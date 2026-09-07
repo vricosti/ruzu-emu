@@ -699,12 +699,15 @@ impl Default for Values {
                 true,
                 false,
             ),
-            sound_index: SwitchableSetting::ranged(
+            sound_index: SwitchableSetting::ranged_with_options(
                 AudioMode::Stereo,
                 AudioMode::Mono,
                 AudioMode::Surround,
                 "sound_index",
                 SystemAudio,
+                Specialization::DEFAULT,
+                true,
+                true,
             ),
             volume: SwitchableSetting::ranged_with_options(
                 100,

@@ -26,7 +26,7 @@ use super::shared_widget as w;
 const AUTO_DEVICE: &str = "auto";
 
 /// Build the Audio tab — upstream `ConfigureAudio`.
-pub fn page() -> Page {
+pub fn page(runtime_lock: bool) -> Page {
     let configuring_global = common::settings::is_configuring_global();
     let (scroller, column) = w::page();
 
@@ -103,6 +103,45 @@ pub fn page() -> Page {
     mute_background.set_visible(configuring_global);
     content.append(&mute_background);
 
+    // Eden uses Widget's runtime sensitivity for all rows, but retains
+    // dedicated unconditional serializers for the engine and device lists.
+    engine_row.set_sensitive(
+        w::SettingEditPolicy::new(
+            &common::settings::values().sink_id,
+            runtime_lock,
+            configuring_global,
+        )
+        .sensitive,
+    );
+    output_row.set_sensitive(
+        w::SettingEditPolicy::new(
+            &common::settings::values().audio_output_device_id,
+            runtime_lock,
+            configuring_global,
+        )
+        .sensitive,
+    );
+    input_row.set_sensitive(
+        w::SettingEditPolicy::new(
+            &common::settings::values().audio_input_device_id,
+            runtime_lock,
+            configuring_global,
+        )
+        .sensitive,
+    );
+    let mode_policy = w::SettingEditPolicy::new(
+        &common::settings::values().sound_index,
+        runtime_lock,
+        configuring_global,
+    );
+    mode_row.set_sensitive(mode_policy.sensitive);
+    let volume_policy = w::SettingEditPolicy::new(
+        &common::settings::values().volume,
+        runtime_lock,
+        configuring_global,
+    );
+    volume_row.set_sensitive(volume_policy.sensitive);
+
     column.append(&group);
 
     // Upstream clears and re-enumerates both device combos when the engine
@@ -136,8 +175,8 @@ pub fn page() -> Page {
             values.sink_id.set_value(sink_id);
             values.audio_output_device_id.set_value(output_name);
             values.audio_input_device_id.set_value(input_name);
-            values.sound_index.set_value(mode_value);
-            values.volume.set_value(volume_value);
+            mode_policy.apply(&mut values.sound_index, mode_value);
+            volume_policy.apply(&mut values.volume, volume_value);
             if configuring_global {
                 values.audio_muted.set_value(muted);
             }
@@ -195,6 +234,44 @@ fn set_devices(dropdown: &gtk::DropDown, devices: Vec<String>, selected: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_and_devices_are_startup_only_but_volume_and_mode_are_live() {
+        let mut values = common::settings::Values::default();
+        assert!(!w::SettingEditPolicy::new(&values.sink_id, false, true).sensitive);
+        assert!(!w::SettingEditPolicy::new(&values.audio_output_device_id, false, true).sensitive);
+        assert!(!w::SettingEditPolicy::new(&values.audio_input_device_id, false, true).sensitive);
+        assert!(w::SettingEditPolicy::new(&values.sink_id, true, true).sensitive);
+        assert!(values.audio_muted.runtime_modifiable);
+        assert!(crate::uisettings::Values::default().mute_when_in_background.runtime_modifiable);
+        let volume = w::SettingEditPolicy::new(&values.volume, false, true);
+        assert!(volume.sensitive);
+        volume.apply(&mut values.volume, 42);
+        assert_eq!(*values.volume.get_value(), 42);
+        let mode = w::SettingEditPolicy::new(&values.sound_index, false, true);
+        assert!(mode.sensitive);
+        mode.apply(
+            &mut values.sound_index,
+            common::settings_enums::AudioMode::Surround,
+        );
+        assert_eq!(
+            *values.sound_index.get_value(),
+            common::settings_enums::AudioMode::Surround
+        );
+    }
+
+    #[test]
+    fn global_volume_apply_does_not_overwrite_active_custom_volume() {
+        let mut values = common::settings::Values::default();
+        values.volume.set_value(90);
+        values.volume.set_global(false);
+        values.volume.set_value(30);
+        let policy = w::SettingEditPolicy::new(&values.volume, false, true);
+        assert!(!policy.sensitive);
+        policy.apply(&mut values.volume, 90);
+        assert_eq!(*values.volume.get_value(), 30);
+        assert_eq!(*values.volume.get_value_global(), 90);
+    }
 
     #[test]
     fn auto_is_the_first_engine() {

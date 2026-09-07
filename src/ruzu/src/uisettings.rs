@@ -228,7 +228,14 @@ impl Default for Values {
 
             confirm_before_stopping: Setting::new(ConfirmStop::AskAlways, "confirmStop", UiGeneral),
             pause_when_in_background: Setting::new(false, "pauseWhenInBackground", UiGeneral),
-            mute_when_in_background: Setting::new(false, "muteWhenInBackground", UiAudio),
+            mute_when_in_background: Setting::with_options(
+                false,
+                "muteWhenInBackground",
+                UiAudio,
+                common::settings_common::Specialization::DEFAULT,
+                true,
+                true,
+            ),
             hide_mouse: Setting::new(true, "hideInactiveMouse", UiGeneral),
             controller_applet_disabled: Setting::new(false, "disableControllerApplet", Ui),
             select_user_on_boot: Setting::new(false, "select_user_on_boot", UiGeneral),

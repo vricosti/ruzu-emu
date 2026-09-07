@@ -180,7 +180,7 @@ impl ConfigureDialog {
             },
             Section {
                 name: "Audio",
-                pages: vec![configure_audio::page()],
+                pages: vec![configure_audio::page(runtime_lock)],
                 apply: apply_pages,
             },
             Section {

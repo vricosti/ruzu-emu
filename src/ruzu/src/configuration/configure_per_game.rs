@@ -97,7 +97,7 @@ impl ConfigurePerGame {
             graphics,
             advanced_graphics.page,
             configure_graphics_extensions::page(runtime_lock),
-            configure_audio::page(),
+            configure_audio::page(runtime_lock),
             configure_input_per_game::page(hid_core),
             configure_network::page(),
             configure_applets::page(),

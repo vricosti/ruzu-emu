@@ -93,7 +93,7 @@ impl ConfigurePerGame {
         let pages = vec![
             configure_per_game_addons::page(properties.title_id, &properties.path),
             configure_system::page(),
-            configure_cpu::page(),
+            configure_cpu::page(runtime_lock),
             graphics,
             advanced_graphics.page,
             configure_graphics_extensions::page(runtime_lock),

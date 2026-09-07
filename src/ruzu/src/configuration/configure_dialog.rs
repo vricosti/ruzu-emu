@@ -166,7 +166,7 @@ impl ConfigureDialog {
             },
             Section {
                 name: "CPU",
-                pages: vec![configure_cpu::page()],
+                pages: vec![configure_cpu::page(runtime_lock)],
                 apply: apply_pages,
             },
             Section {

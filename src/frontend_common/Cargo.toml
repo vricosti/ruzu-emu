@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 common.workspace = true
 log.workspace = true
+zip = { version = "4.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # Upstream's `frontend_common/content_manager.h` includes
 # `core/crypto/key_manager.h` and `core/file_sys/registered_cache.h`; the same

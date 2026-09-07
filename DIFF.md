@@ -13238,3 +13238,27 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   displays an error with retry guidance (French translation included). The message explicitly
   warns that earlier writes may have succeeded and in-memory changes remain applied. No rollback
   or all-files atomicity is claimed; X11 bootstrap and external-content writes also propagate errors.
+
+## 2026-09-07 — src/frontend_common/src/firmware_manager.rs vs frontend_common/firmware_manager.{h,cpp}
+
+### Intentional differences
+
+- Issue #4 extends InstallKeys with ZIP input. Archive enumeration finds exactly one
+  prod.keys at any directory depth, then selects title.keys and key_retail.bin only
+  from the same directory. Ambiguous archives are rejected instead of choosing a key set.
+- Archive paths are never extracted: only the three fixed destination filenames are
+  written. Unsafe paths, symlinks, unreadable archives and empty or oversized selected
+  entries are rejected. Each selected file has a 16 MiB uncompressed limit; all selected
+  entries are read and CRC-checked before any destination writes. Destination I/O errors
+  still allow partial installation, as in upstream's sequential overwrite behavior.
+- Raw-file handling, optional-file order and reload-after-copy remain in their existing
+  owner. ZIP validation adds ErrorInvalidArchive to the frontend result enum.
+
+## 2026-09-07 — src/ruzu/src/main_window.rs vs yuzu/main_window.{h,cpp}
+
+### Intentional differences
+
+- The GTK key chooser also accepts ZIP files (including uppercase extensions) and
+  reports archive errors through the existing completion dialog. Eden delegates its
+  raw-key chooser to QtCommon::Content::InstallKeys. French translations cover the new
+  filter and error text; emulation-running guard and completion behavior are unchanged.

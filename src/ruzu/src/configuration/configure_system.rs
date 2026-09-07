@@ -225,7 +225,8 @@ pub fn page(runtime_lock: bool) -> Page {
     // Gate each dependent control on its check box, as upstream does.
     gate(&custom_rtc_check, &custom_rtc_entry);
     gate(&custom_rtc_check, &rtc_offset);
-    connect_rtc_controls(&custom_rtc_check, &custom_rtc_entry, &rtc_offset);
+    let (rtc_time, refresh_rtc) =
+        connect_rtc_controls(&custom_rtc_check, &custom_rtc_entry, &rtc_offset);
     gate(&rng_seed_check, &rng_seed_entry);
     gate(&speed_check, &speed_control);
 
@@ -378,8 +379,9 @@ pub fn page(runtime_lock: bool) -> Page {
         let time_zone_value = time_zone.selected();
         let rtc_on = custom_rtc_check.is_active();
         let rtc_offset_value = rtc_offset.value() as i64;
-        let rtc_value = parse_rtc(&custom_rtc_entry.text())
-            .unwrap_or_else(|| unix_time_seconds() + rtc_offset_value);
+        // Like QDateTimeEdit, retain seconds not shown in the minute-only text.
+        // Invalid intermediate text does not replace the last valid date.
+        let rtc_value = rtc_time.get();
         let seed_on = rng_seed_check.is_active();
         let seed_value = u32::from_str_radix(rng_seed_entry.text().trim(), 16).unwrap_or(0);
         let device = device_name.text().to_string();
@@ -424,51 +426,101 @@ pub fn page(runtime_lock: bool) -> Page {
         if !configuring_global {
             use_docked_mode_policy.apply(&mut values.use_docked_mode, console_mode);
         }
+        drop(values);
+        refresh_rtc();
     })
 }
 
 /// `ConfigureSystem::UpdateRtcTime` plus its reciprocal date/offset update.
-fn connect_rtc_controls(enabled: &gtk::CheckButton, date: &gtk::Entry, offset: &gtk::SpinButton) {
+fn connect_rtc_controls(
+    enabled: &gtk::CheckButton,
+    date: &gtk::Entry,
+    offset: &gtk::SpinButton,
+) -> (Rc<Cell<i64>>, Rc<dyn Fn()>) {
     let updating = Rc::new(Cell::new(false));
+    let previous_time = Rc::new(Cell::new(0));
+    let displayed_time = Rc::new(Cell::new(0));
 
-    offset.connect_value_changed({
-        let date = date.clone();
+    // ConfigureSystem::UpdateRtcTime. The text field cannot store hidden
+    // seconds as QDateTimeEdit does, so keep its full timestamp separately.
+    let refresh: Rc<dyn Fn()> = Rc::new({
+        let enabled = enabled.downgrade();
+        let date = date.downgrade();
+        let offset = offset.downgrade();
+        let previous_time = Rc::clone(&previous_time);
+        let displayed_time = Rc::clone(&displayed_time);
         let updating = Rc::clone(&updating);
-        move |offset| {
+        move || {
+            let (Some(enabled), Some(date), Some(offset)) =
+                (enabled.upgrade(), date.upgrade(), offset.upgrade())
+            else {
+                return;
+            };
             if updating.replace(true) {
                 return;
             }
-            date.set_text(&format_rtc(unix_time_seconds() + offset.value() as i64));
+            let timestamp = rtc_display_time(
+                unix_time_seconds(), enabled.is_active(), offset.value() as i64,
+            );
+            previous_time.set(timestamp);
+            let text = format_rtc(timestamp);
+            displayed_time.set(parse_rtc(&text).unwrap_or(timestamp));
+            offset.set_sensitive(enabled.is_active());
+            date.set_text(&text);
             updating.set(false);
         }
     });
 
+    offset.connect_value_changed({
+        let refresh = Rc::clone(&refresh);
+        move |_| refresh()
+    });
+
     date.connect_changed({
-        let offset = offset.clone();
+        let enabled = enabled.downgrade();
+        let offset = offset.downgrade();
+        let displayed_time = Rc::clone(&displayed_time);
+        let refresh = Rc::clone(&refresh);
         let updating = Rc::clone(&updating);
         move |date| {
-            if updating.replace(true) {
+            let (Some(enabled), Some(offset)) = (enabled.upgrade(), offset.upgrade()) else {
+                return;
+            };
+            if updating.get() || !enabled.is_active() {
                 return;
             }
             if let Some(timestamp) = parse_rtc(&date.text()) {
-                offset.set_value((timestamp - unix_time_seconds()) as f64);
+                if let Some(new_offset) = rtc_edited_offset(
+                    offset.value() as i64, displayed_time.get(), timestamp,
+                ) {
+                    // Suppress the intermediate refresh; perform it once after
+                    // the spinbox has clamped the value to its supported range.
+                    updating.set(true);
+                    offset.set_value(new_offset as f64);
+                    updating.set(false);
+                    refresh();
+                }
             }
-            updating.set(false);
         }
     });
 
     enabled.connect_toggled({
-        let date = date.clone();
-        let offset = offset.clone();
-        let updating = Rc::clone(&updating);
-        move |enabled| {
-            if !enabled.is_active() || updating.replace(true) {
-                return;
-            }
-            date.set_text(&format_rtc(unix_time_seconds() + offset.value() as i64));
-            updating.set(false);
-        }
+        let refresh = Rc::clone(&refresh);
+        move |_| refresh()
     });
+    refresh();
+    (previous_time, refresh)
+}
+
+fn rtc_display_time(now: i64, enabled: bool, offset: i64) -> i64 {
+    if enabled { now + offset } else { now }
+}
+
+// ConfigureSystem's update_date_offset lambda: edit relative to the displayed
+// date, not the wall clock at the time of the edit. Invalid/overflowing GTK text
+// is ignored, whereas Qt's constrained date editor cannot produce it.
+fn rtc_edited_offset(offset: i64, previous_display: i64, selected: i64) -> Option<i64> {
+    offset.checked_add(selected.checked_sub(previous_display)?)
 }
 
 fn unix_time_seconds() -> i64 {
@@ -679,6 +731,30 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtc_date_edit_is_relative_to_previous_display_not_elapsed_host_time() {
+        let now = 1_800_000_017;
+        let initial_offset = 3600;
+        let previous = rtc_display_time(now, true, initial_offset);
+        let shown = parse_rtc(&format_rtc(previous)).unwrap();
+        let offset = rtc_edited_offset(initial_offset, shown, shown + 60).unwrap();
+        assert_eq!(offset, 3660);
+        // An edit after 90 seconds must still add exactly one minute.
+        let refreshed = rtc_display_time(now + 90, true, offset);
+        assert_eq!(refreshed, now + 90 + 3660);
+        assert_eq!(rtc_edited_offset(offset, shown + 60, shown), Some(3600));
+        // A no-op edit retains the hidden seconds rather than rounding the offset.
+        assert_eq!(rtc_edited_offset(initial_offset, shown, shown), Some(initial_offset));
+        assert_eq!(previous.rem_euclid(60), 17);
+    }
+
+    #[test]
+    fn disabled_rtc_shows_current_time_without_discarding_offset() {
+        assert_eq!(rtc_display_time(1000, false, -300), 1000);
+        assert_eq!(rtc_display_time(1020, true, -300), 720);
+        assert_eq!(rtc_edited_offset(i64::MAX, 0, 1), None);
+    }
 
     #[test]
     fn system_runtime_metadata_matches_upstream_widget_rules() {

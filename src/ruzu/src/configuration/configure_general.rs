@@ -219,13 +219,6 @@ pub fn page() -> Page {
             #[cfg(target_os = "linux")]
             v.gui_force_x11.set_value(use_x11);
         });
-        #[cfg(target_os = "linux")]
-        if let Err(error) = crate::gui_settings::set_force_x11(use_x11) {
-            log::error!("Failed to save the X11 startup preference: {error}");
-        }
-        if let Err(error) = super::qt_config::save_view_values() {
-            log::error!("Failed to save the frontend General settings: {error}");
-        }
 
         let new_external_dirs = external_dirs.borrow().clone();
         let changed = {
@@ -238,9 +231,6 @@ pub fn page() -> Page {
             }
         };
         if changed {
-            if let Err(error) = super::qt_config::save_external_content_dirs(&new_external_dirs) {
-                log::error!("Failed to save external content directories: {error}");
-            }
             crate::util::game::reset_metadata(None, false);
             uisettings::request_game_list_reload();
         }

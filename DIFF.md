@@ -13199,3 +13199,42 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   dummy. The persistent-worker restart regression covers this lock/unlock
   sequence and checks the dispatch count returns to zero. Upstream uses one
   current KThread pointer rather than these separate Rust caches.
+
+## 2026-09-07 — src/ruzu/src/uisettings.rs vs qt_common/config/uisettings.{h,cpp}
+
+### Intentional differences
+
+- GTK retains its explicitly declared settings rather than C++ constructor-registered linkage.
+  `for_each_ui_setting_mut` now exposes the existing UI scalars to the configuration owner,
+  including General, game-list, screenshot and background-audio options. Containers, paths,
+  shortcuts and multiplayer keep their specialized readers/writers. UiGeneral and UiAudio
+  category metadata was checked against the current Eden header.
+
+## 2026-09-07 — src/ruzu/src/configuration/qt_config.rs vs qt_common/config/qt_config.{h,cpp} and frontend_common/config.{h,cpp}
+
+### Intentional differences
+
+- The GTK frontend visits its separate UI registry explicitly; BaseConfig's core registry cannot
+  discover these fields. Verified storage is `[UI]` for Ui/UiGeneral, `UIGameList\` and
+  `Screenshots\` prefixes within `[UI]`, and `[Audio]` for UiAudio. Default markers follow the
+  generic configuration contract. The screenshot path remains a plain, quoted-if-needed string
+  without a default marker, matching Read/SaveScreenshotValues.
+- GTK keeps theme display names in memory; disk values use Eden's internal theme identifiers.
+  The reader accepts both forms for compatibility. Existing unrelated INI entries are preserved.
+- Ruzu retains its multiple synchronous writes instead of one long-lived QtConfig document.
+  Unreadable existing documents now propagate an error in the global/UI save path instead of
+  being treated as empty. This is not an atomic transaction across all settings files.
+  Synthetic tests cover non-default UI scalars, disk reload, category placement, legacy boolean
+  values, defaults, quoted paths, theme conversion and read-error preservation.
+
+## 2026-09-07 — src/ruzu/src/configuration/{configure_dialog,configure_general}.rs vs yuzu/configuration/{configure_dialog,configure_general}.{h,cpp} and yuzu/main_window.cpp
+
+### Intentional differences
+
+- The asynchronous GTK OK callback owns persistence after every page has applied. This matches
+  Eden's ApplyConfiguration-before-SaveAllValues boundary without Qt's blocking exec(). General
+  no longer saves a partial UI snapshot before the UI, Audio and Filesystem pages apply.
+- Unlike the previous log-only path, I/O failure keeps the GTK configuration window open and
+  displays an error with retry guidance (French translation included). The message explicitly
+  warns that earlier writes may have succeeded and in-memory changes remain applied. No rollback
+  or all-files atomicity is claimed; X11 bootstrap and external-content writes also propagate errors.

@@ -278,7 +278,17 @@ impl ConfigureDialog {
             #[weak(rename_to = dialog)]
             this,
             move |_| {
-                dialog.apply_configuration();
+                if let Err(error) = dialog.apply_configuration() {
+                    log::error!("Failed to save configuration: {error}");
+                    crate::gtk_compat::show_message(
+                        Some(&dialog.window),
+                        "Unable to save settings",
+                        &format!("{}\n\n{}\n{error}", crate::i18n::tr(
+                            "Some settings may already have been saved. Your changes remain applied in this session. Check the configuration directory permissions, then click OK to retry."),
+                            super::qt_config::config_path().display()),
+                    );
+                    return;
+                }
                 if let Some(callback) = dialog.on_applied.borrow().as_ref() {
                     callback();
                 }
@@ -318,26 +328,26 @@ impl ConfigureDialog {
     /// Push every page's widget state back into the settings — upstream
     /// `ConfigureDialog::ApplyConfiguration`, which calls `ApplyConfiguration()`
     /// on each tab regardless of which one is currently visible.
-    fn apply_configuration(&self) {
+    fn apply_configuration(&self) -> std::io::Result<()> {
         for section in self.sections.iter() {
             (section.apply)(&section.pages);
         }
         // Upstream `GMainWindow::OnConfigure` calls `config->Save()` once the
         // dialog is accepted; without it the new bindings would live only in
         // this process and be gone next launch.
-        if let Err(error) = super::qt_config::save_global_values() {
-            log::error!("Failed to save global settings: {error}");
-        }
-        if let Err(error) = super::qt_config::save_control_values() {
-            log::error!("Failed to save control settings: {error}");
-        }
-        if let Err(error) = super::qt_config::save_shortcut_values() {
-            log::error!("Failed to save shortcut settings: {error}");
-        }
-        if let Err(error) = super::qt_config::save_ui_language() {
-            log::error!("Failed to save interface language: {error}");
-        }
+        super::qt_config::save_global_values()?;
+        super::qt_config::save_control_values()?;
+        super::qt_config::save_shortcut_values()?;
+        super::qt_config::save_ui_language()?;
+        // All pages must have applied before UI values are serialized, including
+        // UI, Audio and Filesystem (not just the first General page).
+        super::qt_config::save_view_values()?;
+        let external = common::settings::values().external_content_dirs.clone();
+        super::qt_config::save_external_content_dirs(&external)?;
+        #[cfg(target_os = "linux")]
+        crate::gui_settings::set_force_x11(crate::uisettings::with(|values| *values.gui_force_x11.get_value()))?;
         common::settings::log_settings(&common::settings::values());
+        Ok(())
     }
 
     /// Show the dialog — upstream `ConfigureDialog::exec()`.

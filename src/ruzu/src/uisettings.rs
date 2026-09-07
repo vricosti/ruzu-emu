@@ -226,12 +226,12 @@ impl Default for Values {
             show_filter_bar: Setting::new(true, "showFilterBar", Ui),
             show_status_bar: Setting::new(true, "showStatusBar", Ui),
 
-            confirm_before_stopping: Setting::new(ConfirmStop::AskAlways, "confirmStop", Ui),
-            pause_when_in_background: Setting::new(false, "pauseWhenInBackground", Ui),
-            mute_when_in_background: Setting::new(false, "muteWhenInBackground", Ui),
-            hide_mouse: Setting::new(true, "hideInactiveMouse", Ui),
+            confirm_before_stopping: Setting::new(ConfirmStop::AskAlways, "confirmStop", UiGeneral),
+            pause_when_in_background: Setting::new(false, "pauseWhenInBackground", UiGeneral),
+            mute_when_in_background: Setting::new(false, "muteWhenInBackground", UiAudio),
+            hide_mouse: Setting::new(true, "hideInactiveMouse", UiGeneral),
             controller_applet_disabled: Setting::new(false, "disableControllerApplet", Ui),
-            select_user_on_boot: Setting::new(false, "select_user_on_boot", Ui),
+            select_user_on_boot: Setting::new(false, "select_user_on_boot", UiGeneral),
             enable_gamemode: SwitchableSetting::new(
                 !cfg!(target_env = "msvc"),
                 "enable_gamemode",
@@ -277,6 +277,29 @@ impl Default for Values {
             cache_game_list: Setting::new(true, "cache_game_list", UiGameList),
             favorites_expanded: Setting::new(true, "favorites_expanded", UiGameList),
         }
+    }
+}
+
+impl Values {
+    /// UI-owned scalar registry, corresponding to upstream UISettings::linkage.
+    /// Config traversal stays in qt_config; containers, paths and theme use their
+    /// specialized readers/writers, as they do in QtConfig.
+    pub(crate) fn for_each_ui_setting_mut(
+        &mut self,
+        mut visit: impl FnMut(&mut dyn common::settings_setting::BasicSetting),
+    ) {
+        macro_rules! settings {
+            ($($field:ident),+ $(,)?) => { $(visit(&mut self.$field);)+ };
+        }
+        settings!(single_window_mode, fullscreen, display_titlebar, show_filter_bar,
+            show_status_bar, confirm_before_stopping, pause_when_in_background,
+            mute_when_in_background, hide_mouse, controller_applet_disabled,
+            select_user_on_boot, enable_gamemode, show_console,
+            enable_screenshot_save_as, screenshot_height, show_add_ons, show_compat,
+            show_size, show_types, show_play_time, game_icon_size, folder_icon_size,
+            row_1_text_id, row_2_text_id, cache_game_list, favorites_expanded);
+        #[cfg(unix)]
+        settings!(gui_force_x11, gui_hide_backend_warning);
     }
 }
 

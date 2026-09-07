@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Rust counterpart of
-// `/home/vricosti/Dev/emulators/eden/src/yuzu/configuration/qt_config.cpp`
+// `/home/vricosti/Dev/emulators/eden/src/qt_common/config/qt_config.cpp`
 // (`Config::ReadUIValues` / `Config::SaveUIValues` and the Qt-owned control
 // values).
 //
@@ -66,6 +66,11 @@ pub fn load_global_values() {
 /// their specialized writers after this pass.
 pub fn save_global_values() -> io::Result<()> {
     let path = config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(_) => {},
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error),
+    }
     let mut config = BaseConfig::new(ConfigType::GlobalConfig);
     // Upstream writes through the already-loaded, long-lived `QtConfig`
     // object. Reden reconstructs this adapter for each save, so load only the
@@ -266,54 +271,46 @@ pub fn load_roms_path() {
 /// Read upstream's checkable `View` action state from `Category::Ui`.
 pub fn load_view_values() {
     let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
-    let ui = parse_section_values(&contents, "UI");
-    uisettings::with_mut(|values| {
-        values.single_window_mode.set_value(read_ui_bool_setting(
-            &ui,
-            "singleWindowMode",
-            *values.single_window_mode.get_default(),
-        ));
-        values.fullscreen.set_value(read_ui_bool_setting(
-            &ui,
-            "fullscreen",
-            *values.fullscreen.get_default(),
-        ));
-        values.display_titlebar.set_value(read_ui_bool_setting(
-            &ui,
-            "displayTitleBars",
-            *values.display_titlebar.get_default(),
-        ));
-        values.show_filter_bar.set_value(read_ui_bool_setting(
-            &ui,
-            "showFilterBar",
-            *values.show_filter_bar.get_default(),
-        ));
-        values.show_status_bar.set_value(read_ui_bool_setting(
-            &ui,
-            "showStatusBar",
-            *values.show_status_bar.get_default(),
-        ));
-        values.enable_gamemode.set_value(read_ui_bool_setting(
-            &ui,
-            "enable_gamemode",
-            *values.enable_gamemode.get_default(),
-        ));
-        #[cfg(unix)]
-        {
-            values.gui_force_x11.set_value(read_ui_bool_setting(
-                &ui,
-                "gui_force_x11",
-                *values.gui_force_x11.get_default(),
-            ));
-            values
-                .gui_hide_backend_warning
-                .set_value(read_ui_bool_setting(
-                    &ui,
-                    "gui_hide_backend_warning",
-                    *values.gui_hide_backend_warning.get_default(),
-                ));
-        }
+    uisettings::with_mut(|values| read_ui_values(&contents, values));
+}
+
+/// Match QtConfig's UI/UIGameList/Screenshots groups and Config's UiAudio group.
+/// The GTK registry lives separately from common::settings, so BaseConfig cannot
+/// discover these settings through the core registry.
+fn ui_setting_location(setting: &dyn common::settings_setting::BasicSetting) -> (&'static str, String) {
+    use common::settings_enums::Category;
+    if setting.category() == Category::UiAudio {
+        return ("Audio", setting.label().to_owned());
+    }
+    let prefix = match setting.category() {
+        Category::UiGameList => "UIGameList\\",
+        Category::Screenshots => "Screenshots\\",
+        _ => "",
+    };
+    ("UI", format!("{prefix}{}", setting.label()))
+}
+
+fn read_ui_values(contents: &str, values: &mut uisettings::Values) {
+    let ui = parse_section_values(contents, "UI");
+    let audio = parse_section_values(contents, "Audio");
+    values.for_each_ui_setting_mut(|setting| {
+        let (section, key) = ui_setting_location(setting);
+        let document = if section == "Audio" { &audio } else { &ui };
+        let default = setting.default_to_string();
+        let value = if matches!(default.as_str(), "true" | "false") {
+            read_ui_bool_setting(document, &key, default == "true").to_string()
+        } else {
+            read_section_string_setting(document, &key, &default)
+        };
+        setting.load_string(&value);
     });
+    let theme = read_section_string_setting(&ui, "theme", "colorful");
+    let display = uisettings::THEMES.iter().find(|(name, internal)| *name == theme || *internal == theme)
+        .map(|(name, _)| *name).unwrap_or(&theme);
+    values.theme.set_value(display.to_owned());
+    // Upstream's screenshot_path is a plain string without a default marker.
+    values.screenshot_path.set_value(ui.get("Screenshots\\screenshot_path")
+        .map(|value| unquote(value).to_owned()).unwrap_or_default());
 }
 
 /// Read the three Direct Connect fields owned by upstream
@@ -428,65 +425,36 @@ pub fn save_multiplayer_values() -> io::Result<()> {
 /// Persist frontend UI values through upstream `QtConfig::SaveUIValues`'s
 /// generic `Category::Ui` / `Category::UiGeneral` writer.
 pub fn save_view_values() -> io::Result<()> {
-    let path = config_path();
-    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
-    uisettings::with(|values| {
-        for (key, value, default) in [
-            (
-                "singleWindowMode",
-                *values.single_window_mode.get_value(),
-                *values.single_window_mode.get_default(),
-            ),
-            (
-                "fullscreen",
-                *values.fullscreen.get_value(),
-                *values.fullscreen.get_default(),
-            ),
-            (
-                "displayTitleBars",
-                *values.display_titlebar.get_value(),
-                *values.display_titlebar.get_default(),
-            ),
-            (
-                "showFilterBar",
-                *values.show_filter_bar.get_value(),
-                *values.show_filter_bar.get_default(),
-            ),
-            (
-                "showStatusBar",
-                *values.show_status_bar.get_value(),
-                *values.show_status_bar.get_default(),
-            ),
-            (
-                "enable_gamemode",
-                *values.enable_gamemode.get_value(),
-                *values.enable_gamemode.get_default(),
-            ),
-        ] {
-            contents =
-                replace_section_setting(&contents, "UI", key, &value.to_string(), value == default);
-        }
-        #[cfg(unix)]
-        for (key, value, default) in [
-            (
-                "gui_force_x11",
-                *values.gui_force_x11.get_value(),
-                *values.gui_force_x11.get_default(),
-            ),
-            (
-                "gui_hide_backend_warning",
-                *values.gui_hide_backend_warning.get_value(),
-                *values.gui_hide_backend_warning.get_default(),
-            ),
-        ] {
-            contents =
-                replace_section_setting(&contents, "UI", key, &value.to_string(), value == default);
-        }
-    });
+    save_view_values_to(&config_path())
+}
+
+fn save_view_values_to(path: &Path) -> io::Result<()> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let updated = uisettings::with_mut(|values| save_ui_values(&contents, values));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, contents)
+    std::fs::write(path, updated)
+}
+
+fn save_ui_values(contents: &str, values: &mut uisettings::Values) -> String {
+    let mut contents = contents.to_owned();
+    values.for_each_ui_setting_mut(|setting| {
+        let (section, key) = ui_setting_location(setting);
+        let value = setting.to_string_global();
+        contents = replace_section_setting(&contents, section, &key, &value,
+            value == setting.default_to_string());
+    });
+    let theme = values.theme.get_value();
+    let internal = uisettings::THEMES.iter().find(|(name, internal)| *name == theme || *internal == theme)
+        .map(|(_, internal)| *internal).unwrap_or(theme);
+    contents = replace_ui_string_setting(&contents, "theme", internal, "colorful");
+    let path = frontend_common::config::adjust_output_string(values.screenshot_path.get_value());
+    replace_ui_setting(&contents, "Screenshots\\screenshot_path", &path, None)
 }
 
 fn read_ui_bool_setting(
@@ -582,11 +550,17 @@ fn read_section_string_setting(
 }
 
 fn replace_ui_string_setting(contents: &str, key: &str, value: &str, default: &str) -> String {
+    replace_ui_setting(contents, key, value, Some(default))
+}
+
+/// Config::WriteStringSetting distinguishes a plain path from a defaulted setting.
+fn replace_ui_setting(contents: &str, key: &str, value: &str, default: Option<&str>) -> String {
     let default_key = format!("{key}\\default");
-    let rendered = [
-        format!("{default_key}={}", value == default),
-        format!("{key}={value}"),
-    ];
+    let mut rendered = Vec::new();
+    if let Some(default) = default {
+        rendered.push(format!("{default_key}={}", value == default));
+    }
+    rendered.push(format!("{key}={value}"));
     let mut output = Vec::new();
     let mut in_ui = false;
     let mut saw_ui = false;
@@ -1561,6 +1535,72 @@ fn is_true(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_frontend_scalar_settings_survive_disk_roundtrip() {
+        let mut source = uisettings::Values::default();
+        let mut expected = std::collections::BTreeMap::new();
+        source.for_each_ui_setting_mut(|setting| {
+            let default = setting.default_to_string();
+            let custom = match default.as_str() {
+                "true" => "false".to_owned(),
+                "false" => "true".to_owned(),
+                _ => (default.parse::<u64>().unwrap() + 1).to_string(),
+            };
+            setting.load_string(&custom);
+            assert_ne!(setting.to_string_global(), default, "{} did not change", setting.label());
+            expected.insert(ui_setting_location(setting), custom);
+        });
+        source.theme.set_value("Dark".into());
+        source.screenshot_path.set_value("/tmp/screenshots, test".into());
+        let untouched = "[Renderer]\nbackend=1\n[UI]\nPaths\\gamedirs\\size=0\n";
+        let document = save_ui_values(untouched, &mut source);
+        assert!(document.contains("backend=1"));
+        assert!(document.contains("Paths\\gamedirs\\size=0"));
+        assert!(document.contains("theme=qdarkstyle"));
+        assert!(document.contains("UIGameList\\game_icon_size=65"));
+        assert!(document.contains("Screenshots\\screenshot_height=1"));
+        assert!(!document.contains("Screenshots\\screenshot_path\\default"));
+        assert_eq!(parse_section_values(&document, "Audio")["muteWhenInBackground"], "true");
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("qt-config.ini");
+        std::fs::write(&path, document).unwrap();
+        let mut loaded = uisettings::Values::default();
+        read_ui_values(&std::fs::read_to_string(path).unwrap(), &mut loaded);
+        loaded.for_each_ui_setting_mut(|setting| {
+            assert_eq!(setting.to_string_global(), expected[&ui_setting_location(setting)], "{}", setting.label());
+        });
+        assert_eq!(loaded.theme.get_value(), "Dark");
+        assert_eq!(loaded.screenshot_path.get_value(), "/tmp/screenshots, test");
+        assert!(expected.len() >= 27);
+    }
+
+    #[test]
+    fn frontend_reader_honors_defaults_legacy_bools_and_upstream_plain_paths() {
+        let mut values = uisettings::Values::default();
+        read_ui_values(concat!("[UI]\n",
+            "pauseWhenInBackground\\default=false\npauseWhenInBackground=1\n",
+            "hideInactiveMouse\\default=true\nhideInactiveMouse=false\n",
+            "UIGameList\\game_icon_size\\default=false\nUIGameList\\game_icon_size=broken\n",
+            "Screenshots\\screenshot_path=\"C:/Screenshots, test\"\n",
+            "theme\\default=false\ntheme=colorful_dark\n"), &mut values);
+        assert!(*values.pause_when_in_background.get_value());
+        assert!(*values.hide_mouse.get_value());
+        assert_eq!(*values.game_icon_size.get_value(), 64);
+        assert_eq!(values.theme.get_value(), "Dark Colorful");
+        assert_eq!(values.screenshot_path.get_value(), "C:/Screenshots, test");
+    }
+
+    #[test]
+    fn saving_ui_propagates_unreadable_configuration_errors() {
+        let temporary = tempfile::tempdir().unwrap();
+        // A directory instead of a file is a deterministic read error, even under root.
+        assert!(save_view_values_to(temporary.path()).is_err());
+        let path = temporary.path().join("invalid.ini");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(save_view_values_to(&path).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), [0xff, 0xfe]);
+    }
 
     #[test]
     fn shortcut_reader_honors_default_markers_and_custom_empty_bindings() {

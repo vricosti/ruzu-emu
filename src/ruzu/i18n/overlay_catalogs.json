@@ -9,7 +9,9 @@
     "Closing software...": "Cerrando el programa..."
   },
   "fr": {
-    "Closing software...": "Fermeture du logiciel..."
+    "Closing software...": "Fermeture du logiciel...",
+    "Unable to save settings": "Impossible d’enregistrer les paramètres",
+    "Some settings may already have been saved. Your changes remain applied in this session. Check the configuration directory permissions, then click OK to retry.": "Certains paramètres ont peut-être déjà été enregistrés. Vos changements restent appliqués pour cette session. Vérifiez les droits d’accès au dossier de configuration, puis cliquez sur OK pour réessayer."
   },
   "it": {
     "Closing software...": "Chiusura del software in corso..."

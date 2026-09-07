@@ -9,7 +9,7 @@
 use ash::vk;
 use std::sync::{Arc, Mutex};
 
-use crate::renderer_vulkan::scheduler::Scheduler;
+use crate::renderer_vulkan::scheduler::{FramePacing, Scheduler};
 use crate::vulkan_common::vk_enum_string_helper::string_vk_result;
 use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_wrapper::VulkanError;
@@ -172,6 +172,7 @@ pub struct Swapchain {
     device: ash::Device,
     present_queue: vk::Queue,
     submit_mutex: Arc<Mutex<()>>,
+    frame_pacing: Arc<Mutex<FramePacing>>,
     graphics_family: u32,
     present_family: u32,
     mutable_format_enabled: bool,
@@ -209,6 +210,7 @@ impl Swapchain {
         surface: vk::SurfaceKHR,
         device: &Device,
         submit_mutex: Arc<Mutex<()>>,
+        frame_pacing: Arc<Mutex<FramePacing>>,
         width: u32,
         height: u32,
     ) -> Result<Self, VulkanError> {
@@ -221,6 +223,7 @@ impl Swapchain {
             device: device.get_logical().clone(),
             present_queue: device.get_present_queue(),
             submit_mutex,
+            frame_pacing,
             graphics_family: device.get_graphics_family(),
             present_family: device.get_present_family(),
             mutable_format_enabled: device.is_khr_swapchain_mutable_format_enabled(),
@@ -329,17 +332,16 @@ impl Swapchain {
             }
         }
         if let Some(tick) = self.resource_ticks.get_mut(self.image_index as usize) {
+            use common::settings_enums::FramePacingMode;
+            let target_fps = match *common::settings::values().frame_pacing_mode.get_value() {
+                FramePacingMode::TargetAuto => 0.0,
+                FramePacingMode::Target30 => 30.0,
+                FramePacingMode::Target60 => 60.0,
+                FramePacingMode::Target90 => 90.0,
+                FramePacingMode::Target120 => 120.0,
+            };
             match scheduler {
                 Some(scheduler) => {
-                    use common::settings_enums::FramePacingMode;
-                    let target_fps = match *common::settings::values().frame_pacing_mode.get_value()
-                    {
-                        FramePacingMode::TargetAuto => 0.0,
-                        FramePacingMode::Target30 => 30.0,
-                        FramePacingMode::Target60 => 60.0,
-                        FramePacingMode::Target90 => 90.0,
-                        FramePacingMode::Target120 => 120.0,
-                    };
                     scheduler.wait_with_frame_pacing(*tick, target_fps);
                     *tick = scheduler.current_tick();
                 }
@@ -350,6 +352,12 @@ impl Swapchain {
                 // previous present completed, which waited on the blit's
                 // semaphore), and frame readiness by `render_ready`.
                 None => {
+                    // Share only Scheduler::Wait's pacing state. GPU ordering
+                    // still uses image acquisition and render_ready, not an
+                    // aliased mutable Scheduler on the presentation thread.
+                    if target_fps > 0.0 {
+                        self.frame_pacing.lock().unwrap().wait(target_fps);
+                    }
                     *tick = tick.saturating_add(1);
                 }
             }

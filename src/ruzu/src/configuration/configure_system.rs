@@ -51,7 +51,7 @@ const LOCALE_BLOCKLIST: [u32; 7] = [
 ];
 
 /// Build the System tab — upstream `ConfigureSystem`.
-pub fn page() -> Page {
+pub fn page(runtime_lock: bool) -> Page {
     let configuring_global = common::settings::is_configuring_global();
     let (scroller, column) = w::page();
 
@@ -249,6 +249,123 @@ pub fn page() -> Page {
         &turbo_speed_row,
     ]);
 
+    // ConfigureSystem's generic Widget rules apply to both row sensitivity
+    // and serialization, including the paired controls' enclosing rows.
+    let cpu_clock_policy = w::SettingEditPolicy::new(
+        &common::settings::values().cpu_clock,
+        runtime_lock,
+        configuring_global,
+    );
+    cpu_clock_row.set_sensitive(cpu_clock_policy.sensitive);
+    let gpu_clock_policy = w::SettingEditPolicy::new(
+        &common::settings::values().gpu_clock,
+        runtime_lock,
+        configuring_global,
+    );
+    gpu_clock_row.set_sensitive(gpu_clock_policy.sensitive);
+    let language_index_policy = w::SettingEditPolicy::new(
+        &common::settings::values().language_index,
+        runtime_lock,
+        configuring_global,
+    );
+    language_row.set_sensitive(language_index_policy.sensitive);
+    let region_index_policy = w::SettingEditPolicy::new(
+        &common::settings::values().region_index,
+        runtime_lock,
+        configuring_global,
+    );
+    region_row.set_sensitive(region_index_policy.sensitive);
+    let time_zone_index_policy = w::SettingEditPolicy::new(
+        &common::settings::values().time_zone_index,
+        runtime_lock,
+        configuring_global,
+    );
+    time_zone_row.set_sensitive(time_zone_index_policy.sensitive);
+    let custom_rtc_enabled_policy = w::SettingEditPolicy::new(
+        &common::settings::values().custom_rtc_enabled,
+        runtime_lock,
+        configuring_global,
+    );
+    custom_rtc_check.set_sensitive(custom_rtc_enabled_policy.sensitive);
+    let custom_rtc_policy = w::SettingEditPolicy::new(
+        &common::settings::values().custom_rtc,
+        runtime_lock,
+        configuring_global,
+    );
+    rtc_row.set_sensitive(custom_rtc_policy.sensitive);
+    let custom_rtc_offset_policy = w::SettingEditPolicy::new(
+        &common::settings::values().custom_rtc_offset,
+        runtime_lock,
+        configuring_global,
+    );
+    rtc_offset_row.set_sensitive(custom_rtc_offset_policy.sensitive);
+    let rng_seed_enabled_policy = w::SettingEditPolicy::new(
+        &common::settings::values().rng_seed_enabled,
+        runtime_lock,
+        configuring_global,
+    );
+    rng_seed_check.set_sensitive(rng_seed_enabled_policy.sensitive);
+    let rng_seed_policy = w::SettingEditPolicy::new(
+        &common::settings::values().rng_seed,
+        runtime_lock,
+        configuring_global,
+    );
+    seed_row.set_sensitive(rng_seed_policy.sensitive);
+    let use_multi_core_policy = w::SettingEditPolicy::new(
+        &common::settings::values().use_multi_core,
+        runtime_lock,
+        configuring_global,
+    );
+    multicore.set_sensitive(use_multi_core_policy.sensitive);
+    let memory_layout_mode_policy = w::SettingEditPolicy::new(
+        &common::settings::values().memory_layout_mode,
+        runtime_lock,
+        configuring_global,
+    );
+    memory_row.set_sensitive(memory_layout_mode_policy.sensitive);
+    let use_speed_limit_policy = w::SettingEditPolicy::new(
+        &common::settings::values().use_speed_limit,
+        runtime_lock,
+        configuring_global,
+    );
+    speed_check.set_sensitive(use_speed_limit_policy.sensitive);
+    let speed_limit_policy = w::SettingEditPolicy::new(
+        &common::settings::values().speed_limit,
+        runtime_lock,
+        configuring_global,
+    );
+    speed_row.set_sensitive(speed_limit_policy.sensitive);
+    let slow_speed_limit_policy = w::SettingEditPolicy::new(
+        &common::settings::values().slow_speed_limit,
+        runtime_lock,
+        configuring_global,
+    );
+    slow_speed_row.set_sensitive(slow_speed_limit_policy.sensitive);
+    let turbo_speed_limit_policy = w::SettingEditPolicy::new(
+        &common::settings::values().turbo_speed_limit,
+        runtime_lock,
+        configuring_global,
+    );
+    turbo_speed_row.set_sensitive(turbo_speed_limit_policy.sensitive);
+    let sync_core_speed_policy = w::SettingEditPolicy::new(
+        &common::settings::values().sync_core_speed,
+        runtime_lock,
+        configuring_global,
+    );
+    sync_core_speed.set_sensitive(sync_core_speed_policy.sensitive);
+    let program_args_policy = w::SettingEditPolicy::new(
+        &common::settings::values().program_args,
+        runtime_lock,
+        configuring_global,
+    );
+    program_args_row.set_sensitive(program_args_policy.sensitive);
+    let use_docked_mode_policy = w::SettingEditPolicy::new(
+        &common::settings::values().use_docked_mode,
+        runtime_lock,
+        configuring_global,
+    );
+    console_mode_row.set_sensitive(use_docked_mode_policy.sensitive);
+
     Page::new("System", scroller, move || {
         // Widgets hold only a weak reference to their size group, so it has to
         // stay owned for the page's lifetime or the columns drift apart again.
@@ -281,31 +398,31 @@ pub fn page() -> Page {
         };
 
         let mut values = common::settings::values_mut();
-        values.cpu_clock.set_value(cpu_clock_value);
-        values.gpu_clock.set_value(gpu_clock_value);
-        values.language_index.set_value(language_value);
-        values.region_index.set_value(region_value);
+        cpu_clock_policy.apply(&mut values.cpu_clock, cpu_clock_value);
+        gpu_clock_policy.apply(&mut values.gpu_clock, gpu_clock_value);
+        language_index_policy.apply(&mut values.language_index, language_value);
+        region_index_policy.apply(&mut values.region_index, region_value);
         if let Some(zone) = common::settings_enums::TimeZone::from_u32(time_zone_value) {
-            values.time_zone_index.set_value(zone);
+            time_zone_index_policy.apply(&mut values.time_zone_index, zone);
         }
-        values.custom_rtc_enabled.set_value(rtc_on);
-        values.custom_rtc.set_value(rtc_value);
-        values.custom_rtc_offset.set_value(rtc_offset_value);
-        values.rng_seed_enabled.set_value(seed_on);
-        values.rng_seed.set_value(seed_value);
+        custom_rtc_enabled_policy.apply(&mut values.custom_rtc_enabled, rtc_on);
+        custom_rtc_policy.apply(&mut values.custom_rtc, rtc_value);
+        custom_rtc_offset_policy.apply(&mut values.custom_rtc_offset, rtc_offset_value);
+        rng_seed_enabled_policy.apply(&mut values.rng_seed_enabled, seed_on);
+        rng_seed_policy.apply(&mut values.rng_seed, seed_value);
         if configuring_global {
             values.device_name.set_value(device);
         }
-        values.use_multi_core.set_value(multi);
-        values.memory_layout_mode.set_value(memory_value);
-        values.use_speed_limit.set_value(limit_on);
-        values.speed_limit.set_value(limit_value);
-        values.slow_speed_limit.set_value(slow_speed_value);
-        values.turbo_speed_limit.set_value(turbo_speed_value);
-        values.sync_core_speed.set_value(synchronize_core);
-        values.program_args.set_value(args);
+        use_multi_core_policy.apply(&mut values.use_multi_core, multi);
+        memory_layout_mode_policy.apply(&mut values.memory_layout_mode, memory_value);
+        use_speed_limit_policy.apply(&mut values.use_speed_limit, limit_on);
+        speed_limit_policy.apply(&mut values.speed_limit, limit_value);
+        slow_speed_limit_policy.apply(&mut values.slow_speed_limit, slow_speed_value);
+        turbo_speed_limit_policy.apply(&mut values.turbo_speed_limit, turbo_speed_value);
+        sync_core_speed_policy.apply(&mut values.sync_core_speed, synchronize_core);
+        program_args_policy.apply(&mut values.program_args, args);
         if !configuring_global {
-            values.use_docked_mode.set_value(console_mode);
+            use_docked_mode_policy.apply(&mut values.use_docked_mode, console_mode);
         }
     })
 }
@@ -562,6 +679,59 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_runtime_metadata_matches_upstream_widget_rules() {
+        let values = common::settings::Values::default();
+        for startup_only in [
+            values.language_index.setting.runtime_modifiable,
+            values.region_index.setting.runtime_modifiable,
+            values.time_zone_index.setting.runtime_modifiable,
+            values.use_multi_core.setting.runtime_modifiable,
+            values.memory_layout_mode.setting.runtime_modifiable,
+            values.sync_core_speed.setting.runtime_modifiable,
+            values.program_args.setting.runtime_modifiable,
+        ] {
+            assert!(!startup_only);
+        }
+        for runtime_editable in [
+            values.cpu_clock.setting.runtime_modifiable,
+            values.gpu_clock.setting.runtime_modifiable,
+            values.custom_rtc_enabled.setting.runtime_modifiable,
+            values.custom_rtc.setting.runtime_modifiable,
+            values.custom_rtc_offset.setting.runtime_modifiable,
+            values.rng_seed_enabled.setting.runtime_modifiable,
+            values.rng_seed.setting.runtime_modifiable,
+            values.use_speed_limit.setting.runtime_modifiable,
+            values.speed_limit.setting.runtime_modifiable,
+            values.slow_speed_limit.setting.runtime_modifiable,
+            values.turbo_speed_limit.setting.runtime_modifiable,
+            values.use_docked_mode.setting.runtime_modifiable,
+            values.device_name.runtime_modifiable,
+        ] {
+            assert!(runtime_editable);
+        }
+    }
+
+    #[test]
+    fn active_session_rejects_startup_changes_but_allows_speed_changes() {
+        let mut values = common::settings::Values::default();
+        w::SettingEditPolicy::new(&values.use_multi_core, false, true)
+            .apply(&mut values.use_multi_core, false);
+        assert!(*values.use_multi_core.get_value());
+        w::SettingEditPolicy::new(&values.program_args, false, true)
+            .apply(&mut values.program_args, "--synthetic".to_string());
+        assert!(values.program_args.get_value().is_empty());
+        w::SettingEditPolicy::new(&values.speed_limit, false, true)
+            .apply(&mut values.speed_limit, 75);
+        assert_eq!(*values.speed_limit.get_value(), 75);
+        values.speed_limit.set_global(false);
+        values.speed_limit.set_value(120);
+        w::SettingEditPolicy::new(&values.speed_limit, false, true)
+            .apply(&mut values.speed_limit, 80);
+        assert_eq!(*values.speed_limit.get_value(), 120);
+        assert_eq!(*values.speed_limit.get_value_global(), 75);
+    }
 
     #[test]
     fn civil_date_conversions_round_trip() {

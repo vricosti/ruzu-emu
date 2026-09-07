@@ -92,7 +92,7 @@ impl ConfigurePerGame {
             configure_graphics::page(advanced_graphics.expose_compute_option, runtime_lock);
         let pages = vec![
             configure_per_game_addons::page(properties.title_id, &properties.path),
-            configure_system::page(),
+            configure_system::page(runtime_lock),
             configure_cpu::page(runtime_lock),
             graphics,
             advanced_graphics.page,

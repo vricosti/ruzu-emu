@@ -156,7 +156,7 @@ impl ConfigureDialog {
             Section {
                 name: "System",
                 pages: vec![
-                    configure_system::page(),
+                    configure_system::page(runtime_lock),
                     configure_profile_manager::page(),
                     configure_network::page(),
                     configure_filesystem::page(),

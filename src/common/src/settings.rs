@@ -981,7 +981,7 @@ impl Default for Values {
                 Renderer,
             ),
             scaling_filter: SwitchableSetting::with_options(
-                ScalingFilter::Bilinear,
+                ScalingFilter::NearestNeighbor,
                 "scaling_filter",
                 Renderer,
                 Specialization::DEFAULT,
@@ -1992,7 +1992,10 @@ mod tests {
         assert_eq!(*values.vulkan_device.get_value(), 0);
         assert_eq!(*values.resolution_setup.get_value(), ResolutionSetup::Res1X);
         assert_eq!(*values.vsync_mode.get_value(), VSyncMode::Fifo);
-        assert_eq!(*values.scaling_filter.get_value(), ScalingFilter::Bilinear);
+        assert_eq!(
+            *values.scaling_filter.get_value(),
+            ScalingFilter::NearestNeighbor
+        );
         assert_eq!(
             *values.fsr_sharpening_slider.get_value(),
             if cfg!(target_os = "android") { 0 } else { 25 }

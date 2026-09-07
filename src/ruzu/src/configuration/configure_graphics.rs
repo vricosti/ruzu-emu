@@ -154,6 +154,57 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
     settings.append(&fullscreen_row);
     settings.append(&bg_row);
 
+    // Eden's generic Renderer widgets use per-setting runtime edit rules.
+    // Keep the separately managed Vulkan device, VSync and RGB paths below.
+    let backend_policy = w::SettingEditPolicy::new(
+        &common::settings::values().renderer_backend,
+        runtime_lock,
+        configuring_global,
+    );
+    backend_row.set_sensitive(backend_policy.sensitive);
+    let async_gpu_policy = w::SettingEditPolicy::new(
+        &common::settings::values().use_asynchronous_gpu_emulation,
+        runtime_lock,
+        configuring_global,
+    );
+    async_gpu.set_sensitive(async_gpu_policy.sensitive);
+    let fullscreen_policy = w::SettingEditPolicy::new(
+        &common::settings::values().fullscreen_mode,
+        runtime_lock,
+        configuring_global,
+    );
+    fullscreen_row.set_sensitive(fullscreen_policy.sensitive);
+    let aspect_policy = w::SettingEditPolicy::new(
+        &common::settings::values().aspect_ratio,
+        runtime_lock,
+        configuring_global,
+    );
+    aspect_row.set_sensitive(aspect_policy.sensitive);
+    let resolution_policy = w::SettingEditPolicy::new(
+        &common::settings::values().resolution_setup,
+        runtime_lock,
+        configuring_global,
+    );
+    resolution_row.set_sensitive(resolution_policy.sensitive);
+    let filter_policy = w::SettingEditPolicy::new(
+        &common::settings::values().scaling_filter,
+        runtime_lock,
+        configuring_global,
+    );
+    filter_row.set_sensitive(filter_policy.sensitive);
+    let aa_policy = w::SettingEditPolicy::new(
+        &common::settings::values().anti_aliasing,
+        runtime_lock,
+        configuring_global,
+    );
+    aa_row.set_sensitive(aa_policy.sensitive);
+    let sharpness_policy = w::SettingEditPolicy::new(
+        &common::settings::values().fsr_sharpening_slider,
+        runtime_lock,
+        configuring_global,
+    );
+    sharpness_row.set_sensitive(sharpness_policy.sensitive);
+
     column.append(&settings_group);
 
     // Reveal the Vulkan device row only when the selected API is Vulkan.
@@ -216,7 +267,7 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
         let rgba = bg_color.rgba();
 
         let mut values = common::settings::values_mut();
-        values.renderer_backend.set_value(backend_value);
+        backend_policy.apply(&mut values.renderer_backend, backend_value);
         // Upstream `ConfigureGraphics::ApplyConfiguration` only publishes the
         // physical-device combobox while Vulkan is the selected backend. The
         // hidden row must not overwrite a stored Vulkan device when applying
@@ -224,18 +275,18 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
         if updates_vulkan_device(backend_value) {
             values.vulkan_device.set_value(device_index);
         }
-        values.use_asynchronous_gpu_emulation.set_value(async_value);
+        async_gpu_policy.apply(&mut values.use_asynchronous_gpu_emulation, async_value);
         if backend_value != RendererBackend::Null {
             if let Some(mode) = vsync_value {
                 values.vsync_mode.set_value(mode);
             }
         }
-        values.fullscreen_mode.set_value(fullscreen_value);
-        values.aspect_ratio.set_value(aspect_value);
-        values.resolution_setup.set_value(resolution_value);
-        values.scaling_filter.set_value(filter_value);
-        values.anti_aliasing.set_value(aa_value);
-        values.fsr_sharpening_slider.set_value(sharpness_value);
+        fullscreen_policy.apply(&mut values.fullscreen_mode, fullscreen_value);
+        aspect_policy.apply(&mut values.aspect_ratio, aspect_value);
+        resolution_policy.apply(&mut values.resolution_setup, resolution_value);
+        filter_policy.apply(&mut values.scaling_filter, filter_value);
+        aa_policy.apply(&mut values.anti_aliasing, aa_value);
+        sharpness_policy.apply(&mut values.fsr_sharpening_slider, sharpness_value);
         values.bg_red.set_value((rgba.red() * 255.0).round() as u8);
         values
             .bg_green
@@ -392,6 +443,43 @@ fn background_rgba() -> gtk::gdk::RGBA {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_edits_reject_backend_and_resolution_but_allow_filter() {
+        use common::settings_enums::{ResolutionSetup, ScalingFilter};
+        let mut values = common::settings::Values::default();
+        let backend = *values.renderer_backend.get_value();
+        w::SettingEditPolicy::new(&values.renderer_backend, false, true)
+            .apply(&mut values.renderer_backend, RendererBackend::Null);
+        assert_eq!(*values.renderer_backend.get_value(), backend);
+        w::SettingEditPolicy::new(&values.resolution_setup, false, true)
+            .apply(&mut values.resolution_setup, ResolutionSetup::Res2X);
+        assert_eq!(*values.resolution_setup.get_value(), ResolutionSetup::Res1X);
+        w::SettingEditPolicy::new(&values.scaling_filter, false, true)
+            .apply(&mut values.scaling_filter, ScalingFilter::Bicubic);
+        assert_eq!(*values.scaling_filter.get_value(), ScalingFilter::Bicubic);
+    }
+
+    #[test]
+    fn primary_graphics_runtime_metadata_matches_upstream() {
+        let values = common::settings::Values::default();
+        for flag in [
+            values.renderer_backend.setting.runtime_modifiable,
+            values.use_asynchronous_gpu_emulation.setting.runtime_modifiable,
+            values.resolution_setup.setting.runtime_modifiable,
+        ] {
+            assert!(!flag);
+        }
+        for flag in [
+            values.fullscreen_mode.setting.runtime_modifiable,
+            values.aspect_ratio.setting.runtime_modifiable,
+            values.scaling_filter.setting.runtime_modifiable,
+            values.anti_aliasing.setting.runtime_modifiable,
+            values.fsr_sharpening_slider.setting.runtime_modifiable,
+        ] {
+            assert!(flag);
+        }
+    }
 
     #[test]
     fn vsync_setting_present_mode_round_trip_matches_upstream() {

@@ -2420,8 +2420,9 @@ impl GMainWindow {
         }
 
         let filter = gtk::FileFilter::new();
-        filter.set_name(Some("Decryption Keys (*.keys)"));
+        filter.set_name(Some(&crate::i18n::tr("Decryption Keys (*.keys, *.zip)")));
         filter.add_pattern("*.keys");
+        filter.add_pattern("*.[zZ][iI][pP]");
 
         log::info!("Install Decryption Keys: opening file chooser");
         crate::gtk_compat::open_file(
@@ -2451,7 +2452,7 @@ impl GMainWindow {
         );
     }
 
-    /// Install the selected key file and the adjacent optional key files.
+    /// Install a key file and adjacent optional files, or their ZIP equivalent.
     fn install_decryption_keys_from_then(
         self: &Rc<Self>,
         prod_keys: &std::path::Path,
@@ -2465,6 +2466,7 @@ impl GMainWindow {
         }
 
         let message = match result {
+            KeyInstallResult::ErrorInvalidArchive => "Unable to read keys ZIP. Choose an archive containing exactly one prod.keys file; folders inside the archive are supported.",
             KeyInstallResult::Success => "Decryption Keys were successfully installed",
             KeyInstallResult::InvalidDir => "Unable to read key directory, aborting",
             KeyInstallResult::ErrorFailedCopy => "One or more keys failed to copy.",

@@ -781,6 +781,7 @@ dependencies = [
  "core",
  "log",
  "tempfile",
+ "zip",
 ]
 
 [[package]]

@@ -43,6 +43,8 @@ const PAGE_RENDER: &str = "render";
 
 /// Default window geometry, mirroring `main.ui` (`1280 x 720`).
 const DEFAULT_WIDTH: i32 = 1280;
+// MainWindow::default_mouse_hide_timeout (milliseconds).
+const DEFAULT_MOUSE_HIDE_TIMEOUT: u64 = 2500;
 const DEFAULT_HEIGHT: i32 = 720;
 
 fn idle_window_title() -> String {
@@ -409,6 +411,7 @@ pub struct GMainWindow {
     /// Native render-window handles for the running game, so it can be resized
     /// when the GTK window resizes.
     render: RefCell<Option<RenderHandles>>,
+    mouse_hide_timer: RefCell<Option<glib::SourceId>>,
     /// Last native render rectangle, including origin and DPI, so the child
     /// surface cannot drift over the menu/status bars after a restore.
     render_geometry: Cell<Option<RenderGeometry>>,
@@ -1260,6 +1263,7 @@ impl GMainWindow {
             tas_state: Cell::new(input_common::drivers::tas_input::TasState::Stopped),
             is_amiibo_file_select_active: Cell::new(false),
             render: RefCell::new(None),
+            mouse_hide_timer: RefCell::new(None),
             render_geometry: Cell::new(None),
             configure_dialog: RefCell::new(None),
             game_list: RefCell::new(None),
@@ -1414,6 +1418,12 @@ impl GMainWindow {
                     handles.emu_window.set_shown(false);
                 }
             }
+        ));
+
+        this.stack.connect_visible_child_name_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            this,
+            move |_| this.show_mouse_cursor()
         ));
 
         // Keep the embedded render surface sized to the central stack as the
@@ -1967,6 +1977,7 @@ impl GMainWindow {
             self,
             move |gesture, _press_count, x, y| {
                 this.on_mouse_button_pressed(gesture.current_button(), x, y);
+                this.on_mouse_activity();
             }
         ));
         clicks.connect_released(glib::clone!(
@@ -1985,6 +1996,7 @@ impl GMainWindow {
             self,
             move |_, x, y| {
                 this.on_mouse_motion(x, y);
+                this.on_mouse_activity();
             }
         ));
         self.window.add_controller(motion);
@@ -2004,6 +2016,48 @@ impl GMainWindow {
             }
         ));
         self.window.add_controller(scroll);
+    }
+
+    /// MainWindow::ShowMouseCursor. GTK owns the cursor over the render area;
+    /// menus and modal dialogs keep their own cursor. A one-shot GLib source
+    /// replaces Qt's restarted timer without periodic wakeups once hidden.
+    fn show_mouse_cursor(self: &Rc<Self>) {
+        if let Some(timer) = self.mouse_hide_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        self.stack.set_cursor_from_name(None);
+        let active = self.stack.visible_child_name().as_deref() == Some(PAGE_RENDER);
+        let enabled = crate::uisettings::with(|values| *values.hide_mouse.get_value());
+        if !should_hide_mouse(active, enabled) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let timer = glib::timeout_add_local_once(
+            std::time::Duration::from_millis(DEFAULT_MOUSE_HIDE_TIMEOUT),
+            move || {
+                if let Some(this) = weak.upgrade() {
+                    this.mouse_hide_timer.borrow_mut().take();
+                    this.hide_mouse_cursor();
+                }
+            },
+        );
+        *self.mouse_hide_timer.borrow_mut() = Some(timer);
+    }
+
+    /// MainWindow::HideMouseCursor; recheck the live setting at expiration.
+    fn hide_mouse_cursor(&self) {
+        let active = self.stack.visible_child_name().as_deref() == Some(PAGE_RENDER);
+        let enabled = crate::uisettings::with(|values| *values.hide_mouse.get_value());
+        self.stack.set_cursor_from_name(
+            should_hide_mouse(active, enabled).then_some("none"),
+        );
+    }
+
+    /// MainWindow::OnMouseActivity.
+    fn on_mouse_activity(self: &Rc<Self>) {
+        if !*common::settings::values().mouse_panning.get_value() {
+            self.show_mouse_cursor();
+        }
     }
 
     /// Port of `GRenderWindow::focusOutEvent`.
@@ -3247,6 +3301,7 @@ impl GMainWindow {
                     crate::hotkeys::apply_accelerators(&app);
                 }
                 this.status_bar.refresh();
+                this.show_mouse_cursor();
                 if crate::uisettings::take_game_list_reload_pending() {
                     let game_list = this.game_list.borrow().clone();
                     if let Some(game_list) = game_list {
@@ -3276,7 +3331,7 @@ impl GMainWindow {
 
     /// MainWindow::OnConfigure's reset branch. The dialog has stopped input
     /// configuration and closed without applying any pending page values.
-    fn reset_configuration(&self) -> std::io::Result<()> {
+    fn reset_configuration(self: &Rc<Self>) -> std::io::Result<()> {
         use common::fs::path_util::{get_ruzu_path, RuzuPath};
         use crate::configuration::qt_config as config;
         reset_configuration_files(
@@ -3325,6 +3380,7 @@ impl GMainWindow {
         self.window.unmaximize();
         self.window.set_decorated(true);
         self.update_fullscreen_chrome(false);
+        self.show_mouse_cursor();
         if let Some(game_list) = self.game_list.borrow().as_ref() {
             game_list.set_filter_visible(crate::uisettings::with(|v| *v.show_filter_bar.get_value()));
             game_list.reload();
@@ -5389,6 +5445,10 @@ fn blue_accent_theme_variant(theme_name: &str, dark: bool) -> Option<&'static st
     Some(if dark { "Yaru-blue-dark" } else { "Yaru-blue" })
 }
 
+fn should_hide_mouse(render_visible: bool, enabled: bool) -> bool {
+    render_visible && enabled
+}
+
 // Files owned by MainWindow::OnConfigure's defaults reset. Never traverse
 // a symlink at a reset target, which might refer to another emulator's data.
 fn reset_configuration_files(config_dir: &std::path::Path, cache_dir: &std::path::Path) -> std::io::Result<()> {
@@ -5429,6 +5489,15 @@ fn reset_configuration_files(config_dir: &std::path::Path, cache_dir: &std::path
 #[cfg(test)]
 mod reset_configuration_tests {
     use super::reset_configuration_files;
+
+    #[test]
+    fn cursor_hiding_requires_both_rendering_and_the_user_preference() {
+        assert_eq!(super::DEFAULT_MOUSE_HIDE_TIMEOUT, 2500);
+        assert!(super::should_hide_mouse(true, true));
+        assert!(!super::should_hide_mouse(true, false));
+        assert!(!super::should_hide_mouse(false, true));
+        assert!(!super::should_hide_mouse(false, false));
+    }
 
     #[test]
     fn reset_removes_only_configuration_and_game_list_cache() {

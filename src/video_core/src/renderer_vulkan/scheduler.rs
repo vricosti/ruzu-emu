@@ -293,11 +293,69 @@ pub struct Scheduler {
     worker: Option<Arc<SchedulerWorker>>,
     worker_thread: Option<std::thread::JoinHandle<()>>,
 
+    // Only pacing is shared with presentation; command recording remains
+    // exclusively owned by the GPU thread.
+    frame_pacing: Arc<Mutex<FramePacing>>,
+}
+
+/// Mechanical split of Scheduler::Wait's wall-clock pacing state. Eden calls
+/// Wait from presentation too; Rust must not share the mutable command recorder.
+pub struct FramePacing {
     frame_interval: Duration,
     start_time: Instant,
     last_target_fps: f64,
     max_frame_count: u64,
     frame_counter: u64,
+}
+
+impl FramePacing {
+    fn new(now: Instant) -> Self {
+        Self {
+            frame_interval: Duration::ZERO,
+            start_time: now,
+            last_target_fps: 0.0,
+            max_frame_count: 0,
+            frame_counter: 0,
+        }
+    }
+
+    fn deadline(&mut self, now: Instant, enabled: bool, target_fps: f64) -> Option<Instant> {
+        if !enabled || target_fps <= 0.0 {
+            return None;
+        }
+        if self.last_target_fps != target_fps {
+            self.frame_interval = Duration::from_secs_f64(1.0 / target_fps);
+            self.max_frame_count = (0.1 * target_fps) as u64;
+            self.last_target_fps = target_fps;
+            self.frame_counter = 0;
+            self.start_time = now;
+        }
+        self.frame_counter += 1;
+        let target_time = self.start_time + self.frame_interval.mul_f64(self.frame_counter as f64);
+        if target_time >= now {
+            Some(target_time)
+        } else {
+            if self.frame_counter > self.max_frame_count {
+                self.frame_counter = 0;
+                self.start_time = now;
+            }
+            None
+        }
+    }
+
+    pub fn wait(&mut self, target_fps: f64) {
+        let enabled = *common::settings::values().use_speed_limit.get_value();
+        let now = Instant::now();
+        if let Some(target_time) = self.deadline(now, enabled, target_fps) {
+            let sleep_time = target_time.duration_since(now);
+            if sleep_time > Duration::from_millis(2) {
+                std::thread::sleep(sleep_time - Duration::from_millis(1));
+            }
+            while Instant::now() < target_time {
+                std::thread::yield_now();
+            }
+        }
+    }
 }
 
 struct SchedulerWorker {
@@ -647,16 +705,16 @@ impl Scheduler {
             query_runtime_state: None,
             worker: Some(worker),
             worker_thread: Some(worker_thread),
-            frame_interval: Duration::ZERO,
-            start_time: Instant::now(),
-            last_target_fps: 0.0,
-            max_frame_count: 0,
-            frame_counter: 0,
+            frame_pacing: Arc::new(Mutex::new(FramePacing::new(Instant::now()))),
         })
     }
 
     pub fn submit_mutex(&self) -> Arc<Mutex<()>> {
         Arc::clone(&self.submit_mutex)
+    }
+
+    pub fn frame_pacing(&self) -> Arc<Mutex<FramePacing>> {
+        Arc::clone(&self.frame_pacing)
     }
 
     /// Port of upstream `Scheduler::RegisterOnSubmit`.
@@ -1256,30 +1314,8 @@ impl Scheduler {
             self.master_semaphore.wait(tick);
         }
 
-        if *common::settings::values().use_speed_limit.get_value() && target_fps > 0.0 {
-            let now = Instant::now();
-            if self.last_target_fps != target_fps {
-                self.frame_interval = Duration::from_secs_f64(1.0 / target_fps);
-                self.max_frame_count = (0.1 * target_fps) as u64;
-                self.last_target_fps = target_fps;
-                self.frame_counter = 0;
-                self.start_time = now;
-            }
-            self.frame_counter += 1;
-            let target_time =
-                self.start_time + self.frame_interval.mul_f64(self.frame_counter as f64);
-            if target_time >= now {
-                let sleep_time = target_time.duration_since(now);
-                if sleep_time > Duration::from_millis(2) {
-                    std::thread::sleep(sleep_time - Duration::from_millis(1));
-                }
-                while Instant::now() < target_time {
-                    std::thread::yield_now();
-                }
-            } else if self.frame_counter > self.max_frame_count {
-                self.frame_counter = 0;
-                self.start_time = now;
-            }
+        if target_fps > 0.0 {
+            self.frame_pacing.lock().unwrap().wait(target_fps);
         }
     }
 }
@@ -1299,6 +1335,54 @@ impl Drop for Scheduler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_pacing_deadlines_follow_each_supported_target() {
+        let now = std::time::Instant::now();
+        let mut pacing = super::FramePacing::new(now);
+        for fps in [30.0, 60.0, 90.0, 120.0] {
+            let interval = std::time::Duration::from_secs_f64(1.0 / fps);
+            assert_eq!(pacing.deadline(now, true, fps), Some(now + interval));
+            assert_eq!(pacing.deadline(now, true, fps), Some(now + interval * 2));
+        }
+    }
+
+    #[test]
+    fn frame_pacing_auto_and_unlimited_do_not_advance_state() {
+        let now = std::time::Instant::now();
+        let mut pacing = super::FramePacing::new(now);
+        assert_eq!(pacing.deadline(now, true, 0.0), None);
+        assert_eq!(pacing.deadline(now, false, 60.0), None);
+        assert_eq!(pacing.frame_counter, 0);
+        assert_eq!(pacing.last_target_fps, 0.0);
+    }
+
+    #[test]
+    fn frame_pacing_reanchors_after_upstream_lag_threshold() {
+        let now = std::time::Instant::now();
+        let mut pacing = super::FramePacing::new(now);
+        pacing.deadline(now, true, 30.0);
+        let late = now + std::time::Duration::from_secs(1);
+        for _ in 0..2 {
+            assert_eq!(pacing.deadline(late, true, 30.0), None);
+            assert_eq!(pacing.start_time, now);
+        }
+        assert_eq!(pacing.deadline(late, true, 30.0), None);
+        assert_eq!(pacing.frame_counter, 0);
+        assert_eq!(pacing.start_time, late);
+    }
+
+    #[test]
+    fn frame_pacing_state_can_be_used_by_presentation_without_scheduler() {
+        let now = std::time::Instant::now();
+        let pacing = std::sync::Arc::new(std::sync::Mutex::new(super::FramePacing::new(now)));
+        let presentation = pacing.clone();
+        let interval = std::time::Duration::from_secs_f64(1.0 / 60.0);
+        assert_eq!(std::thread::spawn(move || {
+            presentation.lock().unwrap().deadline(now, true, 60.0)
+        }).join().unwrap(), Some(now + interval));
+        assert_eq!(pacing.lock().unwrap().deadline(now, true, 60.0), Some(now + interval * 2));
+    }
+
     use super::*;
     use ash::vk::Handle;
     use std::sync::atomic::AtomicU64;

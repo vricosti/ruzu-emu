@@ -332,6 +332,7 @@ impl RendererVulkan {
             surface_handle,
             &device,
             submit_mutex.clone(),
+            scheduler.frame_pacing(),
             initial_layout.width,
             initial_layout.height,
         )?;

@@ -229,34 +229,11 @@ fn main() -> glib::ExitCode {
     // the main window is mapped. The explicit `migration_prompt_seen` marker,
     // rather than the eagerly-created config directory, owns first-run state.
 
-    // Load the configured game directories out of ruzu's own config, the way
-    // upstream's `Config::ReadUIValues` fills `UISettings::values.game_dirs`
-    // before the game list is built.
-    let game_dirs = configuration::qt_config::load_game_dirs();
-    log::info!("Loaded {} configured game directory(ies)", game_dirs.len());
-    uisettings::with_mut(|v| v.game_dirs = game_dirs);
-    configuration::qt_config::load_roms_path();
-    configuration::qt_config::load_external_content_dirs();
-
-    // Upstream `Config::ReadUIGamelistValues` reads the favorites array in the same
-    // pass that fills `game_dirs`.
-    let favorited_ids = configuration::qt_config::load_favorited_ids();
-    uisettings::with_mut(|v| v.favorited_ids = favorited_ids);
-    configuration::qt_config::load_favorites_expanded();
-
-    configuration::qt_config::load_ui_language();
-    configuration::qt_config::load_view_values();
-    configuration::qt_config::load_multiplayer_values();
+    // QtConfig owns the complete reload, including controls and frontend state.
+    configuration::qt_config::reload_all_values();
     let interface_language = uisettings::with(|v| v.language.get_value().clone());
     i18n::set_language(&interface_language);
     i18n::configure_toolkit_language(&interface_language);
-
-    // Upstream's `Config` constructor reads every category, controls included,
-    // before the window is built. Without this the Controls page would open on
-    // an empty mapping even though one was saved last session.
-    configuration::qt_config::load_global_values();
-    configuration::qt_config::load_control_values();
-    configuration::qt_config::load_shortcut_values();
 
     // Upstream constructs `QApplication app(argc, argv)`. We register handling
     // of file arguments ourselves later (open a game passed on the command

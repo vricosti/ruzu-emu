@@ -52,6 +52,26 @@ pub fn config_path() -> PathBuf {
     get_ruzu_path(RuzuPath::ConfigDir).join("qt-config.ini")
 }
 
+/// QtConfig::ReloadAllValues / ReadQtValues. Keep the complete frontend reload
+/// in its configuration owner so startup and a defaults reset use the same path.
+/// The existing GTK readers remain specialized by category, as upstream.
+pub fn reload_all_values() {
+    let game_dirs = load_game_dirs();
+    log::info!("Loaded {} configured game directory(ies)", game_dirs.len());
+    uisettings::with_mut(|values| values.game_dirs = game_dirs);
+    load_roms_path();
+    load_external_content_dirs();
+    let favorited_ids = load_favorited_ids();
+    uisettings::with_mut(|values| values.favorited_ids = favorited_ids);
+    load_favorites_expanded();
+    load_ui_language();
+    load_view_values();
+    load_multiplayer_values();
+    load_global_values();
+    load_control_values();
+    load_shortcut_values();
+}
+
 /// Read the generic global categories through upstream's `Config::ReadValues`
 /// owner. Qt-owned controls are loaded separately after this pass, matching
 /// `QtConfig::ReadQtValues` ordering.
@@ -1535,6 +1555,50 @@ fn is_true(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_reload_reads_core_and_frontend_in_an_isolated_process() {
+        const CHILD: &str = "RUZU_TEST_COMPLETE_CONFIG_RELOAD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            common::fs::path_util::set_ruzu_path(RuzuPath::ConfigDir, &root);
+            let document = concat!(
+                "[Audio]\nvolume\\default=false\nvolume=42\n",
+                "[UI]\nhideInactiveMouse\\default=false\nhideInactiveMouse=false\n",
+                "Paths\\gamedirs\\size=1\n",
+                "Paths\\gamedirs\\1\\path=/synthetic/homebrew\n",
+            );
+            std::fs::write(config_path(), document).unwrap();
+            reload_all_values();
+            assert_eq!(*common::settings::values().volume.get_value(), 42);
+            uisettings::with(|values| {
+                assert!(!*values.hide_mouse.get_value());
+                assert_eq!(values.game_dirs.len(), 1);
+                assert_eq!(values.game_dirs[0].path, "/synthetic/homebrew");
+                assert!(!values.shortcuts.is_empty());
+            });
+            // Re-read an empty document as the reset path will: stale live
+            // values must not survive simply because an INI key is absent.
+            std::fs::write(config_path(), "").unwrap();
+            reload_all_values();
+            assert_eq!(*common::settings::values().volume.get_value(), 100);
+            uisettings::with(|values| {
+                assert!(*values.hide_mouse.get_value());
+                assert!(values.game_dirs.is_empty());
+            });
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "configuration::qt_config::tests::complete_reload_reads_core_and_frontend_in_an_isolated_process", "--test-threads=1"])
+            .env(CHILD, root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn all_frontend_scalar_settings_survive_disk_roundtrip() {

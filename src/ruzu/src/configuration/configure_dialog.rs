@@ -174,7 +174,7 @@ impl ConfigureDialog {
                 pages: vec![
                     graphics,
                     advanced_graphics.page,
-                    configure_graphics_extensions::page(),
+                    configure_graphics_extensions::page(runtime_lock),
                 ],
                 apply: apply_pages,
             },

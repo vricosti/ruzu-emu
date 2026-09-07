@@ -1179,7 +1179,7 @@ impl Default for Values {
             fix_bloom_effects: SwitchableSetting::new(false, "fix_bloom_effects", RendererHacks),
             emulate_bgr565: SwitchableSetting::new(false, "emulate_bgr565", RendererHacks),
             rescale_hack: SwitchableSetting::new(
-                cfg!(target_os = "android"),
+                false,
                 "rescale_hack",
                 RendererHacks,
             ),
@@ -1219,12 +1219,15 @@ impl Default for Values {
                 "dyna_state",
                 RendererExtensions,
             ),
-            sample_shading: SwitchableSetting::ranged(
+            sample_shading: SwitchableSetting::ranged_with_options(
                 0,
                 0,
                 100,
                 "sample_shading_fraction",
                 RendererExtensions,
+                Specialization::SCALAR,
+                true,
+                false,
             ),
             vertex_input_dynamic_state: SwitchableSetting::new(
                 !cfg!(target_os = "android"),
@@ -2070,10 +2073,7 @@ mod tests {
         assert!(!*values.async_presentation.get_value());
         assert!(!*values.fix_bloom_effects.get_value());
         assert!(!*values.emulate_bgr565.get_value());
-        assert_eq!(
-            *values.rescale_hack.get_value(),
-            cfg!(target_os = "android")
-        );
+        assert!(!*values.rescale_hack.get_value());
         assert!(!*values.use_asynchronous_shaders.get_value());
         assert_eq!(
             *values.gpu_unswizzle_texture_size.get_value(),
@@ -2170,6 +2170,29 @@ mod tests {
         ] {
             assert!(!runtime_modifiable);
         }
+    }
+
+    #[test]
+    fn renderer_extras_runtime_metadata_matches_upstream() {
+        let values = Values::default();
+        assert!(values.skip_cpu_inner_invalidation.setting.runtime_modifiable);
+        for runtime_modifiable in [
+            values.async_presentation.setting.runtime_modifiable,
+            values.fix_bloom_effects.setting.runtime_modifiable,
+            values.emulate_bgr565.setting.runtime_modifiable,
+            values.rescale_hack.setting.runtime_modifiable,
+            values.use_asynchronous_shaders.setting.runtime_modifiable,
+            values.gpu_unswizzle_texture_size.setting.runtime_modifiable,
+            values.gpu_unswizzle_stream_size.setting.runtime_modifiable,
+            values.gpu_unswizzle_chunk_size.setting.runtime_modifiable,
+            values.gpu_unswizzle_enabled.setting.runtime_modifiable,
+            values.dyna_state.setting.runtime_modifiable,
+            values.sample_shading.setting.runtime_modifiable,
+            values.vertex_input_dynamic_state.setting.runtime_modifiable,
+        ] {
+            assert!(!runtime_modifiable);
+        }
+        assert_eq!(values.sample_shading.setting.specialization, Specialization::SCALAR);
     }
 
     #[test]

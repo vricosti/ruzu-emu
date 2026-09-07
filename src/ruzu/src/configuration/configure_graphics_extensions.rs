@@ -11,7 +11,7 @@ use super::shared_widget as w;
 
 /// Build the `Extras` tab in the same Hacks / Vulkan Extensions order
 /// as upstream `ConfigureGraphicsExtensions::Setup`.
-pub fn page() -> Page {
+pub fn page(runtime_lock: bool) -> Page {
     let (scroller, column) = w::page();
 
     let (hacks_group, hacks) = w::group("Hacks");
@@ -105,48 +105,121 @@ pub fn page() -> Page {
     extensions.append(&sample_row);
     extensions.append(&vertex_input);
     column.append(&extensions_group);
+    let configuring_global = common::settings::is_configuring_global();
+    let skip_cpu_inner_invalidation_policy = w::SettingEditPolicy::new(
+        &values.skip_cpu_inner_invalidation,
+        runtime_lock,
+        configuring_global,
+    );
+    skip_cpu_inner_invalidation.set_sensitive(skip_cpu_inner_invalidation_policy.sensitive);
+    let async_presentation_policy =
+        w::SettingEditPolicy::new(&values.async_presentation, runtime_lock, configuring_global);
+    async_presentation.set_sensitive(async_presentation_policy.sensitive);
+    let fix_bloom_effects_policy =
+        w::SettingEditPolicy::new(&values.fix_bloom_effects, runtime_lock, configuring_global);
+    fix_bloom_effects.set_sensitive(fix_bloom_effects_policy.sensitive);
+    let emulate_bgr565_policy =
+        w::SettingEditPolicy::new(&values.emulate_bgr565, runtime_lock, configuring_global);
+    emulate_bgr565.set_sensitive(emulate_bgr565_policy.sensitive);
+    let rescale_hack_policy =
+        w::SettingEditPolicy::new(&values.rescale_hack, runtime_lock, configuring_global);
+    rescale_hack.set_sensitive(rescale_hack_policy.sensitive);
+    let use_asynchronous_shaders_policy = w::SettingEditPolicy::new(
+        &values.use_asynchronous_shaders,
+        runtime_lock,
+        configuring_global,
+    );
+    asynchronous_shaders.set_sensitive(use_asynchronous_shaders_policy.sensitive);
+    let gpu_unswizzle_texture_size_policy = w::SettingEditPolicy::new(
+        &values.gpu_unswizzle_texture_size,
+        runtime_lock,
+        configuring_global,
+    );
+    texture_row.set_sensitive(gpu_unswizzle_texture_size_policy.sensitive);
+    let gpu_unswizzle_stream_size_policy = w::SettingEditPolicy::new(
+        &values.gpu_unswizzle_stream_size,
+        runtime_lock,
+        configuring_global,
+    );
+    stream_row.set_sensitive(gpu_unswizzle_stream_size_policy.sensitive);
+    let gpu_unswizzle_chunk_size_policy = w::SettingEditPolicy::new(
+        &values.gpu_unswizzle_chunk_size,
+        runtime_lock,
+        configuring_global,
+    );
+    chunk_row.set_sensitive(gpu_unswizzle_chunk_size_policy.sensitive);
+    let gpu_unswizzle_enabled_policy = w::SettingEditPolicy::new(
+        &values.gpu_unswizzle_enabled,
+        runtime_lock,
+        configuring_global,
+    );
+    gpu_unswizzle.set_sensitive(gpu_unswizzle_enabled_policy.sensitive);
+    let dyna_state_policy =
+        w::SettingEditPolicy::new(&values.dyna_state, runtime_lock, configuring_global);
+    dynamic_row.set_sensitive(dyna_state_policy.sensitive);
+    let sample_shading_policy =
+        w::SettingEditPolicy::new(&values.sample_shading, runtime_lock, configuring_global);
+    sample_row.set_sensitive(sample_shading_policy.sensitive);
+    let vertex_input_dynamic_state_policy = w::SettingEditPolicy::new(
+        &values.vertex_input_dynamic_state,
+        runtime_lock,
+        configuring_global,
+    );
+    vertex_input.set_sensitive(vertex_input_dynamic_state_policy.sensitive);
     drop(values);
 
     Page::new("Extras", scroller, move || {
+        let skip_cpu_inner_invalidation_value = skip_cpu_inner_invalidation.is_active();
+        let async_presentation_value = async_presentation.is_active();
+        let fix_bloom_effects_value = fix_bloom_effects.is_active();
+        let emulate_bgr565_value = emulate_bgr565.is_active();
+        let rescale_hack_value = rescale_hack.is_active();
+        let use_asynchronous_shaders_value = asynchronous_shaders.is_active();
+        let gpu_unswizzle_texture_size_value =
+            tr::value_at(tr::GPU_UNSWIZZLE_SIZE, texture_size.selected());
+        let gpu_unswizzle_stream_size_value =
+            tr::value_at(tr::GPU_UNSWIZZLE_STREAM, stream_size.selected());
+        let gpu_unswizzle_chunk_size_value =
+            tr::value_at(tr::GPU_UNSWIZZLE_CHUNK, chunk_size.selected());
+        let gpu_unswizzle_enabled_value = gpu_unswizzle.is_active();
+        let dyna_state_value = tr::value_at(tr::EXTENDED_DYNAMIC_STATE, dynamic_state.selected());
+        let sample_shading_value = sample_shading.value() as u32;
+        let vertex_input_dynamic_state_value = vertex_input.is_active();
         let mut values = common::settings::values_mut();
-        values
-            .skip_cpu_inner_invalidation
-            .set_value(skip_cpu_inner_invalidation.is_active());
-        values
-            .async_presentation
-            .set_value(async_presentation.is_active());
-        values
-            .fix_bloom_effects
-            .set_value(fix_bloom_effects.is_active());
-        values.emulate_bgr565.set_value(emulate_bgr565.is_active());
-        values.rescale_hack.set_value(rescale_hack.is_active());
-        values
-            .use_asynchronous_shaders
-            .set_value(asynchronous_shaders.is_active());
-        values.gpu_unswizzle_texture_size.set_value(tr::value_at(
-            tr::GPU_UNSWIZZLE_SIZE,
-            texture_size.selected(),
-        ));
-        values.gpu_unswizzle_stream_size.set_value(tr::value_at(
-            tr::GPU_UNSWIZZLE_STREAM,
-            stream_size.selected(),
-        ));
-        values
-            .gpu_unswizzle_chunk_size
-            .set_value(tr::value_at(tr::GPU_UNSWIZZLE_CHUNK, chunk_size.selected()));
-        values
-            .gpu_unswizzle_enabled
-            .set_value(gpu_unswizzle.is_active());
-        values.dyna_state.set_value(tr::value_at(
-            tr::EXTENDED_DYNAMIC_STATE,
-            dynamic_state.selected(),
-        ));
-        values
-            .sample_shading
-            .set_value(sample_shading.value() as u32);
-        values
-            .vertex_input_dynamic_state
-            .set_value(vertex_input.is_active());
+        skip_cpu_inner_invalidation_policy.apply(
+            &mut values.skip_cpu_inner_invalidation,
+            skip_cpu_inner_invalidation_value,
+        );
+        async_presentation_policy.apply(&mut values.async_presentation, async_presentation_value);
+        fix_bloom_effects_policy.apply(&mut values.fix_bloom_effects, fix_bloom_effects_value);
+        emulate_bgr565_policy.apply(&mut values.emulate_bgr565, emulate_bgr565_value);
+        rescale_hack_policy.apply(&mut values.rescale_hack, rescale_hack_value);
+        use_asynchronous_shaders_policy.apply(
+            &mut values.use_asynchronous_shaders,
+            use_asynchronous_shaders_value,
+        );
+        gpu_unswizzle_texture_size_policy.apply(
+            &mut values.gpu_unswizzle_texture_size,
+            gpu_unswizzle_texture_size_value,
+        );
+        gpu_unswizzle_stream_size_policy.apply(
+            &mut values.gpu_unswizzle_stream_size,
+            gpu_unswizzle_stream_size_value,
+        );
+        gpu_unswizzle_chunk_size_policy.apply(
+            &mut values.gpu_unswizzle_chunk_size,
+            gpu_unswizzle_chunk_size_value,
+        );
+        gpu_unswizzle_enabled_policy.apply(
+            &mut values.gpu_unswizzle_enabled,
+            gpu_unswizzle_enabled_value,
+        );
+        dyna_state_policy.apply(&mut values.dyna_state, dyna_state_value);
+        sample_shading_policy.apply(&mut values.sample_shading, sample_shading_value);
+        vertex_input_dynamic_state_policy.apply(
+            &mut values.vertex_input_dynamic_state,
+            vertex_input_dynamic_state_value,
+        );
     })
 }
 

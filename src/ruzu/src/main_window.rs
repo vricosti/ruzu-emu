@@ -4091,6 +4091,9 @@ impl GMainWindow {
         game_path: String,
         target: crate::util::game::ShortcutTarget,
     ) {
+        #[cfg(target_os = "macos")]
+        let arguments = format!("-g {}", gtk::glib::shell_quote(&game_path).to_string_lossy());
+        #[cfg(not(target_os = "macos"))]
         let arguments = format!("-g \"{game_path}\"");
         crate::util::game::create_shortcut(
             &self.window,
@@ -4851,6 +4854,9 @@ impl GMainWindow {
     /// Switch the central stack to the loading screen and reset its state.
     /// Mirrors the point where upstream shows `LoadingScreen` before booting.
     pub fn show_loading_screen(&self) {
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.release_focus();
+        }
         self.loading_screen.prepare();
         self.stack.set_visible_child_name(PAGE_LOADING);
     }

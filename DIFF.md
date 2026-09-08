@@ -16607,3 +16607,44 @@ unchanged.
 - A synthetic regression invokes the registered callback and checks the result,
   false output and absence of outgoing copy objects. Header and implementation
   were reread after wiring the callback.
+
+## 2026-09-08 — macOS game shortcuts: util/game.rs vs qt_common/util/game.{h,cpp}
+
+### Intentional differences
+
+- Eden's CreateShortcutLink/SaveIconToFile return false on macOS. Ruzu adds a
+  platform implementation in the same game utility owner: a Finder application
+  bundle containing an executable launcher, Info.plist and optional embedded ICNS
+  converted from the game icon with macOS sips/iconutil. No emulator or ROM is copied.
+- Desktop uses GLib's desktop special directory; Applications uses the writable
+  user Applications folder. Existing destination apps are never removed or replaced.
+  Temporary construction is cleaned on failure, then renamed into the destination.
+- The main_window.rs callback quotes the macOS game path before forwarding it.
+  The utility parses that argument list and shell-quotes each argument independently;
+  it never evaluates the original string. Windows/Linux argument handling is unchanged.
+- game_list.rs exposes the two existing shortcut actions on macOS instead of
+  Eden game/game_list.cpp's Apple exclusion. The Applications label describes a
+  folder, with French translation in i18n/menu_catalogs.json. Fullscreen confirmation and metadata
+  extraction retain the existing upstream flow.
+- Launchers reference the current executable's absolute path, so moving or removing
+  Ruzu requires recreating them. This is a launcher, not a relocatable Finder alias.
+  Bundle structure follows Apple's Bundle Programming Guide, not an Eden port.
+
+## 2026-09-08 — game_list.rs / main_window.rs: GTK list focus lifecycle
+
+### Intentional differences
+
+- Eden's game/game_list.{h,cpp} and main_window.{h,cpp} use Qt views and hide the
+  library during boot. Ruzu's GTK adaptation explicitly clears root focus when
+  it belongs to the ColumnView, before hiding it or removing rows during reload,
+  scan completion, filtering and favorites updates. Focus on other controls is
+  preserved. The helper stays with the game list; the window only requests release
+  before showing the loading page. Upstream interfaces and lifecycle reread.
+- The September 8 23:12 crash report shows SIGSEGV at address 0x18 in GTK's
+  gtk_column_view_row_widget_get_column_view, via set_focus_child and window
+  activation. GTK 4.22.4 assumes the row is still parented here. This safeguard
+  removes the library focus before rows become detached; it is not a renderer fix.
+  The exact user interaction causing the stale focus has not been reproduced.
+- A display-dependent regression checks focus removal before row deletion and
+  preservation of an unrelated entry's focus. It is ignored in the ordinary
+  Rust test harness because GTK requires the macOS main thread.

@@ -534,6 +534,10 @@ impl GameListHandle {
         self.0.column_view.grab_focus();
     }
 
+    pub fn release_focus(&self) {
+        release_list_focus(&self.0.column_view);
+    }
+
     /// Upstream `GameList::SetFilterVisible`, `SetFilterFocus`, and
     /// `ClearFilter` as driven by `GMainWindow::OnToggleFilterBar`.
     pub fn set_filter_visible(&self, visible: bool) {
@@ -930,6 +934,7 @@ impl GameListView {
 
     /// Upstream `GameList::OnTextChanged`.
     fn apply_filter(&self, text: &str) {
+        release_list_focus(&self.column_view);
         let query = text.to_lowercase();
         // Upstream hides the complete Favorites group while filtering, then
         // restores it only when at least one favorite remains.
@@ -1316,7 +1321,6 @@ impl GameListView {
                 Some("game-list.copy-title-id"),
             );
         }
-        #[cfg(not(target_os = "macos"))]
         {
             let shortcuts = gio::Menu::new();
             shortcuts.append(
@@ -1324,7 +1328,11 @@ impl GameListView {
                 Some("game-list.shortcut-desktop"),
             );
             shortcuts.append(
-                Some(&crate::i18n::tr("Add to Applications Menu")),
+                Some(&crate::i18n::tr(if cfg!(target_os = "macos") {
+                    "Add to Applications Folder"
+                } else {
+                    "Add to Applications Menu"
+                })),
                 Some("game-list.shortcut-applications"),
             );
             commands.append_submenu(Some(&crate::i18n::tr("Create Shortcut")), &shortcuts);
@@ -1432,7 +1440,6 @@ impl GameListView {
         }
         actions.add_action(&remove_play_time);
 
-        #[cfg(not(target_os = "macos"))]
         for (name, target) in [
             (
                 "shortcut-desktop",
@@ -1701,7 +1708,10 @@ impl GameListView {
                     }
                 });
             }
-            (false, Some(position)) => self.store.remove(position),
+            (false, Some(position)) => {
+                release_list_focus(&self.column_view);
+                self.store.remove(position);
+            }
             _ => {}
         }
     }
@@ -1709,6 +1719,7 @@ impl GameListView {
     /// Upstream `GameList::AddFavorite`: rebuild cloned rows in configured-id
     /// order from the already scanned directory entries.
     fn rebuild_favorites(&self) {
+        release_list_focus(&self.column_view);
         let ids = uisettings::with(|values| values.favorited_ids.clone());
         let favorites = favorite_entries(&ids, &self.all_games.borrow());
         self.favorites.remove_all();
@@ -1762,6 +1773,7 @@ impl GameListView {
     /// Rescan every configured directory and rebuild the tree — upstream
     /// re-runs `GameListWorker` after the directory list changes.
     fn reload(&self) {
+        release_list_focus(&self.column_view);
         self.update_column_visibility();
         uisettings::with(|values| update_toolbar_icons(&self.add_directory_icon,
             &self.refresh_icon, values.theme.get_value()));
@@ -1853,6 +1865,7 @@ impl GameListView {
         let result = take_current_scan_result(&self.scan_result_receiver.borrow(), generation);
         let Some(result) = result else { return };
 
+        release_list_focus(&self.column_view);
         self.store.remove_all();
         self.all_games.borrow_mut().clear();
 
@@ -2151,6 +2164,17 @@ const SELECTION_BG: &str = "#308CC6";
 /// Alternating-row shade, likewise sampled from yuzu (`#F7F7F7` over white).
 /// Expressed as a shade factor so it also works on a dark theme.
 const ALTERNATE_ROW_SHADE: f32 = 0.97;
+
+// GTK's macOS activation path restores the focus-child chain. Clear it while
+// rows are still parented, before hiding the list or removing its model rows.
+// Do not steal focus from the filter entry or another frontend control.
+fn release_list_focus(view: &gtk::ColumnView) {
+    let Some(root) = view.root() else { return };
+    let Some(focus) = root.focus() else { return };
+    if focus == *view.upcast_ref::<gtk::Widget>() || focus.is_ancestor(view) {
+        root.set_focus(None::<&gtk::Widget>);
+    }
+}
 
 /// The "Name" column: expander, icon, and label, so a directory row can be
 /// collapsed and its games are indented under it. Upstream likewise puts the
@@ -2890,6 +2914,47 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK on the platform main thread and a display"]
+    fn list_focus_is_released_before_rows_are_removed_but_other_focus_is_preserved() {
+        gtk::init().unwrap();
+        let model = gtk::StringList::new(&["Game"]);
+        let selection = gtk::SingleSelection::new(Some(model.clone()));
+        let view = gtk::ColumnView::new(Some(selection));
+        let factory = gtk::SignalListItemFactory::new();
+        let cell = Rc::new(RefCell::new(None::<gtk::Label>));
+        factory.connect_setup({
+            let cell = Rc::clone(&cell);
+            move |_, item| {
+                let label = gtk::Label::new(Some("Game"));
+                label.set_focusable(true);
+                item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&label));
+                *cell.borrow_mut() = Some(label);
+            }
+        });
+        view.append_column(&gtk::ColumnViewColumn::new(Some("Name"), Some(factory)));
+        let entry = gtk::Entry::new();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&entry);
+        content.append(&view);
+        let window = gtk::Window::builder().child(&content).build();
+        window.present();
+        let context = glib::MainContext::default();
+        while context.pending() { context.iteration(false); }
+        let label = cell.borrow().clone().expect("list cell created");
+        gtk::prelude::RootExt::set_focus(&window, Some(&label));
+        assert_eq!(gtk::prelude::RootExt::focus(&window), Some(label.upcast()));
+        release_list_focus(&view);
+        assert!(gtk::prelude::RootExt::focus(&window).is_none());
+        model.splice(0, 1, &[]);
+        gtk::prelude::RootExt::set_focus(&window, Some(&entry));
+        let previous = gtk::prelude::RootExt::focus(&window);
+        release_list_focus(&view);
+        assert_eq!(gtk::prelude::RootExt::focus(&window), previous);
+        window.destroy();
+        release_list_focus(&gtk::ColumnView::new(None::<gtk::SingleSelection>));
+    }
 
     #[test]
     fn save_folder_uses_configured_root_selected_user_and_existing_layout() {

@@ -64,6 +64,36 @@ fn format_title_version(mut version: u32) -> String {
     format!("v{}.{}.{}", bytes[3], bytes[2], bytes[1])
 }
 
+/// Upstream `GetUpdateVersionStringFromSlot`. The Rust provider exposes slot
+/// access through the union instead of returning a borrowed slot provider.
+fn get_update_version_string_from_slot(
+    provider: &dyn ContentProvider,
+    slot: ContentProviderUnionSlot,
+    update_tid: u64,
+) -> String {
+    let Some(file) = provider.get_entry_raw_from_slot(slot, update_tid, ContentRecordType::Control) else {
+        return String::new();
+    };
+    let control = NCA::new(file, None);
+    if control.get_status() != super::partition_filesystem::ResultStatus::Success {
+        return String::new();
+    }
+    read_update_version_from_romfs(control.get_romfs())
+}
+
+/// Mechanical extraction of the RomFS-reading portion of the upstream helper,
+/// kept here so its filename rules can be tested without encryption keys.
+fn read_update_version_from_romfs(romfs: Option<VirtualFile>) -> String {
+    let Some(extracted) = extract_romfs(romfs) else {
+        return String::new();
+    };
+    extracted
+        .get_file("control.nacp")
+        .or_else(|| extracted.get_file("Control.nacp"))
+        .map(|file| NACP::from_file(&file).get_version_string())
+        .unwrap_or_default()
+}
+
 // ============================================================================
 // Helper functions
 // ============================================================================
@@ -504,7 +534,7 @@ impl<'a> PatchManager<'a> {
                         let this_build_id: String = compiler
                             .get_build_id()
                             .iter()
-                            .map(|b| format!("{:02x}", b))
+                            .map(|b| format!("{:02X}", b))
                             .collect();
                         let this_build_id = format!("{:0<64}", this_build_id);
                         if nso_build_id == this_build_id {
@@ -545,7 +575,7 @@ impl<'a> PatchManager<'a> {
         let build_id_raw: String = header
             .build_id
             .iter()
-            .map(|b| format!("{:02x}", b))
+            .map(|b| format!("{:02X}", b))
             .collect();
         let build_id = build_id_raw.trim_end_matches('0').to_string();
 
@@ -649,7 +679,7 @@ impl<'a> PatchManager<'a> {
     /// Check if PatchNSO would have any effect given the NSO's build ID.
     /// Corresponds to upstream `PatchManager::HasNSOPatch`.
     pub fn has_nso_patch(&self, build_id: &BuildId, name: &str) -> bool {
-        let build_id_raw: String = build_id.iter().map(|b| format!("{:02x}", b)).collect();
+        let build_id_raw: String = build_id.iter().map(|b| format!("{:02X}", b)).collect();
         let build_id_str = build_id_raw.trim_end_matches('0').to_string();
 
         log::info!(
@@ -808,16 +838,18 @@ impl<'a> PatchManager<'a> {
                     ContentProviderUnionSlot::External => continue,
                     ContentProviderUnionSlot::FrontendManual => continue,
                 };
+                let mut version = get_update_version_string_from_slot(provider, slot, update_tid);
                 let numeric_version = provider
                     .get_entry_version_from_slot(slot, update_tid)
                     .unwrap_or(0);
+                if version.is_empty() && numeric_version != 0 {
+                    version = format_title_version(numeric_version);
+                }
                 let name = format!("Update{suffix}");
                 out.push(Patch {
                     enabled: !disabled.contains(&name),
                     name,
-                    version: (numeric_version != 0)
-                        .then(|| format_title_version(numeric_version))
-                        .unwrap_or_default(),
+                    version,
                     patch_type: PatchType::Update,
                     program_id: self.title_id,
                     title_id: update_tid,
@@ -1290,6 +1322,33 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    #[test]
+    fn update_display_version_reads_control_metadata_from_romfs() {
+        use super::super::control_metadata::RawNACP;
+        let make_control = |name: &str, version: &[u8]| -> VirtualFile {
+            let mut data = vec![0; std::mem::size_of::<RawNACP>()];
+            let offset = std::mem::offset_of!(RawNACP, version_string);
+            data[offset..offset + version.len()].copy_from_slice(version);
+            Arc::new(VectorVfsFile::new(data, name.to_owned(), None))
+        };
+        for files in [
+            vec![make_control("control.nacp", b"3.2.1")],
+            vec![make_control("Control.nacp", b"3.2.1")],
+            vec![make_control("control.nacp", b"3.2.1"), make_control("Control.nacp", b"9.0.0")],
+        ] {
+            let directory: VirtualDir = Arc::new(VectorVfsDirectory::new(
+                files, Vec::new(), "metadata".to_owned(), None,
+            ));
+            let romfs = create_romfs(Some(directory), None).expect("synthetic RomFS");
+            assert_eq!(read_update_version_from_romfs(Some(romfs)), "3.2.1");
+        }
+        assert_eq!(read_update_version_from_romfs(None), "");
+        let directory: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            Vec::new(), Vec::new(), "metadata".to_owned(), None,
+        ));
+        assert_eq!(read_update_version_from_romfs(create_romfs(Some(directory), None)), "");
+    }
+
     struct RecordingContentProvider {
         control_requests: Mutex<Vec<u64>>,
     }
@@ -1336,6 +1395,153 @@ mod tests {
         fn supports_origin_tracking(&self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn dump_settings_export_exefs_after_layers_and_nso_before_patches() {
+        const ROOT: &str = "RUZU_TEST_PATCH_DUMP_ROOT";
+        let root = match std::env::var_os(ROOT) {
+            Some(root) => std::path::PathBuf::from(root),
+            None => {
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let root = std::env::temp_dir().join(format!(
+                    "ruzu-patch-dump-{}-{nonce}",
+                    std::process::id()
+                ));
+                std::fs::create_dir(&root).unwrap();
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", std::thread::current().name().unwrap()])
+                    .env(ROOT, &root)
+                    .status()
+                    .unwrap();
+                std::fs::remove_dir_all(&root).unwrap();
+                assert!(status.success());
+                return;
+            }
+        };
+        use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
+        use crate::file_sys::{bis_factory::BisFactory, fs_filesystem::OpenMode};
+
+        let filesystem = RealVfsFilesystem::new();
+        let directory = |name: &str| {
+            filesystem
+                .arc_create_directory(root.join(name).to_str().unwrap(), OpenMode::READ_WRITE)
+                .unwrap()
+        };
+        let mut controller = FileSystemController::new();
+        controller.set_bis_factory(BisFactory::new(
+            directory("nand"),
+            directory("load"),
+            directory("dump"),
+        ));
+        let provider = RecordingContentProvider {
+            control_requests: Mutex::new(Vec::new()),
+        };
+        let manager = PatchManager::new(42, &controller, &provider);
+        let exefs = directory("base");
+        std::fs::write(root.join("base/main"), b"original executable").unwrap();
+        std::fs::write(root.join("base/main.npdm"), b"original metadata").unwrap();
+        let mod_path = root.join("load/000000000000002A/synthetic/exefs");
+        std::fs::create_dir_all(&mod_path).unwrap();
+        std::fs::write(mod_path.join("main"), b"replacement executable").unwrap();
+        std::fs::write(
+            mod_path.join("ABC.ips"),
+            b"PATCH\x00\x01\x00\x00\x01\xAAEOF",
+        )
+        .unwrap();
+        let dump = root.join("dump/000000000000002A");
+
+        let mut nso = vec![0; 0x101];
+        nso[..4].copy_from_slice(b"NSO0");
+        let offset = std::mem::offset_of!(crate::loader::nso::NsoHeader, build_id);
+        nso[offset..offset + 2].copy_from_slice(&[0xAB, 0xC0]);
+        for enabled in [false, true, false] {
+            {
+                let mut values = common::settings::values_mut();
+                values.dump_exefs.set_value(enabled);
+                values.dump_nso.set_value(enabled);
+            }
+            let layered = manager.patch_exefs(exefs.clone());
+            assert_eq!(
+                layered.get_file("main").unwrap().read_all_bytes(),
+                b"replacement executable"
+            );
+            assert_eq!(manager.patch_nso(nso.clone(), "main")[0x100], 0xAA);
+            if enabled {
+                assert_eq!(
+                    std::fs::read(dump.join("exefs/main")).unwrap(),
+                    b"replacement executable"
+                );
+                assert_eq!(
+                    std::fs::read(dump.join("exefs/main.npdm")).unwrap(),
+                    b"original metadata"
+                );
+                assert_eq!(std::fs::read(dump.join("nso/main-ABC.nso")).unwrap(), nso);
+                assert!(!dump.join("nso/main-abc.nso").exists());
+                // Re-disabling must stop exports, without disabling patch application.
+                std::fs::remove_dir_all(&dump).unwrap();
+            } else {
+                assert!(!dump.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn nso_patch_build_ids_use_upstream_uppercase() {
+        const CHILD: &str = "RUZU_TEST_NSO_PATCH_BUILD_IDS";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        common::settings::values_mut().dump_nso.set_value(false);
+        let directory = |name: &str, files: Vec<VirtualFile>, dirs: Vec<VirtualDir>| -> VirtualDir {
+            Arc::new(VectorVfsDirectory::new(files, dirs, name.into(), None))
+        };
+        let ips: VirtualFile = Arc::new(VectorVfsFile::new(
+            b"PATCH\x00\x01\x00\x00\x01\xAAEOF".to_vec(),
+            "ABC.ips".into(),
+            None,
+        ));
+        let text: VirtualFile = Arc::new(VectorVfsFile::new(
+            format!("@nsobid-{:0<64}\n@enabled\n00000100 BB\n@stop\n", "ABC").into_bytes(),
+            "synthetic.pchtxt".into(),
+            None,
+        ));
+        let exefs = directory("exefs", vec![ips, text], vec![]);
+        let patch = directory("synthetic", vec![], vec![exefs]);
+        let load = directory(
+            "load",
+            vec![],
+            vec![directory("000000000000002A", vec![], vec![patch.clone()])],
+        );
+        let mut controller = FileSystemController::new();
+        controller.set_bis_factory(super::super::bis_factory::BisFactory::new(
+            directory("nand", vec![], vec![]),
+            load,
+            directory("dump", vec![], vec![]),
+        ));
+        let provider = RecordingContentProvider {
+            control_requests: Mutex::new(Vec::new()),
+        };
+        let manager = PatchManager::new(42, &controller, &provider);
+        assert_eq!(manager.collect_patches(&[patch], "ABC").len(), 2);
+        let mut build_id = [0; 32];
+        build_id[..2].copy_from_slice(&[0xAB, 0xC0]);
+        assert!(manager.has_nso_patch(&build_id, "main"));
+        let mut nso = vec![0; 0x101];
+        nso[..4].copy_from_slice(b"NSO0");
+        let offset = std::mem::offset_of!(crate::loader::nso::NsoHeader, build_id);
+        nso[offset..offset + 32].copy_from_slice(&build_id);
+        assert_eq!(manager.patch_nso(nso, "main")[0x100], 0xBB);
     }
 
     #[test]

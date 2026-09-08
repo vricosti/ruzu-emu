@@ -164,18 +164,19 @@ pub trait ServiceFramework: SessionRequestHandler {
     ) {
         let function_name = match info {
             Some(fi) => fi.name.to_string(),
-            None => format!("{}", ctx.get_command()),
+            None => "<unknown>".to_owned(),
         };
 
         let cmd_buf = ctx.command_buffer();
         let mut buf = format!(
-            "function '{}': port='{}' cmd_buf={{[0]=0x{:X}",
+            "function '{}({})': port='{}' cmd_buf={{[0]={:#x}",
+            ctx.get_command(),
             function_name,
             self.get_service_name(),
             cmd_buf[0]
         );
         for i in 1..=8 {
-            buf.push_str(&format!(", [{}]=0x{:X}", i, cmd_buf[i]));
+            buf.push_str(&format!(", [{}]={:#x}", i, cmd_buf[i]));
         }
         buf.push('}');
 
@@ -185,14 +186,16 @@ pub trait ServiceFramework: SessionRequestHandler {
         // ServerManager, whose cooperative service fiber may be suspended.
         if let Some(system) = ctx.get_system() {
             system.get_reporter().save_unimplemented_function_report(
-                system.get().runtime_program_id(),
+                system,
+                ctx,
                 ctx.get_command(),
                 &function_name,
                 self.get_service_name(),
             );
         }
 
-        log::warn!("Unknown / unimplemented {}", buf);
+        log::error!("Unknown / unimplemented {}", buf);
+        common::assert::assert_fail_soft_impl();
 
         if *common::settings::values().use_auto_stub.get_value() {
             log::warn!("Using auto stub fallback!");

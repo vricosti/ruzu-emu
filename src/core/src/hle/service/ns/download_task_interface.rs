@@ -8,7 +8,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
@@ -68,8 +69,8 @@ impl IDownloadTaskInterface {
                 None,
                 "TryCommitCurrentApplicationDownloadTask",
             ),
-            (commands::ENABLE_AUTO_COMMIT, None, "EnableAutoCommit"),
-            (commands::DISABLE_AUTO_COMMIT, None, "DisableAutoCommit"),
+            (commands::ENABLE_AUTO_COMMIT, Some(Self::enable_auto_commit_handler), "EnableAutoCommit"),
+            (commands::DISABLE_AUTO_COMMIT, Some(Self::disable_auto_commit_handler), "DisableAutoCommit"),
             (
                 commands::TRIGGER_DYNAMIC_COMMIT_EVENT,
                 None,
@@ -83,6 +84,18 @@ impl IDownloadTaskInterface {
     }
 
     /// EnableAutoCommit (cmd 707).
+    fn enable_auto_commit_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let result = service.enable_auto_commit().map_or_else(|error| error, |_| RESULT_SUCCESS);
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(result);
+    }
+
+    fn disable_auto_commit_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let result = service.disable_auto_commit().map_or_else(|error| error, |_| RESULT_SUCCESS);
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(result);
+    }
+
     ///
     /// Corresponds to upstream `IDownloadTaskInterface::EnableAutoCommit`.
     pub fn enable_auto_commit(&self) -> Result<(), ResultCode> {

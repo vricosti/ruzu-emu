@@ -297,7 +297,7 @@ impl SystemRef {
 }
 
 /// Type used for the frontend to designate a callback for System to exit the application.
-pub type ExitCallback = Box<dyn Fn() + Send>;
+pub type ExitCallback = Box<dyn Fn() + Send + Sync>;
 
 /// Minimal bridge from `core` to a concrete `audio_core::renderer::Renderer`
 /// session owned by AudioCore.
@@ -1098,9 +1098,6 @@ pub struct System {
     /// Remote debugger server for the current application process.
     /// Upstream owner: `System::Impl::debugger`.
     debugger: Mutex<Option<crate::debugger::debugger::Debugger>>,
-    /// Rust frontend handoff for upstream's detached `System::Exit()` call from
-    /// the debugger connection thread.
-    debugger_shutdown_requested: Arc<AtomicBool>,
 
     /// Shared HLE service registry.
     service_manager: Option<Arc<std::sync::Mutex<ServiceManager>>>,
@@ -1223,7 +1220,7 @@ pub struct System {
     /// Callback to re-launch the application with a specific program index.
     execute_program_callback: Option<ExecuteProgramCallback>,
     /// Callback to exit the application.
-    exit_callback: Option<ExitCallback>,
+    exit_callback: Option<Arc<ExitCallback>>,
     /// Factory callback for creating video/audio subsystems.
     /// Called by setup_for_application_process() to create Host1x, GPU, AudioCore.
     /// Upstream creates these directly in SetupForApplicationProcess (core.cpp:277-283)
@@ -1308,7 +1305,6 @@ impl System {
             hid_core,
             kernel: None,
             debugger: Mutex::new(None),
-            debugger_shutdown_requested: Arc::new(AtomicBool::new(false)),
             telemetry_session: None,
             _network_instance: crate::internal_network::network::NetworkInstance::new(),
             host1x_core: None,
@@ -2138,8 +2134,6 @@ impl System {
         self.perf_stats = None;
         self.cpu_manager.shutdown();
         self.debugger.lock().take();
-        self.debugger_shutdown_requested
-            .store(false, Ordering::Release);
         if let Some(ref kernel) = self.kernel {
             kernel.finalize_services_after_cpu_shutdown();
         }
@@ -2479,13 +2473,18 @@ impl System {
             log::error!("Cannot initialize debugger without an application process");
             return;
         };
-        self.debugger_shutdown_requested
-            .store(false, Ordering::Release);
         let port = *common::settings::values().gdbstub_port.get_value();
+        // Share the frontend notification, not a raw System pointer: a detached
+        // debugger exit callback may outlive the connection/process teardown.
+        let exit_callback = self.exit_callback.clone().unwrap_or_else(|| {
+            Arc::new(Box::new(|| {
+                log::error!("exit_callback must be initialized by the frontend");
+            }))
+        });
         let debugger = crate::debugger::debugger::Debugger::new(
             process,
             port,
-            Arc::clone(&self.debugger_shutdown_requested),
+            exit_callback,
         );
         if debugger.is_initialized() {
             *self.debugger.lock() = Some(debugger);
@@ -2497,10 +2496,6 @@ impl System {
         if let Some(debugger) = self.debugger.lock().as_ref() {
             debugger.notify_shutdown();
         }
-    }
-
-    pub fn debugger_shutdown_requested(&self) -> bool {
-        self.debugger_shutdown_requested.load(Ordering::Acquire)
     }
 
     pub fn notify_debugger_thread_stopped(&self, thread: Arc<KThreadLock>) -> bool {
@@ -2700,7 +2695,7 @@ impl System {
 
     /// Registers a callback from the frontend for System to exit the application.
     pub fn register_exit_callback(&mut self, callback: ExitCallback) {
-        self.exit_callback = Some(callback);
+        self.exit_callback = Some(Arc::new(callback));
     }
 
     /// Instructs the frontend to exit the application.
@@ -2863,6 +2858,18 @@ impl System {
         self.shared_process_memory
             .as_ref()
             .expect("shared_process_memory not set")
+    }
+
+    /// Counterpart of System::GetApplicationProcessProgramID. The application
+    /// process is owned here in Rust rather than by KernelCore. Do not use
+    /// current_process_arc(): an IPC worker can have another current process.
+    pub fn get_application_process_program_id(&self) -> u64 {
+        self.current_process_arc
+            .as_ref()
+            .expect("application process is not loaded")
+            .lock()
+            .unwrap()
+            .get_program_id()
     }
 
     /// Get the runtime program ID.

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use super::application_manager_interface::IApplicationManagerInterface;
 use super::content_management_interface::IContentManagementInterface;
 use super::ecommerce_interface::IECommerceInterface;
+use super::download_task_interface::IDownloadTaskInterface;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
@@ -90,7 +91,7 @@ impl IServiceGetterInterface {
             ),
             (
                 commands::GET_DOWNLOAD_TASK_INTERFACE,
-                None,
+                Some(Self::get_download_task_interface_handler),
                 "GetDownloadTaskInterface",
             ),
             (
@@ -181,8 +182,17 @@ impl IServiceGetterInterface {
     }
 
     /// GetDownloadTaskInterface (cmd 7997).
-    pub fn get_download_task_interface(&self) {
+    pub fn get_download_task_interface(&self) -> IDownloadTaskInterface {
         log::debug!("IServiceGetterInterface::get_download_task_interface called");
+        IDownloadTaskInterface::new()
+    }
+
+    fn get_download_task_interface_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let interface = Arc::new(service.get_download_task_interface());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(interface);
     }
 
     fn get_content_management_interface_handler(
@@ -212,6 +222,23 @@ impl IServiceGetterInterface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_task_getter_returns_upstream_commands() {
+        let service = IServiceGetterInterface::new(crate::core::SystemRef::null(), "ns:am2");
+        assert!(service.handlers[&7997].handler_callback.is_some());
+        let child = service.get_download_task_interface();
+        assert_eq!(child.handlers().len(), 9);
+        for command in 701..=709 {
+            let handler = child.handlers()[&command].handler_callback;
+            assert_eq!(handler.is_some(), matches!(command, 707 | 708));
+            if let Some(handler) = handler {
+                let mut ctx = HLERequestContext::new();
+                handler(&child, &mut ctx);
+                assert_eq!(ctx.command_buffer()[6], 0);
+            }
+        }
+    }
 
     #[test]
     fn content_management_getter_has_upstream_handler() {

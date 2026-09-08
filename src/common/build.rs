@@ -233,6 +233,32 @@ fn track_git_head(repository: &Path) {
     }
 }
 
+// GenerateSCMRev.cmake's string(TIMESTAMP ... UTC), including its reproducible
+// SOURCE_DATE_EPOCH override. libc converts the calendar on the build host;
+// the target's timezone and compiler platform do not participate.
+fn utc_build_timestamp(seconds: u64) -> Option<String> {
+    let timestamp: libc::time_t = seconds.try_into().ok()?;
+    let mut utc: libc::tm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
+    let valid = unsafe { !libc::gmtime_r(&timestamp, &mut utc).is_null() };
+    #[cfg(windows)]
+    let valid = unsafe { libc::gmtime_s(&mut utc, &timestamp) == 0 };
+    #[cfg(not(any(unix, windows)))]
+    let valid = false;
+    valid.then(|| format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+        utc.tm_hour, utc.tm_min, utc.tm_sec))
+}
+
+fn build_timestamp(source_date_epoch: Option<&str>) -> String {
+    let seconds = match source_date_epoch {
+        Some(value) => value.parse::<u64>().expect("SOURCE_DATE_EPOCH must be nonnegative epoch seconds"),
+        None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .expect("build time precedes the Unix epoch").as_secs(),
+    };
+    utc_build_timestamp(seconds).expect("build timestamp is outside the host calendar range")
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let repository = manifest_dir
@@ -245,6 +271,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GIT_REV");
     println!("cargo:rerun-if-env-changed=GIT_BRANCH");
     println!("cargo:rerun-if-env-changed=GIT_TAG");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
     let revision = env::var("GIT_REV")
         .ok()
@@ -269,6 +296,31 @@ fn main() {
     println!("cargo:rustc-env=GIT_BRANCH={branch}");
     println!("cargo:rustc-env=GIT_DESC={build_version}");
     println!("cargo:rustc-env=BUILD_NAME=Ruzu");
+    println!("cargo:rustc-env=BUILD_DATE={}", build_timestamp(env::var("SOURCE_DATE_EPOCH").ok().as_deref()));
     println!("cargo:rustc-env=BUILD_VERSION={build_version}");
     println!("cargo:rustc-env=COMPILER_ID={}", compiler_id(repository));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utc_calendar_and_reproducible_epoch_match_cmake_timestamp() {
+        for (seconds, expected) in [
+            (0, "1970-01-01T00:00:00Z"),
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (1_709_210_096, "2024-02-29T12:34:56Z"),
+            (1_767_225_600, "2026-01-01T00:00:00Z"),
+        ] {
+            assert_eq!(utc_build_timestamp(seconds).as_deref(), Some(expected));
+            assert_eq!(build_timestamp(Some(&seconds.to_string())), expected);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "SOURCE_DATE_EPOCH must be nonnegative epoch seconds")]
+    fn invalid_reproducible_epoch_does_not_silently_use_current_time() {
+        build_timestamp(Some("not-a-timestamp"));
+    }
 }

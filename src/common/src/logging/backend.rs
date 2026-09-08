@@ -1,13 +1,10 @@
-//! Port of zuyu/src/common/logging/backend.h and zuyu/src/common/logging/backend.cpp
-//! Status: COMPLET
-//! Derniere synchro: 2026-03-05
-//!
-//! The C++ version uses a singleton Impl with a background thread draining an MPSC queue.
-//! This Rust port uses a similar architecture with a background thread, atomic flags, and
-//! crossbeam-style channel (std::sync::mpsc).
+//! Backend portion of Eden's common/logging.{h,cpp}.
+//! Rust retains its existing asynchronous writer and log-facade bridge; current
+//! Eden writes synchronously. Settings are sampled by the file writer, and Stop
+//! drains the queue without retaining the producer mutex while joining it.
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -27,7 +24,7 @@ trait Backend: Send {
 
 /// Backend that writes to a file.
 struct FileBackend {
-    file: Option<fs::File>,
+    file: Option<BufWriter<fs::File>>,
     enabled: bool,
     bytes_written: usize,
 }
@@ -35,11 +32,12 @@ struct FileBackend {
 impl FileBackend {
     fn new(filename: &std::path::Path) -> Self {
         // Rotate old log file
-        let old_filename = filename.with_extension("old.txt");
+        let mut old_filename = filename.as_os_str().to_os_string();
+        old_filename.push(".old.txt");
         let _ = fs::remove_file(&old_filename);
         let _ = fs::rename(filename, &old_filename);
 
-        let file = fs::File::create(filename).ok();
+        let file = fs::File::create(filename).ok().map(|file| BufWriter::with_capacity(4096, file));
 
         Self {
             file,
@@ -49,22 +47,36 @@ impl FileBackend {
     }
 }
 
-impl Backend for FileBackend {
-    fn write(&mut self, entry: &Entry) {
+impl FileBackend {
+    // Mechanical split of FileBackend::Write to snapshot settings outside I/O
+    // and exercise limits without writing hundreds of MiB in regression tests.
+    fn write_with_options(&mut self, entry: &Entry, flush_line: bool, censor: bool, extended: bool) {
         if !self.enabled {
             return;
         }
 
         if let Some(ref mut file) = self.file {
-            let msg = format!("{}\n", format_log_message(entry));
+            let mut msg = format!("{}\n", format_log_message(entry));
+            #[cfg(not(target_os = "android"))]
+            if censor {
+                static USERNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                let username = USERNAME.get_or_init(|| {
+                    ["LOGNAME", "USERNAME", "USER"].into_iter()
+                        .find_map(|key| std::env::var_os(key))
+                        .map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
+                });
+                if !username.is_empty() { msg = msg.replace(username.as_str(), "user"); }
+            }
             let bytes = msg.as_bytes();
             if file.write_all(bytes).is_ok() {
                 self.bytes_written += bytes.len();
             }
 
-            // Prevent logs from exceeding 100 MiB
-            const WRITE_LIMIT: usize = 100 * 1024 * 1024;
-            let write_limit_exceeded = self.bytes_written > WRITE_LIMIT;
+            // Eden raises the 100 MiB cap to 1 GiB for extended logging.
+            let write_limit = if extended { 1024 * 1024 * 1024 } else { 100 * 1024 * 1024 };
+            let write_limit_exceeded = self.bytes_written > write_limit;
+
+            if flush_line { let _ = file.flush(); }
 
             if entry.log_level >= Level::Error || write_limit_exceeded {
                 if write_limit_exceeded {
@@ -73,6 +85,18 @@ impl Backend for FileBackend {
                 let _ = file.flush();
             }
         }
+    }
+}
+
+impl Backend for FileBackend {
+    fn write(&mut self, entry: &Entry) {
+        if !self.enabled { return; }
+        let (flush_line, censor, extended) = {
+            let settings = crate::settings::values();
+            (*settings.log_flush_line.get_value(), *settings.censor_username.get_value(),
+                *settings.extended_logging.get_value())
+        };
+        self.write_with_options(entry, flush_line, censor, extended);
     }
 
     fn flush(&mut self) {
@@ -195,11 +219,18 @@ static COLOR_FLAG: Mutex<Option<std::sync::Arc<AtomicBool>>> = Mutex::new(None);
 struct FacadeLogger;
 
 static FACADE_LOGGER: FacadeLogger = FacadeLogger;
+// Rust diagnostic syntax is retained as an initial override, not translated
+// into lossy class-wide rules. Explicit GUI Apply replaces that initial filter.
+static ENV_FILTER: std::sync::OnceLock<env_filter::Filter> = std::sync::OnceLock::new();
+static ENV_FILTER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 impl log::Log for FacadeLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         if SUPPRESS_LOGGING.load(Ordering::Relaxed) {
             return false;
+        }
+        if ENV_FILTER_ACTIVE.load(Ordering::Acquire) {
+            return ENV_FILTER.get().is_some_and(|filter| filter.enabled(metadata));
         }
 
         // Lock-free fast path: reject on the global minimum level before the
@@ -214,6 +245,11 @@ impl log::Log for FacadeLogger {
 
     fn log(&self, record: &log::Record<'_>) {
         if !self.enabled(record.metadata()) {
+            return;
+        }
+        if ENV_FILTER_ACTIVE.load(Ordering::Acquire)
+            && ENV_FILTER.get().is_some_and(|filter| !filter.matches(record))
+        {
             return;
         }
 
@@ -232,38 +268,31 @@ impl log::Log for FacadeLogger {
 
 /// Initialize the yuzu-style asynchronous backend and connect Rust's `log`
 /// facade to it. `RUZU_LOG_FILTER` uses the native class syntax
-/// (`*:Info Render.OpenGL:Debug`). A simple `RUST_LOG=info` style value is
-/// also accepted for command-line compatibility.
+/// (`*:Info Render.OpenGL:Debug`). `RUST_LOG` retains env_logger's module and
+/// message-filter syntax for command-line compatibility.
 pub fn initialize_from_env(log_dir: Option<PathBuf>) {
-    let filter = std::env::var("RUZU_LOG_FILTER")
-        .ok()
-        .or_else(|| {
-            std::env::var("RUST_LOG")
-                .ok()
-                .and_then(|s| rust_log_to_filter(&s))
-        })
-        .unwrap_or_else(|| "*:Warning".to_string());
+    initialize_with_config(log_dir, "*:Warning", true);
+}
 
-    initialize(log_dir, Some(&filter));
-    set_color_console_backend_enabled(env_flag_enabled("RUZU_LOG_COLOR", true));
+/// Initialize from saved settings, with explicit environment diagnostics taking
+/// precedence on startup. The GUI can subsequently replace the active filter.
+pub fn initialize_with_config(log_dir: Option<PathBuf>, configured_filter: &str, console: bool) {
+    let native_override = std::env::var("RUZU_LOG_FILTER").ok();
+    let rust_override = native_override.is_none().then(|| std::env::var("RUST_LOG").ok()).flatten();
+    let filter = native_override.as_deref().unwrap_or_else(|| {
+        if rust_override.is_some() { "*:Trace" } else { configured_filter }
+    });
+    if let Some(directives) = rust_override {
+        let _ = ENV_FILTER.set(env_filter::Builder::new().parse(&directives).build());
+        ENV_FILTER_ACTIVE.store(true, Ordering::Release);
+    }
+
+    initialize(log_dir, Some(filter));
+    set_color_console_backend_enabled(env_flag_enabled("RUZU_LOG_COLOR", console));
 
     match log::set_logger(&FACADE_LOGGER) {
         Ok(()) => log::set_max_level(log::LevelFilter::Trace),
         Err(_) => eprintln!("logging facade was already initialized"),
-    }
-}
-
-fn rust_log_to_filter(value: &str) -> Option<String> {
-    let first = value.split(',').next()?.trim();
-    let level = first.rsplit('=').next()?.trim();
-    match level.to_ascii_lowercase().as_str() {
-        "trace" => Some("*:Trace".to_string()),
-        "debug" => Some("*:Debug".to_string()),
-        "info" => Some("*:Info".to_string()),
-        "warn" | "warning" => Some("*:Warning".to_string()),
-        "error" => Some("*:Error".to_string()),
-        "off" => Some("*:Critical".to_string()),
-        _ => None,
     }
 }
 
@@ -290,12 +319,31 @@ fn level_from_log(level: log::Level) -> Level {
 }
 
 fn class_from_target(target: &str) -> Class {
+    // Default Rust targets are module paths, not upstream logging classes.
+    // Keep the original target intact for RUST_LOG, and translate only modules
+    // whose corresponding C++ file uses a single class for its log calls.
+    // Do not infer a class for whole crates: key_manager.cpp and cubeb_sink.cpp,
+    // for example, deliberately use multiple classes in the same file.
+    match target {
+        // core/arm/dynarmic/arm_dynarmic_{32,64}.cpp: Core_ARM
+        "core::arm::dynarmic::arm_dynarmic_32"
+        | "core::arm::dynarmic::arm_dynarmic_64" => return Class::Core_ARM,
+        // core/loader/{nro,nso}.cpp: Loader
+        "core::loader::nro" | "core::loader::nso" => return Class::Loader,
+        // video_core/renderer_vulkan/vk_rasterizer.cpp: Render_Vulkan
+        "video_core::renderer_vulkan::vk_rasterizer" => return Class::Render_Vulkan,
+        _ => {}
+    }
     let normalized = target.replace("::", ".").replace('_', ".");
     Class::from_name(target)
         .or_else(|| Class::from_name(&normalized))
         .or_else(|| {
             Class::all()
-                .filter(|class| normalized.starts_with(class.name()))
+                .filter(|class| {
+                    normalized
+                        .strip_prefix(class.name())
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+                })
                 .max_by_key(|class| class.name().len())
         })
         .unwrap_or(Class::Log)
@@ -303,8 +351,11 @@ fn class_from_target(target: &str) -> Class {
 
 /// Stops the logger thread and flushes buffers.
 pub fn stop() {
-    let mut guard = LOGGER.lock().unwrap();
-    if let Some(mut state) = guard.take() {
+    // The writer may need a settings read lock held by a logging producer.
+    // Never retain LOGGER while joining it: the producer must be able to finish.
+    SUPPRESS_LOGGING.store(true, Ordering::SeqCst);
+    let state = LOGGER.lock().unwrap().take();
+    if let Some(mut state) = state {
         // Drop the sender to signal the thread to finish
         drop(state.sender);
         if let Some(handle) = state.thread_handle.take() {
@@ -322,11 +373,15 @@ pub fn disable_logging_in_tests() {
 
 /// Sets the global filter.
 pub fn set_global_filter(filter: &Filter) {
-    publish_filter_snapshot(filter);
     let mut guard = LOGGER.lock().unwrap();
+    // Serialize the facade snapshot with the queued logger's filter. Publishing
+    // before this lock lets two concurrent updates leave different filters in
+    // enabled() and push_entry(), even after both updates have returned.
+    publish_filter_snapshot(filter);
     if let Some(ref mut state) = *guard {
         state.filter = filter.clone();
     }
+    ENV_FILTER_ACTIVE.store(false, Ordering::Release);
 }
 
 /// Enables or disables the color console backend.
@@ -450,13 +505,122 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rust_log_level_maps_to_yuzu_filter() {
-        assert_eq!(rust_log_to_filter("info").as_deref(), Some("*:Info"));
-        assert_eq!(
-            rust_log_to_filter("video_core=debug").as_deref(),
-            Some("*:Debug")
-        );
-        assert_eq!(rust_log_to_filter("off").as_deref(), Some("*:Critical"));
+    fn file_logging_options_censor_flush_and_extend_the_limit() {
+        const CHILD: &str = "RUZU_TEST_FILE_LOG_OPTIONS";
+        if std::env::var_os(CHILD).is_none() {
+            for case in ["logname", "username", "user", "empty"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", "logging::backend::tests::file_logging_options_censor_flush_and_extend_the_limit"])
+                    .env(CHILD, case).env("LOGNAME", "synthetic_account")
+                    .env("USERNAME", "other_account").env("USER", "third_account");
+                match case {
+                    "username" => { command.env_remove("LOGNAME").env("USERNAME", "synthetic_account"); }
+                    "user" => { command.env_remove("LOGNAME").env_remove("USERNAME").env("USER", "synthetic_account"); }
+                    "empty" => { command.env("LOGNAME", ""); }
+                    _ => {}
+                }
+                assert!(command.status().unwrap().success(), "{case}");
+            }
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!("ruzu-file-log-options-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("test.log");
+        let mut backend = FileBackend::new(&path);
+        let entry = Entry {
+            timestamp: std::time::Duration::ZERO, log_class: Class::Log,
+            log_level: Level::Info, filename: "test.rs".into(), line_num: 1,
+            function: "test".into(), message: "synthetic_account/other_account/synthetic_account".into(),
+        };
+        backend.write_with_options(&entry, false, true, false);
+        assert!(std::fs::read_to_string(&path).unwrap().is_empty());
+        backend.flush();
+        let text = std::fs::read_to_string(&path).unwrap();
+        #[cfg(not(target_os = "android"))]
+        {
+            if std::env::var(CHILD).unwrap() == "empty" {
+                assert!(text.contains("synthetic_account/other_account/synthetic_account"));
+            } else {
+                assert!(text.contains("user/other_account/user"));
+                assert!(!text.contains("synthetic_account"));
+            }
+        }
+        backend.write_with_options(&entry, true, false, false);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("synthetic_account/other_account/synthetic_account"));
+        backend.bytes_written = 100 * 1024 * 1024;
+        backend.write_with_options(&entry, false, false, true);
+        assert!(backend.enabled);
+        backend.write_with_options(&entry, false, false, false);
+        assert!(!backend.enabled);
+        backend.enabled = true;
+        backend.bytes_written = 1024 * 1024 * 1024;
+        backend.write_with_options(&entry, false, false, true);
+        assert!(!backend.enabled);
+        drop(backend);
+        let replacement = FileBackend::new(&path);
+        assert!(directory.join("test.log.old.txt").is_file());
+        drop(replacement);
+        initialize(Some(directory.clone()), Some("*:Info"));
+        let settings = crate::settings::values_mut();
+        push_entry(Class::Log, Level::Info, "test.rs", 1, "test", "queued_before_stop".into());
+        let (done_tx, done_rx) = mpsc::channel();
+        let stopper = std::thread::spawn(move || { stop(); done_tx.send(()).unwrap(); });
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if LOGGER.try_lock().is_ok_and(|state| state.is_none()) { break; }
+            assert!(Instant::now() < deadline, "Stop retained LOGGER while waiting for settings");
+            std::thread::yield_now();
+        }
+        assert!(done_rx.try_recv().is_err(), "writer should be waiting for the settings guard");
+        drop(settings);
+        done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        stopper.join().unwrap();
+        assert!(std::fs::read_to_string(directory.join("ruzu_log.txt")).unwrap().contains("queued_before_stop"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn facade_uses_config_environment_and_live_filter_changes() {
+        const CHILD: &str = "RUZU_TEST_LOGGER_CONFIGURATION";
+        let Ok(case) = std::env::var(CHILD) else {
+            for case in ["config", "rust", "native", "off"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", "logging::backend::tests::facade_uses_config_environment_and_live_filter_changes"])
+                    .env(CHILD, case).env_remove("RUZU_LOG_FILTER").env_remove("RUST_LOG")
+                    .env("RUZU_LOG_COLOR", "0");
+                match case {
+                    "rust" => { command.env("RUST_LOG", "off,alpha=debug,beta=trace/keep"); }
+                    "native" => { command.env("RUST_LOG", "trace").env("RUZU_LOG_FILTER", "*:Error"); }
+                    "off" => { command.env("RUST_LOG", "off"); }
+                    _ => {}
+                }
+                assert!(command.status().unwrap().success(), "{case}");
+            }
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!("ruzu-logger-test-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        initialize_with_config(Some(directory.clone()), "*:Warning", false);
+        log::debug!(target: "alpha", "keep_alpha_debug");
+        log::trace!(target: "alpha", "keep_alpha_trace");
+        log::trace!(target: "beta", "keep_beta_trace");
+        log::debug!(target: "beta", "discard_regex");
+        log::warn!(target: "other", "keep_other_warning");
+        log::error!(target: "other", "keep_other_error");
+        set_global_filter(&Filter::new(Level::Info));
+        log::info!(target: "other", "live_info");
+        log::debug!(target: "other", "live_debug");
+        stop();
+        let contents = std::fs::read_to_string(directory.join("ruzu_log.txt")).unwrap();
+        assert_eq!(contents.contains("keep_alpha_debug"), case == "rust");
+        assert!(!contents.contains("keep_alpha_trace"));
+        assert_eq!(contents.contains("keep_beta_trace"), case == "rust");
+        assert!(!contents.contains("discard_regex"));
+        assert_eq!(contents.contains("keep_other_warning"), case == "config");
+        assert_eq!(contents.contains("keep_other_error"), case == "config" || case == "native");
+        assert!(contents.contains("live_info"));
+        assert!(!contents.contains("live_debug"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -468,6 +632,76 @@ mod tests {
             Class::Render_OpenGL
         );
         assert_eq!(class_from_target("unknown_target"), Class::Log);
+    }
+
+    #[test]
+    fn audited_module_targets_use_their_upstream_classes() {
+        let cases = [
+            ("core::arm::dynarmic::arm_dynarmic_32", Class::Core_ARM),
+            ("core::arm::dynarmic::arm_dynarmic_64", Class::Core_ARM),
+            ("core::loader::nro", Class::Loader),
+            ("core::loader::nso", Class::Loader),
+            ("video_core::renderer_vulkan::vk_rasterizer", Class::Render_Vulkan),
+        ];
+        for (target, class) in cases {
+            assert_eq!(class_from_target(target), class);
+            let mut filter = Filter::new(Level::Critical);
+            filter.set_class_level(class, Level::Debug);
+            assert!(filter.check_message(class_from_target(target), Level::Debug));
+            assert!(!filter.check_message(Class::Log, Level::Debug));
+            // Prefix collisions must not accidentally extend this audited set.
+            assert_eq!(class_from_target(&format!("{target}_other")), Class::Log);
+        }
+        assert_eq!(class_from_target("core::crypto::key_manager"), Class::Log);
+        assert_eq!(class_from_target("audio_core::sink::cubeb_sink"), Class::Log);
+    }
+
+    #[test]
+    fn class_prefix_requires_a_component_boundary() {
+        assert_eq!(class_from_target("Render.OpenGLExtra"), Class::Render);
+        assert_eq!(class_from_target("Renderer"), Class::Log);
+        assert_eq!(class_from_target("Service.FSExtra"), Class::Service);
+        assert_eq!(class_from_target("Service.FS.operation"), Class::Service_FS);
+        assert_eq!(class_from_target("Service_FS::operation"), Class::Service_FS);
+        for class in Class::all() {
+            assert_eq!(class_from_target(class.name()), class);
+            assert_eq!(class_from_target(&format!("{}.message", class.name())), class);
+        }
+    }
+
+    #[test]
+    fn concurrent_filter_updates_publish_one_consistent_filter() {
+        const CHILD: &str = "RUZU_TEST_CONCURRENT_LOG_FILTER";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "logging::backend::tests::concurrent_filter_updates_publish_one_consistent_filter"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        // Isolate global logger state without starting file/console backends.
+        let (sender, _receiver) = mpsc::channel();
+        *LOGGER.lock().unwrap() = Some(LoggerState {
+            filter: Filter::default(), sender, time_origin: Instant::now(), thread_handle: None,
+        });
+        for _ in 0..50 {
+            std::thread::scope(|scope| {
+                for level in [Level::Debug, Level::Critical] {
+                    scope.spawn(move || {
+                        for _ in 0..100 { set_global_filter(&Filter::new(level)); }
+                    });
+                }
+            });
+            let guard = LOGGER.lock().unwrap();
+            let filter = &guard.as_ref().unwrap().filter;
+            for (slot, level) in FILTER_LEVELS.iter().zip(filter.class_levels()) {
+                assert_eq!(slot.load(Ordering::Relaxed), *level as u8);
+            }
+            assert_eq!(FILTER_GLOBAL_MIN.load(Ordering::Acquire),
+                *filter.class_levels().iter().min().unwrap() as u8);
+        }
     }
 
     #[test]

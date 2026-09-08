@@ -180,9 +180,13 @@ impl RomFSFactory {
         storage: StorageId,
         type_: ContentRecordType,
     ) -> Option<NCA> {
-        let provider = self.content_provider.as_ref()?.lock().unwrap();
         match storage {
-            StorageId::None => provider.get_entry(title_id, type_),
+            StorageId::None => {
+                // Only this branch uses the union upstream. Holding its lock
+                // for NAND/SDMC would invert the controller -> provider order.
+                let provider = self.content_provider.as_ref()?.lock().unwrap();
+                provider.get_entry(title_id, type_)
+            }
             StorageId::NandSystem => {
                 // Upstream: filesystem_controller.GetSystemNANDContents()->GetEntry(...)
                 if let Some(ref fsc) = self.filesystem_controller {
@@ -259,6 +263,28 @@ mod tests {
         assert_eq!(StorageId::NandSystem as u8, 3);
         assert_eq!(StorageId::NandUser as u8, 4);
         assert_eq!(StorageId::SdCard as u8, 5);
+    }
+
+    #[test]
+    fn explicit_storage_lookup_does_not_lock_the_content_union() {
+        for storage in [StorageId::NandSystem, StorageId::NandUser, StorageId::SdCard,
+            StorageId::Host, StorageId::GameCard] {
+            let provider = Arc::new(Mutex::new(ContentProviderUnion::new()));
+            let guard = provider.lock().unwrap();
+            let worker_provider = provider.clone();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let factory = RomFSFactory::new_with_file(None, false, Some(worker_provider), None);
+                let missing = factory.get_entry(42, storage, ContentRecordType::Data).is_none();
+                sender.send(missing).unwrap();
+            });
+            let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+            // Release before joining/asserting so the regression also terminates
+            // on the old implementation instead of hanging the test suite.
+            drop(guard);
+            worker.join().unwrap();
+            assert_eq!(result, Ok(true), "storage {storage:?} must not wait on the union");
+        }
     }
 
     #[test]

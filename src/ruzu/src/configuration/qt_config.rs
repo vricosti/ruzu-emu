@@ -25,7 +25,7 @@ use common::settings_input::{
     native_analog, native_button, native_motion, ControllerType, PlayerInput,
     JOYCON_BODY_NEON_BLUE, JOYCON_BODY_NEON_RED, JOYCON_BUTTONS_NEON_BLUE, JOYCON_BUTTONS_NEON_RED,
 };
-use frontend_common::config::{BaseConfig, ConfigType};
+use frontend_common::config::{adjust_output_string, BaseConfig, ConfigType};
 use input_common::main_common::{generate_analog_param_from_keys, generate_keyboard_param};
 
 use crate::uisettings::{self, GameDir};
@@ -50,6 +50,99 @@ const UI_SECTION: &str = "[UI]";
 /// Path of ruzu's own configuration file.
 pub fn config_path() -> PathBuf {
     get_ruzu_path(RuzuPath::ConfigDir).join("qt-config.ini")
+}
+
+/// QtConfig::ReloadAllValues / ReadQtValues. Keep the complete frontend reload
+/// in its configuration owner so startup and a defaults reset use the same path.
+/// The existing GTK readers remain specialized by category, as upstream.
+pub fn reload_all_values() {
+    if let Err(error) = repair_directory_array_sections(&config_path()) {
+        log::error!("Could not repair directory-array configuration: {error}");
+    }
+    let game_dirs = load_game_dirs();
+    log::info!("Loaded {} configured game directory(ies)", game_dirs.len());
+    uisettings::with_mut(|values| values.game_dirs = game_dirs);
+    load_roms_path();
+    load_external_content_dirs();
+    let favorited_ids = load_favorited_ids();
+    uisettings::with_mut(|values| values.favorited_ids = favorited_ids);
+    load_favorites_expanded();
+    load_ui_language();
+    load_view_values();
+    load_multiplayer_values();
+    load_global_values();
+    load_control_values();
+    load_shortcut_values();
+}
+
+/// Repair the old Ruzu writer's misplaced arrays before strict UI readers run.
+/// Eden has no corresponding migration: its writer already owns the UI section.
+/// The transform is idempotent; a valid UI array takes precedence over stray data.
+fn repaired_directory_array_sections(contents: &str) -> Option<String> {
+    let family = |line: &str| -> Option<usize> {
+        let (key, _) = line.trim().split_once('=')?;
+        [GAMEDIRS_PREFIX, EXTERNAL_CONTENT_DIRS_PREFIX]
+            .iter().position(|prefix| key.starts_with(prefix))
+    };
+    let mut in_ui = false;
+    let mut canonical = [false; 2];
+    let mut misplaced = [Vec::new(), Vec::new()];
+    let mut retained = Vec::new();
+    for line in contents.lines() {
+        if line.trim().starts_with('[') {
+            in_ui = line.trim() == UI_SECTION;
+        }
+        if let Some(index) = family(line) {
+            if in_ui {
+                canonical[index] = true;
+            } else {
+                misplaced[index].push(line.to_owned());
+                continue;
+            }
+        }
+        retained.push(line.to_owned());
+    }
+    if misplaced.iter().all(Vec::is_empty) { return None; }
+    let mut moved = Vec::new();
+    for (index, lines) in misplaced.into_iter().enumerate() {
+        if !canonical[index] { moved.extend(lines); }
+    }
+    if !moved.is_empty() {
+        let insert_at = match retained.iter().position(|line| line.trim() == UI_SECTION) {
+            Some(index) => index + 1,
+            None => {
+                retained.push(UI_SECTION.to_owned());
+                retained.len()
+            }
+        };
+        retained.splice(insert_at..insert_at, moved);
+    }
+    let mut repaired = retained.join("\n");
+    if contents.ends_with('\n') { repaired.push('\n'); }
+    Some(repaired)
+}
+
+fn repair_directory_array_sections(path: &Path) -> io::Result<bool> {
+    use std::io::Write;
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let Some(repaired) = repaired_directory_array_sections(&contents) else { return Ok(false); };
+    let parent = path.parent().ok_or_else(|| io::Error::other("configuration has no parent"))?;
+    let mut backup = tempfile::Builder::new()
+        .prefix("qt-config.ini.before-directory-section-repair-").suffix(".bak")
+        .tempfile_in(parent)?;
+    backup.write_all(contents.as_bytes())?;
+    backup.as_file().sync_all()?;
+    let (_, backup_path) = backup.keep().map_err(|error| error.error)?;
+    let mut replacement = tempfile::NamedTempFile::new_in(parent)?;
+    replacement.write_all(repaired.as_bytes())?;
+    replacement.as_file().sync_all()?;
+    replacement.persist(path).map_err(|error| error.error)?;
+    log::info!("Repaired directory arrays in UI; original configuration saved to {}", backup_path.display());
+    Ok(true)
 }
 
 /// Read the generic global categories through upstream's `Config::ReadValues`
@@ -167,7 +260,7 @@ pub fn save_shortcut_values() -> io::Result<()> {
     std::fs::write(path, contents)
 }
 
-/// Persist the three settings owned by upstream `ConfigureTasDialog`.
+/// Persist the four settings owned by upstream `ConfigureTasDialog`.
 pub fn save_tas_values() -> io::Result<()> {
     let path = config_path();
     let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
@@ -187,6 +280,11 @@ pub fn save_tas_values() -> io::Result<()> {
             "tas_loop",
             *values.tas_loop.get_value(),
             *values.tas_loop.get_default(),
+        ),
+        (
+            "tas_show_recording_dialog",
+            *values.tas_show_recording_dialog.get_value(),
+            *values.tas_show_recording_dialog.get_default(),
         ),
     ] {
         contents = replace_section_setting(
@@ -667,10 +765,20 @@ pub fn save_external_content_dirs(directories: &[String]) -> io::Result<()> {
 pub fn parse_external_content_dirs(contents: &str) -> Vec<String> {
     use std::collections::BTreeMap;
 
+    let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+    config.load_ini(contents);
+    config.begin_group("UI");
+
     let mut size: Option<u32> = None;
     let mut directories = BTreeMap::new();
+    let mut in_ui = false;
     for line in contents.lines() {
         let line = line.trim();
+        if line.starts_with('[') {
+            in_ui = line == UI_SECTION;
+            continue;
+        }
+        if !in_ui { continue; }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
@@ -686,8 +794,11 @@ pub fn parse_external_content_dirs(contents: &str) -> Vec<String> {
         let Ok(index) = index.parse::<u32>() else {
             continue;
         };
-        if field == "path" && !value.is_empty() {
-            directories.insert(index, value.to_string());
+        if field == "path" {
+            let path = config.read_string_setting(key, None);
+            if !path.is_empty() {
+                directories.insert(index, path);
+            }
         }
     }
     directories
@@ -709,13 +820,13 @@ fn replace_external_content_dirs(contents: &str, directories: &[String]) -> Stri
     let mut block_written = false;
     for line in contents.lines() {
         if is_external_dir_line(line) {
-            if !block_written {
-                out.extend(render_external_content_dirs(directories));
-                block_written = true;
-            }
             continue;
         }
         out.push(line.to_string());
+        if line.trim() == UI_SECTION && !block_written {
+            out.extend(render_external_content_dirs(directories));
+            block_written = true;
+        }
     }
     if !block_written {
         if !out.iter().any(|line| line.trim() == UI_SECTION) {
@@ -741,6 +852,7 @@ fn render_external_content_dirs(directories: &[String]) -> Vec<String> {
         directories.len()
     ));
     for (position, path) in directories.iter().enumerate() {
+        let path = adjust_output_string(path);
         lines.push(format!(
             "{EXTERNAL_CONTENT_DIRS_PREFIX}{}\\path={path}",
             position + 1
@@ -1403,13 +1515,23 @@ fn unquote(value: &str) -> &str {
 pub fn parse_game_dirs(contents: &str) -> Vec<GameDir> {
     use std::collections::BTreeMap;
 
+    let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+    config.load_ini(contents);
+    config.begin_group("UI");
+
     let mut size: Option<u32> = None;
     let mut paths: BTreeMap<u32, String> = BTreeMap::new();
     let mut deep: BTreeMap<u32, bool> = BTreeMap::new();
     let mut expanded: BTreeMap<u32, bool> = BTreeMap::new();
+    let mut in_ui = false;
 
     for line in contents.lines() {
         let line = line.trim();
+        if line.starts_with('[') {
+            in_ui = line == UI_SECTION;
+            continue;
+        }
+        if !in_ui { continue; }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
@@ -1429,7 +1551,7 @@ pub fn parse_game_dirs(contents: &str) -> Vec<GameDir> {
         // are metadata, not the value, and must not override it.
         match field {
             "path" => {
-                paths.insert(index, value.to_owned());
+                paths.insert(index, config.read_string_setting(key, None));
             }
             "deep_scan" => {
                 deep.insert(index, is_true(value));
@@ -1467,15 +1589,13 @@ fn replace_game_dirs(contents: &str, dirs: &[GameDir]) -> String {
     let mut block_written = false;
     for line in contents.lines() {
         if is_gamedir_line(line) {
-            // Emit the whole new block where the first old line sat, and drop
-            // every other old line.
-            if !block_written {
-                out.extend(render_game_dirs(dirs));
-                block_written = true;
-            }
             continue;
         }
         out.push(line.to_string());
+        if line.trim() == UI_SECTION && !block_written {
+            out.extend(render_game_dirs(dirs));
+            block_written = true;
+        }
     }
 
     if !block_written {
@@ -1505,7 +1625,7 @@ fn render_game_dirs(dirs: &[GameDir]) -> Vec<String> {
     for (position, dir) in dirs.iter().enumerate() {
         // 1-based on disk, matching what yuzu writes.
         let index = position + 1;
-        lines.push(format!("{GAMEDIRS_PREFIX}{index}\\path={}", dir.path));
+        lines.push(format!("{GAMEDIRS_PREFIX}{index}\\path={}", adjust_output_string(&dir.path)));
         lines.push(format!(
             "{GAMEDIRS_PREFIX}{index}\\deep_scan\\default={}",
             !dir.deep_scan
@@ -1535,6 +1655,50 @@ fn is_true(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_reload_reads_core_and_frontend_in_an_isolated_process() {
+        const CHILD: &str = "RUZU_TEST_COMPLETE_CONFIG_RELOAD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            common::fs::path_util::set_ruzu_path(RuzuPath::ConfigDir, &root);
+            let document = concat!(
+                "[Audio]\nvolume\\default=false\nvolume=42\n",
+                "[UI]\nhideInactiveMouse\\default=false\nhideInactiveMouse=false\n",
+                "Paths\\gamedirs\\size=1\n",
+                "Paths\\gamedirs\\1\\path=/synthetic/homebrew\n",
+            );
+            std::fs::write(config_path(), document).unwrap();
+            reload_all_values();
+            assert_eq!(*common::settings::values().volume.get_value(), 42);
+            uisettings::with(|values| {
+                assert!(!*values.hide_mouse.get_value());
+                assert_eq!(values.game_dirs.len(), 1);
+                assert_eq!(values.game_dirs[0].path, "/synthetic/homebrew");
+                assert!(!values.shortcuts.is_empty());
+            });
+            // Re-read an empty document as the reset path will: stale live
+            // values must not survive simply because an INI key is absent.
+            std::fs::write(config_path(), "").unwrap();
+            reload_all_values();
+            assert_eq!(*common::settings::values().volume.get_value(), 100);
+            uisettings::with(|values| {
+                assert!(*values.hide_mouse.get_value());
+                assert!(values.game_dirs.is_empty());
+            });
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "configuration::qt_config::tests::complete_reload_reads_core_and_frontend_in_an_isolated_process", "--test-threads=1"])
+            .env(CHILD, root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn all_frontend_scalar_settings_survive_disk_roundtrip() {
@@ -1957,7 +2121,7 @@ mod tests {
 
     #[test]
     fn missing_size_keeps_every_entry() {
-        let config = "Paths\\gamedirs\\1\\path=/a\nPaths\\gamedirs\\2\\path=/b\n";
+        let config = "[UI]\nPaths\\gamedirs\\1\\path=/a\nPaths\\gamedirs\\2\\path=/b\n";
         assert_eq!(parse_game_dirs(config).len(), 2);
     }
 
@@ -1979,6 +2143,91 @@ mod tests {
         assert!(written.contains("Paths\\external_content_dirs\\1\\path=/updates/homebrew/"));
         assert!(written.contains("Paths\\external_content_dirs\\2\\path=/dlc/open-source-title/"));
         assert!(written.contains("Unrelated=value"));
+    }
+
+    #[test]
+    fn directory_arrays_read_quoted_paths_like_upstream() {
+        let contents = concat!(
+            "[UI]\n",
+            "Paths\\gamedirs\\size=1\n",
+            "Paths\\gamedirs\\1\\path=\"D:/Games/Homebrew, packs\"\n",
+            "Paths\\external_content_dirs\\size=2\n",
+            "Paths\\external_content_dirs\\1\\path=\"//server/share/Updates, packs\"\n",
+            "Paths\\external_content_dirs\\2\\path=\"\"\n",
+        );
+        assert_eq!(parse_game_dirs(contents)[0].path, "D:/Games/Homebrew, packs");
+        assert_eq!(parse_external_content_dirs(contents), vec!["//server/share/Updates, packs"]);
+    }
+
+    #[test]
+    fn directory_arrays_outside_ui_are_ignored_and_writes_target_ui() {
+        let document = concat!(
+            "[UI]\ntheme=default\n[WebService]\n",
+            "Paths\\gamedirs\\size=2\n",
+            "Paths\\gamedirs\\1\\path=SDMC\n",
+            "Paths\\gamedirs\\2\\path=\"D:/Games/Homebrew, packs\"\n",
+            "Paths\\external_content_dirs\\size=1\n",
+            "Paths\\external_content_dirs\\1\\path=\"D:/Updates, packs\"\n",
+        );
+        assert!(parse_game_dirs(document).is_empty());
+        assert!(parse_external_content_dirs(document).is_empty());
+        let dirs = vec![GameDir { path: "D:/Games/Homebrew".to_owned(), deep_scan: true, expanded: true }];
+        for original in [document, "[UI]\ntheme=default\n[WebService]\nenable_telemetry=false\n"] {
+            let written = replace_game_dirs(original, &dirs);
+            let written = replace_external_content_dirs(&written, &["D:/Updates".to_owned()]);
+            assert_eq!(parse_game_dirs(&written)[0].path, dirs[0].path);
+            assert_eq!(parse_external_content_dirs(&written), vec!["D:/Updates"]);
+            assert!(!written.split("[WebService]").nth(1).unwrap().contains("Paths\\"));
+        }
+    }
+
+    #[test]
+    fn directory_section_repair_is_backed_up_and_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("qt-config.ini");
+        let original = concat!(
+            "[UI]\ntheme=default\n[WebService]\nenable_telemetry=false\n",
+            "Paths\\gamedirs\\size=1\nPaths\\gamedirs\\1\\path=\"D:/Homebrew, games\"\n",
+            "Paths\\external_content_dirs\\size=1\nPaths\\external_content_dirs\\1\\path=D:/Updates\n",
+        );
+        std::fs::write(&path, original).unwrap();
+        assert!(repair_directory_array_sections(&path).unwrap());
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(parse_game_dirs(&repaired)[0].path, "D:/Homebrew, games");
+        assert_eq!(parse_external_content_dirs(&repaired), vec!["D:/Updates"]);
+        assert!(repaired.contains("[WebService]\nenable_telemetry=false"));
+        let backups: Vec<_> = std::fs::read_dir(root.path()).unwrap()
+            .map(|entry| entry.unwrap().path()).filter(|file| file != &path).collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
+        assert!(!repair_directory_array_sections(&path).unwrap());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
+    }
+
+    #[test]
+    fn directory_section_repair_preserves_canonical_ui_and_handles_missing_ui() {
+        let document = concat!("[UI]\nPaths\\gamedirs\\size=0\n[WebService]\n",
+            "Paths\\gamedirs\\size=1\nPaths\\gamedirs\\1\\path=D:/Stale\n");
+        let repaired = repaired_directory_array_sections(document).unwrap();
+        assert!(parse_game_dirs(&repaired).is_empty());
+        assert!(!repaired.contains("D:/Stale"));
+        assert!(repaired_directory_array_sections(&repaired).is_none());
+        let document = "[WebService]\nPaths\\gamedirs\\size=1\nPaths\\gamedirs\\1\\path=D:/Homebrew\n";
+        let repaired = repaired_directory_array_sections(document).unwrap();
+        assert_eq!(parse_game_dirs(&repaired)[0].path, "D:/Homebrew");
+    }
+
+    #[test]
+    fn directory_arrays_write_paths_with_upstream_quoting_and_slashes() {
+        let path = r"D:\Games\Homebrew, packs";
+        let dirs = vec![GameDir { path: path.to_owned(), deep_scan: true, expanded: true }];
+        let document = replace_game_dirs("[UI]\n", &dirs);
+        assert!(document.contains("path=\"D:/Games/Homebrew, packs\""));
+        assert_eq!(parse_game_dirs(&document)[0].path, "D:/Games/Homebrew, packs");
+        let document = replace_external_content_dirs("[UI]\n", &[path.to_owned()]);
+        assert!(document.contains("path=\"D:/Games/Homebrew, packs\""));
+        assert_eq!(parse_external_content_dirs(&document), vec!["D:/Games/Homebrew, packs"]);
     }
 
     #[test]

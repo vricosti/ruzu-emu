@@ -8,11 +8,39 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+mod suspension_event_tests {
+    use super::*;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use crate::hle::kernel::k_readable_event::KReadableEvent;
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+    use crate::hle::service::hle_ipc::KAutoObjectRef;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn suspension_event_returns_stable_unsignaled_handle() {
+        let service = IParentalControlService::new(crate::core::SystemRef::null(), Capability::SYSTEM);
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let readable = Arc::new(Mutex::new(KReadableEvent::new()));
+        readable.lock().unwrap().initialize(1, 2);
+        service.request_suspension_event.attach_kernel_event(readable.clone(), process.clone());
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+        for _ in 0..2 {
+            let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
+            service.handlers[&1457].handler_callback.unwrap()(&service, &mut ctx);
+            assert!(matches!(ctx.outgoing_copy_objects.as_slice(), [KAutoObjectRef::ObjectId(2)]));
+            assert!(!readable.lock().unwrap().is_signaled());
+        }
+    }
+}
+
 use super::pctl_results::*;
 use super::pctl_types::{ApplicationInfo, Capability, PlayTimerSettings, RestrictionSettings};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IParentalControlService.
@@ -155,12 +183,24 @@ pub struct IParentalControlService {
     settings: ParentalControlSettings,
     restriction_settings: RestrictionSettings,
     pin_code: [u8; 8],
+    request_suspension_event: Event,
     capability: Capability,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IParentalControlService {
+    fn get_play_timer_event_to_request_suspension_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let Some(id) = service.request_suspension_event.copy_object_id(ctx) else {
+            ResponseBuilder::new(ctx, 2, 0, 0).push_result(crate::hle::result::RESULT_UNKNOWN);
+            return;
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(id);
+    }
+
     /// Stub handler for nullptr entries -- logs STUBBED and returns RESULT_SUCCESS.
     fn stub_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let cmd = ctx.get_command();
@@ -493,7 +533,7 @@ impl IParentalControlService {
             ),
             (
                 commands::GET_PLAY_TIMER_EVENT_TO_REQUEST_SUSPENSION,
-                Some(Self::stub_handler),
+                Some(Self::get_play_timer_event_to_request_suspension_handler),
                 "GetPlayTimerEventToRequestSuspension",
             ),
             (
@@ -683,6 +723,7 @@ impl IParentalControlService {
             settings: ParentalControlSettings::default(),
             restriction_settings: RestrictionSettings::default(),
             pin_code: [0u8; 8],
+            request_suspension_event: Event::new(),
             capability,
             handlers,
             handlers_tipc: BTreeMap::new(),

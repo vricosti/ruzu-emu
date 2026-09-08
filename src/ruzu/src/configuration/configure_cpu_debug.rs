@@ -68,7 +68,7 @@ const TRAILING_BOOL_OPTIONS: &[(&str, BoolField)] = &[
 ];
 
 /// Build the CPU sub-tab of Debug — upstream `ConfigureCpuDebug`.
-pub fn page() -> Page {
+pub fn page(runtime_lock: bool) -> Page {
     let (scroller, column) = w::page();
 
     let (group, content) = w::group("Toggle CPU Optimizations");
@@ -90,6 +90,7 @@ pub fn page() -> Page {
             *field(&mut values).get_value()
         };
         let check = w::check_row(label, active);
+        check.set_sensitive(runtime_lock);
         content.append(&check);
         bool_checks.push((*field, check));
     }
@@ -100,6 +101,7 @@ pub fn page() -> Page {
             *field(&mut values).get_value()
         };
         let check = w::check_row(label, active);
+        check.set_sensitive(runtime_lock);
         content.append(&check);
         switchable_checks.push((*field, check));
     }
@@ -110,6 +112,7 @@ pub fn page() -> Page {
             *field(&mut values).get_value()
         };
         let check = w::check_row(label, active);
+        check.set_sensitive(runtime_lock);
         content.append(&check);
         bool_checks.push((*field, check));
     }

@@ -485,10 +485,10 @@ impl ProfileManager {
         if index >= MAX_USERS || index >= self.user_count {
             return false;
         }
-        if index < self.user_count - 1 {
-            self.profiles[index..].rotate_left(1);
-        }
-        self.profiles[MAX_USERS - 1] = ProfileInfo::default();
+        // RemoveProfileAtIndex clears the selected slot before stable-partitioning
+        // valid users. In particular, the last occupied slot need not be slot 7.
+        self.profiles[index] = ProfileInfo::default();
+        self.profiles.sort_by_key(|profile| profile.user_uuid == 0);
         self.user_count -= 1;
         self.is_save_needed = true;
         true
@@ -503,6 +503,58 @@ mod tests {
     };
     use common::fs::path_util::{set_ruzu_path, RuzuPath};
     use common::uuid::UUID;
+
+    #[test]
+    fn removed_profiles_stay_removed_after_disk_reload() {
+        const CHILD: &str = "RUZU_PROFILE_REMOVAL_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            set_ruzu_path(RuzuPath::NANDDir, std::path::Path::new(&root));
+            for count in 1..=MAX_USERS {
+                for removed in 0..count {
+                    let mut manager = ProfileManager {
+                        is_save_needed: false,
+                        profiles: Default::default(),
+                        stored_opened_profiles: Default::default(),
+                        user_count: 0,
+                        last_opened_user: 0,
+                    };
+                    let mut name = [0; PROFILE_USERNAME_SIZE];
+                    name[..8].copy_from_slice(b"Homebrew");
+                    for index in 0..count {
+                        assert_eq!(manager.create_new_user(index as u128 + 1, &name), super::RESULT_SUCCESS);
+                    }
+                    assert!(manager.remove_user(removed as u128 + 1));
+                    let expected: Vec<_> = (1..=count as u128)
+                        .filter(|uuid| *uuid != removed as u128 + 1).collect();
+                    assert_eq!(manager.user_count, expected.len());
+                    assert_eq!(&manager.get_all_users()[..expected.len()], expected.as_slice());
+                    assert!(manager.profiles[expected.len()..].iter().all(|p| p.user_uuid == 0));
+                    assert!(!manager.remove_user(removed as u128 + 1));
+                    manager.write_user_save_file();
+                    let bytes = std::fs::read(std::path::Path::new(&root)
+                        .join("system/save/8000000000000010/su/avators/profiles.dat")).unwrap();
+                    assert!(bytes[0x10 + expected.len() * 0xc8..].iter().all(|b| *b == 0));
+                    // Parse directly: the constructor deliberately creates a new
+                    // default user when the last profile has been removed.
+                    manager.profiles = Default::default();
+                    manager.user_count = 0;
+                    manager.parse_user_save_file();
+                    assert_eq!(manager.user_count, expected.len());
+                    assert_eq!(&manager.get_all_users()[..expected.len()], expected.as_slice());
+                }
+            }
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("ruzu-profile-removal-{}-{}",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&root).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", std::thread::current().name().unwrap(), "--test-threads=1"])
+            .env(CHILD, &root).status().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn profile_manager_new_creates_and_opens_default_user() {

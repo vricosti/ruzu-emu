@@ -148,7 +148,7 @@ fn upstream_optimization_config(
         CpuAccuracy::Paranoid => {
             flags = OptimizationFlag::NO_OPTIMIZATIONS;
         }
-        CpuAccuracy::Accurate => {}
+        CpuAccuracy::Accurate | CpuAccuracy::Debugging => {}
     }
 
     (flags, unsafe_optimizations, fastmem_address_space_bits)
@@ -2367,7 +2367,7 @@ impl ArmDynarmic64 {
 
         let settings = common::settings::values();
         let (mut optimizations, mut unsafe_optimizations, fastmem_address_space_bits) =
-            if *settings.cpu_debug_mode.get_value() {
+            if common::settings::is_cpu_debug_enabled(&settings) {
                 (
                     OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
                     false,
@@ -2391,7 +2391,7 @@ impl ArmDynarmic64 {
         let mut only_detect_misalignment_via_page_table_on_page_boundary = true;
         let mut check_halt_on_memory_access = debugger_enabled;
 
-        if *settings.cpu_debug_mode.get_value() {
+        if common::settings::is_cpu_debug_enabled(&settings) {
             if !*settings.cpuopt_page_tables.get_value() {
                 page_table_pointer = None;
             }

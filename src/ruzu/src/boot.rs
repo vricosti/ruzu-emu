@@ -564,7 +564,10 @@ fn run_boot(
     // Subsystem factory (upstream SetupForApplicationProcess): Host1x + GPU +
     // selected renderer + AudioCore. Called during `system.load()`.
     let renderer_backend = *common::settings::values().renderer_backend.get_value();
-    if let Some(detail) = renderer_backend_unavailable_detail(renderer_backend) {
+    // A per-game configuration loaded by this worker may select Vulkan again.
+    // Never re-enter a driver that the frontend's isolated startup probe crashed.
+    let has_broken_vulkan = crate::uisettings::with(|values| values.has_broken_vulkan);
+    if let Some(detail) = renderer_backend_unavailable_detail(renderer_backend, has_broken_vulkan) {
         log::error!("Renderer backend {renderer_backend:?} is unavailable on this host");
         loading_event(LoadingEvent::Failed {
             message: "Unable to start the game".to_owned(),
@@ -977,7 +980,7 @@ fn run_boot(
     // `System`, samples the same counters as upstream's 500 ms GUI timer, and
     // waits for a stop request between samples.
     let (stopped_by_frontend, force_stop) = loop {
-        if guest_exit_requested.load(Ordering::Acquire) || system.debugger_shutdown_requested() {
+        if guest_exit_requested.load(Ordering::Acquire) {
             break (false, false);
         }
         match command_rx.recv_timeout(Duration::from_millis(500)) {
@@ -1220,10 +1223,13 @@ fn load_error_detail(status: ruzu_core::core::SystemResultStatus) -> &'static st
 
 fn renderer_backend_unavailable_detail(
     backend: common::settings_enums::RendererBackend,
+    has_broken_vulkan: bool,
 ) -> Option<&'static str> {
     use common::settings_enums::RendererBackend;
 
-    if backend == RendererBackend::Metal && !cfg!(target_os = "macos") {
+    if backend == RendererBackend::Vulkan && has_broken_vulkan {
+        Some("Vulkan initialization failed during boot.")
+    } else if backend == RendererBackend::Metal && !cfg!(target_os = "macos") {
         Some(
             "The video renderer could not be initialized.\n\
              The Metal renderer is available only on macOS. Select another renderer in Configure > Graphics.",
@@ -1420,7 +1426,7 @@ mod tests {
             RendererBackend::OpenGlGlasm,
             RendererBackend::OpenGlSpirV,
         ] {
-            let detail = renderer_backend_unavailable_detail(backend);
+            let detail = renderer_backend_unavailable_detail(backend, false);
             assert_eq!(detail.is_some(), apple_silicon);
             if let Some(detail) = detail {
                 assert!(detail.contains("Apple Silicon"));
@@ -1429,17 +1435,32 @@ mod tests {
             }
         }
         assert_eq!(
-            renderer_backend_unavailable_detail(RendererBackend::Vulkan),
+            renderer_backend_unavailable_detail(RendererBackend::Vulkan, false),
             None
         );
         assert_eq!(
-            renderer_backend_unavailable_detail(RendererBackend::Null),
+            renderer_backend_unavailable_detail(RendererBackend::Null, false),
             None
         );
-        let metal_detail = renderer_backend_unavailable_detail(RendererBackend::Metal);
+        let metal_detail = renderer_backend_unavailable_detail(RendererBackend::Metal, false);
         assert_eq!(metal_detail.is_some(), !cfg!(target_os = "macos"));
         if let Some(detail) = metal_detail {
             assert!(detail.contains("only on macOS"));
+        }
+        for backend in [
+            RendererBackend::Vulkan,
+            RendererBackend::Null,
+            RendererBackend::Metal,
+            RendererBackend::OpenGlGlsl,
+            RendererBackend::OpenGlGlasm,
+            RendererBackend::OpenGlSpirV,
+        ] {
+            let blocked = renderer_backend_unavailable_detail(backend, true);
+            if backend == RendererBackend::Vulkan {
+                assert_eq!(blocked, Some("Vulkan initialization failed during boot."));
+            } else {
+                assert_eq!(blocked, renderer_backend_unavailable_detail(backend, false));
+            }
         }
     }
 }

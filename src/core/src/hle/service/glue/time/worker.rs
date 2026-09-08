@@ -595,7 +595,7 @@ mod tests {
     fn retains_manager_owned_resource_allocations() {
         let time_manager = make_time_manager();
         let time_manager: SessionRequestHandlerPtr = time_manager;
-        let steady_clock_resource = Arc::new(Mutex::new(StandardSteadyClockResource::new()));
+        let steady_clock_resource = Arc::new(Mutex::new(StandardSteadyClockResource::new(SystemRef::null())));
         let file_timestamp_worker = Arc::new(Mutex::new(FileTimestampWorker::new()));
         let worker = TimeWorker::new(
             SystemRef::null(),
@@ -675,7 +675,7 @@ mod tests {
             SystemRef::null(),
             time_manager_handler,
             Arc::new(CoreTiming::new()),
-            Arc::new(Mutex::new(StandardSteadyClockResource::new())),
+            Arc::new(Mutex::new(StandardSteadyClockResource::new(SystemRef::null()))),
             Arc::new(Mutex::new(FileTimestampWorker::new())),
         );
         worker.initialize(time_sm, set_sys_handler);

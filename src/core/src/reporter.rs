@@ -1,6 +1,4 @@
-//! Port of zuyu/src/core/reporter.h and zuyu/src/core/reporter.cpp
-//! Status: COMPLET
-//! Derniere synchro: 2026-03-11
+//! Counterpart of Eden's core/reporter.{h,cpp}.
 //!
 //! Reporter class for saving telemetry/crash/error reports as JSON files.
 //! Reports are written to the log directory under type-specific subdirectories.
@@ -19,8 +17,9 @@ use common::settings;
 pub enum PlayReportType {
     Old = 0,
     Old2 = 1,
-    New = 2,
-    System = 3,
+    Old3 = 2,
+    New = 3,
+    System = 4,
 }
 
 /// Reporter for generating and saving various report types.
@@ -38,35 +37,31 @@ pub struct Reporter {
 // --- Private helper functions (matching anonymous namespace in C++) ---
 
 fn get_timestamp() -> String {
-    let now = chrono_like_timestamp();
-    now
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    timestamp_at(now).unwrap_or_else(|| "unknown-time".to_owned())
 }
 
-/// Simple timestamp generation without requiring the chrono crate.
-fn chrono_like_timestamp() -> String {
-    use std::time::SystemTime;
-
-    let duration = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-
-    // Convert to a simple date-time string
-    // This is a simplified version; a real implementation would use proper time formatting
-    let hours = (secs / 3600) % 24;
-    let minutes = (secs / 60) % 60;
-    let seconds = secs % 60;
-    let days = secs / 86400;
-    // Approximate date calculation (not fully accurate but functional)
-    let years = 1970 + days / 365;
-    let remaining_days = days % 365;
-    let months = remaining_days / 30 + 1;
-    let day = remaining_days % 30 + 1;
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}",
-        years, months, day, hours, minutes, seconds
-    )
+// GetTimestamp's local-time conversion, split only to test calendar boundaries.
+// Reentrant libc APIs avoid the shared std::localtime buffer used in C++.
+fn timestamp_at(timestamp: libc::time_t) -> Option<String> {
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
+    let valid = unsafe { !libc::localtime_r(&timestamp, &mut local).is_null() };
+    #[cfg(windows)]
+    let valid = unsafe { libc::localtime_s(&mut local, &timestamp) == 0 };
+    #[cfg(not(any(unix, windows)))]
+    let valid = false;
+    valid.then(|| {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}",
+            local.tm_year + 1900,
+            local.tm_mon + 1,
+            local.tm_mday,
+            local.tm_hour,
+            local.tm_min,
+            local.tm_sec,
+        )
+    })
 }
 
 fn get_path(report_type: &str, title_id: u64, timestamp: &str) -> PathBuf {
@@ -89,8 +84,17 @@ fn save_to_file(json: &serde_json::Value, filename: &PathBuf) {
 
     match fs::File::create(filename) {
         Ok(mut file) => {
-            let json_str = serde_json::to_string_pretty(json).unwrap_or_default();
-            if let Err(e) = file.write_all(json_str.as_bytes()) {
+            let mut bytes = Vec::new();
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+            let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, formatter);
+            if let Err(e) = serde::Serialize::serialize(json, &mut serializer) {
+                log::error!("Failed to serialize report '{}': {}", filename.display(), e);
+                return;
+            }
+            bytes.push(b'\n'); // std::setw(4) << json << std::endl upstream.
+            #[cfg(windows)]
+            let bytes = String::from_utf8(bytes).unwrap().replace('\n', "\r\n").into_bytes();
+            if let Err(e) = file.write_all(&bytes) {
                 log::error!("Failed to write report to '{}': {}", filename.display(), e);
             }
         }
@@ -105,14 +109,15 @@ fn save_to_file(json: &serde_json::Value, filename: &PathBuf) {
 }
 
 fn get_ruzu_version_data() -> serde_json::Value {
+    use common::scm_rev;
     serde_json::json!({
-        "scm_rev": env!("CARGO_PKG_VERSION"),
-        "scm_branch": "unknown",
-        "scm_desc": "ruzu",
-        "build_name": "ruzu",
-        "build_date": "unknown",
-        "build_fullname": "ruzu",
-        "build_version": env!("CARGO_PKG_VERSION"),
+        "scm_rev": scm_rev::SCM_REV,
+        "scm_branch": scm_rev::SCM_BRANCH,
+        "scm_desc": scm_rev::SCM_DESC,
+        "build_name": scm_rev::BUILD_NAME,
+        "build_date": scm_rev::BUILD_DATE,
+        "build_fullname": scm_rev::BUILD_FULLNAME,
+        "build_version": scm_rev::BUILD_VERSION,
     })
 }
 
@@ -174,6 +179,40 @@ fn get_full_data_auto(timestamp: &str, title_id: u64) -> serde_json::Value {
     serde_json::json!({
         "yuzu_version": get_ruzu_version_data(),
         "report_common": get_report_common_data(title_id, 0, timestamp, None),
+    })
+}
+
+// Counterpart of GetHLEBufferDescriptorData<read_value, DescriptorType>.
+// Address/size iterators replace the three C++ descriptor template types;
+// output descriptors must never cause a guest-memory read.
+fn get_hle_buffer_descriptor_data<const READ_VALUE: bool>(
+    descriptors: impl Iterator<Item = (u64, u64)>,
+    memory: &crate::memory::memory::Memory,
+) -> serde_json::Value {
+    serde_json::Value::Array(descriptors.map(|(address, size)| {
+        let mut entry = serde_json::json!({
+            "address": format!("{address:016X}"),
+            "size": format!("{size:016X}"),
+        });
+        if READ_VALUE {
+            let mut data = vec![0; size as usize];
+            memory.read_block(address, &mut data);
+            entry["data"] = serde_json::Value::String(hex::encode_upper(data));
+        }
+        entry
+    }).collect())
+}
+
+fn get_hle_request_context_data(
+    ctx: &crate::hle::service::hle_ipc::HLERequestContext,
+    memory: &crate::memory::memory::Memory,
+) -> serde_json::Value {
+    serde_json::json!({
+        "command_buffer": ctx.command_buffer().iter().map(|word| format!("{word:08X}")).collect::<Vec<_>>(),
+        "buffer_descriptor_a": get_hle_buffer_descriptor_data::<true>(ctx.buffer_descriptor_a().iter().map(|d| (d.address(), d.size())), memory),
+        "buffer_descriptor_b": get_hle_buffer_descriptor_data::<false>(ctx.buffer_descriptor_b().iter().map(|d| (d.address(), d.size())), memory),
+        "buffer_descriptor_c": get_hle_buffer_descriptor_data::<false>(ctx.buffer_descriptor_c().iter().map(|d| (d.address(), d.size())), memory),
+        "buffer_descriptor_x": get_hle_buffer_descriptor_data::<true>(ctx.buffer_descriptor_x().iter().map(|d| (d.address(), d.size())), memory),
     })
 }
 
@@ -264,7 +303,7 @@ impl Reporter {
         });
 
         if let Some(buf) = resolved_buffer {
-            break_out["debug_buffer"] = serde_json::Value::String(hex::encode(buf));
+            break_out["debug_buffer"] = serde_json::Value::String(hex::encode_upper(buf));
         }
 
         out["svc_break"] = break_out;
@@ -302,9 +341,9 @@ impl Reporter {
             "system_tick": format!("{:016X}", system_tick),
         });
 
-        let normal_out: Vec<String> = normal_channel.iter().map(|d| hex::encode(d)).collect();
+        let normal_out: Vec<String> = normal_channel.iter().map(|d| hex::encode_upper(d)).collect();
         let interactive_out: Vec<String> =
-            interactive_channel.iter().map(|d| hex::encode(d)).collect();
+            interactive_channel.iter().map(|d| hex::encode_upper(d)).collect();
 
         out["applet_normal_data"] = serde_json::to_value(normal_out).unwrap_or_default();
         out["applet_interactive_data"] = serde_json::to_value(interactive_out).unwrap_or_default();
@@ -334,7 +373,7 @@ impl Reporter {
         out["yuzu_version"] = get_ruzu_version_data();
         out["report_common"] = get_report_common_data(title_id, 0, &timestamp, user_id);
 
-        let data_out: Vec<String> = data.iter().map(|d| hex::encode(d)).collect();
+        let data_out: Vec<String> = data.iter().map(|d| hex::encode_upper(d)).collect();
 
         if let Some(pid) = process_id {
             out["play_report_process_id"] = serde_json::Value::String(format!("{:016X}", pid));
@@ -373,7 +412,7 @@ impl Reporter {
     }
 
     /// Save a filesystem access log message.
-    pub fn save_fs_access_log(&self, log_message: &str) {
+    pub fn save_fs_access_log(&self, log_message: &[u8]) {
         let access_log_path =
             common_fs::path_util::get_ruzu_path(common_fs::path_util::RuzuPath::SDMCDir)
                 .join("FsAccessLog.txt");
@@ -383,7 +422,20 @@ impl Reporter {
             .append(true)
             .open(&access_log_path)
         {
-            let _ = file.write_all(log_message.as_bytes());
+            // Upstream string_view can contain non-UTF-8 bytes. TextFile uses
+            // the native CRT newline conversion on Windows, but none on POSIX.
+            #[cfg(windows)]
+            let text = {
+                let mut text = Vec::with_capacity(log_message.len());
+                for &byte in log_message {
+                    if byte == b'\n' { text.push(b'\r'); }
+                    text.push(byte);
+                }
+                text
+            };
+            #[cfg(windows)]
+            let log_message = text.as_slice();
+            let _ = file.write_all(log_message);
         }
     }
 
@@ -391,7 +443,8 @@ impl Reporter {
     /// Corresponds to upstream `Reporter::SaveUnimplementedFunctionReport`.
     pub fn save_unimplemented_function_report(
         &self,
-        title_id: u64,
+        system: crate::core::SystemRef,
+        ctx: &crate::hle::service::hle_ipc::HLERequestContext,
         command_id: u32,
         name: &str,
         service_name: &str,
@@ -401,13 +454,17 @@ impl Reporter {
         }
 
         let timestamp = get_timestamp();
+        let title_id = system.get().get_application_process_program_id();
         let mut out = get_full_data_auto(&timestamp, title_id);
 
-        out["function"] = serde_json::json!({
-            "command_id": command_id,
-            "function_name": name,
-            "service_name": service_name,
-        });
+        // Reporter is standalone in Rust; the caller supplies its SystemRef.
+        // Use application memory like upstream, not the IPC client's memory.
+        let memory = system.get().memory_shared().expect("application memory is not initialized");
+        let mut function_out = get_hle_request_context_data(ctx, &memory.lock().unwrap());
+        function_out["command_id"] = command_id.into();
+        function_out["function_name"] = name.into();
+        function_out["service_name"] = service_name.into();
+        out["function"] = function_out;
 
         save_to_file(&out, &get_path("unimpl_func_report", title_id, &timestamp));
     }
@@ -448,5 +505,212 @@ impl Reporter {
 impl Default for Reporter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_identity_comes_from_shared_build_metadata() {
+        use common::scm_rev;
+        let report = get_ruzu_version_data();
+        assert_eq!(report.as_object().unwrap().len(), 7);
+        for (name, expected) in [
+            ("scm_rev", scm_rev::SCM_REV), ("scm_branch", scm_rev::SCM_BRANCH),
+            ("scm_desc", scm_rev::SCM_DESC), ("build_name", scm_rev::BUILD_NAME),
+            ("build_date", scm_rev::BUILD_DATE), ("build_fullname", scm_rev::BUILD_FULLNAME),
+            ("build_version", scm_rev::BUILD_VERSION),
+        ] {
+            assert_eq!(report[name], expected);
+        }
+    }
+
+    #[test]
+    fn unimplemented_report_captures_request_and_only_input_buffer_data() {
+        const CHILD: &str = "RUZU_TEST_IPC_REPORT_CONTEXT";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "reporter::tests::unimplemented_report_captures_request_and_only_input_buffer_data"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            use std::sync::{Arc, Mutex};
+            use crate::core::{System, SystemRef};
+            use crate::device_memory::DeviceMemory;
+            use crate::hle::ipc;
+            use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+            use crate::hle::service::hle_ipc::HLERequestContext;
+            use crate::memory::memory::Memory;
+            use common::page_table::{PageTable, PageType};
+            use common::fs::path_util::{set_ruzu_path, RuzuPath};
+
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let directory = std::env::temp_dir().join(format!("ruzu-ipc-report-{}-{nonce}", std::process::id()));
+            fs::create_dir(&directory).unwrap();
+            fs::create_dir(directory.join("sdmc")).unwrap();
+            set_ruzu_path(RuzuPath::LogDir, &directory);
+            set_ruzu_path(RuzuPath::SDMCDir, &directory.join("sdmc"));
+            let reporter = Reporter::new();
+            let mut ctx = HLERequestContext::new();
+            settings::values_mut().reporting_services.set_value(false);
+            reporter.save_unimplemented_function_report(SystemRef::null(), &ctx, 99, "SyntheticCommand", "test:report");
+            assert!(!directory.join("unimpl_func_report").exists());
+
+            let device = Box::new(DeviceMemory::new());
+            let mut table = Box::new(PageTable::new());
+            table.resize(32, 12);
+            table.map_pages(3, 1, 0x3000, PageType::Memory,
+                device.buffer.backing_base_pointer() as usize + 0x3000);
+            let memory = Arc::new(Mutex::new(unsafe {
+                Memory::new(SystemRef::null(), device.as_ref() as *const _, &device.buffer as *const _)
+            }));
+            memory.lock().unwrap().set_current_page_table(table.as_mut() as *mut _, true);
+            memory.lock().unwrap().write_8(0x3000, 0xAB);
+            memory.lock().unwrap().write_8(0x3001, 0xCD);
+            memory.lock().unwrap().write_8(0x3010, 0xEF);
+            let mut system = Box::new(System::new());
+            let mut process = KProcess::new();
+            process.program_id = 42;
+            process.page_table.set_memory(memory.clone());
+            system.set_current_process_arc(Arc::new(ProcessLock::new(process)));
+            system.set_runtime_program_id(123); // Must use the process, not the launch cache.
+
+            let mut words = [0u32; ipc::COMMAND_BUFFER_LENGTH];
+            words[0] = ipc::CommandType::Request as u32 | (1 << 16) | (1 << 20) | (1 << 24);
+            words[1] = 8 | ((ipc::BufferDescriptorCFlag::OneDescriptor as u32) << 10);
+            words[2] = 1 << 16; // X: one byte at 0x3010.
+            words[3] = 0x3010;
+            words[4..7].copy_from_slice(&[2, 0x3000, 0]); // A
+            words[7..10].copy_from_slice(&[16, 0x9000, 0]); // B, deliberately unmapped.
+            words[12] = u32::from_le_bytes(*b"SFCI");
+            words[14] = 99;
+            words[18] = 0xA000; // C, also unmapped.
+            words[19] = 32 << 16;
+            words[ipc::COMMAND_BUFFER_LENGTH - 1] = 0xDEAD_BEEF;
+            ctx.populate_from_incoming_command_buffer(&words);
+            assert_eq!(ctx.get_command(), 99);
+            assert!(ctx.get_memory().is_none()); // Read application memory, not ctx memory.
+            let request_words = *ctx.command_buffer();
+            settings::values_mut().reporting_services.set_value(true);
+            reporter.save_unimplemented_function_report(SystemRef::from_ref(&system), &ctx,
+                ctx.get_command(), "SyntheticCommand", "test:report");
+            assert_eq!(ctx.command_buffer(), &request_words);
+            // A later stub reply must not overwrite the saved input snapshot.
+            crate::hle::service::ipc_helpers::ResponseBuilder::new(&mut ctx, 2, 0, 0)
+                .push_result(crate::hle::result::RESULT_SUCCESS);
+            let paths: Vec<_> = fs::read_dir(directory.join("unimpl_func_report")).unwrap().map(|e| e.unwrap().path()).collect();
+            assert_eq!(paths.len(), 1);
+            let report: serde_json::Value = serde_json::from_slice(&fs::read(&paths[0]).unwrap()).unwrap();
+            assert_eq!(report["report_common"]["title_id"], "000000000000002A");
+            let function = &report["function"];
+            assert_eq!(function["command_id"], 99);
+            assert_eq!(function["function_name"], "SyntheticCommand");
+            assert_eq!(function["service_name"], "test:report");
+            assert_eq!(function["command_buffer"], serde_json::json!(request_words.iter().map(|word| format!("{word:08X}")).collect::<Vec<_>>()));
+            for (kind, address, size, data) in [
+                ("a", 0x3000, 2, Some("ABCD")), ("x", 0x3010, 1, Some("EF")),
+                ("b", 0x9000, 16, None), ("c", 0xA000, 32, None),
+            ] {
+                let entries = function[format!("buffer_descriptor_{kind}")].as_array().unwrap();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0]["address"], format!("{address:016X}"));
+                assert_eq!(entries[0]["size"], format!("{size:016X}"));
+                assert_eq!(entries[0].get("data").and_then(|v| v.as_str()), data);
+            }
+            settings::values_mut().reporting_services.set_value(false);
+            drop(system);
+            drop(memory);
+            drop(table);
+            drop(device);
+            fs::remove_dir_all(directory).unwrap();
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn diagnostic_payloads_preserve_hex_case_and_empty_channels() {
+        const CHILD: &str = "RUZU_TEST_REPORT_PAYLOADS";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "reporter::tests::diagnostic_payloads_preserve_hex_case_and_empty_channels"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        use common::fs::path_util::{set_ruzu_path, RuzuPath};
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("ruzu-report-data-{}-{nonce}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        set_ruzu_path(RuzuPath::LogDir, &directory);
+        let sdmc = directory.join("sdmc");
+        fs::create_dir(&sdmc).unwrap();
+        set_ruzu_path(RuzuPath::SDMCDir, &sdmc);
+        let read_report = |kind: &str| -> serde_json::Value {
+            let files: Vec<_> = fs::read_dir(directory.join(kind)).unwrap().map(|e| e.unwrap().path()).collect();
+            assert_eq!(files.len(), 1);
+            let bytes = fs::read(&files[0]).unwrap();
+            let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+            assert!(bytes.starts_with(format!("{{{newline}    \"").as_bytes()));
+            assert!(bytes.ends_with(newline.as_bytes()));
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        settings::values_mut().reporting_services.set_value(false);
+        let reporter = Reporter::new();
+        reporter.save_svc_break_report(42, 0, false, 0, 0, Some(&[0xAB]));
+        assert!(!directory.join("svc_break_report").exists());
+        settings::values_mut().reporting_services.set_value(true);
+        reporter.save_svc_break_report(42, 0, false, 0, 0, Some(&[0xAB, 0xCD]));
+        assert_eq!(read_report("svc_break_report")["svc_break"]["debug_buffer"], "ABCD");
+        reporter.save_unimplemented_applet_report(42, 0, 0, 0, 0, false, 0,
+            &[vec![0xEF], vec![]], &[vec![0xAB, 0xCD]]);
+        let report = read_report("unimpl_applet_report");
+        assert_eq!(report["applet_normal_data"], serde_json::json!(["EF", ""]));
+        assert_eq!(report["applet_interactive_data"], serde_json::json!(["ABCD"]));
+        settings::values_mut().reporting_services.set_value(false);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn report_timestamp_uses_real_local_calendar() {
+        const CHILD: &str = "RUZU_TEST_REPORT_TIMESTAMP";
+        if std::env::var_os(CHILD).is_none() {
+            for zone in ["UTC", "EST5"] {
+                assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "reporter::tests::report_timestamp_uses_real_local_calendar"
+                    ])
+                    .env(CHILD, "1")
+                    .env("TZ", zone)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            return;
+        }
+        if std::env::var("TZ").unwrap() == "UTC" {
+            assert_eq!(
+                timestamp_at(1_709_210_096).as_deref(),
+                Some("2024-02-29T12-34-56")
+            );
+            assert_eq!(
+                timestamp_at(1_767_225_599).as_deref(),
+                Some("2025-12-31T23-59-59")
+            );
+            assert_eq!(
+                timestamp_at(1_767_225_600).as_deref(),
+                Some("2026-01-01T00-00-00")
+            );
+        } else {
+            assert_eq!(
+                timestamp_at(1_709_210_096).as_deref(),
+                Some("2024-02-29T07-34-56")
+            );
+            assert_eq!(
+                timestamp_at(1_767_225_600).as_deref(),
+                Some("2025-12-31T19-00-00")
+            );
+        }
     }
 }

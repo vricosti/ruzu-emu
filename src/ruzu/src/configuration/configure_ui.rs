@@ -254,6 +254,9 @@ pub fn page() -> Page {
         // Upstream re-runs `UpdateUITheme()` from `OnConfigure` when the theme
         // changed, so the new stylesheet takes effect without a restart.
         crate::main_window::update_ui_theme();
+        // ConfigureUi::ApplyConfiguration requests a list rebuild after the
+        // settings are applied; recycled GTK rows must be rebound as well.
+        uisettings::request_game_list_reload();
     })
 }
 

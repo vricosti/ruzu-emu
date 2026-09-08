@@ -43,7 +43,45 @@ const PAGE_RENDER: &str = "render";
 
 /// Default window geometry, mirroring `main.ui` (`1280 x 720`).
 const DEFAULT_WIDTH: i32 = 1280;
+// MainWindow::default_mouse_hide_timeout (milliseconds).
+const DEFAULT_MOUSE_HIDE_TIMEOUT: u64 = 2500;
 const DEFAULT_HEIGHT: i32 = 720;
+
+/// Snapshot the TAS owner before touching GTK. SDL's macOS HID enumeration can
+/// dispatch nested main-loop callbacks while InputSubsystem is mutably borrowed.
+/// A busy owner means defer this display refresh, not that TAS has stopped.
+fn try_tas_ui_status(
+    input: &RefCell<input_common::main_common::InputSubsystem>,
+) -> Result<
+    Option<(input_common::drivers::tas_input::TasState, usize,
+        [usize; input_common::drivers::tas_input::PLAYER_NUMBER])>,
+    std::cell::BorrowError,
+> {
+    let tas = input.try_borrow()?.get_tas();
+    Ok(tas.map(|tas| tas.lock().get_status()))
+}
+
+#[cfg(test)]
+mod tas_reentrancy_tests {
+    use super::*;
+
+    #[test]
+    fn nested_tas_refresh_defers_until_input_pump_releases_owner() {
+        let input = RefCell::new(input_common::main_common::InputSubsystem::new());
+        let pumping = input.borrow_mut();
+        assert!(try_tas_ui_status(&input).is_err());
+        drop(pumping);
+        assert_eq!(try_tas_ui_status(&input).unwrap(), None);
+        assert!(input.try_borrow_mut().is_ok(), "snapshot must not retain a borrow across GTK calls");
+    }
+
+    #[test]
+    fn shared_input_reader_does_not_block_tas_refresh() {
+        let input = RefCell::new(input_common::main_common::InputSubsystem::new());
+        let _reader = input.borrow();
+        assert_eq!(try_tas_ui_status(&input).unwrap(), None);
+    }
+}
 
 fn idle_window_title() -> String {
     format!(
@@ -108,6 +146,18 @@ enum NandInstallEvent {
 pub enum StartGameType {
     Normal,
     Global,
+}
+
+/// The accepted/rejected result of upstream SelectAndSetCurrentUser.
+fn apply_profile_selection(
+    index: Option<usize>,
+    current_user: &mut common::settings_common::Setting<i32>,
+) -> bool {
+    let Some(index) = index else {
+        return false;
+    };
+    current_user.set_value(index as i32);
+    true
 }
 
 fn boot_parameters_for_start_type(start_type: StartGameType) -> crate::boot::BootParameters {
@@ -317,12 +367,53 @@ mod render_geometry_tests {
     }
 }
 
+// Mechanical extraction of the two identical automatic-state branches in
+// Eden's OnAppFocusStateChanged, kept in the owning module for regression tests.
+fn background_setting_transition(
+    active: bool,
+    enabled: bool,
+    current: bool,
+    automatic: bool,
+) -> (bool, bool) {
+    if enabled && !active && !current {
+        (true, true)
+    } else if active && automatic {
+        // Also release an automatic state if its option was disabled meanwhile.
+        (false, false)
+    } else {
+        (current, automatic)
+    }
+}
+
+#[cfg(test)]
+mod background_setting_tests {
+    use super::background_setting_transition as transition;
+
+    #[test]
+    fn automatic_state_round_trip_is_idempotent() {
+        assert_eq!(transition(false, true, false, false), (true, true));
+        assert_eq!(transition(false, true, true, true), (true, true));
+        assert_eq!(transition(true, true, true, true), (false, false));
+        assert_eq!(transition(true, true, false, false), (false, false));
+    }
+
+    #[test]
+    fn manual_pause_or_mute_is_not_undone() {
+        assert_eq!(transition(false, true, true, false), (true, false));
+        assert_eq!(transition(true, true, true, false), (true, false));
+        assert_eq!(transition(false, false, false, false), (false, false));
+    }
+
+    #[test]
+    fn disabling_option_does_not_leave_automatic_state_stuck() {
+        assert_eq!(transition(true, false, true, true), (false, false));
+    }
+}
+
 /// The main launcher window.
 ///
 /// Upstream `GMainWindow` derives from `QMainWindow`; here we wrap a
-/// `gtk::ApplicationWindow`. Kept as a thin newtype so future state (game list
-/// model, status labels, emulation handles) can hang off it the way the
-/// upstream class members do.
+/// `gtk::ApplicationWindow` and retain the frontend session state.
 pub struct GMainWindow {
     window: ApplicationWindow,
     /// Multiplayer client. Upstream keeps it in `Core::System`'s room network;
@@ -340,6 +431,8 @@ pub struct GMainWindow {
     /// The active emulation session, if a game is running (upstream keeps the
     /// `System` + emu thread on `GMainWindow`).
     session: RefCell<Option<EmulationSession>>,
+    auto_paused: Cell<bool>,
+    auto_muted: Cell<bool>,
     /// Upstream `GMainWindow::current_game_path` and the copy retained by
     /// `OnRestartGame` while `ShutdownGame` clears the current path.
     current_game_path: RefCell<Option<String>>,
@@ -357,15 +450,18 @@ pub struct GMainWindow {
     /// Invalidates the previous session's GTK event poller when another title
     /// is booted before that poller receives a terminal event.
     session_generation: Cell<u64>,
+    profile_selection_pending: Cell<bool>,
     /// Bottom status bar (renderer / accuracy / dock / filter / AA / volume).
     status_bar: Rc<StatusBar>,
     /// Last TAS state reflected in the menu labels.
     tas_state: Cell<input_common::drivers::tas_input::TasState>,
+    is_tas_recording_dialog_active: Cell<bool>,
     /// Prevent duplicate asynchronous amiibo file choosers.
     is_amiibo_file_select_active: Cell<bool>,
     /// Native render-window handles for the running game, so it can be resized
     /// when the GTK window resizes.
     render: RefCell<Option<RenderHandles>>,
+    mouse_hide_timer: RefCell<Option<glib::SourceId>>,
     /// Last native render rectangle, including origin and DPI, so the child
     /// surface cannot drift over the menu/status bars after a restore.
     render_geometry: Cell<Option<RenderGeometry>>,
@@ -755,6 +851,26 @@ mod start_game_type_tests {
     use super::*;
 
     #[test]
+    fn profile_cancel_preserves_user_and_prevents_boot_continuation() {
+        let mut values = common::settings::Values::default();
+        values.current_user.set_value(2);
+        assert!(!apply_profile_selection(None, &mut values.current_user));
+        assert_eq!(*values.current_user.get_value(), 2);
+    }
+
+    #[test]
+    fn profile_accept_sets_user_before_allowing_boot_continuation() {
+        let mut values = common::settings::Values::default();
+        for selected in [3, 0] {
+            assert!(apply_profile_selection(
+                Some(selected),
+                &mut values.current_user,
+            ));
+            assert_eq!(*values.current_user.get_value(), selected as i32);
+        }
+    }
+
+    #[test]
     fn global_menu_action_bypasses_only_the_per_game_configuration() {
         assert!(!boot_parameters_for_start_type(StartGameType::Normal).use_global_configuration);
         assert!(boot_parameters_for_start_type(StartGameType::Global).use_global_configuration);
@@ -1076,6 +1192,17 @@ impl GMainWindow {
     }
 
     fn new_with_config_import_offer(app: &Application, offer_config_import: bool) -> Rc<Self> {
+        frontend_common::settings_generator::generate_settings();
+        if crate::uisettings::with(|values| values.has_broken_vulkan) {
+            // Upstream selects OpenGL when built with it, otherwise Null.
+            // The Apple Silicon frontend deliberately does not support OpenGL.
+            let fallback = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                common::settings_enums::RendererBackend::Null
+            } else {
+                common::settings_enums::RendererBackend::OpenGlGlsl
+            };
+            common::settings::values_mut().renderer_backend.set_value(fallback);
+        }
         let idle_title = idle_window_title();
         let window = ApplicationWindow::builder()
             .application(app)
@@ -1204,6 +1331,8 @@ impl GMainWindow {
             stack,
             loading_screen,
             session: RefCell::new(None),
+            auto_paused: Cell::new(false),
+            auto_muted: Cell::new(false),
             current_game_path: RefCell::new(None),
             pending_restart_path: RefCell::new(None),
             close_confirmation_pending: Cell::new(false),
@@ -1211,10 +1340,13 @@ impl GMainWindow {
             stop_confirmation_pending: Cell::new(false),
             shutdown_dialog: RefCell::new(None),
             session_generation: Cell::new(0),
+            profile_selection_pending: Cell::new(false),
             status_bar,
             tas_state: Cell::new(input_common::drivers::tas_input::TasState::Stopped),
+            is_tas_recording_dialog_active: Cell::new(false),
             is_amiibo_file_select_active: Cell::new(false),
             render: RefCell::new(None),
+            mouse_hide_timer: RefCell::new(None),
             render_geometry: Cell::new(None),
             configure_dialog: RefCell::new(None),
             game_list: RefCell::new(None),
@@ -1227,6 +1359,30 @@ impl GMainWindow {
         });
 
         controller_applet_frontend.start();
+        // Qt reports application focus, not just focus of the main window.
+        // Defer until GTK has completed a focus transfer to another dialog.
+        this.window.connect_is_active_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            this,
+            move |_| {
+                glib::idle_add_local_once(glib::clone!(
+                    #[weak]
+                    this,
+                    move || this.on_app_focus_state_changed(),
+                ));
+            }
+        ));
+        app.connect_active_window_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            this,
+            move |_| {
+                glib::idle_add_local_once(glib::clone!(
+                    #[weak]
+                    this,
+                    move || this.on_app_focus_state_changed(),
+                ));
+            }
+        ));
         error_applet_frontend.start();
         software_keyboard_frontend.start();
 
@@ -1345,6 +1501,12 @@ impl GMainWindow {
                     handles.emu_window.set_shown(false);
                 }
             }
+        ));
+
+        this.stack.connect_visible_child_name_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            this,
+            move |_| this.show_mouse_cursor()
         ));
 
         // Keep the embedded render surface sized to the central stack as the
@@ -1559,6 +1721,7 @@ impl GMainWindow {
         window_action!("verify_installed_contents", on_verify_installed_contents);
         window_action!("load_amiibo", on_load_amiibo);
         window_action!("load_album", on_album);
+        window_action!("load_home_menu", on_home_menu);
         window_action!("load_mii_edit", on_mii_edit);
         window_action!("open_controller_menu", on_open_controller_menu);
         window_action!("migration_tool", on_migration_tool);
@@ -1898,6 +2061,7 @@ impl GMainWindow {
             self,
             move |gesture, _press_count, x, y| {
                 this.on_mouse_button_pressed(gesture.current_button(), x, y);
+                this.on_mouse_activity();
             }
         ));
         clicks.connect_released(glib::clone!(
@@ -1916,6 +2080,7 @@ impl GMainWindow {
             self,
             move |_, x, y| {
                 this.on_mouse_motion(x, y);
+                this.on_mouse_activity();
             }
         ));
         self.window.add_controller(motion);
@@ -1935,6 +2100,48 @@ impl GMainWindow {
             }
         ));
         self.window.add_controller(scroll);
+    }
+
+    /// MainWindow::ShowMouseCursor. GTK owns the cursor over the render area;
+    /// menus and modal dialogs keep their own cursor. A one-shot GLib source
+    /// replaces Qt's restarted timer without periodic wakeups once hidden.
+    fn show_mouse_cursor(self: &Rc<Self>) {
+        if let Some(timer) = self.mouse_hide_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        self.stack.set_cursor_from_name(None);
+        let active = self.stack.visible_child_name().as_deref() == Some(PAGE_RENDER);
+        let enabled = crate::uisettings::with(|values| *values.hide_mouse.get_value());
+        if !should_hide_mouse(active, enabled) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let timer = glib::timeout_add_local_once(
+            std::time::Duration::from_millis(DEFAULT_MOUSE_HIDE_TIMEOUT),
+            move || {
+                if let Some(this) = weak.upgrade() {
+                    this.mouse_hide_timer.borrow_mut().take();
+                    this.hide_mouse_cursor();
+                }
+            },
+        );
+        *self.mouse_hide_timer.borrow_mut() = Some(timer);
+    }
+
+    /// MainWindow::HideMouseCursor; recheck the live setting at expiration.
+    fn hide_mouse_cursor(&self) {
+        let active = self.stack.visible_child_name().as_deref() == Some(PAGE_RENDER);
+        let enabled = crate::uisettings::with(|values| *values.hide_mouse.get_value());
+        self.stack.set_cursor_from_name(
+            should_hide_mouse(active, enabled).then_some("none"),
+        );
+    }
+
+    /// MainWindow::OnMouseActivity.
+    fn on_mouse_activity(self: &Rc<Self>) {
+        if !*common::settings::values().mouse_panning.get_value() {
+            self.show_mouse_cursor();
+        }
     }
 
     /// Port of `GRenderWindow::focusOutEvent`.
@@ -2075,6 +2282,25 @@ impl GMainWindow {
 
     /// Run the checks that upstream performs after presenting the main window.
     fn run_startup_checks(self: &Rc<Self>, offer_config_import: bool) {
+        if crate::uisettings::with(|values| values.has_broken_vulkan) {
+            crate::gtk_compat::show_message_then(
+                Some(&self.window),
+                "Broken Vulkan Installation Detected",
+                "Vulkan initialization failed during boot.",
+                glib::clone!(
+                    #[weak(rename_to = this)]
+                    self,
+                    move || this.run_content_startup_checks(offer_config_import)
+                ),
+            );
+            return;
+        }
+        self.run_content_startup_checks(offer_config_import);
+    }
+
+    // Continue after GTK's asynchronous Vulkan warning is acknowledged; unlike
+    // Qt's blocking warning, the callback must own this sequencing explicitly.
+    fn run_content_startup_checks(self: &Rc<Self>, offer_config_import: bool) {
         if offer_config_import && self.maybe_offer_user_data_migration() {
             return;
         }
@@ -2309,6 +2535,9 @@ impl GMainWindow {
 
         if completion.selection.configuration {
             crate::configuration::qt_config::load_global_values();
+            // GTK migration is asynchronous, after construction rather than
+            // before GenerateSettings as in Eden's constructor.
+            frontend_common::settings_generator::generate_settings();
         }
 
         // Imported configuration may contain absolute paths into any legacy
@@ -2860,6 +3089,18 @@ impl GMainWindow {
         );
     }
 
+    fn on_home_menu(self: &Rc<Self>) {
+        use ruzu_core::hle::service::am::am_types::{AppletId, AppletProgramId};
+        // Eden's LaunchFirmwareApplet also uses LibraryAppletParameters for
+        // QLaunch; AppletManager handles its foreground/input setup separately.
+        self.launch_system_applet(
+            AppletProgramId::QLaunch,
+            AppletId::QLaunch,
+            "Home Menu",
+            None,
+        );
+    }
+
     fn on_album(self: &Rc<Self>) {
         use ruzu_core::hle::service::am::am_types::{AppletId, AppletProgramId};
         self.launch_system_applet(
@@ -3065,7 +3306,7 @@ impl GMainWindow {
     }
 
     fn on_tas_record(self: &Rc<Self>) {
-        if self.session.borrow().is_none() {
+        if self.session.borrow().is_none() || self.is_tas_recording_dialog_active.get() {
             return;
         }
         self.reset_tas_system_buttons();
@@ -3077,13 +3318,25 @@ impl GMainWindow {
             return;
         }
         self.refresh_tas_ui();
+        if !*common::settings::values().tas_show_recording_dialog.get_value() {
+            tas.lock().save_recording(true);
+            return;
+        }
+        self.is_tas_recording_dialog_active.set(true);
+        let this = Rc::downgrade(self);
         crate::gtk_compat::ask_question(
             Some(&self.window),
             "TAS Recording",
             "Overwrite file of player 1?",
             "No",
             "Yes",
-            move |overwrite| tas.lock().save_recording(overwrite),
+            move |overwrite| {
+                tas.lock().save_recording(overwrite);
+                if let Some(this) = this.upgrade() {
+                    this.is_tas_recording_dialog_active.set(false);
+                    this.refresh_tas_ui();
+                }
+            },
         );
     }
 
@@ -3098,11 +3351,16 @@ impl GMainWindow {
     fn refresh_tas_ui(&self) {
         use input_common::drivers::tas_input::TasState;
 
-        let status = if self.session.borrow().is_some() {
-            self.input_subsystem
-                .borrow()
-                .get_tas()
-                .map(|tas| tas.lock().get_status())
+        let Ok(session) = self.session.try_borrow() else {
+            return;
+        };
+        let running = session.is_some();
+        drop(session);
+        let status = if running {
+            let Ok(status) = try_tas_ui_status(&self.input_subsystem) else {
+                return;
+            };
+            status
         } else {
             None
         };
@@ -3178,6 +3436,7 @@ impl GMainWindow {
                     crate::hotkeys::apply_accelerators(&app);
                 }
                 this.status_bar.refresh();
+                this.show_mouse_cursor();
                 if crate::uisettings::take_game_list_reload_pending() {
                     let game_list = this.game_list.borrow().clone();
                     if let Some(game_list) = game_list {
@@ -3190,11 +3449,90 @@ impl GMainWindow {
             #[weak(rename_to = this)]
             self,
             move || {
-                this.configure_dialog.borrow_mut().take();
+                let dialog = this.configure_dialog.borrow_mut().take();
+                if dialog.as_ref().is_some_and(|dialog| dialog.reset_requested()) {
+                    if let Err(error) = this.reset_configuration() {
+                        crate::gtk_compat::show_warning(
+                            Some(&this.window), "Unable to reset settings",
+                            &format!("The reset could not finish. Some settings may already have been reset. {error}"),
+                        );
+                    }
+                }
             }
         ));
         dialog.present();
         *self.configure_dialog.borrow_mut() = Some(dialog);
+    }
+
+    /// MainWindow::OnConfigure's reset branch. The dialog has stopped input
+    /// configuration and closed without applying any pending page values.
+    fn reset_configuration(self: &Rc<Self>) -> std::io::Result<()> {
+        use common::fs::path_util::{get_ruzu_path, RuzuPath};
+        use crate::configuration::qt_config as config;
+        reset_configuration_files(
+            &get_ruzu_path(RuzuPath::ConfigDir),
+            &get_ruzu_path(RuzuPath::CacheDir),
+        )?;
+        let (game_dirs, favorites) = crate::uisettings::with(|values| {
+            (values.game_dirs.clone(), values.favorited_ids.clone())
+        });
+        common::settings::values_mut().disabled_addons.clear();
+        config::reload_all_values();
+        // Ruzu resets in-place rather than restarting the frontend.
+        frontend_common::settings_generator::generate_settings();
+        let mut filter = common::logging::filter::Filter::default();
+        filter.parse_filter_string(common::settings::values().log_filter.get_value());
+        common::logging::backend::set_global_filter(&filter);
+        common::logging::backend::set_color_console_backend_enabled(
+            crate::uisettings::with(|values| *values.show_console.get_value()),
+        );
+        crate::uisettings::with_mut(|values| {
+            values.game_dirs = game_dirs.clone();
+            values.favorited_ids = favorites.clone();
+        });
+        config::save_game_dirs(&game_dirs)?;
+        config::save_favorited_ids(&favorites)?;
+        config::save_global_values()?;
+        config::save_control_values()?;
+        config::save_shortcut_values()?;
+        config::save_view_values()?;
+        config::save_ui_language()?;
+        #[cfg(target_os = "linux")]
+        crate::gui_settings::set_force_x11(crate::uisettings::with(|values| {
+            *values.gui_force_x11.get_value()
+        }))?;
+        let language = crate::uisettings::with(|values| values.language.get_value().clone());
+        crate::i18n::set_language(&language);
+        update_ui_theme();
+        self.hid_core.lock().reload_input_devices();
+        if let Some(app) = self.window.application() {
+            crate::hotkeys::apply_accelerators(&app);
+            for (name, enabled) in [
+                ("show_filter_bar", crate::uisettings::with(|v| *v.show_filter_bar.get_value())),
+                ("show_status_bar", crate::uisettings::with(|v| *v.show_status_bar.get_value())),
+            ] {
+                if let Some(action) = app.lookup_action(name).and_downcast::<gio::SimpleAction>() {
+                    action.set_state(&enabled.to_variant());
+                }
+            }
+        }
+        self.refresh_menu_model();
+        self.status_bar.refresh();
+        self.window.set_default_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        self.window.set_fullscreened(false);
+        self.window.unmaximize();
+        self.window.set_decorated(true);
+        self.update_fullscreen_chrome(false);
+        self.show_mouse_cursor();
+        if let Some(game_list) = self.game_list.borrow().as_ref() {
+            game_list.set_filter_visible(crate::uisettings::with(|v| *v.show_filter_bar.get_value()));
+            game_list.reload();
+        }
+        crate::gamemode::stop();
+        if self.session.borrow().as_ref().is_some_and(|session| !session.is_paused()) {
+            crate::gamemode::start();
+        }
+        Ok(())
     }
 
     /// Upstream `GMainWindow::OnMenuInstallToNAND`: select one or more
@@ -3611,6 +3949,47 @@ impl GMainWindow {
         self.boot_game_with_parameters(filepath, crate::boot::BootParameters::default());
     }
 
+    fn boot_game_with_parameters(
+        self: &Rc<Self>,
+        filepath: String,
+        parameters: crate::boot::BootParameters,
+    ) {
+        if self.profile_selection_pending.get() {
+            return;
+        }
+        if crate::uisettings::with(|values| *values.select_user_on_boot.get_value()) {
+            self.select_and_set_current_user(filepath, parameters);
+        } else {
+            self.boot_game_after_profile_selection(filepath, parameters);
+        }
+    }
+
+    /// Eden's SelectAndSetCurrentUser, with an asynchronous GTK continuation
+    /// instead of QDialog::exec. Cancellation never enters the native boot path.
+    fn select_and_set_current_user(
+        self: &Rc<Self>,
+        filepath: String,
+        parameters: crate::boot::BootParameters,
+    ) {
+        self.profile_selection_pending.set(true);
+        let weak = Rc::downgrade(self);
+        crate::applets::profile_select::select_for_boot(
+            self.window.upcast_ref(),
+            &self.hid_core,
+            move |index| {
+                let Some(this) = weak.upgrade() else { return };
+                this.profile_selection_pending.set(false);
+                let accepted = apply_profile_selection(
+                    index,
+                    &mut common::settings::values_mut().current_user,
+                );
+                if accepted {
+                    this.boot_game_after_profile_selection(filepath, parameters);
+                }
+            },
+        );
+    }
+
     /// Upstream `GMainWindow::BootGameFromList`.
     fn boot_game_from_list(self: &Rc<Self>, filepath: String, start_type: StartGameType) {
         self.boot_game_with_parameters(filepath, boot_parameters_for_start_type(start_type));
@@ -3677,7 +4056,7 @@ impl GMainWindow {
     /// `GMainWindow::BootGame`: attach the Metal layer, show the loading screen,
     /// start the boot thread, and reveal the render view when loading completes.
     #[cfg(target_os = "macos")]
-    fn boot_game_with_parameters(
+    fn boot_game_after_profile_selection(
         self: &Rc<Self>,
         filepath: String,
         parameters: crate::boot::BootParameters,
@@ -3698,7 +4077,7 @@ impl GMainWindow {
                     && this.stack.width() > 0
                     && this.stack.height() > 0
                 {
-                    this.boot_game_with_parameters(filepath.clone(), parameters);
+                    this.boot_game_after_profile_selection(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
                     glib::ControlFlow::Continue
@@ -3712,6 +4091,7 @@ impl GMainWindow {
         // Stop any existing session first (upstream stops before re-booting).
         self.play_time_manager.stop();
         if let Some(mut session) = self.session.borrow_mut().take() {
+            crate::gamemode::stop();
             session.stop();
         }
         if let Some(tas) = self.input_subsystem.borrow().get_tas() {
@@ -3795,6 +4175,7 @@ impl GMainWindow {
                 Some(LoadingEvent::Started { program_id }) => {
                     this.play_time_manager.set_program_id(program_id);
                     this.play_time_manager.start();
+                    crate::gamemode::start();
                 }
                 Some(LoadingEvent::FirstFrame) => {
                     let stack = stack.clone();
@@ -3866,7 +4247,7 @@ impl GMainWindow {
     /// an X11 child `Window` instead of a `CAMetalLayer` sub-view, matching
     /// upstream's per-platform `GetWindowSystemInfo`.
     #[cfg(target_os = "linux")]
-    fn boot_game_with_parameters(
+    fn boot_game_after_profile_selection(
         self: &Rc<Self>,
         filepath: String,
         parameters: crate::boot::BootParameters,
@@ -3886,7 +4267,7 @@ impl GMainWindow {
                     && this.stack.width() > 0
                     && this.stack.height() > 0
                 {
-                    this.boot_game_with_parameters(filepath.clone(), parameters);
+                    this.boot_game_after_profile_selection(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
                     glib::ControlFlow::Continue
@@ -3900,6 +4281,7 @@ impl GMainWindow {
         // Stop any existing session first (upstream stops before re-booting).
         self.play_time_manager.stop();
         if let Some(mut session) = self.session.borrow_mut().take() {
+            crate::gamemode::stop();
             session.stop();
         }
         if let Some(tas) = self.input_subsystem.borrow().get_tas() {
@@ -3990,6 +4372,7 @@ impl GMainWindow {
                 Some(LoadingEvent::Started { program_id }) => {
                     this.play_time_manager.set_program_id(program_id);
                     this.play_time_manager.start();
+                    crate::gamemode::start();
                 }
                 Some(LoadingEvent::FirstFrame) => {
                     let stack = stack.clone();
@@ -4060,7 +4443,7 @@ impl GMainWindow {
     /// `windowHandle()->winId()` to Vulkan. GTK has no native surface per
     /// widget, so `render_window_windows` creates the equivalent child directly.
     #[cfg(target_os = "windows")]
-    fn boot_game_with_parameters(
+    fn boot_game_after_profile_selection(
         self: &Rc<Self>,
         filepath: String,
         parameters: crate::boot::BootParameters,
@@ -4078,7 +4461,7 @@ impl GMainWindow {
                     && this.stack.width() > 0
                     && this.stack.height() > 0
                 {
-                    this.boot_game_with_parameters(filepath.clone(), parameters);
+                    this.boot_game_after_profile_selection(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
                     glib::ControlFlow::Continue
@@ -4093,6 +4476,7 @@ impl GMainWindow {
         // next one. Stop the session first so Vulkan no longer owns its HWND.
         self.play_time_manager.stop();
         if let Some(mut session) = self.session.borrow_mut().take() {
+            crate::gamemode::stop();
             session.stop();
         }
         if let Some(tas) = self.input_subsystem.borrow().get_tas() {
@@ -4173,6 +4557,7 @@ impl GMainWindow {
                 Some(LoadingEvent::Started { program_id }) => {
                     this.play_time_manager.set_program_id(program_id);
                     this.play_time_manager.start();
+                    crate::gamemode::start();
                 }
                 Some(LoadingEvent::FirstFrame) => {
                     let stack = stack.clone();
@@ -4237,7 +4622,7 @@ impl GMainWindow {
 
     /// In-process boot needs a platform-specific native render surface.
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    fn boot_game_with_parameters(
+    fn boot_game_after_profile_selection(
         self: &Rc<Self>,
         _filepath: String,
         _parameters: crate::boot::BootParameters,
@@ -4389,6 +4774,36 @@ impl GMainWindow {
         }
     }
 
+    /// Upstream MainWindow::OnAppFocusStateChanged. GTK windows include modal
+    /// frontend dialogs, so moving focus within Ruzu is not backgrounding it.
+    fn on_app_focus_state_changed(&self) {
+        let Some(paused) = self.session.borrow().as_ref().map(EmulationSession::is_paused) else {
+            return;
+        };
+        let active = gtk::Window::list_toplevels().iter()
+            .filter_map(|widget| widget.downcast_ref::<gtk::Window>())
+            .any(|window| window.is_active());
+        let (pause_background, mute_background) = crate::uisettings::with(|v| (
+            *v.pause_when_in_background.get_value(),
+            *v.mute_when_in_background.get_value(),
+        ));
+        let (pause, auto_pause) = background_setting_transition(active, pause_background, paused, self.auto_paused.get());
+        if pause != paused {
+            if pause { self.on_pause_game(); } else { self.on_start_game(); }
+            if self.session.borrow().as_ref().is_some_and(|session| session.is_paused() == pause) {
+                self.auto_paused.set(auto_pause);
+            }
+        } else {
+            self.auto_paused.set(auto_pause);
+        }
+        let mut values = common::settings::values_mut();
+        let (muted, auto_mute) = background_setting_transition(active, mute_background, *values.audio_muted.get_value(), self.auto_muted.get());
+        values.audio_muted.set_value(muted);
+        self.auto_muted.set(auto_mute);
+        drop(values);
+        self.status_bar.refresh();
+    }
+
     /// Resume the emulation thread — upstream `GMainWindow::OnStartGame`.
     fn on_start_game(&self) {
         let resumed = self
@@ -4401,6 +4816,7 @@ impl GMainWindow {
             return;
         }
         self.start_play_time_for_session();
+        crate::gamemode::start();
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, false);
         }
@@ -4420,6 +4836,7 @@ impl GMainWindow {
             return;
         }
         self.play_time_manager.stop();
+        crate::gamemode::stop();
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, true);
         }
@@ -4566,6 +4983,7 @@ impl GMainWindow {
     /// thread requests guest exit, applies the upstream timeout, and reports
     /// `StopComplete` after forced teardown if necessary.
     fn begin_stop_game(self: &Rc<Self>) -> bool {
+        crate::gamemode::stop();
         self.play_time_manager.stop();
         let requested = self
             .session
@@ -4606,6 +5024,11 @@ impl GMainWindow {
     /// before releasing the native render target, clear the loading assets,
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        crate::gamemode::stop();
+        self.auto_paused.set(false);
+        if self.auto_muted.replace(false) {
+            common::settings::values_mut().audio_muted.set_value(false);
+        }
         self.play_time_manager.stop();
         let close_after_stop = self.close_confirmed.get();
         let restart_path = restart_path_after_shutdown(
@@ -4728,11 +5151,14 @@ impl GMainWindow {
                 #[upgrade_or]
                 glib::ControlFlow::Break,
                 move || {
-                    let session = this.session.borrow();
+                    let Ok(session) = this.session.try_borrow() else {
+                        return glib::ControlFlow::Continue;
+                    };
                     let results = session.as_ref().and_then(EmulationSession::perf_stats);
                     let shaders_building = session
                         .as_ref()
                         .and_then(EmulationSession::shaders_building);
+                    drop(session);
                     this.status_bar
                         .update_performance(results, shaders_building);
                     this.refresh_tas_ui();
@@ -5173,6 +5599,13 @@ pub fn update_ui_theme() {
         return;
     };
 
+    // Restore desktop-owned values before CheckDarkMode samples the fallback
+    // theme name. Our previous Yaru-blue-dark override is not a system dark
+    // preference. GTK reset_property removes the application priority override,
+    // retaining live desktop settings (unlike caching the startup theme).
+    settings.reset_property("gtk-theme-name");
+    settings.reset_property("gtk-application-prefer-dark-theme");
+
     let theme = crate::uisettings::with(|v| v.theme.get_value().clone());
     let internal = crate::uisettings::THEMES
         .iter()
@@ -5202,10 +5635,33 @@ pub fn update_ui_theme() {
     }
     settings.set_gtk_application_prefer_dark_theme(dark);
     install_blue_accent_css();
+    install_ui_theme_css(internal);
     log::debug!(
         "UI theme '{internal}' resolved to {} mode",
         if dark { "dark" } else { "light" }
     );
+}
+
+thread_local! {
+    // A single replaceable provider: theme switches must not accumulate styles
+    // or leave the midnight palette installed when returning to Default/Dark.
+    static UI_THEME_CSS: std::cell::RefCell<Option<gtk::CssProvider>> = const { std::cell::RefCell::new(None) };
+}
+
+fn install_ui_theme_css(theme: &str) {
+    let Some(display) = gtk::gdk::Display::default() else { return; };
+    UI_THEME_CSS.with(|slot| {
+        if let Some(previous) = slot.borrow_mut().take() {
+            gtk::style_context_remove_provider_for_display(&display, &previous);
+        }
+        if matches!(theme, "qdarkstyle_midnight_blue" | "colorful_midnight_blue") {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_data(include_str!("../../../dist/qt_themes/qdarkstyle_midnight_blue/style.css"));
+            gtk::style_context_add_provider_for_display(&display, &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 2);
+            *slot.borrow_mut() = Some(provider);
+        }
+    });
 }
 
 /// Eden's Fusion selection colour, sampled from its configuration dialog.
@@ -5220,9 +5676,173 @@ fn blue_accent_theme_variant(theme_name: &str, dark: bool) -> Option<&'static st
     Some(if dark { "Yaru-blue-dark" } else { "Yaru-blue" })
 }
 
+fn should_hide_mouse(render_visible: bool, enabled: bool) -> bool {
+    render_visible && enabled
+}
+
+// Files owned by MainWindow::OnConfigure's defaults reset. Never traverse
+// a symlink at a reset target, which might refer to another emulator's data.
+fn reset_configuration_files(config_dir: &std::path::Path, cache_dir: &std::path::Path) -> std::io::Result<()> {
+    for root in [config_dir, cache_dir] {
+        if std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(std::io::Error::other("Refusing to reset a linked configuration/cache directory"));
+        }
+    }
+    for (path, directory, keep_directory) in [
+        (config_dir.join("qt-config.ini"), false, false),
+        (config_dir.join("custom"), true, true),
+        (cache_dir.join("game_list"), true, false),
+    ] {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if directory && metadata.is_dir() && !metadata.file_type().is_symlink() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            #[cfg(windows)]
+            if directory && metadata.file_type().is_symlink() {
+                std::fs::remove_dir(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+            #[cfg(not(windows))]
+            std::fs::remove_file(&path)?;
+        }
+        if keep_directory {
+            std::fs::create_dir(&path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod reset_configuration_tests {
+    use super::reset_configuration_files;
+
+    #[test]
+    fn home_menu_is_registered_and_uses_firmware_applet_availability() {
+        assert!(super::MENU_ACTION_NAMES.contains(&"load_home_menu"));
+        assert!(super::APPLET_ACTIONS.contains(&"load_home_menu"));
+        assert!(!super::RUNNING_ACTIONS.contains(&"load_home_menu"));
+        assert!(super::MENU_UI.contains(
+            "<attribute name=\"action\">app.load_home_menu</attribute>"
+        ));
+    }
+
+    #[test]
+    fn cursor_hiding_requires_both_rendering_and_the_user_preference() {
+        assert_eq!(super::DEFAULT_MOUSE_HIDE_TIMEOUT, 2500);
+        assert!(super::should_hide_mouse(true, true));
+        assert!(!super::should_hide_mouse(true, false));
+        assert!(!super::should_hide_mouse(false, true));
+        assert!(!super::should_hide_mouse(false, false));
+    }
+
+    #[test]
+    fn reset_removes_only_configuration_and_game_list_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        for directory in [config.join("custom"), config.join("input"), cache.join("game_list"), cache.join("shader")] {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("synthetic"), "preserve or remove by owner").unwrap();
+        }
+        std::fs::write(config.join("qt-config.ini"), "[UI]").unwrap();
+        std::fs::write(config.join("prod.keys"), "synthetic, not a key").unwrap();
+        reset_configuration_files(&config, &cache).unwrap();
+        assert!(!config.join("qt-config.ini").exists());
+        assert_eq!(std::fs::read_dir(config.join("custom")).unwrap().count(), 0);
+        assert!(!cache.join("game_list").exists());
+        assert!(config.join("input/synthetic").exists());
+        assert!(cache.join("shader/synthetic").exists());
+        assert!(config.join("prod.keys").exists());
+        reset_configuration_files(&config, &cache).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_unlinks_target_without_deleting_shared_source() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let source = root.path().join("shared");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("synthetic"), "keep").unwrap();
+        std::os::unix::fs::symlink(&source, config.join("custom")).unwrap();
+        reset_configuration_files(&config, &root.path().join("cache")).unwrap();
+        assert!(source.join("synthetic").exists());
+        assert!(!std::fs::symlink_metadata(config.join("custom")).unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_root_is_rejected_before_any_configuration_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("qt-config.ini"), "keep").unwrap();
+        let link = root.path().join("linked-config");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        assert!(reset_configuration_files(&link, &root.path().join("cache")).is_err());
+        assert_eq!(std::fs::read_to_string(source.join("qt-config.ini")).unwrap(), "keep");
+    }
+}
+
 #[cfg(test)]
 mod blue_accent_theme_tests {
     use super::blue_accent_theme_variant;
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn midnight_palette_is_valid_shared_and_removed_on_theme_change() {
+        use gtk::prelude::*;
+        gtk::init().unwrap();
+        let errors = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let provider = gtk::CssProvider::new();
+        let captured = errors.clone();
+        provider.connect_parsing_error(move |_, _, error| captured.borrow_mut().push(error.to_string()));
+        provider.load_from_data(include_str!("../../../dist/qt_themes/qdarkstyle_midnight_blue/style.css"));
+        assert!(errors.borrow().is_empty(), "{:?}", errors.borrow());
+        let window = gtk::Window::new();
+        for theme in ["Dark", "Midnight Blue", "Midnight Blue Colorful", "Default", "Midnight Blue", "Dark"] {
+            crate::uisettings::with_mut(|v| v.theme.set_value(theme.into()));
+            super::update_ui_theme();
+            let midnight = theme.starts_with("Midnight");
+            super::UI_THEME_CSS.with(|slot| assert_eq!(slot.borrow().is_some(), midnight));
+            if midnight {
+                assert_eq!(window.style_context().lookup_color("theme_bg_color"),
+                    Some(gtk::gdk::RGBA::parse("#19232D").unwrap()));
+                assert_eq!(window.style_context().lookup_color("theme_selected_bg_color"),
+                    Some(gtk::gdk::RGBA::parse("#1464A0").unwrap()));
+            }
+        }
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn default_theme_restores_desktop_after_forcing_dark() {
+        gtk::init().unwrap();
+        let settings = gtk::Settings::default().unwrap();
+        crate::uisettings::with_mut(|v| v.theme.set_value("Default".into()));
+        super::update_ui_theme();
+        let original_name = settings.gtk_theme_name();
+        let original_dark = settings.is_gtk_application_prefer_dark_theme();
+        for _ in 0..2 {
+            crate::uisettings::with_mut(|v| v.theme.set_value("Dark".into()));
+            super::update_ui_theme();
+            assert!(settings.is_gtk_application_prefer_dark_theme());
+            // Also exercise the fallback contamination independently of which
+            // desktop theme is installed on the test host.
+            settings.set_gtk_theme_name(Some("Yaru-blue-dark"));
+            crate::uisettings::with_mut(|v| v.theme.set_value("Default".into()));
+            super::update_ui_theme();
+            assert_eq!(settings.gtk_theme_name(), original_name);
+            assert_eq!(settings.is_gtk_application_prefer_dark_theme(), original_dark);
+        }
+    }
 
     #[test]
     fn yaru_uses_the_complete_blue_variant() {
@@ -5452,6 +6072,7 @@ const MENU_ACTION_NAMES: &[&str] = &[
     "load_cabinet_restorer",
     "load_cabinet_formatter",
     "load_album",
+    "load_home_menu",
     "load_mii_edit",
     "open_controller_menu",
     "migration_tool",
@@ -5505,6 +6126,7 @@ const RUNNING_ACTIONS: &[&str] = &[
 /// Menu actions that open a system applet, which upstream enables only when
 /// firmware is installed *and* no game is running — `applet_actions`.
 const APPLET_ACTIONS: &[&str] = &[
+    "load_home_menu",
     "load_album",
     "load_cabinet_nickname_owner",
     "load_cabinet_eraser",
@@ -5751,18 +6373,27 @@ const MENU_UI: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
             </item>
           </section>
         </submenu>
-        <item>
-          <attribute name="label" translatable="yes">Open _Album</attribute>
-          <attribute name="action">app.load_album</attribute>
-        </item>
-        <item>
-          <attribute name="label" translatable="yes">Open _Mii Editor</attribute>
-          <attribute name="action">app.load_mii_edit</attribute>
-        </item>
-        <item>
-          <attribute name="label" translatable="yes">Open _Controller Menu</attribute>
-          <attribute name="action">app.open_controller_menu</attribute>
-        </item>
+        <submenu>
+          <attribute name="label" translatable="yes">Launch _Applet</attribute>
+          <section>
+            <item>
+              <attribute name="label" translatable="yes">_Home Menu</attribute>
+              <attribute name="action">app.load_home_menu</attribute>
+            </item>
+            <item>
+              <attribute name="label" translatable="yes">Open _Mii Editor</attribute>
+              <attribute name="action">app.load_mii_edit</attribute>
+            </item>
+            <item>
+              <attribute name="label" translatable="yes">Open _Controller Menu</attribute>
+              <attribute name="action">app.open_controller_menu</attribute>
+            </item>
+            <item>
+              <attribute name="label" translatable="yes">Open _Album</attribute>
+              <attribute name="action">app.load_album</attribute>
+            </item>
+          </section>
+        </submenu>
       </section>
       <section>
         <item>

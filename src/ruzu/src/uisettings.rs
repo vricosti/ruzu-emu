@@ -135,6 +135,8 @@ impl GameDir {
 /// Frontend settings container — upstream `UISettings::Values`.
 #[derive(Clone)]
 pub struct Values {
+    /// Process-local startup probe result; never saved to configuration.
+    pub has_broken_vulkan: bool,
     /// Configured game directories — upstream `UISettings::values.game_dirs`.
     /// Not a `Setting<T>`: upstream stores it as a plain `QVector<GameDir>`
     /// serialized through `QSettings::beginWriteArray`, not through the
@@ -215,6 +217,7 @@ impl Default for Values {
         use Category::*;
 
         Self {
+            has_broken_vulkan: false,
             game_dirs: Vec::new(),
             favorited_ids: Vec::new(),
             shortcuts: default_shortcuts(),
@@ -226,12 +229,31 @@ impl Default for Values {
             show_filter_bar: Setting::new(true, "showFilterBar", Ui),
             show_status_bar: Setting::new(true, "showStatusBar", Ui),
 
-            confirm_before_stopping: Setting::new(ConfirmStop::AskAlways, "confirmStop", UiGeneral),
-            pause_when_in_background: Setting::new(false, "pauseWhenInBackground", UiGeneral),
-            mute_when_in_background: Setting::new(false, "muteWhenInBackground", UiAudio),
-            hide_mouse: Setting::new(true, "hideInactiveMouse", UiGeneral),
-            controller_applet_disabled: Setting::new(false, "disableControllerApplet", Ui),
-            select_user_on_boot: Setting::new(false, "select_user_on_boot", UiGeneral),
+            confirm_before_stopping: Setting::with_options(
+                ConfirmStop::AskAlways, "confirmStop", UiGeneral,
+                common::settings_common::Specialization::DEFAULT, true, true,
+            ),
+            pause_when_in_background: Setting::with_options(
+                false, "pauseWhenInBackground", UiGeneral,
+                common::settings_common::Specialization::DEFAULT, true, true,
+            ),
+            mute_when_in_background: Setting::with_options(
+                false,
+                "muteWhenInBackground",
+                UiAudio,
+                common::settings_common::Specialization::DEFAULT,
+                true,
+                true,
+            ),
+            hide_mouse: Setting::with_options(
+                true, "hideInactiveMouse", UiGeneral,
+                common::settings_common::Specialization::DEFAULT, true, true,
+            ),
+            controller_applet_disabled: Setting::new(false, "disableControllerApplet", UiGeneral),
+            select_user_on_boot: Setting::with_options(
+                false, "select_user_on_boot", UiGeneral,
+                common::settings_common::Specialization::DEFAULT, true, true,
+            ),
             enable_gamemode: SwitchableSetting::new(
                 !cfg!(target_env = "msvc"),
                 "enable_gamemode",
@@ -306,9 +328,9 @@ impl Values {
 /// Selectable widget themes — upstream `UISettings::themes`.
 ///
 /// Each entry is `(display name, internal name)`. GTK has no direct equivalent
-/// of Qt's `.qss` stylesheet themes, so only the two GTK provides natively
-/// (light / dark, via `gtk-application-prefer-dark-theme`) actually change the
-/// appearance; the rest are kept so the combo box matches upstream's contents.
+/// of Qt's `.qss` stylesheets: native light/dark selection is complemented by
+/// the Midnight Blue GTK palette. Colorful variants share their base palette
+/// upstream; icon-theme selection is a separate frontend concern.
 pub const THEMES: &[(&str, &str)] = &[
     ("Default", "default"),
     ("Default Colorful", "colorful"),

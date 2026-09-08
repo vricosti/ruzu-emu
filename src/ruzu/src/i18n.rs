@@ -437,6 +437,7 @@ mod tests {
         assert!(quickstart.contains("https://yuzu-mirror.github.io/help/quickstart/"));
         assert!(quickstart.contains("guide de démarrage rapide ruzu"));
         assert_eq!(tr("_File"), "_Fichier");
+        assert_eq!(tr("_Home Menu"), "Menu _HOME");
         assert_eq!(tr("About ruzu"), "À propos de ruzu");
         set_language("de");
         assert_eq!(tr("Annuler"), "Abbrechen");
@@ -504,6 +505,8 @@ mod tests {
         let _guard = test_lock();
         set_language("fr");
         for source in [
+            "Broken Vulkan Installation Detected",
+            "Vulkan initialization failed during boot.",
             "User Data Migration",
             "Ruzu found data from another emulator. Choose the source, the data, and how Ruzu should use it.",
             "Source data is never moved or deleted. Copy is the recommended default; shared links make both emulators use the same directories. Shader caches are never migrated.",

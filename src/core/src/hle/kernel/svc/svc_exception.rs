@@ -1,6 +1,4 @@
-//! Port of zuyu/src/core/hle/kernel/svc/svc_exception.cpp
-//! Status: COMPLET
-//! Derniere synchro: 2026-03-20
+//! Counterpart of Eden core/hle/kernel/svc/svc_exception.cpp.
 //!
 //! SVC handlers for Break and ReturnFromException.
 
@@ -16,49 +14,43 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
     let notification_only = (reason & 0x80000000) != 0;
 
     let mut has_dumped_buffer = false;
+    let mut debug_buffer = Vec::new();
 
-    // Upstream: handle_debug_buffer reads from guest memory and logs the contents.
-    let handle_debug_buffer = |addr: u64, sz: u64, dumped: &mut bool| {
+    // Same local lambda and capture state as upstream. Retain the bytes for
+    // Reporter; a four-byte error code counts as dumped but leaves the vector empty.
+    let handle_debug_buffer = |addr: u64, sz: u64, dumped: &mut bool, debug_buffer: &mut Vec<u8>| {
         if sz == 0 || addr == 0 || *dumped {
             return;
         }
-
         if let Some(memory) = system.get_svc_memory() {
-            let m = memory.lock().unwrap();
+            let memory = memory.lock().unwrap();
             if sz == 4 {
-                // Typically an error code.
-                let err_code = m.read_32(addr);
-                log::error!("debug_buffer_err_code={:X}", err_code);
+                log::error!("debug_buffer_err_code={:X}", memory.read_32(addr));
             } else {
-                // Hexdump the buffer.
-                let sz = sz as usize;
-                let mut hexdump = String::new();
-                for i in 0..sz {
-                    let byte = m.read_8(addr + i as u64);
-                    hexdump.push_str(&format!("{:02X} ", byte));
-                    if i != 0 && i % 16 == 0 {
-                        hexdump.push('\n');
-                    }
-                }
-                log::error!("debug_buffer=\n{}", hexdump);
+                debug_buffer.resize(sz as usize, 0);
+                memory.read_block(addr, debug_buffer);
             }
         } else {
-            let mem = system.shared_process_memory().read().unwrap();
+            // Existing bootstrap memory adaptation, without an initialized Memory bridge.
+            let memory = system.shared_process_memory().read().unwrap();
             if sz == 4 {
-                let err_code = mem.read_32(addr);
-                log::error!("debug_buffer_err_code={:X}", err_code);
+                log::error!("debug_buffer_err_code={:X}", memory.read_32(addr));
             } else {
-                let sz = sz as usize;
-                let mut hexdump = String::new();
-                for i in 0..sz {
-                    let byte = mem.read_8(addr + i as u64);
-                    hexdump.push_str(&format!("{:02X} ", byte));
-                    if i != 0 && i % 16 == 0 {
-                        hexdump.push('\n');
-                    }
+                debug_buffer.resize(sz as usize, 0);
+                for (i, byte) in debug_buffer.iter_mut().enumerate() {
+                    *byte = memory.read_8(addr + i as u64);
                 }
-                log::error!("debug_buffer=\n{}", hexdump);
             }
+        }
+        if sz != 4 {
+            let mut hexdump = String::new();
+            for (i, byte) in debug_buffer.iter().enumerate() {
+                hexdump.push_str(&format!("{byte:02X} "));
+                if (i + 1) % 32 == 0 {
+                    hexdump.push('\n');
+                }
+            }
+            log::error!("debug_buffer=\n{hexdump}");
         }
         *dumped = true;
     };
@@ -72,7 +64,7 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
                 info1,
                 info2
             );
-            handle_debug_buffer(info1, info2, &mut has_dumped_buffer);
+            handle_debug_buffer(info1, info2, &mut has_dumped_buffer, &mut debug_buffer);
         }
         1 => {
             // BreakReason::Assert
@@ -81,7 +73,7 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
                 info1,
                 info2
             );
-            handle_debug_buffer(info1, info2, &mut has_dumped_buffer);
+            handle_debug_buffer(info1, info2, &mut has_dumped_buffer, &mut debug_buffer);
         }
         2 => {
             // BreakReason::User
@@ -90,7 +82,7 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
                 info1,
                 info2
             );
-            handle_debug_buffer(info1, info2, &mut has_dumped_buffer);
+            handle_debug_buffer(info1, info2, &mut has_dumped_buffer, &mut debug_buffer);
         }
         3 => {
             // BreakReason::PreLoadDll
@@ -135,13 +127,19 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
                 info1,
                 info2
             );
-            handle_debug_buffer(info1, info2, &mut has_dumped_buffer);
+            handle_debug_buffer(info1, info2, &mut has_dumped_buffer, &mut debug_buffer);
         }
     }
 
-    // Upstream: system.GetReporter().SaveSvcBreakReport(...)
-    // Reporter not yet ported — when available, call:
-    // system.reporter().save_svc_break_report(reason, notification_only, info1, info2, debug_buffer);
+    // Reporter is standalone in Rust. Keep the upstream reporting gate before
+    // resolving the application identity, then save before the late dump/backtrace.
+    if *common::settings::values().reporting_services.get_value() {
+        system.reporter.save_svc_break_report(
+            system.get_application_process_program_id(),
+            reason, notification_only, info1, info2,
+            has_dumped_buffer.then_some(debug_buffer.as_slice()),
+        );
+    }
 
     if !notification_only {
         log::error!(
@@ -151,7 +149,7 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
             info2
         );
 
-        handle_debug_buffer(info1, info2, &mut has_dumped_buffer);
+        handle_debug_buffer(info1, info2, &mut has_dumped_buffer, &mut debug_buffer);
 
         if let Some(kernel) = system.kernel() {
             kernel.current_physical_core().log_backtrace();
@@ -505,4 +503,94 @@ fn dump_known_break_strings(system: &System) {
 /// Upstream: UNIMPLEMENTED() — intentionally unimplemented.
 pub fn return_from_exception(_result: ResultCode) {
     log::warn!("svc::ReturnFromException: Upstream UNIMPLEMENTED");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn break_report_preserves_optional_buffer_and_capture_order() {
+        const CHILD: &str = "RUZU_TEST_SVC_BREAK_REPORT";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::kernel::svc::svc_exception::tests::break_report_preserves_optional_buffer_and_capture_order"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            use std::sync::{Arc, Mutex, RwLock};
+            use crate::core::SystemRef;
+            use crate::device_memory::DeviceMemory;
+            use crate::hle::kernel::k_process::{KProcess, ProcessLock, ProcessMemoryData};
+            use crate::memory::memory::Memory;
+            use common::page_table::{PageTable, PageType};
+            use common::fs::path_util::{set_ruzu_path, RuzuPath};
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let directory = std::env::temp_dir().join(format!("ruzu-break-report-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::create_dir(directory.join("sdmc")).unwrap();
+            set_ruzu_path(RuzuPath::LogDir, &directory);
+            set_ruzu_path(RuzuPath::SDMCDir, &directory.join("sdmc"));
+            let device = Box::new(DeviceMemory::new());
+            let mut table = Box::new(PageTable::new());
+            table.resize(32, 12);
+            table.map_pages(3, 1, 0x3000, PageType::Memory,
+                device.buffer.backing_base_pointer() as usize + 0x3000);
+            let memory = Arc::new(Mutex::new(unsafe {
+                Memory::new(SystemRef::null(), device.as_ref() as *const _, &device.buffer as *const _)
+            }));
+            memory.lock().unwrap().set_current_page_table(table.as_mut() as *mut _, true);
+            memory.lock().unwrap().write_32(0x3000, 0x12EF_CDAB);
+            let mut system = Box::new(System::new());
+            let mut process = KProcess::new();
+            process.program_id = 42;
+            process.page_table.set_memory(memory.clone());
+            let process = Arc::new(ProcessLock::new(process));
+            system.set_current_process_arc(process.clone());
+            system.set_runtime_program_id(99);
+            let mut shared = ProcessMemoryData::new();
+            shared.base = 0x3000;
+            shared.data = vec![0xAB, 0xCD, 0xEF, 0x12];
+            system.set_shared_process_memory(Arc::new(RwLock::new(shared)));
+            common::settings::values_mut().reporting_services.set_value(false);
+            break_execution(&system, 0x8000_0001, 0x3000, 3);
+            let reports = directory.join("svc_break_report");
+            assert!(!reports.exists());
+            common::settings::values_mut().reporting_services.set_value(true);
+            for use_native_memory in [true, false] {
+                if !use_native_memory {
+                    process.lock().unwrap().page_table.get_base_mut().m_memory = None;
+                }
+                for (reason, address, size, expected_buffer) in [
+                    (0x8000_0000, 0x3000, 3, Some("ABCDEF")),
+                    (0x8000_0001, 0x3000, 4, Some("")),
+                    (0x8000_0002, 0x3000, 3, Some("ABCDEF")),
+                    (0x8000_00FF, 0x3000, 3, Some("ABCDEF")),
+                    (0x8000_0001, 0, 3, None),
+                    (0x8000_0001, 0x3000, 0, None),
+                    (0x8000_0003, 0x3000, 3, None),
+                    (7, 0x3000, 3, None), // CppException's dump occurs AFTER the report.
+                ] {
+                    break_execution(&system, reason, address, size);
+                    let paths: Vec<_> = std::fs::read_dir(&reports).unwrap().map(|e| e.unwrap().path()).collect();
+                    assert_eq!(paths.len(), 1);
+                    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&paths[0]).unwrap()).unwrap();
+                    assert_eq!(report["report_common"]["title_id"], "000000000000002A");
+                    assert_eq!(report["svc_break"]["type"], format!("{reason:08X}"));
+                    assert_eq!(report["svc_break"]["signal_debugger"], ((reason & 0x8000_0000) != 0).to_string());
+                    assert_eq!(report["svc_break"]["debug_buffer"].as_str(), expected_buffer);
+                    if expected_buffer.is_none() { assert!(report["svc_break"].get("debug_buffer").is_none()); }
+                    std::fs::remove_file(&paths[0]).unwrap();
+                }
+            }
+            common::settings::values_mut().reporting_services.set_value(false);
+            drop(system);
+            drop(process);
+            drop(memory);
+            drop(table);
+            drop(device);
+            std::fs::remove_dir_all(directory).unwrap();
+        }).unwrap().join().unwrap();
+    }
 }

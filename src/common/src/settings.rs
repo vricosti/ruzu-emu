@@ -291,6 +291,7 @@ pub struct Values {
     pub pause_tas_on_load: Setting<bool>,
     pub tas_enable: Setting<bool>,
     pub tas_loop: Setting<bool>,
+    pub tas_show_recording_dialog: Setting<bool>,
 
     pub mouse_panning: Setting<bool>,
     pub mouse_panning_sensitivity: Setting<u8>,
@@ -334,6 +335,8 @@ pub struct Values {
 
     // ── Debugging ───────────────────────────────────────────────────────
     pub record_frame_times: bool,
+    pub serial_battery: Setting<u32>,
+    pub serial_unit: Setting<u32>,
     pub use_gdbstub: Setting<bool>,
     pub gdbstub_port: Setting<u16>,
     pub program_args: SwitchableSetting<String>,
@@ -363,6 +366,8 @@ pub struct Values {
 
     // ── Miscellaneous ───────────────────────────────────────────────────
     pub log_filter: Setting<String>,
+    pub log_flush_line: Setting<bool>,
+    pub censor_username: Setting<bool>,
     pub use_dev_keys: Setting<bool>,
 
     // ── Network ─────────────────────────────────────────────────────────
@@ -374,6 +379,8 @@ pub struct Values {
     pub web_api_url: Setting<String>,
     pub yuzu_username: Setting<String>,
     pub yuzu_token: Setting<String>,
+    /// Generated frontend identity, separate from legacy authenticated credentials.
+    pub eden_token: Setting<String>,
 
     // ── Add-Ons ─────────────────────────────────────────────────────────
     pub disabled_addons: HashMap<u64, Vec<String>>,
@@ -527,6 +534,8 @@ impl Values {
                 disable_buffer_reorder,
             ),
             Category::Debugging => visit!(
+                serial_battery,
+                serial_unit,
                 use_gdbstub,
                 gdbstub_port,
                 dump_exefs,
@@ -554,9 +563,9 @@ impl Values {
                 disable_macro_jit,
                 disable_macro_hle,
             ),
-            Category::Miscellaneous => visit!(log_filter),
+            Category::Miscellaneous => visit!(log_filter, log_flush_line, censor_username),
             Category::WebService => {
-                visit!(enable_telemetry, web_api_url, yuzu_username, yuzu_token,)
+                visit!(enable_telemetry, web_api_url, yuzu_username, yuzu_token, eden_token,)
             }
             Category::System => visit!(
                 cpu_clock,
@@ -588,6 +597,10 @@ impl Values {
                 vibration_enabled,
                 enable_accurate_vibrations,
                 motion_enabled,
+                pause_tas_on_load,
+                tas_enable,
+                tas_loop,
+                tas_show_recording_dialog,
             ),
             Category::Network => visit!(network_interface, airplane_mode,),
             _ => {}
@@ -699,12 +712,15 @@ impl Default for Values {
                 true,
                 false,
             ),
-            sound_index: SwitchableSetting::ranged(
+            sound_index: SwitchableSetting::ranged_with_options(
                 AudioMode::Stereo,
                 AudioMode::Mono,
                 AudioMode::Surround,
                 "sound_index",
                 SystemAudio,
+                Specialization::DEFAULT,
+                true,
+                true,
             ),
             volume: SwitchableSetting::ranged_with_options(
                 100,
@@ -794,7 +810,7 @@ impl Default for Values {
             cpu_accuracy: SwitchableSetting::ranged(
                 CpuAccuracy::Auto,
                 CpuAccuracy::Auto,
-                CpuAccuracy::Paranoid,
+                CpuAccuracy::Debugging,
                 "cpu_accuracy",
                 Cpu,
             ),
@@ -981,7 +997,7 @@ impl Default for Values {
                 Renderer,
             ),
             scaling_filter: SwitchableSetting::with_options(
-                ScalingFilter::Bilinear,
+                ScalingFilter::NearestNeighbor,
                 "scaling_filter",
                 Renderer,
                 Specialization::DEFAULT,
@@ -1129,13 +1145,10 @@ impl Default for Values {
                 true,
                 true,
             ),
-            use_vulkan_driver_pipeline_cache: SwitchableSetting::with_options(
+            use_vulkan_driver_pipeline_cache: SwitchableSetting::new(
                 true,
                 "use_vulkan_driver_pipeline_cache",
                 RendererAdvanced,
-                Specialization::DEFAULT,
-                true,
-                true,
             ),
             enable_compute_pipelines: SwitchableSetting::new(
                 false,
@@ -1182,7 +1195,7 @@ impl Default for Values {
             fix_bloom_effects: SwitchableSetting::new(false, "fix_bloom_effects", RendererHacks),
             emulate_bgr565: SwitchableSetting::new(false, "emulate_bgr565", RendererHacks),
             rescale_hack: SwitchableSetting::new(
-                cfg!(target_os = "android"),
+                false,
                 "rescale_hack",
                 RendererHacks,
             ),
@@ -1222,12 +1235,15 @@ impl Default for Values {
                 "dyna_state",
                 RendererExtensions,
             ),
-            sample_shading: SwitchableSetting::ranged(
+            sample_shading: SwitchableSetting::ranged_with_options(
                 0,
                 0,
                 100,
                 "sample_shading_fraction",
                 RendererExtensions,
+                Specialization::SCALAR,
+                true,
+                false,
             ),
             vertex_input_dynamic_state: SwitchableSetting::new(
                 !cfg!(target_os = "android"),
@@ -1370,6 +1386,7 @@ impl Default for Values {
             pause_tas_on_load: Setting::new(true, "pause_tas_on_load", Controls),
             tas_enable: Setting::new(false, "tas_enable", Controls),
             tas_loop: Setting::new(false, "tas_loop", Controls),
+            tas_show_recording_dialog: Setting::new(true, "tas_show_recording_dialog", Controls),
 
             mouse_panning: Setting::with_options(
                 false,
@@ -1461,6 +1478,8 @@ impl Default for Values {
 
             // Debugging
             record_frame_times: false,
+            serial_battery: Setting::new(0, "serial_battery", Debugging),
+            serial_unit: Setting::new(0, "serial_unit", Debugging),
             use_gdbstub: Setting::new(false, "use_gdbstub", Debugging),
             gdbstub_port: Setting::new(6543, "gdbstub_port", Debugging),
             program_args: SwitchableSetting::with_options(
@@ -1510,14 +1529,7 @@ impl Default for Values {
                 false,
             ),
             use_debug_asserts: Setting::new(false, "use_debug_asserts", Debugging),
-            use_auto_stub: Setting::with_options(
-                false,
-                "use_auto_stub",
-                Debugging,
-                Specialization::DEFAULT,
-                false,
-                false,
-            ),
+            use_auto_stub: Setting::new(false, "use_auto_stub", Debugging),
             enable_all_controllers: Setting::new(false, "enable_all_controllers", Debugging),
             perform_vulkan_check: Setting::new(true, "perform_vulkan_check", Debugging),
             disable_web_applet: Setting::new(true, "disable_web_applet", Debugging),
@@ -1532,6 +1544,8 @@ impl Default for Values {
 
             // Miscellaneous
             log_filter: Setting::new("*:Info".to_string(), "log_filter", Miscellaneous),
+            log_flush_line: Setting::with_options(false, "flush_line", Miscellaneous, Specialization::DEFAULT, true, true),
+            censor_username: Setting::new(true, "censor_username", Miscellaneous),
             use_dev_keys: Setting::new(false, "use_dev_keys", Debugging),
 
             // Network
@@ -1550,6 +1564,7 @@ impl Default for Values {
             ),
             yuzu_username: Setting::new(String::new(), "yuzu_username", WebService),
             yuzu_token: Setting::new(String::new(), "yuzu_token", WebService),
+            eden_token: Setting::new(String::new(), "eden_token", WebService),
 
             // Add-Ons
             disabled_addons: HashMap::new(),
@@ -1611,9 +1626,16 @@ pub fn is_opengl() -> bool {
     )
 }
 
+/// Eden selects debug optimizations through CpuAccuracy::Debugging. Preserve
+/// the older Ruzu checkbox/config key as an explicit compatibility alias.
+pub fn is_cpu_debug_enabled(values: &Values) -> bool {
+    *values.cpu_accuracy.get_value() == CpuAccuracy::Debugging
+        || *values.cpu_debug_mode.get_value()
+}
+
 /// Returns true if fastmem is effectively enabled.
 pub fn is_fastmem_enabled(values: &Values) -> bool {
-    if *values.cpu_debug_mode.get_value() {
+    if is_cpu_debug_enabled(values) {
         return *values.cpuopt_fastmem.get_value();
     }
     if *values.cpu_accuracy.get_value() == CpuAccuracy::Unsafe {
@@ -1985,7 +2007,10 @@ mod tests {
         assert_eq!(*values.vulkan_device.get_value(), 0);
         assert_eq!(*values.resolution_setup.get_value(), ResolutionSetup::Res1X);
         assert_eq!(*values.vsync_mode.get_value(), VSyncMode::Fifo);
-        assert_eq!(*values.scaling_filter.get_value(), ScalingFilter::Bilinear);
+        assert_eq!(
+            *values.scaling_filter.get_value(),
+            ScalingFilter::NearestNeighbor
+        );
         assert_eq!(
             *values.fsr_sharpening_slider.get_value(),
             if cfg!(target_os = "android") { 0 } else { 25 }
@@ -2066,10 +2091,7 @@ mod tests {
         assert!(!*values.async_presentation.get_value());
         assert!(!*values.fix_bloom_effects.get_value());
         assert!(!*values.emulate_bgr565.get_value());
-        assert_eq!(
-            *values.rescale_hack.get_value(),
-            cfg!(target_os = "android")
-        );
+        assert!(!*values.rescale_hack.get_value());
         assert!(!*values.use_asynchronous_shaders.get_value());
         assert_eq!(
             *values.gpu_unswizzle_texture_size.get_value(),
@@ -2115,6 +2137,80 @@ mod tests {
 
         values.current_gpu_accuracy = GpuAccuracy::Low;
         assert!(!is_gpu_level_high(&values));
+    }
+
+    #[test]
+    fn debugging_accuracy_preserves_upstream_value_and_legacy_alias() {
+        let mut values = Values::default();
+        assert_eq!(CpuAccuracy::Debugging as u32, 4);
+        assert_eq!(CpuAccuracy::from_u32(4), Some(CpuAccuracy::Debugging));
+        assert!(!is_cpu_debug_enabled(&values));
+        values.cpu_accuracy.set_value(CpuAccuracy::Debugging);
+        assert_eq!(*values.cpu_accuracy.get_value(), CpuAccuracy::Debugging);
+        assert!(is_cpu_debug_enabled(&values));
+        values.cpuopt_fastmem.set_value(false);
+        assert!(!is_fastmem_enabled(&values));
+        values.cpuopt_fastmem.set_value(true);
+        assert!(is_fastmem_enabled(&values));
+        values.cpu_accuracy.set_value(CpuAccuracy::Auto);
+        assert!(!is_cpu_debug_enabled(&values));
+        values.cpu_debug_mode.set_value(true);
+        assert!(is_cpu_debug_enabled(&values));
+    }
+
+    #[test]
+    fn advanced_renderer_runtime_metadata_matches_upstream() {
+        let values = Values::default();
+        for runtime_modifiable in [
+            values.gpu_accuracy.setting.runtime_modifiable,
+            values.dma_accuracy.setting.runtime_modifiable,
+            values.gpu_fence_behavior.setting.runtime_modifiable,
+            values.frame_pacing_mode.setting.runtime_modifiable,
+            values.sync_memory_operations.setting.runtime_modifiable,
+            values.enable_buffer_history.setting.runtime_modifiable,
+            values.enable_gpu_buffer_readback.setting.runtime_modifiable,
+        ] {
+            assert!(runtime_modifiable);
+        }
+        for runtime_modifiable in [
+            values.vram_usage_mode.setting.runtime_modifiable,
+            values.nvdec_emulation.setting.runtime_modifiable,
+            values.max_anisotropy.setting.runtime_modifiable,
+            values.accelerate_astc.setting.runtime_modifiable,
+            values.astc_recompression.setting.runtime_modifiable,
+            values.renderer_force_max_clock.setting.runtime_modifiable,
+            values.use_disk_shader_cache.setting.runtime_modifiable,
+            values.use_vulkan_driver_pipeline_cache.setting.runtime_modifiable,
+            values.enable_compute_pipelines.setting.runtime_modifiable,
+            values.use_video_framerate.setting.runtime_modifiable,
+            values.use_reactive_flushing.setting.runtime_modifiable,
+            values.barrier_feedback_loops.setting.runtime_modifiable,
+        ] {
+            assert!(!runtime_modifiable);
+        }
+    }
+
+    #[test]
+    fn renderer_extras_runtime_metadata_matches_upstream() {
+        let values = Values::default();
+        assert!(values.skip_cpu_inner_invalidation.setting.runtime_modifiable);
+        for runtime_modifiable in [
+            values.async_presentation.setting.runtime_modifiable,
+            values.fix_bloom_effects.setting.runtime_modifiable,
+            values.emulate_bgr565.setting.runtime_modifiable,
+            values.rescale_hack.setting.runtime_modifiable,
+            values.use_asynchronous_shaders.setting.runtime_modifiable,
+            values.gpu_unswizzle_texture_size.setting.runtime_modifiable,
+            values.gpu_unswizzle_stream_size.setting.runtime_modifiable,
+            values.gpu_unswizzle_chunk_size.setting.runtime_modifiable,
+            values.gpu_unswizzle_enabled.setting.runtime_modifiable,
+            values.dyna_state.setting.runtime_modifiable,
+            values.sample_shading.setting.runtime_modifiable,
+            values.vertex_input_dynamic_state.setting.runtime_modifiable,
+        ] {
+            assert!(!runtime_modifiable);
+        }
+        assert_eq!(values.sample_shading.setting.specialization, Specialization::SCALAR);
     }
 
     #[test]
@@ -2223,6 +2319,22 @@ mod tests {
         });
         assert!(labels.iter().any(|label| label == "disable_wgi_xinput"));
         assert!(labels.iter().any(|label| label == "enable_raw_input"));
+    }
+
+    #[test]
+    fn tas_settings_match_upstream_defaults_and_persistence() {
+        let mut values = Values::default();
+        assert!(*values.pause_tas_on_load.get_value());
+        assert!(!*values.tas_enable.get_value());
+        assert!(!*values.tas_loop.get_value());
+        assert!(*values.tas_show_recording_dialog.get_value());
+        let mut labels = Vec::new();
+        values.for_each_setting_in_category_mut(Category::Controls, |setting| {
+            labels.push(setting.label().to_string());
+        });
+        for label in ["pause_tas_on_load", "tas_enable", "tas_loop", "tas_show_recording_dialog"] {
+            assert_eq!(labels.iter().filter(|entry| entry.as_str() == label).count(), 1);
+        }
     }
 
     #[test]

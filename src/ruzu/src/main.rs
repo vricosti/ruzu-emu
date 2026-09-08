@@ -23,6 +23,7 @@ mod configuration;
 mod emu_window;
 mod file_menu;
 mod game_list;
+mod gamemode;
 mod gtk_compat;
 #[cfg(target_os = "linux")]
 mod gui_settings;
@@ -42,6 +43,7 @@ mod render_window_windows;
 #[cfg(target_os = "linux")]
 mod render_window_x11;
 mod status_bar;
+mod startup_checks;
 mod uisettings;
 mod user_data_migration;
 mod util;
@@ -189,6 +191,9 @@ fn configure_linux_gdk_backend() -> bool {
 }
 
 fn main() -> glib::ExitCode {
+    if startup_checks::check_env_vars() {
+        return glib::ExitCode::SUCCESS;
+    }
     // Homebrew's GTK runtime uses installation-prefix paths. A distributable
     // app supplies equivalent resources inside Contents/Resources instead.
     #[cfg(target_os = "macos")]
@@ -208,7 +213,20 @@ fn main() -> glib::ExitCode {
     #[cfg(target_os = "linux")]
     let forced_x11 = configure_linux_gdk_backend();
 
-    env_logger::init();
+    configuration::qt_config::reload_all_values();
+    // Read the persisted setting before probing. The child exits above without
+    // reading configuration, starting logging, or initializing GTK.
+    let perform_vulkan_check = *common::settings::values().perform_vulkan_check.get_value();
+    match startup_checks::startup_checks(perform_vulkan_check) {
+        Ok(broken) => uisettings::with_mut(|values| values.has_broken_vulkan = broken),
+        Err(error) => eprintln!("Could not run Vulkan startup check: {error}"),
+    }
+    let log_filter = common::settings::values().log_filter.get_value().clone();
+    common::logging::backend::initialize_with_config(
+        Some(common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::LogDir)),
+        &log_filter,
+        uisettings::with(|values| *values.show_console.get_value()),
+    );
 
     #[cfg(target_os = "windows")]
     if enabled_native_windows_decorations {
@@ -229,34 +247,10 @@ fn main() -> glib::ExitCode {
     // the main window is mapped. The explicit `migration_prompt_seen` marker,
     // rather than the eagerly-created config directory, owns first-run state.
 
-    // Load the configured game directories out of ruzu's own config, the way
-    // upstream's `Config::ReadUIValues` fills `UISettings::values.game_dirs`
-    // before the game list is built.
-    let game_dirs = configuration::qt_config::load_game_dirs();
-    log::info!("Loaded {} configured game directory(ies)", game_dirs.len());
-    uisettings::with_mut(|v| v.game_dirs = game_dirs);
-    configuration::qt_config::load_roms_path();
-    configuration::qt_config::load_external_content_dirs();
-
-    // Upstream `Config::ReadUIGamelistValues` reads the favorites array in the same
-    // pass that fills `game_dirs`.
-    let favorited_ids = configuration::qt_config::load_favorited_ids();
-    uisettings::with_mut(|v| v.favorited_ids = favorited_ids);
-    configuration::qt_config::load_favorites_expanded();
-
-    configuration::qt_config::load_ui_language();
-    configuration::qt_config::load_view_values();
-    configuration::qt_config::load_multiplayer_values();
+    // QtConfig owns the complete reload, including controls and frontend state.
     let interface_language = uisettings::with(|v| v.language.get_value().clone());
     i18n::set_language(&interface_language);
     i18n::configure_toolkit_language(&interface_language);
-
-    // Upstream's `Config` constructor reads every category, controls included,
-    // before the window is built. Without this the Controls page would open on
-    // an empty mapping even though one was saved last session.
-    configuration::qt_config::load_global_values();
-    configuration::qt_config::load_control_values();
-    configuration::qt_config::load_shortcut_values();
 
     // Upstream constructs `QApplication app(argc, argv)`. We register handling
     // of file arguments ourselves later (open a game passed on the command
@@ -311,7 +305,9 @@ fn main() -> glib::ExitCode {
         }
     });
 
-    app.run()
+    let result = app.run();
+    common::logging::backend::stop();
+    result
 }
 
 #[cfg(all(test, target_os = "linux"))]

@@ -66,16 +66,38 @@ impl InputProfileContext {
     }
 }
 
-/// Controller types offered by the header combo — upstream
-/// `ConfigureInputPlayer::UpdateControllerAvailableButtons`, in `.ui` order.
-const CONTROLLER_TYPES: &[(ControllerType, &str)] = &[
-    (ControllerType::ProController, "Pro Controller"),
-    (ControllerType::DualJoyconDetached, "Dual Joycons"),
-    (ControllerType::LeftJoycon, "Left Joycon"),
-    (ControllerType::RightJoycon, "Right Joycon"),
-    (ControllerType::Handheld, "Handheld"),
-    (ControllerType::GameCube, "GameCube Controller"),
-];
+/// ConfigureInputPlayer::SetConnectableControllers.
+fn set_connectable_controllers(
+    styles: hid_core::hid_types::NpadStyleTag,
+    player_index: usize,
+    enable_all: bool,
+) -> Vec<(ControllerType, &'static str)> {
+    use hid_core::hid_types::NpadStyleSet as S;
+    let mut rows = Vec::new();
+    let mut add = |flag, kind, label| {
+        if styles.raw.contains(flag) { rows.push((kind, label)); }
+    };
+    add(S::FULLKEY, ControllerType::ProController, "Pro Controller");
+    add(S::JOY_DUAL, ControllerType::DualJoyconDetached, "Dual Joycons");
+    add(S::JOY_LEFT, ControllerType::LeftJoycon, "Left Joycon");
+    add(S::JOY_RIGHT, ControllerType::RightJoycon, "Right Joycon");
+    if player_index == 0 { add(S::HANDHELD, ControllerType::Handheld, "Handheld"); }
+    add(S::GC, ControllerType::GameCube, "GameCube Controller");
+    if enable_all {
+        add(S::PALMA, ControllerType::Pokeball, "Poke Ball Plus");
+        add(S::LARK, ControllerType::NES, "NES Controller");
+        add(S::LUCIA, ControllerType::SNES, "SNES Controller");
+        add(S::LAGOON, ControllerType::N64, "N64 Controller");
+        add(S::LAGER, ControllerType::SegaGenesis, "Sega Genesis");
+    }
+    rows
+}
+
+/// ConfigureInputPlayer::GetIndexFromControllerType returns -1 when absent.
+fn get_index_from_controller_type(rows: &[(ControllerType, &str)], kind: ControllerType) -> u32 {
+    rows.iter().position(|(candidate, _)| *candidate == kind)
+        .map(|index| index as u32).unwrap_or(gtk::INVALID_LIST_POSITION)
+}
 
 /// The label upstream shows for an unmapped binding.
 const NOT_SET: &str = "[not set]";
@@ -736,6 +758,7 @@ pub fn page(
     input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     profile_context: Rc<InputProfileContext>,
+    global: Option<&super::configure_input::GlobalInputSettings>,
 ) -> Page {
     let (controller, mut configuration_controllers) = {
         let hid_core = hid_core.lock();
@@ -788,6 +811,9 @@ pub fn page(
     *page.configuration_controllers.borrow_mut() = std::mem::take(&mut configuration_controllers);
     *page.input_subsystem.borrow_mut() = Some(Rc::clone(&input_subsystem));
     let initial_type = state.borrow().controller_type;
+    let supported_styles = hid_core.lock().get_supported_style_tag();
+    let enable_all = *common::settings::values().enable_all_controllers.get_value();
+    let controller_types = Rc::new(set_connectable_controllers(supported_styles, index, enable_all));
 
     install_group_style();
 
@@ -803,14 +829,9 @@ pub fn page(
     let connect_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let connected = gtk::CheckButton::with_label("Connect Controller");
     connected.set_active(state.borrow().connected);
-    let type_labels: Vec<&str> = CONTROLLER_TYPES.iter().map(|(_, l)| *l).collect();
-    let controller_type = w::combo(
-        &type_labels,
-        CONTROLLER_TYPES
-            .iter()
-            .position(|(t, _)| *t == initial_type)
-            .unwrap_or(0) as u32,
-    );
+    let type_labels: Vec<&str> = controller_types.iter().map(|(_, l)| *l).collect();
+    let controller_type = w::combo(&type_labels, 0);
+    controller_type.set_selected(get_index_from_controller_type(&controller_types, initial_type));
     connect_box.append(&connected);
     connect_box.append(&controller_type);
     header.append(&connect_box);
@@ -1076,6 +1097,14 @@ pub fn page(
     motion_box.append(&motion);
     motion_box.append(&configure_motion);
     footer.append(&motion_box);
+    if let Some(global) = global {
+        global.bind(&motion, &vibration, &docked);
+    } else {
+        // The standalone input-profile editor does not own global options.
+        console_mode.set_visible(false);
+        vibration_box.set_visible(false);
+        motion_box.set_visible(false);
+    }
 
     // "Connected  1 2 3 4 5 6 7 8" over a row of checkboxes.
     let connected_strip = gtk::Grid::new();
@@ -1191,11 +1220,12 @@ pub fn page(
     {
         let page = Rc::downgrade(&page);
         let preview_holder = preview_holder.clone();
+        let controller_types = Rc::clone(&controller_types);
         controller_type.connect_selected_notify(move |combo| {
             let Some(page) = page.upgrade() else {
                 return;
             };
-            let selected = CONTROLLER_TYPES
+            let selected = controller_types
                 .get(combo.selected() as usize)
                 .map(|(kind, _)| *kind)
                 .unwrap_or(ControllerType::ProController);
@@ -1216,6 +1246,7 @@ pub fn page(
         let page = Rc::downgrade(&page);
         let profile_context = Rc::clone(&profile_context);
         let controller_type = controller_type.clone();
+        let controller_types = Rc::clone(&controller_types);
         profile.connect_selected_notify(move |dropdown| {
             let Some(page) = page.upgrade() else {
                 return;
@@ -1239,11 +1270,7 @@ pub fn page(
 
             page.state.borrow_mut().profile_name = profile_name;
             let selected_type = page.state.borrow().controller_type;
-            let selected = CONTROLLER_TYPES
-                .iter()
-                .position(|(controller, _)| *controller == selected_type)
-                .unwrap_or(0);
-            controller_type.set_selected(selected as u32);
+            controller_type.set_selected(get_index_from_controller_type(&controller_types, selected_type));
             page.update_ui();
         });
     }
@@ -1405,13 +1432,10 @@ pub fn page(
         let _keep_alive = &header_captions;
 
         let is_connected = connected.is_active();
-        let selected_controller_type = CONTROLLER_TYPES
+        let selected_controller_type = controller_types
             .get(controller_type.selected() as usize)
             .map(|(t, _)| *t)
             .unwrap_or(ControllerType::ProController);
-        let vibrates = vibration.is_active();
-        let uses_motion = motion.is_active();
-        let is_docked = docked.is_active();
 
         page_owner.refresh_devices();
         if let Some(controller) = page_owner.controller.borrow().as_ref() {
@@ -1441,13 +1465,6 @@ pub fn page(
                 let edited = page_owner.state.borrow();
                 slot.profile_name = edited.profile_name.clone();
             }
-            values.vibration_enabled.set_value(vibrates);
-            values.motion_enabled.set_value(uses_motion);
-            values.use_docked_mode.set_value(if is_docked {
-                common::settings_enums::ConsoleMode::Docked
-            } else {
-                common::settings_enums::ConsoleMode::Handheld
-            });
         }
     })
 }
@@ -2922,10 +2939,55 @@ mod tests {
     fn controller_type_rows_start_with_pro_controller() {
         // The default `PlayerInput::controller_type` is `ProController`; if it
         // were not row 0, a fresh profile would display the wrong type.
-        assert_eq!(CONTROLLER_TYPES[0].0, ControllerType::ProController);
+        let rows = set_connectable_controllers(hid_core::hid_types::NpadStyleTag {
+            raw: hid_core::hid_types::NpadStyleSet::all(),
+        }, 0, false);
+        assert_eq!(rows[0].0, ControllerType::ProController);
         assert_eq!(
             PlayerInput::default().controller_type,
-            CONTROLLER_TYPES[0].0
+            rows[0].0
         );
+    }
+
+    #[test]
+    fn connectable_controller_rows_respect_styles_player_and_debug_setting() {
+        use hid_core::hid_types::{NpadStyleSet as S, NpadStyleTag};
+        use ControllerType as C;
+        let expected = [
+            (S::FULLKEY, C::ProController), (S::JOY_DUAL, C::DualJoyconDetached),
+            (S::JOY_LEFT, C::LeftJoycon), (S::JOY_RIGHT, C::RightJoycon),
+            (S::HANDHELD, C::Handheld), (S::GC, C::GameCube),
+            (S::PALMA, C::Pokeball), (S::LARK, C::NES), (S::LUCIA, C::SNES),
+            (S::LAGOON, C::N64), (S::LAGER, C::SegaGenesis),
+        ];
+        for player in 0..8 {
+            for enable_all in [false, true] {
+                let rows = set_connectable_controllers(NpadStyleTag { raw: S::all() }, player, enable_all);
+                let kinds: Vec<_> = rows.iter().map(|(kind, _)| *kind).collect();
+                let expected_kinds: Vec<_> = expected.iter().enumerate()
+                    .filter(|(index, (_, kind))| (enable_all || *index < 6)
+                        && (player == 0 || *kind != C::Handheld))
+                    .map(|(_, (_, kind))| *kind).collect();
+                assert_eq!(kinds, expected_kinds);
+                for (index, &(kind, _)) in rows.iter().enumerate() {
+                    assert_eq!(get_index_from_controller_type(&rows, kind), index as u32);
+                }
+                if !enable_all {
+                    assert_eq!(get_index_from_controller_type(&rows, C::NES), gtk::INVALID_LIST_POSITION);
+                }
+                assert!(set_connectable_controllers(NpadStyleTag { raw: S::empty() }, player, enable_all).is_empty());
+                for (index, &(flag, kind)) in expected.iter().enumerate() {
+                    let single = set_connectable_controllers(NpadStyleTag { raw: flag }, player, enable_all);
+                    let allowed = (enable_all || index < 6) && (player == 0 || kind != C::Handheld);
+                    assert_eq!(single.len(), usize::from(allowed));
+                    if allowed {
+                        assert_eq!(single[0].0, kind);
+                        use hid_core::frontend::emulated_controller::EmulatedController;
+                        let npad = EmulatedController::map_settings_type_to_npad(kind);
+                        assert_eq!(EmulatedController::map_npad_to_settings_type(npad), kind);
+                    }
+                }
+            }
+        }
     }
 }

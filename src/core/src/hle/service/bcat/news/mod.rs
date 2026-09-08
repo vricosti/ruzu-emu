@@ -14,5 +14,6 @@ pub mod newly_arrived_event_holder;
 pub mod news_data_service;
 pub mod news_database_service;
 pub mod news_service;
+pub mod news_storage;
 pub mod overwrite_event_holder;
 pub mod service_creator;

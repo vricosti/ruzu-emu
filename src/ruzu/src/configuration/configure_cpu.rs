@@ -11,14 +11,74 @@
 
 use gtk::prelude::*;
 
-use common::settings_enums::CpuAccuracy;
+use common::settings_enums::{CpuAccuracy, CpuBackend};
 
 use super::configure_dialog::Page;
 use super::shared_translation as tr;
 use super::shared_widget as w;
 
+// ConfigureCpu::UpdateGroup: unsafe optimizations apply only to Dynarmic.
+fn update_group(accuracy: CpuAccuracy, backend: CpuBackend) -> bool {
+    accuracy == CpuAccuracy::Unsafe && backend == CpuBackend::Dynarmic
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_group_requires_unsafe_dynarmic() {
+        assert!(update_group(CpuAccuracy::Unsafe, CpuBackend::Dynarmic));
+        assert!(!update_group(CpuAccuracy::Unsafe, CpuBackend::Nce));
+        assert!(!update_group(CpuAccuracy::Auto, CpuBackend::Dynarmic));
+        assert!(!update_group(CpuAccuracy::Debugging, CpuBackend::Dynarmic));
+    }
+
+    #[test]
+    fn runtime_accuracy_is_locked_but_custom_ticks_remain_editable() {
+        let mut values = common::settings::Values::default();
+        let accuracy = w::SettingEditPolicy::new(&values.cpu_accuracy, false, true);
+        assert!(!accuracy.sensitive);
+        accuracy.apply(&mut values.cpu_accuracy, CpuAccuracy::Unsafe);
+        assert_eq!(*values.cpu_accuracy.get_value(), CpuAccuracy::Auto);
+        let enabled = w::SettingEditPolicy::new(&values.use_custom_cpu_ticks, false, true);
+        let ticks = w::SettingEditPolicy::new(&values.cpu_ticks, false, true);
+        assert!(enabled.sensitive && ticks.sensitive);
+        enabled.apply(&mut values.use_custom_cpu_ticks, true);
+        ticks.apply(&mut values.cpu_ticks, 12345);
+        assert!(*values.use_custom_cpu_ticks.get_value());
+        assert_eq!(*values.cpu_ticks.get_value(), 12345);
+    }
+
+    #[test]
+    fn all_unsafe_options_reject_runtime_writes_and_allow_idle_writes() {
+        let mut values = common::settings::Values::default();
+        for setting in [
+            &mut values.cpuopt_unsafe_host_mmu,
+            &mut values.cpuopt_unsafe_unfuse_fma,
+            &mut values.cpuopt_unsafe_reduce_fp_error,
+            &mut values.cpuopt_unsafe_ignore_standard_fpcr,
+            &mut values.cpuopt_unsafe_inaccurate_nan,
+            &mut values.cpuopt_unsafe_fastmem_check,
+            &mut values.cpuopt_unsafe_ignore_global_monitor,
+        ] {
+            let initial = *setting.get_value();
+            let running = w::SettingEditPolicy::new(setting, false, true);
+            assert!(!running.sensitive);
+            running.apply(setting, !initial);
+            assert_eq!(*setting.get_value(), initial);
+            let idle = w::SettingEditPolicy::new(setting, true, true);
+            assert!(idle.sensitive);
+            idle.apply(setting, !initial);
+            assert_eq!(*setting.get_value(), !initial);
+        }
+        assert!(!values.cpu_backend.setting.runtime_modifiable);
+    }
+}
+
 /// Build the CPU tab — upstream `ConfigureCpu`.
-pub fn page() -> Page {
+pub fn page(runtime_lock: bool) -> Page {
+    let configuring_global = common::settings::is_configuring_global();
     let (scroller, column) = w::page();
 
     // --- "General" --------------------------------------------------------
@@ -84,6 +144,10 @@ pub fn page() -> Page {
     unsafe_note.set_xalign(0.0);
     unsafe_content.append(&unsafe_note);
 
+    let host_mmu = w::check_row(
+        "Enable Host MMU Emulation (fastmem)",
+        *common::settings::values().cpuopt_unsafe_host_mmu.get_value(),
+    );
     let unfuse_fma = w::check_row(
         "Unfuse FMA (improve performance on CPUs without FMA)",
         *common::settings::values()
@@ -121,6 +185,7 @@ pub fn page() -> Page {
             .get_value(),
     );
     for check in [
+        &host_mmu,
         &unfuse_fma,
         &reduce_fp_error,
         &ignore_standard_fpcr,
@@ -131,18 +196,105 @@ pub fn page() -> Page {
         unsafe_content.append(check);
     }
 
-    unsafe_group.set_visible(accuracy_value == CpuAccuracy::Unsafe);
+    let backend_value = *common::settings::values().cpu_backend.get_value();
+    unsafe_group.set_visible(update_group(accuracy_value, backend_value));
     column.append(&unsafe_group);
 
-    // Upstream `ConfigureCpu::UpdateGroup`: reveal the unsafe group only for
-    // `CpuAccuracy::Unsafe`.
+    // Reevaluate both selectors, as in ConfigureCpu::UpdateGroup.
     {
         let unsafe_group = unsafe_group.clone();
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        let backend = backend.clone();
         accuracy.connect_selected_notify(move |combo| {
             let selected = tr::value_at(tr::CPU_ACCURACY, combo.selected());
-            unsafe_group.set_visible(selected == CpuAccuracy::Unsafe);
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            let backend_value = tr::value_at(tr::CPU_BACKEND, backend.selected());
+            unsafe_group.set_visible(update_group(selected, backend_value));
         });
     }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        let unsafe_group = unsafe_group.clone();
+        let accuracy = accuracy.clone();
+        backend.connect_selected_notify(move |combo| {
+            unsafe_group.set_visible(update_group(
+                tr::value_at(tr::CPU_ACCURACY, accuracy.selected()),
+                tr::value_at(tr::CPU_BACKEND, combo.selected()),
+            ));
+        });
+    }
+
+    // ConfigurationShared::Widget gates both sensitivity and ApplyConfiguration.
+    let accuracy_policy = w::SettingEditPolicy::new(
+        &common::settings::values().cpu_accuracy,
+        runtime_lock,
+        configuring_global,
+    );
+    accuracy_row.set_sensitive(accuracy_policy.sensitive);
+    let custom_ticks_policy = w::SettingEditPolicy::new(
+        &common::settings::values().use_custom_cpu_ticks,
+        runtime_lock,
+        configuring_global,
+    );
+    custom_ticks.set_sensitive(custom_ticks_policy.sensitive);
+    let ticks_policy = w::SettingEditPolicy::new(
+        &common::settings::values().cpu_ticks,
+        runtime_lock,
+        configuring_global,
+    );
+    ticks_row.set_sensitive(ticks_policy.sensitive);
+    let host_mmu_policy = w::SettingEditPolicy::new(
+        &common::settings::values().cpuopt_unsafe_host_mmu,
+        runtime_lock,
+        configuring_global,
+    );
+    host_mmu.set_sensitive(host_mmu_policy.sensitive);
+    let unfuse_policy = w::SettingEditPolicy::new(
+        &common::settings::values().cpuopt_unsafe_unfuse_fma,
+        runtime_lock,
+        configuring_global,
+    );
+    unfuse_fma.set_sensitive(unfuse_policy.sensitive);
+    let fp_error_policy = w::SettingEditPolicy::new(
+        &common::settings::values().cpuopt_unsafe_reduce_fp_error,
+        runtime_lock,
+        configuring_global,
+    );
+    reduce_fp_error.set_sensitive(fp_error_policy.sensitive);
+    let fpcr_policy = w::SettingEditPolicy::new(
+        &common::settings::values().cpuopt_unsafe_ignore_standard_fpcr,
+        runtime_lock,
+        configuring_global,
+    );
+    ignore_standard_fpcr.set_sensitive(fpcr_policy.sensitive);
+    let nan_policy = w::SettingEditPolicy::new(
+        &common::settings::values().cpuopt_unsafe_inaccurate_nan,
+        runtime_lock,
+        configuring_global,
+    );
+    inaccurate_nan.set_sensitive(nan_policy.sensitive);
+    let fastmem_policy = w::SettingEditPolicy::new(
+        &common::settings::values().cpuopt_unsafe_fastmem_check,
+        runtime_lock,
+        configuring_global,
+    );
+    fastmem_check.set_sensitive(fastmem_policy.sensitive);
+    let monitor_policy = w::SettingEditPolicy::new(
+        &common::settings::values().cpuopt_unsafe_ignore_global_monitor,
+        runtime_lock,
+        configuring_global,
+    );
+    ignore_global_monitor.set_sensitive(monitor_policy.sensitive);
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let backend_policy = {
+        let policy = w::SettingEditPolicy::new(
+            &common::settings::values().cpu_backend,
+            runtime_lock,
+            configuring_global,
+        );
+        backend.set_sensitive(policy.sensitive);
+        policy
+    };
 
     Page::new("CPU", scroller, move || {
         let accuracy_value = tr::value_at(tr::CPU_ACCURACY, accuracy.selected());
@@ -154,22 +306,22 @@ pub fn page() -> Page {
         let nan = inaccurate_nan.is_active();
         let fastmem = fastmem_check.is_active();
         let monitor = ignore_global_monitor.is_active();
+        let host_mmu_value = host_mmu.is_active();
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        let backend_value = tr::value_at(tr::CPU_BACKEND, backend.selected());
 
         let mut values = common::settings::values_mut();
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-        values
-            .cpu_backend
-            .set_value(tr::value_at(tr::CPU_BACKEND, backend.selected()));
-        values.cpu_accuracy.set_value(accuracy_value);
-        values.use_custom_cpu_ticks.set_value(custom_ticks_enabled);
-        values.cpu_ticks.set_value(ticks_value);
-        values.cpuopt_unsafe_unfuse_fma.set_value(unfuse);
-        values.cpuopt_unsafe_reduce_fp_error.set_value(fp_error);
-        values.cpuopt_unsafe_ignore_standard_fpcr.set_value(fpcr);
-        values.cpuopt_unsafe_inaccurate_nan.set_value(nan);
-        values.cpuopt_unsafe_fastmem_check.set_value(fastmem);
-        values
-            .cpuopt_unsafe_ignore_global_monitor
-            .set_value(monitor);
+        backend_policy.apply(&mut values.cpu_backend, backend_value);
+        accuracy_policy.apply(&mut values.cpu_accuracy, accuracy_value);
+        custom_ticks_policy.apply(&mut values.use_custom_cpu_ticks, custom_ticks_enabled);
+        ticks_policy.apply(&mut values.cpu_ticks, ticks_value);
+        host_mmu_policy.apply(&mut values.cpuopt_unsafe_host_mmu, host_mmu_value);
+        unfuse_policy.apply(&mut values.cpuopt_unsafe_unfuse_fma, unfuse);
+        fp_error_policy.apply(&mut values.cpuopt_unsafe_reduce_fp_error, fp_error);
+        fpcr_policy.apply(&mut values.cpuopt_unsafe_ignore_standard_fpcr, fpcr);
+        nan_policy.apply(&mut values.cpuopt_unsafe_inaccurate_nan, nan);
+        fastmem_policy.apply(&mut values.cpuopt_unsafe_fastmem_check, fastmem);
+        monitor_policy.apply(&mut values.cpuopt_unsafe_ignore_global_monitor, monitor);
     })
 }

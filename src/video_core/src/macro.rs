@@ -2518,9 +2518,7 @@ pub(crate) fn assert_fail_soft(condition: bool, message: impl FnOnce() -> String
     }
     let message = message();
     log::error!("{message}");
-    if *common::settings::values().use_debug_asserts.get_value() {
-        panic!("{message}");
-    }
+    common::assert::assert_fail_soft_impl();
 }
 
 // ── Instruction field enums ──────────────────────────────────────────────────
@@ -3063,6 +3061,79 @@ mod tests {
             engine.uploaded_macro_code.get(&0x100),
             Some(&vec![0xDEADBEEF, 0xCAFEBABE])
         );
+    }
+
+    #[test]
+    fn macro_settings_preserve_backend_refresh_and_first_compile_dump_policy() {
+        const CHILD: &str = "RUZU_TEST_MACRO_SETTINGS";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        // A synthetic macro fetching one parameter, exiting, then executing its
+        // delay slot. No Maxwell register or memory access is issued.
+        let code = [Operation::AddImmediate as u32
+            | ((ResultOperation::IgnoreAndFetch as u32) << 4) | (1 << 7) | (2 << 8),
+            Operation::AddImmediate as u32 | ((ResultOperation::Move as u32) << 4)];
+        assert!(matches!(MacroEngine::compile_backend(true, &code), AnyCachedMacro::Interpreter(_)));
+        let compiled = MacroEngine::compile_backend(false, &code);
+        #[cfg(target_arch = "x86_64")]
+        assert!(matches!(compiled, AnyCachedMacro::Dynamic(_)));
+        #[cfg(not(target_arch = "x86_64"))]
+        assert!(matches!(compiled, AnyCachedMacro::Interpreter(_)));
+
+        let hle = AnyCachedMacro::BindShader(HleBindShader);
+        for disabled in [false, true, false] {
+            common::settings::values_mut().disable_macro_hle.set_value(disabled);
+            assert_eq!(hle.needs_parameter_refresh(), disabled);
+            assert!(compiled.needs_parameter_refresh());
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("ruzu-macro-settings-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        common::fs::path_util::set_ruzu_path(common::fs::path_util::RuzuPath::DumpDir, &directory);
+        common::settings::set_current_program_id(42);
+        let mut engine = MacroEngine::new(true);
+        for word in code { engine.add_code(0x100, word); }
+        common::settings::values_mut().dump_macros.set_value(false);
+        engine.execute(std::ptr::null_mut(), 0x100, &mut [0, 7], |_| {});
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        common::settings::values_mut().dump_macros.set_value(true);
+        // Enabling dumps does not retroactively dump cache hits upstream.
+        engine.execute(std::ptr::null_mut(), 0x100, &mut [0, 8], |_| {});
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        engine.clear_code(0x100);
+        for word in code { engine.add_code(0x100, word); }
+        engine.execute(std::ptr::null_mut(), 0x100, &mut [0, 9], |_| {});
+        let path = directory.join(format!("{:016x}_{:016x}_jit.macro", 42, hash_macro_code(&code)));
+        assert_eq!(std::fs::read(&path).unwrap(), bytemuck::cast_slice::<u32, u8>(&code));
+        std::fs::remove_file(&path).unwrap();
+        engine.execute(std::ptr::null_mut(), 0x100, &mut [0, 10], |_| {});
+        assert!(!path.exists());
+        assert_fail_soft(true, || panic!("successful assertions do not format messages"));
+        common::settings::values_mut().use_debug_asserts.set_value(false);
+        assert_fail_soft(false, || "synthetic nonfatal assertion".into());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn enabled_macro_assertions_break_instead_of_unwinding() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "RUZU_TEST_MACRO_ASSERT";
+        if std::env::var_os(CHILD).is_some() {
+            let limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) }, 0);
+            common::settings::values_mut().use_debug_asserts.set_value(true);
+            assert_fail_soft(false, || "synthetic macro assertion".into());
+            panic!("breakpoint unexpectedly returned without a debugger");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", std::thread::current().name().unwrap()])
+            .env(CHILD, "1").status().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTRAP));
     }
 
     #[test]

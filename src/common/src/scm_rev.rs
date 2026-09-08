@@ -10,6 +10,10 @@ pub const SCM_REV: &str = env!("GIT_REV");
 pub const SCM_BRANCH: &str = env!("GIT_BRANCH");
 pub const SCM_DESC: &str = env!("GIT_DESC");
 pub const BUILD_NAME: &str = env!("BUILD_NAME");
+pub const BUILD_DATE: &str = env!("BUILD_DATE");
+// Cargo trims trailing whitespace from rustc-env values; concat preserves the
+// trailing space in GenerateSCMRev.cmake's BUILD_FULLNAME.
+pub const BUILD_FULLNAME: &str = concat!(env!("BUILD_NAME"), " ", env!("BUILD_VERSION"), " ");
 pub const BUILD_VERSION: &str = env!("BUILD_VERSION");
 pub const COMPILER_ID: &str = env!("COMPILER_ID");
 
@@ -27,6 +31,10 @@ mod tests {
             assert!(BUILD_VERSION.ends_with(SCM_BRANCH));
         }
         assert_eq!(SCM_DESC, BUILD_VERSION);
+        assert_eq!(BUILD_FULLNAME, format!("{BUILD_NAME} {BUILD_VERSION} "));
+        assert_eq!(BUILD_DATE.len(), 20);
+        assert_eq!(&BUILD_DATE[10..11], "T");
+        assert!(BUILD_DATE.ends_with('Z'));
         assert!(!COMPILER_ID.is_empty());
         assert_ne!(COMPILER_ID, "Unknown compiler");
         #[cfg(target_env = "msvc")]

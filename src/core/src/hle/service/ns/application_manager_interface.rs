@@ -9,9 +9,10 @@
 use super::ns_types::*;
 use crate::core::SystemRef;
 use crate::file_sys::romfs_factory::StorageId;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use std::collections::BTreeMap;
 
@@ -149,6 +150,7 @@ pub const IAPPLICATION_MANAGER_INTERFACE_COMMANDS: &[(u32, bool, &str)] = &[
     (508, false, "GetLastGameCardMountFailureResult"),
     (509, false, "ListApplicationIdOnGameCard"),
     (510, false, "GetGameCardPlatformRegion"),
+    (511, true, "GetGameCardWakenReadyEvent"),
     (600, false, "CountApplicationContentMeta"),
     (601, false, "ListApplicationContentMetaStatus"),
     (602, false, "ListAvailableAddOnContent"),
@@ -334,6 +336,7 @@ pub const IAPPLICATION_MANAGER_INTERFACE_COMMANDS: &[(u32, bool, &str)] = &[
     (3013, false, "IsGameCardEnabled"),
     (3014, false, "IsLocalContentShareEnabled"),
     (3050, false, "ListAssignELicenseTaskResult"),
+    (4022, true, "Unknown4022"),
     (9999, false, "GetApplicationCertificate"),
 ];
 
@@ -341,6 +344,14 @@ pub const IAPPLICATION_MANAGER_INTERFACE_COMMANDS: &[(u32, bool, &str)] = &[
 pub struct IApplicationManagerInterface {
     #[allow(dead_code)]
     system: SystemRef,
+    // The Event bridge lazily creates the kernel endpoint; ownership remains
+    // with this interface, matching upstream's record_update_system_event.
+    record_update_system_event: Event,
+    sd_card_mount_status_event: Event,
+    gamecard_update_detection_event: Event,
+    gamecard_mount_failure_event: Event,
+    gamecard_waken_ready_event: Event,
+    unknown_event: Event,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -351,6 +362,14 @@ impl IApplicationManagerInterface {
             .iter()
             .map(|&(command_id, _, name)| {
                 let handler = match command_id {
+                    0 => Some(Self::list_application_record_handler as _),
+                    44 => Some(Self::get_sd_card_mount_status_changed_event_handler as _),
+                    52 => Some(Self::get_game_card_update_detection_event_handler as _),
+                    505 => Some(Self::get_game_card_mount_failure_event_handler as _),
+                    511 => Some(Self::get_game_card_waken_ready_event_handler as _),
+                    4022 => Some(Self::unknown4022_handler as _),
+                    2 => Some(Self::get_application_record_update_system_event_handler as _),
+                    70 => Some(Self::resume_all_handler as _),
                     71 => Some(Self::get_storage_size_handler as _),
                     2520 => {
                         Some(Self::is_qualification_transition_supported_by_process_id_handler as _)
@@ -362,9 +381,153 @@ impl IApplicationManagerInterface {
             .collect::<Vec<_>>();
         Self {
             system,
+            record_update_system_event: Event::new(),
+            sd_card_mount_status_event: Event::new(),
+            gamecard_update_detection_event: Event::new(),
+            gamecard_mount_failure_event: Event::new(),
+            gamecard_waken_ready_event: Event::new(),
+            unknown_event: Event::new(),
             handlers: build_handler_map(&functions),
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn list_application_record_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        use crate::file_sys::nca_metadata::{ContentRecordType, TitleType};
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let offset = RequestParser::new(ctx).pop_u32() as i32;
+        let provider = service.system.get().get_content_provider()
+            .expect("application listing requires the content provider");
+        let entries = provider.lock().unwrap().list_entries_filter_origin(
+            None, Some(TitleType::Application), Some(ContentRecordType::Program), None);
+        let bytes = Self::list_application_record(
+            entries.iter().map(|(_, entry)| entry.title_id),
+            crate::launch_timestamp_cache::get_launch_timestamp,
+            offset,
+            ctx.get_write_buffer_size(0) / 0x18,
+        );
+        let count = (bytes.len() / 0x18) as u32;
+        ctx.write_buffer(&bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    // Mechanical separation of upstream ListApplicationRecord's record-building
+    // body from its IPC adapter; injected timestamp lookup permits isolated tests.
+    fn list_application_record(
+        installed: impl IntoIterator<Item = u64>,
+        timestamp: impl Fn(u64) -> i64,
+        offset: i32,
+        limit: usize,
+    ) -> Vec<u8> {
+        let mut records = Vec::new();
+        for application_id in installed {
+            if application_id < 0x0100000000001FFF || application_id & 0xFFF != 0 {
+                continue;
+            }
+            records.push(ApplicationRecord {
+                application_id,
+                last_event: ApplicationEvent::Installed,
+                attributes: 0,
+                _padding0: [0; 6],
+                last_updated: timestamp(application_id),
+            });
+        }
+        records.sort_unstable_by(|a, b| b.last_updated.cmp(&a.last_updated)
+            .then_with(|| a.application_id.cmp(&b.application_id)));
+        let mut bytes = Vec::new();
+        for record in records.iter().skip(offset.max(0) as usize).take(limit) {
+            bytes.extend_from_slice(&record.application_id.to_le_bytes());
+            bytes.push(record.last_event as u8);
+            bytes.push(record.attributes);
+            bytes.extend_from_slice(&record._padding0);
+            bytes.extend_from_slice(&record.last_updated.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn get_application_record_update_system_event_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        log::warn!("(STUBBED) GetApplicationRecordUpdateSystemEvent called");
+        service.record_update_system_event.signal();
+        let Some(object_id) = service.record_update_system_event.copy_object_id(ctx) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
+    }
+
+    fn get_sd_card_mount_status_changed_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        log::warn!("(STUBBED) get_sd_card_mount_status_changed_event called");
+        let Some(object_id) = service.sd_card_mount_status_event.copy_object_id(ctx) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
+    }
+
+    fn get_game_card_update_detection_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        log::warn!("(STUBBED) get_game_card_update_detection_event called");
+        let Some(object_id) = service.gamecard_update_detection_event.copy_object_id(ctx) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
+    }
+
+    fn get_game_card_mount_failure_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        log::warn!("(STUBBED) get_game_card_mount_failure_event called");
+        let Some(object_id) = service.gamecard_mount_failure_event.copy_object_id(ctx) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
+    }
+
+    fn get_game_card_waken_ready_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        log::warn!("(STUBBED) get_game_card_waken_ready_event called");
+        let Some(object_id) = service.gamecard_waken_ready_event.copy_object_id(ctx) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
+    }
+
+    fn unknown4022_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        log::warn!("(STUBBED) unknown4022 called");
+        service.unknown_event.signal();
+        let Some(object_id) = service.unknown_event.copy_object_id(ctx) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
     }
 
     fn parse_storage_id(raw: u8) -> Option<StorageId> {
@@ -417,6 +580,11 @@ impl IApplicationManagerInterface {
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_bool(is_supported);
+    }
+
+    fn resume_all_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        resume_all();
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
     }
 }
 
@@ -494,6 +662,110 @@ pub fn get_application_view(application_ids: &[u64], out_views: &mut [Applicatio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_all_command_returns_upstream_success() {
+        let service = IApplicationManagerInterface::new(SystemRef::null());
+        let mut ctx = HLERequestContext::new();
+        service.handlers[&70].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], 0);
+        assert!(ctx.outgoing_copy_objects.is_empty());
+    }
+
+    #[test]
+    fn application_listing_filters_sorts_and_paginates_records() {
+        // Synthetic application IDs, unrelated to any title.
+        let a = 0x0100_0000_0000_2000;
+        let b = a + 0x1000;
+        let c = b + 0x1000;
+        let inputs = [0, a - 1, a + 1, c, b, a];
+        let timestamp = |id| if id == c { -7 } else { 42 };
+        let bytes = IApplicationManagerInterface::list_application_record(inputs, timestamp, -1, 9);
+        assert_eq!(bytes.len(), 3 * 24);
+        for (record, id) in bytes.chunks_exact(24).zip([a, b, c]) {
+            assert_eq!(&record[..8], &id.to_le_bytes());
+            assert_eq!(record[8], 3);
+            assert_eq!(&record[9..16], &[0; 7]);
+            assert_eq!(&record[16..24], &timestamp(id).to_le_bytes());
+        }
+        assert_eq!(IApplicationManagerInterface::list_application_record(inputs, timestamp, 1, 1), bytes[24..48]);
+        assert!(IApplicationManagerInterface::list_application_record(inputs, timestamp, 3, 9).is_empty());
+        assert!(IApplicationManagerInterface::list_application_record(inputs, timestamp, 0, 0).is_empty());
+        assert_eq!(std::mem::offset_of!(ApplicationRecord, last_updated), 16);
+        assert_eq!(std::mem::size_of::<ApplicationRecord>(), 24);
+    }
+    #[test]
+    fn application_events_preserve_identity_and_upstream_signal_state() {
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use crate::hle::kernel::k_readable_event::KReadableEvent;
+        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+        use crate::hle::service::hle_ipc::KAutoObjectRef;
+        use std::sync::{Arc, Mutex};
+
+        let service = IApplicationManagerInterface::new(SystemRef::null());
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+        for (command, event, expected_signal) in [
+            (44, &service.sd_card_mount_status_event, false),
+            (52, &service.gamecard_update_detection_event, false),
+            (505, &service.gamecard_mount_failure_event, false),
+            (511, &service.gamecard_waken_ready_event, false),
+            (4022, &service.unknown_event, true),
+        ] {
+            let object_id = command as u64 + 100;
+            let readable = Arc::new(Mutex::new(KReadableEvent::new()));
+            readable.lock().unwrap().initialize(1, object_id);
+            process.lock().unwrap().register_readable_event_object(object_id, readable.clone());
+            event.attach_kernel_event(readable.clone(), process.clone());
+            for _ in 0..2 {
+                let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
+                service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+                assert!(matches!(ctx.outgoing_copy_objects.as_slice(),
+                    [KAutoObjectRef::ObjectId(id)] if *id == object_id));
+                assert_eq!(readable.lock().unwrap().is_signaled(), expected_signal);
+                event.clear();
+                assert!(!readable.lock().unwrap().is_signaled());
+            }
+        }
+    }
+
+
+
+    #[test]
+    fn record_update_requests_copy_and_signal_the_same_event() {
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use crate::hle::kernel::k_readable_event::KReadableEvent;
+        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+        use crate::hle::service::hle_ipc::KAutoObjectRef;
+        use std::sync::{Arc, Mutex};
+
+        let service = IApplicationManagerInterface::new(SystemRef::null());
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let readable = Arc::new(Mutex::new(KReadableEvent::new()));
+        readable.lock().unwrap().initialize(1, 2);
+        process
+            .lock()
+            .unwrap()
+            .register_readable_event_object(2, readable.clone());
+        service
+            .record_update_system_event
+            .attach_kernel_event(readable.clone(), process.clone());
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+        assert!(!readable.lock().unwrap().is_signaled());
+        for _ in 0..2 {
+            let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
+            service.handlers[&2].handler_callback.unwrap()(&service, &mut ctx);
+            assert!(matches!(
+                ctx.outgoing_copy_objects.as_slice(),
+                [KAutoObjectRef::ObjectId(2)]
+            ));
+            assert!(readable.lock().unwrap().is_signaled());
+            service.record_update_system_event.clear();
+            assert!(!readable.lock().unwrap().is_signaled());
+        }
+    }
 
     #[test]
     fn qualification_transition_command_matches_upstream_registration_and_result() {

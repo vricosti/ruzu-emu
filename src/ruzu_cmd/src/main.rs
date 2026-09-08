@@ -37,6 +37,17 @@ use emu_window::{
 };
 use sdl_config::SdlConfig;
 
+/// Frontend exit callback: wake SDL's blocking event loop and let its owner
+/// detach the debugger and shut down the process. May run on a guest/debugger thread.
+fn request_exit() {
+    use sdl3::sys::everything as sdl;
+    let mut event: sdl::SDL_Event = unsafe { std::mem::zeroed() };
+    event.r#type = sdl::SDL_EVENT_QUIT.0;
+    if !unsafe { sdl::SDL_PushEvent(&mut event) } {
+        log::error!("Could not enqueue frontend quit event");
+    }
+}
+
 fn resolve_renderer_backend(
     renderer_override: Option<&str>,
     configured_backend: RendererBackend,
@@ -68,6 +79,28 @@ mod tests {
         parse_multiplayer_config, resolve_renderer_backend, MultiplayerConfig, RendererBackend,
     };
     use network::room::DEFAULT_ROOM_PORT;
+
+    #[test]
+    fn exit_callback_wakes_sdl_event_wait() {
+        const CHILD: &str = "RUZU_TEST_SDL_EXIT_CALLBACK";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use sdl3::sys::everything as sdl;
+        assert!(unsafe { sdl::SDL_Init(sdl::SDL_INIT_EVENTS) });
+        let sender = std::thread::spawn(super::request_exit);
+        let mut event: sdl::SDL_Event = unsafe { std::mem::zeroed() };
+        assert!(unsafe { sdl::SDL_WaitEventTimeout(&mut event, 1000) });
+        assert_eq!(unsafe { event.r#type }, sdl::SDL_EVENT_QUIT.0);
+        sender.join().unwrap();
+        unsafe { sdl::SDL_Quit() };
+    }
 
     #[test]
     fn configured_renderer_is_used_without_cli_override() {
@@ -1534,12 +1567,10 @@ fn main() {
     system.get_cpu_manager().on_gpu_ready();
 
     // -----------------------------------------------------------------------
-    // Upstream: system.RegisterExitCallback([&] { exit(0); })
-    // The SDL frontend exits immediately when the core requests application exit.
+    // Notify SDL rather than exiting on the guest/debugger thread. The main
+    // thread owns the equivalent of upstream SDL_AppQuit's teardown.
     // -----------------------------------------------------------------------
-    system.register_exit_callback(Box::new(|| {
-        std::process::exit(0);
-    }));
+    system.register_exit_callback(Box::new(request_exit));
 
     // -----------------------------------------------------------------------
     // Step 8 (upstream): system.Run()
@@ -1555,6 +1586,9 @@ fn main() {
         }
     }
     system.run();
+    if system.debugger_enabled() {
+        system.initialize_debugger();
+    }
 
     // -----------------------------------------------------------------------
     // Step 9 (upstream): while (emu_window->IsOpen()) { emu_window->WaitEvent(); }
@@ -1612,6 +1646,7 @@ fn main() {
     // Cleanup after window closes.
     // -----------------------------------------------------------------------
     log::info!("Window closed, shutting down");
+    system.detach_debugger();
     log::info!("Shutdown phase: system.pause() begin");
     system.pause();
     log::info!("Shutdown phase: system.pause() end");

@@ -24,7 +24,7 @@
 // which is why the "UI" page shows as "UI" and the graphics advanced page shows
 // as "Advanced" rather than their class names.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -104,6 +104,7 @@ pub struct ConfigureDialog {
     /// obtains the same edge from `QDialog::Accepted` and then refreshes its
     /// permanent status widgets.
     on_applied: RefCell<Option<Box<dyn Fn()>>>,
+    reset_requested: Rc<Cell<bool>>,
 }
 
 impl ConfigureDialog {
@@ -136,28 +137,40 @@ impl ConfigureDialog {
 
         // Upstream constructs Advanced Graphics first and gives Graphics a
         // callback to `ExposeComputeOption` when a Vulkan device requires it.
-        let advanced_graphics = configure_graphics_advanced::page();
+        let advanced_graphics = configure_graphics_advanced::page(runtime_lock);
         let graphics =
             configure_graphics::page(advanced_graphics.expose_compute_option, runtime_lock);
+
+        let reset_requested = Rc::new(Cell::new(false));
+        let reset_callback = {
+            let requested = Rc::clone(&reset_requested);
+            let window = window.downgrade();
+            move || {
+                requested.set(true);
+                if let Some(window) = window.upgrade() {
+                    window.close();
+                }
+            }
+        };
 
         // Upstream `PopulateSelectionList`'s six rows, in order.
         let sections = vec![
             Section {
                 name: "General",
                 pages: vec![
-                    configure_general::page(),
+                    configure_general::page(runtime_lock, reset_callback),
                     configure_hotkeys::page(),
                     configure_ui::page(),
                     configure_web::page(),
-                    configure_debug_tab::page(),
+                    configure_debug_tab::page(runtime_lock),
                 ],
                 apply: apply_pages,
             },
             Section {
                 name: "System",
                 pages: vec![
-                    configure_system::page(),
-                    configure_profile_manager::page(),
+                    configure_system::page(runtime_lock),
+                    configure_profile_manager::page(runtime_lock),
                     configure_network::page(),
                     configure_filesystem::page(),
                     configure_applets::page(),
@@ -166,7 +179,7 @@ impl ConfigureDialog {
             },
             Section {
                 name: "CPU",
-                pages: vec![configure_cpu::page()],
+                pages: vec![configure_cpu::page(runtime_lock)],
                 apply: apply_pages,
             },
             Section {
@@ -174,13 +187,13 @@ impl ConfigureDialog {
                 pages: vec![
                     graphics,
                     advanced_graphics.page,
-                    configure_graphics_extensions::page(),
+                    configure_graphics_extensions::page(runtime_lock),
                 ],
                 apply: apply_pages,
             },
             Section {
                 name: "Audio",
-                pages: vec![configure_audio::page()],
+                pages: vec![configure_audio::page(runtime_lock)],
                 apply: apply_pages,
             },
             Section {
@@ -254,6 +267,7 @@ impl ConfigureDialog {
             hid_core,
             shown: RefCell::new(None),
             on_applied: RefCell::new(None),
+            reset_requested,
         });
 
         // Upstream connects `itemSelectionChanged` to `UpdateVisibleTabs`.
@@ -360,6 +374,10 @@ impl ConfigureDialog {
     /// configuration dialog has applied its values.
     pub fn connect_applied(&self, callback: impl Fn() + 'static) {
         *self.on_applied.borrow_mut() = Some(Box::new(callback));
+    }
+
+    pub fn reset_requested(&self) -> bool {
+        self.reset_requested.get()
     }
 
     /// Notify the owner once the GTK window closes so its `Rc` can be dropped,

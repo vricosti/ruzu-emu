@@ -65,6 +65,10 @@ pub struct CalendarTime {
     pub hour: i8,
     pub minute: i8,
     pub second: i8,
+    /// Explicit counterpart of the C++ trailing padding. CalendarTime is copied
+    /// into IPC payloads, so Rust must initialize this byte rather than exposing
+    /// implicit, potentially uninitialized padding.
+    pub padding: u8,
 }
 const _: () = assert!(core::mem::size_of::<CalendarTime>() == 0x8);
 
@@ -216,6 +220,28 @@ pub fn get_span_between_time_points(
 #[cfg(test)]
 mod tests {
     use super::convert_to_time_span_ns;
+
+    #[test]
+    fn calendar_time_has_no_uninitialized_wire_padding() {
+        use super::CalendarTime;
+        assert_eq!(core::mem::size_of::<CalendarTime>(), 8);
+        assert_eq!(core::mem::offset_of!(CalendarTime, padding), 7);
+        let calendar = CalendarTime {
+            year: 2024,
+            month: 2,
+            day: 29,
+            hour: 12,
+            minute: 34,
+            second: 56,
+            padding: 0,
+        };
+        // All eight bytes are explicit initialized fields now.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&calendar as *const CalendarTime as *const u8, 8)
+        };
+        let year = 2024_i16.to_ne_bytes();
+        assert_eq!(bytes, &[year[0], year[1], 2, 29, 12, 34, 56, 0]);
+    }
 
     #[test]
     fn convert_to_time_span_matches_cntpct_frequency() {

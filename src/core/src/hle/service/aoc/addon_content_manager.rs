@@ -9,7 +9,26 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::file_sys::nca_metadata::{ContentRecordType, TitleType};
+use crate::file_sys::registered_cache::ContentProvider;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
+
+/// Upstream `AccumulateAOCTitleIDs`: snapshot readable Data content at creation.
+fn accumulate_aoc_title_ids(system: &crate::core::System) -> Vec<u64> {
+    let Some(provider) = system.get_content_provider() else {
+        return Vec::new();
+    };
+    let provider = provider.lock().unwrap();
+    provider
+        .list_entries_filter(Some(TitleType::AOC), Some(ContentRecordType::Data), None)
+        .into_iter()
+        .filter_map(|entry| {
+            let nca = provider.get_entry(entry.title_id, ContentRecordType::Data)?;
+            (nca.get_status() == crate::file_sys::partition_filesystem::ResultStatus::Success)
+                .then_some(entry.title_id)
+        })
+        .collect()
+}
 use crate::hle::service::hle_ipc::{
     HLERequestContext, SessionRequestHandler, SessionRequestHandlerFactory,
     SessionRequestHandlerPtr,
@@ -58,6 +77,7 @@ pub struct IAddOnContentManager {
 
 impl IAddOnContentManager {
     pub fn new(system: crate::core::SystemRef) -> Self {
+        let add_on_content = accumulate_aoc_title_ids(system.get());
         let handlers = build_handler_map(&[
             (
                 commands::COUNT_ADD_ON_CONTENT,
@@ -122,7 +142,7 @@ impl IAddOnContentManager {
             service_context.create_event("GetAddOnContentListChangedEvent".to_string());
         Self {
             system,
-            add_on_content: Vec::new(),
+            add_on_content,
             service_context,
             aoc_change_event_handle,
             handlers,
@@ -160,7 +180,7 @@ impl IAddOnContentManager {
         offset: u32,
         count: u32,
         _process_id: u64,
-    ) -> (u32, Vec<u32>) {
+    ) -> Result<(u32, Vec<u32>), ResultCode> {
         log::debug!(
             "IAddOnContentManager::list_add_on_content called, offset={}, count={}",
             offset,
@@ -185,7 +205,7 @@ impl IAddOnContentManager {
         }
         if (offset as usize) > out.len() {
             // Upstream returns ResultUnknown when offset > out.size()
-            return (0, Vec::new());
+            return Err(RESULT_UNKNOWN);
         }
         let result_count = std::cmp::min(out.len() - offset as usize, count as usize) as u32;
         let result_entries: Vec<u32> = out
@@ -193,7 +213,7 @@ impl IAddOnContentManager {
             .skip(offset as usize)
             .take(result_count as usize)
             .collect();
-        (result_count, result_entries)
+        Ok((result_count, result_entries))
     }
 
     /// GetAddOnContentBaseId (cmd 5).
@@ -203,14 +223,20 @@ impl IAddOnContentManager {
     pub fn get_add_on_content_base_id(&self, _process_id: u64) -> u64 {
         log::debug!("IAddOnContentManager::get_add_on_content_base_id called");
         let title_id = self.system.get().runtime_program_id();
-        // Upstream: PatchManager pm{title_id, system.GetFileSystemController(), system.GetContentProvider()};
-        // const auto res = pm.GetControlMetadata();
-        // if (res.first == nullptr) { return GetAOCBaseTitleID(title_id); }
-        // return res.first->GetDLCBaseTitleId();
-        //
-        // PatchManager::GetControlMetadata requires FileSystemController and ContentProvider
-        // integration that is not yet wired at the system level. Fall back to the
-        // no-metadata path which computes the AOC base title ID arithmetically.
+        let system = self.system.get();
+        let controller = system.get_filesystem_controller();
+        let controller = controller.lock().unwrap();
+        if let Some(provider) = system.get_content_provider() {
+            let provider = provider.lock().unwrap();
+            let patch_manager = crate::file_sys::patch_manager::PatchManager::new(
+                title_id,
+                &controller,
+                &*provider,
+            );
+            if let Some(nacp) = patch_manager.get_control_metadata().0 {
+                return nacp.get_dlc_base_title_id();
+            }
+        }
         crate::file_sys::common_funcs::get_aoc_base_title_id(title_id)
     }
 
@@ -296,7 +322,15 @@ impl IAddOnContentManager {
         let mut rp = RequestParser::new(ctx);
         let offset = rp.pop_u32();
         let count = rp.pop_u32();
-        let (out_count, add_on_content) = service.list_add_on_content(offset, count, ctx.get_pid());
+        let (out_count, add_on_content) =
+            match service.list_add_on_content(offset, count, ctx.get_pid()) {
+                Ok(result) => result,
+                Err(result) => {
+                    let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                    rb.push_result(result);
+                    return;
+                }
+            };
 
         let mut out_bytes = Vec::with_capacity(add_on_content.len() * std::mem::size_of::<u32>());
         for add_on_content_id in add_on_content {
@@ -481,6 +515,107 @@ impl ServiceFramework for IAddOnContentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_content_is_visible_to_aoc_with_filtering_and_pagination() {
+        const CHILD: &str = "RUZU_AOC_REGRESSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root =
+                std::env::temp_dir().join(format!("ruzu-aoc-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&root).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::service::aoc::addon_content_manager::tests::installed_content_is_visible_to_aoc_with_filtering_and_pagination", "--nocapture"])
+                .env(CHILD, &root)
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        // XDG isolation alone does not cover Windows.
+        let root = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
+        common::fs::path_util::set_app_directory(root.to_str().unwrap());
+        use crate::crypto::key_manager::{KeyManager, S128KeyType};
+        use crate::file_sys::fssystem::nca_header::NcaHeader;
+        use crate::file_sys::registered_cache::{
+            ContentProviderUnion, ContentProviderUnionSlot, ManualContentProvider,
+        };
+        use crate::file_sys::vfs::vfs_types::VirtualFile;
+        use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+        use std::sync::Mutex;
+
+        // Synthetic plaintext header without sections: exercises NCA validation
+        // without any user keys or copyrighted content. Key lives only in child.
+        KeyManager::instance()
+            .lock()
+            .unwrap()
+            .set_key_128(S128KeyType::KeyArea, [0x55; 16], 0, 0);
+        let mut header: NcaHeader = unsafe { std::mem::zeroed() };
+        header.magic = NcaHeader::MAGIC3;
+        header.sdk_addon_version = 0x000B_0000;
+        header.content_size = NcaHeader::SIZE as u64;
+        let data = unsafe {
+            std::slice::from_raw_parts(&header as *const NcaHeader as *const u8, NcaHeader::SIZE)
+        }
+        .to_vec();
+        let valid: VirtualFile =
+            Arc::new(VectorVfsFile::new(data, "synthetic.nca".to_owned(), None));
+        let invalid: VirtualFile = Arc::new(VectorVfsFile::new(
+            Vec::new(),
+            "invalid.nca".to_owned(),
+            None,
+        ));
+        let mut provider = Box::new(ManualContentProvider::new());
+        provider.add_entry(
+            TitleType::AOC,
+            ContentRecordType::Data,
+            0x3001,
+            valid.clone(),
+        );
+        provider.add_entry(
+            TitleType::AOC,
+            ContentRecordType::Data,
+            0x3003,
+            valid.clone(),
+        );
+        provider.add_entry(TitleType::AOC, ContentRecordType::Data, 0x3002, invalid);
+        provider.add_entry(
+            TitleType::AOC,
+            ContentRecordType::Data,
+            0x5001,
+            valid.clone(),
+        );
+        provider.add_entry(TitleType::AOC, ContentRecordType::Program, 0x3004, valid);
+        let mut union = ContentProviderUnion::new();
+        unsafe {
+            union.set_slot(
+                ContentProviderUnionSlot::UserNAND,
+                &mut *provider as *mut dyn ContentProvider,
+            );
+        }
+        let mut system = crate::core::System::new_for_test();
+        system.set_runtime_program_id(0x2000);
+        system.set_content_provider(Arc::new(Mutex::new(union)));
+        let service = IAddOnContentManager::new(crate::core::SystemRef::from_ref(&system));
+        assert_eq!(service.add_on_content, vec![0x3001, 0x3003, 0x5001]);
+        assert_eq!(service.count_add_on_content(0), 2);
+        assert_eq!(service.list_add_on_content(0, 10, 0), Ok((2, vec![1, 3])));
+        assert_eq!(service.list_add_on_content(1, 1, 0), Ok((1, vec![3])));
+        assert_eq!(service.list_add_on_content(2, 10, 0), Ok((0, vec![])));
+        assert_eq!(service.list_add_on_content(3, 10, 0), Err(RESULT_UNKNOWN));
+        assert_eq!(service.get_add_on_content_base_id(0), 0x3000);
+        common::settings::values_mut()
+            .disabled_addons
+            .insert(0x2000, vec!["DLC".to_owned()]);
+        assert_eq!(service.count_add_on_content(0), 0);
+        assert_eq!(service.list_add_on_content(0, 10, 0), Ok((0, vec![])));
+        assert_eq!(service.list_add_on_content(1, 10, 0), Err(RESULT_UNKNOWN));
+    }
 
     #[test]
     fn implemented_handlers_match_upstream_function_table() {

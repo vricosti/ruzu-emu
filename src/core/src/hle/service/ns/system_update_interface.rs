@@ -7,10 +7,13 @@
 //! ISystemUpdateInterface — "ns:su" service.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::ns_types::BackgroundNetworkUpdateState;
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
+use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for ISystemUpdateInterface.
@@ -40,6 +43,9 @@ pub mod commands {
 ///
 /// Corresponds to `ISystemUpdateInterface` in upstream.
 pub struct ISystemUpdateInterface {
+    // The existing Event bridge materializes the readable kernel endpoint when
+    // first requested; the interface owns its lifetime, as upstream does.
+    update_notification_event: Event,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -49,12 +55,12 @@ impl ISystemUpdateInterface {
         let handlers = build_handler_map(&[
             (
                 commands::GET_BACKGROUND_NETWORK_UPDATE_STATE,
-                None,
+                Some(Self::get_background_network_update_state_handler),
                 "GetBackgroundNetworkUpdateState",
             ),
             (
                 commands::OPEN_SYSTEM_UPDATE_CONTROL,
-                None,
+                Some(Self::open_system_update_control_handler),
                 "OpenSystemUpdateControl",
             ),
             (
@@ -84,7 +90,7 @@ impl ISystemUpdateInterface {
             ),
             (
                 commands::GET_SYSTEM_UPDATE_NOTIFICATION_EVENT_FOR_CONTENT_DELIVERY,
-                None,
+                Some(Self::get_system_update_notification_event_for_content_delivery_handler),
                 "GetSystemUpdateNotificationEventForContentDelivery",
             ),
             (
@@ -114,9 +120,53 @@ impl ISystemUpdateInterface {
             ),
         ]);
         Self {
+            update_notification_event: Event::new(),
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn get_background_network_update_state_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let state = service.get_background_network_update_state().unwrap();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(state as u32);
+    }
+
+    fn open_system_update_control_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let control = service.open_system_update_control().unwrap();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(Arc::new(control));
+    }
+
+    fn get_system_update_notification_event_for_content_delivery(&self) -> &Event {
+        log::warn!("(STUBBED) GetSystemUpdateNotificationEventForContentDelivery called");
+        &self.update_notification_event
+    }
+
+    fn get_system_update_notification_event_for_content_delivery_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let event = service.get_system_update_notification_event_for_content_delivery();
+        let Some(object_id) = event.copy_object_id(ctx) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
     }
 
     /// GetBackgroundNetworkUpdateState (cmd 0).
@@ -161,5 +211,44 @@ impl ServiceFramework for ISystemUpdateInterface {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+    use crate::hle::kernel::k_readable_event::KReadableEvent;
+    use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+    use crate::hle::service::hle_ipc::KAutoObjectRef;
+    use std::sync::Mutex;
+
+    #[test]
+    fn notification_requests_copy_the_same_unsignaled_event() {
+        let service = ISystemUpdateInterface::new();
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let readable = Arc::new(Mutex::new(KReadableEvent::new()));
+        readable.lock().unwrap().initialize(1, 2);
+        service
+            .update_notification_event
+            .attach_kernel_event(readable.clone(), process.clone());
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+        for _ in 0..2 {
+            let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
+            service.handlers[&9].handler_callback.unwrap()(&service, &mut ctx);
+            assert!(matches!(
+                ctx.outgoing_copy_objects.as_slice(),
+                [KAutoObjectRef::ObjectId(2)]
+            ));
+            assert!(!readable.lock().unwrap().is_signaled());
+        }
+        assert_eq!(
+            service.get_background_network_update_state().unwrap(),
+            BackgroundNetworkUpdateState::None
+        );
+        assert!(service.handlers[&0].handler_callback.is_some());
+        assert!(service.handlers[&1].handler_callback.is_some());
+        assert!(service.handlers[&10].handler_callback.is_none());
     }
 }

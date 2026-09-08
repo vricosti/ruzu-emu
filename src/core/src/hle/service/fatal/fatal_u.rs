@@ -8,10 +8,8 @@
 //! Provides user-facing fatal error reporting (ThrowFatal, ThrowFatalWithPolicy,
 //! ThrowFatalWithCpuContext).
 
-use super::fatal::FatalType;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -27,7 +25,7 @@ pub struct FatalU {
 }
 
 impl FatalU {
-    pub fn new(module: Arc<super::fatal::Module>) -> Self {
+    pub fn new(module: Arc<super::fatal::Module>, system: crate::core::SystemRef) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(FatalU::throw_fatal_handler), "ThrowFatal"),
             (
@@ -45,7 +43,7 @@ impl FatalU {
         log::debug!("fatal:u created");
         Self {
             interface: super::fatal::Interface::new(
-                crate::core::SystemRef::null(),
+                system,
                 module,
                 "fatal:u",
             ),
@@ -56,23 +54,12 @@ impl FatalU {
 
     fn throw_fatal_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const FatalU) };
-        let mut rp = RequestParser::new(ctx);
-        let error_code = rp.pop_u32();
-        svc.interface.throw_fatal(error_code);
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        svc.interface.throw_fatal_handler(ctx);
     }
 
     fn throw_fatal_with_policy_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const FatalU) };
-        let mut rp = RequestParser::new(ctx);
-        let error_code = rp.pop_u32();
-        let fatal_type =
-            FatalType::try_from(rp.pop_u32()).unwrap_or(FatalType::ErrorReportAndScreen);
-        svc.interface
-            .throw_fatal_with_policy(error_code, fatal_type);
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        svc.interface.throw_fatal_with_policy_handler(ctx);
     }
 
     fn throw_fatal_with_cpu_context_handler(
@@ -80,15 +67,7 @@ impl FatalU {
         ctx: &mut HLERequestContext,
     ) {
         let svc = unsafe { &*(this as *const dyn ServiceFramework as *const FatalU) };
-        let mut rp = RequestParser::new(ctx);
-        let error_code = rp.pop_u32();
-        let fatal_type =
-            FatalType::try_from(rp.pop_u32()).unwrap_or(FatalType::ErrorReportAndScreen);
-        let fatal_info = ctx.read_buffer(0);
-        svc.interface
-            .throw_fatal_with_cpu_context(error_code, fatal_type, &fatal_info);
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
+        svc.interface.throw_fatal_with_cpu_context_handler(ctx);
     }
 }
 

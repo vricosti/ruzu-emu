@@ -3,10 +3,10 @@
 
 //! Port of zuyu/src/core/hle/service/ns/ns_types.h
 
-/// nn::ns::detail::ApplicationRecordType
+/// nn::ns::detail::ApplicationEvent
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum ApplicationRecordType {
+pub enum ApplicationEvent {
     Installing = 2,
     Installed = 3,
     GameCardNotInserted = 5,
@@ -32,15 +32,14 @@ pub enum BackgroundNetworkUpdateState {
     Ready = 2,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct ApplicationRecord {
     pub application_id: u64,
-    pub record_type: u8,
-    pub unknown: u8,
+    pub last_event: ApplicationEvent,
+    pub attributes: u8,
     pub _padding0: [u8; 0x6],
-    pub unknown2: u8,
-    pub _padding1: [u8; 0x7],
+    pub last_updated: i64,
 }
 const _: () = assert!(core::mem::size_of::<ApplicationRecord>() == 0x18);
 

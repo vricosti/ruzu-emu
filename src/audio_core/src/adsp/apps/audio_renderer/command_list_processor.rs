@@ -98,7 +98,8 @@ pub struct CommandListProcessor {
     current_processing_time: u64,
     end_time: u64,
     last_dump: String,
-    dump_audio_commands: bool,
+    #[cfg(test)]
+    dump_audio_commands_override: Option<bool>,
 }
 
 impl CommandListProcessor {
@@ -161,8 +162,9 @@ impl CommandListProcessor {
         &self.last_dump
     }
 
-    pub fn set_dump_audio_commands(&mut self, enabled: bool) {
-        self.dump_audio_commands = enabled;
+    #[cfg(test)]
+    fn set_dump_audio_commands(&mut self, enabled: bool) {
+        self.dump_audio_commands_override = Some(enabled);
     }
 
     pub fn get_process(&self) -> *mut () {
@@ -214,7 +216,13 @@ impl CommandListProcessor {
             self.current_processing_time = 0;
         }
 
-        let mut dump = if self.dump_audio_commands {
+        // Eden reads the global setting in Process, not an initialization-only
+        // processor field. Snapshot per list and release the settings lock
+        // before executing commands (which may themselves read settings).
+        let dump_audio_commands = *common::settings::values().dump_audio_commands.get_value();
+        #[cfg(test)]
+        let dump_audio_commands = self.dump_audio_commands_override.unwrap_or(dump_audio_commands);
+        let mut dump = if dump_audio_commands {
             Some(format!("\nSession {session_id}\n"))
         } else {
             None
@@ -686,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn process_populates_last_dump() {
+    fn process_populates_last_dump_from_runtime_setting() {
         let system = make_system();
         let mut samples = vec![0i32; 8];
         let (bytes, stream) = serialize_commands(
@@ -708,9 +716,10 @@ mod tests {
             bytes.len() as u64,
             stream,
         ));
-        processor.set_dump_audio_commands(true);
-
+        let previous = *common::settings::values().dump_audio_commands.get_value();
+        common::settings::values_mut().dump_audio_commands.set_value(true);
         let _ = processor.process(0);
+        common::settings::values_mut().dump_audio_commands.set_value(previous);
 
         assert!(processor.get_last_dump().contains("Session 0"));
         assert!(processor.get_last_dump().contains("ClearMixBufferCommand"));
@@ -765,6 +774,7 @@ mod tests {
         );
 
         let mut processor = CommandListProcessor::default();
+        processor.set_dump_audio_commands(false);
         assert!(processor.initialize(
             system,
             std::ptr::null_mut(),

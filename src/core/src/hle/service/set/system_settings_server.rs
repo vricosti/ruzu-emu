@@ -33,6 +33,38 @@ const SETTINGS_VERSION: u32 = 4;
 /// Settings magic bytes, matching upstream SETTINGS_MAGIC.
 const SETTINGS_MAGIC: u64 = u64::from_le_bytes([b'y', b'u', b'z', b'u', b'_', b's', b'e', b't']);
 
+/// Upstream's file-local Fill3DS_CRC; the caller owns an eleven-byte output.
+fn fill_3ds_crc(d: u32, data: &mut [u8]) {
+    let mut digits = [
+        ((d / 1_000_000_000) % 100) as u8,
+        ((d / 100_000_000) % 10) as u8,
+        ((d / 10_000_000) % 10) as u8,
+        ((d / 1_000_000) % 10) as u8,
+        ((d / 100_000) % 10) as u8,
+        ((d / 10_000) % 10) as u8,
+        ((d / 1_000) % 10) as u8,
+        ((d / 100) % 10) as u8,
+        ((d / 10) % 10) as u8,
+        (d % 10) as u8,
+    ];
+    let retail_digits = [1, 4, 5, 7];
+    digits[0] = retail_digits[((d % 10) % 4) as usize];
+    digits[1] = 0;
+    for (output, digit) in data.iter_mut().zip(digits) {
+        *output = digit + b'0';
+    }
+    let (mut sum_odd, mut sum_even) = (0u8, 0u8);
+    for i in (0..digits.len()).step_by(2) {
+        sum_odd += digits[i];
+        sum_even += digits[i + 1];
+    }
+    let mut sum_digit = (sum_even * 3 + sum_odd) % 10;
+    if sum_digit != 0 {
+        sum_digit = 10 - sum_digit;
+    }
+    data[digits.len()] = sum_digit + b'0';
+}
+
 /// Settings file header.
 ///
 /// Corresponds to `SettingsHeader` in upstream system_settings_server.cpp.
@@ -716,12 +748,42 @@ impl ISystemSettingsServer {
 
     pub fn get_battery_lot(&self) -> BatteryLot {
         log::debug!("ISystemSettingsServer::GetBatteryLot called");
-        BatteryLot::default()
+        Self::battery_lot_from_serial(*common::settings::values().serial_battery.get_value())
+    }
+
+    // Mechanical extraction of GetBatteryLot's lambda for pure payload tests.
+    fn battery_lot_from_serial(d: u32) -> BatteryLot {
+        let mut lot = BatteryLot::default();
+        lot.lot_number[..9].copy_from_slice(b"BHACHZZAD");
+        lot.lot_number[9] = ((d / 100_000) % 26) as u8 + b'A';
+        fill_3ds_crc(d, &mut lot.lot_number[10..]);
+        lot
     }
 
     pub fn get_serial_number(&self) -> SerialNumber {
         log::debug!("ISystemSettingsServer::GetSerialNumber called");
-        SerialNumber::default()
+        let values = common::settings::values();
+        Self::serial_number_from_settings(
+            *values.serial_unit.get_value(),
+            *values.region_index.get_value(),
+        )
+    }
+
+    // Mechanical extraction of GetSerialNumber's lambda, retaining ownership.
+    fn serial_number_from_settings(d: u32, region: common::settings_enums::Region) -> SerialNumber {
+        use common::settings_enums::Region;
+        let mut serial = SerialNumber::default();
+        serial.serial_number[..2].copy_from_slice(b"XA");
+        serial.serial_number[2] = match region {
+            Region::Japan => b'J',
+            Region::Usa => b'W',
+            Region::Europe => b'E',
+            Region::Australia => b'M',
+            Region::China | Region::Taiwan => b'C',
+            Region::Korea => b'K',
+        };
+        fill_3ds_crc(d, &mut serial.serial_number[3..]);
+        serial
     }
 
     pub fn get_nfc_enable_flag(&self) -> bool {
@@ -3071,6 +3133,41 @@ impl ServiceFramework for SystemSettingsService {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn generated_serial_payloads_match_crc_region_and_zero_tail() {
+        use common::settings_enums::Region;
+        for (number, digits) in [
+            (0, b"10000000009"),
+            (1, b"40000000013"),
+            (1_234_567_890, b"10345678901"),
+            (u32::MAX, b"40949672951"),
+        ] {
+            let lot = ISystemSettingsServer::battery_lot_from_serial(number);
+            assert_eq!(&lot.lot_number[..9], b"BHACHZZAD");
+            assert_eq!(lot.lot_number[9], ((number / 100_000) % 26) as u8 + b'A');
+            assert_eq!(&lot.lot_number[10..21], digits);
+            assert_eq!(&lot.lot_number[21..], &[0; 3]);
+            for (region, suffix) in [
+                (Region::Japan, b'J'),
+                (Region::Usa, b'W'),
+                (Region::Europe, b'E'),
+                (Region::Australia, b'M'),
+                (Region::China, b'C'),
+                (Region::Korea, b'K'),
+                (Region::Taiwan, b'C'),
+            ] {
+                let serial = ISystemSettingsServer::serial_number_from_settings(number, region);
+                assert_eq!(&serial.serial_number[..3], &[b'X', b'A', suffix]);
+                assert_eq!(&serial.serial_number[3..14], digits);
+                assert_eq!(&serial.serial_number[14..], &[0; 10]);
+            }
+        }
+        assert_eq!(std::mem::size_of::<BatteryLot>(), 24);
+        assert_eq!(std::mem::align_of::<BatteryLot>(), 1);
+        assert_eq!(std::mem::size_of::<SerialNumber>(), 24);
+        assert_eq!(std::mem::align_of::<SerialNumber>(), 1);
+    }
 
     fn settings_test_dir(name: &str) -> std::path::PathBuf {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);

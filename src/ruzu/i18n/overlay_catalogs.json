@@ -9,6 +9,12 @@
     "Closing software...": "Cerrando el programa..."
   },
   "fr": {
+    "Battery Serial:": "Numéro de série de la batterie :",
+    "Unit Serial:": "Numéro de série de la console :",
+    "Broken Vulkan Installation Detected": "Installation Vulkan défectueuse détectée",
+    "Vulkan initialization failed during boot.": "L’initialisation de Vulkan a échoué au démarrage.",
+    "Profile Selector": "Sélection du profil",
+    "Select a user:": "Sélectionnez un utilisateur :",
     "Decryption Keys (*.keys, *.zip)": "Clés de déchiffrement (*.keys, *.zip)",
     "Unable to read keys ZIP. Choose an archive containing exactly one prod.keys file; folders inside the archive are supported.": "Impossible de lire le ZIP de clés. Choisissez une archive contenant exactement un fichier prod.keys ; les sous-dossiers sont pris en charge.",
     "Closing software...": "Fermeture du logiciel...",

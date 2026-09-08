@@ -261,16 +261,18 @@ impl ISystemDisplayService {
             }
         };
 
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &mode as *const DisplayMode as *const u8,
-                std::mem::size_of::<DisplayMode>(),
-            )
-        };
-        ctx.write_buffer(bytes, 0);
+        Self::push_get_display_mode_response(ctx, &mode);
+    }
 
-        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+    // Upstream Out<DisplayMode> is inline CMIF data, unlike ListDisplayModes'
+    // OutArray. Serialize the four fields explicitly without a guest buffer.
+    fn push_get_display_mode_response(ctx: &mut HLERequestContext, mode: &DisplayMode) {
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(mode.width);
+        rb.push_u32(mode.height);
+        rb.push_f32(mode.refresh_rate);
+        rb.push_u32(mode.unknown);
     }
 
     fn get_shared_buffer_memory_handle_id(
@@ -416,6 +418,18 @@ impl ISystemDisplayService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_mode_is_inline_cmif_data_without_an_output_buffer() {
+        for (width, height) in [(1280, 720), (1920, 1080)] {
+            let mut ctx = HLERequestContext::new();
+            let mode = DisplayMode { width, height, refresh_rate: 60.0, unknown: 0 };
+            ISystemDisplayService::push_get_display_mode_response(&mut ctx, &mode);
+            let start = ctx.data_payload_offset as usize;
+            assert_eq!(ctx.write_size - ctx.data_payload_offset, 6);
+            assert_eq!(&ctx.cmd_buf[start..start + 6], &[0, 0, width, height, 60.0f32.to_bits(), 0]);
+        }
+    }
 
     #[test]
     fn shared_buffer_memory_handle_response_aligns_size_after_nvmap_handle() {

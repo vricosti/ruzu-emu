@@ -13,7 +13,7 @@ use crate::file_sys::patch_manager::PatchManager;
 use crate::file_sys::registered_cache::ContentProviderUnion;
 use crate::file_sys::romfs_factory::StorageId;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -142,9 +142,13 @@ pub struct FspSrv {
     fsc: Option<Arc<std::sync::Mutex<super::super::filesystem::FileSystemController>>>,
     /// Upstream: `FileSys::ContentProviderUnion& content_provider`.
     content_provider: Option<Arc<StdMutex<ContentProviderUnion>>>,
+    /// Upstream constructor-owned Reporter reference. Absent only in the
+    /// existing controller-less construction used by table tests.
+    reporter: Option<Arc<crate::reporter::Reporter>>,
     current_process_id: std::sync::Mutex<u64>,
     access_log_program_index: std::sync::Mutex<u32>,
-    access_log_mode: std::sync::Mutex<AccessLogMode>,
+    // Preserve all raw IPC enum values, including values unknown to this SDK.
+    access_log_mode: std::sync::Mutex<u32>,
     program_id: std::sync::Mutex<u64>,
     /// Upstream: `FileSys::VirtualFile romfs`.
     romfs: std::sync::Mutex<Option<VirtualFile>>,
@@ -191,14 +195,25 @@ impl FspSrv {
         Self {
             fsc: None,
             content_provider: None,
+            reporter: None,
             current_process_id: std::sync::Mutex::new(0),
             access_log_program_index: std::sync::Mutex::new(0),
-            access_log_mode: std::sync::Mutex::new(AccessLogMode::None),
+            access_log_mode: std::sync::Mutex::new(
+                if *common::settings::values().enable_fs_access_log.get_value() {
+                    AccessLogMode::SdCard as u32
+                } else {
+                    AccessLogMode::None as u32
+                }),
             program_id: std::sync::Mutex::new(0),
             romfs: std::sync::Mutex::new(None),
             save_data_controller: std::sync::Mutex::new(None),
             romfs_controller: std::sync::Mutex::new(None),
             handlers: build_handler_map(&[
+                (
+                    23,
+                    Some(Self::create_save_data_file_system_by_system_save_data_id_handler),
+                    "CreateSaveDataFileSystemBySystemSaveDataId",
+                ),
                 (
                     1,
                     Some(Self::set_current_process_handler),
@@ -264,11 +279,13 @@ impl FspSrv {
                     Some(Self::get_global_access_log_mode_handler),
                     "GetGlobalAccessLogMode",
                 ),
+                (1006, Some(Self::output_access_log_to_sd_card_handler), "OutputAccessLogToSdCard"),
                 (
                     1011,
                     Some(Self::get_program_index_for_access_log_handler),
                     "GetProgramIndexForAccessLog",
                 ),
+                (1016, Some(Self::flush_access_log_on_sd_card_handler), "FlushAccessLogOnSdCard"),
             ]),
             handlers_tipc: BTreeMap::new(),
         }
@@ -287,6 +304,9 @@ impl FspSrv {
         } else {
             system.get().get_content_provider().cloned()
         };
+        if !system.is_null() {
+            srv.reporter = Some(Arc::clone(system.get_reporter()));
+        }
         srv
     }
 
@@ -396,6 +416,60 @@ impl FspSrv {
             101 => Some(SaveDataSpaceId::SafeMode),
             _ => None,
         }
+    }
+
+    fn create_save_data_file_system_by_system_save_data_id_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        use crate::file_sys::fs_save_data_types::{SaveDataRank, SaveDataType};
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let words = RequestParser::new(ctx).pop_raw::<[u32; 16]>();
+        // Decode enum bytes before constructing Rust enums: arbitrary IPC bytes
+        // cannot safely be copied into a Rust enum. CreationInfo follows this
+        // attribute but is unused by upstream's implementation of command 23.
+        let save_type = match words[8] as u8 {
+            0 => Some(SaveDataType::System),
+            1 => Some(SaveDataType::Account),
+            2 => Some(SaveDataType::Bcat),
+            3 => Some(SaveDataType::Device),
+            4 => Some(SaveDataType::Temporary),
+            5 => Some(SaveDataType::Cache),
+            6 => Some(SaveDataType::SystemBcat),
+            _ => None,
+        };
+        let rank = match (words[8] >> 8) as u8 {
+            0 => Some(SaveDataRank::Primary),
+            1 => Some(SaveDataRank::Secondary),
+            _ => None,
+        };
+        let mut result = ResultCode::new(RESULT_TARGET_NOT_FOUND.raw());
+        if let (Some(save_type), Some(rank)) = (save_type, rank) {
+            let attribute = SaveDataAttribute::make(
+                words[0] as u64 | ((words[1] as u64) << 32),
+                save_type,
+                [
+                    words[2] as u64 | ((words[3] as u64) << 32),
+                    words[4] as u64 | ((words[5] as u64) << 32),
+                ],
+                words[6] as u64 | ((words[7] as u64) << 32),
+                (words[8] >> 16) as u16,
+                rank,
+            );
+            let created = service
+                .save_data_controller
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|controller| {
+                    controller.create_save_data(SaveDataSpaceId::System, &attribute)
+                });
+            if created.is_some() {
+                result = RESULT_SUCCESS;
+            }
+        }
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
     }
 
     fn open_save_data_file_system_handler(
@@ -622,8 +696,10 @@ impl FspSrv {
             "FspSrv::OpenDataStorageByDataId trace: romfs_present={}",
             data.is_some()
         );
-        let nca =
-            controller.and_then(|c| c.open_base_nca(title_id, storage_id, ContentRecordType::Data));
+        // Upstream does not open the base NCA on the missing-data fallback.
+        let nca = data.as_ref().and_then(|_| {
+            controller.and_then(|c| c.open_base_nca(title_id, storage_id, ContentRecordType::Data))
+        });
         log::info!(
             "FspSrv::OpenDataStorageByDataId trace: nca_present={}",
             nca.is_some()
@@ -667,7 +743,7 @@ impl FspSrv {
             "FspSrv::OpenDataStorageByDataId: no data for title_id={:#x}, returning error",
             title_id
         );
-        Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
+        Self::push_error_with_null_interface(ctx, RESULT_UNKNOWN.get_inner_value());
     }
 
     fn open_patch_data_storage_by_current_process_handler(
@@ -734,13 +810,8 @@ impl FspSrv {
     ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
         let mode_raw = ctx.command_buffer()[ctx.get_data_payload_offset() as usize + 2];
-        let mode = match mode_raw {
-            1 => AccessLogMode::Log,
-            2 => AccessLogMode::SdCard,
-            _ => AccessLogMode::None,
-        };
-        *service.access_log_mode.lock().unwrap() = mode;
-        log::info!("FspSrv::SetGlobalAccessLogMode called, mode={:?}", mode);
+        *service.access_log_mode.lock().unwrap() = mode_raw;
+        log::debug!("FspSrv::SetGlobalAccessLogMode called, mode={}", mode_raw);
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -751,10 +822,28 @@ impl FspSrv {
         ctx: &mut HLERequestContext,
     ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
-        let mode = *service.access_log_mode.lock().unwrap() as u32;
+        let mode = *service.access_log_mode.lock().unwrap();
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(mode);
+    }
+
+    fn output_access_log_to_sd_card_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const FspSrv) };
+        log::debug!("FspSrv::OutputAccessLogToSdCard called");
+        // InBuffer<HipcMapAlias> reads A, not the auto-select A/X helper.
+        let buffer = ctx.read_buffer_a(0);
+        let length = buffer.iter().position(|&byte| byte == 0).unwrap_or(buffer.len());
+        service.reporter.as_ref().expect("FspSrv requires its System Reporter")
+            .save_fs_access_log(&buffer[..length]);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn flush_access_log_on_sd_card_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("FspSrv::FlushAccessLogOnSdCard (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     fn get_program_index_for_access_log_handler(
@@ -820,6 +909,158 @@ impl ServiceFramework for FspSrv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_system_save_creates_a_reopenable_directory() {
+        use crate::file_sys::fs_filesystem::OpenMode;
+        use crate::file_sys::fs_save_data_types::{SaveDataRank, SaveDataType};
+        use crate::file_sys::savedata_factory::SaveDataFactory;
+        use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
+        use crate::hle::service::filesystem::save_data_controller::SaveDataController;
+        let path = std::env::temp_dir().join(format!(
+            "ruzu-system-save-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let root = RealVfsFilesystem::new()
+            .arc_open_directory(&path.to_string_lossy(), OpenMode::READ_WRITE)
+            .unwrap();
+        let factory = Arc::new(StdMutex::new(SaveDataFactory::new(42, root)));
+        factory.lock().unwrap().set_auto_create(false);
+        let controller = SaveDataController::with_factory(factory);
+        let attribute = SaveDataAttribute::make(
+            0,
+            SaveDataType::System,
+            [0, 0],
+            0x8000000000000042,
+            0,
+            SaveDataRank::Primary,
+        );
+        assert!(controller
+            .open_save_data(SaveDataSpaceId::System, &attribute)
+            .is_none());
+        let service = FspSrv::new();
+        *service.save_data_controller.lock().unwrap() = Some(controller.clone());
+        let mut ctx = HLERequestContext::new();
+        // Input attribute begins after the command's u64 ID; creation info is zero.
+        ctx.command_buffer_mut()[8] = 0x42;
+        ctx.command_buffer_mut()[9] = 0x80000000;
+        service.handlers[&23].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], RESULT_SUCCESS.get_inner_value());
+        assert!(controller
+            .open_save_data(SaveDataSpaceId::System, &attribute)
+            .is_some());
+        assert!(controller
+            .open_save_data(SaveDataSpaceId::User, &attribute)
+            .is_none());
+        drop(service);
+        drop(controller);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn missing_data_storage_returns_unknown_like_upstream() {
+        let service = FspSrv::new();
+        let mut ctx = HLERequestContext::new();
+        ctx.command_buffer_mut()[2] = StorageId::None as u32;
+        ctx.command_buffer_mut()[3] = 0;
+        ctx.command_buffer_mut()[4] = 42; // Synthetic, non-system title.
+        ctx.command_buffer_mut()[5] = 0;
+        service.handlers[&202].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], RESULT_UNKNOWN.get_inner_value());
+    }
+
+    #[test]
+    fn access_log_setting_and_ipc_preserve_modes_and_bytes() {
+        const CHILD: &str = "RUZU_TEST_FS_ACCESS_LOG";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::service::filesystem::fsp::fsp_srv::tests::access_log_setting_and_ipc_preserve_modes_and_bytes"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            use crate::core::{System, SystemRef};
+            use crate::device_memory::DeviceMemory;
+            use crate::hle::ipc;
+            use crate::memory::memory::Memory;
+            use common::page_table::{PageTable, PageType};
+            use common::fs::path_util::{set_ruzu_path, RuzuPath};
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let directory = std::env::temp_dir().join(format!("ruzu-fs-log-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::create_dir(directory.join("sdmc")).unwrap();
+            set_ruzu_path(RuzuPath::LogDir, &directory);
+            set_ruzu_path(RuzuPath::SDMCDir, &directory.join("sdmc"));
+            let system = Box::new(System::new());
+            let device = Box::new(DeviceMemory::new());
+            let mut table = Box::new(PageTable::new());
+            table.resize(32, 12);
+            table.map_pages(3, 1, 0x3000, PageType::Memory,
+                device.buffer.backing_base_pointer() as usize + 0x3000);
+            let memory = Arc::new(StdMutex::new(unsafe {
+                Memory::new(SystemRef::null(), device.as_ref() as *const _, &device.buffer as *const _)
+            }));
+            memory.lock().unwrap().set_current_page_table(table.as_mut() as *mut _, true);
+            let log = directory.join("sdmc/FsAccessLog.txt");
+            let mut expected = Vec::new();
+            for enabled in [false, true] {
+                common::settings::values_mut().enable_fs_access_log.set_value(enabled);
+                // Reporter gate is deliberately independent of FS access logging.
+                common::settings::values_mut().reporting_services.set_value(false);
+                let service = FspSrv::new_with_system(SystemRef::from_ref(&system),
+                    Arc::new(StdMutex::new(FileSystemController::new())));
+                assert!(Arc::ptr_eq(service.reporter.as_ref().unwrap(), &system.reporter));
+                let invoke = |command, value| {
+                    let mut ctx = HLERequestContext::new();
+                    ctx.command_buffer_mut()[2] = value;
+                    service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+                    assert_eq!(ctx.command_buffer()[6], 0);
+                    ctx
+                };
+                assert_eq!(invoke(1005, 0).command_buffer()[8], if enabled { 2 } else { 0 });
+                // The setting seeds each service, not every GetGlobalAccessLogMode.
+                common::settings::values_mut().enable_fs_access_log.set_value(!enabled);
+                for mode in [0, 1, 2, 3, u32::MAX] {
+                    invoke(1004, mode);
+                    assert_eq!(invoke(1005, 0).command_buffer()[8], mode);
+                }
+                for message in [b"first\n\0ignored".as_slice(), b"\xFF\x80\n", b"", b"\0ignored"] {
+                    for (i, &byte) in message.iter().enumerate() {
+                        memory.lock().unwrap().write_8(0x3000 + i as u64, byte);
+                    }
+                    let mut words = [0u32; ipc::COMMAND_BUFFER_LENGTH];
+                    words[0] = ipc::CommandType::Request as u32 | (1 << 20);
+                    words[1] = 8;
+                    words[2..5].copy_from_slice(&[message.len() as u32, 0x3000, 0]);
+                    words[8] = u32::from_le_bytes(*b"SFCI");
+                    words[10] = 1006;
+                    let mut ctx = HLERequestContext::new();
+                    ctx.populate_from_incoming_command_buffer(&words);
+                    ctx.set_memory(memory.clone());
+                    assert_eq!(ctx.get_command(), 1006);
+                    service.handlers[&1006].handler_callback.unwrap()(&service, &mut ctx);
+                    assert_eq!(ctx.command_buffer()[6], 0);
+                    for &byte in message.iter().take_while(|&&byte| byte != 0) {
+                        if cfg!(windows) && byte == b'\n' { expected.push(b'\r'); }
+                        expected.push(byte);
+                    }
+                    assert_eq!(std::fs::read(&log).unwrap(), expected);
+                }
+                invoke(1016, 0);
+                assert_eq!(std::fs::read(&log).unwrap(), expected);
+            }
+            drop(memory);
+            drop(table);
+            drop(device);
+            drop(system);
+            std::fs::remove_dir_all(directory).unwrap();
+        }).unwrap().join().unwrap();
+    }
 
     #[test]
     fn save_data_info_reader_handlers_match_upstream_table() {

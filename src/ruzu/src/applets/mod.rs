@@ -2,4 +2,5 @@
 
 pub mod controller;
 pub mod error;
+pub mod profile_select;
 pub mod software_keyboard;

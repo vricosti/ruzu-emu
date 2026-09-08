@@ -27,11 +27,15 @@ use super::shared_widget as w;
 /// Build the Graphics tab — upstream `ConfigureGraphics`.
 pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> Page {
     let (scroller, column) = w::page();
+    let has_broken_vulkan = crate::uisettings::with(|values| values.has_broken_vulkan);
 
     // --- "API Settings" ---------------------------------------------------
     let (api_group, api) = w::group("API Settings");
 
-    let backend_value = *common::settings::values().renderer_backend.get_value();
+    let backend_value = get_current_graphics_backend(
+        *common::settings::values().renderer_backend.get_value(),
+        has_broken_vulkan,
+    );
     let (backend_row, backend) = w::combo_row(
         "API:",
         &tr::labels(tr::GRAPHICS_API),
@@ -64,11 +68,10 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
     apply_api_layout(backend_value, &device_row);
     let configuring_global = common::settings::is_configuring_global();
     let api_uses_global = common::settings::values().renderer_backend.using_global();
-    device_row.set_sensitive(vulkan_device_sensitive(
-        configuring_global,
-        api_uses_global,
-        runtime_lock,
-    ));
+    device_row.set_sensitive(
+        !has_broken_vulkan
+            && vulkan_device_sensitive(configuring_global, api_uses_global, runtime_lock),
+    );
 
     column.append(&api_group);
 
@@ -154,6 +157,58 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
     settings.append(&fullscreen_row);
     settings.append(&bg_row);
 
+    // Eden's generic Renderer widgets use per-setting runtime edit rules.
+    // Keep the separately managed Vulkan device, VSync and RGB paths below.
+    let backend_policy = w::SettingEditPolicy::new(
+        &common::settings::values().renderer_backend,
+        runtime_lock,
+        configuring_global,
+    );
+    backend_row.set_sensitive(backend_policy.sensitive && !has_broken_vulkan);
+    api_group.set_sensitive(!has_broken_vulkan || configuring_global);
+    let async_gpu_policy = w::SettingEditPolicy::new(
+        &common::settings::values().use_asynchronous_gpu_emulation,
+        runtime_lock,
+        configuring_global,
+    );
+    async_gpu.set_sensitive(async_gpu_policy.sensitive);
+    let fullscreen_policy = w::SettingEditPolicy::new(
+        &common::settings::values().fullscreen_mode,
+        runtime_lock,
+        configuring_global,
+    );
+    fullscreen_row.set_sensitive(fullscreen_policy.sensitive);
+    let aspect_policy = w::SettingEditPolicy::new(
+        &common::settings::values().aspect_ratio,
+        runtime_lock,
+        configuring_global,
+    );
+    aspect_row.set_sensitive(aspect_policy.sensitive);
+    let resolution_policy = w::SettingEditPolicy::new(
+        &common::settings::values().resolution_setup,
+        runtime_lock,
+        configuring_global,
+    );
+    resolution_row.set_sensitive(resolution_policy.sensitive);
+    let filter_policy = w::SettingEditPolicy::new(
+        &common::settings::values().scaling_filter,
+        runtime_lock,
+        configuring_global,
+    );
+    filter_row.set_sensitive(filter_policy.sensitive);
+    let aa_policy = w::SettingEditPolicy::new(
+        &common::settings::values().anti_aliasing,
+        runtime_lock,
+        configuring_global,
+    );
+    aa_row.set_sensitive(aa_policy.sensitive);
+    let sharpness_policy = w::SettingEditPolicy::new(
+        &common::settings::values().fsr_sharpening_slider,
+        runtime_lock,
+        configuring_global,
+    );
+    sharpness_row.set_sensitive(sharpness_policy.sensitive);
+
     column.append(&settings_group);
 
     // Reveal the Vulkan device row only when the selected API is Vulkan.
@@ -164,13 +219,15 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
         let vsync_modes = Rc::clone(&vsync_modes);
         let device_records = Rc::clone(&device_records);
         backend.connect_selected_notify(move |combo| {
-            let selected = tr::value_at(tr::GRAPHICS_API, combo.selected());
+            let selected = get_current_graphics_backend(
+                tr::value_at(tr::GRAPHICS_API, combo.selected()),
+                has_broken_vulkan,
+            );
             apply_api_layout(selected, &device_row);
-            device_row.set_sensitive(vulkan_device_sensitive(
-                configuring_global,
-                api_uses_global,
-                runtime_lock,
-            ));
+            device_row.set_sensitive(
+                !has_broken_vulkan
+                    && vulkan_device_sensitive(configuring_global, api_uses_global, runtime_lock),
+            );
             repopulate_vsync(
                 &vsync,
                 &vsync_modes,
@@ -187,7 +244,10 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
         let vsync_modes = Rc::clone(&vsync_modes);
         let device_records = Rc::clone(&device_records);
         device.connect_selected_notify(move |device| {
-            let selected_backend = tr::value_at(tr::GRAPHICS_API, backend.selected());
+            let selected_backend = get_current_graphics_backend(
+                tr::value_at(tr::GRAPHICS_API, backend.selected()),
+                has_broken_vulkan,
+            );
             repopulate_vsync(
                 &vsync,
                 &vsync_modes,
@@ -199,7 +259,10 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
     }
 
     Page::new("Graphics", scroller, move || {
-        let backend_value = tr::value_at(tr::GRAPHICS_API, backend.selected());
+        let backend_value = get_current_graphics_backend(
+            tr::value_at(tr::GRAPHICS_API, backend.selected()),
+            has_broken_vulkan,
+        );
         let device_index = device.selected();
         let async_value = async_gpu.is_active();
         let vsync_value = vsync_modes
@@ -216,7 +279,7 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
         let rgba = bg_color.rgba();
 
         let mut values = common::settings::values_mut();
-        values.renderer_backend.set_value(backend_value);
+        backend_policy.apply(&mut values.renderer_backend, backend_value);
         // Upstream `ConfigureGraphics::ApplyConfiguration` only publishes the
         // physical-device combobox while Vulkan is the selected backend. The
         // hidden row must not overwrite a stored Vulkan device when applying
@@ -224,18 +287,18 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
         if updates_vulkan_device(backend_value) {
             values.vulkan_device.set_value(device_index);
         }
-        values.use_asynchronous_gpu_emulation.set_value(async_value);
+        async_gpu_policy.apply(&mut values.use_asynchronous_gpu_emulation, async_value);
         if backend_value != RendererBackend::Null {
             if let Some(mode) = vsync_value {
                 values.vsync_mode.set_value(mode);
             }
         }
-        values.fullscreen_mode.set_value(fullscreen_value);
-        values.aspect_ratio.set_value(aspect_value);
-        values.resolution_setup.set_value(resolution_value);
-        values.scaling_filter.set_value(filter_value);
-        values.anti_aliasing.set_value(aa_value);
-        values.fsr_sharpening_slider.set_value(sharpness_value);
+        fullscreen_policy.apply(&mut values.fullscreen_mode, fullscreen_value);
+        aspect_policy.apply(&mut values.aspect_ratio, aspect_value);
+        resolution_policy.apply(&mut values.resolution_setup, resolution_value);
+        filter_policy.apply(&mut values.scaling_filter, filter_value);
+        aa_policy.apply(&mut values.anti_aliasing, aa_value);
+        sharpness_policy.apply(&mut values.fsr_sharpening_slider, sharpness_value);
         values.bg_red.set_value((rgba.red() * 255.0).round() as u8);
         values
             .bg_green
@@ -244,6 +307,19 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
             .bg_blue
             .set_value((rgba.blue() * 255.0).round() as u8);
     })
+}
+
+/// `ConfigureGraphics::GetCurrentGraphicsBackend`'s broken-installation guard.
+fn get_current_graphics_backend(backend: RendererBackend, has_broken_vulkan: bool) -> RendererBackend {
+    if backend == RendererBackend::Vulkan && has_broken_vulkan {
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            RendererBackend::Null
+        } else {
+            RendererBackend::OpenGlGlsl
+        }
+    } else {
+        backend
+    }
 }
 
 /// Show the Vulkan device row only for Vulkan — upstream
@@ -392,6 +468,63 @@ fn background_rgba() -> gtk::gdk::RGBA {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crashed_vulkan_probe_only_remaps_the_vulkan_backend() {
+        let fallback = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            RendererBackend::Null
+        } else {
+            RendererBackend::OpenGlGlsl
+        };
+        for &(backend, _) in tr::GRAPHICS_API {
+            assert_eq!(get_current_graphics_backend(backend, false), backend);
+            assert_eq!(
+                get_current_graphics_backend(backend, true),
+                if backend == RendererBackend::Vulkan {
+                    fallback
+                } else {
+                    backend
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_edits_reject_backend_and_resolution_but_allow_filter() {
+        use common::settings_enums::{ResolutionSetup, ScalingFilter};
+        let mut values = common::settings::Values::default();
+        let backend = *values.renderer_backend.get_value();
+        w::SettingEditPolicy::new(&values.renderer_backend, false, true)
+            .apply(&mut values.renderer_backend, RendererBackend::Null);
+        assert_eq!(*values.renderer_backend.get_value(), backend);
+        w::SettingEditPolicy::new(&values.resolution_setup, false, true)
+            .apply(&mut values.resolution_setup, ResolutionSetup::Res2X);
+        assert_eq!(*values.resolution_setup.get_value(), ResolutionSetup::Res1X);
+        w::SettingEditPolicy::new(&values.scaling_filter, false, true)
+            .apply(&mut values.scaling_filter, ScalingFilter::Bicubic);
+        assert_eq!(*values.scaling_filter.get_value(), ScalingFilter::Bicubic);
+    }
+
+    #[test]
+    fn primary_graphics_runtime_metadata_matches_upstream() {
+        let values = common::settings::Values::default();
+        for flag in [
+            values.renderer_backend.setting.runtime_modifiable,
+            values.use_asynchronous_gpu_emulation.setting.runtime_modifiable,
+            values.resolution_setup.setting.runtime_modifiable,
+        ] {
+            assert!(!flag);
+        }
+        for flag in [
+            values.fullscreen_mode.setting.runtime_modifiable,
+            values.aspect_ratio.setting.runtime_modifiable,
+            values.scaling_filter.setting.runtime_modifiable,
+            values.anti_aliasing.setting.runtime_modifiable,
+            values.fsr_sharpening_slider.setting.runtime_modifiable,
+        ] {
+            assert!(flag);
+        }
+    }
 
     #[test]
     fn vsync_setting_present_mode_round_trip_matches_upstream() {

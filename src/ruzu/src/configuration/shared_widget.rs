@@ -19,6 +19,115 @@
 
 use gtk::prelude::*;
 
+/// Setting-specific edit rules from ConfigurationShared::Widget's constructor
+/// and SetupComponent's global serializer. `runtime_lock` means no guest is
+/// running, matching the upstream Builder argument (despite its name).
+#[derive(Clone, Copy)]
+pub struct SettingEditPolicy {
+    pub sensitive: bool,
+    allow_apply: bool,
+}
+
+impl SettingEditPolicy {
+    /// Non-switchable Widget settings only exist in global configuration.
+    pub fn for_setting<T: Clone>(
+        setting: &common::settings_common::Setting<T>,
+        runtime_lock: bool,
+        configuring_global: bool,
+    ) -> Self {
+        let allowed = configuring_global && (runtime_lock || setting.runtime_modifiable);
+        Self { sensitive: allowed, allow_apply: allowed }
+    }
+
+    pub fn apply_setting<T: Clone + PartialOrd>(
+        self,
+        setting: &mut common::settings_common::Setting<T>,
+        value: T,
+    ) {
+        if self.allow_apply {
+            setting.set_value(value);
+        }
+    }
+
+    pub fn new<T: Clone>(
+        setting: &common::settings_common::SwitchableSetting<T>,
+        runtime_lock: bool,
+        configuring_global: bool,
+    ) -> Self {
+        let runtime_allowed = runtime_lock || setting.setting.runtime_modifiable;
+        Self {
+            sensitive: runtime_allowed
+                && (!configuring_global || runtime_lock || setting.using_global()),
+            allow_apply: runtime_allowed && (!configuring_global || setting.using_global()),
+        }
+    }
+
+    pub fn apply<T: Clone + PartialOrd>(
+        self,
+        setting: &mut common::settings_common::SwitchableSetting<T>,
+        value: T,
+    ) {
+        if self.allow_apply {
+            setting.set_value(value);
+        }
+    }
+}
+
+#[cfg(test)]
+mod setting_edit_tests {
+    use super::SettingEditPolicy;
+    use common::settings_common::SwitchableSetting;
+    use common::settings_enums::Category;
+
+    #[test]
+    fn non_switchable_settings_require_global_configuration() {
+        let mut setting = common::settings_common::Setting::with_options(
+            false, "synthetic", Category::UiGeneral,
+            common::settings_common::Specialization::DEFAULT, true, true,
+        );
+        let custom = SettingEditPolicy::for_setting(&setting, true, false);
+        assert!(!custom.sensitive);
+        custom.apply_setting(&mut setting, true);
+        assert!(!*setting.get_value());
+        let global = SettingEditPolicy::for_setting(&setting, false, true);
+        assert!(global.sensitive);
+        global.apply_setting(&mut setting, true);
+        assert!(*setting.get_value());
+    }
+
+    #[test]
+    fn startup_only_setting_rejects_runtime_writes() {
+        let mut setting = SwitchableSetting::new(false, "synthetic", Category::RendererAdvanced);
+        let policy = SettingEditPolicy::new(&setting, false, true);
+        assert!(!policy.sensitive);
+        policy.apply(&mut setting, true);
+        assert!(!*setting.get_value());
+        let policy = SettingEditPolicy::new(&setting, true, true);
+        assert!(policy.sensitive);
+        policy.apply(&mut setting, true);
+        assert!(*setting.get_value());
+    }
+
+    #[test]
+    fn runtime_setting_preserves_global_and_custom_ownership() {
+        let mut setting = SwitchableSetting::new(false, "synthetic", Category::RendererAdvanced);
+        setting.setting.runtime_modifiable = true;
+        let global = SettingEditPolicy::new(&setting, false, true);
+        assert!(global.sensitive);
+        global.apply(&mut setting, true);
+        setting.set_global(false);
+        let global = SettingEditPolicy::new(&setting, false, true);
+        assert!(!global.sensitive);
+        global.apply(&mut setting, true);
+        assert!(!*setting.get_value());
+        let custom = SettingEditPolicy::new(&setting, false, false);
+        assert!(custom.sensitive);
+        custom.apply(&mut setting, true);
+        assert!(*setting.get_value());
+        assert!(*setting.get_value_global());
+    }
+}
+
 /// Left-column width for row labels, in characters. Qt sizes the label column
 /// to the widest label in the group; GTK's size groups are per-page, so a fixed
 /// request keeps the controls aligned across groups like the Qt dialog does.

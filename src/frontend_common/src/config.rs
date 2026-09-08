@@ -2214,6 +2214,289 @@ mod tests {
     }
 
     #[test]
+    fn per_game_loading_preserves_the_boot_selected_user() {
+        // Config::ReadSettingGeneric excludes non-switchable settings from
+        // per-title configuration, including the accepted boot-time profile.
+        for ini in ["", "[System]\ncurrent_user\\default=false\ncurrent_user=0\n"] {
+            let mut config = BaseConfig::new(ConfigType::PerGameConfig);
+            config.load_ini(ini);
+            config.begin_group("System");
+            let mut values = common::settings::Values::default();
+            values.current_user.set_value(3);
+            config.read_setting_generic(&mut values.current_user);
+            assert_eq!(*values.current_user.get_value(), 3);
+        }
+    }
+
+    #[test]
+    fn gpu_logging_settings_round_trip_independently() {
+        use common::settings_enums::GpuLogLevel;
+        for index in 0..5 {
+            for dumps in [false, true] {
+                let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+                config.begin_group("Debugging");
+                let mut source = common::settings::Values::default();
+                source.gpu_log_level.set_value(GpuLogLevel::from_u32(index).unwrap());
+                source.gpu_log_shader_dumps.set_value(dumps);
+                config.write_setting_generic(&mut source.gpu_log_level);
+                config.write_setting_generic(&mut source.gpu_log_shader_dumps);
+                let mut loaded = common::settings::Values::default();
+                config.read_setting_generic(&mut loaded.gpu_log_level);
+                config.read_setting_generic(&mut loaded.gpu_log_shader_dumps);
+                assert_eq!(*loaded.gpu_log_level.get_value() as u32, index);
+                assert_eq!(*loaded.gpu_log_shader_dumps.get_value(), dumps);
+            }
+        }
+    }
+
+    #[test]
+    fn debug_persistence_keeps_auto_stub_but_not_session_diagnostics() {
+        for enabled in [false, true] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            config.begin_group("Debugging");
+            let mut source = common::settings::Values::default();
+            source.use_auto_stub.set_value(enabled);
+            config.write_setting_generic(&mut source.use_auto_stub);
+            assert_eq!(
+                config.ini["Debugging"]["use_auto_stub"],
+                enabled.to_string(),
+            );
+            let mut loaded = common::settings::Values::default();
+            config.read_setting_generic(&mut loaded.use_auto_stub);
+            assert_eq!(*loaded.use_auto_stub.get_value(), enabled);
+            source.enable_fs_access_log.set_value(enabled);
+            config.write_setting_generic(&mut source.enable_fs_access_log);
+            assert_eq!(config.ini["Debugging"]["enable_fs_access_log"], enabled.to_string());
+            config.read_setting_generic(&mut loaded.enable_fs_access_log);
+            assert_eq!(*loaded.enable_fs_access_log.get_value(), enabled);
+            for (source, loaded) in [
+                (&mut source.quest_flag, &mut loaded.quest_flag),
+                (&mut source.disable_web_applet, &mut loaded.disable_web_applet),
+                (&mut source.enable_all_controllers, &mut loaded.enable_all_controllers),
+            ] {
+                source.set_value(enabled);
+                config.write_setting_generic(source);
+                assert_eq!(config.ini["Debugging"][source.label()], enabled.to_string());
+                config.read_setting_generic(loaded);
+                assert_eq!(*loaded.get_value(), enabled);
+            }
+
+            // These four settings deliberately have save=false upstream.
+            for setting in [
+                &mut source.extended_logging,
+                &mut source.reporting_services,
+                &mut source.dump_guest_shaders,
+                &mut source.dump_macros,
+            ] {
+                setting.set_value(true);
+                config.write_setting_generic(setting);
+                assert!(!config.ini["Debugging"].contains_key(setting.label()));
+                config.write_raw(setting.label(), "true".to_string());
+                config.write_raw(&format!("{}\\default", setting.label()), "false".to_string());
+                setting.set_value(false);
+                config.read_setting_generic(setting);
+                assert!(!*setting.get_value(), "{} must ignore stale INI entries", setting.label());
+            }
+        }
+        let mut custom = BaseConfig::new(ConfigType::PerGameConfig);
+        custom.load_ini("[Debugging]\nuse_auto_stub\\default=false\nuse_auto_stub=true\n");
+        custom.begin_group("Debugging");
+        let mut values = common::settings::Values::default();
+        custom.read_setting_generic(&mut values.use_auto_stub);
+        assert!(!*values.use_auto_stub.get_value());
+        custom.write_raw("enable_fs_access_log", "true".into());
+        custom.write_raw("enable_fs_access_log\\default", "false".into());
+        custom.read_setting_generic(&mut values.enable_fs_access_log);
+        assert!(!*values.enable_fs_access_log.get_value());
+        for setting in [&mut values.quest_flag, &mut values.disable_web_applet, &mut values.enable_all_controllers] {
+            let original = *setting.get_value();
+            custom.write_raw(setting.label(), (!original).to_string());
+            custom.write_raw(&format!("{}\\default", setting.label()), "false".into());
+            custom.read_setting_generic(setting);
+            assert_eq!(*setting.get_value(), original);
+        }
+    }
+
+    #[test]
+    fn gpu_logging_tracking_settings_preserve_values_in_configuration() {
+        for enabled in [false, true] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            config.begin_group("Debugging");
+            let mut values = common::settings::Values::default();
+            for setting in [
+                &mut values.gpu_log_vulkan_calls,
+                &mut values.gpu_log_memory_tracking,
+                &mut values.gpu_log_driver_debug,
+            ] {
+                setting.set_value(enabled);
+                config.write_setting_generic(setting);
+                setting.set_value(!enabled);
+                config.read_setting_generic(setting);
+                assert_eq!(*setting.get_value(), enabled);
+            }
+            // The setting is signed upstream too; validation belongs to the
+            // consumer rather than silently changing stored integer values.
+            for entries in [0, 1, 512, -1] {
+                values.gpu_log_ring_buffer_size.set_value(entries);
+                config.write_setting_generic(&mut values.gpu_log_ring_buffer_size);
+                values.gpu_log_ring_buffer_size.set_value(!entries);
+                config.read_setting_generic(&mut values.gpu_log_ring_buffer_size);
+                assert_eq!(*values.gpu_log_ring_buffer_size.get_value(), entries);
+            }
+        }
+    }
+
+    #[test]
+    fn debugger_settings_round_trip_enable_and_port_boundaries() {
+        for (enabled, port) in [(false, 0), (true, 1024), (true, 6543), (false, u16::MAX)] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            config.begin_group("Debugging");
+            let mut values = common::settings::Values::default();
+            values.use_gdbstub.set_value(enabled);
+            values.gdbstub_port.set_value(port);
+            config.write_setting_generic(&mut values.use_gdbstub);
+            config.write_setting_generic(&mut values.gdbstub_port);
+            values.use_gdbstub.set_value(!enabled);
+            values.gdbstub_port.set_value(!port);
+            config.read_setting_generic(&mut values.use_gdbstub);
+            config.read_setting_generic(&mut values.gdbstub_port);
+            assert_eq!(*values.use_gdbstub.get_value(), enabled);
+            assert_eq!(*values.gdbstub_port.get_value(), port);
+        }
+    }
+
+    #[test]
+    fn executable_dump_settings_round_trip_through_debug_configuration() {
+        const CHILD: &str = "RUZU_TEST_EXECUTABLE_DUMP_CONFIG";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        for enabled in [false, true] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            {
+                let mut values = common::settings::values_mut();
+                values.dump_exefs.set_value(enabled);
+                values.dump_nso.set_value(!enabled);
+            }
+            config.save_debugging_values();
+            {
+                let mut values = common::settings::values_mut();
+                values.dump_exefs.set_value(!enabled);
+                values.dump_nso.set_value(enabled);
+            }
+            config.read_debugging_values();
+            let values = common::settings::values();
+            assert_eq!(*values.dump_exefs.get_value(), enabled);
+            assert_eq!(*values.dump_nso.get_value(), !enabled);
+        }
+    }
+
+    #[test]
+    fn macro_backend_settings_persist_but_dump_is_session_only() {
+        for enabled in [false, true] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            config.begin_group("DebuggingGraphics");
+            let mut values = common::settings::Values::default();
+            for setting in [&mut values.disable_macro_jit, &mut values.disable_macro_hle] {
+                setting.set_value(enabled);
+                config.write_setting_generic(setting);
+                assert_eq!(config.ini["DebuggingGraphics"][setting.label()], enabled.to_string());
+                setting.set_value(!enabled);
+                config.read_setting_generic(setting);
+                assert_eq!(*setting.get_value(), enabled);
+            }
+            values.dump_macros.set_value(true);
+            config.write_setting_generic(&mut values.dump_macros);
+            assert!(!config.ini["DebuggingGraphics"].contains_key("dump_macros"));
+        }
+    }
+
+    #[test]
+    fn frame_time_recording_round_trips_through_debug_configuration() {
+        const CHILD: &str = "RUZU_TEST_FRAME_TIME_CONFIG";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::tests::frame_time_recording_round_trips_through_debug_configuration"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        for enabled in [false, true] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            common::settings::values_mut().record_frame_times = enabled;
+            config.save_debugging_values();
+            common::settings::values_mut().record_frame_times = !enabled;
+            config.read_debugging_values();
+            assert_eq!(common::settings::values().record_frame_times, enabled);
+        }
+    }
+
+    #[test]
+    fn frontend_identity_fields_survive_configuration_round_trip() {
+        let mut values = common::settings::Values::default();
+        values.serial_unit.set_value(u32::MAX);
+        values.serial_battery.set_value(12345);
+        values.eden_token.set_value("a".repeat(48));
+        values.yuzu_token.set_value("existing-credential".to_string());
+        let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+        let mut loaded = common::settings::Values::default();
+        for category in [Category::Debugging, Category::WebService] {
+            config.begin_group(category.translate());
+            values.for_each_setting_in_category_mut(category, |setting| config.write_setting_generic(setting));
+            loaded.for_each_setting_in_category_mut(category, |setting| config.read_setting_generic(setting));
+            config.end_group();
+        }
+        assert_eq!(loaded.serial_unit.get_value(), values.serial_unit.get_value());
+        assert_eq!(loaded.serial_battery.get_value(), values.serial_battery.get_value());
+        assert_eq!(loaded.eden_token.get_value(), values.eden_token.get_value());
+        assert_eq!(loaded.yuzu_token.get_value(), values.yuzu_token.get_value());
+        // Per-title loading must not replace these global identity values.
+        config.global = false;
+        for category in [Category::Debugging, Category::WebService] {
+            config.begin_group(category.translate());
+            loaded.for_each_setting_in_category_mut(category, |setting| {
+                if ["serial_unit", "serial_battery", "eden_token"].contains(&setting.label()) {
+                    config.write_raw(setting.label(), "0".to_owned());
+                    config.write_raw(&format!("{}\\default", setting.label()), "false".to_owned());
+                    config.read_setting_generic(setting);
+                }
+            });
+            config.end_group();
+        }
+        assert_eq!(loaded.serial_unit.get_value(), values.serial_unit.get_value());
+        assert_eq!(loaded.serial_battery.get_value(), values.serial_battery.get_value());
+        assert_eq!(loaded.eden_token.get_value(), values.eden_token.get_value());
+    }
+
+    #[test]
+    fn file_logging_options_use_upstream_keys_and_defaults() {
+        for flush in [false, true] {
+            for censor in [false, true] {
+                let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+                config.begin_group("Miscellaneous");
+                let mut source = common::settings::Values::default();
+                assert!(!*source.log_flush_line.get_value());
+                assert!(*source.censor_username.get_value());
+                source.log_flush_line.set_value(flush);
+                source.censor_username.set_value(censor);
+                config.write_setting_generic(&mut source.log_flush_line);
+                config.write_setting_generic(&mut source.censor_username);
+                assert!(config.ini["Miscellaneous"].contains_key("flush_line"));
+                let mut loaded = common::settings::Values::default();
+                config.read_setting_generic(&mut loaded.log_flush_line);
+                config.read_setting_generic(&mut loaded.censor_username);
+                assert_eq!(*loaded.log_flush_line.get_value(), flush);
+                assert_eq!(*loaded.censor_username.get_value(), censor);
+            }
+        }
+    }
+
+    #[test]
     fn scaling_filter_round_trips_the_full_upstream_enum_range() {
         use common::settings_common::Specialization;
         use common::settings_enums::{Category, ScalingFilter};

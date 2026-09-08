@@ -229,8 +229,11 @@ impl SDLSink {
                 String::new()
             };
         Self {
+            // AudioCore constructs separate sinks for the configured input and
+            // output names. Preserve the name for either stream direction;
+            // Eden leaves input_device empty and ignores the capture setting.
+            input_device: output_device.clone(),
             output_device,
-            input_device: String::new(),
             device_channels: 2,
             system_channels: 2,
             streams: Vec::new(),
@@ -408,4 +411,26 @@ pub fn list_sdl_sink_devices(capture: bool) -> Vec<String> {
 
 pub fn get_sdl_latency() -> u32 {
     TARGET_SAMPLE_COUNT * 2
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn configured_device_name_is_retained_for_capture_and_playback() {
+        // Constructing a sink does not open a stream or record audio.
+        let sink = SDLSink::new("Synthetic microphone");
+        assert_eq!(sink.input_device, "Synthetic microphone");
+        assert_eq!(sink.output_device, "Synthetic microphone");
+    }
+
+    #[test]
+    fn automatic_devices_keep_default_selection_in_both_directions() {
+        for name in ["", AUTO_DEVICE_NAME] {
+            let sink = SDLSink::new(name);
+            assert!(sink.input_device.is_empty());
+            assert!(sink.output_device.is_empty());
+        }
+    }
 }

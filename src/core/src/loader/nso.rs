@@ -304,10 +304,19 @@ impl AppLoaderNso {
         // Upstream condition: `should_pass_arguments && !Settings::values.program_args.GetValue().empty()`
         let program_args = common::settings::values().program_args.get_value().clone();
         if should_pass_arguments && !program_args.is_empty() {
+            // Upstream memcpy has no length guard. Do not panic or copy beyond
+            // the fixed argument allocation for an oversized user setting.
+            let capacity = NSO_ARGUMENT_DATA_ALLOCATION_SIZE as usize
+                - std::mem::size_of::<NsoArgumentHeader>();
+            if program_args.len() > capacity {
+                log::error!("NSO arguments exceed the reserved block: {} bytes, maximum {}",
+                    program_args.len(), capacity);
+                return None;
+            }
             code_set.data_segment_mut().size += NSO_ARGUMENT_DATA_ALLOCATION_SIZE;
             let arg_header = NsoArgumentHeader {
-                allocated_size: NSO_ARGUMENT_DATA_ALLOCATION_SIZE,
-                actual_size: program_args.len() as u32,
+                allocated_size: NSO_ARGUMENT_DATA_ALLOCATION_SIZE.to_le(),
+                actual_size: (program_args.len() as u32).to_le(),
                 _padding: [0u8; 0x18],
             };
             let end_offset = program_image.len();
@@ -466,5 +475,60 @@ impl AppLoader for AppLoaderNso {
     fn read_nso_modules(&self, modules: &mut Modules) -> ResultStatus {
         *modules = self.modules.clone();
         ResultStatus::Success
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argument_layout_pass_respects_setting_gate_and_byte_capacity() {
+        const CHILD: &str = "RUZU_TEST_NSO_ARGUMENTS";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            use common::fs::path_util::{set_ruzu_path, RuzuPath};
+            use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let directory = std::env::temp_dir().join(format!("ruzu-argument-test-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::create_dir(directory.join("sdmc")).unwrap();
+            set_ruzu_path(RuzuPath::LogDir, &directory);
+            set_ruzu_path(RuzuPath::SDMCDir, &directory.join("sdmc"));
+            let mut system = Box::new(System::new(None, None));
+            let mut process = KProcess::new();
+            // Minimal synthetic NSO: empty segments and a zeroed header. Its
+            // layout consists only of the optional argument block and BSS.
+            let mut bytes = vec![0; 0x100];
+            bytes[..4].copy_from_slice(b"NSO0");
+            bytes[0x3C..0x40].copy_from_slice(&1u32.to_le_bytes()); // BSS follows args.
+            let file = VectorVfsFile::new(bytes, "synthetic".into(), None);
+            let capacity = NSO_ARGUMENT_DATA_ALLOCATION_SIZE as usize - 0x20;
+            for text in [String::new(), "--label café".into(), "x".repeat(capacity),
+                "é".repeat(capacity / 2), "x".repeat(capacity + 1), "é".repeat(capacity / 2 + 1)] {
+                common::settings::values_mut().program_args.set_value(text.clone());
+                for pass_arguments in [false, true] {
+                    let result = AppLoaderNso::load_module(&mut process, &mut system, &file,
+                        0x10000, pass_arguments, false, None);
+                    let expected = if !pass_arguments || text.is_empty() {
+                        Some(0x11000)
+                    } else if text.len() <= capacity {
+                        Some(0x1A000)
+                    } else { None };
+                    assert_eq!(result, expected, "{} bytes, pass={pass_arguments}", text.len());
+                }
+            }
+            assert_eq!(std::mem::size_of::<NsoArgumentHeader>(), 0x20);
+            assert_eq!(std::mem::offset_of!(NsoArgumentHeader, actual_size), 4);
+            assert_eq!(std::mem::offset_of!(NsoArgumentHeader, _padding), 8);
+            drop(process);
+            drop(system);
+            std::fs::remove_dir_all(directory).unwrap();
+        }).unwrap().join().unwrap();
     }
 }

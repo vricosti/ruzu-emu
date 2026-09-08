@@ -1,0 +1,63 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * GTK adaptation of Eden dist/qt_themes/qdarkstyle_midnight_blue/style.qss.
+ * Colorful Midnight Blue uses this same palette upstream; icons are separate.
+ * Preserve GTK geometry and native input behavior, mapping the QSS palette
+ * and widget states rather than loading Qt selectors into GTK.
+ */
+@define-color theme_bg_color #19232D;
+@define-color theme_base_color #19232D;
+@define-color theme_fg_color #F0F0F0;
+@define-color theme_text_color #F0F0F0;
+@define-color theme_selected_bg_color #1464A0;
+@define-color theme_selected_fg_color #F0F0F0;
+@define-color insensitive_fg_color #787878;
+@define-color borders #32414B;
+
+window, dialog, headerbar, notebook, notebook > stack,
+scrolledwindow, list, listview, columnview, textview, textview text {
+    background-color: #19232D;
+    color: #F0F0F0;
+}
+headerbar, toolbar, .ruzu-toolbar, notebook > header,
+popover > contents, popover contents, menubar {
+    background-color: #32414B;
+    background-image: none;
+    color: #F0F0F0;
+    border-color: #32414B;
+}
+button {
+    background-image: none;
+    background-color: #505F69;
+    color: #F0F0F0;
+    border-color: #32414B;
+}
+button:hover, notebook > header tab:hover {
+    background-color: #148CD2;
+    color: #F0F0F0;
+}
+button:active, button:checked, notebook > header tab:checked {
+    background-color: #32414B;
+    color: #F0F0F0;
+}
+entry, spinbutton, dropdown > button {
+    background-image: none;
+    background-color: #19232D;
+    color: #F0F0F0;
+    border-color: #32414B;
+}
+entry:focus-within, spinbutton:focus-within {
+    border-color: #1464A0;
+}
+selection, row:selected, .ruzu-game-list > listview > row:selected,
+modelbutton:hover, modelbutton:selected, menuitem:hover,
+check:checked, radio:checked, switch:checked, scale highlight {
+    background-image: none;
+    background-color: #1464A0;
+    color: #F0F0F0;
+}
+button:disabled, entry:disabled, spinbutton:disabled {
+    background-color: #32414B;
+    color: #787878;
+}
+label:disabled { color: #787878; }
+separator, scrollbar slider { background-color: #505F69; }

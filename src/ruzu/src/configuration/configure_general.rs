@@ -28,7 +28,7 @@ use super::shared_translation as tr;
 use super::shared_widget as w;
 
 /// Build the General tab — upstream `ConfigureGeneral`.
-pub fn page() -> Page {
+pub fn page(runtime_lock: bool, on_reset: impl Fn() + 'static) -> Page {
     let (scroller, column) = w::page();
 
     // --- "General" group -------------------------------------------------
@@ -186,18 +186,67 @@ pub fn page() -> Page {
     reset.set_margin_top(8);
     reset.set_margin_bottom(10);
     reset.set_margin_start(10);
-    reset.connect_clicked(|_| {
-        // Upstream pops a confirmation, resets `Settings` + `UISettings` to
-        // their defaults, and closes the dialog via the callback installed by
-        // `ConfigureDialog` (`general_tab->SetResetCallback`). Wiring the reset
-        // itself needs the config writer, which is a separate slice; log until
-        // then rather than silently doing nothing.
-        log::info!("Reset All Settings requested (config writer not yet wired)");
+    let on_reset = Rc::new(on_reset);
+    reset.connect_clicked(move |button| {
+        let question = gtk::MessageDialog::builder()
+            .modal(true)
+            .message_type(gtk::MessageType::Question)
+            .text(crate::i18n::tr("Reset All Settings"))
+            .secondary_text(crate::i18n::tr(
+                "This resets all settings and removes all per-game configurations. Game directories, profiles, and input profiles will not be deleted. Proceed?",
+            ))
+            .build();
+        if let Some(parent) = button.root().and_downcast::<gtk::Window>() {
+            question.set_transient_for(Some(&parent));
+            question.set_destroy_with_parent(true);
+        }
+        question.add_button(&crate::i18n::tr("No"), gtk::ResponseType::No);
+        question.add_button(&crate::i18n::tr("Yes"), gtk::ResponseType::Yes);
+        question.set_default_response(gtk::ResponseType::No);
+        let on_reset = Rc::clone(&on_reset);
+        question.connect_response(move |question, response| {
+            question.close();
+            if response == gtk::ResponseType::Yes {
+                on_reset();
+            }
+        });
+        question.present();
     });
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&scroller);
     root.append(&reset);
+
+    let confirm_before_stopping_policy = uisettings::with(|v| w::SettingEditPolicy::for_setting(
+        &v.confirm_before_stopping, runtime_lock, true,
+    ));
+    confirm_row.set_sensitive(confirm_before_stopping_policy.sensitive);
+    let pause_when_in_background_policy = uisettings::with(|v| w::SettingEditPolicy::for_setting(
+        &v.pause_when_in_background, runtime_lock, true,
+    ));
+    pause_background.set_sensitive(pause_when_in_background_policy.sensitive);
+    let hide_mouse_policy = uisettings::with(|v| w::SettingEditPolicy::for_setting(
+        &v.hide_mouse, runtime_lock, true,
+    ));
+    hide_mouse.set_sensitive(hide_mouse_policy.sensitive);
+    let controller_applet_disabled_policy = uisettings::with(|v| w::SettingEditPolicy::for_setting(
+        &v.controller_applet_disabled, runtime_lock, true,
+    ));
+    disable_controller_applet.set_sensitive(controller_applet_disabled_policy.sensitive);
+    let select_user_on_boot_policy = uisettings::with(|v| w::SettingEditPolicy::for_setting(
+        &v.select_user_on_boot, runtime_lock, true,
+    ));
+    select_user_on_boot.set_sensitive(select_user_on_boot_policy.sensitive);
+    let enable_gamemode_policy = uisettings::with(|v| w::SettingEditPolicy::new(
+        &v.enable_gamemode, runtime_lock, true,
+    ));
+    enable_gamemode.set_sensitive(enable_gamemode_policy.sensitive);
+    #[cfg(target_os = "linux")]
+    let gui_force_x11_policy = uisettings::with(|v| w::SettingEditPolicy::for_setting(
+        &v.gui_force_x11, runtime_lock, true,
+    ));
+    #[cfg(target_os = "linux")]
+    force_x11.set_sensitive(gui_force_x11_policy.sensitive);
 
     Page::new("General", root, move || {
         let confirm_value = tr::value_at(tr::CONFIRM_STOP, confirm.selected());
@@ -210,14 +259,14 @@ pub fn page() -> Page {
         let use_x11 = force_x11.is_active();
 
         uisettings::with_mut(|v| {
-            v.confirm_before_stopping.set_value(confirm_value);
-            v.pause_when_in_background.set_value(pause);
-            v.hide_mouse.set_value(hide);
-            v.controller_applet_disabled.set_value(no_controller_applet);
-            v.select_user_on_boot.set_value(select_user);
-            v.enable_gamemode.set_value(gamemode);
+            confirm_before_stopping_policy.apply_setting(&mut v.confirm_before_stopping, confirm_value);
+            pause_when_in_background_policy.apply_setting(&mut v.pause_when_in_background, pause);
+            hide_mouse_policy.apply_setting(&mut v.hide_mouse, hide);
+            controller_applet_disabled_policy.apply_setting(&mut v.controller_applet_disabled, no_controller_applet);
+            select_user_on_boot_policy.apply_setting(&mut v.select_user_on_boot, select_user);
+            enable_gamemode_policy.apply(&mut v.enable_gamemode, gamemode);
             #[cfg(target_os = "linux")]
-            v.gui_force_x11.set_value(use_x11);
+            gui_force_x11_policy.apply_setting(&mut v.gui_force_x11, use_x11);
         });
 
         let new_external_dirs = external_dirs.borrow().clone();
@@ -254,4 +303,35 @@ fn normalize_external_directory(path: &std::path::Path) -> String {
         normalized.push(std::path::MAIN_SEPARATOR);
     }
     normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn general_runtime_permissions_match_upstream() {
+        let mut values = uisettings::Values::default();
+        assert!(values.confirm_before_stopping.runtime_modifiable);
+        for setting in [
+            &mut values.pause_when_in_background,
+            &mut values.hide_mouse,
+            &mut values.select_user_on_boot,
+        ] {
+            let original = *setting.get_value();
+            let policy = w::SettingEditPolicy::for_setting(setting, false, true);
+            assert!(policy.sensitive);
+            policy.apply_setting(setting, !original);
+            assert_eq!(*setting.get_value(), !original);
+        }
+        let policy = w::SettingEditPolicy::for_setting(
+            &values.controller_applet_disabled, false, true,
+        );
+        assert!(!policy.sensitive);
+        policy.apply_setting(&mut values.controller_applet_disabled, true);
+        assert!(!*values.controller_applet_disabled.get_value());
+        assert!(!w::SettingEditPolicy::new(&values.enable_gamemode, false, true).sensitive);
+        #[cfg(target_os = "linux")]
+        assert!(!w::SettingEditPolicy::for_setting(&values.gui_force_x11, false, true).sensitive);
+    }
 }

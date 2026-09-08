@@ -194,7 +194,8 @@ pub trait ServiceFramework: SessionRequestHandler {
             );
         }
 
-        log::warn!("Unknown / unimplemented {}", buf);
+        log::error!("Unknown / unimplemented {}", buf);
+        common::assert::assert_fail_soft_impl();
 
         if *common::settings::values().use_auto_stub.get_value() {
             log::warn!("Using auto stub fallback!");

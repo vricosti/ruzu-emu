@@ -18,19 +18,19 @@ use std::sync::Arc;
 /// Corresponds to `Fatal_P` in upstream fatal_p.h / fatal_p.cpp.
 /// Both commands are nullptr (unimplemented) in upstream.
 pub struct FatalP {
-    pub module: Arc<super::fatal::Module>,
+    pub interface: super::fatal::Interface,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl FatalP {
-    pub fn new(module: Arc<super::fatal::Module>) -> Self {
+    pub fn new(module: Arc<super::fatal::Module>, system: crate::core::SystemRef) -> Self {
         let handlers =
             build_handler_map(&[(0, None, "GetFatalEvent"), (10, None, "GetFatalContext")]);
 
         log::debug!("fatal:p created");
         Self {
-            module,
+            interface: super::fatal::Interface::new(system, module, "fatal:p"),
             handlers,
             handlers_tipc: BTreeMap::new(),
         }

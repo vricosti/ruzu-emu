@@ -1303,8 +1303,8 @@ impl Default for Values {
             ),
             custom_rtc_offset: SwitchableSetting::ranged_with_options(
                 0i64,
-                i32::MIN as i64,
-                i32::MAX as i64,
+                i64::MIN,
+                i64::MAX,
                 "custom_rtc_offset",
                 System,
                 Specialization::COUNTABLE,
@@ -2334,6 +2334,20 @@ mod tests {
         });
         for label in ["pause_tas_on_load", "tas_enable", "tas_loop", "tas_show_recording_dialog"] {
             assert_eq!(labels.iter().filter(|entry| entry.as_str() == label).count(), 1);
+        }
+    }
+
+    #[test]
+    fn rtc_offset_preserves_signed_64_bit_values() {
+        use crate::settings_setting::BasicSetting;
+        let mut values = Values::default();
+        for offset in [i64::MIN, -4_000_000_000, 4_000_000_000, (1i64 << 53) + 1, i64::MAX] {
+            values.custom_rtc_offset.set_value(offset);
+            assert_eq!(*values.custom_rtc_offset.get_value(), offset);
+            let serialized = values.custom_rtc_offset.to_string_repr();
+            values.custom_rtc_offset.set_value(0);
+            values.custom_rtc_offset.load_string(&serialized);
+            assert_eq!(*values.custom_rtc_offset.get_value(), offset);
         }
     }
 

@@ -102,13 +102,15 @@ pub fn page(runtime_lock: bool) -> Page {
     custom_rtc_check.set_active(rtc_enabled);
     let rtc_offset_value = *common::settings::values().custom_rtc_offset.get_value();
     let custom_rtc_entry = gtk::Entry::new();
-    custom_rtc_entry.set_text(&format_rtc(unix_time_seconds() + rtc_offset_value));
+    custom_rtc_entry.set_text(&format_rtc(rtc_display_time(unix_time_seconds(), rtc_enabled, rtc_offset_value)));
     custom_rtc_entry.set_sensitive(rtc_enabled);
     let rtc_row = gated_row(&custom_rtc_check, &custom_rtc_entry);
     system.append(&rtc_row);
 
-    let rtc_offset = gtk::SpinButton::with_range(i32::MIN as f64, i32::MAX as f64, 1.0);
-    rtc_offset.set_value(rtc_offset_value as f64);
+    // GtkSpinButton stores doubles, which cannot preserve every signed 64-bit
+    // offset. Keep the exact decimal representation of upstream's s64 setting.
+    let rtc_offset = gtk::Entry::new();
+    rtc_offset.set_text(&rtc_offset_value.to_string());
     rtc_offset.set_sensitive(rtc_enabled);
     let rtc_offset_row = w::labeled_row(" ", &rtc_offset);
     system.append(&rtc_offset_row);
@@ -228,7 +230,7 @@ pub fn page(runtime_lock: bool) -> Page {
     // Gate each dependent control on its check box, as upstream does.
     gate(&custom_rtc_check, &custom_rtc_entry);
     gate(&custom_rtc_check, &rtc_offset);
-    let (rtc_time, refresh_rtc) =
+    let (rtc_time, rtc_offset_state, refresh_rtc) =
         connect_rtc_controls(&custom_rtc_check, &custom_rtc_entry, &rtc_offset);
     gate(&rng_seed_check, &rng_seed_entry);
     gate(&speed_check, &speed_control);
@@ -381,7 +383,7 @@ pub fn page(runtime_lock: bool) -> Page {
         let region_value = tr::value_at(tr::REGION, region.selected());
         let time_zone_value = time_zone.selected();
         let rtc_on = custom_rtc_check.is_active();
-        let rtc_offset_value = rtc_offset.value() as i64;
+        let rtc_offset_value = rtc_offset_state.get();
         // Like QDateTimeEdit, retain seconds not shown in the minute-only text.
         // Invalid intermediate text does not replace the last valid date.
         let rtc_value = rtc_time.get();
@@ -440,11 +442,12 @@ pub fn page(runtime_lock: bool) -> Page {
 fn connect_rtc_controls(
     enabled: &gtk::CheckButton,
     date: &gtk::Entry,
-    offset: &gtk::SpinButton,
-) -> (Rc<Cell<i64>>, Rc<dyn Fn()>) {
+    offset: &gtk::Entry,
+) -> (Rc<Cell<i64>>, Rc<Cell<i64>>, Rc<dyn Fn()>) {
     let updating = Rc::new(Cell::new(false));
     let previous_time = Rc::new(Cell::new(0));
     let displayed_time = Rc::new(Cell::new(0));
+    let offset_state = Rc::new(Cell::new(parse_rtc_offset(&offset.text()).unwrap_or(0)));
 
     // ConfigureSystem::UpdateRtcTime. The text field cannot store hidden
     // seconds as QDateTimeEdit does, so keep its full timestamp separately.
@@ -455,6 +458,7 @@ fn connect_rtc_controls(
         let previous_time = Rc::clone(&previous_time);
         let displayed_time = Rc::clone(&displayed_time);
         let updating = Rc::clone(&updating);
+        let offset_state = Rc::clone(&offset_state);
         move || {
             let (Some(enabled), Some(date), Some(offset)) =
                 (enabled.upgrade(), date.upgrade(), offset.upgrade())
@@ -464,8 +468,14 @@ fn connect_rtc_controls(
             if updating.replace(true) {
                 return;
             }
+            if let Some(value) = parse_rtc_offset(&offset.text()) {
+                offset_state.set(value);
+                offset.remove_css_class("error");
+            } else {
+                offset.add_css_class("error");
+            }
             let timestamp = rtc_display_time(
-                unix_time_seconds(), enabled.is_active(), offset.value() as i64,
+                unix_time_seconds(), enabled.is_active(), offset_state.get(),
             );
             previous_time.set(timestamp);
             let text = format_rtc(timestamp);
@@ -476,7 +486,7 @@ fn connect_rtc_controls(
         }
     });
 
-    offset.connect_value_changed({
+    offset.connect_changed({
         let refresh = Rc::clone(&refresh);
         move |_| refresh()
     });
@@ -487,6 +497,7 @@ fn connect_rtc_controls(
         let displayed_time = Rc::clone(&displayed_time);
         let refresh = Rc::clone(&refresh);
         let updating = Rc::clone(&updating);
+        let offset_state = Rc::clone(&offset_state);
         move |date| {
             let (Some(enabled), Some(offset)) = (enabled.upgrade(), offset.upgrade()) else {
                 return;
@@ -496,12 +507,11 @@ fn connect_rtc_controls(
             }
             if let Some(timestamp) = parse_rtc(&date.text()) {
                 if let Some(new_offset) = rtc_edited_offset(
-                    offset.value() as i64, displayed_time.get(), timestamp,
+                    offset_state.get(), displayed_time.get(), timestamp,
                 ) {
-                    // Suppress the intermediate refresh; perform it once after
-                    // the spinbox has clamped the value to its supported range.
+                    // Suppress the intermediate refresh while updating both fields.
                     updating.set(true);
-                    offset.set_value(new_offset as f64);
+                    offset.set_text(&new_offset.to_string());
                     updating.set(false);
                     refresh();
                 }
@@ -514,11 +524,16 @@ fn connect_rtc_controls(
         move |_| refresh()
     });
     refresh();
-    (previous_time, refresh)
+    (previous_time, offset_state, refresh)
+}
+
+fn parse_rtc_offset(text: &str) -> Option<i64> {
+    text.trim().parse().ok()
 }
 
 fn rtc_display_time(now: i64, enabled: bool, offset: i64) -> i64 {
-    if enabled { now + offset } else { now }
+    // Same integer behavior as the RTC resource; never overflow in the editor.
+    if enabled { now.wrapping_add(offset) } else { now }
 }
 
 // ConfigureSystem's update_date_offset lambda: edit relative to the displayed
@@ -636,7 +651,7 @@ fn format_rtc(timestamp: i64) -> String {
                 "{:02}/{:02}/{:04} {:02}:{:02}",
                 local.tm_mday,
                 local.tm_mon + 1,
-                local.tm_year + 1900,
+                i64::from(local.tm_year) + 1900,
                 local.tm_hour,
                 local.tm_min
             );
@@ -736,6 +751,19 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtc_offset_editor_preserves_exact_integer_values() {
+        for offset in [i64::MIN, -4_000_000_000, 4_000_000_000, (1i64 << 53) + 1, i64::MAX] {
+            assert_eq!(parse_rtc_offset(&offset.to_string()), Some(offset));
+            assert!(!format_rtc(rtc_display_time(1_800_000_000, true, offset)).is_empty());
+        }
+        for text in ["", "-", "1.5", "9223372036854775808"] {
+            assert_eq!(parse_rtc_offset(text), None);
+        }
+        assert_eq!(rtc_display_time(1, true, i64::MAX), i64::MIN);
+        assert_eq!(rtc_display_time(1, false, i64::MAX), 1);
+    }
 
     #[test]
     fn rtc_date_edit_is_relative_to_previous_display_not_elapsed_host_time() {

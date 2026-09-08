@@ -16,7 +16,7 @@ use crate::hle::api_version;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::service::service::{build_handler_map_from_infos, FunctionInfo, ServiceFramework};
 
 /// IPC command table for Module::Interface (IGeneralInterface).
 pub mod commands {
@@ -57,67 +57,71 @@ impl ModuleInterface {
                 .unwrap_or(0)
         });
 
-        let handlers = build_handler_map(&[
-            (0, Some(Self::get_config_callback), "GetConfig"),
-            (1, Some(Self::modular_exponentiate_callback), "ModularExponentiate"),
-            (5, Some(Self::set_config_callback), "SetConfig"),
-            (7, Some(Self::generate_random_bytes_callback), "GenerateRandomBytes"),
-            (11, Some(Self::is_development_callback), "IsDevelopment"),
-            (24, Some(Self::set_boot_reason_callback), "SetBootReason"),
-            (25, Some(Self::get_boot_reason_callback), "GetBootReason"),
-        ]);
-
         Self {
             name: name.to_string(),
-            handlers,
+            handlers: BTreeMap::new(),
             handlers_tipc: BTreeMap::new(),
             rng: Mutex::new(Mt19937::new(seed)),
         }
     }
 
-    fn get_config_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn register_handlers(&mut self, functions: &[FunctionInfo]) {
+        self.handlers = build_handler_map_from_infos(functions);
+    }
+
+    pub(super) fn get_config_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         service.get_config_handler(ctx);
     }
 
-    fn modular_exponentiate_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn modular_exponentiate_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         let result = service.modular_exponentiate();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
     }
 
-    fn set_config_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn set_config_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         let result = service.set_config();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
     }
 
-    fn generate_random_bytes_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn generate_random_bytes_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         service.generate_random_bytes_handler(ctx);
     }
 
-    fn is_development_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn is_development_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         let result = service.is_development();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
     }
 
-    fn set_boot_reason_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn set_boot_reason_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         let result = service.set_boot_reason();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
     }
 
-    fn get_boot_reason_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn get_boot_reason_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         let result = service.get_boot_reason();
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
+    }
+
+    pub(super) fn generate_aes_kek_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        service.generate_aes_kek(ctx);
+    }
+
+    pub(super) fn generate_aes_key_callback(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        service.generate_aes_key(ctx);
     }
 
     /// GetConfig (cmd 0).
@@ -290,7 +294,7 @@ mod tests {
 
     #[test]
     fn config_reply_keeps_zero_output_on_secure_monitor_errors() {
-        let service = ModuleInterface::new("spl:", Some(0));
+        let service = super::super::spl::Spl::new(Some(0)).module;
         for (item, result) in [
             (ConfigItem::ExosphereNeedsReboot as u32, RESULT_SUCCESS),
             (ConfigItem::ExospherePayloadAddress as u32, spl_results::RESULT_SECURE_MONITOR_NOT_INITIALIZED),
@@ -321,14 +325,14 @@ mod tests {
 
     #[test]
     fn base_command_table_registers_only_general_commands() {
-        let service = ModuleInterface::new("spl:", Some(0));
+        let service = super::super::spl::Spl::new(Some(0)).module;
         assert_eq!(service.handlers().keys().copied().collect::<Vec<_>>(), [0, 1, 5, 7, 11, 24, 25]);
         assert!(service.handlers().values().all(|entry| entry.handler_callback.is_some()));
     }
 
     #[test]
     fn exosphere_version_uses_the_shared_api_version_owner() {
-        let service = ModuleInterface::new("spl:", Some(0));
+        let service = super::super::spl::Spl::new(Some(0)).module;
         let value = service.get_config(ConfigItem::ExosphereApiVersion as u32).unwrap();
         assert_eq!(value as u32, api_version::get_target_firmware());
         assert_eq!((value >> 56) as u8, api_version::ATMOSPHERE_RELEASE_VERSION_MAJOR);
@@ -360,4 +364,24 @@ impl ServiceFramework for ModuleInterface {
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
     }
+}
+
+/// Counterpart of SPL::LoopProcess in spl_module.cpp.
+pub fn loop_process(system: crate::core::SystemRef) {
+    use std::sync::Arc;
+    use super::spl::{Spl, SplMig, SplFs, SplSsl, SplEs, SplManu};
+    use crate::hle::service::server_manager::ServerManager;
+
+    let manager = ServerManager::new_shared(system);
+    {
+        let mut manager = manager.lock().unwrap();
+        manager.register_named_service_handler("csrng", Arc::new(super::csrng::Csrng::new(None)), 0x40);
+        manager.register_named_service_handler("spl:", Arc::new(Spl::new(None)), 0x40);
+        manager.register_named_service_handler("spl:mig", Arc::new(SplMig::new(None)), 0x40);
+        manager.register_named_service_handler("spl:fs", Arc::new(SplFs::new(None)), 0x40);
+        manager.register_named_service_handler("spl:ssl", Arc::new(SplSsl::new(None)), 0x40);
+        manager.register_named_service_handler("spl:es", Arc::new(SplEs::new(None)), 0x40);
+        manager.register_named_service_handler("spl:manu", Arc::new(SplManu::new(None)), 0x40);
+    }
+    ServerManager::run_server_shared(manager);
 }

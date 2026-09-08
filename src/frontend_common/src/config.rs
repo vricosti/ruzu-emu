@@ -2442,6 +2442,8 @@ mod tests {
         values.serial_unit.set_value(u32::MAX);
         values.serial_battery.set_value(12345);
         values.eden_token.set_value("a".repeat(48));
+        values.eden_username.set_value("LocalUser".to_string());
+        values.yuzu_username.set_value("LegacyUser".to_string());
         values.yuzu_token.set_value("existing-credential".to_string());
         let mut config = BaseConfig::new(ConfigType::GlobalConfig);
         let mut loaded = common::settings::Values::default();
@@ -2454,13 +2456,15 @@ mod tests {
         assert_eq!(loaded.serial_unit.get_value(), values.serial_unit.get_value());
         assert_eq!(loaded.serial_battery.get_value(), values.serial_battery.get_value());
         assert_eq!(loaded.eden_token.get_value(), values.eden_token.get_value());
+        assert_eq!(loaded.eden_username.get_value(), values.eden_username.get_value());
+        assert_eq!(loaded.yuzu_username.get_value(), values.yuzu_username.get_value());
         assert_eq!(loaded.yuzu_token.get_value(), values.yuzu_token.get_value());
         // Per-title loading must not replace these global identity values.
         config.global = false;
         for category in [Category::Debugging, Category::WebService] {
             config.begin_group(category.translate());
             loaded.for_each_setting_in_category_mut(category, |setting| {
-                if ["serial_unit", "serial_battery", "eden_token"].contains(&setting.label()) {
+                if ["serial_unit", "serial_battery", "eden_username", "eden_token"].contains(&setting.label()) {
                     config.write_raw(setting.label(), "0".to_owned());
                     config.write_raw(&format!("{}\\default", setting.label()), "false".to_owned());
                     config.read_setting_generic(setting);

@@ -285,7 +285,10 @@ impl FrontendApplet for Error {
                 self.error_code = decode_64_bit_error(args.error_code_64);
                 self.args.error_record = args;
             }
-            mode => log::error!("Unimplemented LibAppletError mode={:02X}!", mode.0),
+            mode => {
+                log::error!("Unimplemented LibAppletError mode={:02X}!", mode.0);
+                common::assert::assert_fail_soft_impl();
+            }
         }
 
         self.initialized = true;
@@ -296,7 +299,8 @@ impl FrontendApplet for Error {
     }
 
     fn execute_interactive(&mut self) {
-        panic!("Unexpected interactive applet data!");
+        log::error!("Unexpected interactive applet data!");
+        common::assert::assert_fail_soft_impl();
     }
 
     fn execute(&mut self) {
@@ -307,7 +311,7 @@ impl FrontendApplet for Error {
         self.completion
             .frontend_executing
             .store(true, Ordering::Release);
-        let title_id = self.system.get().runtime_program_id();
+        let title_id = self.system.get().get_application_process_program_id();
         let reporter = self.system.get_reporter();
 
         match self.mode {
@@ -360,6 +364,7 @@ impl FrontendApplet for Error {
             }
             mode => {
                 log::error!("Unimplemented LibAppletError mode={:02X}!", mode.0);
+                common::assert::assert_fail_soft_impl();
                 Self::display_completed(&self.applet, &self.broker, &self.completion);
             }
         }
@@ -457,10 +462,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn show_error_decodes_64_bit_code_and_completes() {
-        let system = System::new();
-        let system_ref = SystemRef::from_ref(&system);
+    fn show_error_decodes_64_bit_code_and_completes(system: &System) {
+        let system_ref = SystemRef::from_ref(system);
         let owner = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
         let broker = Arc::new(AppletDataBroker::new());
         let frontend = Arc::new(CompletingFrontend(AtomicU32::new(0)));
@@ -493,10 +496,8 @@ mod tests {
         assert_eq!(broker.get_out_data().pop().unwrap(), vec![0; 0x1000]);
     }
 
-    #[test]
-    fn system_error_decodes_fixed_text_buffers() {
-        let system = System::new();
-        let system_ref = SystemRef::from_ref(&system);
+    fn system_error_decodes_fixed_text_buffers(system: &System) {
+        let system_ref = SystemRef::from_ref(system);
         let owner = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
         let broker = Arc::new(AppletDataBroker::new());
         let frontend = Arc::new(CustomTextFrontend(Mutex::new(None)));
@@ -524,5 +525,96 @@ mod tests {
         let captured = frontend.0.lock().unwrap().clone().unwrap();
         assert_eq!(captured, (128 | (7 << 9), "dialog".into(), "detail".into()));
         assert!(applet.is_complete());
+    }
+
+    #[test]
+    fn reports_follow_application_identity_mode_and_completion() {
+        const CHILD: &str = "RUZU_TEST_ERROR_APPLET_REPORTS";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::service::am::frontend::applet_error::tests::reports_follow_application_identity_mode_and_completion"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            use common::fs::path_util::{set_ruzu_path, RuzuPath};
+            use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let directory = std::env::temp_dir().join(format!("ruzu-error-report-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::create_dir(directory.join("sdmc")).unwrap();
+            // System constructs Reporter and truncates FsAccessLog.txt; isolate both paths first.
+            set_ruzu_path(RuzuPath::LogDir, &directory);
+            set_ruzu_path(RuzuPath::SDMCDir, &directory.join("sdmc"));
+            common::settings::values_mut().reporting_services.set_value(false);
+            common::settings::values_mut().use_debug_asserts.set_value(false);
+            let mut system = Box::new(System::new());
+            let mut process = KProcess::new();
+            process.program_id = 42;
+            system.set_current_process_arc(Arc::new(ProcessLock::new(process)));
+            system.set_runtime_program_id(99);
+            show_error_decodes_64_bit_code_and_completes(&system);
+            system_error_decodes_fixed_text_buffers(&system);
+            let system_ref = SystemRef::from_ref(&system);
+            let reports = directory.join("error_report");
+            for enabled in [false, true] {
+                common::settings::values_mut().reporting_services.set_value(enabled);
+                for mode in [0u8, 1, 2, 4, 5, 0xFF] {
+                    let mut input = vec![0u8; match mode { 0 => 0x14, 1 => 0x1018, 2 => 0x1014, _ => 0x18 }];
+                    input[0] = mode;
+                    let result = 128u32 | (7 << 9);
+                    let (main, detail) = match mode {
+                        1 | 2 => ("dialog", "detail"),
+                        4 | 5 => ("000000000000ABCD", ""),
+                        _ => ("", ""),
+                    };
+                    match mode {
+                        0 => input[16..20].copy_from_slice(&result.to_ne_bytes()),
+                        1 | 2 | 4 | 5 => {
+                            if mode == 2 {
+                                input[8..12].copy_from_slice(&result.to_ne_bytes());
+                            } else {
+                                input[8..16].copy_from_slice(&((2128u64 << 32) | 7).to_ne_bytes());
+                            }
+                            if mode == 1 || mode == 2 {
+                                let start = if mode == 1 { 24 } else { 20 };
+                                input[start..start + 8].copy_from_slice(b"dialog\0X");
+                                input[start + 0x800..start + 0x808].copy_from_slice(b"detail\0Y");
+                            } else {
+                                input[16..24].copy_from_slice(&0xABCDu64.to_ne_bytes());
+                            }
+                        }
+                        _ => {},
+                    }
+                    let broker = Arc::new(AppletDataBroker::new());
+                    broker.get_in_data().push(struct_to_vec(&CommonArguments::default()));
+                    broker.get_in_data().push(input);
+                    let frontend = Arc::new(CompletingFrontend(AtomicU32::new(0)));
+                    let mut applet = Error::new(system_ref, Weak::new(), broker.clone(),
+                        LibraryAppletMode::AllForeground, frontend);
+                    applet.initialize();
+                    applet.execute_interactive(); // Soft assertion must return when disabled.
+                    applet.execute();
+                    assert!(applet.is_complete());
+                    assert_eq!(broker.get_out_data().pop().unwrap(), vec![0; 0x1000]);
+                    let paths: Vec<_> = std::fs::read_dir(&reports).into_iter().flatten()
+                        .map(|e| e.unwrap().path()).collect();
+                    if enabled && mode != 0xFF {
+                        assert_eq!(paths.len(), 1);
+                        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&paths[0]).unwrap()).unwrap();
+                        assert_eq!(report["report_common"]["title_id"], "000000000000002A");
+                        assert_eq!(report["report_common"]["result_raw"], format!("{result:08X}"));
+                        assert_eq!(report["error_custom_text"]["main"], main);
+                        assert_eq!(report["error_custom_text"]["detail"], detail);
+                        std::fs::remove_file(&paths[0]).unwrap();
+                    } else { assert!(paths.is_empty()); }
+                    applet.execute(); // Completed applets neither report again nor duplicate replies.
+                    assert!(broker.get_out_data().pop().is_err());
+                    assert_eq!(std::fs::read_dir(&reports).into_iter().flatten().count(), 0);
+                }
+            }
+            drop(system);
+            std::fs::remove_dir_all(directory).unwrap();
+        }).unwrap().join().unwrap();
     }
 }

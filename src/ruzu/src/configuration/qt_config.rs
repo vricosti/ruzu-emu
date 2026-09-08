@@ -1664,6 +1664,8 @@ mod tests {
             common::fs::path_util::set_ruzu_path(RuzuPath::ConfigDir, &root);
             let document = concat!(
                 "[Audio]\nvolume\\default=false\nvolume=42\n",
+                "audio_muted\\default=false\naudio_muted=true\n",
+                "muteWhenInBackground\\default=false\nmuteWhenInBackground=true\n",
                 "[UI]\nhideInactiveMouse\\default=false\nhideInactiveMouse=false\n",
                 "Paths\\gamedirs\\size=1\n",
                 "Paths\\gamedirs\\1\\path=/synthetic/homebrew\n",
@@ -1671,7 +1673,13 @@ mod tests {
             std::fs::write(config_path(), document).unwrap();
             reload_all_values();
             assert_eq!(*common::settings::values().volume.get_value(), 42);
+            {
+                let values = common::settings::values();
+                assert!(*values.audio_muted.get_value());
+                assert_eq!(common::settings::volume(&values), 0.0);
+            }
             uisettings::with(|values| {
+                assert!(*values.mute_when_in_background.get_value());
                 assert!(!*values.hide_mouse.get_value());
                 assert_eq!(values.game_dirs.len(), 1);
                 assert_eq!(values.game_dirs[0].path, "/synthetic/homebrew");
@@ -1682,7 +1690,13 @@ mod tests {
             std::fs::write(config_path(), "").unwrap();
             reload_all_values();
             assert_eq!(*common::settings::values().volume.get_value(), 100);
+            {
+                let values = common::settings::values();
+                assert!(!*values.audio_muted.get_value());
+                assert_eq!(common::settings::volume(&values), 1.0);
+            }
             uisettings::with(|values| {
+                assert!(!*values.mute_when_in_background.get_value());
                 assert!(*values.hide_mouse.get_value());
                 assert!(values.game_dirs.is_empty());
             });

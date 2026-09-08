@@ -119,11 +119,7 @@ pub fn page(runtime_lock: bool) -> Page {
     let seed_enabled = *common::settings::values().rng_seed_enabled.get_value();
     let rng_seed_check = gtk::CheckButton::with_label("RNG Seed");
     rng_seed_check.set_active(seed_enabled);
-    let rng_seed_entry = gtk::Entry::new();
-    rng_seed_entry.set_text(&format!(
-        "{:08X}",
-        common::settings::values().rng_seed.get_value()
-    ));
+    let rng_seed_entry = w::create_hex_edit(*common::settings::values().rng_seed.get_value());
     rng_seed_entry.set_sensitive(seed_enabled);
     let seed_row = gated_row(&rng_seed_check, &rng_seed_entry);
     system.append(&seed_row);

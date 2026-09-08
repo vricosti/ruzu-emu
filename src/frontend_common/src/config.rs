@@ -2250,6 +2250,29 @@ mod tests {
     }
 
     #[test]
+    fn file_logging_options_use_upstream_keys_and_defaults() {
+        for flush in [false, true] {
+            for censor in [false, true] {
+                let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+                config.begin_group("Miscellaneous");
+                let mut source = common::settings::Values::default();
+                assert!(!*source.log_flush_line.get_value());
+                assert!(*source.censor_username.get_value());
+                source.log_flush_line.set_value(flush);
+                source.censor_username.set_value(censor);
+                config.write_setting_generic(&mut source.log_flush_line);
+                config.write_setting_generic(&mut source.censor_username);
+                assert!(config.ini["Miscellaneous"].contains_key("flush_line"));
+                let mut loaded = common::settings::Values::default();
+                config.read_setting_generic(&mut loaded.log_flush_line);
+                config.read_setting_generic(&mut loaded.censor_username);
+                assert_eq!(*loaded.log_flush_line.get_value(), flush);
+                assert_eq!(*loaded.censor_username.get_value(), censor);
+            }
+        }
+    }
+
+    #[test]
     fn scaling_filter_round_trips_the_full_upstream_enum_range() {
         use common::settings_common::Specialization;
         use common::settings_enums::{Category, ScalingFilter};

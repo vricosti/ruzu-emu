@@ -363,6 +363,8 @@ pub struct Values {
 
     // ── Miscellaneous ───────────────────────────────────────────────────
     pub log_filter: Setting<String>,
+    pub log_flush_line: Setting<bool>,
+    pub censor_username: Setting<bool>,
     pub use_dev_keys: Setting<bool>,
 
     // ── Network ─────────────────────────────────────────────────────────
@@ -554,7 +556,7 @@ impl Values {
                 disable_macro_jit,
                 disable_macro_hle,
             ),
-            Category::Miscellaneous => visit!(log_filter),
+            Category::Miscellaneous => visit!(log_filter, log_flush_line, censor_username),
             Category::WebService => {
                 visit!(enable_telemetry, web_api_url, yuzu_username, yuzu_token,)
             }
@@ -1535,6 +1537,8 @@ impl Default for Values {
 
             // Miscellaneous
             log_filter: Setting::new("*:Info".to_string(), "log_filter", Miscellaneous),
+            log_flush_line: Setting::with_options(false, "flush_line", Miscellaneous, Specialization::DEFAULT, true, true),
+            censor_username: Setting::new(true, "censor_username", Miscellaneous),
             use_dev_keys: Setting::new(false, "use_dev_keys", Debugging),
 
             // Network

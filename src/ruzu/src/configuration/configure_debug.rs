@@ -45,6 +45,10 @@ pub fn page(runtime_lock: bool) -> Page {
     let log_filter_value = common::settings::values().log_filter.get_value().clone();
     let (log_filter_row, log_filter) = w::entry_row("Global Log Filter", &log_filter_value);
     logging.append(&log_filter_row);
+    let flush_line = w::check_row("Flush log output on each line", *common::settings::values().log_flush_line.get_value());
+    let censor_username = w::check_row("Censor username in logs", *common::settings::values().censor_username.get_value());
+    logging.append(&flush_line);
+    logging.append(&censor_username);
     let (gpu_log_row, gpu_log_level) = w::combo_row(
         "GPU Logging/Level",
         &["Off", "Errors", "Standard", "Verbose", "All"],
@@ -260,6 +264,8 @@ pub fn page(runtime_lock: bool) -> Page {
         values.use_gdbstub.set_value(gdb);
         values.gdbstub_port.set_value(port);
         values.log_filter.set_value(filter);
+        values.log_flush_line.set_value(flush_line.is_active());
+        values.censor_username.set_value(censor_username.is_active());
         values.gpu_log_level.set_value(
             common::settings_enums::GpuLogLevel::from_u32(gpu_log_level.selected())
                 .unwrap_or(common::settings_enums::GpuLogLevel::Off),
@@ -392,6 +398,10 @@ mod tests {
         let page = page(true);
         let gpu_level = find_gpu_level(&page.widget).unwrap();
         let gpu_dumps = find_switch(&page.widget, "Dump SPIR-V Shaders").unwrap();
+        let flush_line = find_switch(&page.widget, "Flush log output on each line").unwrap();
+        let censor_username = find_switch(&page.widget, "Censor username in logs").unwrap();
+        assert!(!flush_line.is_active());
+        assert!(censor_username.is_active());
         assert_eq!(gpu_level.selected(), 2);
         assert!(gpu_dumps.is_active());
         assert!(gpu_level.is_sensitive() && gpu_dumps.is_sensitive());
@@ -418,10 +428,14 @@ mod tests {
         for index in 0..5 {
             gpu_level.set_selected(index);
             gpu_dumps.set_active(index % 2 == 0);
+            flush_line.set_active(index % 2 == 0);
+            censor_username.set_active(index % 2 != 0);
             (page.apply)();
             let values = common::settings::values();
             assert_eq!(*values.gpu_log_level.get_value() as u32, index);
             assert_eq!(*values.gpu_log_shader_dumps.get_value(), index % 2 == 0);
+            assert_eq!(*values.log_flush_line.get_value(), index % 2 == 0);
+            assert_eq!(*values.censor_username.get_value(), index % 2 != 0);
         }
         log::info!("after_apply_visible");
         common::logging::backend::stop();

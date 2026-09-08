@@ -504,7 +504,7 @@ impl<'a> PatchManager<'a> {
                         let this_build_id: String = compiler
                             .get_build_id()
                             .iter()
-                            .map(|b| format!("{:02x}", b))
+                            .map(|b| format!("{:02X}", b))
                             .collect();
                         let this_build_id = format!("{:0<64}", this_build_id);
                         if nso_build_id == this_build_id {
@@ -545,7 +545,7 @@ impl<'a> PatchManager<'a> {
         let build_id_raw: String = header
             .build_id
             .iter()
-            .map(|b| format!("{:02x}", b))
+            .map(|b| format!("{:02X}", b))
             .collect();
         let build_id = build_id_raw.trim_end_matches('0').to_string();
 
@@ -649,7 +649,7 @@ impl<'a> PatchManager<'a> {
     /// Check if PatchNSO would have any effect given the NSO's build ID.
     /// Corresponds to upstream `PatchManager::HasNSOPatch`.
     pub fn has_nso_patch(&self, build_id: &BuildId, name: &str) -> bool {
-        let build_id_raw: String = build_id.iter().map(|b| format!("{:02x}", b)).collect();
+        let build_id_raw: String = build_id.iter().map(|b| format!("{:02X}", b)).collect();
         let build_id_str = build_id_raw.trim_end_matches('0').to_string();
 
         log::info!(
@@ -1336,6 +1336,61 @@ mod tests {
         fn supports_origin_tracking(&self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn nso_patch_build_ids_use_upstream_uppercase() {
+        const CHILD: &str = "RUZU_TEST_NSO_PATCH_BUILD_IDS";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        common::settings::values_mut().dump_nso.set_value(false);
+        let directory = |name: &str, files: Vec<VirtualFile>, dirs: Vec<VirtualDir>| -> VirtualDir {
+            Arc::new(VectorVfsDirectory::new(files, dirs, name.into(), None))
+        };
+        let ips: VirtualFile = Arc::new(VectorVfsFile::new(
+            b"PATCH\x00\x01\x00\x00\x01\xAAEOF".to_vec(),
+            "ABC.ips".into(),
+            None,
+        ));
+        let text: VirtualFile = Arc::new(VectorVfsFile::new(
+            format!("@nsobid-{:0<64}\n@enabled\n00000100 BB\n@stop\n", "ABC").into_bytes(),
+            "synthetic.pchtxt".into(),
+            None,
+        ));
+        let exefs = directory("exefs", vec![ips, text], vec![]);
+        let patch = directory("synthetic", vec![], vec![exefs]);
+        let load = directory(
+            "load",
+            vec![],
+            vec![directory("000000000000002A", vec![], vec![patch.clone()])],
+        );
+        let mut controller = FileSystemController::new();
+        controller.set_bis_factory(super::super::bis_factory::BisFactory::new(
+            directory("nand", vec![], vec![]),
+            load,
+            directory("dump", vec![], vec![]),
+        ));
+        let provider = RecordingContentProvider {
+            control_requests: Mutex::new(Vec::new()),
+        };
+        let manager = PatchManager::new(42, &controller, &provider);
+        assert_eq!(manager.collect_patches(&[patch], "ABC").len(), 2);
+        let mut build_id = [0; 32];
+        build_id[..2].copy_from_slice(&[0xAB, 0xC0]);
+        assert!(manager.has_nso_patch(&build_id, "main"));
+        let mut nso = vec![0; 0x101];
+        nso[..4].copy_from_slice(b"NSO0");
+        let offset = std::mem::offset_of!(crate::loader::nso::NsoHeader, build_id);
+        nso[offset..offset + 32].copy_from_slice(&build_id);
+        assert_eq!(manager.patch_nso(nso, "main")[0x100], 0xBB);
     }
 
     #[test]

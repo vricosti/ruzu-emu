@@ -26,6 +26,12 @@ pub struct Record {
 /// normal backend mode list. This preserves the upstream owner and data shape
 /// while still exposing the physical device names in Properties.
 pub fn populate_records(records: &mut Vec<Record>) {
+    // Eden skips PopulateRecords after a crashed startup probe. Ruzu requests
+    // the records lazily from Graphics instead of in the main-window ctor.
+    if crate::uisettings::with(|values| values.has_broken_vulkan) {
+        records.clear();
+        return;
+    }
     if let Err(error) = try_populate_records(records) {
         log::error!("Failed to enumerate Vulkan devices: {error}");
     }

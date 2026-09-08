@@ -43,6 +43,7 @@ mod render_window_windows;
 #[cfg(target_os = "linux")]
 mod render_window_x11;
 mod status_bar;
+mod startup_checks;
 mod uisettings;
 mod user_data_migration;
 mod util;
@@ -190,6 +191,9 @@ fn configure_linux_gdk_backend() -> bool {
 }
 
 fn main() -> glib::ExitCode {
+    if startup_checks::check_env_vars() {
+        return glib::ExitCode::SUCCESS;
+    }
     // Homebrew's GTK runtime uses installation-prefix paths. A distributable
     // app supplies equivalent resources inside Contents/Resources instead.
     #[cfg(target_os = "macos")]
@@ -210,6 +214,13 @@ fn main() -> glib::ExitCode {
     let forced_x11 = configure_linux_gdk_backend();
 
     configuration::qt_config::reload_all_values();
+    // Read the persisted setting before probing. The child exits above without
+    // reading configuration, starting logging, or initializing GTK.
+    let perform_vulkan_check = *common::settings::values().perform_vulkan_check.get_value();
+    match startup_checks::startup_checks(perform_vulkan_check) {
+        Ok(broken) => uisettings::with_mut(|values| values.has_broken_vulkan = broken),
+        Err(error) => eprintln!("Could not run Vulkan startup check: {error}"),
+    }
     let log_filter = common::settings::values().log_filter.get_value().clone();
     common::logging::backend::initialize_with_config(
         Some(common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::LogDir)),

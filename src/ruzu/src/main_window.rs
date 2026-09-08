@@ -1155,6 +1155,16 @@ impl GMainWindow {
     }
 
     fn new_with_config_import_offer(app: &Application, offer_config_import: bool) -> Rc<Self> {
+        if crate::uisettings::with(|values| values.has_broken_vulkan) {
+            // Upstream selects OpenGL when built with it, otherwise Null.
+            // The Apple Silicon frontend deliberately does not support OpenGL.
+            let fallback = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                common::settings_enums::RendererBackend::Null
+            } else {
+                common::settings_enums::RendererBackend::OpenGlGlsl
+            };
+            common::settings::values_mut().renderer_backend.set_value(fallback);
+        }
         let idle_title = idle_window_title();
         let window = ApplicationWindow::builder()
             .application(app)
@@ -2232,6 +2242,25 @@ impl GMainWindow {
 
     /// Run the checks that upstream performs after presenting the main window.
     fn run_startup_checks(self: &Rc<Self>, offer_config_import: bool) {
+        if crate::uisettings::with(|values| values.has_broken_vulkan) {
+            crate::gtk_compat::show_message_then(
+                Some(&self.window),
+                "Broken Vulkan Installation Detected",
+                "Vulkan initialization failed during boot.",
+                glib::clone!(
+                    #[weak(rename_to = this)]
+                    self,
+                    move || this.run_content_startup_checks(offer_config_import)
+                ),
+            );
+            return;
+        }
+        self.run_content_startup_checks(offer_config_import);
+    }
+
+    // Continue after GTK's asynchronous Vulkan warning is acknowledged; unlike
+    // Qt's blocking warning, the callback must own this sequencing explicitly.
+    fn run_content_startup_checks(self: &Rc<Self>, offer_config_import: bool) {
         if offer_config_import && self.maybe_offer_user_data_migration() {
             return;
         }

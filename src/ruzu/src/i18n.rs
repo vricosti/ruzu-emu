@@ -504,6 +504,8 @@ mod tests {
         let _guard = test_lock();
         set_language("fr");
         for source in [
+            "Broken Vulkan Installation Detected",
+            "Vulkan initialization failed during boot.",
             "User Data Migration",
             "Ruzu found data from another emulator. Choose the source, the data, and how Ruzu should use it.",
             "Source data is never moved or deleted. Copy is the recommended default; shared links make both emulators use the same directories. Shader caches are never migrated.",

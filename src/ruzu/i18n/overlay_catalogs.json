@@ -9,6 +9,8 @@
     "Closing software...": "Cerrando el programa..."
   },
   "fr": {
+    "Broken Vulkan Installation Detected": "Installation Vulkan défectueuse détectée",
+    "Vulkan initialization failed during boot.": "L’initialisation de Vulkan a échoué au démarrage.",
     "Profile Selector": "Sélection du profil",
     "Select a user:": "Sélectionnez un utilisateur :",
     "Decryption Keys (*.keys, *.zip)": "Clés de déchiffrement (*.keys, *.zip)",

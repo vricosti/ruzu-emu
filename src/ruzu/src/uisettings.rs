@@ -135,6 +135,8 @@ impl GameDir {
 /// Frontend settings container — upstream `UISettings::Values`.
 #[derive(Clone)]
 pub struct Values {
+    /// Process-local startup probe result; never saved to configuration.
+    pub has_broken_vulkan: bool,
     /// Configured game directories — upstream `UISettings::values.game_dirs`.
     /// Not a `Setting<T>`: upstream stores it as a plain `QVector<GameDir>`
     /// serialized through `QSettings::beginWriteArray`, not through the
@@ -215,6 +217,7 @@ impl Default for Values {
         use Category::*;
 
         Self {
+            has_broken_vulkan: false,
             game_dirs: Vec::new(),
             favorited_ids: Vec::new(),
             shortcuts: default_shortcuts(),

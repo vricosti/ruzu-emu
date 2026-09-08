@@ -177,7 +177,9 @@ impl StatusBar {
     /// `renderer_status_button` in `BootGame`/`OnEmulationStopped`.
     pub fn set_emulation_running(&self, running: bool) {
         self.emulation_running.set(running);
-        self.renderer.set_sensitive(!running);
+        self.renderer.set_sensitive(
+            !running && !crate::uisettings::with(|values| values.has_broken_vulkan),
+        );
     }
 
     /// GTK counterpart of `Qt::CustomContextMenu` on each status button.
@@ -246,6 +248,9 @@ impl StatusBar {
     }
 
     fn renderer_context_actions(&self) -> Vec<StatusMenuAction> {
+        if crate::uisettings::with(|values| values.has_broken_vulkan) {
+            return Vec::new();
+        }
         renderer_context_choices(self.emulation_running.get())
             .into_iter()
             .map(|(backend, label)| {
@@ -351,6 +356,9 @@ impl StatusBar {
 
     /// Upstream `GMainWindow::OnToggleGraphicsAPI`.
     fn on_toggle_graphics_api(&self) {
+        if crate::uisettings::with(|values| values.has_broken_vulkan) {
+            return;
+        }
         let mut values = settings::values_mut();
         let api = next_graphics_api(*values.renderer_backend.get_value());
         values.renderer_backend.set_value(api);
@@ -432,6 +440,10 @@ impl StatusBar {
             RendererBackend::Null => "NULL".to_string(),
         };
         self.renderer.set_label(&renderer);
+        self.renderer.set_sensitive(
+            !self.emulation_running.get()
+                && !crate::uisettings::with(|values| values.has_broken_vulkan),
+        );
         // `renderer_status_button->setChecked(api == Vulkan)` — checked renders
         // orange, unchecked blue. Metal follows the accelerated native API
         // presentation rather than the OpenGL presentation.
@@ -772,6 +784,51 @@ fn install_css() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display and isolated process for startup probe state"]
+    fn crashed_vulkan_probe_locks_frontend_selectors_until_restart() {
+        gtk::init().expect("GTK display required");
+        crate::uisettings::with_mut(|values| values.has_broken_vulkan = true);
+        settings::set_configuring_global(true);
+        settings::values_mut().renderer_backend.set_value(RendererBackend::Vulkan);
+        let bar = StatusBar::new();
+        assert!(!bar.renderer.is_sensitive());
+        assert!(bar.renderer_context_actions().is_empty());
+        bar.on_toggle_graphics_api();
+        assert_eq!(
+            *settings::values().renderer_backend.get_value(),
+            RendererBackend::Vulkan,
+        );
+        for running in [true, false] {
+            bar.set_emulation_running(running);
+            bar.refresh();
+            assert!(!bar.renderer.is_sensitive());
+        }
+        let page = crate::configuration::configure_graphics::page(|| (), true);
+        fn first_dropdown(widget: &gtk::Widget) -> Option<gtk::DropDown> {
+            if let Ok(dropdown) = widget.clone().downcast::<gtk::DropDown>() {
+                return Some(dropdown);
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(dropdown) = first_dropdown(&widget) {
+                    return Some(dropdown);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        let backend = first_dropdown(&page.widget).expect("Graphics API dropdown");
+        assert!(!backend.is_sensitive());
+        // Even programmatic selection cannot publish Vulkan after a bad probe.
+        backend.set_selected(0);
+        (page.apply)();
+        assert_ne!(
+            *settings::values().renderer_backend.get_value(),
+            RendererBackend::Vulkan,
+        );
+    }
 
     #[test]
     fn graphics_api_toggle_matches_upstream_switch() {

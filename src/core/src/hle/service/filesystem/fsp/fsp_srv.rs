@@ -210,6 +210,11 @@ impl FspSrv {
             romfs_controller: std::sync::Mutex::new(None),
             handlers: build_handler_map(&[
                 (
+                    23,
+                    Some(Self::create_save_data_file_system_by_system_save_data_id_handler),
+                    "CreateSaveDataFileSystemBySystemSaveDataId",
+                ),
+                (
                     1,
                     Some(Self::set_current_process_handler),
                     "SetCurrentProcess",
@@ -411,6 +416,60 @@ impl FspSrv {
             101 => Some(SaveDataSpaceId::SafeMode),
             _ => None,
         }
+    }
+
+    fn create_save_data_file_system_by_system_save_data_id_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        use crate::file_sys::fs_save_data_types::{SaveDataRank, SaveDataType};
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let words = RequestParser::new(ctx).pop_raw::<[u32; 16]>();
+        // Decode enum bytes before constructing Rust enums: arbitrary IPC bytes
+        // cannot safely be copied into a Rust enum. CreationInfo follows this
+        // attribute but is unused by upstream's implementation of command 23.
+        let save_type = match words[8] as u8 {
+            0 => Some(SaveDataType::System),
+            1 => Some(SaveDataType::Account),
+            2 => Some(SaveDataType::Bcat),
+            3 => Some(SaveDataType::Device),
+            4 => Some(SaveDataType::Temporary),
+            5 => Some(SaveDataType::Cache),
+            6 => Some(SaveDataType::SystemBcat),
+            _ => None,
+        };
+        let rank = match (words[8] >> 8) as u8 {
+            0 => Some(SaveDataRank::Primary),
+            1 => Some(SaveDataRank::Secondary),
+            _ => None,
+        };
+        let mut result = ResultCode::new(RESULT_TARGET_NOT_FOUND.raw());
+        if let (Some(save_type), Some(rank)) = (save_type, rank) {
+            let attribute = SaveDataAttribute::make(
+                words[0] as u64 | ((words[1] as u64) << 32),
+                save_type,
+                [
+                    words[2] as u64 | ((words[3] as u64) << 32),
+                    words[4] as u64 | ((words[5] as u64) << 32),
+                ],
+                words[6] as u64 | ((words[7] as u64) << 32),
+                (words[8] >> 16) as u16,
+                rank,
+            );
+            let created = service
+                .save_data_controller
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|controller| {
+                    controller.create_save_data(SaveDataSpaceId::System, &attribute)
+                });
+            if created.is_some() {
+                result = RESULT_SUCCESS;
+            }
+        }
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
     }
 
     fn open_save_data_file_system_handler(
@@ -850,6 +909,58 @@ impl ServiceFramework for FspSrv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_system_save_creates_a_reopenable_directory() {
+        use crate::file_sys::fs_filesystem::OpenMode;
+        use crate::file_sys::fs_save_data_types::{SaveDataRank, SaveDataType};
+        use crate::file_sys::savedata_factory::SaveDataFactory;
+        use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
+        use crate::hle::service::filesystem::save_data_controller::SaveDataController;
+        let path = std::env::temp_dir().join(format!(
+            "ruzu-system-save-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let root = RealVfsFilesystem::new()
+            .arc_open_directory(&path.to_string_lossy(), OpenMode::READ_WRITE)
+            .unwrap();
+        let factory = Arc::new(StdMutex::new(SaveDataFactory::new(42, root)));
+        factory.lock().unwrap().set_auto_create(false);
+        let controller = SaveDataController::with_factory(factory);
+        let attribute = SaveDataAttribute::make(
+            0,
+            SaveDataType::System,
+            [0, 0],
+            0x8000000000000042,
+            0,
+            SaveDataRank::Primary,
+        );
+        assert!(controller
+            .open_save_data(SaveDataSpaceId::System, &attribute)
+            .is_none());
+        let service = FspSrv::new();
+        *service.save_data_controller.lock().unwrap() = Some(controller.clone());
+        let mut ctx = HLERequestContext::new();
+        // Input attribute begins after the command's u64 ID; creation info is zero.
+        ctx.command_buffer_mut()[8] = 0x42;
+        ctx.command_buffer_mut()[9] = 0x80000000;
+        service.handlers[&23].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], RESULT_SUCCESS.get_inner_value());
+        assert!(controller
+            .open_save_data(SaveDataSpaceId::System, &attribute)
+            .is_some());
+        assert!(controller
+            .open_save_data(SaveDataSpaceId::User, &attribute)
+            .is_none());
+        drop(service);
+        drop(controller);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn missing_data_storage_returns_unknown_like_upstream() {

@@ -14,6 +14,7 @@ use super::bcat_types::*;
 use super::delivery_cache_progress_service::IDeliveryCacheProgressService;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for IBcatService
@@ -129,7 +130,7 @@ impl IBcatService {
             ),
             (
                 commands::REGISTER_SYSTEM_APPLICATION_DELIVERY_TASKS,
-                None,
+                Some(Self::register_system_application_delivery_tasks_handler),
                 "RegisterSystemApplicationDeliveryTasks",
             ),
             (
@@ -247,6 +248,16 @@ impl IBcatService {
         RESULT_SUCCESS
     }
 
+    fn register_system_application_delivery_tasks_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let result = service.register_system_application_delivery_tasks();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(result);
+    }
+
     pub fn register_system_application_delivery_tasks(&self) -> ResultCode {
         log::warn!("(STUBBED) IBcatService::register_system_application_delivery_tasks called");
         RESULT_SUCCESS
@@ -273,6 +284,25 @@ impl IBcatService {
 
     pub fn get_progress_backend_mut(&mut self, sync_type: SyncType) -> &mut ProgressServiceBackend {
         &mut self.progress[sync_type as usize]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registration_command_returns_success_without_output_objects() {
+        let service = IBcatService::new(Arc::new(Mutex::new(
+            super::super::backend::NullBcatBackend::new(),
+        )));
+        let mut ctx = HLERequestContext::new();
+        let command = commands::REGISTER_SYSTEM_APPLICATION_DELIVERY_TASKS;
+        service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], RESULT_SUCCESS.get_inner_value());
+        assert!(ctx.outgoing_copy_objects.is_empty());
+        assert!(service.handlers[&commands::REGISTER_BACKGROUND_DELIVERY_TASK]
+            .handler_callback.is_none());
     }
 }
 

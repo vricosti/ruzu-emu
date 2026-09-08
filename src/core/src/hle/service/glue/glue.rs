@@ -58,9 +58,12 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         let factory: SessionRequestHandlerFactory = Box::new(|| Arc::new(EctxAW::new()));
         server_manager.register_named_service("ectx:aw", factory, 64);
 
-        // Notification Services — stub
-        register_stub(&mut server_manager, "notif:a");
-        register_stub(&mut server_manager, "notif:s");
+        use super::notif::{INotificationServices, INotificationServicesForApplication};
+        // Upstream owns one alarm store per named service, not per session.
+        let application = Arc::new(INotificationServicesForApplication::new());
+        let system_notifications = Arc::new(INotificationServices::new());
+        server_manager.register_named_service("notif:a", Box::new(move || application.clone()), 64);
+        server_manager.register_named_service("notif:s", Box::new(move || system_notifications.clone()), 64);
     }
 
     // Create the Glue::Time::TimeManager, matching upstream constructor.

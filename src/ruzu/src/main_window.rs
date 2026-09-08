@@ -6373,22 +6373,27 @@ const MENU_UI: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
             </item>
           </section>
         </submenu>
-        <item>
-          <attribute name="label" translatable="yes">_Home Menu</attribute>
-          <attribute name="action">app.load_home_menu</attribute>
-        </item>
-        <item>
-          <attribute name="label" translatable="yes">Open _Album</attribute>
-          <attribute name="action">app.load_album</attribute>
-        </item>
-        <item>
-          <attribute name="label" translatable="yes">Open _Mii Editor</attribute>
-          <attribute name="action">app.load_mii_edit</attribute>
-        </item>
-        <item>
-          <attribute name="label" translatable="yes">Open _Controller Menu</attribute>
-          <attribute name="action">app.open_controller_menu</attribute>
-        </item>
+        <submenu>
+          <attribute name="label" translatable="yes">Launch _Applet</attribute>
+          <section>
+            <item>
+              <attribute name="label" translatable="yes">_Home Menu</attribute>
+              <attribute name="action">app.load_home_menu</attribute>
+            </item>
+            <item>
+              <attribute name="label" translatable="yes">Open _Mii Editor</attribute>
+              <attribute name="action">app.load_mii_edit</attribute>
+            </item>
+            <item>
+              <attribute name="label" translatable="yes">Open _Controller Menu</attribute>
+              <attribute name="action">app.open_controller_menu</attribute>
+            </item>
+            <item>
+              <attribute name="label" translatable="yes">Open _Album</attribute>
+              <attribute name="action">app.load_album</attribute>
+            </item>
+          </section>
+        </submenu>
       </section>
       <section>
         <item>

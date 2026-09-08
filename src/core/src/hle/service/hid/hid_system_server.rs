@@ -39,6 +39,7 @@ pub struct IHidSystemServer {
     resource_manager: Arc<parking_lot::Mutex<ResourceManager>>,
     firmware_settings: Arc<HidFirmwareSettings>,
     acquire_device_registered_event: Arc<Event>,
+    joy_detach_event: Event,
 }
 
 impl IHidSystemServer {
@@ -1025,15 +1026,19 @@ impl IHidSystemServer {
 
     /// Upstream: IHidSystemServer::AcquireJoyDetachOnBluetoothOffEventHandle (cmd 751)
     fn acquire_joy_detach_on_bluetooth_off_event_handle_handler(
-        _this: &dyn ServiceFramework,
+        this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
         log::info!("(STUBBED) AcquireJoyDetachOnBluetoothOffEventHandle called");
 
-        // Upstream: rb{ctx, 2, 1} + PushCopyObjects(event). Stubbed with handle=0.
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let Some(id) = service.joy_detach_event.copy_object_id(ctx) else {
+            ResponseBuilder::new(ctx, 2, 0, 0).push_result(crate::hle::result::RESULT_UNKNOWN);
+            return;
+        };
         let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_objects(0);
+        rb.push_copy_object_id(id);
     }
 
     /// Upstream: nullptr (cmd 800)
@@ -3224,6 +3229,7 @@ impl IHidSystemServer {
             resource_manager,
             firmware_settings,
             acquire_device_registered_event: Arc::new(Event::new()),
+            joy_detach_event: Event::new(),
         }
     }
 }
@@ -3255,6 +3261,28 @@ impl ServiceFramework for IHidSystemServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joy_detach_event_returns_a_readable_object_instead_of_null() {
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use crate::hle::kernel::k_readable_event::KReadableEvent;
+        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+        use crate::hle::service::hle_ipc::KAutoObjectRef;
+        let settings = Arc::new(HidFirmwareSettings::new());
+        let hid = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        let manager = Arc::new(parking_lot::Mutex::new(ResourceManager::new(settings.clone(), hid)));
+        let service = IHidSystemServer::new(manager, settings);
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let readable = Arc::new(std::sync::Mutex::new(KReadableEvent::new()));
+        readable.lock().unwrap().initialize(1, 2);
+        service.joy_detach_event.attach_kernel_event(readable.clone(), process.clone());
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+        let mut ctx = HLERequestContext::new_with_thread(thread, 0);
+        service.handlers[&751].handler_callback.unwrap()(&service, &mut ctx);
+        assert!(matches!(ctx.outgoing_copy_objects.as_slice(), [KAutoObjectRef::ObjectId(2)]));
+        assert!(!readable.lock().unwrap().is_signaled());
+    }
 
     #[test]
     fn set_npad_system_ext_state_enabled_parameters_preserve_aruid_offset() {

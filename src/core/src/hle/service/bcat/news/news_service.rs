@@ -6,8 +6,10 @@
 
 use std::collections::BTreeMap;
 
+use super::news_storage::NewsStorage;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for INewsService
@@ -42,22 +44,46 @@ pub struct INewsService {
 impl INewsService {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (commands::POST_LOCAL_NEWS, None, "PostLocalNews"),
-            (commands::SET_PASSPHRASE, None, "SetPassphrase"),
+            (
+                commands::POST_LOCAL_NEWS,
+                Some(Self::post_local_news_handler),
+                "PostLocalNews",
+            ),
+            (
+                commands::SET_PASSPHRASE,
+                Some(Self::set_passphrase_handler),
+                "SetPassphrase",
+            ),
             (
                 commands::GET_SUBSCRIPTION_STATUS,
-                None,
+                Some(Self::get_subscription_status_handler),
                 "GetSubscriptionStatus",
             ),
-            (commands::GET_TOPIC_LIST, None, "GetTopicList"),
-            (commands::UNKNOWN_30110, None, "Unknown30110"),
+            (
+                commands::GET_TOPIC_LIST,
+                Some(Self::get_topic_list_handler),
+                "GetTopicList",
+            ),
+            (
+                commands::UNKNOWN_30110,
+                Some(Self::get_topic_list_handler),
+                "Unknown30110",
+            ),
             (
                 commands::IS_SYSTEM_UPDATE_REQUIRED,
-                None,
+                Some(Self::is_system_update_required_handler),
                 "IsSystemUpdateRequired",
             ),
-            (commands::UNKNOWN_30201, None, "Unknown30201"),
-            (commands::UNKNOWN_30210, None, "Unknown30210"),
+            (
+                commands::UNKNOWN_30201,
+                Some(Self::is_system_update_required_handler),
+                "Unknown30201",
+            ),
+            (
+                commands::UNKNOWN_30210,
+                Some(Self::is_system_update_required_handler),
+                "Unknown30210",
+            ),
             (
                 commands::REQUEST_IMMEDIATE_RECEPTION,
                 None,
@@ -75,18 +101,22 @@ impl INewsService {
             ),
             (
                 commands::REQUEST_AUTO_SUBSCRIPTION,
-                None,
+                Some(Self::request_auto_subscription_handler),
                 "RequestAutoSubscription",
             ),
-            (commands::CLEAR_STORAGE, None, "ClearStorage"),
+            (
+                commands::CLEAR_STORAGE,
+                Some(Self::clear_storage_handler),
+                "ClearStorage",
+            ),
             (
                 commands::CLEAR_SUBSCRIPTION_STATUS_ALL,
-                None,
+                Some(Self::clear_subscription_status_all_handler),
                 "ClearSubscriptionStatusAll",
             ),
             (
                 commands::GET_NEWS_DATABASE_DUMP,
-                None,
+                Some(Self::get_news_database_dump_handler),
                 "GetNewsDatabaseDump",
             ),
         ]);
@@ -95,6 +125,93 @@ impl INewsService {
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    pub fn get_topic_list(&self, topics: &mut [u8]) -> i32 {
+        if topics.len() < 32 {
+            return 0;
+        }
+        topics.fill(0);
+        0
+    }
+    fn post_local_news_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let _ = service;
+        let data = ctx.read_buffer(0);
+        log::warn!("(STUBBED) PostLocalNews size={}", data.len());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+    fn set_passphrase_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let _ = service;
+        let data = ctx.read_buffer_x(0);
+        log::warn!("(STUBBED) SetPassphrase size={}", data.len());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+    fn get_subscription_status_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let _ = service;
+        let data = ctx.read_buffer_x(0);
+        let (_, value) = service.get_subscription_status(&data);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(value);
+    }
+    fn get_topic_list_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let _ = service;
+        let _filter = RequestParser::new(ctx).pop_u32() as i32;
+        // Authorized offline provider: no fabricated Eden topic or remote feed.
+        let mut topics = vec![0; ctx.get_write_buffer_size(0)];
+        let value = service.get_topic_list(&mut topics);
+        if topics.len() >= 32 {
+            ctx.write_buffer(&topics, 0);
+        }
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(value as u32);
+    }
+    fn is_system_update_required_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let _ = service;
+        let (_, value) = service.is_system_update_required();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(value);
+    }
+    fn request_auto_subscription_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let _ = service;
+        let value = RequestParser::new(ctx).pop_u64();
+        service.request_auto_subscription(value);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+    fn clear_storage_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let _ = service;
+        NewsStorage::instance().lock().unwrap().clear();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+    fn clear_subscription_status_all_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let _ = service;
+        log::warn!("(STUBBED) ClearSubscriptionStatusAll");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+    fn get_news_database_dump_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let _ = service;
+        log::warn!("(STUBBED) GetNewsDatabaseDump");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     pub fn get_subscription_status(&self, _buffer_data: &[u8]) -> (ResultCode, u32) {

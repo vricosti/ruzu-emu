@@ -23,6 +23,7 @@ mod configuration;
 mod emu_window;
 mod file_menu;
 mod game_list;
+mod gamemode;
 mod gtk_compat;
 #[cfg(target_os = "linux")]
 mod gui_settings;

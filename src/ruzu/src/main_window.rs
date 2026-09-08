@@ -3385,6 +3385,10 @@ impl GMainWindow {
             game_list.set_filter_visible(crate::uisettings::with(|v| *v.show_filter_bar.get_value()));
             game_list.reload();
         }
+        crate::gamemode::stop();
+        if self.session.borrow().as_ref().is_some_and(|session| !session.is_paused()) {
+            crate::gamemode::start();
+        }
         Ok(())
     }
 
@@ -3903,6 +3907,7 @@ impl GMainWindow {
         // Stop any existing session first (upstream stops before re-booting).
         self.play_time_manager.stop();
         if let Some(mut session) = self.session.borrow_mut().take() {
+            crate::gamemode::stop();
             session.stop();
         }
         if let Some(tas) = self.input_subsystem.borrow().get_tas() {
@@ -3986,6 +3991,7 @@ impl GMainWindow {
                 Some(LoadingEvent::Started { program_id }) => {
                     this.play_time_manager.set_program_id(program_id);
                     this.play_time_manager.start();
+                    crate::gamemode::start();
                 }
                 Some(LoadingEvent::FirstFrame) => {
                     let stack = stack.clone();
@@ -4091,6 +4097,7 @@ impl GMainWindow {
         // Stop any existing session first (upstream stops before re-booting).
         self.play_time_manager.stop();
         if let Some(mut session) = self.session.borrow_mut().take() {
+            crate::gamemode::stop();
             session.stop();
         }
         if let Some(tas) = self.input_subsystem.borrow().get_tas() {
@@ -4181,6 +4188,7 @@ impl GMainWindow {
                 Some(LoadingEvent::Started { program_id }) => {
                     this.play_time_manager.set_program_id(program_id);
                     this.play_time_manager.start();
+                    crate::gamemode::start();
                 }
                 Some(LoadingEvent::FirstFrame) => {
                     let stack = stack.clone();
@@ -4284,6 +4292,7 @@ impl GMainWindow {
         // next one. Stop the session first so Vulkan no longer owns its HWND.
         self.play_time_manager.stop();
         if let Some(mut session) = self.session.borrow_mut().take() {
+            crate::gamemode::stop();
             session.stop();
         }
         if let Some(tas) = self.input_subsystem.borrow().get_tas() {
@@ -4364,6 +4373,7 @@ impl GMainWindow {
                 Some(LoadingEvent::Started { program_id }) => {
                     this.play_time_manager.set_program_id(program_id);
                     this.play_time_manager.start();
+                    crate::gamemode::start();
                 }
                 Some(LoadingEvent::FirstFrame) => {
                     let stack = stack.clone();
@@ -4622,6 +4632,7 @@ impl GMainWindow {
             return;
         }
         self.start_play_time_for_session();
+        crate::gamemode::start();
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, false);
         }
@@ -4641,6 +4652,7 @@ impl GMainWindow {
             return;
         }
         self.play_time_manager.stop();
+        crate::gamemode::stop();
         if let Some(app) = self.window.application() {
             update_menu_state(&app, true, true);
         }
@@ -4787,6 +4799,7 @@ impl GMainWindow {
     /// thread requests guest exit, applies the upstream timeout, and reports
     /// `StopComplete` after forced teardown if necessary.
     fn begin_stop_game(self: &Rc<Self>) -> bool {
+        crate::gamemode::stop();
         self.play_time_manager.stop();
         let requested = self
             .session
@@ -4827,6 +4840,7 @@ impl GMainWindow {
     /// before releasing the native render target, clear the loading assets,
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        crate::gamemode::stop();
         self.auto_paused.set(false);
         if self.auto_muted.replace(false) {
             common::settings::values_mut().audio_muted.set_value(false);

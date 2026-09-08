@@ -222,7 +222,7 @@ impl TimeZoneService {
             return rc;
         }
         let time_point =
-            match steady_clock_core::get_current_time_point(&time.standard_steady_clock) {
+            match steady_clock_core::get_current_time_point(&*time.standard_steady_clock.lock().unwrap()) {
                 Ok(time_point) => time_point,
                 Err(rc) => return rc,
             };

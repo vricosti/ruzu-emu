@@ -23,7 +23,6 @@ use crate::hle::service::psc::time::common::{
 use crate::hle::service::psc::time::r#static::StaticService;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
-use super::clocks::steady_clock_core::SteadyClockCoreImpl;
 use super::manager::TimeManager;
 
 /// PSC::Time::ServiceManager — handles clock core setup.
@@ -269,23 +268,30 @@ impl TimeServiceManager {
         test_offset: i64,
     ) -> ResultCode {
         let mut time = self.time.lock().unwrap();
-        time.standard_steady_clock.initialize(
+        time.standard_steady_clock.lock().unwrap().initialize(
             clock_source_id,
             rtc_offset,
             internal_offset,
             test_offset,
             is_rtc_reset_detected,
         );
-        *time.steady_clock_source_id.lock().unwrap() = clock_source_id;
         time.alarms.set_steady_clock_initialized(true);
 
-        let raw_time = time.standard_steady_clock.get_current_raw_time_point_impl();
+        let raw_time = super::clocks::steady_clock_core::get_raw_time(
+            &*time.standard_steady_clock.lock().unwrap(),
+        );
         let boot_time = raw_time - (self.get_time_ns)();
         time.shared_memory
             .set_steady_clock_time_point(clock_source_id, boot_time);
         time.standard_steady_clock
+            .lock()
+            .unwrap()
             .set_continuous_adjustment(clock_source_id, boot_time);
-        let time_point = time.standard_steady_clock.get_continuous_adjustment();
+        let time_point = time
+            .standard_steady_clock
+            .lock()
+            .unwrap()
+            .get_continuous_adjustment();
         time.shared_memory.set_continuous_adjustment(&time_point);
         RESULT_SUCCESS
     }
@@ -426,13 +432,24 @@ impl TimeServiceManager {
 
     pub fn set_standard_steady_clock_base_time(&self, base_time: i64) -> ResultCode {
         let mut time = self.time.lock().unwrap();
-        time.standard_steady_clock.set_rtc_offset(base_time);
-        let raw_time = time.standard_steady_clock.get_current_raw_time_point_impl();
+        time.standard_steady_clock
+            .lock()
+            .unwrap()
+            .set_rtc_offset(base_time);
+        let raw_time = super::clocks::steady_clock_core::get_raw_time(
+            &*time.standard_steady_clock.lock().unwrap(),
+        );
         let diff = raw_time - (self.get_time_ns)();
         time.shared_memory.update_base_time(diff);
         time.standard_steady_clock
+            .lock()
+            .unwrap()
             .update_continuous_adjustment_time(diff);
-        let time_point = time.standard_steady_clock.get_continuous_adjustment();
+        let time_point = time
+            .standard_steady_clock
+            .lock()
+            .unwrap()
+            .get_continuous_adjustment();
         time.shared_memory.set_continuous_adjustment(&time_point);
         RESULT_SUCCESS
     }
@@ -826,6 +843,49 @@ impl ServiceFramework for TimeServiceManager {
 mod tests {
     use super::*;
     use crate::hle::service::service::ServiceFramework;
+
+    #[test]
+    fn shared_memory_and_system_clock_apply_rtc_base_once() {
+        let service =
+            TimeServiceManager::new(SystemRef::null(), std::ptr::null(), std::ptr::null_mut());
+        let epoch_seconds = 1_700_000_000i64;
+        assert_eq!(
+            service.setup_standard_steady_clock_core(
+                false,
+                [0x42; 16],
+                epoch_seconds * 1_000_000_000,
+                2_000_000_000,
+                3_000_000_000
+            ),
+            RESULT_SUCCESS
+        );
+        assert_eq!(
+            service.setup_standard_local_system_clock_core(
+                &SystemClockContext::default(),
+                epoch_seconds
+            ),
+            RESULT_SUCCESS
+        );
+        let shared = service.shared_time();
+        let time = shared.lock().unwrap();
+        let context = time.shared_memory.get_local_system_context();
+        let steady = time.shared_memory.get_steady_clock_time_point();
+        // Guest shared-memory fast path: the published base is in nanoseconds,
+        // whereas SystemClockContext::offset is in seconds.
+        let guest_time = context.offset + steady.time_point / 1_000_000_000;
+        let ipc_time = time
+            .standard_local_system_clock
+            .clock
+            .get_current_time()
+            .unwrap();
+        assert_eq!(guest_time, epoch_seconds);
+        assert_eq!(ipc_time, guest_time);
+        assert_eq!(context.offset, -5);
+        assert_eq!(
+            context.steady_time_point.clock_source_id,
+            steady.clock_source_id
+        );
+    }
 
     #[test]
     fn setup_standard_local_system_clock_core_writes_context_derived_from_current_steady_clock() {

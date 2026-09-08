@@ -62,13 +62,16 @@ impl SteadyClockBackend for TimeManagerSteadyClockBackend {
             .lock()
             .unwrap()
             .standard_steady_clock
+            .lock()
+            .unwrap()
             .state
             .is_initialized()
     }
 
     fn get_current_time_point(&self) -> Result<SteadyClockTimePoint, ResultCode> {
         let time = self.time_manager.lock().unwrap();
-        steady_clock_core::get_current_time_point(&time.standard_steady_clock)
+        let clock = time.standard_steady_clock.lock().unwrap();
+        steady_clock_core::get_current_time_point(&*clock)
     }
 
     fn get_test_offset(&self) -> i64 {
@@ -76,6 +79,8 @@ impl SteadyClockBackend for TimeManagerSteadyClockBackend {
             .lock()
             .unwrap()
             .standard_steady_clock
+            .lock()
+            .unwrap()
             .get_test_offset_impl()
     }
 
@@ -84,6 +89,8 @@ impl SteadyClockBackend for TimeManagerSteadyClockBackend {
             .lock()
             .unwrap()
             .standard_steady_clock
+            .lock()
+            .unwrap()
             .set_test_offset_impl(offset);
     }
 
@@ -92,6 +99,8 @@ impl SteadyClockBackend for TimeManagerSteadyClockBackend {
             .lock()
             .unwrap()
             .standard_steady_clock
+            .lock()
+            .unwrap()
             .get_rtc_value_impl()
     }
 
@@ -100,6 +109,8 @@ impl SteadyClockBackend for TimeManagerSteadyClockBackend {
             .lock()
             .unwrap()
             .standard_steady_clock
+            .lock()
+            .unwrap()
             .state
             .is_reset_detected()
     }
@@ -109,6 +120,8 @@ impl SteadyClockBackend for TimeManagerSteadyClockBackend {
             .lock()
             .unwrap()
             .standard_steady_clock
+            .lock()
+            .unwrap()
             .get_setup_result_value_impl()
     }
 
@@ -117,6 +130,8 @@ impl SteadyClockBackend for TimeManagerSteadyClockBackend {
             .lock()
             .unwrap()
             .standard_steady_clock
+            .lock()
+            .unwrap()
             .get_internal_offset_impl()
     }
 }

@@ -209,7 +209,10 @@ impl HIDCore {
             for callback in callbacks {
                 callback.dispatch();
             }
-            controller.lock().reload_input();
+            let callbacks = controller.lock().reload_input_deferred();
+            for callback in callbacks {
+                callback.dispatch();
+            }
         }
 
         reload(&self.player_1);

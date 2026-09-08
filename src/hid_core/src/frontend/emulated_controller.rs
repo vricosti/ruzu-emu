@@ -258,6 +258,9 @@ struct ControllerEventContext {
     is_connected: AtomicBool,
     supported_style_tag: Mutex<NpadStyleTag>,
     callback_list: Mutex<HashMap<i32, ControllerUpdateCallback>>,
+    // ForceUpdate can synchronously enter the driver callback path while the
+    // Rust controller owner is locked. Retain notifications until it is released.
+    deferred_input_callbacks: Mutex<Option<Vec<DeferredControllerCallback>>>,
 }
 
 fn trigger_on_change(
@@ -272,6 +275,16 @@ fn trigger_on_change(
         .filter(|callback| is_npad_service_update || !callback.is_npad_service)
         .map(|callback| Arc::clone(&callback.on_change))
         .collect();
+    {
+        let mut pending = context.deferred_input_callbacks.lock();
+        if let Some(pending) = pending.as_mut() {
+            pending.extend(callbacks.into_iter().map(|callback| DeferredControllerCallback {
+                callback,
+                trigger_type,
+            }));
+            return;
+        }
+    }
     for callback in callbacks {
         callback(trigger_type);
     }
@@ -1042,6 +1055,7 @@ impl EmulatedController {
                 raw: NpadStyleSet::ALL,
             }),
             callback_list: Mutex::new(HashMap::new()),
+            deferred_input_callbacks: Mutex::new(None),
         });
         Self {
             npad_id_type,
@@ -1511,6 +1525,16 @@ impl EmulatedController {
     /// into the shared status. Upstream calls `ForceUpdate()` on each device right
     /// after, so a device that already has a value reports it without waiting
     /// for the next change.
+    pub(crate) fn reload_input_deferred(&mut self) -> Vec<DeferredControllerCallback> {
+        {
+            let mut pending = self.event_context.deferred_input_callbacks.lock();
+            assert!(pending.is_none());
+            *pending = Some(Vec::new());
+        }
+        self.reload_input();
+        self.event_context.deferred_input_callbacks.lock().take().unwrap()
+    }
+
     pub fn reload_input(&mut self) {
         self.load_devices();
 
@@ -2453,6 +2477,64 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn reload_force_update_callbacks_can_reenter_controller_across_reloads() {
+        struct Factory;
+        struct Device(InputCallback);
+        impl common::input::InputDeviceFactory for Factory {
+            fn create(&self, _: &ParamPackage) -> Box<dyn InputDevice> {
+                Box::new(Device(InputCallback { on_change: None }))
+            }
+        }
+        impl InputDevice for Device {
+            fn set_callback(&mut self, callback: InputCallback) { self.0 = callback; }
+            fn trigger_on_change(&self, status: &CallbackStatus) {
+                if let Some(callback) = &self.0.on_change { callback(status); }
+            }
+            fn force_update(&mut self) {
+                if let Some(callback) = &self.0.on_change {
+                    callback(&stick_callback(0.25, 0.0));
+                }
+            }
+        }
+        const ENGINE: &str = "controller_reload_reentry_test";
+        common::input::register_input_factory(ENGINE, Arc::new(Factory));
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) { common::input::unregister_input_factory(ENGINE); }
+        }
+        let _cleanup = Cleanup;
+        let owner = Arc::new(Mutex::new(EmulatedController::new(NpadIdType::Player1)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let mut controller = owner.lock();
+            controller.stick_params[0].set_str("engine", ENGINE.to_string());
+            let weak = Arc::downgrade(&owner);
+            let calls = Arc::clone(&calls);
+            controller.set_callback(ControllerUpdateCallback {
+                on_change: Arc::new(move |_| {
+                    let owner = weak.upgrade().unwrap();
+                    let _controller = owner.try_lock().expect("callback re-entered a locked controller");
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }),
+                is_npad_service: false,
+            });
+        }
+        for _ in 0..4 {
+            let before = calls.load(Ordering::SeqCst);
+            let callbacks = owner.lock().reload_input_deferred();
+            assert_eq!(calls.load(Ordering::SeqCst), before);
+            assert!(!callbacks.is_empty(), "ForceUpdate must retain notifications");
+            for callback in callbacks { callback.dispatch(); }
+            assert!(calls.load(Ordering::SeqCst) > before);
+        }
+        // Normal driver notifications remain immediate outside a reload.
+        let context = Arc::clone(&owner.lock().event_context);
+        let before = calls.load(Ordering::SeqCst);
+        trigger_on_change(&context, ControllerTriggerType::Stick, false);
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+    }
+
+    #[test]
     fn deferred_callbacks_run_after_the_controller_owner_is_released() {
         let calls = Arc::new(AtomicUsize::new(0));
         let callback_calls = Arc::clone(&calls);
@@ -2625,6 +2707,7 @@ mod tests {
                 raw: NpadStyleSet::ALL,
             }),
             callback_list: Mutex::new(HashMap::new()),
+            deferred_input_callbacks: Mutex::new(None),
         })
     }
 

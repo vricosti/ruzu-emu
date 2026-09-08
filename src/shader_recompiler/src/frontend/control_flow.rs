@@ -776,7 +776,10 @@ pub fn build_cfg_from_env(
     base_offset: u32,
     _code_words: usize,
 ) -> Vec<CfgBlock> {
-    let cfg = FlowCfg::new(env, Location::new(base_offset), false);
+    // Vulkan/OpenGL pass index == 0 (VertexA) to upstream CFG so EXIT
+    // branches through the dispatch block before dual-vertex merging.
+    let exits_to_dispatcher = env.shader_stage() == crate::stage::Stage::VertexA;
+    let cfg = FlowCfg::new(env, Location::new(base_offset), exits_to_dispatcher);
     cfg.to_cfg_blocks(base_offset)
 }
 
@@ -1207,6 +1210,9 @@ mod tests {
     struct PretEnvironment {
         texture_pass_caches: TexturePassCaches,
         sph: ProgramHeader,
+        stage: Stage,
+        instruction: u64,
+        following_instruction: Option<u64>,
     }
 
     impl Default for PretEnvironment {
@@ -1214,6 +1220,9 @@ mod tests {
             Self {
                 texture_pass_caches: TexturePassCaches::default(),
                 sph: ProgramHeader::default(),
+                stage: Stage::Compute,
+                instruction: 0xe270_0000_0007_000f,
+                following_instruction: None,
             }
         }
     }
@@ -1223,8 +1232,12 @@ mod tests {
             &mut self.texture_pass_caches
         }
 
-        fn read_instruction(&mut self, _address: u32) -> u64 {
-            0xe270_0000_0007_000f
+        fn read_instruction(&mut self, address: u32) -> u64 {
+            if address > 8 {
+                self.following_instruction.unwrap_or(self.instruction)
+            } else {
+                self.instruction
+            }
         }
 
         fn read_cbuf_value(&mut self, _cbuf_index: u32, _cbuf_offset: u32) -> u32 {
@@ -1287,7 +1300,7 @@ mod tests {
         }
 
         fn shader_stage(&self) -> Stage {
-            Stage::Compute
+            self.stage
         }
 
         fn start_address(&self) -> u32 {
@@ -1297,6 +1310,57 @@ mod tests {
         fn is_proprietary_driver(&self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn environment_cfg_routes_vertex_a_exit_through_dispatcher() {
+        for stage in [
+            Stage::VertexA, Stage::VertexB, Stage::TessellationControl,
+            Stage::TessellationEval, Stage::Geometry, Stage::Fragment, Stage::Compute,
+        ] {
+            let mut env = PretEnvironment {
+                stage,
+                instruction: 0xe300_0000_0007_000f,
+                ..Default::default()
+            };
+            assert_eq!(
+                maxwell_opcodes::decode_opcode(env.instruction),
+                Some(MaxwellOpcode::EXIT)
+            );
+            let blocks = build_cfg_from_env(&mut env, 0, 2);
+            if stage == Stage::VertexA {
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[0].end_class, EndClass::Branch);
+                let target = blocks[0].branch_true.unwrap();
+                assert_eq!(blocks[target].end_class, EndClass::Exit);
+                assert_eq!(blocks[target].begin, blocks[target].end);
+                assert!(blocks[0].branch_false.is_none());
+            } else {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].end_class, EndClass::Exit);
+            }
+        }
+    }
+
+    #[test]
+    fn vertex_a_conditional_exits_share_the_dispatch_block() {
+        let mut env = PretEnvironment {
+            stage: Stage::VertexA,
+            instruction: 0xe300_0000_0000_000f, // EXIT P0
+            following_instruction: Some(0xe300_0000_0007_000f), // EXIT PT
+            ..Default::default()
+        };
+        let blocks = build_cfg_from_env(&mut env, 0, 3);
+        assert_eq!(blocks.len(), 3);
+        let conditional = &blocks[0];
+        assert_eq!(conditional.end_class, EndClass::Branch);
+        assert_eq!(conditional.cond.get_pred(), (IrPred::P0, false));
+        let dispatch = conditional.branch_true.unwrap();
+        let fallthrough = conditional.branch_false.unwrap();
+        assert_ne!(dispatch, fallthrough);
+        assert_eq!(blocks[fallthrough].branch_true, Some(dispatch));
+        assert_eq!(blocks[dispatch].end_class, EndClass::Exit);
+        assert_eq!(blocks[dispatch].begin, blocks[dispatch].end);
     }
 
     #[test]

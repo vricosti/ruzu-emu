@@ -409,6 +409,7 @@ mod tests {
             values.serial_unit.set_value(98765);
         }
         let locked_page = page(false);
+        assert!(!find_switch(&locked_page.widget, "Enable FS Access Log").unwrap().is_sensitive());
         assert!(!find_gpu_level(&locked_page.widget).unwrap().is_sensitive());
         assert!(!find_switch(&locked_page.widget, "Dump SPIR-V Shaders").unwrap().is_sensitive());
         let page = page(true);
@@ -417,6 +418,9 @@ mod tests {
         let flush_line = find_switch(&page.widget, "Flush log output on each line").unwrap();
         let censor_username = find_switch(&page.widget, "Censor username in logs").unwrap();
         let auto_stub = find_switch(&page.widget, "Enable Auto-Stub").unwrap();
+        let fs_access_log = find_switch(&page.widget, "Enable FS Access Log").unwrap();
+        assert!(!fs_access_log.is_active());
+        assert!(fs_access_log.is_sensitive());
         assert!(!auto_stub.is_active());
         assert!(!flush_line.is_active());
         assert!(censor_username.is_active());
@@ -454,6 +458,7 @@ mod tests {
             flush_line.set_active(index % 2 == 0);
             censor_username.set_active(index % 2 != 0);
             auto_stub.set_active(index % 2 != 0);
+            fs_access_log.set_active(index % 2 != 0);
             battery.set_text(serial_cases[index as usize].0);
             unit.set_text(serial_cases[4 - index as usize].0);
             (page.apply)();
@@ -463,6 +468,7 @@ mod tests {
             assert_eq!(*values.log_flush_line.get_value(), index % 2 == 0);
             assert_eq!(*values.censor_username.get_value(), index % 2 != 0);
             assert_eq!(*values.use_auto_stub.get_value(), index % 2 != 0);
+            assert_eq!(*values.enable_fs_access_log.get_value(), index % 2 != 0);
             assert_eq!(*values.serial_battery.get_value(), serial_cases[index as usize].1);
             assert_eq!(*values.serial_unit.get_value(), serial_cases[4 - index as usize].1);
         }

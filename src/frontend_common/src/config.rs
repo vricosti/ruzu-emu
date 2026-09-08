@@ -2264,6 +2264,11 @@ mod tests {
             let mut loaded = common::settings::Values::default();
             config.read_setting_generic(&mut loaded.use_auto_stub);
             assert_eq!(*loaded.use_auto_stub.get_value(), enabled);
+            source.enable_fs_access_log.set_value(enabled);
+            config.write_setting_generic(&mut source.enable_fs_access_log);
+            assert_eq!(config.ini["Debugging"]["enable_fs_access_log"], enabled.to_string());
+            config.read_setting_generic(&mut loaded.enable_fs_access_log);
+            assert_eq!(*loaded.enable_fs_access_log.get_value(), enabled);
 
             // These four settings deliberately have save=false upstream.
             for setting in [
@@ -2288,6 +2293,10 @@ mod tests {
         let mut values = common::settings::Values::default();
         custom.read_setting_generic(&mut values.use_auto_stub);
         assert!(!*values.use_auto_stub.get_value());
+        custom.write_raw("enable_fs_access_log", "true".into());
+        custom.write_raw("enable_fs_access_log\\default", "false".into());
+        custom.read_setting_generic(&mut values.enable_fs_access_log);
+        assert!(!*values.enable_fs_access_log.get_value());
     }
 
     #[test]

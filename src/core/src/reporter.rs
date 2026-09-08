@@ -412,7 +412,7 @@ impl Reporter {
     }
 
     /// Save a filesystem access log message.
-    pub fn save_fs_access_log(&self, log_message: &str) {
+    pub fn save_fs_access_log(&self, log_message: &[u8]) {
         let access_log_path =
             common_fs::path_util::get_ruzu_path(common_fs::path_util::RuzuPath::SDMCDir)
                 .join("FsAccessLog.txt");
@@ -422,7 +422,20 @@ impl Reporter {
             .append(true)
             .open(&access_log_path)
         {
-            let _ = file.write_all(log_message.as_bytes());
+            // Upstream string_view can contain non-UTF-8 bytes. TextFile uses
+            // the native CRT newline conversion on Windows, but none on POSIX.
+            #[cfg(windows)]
+            let text = {
+                let mut text = Vec::with_capacity(log_message.len());
+                for &byte in log_message {
+                    if byte == b'\n' { text.push(b'\r'); }
+                    text.push(byte);
+                }
+                text
+            };
+            #[cfg(windows)]
+            let log_message = text.as_slice();
+            let _ = file.write_all(log_message);
         }
     }
 

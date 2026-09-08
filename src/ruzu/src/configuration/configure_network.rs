@@ -14,7 +14,7 @@ use super::configure_dialog::Page;
 use super::shared_widget as w;
 
 /// Build the Network tab — upstream `ConfigureNetwork`.
-pub fn page() -> Page {
+pub fn page(runtime_lock: bool) -> Page {
     let (scroller, column) = w::page();
 
     let (general_group, general) = w::group("General");
@@ -42,6 +42,9 @@ pub fn page() -> Page {
     if selected.is_none() {
         interface.set_selected(gtk::INVALID_LIST_POSITION);
     }
+    // ConfigureNetwork::SetConfiguration locks only the interface selector.
+    // Airplane mode remains editable while the system is powered on.
+    interface.set_sensitive(runtime_lock);
     general.append(&interface_row);
     let airplane_mode = w::check_row(
         "Enable Airplane Mode",
@@ -86,6 +89,33 @@ fn interface_names_in_enumeration_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display; run this test alone"]
+    fn running_system_locks_interface_but_not_airplane_mode() {
+        gtk::init().expect("GTK display required");
+        fn descendants(widget: &gtk::Widget, result: &mut Vec<gtk::Widget>) {
+            result.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                descendants(&widget, result);
+            }
+        }
+        for runtime_lock in [false, true] {
+            let page = page(runtime_lock);
+            let mut widgets = Vec::new();
+            descendants(&page.widget, &mut widgets);
+            let interfaces: Vec<_> = widgets.iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::DropDown>()).collect();
+            assert_eq!(interfaces.len(), 1);
+            assert_eq!(interfaces[0].is_sensitive(), runtime_lock);
+            let toggles: Vec<_> = widgets.iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::CheckButton>()).collect();
+            assert_eq!(toggles.len(), 1);
+            assert!(toggles[0].is_sensitive());
+        }
+    }
 
     #[test]
     fn loopback_is_not_offered() {

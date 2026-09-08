@@ -290,14 +290,37 @@ pub fn get_shortcut_path(target: ShortcutTarget) -> Option<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        return match target {
-            ShortcutTarget::Desktop => std::env::var_os("USERPROFILE")
-                .map(PathBuf::from)
-                .map(|path| path.join("Desktop")),
-            ShortcutTarget::Applications => std::env::var_os("APPDATA")
-                .map(PathBuf::from)
-                .map(|path| path.join("Microsoft/Windows/Start Menu/Programs")),
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::System::Com::CoTaskMemFree;
+        use windows_sys::Win32::UI::Shell::{
+            FOLDERID_Desktop, FOLDERID_Programs, SHGetKnownFolderPath,
         };
+
+        // QStandardPaths queries the Windows shell in Eden. Do not reconstruct
+        // these paths: OneDrive and administrators can redirect either folder.
+        let folder = match target {
+            ShortcutTarget::Desktop => &FOLDERID_Desktop,
+            ShortcutTarget::Applications => &FOLDERID_Programs,
+        };
+        let mut path = std::ptr::null_mut();
+        let result = unsafe { SHGetKnownFolderPath(folder, 0, std::ptr::null_mut(), &mut path) };
+        let resolved = if result >= 0 && !path.is_null() {
+            // The successful shell result is a NUL-terminated, allocated UTF-16 string.
+            let mut length = 0;
+            unsafe {
+                while *path.add(length) != 0 {
+                    length += 1;
+                }
+                Some(PathBuf::from(std::ffi::OsString::from_wide(
+                    std::slice::from_raw_parts(path, length),
+                )))
+            }
+        } else {
+            log::error!("Cannot resolve shortcut folder: HRESULT {result:#010x}");
+            None
+        };
+        unsafe { CoTaskMemFree(path.cast()) };
+        return resolved;
     }
 
     #[allow(unreachable_code)]
@@ -311,18 +334,105 @@ fn make_shortcut_icon_path(program_id: u64, game_title: &str) -> std::io::Result
     let directory = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::IconsDir);
 
     std::fs::create_dir_all(&directory)?;
-    let name = if program_id == 0 {
-        format!("ruzu-{game_title}.png")
+    let extension = if cfg!(target_os = "windows") {
+        "ico"
     } else {
-        format!("ruzu-{program_id:016X}.png")
+        "png"
+    };
+    let name = if program_id == 0 {
+        format!("ruzu-{game_title}.{extension}")
+    } else {
+        format!("ruzu-{program_id:016X}.{extension}")
     };
     Ok(directory.join(name))
 }
 
+#[cfg(not(target_os = "windows"))]
 fn save_icon_to_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let texture = gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from(bytes))
         .map_err(|error| error.to_string())?;
     texture.save_to_png(path).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn save_icon_to_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use gtk::gdk_pixbuf::prelude::PixbufLoaderExt;
+
+    // Eden SaveIconToFile: seven uncompressed RGB32 DIB images in an ICO.
+    // Serialize fields explicitly in little endian rather than copying packed
+    // C++ structs. GdkPixbuf replaces QImage's decoding and smooth scaling.
+    const SCALE_SIZES: [u32; 7] = [256, 128, 64, 48, 32, 24, 16];
+    const BYTES_PER_PIXEL: u32 = 4;
+    let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+    loader.write(bytes).map_err(|error| error.to_string())?;
+    loader.close().map_err(|error| error.to_string())?;
+    let source = loader.pixbuf().ok_or("Cannot decode shortcut icon")?;
+    // QImage::Format_RGB32 discards alpha before scaling, not afterwards.
+    let source = if source.has_alpha() {
+        let mut pixels = source.read_pixel_bytes().to_vec();
+        for y in 0..source.height() as usize {
+            for x in 0..source.width() as usize {
+                pixels[y * source.rowstride() as usize + x * 4 + 3] = 255;
+            }
+        }
+        gtk::gdk_pixbuf::Pixbuf::from_bytes(
+            &gtk::glib::Bytes::from_owned(pixels),
+            gtk::gdk_pixbuf::Colorspace::Rgb,
+            true,
+            8,
+            source.width(),
+            source.height(),
+            source.rowstride(),
+        )
+    } else {
+        source
+    };
+    let mut icon = Vec::new();
+    icon.extend_from_slice(&0u16.to_le_bytes());
+    icon.extend_from_slice(&1u16.to_le_bytes());
+    icon.extend_from_slice(&(SCALE_SIZES.len() as u16).to_le_bytes());
+    let mut image_offset = 6 + 16 * SCALE_SIZES.len() as u32;
+    for size in SCALE_SIZES {
+        let image_size = 40 + size * size * BYTES_PER_PIXEL;
+        icon.extend_from_slice(&[size as u8, size as u8, 0, 0]);
+        icon.extend_from_slice(&1u16.to_le_bytes());
+        icon.extend_from_slice(&32u16.to_le_bytes());
+        icon.extend_from_slice(&image_size.to_le_bytes());
+        icon.extend_from_slice(&image_offset.to_le_bytes());
+        image_offset += image_size;
+    }
+    for size in SCALE_SIZES {
+        let scaled = source
+            .scale_simple(
+                size as i32,
+                size as i32,
+                gtk::gdk_pixbuf::InterpType::Bilinear,
+            )
+            .ok_or("Cannot scale shortcut icon")?;
+        // BITMAPINFOHEADER: double height includes the implicit ICO mask;
+        // like Eden, opaque RGB32 pixels are written without a separate mask.
+        icon.extend_from_slice(&40u32.to_le_bytes());
+        icon.extend_from_slice(&size.to_le_bytes());
+        icon.extend_from_slice(&(size * 2).to_le_bytes());
+        icon.extend_from_slice(&1u16.to_le_bytes());
+        icon.extend_from_slice(&32u16.to_le_bytes());
+        icon.extend_from_slice(&[0u8; 24]);
+        let pixels = scaled.read_pixel_bytes();
+        let stride = scaled.rowstride() as usize;
+        let channels = scaled.n_channels() as usize;
+        for y in (0..size as usize).rev() {
+            for x in 0..size as usize {
+                let offset = y * stride + x * channels;
+                icon.extend_from_slice(&[
+                    pixels[offset + 2],
+                    pixels[offset + 1],
+                    pixels[offset],
+                    255,
+                ]);
+            }
+        }
+    }
+    std::fs::write(path, icon).map_err(|error| error.to_string())
 }
 
 fn read_title_and_icon(game_path: &str, program_id: u64) -> (Option<String>, Vec<u8>) {
@@ -415,16 +525,36 @@ fn create_shortcut_link(
     name: &str,
 ) -> bool {
     let shortcut = shortcut_path.join(format!("{name}.lnk"));
-    let script = "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($args[0]);$s.TargetPath=$args[1];$s.Arguments=$args[2];$s.Description=$args[3];if(Test-Path $args[4]){$s.IconLocation=$args[4]};$s.Save()";
-    std::process::Command::new("powershell.exe")
+    use std::os::windows::process::CommandExt;
+    // Windows PowerShell -Command parses trailing arguments as script text,
+    // not as $args. Keep paths and game arguments out of the script entirely.
+    // WScript.Shell supplies the same ShellLink COM object Eden uses directly.
+    let script = "$ErrorActionPreference='Stop';$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:RUZU_SHORTCUT_PATH);$s.TargetPath=$env:RUZU_SHORTCUT_COMMAND;$s.Arguments=$env:RUZU_SHORTCUT_ARGUMENTS;$s.Description=$env:RUZU_SHORTCUT_COMMENT;if($env:RUZU_SHORTCUT_ICON -and (Test-Path -LiteralPath $env:RUZU_SHORTCUT_ICON -PathType Leaf)){$s.IconLocation=$env:RUZU_SHORTCUT_ICON};$s.Save()";
+    let output = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .arg(shortcut)
-        .arg(command)
-        .arg(arguments)
-        .arg(comment)
-        .arg(icon_path)
-        .status()
-        .is_ok_and(|status| status.success())
+        .env("RUZU_SHORTCUT_PATH", &shortcut)
+        .env("RUZU_SHORTCUT_COMMAND", command)
+        .env("RUZU_SHORTCUT_ARGUMENTS", arguments)
+        .env("RUZU_SHORTCUT_COMMENT", comment)
+        .env("RUZU_SHORTCUT_ICON", icon_path)
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .output();
+    match output {
+        Ok(output) if output.status.success() && shortcut.is_file() => true,
+        Ok(output) => {
+            log::error!(
+                "Failed to create shortcut {} ({}): {}",
+                shortcut.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            false
+        }
+        Err(error) => {
+            log::error!("Failed to create shortcut {}: {error}", shortcut.display());
+            false
+        }
+    }
 }
 
 #[cfg(not(any(
@@ -494,6 +624,158 @@ mod tests {
     #[test]
     fn shortcut_title_removes_edens_illegal_characters() {
         assert_eq!(sanitize_shortcut_name("A<B>:C\"/D\\E|F?G*H.I"), "ABCDEFGHI");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_shortcut_icon_matches_edens_ico_layout_and_loads_in_windows() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DestroyIcon, LoadImageW, IMAGE_ICON, LR_LOADFROMFILE,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.ico");
+        // Red top row, blue bottom row: tests DIB row inversion and BGR order.
+        let pixels = gtk::glib::Bytes::from_static(&[
+            255, 0, 0, 0, 255, 0, 0, 0, 0, 0, 255, 255, 0, 0, 255, 255,
+        ]);
+        let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+            &pixels,
+            gtk::gdk_pixbuf::Colorspace::Rgb,
+            true,
+            8,
+            2,
+            2,
+            8,
+        );
+        save_icon_to_file(&path, &pixbuf.save_to_bufferv("png", &[]).unwrap()).unwrap();
+        let ico = std::fs::read(&path).unwrap();
+        assert_eq!(&ico[..6], &[0, 0, 1, 0, 7, 0]);
+        let read_u32 =
+            |offset| u32::from_le_bytes(ico[offset..offset + 4].try_into().unwrap()) as usize;
+        let mut expected_offset = 6 + 7 * 16;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        for (index, size) in [256usize, 128, 64, 48, 32, 24, 16].into_iter().enumerate() {
+            let entry = 6 + index * 16;
+            assert_eq!(
+                &ico[entry..entry + 8],
+                &[size as u8, size as u8, 0, 0, 1, 0, 32, 0]
+            );
+            assert_eq!(read_u32(entry + 8), 40 + size * size * 4);
+            assert_eq!(read_u32(entry + 12), expected_offset);
+            assert_eq!(read_u32(expected_offset), 40);
+            assert_eq!(read_u32(expected_offset + 4), size);
+            assert_eq!(read_u32(expected_offset + 8), size * 2);
+            assert_eq!(
+                &ico[expected_offset + 12..expected_offset + 16],
+                &[1, 0, 32, 0]
+            );
+            assert_eq!(&ico[expected_offset + 16..expected_offset + 40], &[0; 24]);
+            assert_eq!(
+                &ico[expected_offset + 40..expected_offset + 44],
+                &[255, 0, 0, 255]
+            );
+            let top = expected_offset + 40 + (size - 1) * size * 4;
+            assert_eq!(&ico[top..top + 4], &[0, 0, 255, 255]);
+            let handle = unsafe {
+                LoadImageW(
+                    std::ptr::null_mut(),
+                    wide.as_ptr(),
+                    IMAGE_ICON,
+                    size as i32,
+                    size as i32,
+                    LR_LOADFROMFILE,
+                )
+            };
+            assert!(
+                !handle.is_null(),
+                "Windows failed to load {size}px icon: {}",
+                std::io::Error::last_os_error()
+            );
+            unsafe {
+                DestroyIcon(handle);
+            }
+            expected_offset += 40 + size * size * 4;
+        }
+        assert_eq!(ico.len(), expected_offset);
+        assert!(save_icon_to_file(&directory.path().join("invalid.ico"), b"not an image").is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_shortcut_folders_match_shell_locations() {
+        use std::os::windows::process::CommandExt;
+        for (target, special_folder) in [
+            (ShortcutTarget::Desktop, "DesktopDirectory"),
+            (ShortcutTarget::Applications, "Programs"),
+        ] {
+            let output = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command",
+                    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;[Environment]::GetFolderPath($env:RUZU_TEST_FOLDER)"])
+                .env("RUZU_TEST_FOLDER", special_folder)
+                .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                .output().unwrap();
+            assert!(output.status.success());
+            let expected = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                get_shortcut_path(target).unwrap(),
+                PathBuf::from(expected.trim_start_matches('\u{feff}').trim())
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_shortcut_roundtrips_paths_and_arguments_without_script_interpretation() {
+        use std::os::windows::process::CommandExt;
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("Jeux été & amis [1] $test");
+        std::fs::create_dir(&folder).unwrap();
+        let command = folder.join("ruzu test.exe");
+        std::fs::write(&command, b"test target; never executed").unwrap();
+        let arguments = "-f -g \"C:\\Jeux\\L'été & $test [1].nsp\"";
+        let comment = "Démarrer l'été & $test";
+        assert!(create_shortcut_link(
+            &folder,
+            comment,
+            Path::new(""),
+            &command,
+            arguments,
+            "",
+            "",
+            "Jeu été"
+        ));
+        let shortcut = folder.join("Jeu été.lnk");
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:RUZU_TEST_LINK);@{target=$s.TargetPath;arguments=$s.Arguments;description=$s.Description}|ConvertTo-Json -Compress"])
+            .env("RUZU_TEST_LINK", &shortcut)
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = String::from_utf8(output.stdout).unwrap();
+        let properties: serde_json::Value =
+            serde_json::from_str(json.trim_start_matches('\u{feff}')).unwrap();
+        assert_eq!(
+            properties["target"].as_str().unwrap(),
+            command.to_str().unwrap()
+        );
+        assert_eq!(properties["arguments"], arguments);
+        assert_eq!(properties["description"], comment);
+        assert!(!create_shortcut_link(
+            &folder.join("missing"),
+            comment,
+            Path::new(""),
+            &command,
+            arguments,
+            "",
+            "",
+            "Jeu"
+        ));
     }
 
     #[cfg(target_os = "windows")]

@@ -38,18 +38,6 @@ $InstallerScript = Join-Path $DistDirectory "installer.nsi"
 $Manifest = Join-Path $DistDirectory "ruzu.manifest"
 $Icon = Join-Path $DistDirectory "ruzu.ico"
 
-function Get-WorkspaceVersion {
-    $cargoManifest = Get-Content -LiteralPath (Join-Path $ProjectRoot "Cargo.toml") -Raw
-    $match = [regex]::Match(
-        $cargoManifest,
-        '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"'
-    )
-    if (-not $match.Success) {
-        throw "Unable to read workspace.package.version from Cargo.toml."
-    }
-    return $match.Groups[1].Value
-}
-
 function Assert-PackagingSources {
     foreach ($path in @(
         $InstallerScript,
@@ -123,66 +111,6 @@ function Resolve-MakeNsis {
     throw "makensis.exe was not found. Install NSIS 3 and retry."
 }
 
-function Assert-MainBranch {
-    param(
-        [Parameter(Mandatory)][string]$Repository,
-        [Parameter(Mandatory)][string]$DisplayName,
-        [Parameter(Mandatory)][string]$GitExecutable
-    )
-
-    $branch = & $GitExecutable -C $Repository branch --show-current
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to determine the current Git branch for $DisplayName."
-    }
-    $branch = ($branch -join "`n").Trim()
-    if ($branch -ne "main") {
-        $actual = if ($branch) { $branch } else { "detached HEAD" }
-        throw "$DisplayName must be checked out on branch main before packaging (current: $actual)."
-    }
-}
-
-function Assert-ReleaseBranches {
-    $git = Get-Command git.exe -ErrorAction SilentlyContinue
-    if (-not $git) {
-        throw "git.exe was not found; Git is required to verify release branches."
-    }
-
-    Assert-MainBranch `
-        -Repository $ProjectRoot `
-        -DisplayName "Ruzu" `
-        -GitExecutable $git.Source
-
-    $submoduleEntries = @(
-        & $git.Source -C $ProjectRoot config --file .gitmodules --get-regexp '^submodule\..*\.path$'
-    )
-    if ($LASTEXITCODE -gt 1) {
-        throw "Unable to read Ruzu's Git submodule configuration."
-    }
-
-    foreach ($entry in $submoduleEntries) {
-        $parts = $entry -split '\s+', 2
-        if ($parts.Count -ne 2) {
-            throw "Invalid Git submodule entry: $entry"
-        }
-        $relativePath = $parts[1]
-        $repository = Join-Path $ProjectRoot $relativePath
-        $status = @(& $git.Source -C $ProjectRoot submodule status -- $relativePath)
-        if ($LASTEXITCODE -ne 0 -or $status.Count -ne 1) {
-            throw "Unable to inspect Git submodule $relativePath."
-        }
-        if ($status[0].StartsWith("-")) {
-            throw "Git submodule $relativePath must be initialized before packaging."
-        }
-        if ($status[0].StartsWith("+") -or $status[0].StartsWith("U")) {
-            throw "Git submodule $relativePath must match the commit recorded by Ruzu before packaging."
-        }
-        Assert-MainBranch `
-            -Repository $repository `
-            -DisplayName "Git submodule $relativePath" `
-            -GitExecutable $git.Source
-    }
-}
-
 function Copy-RuntimeTree {
     param(
         [Parameter(Mandatory)][string]$Source,
@@ -209,9 +137,10 @@ function Copy-RequiredFile {
 }
 
 Assert-PackagingSources
-if (-not $Version) {
-    $Version = Get-WorkspaceVersion
-}
+$ReleaseValidator = Join-Path $ProjectRoot "scripts\check-release.ps1"
+$Version = & $ReleaseValidator -Repository $ProjectRoot -Version $Version -ForcePackage:$ForcePackage
+$releaseCommit = & git -C $ProjectRoot rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw "Unable to resolve the release commit." }
 if ($ValidateOnly) {
     Write-Host "Windows packaging sources are valid for Ruzu $Version."
     return
@@ -225,13 +154,6 @@ else {
 }
 if (-not $isWindowsPlatform) {
     throw "Ruzu's Windows package must be built on Windows with the MSVC toolchain."
-}
-
-if ($ForcePackage) {
-    Write-Warning "Git main-branch checks were explicitly disabled with -ForcePackage."
-}
-else {
-    Assert-ReleaseBranches
 }
 
 $makeNsis = if (-not $StageOnly) {
@@ -344,6 +266,11 @@ if (-not (Test-Path -LiteralPath $compiledSchemas -PathType Leaf)) {
 
 Write-Host "Staged Ruzu and $($runtimeDlls.Count) vcpkg DLLs in:"
 Write-Host "  $stageDirectory"
+$null = & $ReleaseValidator -Repository $ProjectRoot -Version $Version -ForcePackage:$ForcePackage
+$currentCommit = & git -C $ProjectRoot rev-parse HEAD
+if ($LASTEXITCODE -ne 0 -or $currentCommit -ne $releaseCommit) {
+    throw "The release commit changed during packaging; rebuild the release."
+}
 if ($StageOnly) {
     return
 }

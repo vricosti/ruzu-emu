@@ -1879,6 +1879,23 @@ impl GMainWindow {
         app.set_accels_for_action("app.exit_fullscreen", &["Escape"]);
     }
 
+    /// Eden MainWindow's startup argument slice: a supplied game path resets
+    /// fullscreen unless -f is present; -f alone checks the action for next boot.
+    pub(crate) fn apply_launch_options(self: &Rc<Self>, game: Option<String>, fullscreen: bool) {
+        if game.is_some() || fullscreen {
+            crate::uisettings::with_mut(|values| values.fullscreen.set_value(fullscreen));
+            if let Some(app) = self.window.application() {
+                self.set_fullscreen_action_state(&app, fullscreen);
+            }
+            if self.session.borrow().is_some() {
+                self.set_fullscreen(fullscreen);
+            }
+        }
+        if let Some(path) = game {
+            self.boot_game(path);
+        }
+    }
+
     fn toggle_fullscreen(&self, app: &Application) {
         let checked = !app
             .lookup_action("fullscreen")

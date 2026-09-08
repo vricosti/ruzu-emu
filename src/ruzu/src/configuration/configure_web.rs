@@ -122,22 +122,34 @@ mod tests {
             values.yuzu_username.set_value("LegacyUser".into());
             values.yuzu_token.set_value("legacy-token".into());
         }
-        fn entries(widget: &gtk::Widget, output: &mut Vec<gtk::Entry>) {
+        fn entries(widget: &gtk::Widget, output: &mut Vec<gtk::Entry>, buttons: &mut Vec<gtk::Button>) {
             if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
                 output.push(entry.clone());
+            }
+            if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                if button.label().as_deref() == Some("Generate Token") {
+                    buttons.push(button.clone());
+                }
             }
             let mut child = widget.first_child();
             while let Some(widget) = child {
                 child = widget.next_sibling();
-                entries(&widget, output);
+                entries(&widget, output, buttons);
             }
         }
         let page = page();
         let mut edits = Vec::new();
-        entries(&page.widget, &mut edits);
+        let mut buttons = Vec::new();
+        entries(&page.widget, &mut edits, &mut buttons);
         assert_eq!(edits.len(), 2);
         assert_eq!(edits[0].text(), "InitialUser");
         assert_eq!(edits[1].text(), "a".repeat(48));
+        assert_eq!(buttons.len(), 1);
+        buttons[0].emit_clicked();
+        assert_eq!(edits[1].text().len(), 48);
+        assert!(edits[1].text().bytes().all(|byte| byte.is_ascii_lowercase()));
+        // Generate changes only the draft, never the persistent setting.
+        assert_eq!(common::settings::values().eden_token.get_value(), &"a".repeat(48));
         edits[1].set_text("");
         let mut position = 0;
         edits[1].insert_text("ABC123", &mut position);

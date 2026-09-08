@@ -295,7 +295,11 @@ fn class_from_target(target: &str) -> Class {
         .or_else(|| Class::from_name(&normalized))
         .or_else(|| {
             Class::all()
-                .filter(|class| normalized.starts_with(class.name()))
+                .filter(|class| {
+                    normalized
+                        .strip_prefix(class.name())
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+                })
                 .max_by_key(|class| class.name().len())
         })
         .unwrap_or(Class::Log)
@@ -322,8 +326,11 @@ pub fn disable_logging_in_tests() {
 
 /// Sets the global filter.
 pub fn set_global_filter(filter: &Filter) {
-    publish_filter_snapshot(filter);
     let mut guard = LOGGER.lock().unwrap();
+    // Serialize the facade snapshot with the queued logger's filter. Publishing
+    // before this lock lets two concurrent updates leave different filters in
+    // enabled() and push_entry(), even after both updates have returned.
+    publish_filter_snapshot(filter);
     if let Some(ref mut state) = *guard {
         state.filter = filter.clone();
     }
@@ -468,6 +475,54 @@ mod tests {
             Class::Render_OpenGL
         );
         assert_eq!(class_from_target("unknown_target"), Class::Log);
+    }
+
+    #[test]
+    fn class_prefix_requires_a_component_boundary() {
+        assert_eq!(class_from_target("Render.OpenGLExtra"), Class::Render);
+        assert_eq!(class_from_target("Renderer"), Class::Log);
+        assert_eq!(class_from_target("Service.FSExtra"), Class::Service);
+        assert_eq!(class_from_target("Service.FS.operation"), Class::Service_FS);
+        assert_eq!(class_from_target("Service_FS::operation"), Class::Service_FS);
+        for class in Class::all() {
+            assert_eq!(class_from_target(class.name()), class);
+            assert_eq!(class_from_target(&format!("{}.message", class.name())), class);
+        }
+    }
+
+    #[test]
+    fn concurrent_filter_updates_publish_one_consistent_filter() {
+        const CHILD: &str = "RUZU_TEST_CONCURRENT_LOG_FILTER";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "logging::backend::tests::concurrent_filter_updates_publish_one_consistent_filter"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        // Isolate global logger state without starting file/console backends.
+        let (sender, _receiver) = mpsc::channel();
+        *LOGGER.lock().unwrap() = Some(LoggerState {
+            filter: Filter::default(), sender, time_origin: Instant::now(), thread_handle: None,
+        });
+        for _ in 0..50 {
+            std::thread::scope(|scope| {
+                for level in [Level::Debug, Level::Critical] {
+                    scope.spawn(move || {
+                        for _ in 0..100 { set_global_filter(&Filter::new(level)); }
+                    });
+                }
+            });
+            let guard = LOGGER.lock().unwrap();
+            let filter = &guard.as_ref().unwrap().filter;
+            for (slot, level) in FILTER_LEVELS.iter().zip(filter.class_levels()) {
+                assert_eq!(slot.load(Ordering::Relaxed), *level as u8);
+            }
+            assert_eq!(FILTER_GLOBAL_MIN.load(Ordering::Acquire),
+                *filter.class_levels().iter().min().unwrap() as u8);
+        }
     }
 
     #[test]

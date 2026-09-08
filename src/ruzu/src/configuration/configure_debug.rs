@@ -411,10 +411,17 @@ mod tests {
             values.disable_web_applet.set_value(false);
         }
         let locked_page = page(false);
+        for label in ["Disable Macro JIT", "Disable Macro HLE", "Dump Maxwell Macros"] {
+            assert!(!find_switch(&locked_page.widget, label).unwrap().is_sensitive());
+        }
         assert!(!find_switch(&locked_page.widget, "Enable FS Access Log").unwrap().is_sensitive());
         assert!(!find_gpu_level(&locked_page.widget).unwrap().is_sensitive());
         assert!(!find_switch(&locked_page.widget, "Dump SPIR-V Shaders").unwrap().is_sensitive());
         let page = page(true);
+        let macro_jit = find_switch(&page.widget, "Disable Macro JIT").unwrap();
+        let macro_hle = find_switch(&page.widget, "Disable Macro HLE").unwrap();
+        let macro_dump = find_switch(&page.widget, "Dump Maxwell Macros").unwrap();
+        assert!(!macro_jit.is_active() && !macro_hle.is_active() && !macro_dump.is_active());
         let gpu_level = find_gpu_level(&page.widget).unwrap();
         let gpu_dumps = find_switch(&page.widget, "Dump SPIR-V Shaders").unwrap();
         let flush_line = find_switch(&page.widget, "Flush log output on each line").unwrap();
@@ -463,6 +470,9 @@ mod tests {
         }
         let serial_cases = [("0", 0), ("4294967295", u32::MAX), ("4294967296", 0), ("-1", 0), (" +42 ", 42)];
         for index in 0..5 {
+            macro_jit.set_active(index % 2 == 0);
+            macro_hle.set_active(index % 2 != 0);
+            macro_dump.set_active(index % 2 == 0);
             gpu_level.set_selected(index);
             gpu_dumps.set_active(index % 2 == 0);
             flush_line.set_active(index % 2 == 0);
@@ -475,6 +485,9 @@ mod tests {
             unit.set_text(serial_cases[4 - index as usize].0);
             (page.apply)();
             let values = common::settings::values();
+            assert_eq!(*values.disable_macro_jit.get_value(), index % 2 == 0);
+            assert_eq!(*values.disable_macro_hle.get_value(), index % 2 != 0);
+            assert_eq!(*values.dump_macros.get_value(), index % 2 == 0);
             assert_eq!(*values.gpu_log_level.get_value() as u32, index);
             assert_eq!(*values.gpu_log_shader_dumps.get_value(), index % 2 == 0);
             assert_eq!(*values.log_flush_line.get_value(), index % 2 == 0);

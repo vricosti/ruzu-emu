@@ -2318,6 +2318,26 @@ mod tests {
     }
 
     #[test]
+    fn macro_backend_settings_persist_but_dump_is_session_only() {
+        for enabled in [false, true] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            config.begin_group("DebuggingGraphics");
+            let mut values = common::settings::Values::default();
+            for setting in [&mut values.disable_macro_jit, &mut values.disable_macro_hle] {
+                setting.set_value(enabled);
+                config.write_setting_generic(setting);
+                assert_eq!(config.ini["DebuggingGraphics"][setting.label()], enabled.to_string());
+                setting.set_value(!enabled);
+                config.read_setting_generic(setting);
+                assert_eq!(*setting.get_value(), enabled);
+            }
+            values.dump_macros.set_value(true);
+            config.write_setting_generic(&mut values.dump_macros);
+            assert!(!config.ini["DebuggingGraphics"].contains_key("dump_macros"));
+        }
+    }
+
+    #[test]
     fn frame_time_recording_round_trips_through_debug_configuration() {
         const CHILD: &str = "RUZU_TEST_FRAME_TIME_CONFIG";
         if std::env::var_os(CHILD).is_none() {

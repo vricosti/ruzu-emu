@@ -409,6 +409,7 @@ mod tests {
             values.serial_battery.set_value(12345);
             values.serial_unit.set_value(98765);
             values.disable_web_applet.set_value(false);
+            values.program_args.set_value("--before".into());
         }
         let locked_page = page(false);
         for label in ["Disable Macro JIT", "Disable Macro HLE", "Dump Maxwell Macros"] {
@@ -418,6 +419,7 @@ mod tests {
         assert!(!find_gpu_level(&locked_page.widget).unwrap().is_sensitive());
         assert!(!find_switch(&locked_page.widget, "Dump SPIR-V Shaders").unwrap().is_sensitive());
         let page = page(true);
+        let system_page = super::super::configure_system::page(true);
         let macro_jit = find_switch(&page.widget, "Disable Macro JIT").unwrap();
         let macro_hle = find_switch(&page.widget, "Disable Macro HLE").unwrap();
         let macro_dump = find_switch(&page.widget, "Dump Maxwell Macros").unwrap();
@@ -456,6 +458,8 @@ mod tests {
             None
         }
         find_entry(&page.widget, "*:Warning").expect("global log filter entry").set_text("*:Info");
+        let args_text = "--label \"café au lait\" --path=/tmp/example";
+        find_entry(&page.widget, "--before").unwrap().set_text(args_text);
         let battery = find_entry(&page.widget, "12345").expect("battery serial entry");
         let unit = find_entry(&page.widget, "98765").expect("unit serial entry");
         assert!(find_entry(&locked_page.widget, "12345").unwrap().is_sensitive());
@@ -500,6 +504,10 @@ mod tests {
             assert_eq!(*values.serial_battery.get_value(), serial_cases[index as usize].1);
             assert_eq!(*values.serial_unit.get_value(), serial_cases[4 - index as usize].1);
         }
+        // ConfigureDialog applies General/Debug before System. The System page
+        // was constructed with --before and must not overwrite the new text.
+        (system_page.apply)();
+        assert_eq!(common::settings::values().program_args.get_value(), args_text);
         log::info!("after_apply_visible");
         common::logging::backend::stop();
         let log = std::fs::read_to_string(directory.path().join("log/ruzu_log.txt")).unwrap();

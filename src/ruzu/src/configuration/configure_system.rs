@@ -149,6 +149,9 @@ pub fn page(runtime_lock: bool) -> Page {
 
     let program_args_value = common::settings::values().program_args.get_value().clone();
     let (program_args_row, program_args) = w::entry_row("Homebrew Args:", &program_args_value);
+    // Global arguments belong to ConfigureDebug upstream. Keeping a second
+    // editable copy here overwrites Debug's newly applied text with stale data.
+    program_args_row.set_visible(!configuring_global);
     system.append(&program_args_row);
 
     let invalid_locale = gtk::Label::new(None);
@@ -422,7 +425,9 @@ pub fn page(runtime_lock: bool) -> Page {
         slow_speed_limit_policy.apply(&mut values.slow_speed_limit, slow_speed_value);
         turbo_speed_limit_policy.apply(&mut values.turbo_speed_limit, turbo_speed_value);
         sync_core_speed_policy.apply(&mut values.sync_core_speed, synchronize_core);
-        program_args_policy.apply(&mut values.program_args, args);
+        if !configuring_global {
+            program_args_policy.apply(&mut values.program_args, args);
+        }
         if !configuring_global {
             use_docked_mode_policy.apply(&mut values.use_docked_mode, console_mode);
         }

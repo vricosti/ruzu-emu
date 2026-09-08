@@ -112,6 +112,18 @@ pub enum StartGameType {
     Global,
 }
 
+/// The accepted/rejected result of upstream SelectAndSetCurrentUser.
+fn apply_profile_selection(
+    index: Option<usize>,
+    current_user: &mut common::settings_common::Setting<i32>,
+) -> bool {
+    let Some(index) = index else {
+        return false;
+    };
+    current_user.set_value(index as i32);
+    true
+}
+
 fn boot_parameters_for_start_type(start_type: StartGameType) -> crate::boot::BootParameters {
     let mut parameters = crate::boot::BootParameters::default();
     parameters.use_global_configuration = start_type == StartGameType::Global;
@@ -402,6 +414,7 @@ pub struct GMainWindow {
     /// Invalidates the previous session's GTK event poller when another title
     /// is booted before that poller receives a terminal event.
     session_generation: Cell<u64>,
+    profile_selection_pending: Cell<bool>,
     /// Bottom status bar (renderer / accuracy / dock / filter / AA / volume).
     status_bar: Rc<StatusBar>,
     /// Last TAS state reflected in the menu labels.
@@ -799,6 +812,26 @@ mod fullscreen_hotkey_tests {
 #[cfg(test)]
 mod start_game_type_tests {
     use super::*;
+
+    #[test]
+    fn profile_cancel_preserves_user_and_prevents_boot_continuation() {
+        let mut values = common::settings::Values::default();
+        values.current_user.set_value(2);
+        assert!(!apply_profile_selection(None, &mut values.current_user));
+        assert_eq!(*values.current_user.get_value(), 2);
+    }
+
+    #[test]
+    fn profile_accept_sets_user_before_allowing_boot_continuation() {
+        let mut values = common::settings::Values::default();
+        for selected in [3, 0] {
+            assert!(apply_profile_selection(
+                Some(selected),
+                &mut values.current_user,
+            ));
+            assert_eq!(*values.current_user.get_value(), selected as i32);
+        }
+    }
 
     #[test]
     fn global_menu_action_bypasses_only_the_per_game_configuration() {
@@ -1259,6 +1292,7 @@ impl GMainWindow {
             stop_confirmation_pending: Cell::new(false),
             shutdown_dialog: RefCell::new(None),
             session_generation: Cell::new(0),
+            profile_selection_pending: Cell::new(false),
             status_bar,
             tas_state: Cell::new(input_common::drivers::tas_input::TasState::Stopped),
             is_amiibo_file_select_active: Cell::new(false),
@@ -3806,6 +3840,47 @@ impl GMainWindow {
         self.boot_game_with_parameters(filepath, crate::boot::BootParameters::default());
     }
 
+    fn boot_game_with_parameters(
+        self: &Rc<Self>,
+        filepath: String,
+        parameters: crate::boot::BootParameters,
+    ) {
+        if self.profile_selection_pending.get() {
+            return;
+        }
+        if crate::uisettings::with(|values| *values.select_user_on_boot.get_value()) {
+            self.select_and_set_current_user(filepath, parameters);
+        } else {
+            self.boot_game_after_profile_selection(filepath, parameters);
+        }
+    }
+
+    /// Eden's SelectAndSetCurrentUser, with an asynchronous GTK continuation
+    /// instead of QDialog::exec. Cancellation never enters the native boot path.
+    fn select_and_set_current_user(
+        self: &Rc<Self>,
+        filepath: String,
+        parameters: crate::boot::BootParameters,
+    ) {
+        self.profile_selection_pending.set(true);
+        let weak = Rc::downgrade(self);
+        crate::applets::profile_select::select_for_boot(
+            self.window.upcast_ref(),
+            &self.hid_core,
+            move |index| {
+                let Some(this) = weak.upgrade() else { return };
+                this.profile_selection_pending.set(false);
+                let accepted = apply_profile_selection(
+                    index,
+                    &mut common::settings::values_mut().current_user,
+                );
+                if accepted {
+                    this.boot_game_after_profile_selection(filepath, parameters);
+                }
+            },
+        );
+    }
+
     /// Upstream `GMainWindow::BootGameFromList`.
     fn boot_game_from_list(self: &Rc<Self>, filepath: String, start_type: StartGameType) {
         self.boot_game_with_parameters(filepath, boot_parameters_for_start_type(start_type));
@@ -3872,7 +3947,7 @@ impl GMainWindow {
     /// `GMainWindow::BootGame`: attach the Metal layer, show the loading screen,
     /// start the boot thread, and reveal the render view when loading completes.
     #[cfg(target_os = "macos")]
-    fn boot_game_with_parameters(
+    fn boot_game_after_profile_selection(
         self: &Rc<Self>,
         filepath: String,
         parameters: crate::boot::BootParameters,
@@ -3893,7 +3968,7 @@ impl GMainWindow {
                     && this.stack.width() > 0
                     && this.stack.height() > 0
                 {
-                    this.boot_game_with_parameters(filepath.clone(), parameters);
+                    this.boot_game_after_profile_selection(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
                     glib::ControlFlow::Continue
@@ -4063,7 +4138,7 @@ impl GMainWindow {
     /// an X11 child `Window` instead of a `CAMetalLayer` sub-view, matching
     /// upstream's per-platform `GetWindowSystemInfo`.
     #[cfg(target_os = "linux")]
-    fn boot_game_with_parameters(
+    fn boot_game_after_profile_selection(
         self: &Rc<Self>,
         filepath: String,
         parameters: crate::boot::BootParameters,
@@ -4083,7 +4158,7 @@ impl GMainWindow {
                     && this.stack.width() > 0
                     && this.stack.height() > 0
                 {
-                    this.boot_game_with_parameters(filepath.clone(), parameters);
+                    this.boot_game_after_profile_selection(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
                     glib::ControlFlow::Continue
@@ -4259,7 +4334,7 @@ impl GMainWindow {
     /// `windowHandle()->winId()` to Vulkan. GTK has no native surface per
     /// widget, so `render_window_windows` creates the equivalent child directly.
     #[cfg(target_os = "windows")]
-    fn boot_game_with_parameters(
+    fn boot_game_after_profile_selection(
         self: &Rc<Self>,
         filepath: String,
         parameters: crate::boot::BootParameters,
@@ -4277,7 +4352,7 @@ impl GMainWindow {
                     && this.stack.width() > 0
                     && this.stack.height() > 0
                 {
-                    this.boot_game_with_parameters(filepath.clone(), parameters);
+                    this.boot_game_after_profile_selection(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
                     glib::ControlFlow::Continue
@@ -4438,7 +4513,7 @@ impl GMainWindow {
 
     /// In-process boot needs a platform-specific native render surface.
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    fn boot_game_with_parameters(
+    fn boot_game_after_profile_selection(
         self: &Rc<Self>,
         _filepath: String,
         _parameters: crate::boot::BootParameters,

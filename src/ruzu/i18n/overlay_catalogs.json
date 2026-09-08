@@ -9,6 +9,8 @@
     "Closing software...": "Cerrando el programa..."
   },
   "fr": {
+    "Profile Selector": "Sélection du profil",
+    "Select a user:": "Sélectionnez un utilisateur :",
     "Decryption Keys (*.keys, *.zip)": "Clés de déchiffrement (*.keys, *.zip)",
     "Unable to read keys ZIP. Choose an archive containing exactly one prod.keys file; folders inside the archive are supported.": "Impossible de lire le ZIP de clés. Choisissez une archive contenant exactement un fichier prod.keys ; les sous-dossiers sont pris en charge.",
     "Closing software...": "Fermeture du logiciel...",

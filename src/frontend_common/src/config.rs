@@ -2214,6 +2214,21 @@ mod tests {
     }
 
     #[test]
+    fn per_game_loading_preserves_the_boot_selected_user() {
+        // Config::ReadSettingGeneric excludes non-switchable settings from
+        // per-title configuration, including the accepted boot-time profile.
+        for ini in ["", "[System]\ncurrent_user\\default=false\ncurrent_user=0\n"] {
+            let mut config = BaseConfig::new(ConfigType::PerGameConfig);
+            config.load_ini(ini);
+            config.begin_group("System");
+            let mut values = common::settings::Values::default();
+            values.current_user.set_value(3);
+            config.read_setting_generic(&mut values.current_user);
+            assert_eq!(*values.current_user.get_value(), 3);
+        }
+    }
+
+    #[test]
     fn scaling_filter_round_trips_the_full_upstream_enum_range() {
         use common::settings_common::Specialization;
         use common::settings_enums::{Category, ScalingFilter};

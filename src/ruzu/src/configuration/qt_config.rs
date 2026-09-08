@@ -262,8 +262,15 @@ pub fn save_shortcut_values() -> io::Result<()> {
 
 /// Persist the four settings owned by upstream `ConfigureTasDialog`.
 pub fn save_tas_values() -> io::Result<()> {
-    let path = config_path();
-    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    save_tas_values_to(&config_path())
+}
+
+fn save_tas_values_to(path: &Path) -> io::Result<()> {
+    let mut contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
     let values = common::settings::values();
     for (key, value, default) in [
         (
@@ -1778,6 +1785,16 @@ mod tests {
         std::fs::write(&path, [0xff, 0xfe]).unwrap();
         assert!(save_view_values_to(&path).is_err());
         assert_eq!(std::fs::read(path).unwrap(), [0xff, 0xfe]);
+    }
+
+    #[test]
+    fn saving_tas_preserves_unreadable_configuration() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert!(save_tas_values_to(temporary.path()).is_err());
+        let path = temporary.path().join("invalid.ini");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(save_tas_values_to(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe]);
     }
 
     #[test]

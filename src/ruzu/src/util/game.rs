@@ -510,6 +510,18 @@ fn create_shortcut_link(
         log::error!("Failed to create shortcut {}: {error}", path.display());
         return false;
     }
+    // Unlike upstream's write-only path, desktop launchers require execution
+    // permission. Add only owner execution, preserving the user's other modes.
+    use std::os::unix::fs::PermissionsExt;
+    let executable = std::fs::metadata(&path).and_then(|metadata| {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() | 0o100);
+        std::fs::set_permissions(&path, permissions)
+    });
+    if let Err(error) = executable {
+        log::error!("Failed to make shortcut executable {}: {error}", path.display());
+        return false;
+    }
     true
 }
 
@@ -835,5 +847,35 @@ mod tests {
                 icon.display()
             )
         );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    #[test]
+    fn desktop_shortcut_is_executable_on_creation_and_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Homebrew.desktop");
+        let create = || {
+            create_shortcut_link(
+                directory.path(),
+                "",
+                Path::new(""),
+                Path::new("/opt/ruzu"),
+                "",
+                "",
+                "",
+                "Homebrew",
+            )
+        };
+        assert!(create());
+        assert_ne!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o100, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(create());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Name=Homebrew\n"));
     }
 }

@@ -34,15 +34,19 @@ const FOLDER_ICON_SIZES: &[(u32, &str)] = &[
     (72, "Large (72x72)"),
 ];
 
-/// Screenshot resolutions — upstream `ConfigureUi::UpdateScreenshotInfo`, whose
-/// first entry reports the resolution the current aspect/scale would produce.
-const SCREENSHOT_RESOLUTIONS: &[(u32, &str)] = &[
-    (0, "Auto"),
-    (720, "1280x720 (720p)"),
-    (1080, "1920x1080 (1080p)"),
-    (1440, "2560x1440 (1440p)"),
-    (2160, "3840x2160 (4K)"),
-];
+/// PopulateResolutionComboBox: both console heights at every supported scale.
+fn screenshot_resolutions() -> Vec<u32> {
+    use ruzu_core::frontend::framebuffer_layout::{screen_docked, screen_undocked};
+    let mut heights = std::collections::BTreeSet::new();
+    for &(_, setup) in common::settings_enums::ResolutionSetup::canonicalizations() {
+        let mut info = common::settings::ResolutionScalingInfo::default();
+        common::settings::translate_resolution_info(setup, &mut info);
+        for height in [screen_undocked::HEIGHT, screen_docked::HEIGHT] {
+            heights.insert((height as f32 * info.up_factor) as u32);
+        }
+    }
+    std::iter::once(0).chain(heights).collect()
+}
 
 /// Build the UI tab — upstream `ConfigureUi`.
 pub fn page() -> Page {
@@ -183,9 +187,13 @@ pub fn page() -> Page {
     let (path_row, path_entry, path_browse) = w::path_row("Screenshots Path:", &screenshot_path);
     screenshots.append(&path_row);
 
-    let resolution_labels: Vec<&str> = SCREENSHOT_RESOLUTIONS.iter().map(|(_, l)| *l).collect();
+    let resolutions = screenshot_resolutions();
+    let resolution_text: Vec<String> = resolutions.iter().map(|height| {
+        if *height == 0 { crate::i18n::tr("Auto") } else { height.to_string() }
+    }).collect();
+    let resolution_labels: Vec<&str> = resolution_text.iter().map(String::as_str).collect();
     let resolution_index = uisettings::with(|v| {
-        index_by_value(SCREENSHOT_RESOLUTIONS, *v.screenshot_height.get_value())
+        resolutions.iter().position(|height| height == v.screenshot_height.get_value()).unwrap_or(0) as u32
     });
     let (resolution_row, resolution) =
         w::combo_row("Resolution:", &resolution_labels, resolution_index);
@@ -222,7 +230,7 @@ pub fn page() -> Page {
             .unwrap_or_default();
         let game_icon_value = value_at(GAME_ICON_SIZES, game_icon.selected());
         let folder_icon_value = value_at(FOLDER_ICON_SIZES, folder_icon.selected());
-        let screenshot_height = value_at(SCREENSHOT_RESOLUTIONS, resolution.selected());
+        let screenshot_height = resolutions.get(resolution.selected() as usize).copied().unwrap_or(0);
 
         let compat = show_compat.is_active();
         let add_ons = show_add_ons.is_active();
@@ -296,8 +304,11 @@ mod tests {
 
     #[test]
     fn index_and_value_round_trip() {
-        let idx = index_by_value(SCREENSHOT_RESOLUTIONS, 1080);
-        assert_eq!(value_at(SCREENSHOT_RESOLUTIONS, idx), 1080);
+        assert_eq!(screenshot_resolutions(), vec![
+            0, 180, 270, 360, 540, 720, 810, 900, 1080, 1350, 1440,
+            1620, 2160, 2880, 3240, 3600, 4320, 5040, 5400, 5760,
+            6480, 7560, 8640,
+        ]);
     }
 
     #[test]

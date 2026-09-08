@@ -30,9 +30,9 @@ mod gui_settings;
 mod homebrew_vfs;
 mod hotkeys;
 mod i18n;
-mod install_dialog;
 #[cfg(unix)]
 mod input_session;
+mod install_dialog;
 mod loading_screen;
 mod main_window;
 mod migration_worker;
@@ -44,8 +44,8 @@ mod render_window;
 mod render_window_windows;
 #[cfg(target_os = "linux")]
 mod render_window_x11;
-mod status_bar;
 mod startup_checks;
+mod status_bar;
 mod uisettings;
 mod user_data_migration;
 mod util;
@@ -225,7 +225,9 @@ fn main() -> glib::ExitCode {
     }
     let log_filter = common::settings::values().log_filter.get_value().clone();
     common::logging::backend::initialize_with_config(
-        Some(common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::LogDir)),
+        Some(common::fs::path_util::get_ruzu_path(
+            common::fs::path_util::RuzuPath::LogDir,
+        )),
         &log_filter,
         uisettings::with(|values| *values.show_console.get_value()),
     );
@@ -254,13 +256,30 @@ fn main() -> glib::ExitCode {
     i18n::set_language(&interface_language);
     i18n::configure_toolkit_language(&interface_language);
 
-    // Upstream constructs `QApplication app(argc, argv)`. We register handling
-    // of file arguments ourselves later (open a game passed on the command
-    // line), so declare HANDLES_OPEN even though the handler is not wired yet.
+    // GTK parses/forwards command lines; GMainWindow owns their launch behavior
+    // just as Eden's MainWindow constructor does after QApplication startup.
     let app = gtk::Application::builder()
         .application_id(APPLICATION_ID)
-        .flags(gio::ApplicationFlags::HANDLES_OPEN)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
+    register_launch_options(&app);
+    app.connect_command_line(|app, command_line| {
+        let (game, fullscreen) = launch_options(command_line);
+        let existing = main_window();
+        let window = existing.clone().unwrap_or_else(|| {
+            if game.is_some() {
+                GMainWindow::new_for_direct_game(app)
+            } else {
+                GMainWindow::new(app)
+            }
+        });
+        window.present();
+        if existing.is_none() {
+            set_main_window(Rc::clone(&window));
+        }
+        window.apply_launch_options(game, fullscreen);
+        0
+    });
 
     // `startup` fires exactly once, before the first `activate`/`open`. This is
     // where the application-scoped menu bar and actions are installed. On the
@@ -312,6 +331,140 @@ fn main() -> glib::ExitCode {
     let result = app.run();
     common::logging::backend::stop();
     result
+}
+
+fn register_launch_options(app: &impl IsA<gio::Application>) {
+    app.add_main_option(
+        "fullscreen",
+        b'f'.into(),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "Launch the game in fullscreen",
+        None,
+    );
+    app.add_main_option(
+        "game",
+        b'g'.into(),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::Filename,
+        "Launch a game",
+        Some("PATH"),
+    );
+}
+
+fn launch_options(command_line: &gio::ApplicationCommandLine) -> (Option<String>, bool) {
+    let options = command_line.options_dict();
+    let (game, fullscreen) = decoded_launch_options(&options, command_line.arguments());
+    // Use the invoking process's working directory, including when GApplication
+    // forwards this launch to an already running Ruzu instance.
+    let game = game
+        .and_then(|arg| command_line.create_file_for_arg(arg).path())
+        .map(|path| path.to_string_lossy().into_owned());
+    (game, fullscreen)
+}
+
+fn decoded_launch_options(
+    options: &glib::VariantDict,
+    arguments: Vec<std::ffi::OsString>,
+) -> (Option<std::ffi::OsString>, bool) {
+    let fullscreen = options
+        .lookup::<bool>("fullscreen")
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    let game = options
+        .lookup::<std::ffi::OsString>("game")
+        .ok()
+        .flatten()
+        .or_else(|| arguments.into_iter().skip(1).last());
+    (game, fullscreen)
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    #[test]
+    fn decoded_shortcut_options_preserve_paths_and_fullscreen() {
+        let path = std::ffi::OsString::from("Jeux/Mario Kart é [1].nsp");
+        for fullscreen in [false, true] {
+            let options = glib::VariantDict::new(None);
+            options.insert("game", &path);
+            options.insert("fullscreen", fullscreen);
+            assert_eq!(
+                decoded_launch_options(&options, vec!["ruzu".into()]),
+                (Some(path.clone()), fullscreen)
+            );
+        }
+        let options = glib::VariantDict::new(None);
+        assert_eq!(
+            decoded_launch_options(&options, vec!["ruzu".into(), path.clone()]),
+            (Some(path), false)
+        );
+        assert_eq!(
+            decoded_launch_options(&options, vec!["ruzu".into()]),
+            (None, false)
+        );
+        options.insert("fullscreen", true);
+        assert_eq!(
+            decoded_launch_options(&options, vec!["ruzu".into()]),
+            (None, true)
+        );
+    }
+
+    // GLib on Windows reads the real UTF-16 process command line, ignoring
+    // run_with_args' synthetic argv. Validate that platform with the binary.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn gtk_parses_shortcut_options_and_positional_files() {
+        for (arguments, game, fullscreen) in [
+            (
+                vec!["ruzu", "-f", "-g", "Jeux/Mario Kart é.nsp"],
+                Some("Mario Kart é.nsp"),
+                true,
+            ),
+            (
+                vec!["ruzu", "--game", "Jeux/Mario Kart é.nsp", "--fullscreen"],
+                Some("Mario Kart é.nsp"),
+                true,
+            ),
+            (
+                vec!["ruzu", "-g", "Jeux/Mario Kart é.nsp"],
+                Some("Mario Kart é.nsp"),
+                false,
+            ),
+            (
+                vec!["ruzu", "Jeux/Mario Kart é.nsp"],
+                Some("Mario Kart é.nsp"),
+                false,
+            ),
+            (vec!["ruzu", "-f"], None, true),
+            (vec!["ruzu"], None, false),
+        ] {
+            let app = gio::Application::new(
+                None,
+                gio::ApplicationFlags::NON_UNIQUE | gio::ApplicationFlags::HANDLES_COMMAND_LINE,
+            );
+            register_launch_options(&app);
+            let observed = Rc::new(RefCell::new(None));
+            let result = Rc::clone(&observed);
+            app.connect_command_line(move |_, command_line| {
+                *result.borrow_mut() = Some(launch_options(command_line));
+                0
+            });
+            assert_eq!(app.run_with_args(&arguments), glib::ExitCode::SUCCESS);
+            let (actual_game, actual_fullscreen) = observed.borrow_mut().take().unwrap();
+            assert_eq!(actual_fullscreen, fullscreen);
+            assert_eq!(
+                actual_game.as_deref().map(|path| std::path::Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()),
+                game
+            );
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

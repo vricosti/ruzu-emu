@@ -291,6 +291,7 @@ pub struct Values {
     pub pause_tas_on_load: Setting<bool>,
     pub tas_enable: Setting<bool>,
     pub tas_loop: Setting<bool>,
+    pub tas_show_recording_dialog: Setting<bool>,
 
     pub mouse_panning: Setting<bool>,
     pub mouse_panning_sensitivity: Setting<u8>,
@@ -596,6 +597,10 @@ impl Values {
                 vibration_enabled,
                 enable_accurate_vibrations,
                 motion_enabled,
+                pause_tas_on_load,
+                tas_enable,
+                tas_loop,
+                tas_show_recording_dialog,
             ),
             Category::Network => visit!(network_interface, airplane_mode,),
             _ => {}
@@ -1381,6 +1386,7 @@ impl Default for Values {
             pause_tas_on_load: Setting::new(true, "pause_tas_on_load", Controls),
             tas_enable: Setting::new(false, "tas_enable", Controls),
             tas_loop: Setting::new(false, "tas_loop", Controls),
+            tas_show_recording_dialog: Setting::new(true, "tas_show_recording_dialog", Controls),
 
             mouse_panning: Setting::with_options(
                 false,
@@ -2313,6 +2319,22 @@ mod tests {
         });
         assert!(labels.iter().any(|label| label == "disable_wgi_xinput"));
         assert!(labels.iter().any(|label| label == "enable_raw_input"));
+    }
+
+    #[test]
+    fn tas_settings_match_upstream_defaults_and_persistence() {
+        let mut values = Values::default();
+        assert!(*values.pause_tas_on_load.get_value());
+        assert!(!*values.tas_enable.get_value());
+        assert!(!*values.tas_loop.get_value());
+        assert!(*values.tas_show_recording_dialog.get_value());
+        let mut labels = Vec::new();
+        values.for_each_setting_in_category_mut(Category::Controls, |setting| {
+            labels.push(setting.label().to_string());
+        });
+        for label in ["pause_tas_on_load", "tas_enable", "tas_loop", "tas_show_recording_dialog"] {
+            assert_eq!(labels.iter().filter(|entry| entry.as_str() == label).count(), 1);
+        }
     }
 
     #[test]

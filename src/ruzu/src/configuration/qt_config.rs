@@ -260,7 +260,7 @@ pub fn save_shortcut_values() -> io::Result<()> {
     std::fs::write(path, contents)
 }
 
-/// Persist the three settings owned by upstream `ConfigureTasDialog`.
+/// Persist the four settings owned by upstream `ConfigureTasDialog`.
 pub fn save_tas_values() -> io::Result<()> {
     let path = config_path();
     let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
@@ -280,6 +280,11 @@ pub fn save_tas_values() -> io::Result<()> {
             "tas_loop",
             *values.tas_loop.get_value(),
             *values.tas_loop.get_default(),
+        ),
+        (
+            "tas_show_recording_dialog",
+            *values.tas_show_recording_dialog.get_value(),
+            *values.tas_show_recording_dialog.get_default(),
         ),
     ] {
         contents = replace_section_setting(

@@ -13262,3 +13262,40 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
   reports archive errors through the existing completion dialog. Eden delegates its
   raw-key chooser to QtCommon::Content::InstallKeys. French translations cover the new
   filter and error text; emulation-running guard and completion behavior are unchanged.
+
+## 2026-09-08 — src/ruzu/src/main_window.rs vs yuzu/main_window.{h,cpp}
+
+### Intentional differences
+
+- GTK status callbacks may reenter during SDL's macOS HID event pump. A busy
+  InputSubsystem or session RefCell defers the cosmetic TAS refresh to the next
+  timer tick, retaining its previous state instead of panicking or reporting Stopped.
+  Session and input borrows end before GTK updates; input pumping and recording
+  cadence are unchanged. Two focused tests exercise busy and shared-owner access.
+- OnTasRecord retains the upstream recording-dialog guard across the asynchronous
+  GTK confirmation. Disabling tas_show_recording_dialog saves with overwrite=true,
+  as upstream does; confirmation still defaults to Yes.
+
+## 2026-09-08 — src/ruzu/src/configuration/configure_tas.rs vs yuzu/configuration/configure_tas.{h,cpp,ui}
+
+### Intentional differences
+
+- GTK frames reproduce the TAS / Settings / Script Directory groups, explanation,
+  warning, four checkbox labels and order, disabled pause-on-load checkbox, spacer,
+  and OK/Cancel actions. Native GTK styling replaces Qt widget metrics.
+- The asynchronous directory chooser starts at the edited path, preserves the path
+  on cancellation and appends a trailing slash on selection. Translation is applied
+  when opening the dialog rather than through Qt LanguageChange events.
+
+## 2026-09-08 — src/common/src/settings.rs and src/ruzu/src/configuration/qt_config.rs vs common/settings.h and frontend_common/config.{h,cpp}
+
+### Intentional differences
+
+- The Rust category visitor explicitly registers all four TAS settings where Eden
+  uses Setting linkage. The previously missing tas_show_recording_dialog defaults
+  to true. Existing TAS settings now participate in generic category reload/save,
+  not only the dialog's dedicated INI writer. Local Values tests verify defaults
+  and registration without modifying the user's configuration.
+- The GTK dialog persists its four Controls keys plus TAS directory on acceptance;
+  Eden applies through its long-lived Qt configuration owner. No serialized binary
+  payloads are changed by this UI/settings slice.

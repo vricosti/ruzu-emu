@@ -47,6 +47,42 @@ const DEFAULT_WIDTH: i32 = 1280;
 const DEFAULT_MOUSE_HIDE_TIMEOUT: u64 = 2500;
 const DEFAULT_HEIGHT: i32 = 720;
 
+/// Snapshot the TAS owner before touching GTK. SDL's macOS HID enumeration can
+/// dispatch nested main-loop callbacks while InputSubsystem is mutably borrowed.
+/// A busy owner means defer this display refresh, not that TAS has stopped.
+fn try_tas_ui_status(
+    input: &RefCell<input_common::main_common::InputSubsystem>,
+) -> Result<
+    Option<(input_common::drivers::tas_input::TasState, usize,
+        [usize; input_common::drivers::tas_input::PLAYER_NUMBER])>,
+    std::cell::BorrowError,
+> {
+    let tas = input.try_borrow()?.get_tas();
+    Ok(tas.map(|tas| tas.lock().get_status()))
+}
+
+#[cfg(test)]
+mod tas_reentrancy_tests {
+    use super::*;
+
+    #[test]
+    fn nested_tas_refresh_defers_until_input_pump_releases_owner() {
+        let input = RefCell::new(input_common::main_common::InputSubsystem::new());
+        let pumping = input.borrow_mut();
+        assert!(try_tas_ui_status(&input).is_err());
+        drop(pumping);
+        assert_eq!(try_tas_ui_status(&input).unwrap(), None);
+        assert!(input.try_borrow_mut().is_ok(), "snapshot must not retain a borrow across GTK calls");
+    }
+
+    #[test]
+    fn shared_input_reader_does_not_block_tas_refresh() {
+        let input = RefCell::new(input_common::main_common::InputSubsystem::new());
+        let _reader = input.borrow();
+        assert_eq!(try_tas_ui_status(&input).unwrap(), None);
+    }
+}
+
 fn idle_window_title() -> String {
     format!(
         "{} | {} | {}",
@@ -419,6 +455,7 @@ pub struct GMainWindow {
     status_bar: Rc<StatusBar>,
     /// Last TAS state reflected in the menu labels.
     tas_state: Cell<input_common::drivers::tas_input::TasState>,
+    is_tas_recording_dialog_active: Cell<bool>,
     /// Prevent duplicate asynchronous amiibo file choosers.
     is_amiibo_file_select_active: Cell<bool>,
     /// Native render-window handles for the running game, so it can be resized
@@ -1306,6 +1343,7 @@ impl GMainWindow {
             profile_selection_pending: Cell::new(false),
             status_bar,
             tas_state: Cell::new(input_common::drivers::tas_input::TasState::Stopped),
+            is_tas_recording_dialog_active: Cell::new(false),
             is_amiibo_file_select_active: Cell::new(false),
             render: RefCell::new(None),
             mouse_hide_timer: RefCell::new(None),
@@ -3268,7 +3306,7 @@ impl GMainWindow {
     }
 
     fn on_tas_record(self: &Rc<Self>) {
-        if self.session.borrow().is_none() {
+        if self.session.borrow().is_none() || self.is_tas_recording_dialog_active.get() {
             return;
         }
         self.reset_tas_system_buttons();
@@ -3280,13 +3318,25 @@ impl GMainWindow {
             return;
         }
         self.refresh_tas_ui();
+        if !*common::settings::values().tas_show_recording_dialog.get_value() {
+            tas.lock().save_recording(true);
+            return;
+        }
+        self.is_tas_recording_dialog_active.set(true);
+        let this = Rc::downgrade(self);
         crate::gtk_compat::ask_question(
             Some(&self.window),
             "TAS Recording",
             "Overwrite file of player 1?",
             "No",
             "Yes",
-            move |overwrite| tas.lock().save_recording(overwrite),
+            move |overwrite| {
+                tas.lock().save_recording(overwrite);
+                if let Some(this) = this.upgrade() {
+                    this.is_tas_recording_dialog_active.set(false);
+                    this.refresh_tas_ui();
+                }
+            },
         );
     }
 
@@ -3301,11 +3351,16 @@ impl GMainWindow {
     fn refresh_tas_ui(&self) {
         use input_common::drivers::tas_input::TasState;
 
-        let status = if self.session.borrow().is_some() {
-            self.input_subsystem
-                .borrow()
-                .get_tas()
-                .map(|tas| tas.lock().get_status())
+        let Ok(session) = self.session.try_borrow() else {
+            return;
+        };
+        let running = session.is_some();
+        drop(session);
+        let status = if running {
+            let Ok(status) = try_tas_ui_status(&self.input_subsystem) else {
+                return;
+            };
+            status
         } else {
             None
         };
@@ -5096,11 +5151,14 @@ impl GMainWindow {
                 #[upgrade_or]
                 glib::ControlFlow::Break,
                 move || {
-                    let session = this.session.borrow();
+                    let Ok(session) = this.session.try_borrow() else {
+                        return glib::ControlFlow::Continue;
+                    };
                     let results = session.as_ref().and_then(EmulationSession::perf_stats);
                     let shaders_building = session
                         .as_ref()
                         .and_then(EmulationSession::shaders_building);
+                    drop(session);
                     this.status_bar
                         .update_performance(results, shaders_building);
                     this.refresh_tas_ui();

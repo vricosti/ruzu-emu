@@ -1,5 +1,30 @@
 # Upstream parity notes
 
+## 2026-09-08 — src/core/src/hle/kernel/board/k_system_control.rs vs core/hle/kernel/board/nintendo/nx/k_system_control.{h,cpp}
+
+### Intentional differences
+- The applet-pool `UNIMPLEMENTED_IF` diagnostics in secure allocation/free use
+  explicit logging followed by the existing `common::assert::assert_fail_soft_impl`
+  rather than a C++ macro. With debug assertions disabled, control continues to
+  the existing aligned pool allocation/free, instead of unwinding across a fibre
+  entry point. Debug-assert policy is still honored; size and allocation-failure
+  validation remain active. Re-read both upstream methods and assert.{h,cpp}.
+- The regression runs its debug-assert setting in a child process and verifies
+  alignment rejection, successful allocation, free-size restoration and exhaustion.
+
+## 2026-09-08 — src/core/src/hle/kernel/k_thread.rs vs core/hle/kernel/k_thread.{h,cpp}
+
+### Intentional differences
+- `WaitCancel` uses the existing Rust scheduler-lock accessor (optional only for
+  standalone test kernels). The lock now covers both the cancellable-state check
+  and the pending-cancellation latch, as in C++; locking only inside `CancelWait`
+  cannot serialize the latch with wait registration. The existing Rust queue
+  adapter still owns response publication and clearing the synchronization index.
+- A two-thread regression holds the registration lock across the cancellation
+  check and `BeginWait`, verifying that cancellation cannot complete in between.
+  It fails without the outer lock and passes with it. Upstream declaration and
+  `WaitCancel` body re-read after the change; no layout or ownership changes.
+
 ## 2026-09-08 - Metal clear pass reuse vs blit_image.h/.cpp and vk_scheduler.h/.cpp
 
 ### Intentional differences
@@ -16544,6 +16569,24 @@ unchanged.
 - Tests cover cache identity, distinct keys, validation even on hits, and depth-state survival after cache destruction. Full release video_core with Metal validation: 1825 passed, 4 ignored, no warnings. Runtime measurements are tracked in METAL_SHADER_COST_STATE.md.
 - First bounded release hall run: 23.87 FPS versus 20.93 in the preceding profiled run; not yet repeated. Pipeline lookup samples fall from 11.1% to 5.3% of the GPU thread. Captures show no obvious corruption, memory/disk guards remain below limits. This does not establish a hardware ceiling or cross-title performance gain.
 
+## 2026-09-08 — src/core/src/hle/service/filesystem/save_data_controller.rs vs core/hle/service/filesystem/save_data_controller.{h,cpp}
+
+### Intentional differences
+- ReadSaveDataSize borrows System for the call instead of storing its non-owning reference. Metadata lookup remains in the file-local GetDefaultSaveDataSize counterpart. The AM caller releases the Rust filesystem-controller mutex before metadata lookup reacquires it; the factory mutex is also released before lookup. Upstream uses non-mutex references here.
+- Existing optional factory construction is retained; size operations require an initialized factory, as upstream does. Missing control metadata uses the upstream fallback; an absent content provider is treated as missing metadata in an uninitialized test System.
+
+### Verification
+- Re-read the header and implementation, plus savedata_factory persistence. Only an all-zero size pair triggers default lookup and persistence. Nonzero pairs are returned unchanged; writes delegate to the existing factory. Tests exercise reopening, partial-zero pairs, large values and separation by program/user.
+
+## 2026-09-08 — src/core/src/hle/service/am/service/application_functions.rs vs core/hle/service/am/service/application_functions.{h,cpp}
+
+### Intentional differences
+- The word-based Rust IPC parser reads the one-byte type and adjacent 16-byte UUID together; a mechanical local parser is shared by commands 25/26. Invalid type bytes return an argument error rather than constructing an invalid Rust enum. Upstream allows arbitrary enum bit patterns.
+- UUID bytes are decoded into two little-endian words, matching UUID::AsU128 on supported little-endian hosts. Extension sizes follow at byte offsets 24/32; responses use explicit u64 serialization rather than native struct copies.
+
+### Verification
+- Re-read both command declarations/bodies, UUID layout and CMIF alignment calculation. GetSaveDataSize reads the applet's program ID through the filesystem controller; ExtendSaveData persists both sizes then reports zero required space. No game-specific behavior or identifiers were added. The synthetic packed-identity test uses nonzero padding to detect offset mistakes.
+
 ## 2026-09-08 - MSL precise helper optimization vs backend/spirv/emit_spirv_floating_point.cpp
 
 ### Intentional differences
@@ -16554,3 +16597,13 @@ unchanged.
 - Re-read Eden emit_spirv_instructions.h declarations, emit_spirv_floating_point.cpp Decorate/Add/Mul/Fma and frontend/ir/modifiers.h. Instruction-level no_contraction selection is unchanged; no guest or resource ABI changes. Source-generation expectations now also require the pragma.
 - M2 Pro native differential test: 73728 triples, zero differing words in MSL 2.3 and 4.0. Full release suites with Metal validation: shader_recompiler 576 passed; video_core 1824 passed, 4 ignored; no warnings.
 - Scene-matched release GUI comparison: baseline 15.91 FPS, optimized 20.80 FPS, optimized repeat 20.81 FPS in the late hall window. Captures show no obvious geometry corruption; not a deterministic pixel oracle. Rebuilt/signed app is available. Memory, swap caveats, exact artifacts and remaining cross-title validation are recorded in METAL_SHADER_COST_STATE.md.
+## 2026-09-08 — src/core/src/hle/service/ns/vulnerability_manager_interface.rs vs core/hle/service/ns/vulnerability_manager_interface.{h,cpp}
+
+### Intentional differences
+- The existing Rust result-returning `needs_update_vulnerability` method is now
+  connected through a file-owned IPC callback rather than C++ CMIF template
+  dispatch. The callback writes success and false, matching the upstream bool
+  output; commands 1201 and 1202 remain unimplemented as upstream.
+- A synthetic regression invokes the registered callback and checks the result,
+  false output and absence of outgoing copy objects. Header and implementation
+  were reread after wiring the callback.

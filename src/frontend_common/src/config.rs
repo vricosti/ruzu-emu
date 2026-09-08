@@ -2229,6 +2229,27 @@ mod tests {
     }
 
     #[test]
+    fn gpu_logging_settings_round_trip_independently() {
+        use common::settings_enums::GpuLogLevel;
+        for index in 0..5 {
+            for dumps in [false, true] {
+                let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+                config.begin_group("Debugging");
+                let mut source = common::settings::Values::default();
+                source.gpu_log_level.set_value(GpuLogLevel::from_u32(index).unwrap());
+                source.gpu_log_shader_dumps.set_value(dumps);
+                config.write_setting_generic(&mut source.gpu_log_level);
+                config.write_setting_generic(&mut source.gpu_log_shader_dumps);
+                let mut loaded = common::settings::Values::default();
+                config.read_setting_generic(&mut loaded.gpu_log_level);
+                config.read_setting_generic(&mut loaded.gpu_log_shader_dumps);
+                assert_eq!(*loaded.gpu_log_level.get_value() as u32, index);
+                assert_eq!(*loaded.gpu_log_shader_dumps.get_value(), dumps);
+            }
+        }
+    }
+
+    #[test]
     fn scaling_filter_round_trips_the_full_upstream_enum_range() {
         use common::settings_common::Specialization;
         use common::settings_enums::{Category, ScalingFilter};

@@ -45,6 +45,14 @@ pub fn page(runtime_lock: bool) -> Page {
     let log_filter_value = common::settings::values().log_filter.get_value().clone();
     let (log_filter_row, log_filter) = w::entry_row("Global Log Filter", &log_filter_value);
     logging.append(&log_filter_row);
+    let (gpu_log_row, gpu_log_level) = w::combo_row(
+        "GPU Logging/Level",
+        &["Off", "Errors", "Standard", "Verbose", "All"],
+        *common::settings::values().gpu_log_level.get_value() as u32,
+    );
+    gpu_log_level.set_sensitive(runtime_lock);
+    gpu_log_level.set_tooltip_text(Some("Detail level for GPU logs. Off disables logging entirely."));
+    logging.append(&gpu_log_row);
     let show_console = w::check_row(
         "Show Log in Console",
         crate::uisettings::with(|v| *v.show_console.get_value()),
@@ -125,6 +133,13 @@ pub fn page(runtime_lock: bool) -> Page {
         "Disable Macro HLE",
         *common::settings::values().disable_macro_hle.get_value(),
     );
+    let gpu_log_shader_dumps = w::check_row(
+        "Dump SPIR-V Shaders",
+        *common::settings::values().gpu_log_shader_dumps.get_value(),
+    );
+    // Upstream's tooltip still says LogDir/shaders, but DumpSpirvShader writes
+    // directly into DumpDir in both implementations.
+    gpu_log_shader_dumps.set_tooltip_text(Some("Dump compiled SPIR-V binaries (.spv) to the configured dump directory."));
     for check in [
         &renderer_debug,
         &renderdoc_hotkey,
@@ -136,6 +151,7 @@ pub fn page(runtime_lock: bool) -> Page {
         &disable_macro_jit,
         &dump_macros,
         &disable_macro_hle,
+        &gpu_log_shader_dumps,
     ] {
         check.set_sensitive(runtime_lock);
         graphics.append(check);
@@ -244,6 +260,11 @@ pub fn page(runtime_lock: bool) -> Page {
         values.use_gdbstub.set_value(gdb);
         values.gdbstub_port.set_value(port);
         values.log_filter.set_value(filter);
+        values.gpu_log_level.set_value(
+            common::settings_enums::GpuLogLevel::from_u32(gpu_log_level.selected())
+                .unwrap_or(common::settings_enums::GpuLogLevel::Off),
+        );
+        values.gpu_log_shader_dumps.set_value(gpu_log_shader_dumps.is_active());
         values.extended_logging.set_value(extended);
         values.program_args.set_value(args);
 
@@ -338,20 +359,42 @@ mod tests {
         let manager = KeyManager::instance();
         assert_eq!(manager.lock().unwrap().get_key_128(S128KeyType::Master, 0, 0), [0x11; 16]);
 
-        fn find_switch(widget: &gtk::Widget) -> Option<gtk::CheckButton> {
+        fn find_switch(widget: &gtk::Widget, label: &str) -> Option<gtk::CheckButton> {
             if let Some(check) = widget.downcast_ref::<gtk::CheckButton>() {
-                if check.label().as_deref() == Some("Use dev.keys") {
+                if check.label().as_deref() == Some(label) {
                     return Some(check.clone());
                 }
             }
             let mut child = widget.first_child();
             while let Some(widget) = child {
-                if let Some(check) = find_switch(&widget) { return Some(check); }
+                if let Some(check) = find_switch(&widget, label) { return Some(check); }
                 child = widget.next_sibling();
             }
             None
         }
+        fn find_gpu_level(widget: &gtk::Widget) -> Option<gtk::DropDown> {
+            if let Some(combo) = widget.downcast_ref::<gtk::DropDown>() { return Some(combo.clone()); }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(combo) = find_gpu_level(&widget) { return Some(combo); }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        {
+            let mut values = common::settings::values_mut();
+            values.gpu_log_level.set_value(common::settings_enums::GpuLogLevel::Standard);
+            values.gpu_log_shader_dumps.set_value(true);
+        }
+        let locked_page = page(false);
+        assert!(!find_gpu_level(&locked_page.widget).unwrap().is_sensitive());
+        assert!(!find_switch(&locked_page.widget, "Dump SPIR-V Shaders").unwrap().is_sensitive());
         let page = page(true);
+        let gpu_level = find_gpu_level(&page.widget).unwrap();
+        let gpu_dumps = find_switch(&page.widget, "Dump SPIR-V Shaders").unwrap();
+        assert_eq!(gpu_level.selected(), 2);
+        assert!(gpu_dumps.is_active());
+        assert!(gpu_level.is_sensitive() && gpu_dumps.is_sensitive());
         fn find_filter(widget: &gtk::Widget) -> Option<gtk::Entry> {
             if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
                 if entry.text() == "*:Warning" { return Some(entry.clone()); }
@@ -364,13 +407,21 @@ mod tests {
             None
         }
         find_filter(&page.widget).expect("global log filter entry").set_text("*:Info");
-        let check = find_switch(&page.widget).expect("Use dev.keys row");
+        let check = find_switch(&page.widget, "Use dev.keys").expect("Use dev.keys row");
         assert!(!check.is_active());
         for (enabled, expected) in [(true, 0x22), (false, 0x11)] {
             check.set_active(enabled);
             (page.apply)();
             assert_eq!(*common::settings::values().use_dev_keys.get_value(), enabled);
             assert_eq!(manager.lock().unwrap().get_key_128(S128KeyType::Master, 0, 0), [expected; 16]);
+        }
+        for index in 0..5 {
+            gpu_level.set_selected(index);
+            gpu_dumps.set_active(index % 2 == 0);
+            (page.apply)();
+            let values = common::settings::values();
+            assert_eq!(*values.gpu_log_level.get_value() as u32, index);
+            assert_eq!(*values.gpu_log_shader_dumps.get_value(), index % 2 == 0);
         }
         log::info!("after_apply_visible");
         common::logging::backend::stop();

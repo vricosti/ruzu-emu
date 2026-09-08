@@ -12,20 +12,11 @@ use std::sync::Mutex;
 use super::mt19937::Mt19937;
 use super::spl_results;
 use super::spl_types::ConfigItem;
+use crate::hle::api_version;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
-
-/// Atmosphere release version constants.
-///
-/// Corresponds to `HLE::ApiVersion::ATMOSPHERE_RELEASE_VERSION_*` in upstream.
-const ATMOSPHERE_RELEASE_VERSION_MAJOR: u64 = 1;
-const ATMOSPHERE_RELEASE_VERSION_MINOR: u64 = 0;
-const ATMOSPHERE_RELEASE_VERSION_MICRO: u64 = 0;
-
-/// Target firmware version (placeholder).
-const TARGET_FIRMWARE: u64 = 0x0E0000000; // ~14.0.0
 
 /// IPC command table for Module::Interface (IGeneralInterface).
 pub mod commands {
@@ -113,10 +104,10 @@ impl ModuleInterface {
             }
             Some(ConfigItem::ExosphereApiVersion) => {
                 // Get information about the current exosphere version.
-                let value = (ATMOSPHERE_RELEASE_VERSION_MAJOR << 56)
-                    | (ATMOSPHERE_RELEASE_VERSION_MINOR << 48)
-                    | (ATMOSPHERE_RELEASE_VERSION_MICRO << 40)
-                    | TARGET_FIRMWARE;
+                let value = (u64::from(api_version::ATMOSPHERE_RELEASE_VERSION_MAJOR) << 56)
+                    | (u64::from(api_version::ATMOSPHERE_RELEASE_VERSION_MINOR) << 48)
+                    | (u64::from(api_version::ATMOSPHERE_RELEASE_VERSION_MICRO) << 40)
+                    | u64::from(api_version::get_target_firmware());
                 Ok(value)
             }
             Some(ConfigItem::ExosphereNeedsReboot) => {
@@ -198,6 +189,22 @@ impl ModuleInterface {
     pub fn get_boot_reason(&self) -> ResultCode {
         log::warn!("GetBootReason is not implemented!");
         spl_results::RESULT_SECURE_MONITOR_NOT_IMPLEMENTED
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exosphere_version_uses_the_shared_api_version_owner() {
+        let service = ModuleInterface::new("spl:", Some(0));
+        let value = service.get_config(ConfigItem::ExosphereApiVersion as u32).unwrap();
+        assert_eq!(value as u32, api_version::get_target_firmware());
+        assert_eq!((value >> 56) as u8, api_version::ATMOSPHERE_RELEASE_VERSION_MAJOR);
+        assert_eq!((value >> 48) as u8, api_version::ATMOSPHERE_RELEASE_VERSION_MINOR);
+        assert_eq!((value >> 40) as u8, api_version::ATMOSPHERE_RELEASE_VERSION_MICRO);
+        assert_eq!((value >> 32) as u8, 0);
     }
 }
 

@@ -2,12 +2,12 @@
 
 <#
 .SYNOPSIS
-Builds a self-contained Ruzu Windows directory and NSIS installer.
+Builds a self-contained Ruzu Windows directory, ZIP archive and NSIS installer.
 
 .DESCRIPTION
 The script stages the Rust executables, the dynamic vcpkg runtime, GTK/GLib
 data files, licenses and documentation under target\package. It then invokes
-the Ruzu NSIS installer definition in this directory.
+the Ruzu NSIS installer definition in this directory and archives the staged runtime.
 
 Run build.bat once before this script so the x64 MSVC and vcpkg environment is
 available. Cargo builds SDL3 statically; GTK, FFmpeg, OpenSSL and their runtime
@@ -276,7 +276,7 @@ else {
 }
 $binaryDirectory = Join-Path $targetRoot $Profile
 $packageRoot = Join-Path $targetRoot "package"
-$stageDirectory = Join-Path $packageRoot "Ruzu-Windows-$Version-$Architecture-$Variant"
+$stageDirectory = Join-Path $packageRoot "Ruzu-Windows-v$Version-$Architecture-$Variant"
 $outputDirectory = $packageRoot
 
 if (Test-Path -LiteralPath $stageDirectory) {
@@ -366,9 +366,17 @@ finally {
     Pop-Location
 }
 
-$installer = Join-Path $outputDirectory "Ruzu-Windows-$Version-$Architecture-$Variant-installer.exe"
+$installer = Join-Path $outputDirectory "Ruzu-Windows-v$Version-$Architecture-$Variant-installer.exe"
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "NSIS completed without producing the expected installer: $installer"
 }
 Write-Host "Created Windows installer:"
 Write-Host "  $installer"
+
+$archive = Join-Path $outputDirectory "Ruzu-Windows-v$Version-$Architecture-$Variant.zip"
+Compress-Archive -LiteralPath $stageDirectory -DestinationPath $archive -CompressionLevel Optimal -Force
+if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+    throw "The standalone ZIP archive was not produced: $archive"
+}
+Write-Host "Created standalone Windows ZIP:"
+Write-Host "  $archive"

@@ -34,7 +34,7 @@ RequestExecutionLevel user
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 
 Name "${PRODUCT_NAME}"
-OutFile "${OUTPUT_DIR}\${PRODUCT_NAME}-Windows-${PRODUCT_VERSION}-${ARCH}-${VARIANT}-installer.exe"
+OutFile "${OUTPUT_DIR}\${PRODUCT_NAME}-Windows-v${PRODUCT_VERSION}-${ARCH}-${VARIANT}-installer.exe"
 SetCompressor /SOLID lzma
 InstallDir "$LOCALAPPDATA\Programs\${PRODUCT_NAME}"
 InstallDirRegKey HKCU "${PRODUCT_UNINST_KEY}" "InstallLocation"

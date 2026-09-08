@@ -75,13 +75,21 @@ fn set_connectable_controllers(
     use hid_core::hid_types::NpadStyleSet as S;
     let mut rows = Vec::new();
     let mut add = |flag, kind, label| {
-        if styles.raw.contains(flag) { rows.push((kind, label)); }
+        if styles.raw.contains(flag) {
+            rows.push((kind, label));
+        }
     };
     add(S::FULLKEY, ControllerType::ProController, "Pro Controller");
-    add(S::JOY_DUAL, ControllerType::DualJoyconDetached, "Dual Joycons");
+    add(
+        S::JOY_DUAL,
+        ControllerType::DualJoyconDetached,
+        "Dual Joycons",
+    );
     add(S::JOY_LEFT, ControllerType::LeftJoycon, "Left Joycon");
     add(S::JOY_RIGHT, ControllerType::RightJoycon, "Right Joycon");
-    if player_index == 0 { add(S::HANDHELD, ControllerType::Handheld, "Handheld"); }
+    if player_index == 0 {
+        add(S::HANDHELD, ControllerType::Handheld, "Handheld");
+    }
     add(S::GC, ControllerType::GameCube, "GameCube Controller");
     if enable_all {
         add(S::PALMA, ControllerType::Pokeball, "Poke Ball Plus");
@@ -95,8 +103,10 @@ fn set_connectable_controllers(
 
 /// ConfigureInputPlayer::GetIndexFromControllerType returns -1 when absent.
 fn get_index_from_controller_type(rows: &[(ControllerType, &str)], kind: ControllerType) -> u32 {
-    rows.iter().position(|(candidate, _)| *candidate == kind)
-        .map(|index| index as u32).unwrap_or(gtk::INVALID_LIST_POSITION)
+    rows.iter()
+        .position(|(candidate, _)| *candidate == kind)
+        .map(|index| index as u32)
+        .unwrap_or(gtk::INVALID_LIST_POSITION)
 }
 
 /// The label upstream shows for an unmapped binding.
@@ -425,6 +435,41 @@ impl PlayerPage {
         *self.controller.borrow_mut() = Some(selected);
     }
 
+    fn button_to_text(&self, serialized: &str) -> String {
+        use common::input::ButtonNames as B;
+        let params = common::param_package::ParamPackage::from_serialized(serialized);
+        let name = self
+            .input_subsystem
+            .borrow()
+            .as_ref()
+            .map(|subsystem| subsystem.borrow().get_button_name(&params));
+        let physical_label = self
+            .input_subsystem
+            .borrow()
+            .as_ref()
+            .and_then(|subsystem| subsystem.borrow().get_button_display_name(&params));
+        let label = if let Some(label) = physical_label {
+            label
+        } else {
+            match name {
+                Some(B::ButtonA) => "A",
+                Some(B::ButtonB) => "B",
+                Some(B::ButtonX) => "X",
+                Some(B::ButtonY) => "Y",
+                Some(B::Cross) => "✕",
+                Some(B::Circle) => "○",
+                Some(B::Square) => "□",
+                Some(B::Triangle) => "△",
+                _ => return button_to_text(serialized),
+            }
+        };
+        let enabled = |key| params.get_int(key, 0) != 0 || params.get_str(key, "") == "true";
+        let turbo = if enabled("turbo") { "$" } else { "" };
+        let toggle = if enabled("toggle") { "~" } else { "" };
+        let inverted = if enabled("inverted") { "!" } else { "" };
+        format!("{turbo}{toggle}{inverted}{label}")
+    }
+
     fn update_ui(&self) {
         self.refresh_devices();
         // GTK emits value-changed synchronously from set_value(). Keep no
@@ -435,7 +480,7 @@ impl PlayerPage {
             let text = state
                 .buttons
                 .get(*index)
-                .map(|param| button_to_text(param))
+                .map(|param| self.button_to_text(param))
                 .unwrap_or_else(|| NOT_SET.to_string());
             button.set_label(&text);
         }
@@ -443,7 +488,15 @@ impl PlayerPage {
             let text = state
                 .analogs
                 .get(*index)
-                .map(|param| analog_to_text(param, *direction))
+                .map(|param| {
+                    let mapping = common::param_package::ParamPackage::from_serialized(param);
+                    let nested = mapping.get_str(direction.parameter_key(), "");
+                    if nested.is_empty() {
+                        analog_to_text(param, *direction)
+                    } else {
+                        self.button_to_text(&nested)
+                    }
+                })
                 .unwrap_or_else(|| NOT_SET.to_string());
             button.set_label(&text);
         }
@@ -451,7 +504,7 @@ impl PlayerPage {
             let text = state
                 .motions
                 .get(*index)
-                .map(|param| button_to_text(param))
+                .map(|param| self.button_to_text(param))
                 .unwrap_or_else(|| NOT_SET.to_string());
             button.set_label(&text);
         }
@@ -487,7 +540,7 @@ impl PlayerPage {
 
             controls
                 .modifier_button
-                .set_label(&button_to_text(&param.get_str("modifier", "")));
+                .set_label(&self.button_to_text(&param.get_str("modifier", "")));
 
             if is_controller {
                 let deadzone = (param.get_float("deadzone", 0.15) * 100.0) as i32;
@@ -812,8 +865,14 @@ pub fn page(
     *page.input_subsystem.borrow_mut() = Some(Rc::clone(&input_subsystem));
     let initial_type = state.borrow().controller_type;
     let supported_styles = hid_core.lock().get_supported_style_tag();
-    let enable_all = *common::settings::values().enable_all_controllers.get_value();
-    let controller_types = Rc::new(set_connectable_controllers(supported_styles, index, enable_all));
+    let enable_all = *common::settings::values()
+        .enable_all_controllers
+        .get_value();
+    let controller_types = Rc::new(set_connectable_controllers(
+        supported_styles,
+        index,
+        enable_all,
+    ));
 
     install_group_style();
 
@@ -831,7 +890,10 @@ pub fn page(
     connected.set_active(state.borrow().connected);
     let type_labels: Vec<&str> = controller_types.iter().map(|(_, l)| *l).collect();
     let controller_type = w::combo(&type_labels, 0);
-    controller_type.set_selected(get_index_from_controller_type(&controller_types, initial_type));
+    controller_type.set_selected(get_index_from_controller_type(
+        &controller_types,
+        initial_type,
+    ));
     connect_box.append(&connected);
     connect_box.append(&controller_type);
     header.append(&connect_box);
@@ -1270,7 +1332,10 @@ pub fn page(
 
             page.state.borrow_mut().profile_name = profile_name;
             let selected_type = page.state.borrow().controller_type;
-            controller_type.set_selected(get_index_from_controller_type(&controller_types, selected_type));
+            controller_type.set_selected(get_index_from_controller_type(
+                &controller_types,
+                selected_type,
+            ));
             page.update_ui();
         });
     }
@@ -2939,14 +3004,15 @@ mod tests {
     fn controller_type_rows_start_with_pro_controller() {
         // The default `PlayerInput::controller_type` is `ProController`; if it
         // were not row 0, a fresh profile would display the wrong type.
-        let rows = set_connectable_controllers(hid_core::hid_types::NpadStyleTag {
-            raw: hid_core::hid_types::NpadStyleSet::all(),
-        }, 0, false);
-        assert_eq!(rows[0].0, ControllerType::ProController);
-        assert_eq!(
-            PlayerInput::default().controller_type,
-            rows[0].0
+        let rows = set_connectable_controllers(
+            hid_core::hid_types::NpadStyleTag {
+                raw: hid_core::hid_types::NpadStyleSet::all(),
+            },
+            0,
+            false,
         );
+        assert_eq!(rows[0].0, ControllerType::ProController);
+        assert_eq!(PlayerInput::default().controller_type, rows[0].0);
     }
 
     #[test]
@@ -2954,30 +3020,50 @@ mod tests {
         use hid_core::hid_types::{NpadStyleSet as S, NpadStyleTag};
         use ControllerType as C;
         let expected = [
-            (S::FULLKEY, C::ProController), (S::JOY_DUAL, C::DualJoyconDetached),
-            (S::JOY_LEFT, C::LeftJoycon), (S::JOY_RIGHT, C::RightJoycon),
-            (S::HANDHELD, C::Handheld), (S::GC, C::GameCube),
-            (S::PALMA, C::Pokeball), (S::LARK, C::NES), (S::LUCIA, C::SNES),
-            (S::LAGOON, C::N64), (S::LAGER, C::SegaGenesis),
+            (S::FULLKEY, C::ProController),
+            (S::JOY_DUAL, C::DualJoyconDetached),
+            (S::JOY_LEFT, C::LeftJoycon),
+            (S::JOY_RIGHT, C::RightJoycon),
+            (S::HANDHELD, C::Handheld),
+            (S::GC, C::GameCube),
+            (S::PALMA, C::Pokeball),
+            (S::LARK, C::NES),
+            (S::LUCIA, C::SNES),
+            (S::LAGOON, C::N64),
+            (S::LAGER, C::SegaGenesis),
         ];
         for player in 0..8 {
             for enable_all in [false, true] {
-                let rows = set_connectable_controllers(NpadStyleTag { raw: S::all() }, player, enable_all);
+                let rows =
+                    set_connectable_controllers(NpadStyleTag { raw: S::all() }, player, enable_all);
                 let kinds: Vec<_> = rows.iter().map(|(kind, _)| *kind).collect();
-                let expected_kinds: Vec<_> = expected.iter().enumerate()
-                    .filter(|(index, (_, kind))| (enable_all || *index < 6)
-                        && (player == 0 || *kind != C::Handheld))
-                    .map(|(_, (_, kind))| *kind).collect();
+                let expected_kinds: Vec<_> = expected
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, (_, kind))| {
+                        (enable_all || *index < 6) && (player == 0 || *kind != C::Handheld)
+                    })
+                    .map(|(_, (_, kind))| *kind)
+                    .collect();
                 assert_eq!(kinds, expected_kinds);
                 for (index, &(kind, _)) in rows.iter().enumerate() {
                     assert_eq!(get_index_from_controller_type(&rows, kind), index as u32);
                 }
                 if !enable_all {
-                    assert_eq!(get_index_from_controller_type(&rows, C::NES), gtk::INVALID_LIST_POSITION);
+                    assert_eq!(
+                        get_index_from_controller_type(&rows, C::NES),
+                        gtk::INVALID_LIST_POSITION
+                    );
                 }
-                assert!(set_connectable_controllers(NpadStyleTag { raw: S::empty() }, player, enable_all).is_empty());
+                assert!(set_connectable_controllers(
+                    NpadStyleTag { raw: S::empty() },
+                    player,
+                    enable_all
+                )
+                .is_empty());
                 for (index, &(flag, kind)) in expected.iter().enumerate() {
-                    let single = set_connectable_controllers(NpadStyleTag { raw: flag }, player, enable_all);
+                    let single =
+                        set_connectable_controllers(NpadStyleTag { raw: flag }, player, enable_all);
                     let allowed = (enable_all || index < 6) && (player == 0 || kind != C::Handheld);
                     assert_eq!(single.len(), usize::from(allowed));
                     if allowed {

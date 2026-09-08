@@ -608,6 +608,14 @@ impl InputSubsystem {
         self.imp.get_button_name(params)
     }
 
+    /// Physical SDL labels beyond the upstream ButtonNames vocabulary.
+    pub fn get_button_display_name(&self, params: &ParamPackage) -> Option<&'static str> {
+        if params.get_str("engine", "") != "sdl" {
+            return None;
+        }
+        self.imp.sdl.as_ref()?.get_button_display_name(params)
+    }
+
     /// Returns true if device is a controller.
     /// Port of InputSubsystem::IsController
     pub fn is_controller(&self, params: &ParamPackage) -> bool {

@@ -233,7 +233,11 @@ all build, dependency, runtime-file, and NSIS validations remain enabled.
 
 The script builds both `ruzu.exe` and `ruzu-cmd.exe`, stages the dynamic
 `x64-windows-ruzu` vcpkg DLLs and GTK/GLib runtime data, then writes the package
-and installer under `target\package`. Packaging is accepted only when Ruzu and
+directory, standalone ZIP and NSIS installer under `target\package`. The ZIP contains
+the versioned directory with both executables and their runtime dependencies.
+Windows package names include the tag prefix, for example
+`Ruzu-Windows-v0.0.2-x64-msvc.zip` and `Ruzu-Windows-v0.0.2-x64-msvc-installer.exe`.
+Packaging is accepted only when Ruzu and
 all initialized project submodules are checked out on their `main` branches and
 the submodules match the commits recorded by Ruzu. The advanced staging-only
 and existing-binary modes remain available by invoking

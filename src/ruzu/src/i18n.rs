@@ -552,6 +552,40 @@ mod tests {
     }
 
     #[test]
+    fn game_context_menu_uses_french_translations() {
+        let _guard = test_lock();
+        set_language("fr");
+        for (source, french) in [
+            ("Configure Game", "Configurer le jeu"),
+            ("Create Shortcut", "Créer un raccourci"),
+            ("Add to Desktop", "Ajouter au bureau"),
+            ("Add to Applications Menu", "Ajouter au menu des applications"),
+            (
+                "Start Game without Custom Configuration",
+                "Démarrer le jeu sans configuration custom",
+            ),
+            (
+                "Open Save Data Location",
+                "Ouvrir l'emplacement des données de sauvegarde",
+            ),
+            (
+                "Open Mod Data Location",
+                "Ouvrir l'emplacement des données des mods",
+            ),
+            (
+                "Open Transferable Pipeline Cache",
+                "Ouvrir le cache de pipelines transférable",
+            ),
+        ] {
+            assert_eq!(tr(source), french);
+            set_language("en");
+            assert_eq!(tr(french), source);
+            set_language("fr");
+        }
+        set_language("en");
+    }
+
+    #[test]
     fn multiplayer_menu_uses_edens_french_translations() {
         let _guard = test_lock();
         set_language("fr");

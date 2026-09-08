@@ -272,6 +272,8 @@ fn main() -> glib::ExitCode {
         // system themes rather than forcing one, which is why yuzu renders
         // light on a light Linux desktop and dark on a dark macOS one.
         main_window::update_ui_theme();
+        #[cfg(target_os = "windows")]
+        main_window::watch_system_theme();
         main_window::init_app_menu(app);
     });
 

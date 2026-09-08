@@ -51,6 +51,127 @@ struct SdlState {
 
 type GamepadBindings = Vec<sdl::SDL_GamepadBinding>;
 
+// Display-only extension of GetUIName. Physical names belong to the driver,
+// not the frontend or the persisted raw joystick mapping.
+fn extra_button_label(
+    kind: sdl::SDL_GamepadType,
+    button: sdl::SDL_GamepadButton,
+) -> Option<&'static str> {
+    use sdl::{SDL_GamepadButton as B, SDL_GamepadType as T};
+    let ps = matches!(kind, T::PS3 | T::PS4 | T::PS5);
+    let nx = matches!(
+        kind,
+        T::NINTENDO_SWITCH_PRO
+            | T::NINTENDO_SWITCH_JOYCON_LEFT
+            | T::NINTENDO_SWITCH_JOYCON_RIGHT
+            | T::NINTENDO_SWITCH_JOYCON_PAIR
+    );
+    let xbox = matches!(kind, T::XBOX360 | T::XBOXONE);
+    Some(match button {
+        B::DPAD_UP => "D-Pad Up",
+        B::DPAD_DOWN => "D-Pad Down",
+        B::DPAD_LEFT => "D-Pad Left",
+        B::DPAD_RIGHT => "D-Pad Right",
+        B::BACK if nx => "−",
+        B::START if nx => "+",
+        B::BACK if kind == T::PS5 => "Create",
+        B::BACK if kind == T::PS4 => "Share",
+        B::BACK if kind == T::PS3 => "Select",
+        B::START if kind == T::PS3 => "Start",
+        B::START if ps => "Options",
+        B::BACK if kind == T::XBOX360 => "Back",
+        B::START if kind == T::XBOX360 => "Start",
+        B::BACK if xbox => "View",
+        B::START if xbox => "Menu",
+        B::LEFT_SHOULDER if nx => "L",
+        B::RIGHT_SHOULDER if nx => "R",
+        B::LEFT_SHOULDER if ps => "L1",
+        B::RIGHT_SHOULDER if ps => "R1",
+        B::LEFT_SHOULDER if xbox => "LB",
+        B::RIGHT_SHOULDER if xbox => "RB",
+        B::LEFT_STICK if ps => "L3",
+        B::RIGHT_STICK if ps => "R3",
+        B::LEFT_STICK if nx => "Stick L",
+        B::RIGHT_STICK if nx => "Stick R",
+        B::LEFT_STICK if xbox => "LS",
+        B::RIGHT_STICK if xbox => "RS",
+        B::GUIDE if ps => "PS",
+        B::GUIDE if nx => "Home",
+        B::GUIDE if xbox => "Xbox",
+        B::TOUCHPAD if ps => "Touchpad",
+        B::MISC1 if nx => "Capture",
+        _ => return None,
+    })
+}
+
+fn trigger_label(kind: sdl::SDL_GamepadType, axis: sdl::SDL_GamepadAxis) -> Option<&'static str> {
+    use sdl::{SDL_GamepadAxis as A, SDL_GamepadType as T};
+    let right = match axis {
+        A::LEFT_TRIGGER => false,
+        A::RIGHT_TRIGGER => true,
+        _ => return None,
+    };
+    match kind {
+        T::PS3 | T::PS4 | T::PS5 => Some(if right { "R2" } else { "L2" }),
+        T::XBOX360 | T::XBOXONE => Some(if right { "RT" } else { "LT" }),
+        T::NINTENDO_SWITCH_PRO
+        | T::NINTENDO_SWITCH_JOYCON_LEFT
+        | T::NINTENDO_SWITCH_JOYCON_RIGHT
+        | T::NINTENDO_SWITCH_JOYCON_PAIR => Some(if right { "ZR" } else { "ZL" }),
+        _ => None,
+    }
+}
+
+fn binding_matches_param(binding: &sdl::SDL_GamepadBinding, params: &ParamPackage) -> bool {
+    unsafe {
+        match binding.input_type {
+            sdl::SDL_GAMEPAD_BINDTYPE_BUTTON => {
+                params.has("button") && binding.input.button == params.get_int("button", -1)
+            }
+            sdl::SDL_GAMEPAD_BINDTYPE_HAT => {
+                let direction = match params.get_str("direction", "").as_str() {
+                    "up" => SDL_HAT_UP,
+                    "down" => SDL_HAT_DOWN,
+                    "left" => SDL_HAT_LEFT,
+                    "right" => SDL_HAT_RIGHT,
+                    _ => return false,
+                };
+                params.has("hat")
+                    && binding.input.hat.hat == params.get_int("hat", -1)
+                    && binding.input.hat.hat_mask == i32::from(direction)
+            }
+            sdl::SDL_GAMEPAD_BINDTYPE_AXIS => {
+                let axis = binding.input.axis;
+                let negative = params.get_str("direction", "+") == "-";
+                params.has("axis")
+                    && axis.axis == params.get_int("axis", -1)
+                    && if negative {
+                        axis.axis_min.min(axis.axis_max) < 0
+                    } else {
+                        axis.axis_min.max(axis.axis_max) > 0
+                    }
+            }
+            _ => false,
+        }
+    }
+}
+
+// SDL labels account for Nintendo's reversed letters and PlayStation symbols.
+fn face_button_name(label: sdl::SDL_GamepadButtonLabel) -> ButtonNames {
+    use sdl::SDL_GamepadButtonLabel as L;
+    match label {
+        L::A => ButtonNames::ButtonA,
+        L::B => ButtonNames::ButtonB,
+        L::X => ButtonNames::ButtonX,
+        L::Y => ButtonNames::ButtonY,
+        L::CROSS => ButtonNames::Cross,
+        L::CIRCLE => ButtonNames::Circle,
+        L::SQUARE => ButtonNames::Square,
+        L::TRIANGLE => ButtonNames::Triangle,
+        _ => ButtonNames::Value,
+    }
+}
+
 fn gamepad_bindings(controller: *mut sdl::SDL_Gamepad) -> GamepadBindings {
     if controller.is_null() {
         return Vec::new();
@@ -1183,9 +1304,57 @@ impl SDLDriver {
     }
 
     /// Port of SDLDriver::GetUIName (override)
+    pub fn get_button_display_name(&self, params: &ParamPackage) -> Option<&'static str> {
+        let joystick =
+            self.joystick_by_guid(&params.get_str("guid", ""), params.get_int("port", 0))?;
+        let controller = { joystick.lock().sdl_game_controller() };
+        if controller.is_null() {
+            return None;
+        }
+        let kind = unsafe { sdl::SDL_GetGamepadType(controller) };
+        for binding in gamepad_bindings(controller) {
+            if !binding_matches_param(&binding, params) {
+                continue;
+            }
+            let label = unsafe {
+                match binding.output_type {
+                    sdl::SDL_GAMEPAD_BINDTYPE_BUTTON => {
+                        extra_button_label(kind, binding.output.button)
+                    }
+                    sdl::SDL_GAMEPAD_BINDTYPE_AXIS => trigger_label(kind, binding.output.axis.axis),
+                    _ => None,
+                }
+            };
+            if label.is_some() {
+                return label;
+            }
+        }
+        None
+    }
+
+    /// Port of SDLDriver::GetUIName (override)
     pub fn get_ui_name(&self, params: &ParamPackage) -> ButtonNames {
         if params.has("button") {
-            // Upstream TODO(German77): Find how to substitute the values for real button names
+            // Ruzu extension of upstream's numeric fallback: reverse SDL's raw
+            // joystick mapping before asking for the physical face-button label.
+            if let Some(joystick) =
+                self.joystick_by_guid(&params.get_str("guid", ""), params.get_int("port", 0))
+            {
+                let controller = { joystick.lock().sdl_game_controller() };
+                if !controller.is_null() {
+                    for binding in gamepad_bindings(controller) {
+                        if binding.input_type == sdl::SDL_GAMEPAD_BINDTYPE_BUTTON
+                            && binding.output_type == sdl::SDL_GAMEPAD_BINDTYPE_BUTTON
+                            && unsafe { binding.input.button } == params.get_int("button", -1)
+                        {
+                            let label = unsafe {
+                                sdl::SDL_GetGamepadButtonLabel(controller, binding.output.button)
+                            };
+                            return face_button_name(label);
+                        }
+                    }
+                }
+            }
             return ButtonNames::Value;
         }
         if params.has("hat") {
@@ -1315,6 +1484,83 @@ impl Drop for SDLDriver {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn menu_and_trigger_labels_follow_controller_family() {
+        use super::*;
+        use sdl::{SDL_GamepadAxis as A, SDL_GamepadButton as B, SDL_GamepadType as T};
+        for (kind, back, start, shoulder, trigger) in [
+            (T::XBOX360, "Back", "Start", "LB", "RT"),
+            (T::XBOXONE, "View", "Menu", "LB", "RT"),
+            (T::PS3, "Select", "Start", "L1", "R2"),
+            (T::PS4, "Share", "Options", "L1", "R2"),
+            (T::PS5, "Create", "Options", "L1", "R2"),
+            (T::NINTENDO_SWITCH_PRO, "−", "+", "L", "ZR"),
+        ] {
+            assert_eq!(extra_button_label(kind, B::BACK), Some(back));
+            assert_eq!(extra_button_label(kind, B::START), Some(start));
+            assert_eq!(extra_button_label(kind, B::LEFT_SHOULDER), Some(shoulder));
+            assert_eq!(trigger_label(kind, A::RIGHT_TRIGGER), Some(trigger));
+        }
+        assert_eq!(extra_button_label(T::UNKNOWN, B::BACK), None);
+        assert_eq!(trigger_label(T::UNKNOWN, A::LEFT_TRIGGER), None);
+        assert_eq!(trigger_label(T::XBOXONE, A::LEFTX), None);
+    }
+
+    #[test]
+    fn physical_labels_match_raw_bindings_not_standard_button_indices() {
+        use super::*;
+        let mut binding = sdl::SDL_GamepadBinding::default();
+        binding.input_type = sdl::SDL_GAMEPAD_BINDTYPE_BUTTON;
+        binding.input.button = 17;
+        let mut param = ParamPackage::from_serialized("engine:sdl,button:17");
+        assert!(binding_matches_param(&binding, &param));
+        param.set_str("button", "6".to_owned());
+        assert!(!binding_matches_param(&binding, &param));
+        binding.input_type = sdl::SDL_GAMEPAD_BINDTYPE_HAT;
+        binding.input.hat.hat = 2;
+        binding.input.hat.hat_mask = i32::from(SDL_HAT_UP);
+        assert!(binding_matches_param(
+            &binding,
+            &ParamPackage::from_serialized("hat:2,direction:up")
+        ));
+        assert!(!binding_matches_param(
+            &binding,
+            &ParamPackage::from_serialized("hat:2,direction:down")
+        ));
+        binding.input_type = sdl::SDL_GAMEPAD_BINDTYPE_AXIS;
+        binding.input.axis.axis = 5;
+        binding.input.axis.axis_min = 0;
+        binding.input.axis.axis_max = 32767;
+        assert!(binding_matches_param(
+            &binding,
+            &ParamPackage::from_serialized("axis:5,direction:+")
+        ));
+        assert!(!binding_matches_param(
+            &binding,
+            &ParamPackage::from_serialized("axis:5,direction:-")
+        ));
+    }
+    #[test]
+    fn face_labels_follow_controller_type_instead_of_raw_button_number() {
+        use super::*;
+        for (kind, expected) in [
+            (sdl::SDL_GamepadType::XBOXONE, ButtonNames::ButtonA),
+            (
+                sdl::SDL_GamepadType::NINTENDO_SWITCH_PRO,
+                ButtonNames::ButtonB,
+            ),
+            (sdl::SDL_GamepadType::PS5, ButtonNames::Cross),
+        ] {
+            let label = unsafe {
+                sdl::SDL_GetGamepadButtonLabelForType(kind, sdl::SDL_GamepadButton::SOUTH)
+            };
+            assert_eq!(face_button_name(label), expected);
+        }
+        assert_eq!(
+            face_button_name(sdl::SDL_GamepadButtonLabel::UNKNOWN),
+            ButtonNames::Value
+        );
+    }
     use super::*;
     use common::input::VibrationAmplificationType;
 

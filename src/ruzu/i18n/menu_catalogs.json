@@ -1,5 +1,13 @@
 {
   "fr": {
+    "Configure Game": "Configurer le jeu",
+    "Create Shortcut": "Créer un raccourci",
+    "Add to Desktop": "Ajouter au bureau",
+    "Add to Applications Menu": "Ajouter au menu des applications",
+    "Start Game without Custom Configuration": "Démarrer le jeu sans configuration custom",
+    "Open Save Data Location": "Ouvrir l'emplacement des données de sauvegarde",
+    "Open Mod Data Location": "Ouvrir l'emplacement des données des mods",
+    "Open Transferable Pipeline Cache": "Ouvrir le cache de pipelines transférable",
     "Launch &Applet": "Lancer une &applet",
     "&Home Menu": "Menu &HOME",
     "Home Menu": "Menu HOME",

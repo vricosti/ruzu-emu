@@ -32,8 +32,24 @@ pub(crate) fn open_folder(path: &Path) -> std::io::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn windows_open_folder_command(path: &Path) -> std::process::Command {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    // SaveDataFactory produces slash-separated VFS paths. Rust accepts those
+    // on Windows, but Explorer needs native separators (Qt's file-URL adapter
+    // performs this conversion upstream). Preserve the original UTF-16 path.
+    let native_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| {
+            if unit == b'/' as u16 {
+                b'\\' as u16
+            } else {
+                unit
+            }
+        })
+        .collect();
     let mut command = std::process::Command::new("explorer.exe");
-    command.arg(path);
+    command.arg(std::ffi::OsString::from_wide(&native_path));
     command
 }
 
@@ -490,6 +506,29 @@ mod tests {
 
         assert_eq!(command.get_program(), OsStr::new("explorer.exe"));
         assert_eq!(command.get_args().collect::<Vec<_>>(), [path.as_os_str()]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_folder_launcher_normalizes_vfs_separators() {
+        use std::ffi::OsStr;
+
+        for (input, expected) in [
+            (
+                r"C:\Users\René User\AppData\Roaming\ruzu\nand/user/save/account/0123/0100000000000001/0",
+                r"C:\Users\René User\AppData\Roaming\ruzu\nand\user\save\account\0123\0100000000000001\0",
+            ),
+            (
+                r"//server/share/Game Saves/user/save",
+                r"\\server\share\Game Saves\user\save",
+            ),
+        ] {
+            let command = windows_open_folder_command(Path::new(input));
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [OsStr::new(expected)]
+            );
+        }
     }
 
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]

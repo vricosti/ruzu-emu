@@ -416,6 +416,9 @@ mod background_setting_tests {
 /// `gtk::ApplicationWindow` and retain the frontend session state.
 pub struct GMainWindow {
     window: ApplicationWindow,
+    /// Qt saveGeometry/restoreGeometry includes the maximized state. GTK's
+    /// Win32 fullscreen rectangle restoration alone does not preserve it.
+    maximized_before_fullscreen: Cell<Option<bool>>,
     /// Multiplayer client. Upstream keeps it in `Core::System`'s room network;
     /// it lives here until the room network owner is ported, because the
     /// Multiplayer menu is currently its only user.
@@ -1326,6 +1329,7 @@ impl GMainWindow {
 
         let this = Rc::new(Self {
             window,
+            maximized_before_fullscreen: Cell::new(None),
             room_member,
             menu_bar,
             stack,
@@ -1553,6 +1557,9 @@ impl GMainWindow {
                 this.set_fullscreen_action_state(&app, fullscreen);
                 crate::uisettings::with_mut(|values| values.fullscreen.set_value(fullscreen));
                 this.update_fullscreen_chrome(fullscreen);
+                if !fullscreen {
+                    this.restore_pre_fullscreen_state();
+                }
             }
         ));
 
@@ -1906,11 +1913,20 @@ impl GMainWindow {
     /// Upstream `GMainWindow::ToggleFullscreen` / `ShowFullscreen` /
     /// `HideFullscreen`, adapted to ruzu's always-single-window GTK frontend.
     fn set_fullscreen(&self, fullscreen: bool) {
+        if fullscreen && self.maximized_before_fullscreen.get().is_none() {
+            self.maximized_before_fullscreen.set(Some(self.window.is_maximized()));
+        }
         self.update_fullscreen_chrome(fullscreen);
         let mode = *common::settings::values().fullscreen_mode.get_value();
-        let exclusive = uses_exclusive_fullscreen(mode, display_uses_wayland());
+        // GDK Win32 fullscreen uses rcMonitor (not rcWork), removes window
+        // borders, and saves/restores the previous rectangle and style. This
+        // provides Eden's monitor-covering borderless behavior as well; a
+        // maximized window leaves the taskbar visible. No GPU-exclusive mode
+        // is requested by this GTK operation.
+        let native_fullscreen = cfg!(target_os = "windows")
+            || uses_exclusive_fullscreen(mode, display_uses_wayland());
         if fullscreen {
-            if exclusive {
+            if native_fullscreen {
                 self.window.set_fullscreened(true);
             } else {
                 // GTK has no Qt-style `FramelessWindowHint` geometry path.
@@ -1920,11 +1936,24 @@ impl GMainWindow {
                 self.window.set_decorated(false);
                 self.window.maximize();
             }
-        } else if exclusive {
+        } else if native_fullscreen {
             self.window.set_fullscreened(false);
         } else {
             self.window.unmaximize();
             self.window.set_decorated(true);
+        }
+        if !fullscreen {
+            self.restore_pre_fullscreen_state();
+        }
+    }
+
+    fn restore_pre_fullscreen_state(&self) {
+        if let Some(maximized) = self.maximized_before_fullscreen.take() {
+            if maximized {
+                self.window.maximize();
+            } else {
+                self.window.unmaximize();
+            }
         }
     }
 
@@ -5574,7 +5603,9 @@ impl ProgressWindow {
 /// return (text_color.value() > window_color.value());
 /// ```
 ///
-/// GTK has no equivalent palette object to sample, but it does expose the
+/// Windows reads the application's AppsUseLightTheme preference directly,
+/// independently of the taskbar/system theme, with a light fallback.
+/// On other platforms GTK has no equivalent palette object to sample, but it does expose the
 /// desktop's stated preference directly, which is the thing the Qt heuristic is
 /// inferring. Two sources are consulted, most authoritative first:
 ///
@@ -5586,6 +5617,12 @@ impl ProgressWindow {
 /// Returning `false` (light) when neither source answers matches upstream,
 /// whose default theme on non-Windows is the light `DefaultColorful`.
 pub fn check_dark_mode() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows_apps_prefer_dark()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
     if let Some(prefers_dark) = portal_color_scheme() {
         return prefers_dark;
     }
@@ -5594,11 +5631,61 @@ pub fn check_dark_mode() -> bool {
         .and_then(|settings| settings.gtk_theme_name())
         .map(|name| name.to_lowercase().ends_with("-dark"))
         .unwrap_or(false)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_apps_prefer_dark() -> bool {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+        .encode_utf16().collect();
+    let name: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+    let mut value = 1u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr(), RRF_RT_REG_DWORD,
+            std::ptr::null_mut(), (&mut value as *mut u32).cast(), &mut size)
+    };
+    windows_theme_is_dark(status, value)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_theme_is_dark(status: u32, value: u32) -> bool {
+    status == 0 && value == 0
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_theme_tests {
+    #[test]
+    fn missing_or_invalid_preference_falls_back_to_light() {
+        assert!(super::windows_theme_is_dark(0, 0));
+        assert!(!super::windows_theme_is_dark(0, 1));
+        assert!(!super::windows_theme_is_dark(0, 2));
+        // A failed registry read must not interpret a zero buffer as dark.
+        assert!(!super::windows_theme_is_dark(2, 0));
+        assert!(!super::windows_theme_is_dark(5, 0));
+    }
+}
+
+/// Watch the Windows application preference on GTK's main thread. Only rebuild
+/// the theme when the OS preference changes; explicit dark themes remain dark.
+#[cfg(target_os = "windows")]
+pub fn watch_system_theme() {
+    let mut previous = windows_apps_prefer_dark();
+    glib::timeout_add_seconds_local(2, move || {
+        let current = windows_apps_prefer_dark();
+        if current != previous {
+            previous = current;
+            update_ui_theme();
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// Read `org.freedesktop.appearance` / `color-scheme` from the XDG desktop
 /// portal. `None` when no portal is reachable (no session bus, no portal
 /// service, or the key is absent).
+#[cfg(not(target_os = "windows"))]
 fn portal_color_scheme() -> Option<bool> {
     let connection = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok()?;
     let reply = connection

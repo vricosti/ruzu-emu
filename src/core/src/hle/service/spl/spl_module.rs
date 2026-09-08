@@ -12,8 +12,9 @@ use std::sync::Mutex;
 use super::mt19937::Mt19937;
 use super::spl_results;
 use super::spl_types::ConfigItem;
-use crate::hle::result::ResultCode;
+use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// Atmosphere release version constants.
@@ -44,7 +45,7 @@ pub mod commands {
 /// Upstream owns a `std::mt19937 rng` member that advances across
 /// `GenerateRandomBytes` calls. We mirror that with a persistent
 /// `Mutex<Mt19937>`; resetting the state from the seed on each call — as
-/// the original port did — caused consecutive RNG calls to return
+/// the original port did — caused consecutive RNG calls to return the same bytes.
 pub struct ModuleInterface {
     name: String,
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -55,6 +56,10 @@ pub struct ModuleInterface {
 impl ModuleInterface {
     pub fn new(name: &str, rng_seed: Option<u32>) -> Self {
         let seed = rng_seed.unwrap_or_else(|| {
+            let settings = common::settings::values();
+            if *settings.rng_seed_enabled.get_value() {
+                return *settings.rng_seed.get_value();
+            }
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as u32)
@@ -157,16 +162,24 @@ impl ModuleInterface {
     /// Corresponds to `Module::Interface::GenerateRandomBytes` in upstream.
     /// Upstream draws one 32-bit value per byte from a persistent
     /// `std::mt19937` through `std::uniform_int_distribution<u16>(0, 0xFF)`.
-    /// We match the persistence and take one MT output per byte; the byte
-    /// selection isn't bit-exact with libstdc++'s rejection-sampling impl,
-    /// but MT19937 outputs are uniformly distributed across all 32 bits,
-    /// so any byte slice of the output is uniform in [0, 0xFF].
+    /// A full-range 32-bit MT output reduced to 256 values uses the high
+    /// eight bits with libstdc++, matching the existing CSRNG distribution.
     pub fn generate_random_bytes(&self, buf: &mut [u8]) {
         log::debug!("GenerateRandomBytes called, size={}", buf.len());
         let mut rng = self.rng.lock().unwrap();
         for byte in buf.iter_mut() {
-            *byte = (rng.next_u32() & 0xFF) as u8;
+            *byte = (rng.next_u32() >> 24) as u8;
         }
+    }
+
+    /// IPC adapter for upstream Module::Interface::GenerateRandomBytes.
+    pub fn generate_random_bytes_handler(&self, ctx: &mut HLERequestContext) {
+        let mut data = vec![0; ctx.get_write_buffer_size(0)];
+        self.generate_random_bytes(&mut data);
+        ctx.write_buffer(&data, 0);
+
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     /// IsDevelopment (cmd 11).

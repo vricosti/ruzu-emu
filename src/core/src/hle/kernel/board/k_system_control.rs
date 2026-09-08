@@ -186,10 +186,10 @@ pub fn allocate_secure_memory(
     use super::super::k_memory_manager::{Direction, Pool};
 
     // Applet secure memory is handled separately.
-    assert!(
-        pool != Pool::Applet as u32,
-        "Applet secure memory not implemented"
-    );
+    if pool == Pool::Applet as u32 {
+        log::error!("KSystemControl::AllocateSecureMemory: applet secure memory unimplemented");
+        common::assert::assert_fail_soft_impl();
+    }
 
     // Determine alignment.
     let alignment = if pool == Pool::System as u32 {
@@ -229,10 +229,10 @@ pub fn free_secure_memory(
 
     use super::super::k_memory_manager::Pool;
 
-    assert!(
-        pool != Pool::Applet as u32,
-        "Applet secure memory not implemented"
-    );
+    if pool == Pool::Applet as u32 {
+        log::error!("KSystemControl::FreeSecureMemory: applet secure memory unimplemented");
+        common::assert::assert_fail_soft_impl();
+    }
 
     let alignment = if pool == Pool::System as u32 {
         PAGE_SIZE
@@ -250,4 +250,51 @@ pub fn free_secure_memory(
 pub fn get_insecure_memory_pool() -> u32 {
     // KMemoryManager::Pool::SystemNonSecure
     3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::k_memory_manager::{KMemoryManager, Pool};
+
+    #[test]
+    fn applet_secure_allocation_continues_after_soft_assert() {
+        const CHILD: &str = "RUZU_TEST_APPLET_SECURE_ALLOCATION";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hle::kernel::board::k_system_control::tests::applet_secure_allocation_continues_after_soft_assert",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        common::settings::values_mut()
+            .use_debug_asserts
+            .set_value(false);
+        let mut memory = KMemoryManager::new();
+        memory.initialize_pool(Pool::Applet, 0x1_0000_0000, SECURE_APPLET_MEMORY_SIZE);
+        let free = memory.get_free_size(Pool::Applet);
+        assert_eq!(
+            calculate_required_secure_memory_size(SECURE_ALIGNMENT, Pool::Applet as u32),
+            0
+        );
+        assert_eq!(
+            allocate_secure_memory(&mut memory, 1, Pool::Applet as u32),
+            Err(crate::hle::kernel::svc::svc_results::RESULT_INVALID_SIZE)
+        );
+        let address =
+            allocate_secure_memory(&mut memory, SECURE_ALIGNMENT, Pool::Applet as u32).unwrap();
+        assert_eq!(address as usize % SECURE_ALIGNMENT, 0);
+        assert_eq!(memory.get_free_size(Pool::Applet), free - SECURE_ALIGNMENT);
+        free_secure_memory(&mut memory, address, SECURE_ALIGNMENT, Pool::Applet as u32);
+        assert_eq!(memory.get_free_size(Pool::Applet), free);
+        assert_eq!(
+            allocate_secure_memory(&mut memory, SECURE_APPLET_MEMORY_SIZE * 2, Pool::Applet as u32),
+            Err(crate::hle::kernel::svc::svc_results::RESULT_OUT_OF_MEMORY)
+        );
+    }
 }

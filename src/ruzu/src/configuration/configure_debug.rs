@@ -152,6 +152,10 @@ pub fn page(runtime_lock: bool) -> Page {
         "Enable CPU Debugging",
         *common::settings::values().cpu_debug_mode.get_value(),
     );
+    let use_dev_keys = w::check_row(
+        "Use dev.keys",
+        *common::settings::values().use_dev_keys.get_value(),
+    );
     let debug_asserts = w::check_row(
         "Enable Debug Asserts",
         *common::settings::values().use_debug_asserts.get_value(),
@@ -176,6 +180,7 @@ pub fn page(runtime_lock: bool) -> Page {
     );
     for check in [
         &quest_flag,
+        &use_dev_keys,
         &cpu_debug_mode,
         &debug_asserts,
         &vulkan_check,
@@ -270,6 +275,7 @@ pub fn page(runtime_lock: bool) -> Page {
             .set_value(disable_macro_hle.is_active());
 
         values.quest_flag.set_value(quest_flag.is_active());
+        values.use_dev_keys.set_value(use_dev_keys.is_active());
         values.cpu_debug_mode.set_value(cpu_debug_mode.is_active());
         values
             .use_debug_asserts
@@ -291,5 +297,59 @@ pub fn page(runtime_lock: bool) -> Page {
         values
             .dump_audio_commands
             .set_value(dump_audio_commands.is_active());
+        // ReloadKeys reads settings itself; release the settings write guard
+        // before taking the key-manager lock, in upstream ApplyConfiguration order.
+        drop(values);
+        ruzu_core::crypto::key_manager::KeyManager::instance()
+            .lock()
+            .unwrap()
+            .reload_keys();
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display and isolated process for global key-manager state"]
+    fn applying_dev_keys_switch_reloads_the_selected_synthetic_keys() {
+        use common::fs::path_util::{set_ruzu_path, RuzuPath};
+        use ruzu_core::crypto::key_manager::{KeyManager, S128KeyType};
+
+        gtk::init().expect("a GTK display is required");
+        let directory = tempfile::tempdir().unwrap();
+        set_ruzu_path(RuzuPath::KeysDir, directory.path());
+        // Artificial bytes only: these fixtures do not contain usable console keys.
+        std::fs::write(directory.path().join("prod.keys"),
+            "master_key_00 = 11111111111111111111111111111111\n").unwrap();
+        std::fs::write(directory.path().join("dev.keys"),
+            "master_key_00 = 22222222222222222222222222222222\n").unwrap();
+        common::settings::values_mut().use_dev_keys.set_value(false);
+        let manager = KeyManager::instance();
+        assert_eq!(manager.lock().unwrap().get_key_128(S128KeyType::Master, 0, 0), [0x11; 16]);
+
+        fn find_switch(widget: &gtk::Widget) -> Option<gtk::CheckButton> {
+            if let Some(check) = widget.downcast_ref::<gtk::CheckButton>() {
+                if check.label().as_deref() == Some("Use dev.keys") {
+                    return Some(check.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(check) = find_switch(&widget) { return Some(check); }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        let page = page(true);
+        let check = find_switch(&page.widget).expect("Use dev.keys row");
+        assert!(!check.is_active());
+        for (enabled, expected) in [(true, 0x22), (false, 0x11)] {
+            check.set_active(enabled);
+            (page.apply)();
+            assert_eq!(*common::settings::values().use_dev_keys.get_value(), enabled);
+            assert_eq!(manager.lock().unwrap().get_key_128(S128KeyType::Master, 0, 0), [expected; 16]);
+        }
+    }
 }

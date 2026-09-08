@@ -31,6 +31,8 @@ mod homebrew_vfs;
 mod hotkeys;
 mod i18n;
 mod install_dialog;
+#[cfg(unix)]
+mod input_session;
 mod loading_screen;
 mod main_window;
 mod migration_worker;

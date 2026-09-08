@@ -285,6 +285,16 @@ pub trait RasterizerInterface {
         self.accelerate_conditional_rendering()
     }
 
+    /// Snapshot adapter: do not reborrow Maxwell3D while ProcessQueryCondition
+    /// already holds its mutable engine borrow. Existing backends retain their
+    /// address-based or live-owner implementation through this default.
+    fn accelerate_conditional_rendering_with_state(
+        &mut self,
+        state: crate::query_cache::query_cache::RenderConditionState,
+    ) -> bool {
+        self.accelerate_conditional_rendering_with_address(state.address, 24)
+    }
+
     /// Attempt to use a faster method to perform a surface copy.
     fn accelerate_surface_copy(
         &mut self,

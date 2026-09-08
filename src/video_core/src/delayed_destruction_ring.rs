@@ -36,7 +36,8 @@ impl<T, const TICKS_TO_DESTROY: usize> DelayedDestructionRing<T, TICKS_TO_DESTRO
         self.elements[self.index].push(object);
     }
 
-    #[cfg(test)]
+    /// Diagnostic count only; does not advance retirement or release objects.
+    #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn retained_len(&self) -> usize {
         self.elements.iter().map(Vec::len).sum()
     }
@@ -67,12 +68,15 @@ mod tests {
         let drops = Rc::new(Cell::new(0));
         let mut ring = DelayedDestructionRing::<_, 3>::new();
         ring.push(DropCounter(Rc::clone(&drops)));
+        assert_eq!(ring.retained_len(), 1);
 
         ring.tick();
         ring.tick();
         assert_eq!(drops.get(), 0);
+        assert_eq!(ring.retained_len(), 1);
         ring.tick();
         assert_eq!(drops.get(), 1);
+        assert_eq!(ring.retained_len(), 0);
     }
 
     #[test]

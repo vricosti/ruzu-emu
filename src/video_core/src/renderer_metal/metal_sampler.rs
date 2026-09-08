@@ -60,6 +60,9 @@ impl MetalSampler {
             MetalSamplerError,
         > {
             let descriptor = MTLSamplerDescriptor::new();
+            // The same immutable guest sampler can be used directly or through
+            // an argument buffer; Metal requires this at creation for the latter.
+            descriptor.setSupportArgumentBuffers(true);
             descriptor.setMagFilter(if force_nearest {
                 MTLSamplerMinMagFilter::Nearest
             } else {

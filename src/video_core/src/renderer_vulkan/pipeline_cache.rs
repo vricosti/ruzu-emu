@@ -604,6 +604,121 @@ pub(crate) struct TranslatedGraphicsShader {
 
 pub(crate) const NUM_GRAPHICS_STAGES: usize = 5;
 
+pub(crate) const GEOMETRY_CAPTURE_VERSION: u32 = 1;
+
+fn pre_raster_capture_directory(
+    key: &GraphicsPipelineKey,
+    has_geometry: bool,
+) -> Option<&'static PathBuf> {
+    static TESSELLATION_DIRECTORY: std::sync::OnceLock<Option<PathBuf>> =
+        std::sync::OnceLock::new();
+    if key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0 {
+        if let Some(directory) = TESSELLATION_DIRECTORY
+            .get_or_init(|| std::env::var_os("RUZU_DUMP_TESSELLATION_PIPELINES").map(PathBuf::from))
+            .as_ref()
+        {
+            return Some(directory);
+        }
+    }
+    if !has_geometry {
+        return None;
+    }
+    static DIRECTORY: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| std::env::var_os("RUZU_DUMP_GEOMETRY_PIPELINES").map(PathBuf::from))
+        .as_ref()
+}
+
+// Keep all translation-time lookups, not only the Maxwell words. FileEnvironment
+// can then replay the translation without consulting a later guest-memory state.
+fn capture_geometry_environments(
+    path: &std::path::Path,
+    key: &GraphicsPipelineKey,
+    environments: &[&crate::shader_environment::GenericEnvironment],
+) -> std::io::Result<bool> {
+    if environments.is_empty() || environments.iter().any(|env| !env.can_be_serialized()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "geometry environments cannot be replayed from their cached instructions",
+        ));
+    }
+    // Claim each key once, including when several disk-cache workers translate it.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    serialize_pipeline(
+        &key.to_cache_bytes(),
+        environments,
+        path,
+        GEOMETRY_CAPTURE_VERSION,
+    );
+    if std::fs::metadata(path)?.len() <= 12 {
+        return Err(std::io::Error::other(
+            "geometry environment serialization failed",
+        ));
+    }
+    Ok(true)
+}
+
+// Opt-in diagnostic at the shared translation boundary (also used by Metal).
+// Eden has no equivalent: this records the inputs needed to design a geometry
+// fallback without confusing guest geometry with generated layer passthrough.
+// Tessellation capture uses the same complete environment format and is opt-in
+// independently, including pipelines without a geometry stage.
+fn dump_geometry_pipeline_stage(
+    directory: &std::path::Path,
+    key: &GraphicsPipelineKey,
+    program: &Program,
+    runtime_info: &RuntimeInfo,
+    code: &[u64],
+    code_start: u32,
+) {
+    use std::io::Write;
+    let result = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(directory)?;
+        let path = directory.join(format!("{:016x}_{:?}.txt", key.hash_value(), program.stage));
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut file = std::io::BufWriter::new(file);
+        writeln!(file, "hashes={:016x?}", key.unique_hashes)?;
+        writeln!(file, "guest_geometry={}", key.unique_hashes[4] != 0)?;
+        writeln!(
+            file,
+            "guest_tessellation={}",
+            key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0
+        )?;
+        writeln!(file, "code_start={code_start:#x}\nkey={key:?}")?;
+        writeln!(file, "runtime={runtime_info:#?}\nprogram={program:#?}")?;
+        writeln!(file, "\nMaxwell code (header included when present):")?;
+        for (index, word) in code.iter().enumerate() {
+            writeln!(
+                file,
+                "{:08x}: {word:016x}",
+                u64::from(code_start) + index as u64 * 8
+            )?;
+        }
+        file.flush()?;
+        log::info!("Pre-raster pipeline stage captured: {}", path.display());
+        Ok(())
+    })();
+    if let Err(error) = result {
+        log::error!("Pre-raster pipeline capture failed: {error}");
+    }
+}
+
 pub(crate) fn translate_graphics_stages_from_environments_with_features(
     host_info: &HostTranslateInfo,
     key: &GraphicsPipelineKey,
@@ -698,12 +813,34 @@ pub(crate) fn translate_graphics_stages_from_environments_with_features(
 
     let mut translated: [Option<TranslatedGraphicsShader>; NUM_GRAPHICS_STAGES] =
         std::array::from_fn(|_| None);
+    let has_geometry = programs[4].is_some();
+    let capture_directory = pre_raster_capture_directory(key, has_geometry);
+    if let Some(directory) = capture_directory {
+        let path = directory.join(format!("{:016x}.bin", key.hash_value()));
+        let result = std::fs::create_dir_all(directory).and_then(|()| {
+            capture_geometry_environments(&path, key, &environments.span())
+        });
+        match result {
+            Ok(true) => log::info!("Pre-raster pipeline environments captured: {}", path.display()),
+            Ok(false) => {}
+            Err(error) => log::error!("Pre-raster environment capture failed: {error}"),
+        }
+    }
     for program_index in first_program..NUM_PROGRAMS {
         let Some(runtime_info) = runtime_infos[program_index].take() else {
             continue;
         };
         let mut program = programs[program_index].take()?;
         convert_legacy_to_generic(&mut program, &runtime_info);
+        if let Some(directory) = capture_directory {
+            let env = environments.envs[program_index].generic_environment();
+            let (code, start) = if key.unique_hashes[program_index] == 0 {
+                (&[][..], 0)
+            } else {
+                (env.cached_code_slice(), env.cached_code_start())
+            };
+            dump_geometry_pipeline_stage(directory, key, &program, &runtime_info, code, start);
+        }
         translated[program_index - 1] = Some(TranslatedGraphicsShader {
             program,
             runtime_info,
@@ -807,6 +944,8 @@ pub(super) fn compile_graphics_stages_from_file_environments(
     let mut bindings = Bindings::default();
     let mut compiled_stages: [Option<CompiledShader>; 5] = std::array::from_fn(|_| None);
     let mut previous_stage_index: Option<usize> = None;
+    let has_geometry = programs[4].is_some();
+    let capture_directory = pre_raster_capture_directory(key, has_geometry);
     let first_program = if uses_vertex_a && uses_vertex_b { 1 } else { 0 };
     for program_index in first_program..NUM_PROGRAMS {
         let is_emulated_stage = layer_source_program.is_some() && program_index == 4;
@@ -823,6 +962,15 @@ pub(super) fn compile_graphics_stages_from_file_environments(
         };
         let program = programs[program_index].as_mut()?;
         convert_legacy_to_generic(program, &runtime_info);
+        if let Some(directory) = capture_directory {
+            let env = environments
+                .iter()
+                .find(|env| env.shader_stage() == program.stage);
+            let (code, start) = env.map_or((&[][..], 0), |env| {
+                (env.cached_instruction_slice(), env.cached_instruction_start())
+            });
+            dump_geometry_pipeline_stage(directory, key, program, &runtime_info, code, start);
+        }
         let spirv_words = shader_recompiler::backend::emit_spirv_with_bindings(
             program,
             profile,
@@ -1998,6 +2146,10 @@ impl PipelineCache {
             RefCell::new(Vec::new());
         let load_compute = |file: &mut std::fs::File, env: FileEnvironment| {
             let key = ComputePipelineCacheKey::read_from_file(file)?;
+            if env.has_ambiguous_depth_stencil_formats() {
+                skipped.set(skipped.get() + 1);
+                return Ok(());
+            }
             loaded_compute.borrow_mut().push((key, env));
             Ok(())
         };
@@ -2005,6 +2157,10 @@ impl PipelineCache {
             RefCell::new(Vec::new());
         let load_graphics = |file: &mut std::fs::File, envs: Vec<FileEnvironment>| {
             let key = GraphicsPipelineKey::read_from_file(file)?;
+            if envs.iter().any(FileEnvironment::has_ambiguous_depth_stencil_formats) {
+                skipped.set(skipped.get() + 1);
+                return Ok(());
+            }
             if !graphics_key_dynamic_features_match(&key, &dynamic_features) {
                 skipped.set(skipped.get() + 1);
                 return Ok(());
@@ -2268,6 +2424,195 @@ mod tests {
         SamplerBinding, ScissorInfo, ShaderStageInfo, StencilFaceInfo, ViewportInfo, ZetaInfo,
     };
 
+    /// Offline prerequisite inspection, not a rendering test. The native host
+    /// profile uses the shared Maxwell translator. TCS is compiled as a native
+    /// compute entry, TES through its production native PSO. No rendered oracle.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires RUZU_REPLAY_VULKAN_CACHE and a new RUZU_DUMP_TESSELLATION_PIPELINES directory"]
+    fn inspect_cached_tessellation_with_native_host_profile() {
+        use crate::renderer_metal::{
+            metal_device::MetalDevice,
+            metal_pipeline_cache::{make_host_translate_info as native_host_info, make_shader_profile},
+            metal_shader::compile_msl_library,
+        };
+        use crate::shader_environment::GraphicsEnvironment;
+        use std::io::Write;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let source = PathBuf::from(std::env::var_os("RUZU_REPLAY_VULKAN_CACHE")
+            .expect("set RUZU_REPLAY_VULKAN_CACHE to a Vulkan environment cache"));
+        let directory = PathBuf::from(std::env::var_os("RUZU_DUMP_TESSELLATION_PIPELINES")
+            .expect("set RUZU_DUMP_TESSELLATION_PIPELINES to a new output directory"));
+        std::fs::DirBuilder::new().mode(0o700).create(&directory).unwrap();
+        let copy = directory.join("input-snapshot.bin");
+        // LoadPipelines may delete invalid files. Only expose this private copy,
+        // and validate its survival before treating an empty result as evidence.
+        let mut snapshot = std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(&copy).unwrap();
+        std::io::copy(&mut std::fs::File::open(source).unwrap(), &mut snapshot).unwrap();
+        snapshot.flush().unwrap();
+        drop(snapshot);
+        let mut graphics_count = 0usize;
+        let mut compute_count = 0usize;
+        let mut entries = Vec::new();
+        load_pipelines(
+            || false, &copy, CACHE_VERSION,
+            Box::new(|file, _| {
+                ComputePipelineCacheKey::read_from_file(file)?;
+                compute_count += 1;
+                Ok(())
+            }),
+            Box::new(|file, environments| {
+                let key = GraphicsPipelineKey::read_from_file(file)?;
+                graphics_count += 1;
+                if key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0 {
+                    entries.push((key, environments));
+                }
+                Ok(())
+            }),
+        );
+        assert!(copy.exists(), "cache snapshot rejected; counts are not valid");
+        assert!(graphics_count + compute_count != 0, "cache snapshot is empty");
+        eprintln!("Environment inventory: graphics={graphics_count} compute={compute_count} tessellation={}", entries.len());
+        let device = MetalDevice::new().unwrap();
+        let host_info = native_host_info(device.profile());
+        for (key, files) in entries {
+            let mut environments = GraphicsEnvironments::default();
+            for file in files {
+                let slot = (0..NUM_PROGRAMS)
+                    .find(|&slot| shader_stage_for_program(slot) == Some(file.shader_stage()))
+                    .expect("graphics entry contains a graphics stage");
+                environments.envs[slot] = GraphicsEnvironment::from_file_environment(file);
+                environments.env_ptrs[slot] = Some(slot);
+            }
+            let translated = catch_shader_exception(|| {
+                translate_graphics_stages_from_environments_with_features(
+                    &host_info, &key, &mut environments,
+                    RuntimeInfoDeviceFeatures { transform_feedback: true, molten_vk: true },
+                )
+            }).expect("captured shader translation must succeed")
+                .expect("captured pipeline must have a vertex stage");
+            let stages: Vec<_> = translated.iter().flatten().map(|stage| stage.program.stage).collect();
+            eprintln!("Tessellation pipeline {:016x}: {stages:?}", key.hash_value());
+            if let Some(control) = &translated[1] {
+                use shader_recompiler::backend::msl::{
+                    emit_msl::emit_msl_tessellation_control_function,
+                    emit_msl_tessellation::TessellationControlLayout, MslOptions,
+                };
+                use crate::renderer_metal::metal_tessellation_pipeline::MetalTessellationControlPipeline;
+                let artifact = emit_msl_tessellation_control_function(&control.program,
+                    &make_shader_profile(device.profile()), &control.runtime_info,
+                    &MslOptions::default(), &mut Bindings::default()).unwrap();
+                std::fs::write(directory.join(format!("{:016x}_control.metal", key.hash_value())),
+                    &artifact.source.source).unwrap();
+                let layout = TessellationControlLayout::new(&control.program, &control.runtime_info).unwrap();
+                MetalTessellationControlPipeline::new(&device, &artifact, &layout).unwrap();
+                eprintln!("Runtime native TCS compute pipeline compiled: {:016x}", key.hash_value());
+            }
+            if let (Some(control), Some(evaluation)) = (&translated[1], &translated[2]) {
+                use shader_recompiler::backend::msl::{
+                    emit_msl::emit_msl_tessellation_evaluation_function,
+                    emit_msl_tessellation::TessellationControlLayout,
+                    MslOptions,
+                };
+                use crate::renderer_metal::{metal_pipeline_cache::MetalRenderPipelineKey,
+                    metal_tessellation_pipeline::MetalTessellationEvaluationPipeline};
+                use objc2_foundation::NSString;
+                use objc2_metal::{MTLLibrary as _, MTLPixelFormat};
+                let layout = TessellationControlLayout::new(&control.program, &control.runtime_info).unwrap();
+                let artifact = emit_msl_tessellation_evaluation_function(&evaluation.program,
+                    &make_shader_profile(device.profile()), &evaluation.runtime_info,
+                    &MslOptions::default(), &mut Bindings::default()).unwrap();
+                std::fs::write(directory.join(format!("{:016x}_evaluation.metal", key.hash_value())),
+                    &artifact.source.source).unwrap();
+                // Diagnostic-only fragment: this verifies the real TES entry,
+                // not framebuffer formats or the complete captured guest pipeline.
+                let library = compile_msl_library(device.device(),
+                    "#include <metal_stdlib>\nusing namespace metal;\nfragment float4 probe_fragment() { return float4(1.0f); }",
+                    artifact.language_version).unwrap();
+                let fragment = library.newFunctionWithName(&NSString::from_str("probe_fragment")).unwrap();
+                let mut render_key = MetalRenderPipelineKey::new(0, 0);
+                render_key.color_attachments[0].format = MTLPixelFormat::RGBA8Unorm;
+                MetalTessellationEvaluationPipeline::new(&device, &render_key, &artifact,
+                    &layout, &evaluation.runtime_info, 64, Some(&fragment)).unwrap();
+                eprintln!("Native TES render pipeline compiled: {:016x}", key.hash_value());
+            }
+            let mut cache = crate::renderer_metal::metal_pipeline_cache::MetalPipelineCache::new(device.clone());
+            cache.validate_captured_tessellation(&key, &mut environments)
+                .expect("complete captured native tessellation stage chain must compile");
+            eprintln!("Native captured VS/TCS/TES/FS pipeline and cache reuse verified: {:016x}", key.hash_value());
+        }
+    }
+
+    #[test]
+    fn pre_raster_environment_capture_replays_every_stage_once_and_rejects_unbound_code() {
+        use crate::shader_environment::{GenericEnvironment, ShaderStage as EnvironmentStage};
+
+        let path = std::env::temp_dir().join(format!(
+            "ruzu-geometry-environments-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let mut key = GraphicsPipelineKey::default();
+        key.unique_hashes = [0, 0x1234, 0x2345, 0x3456, 0x5678, 0x9abc];
+        let stages = [
+            EnvironmentStage::VertexB,
+            EnvironmentStage::TessellationControl,
+            EnvironmentStage::TessellationEval,
+            EnvironmentStage::Geometry,
+            EnvironmentStage::Fragment,
+        ];
+        let mut environments: Vec<_> = stages
+            .into_iter()
+            .map(|stage| {
+                let mut env = GenericEnvironment::new()
+                    .with_program(0, 0x100)
+                    .with_stage(stage)
+                    .with_gpu_read(Arc::new(move |_, bytes| {
+                        for chunk in bytes.chunks_exact_mut(8) {
+                            chunk.copy_from_slice(&(stage as u64 + 1).to_le_bytes());
+                        }
+                    }));
+                env.set_cached_size(16);
+                env
+            })
+            .collect();
+        let references: Vec<_> = environments.iter().collect();
+        assert!(capture_geometry_environments(&path, &key, &references).unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!capture_geometry_environments(&path, &key, &references).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let mut calls = 0;
+        load_pipelines(
+            || false,
+            &path,
+            GEOMETRY_CAPTURE_VERSION,
+            Box::new(|_, _| panic!("graphics capture must not contain a compute entry")),
+            Box::new(|file, loaded| {
+                assert_eq!(loaded.len(), stages.len());
+                for (env, stage) in loaded.iter().zip(stages) {
+                    assert_eq!(env.shader_stage(), stage);
+                    assert_eq!(env.read_instruction(0x100), stage as u64 + 1);
+                    assert_eq!(env.read_instruction(0x108), stage as u64 + 1);
+                }
+                let loaded_key = GraphicsPipelineKey::read_from_file(file)?;
+                assert_eq!(loaded_key.to_cache_bytes(), key.to_cache_bytes());
+                calls += 1;
+                Ok(())
+            }),
+        );
+        assert_eq!(calls, 1);
+        std::fs::remove_file(&path).unwrap();
+        environments[1].read_instruction(0x110);
+        let references: Vec<_> = environments.iter().collect();
+        assert!(capture_geometry_environments(&path, &key, &references).is_err());
+        assert!(!path.exists());
+    }
+
     fn program_slots_with(
         program_index: usize,
         program: Program,
@@ -2445,6 +2790,41 @@ mod tests {
         let result = catch_shader_exception(|| env.read_cbuf_value(2, 0x20));
 
         assert_eq!(result.unwrap_err(), "Uncached read texture type");
+    }
+
+    #[test]
+    fn unsupported_geometry_stream_emission_is_caught_and_compilation_can_continue() {
+        use shader_recompiler::ir::{basic_block::Block, emitter::Emitter, Program, Value};
+
+        for emit_vertex in [true, false] {
+            let result = catch_shader_exception(|| {
+                let mut program = Program::new(ShaderStage::Geometry);
+                program.blocks.push(Block::new());
+                let mut emitter = Emitter::new(&mut program, 0);
+                if emit_vertex {
+                    emitter.emit_vertex(Value::ImmU32(0));
+                } else {
+                    emitter.end_primitive(Value::ImmU32(0));
+                }
+                let profile = shader_recompiler::profile::Profile {
+                    support_geometry_streams: false,
+                    ..Default::default()
+                };
+                shader_recompiler::backend::emit_spirv(&program, &profile, &Default::default())
+            });
+            assert_eq!(result.unwrap_err(), "Geometry streams is not implemented");
+        }
+
+        let result = catch_shader_exception(|| {
+            let mut program = Program::new(ShaderStage::Fragment);
+            program.blocks.push(shader_recompiler::ir::basic_block::Block::new());
+            shader_recompiler::backend::emit_spirv(
+                &program,
+                &Default::default(),
+                &Default::default(),
+            )
+        });
+        assert!(!result.unwrap().is_empty());
     }
 
     fn make_test_draw_call() -> DrawCall {

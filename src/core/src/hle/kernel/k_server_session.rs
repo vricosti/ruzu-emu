@@ -2116,25 +2116,7 @@ impl KServerSession {
     /// Called when the client side is closed.
     /// Port of upstream `KServerSession::OnClientClosed`.
     /// Upstream signals the session and wakes waiting threads.
-    ///
-    /// Callers should migrate to `on_client_closed_with_process(...)` when they
-    /// already hold the owner `KProcess`. This fallback path re-enters the
-    /// kernel registry to rediscover the owner process and is unsafe under a
-    /// held process lock.
     pub fn on_client_closed(&mut self) {
-        self.on_client_closed_impl();
-    }
-
-    /// Port of upstream `KServerSession::OnClientClosed`, when the owner
-    /// process is already known by the caller.
-    pub fn on_client_closed_with_process(
-        &mut self,
-        _process: &mut crate::hle::kernel::k_process::KProcess,
-    ) {
-        self.on_client_closed_impl();
-    }
-
-    fn on_client_closed_impl(&mut self) {
         self.client_closed = true;
 
         // Eden keeps the request currently being dispatched in
@@ -2169,22 +2151,7 @@ impl KServerSession {
 
     /// Enqueue a request.
     /// Port of upstream `KServerSession::OnRequest`.
-    ///
-    /// Callers should migrate to `on_request_with_process(...)` when they
-    /// already hold the owner `KProcess`. This fallback path re-enters the
-    /// kernel registry to rediscover the owner process and is unsafe under a
-    /// held process lock.
     pub fn on_request(&mut self, request: Arc<Mutex<KSessionRequest>>) -> u32 {
-        self.on_request_impl(request)
-    }
-
-    /// Port of upstream `KServerSession::OnRequest`, when the owner process is
-    /// already known by the caller.
-    pub fn on_request_with_process(
-        &mut self,
-        _process: &mut crate::hle::kernel::k_process::KProcess,
-        request: Arc<Mutex<KSessionRequest>>,
-    ) -> u32 {
         self.on_request_impl(request)
     }
 
@@ -2865,14 +2832,14 @@ impl KServerSession {
             return;
         };
 
-        let should_finalize = process
-            .get_session_by_object_id(parent_id)
-            .is_some_and(|parent| {
-                let mut parent = parent.lock().unwrap();
-                parent.on_server_closed();
-                parent.close_server_endpoint()
-            });
+        let parent = process.get_session_by_object_id(parent_id);
+        if let Some(parent) = &parent {
+            parent.lock().unwrap().on_server_closed();
+        }
         self.cleanup_requests();
+        // Eden releases the server's parent reference only after cleanup.
+        let should_finalize =
+            parent.is_some_and(|parent| parent.lock().unwrap().close_server_endpoint());
         if should_finalize {
             process.unregister_session_object_by_object_id(parent_id);
         }
@@ -3011,6 +2978,54 @@ mod tests {
             .get_session_by_object_id(session_id)
             .is_none());
         assert_eq!(port.lock().unwrap().client.get_num_sessions(), 0);
+    }
+
+    #[test]
+    fn server_close_retains_parent_reference_until_requests_are_cleaned() {
+        use std::time::{Duration, Instant};
+
+        let session = Arc::new(Mutex::new(super::super::k_session::KSession::new()));
+        let request = Arc::new(Mutex::new(KSessionRequest::new()));
+        let server = {
+            let mut parent = session.lock().unwrap();
+            parent.initialize(None, 0);
+            let mut server = parent.server.lock().unwrap();
+            server.initialize(0x1000);
+            server.current_request = Some(request.clone());
+            parent.server.clone()
+        };
+        let request_guard = request.lock().unwrap();
+        let closing_session = session.clone();
+        let close_thread = std::thread::spawn(move || {
+            let mut process = KProcess::new();
+            process.register_session_object(0x1000, closing_session);
+            server.lock().unwrap().destroy_with_process(&mut process);
+            process.get_session_by_object_id(0x1000).is_none()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut parent_available = false;
+        let mut finalized_early = false;
+        while Instant::now() < deadline {
+            if let Ok(mut parent) = session.try_lock() {
+                if parent.is_server_closed() {
+                    // Both closed predicates mean non-Normal upstream. Here
+                    // only the server destroy can have made that transition.
+                    parent_available = true;
+                    finalized_early = parent.close_client_endpoint();
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(request_guard);
+        let finalized_after_cleanup = close_thread.join().unwrap();
+        assert!(parent_available);
+        assert!(
+            !finalized_early,
+            "server reference released before request cleanup"
+        );
+        assert!(finalized_after_cleanup);
     }
 
     impl SessionPageTableMemoryForTest {

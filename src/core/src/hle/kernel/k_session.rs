@@ -109,30 +109,8 @@ impl KSession {
         &self.client
     }
 
-    /// Forward a request to the server session.
-    /// Matches upstream `KSession::OnRequest(KSessionRequest*)`.
-    pub fn on_request(&self, request: Arc<Mutex<KSessionRequest>>) -> u32 {
-        self.server.lock().unwrap().on_request(request)
-    }
-
-    /// Forward a request to the server session when the owner process is
-    /// already held by the caller.
-    pub fn on_request_with_process(
-        &self,
-        process: &mut super::k_process::KProcess,
-        request: Arc<Mutex<KSessionRequest>>,
-    ) -> u32 {
-        let _ = process;
-        self.on_request_defer_scheduler_unlock(request)
-    }
-
-    /// Forward a request while deferring scheduler unlock until after the
-    /// Rust `KServerSession` mutex is released.
-    pub fn on_request_defer_scheduler_unlock(&self, request: Arc<Mutex<KSessionRequest>>) -> u32 {
-        Self::on_server_request_defer_scheduler_unlock(&self.server, self.name as u64, request)
-    }
-
     /// Forward a request through an already-resolved server endpoint.
+    /// Adapts Eden `KSession::OnRequest` without holding the parent mutex.
     ///
     /// This lets callers clone `KSession::server` under a short `KSession`
     /// mutex borrow, then drop the parent-session mutex before `OnRequest`
@@ -200,23 +178,20 @@ impl KSession {
     }
 
     /// Called when the client side is closed.
-    pub fn on_client_closed(&mut self) {
-        if self.get_state() == SessionState::Normal {
-            self.set_state(SessionState::ClientClosed);
-            self.server.lock().unwrap().on_client_closed();
-        }
-    }
-
-    /// Called when the client side is closed, with the owning process already
-    /// held by the caller.
-    pub fn on_client_closed_with_process(&mut self, process: &mut super::k_process::KProcess) {
-        if self.get_state() == SessionState::Normal {
-            self.set_state(SessionState::ClientClosed);
-            self.server
-                .lock()
-                .unwrap()
-                .on_client_closed_with_process(process);
-        }
+    /// Eden holds no parent mutex across the server notification. Release the
+    /// Rust parent guard before acquiring the server endpoint: server destroy
+    /// acquires these objects in the opposite order. The caller retains its
+    /// parent reference until this notification completes, as in Destroy.
+    pub fn on_client_closed(session: &Arc<Mutex<Self>>) {
+        let server = {
+            let parent = session.lock().unwrap();
+            if parent.get_state() != SessionState::Normal {
+                return;
+            }
+            parent.set_state(SessionState::ClientClosed);
+            Arc::clone(&parent.server)
+        };
+        server.lock().unwrap().on_client_closed();
     }
 
     /// Release upstream's reference held by `KServerSession`.
@@ -334,16 +309,18 @@ mod tests {
 
     #[test]
     fn test_on_client_closed_only_transitions_from_normal() {
-        let mut session = KSession::new();
-        session.initialize(None, 0);
-        session.on_client_closed();
+        let session = Arc::new(Mutex::new(KSession::new()));
+        session.lock().unwrap().initialize(None, 0);
+        KSession::on_client_closed(&session);
+        let session = session.lock().unwrap();
         assert!(session.is_client_closed());
         assert!(session.server.lock().unwrap().client_closed);
 
-        let mut already_server_closed = KSession::new();
-        already_server_closed.initialize(None, 0);
-        already_server_closed.on_server_closed();
-        already_server_closed.on_client_closed();
+        let already_server_closed = Arc::new(Mutex::new(KSession::new()));
+        already_server_closed.lock().unwrap().initialize(None, 0);
+        already_server_closed.lock().unwrap().on_server_closed();
+        KSession::on_client_closed(&already_server_closed);
+        let already_server_closed = already_server_closed.lock().unwrap();
         assert_eq!(
             already_server_closed.get_state(),
             SessionState::ServerClosed

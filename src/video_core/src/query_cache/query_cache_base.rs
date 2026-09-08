@@ -277,6 +277,32 @@ impl QueryCacheBase {
         }
     }
 
+    /// Scoped-owner variant of FlushRegion. Returns the RequestGuestHostSync
+    /// decision so a retained backend report owner can release its mutex before
+    /// the rasterizer drains fences whose callbacks lock that same owner.
+    pub fn flush_region_with_memory(
+        &mut self,
+        addr: VAddr,
+        size: usize,
+        device_memory: &mut dyn DeviceMemoryWriter,
+    ) -> bool {
+        let mut result = false;
+        let impl_ = &self.impl_;
+        Self::iterate_cache::<false, _>(
+            &self.cache_mutex,
+            &mut self.cached_queries,
+            addr,
+            size,
+            |location| {
+                if let Some(query) = impl_.obtain_query(location) {
+                    result |= Self::semi_flush_query_value(query, Some(&mut *device_memory));
+                }
+                result
+            },
+        );
+        result
+    }
+
     /// Cache the location created by a backend dispatch path.
     ///
     /// This is the indexing block at the end of upstream `CounterReport`,
@@ -603,10 +629,18 @@ impl QueryCacheBase {
         });
     }
 
-    /// Attempt to use host-side conditional rendering.
-    ///
+    /// Device-address part of AccelerateHostConditionalRendering's gen_lookup.
+    /// Kept in the shared cache so native runtimes can use a scoped channel
+    /// translator without storing it in report objects retained by callbacks.
+    pub fn lookup_query_for_conditional_rendering(&self, address: VAddr) -> Option<&QueryBase> {
+        let _lock = self.cache_mutex.lock().unwrap();
+        let page = self.cached_queries.get(&(address >> DEVICE_PAGEBITS))?;
+        let offset = (address & DEVICE_PAGEMASK) as u32;
+        let location = page.get(&offset).or_else(|| page.get(&(offset + 4)))?;
+        self.impl_.obtain_query(*location)
+    }
+
     /// Maps to C++ `QueryCacheBase::AccelerateHostConditionalRendering`.
-    ///
     /// Reads Maxwell3D render-enable registers and performs GPU-side
     /// conditional rendering acceleration.  Requires Maxwell3D engine and
     /// runtime.  Returns false (fall back to CPU path).
@@ -634,30 +668,7 @@ impl QueryCacheBase {
                 };
             };
 
-            let _lock = owner.cache_mutex.lock().unwrap();
-            let Some(sub_container) = owner.cached_queries.get(&(cpu_addr >> DEVICE_PAGEBITS))
-            else {
-                return LookupData {
-                    address: cpu_addr,
-                    found_query: None,
-                };
-            };
-
-            let mut location = sub_container
-                .get(&((cpu_addr & DEVICE_PAGEMASK) as u32))
-                .copied();
-            if location.is_none() {
-                location = sub_container
-                    .get(&(((cpu_addr & DEVICE_PAGEMASK) + 4) as u32))
-                    .copied();
-            }
-            let Some(location) = location else {
-                return LookupData {
-                    address: cpu_addr,
-                    found_query: None,
-                };
-            };
-            let found_query = owner.impl_.obtain_query(location);
+            let found_query = owner.lookup_query_for_conditional_rendering(cpu_addr);
             if let Some(query) = found_query {
                 *qc_dirty |= query.flags.intersects(QueryFlagBits::IS_HOST_MANAGED)
                     && !query.flags.intersects(QueryFlagBits::IS_GUEST_SYNCED);
@@ -965,34 +976,23 @@ impl QueryCacheBase {
         impl_: &mut QueryCacheBaseImpl,
         location: QueryLocation,
     ) -> bool {
-        let Some((
-            guest_address,
-            value,
-            has_timestamp,
-            is_final_value_synced,
-            is_guest_synced,
-            is_host_managed,
-        )) = impl_.obtain_query(location).map(|query_base| {
-            (
-                query_base.guest_address,
-                query_base.value,
-                query_base.flags.intersects(QueryFlagBits::HAS_TIMESTAMP),
-                query_base
-                    .flags
-                    .intersects(QueryFlagBits::IS_FINAL_VALUE_SYNCED),
-                query_base.flags.intersects(QueryFlagBits::IS_GUEST_SYNCED),
-                query_base.flags.intersects(QueryFlagBits::IS_HOST_MANAGED),
-            )
-        })
-        else {
+        let Some(query) = impl_.obtain_query(location).cloned() else {
             return false;
         };
-        if is_final_value_synced && !is_guest_synced {
-            if let Some(device_memory) = impl_.device_memory_mut() {
-                if has_timestamp {
-                    device_memory.write_u64(guest_address, value);
+        Self::semi_flush_query_value(&query, impl_.device_memory_mut())
+    }
+
+    fn semi_flush_query_value(
+        query: &QueryBase,
+        device_memory: Option<&mut dyn DeviceMemoryWriter>,
+    ) -> bool {
+        let is_guest_synced = query.flags.contains(QueryFlagBits::IS_GUEST_SYNCED);
+        if query.flags.contains(QueryFlagBits::IS_FINAL_VALUE_SYNCED) && !is_guest_synced {
+            if let Some(device_memory) = device_memory {
+                if query.flags.contains(QueryFlagBits::HAS_TIMESTAMP) {
+                    device_memory.write_u64(query.guest_address, query.value);
                 } else {
-                    device_memory.write_u32(guest_address, value as u32);
+                    device_memory.write_u32(query.guest_address, query.value as u32);
                 }
             } else {
                 log::warn!(
@@ -1001,7 +1001,7 @@ impl QueryCacheBase {
             }
             return false;
         }
-        is_host_managed && !is_guest_synced
+        query.flags.contains(QueryFlagBits::IS_HOST_MANAGED) && !is_guest_synced
     }
 
     /// Request a guest-host synchronization.
@@ -1554,6 +1554,28 @@ mod tests {
         assert_eq!(rasterizer.release_fences_calls, vec![true]);
         assert!(device_memory.writes32.is_empty());
         assert!(device_memory.writes64.is_empty());
+    }
+
+    #[test]
+    fn scoped_flush_region_preserves_early_exit_without_a_bound_rasterizer() {
+        let mut cache = QueryCacheBase::new();
+        let mut pending = CountingStreamer::new(QueryType::Payload as usize,
+            QueryBase::with_params(0x1000, QueryFlagBits::IS_HOST_MANAGED, 0));
+        let mut ready = CountingStreamer::new(QueryType::ZPassPixelCount64 as usize,
+            QueryBase::with_params(0x2000,
+                QueryFlagBits::IS_FINAL_VALUE_SYNCED | QueryFlagBits::HAS_TIMESTAMP,
+                0x1122334455667788));
+        cache.impl_.register_streamer(QueryType::Payload as usize, &mut pending);
+        cache.impl_.register_streamer(QueryType::ZPassPixelCount64 as usize, &mut ready);
+        cache.cache_query_location(0x1000, QueryLocation::new(QueryType::Payload as u32, 0));
+        cache.cache_query_location(0x2000, QueryLocation::new(QueryType::ZPassPixelCount64 as u32, 0));
+        let mut memory = CountingDeviceMemory::default();
+        assert!(cache.flush_region_with_memory(0x1000, 0x1004, &mut memory));
+        assert!(memory.writes32.is_empty());
+        assert!(memory.writes64.is_empty());
+        assert!(!cache.flush_region_with_memory(0x2000, 4, &mut memory));
+        assert_eq!(memory.writes64, [(0x2000, 0x1122334455667788)]);
+        assert!(!ready.query.flags.contains(QueryFlagBits::IS_GUEST_SYNCED));
     }
 
     #[test]

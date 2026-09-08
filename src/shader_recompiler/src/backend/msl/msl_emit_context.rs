@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use super::msl_function::{MslFunctionInterface, MslParameter, MslParameterAttribute};
 use crate::backend::bindings::Bindings;
 use crate::ir::instruction::Inst;
 use crate::ir::opcodes::Opcode;
@@ -29,6 +30,10 @@ use super::{
 
 pub struct MslEmitContext {
     stage: Stage,
+    interface: super::msl_function::MslFunctionInterface,
+    geometry: Option<super::emit_msl_geometry::GeometryLayout>,
+    tessellation_control: Option<super::emit_msl_tessellation::TessellationControlLayout>,
+    tessellation_evaluation: Option<super::emit_msl_tessellation::TessellationEvaluationLayout>,
     source: String,
     local_declarations: String,
     local_declarations_offset: Option<usize>,
@@ -162,11 +167,51 @@ impl MslEmitContext {
         options: &MslOptions,
         binding_counters: &mut Bindings,
     ) -> Result<Self, MslError> {
+        Self::new_with_kind(
+            program,
+            profile,
+            runtime_info,
+            options,
+            binding_counters,
+            super::msl_function::MslFunctionKind::StageEntryPoint,
+        )
+    }
+
+    pub(crate) fn new_with_kind(
+        program: &crate::ir::Program,
+        profile: &Profile,
+        runtime_info: &RuntimeInfo,
+        options: &MslOptions,
+        binding_counters: &mut Bindings,
+        function_kind: super::msl_function::MslFunctionKind,
+    ) -> Result<Self, MslError> {
+        use super::msl_function::MslFunctionKind;
         let stage = program.stage;
+        if function_kind == MslFunctionKind::VertexFunction
+            && (stage != Stage::VertexB || options.disable_rasterization)
+        {
+            return Err(MslError::UnsupportedProgramFeature(
+                "callable vertex function requires vertex outputs",
+            ));
+        }
+        if function_kind == MslFunctionKind::GeometryFunction && stage != Stage::Geometry {
+            return Err(MslError::UnsupportedProgramFeature(
+                "callable geometry function requires geometry stage",
+            ));
+        }
+        if function_kind == MslFunctionKind::TessellationControlFunction && stage != Stage::TessellationControl {
+            return Err(MslError::UnsupportedStage(stage));
+        }
+        if function_kind == MslFunctionKind::TessellationEvaluationFunction
+            && (stage != Stage::TessellationEval || options.disable_rasterization) {
+            return Err(MslError::UnsupportedStage(stage));
+        }
         match stage {
             Stage::VertexA => return Err(MslError::UnmergedVertexA),
-            Stage::VertexB | Stage::Fragment | Stage::Compute => {}
-            Stage::TessellationControl | Stage::TessellationEval | Stage::Geometry => {
+            Stage::VertexB | Stage::Fragment | Stage::Compute | Stage::Geometry => {}
+            Stage::TessellationControl if function_kind == MslFunctionKind::TessellationControlFunction => {}
+            Stage::TessellationEval if function_kind == MslFunctionKind::TessellationEvaluationFunction => {}
+            Stage::TessellationControl | Stage::TessellationEval => {
                 return Err(MslError::UnsupportedStage(stage))
             }
         }
@@ -186,8 +231,10 @@ impl MslEmitContext {
             let buffer_index = bindings.buffer_count;
             bindings.buffer_count += 1;
             bindings.push_constant_buffer_index = Some(buffer_index);
-            parameters.push(format!(
-                "constant MslResolutionInfo& rescaling_push_constants [[buffer({buffer_index})]]"
+            parameters.push(MslParameter::new(
+                "constant MslResolutionInfo&",
+                "rescaling_push_constants",
+                MslParameterAttribute::Buffer(buffer_index),
             ));
             if stage == Stage::Compute {
                 concat!(
@@ -209,8 +256,10 @@ impl MslEmitContext {
             let buffer_index = bindings.buffer_count;
             bindings.buffer_count += 1;
             bindings.push_constant_buffer_index = Some(buffer_index);
-            parameters.push(format!(
-                "constant MslRenderAreaInfo& render_area_push_constants [[buffer({buffer_index})]]"
+            parameters.push(MslParameter::new(
+                "constant MslRenderAreaInfo&",
+                "render_area_push_constants",
+                MslParameterAttribute::Buffer(buffer_index),
             ));
             concat!(
                 "struct MslRenderAreaInfo {\n",
@@ -247,7 +296,11 @@ impl MslEmitContext {
                 count: None,
             });
             let name = format!("c{}", descriptor.index);
-            parameters.push(format!("constant uint4* {name} [[buffer({buffer_index})]]"));
+            parameters.push(MslParameter::new(
+                "constant uint4*",
+                &name,
+                MslParameterAttribute::Buffer(buffer_index),
+            ));
             constant_buffers.insert(descriptor.index, name);
         }
         if program.info.uses_cbuf_indirect {
@@ -279,7 +332,11 @@ impl MslEmitContext {
                 count: None,
             });
             let name = format!("ssbo{storage_index}");
-            parameters.push(format!("device uint* {name} [[buffer({buffer_index})]]"));
+            parameters.push(MslParameter::new(
+                "device uint*",
+                &name,
+                MslParameterAttribute::Buffer(buffer_index),
+            ));
             storage_descriptor_names.push(name.clone());
             for alias in 0..descriptor.count {
                 storage_buffers.insert(storage_index + alias, name.clone());
@@ -416,76 +473,199 @@ impl MslEmitContext {
                 || (profile.warp_size_potentially_larger_than_guest
                     && program.info.uses_subgroup_vote));
         if needs_subgroup_lane_id {
-            parameters.push("uint subgroup_lane_id [[thread_index_in_simdgroup]]".to_owned());
+            parameters.push(MslParameter::builtin(
+                "uint",
+                "subgroup_lane_id",
+                "thread_index_in_simdgroup",
+            ));
         }
         if program.info.uses_workgroup_id {
-            parameters.push("uint3 workgroup_id [[threadgroup_position_in_grid]]".to_owned());
+            parameters.push(MslParameter::builtin(
+                "uint3",
+                "workgroup_id",
+                "threadgroup_position_in_grid",
+            ));
         }
         if program.info.uses_local_invocation_id {
-            parameters
-                .push("uint3 local_invocation_id [[thread_position_in_threadgroup]]".to_owned());
+            parameters.push(MslParameter::builtin(
+                "uint3",
+                "local_invocation_id",
+                "thread_position_in_threadgroup",
+            ));
         }
         if program.info.uses_sample_id {
-            parameters.push("uint sample_id [[sample_id]]".to_owned());
+            parameters.push(MslParameter::builtin("uint", "sample_id", "sample_id"));
         }
         let loads = &program.info.loads;
         match stage {
             Stage::VertexB => {
                 if loads.get(crate::ir::value::Attribute::INSTANCE_ID.0 as usize) {
                     if profile.support_vertex_instance_id {
-                        parameters.push("uint instance_id [[instance_id]]".to_owned());
+                        parameters.push(MslParameter::builtin(
+                            "uint",
+                            "instance_id",
+                            "instance_id",
+                        ));
                         if loads.get(crate::ir::value::Attribute::BASE_INSTANCE.0 as usize) {
-                            parameters.push("uint base_instance [[base_instance]]".to_owned());
+                            parameters.push(MslParameter::builtin(
+                                "uint",
+                                "base_instance",
+                                "base_instance",
+                            ));
                         }
                     } else {
-                        parameters.push("uint instance_index [[instance_id]]".to_owned());
-                        parameters.push("uint base_instance [[base_instance]]".to_owned());
+                        parameters.push(MslParameter::builtin(
+                            "uint",
+                            "instance_index",
+                            "instance_id",
+                        ));
+                        parameters.push(MslParameter::builtin(
+                            "uint",
+                            "base_instance",
+                            "base_instance",
+                        ));
                     }
                 } else if loads.get(crate::ir::value::Attribute::BASE_INSTANCE.0 as usize) {
-                    parameters.push("uint base_instance [[base_instance]]".to_owned());
+                    parameters.push(MslParameter::builtin(
+                        "uint",
+                        "base_instance",
+                        "base_instance",
+                    ));
                 }
                 if loads.get(crate::ir::value::Attribute::VERTEX_ID.0 as usize) {
                     if profile.support_vertex_instance_id {
-                        parameters.push("uint vertex_id [[vertex_id]]".to_owned());
+                        parameters.push(MslParameter::builtin("uint", "vertex_id", "vertex_id"));
                         if loads.get(crate::ir::value::Attribute::BASE_VERTEX.0 as usize) {
-                            parameters.push("uint base_vertex [[base_vertex]]".to_owned());
+                            parameters.push(MslParameter::builtin(
+                                "uint",
+                                "base_vertex",
+                                "base_vertex",
+                            ));
                         }
                     } else {
-                        parameters.push("uint vertex_index [[vertex_id]]".to_owned());
-                        parameters.push("uint base_vertex [[base_vertex]]".to_owned());
+                        parameters.push(MslParameter::builtin("uint", "vertex_index", "vertex_id"));
+                        parameters.push(MslParameter::builtin(
+                            "uint",
+                            "base_vertex",
+                            "base_vertex",
+                        ));
                     }
                 } else if loads.get(crate::ir::value::Attribute::BASE_VERTEX.0 as usize) {
-                    parameters.push("uint base_vertex [[base_vertex]]".to_owned());
+                    parameters.push(MslParameter::builtin("uint", "base_vertex", "base_vertex"));
                 }
             }
             Stage::Fragment => {
                 if loads.get(crate::ir::value::Attribute::PRIMITIVE_ID.0 as usize) {
-                    parameters.push("uint primitive_id [[primitive_id]]".to_owned());
+                    parameters.push(MslParameter::builtin(
+                        "uint",
+                        "primitive_id",
+                        "primitive_id",
+                    ));
                 }
                 if loads.get(crate::ir::value::Attribute::LAYER.0 as usize) {
-                    parameters.push("uint layer [[render_target_array_index]]".to_owned());
+                    parameters.push(MslParameter::builtin(
+                        "uint",
+                        "layer",
+                        "render_target_array_index",
+                    ));
                 }
                 if loads.any_component(crate::ir::value::Attribute::POSITION_X.0 as usize) {
-                    parameters.push("float4 fragment_position [[position]]".to_owned());
+                    parameters.push(MslParameter::builtin(
+                        "float4",
+                        "fragment_position",
+                        "position",
+                    ));
                 }
                 if loads.get(crate::ir::value::Attribute::FRONT_FACE.0 as usize) {
-                    parameters.push("bool front_face [[front_facing]]".to_owned());
+                    parameters.push(MslParameter::builtin("bool", "front_face", "front_facing"));
                 }
                 if loads.get(crate::ir::value::Attribute::POINT_SPRITE_S.0 as usize)
                     || loads.get(crate::ir::value::Attribute::POINT_SPRITE_T.0 as usize)
                 {
-                    parameters.push("float2 point_coord [[point_coord]]".to_owned());
+                    parameters.push(MslParameter::builtin(
+                        "float2",
+                        "point_coord",
+                        "point_coord",
+                    ));
                 }
             }
             _ => {}
         }
+        let geometry = (stage == Stage::Geometry)
+            .then(|| super::emit_msl_geometry::GeometryLayout::new(program, runtime_info, options))
+            .transpose()?;
+        let tessellation_control = (stage == Stage::TessellationControl)
+            .then(|| super::emit_msl_tessellation::TessellationControlLayout::new(program, runtime_info))
+            .transpose()?;
+        let tessellation_evaluation = (stage == Stage::TessellationEval)
+            .then(|| super::emit_msl_tessellation::TessellationEvaluationLayout::new(program, runtime_info))
+            .transpose()?;
+        if geometry.is_some_and(|layout| layout.stores_viewport_index)
+            && !profile.support_multi_viewport
+        {
+            return Err(MslError::UnsupportedProgramFeature("geometry viewport arrays"));
+        }
         let mut stage_input = String::new();
+        if tessellation_evaluation.is_some() {
+            for (ty, name) in [
+                ("const device ControlPoint*", "patch_input"),
+                ("const device PatchData&", "patch"),
+                ("uint", "patch_vertices"), ("uint", "patch_id"), ("float3", "tess_coord"),
+            ] {
+                parameters.push(MslParameter::new(ty, name, MslParameterAttribute::None));
+            }
+        }
+        if let Some(layout) = &tessellation_control {
+            stage_input = layout.declarations();
+            for (ty, name) in [
+                ("const device MslControlInput*", "patch_input"),
+                ("device MslControlOutput*", "patch_output"),
+                ("device MslControlPatch&", "patch"),
+                ("uint", "patch_vertices"), ("uint", "invocation_id"), ("uint", "patch_id"),
+            ] {
+                parameters.push(MslParameter::new(ty, name, MslParameterAttribute::None));
+            }
+        }
+        if let Some(layout) = &geometry {
+            stage_input = layout.payload_declaration(runtime_info);
+            parameters.push(MslParameter::builtin(
+                if function_kind == MslFunctionKind::GeometryFunction {
+                    "const thread MslGeometryPayload&"
+                } else {
+                    "const object_data MslGeometryPayload&"
+                },
+                "geometry_input",
+                "payload",
+            ));
+            parameters.push(MslParameter::builtin(
+                "uint3",
+                "geometry_group",
+                "threadgroup_position_in_grid",
+            ));
+            parameters.push(MslParameter::new(
+                if function_kind == MslFunctionKind::GeometryFunction {
+                    "thread GeometryOutput&"
+                } else {
+                    "MslGeometryMesh"
+                },
+                "geometry_mesh",
+                MslParameterAttribute::None,
+            ));
+        }
         for index in 0..32 {
+            if tessellation_control.is_some() || tessellation_evaluation.is_some() { break; }
             let input_type = runtime_info.generic_input_types[index];
             if !runtime_info.previous_stage_stores.generic_any(index)
                 || !program.info.loads.generic_any(index)
-                || input_type == AttributeType::Disabled
+                || (input_type == AttributeType::Disabled && stage != Stage::Geometry)
             {
+                continue;
+            }
+            if stage == Stage::Geometry {
+                input_generics[index] = Some(MslInputGenericDefinition {
+                    name: format!("in_attr{index}"),
+                    load_op: MslInputGenericLoadOp::None,
+                });
                 continue;
             }
             if stage_input.is_empty() {
@@ -523,30 +703,62 @@ impl MslEmitContext {
             stage_input.push_str(&format!("    {type_name} {name} {attribute};\n"));
             input_generics[index] = Some(MslInputGenericDefinition { name, load_op });
         }
-        if !stage_input.is_empty() {
+        if !stage_input.is_empty() && stage != Stage::Geometry && tessellation_control.is_none() {
             stage_input.push_str("};\n\n");
             let parameter = match stage {
-                Stage::VertexB => "MslVertexIn input [[stage_in]]",
-                Stage::Fragment => "MslFragmentIn input [[stage_in]]",
+                Stage::VertexB => "MslVertexIn",
+                Stage::Fragment => "MslFragmentIn",
                 _ => unreachable!(),
             };
-            parameters.insert(0, parameter.to_owned());
+            parameters.insert(0, MslParameter::builtin(parameter, "input", "stage_in"));
         }
-        let parameters = parameters.join(", ");
+        let mut sampler_declaration = String::new();
+        if bindings.sampler_count > super::MAX_DIRECT_SAMPLERS {
+            let type_name = format!("Msl{stage:?}SamplerArguments");
+            sampler_declaration.push_str(&format!("struct {type_name} {{\n"));
+            parameters.retain(|parameter| {
+                if let MslParameterAttribute::Sampler(index) = parameter.attribute {
+                    sampler_declaration.push_str(&format!(
+                        "    {} {} [[id({index})]];\n", parameter.ty, parameter.name,
+                    ));
+                    false
+                } else {
+                    true
+                }
+            });
+            sampler_declaration.push_str("};\n\n");
+            let index = bindings.buffer_count;
+            bindings.buffer_count += 1;
+            bindings.sampler_argument_buffer_index = Some(index);
+            parameters.push(MslParameter::new(
+                format!("constant {type_name}&"), "sampler_arguments", MslParameterAttribute::Buffer(index),
+            ));
+            for texture in &mut textures {
+                texture.sampler_name = format!("sampler_arguments.{}", texture.sampler_name);
+            }
+        }
+        let interface = MslFunctionInterface {
+            kind: function_kind,
+            parameters,
+        };
+        let parameters = interface.declarations();
         let mut source = String::new();
+        source.push_str(&sampler_declaration);
         source.push_str(push_constant_declaration);
         source.push_str(&stage_input);
         // SPIRV-Cross removes FragDepth when EarlyFragmentTests is active:
         // SPIR-V makes that write ineffective, while Metal rejects the pair.
         let emits_frag_depth = program.info.stores_frag_depth && !runtime_info.force_early_z;
-        let emits_point_size = !options.disable_rasterization
+        let emits_point_size = stage != Stage::TessellationControl && !options.disable_rasterization
+            && (stage != Stage::Geometry
+                || program.output_topology == crate::ir::types::OutputTopology::PointList)
             && options.enable_point_size_builtin
             && (program
                 .info
                 .stores
                 .get(crate::ir::value::Attribute::POINT_SIZE.0 as usize)
                 || runtime_info.fixed_state_point_size.is_some());
-        if emits_point_size && stage != Stage::VertexB {
+        if emits_point_size && !matches!(stage, Stage::VertexB | Stage::Geometry | Stage::TessellationEval) {
             return Err(MslError::UnsupportedProgramFeature(
                 "point-size output outside a vertex shader",
             ));
@@ -562,11 +774,20 @@ impl MslEmitContext {
             emits_frag_color[1] = true;
         }
         let returns_output = match stage {
+            Stage::TessellationControl => {
+                source.push_str(&format!("inline void ruzu_control({parameters}) {{\n"));
+                // Eden DefineOutputs initializes the clip-distance interface to
+                // zero. Each native invocation owns its corresponding record.
+                for index in 0..clip_distance_count {
+                    source.push_str(&format!("    patch_output[invocation_id].clip_distance[{index}] = 0.0f;\n"));
+                }
+                false
+            }
             Stage::VertexB if options.disable_rasterization => {
                 source.push_str(&format!("vertex void main0({parameters}) {{\n"));
                 false
             }
-            Stage::VertexB => {
+            Stage::VertexB | Stage::Geometry | Stage::TessellationEval => {
                 source.push_str("struct MslVertexOut {\n");
                 source.push_str("    float4 position [[position]];\n");
                 if emits_point_size {
@@ -585,7 +806,28 @@ impl MslEmitContext {
                     }
                 }
                 source.push_str("};\n\n");
-                source.push_str(&format!("vertex MslVertexOut main0({parameters}) {{\n"));
+                if let Some(layout) = &geometry {
+                    if function_kind == MslFunctionKind::GeometryFunction {
+                        source.push_str(layout.primitive_declaration());
+                        source.push_str(&format!("template<typename GeometryOutput>\ninline void ruzu_geometry({parameters}) {{\n"));
+                    } else {
+                        source.push_str(&layout.mesh_declaration());
+                        source.push_str(&format!("[[mesh, max_total_threads_per_threadgroup(1)]] void main0({parameters}) {{\n"));
+                    }
+                    source.push_str("    uint geometry_vertex = 0u;\n    uint geometry_primitive = 0u;\n    uint geometry_strip_vertices = 0u;\n");
+                    if layout.has_primitive_outputs() {
+                        source.push_str("    MslGeometryPrimitiveOut geometry_primitive_output = {};\n");
+                    }
+                } else {
+                    let entry = if function_kind == MslFunctionKind::TessellationEvaluationFunction {
+                        "template<typename ControlPoint, typename PatchData>\ninline MslVertexOut ruzu_evaluate"
+                    } else if function_kind == MslFunctionKind::VertexFunction {
+                        "inline MslVertexOut ruzu_vertex"
+                    } else {
+                        "vertex MslVertexOut main0"
+                    };
+                    source.push_str(&format!("{entry}({parameters}) {{\n"));
+                }
                 source.push_str(concat!(
                     "    MslVertexOut output = {};\n",
                     "    output.position = float4(0.0f);\n",
@@ -662,6 +904,10 @@ impl MslEmitContext {
         let local_declarations_offset = (!program.syntax_list.is_empty()).then_some(source.len());
         Ok(Self {
             stage,
+            interface,
+            geometry,
+            tessellation_control,
+            tessellation_evaluation,
             source,
             local_declarations: String::new(),
             local_declarations_offset,
@@ -772,7 +1018,7 @@ impl MslEmitContext {
         descriptor: &TextureBufferDescriptor,
         descriptor_binding: u32,
         bindings: &mut MslBindingLayout,
-        parameters: &mut Vec<String>,
+        parameters: &mut Vec<MslParameter>,
     ) -> Result<MslTextureBufferDefinition, MslError> {
         if descriptor.count != 1 {
             return Err(MslError::UnsupportedProgramFeature(
@@ -791,8 +1037,10 @@ impl MslEmitContext {
             count: None,
         });
         let texture_name = format!("texbuf{descriptor_index}");
-        parameters.push(format!(
-            "texture_buffer<float, access::read> {texture_name} [[texture({texture_index})]]"
+        parameters.push(MslParameter::new(
+            "texture_buffer<float, access::read>",
+            &texture_name,
+            MslParameterAttribute::Texture(texture_index),
         ));
         Ok(MslTextureBufferDefinition {
             texture_name,
@@ -807,7 +1055,7 @@ impl MslEmitContext {
         descriptor_binding: u32,
         supports_read_write_textures: bool,
         bindings: &mut MslBindingLayout,
-        parameters: &mut Vec<String>,
+        parameters: &mut Vec<MslParameter>,
     ) -> Result<MslImageBufferDefinition, MslError> {
         if descriptor.count == 0 {
             return Err(MslError::UnsupportedProgramFeature(
@@ -849,13 +1097,16 @@ impl MslEmitContext {
         });
         let image_name = format!("imgbuf{descriptor_index}");
         if descriptor.count > 1 {
-            parameters.push(format!(
-                "array<{image_type}, {}> {image_name} [[texture({texture_index})]]",
-                descriptor.count
+            parameters.push(MslParameter::new(
+                format!("array<{image_type}, {}>", descriptor.count),
+                &image_name,
+                MslParameterAttribute::Texture(texture_index),
             ));
         } else {
-            parameters.push(format!(
-                "{image_type} {image_name} [[texture({texture_index})]]"
+            parameters.push(MslParameter::new(
+                &image_type,
+                &image_name,
+                MslParameterAttribute::Texture(texture_index),
             ));
         }
         Ok(MslImageBufferDefinition {
@@ -870,7 +1121,7 @@ impl MslEmitContext {
         descriptor: &TextureDescriptor,
         descriptor_binding: u32,
         bindings: &mut MslBindingLayout,
-        parameters: &mut Vec<String>,
+        parameters: &mut Vec<MslParameter>,
     ) -> Result<MslTextureDefinition, MslError> {
         if descriptor.texture_type == TextureType::Buffer {
             return Err(MslError::UnsupportedProgramFeature(
@@ -955,20 +1206,26 @@ impl MslEmitContext {
             format!("{texture_class}<{component}>")
         };
         if descriptor.count > 1 {
-            parameters.push(format!(
-                "array<{texture_type}, {}> {texture_name} [[texture({texture_index})]]",
-                descriptor.count
+            parameters.push(MslParameter::new(
+                format!("array<{texture_type}, {}>", descriptor.count),
+                &texture_name,
+                MslParameterAttribute::Texture(texture_index),
             ));
-            parameters.push(format!(
-                "array<sampler, {}> {sampler_name} [[sampler({sampler_index})]]",
-                descriptor.count
+            parameters.push(MslParameter::new(
+                format!("array<sampler, {}>", descriptor.count),
+                &sampler_name,
+                MslParameterAttribute::Sampler(sampler_index),
             ));
         } else {
-            parameters.push(format!(
-                "{texture_type} {texture_name} [[texture({texture_index})]]"
+            parameters.push(MslParameter::new(
+                &texture_type,
+                &texture_name,
+                MslParameterAttribute::Texture(texture_index),
             ));
-            parameters.push(format!(
-                "sampler {sampler_name} [[sampler({sampler_index})]]"
+            parameters.push(MslParameter::new(
+                "sampler",
+                &sampler_name,
+                MslParameterAttribute::Sampler(sampler_index),
             ));
         }
         Ok(MslTextureDefinition {
@@ -988,7 +1245,7 @@ impl MslEmitContext {
         descriptor_binding: u32,
         supports_read_write_textures: bool,
         bindings: &mut MslBindingLayout,
-        parameters: &mut Vec<String>,
+        parameters: &mut Vec<MslParameter>,
     ) -> Result<MslImageDefinition, MslError> {
         if descriptor.count == 0 {
             return Err(MslError::UnsupportedProgramFeature(
@@ -1048,13 +1305,16 @@ impl MslEmitContext {
 
         let image_name = format!("img{descriptor_index}");
         if descriptor.count > 1 {
-            parameters.push(format!(
-                "array<{image_type}, {}> {image_name} [[texture({texture_index})]]",
-                descriptor.count
+            parameters.push(MslParameter::new(
+                format!("array<{image_type}, {}>", descriptor.count),
+                &image_name,
+                MslParameterAttribute::Texture(texture_index),
             ));
         } else {
-            parameters.push(format!(
-                "{image_type} {image_name} [[texture({texture_index})]]"
+            parameters.push(MslParameter::new(
+                &image_type,
+                &image_name,
+                MslParameterAttribute::Texture(texture_index),
             ));
         }
         Ok(MslImageDefinition {
@@ -1070,7 +1330,55 @@ impl MslEmitContext {
     }
 
     pub(crate) fn emits_vertex_outputs(&self) -> bool {
-        self.stage == Stage::VertexB && self.returns_output
+        matches!(self.stage, Stage::VertexB | Stage::Geometry | Stage::TessellationEval) && self.returns_output
+    }
+
+    pub(crate) fn tessellation_control_layout(&self) -> Result<&super::emit_msl_tessellation::TessellationControlLayout, MslError> {
+        self.tessellation_control.as_ref().ok_or(MslError::UnsupportedProgramFeature("tessellation control interface"))
+    }
+
+    pub(crate) fn tessellation_evaluation_layout(&self) -> Result<&super::emit_msl_tessellation::TessellationEvaluationLayout, MslError> {
+        self.tessellation_evaluation.as_ref().ok_or(MslError::UnsupportedProgramFeature("tessellation evaluation interface"))
+    }
+
+    pub(crate) fn geometry_input_vertices(&self) -> Result<u32, MslError> {
+        self.geometry.map(|layout| layout.input_vertices).ok_or(
+            MslError::UnsupportedProgramFeature("geometry builtin outside geometry stage"),
+        )
+    }
+
+    pub(crate) fn emit_geometry_vertex(&mut self) -> Result<(), MslError> {
+        let layout = self.geometry.ok_or(MslError::UnsupportedProgramFeature(
+            "EmitVertex outside geometry stage",
+        ))?;
+        self.emit_statement(layout.emit_vertex());
+        if layout.has_primitive_outputs() {
+            self.emit_statement(layout.emit_primitive_output());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn geometry_input_expression(
+        &self,
+        attribute: crate::ir::value::Attribute,
+        vertex: &str,
+    ) -> String {
+        let swizzle = ["x", "y", "z", "w"];
+        if attribute.is_position() {
+            return format!(
+                "geometry_input.vertices[{vertex}].position.{}",
+                swizzle[attribute.position_element() as usize]
+            );
+        }
+        let index = attribute.generic_index() as usize;
+        let component = attribute.generic_element() as usize;
+        if self.input_generics[index].is_none() {
+            return if component == 3 { "1.0f" } else { "0.0f" }.to_owned();
+        }
+        format!(
+            "geometry_input.vertices[{vertex}].in_attr{index}.{}",
+            swizzle[component]
+        )
     }
 
     pub(crate) fn converts_depth_mode(&self) -> bool {
@@ -1780,7 +2088,9 @@ impl MslEmitContext {
     }
 
     pub fn emit_return(&mut self) {
-        if self.returns_output {
+        if self.geometry.is_some() {
+            self.emit_statement("geometry_mesh.set_primitive_count(geometry_primitive);\nreturn;");
+        } else if self.returns_output {
             self.emit_statement("return output;");
         } else {
             self.emit_statement("return;");
@@ -1960,6 +2270,36 @@ impl MslEmitContext {
         Ok(())
     }
 
+    pub(crate) fn emit_set_layer(
+        &mut self,
+        inst_ref: InstRef,
+        value: &Value,
+    ) -> Result<(), MslError> {
+        if !self.geometry.is_some_and(|layout| layout.stores_layer) {
+            return Err(MslError::UnsupportedAttribute(crate::ir::value::Attribute::LAYER.0));
+        }
+        let expression = self.value_expression(value, inst_ref, 1)?;
+        self.emit_statement(&format!(
+            "geometry_primitive_output.layer = as_type<uint>({expression});"
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn emit_set_viewport_index(
+        &mut self,
+        inst_ref: InstRef,
+        value: &Value,
+    ) -> Result<(), MslError> {
+        if !self.geometry.is_some_and(|layout| layout.stores_viewport_index) {
+            return Err(MslError::UnsupportedAttribute(crate::ir::value::Attribute::VIEWPORT_INDEX.0));
+        }
+        let expression = self.value_expression(value, inst_ref, 1)?;
+        self.emit_statement(&format!(
+            "geometry_primitive_output.viewport = as_type<uint>({expression});"
+        ));
+        Ok(())
+    }
+
     pub fn emit_set_clip_distance(
         &mut self,
         inst_ref: InstRef,
@@ -2074,7 +2414,7 @@ impl MslEmitContext {
             self.source.insert_str(offset, &self.local_declarations);
         }
         if self.returns_output && !self.terminal_return_emitted {
-            self.source.push_str("    return output;\n");
+            self.emit_return();
         }
         self.source.push_str("}\n");
         let mut source = String::from("#include <metal_stdlib>\nusing namespace metal;\n\n");
@@ -2090,10 +2430,16 @@ impl MslEmitContext {
         if self.uses_cbuf_indirect {
             Self::define_constant_buffer_indirect_functions(&mut source);
         }
+        if self.uses_no_contraction_add || self.uses_no_contraction_mul || self.uses_no_contraction_fma {
+            // Preserve NoContraction without blocking inlining/constant folding
+            // of every precise operation. Keep explicit fma calls and safe math;
+            // disabling implicit contraction also conservatively covers callers.
+            source.push_str("#pragma STDC FP_CONTRACT OFF\n\n");
+        }
         if self.uses_no_contraction_add {
             source.push_str(concat!(
                 "template<typename T>\n",
-                "[[clang::optnone]] T spvFAdd(T lhs, T rhs) {\n",
+                "inline T spvFAdd(T lhs, T rhs) {\n",
                 "    return fma(T(1), lhs, rhs);\n",
                 "}\n\n",
             ));
@@ -2101,7 +2447,7 @@ impl MslEmitContext {
         if self.uses_no_contraction_mul {
             source.push_str(concat!(
                 "template<typename T>\n",
-                "[[clang::optnone]] T spvFMul(T lhs, T rhs) {\n",
+                "inline T spvFMul(T lhs, T rhs) {\n",
                 "    return fma(lhs, rhs, T(0));\n",
                 "}\n\n",
             ));
@@ -2109,7 +2455,7 @@ impl MslEmitContext {
         if self.uses_no_contraction_fma {
             source.push_str(concat!(
                 "template<typename T>\n",
-                "[[clang::optnone]] T spvFma(T a, T b, T c) {\n",
+                "inline T spvFma(T a, T b, T c) {\n",
                 "    return fma(a, b, c);\n",
                 "}\n\n",
             ));
@@ -2252,9 +2598,16 @@ impl MslEmitContext {
                 stage: self.stage,
             },
             bindings: self.bindings,
-            entry_point: "main0".to_owned(),
+            entry_point: match self.interface.kind {
+                super::msl_function::MslFunctionKind::StageEntryPoint => "main0",
+                super::msl_function::MslFunctionKind::VertexFunction => "ruzu_vertex",
+                super::msl_function::MslFunctionKind::GeometryFunction => "ruzu_geometry",
+                super::msl_function::MslFunctionKind::TessellationControlFunction => "ruzu_control",
+                super::msl_function::MslFunctionKind::TessellationEvaluationFunction => "ruzu_evaluate",
+            }.to_owned(),
             language_version: self.language_version,
             execution: self.execution,
+            interface: Some(self.interface),
         }
     }
 }

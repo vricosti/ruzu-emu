@@ -390,7 +390,7 @@ fn run_thread(
             break;
         }
 
-        match next.data {
+        with_command_autorelease_pool(|| match next.data {
             CommandData::SubmitList(submit) => {
                 scheduler.push(gpu, submit.channel, submit.entries);
             }
@@ -414,7 +414,7 @@ fn run_thread(
                 unreachable!("FlushAndInvalidateRegion should not be queued");
             }
             CommandData::None => unreachable!("empty GPU thread command was queued"),
-        }
+        });
 
         // Signal fence completion.
         state.signaled_fence.store(next.fence, Ordering::SeqCst);
@@ -425,9 +425,66 @@ fn run_thread(
     }
 }
 
+/// Native Metal calls can autorelease temporary objects internally. Unlike
+/// Eden's driver-owned Vulkan entry points, this OS thread has no Cocoa event
+/// loop to drain them. Bound their lifetime to one command, not the thread;
+/// resources retained by the renderer or submitted command buffers survive.
+fn with_command_autorelease_pool<R>(execute: impl FnOnce() -> R) -> R {
+    #[cfg(target_os = "macos")]
+    {
+        objc2::rc::autoreleasepool(|_| execute())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        execute()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn command_pool_drains_temporaries_but_preserves_retained_resources() {
+        use objc2::rc::{Retained, Weak};
+        use objc2::runtime::NSObject;
+
+        let (temporary, retained) = with_command_autorelease_pool(|| {
+            let temporary = NSObject::new();
+            let weak = Weak::from_retained(&temporary);
+            let _ = Retained::autorelease_ptr(temporary);
+            assert!(weak.load().is_some());
+
+            let resource = NSObject::new();
+            let _ = Retained::autorelease_ptr(resource.clone());
+            (weak, resource)
+        });
+        assert!(temporary.load().is_none());
+        let weak = Weak::from_retained(&retained);
+        assert!(weak.load().is_some());
+        drop(retained);
+        assert!(weak.load().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn command_pool_drains_during_unwind() {
+        use objc2::rc::{Retained, Weak};
+        use objc2::runtime::NSObject;
+
+        let mut temporary = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_command_autorelease_pool(|| {
+                let object = NSObject::new();
+                temporary = Some(Weak::from_retained(&object));
+                let _ = Retained::autorelease_ptr(object);
+                panic!("command failed");
+            });
+        }));
+        assert!(result.is_err());
+        assert!(temporary.unwrap().load().is_none());
+    }
 
     #[test]
     fn shutdown_wakes_joins_and_is_idempotent() {

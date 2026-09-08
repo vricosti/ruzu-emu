@@ -1,0 +1,31 @@
+# Replace the paths and device. --list-input-devices lists available evdev nodes.
+# Use a new output directory for every run. No frontend settings are rewritten.
+[process]
+executable = "../../target/release/ruzu"
+rom_path = "/absolute/path/to/freebrick.nro"
+rom_arg = "-g"
+working_directory = "../.."
+log_file = "recording/process.log"
+terminate_after_timeline = true
+
+[session]
+mode = "record"
+device = "/dev/input/by-id/your-controller-event-joystick"
+file = "recording/input.json"
+duration = "00:05:00"
+# For replay: mode = "replay", keep file, remove device and duration.
+
+[capture]
+output_directory = "recording"
+# Empty: no X11 tools required. Add timecodes to take screenshots as well.
+times = []
+
+# Optional RenderDoc integration; see README for building rdc_trigger.so.
+# [renderdoc]
+# library = "/path/to/renderdoc/lib/librenderdoc.so"
+# helper = "/path/to/rdc_trigger.so"
+# vulkan_layer_manifest = "/path/to/renderdoc/etc/vulkan/implicit_layer.d/renderdoc_capture.json"
+# capture_prefix = "recording/rdc/frame"
+# times = ["00:02:00"]
+# frames = 1
+# timeout = "30"

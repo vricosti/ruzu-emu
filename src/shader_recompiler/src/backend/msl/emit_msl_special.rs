@@ -61,7 +61,7 @@ pub fn emit_prologue(context: &mut MslEmitContext, program: &ir::Program) {
         }
     }
 
-    if context.emits_vertex_outputs() {
+    if context.stage() == Stage::VertexB && context.emits_vertex_outputs() {
         context.emit_statement("output.position = float4(0.0f, 0.0f, 0.0f, 1.0f);");
         for index in 0..32 {
             if program.info.stores.generic_any(index) {
@@ -76,6 +76,8 @@ pub fn emit_prologue(context: &mut MslEmitContext, program: &ir::Program) {
                 context.emit_statement(&format!("output.clip_distance[{index}] = 0.0f;"));
             }
         }
+    }
+    if context.emits_vertex_outputs() {
         set_fixed_pipeline_point_size(context);
     }
 }
@@ -110,11 +112,42 @@ fn alpha_test(context: &mut MslEmitContext) {
 
 /// Emit Eden's `EmitEpilogue` behavior into the direct MSL entry point.
 pub fn emit_epilogue(context: &mut MslEmitContext) {
-    if context.emits_vertex_outputs() && context.converts_depth_mode() {
+    if context.stage() != Stage::Geometry
+        && context.emits_vertex_outputs()
+        && context.converts_depth_mode()
+    {
         context
             .emit_statement("output.position.z = (output.position.z + output.position.w) * 0.5f;");
     }
     if context.stage() == Stage::Fragment {
         alpha_test(context);
     }
+}
+
+fn require_raster_stream_zero(inst: &ir::Inst) -> Result<(), MslError> {
+    if !matches!(inst.arg(0), ir::Value::ImmU32(0)) {
+        return Err(MslError::UnsupportedProgramFeature(
+            "nonzero or dynamic geometry stream",
+        ));
+    }
+    Ok(())
+}
+
+/// Capture the current output record before subsequent attribute stores.
+pub fn emit_emit_vertex(context: &mut MslEmitContext, inst: &ir::Inst) -> Result<(), MslError> {
+    require_raster_stream_zero(inst)?;
+    if context.converts_depth_mode() {
+        context
+            .emit_statement("output.position.z = (output.position.z + output.position.w) * 0.5f;");
+    }
+    context.emit_geometry_vertex()?;
+    set_fixed_pipeline_point_size(context);
+    Ok(())
+}
+
+pub fn emit_end_primitive(context: &mut MslEmitContext, inst: &ir::Inst) -> Result<(), MslError> {
+    require_raster_stream_zero(inst)?;
+    context.geometry_input_vertices()?;
+    context.emit_statement("geometry_strip_vertices = 0u;");
+    Ok(())
 }

@@ -1743,6 +1743,17 @@ fn test_viewport_default() {
 }
 
 #[test]
+fn viewport_swizzle_encodings_match_maxwell_registers() {
+    assert_eq!(std::mem::size_of::<ViewportSwizzle>(), 4);
+    assert_eq!([
+        ViewportSwizzle::PositiveX as u32, ViewportSwizzle::NegativeX as u32,
+        ViewportSwizzle::PositiveY as u32, ViewportSwizzle::NegativeY as u32,
+        ViewportSwizzle::PositiveZ as u32, ViewportSwizzle::NegativeZ as u32,
+        ViewportSwizzle::PositiveW as u32, ViewportSwizzle::NegativeW as u32,
+    ], [0, 1, 2, 3, 4, 5, 6, 7]);
+}
+
+#[test]
 fn test_scissor_default() {
     let sc = ScissorInfo::default();
     assert!(!sc.enabled);
@@ -3770,6 +3781,31 @@ fn test_call_method_query_condition_if_equal_reads_compare_block() {
     engine.call_method(RENDER_ENABLE_MODE, 3, true);
 
     assert!(engine.should_execute());
+}
+
+#[test]
+fn test_cpu_query_condition_requires_both_initial_words_nonzero() {
+    let memory = Arc::new(crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default());
+    let mut backing = vec![0u8; 0x1000];
+    memory.smmu_set_physical_base_for_test(backing.as_mut_ptr() as usize);
+    memory.smmu_map_with_cpu_backing(0x8000, backing.as_mut_ptr(), 0x4000, backing.len(), 1, true);
+    let mut channel_memory = crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+        1, memory, 32, 0x1_0000_0000, 16, 12,
+    );
+    channel_memory.map(0x10000, 0x8000, 0x1000, 0, false);
+    let mut engine = Maxwell3D::new();
+    engine.set_memory_manager(Arc::new(parking_lot::Mutex::new(channel_memory)));
+    engine.call_method(RENDER_ENABLE_BASE, 0, true);
+    engine.call_method(RENDER_ENABLE_BASE + 1, 0x10100, true);
+    engine.call_method(RENDER_ENABLE_OVERRIDE, 0, true);
+    // The two words are independent, not one 64-bit nonzero comparison.
+    for (sequence, mode, expected) in [(0u32, 0u32, false), (1, 0, false),
+        (0, 1, false), (1, 1, true), (u32::MAX, u32::MAX, true)] {
+        backing[0x100..0x104].copy_from_slice(&sequence.to_le_bytes());
+        backing[0x104..0x108].copy_from_slice(&mode.to_le_bytes());
+        engine.call_method(RENDER_ENABLE_MODE, 2, true);
+        assert_eq!(engine.should_execute(), expected);
+    }
 }
 
 #[test]

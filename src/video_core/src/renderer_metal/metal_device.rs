@@ -140,7 +140,19 @@ fn select_msl_language_version(is_apple_silicon: bool) -> MslVersion {
 }
 
 impl MetalDeviceProfile {
-    fn query(device: &ProtocolObject<dyn MTLDevice>) -> Self {
+    /// Apple feature tables expose 16 viewports from Apple5 and on Mac2.
+    /// Older families support only the single-viewport API.
+    pub fn max_viewports(&self) -> usize {
+        if self.highest_apple_family.is_some_and(|family| family >= 5)
+            || self.supports_mac2_family
+        {
+            16
+        } else {
+            1
+        }
+    }
+
+    pub(crate) fn query(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         let highest_apple_family = [
             (10, MTLGPUFamily::Apple10),
             (9, MTLGPUFamily::Apple9),
@@ -245,6 +257,33 @@ impl MetalDeviceProfile {
                 || self.supports_mac2_family)
     }
 
+    /// Metal's mesh pipeline requires MSL 3.0 and Apple7 or Mac2 hardware.
+    /// See Apple's Metal feature tables and WWDC22 session 10162. This reports
+    /// a native prerequisite, not support for Maxwell geometry shaders.
+    pub fn supports_mesh_shaders(&self) -> bool {
+        self.msl_language_version >= MslVersion::V3_0
+            && (self.highest_apple_family.is_some_and(|family| family >= 7)
+                || self.supports_mac2_family)
+    }
+
+    /// Native tessellation limits from Apple's Metal feature tables. This is
+    /// not a claim that every Maxwell tessellation domain is implemented.
+    pub fn max_tessellation_factor(&self) -> Option<u32> {
+        if self.supports_mac2_family || self.highest_apple_family.is_some_and(|f| f >= 5) {
+            Some(64)
+        } else if self.highest_apple_family.is_some_and(|f| f >= 3) {
+            Some(16)
+        } else {
+            None
+        }
+    }
+
+    /// Indirect patch draws require Apple5 or Mac2, independently of basic
+    /// tessellation (already available on Apple3/4 with lower factor limits).
+    pub fn supports_indirect_tessellation(&self) -> bool {
+        self.supports_mac2_family || self.highest_apple_family.is_some_and(|f| f >= 5)
+    }
+
     pub fn argument_binding_model(&self) -> MetalArgumentBindingModel {
         if self.max_argument_buffer_sampler_count == 0 {
             return MetalArgumentBindingModel::Direct;
@@ -329,6 +368,53 @@ mod tests {
     #[test]
     fn intel_devices_never_select_apple_silicon_only_msl() {
         assert!(select_msl_language_version(false) <= MslVersion::V3_1);
+    }
+
+    #[test]
+    fn viewport_limit_follows_device_family_not_host_cpu() {
+        let mut profile = native_profile();
+        for (apple, mac2, expected) in [
+            (None, false, 1), (Some(4), false, 1), (Some(5), false, 16),
+            (Some(7), false, 16), (Some(10), false, 16), (None, true, 16),
+        ] {
+            profile.highest_apple_family = apple;
+            profile.supports_mac2_family = mac2;
+            assert_eq!(profile.max_viewports(), expected);
+        }
+    }
+
+    #[test]
+    fn tessellation_limit_uses_queried_family() {
+        let mut profile = native_profile();
+        for (apple, mac2, expected) in [
+            (None, false, None), (Some(2), false, None),
+            (Some(3), false, Some(16)), (Some(4), false, Some(16)),
+            (Some(5), false, Some(64)), (Some(7), false, Some(64)),
+            (Some(10), false, Some(64)), (None, true, Some(64)),
+        ] {
+            profile.highest_apple_family = apple;
+            profile.supports_mac2_family = mac2;
+            assert_eq!(profile.max_tessellation_factor(), expected);
+            assert_eq!(profile.supports_indirect_tessellation(), expected == Some(64));
+        }
+    }
+
+    #[test]
+    fn mesh_support_requires_both_language_and_device_family() {
+        let mut profile = native_profile();
+        profile.supports_mac2_family = false;
+        profile.highest_apple_family = Some(7);
+        profile.msl_language_version = MslVersion::V2_4;
+        assert!(!profile.supports_mesh_shaders());
+        profile.msl_language_version = MslVersion::V3_0;
+        assert!(profile.supports_mesh_shaders());
+        profile.highest_apple_family = Some(6);
+        assert!(!profile.supports_mesh_shaders());
+        profile.highest_apple_family = None;
+        profile.supports_mac2_family = true;
+        assert!(profile.supports_mesh_shaders());
+        profile.msl_language_version = MslVersion::V2_4;
+        assert!(!profile.supports_mesh_shaders());
     }
 
     #[test]

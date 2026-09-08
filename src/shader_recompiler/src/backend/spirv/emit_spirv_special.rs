@@ -266,7 +266,9 @@ pub fn emit_emit_vertex(ctx: &mut SpirvEmitContext, stream: &Value) {
         convert_depth_mode(ctx);
     }
     if !ctx.profile.support_geometry_streams {
-        panic!("SPIR-V: geometry streams are not supported");
+        std::panic::panic_any(crate::exception::NotImplementedException::new(
+            "Geometry streams",
+        ));
     }
     let stream = if stream.is_immediate() {
         ctx.resolve_value(stream)
@@ -283,7 +285,9 @@ pub fn emit_emit_vertex(ctx: &mut SpirvEmitContext, stream: &Value) {
 /// Matches upstream `EmitEndPrimitive(EmitContext&, const IR::Value&)`.
 pub fn emit_end_primitive(ctx: &mut SpirvEmitContext, stream: &Value) {
     if !ctx.profile.support_geometry_streams {
-        panic!("SPIR-V: geometry streams are not supported");
+        std::panic::panic_any(crate::exception::NotImplementedException::new(
+            "Geometry streams",
+        ));
     }
     let stream = if stream.is_immediate() {
         ctx.resolve_value(stream)
@@ -330,6 +334,50 @@ mod tests {
         emitter.set_frag_color(Value::ImmU32(0), Value::ImmU32(3), Value::ImmF32(0.25));
         emitter.epilogue();
         program
+    }
+
+    #[test]
+    fn unsupported_geometry_streams_raise_typed_shader_exceptions() {
+        for emit_vertex in [true, false] {
+            let error = std::panic::catch_unwind(|| {
+                let mut program = Program::new(ShaderStage::Geometry);
+                program.blocks.push(Block::new());
+                let mut emitter = Emitter::new(&mut program, 0);
+                if emit_vertex {
+                    emitter.emit_vertex(Value::ImmU32(0));
+                } else {
+                    emitter.end_primitive(Value::ImmU32(0));
+                }
+                let profile = Profile {
+                    support_geometry_streams: false,
+                    ..Default::default()
+                };
+                emit_spirv(&program, &profile, &Default::default());
+            })
+            .expect_err("unsupported geometry streams must reject the shader");
+            let error = error
+                .downcast_ref::<crate::exception::NotImplementedException>()
+                .expect("the pipeline cache must recognize the shader exception");
+            assert_eq!(error.to_string(), "Geometry streams is not implemented");
+        }
+    }
+
+    #[test]
+    fn supported_geometry_streams_emit_vertex_and_end_primitive() {
+        let mut program = Program::new(ShaderStage::Geometry);
+        program.blocks.push(Block::new());
+        let mut emitter = Emitter::new(&mut program, 0);
+        emitter.emit_vertex(Value::ImmU32(0));
+        emitter.end_primitive(Value::ImmU32(0));
+        let profile = Profile {
+            support_geometry_streams: true,
+            ..Default::default()
+        };
+
+        let words = emit_spirv(&program, &profile, &Default::default());
+
+        assert_eq!(count_opcode(&words, rspirv::spirv::Op::EmitStreamVertex), 1);
+        assert_eq!(count_opcode(&words, rspirv::spirv::Op::EndStreamPrimitive), 1);
     }
 
     #[test]

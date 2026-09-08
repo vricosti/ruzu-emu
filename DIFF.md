@@ -1,5 +1,160 @@
 # Upstream parity notes
 
+## 2026-09-08 - Metal clear pass reuse vs blit_image.h/.cpp and vk_scheduler.h/.cpp
+
+### Intentional differences
+- `metal_framebuffer.rs` includes view-relative slice in its native pass key and owns a key constructor matching its per-layer descriptor. Metal selects slices directly; Eden's compatibility uses VkFramebuffer/renderpass identity.
+- `metal_blit_helper.rs::clear_attachments` requests a compatible retained encoder, matching Eden ClearColor/ClearDepthStencil -> RequestRenderpass. It explicitly resets viewport, scissor, cull, depth bias and visibility mode that previously came from fresh encoder defaults. Existing pipeline/depth-stencil/buffer setup remains intact.
+- `metal_rasterizer.rs` passes the framebuffer-owned layer key. Its subsequent guest draw path already binds relevant dynamic state again, unlike Eden's dirty-state invalidation. Conditional arguments, masked/integer clear shader behavior and native load-action eligibility are unchanged.
+
+### Verification
+- Re-read upstream helper header and clear implementations, plus Scheduler::RequestRenderpass compatibility and declarations. Helpers remain in their existing owners; no new synchronization or submission.
+- Native conditional-clear regression now dirties inherited viewport/scissor/cull/depth-bias state, checks retained encoder identity before/after clear and subsequent compatible begin, then verifies exact pixels over enabled/inverted predicates, typed colors, depth/stencil masks, view mips/layers and MSAA. Framebuffer key test distinguishes layer zero/one and visibility identities.
+- Full release video_core suite with Metal validation: 1823 passed, 3 ignored, no warnings (`/tmp/metal-clear-reuse-tests.log`). Internal key changes are not guest/serialized layouts. GUI performance validation pending; no claimed gain yet.
+- GUI validation subsequently completed with the same stationary hall visibly intact, no safety trigger and median 15.985 FPS versus 15.928 in the prior profiled run: no material FPS improvement established. A sampled lot records 300 render passes and 20 remaining clear-helper end sites. Evidence: `../ruzu-diagnostics/lm3-clear-reuse-20260908.nVp56r/`; detailed scope in METAL_UPLOAD_PREFIX_STATE.md.
+
+## 2026-09-08 - Metal helper profiling vs renderer_vulkan/blit_image.h/.cpp
+
+### Intentional differences
+- `metal_gpu_profiler.rs` owns bounded per-pass helper counters separately from guest draw counts/hashes. This is optional native Metal diagnostic metadata, not an Eden port or shader semantic change.
+- `metal_scheduler.rs` forwards helper observations only to an active sampled render pass; `metal_blit_helper.rs` tags its existing depth/stencil blit, color blit and clear draws. No encoder, submission, barrier or lifetime ordering changes.
+
+### Verification
+- Re-read Eden's header and BlitColor, BlitDepthStencil, ClearColor/ClearDepthStencil implementations. Helper ownership remains in the blit helper; native triangle-strip topology and Metal state setup are unchanged by this slice.
+- Extended metadata test verifies each helper category, separation from guest shaders/counts, compute-boundary exclusion and exhausted-sample-budget exclusion. Full release video_core suite with Metal validation: 1823 passed, 3 ignored, no warnings (`/tmp/metal-helper-profile-tests.log`).
+- No serialized/guest binary layout change. New runtime helper attribution remains unmeasured until GUI rebuild; current profile's zero guest draws must not be interpreted as an empty native pass.
+- Runtime verification subsequently completed using GUI UUID B423108B-9983-3F69-8606-533C2BF9D271: the 800x450 zero-guest-draw pass reports one shader clear, with a 1.465 ms fragment interval in tick 14361. The 120-second run completed without a safety trigger and with the hall visibly populated. Timing and comparison limitations are recorded in METAL_UPLOAD_PREFIX_STATE.md; this metadata slice makes no performance improvement claim.
+
+## 2026-09-08 - Metal PostCopyBarrier vs renderer_vulkan/vk_buffer_cache.h/.cpp
+
+### Intentional differences
+- `renderer_metal/metal_buffer_cache.rs::post_copy_barrier` does not end an unrelated active render encoder. Eden requires an explicit Vulkan TRANSFER_WRITE memory barrier outside its render pass. Native Metal tracks buffer-cache allocation hazards across encoders on the existing command queue; ordinary copies already change encoder and upload-prefix submission order is unchanged.
+- The CPU-written upload stream is untracked, but source leases are completion-tick protected. This optimization must not be reused for untracked GPU destinations or Metal 4 command queues. Apple reference: https://developer.apple.com/documentation/metal/mtlhazardtrackingmode .
+
+### Verification
+- Re-read Eden PreCopyBarrier/PostCopyBarrier declarations and definitions, common callers, native allocation options and scheduler encoder/prefix commit paths. No common control flow or lifetime change.
+- Native regression passes for ordered/prefix copies followed by PostCopyBarrier, render encoder identity preservation, and exact compute consumption without an intermediate wait. Full release Metal-validation suite: 1823 passed, 3 ignored, no warnings (/tmp/metal-post-copy-barrier-tests.log).
+- The hall trace's 125 line-705 sites were PostCopyBarrier, not encode_copies. Runtime pass-count/FPS validation pending; avoiding this call may merely move a necessary end to the following compute dispatch.
+- Subsequent bounded GUI comparison completed without errors: unprofiled baseline median 15.841 FPS; optimized 21.811 FPS over 110..120 seconds. Optimized FPS rises only near the end and captures differ in camera/animation state, so this is not an isolated gain or sustained same-scene >=20 FPS validation. Details and evidence paths are in METAL_UPLOAD_PREFIX_STATE.md; memory stayed below guards with no swap growth.
+- Repeat optimized run with an additional end-window capture: median 17.907 FPS, range 15.895..18.848, same stationary hall composition as the baseline. No crash/corruption visible or swap growth. The earlier 21.811 FPS is not repeatable under this check; a stable >=20 FPS claim is invalidated, while exact performance attribution remains pending.
+- Extended the native regression to consume the copied value in a fragment shader inside the retained render encoder, then read back the resulting pixel through compute. Both ordinary and prefix uploads produce the exact expected RGBA bytes without an intermediate submit/wait. Direct fragment buffer binding matches `metal_rasterizer.rs::bind_stage`; no argument-buffer residency assumption is needed for this case. Re-read Eden's header/implementation barriers; production behavior unchanged in this test slice. Full release Metal-validation suite: 1823 passed, 3 ignored, no warnings (`/tmp/metal-post-copy-render-tests.log`).
+
+## 2026-09-08 - Metal frame GC vs texture_cache/texture_cache.h
+
+### Intentional differences
+- `renderer_metal/metal_texture_cache.rs::tick_frame` bridges the common collector to native single-sample downloads, using the same stable runtime Box callback pattern as the OpenGL split backend. Eden stores backend Images directly in its slots.
+- The common collector owns LRU selection, thresholds, writeback, unregister/delete and retirement ordering. Metal uses Eden's no-device-memory-info estimated-budget branch; native allocations are not misreported as a dedicated VRAM budget.
+- Transfer errors or missing native storage retain the GPU-modified image rather than creating empty storage and writing invented pixels. Successful downloads finish before common guest writeback; no unconditional per-draw idle wait is introduced.
+
+### Verification
+- Re-read Eden constructor budget branches, RunGarbageCollector and TickFrame, plus the common Rust downloader/writeback path and OpenGL runtime bridge. Collector invocation precedes delayed retirement and frame advancement.
+- Native integration test passes for GPU-produced red pixels, exact guest writeback through the common CPU-address adapter, LRU eviction/delayed retirement, recently-used retention and native transfer-validation failure retention. Full release suite with Metal validation: 1822 passed, 3 ignored, no warnings (/tmp/metal-gc-wiring-tests.log).
+- GUI memory/performance validation remains pending; collector wiring alone is not evidence of improved FPS or memory use.
+
+## 2026-09-08 - Metal X8D24 transfers vs renderer_vulkan/vk_texture_cache.h/.cpp and maxwell_to_vk.cpp
+
+### Intentional differences
+- `renderer_metal/metal_texture_cache.rs` converts X8D24 low-24-bit depth to native Depth32Float for upload and back to nearest UNORM24 for CPU download. Eden chooses X8_D24_UNORM_PACK32; Metal's format table requires explicit float storage instead. Unused X8 bits are ignored on upload and zeroed on download, not treated as stencil.
+- `renderer_metal/metal_image.rs` records native depth buffer/image transfers using the shared converted-transfer path, without submission or CPU wait. The runtime CPU-facing download waits before exposing bytes, preserving the upstream consumer ordering.
+- Existing expanded-color helpers were mechanically renamed for uncompressed color/depth conversion; ownership, copy traversal and RGB32/G4R4 semantics are unchanged.
+
+### Verification
+- Re-read Eden Image transfer declarations/implementations and X8_D24 format mapping. Vulkan format definition identifies low 24 depth bits and unused high bits: https://github.khronos.org/Vulkan-Site/spec/latest/chapters/formats.html .
+- Native mip/layer/padding/readback test and exhaustive 24-bit quantization test pass. Full release Metal-validation suite: 1821 passed, 3 ignored, no warnings (/tmp/metal-x8d24-transfer-tests.log). No GUI rebuild/run yet.
+- Collector wiring, writeback/eviction integration tests and new gameplay measurements remain; no memory or FPS improvement claimed yet.
+
+## 2026-09-08 - Metal A5B5G5R1 views vs renderer_vulkan/vk_texture_cache.h/.cpp and maxwell_to_vk.cpp
+
+### Intentional differences
+- `renderer_metal/metal_format.rs` selects native A1BGR5Unorm storage for Eden's R5G5B5A1_PACK16. Guest bytes are unchanged, avoiding an unnecessary expanded allocation and CPU conversion.
+- `renderer_metal/metal_image_view.rs` owns `swap_special`, matching Eden's ImageView construction and SwapSpecial: sampled R/A and G/B sources are exchanged; constants are unchanged; render-target views remain identity. The helper is in the native ImageView owner rather than Vulkan's combined cache file.
+
+### Verification
+- Re-read Eden ImageView declarations, constructor, TryTransformSwizzleIfNeeded, SwapSpecial and SurfaceFormat table after implementation. The conditional order and component permutation match.
+- Extended the native GPU oracle to sample MetalImageView handles for all 65536 A5B5G5R1 words, checking R1/G5/B5/A5 independently and verifying exact transfer round trips. Full release suite with Metal validation: 1819 passed, 3 ignored, no warnings (/tmp/metal-a5551-transfer-tests.log). No GUI rebuild/run.
+- X8D24 transfer remains the final converted-format prerequisite for the real GC downloader; no collector activation or performance claim in this slice.
+
+## 2026-09-07 - Offline tessellation inventory vs renderer_vulkan/vk_pipeline_cache.h/.cpp
+
+### Intentional differences
+- A macOS-only ignored test beside the cache reader replays a private snapshot
+  of a Vulkan environment cache. Eden's LoadDiskResources/CreateGraphicsPipeline
+  declarations and callback order were re-read; the test consumes the same
+  compute/graphics key layouts, but selects only TCS/TES entries for inspection.
+- Translation uses the existing native Metal host profile and shared Maxwell IR
+  boundary. It creates no renderer or compiled pipeline and cannot establish
+  pixel correctness. The existing opt-in pre-raster dumper owns the exports.
+- The reader is never given the original cache: it may delete invalid inputs.
+  Output must be a new owner-only directory; snapshot rejection is a test failure,
+  not evidence that a title has no tessellation. No game assets are committed.
+
+### Missing items
+- Native TCS/TES lowering and live validation remain prerequisites. This test
+  supplies real inputs when they exist in the cache; it does not implement them.
+
+### Binary layout verification
+- Reuses FileEnvironment, GraphicsPipelineKey and ComputePipelineCacheKey readers
+  with the Vulkan cache owner's version, rather than a duplicate binary parser.
+- Manual replay finds two TCS/TES pipelines among 730 graphics and one compute
+  entries; both translate and export successfully. Full release video_core with
+  Metal validation passes 1,738 tests, three ignored, no warnings. The copied
+  cache hash matches the untouched original; no rendered output is asserted.
+
+## 2026-09-07 - Metal CPU-owned conditional rendering
+
+### Intentional differences
+
+- metal_query_cache.rs declines host conditional acceleration for Conditional
+  mode only when no cached report exists (including the +4 lookup) and the
+  buffer range is not GPU-modified. It clears any older host predicate first.
+  Maxwell3D::ProcessQueryCondition then performs the existing synchronized
+  ReadBlock evaluation: both initial 32-bit words must be nonzero. This is not
+  an unconditional-draw shortcut or an unsynchronized RAM read.
+- Eden vk_query_cache.h/.cpp always resolves Conditional mode on the GPU when
+  EXT_conditional_rendering exists. Metal's explicit indirect-mask emulation
+  otherwise introduces compute work and render-pass breaks for every draw.
+  CPU-owned records do not need that mechanism. GPU-modified buffers and cached
+  reports retain the existing asynchronous predicate path and ownership/order.
+- maxwell_3d_test.rs checks the CPU fallback against the two independent words
+  in Eden maxwell_3d.h/.cpp ReportSemaphore::Compare/ProcessQueryCondition.
+  Native query regressions cover predicate replacement without GPU work and
+  GPU-only values that disagree with guest memory, including either zero half.
+
+### Validation limits
+
+- Runtime frequency of the CPU-owned case and the FPS benefit have not been
+  measured. This is not evidence that conditional emulation is the sole bottleneck.
+
+## 2026-09-06 - Optional GUI input control and Metal profiling coverage
+
+### Intentional differences
+
+- src/ruzu/src/input_session.rs and tools/capture_harness/gui_control.py are
+  project-owned diagnostic facilities, not an Eden port. An explicit private
+  Unix socket routes bounded player-1 button presses to the existing
+  InputCommon::VirtualGamepad::SetButtonState equivalent. Its button order and
+  callback path were checked against Eden input_common/drivers/virtual_gamepad.h
+  and .cpp. No host input is recorded, no mappings are rewritten, and the
+  existing renderer screenshot path is used rather than desktop capture.
+- The Unix-only GUI hook has no Windows ABI changes. No environment opt-in
+  means no socket/timer. The directory must be new and is owner-only; button
+  release is server-owned, and capture names cannot escape that directory.
+- metal_gpu_profiler.rs rotates bounded timestamp windows across sampled
+  batches, rather than repeatedly profiling only their prefixes. Coverage is
+  logged per batch; different windows are not represented as one frame.
+  metal_scheduler.rs and native compute producers attribute compute calls and
+  explicit render-pass exits without changing submission, barriers or encoder
+  reuse. This instrumentation has no Eden counterpart: vk_scheduler.h/.cpp
+  remain the reference for lifecycle semantics, not Metal counter APIs.
+
+### Validation limits
+
+- Input acknowledgements do not prove menu progression. Fresh renderer images
+  and mapped HID state must validate the user-specified navigation sequence.
+- Native stage timings overlap and are raw GPU ticks, not GPU utilization.
+  Operation call counts do not identify the cost of an individual dispatch
+  inside a shared compute encoder.
+
 Keep actionable parity debt, intentional adaptations, significant corrections, and concrete
 binary-layout contracts, with their upstream file references. Historical entries are scoped to
 their audit date; they are not a certification of the current tree. Eden is the current reference;
@@ -8,6 +163,222 @@ older entries may refer to zuyu or dynarmic.
 Omit empty audit categories, "nothing to fix" statements, generic unchanged-layout claims,
 successful build/test totals, launch commands, binary paths, and temporary logs. Keep unresolved
 test failures and validation limits. Do not append an entry for documentation-only cleanup.
+
+## 2026-09-06 - Metal cull-both execution vs Eden vk_rasterizer.h/.cpp (UpdateCullMode), maxwell_to_vk.h/.cpp (CullFace)
+
+### Intentional differences
+
+- Eden forwards FRONT_AND_BACK to Vulkan rasterization without skipping the
+  draw. Metal has no equivalent cull mode. metal_pipeline_cache.rs selects a
+  non-rasterizing pipeline for triangle output and the matching void vertex
+  entry point; geometry's preceding callable vertex still produces records.
+- The shared policy uses geometry output topology when present, rather than
+  input topology. Point/line output remains rasterized even with cull-both.
+  Explicit guest rasterization disable still applies to all output classes.
+- Native and mesh PSOs omit the fragment function when non-rasterizing.
+  metal_rasterizer.rs no longer returns before executing vertex/geometry work.
+  Buffer stores and query/scheduler ordering remain on the normal draw path.
+- metal_shader.rs tests mesh side effects plus absence of rasterized pixels;
+  metal_pipeline_cache.rs tests native vertex stores and topology policy.
+  This does not establish unimplemented clipping/statistics/XFB contracts.
+
+## 2026-09-06 - Native geometry vertex production and graphics integration vs Eden vk_graphics_pipeline.{h,cpp}, vk_pipeline_cache.{h,cpp}, and vk_rasterizer.{h,cpp}
+
+### Intentional differences
+
+- metal_geometry_pipeline.rs owns the native replacement for fixed-function
+  vertex/geometry execution: direct callable vertex IR runs in compute once per
+  stream entry/instance, then object shaders reuse retained outputs. Eden has no
+  native Metal file; the IR remains in shader_recompiler and no SPIR-V bridge is
+  used. Vertex ID/base/instance behavior follows emit_spirv_context_get_set.cpp.
+- metal_pipeline_cache.rs retains either a real native vertex module or a
+  callable artifact plus geometry module/runtime. The mesh PSO and its vertex
+  producer share the complete render/vertex-layout cache key. There is no fake
+  vertex function satisfying the old module-only interface.
+- metal_graphics_pipeline.rs consumes stage-3 descriptors in Eden's stage order;
+  native binding layout suffices even for a callable artifact. metal_rasterizer.rs
+  records assembly and vertex production before the object/mesh render command.
+  Prepared native resource objects are forwarded without rereading guest memory.
+- metal_shader.rs shares native library compilation options with the producer
+  and object functions. Its pixel regression uses the production mesh PSO cache
+  and resource binders rather than a test-only render-pipeline descriptor.
+- emit_msl_special.rs keeps the explicit position/generic prologue defaults in
+  VertexB only, matching Eden; the geometry prologue retains fixed point size
+  without introducing the vertex stage's default W values.
+- emit_msl_geometry.rs owns sparse float4 record and payload sizes. The vertex
+  producer's parameter block is serialized as 66 initialized u32 words: four
+  draw fields, then 31 little-endian u64 bound sizes. No Rust struct padding is
+  copied. Consumers compare the generic mask as well as record stride.
+- metal_vertex_pulling.rs checks complete attribute ranges before pointer
+  arithmetic/load, using 64-bit offsets. Out-of-range inputs remain zero for
+  containment; unspecified guest OOB values are not asserted to match hardware.
+
+### Missing items
+
+- GPU expansion of indirect geometry input, full stage interfaces and gameplay
+  validation are interrupted integration prerequisites tracked in
+  GEOMETRY_SUPPORT.md. Explicit errors remain; synthetic rendering is not proof
+  that every geometry draw is implemented.
+- The existing Metal uint8/quad index converters require a separate first-index
+  audit. The new assembler does not repair already-converted native data.
+
+## 2026-09-05 - src/shader_recompiler/src/backend/spirv/emit_spirv_special.rs vs Eden shader_recompiler/backend/spirv/emit_spirv_special.cpp and emit_spirv_instructions.h
+
+### Intentional differences
+
+- EmitVertex and EndPrimitive reject unsupported geometry streams using the
+  existing typed NotImplementedException panic payload, corresponding to the
+  C++ exception. A string panic bypassed the pipeline cache's Shader::Exception
+  equivalent and killed the GPU thread. Depth conversion and point-size reset
+  retain upstream ordering; this change does not implement geometry support.
+
+## 2026-09-05 - src/video_core/src/renderer_vulkan/pipeline_cache.rs vs Eden video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}
+
+### Intentional differences
+
+- Regression coverage exercises both unsupported stream instructions through
+  the existing typed-exception boundary and subsequent successful compilation.
+  Ordinary Rust panics still propagate instead of being silently discarded.
+- Optional RUZU_DUMP_GEOMETRY_PIPELINES captures translated IR, runtime state,
+  pipeline identity and cached Maxwell words for pipelines with a geometry
+  stage, including generated layer passthrough. This diagnostic has no Eden
+  counterpart; it leaves compilation and capability selection unchanged.
+
+## 2026-09-05 - src/video_core/src/renderer_metal/metal_device.rs and metal_shader.rs (native Metal prerequisite)
+
+### Intentional differences
+
+- Eden has no native Metal counterpart. Device-owned mesh capability policy
+  requires MSL 3.0 and Apple7 or Mac2, per Apple's feature tables and WWDC22
+  session 10162. It does not advertise Maxwell geometry support.
+- A native shader-module/pipeline creation test verifies this prerequisite
+  through Metal, without Vulkan or SPIR-V conversion. It is not a rendering
+  equivalence test; geometry lowering and draw integration are the interrupted
+  slice tracked in GEOMETRY_SUPPORT.md.
+
+## 2026-09-05 - src/shader_recompiler/src/backend/msl geometry emission vs Eden backend/spirv emission
+
+### Intentional differences
+
+- emit_msl_geometry.rs introduces a native Metal mesh representation; Eden has
+  no equivalent backend. Mesh output snapshots and strip index generation
+  replace native geometry instructions without a SPIR-V intermediary.
+- emit_msl_special.rs retains instruction ownership from emit_spirv_special.cpp
+  and emit_spirv_instructions.h: depth conversion precedes EmitVertex and fixed
+  point size is restored afterward. Unsupported nonzero/dynamic streams and XFB
+  are explicit errors, not stream-zero substitutions.
+- emit_msl_context_get_set.rs mirrors emit_spirv_context_get_set.cpp's indexed
+  geometry input loads, PrimitiveId bit patterns and InvocationInfo count shift.
+  The native payload/group ABI replaces SPIR-V builtins; the object producer
+  must dispatch one X group per GS invocation of each input primitive.
+- msl_emit_context.rs owns payload/output declarations and final primitive count;
+  emit_msl.rs and mod.rs only select and dispatch this stage. Native compilation
+  validates complete mesh storage, rather than estimating generic fields alone.
+- metal_shader.rs exercises generated geometry MSL by rendering and reading back
+  pixels for runtime-variable emissions, incomplete strips and separate strips.
+  The synthetic object/fragment oracle does not translate actual guest vertices.
+
+### Missing items
+
+- Live mesh pipelines remain deliberately disabled until vertex production,
+  primitive assembly and resource binding exist. Point/line rasterization,
+  continuous strip culling, flat/provoking interpolation, multi-invocation order,
+  layer/viewport/primitive-ID export and real-game validation remain open in
+  GEOMETRY_SUPPORT.md; synthetic coverage is not completion of the stage.
+
+## 2026-09-06 - src/video_core/src/renderer_metal/metal_vertex_pulling.rs vs Eden vertex-fetch configuration
+
+### Intentional differences
+
+- Eden's renderer_vulkan/maxwell_to_vk.{h,cpp}, VertexFormat, selects the native
+  vertex-fetch format; vk_graphics_pipeline.{h,cpp} binds that format and its
+  stride/divisor. Metal object shaders need explicit fetch. This module consumes
+  the existing MetalVertexInputState rather than decoding guest registers again.
+- Integer/normalized/half/float and packed conversions produce the same input
+  types and missing-component defaults as the current Metal descriptor path.
+  Scaled integer conversion remains owned by the IR emitter. Native vertex fetch
+  is the GPU differential oracle; normalized rounding may differ by one bit and
+  NaN payloads need not survive conversion.
+- Native buffer indices remain those allocated by the pipeline cache. Explicit
+  byte reads avoid scalar-pointer alignment assumptions; address stepping uses
+  the measured Metal base-instance/divisor ordering. mod.rs only exports the
+  module. No live renderer behavior or capability advertisement changes yet.
+
+### Missing items
+
+- Callable guest vertex execution, robust input ranges and indexed/restart
+  assembly must be wired before enabling geometry draws. The format oracle does
+  not validate these prerequisites, multiple input buffers or game rendering.
+
+## 2026-09-06 - src/shader_recompiler/src/backend/msl/msl_function.rs, msl_emit_context.rs, emit_msl.rs and mod.rs (callable vertex interface)
+
+### Intentional differences
+
+- Eden's backend/glsl/emit_glsl.{h,cpp} owns the source-language emission entry
+  point; backend/spirv/spirv_emit_context.{h,cpp} owns resources and interfaces.
+  Those boundaries are retained. Eden has no native MSL object/mesh counterpart.
+- MSL parameters now retain type, name and binding/builtin attribute as explicit
+  metadata. The context still allocates resources in the same order. A callable
+  vertex function omits entry-point parameter attributes but retains their ABI
+  metadata, prologue, IR body and returns. The renderer need not parse MSL text.
+- Compatibility SPIRV-Cross artifacts explicitly have no callable interface.
+  Native stage composition only consumes the direct emitter's interface.
+
+### Missing items
+
+- This is vertex-function emission, not live geometry integration. Indexed and
+  restart-aware assembly, vertex execution scheduling and per-stage native
+  binding remain prerequisites tracked in GEOMETRY_SUPPORT.md.
+
+## 2026-09-06 - src/video_core/src/renderer_metal/metal_shader.rs and metal_vertex_pulling.rs (native vertex-to-mesh validation)
+
+### Intentional differences
+
+- The synthetic object producer now executes generated vertex IR with explicit
+  vertex fetch and a CBUF before forwarding positions to generated geometry IR.
+  Separate native libraries preserve each stage's output type without textual
+  renaming. Object resources and call arguments come from the parameter ABI.
+- The fetch oracle uses the older fast-math option before macOS 15, matching
+  the production compiler's availability guard for setMathMode.
+
+### Missing items
+
+- The test assembles a single triangle with a test-only object producer. It does
+  not exercise guest index/restart streams, shared-vertex side effects, multiple
+  instances, generic vertex-to-geometry varyings or live draw submission.
+
+## 2026-09-06 - src/video_core/src/renderer_metal/metal_primitive_assembler.rs vs Eden Vulkan input assembly
+
+### Intentional differences
+
+- Eden's vk_pipeline_cache.{h,cpp} selects the geometry input class and
+  vk_graphics_pipeline.{h,cpp}/maxwell_to_vk.{h,cpp} delegate primitive assembly
+  to Vulkan. Native Metal mesh draws need explicit assembly. The new module
+  consumes native cached buffers, with GPU prefix scans for restart segments
+  and ordered compaction; it neither reads guest memory nor submits/waits.
+- Records store input-stream ordinals, preserving shared strip inputs and a
+  stable PrimitiveId independent of duplicate vertex indices. Degenerate
+  primitives remain present. Index decoding precedes base-vertex addition and
+  restart comparison uses the unadjusted value. Runtime parameters serialize
+  eight explicit u32 words; indirect arguments are three u32 words.
+- Point/line/triangle lists, strips, fans and adjacency follow Vulkan's
+  drawing.adoc definitions, including strip-adjacency boundary neighbors.
+  Triangle strip/fan inputs retain last-vertex ordering with matching winding.
+  Native line loops close explicitly; Eden's Vulkan format table maps LineLoop
+  to triangles instead. This is a native topology implementation, not a literal
+  copy of that backend limitation. Converted quads must enter as triangles.
+- Metal tracked buffers and encoder barriers order scan/assembly consumers.
+  The shader test now uses the GPU-produced records and indirect dispatch count
+  for its vertex-to-mesh draw, without an intermediate CPU synchronization.
+  mod.rs only exports the native module.
+
+### Missing items
+
+- The live draw path remains disabled pending its vertex-result producer,
+  stage-resource bindings and mesh pipeline integration. Raw patches need
+  tessellation. General indirect guest-draw argument processing, robust vertex
+  input bounds, real guest rendering and performance are not validated by the
+  synthetic assembly or rasterization tests.
 
 ## 2026-09-05 - src/rdynarmic/src/backend/arm64/a64_address_space.rs vs Eden dynarmic/backend/arm64/a64_address_space.{h,cpp}
 
@@ -12896,6 +13267,28 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - Matched gameplay timing remains pending. The synthetic compiler regression
   and the exercised game shaders do not establish complete shader coverage.
 
+## 2026-09-06 - src/video_core/src/renderer_metal/metal_compute_pass.rs and metal_buffer_cache.rs vs eden/src/video_core/renderer_vulkan/vk_compute_pass.h/.cpp and vk_buffer_cache.cpp (index assembly)
+
+### Intentional differences
+
+- Uint8Pass/QuadIndexedPass own native compute pipelines; BufferCacheRuntime
+  delegates assembly and binds the returned staging buffer/offset. Scheduler
+  and staging references are passed per call, rather than stored in each pass.
+  Pipeline construction is lazy, consistent with the native Metal helpers.
+- Native buffer slots and copied parameter words replace descriptor templates.
+  Tracked Metal resources and a buffer memory barrier order compute writes
+  before consumers in the scheduler. No CPU readback, flush or global wait.
+- The corresponding metal_uint8.metal and metal_quad_indexed.metal keep Eden's
+  fixed restart remap, six-index swizzles, integer widths and wrapping base
+  addition. Explicit counts replace GLSL runtime-array lengths. Byte loads
+  avoid u32 alignment/overread requirements on subword quad indices.
+- Dispatch covers useful invocations only and clamps the 1024-thread group
+  size to the native pipeline limit. Empty output retains a minimum allocation
+  without dispatch. Quad strips with fewer than two input vertices preserve
+  the existing empty Metal result instead of unsigned size underflow.
+- Bounds/size failures return explicit errors. Parameters are initialized u32
+  arrays (4 bytes for uint8, 16 for quads), with no implicit serialized padding.
+
 ## 2026-09-05 - src/video_core/src/renderer_metal/metal_shader.rs (native compiler regression)
 
 ### Intentional differences
@@ -13299,3 +13692,2865 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 - The GTK dialog persists its four Controls keys plus TAS directory on acceptance;
   Eden applies through its long-lived Qt configuration owner. No serialized binary
   payloads are changed by this UI/settings slice.
+
+## 2026-09-06 — tools/capture_harness/{src,rdc_trigger.c} (diagnostic tooling; no Eden counterpart)
+
+### Intentional differences
+
+- This is project-owned tooling, not an emulation port. No matching capture harness or uinput
+  timeline helper was found in Eden. Linux recording/replay lives in `linux_input.rs`; versioned
+  input data and worker lifetime live in `session.rs`; RenderDoc launch/control lives in
+  `renderdoc.rs`. The existing screenshot/logical-button orchestration remains in `main.rs`.
+- The earlier diagnostic C uinput helpers are replaced by Rust evdev/uinput recording and replay,
+  with explicit device selection and monotonic packet timestamps. RenderDoc retains a small C
+  preload bridge compiled against the SDK's `renderdoc_app.h`, avoiding a duplicated API-table ABI.
+  Review against that header preserves TriggerMultiFrameCapture's active API/window semantics and
+  checks GetNumCaptures/GetCapture completion; it does not assume the GTK window is the Vulkan target.
+- This changes no emulator scheduling or controller settings. Raw input workers are independent of
+  screenshot delays, and normal timeline completion joins them without cancelling an event exactly
+  at the deadline. Input loss invalidates a recording; replay releases virtual keys and restores
+  initial axes on controlled exit. Force feedback, multitouch and interactive replay checkpoints
+  are outside this tooling version, documented in its README.
+
+## 2026-09-06 - src/core/src/arm/debug.rs vs core/arm/debug.cpp and debug.h
+
+### Intentional differences
+
+- Thread names and frame records now use KProcess::get_memory, matching Eden's
+  process-owned Memory rather than the legacy ProcessMemoryData shadow.
+  Frame validity uses the actual page table, including records spanning pages.
+- The Rust memory mutex is released before symbolication reads module memory.
+  A process with no runtime Memory yields only PC/LR; it does not fabricate
+  frame records from the legacy shadow. Checked range addition rejects overflow.
+- The existing optional stack/hexdump diagnostics in
+  src/core/src/hle/kernel/svc/svc_exception.rs use the same canonical reader.
+  These extra diagnostics have no Eden counterpart; normal SVC behavior is unchanged.
+
+### Missing items
+
+- Existing symbol-name resolution in SymbolicateBacktrace is still absent;
+  this correction concerns live memory reads, not a complete debug.cpp port.
+- Existing module-discovery fallback for loader-only processes remains separate
+  from runtime stack walking. Thread-name helper ownership is still combined
+  in get_thread_name rather than Eden's two per-execution-mode helpers.
+
+## 2026-09-06 - geometry capture/replay in renderer_vulkan/pipeline_cache.rs and renderer_metal/metal_pipeline_cache.rs vs Eden vk_pipeline_cache.h/.cpp and shader_environment.h/.cpp
+
+### Intentional differences
+
+- Opt-in geometry captures now include all serialized shader environments and
+  the complete graphics key at the shared translation boundary, before native
+  compilation. Eden's normal cache only serializes successfully built pipelines;
+  this extra diagnostic deliberately preserves inputs for rejected pipelines.
+- Existing GenericEnvironment/FileEnvironment serialization owns the payload:
+  cached instructions, translation-time CBUF values/replacements, texture
+  type/format lookups, SPH and geometry passthrough mask. No new binary layout
+  or fabricated replay environment is introduced. Unbound instructions reject
+  capture; exclusive creation prevents duplicate-key appends/overwrites.
+- The explicitly ignored native replay test requires an external capture, loads
+  a disposable copy (LoadPipelines may delete invalid data), and compiles the
+  direct MSL stages, vertex producer and object shader on the real device.
+  This is compiler validation, not a framebuffer or visual oracle.
+- Replay rejects serialized keys lacking dynamic vertex formats/strides rather
+  than constructing a producer from defaulted input state. Those Vulkan keys
+  need an additional draw-state snapshot; native Metal keeps this state fixed.
+
+### Missing items
+
+- Previously collected text captures lack complete environments. Actual guest
+  replay requires a fresh capture; no successful game replay is claimed here.
+  Capture round-trip/rejection tests pass; full video_core release suite passes
+  with the external-capture test and one pre-existing test explicitly ignored.
+
+## 2026-09-06 - Metal geometry provoking vertices and empty assembly vs Eden fixed_pipeline_state.h/.cpp, vk_graphics_pipeline.h/.cpp and emit_spirv_special.cpp
+
+### Intentional differences
+
+- Eden selects first/last provoking mode in FixedPipelineState and applies it
+  through Vulkan rasterization state. Metal mesh lowering instead selects the
+  first rasterized index of each emitted primitive. First-mode odd triangles
+  now retain the intended provoking vertex; last mode rotates triangle indices
+  without reversing winding and reverses line endpoints. EmitVertex snapshots
+  and EndPrimitive strip boundaries are unchanged.
+- GeometryLayout owns the output assembly. MetalShaderCompileOptions forwards
+  the mode into MslOptions. The existing fixed-state bit remains part of shader
+  and pipeline cache identity. Capability selection is restricted to the native
+  geometry path; non-geometry device policy and transform-feedback support are
+  not changed or advertised as new hardware capabilities.
+- Eden delegates input assembly to the driver. The native compute assembler
+  skips initialization/scans for zero inputs but still writes zero primitive
+  count to GPU indirect arguments. No zero-length input binding is encoded;
+  bound output storage retains the minimum extent of its shader pointer type.
+  No CPU readback or extra wait was added to production recording.
+- Rechecked Vulkan Geometry Shader Input Primitives: triangle inputs may use
+  cyclic permutations preserving winding. The previous strip/fan input order
+  is therefore not a demonstrated mismatch and remains unchanged. This differs
+  from output flat interpolation, where provoking-vertex identity is observable.
+- Native pixel tests use production MSL compilation options. First/last flat
+  colors, backface culling and full-frame smooth interpolation equivalence pass
+  for lines and triangles. Full release suites with Metal API validation pass:
+  shader_recompiler 562, video_core 1673 (two explicit ignored tests). No Rust
+  warnings; the empty-range test also passes Metal's typed buffer validation.
+
+### Missing items
+
+- Native synthetic pixels are not actual title validation. Gameplay geometry,
+  same-scene Eden comparison, regression runs and release cost remain unproven.
+  Other stopped geometry interface/indirect-input slices are tracked in
+  GEOMETRY_SUPPORT.md; this change does not claim to complete them.
+
+## 2026-09-06 - MSL geometry Layer output vs Eden emit_spirv_context_get_set.cpp and spirv_emit_context.h/.cpp
+
+Status: interrupted, not a completed Layer implementation. The native
+layered-line pixel test fails on this device, including an independent
+hand-written Metal reproducer; triangles pass. See GEOMETRY_SUPPORT.md for
+evidence and the capture/replay prerequisite. No expected pixels were weakened.
+
+### Intentional differences
+
+- SetAttribute dispatch now lives in emit_msl_context_get_set.rs, matching its
+  upstream operation owner. Like Eden, it ignores the output vertex operand:
+  the current output record is written, and EmitVertex captures it separately.
+  The previous immediate-zero restriction was not an upstream requirement.
+- GeometryLayout owns a native MslGeometryPrimitiveOut only when Layer is
+  written. MslEmitContext owns its state; Layer stores use as_type<uint>,
+  preserving the float-carried integer bit pattern of Eden's OpBitcast.
+- Metal's render_target_array_index is per primitive, whereas Vulkan exposes
+  Layer as a shader output. Vulkan requires one identical Layer value for all
+  vertices of a primitive, so the complete primitive captures the current
+  layer when emitted. Incomplete strips do not call set_primitive; points,
+  lines and triangles use their respective completion conditions.
+- MetalFramebuffer already sets RenderTargetArrayLength and retains restricted
+  array views, matching the existing Eden Framebuffer counterpart. No new
+  framebuffer identity, storage map, production readback or wait was introduced.
+  The synthetic pixel test now exercises those actual backend image/view/pass
+  owners and scheduled image download instead of an ad-hoc shared texture.
+- Geometry payload and preceding-vertex ABI remain unchanged. The per-primitive
+  uint field uses the MSL compiler's mesh interface; no Rust raw-byte struct is
+  added or serialized. Non-geometry Layer output remains unsupported explicitly.
+
+### Missing items
+
+- Viewport output remains stopped on its raster-state prerequisite: only index
+  zero is bound today. Layer support does not imply viewport/mask support.
+- Native layered synthetic pixels are not title pixels or a same-scene Eden
+  comparison. Actual gameplay, indirect geometry input, remaining interfaces
+  and release performance are still tracked in GEOMETRY_SUPPORT.md.
+
+## 2026-09-06 - Callable MSL geometry prerequisite vs Eden geometry emission contracts
+
+### Intentional differences
+
+- Eden has a hardware GS and no callable MSL equivalent. msl_function.rs owns
+  GeometryFunction's explicit ABI; emit_msl.rs exposes its emission entry and
+  MslEmitContext owns the declaration/return. GeometryLayout retains ownership
+  of primitive output declarations. No resource allocator or IR body is copied.
+- The callable form takes a thread-local input record, supplied invocation
+  coordinates and a typed GeometryOutput reference. Its transport implements
+  the same set_vertex/index/primitive/count operations used by mesh emission.
+  The function performs every guest instruction once; subsequent raster replay
+  must consume the captured output rather than reexecute those instructions.
+- Eden's EmitEmitVertex/EmitEndPrimitive and OutputAttrPointer/EmitSetAttribute
+  were re-read with spirv_emit_context.h. Unit tests require identical IR body
+  text and binding allocation between callable and mesh forms; only function
+  declaration and transport/address-space parameters differ. Non-GS programs
+  are rejected by the callable GS entry point.
+- The native compute capture test checks four segments, both cuts/layers,
+  emission-time position snapshots and exactly one guest SSBO atomic increment.
+  It exports scalar uint results rather than introducing a shared Rust/C++ ABI.
+  Its synchronization and capture transport are test-owned, not a production
+  readback or wait inserted into rendering.
+
+### Missing items
+
+- Runtime capture storage, raster replay and their integration remain the next
+  prerequisite slice. The existing layered-line raster oracle still fails;
+  passing callable tests must not be used to claim that Layer now renders.
+
+## 2026-09-06 - metal_geometry_capture.rs and native GS integration vs Eden hardware geometry stage
+
+### Intentional differences
+
+- Eden's vk_graphics_pipeline.h/.cpp prepares resources for a hardware GS.
+  Metal has no such stage: metal_geometry_capture.rs owns the native GPU
+  capture/replay transport, while metal_geometry_pipeline.rs retains graphics
+  pipeline ownership and metal_rasterizer.rs schedules it within the draw.
+- Layer-writing GS now compiles as a callable artifact with unchanged resource
+  binding allocation. MetalGeometryShader/MetalGeometryOutput explicitly select
+  direct mesh or capture; no unused mesh entry is compiled in the capture path.
+  metal_graphics_pipeline.rs prepares the same guest resources for either kind.
+- GS capture runs once per input primitive, invocation and instance. Its output
+  vertices, indices, cuts and per-primitive Layer are replayed with one mesh per
+  emitted primitive. This avoids the independently reproduced mixed-Layer line
+  mesh routing defect without changing guest Layer values or repeating stores.
+- Dispatch dimensions and emitted counts stay on GPU. Private tracked buffers,
+  compute barriers and encoder transitions preserve the VS -> GS -> fragment
+  dependency. There is no added production wait or readback. The record stride
+  is obtained from compiler reflection; no Rust/C++ raw struct layout is assumed.
+- Eden's EmitEmitVertex/EmitEndPrimitive, OutputAttrPointer/EmitSetAttribute and
+  ConfigureImpl/ConfigureDraw were re-read against the new path. The native test
+  retains the previously failing pixel oracle and adds empty/incomplete output,
+  culling, multiple invocations/instances and noncommutative transparent blends.
+
+### Missing items
+
+- Native layered points and cross-device ordering/limits still need validation.
+  Viewport/indirect-input interfaces and the title/same-scene/performance gates
+  remain in GEOMETRY_SUPPORT.md. This resolves the layered-line test, not the
+  entire geometry support goal.
+
+Verification follow-up: layered points now pass the native pixel oracle too,
+including empty/partial emission and fixed point size. Capture allocations use
+compiler-reflected size rounded to compiler-reflected alignment. The final
+full release suites pass (565 shader, 1674 video, 2 explicit ignored tests),
+with Metal API validation and no Rust warnings. Cross-device validation and
+the real-title/same-scene/performance gates remain open.
+
+## 2026-09-06 - metal_rasterizer.rs scissor conversion vs vk_rasterizer.h/.cpp
+
+### Intentional differences
+
+- Re-read Eden GetScissorState and UpdateScissorsState, including the unsigned
+  16-bit Maxwell ScissorTest/SurfaceClip fields. Lower-left coordinates are
+  flipped using surface_clip.height before clipping. Intermediate signed i64
+  arithmetic represents the same valid register range without unsigned wrap.
+- Metal requires a scissor contained within the attachment; rectangles are
+  intersected with render_area instead of submitting Vulkan's unbounded disabled
+  scissor. Empty intersections remain empty and do not suppress shader execution.
+- UpdateScissorsState ownership is retained in MetalRasterizer. Its pure
+  surface_clip_scissor helper mechanically isolates the scale/offset-disabled
+  branch for native pixel tests. Commands use the existing Metal scheduler's
+  encoder path; no wait or readback was added to production rendering.
+
+### Missing items
+
+- This fixes the active single-scissor, unscaled path. Device-limited viewport
+  arrays, ViewportIndex shader output and signed viewport conversion remain the
+  interrupted prerequisite in GEOMETRY_SUPPORT.md. Metal scale_up_image still
+  returns unsupported, so scaled-attachment state is not claimed here.
+- Native tests exercise ordinary/disabled scissors, lower-left origin,
+  surface_clip differing from the attachment size, out-of-bounds/empty regions,
+  and vertex side effects despite zero rasterized pixels.
+
+Verification: all 1677 video_core tests pass in release with Metal API
+validation enabled; two tests are explicitly ignored. No Rust warnings.
+This is synthetic pixel coverage, not real-title geometry validation.
+
+## 2026-09-06 - Metal viewport state and geometry ViewportIndex vs Eden
+
+### Intentional differences
+
+- metal_device.rs follows Vulkan Device::GetMaxViewports/SupportsMultiViewport
+  ownership. Metal has no maxViewports selector: its family tables specify 16
+  for Apple5+ and Mac2, otherwise one. No CPU-model or product-name assumption.
+  Source: https://developer.apple.com/metal/limits/ and Apple's
+  rendering-to-multiple-viewports-in-a-draw-command documentation.
+- metal_rasterizer.rs now owns UpdateViewportsState/UpdateScissorsState
+  counterparts and sends matching arrays bounded by the device limit. Reads
+  and encoder calls retain their draw ordering; the existing immediate Metal
+  scheduler closure consumes stack arrays before their lifetime ends.
+- GetViewportState preserves signed extents, fractional widths, off-attachment
+  origins, lower-left origin, NegativeY swizzle and depth clamps. Metal's NDC Y
+  convention requires originY = vk.y + vk.height, height = -vk.height. Native
+  API validation accepts negative width/height; pixel tests verify both signs.
+  Viewports are no longer incorrectly intersected with the render attachment;
+  only scissors are. The disabled-transform surface branch retains ownership
+  through a pure mechanical helper, as with scissors.
+- maxwell_3d.rs now owns the complete ViewportSwizzle enum from maxwell_3d.h,
+  rather than embedding NegativeY's value in the Metal renderer. Its eight
+  discriminants and four-byte representation have a focused test.
+- emit_msl.rs validates ViewportIndex only for Geometry. emit_msl_context_get_set.rs
+  and msl_emit_context.rs mirror OutputAttrPointer/EmitSetAttribute: uint
+  bitcasts are retained, and output state is snapshotted at primitive emission.
+  emit_msl_geometry.rs declares a distinct viewport_array_index primitive field.
+- metal_pipeline_cache.rs gates multi-viewport support on the device and uses
+  metal_geometry_capture.rs for Layer and/or ViewportIndex outputs. The existing
+  compiler-reflected record ABI and per-primitive replay preserve independent
+  Layer/ViewportIndex values without adding host readbacks or global waits.
+- Unlike Eden's non-supporting-driver path, unavailable viewport output is a
+  typed compile error, never a silently ignored store or forced viewport zero.
+
+### Missing items
+
+- Non-geometry ViewportIndex/Layer and ViewportMask remain unadvertised and
+  unsupported; transform feedback and indirect geometry input are separate
+  existing slices. Scaled Metal attachments remain unavailable.
+- Real-title pixels, same-scene Eden comparison, cross-device validation and
+  release performance still require the runtime gates in GEOMETRY_SUPPORT.md.
+
+Verification: native state-array tests render all 16 indexes with signed
+transforms and an independently empty scissor. The geometry matrix adds output
+with ViewportIndex alone and combined with Layer, including cuts, zero/partial
+emission, invocation side effects, culling and ordered blends. Final results
+are recorded in GEOMETRY_SUPPORT.md after the strengthened rerun completes.
+
+The strengthened final run passes: 566 shader tests, 1682 video tests and two
+explicit ignored tests, with Metal API validation and no Rust warnings. The
+combined GS test deliberately assigns different Layer and ViewportIndex values;
+the viewport-only path separately verifies the record without a Layer field.
+
+## 2026-09-06 - session-close locking and parent lifetime
+
+Compared src/core/src/hle/kernel/{k_session,k_client_session,k_server_session}.rs
+with Eden's corresponding .h/.cpp files, particularly OnClientClosed and both
+Destroy methods. Ownership stays in those three matching modules.
+
+### Intentional differences
+
+- KSession::on_client_closed takes the shared parent Arc rather than an already
+  locked &mut receiver. It publishes ClientClosed under the parent mutex, retains
+  the server Arc, then releases the parent guard before notifying the server.
+  Eden has no parent host mutex around that notification. This removes the
+  parent/server ABBA cycle without skipping cleanup or weakening endpoint locks.
+- KClientSession::destroy_with_process retains its logical parent reference
+  until notification completes, then releases it and finalizes only if last.
+  The unused process-forwarding notification adapter is removed; the server
+  notification did not use that argument and its implementation is unchanged.
+- KServerSession::destroy_with_process now follows OnServerClosed,
+  CleanupRequests, parent Close in that order. Previously its logical parent
+  reference was released before cleanup, permitting concurrent finalization.
+- Existing Arc/registry endpoint lifetime representation remains the Rust
+  adaptation of Eden's embedded KAutoObject reference counts. No guest binary
+  structure, descriptor, or serialization layout changes in this slice.
+
+### Verification
+
+- The bounded concurrent client-close regression fails before the fix with
+  "client close held parent while waiting for server". Both tests release their
+  held endpoint/request guards and join before asserting, including failure.
+- Client and server tests exercise parent availability, notification/cleanup
+  ordering, and retaining the last logical reference until that work completes.
+- Focused and full-suite results, plus the subsequent GUI retry, are tracked in
+  GEOMETRY_SUPPORT.md. No full-kernel parity claim is made by this local fix.
+
+## 2026-09-06 - Metal TriangleFan assembly vs Eden Vulkan input assembly
+
+Compared metal_primitive_assembler.rs and metal_rasterizer.rs with Eden
+renderer_vulkan/maxwell_to_vk.{h,cpp}, vk_graphics_pipeline.{h,cpp} and
+vk_compute_pass.{h,cpp}; re-read topology mapping, provoking selection and GPU
+index-conversion ordering after implementation.
+
+### Intentional differences
+- Eden submits TriangleFan to Vulkan's fixed-function assembler. Metal lacks
+  that topology; the native assembler now produces triangle-list indices and
+  indexed-indirect arguments on GPU for ordinary direct draws as well as
+  supporting GS input assembly. No SPIR-V/MSL bridge or CPU conversion is used.
+- Fan rotation preserves first/last provoking values and front-face winding.
+  Geometry input records retain their existing order; raster conversion is a
+  separate final kernel owned by the native primitive assembler.
+- Scheduler compute barriers and encoder transitions replace Vulkan's compute
+  to index-read dependency. Native bound buffers retain their GPU lifetime.
+
+### Binary layout verification
+- Five explicitly written u32 words match native indexed-indirect arguments:
+  indexCount, instanceCount, indexStart, signed baseVertex bits, baseInstance.
+  Input controls use initialized u32 arrays, with no host struct padding.
+
+### Verification and scope
+- Exact index/argument tests cover empty and short input, restart segments,
+  degenerates, 8/16/32-bit inputs, nonzero source offsets and both provoking
+  modes. Native pixels verify culling, flat colors and instanced draw arguments.
+- Indirect fan inputs still require a separate GPU argument-expansion slice;
+  they remain explicitly rejected, not drawn as the wrong native topology.
+  Real-title validation remains dependent on the sampler ABI prerequisite
+  recorded in GEOMETRY_SUPPORT.md.
+
+## 2026-09-06 - Metal sampler lifetime prerequisite
+
+Compared metal_scheduler.rs with Eden vk_scheduler.{h,cpp} submission and
+completion ownership after implementation. This is a Metal-specific resource
+retention adaptation, not a change to the guest scheduling model: argument-buffer
+samplers are not MTLResource objects and are not retained by useResource.
+One cohort per native command buffer retains them; its completed handler clears
+the cohort even if the scheduler has been dropped. Flush starts a new cohort
+without waiting. No guest binary layout changes. The native completion test
+passes; caller binding integration follows in the argument-buffer ABI slice.
+
+## 2026-09-06 - Native MSL sampler argument-buffer ABI
+
+Re-read Eden vk_update_descriptor.{h,cpp}, vk_texture_cache.{h,cpp} Sampler,
+vk_scheduler.{h,cpp} and compared descriptor order, sampler variants and lifetime
+after implementation. Eden has no native Metal shader or argument-buffer ABI.
+
+### Intentional differences
+- msl_emit_context.rs/msl/mod.rs reserve a buffer for >16 samplers and emit
+  stage-specific argument structs; sampler member IDs preserve the existing
+  guest descriptor mapping. <=16 direct bindings are unchanged.
+- metal_update_descriptor.rs owns native argument encoding, using Metal's
+  encodedLength/member layout rather than Vulkan descriptor bytes or hardcoded
+  handle sizes. Each prepared argument buffer has distinct tracked storage.
+- metal_sampler.rs enables argument-buffer support on all guest state variants.
+  Filtering, LOD, comparison and anisotropy selection are unchanged.
+- metal_graphics_pipeline.rs/metal_compute_pipeline.rs prepare the argument
+  buffer; metal_rasterizer.rs and metal_geometry_pipeline.rs bind it for every
+  applicable stage and no longer bind the same samplers directly. Command-buffer
+  cohorts keep indirect sampler references alive through GPU completion.
+- metal_shader.rs and callable constructors validate the ABI against the device
+  profile before native compilation. No unsupported capability is invented.
+
+### Verification
+- Native pixels distinguish 17 LOD states for scalar and array declarations.
+  Completion and cross-stage ABI tests cover retention and callable parameters.
+- No Vulkan descriptor binary layout is reused. MTLArgumentEncoder owns opaque
+  Metal bytes; texture/data-buffer namespaces remain unchanged. Real-title and
+  release-cost validation remain separate gates recorded in GEOMETRY_SUPPORT.md.
+## 2026-09-06 - Pre-raster shader environment capture
+
+`src/video_core/src/renderer_vulkan/pipeline_cache.rs` was compared again with
+Eden `renderer_vulkan/vk_pipeline_cache.h/.cpp`, especially graphics stage
+translation, MakeRuntimeInfo, and ConvertLegacyToGeneric ordering.
+
+### Intentional differences
+- Independently opt-in tessellation capture extends the existing geometry
+  diagnostic at the shared translation boundary. Eden has shader dumps but not
+  this Rust environment replay format. It does not alter stage selection,
+  runtime state, backend capabilities or unsupported-stage handling.
+- Captures retain all active stage environments and the fixed key, not only
+  instruction bytes; this preserves translation-time lookups for offline replay.
+  The serialization version is unchanged. The round-trip regression now covers
+  tessellation control/evaluation alongside vertex, geometry and fragment.
+
+### Missing items
+- Native Metal TCS/TES lowering and patch/factor execution remain a stopped
+  prerequisite documented in GEOMETRY_SUPPORT.md, not an implemented fallback.
+## 2026-09-06 - Session teardown after unified-waits integration
+
+Compared `k_session.rs`, `k_client_session.rs` and `k_server_session.rs` again
+with Eden's corresponding headers and implementations, including OnRequest,
+OnClientClosed, and both endpoint Destroy methods.
+
+### Intentional differences
+- The surviving Rust request-forwarding bridge accepts a resolved server Arc
+  rather than borrowing the parent session while locking the endpoint. This
+  adapts Eden KSession::OnRequest to Rust wrapper locks and retains the existing
+  deferred scheduler-unlock boundary. Removed unused parent-borrowing wrappers
+  which could recreate the parent/server ABBA cycle.
+- Removed unused process-taking server wrappers (their process arguments were
+  ignored) and folded OnClientClosed into its single upstream-owned method.
+  No notification or request cleanup algorithm changed in this cleanup.
+- Endpoint regression comments clarify that both IsClientClosed/IsServerClosed
+  mean state != Normal upstream; only one side initiates each test scenario.
+
+### Integration evidence
+- Reapplied the geometry work on origin/main 1f700f99. Unified host/guest waits
+  change server notification registration, not parent/server mutex ordering or
+  the Destroy parent-reference lifetime. The two local teardown fixes remain
+  necessary and are preserved. The server keeps its logical parent reference
+  through CleanupRequests; the client releases the parent mutex before notifying
+  the server, retaining its logical reference through that notification.
+
+## 2026-09-06 - Metal conditional resolve vs Vulkan compute pass
+
+Compared `metal_compute_pass.rs::ConditionalRenderingResolvePass` and
+`host_shaders/metal_resolve_conditional_render.metal` against Eden's
+`renderer_vulkan/vk_compute_pass.{h,cpp}` and
+`host_shaders/resolve_conditional_render.comp`, rereading the constructor,
+Resolve, input/output descriptors, uniform, barriers, and both shader branches.
+
+### Intentional differences
+- Direct MSL and native buffer bindings replace SPIR-V/descriptors. The pass
+  retains the upstream owner and one-thread dispatch, reading 8 or 24 bytes
+  and writing one u32. The comparison-to-zero requires both initial words
+  nonzero; equality compares words 0/1 with 4/5 and ignores words 2/3.
+- A destination offset permits scheduler/staging-owned suballocations. Checked
+  ranges and uint alignment return a native error before recording rather than
+  sending an invalid range to the driver. The four-byte uniform is explicitly
+  converted from bool, not copied as a Rust bool payload.
+- Tracked resources and compute buffer barriers preserve GPU producer/consumer
+  ordering. No CPU read, submit, completion wait, or Vulkan extension gate is
+  embedded in this native compute prerequisite. The eventual native predicate
+  consumer replaces Vulkan's conditional-rendering stage/access mask.
+
+### Missing items
+- Live conditional acceleration remains intentionally inactive until the
+  draw/clear predicate consumers and cache/channel lifecycle are implemented.
+  The interruption and exact prerequisites are recorded in GEOMETRY_SUPPORT.md;
+  this pass alone is not a fix for the measured conditional readback stall.
+
+### Verification
+- Native GPU tests check literal expected values, producer/consumer ordering
+  including consecutive compute dispatches, private source storage, preserved
+  destination guards, upload-owner release, and range/alignment errors.
+- Full release video_core suite with Metal validation: 1689 passed, two ignored,
+  no failures or Rust warnings. The pass is a validated prerequisite, not yet
+  connected to guest draws; live performance remains unmodified.
+
+## 2026-09-06 - Native Metal conditional command arguments
+
+Compared `metal_compute_pass.rs::ConditionalRenderingArgumentsPass` and
+`host_shaders/metal_conditional_arguments.metal` with the responsibilities of
+Eden `vk_query_cache.{h,cpp}` HostConditionalRenderingCompareBCImpl and
+Pause/ResumeHostConditionalRendering, and with Apple's installed
+MTLRenderCommandEncoder.h / MTLComputeCommandEncoder.h argument definitions.
+The native operation belongs with compute passes; no guest-address resolution
+or query lifecycle is moved into the shader helper.
+
+### Intentional differences
+- There is no matching Eden shader: native Metal consumers need GPU-generated
+  indirect records instead of Vulkan's begin/end conditional-render commands.
+  Input records remain unmodified; separate staging-pool allocations retain
+  outputs until their scheduler tick completes. True predicates copy every raw
+  field; false predicates zero only instanceCount (ordinary/indexed draw) or
+  X threadgroups (compute/mesh dispatch). Inversion is applied on the GPU.
+- Three explicit argument layouts preserve the native 16/20/12-byte records,
+  including signed baseVertex bits, first index/vertex and baseInstance. Source
+  stride may include padding; output records are packed. The five uniform words
+  are initialized u32 values, including the explicitly converted boolean.
+- Checked alignment, range arithmetic and source stride reject invalid inputs
+  before recording. Tracked resources and compute barriers replace Vulkan's
+  indirect/conditional access barriers without CPU reads or completion waits.
+
+### Integration state
+- This is the command-argument prerequisite, not yet live acceleration.
+  Geometry producer dispatches, ordinary/mesh draws, draw-texture and clears
+  must consume the generated records before the renderer can claim that it
+  handled a Maxwell condition. Remaining lifecycle work is recorded in
+  GEOMETRY_SUPPORT.md. No guest draws have been bypassed as an optimization.
+
+### Verification
+- Native GPU tests cover all three record layouts, strided multiple commands,
+  predicate inversion/nonzero high bits, GPU-written sources, live staging
+  outputs and checked range errors. Header-derived sizes and member offsets
+  are asserted against objc2-metal's native ABI definitions.
+- Actual indirect compute and raster commands verify shader-side-effect
+  suppression, including indexed negative baseVertex and nonzero baseInstance.
+  Disabled commands leave counters untouched; enabled commands preserve the
+  expected vertex/instance IDs. This tests execution, not only serialized data.
+- Full release video_core suite under Metal API validation: 1693 passed,
+  two ignored, no failures or Rust warnings. Live guest integration, including
+  conditional clears and the complete geometry producer chain, remains pending.
+
+## 2026-09-06 - Native Metal conditional geometry execution
+
+Compared `metal_geometry_pipeline.rs` and `metal_primitive_assembler.rs` with
+Eden `renderer_vulkan/vk_query_cache.{h,cpp}` conditional-region ownership and
+`vk_compute_pass.{h,cpp}` predicate production, including a second source read
+after implementation. These are native backend adaptation files: Eden uses
+fixed-function vertex/geometry execution inside a conditional-render region.
+
+### Intentional differences
+- `MetalGeometryPipeline::record_conditional_inputs` generates separate indirect
+  grids for guest vertex execution and the assembled primitives. Disabling only
+  rasterization would leave guest VS/GS stores active, so both grids are gated.
+  The existing capture/replay path derives its GS and mesh grids from the gated
+  assembly; the object/mesh path consumes it directly.
+- The vertex producer now accepts an indirect threadgroup grid while retaining
+  its original direct-dispatch path. Rounded groups use the existing generated
+  entry-point bounds checks, preserving vertex IDs, instance IDs, base fields
+  and restart suppression. Checked offsets reject invalid argument ranges
+  before recording or binding resources.
+- Cloning assembly ownership shares immutable vertex/segment/primitive buffers
+  but substitutes a dedicated gated argument buffer. Original GPU-produced
+  counts remain intact. Pool-relative offsets are honored and transient grids
+  are consumed in their allocation tick; no CPU query read, submission or wait
+  is introduced. Guest address/query lifetime remains outside these helpers.
+
+### Verification
+- Native GPU vertex tests exercise direct, true, false and inverted conditions,
+  including GPU-written predicates, repeated indices, restart entries, negative
+  baseVertex, nonzero baseInstance, storage atomics and rejected argument ranges.
+- The geometry pixel matrix now runs every case with all five condition modes:
+  object/mesh and compute-capture/replay, point/line/triangle outputs, cuts,
+  provoking vertices, culling, multiple invocations/instances, layers and
+  viewports. Disabled cases leave every layer clear and both GS counters zero;
+  enabled cases preserve the existing literal pixel and counter expectations.
+  Original assembly argument words are checked after each draw.
+- Full release `video_core` with Metal API validation: 1693 passed, zero failed,
+  two ignored. This validates consumers, not live conditional acceleration or
+  a performance gain; rasterizer/query ownership and conditional clears remain
+  the next prerequisite slice tracked in GEOMETRY_SUPPORT.md.
+
+## 2026-09-06 - Native Metal conditional DrawTexture and attachment clears
+
+Compared `renderer_metal/metal_blit_helper.rs` with Eden
+`renderer_vulkan/blit_image.{h,cpp}` (`BlitColor` with a supplied sampler,
+`ClearColor`, `ClearDepthStencil`) and `vk_rasterizer.cpp::Clear` before and
+after implementation. `metal_rasterizer.rs` keeps the two existing callers on
+the direct path until the complete query/rasterizer condition owner is wired.
+
+### Intentional differences
+- The existing Metal quad helpers accept an optional GPU indirect record.
+  ConditionalRenderingArgumentsPass preserves the four-vertex strip parameters
+  and gates instanceCount. Metal lacks a Vulkan-style conditional-render region;
+  guest address resolution and predicate ownership do not belong in this helper.
+- Argument offset/size checks and rejection of active attachment load-action
+  clears occur before encoding. A GPU-disabled quad must not execute an
+  unconditional load-action clear. The rasterizer's full-clear optimization
+  must switch to this shader path when live acceleration is enabled.
+- Color/depth/stencil shader payloads, typed integer values, masks, regions,
+  samples, resource binding and visibility-query slots are unchanged. Direct
+  callers pass None and retain their original draw command.
+
+### Corrected local ordering
+- BlitColor with a supplied sampler now ends its custom render pass before
+  returning, matching Eden's EndRenderPass. The native DrawTexture test asserts
+  that no render encoder remains active after both direct and indirect calls.
+
+### Verification
+- Native GPU tests cover enabled/disabled/inverted conditions for floating,
+  signed/unsigned integer color, depth, stencil and combined depth/stencil;
+  full and partial regions; color/stencil write masks; 1x/4x MSAA; selected mip
+  and array-layer views. Disabled cases preserve initialized pixels and values.
+- DrawTexture tests use the same Color2D sampled view as the live texture cache,
+  with reversed source coordinates and a restricted destination region. They
+  check literal pixel values and actual visibility counters (four samples when
+  enabled, zero otherwise), including a direct nonconditional control.
+- The first DrawTexture fixture incorrectly bound a render-target array view
+  to a texture2d shader; Metal validation caught this. The fixture was corrected,
+  not the live sampling path. Range/overflow and unconditional load-clear
+  rejection have separate tests.
+- Final full release video_core, including the EndRenderPass lifecycle assertion:
+  1696 passed, zero failures, two ignored, with Metal API validation and no Rust
+  warnings. The verification log is recorded in GEOMETRY_SUPPORT.md.
+
+### Remaining integration
+- Query/channel-owned predicates and all rasterizer draw variants still need
+  wiring before advertising conditional acceleration. No CPU synchronization
+  was removed and no live FPS improvement is claimed by these helper tests.
+
+## 2026-09-06 - Native Metal visibility report accumulation
+
+Compared `metal_query_cache.rs` with Eden `vk_query_cache.cpp::SamplesStreamer`
+PresyncWrites/SyncWrites and the runtime declarations in `vk_query_cache.h`;
+compared `metal_compute_pass.rs::VisibilityResolvePass` and its native host shader
+with `vk_compute_pass.{h,cpp}::QueriesPrefixScanPass` after implementation.
+
+### Intentional differences
+- Metal provides one 64-bit visibility slot per draw instead of Vulkan query-pool
+  results. Only each report's final prefix is needed here, so a hierarchical
+  256-thread reduction replaces the upstream all-prefix scan. It uses unsigned
+  64-bit addition with wrapping, zero tail lanes and threadgroup barriers; the
+  previous accumulator is added only in the final reduction pass.
+- The cache resolves only new slots since its last report. Completed banks and
+  counter resets retain their existing ordering. Results are immutable buffers:
+  a later report/reset never overwrites an earlier callback's result. Intermediate
+  buffers are private; the final eight bytes use shared storage for fence reads.
+- Native query reports now invoke the GPU resolver, replacing their previous CPU
+  loop over every visibility slot. Callbacks still write the same guest value
+  and timestamp after fence completion, but read only one retained result.
+  The callback captures the Send wrapper through a method, not its non-Send raw
+  Objective-C field. No new guest-visible wait or fabricated counter is added.
+- Native uniforms occupy sixteen initialized bytes (MSL uint3 plus padding).
+  Checked byte ranges/alignment and bounded counts precede command recording.
+
+### Verification
+- Native GPU reductions cover 1/255/256/257/2048/65537 inputs, partial groups,
+  multiple reduction levels, high words, 64-bit wraparound, GPU-produced inputs,
+  guard data outside the selected range and invalid ranges.
+- Cache tests verify incremental reports [7,18,17], an empty reset result, a
+  subsequent result of 9, bank rollover, immutable prior results, reuse without
+  new draws, and retained lifetimes after dropping the cache before completion.
+- The real DrawTexture visibility test compares the GPU-resolved total with the
+  native visibility slot for direct/enabled/disabled/inverted draws.
+- Full release video_core with Metal API validation: 1698 passed, zero failed,
+  two ignored; no Rust warnings.
+- The conditional-rendering address/query lifecycle is still the next slice:
+  these GPU results are not yet registered as authoritative host-managed query
+  buffers for Maxwell conditions. No FPS improvement has been measured.
+
+## 2026-09-06 - Metal query report address lifetime
+
+Re-read Eden `query_cache/query_cache_base.h` and
+`query_cache/query_cache.h::CounterReport` after changing
+`renderer_metal/metal_query_cache.rs::report` and its writeback helpers.
+
+### Corrected behavior
+- Translate the report GPU address to a device address before recording work,
+  not when its deferred fence callback executes. Unmapped reports return before
+  allocating a visibility result or recording a reduction. Later channel GPU
+  remaps cannot redirect an older report to a different device destination.
+- Callbacks retain the device-memory owner, not the channel memory manager.
+  Timestamped reports obtain ticks at completion and write the timestamp before
+  the eight-byte value; other reports write only four bytes, as in CounterReport.
+
+### Intentional differences
+- Eden retains raw host pointers for both writes. This slice follows the shared
+  Rust query cache's DeviceMemoryWriter bridge: retain the device owner/address
+  and resolve its host backing at each typed write. This avoids introducing an
+  unchecked host-pointer lifetime, but does not establish equivalence for SMMU
+  unmapping/replacement. Query invalidation remains a prerequisite below.
+
+### Verification and interrupted slice
+- Eight focused release Metal query-cache tests pass with Metal API validation.
+  The new regression covers payload/visibility reports, four/eight-byte writes,
+  completion-time timestamps, GPU remapping before completion, and dropping the
+  channel/cache while callbacks retain their resources. An unmapped report test
+  verifies that no GPU work is recorded.
+- Shared QueryCacheBase registration/replacement/invalidation and channel/runtime
+  ownership are still required before enabling host conditional acceleration.
+  This local address fix does not claim to replace those lifecycle operations.
+  Full release video_core with Metal API validation: 1700 passed, zero failed,
+  two ignored; no Rust warnings. The continuation is tracked in GEOMETRY_SUPPORT.md.
+
+## 2026-09-06 - Metal query registration, invalidation and ordered retirement
+
+Compared `renderer_metal/metal_query_cache.rs` with Eden
+`query_cache/query_cache_base.h`, `query_cache/query_cache.h` (CounterReport,
+UnregisterPending, CommitAsyncFlushes), `query_stream.h`, and the SamplesStreamer
+owner in `renderer_vulkan/vk_query_cache.{h,cpp}` after implementation.
+Compared Metal rasterizer invalidation and fence routing with
+`renderer_vulkan/vk_rasterizer.{h,cpp}` and `video_core/fence_manager.h`.
+
+### Ownership and behavior
+- Deferred Metal reports now register in the existing shared QueryCacheBase
+  page index. Native report streamers use SimpleStreamer slot storage and shared
+  QueryBase/GuestQuery flags, rather than introducing another address map.
+- A mutex-owned graph retains a boxed base and boxed streamers. Its internal raw
+  pointers remain stable across moves; callbacks retain the graph and all access
+  is serialized. No rasterizer, channel or runtime raw pointer is bound here.
+- Shared replacement marks IsRewritten; completing an older ordered report still
+  writes its value but UnregisterPending checks the full location before removing
+  a cache entry. Region invalidation marks IsInvalidated and suppresses both value
+  and timestamp writes. Metal InvalidateRegion and InnerInvalidation now call this
+  shared path in the same texture/buffer/query/shader order as Eden.
+- Completion only queues pending retirement. A separately queued fence operation
+  performs UnregisterPending; Free releases the retained GPU buffer and recycles
+  the slot. It does not recycle directly from the report callback.
+
+### Intentional native adaptations
+- Report results use immutable Metal visibility-reduction buffers, not Vulkan
+  query banks. Their accumulation is already GPU-resolved at report creation;
+  final CPU value synchronization occurs at fence completion, not at insertion.
+- Native report streamers adapt both payloads and resolved visibility buffers to
+  the shared registry. They do not replace the shared GuestStreamer SyncValues
+  upload path, which is the next prerequisite for buffer-cache coherence.
+- The cleanup operation is queued immediately before the rasterizer enters the
+  common fence call, instead of reentering a mutably borrowed FenceManager from
+  its commit callback. Its execution still follows previously queued operations
+  and waits for that fence's GPU completion when the batch contains a GPU query.
+  No GPU work is recorded by the cleanup operation itself.
+- The common SignalFence callback can run before GPU completion at low accuracy.
+  Host-produced Metal reports therefore use a SyncOperation followed by a fence
+  with no GPU read in its signal callback. This preserves the actual report value
+  without a global wait. Eden can reject a not-finally-synced report in that mode;
+  native Metal instead retains it to completion rather than reading live memory
+  or dropping the report. Payload-only signal behavior is unchanged.
+
+### Verification
+- Added tests for replacement, delayed unregister, slot reuse and bounded slot
+  counts, partial-range invalidation, unchanged timestamps on invalid reports,
+  GPU-result resource release, and cross-thread callbacks after cache destruction.
+- Native fence regression covers low accuracy with a GPU-produced visibility
+  result: the early signal fires, guest report bytes stay untouched until the
+  real command-buffer fence completes, then contain the expected count.
+- This regression initially read zero instead of 73 despite using SyncOperation.
+  The second missing edge was Metal's constant-false ShouldWaitAsyncFlushes:
+  non-async FenceManager only tests/waits for a fence if that hook requests it.
+  Query commits now append a samples-stream mask (or zero for an empty batch) to
+  shared QueryCacheBaseImpl::flushes_pending. The shared ShouldWaitAsyncFlushes
+  and native PopAsyncFlushes closures are wired into signal/reference/syncpoint,
+  release and WFI paths. Each queued fence consumes exactly one mask, including
+  empty batches. No unrelated batch gets an unconditional GPU wait.
+- A report reusing a previous GPU result ensures a current command buffer exists
+  so its fence is an ordered queue marker, not a stub while the old producer may
+  still be executing. Report synchronization remains per-result after that fence.
+- Metal currently uses the non-async FenceManager. ReleaseFences only drains its
+  existing queue and must not manufacture a new query-flush batch; the three
+  actual fence-creation edges own CommitAsyncFlushes. Enabling an async native
+  fence worker later also requires wiring its force-drain fence creation edge.
+- Final full release video_core with Metal API validation: 1706 passed, zero
+  failed, two ignored, no Rust warnings. Continuation is in GEOMETRY_SUPPORT.md.
+  Conditional acceleration is not yet enabled, and no FPS gain is claimed.
+
+## 2026-09-06 - Native Metal QueryCacheRuntime::SyncValues
+
+Re-read `renderer_vulkan/vk_query_cache.h` and
+`renderer_vulkan/vk_query_cache.cpp::SyncValues`/HostSyncValues after implementing
+their native owner in `renderer_metal/metal_query_cache.rs`.
+
+### Ownership and ordering
+- QueryCacheRuntime owns the page groups, redirects, destination buffer handles
+  and per-destination copies, matching the upstream runtime Impl. The shared
+  SyncValuesStruct is reused; HostSyncValues remains in the backend query file.
+  A Rust trait expresses the template's GeneratesBaseBuffer and plain fields.
+- BufferOperations retries acquisitions under the common buffer-cache mutex.
+  Each destination uses FullSynchronize/DoNothing, retaining surrounding guest
+  bytes without inventing a buffer-cache MarkAsWritten side effect. Captured
+  native handles come from the final acquisition pass, including after merges.
+- CPU values are copied immediately into an upload staging allocation, including
+  its nonzero offset. Host values are copied from GPU buffers at the supplied
+  offsets. All copies record into the common Metal scheduler after acquisitions;
+  neither path submits nor waits. GPU-produced values are never read by the CPU.
+- Scheduler/staging pointers follow the existing Metal BufferCacheRuntime owner
+  contract: stable boxed services outlive the runtime. A typed scheduler borrow
+  is created only after BufferOperations has finished using that scheduler.
+  The constructor is unsafe with this explicit lifetime/serialization contract;
+  constructing a runtime from services that subsequently move is not a safe API.
+
+### Intentional native differences
+- Native transfers use a shared blit encoder rather than Vulkan CopyBuffer.
+  Four/eight-byte query widths, alignment, source bounds and overflow are checked
+  before acquiring buffers or recording work. An invalid request returns an error.
+- For a four-byte-aligned eight-byte report crossing a device-page boundary,
+  acquisition includes both pages. Eden's grouping includes only the page of the
+  start address. First-match overlap/adjacency grouping is unchanged for ordinary
+  page-contained queries; this extension prevents an out-of-range native copy.
+- This is the SyncValues prerequisite, not a complete runtime/channel binding:
+  pending report synchronization and native conditional consumers remain to wire.
+  The stopped integration slice is tracked in GEOMETRY_SUPPORT.md.
+
+### Verification
+- Native tests copy literal CPU values and GPU-produced values into the actual
+  common buffer cache, checking source offsets, adjacent/disjoint page groups,
+  four/eight-byte widths, cross-page reports, untouched neighboring bytes and
+  retained source lifetime. Scheduler ticks do not advance during SyncValues.
+- Invalid widths, addresses, overflow, missing GPU sources and bad source ranges
+  return errors without recording work. The fixture rejects guest-memory writes,
+  so synchronization cannot silently use a CPU writeback instead of a GPU copy.
+- Full release video_core with Metal API validation: 1709 passed, zero failed,
+  two ignored, no Rust warnings. Final constructor-contract verification and
+  remaining integration are recorded in GEOMETRY_SUPPORT.md.
+
+## 2026-09-06 - Metal inline-write query invalidation
+
+Compared `metal_rasterizer.rs::accelerate_inline_to_memory` after implementation
+with Eden `vk_rasterizer.h` and `vk_rasterizer.cpp::AccelerateInlineToMemory`.
+The native path now invalidates query-cache reports after shader invalidation,
+matching Eden's final operation. Its prior omission left a report eligible to
+overwrite bytes subsequently supplied by a guest inline write. The common query
+invalidation/write-suppression tests cover the called owner; no game-specific
+filter or new trace was introduced.
+
+## 2026-09-06 - Metal pending query synchronization and WFI
+
+Re-read Eden `query_cache/query_cache.h` GuestStreamer::SyncWrites,
+QueryCacheBase::NotifyWFI/CommitAsyncFlushes, `renderer_vulkan/vk_query_cache.h`
+and `.cpp` SamplesStreamer::PresyncWrites/SyncWrites, plus
+`vk_rasterizer.cpp::WaitForIdle`, against the native query/rasterizer owners.
+
+### Ownership and ordering
+- MetalReportStreamer records pending slot IDs at WriteCounter and removes
+  retired IDs at Free. Rewritten/invalidated reports are excluded from GPU sync.
+- MetalQueryCache::notify_wfi visits payload then samples, using the common
+  buffer cache before locking the retained report graph. Its runtime remains
+  GPU-thread-owned; fence callbacks do not acquire the scheduler runtime.
+- MetalRasterizer now constructs QueryCacheRuntime with its stable boxed
+  scheduler/staging services and synchronizes before query flush-mask commits
+  at fence/syncpoint/reference creation, and before WaitForIdle ordering.
+- Visibility values copy all eight bytes, including reports whose eventual
+  non-timestamped CPU write is four bytes. Payloads use four/eight bytes according
+  to HasTimestamp. GPU copies do not write timestamps or mark FinalValueSynced.
+
+### Intentional native differences
+- Report-time GPU reductions supply PresyncWrites' source before ordered Metal
+  blits. Tracked source/destination resources and encoder boundaries replace
+  Vulkan barriers; no new submit or host completion wait is added here.
+- IsHostSynced is set after successful recording rather than before SyncValues.
+  Errors retain pending reports for retry; already-recorded values are skipped.
+  The live error path logs failure, leaving those reports unsynchronized.
+- The native wrapper invokes streamer synchronization with explicit runtime and
+  buffer-cache arguments, not a raw runtime pointer in the Send report graph.
+  Host conditional lookup/consumer integration remains an interrupted slice in
+  GEOMETRY_SUPPORT.md, not an advertised capability.
+
+### Verification
+- Native tests cover replacements, partial invalidation, preserved neighboring
+  bytes, GPU-produced 64-bit values without HasTimestamp, timestamp exclusion,
+  failed sync retry, retirement/slot reuse and empty repeated synchronization.
+- Release video_core with Metal API validation: 1711 passed, zero failed,
+  two ignored. No game performance gain has been measured for this slice.
+
+## 2026-09-06 - Metal conditional runtime state and buffer-cache predicate
+
+Compared `renderer_metal/metal_query_cache.rs` after implementation with Eden
+`renderer_vulkan/vk_query_cache.h` and `.cpp` QueryCacheRuntimeImpl construction,
+End/Pause/ResumeHostConditionalRendering, HostConditionalRenderingCompareBCImpl
+and HostConditionalRenderingCompareValueImpl. The rasterizer only constructs
+the owner in this slice; host conditional acceleration is not enabled.
+
+### Ownership and ordering
+- QueryCacheRuntime owns the resolve pass, a dedicated four-byte device-local
+  predicate, the current setup and its running state. Source buffer acquisition
+  stays FullSynchronize/DoNothing under the common buffer-cache mutex.
+- The resolved path reads eight or twenty-four bytes with the existing native
+  resolve shader, including the +16 comparison and two-half conditional rule.
+  Equal comparisons use a non-inverted predicate; not-equal inverts it. The
+  zero-versus-query direct path uses the low word with the opposite inversion.
+- Resolve preserves the prior running/paused state. End removes the setup;
+  Resume without a setup cannot reactivate an old predicate. Range/recording
+  failures clear the setup rather than leaving an earlier condition active.
+
+### Intentional native differences
+- Metal has no begin/end conditional region. Option<MetalConditionalRendering>
+  represents setup plus is-set; each consumer obtains a retained buffer handle,
+  offset and inversion, then records native indirect-argument masking. GPU
+  resources are retained; predicate bytes must be consumed in command order,
+  not mistaken for an immutable CPU snapshot. No staging slot owns the predicate.
+- The native direct setup always updates inversion. Eden's handle/offset-only
+  early-out omits the flags comparison and can retain the previous inversion
+  when equality changes at the same address. Native masking needs no redundant
+  Vulkan begin/end suppression; retaining that early-out would reproduce stale
+  conditional state. This behavioral difference is explicitly tested.
+- Constructor failures use Result; native buffers/encoder transitions replace
+  Vulkan allocations/commands. No submit or CPU completion wait is introduced.
+
+### Verification
+- GPU tests resolve repeated SyncValues-produced values, consume masked draw
+  records before subsequent predicate writes, and compare literal argument
+  words after completion. Source high/low halves, ignored middle words, equality,
+  inversion, direct low-word semantics and untouched draw fields are covered.
+- Lifecycle tests cover initial pause, resume, end, setup replacement and invalid
+  ranges. Source/runtime integration and full-suite status are recorded in
+  GEOMETRY_SUPPORT.md; a native helper test does not prove live acceleration.
+- Full release video_core with Metal API validation passed: 1714 tests,
+  zero failures, two ignored, no Rust warnings. No FPS result is claimed.
+
+## 2026-09-06 - Shared conditional lookup and native channel bridge
+
+Re-read Eden `query_cache/query_cache_base.h`, `query_cache/query_cache.h`
+AccelerateHostConditionalRendering/gen_lookup and Vulkan runtime compare methods
+in `vk_query_cache.h/.cpp` after implementing the corresponding Rust changes.
+
+### Ownership and ordering
+- The device-address portion of gen_lookup is mechanically extracted into
+  QueryCacheBase::lookup_query_for_conditional_rendering. The existing shared
+  acceleration path and Metal use this single index lookup: exact location first,
+  then +4 within the same page, followed by ObtainQuery. No second map is added.
+- Metal borrows RenderConditionState and the current channel MemoryManager for
+  the acceleration call. Translation and query references do not enter the Send
+  report graph. Buffer-cache then report locks cover lookup/flags/recording.
+- Override and constant conditions end the old setup. Pending reports without
+  IsHostSynced cannot be used as authoritative GPU values. Equality checks retain
+  the shared query-dirty/GPU-modified-source eligibility gates.
+
+### Intentional native differences
+- Complete eight/twenty-four-byte records are checked through exact endpoint
+  translations. GpuToCpuAddress's range overload searches a page and discards the
+  byte offset; it is deliberately not used. Unmapped/noncontiguous/overflowed
+  records return to CPU handling rather than synthesizing an address-zero input.
+- Eligible equality comparisons resolve both full values on GPU. Metal does not
+  inherit Vulkan driver/low-accuracy shortcuts that render unconditionally, nor
+  the low-word-only zero fast path. CPU-only comparisons retain CPU handling.
+- The runtime/channel are explicit scoped arguments, not persistent pointers
+  bound into the retained QueryCacheBaseImpl. Missing native FlushRegion query
+  synchronization is a prerequisite before live activation, recorded below.
+
+### Verification
+- Native tests check a non-page-aligned GPU VA mapping to a distinct device
+  address, pending/synced/guest-synced reports, exact/+4 priority, same-page lookup,
+  replacement, real CPU writes after query invalidation, unmapped records and
+  GPU-modified sources without query metadata. Literal GPU predicates are read
+  only after test completion; production lookup adds no submit or host wait.
+- An initial test incorrectly expected invalidation to retain the query in the
+  index. It was corrected against IterateCache<true> to assert removal and verify
+  newly uploaded CPU bytes replace the prior GPU value.
+- Full release video_core with Metal API validation: 1718 passed, zero failed,
+  two ignored, no Rust warnings. Live draw acceleration remains disabled.
+
+## 2026-09-06 - Scoped query FlushRegion and live Metal routing
+
+Re-read Eden `query_cache/query_cache_base.h::FlushRegion`,
+`query_cache/query_cache.h::SemiFlushQueryDirty/RequestGuestHostSync`,
+`renderer_vulkan/vk_rasterizer.cpp::FlushRegion` and the corresponding header
+interfaces after implementation. ReleaseFences defaults to force=true upstream.
+
+### Ownership and ordering
+- QueryCacheBase::flush_region_with_memory uses the same IterateCache<false>
+  and shared semi-flush value helper as the existing bound-owner path. It stops
+  at the first host-managed dirty report. No second query index or dirty rules.
+- Available final values write u32 or u64 according to HasTimestamp, without
+  synthesizing a timestamp, setting IsGuestSynced or retiring the query. Missing
+  final values return the RequestGuestHostSync decision instead of reading GPU
+  contents prematurely.
+- MetalQueryCache borrows a device-address writer for the call only. The live
+  rasterizer routes QUERY_CACHE after texture and buffer flushes, then calls
+  ReleaseFences(true) only if requested and after the report lock is gone.
+
+### Intentional Rust differences
+- The final ReleaseFences decision crosses the retained-report mutex boundary
+  as a bool. Its callbacks lock the same owner; calling them under that mutex
+  would deadlock. No runtime/rasterizer/device writer pointer is stored there.
+- The existing bound-owner helper snapshots the small QueryBase value before
+  borrowing its writer to avoid aliasing Impl borrows; its behavior is unchanged.
+  DeviceMemoryWriter uses existing device-address writes rather than C++ memcpy.
+- No extra unconditional scheduler wait is introduced. Actual pending reports
+  take the existing fence path; already-final payloads require no GPU submission.
+
+### Verification
+- Shared tests cover first-dirty early exit and the explicit-writer path without
+  bound rasterizer pointers. Native tests verify widths, untouched timestamps and
+  neighbors, invalidation, guest-synced reports and absence of early retirement.
+- The existing low-accuracy GPU test also checks the returned synchronization
+  request and unlocked report mutex before deferred callbacks. A live rasterizer
+  test covers QUERY_CACHE filtering, payload writes without submission, and an
+  actual pending visibility result released through FlushRegion/ReleaseFences.
+- Test results and remaining draw-consumer integration are in GEOMETRY_SUPPORT.md.
+- Full release video_core with Metal API validation: 1721 passed, zero failed,
+  two ignored, no Rust warnings. This does not establish a game FPS improvement.
+
+## 2026-09-06 - Metal conditional consumers vs Eden query/rasterizer interfaces
+
+Re-read renderer_vulkan/vk_rasterizer.h/.cpp, vk_query_cache.h/.cpp,
+engines/maxwell_3d.h/.cpp and rasterizer_interface.h. Rust owners are
+renderer_metal/metal_rasterizer.rs, metal_query_cache.rs,
+engines/maxwell_3d.rs and rasterizer_interface.rs.
+
+### Intentional differences
+- Maxwell passes a RenderConditionState snapshot to the native hook rather than
+  reborrowing its own engine through a raw pointer during ProcessQueryCondition.
+  The default trait adapter delegates to the existing address/legacy hooks, so
+  OpenGL and Vulkan keep their current behavior.
+- Metal has no Vulkan conditional-rendering region. Graphics consumers resume
+  the query predicate and mask indirect arguments on GPU. Ordinary/indexed draws,
+  indirect draws, fan expansion, geometry VS/GS dispatches, DrawTexture and
+  shader clears consume the mask; compute/copy/cache helpers remain unconditional.
+- Indexed arguments preserve firstIndex, signed baseVertex bits and baseInstance;
+  the index-buffer binding offset does not add firstIndex a second time.
+- Conditional clears cannot use attachment load-action clears. They use the
+  existing typed shader-clear path with masked quad arguments. Staging outputs
+  remain protected by the scheduler timeline, not a per-draw CPU wait.
+- The query bridge uses scoped GPU address translation rather than holding the
+  channel memory mutex across buffer-cache operations. Releasing the bound channel
+  removes its active predicate; unbound-channel release does not.
+
+### Verification
+- Live rasterizer test maps distinct GPU/device addresses and checks GPU-owned
+  equal/unequal comparisons, quad argument suppression, unchanged submission tick,
+  untouched guest memory, and removal of the predicate for unconditional rendering.
+- Existing argument, geometry and blit tests exercise GPU side effects, pixels,
+  layouts, inversion and typed clears. Full-suite and game results are recorded
+  in GEOMETRY_SUPPORT.md; compiling this path alone does not establish a FPS gain.
+
+## 2026-09-06 - src/video_core/src/gpu_thread.rs vs video_core/gpu_thread.h/.cpp
+
+### Intentional differences
+- Native Metal invokes Objective-C directly on the Rust GPU OS thread, outside
+  AppKit's event loop. Each dispatched command now has a macOS autorelease pool,
+  drained before publishing command completion. Eden has no native Metal backend;
+  this is explicit platform lifetime glue, not a different scheduling policy.
+- The local closure wrapper is mechanical and keeps all dispatch ownership in
+  gpu_thread.rs. Non-macOS platforms invoke the closure directly. No explicit GPU
+  wait, resource retirement tick, queue order or fence value is changed.
+
+### Verification
+- Re-read Eden's header and StartThread loop after editing: pop/stop checks,
+  SubmitList/Tick/Flush/Invalidate dispatch, fence store and waiter notification
+  retain their ordering. No serialized structure or binary layout changes.
+- Tests exercise real Objective-C temporary destruction at scope exit, survival
+  of an explicitly retained resource, and pool draining during Rust unwinding.
+- Release video_core suite with Metal validation enabled: 1,724 passed, zero
+  failed, two ignored, no warnings. All four gpu_thread tests pass.
+- This fixes a missing lifetime scope, not yet the measured cause of the earlier
+  swap exhaustion. Runtime A/B validation and other Metal calling-thread scopes
+  remain separate from this command-loop slice; see GEOMETRY_SUPPORT.md.
+
+## 2026-09-06 - renderer_metal/metal_scheduler.rs and metal_presenter.rs GPU timing
+
+### Intentional differences
+- Native Metal-only, opt-in RUZU_PROFILE_METAL_SUBMISSIONS instrumentation reads
+  GPUStartTime/GPUEndTime after successfully completed command buffers are already
+  retired through poll/wait/finish. No extra wait, flush or completion handler.
+- Classifies existing guest, presentation, external and synchronous submissions;
+  the presentation entry point only supplies metadata to the same commit method.
+  The option is read once at scheduler construction; absent means no timestamp
+  calls, clocks or logs at completion. Fixed-size accumulators emit at most one
+  report per second; unavailable/non-finite timestamps do not count as measured.
+- Measurements are command-buffer spans, not individual pass costs or utilization
+  percentages. Completion-observation windows and GPU execution windows differ.
+
+### Verification
+- Re-read Eden vk_scheduler.h/.cpp Flush/Finish/Wait and vk_present_manager.h/.cpp
+  alongside the native Metal methods. Submission, encoder ending, tick assignment,
+  completion checks and resource-retirement ordering are unchanged. This diagnostic
+  is not an upstream feature port. No shader or serialized layout is modified.
+- Added timestamp aggregation edge cases and a native submission test checking
+  preserved ticks and exactly-once completion observation across all four kinds.
+  Compilation and runtime evidence are recorded separately in GEOMETRY_SUPPORT.md.
+- Full video_core release suite with Metal validation: 1,726 passed, zero failed,
+  two ignored, no warnings. Release GUI and app bundle built successfully.
+  Live timing capture awaits an unlocked console; no runtime optimization claim.
+
+## 2026-09-06 - renderer_metal/renderer_metal.rs and metal_presenter.rs native screenshots
+
+### Intentional differences
+- RenderScreenshot and RenderToBuffer stay in the renderer owner, corresponding
+  to renderer_vulkan/renderer_vulkan.h/.cpp. RequestScreenshot delegates to the
+  existing RendererBaseData request publisher and asynchronous callback wrapper.
+- Metal renders the same resolved source used by its current presenter into a
+  private BGRA8Unorm texture, then copies to a shared MetalBuffer. 256-byte padded
+  GPU rows are unpacked into the frontend's width*height*4 bytes. Shared storage
+  needs no Vulkan mapped-memory invalidation after the copy command completes.
+- Only requested captures wait for their command buffer, after flushing earlier
+  guest work in queue order. Normal frames do not allocate a capture or read back.
+- The presenter shares its existing source-image encoding mechanically with the
+  capture path. Normal presentation still fills the drawable; capture uses the
+  requested screen rectangle and configured background color (alpha one), as in
+  Eden's present/window_adapt_pass.cpp. No SPIR-V conversion or OS window capture.
+- On a failed capture, log the error, release the pending request and drop its
+  callback without publishing uninitialized pixels. The callback bool is invert_y,
+  not a failure indicator. Destination pointer is cleared after request retirement.
+
+### Verification
+- Re-read RendererBase::RequestScreenshot, RendererVulkan::Composite,
+  RenderScreenshot and RenderToBuffer, including declarations. Retain the request,
+  render before presentation, finish GPU copy, copy pixels, callback(false), clear
+  pending ordering. The result callback is only invoked after valid pixel data.
+- Real GPU tests cover a pending upload, six RGBA source colors -> top-down BGRA,
+  screen rectangle/background, padded rows, untouched guard bytes, deferred and
+  exactly-once completion, duplicate request rejection and invalid request cleanup.
+  No-request calls leave the submission tick and active work unchanged.
+- This slice captures the existing Metal compositor output. It does not establish
+  complete Eden layer/crop/transform composition parity, or implement the separate
+  applet capture path. Neither is silently presented as fixed by this screenshot
+  change. Full-suite and live verification are recorded in GEOMETRY_SUPPORT.md.
+- Full release video_core suite with Metal API validation: 1,728 passed, zero
+  failed, two ignored; no warnings. Gameplay screenshot validation is pending.
+## 2026-09-06 - Metal stage profiler and scheduler vs renderer_vulkan/vk_scheduler.h/.cpp
+
+### Intentional differences
+- `renderer_metal/metal_gpu_profiler.rs` is native diagnostic ownership with no
+  Eden Vulkan class counterpart. Apple's stage-boundary counter API, rather than
+  Vulkan query pools/barriers, samples existing Metal encoders. It is gated by
+  `RUZU_PROFILE_METAL_STAGES` and actual device counter support.
+- `metal_scheduler.rs` retains a single bounded sample-buffer lease with its
+  producing command buffer and resolves only after existing completion checks.
+  Re-reading Eden's Flush/Finish/BeginRenderPassImpl confirmed the ordering
+  contracts remain unchanged; no diagnostic submission or wait is inserted.
+- Render descriptors are copied only for sampled passes, avoiding persistent
+  mutation of caller-owned descriptors. Counts are GPU ticks, not assumed ns.
+- Sample acquisition starts on compute/render encoder creation. Live evidence
+  showed allocation-time sampling phase-locked to tiny blit-only submissions;
+  those and transfers before acquisition are excluded from stage coverage, while
+  the independent submission timing still observes all completed batches.
+
+### Unintentional differences (to fix)
+- No new guest-ordering difference identified in this diagnostic slice.
+
+### Missing items
+- Live per-stage results and attribution of the 132-135 ms guest batches remain
+  pending; bounded sampling reports omissions and is not whole-frame coverage.
+
+### Binary layout verification
+- Timestamp results are decoded as pairs of native-endian u64 values with
+  length/overflow/error-value checks, not by casting potentially unaligned bytes.
+- Full release video_core with MTL_DEBUG_LAYER=1: 1,732 passed, two ignored,
+  no warnings. Native timestamp/output, bounded lease, descriptor non-mutation,
+  submission tick and invalid-data tests cover this profiling slice.
+
+## 2026-09-07 - Native callable TCS vs Eden SPIR-V control-patch interfaces
+
+### Intentional differences
+- `backend/msl/emit_msl_tessellation.rs` owns native device-buffer transport;
+  Eden `spirv_emit_context.{h,cpp}` declares per-vertex output arrays and patch
+  variables instead. `msl_emit_context.rs`, `msl_function.rs`, `emit_msl.rs` and
+  `emit_msl_context_get_set.rs` preserve the corresponding context, callable ABI,
+  dispatch and instruction ownership. There is no SPIR-V conversion.
+- `emit_msl_barriers.rs` adds Metal's device-memory flag to the workgroup barrier
+  for device-backed TCS outputs. It preserves workgroup execution scope; each
+  caller must dispatch all invocations of a patch in one workgroup.
+- Eden OutputAttrPointer/OutputAccessChain, DefineInputs, EmitGetPatch/SetPatch,
+  and EmitInvocationInfo were re-read with their header declarations. Whole-vec4
+  input gating, invocation-owned stores, generic-only patch reads and separate
+  outer/inner write indices match. TCS output count is program.invocations.
+- The opt-in offline Vulkan cache inspection test copies its input before using
+  that owner's versioned loader, then compiles native TCS using the actual Metal
+  profile. It does not change live Vulkan pipeline handling or original caches.
+
+### Unintentional differences (to fix)
+- No additional difference identified in the callable TCS slice. This does not
+  advertise live tessellation support; its missing runtime dependencies remain
+  explicit in GEOMETRY_SUPPORT.md.
+
+### Missing items
+- TES native entry, producer/consumer buffer integration, factor conversion,
+  hardware tessellator configuration and retained-resource draw submission.
+
+### Binary layout verification
+- Native GPU test in metal_shader.rs validates 2x3 invocations, distinct output
+  records, cross-invocation reads after a barrier, CBUF data and computed factors.
+  Shader-side sizeof reports 80-byte output records for the tested layout;
+  only tightly packed scalar results are read by the host.
+- Four compiler tests and the native GPU test pass. Final complete release
+  suites: shader_recompiler 571 passed; video_core 1,739 passed, three ignored;
+  no warnings. Both real cached TCS programs compile as native compute pipelines.
+
+## 2026-09-07 - Native callable TES vs Eden SPIR-V evaluation interfaces
+
+### Intentional differences
+- `emit_msl_tessellation.rs`, `msl_emit_context.rs`, `msl_function.rs`,
+  `emit_msl.rs` and `emit_msl_context_get_set.rs` keep layout, context, callable
+  interface, dispatch and opcode ownership separate. Eden has no MSL counterpart;
+  its `spirv_emit_context.{h,cpp}`, `emit_spirv_instructions.h` and
+  `emit_spirv_context_get_set.cpp` were re-read for per-vertex arrays, patch
+  variables, built-ins and output behavior. Native TES consumes the producer's
+  actual device types through templates, preserving its full stride.
+- TessCoord and PrimitiveId ignore the vertex operand exactly as Eden does.
+  Unlike Eden's disabled-subgroup zero fallback in emit_spirv_warp.cpp, this new
+  TES path rejects observable lane/subgroup operations. A lane used exclusively
+  as an ignored built-in vertex operand is elided, not replaced with a value.
+  Both captured TES programs satisfy this narrower, semantically exact condition.
+- Native hardware verification in metal_shader.rs supplies test-owned compute
+  production and a post-tessellation entry with actual Metal domain coordinates.
+  This follows Apple's compute/tessellator/post-tessellation architecture, not
+  Vulkan execution APIs. Resources stay alive through the verification readback.
+
+### Unintentional differences (to fix)
+- No new difference identified in this callable interface slice; generic patch
+  stores in TES are explicitly rejected rather than modifying read-only input.
+
+### Missing items
+- Live native tessellation pipeline/resource assembly and retained draw path;
+  capability-gated domain/spacing/winding/factor conversion; game visual/FPS gate.
+  These are prerequisites, not replaced by a fake vertex entry or dropped draw.
+
+### Binary layout verification
+- GPU test reads a later generic from the third control point when the producer
+  contains an extra unused vec4, and patch data with another unused preceding
+  vec4. Two patches retain distinct colors/identity. Zero factors discard only
+  the selected patch. This checks producer stride plus compute-to-render ordering.
+- Three TES compiler regressions cover patch/domain/index ownership, invalid
+  writes/stages and rejection of an observable lane. Final release suites:
+  shader_recompiler 574 passed; video_core 1,740 passed and three ignored; no
+  warnings. The ignored cache probe separately compiles both real TCS/TES pairs
+  with the native device profile, without touching the original cache.
+
+## 2026-09-07 - Native patch assembly and TCS runtime vs Eden tessellation stages
+
+### Intentional differences
+- `metal_primitive_assembler.rs` separates the index/restart stream from the
+  six-ordinal geometry primitive record. Patches retain their actual topology
+  and up to 32 input control points; no triangle/point reinterpretation is used.
+  GPU prefix scans compact complete patches in input order and produce both
+  dispatch and draw arguments. The patch-specific PSOs are created lazily.
+- `metal_geometry_pipeline.rs` lets the existing vertex producer consume that
+  shared stream, executing once per non-restart input entry and instance. Its
+  ordinary geometry callers keep the same command order and resource bindings.
+- New `metal_tessellation_pipeline.rs` owns native TCS compute compilation and
+  retained output/patch buffers; `renderer_metal/mod.rs` only registers it.
+  Eden's `vk_graphics_pipeline.{h,cpp}` instead configures fixed-function stages.
+  Input control-point count and output invocation count remain independent.
+  One workgroup executes one patch; instance output stride uses allocation
+  capacity, not the GPU-compacted count. No CPU count readback or wait is added.
+- Re-read Eden's `vk_graphics_pipeline.{h,cpp}`, `spirv_emit_context.{h,cpp}`,
+  `emit_spirv_context_get_set.cpp`, `emit_spirv_instructions.h` and
+  `emit_spirv_special.cpp`. Invocation-owned output stores, PatchVertices << 16,
+  generic patch variables, outer/inner indices and clip-distance initialization
+  preserve those contracts. Unlike MoltenVK's always-enabled host restart,
+  the native decoder can honor the guest restart enable/index directly.
+- `emit_msl_tessellation.rs` keeps all vertex-producer generics in the TCS
+  transport, including unread ones, and owns its input/output/patch strides.
+  `msl_emit_context.rs` now initializes each TCS invocation's declared clip
+  distances to zero, matching Eden's initialized output interface. It does not
+  invent values for unwritten tessellation factors or patch variables.
+- The opt-in cache inspection test in Vulkan's `pipeline_cache.rs` now compiles
+  the real native TCS runtime wrapper rather than a second test-only wrapper.
+  The original cache is still copied before its versioned loader is invoked.
+
+### Unintentional differences (to fix)
+- No additional difference found in this prerequisite's audit. This is not
+  evidence that the live native tessellation/render path is complete.
+
+### Missing items
+- Runtime factor conversion and native TES/render PSO, domain/spacing/winding
+  validation, conditional gating of every guest stage, stage resource binding
+  integration and the real game visual/performance gate. The live rejection
+  stays in place until the complete chain exists; see GEOMETRY_SUPPORT.md.
+
+### Binary layout verification
+- Shader-side static_assert checks all three transport strides. Native GPU
+  tests cover unread producer attributes, 32 input points with three outputs,
+  1/3/32 TCS invocations, input counts 3/32, restart-only/empty ranges, multiple
+  instances with sparse patch regions, CBUF/SSBO binding and exact side-effect
+  counts. Resources are dropped before the test-only final wait to exercise
+  command-buffer retention. Clip components not written by TCS remain zero.
+- Final complete release pass with Metal validation: shader_recompiler
+  576 passed; video_core 1,744 passed, three ignored; zero warnings/failures.
+  Both captured TCS programs compile with the actual runtime wrapper, and both
+  TES programs still compile with the native render probe. The original cache
+  SHA256 is unchanged. Logs and remaining integration gates are recorded in
+  GEOMETRY_SUPPORT.md.
+
+
+## 2026-09-07 - Native tessellation factors vs Eden execution modes and patch outputs
+
+### Intentional differences
+- `metal_tessellation_pipeline.rs` adds a GPU conversion pass from TCS f32
+  outer/inner fields to Metal triangle/quad half-factor buffers. Eden's
+  `emit_spirv.{h,cpp}` selects tessellation modes and its
+  `emit_spirv_context_get_set.cpp` writes fixed-function factor outputs instead.
+  These sources and `vk_graphics_pipeline.{h,cpp}` were re-read for output
+  count, domain, spacing, winding and the distinct outer/inner index spaces.
+- Apple Metal has no hardware isoline domain; this constructor rejects it
+  explicitly. Integer spacing clamps/ceils in f32 before half conversion.
+  Fractional spacing retains a fractional half value and preserves the even/odd
+  segment-count boundary when nearest-half rounding would cross it. Positions
+  retain native half precision, not a claim of bit-identical Maxwell coordinates.
+- Raw-bit classification preserves positive f32 subnormals before Metal's
+  floating comparisons can flush them to zero. Only nonpositive/NaN outer
+  factors discard patches; negative inner factors clamp to the mode minimum.
+  Inner NaN behavior is not asserted where the guest API leaves it unspecified.
+- `metal_device.rs` owns known family limits (Apple3/4: 16; Apple5+/Mac2: 64).
+  Unidentified profiles return None instead of guessing a device limit. The
+  converter refuses an excessive requested generation level instead of silently
+  reducing it. Integer limits may be odd; fractional limits must be even.
+- `metal_shader.rs`'s native TES raster test now consumes factors from the
+  production conversion pass, after GPU patch-data production and a buffer
+  barrier. There is no intermediate CPU readback or global wait.
+
+### Unintentional differences (to fix)
+- No new discrepancy found in factor field ordering or the tested conversion
+  contracts. Fractional-coordinate precision still needs an end-to-end hardware
+  comparison; factor-value tests alone do not validate the generated surface.
+
+### Missing items
+- Native TES/render PSO ownership and live resource-stage integration; validate
+  per-patch/per-instance factor stepping with nonzero guest baseInstance before
+  using the assembler's draw arguments. Conditional gating remains required.
+  The live tessellation rejection has not been removed.
+
+### Binary layout verification
+- GPU tests exercise 24 boundary values, triangle/quad packing, all three spacing
+  modes, producer strides with/without generic patch data, sparse instance
+  regions, and independent outer/inner components. The original failed test
+  identified positive f32 bits 0x00000001 incorrectly producing half zero; the
+  raw-bit fix passes that regression. Native raster verification discards only
+  the selected patch while retaining its neighbor's expected pixels.
+- Apple API/specification references: https://developer.apple.com/metal/capabilities/
+  and https://developer.apple.com/documentation/metal/mtltessellationpartitionmode
+  and https://docs.vulkan.org/spec/latest/chapters/tessellation.html .
+  Full-suite final-source results are recorded in GEOMETRY_SUPPORT.md.
+
+## 2026-09-07 - src/common/src/thread_worker.rs vs common/thread_worker.h
+
+### Intentional differences
+- Rust Condvar has no stop-token-aware wait equivalent to Eden's
+  condition_variable_any::wait(lock, stop_token, predicate). Drop now publishes
+  the stop predicate under queue_mutex before notifying, then releases the
+  mutex before joining workers. This prevents notification between the worker's
+  predicate check and its atomic wait/unlock; queue ordering and abandonment of
+  not-yet-started work are unchanged. No per-task lock or polling was added.
+- The regression test holds the predicate mutex across destruction on another
+  thread, and fails on the original destructor. A separate startup/drop test
+  checks that all 128 per-worker states are destroyed before their pools return.
+  These exercise Rust cancellation adaptation, not a new upstream API.
+
+### Verification scope
+- Re-read Eden's complete header (there is no thread_worker.cpp): constructor
+  loop, stop-token wait, WaitForRequests and jthread-owned teardown. Ownership
+  stays in the matching thread_worker module; no serialized payload changed.
+- The video_core suite was observed live stuck joining TextureDecoder during
+  unmap_memory_unregisters_untracks_and_deletes_image. Saved stack evidence:
+  /tmp/ruzu-tess-factors-test-sample-20260907.txt. Only that owned test process
+  was terminated after diagnosis; the user's running GUI was not touched.
+- Regression before fix: /tmp/ruzu-worker-stop-before-20260907.log, failed with
+  "stop notification bypassed the predicate mutex". Full post-fix results are
+  tracked in GEOMETRY_SUPPORT.md; this is not evidence of a game FPS improvement.
+
+## 2026-09-07 - Native patch instance addressing vs Eden graphics draw/instance ABI
+
+### Intentional differences
+- Eden vk_rasterizer.cpp forwards guest base_instance to native Draw/DrawIndexed.
+  Native Metal patch rendering instead consumes prior compute-stage outputs.
+  PerPatchAndPerInstance includes the native baseInstance in factor addressing,
+  proven by a two-patch/two-instance hardware raster test at bases zero and 11.
+  The Metal patch assembler now writes baseInstance=0 in its indirect raster
+  arguments and retains the guest base on MetalPatchAssembly. The preceding VS
+  consumes this guest base, not the rebased native value. No guest-sized prefix,
+  extra readback, CPU patch count or synchronization wait is introduced.
+- Changed code remains owned by metal_primitive_assembler.rs and its native
+  tessellation pipeline test. Eden has no corresponding Metal instance-buffer
+  transport; this is an API adaptation, not a literal Vulkan draw-argument port.
+
+### Verification scope
+- Re-read Eden vk_rasterizer.cpp/h draw ownership and
+  emit_spirv_context_get_set.cpp InstanceId/BaseInstance handling. Guest shader
+  instance semantics must remain distinct from the native buffer lookup index.
+- Hardware oracle uses nonzero factors for only patch zero in instance zero and
+  patch one in instance one; their red/green pixels distinguish both strides and
+  discard behavior. The original direct-draw contract test passes in
+  /tmp/ruzu-tess-base-instance-20260907.log with Metal API validation enabled.
+- Extended test executes real assembler-generated indirect arguments with guest
+  bases 11 and UINT32_MAX, using only two instance regions. Existing VS tests now
+  use the retained base field and still assert vertex/instance values and counts.
+  Final-source results are recorded in GEOMETRY_SUPPORT.md.
+- The four-u32 indirect layout is unchanged; its native base field is deliberately
+  zero and the former fourth assembly uniform is explicitly reserved/zeroed.
+- API: https://developer.apple.com/documentation/metal/mtltessellationfactorstepfunction/perpatchandperinstance
+  Native TES render-PSO/resource integration is still incomplete; synthetic
+  pixels do not establish correct game rendering or the >=20 FPS objective.
+
+## 2026-09-07 - Native TES render PSO vs Eden tessellation stage setup
+
+### Intentional differences
+- metal_tessellation_pipeline.rs owns MetalTessellationEvaluationPipeline,
+  wrapping the common IR's callable TES with a native post-tessellation vertex
+  entry. Eden emit_spirv.cpp sets domain/spacing/winding execution modes and
+  vk_graphics_pipeline.cpp/h owns graphics state. Metal expresses those modes
+  through patch attributes and MTLRenderPipelineDescriptor, with retained TCS
+  buffers instead of native Vulkan stage variables. No SPIR-V conversion occurs.
+- Producer declarations, including unread generic fields, are reused verbatim;
+  static assertions verify their control-point and patch strides. Three transport
+  buffer slots follow existing TES bindings without renumbering guest resources.
+  bind checks record sizes and uses capacity-based instance addressing. A positive
+  native factor stride is supplied for empty draws, where no factor is consumed.
+- The native PSO preserves attachment formats/blending, samples, alpha coverage,
+  alpha-to-one and rasterization state. With rasterization disabled, a void entry
+  still executes the callable TES and its stores; it does not omit the stage.
+
+### Verification scope
+- Re-read Eden emit_spirv.cpp/h (TCS output count; TES domain, spacing, winding)
+  and vk_graphics_pipeline.cpp/h (input patch count and raster state). API references:
+  https://developer.apple.com/documentation/metal/mtlrenderpipelinedescriptor
+  https://developer.apple.com/library/archive/documentation/Miscellaneous/Conceptual/MetalProgrammingGuide/Tessellation/Tessellation.html
+- metal_shader.rs hardware test now uses production TES PSO/binding and actual
+  assembler indirect arguments, not a hand-written TES entry. It checks CBUF,
+  SSBO atomic side effects, producer generic stride, patch generic data, patch
+  discard, empty draws, and pixels with rasterization enabled/disabled.
+- Native constructor tests compile triangle/quad, all three spacing modes, both
+  winding choices, the last valid transport binding slot, and explicit rejection
+  of an overflowing binding layout or unsupported isoline domain. Compilation
+  is not a differential oracle for fractional generated coordinates or winding.
+- renderer_vulkan/pipeline_cache.rs offline test now invokes the production TES
+  constructor on both captured game programs. Its diagnostic fragment remains
+  explicitly synthetic: this does not validate the guest fragment or framebuffer.
+- Full release suites: shader_recompiler 576 passed; video_core 1,749 passed,
+  three ignored; no warnings, Metal validation enabled. Captured TCS/TES probe
+  passes; logs and original-cache hash are recorded in GEOMETRY_SUPPORT.md.
+
+### Interrupted integration boundary
+- Live MetalGraphicsShaderStages still rejects TCS/TES. Before removing that
+  guard, add complete stage resource preparation, retained pipeline ownership,
+  conditional dispatch for VS/TCS/factors/TES, and capability-checked indirect
+  tessellation. Current synthetic and captured-compilation evidence is not a
+  live-game correctness or >=20 FPS measurement.
+
+## 2026-09-07 - Live Metal tessellation stage and draw ownership
+
+### Intentional differences
+- metal_pipeline_cache.rs now retains a tessellation stage variant and PSO cache.
+  Its counterpart is Eden vk_pipeline_cache.cpp/h CreateGraphicsPipeline: shared
+  translation and monotonically shared stage bindings are preserved. Native VS
+  and TCS compute producers precede Metal's TES patch draw; there is no SPIR-V
+  conversion. The complete shader/runtime hash distinguishes native PSOs.
+- metal_graphics_pipeline.rs prepares stages 1/2 with their own TCS/TES binding
+  layouts, alongside VS/GS/FS. Descriptor cursors, guest snapshots and rescaling
+  remain in ConfigureImpl order from vk_graphics_pipeline.cpp/h. Sampler retention
+  and render-area constants in metal_rasterizer.rs now cover all five stages.
+- metal_tessellation_pipeline.rs owns the retained VS/TCS/factor/TES chain.
+  metal_geometry_pipeline.rs exposes conditional vertex-stream recording without
+  inventing a geometry input topology. All predicate arguments are resolved before
+  guest shader execution; shader stores cannot change the decision midway through
+  a draw. The native implementation needs distinct compute dispatches where Eden
+  uses one conditional native draw. No global wait or CPU factor/count readback.
+- metal_rasterizer.rs shares decoded vertex/index preparation between geometry
+  and tessellation. Patch input uses fixed input control-point count; native TES
+  consumes the TCS output count. These are distinct contracts in Eden's fixed
+  pipeline state and emit_spirv.cpp. Native patch arguments keep baseInstance zero,
+  with the guest base retained separately for VS fetch/instance semantics.
+- metal_device.rs checks indirect tessellation independently from basic support
+  (Apple5+/Mac2). Older basic-tessellation-only profiles are not advertised as
+  supporting this indirect implementation. This follows Apple's feature tables.
+
+### Verification scope
+- Re-read vk_pipeline_cache.cpp/h, vk_graphics_pipeline.cpp/h, vk_rasterizer.cpp/h
+  and emit_spirv.cpp/h. Compared stage enumeration, previous-stage runtime data,
+  descriptor preparation, patch-list selection, input/output control-point counts
+  and domain/spacing/winding ownership against the native implementation.
+- Complete-chain GPU test executes real common-IR VS/TCS/TES and native raster
+  output for enabled/disabled/inverted conditions. VS overwrites the predicate;
+  VS/TCS/TES side-effect counters and pixels still follow its initial value.
+  Two instances and guest base 19 are included. Original indirect args remain intact.
+- The ignored Vulkan-environment probe also invokes the Metal cache's production
+  builder and full retained tessellation PSO, using actual captured VS and FS,
+  shared resource indices and serialized attachment formats. Both captured
+  pipelines compile and reuse the same cached PSO. This is not a rendered replay;
+  a Vulkan disk key may omit dynamic vertex state.
+- Final release suites: shader_recompiler 576 passed; video_core 1,750 passed,
+  three ignored. Metal API validation enabled, no warnings. Separate captured
+  environment probe passed; source-cache hash unchanged. See GEOMETRY_SUPPORT.md
+  for logs and the remaining runtime gate.
+
+### Interrupted validation boundary
+- Live-game pixels and performance are not yet measured with this implementation.
+  Indirect guest patch input, TES-to-GS chaining, incomplete TCS/TES pairs and
+  isolines still return explicit errors, not fabricated output or omitted stages.
+  The two captured pipelines are direct-input triangle TCS/TES pairs. Fractional
+  coordinate/winding equivalence still needs a differential runtime oracle.
+
+## 2026-09-07 - Metal TES winding vs Eden/Vulkan upper-left domain
+
+### Intentional differences
+- metal_tessellation_pipeline.rs converts guest CW to native CounterClockwise
+  and guest CCW to native Clockwise. Eden emit_spirv.cpp/h forwards the guest
+  execution mode; vk_graphics_pipeline.cpp/h leaves the Vulkan tessellation
+  domain at its default upper-left origin. Metal uses the opposite orientation
+  convention. This is an API boundary conversion, not a guest state change or
+  a per-title override. Viewport and rasterizer front-face settings are unchanged.
+
+### Verified defect and regression scope
+- The previous literal CW-to-CW mapping fails the new hardware oracle:
+  evaluation_winding_matches_upper_left_domain_triangles. Three interior pixels
+  reported back-facing green rather than the explicit reference's front-facing
+  red for a CCW guest triangle. See /tmp/ruzu-tess-winding-before-20260907.log.
+- The reference supplies explicit (u,v) triangles with positive signed area for
+  CW, as specified for Vulkan's upper-left domain. Production callable TES,
+  factor conversion and indirect patch draw are compared against that reference
+  under identical viewport, native front-face and cull state. No dependency on a
+  SPIR-V conversion was added. Test coverage includes triangles/quads, both guest
+  orders, both native front-face settings, no/front/back culling, all three
+  spacing modes and levels 1, 2.25, 3.5. Final results go in GEOMETRY_SUPPORT.md.
+- Cross-check: MoltenVK mvk_datatypes.mm::mvkMTLWindingFromSpvExecutionModeInObj
+  performs the same inversion; MVKPipeline.mm reverses it for an explicitly
+  lower-left domain. Eden does not request that lower-left override.
+- Sources: https://docs.vulkan.org/spec/latest/chapters/tessellation.html#tessellation-winding
+  and https://github.com/KhronosGroup/MoltenVK/blob/main/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.mm
+  (read-only inspection, no installed library changes).
+
+### Remaining verification
+- Planar coverage/front-facing comparisons do not verify every fractional
+  tessellation coordinate or implementation-dependent interior triangulation.
+  Live-game rendering and performance still require the new GUI run.
+
+## 2026-09-07 - GUI input-session response and performance diagnostics
+
+### Intentional differences
+- src/ruzu/src/input_session.rs and tools/capture_harness/gui_control.py are
+  opt-in local test tooling, not an Eden frontend port. The Darwin Python bind
+  address now includes its terminating NUL so Rust receives the full peer path.
+  Reply errors are logged; no guessed destination or automatic input retry.
+- src/ruzu/src/main_window.rs exposes EmulationSession::perf_stats through that
+  diagnostic status command. Rechecked Eden main_window.h/.cpp UpdateStatusBar:
+  the same average_game_fps/system_fps/frametime values are used. Rust reads the
+  existing copied GUI sample, never calls GetAndResetPerfStats a second time.
+
+### Verification
+- Four focused input-session tests pass, including real Unix datagram round-trip
+  and button-release lifecycle. Standalone Python/Rust interop fails without
+  the Darwin NUL and succeeds with it. Live monitored navigation reached the
+  lobby; rendering/performance evidence and remaining gates in GEOMETRY_SUPPORT.md.
+- Added Python client regression tests for Darwin's explicit terminator and
+  unchanged Linux pathname addressing; both pass. The second GUI run verifies
+  real client/server responses, navigation and captures. It measures ~7.95 FPS
+  in the lobby; no performance-completion claim. No backend code changed during
+  this diagnostic follow-up, and full GUI tests were not rerun.
+
+## 2026-09-07 — Native Metal UInt8 conversion reuse
+
+Compared `renderer_metal/metal_buffer_cache.rs` with Eden's
+`renderer_vulkan/vk_buffer_cache.{h,cpp}` (Buffer, BindIndexBuffer),
+`metal_compute_pass.rs` with `vk_compute_pass.{h,cpp}` (Uint8Pass::Assemble),
+and `metal_query_cache.rs` with `vk_query_cache.{h,cpp}` (SyncValues).
+`metal_buffer.rs` owns the native allocation's invalidation metadata.
+
+### Intentional differences
+- Metal caches UInt8-to-UInt16 outputs in the owning backend Buffer; Eden's
+  unsupported-UInt8 path converts through staging on each bind. The native
+  optimization avoids compute encoders and render-pass exits on reuse, without
+  changing the conversion kernel, restart values, dispatch ordering or barriers.
+- Only sources with common-cache write_tick == 0 are eligible. Shader-writable
+  sources always reconvert, since a scheduler tick cannot distinguish multiple
+  writes. CPU writes and encoded copies advance an allocation generation;
+  SyncValues explicitly advances it for native blits bypassing encode_copy.
+  Saturation disables reuse rather than wrapping to an old generation.
+- Cached outputs own private Metal allocations, not staging leases. The cache
+  is bounded globally to 16 MiB of logical payload and 4096 entries; native
+  allocation overhead and resources retained by in-flight command buffers are
+  additional. Invalidations/source destruction release cache ownership and
+  update logical memory accounting. Standard retained-reference command buffers
+  preserve encoded consumers. Capacity exhaustion uses the existing conversion.
+- AssembleInto mechanically shares the existing conversion with both output
+  ownership paths. No serialized or externally shared struct layout changes.
+
+### Verification
+- Re-read upstream interfaces and implementations; upstream query uploads use
+  ObtainCPUBuffer with DoNothing, hence cannot rely on common write_tick alone.
+- Metal API validation: full release video_core suite passes (1756 passed,
+  3 ignored). Tests cover reuse with no recorded work, CPU/native-copy/query
+  invalidation, multiple writes in one tick, retained prior outputs, exclusion
+  of GPU-written buffers, generation saturation and capacity fallback.
+- Live performance/rendering validation is pending; this does not establish
+  that repeated eligible UInt8 sources account for the measured encoder count.
+- First runtime attempt exceeded the unchanged 10 GiB footprint safety limit;
+  no completed visual/FPS validation. Added opt-in once-per-second cache hit and
+  allocation diagnostics using the existing submission-profile switch. Detailed
+  evidence and pending memory investigation are in GEOMETRY_SUPPORT.md.
+
+### Index-origin prerequisite discovered during live validation
+- Rechecked Eden BindHostIndexBuffer, BindIndexBuffer and MakeDrawParams:
+  the common-cache argument named base_vertex actually carries index.first,
+  and the rasterizer keeps that first_index in the draw. Metal's converted
+  output must retain the original index origin. Convert first + count rather
+  than count alone; otherwise a nonzero first reads beyond the converted data.
+- This deliberately differs from Eden's Uint8 fallback (which also requests
+  count only), not from Maxwell index semantics. Native UInt16/UInt32 paths,
+  quad conversion, base-vertex arithmetic and the draw's first_index stay
+  unchanged. Overflow is reported explicitly, not clamped or wrapped into a
+  short output. A new test checks nonzero source offset plus first_index,
+  restart conversion and both cached/noncacheable sources.
+- MetalScheduler now retains the driver's error description in its existing
+  error result; detection, propagation and command lifetime are unchanged.
+  This is native diagnostic detail, not Vulkan scheduler ownership migration.
+- Full release video_core tests after the index-origin fix: 1757 passed,
+  3 ignored with Metal API validation. Live validation stops earlier on a
+  float/stencil binding mismatch; details in GEOMETRY_SUPPORT.md. Added a
+  one-shot API-validation-only diagnostic in metal_graphics_pipeline.rs,
+  corresponding to PushImageDescriptors resource preparation. It logs the
+  offending descriptor/view without changing binding or draw semantics.
+- Live capture confirms the mismatch is a real RRRR stencil view of
+  S8UintD24Unorm, not a guessed binding. Shared shader metadata currently loses
+  the selected aspect's integer classification; Eden's combined-format test
+  has the same limitation. The native MSL numeric-type prerequisite and cache
+  compatibility constraints are recorded in GEOMETRY_SUPPORT.md; no unverified
+  aspect substitution or shader-type change was applied.
+- Final snapshot including diagnostics: full release video_core suite passes
+  1757 tests, 3 ignored, with Metal API validation and no compiler warnings.
+  Live validation remains blocked by the recorded stencil contract, not covered
+  by those existing tests. git diff --check passes; bundled MoltenVK unchanged.
+
+## 2026-09-07 - Sampled depth/stencil numeric metadata
+
+### Intentional differences
+- `shader_environment.rs` vs Eden `shader_environment.h/.cpp`: re-read
+  ConvertTexturePixelFormat, Graphics/Compute/FileEnvironment and compared
+  Eden `vk_texture_cache.cpp::ImageViewAspectMask`. Shader metadata now describes
+  the selected aspect: S8/D24 R is uint stencil, G is depth; D24/S8 and
+  D32/S8 reverse that selection. Image storage and render-target formats do
+  not change. Eden's combined-format metadata loses this distinction, which
+  native Metal rejects when a float MSL resource binds X32_Stencil8.
+- `surface.rs` includes unsigned S8 in integer classification and 8-bit
+  component width. The shared environment uses the same unsigned contract.
+- Metal, Vulkan and OpenGL cache loaders consume the key but defer prebuilding
+  legacy combined-format environments, whose serialized metadata lacks TIC
+  swizzles. Live translation uses the actual TIC; no draw is skipped and no
+  cache file is deleted or rewritten. The file/enum layouts remain unchanged.
+- Native graphics/compute sampler selection prioritizes integer nearest
+  filtering over the default-anisotropy fallback, which can retain linear
+  filtering. The nearest variant also disables anisotropy.
+
+### Verification
+- Added real TIC/swizzle classification coverage for all three combined formats
+  and a cache-load regression proving legacy/new records remain byte-identical.
+- Native direct-IR-to-MSL GPU test samples stencil values 0, 1, 128, 255 and
+  depth 0.25, checking RGBA8 readback under Metal API validation. Integer raw
+  return bits are converted through the shader IR, not normalized implicitly.
+- Full release video_core suite: 1760 passed, 3 ignored. Final sampler-order
+  rebuild and live validation are in progress; this does not establish FPS gains.
+
+## 2026-09-07 - metal_buffer_cache.rs null constant allocation
+
+### Intentional differences
+- Compared Eden vk_buffer_cache.h/.cpp Buffer(null), CreateNullBuffer and
+  ReserveNullBuffer with the native common-cache Buffer and runtime fallback.
+  Eden's four-byte reserved index/vertex allocation does not satisfy Metal's
+  constant uint4 pointer contract. The native null allocations use the existing
+  Maxwell MAX_CONST_BUFFER_SIZE constant and explicit zero initialization, also
+  covering indirect constant reads. No valid guest buffers are substituted.
+- Metadata layout, guest addresses, lifetime ownership and command ordering
+  remain unchanged. The zero initialization occurs before exposing the handle.
+
+### Verification
+- Validation run G exposed a four-byte c0 binding vs required 16-byte vector
+  at 28 seconds, after the stencil fix passed its previous failure point.
+- New GPU regression exercises runtime BindComputeUniformBuffer with a null
+  Buffer and the separate fallback, reading first/last uint4 into a result
+  initialized to nonzero. Full suite/rebuild/live recheck pending.
+- Additional local correction after comparing BindHostComputeUniformBuffers
+  in Eden buffer_cache.h and the shared runtime queue in vk_buffer_cache:
+  native WithMappedUniformBuffer now follows BindingTarget for compute vs
+  graphics. Previously all aligned stream copies went into graphics UBOs,
+  leaving compute descriptors short and eligible for null fallback. Added
+  mapped/direct/mapped order and target-isolation regression. The common-cache
+  iteration and binding-index semantics are not changed.
+- Final verification: full release video_core 1762 passed, 3 ignored with
+  Metal API validation; no warnings. GUI build/bundle succeeded. Run H reached
+  Lobby gameplay under validation without the stencil or short-CBUF assertion;
+  run I reached the same scene without validation and measured 7.9165 median
+  FPS vs 7.947 baseline. No material performance gain claimed. Both instances
+  exited normally and neither saturated memory/swap/disk. Details, raw logs
+  and remaining geometry/performance scope are in GEOMETRY_SUPPORT.md.
+
+## 2026-09-07 - Native sampled render-pass attribution
+
+### Intentional differences
+- metal_gpu_profiler.rs has no Eden counterpart: native timestamp attachments
+  now retain bounded scalar metadata (shader hashes, draw count, texture storage
+  extent/format) for sampled render passes. At most eight ranked passes are
+  logged per completed sampled batch, at the existing one-batch/second cadence.
+- metal_scheduler.rs / metal_rasterizer.rs vs Eden vk_scheduler.h/.cpp and
+  vk_rasterizer.h/.cpp: inspected Draw and RequestRenderpass again. Attribution
+  runs after native pass selection; it does not split/reorder encoders, alter
+  draw execution, retain GPU resources or introduce waits. Shared passes report
+  first/last shader identities and whether other identities were present.
+- Ranking adds vertex/fragment raw ticks only for diagnostic selection, not
+  wall-time or utilization. Rotating partial-window coverage remains explicit.
+
+### Verification
+- Added bounded-metadata, mixed-shader, compute-transition and lease-reset
+  regression. Full release tests/build and live attribution are in progress.
+- Verified full release video_core: 1763 passed / 3 ignored, no warnings;
+  GUI build and bundle successful. Run J reaches the same Lobby with 7.9389
+  median FPS, no saturation and a normal exit. Scalar attribution identifies
+  actual fullscreen and mixed geometry pass shaders, but exact tick comparison
+  exposes insufficient coverage of long batches. No root-cause or FPS-gain
+  claim; full-batch counter coverage is the next prerequisite, documented in
+  GEOMETRY_SUPPORT.md along with logs and the Apple timestamp-clock contract.
+
+## 2026-09-07 - Native whole-batch counter coverage
+
+### Intentional differences
+- metal_gpu_profiler.rs: sixteen fixed 1024-sample pages replace rotating
+  partial windows. Each page remains 8 KiB; the entire 128-KiB cohort has one
+  in-flight lease. Render timestamp groups never straddle pages. Exhaustion
+  remains explicit, and missing/short resolve data is invalid, not zero timing.
+- Calibration samples paired CPU/GPU clocks before/after the batch, following
+  Apple's Converting GPU timestamps into CPU time. CPU values from this API
+  are already nanoseconds. Interval union avoids double-counting overlapping
+  stages and reports the largest gap, total span and stage sums separately.
+- metal_scheduler.rs: rechecked completion ordering and Eden vk_scheduler
+  header/implementation. Acquire before the first encoder (including uploads),
+  not halfway through a batch. Completion supplies the same command buffer's
+  GPU duration; no added wait or scheduling change. Cadence is >=1 second with
+  a small deterministic phase variation to avoid repeating one frame phase.
+
+### Verification
+- Native two-page blit/readback test, encoder-boundary padding, total capacity,
+  single in-flight lease, calibrated clock edge cases and overlapping interval
+  union tests. Scheduler test now covers the upload prefix in the same sampled
+  batch and refuses a second lease while the first remains in flight.
+- Full release video_core: 1763 passed, 3 ignored under Metal validation;
+  GUI build/bundle successful, no warnings. Run K: same Lobby, 7.93854 median
+  FPS, normal exit without memory/disk saturation. Wall-clock-only selection
+  is biased toward tiny transfer batches; no expensive-batch conclusion yet.
+- Re-read Eden vk_scheduler.h/.cpp: diagnostic selection remains native Metal
+  only, with no change to Flush/Finish ordering or resource completion. Added
+  rotating eligible-batch ordinal and a test for in-flight exclusion to avoid
+  repeatedly measuring the first transfer after a recording pause. Validation
+  of that refinement is pending; details and invalidated assumptions remain in
+  GEOMETRY_SUPPORT.md.
+
+### Follow-up validation
+- Batch-ordinal refinement: 1764 release video_core tests passed, 3 ignored
+  under Metal API validation; GUI build/bundle successful without warnings.
+- Run L reaches full large-batch coverage, but a GPU recovery during loading
+  invalidates its subsequent black images and timing data. Not a validated
+  performance improvement or a proven instrumentation regression. Control
+  without stage counters is in progress; GEOMETRY_SUPPORT.md retains evidence.
+- Controls completed: run M without stage counters and run N with counters
+  both show the same Lobby, ~7.91 median FPS and no GPU errors. Six valid
+  complete large batches now expose ~37 ms outside stage intervals per
+  ~125-ms batch. Conditional-argument masking accounts for 534 render breaks
+  in one measured batch. No rendering optimization applied or speedup claimed;
+  follow-up must preserve guest predicate/resource ordering. Full measurements,
+  limits and the invalid run L are retained in GEOMETRY_SUPPORT.md.
+
+## 2026-09-07 - Native conditional direct-argument groups
+
+### Intentional differences
+- metal_compute_pass.rs vs Eden vk_compute_pass.h/.cpp and vk_query_cache.h/.cpp:
+  Eden uses a conditional-rendering region after predicate resolution. Native
+  Metal uses GPU-masked indirect records instead. Group up to 64 CPU-defined
+  direct records under one private resolved predicate; mask remains GPU-side.
+  Native helper/state stays in the compute-pass counterpart, not the dispatcher.
+- metal_query_cache.rs identifies its private resolve buffer separately from
+  guest-addressable predicate buffers. Only the former permits grouping: guest
+  shaders cannot change it. Generic predicates and GPU-generated indirect
+  arguments retain the previous ordered path, including tessellation/geometry.
+- metal_scheduler.rs supplies a submission/non-render-work token. Every compute
+  or blit call changes it, even when reusing an encoder; a new submission also
+  changes it. Private predicate producers therefore end an old group. No added
+  waits, CPU predicate readback, or movement across GPU producers.
+- metal_rasterizer.rs snapshots each direct draw's five words while recording.
+  Later words may fill the same upload page only before its submission. This
+  follows Apple's CPU/GPU resource synchronization contract, not Vulkan-specific
+  barriers: https://developer.apple.com/documentation/metal/synchronizing-cpu-and-gpu-work
+
+### Binary layout verification
+- Records contain five initialized u32 words (20 bytes). Indexed draws consume
+  all five; nonindexed draws consume their 16-byte prefix. Both layouts disable
+  instance count in word 1, preserving signed base-vertex bits and base instance.
+  Unused records start zeroed and have no draw consumer. GPU output remains
+  separate from CPU sources and guest argument buffers.
+
+### Verification
+- Re-read the upstream conditional resolve and region implementations and
+  scheduler submission contracts. Added native GPU regressions for vertex side
+  effects/IDs with GPU-written predicates, capacity rollover, submission,
+  guest-addressable exclusion and reused-encoder invalidation. Release full
+  video_core: 1767 passed, 3 ignored under Metal API validation. GUI release
+  build/bundle successful without warnings. With the additional isolated
+  key-change test (identity/offset/inversion without a producer between draws),
+  the full release library suite passes 1768 tests, 3 ignored, under Metal API
+  validation with no warnings. Different private buffers hold opposite values,
+  and GPU-readback assertions verify each expected masked record explicitly.
+- Final `cargo test -p video_core --release` also passes under Metal API
+  validation: 1768 passed, 3 ignored; doc-tests pass (0 tests), no warnings.
+- Run O confirms the same Lobby at 10.85697 median FPS, versus 7.91063 before
+  grouping; no GPU errors or panic. Conditional-argument render breaks fall
+  from 534 to 0 in comparable measured batches. Native stage costs, capture,
+  resource limits and validation scope are recorded in GEOMETRY_SUPPORT.md.
+  A fresh control without stage counters suffered a GPU progress timeout
+  during loading and rendered black afterward, similar to pre-optimization
+  run L. Its FPS are not comparable to correct gameplay; the optimization is
+  not stable across all launches. A second control without stage counters
+  reached the same Lobby correctly at 10.87932 median FPS, with no GPU errors
+  or resource saturation. Two successful runs reproduce the speedup; the
+  intermittent timeout, >=20 FPS goal and other title regressions remain
+  unresolved. GEOMETRY_SUPPORT.md retains all three outcomes.
+
+## 2026-09-07 - Metal index conversion attribution
+
+### Intentional differences
+- metal_gpu_profiler.rs distinguishes Uint8Pass expansion from QuadIndexedPass
+  topology conversion. These are native diagnostic counters, enabled only by
+  the existing stage profiler, not shader state or scheduling policy.
+- metal_compute_pass.rs vs Eden vk_compute_pass.h/.cpp: re-read both Assemble
+  implementations; only the quad diagnostic tag changes. Allocation, producer
+  ordering, dispatch and visibility semantics remain unchanged.
+
+### Verification
+- Counter regression independently checks call/break counts for both paths.
+  Full release tests pass (1768 passed, 3 ignored, doc-tests pass), GUI release
+  rebuild/bundle succeeds without warnings. Run R confirms 268 UInt8 conversions
+  and 255 breaks, versus zero quad conversions in a complete Lobby batch.
+
+## 2026-09-07 - Buffer write notifications for native derived-index lifetime
+
+### Intentional differences
+- buffer_cache/buffer_cache_base.rs vs Eden buffer_cache/buffer_base.h and
+  buffer_cache.h: expose set_write_tick through the Rust backend-buffer trait.
+  Its default forwards to BufferBase unchanged; MarkWrittenBuffer keeps its
+  original call edge/order and write-tick value for non-OpenGL backends.
+- renderer_metal/metal_buffer_cache.rs overrides that notification to advance
+  its allocation content generation on every declared GPU write, including
+  multiple writes in the same tick. CPU writes and native copies already use
+  the same invalidation. Native derived UInt8 indices may then be reused until
+  the next generation, rather than permanently excluding every allocation
+  which has ever had a GPU write. Cache allocation limits remain unchanged.
+- Metal has no native uint8 index type. This derived cache has no Eden Vulkan
+  equivalent; it preserves GPU conversion/producer order without readbacks or
+  waits. Whole-allocation invalidation deliberately remains conservative.
+
+### Verification
+- Re-read Eden MarkWrittenBuffer, BufferBase::setWriteTick, Uint8Pass::Assemble
+  and BindHostIndexBuffer. Graphics/compute writable SSBOs, image buffers,
+  transform feedback and ObtainCPUBuffer(MarkAsWritten) reach the existing
+  declaration edge before GPU work. Graphics index preparation precedes writable
+  stage-buffer declarations, so a draw's write invalidates earlier conversions.
+- Native generic-call regression proves that two common-cache MarkAsWritten
+  operations in one tick advance Metal generations twice while preserving the
+  base tick. Focused release test passed with Metal API validation before the
+  reuse policy was changed.
+- Added default-backend setter semantics and actual compute-write/conversion
+  interleaving tests, preserving old outputs and restart values with one final
+  submission. Full release crate suite passes 1770 tests, 3 ignored, doc-tests
+  pass under Metal API validation, without warnings. Live correctness and
+  performance verification of the broader reuse remain pending.
+
+## 2026-09-07 - Native Metal command-lifecycle diagnostics
+
+### Intentional differences
+- renderer_metal/metal_command_journal.rs is a Metal-specific diagnostic owner,
+  not a port of Eden's Vulkan implementation. Re-read gpu_logging/gpu_logging.h
+  and .cpp (GPULogger/WriteToLog) and vk_scheduler.h/.cpp (Flush/Finish/WaitWorker).
+  Eden supplies optional GPU API logging, but no native Metal allocation or
+  completion-callback lifecycle. A bounded fixed-record file records events
+  before potentially blocking driver calls rather than requiring a subsequent
+  successful GPU poll or a crash handler to save the evidence.
+- metal_scheduler.rs keeps existing begin/commit/finish ownership and submission
+  order. Only the opt-in journal adds file writes and a completion handler.
+  The handler captures a file-owner Arc plus scalar identity, never a retained
+  command buffer, renderer or scheduler; no retain cycle is introduced.
+- No queue limits, barriers, waits, guest resources or error behavior change.
+  Diagnostics are disabled without RUZU_METAL_COMMAND_JOURNAL. Enabled file I/O
+  affects timing and cannot be used as a performance baseline.
+
+### Verification
+- Re-read native scheduler and Apple's SDK MTLCommandQueue/MTLCommandBuffer
+  headers: ordinary command buffers retain resources; completed handlers receive
+  a live command buffer. Both common and synchronous commits install the handler
+  before commit, without holding the file lock across any Metal call.
+- New file creation refuses overwrite, disk allocation is bounded to 4 MiB,
+  ring wrap and cross-thread journal ownership are tested without Metal execution.
+  Four focused CPU tests pass in release; all video_core test code compiles
+  without warnings. Full GPU tests/live runs are suspended after the WindowServer
+  watchdog panic. This is diagnostic infrastructure, NOT a validated hang fix.
+- No guest binary layouts change. The journal's 512-byte ASCII records are an
+  internal diagnostic format; recent writes are not guaranteed durable across
+  kernel panic and must not be interpreted as a complete execution history.
+
+## 2026-09-07 - metal_buffer.rs: native allocation limit validation
+
+### Intentional differences
+- Eden renderer_vulkan/vk_buffer_cache.h/.cpp delegates native allocation through
+  CreateBuffer and MemoryAllocator; it has no Metal counterpart. Native Metal's
+  allocation owner remains metal_buffer.rs. Before the driver call, validate
+  the requested native size against MetalDeviceProfile.max_buffer_length, which
+  is already queried from MTLDevice.maxBufferLength. This is device-specific
+  validation rather than a Vulkan size limit copied into Metal.
+- Requests beyond the device limit now return AllocationTooLarge explicitly,
+  without invoking the driver or truncating requested storage. The existing
+  four-byte minimum/null storage, resource options and ordinary allocation
+  failure path are preserved. No scheduler or guest layout changes.
+
+### Verification
+- Re-read Eden Buffer constructors/CreateBuffer, native Metal allocation code,
+  and Apple MTLDevice headers/documentation. Apple's maxBufferLength describes
+  the largest allocation supported for a single buffer; the cached value is
+  queried from the actual device, not a guessed family constant.
+- Added a CPU-only boundary test including exact-capacity acceptance, rejection
+  one byte above capacity, usize::MAX without wrap and minimum null storage.
+  Runtime validation remains separate from the unresolved WindowServer incident;
+  there is no evidence that an oversized allocation triggered that incident.
+- The focused CPU-only test passes in release without warnings. Full test-target
+  compilation succeeds; GPU tests were not run after the system watchdog panic.
+
+## 2026-09-07 - Metal command workload journal vs renderer_vulkan/vk_scheduler.h/.cpp
+
+### Intentional differences
+- Native Metal diagnostics have no literal Eden equivalent. CommandWorkload lives
+  in metal_command_journal.rs; metal_scheduler.rs owns its lifetime alongside the
+  active guest command buffer. Re-read Eden Record/Flush/Finish and the Rust
+  recording/commit paths: no emulation ordering, waits or resource ownership changed.
+- Opt-in summaries record blit/compute helper-call counts and observed draw count,
+  plus first/last six-stage shader hashes. Compute categories reuse the existing
+  metal_gpu_profiler.rs enum and its count constant, rather than duplicating a map.
+- Counts saturate. At flush, at most two fixed-size records identify the actual
+  native buffer and prospective submission tick. No per-draw file I/O or resource
+  retention is added. Disabled journaling does not allocate a workload summary.
+
+### Verification and limits
+- CPU-only release journal tests pass: 6 passed, 1774 filtered out, no warnings.
+  Tests cover counters, summary reset, saturation and maximum-width records, in
+  addition to ring bounds, overwrite protection and callback-owner lifetime.
+- Re-read native wiring: presentation/external commits do not consume the active
+  guest summary; Finish flushes the guest lot before its caller-owned command.
+- Summaries describe recording, not successful execution. Helper counts are not
+  kernel dispatch counts, first/last hashes omit intermediate shader sets, and
+  caller-owned command buffers have no work summary. Ring eviction still applies.
+  The new workload wiring has not yet been exercised on the live GPU. Full GPU
+  tests are deferred after the WindowServer panic; this slice is not a claim of
+  full-crate or application stability.
+
+## 2026-09-07 - metal_primitive_assembler.rs identity restart-prefix scan
+
+### Intentional differences
+- Eden uses native primitive assembly on its supported graphics backends; its
+  vk_compute_pass.h/.cpp Uint8Pass/QuadIndexedPass are not a general Metal GS
+  assembler. Re-read those interfaces/implementations and the native Metal
+  input-stream, parameter-packing and prefix kernels. This remains an explicit
+  Metal-owned adaptation, not a moved or simplified Eden method.
+- record_input_stream omits the segment prefix only when the actual packed
+  restart-enabled word is zero. assembly_initialize then writes uint2(0) for
+  every segment, and the max/sum reduction has zero as identity. Array draws
+  already pack restart disabled, even when the guest register holds an index.
+- All initialization, validation, index/base-vertex bit patterns, enabled-restart
+  scans, primitive counts, emission and caller interfaces remain unchanged. No
+  resource layout, lifetime, synchronization or shader-source change is required.
+
+### Verification
+- Eight focused native assembler tests pass in release without warnings.
+  New coverage checks empty/single/multigroup inputs, arrays and every index
+  width, disabled/enabled restart, resulting vertex/segment data and elimination
+  of scan recording only in the identity case. Existing topology/adjacency,
+  multilevel restart, patch, provoking-vertex and raster-output tests also pass.
+- Full video_core release tests with Metal API validation are running separately.
+  No live FPS gain is claimed before rebuilding and repeating the same lobby.
+
+Follow-up verification: `cargo test -p video_core --release -- --test-threads=1`
+with MTL_DEBUG_LAYER=1 passes 1778 tests, 3 ignored, plus doc-tests (0). Native
+validation activation is present in the log, with no compiler warnings or test
+failures. The focused eight-test run and full-suite log are preserved under
+../ruzu-diagnostics/lm3-lobby-20260907.QL1ZZo/. GUI rebuild is in progress;
+game performance has not been remeasured with the identity-scan change.
+
+## 2026-09-07 - metal_staging_buffer_pool.rs / metal_buffer_cache.rs vs vk_staging_buffer_pool / vk_buffer_cache
+
+### Intentional differences
+- Re-read both Eden .h/.cpp pairs. StreamBuf remains owned by the staging pool;
+  the Rust getter borrows its Arc allocation instead of returning a VkBuffer.
+  Identity uses Arc::ptr_eq; small uploads share the stream, deferred uploads
+  do not. No allocation, mapping, reuse or retirement policy changes.
+- Metal CopyBufferFromStaging tags eligible prefix candidates using the same
+  stream identity plus CanReorderUpload result as Eden CopyBuffer. Recording
+  stays inline; this diagnostic is not the missing upload-prefix implementation.
+- Metal GPU profiler adds a separate render-break category, not a compute call
+  for the blit. The optional bounded command journal adapts its fixed arrays.
+  These native diagnostics have no Eden counterpart and change no guest layout.
+
+### Missing prerequisite
+- Eden RecordWithUploadBuffer has separate upload/render recording with shared
+  submission lifetime. Metal needs a native cohort equivalent before hoisting
+  copies. Work on that slice is stopped in METAL_UPLOAD_PREFIX_STATE.md rather
+  than adding an independent upload tick that could free staging too early.
+
+### Verification
+- Added stream/dedicated identity checks and render-break category isolation.
+  Full video_core release tests with Metal validation are running. Runtime
+  attribution is not measured yet and no FPS improvement is claimed.
+
+Full release verification completed with Metal API validation: 1778 passed,
+3 ignored, doc-tests pass (0), no compiler warnings. Log retained in
+../ruzu-diagnostics/lm3-eligible-20260907.dhgwvK/tests.log. The native getter
+identity and profiler category checks pass along with journal record-size tests.
+
+Runtime follow-up: completed bounded release GUI lobby run. EligibleUpload is
+11.81% of counted render breaks in ten sampled large batches, not all generic
+breaks and not a measured time share. Copies remain inline. GEOMETRY_SUPPORT.md
+and METAL_UPLOAD_PREFIX_STATE.md retain the evidence and prerequisite gates.
+Also re-read Eden Buffer::MarkUsage/LastUsageTick/ResetUsageTracking and runtime
+TickFrame: both backends reset usage only after its submission completes. The
+native current_tick is therefore part of the required prefix cohort contract,
+not a safe place to introduce an independent early-retirement upload tick.
+
+## 2026-09-07 - metal_scheduler.rs / metal_gpu_profiler.rs render-end attribution
+
+### Intentional differences
+- Re-read Eden vk_scheduler.h/.cpp RequestOutsideRenderPassOperationContext,
+  EndRenderPass, RequestRenderpass and submission ordering. Metal keeps its
+  native encoder ownership; no Vulkan barrier/query implementation is moved.
+- A bounded per-sampled-batch source-site counter lives in the native profiler.
+  Rust track_caller propagates the requesting source site through mechanical
+  scheduler wrappers to end_active_encoder. Only an actual Render encoder end
+  is counted, including attachment changes and flush, unlike the narrower
+  compute/explicit-context break categories. No backtrace or per-draw log.
+- At most 64 distinct file/line/column sites are retained; excess events have
+  an explicit omitted count. Entries reset with the existing profiling cohort.
+  The disabled path creates no site collection. Guest state, binary layouts,
+  encoder reuse, ordering, and completion ticks remain unchanged.
+
+### Verification
+- Added bounded-site/overflow/duplicate coverage and extended native scheduler
+  tests to check that context exit followed by compute encoder reuse counts one
+  render end. Full release video_core tests with Metal validation are running.
+  Runtime caller attribution and any resulting optimization remain unverified.
+
+Full release video_core verification with Metal validation passes 1779 tests,
+3 ignored, doc-tests pass (0). No compiler warnings. The new source attribution
+does not replace narrower category counts: render-pass replacement and flush
+also end encoders, so totals deliberately measure different scopes.
+
+## 2026-09-07 - metal_staging_buffer_pool.rs capacity attribution vs vk_staging_buffer_pool.h/.cpp
+
+### Intentional differences
+- Re-read Eden StagingBufferPool cached-entry ownership, Request, FreeDeferred,
+  GetCache and ReleaseLevel. The new native-only capacity snapshot stays with
+  this owner and reads existing cache entries without changing their lifetimes.
+- Reports upload/download/device-local buffer capacity, reusable bytes at an
+  already observed tick, and explicitly deferred capacity. Stream capacity is
+  separate. These quantities are not Metal resident size or process footprint;
+  other renderer allocations are intentionally outside this owner's scope.
+- Existing once-per-second gated buffer-cache diagnostic consumes this snapshot;
+  disabled profiling performs no scan. No polling, GPU waits, new allocation
+  cache, eviction policy change or guest-visible capability is introduced.
+
+### Verification
+- New test distinguishes pending/reusable/deferred capacity, excludes the stream,
+  verifies explicit deferred release and confirms the query does not advance
+  scheduler completion. Full release video_core validation tests are running.
+- Runtime source-site run was stopped by its memory guard before the hall;
+  GEOMETRY_SUPPORT.md records the missing visual/performance evidence. Staging
+  capacity attribution is not yet exercised in the game.
+
+Verification completed: full video_core release suite passes 1780 tests,
+3 ignored, doc-tests 0 with Metal API validation enabled and no compiler
+warnings. The new staging snapshot regression passes. No GUI runtime claim
+is made until rebuilding the bundle and repeating a guarded measurement.
+
+Runtime follow-up: GUI rebuilt and the bounded 120s run reached the lobby.
+Staging upload capacity peaks at 434.66 MiB (reusable at that sample), not the
+multi-GiB device allocation difference. Render-end sites identify another
+123..127 depth-feedback closures per large batch, outside the older operation
+category totals. See GEOMETRY_SUPPORT.md for evidence and limitations; no
+barrier, attachment lifetime, or guest behavior was changed by these diagnostics.
+
+## 2026-09-07 - Metal native depth-feedback attribution
+
+### Intentional differences
+- `renderer_metal/metal_gpu_profiler.rs` owns bounded native texture-view
+  ancestry/range metadata for already sampled batches. Eden's
+  `texture_cache/texture_cache.h::CheckFeedbackLoop` compares ImageIds, not
+  native mip/slice ranges. This diagnostic does not change that predicate.
+- `metal_rasterizer.rs` records whether the existing callback requested a
+  boundary and forwards the actual prepared textures, render-pass descriptor,
+  and effective depth/stencil key through `metal_scheduler.rs`. The callback
+  still ends the pass at the same point before framebuffer configuration.
+- No extra GPU commands, waits, resource caches, or retained-resource lifetimes
+  are added. The disabled profiler does not traverse texture ancestry. At most
+  64 distinct scalar alias records are retained per sampled batch; overflow is
+  counted explicitly. Array length and texture type are raw Metal metadata,
+  not a claim of physical slice overlap for cube/3D textures.
+
+### Verification
+- Re-read Eden's `vk_texture_cache.h` declaration and
+  `vk_texture_cache.cpp::BarrierFeedbackLoop`: it requests an outside-render-pass
+  context. Re-read the common `CheckFeedbackLoop` implementation; its ordering
+  and serial-cache semantics remain unchanged in this slice.
+- Checked the SDK bindings for parentTexture, parentRelativeLevel and
+  parentRelativeSlice. Parent offsets are accumulated to the root texture.
+- Added a regression for bounded aggregation, repeated keys and distinct depth
+  write state. All 1781 video_core release tests pass (3 ignored, no doc tests)
+  with Metal API validation enabled and no compiler warnings. Guarded GUI
+  observation is pending. The alias records cover bound texture descriptors;
+  they do not prove that every descriptor is dynamically sampled by its shader.
+
+Runtime follow-up: rebuilt/signed GUI, then guarded run stopped at 101s on
+global swap growth. Native menu aliases overlap mip/slice with depth writes
+disabled but Less/LessEqual comparison active. No large hall batch completed;
+do not claim either a performance improvement or disjoint-range optimization.
+Full evidence and safety outcome are recorded in GEOMETRY_SUPPORT.md.
+
+## 2026-09-07 - Metal cache frame retirement vs Eden TickFrame
+
+### Intentional differences
+- `renderer_metal/metal_texture_cache.rs::tick_frame` forwards the common
+  sentenced image/framebuffer/view rings, async decode and async unswizzle in
+  Eden `texture_cache/texture_cache.h::TickFrame` order, before runtime work and
+  frame counter advancement. Native command buffers retain encoded resources;
+  releasing the cache's ownership does not introduce a GPU wait or early native
+  resource destruction. The existing ring remains the matching upstream owner.
+- `metal_rasterizer.rs::tick_frame` now takes separate texture/buffer critical
+  sections, matching `renderer_vulkan/vk_rasterizer.cpp::TickFrame` and its
+  header declaration. The texture guard uses the existing stable-address mutex
+  pattern; the buffer guard retains its Arc. Neither mutex is replaced or moved.
+
+### Verification
+- Re-read Eden `delayed_destruction_ring.h`, `TextureCache<P>::TickFrame`,
+  `vk_texture_cache.h` and `RasterizerVulkan::TickFrame`. Verified the same ring
+  advancement, async ordering, runtime-before-frame counter order and separate
+  lock scopes. The Metal runtime's staging tick polls known GPU completion;
+  it does not submit or wait for the recorded test commands.
+- New native regression populates all three rings with real native owners,
+  proves retention before the complete eight-frame interval and removal after,
+  then submits the already-recorded image upload/download and checks exact
+  pixels. The focused release test passes under Metal API validation.
+- Full release suite passes: 1782 tests, 3 ignored, no doc tests, with Metal API
+  validation and no compiler warnings. No runtime memory/FPS improvement is
+  claimed; the GUI bundle has not been rebuilt for this slice.
+
+### Interrupted prerequisite
+- The Metal wrapper still lacks upstream's pre-retirement LRU collection and
+  its real GPU image downloader. METAL_TEXTURE_GC_STATE.md records the stopped
+  slice and exact download/conversion prerequisites. No fake downloader or
+  discard of GPU-modified data is introduced to bypass this requirement.
+
+## 2026-09-07 - Metal image download prerequisites vs vk_texture_cache
+
+### Intentional differences
+- `metal_texture_cache.rs::download_staging_buffer` mirrors Eden
+  `TextureCacheRuntime::DownloadStagingBuffer` from vk_texture_cache.h/.cpp,
+  forwarding the size/deferred contract to the existing native download pool.
+- `metal_image.rs::download_depth_stencil_memory` owns the native aspect-copy
+  portion of `Image::DownloadMemory`. Unlike Vulkan's packed guest D24S8 image,
+  Metal's Depth32Float_Stencil8 needs separate float-depth and byte-stencil
+  buffer copies. Guest packing remains the cache/conversion layer's job.
+- Both native copy lists are validated before encoding; native/slice storage
+  authority is synchronized before reading. Metal's tracked resources and
+  encoder boundary replace Vulkan layout transitions. No submit/wait or new
+  lifetime policy is introduced in the transfer method.
+
+### Verification
+- Re-read vk_texture_cache.h declarations and vk_texture_cache.cpp staging and
+  Image::DownloadMemory implementations, including copy offsets and aspects.
+- Native regression for both guest D24S8 orders, mip, array layers, staging
+  offset and prefix/suffix guards passes with Metal API validation. Full
+  release suite: 1783 passed, 3 ignored, no doc tests or compiler warnings.
+- This is a prerequisite only. Packed guest reconstruction, remaining converted
+  formats and live GC hookup are not claimed complete; interrupted state is in
+  METAL_TEXTURE_GC_STATE.md. No unsupported-format placeholder was wired to GC.
+
+## 2026-09-07 - Metal D24S8 packed download conversion
+
+### Intentional differences
+- `metal_texture_cache.rs::download_depth24_stencil8_memory` reconstructs guest
+  packed words after native plane readback completes. The wait occurs only for
+  this CPU readback, corresponding to Eden RunGarbageCollector's DownloadMemory
+  then Finish before SwizzleImage; no per-frame wait or live GC hook was added.
+- `converted_depth_stencil_copies` is a mechanical extraction of upload's plane
+  layout, shared by download. Alignment, offsets, levels and layer spans are
+  unchanged. Download reconstruction writes only actual texels, not row/layer
+  padding which a native blit does not initialize.
+- Native Depth32Float storage is quantized to guest UNORM24 with clamping and
+  nearest rounding, using f64 for the product to avoid a second f32 rounding.
+  NaN has no UNORM representation and deterministically maps to zero. This is
+  format reconstruction, not Eden's D24S8-to-ABGR8 reinterpretation shader.
+  Reference: https://docs.vulkan.org/spec/latest/chapters/fundamentals.html#fundamentals-fixedfpconv
+
+### Verification
+- Re-read Eden vk_texture_cache.h/.cpp DownloadMemory and the common
+  RunGarbageCollector download/finish/writeback ordering, plus its depth
+  reinterpretation shader to distinguish that operation from UNORM conversion.
+- Added exhaustive roundtrip of every 24-bit depth integer, fixed endpoint/
+  midpoint tests, both packing orders, padded rows/layers and truncated-buffer
+  checks. Extended the native test to reconstruct packed guest bytes after GPU
+  upload/download. Full video_core release validation passes: 1785 tests,
+  3 ignored, Metal API validation enabled. Evidence:
+  `../ruzu-diagnostics/metal-depth-pack-20260907.oA31lQ/tests.log`.
+- Other converted format downloads and the live collector are still the
+  stopped prerequisite described in METAL_TEXTURE_GC_STATE.md.
+
+## 2026-09-07 - Metal depth-alias diagnostic detail
+
+### Intentional differences
+- metal_gpu_profiler.rs owns bounded native diagnostics; Eden has no native
+  Metal profiler counterpart. metal_rasterizer.rs forwards the effective
+  MetalDepthStencilKey and lazily enumerated prepared texture bindings through
+  metal_scheduler.rs only to an active profiling sample.
+- The alias key now includes stage, native slot, stage shader hash, native
+  pixel format and both stencil faces' compare/operations/read/write masks.
+  Scalar metadata only; the cap stays 64 unique keys per sampled batch and
+  omitted entries remain counted. No retained texture owners are added.
+- Stage numbers 1..5 follow vertex-B/control/evaluation/geometry/fragment key
+  slots. A combined vertex-A/B program needs the vertex-A hash separately for
+  a complete identity; the diagnostic's vertex hash is explicitly slot 1.
+
+### Verification
+- Re-read Eden texture_cache_base.h declaration and texture_cache.h
+  CheckFeedbackLoop, plus vk_texture_cache.h/.cpp BarrierFeedbackLoop. The
+  common predicate and native render-pass termination are unchanged.
+- Stencil metadata is forwarded from the same key that creates the native
+  depth/stencil state, not inferred from guest enable flags. It describes
+  possible operations, not proof that a particular fragment writes stencil.
+- Bound descriptors do not prove dynamic shader reads. The added identity
+  enables comparison with generated shader accesses before changing barriers.
+- Aggregation tests distinguish descriptor and stencil fields and retain the
+  bounded overflow contract. Both focused tests pass; full video_core release
+  suite: 1786 passed, 3 ignored, Metal API validation enabled, no Rust warnings.
+  Evidence: `../ruzu-diagnostics/metal-depth-pack-20260907.oA31lQ/alias-full-tests.log`.
+
+## 2026-09-07 - metal_image.rs native depth/stencil sampling snapshot
+
+### Intentional differences
+- Native Metal-only allocation/copy primitive owned by MetalImage. Eden has no
+  equivalent sampling snapshot: vk_texture_cache.h/.cpp BarrierFeedbackLoop
+  only requests an outside-pass context. Its generic CopyImage remains owned
+  by the runtime; the existing Rust runtime copy method is not moved/replaced.
+- create_sampling_snapshot allocates independent matching native storage and
+  records a full texture copy through the scheduler's existing blit encoder.
+  No CPU wait, guest readback, cached reuse, descriptor rebinding or barrier
+  removal is introduced. Callers will own invalidation and allocation accounting.
+- Explicitly requires single-sample 2D depth/stencil images. This prerequisite
+  does not claim a multisample resolve or generic texture snapshot implementation.
+
+### Verification
+- Re-read Eden CopyImage and BarrierFeedbackLoop declarations and definitions,
+  and Metal's copyFromTexture:toTexture: binding contract (matching mip/layer
+  ranges). Both allocations use the same native format, dimensions and resources.
+- The scheduler ends an incompatible active encoder and retains ordinary
+  command-buffer resources until completion; consecutive blits remain batched.
+- Extended the native converted-depth test: snapshot before source overwrite,
+  no intervening CPU wait, then verify old snapshot and new original depth and
+  stencil independently. Covers both D24S8 guest layouts, mip 1, two layers.
+  Focused native test passes; full video_core release suite passes: 1786 tests,
+  3 ignored, Metal API validation enabled, no Rust warnings. Evidence:
+  `../ruzu-diagnostics/metal-depth-pack-20260907.oA31lQ/snapshot-full-tests.log`.
+- Reuse remains stopped at METAL_DEPTH_FEEDBACK_STATE.md until producer
+  invalidation and memory accounting are implemented and verified.
+
+## 2026-09-07 - Metal native image content revisions
+
+### Intentional differences
+- metal_image.rs owns a native recording revision separate from Eden
+  image_base.h modification_tick. Eden MarkModification in texture_cache.h
+  increments guest dirty tracking even on render-target preparation; that
+  contract remains unchanged. The native revision tracks possible write sites
+  for the separate sampling snapshot prerequisite.
+- Revisions saturate to an uncacheable sentinel instead of wrapping. They do
+  not provide GPU completion synchronization and must be paired with allocation
+  identity; no shared binary layout or serialized cache format is changed.
+- metal_pipeline_cache.rs derives conservative depth/stencil write possibility
+  from the exact MetalDepthStencilKey used to create the native state, including
+  both faces' operations and the low eight stencil write-mask bits.
+- metal_texture_cache.rs owns view/attachment-to-image invalidation; native
+  rasterizer write sites call it before recording draw/clear/draw-texture work.
+  Runtime copies/resolves/blits and writable image descriptors also participate.
+  Color attachments and partial/conditional operations invalidate conservatively.
+
+### Verification
+- Re-read Eden image_base.h, texture_cache_base.h and texture_cache.h
+  MarkModification/UpdateRenderTargets, and vk_texture_cache.h/.cpp copy and
+  feedback interfaces. Guest order and common dirty tracking are not replaced.
+- Native upload owners validate ranges before advancing the revision. D32S8
+  downloads and native/slice authority synchronization are not content writes.
+- Tests cover storage/content separation, saturation, selected RT writers,
+  both stencil faces and all stencil outcomes, disabled/zero-mask cases, and
+  snapshot invalidation after a real native upload. Full video_core release
+  suite: 1789 passed, 3 ignored, Metal API validation enabled, no Rust warnings.
+  Evidence: `../ruzu-diagnostics/metal-depth-pack-20260907.oA31lQ/revision-full-tests.log`.
+- Snapshot allocation accounting and draw rebinding remain a stopped slice in
+  METAL_DEPTH_FEEDBACK_STATE.md. No feedback barrier removed in this change.
+
+## 2026-09-07 - renderer_metal/metal_scheduler.rs allocation lease lifetime
+
+Historical intermediate design, superseded by the fixed snapshot heap below.
+The unused lease API/tests have been removed; existing sampler retention is
+unchanged.
+
+### Intentional differences
+- Native Metal allocation-budget leases follow command-buffer completion rather
+  than Vulkan master-semaphore retirement. Re-read Eden vk_scheduler.h/.cpp
+  Flush/Finish/Wait/WaitWorker: worker drain is not GPU completion. This change
+  adds no flush, wait, command reordering, or guest-visible synchronization.
+- Each active batch owns a deduplicated Arc cohort through addCompletedHandler.
+  Neither the scheduler nor the command buffer is captured. Cache eviction and
+  completion of another batch cannot release a still-referenced reservation.
+- Metal's callback lifetime is documented in Apple's
+  [addCompletedHandler](https://developer.apple.com/documentation/metal/mtlcommandbuffer/addcompletedhandler(_:)).
+  Registration occurs before commit; completion clears the batch's references.
+
+### Verification
+- Two focused native tests pass with Metal API validation: cache-owner removal,
+  repeated binding deduplication, completed-batch release, another unsubmitted
+  batch retaining the same lease, and abandoned-batch destruction.
+- No binary payload layout changes. The snapshot budget and draw consumer are
+  not enabled; the interrupted integration remains in METAL_DEPTH_FEEDBACK_STATE.md.
+- Full video_core release suite: 1791 passed, 3 ignored, Metal API validation
+  enabled, no Rust warnings. Log: `/tmp/metal-allocation-lease-full-tests.log`.
+
+## 2026-09-07 - Metal depth snapshot cache vs vk_texture_cache.h/.cpp
+
+### Intentional differences
+- Re-read Eden Image allocation/destruction, ResolveShadow ownership and
+  BarrierFeedbackLoop. Eden's shadow is a color MSAA resolve; this native Metal
+  cache instead preserves single-sample depth/stencil for read-only sampling.
+  It does not change the common feedback predicate or guest image identity.
+- Native allocation remains in metal_image.rs; a mechanical allocator callback
+  reuses the same descriptor/metadata constructor for device and heap storage.
+  No format, mip, layer, aspect, or sample conversion was added.
+- Runtime-owned cache uses one lazy private 64 MiB heap, not estimated ordinary
+  texture bytes. Heap allocation inherits explicit Tracked hazard mode; Apple's
+  heap default is Untracked. No manual aliasing or wait is used for exhaustion.
+- Retained source handles plus allocation-local revisions prevent recycled-key
+  reuse. Cached source retention is extra memory outside the snapshot heap.
+- Failed heap allocation preserves the original rendering path. Invalid copy or
+  scheduler errors still propagate; no draw is silently suppressed.
+
+### Verification
+- Native cache tests exercise unchanged reuse and upload invalidation with old
+  snapshot preservation, both depth/stencil packing orders, mip 1 and two layers.
+- No binary interface layout changes. Draw/view integration is still stopped
+  in METAL_DEPTH_FEEDBACK_STATE.md; no FPS gain or game validation claimed.
+- Full release video_core suite: 1792 passed, 3 ignored, Metal API validation
+  enabled, no Rust warnings. In-flight heap eviction and allocation-failure
+  fallback pass. Log: `/tmp/metal-snapshot-cache-full-tests.log`.
+
+## 2026-09-07 - metal_graphics_pipeline.rs vs vk_graphics_pipeline.h/.cpp
+
+### Intentional differences
+- Re-read ConfigureImpl's prepare_stage and pipeline_helper.h PushImageDescriptors.
+  Native prepared texture bindings now retain source view/type/write intent
+  through reflected index assignment. Eden immediately writes descriptors; Metal
+  needs this metadata for a subsequent native sampling-view substitution decision.
+- Sampled, storage-image and buffer-view sources remain distinct. No preparation,
+  modification marking, rescaling, sampler selection or binding order changed.
+- This is host metadata, not a shader ABI payload or binary serialization change.
+
+### Verification
+- Reflection regression covers array indices, view ID/type, storage write intent,
+  buffer identity classification and sampled-image classification with null native
+  handles. No draw-path substitution has been activated.
+- Full release video_core suite: 1793 passed, 3 ignored, Metal API validation,
+  no Rust warnings. Log: `/tmp/metal-binding-source-tests-fixed.log`.
+
+## 2026-09-07 - metal_texture_cache.rs snapshot views vs vk_texture_cache.h/.cpp
+
+### Intentional differences
+- Re-read ImageView constructors and native type/range/swizzle selection in
+  vk_texture_cache.h/.cpp. Snapshot views reuse MetalImageView::new rather than
+  duplicating that logic. The alternate storage is a Metal optimization, not
+  a new common-cache guest image or a Vulkan-layout emulation.
+- Runtime retains up to 64 native view pairs keyed by live native identities.
+  No ImageViewBase pointer is retained by this map. Heap pressure evicts native
+  view owners without forcing GPU completion or declaring resources aliasable.
+- Missing slots or unavailable snapshots preserve the original path; native
+  image-view construction errors now propagate through MetalTextureCacheError.
+
+### Verification
+- Native view test covers depth/stencil formats, swizzle, mip/layer ranges,
+  distinct root storage, cached handle reuse and base-slot deletion. It does not
+  yet execute a shader sampling these views. Draw integration remains stopped
+  in METAL_DEPTH_FEEDBACK_STATE.md; no game performance gain claimed.
+- No binary layout/serialized payload changed.
+- Full release video_core suite: 1794 passed, 3 ignored, Metal API validation,
+  no Rust warnings. Log: `/tmp/metal-snapshot-views-full-tests.log`.
+
+## 2026-09-07 - Metal read-only depth feedback integration
+
+### Intentional differences
+- Re-read Eden texture_cache.h CheckFeedbackLoop, vk_texture_cache.h/.cpp
+  BarrierFeedbackLoop and vk_graphics_pipeline.h/.cpp ConfigureImpl. Common
+  detection stays intact. The native rasterizer defers its encoder-end decision
+  until effective write state and all sampled-view replacements are available.
+- Unlike ending every alias pass in Vulkan, eligible native Metal draws sample
+  independent depth/stencil storage. Attachments and their tests stay unchanged.
+  New copies use existing ordered native blit recording; cache hits add no copy.
+- Resource classification and all-or-nothing replacement belong to
+  metal_graphics_pipeline.rs; cache/view allocation stays in metal_texture_cache.rs.
+  Any storage alias, missing bound view, possible fixed-function write or missing
+  snapshot keeps the ordinary boundary. Native operation errors still propagate.
+
+### Verification
+- Candidate tests cover depth sampling, unrelated images, missing views, buffer
+  textures and both writable/read-only storage aliases. The native view test
+  additionally checks no substitution when writes are possible or another stage
+  has a storage alias, then successful read-only substitution.
+- No shader ABI, serialized layout or guest draw count changed. Game validation
+  and measured performance are pending a new release GUI build.
+- Full release video_core suite: 1795 passed, 3 ignored, Metal API validation,
+  no Rust warnings. Log: `/tmp/metal-depth-feedback-integration-final-tests.log`.
+- Guarded release GUI retry reaches the hall with geometry visually present.
+  Complete sampled GPU batches have median 68.89 ms / 508 render endings versus
+  77.54 ms / 601.5 in the last baseline. GUI median 13.96 vs 12.91 FPS is not yet
+  repeatable proof: an earlier baseline also reached 13.96. First attempt hit
+  an unrelated-or-unproven guest svcBreak during loading and is excluded.
+  Full evidence and resource limits/results are in METAL_DEPTH_FEEDBACK_STATE.md.
+
+## 2026-09-07 - Metal uint8 conversion cache miss diagnostics
+
+### Intentional differences
+- Re-read Eden vk_buffer_cache.h/.cpp: BindIndexBuffer owns uint8 conversion
+  selection and Uint8Pass owns conversion. Metal keeps these boundaries and its
+  native conversion cache. Only the existing opt-in submission profiler changes.
+- Count entries discarded on generation changes, whether the current requested
+  range was among them, inserted conversions and uncached fallbacks. No guest
+  bytes are read by the profiler and invalidation/recording order is unchanged.
+- An invalidated requested range does not prove its bytes changed; conversely,
+  other discarded ranges requested later are not counted by that metric. These
+  counters locate churn, not safe-to-reuse data.
+
+### Verification
+- Native regression exercises a hit, a second range, generation invalidation
+  and zero-count fallback, with exact counter expectations. No ABI changes.
+- Runtime measurement remains pending; no performance improvement claimed.
+- Full release video_core suite with Metal API validation: 1796 passed,
+  3 ignored, no warnings (`/tmp/metal-uint8-profile-tests.log`).
+- Release GUI 417370A1-BE3D-3183-935A-4F140452D78C built and signed;
+  MoltenVK SHA256 unchanged. Guarded attempt in
+  `../ruzu-diagnostics/lm3-uint8-misses-20260907.A04xeA` encounters
+  UserlandAssert 0x2a2 / svcBreak while loading before reaching the hall.
+  It is excluded from performance comparison; miss counters have no relevant
+  scene samples. This repeats the earlier intermittent loading failure and
+  does not establish a cause in either optimization or instrumentation.
+- Unchanged-binary retry produced real miss counters with zero capacity
+  fallbacks and approximately matched discarded/inserted counts. It was stopped
+  by the disk guard before a stable hall sample. Evidence, limits of inference
+  and the required range-notification prerequisite are in
+  METAL_INDEX_CACHE_STATE.md. No range-aware optimization has been enabled.
+
+## 2026-09-08 - Buffer write-range notification prerequisite
+
+### Intentional differences
+- Re-read Eden buffer_cache.h MarkWrittenBuffer and buffer_base.h setWriteTick
+  and Offset. Rust keeps ownership and the non-OpenGL condition, forwarding
+  offset/size already known at that point through the buffer backend trait.
+- The default mark_written_region calls the existing virtualized set_write_tick;
+  native Metal whole-allocation invalidation remains unchanged. No native range
+  reuse or timing/order changes are enabled. Wrapping relative subtraction
+  avoids introducing a new panic solely to report an invalid range.
+- Guest dirty-range trackers are updated in the same order after notification.
+  No serialized payload, struct wire layout or shader ABI changes.
+
+### Verification status
+- Tests added for default tick semantics and native repeated same-tick/invalid
+  range conservative invalidation. Compilation/tests pending disk recovery;
+  previous test results must not be cited as validation of this slice.
+- diff --check passes. Interrupted state in METAL_INDEX_CACHE_STATE.md.
+- Pending compilation status above is superseded: guarded incremental release
+  video_core suite with Metal API validation passes (1798 tests, 3 ignored,
+  no warnings). Both new notification tests passed. Net disk change 6.6 MiB;
+  no resource guard fired. No GUI rebuild/runtime validation performed.
+
+## 2026-09-08 - Native Metal bounded buffer write history
+
+### Intentional differences
+- metal_buffer.rs owns an optional allocation-local recording history (64
+  ranges), initialized through OnceLock only when requested. No Eden equivalent:
+  this supports Metal's derived uint8 conversion cache, not guest dirty tracking.
+- Re-read Eden buffer_cache.h MarkWrittenBuffer, buffer_base.h setWriteTick,
+  vk_buffer_cache.h/.cpp CopyBuffer, vk_query_cache.h/.cpp SyncValues and
+  vk_compute_pass.h/.cpp Uint8Pass. Corresponding Metal producers report exactly
+  the destination offset/size they already use; native command order is unchanged.
+- Unknown/invalid writes, history eviction, missing/out-of-order revisions and
+  saturated generations conservatively refuse unchanged-content certification.
+  History does not replace fences or authorize concurrent CPU/GPU resource use.
+- metal_buffer_cache.rs now preserves GPU-declared ranges in its notification
+  override. The live uint8 cache still uses whole-buffer invalidation; history
+  consumption/reuse is not integrated yet. Public history methods are the native
+  prerequisite interface and are currently exercised by tests only.
+
+### Verification
+- Pure history test covers overlap, touching endpoints, eviction, unavailable
+  revisions and saturation. Native test covers lazy allocation, CPU writes and
+  malformed/unknown ranges. Initial full release suite: 1800 passed, 3 ignored,
+  no warnings, Metal API validation. A subsequent conservative out-of-order
+  refinement is undergoing the full suite again; do not cite the initial pass
+  as verification of that refinement.
+- No wire layout or shader ABI changes. Per-buffer history is bounded, not a
+  global GPU memory budget. Game performance unchanged/unmeasured for this slice.
+- Final full release suite after the out-of-order refinement: 1800 passed,
+  3 ignored, no warnings, Metal API validation enabled. Log:
+  /tmp/metal-write-history-final-tests.log. History prerequisite is verified;
+  live cache consumption remains the next slice.
+
+## 2026-09-08 - Metal range-aware uint8 conversion reuse
+
+### Intentional differences
+- Re-read Eden vk_buffer_cache.h/.cpp BindIndexBuffer. Metal still owns uint8
+  conversion selection in metal_buffer_cache.rs and dispatch in its compute
+  pass. Native derived-data reuse now consults MetalBuffer's verified history.
+- A generation change prunes only entries whose source range cannot be proved
+  unchanged. Accounting subtracts actual removed allocations/entries; retained
+  entries are validated through the new generation. Unknown history/saturation
+  removes all entries. Converted buffers remain independently GPU-retained.
+- No changes to guest primitive/index counts, restart conversion, cache limits,
+  synchronization, shader ABI or serialized layouts. Profiling invalidated-entry
+  counts now measure actual removals rather than whole-map size.
+
+### Verification
+- Native tests added for disjoint GPU copies, overlapping replacement, old/new
+  converted index data (including 0xff primitive restart), retained accounting,
+  disjoint CPU upload with no recorded work, history eviction and unknown writes.
+- Full release suite and guarded GUI performance measurement pending.
+- Full release video_core suite verified: 1802 passed, 3 ignored, no warnings,
+  Metal API validation. Log: /tmp/metal-index-range-integration-tests.log.
+- Release GUI rebuilt/signed, but two attempts hit the pre-existing audio
+  initialization assertion before input. Existing break-stack diagnostic gives
+  the previously investigated SDK path; current console is locked. Runtime
+  correctness/performance remain unverified pending unlocked-session control.
+  Evidence and exact qualification recorded in METAL_INDEX_CACHE_STATE.md.
+
+## 2026-09-08 - Index cache producer audit and partial-clear regression
+
+### Verification
+- Re-read Eden vk_buffer_cache.h/.cpp ClearBuffer. Native runtime clear expands
+  its existing u32 pattern into staging, then uses the same notified copy path.
+  Added a test through the actual runtime trait method, preserving left-range
+  reuse while replacing the cleared right-range conversion. Native readback
+  verifies old/new outputs, restart value and cache accounting.
+- Reviewed common writable bindings, immediate uploads, staging/common copies,
+  query-result copies and direct visibility writes. Visibility CPU writes use
+  separate query-bank allocations, not common-cache index sources. Scheduler
+  with_blit_encoder invokes its closure synchronously; notifications are not
+  postponed to a submission worker. No additional missing producer found in
+  these paths. This is scoped source review, not proof for future write paths.
+- Initial new test failed to compile because its trait was not in scope;
+  corrected to a fully qualified trait call. Final full-suite run pending.
+- No production renderer change in this audit. GUI remains the previously
+  rebuilt range-aware version. Session lock still prevents the requested
+  unlocked runtime control; no further GUI attempt made.
+- Final suite verified: 1803 passed, 3 ignored, no warnings with Metal API
+  validation (/tmp/metal-index-clear-final-tests.log). Pending status superseded.
+
+## 2026-09-08 - Metal texture memory attribution
+
+### Intentional differences
+- `renderer_metal/metal_texture_cache.rs` adds a native diagnostic after frame
+  advancement, gated by the existing `RUZU_PROFILE_METAL_SUBMISSIONS` setting.
+  It reports live slot-owned root/slice texture allocated sizes, largest image,
+  retired owner counts and the device total once per second. These categories
+  are not process footprint and do not include every in-flight owner.
+- `delayed_destruction_ring.rs` exposes its existing test-only retained count
+  to the macOS profiler. Compared again against Eden's header: Tick/Push and
+  the array/vector ownership remain unchanged; the count does not retire data.
+  No separate upstream .cpp exists. Test checks the count through retirement.
+
+### Remaining prerequisites
+- Re-read Eden `TextureCache<P>::TickFrame` and `vk_texture_cache.h/.cpp`
+  DownloadMemory/DownloadStagingBuffer. Metal's full GC downloader remains
+  incomplete as recorded in METAL_TEXTURE_GC_STATE.md. This diagnostic does not
+  enable partial collection or discard GPU-modified image contents.
+- Native texture statistics are for attribution, not evidence of a leak or a
+  performance improvement. Full release verification and a rebuilt GUI sample
+  are required before interpreting runtime results.
+
+### Binary layout verification
+- The diagnostic timestamp is runtime-only; no guest/serialized layout changes.
+  MetalTextureCache remains repr(transparent) around its common cache.
+
+### Verification
+- Full release video_core suite: 1803 passed, 3 ignored, no warnings with
+  Metal API validation. Log /tmp/metal-texture-memory-profile-tests.log.
+- Rebuilt/signed GUI and bounded hall run completed without a safety stop;
+  evidence ../ruzu-diagnostics/lm3-texture-memory-20260908.s0Ol6W. Captures
+  100/110 inspected. Live textures account for about 3 GB, retired owner counts
+  zero, peak process footprint 8.08 GiB. This does not prove absence of leaks.
+- Native profile successfully resolves the additional counters. Sampling costs
+  occur only with existing profiling enabled; no allocator or GC change made.
+
+## 2026-09-08 - Metal scheduler retirement validation prerequisite
+
+### Intentional differences
+- `renderer_metal/metal_scheduler.rs` keeps native submission owners in its
+  queue until completion validation succeeds. The shared retirement helper is
+  mechanical extraction of the repeated poll/wait/finish_all code; ownership
+  stays with MetalScheduler. Native Metal errors return Result, rather than
+  Eden's Vulkan exception/device-loss mechanism.
+- Compared again with Eden `vk_scheduler.h/.cpp` Finish/Wait/SubmitExecution:
+  synchronous finish now submits then waits through the ordinary pending queue,
+  so earlier unsuccessful work cannot be bypassed by advancing known_gpu_tick.
+  No upload reordering or new wait on the ordinary asynchronous path added.
+
+### Verification scope
+- Native regression checks repeated rejected retirement retains both queued
+  owners and leaves completed_tick unchanged, then verifies ordered successful
+  retirement. It uses NotEnqueued buffers to exercise validation failure safely;
+  it does not claim to inject a real Metal device error.
+- Multi-command-buffer cohort ownership and the upload-prefix path remain
+  the next prerequisite in METAL_UPLOAD_PREFIX_STATE.md, not implemented here.
+- No guest binary/serialized layout change. Full suite pending.
+- Verification completed: 1804 passed, 3 ignored, no warnings, full release
+  video_core suite with Metal API validation (/tmp/metal-retirement-order-tests.log).
+  Existing finish-order and monotonic-tick tests pass. GUI runtime validation
+  of this scheduler slice remains pending; no FPS improvement claimed.
+
+## 2026-09-08 - Metal shared-tick submission cohort
+
+### Intentional differences
+- `renderer_metal/metal_scheduler.rs` pending submission now owns an optional
+  upload-prefix buffer alongside the render buffer. Re-read Eden
+  vk_scheduler.h/.cpp and vk_master_semaphore.h/.cpp: upstream submits uploads
+  then rendering and signals one timeline value for both. Metal uses two native
+  commits on the same queue but a single logical tick and pending owner.
+- All wait/poll/retirement paths validate both members. Either native Error
+  surfaces before a pending-member validation error, and the owner remains
+  queued on failure. No early completion is inferred from the render member.
+- Native completion journal events still describe individual buffers;
+  cohort_retired describes successful logical retirement. Upload timing has
+  its own profile category, not part of render-stage sample durations.
+- Private commit_cohort is used by normal submission with no prefix and native
+  tests with a prefix. Live upload selection is intentionally not activated
+  until encoder ownership, stream-wrap lifetime and dependencies are verified.
+
+### Verification
+- Native tests cover either member completing first, no retirement while the
+  other is pending, overlapping uploads followed by consumer readback, and one
+  tick allocation. Status matrix covers Error with pending/complete companions
+  without intentionally causing a GPU fault.
+- First full release suite: 1807 passed, 3 ignored, no warnings, Metal API
+  validation (/tmp/metal-cohort-tests.log). Extended actual staging-pool lease
+  test is being rerun in /tmp/metal-cohort-staging-tests.log.
+- No serialized/guest binary layout changes. No GUI performance claim; active
+  prefix recording and resource-use audit remain in METAL_UPLOAD_PREFIX_STATE.md.
+- Extended full suite verified: 1807 passed, 3 ignored, no warnings, Metal API
+  validation (/tmp/metal-cohort-staging-tests.log). Actual deferred pool entry
+  remains non-reusable until both members complete, then is reused by identity.
+
+## 2026-09-08 - Metal active upload-prefix path
+
+### Intentional differences
+- `metal_scheduler.rs` owns a lazy prefix command buffer/blit encoder separately
+  from the active guest encoder. Flush/Drop end both; the shared-tick cohort owns
+  both submissions. External/presentation commits first flush pending guest work
+  so a captured resource tick cannot be assigned to an unrelated submission.
+- `metal_buffer.rs` mechanically shares bounds checking, write notification and
+  the native copy call between ordered and eligible-prefix methods. Ownership
+  remains the buffer, corresponding to Eden's native buffer transfer operations.
+- `metal_buffer_cache.rs` selects the prefix only for exact stream identity and
+  an allowed reorder, matching re-read vk_buffer_cache.h/.cpp CopyBuffer and
+  CanReorderUpload. No generic copies/downloads are moved. Metal tracked native
+  destination buffers replace Vulkan's upload-to-render memory barrier.
+- `metal_staging_buffer_pool.rs` adds only a native regression test. Re-read
+  vk_staging_buffer_pool.h/.cpp GetStreamBuffer/AreRegionsActive: wrap uses the
+  shared completion tick and falls back rather than overwriting active bytes.
+- Current native graphics buffers/textures are bound directly in bind_stage;
+  the argument-buffer path observed here carries samplers. This audit does not
+  cover future arbitrary indirect buffer-pointer interfaces.
+
+### Verification
+- 1810 initial full release tests passed with Metal validation; extended
+  eligibility test corrected for upstream's 64-byte usage granularity and final
+  full suite pending. Native tests verify actual transfer bytes, encoder reuse,
+  unsubmitted stream-wrap protection, and upload-only/external/drop lifecycle.
+- No guest or serialized binary layout changes. GUI rebuild and guarded hall
+  validation are pending; source implementation is not a measured FPS gain.
+- Final full release suite: 1811 passed, 3 ignored, no warnings, Metal API
+  validation (/tmp/metal-upload-eligibility-tests.log). Eligibility test uses a
+  full usage granule; existing conservative sub-granule handling is unchanged.
+- Native completion journal includes expected cohort member count, distinguishing
+  GPU group completion from deferred CPU retirement. Initial runtime supervisor
+  falsely stopped on completed initialization buffers not yet retired by CPU;
+  corrected supervisor groups/deduplicates callbacks instead. No guest ordering
+  change in this journal correction. Full release suite remains 1811 passed,
+  3 ignored, no warnings with Metal validation (/tmp/metal-cohort-journal-tests.log).
+
+## 2026-09-08 - Metal buffer-copy attribution
+
+### Intentional differences
+- Re-read Eden vk_buffer_cache.h/.cpp CopyBuffer, ClearBuffer and pre/post
+  barriers: Metal preserves ordered copies and tracks hazards with native
+  resources. No barrier was removed. Clear still copies the same staging bytes
+  inline; its profiler category now distinguishes it from ordinary uploads.
+- metal_gpu_profiler.rs and metal_command_journal.rs are native diagnostic
+  counterparts, not guest behavior. Extend bounded categories under existing
+  profiling, and test their independent counters and journal array size.
+
+### Verification
+- GUI upload-prefix run completed with correct hall but no confirmed FPS gain
+  (15.622 vs prior 15.944). Inline copies still dominate the surviving breaks;
+  see METAL_UPLOAD_PREFIX_STATE.md for evidence and invalidated hypothesis.
+- Full release tests being rerun after extending a fixed-size journal test.
+- No serialized guest layout or native resource-lifetime changes.
+- Verified full release suite: 1811 passed, 3 ignored, no warnings with Metal
+  API validation. GUI attribution run stopped intentionally at the 10-GiB
+  physical-footprint guard before the hall; no new FPS claim. Existing LRU
+  download/writeback prerequisite now blocks further safe performance runs.
+
+## 2026-09-08 - Metal B5G6R5 download vs vk_texture_cache.h/.cpp
+
+### Intentional differences
+- Re-read Image::DownloadMemory header overloads and implementation: image
+  owns native transfer recording, runtime supplies staging, and CPU reads wait
+  for completion (TextureCache::RunGarbageCollector). Metal keeps these owners.
+- metal_image.rs mechanically shares its native download encoder between
+  byte-compatible formats and converted B5G6R5, retaining slice-authority
+  synchronization. Copy validation precedes recording, including the original
+  native path, so rejected ranges do not record a storage synchronization.
+- metal_texture_cache.rs reverses the Metal-specific red/blue bit packing;
+  Eden's compatible Vulkan format needs no corresponding conversion. Only
+  copied texels are written, not undefined transfer padding. The CPU-facing
+  method waits only because it returns downloaded bytes, not on every frame.
+
+### Verification
+- Added native transfer test with fixed color bit patterns, a nonzero mip,
+  nonzero first array layer, two layers, staging offset and row/layer padding.
+  Checks native methods do not submit. Invalid-range test verifies no partial
+  guest output writes. Full video_core release suite pending.
+- No guest struct/serialized layout changes. LRU collection remains stopped
+  on the other prerequisites in METAL_TEXTURE_GC_STATE.md, not stubbed on.
+- B5G6R5 full release suite: 1813 passed, 3 ignored, no warnings with Metal
+  API validation. CPU single-sample wrapper also reuses existing native and
+  D32S8 paths, initializes untouched staging bytes from the caller's output,
+  waits for completion and returns bytes. Runtime tests extended for these
+  branches; full suite rerunning. Multisample resolve remains a prerequisite,
+  not silently downloaded as single-sample storage.
+- Extended native/runtime verification passed: full video_core release suite
+  1813 passed, 3 ignored, no warnings, Metal validation enabled
+  (/tmp/metal-single-sample-download-tests.log). No GUI performance claim.
+
+## 2026-09-08 - Metal sample expansion vs blit_image.h/.cpp
+
+### Intentional differences
+- Re-read Eden BlitImageHelper::CopyMSAA declaration/body and
+  host_shaders/convert_msaa_to_non_msaa.frag: expand samples into separate
+  destination texels with coord/scale and x + scale.x*y sample ordering.
+  This is not the averaged color resolve already used for presentation.
+- metal_blit_helper.rs owns the native direction-specific pass and pipeline
+  key. The source view/framebuffer provide subresource ownership instead of
+  constructing Vulkan views inside CopyMSAA. Existing blits retain their
+  previous resolve behavior. An expansion key cannot reuse a resolve pipeline.
+- Native MSL parameters mirror the three int2 fields (24 bytes, offsets 0/8/16,
+  host alignment 8). Incompatible formats/sample counts or out-of-bounds
+  regions return errors before recording instead of issuing invalid native work.
+
+### Verification
+- Native test writes different values per sample, expands a partial rectangle
+  from array layer 1 into mip 1/layer 1, and checks exact bytes and untouched
+  borders. Rejects mismatched sample counts/bounds without creating GPU work.
+- Full release video_core: 1814 passed, 3 ignored, no warnings, Metal API
+  validation enabled. No guest/serialized layout changes.
+- Eligibility audit corrected the investigation: Eden and Rust IsSafeDownload
+  exclude MSAA, so this is not a blocker for current LRU collection. Actual
+  remaining converted-format prerequisites are in METAL_TEXTURE_GC_STATE.md.
+
+## 2026-09-08 - Metal RGB32 transfers vs vk_texture_cache.h/.cpp
+
+### Intentional differences
+- Re-read Eden surface.h (96-bit guest RGB32) and maxwell_to_vk.cpp
+  (R32G32B32_SFLOAT), plus Image::UploadMemory/DownloadMemory ownership and
+  staging layout. Metal uses RGBA32Float, requiring explicit 12/16-byte
+  conversion in metal_texture_cache.rs rather than a byte-compatible blit.
+- metal_image.rs records the 16-byte native download using its existing
+  encoder and storage-authority handling. No new submit/wait in native transfer.
+- The cache conversion copies float bits without arithmetic, synthesizes only
+  alpha=1 for upload, and drops only alpha for download. Pitched padding/gaps
+  are untouched. Layout/range overflow is rejected before destination writes.
+- Upload is wired into the existing backend upload method, and CPU download
+  into the single-sample wrapper; same module owners as the prior conversions.
+
+### Verification
+- Native upload/readback test verifies NaN payloads, signed zero, mip/layers,
+  guest/staging offsets, native alpha and untouched padding. Invalid-copy test
+  checks both directions and no partial output writes. Full suite pending.
+- No guest/serialized struct layout changes. Native RGB32 layout is deliberately
+  expanded, not claimed binary-compatible. Other converted formats still block
+  the complete GC slice as recorded in METAL_TEXTURE_GC_STATE.md.
+- Full release suite verified: 1816 passed, 3 ignored, no warnings, Metal API
+  validation enabled (/tmp/metal-rgb32-transfer-tests.log). No GUI rerun.
+
+## 2026-09-08 - Metal G4R4 transfers vs vk_texture_cache.h/.cpp
+
+### Intentional differences
+- Re-read maxwell_to_vk.cpp G4R4 -> R4G4_UNORM_PACK8 and
+  TryTransformSwizzleIfNeeded -> SwapGreenRed in vk_texture_cache.cpp.
+  Metal instead expands guest low-R/high-G nibbles to native RG8 channels.
+  The normalized upload values are exact; download quantizes GPU RG8 values
+  to the nearest representable guest UNORM4 value.
+- metal_texture_cache.rs mechanically shares RGB32's checked copy layout and
+  range traversal, keeping format-specific conversion in that owner. The live
+  upload switch and CPU download wrapper both select the new format.
+- metal_image.rs shares expanded-format readback with RGB32, selecting the
+  native texel size from the image's guest format before recording the blit.
+  No queue/lifetime change or additional asynchronous wait was introduced.
+
+### Verification
+- Native test exercises every guest byte, two layers of mip 1, pitched rows,
+  nonzero offsets, native channel values and untouched padding. CPU test
+  exhaustively checks 65536 native pairs. Existing RGB32 bit-pattern tests
+  continue exercising the shared traversal. Full release suite pending.
+- No guest/serialized layout change. Native G4R4 storage is explicitly expanded,
+  not byte-compatible. Remaining GC prerequisites stay in the project state file.
+- Full release verification completed: 1818 passed, 3 ignored, no warnings,
+  Metal API validation enabled (/tmp/metal-g4r4-transfer-tests.log).
+## 2026-09-08 - Metal packed 1555 transfers vs renderer_vulkan/vk_texture_cache.h/.cpp and maxwell_to_vk.cpp
+
+### Intentional differences
+- `renderer_metal/metal_format.rs` maps A1R5G5B5 to Metal BGR5A1Unorm (bit-15 alpha), not A1BGR5Unorm (bit-0 alpha). This matches Eden's A1R5G5B5_PACK16 interpretation; native mapping cross-checked with MoltenVK's MVKPixelFormats.mm.
+- `renderer_metal/metal_texture_cache.rs` converts A1B5G5R5 red/blue packing in both transfer directions instead of Eden's SwapBlueRed image-view swizzle. Alpha and green are unchanged. Mechanical reuse of the B5G6R5 transfer traversal retains the cache/image ownership boundary.
+- `renderer_metal/metal_image.rs` records native packed16 readback without submitting. The CPU-facing runtime wrapper finishes before exposing downloaded bytes, as Eden's CPU download consumers require.
+
+### Verification
+- Re-read Eden Image upload/download declarations and implementation, format table and TryTransformSwizzleIfNeeded. Also rechecked ImageBase::IsSafeDownload: MSAA is excluded, not a prerequisite for GC downloads.
+- Native GPU component-read oracle passes over all 65536 guest words for both 1555 variants, plus upload/download round trips. Full release video_core suite with Metal validation: 1819 passed, 3 ignored, no warnings (/tmp/metal-a1555-transfer-tests.log). No new GUI run.
+- Remaining GC prerequisites are A5B5G5R1/X8D24 conversion and wiring the real downloader; tracked in METAL_TEXTURE_GC_STATE.md. No GC activation or FPS claim in this slice.
+
+## 2026-09-08 - Metal offline shader inspection vs renderer_vulkan/vk_pipeline_cache.h/.cpp
+
+### Intentional differences
+- A manual ignored test in `renderer_metal/metal_pipeline_cache.rs` exports selected cached vertex/fragment MSL and binding metadata. This native diagnostic has no Eden counterpart; ownership remains with the pipeline cache. Reuses the live translation/build function, with no renderer-side instrumentation.
+- Reads a private uniquely named copy because the common cache loader can delete incompatible files. Original caches are never passed to that destructive validation path.
+
+### Verification
+- Re-read Eden LoadDiskResources declaration and graphics cache callback: deserialize key and environments, then compile from those environments. The test follows that dependency and ordering; it does not substitute synthetic resource metadata.
+- No serialized format or ABI change. Full release video_core suite with Metal validation: 1823 passed, 4 ignored, no warnings. Explicit inspection test compiles nine selected graphics variants successfully.
+- Shader counts, invalidated assumptions and the remaining precise-arithmetic/performance experiment are recorded in METAL_SHADER_COST_STATE.md. This test-only slice makes no rendering or FPS claim.
+
+## 2026-09-08 - Metal layer composition and applet capture vs renderer_vulkan/present and renderer_vulkan.{h,cpp}
+
+### Intentional differences
+- Native composition moved from MetalPresenter into present/window_adapt_pass.rs; present/layer.rs owns retained texture identity and normalized crop. Eden's descriptor sets/push constants become Metal texture bindings and a 16-byte float4 copied with setVertexBytes. The fullscreen triangle replaces the four-vertex strip, retaining UV interpolation and screen placement.
+- MetalPresenter keeps drawable/submission ownership. RendererMetal retains the capture target, submits its composition before the window visibility check, and downloads/swizzles only on demand. Shared-storage MetalBuffer needs completion but no Vulkan invalidate operation. Command buffers retain native resources; same-queue ordering replaces Vulkan layouts/barriers.
+
+### Verification
+- Re-read window_adapt_pass.h/.cpp, layer.h/.cpp, util.cpp blend factors and renderer_vulkan.h/.cpp capture ordering. Opaque replaces all components; premultiplied uses One/OneMinusSrcAlpha for RGB; coverage uses SrcAlpha/OneMinusSrcAlpha; both overwrite alpha. NormalizeCrop uses guest dimensions, not scaled texture dimensions. Capture bilinear/no-AA matches present.h.
+- Full release video_core with Metal validation: 1827 passed, 4 ignored. Native pixel tests exercise blend modes, alpha, crop/flip, persistent target reuse and tiled capture round-trip; existing screenshot lifetime/row-layout tests still pass.
+- Bounded release GUI run confirms the captured background behind Select a user now renders. The existing save thumbnail remains black: read-only decoding proves both saved 160x90 JPEG thumbnails contain only black pixels and predate this change. No save edited. Evidence and limits in METAL_APPLET_CAPTURE_STATE.md; audio still unmeasured.
+
+### Remaining scope
+- Preexisting raw display-image fallback and display filters beyond bilinear are not ported. Applet capture is no longer an unconditional zero buffer, but old saved thumbnails may remain black; runtime verification and audio diagnostics are separate. See METAL_APPLET_CAPTURE_STATE.md.
+
+## 2026-09-08 - Metal applet capture inspection vs renderer_vulkan/renderer_vulkan.h/.cpp
+
+### Missing prerequisites
+- RendererMetal GetAppletCaptureBuffer returns only zeros; Eden retains, downloads and swizzles a composed capture image. Metal Composite also selects only the last available framebuffer instead of composing all layers and their blend/crop/transform state. These require a native compositor/capture ownership slice, not a fake screenshot fallback.
+- Source/header re-read and the consumer SharedBufferManager traced. Screenshots confirm black applet background and save thumbnail, but the thumbnail producer and possible already-black saved data remain unverified. Interrupted implementation ordering and audio measurement requirements are in METAL_APPLET_CAPTURE_STATE.md. This inspection changes no runtime code and makes no fix claim.
+
+## 2026-09-08 - Metal pipeline cache lookup vs renderer_vulkan/vk_pipeline_cache.h/.cpp
+
+### Intentional differences
+- Native Metal render, compute, geometry, tessellation and depth-state caches use Rust Entry to avoid repeated hashing on hits. This follows Eden CurrentGraphicsPipelineSlowPath/CurrentComputePipeline try_emplace iterator reuse, not the complete current-pipeline transition cache. Metal retains its separate native state objects and existing cache keys.
+- Depth-state lookup returns a borrowed Retained owner so its caller can retain the same object without another map lookup. No change to GPU resource lifetime, compilation order, validation before cache hits, hash algorithm or failure insertion policy.
+
+### Verification
+- Re-read vk_pipeline_cache.h interfaces and .cpp slow graphics/compute lookup; compared the native construction paths after conversion. Metal construction failures remain uncached, unlike Eden's nullable pipeline entries; this behavior predates this lookup-only slice and is unchanged.
+- Tests cover cache identity, distinct keys, validation even on hits, and depth-state survival after cache destruction. Full release video_core with Metal validation: 1825 passed, 4 ignored, no warnings. Runtime measurements are tracked in METAL_SHADER_COST_STATE.md.
+- First bounded release hall run: 23.87 FPS versus 20.93 in the preceding profiled run; not yet repeated. Pipeline lookup samples fall from 11.1% to 5.3% of the GPU thread. Captures show no obvious corruption, memory/disk guards remain below limits. This does not establish a hardware ceiling or cross-title performance gain.
+
+## 2026-09-08 - MSL precise helper optimization vs backend/spirv/emit_spirv_floating_point.cpp
+
+### Intentional differences
+- `backend/msl/msl_emit_context.rs` owns the native equivalents of Eden's NoContraction decoration. The three existing fma-based helpers now use inline instead of optnone. FP_CONTRACT OFF prevents implicit contraction, including conservatively in subsequent code of shaders that need these helpers. Explicit fma and the existing safe-math compilation policy remain unchanged. No SPIR-V translation is introduced.
+- Native `metal_shader.rs` differential test compares old/new helpers, including signed zero, NaN/Inf, subnormals, separate multiply/add and dependent chains. Exhaustive FP16 bit patterns for one operand are not exhaustive operand combinations or a complete guest-FP oracle. Timing is diagnostic, never a test assertion.
+
+### Verification
+- Re-read Eden emit_spirv_instructions.h declarations, emit_spirv_floating_point.cpp Decorate/Add/Mul/Fma and frontend/ir/modifiers.h. Instruction-level no_contraction selection is unchanged; no guest or resource ABI changes. Source-generation expectations now also require the pragma.
+- M2 Pro native differential test: 73728 triples, zero differing words in MSL 2.3 and 4.0. Full release suites with Metal validation: shader_recompiler 576 passed; video_core 1824 passed, 4 ignored; no warnings.
+- Scene-matched release GUI comparison: baseline 15.91 FPS, optimized 20.80 FPS, optimized repeat 20.81 FPS in the late hall window. Captures show no obvious geometry corruption; not a deterministic pixel oracle. Rebuilt/signed app is available. Memory, swap caveats, exact artifacts and remaining cross-title validation are recorded in METAL_SHADER_COST_STATE.md.

@@ -1842,6 +1842,20 @@ impl StreamOutLayout {
 /// Number of hardware viewports/scissors.
 pub const NUM_VIEWPORTS: usize = 16;
 
+/// Upstream `Maxwell3D::Regs::ViewportSwizzle` register encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ViewportSwizzle {
+    PositiveX = 0,
+    NegativeX = 1,
+    PositiveY = 2,
+    NegativeY = 3,
+    PositiveZ = 4,
+    NegativeZ = 5,
+    PositiveW = 6,
+    NegativeW = 7,
+}
+
 /// Viewport computed from scale/translate registers.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ViewportInfo {
@@ -4647,9 +4661,10 @@ impl Maxwell3D {
     fn process_query_condition(&mut self) {
         let condition_address = ((self.regs[RENDER_ENABLE_BASE as usize] as u64) << 32)
             | self.regs[(RENDER_ENABLE_BASE + 1) as usize] as u64;
+        let condition_state = self.render_condition_state();
         let accelerated = self
             .with_rasterizer_mut(|rasterizer| {
-                rasterizer.accelerate_conditional_rendering_with_address(condition_address, 24)
+                rasterizer.accelerate_conditional_rendering_with_state(condition_state)
             })
             .unwrap_or(false);
         if accelerated {

@@ -51,6 +51,9 @@ fn varying_mask_has_only_stage_inputs(stage: crate::stage::Stage, mask: &[u64; 8
                 crate::stage::Stage::Fragment => {
                     is_generic || matches!(attribute, 24 | 25 | 28..=31 | 184 | 185 | 255)
                 }
+                crate::stage::Stage::Geometry => is_generic || matches!(attribute, 24 | 28..=31),
+                crate::stage::Stage::TessellationControl => is_generic || matches!(attribute, 24 | 28..=31),
+                crate::stage::Stage::TessellationEval => is_generic || matches!(attribute, 24 | 28..=31 | 188 | 189),
                 _ => false,
             };
             if !allowed {
@@ -62,13 +65,16 @@ fn varying_mask_has_only_stage_inputs(stage: crate::stage::Stage, mask: &[u64; 8
     })
 }
 
-fn varying_mask_has_only_vertex_outputs(mask: &[u64; 8]) -> bool {
+fn varying_mask_has_only_vertex_outputs(stage: crate::stage::Stage, mask: &[u64; 8]) -> bool {
     mask.iter().enumerate().all(|(word_index, word)| {
         let mut remaining = *word;
         while remaining != 0 {
             let bit = remaining.trailing_zeros() as usize;
             let attribute = word_index * 64 + bit;
-            if !matches!(attribute, 27..=159 | 176..=183) {
+            let geometry_primitive_output = stage == crate::stage::Stage::Geometry
+                && (attribute == crate::ir::Attribute::LAYER.0 as usize
+                    || attribute == crate::ir::Attribute::VIEWPORT_INDEX.0 as usize);
+            if !matches!(attribute, 27..=159 | 176..=183) && !geometry_primitive_output {
                 return false;
             }
             remaining &= remaining - 1;
@@ -105,15 +111,19 @@ fn first_unsupported_program_feature(
     if program.stage != crate::stage::Stage::Compute && program.workgroup_size != [1, 1, 1] {
         return Some("workgroup size");
     }
-    if program.output_vertices != 0 || program.invocations != 1 {
+    if !matches!(program.stage, crate::stage::Stage::Geometry | crate::stage::Stage::TessellationControl)
+        && (program.output_vertices != 0 || program.invocations != 1)
+    {
         return Some("geometry execution modes");
     }
     if program.is_geometry_passthrough {
         return Some("geometry passthrough");
     }
     let supported_stage_loads = varying_mask_has_only_stage_inputs(program.stage, &info.loads.mask);
-    let supported_vertex_stores = program.stage == crate::stage::Stage::VertexB
-        && varying_mask_has_only_vertex_outputs(&info.stores.mask);
+    let supported_vertex_stores = matches!(
+        program.stage,
+        crate::stage::Stage::VertexB | crate::stage::Stage::Geometry | crate::stage::Stage::TessellationControl | crate::stage::Stage::TessellationEval
+    ) && varying_mask_has_only_vertex_outputs(program.stage, &info.stores.mask);
     let supported_fragment_colors = program.stage == crate::stage::Stage::Fragment;
     if (!supported_stage_loads && info.loads.mask.iter().any(|word| *word != 0))
         || (!supported_vertex_stores && info.stores.mask.iter().any(|word| *word != 0))
@@ -123,8 +133,8 @@ fn first_unsupported_program_feature(
         || (!supported_fragment_colors && info.stores_frag_color.iter().any(|store| *store))
         || ((info.stores_sample_mask || info.stores_frag_depth)
             && program.stage != crate::stage::Stage::Fragment)
-        || info.stores_tess_level_outer
-        || info.stores_tess_level_inner
+        || ((info.stores_tess_level_outer || info.stores_tess_level_inner)
+            && program.stage != crate::stage::Stage::TessellationControl)
         || !info.legacy_stores_mapping.is_empty()
     {
         return Some("stage inputs or outputs");
@@ -141,14 +151,15 @@ fn first_unsupported_program_feature(
     if info.uses_rescaling_uniform && !profile.unified_descriptor_binding {
         return Some("rescaling without unified descriptor binding");
     }
-    if info.uses_patches.iter().any(|used| *used) {
+    if info.uses_patches.iter().any(|used| *used) && !matches!(program.stage, crate::stage::Stage::TessellationControl | crate::stage::Stage::TessellationEval) {
         return Some("tessellation patches");
     }
     if info.uses_global_memory && !profile.support_int64 {
         return Some("global memory without 64-bit integers");
     }
-    if info.uses_invocation_id
-        || info.uses_invocation_info
+    if (info.uses_invocation_id
+        && !matches!(program.stage, crate::stage::Stage::Geometry | crate::stage::Stage::TessellationControl))
+        || (info.uses_invocation_info && !matches!(program.stage, crate::stage::Stage::Geometry | crate::stage::Stage::TessellationControl | crate::stage::Stage::TessellationEval))
         || info.requires_layer_emulation
         || info.emulated_layer != 0
     {
@@ -682,6 +693,10 @@ fn emit_inst(
         Opcode::GetAttributeU32 => {
             emit_msl_context_get_set::emit_get_attribute_u32(context, inst_ref, inst)
         }
+        Opcode::InvocationInfo => emit_msl_context_get_set::emit_invocation_info(context, inst_ref),
+        Opcode::InvocationId => emit_msl_context_get_set::emit_invocation_id(context, inst_ref),
+        Opcode::EmitVertex => emit_msl_special::emit_emit_vertex(context, inst),
+        Opcode::EndPrimitive => emit_msl_special::emit_end_primitive(context, inst),
         Opcode::LoadStorageU8
         | Opcode::LoadStorageS8
         | Opcode::LoadStorageU16
@@ -732,6 +747,9 @@ fn emit_inst(
         Opcode::VoteAll => emit_msl_warp::emit_vote_all(context, inst_ref, inst),
         Opcode::VoteAny => emit_msl_warp::emit_vote_any(context, inst_ref, inst),
         Opcode::VoteEqual => emit_msl_warp::emit_vote_equal(context, inst_ref, inst),
+        // TessellationEvaluationLayout verifies that all these uses are
+        // ignored TessCoord/PrimitiveId operands, not an observable value.
+        Opcode::LaneId if context.stage() == crate::stage::Stage::TessellationEval => Ok(()),
         Opcode::LaneId => emit_msl_warp::emit_lane_id(context, inst_ref),
         Opcode::SubgroupBallot => emit_msl_warp::emit_subgroup_ballot(context, inst_ref, inst),
         Opcode::SubgroupEqMask
@@ -876,41 +894,8 @@ fn emit_inst(
         | Opcode::ImageAtomicExchange32 => {
             emit_msl_image_atomic::emit_image_atomic(context, inst_ref, inst)
         }
-        Opcode::SetAttribute => {
-            let Value::Attribute(attribute) = inst.arg(0) else {
-                return Err(MslError::ExpectedImmediate {
-                    opcode: inst.opcode,
-                    arg: 0,
-                    expected: "attribute",
-                });
-            };
-            if immediate_u32(inst, 2)? != 0 {
-                return Err(MslError::UnsupportedProgramFeature(
-                    "per-vertex output indexing",
-                ));
-            }
-            if attribute.is_generic() {
-                return context.emit_set_generic(inst_ref, *attribute, inst.arg(1));
-            }
-            if attribute.is_position() {
-                return context.emit_set_position(
-                    inst_ref,
-                    attribute.position_element(),
-                    inst.arg(1),
-                );
-            }
-            if *attribute == crate::ir::value::Attribute::POINT_SIZE {
-                return context.emit_set_point_size(inst_ref, inst.arg(1));
-            }
-            if attribute.is_clip_distance() {
-                return context.emit_set_clip_distance(
-                    inst_ref,
-                    attribute.clip_distance_index(),
-                    inst.arg(1),
-                );
-            }
-            Err(MslError::UnsupportedAttribute(attribute.0))
-        }
+        Opcode::SetAttribute => emit_msl_context_get_set::emit_set_attribute(context, inst_ref, inst),
+        Opcode::GetPatch | Opcode::SetPatch => emit_msl_context_get_set::emit_patch(context, inst_ref, inst),
         Opcode::SetFragColor => {
             let render_target = immediate_u32(inst, 0)?;
             let component = immediate_u32(inst, 1)?;
@@ -1087,6 +1072,91 @@ pub fn emit_msl_with_options_and_bindings(
     options: &MslOptions,
     bindings: &mut Bindings,
 ) -> Result<MslShaderArtifact, MslError> {
+    emit_msl_function(
+        program,
+        profile,
+        runtime_info,
+        options,
+        bindings,
+        super::msl_function::MslFunctionKind::StageEntryPoint,
+    )
+}
+
+/// Emit the unchanged vertex IR as a function for native stage composition.
+/// Its caller supplies builtins and resources using the returned parameter ABI.
+pub fn emit_msl_vertex_function(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+) -> Result<MslShaderArtifact, MslError> {
+    emit_msl_function(
+        program,
+        profile,
+        runtime_info,
+        options,
+        bindings,
+        super::msl_function::MslFunctionKind::VertexFunction,
+    )
+}
+
+/// Emit geometry IR once into a caller-supplied output transport. The transport
+/// implements the mesh emission operations; no guest instruction is replayed
+/// when its captured primitives are subsequently rasterized.
+pub fn emit_msl_geometry_function(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+) -> Result<MslShaderArtifact, MslError> {
+    emit_msl_function(
+        program,
+        profile,
+        runtime_info,
+        options,
+        bindings,
+        super::msl_function::MslFunctionKind::GeometryFunction,
+    )
+}
+
+/// Callable TCS; its compute caller supplies one complete patch per workgroup,
+/// invocation IDs and retained input/output storage. No tessellation is faked
+/// by treating this as a normal vertex entry point.
+pub fn emit_msl_tessellation_control_function(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+) -> Result<MslShaderArtifact, MslError> {
+    emit_msl_function(program, profile, runtime_info, options, bindings,
+        super::msl_function::MslFunctionKind::TessellationControlFunction)
+}
+
+/// Callable TES. Its native post-tessellation caller supplies hardware domain
+/// coordinates and the actual producer's device-buffer types, without
+/// reinterpreting a consumer subset as a differently-strided input record.
+pub fn emit_msl_tessellation_evaluation_function(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+) -> Result<MslShaderArtifact, MslError> {
+    emit_msl_function(program, profile, runtime_info, options, bindings,
+        super::msl_function::MslFunctionKind::TessellationEvaluationFunction)
+}
+
+fn emit_msl_function(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+    kind: super::msl_function::MslFunctionKind,
+) -> Result<MslShaderArtifact, MslError> {
     if program.info.uses_fp32_denorms_preserve {
         // Metal has no explicit denorm-preserve execution mode. Match
         // upstream `SetupDenormControl` on a host without preserve support:
@@ -1098,7 +1168,8 @@ pub fn emit_msl_with_options_and_bindings(
     }
     let mut program = program.clone();
     precolor(&mut program);
-    let mut context = MslEmitContext::new(&program, profile, runtime_info, options, bindings)?;
+    let mut context =
+        MslEmitContext::new_with_kind(&program, profile, runtime_info, options, bindings, kind)?;
     declare_phis(&mut context, &program)?;
     emit_program(&mut context, &program)?;
     Ok(context.finish())
@@ -1251,6 +1322,41 @@ mod tests {
             vec![Value::ImmF32(1.0), Value::ImmF32(2.0), Value::ImmU32(0xE4)],
         );
         program
+    }
+
+    #[test]
+    fn sampler_argument_abi_is_shared_by_entry_points_and_callable_stages() {
+        use super::super::msl_function::MslParameterAttribute;
+        for stage in [Stage::VertexB, Stage::Fragment, Stage::Compute, Stage::Geometry] {
+            for count in [16, 17] {
+                let mut program = sampled_texture_program(count, true);
+                program.stage = stage;
+                if stage == Stage::Geometry {
+                    program.output_vertices = 3;
+                    program.invocations = 1;
+                }
+                let options = MslOptions { language_version: super::super::MslVersion::V3_0, ..Default::default() };
+                let profile = Profile::default();
+                let runtime = RuntimeInfo { input_topology: crate::runtime_info::InputTopology::Triangles, ..Default::default() };
+                let mut bindings = Bindings::default();
+                let artifact = match stage {
+                    Stage::Geometry => emit_msl_geometry_function(&program, &profile, &runtime, &options, &mut bindings),
+                    Stage::VertexB => emit_msl_vertex_function(&program, &profile, &runtime, &options, &mut bindings),
+                    _ => emit_msl_with_options_and_bindings(&program, &profile, &runtime, &options, &mut bindings),
+                }.unwrap();
+                assert_eq!(artifact.bindings.sampler_count, count);
+                assert_eq!(artifact.bindings.sampler_argument_buffer_index.is_some(), count > 16);
+                let interface = artifact.interface.as_ref().unwrap();
+                let direct = interface.parameters.iter().filter(|p| matches!(p.attribute, MslParameterAttribute::Sampler(_))).count();
+                assert_eq!(direct, usize::from(count <= 16));
+                if count > 16 {
+                    let index = artifact.bindings.sampler_argument_buffer_index.unwrap();
+                    assert!(interface.parameters.iter().any(|p| p.name == "sampler_arguments" && p.attribute == MslParameterAttribute::Buffer(index)));
+                    assert!(artifact.source.source.contains("sampler_arguments.samp0["));
+                    assert!(artifact.source.source.contains("array<sampler, 17> samp0 [[id(0)]];"));
+                }
+            }
+        }
     }
 
     fn sampled_texture_program(count: u32, explicit_lod: bool) -> ir::Program {
@@ -3943,7 +4049,8 @@ mod tests {
         assert!(artifact
             .source
             .source
-            .contains("[[clang::optnone]] T spvFAdd"));
+            .contains("inline T spvFAdd"));
+        assert!(artifact.source.source.contains("#pragma STDC FP_CONTRACT OFF"));
         assert_eq!(integer, 0);
     }
 

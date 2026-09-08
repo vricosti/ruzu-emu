@@ -1411,6 +1411,15 @@ impl GMainWindow {
         this.start_input_driver_updates();
         this.start_status_bar_updates();
 
+        #[cfg(unix)]
+        {
+            let weak = Rc::downgrade(&this);
+            crate::input_session::start(move |command| {
+                let window = weak.upgrade().ok_or("window is closed")?;
+                window.input_session_command(command)
+            });
+        }
+
         // Game list page: activating a row boots that game in-process.
         let (game_list, game_list_handle) = crate::game_list::build(
             &this.hid_core,
@@ -3282,6 +3291,40 @@ impl GMainWindow {
             .is_some_and(|session| session.capture_screenshot(path, layout))
         {
             log::error!("Failed to send screenshot request to the emulation thread");
+        }
+    }
+
+    #[cfg(unix)]
+    fn input_session_command(&self, command: crate::input_session::Command) -> Result<serde_json::Value, String> {
+        use crate::input_session::Command;
+        use hid_core::hid_types::NpadIdType;
+        use serde_json::json;
+        match command {
+            Command::Buttons { ids, pressed } => {
+                if pressed && self.session.borrow().is_none() { return Err("no emulation session".into()) }
+                let mut input = self.input_subsystem.borrow_mut();
+                let pad = input.get_virtual_gamepad_mut().ok_or("virtual gamepad unavailable")?;
+                for id in ids { pad.set_button_state_by_id(0, id, pressed); }
+                Ok(json!({"pressed": pressed}))
+            }
+            Command::Capture(path) => {
+                let accepted = self.session.borrow().as_ref().is_some_and(|session| {
+                    session.capture_screenshot(path.clone(), default_frame_layout(960, 540))
+                });
+                if !accepted { return Err("no active screenshot receiver".into()) }
+                Ok(json!({"queued": path}))
+            }
+            Command::Status => {
+                let controller = self.hid_core.lock().get_emulated_controller(NpadIdType::Player1);
+                let controller = controller.lock();
+                let buttons: Vec<bool> = controller.get_buttons_values().iter().map(|value| value.value).collect();
+                let performance = self.session.borrow().as_ref().and_then(EmulationSession::perf_stats)
+                    .map(|stats| json!({"game_fps": stats.average_game_fps,
+                        "system_fps": stats.system_fps, "frame_seconds": stats.frametime}));
+                Ok(json!({"pid": std::process::id(), "has_session": self.session.borrow().is_some(),
+                    "generation": self.session_generation.get(), "buttons": buttons,
+                    "performance": performance}))
+            }
         }
     }
 

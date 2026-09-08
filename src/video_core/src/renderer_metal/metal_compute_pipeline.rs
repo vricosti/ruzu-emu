@@ -42,6 +42,8 @@ use super::metal_texture_cache::MetalTextureCache;
 
 #[derive(Debug, Error)]
 pub enum MetalComputePipelineError {
+    #[error(transparent)]
+    Descriptor(#[from] super::metal_update_descriptor::MetalDescriptorError),
     #[error("compute descriptor references disabled constant buffer {0}")]
     DisabledConstantBuffer(u32),
     #[error("compute image view {0} was not materialized")]
@@ -98,6 +100,7 @@ pub struct MetalPreparedCompute {
     pub buffers: Vec<MetalComputeBufferBinding>,
     pub textures: Vec<MetalComputeTextureBinding>,
     pub samplers: Vec<MetalComputeSamplerBinding>,
+    pub samplers_in_argument_buffer: bool,
     pub push_constants: Option<(u32, [u8; 32])>,
     pub image_views: Vec<ImageViewInOut>,
 }
@@ -429,10 +432,12 @@ pub fn configure_compute_resources(
                 .sampler(sampler_id)
                 .or_else(|| texture_cache.sampler(NULL_SAMPLER_ID))
                 .ok_or(MetalComputePipelineError::MissingSampler(sampler_id.index))?;
-            let sampler = if sampler.has_added_anisotropy() && !supports_anisotropy {
-                sampler.retained_handle_with_default_anisotropy()
-            } else if sampler.has_linear_filtering() && is_pixel_format_integer(format) {
+            let sampler = if sampler.has_linear_filtering()
+                && (descriptor.is_integer || is_pixel_format_integer(format))
+            {
                 sampler.retained_handle_with_nearest_filter()
+            } else if sampler.has_added_anisotropy() && !supports_anisotropy {
+                sampler.retained_handle_with_default_anisotropy()
             } else if descriptor.is_depth
                 && sampler.has_depth_comparison()
                 && !supports_depth_comparison
@@ -482,6 +487,15 @@ pub fn configure_compute_resources(
     }
 
     let mut prepared = bind_reflected_layout(pipeline.shader().bindings(), declarations)?;
+    if let Some(arguments) = super::metal_update_descriptor::MetalSamplerArgumentBuffer::new(
+        device, pipeline.shader().bindings(),
+        prepared.samplers.iter().map(|sampler| (sampler.index, &sampler.sampler)),
+    )? {
+        prepared.buffers.push(MetalComputeBufferBinding {
+            index: arguments.index, buffer: arguments.buffer, offset: 0,
+        });
+        prepared.samplers_in_argument_buffer = true;
+    }
     if let Some(index) = pipeline.shader().bindings().push_constant_buffer_index {
         prepared.push_constants = Some((index, make_push_constants(info, &rescaling)));
     }
@@ -504,7 +518,7 @@ pub fn bind_compute_resources(
         for binding in &prepared.textures {
             encoder.setTexture_atIndex(binding.texture.as_deref(), binding.index as usize);
         }
-        for binding in &prepared.samplers {
+        for binding in prepared.samplers.iter().filter(|_| !prepared.samplers_in_argument_buffer) {
             encoder.setSamplerState_atIndex(Some(&binding.sampler), binding.index as usize);
         }
         if let Some((index, bytes)) = &prepared.push_constants {

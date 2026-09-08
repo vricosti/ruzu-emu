@@ -872,7 +872,147 @@ impl ServiceFramework for ISslService {
     }
 }
 
-/// Registers the "ssl" service.
+/// Port of ISslServiceForSystem in upstream ssl.cpp.
+/// Upstream currently returns only ResultSuccess for every command, including
+/// CreateContextForSystem. This interface must not alias the ordinary TLS service.
+pub struct ISslServiceForSystem {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl ISslServiceForSystem {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, Some(Self::create_context), "CreateContext"),
+                (1, Some(Self::get_context_count), "GetContextCount"),
+                (2, Some(Self::get_certificates), "GetCertificates"),
+                (3, Some(Self::get_certificate_buf_size), "GetCertificateBufSize"),
+                (4, Some(Self::debug_ioctl), "DebugIoctl"),
+                (5, Some(Self::set_interface_version), "SetInterfaceVersion"),
+                (6, Some(Self::flush_session_cache), "FlushSessionCache"),
+                (7, Some(Self::set_debug_option), "SetDebugOption"),
+                (8, Some(Self::get_debug_option), "GetDebugOption"),
+                (9, Some(Self::clear_tls12_fallback_flag), "ClearTls12FallbackFlag"),
+                (100, Some(Self::create_context_for_system), "CreateContextForSystem"),
+                (101, Some(Self::set_thread_core_mask), "SetThreadCoreMask"),
+                (102, Some(Self::get_thread_core_mask), "GetThreadCoreMask"),
+                (103, Some(Self::verify_signature), "VerifySignature"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn create_context(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::CreateContext (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_context_count(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::GetContextCount (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_certificates(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::GetCertificates (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_certificate_buf_size(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::GetCertificateBufSize (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn debug_ioctl(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::DebugIoctl (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_interface_version(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::SetInterfaceVersion (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn flush_session_cache(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::FlushSessionCache (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_debug_option(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::SetDebugOption (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_debug_option(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::GetDebugOption (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn clear_tls12_fallback_flag(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::ClearTls12FallbackFlag (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn create_context_for_system(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::CreateContextForSystem (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_thread_core_mask(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::SetThreadCoreMask (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_thread_core_mask(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::GetThreadCoreMask (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn verify_signature(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("ISslServiceForSystem::VerifySignature (STUBBED) called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for ISslServiceForSystem {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ssl:s"
+    }
+}
+
+impl ServiceFramework for ISslServiceForSystem {
+    fn get_service_name(&self) -> &str {
+        "ssl:s"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+/// Registers the "ssl" and "ssl:s" services.
 ///
 /// Corresponds to `Service::SSL::LoopProcess` in upstream `ssl.cpp`.
 pub fn loop_process(system: crate::core::SystemRef) {
@@ -884,6 +1024,11 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service_handler(
             "ssl",
             Arc::new(ISslService::new(system)),
+            64,
+        );
+        server_manager.register_named_service_handler(
+            "ssl:s",
+            Arc::new(ISslServiceForSystem::new()),
             64,
         );
     }
@@ -962,10 +1107,53 @@ mod tests {
 
     #[test]
     fn ssl_service_handler_table_matches_upstream_slice() {
-        let service = ISslService::new(SystemRef::null());
-        assert_eq!(service.handlers().len(), 9);
-        assert!(service.handlers().contains_key(&0));
-        assert!(service.handlers().contains_key(&5));
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let system = Box::new(crate::core::System::new_for_test());
+                let service = ISslService::new(SystemRef::from_ref(&system));
+                assert_eq!(service.handlers().len(), 9);
+                assert!(service.handlers().contains_key(&0));
+                assert!(service.handlers().contains_key(&5));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn system_ssl_commands_match_upstream_result_only_responses() {
+        let service = ISslServiceForSystem::new();
+        assert_eq!(service.get_service_name(), "ssl:s");
+        let expected = [
+            (0, "CreateContext"),
+            (1, "GetContextCount"),
+            (2, "GetCertificates"),
+            (3, "GetCertificateBufSize"),
+            (4, "DebugIoctl"),
+            (5, "SetInterfaceVersion"),
+            (6, "FlushSessionCache"),
+            (7, "SetDebugOption"),
+            (8, "GetDebugOption"),
+            (9, "ClearTls12FallbackFlag"),
+            (100, "CreateContextForSystem"),
+            (101, "SetThreadCoreMask"),
+            (102, "GetThreadCoreMask"),
+            (103, "VerifySignature"),
+        ];
+        assert_eq!(service.handlers().len(), expected.len());
+        for (id, name) in expected {
+            let handler = &service.handlers()[&id];
+            assert_eq!(handler.name, name);
+            let mut ctx = HLERequestContext::new();
+            ctx.command_buffer_mut().fill(0xdead_beef);
+            (handler.handler_callback.unwrap())(&service, &mut ctx);
+            assert_eq!(ctx.command_buffer()[6], 0, "command {id}");
+            assert_eq!(ctx.command_buffer()[7], 0, "command {id}");
+            // No handle descriptor: even CreateContextForSystem has no output
+            // interface in the upstream implementation.
+            assert_eq!(ctx.command_buffer()[1] >> 31, 0, "command {id}");
+        }
     }
 
     #[test]

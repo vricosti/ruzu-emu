@@ -404,7 +404,7 @@ impl StaticService {
         if let Some(shared_time) = &self.shared_time {
             let mut time = shared_time.lock().unwrap();
             if !time.standard_user_system_clock.is_initialized()
-                || !time.standard_steady_clock.state.is_initialized()
+                || !time.standard_steady_clock.lock().unwrap().state.is_initialized()
             {
                 return RESULT_CLOCK_UNINITIALIZED;
             }
@@ -429,7 +429,7 @@ impl StaticService {
                 .set_automatic_correction(automatic_correction);
 
             let time_point = match super::clocks::steady_clock_core::get_current_time_point(
-                &time.standard_steady_clock,
+                &*time.standard_steady_clock.lock().unwrap(),
             ) {
                 Ok(time_point) => time_point,
                 Err(rc) => return rc,
@@ -517,18 +517,18 @@ impl StaticService {
     ) -> Result<i64, ResultCode> {
         if let Some(shared_time) = &self.shared_time {
             let time = shared_time.lock().unwrap();
-            if !time.standard_steady_clock.state.is_initialized() {
+            if !time.standard_steady_clock.lock().unwrap().state.is_initialized() {
                 return Err(RESULT_CLOCK_UNINITIALIZED);
             }
 
             let time_point = super::clocks::steady_clock_core::get_current_time_point(
-                &time.standard_steady_clock,
+                &*time.standard_steady_clock.lock().unwrap(),
             )?;
             if !time_point.id_matches(&context.steady_time_point) {
                 return Err(RESULT_CLOCK_MISMATCH);
             }
 
-            let current_time_s = time.standard_steady_clock.get_current_uptime_ns() / 1_000_000_000;
+            let current_time_s = time.standard_steady_clock.lock().unwrap().get_current_uptime_ns() / 1_000_000_000;
             return Ok((context.offset + time_point.time_point) - current_time_s);
         }
 
@@ -1134,7 +1134,7 @@ impl StaticService {
         snapshot.user_context = *user_context;
         snapshot.network_context = *network_context;
         snapshot.steady_clock_time_point =
-            super::clocks::steady_clock_core::get_current_time_point(&time.standard_steady_clock)?;
+            super::clocks::steady_clock_core::get_current_time_point(&*time.standard_steady_clock.lock().unwrap())?;
         snapshot.is_automatic_correction_enabled =
             time.standard_user_system_clock.get_automatic_correction();
         snapshot.location_name = time.time_zone.get_location_name().unwrap_or([0u8; 0x24]);

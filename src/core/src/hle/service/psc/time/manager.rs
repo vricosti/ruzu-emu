@@ -28,9 +28,8 @@ use super::time_zone::TimeZone;
 ///
 /// Corresponds to `PSC::Time::TimeManager` in upstream manager.h.
 pub struct TimeManager {
-    pub steady_clock_source_id: Arc<Mutex<super::common::ClockSourceId>>,
-    pub standard_steady_clock: StandardSteadyClockCore,
-    pub tick_based_steady_clock: TickBasedSteadyClockCore,
+    pub standard_steady_clock: Arc<Mutex<StandardSteadyClockCore>>,
+    pub tick_based_steady_clock: Arc<TickBasedSteadyClockCore>,
     pub standard_local_system_clock: StandardLocalSystemClockCore,
     pub standard_network_system_clock: StandardNetworkSystemClockCore,
     pub standard_user_system_clock: StandardUserSystemClockCore,
@@ -59,58 +58,46 @@ impl TimeManager {
         memory_manager: Option<&mut crate::hle::kernel::k_memory_manager::KMemoryManager>,
     ) -> Self {
         let get_ticks_ns = Arc::new(get_ticks_ns);
-        let steady_clock_source_id = Arc::new(Mutex::new([0u8; 16]));
-
-        // Helper to create a steady clock time point callback from the tick source.
-        let make_time_point_cb =
-            |ticks: Arc<Box<dyn Fn() -> i64 + Send + Sync>>,
-             clock_source_id: Arc<Mutex<super::common::ClockSourceId>>| {
-                Box::new(move || {
-                    let ticks_ns = ticks();
-                    let current_time_s = ticks_ns / 1_000_000_000;
-                    Ok(
-                        crate::hle::service::psc::time::common::SteadyClockTimePoint {
-                            time_point: current_time_s,
-                            clock_source_id: *clock_source_id.lock().unwrap(),
-                        },
-                    )
-                })
-                    as Box<
-                        dyn Fn() -> Result<
-                                crate::hle::service::psc::time::common::SteadyClockTimePoint,
-                                crate::hle::result::ResultCode,
-                            > + Send
-                            + Sync,
-                    >
-            };
+        // Preserve upstream references to the actual steady clock, including its
+        // RTC base, offsets and monotonic clamp. Arc keeps the referenced owner
+        // stable when TimeManager moves; callbacks never relock TimeManager.
+        let make_time_point_cb = |clock: Arc<Mutex<StandardSteadyClockCore>>| {
+            Box::new(move || {
+                super::clocks::steady_clock_core::get_current_time_point(&*clock.lock().unwrap())
+            })
+                as Box<
+                    dyn Fn() -> Result<
+                            crate::hle::service::psc::time::common::SteadyClockTimePoint,
+                            crate::hle::result::ResultCode,
+                        > + Send
+                        + Sync,
+                >
+        };
 
         // StandardSteadyClockCore
-        let standard_steady_clock = StandardSteadyClockCore::new({
+        let standard_steady_clock = Arc::new(Mutex::new(StandardSteadyClockCore::new({
             let ticks = Arc::clone(&get_ticks_ns);
             Box::new(move || ticks())
-        });
+        })));
 
         // TickBasedSteadyClockCore
-        let tick_based_steady_clock = TickBasedSteadyClockCore::new({
+        let tick_based_steady_clock = Arc::new(TickBasedSteadyClockCore::new({
             let ticks = Arc::clone(&get_ticks_ns);
             Box::new(move || ticks())
-        });
+        }));
 
         // System clock cores — each gets a time point callback from the tick source
         let standard_local_system_clock = StandardLocalSystemClockCore::new(make_time_point_cb(
-            Arc::clone(&get_ticks_ns),
-            Arc::clone(&steady_clock_source_id),
+            Arc::clone(&standard_steady_clock),
         ));
-        let standard_network_system_clock =
-            StandardNetworkSystemClockCore::new(make_time_point_cb(
-                Arc::clone(&get_ticks_ns),
-                Arc::clone(&steady_clock_source_id),
-            ));
+        let standard_network_system_clock = StandardNetworkSystemClockCore::new(
+            make_time_point_cb(Arc::clone(&standard_steady_clock)),
+        );
         let standard_user_system_clock = StandardUserSystemClockCore::new();
-        let ephemeral_network_clock = EphemeralNetworkSystemClockCore::new(make_time_point_cb(
-            Arc::clone(&get_ticks_ns),
-            Arc::clone(&steady_clock_source_id),
-        ));
+        let ephemeral_network_clock = EphemeralNetworkSystemClockCore::new({
+            let clock = Arc::clone(&tick_based_steady_clock);
+            Box::new(move || super::clocks::steady_clock_core::get_current_time_point(&*clock))
+        });
 
         // TimeZone
         let time_zone = TimeZone::new();
@@ -128,8 +115,10 @@ impl TimeManager {
 
         // Alarms — gets a raw time callback from the steady clock tick source
         let alarms = Alarms::new({
-            let ticks = Arc::clone(&get_ticks_ns);
-            Box::new(move || ticks())
+            let clock = Arc::clone(&standard_steady_clock);
+            Box::new(move || {
+                super::clocks::steady_clock_core::get_raw_time(&*clock.lock().unwrap())
+            })
         });
 
         // Context writers
@@ -142,7 +131,6 @@ impl TimeManager {
             EphemeralNetworkSystemClockContextWriter::new();
 
         Self {
-            steady_clock_source_id,
             standard_steady_clock,
             tick_based_steady_clock,
             standard_local_system_clock,
@@ -170,10 +158,89 @@ mod tests {
     use super::TimeManager;
 
     #[test]
+    fn system_clocks_follow_live_standard_clock_and_ephemeral_uses_tick_clock() {
+        use super::super::clocks::steady_clock_core::{
+            get_current_time_point, SteadyClockCoreImpl,
+        };
+        use std::sync::{
+            atomic::{AtomicI64, Ordering},
+            Arc,
+        };
+        let ticks = Arc::new(AtomicI64::new(5_000_000_000));
+        let manager = TimeManager::new(Box::new({
+            let ticks = Arc::clone(&ticks);
+            move || ticks.load(Ordering::Relaxed)
+        }));
+        let id = [0x24; 16];
+        manager.standard_steady_clock.lock().unwrap().initialize(
+            id,
+            100_000_000_000,
+            2_000_000_000,
+            3_000_000_000,
+            false,
+        );
+        for elapsed in [5, 8, 6] {
+            ticks.store(elapsed * 1_000_000_000, Ordering::Relaxed);
+            let expected =
+                get_current_time_point(&*manager.standard_steady_clock.lock().unwrap()).unwrap();
+            assert_eq!(
+                manager
+                    .standard_local_system_clock
+                    .clock
+                    .get_current_time_point()
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                manager
+                    .standard_network_system_clock
+                    .clock
+                    .get_current_time_point()
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                manager.alarms.get_raw_time(),
+                expected.time_point * 1_000_000_000
+            );
+            let ephemeral = manager
+                .ephemeral_network_clock
+                .clock
+                .get_current_time_point()
+                .unwrap();
+            assert_eq!(
+                ephemeral,
+                get_current_time_point(&*manager.tick_based_steady_clock).unwrap()
+            );
+            assert_eq!(ephemeral.time_point, elapsed);
+            assert_ne!(ephemeral.clock_source_id, id);
+        }
+        {
+            let mut clock = manager.standard_steady_clock.lock().unwrap();
+            clock.set_rtc_offset(200_000_000_000);
+            clock.set_internal_offset_impl(4_000_000_000);
+            clock.set_test_offset_impl(5_000_000_000);
+        }
+        assert_eq!(
+            manager
+                .standard_local_system_clock
+                .clock
+                .get_current_time_point()
+                .unwrap()
+                .time_point,
+            215
+        );
+    }
+
+    #[test]
     fn local_clock_callback_uses_updated_shared_clock_source_id() {
         let manager = TimeManager::new(Box::new(|| 5_000_000_000));
         let new_id = [0x5Au8; 16];
-        *manager.steady_clock_source_id.lock().unwrap() = new_id;
+        manager
+            .standard_steady_clock
+            .lock()
+            .unwrap()
+            .initialize(new_id, 0, 0, 0, false);
 
         let time_point = manager
             .standard_local_system_clock

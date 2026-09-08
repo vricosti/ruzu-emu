@@ -25,15 +25,7 @@ pub struct TickBasedSteadyClockCore {
 
 impl TickBasedSteadyClockCore {
     pub fn new(get_ticks_ns: Box<dyn Fn() -> i64 + Send + Sync>) -> Self {
-        // Upstream: m_clock_source_id is initialized with Common::UUID::MakeRandom()
-        // We use a fixed placeholder; real UUID generation will be wired later.
-        let clock_source_id: ClockSourceId = {
-            let mut id = [0u8; 16];
-            // Simple placeholder: non-zero to distinguish from default
-            id[0] = 0x01;
-            id[15] = 0x01;
-            id
-        };
+        let clock_source_id = common::uuid::UUID::make_random().uuid;
         Self {
             state: SteadyClockCoreState::new(),
             clock_source_id,

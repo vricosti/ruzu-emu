@@ -911,7 +911,7 @@ mod tests {
         {
             let manager = time_manager.lock().unwrap();
             let mut time = manager.psc_time.lock().unwrap();
-            time.standard_steady_clock
+            time.standard_steady_clock.lock().unwrap()
                 .initialize([0; 16], 0, 0, 0, false);
             time.standard_local_system_clock
                 .initialize(&SystemClockContext::default(), 0);

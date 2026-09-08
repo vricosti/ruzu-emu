@@ -2196,6 +2196,7 @@ dependencies = [
  "embed-resource",
  "frontend_common",
  "gdk4-x11",
+ "getrandom 0.2.17",
  "gtk4",
  "hid_core",
  "input_common",

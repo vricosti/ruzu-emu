@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Rust/GTK4 counterpart of
-// `/home/vricosti/Dev/emulators/zuyu/src/yuzu/configuration/configure_web.cpp`
+// Eden `src/yuzu/configuration/configure_web.cpp`
 // (`ConfigureWeb`), whose widget tree lives in `configure_web.ui`.
 //
-// Two groups: the web-service credentials (username, token, Verify) and the
-// telemetry opt-in with its regenerable telemetry ID.
+// Local multiplayer identity validation and token generation. No telemetry
+// controls: upstream removed them. Discord support is not compiled in Ruzu.
 
 use gtk::prelude::*;
 
@@ -19,14 +19,6 @@ pub fn page() -> Page {
     // --- "ruzu Web Service" ----------------------------------------------
     let (service_group, service) = w::group("ruzu Web Service");
 
-    let consent = gtk::Label::new(Some(
-        "By providing your username and token, you agree to allow ruzu to collect additional \
-         usage data, which may include user identifying information.",
-    ));
-    consent.set_xalign(0.0);
-    consent.set_wrap(true);
-    service.append(&consent);
-
     let username_value = common::settings::values().eden_username.get_value().clone();
     let (username_row, username) = w::entry_row("Username:", &username_value);
     service.append(&username_row);
@@ -36,85 +28,88 @@ pub fn page() -> Page {
     // Upstream sets `QLineEdit::Password` echo mode on the token field.
     token.set_visibility(false);
     service.append(&token_row);
-
-    let links = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let sign_up = gtk::LinkButton::with_label("https://profile.yuzu-emu.org/", "Sign up");
-    sign_up.set_has_frame(false);
-    let what_is_token = gtk::LinkButton::with_label(
-        "https://yuzu-emu.org/wiki/yuzu-web-service/",
-        "What is my token?",
-    );
-    what_is_token.set_has_frame(false);
-    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    let verify = gtk::Button::with_label("Verify");
-    links.append(&sign_up);
-    links.append(&what_is_token);
-    links.append(&spacer);
-    links.append(&verify);
-    service.append(&links);
-
+    let username_status = gtk::Label::new(None);
+    let token_status = gtk::Label::new(None);
+    service.append(&username_status);
+    service.append(&token_status);
+    for (entry, status, is_token) in [
+        (&username, &username_status, false), (&token, &token_status, true),
+    ] {
+        // Like QRegularExpressionValidator, permit incomplete input while
+        // rejecting characters/lengths that cannot become an acceptable value.
+        entry.connect_insert_text(move |entry, inserted, _| {
+            let limit = if is_token { 48 } else { 20 };
+            if entry.text().chars().count() + inserted.chars().count() > limit
+                || (is_token && !inserted.bytes().all(|byte| byte.is_ascii_lowercase()))
+                || (!is_token && inserted.contains('\n'))
+            {
+                entry.stop_signal_emission_by_name("insert-text");
+            }
+        });
+        verify_login(entry, status, is_token);
+        let status = status.clone();
+        entry.connect_changed(move |entry| verify_login(entry, &status, is_token));
+    }
+    let generate = gtk::Button::with_label("Generate Token");
+    let token_for_generate = token.clone();
+    generate.connect_clicked(move |_| {
+        match generate_token() {
+            Ok(value) => token_for_generate.set_text(&value),
+            Err(error) => token_status.set_text(&format!("Could not generate token: {error}")),
+        }
+    });
+    service.append(&generate);
     column.append(&service_group);
-
-    // --- "Telemetry" ------------------------------------------------------
-    let (telemetry_group, telemetry) = w::group("Telemetry");
-
-    let share = w::check_row(
-        "Share anonymous usage data with the ruzu team",
-        *common::settings::values().enable_telemetry.get_value(),
-    );
-    telemetry.append(&share);
-
-    let learn_more =
-        gtk::LinkButton::with_label("https://yuzu-emu.org/help/feature/telemetry/", "Learn more");
-    learn_more.set_has_frame(false);
-    learn_more.set_halign(gtk::Align::Start);
-    telemetry.append(&learn_more);
-
-    let id_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let telemetry_id = gtk::Label::new(Some(&format!(
-        "Telemetry ID: 0x{:016X}",
-        current_telemetry_id()
-    )));
-    telemetry_id.set_xalign(0.0);
-    telemetry_id.set_hexpand(true);
-    let regenerate = gtk::Button::with_label("Regenerate");
-    id_row.append(&telemetry_id);
-    id_row.append(&regenerate);
-    telemetry.append(&id_row);
-
-    column.append(&telemetry_group);
-
-    // Upstream's Verify posts the token to the web service and reports the
-    // result; Regenerate calls `Core::RegenerateTelemetryId()`. Neither the web
-    // service client nor the telemetry store is wired into ruzu yet.
-    verify.connect_clicked(|_| {
-        log::info!("Web: Verify requested (web service client not yet wired)");
-    });
-    regenerate.connect_clicked(|_| {
-        log::info!("Web: Regenerate telemetry ID requested (telemetry store not yet wired)");
-    });
 
     Page::new("Web", scroller, move || {
         let token_text = token.text().to_string();
-        let telemetry_enabled = share.is_active();
         let mut values = common::settings::values_mut();
         values.eden_username.set_value(username.text().to_string());
         values.eden_token.set_value(token_text);
-        values.enable_telemetry.set_value(telemetry_enabled);
     })
 }
 
-/// The telemetry ID upstream reads from `Core::GetTelemetryId()`. That store is
-/// not ported, so report 0 rather than inventing an ID that would then differ
-/// from whatever the real store eventually holds.
-fn current_telemetry_id() -> u64 {
-    0
+fn verify_login(entry: &gtk::Entry, status: &gtk::Label, is_token: bool) {
+    let text = entry.text();
+    let valid = if is_token {
+        text.len() == 48 && text.bytes().all(|byte| byte.is_ascii_lowercase())
+    } else {
+        (4..=20).contains(&text.chars().count()) && !text.contains('\n')
+    };
+    status.set_text(if valid { "All Good" } else if is_token {
+        "Must be 48 characters, and lowercase a-z"
+    } else { "Must be between 4-20 characters" });
+}
+
+/// ConfigureWeb::GenerateToken: system entropy replaces QRandomGenerator::system.
+/// Reject the uneven tail before mapping bytes to the 26-letter alphabet.
+fn generate_token() -> Result<String, getrandom::Error> {
+    let mut result = String::with_capacity(48);
+    while result.len() < 48 {
+        let mut bytes = [0; 64];
+        getrandom::getrandom(&mut bytes)?;
+        for byte in bytes {
+            if byte < 234 {
+                result.push((b'a' + byte % 26) as char);
+                if result.len() == 48 { break; }
+            }
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_tokens_match_upstream_alphabet_and_length() {
+        for _ in 0..32 {
+            let token = generate_token().unwrap();
+            assert_eq!(token.len(), 48);
+            assert!(token.bytes().all(|byte| byte.is_ascii_lowercase()));
+        }
+    }
 
     #[test]
     #[ignore = "requires a GTK display; run alone in its own test process"]
@@ -143,6 +138,10 @@ mod tests {
         assert_eq!(edits.len(), 2);
         assert_eq!(edits[0].text(), "InitialUser");
         assert_eq!(edits[1].text(), "a".repeat(48));
+        edits[1].set_text("");
+        let mut position = 0;
+        edits[1].insert_text("ABC123", &mut position);
+        assert!(edits[1].text().is_empty());
         edits[0].set_text("LocalUser");
         edits[1].set_text(&"b".repeat(48));
         (page.apply)();

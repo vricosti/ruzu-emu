@@ -209,7 +209,13 @@ fn main() -> glib::ExitCode {
     #[cfg(target_os = "linux")]
     let forced_x11 = configure_linux_gdk_backend();
 
-    env_logger::init();
+    configuration::qt_config::reload_all_values();
+    let log_filter = common::settings::values().log_filter.get_value().clone();
+    common::logging::backend::initialize_with_config(
+        Some(common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::LogDir)),
+        &log_filter,
+        uisettings::with(|values| *values.show_console.get_value()),
+    );
 
     #[cfg(target_os = "windows")]
     if enabled_native_windows_decorations {
@@ -231,7 +237,6 @@ fn main() -> glib::ExitCode {
     // rather than the eagerly-created config directory, owns first-run state.
 
     // QtConfig owns the complete reload, including controls and frontend state.
-    configuration::qt_config::reload_all_values();
     let interface_language = uisettings::with(|v| v.language.get_value().clone());
     i18n::set_language(&interface_language);
     i18n::configure_toolkit_language(&interface_language);
@@ -289,7 +294,9 @@ fn main() -> glib::ExitCode {
         }
     });
 
-    app.run()
+    let result = app.run();
+    common::logging::backend::stop();
+    result
 }
 
 #[cfg(all(test, target_os = "linux"))]

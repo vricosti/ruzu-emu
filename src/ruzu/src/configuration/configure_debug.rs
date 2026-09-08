@@ -300,6 +300,10 @@ pub fn page(runtime_lock: bool) -> Page {
         // ReloadKeys reads settings itself; release the settings write guard
         // before taking the key-manager lock, in upstream ApplyConfiguration order.
         drop(values);
+        let mut filter = common::logging::filter::Filter::default();
+        filter.parse_filter_string(&common::settings::values().log_filter.get_value());
+        common::logging::backend::set_global_filter(&filter);
+        common::logging::backend::set_color_console_backend_enabled(console);
         ruzu_core::crypto::key_manager::KeyManager::instance()
             .lock()
             .unwrap()
@@ -320,6 +324,11 @@ mod tests {
         gtk::init().expect("a GTK display is required");
         let directory = tempfile::tempdir().unwrap();
         set_ruzu_path(RuzuPath::KeysDir, directory.path());
+        std::env::remove_var("RUZU_LOG_FILTER");
+        std::env::remove_var("RUST_LOG");
+        common::settings::values_mut().log_filter.set_value("*:Warning".to_owned());
+        common::logging::backend::initialize_with_config(Some(directory.path().join("log")), "*:Warning", false);
+        log::info!("before_apply_hidden");
         // Artificial bytes only: these fixtures do not contain usable console keys.
         std::fs::write(directory.path().join("prod.keys"),
             "master_key_00 = 11111111111111111111111111111111\n").unwrap();
@@ -343,6 +352,18 @@ mod tests {
             None
         }
         let page = page(true);
+        fn find_filter(widget: &gtk::Widget) -> Option<gtk::Entry> {
+            if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                if entry.text() == "*:Warning" { return Some(entry.clone()); }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(entry) = find_filter(&widget) { return Some(entry); }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        find_filter(&page.widget).expect("global log filter entry").set_text("*:Info");
         let check = find_switch(&page.widget).expect("Use dev.keys row");
         assert!(!check.is_active());
         for (enabled, expected) in [(true, 0x22), (false, 0x11)] {
@@ -351,5 +372,10 @@ mod tests {
             assert_eq!(*common::settings::values().use_dev_keys.get_value(), enabled);
             assert_eq!(manager.lock().unwrap().get_key_128(S128KeyType::Master, 0, 0), [expected; 16]);
         }
+        log::info!("after_apply_visible");
+        common::logging::backend::stop();
+        let log = std::fs::read_to_string(directory.path().join("log/ruzu_log.txt")).unwrap();
+        assert!(!log.contains("before_apply_hidden"));
+        assert!(log.contains("after_apply_visible"));
     }
 }

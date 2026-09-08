@@ -30,7 +30,6 @@ gtk = { version = "0.9", package = "gtk4", features = ["v4_6"] }
 # rendered to a file in tests and compared against upstream by eye.
 cairo-rs = { version = "0.20", features = ["png"] }
 log = { workspace = true }
-env_logger = { workspace = true }
 serde_json = { workspace = true }
 ash = { workspace = true }
 libc = "0.2"

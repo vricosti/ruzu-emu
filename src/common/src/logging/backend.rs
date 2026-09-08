@@ -195,11 +195,18 @@ static COLOR_FLAG: Mutex<Option<std::sync::Arc<AtomicBool>>> = Mutex::new(None);
 struct FacadeLogger;
 
 static FACADE_LOGGER: FacadeLogger = FacadeLogger;
+// Rust diagnostic syntax is retained as an initial override, not translated
+// into lossy class-wide rules. Explicit GUI Apply replaces that initial filter.
+static ENV_FILTER: std::sync::OnceLock<env_filter::Filter> = std::sync::OnceLock::new();
+static ENV_FILTER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 impl log::Log for FacadeLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
         if SUPPRESS_LOGGING.load(Ordering::Relaxed) {
             return false;
+        }
+        if ENV_FILTER_ACTIVE.load(Ordering::Acquire) {
+            return ENV_FILTER.get().is_some_and(|filter| filter.enabled(metadata));
         }
 
         // Lock-free fast path: reject on the global minimum level before the
@@ -214,6 +221,11 @@ impl log::Log for FacadeLogger {
 
     fn log(&self, record: &log::Record<'_>) {
         if !self.enabled(record.metadata()) {
+            return;
+        }
+        if ENV_FILTER_ACTIVE.load(Ordering::Acquire)
+            && ENV_FILTER.get().is_some_and(|filter| !filter.matches(record))
+        {
             return;
         }
 
@@ -232,38 +244,31 @@ impl log::Log for FacadeLogger {
 
 /// Initialize the yuzu-style asynchronous backend and connect Rust's `log`
 /// facade to it. `RUZU_LOG_FILTER` uses the native class syntax
-/// (`*:Info Render.OpenGL:Debug`). A simple `RUST_LOG=info` style value is
-/// also accepted for command-line compatibility.
+/// (`*:Info Render.OpenGL:Debug`). `RUST_LOG` retains env_logger's module and
+/// message-filter syntax for command-line compatibility.
 pub fn initialize_from_env(log_dir: Option<PathBuf>) {
-    let filter = std::env::var("RUZU_LOG_FILTER")
-        .ok()
-        .or_else(|| {
-            std::env::var("RUST_LOG")
-                .ok()
-                .and_then(|s| rust_log_to_filter(&s))
-        })
-        .unwrap_or_else(|| "*:Warning".to_string());
+    initialize_with_config(log_dir, "*:Warning", true);
+}
 
-    initialize(log_dir, Some(&filter));
-    set_color_console_backend_enabled(env_flag_enabled("RUZU_LOG_COLOR", true));
+/// Initialize from saved settings, with explicit environment diagnostics taking
+/// precedence on startup. The GUI can subsequently replace the active filter.
+pub fn initialize_with_config(log_dir: Option<PathBuf>, configured_filter: &str, console: bool) {
+    let native_override = std::env::var("RUZU_LOG_FILTER").ok();
+    let rust_override = native_override.is_none().then(|| std::env::var("RUST_LOG").ok()).flatten();
+    let filter = native_override.as_deref().unwrap_or_else(|| {
+        if rust_override.is_some() { "*:Trace" } else { configured_filter }
+    });
+    if let Some(directives) = rust_override {
+        let _ = ENV_FILTER.set(env_filter::Builder::new().parse(&directives).build());
+        ENV_FILTER_ACTIVE.store(true, Ordering::Release);
+    }
+
+    initialize(log_dir, Some(filter));
+    set_color_console_backend_enabled(env_flag_enabled("RUZU_LOG_COLOR", console));
 
     match log::set_logger(&FACADE_LOGGER) {
         Ok(()) => log::set_max_level(log::LevelFilter::Trace),
         Err(_) => eprintln!("logging facade was already initialized"),
-    }
-}
-
-fn rust_log_to_filter(value: &str) -> Option<String> {
-    let first = value.split(',').next()?.trim();
-    let level = first.rsplit('=').next()?.trim();
-    match level.to_ascii_lowercase().as_str() {
-        "trace" => Some("*:Trace".to_string()),
-        "debug" => Some("*:Debug".to_string()),
-        "info" => Some("*:Info".to_string()),
-        "warn" | "warning" => Some("*:Warning".to_string()),
-        "error" => Some("*:Error".to_string()),
-        "off" => Some("*:Critical".to_string()),
-        _ => None,
     }
 }
 
@@ -334,6 +339,7 @@ pub fn set_global_filter(filter: &Filter) {
     if let Some(ref mut state) = *guard {
         state.filter = filter.clone();
     }
+    ENV_FILTER_ACTIVE.store(false, Ordering::Release);
 }
 
 /// Enables or disables the color console backend.
@@ -457,13 +463,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rust_log_level_maps_to_yuzu_filter() {
-        assert_eq!(rust_log_to_filter("info").as_deref(), Some("*:Info"));
-        assert_eq!(
-            rust_log_to_filter("video_core=debug").as_deref(),
-            Some("*:Debug")
-        );
-        assert_eq!(rust_log_to_filter("off").as_deref(), Some("*:Critical"));
+    fn facade_uses_config_environment_and_live_filter_changes() {
+        const CHILD: &str = "RUZU_TEST_LOGGER_CONFIGURATION";
+        let Ok(case) = std::env::var(CHILD) else {
+            for case in ["config", "rust", "native", "off"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", "logging::backend::tests::facade_uses_config_environment_and_live_filter_changes"])
+                    .env(CHILD, case).env_remove("RUZU_LOG_FILTER").env_remove("RUST_LOG")
+                    .env("RUZU_LOG_COLOR", "0");
+                match case {
+                    "rust" => { command.env("RUST_LOG", "off,alpha=debug,beta=trace/keep"); }
+                    "native" => { command.env("RUST_LOG", "trace").env("RUZU_LOG_FILTER", "*:Error"); }
+                    "off" => { command.env("RUST_LOG", "off"); }
+                    _ => {}
+                }
+                assert!(command.status().unwrap().success(), "{case}");
+            }
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!("ruzu-logger-test-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        initialize_with_config(Some(directory.clone()), "*:Warning", false);
+        log::debug!(target: "alpha", "keep_alpha_debug");
+        log::trace!(target: "alpha", "keep_alpha_trace");
+        log::trace!(target: "beta", "keep_beta_trace");
+        log::debug!(target: "beta", "discard_regex");
+        log::warn!(target: "other", "keep_other_warning");
+        log::error!(target: "other", "keep_other_error");
+        set_global_filter(&Filter::new(Level::Info));
+        log::info!(target: "other", "live_info");
+        log::debug!(target: "other", "live_debug");
+        stop();
+        let contents = std::fs::read_to_string(directory.join("ruzu_log.txt")).unwrap();
+        assert_eq!(contents.contains("keep_alpha_debug"), case == "rust");
+        assert!(!contents.contains("keep_alpha_trace"));
+        assert_eq!(contents.contains("keep_beta_trace"), case == "rust");
+        assert!(!contents.contains("discard_regex"));
+        assert_eq!(contents.contains("keep_other_warning"), case == "config");
+        assert_eq!(contents.contains("keep_other_error"), case == "config" || case == "native");
+        assert!(contents.contains("live_info"));
+        assert!(!contents.contains("live_debug"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

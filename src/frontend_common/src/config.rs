@@ -2318,6 +2318,25 @@ mod tests {
     }
 
     #[test]
+    fn debugger_settings_round_trip_enable_and_port_boundaries() {
+        for (enabled, port) in [(false, 0), (true, 1024), (true, 6543), (false, u16::MAX)] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            config.begin_group("Debugging");
+            let mut values = common::settings::Values::default();
+            values.use_gdbstub.set_value(enabled);
+            values.gdbstub_port.set_value(port);
+            config.write_setting_generic(&mut values.use_gdbstub);
+            config.write_setting_generic(&mut values.gdbstub_port);
+            values.use_gdbstub.set_value(!enabled);
+            values.gdbstub_port.set_value(!port);
+            config.read_setting_generic(&mut values.use_gdbstub);
+            config.read_setting_generic(&mut values.gdbstub_port);
+            assert_eq!(*values.use_gdbstub.get_value(), enabled);
+            assert_eq!(*values.gdbstub_port.get_value(), port);
+        }
+    }
+
+    #[test]
     fn executable_dump_settings_round_trip_through_debug_configuration() {
         const CHILD: &str = "RUZU_TEST_EXECUTABLE_DUMP_CONFIG";
         if std::env::var_os(CHILD).is_none() {

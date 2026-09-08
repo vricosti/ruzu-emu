@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::core::ExitCallback;
 use crate::debugger::debugger_interface::{DebuggerAction, DebuggerBackend, DebuggerFrontend};
 use crate::debugger::gdbstub::GdbStub;
 use crate::hle::kernel::k_process::{DebugWatchpoint, ProcessLock};
@@ -129,7 +130,7 @@ impl DebuggerImpl {
     fn new(
         debug_process: Arc<ProcessLock>,
         port: u16,
-        shutdown_requested: Arc<AtomicBool>,
+        exit_callback: Arc<ExitCallback>,
     ) -> Option<Self> {
         log::info!("Starting debugger server on port {port}...");
         let listener = match TcpListener::bind(("0.0.0.0", port)) {
@@ -159,7 +160,7 @@ impl DebuggerImpl {
                     signal_receiver,
                     thread_connection_state,
                     thread_stop_requested,
-                    shutdown_requested,
+                    exit_callback,
                 );
             })
             .ok()?;
@@ -257,7 +258,7 @@ fn execute_actions(
     backend: &mut ConnectionBackend,
     process: &Arc<ProcessLock>,
     state: &Arc<Mutex<SharedConnectionState>>,
-    shutdown_requested: &AtomicBool,
+    exit_callback: &Arc<ExitCallback>,
     actions: Vec<DebuggerAction>,
 ) {
     for action in actions {
@@ -292,7 +293,16 @@ fn execute_actions(
                 resume_threads(std::mem::take(&mut frontend.resume_threads), active_id);
             }
             DebuggerAction::ShutdownEmulation => {
-                shutdown_requested.store(true, Ordering::Release);
+                // Upstream invokes System::Exit on another thread so frontend
+                // teardown can join the debugger without joining itself. Own
+                // only the callback; do not extend or borrow System's lifetime.
+                let exit_callback = Arc::clone(exit_callback);
+                if let Err(error) = thread::Builder::new()
+                    .name("DebuggerExit".to_owned())
+                    .spawn(move || exit_callback())
+                {
+                    log::error!("Cannot request debugger shutdown: {error}");
+                }
             }
         }
     }
@@ -333,7 +343,7 @@ fn run_connection(
     signal_receiver: &Receiver<SignalInfo>,
     connection_state: &Arc<Mutex<SharedConnectionState>>,
     stop_requested: &Arc<AtomicBool>,
-    shutdown_requested: &AtomicBool,
+    exit_callback: &Arc<ExitCallback>,
 ) -> Option<TcpStream> {
     log::info!("Accepting new debugger peer connection");
     pause_emulation(debug_process);
@@ -386,7 +396,7 @@ fn run_connection(
                     &mut backend,
                     debug_process,
                     connection_state,
-                    shutdown_requested,
+                    exit_callback,
                     actions,
                 );
             }
@@ -411,7 +421,7 @@ fn run_server(
     signal_receiver: Receiver<SignalInfo>,
     connection_state: Arc<Mutex<SharedConnectionState>>,
     stop_requested: Arc<AtomicBool>,
-    shutdown_requested: Arc<AtomicBool>,
+    exit_callback: Arc<ExitCallback>,
 ) {
     let mut pending_peer = None;
     while !stop_requested.load(Ordering::Acquire) {
@@ -437,7 +447,7 @@ fn run_server(
             &signal_receiver,
             &connection_state,
             &stop_requested,
-            &shutdown_requested,
+            &exit_callback,
         );
     }
 }
@@ -453,9 +463,9 @@ impl Debugger {
     pub fn new(
         debug_process: Arc<ProcessLock>,
         server_port: u16,
-        shutdown_requested: Arc<AtomicBool>,
+        exit_callback: Arc<ExitCallback>,
     ) -> Self {
-        let impl_ = DebuggerImpl::new(debug_process, server_port, shutdown_requested);
+        let impl_ = DebuggerImpl::new(debug_process, server_port, exit_callback);
         Self { impl_ }
     }
 
@@ -512,11 +522,34 @@ mod tests {
     use std::net::SocketAddr;
 
     #[test]
+    fn remote_shutdown_callback_can_join_the_debugger() {
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let owner: Arc<Mutex<Option<Debugger>>> = Arc::new(Mutex::new(None));
+        let weak_owner = Arc::downgrade(&owner);
+        let (done, completed) = mpsc::channel();
+        let debugger = Debugger::new(process, 0, Arc::new(Box::new(move || {
+            let owner = weak_owner.upgrade().unwrap();
+            let debugger = owner.lock().unwrap().take();
+            drop(debugger);
+            done.send(thread::current().name().map(str::to_owned)).unwrap();
+        })));
+        let port = debugger.port().unwrap();
+        *owner.lock().unwrap() = Some(debugger);
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client.write_all(b"$k#6b").unwrap();
+        assert_eq!(
+            completed.recv_timeout(Duration::from_secs(2)).unwrap().as_deref(),
+            Some("DebuggerExit")
+        );
+        assert!(owner.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn debugger_refuses_a_port_that_is_already_bound() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind occupied port");
         let port = listener.local_addr().expect("local address").port();
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let debugger = Debugger::new(process, port, Arc::new(AtomicBool::new(false)));
+        let debugger = Debugger::new(process, port, Arc::new(Box::new(|| {})));
 
         assert!(!debugger.is_initialized());
     }
@@ -524,7 +557,7 @@ mod tests {
     #[test]
     fn debugger_binds_an_ephemeral_port_and_stops_on_drop() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let debugger = Debugger::new(process, 0, Arc::new(AtomicBool::new(false)));
+        let debugger = Debugger::new(process, 0, Arc::new(Box::new(|| {})));
 
         assert!(debugger.is_initialized());
         assert_ne!(debugger.port(), Some(0));
@@ -533,7 +566,7 @@ mod tests {
     #[test]
     fn debugger_routes_remote_packets_to_the_gdb_frontend() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let debugger = Debugger::new(process, 0, Arc::new(AtomicBool::new(false)));
+        let debugger = Debugger::new(process, 0, Arc::new(Box::new(|| {})));
         let port = debugger.port().expect("debugger listener port");
         let mut client = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))
             .expect("connect debugger client");

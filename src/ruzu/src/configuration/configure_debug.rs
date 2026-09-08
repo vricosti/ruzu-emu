@@ -473,6 +473,32 @@ mod tests {
             assert_eq!(manager.lock().unwrap().get_key_128(S128KeyType::Master, 0, 0), [expected; 16]);
         }
         let serial_cases = [("0", 0), ("4294967295", u32::MAX), ("4294967296", 0), ("-1", 0), (" +42 ", 42)];
+        fn find_port(widget: &gtk::Widget) -> Option<gtk::SpinButton> {
+            if let Some(spin) = widget.downcast_ref::<gtk::SpinButton>() {
+                return Some(spin.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(spin) = find_port(&widget) {
+                    return Some(spin);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        let gdb = find_switch(&page.widget, "Enable GDB Stub").unwrap();
+        let port = find_port(&page.widget).unwrap();
+        assert_eq!(port.adjustment().lower(), 1024.0);
+        assert_eq!(port.adjustment().upper(), 65535.0);
+        for (enabled, number) in [(true, 1024), (false, 65535), (true, 6543)] {
+            gdb.set_active(enabled);
+            assert_eq!(port.is_sensitive(), enabled);
+            port.set_value(f64::from(number));
+            (page.apply)();
+            let values = common::settings::values();
+            assert_eq!(*values.use_gdbstub.get_value(), enabled);
+            assert_eq!(*values.gdbstub_port.get_value(), number as u16);
+        }
         for index in 0..5 {
             macro_jit.set_active(index % 2 == 0);
             macro_hle.set_active(index % 2 != 0);

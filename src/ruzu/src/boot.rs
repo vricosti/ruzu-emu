@@ -980,7 +980,7 @@ fn run_boot(
     // `System`, samples the same counters as upstream's 500 ms GUI timer, and
     // waits for a stop request between samples.
     let (stopped_by_frontend, force_stop) = loop {
-        if guest_exit_requested.load(Ordering::Acquire) || system.debugger_shutdown_requested() {
+        if guest_exit_requested.load(Ordering::Acquire) {
             break (false, false);
         }
         match command_rx.recv_timeout(Duration::from_millis(500)) {

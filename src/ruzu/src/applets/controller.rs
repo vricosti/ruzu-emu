@@ -1067,6 +1067,8 @@ fn player_range(parameters: &ControllerParameters) -> (usize, usize) {
 }
 
 fn controller_types(style_tag: NpadStyleTag, player_index: usize) -> Vec<NpadStyleIndex> {
+    // QtControllerSelectorDialog::SetEmulatedControllers owns this list separately
+    // from ConfigureInputPlayer; its missing-selection behavior also differs.
     let mut result = Vec::new();
     let mut add = |flag, style| {
         if style_tag.raw.contains(flag) {
@@ -1081,20 +1083,12 @@ fn controller_types(style_tag: NpadStyleTag, player_index: usize) -> Vec<NpadSty
         add(NpadStyleSet::HANDHELD, NpadStyleIndex::Handheld);
     }
     add(NpadStyleSet::GC, NpadStyleIndex::GameCube);
-
-    if *common::settings::values()
-        .enable_all_controllers
-        .get_value()
-    {
+    if *common::settings::values().enable_all_controllers.get_value() {
         add(NpadStyleSet::PALMA, NpadStyleIndex::Pokeball);
         add(NpadStyleSet::LARK, NpadStyleIndex::NES);
         add(NpadStyleSet::LUCIA, NpadStyleIndex::SNES);
         add(NpadStyleSet::LAGOON, NpadStyleIndex::N64);
         add(NpadStyleSet::LAGER, NpadStyleIndex::SegaGenesis);
-    }
-
-    if result.is_empty() {
-        result.push(NpadStyleIndex::Fullkey);
     }
     result
 }
@@ -1133,6 +1127,14 @@ fn controller_name(controller_type: NpadStyleIndex) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_supported_styles_do_not_add_an_unsupported_controller() {
+        for player in 0..8 {
+            assert!(super::controller_types(super::NpadStyleTag {
+                raw: super::NpadStyleSet::empty(),
+            }, player).is_empty());
+        }
+    }
     use super::*;
 
     #[test]

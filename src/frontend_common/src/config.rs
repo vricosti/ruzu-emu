@@ -2272,6 +2272,7 @@ mod tests {
             for (source, loaded) in [
                 (&mut source.quest_flag, &mut loaded.quest_flag),
                 (&mut source.disable_web_applet, &mut loaded.disable_web_applet),
+                (&mut source.enable_all_controllers, &mut loaded.enable_all_controllers),
             ] {
                 source.set_value(enabled);
                 config.write_setting_generic(source);
@@ -2307,7 +2308,7 @@ mod tests {
         custom.write_raw("enable_fs_access_log\\default", "false".into());
         custom.read_setting_generic(&mut values.enable_fs_access_log);
         assert!(!*values.enable_fs_access_log.get_value());
-        for setting in [&mut values.quest_flag, &mut values.disable_web_applet] {
+        for setting in [&mut values.quest_flag, &mut values.disable_web_applet, &mut values.enable_all_controllers] {
             let original = *setting.get_value();
             custom.write_raw(setting.label(), (!original).to_string());
             custom.write_raw(&format!("{}\\default", setting.label()), "false".into());

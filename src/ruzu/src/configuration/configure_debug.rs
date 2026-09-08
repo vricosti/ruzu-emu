@@ -421,6 +421,8 @@ mod tests {
         let censor_username = find_switch(&page.widget, "Censor username in logs").unwrap();
         let auto_stub = find_switch(&page.widget, "Enable Auto-Stub").unwrap();
         let quest_flag = find_switch(&page.widget, "Kiosk (Quest) Mode").unwrap();
+        let all_controllers = find_switch(&page.widget, "Enable All Controller Types").unwrap();
+        assert!(!all_controllers.is_active());
         let web_applet = find_switch(&page.widget, "Web applet not compiled").unwrap();
         assert!(!quest_flag.is_active());
         assert!(web_applet.is_active());
@@ -467,6 +469,7 @@ mod tests {
             censor_username.set_active(index % 2 != 0);
             auto_stub.set_active(index % 2 != 0);
             quest_flag.set_active(index % 2 != 0);
+            all_controllers.set_active(index % 2 != 0);
             fs_access_log.set_active(index % 2 != 0);
             battery.set_text(serial_cases[index as usize].0);
             unit.set_text(serial_cases[4 - index as usize].0);
@@ -478,6 +481,7 @@ mod tests {
             assert_eq!(*values.censor_username.get_value(), index % 2 != 0);
             assert_eq!(*values.use_auto_stub.get_value(), index % 2 != 0);
             assert_eq!(*values.quest_flag.get_value(), index % 2 != 0);
+            assert_eq!(*values.enable_all_controllers.get_value(), index % 2 != 0);
             assert!(*values.disable_web_applet.get_value());
             assert_eq!(*values.enable_fs_access_log.get_value(), index % 2 != 0);
             assert_eq!(*values.serial_battery.get_value(), serial_cases[index as usize].1);

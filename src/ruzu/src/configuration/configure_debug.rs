@@ -212,6 +212,17 @@ pub fn page(runtime_lock: bool) -> Page {
     }
     columns.append(&advanced_group);
 
+    let (battery_row, serial_battery) = w::entry_row(
+        "Battery Serial:",
+        &common::settings::values().serial_battery.get_value().to_string(),
+    );
+    let (unit_row, serial_unit) = w::entry_row(
+        "Unit Serial:",
+        &common::settings::values().serial_unit.get_value().to_string(),
+    );
+    advanced.append(&battery_row);
+    advanced.append(&unit_row);
+
     let (debugging_group, debugging) = w::group("Debugging");
     debugging_group.set_hexpand(true);
     let fs_access_log = w::check_row(
@@ -314,6 +325,9 @@ pub fn page(runtime_lock: bool) -> Page {
             .enable_all_controllers
             .set_value(all_controllers.is_active());
         values.use_auto_stub.set_value(auto_stub.is_active());
+        // QString::toUInt uses base 10 and returns zero for invalid/overflowing input.
+        values.serial_battery.set_value(serial_battery.text().trim().parse().unwrap_or(0));
+        values.serial_unit.set_value(serial_unit.text().trim().parse().unwrap_or(0));
 
         values
             .enable_fs_access_log
@@ -391,6 +405,8 @@ mod tests {
             let mut values = common::settings::values_mut();
             values.gpu_log_level.set_value(common::settings_enums::GpuLogLevel::Standard);
             values.gpu_log_shader_dumps.set_value(true);
+            values.serial_battery.set_value(12345);
+            values.serial_unit.set_value(98765);
         }
         let locked_page = page(false);
         assert!(!find_gpu_level(&locked_page.widget).unwrap().is_sensitive());
@@ -407,18 +423,22 @@ mod tests {
         assert_eq!(gpu_level.selected(), 2);
         assert!(gpu_dumps.is_active());
         assert!(gpu_level.is_sensitive() && gpu_dumps.is_sensitive());
-        fn find_filter(widget: &gtk::Widget) -> Option<gtk::Entry> {
+        fn find_entry(widget: &gtk::Widget, text: &str) -> Option<gtk::Entry> {
             if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-                if entry.text() == "*:Warning" { return Some(entry.clone()); }
+                if entry.text() == text { return Some(entry.clone()); }
             }
             let mut child = widget.first_child();
             while let Some(widget) = child {
-                if let Some(entry) = find_filter(&widget) { return Some(entry); }
+                if let Some(entry) = find_entry(&widget, text) { return Some(entry); }
                 child = widget.next_sibling();
             }
             None
         }
-        find_filter(&page.widget).expect("global log filter entry").set_text("*:Info");
+        find_entry(&page.widget, "*:Warning").expect("global log filter entry").set_text("*:Info");
+        let battery = find_entry(&page.widget, "12345").expect("battery serial entry");
+        let unit = find_entry(&page.widget, "98765").expect("unit serial entry");
+        assert!(find_entry(&locked_page.widget, "12345").unwrap().is_sensitive());
+        assert!(find_entry(&locked_page.widget, "98765").unwrap().is_sensitive());
         let check = find_switch(&page.widget, "Use dev.keys").expect("Use dev.keys row");
         assert!(!check.is_active());
         for (enabled, expected) in [(true, 0x22), (false, 0x11)] {
@@ -427,12 +447,15 @@ mod tests {
             assert_eq!(*common::settings::values().use_dev_keys.get_value(), enabled);
             assert_eq!(manager.lock().unwrap().get_key_128(S128KeyType::Master, 0, 0), [expected; 16]);
         }
+        let serial_cases = [("0", 0), ("4294967295", u32::MAX), ("4294967296", 0), ("-1", 0), (" +42 ", 42)];
         for index in 0..5 {
             gpu_level.set_selected(index);
             gpu_dumps.set_active(index % 2 == 0);
             flush_line.set_active(index % 2 == 0);
             censor_username.set_active(index % 2 != 0);
             auto_stub.set_active(index % 2 != 0);
+            battery.set_text(serial_cases[index as usize].0);
+            unit.set_text(serial_cases[4 - index as usize].0);
             (page.apply)();
             let values = common::settings::values();
             assert_eq!(*values.gpu_log_level.get_value() as u32, index);
@@ -440,6 +463,8 @@ mod tests {
             assert_eq!(*values.log_flush_line.get_value(), index % 2 == 0);
             assert_eq!(*values.censor_username.get_value(), index % 2 != 0);
             assert_eq!(*values.use_auto_stub.get_value(), index % 2 != 0);
+            assert_eq!(*values.serial_battery.get_value(), serial_cases[index as usize].1);
+            assert_eq!(*values.serial_unit.get_value(), serial_cases[4 - index as usize].1);
         }
         log::info!("after_apply_visible");
         common::logging::backend::stop();

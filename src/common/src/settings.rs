@@ -334,6 +334,8 @@ pub struct Values {
 
     // ── Debugging ───────────────────────────────────────────────────────
     pub record_frame_times: bool,
+    pub serial_battery: Setting<u32>,
+    pub serial_unit: Setting<u32>,
     pub use_gdbstub: Setting<bool>,
     pub gdbstub_port: Setting<u16>,
     pub program_args: SwitchableSetting<String>,
@@ -376,6 +378,8 @@ pub struct Values {
     pub web_api_url: Setting<String>,
     pub yuzu_username: Setting<String>,
     pub yuzu_token: Setting<String>,
+    /// Generated frontend identity, separate from legacy authenticated credentials.
+    pub eden_token: Setting<String>,
 
     // ── Add-Ons ─────────────────────────────────────────────────────────
     pub disabled_addons: HashMap<u64, Vec<String>>,
@@ -529,6 +533,8 @@ impl Values {
                 disable_buffer_reorder,
             ),
             Category::Debugging => visit!(
+                serial_battery,
+                serial_unit,
                 use_gdbstub,
                 gdbstub_port,
                 dump_exefs,
@@ -558,7 +564,7 @@ impl Values {
             ),
             Category::Miscellaneous => visit!(log_filter, log_flush_line, censor_username),
             Category::WebService => {
-                visit!(enable_telemetry, web_api_url, yuzu_username, yuzu_token,)
+                visit!(enable_telemetry, web_api_url, yuzu_username, yuzu_token, eden_token,)
             }
             Category::System => visit!(
                 cpu_clock,
@@ -1466,6 +1472,8 @@ impl Default for Values {
 
             // Debugging
             record_frame_times: false,
+            serial_battery: Setting::new(0, "serial_battery", Debugging),
+            serial_unit: Setting::new(0, "serial_unit", Debugging),
             use_gdbstub: Setting::new(false, "use_gdbstub", Debugging),
             gdbstub_port: Setting::new(6543, "gdbstub_port", Debugging),
             program_args: SwitchableSetting::with_options(
@@ -1550,6 +1558,7 @@ impl Default for Values {
             ),
             yuzu_username: Setting::new(String::new(), "yuzu_username", WebService),
             yuzu_token: Setting::new(String::new(), "yuzu_token", WebService),
+            eden_token: Setting::new(String::new(), "eden_token", WebService),
 
             // Add-Ons
             disabled_addons: HashMap::new(),

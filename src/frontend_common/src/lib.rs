@@ -11,3 +11,4 @@ pub mod content_manager;
 pub mod firmware_manager;
 pub mod mod_manager;
 pub mod play_time_manager;
+pub mod settings_generator;

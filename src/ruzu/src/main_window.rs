@@ -1155,6 +1155,7 @@ impl GMainWindow {
     }
 
     fn new_with_config_import_offer(app: &Application, offer_config_import: bool) -> Rc<Self> {
+        frontend_common::settings_generator::generate_settings();
         if crate::uisettings::with(|values| values.has_broken_vulkan) {
             // Upstream selects OpenGL when built with it, otherwise Null.
             // The Apple Silicon frontend deliberately does not support OpenGL.
@@ -2495,6 +2496,9 @@ impl GMainWindow {
 
         if completion.selection.configuration {
             crate::configuration::qt_config::load_global_values();
+            // GTK migration is asynchronous, after construction rather than
+            // before GenerateSettings as in Eden's constructor.
+            frontend_common::settings_generator::generate_settings();
         }
 
         // Imported configuration may contain absolute paths into any legacy
@@ -3406,6 +3410,8 @@ impl GMainWindow {
         });
         common::settings::values_mut().disabled_addons.clear();
         config::reload_all_values();
+        // Ruzu resets in-place rather than restarting the frontend.
+        frontend_common::settings_generator::generate_settings();
         let mut filter = common::logging::filter::Filter::default();
         filter.parse_filter_string(common::settings::values().log_filter.get_value());
         common::logging::backend::set_global_filter(&filter);

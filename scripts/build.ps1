@@ -793,6 +793,14 @@ Ensure-WindowsBuildTools
 $vsInstallPath = Get-VSInstallPath
 Import-VSDevEnvironment -VSInstallPath $vsInstallPath
 Ensure-Rust
+if ($BuildAction -eq "package") {
+    if ($BuildProfile -ne "release") {
+        throw "Packaging is only available for release builds."
+    }
+    # Validate before the potentially expensive vcpkg dependency build.
+    $null = & (Join-Path $ScriptDirectory "check-release.ps1") `
+        -Repository $ProjectRoot -ForcePackage:$ForcePackage
+}
 $vcpkgRoot = Ensure-VcpkgDependencies
 Configure-NativeEnvironment -VcpkgRoot $vcpkgRoot -VSInstallPath $vsInstallPath
 Verify-NativeDependencies

@@ -204,6 +204,12 @@ MoltenVK under `Contents/Frameworks`, matching the upstream macOS bundle
 layout. Set `MOLTENVK_LIBRARY=/path/to/libMoltenVK.dylib` to package a specific
 MoltenVK build instead of the Homebrew installation.
 
+Use `./build.sh package` (optionally `--skip-deps`) to build a release ZIP at
+`target/release/Ruzu-macOS-v<version>.zip`, containing
+`Ruzu-macOS-v<version>/ruzu.app`. Cargo supplies the archive and Info.plist versions.
+Packaging requires a clean checkout, initialized matching submodules, and an exact
+HEAD tag `v<version>` matching Cargo. Ordinary builds do not require a release tag.
+
 On Windows, run `build.bat` from an ordinary Command Prompt. It detects or
 installs Visual Studio Build Tools, Rust and vcpkg, then configures the current
 prompt and creates a standalone Release build in
@@ -228,8 +234,9 @@ To deliberately create a test package from another branch, use:
 build.bat package -ForcePackage
 ```
 
-`-ForcePackage` bypasses only the Git `main`-branch checks and prints a warning;
-all build, dependency, runtime-file, and NSIS validations remain enabled.
+`-ForcePackage` bypasses the release tag and clean-checkout/submodule checks and
+prints a warning. Cargo remains authoritative: a different `-Version` override
+is rejected. All build, dependency, runtime-file, and NSIS validations remain enabled.
 
 The script builds both `ruzu.exe` and `ruzu-cmd.exe`, stages the dynamic
 `x64-windows-ruzu` vcpkg DLLs and GTK/GLib runtime data, then writes the package
@@ -237,9 +244,10 @@ directory, standalone ZIP and NSIS installer under `target\package`. The ZIP con
 the versioned directory with both executables and their runtime dependencies.
 Windows package names include the tag prefix, for example
 `Ruzu-Windows-v0.0.2-x64-msvc.zip` and `Ruzu-Windows-v0.0.2-x64-msvc-installer.exe`.
-Packaging is accepted only when Ruzu and
-all initialized project submodules are checked out on their `main` branches and
-the submodules match the commits recorded by Ruzu. The advanced staging-only
+Normal packaging requires a clean checkout (including untracked files), initialized
+submodules matching the recorded commits, and an exact HEAD tag equal to
+`v<workspace Cargo version>`. Detached HEAD at that tag is supported; no particular
+branch name is required for Ruzu or its submodules. The advanced staging-only
 and existing-binary modes remain available by invoking
 `dist\package-windows.ps1` directly with `-StageOnly` or `-SkipBuild`.
 

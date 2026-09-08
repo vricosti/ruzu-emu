@@ -113,7 +113,7 @@ if /i "%RUZU_BUILD_PROFILE%"=="debug" (
 echo.
 echo Building the self-contained Windows package and NSIS installer...
 if "%RUZU_FORCE_PACKAGE%"=="1" (
-    echo WARNING: Git main-branch checks are disabled for this package.
+    echo WARNING: Release tag and clean-checkout checks are disabled for this package.
     "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist\package-windows.ps1" -Profile release -ForcePackage
 ) else (
     "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist\package-windows.ps1" -Profile release

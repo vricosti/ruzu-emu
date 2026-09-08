@@ -10,6 +10,12 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 usage() {
     cat <<'EOF'
 Usage: ./build.sh [options] [-- <extra cargo arguments>]
+       ./build.sh package [--skip-deps]
+
+The package command builds a macOS release and creates
+target/release/Ruzu-macOS-v<Cargo version>.zip containing
+Ruzu-macOS-v<Cargo version>/ruzu.app.
+Packaging requires a clean checkout and an exact Git tag matching v<Cargo version>.
 
 Options:
   --debug        Build the debug profile instead of release.
@@ -30,6 +36,24 @@ case "${1-}" in
         exit 0
         ;;
 esac
+
+if [ "${1-}" = package ]; then
+    shift
+    if [ "$(uname -s)" != Darwin ]; then
+        echo "The package command currently supports macOS only." >&2
+        exit 1
+    fi
+    for arg in "$@"; do
+        case "$arg" in
+            --skip-deps|--release) ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Unsupported package option: $arg (use --skip-deps)." >&2; exit 1 ;;
+        esac
+    done
+    sh "$SCRIPT_DIR/scripts/check-release.sh" "$SCRIPT_DIR" >/dev/null
+    RUZU_MACOS_PACKAGE=1
+    export RUZU_MACOS_PACKAGE
+fi
 
 case "$(uname -s)" in
     Linux)

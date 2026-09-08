@@ -34,13 +34,29 @@ fi
 # The build pipeline has already compiled the workspace; standalone runs still
 # need cargo, so this is opt-out rather than removed.
 skip_build=false
+package=false
 for arg in "$@"; do
     case "$arg" in
         --no-build) skip_build=true ;;
+        --package) package=true ;;
+        *) echo "Unknown option: $arg" >&2; exit 1 ;;
     esac
 done
 
 cd "$repo_root"
+if [[ "$package" == true ]]; then
+    # Also validate direct invocations, before touching an existing app or archive.
+    sh "$repo_root/scripts/check-release.sh" "$repo_root" >/dev/null
+    release_commit="$(git rev-parse HEAD)"
+fi
+# Cargo resolves workspace-inherited versions; do not parse TOML or trust the tag.
+package_id="$(cargo pkgid --offline -p ruzu)"
+version="${package_id##*#}"
+version="${version##*@}"
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "macOS release packaging requires a numeric major.minor.patch version: $version" >&2
+    exit 1
+fi
 if [[ "$skip_build" != true ]]; then
     cargo build --locked --release --bin ruzu
 fi
@@ -63,6 +79,8 @@ iconset="$staging/ruzu.iconset"
 mkdir -p "$macos" "$frameworks" "$resources" "$iconset"
 install -m 755 "$binary" "$macos/ruzu"
 install -m 644 "$plist" "$contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$contents/Info.plist"
 
 make_icon() {
     sips -z "$1" "$1" "$icon_source" --out "$iconset/$2" >/dev/null
@@ -159,6 +177,26 @@ while IFS= read -r nested_code; do
 done < <(find "$frameworks" -type f -print | sort)
 codesign --force --sign - "$macos/ruzu" >/dev/null
 codesign --force --sign - "$staging" >/dev/null
+codesign --verify --deep --strict "$staging"
+
+if [[ "$package" == true ]]; then
+    # Do not publish if the sources changed during compilation or bundling.
+    checked_version="$(sh "$repo_root/scripts/check-release.sh" "$repo_root")"
+    if [[ "$checked_version" != "$version" || "$(git rev-parse HEAD)" != "$release_commit" ]]; then
+        echo "Release version or commit changed while packaging; rebuild the release." >&2
+        exit 1
+    fi
+    archive="$build_dir/Ruzu-macOS-v$version.zip"
+    package_root="$staging_root/Ruzu-macOS-v$version"
+    mkdir "$package_root"
+    mv "$staging" "$package_root/ruzu.app"
+    # Keep the previous archive intact until the new signed bundle is compressed.
+    ditto -c -k --sequesterRsrc --keepParent "$package_root" "$staging_root/package.zip"
+    mv "$package_root/ruzu.app" "$staging"
+    rmdir "$package_root"
+    mv -f "$staging_root/package.zip" "$archive"
+    echo "Packaged $archive"
+fi
 
 if [[ -e "$app" ]]; then
     rm -rf "$app"

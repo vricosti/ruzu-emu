@@ -132,7 +132,11 @@ post_build_platform() {
     fi
     echo
     echo "Packaging ruzu.app..."
-    "${PLATFORM_SCRIPT_DIR}/build-macos-app.sh" --no-build
+    if [ "${RUZU_MACOS_PACKAGE:-0}" = 1 ]; then
+        "${PLATFORM_SCRIPT_DIR}/build-macos-app.sh" --no-build --package
+    else
+        "${PLATFORM_SCRIPT_DIR}/build-macos-app.sh" --no-build
+    fi
 }
 
 run_pipeline "$@"

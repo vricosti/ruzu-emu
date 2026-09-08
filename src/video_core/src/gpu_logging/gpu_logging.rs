@@ -346,15 +346,19 @@ impl GpuLogger {
                 .lock()
                 .expect("GPU log ring buffer lock poisoned");
             let size = self.ring_buffer_size.load(Ordering::Acquire);
-            let index = ring.index;
-            ring.calls[index] = Some(VulkanCallEntry {
-                timestamp,
-                call_name: call_name.to_owned(),
-                parameters: parameters.to_owned(),
-                result,
-                thread_id,
-            });
-            ring.index = (index + 1) % size;
+            // A zero-sized history cannot be indexed (upstream would invoke
+            // undefined behavior). Keep file logging/counters without history.
+            if size != 0 {
+                let index = ring.index;
+                ring.calls[index] = Some(VulkanCallEntry {
+                    timestamp,
+                    call_name: call_name.to_owned(),
+                    parameters: parameters.to_owned(),
+                    result,
+                    thread_id,
+                });
+                ring.index = (index + 1) % size;
+            }
             ring.total_vulkan_calls = ring.total_vulkan_calls.wrapping_add(1);
         }
         self.write_to_log(&format!(
@@ -736,6 +740,13 @@ impl GpuLogger {
             .ring_buffer
             .lock()
             .expect("GPU log ring buffer lock poisoned");
+        // Preserve the previous history if Rust cannot represent/allocate the
+        // requested capacity; do not panic and poison the logger's mutex.
+        let additional = entries.saturating_sub(ring.calls.len());
+        if let Err(error) = ring.calls.try_reserve(additional) {
+            error!("[GPU Logging] Cannot resize call history to {entries}: {error}");
+            return;
+        }
         ring.calls.resize(entries, None);
         ring.index = 0;
         self.ring_buffer_size.store(entries, Ordering::Release);
@@ -844,6 +855,114 @@ pub fn get_shader_stage_name(stage_index: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracking_options_and_history_resize_preserve_logging_contracts() {
+        const ROOT: &str = "RUZU_TEST_GPU_LOG_OPTIONS";
+        let root = match std::env::var_os(ROOT) {
+            Some(root) => std::path::PathBuf::from(root),
+            None => {
+                let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+                let root = std::env::temp_dir().join(format!(
+                    "ruzu-gpu-log-options-{}-{nonce}", std::process::id()
+                ));
+                std::fs::create_dir(&root).unwrap();
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", std::thread::current().name().unwrap()])
+                    .env(ROOT, &root)
+                    .status()
+                    .unwrap();
+                std::fs::remove_dir_all(&root).unwrap();
+                assert!(status.success());
+                return;
+            }
+        };
+        common::fs::path_util::set_ruzu_path(RuzuPath::LogDir, &root);
+        let logger = GpuLogger::default();
+        logger.initialize(LogLevel::Off, DriverType::Unknown);
+        assert!(!logger.is_initialized());
+        assert!(!root.join("ruzu_gpu.log").exists());
+        logger.initialize(LogLevel::All, DriverType::Unknown);
+        assert!(logger.is_initialized());
+
+        for (level, expected) in [
+            (LogLevel::Off, 0),
+            (LogLevel::Errors, 1),
+            (LogLevel::Standard, 1),
+            (LogLevel::Verbose, 2),
+            (LogLevel::All, 2),
+        ] {
+            logger.set_ring_buffer_size(0);
+            logger.set_ring_buffer_size(2);
+            logger.set_log_level(level);
+            logger.log_vulkan_call("vkQueueSubmit", "", 0);
+            logger.log_vulkan_call("vkCmdDraw", "", 0);
+            assert_eq!(logger.get_current_snapshot().recent_calls.len(), expected);
+        }
+        logger.set_log_level(LogLevel::All);
+        let previous_calls = logger.ring_buffer.lock().unwrap().total_vulkan_calls;
+        logger.set_ring_buffer_size(0);
+        logger.set_ring_buffer_size(2);
+        for name in ["vkCmdA", "vkCmdB", "vkCmdC"] {
+            logger.log_vulkan_call(name, "synthetic", 0);
+        }
+        let names = || logger.get_current_snapshot().recent_calls.into_iter()
+            .map(|call| call.call_name).collect::<Vec<_>>();
+        assert_eq!(names(), ["vkCmdB", "vkCmdC"]);
+        logger.set_ring_buffer_size(1);
+        assert_eq!(names(), ["vkCmdC"]);
+        logger.set_ring_buffer_size(3);
+        logger.log_vulkan_call("vkCmdD", "", 0);
+        assert_eq!(names(), ["vkCmdD"]);
+        logger.set_ring_buffer_size(0);
+        logger.log_vulkan_call("vkCmdWithoutHistory", "", 0);
+        assert!(names().is_empty());
+        assert_eq!(logger.ring_buffer.lock().unwrap().total_vulkan_calls, previous_calls + 5);
+        logger.set_ring_buffer_size(2);
+        logger.log_vulkan_call("vkCmdRestored", "", 0);
+        logger.set_ring_buffer_size(usize::MAX);
+        assert_eq!(logger.ring_buffer_size.load(Ordering::Acquire), 2);
+        assert_eq!(names(), ["vkCmdRestored"]);
+        logger.enable_vulkan_call_tracking(false);
+        logger.log_vulkan_call("vkCmdDisabled", "", 0);
+        assert_eq!(names(), ["vkCmdRestored"]);
+
+        logger.enable_memory_tracking(false);
+        logger.log_memory_allocation(42, 1024, 3);
+        assert!(logger.memory.lock().unwrap().allocations.is_empty());
+        logger.enable_memory_tracking(true);
+        logger.log_memory_allocation(42, 1024, 3);
+        {
+            let memory = logger.memory.lock().unwrap();
+            assert!(memory.allocations[&42].is_device_local);
+            assert!(memory.allocations[&42].is_host_visible);
+            assert_eq!(memory.current_allocated_bytes, 1024);
+        }
+        logger.enable_memory_tracking(false);
+        logger.log_memory_deallocation(42);
+        assert_eq!(logger.memory.lock().unwrap().current_allocated_bytes, 1024);
+        logger.enable_memory_tracking(true);
+        logger.log_memory_deallocation(42);
+        logger.log_memory_deallocation(99);
+        {
+            let memory = logger.memory.lock().unwrap();
+            assert_eq!(memory.current_allocated_bytes, 0);
+            assert_eq!(memory.peak_allocated_bytes, 1024);
+            assert_eq!(memory.total_deallocations, 1);
+        }
+
+        logger.enable_driver_debug_info(false);
+        logger.log_driver_debug_info("driver-snapshot-only");
+        assert_eq!(logger.get_current_snapshot().driver_debug_info, "driver-snapshot-only");
+        logger.enable_driver_debug_info(true);
+        logger.log_driver_debug_info("driver-file-output");
+        logger.shutdown();
+        let log = std::fs::read_to_string(root.join("ruzu_gpu.log")).unwrap();
+        assert!(log.contains("vkCmdWithoutHistory"));
+        assert!(!log.contains("vkCmdDisabled"));
+        assert!(!log.contains("driver-snapshot-only"));
+        assert!(log.contains("driver-file-output"));
+    }
 
     #[test]
     fn enum_discriminants_match_eden() {

@@ -2318,6 +2318,35 @@ mod tests {
     }
 
     #[test]
+    fn gpu_logging_tracking_settings_preserve_values_in_configuration() {
+        for enabled in [false, true] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            config.begin_group("Debugging");
+            let mut values = common::settings::Values::default();
+            for setting in [
+                &mut values.gpu_log_vulkan_calls,
+                &mut values.gpu_log_memory_tracking,
+                &mut values.gpu_log_driver_debug,
+            ] {
+                setting.set_value(enabled);
+                config.write_setting_generic(setting);
+                setting.set_value(!enabled);
+                config.read_setting_generic(setting);
+                assert_eq!(*setting.get_value(), enabled);
+            }
+            // The setting is signed upstream too; validation belongs to the
+            // consumer rather than silently changing stored integer values.
+            for entries in [0, 1, 512, -1] {
+                values.gpu_log_ring_buffer_size.set_value(entries);
+                config.write_setting_generic(&mut values.gpu_log_ring_buffer_size);
+                values.gpu_log_ring_buffer_size.set_value(!entries);
+                config.read_setting_generic(&mut values.gpu_log_ring_buffer_size);
+                assert_eq!(*values.gpu_log_ring_buffer_size.get_value(), entries);
+            }
+        }
+    }
+
+    #[test]
     fn debugger_settings_round_trip_enable_and_port_boundaries() {
         for (enabled, port) in [(false, 0), (true, 1024), (true, 6543), (false, u16::MAX)] {
             let mut config = BaseConfig::new(ConfigType::GlobalConfig);

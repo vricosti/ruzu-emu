@@ -7,7 +7,7 @@
 //! Translation capability policy belongs to the pipeline cache, not to the
 //! device wrapper or the rasterizer.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::panic::{catch_unwind, resume_unwind, take_hook, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -27,7 +27,9 @@ use objc2_metal::{
     MTLVertexStepFunction,
 };
 use shader_recompiler::backend::msl::{
-    emit_msl::{emit_msl_vertex_function, emit_msl_geometry_function}, emit_msl_geometry::GeometryLayout,
+    emit_msl::{emit_msl_vertex_function, emit_msl_geometry_function,
+        emit_msl_tessellation_control_function, emit_msl_tessellation_evaluation_function},
+    emit_msl_geometry::GeometryLayout, emit_msl_tessellation::TessellationControlLayout,
 };
 use shader_recompiler::host_translate_info::HostTranslateInfo;
 use shader_recompiler::ir::types::OutputTopology;
@@ -66,6 +68,8 @@ use super::metal_framebuffer::MetalFramebuffer;
 use super::metal_geometry_pipeline::{
     MetalGeometryPipeline, MetalGeometryPipelineError, MetalGeometryShaderStages,
 };
+use super::metal_tessellation_pipeline::{MetalTessellationPipeline, MetalTessellationPipelineError,
+    MetalTessellationShaderStages};
 use super::metal_shader::{
     compile_direct_msl_shader_with_bindings, direct_msl_options, DirectMslCompileError,
     MetalShaderBindingLayout, MetalShaderCompileOptions, MetalShaderError, MetalShaderModule,
@@ -422,6 +426,15 @@ pub struct MetalDepthStencilKey {
 }
 
 impl MetalDepthStencilKey {
+    /// Conservative fixed-function write possibility, independent of whether
+    /// fragments survive culling, stencil/depth tests or conditional rendering.
+    pub fn may_write_depth_stencil(&self) -> bool {
+        self.depth_write_enabled || (self.stencil_enabled && [self.front, self.back].iter().any(|face| {
+            face.write_mask & 0xff != 0 && [face.stencil_fail, face.depth_fail, face.depth_stencil_pass]
+                .iter().any(|operation| *operation != MTLStencilOperation::Keep)
+        }))
+    }
+
     fn from_fixed_state(fixed: &FixedPipelineState, live: &DepthStencilInfo) -> Self {
         let dynamic = &fixed.dynamic_state;
         let depth_test_enabled = dynamic.depth_test_enable();
@@ -552,6 +565,7 @@ pub struct MetalGraphicsShaderStages {
 enum MetalVertexShader {
     Native(Arc<MetalShaderModule>),
     Geometry(Arc<MetalGeometryShaderStages>),
+    Tessellation(Arc<MetalTessellationShaderStages>),
 }
 
 impl MetalGraphicsShaderStages {
@@ -566,7 +580,7 @@ impl MetalGraphicsShaderStages {
     pub fn vertex(&self) -> Option<&MetalShaderModule> {
         match &self.vertex {
             MetalVertexShader::Native(module) => Some(module),
-            MetalVertexShader::Geometry(_) => None,
+            MetalVertexShader::Geometry(_) | MetalVertexShader::Tessellation(_) => None,
         }
     }
 
@@ -574,13 +588,21 @@ impl MetalGraphicsShaderStages {
         match &self.vertex {
             MetalVertexShader::Native(module) => module.bindings(),
             MetalVertexShader::Geometry(stages) => &stages.vertex.bindings,
+            MetalVertexShader::Tessellation(stages) => &stages.vertex.bindings,
         }
     }
 
     pub fn geometry(&self) -> Option<&MetalGeometryShaderStages> {
         match &self.vertex {
             MetalVertexShader::Geometry(stages) => Some(stages),
-            MetalVertexShader::Native(_) => None,
+            MetalVertexShader::Native(_) | MetalVertexShader::Tessellation(_) => None,
+        }
+    }
+
+    pub fn tessellation(&self) -> Option<&MetalTessellationShaderStages> {
+        match &self.vertex {
+            MetalVertexShader::Tessellation(stages) => Some(stages),
+            _ => None,
         }
     }
 
@@ -633,6 +655,8 @@ impl MetalComputePipeline {
 
 #[derive(Debug, Error)]
 pub enum MetalPipelineError {
+    #[error(transparent)]
+    Tessellation(#[from] MetalTessellationPipelineError),
     #[error(transparent)]
     Geometry(#[from] MetalGeometryPipelineError),
     #[error("expected {expected} shader, got {actual:?}")]
@@ -727,6 +751,7 @@ pub struct MetalPipelineCache {
     host_info: HostTranslateInfo,
     render_pipelines: HashMap<MetalRenderPipelineKey, MetalRenderPipeline>,
     geometry_pipelines: HashMap<MetalRenderPipelineKey, Arc<MetalGeometryPipeline>>,
+    tessellation_pipelines: HashMap<MetalRenderPipelineKey, Arc<MetalTessellationPipeline>>,
     depth_stencil_states:
         HashMap<MetalDepthStencilKey, Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
     compute_pipelines: HashMap<MetalComputePipelineKey, MetalComputePipeline>,
@@ -754,6 +779,7 @@ impl MetalPipelineCache {
             host_info,
             render_pipelines: HashMap::new(),
             geometry_pipelines: HashMap::new(),
+            tessellation_pipelines: HashMap::new(),
             depth_stencil_states: HashMap::new(),
             compute_pipelines: HashMap::new(),
             graphics_shader_modules: HashMap::new(),
@@ -817,15 +843,11 @@ impl MetalPipelineCache {
         let Some(translated) = translated else {
             return Ok(None);
         };
-        if translated[1].is_some() {
+        let tessellated = translated[1].is_some() || translated[2].is_some();
+        if tessellated && (translated[1].is_none() || translated[2].is_none()
+            || translated[3].is_some() || !device.profile().supports_indirect_tessellation()) {
             return Err(MetalPipelineError::UnsupportedGraphicsStage(
-                "tessellation control",
-            ));
-        }
-        if translated[2].is_some() {
-            return Err(MetalPipelineError::UnsupportedGraphicsStage(
-                "tessellation evaluation",
-            ));
+                "incomplete tessellation pair, TES-to-GS chain or device without indirect tessellation"));
         }
         if translated[3].is_some() && !device.profile().supports_mesh_shaders() {
             return Err(MetalPipelineError::UnsupportedGraphicsStage(
@@ -843,6 +865,8 @@ impl MetalPipelineCache {
         let mut vertex = None;
         let mut callable_vertex = None;
         let mut geometry = None;
+        let mut control = None;
+        let mut evaluation = None;
         let mut fragment = None;
         let mut options = MetalShaderCompileOptions::for_device(device.profile());
         options.enable_point_size_builtin = key.fixed_state.topology() == PrimitiveTopology::Points;
@@ -854,7 +878,7 @@ impl MetalPipelineCache {
         let mut direct_bindings = Bindings::default();
         for translated_stage in translated.iter().flatten() {
             let mut stage_options = options.clone();
-            if translated[3].is_some() && translated_stage.program.stage == Stage::VertexB {
+            if (translated[3].is_some() || tessellated) && translated_stage.program.stage == Stage::VertexB {
                 // The vertex stage produces retained records, not rasterized primitives.
                 stage_options.enable_point_size_builtin = false;
                 stage_options.disable_rasterization = false;
@@ -868,6 +892,20 @@ impl MetalPipelineCache {
                     )
                     .map_err(DirectMslCompileError::from)?,
                 );
+                continue;
+            }
+            if matches!(translated_stage.program.stage, Stage::TessellationControl | Stage::TessellationEval) {
+                stage_options.disable_rasterization = false;
+                let msl_options = direct_msl_options(device.device(), &stage_options);
+                if translated_stage.program.stage == Stage::TessellationControl {
+                    control = Some(emit_msl_tessellation_control_function(&translated_stage.program,
+                        profile, &translated_stage.runtime_info, &msl_options, &mut direct_bindings)
+                        .map_err(DirectMslCompileError::from)?);
+                } else {
+                    evaluation = Some(emit_msl_tessellation_evaluation_function(&translated_stage.program,
+                        profile, &translated_stage.runtime_info, &msl_options, &mut direct_bindings)
+                        .map_err(DirectMslCompileError::from)?);
+                }
                 continue;
             }
             if translated_stage.program.stage == Stage::Geometry {
@@ -915,7 +953,7 @@ impl MetalPipelineCache {
         }
 
         #[cfg(feature = "metal-spirv-validation")]
-        if validate_direct_msl_enabled() && geometry.is_none() {
+        if validate_direct_msl_enabled() && geometry.is_none() && !tessellated {
             let validation = catch_shader_exception(|| {
                 let mut bindings = Bindings::default();
                 translated
@@ -976,7 +1014,18 @@ impl MetalPipelineCache {
                 ),
             }
         }
-        let vertex = if let Some((shader, runtime, layout, invocations)) = geometry {
+        let vertex = if tessellated {
+            let control_stage = translated[1].as_ref().unwrap();
+            MetalVertexShader::Tessellation(Arc::new(MetalTessellationShaderStages {
+                vertex: callable_vertex.ok_or(MetalPipelineError::MissingVertexStage)?,
+                control: control.ok_or(MetalPipelineError::UnsupportedGraphicsStage("missing TCS artifact"))?,
+                evaluation: evaluation.ok_or(MetalPipelineError::UnsupportedGraphicsStage("missing TES artifact"))?,
+                layout: TessellationControlLayout::new(&control_stage.program, &control_stage.runtime_info)
+                    .map_err(DirectMslCompileError::from)?,
+                control_runtime: control_stage.runtime_info.clone(),
+                evaluation_runtime: translated[2].as_ref().unwrap().runtime_info.clone(),
+            }))
+        } else if let Some((shader, runtime, layout, invocations)) = geometry {
             MetalVertexShader::Geometry(Arc::new(MetalGeometryShaderStages {
                 vertex: callable_vertex.ok_or(MetalPipelineError::MissingVertexStage)?,
                 shader,
@@ -995,6 +1044,61 @@ impl MetalPipelineCache {
             enabled_uniform_buffer_masks,
             uniform_buffer_sizes: Arc::new(uniform_buffer_sizes),
         }))
+    }
+
+    /// Offline compile gate for captured environments. Dynamic vertex state may
+    /// be absent from a Vulkan disk key; this is not a draw or vertex-fetch oracle.
+    #[cfg(test)]
+    pub(crate) fn validate_captured_tessellation(
+        &mut self,
+        key: &GraphicsPipelineKey,
+        environments: &mut GraphicsEnvironments,
+    ) -> Result<(), MetalPipelineError> {
+        use crate::surface::{get_format_type, pixel_format_from_depth_format,
+            pixel_format_from_render_target_format, SurfaceType};
+        use crate::textures::texture::MsaaMode;
+        use super::metal_format::surface_format;
+
+        let stages = Self::build_graphics_shader_stages(
+            &self.device, &self.profile, &self.host_info, key, environments,
+        )?.ok_or(MetalPipelineError::MissingVertexStage)?;
+        let tessellation = stages.tessellation()
+            .ok_or(MetalPipelineError::UnsupportedGraphicsStage("capture has no tessellation"))?;
+        let mut render_key = MetalRenderPipelineKey::new(key.unique_hashes[1], key.unique_hashes[5]);
+        render_key.shader_variant_hash = key.hash_value();
+        render_key.vertex_input = self.make_vertex_input_state(&stages)?;
+        let fixed = &key.fixed_state;
+        for (index, format) in fixed.color_formats.iter().copied().enumerate() {
+            let native = if format == 0 { MTLPixelFormat::Invalid } else {
+                surface_format(pixel_format_from_render_target_format(format as u32))
+                    .expect("captured color format has a native mapping").pixel_format
+            };
+            render_key.color_attachments[index] = metal_color_attachment(fixed.attachments[index], native);
+        }
+        if fixed.depth_enabled() {
+            let format = pixel_format_from_depth_format(fixed.depth_format());
+            let native = surface_format(format).expect("captured depth format has a native mapping").pixel_format;
+            match get_format_type(format) {
+                SurfaceType::Depth => render_key.depth_format = native,
+                SurfaceType::Stencil => render_key.stencil_format = native,
+                SurfaceType::DepthStencil => {
+                    render_key.depth_format = native;
+                    render_key.stencil_format = native;
+                }
+                _ => panic!("captured depth attachment has a color format"),
+            }
+        }
+        render_key.sample_count = crate::texture_cache::samples_helper::num_samples(
+            MsaaMode::from_raw(fixed.msaa_mode_raw()).expect("captured sample mode is valid"),
+        ) as u32;
+        render_key.topology = MTLPrimitiveTopologyClass::Triangle;
+        render_key.alpha_to_coverage = fixed.alpha_to_coverage_enabled();
+        render_key.alpha_to_one = fixed.alpha_to_one_enabled();
+        render_key.rasterization_enabled = metal_rasterization_enabled(fixed, Some(OutputTopology::TriangleStrip));
+        let first = self.get_or_create_tessellation_pipeline(render_key, tessellation, stages.fragment())?;
+        let second = self.get_or_create_tessellation_pipeline(render_key, tessellation, stages.fragment())?;
+        assert!(Arc::ptr_eq(&first, &second), "native tessellation PSO must be reused");
+        Ok(())
     }
 
     /// Port of Eden `PipelineCache::CurrentGraphicsPipeline` up through
@@ -1037,6 +1141,21 @@ impl MetalPipelineCache {
         Ok(self.graphics_shader_modules.get(&key).cloned())
     }
 
+    pub fn get_or_create_tessellation_pipeline(
+        &mut self,
+        key: MetalRenderPipelineKey,
+        stages: &MetalTessellationShaderStages,
+        fragment: Option<&MetalShaderModule>,
+    ) -> Result<Arc<MetalTessellationPipeline>, MetalPipelineError> {
+        let entry = match self.tessellation_pipelines.entry(key) {
+            Entry::Occupied(entry) => return Ok(Arc::clone(entry.get())),
+            Entry::Vacant(entry) => entry,
+        };
+        let pipeline = MetalTessellationPipeline::new(&self.device, &key, stages,
+            fragment.map(MetalShaderModule::function), 64)?;
+        Ok(Arc::clone(entry.insert(Arc::new(pipeline))))
+    }
+
     pub fn get_or_create_geometry_pipeline(
         &mut self,
         key: MetalRenderPipelineKey,
@@ -1050,15 +1169,12 @@ impl MetalPipelineCache {
         {
             return Err(MetalPipelineError::UnsupportedSampleCount(key.sample_count));
         }
-        if !self.geometry_pipelines.contains_key(&key) {
-            let pipeline = MetalGeometryPipeline::new(&self.device, &key, stages, fragment)?;
-            self.geometry_pipelines.insert(key, Arc::new(pipeline));
-        }
-        Ok(Arc::clone(
-            self.geometry_pipelines
-                .get(&key)
-                .expect("pipeline inserted above"),
-        ))
+        let entry = match self.geometry_pipelines.entry(key) {
+            Entry::Occupied(entry) => return Ok(Arc::clone(entry.get())),
+            Entry::Vacant(entry) => entry,
+        };
+        let pipeline = MetalGeometryPipeline::new(&self.device, &key, stages, fragment)?;
+        Ok(Arc::clone(entry.insert(Arc::new(pipeline))))
     }
 
     pub fn get_or_create_render_pipeline(
@@ -1088,7 +1204,11 @@ impl MetalPipelineCache {
         {
             return Err(MetalPipelineError::UnsupportedSampleCount(key.sample_count));
         }
-        if !self.render_pipelines.contains_key(&key) {
+        let entry = match self.render_pipelines.entry(key) {
+            Entry::Occupied(entry) => return Ok(entry.into_mut()),
+            Entry::Vacant(entry) => entry,
+        };
+        let pipeline = {
             let descriptor = MTLRenderPipelineDescriptor::new();
             descriptor.setVertexFunction(Some(vertex.function()));
             descriptor.setFragmentFunction(
@@ -1129,13 +1249,9 @@ impl MetalPipelineCache {
                 .map_err(|error| {
                     MetalPipelineError::RenderPipeline(error.localizedDescription().to_string())
                 })?;
-            self.render_pipelines
-                .insert(key, MetalRenderPipeline { key, state });
-        }
-        Ok(self
-            .render_pipelines
-            .get(&key)
-            .expect("pipeline inserted above"))
+            MetalRenderPipeline { key, state }
+        };
+        Ok(entry.insert(pipeline))
     }
 
     pub fn make_vertex_input_state(
@@ -1167,11 +1283,14 @@ impl MetalPipelineCache {
         key.depth_format = framebuffer.depth_format();
         key.stencil_format = framebuffer.stencil_format();
         key.sample_count = framebuffer.samples();
-        key.topology = metal_topology_class(fixed.topology());
+        key.topology = if stages.tessellation().is_some() { MTLPrimitiveTopologyClass::Triangle }
+            else { metal_topology_class(fixed.topology()) };
         key.alpha_to_coverage = fixed.alpha_to_coverage_enabled();
         key.alpha_to_one = fixed.alpha_to_one_enabled();
         key.rasterization_enabled =
-            metal_rasterization_enabled(fixed, stages.geometry().map(|stage| stage.layout.topology));
+            metal_rasterization_enabled(fixed, if stages.tessellation().is_some() {
+                Some(OutputTopology::TriangleStrip)
+            } else { stages.geometry().map(|stage| stage.layout.topology) });
         Ok(key)
     }
 
@@ -1186,8 +1305,12 @@ impl MetalPipelineCache {
     pub fn get_or_create_depth_stencil_state(
         &mut self,
         key: MetalDepthStencilKey,
-    ) -> Result<&ProtocolObject<dyn MTLDepthStencilState>, MetalPipelineError> {
-        if !self.depth_stencil_states.contains_key(&key) {
+    ) -> Result<&Retained<ProtocolObject<dyn MTLDepthStencilState>>, MetalPipelineError> {
+        let entry = match self.depth_stencil_states.entry(key) {
+            Entry::Occupied(entry) => return Ok(entry.into_mut()),
+            Entry::Vacant(entry) => entry,
+        };
+        let state = {
             let descriptor = MTLDepthStencilDescriptor::new();
             descriptor.setDepthCompareFunction(key.depth_compare);
             descriptor.setDepthWriteEnabled(key.depth_write_enabled);
@@ -1197,29 +1320,19 @@ impl MetalPipelineCache {
                 descriptor.setFrontFaceStencil(Some(&front));
                 descriptor.setBackFaceStencil(Some(&back));
             }
-            let state = self
-                .device
+            self.device
                 .device()
                 .newDepthStencilStateWithDescriptor(&descriptor)
-                .ok_or(MetalPipelineError::DepthStencilState)?;
-            self.depth_stencil_states.insert(key, state);
-        }
-        Ok(self
-            .depth_stencil_states
-            .get(&key)
-            .expect("depth/stencil state inserted above"))
+                .ok_or(MetalPipelineError::DepthStencilState)?
+        };
+        Ok(entry.insert(state))
     }
 
     pub fn retained_depth_stencil_state(
         &mut self,
         key: MetalDepthStencilKey,
     ) -> Result<Retained<ProtocolObject<dyn MTLDepthStencilState>>, MetalPipelineError> {
-        self.get_or_create_depth_stencil_state(key)?;
-        Ok(self
-            .depth_stencil_states
-            .get(&key)
-            .expect("depth/stencil state inserted above")
-            .clone())
+        self.get_or_create_depth_stencil_state(key).cloned()
     }
 
     pub fn get_or_create_compute_pipeline(
@@ -1238,23 +1351,18 @@ impl MetalPipelineCache {
             shared_memory_size: 0,
             workgroup_size: [1; 3],
         };
-        if !self.compute_pipelines.contains_key(&key) {
-            let state = Self::create_compute_pipeline_state(&self.device, shader)?;
-            self.compute_pipelines.insert(
-                key,
-                MetalComputePipeline {
-                    key,
-                    info: Arc::new(ShaderInfo::default()),
-                    uniform_buffer_sizes: Arc::new([0; 8]),
-                    shader: Arc::new(shader.clone()),
-                    state,
-                },
-            );
-        }
-        Ok(self
-            .compute_pipelines
-            .get(&key)
-            .expect("pipeline inserted above"))
+        let entry = match self.compute_pipelines.entry(key) {
+            Entry::Occupied(entry) => return Ok(entry.into_mut()),
+            Entry::Vacant(entry) => entry,
+        };
+        let state = Self::create_compute_pipeline_state(&self.device, shader)?;
+        Ok(entry.insert(MetalComputePipeline {
+            key,
+            info: Arc::new(ShaderInfo::default()),
+            uniform_buffer_sizes: Arc::new([0; 8]),
+            shader: Arc::new(shader.clone()),
+            state,
+        }))
     }
 
     fn create_compute_pipeline_state(
@@ -1480,11 +1588,19 @@ impl MetalPipelineCache {
             CACHE_VERSION,
             Box::new(|file, environment| {
                 let key = MetalComputePipelineKey::read_from_file(file)?;
+                if environment.has_ambiguous_depth_stencil_formats() {
+                    log::debug!("Deferring cached Metal compute shader with legacy depth/stencil metadata");
+                    return Ok(());
+                }
                 compute_entries.borrow_mut().push((key, environment));
                 Ok(())
             }),
             Box::new(|file, environments| {
                 let key = GraphicsPipelineKey::read_from_file(file)?;
+                if environments.iter().any(FileEnvironment::has_ambiguous_depth_stencil_formats) {
+                    log::debug!("Deferring cached Metal graphics shaders with legacy depth/stencil metadata");
+                    return Ok(());
+                }
                 graphics_entries.borrow_mut().push((key, environments));
                 Ok(())
             }),
@@ -2241,6 +2357,39 @@ mod tests {
     }
 
     #[test]
+    fn depth_stencil_write_possibility_honors_enables_masks_and_both_faces() {
+        let mut key = MetalDepthStencilKey {
+            depth_compare: MTLCompareFunction::Less,
+            depth_write_enabled: false,
+            stencil_enabled: true,
+            front: MetalStencilFaceState::default(),
+            back: MetalStencilFaceState::default(),
+        };
+        assert!(!key.may_write_depth_stencil());
+        for face in 0..2 {
+            for outcome in 0..3 {
+                let mut modified = key;
+                let state = if face == 0 { &mut modified.front } else { &mut modified.back };
+                match outcome {
+                    0 => state.stencil_fail = MTLStencilOperation::Replace,
+                    1 => state.depth_fail = MTLStencilOperation::Zero,
+                    _ => state.depth_stencil_pass = MTLStencilOperation::Invert,
+                }
+                assert!(modified.may_write_depth_stencil());
+                modified.front.write_mask = 0x100;
+                modified.back.write_mask = 0;
+                assert!(!modified.may_write_depth_stencil());
+                modified.front.write_mask = 0xff;
+                modified.back.write_mask = 0xff;
+                modified.stencil_enabled = false;
+                assert!(!modified.may_write_depth_stencil());
+            }
+        }
+        key.depth_write_enabled = true;
+        assert!(key.may_write_depth_stencil());
+    }
+
+    #[test]
     fn disabled_depth_test_cannot_write_depth_on_metal() {
         let mut fixed = FixedPipelineState::default();
         fixed.dynamic_state.set_depth_test_enable(false);
@@ -2369,6 +2518,89 @@ mod tests {
             .state() as *const _;
 
         assert_eq!(first, second);
+        assert_eq!(cache.render_pipelines.len(), 1);
+        assert!(matches!(
+            cache.get_or_create_render_pipeline(key, &fragment, Some(&fragment)),
+            Err(MetalPipelineError::InvalidShaderStage { .. })
+        ), "a cache hit must not bypass shader-stage validation");
+        let mut other = key;
+        other.color_attachments[0].format = MTLPixelFormat::RGBA8Unorm;
+        cache.get_or_create_render_pipeline(other, &vertex, Some(&fragment)).unwrap();
+        assert_eq!(cache.render_pipelines.len(), 2);
+        assert_eq!(first, cache.get_or_create_render_pipeline(key, &vertex, Some(&fragment))
+            .unwrap().state() as *const _);
+    }
+
+    #[test]
+    fn retained_depth_states_reuse_identity_and_survive_cache_drop() {
+        let device = MetalDevice::new().unwrap();
+        let mut cache = MetalPipelineCache::new(device);
+        let key = MetalDepthStencilKey::from_fixed_state(
+            &FixedPipelineState::default(), &DepthStencilInfo::default());
+        let first = cache.retained_depth_stencil_state(key).unwrap();
+        let second = cache.retained_depth_stencil_state(key).unwrap();
+        assert!(std::ptr::eq(&*first, &*second));
+        assert_eq!(cache.depth_stencil_states.len(), 1);
+        let mut other = key;
+        other.depth_write_enabled = !key.depth_write_enabled;
+        let third = cache.retained_depth_stencil_state(other).unwrap();
+        assert!(!std::ptr::eq(&*first, &*third));
+        assert_eq!(cache.depth_stencil_states.len(), 2);
+        drop(cache);
+        assert!(std::ptr::eq(&*first.device(), &*third.device()));
+    }
+
+    /// Offline profiling aid; reads a private copy because LoadPipelines may
+    /// delete incompatible caches. No shader dumping runs in the renderer.
+    #[test]
+    #[ignore = "requires RUZU_INSPECT_METAL_CACHE, RUZU_INSPECT_SHADER_HASHES and RUZU_INSPECT_OUTPUT"]
+    fn inspect_cached_graphics_msl() {
+        let source = std::env::var_os("RUZU_INSPECT_METAL_CACHE").unwrap();
+        let hashes: Vec<u64> = std::env::var("RUZU_INSPECT_SHADER_HASHES").unwrap()
+            .split(',').map(|hash| u64::from_str_radix(hash.trim().trim_start_matches("0x"), 16).unwrap())
+            .collect();
+        assert!(!hashes.is_empty());
+        let output = PathBuf::from(std::env::var_os("RUZU_INSPECT_OUTPUT").unwrap());
+        std::fs::create_dir_all(&output).unwrap();
+        let copy = output.join(format!("cache-copy-{}-{}.bin", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::copy(source, &copy).unwrap();
+        let mut entries = Vec::new();
+        load_pipelines(
+            || false, &copy, CACHE_VERSION,
+            Box::new(|file, _| {
+                MetalComputePipelineKey::read_from_file(file)?;
+                Ok(())
+            }),
+            Box::new(|file, environments| {
+                let key = GraphicsPipelineKey::read_from_file(file)?;
+                if hashes.iter().any(|hash| key.unique_hashes.contains(hash)) {
+                    entries.push((key, environments));
+                }
+                Ok(())
+            }),
+        );
+        assert!(copy.exists(), "cache reader rejected the private copy");
+        std::fs::remove_file(copy).unwrap();
+        assert!(!entries.is_empty(), "no requested shader found");
+        let device = MetalDevice::new().unwrap();
+        let cache = MetalPipelineCache::new(device.clone());
+        for (key, environments) in entries {
+            let mut environments = MetalPipelineCache::graphics_environments_from_files(environments);
+            let stages = MetalPipelineCache::build_graphics_shader_stages(
+                &device, cache.profile(), cache.host_info(), &key, &mut environments,
+            ).unwrap().expect("graphics pipeline must translate");
+            for (slot, module) in [(1, stages.vertex()), (5, stages.fragment())] {
+                let Some(module) = module else { continue };
+                let stem = format!("{:016X}-{:016X}-stage{slot}", key.hash_value(), key.unique_hashes[slot]);
+                std::fs::write(output.join(format!("{stem}.metal")), &module.source().source).unwrap();
+                std::fs::write(output.join(format!("{stem}.txt")), format!(
+                    "bindings={:#?}\nexecution={:#?}\nlanguage={:?}\n", module.bindings(),
+                    module.execution(), module.language_version(),
+                )).unwrap();
+                eprintln!("exported {stem}: {} source bytes", module.source().source.len());
+            }
+        }
     }
 
     /// Manual offline validation; no game assets are embedded in the test suite.

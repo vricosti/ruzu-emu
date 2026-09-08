@@ -211,3 +211,34 @@ RENDERDOC_INCLUDE=/path/to/renderdoc/include \
 The tests use synthetic input sinks and a fake RenderDoc API. They do not inject input into your desktop,
 launch a game, or access a GPU. Physical controller mapping and scene progression still need a manual
 record/replay test on the intended emulator configuration.
+## Ruzu GUI control on macOS / Unix
+
+For process-local logical buttons rather than Linux physical-device sessions,
+launch the GUI with `RUZU_INPUT_SESSION_DIR=/tmp/ruzu-input-UNIQUE`. The directory
+must not exist; the GUI creates it mode 0700 and binds `control.sock` there.
+Without this opt-in no socket or polling timer is created. This does not capture
+host keyboard events, require Accessibility permission, alter controller mappings,
+or implement raw evdev replay on macOS.
+
+Use `python3 tools/capture_harness/gui_control.py /tmp/ruzu-input-UNIQUE status`,
+`press A`, `press L R`, `release`, or `capture after-A-01.png`. Button presses
+default to 300 ms and always expire in the GUI, even if the client disconnects.
+Durations are bounded to 1..2000 ms; an overlapping press is rejected. The
+controller is player 1, using the existing VirtualGamepad driver. Screenshots
+come from the renderer, not the desktop, and use unique filenames in the session
+directory. The helper waits for the PNG to finish, not merely for request receipt.
+
+An accepted press proves input delivery, not game progression. Check `status`
+for the mapped HID button state and inspect a fresh screenshot between menu
+steps. For a user-specified 40 s startup / 7 s between A presses, wait 40 s after
+launch, then issue individual bounded presses with at least 7 s between them.
+Stop when the desired scene is visible; do not blindly keep pressing in gameplay.
+Only explicit command timestamps are replayable this way; this interface does
+not record physical input. Existing TAS recording remains a separate facility.
+
+`status` also returns the existing GUI performance snapshot (`game_fps`,
+`system_fps`, `frame_seconds`), without resetting the emulator's counters. Avoid
+renderer captures during a timed performance interval because screenshots need
+GPU readback. On Darwin the client explicitly terminates its bound Unix socket
+address to preserve the full reply pathname when the Rust server decodes it.
+Client regression tests: `python3 -m unittest discover -s tools/capture_harness/tests -p 'test_gui_control.py' -v`.

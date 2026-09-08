@@ -28,7 +28,7 @@ use thiserror::Error;
 
 use super::metal_buffer::{MetalBuffer, MetalBufferError};
 use super::metal_device::MetalDevice;
-use super::metal_framebuffer::{MetalFramebuffer, MetalFramebufferSignature};
+use super::metal_framebuffer::{MetalFramebuffer, MetalFramebufferSignature, MetalRenderPassKey};
 use super::metal_image_view::MetalImageView;
 use super::metal_query_cache::{MetalQueryCache, MetalVisibilityQuery};
 use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
@@ -49,6 +49,15 @@ struct BlitParameters {
     src: [f32; 4],
     target_size: [f32; 2],
     _padding: [f32; 2],
+}
+
+// Metal int2 has eight-byte alignment; all fields mirror MSAACopyPushConstants.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct MsaaCopyParameters {
+    dst_offset: [i32; 2],
+    src_offset: [i32; 2],
+    scale: [i32; 2],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -106,6 +115,7 @@ struct BlitPipelineKey {
     aspect: BlitAspect,
     color_type: MetalClearColorType,
     source_msaa: bool,
+    expand_samples: bool,
     operation: Operation,
 }
 
@@ -410,6 +420,16 @@ fragment float4 blit_color_resolve(BlitVertexOut input [[stage_in]],
     return result / float(source.get_num_samples());
 }
 
+struct MsaaCopyParameters { int2 dst_offset; int2 src_offset; int2 scale; };
+fragment float4 blit_color_expand(BlitVertexOut input [[stage_in]],
+                                 texture2d_ms<float> source [[texture(0)]],
+                                 constant MsaaCopyParameters& params [[buffer(1)]]) {
+    int2 coord = int2(input.position.xy) - params.dst_offset + params.src_offset;
+    int2 sample_offset = coord % params.scale;
+    uint sample_id = uint(sample_offset.x + params.scale.x * sample_offset.y);
+    return source.read(uint2(coord / params.scale), sample_id);
+}
+
 struct ClearParameters {
     float4 dst;
     float2 target_size;
@@ -709,7 +729,9 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
             BlitAspect::Stencil => "stencil",
             BlitAspect::DepthStencil => "depth_stencil",
         };
-        let name = if key.source_msaa {
+        let name = if key.expand_samples {
+            "blit_color_expand".into()
+        } else if key.source_msaa {
             format!(
                 "blit_{aspect}_{}",
                 if key.signature.samples == 1 {
@@ -773,6 +795,7 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
             filter,
             operation,
             BlitAspect::Color,
+            None,
         )
     }
 
@@ -794,7 +817,57 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
             Filter::Point,
             Operation::SrcCopy,
             BlitAspect::Color,
+            None,
         )
+    }
+
+    /// Sample-preserving MSAA-to-single-sample direction of Eden CopyMSAA.
+    /// Coordinates address the expanded sample grid, not resolved pixels.
+    pub fn copy_msaa_to_single_sample_color(
+        &mut self,
+        scheduler: &mut MetalScheduler,
+        framebuffer: &MetalFramebuffer,
+        source: &MetalImageView,
+        dst: MetalBlitRegion,
+        src: MetalBlitRegion,
+        num_samples: u32,
+    ) -> Result<(), MetalBlitError> {
+        let signature = framebuffer.signature();
+        if !matches!(num_samples, 2 | 4 | 8 | 16) || source.samples() != num_samples
+            || signature.samples != 1
+            || get_format_type(source.base().format) != SurfaceType::ColorTexture
+            || crate::surface::is_pixel_format_integer(source.base().format)
+            || signature.depth_format != MTLPixelFormat::Invalid
+            || signature.stencil_format != MTLPixelFormat::Invalid
+        {
+            return Err(MetalBlitError::InvalidBlit("MSAA expansion requires float color and matching native samples"));
+        }
+        let texture = source.handle(TextureType::Color2D)
+            .ok_or(MetalBlitError::InvalidBlit("missing MSAA source view"))?;
+        if signature.color_formats[0] != texture.pixelFormat()
+            || signature.color_formats[1..].iter().any(|format| *format != MTLPixelFormat::Invalid)
+        {
+            return Err(MetalBlitError::InvalidBlit("MSAA expansion requires one matching color attachment"));
+        }
+        let (x, y) = crate::texture_cache::samples_helper::samples_log2(num_samples as i32);
+        let scale = [1 << x, 1 << y];
+        let area = framebuffer.render_area();
+        let size = |region: MetalBlitRegion| (i64::from(region.end.0) - i64::from(region.start.0),
+            i64::from(region.end.1) - i64::from(region.start.1));
+        if dst.start.0 < 0 || dst.start.1 < 0 || src.start.0 < 0 || src.start.1 < 0
+            || size(dst).0 <= 0 || size(dst).1 <= 0 || size(dst) != size(src)
+            || i64::from(dst.end.0) > i64::from(area.0) || i64::from(dst.end.1) > i64::from(area.1)
+            || i64::from(src.end.0) > texture.width() as i64 * i64::from(scale[0])
+            || i64::from(src.end.1) > texture.height() as i64 * i64::from(scale[1])
+        {
+            return Err(MetalBlitError::InvalidBlit("MSAA expansion region"));
+        }
+        self.record_image_blit(scheduler, framebuffer, source, dst, src, Filter::Point,
+            Operation::SrcCopy, BlitAspect::Color, Some(MsaaCopyParameters {
+                dst_offset: [dst.start.0, dst.start.1],
+                src_offset: [src.start.0, src.start.1],
+                scale,
+            }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -827,6 +900,7 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
             filter,
             operation,
             aspect,
+            None,
         )
     }
 
@@ -860,6 +934,7 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
         filter: Filter,
         operation: Operation,
         aspect: BlitAspect,
+        expansion: Option<MsaaCopyParameters>,
     ) -> Result<(), MetalBlitError> {
         if dst.start.0 == dst.end.0 || dst.start.1 == dst.end.1 {
             return Ok(());
@@ -875,6 +950,7 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
                 MetalClearColorType::Float
             },
             source_msaa: source.samples() > 1,
+            expand_samples: expansion.is_some(),
             operation,
         };
         let pipeline = self.image_blit_pipeline(key)?;
@@ -935,6 +1011,7 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
         // Starting a fresh encoder both orders prior texture writes and prevents
         // helper state from leaking into a retained guest render pass.
         scheduler.begin_render_pass(&framebuffer.render_pass_descriptor())?;
+        scheduler.profile_helper_draw(super::metal_gpu_profiler::RenderHelper::DepthStencilBlit);
         scheduler.with_render_encoder(|encoder| unsafe {
             MetalQueryCache::configure_draw(encoder, None);
             encoder.setRenderPipelineState(&pipeline);
@@ -962,6 +1039,11 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
             encoder.setFragmentTexture_atIndex(Some(texture), 0);
             encoder.setFragmentTexture_atIndex(stencil, 1);
             encoder.setFragmentSamplerState_atIndex(Some(sampler), 0);
+            if let Some(parameters) = &expansion {
+                encoder.setFragmentBytes_length_atIndex(
+                    NonNull::from(parameters).cast(), std::mem::size_of_val(parameters), 1,
+                );
+            }
             encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
         })?;
         scheduler.end_render_pass();
@@ -1002,6 +1084,7 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
             _padding: [0.0; 2],
         };
         scheduler.begin_render_pass(render_pass)?;
+        scheduler.profile_helper_draw(super::metal_gpu_profiler::RenderHelper::ColorBlit);
         scheduler.with_render_encoder(|encoder| unsafe {
             MetalQueryCache::configure_draw(encoder, visibility_query);
             encoder.setRenderPipelineState(&pipeline);
@@ -1034,6 +1117,7 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
         &mut self,
         scheduler: &mut MetalScheduler,
         render_pass: &MTLRenderPassDescriptor,
+        render_pass_key: MetalRenderPassKey,
         signature: MetalFramebufferSignature,
         color_attachment: Option<u8>,
         color_type: MetalClearColorType,
@@ -1079,8 +1163,22 @@ fragment ClearUintDepthOut{index} clear_uint_depth_{index}(constant ClearParamet
                 .cast::<c_void>(),
         )
         .expect("stack clear parameter pointer is non-null");
-        scheduler.begin_render_pass(render_pass)?;
+        scheduler.begin_or_reuse_render_pass(render_pass, render_pass_key)?;
+        scheduler.profile_helper_draw(super::metal_gpu_profiler::RenderHelper::Clear);
         scheduler.with_render_encoder(|encoder| unsafe {
+            // Helpers may now follow a guest draw in the same native encoder.
+            MetalQueryCache::configure_draw(encoder, None);
+            encoder.setViewport(MTLViewport {
+                originX: 0.0, originY: 0.0,
+                width: parameters.render_area.0 as f64,
+                height: parameters.render_area.1 as f64, znear: 0.0, zfar: 1.0,
+            });
+            encoder.setScissorRect(MTLScissorRect {
+                x: 0, y: 0, width: parameters.render_area.0 as usize,
+                height: parameters.render_area.1 as usize,
+            });
+            encoder.setCullMode(MTLCullMode::None);
+            encoder.setDepthBias_slopeScale_clamp(0.0, 0.0, 0.0);
             encoder.setRenderPipelineState(&pipeline);
             encoder.setDepthStencilState(Some(&depth_state));
             if stencil {
@@ -1318,15 +1416,27 @@ mod tests {
                             signed_color: [-9, 10, -11, 12], unsigned_color: [9, 10, 11, 12],
                             depth: 0.875, stencil: 0x12,
                         };
-                        helper.clear_attachments(&mut scheduler, &fb.render_pass_descriptor(), fb.signature(),
+                        helper.clear_attachments(&mut scheduler, &fb.render_pass_descriptor(), fb.render_pass_key(0), fb.signature(),
                             color, color_type, 0xf, fb.has_depth(), fb.has_stencil(), 0xff, initial, None).unwrap();
                         let args = conditional_quad(&device, &mut scheduler, &mut pool, &args_pass, value, inverted);
-                        helper.clear_attachments(&mut scheduler, &fb.render_pass_descriptor(), fb.signature(),
+                        scheduler.begin_or_reuse_render_pass(&fb.render_pass_descriptor(), fb.render_pass_key(0)).unwrap();
+                        let encoder_before = scheduler.with_render_encoder(|encoder| {
+                            encoder.setCullMode(MTLCullMode::Front);
+                            encoder.setViewport(MTLViewport { originX: 0.0, originY: 0.0,
+                                width: 1.0, height: 1.0, znear: 0.75, zfar: 1.0 });
+                            encoder.setScissorRect(MTLScissorRect { x: 0, y: 0, width: 1, height: 1 });
+                            encoder.setDepthBias_slopeScale_clamp(2.0, 2.0, 2.0);
+                            encoder as *const _ as usize
+                        }).unwrap();
+                        helper.clear_attachments(&mut scheduler, &fb.render_pass_descriptor(), fb.render_pass_key(0), fb.signature(),
                             color, color_type, 0x5, fb.has_depth(), fb.has_stencil(), 0x0f,
                             MetalClearParameters { region, color: [1.0, 0.0, 0.0, 0.0],
                                 signed_color: [-19, 20, -21, 22], unsigned_color: [19, 20, 21, 22],
                                 depth: 0.375, stencil: 0x9b, ..initial },
                             Some((&args.buffer, args.offset))).unwrap();
+                        assert_eq!(encoder_before, scheduler.with_render_encoder(|e| e as *const _ as usize).unwrap());
+                        scheduler.begin_or_reuse_render_pass(&fb.render_pass_descriptor(), fb.render_pass_key(0)).unwrap();
+                        assert_eq!(encoder_before, scheduler.with_render_encoder(|e| e as *const _ as usize).unwrap());
                         let resolved = (samples > 1).then(|| target(&device, format, 1));
                         if let Some(resolved) = &resolved {
                             if color.is_some() {
@@ -1821,6 +1931,82 @@ mod tests {
             download.read(0, &mut actual).unwrap();
             assert_eq!(actual.as_slice(), bytes);
         }
+    }
+
+    #[test]
+    fn msaa_expansion_preserves_each_sample_and_copy_offsets() {
+        assert_eq!(std::mem::size_of::<MsaaCopyParameters>(), 24);
+        assert_eq!(std::mem::offset_of!(MsaaCopyParameters, scale), 16);
+        let device = MetalDevice::new().unwrap();
+        let mut scheduler = MetalScheduler::new(&device);
+        let mut helper = MetalBlitHelper::new(&device).unwrap();
+        let source = target_subresource(&device, PixelFormat::A8B8G8R8Unorm, 4, 0, 1);
+        let destination = target_subresource(&device, PixelFormat::A8B8G8R8Unorm, 1, 1, 1);
+        let library = device.device().newLibraryWithSource_options_error(&NSString::from_str(r#"
+#include <metal_stdlib>
+using namespace metal;
+fragment float4 samples(float4 position [[position]], uint sample [[sample_id]]) {
+    return float4(float(sample), floor(position.x), floor(position.y), 3.0f) / 3.0f;
+}
+"#), None).unwrap();
+        let fragment = library.newFunctionWithName(&NSString::from_str("samples")).unwrap();
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        descriptor.setVertexFunction(Some(&helper.vertex));
+        descriptor.setFragmentFunction(Some(&fragment));
+        descriptor.setRasterSampleCount(4);
+        unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) }
+            .setPixelFormat(source.framebuffer.signature().color_formats[0]);
+        let pipeline = device.device().newRenderPipelineStateWithDescriptor_error(&descriptor).unwrap();
+        let parameters = BlitParameters {
+            dst: [0.0, 0.0, 4.0, 4.0], src: [0.0, 0.0, 1.0, 1.0],
+            target_size: [4.0, 4.0], _padding: [0.0; 2],
+        };
+        scheduler.begin_render_pass(&source.framebuffer.render_pass_descriptor()).unwrap();
+        scheduler.with_render_encoder(|encoder| unsafe {
+            encoder.setRenderPipelineState(&pipeline);
+            encoder.setCullMode(MTLCullMode::None);
+            encoder.setViewport(MTLViewport { originX: 0.0, originY: 0.0, width: 4.0, height: 4.0, znear: 0.0, zfar: 1.0 });
+            encoder.setVertexBytes_length_atIndex(NonNull::from(&parameters).cast(), std::mem::size_of_val(&parameters), 0);
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+        }).unwrap();
+        scheduler.end_render_pass();
+        let upload = MetalBuffer::new(&device, 64).unwrap();
+        upload.write(0, &[0xcd; 64]).unwrap();
+        let copy = crate::texture_cache::types::BufferImageCopy {
+            buffer_size: 64,
+            image_subresource: SubresourceLayers { base_level: 1, base_layer: 1, num_layers: 1 },
+            image_extent: Extent3D { width: 4, height: 4, depth: 1 },
+            ..Default::default()
+        };
+        destination.image.upload_memory(&mut scheduler, &upload, 0, &[copy]).unwrap();
+        let tick = scheduler.current_tick();
+        helper.copy_msaa_to_single_sample_color(&mut scheduler, &destination.framebuffer, &source.view,
+            MetalBlitRegion { start: (1, 1), end: (4, 4) },
+            MetalBlitRegion { start: (3, 1), end: (6, 4) }, 4).unwrap();
+        assert_eq!(scheduler.current_tick(), tick);
+        let download = MetalBuffer::new(&device, 64).unwrap();
+        destination.image.download_memory(&mut scheduler, &download, 0, &[copy]).unwrap();
+        scheduler.finish_all().unwrap();
+        let mut actual = [0; 64];
+        download.read(0, &mut actual).unwrap();
+        let mut expected = [0xcd; 64];
+        for y in 1..4usize {
+            for x in 1..4usize {
+                let sx = x + 2;
+                let sample = sx % 2 + 2 * (y % 2);
+                let offset = (y * 4 + x) * 4;
+                expected[offset..offset + 4].copy_from_slice(&[
+                    (sample * 85) as u8, ((sx / 2) * 85) as u8, ((y / 2) * 85) as u8, 255,
+                ]);
+            }
+        }
+        assert_eq!(actual, expected, "samples must not be averaged or replaced by sample zero");
+        let full = MetalBlitRegion { start: (0, 0), end: (4, 4) };
+        assert!(helper.copy_msaa_to_single_sample_color(&mut scheduler, &destination.framebuffer,
+            &source.view, full, full, 8).is_err());
+        assert!(helper.copy_msaa_to_single_sample_color(&mut scheduler, &destination.framebuffer,
+            &source.view, full, MetalBlitRegion { start: (6, 0), end: (10, 4) }, 4).is_err());
+        assert!(!scheduler.has_active_work());
     }
 
     #[test]

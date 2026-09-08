@@ -32,6 +32,8 @@ pub struct MslEmitContext {
     stage: Stage,
     interface: super::msl_function::MslFunctionInterface,
     geometry: Option<super::emit_msl_geometry::GeometryLayout>,
+    tessellation_control: Option<super::emit_msl_tessellation::TessellationControlLayout>,
+    tessellation_evaluation: Option<super::emit_msl_tessellation::TessellationEvaluationLayout>,
     source: String,
     local_declarations: String,
     local_declarations_offset: Option<usize>,
@@ -197,9 +199,18 @@ impl MslEmitContext {
                 "callable geometry function requires geometry stage",
             ));
         }
+        if function_kind == MslFunctionKind::TessellationControlFunction && stage != Stage::TessellationControl {
+            return Err(MslError::UnsupportedStage(stage));
+        }
+        if function_kind == MslFunctionKind::TessellationEvaluationFunction
+            && (stage != Stage::TessellationEval || options.disable_rasterization) {
+            return Err(MslError::UnsupportedStage(stage));
+        }
         match stage {
             Stage::VertexA => return Err(MslError::UnmergedVertexA),
             Stage::VertexB | Stage::Fragment | Stage::Compute | Stage::Geometry => {}
+            Stage::TessellationControl if function_kind == MslFunctionKind::TessellationControlFunction => {}
+            Stage::TessellationEval if function_kind == MslFunctionKind::TessellationEvaluationFunction => {}
             Stage::TessellationControl | Stage::TessellationEval => {
                 return Err(MslError::UnsupportedStage(stage))
             }
@@ -583,12 +594,38 @@ impl MslEmitContext {
         let geometry = (stage == Stage::Geometry)
             .then(|| super::emit_msl_geometry::GeometryLayout::new(program, runtime_info, options))
             .transpose()?;
+        let tessellation_control = (stage == Stage::TessellationControl)
+            .then(|| super::emit_msl_tessellation::TessellationControlLayout::new(program, runtime_info))
+            .transpose()?;
+        let tessellation_evaluation = (stage == Stage::TessellationEval)
+            .then(|| super::emit_msl_tessellation::TessellationEvaluationLayout::new(program, runtime_info))
+            .transpose()?;
         if geometry.is_some_and(|layout| layout.stores_viewport_index)
             && !profile.support_multi_viewport
         {
             return Err(MslError::UnsupportedProgramFeature("geometry viewport arrays"));
         }
         let mut stage_input = String::new();
+        if tessellation_evaluation.is_some() {
+            for (ty, name) in [
+                ("const device ControlPoint*", "patch_input"),
+                ("const device PatchData&", "patch"),
+                ("uint", "patch_vertices"), ("uint", "patch_id"), ("float3", "tess_coord"),
+            ] {
+                parameters.push(MslParameter::new(ty, name, MslParameterAttribute::None));
+            }
+        }
+        if let Some(layout) = &tessellation_control {
+            stage_input = layout.declarations();
+            for (ty, name) in [
+                ("const device MslControlInput*", "patch_input"),
+                ("device MslControlOutput*", "patch_output"),
+                ("device MslControlPatch&", "patch"),
+                ("uint", "patch_vertices"), ("uint", "invocation_id"), ("uint", "patch_id"),
+            ] {
+                parameters.push(MslParameter::new(ty, name, MslParameterAttribute::None));
+            }
+        }
         if let Some(layout) = &geometry {
             stage_input = layout.payload_declaration(runtime_info);
             parameters.push(MslParameter::builtin(
@@ -616,6 +653,7 @@ impl MslEmitContext {
             ));
         }
         for index in 0..32 {
+            if tessellation_control.is_some() || tessellation_evaluation.is_some() { break; }
             let input_type = runtime_info.generic_input_types[index];
             if !runtime_info.previous_stage_stores.generic_any(index)
                 || !program.info.loads.generic_any(index)
@@ -665,7 +703,7 @@ impl MslEmitContext {
             stage_input.push_str(&format!("    {type_name} {name} {attribute};\n"));
             input_generics[index] = Some(MslInputGenericDefinition { name, load_op });
         }
-        if !stage_input.is_empty() && stage != Stage::Geometry {
+        if !stage_input.is_empty() && stage != Stage::Geometry && tessellation_control.is_none() {
             stage_input.push_str("};\n\n");
             let parameter = match stage {
                 Stage::VertexB => "MslVertexIn",
@@ -711,7 +749,7 @@ impl MslEmitContext {
         // SPIRV-Cross removes FragDepth when EarlyFragmentTests is active:
         // SPIR-V makes that write ineffective, while Metal rejects the pair.
         let emits_frag_depth = program.info.stores_frag_depth && !runtime_info.force_early_z;
-        let emits_point_size = !options.disable_rasterization
+        let emits_point_size = stage != Stage::TessellationControl && !options.disable_rasterization
             && (stage != Stage::Geometry
                 || program.output_topology == crate::ir::types::OutputTopology::PointList)
             && options.enable_point_size_builtin
@@ -720,7 +758,7 @@ impl MslEmitContext {
                 .stores
                 .get(crate::ir::value::Attribute::POINT_SIZE.0 as usize)
                 || runtime_info.fixed_state_point_size.is_some());
-        if emits_point_size && !matches!(stage, Stage::VertexB | Stage::Geometry) {
+        if emits_point_size && !matches!(stage, Stage::VertexB | Stage::Geometry | Stage::TessellationEval) {
             return Err(MslError::UnsupportedProgramFeature(
                 "point-size output outside a vertex shader",
             ));
@@ -736,11 +774,20 @@ impl MslEmitContext {
             emits_frag_color[1] = true;
         }
         let returns_output = match stage {
+            Stage::TessellationControl => {
+                source.push_str(&format!("inline void ruzu_control({parameters}) {{\n"));
+                // Eden DefineOutputs initializes the clip-distance interface to
+                // zero. Each native invocation owns its corresponding record.
+                for index in 0..clip_distance_count {
+                    source.push_str(&format!("    patch_output[invocation_id].clip_distance[{index}] = 0.0f;\n"));
+                }
+                false
+            }
             Stage::VertexB if options.disable_rasterization => {
                 source.push_str(&format!("vertex void main0({parameters}) {{\n"));
                 false
             }
-            Stage::VertexB | Stage::Geometry => {
+            Stage::VertexB | Stage::Geometry | Stage::TessellationEval => {
                 source.push_str("struct MslVertexOut {\n");
                 source.push_str("    float4 position [[position]];\n");
                 if emits_point_size {
@@ -772,7 +819,9 @@ impl MslEmitContext {
                         source.push_str("    MslGeometryPrimitiveOut geometry_primitive_output = {};\n");
                     }
                 } else {
-                    let entry = if function_kind == MslFunctionKind::VertexFunction {
+                    let entry = if function_kind == MslFunctionKind::TessellationEvaluationFunction {
+                        "template<typename ControlPoint, typename PatchData>\ninline MslVertexOut ruzu_evaluate"
+                    } else if function_kind == MslFunctionKind::VertexFunction {
                         "inline MslVertexOut ruzu_vertex"
                     } else {
                         "vertex MslVertexOut main0"
@@ -857,6 +906,8 @@ impl MslEmitContext {
             stage,
             interface,
             geometry,
+            tessellation_control,
+            tessellation_evaluation,
             source,
             local_declarations: String::new(),
             local_declarations_offset,
@@ -1279,7 +1330,15 @@ impl MslEmitContext {
     }
 
     pub(crate) fn emits_vertex_outputs(&self) -> bool {
-        matches!(self.stage, Stage::VertexB | Stage::Geometry) && self.returns_output
+        matches!(self.stage, Stage::VertexB | Stage::Geometry | Stage::TessellationEval) && self.returns_output
+    }
+
+    pub(crate) fn tessellation_control_layout(&self) -> Result<&super::emit_msl_tessellation::TessellationControlLayout, MslError> {
+        self.tessellation_control.as_ref().ok_or(MslError::UnsupportedProgramFeature("tessellation control interface"))
+    }
+
+    pub(crate) fn tessellation_evaluation_layout(&self) -> Result<&super::emit_msl_tessellation::TessellationEvaluationLayout, MslError> {
+        self.tessellation_evaluation.as_ref().ok_or(MslError::UnsupportedProgramFeature("tessellation evaluation interface"))
     }
 
     pub(crate) fn geometry_input_vertices(&self) -> Result<u32, MslError> {
@@ -2371,10 +2430,16 @@ impl MslEmitContext {
         if self.uses_cbuf_indirect {
             Self::define_constant_buffer_indirect_functions(&mut source);
         }
+        if self.uses_no_contraction_add || self.uses_no_contraction_mul || self.uses_no_contraction_fma {
+            // Preserve NoContraction without blocking inlining/constant folding
+            // of every precise operation. Keep explicit fma calls and safe math;
+            // disabling implicit contraction also conservatively covers callers.
+            source.push_str("#pragma STDC FP_CONTRACT OFF\n\n");
+        }
         if self.uses_no_contraction_add {
             source.push_str(concat!(
                 "template<typename T>\n",
-                "[[clang::optnone]] T spvFAdd(T lhs, T rhs) {\n",
+                "inline T spvFAdd(T lhs, T rhs) {\n",
                 "    return fma(T(1), lhs, rhs);\n",
                 "}\n\n",
             ));
@@ -2382,7 +2447,7 @@ impl MslEmitContext {
         if self.uses_no_contraction_mul {
             source.push_str(concat!(
                 "template<typename T>\n",
-                "[[clang::optnone]] T spvFMul(T lhs, T rhs) {\n",
+                "inline T spvFMul(T lhs, T rhs) {\n",
                 "    return fma(lhs, rhs, T(0));\n",
                 "}\n\n",
             ));
@@ -2390,7 +2455,7 @@ impl MslEmitContext {
         if self.uses_no_contraction_fma {
             source.push_str(concat!(
                 "template<typename T>\n",
-                "[[clang::optnone]] T spvFma(T a, T b, T c) {\n",
+                "inline T spvFma(T a, T b, T c) {\n",
                 "    return fma(a, b, c);\n",
                 "}\n\n",
             ));
@@ -2537,6 +2602,8 @@ impl MslEmitContext {
                 super::msl_function::MslFunctionKind::StageEntryPoint => "main0",
                 super::msl_function::MslFunctionKind::VertexFunction => "ruzu_vertex",
                 super::msl_function::MslFunctionKind::GeometryFunction => "ruzu_geometry",
+                super::msl_function::MslFunctionKind::TessellationControlFunction => "ruzu_control",
+                super::msl_function::MslFunctionKind::TessellationEvaluationFunction => "ruzu_evaluate",
             }.to_owned(),
             language_version: self.language_version,
             execution: self.execution,

@@ -9,6 +9,8 @@ pub enum MslFunctionKind {
     StageEntryPoint,
     VertexFunction,
     GeometryFunction,
+    TessellationControlFunction,
+    TessellationEvaluationFunction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

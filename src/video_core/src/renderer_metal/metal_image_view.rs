@@ -66,7 +66,14 @@ impl MetalImageView {
         let format = aspect_format(view.format, aspect, render_format);
         let levels = ns_range(view.range.base.level, view.range.extent.levels);
         let slices = ns_range(view.range.base.layer, view.range.extent.layers);
-        let swizzle = [info.x_source, info.y_source, info.z_source, info.w_source];
+        let mut swizzle = [info.x_source, info.y_source, info.z_source, info.w_source];
+        if view.format == PixelFormat::A5B5G5R1Unorm && !info.is_render_target() {
+            // Eden TryTransformSwizzleIfNeeded / SwapSpecial: the packed
+            // native R,G,B,A components represent guest A,B,G,R respectively.
+            for source in &mut swizzle {
+                *source = swap_special(*source);
+            }
+        }
         let mut sampled_swizzle = if info.is_render_target() {
             identity_swizzle()
         } else {
@@ -396,6 +403,17 @@ fn metal_texture_type(texture_type: TextureType, samples: u32) -> MTLTextureType
         TextureType::ColorCube => MTLTextureType::TypeCube,
         TextureType::ColorArrayCube => MTLTextureType::TypeCubeArray,
         TextureType::Buffer => MTLTextureType::TypeTextureBuffer,
+    }
+}
+
+// Eden vk_texture_cache.cpp::SwapSpecial.
+fn swap_special(source: u8) -> u8 {
+    match source {
+        value if value == SwizzleSource::R as u8 => SwizzleSource::A as u8,
+        value if value == SwizzleSource::G as u8 => SwizzleSource::B as u8,
+        value if value == SwizzleSource::B as u8 => SwizzleSource::G as u8,
+        value if value == SwizzleSource::A as u8 => SwizzleSource::R as u8,
+        value => value,
     }
 }
 

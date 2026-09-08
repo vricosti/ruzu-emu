@@ -950,7 +950,8 @@ pub fn is_pixel_format_etc2(format: PixelFormat) -> bool {
 pub fn is_pixel_format_integer(format: PixelFormat) -> bool {
     matches!(
         format,
-        PixelFormat::A8B8G8R8Sint
+        PixelFormat::S8Uint
+            | PixelFormat::A8B8G8R8Sint
             | PixelFormat::A8B8G8R8Uint
             | PixelFormat::A2B10G10R10Uint
             | PixelFormat::R8Sint
@@ -995,7 +996,8 @@ pub fn is_pixel_format_signed_integer(format: PixelFormat) -> bool {
 /// Port of `PixelComponentSizeBitsInteger` from `surface.cpp`.
 pub fn pixel_component_size_bits_integer(format: PixelFormat) -> usize {
     match format {
-        PixelFormat::A8B8G8R8Sint
+        PixelFormat::S8Uint
+        | PixelFormat::A8B8G8R8Sint
         | PixelFormat::A8B8G8R8Uint
         | PixelFormat::R8Sint
         | PixelFormat::R8Uint

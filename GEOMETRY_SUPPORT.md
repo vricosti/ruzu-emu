@@ -1930,6 +1930,97 @@ claim the runaway incident fixed until a matched, monitored run validates it.
 Rebuilt release GUI without warnings and bundled it using the existing MoltenVK
 library. Library SHA256 stayed
 0995b17b030c01e991e2c36b48a953d8a4fdb6c4df1b9dcaa46b6d9e08612855.
+
+### 2026-09-07 - Selected-aspect shader metadata prerequisite
+
+The captured X32_Stencil8/float mismatch now has a tested correction. Shared
+graphics/compute shader environments resolve TIC swizzles to the sampled
+depth or unsigned stencil format, without changing image storage or RT
+formats. S8 classification and component width are consistent. Integer nearest
+sampling takes priority over anisotropy fallback in both native bind paths.
+
+Legacy combined-format disk environments cannot resolve the aspect without
+their original TIC. All three backend preloaders consume their keys and defer
+these entries to live translation; original caches are preserved. A regression
+test verifies a mixed old/new cache stays byte-identical after loading.
+
+Direct MSL GPU readback tests pass under Metal API validation for stencil
+0/1/128/255 and ordinary depth sampling at 0.25. Full video_core release suite
+passes 1760 tests, 3 ignored. Final sampler-order tests/build and a new monitored
+GUI validation run are pending. The previous failure is not declared fixed
+in-game until that run passes. UInt8 cache FPS benefit remains unmeasured.
+
+Validation run G: fresh GUI PID 75388, `/tmp/lm3-0907g-app.log` and
+`/tmp/lm3-0907g-resources.csv`. Previous stencil-type assertion did not recur;
+at 28 seconds Metal validation instead aborted a compute dispatch: CBUF c0
+bound allocation length 4, required native uint4 length 16. No A was sent,
+no emulator remains, sampled footprint peaked about 4.3 GiB and swap was stable.
+This is not a comparable gameplay/performance run. The full final sampler-order
+suite and GUI build passed without warnings before launching.
+
+New prerequisite: the backend common-cache null Buffer and runtime fallback
+both allocate only 4 bytes, copied from Vulkan's null index resource. Native
+constant uint4 pointers and indirect CBUF reads require a complete readable
+constant range. Both now allocate MAX_CONST_BUFFER_SIZE with explicit zero
+initialization; guest allocation sizes and metadata are unchanged. Added GPU
+test uses the real runtime compute binding and reads the first/last uint4 for
+both null allocation paths. Full tests/rebuild and subsequent validation run
+are pending. This is a local native allocation-contract fix, not a scheduler
+wait or a replacement of valid guest buffers.
+
+Following the null fallback exposed an independent routing defect:
+`BufferCacheRuntime::with_mapped_uniform_buffer` always pushed graphics UBOs,
+even after BeginComputeBindings. Common BindHostComputeUniformBuffers uses
+this path for unaligned offsets; the resulting compute list is short and its
+descriptor lookup falls back to null. It now follows the existing BindingTarget,
+as texel bindings already do. Regression mixes mapped/direct/mapped compute
+bindings, checks bytes/order and verifies graphics binding isolation. Eden's
+Vulkan runtime pushes the same stream data to the active descriptor queue;
+native separate lists must preserve that destination. This does not prove the
+captured c0 used this path, but the misrouting is independently reproducible.
+
+### 2026-09-07 - Live validation passed; no material FPS improvement
+
+Final snapshot: full release video_core suite 1762 passed / 3 ignored with
+Metal API validation, no warnings; GUI release and bundle succeeded. Logs:
+`/tmp/ruzu-compute-routing-final-{tests,gui,bundle}-20260907.log`.
+
+Run H (validation enabled): `/tmp/lm3-0907h-app.log`, PID 12354, fresh GUI,
+seven A inputs, confirmed Lobby gameplay via `lobby-validation.png` in its
+session directory. Neither stencil-type nor short-CBUF assertion recurred
+through gameplay. Quit normally at 251 seconds, watcher exit 0. Peak footprint
+8.376 GiB, swap unchanged, disk free delta -12.51 MiB; no saturation.
+
+Run I (validation disabled, same release GUI and profiling flags as baseline B):
+`/tmp/lm3-0907i-app.log`, PID 25779. Automated seven A inputs after initial wait,
+at least seven seconds apart. `after07.png` caught the Lobby fade-in;
+`lobby-measure.png` confirmed the same static Lobby camera as baseline B.
+No further input or captures during the 15 two-second status samples:
+`/tmp/lm3-0907i-fps.jsonl`, 04:58:10..04:58:38 UTC.
+
+- FPS median 7.9165, range 7.8717..8.9608, mean 8.1195. Baseline B median
+  7.947: no meaningful improvement. Do not claim the UInt8 cache fixed FPS.
+- Guest command-buffer mean duration 28.675 ms (previous 29.807); median
+  per-report peak 130.256 ms (previous 134.105). Long GPU batches persist.
+- UInt8 cache per-report median requests 4185, hits 1774, uncacheable 1674.
+  Median owned converted bytes 65790 / 298 entries. Median native allocations
+  2,295,005,184 bytes, common-buffer accounting 176,357,630 bytes.
+- Sampled-batch index conversion calls median 221 (previous 463). Batches
+  differ in work size; this is supporting evidence, not a per-frame ratio.
+- Stage samples rotate across partial batches. Of summed raw sampled ticks,
+  fragment ~60.6%, vertex ~32.6%, compute ~5.5%, blit ~1.3%. Stages overlap;
+  these are NOT wall-clock utilization percentages or an identified culprit
+  shader. Correlate expensive native render passes with actual guest pipelines,
+  attachment sizes and resource contents before the next optimization.
+- Quit normally at 227 seconds, watcher exit 0. Peak footprint 7.984 GiB;
+  swap delta -8 MiB, disk free delta -0.38 MiB. No process remains. This
+  bounded run does not rule out longer-term leaks.
+
+The independently reproduced numeric-type, null-range and compute-stream-target
+defects are fixed and tested. Full scene parity, other-title regressions and
+the >=20 FPS target remain open. Next slice: enrich existing bounded stage
+profiling with pass/pipeline identity, then isolate the longest native render
+passes; do not add global waits or skip work to make the timing look better.
 New app executable SHA256:
 2270a2d16744a691abf3af9bbcfb4f991f2cea62318e82075acb4aad26f4af98.
 One app instance, PID 72947, started through the same external watchdog; no
@@ -2168,3 +2259,1564 @@ replay path before promising autonomous navigation. Preserve config/saves/caches
 record only explicitly selected game input, and do not capture unrelated typing.
 The >=20 FPS and visual parity gates remain unmet. This is a WIP checkpoint,
 not a claim that the geometry/performance objective is complete.
+
+## 2026-09-06 - Input control and profiling follow-up
+
+Checkpoint cba4f79c is pushed on fix/vulkan-geometry-stream-exception after
+rebase onto capture-harness 832ac04c. Only the DIFF.md append conflicted; both
+entries were preserved. No input automation was yet present in the app built
+at 23:25. The user's 23:41 screenshot shows Vulkan/MoltenVK, not native Metal;
+their later Vulkan test is visually working at about 14 FPS. Large polygons
+in the earlier capture are intermittent/unexplained, not a proven Metal regression.
+
+macOS event-posting preflight is denied. A local opt-in GUI control socket now
+uses the existing virtual gamepad rather than attempting unauthorized OS input.
+No physical keyboard is recorded or mapping changed. Runtime HID and screenshot
+validation remain pending. User's requested sequence: wait 40 s after launch,
+then A every 7 s, stop on arrival in gameplay. Do not use the old 9-A sequence
+for this title. Each input must have a release and a same-process fresh capture.
+
+Stage profiling now rotates 1024-sample windows and attributes compute calls /
+explicit render exits to conditional masking, conditional resolve, visibility,
+geometry vertex, assembly, index conversion, guest, or other. The prior prefix
+sample omitted 3345 stages; its ratios cannot represent the complete frame.
+This is diagnostic-only and does not change encoder reuse/submission order.
+The always-GPU conditional-compare-to-zero path matches Eden's Vulkan runtime;
+it is not a confirmed missing upstream CPU fast path. Any Metal optimization
+must retain authoritative GPU predicates, not assume guest RAM is current.
+
+Verification: input-session focused tests 3/3 pass. Full GUI suite has 288
+passes and two failures outside the modified files: shared_translation expects
+the backend list without Metal; overlay_dialog initializes GTK from a Rust test
+worker rather than the macOS main thread. Do not report the GUI suite as green.
+Full release video_core suite under MTL_DEBUG_LAYER=1 passes 1735 tests with two
+ignored and no warnings. The new attribution test proves changing a diagnostic
+tag preserves compute encoder identity and counts one explicit render exit only
+once; sampled windows count omitted work and reset when workloads shrink.
+GUI release build is running in /tmp/ruzu-gui-input-build-20260906.log (session
+23402). The user's existing GUI PID 63454 is still open and has not been stopped
+or replaced. Runtime navigation/capture remains unverified until relaunch; do
+not send new control commands to this old process, which has no socket.
+
+GUI release build completed without warnings (3m24s); the final logical-button
+enum mapping was rechecked by the 3/3 focused tests in
+/tmp/ruzu-input-session-final-tests-20260907.log. target/release/ruzu is new
+(2026-09-07 00:03), but ruzu.app still contains the 23:25 binary. Bundling is
+deliberately pending while the user's Vulkan instance PID 63454 remains open.
+The async question asking to close that test/relaunch Metal has not been answered.
+Do not claim an automated game run or fresh screenshots have been obtained.
+
+Next: after the user's test ends, bundle with the existing MoltenVK library
+(SHA256 0995b17b030c01e991e2c36b48a953d8a4fdb6c4df1b9dcaa46b6d9e08612855),
+then one watched ruzu.app launch with the isolated Metal configuration and
+RUZU_INPUT_SESSION_DIR set to a NEW short /tmp directory. Never precreate that
+directory. At +40 s use gui_control.py status/capture/press A; inspect fresh
+960x540 captures and space further presses by at least 7 s. Check mapped HID
+button A while down and after its 300 ms expiry, stop inputs on gameplay arrival,
+and collect GPU operation counts only after the navigation/readbacks settle.
+No FPS improvement has yet been implemented or measured in this follow-up.
+
+## 2026-09-07 - CPU-owned conditional optimization (runtime validation pending)
+
+While the user's Vulkan PID 63454 remains open, a bounded native optimization
+was added: Conditional mode with neither query metadata nor GPU-modified buffer
+data returns to Maxwell's existing synchronized CPU evaluation. Any prior GPU
+predicate is cleared. This avoids resolve + per-draw argument masking for that
+case without reading stale GPU-owned data. The two independent u32 words retain
+the upstream AND semantics; a 64-bit nonzero replacement would be incorrect.
+
+The targeted conditional suite passes 24 tests, including GPU values differing
+from RAM, both single-zero-word cases, and removal of a prior host predicate
+without any new GPU work. Full video_core validation passed as well; logs:
+/tmp/ruzu-cpu-conditional-{tests,full-tests}-20260907.log. No Vulkan runtime
+behavior changed; the shared engine has only an added regression test.
+This supersedes the earlier note that no performance change was implemented,
+but there is still NO measured game FPS gain or verified automatic navigation.
+Rebuild the GUI again before the next bundle/run: its 00:03 executable predates
+this conditional optimization. Keep the native profiling and input changes,
+and preserve the currently running user's application until they finish testing.
+
+The subsequent GUI release rebuild completed successfully (1m16s, no warnings),
+as recorded in /tmp/ruzu-cpu-conditional-gui-build-20260907.log. The app bundle
+has deliberately not been replaced while the user's original Vulkan PID 63454
+is still alive. Neither the input socket nor the new conditional policy has
+therefore been exercised in a game. The CPU fallback uses the original engine's
+synchronized ReadBlock; query metadata / GPU-dirty records retain GPU evaluation.
+
+## 2026-09-07 - Real tessellation prerequisite recovered offline
+
+No second emulator was launched. A macOS-only ignored inspection test in
+renderer_vulkan/pipeline_cache.rs uses that owner's cache version/key readers,
+copies the selected file to a NEW owner-only directory, then scans the snapshot.
+LoadPipelines must never receive the original cache because it deletes invalid
+files. The diagnostic asserts snapshot survival before reporting counts and
+exports through the existing complete-environment/IR capture boundary, using
+the actual native Metal host translation profile. It builds no GPU pipelines.
+
+The current Vulkan environment cache contains 730 graphics entries, one compute
+entry, and TWO tessellation pipelines. Unlike the older geometry-only capture,
+this provides real TCS/TES programs without another navigation run. Original and
+snapshot SHA256 both equal
+dc6b5b6471e9501a687f85c663e8c30aefc6e653dacc2fa44a3c47388715a455.
+Artifacts: /tmp/ruzu-offline-tess-20260907-01, test log:
+/tmp/ruzu-offline-tess-test-20260907.log (one ignored/manual test explicitly run
+and passed). The earlier command with a short --exact filter ran zero tests;
+only the subsequent fully-qualified test execution is validation evidence.
+
+Pipeline inventory:
+- f5643c92bc555963: VS 173683efa17936c9, TCS c0f4e20e1c27f47f,
+  TES c1d03f8053f7efe5, FS 81b2fae866f8426c.
+- cfbfb82c9fc851b8: VS 4a029f924db752b0, TCS 5e122f0e82a5c81a,
+  TES 48114928452638f7, FS bb55422562412818.
+- Both use Patch topology, three input control points, three TCS invocations,
+  triangle TES domain, Equal spacing and clockwise tessellation winding. Neither
+  contains a geometry stage or enabled XFB varying records.
+- TCS loads indexed per-vertex generics and CBUF values, writes per-vertex
+  generics, and writes Patch(0/1/2/4): three outer levels and inner level zero.
+  Factors include data-dependent FP calculations, not only constant one.
+  No barrier, shared/local memory or SSBO/texture opcode occurs in these TCS IRs.
+- TES reads per-vertex generics and TessellationEvaluationPoint.U/V, CBUF values,
+  InvocationInfo and LaneId, then writes output attributes. The second pair
+  additionally carries Generic10 components. Do not replace its lane/patch
+  interfaces with geometry-only constants or zero values.
+- TCS runtime.tess_primitive=Isolines is the unused default in the shared
+  runtime structure; make_runtime_info only fills the domain for TES. It is
+  NOT evidence that the game requests isolines. program.output_vertices=0 is
+  likewise not the TCS output count: its invocation count is three.
+
+The native tessellation slice remains interrupted pending real interfaces:
+callable vertex production -> TCS compute / retained patch data and factors ->
+hardware tessellator -> TES post-tessellation vertex function -> fragment.
+Apple documents separate factor/patch/control-point buffers, half-encoded
+triangle factors and patch_id/position_in_patch inputs:
+https://developer.apple.com/library/archive/documentation/Miscellaneous/Conceptual/MetalProgrammingGuide/Tessellation/Tessellation.html
+Eden EmitGetPatch/EmitSetPatch/EmitInvocationInfo and declarations were re-read:
+preserve generic patch ownership, outer/inner factor indices and the input
+control-point count shifted by 16. This is a native backend prerequisite, not
+a reason to alter the shared Maxwell translator or substitute a normal triangle.
+Live rendering, same-scene comparison and >=20 FPS remain unmet. Do not infer
+that these two omitted pipelines alone cause the low frame rate or flicker.
+
+After this diagnostic addition, full release video_core with MTL_DEBUG_LAYER=1
+passes 1,738 tests, zero failures, three ignored (including the new manual
+inspection test), and no Rust warnings. Log:
+/tmp/ruzu-offline-prerequisite-full-tests-20260907.log. The user-owned Vulkan
+process is still alive and was neither stopped nor sent inputs. The next game
+run must use the rebuilt GUI with the 40 s / 7 s input cadence and a resource
+watchdog, after the user's current test ends.
+
+## 2026-09-07 - Callable native TCS verified; TES/runtime still pending
+
+The compiler now emits the shared Maxwell TCS IR as an inline native MSL
+function. Its compute caller owns a complete patch per workgroup, invocation
+IDs, input/output device buffers and patch storage. Output attributes index
+InvocationId rather than the IR SetAttribute vertex operand, exactly as Eden.
+InvocationInfo preserves the input patch count shifted by 16; patch outer
+indices 0..3 and inner indices 4..5 remain separate. Factors stay guest f32
+until a later native factor-buffer conversion. No live tessellation gate was
+removed: TES and the retained factor/control-point draw pipeline are prerequisites.
+
+The final upstream audit corrected an intermediate mistaken per-component
+default: DefineInputs gates a WHOLE vec4 on Generic(index), not each component.
+Only absent/Disabled input interfaces default to (0,0,0,1). Regression tests
+cover partial masks, disabled inputs, invalid invocation counts, patch indices,
+barrier memory domains and rejection as a normal stage entry point.
+
+Native Metal validation executed two workgroups of three TCS invocations with
+distinct inputs, CBUF reads, cross-invocation output reads, generic output and
+computed patch factors. GPU-observed output stride is 80 bytes for that interface;
+the host never assumes a Rust vec4 struct layout. The two actual captured TCS
+programs also compile into compute pipelines using the real native device profile:
+/tmp/ruzu-offline-tcs-20260907-03 and
+/tmp/ruzu-tcs-final-captured-test-20260907.log. This is compile evidence, not a
+rendered comparison. Original game cache was only copied, never modified.
+
+Full release tests with MTL_DEBUG_LAYER=1: shader_recompiler 571 passed;
+video_core 1,739 passed and three ignored; zero failures/warnings. Log:
+/tmp/ruzu-tcs-final-full-tests-20260907.log. No new in-game FPS result exists.
+Next prerequisite: TES callable input/output and native post-tessellation entry
+point. Its per-control-point buffer stride must come from the TCS producer,
+not from just the subset of generics the TES reads. User navigation remains
+40 seconds then A at seven-second intervals, stopping on gameplay arrival.
+
+## 2026-09-07 - Callable TES and native patch rasterization prerequisite
+
+The native compiler now has a separate ruzu_evaluate callable TES. It uses
+the producer's concrete ControlPoint and PatchData template types, rather than
+reconstructing a struct from the consumer's attribute subset (which would read
+the wrong stride). Generic/position inputs preserve the control-point index;
+patch generics are read-only and patch-wide. PatchVertices/PrimitiveId and
+TessCoord retain Eden's ownership and raw-bit conventions. The normal stage
+entry still rejects TES until a real native wrapper owns its draw state.
+
+Important refinement of the LaneId prerequisite: both captured TES programs
+use it ONLY as the vertex operand of TessCoord U/V loads. Eden ignores that
+operand for those built-ins; it is not a semantic SIMD dependency. The native
+layout checks every lane use (including phi operands) and elides only the
+ignored value, without manufacturing a zero lane. Observable lane/shuffle/vote/
+mask operations remain explicitly unsupported in post-tessellation vertex
+functions. The earlier blanket suspicion about LaneId blocking these two TES
+programs is invalidated; it remains a limitation for other observable uses.
+
+A native hardware test executes two triangle patches with compute-produced
+points/factors, per-patch data, CBUF data, hardware domain coordinates and
+generated TES code. Extra producer fields precede both consumed generic fields.
+The result is a red and a green patch with the expected blue component; setting
+only the second patch's factors to zero leaves the first intact and clears the
+second. No intermediate CPU readback/wait separates compute and rendering.
+The final wait exists only for the test's output verification.
+
+Final full release tests (Metal validation enabled): shader_recompiler 574
+passed; video_core 1,740 passed, three ignored; zero failures and no warnings.
+/tmp/ruzu-tes-final-full-tests-20260907.log
+Both real captured TCS/TES pairs also compile into native compute/render PSOs:
+/tmp/ruzu-offline-tes-20260907-02
+/tmp/ruzu-tes-final-captured-test-20260907.log
+The manual probe uses a test fragment stage and is not evidence of actual game
+pixels. Original cache SHA256 remains unchanged from the earlier snapshot.
+
+Next: implement native tessellation pipeline ownership in renderer_metal:
+vertex production/patch assembly -> TCS compute -> half factor conversion ->
+hardware tessellator/TES -> real fragment, with resource bindings and lifetimes
+retained by the scheduler. Keep the live pipeline rejection until that whole
+chain exists. Handle domain/spacing/winding and unsupported isolines truthfully;
+do not substitute ordinary triangles. Only then validate the game and FPS.
+The user's original Vulkan PID 63454 remains open, untouched. No new GUI run,
+automatic input sequence, game capture, or FPS gain occurred in this turn.
+
+## 2026-09-07 - Native tessellation runtime interrupted at patch input assembly
+
+The existing MetalPrimitiveAssembly stores six ordinals per primitive and exposes
+geometry InputTopology; it cannot represent patches of up to 32 control points.
+Do not reinterpret Patch as Triangle/Point merely to reuse this type. The next
+prerequisite separates the shared vertex-index/restart stream from primitive
+records, then adds GPU patch-start compaction and dispatch/draw arguments. TCS
+will consume each complete patch as one workgroup; incomplete trailing segments
+must not become patches. Native input decoding must still preserve baseVertex
+bits, index width/offset, restart-before-base-add and instance counts. Pipeline
+integration remains stopped until this prerequisite is implemented and tested.
+
+## 2026-09-07 - Patch input and retained TCS runtime prerequisites implemented
+
+The preceding interruption is resolved for input assembly and control execution:
+MetalVertexStream now separates index/restart decoding from geometry topology.
+MetalPatchAssembly compacts complete patches on GPU and writes dispatch/draw
+arguments; trailing incomplete segments are not dispatched. Patch PSOs are lazy.
+Tests cover index widths 0/1/2/4, restart across scan workgroups, negative
+baseVertex bit patterns, empty inputs and instance counts. The ordinary geometry
+and fan paths retain their tested ordering and output behavior.
+
+MetalGeometryVertexPipeline::record_stream consumes the actual patch stream.
+The new MetalTessellationControlPipeline owns generated native compute entry,
+resource-slot allocation, output allocations and indirect dispatch. It binds
+prepared resources without reading guest memory later. One workgroup owns one
+patch, with exactly the program's invocation count. Full vertex-producer stride
+is retained even for generics that TCS does not read. TCS input count and output
+invocations are independently tested (including 32 inputs / three outputs).
+
+Important integration contract: output regions are separated per instance by
+capacity_per_instance, NOT the GPU-compacted count of complete patches. TES and
+factor conversion must use that same capacity stride. The GPU tests include
+restart-discarded patches that make these two quantities differ. Native
+static_assert verifies input/output/patch record sizes at pipeline compilation.
+An audit also fixed missing TCS clip-distance initialization in MslEmitContext;
+GPU checks verify the declared but unwritten components are zero, as in Eden.
+
+Confirmed first full release suites: shader_recompiler 575 passed, video_core
+1,744 passed and three ignored, zero failures/warnings, Metal validation on.
+/tmp/ruzu-control-runtime-full-tests-20260907.log
+The expanded runtime test covers 1/3/32 invocations, 3/32 input points, multiple
+instances, empty/restart-only ranges, CBUF values, SSBO side effects, patch
+variables, primitive IDs and GPU retention after host packets are dropped.
+The earlier captured pair probe still passed after the producer-stride change:
+/tmp/ruzu-patch-captured-test-20260907.log
+/tmp/ruzu-offline-tes-patch-20260907-01
+It has now been changed to compile the actual runtime TCS wrapper, not a probe
+entry. Final-source tests and that updated probe are being run separately.
+
+Next prerequisite: factor conversion and real native post-tessellation pipeline
+in metal_tessellation_pipeline.rs, then stage/resource integration in the native
+pipeline cache and rasterizer. Preserve sparse instance strides and GPU predicate
+gating for VS/TCS/TES side effects. Do not merely remove the live rejection.
+Equal-spacing factor conversion must not let f32-to-half rounding change ceil
+segment counts near integer boundaries; fractional modes also need explicit
+native capability/precision validation. No default factors or global waits.
+
+No new game run or FPS gain is claimed. User Vulkan PID 63454 remains open and
+untouched. Navigation on the next authorized run: wait 40s, then A at intervals
+of at least seven seconds, checking captures and stopping on gameplay arrival.
+Free disk space remains about 32 GiB. DIFF.md audit updated; no commit made.
+
+Final-source verification completed:
+- /tmp/ruzu-control-runtime-final-tests-20260907.log: shader_recompiler 576 passed;
+  video_core 1,744 passed, three ignored; no warnings/failures, Metal validation on.
+- /tmp/ruzu-control-runtime-captured-test-20260907.log: both real TCS programs
+  compile through MetalTessellationControlPipeline::new; both TES render probes
+  compile. This remains compilation evidence, not a game-render comparison.
+- /tmp/ruzu-offline-control-runtime-20260907-01 contains the private cache copy
+  and callable MSL/IR captures. Original and copied cache SHA256 both remain
+  dc6b5b6471e9501a687f85c663e8c30aefc6e653dacc2fa44a3c47388715a455.
+- git diff --check passes. No full GUI rebuild/rebundle or new launch occurred.
+
+## 2026-09-07 - Native factor conversion and denormal regression
+
+MetalTessellationFactorPipeline now consumes the actual TCS patch layout and
+GPU-compacted dispatch count. It writes separate half buffers for triangles
+(three outer, one inner) and quads (four outer, two inner), retaining the TCS
+capacity-based instance stride. Conversion is GPU-only, with retained resources
+and a buffer barrier before the eventual tessellator read. No default factors,
+CPU count readback, global wait or live-path draw suppression was introduced.
+
+Equal mode clamps and ceils in f32 before conversion, preserving segment count
+for values just above integers. Fractional even/odd modes clamp to their correct
+range, retain fractional half precision and correct only a rounding-induced
+crossing of the integer segment-count boundary. Fractional generated coordinates
+are not yet validated against a guest/native oracle. Isolines remain explicitly
+unsupported by this hardware path. Device profile owns known tessellation limits;
+an unsupported requested generation level is rejected, never silently reduced.
+
+Measured failure during implementation, now corrected: the first GPU matrix
+failed for triangle/Equal, external factor f32 bits 0x00000001 (1e-45), output
+half 0x0000. A floating comparison had treated the positive subnormal as zero.
+The outer discard decision now inspects sign/magnitude/NaN bits BEFORE numeric
+clamping. This is a synthetic conversion bug caught by the test, not a proven
+cause of the original game's missing geometry or low FPS.
+- Failed evidence: /tmp/ruzu-tess-factors-case-test-20260907.log
+- Corrected matrix: /tmp/ruzu-tess-factors-fixed-test-20260907.log
+- First full pass: /tmp/ruzu-tess-factors-full-tests-20260907.log
+  (shader_recompiler 576 passed; video_core 1,747 passed, three ignored).
+The production converter is also used by the hardware TES raster test: computed
+patch data -> factor conversion -> native tessellator/TES -> fragment pixels.
+Discarding patch two leaves patch one intact; both colors are checked on GPU
+readback. The final matrix additionally varies each external/internal component
+independently to detect incorrect field order.
+
+Next: native TES entry and render PSO in metal_tessellation_pipeline.rs, then
+cache/rasterizer resource integration. Resolve the factor-buffer instance index
+contract BEFORE issuing nonzero-baseInstance draws: Apple documents the factor
+lookup using instanceID * instanceStride, whereas allocated TCS regions start at
+instance zero. Test the hardware behavior; if rebasing the native draw to zero
+is necessary, retain the guest base in the explicit shader ABI rather than
+allocating an unbounded prefix or changing guest InstanceId. Do not assume the
+existing single-instance raster test proves this case. Preserve predicate gating
+of every guest stage, not only the final raster draw.
+
+API sources re-read: Apple's tessellation guide and Metal capability tables;
+maxTessellationFactor/MTLTessellationPartitionMode documentation (including the
+official Markdown endpoints); Khronos tessellation discard/spacing specification.
+Eden stayed read-only. DIFF.md updated. User Vulkan process 63454 is still open,
+untouched; no new GUI run, game screenshot, frame-rate result or commit.
+
+## 2026-09-07 - Worker stop race and hardware instance-addressing gate
+
+The final factor suite did not initially finish: video_core's
+unmap_memory_unregisters_untracks_and_deletes_image was stuck in
+StatefulThreadWorker::Drop joining TextureDecoder. The owned test process 91275
+was sampled (see /tmp/ruzu-tess-factors-test-sample-20260907.txt), revalidated live,
+then explicitly terminated after diagnosis. The user's GUI 63454 was untouched.
+This was not a GPU-wait timeout or a reason to silently restart a live test.
+
+Confirmed local defect: Drop stored stop and notified without queue_mutex,
+allowing the notification to precede the worker's atomic Condvar wait/unlock.
+Eden uses stop-token-aware condition_variable_any; the Rust adaptation needs the
+predicate mutex. Drop now takes it only around stop publication and releases it
+before notification/join. The new mutex-contract regression failed before the
+fix, then passes; startup/drop stress verifies destruction of 128 worker states.
+
+Post-fix complete verification: /tmp/ruzu-worker-stop-final-tests-20260907.log
+common 367 passed; shader_recompiler 576 passed; video_core 1,747 passed with
+three ignored. No warnings, Metal API validation enabled. This suite includes
+all previous factor/TCS/TES tests, but predates the subsequent instance oracle.
+It does not demonstrate any live-game performance gain.
+
+Hardware gate resolved: native PerPatchAndPerInstance factor addressing DOES
+include baseInstance on this M2 Pro. Direct draws with bases 0 and 11 produced
+the expected separate red/green patches only from the corresponding absolute
+factor regions. Evidence: /tmp/ruzu-tess-base-instance-20260907.log, one passed.
+Production patch assembly now emits native baseInstance=0, retaining the guest
+base separately for the preceding VS and its resource fetches. Tests use that
+retained field; an extended oracle exercises real indirect draw arguments with
+guest bases 11 and UINT32_MAX while allocating only two factor regions.
+
+Next integration boundary remains the production TES entry/render PSO and
+resource binding, then live cache/rasterizer stage execution with conditional
+gating of every producer. The instance-offset prerequisite is no longer an
+unresolved guess. No game-specific values, silent draw removal or global waits
+were introduced. User input cadence remains 40 seconds after launch, then A
+every >=7 seconds until gameplay, with scene inspection rather than a fixed
+number of button presses. No second emulator has been launched.
+
+Final-source verification (including retained-base VS callers and native
+indirect rasterization) completed in
+/tmp/ruzu-tess-native-instance-verified-20260907.log: common 367 passed,
+shader_recompiler 576 passed, video_core 1,748 passed/three ignored. Metal API
+validation enabled, no warnings or errors. git diff --check passes; disk still
+has 31 GiB available. User GUI 63454 remains running, unmodified. No GUI rebuild,
+new game capture, commit or FPS result in this slice; the goal remains open.
+
+## 2026-09-07 - Production TES entry, PSO and retained binding verified
+
+MetalTessellationEvaluationPipeline is implemented in its native pipeline owner.
+It wraps the common callable TES using the exact producer control/patch layouts,
+three transport slots after guest resources, zero-based instance regions and
+native triangle/quad patch attributes. Domain/spacing/winding and framebuffer
+blend/sample/raster state are part of the PSO; no Vulkan shader conversion is used.
+Rasterization-disabled entries return void but still execute all TES side effects.
+Binding validates producer strides, capacities and buffer bounds. Empty patch
+draws bind a valid positive native factor step without inventing any invocation.
+
+The previous hand-written hardware TES entry in metal_shader.rs has been removed.
+Its replacement test executes production PSO/bind + real GPU assembler draw args,
+and verifies red/green output, CBUF and patch-generic multiplication, unread producer
+generic fields, factor-discard, zero patches, and TES atomic writes with and
+without rasterization. Both raster modes preserve writes for nonempty draws;
+empty draws produce neither writes nor pixels. All these checks pass.
+
+Constructor coverage: triangles/quads, Equal/FractionalEven/FractionalOdd, CW/CCW,
+last valid buffer base (28), rejecting base 29 and isolines. Fractional coordinate
+placement and winding equivalence to a guest oracle remain unverified; constructor
+success alone must not be presented as that evidence.
+
+Verification:
+- /tmp/ruzu-tes-native-pso-20260907.log: initial production pixel test passed.
+- /tmp/ruzu-tes-native-discard-20260907.log: raster-disabled side effects passed.
+- /tmp/ruzu-tes-pso-full-20260907.log: final shader_recompiler 576 passed;
+  video_core 1,749 passed/three ignored; no warnings, Metal API validation on.
+- /tmp/ruzu-tes-production-captured-20260907.log: both captured TCS compute and
+  TES production PSOs compile (f5643c92bc555963, cfbfb82c9fc851b8). The offline
+  probe still uses a diagnostic fragment; it is NOT a whole guest-pipeline replay.
+- /tmp/ruzu-offline-tes-production-pso-20260907-01 contains the private cache
+  copy and callable shader captures. Original and copy SHA256 unchanged:
+  dc6b5b6471e9501a687f85c663e8c30aefc6e653dacc2fa44a3c47388715a455.
+
+Next concrete integration slice (guard remains in place):
+1. Add retained tessellation variant beside MetalVertexShader::Geometry in
+   metal_pipeline_cache.rs, preserving all stage binding counters/runtime keys.
+2. metal_graphics_pipeline.rs currently skips native stages 1/2 through
+   advance_empty_native_stage. Prepare real TCS/TES descriptor payloads there;
+   do not reuse VS resources or read guest memory after waiting for a pipeline.
+3. Add topology-independent indirect VS entry to MetalGeometryVertexPipeline's
+   shared record_impl interface. Current record_indirect requires a geometry
+   assembly; do not fabricate one for a patch stream.
+4. Gate the VS dispatch, TCS/factor dispatch and final patch draw from the same
+   predicate. ConditionalArgumentLayout::Draw already has the same four-u32
+   size/instanceCount position as patch args; retain real instance base for VS.
+   Do not merely suppress rasterization while allowing conditional shader stores.
+5. Capability-check indirect tessellation (Apple5+/Mac2 per Apple tables), then
+   integrate the whole retained chain in metal_rasterizer.rs before enabling the
+   TCS/TES cache path. Native TES+GS chaining must not silently drop either stage.
+
+Eden stayed read-only; DIFF.md updated, git diff --check passes. User GUI 63454
+is still running and untouched. No new GUI launch/rebundle or FPS claim. The
+game-rendering and >=20 FPS goal is still open.
+
+## 2026-09-07 - Full tessellation chain wired into live rasterizer
+
+The five integration steps above are implemented for direct patch input. The
+cache now retains a VS/TCS/TES variant, builds with shared stage binding counters,
+and caches its native PSO. Graphics resource preparation binds actual stage 1/2
+payloads. The rasterizer records VS, TCS, factor conversion and native TES draw,
+preserving input-vs-output control-point counts, index offsets/restart, guest
+instance base, render-area constants and argument-buffer sampler lifetimes.
+
+Conditional gating is shared by every producer and the final draw. The complete
+GPU test has VS clear the predicate itself and verifies that TCS/TES still follow
+the initial decision. Enabled/disabled/inverted cases, two instances, guest base
+19, per-stage SSBO atomics and rendered pixels pass. No per-draw finish/wait or
+CPU readback was added. Guest-indirect patch input and TES+GS remain explicit
+unsupported prerequisites, not silently truncated pipelines.
+
+Evidence:
+- /tmp/ruzu-tess-chain-test-fixed-20260907.log: complete chain GPU test passed.
+- /tmp/ruzu-tess-live-check-20260907.log: live-path release check passed.
+- /tmp/ruzu-tess-live-full-tests-fixed-20260907.log: shader_recompiler 576 and
+  video_core 1,750 passed, three ignored; Metal validation on, no warnings.
+- /tmp/ruzu-tess-live-captured-chain-20260907.log: both real captured pipelines
+  f5643c92bc555963 / cfbfb82c9fc851b8 compile via production cache build, including
+  actual VS/TCS/TES/FS, shared bindings and recorded attachment formats. PSO reuse
+  asserted. This improves on the previous diagnostic-fragment-only probe.
+- /tmp/ruzu-offline-tess-chain-live-20260907-01 holds the private cache snapshot.
+  Original and snapshot SHA256 still match:
+  dc6b5b6471e9501a687f85c663e8c30aefc6e653dacc2fa44a3c47388715a455.
+
+Compilation is NOT a vertex-fetch or frame oracle: Vulkan disk keys can omit
+dynamic vertex state. Fractional coordinate/winding equivalence, game rendering,
+other-title regression and >=20 FPS are still unverified. No goal completion claim.
+
+GUI release build started, log /tmp/ruzu-tess-live-gui-build-20260907.log; not yet
+rebundled or launched. Existing user GUI PID 63454 is still running; asked the
+user to close it before replacing ruzu.app or starting another instance. No
+inputs sent, no save/config/library changes. Next launch must wait 40s, then A
+at intervals >=7s with scene inspection until gameplay, and monitor memory/disk.
+
+GUI build completed successfully in 2m07s, no warnings. The rebuilt executable is
+target/release/ruzu; target/release/ruzu.app is deliberately still the old bundle
+while user PID 63454 remains active. Do not launch that old bundle as a test of
+the new tessellation path. Rebundle only after the user closes the old GUI,
+preserving the current MoltenVK library. Disk remains at 31 GiB available.
+
+## 2026-09-07 - Native tessellation winding regression found and corrected
+
+Existing user GUI 63454 is still alive; no second emulator launched or inputs
+sent. A read-only ScreenCaptureKit attempt on its windows failed with -3811,
+including window 15355 (title identifies Luigi's Mansion 3, old build 1f700f9992).
+No successful new reference image exists from that attempt; do not reuse an old
+PNG as evidence for this slice.
+
+Used the remaining runtime-validation boundary to test winding. Eden leaves the
+tessellation domain at Vulkan's default upper-left origin: clockwise triangles
+have positive signed (u,v) area. Native Metal's tessellator has the opposite
+convention. MoltenVK's mvkMTLWindingFromSpvExecutionModeInObj also reverses the
+two values. The initial native CW-to-CW mapping was wrong.
+
+New test evaluation_winding_matches_upper_left_domain_triangles compares the
+production TES/factor/indirect-draw path against explicit triangles with the
+specified signed area. Both use the same native viewport, front-face and culling
+state; the fragment reports front/back as red/green. Before correction the first
+triangle case was back-facing instead of front-facing at all three interior
+probes: /tmp/ruzu-tess-winding-before-20260907.log (test failed).
+
+The pipeline now reverses tess_clockwise at the native API boundary, without
+changing the guest runtime state or rasterizer front-face settings. After the
+fix, /tmp/ruzu-tess-winding-after-20260907.log passes all 216 reference comparisons:
+triangles/quads, all three spacing modes, levels 1/2.25/3.5, both guest winding
+orders, both front-face modes and no/front/back culling. This validates orientation
+and sampled planar coverage, NOT exact fractional coordinates or interior edge
+placement. No workaround, game-specific predicate or GPU-wide wait was added.
+
+Full release suites are running in /tmp/ruzu-tess-winding-full-20260907.log;
+GUI rebuild follows in /tmp/ruzu-tess-winding-gui-build-20260907.log. The previous
+target/release/ruzu build predates this winding fix until the latter completes.
+Bundle remains untouched while the user GUI is open. DIFF.md includes the source
+audit. Game rendering, other-title regression and >=20 FPS remain open gates.
+
+Final verification completed: shader_recompiler 576 passed; video_core 1,751
+passed/three ignored, no warnings, Metal validation on. GUI release build
+completed successfully in 1m42s (including waiting for Cargo's artifact lock),
+no warnings. target/release/ruzu contains the winding fix; ruzu.app remains the
+old bundle until user GUI 63454 closes. git diff --check passes. No commit/push.
+
+## 2026-09-07 - Live validation waiting for user session closure
+
+Revalidated the same live-run blocker across three consecutive goal turns.
+User GUI PID 63454 (started Sep 6 23:37:41) remains active in the old ruzu.app;
+the last check reports 3h18m elapsed and about 594 MiB RSS. No permission to stop
+the user's session has arrived. Do not start a second emulator, replace its
+bundle underneath it, or treat the old rendering as evidence for these fixes.
+
+The source changes, successful release binary and test evidence are preserved.
+Next required evidence is gameplay rendering and performance from this build,
+not another compilation-only claim. Resume after the user closes the GUI or
+explicitly authorizes stopping it: verify no emulator remains, rebundle while
+preserving MoltenVK, launch the monitored isolated Metal GUI session, wait 40s,
+then press A at >=7s intervals with renderer captures until gameplay. Compare
+the same scene and check memory/disk before measuring the >=20 FPS gate.
+The goal is blocked at this runtime gate, not completed.
+
+## 2026-09-07 - Live Metal lobby reached after resuming
+
+The user authorized stopping/restarting the GUI. PID 63454 had already exited
+when checked; no second emulator was started alongside it. Rebundled the release
+GUI including the tessellation winding fix. MoltenVK SHA256 is unchanged:
+0995b17b030c01e991e2c36b48a953d8a4fdb6c4df1b9dcaa46b6d9e08612855.
+
+One watched Metal GUI run (PID 5365, /tmp/lm3-ts-0907a-app.log) loaded all 1020
+cached pipelines, then reached the existing Lobby save with seven logical A
+presses. First press after 40 seconds, all later presses separated by >=7 seconds.
+Fresh renderer captures in /tmp/lm3-ts-0907a show profile, update information,
+Story, save selection, confirmation and gameplay. loaded-01.png and
+gameplay-02.png show the characters, staircases and lobby without the earlier
+large triangles in these frames. This is NOT a full differential validation or
+a claim of flicker-free rendering. No further buttons sent after loading.
+
+Performance remains insufficient: the fresh window capture
+/tmp/lm3-ts-0907a-window-15477.png reports 4 FPS. A 2-second CPU sample has
+433/647 GPU-thread samples in CAMetalLayer::nextDrawable. This identifies an
+observed wait, not whether the cause is drawable lifetime or GPU execution cost.
+Next run needs the existing native GPU timing counters before optimization.
+
+Resource watch: /tmp/lm3-ts-0907a-resources.csv. Peak footprint about 9 GB,
+no swap growth, disk stayed about 30 GiB free. Quit normally after 342 seconds
+(exit 0). No emulator remains from this run; no memory/disk exhaustion observed.
+
+Input requests worked but their replies timed out. Standalone Python-to-Rust
+Unix datagram probe reproduced a truncated return pathname on Darwin: reply
+became repl, send_to failed ENOENT. Explicitly NUL-terminating the Python bind
+address fixes the round trip. gui_control.py now does this on Darwin only.
+Rust control logs reply errors rather than discarding them and has a real socket
+round-trip test. GUI status also exposes the existing copied performance sample;
+it does not reset counters or touch rendering. Four focused GUI tests pass in
+/tmp/ruzu-input-roundtrip-20260907.log. GUI rebuild for these diagnostics is in
+/tmp/ruzu-input-perf-build-20260907.log. >=20 FPS and other-title regression remain
+open; the previous user-session blocker is no longer applicable.
+
+## 2026-09-07 - Measured lobby bottleneck: GPU work and encoder fragmentation
+
+Second monitored GUI run PID 51859, /tmp/lm3-ts-0907b-app.log, same isolated Metal
+configuration and save. Rebuilt GUI including status FPS and diagnostic reply
+logging. Python Darwin fix works live: status, all seven A acknowledgements and
+fresh internal captures succeed; lobby.png confirms the same loaded scene. No
+keyboard mapping changes. Stopped normally after 327 seconds (exit 0).
+
+Enabled existing RUZU_PROFILE_METAL_SUBMISSIONS and RUZU_PROFILE_METAL_STAGES.
+No API-validation layer, no renderer captures during the performance interval
+03:33:12..03:33:40 UTC. Fifteen copied GUI samples every 2 seconds in
+/tmp/lm3-ts-0907b-fps.jsonl: median 7.947 FPS, range 6.931..7.990. These are
+instrumented measurements, not a claim of improvement over the earlier 8 FPS.
+The prior unprofiled 4 FPS screenshot was one snapshot, not a matched benchmark.
+
+Twenty-eight completion intervals in this window: presentation command buffers
+average 0.197 ms GPU execution, guest command buffers average 29.807 ms; the
+median per-interval longest guest buffer is 134.105 ms. Multiple guest buffers
+compose a frame and execution spans can overlap, so sums are NOT GPU utilization.
+Nevertheless long guest execution is observed independently of the CPU's wait
+in nextDrawable. Merely moving that wait to another thread is not a demonstrated
+solution to the frame's GPU cost.
+
+Twenty-seven sampled guest batches have median encoder/stage counts:
+235 blit, 916 compute, 1342 vertex + 1342 fragment (=1342 render encoders).
+Compute calls: other=0, guest=1, geometry_vertex=1, primitive_assembly=83,
+conditional_resolve=37, conditional_arguments=635, visibility_resolve=0,
+index_conversion=463. Render breaks attributed to index_conversion=452 and
+conditional_arguments=417, conditional_resolve=36, primitive_assembly=1,
+other=249. These are counts per sampled batch, NOT costs or whole-frame totals.
+The CPU sample also observes Uint8Pass::assemble in the index-binding path.
+The direct geometry producer itself is not the dominant dispatch count here.
+
+Next optimization slice: characterize repeated UInt8 index conversion and
+conditional draw preparation. Reduce redundant conversions/render-pass exits
+only with valid source-content lifetime/invalidation and predicate visibility.
+Do not reuse converted indices by address alone, move conversions across guest
+writes, remove required barriers, or force predicates true. A conversion cache
+needs complete CPU/GPU-write invalidation before reuse is safe. The profiling
+currently groups UInt8 and quad conversions together; split attribution before
+claiming all 463 are UInt8. Preserve native Metal ownership, not Vulkan command
+structure for its own sake. No such optimization was applied in this slice.
+
+Resource watch: peak footprint 8.131 GiB, disk free delta -28.1 MiB, swap used
+delta -16 MiB. No runaway memory or disk growth reproduced. No emulator remains.
+GUI release build completed without warnings; four focused Rust input tests and
+two Python address-regression tests pass. Full GUI suite was not rerun (its
+earlier macOS main-thread test failures remain recorded above). Existing full
+shader/video results remain those of the winding slice. DIFF.md updated, no
+commit/push. Required >=20 FPS, differential rendering and other-title runtime
+regression gates remain open.
+
+### 2026-09-07 — Bounded UInt8 conversion reuse, runtime gate pending
+
+Implemented a native backend-Buffer-owned conversion cache to test the repeated
+index conversion hypothesis above. The key is offset/count within a source
+allocation and its content generation, never a guest address alone. Sources
+marked GPU-written by the common buffer cache are ineligible. CPU writes,
+encoded copies and native query blits invalidate at recording time, including
+multiple writes in the same scheduler tick. Saturation disables reuse.
+
+Private output allocations avoid caching recyclable staging slices. Global
+limits are 16 MiB of logical data and 4096 entries, excluding native allocation
+overhead and in-flight retained resources. Overflow uses the original conversion.
+No global wait, readback, draw omission, predicate change or kernel change was
+introduced by this slice. Re-read Eden Uint8Pass/BindIndexBuffer/SyncValues;
+the deliberate native caching difference is audited in DIFF.md.
+
+Full release video_core suite with Metal API validation: 1756 passed, 3 ignored.
+The GUI build and same-lobby runtime measurement are pending. Compare against
+run B's median 7.947 FPS, and do not infer an FPS gain from unit tests or lumped
+index-conversion counters (which include quads).
+
+First live attempt with cache: `/tmp/lm3-0907c-app.log`, resource history
+`/tmp/lm3-0907c-resources.csv`. Seven confirmed A presses reached the lobby
+loading sequence. The monitor stopped PID 22053 at 189 seconds after physical
+footprint reached 10.236 GiB (baseline B peaked at 8.131 GiB). It required KILL
+after the three-second TERM grace period; this was a safety stop, not an
+observed spontaneous panic. Disk delta was only -23.88 MiB, swap delta zero.
+No completed visual/FPS validation: the last captured frame was Loading.
+Early gameplay counters exist, but cannot establish performance or correctness.
+
+Added bounded diagnostics under the existing RUZU_PROFILE_METAL_SUBMISSIONS
+gate: once-per-second UInt8 requests/hits/exclusions, retained cache payload and
+entry count, common-buffer logical bytes and Metal currentAllocatedSize. The
+environment is read once at runtime creation. This will distinguish the new
+derived cache from other native allocations; do not assume the footprint jump
+is either a cache leak or unrelated without measurement. Safety limits unchanged.
+
+Second attempt `/tmp/lm3-0907d-*` exposed a GPU command-buffer error at lobby
+entry, with a driver recovery message; subsequent black frames/FPS are invalid
+performance evidence. Stopped normally, exit 0. The derived cache retained only
+~55 KiB in the observed intervals, while Metal reported ~2.6 GiB allocated.
+Suspending performance validation to fix a prerequisite found in the index path:
+the rasterizer applies first_index after conversion but Uint8Pass was asked to
+convert count elements, not first_index + count. Dedicated exact-sized outputs
+make this range error more visible than staging allocation padding. This is a
+confirmed range defect, not yet proof that it caused the live GPU error.
+
+The index-origin prerequisite is implemented: convert first + count, keep the
+draw's original first_index. Full release video_core suite passes 1757 tests,
+3 ignored under Metal API validation. Dedicated test covers nonzero allocation
+offset and first_index, restart, reuse and the noncacheable staging path.
+
+Live API-validation attempt `/tmp/lm3-0907e-app.log` aborts BEFORE title input
+at ~14 seconds: MTLDebugRenderCommandEncoder reports main0 texture tex4 declared
+float but bound to MTLPixelFormatX32_Stencil8 (requires uint/ushort). This is not
+an index validation error. Stopped automated input after connection refusal;
+process exited by SIGABRT, no remaining instance. Performance gate suspended.
+
+Next prerequisite is the sampled depth/stencil numeric-type contract. Rechecked
+Eden ImageViewAspectMask, ConvertTexturePixelFormat/IsTexturePixelFormatInteger
+and Metal equivalents: aspect selection follows the swizzle, while shader
+integer classification uses the combined PixelFormat. Need actual bound view
+and shader descriptor before changing either, not a blind depth-view fallback.
+An API-validation-only one-shot METAL_STENCIL_TYPE diagnostic in prepare_stage
+reports stage, descriptor, TIC index, base and constructor ImageViewInfo. It is
+temporary investigation tooling, no draw/binding changes. Rebuild/live capture
+pending. Do not call either performance optimization or live rendering validated.
+
+Confirmed descriptor capture: `/tmp/lm3-0907f-app.log`, same validation abort
+at ~14 seconds (PID 11748 exited SIGABRT). Stage 4, CBUF 2 offset 64, TIC 5235,
+view image_id 30 at GPU address 23675535360, 1920x1080, format S8UintD24Unorm,
+swizzle [2,2,2,2] = RRRR. Descriptor is Color2D, is_depth=false,
+is_integer=false. This really selects stencil, not a null view or depth-only
+comparison sampler. The format-lookup entries for S8UintD24Unorm have UINT in
+R and UNORM in G; native aspect selection matches Eden ImageViewAspectMask.
+Shader environment integer classification only sees the combined format and
+returns false (also true of the inspected Eden code). Metal's native stencil
+texture requires an integer MSL resource declaration. Do not change the bound
+aspect to depth or suppress this validation failure.
+
+Resume prerequisite: represent the selected aspect's numeric type in shader
+translation and ensure the emitted MSL preserves Maxwell's raw integer return
+semantics, swizzle and sampler behavior. Add an actual stencil-sampling render
+test under Metal API validation, not merely image-view construction tests.
+Graphics and compute must agree; depth sampling and combined RT formats must
+stay unchanged. FileEnvironment currently persists only the combined format,
+not the TIC swizzle. Old metal.bin environments are insufficient to infer this
+aspect: plan compatibility/invalidation without deleting original caches (use
+private copies or a separate native cache namespace for experiments). Do not
+blindly reinterpret every S8UintD24Unorm descriptor as integer: G selects depth.
+
+No emulator remains. GUI rebuilt successfully without warnings, including the
+one-shot diagnostic. Performance remains unvalidated; last comparable baseline
+is 7.947 FPS. Current index optimization/correctness changes are uncommitted.
+
+Final verification of this snapshot (including the one-shot diagnostic):
+`/tmp/ruzu-stencil-contract-final-tests-20260907.log`, release video_core with
+MTL_DEBUG_LAYER=1: 1757 passed, 3 ignored, no warnings. git diff --check passes.
+Bundled MoltenVK SHA-256 remains unchanged:
+0995b17b030c01e991e2c36b48a953d8a4fdb6c4df1b9dcaa46b6d9e08612855.
+
+### 2026-09-07 - Bounded native render-pass attribution (run J)
+
+Added scalar metadata to existing sampled render passes: shader identities,
+draw count, native attachment storage dimensions and pixel formats. Shared
+passes distinguish first/last shaders and a mixed-shader flag. No draw order,
+encoder reuse, resource lifetime or GPU wait changes. Metadata is bounded by
+the existing timestamp sample budget; at most eight ranked passes are logged
+per completed sampled batch. Unsampled passes never append metadata. Tests
+cover mixed identities, compute transitions, budget exhaustion and lease reuse.
+
+Full release video_core: 1763 passed, 3 ignored, no warnings. GUI build/bundle
+successful. Logs /tmp/ruzu-pass-profile-{tests,gui,bundle}-20260907.log.
+Run J: /tmp/lm3-0907j-app.log and resource CSV, PID 66836, same release Metal
+GUI/config/profile flags, no API validation. Seven automated A inputs after
+initial 40 seconds, >=7 seconds apart. after07.png/lobby.png confirm the Lobby.
+No inputs/captures during 15 status samples, 05:09:55..05:10:23 UTC, saved in
+/tmp/lm3-0907j-fps.jsonl. Median 7.9389 FPS, range 7.8429..8.9074, unchanged.
+Normal exit at 197 seconds; no process remains. Peak footprint 8.365 GiB,
+swap delta -8 MiB, free disk delta -23.0 MiB. No saturation in this run.
+
+184 ranked-pass records in the measurement window provide concrete identities:
+- VS D32B4C8446AAA0DB / FS 6B3071DDAF092CA3: one draw, three 1920x1080
+  color storage attachments (native formats 92/92/25), no depth. Four sampled
+  records, fragment ticks around 1.65 million each.
+- A mixed 39-draw 1600x900 pass: first VS B200E98022015F82,
+  first FS 024269BC313E7507, color format 92, depth 260. One sampled record
+  with vertex 2,832,250 ticks and fragment 1,218,000 ticks. Do not attribute
+  the whole pass to the first shader.
+- Several 64x64 mixed-shader passes also rank highly. No demonstrated single
+  offending shader yet; a ranked partial sample is not a frame-time breakdown.
+
+Important measurement gap, verified against exact submission ticks: across
+the run, 81 GPU_TIME reports have guest peaks >100 ms. Only nine of those
+peak ticks have STAGE_TIME records. Tick 12695 is a real 130.376-ms peak:
+seen 235 blit / 838 compute / 1277 render, but the window measures only
+53 / 121 / 169 render entries. Ticks 13188 and 14471 have zero measurements
+because the rotating window starts beyond these smaller batches. Thus the
+existing partial windows cannot explain the long command buffers reliably.
+Do not conclude the fullscreen shader or geometry emulation is the root cause.
+
+Clock check: Apple's paired sampleTimestamps API returns CPU nanoseconds;
+do NOT multiply that CPU delta by mach_timebase_info again. A standalone
+100-ms native probe on this M2 Pro reports host 110045125 ns, CPU and GPU
+deltas both 110018333, ratio 1.0. An earlier exploratory expression that
+multiplied by the 125/3 Mach timebase was invalid and is not used in code.
+Reference: https://developer.apple.com/documentation/metal/converting-gpu-timestamps-into-cpu-time
+
+Next measurement prerequisite: cover a complete large guest batch using a
+bounded set of small native counter buffers (rather than exceeding Apple's
+per-buffer limit), paired-clock calibration around the sampled batch, and
+report coverage. Keep one sampled batch in flight and the existing low
+cadence. Then compare total stage durations and gaps with that same batch's
+GPUStartTime/GPUEndTime. Only after this coverage is established choose between
+shader cost, load/store churn, and synchronization changes. >=20 FPS and the
+other full-goal verification requirements remain open.
+
+### 2026-09-07 - Whole-batch profiling and selection bias (run K)
+
+Implemented sixteen bounded 1024-timestamp pages (128 KiB total), one in-flight
+lease, page-local encoder attachments, paired-clock calibration and interval
+union coverage. Sample acquisition now precedes the first encoder, including
+upload prefixes. No change to draw order, encoder reuse, submission or waits.
+Full release video_core under Metal validation: 1763 passed, 3 ignored;
+GUI build/bundle succeeded without warnings (whole-batch logs in /tmp).
+
+Run K reached the same Lobby (after07-resumed.png). Fifteen status samples at
+05:32:44..05:33:13 UTC: median 7.93854 game FPS. Normal exit at 379 seconds,
+peak footprint 7.886 GiB, no swap growth, disk free +4.8 MiB. Logs:
+/tmp/lm3-0907k-app.log and /tmp/lm3-0907k-resources.csv.
+
+Invalidated measurement assumption: a varied wall-clock cadence alone does
+not avoid sample-selection bias. Of the first 261 completed sampled batches,
+none exceeded 14.87 ms even though submission peaks in gameplay exceed 100 ms.
+In the Lobby it repeatedly selects a single tiny blit. Complete coverage of a
+selected batch does not imply representative selection of expensive batches.
+CPU recording bursts after waits are the suspected source of this bias.
+
+Next refinement rotates the selected batch ordinal (0..16) after the minimum
+one-second interval. Selection is still before the first encoder. Skips do not
+advance while the lease is in flight. This is diagnostic-only, not a rendering
+optimization. Regression test covers ordinal rotation and in-flight exclusion.
+Rebuild/live validation pending; the 20-FPS objective remains unmet.
+
+Ordinal refinement verification: 1764 release video_core tests passed, 3
+ignored, Metal API validation enabled; GUI build/bundle succeeded without
+warnings. Logs /tmp/ruzu-batch-ordinal-{full-tests,gui,bundle}-20260907.log.
+
+Run L must NOT be used as a performance baseline. It selected complete large
+batches successfully, but at 05:38:36 UTC the application reported GPU recovery
+(InnocentVictim, command-buffer error status 5) during scene loading. Subsequent
+captures stayed black and frame rate was about 3 FPS. The 298..328-ms samples
+with ~1276 render and 838 compute encoders were AFTER that recovery. They do
+not establish a new bottleneck or a profiling-overhead ratio. Cause of the GPU
+error is not established. The first screenshot request was during loading;
+next control run avoids capture until loading has settled.
+
+Run L logs /tmp/lm3-0907l-app.log and resource CSV; normal stop at 229 seconds,
+peak footprint 8.327 GiB, no swap growth, disk delta -9.52 MiB. Control run M
+uses the identical release binary with stage profiling disabled (submission
+timing stays enabled). No shader/cache/library changes between the two runs.
+Do not silently discard this failed validation when resuming the investigation.
+
+Control M: stage counters disabled, same binary/config/cache and seven A inputs.
+Lobby visible in /tmp/lm3-0907m/lobby-control.png; no GPU recovery/error.
+Fifteen samples 05:43:24..05:43:53 UTC: median 7.91150 FPS (range 7.84289..
+10.97668), guest submission peaks about 130 ms. Resource peak 8.344 GiB,
+no swap growth, normal exit at 178 seconds. This restores the prior baseline;
+one successful control alone does not prove stage counters caused run L's
+failure. Run N repeats full profiling without screenshots during loading.
+
+Apple's feature-set limits were checked again: maximum counter sample buffer
+length 32 KiB, maximum number of sample buffers 32 on Apple families. Current
+profiler owns 16 buffers of 8 KiB, not one oversized buffer. This does not by
+itself rule out an instrumentation bug. Reference:
+https://developer.apple.com/metal/limits/
+
+### 2026-09-07 - Valid complete gameplay batches (run N)
+
+Repeated the instrumented build, same config/save, 40-second initial delay and
+seven A presses >=7 seconds apart. No screenshots during loading. Capture
+/tmp/lm3-0907n/lobby-confirmed.png verifies the same Lobby as control M.
+No GPU recovery, synchronization failure or panic. Fifteen status samples
+05:46:51..05:47:19 UTC: median 7.91063 FPS, range 7.84294..8.93538. This is
+effectively the same as control M's 7.91150 FPS; no speedup claim. Run L's
+failure is not consistently reproduced by enabling the stage profiler.
+
+Six complete gameplay batches (ticks 10413,11168,11409,11858,12163,12398)
+have median command duration 125.198 ms, interval union 88.258 ms and
+uncovered duration 37.030 ms. Median largest individual gap is 1.270 ms.
+Every measured stage is present, omitted=0, eight timestamp pages suffice.
+Stage-sum medians: blit 1.033 ms, compute 4.683 ms, vertex 30.563 ms,
+fragment 59.183 ms. Stage sums overlap: do not sum them into utilization or
+attribute all fragment time to shader ALU rather than attachment traffic.
+
+Concrete tick 10413: 127.512 ms, covered 91.515 ms, 235 blit / 838 compute /
+1275 render encoders. Compute calls include 635 conditional argument masks,
+83 primitive assembly, 37 condition resolves, 268 index conversions, one guest
+compute and one geometry-vertex call. Recorded render breaks: 534 conditional
+arguments, 255 index conversion, 36 condition resolve, one primitive assembly,
+250 other. These are per-batch counts, not a claim that every batch is a frame.
+The largest measured render pass costs about 4.07 ms in overlapping stage sums
+(mixed 39-draw pass), not anything near the full batch's 127 ms.
+
+Code cross-check: ConditionalRenderingArgumentsPass::resolve requests outside
+render-pass context before GPU masking each draw's indirect arguments;
+ordinary framebuffer descriptors preserve attachments with LOAD/STORE. Eden
+uses a native conditional-rendering region instead. This makes repeated pass
+breaks a concrete optimization candidate for tile-based Metal, but the 37 ms
+outside timestamp intervals is NOT proven to be entirely load/store overhead.
+No single long idle wait explains these batches, and no single shader is yet
+shown to dominate. Next slice should preserve predicate-write/draw ordering
+while reducing per-draw conditional argument preparation/pass breaks, with
+GPU-written predicate and shader-side-effect tests before a live comparison.
+Do not move conditional reads ahead of their producer or replace them with a
+CPU readback/global wait. Keep render-persistence semantics intact.
+
+Normal exit at 196 seconds; no emulator remains. Peak footprint 8.640 GiB,
+swap unchanged, disk free +1.43 MiB. Logs /tmp/lm3-0907n-app.log,
+/tmp/lm3-0907n-resources.csv and /tmp/lm3-0907n-fps.jsonl. Current code edits
+remain diagnostic-only in this slice; no commit or push. The full correctness
+regressions and >=20 FPS goal remain open.
+
+### 2026-09-07 - Conditional direct-argument grouping implementation
+
+Active performance slice after run N: batch up to 64 direct draw records under
+the internal predicate produced by QueryCacheRuntime. CPU appends remain in
+the same unsubmitted command buffer; compute/blit work (including reused
+encoders), submission, predicate identity/offset/inversion or capacity changes
+force a new group. Guest-addressable predicates and GPU-defined draw arguments
+are not read early. The existing per-command masking path remains for them.
+Private predicates cannot be modified by guest shader side effects. Normal
+render attachment LOAD/STORE behavior is unchanged. No global wait/readback.
+
+Affected ownership: metal_compute_pass.rs owns native argument grouping;
+metal_query_cache.rs marks the private resolve predicate; metal_scheduler.rs
+owns the mutation/submission token; metal_rasterizer.rs supplies direct words.
+Tests compare actual vertex side effects and IDs in grouped/ungrouped draws,
+including GPU predicate updates, and cover capacity/lifetime boundaries.
+Full release video_core tests under Metal API validation passed (1767 tests,
+3 ignored), and the release GUI was rebuilt/bundled without warnings.
+
+Run O used the same configuration, save, seven A inputs and profiling flags as
+N. The Lobby is confirmed in /tmp/lm3-0907o/lobby-confirmed.png. Fifteen status
+samples 06:08:06..06:08:35 UTC give median 10.85697 FPS, range 10.78702..
+10.97644, versus N's 7.91063 FPS: about 37% faster on this scene, not >=20 FPS.
+No GPU recovery, synchronization error or panic was logged. The initial
+fastmem page-size fallback and missing-avatar fallback are unchanged.
+
+O's tick 12181 contains 235 blit / 303 compute / 739 render encoders, versus
+N's representative 235 / 838 / 1275. Conditional-argument calls fall from 635
+to 101 and their recorded render breaks from 534 to 0; the remaining groups
+are prepared outside an already-active render pass. Index-conversion breaks
+remain 255. All sampled stages are covered, with four pages rather than eight.
+Over 63 complete gameplay batches from tick 12181 through 29775, median GPU
+duration is 90.633 ms, covered interval union 75.311 ms, and uncovered duration
+14.616 ms. Stage-sum medians are blit 1.041, compute 2.378, vertex 24.013,
+fragment 54.103 ms; they overlap and must not be added as utilization.
+These samples span a longer run than N's initial six-batch baseline.
+
+Run O exited normally after 422 seconds. Peak footprint 8.169 GiB; swap
+decreased 8 MiB and disk free decreased 26.70 MiB (no saturation). The run
+was stopped before starting control P with stage counters disabled. No build
+or GPU tests run concurrently with that FPS control. An additional regression
+isolates predicate identity/offset/inversion changes without an intervening
+GPU producer, so token changes cannot accidentally hide a missing key check.
+Logs and resource/FPS series use /tmp/lm3-0907o-*; no commit or push.
+
+Control P is invalid for a normal-performance comparison: at 06:11:36 UTC,
+before the first screenshot, Metal reports GPU recovery/status 5 and query
+synchronization failure. The later capture is black and runs at roughly
+4 FPS. macOS gpuEvent-<unknown>-2026-09-07-081136.ips records a GPU
+"progress timeout", and kernel logs confirm a global GPU restart. They do
+not identify the responsible command or shader (process_name is unknown,
+command_buffer_trace_id=-1); do not infer a specific culprit from the victim
+error. This resembles the failure in pre-optimization run L, now reproduced
+without stage counters: those counters are not necessary for the failure.
+It does not establish that the new grouping is unrelated to all GPU hangs.
+P exited normally at 177 seconds, and no emulator remains. Preserve its
+logs/capture under /tmp/lm3-0907p-* rather than counting it as a successful
+control. The isolated predicate-key test passes: different private buffers
+hold opposite values, and six explicit GPU-readback expectations cover buffer
+identity, offset and inversion changes without intervening producer work.
+Expanded release video_core library suite: 1768 passed, 3 ignored under Metal
+API validation, no warnings; log /tmp/ruzu-conditional-key-full-tests-20260907.log.
+Only tests/docs changed after the GUI build used for O/P. Control Q repeats
+P's flags and inputs, with no concurrent builds/tests. The same Lobby is
+visible in /tmp/lm3-0907q/lobby-repeat.png. Fifteen samples at 06:18:17..
+06:18:46 UTC give median 10.87932 FPS (range 9.95375..11.89295), consistent
+with O's 10.85697 FPS with stage counters and faster than the prior ~7.91 FPS
+controls. No GPU recovery, synchronization failure or panic in Q. Normal exit
+at 199 seconds, peak footprint 8.121 GiB, no swap growth, disk free -23.28 MiB.
+P's resource peak was 7.839 GiB, swap -8 MiB and disk free -2.66 MiB; memory
+or disk saturation was not observed in that failing control either.
+
+This validates the speedup on two correct Lobby runs, not general stability:
+one of the three optimized launches still suffered a GPU timeout, and the
+pre-optimization timeout remains unresolved. No emulator remains. Logs,
+resource samples and FPS series are /tmp/lm3-0907q-*.
+Final full-crate check `cargo test -p video_core --release` under Metal API
+validation passes 1768 tests, 3 ignored, plus doc-tests (0 tests), without
+warnings. Log /tmp/ruzu-conditional-key-crate-tests-20260907.log. No commit/push.
+
+Next performance slice, once correctness is stable: distinguish the remaining
+UInt8 expansion and quad-index conversions behind the 255 index-conversion
+render breaks. Do not simply cache shader-writable buffers: write_tick cannot
+distinguish multiple writes in one batch, and the current conservative bypass
+is necessary for correctness. Any broader reuse needs actual producer/range
+tracking, not fewer barriers or a CPU readback. The fragment stage still costs
+about 54 ms summed across passes; this alone is not proof of shader-ALU cost
+rather than attachment traffic. The >=20 FPS goal remains open.
+
+### 2026-09-07 - Split index-conversion measurements
+
+The previous index_conversion counter combined Uint8Pass and QuadIndexedPass.
+Split the existing gated profiler into uint8_conversion (old slot 7) and
+quad_index_conversion (new slot 8) without changing actual work or ordering.
+The current common cache marks whole allocations with write_tick, so the
+uncacheable UInt8 count does not establish writes to each requested subrange.
+Do not broaden reuse based on that assumption. Measure the concrete source of
+the remaining 255 render breaks before choosing the next optimization.
+Full release tests pass (1768 passed, 3 ignored, doc-tests pass) under Metal API
+validation; GUI release build/bundle succeeds without warnings. Run R confirms
+the Lobby with no GPU error. Tick 13480: 268 UInt8 conversions, 255 render
+breaks, zero quad conversions. This rules out quad conversion as the remaining
+index-break source for this scene. Capture /tmp/lm3-0907r/lobby-index-split.png;
+logs and resource CSV /tmp/lm3-0907r-*. Run stopped normally before editing.
+
+Interrupted reuse slice / prerequisite: removing the permanent write_tick
+exclusion requires notification of EVERY declared GPU write, not comparing
+ticks. The common MarkWrittenBuffer already calls set_write_tick for graphics
+and compute SSBOs, image buffers, transform feedback and ObtainCPUBuffer with
+MarkAsWritten. Preserve that edge and base state, but expose the setter through
+the backend-buffer trait so Metal can advance its content generation even for
+repeated writes with the same tick. CPU uploads/native blits already advance
+that generation. First verify generic dispatch and actual compute-write ->
+convert -> compute-write -> convert ordering; only then change reuse policy.
+Whole-allocation invalidation is conservative: no per-range reuse is claimed.
+
+Prerequisite verified: the focused native generic-call test passes with Metal
+API validation, demonstrating two increments for two common-cache writes in
+one tick. The default setter still delegates to BufferBase; only Metal adds
+derived-data invalidation. The next implementation now allows reuse within an
+unchanged generation even after a historical GPU write. Added real compute
+stores interleaved with conversions in one submission and checks that retained
+older outputs keep their original indices; no CPU/blit writes can accidentally
+make that test pass. Full release crate tests pass (1770 passed, 3 ignored,
+doc-tests pass) under Metal API validation without warnings. GUI build and
+live verification are pending.
+Do not claim a speedup yet. The earlier permanent exclusion remains documented
+above as the conservative policy before this notification prerequisite existed.
+
+### 2026-09-07 - Run T: WindowServer watchdog and system panic
+
+Live validation is NOT complete. The user reported a WindowServer failure during
+run T. After reboot, no ruzu process remains and the /tmp/lm3-0907t resource log
+is no longer available. Do not treat this run as a successful performance control.
+
+System diagnostic reports confirm WindowServer watchdog failures at 08:44 and
+08:45 local time. The 08:45:45 stackshot identifies ruzu PID 32679 (run T), with
+a 5972.46 MB footprint, and the restarted WindowServer blocked on its main
+thread in CoreAnimation Metal submission through IOGPUFamily and AGXG14X.
+The ruzu main thread is also waiting in a graphics-driver call through libGL;
+that stack alone does not identify the guest renderer or the initiating fault.
+The panic report saved at 09:03:12 states that WindowServer missed checkins for
+120 seconds after two induced crashes. Compressor and swap are reported OK.
+This is not evidence of a memory-exhaustion panic, nor does it identify a faulty
+shader, command buffer, or establish that the newest index-cache policy caused it.
+
+Evidence is retained by macOS in /Library/Logs/DiagnosticReports:
+- WindowServer_2026-09-07-084418_MacBook-Pro-le-Plubo.userspace_watchdog_timeout.spin
+- WindowServer_2026-09-07-084545_MacBook-Pro-le-Plubo.userspace_watchdog_timeout.spin
+- panic-full-2026-09-07-090312.0002.panic
+
+Suspend further live GPU runs while investigating this failure. The resource
+watcher guarded memory/disk usage but did not prevent a system-wide graphics
+stall. Passing synthetic tests or one successful Lobby run does not establish
+stability; prior intermittent GPU timeouts remain relevant, not invalidated.
+
+Offline symbolication narrows the blocked call (no game or GPU tests launched):
+the current bundled executable UUID 1CE09541-F6F5-3762-99EC-A0A6A6D81728 matches
+the stackshot. With load address 0x1022b4000, the GPU-thread return address
+0x1025f9218 resolves to MetalPresenter::present_texture +124. Disassembly at
+unslid 0x100345218 identifies the return from the Objective-C commandBuffer
+message, via the MTLCommandQueue::commandBuffer cached selector at 0x10186b060.
+The preceding scheduler.flush and nextDrawable calls already returned. Thus
+the observed wait is Scheduler::begin allocating a presentation command buffer,
+not nextDrawable or an explicit waitUntilCompleted. The same stackshot shows
+ruzu's Metal submission worker waiting in IOGPUFamily/AGXG14X.
+
+At this snapshot ruzu's age is 156 seconds and the GPU thread last ran 124.538
+seconds earlier: the wait began approximately 32 seconds after launch, before
+the scripted first A at 40 seconds. This is a startup/presentation failure,
+not a verified failure in the measured Lobby workload. Earlier rendering can
+still have triggered the driver stall; the exact offending workload is unknown.
+
+The queue is created with newCommandQueue; Apple documents a default limit of
+64 uncompleted command buffers. Queue-capacity backpressure after stalled
+submissions is a hypothesis, not a measured in-flight count. Increasing that
+limit or adding device-wide waits is not a justified fix. The unified log from
+08:43:00 through 08:44:20 supplies no specific GPU fault/command attribution.
+Next investigation must distinguish uncompleted submitted work from allocation
+or driver deadlock, retaining command/encoder identity before any subsequent
+live reproduction. Do not describe a resource watchdog as protection against
+GPU hangs: the system incident demonstrates that it is insufficient.
+
+### 2026-09-07 - Offline-tested command-lifecycle journal
+
+Added RUZU_METAL_COMMAND_JOURNAL=/absolute/path/to/new-file as an opt-in diagnostic
+in the native scheduler. Use a persistent diagnostic directory, not /tmp, for
+any future reproduction. The file must not exist: existing evidence is never
+truncated. It contains 8192 fixed 512-byte records (4 MiB maximum), with monotonic
+sequence numbers and elapsed CPU time. After wrapping, sort complete ASCII
+records by their fixed-width seq field to recover chronological order; empty
+slots are zero-filled. OS writes bypass userspace buffering but are not fsynced
+per command. Recent records can be lost/torn in a kernel panic: this is not a
+crash-proof storage or GPU recovery mechanism.
+
+allocation_begin records the scheduler's pending list length and last observed
+GPU tick BEFORE requesting a command buffer. allocation_returned identifies
+the returned native object (zero means allocation failure). Submission events
+include object, tick and kind (guest/presentation/external/synchronous), bracket
+the commit call, and install a completion callback with the driver's terminal
+status. Completion does not depend on the recording thread polling; it can
+precede commit_returned. The callback retains only the journal, not the command
+buffer or scheduler. No driver calls occur while holding the file mutex.
+Pending list length is CPU bookkeeping, NOT a queried count of unfinished GPU
+commands. The ring only retains recent history; an unmatched event at its start
+may belong to an evicted prefix, not a leak.
+
+Disabled by default; no new GPU waits, queue-size changes, resource ownership
+changes or skipped work. Enabled I/O/callbacks can perturb timing and must not
+be used for performance comparisons. This first slice attributes allocation,
+submission and completion, not individual shaders/encoders or the root cause.
+The four CPU-only journal tests pass in release without warnings; the full
+video_core test target compiles. The full suite was deliberately not executed
+because it runs native GPU work. Actual Metal callback execution and further
+live validation remain pending. No GUI rebuild/relaunch was performed, keeping
+the matching crash executable available for offline symbolication.
+
+### 2026-09-07 - Allocation/dispatch bounds audit, no live reproduction
+
+Reviewed primitive initialization/classification/prefix-scan/emission, patch
+arguments, geometry vertex producer and geometry capture/replay sizing. Their
+host allocations use checked products; even empty assembly writes its indirect
+dimensions. No concrete out-of-bounds defect was established in those inspected
+paths. This does not prove arbitrary guest shader execution safe or identify
+the WindowServer failure's cause.
+
+One local device-limit validation was missing: MetalDeviceProfile already reads
+MTLDevice.maxBufferLength, but MetalBuffer::new_with_options did not consult it.
+The allocator now rejects requested native allocations above that reported
+limit before calling newBufferWithLength, with an explicit AllocationTooLarge
+error. Existing minimum four-byte null storage, memory modes and in-range
+allocation behavior remain unchanged. No clamping, fake capacity, new GPU wait,
+or recovery claim is involved. In-range allocations may still fail normally.
+The CPU-only boundary test covers exact limits, minimum storage and usize::MAX.
+It passes in release without warnings; the complete test target compiles, but
+only this CPU test was executed. Live GPU tests remain suspended;
+permission for a diagnostic reproduction was requested after the system panic.
+
+### 2026-09-07 - Diagnostic GUI prepared, not launched
+
+Preserved the incident executable and WindowServer/panic reports outside /tmp:
+../ruzu-diagnostics/metal-watchdog-20260907.ct1kH4/. The directory is 42 MiB and
+also contains a current working-tree patch and untracked-source archive. These
+source snapshots include the later journal/allocation validation, not solely
+the pre-crash source state. The archived executable UUID remains
+1CE09541-F6F5-3762-99EC-A0A6A6D81728 and its SHA-256 matches the old app exactly
+(ebe41546bb5956d7b59de0cea05ba84e50e38e8457eba6b800900f19b7f41046).
+
+Release GUI build and app bundling succeed without compiler warnings. The new
+app UUID is DF206A61-5FD7-3E96-A42E-F3AD37CE4B2C; deep/strict codesign verification
+passes. Bundled MoltenVK retains SHA-256
+0995b17b030c01e991e2c36b48a953d8a4fdb6c4df1b9dcaa46b6d9e08612855.
+Disk availability is still approximately 36 GiB. No emulator instance is active,
+and the rebuilt app was NOT launched. Live diagnostic reproduction is awaiting
+the user's decision about the risk of another system-wide GPU stall. The >=20
+FPS and stable rendering completion gates remain open.
+
+### 2026-09-07 - Authorized bounded diagnostic reproduction
+
+After explicit user authorization, launched one release GUI instance with Metal,
+the command journal and submission profiling; stage counters remained disabled.
+Evidence is persistent in ../ruzu-diagnostics/lm3-watch-20260907.i3EfDz/:
+app.log, monitor.jsonl, commands.bin, isolated config and renderer captures.
+The input socket alone used /tmp. The isolated config was copied from the current
+user config because the previous temporary config disappeared at reboot; this
+is not a proven configuration-identical replay of run T.
+
+The supervisor reached its 60-second cap, sent SIGTERM and escalated to SIGKILL
+after three seconds. The process exited with -9 and no ruzu instance remained.
+This was our deliberate termination, not an emulator crash. A presses were
+acknowledged at approximately 40, 47 and 55 seconds. final.png shows the New
+Features dialog, NOT the lobby; capture-request-after40s.png must not be treated
+as a guaranteed pre-input capture despite its original temporary filename.
+
+No WindowServer failure was observed. GPU completions and GUI status continued
+advancing, including during the termination grace period. The 4 MiB journal
+wrapped normally and retains 8192 recent records, with no status=5 completion;
+the supervisor also checked completion errors throughout the run. Retained
+events reach submission tick 6129. Uncompleted tail records after SIGKILL are
+not evidence of a spontaneous hang. The only ERROR-level app log was the known
+16 KiB host-page fastmem fallback to VirtualBuffer, not a Metal failure.
+
+Peak sampled resident memory was 3.064 GiB (RSS, not total physical footprint or
+GPU allocation). Global swap use went from 424.88 to 408.88 MiB. Maximum disk
+availability decrease from the starting sample was 13.61 MiB. These results do
+not reproduce memory/disk exhaustion and do not rule out a longer-run leak.
+No new GPU fix was made based on this negative reproduction. Journal callbacks
+now have live execution evidence, but the system crash is not declared fixed,
+and these instrumented menu observations do not validate lobby FPS or >=20 FPS.
+
+### 2026-09-07 - Command workload attribution prerequisite
+
+The live journal showed progress but could not describe which work a command
+contained. Added opt-in, constant-size CommandWorkload metadata owned by the
+active guest command buffer. At flush it records blit calls, compute helper
+categories (Other, Guest, GeometryVertex, PrimitiveAssembly, ConditionalResolve,
+ConditionalArguments, VisibilityResolve, IndexConversion, QuadIndexConversion),
+observed draws and first/last graphics stage hashes. Native object and tick join
+these records to existing submission/completion events. No per-draw file writes,
+GPU waits, installed-library changes or shader changes. Presentation/external
+buffers do not steal/reset the guest summary. This is recording attribution,
+not a complete shader history or evidence that a listed shader caused a fault.
+
+Six CPU-only journal tests pass in release without warnings, including maximum
+record widths, saturation and reset; full native GPU tests remain deferred.
+The workload extension was added AFTER the bounded run above, so that run only
+validates the original lifecycle journal. Build/live validation of the new
+summary and same-lobby performance remain separate gates. DIFF.md updated.
+
+The GUI release build now succeeds in 1m50s without warnings; app bundling and
+deep/strict codesign verification pass. The rebuilt arm64 executable UUID is
+4143CE24-DE40-3D6D-8790-1DEB3AAC1A24. Bundled MoltenVK retains the SHA-256 recorded
+above. Build logs are workload-gui-build.log and workload-bundle-build.log in the
+same persistent evidence directory. The new app was not launched in this slice.
+
+### 2026-09-07 - Workload journal live, lobby reproduced without system failure
+
+Two bounded GUI runs used the rebuilt app with lifecycle/workload journaling,
+submission timing and stage counters disabled. No builds/tests ran concurrently.
+The first (../ruzu-diagnostics/lm3-workload-20260907.wA5Qzf/) reached the Story
+menu, not the lobby: seven presses at 40 seconds then seven-second spacing were
+insufficient. Its late median 26.95 FPS is NOT a lobby result. Peak physical
+footprint 7.675 GiB, swap unchanged, maximum disk drop 12.39 MiB. The supervisor
+stopped it at 120 seconds, then SIGKILL after the SIGTERM grace period.
+
+The second (../ruzu-diagnostics/lm3-lobby-20260907.QL1ZZo/) used eleven presses
+at the same spacing, ending around 110 seconds. scene-90.png shows the Lobby
+save selection; scene-110.png shows the real rendered lobby with Luigi, other
+characters, staircases, lighting and geometry. scene-150.png shows a closer
+camera, so later FPS must not be compared as a fixed-camera improvement.
+At elapsed 110..130s (19 samples) median game FPS was 12.97198, range
+11.88094..15.89974. At 150..161s the different camera gives median 14.90676.
+Neither window meets >=20 FPS. This reproduces the earlier approximate 13 FPS
+result, not a new speedup; all measurements include diagnostic overhead.
+
+The retained journal has actual workload records and no status=5 completions;
+the supervisor checked errors throughout both runs. Large late guest batches
+have median 1722 observed draws, 236 blit-helper calls and compute calls
+[0,1,1,77,34,65,0,67,0] in the category order above. This is not a dispatch or
+render-break count. End-of-run submission timing reports guest peak buffers
+around 74 ms and presentation peak below 0.5 ms. Full GPU-time sums can overlap;
+do not call those sums device utilization or assign the cost to geometry alone.
+
+Second-run peak physical footprint was 8.835 GiB, global swap unchanged and
+maximum disk drop 30.20 MiB. Stopped deliberately at 160 seconds with SIGTERM,
+then SIGKILL after three seconds; no ruzu remained. No WindowServer failure or
+Metal error was observed. The fastmem page-size fallback is the only ERROR log.
+This still does not prove the intermittent watchdog failure fixed. Physical
+footprint now uses proc_pid_rusage v0 with layout verified against the installed
+SDK, rather than treating RSS as physical/GPU memory. Persistent diagnostics
+include the scripts, isolated configs, logs, journal and renderer PNGs.
+
+### 2026-09-07 - Identity restart-prefix optimization under verification
+
+The assembly workload warranted inspecting redundant prefix work before larger
+cache or synchronization changes. assembly_initialize writes uint2(0) segments
+whenever the packed restart-enabled field is zero (including array draws).
+combine uses max(X) and sum(Y), so the entire prefix remains zero. Native
+record_input_stream now skips only that identity scan; indexed enabled-restart
+draws retain the existing multilevel scan, and vertex initialization, primitive
+count compaction, patch assembly and emission are untouched. No guest-specific
+case, resource cache, CPU readback or new GPU wait was introduced.
+Added native input-stream coverage for 0/1/multigroup counts, arrays and 8/16/32
+bit indices, enabled/disabled restart, signed base-vertex bit patterns and the
+number of recording operations. GPU test execution is in progress; no speedup
+or runtime parity is claimed yet for this change.
+
+Verification completed: all eight native assembler tests pass, including the
+new identity-scan input-stream test. The complete video_core release crate suite
+then passes with Metal API validation enabled: 1778 passed, 3 ignored, doc-tests
+pass (0), without compiler warnings. Logs are identity-scan-tests.log and
+identity-scan-full-tests.log in the second-run persistent directory. GUI rebuild
+is in progress. The measured lobby medians above precede this optimization and
+must not be attributed to it. The >=20 FPS and broader visual/regression gates
+remain open, as does the intermittent system-level GPU failure investigation.
+
+Release GUI rebuild completes without warnings in 1m51s. Bundle creation and
+deep/strict codesign verification pass; executable UUID is
+9B99FD3C-4BFF-3895-AE32-724F871DAB6C and bundled MoltenVK SHA-256 is unchanged.
+No emulator remains active. The updated app has not yet been used for a lobby
+performance comparison; identity-scan-gui-build.log and
+identity-scan-bundle-build.log preserve this build's results.
+
+### 2026-09-07 - Identity scan control and render-break attribution
+
+The updated GUI was subsequently tested in
+../ruzu-diagnostics/lm3-scan-20260907.ASJFjp/: scene-110.png again shows the
+rendered lobby. Median FPS at 110..130 seconds is 12.94359 versus 12.97198
+before the change: no measurable gain. Later workload and camera differ, so
+do not infer a regression from the larger recorded draw/conversion counts.
+Peak physical footprint 9.643 GiB, swap unchanged, maximum disk drop 7.36 MiB.
+The supervisor stopped the app deliberately at 160 seconds, not a game crash.
+
+Stage profiling in ../ruzu-diagnostics/lm3-stages-20260907.jP5XGy/ stopped at
+106.29 seconds on the unchanged 10 GiB physical-footprint guard (10.048 GiB).
+Completions still progressed; no new driver failure was observed. Only the
+90-second save-menu capture exists; there is no lobby screenshot for this run.
+Batch 11922 reports command duration 75.08 ms, stage sums approximately
+1.02 ms blit, 1.51 ms compute, 20.04 ms vertex and 47.40 ms fragment. These
+overlap and may include stalls, not just shader ALU execution. Generic Other
+render breaks are 256, versus 103 index conversions. A second batch has 254
+and 105 respectively. No evidence yet attributes all Other breaks to uploads.
+
+Added a distinct EligibleUpload render-break tag for precisely the Eden stream
+buffer plus can_reorder_upload condition. Copies remain inline. An actual Metal
+upload prefix requires shared upload/render retirement first; the interrupted
+slice and verification gates are in METAL_UPLOAD_PREFIX_STATE.md. The current
+work does not yet claim that reordering restores performance or system stability.
+
+### 2026-09-07 - Eligible-upload measurement completed
+
+Evidence: ../ruzu-diagnostics/lm3-eligible-20260907.dhgwvK/ includes supervisor,
+analysis script, logs, renderer captures every 10 seconds from 90s and isolated
+config. Release GUI UUID 563FC521-ADFB-3AC2-A1B1-3F7AD05F14CB, build without
+compiler warnings, bundle deep/strict signature verified. Bundled MoltenVK
+hash unchanged. Full release video_core tests: 1778 passed, 3 ignored, doc-tests
+pass (0), Metal validation enabled. No GPU ordering change in this build.
+
+scene-100.png and scene-110.png visibly show the lobby with characters,
+staircases, portraits and lighting. At 110..130s median FPS is 12.93159
+(19 samples, range 1.98012..14.94707). This is still approximately 13 FPS,
+not >=20. Later animation changes make 130..150s median 14.85105 unsuitable
+as evidence of a fixed-scene gain. Instrumentation/capture overhead is included.
+
+For the 100..150s observed tick window, ten sampled batches with more than
+100 counted render breaks have median Other=221, UInt8=67 and EligibleUpload
+=23.5. Eligible counts vary 0..120 and constitute 11.81% of counted breaks
+across those batches. These are operation counts, not weighted GPU cost or
+all-frame statistics. The hypothesis that safe stream uploads explain the
+entire generic category is invalidated; generic caller attribution is the next
+measurement before a large scheduler rewrite. Do not remove necessary barriers.
+
+Supervisor reached the 160s cap, then deliberately terminated the app with
+SIGTERM followed by SIGKILL after 3s. No process remains. Physical footprint
+peak 8.798 GiB; swap growth zero; maximum disk drop 10.18 MiB. No Metal error
+or panic observed; the sole ERROR line is the known 16K/4K fastmem fallback.
+The earlier intermittent WindowServer watchdog failure is not proved fixed.
+
+### 2026-09-07 - Render-end source attribution and memory guard stop
+
+Added bounded file/line/column attribution at the scheduler's actual Render
+encoder end. Existing stage profiling controls it; no stack capture, per-draw
+log, GPU ordering change or additional counter buffers. Up to 64 sites per
+sampled batch, explicit overflow count, reset on completion. Counts also include
+attachment changes and flush; they are not identical to the older work tags.
+1779 release video_core tests pass with Metal validation (3 ignored, doc-tests
+0), no compiler warnings. GUI UUID C7212D24-1D78-38E8-A13A-472121FECE73;
+deep/strict bundle signature passes and bundled MoltenVK hash is unchanged.
+
+Run evidence: ../ruzu-diagnostics/lm3-render-ends-20260907.CRyqm7/. Supervisor
+stopped at 90.57s: physical footprint reached 10.614 GiB between 1s samples,
+exceeding the unchanged 10 GiB stop threshold. Swap growth zero, disk drop
+18.39 MiB. No 90s screenshot was requested before the guard; no lobby capture
+or lobby FPS result exists. Do not compare this run's menu FPS with the earlier
+lobby. SIGTERM then SIGKILL was our deliberate stop, not a game crash. No
+remaining process, no logged Metal command error; known fastmem fallback only.
+
+Source attribution is exercised, with omitted=0 in observed batches. Last
+substantial pre-stop lot reports clear-helper starts, fragment barriers, texture
+copies, buffer copies and conversions separately. This does not yet establish
+the dominant cause in the hall. Do not remove fragment barriers: Apple's
+WWDC22 "Go bindless with Metal 3" specifically disallows after-fragment in-pass
+barriers on Apple GPUs; a simple substitution is not a valid optimization.
+Reference: https://developer.apple.com/videos/play/wwdc2022/10101/
+
+At the stop the existing allocation log reports about 6.6 GB Metal allocations
+but only about 70 MB in the common buffer-cache allocation counter. This is a
+scope difference, not proof of leaked bytes. Before another identical runtime
+attempt, extended that same gated once-per-second diagnostic with staging-pool
+capacity by upload/download/device-local usage, reusable/deferred subsets and
+stream capacity. It uses observed completed_tick without polling or waiting.
+This attribution is pending tests/build and has not yet measured the game.
+
+Staging snapshot verification subsequently passed the complete release
+video_core suite with Metal validation: 1780 passed, 3 ignored, doc-tests 0.
+No compiler warnings. See staging-memory-tests.log in the run directory.
+The GUI bundle still contains source-site attribution only, not this newest
+staging snapshot; rebuild before the next measurement. No emulator remains.
+
+### 2026-09-07 - Staging capacity measured; depth feedback identified
+
+Rebuilt GUI UUID 29DDFBC2-4CEE-3E64-895F-52196CB111F1, release build without
+compiler warnings, bundle signature verified, bundled MoltenVK unchanged.
+Evidence: ../ruzu-diagnostics/lm3-staging-memory-20260907.aEEGUO/ includes
+supervisor, analysis, isolated config, logs and renderer captures 70..110s.
+The 110s capture visibly reaches the lobby with characters and geometry.
+Median FPS 100..110s is 12.91158 (9 samples); 110..121s is 12.98641 (11 samples).
+No speedup or >=20 FPS result. Supervisor stopped at its shortened 120s cap
+(121.02s observed), followed by deliberate SIGKILL after SIGTERM timeout.
+Physical footprint peaked at 9.114 GiB, swap unchanged, disk drop 18.52 MiB.
+No Metal error or panic observed; no processes remain. This does not prove the
+intermittent memory growth or WindowServer failure resolved.
+
+Staging diagnostics rule out a multi-GiB staging cache in THIS run: upload
+capacity peaked at 434.66 MiB, entirely reusable at that sample; device-local
+capacity peaked at 0.570 MiB; download capacity was zero. The separate stream
+is 128 MiB. Last upload capacity is 16.43 MiB. These are pool-owned capacities,
+not resident bytes; other allocations still need attribution if growth returns.
+
+Four sampled large lobby batches contain 596..605 actual render encoder ends.
+Per batch: buffer-cache copies 185..189; depth feedback callback at
+metal_rasterizer.rs:707 123..127; uint8 conversion 103..105; clear helper
+39..42; fragment barriers 35; texture copies 29; other attachment changes
+26..33; conditional resolve 30..36; primitive assembly 11. The earlier work
+tag counter omitted depth-feedback ends and ordinary attachment changes, so
+its total was not all render-pass ends. These remain event counts, not measured
+time shares. Eligible uploads vary even within this run; no universal ratio.
+
+Next correctness/performance slice: determine actual sampled/attached native
+depth subresource overlap and effective depth/stencil writes for the feedback
+draws. A base ImageId alias alone is insufficient to prove a native hazard.
+Do not simply remove the callback or replace it with an after-fragment barrier.
+Apple's WWDC20 guidance recommends sampling a separate snapshot when the
+attachment is simultaneously sampled, rather than barriers. The native code
+currently ends the prior encoder but binds views of the original image. Need
+actual draw evidence and synthetic validation before changing this ownership.
+Source: https://developer.apple.com/videos/play/wwdc2020/10631/
+
+The talk's automatic compatibility snapshots only apply to apps built against
+Catalina-era SDKs. vtool reports this executable uses SDK 26.5 (minimum OS 11),
+so that legacy SDK workaround cannot be assumed to explain this app's memory
+or performance. Read-only depth does not by itself justify omitting store actions
+or ignoring sampled-attachment restrictions. Preserve clears and written contents.
+
+### 2026-09-07 - Native depth-alias measurement, resource-limited run
+
+Evidence: `../ruzu-diagnostics/lm3-depth-alias-20260907.NMx1Fj/`.
+GUI release UUID D3008E07-BA4B-3406-8FCB-513C043D3D9A. Full video_core suite:
+1781 passed, 3 ignored, with Metal API validation; build has no warnings and
+bundle signature verification passes. MoltenVK is unchanged.
+
+Added bounded alias metadata to the existing sampled-batch profiler. It follows
+actual MTLTexture parent views to their root and reports levels/slices, native
+types and the effective depth/stencil key. Disabled profiling does not traverse
+views. No pass/barrier/cache behavior was changed.
+
+This run was stopped at 101.04s by the existing resource guard: peak process
+footprint 9.864 GiB, global swap growth 3209.44 MiB, free disk drop 2076.76 MiB.
+SIGTERM followed by SIGKILL was our deliberate stop, not an observed crash.
+No instance remains. The verified scene-80 capture is the save-selection menu;
+there is no completed large hall sample and no valid hall FPS comparison.
+
+Menu batches 6167, 7510 and 8741 contain native depth aliases of the same root,
+mip 0 and slice 0. Bound texture is Type2D, attachment Type2DArray with one render
+layer; native depth writes and stencil are disabled, but comparison is Less or
+LessEqual (not Always). Therefore neither disjoint-subresource elision nor
+simply detaching unused depth is justified by these observations. These are
+bound-descriptor candidates, not proof of dynamic shader sampling, and must not
+be extrapolated to all 123..127 hall feedback boundaries measured previously.
+
+The next slice needs actual hall alias coverage under the same resource limits.
+If it confirms overlapping read-only depth, investigate a versioned native
+sampling snapshot and true write invalidation before trying to merge passes;
+do not weaken synchronization or insert a fresh depth copy for every draw.
+See METAL_DEPTH_FEEDBACK_STATE.md for the prerequisite boundary.
+
+### 2026-09-07 - Cache retirement omission confirmed in source
+
+MetalTextureCache::tick_frame never advanced any of the three sentenced-resource
+rings, although DeleteImage/RemoveFramebuffers placed native owners into them.
+This is an indefinite retention bug independent of LRU image selection. Restored
+the ring/async/runtime/frame ordering and the caller's separate cache locks.
+The native regression passes: all three rings retain resources until eight ticks,
+then release their owners without invalidating previously recorded image copies.
+
+Full release validation passes: 1782 tests, 3 ignored, with Metal API validation
+and no warnings (`../ruzu-diagnostics/lm3-cache-retirement-20260907.N25XYP/tests.log`).
+The GUI bundle has not yet been rebuilt for this change, and the previous swap
+increase is not proven to be solely due to
+the rings. The additional absent LRU/downloader path is recorded as an active
+prerequisite in METAL_TEXTURE_GC_STATE.md, not treated as completed parity.
+
+Download prerequisite update: Metal runtime download staging and native
+converted D24S8 depth/stencil plane readback are implemented. Tests verify two
+array layers, mip 1, both guest D24/S8 layouts and offset guard preservation.
+Full release suite: 1783 passed, 3 ignored, Metal API validation enabled, no
+warnings. No game run or GUI rebuild in this slice; guest packed reconstruction
+and the live GC downloader remain the next required work, so no FPS or memory
+improvement is inferred from these native transfer tests.
+
+Packed reconstruction update: the D24S8 runtime readback now reconstructs both
+guest packing orders from native float-depth and stencil planes after explicit
+CPU-readback completion. All 16,777,216 integer depth values roundtrip through
+the upload normalization and download quantization. Native GPU roundtrip,
+mips/layers/offset guards and padded CPU output are tested. Full video_core
+release suite: 1785 passed, 3 ignored, Metal API validation enabled, no warnings
+(`../ruzu-diagnostics/metal-depth-pack-20260907.oA31lQ/tests.log`). The GUI remains
+unrebuilt for this slice. Other converted downloads and live GC wiring remain
+prerequisites; no new runtime memory or FPS claim is made.
+
+### 2026-09-07 - Rebuilt GUI Retirement and Hall Check
+
+Release build completed in 1m51s without Rust warnings. Repackaged and verified
+the signed bundle, UUID 6E029517-B6CE-3F32-8487-B63BC55D7975; bundled MoltenVK
+SHA256 remains 0995b17b030c01e991e2c36b48a953d8a4fdb6c4df1b9dcaa46b6d9e08612855.
+Evidence: `../ruzu-diagnostics/lm3-retirement-check-20260907.EJCjDT/`.
+Scene-110 confirms the hall. The 110..120s FPS median is 13.96, nine samples;
+the >=20 FPS requirement remains unmet. Peak footprint 8.98 GiB, global swap
+growth 2512 MiB, maximum disk-space drop 2053 MiB. Stopped at 120s by the harness,
+SIGTERM then SIGKILL, no spontaneous crash or surviving instance.
+
+Four fully sampled hall batches establish real mip/layer depth aliasing and
+596..606 render encoder endings, with 74.1..83.9ms GPU command duration.
+Depth writes are disabled in the observed aliases, but stencil is sometimes
+enabled and depth comparison remains active. This is not proof of read-only
+stencil or of dynamic shader accesses. See METAL_DEPTH_FEEDBACK_STATE.md before
+changing any feedback boundary. No barrier was removed and no performance gain
+is established by this run.
+
+User clarification: 20 FPS remains a performance target, not an assumed
+hardware guarantee. Eden's user-observed approximately 10 FPS is not a measured
+upper bound for native Metal. Prioritize correct rendering and demonstrated
+improvements without unsafe synchronization shortcuts or higher resource caps.
+
+### 2026-09-07 - Read-only Depth/Stencil Alias Evidence
+
+The rebuilt release GUI, UUID C42CA4BC-68D8-34AC-9EEB-39E666346223, reached the
+hall with detailed bounded alias metadata. Four complete batches each contain
+149 alias bindings, all fragment-stage slots 0/1 and Depth32Float_Stencil8,
+17 shader hashes, no omitted keys. All have depth writes disabled and either
+disabled stencil or Keep on all enabled stencil outcomes. This establishes
+fixed-function read-only attachment state for the observed aliasing draws,
+not for intervening producers and not proof of dynamic shader accesses.
+Evidence: `../ruzu-diagnostics/lm3-stencil-detail-20260907.q2Wtg1/`, scene-110.png.
+Full video_core suite: 1786 passed, 3 ignored, Metal API validation enabled.
+No rendering policy changed. Median hall FPS 12.91, footprint peak 9.09 GiB,
+global swap +472 MiB, disk-space drop 19 MiB. Harness stopped at the time limit;
+no instance remains. The next native snapshot prerequisite is documented in
+METAL_DEPTH_FEEDBACK_STATE.md; no unsafe barrier removal or gain is claimed.
+
+### 2026-09-07 - Independent Native Depth Snapshot Primitive
+
+MetalImage can now allocate and record an independent single-sample 2D
+depth/stencil copy, without CPU readback or a global wait. Native tests preserve
+the old depth and stencil after an ordered overwrite of the original, for
+both D24S8 guest layouts, mip 1 and two layers. Full video_core release suite:
+1786 passed, 3 ignored, Metal API validation enabled, no Rust warnings.
+This is a prerequisite, not an enabled draw optimization: producer invalidation
+and allocation accounting remain documented in METAL_DEPTH_FEEDBACK_STATE.md.
+No GUI rebuild/run in this slice and no runtime performance claim.
+
+### 2026-09-07 - Native Write Revision Prerequisite
+
+Metal images now have an allocation-local saturating content revision, separate
+from common guest dirty flags and native/slice authority. Native uploads,
+copies/resolves/render blits, writable shader-image bindings, clear paths and
+draw attachments participate. Effective depth/stencil state prevents read-only
+draws from advancing the depth revision merely because the attachment is bound.
+This remains conservative for conditional/culled/partial writes and is not a
+GPU completion fence. Snapshot identity must include the owning allocation.
+Full video_core release suite: 1789 passed, 3 ignored, Metal API validation,
+no Rust warnings. The preserved snapshot/native overwrite test also checks a
+revision change; tests cover masks, both stencil faces and saturation.
+Snapshot retention, accounting and descriptor rebinding remain the next slice.
+No render-pass boundary removed, no GUI rebuild and no new FPS claim.

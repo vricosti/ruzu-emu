@@ -3157,7 +3157,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Upstream: `BufferCache<P>::MarkWrittenBuffer`
     fn mark_written_buffer(&mut self, buffer_id: BufferId, device_addr: VAddr, size: u32) {
         if !P::IS_OPENGL {
-            self.slot_buffers[buffer_id].set_write_tick(self.runtime.current_tick());
+            let buffer = &mut self.slot_buffers[buffer_id];
+            let offset = device_addr.wrapping_sub(buffer.cpu_addr());
+            buffer.mark_written_region(self.runtime.current_tick(), offset, u64::from(size));
         }
         self.memory_tracker
             .mark_region_as_gpu_modified(device_addr, size as u64);

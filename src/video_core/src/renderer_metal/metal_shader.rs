@@ -979,6 +979,113 @@ mod tests {
             .expect("create native mesh pipeline");
     }
 
+    /// Native differential oracle against the former optnone helpers. Timings
+    /// are diagnostic only: correctness never depends on a performance ratio.
+    #[test]
+    fn precise_helpers_without_optnone_probe() {
+        use crate::renderer_metal::metal_buffer::MetalBuffer;
+        use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLCommandEncoder as _,
+            MTLComputeCommandEncoder as _, MTLCommandBufferStatus, MTLSize};
+        let device = MetalDevice::new().unwrap();
+        let special = [0u32, 0x80000000, 1, 0x80000001, 0x007fffff, 0x00800000,
+            0x3f800000, 0x3f800001, 0x3f7fffff, 0xbf800000, 0x7f7fffff,
+            0xff7fffff, 0x7f800000, 0xff800000, 0x7fc12345, 0x7f812345];
+        let mut inputs = Vec::<[u32; 4]>::new();
+        for a in special { for b in special { for c in special {
+            inputs.push([a, b, c, 0]);
+        } } }
+        let mut random = 0x12345678u32;
+        for _ in 0..4096 {
+            let mut values = [0; 4];
+            for value in &mut values[..3] {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                *value = random;
+            }
+            inputs.push(values);
+        }
+        // Every half bit pattern, with varied second operands including NaNs
+        // and subnormals. Float cancellation cases above also check that a
+        // separate multiply/add is not silently contracted to one FMA.
+        for half in 0..=u16::MAX {
+            inputs.push([u32::from(half), u32::from(half.wrapping_mul(173).wrapping_add(19)), 0xbc00, 0]);
+        }
+        let bytes = bytemuck::cast_slice(&inputs);
+        let input = MetalBuffer::new(&device, bytes.len()).unwrap();
+        input.write(0, bytes).unwrap();
+        let outputs = [MetalBuffer::new(&device, bytes.len() * 2).unwrap(),
+            MetalBuffer::new(&device, bytes.len() * 2).unwrap()];
+        let kernel = r#"
+kernel void probe(device const uint4* input [[buffer(0)]], device uint4* output [[buffer(1)]],
+                  uint i [[thread_position_in_grid]]) {
+    float3 v = as_type<float3>(input[i].xyz);
+    float x = as_type<float>(0x3f000000u | (input[i].x & 0x007fffffu));
+    float b = as_type<float>(0x35000000u | (input[i].y & 0x007fffffu));
+    for (uint j = 0; j < 64; ++j) {
+        x = spvFma(x, 0.9999f, b);
+        x = spvFAdd(x, b);
+        x = spvFMul(x, 0.9999f);
+    }
+    output[2*i] = as_type<uint4>(float4(spvFAdd(v.x, v.y), spvFMul(v.x, v.y),
+                                    spvFma(v.x, v.y, v.z), x));
+    half3 h = as_type<half3>(ushort3(input[i].xyz));
+    output[2*i+1] = uint4(as_type<ushort>(spvFAdd(h.x, h.y)),
+                         as_type<ushort>(spvFMul(h.x, h.y)),
+                         as_type<ushort>(spvFma(h.x, h.y, h.z)),
+                         as_type<uint>(spvFAdd(spvFMul(v.x, v.y), v.z)));
+}
+"#;
+        for version in [MslVersion::V2_3, device.profile().msl_language_version] {
+            let pipelines: Vec<_> = ["[[clang::optnone]]", "inline"].into_iter().map(|attribute| {
+                let pragma = if attribute == "inline" { "#pragma STDC FP_CONTRACT OFF\n" } else { "" };
+                let source = format!("#include <metal_stdlib>\nusing namespace metal;\n{pragma}\n\
+                    template<typename T> {attribute} T spvFAdd(T a, T b) {{ return fma(T(1), a, b); }}\n\
+                    template<typename T> {attribute} T spvFMul(T a, T b) {{ return fma(a, b, T(0)); }}\n\
+                    template<typename T> {attribute} T spvFma(T a, T b, T c) {{ return fma(a, b, c); }}\n{kernel}");
+                let library = compile_msl_library(device.device(), &source, version).unwrap();
+                let function = library.newFunctionWithName(&NSString::from_str("probe")).unwrap();
+                device.device().newComputePipelineStateWithFunction_error(&function).unwrap()
+            }).collect();
+            let mut timings = [Vec::<f64>::new(), Vec::new()];
+            for iteration in 0..10 {
+                for index in [iteration % 2, 1 - iteration % 2] {
+                    let command = device.command_queue().commandBuffer().unwrap();
+                    let encoder = command.computeCommandEncoder().unwrap();
+                    encoder.setComputePipelineState(&pipelines[index]);
+                    // All buffers and pipelines remain alive until this command completes.
+                    unsafe {
+                        encoder.setBuffer_offset_atIndex(Some(input.handle()), 0, 0);
+                        encoder.setBuffer_offset_atIndex(Some(outputs[index].handle()), 0, 1);
+                    }
+                    encoder.dispatchThreads_threadsPerThreadgroup(
+                        MTLSize { width: inputs.len(), height: 1, depth: 1 },
+                        MTLSize { width: 64, height: 1, depth: 1 });
+                    encoder.endEncoding();
+                    command.commit();
+                    command.waitUntilCompleted();
+                    assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+                    if iteration > 1 { timings[index].push((command.GPUEndTime() - command.GPUStartTime()) * 1000.0); }
+                }
+            }
+            let mut reference = vec![0; bytes.len() * 2];
+            let mut candidate = vec![0; bytes.len() * 2];
+            outputs[0].read(0, &mut reference).unwrap();
+            outputs[1].read(0, &mut candidate).unwrap();
+            let mut mismatches = 0;
+            for (index, (a, b)) in reference.chunks_exact(4).zip(candidate.chunks_exact(4)).enumerate() {
+                if a != b {
+                    if mismatches < 8 { eprintln!("{version:?} input={:08x?} component={} old={a:02x?} candidate={b:02x?}", inputs[index / 8], index % 8); }
+                    mismatches += 1;
+                }
+            }
+            for timing in &mut timings { timing.sort_by(f64::total_cmp); }
+            eprintln!("{version:?}: {} input triples, mismatching words={mismatches}, median GPU ms optnone={} inline={}",
+                inputs.len(), timings[0][4], timings[1][4]);
+            assert_eq!(mismatches, 0, "candidate changes native arithmetic results");
+        }
+    }
+
     #[test]
     fn callable_geometry_captures_outputs_and_executes_side_effects_once() {
         use crate::renderer_metal::{metal_buffer::MetalBuffer, metal_scheduler::MetalScheduler};
@@ -1060,6 +1167,279 @@ kernel void capture(device uint* counter [[buffer(0)]], device uint* result [[bu
         assert_eq!(&words[..5], &[4, 1, 1, 2, 2]);
         assert_eq!(&words[5..13], &[0, 1, 1, 2, 3, 4, 4, 5]);
         assert_eq!(&words[13..], &(0..6).map(|v| (v as f32).to_bits()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn callable_tessellation_control_writes_distinct_vertices_and_patch_factors() {
+        use crate::renderer_metal::{metal_buffer::MetalBuffer, metal_scheduler::MetalScheduler};
+        use objc2_metal::{MTLComputeCommandEncoder as _, MTLSize};
+        use shader_recompiler::backend::msl::{emit_msl::emit_msl_tessellation_control_function, MslOptions};
+        use shader_recompiler::ir::{Attribute, Patch, SyntaxNode};
+        use shader_recompiler::ir_opt::collect_shader_info_pass::collect_shader_info_pass;
+
+        let device = MetalDevice::new().unwrap();
+        let mut program = Program::new(Stage::TessellationControl);
+        program.invocations = 3;
+        for _ in 0..3 { program.add_block(); }
+        let mut ir = Emitter::new(&mut program, 0);
+        ir.prologue();
+        let id = ir.invocation_id();
+        let input = ir.get_attribute(Attribute::generic(0, 0), id);
+        let constant = ir.get_cbuf_f32(Value::ImmU32(0), Value::ImmU32(0));
+        let value = ir.fp_add_32(input, constant);
+        ir.set_attribute(Attribute::generic(0, 0), value, Value::ImmU32(31));
+        let info = ir.invocation_info();
+        let info = ir.bit_cast_f32_u32(info);
+        ir.set_attribute(Attribute::POSITION_Y, info, Value::ImmU32(0));
+        let patch_id = ir.get_attribute(Attribute::PRIMITIVE_ID, Value::ImmU32(0));
+        ir.set_attribute(Attribute::POSITION_Z, patch_id, Value::ImmU32(0));
+        ir.barrier();
+        let first = ir.i_equal(id, Value::ImmU32(0));
+        let condition = ir.condition_ref(first);
+        let mut ir = Emitter::new(&mut program, 1);
+        ir.set_patch(Patch::TESS_LOD_LEFT, value);
+        ir.set_patch(Patch::TESS_LOD_INTERIOR_U, constant);
+        let mut ir = Emitter::new(&mut program, 2);
+        ir.epilogue();
+        program.syntax_list = vec![SyntaxNode::Block(0),
+            SyntaxNode::If { cond: condition, body: 1, merge: 2 }, SyntaxNode::Block(1),
+            SyntaxNode::EndIf { merge: 2 }, SyntaxNode::Block(2), SyntaxNode::Return];
+        collect_shader_info_pass(&mut program);
+        let mut runtime = RuntimeInfo::default();
+        runtime.previous_stage_stores.set(Attribute::generic(0, 0).0 as usize, true);
+        let artifact = emit_msl_tessellation_control_function(&program, &Profile::default(),
+            &runtime, &MslOptions::default(), &mut Bindings::default()).unwrap();
+        assert_eq!(artifact.bindings.buffer_count, 1);
+        assert_eq!(artifact.interface.as_ref().unwrap().parameters[0].name, "c0");
+        // Use GPU-side sizeof/pointers rather than assuming a Rust struct has
+        // the same vec4 alignment. Export only tightly packed scalar results.
+        let source = format!("{}\n{}", artifact.source.source, r#"
+kernel void probe_control(device MslControlInput* inputs [[buffer(0)]],
+    device MslControlOutput* outputs [[buffer(1)]],
+    device MslControlPatch* patches [[buffer(2)]], constant uint4* c0 [[buffer(3)]],
+    device uint* result [[buffer(4)]], uint invocation [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    uint patch_id = group.x;
+    device MslControlInput* input = inputs + patch_id * 3u;
+    device MslControlOutput* output = outputs + patch_id * 3u;
+    input[invocation].attr0.x = float(patch_id * 10u + invocation);
+    threadgroup_barrier(mem_flags::mem_device);
+    ruzu_control(c0, input, output, patches[patch_id], 3u, invocation, patch_id);
+    threadgroup_barrier(mem_flags::mem_device);
+    // Each invocation observes another invocation's result after the barrier.
+    result[patch_id * 8u + invocation] = as_type<uint>(output[(invocation + 1u) % 3u].attr0.x);
+    if (invocation == 0u) {
+        result[patch_id * 8u + 3u] = as_type<uint>(output[2].position.y);
+        result[patch_id * 8u + 4u] = as_type<uint>(output[2].position.z);
+        result[patch_id * 8u + 5u] = as_type<uint>(patches[patch_id].outer[0]);
+        result[patch_id * 8u + 6u] = as_type<uint>(patches[patch_id].inner[0]);
+        result[patch_id * 8u + 7u] = sizeof(MslControlOutput);
+    }
+}
+"#);
+        let library = compile_msl_library(device.device(), &source, MslVersion::V2_3).unwrap();
+        let function = library.newFunctionWithName(&NSString::from_str("probe_control")).unwrap();
+        let pipeline = device.device().newComputePipelineStateWithFunction_error(&function).unwrap();
+        let inputs = MetalBuffer::new(&device, 4096).unwrap();
+        let outputs = MetalBuffer::new(&device, 4096).unwrap();
+        let patches = MetalBuffer::new(&device, 4096).unwrap();
+        let cbuf = MetalBuffer::new(&device, 16).unwrap();
+        cbuf.write(0, bytemuck::cast_slice(&[2.5f32, 0.0, 0.0, 0.0])).unwrap();
+        let result = MetalBuffer::new(&device, 64).unwrap();
+        let mut scheduler = MetalScheduler::new(&device);
+        scheduler.with_compute_encoder(|encoder| unsafe {
+            encoder.setComputePipelineState(&pipeline);
+            for (index, buffer) in [&inputs, &outputs, &patches, &cbuf, &result].iter().enumerate() {
+                encoder.setBuffer_offset_atIndex(Some(buffer.handle()), 0, index);
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize { width: 2, height: 1, depth: 1 }, MTLSize { width: 3, height: 1, depth: 1 });
+        }).unwrap();
+        scheduler.finish_all().unwrap();
+        let mut bytes = [0; 64];
+        result.read(0, &mut bytes).unwrap();
+        let words: Vec<_> = bytes.chunks_exact(4).map(|b| u32::from_ne_bytes(b.try_into().unwrap())).collect();
+        for patch in 0..2 {
+            let base = (patch * 10) as f32;
+            assert_eq!(&words[patch * 8..patch * 8 + 7], &[
+                (base + 3.5).to_bits(), (base + 4.5).to_bits(), (base + 2.5).to_bits(),
+                3 << 16, patch as u32, (base + 2.5).to_bits(), 2.5f32.to_bits()]);
+            assert_eq!(words[patch * 8 + 7], 80, "native output vec4 alignment");
+        }
+    }
+
+    #[test]
+    fn callable_evaluation_rasterizes_hardware_patches_with_producer_stride() {
+        use crate::renderer_metal::{metal_buffer::MetalBuffer, metal_scheduler::MetalScheduler};
+        use crate::renderer_metal::{
+            metal_primitive_assembler::{MetalPrimitiveAssembler, MetalPrimitiveAssemblyParams},
+            metal_tessellation_pipeline::{MetalTessellationFactorPipeline, MetalTessellationPatches,
+                MetalTessellationEvaluationPipeline},
+            metal_pipeline_cache::MetalRenderPipelineKey,
+        };
+        use crate::engines::maxwell_3d::PrimitiveTopology;
+        use std::sync::Arc;
+        use objc2_metal::{MTLComputeCommandEncoder as _, MTLRenderCommandEncoder as _,
+            MTLBlitCommandEncoder as _, MTLTextureDescriptor, MTLTextureUsage,
+            MTLRenderPassDescriptor, MTLPixelFormat,
+            MTLClearColor, MTLLoadAction, MTLStoreAction, MTLSize, MTLOrigin, MTLViewport};
+        use shader_recompiler::backend::msl::{emit_msl::emit_msl_tessellation_evaluation_function, MslOptions};
+        use shader_recompiler::backend::msl::emit_msl_tessellation::TessellationControlLayout;
+        use shader_recompiler::runtime_info::{TessPrimitive, TessSpacing};
+        use shader_recompiler::ir::{Attribute, Patch, SyntaxNode};
+        use shader_recompiler::ir_opt::collect_shader_info_pass::collect_shader_info_pass;
+
+        let device = MetalDevice::new().unwrap();
+        let mut program = Program::new(Stage::TessellationEval);
+        program.add_block();
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+        let mut ir = Emitter::new(&mut program, 0);
+        ir.prologue();
+        let lane = ir.lane_id();
+        let u = ir.get_attribute(Attribute::TESSELLATION_EVALUATION_POINT_U, lane);
+        let v = ir.get_attribute(Attribute::TESSELLATION_EVALUATION_POINT_V, lane);
+        let sum = ir.fp_add_32(u, v);
+        let w = ir.fp_sub_32(Value::ImmF32(1.0), sum);
+        for attribute in [Attribute::POSITION_X, Attribute::POSITION_Y, Attribute::POSITION_Z, Attribute::POSITION_W] {
+            let a = ir.get_attribute(attribute, Value::ImmU32(0));
+            let b = ir.get_attribute(attribute, Value::ImmU32(1));
+            let c = ir.get_attribute(attribute, Value::ImmU32(2));
+            let a = ir.fp_mul_32(a, u);
+            let b = ir.fp_mul_32(b, v);
+            let c = ir.fp_mul_32(c, w);
+            let ab = ir.fp_add_32(a, b);
+            let position = ir.fp_add_32(ab, c);
+            ir.set_attribute(attribute, position, Value::ImmU32(0));
+        }
+        for component in 0..2 {
+            let color = ir.get_attribute(Attribute::generic(9, component), Value::ImmU32(2));
+            ir.set_attribute(Attribute::generic(0, component), color, Value::ImmU32(0));
+        }
+        let patch = ir.get_patch(Patch::generic(7, 0));
+        let constant = ir.get_cbuf_f32(Value::ImmU32(0), Value::ImmU32(0));
+        let blue = ir.fp_mul_32(patch, constant);
+        ir.set_attribute(Attribute::generic(0, 2), blue, Value::ImmU32(0));
+        ir.set_attribute(Attribute::generic(0, 3), Value::ImmF32(1.0), Value::ImmU32(0));
+        ir.epilogue();
+        program.blocks[0].append_new_inst(shader_recompiler::ir::Opcode::StorageAtomicIAdd32,
+            vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU32(1)]);
+        collect_shader_info_pass(&mut program);
+        program.info.storage_buffers_descriptors.push(shader_recompiler::shader_info::StorageBufferDescriptor {
+            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true,
+        });
+        let mut runtime = RuntimeInfo::default();
+        runtime.previous_stage_stores.set(Attribute::generic(9, 0).0 as usize, true);
+        // Producer has an additional unused field before the consumed one.
+        runtime.previous_stage_stores.set(Attribute::generic(0, 0).0 as usize, true);
+        let artifact = emit_msl_tessellation_evaluation_function(&program, &Profile::default(),
+            &runtime, &MslOptions::default(), &mut Bindings::default()).unwrap();
+        let mut control = Program::new(Stage::TessellationControl);
+        control.invocations = 3;
+        control.info.uses_patches[0] = true;
+        control.info.uses_patches[7] = true;
+        control.info.stores.set(Attribute::generic(0, 0).0 as usize, true);
+        control.info.stores.set(Attribute::generic(9, 0).0 as usize, true);
+        let layout = TessellationControlLayout::new(&control, &RuntimeInfo::default()).unwrap();
+        let source = format!("{}\n{}\n{}", artifact.source.source, layout.declarations(), r#"
+typedef MslControlOutput ProducerPoint;
+typedef MslControlPatch ProducerPatch;
+kernel void prepare_patch(device ProducerPoint* points [[buffer(0)]],
+    device ProducerPatch* patches [[buffer(1)]],
+    constant uint& discard_second [[buffer(2)]], uint id [[thread_position_in_grid]]) {
+    const float2 xy[3] = {float2(-0.4f, -0.8f), float2(0.4f, -0.8f), float2(0.0f, 0.8f)};
+    for (uint i = 0; i < 3; ++i) {
+        points[id*3+i].position = float4(xy[i] + float2(id ? 0.5f : -0.5f, 0.0f), 0.5f, 1.0f);
+        points[id*3+i].attr0 = float4(100.0f);
+        points[id*3+i].attr9 = id ? float4(0,1,0,1) : float4(1,0,0,1);
+    }
+    patches[id].generic0 = float4(100.0f);
+    patches[id].generic7 = float4(0.25f);
+    for (uint i = 0; i < 4; ++i) patches[id].outer[i] = id && discard_second ? 0.0f : 4.0f;
+    patches[id].inner[0] = patches[id].inner[1] = 4.0f;
+}
+fragment float4 shade_patch(MslVertexOut input [[stage_in]]) { return input.out_attr0; }
+"#);
+        let library = compile_msl_library(device.device(), &source, MslVersion::V2_3).unwrap();
+        let compute = library.newFunctionWithName(&NSString::from_str("prepare_patch")).unwrap();
+        let compute = device.device().newComputePipelineStateWithFunction_error(&compute).unwrap();
+        let mut key = MetalRenderPipelineKey::new(0, 0);
+        key.color_attachments[0].format = MTLPixelFormat::RGBA8Unorm;
+        let target_desc = unsafe { MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            MTLPixelFormat::RGBA8Unorm, 64, 64, false) };
+        target_desc.setUsage(MTLTextureUsage::RenderTarget);
+        let target = device.device().newTextureWithDescriptor(&target_desc).unwrap();
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        attachment.setTexture(Some(&target));
+        attachment.setLoadAction(MTLLoadAction::Clear);
+        attachment.setStoreAction(MTLStoreAction::Store);
+        attachment.setClearColor(MTLClearColor { red: 0., green: 0., blue: 0., alpha: 0. });
+        let points = Arc::new(MetalBuffer::new(&device, 6 * layout.output_stride()).unwrap());
+        let patches = Arc::new(MetalBuffer::new(&device, 2 * layout.patch_stride()).unwrap());
+        let assembler = MetalPrimitiveAssembler::new(&device).unwrap();
+        let factors_pipeline = MetalTessellationFactorPipeline::new(&device, &layout,
+            TessPrimitive::Triangles, TessSpacing::Equal, 16).unwrap();
+        let cbuf = MetalBuffer::new(&device, 16).unwrap();
+        cbuf.write(0, bytemuck::cast_slice(&[2.0f32, 0., 0., 0.])).unwrap();
+        let download = MetalBuffer::new(&device, 256 * 64).unwrap();
+        let counter = MetalBuffer::new(&device, 4).unwrap();
+        for rasterization_enabled in [true, false] {
+        key.rasterization_enabled = rasterization_enabled;
+        let pipeline = MetalTessellationEvaluationPipeline::new(&device, &key, &artifact, &layout,
+            &RuntimeInfo { tess_primitive: TessPrimitive::Triangles, tess_spacing: TessSpacing::Equal,
+                ..runtime.clone() }, 16,
+            Some(&library.newFunctionWithName(&NSString::from_str("shade_patch")).unwrap())).unwrap();
+        for discard in [0u32, 1, 2] {
+            counter.write(0, &[0; 4]).unwrap();
+            let mut scheduler = MetalScheduler::new(&device);
+            let assembly = assembler.record_patches(&mut scheduler, MetalPrimitiveAssemblyParams {
+                topology: PrimitiveTopology::Patches, count: if discard == 2 { 0 } else { 6 }, instances: 1,
+                base_vertex: 0, index_bytes: 0, restart_index: None,
+            }, 3, None, 0).unwrap();
+            scheduler.with_compute_encoder(|encoder| unsafe {
+                encoder.setComputePipelineState(&compute);
+                for (index, buffer) in [&points, &patches].iter().enumerate() {
+                    encoder.setBuffer_offset_atIndex(Some(buffer.handle()), 0, index);
+                }
+                encoder.setBytes_length_atIndex(std::ptr::NonNull::from(&discard).cast(), 4, 2);
+                let size = MTLSize { width: 2, height: 1, depth: 1 };
+                encoder.dispatchThreads_threadsPerThreadgroup(size, size);
+                encoder.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
+            }).unwrap();
+            let produced = MetalTessellationPatches { control_points: points.clone(), patch_data: patches.clone(),
+                capacity_per_instance: if discard == 2 { 0 } else { 2 }, instances: 1, output_vertices: 3,
+                control_stride: layout.output_stride(), patch_stride: layout.patch_stride() };
+            let factors = factors_pipeline.record(&mut scheduler, &assembly, &produced).unwrap();
+            scheduler.begin_render_pass(&pass).unwrap();
+            scheduler.with_render_encoder(|encoder| unsafe {
+                pipeline.bind(encoder, &produced, &factors).unwrap();
+                encoder.setVertexBuffer_offset_atIndex(Some(cbuf.handle()), 0, 0);
+                encoder.setVertexBuffer_offset_atIndex(Some(counter.handle()), 0, 1);
+                encoder.setViewport(MTLViewport { originX: 0., originY: 0., width: 64., height: 64., znear: 0., zfar: 1. });
+                encoder.drawPatches_patchIndexBuffer_patchIndexBufferOffset_indirectBuffer_indirectBufferOffset(
+                    3, None, 0, assembly.draw_arguments.handle(), 0);
+            }).unwrap();
+            scheduler.with_blit_encoder(|encoder| unsafe {
+                encoder.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                    &target, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 }, MTLSize { width: 64, height: 64, depth: 1 },
+                    download.handle(), 0, 256, 256*64);
+            }).unwrap();
+            scheduler.finish_all().unwrap();
+            let mut pixels = vec![0; 256*64];
+            download.read(0, &mut pixels).unwrap();
+            let mut invocations = [0; 4];
+            counter.read(0, &mut invocations).unwrap();
+            assert_eq!(u32::from_ne_bytes(invocations) > 0, discard != 2,
+                "TES stores mismatch with rasterization={rasterization_enabled} discard={discard}");
+            for (x, expected) in [(16, [255,0,128,255]), (48, if discard == 0 { [0,255,128,255] } else { [0,0,0,0] })] {
+                let expected = if rasterization_enabled && discard != 2 { expected } else { [0; 4] };
+                let actual = &pixels[(32*64+x)*4..(32*64+x)*4+4];
+                for (value, expected) in actual.iter().zip(expected) {
+                    assert!((*value as i32 - expected).abs() <= 1, "discard={discard} x={x} actual={actual:?}");
+                }
+            }
+        }
+        }
     }
 
     #[test]
@@ -2022,6 +2402,117 @@ vertex float4 argument_test_vertex(uint id [[vertex_id]]) {
                     assert!((pixels[index*4+component] as i16 - expected).abs() <= 2,
                         "array={array} sampler={index} actual={:?}", &pixels[index*4..index*4+4]);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_msl_samples_integer_stencil_and_float_depth_aspects() {
+        use super::super::{metal_buffer::MetalBuffer, metal_scheduler::MetalScheduler,
+            metal_update_descriptor::MetalSamplerArgumentBuffer};
+        use objc2_metal::{MTLBlitCommandEncoder, MTLRenderCommandEncoder, MTLTexture,
+            MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
+            MTLRenderPassDescriptor, MTLSamplerDescriptor, MTLSamplerMinMagFilter,
+            MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureDescriptor, MTLTextureUsage};
+        let device = MetalDevice::new().unwrap();
+        let profile = make_shader_profile(device.profile());
+        let desc = unsafe { MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            MTLPixelFormat::Depth32Float_Stencil8, 1, 1, false) };
+        desc.setStorageMode(MTLStorageMode::Private);
+        desc.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead | MTLTextureUsage::PixelFormatView);
+        let source = device.device().newTextureWithDescriptor(&desc).unwrap();
+        let stencil = source.newTextureViewWithPixelFormat(MTLPixelFormat::X32_Stencil8).unwrap();
+        let target_desc = unsafe { MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            MTLPixelFormat::RGBA8Unorm, 1, 1, false) };
+        target_desc.setUsage(MTLTextureUsage::RenderTarget);
+        let target = device.device().newTextureWithDescriptor(&target_desc).unwrap();
+        let sampler_desc = MTLSamplerDescriptor::new();
+        sampler_desc.setSupportArgumentBuffers(true);
+        sampler_desc.setMinFilter(MTLSamplerMinMagFilter::Nearest);
+        sampler_desc.setMagFilter(MTLSamplerMinMagFilter::Nearest);
+        let sampler = device.device().newSamplerStateWithDescriptor(&sampler_desc).unwrap();
+        for integer in [false, true] {
+            let mut program = Program::new(Stage::Fragment);
+            program.blocks.push(Block::new());
+            let mut texture = sampled_texture_program(1, TextureType::Color2D).info.texture_descriptors.remove(0);
+            texture.is_integer = integer;
+            program.info.texture_descriptors.push(texture);
+            let value = |inst| Value::Inst(InstRef { block: 0, inst });
+            let coords = sample_coordinates(&mut program, TextureType::Color2D);
+            let sample = program.blocks[0].append_new_inst(Opcode::ImageSampleExplicitLod,
+                vec![Value::ImmU32(0), coords, Value::ImmF32(0.), Value::Void]);
+            program.blocks[0].inst_mut(sample).flags = TextureInstInfo {
+                descriptor_index: 0, texture_type: TextureType::Color2D as u8,
+                is_integer: integer, ..Default::default()
+            }.to_u32();
+            let mut red = program.blocks[0].append_new_inst(Opcode::CompositeExtractF32x4,
+                vec![value(sample), Value::ImmU32(0)]);
+            if integer {
+                red = program.blocks[0].append_new_inst(Opcode::BitCastU32F32, vec![value(red)]);
+                red = program.blocks[0].append_new_inst(Opcode::ConvertF32U32, vec![value(red)]);
+                red = program.blocks[0].append_new_inst(Opcode::FPMul32,
+                    vec![value(red), Value::ImmF32(1. / 255.)]);
+            }
+            store_sample_result(&mut program, red, false);
+            let mut artifact = shader_recompiler::backend::msl::emit_msl_with_options(
+                &program, &profile, &RuntimeInfo::default(),
+                &direct_msl_options(device.device(), &MetalShaderCompileOptions::for_device(device.profile())),
+            ).unwrap();
+            assert!(artifact.source.source.contains(if integer { "texture2d<uint>" } else { "texture2d<float>" }));
+            artifact.source.source.push_str(r#"
+vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
+    return float4(id == 1u ? 3.0 : -1.0, id == 2u ? 3.0 : -1.0, 0.0, 1.0);
+}
+"#);
+            let module = compile_native_msl_artifact(device.device(), artifact).unwrap();
+            let arguments = MetalSamplerArgumentBuffer::new(&device, module.bindings(), [(0, &sampler)]).unwrap();
+            let pipeline_desc = MTLRenderPipelineDescriptor::new();
+            pipeline_desc.setVertexFunction(Some(&module.library().newFunctionWithName(&NSString::from_str("aspect_test_vertex")).unwrap()));
+            pipeline_desc.setFragmentFunction(Some(module.function()));
+            unsafe { pipeline_desc.colorAttachments().objectAtIndexedSubscript(0) }.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+            let pipeline = device.device().newRenderPipelineStateWithDescriptor_error(&pipeline_desc).unwrap();
+            for stencil_value in [0, 1, 128, 255] {
+                let mut scheduler = MetalScheduler::new(&device);
+                let clear = MTLRenderPassDescriptor::renderPassDescriptor();
+                let depth = clear.depthAttachment();
+                depth.setTexture(Some(&source));
+                depth.setLoadAction(MTLLoadAction::Clear);
+                depth.setStoreAction(MTLStoreAction::Store);
+                depth.setClearDepth(0.25);
+                let attachment = clear.stencilAttachment();
+                attachment.setTexture(Some(&source));
+                attachment.setLoadAction(MTLLoadAction::Clear);
+                attachment.setStoreAction(MTLStoreAction::Store);
+                attachment.setClearStencil(stencil_value);
+                scheduler.begin_render_pass(&clear).unwrap();
+                scheduler.end_render_pass();
+                let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+                let color = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+                color.setTexture(Some(&target));
+                color.setLoadAction(MTLLoadAction::DontCare);
+                color.setStoreAction(MTLStoreAction::Store);
+                scheduler.begin_render_pass(&pass).unwrap();
+                scheduler.with_render_encoder(|encoder| unsafe {
+                    encoder.setRenderPipelineState(&pipeline);
+                    encoder.setFragmentTexture_atIndex(Some(if integer { &stencil } else { &source }), 0);
+                    if let Some(args) = arguments.as_ref() {
+                        encoder.setFragmentBuffer_offset_atIndex(Some(args.buffer.handle()), 0, args.index as usize);
+                    } else {
+                        encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+                    }
+                    encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+                }).unwrap();
+                let download = MetalBuffer::new(&device, 256).unwrap();
+                scheduler.with_blit_encoder(|encoder| unsafe {
+                    encoder.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                        &target, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 }, MTLSize { width: 1, height: 1, depth: 1 },
+                        download.handle(), 0, 256, 256);
+                }).unwrap();
+                scheduler.finish_all().unwrap();
+                let mut pixel = [0; 4];
+                download.read(0, &mut pixel).unwrap();
+                let expected = if integer { stencil_value as u8 } else { 64 };
+                assert_eq!(pixel, [expected; 4], "integer={integer} stencil={stencil_value}");
             }
         }
     }
@@ -4137,7 +4628,8 @@ vertex float4 argument_test_vertex(uint id [[vertex_id]]) {
         assert!(shader
             .source()
             .source
-            .contains("[[clang::optnone]] T spvFAdd"));
+            .contains("inline T spvFAdd"));
+        assert!(shader.source().source.contains("#pragma STDC FP_CONTRACT OFF"));
     }
 
     #[test]
@@ -4260,7 +4752,8 @@ vertex float4 argument_test_vertex(uint id [[vertex_id]]) {
         assert!(artifact
             .source
             .source
-            .contains("[[clang::optnone]] T spvFma"));
+            .contains("inline T spvFma"));
+        assert!(artifact.source.source.contains("#pragma STDC FP_CONTRACT OFF"));
         assert!(artifact.source.source.contains("spvFma("));
 
         let shader = compile_native_msl_artifact(device.device(), artifact)

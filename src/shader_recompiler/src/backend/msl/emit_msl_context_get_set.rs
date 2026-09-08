@@ -27,6 +27,15 @@ pub fn emit_set_attribute(
             expected: "attribute",
         });
     };
+    if context.stage() == crate::stage::Stage::TessellationControl {
+        if attribute.is_clip_distance() && attribute.clip_distance_index() >= context.clip_distance_count() {
+            return Ok(());
+        }
+        let destination = context.tessellation_control_layout()?.output_expression(*attribute)?;
+        let value = context.value_expression(inst.arg(1), inst_ref, 1)?;
+        context.emit_statement(&format!("{destination} = {value};"));
+        return Ok(());
+    }
     // Eden's EmitSetAttribute ignores vertex: these writes update the current
     // output record, and GS EmitVertex captures that record separately.
     if attribute.is_generic() {
@@ -115,11 +124,14 @@ pub fn emit_local_invocation_id(
     )
 }
 
-/// Geometry InvocationInfo follows Eden: input vertex count in bits 16..31.
+/// InvocationInfo follows Eden: the current input vertex count in bits 16..31.
 pub fn emit_invocation_info(
     context: &mut MslEmitContext,
     inst_ref: InstRef,
 ) -> Result<(), MslError> {
+    if matches!(context.stage(), crate::stage::Stage::TessellationControl | crate::stage::Stage::TessellationEval) {
+        return context.define(inst_ref, ir::Type::U32, "patch_vertices << 16u".into(), false);
+    }
     let vertices = context.geometry_input_vertices()?;
     context.define(
         inst_ref,
@@ -130,6 +142,9 @@ pub fn emit_invocation_info(
 }
 
 pub fn emit_invocation_id(context: &mut MslEmitContext, inst_ref: InstRef) -> Result<(), MslError> {
+    if context.stage() == crate::stage::Stage::TessellationControl {
+        return context.define(inst_ref, ir::Type::U32, "invocation_id".into(), false);
+    }
     context.geometry_input_vertices()?;
     context.define(
         inst_ref,
@@ -232,6 +247,20 @@ pub fn emit_get_attribute(
             expected: "attribute",
         });
     };
+    if context.stage() == crate::stage::Stage::TessellationControl {
+        let vertex = context.value_expression(inst.arg(1), inst_ref, 1)?;
+        let expression = context.tessellation_control_layout()?.input_expression(*attribute, &vertex)?;
+        return context.define(inst_ref, ir::Type::F32, expression, false);
+    }
+    if context.stage() == crate::stage::Stage::TessellationEval {
+        // Eden reads TessCoord/PrimitiveId directly: the IR vertex operand is
+        // relevant only for per-control-point arrays, not these built-ins.
+        let vertex = if attribute.is_generic() || attribute.is_position() {
+            context.value_expression(inst.arg(1), inst_ref, 1)?
+        } else { String::new() };
+        let expression = context.tessellation_evaluation_layout()?.input_expression(*attribute, &vertex)?;
+        return context.define(inst_ref, ir::Type::F32, expression, false);
+    }
     if context.stage() == crate::stage::Stage::Geometry {
         let expression = if *attribute == crate::ir::value::Attribute::PRIMITIVE_ID {
             "as_type<float>(geometry_input.primitive_id)".to_owned()
@@ -287,6 +316,30 @@ pub fn emit_get_attribute(
     context.define(inst_ref, ir::Type::F32, expression, false)
 }
 
+/// Patch variables belong to the complete patch, unlike invocation-owned
+/// per-vertex outputs. Match Eden's generic loads and outer/inner stores.
+pub fn emit_patch(context: &mut MslEmitContext, inst_ref: InstRef, inst: &ir::Inst) -> Result<(), MslError> {
+    let Value::Patch(patch) = inst.arg(0) else {
+        return Err(MslError::ExpectedImmediate { opcode: inst.opcode, arg: 0, expected: "patch" });
+    };
+    let writing = inst.opcode == Opcode::SetPatch;
+    if context.stage() == crate::stage::Stage::TessellationEval {
+        if writing {
+            return Err(MslError::UnsupportedProgramFeature("patch store outside tessellation control"));
+        }
+        let expression = context.tessellation_evaluation_layout()?.patch_expression(*patch)?;
+        return context.define(inst_ref, ir::Type::F32, expression, false);
+    }
+    let expression = context.tessellation_control_layout()?.patch_expression(*patch, writing)?;
+    if writing {
+        let value = context.value_expression(inst.arg(1), inst_ref, 1)?;
+        context.emit_statement(&format!("{expression} = {value};"));
+        Ok(())
+    } else {
+        context.define(inst_ref, ir::Type::F32, expression, false)
+    }
+}
+
 /// Emit Eden's integer system-value attribute path without the float bitcast.
 pub fn emit_get_attribute_u32(
     context: &mut MslEmitContext,
@@ -300,6 +353,9 @@ pub fn emit_get_attribute_u32(
             expected: "attribute",
         });
     };
+    if matches!(context.stage(), crate::stage::Stage::TessellationControl | crate::stage::Stage::TessellationEval) && *attribute == crate::ir::value::Attribute::PRIMITIVE_ID {
+        return context.define(inst_ref, ir::Type::U32, "patch_id".into(), false);
+    }
     if context.stage() == crate::stage::Stage::Geometry
         && *attribute == crate::ir::value::Attribute::PRIMITIVE_ID
     {

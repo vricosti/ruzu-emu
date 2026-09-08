@@ -63,6 +63,7 @@ pub struct MetalRenderPassKey {
     samples: u32,
     layers: usize,
     visibility_result_buffer: usize,
+    slice: usize,
 }
 
 impl MetalRenderPassKey {
@@ -223,7 +224,16 @@ impl MetalFramebuffer {
             samples: self.samples,
             layers: self.layers,
             visibility_result_buffer,
+            slice: 0,
         }
+    }
+
+    /// Identity matching render_pass_descriptor_for_layer, relative to its views.
+    pub fn render_pass_key_for_layer(&self, layer: u32) -> MetalRenderPassKey {
+        let mut key = self.render_pass_key(0);
+        key.layers = 1;
+        key.slice = layer as usize;
+        key
     }
 
     pub fn render_pass_descriptor_for_layer(
@@ -420,6 +430,8 @@ mod tests {
         assert_ne!(pass_key.color_attachments[2], 0);
         assert_eq!(pass_key.color_attachments[0], 0);
         assert_ne!(pass_key, framebuffer.render_pass_key(0x1234));
+        assert_eq!(pass_key, framebuffer.render_pass_key_for_layer(0));
+        assert_ne!(pass_key, framebuffer.render_pass_key_for_layer(1));
         let descriptor = framebuffer.render_pass_descriptor();
         let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(2) };
         assert!(attachment.texture().is_some());

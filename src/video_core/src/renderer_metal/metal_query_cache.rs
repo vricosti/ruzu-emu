@@ -126,6 +126,8 @@ pub struct MetalConditionalRendering {
     pub buffer: Arc<MetalBuffer>,
     pub offset: usize,
     pub inverted: bool,
+    /// Only the private resolve buffer is inaccessible to guest shader writes.
+    pub(crate) private_resolve: bool,
 }
 
 impl QueryCacheRuntime {
@@ -220,6 +222,7 @@ impl QueryCacheRuntime {
             buffer: Arc::clone(&self.hcr_resolve_buffer),
             offset: 0,
             inverted: !is_equal,
+            private_resolve: true,
         });
         if was_running {
             self.resume_host_conditional_rendering();
@@ -263,6 +266,7 @@ impl QueryCacheRuntime {
             buffer,
             offset: offset as usize,
             inverted: is_equal,
+            private_resolve: false,
         });
         Ok(())
     }
@@ -399,6 +403,7 @@ impl QueryCacheRuntime {
                 self.buffers_to_upload_to.iter().zip(&self.copies_setup)
             {
                 for copy in copies {
+                    destination.mark_content_range_modified(copy.dst_offset, u64::from(copy.size));
                     unsafe {
                         encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                             source,
@@ -946,6 +951,16 @@ impl MetalQueryCache {
                 return Ok(false);
             }
         }
+        if compare_to_zero && first.is_none()
+            && !buffer_cache.is_region_gpu_modified(address, size as usize)
+        {
+            // Metal must otherwise mask indirect arguments in compute before
+            // every draw. For a CPU-owned condition, retain Maxwell's ordinary
+            // synchronized ReadBlock evaluation instead. GPU-written buffers
+            // and cached reports still require the ordered GPU predicate.
+            runtime.end_host_conditional_rendering();
+            return Ok(false);
+        }
         if !compare_to_zero {
             let mut qc_dirty = false;
             let mut in_bc = false;
@@ -1329,22 +1344,11 @@ mod tests {
         f.cache
             .set_device_memory(Box::new(QuerySyncMemory(Arc::new(bytes))));
         f.cache.write_memory(0x8144, 4);
-        assert!(cache
+        assert!(!cache
             .accelerate_host_conditional_rendering(&mut f.runtime, &mut f.cache, &memory, state,)
             .unwrap());
-        let predicate = f.runtime.active_conditional_rendering().unwrap();
-        let readback = MetalBuffer::new(&f.device, 4).unwrap();
-        predicate
-            .buffer
-            .encode_copy(&mut f.scheduler, &readback, predicate.offset, 0, 4)
-            .unwrap();
-        f.scheduler.finish_all().unwrap();
-        let mut bytes = [0u8; 4];
-        readback.read(0, &mut bytes).unwrap();
-        assert_eq!(
-            bytes, [0; 4],
-            "invalidated query must not retain old GPU value 13"
-        );
+        assert!(f.runtime.active_conditional_rendering().is_none(),
+            "CPU-owned condition must not retain old GPU value 13");
         for bad in [
             RenderConditionState {
                 override_mode: 1,
@@ -1433,6 +1437,28 @@ mod tests {
     }
 
     #[test]
+    fn common_gpu_write_notifications_advance_native_generation_within_one_tick() {
+        let mut f = QuerySyncFixture::new();
+        let (id, _) = f.cache.obtain_cpu_buffer(
+            0x8100, 24, ObtainBufferSynchronize::NoSynchronize,
+            ObtainBufferOperation::DoNothing,
+        );
+        let buffer = f.cache.backend_buffer(id).unwrap().handle();
+        let generation = buffer.content_generation();
+        let tick = f.scheduler.current_tick();
+        for expected in 1..=2 {
+            let (written_id, _) = f.cache.obtain_cpu_buffer(
+                0x8100, 24, ObtainBufferSynchronize::NoSynchronize,
+                ObtainBufferOperation::MarkAsWritten,
+            );
+            assert_eq!(written_id, id);
+            assert_eq!(buffer.content_generation(), generation + expected);
+            assert_eq!(f.cache.backend_buffer(id).unwrap().write_tick(), tick);
+            assert_eq!(f.scheduler.current_tick(), tick);
+        }
+    }
+
+    #[test]
     fn conditional_lookup_accepts_gpu_modified_buffers_without_query_metadata() {
         let mut f = QuerySyncFixture::new();
         let cache = MetalQueryCache::new(&f.device).unwrap();
@@ -1487,6 +1513,61 @@ mod tests {
         readback.read(0, &mut bytes).unwrap();
         assert_eq!(u32::from_ne_bytes(bytes), 1);
         assert!(!predicate.inverted);
+    }
+
+    #[test]
+    fn cpu_owned_conditional_uses_engine_evaluation_without_new_gpu_work() {
+        let mut f = QuerySyncFixture::new();
+        let cache = MetalQueryCache::new(&f.device).unwrap();
+        let memory = conditional_channel_memory();
+        // Exercise replacement of a previously active GPU conditional region.
+        f.runtime.host_conditional_rendering_compare_value_impl(&mut f.cache, 0x8100, true).unwrap();
+        f.runtime.resume_host_conditional_rendering();
+        assert!(f.runtime.active_conditional_rendering().is_some());
+        f.scheduler.finish_all().unwrap();
+        let tick = f.scheduler.current_tick();
+        let state = RenderConditionState {
+            override_mode: 0,
+            comparison_mode: ComparisonMode::Conditional,
+            address: 0x20100,
+        };
+        assert!(!f.cache.is_region_gpu_modified(0x8100, 8));
+        assert!(!cache.accelerate_host_conditional_rendering(&mut f.runtime, &mut f.cache, &memory, state).unwrap());
+        f.runtime.resume_host_conditional_rendering();
+        assert!(f.runtime.active_conditional_rendering().is_none());
+        assert!(!f.scheduler.has_active_work());
+        assert_eq!(f.scheduler.current_tick(), tick);
+    }
+
+    #[test]
+    fn gpu_owned_conditional_without_report_keeps_gpu_two_word_comparison() {
+        let mut f = QuerySyncFixture::new();
+        let cache = MetalQueryCache::new(&f.device).unwrap();
+        let memory = conditional_channel_memory();
+        let state = RenderConditionState {
+            override_mode: 0,
+            comparison_mode: ComparisonMode::Conditional,
+            address: 0x20100,
+        };
+        // Guest RAM contains 0xa5 in both words throughout. Only the GPU copy
+        // is authoritative; a CPU fallback would incorrectly render all cases.
+        for (value, expected) in [(0, 0), (1, 0), (0x1_0000_0000, 0), (0x1_0000_0001, 1)] {
+            f.runtime.sync_values(&mut f.cache,
+                &[SyncValuesStruct { address: 0x8100, value, size: 8 }], None).unwrap();
+            f.cache.obtain_cpu_buffer(0x8100, 8, ObtainBufferSynchronize::NoSynchronize,
+                ObtainBufferOperation::MarkAsWritten);
+            let tick = f.scheduler.current_tick();
+            assert!(cache.accelerate_host_conditional_rendering(&mut f.runtime, &mut f.cache, &memory, state).unwrap());
+            f.runtime.resume_host_conditional_rendering();
+            let predicate = f.runtime.active_conditional_rendering().unwrap();
+            assert_eq!(f.scheduler.current_tick(), tick, "no CPU wait/readback in production");
+            let readback = MetalBuffer::new(&f.device, 4).unwrap();
+            predicate.buffer.encode_copy(&mut f.scheduler, &readback, predicate.offset, 0, 4).unwrap();
+            f.scheduler.finish_all().unwrap();
+            let mut bytes = [0; 4];
+            readback.read(0, &mut bytes).unwrap();
+            assert_eq!(u32::from_ne_bytes(bytes), expected);
+        }
     }
 
     #[test]
@@ -1852,6 +1933,16 @@ mod tests {
         );
         assert_eq!(f.runtime.little_cache, [(0x8000, 0xa000), (0xa000, 0xb000)]);
         assert_eq!(f.runtime.redirect_cache, [0, 1, 0, 0]);
+        let generations: Vec<_> = f.runtime.buffers_to_upload_to.iter()
+            .map(|(buffer, _)| (Arc::clone(buffer), buffer.content_generation())).collect();
+        f.runtime.sync_values(&mut f.cache, &values, None).unwrap();
+        assert_eq!(f.scheduler.current_tick(), tick);
+        for ((old, generation), (current, _)) in generations.iter()
+            .zip(&f.runtime.buffers_to_upload_to) {
+            assert!(Arc::ptr_eq(old, current));
+            assert!(current.content_generation() > *generation,
+                "query blits must invalidate converted indices even in one scheduler tick");
+        }
         for value in values {
             let bytes = f.read_gpu(value.address - 4, 20);
             assert_eq!(&bytes[..4], &[0xa5; 4]);

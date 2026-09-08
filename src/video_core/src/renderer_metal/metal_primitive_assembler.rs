@@ -11,7 +11,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -39,6 +39,8 @@ pub enum MetalPrimitiveAssemblyError {
     IndexWidth(u32),
     #[error("geometry index buffer range is missing or out of bounds")]
     IndexRange,
+    #[error("patch input requires between 1 and 32 control points, got {0}")]
+    PatchControlPoints(u32),
     #[error("geometry input count exceeds addressable native buffer range")]
     Size,
     #[error("Metal primitive assembly compilation failed: {0}")]
@@ -109,6 +111,36 @@ pub struct MetalPrimitiveAssembly {
     pub input_topology: InputTopology,
 }
 
+/// Topology-independent index decoding and restart segmentation. Vertex
+/// producers consume this stream; primitive/patch assemblers consume ordinals.
+#[derive(Clone)]
+pub struct MetalVertexStream {
+    params: MetalPrimitiveAssemblyParams,
+    pub vertex_ids: Arc<MetalBuffer>,
+    pub segments: Arc<MetalBuffer>,
+}
+
+impl MetalVertexStream {
+    pub fn params(&self) -> MetalPrimitiveAssemblyParams { self.params }
+}
+
+#[derive(Clone)]
+pub struct MetalPatchAssembly {
+    pub stream: MetalVertexStream,
+    pub control_points: u32,
+    /// Preserve the guest base for the preceding vertex shader. The native
+    /// tessellator uses zero-based instance regions in retained output buffers.
+    pub base_instance: u32,
+    /// First stream ordinal of each complete patch, in input order.
+    pub starts: Arc<MetalBuffer>,
+    /// MTLDispatchThreadgroupsIndirectArguments: patches, instances, one.
+    pub dispatch_arguments: Arc<MetalBuffer>,
+    /// MTLDrawPatchIndirectArguments: patchCount, instanceCount, patchStart,
+    /// baseInstance (zero). TCS output is compacted in the same patch order;
+    /// guest base_instance must not offset the tessellation factor allocation.
+    pub draw_arguments: Arc<MetalBuffer>,
+}
+
 /// Packed triangle-list indices and MTLDrawIndexedPrimitivesIndirectArguments.
 /// The GPU determines the count after primitive restart; the host never reads it.
 pub struct MetalTriangleFanDraw {
@@ -120,6 +152,14 @@ impl MetalPrimitiveAssembly {
     pub fn params(&self) -> MetalPrimitiveAssemblyParams {
         self.params
     }
+    pub fn vertex_stream(&self) -> MetalVertexStream {
+        MetalVertexStream { params: self.params, vertex_ids: self.vertex_ids.clone(), segments: self.segments.clone() }
+    }
+}
+
+struct MetalPatchPipelines {
+    classify: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    emit: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 pub struct MetalPrimitiveAssembler {
@@ -131,6 +171,8 @@ pub struct MetalPrimitiveAssembler {
     emit: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fan_indices: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     null_index: MetalBuffer,
+    library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    patch_pipelines: OnceLock<MetalPatchPipelines>,
 }
 
 impl MetalPrimitiveAssembler {
@@ -160,6 +202,8 @@ impl MetalPrimitiveAssembler {
             emit: pipeline("assembly_emit")?,
             fan_indices: pipeline("assembly_fan_indices")?,
             null_index: MetalBuffer::new(device, 4)?,
+            library,
+            patch_pipelines: OnceLock::new(),
         })
     }
 
@@ -190,7 +234,7 @@ impl MetalPrimitiveAssembler {
             base_instance,
             u32::from(provoking_vertex_last),
         ];
-        scheduler.with_compute_encoder(|encoder| {
+        scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::PrimitiveAssembly, |encoder| {
             encoder.setComputePipelineState(&self.fan_indices);
             bind(encoder, &assembly.vertex_ids, 0, 0);
             bind(encoder, &assembly.primitives, 0, 1);
@@ -203,13 +247,12 @@ impl MetalPrimitiveAssembler {
         Ok(MetalTriangleFanDraw { indices, arguments })
     }
 
-    pub fn record(
+    pub fn record_input_stream(
         &self,
         scheduler: &mut MetalScheduler,
         params: MetalPrimitiveAssemblyParams,
         index: Option<(&MetalBuffer, usize)>,
-    ) -> Result<MetalPrimitiveAssembly, MetalPrimitiveAssemblyError> {
-        let input_topology = params.input_topology()?;
+    ) -> Result<MetalVertexStream, MetalPrimitiveAssemblyError> {
         if !matches!(params.index_bytes, 0 | 1 | 2 | 4) {
             return Err(MetalPrimitiveAssemblyError::IndexWidth(params.index_bytes));
         }
@@ -236,14 +279,11 @@ impl MetalPrimitiveAssembler {
         };
         let vertex_ids = buffer(4)?;
         let segments = buffer(8)?;
-        let counts = buffer(8)?;
-        let primitives = buffer(PRIMITIVE_RECORD_WORDS * 4)?;
-        let dispatch_arguments = Arc::new(MetalBuffer::new_private(&self.device, 12)?);
         let words = params.words();
         // An empty range may start at buffer.length(); Metal cannot bind that
         // offset, and there are no input vertices to initialize or classify.
         if params.count != 0 {
-            scheduler.with_compute_encoder(|encoder| {
+            scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::PrimitiveAssembly, |encoder| {
                 encoder.setComputePipelineState(&self.initialize);
                 bind(encoder, index_buffer, index_offset, 0);
                 bind(encoder, &vertex_ids, 0, 1);
@@ -251,8 +291,29 @@ impl MetalPrimitiveAssembler {
                 bind_words(encoder, &words, 3);
                 dispatch(encoder, params.count);
             })?;
-            self.scan_prefix(scheduler, &segments, params.count)?;
-            scheduler.with_compute_encoder(|encoder| {
+            // With restart disabled (including array draws), initialize writes
+            // uint2(0) throughout. The max/sum prefix would leave it unchanged.
+            if words[3] != 0 {
+                self.scan_prefix(scheduler, &segments, params.count)?;
+            }
+        }
+        Ok(MetalVertexStream { params, vertex_ids, segments })
+    }
+
+    pub fn record(
+        &self,
+        scheduler: &mut MetalScheduler,
+        params: MetalPrimitiveAssemblyParams,
+        index: Option<(&MetalBuffer, usize)>,
+    ) -> Result<MetalPrimitiveAssembly, MetalPrimitiveAssemblyError> {
+        let input_topology = params.input_topology()?;
+        let MetalVertexStream { vertex_ids, segments, .. } = self.record_input_stream(scheduler, params, index)?;
+        let counts = self.sized_buffer(params.count, 8)?;
+        let primitives = self.sized_buffer(params.count, PRIMITIVE_RECORD_WORDS * 4)?;
+        let dispatch_arguments = Arc::new(MetalBuffer::new_private(&self.device, 12)?);
+        let words = params.words();
+        if params.count != 0 {
+            scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::PrimitiveAssembly, |encoder| {
                 encoder.setComputePipelineState(&self.classify);
                 bind(encoder, &segments, 0, 0);
                 bind(encoder, &counts, 0, 1);
@@ -261,7 +322,7 @@ impl MetalPrimitiveAssembler {
             })?;
             self.scan_prefix(scheduler, &counts, params.count)?;
         }
-        scheduler.with_compute_encoder(|encoder| {
+        scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::PrimitiveAssembly, |encoder| {
             encoder.setComputePipelineState(&self.emit);
             bind(encoder, &segments, 0, 0);
             bind(encoder, &counts, 0, 1);
@@ -281,6 +342,69 @@ impl MetalPrimitiveAssembler {
         })
     }
 
+    fn sized_buffer(&self, count: u32, stride: usize) -> Result<Arc<MetalBuffer>, MetalPrimitiveAssemblyError> {
+        let size = (count.max(1) as usize).checked_mul(stride).ok_or(MetalPrimitiveAssemblyError::Size)?;
+        Ok(Arc::new(MetalBuffer::new_private(&self.device, size)?))
+    }
+
+    fn patch_pipelines(&self) -> Result<&MetalPatchPipelines, MetalPrimitiveAssemblyError> {
+        if self.patch_pipelines.get().is_none() {
+            let pipeline = |name: &str| {
+                let function = self.library.newFunctionWithName(&NSString::from_str(name))
+                    .ok_or_else(|| MetalPrimitiveAssemblyError::Compile(format!("missing {name}")))?;
+                self.device.device().newComputePipelineStateWithFunction_error(&function)
+                    .map_err(|error| MetalPrimitiveAssemblyError::Compile(error.to_string()))
+            };
+            let pipelines = MetalPatchPipelines { classify: pipeline("assembly_patch_classify")?, emit: pipeline("assembly_patch_emit")? };
+            let _ = self.patch_pipelines.set(pipelines);
+        }
+        Ok(self.patch_pipelines.get().expect("patch pipeline initialized"))
+    }
+
+    pub fn record_patches(
+        &self,
+        scheduler: &mut MetalScheduler,
+        params: MetalPrimitiveAssemblyParams,
+        control_points: u32,
+        index: Option<(&MetalBuffer, usize)>,
+        base_instance: u32,
+    ) -> Result<MetalPatchAssembly, MetalPrimitiveAssemblyError> {
+        if params.topology != PrimitiveTopology::Patches {
+            return Err(MetalPrimitiveAssemblyError::Topology(params.topology));
+        }
+        if !(1..=32).contains(&control_points) {
+            return Err(MetalPrimitiveAssemblyError::PatchControlPoints(control_points));
+        }
+        let pipelines = self.patch_pipelines()?;
+        let stream = self.record_input_stream(scheduler, params, index)?;
+        let counts = self.sized_buffer(params.count, 8)?;
+        let starts = self.sized_buffer(params.count / control_points, 4)?;
+        let dispatch_arguments = self.sized_buffer(1, 12)?;
+        let draw_arguments = self.sized_buffer(1, 16)?;
+        let words = [params.count, control_points, params.instances, 0];
+        if params.count != 0 {
+            scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::PrimitiveAssembly, |encoder| {
+                encoder.setComputePipelineState(&pipelines.classify);
+                bind(encoder, &stream.segments, 0, 0);
+                bind(encoder, &counts, 0, 1);
+                bind_words(encoder, &words, 2);
+                dispatch(encoder, params.count);
+            })?;
+            self.scan_prefix(scheduler, &counts, params.count)?;
+        }
+        scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::PrimitiveAssembly, |encoder| {
+            encoder.setComputePipelineState(&pipelines.emit);
+            bind(encoder, &stream.segments, 0, 0);
+            bind(encoder, &counts, 0, 1);
+            bind(encoder, &starts, 0, 2);
+            bind(encoder, &dispatch_arguments, 0, 3);
+            bind(encoder, &draw_arguments, 0, 4);
+            bind_words(encoder, &words, 5);
+            dispatch(encoder, params.count.max(1));
+        })?;
+        Ok(MetalPatchAssembly { stream, control_points, base_instance, starts, dispatch_arguments, draw_arguments })
+    }
+
     fn scan_prefix(
         &self,
         scheduler: &mut MetalScheduler,
@@ -292,7 +416,7 @@ impl MetalPrimitiveAssembler {
         }
         let groups = count.div_ceil(SCAN_WIDTH);
         let totals = MetalBuffer::new_private(&self.device, groups as usize * 8)?;
-        scheduler.with_compute_encoder(|encoder| {
+        scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::PrimitiveAssembly, |encoder| {
             encoder.setComputePipelineState(&self.scan);
             bind(encoder, values, 0, 0);
             bind(encoder, &totals, 0, 1);
@@ -301,7 +425,7 @@ impl MetalPrimitiveAssembler {
         })?;
         if groups > 1 {
             self.scan_prefix(scheduler, &totals, groups)?;
-            scheduler.with_compute_encoder(|encoder| {
+            scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::PrimitiveAssembly, |encoder| {
                 encoder.setComputePipelineState(&self.add);
                 bind(encoder, values, 0, 0);
                 bind(encoder, &totals, 0, 1);
@@ -490,6 +614,37 @@ kernel void assembly_fan_indices(const device uint* vertex_ids [[buffer(0)]],
         indices[ulong(i)*3u+j] = vertex_ids[ordinal] - p[0];
     }
 }
+
+struct PatchAssemblyParams { uint count, control_points, instances, reserved; };
+inline bool patch_ends(uint i, const device uint2* segments, constant PatchAssemblyParams& p) {
+    uint start = segments[i].x;
+    return start <= i && (i-start) % p.control_points == p.control_points-1u;
+}
+kernel void assembly_patch_classify(const device uint2* segments [[buffer(0)]],
+    device uint2* counts [[buffer(1)]], constant PatchAssemblyParams& p [[buffer(2)]],
+    uint i [[thread_position_in_grid]]) {
+    if (i < p.count) counts[i] = uint2(0u, uint(patch_ends(i, segments, p)));
+}
+kernel void assembly_patch_emit(const device uint2* segments [[buffer(0)]],
+    const device uint2* counts [[buffer(1)]], device uint* starts [[buffer(2)]],
+    device uint* dispatch_arguments [[buffer(3)]], device uint* draw_arguments [[buffer(4)]],
+    constant PatchAssemblyParams& p [[buffer(5)]], uint i [[thread_position_in_grid]]) {
+    if (i == 0u) {
+        uint patches = p.count == 0u ? 0u : counts[p.count-1u].y;
+        dispatch_arguments[0] = patches;
+        dispatch_arguments[1] = p.instances;
+        dispatch_arguments[2] = 1u;
+        draw_arguments[0] = patches;
+        draw_arguments[1] = p.instances;
+        draw_arguments[2] = 0u;
+        // PerPatchAndPerInstance factor lookup includes native baseInstance.
+        // Retained TCS outputs are instance-relative, not guest-base-prefixed.
+        draw_arguments[3] = 0u;
+    }
+    if (i < p.count && patch_ends(i, segments, p)) {
+        starts[counts[i].y-1u] = i - (p.control_points-1u);
+    }
+}
 "#;
 
 #[cfg(test)]
@@ -526,6 +681,57 @@ mod tests {
             .chunks_exact(4)
             .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn input_stream_skips_only_identity_restart_scan() {
+        let device = MetalDevice::new().unwrap();
+        let assembler = MetalPrimitiveAssembler::new(&device).unwrap();
+        for count in [0, 1, SCAN_WIDTH as usize + 3] {
+            for index_bytes in [0, 1, 2, 4] {
+                for restart_index in [None, Some(255)] {
+                    let mut scheduler = MetalScheduler::new(&device);
+                    let p = MetalPrimitiveAssemblyParams {
+                        index_bytes, restart_index, ..params(PrimitiveTopology::Triangles, count)
+                    };
+                    let mut bytes = vec![0xBA; 12];
+                    for index in 0..count as u32 {
+                        bytes.extend_from_slice(&index.to_le_bytes()[..index_bytes as usize]);
+                    }
+                    let source = MetalBuffer::new(&device, bytes.len()).unwrap();
+                    source.write(0, &bytes).unwrap();
+                    let before = scheduler.conditional_batch_token().1;
+                    let stream = assembler.record_input_stream(&mut scheduler, p, Some((&source, 12))).unwrap();
+                    let calls = scheduler.conditional_batch_token().1 - before;
+                    let restart_enabled = index_bytes != 0 && restart_index.is_some();
+                    if count == 0 {
+                        assert_eq!(calls, 0, "{p:?}");
+                    } else if restart_enabled {
+                        assert!(calls > 1, "restart must still scan: {p:?}");
+                    } else {
+                        assert_eq!(calls, 1, "only initialization is needed: {p:?}");
+                    }
+                    let ids = readback(&device, &mut scheduler, &stream.vertex_ids);
+                    let segments = readback(&device, &mut scheduler, &stream.segments);
+                    scheduler.finish_all().unwrap();
+                    let ids = words(&ids);
+                    let segments = words(&segments);
+                    let mut segment_start = 0;
+                    for i in 0..count {
+                        let raw = match index_bytes {
+                            1 => i as u8 as u32,
+                            2 => i as u16 as u32,
+                            _ => i as u32,
+                        };
+                        if restart_enabled && raw == 255 {
+                            segment_start = i as u32 + 1;
+                        }
+                        assert_eq!(ids[i], raw.wrapping_add(p.base_vertex as u32), "{p:?}, vertex {i}");
+                        assert_eq!(&segments[2 * i..2 * i + 2], &[segment_start, 0], "{p:?}, segment {i}");
+                    }
+                }
+            }
+        }
     }
 
     fn run_case(
@@ -587,6 +793,81 @@ mod tests {
             assert_eq!(actual_segments[i * 2], segment_start, "segment={i} {p:?}");
             assert_eq!(actual_segments[i * 2 + 1], 0);
         }
+    }
+
+    #[test]
+    fn native_patch_assembly_preserves_complete_segments_indices_and_arguments() {
+        let device = MetalDevice::new().unwrap();
+        let assembler = MetalPrimitiveAssembler::new(&device).unwrap();
+        assert!(assembler.patch_pipelines.get().is_none());
+        // Cross the prefix-scan boundary, including incomplete segments, repeated
+        // indices, and leading/consecutive/trailing restart markers.
+        let mut long = (0..777u32).map(|i| i % 97).collect::<Vec<_>>();
+        for index in [0, 1, 2, 31, 32, 255, 256, 257, 515, 776] { long[index] = 255; }
+        for controls in [1u32, 3, 7, 32] {
+            for indices in [vec![], vec![2, 2], vec![255, 4, 5, 6, 7, 255, 255, 8, 9, 10, 255], long.clone()] {
+                for width in [0u32, 1, 2, 4] {
+                    for instances in [0u32, 2] {
+                        let mut scheduler = MetalScheduler::new(&device);
+                        let mut bytes = vec![0xBA; 12];
+                        for value in &indices { bytes.extend_from_slice(&value.to_le_bytes()[..width as usize]); }
+                        let upload = MetalBuffer::new(&device, bytes.len()).unwrap();
+                        upload.write(0, &bytes).unwrap();
+                        let index_buffer = MetalBuffer::new_private(&device, bytes.len()).unwrap();
+                        upload.encode_copy(&mut scheduler, &index_buffer, 0, 0, bytes.len()).unwrap();
+                        let p = MetalPrimitiveAssemblyParams { topology: PrimitiveTopology::Patches,
+                            count: indices.len() as u32, base_vertex: -7, instances,
+                            index_bytes: width, restart_index: Some(255) };
+                        let patch = assembler.record_patches(&mut scheduler, p, controls, Some((&index_buffer, 12)), 19).unwrap();
+                        assert_eq!(patch.control_points, controls);
+                        assert_eq!(patch.base_instance, 19);
+                        assert_eq!(patch.stream.params().topology, PrimitiveTopology::Patches);
+                        let starts = readback(&device, &mut scheduler, &patch.starts);
+                        let ids = readback(&device, &mut scheduler, &patch.stream.vertex_ids);
+                        let dispatch = readback(&device, &mut scheduler, &patch.dispatch_arguments);
+                        let draw = readback(&device, &mut scheduler, &patch.draw_arguments);
+                        // Test-only wait, after all outputs are copied. Production
+                        // patch counts remain entirely on the GPU.
+                        scheduler.finish_all().unwrap();
+                        let mut expected = Vec::new();
+                        let mut segment = Vec::new();
+                        for (ordinal, value) in indices.iter().enumerate() {
+                            if width != 0 && *value == 255 { segment.clear(); continue; }
+                            segment.push(ordinal as u32);
+                            if segment.len() == controls as usize {
+                                expected.push(segment[0]);
+                                segment.clear();
+                            }
+                        }
+                        assert_eq!(&words(&starts)[..expected.len()], expected, "controls={controls} width={width} count={}", indices.len());
+                        assert_eq!(words(&dispatch), [expected.len() as u32, instances, 1]);
+                        assert_eq!(words(&draw), [expected.len() as u32, instances, 0, 0]);
+                        let ids = words(&ids);
+                        for (ordinal, value) in indices.iter().enumerate() {
+                            let index = if width == 0 { ordinal as u32 } else { *value };
+                            assert_eq!(ids[ordinal], index.wrapping_sub(7));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(assembler.patch_pipelines.get().is_some());
+    }
+
+    #[test]
+    fn patch_assembly_rejects_invalid_layout_before_recording() {
+        let device = MetalDevice::new().unwrap();
+        let assembler = MetalPrimitiveAssembler::new(&device).unwrap();
+        let mut scheduler = MetalScheduler::new(&device);
+        for controls in [0, 33, u32::MAX] {
+            assert!(matches!(assembler.record_patches(&mut scheduler,
+                params(PrimitiveTopology::Patches, 3), controls, None, 0),
+                Err(MetalPrimitiveAssemblyError::PatchControlPoints(_))));
+        }
+        assert!(matches!(assembler.record_patches(&mut scheduler,
+            params(PrimitiveTopology::Triangles, 3), 3, None, 0),
+            Err(MetalPrimitiveAssemblyError::Topology(_))));
+        assert!(assembler.patch_pipelines.get().is_none());
     }
 
     #[test]

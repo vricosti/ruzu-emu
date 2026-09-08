@@ -10,6 +10,7 @@
 pub mod metal_blit_helper;
 pub mod metal_buffer;
 pub mod metal_buffer_cache;
+mod metal_command_journal;
 pub mod metal_compute_pass;
 pub mod metal_compute_pipeline;
 pub mod metal_device;
@@ -34,6 +35,8 @@ pub mod metal_shader;
 pub mod metal_staging_buffer_pool;
 pub mod metal_state_tracker;
 pub mod metal_texture_cache;
+pub mod metal_tessellation_pipeline;
 pub mod metal_update_descriptor;
 pub mod metal_vertex_pulling;
 pub mod renderer_metal;
+pub mod present;

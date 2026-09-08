@@ -52,6 +52,8 @@ fn varying_mask_has_only_stage_inputs(stage: crate::stage::Stage, mask: &[u64; 8
                     is_generic || matches!(attribute, 24 | 25 | 28..=31 | 184 | 185 | 255)
                 }
                 crate::stage::Stage::Geometry => is_generic || matches!(attribute, 24 | 28..=31),
+                crate::stage::Stage::TessellationControl => is_generic || matches!(attribute, 24 | 28..=31),
+                crate::stage::Stage::TessellationEval => is_generic || matches!(attribute, 24 | 28..=31 | 188 | 189),
                 _ => false,
             };
             if !allowed {
@@ -109,7 +111,7 @@ fn first_unsupported_program_feature(
     if program.stage != crate::stage::Stage::Compute && program.workgroup_size != [1, 1, 1] {
         return Some("workgroup size");
     }
-    if program.stage != crate::stage::Stage::Geometry
+    if !matches!(program.stage, crate::stage::Stage::Geometry | crate::stage::Stage::TessellationControl)
         && (program.output_vertices != 0 || program.invocations != 1)
     {
         return Some("geometry execution modes");
@@ -120,7 +122,7 @@ fn first_unsupported_program_feature(
     let supported_stage_loads = varying_mask_has_only_stage_inputs(program.stage, &info.loads.mask);
     let supported_vertex_stores = matches!(
         program.stage,
-        crate::stage::Stage::VertexB | crate::stage::Stage::Geometry
+        crate::stage::Stage::VertexB | crate::stage::Stage::Geometry | crate::stage::Stage::TessellationControl | crate::stage::Stage::TessellationEval
     ) && varying_mask_has_only_vertex_outputs(program.stage, &info.stores.mask);
     let supported_fragment_colors = program.stage == crate::stage::Stage::Fragment;
     if (!supported_stage_loads && info.loads.mask.iter().any(|word| *word != 0))
@@ -131,8 +133,8 @@ fn first_unsupported_program_feature(
         || (!supported_fragment_colors && info.stores_frag_color.iter().any(|store| *store))
         || ((info.stores_sample_mask || info.stores_frag_depth)
             && program.stage != crate::stage::Stage::Fragment)
-        || info.stores_tess_level_outer
-        || info.stores_tess_level_inner
+        || ((info.stores_tess_level_outer || info.stores_tess_level_inner)
+            && program.stage != crate::stage::Stage::TessellationControl)
         || !info.legacy_stores_mapping.is_empty()
     {
         return Some("stage inputs or outputs");
@@ -149,14 +151,15 @@ fn first_unsupported_program_feature(
     if info.uses_rescaling_uniform && !profile.unified_descriptor_binding {
         return Some("rescaling without unified descriptor binding");
     }
-    if info.uses_patches.iter().any(|used| *used) {
+    if info.uses_patches.iter().any(|used| *used) && !matches!(program.stage, crate::stage::Stage::TessellationControl | crate::stage::Stage::TessellationEval) {
         return Some("tessellation patches");
     }
     if info.uses_global_memory && !profile.support_int64 {
         return Some("global memory without 64-bit integers");
     }
-    if ((info.uses_invocation_id || info.uses_invocation_info)
-        && program.stage != crate::stage::Stage::Geometry)
+    if (info.uses_invocation_id
+        && !matches!(program.stage, crate::stage::Stage::Geometry | crate::stage::Stage::TessellationControl))
+        || (info.uses_invocation_info && !matches!(program.stage, crate::stage::Stage::Geometry | crate::stage::Stage::TessellationControl | crate::stage::Stage::TessellationEval))
         || info.requires_layer_emulation
         || info.emulated_layer != 0
     {
@@ -744,6 +747,9 @@ fn emit_inst(
         Opcode::VoteAll => emit_msl_warp::emit_vote_all(context, inst_ref, inst),
         Opcode::VoteAny => emit_msl_warp::emit_vote_any(context, inst_ref, inst),
         Opcode::VoteEqual => emit_msl_warp::emit_vote_equal(context, inst_ref, inst),
+        // TessellationEvaluationLayout verifies that all these uses are
+        // ignored TessCoord/PrimitiveId operands, not an observable value.
+        Opcode::LaneId if context.stage() == crate::stage::Stage::TessellationEval => Ok(()),
         Opcode::LaneId => emit_msl_warp::emit_lane_id(context, inst_ref),
         Opcode::SubgroupBallot => emit_msl_warp::emit_subgroup_ballot(context, inst_ref, inst),
         Opcode::SubgroupEqMask
@@ -889,6 +895,7 @@ fn emit_inst(
             emit_msl_image_atomic::emit_image_atomic(context, inst_ref, inst)
         }
         Opcode::SetAttribute => emit_msl_context_get_set::emit_set_attribute(context, inst_ref, inst),
+        Opcode::GetPatch | Opcode::SetPatch => emit_msl_context_get_set::emit_patch(context, inst_ref, inst),
         Opcode::SetFragColor => {
             let render_target = immediate_u32(inst, 0)?;
             let component = immediate_u32(inst, 1)?;
@@ -1112,6 +1119,34 @@ pub fn emit_msl_geometry_function(
         bindings,
         super::msl_function::MslFunctionKind::GeometryFunction,
     )
+}
+
+/// Callable TCS; its compute caller supplies one complete patch per workgroup,
+/// invocation IDs and retained input/output storage. No tessellation is faked
+/// by treating this as a normal vertex entry point.
+pub fn emit_msl_tessellation_control_function(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+) -> Result<MslShaderArtifact, MslError> {
+    emit_msl_function(program, profile, runtime_info, options, bindings,
+        super::msl_function::MslFunctionKind::TessellationControlFunction)
+}
+
+/// Callable TES. Its native post-tessellation caller supplies hardware domain
+/// coordinates and the actual producer's device-buffer types, without
+/// reinterpreting a consumer subset as a differently-strided input record.
+pub fn emit_msl_tessellation_evaluation_function(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+) -> Result<MslShaderArtifact, MslError> {
+    emit_msl_function(program, profile, runtime_info, options, bindings,
+        super::msl_function::MslFunctionKind::TessellationEvaluationFunction)
 }
 
 fn emit_msl_function(
@@ -4014,7 +4049,8 @@ mod tests {
         assert!(artifact
             .source
             .source
-            .contains("[[clang::optnone]] T spvFAdd"));
+            .contains("inline T spvFAdd"));
+        assert!(artifact.source.source.contains("#pragma STDC FP_CONTRACT OFF"));
         assert_eq!(integer, 0);
     }
 

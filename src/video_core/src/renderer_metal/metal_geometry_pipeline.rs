@@ -33,7 +33,7 @@ use super::metal_compute_pass::{
 use super::metal_device::MetalDevice;
 use super::metal_graphics_pipeline::MetalPreparedStage;
 use super::metal_pipeline_cache::{MetalRenderPipelineKey, MetalVertexInputState};
-use super::metal_primitive_assembler::MetalPrimitiveAssembly;
+use super::metal_primitive_assembler::{MetalPrimitiveAssembly, MetalVertexStream};
 use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
 use super::metal_staging_buffer_pool::MetalStagingBufferPool;
 use super::metal_shader::{compile_msl_library, MetalShaderError, MetalShaderModule};
@@ -325,6 +325,11 @@ pub struct MetalGeometryVertices {
 }
 
 impl MetalGeometryVertices {
+    pub(super) fn matches_stream(&self, stream: &MetalVertexStream, stride: usize, generic_mask: u32) -> bool {
+        self.count == stream.params().count && self.instances == stream.params().instances
+            && self.stride == stride && self.generic_mask == generic_mask
+    }
+
     pub(super) fn validate(&self, assembly: &MetalPrimitiveAssembly, stride: usize,
         generic_mask: u32, input_vertices: u32) -> Result<(), MetalGeometryPipelineError> {
         let p = assembly.params();
@@ -482,7 +487,51 @@ kernel void geometry_vertices({parameters}) {{
         vertex_sizes: &[u64; 31],
         bind_resources: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
     ) -> Result<MetalGeometryVertices, MetalGeometryPipelineError> {
-        self.record_impl(scheduler, assembly, base_instance, vertex_sizes, None, bind_resources)
+        self.record_impl(scheduler, assembly.params(), &assembly.vertex_ids, &assembly.segments,
+            base_instance, vertex_sizes, None, bind_resources)
+    }
+
+    /// The same vertex producer also precedes tessellation. Consume decoded
+    /// input entries without claiming they have a geometry InputTopology.
+    pub fn record_stream(
+        &self,
+        scheduler: &mut MetalScheduler,
+        stream: &MetalVertexStream,
+        base_instance: u32,
+        vertex_sizes: &[u64; 31],
+        bind_resources: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
+    ) -> Result<MetalGeometryVertices, MetalGeometryPipelineError> {
+        self.record_impl(scheduler, stream.params(), &stream.vertex_ids, &stream.segments,
+            base_instance, vertex_sizes, None, bind_resources)
+    }
+
+    /// Resolve the predicate before executing any vertex invocation, without
+    /// manufacturing a geometry topology for tessellation patch input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_conditional_stream(
+        &self,
+        scheduler: &mut MetalScheduler,
+        staging_pool: &mut MetalStagingBufferPool,
+        arguments_pass: &ConditionalRenderingArgumentsPass,
+        predicate: &MetalBuffer,
+        predicate_offset: usize,
+        inverted: bool,
+        stream: &MetalVertexStream,
+        base_instance: u32,
+        vertex_sizes: &[u64; 31],
+        bind_resources: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
+    ) -> Result<MetalGeometryVertices, MetalGeometryPipelineError> {
+        let params = stream.params();
+        let groups = [
+            (params.count as usize).div_ceil(self.pipeline.threadExecutionWidth()) as u32,
+            params.instances, 1,
+        ];
+        let source = MetalBuffer::new(&self.device, 12)?;
+        source.write(0, bytemuck::cast_slice(&groups))?;
+        let arguments = arguments_pass.resolve(scheduler, staging_pool, predicate,
+            predicate_offset, inverted, &source, 0, 12, 1, ConditionalArgumentLayout::Dispatch)?;
+        self.record_impl(scheduler, params, &stream.vertex_ids, &stream.segments,
+            base_instance, vertex_sizes, Some((&arguments.buffer, arguments.offset)), bind_resources)
     }
 
     /// The grid uses threadgroups (not threads); the generated vertex entry point
@@ -501,20 +550,22 @@ kernel void geometry_vertices({parameters}) {{
         if offset % 4 != 0 || offset.checked_add(12).is_none_or(|end| end > arguments.length()) {
             return Err(MetalGeometryPipelineError::IndirectRange);
         }
-        self.record_impl(scheduler, assembly, base_instance, vertex_sizes,
-            Some((arguments, offset)), bind_resources)
+        self.record_impl(scheduler, assembly.params(), &assembly.vertex_ids, &assembly.segments,
+            base_instance, vertex_sizes, Some((arguments, offset)), bind_resources)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_impl(
         &self,
         scheduler: &mut MetalScheduler,
-        assembly: &MetalPrimitiveAssembly,
+        params: super::metal_primitive_assembler::MetalPrimitiveAssemblyParams,
+        vertex_ids: &MetalBuffer,
+        segments: &MetalBuffer,
         base_instance: u32,
         vertex_sizes: &[u64; 31],
         indirect: Option<(&MetalBuffer, usize)>,
         bind_resources: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
     ) -> Result<MetalGeometryVertices, MetalGeometryPipelineError> {
-        let params = assembly.params();
         let size = (params.count as usize)
             .checked_mul(params.instances as usize)
             .and_then(|n| n.checked_mul(self.stride))
@@ -532,14 +583,14 @@ kernel void geometry_vertices({parameters}) {{
                 pair[0] = *size as u32;
                 pair[1] = (*size >> 32) as u32;
             }
-            scheduler.with_compute_encoder(|encoder| {
+            scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::GeometryVertex, |encoder| {
                 encoder.setComputePipelineState(&self.pipeline);
                 bind_resources(encoder);
                 // SAFETY: each buffer is retained through the command buffer; parameters are copied.
                 unsafe {
                     let slot = self.extra_buffer_base as usize;
-                    encoder.setBuffer_offset_atIndex(Some(assembly.vertex_ids.handle()), 0, slot);
-                    encoder.setBuffer_offset_atIndex(Some(assembly.segments.handle()), 0, slot + 1);
+                    encoder.setBuffer_offset_atIndex(Some(vertex_ids.handle()), 0, slot);
+                    encoder.setBuffer_offset_atIndex(Some(segments.handle()), 0, slot + 1);
                     encoder.setBuffer_offset_atIndex(Some(buffer.handle()), 0, slot + 2);
                     encoder.setBytes_length_atIndex(
                         NonNull::from(&words).cast::<c_void>(),
@@ -705,6 +756,103 @@ mod tests {
     use shader_recompiler::profile::Profile;
     use shader_recompiler::shader_info::StorageBufferDescriptor;
     use shader_recompiler::stage::Stage;
+
+    #[test]
+    fn patch_vertex_stream_keeps_ids_instances_and_one_execution_per_entry() {
+        let device = MetalDevice::new().unwrap();
+        let assembler = MetalPrimitiveAssembler::new(&device).unwrap();
+        let mut program = Program::new(Stage::VertexB);
+        program.add_block();
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+        let mut ir = Emitter::new(&mut program, 0);
+        for (component, attribute) in [Attribute::VERTEX_ID, Attribute::INSTANCE_ID].into_iter().enumerate() {
+            let id = ir.get_attribute_u32(attribute, Value::ImmU32(0));
+            let bits = ir.bit_cast_f32_u32(id);
+            ir.set_attribute(Attribute::generic(0, component as u32), bits, Value::ImmU32(0));
+            ir.set_attribute(Attribute::generic(7, component as u32), bits, Value::ImmU32(0));
+        }
+        program.blocks[0].append_new_inst(Opcode::StorageAtomicIAdd32,
+            vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU32(1)]);
+        collect_shader_info_pass(&mut program);
+        program.info.storage_buffers_descriptors.push(StorageBufferDescriptor {
+            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true,
+        });
+        let artifact = emit_msl_vertex_function(&program, &Profile { support_vertex_instance_id: true, ..Default::default() },
+            &RuntimeInfo::default(), &MslOptions::default(), &mut Bindings::default()).unwrap();
+        let runtime = RuntimeInfo { previous_stage_stores: program.info.stores, ..Default::default() };
+        let producer = MetalGeometryVertexPipeline::new(&device, &artifact, &MetalVertexInputState::default(), &runtime).unwrap();
+        let mut indices = vec![u32::MAX];
+        indices.extend((0..35u32).map(|id| id % 5));
+        indices.push(u32::MAX);
+        let upload = MetalBuffer::new(&device, indices.len()*4).unwrap();
+        upload.write(0, bytemuck::cast_slice(&indices)).unwrap();
+        let mut scheduler = MetalScheduler::new(&device);
+        let patches = assembler.record_patches(&mut scheduler, MetalPrimitiveAssemblyParams {
+            topology: PrimitiveTopology::Patches, count: indices.len() as u32, base_vertex: -3,
+            instances: 2, index_bytes: 4, restart_index: Some(u32::MAX),
+        }, 32, Some((&upload, 0)), 19).unwrap();
+        let counter = MetalBuffer::new(&device, 4).unwrap();
+        counter.write(0, &0u32.to_ne_bytes()).unwrap();
+        let vertices = producer.record_stream(&mut scheduler, &patches.stream, patches.base_instance, &[0; 31], |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(counter.handle()), 0, 0);
+        }).unwrap();
+        assert_eq!(vertices.stride, 48);
+        // The TCS reads only Generic7, after an unread Generic0 record. Its
+        // input count is 32, independently of its three output invocations.
+        use shader_recompiler::backend::msl::{emit_msl::emit_msl_tessellation_control_function,
+            emit_msl_tessellation::TessellationControlLayout};
+        let mut control = Program::new(Stage::TessellationControl);
+        control.invocations = 3;
+        control.add_block();
+        control.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+        let mut ir = Emitter::new(&mut control, 0);
+        let invocation = ir.invocation_id();
+        let index = ir.iadd_32(invocation, Value::ImmU32(29));
+        for component in 0..2 {
+            let value = ir.get_attribute(Attribute::generic(7, component), index);
+            ir.set_attribute(Attribute::generic(3, component), value, Value::ImmU32(0));
+        }
+        collect_shader_info_pass(&mut control);
+        let control_artifact = emit_msl_tessellation_control_function(&control, &Profile::default(),
+            &runtime, &MslOptions::default(), &mut Bindings::default()).unwrap();
+        let layout = TessellationControlLayout::new(&control, &runtime).unwrap();
+        assert_eq!(layout.input_stride(), vertices.stride);
+        let control_pipeline = super::super::metal_tessellation_pipeline::MetalTessellationControlPipeline::new(
+            &device, &control_artifact, &layout).unwrap();
+        let output = control_pipeline.record(&mut scheduler, &patches, &vertices, |_| {}).unwrap();
+        let result = MetalBuffer::new(&device, output.control_points.length()).unwrap();
+        output.control_points.encode_copy(&mut scheduler, &result, 0, 0, result.length()).unwrap();
+        assert_eq!(output.control_stride, 80);
+        assert_eq!(output.capacity_per_instance, 1);
+        drop(output);
+        let download = MetalBuffer::new(&device, vertices.buffer.length()).unwrap();
+        vertices.buffer.encode_copy(&mut scheduler, &download, 0, 0, vertices.buffer.length()).unwrap();
+        // The encoded buffers remain retained even after their packet is dropped.
+        drop(vertices);
+        drop(patches);
+        scheduler.finish_all().unwrap();
+        let mut executions = [0; 4];
+        counter.read(0, &mut executions).unwrap();
+        assert_eq!(u32::from_ne_bytes(executions), 70);
+        let mut control_results = vec![0u8; result.length()];
+        result.read(0, &mut control_results).unwrap();
+        for (slot, record) in control_results.chunks_exact(80).enumerate() {
+            let words = &record[64..72];
+            let instance = slot / 3;
+            let index = slot % 3 + 29;
+            assert_eq!(u32::from_ne_bytes(words[..4].try_into().unwrap()), indices[index+1].wrapping_sub(3));
+            assert_eq!(u32::from_ne_bytes(words[4..].try_into().unwrap()), 19+instance as u32);
+        }
+        let mut bytes = vec![0; download.length()];
+        download.read(0, &mut bytes).unwrap();
+        for instance in 0..2 {
+            for (ordinal, id) in indices.iter().enumerate().filter(|(_, id)| **id != u32::MAX) {
+                let offset = (instance*indices.len()+ordinal)*48+16;
+                assert_eq!(u32::from_ne_bytes(bytes[offset..offset+4].try_into().unwrap()), id.wrapping_sub(3));
+                assert_eq!(u32::from_ne_bytes(bytes[offset+4..offset+8].try_into().unwrap()), 19+instance as u32);
+            }
+        }
+    }
 
     #[test]
     fn vertex_results_preserve_ids_and_execute_stores_once_per_stream_entry() {

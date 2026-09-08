@@ -432,10 +432,12 @@ pub fn configure_compute_resources(
                 .sampler(sampler_id)
                 .or_else(|| texture_cache.sampler(NULL_SAMPLER_ID))
                 .ok_or(MetalComputePipelineError::MissingSampler(sampler_id.index))?;
-            let sampler = if sampler.has_added_anisotropy() && !supports_anisotropy {
-                sampler.retained_handle_with_default_anisotropy()
-            } else if sampler.has_linear_filtering() && is_pixel_format_integer(format) {
+            let sampler = if sampler.has_linear_filtering()
+                && (descriptor.is_integer || is_pixel_format_integer(format))
+            {
                 sampler.retained_handle_with_nearest_filter()
+            } else if sampler.has_added_anisotropy() && !supports_anisotropy {
+                sampler.retained_handle_with_default_anisotropy()
             } else if descriptor.is_depth
                 && sampler.has_depth_comparison()
                 && !supports_depth_comparison

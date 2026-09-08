@@ -1409,6 +1409,16 @@ pub struct FileEnvironment {
 }
 
 impl FileEnvironment {
+    /// Older entries persisted combined storage formats without the TIC
+    /// swizzle. They cannot determine whether sampling returned depth or stencil.
+    /// Loaders must consume the key, skip prebuilding this entry and let live
+    /// translation capture the selected aspect; the cache file stays intact.
+    pub fn has_ambiguous_depth_stencil_formats(&self) -> bool {
+        self.texture_pixel_formats.values().any(|format| matches!(format,
+            TexturePixelFormat::D24UnormS8Uint | TexturePixelFormat::S8UintD24Unorm
+                | TexturePixelFormat::D32FloatS8Uint))
+    }
+
     pub fn new() -> Self {
         Self {
             texture_pass_caches: Default::default(),
@@ -2075,7 +2085,22 @@ fn convert_texture_pixel_format(entry: &TicEntry) -> TexturePixelFormat {
         entry.a_type(),
         entry.srgb_conversion() != 0,
     );
-    unsafe { std::mem::transmute::<u32, TexturePixelFormat>(pixel_format as u32) }
+    // Shader metadata describes the sampled aspect, not the storage layout.
+    // Match ImageViewAspectMask: S8/D24 exposes stencil in R, while D24/S8
+    // and D32/S8 expose it in G. The combined format loses this numeric type.
+    use crate::surface::PixelFormat;
+    use crate::textures::texture::SwizzleSource;
+    let any_r = [entry.x_source(), entry.y_source(), entry.z_source(), entry.w_source()]
+        .contains(&(SwizzleSource::R as u32));
+    let sampled_format = match pixel_format {
+        PixelFormat::S8UintD24Unorm if any_r => PixelFormat::S8Uint,
+        PixelFormat::S8UintD24Unorm => PixelFormat::X8D24Unorm,
+        PixelFormat::D24UnormS8Uint if any_r => PixelFormat::X8D24Unorm,
+        PixelFormat::D32FloatS8Uint if any_r => PixelFormat::D32Float,
+        PixelFormat::D24UnormS8Uint | PixelFormat::D32FloatS8Uint => PixelFormat::S8Uint,
+        _ => pixel_format,
+    };
+    unsafe { std::mem::transmute::<u32, TexturePixelFormat>(sampled_format as u32) }
 }
 
 /// `convert_texture_pixel_format` transmutes a `PixelFormat` straight into a
@@ -2133,7 +2158,8 @@ fn assert_pixel_format_layouts_match() {
 fn is_integer_pixel_format(format: TexturePixelFormat) -> bool {
     matches!(
         format,
-        TexturePixelFormat::A8B8G8R8Sint
+        TexturePixelFormat::S8Uint
+            | TexturePixelFormat::A8B8G8R8Sint
             | TexturePixelFormat::A8B8G8R8Uint
             | TexturePixelFormat::R8Sint
             | TexturePixelFormat::R8Uint
@@ -2170,6 +2196,74 @@ fn deserialize_enum_u32<T>(raw: u32, max: u32, type_name: &str) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn sampled_depth_stencil_metadata_preserves_aspect_numeric_type() {
+        use crate::textures::texture::{ComponentType as C, SwizzleSource as S, TextureFormat as T};
+        for (format, types, red, green) in [
+            (T::Z24S8, [C::Uint, C::Unorm, C::Unorm, C::Unorm],
+                TexturePixelFormat::S8Uint, TexturePixelFormat::X8D24Unorm),
+            (T::S8Z24, [C::Unorm, C::Uint, C::Uint, C::Uint],
+                TexturePixelFormat::X8D24Unorm, TexturePixelFormat::S8Uint),
+            (T::Z32X24S8, [C::Float, C::Uint, C::Unorm, C::Unorm],
+                TexturePixelFormat::D32Float, TexturePixelFormat::S8Uint),
+        ] {
+            for (swizzle, expected) in [([S::R; 4], red), ([S::G; 4], green),
+                ([S::Zero, S::OneInt, S::G, S::OneFloat], green),
+                ([S::G, S::G, S::G, S::R], red)] {
+                let mut word = format as u32;
+                for (index, component) in types.iter().enumerate() {
+                    word |= (*component as u32) << (7 + index * 3);
+                }
+                for (index, source) in swizzle.iter().enumerate() {
+                    word |= (*source as u32) << (19 + index * 3);
+                }
+                let entry = TicEntry { raw: [word as u64, 0, 0, 0] };
+                let result = convert_texture_pixel_format(&entry);
+                assert_eq!(result, expected, "format={format:?} swizzle={swizzle:?}");
+                assert_eq!(is_integer_pixel_format(result), expected == TexturePixelFormat::S8Uint);
+                assert_eq!(is_integer_pixel_format(result), crate::surface::is_pixel_format_integer(
+                    unsafe { std::mem::transmute::<u32, crate::surface::PixelFormat>(result as u32) }));
+            }
+        }
+        assert_eq!(crate::surface::pixel_component_size_bits_integer(crate::surface::PixelFormat::S8Uint), 8);
+    }
+
+    #[test]
+    fn legacy_aspect_metadata_can_be_deferred_without_deleting_cache_entries() {
+        use std::cell::RefCell;
+        let path = make_test_cache_path("sampled-aspects");
+        for (stage, format) in [
+            (ShaderStage::Compute, TexturePixelFormat::S8UintD24Unorm),
+            (ShaderStage::Fragment, TexturePixelFormat::D32FloatS8Uint),
+            (ShaderStage::Compute, TexturePixelFormat::S8Uint),
+            (ShaderStage::Fragment, TexturePixelFormat::D32Float),
+        ] {
+            let mut env = GenericEnvironment::new();
+            env.stage = stage;
+            env.cached_lowest = 0;
+            env.cached_highest = 0;
+            env.code = vec![0];
+            env.texture_pixel_formats.insert(9, format);
+            serialize_pipeline(b"test", &[&env], &path, 7);
+        }
+        let before = std::fs::read(&path).unwrap();
+        let decisions = RefCell::new(Vec::new());
+        load_pipelines(|| false, &path, 7,
+            Box::new(|file, env| {
+                assert_eq!(read_test_cache_key(file, 4), b"test");
+                decisions.borrow_mut().push(env.has_ambiguous_depth_stencil_formats());
+                Ok(())
+            }),
+            Box::new(|file, envs| {
+                assert_eq!(read_test_cache_key(file, 4), b"test");
+                decisions.borrow_mut().push(envs.iter().any(FileEnvironment::has_ambiguous_depth_stencil_formats));
+                Ok(())
+            }));
+        assert_eq!(*decisions.borrow(), [true, true, false, false]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn texture_pixel_format_layout_matches_surface_pixel_format() {

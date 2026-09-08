@@ -18,6 +18,7 @@ mod emit_msl_control_flow;
 mod emit_msl_convert;
 mod emit_msl_floating_point;
 pub mod emit_msl_geometry;
+pub mod emit_msl_tessellation;
 mod emit_msl_image;
 mod emit_msl_image_atomic;
 mod emit_msl_integer;

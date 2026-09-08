@@ -407,6 +407,20 @@ pub trait BufferCacheBuffer:
     /// Backend API handle used by same-backend rasterizer helpers.
     fn raw_handle(&self) -> u64;
 
+    /// Upstream BufferBase::setWriteTick, dispatched through P::Buffer so a
+    /// native backend can invalidate derived data on every declared write.
+    /// Repeated writes in one tick must not collapse into one notification.
+    fn set_write_tick(&mut self, tick: u64) {
+        self.deref_mut().set_write_tick(tick);
+    }
+
+    /// Native derived-data caches may need the range already known by upstream
+    /// MarkWrittenBuffer. Other backends retain exactly setWriteTick behavior;
+    /// dispatch through the hook so existing whole-buffer invalidation remains.
+    fn mark_written_region(&mut self, tick: u64, _offset: u64, _size: u64) {
+        self.set_write_tick(tick);
+    }
+
     /// Backend-specific usage tracking. OpenGL intentionally implements these
     /// as no-ops; Vulkan owns the range tracker on its concrete `Buffer`.
     fn mark_usage(&mut self, _offset: u64, _size: u64) {}
@@ -1428,6 +1442,27 @@ pub enum DirtyFlag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_backend_write_notification_preserves_base_tick_semantics() {
+        let mut runtime = TestBufferCacheRuntime::default();
+        let mut buffer = TestBuffer::new(&mut runtime, 0x1000, 4);
+        assert_eq!(buffer.write_tick(), 0);
+        for tick in [19, 19, 0, u64::MAX] {
+            BufferCacheBuffer::set_write_tick(&mut buffer, tick);
+            assert_eq!(buffer.write_tick(), tick);
+        }
+    }
+
+    #[test]
+    fn default_region_notification_preserves_write_tick_semantics() {
+        let mut runtime = TestBufferCacheRuntime::default();
+        let mut buffer = TestBuffer::new(&mut runtime, 0x1000, 8);
+        for (tick, offset, size) in [(19, 0, 4), (19, 4, 4), (0, 0, 0), (u64::MAX, 0, 8)] {
+            buffer.mark_written_region(tick, offset, size);
+            assert_eq!(buffer.write_tick(), tick);
+        }
+    }
 
     #[test]
     fn test_null_binding() {

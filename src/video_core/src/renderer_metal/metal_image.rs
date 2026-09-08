@@ -6,10 +6,10 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBlitOption, MTLDevice, MTLOrigin, MTLSize, MTLStorageMode,
+    MTLBlitCommandEncoder, MTLBlitOption, MTLDevice, MTLHeap, MTLOrigin, MTLPixelFormat, MTLSize, MTLStorageMode,
     MTLTexture, MTLTextureDescriptor, MTLTextureType,
 };
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::surface::PixelFormat;
@@ -63,6 +63,7 @@ pub struct MetalImage {
     guest_samples: u32,
     allocation_tick: u64,
     storage_authority: AtomicU8,
+    content_revision: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +76,16 @@ enum StorageAuthority {
 
 impl MetalImage {
     pub fn new(device: &MetalDevice, info: &ImageInfo) -> Result<Self, MetalImageError> {
+        Self::new_with_allocator(device, info, |descriptor| {
+            device.device().newTextureWithDescriptor(descriptor)
+        })
+    }
+
+    fn new_with_allocator(
+        device: &MetalDevice,
+        info: &ImageInfo,
+        mut allocate: impl FnMut(&MTLTextureDescriptor) -> Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    ) -> Result<Self, MetalImageError> {
         if info.image_type == ImageType::Buffer {
             return Err(MetalImageError::BufferImageRequiresBuffer);
         }
@@ -114,9 +125,7 @@ impl MetalImage {
         descriptor.setStorageMode(MTLStorageMode::Private);
         descriptor.setUsage(texture_usage(device.profile(), info.format));
 
-        let texture = device
-            .device()
-            .newTextureWithDescriptor(&descriptor)
+        let texture = allocate(&descriptor)
             .ok_or(MetalImageError::AllocationFailed {
                 width,
                 height,
@@ -142,9 +151,7 @@ impl MetalImage {
             descriptor.setStorageMode(MTLStorageMode::Private);
             descriptor.setUsage(texture_usage(device.profile(), info.format));
             Some(
-                device
-                    .device()
-                    .newTextureWithDescriptor(&descriptor)
+                allocate(&descriptor)
                     .ok_or(MetalImageError::AllocationFailed {
                         width,
                         height,
@@ -168,6 +175,7 @@ impl MetalImage {
             guest_samples: info.num_samples,
             allocation_tick: 0,
             storage_authority: AtomicU8::new(StorageAuthority::Coherent as u8),
+            content_revision: AtomicU64::new(0),
         })
     }
 
@@ -177,6 +185,85 @@ impl MetalImage {
 
     pub(crate) fn retained_handle(&self) -> Retained<ProtocolObject<dyn MTLTexture>> {
         self.texture.clone()
+    }
+
+    /// CPU recording version, not a GPU completion fence. Cache locks serialize
+    /// producers. Pair with image identity; revisions are local to an allocation.
+    pub fn content_revision(&self) -> Option<u64> {
+        let revision = self.content_revision.load(Ordering::Relaxed);
+        (revision != u64::MAX).then_some(revision)
+    }
+
+    pub fn mark_contents_modified(&self) {
+        // Never wrap back to a cached revision. Exhaustion disables reuse.
+        let _ = self.content_revision.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |revision| Some(revision.saturating_add(1)));
+    }
+
+    /// Independent depth/stencil storage for sampling outside attachment aliasing.
+    /// Native Metal adaptation: Eden's Vulkan feedback hook only ends the pass.
+    /// This records a copy, not a wait or a reuse policy. Callers must invalidate
+    /// any cached snapshot on writes and account for its separate allocation.
+    pub fn create_sampling_snapshot(
+        &self,
+        device: &MetalDevice,
+        scheduler: &mut MetalScheduler,
+    ) -> Result<Self, MetalImageError> {
+        self.create_sampling_snapshot_with_allocator(device, scheduler, |descriptor| {
+            device.device().newTextureWithDescriptor(descriptor)
+        })
+    }
+
+    pub fn create_sampling_snapshot_in_heap(
+        &self,
+        device: &MetalDevice,
+        scheduler: &mut MetalScheduler,
+        heap: &ProtocolObject<dyn MTLHeap>,
+    ) -> Result<Self, MetalImageError> {
+        self.create_sampling_snapshot_with_allocator(device, scheduler, |descriptor| {
+            heap.newTextureWithDescriptor(descriptor)
+        })
+    }
+
+    fn create_sampling_snapshot_with_allocator(
+        &self,
+        device: &MetalDevice,
+        scheduler: &mut MetalScheduler,
+        allocate: impl FnMut(&MTLTextureDescriptor) -> Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    ) -> Result<Self, MetalImageError> {
+        if !self.supports_sampling_snapshot() {
+            return Err(MetalImageError::InvalidCopy(
+                "sampling snapshot requires single-sample 2D depth/stencil storage",
+            ));
+        }
+        let snapshot = Self::new_with_allocator(device, &ImageInfo {
+            format: self.guest_format,
+            image_type: self.image_type,
+            size: crate::texture_cache::types::Extent3D {
+                width: self.size.0, height: self.size.1, depth: 1,
+            },
+            resources: crate::texture_cache::types::SubresourceExtent {
+                levels: self.levels as i32, layers: self.layers as i32,
+            },
+            num_samples: 1,
+            ..ImageInfo::default()
+        }, allocate)?;
+        self.ensure_native_storage(scheduler)?;
+        scheduler.with_blit_encoder(|encoder| {
+            // Both allocations have identical native format, levels and layers.
+            // The ordinary command buffer retains both textures through completion.
+            unsafe { encoder.copyFromTexture_toTexture(self.handle(), snapshot.handle()) };
+        })?;
+        Ok(snapshot)
+    }
+
+    pub fn supports_sampling_snapshot(&self) -> bool {
+        matches!(self.image_type, ImageType::E2D | ImageType::Linear)
+            && self.guest_samples == 1
+            && self.samples == 1
+            && matches!(self.format.pixel_format,
+                MTLPixelFormat::Depth16Unorm | MTLPixelFormat::Depth32Float
+                | MTLPixelFormat::Depth32Float_Stencil8 | MTLPixelFormat::Stencil8)
     }
 
     pub fn slice_handle(&self) -> Option<&ProtocolObject<dyn MTLTexture>> {
@@ -379,6 +466,7 @@ impl MetalImage {
             return Err(MetalImageError::ConversionRequired(self.guest_format));
         }
         let native_copies = self.native_buffer_copies(source, base_offset, copies)?;
+        if !native_copies.is_empty() { self.mark_contents_modified(); }
         let slice_copies = self
             .slice_texture
             .as_ref()
@@ -448,6 +536,7 @@ impl MetalImage {
             1,
             bytes_per_texel,
         )?;
+        if !native_copies.is_empty() { self.mark_contents_modified(); }
         let slice_copies = self
             .slice_texture
             .as_ref()
@@ -515,6 +604,7 @@ impl MetalImage {
             self.native_buffer_copies_with_layout(source, base_offset, depth_copies, 1, 1, 4)?;
         let stencil =
             self.native_buffer_copies_with_layout(source, base_offset, stencil_copies, 1, 1, 1)?;
+        if !depth.is_empty() || !stencil.is_empty() { self.mark_contents_modified(); }
         let depth_slices = self
             .slice_texture
             .as_ref()
@@ -538,6 +628,43 @@ impl MetalImage {
         Ok(())
     }
 
+    /// Native aspect-transfer part of Image::DownloadMemory for converted
+    /// D24S8 images. The cache owns reconstruction of the guest packed words.
+    pub fn download_depth_stencil_memory(
+        &self,
+        scheduler: &mut MetalScheduler,
+        destination: &MetalBuffer,
+        base_offset: usize,
+        depth_copies: &[BufferImageCopy],
+        stencil_copies: &[BufferImageCopy],
+    ) -> Result<(), MetalImageError> {
+        if !matches!(self.guest_format, PixelFormat::D24UnormS8Uint | PixelFormat::S8UintD24Unorm) {
+            return Err(MetalImageError::InvalidCopy("depth/stencil plane download requires D24S8"));
+        }
+        if depth_copies.len() != stencil_copies.len() {
+            return Err(MetalImageError::InvalidCopy("depth/stencil copy count mismatch"));
+        }
+        let depth = self.native_buffer_copies_with_layout(destination, base_offset, depth_copies, 1, 1, 4)?;
+        let stencil = self.native_buffer_copies_with_layout(destination, base_offset, stencil_copies, 1, 1, 1)?;
+        self.ensure_native_storage(scheduler)?;
+        scheduler.with_blit_encoder(|encoder| {
+            for (copy, options) in depth.iter().map(|copy| (copy, MTLBlitOption::DepthFromDepthStencil))
+                .chain(stencil.iter().map(|copy| (copy, MTLBlitOption::StencilFromDepthStencil)))
+            {
+                // Metal exposes the combined attachment as separate float
+                // depth and byte stencil planes during buffer transfers.
+                unsafe {
+                    encoder.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                        self.handle(), copy.slice, copy.level, copy.origin, copy.size,
+                        destination.handle(), copy.buffer_offset, copy.bytes_per_row,
+                        copy.bytes_per_image, options,
+                    );
+                }
+            }
+        })?;
+        Ok(())
+    }
+
     /// Port of Eden `Image::DownloadMemory` for byte-compatible Metal formats.
     pub fn download_memory(
         &self,
@@ -549,8 +676,53 @@ impl MetalImage {
         if self.guest_format == PixelFormat::D32FloatS8Uint {
             return Err(MetalImageError::ConversionRequired(self.guest_format));
         }
-        self.ensure_native_storage(scheduler)?;
         let native_copies = self.native_buffer_copies(destination, base_offset, copies)?;
+        self.encode_download_memory(scheduler, destination, &native_copies)
+    }
+
+    /// The cache converts these native packed words back to guest channel order.
+    pub fn download_packed16_memory(
+        &self,
+        scheduler: &mut MetalScheduler,
+        destination: &MetalBuffer,
+        base_offset: usize,
+        copies: &[BufferImageCopy],
+    ) -> Result<(), MetalImageError> {
+        if !matches!(self.guest_format, PixelFormat::B5G6R5Unorm | PixelFormat::A1B5G5R5Unorm) {
+            return Err(MetalImageError::InvalidCopy("packed16 download format"));
+        }
+        let native_copies = self.native_buffer_copies_with_layout(
+            destination, base_offset, copies, 1, 1, 2,
+        )?;
+        self.encode_download_memory(scheduler, destination, &native_copies)
+    }
+
+    pub fn download_converted_memory(
+        &self,
+        scheduler: &mut MetalScheduler,
+        destination: &MetalBuffer,
+        base_offset: usize,
+        copies: &[BufferImageCopy],
+    ) -> Result<(), MetalImageError> {
+        let bytes_per_texel = match self.guest_format {
+            PixelFormat::R32G32B32Float => 16,
+            PixelFormat::G4R4Unorm => 2,
+            PixelFormat::X8D24Unorm => 4,
+            _ => return Err(MetalImageError::InvalidCopy("expanded color download format")),
+        };
+        let native_copies = self.native_buffer_copies_with_layout(
+            destination, base_offset, copies, 1, 1, bytes_per_texel,
+        )?;
+        self.encode_download_memory(scheduler, destination, &native_copies)
+    }
+
+    fn encode_download_memory(
+        &self,
+        scheduler: &mut MetalScheduler,
+        destination: &MetalBuffer,
+        native_copies: &[NativeBufferImageCopy],
+    ) -> Result<(), MetalImageError> {
+        self.ensure_native_storage(scheduler)?;
         scheduler.request_outside_render_pass_operation_context();
         scheduler.with_blit_encoder(|encoder| {
             for copy in native_copies {
@@ -591,7 +763,9 @@ impl MetalImage {
         if !upload {
             self.ensure_native_storage(scheduler)?;
         }
-        for copy in self.native_buffer_copies(buffer, base_offset, copies)? {
+        let native_copies = self.native_buffer_copies(buffer, base_offset, copies)?;
+        if upload && !native_copies.is_empty() { self.mark_contents_modified(); }
+        for copy in native_copies {
             helper.copy(
                 scheduler,
                 self.handle(),
@@ -904,6 +1078,23 @@ mod tests {
             depth.format().pixel_format,
             objc2_metal::MTLPixelFormat::Depth32Float
         );
+    }
+
+    #[test]
+    fn content_revision_does_not_follow_storage_authority_or_wrap() {
+        let device = MetalDevice::new().unwrap();
+        let image = MetalImage::new(&device, &image_info(PixelFormat::D32Float, 1, 1)).unwrap();
+        assert_eq!(image.content_revision(), Some(0));
+        image.mark_native_modified();
+        image.mark_modified_for_texture_type(TextureType::Color2D);
+        assert_eq!(image.content_revision(), Some(0));
+        image.mark_contents_modified();
+        assert_eq!(image.content_revision(), Some(1));
+        image.content_revision.store(u64::MAX - 1, Ordering::Relaxed);
+        image.mark_contents_modified();
+        assert_eq!(image.content_revision(), None);
+        image.mark_contents_modified();
+        assert_eq!(image.content_revision(), None);
     }
 
     #[test]

@@ -266,6 +266,24 @@ impl MetalDeviceProfile {
                 || self.supports_mac2_family)
     }
 
+    /// Native tessellation limits from Apple's Metal feature tables. This is
+    /// not a claim that every Maxwell tessellation domain is implemented.
+    pub fn max_tessellation_factor(&self) -> Option<u32> {
+        if self.supports_mac2_family || self.highest_apple_family.is_some_and(|f| f >= 5) {
+            Some(64)
+        } else if self.highest_apple_family.is_some_and(|f| f >= 3) {
+            Some(16)
+        } else {
+            None
+        }
+    }
+
+    /// Indirect patch draws require Apple5 or Mac2, independently of basic
+    /// tessellation (already available on Apple3/4 with lower factor limits).
+    pub fn supports_indirect_tessellation(&self) -> bool {
+        self.supports_mac2_family || self.highest_apple_family.is_some_and(|f| f >= 5)
+    }
+
     pub fn argument_binding_model(&self) -> MetalArgumentBindingModel {
         if self.max_argument_buffer_sampler_count == 0 {
             return MetalArgumentBindingModel::Direct;
@@ -362,6 +380,22 @@ mod tests {
             profile.highest_apple_family = apple;
             profile.supports_mac2_family = mac2;
             assert_eq!(profile.max_viewports(), expected);
+        }
+    }
+
+    #[test]
+    fn tessellation_limit_uses_queried_family() {
+        let mut profile = native_profile();
+        for (apple, mac2, expected) in [
+            (None, false, None), (Some(2), false, None),
+            (Some(3), false, Some(16)), (Some(4), false, Some(16)),
+            (Some(5), false, Some(64)), (Some(7), false, Some(64)),
+            (Some(10), false, Some(64)), (None, true, Some(64)),
+        ] {
+            profile.highest_apple_family = apple;
+            profile.supports_mac2_family = mac2;
+            assert_eq!(profile.max_tessellation_factor(), expected);
+            assert_eq!(profile.supports_indirect_tessellation(), expected == Some(64));
         }
     }
 

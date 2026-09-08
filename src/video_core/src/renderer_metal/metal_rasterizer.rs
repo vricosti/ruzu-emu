@@ -51,7 +51,7 @@ use super::metal_compute_pipeline::{
     bind_compute_resources, configure_compute_resources, MetalComputePipelineError,
 };
 use super::metal_compute_pass::{
-    ConditionalArgumentLayout, ConditionalRenderingArgumentsPass, MetalComputePassError,
+    ConditionalArgumentLayout, ConditionalDirectArguments, ConditionalRenderingArgumentsPass, MetalComputePassError,
 };
 use super::metal_device::MetalDevice;
 use super::metal_fence_manager::{MetalFence, MetalFenceManager};
@@ -72,7 +72,8 @@ use super::metal_query_cache::{MetalQueryCache, MetalQueryCacheError, MetalQuery
 use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
 use super::metal_staging_buffer_pool::{MetalStagingBufferError, MetalStagingBufferPool, StagingBufferRef};
 use super::metal_state_tracker::MetalStateTracker;
-use super::metal_texture_cache::MetalTextureCache;
+use super::metal_texture_cache::{MetalTextureCache, MetalTextureCacheError};
+use super::metal_tessellation_pipeline::MetalTessellationPipelineError;
 
 macro_rules! lock_two_reentrant_mutexes {
     ($first:expr, $second:expr, $first_guard:ident, $second_guard:ident) => {
@@ -91,13 +92,19 @@ macro_rules! lock_two_reentrant_mutexes {
 #[derive(Debug, Error)]
 pub enum MetalRasterizerError {
     #[error(transparent)]
+    TextureCache(#[from] MetalTextureCacheError),
+    #[error(transparent)]
     ComputePass(#[from] MetalComputePassError),
     #[error(transparent)]
     Geometry(#[from] MetalGeometryPipelineError),
     #[error(transparent)]
+    Tessellation(#[from] MetalTessellationPipelineError),
+    #[error(transparent)]
     Assembly(#[from] MetalPrimitiveAssemblyError),
     #[error("native geometry indirect input requires GPU draw-argument expansion")]
     GeometryIndirectInput,
+    #[error("native tessellation indirect input requires GPU draw-argument expansion")]
+    TessellationIndirectInput,
     #[error("geometry input references unbound vertex buffer {0}")]
     GeometryVertexBuffer(usize),
     #[error(transparent)]
@@ -145,7 +152,8 @@ struct MetalIndirectBinding {
 }
 
 struct MetalConditionalDrawArguments {
-    arguments: StagingBufferRef,
+    buffer: Arc<super::metal_buffer::MetalBuffer>,
+    offset: usize,
     layout: ConditionalArgumentLayout,
     count: u32,
 }
@@ -387,6 +395,7 @@ pub struct MetalRasterizer {
     query_cache: MetalQueryCache,
     query_cache_runtime: QueryCacheRuntime,
     conditional_arguments_pass: ConditionalRenderingArgumentsPass,
+    conditional_direct_arguments: ConditionalDirectArguments,
     state_tracker: MetalStateTracker,
     fence_manager: MetalFenceManager,
     blit_image: Box<MetalBlitHelper>,
@@ -452,6 +461,7 @@ impl MetalRasterizer {
             query_cache,
             query_cache_runtime,
             conditional_arguments_pass,
+            conditional_direct_arguments: ConditionalDirectArguments::default(),
             state_tracker,
             fence_manager,
             blit_image,
@@ -606,6 +616,9 @@ impl MetalRasterizer {
         if stages.geometry().is_some() && indirect_params.is_some() {
             return Err(MetalRasterizerError::GeometryIndirectInput);
         }
+        if stages.tessellation().is_some() && indirect_params.is_some() {
+            return Err(MetalRasterizerError::TessellationIndirectInput);
+        }
         // Indirect fan inputs need GPU argument expansion before input assembly.
         // Do not feed their original fan indices to a native triangle-list draw.
         if draw.draw_state().topology == PrimitiveTopology::TriangleFan && indirect_params.is_some() {
@@ -688,12 +701,14 @@ impl MetalRasterizer {
             );
 
         // Eden performs this after UpdateRenderTargets and before configuring
-        // the draw. Ending the current Metal encoder provides the required
-        // producer/consumer boundary without inventing a Vulkan-style layout.
-        let scheduler = self.scheduler.as_mut();
+        // the draw. Defer the native boundary decision until effective write
+        // state and independent sampled views are known.
+        let mut feedback_requested = false;
         self.texture_cache
             .base
-            .check_feedback_loop(&prepared.image_views, || scheduler.end_render_pass());
+            .check_feedback_loop(&prepared.image_views, || {
+                feedback_requested = true;
+            });
 
         let visibility_query = self
             .query_cache
@@ -730,8 +745,15 @@ impl MetalRasterizer {
                 )
             })
             .transpose()?;
+        let tessellation_pipeline = stages.tessellation().map(|tessellation| {
+            self.pipeline_cache.get_or_create_tessellation_pipeline(
+                pipeline_key, tessellation, stages.fragment(),
+            )
+        }).transpose()?;
         let pipeline_state = if let Some(geometry) = &geometry_pipeline {
             geometry.state.clone()
+        } else if let Some(tessellation) = &tessellation_pipeline {
+            tessellation.retained_state()
         } else {
             self.pipeline_cache
                 .get_or_create_render_pipeline(
@@ -746,10 +768,26 @@ impl MetalRasterizer {
         let depth_key = self
             .pipeline_cache
             .make_depth_stencil_key(&stages, &draw.depth_stencil());
+        if feedback_requested && !prepared.snapshot_read_only_depth_feedback(
+            &mut self.texture_cache, depth_key.may_write_depth_stencil(),
+        )? {
+            self.scheduler.end_render_pass();
+        }
+        self.scheduler.profile_depth_feedback(
+            &render_pass,
+            feedback_requested,
+            &depth_key,
+            [&prepared.vertex, &prepared.control, &prepared.evaluation, &prepared.geometry, &prepared.fragment]
+                .into_iter()
+                .enumerate()
+                .flat_map(|(index, stage)| stage.textures.iter().map(move |binding| (index + 1, binding)))
+                .filter_map(|(stage, binding)| binding.texture.as_deref()
+                    .map(|texture| (stage, binding.index, stages.key().unique_hashes[stage], texture))),
+        );
         let depth_state = self
             .pipeline_cache
             .retained_depth_stencil_state(depth_key)?;
-        let primitive_type = if geometry_pipeline.is_some() {
+        let primitive_type = if geometry_pipeline.is_some() || tessellation_pipeline.is_some() {
             None
         } else {
             Some(metal_primitive_type(draw.draw_state().topology)?)
@@ -775,7 +813,8 @@ impl MetalRasterizer {
         let depth_stencil = draw.depth_stencil();
         let vertex_layouts = pipeline_key.vertex_input.layouts;
 
-        for stage in [&prepared.vertex, &prepared.geometry, &prepared.fragment] {
+        for stage in [&prepared.vertex, &prepared.control, &prepared.evaluation,
+            &prepared.geometry, &prepared.fragment] {
             if stage.samplers_in_argument_buffer {
                 self.scheduler.retain_sampler_states(stage.samplers.iter().map(|s| s.sampler.clone()))?;
             }
@@ -785,6 +824,7 @@ impl MetalRasterizer {
         let predicate = self.query_cache_runtime.active_conditional_rendering();
 
         let fan_draw = if geometry_pipeline.is_none()
+            && tessellation_pipeline.is_none()
             && draw.draw_state().topology == PrimitiveTopology::TriangleFan
         {
             if self.primitive_assembler.is_none() {
@@ -833,7 +873,9 @@ impl MetalRasterizer {
             None
         };
 
-        let geometry_inputs = if let Some(geometry) = &geometry_pipeline {
+        let (geometry_inputs, tessellation_inputs) = if geometry_pipeline.is_some()
+            || tessellation_pipeline.is_some()
+        {
             let mut vertex_sizes = [0u64; 31];
             for (source, layout) in vertex_layouts.iter().enumerate().filter(|(_, l)| l.enabled) {
                 let binding = prepared
@@ -863,7 +905,7 @@ impl MetalRasterizer {
                 objc2_metal::MTLIndexType::UInt16 => 2,
                 _ => 4,
             });
-            let converted_quads = matches!(
+            let converted_quads = tessellation_pipeline.is_none() && matches!(
                 draw.draw_state().topology,
                 PrimitiveTopology::Quads | PrimitiveTopology::QuadStrip
             );
@@ -878,10 +920,11 @@ impl MetalRasterizer {
                     restart.index
                 },
             );
-            let assembly = self.primitive_assembler.as_ref().unwrap().record(
-                self.scheduler.as_mut(),
-                MetalPrimitiveAssemblyParams {
-                    topology: if converted_quads {
+            let assembly_params = MetalPrimitiveAssemblyParams {
+                    // Eden forces patch-list input when TES is enabled.
+                    topology: if tessellation_pipeline.is_some() {
+                        PrimitiveTopology::Patches
+                    } else if converted_quads {
                         PrimitiveTopology::Triangles
                     } else {
                         draw.draw_state().topology
@@ -891,14 +934,17 @@ impl MetalRasterizer {
                     instances: draw_params.num_instances,
                     index_bytes,
                     restart_index,
-                },
-                index.map(|index| {
-                    (
+                };
+            let index = index.map(|index| {
+                    let offset = (draw_params.first_index as usize)
+                        .checked_mul(index_bytes as usize)
+                        .and_then(|first| index.offset.checked_add(first))
+                        .ok_or(MetalPrimitiveAssemblyError::IndexRange)?;
+                    Ok::<_, MetalPrimitiveAssemblyError>((
                         index.buffer.as_ref(),
-                        index.offset + draw_params.first_index as usize * index_bytes as usize,
-                    )
-                }),
-            )?;
+                        offset,
+                    ))
+                }).transpose()?;
             let bind_resources = |encoder: &objc2::runtime::ProtocolObject<dyn MTLComputeCommandEncoder>| {
                     bind_vertex_resources(encoder, &prepared.vertex);
                     for (source, layout) in
@@ -917,57 +963,98 @@ impl MetalRasterizer {
                         }
                     }
                 };
-            let (assembly, vertices) = if let Some(predicate) = &predicate {
-                geometry.record_conditional_inputs(
+            if let Some(tessellation) = &tessellation_pipeline {
+                let assembly = self.primitive_assembler.as_ref().unwrap().record_patches(
+                    self.scheduler.as_mut(), assembly_params,
+                    stages.key().fixed_state.patch_control_points(), index,
+                    draw_params.base_instance,
+                )?;
+                let inputs = tessellation.record_inputs(
                     self.scheduler.as_mut(), self._staging_pool.as_mut(),
                     &self.conditional_arguments_pass,
-                    &predicate.buffer, predicate.offset, predicate.inverted,
-                    &assembly, draw_params.base_instance, &vertex_sizes, bind_resources,
-                )?
-            } else {
-                let vertices = geometry.vertex.record(
-                    self.scheduler.as_mut(), &assembly, draw_params.base_instance,
-                    &vertex_sizes, bind_resources,
+                    predicate.as_ref().map(|p| (p.buffer.as_ref(), p.offset, p.inverted)),
+                    &assembly, &vertex_sizes, bind_resources,
+                    |encoder| bind_vertex_resources(encoder, &prepared.control),
                 )?;
-                (assembly, vertices)
-            };
-            let captured = geometry.capture_output(self.scheduler.as_mut(), &assembly, &vertices, &prepared.geometry)?;
-            Some((assembly, vertices, captured))
+                (None, Some(inputs))
+            } else {
+                let geometry = geometry_pipeline.as_ref().unwrap();
+                let assembly = self.primitive_assembler.as_ref().unwrap().record(
+                    self.scheduler.as_mut(), assembly_params, index,
+                )?;
+                let (assembly, vertices) = if let Some(predicate) = &predicate {
+                    geometry.record_conditional_inputs(
+                        self.scheduler.as_mut(), self._staging_pool.as_mut(),
+                        &self.conditional_arguments_pass,
+                        &predicate.buffer, predicate.offset, predicate.inverted,
+                        &assembly, draw_params.base_instance, &vertex_sizes, bind_resources,
+                    )?
+                } else {
+                    let vertices = geometry.vertex.record(
+                        self.scheduler.as_mut(), &assembly, draw_params.base_instance,
+                        &vertex_sizes, bind_resources,
+                    )?;
+                    (assembly, vertices)
+                };
+                let captured = geometry.capture_output(self.scheduler.as_mut(), &assembly, &vertices, &prepared.geometry)?;
+                (Some((assembly, vertices, captured)), None)
+            }
         } else {
-            None
+            (None, None)
         };
 
-        let conditional_draw = if geometry_inputs.is_none() {
+        let conditional_draw = if geometry_inputs.is_none() && tessellation_inputs.is_none() {
             if let Some(predicate) = &predicate {
-                let (source, source_offset, stride, count, layout) = if let Some(fan) = &fan_draw {
-                    (Arc::clone(&fan.arguments), 0, 20, 1, ConditionalArgumentLayout::DrawIndexed)
-                } else if let Some(binding) = indirect_binding.as_ref().filter(|b| !b.params.is_byte_count) {
-                    (Arc::clone(&binding.buffer), binding.offset, binding.params.stride as u32,
-                        binding.draw_count, if binding.params.is_indexed {
-                            ConditionalArgumentLayout::DrawIndexed
-                        } else { ConditionalArgumentLayout::Draw })
-                } else {
-                    let words = if draw_params.is_indexed {
+                let direct_words = if fan_draw.is_none()
+                    && !indirect_binding.as_ref().is_some_and(|b| !b.params.is_byte_count)
+                {
+                    Some(if draw_params.is_indexed {
                         [draw_params.num_vertices, draw_params.num_instances, draw_params.first_index,
                             draw_params.base_vertex as u32, draw_params.base_instance]
                     } else {
                         [draw_params.num_vertices, draw_params.num_instances,
                             draw_params.base_vertex.max(0) as u32, draw_params.base_instance, 0]
+                    })
+                } else { None };
+                let batched = if let Some(words) = direct_words {
+                    self.conditional_direct_arguments.append(
+                        &self.conditional_arguments_pass, self.scheduler.as_mut(),
+                        self._staging_pool.as_mut(), predicate, words,
+                    )?
+                } else { None };
+                if let Some((buffer, offset)) = batched {
+                    Some(MetalConditionalDrawArguments {
+                        buffer, offset, count: 1,
+                        layout: if draw_params.is_indexed { ConditionalArgumentLayout::DrawIndexed }
+                            else { ConditionalArgumentLayout::Draw },
+                    })
+                } else {
+                    let (source, source_offset, stride, count, layout) = if let Some(fan) = &fan_draw {
+                        (Arc::clone(&fan.arguments), 0, 20, 1, ConditionalArgumentLayout::DrawIndexed)
+                    } else if let Some(binding) = indirect_binding.as_ref().filter(|b| !b.params.is_byte_count) {
+                        (Arc::clone(&binding.buffer), binding.offset, binding.params.stride as u32,
+                            binding.draw_count, if binding.params.is_indexed {
+                                ConditionalArgumentLayout::DrawIndexed
+                            } else { ConditionalArgumentLayout::Draw })
+                    } else {
+                        let words = direct_words.expect("direct conditional arguments");
+                        let layout = if draw_params.is_indexed { ConditionalArgumentLayout::DrawIndexed }
+                            else { ConditionalArgumentLayout::Draw };
+                        let source = self._staging_pool.request_upload_buffer(
+                            self.scheduler.as_mut(), layout.byte_size(), false,
+                        )?;
+                        source.buffer.write(source.offset, &bytemuck::cast_slice(&words)[..layout.byte_size()])?;
+                        (source.buffer, source.offset, layout.byte_size() as u32, 1, layout)
                     };
-                    let layout = if draw_params.is_indexed { ConditionalArgumentLayout::DrawIndexed }
-                        else { ConditionalArgumentLayout::Draw };
-                    let source = self._staging_pool.request_upload_buffer(
-                        self.scheduler.as_mut(), layout.byte_size(), false,
+                    let arguments = self.conditional_arguments_pass.resolve(
+                        self.scheduler.as_mut(), self._staging_pool.as_mut(),
+                        &predicate.buffer, predicate.offset, predicate.inverted,
+                        &source, source_offset, stride, count, layout,
                     )?;
-                    source.buffer.write(source.offset, &bytemuck::cast_slice(&words)[..layout.byte_size()])?;
-                    (source.buffer, source.offset, layout.byte_size() as u32, 1, layout)
-                };
-                let arguments = self.conditional_arguments_pass.resolve(
-                    self.scheduler.as_mut(), self._staging_pool.as_mut(),
-                    &predicate.buffer, predicate.offset, predicate.inverted,
-                    &source, source_offset, stride, count, layout,
-                )?;
-                Some(MetalConditionalDrawArguments { arguments, layout, count })
+                    Some(MetalConditionalDrawArguments {
+                        buffer: arguments.buffer, offset: arguments.offset, layout, count,
+                    })
+                }
             } else { None }
         } else { None };
 
@@ -975,6 +1062,8 @@ impl MetalRasterizer {
             .begin_or_reuse_render_pass(&render_pass, render_pass_key)?;
         self.update_viewports_state(draw)?;
         self.update_scissors_state(draw, render_area)?;
+        self.scheduler.profile_graphics_draw(stages.key().unique_hashes);
+        self.texture_cache.mark_render_target_contents_modified(u32::MAX, depth_key.may_write_depth_stencil());
         self.scheduler.with_render_encoder(|encoder| {
             MetalQueryCache::configure_draw(encoder, visibility_query);
             encoder.setRenderPipelineState(&pipeline_state);
@@ -1017,7 +1106,13 @@ impl MetalRasterizer {
             if let Some((assembly, vertices, captured)) = &geometry_inputs {
                 bind_stage(encoder, &prepared.fragment, false);
                 return geometry_pipeline.as_ref().unwrap().record_draw(encoder, assembly, vertices,
-                    &prepared.geometry, captured.as_ref());
+                    &prepared.geometry, captured.as_ref()).map_err(MetalRasterizerError::from);
+            }
+            if let Some(inputs) = &tessellation_inputs {
+                bind_stage(encoder, &prepared.evaluation, true);
+                bind_stage(encoder, &prepared.fragment, false);
+                return tessellation_pipeline.as_ref().unwrap().record_draw(encoder, inputs)
+                    .map_err(MetalRasterizerError::from);
             }
             bind_stage(encoder, &prepared.vertex, true);
             bind_stage(encoder, &prepared.fragment, false);
@@ -1040,7 +1135,7 @@ impl MetalRasterizer {
 
                 if let Some(conditional) = &conditional_draw {
                     for command in 0..conditional.count as usize {
-                        let offset = conditional.arguments.offset + command * conditional.layout.byte_size();
+                        let offset = conditional.offset + command * conditional.layout.byte_size();
                         match conditional.layout {
                             ConditionalArgumentLayout::DrawIndexed => {
                                 let (buffer, index_offset, index_type, primitive) = if let Some(fan) = &fan_draw {
@@ -1051,12 +1146,12 @@ impl MetalRasterizer {
                                 };
                                 encoder.drawIndexedPrimitives_indexType_indexBuffer_indexBufferOffset_indirectBuffer_indirectBufferOffset(
                                     primitive, index_type, buffer.handle(), index_offset,
-                                    conditional.arguments.buffer.handle(), offset,
+                                    conditional.buffer.handle(), offset,
                                 );
                             }
                             ConditionalArgumentLayout::Draw => {
                                 encoder.drawPrimitives_indirectBuffer_indirectBufferOffset(
-                                    primitive_type, conditional.arguments.buffer.handle(), offset,
+                                    primitive_type, conditional.buffer.handle(), offset,
                                 );
                             }
                             ConditionalArgumentLayout::Dispatch => unreachable!("raster arguments only"),
@@ -1271,6 +1366,7 @@ impl MetalRasterizer {
             (source_width, source_height)
         };
         let conditional_arguments = self.conditional_quad_arguments()?;
+        self.texture_cache.mark_render_target_contents_modified(u32::MAX, false);
         self.blit_image.blit_color_with_sampler(
             self.scheduler.as_mut(),
             &render_pass,
@@ -1370,6 +1466,8 @@ impl MetalRasterizer {
         if !color_present && !depth_present && !stencil_present {
             return Ok(());
         }
+        self.texture_cache.mark_render_target_contents_modified(
+            if color_present { 1 << color_attachment } else { 0 }, depth_present || stencil_present);
         let color_format = color_present.then(|| {
             crate::surface::pixel_format_from_render_target_format(
                 render_targets.render_targets[color_attachment].format,
@@ -1475,13 +1573,17 @@ impl MetalRasterizer {
             }
         }
         for layer in 0..layer_count.max(1) {
-            let render_pass = {
+            let (render_pass, render_pass_key) = {
                 let framebuffer = self.texture_cache.base.get_framebuffer()?;
-                framebuffer.render_pass_descriptor_for_layer(clear_layer + layer)
+                (
+                    framebuffer.render_pass_descriptor_for_layer(clear_layer + layer),
+                    framebuffer.render_pass_key_for_layer(clear_layer + layer),
+                )
             };
             self.blit_image.clear_attachments(
                 self.scheduler.as_mut(),
                 &render_pass,
+                render_pass_key,
                 signature,
                 color_present.then_some(color_attachment as u8),
                 color_type,
@@ -1581,7 +1683,7 @@ impl MetalRasterizer {
             if prepared.samplers_in_argument_buffer {
                 self.scheduler.retain_sampler_states(prepared.samplers.iter().map(|s| s.sampler.clone()))?;
             }
-            self.scheduler.with_compute_encoder(|encoder| unsafe {
+            self.scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::Guest, |encoder| unsafe {
                 encoder.setComputePipelineState(&pipeline_state);
                 bind_compute_resources(encoder, &prepared);
                 encoder.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
@@ -1602,7 +1704,7 @@ impl MetalRasterizer {
         if prepared.samplers_in_argument_buffer {
             self.scheduler.retain_sampler_states(prepared.samplers.iter().map(|s| s.sampler.clone()))?;
         }
-        self.scheduler.with_compute_encoder(|encoder| {
+        self.scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::Guest, |encoder| {
             encoder.setComputePipelineState(&pipeline_state);
             bind_compute_resources(encoder, &prepared);
             encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -1658,8 +1760,20 @@ impl MetalRasterizer {
     }
 
     pub fn tick_frame(&mut self) {
-        self.texture_cache.tick_frame();
-        self.common_buffer_cache.tick_frame();
+        // Match RasterizerVulkan::TickFrame's separate cache critical sections;
+        // CPU invalidation can retire resources while the GPU advances frames.
+        {
+            let mutex: *const _ = &self.texture_cache.base.mutex;
+            // SAFETY: the cache stays in place and the guard only protects its
+            // interior state; no cache mutation moves or replaces the mutex.
+            let _guard = unsafe { (*mutex).lock() };
+            self.texture_cache.tick_frame();
+        }
+        {
+            let mutex = Arc::clone(&self.common_buffer_cache.mutex);
+            let _guard = mutex.lock();
+            self.common_buffer_cache.tick_frame();
+        }
     }
 
     pub fn finish(&mut self) -> Result<(), MetalRasterizerError> {
@@ -2181,19 +2295,14 @@ fn patch_render_area(
 ) {
     let words = [render_area.0 as f32, render_area.1 as f32, 0.0, 0.0];
     let bytes = bytemuck::cast_slice::<f32, u8>(&words);
-    if stages.stage_infos()[0].uses_render_area {
-        if let Some((_, data)) = prepared.vertex.push_constants.as_mut() {
-            data[..16].copy_from_slice(bytes);
-        }
-    }
-    if stages.stage_infos()[4].uses_render_area {
-        if let Some((_, data)) = prepared.fragment.push_constants.as_mut() {
-            data[..16].copy_from_slice(bytes);
-        }
-    }
-    if stages.stage_infos()[3].uses_render_area {
-        if let Some((_, data)) = prepared.geometry.push_constants.as_mut() {
-            data[..16].copy_from_slice(bytes);
+    for (info, stage) in stages.stage_infos().iter().zip([
+        &mut prepared.vertex, &mut prepared.control, &mut prepared.evaluation,
+        &mut prepared.geometry, &mut prepared.fragment,
+    ]) {
+        if info.uses_render_area {
+            if let Some((_, data)) = stage.push_constants.as_mut() {
+                data[..16].copy_from_slice(bytes);
+            }
         }
     }
 }

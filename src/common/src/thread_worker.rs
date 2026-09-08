@@ -186,7 +186,13 @@ impl<S: Send + 'static> StatefulThreadWorker<S> {
 
 impl<S: Send + 'static> Drop for StatefulThreadWorker<S> {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Release);
+        {
+            // Unlike Eden's stop-token-aware condition_variable_any, Rust's
+            // Condvar needs stop publication serialized with the wait predicate.
+            // Release this mutex before joining: workers reacquire it on wakeup.
+            let _queue = self.shared.queue.lock().unwrap();
+            self.shared.stop.store(true, Ordering::Release);
+        }
         self.shared.condition.notify_all();
         for handle in self.threads.drain(..) {
             let _ = handle.join();
@@ -226,6 +232,56 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
+
+    #[test]
+    fn drop_serializes_stop_with_the_wait_predicate() {
+        // No real worker is needed: holding its predicate mutex models the
+        // interval between checking stop and atomically entering Condvar::wait.
+        let worker = ThreadWorker::new_stateless(0, "stop-predicate".to_string());
+        let shared = Arc::clone(&worker.shared);
+        let queue = shared.queue.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            drop(worker);
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let finished_while_locked = done_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        let stop_while_locked = shared.stop.load(Ordering::Acquire);
+        drop(queue);
+        dropper.join().unwrap();
+        assert!(
+            !finished_while_locked,
+            "stop notification bypassed the predicate mutex"
+        );
+        assert!(
+            !stop_while_locked,
+            "stop changed during the wait predicate check"
+        );
+        assert!(shared.stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn immediate_drop_joins_starting_workers() {
+        let stopped = Arc::new(AtomicUsize::new(0));
+        struct State(Arc<AtomicUsize>);
+        impl Drop for State {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Release);
+            }
+        }
+        for _ in 0..64 {
+            let stopped = Arc::clone(&stopped);
+            drop(StatefulThreadWorker::new(
+                2,
+                "starting-worker".to_string(),
+                move || State(Arc::clone(&stopped)),
+            ));
+        }
+        assert_eq!(stopped.load(Ordering::Acquire), 128);
+    }
 
     #[test]
     fn test_stateless_worker() {

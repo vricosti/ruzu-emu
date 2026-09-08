@@ -18,7 +18,7 @@ use super::configure_dialog::Page;
 use super::shared_widget as w;
 
 /// Build the Debug sub-tab — upstream `ConfigureDebug`.
-pub fn page() -> Page {
+pub fn page(runtime_lock: bool) -> Page {
     let (scroller, column) = w::page();
 
     // --- Row 1: "Debugger" | "Logging" ------------------------------------
@@ -49,6 +49,7 @@ pub fn page() -> Page {
         "Show Log in Console",
         crate::uisettings::with(|v| *v.show_console.get_value()),
     );
+    show_console.set_sensitive(runtime_lock);
     logging.append(&show_console);
     let extended_logging = w::check_row(
         "Enable Extended Logging**",
@@ -65,6 +66,7 @@ pub fn page() -> Page {
     let (homebrew_group, homebrew) = w::group("Homebrew");
     let program_args_value = common::settings::values().program_args.get_value().clone();
     let (args_row, program_args) = w::entry_row("Arguments String", &program_args_value);
+    program_args.set_sensitive(runtime_lock);
     homebrew.append(&args_row);
     column.append(&homebrew_group);
 
@@ -135,6 +137,7 @@ pub fn page() -> Page {
         &dump_macros,
         &disable_macro_hle,
     ] {
+        check.set_sensitive(runtime_lock);
         graphics.append(check);
     }
     columns.append(&graphics_group);
@@ -190,6 +193,7 @@ pub fn page() -> Page {
         "Enable FS Access Log",
         *common::settings::values().enable_fs_access_log.get_value(),
     );
+    fs_access_log.set_sensitive(runtime_lock);
     let reporting_services = w::check_row(
         "Enable Verbose Reporting Services**",
         *common::settings::values().reporting_services.get_value(),

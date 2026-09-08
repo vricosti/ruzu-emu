@@ -162,7 +162,7 @@ impl ConfigureDialog {
                     configure_hotkeys::page(),
                     configure_ui::page(),
                     configure_web::page(),
-                    configure_debug_tab::page(),
+                    configure_debug_tab::page(runtime_lock),
                 ],
                 apply: apply_pages,
             },

@@ -2291,6 +2291,25 @@ mod tests {
     }
 
     #[test]
+    fn frame_time_recording_round_trips_through_debug_configuration() {
+        const CHILD: &str = "RUZU_TEST_FRAME_TIME_CONFIG";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::tests::frame_time_recording_round_trips_through_debug_configuration"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        for enabled in [false, true] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            common::settings::values_mut().record_frame_times = enabled;
+            config.save_debugging_values();
+            common::settings::values_mut().record_frame_times = !enabled;
+            config.read_debugging_values();
+            assert_eq!(common::settings::values().record_frame_times, enabled);
+        }
+    }
+
+    #[test]
     fn frontend_identity_fields_survive_configuration_round_trip() {
         let mut values = common::settings::Values::default();
         values.serial_unit.set_value(u32::MAX);

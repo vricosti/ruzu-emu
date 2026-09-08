@@ -1,10 +1,9 @@
-//! Port of zuyu/src/core/perf_stats.h and zuyu/src/core/perf_stats.cpp
-//! Status: COMPLET
-//! Derniere synchro: 2026-03-05
+//! Counterpart of Eden's core/perf_stats.{h,cpp}.
 //!
 //! Performance statistics tracker (FPS, frame times, emulation speed).
 
 use parking_lot::Mutex;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -36,7 +35,7 @@ pub struct PerfStats {
     /// Atomic for cross-thread access without lock.
     game_frames: AtomicU32,
     /// Title ID for the game that is running. 0 if there is no game running yet.
-    _title_id: u64,
+    title_id: u64,
 }
 
 struct PerfStatsInner {
@@ -72,7 +71,11 @@ impl PerfStats {
         Self {
             inner: Mutex::new(PerfStatsInner {
                 current_index: 0,
-                perf_history: Box::new([0.0; PERF_HISTORY_SIZE]),
+                // Avoid materializing the 1.7 MiB history on the Rust stack.
+                perf_history: vec![0.0; PERF_HISTORY_SIZE]
+                    .into_boxed_slice()
+                    .try_into()
+                    .unwrap(),
                 reset_point: now,
                 reset_point_system_us: Duration::ZERO,
                 accumulated_frametime: Duration::ZERO,
@@ -83,7 +86,7 @@ impl PerfStats {
                 previous_fps: 0.0,
             }),
             game_frames: AtomicU32::new(0),
-            _title_id: title_id,
+            title_id,
         }
     }
 
@@ -179,6 +182,84 @@ impl PerfStats {
     }
 }
 
+impl Drop for PerfStats {
+    fn drop(&mut self) {
+        if !common::settings::values().record_frame_times || self.title_id == 0 {
+            return;
+        }
+        let result = (|| -> io::Result<()> {
+            let timestamp = unsafe { libc::time(std::ptr::null_mut()) };
+            let filename = frame_time_filename(self.title_id, timestamp)?;
+            let directory =
+                common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::LogDir);
+            std::fs::create_dir_all(&directory)?;
+            let mut file = io::BufWriter::new(std::fs::File::create(directory.join(filename))?);
+            let inner = self.inner.get_mut();
+            let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+            // Upstream intends to skip warm-up frames; a reversed iterator
+            // range when fewer than five frames ran must not become Rust UB.
+            for &duration in inner
+                .perf_history
+                .get(IGNORE_FRAMES..inner.current_index)
+                .unwrap_or(&[])
+            {
+                write!(file, "{}{newline}", format_frame_time(duration))?;
+            }
+            file.flush()
+        })();
+        if let Err(error) = result {
+            log::error!("Could not save frame time history: {error}");
+        }
+    }
+}
+
+// Destructor's local timestamp formatting, with thread-safe libc conversion
+// instead of std::localtime's shared buffer. No guest RTC or timezone is used.
+fn frame_time_filename(title_id: u64, timestamp: libc::time_t) -> io::Result<String> {
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
+    let valid = unsafe { !libc::localtime_r(&timestamp, &mut local).is_null() };
+    #[cfg(windows)]
+    let valid = unsafe { libc::localtime_s(&mut local, &timestamp) == 0 };
+    #[cfg(not(any(unix, windows)))]
+    let valid = false;
+    if !valid {
+        return Err(io::Error::other("local time conversion failed"));
+    }
+    Ok(format!(
+        "{:04}-{:02}-{:02}-{:02}-{:02}_{title_id:016X}.csv",
+        local.tm_year + 1900,
+        local.tm_mon + 1,
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min
+    ))
+}
+
+// ostream_iterator<double> uses defaultfloat with six significant digits.
+// Keep that CSV representation rather than Rust Display's full precision.
+fn format_frame_time(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string().to_ascii_lowercase();
+    }
+    let scientific = format!("{value:.5e}");
+    let (mantissa, exponent) = scientific.split_once('e').unwrap();
+    let exponent: i32 = exponent.parse().unwrap();
+    if !(-4..6).contains(&exponent) {
+        format!(
+            "{}e{exponent:+03}",
+            mantissa.trim_end_matches('0').trim_end_matches('.')
+        )
+    } else {
+        let fixed = format!("{value:.precision$}", precision = (5 - exponent) as usize);
+        if fixed.contains('.') {
+            fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
+        } else {
+            fixed
+        }
+    }
+}
+
 /// Speed limiter for single-core mode.
 pub struct SpeedLimiter {
     /// Emulated system time (in microseconds) at the last limiter invocation
@@ -245,5 +326,106 @@ impl SpeedLimiter {
 impl Default for SpeedLimiter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_numbers_match_default_stream_precision() {
+        for (value, expected) in [
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (16.6666666, "16.6667"),
+            (0.001234567, "0.00123457"),
+            (0.0001, "0.0001"),
+            (0.00001234567, "1.23457e-05"),
+            (999999.5, "1e+06"),
+            (100000.0, "100000"),
+            (12345678.0, "1.23457e+07"),
+        ] {
+            assert_eq!(format_frame_time(value), expected);
+        }
+    }
+
+    #[test]
+    fn frame_time_export_obeys_setting_and_skips_warmup() {
+        const CHILD: &str = "RUZU_TEST_FRAME_TIME_EXPORT";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "perf_stats::tests::frame_time_export_obeys_setting_and_skips_warmup"
+                ])
+                .env(CHILD, "1")
+                .env("TZ", "UTC")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        use common::fs::path_util::{set_ruzu_path, RuzuPath};
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("ruzu-frame-times-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        set_ruzu_path(RuzuPath::LogDir, &directory);
+        common::settings::values_mut().record_frame_times = false;
+        drop(PerfStats::new(42)); // Synthetic identifier, not an installed title.
+        common::settings::values_mut().record_frame_times = true;
+        drop(PerfStats::new(0));
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        assert_eq!(
+            frame_time_filename(42, 1_709_210_096).unwrap(),
+            "2024-02-29-12-34_000000000000002A.csv"
+        );
+
+        common::settings::values_mut().record_frame_times = false;
+        let mut stats = PerfStats::new(42);
+        let inner = stats.inner.get_mut();
+        inner.current_index = 7;
+        inner.perf_history[..7].copy_from_slice(&[
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            16.6666666,
+            0.001234567,
+        ]);
+        // Polling FPS must not clear the historical data exported on teardown.
+        stats.get_and_reset_stats(Duration::from_micros(100));
+        common::settings::values_mut().record_frame_times = true;
+        drop(stats);
+        let path = std::fs::read_dir(&directory)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with("_000000000000002A.csv"));
+        let csv = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(csv.lines().collect::<Vec<_>>(), ["16.6667", "0.00123457"]);
+        std::fs::remove_file(path).unwrap();
+        drop(PerfStats::new(43)); // A short/failed boot produces no sample rows.
+        let path = std::fs::read_dir(&directory)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(std::fs::read(path).unwrap().is_empty());
+        common::settings::values_mut().record_frame_times = false;
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

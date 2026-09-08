@@ -1,6 +1,4 @@
-//! Port of zuyu/src/core/reporter.h and zuyu/src/core/reporter.cpp
-//! Status: COMPLET
-//! Derniere synchro: 2026-03-11
+//! Counterpart of Eden's core/reporter.{h,cpp}.
 //!
 //! Reporter class for saving telemetry/crash/error reports as JSON files.
 //! Reports are written to the log directory under type-specific subdirectories.
@@ -38,35 +36,31 @@ pub struct Reporter {
 // --- Private helper functions (matching anonymous namespace in C++) ---
 
 fn get_timestamp() -> String {
-    let now = chrono_like_timestamp();
-    now
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    timestamp_at(now).unwrap_or_else(|| "unknown-time".to_owned())
 }
 
-/// Simple timestamp generation without requiring the chrono crate.
-fn chrono_like_timestamp() -> String {
-    use std::time::SystemTime;
-
-    let duration = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-
-    // Convert to a simple date-time string
-    // This is a simplified version; a real implementation would use proper time formatting
-    let hours = (secs / 3600) % 24;
-    let minutes = (secs / 60) % 60;
-    let seconds = secs % 60;
-    let days = secs / 86400;
-    // Approximate date calculation (not fully accurate but functional)
-    let years = 1970 + days / 365;
-    let remaining_days = days % 365;
-    let months = remaining_days / 30 + 1;
-    let day = remaining_days % 30 + 1;
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}",
-        years, months, day, hours, minutes, seconds
-    )
+// GetTimestamp's local-time conversion, split only to test calendar boundaries.
+// Reentrant libc APIs avoid the shared std::localtime buffer used in C++.
+fn timestamp_at(timestamp: libc::time_t) -> Option<String> {
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
+    let valid = unsafe { !libc::localtime_r(&timestamp, &mut local).is_null() };
+    #[cfg(windows)]
+    let valid = unsafe { libc::localtime_s(&mut local, &timestamp) == 0 };
+    #[cfg(not(any(unix, windows)))]
+    let valid = false;
+    valid.then(|| {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}",
+            local.tm_year + 1900,
+            local.tm_mon + 1,
+            local.tm_mday,
+            local.tm_hour,
+            local.tm_min,
+            local.tm_sec,
+        )
+    })
 }
 
 fn get_path(report_type: &str, title_id: u64, timestamp: &str) -> PathBuf {
@@ -448,5 +442,53 @@ impl Reporter {
 impl Default for Reporter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_timestamp_uses_real_local_calendar() {
+        const CHILD: &str = "RUZU_TEST_REPORT_TIMESTAMP";
+        if std::env::var_os(CHILD).is_none() {
+            for zone in ["UTC", "EST5"] {
+                assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "reporter::tests::report_timestamp_uses_real_local_calendar"
+                    ])
+                    .env(CHILD, "1")
+                    .env("TZ", zone)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            return;
+        }
+        if std::env::var("TZ").unwrap() == "UTC" {
+            assert_eq!(
+                timestamp_at(1_709_210_096).as_deref(),
+                Some("2024-02-29T12-34-56")
+            );
+            assert_eq!(
+                timestamp_at(1_767_225_599).as_deref(),
+                Some("2025-12-31T23-59-59")
+            );
+            assert_eq!(
+                timestamp_at(1_767_225_600).as_deref(),
+                Some("2026-01-01T00-00-00")
+            );
+        } else {
+            assert_eq!(
+                timestamp_at(1_709_210_096).as_deref(),
+                Some("2024-02-29T07-34-56")
+            );
+            assert_eq!(
+                timestamp_at(1_767_225_600).as_deref(),
+                Some("2025-12-31T19-00-00")
+            );
+        }
     }
 }

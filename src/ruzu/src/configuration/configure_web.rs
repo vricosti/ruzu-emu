@@ -27,19 +27,11 @@ pub fn page() -> Page {
     consent.set_wrap(true);
     service.append(&consent);
 
-    let username = common::settings::values().yuzu_username.get_value().clone();
-    let username_label = gtk::Label::new(Some(&format!(
-        "Username: {}",
-        if username.is_empty() {
-            "Unspecified".to_string()
-        } else {
-            username
-        }
-    )));
-    username_label.set_xalign(0.0);
-    service.append(&username_label);
+    let username_value = common::settings::values().eden_username.get_value().clone();
+    let (username_row, username) = w::entry_row("Username:", &username_value);
+    service.append(&username_row);
 
-    let token_value = common::settings::values().yuzu_token.get_value().clone();
+    let token_value = common::settings::values().eden_token.get_value().clone();
     let (token_row, token) = w::entry_row("Token:", &token_value);
     // Upstream sets `QLineEdit::Password` echo mode on the token field.
     token.set_visibility(false);
@@ -107,7 +99,8 @@ pub fn page() -> Page {
         let token_text = token.text().to_string();
         let telemetry_enabled = share.is_active();
         let mut values = common::settings::values_mut();
-        values.yuzu_token.set_value(token_text);
+        values.eden_username.set_value(username.text().to_string());
+        values.eden_token.set_value(token_text);
         values.enable_telemetry.set_value(telemetry_enabled);
     })
 }
@@ -117,4 +110,46 @@ pub fn page() -> Page {
 /// from whatever the real store eventually holds.
 fn current_telemetry_id() -> u64 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone in its own test process"]
+    fn web_page_edits_frontend_identity_without_overwriting_legacy_credentials() {
+        gtk::init().expect("GTK display required");
+        {
+            let mut values = common::settings::values_mut();
+            values.eden_username.set_value("InitialUser".into());
+            values.eden_token.set_value("a".repeat(48));
+            values.yuzu_username.set_value("LegacyUser".into());
+            values.yuzu_token.set_value("legacy-token".into());
+        }
+        fn entries(widget: &gtk::Widget, output: &mut Vec<gtk::Entry>) {
+            if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                output.push(entry.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                entries(&widget, output);
+            }
+        }
+        let page = page();
+        let mut edits = Vec::new();
+        entries(&page.widget, &mut edits);
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].text(), "InitialUser");
+        assert_eq!(edits[1].text(), "a".repeat(48));
+        edits[0].set_text("LocalUser");
+        edits[1].set_text(&"b".repeat(48));
+        (page.apply)();
+        let values = common::settings::values();
+        assert_eq!(values.eden_username.get_value(), "LocalUser");
+        assert_eq!(values.eden_token.get_value(), &"b".repeat(48));
+        assert_eq!(values.yuzu_username.get_value(), "LegacyUser");
+        assert_eq!(values.yuzu_token.get_value(), "legacy-token");
+    }
 }

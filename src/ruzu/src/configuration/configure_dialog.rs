@@ -173,7 +173,7 @@ impl ConfigureDialog {
                     configure_profile_manager::page(runtime_lock),
                     configure_network::page(),
                     configure_filesystem::page(),
-                    configure_applets::page(),
+                    configure_applets::page(runtime_lock),
                 ],
                 apply: apply_pages,
             },

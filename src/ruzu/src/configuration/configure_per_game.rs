@@ -100,7 +100,7 @@ impl ConfigurePerGame {
             configure_audio::page(runtime_lock),
             configure_input_per_game::page(hid_core),
             configure_network::page(),
-            configure_applets::page(),
+            configure_applets::page(runtime_lock),
         ];
 
         let window = gtk::Window::builder()

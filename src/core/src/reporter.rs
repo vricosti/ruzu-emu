@@ -17,8 +17,9 @@ use common::settings;
 pub enum PlayReportType {
     Old = 0,
     Old2 = 1,
-    New = 2,
-    System = 3,
+    Old3 = 2,
+    New = 3,
+    System = 4,
 }
 
 /// Reporter for generating and saving various report types.
@@ -83,8 +84,17 @@ fn save_to_file(json: &serde_json::Value, filename: &PathBuf) {
 
     match fs::File::create(filename) {
         Ok(mut file) => {
-            let json_str = serde_json::to_string_pretty(json).unwrap_or_default();
-            if let Err(e) = file.write_all(json_str.as_bytes()) {
+            let mut bytes = Vec::new();
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+            let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, formatter);
+            if let Err(e) = serde::Serialize::serialize(json, &mut serializer) {
+                log::error!("Failed to serialize report '{}': {}", filename.display(), e);
+                return;
+            }
+            bytes.push(b'\n'); // std::setw(4) << json << std::endl upstream.
+            #[cfg(windows)]
+            let bytes = String::from_utf8(bytes).unwrap().replace('\n', "\r\n").into_bytes();
+            if let Err(e) = file.write_all(&bytes) {
                 log::error!("Failed to write report to '{}': {}", filename.display(), e);
             }
         }
@@ -258,7 +268,7 @@ impl Reporter {
         });
 
         if let Some(buf) = resolved_buffer {
-            break_out["debug_buffer"] = serde_json::Value::String(hex::encode(buf));
+            break_out["debug_buffer"] = serde_json::Value::String(hex::encode_upper(buf));
         }
 
         out["svc_break"] = break_out;
@@ -296,9 +306,9 @@ impl Reporter {
             "system_tick": format!("{:016X}", system_tick),
         });
 
-        let normal_out: Vec<String> = normal_channel.iter().map(|d| hex::encode(d)).collect();
+        let normal_out: Vec<String> = normal_channel.iter().map(|d| hex::encode_upper(d)).collect();
         let interactive_out: Vec<String> =
-            interactive_channel.iter().map(|d| hex::encode(d)).collect();
+            interactive_channel.iter().map(|d| hex::encode_upper(d)).collect();
 
         out["applet_normal_data"] = serde_json::to_value(normal_out).unwrap_or_default();
         out["applet_interactive_data"] = serde_json::to_value(interactive_out).unwrap_or_default();
@@ -328,7 +338,7 @@ impl Reporter {
         out["yuzu_version"] = get_ruzu_version_data();
         out["report_common"] = get_report_common_data(title_id, 0, &timestamp, user_id);
 
-        let data_out: Vec<String> = data.iter().map(|d| hex::encode(d)).collect();
+        let data_out: Vec<String> = data.iter().map(|d| hex::encode_upper(d)).collect();
 
         if let Some(pid) = process_id {
             out["play_report_process_id"] = serde_json::Value::String(format!("{:016X}", pid));
@@ -448,6 +458,48 @@ impl Default for Reporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_payloads_preserve_hex_case_and_empty_channels() {
+        const CHILD: &str = "RUZU_TEST_REPORT_PAYLOADS";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "reporter::tests::diagnostic_payloads_preserve_hex_case_and_empty_channels"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        use common::fs::path_util::{set_ruzu_path, RuzuPath};
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("ruzu-report-data-{}-{nonce}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        set_ruzu_path(RuzuPath::LogDir, &directory);
+        let sdmc = directory.join("sdmc");
+        fs::create_dir(&sdmc).unwrap();
+        set_ruzu_path(RuzuPath::SDMCDir, &sdmc);
+        let read_report = |kind: &str| -> serde_json::Value {
+            let files: Vec<_> = fs::read_dir(directory.join(kind)).unwrap().map(|e| e.unwrap().path()).collect();
+            assert_eq!(files.len(), 1);
+            let bytes = fs::read(&files[0]).unwrap();
+            let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+            assert!(bytes.starts_with(format!("{{{newline}    \"").as_bytes()));
+            assert!(bytes.ends_with(newline.as_bytes()));
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        settings::values_mut().reporting_services.set_value(false);
+        let reporter = Reporter::new();
+        reporter.save_svc_break_report(42, 0, false, 0, 0, Some(&[0xAB]));
+        assert!(!directory.join("svc_break_report").exists());
+        settings::values_mut().reporting_services.set_value(true);
+        reporter.save_svc_break_report(42, 0, false, 0, 0, Some(&[0xAB, 0xCD]));
+        assert_eq!(read_report("svc_break_report")["svc_break"]["debug_buffer"], "ABCD");
+        reporter.save_unimplemented_applet_report(42, 0, 0, 0, 0, false, 0,
+            &[vec![0xEF], vec![]], &[vec![0xAB, 0xCD]]);
+        let report = read_report("unimpl_applet_report");
+        assert_eq!(report["applet_normal_data"], serde_json::json!(["EF", ""]));
+        assert_eq!(report["applet_interactive_data"], serde_json::json!(["ABCD"]));
+        settings::values_mut().reporting_services.set_value(false);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn report_timestamp_uses_real_local_calendar() {

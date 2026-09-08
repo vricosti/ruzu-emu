@@ -2865,6 +2865,18 @@ impl System {
             .expect("shared_process_memory not set")
     }
 
+    /// Counterpart of System::GetApplicationProcessProgramID. The application
+    /// process is owned here in Rust rather than by KernelCore. Do not use
+    /// current_process_arc(): an IPC worker can have another current process.
+    pub fn get_application_process_program_id(&self) -> u64 {
+        self.current_process_arc
+            .as_ref()
+            .expect("application process is not loaded")
+            .lock()
+            .unwrap()
+            .get_program_id()
+    }
+
     /// Get the runtime program ID.
     pub fn runtime_program_id(&self) -> u64 {
         self.runtime_program_id

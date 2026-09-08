@@ -2250,6 +2250,47 @@ mod tests {
     }
 
     #[test]
+    fn debug_persistence_keeps_auto_stub_but_not_session_diagnostics() {
+        for enabled in [false, true] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            config.begin_group("Debugging");
+            let mut source = common::settings::Values::default();
+            source.use_auto_stub.set_value(enabled);
+            config.write_setting_generic(&mut source.use_auto_stub);
+            assert_eq!(
+                config.ini["Debugging"]["use_auto_stub"],
+                enabled.to_string(),
+            );
+            let mut loaded = common::settings::Values::default();
+            config.read_setting_generic(&mut loaded.use_auto_stub);
+            assert_eq!(*loaded.use_auto_stub.get_value(), enabled);
+
+            // These four settings deliberately have save=false upstream.
+            for setting in [
+                &mut source.extended_logging,
+                &mut source.reporting_services,
+                &mut source.dump_guest_shaders,
+                &mut source.dump_macros,
+            ] {
+                setting.set_value(true);
+                config.write_setting_generic(setting);
+                assert!(!config.ini["Debugging"].contains_key(setting.label()));
+                config.write_raw(setting.label(), "true".to_string());
+                config.write_raw(&format!("{}\\default", setting.label()), "false".to_string());
+                setting.set_value(false);
+                config.read_setting_generic(setting);
+                assert!(!*setting.get_value(), "{} must ignore stale INI entries", setting.label());
+            }
+        }
+        let mut custom = BaseConfig::new(ConfigType::PerGameConfig);
+        custom.load_ini("[Debugging]\nuse_auto_stub\\default=false\nuse_auto_stub=true\n");
+        custom.begin_group("Debugging");
+        let mut values = common::settings::Values::default();
+        custom.read_setting_generic(&mut values.use_auto_stub);
+        assert!(!*values.use_auto_stub.get_value());
+    }
+
+    #[test]
     fn file_logging_options_use_upstream_keys_and_defaults() {
         for flush in [false, true] {
             for censor in [false, true] {

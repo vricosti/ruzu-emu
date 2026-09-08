@@ -8,9 +8,9 @@
 // "Homebrew" group below them, then three side-by-side columns — "Graphics",
 // "Advanced" and "Debugging" — and finally the reset note.
 //
-// The `**`-suffixed labels are upstream's marker for settings that
-// `ConfigureDebug::ApplyConfiguration` resets on exit, explained by the trailing
-// note.
+// The `**`-suffixed labels mark session-only settings: their save=false
+// metadata excludes them from configuration persistence. Apply does not reset
+// them; a fresh process starts with their defaults.
 
 use gtk::prelude::*;
 
@@ -195,7 +195,7 @@ pub fn page(runtime_lock: bool) -> Page {
             .get_value(),
     );
     let auto_stub = w::check_row(
-        "Enable Auto-Stub**",
+        "Enable Auto-Stub",
         *common::settings::values().use_auto_stub.get_value(),
     );
     for check in [
@@ -400,6 +400,8 @@ mod tests {
         let gpu_dumps = find_switch(&page.widget, "Dump SPIR-V Shaders").unwrap();
         let flush_line = find_switch(&page.widget, "Flush log output on each line").unwrap();
         let censor_username = find_switch(&page.widget, "Censor username in logs").unwrap();
+        let auto_stub = find_switch(&page.widget, "Enable Auto-Stub").unwrap();
+        assert!(!auto_stub.is_active());
         assert!(!flush_line.is_active());
         assert!(censor_username.is_active());
         assert_eq!(gpu_level.selected(), 2);
@@ -430,12 +432,14 @@ mod tests {
             gpu_dumps.set_active(index % 2 == 0);
             flush_line.set_active(index % 2 == 0);
             censor_username.set_active(index % 2 != 0);
+            auto_stub.set_active(index % 2 != 0);
             (page.apply)();
             let values = common::settings::values();
             assert_eq!(*values.gpu_log_level.get_value() as u32, index);
             assert_eq!(*values.gpu_log_shader_dumps.get_value(), index % 2 == 0);
             assert_eq!(*values.log_flush_line.get_value(), index % 2 == 0);
             assert_eq!(*values.censor_username.get_value(), index % 2 != 0);
+            assert_eq!(*values.use_auto_stub.get_value(), index % 2 != 0);
         }
         log::info!("after_apply_visible");
         common::logging::backend::stop();

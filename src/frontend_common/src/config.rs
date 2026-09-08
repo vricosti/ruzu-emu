@@ -2269,6 +2269,16 @@ mod tests {
             assert_eq!(config.ini["Debugging"]["enable_fs_access_log"], enabled.to_string());
             config.read_setting_generic(&mut loaded.enable_fs_access_log);
             assert_eq!(*loaded.enable_fs_access_log.get_value(), enabled);
+            for (source, loaded) in [
+                (&mut source.quest_flag, &mut loaded.quest_flag),
+                (&mut source.disable_web_applet, &mut loaded.disable_web_applet),
+            ] {
+                source.set_value(enabled);
+                config.write_setting_generic(source);
+                assert_eq!(config.ini["Debugging"][source.label()], enabled.to_string());
+                config.read_setting_generic(loaded);
+                assert_eq!(*loaded.get_value(), enabled);
+            }
 
             // These four settings deliberately have save=false upstream.
             for setting in [
@@ -2297,6 +2307,13 @@ mod tests {
         custom.write_raw("enable_fs_access_log\\default", "false".into());
         custom.read_setting_generic(&mut values.enable_fs_access_log);
         assert!(!*values.enable_fs_access_log.get_value());
+        for setting in [&mut values.quest_flag, &mut values.disable_web_applet] {
+            let original = *setting.get_value();
+            custom.write_raw(setting.label(), (!original).to_string());
+            custom.write_raw(&format!("{}\\default", setting.label()), "false".into());
+            custom.read_setting_generic(setting);
+            assert_eq!(*setting.get_value(), original);
+        }
     }
 
     #[test]

@@ -562,6 +562,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quest_flag_ipc_reflects_live_global_setting() {
+        const CHILD: &str = "RUZU_TEST_QUEST_FLAG";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::service::set::settings_server::tests::quest_flag_ipc_reflects_live_global_setting"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        let server = ISettingsServer::new();
+        let handler = &server.handlers[&commands::GET_QUEST_FLAG];
+        assert_eq!(handler.name, "GetQuestFlag");
+        for enabled in [false, true, false] {
+            common::settings::values_mut().quest_flag.set_value(enabled);
+            let mut ctx = HLERequestContext::new();
+            ctx.command_buffer_mut().fill(u32::MAX);
+            handler.handler_callback.unwrap()(&server, &mut ctx);
+            assert_eq!(ctx.command_buffer()[6], 0);
+            assert_eq!(ctx.command_buffer()[7], 0);
+            assert_eq!(ctx.command_buffer()[8], u32::from(enabled));
+            assert!(ctx.command_buffer()[9..].iter().all(|&word| word == 0));
+        }
+    }
+
+    #[test]
     fn test_get_language_code() {
         let old_language = *common::settings::values().language_index.get_value();
         common::settings::values_mut()

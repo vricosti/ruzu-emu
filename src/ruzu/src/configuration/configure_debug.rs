@@ -184,9 +184,9 @@ pub fn page(runtime_lock: bool) -> Page {
         "Perform Startup Vulkan Check",
         *common::settings::values().perform_vulkan_check.get_value(),
     );
-    // Upstream ships without the web applet compiled in, so this row is a
-    // permanently-disabled placeholder reading "Web applet not compiled".
-    let web_applet = w::check_row("Web applet not compiled", false);
+    // Match ConfigureDebug without YUZU_USE_QT_WEB_ENGINE: checked and disabled,
+    // then persist disable_web_applet=true when applying the page.
+    let web_applet = w::check_row("Web applet not compiled", true);
     web_applet.set_sensitive(false);
     let all_controllers = w::check_row(
         "Enable All Controller Types",
@@ -313,6 +313,7 @@ pub fn page(runtime_lock: bool) -> Page {
             .set_value(disable_macro_hle.is_active());
 
         values.quest_flag.set_value(quest_flag.is_active());
+        values.disable_web_applet.set_value(web_applet.is_active());
         values.use_dev_keys.set_value(use_dev_keys.is_active());
         values.cpu_debug_mode.set_value(cpu_debug_mode.is_active());
         values
@@ -407,6 +408,7 @@ mod tests {
             values.gpu_log_shader_dumps.set_value(true);
             values.serial_battery.set_value(12345);
             values.serial_unit.set_value(98765);
+            values.disable_web_applet.set_value(false);
         }
         let locked_page = page(false);
         assert!(!find_switch(&locked_page.widget, "Enable FS Access Log").unwrap().is_sensitive());
@@ -418,6 +420,12 @@ mod tests {
         let flush_line = find_switch(&page.widget, "Flush log output on each line").unwrap();
         let censor_username = find_switch(&page.widget, "Censor username in logs").unwrap();
         let auto_stub = find_switch(&page.widget, "Enable Auto-Stub").unwrap();
+        let quest_flag = find_switch(&page.widget, "Kiosk (Quest) Mode").unwrap();
+        let web_applet = find_switch(&page.widget, "Web applet not compiled").unwrap();
+        assert!(!quest_flag.is_active());
+        assert!(web_applet.is_active());
+        assert!(!web_applet.is_sensitive());
+        assert!(find_switch(&locked_page.widget, "Kiosk (Quest) Mode").unwrap().is_sensitive());
         let fs_access_log = find_switch(&page.widget, "Enable FS Access Log").unwrap();
         assert!(!fs_access_log.is_active());
         assert!(fs_access_log.is_sensitive());
@@ -458,6 +466,7 @@ mod tests {
             flush_line.set_active(index % 2 == 0);
             censor_username.set_active(index % 2 != 0);
             auto_stub.set_active(index % 2 != 0);
+            quest_flag.set_active(index % 2 != 0);
             fs_access_log.set_active(index % 2 != 0);
             battery.set_text(serial_cases[index as usize].0);
             unit.set_text(serial_cases[4 - index as usize].0);
@@ -468,6 +477,8 @@ mod tests {
             assert_eq!(*values.log_flush_line.get_value(), index % 2 == 0);
             assert_eq!(*values.censor_username.get_value(), index % 2 != 0);
             assert_eq!(*values.use_auto_stub.get_value(), index % 2 != 0);
+            assert_eq!(*values.quest_flag.get_value(), index % 2 != 0);
+            assert!(*values.disable_web_applet.get_value());
             assert_eq!(*values.enable_fs_access_log.get_value(), index % 2 != 0);
             assert_eq!(*values.serial_battery.get_value(), serial_cases[index as usize].1);
             assert_eq!(*values.serial_unit.get_value(), serial_cases[4 - index as usize].1);

@@ -295,6 +295,21 @@ fn level_from_log(level: log::Level) -> Level {
 }
 
 fn class_from_target(target: &str) -> Class {
+    // Default Rust targets are module paths, not upstream logging classes.
+    // Keep the original target intact for RUST_LOG, and translate only modules
+    // whose corresponding C++ file uses a single class for its log calls.
+    // Do not infer a class for whole crates: key_manager.cpp and cubeb_sink.cpp,
+    // for example, deliberately use multiple classes in the same file.
+    match target {
+        // core/arm/dynarmic/arm_dynarmic_{32,64}.cpp: Core_ARM
+        "core::arm::dynarmic::arm_dynarmic_32"
+        | "core::arm::dynarmic::arm_dynarmic_64" => return Class::Core_ARM,
+        // core/loader/{nro,nso}.cpp: Loader
+        "core::loader::nro" | "core::loader::nso" => return Class::Loader,
+        // video_core/renderer_vulkan/vk_rasterizer.cpp: Render_Vulkan
+        "video_core::renderer_vulkan::vk_rasterizer" => return Class::Render_Vulkan,
+        _ => {}
+    }
     let normalized = target.replace("::", ".").replace('_', ".");
     Class::from_name(target)
         .or_else(|| Class::from_name(&normalized))
@@ -515,6 +530,28 @@ mod tests {
             Class::Render_OpenGL
         );
         assert_eq!(class_from_target("unknown_target"), Class::Log);
+    }
+
+    #[test]
+    fn audited_module_targets_use_their_upstream_classes() {
+        let cases = [
+            ("core::arm::dynarmic::arm_dynarmic_32", Class::Core_ARM),
+            ("core::arm::dynarmic::arm_dynarmic_64", Class::Core_ARM),
+            ("core::loader::nro", Class::Loader),
+            ("core::loader::nso", Class::Loader),
+            ("video_core::renderer_vulkan::vk_rasterizer", Class::Render_Vulkan),
+        ];
+        for (target, class) in cases {
+            assert_eq!(class_from_target(target), class);
+            let mut filter = Filter::new(Level::Critical);
+            filter.set_class_level(class, Level::Debug);
+            assert!(filter.check_message(class_from_target(target), Level::Debug));
+            assert!(!filter.check_message(Class::Log, Level::Debug));
+            // Prefix collisions must not accidentally extend this audited set.
+            assert_eq!(class_from_target(&format!("{target}_other")), Class::Log);
+        }
+        assert_eq!(class_from_target("core::crypto::key_manager"), Class::Log);
+        assert_eq!(class_from_target("audio_core::sink::cubeb_sink"), Class::Log);
     }
 
     #[test]

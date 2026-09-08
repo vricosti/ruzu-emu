@@ -91,25 +91,24 @@ pub fn make_cbuf_key(index: u32, offset: u32) -> u64 {
 
 fn stage_to_prefix(stage: ShaderStage) -> &'static str {
     match stage {
-        ShaderStage::VertexB => "VB",
-        ShaderStage::TessellationControl => "TC",
-        ShaderStage::TessellationEval => "TE",
-        ShaderStage::Geometry => "GS",
-        ShaderStage::Fragment => "FS",
-        ShaderStage::Compute => "CS",
-        ShaderStage::VertexA => "VA",
+        ShaderStage::VertexB => "vs",
+        ShaderStage::TessellationControl => "tc",
+        ShaderStage::TessellationEval => "te",
+        ShaderStage::Geometry => "gs",
+        ShaderStage::Fragment => "fs",
+        ShaderStage::Compute => "cs",
+        ShaderStage::VertexA => "va",
     }
 }
 
 fn dump_impl(
-    pipeline_hash: u64,
+    _pipeline_hash: u64,
     shader_hash: u64,
     code: &[u64],
     initial_offset: u32,
     stage: ShaderStage,
 ) {
-    let shader_dir = get_ruzu_path(RuzuPath::DumpDir);
-    let base_dir = shader_dir.join("shaders");
+    let base_dir = get_ruzu_path(RuzuPath::DumpDir);
     if let Err(error) = fs::create_dir_all(&base_dir) {
         log::error!(
             "Failed to create shader dump directories {}: {}",
@@ -119,8 +118,9 @@ fn dump_impl(
         return;
     }
     let prefix = stage_to_prefix(stage);
+    let program_id = common::settings::get_current_program_id();
     let path = base_dir.join(format!(
-        "{pipeline_hash:016x}_{prefix}_{shader_hash:016x}.ash"
+        "{program_id:016x}_{shader_hash:016x}_{prefix}.ash"
     ));
     let initial_offset = initial_offset as usize;
     if initial_offset % INST_SIZE != 0 || initial_offset > code.len() * INST_SIZE {
@@ -2182,6 +2182,76 @@ mod tests {
     use crate::memory_manager::MemoryManager;
     use parking_lot::Mutex as ParkingLotMutex;
     use std::sync::Mutex;
+
+    #[test]
+    fn shader_dumps_match_program_names_offsets_and_disassembler_padding() {
+        const ROOT: &str = "RUZU_TEST_SHADER_DUMP_ROOT";
+        let root = match std::env::var_os(ROOT) {
+            Some(root) => std::path::PathBuf::from(root),
+            None => {
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                let root = std::env::temp_dir().join(format!(
+                    "ruzu-shader-dump-{}-{nonce}", std::process::id()
+                ));
+                fs::create_dir(&root).unwrap();
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", std::thread::current().name().unwrap()])
+                    .env(ROOT, &root).status().unwrap();
+                fs::remove_dir_all(&root).unwrap();
+                assert!(status.success());
+                return;
+            }
+        };
+        common::fs::path_util::set_ruzu_path(RuzuPath::DumpDir, &root);
+        for (stage, prefix) in [
+            (ShaderStage::VertexA, "va"),
+            (ShaderStage::VertexB, "vs"),
+            (ShaderStage::TessellationControl, "tc"),
+            (ShaderStage::TessellationEval, "te"),
+            (ShaderStage::Geometry, "gs"),
+            (ShaderStage::Fragment, "fs"),
+            (ShaderStage::Compute, "cs"),
+        ] {
+            for (words, initial_offset) in (0..=5usize)
+                .flat_map(|words| [0, 8, 0x50].map(|offset| (words, offset)))
+            {
+                let hash = 0xA0 + words as u64;
+                let mut generic = GenericEnvironment::new();
+                generic.stage = stage;
+                generic.initial_offset = initial_offset;
+                generic.code = vec![0xFFFF_FFFF_FFFF_FFFF; initial_offset as usize / 8];
+                generic.code.extend((0..words).map(|i| 0x0123_4567_89AB_CD00 + i as u64));
+                let mut expected: Vec<u8> = generic.code[initial_offset as usize / 8..].iter()
+                    .flat_map(|word| word.to_ne_bytes()).collect();
+                // At least one terminating instruction, then pad to a 32-byte bundle.
+                expected.resize((words / 4 + 1) * 32, 0);
+                common::settings::set_current_program_id(42);
+                generic.dump(0x1111, hash);
+                let path = root.join(format!("000000000000002a_{hash:016x}_{prefix}.ash"));
+                assert_eq!(fs::read(&path).unwrap(), expected);
+
+                let mut cached = FileEnvironment::new();
+                cached.stage = stage;
+                cached.initial_offset = generic.initial_offset;
+                cached.code = generic.code.clone();
+                // Changing pipeline does not change the filename or create a duplicate.
+                cached.dump(0x2222, hash);
+                assert_eq!(fs::read(&path).unwrap(), expected);
+                common::settings::set_current_program_id(43);
+                cached.dump(0x2222, hash);
+                assert_eq!(
+                    fs::read(root.join(format!("000000000000002b_{hash:016x}_{prefix}.ash"))).unwrap(),
+                    expected
+                );
+            }
+        }
+        assert!(!root.join("shaders").exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 7 * 6 * 2);
+        dump_impl(0, 0xFF, &[1], 1, ShaderStage::Compute);
+        dump_impl(0, 0xFF, &[1], 16, ShaderStage::Compute);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 7 * 6 * 2);
+    }
 
     #[test]
     fn read_texture_info_limit_assert_is_fail_soft_like_upstream() {

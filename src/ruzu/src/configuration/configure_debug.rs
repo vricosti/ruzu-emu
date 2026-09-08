@@ -423,6 +423,9 @@ mod tests {
         let macro_jit = find_switch(&page.widget, "Disable Macro JIT").unwrap();
         let macro_hle = find_switch(&page.widget, "Disable Macro HLE").unwrap();
         let macro_dump = find_switch(&page.widget, "Dump Maxwell Macros").unwrap();
+        let guest_shaders = find_switch(&page.widget, "Dump Game Shaders").unwrap();
+        assert!(!guest_shaders.is_active());
+        assert!(!find_switch(&locked_page.widget, "Dump Game Shaders").unwrap().is_sensitive());
         assert!(!macro_jit.is_active() && !macro_hle.is_active() && !macro_dump.is_active());
         let gpu_level = find_gpu_level(&page.widget).unwrap();
         let gpu_dumps = find_switch(&page.widget, "Dump SPIR-V Shaders").unwrap();
@@ -503,6 +506,7 @@ mod tests {
             macro_jit.set_active(index % 2 == 0);
             macro_hle.set_active(index % 2 != 0);
             macro_dump.set_active(index % 2 == 0);
+            guest_shaders.set_active(index % 2 != 0);
             gpu_level.set_selected(index);
             gpu_dumps.set_active(index % 2 == 0);
             flush_line.set_active(index % 2 == 0);
@@ -518,6 +522,7 @@ mod tests {
             assert_eq!(*values.disable_macro_jit.get_value(), index % 2 == 0);
             assert_eq!(*values.disable_macro_hle.get_value(), index % 2 != 0);
             assert_eq!(*values.dump_macros.get_value(), index % 2 == 0);
+            assert_eq!(*values.dump_guest_shaders.get_value(), index % 2 != 0);
             assert_eq!(*values.gpu_log_level.get_value() as u32, index);
             assert_eq!(*values.gpu_log_shader_dumps.get_value(), index % 2 == 0);
             assert_eq!(*values.log_flush_line.get_value(), index % 2 == 0);

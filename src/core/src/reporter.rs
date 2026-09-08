@@ -109,14 +109,15 @@ fn save_to_file(json: &serde_json::Value, filename: &PathBuf) {
 }
 
 fn get_ruzu_version_data() -> serde_json::Value {
+    use common::scm_rev;
     serde_json::json!({
-        "scm_rev": env!("CARGO_PKG_VERSION"),
-        "scm_branch": "unknown",
-        "scm_desc": "ruzu",
-        "build_name": "ruzu",
-        "build_date": "unknown",
-        "build_fullname": "ruzu",
-        "build_version": env!("CARGO_PKG_VERSION"),
+        "scm_rev": scm_rev::SCM_REV,
+        "scm_branch": scm_rev::SCM_BRANCH,
+        "scm_desc": scm_rev::SCM_DESC,
+        "build_name": scm_rev::BUILD_NAME,
+        "build_date": scm_rev::BUILD_DATE,
+        "build_fullname": scm_rev::BUILD_FULLNAME,
+        "build_version": scm_rev::BUILD_VERSION,
     })
 }
 
@@ -497,6 +498,21 @@ impl Default for Reporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_identity_comes_from_shared_build_metadata() {
+        use common::scm_rev;
+        let report = get_ruzu_version_data();
+        assert_eq!(report.as_object().unwrap().len(), 7);
+        for (name, expected) in [
+            ("scm_rev", scm_rev::SCM_REV), ("scm_branch", scm_rev::SCM_BRANCH),
+            ("scm_desc", scm_rev::SCM_DESC), ("build_name", scm_rev::BUILD_NAME),
+            ("build_date", scm_rev::BUILD_DATE), ("build_fullname", scm_rev::BUILD_FULLNAME),
+            ("build_version", scm_rev::BUILD_VERSION),
+        ] {
+            assert_eq!(report[name], expected);
+        }
+    }
 
     #[test]
     fn unimplemented_report_captures_request_and_only_input_buffer_data() {

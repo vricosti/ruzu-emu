@@ -17,6 +17,9 @@ toml.workspace = true
 fastrand.workspace = true
 env_filter = "1.0"
 
+[build-dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["libloaderapi"] }
 windows-sys = { version = "0.61", features = [

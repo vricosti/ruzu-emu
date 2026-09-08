@@ -59,7 +59,9 @@ pub fn split_path(full_path: &str) -> Option<(String, String, String)> {
         return None;
     }
 
-    let dir_end = full_path.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let dir_end = full_path
+        .rfind(|c| c == '/' || (cfg!(windows) && matches!(c, '\\' | ':')))
+        .map(|i| i + 1).unwrap_or(0);
 
     let fname_end = full_path
         .rfind('.')
@@ -170,6 +172,19 @@ mod tests {
         assert_eq!(path, "/home/user/");
         assert_eq!(name, "file");
         assert_eq!(ext, ".txt");
+    }
+
+    #[test]
+    fn split_path_respects_host_directory_separators() {
+        let (directory, filename, extension) = split_path(r"C:\homebrew\demo.nro").unwrap();
+        if cfg!(windows) {
+            assert_eq!(directory, "C:\\homebrew\\");
+            assert_eq!(filename, "demo");
+        } else {
+            assert_eq!(directory, "");
+            assert_eq!(filename, r"C:\homebrew\demo");
+        }
+        assert_eq!(extension, ".nro");
     }
 
     #[test]

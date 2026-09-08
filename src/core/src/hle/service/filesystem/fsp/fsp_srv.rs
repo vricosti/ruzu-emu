@@ -13,7 +13,7 @@ use crate::file_sys::patch_manager::PatchManager;
 use crate::file_sys::registered_cache::ContentProviderUnion;
 use crate::file_sys::romfs_factory::StorageId;
 use crate::file_sys::vfs::vfs_types::VirtualFile;
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -637,8 +637,10 @@ impl FspSrv {
             "FspSrv::OpenDataStorageByDataId trace: romfs_present={}",
             data.is_some()
         );
-        let nca =
-            controller.and_then(|c| c.open_base_nca(title_id, storage_id, ContentRecordType::Data));
+        // Upstream does not open the base NCA on the missing-data fallback.
+        let nca = data.as_ref().and_then(|_| {
+            controller.and_then(|c| c.open_base_nca(title_id, storage_id, ContentRecordType::Data))
+        });
         log::info!(
             "FspSrv::OpenDataStorageByDataId trace: nca_present={}",
             nca.is_some()
@@ -682,7 +684,7 @@ impl FspSrv {
             "FspSrv::OpenDataStorageByDataId: no data for title_id={:#x}, returning error",
             title_id
         );
-        Self::push_error_with_null_interface(ctx, RESULT_TARGET_NOT_FOUND.raw());
+        Self::push_error_with_null_interface(ctx, RESULT_UNKNOWN.get_inner_value());
     }
 
     fn open_patch_data_storage_by_current_process_handler(
@@ -848,6 +850,18 @@ impl ServiceFramework for FspSrv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_data_storage_returns_unknown_like_upstream() {
+        let service = FspSrv::new();
+        let mut ctx = HLERequestContext::new();
+        ctx.command_buffer_mut()[2] = StorageId::None as u32;
+        ctx.command_buffer_mut()[3] = 0;
+        ctx.command_buffer_mut()[4] = 42; // Synthetic, non-system title.
+        ctx.command_buffer_mut()[5] = 0;
+        service.handlers[&202].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], RESULT_UNKNOWN.get_inner_value());
+    }
 
     #[test]
     fn access_log_setting_and_ipc_preserve_modes_and_bytes() {

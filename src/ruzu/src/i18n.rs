@@ -437,6 +437,7 @@ mod tests {
         assert!(quickstart.contains("https://yuzu-mirror.github.io/help/quickstart/"));
         assert!(quickstart.contains("guide de démarrage rapide ruzu"));
         assert_eq!(tr("_File"), "_Fichier");
+        assert_eq!(tr("_Home Menu"), "Menu _HOME");
         assert_eq!(tr("About ruzu"), "À propos de ruzu");
         set_language("de");
         assert_eq!(tr("Annuler"), "Abbrechen");

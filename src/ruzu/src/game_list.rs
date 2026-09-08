@@ -48,18 +48,66 @@ use crate::main_window::StartGameType;
 use crate::uisettings::{self, GameDir};
 use crate::util::controller_navigation::{ControllerNavigation, NavigationKey};
 
-/// Pixel size of the game icon shown in the list.
-const ICON_SIZE: i32 = 64;
-
-/// Pixel size of the folder icon on a directory row.
-const FOLDER_ICON_SIZE: i32 = 48;
-
 /// Upstream's colorful-theme `folder`, `bad_folder` and `star` icons. Keep
 /// local copies so the game list does not depend on the host icon theme or the
 /// zuyu tree.
-const FOLDER_ICON_PNG: &[u8] = include_bytes!("../assets/game-list-folder.png");
-const BAD_FOLDER_ICON_PNG: &[u8] = include_bytes!("../assets/game-list-bad-folder.png");
-const FAVORITES_ICON_PNG: &[u8] = include_bytes!("../assets/game-list-star.png");
+const FOLDER_ICON_PNG: &[u8] = include_bytes!("../../../dist/qt_themes/colorful/icons/48x48/folder.png");
+const BAD_FOLDER_ICON_PNG: &[u8] = include_bytes!("../../../dist/qt_themes/colorful/icons/48x48/bad_folder.png");
+const FAVORITES_ICON_PNG: &[u8] = include_bytes!("../../../dist/qt_themes/colorful/icons/48x48/star.png");
+
+/// Eden's midnight icon QRC aliases qdarkstyle, while the colorful variants
+/// inherit colorful. Embed those assets instead of depending on Qt icon lookup.
+fn theme_icons(theme: &str) -> [&'static [u8]; 3] {
+    let internal = uisettings::THEMES.iter()
+        .find(|(name, internal)| *name == theme || *internal == theme)
+        .map(|(_, internal)| *internal).unwrap_or("colorful");
+    if matches!(internal, "qdarkstyle" | "qdarkstyle_midnight_blue") {
+        [include_bytes!("../../../dist/qt_themes/qdarkstyle/icons/48x48/folder.png"),
+         include_bytes!("../../../dist/qt_themes/qdarkstyle/icons/48x48/bad_folder.png"),
+         include_bytes!("../../../dist/qt_themes/qdarkstyle/icons/48x48/star.png")]
+    } else {
+        // Default retains the existing bundled fallback instead of requiring
+        // a desktop icon theme (not universally available on Windows).
+        [FOLDER_ICON_PNG, BAD_FOLDER_ICON_PNG, FAVORITES_ICON_PNG]
+    }
+}
+
+/// QIcon::fromTheme aliases from Eden's theme QRCs (add, refresh).
+fn toolbar_icons(theme: &str) -> [&'static [u8]; 2] {
+    let internal = uisettings::THEMES.iter()
+        .find(|(name, internal)| *name == theme || *internal == theme)
+        .map(|(_, internal)| *internal).unwrap_or("colorful");
+    let add: &[u8] = if matches!(internal, "qdarkstyle" | "qdarkstyle_midnight_blue") {
+        include_bytes!("../../../dist/qt_themes/qdarkstyle/icons/48x48/list-add.png")
+    } else {
+        include_bytes!("../../../dist/qt_themes/colorful/icons/48x48/list-add.png")
+    };
+    let refresh: &[u8] = match internal {
+        "qdarkstyle" | "qdarkstyle_midnight_blue" | "colorful_midnight_blue" =>
+            include_bytes!("../../../dist/qt_themes/qdarkstyle/icons/16x16/view-refresh.png"),
+        "colorful_dark" =>
+            include_bytes!("../../../dist/qt_themes/colorful_dark/icons/16x16/view-refresh.png"),
+        _ => include_bytes!("../../../dist/qt_themes/colorful/icons/16x16/view-refresh.png"),
+    };
+    [add, refresh]
+}
+
+fn update_toolbar_icons(add: &gtk::Image, refresh: &gtk::Image, theme: &str) {
+    let icons = toolbar_icons(theme);
+    for (image, bytes) in [(add, icons[0]), (refresh, icons[1])] {
+        image.set_pixel_size(16);
+        // pixel-size alone applies to named icons, not arbitrary paintables.
+        // Match Qt's toolbar icon extent without retaining the 48px source size.
+        let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+        let texture = (|| {
+            loader.write(bytes).ok()?;
+            loader.close().ok()?;
+            let pixbuf = loader.pixbuf()?.scale_simple(16, 16, gtk::gdk_pixbuf::InterpType::Bilinear)?;
+            Some(gdk::Texture::for_pixbuf(&pixbuf))
+        })();
+        image.set_paintable(texture.as_ref());
+    }
+}
 
 /// Icon shown on a filesystem directory row.
 ///
@@ -67,11 +115,12 @@ const FAVORITES_ICON_PNG: &[u8] = include_bytes!("../assets/game-list-star.png")
 /// (`qt_common/game_list/game_list_p.h`), which selects the icon from the
 /// directory's presence on disk:
 /// `icon_name = QFileInfo::exists(path) ? "folder" : "bad_folder";`
-fn folder_icon_png(path: &str) -> &'static [u8] {
+fn folder_icon_png(path: &str, theme: &str) -> &'static [u8] {
+    let icons = theme_icons(theme);
     if Path::new(path).exists() {
-        FOLDER_ICON_PNG
+        icons[0]
     } else {
-        BAD_FOLDER_ICON_PNG
+        icons[1]
     }
 }
 
@@ -278,7 +327,8 @@ impl GameEntry {
         let imp = obj.imp();
         *imp.name.borrow_mut() = path.to_owned();
         *imp.path.borrow_mut() = path.to_owned();
-        *imp.icon.borrow_mut() = embedded_icon(folder_icon_png(path));
+        *imp.icon.borrow_mut() = uisettings::with(|values|
+            embedded_icon(folder_icon_png(path, values.theme.get_value())));
         imp.is_folder.set(true);
         imp.is_favorites.set(false);
         imp.deep_scan.set(deep_scan);
@@ -291,7 +341,8 @@ impl GameEntry {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         *imp.name.borrow_mut() = crate::i18n::tr("Favorites");
-        *imp.icon.borrow_mut() = embedded_icon(FAVORITES_ICON_PNG);
+        *imp.icon.borrow_mut() = uisettings::with(|values|
+            embedded_icon(theme_icons(values.theme.get_value())[2]));
         imp.is_folder.set(true);
         imp.is_favorites.set(true);
         *imp.children.borrow_mut() = Some(children);
@@ -318,6 +369,20 @@ impl GameEntry {
 
     fn name(&self) -> String {
         self.imp().name.borrow().clone()
+    }
+
+    /// QtCommon GameListItemPath::data(DisplayRole), for the GTK tree view.
+    fn display_name(&self, first: u8, second: u8) -> String {
+        if self.is_folder() { return self.name(); }
+        let filename = common::string_util::split_path(&self.path())
+            .map(|(_, filename, _)| filename).unwrap_or_default();
+        let data = [filename, self.kind(), format!("{:#016x}", self.program_id()), self.name()];
+        // Invalid persisted indices must not panic during a list bind.
+        let row1 = data.get(first as usize).map(String::as_str).unwrap_or("");
+        match data.get(second as usize) {
+            Some(row2) if row1 != row2 => format!("{row1}\n    {row2}"),
+            _ => row1.to_owned(),
+        }
     }
     fn developer(&self) -> String {
         self.imp().developer.borrow().clone()
@@ -402,6 +467,8 @@ struct GameListView {
     on_create_shortcut: Rc<dyn Fn(u64, String, crate::util::game::ShortcutTarget)>,
     on_refresh: Rc<dyn Fn()>,
     refresh_button: gtk::Button,
+    add_directory_icon: gtk::Image,
+    refresh_icon: gtk::Image,
     runtime_lock: Rc<dyn Fn() -> bool>,
     property_dialog:
         RefCell<Option<Rc<crate::configuration::configure_per_game::ConfigurePerGame>>>,
@@ -613,9 +680,10 @@ pub fn build<
     // `Button::builder().label(..).icon_name(..)` is not additive — setting
     // `icon_name` replaces the label child — so build the icon+label row
     // explicitly.
-    let add_button = icon_label_button("list-add-symbolic", "Add Game Directory");
+    let (add_button, add_directory_icon) = icon_label_button("Add Game Directory");
+    let refresh_icon = gtk::Image::new();
     let refresh_button = gtk::Button::builder()
-        .icon_name("view-refresh-symbolic")
+        .child(&refresh_icon)
         .tooltip_text("Rescan game directories")
         .build();
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -675,6 +743,8 @@ pub fn build<
         on_create_shortcut,
         on_refresh,
         refresh_button: refresh_button.clone(),
+        add_directory_icon,
+        refresh_icon,
         runtime_lock: Rc::new(runtime_lock),
         property_dialog: RefCell::new(None),
         scan_generation: Arc::new(AtomicU64::new(0)),
@@ -801,14 +871,15 @@ pub fn build<
 }
 
 /// A button showing an icon beside a text label.
-fn icon_label_button(icon_name: &str, label: &str) -> gtk::Button {
+fn icon_label_button(label: &str) -> (gtk::Button, gtk::Image) {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    content.append(&gtk::Image::from_icon_name(icon_name));
+    let image = gtk::Image::new();
+    content.append(&image);
     content.append(&gtk::Label::new(Some(label)));
 
     let button = gtk::Button::new();
     button.set_child(Some(&content));
-    button
+    (button, image)
 }
 
 /// The centred call-to-action shown when no game directory is configured.
@@ -1309,9 +1380,10 @@ impl GameListView {
             let open_save_data = gio::SimpleAction::new("open-save-data", None);
             {
                 let view = Rc::downgrade(self);
+                let game_path = entry.path();
                 open_save_data.connect_activate(move |_, _| {
                     if let Some(view) = view.upgrade() {
-                        view.open_save_data_location(program_id);
+                        view.open_save_data_location(program_id, &game_path);
                     }
                 });
             }
@@ -1478,16 +1550,52 @@ impl GameListView {
         *self.property_dialog.borrow_mut() = Some(dialog);
     }
 
-    fn open_save_data_location(&self, program_id: u64) {
-        let root = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::NANDDir)
-            .join("user/save");
-        let title = format!("{program_id:016X}");
-        let found = find_directory_named(&root, &title, 4);
-        let path = found.unwrap_or_else(|| {
-            root.join("0000000000000000")
-                .join("00000000000000000000000000000000")
-                .join(title)
+    fn open_save_data_location(self: &Rc<Self>, program_id: u64, game_path: &str) {
+        // MainWindow::OnGameListOpenFolder reads patched control metadata first,
+        // then falls back to the selected file's control metadata.
+        let mut reader = MetadataReader::new();
+        let control = {
+            let controller = reader.controller.lock().unwrap();
+            let provider = reader.content_provider.lock().unwrap();
+            PatchManager::new(program_id, &controller, &*provider).get_control_metadata().0
+        };
+        let control = control.or_else(|| {
+            let file = ruzu_core::core::get_game_file_from_path(&reader.vfs, game_path)?;
+            let loader = get_loader(&mut reader.loader_system, file, program_id, 0)?;
+            let mut control = NACP::new();
+            (loader.read_control_data(&mut control) == ResultStatus::Success).then_some(control)
         });
+        let Some(control) = control else {
+            crate::gtk_compat::show_warning(self.parent_window().as_ref(),
+                "Error Opening Save Data Folder", "Unable to read the game's save data metadata.");
+            return;
+        };
+        if control.get_default_normal_save_size() > 0 {
+            let Some(parent) = self.parent_window() else { return; };
+            let view = Rc::downgrade(self);
+            crate::applets::profile_select::select_for_boot(&parent, &self.hid_core, move |index| {
+                let Some(index) = index else { return; };
+                let manager = ruzu_core::hle::service::acc::profile_manager::ProfileManager::new();
+                let Some(uuid) = manager.get_user(index) else { return; };
+                if let Some(view) = view.upgrade() { view.open_save_data_for_user(program_id, uuid); }
+            });
+        } else if control.get_device_save_data_size() > 0 {
+            self.open_save_data_for_user(program_id, 0);
+        } else {
+            crate::gtk_compat::show_warning(self.parent_window().as_ref(),
+                "Error Opening Save Data Folder", "This title does not declare save data.");
+        }
+    }
+
+    fn open_save_data_for_user(&self, program_id: u64, user: u128) {
+        let path = match save_data_location(program_id, user) {
+            Ok(path) => path,
+            Err(error) => {
+                crate::gtk_compat::show_warning(self.parent_window().as_ref(),
+                    "Error Opening Save Data Folder", &error.to_string());
+                return;
+            }
+        };
         if let Err(error) = std::fs::create_dir_all(&path) {
             log::error!(
                 "Failed to create save data directory {}: {error}",
@@ -1655,6 +1763,12 @@ impl GameListView {
     /// re-runs `GameListWorker` after the directory list changes.
     fn reload(&self) {
         self.update_column_visibility();
+        uisettings::with(|values| update_toolbar_icons(&self.add_directory_icon,
+            &self.refresh_icon, values.theme.get_value()));
+        // The favorites root is retained across rescans, unlike directory
+        // roots. Refresh its themed decoration before it is rebound as well.
+        *self.favorites_root.imp().icon.borrow_mut() = uisettings::with(|values|
+            embedded_icon(theme_icons(values.theme.get_value())[2]));
 
         // Rebuilding the store drops the selection; remember which directory
         // was picked so it can be restored afterwards.
@@ -2083,20 +2197,27 @@ fn make_name_column(on_context_menu: ContextMenuHandler) -> gtk::ColumnViewColum
             return;
         };
 
-        if entry.is_folder() {
-            picture.set_size_request(FOLDER_ICON_SIZE, FOLDER_ICON_SIZE);
-            picture.set_paintable(entry.icon().as_ref());
-        } else {
-            picture.set_size_request(ICON_SIZE, ICON_SIZE);
-            picture.set_paintable(entry.icon().as_ref());
-        }
-        label.set_label(&entry.name());
+        uisettings::with(|values| {
+            bind_name_cell(&entry, &picture, &label, values);
+        });
     });
 
     let column = gtk::ColumnViewColumn::new(Some(&crate::i18n::tr("Name")), Some(factory));
     column.set_expand(true);
     column.set_resizable(true);
     column
+}
+
+// Mechanical GTK factory binding, shared with the widget regression test.
+fn bind_name_cell(entry: &GameEntry, picture: &gtk::Picture, label: &gtk::Label,
+    values: &uisettings::Values) {
+    let size = if entry.is_folder() { *values.folder_icon_size.get_value() }
+        else { *values.game_icon_size.get_value() };
+    picture.set_size_request(size as i32, size as i32);
+    picture.set_visible(size != 0);
+    picture.set_paintable(entry.icon().as_ref());
+    label.set_label(&entry.display_name(*values.row_1_text_id.get_value(),
+        *values.row_2_text_id.get_value()));
 }
 
 /// Decode one of the embedded upstream game-list icons.
@@ -2208,23 +2329,17 @@ fn add_unavailable_action(
     actions.add_action(&action);
 }
 
-fn find_directory_named(root: &Path, name: &str, remaining_depth: usize) -> Option<PathBuf> {
-    if remaining_depth == 0 {
-        return None;
-    }
-    for entry in std::fs::read_dir(root).ok()?.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if path.file_name().and_then(|part| part.to_str()) == Some(name) {
-            return Some(path);
-        }
-        if let Some(found) = find_directory_named(&path, name, remaining_depth - 1) {
-            return Some(found);
-        }
-    }
-    None
+/// OnGameListOpenFolder's SaveDir + SaveDataFactory::GetFullPath composition.
+fn save_data_location(program_id: u64, user: u128) -> std::io::Result<PathBuf> {
+    use ruzu_core::file_sys::{savedata_factory::SaveDataFactory,
+        fs_save_data_types::{SaveDataSpaceId, SaveDataType}};
+    let root = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::SaveDir);
+    std::fs::create_dir_all(&root)?;
+    let dir = frontend_vfs().arc_open_directory(&root.to_string_lossy(), OpenMode::READ)
+        .ok_or_else(|| std::io::Error::other("Unable to open the save data directory"))?;
+    let relative = SaveDataFactory::get_full_path(0, &dir, SaveDataSpaceId::User,
+        SaveDataType::Account, program_id, [user as u64, (user >> 64) as u64], 0);
+    Ok(root.join(relative.trim_start_matches('/')))
 }
 
 /// Upstream `GMainWindow::OnGameListOpenDirectory`.
@@ -2777,6 +2892,129 @@ mod tests {
     use super::*;
 
     #[test]
+    fn save_folder_uses_configured_root_selected_user_and_existing_layout() {
+        const CHILD: &str = "RUZU_SAVE_FOLDER_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let saves = root.join("custom saves");
+            let nand = root.join("nand");
+            std::fs::create_dir_all(&saves).unwrap();
+            std::fs::create_dir_all(&nand).unwrap();
+            common::fs::path_util::set_ruzu_path(common::fs::path_util::RuzuPath::NANDDir, &nand);
+            common::fs::path_util::set_ruzu_path(common::fs::path_util::RuzuPath::SaveDir, &saves);
+            let user = 0x1234_u128;
+            let other = saves.join("user/save/0000000000000000/00000000000000000000000000005678/000000000000002A");
+            std::fs::create_dir_all(&other).unwrap();
+            assert_eq!(save_data_location(42, user).unwrap(), saves.join(
+                "user/save/0000000000000000/00000000000000000000000000001234/000000000000002A"));
+            assert_eq!(save_data_location(42, 0).unwrap(), saves.join(
+                "user/save/0000000000000000/00000000000000000000000000000000/000000000000002A"));
+            let uuid: String = user.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            let future = saves.join(format!("user/save/account/{uuid}/0000000000000200/0"));
+            std::fs::create_dir_all(&future).unwrap();
+            assert_eq!(save_data_location(0x201, user).unwrap(), future);
+            assert!(nand.read_dir().unwrap().next().is_none());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", std::thread::current().name().unwrap(), "--test-threads=1"])
+            .env(CHILD, root.path()).status().unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn toolbar_icons_follow_colorful_and_midnight_qrc_aliases() {
+        let colorful = toolbar_icons("colorful");
+        let dark = toolbar_icons("qdarkstyle");
+        assert_eq!(toolbar_icons("Midnight Blue"), dark);
+        let midnight_colorful = toolbar_icons("Midnight Blue Colorful");
+        assert_eq!(midnight_colorful[0], colorful[0]);
+        assert_eq!(midnight_colorful[1], dark[1]);
+        assert_ne!(colorful[0], dark[0]);
+        for (name, internal) in uisettings::THEMES {
+            assert_eq!(toolbar_icons(name), toolbar_icons(internal));
+            for bytes in toolbar_icons(internal) { assert!(embedded_icon(bytes).is_some()); }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn toolbar_images_rebind_to_each_theme_at_toolbar_size() {
+        gtk::init().unwrap();
+        let add = gtk::Image::new();
+        let refresh = gtk::Image::new();
+        for (name, _) in uisettings::THEMES {
+            update_toolbar_icons(&add, &refresh, name);
+            for image in [&add, &refresh] {
+                let paintable = image.paintable().unwrap();
+                assert_eq!(paintable.intrinsic_width(), 16);
+                assert_eq!(paintable.intrinsic_height(), 16);
+            }
+        }
+    }
+
+    #[test]
+    fn colorful_and_monochrome_directory_icons_follow_upstream_aliases() {
+        let colorful = theme_icons("colorful");
+        let monochrome = theme_icons("qdarkstyle");
+        for theme in ["Dark Colorful", "colorful_dark", "Midnight Blue Colorful", "colorful_midnight_blue"] {
+            assert_eq!(theme_icons(theme), colorful);
+        }
+        assert_eq!(theme_icons("Midnight Blue"), monochrome);
+        assert_eq!(theme_icons("qdarkstyle_midnight_blue"), monochrome);
+        for index in 0..3 {
+            assert_ne!(colorful[index], monochrome[index]);
+            assert!(embedded_icon(colorful[index]).is_some());
+            assert!(embedded_icon(monochrome[index]).is_some());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn recycled_name_cell_applies_icon_sizes_and_row_preferences() {
+        gtk::init().unwrap();
+        let entry = GameEntry::new_game("Homebrew", "", "", "NRO", "aarch64", "", "", "",
+            "/homebrew/demo.nro", None, 42);
+        let folder = GameEntry::new_folder("/homebrew", false, gio::ListStore::new::<GameEntry>());
+        let picture = gtk::Picture::new();
+        let label = gtk::Label::new(None);
+        let mut values = uisettings::Values::default();
+        values.row_1_text_id.set_value(3);
+        values.row_2_text_id.set_value(1);
+        for size in [32, 64, 128, 256, 0, 64] {
+            values.game_icon_size.set_value(size);
+            bind_name_cell(&entry, &picture, &label, &values);
+            assert_eq!(picture.width_request(), size as i32);
+            assert_eq!(picture.height_request(), size as i32);
+            assert_eq!(picture.is_visible(), size != 0);
+            assert_eq!(label.text(), "Homebrew\n    NRO");
+        }
+        values.folder_icon_size.set_value(72);
+        bind_name_cell(&folder, &picture, &label, &values);
+        assert_eq!(picture.width_request(), 72);
+        assert_eq!(label.text(), "/homebrew");
+        values.row_2_text_id.set_value(4);
+        bind_name_cell(&entry, &picture, &label, &values);
+        assert_eq!(picture.width_request(), 64);
+        assert_eq!(label.text(), "Homebrew");
+    }
+
+    #[test]
+    fn game_row_text_uses_selected_metadata_and_suppresses_duplicates() {
+        let entry = GameEntry::new_game("Homebrew", "", "", "NRO", "aarch64", "", "", "",
+            "/homebrew/demo.release.nro", None, 42);
+        assert_eq!(entry.display_name(0, 4), "demo.release");
+        assert_eq!(entry.display_name(1, 4), "NRO");
+        assert_eq!(entry.display_name(2, 4), "0x0000000000002a");
+        assert_eq!(entry.display_name(3, 0), "Homebrew\n    demo.release");
+        assert_eq!(entry.display_name(3, 3), "Homebrew");
+        assert_eq!(entry.display_name(3, 255), "Homebrew");
+        let folder = GameEntry::new_folder("/homebrew", false, gio::ListStore::new::<GameEntry>());
+        assert_eq!(folder.display_name(2, 0), "/homebrew");
+    }
+
+    #[test]
     fn context_menu_uses_traditional_nested_submenus() {
         assert_eq!(context_menu_flags(), gtk::PopoverMenuFlags::NESTED);
     }
@@ -2798,19 +3036,19 @@ mod tests {
         assert_ne!(FOLDER_ICON_PNG, BAD_FOLDER_ICON_PNG);
 
         let existing = make_temp_dir();
-        assert_eq!(folder_icon_png(existing.to_str().unwrap()), FOLDER_ICON_PNG);
+        assert_eq!(folder_icon_png(existing.to_str().unwrap(), "colorful"), FOLDER_ICON_PNG);
 
         let missing = existing.join("gone");
         assert!(!missing.exists());
         assert_eq!(
-            folder_icon_png(missing.to_str().unwrap()),
+            folder_icon_png(missing.to_str().unwrap(), "colorful"),
             BAD_FOLDER_ICON_PNG
         );
 
         // A directory that disappears after being registered switches icons.
         std::fs::remove_dir_all(&existing).unwrap();
         assert_eq!(
-            folder_icon_png(existing.to_str().unwrap()),
+            folder_icon_png(existing.to_str().unwrap(), "colorful"),
             BAD_FOLDER_ICON_PNG
         );
     }

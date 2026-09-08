@@ -48,6 +48,7 @@ pub fn present(
         input_subsystem,
         hid_core,
         profile_context,
+        None,
     );
 
     // Upstream's `ui->controllerLayout->addWidget(profile_widget)`. The Clear and

@@ -1683,6 +1683,7 @@ impl GMainWindow {
         window_action!("verify_installed_contents", on_verify_installed_contents);
         window_action!("load_amiibo", on_load_amiibo);
         window_action!("load_album", on_album);
+        window_action!("load_home_menu", on_home_menu);
         window_action!("load_mii_edit", on_mii_edit);
         window_action!("open_controller_menu", on_open_controller_menu);
         window_action!("migration_tool", on_migration_tool);
@@ -3047,6 +3048,18 @@ impl GMainWindow {
                 cabinet_mode,
                 use_global_configuration: false,
             },
+        );
+    }
+
+    fn on_home_menu(self: &Rc<Self>) {
+        use ruzu_core::hle::service::am::am_types::{AppletId, AppletProgramId};
+        // Eden's LaunchFirmwareApplet also uses LibraryAppletParameters for
+        // QLaunch; AppletManager handles its foreground/input setup separately.
+        self.launch_system_applet(
+            AppletProgramId::QLaunch,
+            AppletId::QLaunch,
+            "Home Menu",
+            None,
         );
     }
 
@@ -5528,6 +5541,13 @@ pub fn update_ui_theme() {
         return;
     };
 
+    // Restore desktop-owned values before CheckDarkMode samples the fallback
+    // theme name. Our previous Yaru-blue-dark override is not a system dark
+    // preference. GTK reset_property removes the application priority override,
+    // retaining live desktop settings (unlike caching the startup theme).
+    settings.reset_property("gtk-theme-name");
+    settings.reset_property("gtk-application-prefer-dark-theme");
+
     let theme = crate::uisettings::with(|v| v.theme.get_value().clone());
     let internal = crate::uisettings::THEMES
         .iter()
@@ -5557,10 +5577,33 @@ pub fn update_ui_theme() {
     }
     settings.set_gtk_application_prefer_dark_theme(dark);
     install_blue_accent_css();
+    install_ui_theme_css(internal);
     log::debug!(
         "UI theme '{internal}' resolved to {} mode",
         if dark { "dark" } else { "light" }
     );
+}
+
+thread_local! {
+    // A single replaceable provider: theme switches must not accumulate styles
+    // or leave the midnight palette installed when returning to Default/Dark.
+    static UI_THEME_CSS: std::cell::RefCell<Option<gtk::CssProvider>> = const { std::cell::RefCell::new(None) };
+}
+
+fn install_ui_theme_css(theme: &str) {
+    let Some(display) = gtk::gdk::Display::default() else { return; };
+    UI_THEME_CSS.with(|slot| {
+        if let Some(previous) = slot.borrow_mut().take() {
+            gtk::style_context_remove_provider_for_display(&display, &previous);
+        }
+        if matches!(theme, "qdarkstyle_midnight_blue" | "colorful_midnight_blue") {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_data(include_str!("../../../dist/qt_themes/qdarkstyle_midnight_blue/style.css"));
+            gtk::style_context_add_provider_for_display(&display, &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 2);
+            *slot.borrow_mut() = Some(provider);
+        }
+    });
 }
 
 /// Eden's Fusion selection colour, sampled from its configuration dialog.
@@ -5619,6 +5662,16 @@ fn reset_configuration_files(config_dir: &std::path::Path, cache_dir: &std::path
 #[cfg(test)]
 mod reset_configuration_tests {
     use super::reset_configuration_files;
+
+    #[test]
+    fn home_menu_is_registered_and_uses_firmware_applet_availability() {
+        assert!(super::MENU_ACTION_NAMES.contains(&"load_home_menu"));
+        assert!(super::APPLET_ACTIONS.contains(&"load_home_menu"));
+        assert!(!super::RUNNING_ACTIONS.contains(&"load_home_menu"));
+        assert!(super::MENU_UI.contains(
+            "<attribute name=\"action\">app.load_home_menu</attribute>"
+        ));
+    }
 
     #[test]
     fn cursor_hiding_requires_both_rendering_and_the_user_preference() {
@@ -5682,6 +5735,56 @@ mod reset_configuration_tests {
 #[cfg(test)]
 mod blue_accent_theme_tests {
     use super::blue_accent_theme_variant;
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn midnight_palette_is_valid_shared_and_removed_on_theme_change() {
+        use gtk::prelude::*;
+        gtk::init().unwrap();
+        let errors = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let provider = gtk::CssProvider::new();
+        let captured = errors.clone();
+        provider.connect_parsing_error(move |_, _, error| captured.borrow_mut().push(error.to_string()));
+        provider.load_from_data(include_str!("../../../dist/qt_themes/qdarkstyle_midnight_blue/style.css"));
+        assert!(errors.borrow().is_empty(), "{:?}", errors.borrow());
+        let window = gtk::Window::new();
+        for theme in ["Dark", "Midnight Blue", "Midnight Blue Colorful", "Default", "Midnight Blue", "Dark"] {
+            crate::uisettings::with_mut(|v| v.theme.set_value(theme.into()));
+            super::update_ui_theme();
+            let midnight = theme.starts_with("Midnight");
+            super::UI_THEME_CSS.with(|slot| assert_eq!(slot.borrow().is_some(), midnight));
+            if midnight {
+                assert_eq!(window.style_context().lookup_color("theme_bg_color"),
+                    Some(gtk::gdk::RGBA::parse("#19232D").unwrap()));
+                assert_eq!(window.style_context().lookup_color("theme_selected_bg_color"),
+                    Some(gtk::gdk::RGBA::parse("#1464A0").unwrap()));
+            }
+        }
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn default_theme_restores_desktop_after_forcing_dark() {
+        gtk::init().unwrap();
+        let settings = gtk::Settings::default().unwrap();
+        crate::uisettings::with_mut(|v| v.theme.set_value("Default".into()));
+        super::update_ui_theme();
+        let original_name = settings.gtk_theme_name();
+        let original_dark = settings.is_gtk_application_prefer_dark_theme();
+        for _ in 0..2 {
+            crate::uisettings::with_mut(|v| v.theme.set_value("Dark".into()));
+            super::update_ui_theme();
+            assert!(settings.is_gtk_application_prefer_dark_theme());
+            // Also exercise the fallback contamination independently of which
+            // desktop theme is installed on the test host.
+            settings.set_gtk_theme_name(Some("Yaru-blue-dark"));
+            crate::uisettings::with_mut(|v| v.theme.set_value("Default".into()));
+            super::update_ui_theme();
+            assert_eq!(settings.gtk_theme_name(), original_name);
+            assert_eq!(settings.is_gtk_application_prefer_dark_theme(), original_dark);
+        }
+    }
 
     #[test]
     fn yaru_uses_the_complete_blue_variant() {
@@ -5911,6 +6014,7 @@ const MENU_ACTION_NAMES: &[&str] = &[
     "load_cabinet_restorer",
     "load_cabinet_formatter",
     "load_album",
+    "load_home_menu",
     "load_mii_edit",
     "open_controller_menu",
     "migration_tool",
@@ -5964,6 +6068,7 @@ const RUNNING_ACTIONS: &[&str] = &[
 /// Menu actions that open a system applet, which upstream enables only when
 /// firmware is installed *and* no game is running — `applet_actions`.
 const APPLET_ACTIONS: &[&str] = &[
+    "load_home_menu",
     "load_album",
     "load_cabinet_nickname_owner",
     "load_cabinet_eraser",
@@ -6210,6 +6315,10 @@ const MENU_UI: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
             </item>
           </section>
         </submenu>
+        <item>
+          <attribute name="label" translatable="yes">_Home Menu</attribute>
+          <attribute name="action">app.load_home_menu</attribute>
+        </item>
         <item>
           <attribute name="label" translatable="yes">Open _Album</attribute>
           <attribute name="action">app.load_album</attribute>

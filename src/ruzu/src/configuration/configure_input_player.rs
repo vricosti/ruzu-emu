@@ -758,6 +758,7 @@ pub fn page(
     input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     profile_context: Rc<InputProfileContext>,
+    global: Option<&super::configure_input::GlobalInputSettings>,
 ) -> Page {
     let (controller, mut configuration_controllers) = {
         let hid_core = hid_core.lock();
@@ -1096,6 +1097,14 @@ pub fn page(
     motion_box.append(&motion);
     motion_box.append(&configure_motion);
     footer.append(&motion_box);
+    if let Some(global) = global {
+        global.bind(&motion, &vibration, &docked);
+    } else {
+        // The standalone input-profile editor does not own global options.
+        console_mode.set_visible(false);
+        vibration_box.set_visible(false);
+        motion_box.set_visible(false);
+    }
 
     // "Connected  1 2 3 4 5 6 7 8" over a row of checkboxes.
     let connected_strip = gtk::Grid::new();
@@ -1427,9 +1436,6 @@ pub fn page(
             .get(controller_type.selected() as usize)
             .map(|(t, _)| *t)
             .unwrap_or(ControllerType::ProController);
-        let vibrates = vibration.is_active();
-        let uses_motion = motion.is_active();
-        let is_docked = docked.is_active();
 
         page_owner.refresh_devices();
         if let Some(controller) = page_owner.controller.borrow().as_ref() {
@@ -1459,13 +1465,6 @@ pub fn page(
                 let edited = page_owner.state.borrow();
                 slot.profile_name = edited.profile_name.clone();
             }
-            values.vibration_enabled.set_value(vibrates);
-            values.motion_enabled.set_value(uses_motion);
-            values.use_docked_mode.set_value(if is_docked {
-                common::settings_enums::ConsoleMode::Docked
-            } else {
-                common::settings_enums::ConsoleMode::Handheld
-            });
         }
     })
 }

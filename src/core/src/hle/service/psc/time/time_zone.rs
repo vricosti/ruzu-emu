@@ -187,6 +187,7 @@ impl TimeZone {
             hour: internal.tm_hour as i8,
             minute: internal.tm_min as i8,
             second: internal.tm_sec as i8,
+            padding: 0,
         };
 
         let mut name = [0u8; 8];
@@ -289,6 +290,7 @@ impl TimeZone {
             hour: calendar.hour,
             minute: calendar.minute,
             second: calendar.second,
+            padding: 0,
         };
         let mut internal = CalendarTimeInternal {
             tm_sec: calendar.second as i32,
@@ -418,6 +420,7 @@ mod tests {
         assert_eq!(cal.hour, 0);
         assert_eq!(cal.minute, 0);
         assert_eq!(cal.second, 0);
+        assert_eq!(cal.padding, 0);
         assert_eq!(info.day_of_week, 4); // Thursday
         assert_eq!(info.day_of_year, 0);
         assert_eq!(info.ut_offset, 0);
@@ -436,6 +439,7 @@ mod tests {
         assert_eq!(cal.hour, 13);
         assert_eq!(cal.minute, 40);
         assert_eq!(cal.second, 0);
+        assert_eq!(cal.padding, 0);
         assert_eq!(info.day_of_week, 4); // Thursday
         assert_eq!(info.ut_offset, 0);
     }
@@ -465,6 +469,7 @@ mod tests {
             hour: 2,
             minute: 30,
             second: 0,
+            padding: 0,
         };
         let mut out_times = [0i64; 2];
 
@@ -486,6 +491,7 @@ mod tests {
             hour: 0,
             minute: 0,
             second: 0,
+            padding: 0,
         };
         let mut out_times = [i64::MIN; 2];
 

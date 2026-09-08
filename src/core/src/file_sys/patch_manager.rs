@@ -64,6 +64,36 @@ fn format_title_version(mut version: u32) -> String {
     format!("v{}.{}.{}", bytes[3], bytes[2], bytes[1])
 }
 
+/// Upstream `GetUpdateVersionStringFromSlot`. The Rust provider exposes slot
+/// access through the union instead of returning a borrowed slot provider.
+fn get_update_version_string_from_slot(
+    provider: &dyn ContentProvider,
+    slot: ContentProviderUnionSlot,
+    update_tid: u64,
+) -> String {
+    let Some(file) = provider.get_entry_raw_from_slot(slot, update_tid, ContentRecordType::Control) else {
+        return String::new();
+    };
+    let control = NCA::new(file, None);
+    if control.get_status() != super::partition_filesystem::ResultStatus::Success {
+        return String::new();
+    }
+    read_update_version_from_romfs(control.get_romfs())
+}
+
+/// Mechanical extraction of the RomFS-reading portion of the upstream helper,
+/// kept here so its filename rules can be tested without encryption keys.
+fn read_update_version_from_romfs(romfs: Option<VirtualFile>) -> String {
+    let Some(extracted) = extract_romfs(romfs) else {
+        return String::new();
+    };
+    extracted
+        .get_file("control.nacp")
+        .or_else(|| extracted.get_file("Control.nacp"))
+        .map(|file| NACP::from_file(&file).get_version_string())
+        .unwrap_or_default()
+}
+
 // ============================================================================
 // Helper functions
 // ============================================================================
@@ -808,16 +838,18 @@ impl<'a> PatchManager<'a> {
                     ContentProviderUnionSlot::External => continue,
                     ContentProviderUnionSlot::FrontendManual => continue,
                 };
+                let mut version = get_update_version_string_from_slot(provider, slot, update_tid);
                 let numeric_version = provider
                     .get_entry_version_from_slot(slot, update_tid)
                     .unwrap_or(0);
+                if version.is_empty() && numeric_version != 0 {
+                    version = format_title_version(numeric_version);
+                }
                 let name = format!("Update{suffix}");
                 out.push(Patch {
                     enabled: !disabled.contains(&name),
                     name,
-                    version: (numeric_version != 0)
-                        .then(|| format_title_version(numeric_version))
-                        .unwrap_or_default(),
+                    version,
                     patch_type: PatchType::Update,
                     program_id: self.title_id,
                     title_id: update_tid,
@@ -1289,6 +1321,33 @@ mod tests {
     use super::super::vfs::vfs_vector::{VectorVfsDirectory, VectorVfsFile};
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn update_display_version_reads_control_metadata_from_romfs() {
+        use super::super::control_metadata::RawNACP;
+        let make_control = |name: &str, version: &[u8]| -> VirtualFile {
+            let mut data = vec![0; std::mem::size_of::<RawNACP>()];
+            let offset = std::mem::offset_of!(RawNACP, version_string);
+            data[offset..offset + version.len()].copy_from_slice(version);
+            Arc::new(VectorVfsFile::new(data, name.to_owned(), None))
+        };
+        for files in [
+            vec![make_control("control.nacp", b"3.2.1")],
+            vec![make_control("Control.nacp", b"3.2.1")],
+            vec![make_control("control.nacp", b"3.2.1"), make_control("Control.nacp", b"9.0.0")],
+        ] {
+            let directory: VirtualDir = Arc::new(VectorVfsDirectory::new(
+                files, Vec::new(), "metadata".to_owned(), None,
+            ));
+            let romfs = create_romfs(Some(directory), None).expect("synthetic RomFS");
+            assert_eq!(read_update_version_from_romfs(Some(romfs)), "3.2.1");
+        }
+        assert_eq!(read_update_version_from_romfs(None), "");
+        let directory: VirtualDir = Arc::new(VectorVfsDirectory::new(
+            Vec::new(), Vec::new(), "metadata".to_owned(), None,
+        ));
+        assert_eq!(read_update_version_from_romfs(create_romfs(Some(directory), None)), "");
+    }
 
     struct RecordingContentProvider {
         control_requests: Mutex<Vec<u64>>,

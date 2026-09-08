@@ -296,6 +296,7 @@ fn get_epoch_time_from_initial_year(set_sys: &SystemSettingsService) -> i64 {
         hour: 0,
         minute: 0,
         second: 0,
+        padding: 0,
     })
 }
 

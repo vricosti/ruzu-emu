@@ -328,9 +328,9 @@ impl Values {
 /// Selectable widget themes — upstream `UISettings::themes`.
 ///
 /// Each entry is `(display name, internal name)`. GTK has no direct equivalent
-/// of Qt's `.qss` stylesheet themes, so only the two GTK provides natively
-/// (light / dark, via `gtk-application-prefer-dark-theme`) actually change the
-/// appearance; the rest are kept so the combo box matches upstream's contents.
+/// of Qt's `.qss` stylesheets: native light/dark selection is complemented by
+/// the Midnight Blue GTK palette. Colorful variants share their base palette
+/// upstream; icon-theme selection is a separate frontend concern.
 pub const THEMES: &[(&str, &str)] = &[
     ("Default", "default"),
     ("Default Colorful", "colorful"),

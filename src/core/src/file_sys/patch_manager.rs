@@ -1339,6 +1339,98 @@ mod tests {
     }
 
     #[test]
+    fn dump_settings_export_exefs_after_layers_and_nso_before_patches() {
+        const ROOT: &str = "RUZU_TEST_PATCH_DUMP_ROOT";
+        let root = match std::env::var_os(ROOT) {
+            Some(root) => std::path::PathBuf::from(root),
+            None => {
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let root = std::env::temp_dir().join(format!(
+                    "ruzu-patch-dump-{}-{nonce}",
+                    std::process::id()
+                ));
+                std::fs::create_dir(&root).unwrap();
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", std::thread::current().name().unwrap()])
+                    .env(ROOT, &root)
+                    .status()
+                    .unwrap();
+                std::fs::remove_dir_all(&root).unwrap();
+                assert!(status.success());
+                return;
+            }
+        };
+        use crate::file_sys::vfs::vfs_real::RealVfsFilesystem;
+        use crate::file_sys::{bis_factory::BisFactory, fs_filesystem::OpenMode};
+
+        let filesystem = RealVfsFilesystem::new();
+        let directory = |name: &str| {
+            filesystem
+                .arc_create_directory(root.join(name).to_str().unwrap(), OpenMode::READ_WRITE)
+                .unwrap()
+        };
+        let mut controller = FileSystemController::new();
+        controller.set_bis_factory(BisFactory::new(
+            directory("nand"),
+            directory("load"),
+            directory("dump"),
+        ));
+        let provider = RecordingContentProvider {
+            control_requests: Mutex::new(Vec::new()),
+        };
+        let manager = PatchManager::new(42, &controller, &provider);
+        let exefs = directory("base");
+        std::fs::write(root.join("base/main"), b"original executable").unwrap();
+        std::fs::write(root.join("base/main.npdm"), b"original metadata").unwrap();
+        let mod_path = root.join("load/000000000000002A/synthetic/exefs");
+        std::fs::create_dir_all(&mod_path).unwrap();
+        std::fs::write(mod_path.join("main"), b"replacement executable").unwrap();
+        std::fs::write(
+            mod_path.join("ABC.ips"),
+            b"PATCH\x00\x01\x00\x00\x01\xAAEOF",
+        )
+        .unwrap();
+        let dump = root.join("dump/000000000000002A");
+
+        let mut nso = vec![0; 0x101];
+        nso[..4].copy_from_slice(b"NSO0");
+        let offset = std::mem::offset_of!(crate::loader::nso::NsoHeader, build_id);
+        nso[offset..offset + 2].copy_from_slice(&[0xAB, 0xC0]);
+        for enabled in [false, true, false] {
+            {
+                let mut values = common::settings::values_mut();
+                values.dump_exefs.set_value(enabled);
+                values.dump_nso.set_value(enabled);
+            }
+            let layered = manager.patch_exefs(exefs.clone());
+            assert_eq!(
+                layered.get_file("main").unwrap().read_all_bytes(),
+                b"replacement executable"
+            );
+            assert_eq!(manager.patch_nso(nso.clone(), "main")[0x100], 0xAA);
+            if enabled {
+                assert_eq!(
+                    std::fs::read(dump.join("exefs/main")).unwrap(),
+                    b"replacement executable"
+                );
+                assert_eq!(
+                    std::fs::read(dump.join("exefs/main.npdm")).unwrap(),
+                    b"original metadata"
+                );
+                assert_eq!(std::fs::read(dump.join("nso/main-ABC.nso")).unwrap(), nso);
+                assert!(!dump.join("nso/main-abc.nso").exists());
+                // Re-disabling must stop exports, without disabling patch application.
+                std::fs::remove_dir_all(&dump).unwrap();
+            } else {
+                assert!(!dump.exists());
+            }
+        }
+    }
+
+    #[test]
     fn nso_patch_build_ids_use_upstream_uppercase() {
         const CHILD: &str = "RUZU_TEST_NSO_PATCH_BUILD_IDS";
         if std::env::var_os(CHILD).is_none() {

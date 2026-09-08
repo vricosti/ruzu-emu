@@ -2318,6 +2318,38 @@ mod tests {
     }
 
     #[test]
+    fn executable_dump_settings_round_trip_through_debug_configuration() {
+        const CHILD: &str = "RUZU_TEST_EXECUTABLE_DUMP_CONFIG";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        for enabled in [false, true] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            {
+                let mut values = common::settings::values_mut();
+                values.dump_exefs.set_value(enabled);
+                values.dump_nso.set_value(!enabled);
+            }
+            config.save_debugging_values();
+            {
+                let mut values = common::settings::values_mut();
+                values.dump_exefs.set_value(!enabled);
+                values.dump_nso.set_value(enabled);
+            }
+            config.read_debugging_values();
+            let values = common::settings::values();
+            assert_eq!(*values.dump_exefs.get_value(), enabled);
+            assert_eq!(*values.dump_nso.get_value(), !enabled);
+        }
+    }
+
+    #[test]
     fn macro_backend_settings_persist_but_dump_is_session_only() {
         for enabled in [false, true] {
             let mut config = BaseConfig::new(ConfigType::GlobalConfig);

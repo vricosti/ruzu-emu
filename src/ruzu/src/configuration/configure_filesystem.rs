@@ -210,3 +210,59 @@ fn connect_folder_picker(button: &gtk::Button, entry: &gtk::Entry, title: &str) 
         });
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone for global filesystem/settings state"]
+    fn executable_dump_switches_initialize_and_apply_independently() {
+        gtk::init().expect("a GTK display is required");
+        let root = tempfile::tempdir().unwrap();
+        for (path, name) in [
+            (RuzuPath::NANDDir, "nand"),
+            (RuzuPath::SaveDir, "save"),
+            (RuzuPath::SDMCDir, "sdmc"),
+            (RuzuPath::DumpDir, "dump"),
+            (RuzuPath::LoadDir, "load"),
+        ] {
+            let directory = root.path().join(name);
+            std::fs::create_dir(&directory).unwrap();
+            set_ruzu_path(path, &directory);
+        }
+        fn find_switch(widget: &gtk::Widget, label: &str) -> Option<gtk::CheckButton> {
+            if let Some(check) = widget.downcast_ref::<gtk::CheckButton>() {
+                if check.label().as_deref() == Some(label) {
+                    return Some(check.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(check) = find_switch(&widget, label) {
+                    return Some(check);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        for enabled in [false, true] {
+            {
+                let mut values = common::settings::values_mut();
+                values.dump_nso.set_value(enabled);
+                values.dump_exefs.set_value(!enabled);
+            }
+            let page = page();
+            let nso = find_switch(&page.widget, "Dump Decompressed NSOs").unwrap();
+            let exefs = find_switch(&page.widget, "Dump ExeFS").unwrap();
+            assert_eq!(nso.is_active(), enabled);
+            assert_eq!(exefs.is_active(), !enabled);
+            nso.set_active(!enabled);
+            exefs.set_active(enabled);
+            (page.apply)();
+            let values = common::settings::values();
+            assert_eq!(*values.dump_nso.get_value(), !enabled);
+            assert_eq!(*values.dump_exefs.get_value(), enabled);
+        }
+    }
+}

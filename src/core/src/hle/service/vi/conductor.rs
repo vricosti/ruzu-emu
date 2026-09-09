@@ -469,23 +469,60 @@ impl Drop for Conductor {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_next_ticks, FRAME_NS};
+    use super::compute_next_ticks;
+
+    // GetNextTicks uses f32 arithmetic, unlike the integer FrameNs used when
+    // initially scheduling the event. At 60 Hz its result rounds up by 1 ns.
+    const NEXT_TICKS_60HZ: i64 = 16_666_667;
 
     #[test]
     fn get_next_ticks_matches_60hz_at_default_multicore_speed_limit() {
         let ticks = compute_next_ticks(1, 1.0, true, true, 100, false, false);
-        assert_eq!(ticks, FRAME_NS);
+        assert_eq!(ticks, NEXT_TICKS_60HZ);
     }
 
     #[test]
     fn get_next_ticks_uses_unlocked_multicore_rate_when_speed_limit_disabled() {
         let ticks = compute_next_ticks(1, 1.0, true, false, 100, false, false);
-        assert_eq!(ticks, FRAME_NS / 100);
+        assert_eq!(ticks, 166_666);
     }
 
     #[test]
     fn get_next_ticks_overrides_compose_scale_for_nvdec_video_rate() {
         let ticks = compute_next_ticks(2, 0.05, true, true, 100, true, true);
-        assert_eq!(ticks, FRAME_NS * 2);
+        assert_eq!(ticks, 33_333_334);
+    }
+
+    #[test]
+    fn video_rate_override_requires_both_decoder_activity_and_setting() {
+        for (active, enabled) in [(false, false), (false, true), (true, false)] {
+            assert_eq!(
+                compute_next_ticks(1, 1.0, true, true, 200, active, enabled),
+                8_333_333,
+            );
+        }
+        assert_eq!(
+            compute_next_ticks(1, 1.0, true, true, 200, true, true),
+            NEXT_TICKS_60HZ
+        );
+        // The video override wins over unlocked speed and composition scaling.
+        assert_eq!(
+            compute_next_ticks(1, 0.5, true, false, 200, true, true),
+            NEXT_TICKS_60HZ
+        );
+    }
+
+    #[test]
+    fn single_core_leaves_speed_limiting_to_cpu_but_keeps_composition_scale() {
+        for limited in [false, true] {
+            assert_eq!(
+                compute_next_ticks(1, 1.0, false, limited, 200, false, false),
+                NEXT_TICKS_60HZ
+            );
+            assert_eq!(
+                compute_next_ticks(1, 2.0, false, limited, 200, false, false),
+                8_333_333
+            );
+        }
     }
 }

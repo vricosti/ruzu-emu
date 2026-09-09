@@ -240,6 +240,7 @@ impl IHidServer {
                 "ResetIsSixAxisSensorDeviceNewlyAssigned",
             ),
             (91, Some(Self::activate_gesture), "ActivateGesture"),
+            (92, Some(Self::set_gesture_output_ranges), "SetGestureOutputRanges"),
             (
                 100,
                 Some(Self::set_supported_npad_style_set),
@@ -1546,6 +1547,23 @@ impl IHidServer {
         };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
+    }
+
+    // cmd 92: SetGestureOutputRanges
+    fn set_gesture_output_ranges(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let param1 = rp.pop_u32();
+        let param2 = rp.pop_u32();
+        let param3 = rp.pop_u32();
+        let param4 = rp.pop_u32();
+        // Upstream accepts these four raw u32 values without validation or
+        // state changes; the gesture-range operation itself remains stubbed.
+        log::warn!(
+            "(STUBBED) IHidServer::SetGestureOutputRanges called, param1={}, param2={}, param3={}, param4={}",
+            param1, param2, param3, param4
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     // cmd 100: SetSupportedNpadStyleSet
@@ -3325,6 +3343,32 @@ impl ServiceFramework for IHidServer {
 mod tests {
     use super::*;
     use hid_core::hid_core::HIDCore;
+
+    #[test]
+    fn gesture_output_ranges_is_registered_and_returns_success_for_raw_u32_inputs() {
+        let firmware_settings = Arc::new(HidFirmwareSettings::new());
+        let resource_manager = Arc::new(parking_lot::Mutex::new(ResourceManager::new(
+            Arc::clone(&firmware_settings),
+            Arc::new(parking_lot::Mutex::new(HIDCore::new())),
+        )));
+        let server = IHidServer::new(
+            SystemRef::null(), resource_manager, firmware_settings,
+            Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+        );
+        let info = server.handlers().get(&92).expect("HID command 92 is registered");
+        assert_eq!(info.name, "SetGestureOutputRanges");
+        let callback = info.handler_callback.expect("HID command 92 is implemented");
+        // No gesture activation or guest resource is needed. Eden does not
+        // interpret these values as signed, clamp them, or reject any range.
+        for parameters in [[0; 4], [1, 2, 3, 4], [u32::MAX, 0x8000_0000, 0, u32::MAX]] {
+            let mut ctx = HLERequestContext::new();
+            ctx.cmd_buf[2..6].copy_from_slice(&parameters);
+            callback(&server, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+            assert!(ctx.outgoing_move_objects.is_empty());
+            assert!(ctx.outgoing_copy_objects.is_empty());
+        }
+    }
 
     #[test]
     fn create_applet_resource_reports_success_and_returns_interface_after_manager_error() {

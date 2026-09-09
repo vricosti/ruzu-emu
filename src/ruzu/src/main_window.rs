@@ -258,6 +258,17 @@ enum StopConfirmation {
     ForceLockedExit,
 }
 
+// LinkActionShortcut gates only controller activation. connect_shortcut's
+// direct connections and the three explicitly tas_allowed actions remain live.
+fn controller_hotkey_allowed(name: &str, tas_running: bool) -> bool {
+    !tas_running || matches!(name,
+        "TAS Start/Stop" | "TAS Record" | "TAS Reset" | "Exit Fullscreen"
+        | "Change Adapting Filter" | "Change Docked Mode" | "Change GPU Mode"
+        | "Audio Mute/Unmute" | "Audio Volume Down" | "Audio Volume Up"
+        | "Toggle Framerate Limit" | "Toggle Turbo Speed" | "Toggle Slow Speed"
+        | "Toggle Renderdoc Capture")
+}
+
 fn stop_confirmation(setting: ConfirmStop, exit_locked: bool) -> StopConfirmation {
     match (setting, exit_locked) {
         (ConfirmStop::AskAlways, false) => StopConfirmation::ChangeGame,
@@ -551,6 +562,7 @@ pub struct GMainWindow {
     /// The open configuration dialog, kept alive while it is on screen
     /// (upstream holds `ConfigureDialog` on the stack across `exec()`).
     configure_dialog: RefCell<Option<Rc<crate::configuration::ConfigureDialog>>>,
+    controller_hotkeys: RefCell<Vec<crate::hotkeys::ControllerShortcut>>,
     configure_per_game: RefCell<Option<Rc<crate::configuration::configure_per_game::ConfigurePerGame>>>,
     /// Handle to the game list, so it can be rescanned when the configured
     /// directories change.
@@ -1011,6 +1023,19 @@ mod stop_confirmation_tests {
     }
 
     #[test]
+    fn controller_tas_gate_only_blocks_linked_menu_actions() {
+        for &(name, _) in crate::hotkeys::HOTKEY_ACTIONS {
+            assert!(controller_hotkey_allowed(name, false), "{name}");
+        }
+        for name in ["Stop Emulation", "Load File", "Configure", "Capture Screenshot"] {
+            assert!(!controller_hotkey_allowed(name, true), "{name}");
+        }
+        for name in ["TAS Start/Stop", "TAS Record", "TAS Reset", "Audio Volume Up", "Toggle Turbo Speed"] {
+            assert!(controller_hotkey_allowed(name, true), "{name}");
+        }
+    }
+
+    #[test]
     fn restart_only_survives_a_successful_non_closing_shutdown() {
         let path = Some("title.nsp".to_owned());
         assert_eq!(
@@ -1435,6 +1460,7 @@ impl GMainWindow {
             mouse_hide_timer: RefCell::new(None),
             render_geometry: Cell::new(None),
             configure_dialog: RefCell::new(None),
+            controller_hotkeys: RefCell::new(Vec::new()),
             configure_per_game: RefCell::new(None),
             game_list: RefCell::new(None),
             play_time_manager,
@@ -1641,6 +1667,7 @@ impl GMainWindow {
         this.register_boot_actions(app);
         this.register_view_actions(app);
         crate::hotkeys::apply_accelerators(app);
+        this.initialize_controller_hotkeys();
 
         // Keep the checkable menu action and the window chrome synchronized
         // when the compositor exits fullscreen independently.
@@ -3709,6 +3736,7 @@ impl GMainWindow {
                 if let Some(app) = this.window.application() {
                     crate::hotkeys::apply_accelerators(&app);
                 }
+                this.initialize_controller_hotkeys();
                 this.status_bar.refresh();
                 this.show_mouse_cursor();
                 if crate::uisettings::take_game_list_reload_pending() {
@@ -3736,6 +3764,44 @@ impl GMainWindow {
         ));
         dialog.present();
         *self.configure_dialog.borrow_mut() = Some(dialog);
+    }
+
+    /// Controller half of MainWindow::InitializeHotkeys/LinkActionShortcut.
+    fn initialize_controller_hotkeys(&self) {
+        let configured = crate::uisettings::with(|values| values.shortcuts.clone());
+        let mut bindings = self.controller_hotkeys.borrow_mut();
+        if bindings.is_empty() {
+            let controller = self.hid_core.lock().get_emulated_controller(hid_core::hid_types::NpadIdType::Player1);
+            let tas = self.input_subsystem.borrow().get_tas();
+            for &(name, action) in crate::hotkeys::HOTKEY_ACTIONS {
+                let window: glib::SendWeakRef<gtk::ApplicationWindow> = self.window.downgrade().into();
+                let tas = tas.clone();
+                bindings.push(crate::hotkeys::ControllerShortcut::new(Arc::clone(&controller), move || {
+                    let window = window.clone();
+                    let tas = tas.clone();
+                    // Like Qt::QueuedConnection, never run GUI or emulation
+                    // actions on the input-driver thread.
+                    glib::idle_add_once(move || {
+                        let Some(window) = window.upgrade() else { return; };
+                        let running_tas = tas.as_ref().is_some_and(|tas| {
+                            tas.lock().get_status().0 != input_common::drivers::tas_input::TasState::Stopped
+                        });
+                        if !controller_hotkey_allowed(name, running_tas) { return; }
+                        if let Some(app) = window.application() {
+                            let action = action.strip_prefix("app.").unwrap();
+                            if app.lookup_action(action).is_some_and(|action| action.is_enabled()) {
+                                gio::prelude::ActionGroupExt::activate_action(&app, action, None);
+                            }
+                        }
+                    });
+                }));
+            }
+        }
+        for (binding, &(name, _)) in bindings.iter().zip(crate::hotkeys::HOTKEY_ACTIONS) {
+            let key = configured.iter().find(|shortcut| shortcut.name == name)
+                .map_or("", |shortcut| shortcut.controller_keyseq.as_str());
+            binding.set_key(key);
+        }
     }
 
     /// MainWindow::OnConfigurePerGame/OpenPerGameConfiguration. The GTK modal
@@ -3828,6 +3894,7 @@ impl GMainWindow {
         crate::i18n::set_language(&language);
         update_ui_theme();
         self.hid_core.lock().reload_input_devices();
+        self.initialize_controller_hotkeys();
         if let Some(app) = self.window.application() {
             crate::hotkeys::apply_accelerators(&app);
             for (name, enabled) in [

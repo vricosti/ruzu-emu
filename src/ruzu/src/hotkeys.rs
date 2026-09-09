@@ -1,10 +1,113 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // GTK counterpart of `/home/vricosti/Dev/emulators/eden/src/yuzu/hotkeys.cpp`.
-// The registry data is owned by `uisettings`; this module connects the keyboard
-// half to GTK application actions and matches window-owned emulation hotkeys.
+// The registry data is owned by `uisettings`; this module implements keyboard
+// conversion and HID controller-shortcut detection for window-owned actions.
 
 use gtk::prelude::*;
+use std::sync::Arc;
+use parking_lot::Mutex;
+use hid_core::frontend::emulated_controller::{ControllerTriggerType, ControllerUpdateCallback};
+use hid_core::hid_core::EmulatedControllerHandle;
+use hid_core::hid_types::{NpadButton, NpadButtonState, HomeButtonState, CaptureButtonState};
+
+/// ControllerButtonSequence in upstream hotkeys.h.
+#[derive(Default, Clone, Copy)]
+struct ControllerButtonSequence {
+    capture: u64,
+    home: u64,
+    npad: NpadButton,
+}
+
+impl ControllerButtonSequence {
+    fn parse(text: &str) -> Self {
+        let mut sequence = Self::default();
+        for button in text.split('+') {
+            sequence.npad |= match button {
+                "A" => NpadButton::A, "B" => NpadButton::B,
+                "X" => NpadButton::X, "Y" => NpadButton::Y,
+                "L" => NpadButton::L, "R" => NpadButton::R,
+                "ZL" => NpadButton::ZL, "ZR" => NpadButton::ZR,
+                "Dpad_Left" => NpadButton::LEFT, "Dpad_Right" => NpadButton::RIGHT,
+                "Dpad_Up" => NpadButton::UP, "Dpad_Down" => NpadButton::DOWN,
+                "Left_Stick" => NpadButton::STICK_L, "Right_Stick" => NpadButton::STICK_R,
+                "Minus" => NpadButton::MINUS, "Plus" => NpadButton::PLUS,
+                "Home" => { sequence.home = 1; NpadButton::empty() }
+                "Screenshot" => { sequence.capture = 1; NpadButton::empty() }
+                _ => NpadButton::empty(),
+            };
+        }
+        sequence
+    }
+
+    fn is_empty(self) -> bool { self.npad.is_empty() && self.home == 0 && self.capture == 0 }
+}
+
+struct ControllerShortcutState {
+    sequence: ControllerButtonSequence,
+    active: bool,
+    enabled: bool,
+}
+
+impl ControllerShortcutState {
+    fn update(&mut self, trigger: ControllerTriggerType, buttons: (NpadButtonState, HomeButtonState, CaptureButtonState)) -> bool {
+        if !self.enabled || trigger != ControllerTriggerType::Button || self.sequence.is_empty() {
+            return false;
+        }
+        let matched = buttons.0.raw.contains(self.sequence.npad)
+            && buttons.1.raw & self.sequence.home == self.sequence.home
+            && buttons.2.raw & self.sequence.capture == self.sequence.capture;
+        if matched && !self.active {
+            self.active = true;
+            return true;
+        }
+        // Preserve ControllerUpdateEvent literally: even a matching event
+        // received while active clears the latch upstream.
+        self.active = false;
+        false
+    }
+}
+
+/// ControllerShortcut: evaluate live button state in the HID callback, before
+/// GTK dispatch. The callback-safe view avoids re-locking the controller owner.
+pub struct ControllerShortcut {
+    controller: EmulatedControllerHandle,
+    callback_key: i32,
+    state: Arc<Mutex<ControllerShortcutState>>,
+}
+
+impl ControllerShortcut {
+    pub fn new(controller: EmulatedControllerHandle, activate: impl Fn() + Send + Sync + 'static) -> Self {
+        let state = Arc::new(Mutex::new(ControllerShortcutState {
+            sequence: ControllerButtonSequence::default(), active: false, enabled: true,
+        }));
+        let callback_state = Arc::clone(&state);
+        let callback_key = {
+            let mut owner = controller.lock();
+            let reader = owner.button_state_reader();
+            owner.set_callback(ControllerUpdateCallback {
+                on_change: Arc::new(move |trigger| {
+                    if trigger != ControllerTriggerType::Button { return; }
+                    let activate_now = callback_state.lock().update(trigger, reader.read());
+                    if activate_now { activate(); }
+                }),
+                is_npad_service: false,
+            })
+        };
+        Self { controller, callback_key, state }
+    }
+
+    pub fn set_key(&self, text: &str) {
+        self.state.lock().sequence = ControllerButtonSequence::parse(text);
+    }
+}
+
+impl Drop for ControllerShortcut {
+    fn drop(&mut self) {
+        self.state.lock().enabled = false;
+        self.controller.lock().delete_callback(self.callback_key);
+    }
+}
 
 pub fn matches(action: &str, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
     let sequence = crate::uisettings::with(|values| {
@@ -31,8 +134,7 @@ pub fn matches(action: &str, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierTyp
 /// Apply the subset of upstream keyboard hotkeys whose GTK actions are already
 /// ported. Reapplying disconnects the former accelerator exactly as
 /// `HotkeyRegistry::LoadHotkeys` updates an existing `QShortcut`.
-pub fn apply_accelerators(app: &gtk::Application) {
-    for (hotkey, action) in [
+pub(crate) const HOTKEY_ACTIONS: &[(&str, &str)] = &[
         ("Continue/Pause Emulation", "app.pause"),
         ("Stop Emulation", "app.stop"),
         ("Restart Emulation", "app.restart"),
@@ -63,7 +165,10 @@ pub fn apply_accelerators(app: &gtk::Application) {
         ("Toggle Turbo Speed", "app.toggle_turbo_speed"),
         ("Toggle Slow Speed", "app.toggle_slow_speed"),
         ("Exit ruzu", "app.quit"),
-    ] {
+    ];
+
+pub fn apply_accelerators(app: &gtk::Application) {
+    for &(hotkey, action) in HOTKEY_ACTIONS {
         let accelerator = crate::uisettings::with(|values| {
             values
                 .shortcuts
@@ -125,6 +230,80 @@ fn gtk_accelerator_from_native(sequence: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_sequences_and_latch_follow_upstream() {
+        let sequence = ControllerButtonSequence::parse("A+B+Home+Screenshot+Unknown");
+        assert_eq!(sequence.npad, NpadButton::A | NpadButton::B);
+        assert_eq!((sequence.home, sequence.capture), (1, 1));
+        assert!(ControllerButtonSequence::parse("unknown++").is_empty());
+        let mut state = ControllerShortcutState { sequence, active: false, enabled: true };
+        let buttons = (NpadButtonState { raw: NpadButton::A | NpadButton::B | NpadButton::X },
+            HomeButtonState { raw: 1 }, CaptureButtonState { raw: 1 });
+        assert!(!state.update(ControllerTriggerType::Stick, buttons));
+        assert!(state.update(ControllerTriggerType::Button, buttons));
+        // This unusual repeated-match behavior is the current upstream code,
+        // not a Rust debounce policy invented for this port.
+        assert!(!state.update(ControllerTriggerType::Button, buttons));
+        assert!(state.update(ControllerTriggerType::Button, buttons));
+        assert!(!state.update(ControllerTriggerType::Button, Default::default()));
+        state.enabled = false;
+        assert!(!state.update(ControllerTriggerType::Button, buttons));
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK/SDL and input-factory state"]
+    fn controller_shortcuts_receive_fast_input_rebind_clear_and_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use hid_core::frontend::emulated_controller::EmulatedController;
+        use hid_core::hid_types::{NpadIdType, NpadStyleIndex};
+        gtk::init().unwrap();
+        let mut input = input_common::InputSubsystem::new();
+        input.initialize();
+        let controller = Arc::new(Mutex::new(EmulatedController::new(NpadIdType::Player1)));
+        {
+            let mut owner = controller.lock();
+            owner.set_npad_style_index(NpadStyleIndex::Fullkey);
+            for index in 0..2 {
+                let mut params = common::param_package::ParamPackage::default();
+                params.set_str("engine", "virtual_gamepad".to_owned());
+                params.set_str("guid", common::uuid::UUID::default().raw_string());
+                params.set_int("port", 0);
+                params.set_int("pad", 0);
+                params.set_int("button", index as i32);
+                owner.set_button_param(index, params);
+            }
+            owner.reload_input();
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shortcut = ControllerShortcut::new(Arc::clone(&controller), {
+            let calls = Arc::clone(&calls);
+            move || { calls.fetch_add(1, Ordering::Relaxed); }
+        });
+        shortcut.set_key("A+B");
+        let gamepad = input.get_virtual_gamepad_mut().unwrap();
+        let _owner = controller.lock();
+        gamepad.set_button_state_by_id(0, 0, true);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        gamepad.set_button_state_by_id(0, 1, true);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        gamepad.set_button_state_by_id(0, 1, false);
+        gamepad.set_button_state_by_id(0, 1, true);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        shortcut.set_key("");
+        gamepad.set_button_state_by_id(0, 1, false);
+        gamepad.set_button_state_by_id(0, 1, true);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        shortcut.set_key("A");
+        gamepad.set_button_state_by_id(0, 0, false);
+        gamepad.set_button_state_by_id(0, 0, true);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        drop(_owner);
+        drop(shortcut);
+        gamepad.set_button_state_by_id(0, 0, false);
+        gamepad.set_button_state_by_id(0, 0, true);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
 
     #[test]
     #[ignore = "requires GTK display; run in an isolated process"]

@@ -194,7 +194,7 @@ struct ErrorReply {
 
 pub struct RingController {
     base: HidbusBase,
-    input: Option<Arc<Mutex<EmulatedController>>>,
+    input: Arc<Mutex<EmulatedController>>,
     command: RingConCommands,
     total_rep_count: u8,
     total_push_count: u8,
@@ -205,10 +205,10 @@ pub struct RingController {
 }
 
 impl RingController {
-    pub fn new(event: Box<dyn super::hidbus_base::HidbusCommandEvent>, memory: Box<dyn super::hidbus_base::HidbusMemory>) -> Self {
+    pub fn new(input: Arc<Mutex<EmulatedController>>, event: Box<dyn super::hidbus_base::HidbusCommandEvent>, memory: Box<dyn super::hidbus_base::HidbusMemory>) -> Self {
         Self {
             base: HidbusBase::new(event, memory),
-            input: None,
+            input,
             command: RingConCommands::Error,
             total_rep_count: 0,
             total_push_count: 0,
@@ -240,27 +240,16 @@ impl RingController {
         }
     }
 
-    pub fn new_with_input(input: Arc<Mutex<EmulatedController>>, event: Box<dyn super::hidbus_base::HidbusCommandEvent>, memory: Box<dyn super::hidbus_base::HidbusMemory>) -> Self {
-        Self {
-            input: Some(input),
-            ..Self::new(event, memory)
-        }
-    }
-
     pub fn on_init(&mut self) {
-        if let Some(input) = &self.input {
-            input
-                .lock()
-                .set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Ring);
-        }
+        self.input
+            .lock()
+            .set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Ring);
     }
 
     pub fn on_release(&mut self) {
-        if let Some(input) = &self.input {
-            input
-                .lock()
-                .set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Active);
-        }
+        self.input
+            .lock()
+            .set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Active);
     }
 
     pub fn on_update(&mut self) {
@@ -317,10 +306,7 @@ impl RingController {
     }
 
     fn get_sensor_value(&self) -> RingConData {
-        let force = self
-            .input
-            .as_ref()
-            .map_or(0.0, |input| input.lock().get_ring_sensor_force().force);
+        let force = self.input.lock().get_ring_sensor_force().force;
         RingConData {
             status: DataValid::Valid as u32,
             data: (force * RANGE as f32) as i16 + IDLE_VALUE,
@@ -552,6 +538,28 @@ impl super::hidbus_base::HidbusDevice for RingController {
 mod tests {
     use super::*;
 
+    fn input() -> Arc<Mutex<EmulatedController>> {
+        crate::hid_core::HIDCore::new().get_emulated_controller_by_index(0)
+    }
+
+    #[test]
+    fn activation_and_release_change_the_owned_controller_polling_mode() {
+        use super::super::hidbus_base::{HidbusDevice, test_command_event, test_memory};
+        let input = input();
+        input.lock().reload_from_settings();
+        let mut controller = RingController::new(Arc::clone(&input), test_command_event(), test_memory());
+        controller.activate_device();
+        assert_eq!(input.lock().get_polling_mode(EmulatedDeviceIndex::RightIndex), PollingMode::Ring);
+        assert_eq!(input.lock().get_polling_mode(EmulatedDeviceIndex::LeftIndex), PollingMode::Active);
+        controller.deactivate_device();
+        assert_eq!(input.lock().get_polling_mode(EmulatedDeviceIndex::RightIndex), PollingMode::Active);
+        let weak = Arc::downgrade(&input);
+        drop(input);
+        assert!(weak.upgrade().is_some());
+        drop(controller);
+        assert!(weak.upgrade().is_none());
+    }
+
     #[test]
     fn command_completion_signals_all_reply_paths_and_releases_owner() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -561,7 +569,7 @@ mod tests {
         }
         let count = Arc::new(AtomicUsize::new(0));
         let weak = Arc::downgrade(&count);
-        let mut controller = RingController::new(Box::new(Event(Arc::clone(&count))), super::super::hidbus_base::test_memory());
+        let mut controller = RingController::new(input(), Box::new(Event(Arc::clone(&count))), super::super::hidbus_base::test_memory());
         assert!(!controller.set_command(&[0, 1, 2]));
         assert_eq!(count.load(Ordering::SeqCst), 0);
         for (index, command) in [RingConCommands::GetFirmwareVersion,
@@ -592,7 +600,7 @@ mod tests {
             }
         }
         let writes = Arc::new(Mutex::new(Vec::new()));
-        let mut controller = RingController::new(test_command_event(), Box::new(Memory(Arc::clone(&writes))));
+        let mut controller = RingController::new(input(), test_command_event(), Box::new(Memory(Arc::clone(&writes))));
         controller.on_update();
         assert!(writes.lock().is_empty());
         crate::hidbus::hidbus_base::HidbusDevice::activate_device(&mut controller);

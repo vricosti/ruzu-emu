@@ -2539,6 +2539,26 @@ mod tests {
     }
 
     #[test]
+    fn audio_command_dump_is_session_only_and_ignores_old_ini_values() {
+        let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+        config.begin_group("Audio");
+        let mut values = common::settings::Values::default();
+        values.dump_audio_commands.set_value(true);
+        config.write_setting_generic(&mut values.dump_audio_commands);
+        assert!(config.ini.get("Audio").is_none_or(|section|
+            !section.contains_key("dump_audio_commands")));
+        config.write_raw("dump_audio_commands", "true".into());
+        config.write_raw("dump_audio_commands\\default", "false".into());
+        let mut fresh = common::settings::Values::default();
+        config.read_setting_generic(&mut fresh.dump_audio_commands);
+        assert!(!*fresh.dump_audio_commands.get_value());
+        // Reloading configuration must not undo a deliberate session toggle.
+        config.write_raw("dump_audio_commands", "false".into());
+        config.read_setting_generic(&mut values.dump_audio_commands);
+        assert!(*values.dump_audio_commands.get_value());
+    }
+
+    #[test]
     fn scaling_filter_round_trips_the_full_upstream_enum_range() {
         use common::settings_common::Specialization;
         use common::settings_enums::{Category, ScalingFilter};

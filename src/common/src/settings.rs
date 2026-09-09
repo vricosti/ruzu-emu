@@ -763,7 +763,14 @@ impl Default for Values {
                 true,
                 true,
             ),
-            dump_audio_commands: Setting::new(false, "dump_audio_commands", Audio),
+            dump_audio_commands: Setting::with_options(
+                false,
+                "dump_audio_commands",
+                Audio,
+                Specialization::DEFAULT,
+                false,
+                false,
+            ),
 
             // Core
             use_multi_core: SwitchableSetting::new(true, "use_multi_core", Core),

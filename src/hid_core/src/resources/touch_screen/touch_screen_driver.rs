@@ -158,9 +158,10 @@ impl TouchScreenDriver {
                 touch_entry.position_y =
                     (active_fingers[id].position_y * TOUCH_SENSOR_HEIGHT as f32) as u32;
                 // Upstream reads diameter and rotation from Settings::values.touchscreen
-                touch_entry.diameter_x = 15;
-                touch_entry.diameter_y = 15;
-                touch_entry.rotation_angle = 0;
+                let settings = common::settings::values();
+                touch_entry.diameter_x = settings.touchscreen.diameter_x;
+                touch_entry.diameter_y = settings.touchscreen.diameter_y;
+                touch_entry.rotation_angle = settings.touchscreen.rotation_angle as i32;
                 touch_entry.finger = active_fingers[id].id;
                 touch_entry.attribute = active_fingers[id].attribute;
             }

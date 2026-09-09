@@ -159,15 +159,32 @@ impl Default for ButtonOnlyPollingDataAccessor {
 
 /// Base trait for hidbus devices
 pub trait HidbusDevice {
-    fn activate_device(&mut self);
-    fn deactivate_device(&mut self);
-    fn is_device_activated(&self) -> bool;
-    fn enable(&mut self, enable: bool);
-    fn is_enabled(&self) -> bool;
-    fn is_polling_mode(&self) -> bool;
-    fn get_polling_mode(&self) -> JoyPollingMode;
-    fn set_polling_mode(&mut self, mode: JoyPollingMode);
-    fn disable_polling_mode(&mut self);
+    fn base(&self) -> &HidbusBase;
+    fn base_mut(&mut self) -> &mut HidbusBase;
+
+    /// HidbusBase::ActivateDevice dispatches the derived OnInit only once.
+    fn activate_device(&mut self) {
+        if self.base().is_activated {
+            return;
+        }
+        self.base_mut().is_activated = true;
+        self.on_init();
+    }
+
+    /// OnRelease observes the active state; clear it only after the callback.
+    fn deactivate_device(&mut self) {
+        if self.base().is_activated {
+            self.on_release();
+        }
+        self.base_mut().is_activated = false;
+    }
+    fn is_device_activated(&self) -> bool { self.base().is_device_activated() }
+    fn enable(&mut self, enable: bool) { self.base_mut().enable(enable); }
+    fn is_enabled(&self) -> bool { self.base().is_enabled() }
+    fn is_polling_mode(&self) -> bool { self.base().is_polling_mode() }
+    fn get_polling_mode(&self) -> JoyPollingMode { self.base().get_polling_mode() }
+    fn set_polling_mode(&mut self, mode: JoyPollingMode) { self.base_mut().set_polling_mode(mode); }
+    fn disable_polling_mode(&mut self) { self.base_mut().disable_polling_mode(); }
 
     fn on_init(&mut self) {}
     fn on_release(&mut self) {}
@@ -183,8 +200,22 @@ pub trait HidbusDevice {
     }
 }
 
+/// Kernel-event bridge supplied by core, which cannot be a dependency of hid_core.
+/// The implementation owns the service event reservation and releases it on Drop.
+/// Production devices must receive an event; there is no optional/no-op fallback.
+pub trait HidbusCommandEvent: Send + Sync {
+    fn signal(&self);
+}
+
+/// The ApplicationMemory::WriteBlock access supplied by core across the crate boundary.
+pub trait HidbusMemory: Send + Sync {
+    fn write_block(&self, address: u64, data: &[u8]);
+}
+
 /// Base implementation for hidbus devices
 pub struct HidbusBase {
+    pub send_command_async_event: Box<dyn HidbusCommandEvent>,
+    pub memory: Box<dyn HidbusMemory>,
     pub is_activated: bool,
     pub device_enabled: bool,
     pub polling_mode_enabled: bool,
@@ -196,8 +227,10 @@ pub struct HidbusBase {
 }
 
 impl HidbusBase {
-    pub fn new() -> Self {
+    pub fn new(send_command_async_event: Box<dyn HidbusCommandEvent>, memory: Box<dyn HidbusMemory>) -> Self {
         Self {
+            send_command_async_event,
+            memory,
             is_activated: false,
             device_enabled: false,
             polling_mode_enabled: false,
@@ -207,14 +240,6 @@ impl HidbusBase {
             button_only_data: ButtonOnlyPollingDataAccessor::default(),
             transfer_memory: 0,
         }
-    }
-
-    pub fn activate_device(&mut self) {
-        self.is_activated = true;
-    }
-
-    pub fn deactivate_device(&mut self) {
-        self.is_activated = false;
     }
 
     pub fn is_device_activated(&self) -> bool {
@@ -251,10 +276,22 @@ impl HidbusBase {
     }
 }
 
-impl Default for HidbusBase {
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+pub(crate) fn test_memory() -> Box<dyn HidbusMemory> {
+    struct Memory;
+    impl HidbusMemory for Memory {
+        fn write_block(&self, _: u64, _: &[u8]) {}
     }
+    Box::new(Memory)
+}
+
+#[cfg(test)]
+pub(crate) fn test_command_event() -> Box<dyn HidbusCommandEvent> {
+    struct TestEvent;
+    impl HidbusCommandEvent for TestEvent {
+        fn signal(&self) {}
+    }
+    Box::new(TestEvent)
 }
 
 #[cfg(test)]
@@ -262,8 +299,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lifecycle_dispatches_once_and_preserves_callback_order() {
+        struct Device { base: HidbusBase, calls: Vec<&'static str> }
+        impl HidbusDevice for Device {
+            fn base(&self) -> &HidbusBase { &self.base }
+            fn base_mut(&mut self) -> &mut HidbusBase { &mut self.base }
+            fn on_init(&mut self) {
+                assert!(self.base.is_activated);
+                self.calls.push("init");
+            }
+            fn on_release(&mut self) {
+                assert!(self.base.is_activated);
+                self.calls.push("release");
+            }
+        }
+        let mut device = Device { base: HidbusBase::new(test_command_event(), test_memory()), calls: Vec::new() };
+        let dynamic: &mut dyn HidbusDevice = &mut device;
+        dynamic.deactivate_device();
+        dynamic.activate_device();
+        dynamic.activate_device();
+        dynamic.deactivate_device();
+        dynamic.deactivate_device();
+        assert!(!dynamic.is_device_activated());
+        dynamic.activate_device();
+        assert_eq!(device.calls, ["init", "release", "init"]);
+    }
+
+    #[test]
     fn polling_accessor_defaults_match_upstream() {
-        let base = HidbusBase::new();
+        let base = HidbusBase::new(test_command_event(), test_memory());
         assert_eq!(base.disable_sixaxis_data.header.result.raw(), u32::MAX);
         assert_eq!(base.enable_sixaxis_data.header.result.raw(), u32::MAX);
         assert_eq!(base.button_only_data.header.result.raw(), u32::MAX);

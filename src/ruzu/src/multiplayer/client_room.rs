@@ -75,6 +75,7 @@ pub fn show(parent: &gtk::ApplicationWindow, room_member: Arc<RoomMember>) {
         .default_width(640)
         .default_height(460)
         .build();
+    crate::hotkeys::install_secondary_window_shortcuts(&dialog, parent);
 
     let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
     column.set_margin_top(12);

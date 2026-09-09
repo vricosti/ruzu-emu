@@ -68,7 +68,7 @@ pub struct DefaultHotkey {
 }
 
 const WINDOW_SHORTCUT: i32 = 1;
-const APPLICATION_SHORTCUT: i32 = 2;
+pub(crate) const APPLICATION_SHORTCUT: i32 = 2;
 const WIDGET_WITH_CHILDREN_SHORTCUT: i32 = 3;
 
 /// Kept in the exact upstream positional order required by its shortcut

@@ -46,9 +46,17 @@ impl KeyboardShortcutState {
 pub(crate) fn keyboard_binding(
     app: &gtk::Application, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType,
 ) -> Option<(&'static str, bool)> {
+    keyboard_binding_in_context(app, keyval, state, false)
+}
+
+fn keyboard_binding_in_context(
+    app: &gtk::Application, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType,
+    application_only: bool,
+) -> Option<(&'static str, bool)> {
     crate::uisettings::with(|values| {
         HOTKEY_ACTIONS.iter().find_map(|&(name, action)| {
             let shortcut = values.shortcuts.iter().find(|shortcut| shortcut.name == name)?;
+            if application_only && shortcut.context != crate::uisettings::APPLICATION_SHORTCUT { return None; }
             let accelerator = gtk_accelerator_from_native(&shortcut.keyseq)?;
             let (key, modifiers) = gtk::accelerator_parse(&accelerator)?;
             let mask = gtk::accelerator_get_default_mod_mask();
@@ -56,6 +64,56 @@ pub(crate) fn keyboard_binding(
             let target = app.lookup_action(action.strip_prefix("app.")?)?;
             target.is_enabled().then_some((action, shortcut.repeat))
         })
+    })
+}
+
+/// QShortcut application context also reaches nonmodal auxiliary windows.
+/// Plain GTK transient windows do not inherit the parent's application or its
+/// accelerators. Install only that context here, owned by the auxiliary window.
+pub(crate) fn install_secondary_window_shortcuts(window: &gtk::Window, owner: &gtk::ApplicationWindow) {
+    let held = std::rc::Rc::new(std::cell::RefCell::new(KeyboardShortcutState::default()));
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed({
+        let held = std::rc::Rc::clone(&held);
+        let owner = owner.downgrade();
+        let window = window.downgrade();
+        move |_, key, code, modifiers| {
+            let (Some(owner), Some(window)) = (owner.upgrade(), window.upgrade()) else { return gtk::glib::Propagation::Proceed; };
+            if window.is_modal() || owner_blocked_by_modal(&owner) { return gtk::glib::Propagation::Proceed; }
+            let Some(app) = owner.application() else { return gtk::glib::Propagation::Proceed; };
+            let binding = keyboard_binding_in_context(&app, key, modifiers, true);
+            let event = held.borrow_mut().press(code, binding);
+            match event {
+                KeyboardShortcutEvent::Activate(action) => {
+                    gtk::gio::prelude::ActionGroupExt::activate_action(&app, action.strip_prefix("app.").unwrap(), None);
+                    gtk::glib::Propagation::Stop
+                }
+                KeyboardShortcutEvent::Suppressed => gtk::glib::Propagation::Stop,
+                KeyboardShortcutEvent::Unhandled => gtk::glib::Propagation::Proceed,
+            }
+        }
+    });
+    keys.connect_key_released({
+        let held = std::rc::Rc::clone(&held);
+        move |_, _, code, _| { held.borrow_mut().release(code); }
+    });
+    window.add_controller(keys);
+    let focus = gtk::EventControllerFocus::new();
+    focus.connect_leave(move |_| held.borrow_mut().clear());
+    window.add_controller(focus);
+}
+
+fn owner_blocked_by_modal(owner: &gtk::ApplicationWindow) -> bool {
+    let windows = gtk::Window::list_toplevels();
+    windows.into_iter().filter_map(|widget| widget.downcast::<gtk::Window>().ok()).any(|window| {
+        if !window.is_visible() || !window.is_modal() { return false; }
+        let mut parent = window.transient_for();
+        while let Some(window) = parent {
+            if window == *owner.upcast_ref::<gtk::Window>() { return true; }
+            parent = window.transient_for();
+        }
+        false
     })
 }
 
@@ -274,6 +332,50 @@ mod tests {
         state.clear();
         assert!(!state.release(10));
         assert_eq!(state.press(10, Some(("app.pause", false))), Activate("app.pause"));
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; run in an isolated process"]
+    fn secondary_window_shortcuts_respect_context_repeat_and_modality() {
+        gtk::init().unwrap();
+        let app = gtk::Application::builder().application_id("org.ruzu.SecondaryHotkeysTest").build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let owner = gtk::ApplicationWindow::builder().application(&app).build();
+        let secondary = gtk::Window::builder().transient_for(&owner).build();
+        install_secondary_window_shortcuts(&secondary, &owner);
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        for name in ["audio_volume_up", "fullscreen"] {
+            let action = gtk::gio::SimpleAction::new(name, None);
+            action.connect_activate({ let calls = calls.clone(); move |_, _| calls.set(calls.get() + 1) });
+            app.add_action(&action);
+        }
+        let original = crate::uisettings::with(|values| values.shortcuts.clone());
+        crate::uisettings::with_mut(|values| {
+            values.shortcuts.retain(|shortcut| matches!(shortcut.name.as_str(), "Audio Volume Up" | "Fullscreen"));
+            for shortcut in &mut values.shortcuts {
+                shortcut.keyseq = if shortcut.name == "Fullscreen" { "F11" } else { "F12" }.into();
+                shortcut.repeat = false;
+            }
+        });
+        let controllers = secondary.observe_controllers();
+        let keys = (0..controllers.n_items()).find_map(|i| controllers.item(i).and_downcast::<gtk::EventControllerKey>()).unwrap();
+        let press = |key: gtk::gdk::Key| keys.emit_by_name::<bool>("key-pressed", &[&key, &96u32, &gtk::gdk::ModifierType::empty()]);
+        assert!(!press(gtk::gdk::Key::F11), "window context belongs to main only");
+        assert!(press(gtk::gdk::Key::F12));
+        assert!(press(gtk::gdk::Key::F12));
+        assert_eq!(calls.get(), 1);
+        keys.emit_by_name::<()>("key-released", &[&gtk::gdk::Key::F12, &96u32, &gtk::gdk::ModifierType::empty()]);
+        let modal = gtk::Window::builder().transient_for(&owner).modal(true).build();
+        modal.set_visible(true);
+        assert!(!press(gtk::gdk::Key::F12), "modal sibling blocks main-owned application shortcut");
+        assert_eq!(calls.get(), 1);
+        modal.set_visible(false);
+        assert!(press(gtk::gdk::Key::F12));
+        assert_eq!(calls.get(), 2);
+        secondary.set_modal(true);
+        assert!(!press(gtk::gdk::Key::F12));
+        modal.destroy(); secondary.destroy(); owner.destroy();
+        crate::uisettings::with_mut(|values| values.shortcuts = original);
     }
 
     #[test]

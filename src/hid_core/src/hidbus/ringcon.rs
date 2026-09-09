@@ -189,8 +189,28 @@ struct StatusReply {
 #[repr(C)]
 struct ErrorReply {
     status: u32,
-    _padding: [u8; 3],
+    // C++ has three reserved bytes and one implicit tail byte. Make all
+    // four explicit so copying the complete eight-byte reply never reads
+    // uninitialized Rust padding.
+    _padding: [u8; 4],
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<RingConFirmwareVersion>() == 0x2);
+    assert!(std::mem::size_of::<FactoryCalibration>() == 0x10);
+    assert!(std::mem::size_of::<CalibrationValue>() == 0x4);
+    assert!(std::mem::size_of::<UserCalibration>() == 0xC);
+    assert!(std::mem::size_of::<RingConData>() == 0x8);
+    assert!(std::mem::size_of::<FirmwareVersionReply>() == 0x8);
+    assert!(std::mem::size_of::<ReadIdReply>() == 0x10);
+    assert!(std::mem::size_of::<Cmd020105Reply>() == 0x8);
+    assert!(std::mem::size_of::<ReadUnkCalReply>() == 0x8);
+    assert!(std::mem::size_of::<ReadFactoryCalReply>() == 0x14);
+    assert!(std::mem::size_of::<ReadUserCalReply>() == 0x14);
+    assert!(std::mem::size_of::<GetThreeByteReply>() == 0x8);
+    assert!(std::mem::size_of::<StatusReply>() == 0x4);
+    assert!(std::mem::size_of::<ErrorReply>() == 0x8);
+};
 
 pub struct RingController {
     base: HidbusBase,
@@ -485,7 +505,7 @@ impl RingController {
     fn get_error_reply(&self, out_data: &mut [u8]) -> u64 {
         let reply = ErrorReply {
             status: DataValid::BadCRC as u32,
-            _padding: [0; 3],
+            _padding: [0; 4],
         };
         Self::get_data(&reply, out_data)
     }
@@ -548,6 +568,19 @@ impl Default for RingController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_reply_initializes_all_bytes_and_respects_output_capacity() {
+        let controller = RingController::new();
+        let expected = [1, 0, 0, 0, 0, 0, 0, 0];
+        for capacity in 0..=12 {
+            let mut output = [0xA5; 12];
+            let count = controller.get_reply(&mut output[..capacity]) as usize;
+            assert_eq!(count, capacity.min(expected.len()));
+            assert_eq!(&output[..count], &expected[..count]);
+            assert!(output[count..].iter().all(|byte| *byte == 0xA5));
+        }
+    }
 
     #[test]
     fn sixaxis_polling_updates_the_ring_lifo_like_upstream() {

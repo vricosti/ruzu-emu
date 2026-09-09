@@ -523,6 +523,7 @@ fn translate_arm_instruction(
         // ASIMD
         AsimdVmovImm => asimd::arm_asimd_vmov_imm(ir, decoded),
         AsimdVmovn => asimd_two_regs_misc::arm_asimd_vmovn(ir, decoded),
+        AsimdVqmovn => asimd_two_regs_misc::arm_asimd_vqmovn(ir, decoded),
         // ASIMD three-register same (integer)
         AsimdVhadd => asimd_three_regs::arm_asimd_vhadd(ir, decoded),
         AsimdVqadd => asimd_three_regs::arm_asimd_vqadd(ir, decoded),
@@ -589,6 +590,8 @@ fn translate_arm_instruction(
         AsimdVmulScalar => asimd::arm_asimd_vmul_scalar(ir, decoded),
         AsimdVdupScalar => asimd::arm_asimd_vdup_scalar(ir, decoded),
         AsimdVcvtInteger => asimd::arm_asimd_vcvt_integer(ir, decoded),
+        AsimdVcvtFixed => asimd_two_regs_shift::arm_asimd_vcvt_fixed(ir, decoded),
+        AsimdVshll => asimd_two_regs_shift::arm_asimd_vshll(ir, decoded),
         AsimdVtrn => asimd::arm_asimd_vtrn(ir, decoded),
         AsimdVtbl => asimd::arm_asimd_vtbl(ir, decoded),
         AsimdVtbx => asimd::arm_asimd_vtbx(ir, decoded),

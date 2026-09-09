@@ -100,6 +100,7 @@ fn build_dialog() -> gtk::Window {
             window.close();
         }
     });
+    crate::i18n::translate_widget_tree(&window);
     window
 }
 
@@ -124,6 +125,7 @@ mod tests {
             }
         }
         gtk::init().unwrap();
+        crate::i18n::set_language("en");
         {
             let mut settings = common::settings::values_mut();
             settings.touchscreen.diameter_x = 70;
@@ -172,5 +174,15 @@ mod tests {
                 if accept { 0 } else { 90 }
             );
         }
+        crate::i18n::set_language("fr");
+        let translated = build_dialog();
+        assert_eq!(translated.title().as_deref(), Some("Configurer l'Écran Tactile"));
+        let mut buttons = Vec::<gtk::Button>::new();
+        collect(translated.upcast_ref(), &mut buttons);
+        assert!(buttons.iter().any(|b| b.label().as_deref() == Some("Restaurer les paramètres par défaut")));
+        crate::i18n::set_language("en");
+        crate::i18n::translate_widget_tree(&translated);
+        assert_eq!(translated.title().as_deref(), Some("Configure Touchscreen"));
+        translated.close();
     }
 }

@@ -2503,6 +2503,56 @@ fn face_buttons_group(page: &Rc<PlayerPage>) -> gtk::Box {
 mod tests {
     #[test]
     #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn debug_page_applies_to_selected_settings_bank() {
+        use super::*;
+        gtk::init().unwrap();
+        for global in [true, false] {
+            {
+                let mut settings = common::settings::values_mut();
+                settings.players.set_global(!global);
+                settings.players.get_value_mut()[9].buttons[0] = "engine:keyboard,code:71".into();
+                settings.players.set_global(global);
+                settings.players.get_value_mut()[9].buttons[0] = "engine:keyboard,code:72".into();
+            }
+            let hid = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+            let other = hid.lock().get_emulated_controller_by_index(9);
+            let input = Rc::new(RefCell::new(input_common::InputSubsystem::new()));
+            let profiles = Rc::new(InputProfileContext::new(InputProfiles::new()));
+            let initial = common::param_package::ParamPackage::from_serialized("engine:keyboard,code:72");
+            other.lock().set_button_param(0, initial.clone());
+            let page = page(9, input, hid, profiles, None, true);
+            assert_eq!(common::settings::values().players.get_value()[9].buttons[0], initial.serialize());
+            fn clear(widget: &gtk::Widget) -> bool {
+                if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                    if button.label().as_deref() == Some("Clear") {
+                        button.emit_clicked();
+                        return true;
+                    }
+                }
+                let mut child = widget.first_child();
+                while let Some(widget) = child {
+                    if clear(&widget) { return true; }
+                    child = widget.next_sibling();
+                }
+                false
+            }
+            assert!(clear(&page.widget));
+            (page.apply)();
+            {
+                let settings = common::settings::values();
+                assert_eq!(settings.players.using_global(), global);
+                assert_eq!(settings.players.get_value()[9].buttons[0], "[empty]");
+            }
+            drop(page);
+            assert!(!other.lock().is_configuring_mode());
+            let mut settings = common::settings::values_mut();
+            settings.players.set_global(!global);
+            assert_eq!(settings.players.get_value()[9].buttons[0], "engine:keyboard,code:71");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
     fn debug_page_limits_layout_and_owns_only_other_controller() {
         use super::*;
         gtk::init().unwrap();

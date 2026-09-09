@@ -9,7 +9,7 @@ use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::service::kernel_helpers::ServiceContext;
 use crate::hle::service::os::event::Event;
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -85,6 +85,27 @@ pub struct Hidbus {
 }
 
 impl Hidbus {
+    /// Hidbus::GetSharedMemoryHandle. Register the persistent kernel object in
+    /// the caller; defer handle allocation to the normal IPC reply writer.
+    fn get_shared_memory_handle(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let object_id = (|| {
+            let kernel = crate::hle::kernel::kernel::get_kernel_ref()?;
+            let (object_id, memory) = kernel.get_hid_bus_shared_mem()?;
+            let thread = ctx.get_thread()?;
+            let process = thread.lock().unwrap().parent.as_ref()?.upgrade()?;
+            process.lock().unwrap().register_shared_memory_object(object_id, memory);
+            Some(object_id)
+        })();
+        if let Some(object_id) = object_id {
+            let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+            rb.push_result(RESULT_SUCCESS);
+            rb.push_copy_object_id(object_id);
+        } else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+        }
+    }
+
     fn stub_success_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let cmd = ctx.get_command();
         log::debug!("(STUBBED) hidbus command {}", cmd);
@@ -117,7 +138,7 @@ impl Hidbus {
             ),
             (
                 10,
-                Some(Self::stub_success_handler),
+                Some(Self::get_shared_memory_handle),
                 "GetSharedMemoryHandle",
             ),
             (
@@ -167,6 +188,33 @@ impl ServiceFramework for Hidbus {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_memory_response_uses_the_same_kernel_object_for_each_caller() {
+        use super::*;
+        use crate::device_memory::{DeviceMemory, dram_memory_map};
+        use crate::hle::kernel::k_memory_manager::Pool;
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+        use crate::hle::service::hle_ipc::KAutoObjectRef;
+        let device_memory = DeviceMemory::with_size(0x10000);
+        let mut kernel = crate::hle::kernel::kernel::ScopedKernelForTest::new();
+        kernel.memory_manager_mut().initialize_pool(Pool::SECURE, dram_memory_map::BASE, 0x10000);
+        assert!(kernel.kernel_mut().initialize_hidbus_shared_memory(&device_memory).is_success());
+        let (id, memory) = kernel.kernel_mut().get_hid_bus_shared_mem().unwrap();
+        let service = Hidbus::new();
+        for _ in 0..2 {
+            let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+            let thread = Arc::new(KThreadLock::new(KThread::new()));
+            thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+            let mut ctx = HLERequestContext::new_with_thread(thread, 0);
+            Hidbus::get_shared_memory_handle(&service, &mut ctx);
+            assert_eq!(ctx.outgoing_copy_objects.len(), 1);
+            assert!(matches!(ctx.outgoing_copy_objects[0], KAutoObjectRef::ObjectId(object_id) if object_id == id));
+            let registered = process.lock().unwrap().get_shared_memory_by_object_id(id).unwrap();
+            assert!(Arc::ptr_eq(&memory, &registered));
+        }
+    }
+
     #[test]
     fn command_event_owns_kernel_endpoint_and_service_registration() {
         use super::*;

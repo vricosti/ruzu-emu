@@ -96,8 +96,9 @@ pub fn page(hid: &Arc<parking_lot::Mutex<HIDCore>>) -> (Page, Rc<ControllerCaptu
         ACTION_COLUMN_WIDTH,
         Rc::clone(&rows),
         |row| row.action(),
+        Rc::clone(&capture),
     ));
-    view.append_column(&hotkey_column(HOTKEY_COLUMN_WIDTH, Rc::clone(&rows)));
+    view.append_column(&hotkey_column(HOTKEY_COLUMN_WIDTH, Rc::clone(&rows), Rc::clone(&capture)));
     view.append_column(&controller_hotkey_column(
         "Controller Hotkey",
         HOTKEY_COLUMN_WIDTH,
@@ -252,15 +253,92 @@ fn get_button_combination_name(buttons: NpadButton, home: bool, screenshot: bool
     if names.is_empty() { crate::i18n::tr("Invalid") } else { names.join("+") }
 }
 
+/// RestoreHotkey/RestoreControllerHotkey, including upstream's same-value
+/// exception to conflict detection. A conflict leaves the previous value intact.
+fn restore_hotkey(row: &HotkeyRow, rows: &[HotkeyRow], controller: bool) -> Result<(), String> {
+    let Some(default) = crate::uisettings::DEFAULT_HOTKEYS.iter().find(|key| key.name == row.action()) else {
+        return Ok(());
+    };
+    let value = if controller { default.controller_keyseq } else { default.keyseq };
+    let current = if controller { row.controller_hotkey() } else { row.hotkey() };
+    let same = |left: &str, right: &str| if controller { left == right } else { same_key_sequence(left, right) };
+    if !same(&current, value) {
+        if let Some(conflict) = rows.iter().find(|candidate| {
+            let candidate = if controller { candidate.controller_hotkey() } else { candidate.hotkey() };
+            same(&candidate, value)
+        }) { return Err(conflict.action()); }
+    }
+    if controller { row.set_controller_hotkey(value); } else { row.set_hotkey(value); }
+    Ok(())
+}
+
+/// PopupContextMenu: Action and Hotkey columns edit the keyboard sequence;
+/// only the Controller Hotkey column edits the controller sequence.
+fn install_context_menu(
+    widget: &impl IsA<gtk::Widget>, item: &gtk::ListItem,
+    rows: Rc<Vec<HotkeyRow>>, capture: Rc<ControllerCapture>, controller: bool,
+) {
+    let click = gtk::GestureClick::new();
+    click.set_button(3);
+    let widget = widget.clone().upcast::<gtk::Widget>();
+    let source = widget.downgrade();
+    let item = item.downgrade();
+    click.connect_pressed(move |gesture, _, x, y| {
+        let (Some(source), Some(item)) = (source.upgrade(), item.upgrade()) else { return; };
+        let Some(row) = item.item().and_downcast::<gtk::TreeListRow>()
+            .and_then(|item| item.item()).and_downcast::<HotkeyRow>() else { return; };
+        if row.is_group() { return; }
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        let popover = gtk::Popover::new();
+        popover.set_parent(&source);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        for restore in [true, false] {
+            let button = gtk::Button::with_label(&crate::i18n::tr(if restore { "Restore Default" } else { "Clear" }));
+            button.add_css_class("flat");
+            button.connect_clicked({
+                let row = row.clone();
+                let rows = Rc::clone(&rows);
+                let capture = Rc::clone(&capture);
+                let popover = popover.downgrade();
+                let source = source.downgrade();
+                move |_| {
+                    capture.cancel();
+                    let result = if restore { restore_hotkey(&row, &rows, controller) } else {
+                        if controller { row.set_controller_hotkey(""); } else { row.set_hotkey(""); }
+                        Ok(())
+                    };
+                    if let Some(popover) = popover.upgrade() { popover.popdown(); }
+                    if let Err(action) = result {
+                        let parent = source.upgrade().and_then(|source| source.root()).and_downcast::<gtk::Window>();
+                        crate::gtk_compat::show_warning(parent.as_ref(),
+                            if controller { "Conflicting Button Sequence" } else { "Conflicting Key Sequence" },
+                            &crate::i18n::tr(if controller {
+                                "The default button sequence is already assigned to: %1"
+                            } else { "The default key sequence is already assigned to: %1" })
+                                .replace("%1", &crate::i18n::tr(&action)));
+                    }
+                }
+            });
+            content.append(&button);
+        }
+        popover.set_child(Some(&content));
+        popover.connect_closed(|popover| popover.unparent());
+        popover.popup();
+    });
+    widget.add_controller(click);
+}
+
 /// Editable keyboard-binding column. Upstream routes a double-click in either
 /// the action or keyboard column to the keyboard `SequenceDialog`; the binding
 /// cell is the GTK interaction target advertised by the hint above the table.
-fn hotkey_column(width: i32, rows: Rc<Vec<HotkeyRow>>) -> gtk::ColumnViewColumn {
+fn hotkey_column(width: i32, rows: Rc<Vec<HotkeyRow>>, capture: Rc<ControllerCapture>) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap().clone();
         let label = gtk::Label::new(None);
         label.set_xalign(0.0);
+        install_context_menu(&label, &item, Rc::clone(&rows), Rc::clone(&capture), false);
 
         let click = gtk::GestureClick::new();
         click.set_button(1);
@@ -369,6 +447,7 @@ fn expander_column(
     width: i32,
     rows: Rc<Vec<HotkeyRow>>,
     get: fn(&HotkeyRow) -> String,
+    capture: Rc<ControllerCapture>,
 ) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(move |_, item| {
@@ -377,6 +456,7 @@ fn expander_column(
         label.set_xalign(0.0);
         let expander = gtk::TreeExpander::new();
         expander.set_child(Some(&label));
+        install_context_menu(&expander, &list_item, Rc::clone(&rows), Rc::clone(&capture), false);
 
         let click = gtk::GestureClick::new();
         click.set_button(1);
@@ -433,6 +513,7 @@ fn controller_hotkey_column(title: &str, width: i32, get: fn(&HotkeyRow) -> Stri
     factory.connect_setup(move |_, item| {
         let label = gtk::Label::new(None);
         label.set_xalign(0.0);
+        install_context_menu(&label, item.downcast_ref::<gtk::ListItem>().unwrap(), Rc::clone(&capture.rows), Rc::clone(&capture), true);
         let click = gtk::GestureClick::new();
         click.set_button(1);
         click.connect_pressed({
@@ -635,6 +716,35 @@ fn unregister_label(labels: &mut Vec<gtk::glib::WeakRef<gtk::Label>>, label: &gt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_row_restore_checks_conflicts_without_touching_the_other_column() {
+        let default = crate::uisettings::DEFAULT_HOTKEYS.iter()
+            .find(|key| key.name == "Configure").unwrap();
+        let row = HotkeyRow::binding(default.name, "F12", "A+B");
+        let other = HotkeyRow::binding("Synthetic action", default.keyseq, "");
+        let rows = vec![row.clone(), other.clone()];
+        assert_eq!(restore_hotkey(&row, &rows, false), Err("Synthetic action".into()));
+        assert_eq!(row.hotkey(), "F12");
+        other.set_hotkey("F11");
+        assert!(restore_hotkey(&row, &rows, false).is_ok());
+        assert_eq!(row.hotkey(), default.keyseq);
+        assert_eq!(row.controller_hotkey(), "A+B");
+        other.set_hotkey(default.keyseq);
+        assert!(restore_hotkey(&row, &rows, false).is_ok(), "restoring same value is allowed");
+
+        let default = crate::uisettings::DEFAULT_HOTKEYS.iter()
+            .find(|key| !key.controller_keyseq.is_empty()).unwrap();
+        let row = HotkeyRow::binding(default.name, "F10", "A+B+X");
+        let other = HotkeyRow::binding("Synthetic action", "", default.controller_keyseq);
+        let rows = vec![row.clone(), other.clone()];
+        assert!(restore_hotkey(&row, &rows, true).is_err());
+        assert_eq!(row.controller_hotkey(), "A+B+X");
+        other.set_controller_hotkey("");
+        assert!(restore_hotkey(&row, &rows, true).is_ok());
+        assert_eq!(row.controller_hotkey(), default.controller_keyseq);
+        assert_eq!(row.hotkey(), "F10");
+    }
 
     #[test]
     fn controller_combination_names_follow_upstream_order_and_side_buttons() {

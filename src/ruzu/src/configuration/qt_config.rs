@@ -1654,6 +1654,54 @@ fn is_true(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_controller_bindings_survive_disk_reload() {
+        use super::*;
+        const CHILD: &str = "RUZU_TEST_DEBUG_BINDINGS_DISK";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "configuration::qt_config::tests::debug_controller_bindings_survive_disk_reload"])
+                .env(CHILD, root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .status().unwrap().success());
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        common::fs::path_util::set_ruzu_path(RuzuPath::ConfigDir, &root);
+        load_control_values();
+        let hid = hid_core::hid_core::HIDCore::new();
+        let controller = hid.get_emulated_controller_by_index(9);
+        let button = common::param_package::ParamPackage::from_serialized("engine:keyboard,code:71");
+        let stick = common::param_package::ParamPackage::from_serialized("engine:analog_from_button,left:engine$0keyboard$1code$065");
+        {
+            let mut controller = controller.lock();
+            controller.set_button_param(0, button.clone());
+            controller.set_stick_param(0, stick.clone());
+            controller.save_current_config();
+        }
+        save_control_values().unwrap();
+        let disk = parse_controls(&std::fs::read_to_string(config_path()).unwrap());
+        assert_eq!(disk["player_9_button_a"], button.serialize());
+        assert_eq!(disk["player_9_lstick"], stick.serialize());
+        {
+            let mut settings = common::settings::values_mut();
+            settings.players.get_value_mut()[9].buttons[0].clear();
+            settings.players.get_value_mut()[9].analogs[0].clear();
+        }
+        load_control_values();
+        let mut controller = controller.lock();
+        controller.reload_from_settings();
+        let loaded_button = controller.get_button_param(0);
+        assert_eq!(loaded_button.get_str("engine", ""), "keyboard");
+        assert_eq!(loaded_button.get_int("code", -1), 71);
+        let loaded_stick = controller.get_stick_param(0);
+        assert_eq!(loaded_stick.get_str("engine", ""), "analog_from_button");
+        assert_eq!(loaded_stick.get_str("left", ""), stick.get_str("left", ""));
+    }
+
     use super::*;
 
     #[test]

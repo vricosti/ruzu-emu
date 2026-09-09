@@ -906,6 +906,60 @@ mod fullscreen_hotkey_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires GTK display and isolated XDG directories; run alone"]
+    fn main_window_capture_dispatches_configured_shortcuts_once_per_press() {
+        gtk::init().unwrap();
+        let app = Application::builder().application_id("org.ruzu.KeyboardCaptureTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let main = GMainWindow::new_for_direct_game(&app);
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let action = gio::SimpleAction::new("audio_volume_up", None);
+        action.connect_activate({
+            let calls = Rc::clone(&calls);
+            move |_, _| calls.set(calls.get() + 1)
+        });
+        app.add_action(&action);
+        crate::uisettings::with_mut(|values| {
+            values.shortcuts.retain(|shortcut| shortcut.name == "Audio Volume Up");
+            values.shortcuts[0].keyseq = "Ctrl+F12".into();
+            values.shortcuts[0].repeat = false;
+        });
+        let controllers = main.window.observe_controllers();
+        let keys = (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i).and_downcast::<gtk::EventControllerKey>())
+            .find(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture)
+            .expect("production capture handler");
+        let press = || keys.emit_by_name::<bool>("key-pressed", &[
+            &gtk::gdk::Key::F12, &96u32, &gtk::gdk::ModifierType::CONTROL_MASK,
+        ]);
+        assert!(press(), "configured action must stop input propagation");
+        assert!(press());
+        assert_eq!(calls.get(), 1);
+        // Releasing Control first must not prevent release bookkeeping.
+        keys.emit_by_name::<()>("key-released", &[
+            &gtk::gdk::Key::F12, &96u32, &gtk::gdk::ModifierType::empty(),
+        ]);
+        assert!(press());
+        assert_eq!(calls.get(), 2);
+        crate::uisettings::with_mut(|values| values.shortcuts[0].repeat = true);
+        assert!(press());
+        assert_eq!(calls.get(), 3);
+        action.set_enabled(false);
+        assert!(press(), "already consumed press stays consumed after disable");
+        assert_eq!(calls.get(), 3);
+        let focus = (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i).and_downcast::<gtk::EventControllerFocus>())
+            .next().unwrap();
+        focus.emit_by_name::<()>("leave", &[]);
+        action.set_enabled(true);
+        crate::uisettings::with_mut(|values| values.shortcuts[0].repeat = false);
+        assert!(press());
+        assert_eq!(calls.get(), 4);
+        // Destroy without invoking the user-facing close/save workflow.
+        main.window.destroy();
+    }
+
+    #[test]
     fn classifies_upstream_fullscreen_shortcuts() {
         assert_eq!(
             fullscreen_hotkey(gtk::gdk::Key::F11),

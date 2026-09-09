@@ -205,9 +205,9 @@ pub struct RingController {
 }
 
 impl RingController {
-    pub fn new() -> Self {
+    pub fn new(event: Box<dyn super::hidbus_base::HidbusCommandEvent>) -> Self {
         Self {
-            base: HidbusBase::new(),
+            base: HidbusBase::new(event),
             input: None,
             command: RingConCommands::Error,
             total_rep_count: 0,
@@ -240,10 +240,10 @@ impl RingController {
         }
     }
 
-    pub fn new_with_input(input: Arc<Mutex<EmulatedController>>) -> Self {
+    pub fn new_with_input(input: Arc<Mutex<EmulatedController>>, event: Box<dyn super::hidbus_base::HidbusCommandEvent>) -> Self {
         Self {
             input: Some(input),
-            ..Self::new()
+            ..Self::new(event)
         }
     }
 
@@ -340,15 +340,13 @@ impl RingController {
             | RingConCommands::ReadRepCount
             | RingConCommands::ReadTotalPushCount => {
                 assert!(data.len() == 0x4, "data.size is not 0x4 bytes");
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.send_command_async_event.signal();
                 true
             }
             RingConCommands::ResetRepCount => {
                 assert!(data.len() == 0x4, "data.size is not 0x4 bytes");
                 self.total_rep_count = 0;
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.send_command_async_event.signal();
                 true
             }
             RingConCommands::SaveCalData => {
@@ -362,16 +360,14 @@ impl RingController {
                     self.user_calibration.zero.value = i16::from_le_bytes([data[12], data[13]]);
                     self.user_calibration.zero.crc = u16::from_le_bytes([data[14], data[15]]);
                 }
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.send_command_async_event.signal();
                 true
             }
             _ => {
                 log::error!("Command not implemented {:?}", self.command);
                 self.command = RingConCommands::Error;
                 // Signal a reply to avoid softlocking the game
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.send_command_async_event.signal();
                 false
             }
         }
@@ -528,20 +524,52 @@ impl RingController {
     }
 }
 
-impl Default for RingController {
-    fn default() -> Self {
-        Self::new()
-    }
+impl super::hidbus_base::HidbusDevice for RingController {
+    fn base(&self) -> &HidbusBase { &self.base }
+    fn base_mut(&mut self) -> &mut HidbusBase { &mut self.base }
+    fn on_init(&mut self) { RingController::on_init(self); }
+    fn on_release(&mut self) { RingController::on_release(self); }
+    fn on_update(&mut self) { RingController::on_update(self); }
+    fn get_device_id(&self) -> u8 { RingController::get_device_id(self) }
+    fn set_command(&mut self, data: &[u8]) -> bool { RingController::set_command(self, data) }
+    fn get_reply(&self, data: &mut [u8]) -> u64 { RingController::get_reply(self, data) }
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn command_completion_signals_all_reply_paths_and_releases_owner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Event(Arc<AtomicUsize>);
+        impl super::super::hidbus_base::HidbusCommandEvent for Event {
+            fn signal(&self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let weak = Arc::downgrade(&count);
+        let mut controller = RingController::new(Box::new(Event(Arc::clone(&count))));
+        assert!(!controller.set_command(&[0, 1, 2]));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        for (index, command) in [RingConCommands::GetFirmwareVersion,
+            RingConCommands::ResetRepCount, RingConCommands::SaveCalData,
+            RingConCommands::Error].into_iter().enumerate() {
+            let mut data = (command as u32).to_le_bytes().to_vec();
+            if command == RingConCommands::SaveCalData { data.resize(0x14, 0); }
+            assert_eq!(controller.set_command(&data), command != RingConCommands::Error);
+            assert_eq!(count.load(Ordering::SeqCst), index + 1);
+        }
+        drop(count);
+        assert!(weak.upgrade().is_some());
+        drop(controller);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
     fn sixaxis_polling_updates_the_ring_lifo_like_upstream() {
-        let mut controller = RingController::new();
-        controller.base.activate_device();
+        let mut controller = RingController::new(super::super::hidbus_base::test_command_event());
+        crate::hidbus::hidbus_base::HidbusDevice::activate_device(&mut controller);
         controller.base.enable(true);
         controller
             .base

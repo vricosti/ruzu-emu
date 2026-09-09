@@ -2208,6 +2208,7 @@ dependencies = [
  "network",
  "objc",
  "parking_lot",
+ "sdl3-sys",
  "serde_json",
  "tempfile",
  "video_core",

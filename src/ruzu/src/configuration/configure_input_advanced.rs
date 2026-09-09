@@ -88,8 +88,6 @@ pub fn page(
         *common::settings::values().enable_ir_sensor.get_value(),
         Some("Configure"),
     );
-    // Match Eden without Qt Multimedia: Ruzu has no frontend camera capture backend yet.
-    infrared.row.set_sensitive(false);
 
     for device in [
         &keyboard,
@@ -174,16 +172,8 @@ pub fn page(
 
     column.append(&split);
 
-    // The remaining per-device Configure dialogs are separate upstream
-    // widgets; log until their matching owners are ported.
-    for (button, name) in [
-        (&infrared.configure, "Infrared camera"),
-    ] {
-        let Some(button) = button else { continue };
-        let name = name.to_string();
-        button.connect_clicked(move |_| {
-            log::info!("Controls: {name} configuration not yet ported");
-        });
+    if let Some(button) = &infrared.configure {
+        button.connect_clicked(super::configure_camera::present);
     }
     if let Some(button) = &debug_controller.configure {
         let input = Rc::clone(&input_subsystem);

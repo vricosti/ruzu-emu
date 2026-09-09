@@ -557,6 +557,7 @@ pub struct GMainWindow {
     render: RefCell<Option<RenderHandles>>,
     mouse_hide_timer: RefCell<Option<glib::SourceId>>,
     mouse_constrain_timer: RefCell<Option<glib::SourceId>>,
+    camera_timer: RefCell<Option<glib::SourceId>>,
     /// Last native render rectangle, including origin and DPI, so the child
     /// surface cannot drift over the menu/status bars after a restore.
     render_geometry: Cell<Option<RenderGeometry>>,
@@ -1896,6 +1897,7 @@ impl GMainWindow {
             render: RefCell::new(None),
             mouse_hide_timer: RefCell::new(None),
             mouse_constrain_timer: RefCell::new(None),
+            camera_timer: RefCell::new(None),
             render_geometry: Cell::new(None),
             configure_dialog: RefCell::new(None),
             controller_hotkeys: RefCell::new(Vec::new()),
@@ -4329,6 +4331,7 @@ impl GMainWindow {
             self,
             move || {
                 let docked = common::settings::is_docked_mode(&common::settings::values());
+                this.initialize_camera();
                 let previous = previous_docked.replace(docked);
                 if let Some(session) = this.session.borrow().as_ref() {
                     let _ = session.docked_mode_changed(previous, docked);
@@ -5223,6 +5226,7 @@ impl GMainWindow {
             loading_event,
         );
         *self.session.borrow_mut() = Some(session);
+        self.initialize_camera();
         self.status_bar.set_emulation_running(true);
         if let Some(game_list) = self.game_list.borrow().as_ref() {
             game_list.set_refresh_enabled(false);
@@ -5413,6 +5417,7 @@ impl GMainWindow {
             loading_event,
         );
         *self.session.borrow_mut() = Some(session);
+        self.initialize_camera();
         self.status_bar.set_emulation_running(true);
         if let Some(game_list) = self.game_list.borrow().as_ref() {
             game_list.set_refresh_enabled(false);
@@ -5591,6 +5596,7 @@ impl GMainWindow {
             loading_event,
         );
         *self.session.borrow_mut() = Some(session);
+        self.initialize_camera();
         self.status_bar.set_emulation_running(true);
         if let Some(game_list) = self.game_list.borrow().as_ref() {
             game_list.set_refresh_enabled(false);
@@ -6231,6 +6237,7 @@ impl GMainWindow {
     /// thread requests guest exit, applies the upstream timeout, and reports
     /// `StopComplete` after forced teardown if necessary.
     fn begin_stop_game(self: &Rc<Self>) -> bool {
+        self.finalize_camera();
         self.stop_mouse_constraint();
         crate::gamemode::stop();
         self.play_time_manager.stop();
@@ -6274,6 +6281,7 @@ impl GMainWindow {
     /// before releasing the native render target, clear the loading assets,
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        self.finalize_camera();
         self.stop_mouse_constraint();
         if self.pre_fullscreen_state.borrow().is_some() {
             self.set_fullscreen(false);
@@ -6362,6 +6370,59 @@ impl GMainWindow {
         };
         self.play_time_manager.set_program_id(program_id);
         self.play_time_manager.start();
+    }
+
+    /// GRenderWindow::InitializeCamera/FinalizeCamera: the GTK source owns the
+    /// SDL capture and drops it when removed, before input/session destruction.
+    fn initialize_camera(self: &Rc<Self>) {
+        self.finalize_camera();
+        if self.session.borrow().is_none() {
+            return;
+        }
+        let selected = {
+            let values = common::settings::values();
+            if !*values.enable_ir_sensor.get_value() {
+                return;
+            }
+            values.ir_sensor_device.get_value().clone()
+        };
+        let Some(mut driver) = self.input_subsystem.borrow().get_camera().cloned() else {
+            return;
+        };
+        let mut capture = match crate::camera_capture::Capture::open(&selected) {
+            Ok(capture) => capture,
+            Err(error) => {
+                log::error!("Cannot initialize infrared camera: {error}");
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        let timer = glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            let Some(this) = weak.upgrade() else { return glib::ControlFlow::Break; };
+            if !*common::settings::values().enable_ir_sensor.get_value() {
+                this.camera_timer.borrow_mut().take();
+                return glib::ControlFlow::Break;
+            }
+            let width = driver.get_image_width();
+            let height = driver.get_image_height();
+            match capture.frame(width, height) {
+                Ok(Some(pixels)) => driver.set_camera_data(width, height, &pixels),
+                Ok(None) => {},
+                Err(error) => {
+                    log::error!("Infrared camera capture stopped: {error}");
+                    this.camera_timer.borrow_mut().take();
+                    return glib::ControlFlow::Break;
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+        *self.camera_timer.borrow_mut() = Some(timer);
+    }
+
+    fn finalize_camera(&self) {
+        if let Some(timer) = self.camera_timer.borrow_mut().take() {
+            timer.remove();
+        }
     }
 
     /// Animate fake shader-build progress to exercise the loading-screen UI.

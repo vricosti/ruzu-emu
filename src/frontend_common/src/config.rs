@@ -2834,7 +2834,7 @@ mod tests {
             ("mouse_panning_min_decay", "26"), ("emulate_analog_keyboard", "true"),
             ("touch_device", "min_x:20,min_y:30,max_x:900,max_y:800"),
             ("touch_from_button_map", "2"), ("enable_ring_controller", "false"),
-            ("enable_ir_sensor", "true"), ("ir_sensor_device", "synthetic-camera"),
+            ("enable_ir_sensor", "true"), ("ir_sensor_device", "sdl-name:Synthetic camera = 1"),
             ("random_amiibo_id", "true"),
         ];
         common::settings::values_mut().for_each_setting_in_category_mut(Category::Controls, |setting| {
@@ -2856,7 +2856,7 @@ mod tests {
         let mut reader = BaseConfig::new(ConfigType::GlobalConfig);
         reader.set_up_ini(&path);
         for (key, value) in entries {
-            let stored = if key == "touch_device" { format!("\"{value}\"") } else { value.to_owned() };
+            let stored = if matches!(key, "touch_device" | "ir_sensor_device") { format!("\"{value}\"") } else { value.to_owned() };
             assert_eq!(reader.ini["Controls"].get(key), Some(&stored), "{key}");
         }
         assert!(!reader.ini["Controls"].contains_key("mouse_panning"));

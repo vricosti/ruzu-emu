@@ -19,6 +19,7 @@ use gtk::{gio, glib};
 mod about_dialog;
 mod applets;
 mod boot;
+mod camera_capture;
 mod configuration;
 mod debugger;
 mod emu_window;

@@ -48,6 +48,8 @@
   <string>11.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSCameraUsageDescription</key>
+  <string>Ruzu uses the camera you select to emulate infrared camera input and display its preview.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
   <key>NSSupportsAutomaticGraphicsSwitching</key>

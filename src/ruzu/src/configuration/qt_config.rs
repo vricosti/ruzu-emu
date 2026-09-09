@@ -1103,7 +1103,7 @@ pub(super) const DEFAULT_BUTTONS: [i32; native_button::NUM_BUTTONS] = [
 pub(super) const DEFAULT_MOTIONS: [i32; native_motion::NUM_MOTIONS] = [b'7' as i32, b'8' as i32];
 
 /// QtConfig::default_ringcon_analogs.
-const DEFAULT_RINGCON_ANALOGS: [i32; 2] = [b'A' as i32, b'D' as i32];
+pub(super) const DEFAULT_RINGCON_ANALOGS: [i32; 2] = [b'A' as i32, b'D' as i32];
 
 /// QtConfig::ReadHidbusValues, using the already parsed Controls section.
 fn read_hidbus_values(values: &std::collections::BTreeMap<String, String>) -> String {

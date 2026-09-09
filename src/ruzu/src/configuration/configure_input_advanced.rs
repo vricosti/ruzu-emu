@@ -88,7 +88,7 @@ pub fn page(
         *common::settings::values().enable_ir_sensor.get_value(),
         Some("Configure"),
     );
-    // Upstream ships the IR camera row permanently disabled (no backend).
+    // Match Eden without Qt Multimedia: Ruzu has no frontend camera capture backend yet.
     infrared.row.set_sensitive(false);
 
     for device in [
@@ -177,7 +177,6 @@ pub fn page(
     // The remaining per-device Configure dialogs are separate upstream
     // widgets; log until their matching owners are ported.
     for (button, name) in [
-        (&ring_controller.configure, "Ring controller"),
         (&infrared.configure, "Infrared camera"),
     ] {
         let Some(button) = button else { continue };
@@ -192,6 +191,11 @@ pub fn page(
         button.connect_clicked(move |button| {
             super::configure_debug_controller::present(button, Rc::clone(&input), std::sync::Arc::clone(&hid_core), Rc::clone(&profiles));
         });
+    }
+    if let Some(button) = &ring_controller.configure {
+        let input = Rc::clone(&input_subsystem);
+        let hid = Arc::clone(&hid_core);
+        button.connect_clicked(move |button| super::configure_ringcon::present(button, Rc::clone(&input), Arc::clone(&hid)));
     }
     configure_motion_touch.connect_clicked(move |button| {
         super::configure_motion_touch::present(button, Rc::clone(&input_subsystem));

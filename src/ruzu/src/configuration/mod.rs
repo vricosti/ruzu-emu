@@ -47,6 +47,7 @@ pub mod configure_system;
 pub mod configure_tas;
 pub mod configure_touch_from_button;
 pub mod configure_touchscreen_advanced;
+pub mod configure_ringcon;
 pub mod configure_ui;
 pub mod configure_vibration;
 pub mod configure_web;

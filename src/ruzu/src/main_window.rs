@@ -5388,7 +5388,7 @@ fn switch_modifiers(state: gtk::gdk::ModifierType) -> i32 {
 ///
 /// Printable Qt keys use their uppercase Unicode value. Non-printable keys
 /// occupy Qt's `0x01000000` range.
-fn gdk_key_to_qt_key(keyval: gtk::gdk::Key) -> i32 {
+pub(crate) fn gdk_key_to_qt_key(keyval: gtk::gdk::Key) -> i32 {
     use gtk::gdk::Key;
 
     const QT_KEY_ESCAPE: i32 = 0x0100_0000;

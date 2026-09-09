@@ -459,6 +459,7 @@ fn preserve_global_selections(state: &SettingState) {
             }
         });
     }
+    configure_audio::preserve_device_overrides(&mut values);
 }
 
 fn info_panel(properties: &GameProperties) -> gtk::Frame {

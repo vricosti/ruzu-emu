@@ -221,6 +221,17 @@ fn selected_device(devices: &[String], selected: &str) -> u32 {
         .unwrap_or(0) as u32
 }
 
+/// ConfigureAudio::Setup keeps device overrides when the custom sink differs
+/// from the global one (global_sink_match disables their restore buttons).
+/// Ruzu restores unchanged global values after applying all per-game pages;
+/// identical device text is not sufficient when it belongs to another sink.
+pub(super) fn preserve_device_overrides(values: &mut common::settings::Values) {
+    if values.sink_id.get_value() != values.sink_id.get_value_global() {
+        values.audio_output_device_id.set_global(false);
+        values.audio_input_device_id.set_global(false);
+    }
+}
+
 fn set_devices(dropdown: &gtk::DropDown, devices: Vec<String>, selected: u32) {
     let device_refs: Vec<&str> = devices.iter().map(String::as_str).collect();
     dropdown.set_model(Some(&gtk::StringList::new(&device_refs)));
@@ -234,6 +245,39 @@ fn set_devices(dropdown: &gtk::DropDown, devices: Vec<String>, selected: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn different_custom_engine_keeps_devices_independent_of_global_changes() {
+        let mut values = common::settings::Values::default();
+        values.sink_id.set_value(AudioEngine::Auto);
+        values.sink_id.set_global(false);
+        values.sink_id.set_value(AudioEngine::Null);
+        for device in [&mut values.audio_output_device_id, &mut values.audio_input_device_id] {
+            device.set_global(false);
+            device.set_value("auto".to_owned());
+            // The generic per-game pass restores equal values to global.
+            device.set_global(true);
+        }
+        preserve_device_overrides(&mut values);
+        for device in [&mut values.audio_output_device_id, &mut values.audio_input_device_id] {
+            assert!(!device.using_global());
+            device.set_global(true);
+            device.set_value("Global device".to_owned());
+            device.set_global(false);
+            assert_eq!(device.get_value(), "auto");
+        }
+    }
+
+    #[test]
+    fn matching_engine_allows_device_inheritance() {
+        let mut values = common::settings::Values::default();
+        let engine = *values.sink_id.get_value();
+        values.sink_id.set_global(false);
+        values.sink_id.set_value(engine);
+        preserve_device_overrides(&mut values);
+        assert!(values.audio_output_device_id.using_global());
+        assert!(values.audio_input_device_id.using_global());
+    }
 
     #[test]
     fn engine_and_devices_are_startup_only_but_volume_and_mode_are_live() {

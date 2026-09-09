@@ -136,6 +136,29 @@ pub fn attach_render_window(
     })
 }
 
+/// Native part of MainWindow::ToggleWindowMode. Keep the HWND used by Vulkan;
+/// the caller subsequently resizes it in the destination GTK host.
+pub fn reparent_render_window(destination: &gtk::Window, child: HWND) -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetParent;
+    if child.is_null() { return false; }
+    let Some(surface) = destination.surface() else { return false; };
+    let parent = unsafe { gdk_win32_surface_get_handle(surface.as_ptr().cast()) };
+    if parent.is_null() { return false; }
+    // Both hosts belong to GTK in this process, with the same DPI awareness.
+    // WS_CHILD remains set: this is not a conversion to a desktop popup.
+    unsafe {
+        SetLastError(0);
+        let previous = SetParent(child, parent);
+        let error = GetLastError();
+        if previous.is_null() && error != 0 {
+            log::error!("Cannot reparent native render window: Win32 error {error}");
+            return false;
+        }
+    }
+    true
+}
+
 /// Show or hide the child render window.
 pub fn set_render_window_hidden(window: HWND, hidden: bool) {
     if window.is_null() {

@@ -491,11 +491,23 @@ mod background_setting_tests {
 ///
 /// Upstream `GMainWindow` derives from `QMainWindow`; here we wrap a
 /// `gtk::ApplicationWindow` and retain the frontend session state.
+struct DetachedRenderHost {
+    window: gtk::Window,
+    area: gtk::Box,
+}
+
 pub struct GMainWindow {
     window: ApplicationWindow,
+    /// GTK counterpart of GRenderWindow's independent top-level parent.
+    /// Native surface ownership remains in `render`, not in this GTK host.
+    detached_render_host: RefCell<Option<DetachedRenderHost>>,
+    /// First frame has completed the loading transition; independent of the
+    /// launcher's selected page when rendering in another window.
+    render_page_visible: Cell<bool>,
+    saved_render_window_geometry: Cell<Option<crate::uisettings::RenderWindowGeometry>>,
     /// Qt saveGeometry/restoreGeometry includes the maximized state. GTK's
     /// Win32 fullscreen rectangle restoration alone does not preserve it.
-    maximized_before_fullscreen: Cell<Option<bool>>,
+    pre_fullscreen_state: RefCell<Option<(gtk::Window, bool)>>,
     /// Multiplayer client. Upstream keeps it in `Core::System`'s room network;
     /// it lives here until the room network owner is ported, because the
     /// Multiplayer menu is currently its only user.
@@ -578,6 +590,8 @@ pub struct GMainWindow {
     /// GUI software keyboard applet installed for each boot.
     /// Upstream owner: `GMainWindow` through `QtSoftwareKeyboard`.
     software_keyboard: Arc<crate::applets::software_keyboard::GtkSoftwareKeyboard>,
+    software_keyboard_frontend: Rc<crate::applets::software_keyboard::SoftwareKeyboardFrontend>,
+    error_applet_frontend: Rc<crate::applets::error::ErrorAppletFrontend>,
 }
 
 /// Handles needed to resize the embedded render surface on window resize.
@@ -921,6 +935,227 @@ mod fullscreen_hotkey_tests {
 
     #[test]
     #[ignore = "requires GTK display and isolated XDG directories; run alone"]
+    fn detached_host_boot_presentation_and_idle_close_preserve_saved_mode() {
+        gtk::init().unwrap();
+        let app = Application::builder().application_id("org.ruzu.DetachedBootTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        crate::uisettings::with_mut(|values| values.single_window_mode.set_value(false));
+        let main = GMainWindow::new_for_direct_game(&app);
+        let host = main.render_host().0;
+        assert_ne!(host, main.window.clone().upcast::<gtk::Window>());
+        assert!(!host.get_visible());
+        main.present_render_host_for_boot();
+        assert!(host.get_visible());
+        main.present_render_host_for_boot();
+        assert_eq!(main.render_host().0, host);
+        // Closing an idle render window hides it, without dropping the selected
+        // host or changing the setting needed for the next boot.
+        host.close();
+        assert!(!host.get_visible());
+        assert!(main.detached_render_host.borrow().is_some());
+        main.present_render_host_for_boot();
+        assert!(host.get_visible());
+        // Exercise the launcher's actual close handler. It must release the
+        // second application window without persisting integrated mode.
+        main.window.present();
+        main.window.close();
+        assert!(main.detached_render_host.borrow().is_none());
+        assert!(!app.windows().contains(&host));
+        assert!(!crate::uisettings::with(|values| *values.single_window_mode.get_value()));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires X11/GTK and isolated XDG directories; run alone"]
+    fn window_mode_preserves_live_native_child() {
+        use x11::xlib;
+        gtk::init().unwrap();
+        let app = Application::builder().application_id("org.ruzu.NativeHostTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        crate::uisettings::with_mut(|values| values.single_window_mode.set_value(true));
+        let main = GMainWindow::new_for_direct_game(&app);
+        let x11 = gdk4_x11::X11Display::open(None).unwrap();
+        main.window.set_display(&x11);
+        gtk::prelude::WidgetExt::realize(&main.window);
+        let embedded = crate::render_window_x11::attach_render_window(main.window.upcast_ref(),
+            Some((0.0, 0.0, 64.0, 64.0))).unwrap();
+        *main.render.borrow_mut() = Some(RenderHandles {
+            emu_window: crate::emu_window::GtkEmuWindow::from_window_info(Default::default(), embedded.drawable_size),
+            child_window: embedded.window as usize, display: embedded.display as usize,
+            colormap: embedded.colormap,
+        });
+        for _ in 0..4 {
+            gio::prelude::ActionGroupExt::activate_action(&app, "single_window_mode", None);
+            let mut root = 0;
+            let mut parent = 0;
+            let mut children = std::ptr::null_mut();
+            let mut count = 0;
+            unsafe {
+                assert_ne!(xlib::XQueryTree(embedded.display.cast(), embedded.window,
+                    &mut root, &mut parent, &mut children, &mut count), 0);
+                if !children.is_null() { xlib::XFree(children.cast()); }
+            }
+            let surface = main.render_host().0.surface().unwrap();
+            assert_eq!(parent, surface.downcast::<gdk4_x11::X11Surface>().unwrap().xid());
+            assert_eq!(main.render.borrow().as_ref().unwrap().child_window, embedded.window as usize);
+        }
+        assert!(main.detached_render_host.borrow().is_none());
+        main.render.borrow_mut().take();
+        crate::render_window_x11::destroy_render_window(embedded.display, embedded.window, embedded.colormap);
+        main.window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires GTK display and isolated XDG directories; run alone"]
+    fn switching_render_hosts_moves_loading_widget_without_changing_launcher() {
+        gtk::init().unwrap();
+        let app = Application::builder().application_id("org.ruzu.WindowModeTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let main = GMainWindow::new_for_direct_game(&app);
+        let launcher_parent = main.stack.parent().unwrap();
+        for iteration in 0..4 {
+            gio::prelude::ActionGroupExt::activate_action(&app, "single_window_mode", None);
+            assert!(main.detached_render_host.borrow().is_some());
+            assert!(!crate::uisettings::with(|values| *values.single_window_mode.get_value()));
+            main.update_fullscreen_chrome(true);
+            if let Some(menu) = main.menu_bar.as_ref() { assert!(menu.get_visible()); }
+            let (window, area) = main.render_host();
+            assert_ne!(window, main.window.clone().upcast::<gtk::Window>());
+            if iteration > 0 { assert_eq!(window.default_size(), (1600, 900)); }
+            let launcher_size = main.window.default_size();
+            for (action, height) in [("reset_window_size_720", 720), ("reset_window_size_900", 900), ("reset_window_size_1080", 1080)] {
+                common::settings::values_mut().aspect_ratio.set_value(common::settings_enums::AspectRatio::R4_3);
+                gio::prelude::ActionGroupExt::activate_action(&app, action, None);
+                assert_eq!(window.default_size(), (height * 4 / 3, height));
+                assert_eq!(main.window.default_size(), launcher_size);
+            }
+            common::settings::values_mut().aspect_ratio.set_value(common::settings_enums::AspectRatio::Stretch);
+            gio::prelude::ActionGroupExt::activate_action(&app, "reset_window_size_900", None);
+            assert_eq!(window.default_size(), (1600, 900));
+            assert_eq!(main.loading_screen.widget().parent(), Some(area));
+            assert_eq!(main.stack.parent().as_ref(), Some(&launcher_parent));
+            assert!(main.switch_render_host(false), "same mode is idempotent");
+            assert_eq!(main.render_host().0, window);
+            gio::prelude::ActionGroupExt::activate_action(&app, "single_window_mode", None);
+            assert!(main.detached_render_host.borrow().is_none());
+            assert!(crate::uisettings::with(|values| *values.single_window_mode.get_value()));
+            let saved = crate::uisettings::restore_render_window_state().unwrap().unwrap();
+            assert_eq!((saved.width, saved.height), (1600, 900));
+            main.update_fullscreen_chrome(true);
+            if let Some(menu) = main.menu_bar.as_ref() { assert!(!menu.get_visible()); }
+            main.update_fullscreen_chrome(false);
+            assert_eq!(main.loading_screen.widget().parent(), Some(main.stack.clone().upcast()));
+            assert_eq!(main.stack.visible_child_name().as_deref(), Some(PAGE_GAME_LIST));
+            assert_eq!(main.render_host().0, main.window.clone().upcast::<gtk::Window>());
+        }
+        main.window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires GTK display and isolated XDG directories; run alone"]
+    fn render_page_transition_rejects_stale_sessions_and_preserves_launcher() {
+        gtk::init().unwrap();
+        let app = Application::builder().application_id("org.ruzu.RenderPageTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let main = GMainWindow::new_for_direct_game(&app);
+        let emu = crate::emu_window::GtkEmuWindow::from_window_info(Default::default(), (64, 64));
+        let shown = emu.shown_state();
+        // Null native handles exercise GTK state without a GPU or visible window.
+        *main.render.borrow_mut() = Some(RenderHandles {
+            emu_window: emu, child_window: 0,
+            #[cfg(target_os = "linux")] display: 0,
+            #[cfg(target_os = "linux")] colormap: 0,
+            #[cfg(target_os = "macos")] metal_layer: 0,
+        });
+        main.session_generation.set(7);
+        main.show_loading_screen();
+        main.show_render_page(6);
+        assert!(!main.render_page_visible.get());
+        assert_eq!(main.stack.visible_child_name().as_deref(), Some(PAGE_LOADING));
+        let render_available_during_notify = Rc::new(Cell::new(false));
+        let notification = main.stack.connect_visible_child_name_notify({
+            let main = Rc::downgrade(&main);
+            let available = Rc::clone(&render_available_during_notify);
+            move |_| {
+                let main = main.upgrade().unwrap();
+                available.set(main.render.try_borrow_mut().is_ok());
+            }
+        });
+        main.show_render_page(7);
+        assert!(render_available_during_notify.get());
+        main.stack.disconnect(notification);
+        assert!(main.render_page_visible.get());
+        assert_eq!(main.stack.visible_child_name().as_deref(), Some(PAGE_RENDER));
+        let detached = gtk::Window::new();
+        let area = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        detached.set_child(Some(&area));
+        *main.detached_render_host.borrow_mut() = Some(DetachedRenderHost { window: detached.clone(), area });
+        main.install_render_visibility_handlers(&detached);
+        main.show_render_page(7);
+        assert!(main.render_page_visible.get());
+        assert_eq!(main.stack.visible_child_name().as_deref(), Some(PAGE_GAME_LIST));
+        gtk::prelude::WidgetExt::realize(&main.window);
+        gtk::prelude::WidgetExt::realize(&detached);
+        shown.store(true, std::sync::atomic::Ordering::SeqCst);
+        main.window.emit_by_name::<()>("unmap", &[]);
+        assert!(shown.load(std::sync::atomic::Ordering::SeqCst));
+        detached.emit_by_name::<()>("unmap", &[]);
+        assert!(!shown.load(std::sync::atomic::Ordering::SeqCst));
+        main.render.borrow_mut().take();
+        main.show_game_list();
+        main.show_render_page(7);
+        assert!(!main.render_page_visible.get());
+        detached.destroy();
+        main.window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires GTK display and isolated XDG directories; run alone"]
+    fn render_host_selection_keeps_launcher_separate() {
+        gtk::init().unwrap();
+        let app = Application::builder().application_id("org.ruzu.RenderHostTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let main = GMainWindow::new_for_direct_game(&app);
+        let (window, area) = main.render_host();
+        assert_eq!(window, main.window.clone().upcast::<gtk::Window>());
+        assert_eq!(area, main.stack.clone().upcast::<gtk::Widget>());
+        let detached = gtk::Window::new();
+        let backdrop = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        detached.set_child(Some(&backdrop));
+        *main.detached_render_host.borrow_mut() = Some(DetachedRenderHost {
+            window: detached.clone(), area: backdrop.clone(),
+        });
+        assert!(!main.render_host_ready());
+        let (window, area) = main.render_host();
+        assert_eq!(window, detached);
+        assert_eq!(area, backdrop.upcast::<gtk::Widget>());
+        assert!(main.stack.parent().is_some(), "launcher stays in its original hierarchy");
+        assert!(!main.is_render_input_source(Some(main.window.clone().upcast())));
+        assert!(main.is_render_input_source(Some(detached.clone().upcast())));
+        assert!(!main.is_render_input_source(None));
+        main.install_input_handlers(&detached);
+        let focus = |window: &gtk::Window| {
+            let controllers = window.observe_controllers();
+            (0..controllers.n_items())
+                .filter_map(|i| controllers.item(i).and_downcast::<gtk::EventControllerFocus>())
+                .next().unwrap()
+        };
+        *main.mouse_constrain_timer.borrow_mut() = Some(glib::timeout_add_local(
+            std::time::Duration::from_secs(60), || panic!("cancelled timer fired")));
+        focus(main.window.upcast_ref()).emit_by_name::<()>("leave", &[]);
+        assert!(main.mouse_constrain_timer.borrow().is_some(), "launcher focus must not clear render input");
+        focus(&detached).emit_by_name::<()>("leave", &[]);
+        assert!(main.mouse_constrain_timer.borrow().is_none());
+        main.detached_render_host.borrow_mut().take();
+        assert_eq!(main.render_host().0, main.window.clone().upcast::<gtk::Window>());
+        assert!(main.is_render_input_source(Some(main.window.clone().upcast())));
+        assert!(!main.is_render_input_source(Some(detached.clone().upcast())));
+        detached.destroy();
+        main.window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires GTK display and isolated XDG directories; run alone"]
     fn mouse_panning_action_and_focus_cleanup() {
         gtk::init().unwrap();
         let app = Application::builder().application_id("org.ruzu.MousePanningTest").build();
@@ -1010,6 +1245,24 @@ mod fullscreen_hotkey_tests {
         crate::uisettings::with_mut(|values| values.shortcuts[0].repeat = false);
         assert!(press());
         assert_eq!(calls.get(), 4);
+        assert!(main.switch_render_host(false));
+        let detached = main.render_host().0;
+        let detached_controllers = detached.observe_controllers();
+        let detached_keys = (0..detached_controllers.n_items())
+            .filter_map(|i| detached_controllers.item(i).and_downcast::<gtk::EventControllerKey>())
+            .find(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture)
+            .expect("detached production capture handler");
+        assert!(detached_keys.emit_by_name::<bool>("key-pressed", &[
+            &gtk::gdk::Key::F12, &96u32, &gtk::gdk::ModifierType::CONTROL_MASK,
+        ]));
+        assert_eq!(calls.get(), 5);
+        detached_keys.emit_by_name::<()>("key-released", &[
+            &gtk::gdk::Key::F12, &96u32, &gtk::gdk::ModifierType::empty(),
+        ]);
+        assert!(main.switch_render_host(true));
+        focus.emit_by_name::<()>("leave", &[]);
+        assert!(press());
+        assert_eq!(calls.get(), 6);
         // Destroy without invoking the user-facing close/save workflow.
         main.window.destroy();
     }
@@ -1403,7 +1656,11 @@ mod render_pointer_tests {
 
 impl GMainWindow {
     fn update_window_title(&self, running: Option<&RunningTitle>) {
-        self.window.set_title(Some(&window_title(running)));
+        let title = window_title(running);
+        self.window.set_title(Some(&title));
+        if let Some(host) = self.detached_render_host.borrow().as_ref() {
+            host.window.set_title(Some(&title));
+        }
     }
 
     /// Construct and lay out the main window. Mirrors the body of the upstream
@@ -1557,7 +1814,14 @@ impl GMainWindow {
 
         let this = Rc::new(Self {
             window,
-            maximized_before_fullscreen: Cell::new(None),
+            pre_fullscreen_state: RefCell::new(None),
+            detached_render_host: RefCell::new(None),
+            render_page_visible: Cell::new(false),
+            saved_render_window_geometry: Cell::new(
+                crate::uisettings::restore_render_window_state().unwrap_or_else(|error| {
+                    log::warn!("Cannot restore render window geometry: {error}");
+                    None
+                })),
             room_member,
             menu_bar,
             stack,
@@ -1593,6 +1857,8 @@ impl GMainWindow {
             controller_applet,
             error_applet,
             software_keyboard,
+            software_keyboard_frontend: Rc::clone(&software_keyboard_frontend),
+            error_applet_frontend: Rc::clone(&error_applet_frontend),
         });
 
         controller_applet_frontend.connect_docked_mode_changed(glib::clone!(
@@ -1658,7 +1924,7 @@ impl GMainWindow {
         // engines are registered when the guest starts reading its controllers.
         this.input_subsystem.borrow_mut().initialize();
         this.hid_core.lock().reload_input_devices();
-        this.install_input_handlers();
+        this.install_input_handlers(this.window.upcast_ref());
         this.start_input_driver_updates();
         this.start_status_bar_updates();
 
@@ -1732,36 +1998,7 @@ impl GMainWindow {
             ));
         }
 
-        // Keep the renderer's visibility state synchronized with the GTK
-        // toplevel, matching `GRenderWindow::IsShown()` while minimized or
-        // unmapped. The render owner may not exist during the initial map.
-        this.window.connect_map(glib::clone!(
-            #[weak(rename_to = this)]
-            this,
-            move |_| {
-                // A native child can retain stale placement across Win32/X11
-                // minimize/restore even when its logical size is unchanged.
-                #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-                {
-                    this.render_geometry.set(None);
-                    this.maybe_resize_render();
-                }
-                let render = this.render.borrow();
-                if let Some(handles) = render.as_ref() {
-                    handles.emu_window.set_shown(true);
-                }
-            }
-        ));
-        this.window.connect_unmap(glib::clone!(
-            #[weak(rename_to = this)]
-            this,
-            move |_| {
-                let render = this.render.borrow();
-                if let Some(handles) = render.as_ref() {
-                    handles.emu_window.set_shown(false);
-                }
-            }
-        ));
+        this.install_render_visibility_handlers(this.window.upcast_ref());
 
         this.stack.connect_visible_child_name_notify(glib::clone!(
             #[weak(rename_to = this)]
@@ -1795,21 +2032,7 @@ impl GMainWindow {
 
         // Keep the checkable menu action and the window chrome synchronized
         // when the compositor exits fullscreen independently.
-        this.window.connect_fullscreened_notify(glib::clone!(
-            #[weak(rename_to = this)]
-            this,
-            #[weak]
-            app,
-            move |window| {
-                let fullscreen = window.is_fullscreen();
-                this.set_fullscreen_action_state(&app, fullscreen);
-                crate::uisettings::with_mut(|values| values.fullscreen.set_value(fullscreen));
-                this.update_fullscreen_chrome(fullscreen);
-                if !fullscreen {
-                    this.restore_pre_fullscreen_state();
-                }
-            }
-        ));
+        this.install_fullscreen_handler(this.window.upcast_ref());
 
         // Confirm while a title is active, then stop emulation before GTK tears
         // down the native surface. This mirrors upstream `ConfirmClose()` and
@@ -1827,6 +2050,12 @@ impl GMainWindow {
                     w.close_confirmation_pending.get()
                 );
                 if w.session.borrow().is_none() {
+                    // A hidden application-associated render host must not
+                    // keep GTK alive after the launcher is closed. Preserve
+                    // the user's saved mode, but release the idle host safely.
+                    if !w.switch_render_host(true) {
+                        return glib::Propagation::Stop;
+                    }
                     return glib::Propagation::Proceed;
                 }
 
@@ -2096,18 +2325,40 @@ impl GMainWindow {
     /// Register upstream's checkable `View > Fullscreen` action and its two
     /// hotkeys: `F11` toggles it, while `Esc` only exits fullscreen.
     fn register_view_actions(self: &Rc<Self>, app: &Application) {
+        use ruzu_core::frontend::framebuffer_layout::{screen_docked, screen_undocked};
         self.register_fullscreen_actions(app);
+        for (name, width, height) in [
+            ("reset_window_size_720", screen_undocked::WIDTH, screen_undocked::HEIGHT),
+            ("reset_window_size_900", 1600, 900),
+            ("reset_window_size_1080", screen_docked::WIDTH, screen_docked::HEIGHT),
+        ] {
+            let action = gio::SimpleAction::new(name, None);
+            action.connect_activate(glib::clone!(#[weak(rename_to = this)] self,
+                move |_, _| this.reset_window_size(width, height)));
+            app.add_action(&action);
+        }
 
         let single_window = stateful_boolean_action(
             "single_window_mode",
             crate::uisettings::with(|values| *values.single_window_mode.get_value()),
         );
-        single_window.connect_activate(|action, _| {
-            let enabled = toggle_boolean_action(action);
-            crate::uisettings::with_mut(|values| values.single_window_mode.set_value(enabled));
-            persist_view_settings();
-        });
+        single_window.connect_activate(glib::clone!(#[weak(rename_to = this)] self,
+            move |action, _| {
+                let enabled = this.detached_render_host.borrow().is_some();
+                if this.switch_render_host(enabled) {
+                    action.set_state(&enabled.to_variant());
+                    crate::uisettings::with_mut(|values| values.single_window_mode.set_value(enabled));
+                    persist_view_settings();
+                } else {
+                    log::error!("Cannot change the native render window parent");
+                }
+            }));
         app.add_action(&single_window);
+        let embedded = crate::uisettings::with(|values| *values.single_window_mode.get_value());
+        if !self.switch_render_host(embedded) {
+            single_window.set_state(&true.to_variant());
+            log::error!("Cannot restore the separate render window");
+        }
 
         let display_headers = stateful_boolean_action(
             "display_dock_widget_headers",
@@ -2148,9 +2399,9 @@ impl GMainWindow {
             move |action, _| {
                 let visible = toggle_boolean_action(action);
                 crate::uisettings::with_mut(|values| values.show_status_bar.set_value(visible));
-                this.status_bar
-                    .widget()
-                    .set_visible(visible && !this.window.is_fullscreen());
+                let fullscreen = this.pre_fullscreen_state.borrow().is_some()
+                    || this.render_host().0.is_fullscreen();
+                this.update_fullscreen_chrome(fullscreen);
                 persist_view_settings();
             }
         ));
@@ -2181,6 +2432,30 @@ impl GMainWindow {
             }));
         overlay.set_visible(crate::uisettings::with(|values| *values.show_perf_overlay.get_value()));
         *self.perf_overlay.borrow_mut() = Some(overlay);
+    }
+
+    /// MainWindow::ResetWindowSize. AspectRatio is duplicated in the current
+    /// frontend layout API, so translate its enum at this boundary.
+    fn reset_window_size(&self, width: u32, height: u32) {
+        use common::settings_enums::AspectRatio as SettingAspect;
+        use ruzu_core::frontend::framebuffer_layout::{emulation_aspect_ratio, AspectRatio};
+        let aspect = match *common::settings::values().aspect_ratio.get_value() {
+            SettingAspect::R16_9 => AspectRatio::Default,
+            SettingAspect::R4_3 => AspectRatio::R4_3,
+            SettingAspect::R21_9 => AspectRatio::R21_9,
+            SettingAspect::R16_10 => AspectRatio::R16_10,
+            SettingAspect::Stretch => AspectRatio::StretchToWindow,
+        };
+        let ratio = emulation_aspect_ratio(aspect, height as f32 / width as f32);
+        let render_width = (height as f32 / ratio) as i32;
+        let extra_height = if self.detached_render_host.borrow().is_none() {
+            let menu_height = self.menu_bar.as_ref().map_or(0, |menu| menu.height());
+            let status_height = if crate::uisettings::with(|values| *values.show_status_bar.get_value()) {
+                self.status_bar.widget().height()
+            } else { 0 };
+            menu_height + status_height
+        } else { 0 };
+        self.render_host().0.set_default_size(render_width, height as i32 + extra_height);
     }
 
     fn register_fullscreen_actions(self: &Rc<Self>, app: &Application) {
@@ -2260,10 +2535,12 @@ impl GMainWindow {
     }
 
     /// Upstream `GMainWindow::ToggleFullscreen` / `ShowFullscreen` /
-    /// `HideFullscreen`, adapted to ruzu's always-single-window GTK frontend.
+    /// `HideFullscreen`, applied to the selected GTK render host.
     fn set_fullscreen(&self, fullscreen: bool) {
-        if fullscreen && self.maximized_before_fullscreen.get().is_none() {
-            self.maximized_before_fullscreen.set(Some(self.window.is_maximized()));
+        let window = self.render_host().0;
+        if fullscreen { self.save_render_window_geometry(); }
+        if fullscreen && self.pre_fullscreen_state.borrow().is_none() {
+            *self.pre_fullscreen_state.borrow_mut() = Some((window.clone(), window.is_maximized()));
         }
         self.update_fullscreen_chrome(fullscreen);
         let mode = *common::settings::values().fullscreen_mode.get_value();
@@ -2276,20 +2553,20 @@ impl GMainWindow {
             || uses_exclusive_fullscreen(mode, display_uses_wayland());
         if fullscreen {
             if native_fullscreen {
-                self.window.set_fullscreened(true);
+                window.set_fullscreened(true);
             } else {
                 // GTK has no Qt-style `FramelessWindowHint` geometry path.
                 // An undecorated maximized X11 window is the corresponding
                 // borderless mode; Wayland is forced through fullscreen above,
                 // exactly like upstream.
-                self.window.set_decorated(false);
-                self.window.maximize();
+                window.set_decorated(false);
+                window.maximize();
             }
         } else if native_fullscreen {
-            self.window.set_fullscreened(false);
+            window.set_fullscreened(false);
         } else {
-            self.window.unmaximize();
-            self.window.set_decorated(true);
+            window.unmaximize();
+            window.set_decorated(true);
         }
         if !fullscreen {
             self.restore_pre_fullscreen_state();
@@ -2297,16 +2574,32 @@ impl GMainWindow {
     }
 
     fn restore_pre_fullscreen_state(&self) {
-        if let Some(maximized) = self.maximized_before_fullscreen.take() {
+        let saved = self.pre_fullscreen_state.borrow_mut().take();
+        if let Some((window, maximized)) = saved {
             if maximized {
-                self.window.maximize();
+                window.maximize();
             } else {
-                self.window.unmaximize();
+                window.unmaximize();
             }
         }
     }
 
+    fn install_fullscreen_handler(self: &Rc<Self>, window: &gtk::Window) {
+        window.connect_fullscreened_notify(glib::clone!(#[weak(rename_to = this)] self,
+            move |window| {
+                if !this.is_render_input_source(Some(window.clone().upcast())) { return; }
+                let fullscreen = window.is_fullscreen();
+                if let Some(app) = this.window.application() {
+                    this.set_fullscreen_action_state(&app, fullscreen);
+                }
+                crate::uisettings::with_mut(|values| values.fullscreen.set_value(fullscreen));
+                this.update_fullscreen_chrome(fullscreen);
+                if !fullscreen { this.restore_pre_fullscreen_state(); }
+            }));
+    }
+
     fn update_fullscreen_chrome(&self, fullscreen: bool) {
+        let fullscreen = fullscreen && self.detached_render_host.borrow().is_none();
         if let Some(menu_bar) = self.menu_bar.as_ref() {
             menu_bar.set_visible(!fullscreen);
         }
@@ -2344,7 +2637,7 @@ impl GMainWindow {
     /// controller-binding path. Settings store those Qt values upstream, so
     /// preserving them keeps imported bindings and newly captured bindings in
     /// the same key space.
-    fn install_input_handlers(self: &Rc<Self>) {
+    fn install_input_handlers(self: &Rc<Self>, window: &gtk::Window) {
         let shortcut_state = Rc::new(RefCell::new(crate::hotkeys::KeyboardShortcutState::default()));
         let focus = gtk::EventControllerFocus::new();
         focus.connect_leave(glib::clone!(
@@ -2352,12 +2645,14 @@ impl GMainWindow {
             shortcut_state,
             #[weak(rename_to = this)]
             self,
-            move |_| {
+            move |controller| {
                 shortcut_state.borrow_mut().clear();
-                this.release_all_input();
+                if this.is_render_input_source(controller.widget()) {
+                    this.release_all_input();
+                }
             }
         ));
-        self.window.add_controller(focus);
+        window.add_controller(focus);
 
         let keys = gtk::EventControllerKey::new();
         // Capture, so a key bound to a game control is not first swallowed by a
@@ -2371,7 +2666,7 @@ impl GMainWindow {
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |_, keyval, keycode, state| {
+            move |controller, keyval, keycode, state| {
                 if let Some(app) = this.window.application() {
                     let binding = crate::hotkeys::keyboard_binding(&app, keyval, state);
                     let event = shortcut_state.borrow_mut().press(keycode, binding);
@@ -2385,6 +2680,10 @@ impl GMainWindow {
                         crate::hotkeys::KeyboardShortcutEvent::Suppressed => return glib::Propagation::Stop,
                         crate::hotkeys::KeyboardShortcutEvent::Unhandled => {}
                     }
+                }
+
+                if !this.is_render_input_source(controller.widget()) {
+                    return glib::Propagation::Proceed;
                 }
 
                 // Upstream sends launcher keys to `QTreeView`, not through
@@ -2416,10 +2715,11 @@ impl GMainWindow {
             shortcut_state,
             #[weak(rename_to = this)]
             self,
-            move |_, keyval, keycode, state| {
+            move |controller, keyval, keycode, state| {
                 if shortcut_state.borrow_mut().release(keycode) {
                     return;
                 }
+                if !this.is_render_input_source(controller.widget()) { return; }
                 if this.session.borrow().is_none()
                     && this.stack.visible_child_name().as_deref() == Some(PAGE_GAME_LIST)
                     && crate::game_list::navigation_key_for_gdk(keyval).is_some()
@@ -2429,7 +2729,7 @@ impl GMainWindow {
                 this.on_key_event(keyval, state, false);
             }
         ));
-        self.window.add_controller(keys);
+        window.add_controller(keys);
 
         let clicks = gtk::GestureClick::new();
         // Zero asks GTK to report every mouse button. This mirrors upstream's
@@ -2441,6 +2741,7 @@ impl GMainWindow {
             #[weak(rename_to = this)]
             self,
             move |gesture, _press_count, x, y| {
+                if !this.is_render_input_source(gesture.widget()) { return; }
                 this.on_mouse_button_pressed(gesture.current_button(), x, y);
                 this.on_mouse_activity();
             }
@@ -2449,25 +2750,29 @@ impl GMainWindow {
             #[weak(rename_to = this)]
             self,
             move |gesture, _press_count, _x, _y| {
+                if !this.is_render_input_source(gesture.widget()) { return; }
                 this.on_mouse_button_released(gesture.current_button());
             }
         ));
-        self.window.add_controller(clicks);
+        window.add_controller(clicks);
 
         let motion = gtk::EventControllerMotion::new();
         motion.set_propagation_phase(gtk::PropagationPhase::Capture);
         motion.connect_motion(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |_, x, y| {
+            move |controller, x, y| {
+                if !this.is_render_input_source(controller.widget()) { return; }
                 this.on_mouse_motion(x, y);
                 this.on_mouse_activity();
             }
         ));
-        motion.connect_leave(glib::clone!(#[weak(rename_to = this)] self, move |_| {
-            this.start_mouse_constraint();
+        motion.connect_leave(glib::clone!(#[weak(rename_to = this)] self, move |controller| {
+            if this.is_render_input_source(controller.widget()) {
+                this.start_mouse_constraint();
+            }
         }));
-        self.window.add_controller(motion);
+        window.add_controller(motion);
 
         let scroll = gtk::EventControllerScroll::new(
             gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
@@ -2478,12 +2783,13 @@ impl GMainWindow {
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |_, dx, dy| {
+            move |controller, dx, dy| {
+                if !this.is_render_input_source(controller.widget()) { return glib::Propagation::Proceed; }
                 this.on_mouse_wheel(dx, dy);
                 glib::Propagation::Proceed
             }
         ));
-        self.window.add_controller(scroll);
+        window.add_controller(scroll);
     }
 
     /// MainWindow::ShowMouseCursor. GTK owns the cursor over the render area;
@@ -2493,8 +2799,8 @@ impl GMainWindow {
         if let Some(timer) = self.mouse_hide_timer.borrow_mut().take() {
             timer.remove();
         }
-        self.stack.set_cursor_from_name(None);
-        let active = self.stack.visible_child_name().as_deref() == Some(PAGE_RENDER);
+        self.render_host().1.set_cursor_from_name(None);
+        let active = self.render_page_visible.get();
         let enabled = crate::uisettings::with(|values| *values.hide_mouse.get_value());
         if !should_hide_mouse(active, enabled) {
             return;
@@ -2514,9 +2820,9 @@ impl GMainWindow {
 
     /// MainWindow::HideMouseCursor; recheck the live setting at expiration.
     fn hide_mouse_cursor(&self) {
-        let active = self.stack.visible_child_name().as_deref() == Some(PAGE_RENDER);
+        let active = self.render_page_visible.get();
         let enabled = crate::uisettings::with(|values| *values.hide_mouse.get_value());
-        self.stack.set_cursor_from_name(
+        self.render_host().1.set_cursor_from_name(
             should_hide_mouse(active, enabled).then_some("none"),
         );
     }
@@ -2579,10 +2885,11 @@ impl GMainWindow {
         window_x: f64,
         window_y: f64,
     ) -> Option<RenderPointerPosition> {
-        if self.stack.visible_child_name().as_deref() != Some(PAGE_RENDER) {
+        if !self.render_page_visible.get() {
             return None;
         }
-        let rect = self.stack.compute_bounds(&self.window)?;
+        let (window, area) = self.render_host();
+        let rect = area.compute_bounds(&window)?;
         let local_x = window_x - f64::from(rect.x());
         let local_y = window_y - f64::from(rect.y());
         let width = f64::from(rect.width());
@@ -2644,8 +2951,8 @@ impl GMainWindow {
     }
 
     fn start_mouse_constraint(self: &Rc<Self>) {
-        if self.mouse_constrain_timer.borrow().is_some() || !self.window.is_active()
-            || self.stack.visible_child_name().as_deref() != Some(PAGE_RENDER)
+        if self.mouse_constrain_timer.borrow().is_some() || !self.render_host().0.is_active()
+            || !self.render_page_visible.get()
             || self.shutdown_dialog.borrow().is_some()
             || !*common::settings::values().mouse_panning.get_value() { return; }
         let timer = glib::timeout_add_local(std::time::Duration::from_millis(10),
@@ -2666,16 +2973,17 @@ impl GMainWindow {
             if !*settings.mouse_panning.get_value() { return false; }
             *settings.mouse_enabled.get_value()
         };
-        if !self.window.is_active() || self.stack.visible_child_name().as_deref() != Some(PAGE_RENDER) { return false; }
+        let (window, area) = self.render_host();
+        if !window.is_active() || !self.render_page_visible.get() { return false; }
         // GTK can retain the parent's active flag while presenting a modal;
         // never pull the pointer away from its controls during that transition.
         if self.shutdown_dialog.borrow().is_some()
-            || crate::hotkeys::owner_blocked_by_modal(&self.window) { return false; }
+            || crate::hotkeys::owner_blocked_by_modal(&window) { return false; }
         let render = self.render.borrow();
         let Some(handles) = render.as_ref() else { return false; };
         let layout_owner = handles.emu_window.framebuffer_layout();
         let Ok(layout) = layout_owner.read() else { return false; };
-        let (width, height) = (self.stack.width() as f64, self.stack.height() as f64);
+        let (width, height) = (area.width() as f64, area.height() as f64);
         if width <= 0.0 || height <= 0.0 || layout.width == 0 || layout.height == 0
             || layout.screen.right <= layout.screen.left || layout.screen.bottom <= layout.screen.top
         { return false; }
@@ -4128,9 +4436,15 @@ impl GMainWindow {
         update_ui_theme();
         self.hid_core.lock().reload_input_devices();
         self.initialize_controller_hotkeys();
+        self.set_fullscreen(false);
+        let embedded = crate::uisettings::with(|v| *v.single_window_mode.get_value());
+        if !self.switch_render_host(embedded) {
+            return Err(std::io::Error::other("Cannot restore render window mode"));
+        }
         if let Some(app) = self.window.application() {
             crate::hotkeys::apply_accelerators(&app);
             for (name, enabled) in [
+                ("single_window_mode", embedded),
                 ("show_filter_bar", crate::uisettings::with(|v| *v.show_filter_bar.get_value())),
                 ("show_status_bar", crate::uisettings::with(|v| *v.show_status_bar.get_value())),
                 ("show_perf_overlay", crate::uisettings::with(|v| *v.show_perf_overlay.get_value())),
@@ -4698,15 +5012,12 @@ impl GMainWindow {
         // boot is requested before that (e.g. launched with a game argument),
         // retry on a short timer until both are ready — otherwise the render
         // area would be 0×0.
-        let ready =
-            self.window.surface().is_some() && self.stack.width() > 0 && self.stack.height() > 0;
+        self.present_render_host_for_boot();
+        let ready = self.render_host_ready();
         if !ready {
             let this = Rc::clone(self);
             glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
-                if this.window.surface().is_some()
-                    && this.stack.width() > 0
-                    && this.stack.height() > 0
-                {
+                if this.render_host_ready() {
                     this.boot_game_after_profile_selection(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
@@ -4736,7 +5047,8 @@ impl GMainWindow {
 
         // Render area = the central stack's bounds in window coordinates, so
         // the child render window leaves the bottom status bar visible.
-        let render_rect = self.stack.compute_bounds(&self.window).map(|r| {
+        let (render_host, render_area) = self.render_host();
+        let render_rect = render_area.compute_bounds(&render_host).map(|r| {
             (
                 r.x() as f64,
                 r.y() as f64,
@@ -4746,7 +5058,7 @@ impl GMainWindow {
         });
 
         let Some(layer) = crate::render_window::attach_metal_layer(
-            self.window.upcast_ref::<gtk::Window>(),
+            &render_host,
             render_rect,
         ) else {
             log::error!("Cannot boot: failed to embed render surface");
@@ -4755,7 +5067,6 @@ impl GMainWindow {
         // Keep the render window hidden so the GTK loading screen shows during
         // load; revealed on completion.
         crate::render_window::set_render_view_hidden(layer.child_window, true);
-        let child_window = layer.child_window as usize;
 
         let emu = GtkEmuWindow::from_metal_layer(layer);
         let window_info = emu.window_info().clone();
@@ -4783,7 +5094,6 @@ impl GMainWindow {
         });
 
         let loading = Rc::clone(&self.loading_screen);
-        let stack = self.stack.clone();
         let this = Rc::clone(self);
         glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
             if this.session_generation.get() != session_generation {
@@ -4809,14 +5119,9 @@ impl GMainWindow {
                 }
                 Some(LoadingEvent::FirstFrame) => {
                     this.create_performance_overlay();
-                    let stack = stack.clone();
-                    loading.on_load_complete(move || {
-                        // Upstream reveals the render window only after the
-                        // loading screen has faded out following its first
-                        // framebuffer.
-                        stack.set_visible_child_name(PAGE_RENDER);
-                        crate::render_window::set_render_view_hidden(child_window as *mut _, false);
-                    });
+                    loading.on_load_complete(glib::clone!(#[weak] this, move || {
+                        this.show_render_page(session_generation);
+                    }));
                 }
                 Some(LoadingEvent::Failed { message, detail }) => {
                     this.on_emulation_stopped(Some((message, detail)));
@@ -4889,15 +5194,12 @@ impl GMainWindow {
 
         // The render surface only exists once the window is realized, and the
         // central stack only has an allocation after the first layout pass.
-        let ready =
-            self.window.surface().is_some() && self.stack.width() > 0 && self.stack.height() > 0;
+        self.present_render_host_for_boot();
+        let ready = self.render_host_ready();
         if !ready {
             let this = Rc::clone(self);
             glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
-                if this.window.surface().is_some()
-                    && this.stack.width() > 0
-                    && this.stack.height() > 0
-                {
+                if this.render_host_ready() {
                     this.boot_game_after_profile_selection(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
@@ -4924,7 +5226,8 @@ impl GMainWindow {
 
         // Render area = the central stack's bounds, so the child window leaves
         // the menu bar and status bar visible.
-        let render_rect = self.stack.compute_bounds(&self.window).map(|r| {
+        let (render_host, render_area) = self.render_host();
+        let render_rect = render_area.compute_bounds(&render_host).map(|r| {
             (
                 r.x() as f64,
                 r.y() as f64,
@@ -4934,7 +5237,7 @@ impl GMainWindow {
         });
 
         let Some(embedded) =
-            render::attach_render_window(self.window.upcast_ref::<gtk::Window>(), render_rect)
+            render::attach_render_window(&render_host, render_rect)
         else {
             log::error!(
                 "Cannot boot: failed to embed an X11 render surface. \
@@ -4979,9 +5282,6 @@ impl GMainWindow {
         });
 
         let loading = Rc::clone(&self.loading_screen);
-        let stack = self.stack.clone();
-        let display = embedded.display as usize;
-        let child = embedded.window;
         let this = Rc::clone(self);
         glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
             if this.session_generation.get() != session_generation {
@@ -5007,11 +5307,9 @@ impl GMainWindow {
                 }
                 Some(LoadingEvent::FirstFrame) => {
                     this.create_performance_overlay();
-                    let stack = stack.clone();
-                    loading.on_load_complete(move || {
-                        stack.set_visible_child_name(PAGE_RENDER);
-                        render::set_render_window_hidden(display as *mut _, child, false);
-                    });
+                    loading.on_load_complete(glib::clone!(#[weak] this, move || {
+                        this.show_render_page(session_generation);
+                    }));
                 }
                 Some(LoadingEvent::Failed { message, detail }) => {
                     this.on_emulation_stopped(Some((message, detail)));
@@ -5084,15 +5382,12 @@ impl GMainWindow {
         use crate::render_window_windows as render;
         use ruzu_core::frontend::emu_window::{WindowSystemInfo, WindowSystemType};
 
-        let ready =
-            self.window.surface().is_some() && self.stack.width() > 0 && self.stack.height() > 0;
+        self.present_render_host_for_boot();
+        let ready = self.render_host_ready();
         if !ready {
             let this = Rc::clone(self);
             glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
-                if this.window.surface().is_some()
-                    && this.stack.width() > 0
-                    && this.stack.height() > 0
-                {
+                if this.render_host_ready() {
                     this.boot_game_after_profile_selection(filepath.clone(), parameters);
                     glib::ControlFlow::Break
                 } else {
@@ -5121,7 +5416,8 @@ impl GMainWindow {
         self.session_generation.set(session_generation);
         self.status_bar.refresh();
 
-        let render_rect = self.stack.compute_bounds(&self.window).map(|rect| {
+        let (render_host, render_area) = self.render_host();
+        let render_rect = render_area.compute_bounds(&render_host).map(|rect| {
             (
                 rect.x() as f64,
                 rect.y() as f64,
@@ -5130,7 +5426,7 @@ impl GMainWindow {
             )
         });
         let Some(embedded) =
-            render::attach_render_window(self.window.upcast_ref::<gtk::Window>(), render_rect)
+            render::attach_render_window(&render_host, render_rect)
         else {
             log::error!("Cannot boot: failed to embed a Win32 render surface");
             self.alert(
@@ -5166,8 +5462,6 @@ impl GMainWindow {
         });
 
         let loading = Rc::clone(&self.loading_screen);
-        let stack = self.stack.clone();
-        let child = embedded.window as usize;
         let this = Rc::clone(self);
         glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
             if this.session_generation.get() != session_generation {
@@ -5193,11 +5487,9 @@ impl GMainWindow {
                 }
                 Some(LoadingEvent::FirstFrame) => {
                     this.create_performance_overlay();
-                    let stack = stack.clone();
-                    loading.on_load_complete(move || {
-                        stack.set_visible_child_name(PAGE_RENDER);
-                        render::set_render_window_hidden(child as _, false);
-                    });
+                    loading.on_load_complete(glib::clone!(#[weak] this, move || {
+                        this.show_render_page(session_generation);
+                    }));
                 }
                 Some(LoadingEvent::Failed { message, detail }) => {
                     this.on_emulation_stopped(Some((message, detail)));
@@ -5263,17 +5555,215 @@ impl GMainWindow {
         log::error!("In-process boot is not implemented on this platform yet");
     }
 
+    /// GRenderWindow owns the native target regardless of whether Qt embeds it
+    /// or makes it top-level. GTK needs an explicit host/area pair instead.
+    /// Clone the GTK references so callers never retain a RefCell borrow across
+    /// native window calls or GTK callbacks.
+    fn render_host(&self) -> (gtk::Window, gtk::Widget) {
+        if let Some(host) = self.detached_render_host.borrow().as_ref() {
+            (host.window.clone(), host.area.clone().upcast())
+        } else {
+            (self.window.clone().upcast(), self.stack.clone().upcast())
+        }
+    }
+
+    /// Native counterpart of QWidget's setParent in ToggleWindowMode. This
+    /// must succeed before changing the selected GTK owner or destroying it.
+    fn reparent_render_to(&self, destination: &gtk::Window) -> bool {
+        let render = self.render.borrow();
+        let Some(handles) = render.as_ref() else { return true; };
+        #[cfg(target_os = "linux")]
+        return crate::render_window_x11::reparent_render_window(
+            destination, handles.display as *mut _, handles.child_window as _);
+        #[cfg(target_os = "windows")]
+        return crate::render_window_windows::reparent_render_window(destination, handles.child_window as _);
+        #[cfg(target_os = "macos")]
+        return crate::render_window::reparent_render_window(destination, handles.child_window as *mut _);
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        false
+    }
+
+    /// GTK part of MainWindow::ToggleWindowMode. The caller updates/persists
+    /// the checkable setting only after this transition succeeds.
+    fn switch_render_host(self: &Rc<Self>, single_window: bool) -> bool {
+        if single_window == self.detached_render_host.borrow().is_none() { return true; }
+        self.save_render_window_geometry();
+        let fullscreen = self.pre_fullscreen_state.borrow().is_some();
+        // Restore the old host before moving the surface; otherwise its saved
+        // maximize state would accidentally be restored onto the new host.
+        if fullscreen { self.set_fullscreen(false); }
+        let changed = self.switch_render_host_inner(single_window);
+        if fullscreen {
+            self.set_fullscreen(true);
+            if let Some(app) = self.window.application() {
+                self.set_fullscreen_action_state(&app, true);
+            }
+            crate::uisettings::with_mut(|values| values.fullscreen.set_value(true));
+        }
+        changed
+    }
+
+    fn switch_render_host_inner(self: &Rc<Self>, single_window: bool) -> bool {
+        self.stop_mouse_constraint();
+        self.release_all_input();
+        if single_window {
+            if !self.reparent_render_to(self.window.upcast_ref()) { return false; }
+            let previous = self.detached_render_host.borrow_mut().take().unwrap();
+            self.software_keyboard_frontend.set_parent(self.window.upcast_ref());
+            self.error_applet_frontend.set_parent(self.window.upcast_ref());
+            self.place_loading_screen();
+            previous.window.destroy();
+        } else {
+            let geometry = self.saved_render_window_geometry.get().unwrap_or(
+                crate::uisettings::RenderWindowGeometry {
+                    width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT, maximized: false,
+                });
+            let window = gtk::Window::builder()
+                .application(&self.window.application().expect("main application"))
+                .display(&gtk::prelude::WidgetExt::display(&self.window))
+                .title(self.window.title().as_deref().unwrap_or("Ruzu"))
+                .default_width(geometry.width)
+                .default_height(geometry.height)
+                .build();
+            if geometry.maximized { window.maximize(); }
+            let area = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            area.add_css_class("ruzu-render-bg");
+            area.set_hexpand(true);
+            area.set_vexpand(true);
+            area.set_focusable(true);
+            window.set_child(Some(&area));
+            gtk::prelude::WidgetExt::realize(&window);
+            if !self.reparent_render_to(&window) {
+                window.destroy();
+                return false;
+            }
+            self.install_input_handlers(&window);
+            self.install_render_visibility_handlers(&window);
+            self.install_fullscreen_handler(&window);
+            window.connect_close_request(glib::clone!(#[weak(rename_to = this)] self,
+                #[upgrade_or] glib::Propagation::Stop, move |window| {
+                    if this.session.borrow().is_some() {
+                        this.on_stop_game();
+                    } else {
+                        window.set_visible(false);
+                    }
+                    glib::Propagation::Stop
+                }));
+            window.connect_is_active_notify(glib::clone!(#[weak(rename_to = this)] self, move |_| {
+                glib::idle_add_local_once(glib::clone!(#[weak] this,
+                    move || this.on_app_focus_state_changed()));
+            }));
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            area.add_tick_callback(glib::clone!(#[weak(rename_to = this)] self,
+                #[upgrade_or] glib::ControlFlow::Break, move |_, _| {
+                    this.maybe_resize_render();
+                    glib::ControlFlow::Continue
+                }));
+            *self.detached_render_host.borrow_mut() = Some(DetachedRenderHost { window, area });
+            let parent = self.render_host().0;
+            self.software_keyboard_frontend.set_parent(&parent);
+            self.error_applet_frontend.set_parent(&parent);
+            self.place_loading_screen();
+        }
+        self.render_geometry.set(None);
+        if self.render_page_visible.get() {
+            self.show_render_page(self.session_generation.get());
+            self.render_host().0.present();
+        } else if self.session.borrow().is_some() {
+            self.render_host().0.present();
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        self.maybe_resize_render();
+        true
+    }
+
+    /// Move the existing loading UI, not its progress state, alongside the
+    /// render host. Qt has one loading widget too; no duplicated subscriptions.
+    fn place_loading_screen(&self) {
+        let widget = self.loading_screen.widget();
+        if let Some(parent) = widget.parent() {
+            if let Some(stack) = parent.downcast_ref::<gtk::Stack>() { stack.remove(widget); }
+            else if let Some(container) = parent.downcast_ref::<gtk::Box>() { container.remove(widget); }
+        }
+        if let Some(host) = self.detached_render_host.borrow().as_ref() {
+            host.area.append(widget);
+            self.stack.set_visible_child_name(PAGE_GAME_LIST);
+        } else {
+            self.stack.add_named(widget, Some(PAGE_LOADING));
+            self.stack.set_visible_child_name(if self.render_page_visible.get() { PAGE_RENDER }
+                else if self.session.borrow().is_some() { PAGE_LOADING } else { PAGE_GAME_LIST });
+        }
+    }
+
+    fn render_host_ready(&self) -> bool {
+        let (window, area) = self.render_host();
+        window.surface().is_some() && area.width() > 0 && area.height() > 0
+    }
+
+    fn present_render_host_for_boot(&self) {
+        let window = self.detached_render_host.borrow().as_ref().map(|host| host.window.clone());
+        if let Some(window) = window {
+            if !window.get_visible() { window.present(); }
+        }
+    }
+
+    /// BackupGeometry / SaveWindowState for the detached GTK host. GTK's
+    /// default-size properties retain the normal size while maximized.
+    fn save_render_window_geometry(&self) {
+        if self.pre_fullscreen_state.borrow().is_some() { return; }
+        let geometry = {
+            let host = self.detached_render_host.borrow();
+            let Some(host) = host.as_ref() else { return; };
+            if host.window.is_fullscreen() { return; }
+            let (width, height) = host.window.default_size();
+            if width <= 0 || height <= 0 { return; }
+            crate::uisettings::RenderWindowGeometry {
+                width, height, maximized: host.window.is_maximized(),
+            }
+        };
+        self.saved_render_window_geometry.set(Some(geometry));
+        if let Err(error) = crate::uisettings::save_render_window_state(geometry) {
+            log::warn!("Cannot save render window geometry: {error}");
+        }
+    }
+
+    /// GRenderWindow::IsShown follows the render host, not the launcher when
+    /// detached. Map/unmap signals from an inactive host must not pause video.
+    fn install_render_visibility_handlers(self: &Rc<Self>, window: &gtk::Window) {
+        window.connect_map(glib::clone!(#[weak(rename_to = this)] self, move |window| {
+            if !this.is_render_input_source(Some(window.clone().upcast())) { return; }
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            {
+                this.render_geometry.set(None);
+                this.maybe_resize_render();
+            }
+            if let Some(handles) = this.render.borrow().as_ref() {
+                handles.emu_window.set_shown(true);
+            };
+        }));
+        window.connect_unmap(glib::clone!(#[weak(rename_to = this)] self, move |window| {
+            if !this.is_render_input_source(Some(window.clone().upcast())) { return; }
+            if let Some(handles) = this.render.borrow().as_ref() {
+                handles.emu_window.set_shown(false);
+            };
+        }));
+    }
+
+    fn is_render_input_source(&self, source: Option<gtk::Widget>) -> bool {
+        source.as_ref() == Some(self.render_host().0.upcast_ref::<gtk::Widget>())
+    }
+
     /// If a game is running and the central stack changed size, resize the
     /// embedded render window and update the framebuffer layout so the renderer
     /// recreates its swapchain at the new size (fills the window instead of
     /// staying fixed at the boot size).
     #[cfg(target_os = "macos")]
     fn maybe_resize_render(&self) {
-        let Some(rect) = self.stack.compute_bounds(&self.window) else {
+        let (render_host, render_area) = self.render_host();
+        let Some(rect) = render_area.compute_bounds(&render_host) else {
             return;
         };
-        let scale = self
-            .window
+        let scale = render_host
             .surface()
             .map_or(1, |surface| surface.scale_factor());
         let Some(geometry) =
@@ -5299,7 +5789,7 @@ impl GMainWindow {
         // new resolution (upstream-equivalent, crisp — see `resize_child_window`
         // and the `device_wait_idle` in the swapchain recreation).
         if let Some((dw, dh)) = crate::render_window::resize_child_window(
-            self.window.upcast_ref::<gtk::Window>(),
+            &render_host,
             handles.child_window as *mut _,
             handles.metal_layer as *mut _,
             gr,
@@ -5313,11 +5803,11 @@ impl GMainWindow {
     /// window to the stack's new bounds and rebuild the frame layout.
     #[cfg(target_os = "linux")]
     fn maybe_resize_render(&self) {
-        let Some(rect) = self.stack.compute_bounds(&self.window) else {
+        let (render_host, render_area) = self.render_host();
+        let Some(rect) = render_area.compute_bounds(&render_host) else {
             return;
         };
-        let scale = self
-            .window
+        let scale = render_host
             .surface()
             .map_or(1, |surface| surface.scale_factor());
         let Some(geometry) =
@@ -5339,7 +5829,7 @@ impl GMainWindow {
             rect.height() as f64,
         );
         if let Some((dw, dh)) = crate::render_window_x11::resize_render_window(
-            self.window.upcast_ref::<gtk::Window>(),
+            &render_host,
             handles.display as *mut _,
             handles.child_window as u64,
             gr,
@@ -5353,11 +5843,11 @@ impl GMainWindow {
     /// and publish the new framebuffer layout after the native resize.
     #[cfg(target_os = "windows")]
     fn maybe_resize_render(&self) {
-        let Some(rect) = self.stack.compute_bounds(&self.window) else {
+        let (render_host, render_area) = self.render_host();
+        let Some(rect) = render_area.compute_bounds(&render_host) else {
             return;
         };
-        let scale = self
-            .window
+        let scale = render_host
             .surface()
             .map_or(1, |surface| surface.scale_factor());
         let Some(geometry) =
@@ -5380,7 +5870,7 @@ impl GMainWindow {
         );
         if let Some((drawable_width, drawable_height)) =
             crate::render_window_windows::resize_render_window(
-                self.window.upcast_ref::<gtk::Window>(),
+                &render_host,
                 handles.child_window as _,
                 gtk_rect,
             )
@@ -5395,19 +5885,64 @@ impl GMainWindow {
     /// Switch the central stack to the loading screen and reset its state.
     /// Mirrors the point where upstream shows `LoadingScreen` before booting.
     pub fn show_loading_screen(&self) {
+        self.render_page_visible.set(false);
+        self.stop_mouse_constraint();
         if let Some(game_list) = self.game_list.borrow().as_ref() {
             game_list.release_focus();
         }
         self.loading_screen.prepare();
-        self.stack.set_visible_child_name(PAGE_LOADING);
+        if let Some(host) = self.detached_render_host.borrow().as_ref() {
+            self.stack.set_visible_child_name(PAGE_GAME_LIST);
+            host.window.present();
+        } else {
+            self.stack.set_visible_child_name(PAGE_LOADING);
+        }
     }
 
     /// Switch the central stack back to the game list.
     pub fn show_game_list(&self) {
+        self.save_render_window_geometry();
+        self.render_page_visible.set(false);
+        self.stop_mouse_constraint();
+        if let Some(host) = self.detached_render_host.borrow().as_ref() {
+            host.window.set_visible(false);
+        }
         self.stack.set_visible_child_name(PAGE_GAME_LIST);
         if let Some(game_list) = self.game_list.borrow().as_ref() {
             game_list.focus();
         }
+    }
+
+    /// Completion of LoadingScreen's fade, corresponding to upstream's
+    /// Hidden/render-window reveal connection. Do not retain a raw native
+    /// handle in the asynchronous callback across Stop or another boot.
+    fn show_render_page(&self, generation: u64) {
+        if self.session_generation.get() != generation || self.shutdown_dialog.borrow().is_some() {
+            return;
+        }
+        if self.render.borrow().is_none() { return; }
+        self.render_page_visible.set(true);
+        if self.detached_render_host.borrow().is_some() {
+            self.stack.set_visible_child_name(PAGE_GAME_LIST);
+        } else {
+            self.stack.set_visible_child_name(PAGE_RENDER);
+        }
+        // Changing the GTK page emits synchronous notifications. Do not hold
+        // the render borrow across them, and recheck the session before using
+        // a native handle in case a callback stopped or replaced the session.
+        if self.session_generation.get() != generation || self.shutdown_dialog.borrow().is_some() {
+            return;
+        }
+        let render = self.render.borrow();
+        let Some(handles) = render.as_ref() else { return; };
+        #[cfg(target_os = "linux")]
+        crate::render_window_x11::set_render_window_hidden(
+            handles.display as *mut _, handles.child_window as _, false);
+        #[cfg(target_os = "windows")]
+        crate::render_window_windows::set_render_window_hidden(handles.child_window as _, false);
+        #[cfg(target_os = "macos")]
+        crate::render_window::set_render_view_hidden(handles.child_window as *mut _, false);
+        handles.emu_window.set_shown(self.render_host().0.is_mapped());
     }
 
     /// Upstream MainWindow::OnAppFocusStateChanged. GTK windows include modal
@@ -5636,7 +6171,7 @@ impl GMainWindow {
         self.reset_software_keyboard();
 
         if let Some(app) = self.window.application() {
-            if self.window.is_fullscreen() {
+            if self.pre_fullscreen_state.borrow().is_some() || self.render_host().0.is_fullscreen() {
                 self.set_fullscreen_action_state(&app, false);
                 crate::uisettings::with_mut(|values| values.fullscreen.set_value(false));
                 self.set_fullscreen(false);
@@ -5663,6 +6198,9 @@ impl GMainWindow {
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
         self.stop_mouse_constraint();
+        if self.pre_fullscreen_state.borrow().is_some() {
+            self.set_fullscreen(false);
+        }
         self.perf_overlay.borrow_mut().take();
         // A guest-requested exit can arrive while the nonblocking GTK modal is
         // open. Do not leave it editing the next session's settings bank.

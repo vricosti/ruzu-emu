@@ -104,7 +104,7 @@ pub(crate) fn install_secondary_window_shortcuts(window: &gtk::Window, owner: &g
     window.add_controller(focus);
 }
 
-pub(crate) fn owner_blocked_by_modal(owner: &gtk::ApplicationWindow) -> bool {
+pub(crate) fn owner_blocked_by_modal(owner: &impl IsA<gtk::Window>) -> bool {
     let windows = gtk::Window::list_toplevels();
     windows.into_iter().filter_map(|widget| widget.downcast::<gtk::Window>().ok()).any(|window| {
         if !window.is_visible() || !window.is_modal() { return false; }

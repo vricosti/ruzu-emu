@@ -24,6 +24,81 @@ use common::settings_enums::{Category, ConfirmStop};
 /// Upstream `UISettings::values.is_game_list_reload_pending`.
 static GAME_LIST_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// GTK equivalent of the restorable part of UISettings::renderwindow_geometry.
+/// Qt's QByteArray saveGeometry payload is not a GTK serialization format.
+/// Position remains compositor-owned; width/height are normal logical size,
+/// never the fullscreen/maximized framebuffer dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RenderWindowGeometry {
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+
+const RENDER_WINDOW_GEOMETRY_GROUP: &str = "GTKRenderWindow";
+
+fn parse_window_state(contents: &str) -> Result<gtk::glib::KeyFile, gtk::glib::Error> {
+    let file = gtk::glib::KeyFile::new();
+    if !contents.trim().is_empty() {
+        file.load_from_data(contents, gtk::glib::KeyFileFlags::KEEP_COMMENTS
+            | gtk::glib::KeyFileFlags::KEEP_TRANSLATIONS)?;
+    }
+    Ok(file)
+}
+
+fn read_render_window_geometry(contents: &str) -> Result<Option<RenderWindowGeometry>, gtk::glib::Error> {
+    let file = parse_window_state(contents)?;
+    let group = RENDER_WINDOW_GEOMETRY_GROUP;
+    let (Ok(width), Ok(height)) = (file.integer(group, "width"), file.integer(group, "height")) else {
+        return Ok(None);
+    };
+    if width <= 0 || height <= 0 { return Ok(None); }
+    Ok(Some(RenderWindowGeometry {
+        width, height, maximized: file.boolean(group, "maximized").unwrap_or(false),
+    }))
+}
+
+fn write_render_window_geometry(contents: &str, geometry: RenderWindowGeometry) -> Result<String, gtk::glib::Error> {
+    let file = parse_window_state(contents)?;
+    let group = RENDER_WINDOW_GEOMETRY_GROUP;
+    file.set_integer(group, "width", geometry.width);
+    file.set_integer(group, "height", geometry.height);
+    file.set_boolean(group, "maximized", geometry.maximized);
+    Ok(file.to_data().to_string())
+}
+
+fn window_state_path() -> std::path::PathBuf {
+    common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::ConfigDir)
+        .join("window_state.ini")
+}
+
+/// UISettings::RestoreWindowState, GTK geometry section only. Preserve Qt's
+/// independent geometry/state keys rather than reinterpret their opaque bytes.
+pub(crate) fn restore_render_window_state() -> std::io::Result<Option<RenderWindowGeometry>> {
+    match std::fs::read_to_string(window_state_path()) {
+        Ok(contents) => read_render_window_geometry(&contents).map_err(std::io::Error::other),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// UISettings::SaveWindowState. Do not erase unrelated state or silently
+/// overwrite a file that could not be parsed/read.
+pub(crate) fn save_render_window_state(geometry: RenderWindowGeometry) -> std::io::Result<()> {
+    if geometry.width <= 0 || geometry.height <= 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid render window size"));
+    }
+    let path = window_state_path();
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let updated = write_render_window_geometry(&contents, geometry).map_err(std::io::Error::other)?;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    std::fs::write(path, updated)
+}
+
 pub fn request_game_list_reload() {
     GAME_LIST_RELOAD_PENDING.store(true, Ordering::Release);
 }
@@ -384,6 +459,31 @@ pub fn with_mut<R>(f: impl FnOnce(&mut Values) -> R) -> R {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn render_geometry_round_trip_preserves_other_window_state() {
+        let original = "[General]\ngeometryRenderWindow=@ByteArray(opaque)\nstate=other\n";
+        let geometry = super::RenderWindowGeometry { width: 960, height: 720, maximized: true };
+        let written = super::write_render_window_geometry(original, geometry).unwrap();
+        assert_eq!(super::read_render_window_geometry(&written).unwrap(), Some(geometry));
+        let file = super::parse_window_state(&written).unwrap();
+        assert_eq!(file.value("General", "geometryRenderWindow").unwrap(), "@ByteArray(opaque)");
+        assert_eq!(file.value("General", "state").unwrap(), "other");
+        assert_eq!(super::write_render_window_geometry(&written, geometry).unwrap(), written);
+    }
+
+    #[test]
+    fn render_geometry_rejects_incomplete_invalid_or_malformed_state() {
+        for contents in ["", "[GTKRenderWindow]\nwidth=640\n",
+            "[GTKRenderWindow]\nwidth=-1\nheight=480\n",
+            "[GTKRenderWindow]\nwidth=640\nheight=0\n",
+            "[GTKRenderWindow]\nwidth=invalid\nheight=480\n"] {
+            assert_eq!(super::read_render_window_geometry(contents).unwrap(), None);
+        }
+        let malformed = "not an ini file";
+        assert!(super::read_render_window_geometry(malformed).is_err());
+        assert!(super::write_render_window_geometry(malformed,
+            super::RenderWindowGeometry { width: 640, height: 480, maximized: false }).is_err());
+    }
     use super::*;
 
     #[test]

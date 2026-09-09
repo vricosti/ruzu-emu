@@ -143,6 +143,28 @@ pub fn resize_child_window(
     }
 }
 
+/// Native part of MainWindow::ToggleWindowMode. Keep the child NSWindow,
+/// content view and CAMetalLayer alive while changing the GTK host.
+pub fn reparent_render_window(destination: &gtk::Window, child_window: *mut c_void) -> bool {
+    if child_window.is_null() { return false; }
+    let Some(surface) = destination.surface() else { return false; };
+    let parent = unsafe { gdk_macos_surface_get_native_window(surface.as_ptr().cast()) } as *mut Object;
+    if parent.is_null() { return false; }
+    unsafe {
+        let child = child_window as *mut Object;
+        let old_parent: *mut Object = msg_send![child, parentWindow];
+        if parent == old_parent { return true; }
+        // Keep ownership across removal from the old parent's child list.
+        let _: *mut Object = msg_send![child, retain];
+        if !old_parent.is_null() {
+            let _: () = msg_send![old_parent, removeChildWindow: child];
+        }
+        let _: () = msg_send![parent, addChildWindow: child ordered: 1i64];
+        let _: () = msg_send![child, release];
+    }
+    true
+}
+
 /// Show or hide the render child window. Called on the GTK main thread.
 /// `alphaValue` keeps the child-window link (and parent tracking) intact,
 /// unlike `orderOut`.

@@ -101,12 +101,17 @@ impl OverlayDialog {
 }
 
 impl ErrorOverlayDialog {
+    pub(crate) fn set_parent(&self, parent: &gtk::Window) {
+        self.window.set_transient_for(Some(parent));
+    }
+
     pub fn new(
-        parent: &gtk::ApplicationWindow,
+        parent: &impl IsA<gtk::Window>,
         hid_core: Arc<Mutex<HIDCore>>,
         title: &str,
         body: &str,
     ) -> Rc<Self> {
+        let parent = parent.as_ref();
         install_css();
 
         let parent_width = effective_dimension(parent.width(), BASE_PARENT_WIDTH);

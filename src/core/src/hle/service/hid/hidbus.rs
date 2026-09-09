@@ -61,7 +61,7 @@ impl Hidbus {
                 Some(Self::stub_success_handler),
                 "DisableJoyPollingReceiveMode",
             ),
-            (13, Some(Self::stub_success_handler), "GetPollingData"),
+            (13, None, "GetPollingData"),
             (14, Some(Self::stub_success_handler), "SetStatusManagerType"),
         ]);
 
@@ -93,5 +93,16 @@ impl ServiceFramework for Hidbus {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn polling_data_is_registered_without_a_handler() {
+        let service = super::Hidbus::new();
+        let command = service.handlers.get(&13).unwrap();
+        assert_eq!(command.name, "GetPollingData");
+        assert!(command.handler_callback.is_none());
     }
 }

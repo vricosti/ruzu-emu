@@ -40,6 +40,7 @@ mod multiplayer;
 mod overlay_dialog;
 #[cfg(target_os = "macos")]
 mod render_window;
+mod render;
 #[cfg(target_os = "windows")]
 mod render_window_windows;
 #[cfg(target_os = "linux")]

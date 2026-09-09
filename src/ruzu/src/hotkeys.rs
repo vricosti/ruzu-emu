@@ -244,6 +244,7 @@ pub(crate) const HOTKEY_ACTIONS: &[(&str, &str)] = &[
         ("Leave Room", "app.leave_room"),
         ("Toggle Filter Bar", "app.show_filter_bar"),
         ("Toggle Status Bar", "app.show_status_bar"),
+        ("Toggle Performance Overlay", "app.show_perf_overlay"),
         ("Toggle Renderdoc Capture", "app.renderdoc_capture"),
         ("Toggle Framerate Limit", "app.toggle_framerate_limit"),
         ("Toggle Turbo Speed", "app.toggle_turbo_speed"),

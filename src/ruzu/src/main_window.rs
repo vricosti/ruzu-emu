@@ -534,6 +534,7 @@ pub struct GMainWindow {
     docked_mode_change_pending: Cell<bool>,
     /// Bottom status bar (renderer / accuracy / dock / filter / AA / volume).
     status_bar: Rc<StatusBar>,
+    perf_overlay: RefCell<Option<crate::render::performance_overlay::PerformanceOverlay>>,
     /// Last TAS state reflected in the menu labels.
     tas_state: Cell<input_common::drivers::tas_input::TasState>,
     is_tas_recording_dialog_active: Cell<bool>,
@@ -1494,6 +1495,7 @@ impl GMainWindow {
             profile_selection_pending: Cell::new(false),
             docked_mode_change_pending: Cell::new(false),
             status_bar,
+            perf_overlay: RefCell::new(None),
             tas_state: Cell::new(input_common::drivers::tas_input::TasState::Stopped),
             is_tas_recording_dialog_active: Cell::new(false),
             is_amiibo_file_select_active: Cell::new(false),
@@ -2056,6 +2058,32 @@ impl GMainWindow {
             }
         ));
         app.add_action(&show_status);
+        let show_perf = stateful_boolean_action("show_perf_overlay",
+            crate::uisettings::with(|values| *values.show_perf_overlay.get_value()));
+        show_perf.connect_activate(glib::clone!(
+            #[weak(rename_to = this)] self,
+            move |action, _| {
+                let visible = toggle_boolean_action(action);
+                crate::uisettings::with_mut(|values| values.show_perf_overlay.set_value(visible));
+                if let Some(overlay) = this.perf_overlay.borrow().as_ref() { overlay.set_visible(visible); }
+                persist_view_settings();
+            }
+        ));
+        app.add_action(&show_perf);
+    }
+
+    fn create_performance_overlay(self: &Rc<Self>) {
+        if self.perf_overlay.borrow().is_some() { return; }
+        let overlay = crate::render::performance_overlay::PerformanceOverlay::new(&self.window,
+            glib::clone!(#[weak(rename_to = this)] self, move || {
+                crate::uisettings::with_mut(|values| values.show_perf_overlay.set_value(false));
+                if let Some(action) = this.window.application().and_then(|app| app.lookup_action("show_perf_overlay")).and_downcast::<gio::SimpleAction>() {
+                    action.set_state(&false.to_variant());
+                }
+                persist_view_settings();
+            }));
+        overlay.set_visible(crate::uisettings::with(|values| *values.show_perf_overlay.get_value()));
+        *self.perf_overlay.borrow_mut() = Some(overlay);
     }
 
     fn register_fullscreen_actions(self: &Rc<Self>, app: &Application) {
@@ -3935,6 +3963,7 @@ impl GMainWindow {
             for (name, enabled) in [
                 ("show_filter_bar", crate::uisettings::with(|v| *v.show_filter_bar.get_value())),
                 ("show_status_bar", crate::uisettings::with(|v| *v.show_status_bar.get_value())),
+                ("show_perf_overlay", crate::uisettings::with(|v| *v.show_perf_overlay.get_value())),
             ] {
                 if let Some(action) = app.lookup_action(name).and_downcast::<gio::SimpleAction>() {
                     action.set_state(&enabled.to_variant());
@@ -3948,6 +3977,9 @@ impl GMainWindow {
         self.window.unmaximize();
         self.window.set_decorated(true);
         self.update_fullscreen_chrome(false);
+        if let Some(overlay) = self.perf_overlay.borrow().as_ref() {
+            overlay.set_visible(crate::uisettings::with(|values| *values.show_perf_overlay.get_value()));
+        }
         self.show_mouse_cursor();
         if let Some(game_list) = self.game_list.borrow().as_ref() {
             game_list.set_filter_visible(crate::uisettings::with(|v| *v.show_filter_bar.get_value()));
@@ -4606,6 +4638,7 @@ impl GMainWindow {
                     crate::gamemode::start();
                 }
                 Some(LoadingEvent::FirstFrame) => {
+                    this.create_performance_overlay();
                     let stack = stack.clone();
                     loading.on_load_complete(move || {
                         // Upstream reveals the render window only after the
@@ -4803,6 +4836,7 @@ impl GMainWindow {
                     crate::gamemode::start();
                 }
                 Some(LoadingEvent::FirstFrame) => {
+                    this.create_performance_overlay();
                     let stack = stack.clone();
                     loading.on_load_complete(move || {
                         stack.set_visible_child_name(PAGE_RENDER);
@@ -4988,6 +5022,7 @@ impl GMainWindow {
                     crate::gamemode::start();
                 }
                 Some(LoadingEvent::FirstFrame) => {
+                    this.create_performance_overlay();
                     let stack = stack.clone();
                     loading.on_load_complete(move || {
                         stack.set_visible_child_name(PAGE_RENDER);
@@ -5426,6 +5461,7 @@ impl GMainWindow {
             return false;
         }
 
+        self.perf_overlay.borrow_mut().take();
         self.reset_software_keyboard();
 
         if let Some(app) = self.window.application() {
@@ -5455,6 +5491,7 @@ impl GMainWindow {
     /// before releasing the native render target, clear the loading assets,
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        self.perf_overlay.borrow_mut().take();
         // A guest-requested exit can arrive while the nonblocking GTK modal is
         // open. Do not leave it editing the next session's settings bank.
         let properties = self.configure_per_game.borrow_mut().take();
@@ -5598,6 +5635,9 @@ impl GMainWindow {
                     drop(session);
                     this.status_bar
                         .update_performance(results, shaders_building);
+                    if let (Some(results), Some(overlay)) = (results, this.perf_overlay.borrow().as_ref()) {
+                        overlay.update_stats(&results);
+                    }
                     this.refresh_tas_ui();
                     if let Some(app) = this.window.application() {
                         update_room_action_state(&app, this.room_member.get_state());
@@ -6554,6 +6594,7 @@ const MENU_ACTION_NAMES: &[&str] = &[
     "display_dock_widget_headers",
     "show_filter_bar",
     "show_status_bar",
+    "show_perf_overlay",
     "reset_window_size_720",
     "reset_window_size_900",
     "reset_window_size_1080",
@@ -6795,6 +6836,10 @@ const MENU_UI: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
         <item>
           <attribute name="label" translatable="yes">Show _Status Bar</attribute>
           <attribute name="action">app.show_status_bar</attribute>
+        </item>
+        <item>
+          <attribute name="label" translatable="yes">Show Performance Overlay</attribute>
+          <attribute name="action">app.show_perf_overlay</attribute>
         </item>
       </section>
       <section>

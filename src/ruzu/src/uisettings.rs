@@ -162,6 +162,7 @@ pub struct Values {
     pub display_titlebar: Setting<bool>,
     pub show_filter_bar: Setting<bool>,
     pub show_status_bar: Setting<bool>,
+    pub show_perf_overlay: Setting<bool>,
 
     pub confirm_before_stopping: Setting<ConfirmStop>,
     pub pause_when_in_background: Setting<bool>,
@@ -228,6 +229,7 @@ impl Default for Values {
             display_titlebar: Setting::new(true, "displayTitleBars", Ui),
             show_filter_bar: Setting::new(true, "showFilterBar", Ui),
             show_status_bar: Setting::new(true, "showStatusBar", Ui),
+            show_perf_overlay: Setting::new(false, "show_perf_overlay", UiGameList),
 
             confirm_before_stopping: Setting::with_options(
                 ConfirmStop::AskAlways, "confirmStop", UiGeneral,
@@ -314,7 +316,7 @@ impl Values {
             ($($field:ident),+ $(,)?) => { $(visit(&mut self.$field);)+ };
         }
         settings!(single_window_mode, fullscreen, display_titlebar, show_filter_bar,
-            show_status_bar, confirm_before_stopping, pause_when_in_background,
+            show_status_bar, show_perf_overlay, confirm_before_stopping, pause_when_in_background,
             mute_when_in_background, hide_mouse, controller_applet_disabled,
             select_user_on_boot, enable_gamemode, show_console,
             enable_screenshot_save_as, screenshot_height, show_add_ons, show_compat,

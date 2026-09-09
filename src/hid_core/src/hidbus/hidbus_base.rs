@@ -159,15 +159,32 @@ impl Default for ButtonOnlyPollingDataAccessor {
 
 /// Base trait for hidbus devices
 pub trait HidbusDevice {
-    fn activate_device(&mut self);
-    fn deactivate_device(&mut self);
-    fn is_device_activated(&self) -> bool;
-    fn enable(&mut self, enable: bool);
-    fn is_enabled(&self) -> bool;
-    fn is_polling_mode(&self) -> bool;
-    fn get_polling_mode(&self) -> JoyPollingMode;
-    fn set_polling_mode(&mut self, mode: JoyPollingMode);
-    fn disable_polling_mode(&mut self);
+    fn base(&self) -> &HidbusBase;
+    fn base_mut(&mut self) -> &mut HidbusBase;
+
+    /// HidbusBase::ActivateDevice dispatches the derived OnInit only once.
+    fn activate_device(&mut self) {
+        if self.base().is_activated {
+            return;
+        }
+        self.base_mut().is_activated = true;
+        self.on_init();
+    }
+
+    /// OnRelease observes the active state; clear it only after the callback.
+    fn deactivate_device(&mut self) {
+        if self.base().is_activated {
+            self.on_release();
+        }
+        self.base_mut().is_activated = false;
+    }
+    fn is_device_activated(&self) -> bool { self.base().is_device_activated() }
+    fn enable(&mut self, enable: bool) { self.base_mut().enable(enable); }
+    fn is_enabled(&self) -> bool { self.base().is_enabled() }
+    fn is_polling_mode(&self) -> bool { self.base().is_polling_mode() }
+    fn get_polling_mode(&self) -> JoyPollingMode { self.base().get_polling_mode() }
+    fn set_polling_mode(&mut self, mode: JoyPollingMode) { self.base_mut().set_polling_mode(mode); }
+    fn disable_polling_mode(&mut self) { self.base_mut().disable_polling_mode(); }
 
     fn on_init(&mut self) {}
     fn on_release(&mut self) {}
@@ -207,14 +224,6 @@ impl HidbusBase {
             button_only_data: ButtonOnlyPollingDataAccessor::default(),
             transfer_memory: 0,
         }
-    }
-
-    pub fn activate_device(&mut self) {
-        self.is_activated = true;
-    }
-
-    pub fn deactivate_device(&mut self) {
-        self.is_activated = false;
     }
 
     pub fn is_device_activated(&self) -> bool {
@@ -260,6 +269,33 @@ impl Default for HidbusBase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_dispatches_once_and_preserves_callback_order() {
+        struct Device { base: HidbusBase, calls: Vec<&'static str> }
+        impl HidbusDevice for Device {
+            fn base(&self) -> &HidbusBase { &self.base }
+            fn base_mut(&mut self) -> &mut HidbusBase { &mut self.base }
+            fn on_init(&mut self) {
+                assert!(self.base.is_activated);
+                self.calls.push("init");
+            }
+            fn on_release(&mut self) {
+                assert!(self.base.is_activated);
+                self.calls.push("release");
+            }
+        }
+        let mut device = Device { base: HidbusBase::new(), calls: Vec::new() };
+        let dynamic: &mut dyn HidbusDevice = &mut device;
+        dynamic.deactivate_device();
+        dynamic.activate_device();
+        dynamic.activate_device();
+        dynamic.deactivate_device();
+        dynamic.deactivate_device();
+        assert!(!dynamic.is_device_activated());
+        dynamic.activate_device();
+        assert_eq!(device.calls, ["init", "release", "init"]);
+    }
 
     #[test]
     fn polling_accessor_defaults_match_upstream() {

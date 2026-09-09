@@ -1551,7 +1551,7 @@ impl System {
 
             // Upstream `KernelCore::Impl::InitializeHackSharedMemory` runs
             // after the physical memory manager is ready. Initialize the
-            // persistent objects here so every font, IRS and HIDbus session returns
+            // persistent objects here so every font, IRS and HID bus session returns
             // the same respective backing.
             let result = kernel.initialize_font_shared_memory(device_memory);
             assert!(
@@ -1564,7 +1564,10 @@ impl System {
                 "failed to initialize IRS shared memory"
             );
             let result = kernel.initialize_hidbus_shared_memory(device_memory);
-            assert!(result.is_success(), "failed to initialize HIDbus shared memory");
+            assert!(
+                result.is_success(),
+                "failed to initialize HID bus shared memory"
+            );
         }
 
         // Provide CoreTiming to the kernel so guest thread functions can access it.

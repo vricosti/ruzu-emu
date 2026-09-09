@@ -1108,7 +1108,8 @@ const DEFAULT_RINGCON_ANALOGS: [i32; 2] = [b'A' as i32, b'D' as i32];
 /// QtConfig::ReadHidbusValues, using the already parsed Controls section.
 fn read_hidbus_values(values: &std::collections::BTreeMap<String, String>) -> String {
     values.get("ring_controller").filter(|value| !value.is_empty()
-        && values.get("ring_controller\\default").is_none_or(|flag| flag != "true")).cloned()
+         && values.get("ring_controller\\default").is_some_and(|flag|
+             matches!(flag.to_ascii_lowercase().as_str(), "false" | "no" | "off" | "0"))).cloned()
         .unwrap_or_else(|| generate_analog_param_from_keys(
             0, 0, DEFAULT_RINGCON_ANALOGS[0], DEFAULT_RINGCON_ANALOGS[1], 0, 0.05,
         ))
@@ -1398,12 +1399,13 @@ fn append_player_entries(entries: &mut Vec<(String, String)>, index: usize, play
     entries.push((format!("{prefix}profile_name"), player.profile_name.clone()));
 }
 
-/// Parse the `player_N_…` keys out of the `[Controls]` section.
+/// Parse player bindings and the global ring binding from `[Controls]`.
 ///
 /// Upstream writes each binding as a `key\default=` line followed by the value,
 /// quoted because the parameter string contains commas. Both the quotes and the
 /// companion `\default` line are handled here; keys whose `\default` is `true`
-/// still carry their value, so they are read like any other.
+/// still carry their value, so player keys are read like any other. The ring
+/// binding retains its marker for `ReadHidbusValues` default selection.
 pub fn parse_controls(contents: &str) -> std::collections::BTreeMap<String, String> {
     let mut values = std::collections::BTreeMap::new();
     let mut in_section = false;
@@ -1460,7 +1462,7 @@ fn parse_profile_controls(contents: &str) -> std::collections::BTreeMap<String, 
     values
 }
 
-/// Replace the `player_N_…` lines of `contents` with `entries`.
+/// Replace player bindings and, when supplied, the global ring binding.
 ///
 /// The rewritten block is dropped where the first existing binding sat, so a
 /// hand-edited file keeps its shape; a file with no `[Controls]` section at all
@@ -1744,6 +1746,7 @@ mod tests {
             assert_eq!(button.get_int("code", 0), key as i32);
         }
         for input in ["[Controls]\nring_controller=\"\"\n",
+             "[Controls]\nring_controller=\"engine:sdl,axis_x:3\"\n",
             "[Controls]\nring_controller=\"engine:sdl,axis_x:3\"\nring_controller\\default=true\n"] {
             let restored = read_hidbus_values(&parse_controls(input));
             let restored = common::param_package::ParamPackage::from_serialized(&restored);
@@ -1810,6 +1813,8 @@ mod tests {
                 "[UI]\nhideInactiveMouse\\default=false\nhideInactiveMouse=false\n",
                 "Paths\\gamedirs\\size=1\n",
                 "Paths\\gamedirs\\1\\path=/synthetic/homebrew\n",
+                "[Controls]\nring_controller\\default=false\n",
+                "ring_controller=\"engine:sdl,axis_x:3\"\n",
             );
             std::fs::write(config_path(), document).unwrap();
             reload_all_values();
@@ -1819,6 +1824,12 @@ mod tests {
                 assert!(*values.audio_muted.get_value());
                 assert_eq!(common::settings::volume(&values), 0.0);
             }
+            assert_eq!(common::settings::values().ringcon_analogs, "engine:sdl,axis_x:3");
+            common::settings::values_mut().ringcon_analogs = "engine:sdl,axis_x:4".into();
+            save_control_values().unwrap();
+            common::settings::values_mut().ringcon_analogs.clear();
+            load_control_values();
+            assert_eq!(common::settings::values().ringcon_analogs, "engine:sdl,axis_x:4");
             uisettings::with(|values| {
                 assert!(*values.mute_when_in_background.get_value());
                 assert!(!*values.hide_mouse.get_value());

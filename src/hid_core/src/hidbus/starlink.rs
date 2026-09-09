@@ -12,9 +12,9 @@ pub struct Starlink {
 }
 
 impl Starlink {
-    pub fn new(event: Box<dyn super::hidbus_base::HidbusCommandEvent>, memory: Box<dyn super::hidbus_base::HidbusMemory>) -> Self {
+    pub fn new(runtime: std::sync::Arc<dyn super::hidbus_base::HidbusRuntime>) -> Self {
         Self {
-            base: HidbusBase::new(event, memory),
+            base: HidbusBase::new(runtime),
         }
     }
 

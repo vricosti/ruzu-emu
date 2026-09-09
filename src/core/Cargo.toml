@@ -17,6 +17,7 @@ cipher.workspace = true
 ctr.workspace = true
 hmac.workspace = true
 hex.workspace = true
+flate2 = "1"
 image.workspace = true
 libc = "0.2"
 log.workspace = true

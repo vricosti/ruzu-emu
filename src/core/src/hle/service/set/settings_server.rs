@@ -587,15 +587,50 @@ mod tests {
 
     #[test]
     fn test_get_language_code() {
-        let old_language = *common::settings::values().language_index.get_value();
-        common::settings::values_mut()
-            .language_index
-            .set_value(common::settings_enums::Language::French);
+        const CHILD: &str = "RUZU_TEST_SETTINGS_LOCALE_IPC";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hle::service::set::settings_server::tests::test_get_language_code"
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
         let server = ISettingsServer::new();
-        assert_eq!(server.get_language_code(), LanguageCode::Fr);
-        common::settings::values_mut()
-            .language_index
-            .set_value(old_language);
+        let languages = common::settings_enums::Language::canonicalizations();
+        assert_eq!(languages.len(), AVAILABLE_LANGUAGE_CODES.len());
+        for &(_, language) in languages {
+            common::settings::values_mut()
+                .language_index
+                .set_value(language);
+            let mut ctx = HLERequestContext::new();
+            ctx.command_buffer_mut().fill(u32::MAX);
+            server.handlers[&commands::GET_LANGUAGE_CODE]
+                .handler_callback
+                .unwrap()(&server, &mut ctx);
+            assert_eq!(ctx.command_buffer()[6], 0);
+            assert_eq!(ctx.command_buffer()[7], 0);
+            let actual =
+                u64::from(ctx.command_buffer()[8]) | (u64::from(ctx.command_buffer()[9]) << 32);
+            assert_eq!(actual, AVAILABLE_LANGUAGE_CODES[language as usize] as u64);
+        }
+        for &(_, region) in common::settings_enums::Region::canonicalizations() {
+            common::settings::values_mut()
+                .region_index
+                .set_value(region);
+            let mut ctx = HLERequestContext::new();
+            ctx.command_buffer_mut().fill(u32::MAX);
+            server.handlers[&commands::GET_REGION_CODE]
+                .handler_callback
+                .unwrap()(&server, &mut ctx);
+            assert_eq!(ctx.command_buffer()[6], 0);
+            assert_eq!(ctx.command_buffer()[7], 0);
+            assert_eq!(ctx.command_buffer()[8], region as u32);
+        }
     }
 
     #[test]

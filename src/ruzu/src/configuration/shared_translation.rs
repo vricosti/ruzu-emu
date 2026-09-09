@@ -268,6 +268,8 @@ pub const LANGUAGE: &[(Language, &str)] = &[
         Language::PortugueseBrazilian,
         "Brazilian Portuguese (português do Brasil)",
     ),
+    (Language::Polish, "Polish (polska)"),
+    (Language::Thai, "Thai (แบบไทย)"),
 ];
 
 pub const REGION: &[(Region, &str)] = &[

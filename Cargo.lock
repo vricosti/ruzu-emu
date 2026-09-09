@@ -435,6 +435,7 @@ dependencies = [
  "cipher",
  "common",
  "ctr",
+ "flate2",
  "hex",
  "hid_core",
  "hmac",

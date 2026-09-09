@@ -2539,6 +2539,22 @@ mod tests {
     }
 
     #[test]
+    fn all_system_language_choices_survive_configuration_roundtrip() {
+        let languages = common::settings_enums::Language::canonicalizations();
+        assert_eq!(languages.len(), 20);
+        for &(_, language) in languages {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            config.begin_group("System");
+            let mut source = common::settings::Values::default();
+            source.language_index.set_value(language);
+            config.write_setting_generic(&mut source.language_index);
+            let mut loaded = common::settings::Values::default();
+            config.read_setting_generic(&mut loaded.language_index);
+            assert_eq!(*loaded.language_index.get_value(), language);
+        }
+    }
+
+    #[test]
     fn audio_command_dump_is_session_only_and_ignores_old_ini_values() {
         let mut config = BaseConfig::new(ConfigType::GlobalConfig);
         config.begin_group("Audio");

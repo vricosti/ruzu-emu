@@ -211,6 +211,8 @@ settings_enum! {
         ChineseSimplified,
         ChineseTraditional,
         PortugueseBrazilian,
+        Polish,
+        Thai,
     }
 }
 

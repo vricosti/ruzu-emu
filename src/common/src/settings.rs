@@ -1297,7 +1297,7 @@ impl Default for Values {
             language_index: SwitchableSetting::ranged(
                 Language::EnglishAmerican,
                 Language::Japanese,
-                Language::PortugueseBrazilian,
+                Language::Thai,
                 "language_index",
                 System,
             ),

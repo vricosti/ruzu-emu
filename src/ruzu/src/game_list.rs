@@ -47,6 +47,7 @@ use crate::configuration::qt_config;
 use crate::main_window::StartGameType;
 use crate::uisettings::{self, GameDir};
 use crate::util::controller_navigation::{ControllerNavigation, NavigationKey};
+mod worker;
 
 /// Upstream's colorful-theme `folder`, `bad_folder` and `star` icons. Keep
 /// local copies so the game list does not depend on the host icon theme or the
@@ -117,6 +118,15 @@ fn update_toolbar_icons(add: &gtk::Image, refresh: &gtk::Image, theme: &str) {
 /// `icon_name = QFileInfo::exists(path) ? "folder" : "bad_folder";`
 fn folder_icon_png(path: &str, theme: &str) -> &'static [u8] {
     let icons = theme_icons(theme);
+    if matches!(path, "SDMC" | "UserNAND" | "SysNAND") {
+        let dark = icons[0] == include_bytes!("../../../dist/qt_themes/qdarkstyle/icons/48x48/folder.png");
+        return match (path == "SDMC", dark) {
+            (true, false) => include_bytes!("../../../dist/qt_themes/colorful/icons/48x48/sd_card.png"),
+            (false, false) => include_bytes!("../../../dist/qt_themes/colorful/icons/48x48/chip.png"),
+            (true, true) => include_bytes!("../../../dist/qt_themes/qdarkstyle/icons/48x48/sd_card.png"),
+            (false, true) => include_bytes!("../../../dist/qt_themes/qdarkstyle/icons/48x48/chip.png"),
+        };
+    }
     if Path::new(path).exists() {
         icons[0]
     } else {
@@ -325,7 +335,12 @@ impl GameEntry {
     fn new_folder(path: &str, deep_scan: bool, children: gio::ListStore) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
-        *imp.name.borrow_mut() = path.to_owned();
+        *imp.name.borrow_mut() = match path {
+            "SDMC" => crate::i18n::tr("Installed SD Titles"),
+            "UserNAND" => crate::i18n::tr("Installed NAND Titles"),
+            "SysNAND" => crate::i18n::tr("System Titles"),
+            _ => path.to_owned(),
+        };
         *imp.path.borrow_mut() = path.to_owned();
         *imp.icon.borrow_mut() = uisettings::with(|values|
             embedded_icon(folder_icon_png(path, values.theme.get_value())));
@@ -1099,7 +1114,7 @@ impl GameListView {
         y: f64,
     ) {
         let path = entry.path();
-        let (position, count) = filesystem_directory_position(&path);
+        let (position, count) = game_directory_position(&path);
 
         let menu = gio::Menu::new();
         menu.append(
@@ -1114,14 +1129,16 @@ impl GameListView {
             Some(&crate::i18n::tr("Open Directory Location")),
             Some("game-list.open-directory"),
         );
-        menu.append(
-            Some(&crate::i18n::tr("Scan Subfolders")),
-            Some("game-list.scan-subfolders"),
-        );
-        menu.append(
-            Some(&crate::i18n::tr("Remove Game Directory")),
-            Some("game-list.remove-directory"),
-        );
+        if !matches!(path.as_str(), "SDMC" | "UserNAND" | "SysNAND") {
+            menu.append(
+                Some(&crate::i18n::tr("Scan Subfolders")),
+                Some("game-list.scan-subfolders"),
+            );
+            menu.append(
+                Some(&crate::i18n::tr("Remove Game Directory")),
+                Some("game-list.remove-directory"),
+            );
+        }
 
         let actions = gio::SimpleActionGroup::new();
 
@@ -1157,7 +1174,7 @@ impl GameListView {
             let view = Rc::downgrade(self);
             open_directory.connect_activate(move |_, _| {
                 if let Some(view) = view.upgrade() {
-                    open_directory_location(Path::new(&path), view.parent_window().as_ref());
+                    open_directory_location(&crate::main_window::game_list_directory_path(&path), view.parent_window().as_ref());
                 }
             });
         }
@@ -1787,10 +1804,7 @@ impl GameListView {
         let previously_selected = selected_directory_path(&self.selection);
 
         let dirs = uisettings::with(|v| v.game_dirs.clone());
-        let scannable: Vec<GameDir> = dirs
-            .into_iter()
-            .filter(GameDir::is_filesystem_path)
-            .collect();
+        let scannable = dirs;
         let directory_to_select =
             preferred_directory_path(previously_selected.as_deref(), &scannable);
 
@@ -1833,12 +1847,16 @@ impl GameListView {
                     if current_generation.load(Ordering::Acquire) != generation {
                         return;
                     }
-                    populate_frontend_manual_content_provider(std::slice::from_ref(&directory));
-                    let games = scan_dir_games(
+                    let games = if directory.is_filesystem_path() {
+                        populate_frontend_manual_content_provider(std::slice::from_ref(&directory));
+                        scan_dir_games(
                         Path::new(&directory.path),
                         directory.deep_scan,
                         &mut metadata_reader,
-                    );
+                        )
+                    } else {
+                        worker::add_titles_to_game_list(&directory.path, &mut metadata_reader)
+                    };
                     directories.push(ScannedDirectory {
                         path: directory.path,
                         deep_scan: directory.deep_scan,
@@ -1991,11 +2009,11 @@ impl GameListView {
         self.reload();
     }
 
-    /// Move a custom directory by one visible row, matching
+    /// Move a directory root by one visible row, matching
     /// `GameList::AddPermDirPopup`.
     fn move_directory(&self, path: &str, direction: isize) {
         let moved = uisettings::with_mut(|values| {
-            move_filesystem_directory(&mut values.game_dirs, path, direction)
+            move_game_directory(&mut values.game_dirs, path, direction)
         });
         if !moved {
             return;
@@ -2384,12 +2402,11 @@ fn open_directory_location(path: &Path, parent: Option<&gtk::Window>) {
 }
 
 /// Visible index and visible directory count for `path`.
-fn filesystem_directory_position(path: &str) -> (Option<usize>, usize) {
+fn game_directory_position(path: &str) -> (Option<usize>, usize) {
     uisettings::with(|values| {
         let paths: Vec<&str> = values
             .game_dirs
             .iter()
-            .filter(|directory| directory.is_filesystem_path())
             .map(|directory| directory.path.as_str())
             .collect();
         (
@@ -2399,25 +2416,17 @@ fn filesystem_directory_position(path: &str) -> (Option<usize>, usize) {
     })
 }
 
-/// Swap one custom directory with the adjacent visible custom directory.
-fn move_filesystem_directory(directories: &mut [GameDir], path: &str, direction: isize) -> bool {
-    let visible: Vec<usize> = directories
-        .iter()
-        .enumerate()
-        .filter(|(_, directory)| directory.is_filesystem_path())
-        .map(|(index, _)| index)
-        .collect();
-    let Some(visible_index) = visible
-        .iter()
-        .position(|index| directories[*index].path == path)
+/// Swap adjacent visible roots, including installed storage roots.
+fn move_game_directory(directories: &mut [GameDir], path: &str, direction: isize) -> bool {
+    let Some(visible_index) = directories.iter().position(|directory| directory.path == path)
     else {
         return false;
     };
     let target = visible_index as isize + direction;
-    if !(0..visible.len() as isize).contains(&target) {
+    if !(0..directories.len() as isize).contains(&target) {
         return false;
     }
-    directories.swap(visible[visible_index], visible[target as usize]);
+    directories.swap(visible_index, target as usize);
     true
 }
 
@@ -2661,6 +2670,10 @@ impl MetadataReader {
     /// bootable title (no loader, or `FileType::Unknown` / `FileType::Error`).
     fn read(&mut self, path: &str) -> Option<GameMetadata> {
         let file = self.vfs.arc_open_file(path, OpenMode::READ)?;
+        self.read_virtual_file(file, false)
+    }
+
+    fn read_virtual_file(&mut self, file: VirtualFile, require_program_id: bool) -> Option<GameMetadata> {
         let loader = get_loader(&mut self.loader_system, file.clone(), 0, 0)?;
 
         let file_type = loader.get_file_type();
@@ -2689,6 +2702,7 @@ impl MetadataReader {
 
         let mut program_id = 0;
         if loader.read_program_id(&mut program_id) != ResultStatus::Success {
+            if require_program_id { return None; }
             program_id = 0;
         }
 
@@ -3087,7 +3101,7 @@ mod tests {
 
     static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn make_temp_dir() -> PathBuf {
+    pub(super) fn make_temp_dir() -> PathBuf {
         let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("ruzu-game-list-{}-{counter}", std::process::id()));
@@ -3347,7 +3361,22 @@ mod tests {
     }
 
     #[test]
-    fn directory_context_move_preserves_non_filesystem_entries() {
+    fn installed_root_labels_icons_and_open_paths() {
+        use common::fs::path_util::{get_ruzu_path, RuzuPath};
+        for (path, title) in [("SDMC", "Installed SD Titles"), ("UserNAND", "Installed NAND Titles"), ("SysNAND", "System Titles")] {
+            let root = GameEntry::new_folder(path, false, gio::ListStore::new::<GameEntry>());
+            assert_eq!(root.name(), title);
+            assert_eq!(root.path(), path);
+            assert_ne!(folder_icon_png(path, "colorful"), BAD_FOLDER_ICON_PNG);
+        }
+        assert_eq!(crate::main_window::game_list_directory_path("SDMC"), get_ruzu_path(RuzuPath::SDMCDir).join("Nintendo/Contents/registered"));
+        assert_eq!(crate::main_window::game_list_directory_path("UserNAND"), get_ruzu_path(RuzuPath::NANDDir).join("user/Contents/registered"));
+        assert_eq!(crate::main_window::game_list_directory_path("SysNAND"), get_ruzu_path(RuzuPath::NANDDir).join("system/Contents/registered"));
+        assert_eq!(crate::main_window::game_list_directory_path("/homebrew"), PathBuf::from("/homebrew"));
+    }
+
+    #[test]
+    fn directory_context_moves_adjacent_visible_roots() {
         let mut directories = vec![
             GameDir {
                 path: "SDMC".to_string(),
@@ -3371,21 +3400,23 @@ mod tests {
             },
         ];
 
-        assert!(move_filesystem_directory(
+        assert!(move_game_directory(
             &mut directories,
             "/games/two",
             -1
         ));
         assert_eq!(directories[0].path, "SDMC");
-        assert_eq!(directories[1].path, "/games/two");
-        assert_eq!(directories[2].path, "UserNAND");
-        assert_eq!(directories[3].path, "/games/one");
-        assert!(!move_filesystem_directory(
+        assert_eq!(directories[1].path, "/games/one");
+        assert_eq!(directories[2].path, "/games/two");
+        assert_eq!(directories[3].path, "UserNAND");
+        assert!(move_game_directory(
             &mut directories,
             "/games/two",
             -1
         ));
-        assert!(!move_filesystem_directory(&mut directories, "/missing", 1));
+        assert!(move_game_directory(&mut directories, "SDMC", 1));
+        assert!(!move_game_directory(&mut directories, "UserNAND", 1));
+        assert!(!move_game_directory(&mut directories, "/missing", 1));
     }
 
     #[test]

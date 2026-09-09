@@ -5665,6 +5665,17 @@ fn stateful_boolean_action(name: &str, initial: bool) -> gio::SimpleAction {
     gio::SimpleAction::new_stateful(name, None, &initial.to_variant())
 }
 
+/// OnGameListOpenDirectory resolves permanent roots before opening the host folder.
+pub(crate) fn game_list_directory_path(directory: &str) -> std::path::PathBuf {
+    use common::fs::path_util::{get_ruzu_path, RuzuPath};
+    match directory {
+        "SDMC" => get_ruzu_path(RuzuPath::SDMCDir).join("Nintendo/Contents/registered"),
+        "UserNAND" => get_ruzu_path(RuzuPath::NANDDir).join("user/Contents/registered"),
+        "SysNAND" => get_ruzu_path(RuzuPath::NANDDir).join("system/Contents/registered"),
+        other => other.into(),
+    }
+}
+
 fn toggle_boolean_action(action: &gio::SimpleAction) -> bool {
     let enabled = !action
         .state()

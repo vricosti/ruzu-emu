@@ -740,10 +740,28 @@ fn parse_section_values(
 /// Read the configured game directories — upstream `Config::ReadUIValues`'s
 /// `gamedirs` array.
 pub fn load_game_dirs() -> Vec<GameDir> {
-    match std::fs::read_to_string(config_path()) {
-        Ok(contents) => parse_game_dirs(&contents),
-        Err(_) => Vec::new(),
+    game_dirs_with_defaults(&std::fs::read_to_string(config_path()).unwrap_or_default())
+}
+
+/// ReadPathValues' empty-array fallback. Imports still use parse_game_dirs so
+/// importing a file without game paths does not fabricate source directories.
+fn game_dirs_with_defaults(contents: &str) -> Vec<GameDir> {
+    let mut directories = parse_game_dirs(contents);
+    if directories.is_empty() {
+        directories.extend(["SDMC", "UserNAND", "SysNAND"].map(|path| GameDir {
+            path: path.into(), deep_scan: false, expanded: true,
+        }));
+        let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+        config.load_ini(contents);
+        config.begin_group("UI");
+        config.begin_group("Paths");
+        let legacy = config.read_string_setting("gameListRootDir", Some("."));
+        if legacy != "." {
+            directories.push(GameDir { path: legacy,
+                deep_scan: config.read_boolean_setting("gameListDeepScan", Some(false)), expanded: true });
+        }
     }
+    directories
 }
 
 /// Read `Settings::values.external_content_dirs` from the QSettings array
@@ -1850,7 +1868,7 @@ mod tests {
             uisettings::with(|values| {
                 assert!(!*values.mute_when_in_background.get_value());
                 assert!(*values.hide_mouse.get_value());
-                assert!(values.game_dirs.is_empty());
+                assert_eq!(values.game_dirs.iter().map(|dir| dir.path.as_str()).collect::<Vec<_>>(), ["SDMC", "UserNAND", "SysNAND"]);
             });
             return;
         }
@@ -1903,6 +1921,20 @@ mod tests {
         assert_eq!(loaded.theme.get_value(), "Dark");
         assert_eq!(loaded.screenshot_path.get_value(), "/tmp/screenshots, test");
         assert!(expected.len() >= 27);
+    }
+
+    #[test]
+    fn empty_game_directory_array_uses_installed_roots_and_legacy_path() {
+        let defaults = game_dirs_with_defaults("");
+        assert_eq!(defaults.iter().map(|dir| dir.path.as_str()).collect::<Vec<_>>(), ["SDMC", "UserNAND", "SysNAND"]);
+        assert!(defaults.iter().all(|dir| dir.expanded && !dir.deep_scan));
+        let legacy = game_dirs_with_defaults("[UI]\nPaths\\gameListRootDir=/homebrew\nPaths\\gameListRootDir\\default=false\nPaths\\gameListDeepScan=true\nPaths\\gameListDeepScan\\default=false\n");
+        assert_eq!(legacy.len(), 4);
+        assert_eq!(legacy[3].path, "/homebrew");
+        assert!(legacy[3].deep_scan);
+        let existing = game_dirs_with_defaults("[UI]\nPaths\\gamedirs\\size=1\nPaths\\gamedirs\\1\\path=/homebrew\n");
+        assert_eq!(existing.len(), 1, "do not replace an explicitly configured list");
+        assert!(parse_game_dirs("").is_empty(), "source import does not synthesize directories");
     }
 
     #[test]

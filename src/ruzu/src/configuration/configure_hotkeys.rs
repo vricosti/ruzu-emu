@@ -432,6 +432,20 @@ fn configure_keyboard_hotkey(
 }
 
 fn same_key_sequence(left: &str, right: &str) -> bool {
+    // IsUsedKey compares decoded QKeySequences, not their display strings.
+    // Use the same native-label conversion as the GTK action registry so
+    // modifier ordering and aliases cannot conceal duplicate bindings.
+    let parse = |text: &str| crate::hotkeys::gtk_accelerator_from_native(text)
+        .and_then(|accelerator| gtk::accelerator_parse(&accelerator));
+    match (parse(left), parse(right)) {
+        (Some((left_key, left_mods)), Some((right_key, right_mods))) => {
+            return left_key.to_lower() == right_key.to_lower() && left_mods == right_mods;
+        }
+        (Some(_), None) | (None, Some(_)) => return false,
+        // Preserve empty bindings and unknown imported labels without treating
+        // all unparseable strings as the same shortcut.
+        (None, None) => {}
+    }
     left.chars()
         .filter(|character| !character.is_whitespace())
         .flat_map(char::to_lowercase)
@@ -718,7 +732,9 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires GTK display; run in an isolated process"]
     fn per_row_restore_checks_conflicts_without_touching_the_other_column() {
+        gtk::init().unwrap();
         let default = crate::uisettings::DEFAULT_HOTKEYS.iter()
             .find(|key| key.name == "Configure").unwrap();
         let row = HotkeyRow::binding(default.name, "F12", "A+B");
@@ -866,8 +882,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires GTK display; run in an isolated process"]
     fn duplicate_comparison_uses_native_sequence_semantics() {
+        gtk::init().unwrap();
         assert!(same_key_sequence("Ctrl+M", "ctrl + m"));
+        assert!(same_key_sequence("Ctrl+Shift+M", "Shift+Control+m"));
+        assert!(same_key_sequence("Esc", "Escape"));
+        assert!(same_key_sequence("Ctrl+KP\u{2009}+", "Control+KP_Add"));
+        assert!(same_key_sequence("", ""));
+        assert!(!same_key_sequence("UnknownOne", "UnknownTwo"));
+        assert!(!same_key_sequence("Ctrl+M", "Shift+M"));
+        assert!(!same_key_sequence("+", "KP +"));
         assert!(!same_key_sequence("Ctrl+M", "Ctrl+N"));
     }
 }

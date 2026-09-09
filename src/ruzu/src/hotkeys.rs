@@ -183,7 +183,7 @@ pub fn apply_accelerators(app: &gtk::Application) {
     }
 }
 
-fn gtk_accelerator_from_native(sequence: &str) -> Option<String> {
+pub(crate) fn gtk_accelerator_from_native(sequence: &str) -> Option<String> {
     // Consume modifier prefixes rather than splitting the final key: '+' is
     // itself a valid QKeySequence/GTK display label, including "Ctrl++" and
     // "Ctrl+KP\u{2009}+" emitted by the recording dialog.

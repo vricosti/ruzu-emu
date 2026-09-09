@@ -62,6 +62,17 @@ impl HidbusStubbed {
     }
 }
 
+impl super::hidbus_base::HidbusDevice for HidbusStubbed {
+    fn base(&self) -> &HidbusBase { &self.base }
+    fn base_mut(&mut self) -> &mut HidbusBase { &mut self.base }
+    fn on_init(&mut self) { HidbusStubbed::on_init(self); }
+    fn on_release(&mut self) { HidbusStubbed::on_release(self); }
+    fn on_update(&mut self) { HidbusStubbed::on_update(self); }
+    fn get_device_id(&self) -> u8 { HidbusStubbed::get_device_id(self) }
+    fn set_command(&mut self, data: &[u8]) -> bool { HidbusStubbed::set_command(self, data) }
+    fn get_reply(&self, data: &mut [u8]) -> u64 { HidbusStubbed::get_reply(self, data) }
+}
+
 impl Default for HidbusStubbed {
     fn default() -> Self {
         Self::new()

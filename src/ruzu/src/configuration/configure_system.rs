@@ -550,7 +550,8 @@ fn unix_time_seconds() -> i64 {
 fn is_valid_locale(region_index: u32, language_index: u32) -> bool {
     LOCALE_BLOCKLIST
         .get(region_index as usize)
-        .is_some_and(|blocked| ((blocked >> language_index) & 1) == 0)
+        .and_then(|blocked| blocked.checked_shr(language_index))
+        .is_some_and(|blocked| (blocked & 1) == 0)
 }
 
 fn connect_locale_validation(
@@ -559,10 +560,21 @@ fn connect_locale_validation(
     warning: &gtk::Label,
 ) {
     let update = Rc::new({
-        let language = language.clone();
-        let region = region.clone();
-        let warning = warning.clone();
+        // Qt's receiver-owned connections disappear with ConfigureSystem.
+        // GTK signal closures must not own their emitting dropdowns.
+        let language = language.downgrade();
+        let region = region.downgrade();
+        let warning = warning.downgrade();
         move || {
+            let (Some(language), Some(region), Some(warning)) =
+                (language.upgrade(), region.upgrade(), warning.upgrade()) else { return };
+            // Rebuilding a translated model temporarily clears its selection.
+            // There is no locale to validate until both rows are selected.
+            if language.selected() == gtk::INVALID_LIST_POSITION
+                || region.selected() == gtk::INVALID_LIST_POSITION {
+                warning.set_visible(false);
+                return;
+            }
             let valid = is_valid_locale(region.selected(), language.selected());
             warning.set_visible(!valid);
             if valid {
@@ -892,5 +904,34 @@ mod tests {
         assert!(!is_valid_locale(2, 1));
         assert!(is_valid_locale(4, 18));
         assert!(!is_valid_locale(7, 0));
+        assert!(!is_valid_locale(0, gtk::INVALID_LIST_POSITION));
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; run alone"]
+    fn locale_validation_releases_widgets_and_handles_empty_selection() {
+        gtk::init().unwrap();
+        let language = gtk::DropDown::from_strings(&tr::labels(tr::LANGUAGE));
+        let region = gtk::DropDown::from_strings(&tr::labels(tr::REGION));
+        let warning = gtk::Label::new(None);
+        connect_locale_validation(&language, &region, &warning);
+        language.set_selected(6);
+        assert!(warning.is_visible());
+        language.set_selected(gtk::INVALID_LIST_POSITION);
+        assert!(!warning.is_visible());
+        language.set_selected(0);
+        assert!(!warning.is_visible());
+        region.set_selected(gtk::INVALID_LIST_POSITION);
+        assert!(!warning.is_visible());
+        region.set_selected(0);
+        language.set_selected(6);
+        assert!(warning.is_visible());
+        let weak_language = language.downgrade();
+        let weak_region = region.downgrade();
+        let weak_warning = warning.downgrade();
+        drop((language, region, warning));
+        assert!(weak_language.upgrade().is_none());
+        assert!(weak_region.upgrade().is_none());
+        assert!(weak_warning.upgrade().is_none());
     }
 }

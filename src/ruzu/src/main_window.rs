@@ -4473,9 +4473,7 @@ impl GMainWindow {
         let mut filter = common::logging::filter::Filter::default();
         filter.parse_filter_string(common::settings::values().log_filter.get_value());
         common::logging::backend::set_global_filter(&filter);
-        common::logging::backend::set_color_console_backend_enabled(
-            crate::uisettings::with(|values| *values.show_console.get_value()),
-        );
+        crate::debugger::console::toggle_console();
         crate::uisettings::with_mut(|values| {
             values.game_dirs = game_dirs.clone();
             values.favorited_ids = favorites.clone();

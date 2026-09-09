@@ -345,7 +345,7 @@ pub fn page(runtime_lock: bool) -> Page {
         let mut filter = common::logging::filter::Filter::default();
         filter.parse_filter_string(&common::settings::values().log_filter.get_value());
         common::logging::backend::set_global_filter(&filter);
-        common::logging::backend::set_color_console_backend_enabled(console);
+        crate::debugger::console::toggle_console();
         ruzu_core::crypto::key_manager::KeyManager::instance()
             .lock()
             .unwrap()

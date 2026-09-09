@@ -107,10 +107,6 @@ pub fn page() -> Page {
     // --- "Game List" ------------------------------------------------------
     let (game_list_group, game_list) = w::group("Game List");
 
-    let show_compat = w::check_row(
-        "Show Compatibility List",
-        uisettings::with(|v| *v.show_compat.get_value()),
-    );
     let show_add_ons = w::check_row(
         "Show Add-Ons Column",
         uisettings::with(|v| *v.show_add_ons.get_value()),
@@ -128,7 +124,6 @@ pub fn page() -> Page {
         uisettings::with(|v| *v.show_play_time.get_value()),
     );
     for check in [
-        &show_compat,
         &show_add_ons,
         &show_size,
         &show_types,
@@ -232,7 +227,6 @@ pub fn page() -> Page {
         let folder_icon_value = value_at(FOLDER_ICON_SIZES, folder_icon.selected());
         let screenshot_height = resolutions.get(resolution.selected() as usize).copied().unwrap_or(0);
 
-        let compat = show_compat.is_active();
         let add_ons = show_add_ons.is_active();
         let size = show_size.is_active();
         let types = show_types.is_active();
@@ -245,7 +239,6 @@ pub fn page() -> Page {
         uisettings::with_mut(|v| {
             v.theme.set_value(theme_name);
             v.language.set_value(language_code);
-            v.show_compat.set_value(compat);
             v.show_add_ons.set_value(add_ons);
             v.show_size.set_value(size);
             v.show_types.set_value(types);

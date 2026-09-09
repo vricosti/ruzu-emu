@@ -259,7 +259,6 @@ pub struct Values {
     // ── Ui ──────────────────────────────────────────────────────────────
     pub single_window_mode: Setting<bool>,
     pub fullscreen: Setting<bool>,
-    pub display_titlebar: Setting<bool>,
     pub show_filter_bar: Setting<bool>,
     pub show_status_bar: Setting<bool>,
     pub show_perf_overlay: Setting<bool>,
@@ -301,7 +300,6 @@ pub struct Values {
 
     // ── UiGameList ──────────────────────────────────────────────────────
     pub show_add_ons: Setting<bool>,
-    pub show_compat: Setting<bool>,
     pub show_size: Setting<bool>,
     pub show_types: Setting<bool>,
     pub show_play_time: Setting<bool>,
@@ -326,7 +324,6 @@ impl Default for Values {
 
             single_window_mode: Setting::new(true, "singleWindowMode", Ui),
             fullscreen: Setting::new(false, "fullscreen", Ui),
-            display_titlebar: Setting::new(true, "displayTitleBars", Ui),
             show_filter_bar: Setting::new(true, "showFilterBar", Ui),
             show_status_bar: Setting::new(true, "showStatusBar", Ui),
             show_perf_overlay: Setting::new(false, "show_perf_overlay", UiGameList),
@@ -390,7 +387,6 @@ impl Default for Values {
             screenshot_height: Setting::new(0, "screenshot_height", Screenshots),
 
             show_add_ons: Setting::new(true, "show_add_ons", UiGameList),
-            show_compat: Setting::new(false, "show_compat", UiGameList),
             show_size: Setting::new(true, "show_size", UiGameList),
             show_types: Setting::new(true, "show_types", UiGameList),
             show_play_time: Setting::new(true, "show_play_time", UiGameList),
@@ -415,11 +411,11 @@ impl Values {
         macro_rules! settings {
             ($($field:ident),+ $(,)?) => { $(visit(&mut self.$field);)+ };
         }
-        settings!(single_window_mode, fullscreen, display_titlebar, show_filter_bar,
+        settings!(single_window_mode, fullscreen, show_filter_bar,
             show_status_bar, show_perf_overlay, confirm_before_stopping, pause_when_in_background,
             mute_when_in_background, hide_mouse, controller_applet_disabled,
             select_user_on_boot, enable_gamemode, show_console,
-            enable_screenshot_save_as, screenshot_height, show_add_ons, show_compat,
+            enable_screenshot_save_as, screenshot_height, show_add_ons,
             show_size, show_types, show_play_time, game_icon_size, folder_icon_size,
             row_1_text_id, row_2_text_id, cache_game_list, favorites_expanded);
         #[cfg(unix)]

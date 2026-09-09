@@ -1573,6 +1573,21 @@ mod menu_mnemonic_tests {
     use super::*;
 
     #[test]
+    fn view_menu_does_not_expose_removed_dock_header_setting() {
+        // Eden removed this legacy dock-widget setting; it is unrelated to
+        // native window decorations and has no GTK runtime consumer.
+        assert!(!MENU_ACTION_NAMES.contains(&"display_dock_widget_headers"));
+        assert!(!MENU_UI.contains("app.display_dock_widget_headers"));
+        let mut values = crate::uisettings::Values::default();
+        values.for_each_ui_setting_mut(|setting| {
+            assert_ne!(setting.label(), "displayTitleBars");
+            assert_ne!(setting.label(), "show_compat");
+        });
+        assert!(MENU_ACTION_NAMES.contains(&"single_window_mode"));
+        assert!(MENU_ACTION_NAMES.contains(&"fullscreen"));
+    }
+
+    #[test]
     fn every_visible_top_level_menu_has_an_upstream_mnemonic() {
         for label in ["_File", "_Emulation", "_View", "_Tools", "_Help"] {
             assert!(
@@ -2403,17 +2418,6 @@ impl GMainWindow {
             single_window.set_state(&true.to_variant());
             log::error!("Cannot restore the separate render window");
         }
-
-        let display_headers = stateful_boolean_action(
-            "display_dock_widget_headers",
-            crate::uisettings::with(|values| *values.display_titlebar.get_value()),
-        );
-        display_headers.connect_activate(|action, _| {
-            let enabled = toggle_boolean_action(action);
-            crate::uisettings::with_mut(|values| values.display_titlebar.set_value(enabled));
-            persist_view_settings();
-        });
-        app.add_action(&display_headers);
 
         let show_filter = stateful_boolean_action(
             "show_filter_bar",
@@ -7378,7 +7382,6 @@ const MENU_ACTION_NAMES: &[&str] = &[
     // View
     "fullscreen",
     "single_window_mode",
-    "display_dock_widget_headers",
     "show_filter_bar",
     "show_status_bar",
     "show_perf_overlay",
@@ -7611,10 +7614,6 @@ const MENU_UI: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
         <item>
           <attribute name="label" translatable="yes">Single _Window Mode</attribute>
           <attribute name="action">app.single_window_mode</attribute>
-        </item>
-        <item>
-          <attribute name="label" translatable="yes">Display D_ock Widget Headers</attribute>
-          <attribute name="action">app.display_dock_widget_headers</attribute>
         </item>
         <item>
           <attribute name="label" translatable="yes">Show _Filter Bar</attribute>

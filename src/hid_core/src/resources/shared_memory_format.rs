@@ -406,7 +406,9 @@ pub struct SharedMemoryFormat {
     pub console: ConsoleSixAxisSensorSharedMemoryFormat,
     pub _padding1: [u8; 0x19E0],
     pub debug_mouse: MouseSharedMemoryFormat,
-    pub _padding2: [u8; 0x2000],
+    pub _padding2: [u8; 0x200],
+    pub npad_condition: NpadCondition,
+    pub _padding3: [u8; 0x1DF0],
 }
 
 impl Default for SharedMemoryFormat {
@@ -427,17 +429,18 @@ impl Default for SharedMemoryFormat {
             console: ConsoleSixAxisSensorSharedMemoryFormat::default(),
             _padding1: [0; 0x19E0],
             debug_mouse: MouseSharedMemoryFormat::default(),
-            _padding2: [0; 0x2000],
+            _padding2: [0; 0x200],
+            npad_condition: NpadCondition::default(),
+            _padding3: [0; 0x1DF0],
         }
     }
 }
 
 impl SharedMemoryFormat {
     pub fn initialize(&mut self) {
-        // Upstream Initialize() is empty because `std::construct_at` already
-        // ran the default constructors for the whole object graph on the
-        // mapped page. ruzu maps a zero-filled page first, then calls this
-        // method, so we must explicitly materialize the default state here.
+        // Upstream constructs the object graph on the mapped page, then
+        // Initialize() resets npad_condition. Ruzu starts with a zero-filled
+        // page, so materialize all defaults, including that condition, here.
         *self = Self::default();
     }
 }
@@ -445,6 +448,26 @@ impl SharedMemoryFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initialize_publishes_global_npad_condition() {
+        let mut shared = SharedMemoryFormat::default();
+        shared.npad_condition.is_initialized = 0;
+        shared.npad_condition.is_valid = 0;
+        shared.npad_condition.hold_type = u32::MAX;
+        shared.initialize();
+
+        let condition = &shared.npad_condition;
+        assert_eq!(std::mem::offset_of!(SharedMemoryFormat, npad_condition), 0x3E200);
+        assert_eq!(std::mem::size_of::<SharedMemoryFormat>(), 0x40000);
+        assert_eq!(std::mem::offset_of!(NpadCondition, is_initialized), 4);
+        assert_eq!(std::mem::offset_of!(NpadCondition, hold_type), 8);
+        assert_eq!(std::mem::offset_of!(NpadCondition, is_valid), 12);
+        assert_eq!(condition._00, 0);
+        assert_eq!(condition.is_initialized, 1);
+        assert_eq!(condition.hold_type, NpadJoyHoldType::Horizontal as u32);
+        assert_eq!(condition.is_valid, 1);
+    }
 
     #[test]
     fn initialize_materializes_lifo_default_state() {

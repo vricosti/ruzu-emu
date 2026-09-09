@@ -506,6 +506,21 @@ struct GameListScanResult {
     directory_to_select: Option<String>,
 }
 
+impl GameListScanResult {
+    /// Eden `GameListModel::IsEmpty` removes empty installed-title roots,
+    /// but retains empty custom directories. Apply this to the completed scan,
+    /// before building GTK rows, so directory roots and `all_games` stay aligned.
+    /// Never remove these paths from the configured directories: a later scan
+    /// must reveal the root again when a title is installed.
+    fn is_empty(&mut self) -> bool {
+        self.directories.retain(|directory| {
+            !directory.games.is_empty()
+                || !matches!(directory.path.as_str(), "SDMC" | "UserNAND" | "SysNAND")
+        });
+        self.directories.is_empty()
+    }
+}
+
 type ContextMenuHandler = Rc<dyn Fn(GameEntry, gtk::Widget, u32, f64, f64)>;
 
 /// Stack page names.
@@ -1673,7 +1688,7 @@ impl GameListView {
         self.root.root().and_downcast::<gtk::Window>()
     }
 
-    /// Return the Nth configured-directory root independently of whether the
+    /// Return the Nth visible directory root independently of whether the
     /// optional Favorites row currently occupies position zero.
     fn directory_root(&self, directory_index: usize) -> Option<GameEntry> {
         (0..self.store.n_items())
@@ -1881,7 +1896,9 @@ impl GameListView {
     fn process_scan_results(&self) {
         let generation = self.scan_generation.load(Ordering::Acquire);
         let result = take_current_scan_result(&self.scan_result_receiver.borrow(), generation);
-        let Some(result) = result else { return };
+        let Some(mut result) = result else { return };
+
+        let is_empty = result.is_empty();
 
         release_list_focus(&self.column_view);
         self.store.remove_all();
@@ -1931,6 +1948,7 @@ impl GameListView {
             self.select_directory(&path);
         }
         self.apply_filter(&self.filter_entry.text());
+        self.stack.set_visible_child_name(if is_empty { PAGE_EMPTY } else { PAGE_LIST });
     }
 
     /// Eden `GameTree::UpdateColumnVisibility`.
@@ -3193,6 +3211,44 @@ mod tests {
         let result = take_current_scan_result(&receiver, 3).unwrap();
         assert_eq!(result.generation, 3);
         assert!(take_current_scan_result(&receiver, 3).is_none());
+    }
+
+    #[test]
+    fn empty_installed_roots_are_hidden_without_hiding_custom_directories() {
+        let make_result = |paths: &[&str]| GameListScanResult {
+            generation: 1,
+            directories: paths.iter().map(|path| ScannedDirectory {
+                path: (*path).to_owned(), deep_scan: false, games: Vec::new(),
+            }).collect(),
+            directory_to_select: None,
+        };
+        let mut empty = make_result(&["SDMC", "UserNAND", "SysNAND"]);
+        assert!(empty.is_empty());
+        assert!(empty.directories.is_empty());
+        assert!(empty.is_empty());
+
+        let mut mixed = make_result(&["SDMC", "/homebrew/empty", "UserNAND", "SysNAND", "/homebrew/SDMC"]);
+        assert!(!mixed.is_empty());
+        assert_eq!(mixed.directories.iter().map(|dir| dir.path.as_str()).collect::<Vec<_>>(),
+            ["/homebrew/empty", "/homebrew/SDMC"]);
+
+        // Fresh scans still contain the configured roots: installation reveals
+        // each category, and an empty scan after removal hides it again.
+        for path in ["SDMC", "UserNAND", "SysNAND"] {
+            let mut populated = make_result(&[path]);
+            populated.directories[0].games.push(GameFile {
+                name: "Homebrew".to_owned(), developer: String::new(),
+                version: String::new(), kind: "NRO".to_owned(),
+                architecture: "aarch64".to_owned(), size: 0,
+                path: PathBuf::from("homebrew.nro"), program_id: 0,
+                add_ons: String::new(), icon: None,
+            });
+            assert!(!populated.is_empty());
+            assert_eq!(populated.directories[0].path, path);
+            assert_eq!(populated.directories[0].games.len(), 1);
+            populated.directories[0].games.clear();
+            assert!(populated.is_empty());
+        }
     }
 
     #[test]

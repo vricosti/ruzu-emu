@@ -171,8 +171,9 @@ impl ConfigurePerGame {
             #[weak(rename_to = dialog)]
             this,
             move |_| {
-                dialog.apply_configuration();
-                dialog.window.close();
+                if dialog.apply_configuration() {
+                    dialog.window.close();
+                }
             }
         ));
         this.window.connect_close_request(glib::clone!(
@@ -213,9 +214,9 @@ impl ConfigurePerGame {
         });
     }
 
-    fn apply_configuration(&self) {
+    fn apply_configuration(&self) -> bool {
         if self.finalized.get() {
-            return;
+            return true;
         }
 
         let setting_state = prepare_custom_settings();
@@ -249,10 +250,11 @@ impl ConfigurePerGame {
                 "Properties",
                 "The custom game configuration could not be saved.",
             );
-            return;
+            return false;
         }
 
         self.restore_global_configuration();
+        true
     }
 
     fn restore_global_configuration(&self) {
@@ -450,6 +452,42 @@ fn info_panel(properties: &GameProperties) -> gtk::Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a display and an isolated process for GTK/global settings"]
+    fn failed_save_keeps_properties_editable_for_retry() {
+        gtk::init().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("properties.ini");
+        // A directory where the file should be reliably rejects writes, even
+        // when the test runner has permission to bypass read-only file modes.
+        std::fs::create_dir(&config_path).unwrap();
+        let mut config = BaseConfig::new(ConfigType::PerGameConfig);
+        config.set_up_ini(&config_path);
+        common::settings::set_configuring_global(false);
+        let dialog = ConfigurePerGame {
+            window: gtk::Window::new(),
+            pages: Vec::new(),
+            config: RefCell::new(config),
+            config_path: config_path.clone(),
+            finalized: Cell::new(false),
+            running: false,
+        };
+        assert!(!dialog.apply_configuration());
+        assert!(!dialog.finalized.get());
+        assert!(!common::settings::is_configuring_global());
+
+        std::fs::remove_dir(&config_path).unwrap();
+        assert!(dialog.apply_configuration());
+        assert!(dialog.finalized.get());
+        assert!(common::settings::is_configuring_global());
+        assert!(config_path.is_file());
+        for window in gtk::Window::list_toplevels() {
+            if let Ok(window) = window.downcast::<gtk::Window>() {
+                window.close();
+            }
+        }
+    }
 
     #[test]
     fn closing_running_properties_keeps_active_custom_settings() {

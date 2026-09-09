@@ -501,17 +501,22 @@ impl UdpClient {
 }
 
 fn parse_server(server: &str) -> Option<(&str, u16)> {
-    let (host, port) = server.split_once(':')?;
-    let port = if port.is_empty() {
-        0
-    } else if let Some(port) = port.strip_prefix("0x").or_else(|| port.strip_prefix("0X")) {
-        u64::from_str_radix(port, 16).ok()? as u16
-    } else if port.len() > 1 && port.starts_with('0') {
-        u64::from_str_radix(&port[1..], 8).ok()? as u16
-    } else {
-        port.parse::<u64>().ok()? as u16
-    };
-    Some((host, port))
+    // If the first getline reaches EOF, the second one leaves its token
+    // unchanged; otherwise only the next colon-delimited token is parsed.
+    let (host, port) = server.split_once(':').unwrap_or((server, server));
+    // ReloadSockets uses strtol(base=0), checks only the terminating character,
+    // then casts to u16. Preserve signs, leading whitespace, native long
+    // overflow and truncation rather than rejecting values as unsigned Rust.
+    let mut token = port.split(':').next()?.as_bytes().to_vec();
+    token.push(0);
+    let mut end = std::ptr::null_mut();
+    // SAFETY: token is NUL terminated and remains alive for both the parse and
+    // the end-pointer check. strtol returns an address within that buffer.
+    let value = unsafe { libc::strtol(token.as_ptr().cast(), &mut end, 0) };
+    if unsafe { *end } != 0 {
+        return None;
+    }
+    Some((host, value as u16))
 }
 
 fn generate_client_id() -> u32 {
@@ -881,6 +886,25 @@ pub fn test_communication(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn server_ports_preserve_strtol_conversion() {
+        for (port, expected) in [
+            ("26760", Some(26760)), ("+26760", Some(26760)),
+            (" \t26760", Some(26760)), ("-1", Some(65535)),
+            ("-0x1", Some(65535)), ("010", Some(8)),
+            ("0X10", Some(16)), ("65536", Some(0)), ("", Some(0)),
+            ("999999999999999999999999999", Some(65535)),
+            ("-999999999999999999999999999", Some(0)),
+            ("08", None), ("1 ", None), ("+", None), ("0x", None),
+        ] {
+            assert_eq!(parse_server(&format!("127.0.0.1:{port}")),
+                expected.map(|value| ("127.0.0.1", value)), "{port:?}");
+        }
+        assert_eq!(parse_server("26760"), Some(("26760", 26760)));
+        assert_eq!(parse_server("localhost"), None);
+        assert_eq!(parse_server("localhost:1:2"), Some(("localhost", 1)));
+    }
 
     fn crc32(data: &[u8]) -> u32 {
         let mut crc = u32::MAX;

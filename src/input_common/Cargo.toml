@@ -15,6 +15,7 @@ joycon-hid = []
 
 [dependencies]
 common.workspace = true
+libc.workspace = true
 log.workspace = true
 bitflags.workspace = true
 parking_lot.workspace = true

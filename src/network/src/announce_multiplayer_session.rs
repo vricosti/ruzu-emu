@@ -373,8 +373,8 @@ mod tests {
         assert!(room.create(
             "Free Room",
             "Free homebrew multiplayer",
-            "",
-            24872,
+            "127.0.0.1",
+            0,
             "secret",
             4,
             "FreeHost",
@@ -438,7 +438,7 @@ mod tests {
         let state = state.lock();
         assert_eq!(state.name, "Free Room");
         assert_eq!(state.description, "Free homebrew multiplayer");
-        assert_eq!(state.port, 24872);
+        assert_eq!(state.port, 0);
         assert_eq!(state.member_slots, 4);
         assert_eq!(state.network_version, NETWORK_VERSION);
         assert!(state.has_password);

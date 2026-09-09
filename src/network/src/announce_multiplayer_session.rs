@@ -53,8 +53,8 @@ impl AnnounceMultiplayerSession {
         let values = common::settings::values();
         let backend: Box<dyn Backend> = Box::new(web_service::announce_room_json::RoomJson::new(
             values.web_api_url.get_value(),
-            values.yuzu_username.get_value(),
-            values.yuzu_token.get_value(),
+            values.eden_username.get_value(),
+            values.eden_token.get_value(),
         ));
 
         Self {
@@ -232,8 +232,8 @@ impl AnnounceMultiplayerSession {
         let values = common::settings::values();
         *self.backend.lock() = Box::new(web_service::announce_room_json::RoomJson::new(
             values.web_api_url.get_value(),
-            values.yuzu_username.get_value(),
-            values.yuzu_token.get_value(),
+            values.eden_username.get_value(),
+            values.eden_token.get_value(),
         ));
     }
 

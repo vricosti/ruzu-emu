@@ -33,6 +33,7 @@ log = { workspace = true }
 serde_json = { workspace = true }
 ash = { workspace = true }
 libc = "0.2"
+getrandom = "0.2"
 tempfile = { workspace = true }
 zip = { version = "4.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 

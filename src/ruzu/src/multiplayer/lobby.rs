@@ -243,8 +243,8 @@ fn local_game_icon(
 /// signed JWT. Anonymous users send an empty token.
 fn external_room_token(verify_uid: &str) -> String {
     let values = common::settings::values();
-    let username = values.yuzu_username.get_value().clone();
-    let credential = values.yuzu_token.get_value().clone();
+    let username = values.eden_username.get_value().clone();
+    let credential = values.eden_token.get_value().clone();
     if username.is_empty() || credential.is_empty() {
         return String::new();
     }
@@ -672,7 +672,7 @@ pub fn show(
 
     let saved_nickname =
         crate::uisettings::with(|values| values.multiplayer_nickname.get_value().clone());
-    let web_username = common::settings::values().yuzu_username.get_value().clone();
+    let web_username = common::settings::values().eden_username.get_value().clone();
     let nickname_value = if saved_nickname.is_empty() || saved_nickname == "Eden" {
         let chosen = if web_username.is_empty() {
             generated_nickname()

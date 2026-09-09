@@ -171,9 +171,9 @@ impl ConfigureDialog {
                 pages: vec![
                     configure_system::page(runtime_lock),
                     configure_profile_manager::page(runtime_lock),
-                    configure_network::page(),
+                    configure_network::page(runtime_lock),
                     configure_filesystem::page(),
-                    configure_applets::page(),
+                    configure_applets::page(runtime_lock),
                 ],
                 apply: apply_pages,
             },

@@ -9,8 +9,8 @@
 // and the console's real applet ("Real applet", `AppletMode::LLE`).
 //
 // The row labels come from `shared_translation.cpp`'s `INSERT(Settings,
-// <field>_applet_mode, ...)` entries; the row *order* is `configure_applets.ui`'s,
-// which is not the same as the declaration order in `Settings::Values`.
+// <field>_applet_mode, ...)` entries. ConfigureApplets::Setup orders visible
+// settings by registration ID, skipping its six hidden applets.
 
 use gtk::prelude::*;
 
@@ -21,12 +21,13 @@ use super::configure_dialog::Page;
 use super::shared_translation as tr;
 use super::shared_widget as w;
 
-/// The applets the dialog exposes, in `configure_applets.ui` order, paired with
+/// The applets the dialog exposes, in upstream registration order, paired with
 /// an accessor for the matching `Settings::Values` field.
 ///
 /// Upstream exposes nine of the fifteen `*_applet_mode` settings; the rest
 /// (`shop`, `login_share`, `wifi_web_auth`, `my_page`, `net_connect`,
-/// `data_erase`) have no UI row, so they keep their defaults.
+/// `data_erase`) have hidden rows upstream. This page leaves their settings
+/// untouched, including values loaded from the configuration file.
 type Field = fn(&mut Values) -> &mut common::settings_common::SwitchableSetting<AppletMode>;
 
 const APPLETS: &[(&str, Field)] = &[
@@ -44,7 +45,8 @@ const APPLETS: &[(&str, Field)] = &[
 ];
 
 /// Build the Applets tab — upstream `ConfigureApplets`.
-pub fn page() -> Page {
+pub fn page(runtime_lock: bool) -> Page {
+    let configuring_global = common::settings::is_configuring_global();
     let (scroller, column) = w::page();
 
     let (group, content) = w::group("Applet mode preference");
@@ -53,32 +55,43 @@ pub fn page() -> Page {
     let mut combos = Vec::with_capacity(APPLETS.len());
 
     for (label, field) in APPLETS {
-        let current = {
-            // `get_value` borrows the settings guard, so read through a clone
+        let (current, policy) = {
+            // Copy the value and policy out of the settings guard
             // rather than holding the lock across widget construction.
             let mut values = common::settings::values_mut();
-            *field(&mut values).get_value()
+            let setting = field(&mut values);
+            (
+                *setting.get_value(),
+                w::SettingEditPolicy::new(setting, runtime_lock, configuring_global),
+            )
         };
         let (row, combo) = w::combo_row(label, &labels, tr::index_of(tr::APPLET_MODE, &current));
+        row.set_sensitive(policy.sensitive);
         content.append(&row);
-        combos.push((*field, combo));
+        combos.push((*field, combo, policy));
     }
 
     let enable_overlay = w::check_row(
         "Enable Overlay Applet",
         *common::settings::values().enable_overlay.get_value(),
     );
+    let overlay_policy = w::SettingEditPolicy::new(
+        &common::settings::values().enable_overlay,
+        runtime_lock,
+        configuring_global,
+    );
+    enable_overlay.set_sensitive(overlay_policy.sensitive);
     content.append(&enable_overlay);
 
     column.append(&group);
 
     Page::new("Applets", scroller, move || {
         let mut values = common::settings::values_mut();
-        for (field, combo) in &combos {
+        for (field, combo, policy) in &combos {
             let mode = tr::value_at(tr::APPLET_MODE, combo.selected());
-            field(&mut values).set_value(mode);
+            policy.apply(field(&mut values), mode);
         }
-        values.enable_overlay.set_value(enable_overlay.is_active());
+        overlay_policy.apply(&mut values.enable_overlay, enable_overlay.is_active());
     })
 }
 
@@ -87,9 +100,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn applet_preferences_are_startup_only_in_global_and_per_game_dialogs() {
+        for configuring_global in [true, false] {
+            let mut values = Values::default();
+            for (_, field) in APPLETS {
+                let setting = field(&mut values);
+                setting.set_global(configuring_global);
+                setting.set_value(AppletMode::HLE);
+                let running = w::SettingEditPolicy::new(setting, false, configuring_global);
+                assert!(!running.sensitive);
+                running.apply(setting, AppletMode::LLE);
+                assert_eq!(*setting.get_value(), AppletMode::HLE);
+                let stopped = w::SettingEditPolicy::new(setting, true, configuring_global);
+                assert!(stopped.sensitive);
+                stopped.apply(setting, AppletMode::LLE);
+                assert_eq!(*setting.get_value(), AppletMode::LLE);
+            }
+            let setting = &mut values.enable_overlay;
+            setting.set_global(configuring_global);
+            let running = w::SettingEditPolicy::new(setting, false, configuring_global);
+            assert!(!running.sensitive);
+            running.apply(setting, true);
+            assert!(!*setting.get_value());
+            let stopped = w::SettingEditPolicy::new(setting, true, configuring_global);
+            assert!(stopped.sensitive);
+            stopped.apply(setting, true);
+            assert!(*setting.get_value());
+        }
+    }
+
+    #[test]
     fn applet_rows_match_upstream_ui_order() {
-        // `configure_applets.ui` lists these nine, in this order. A reorder
-        // would silently move a user's saved choice onto a different applet.
+        // ConfigureApplets::Setup retains this visible registration order.
         let labels: Vec<&str> = APPLETS.iter().map(|(label, _)| *label).collect();
         assert_eq!(
             labels,

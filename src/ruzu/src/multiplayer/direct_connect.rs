@@ -39,7 +39,7 @@ pub fn show(
 
     let nickname_value = crate::uisettings::with(|v| v.multiplayer_nickname.get_value().clone());
     let nickname_value = if nickname_value.is_empty() {
-        let web_username = common::settings::values().yuzu_username.get_value().clone();
+        let web_username = common::settings::values().eden_username.get_value().clone();
         if web_username.is_empty() {
             nickname_value
         } else {

@@ -154,16 +154,23 @@ pub fn load_global_values() {
     config.initialize(&path);
 }
 
+// Mechanical shared preflight for this module's read/modify/write adapters.
+// Eden retains its parsed Config object; Rust must not replace unreadable input
+// with an empty document before updating one category.
+fn read_configuration_for_update(path: &Path) -> io::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Persist the generic global categories through upstream's
 /// `Config::SaveValues` owner. Qt-owned controls and UI values are written by
 /// their specialized writers after this pass.
 pub fn save_global_values() -> io::Result<()> {
     let path = config_path();
-    match std::fs::read_to_string(&path) {
-        Ok(_) => {},
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-        Err(error) => return Err(error),
-    }
+    read_configuration_for_update(&path)?;
     let mut config = BaseConfig::new(ConfigType::GlobalConfig);
     // Upstream writes through the already-loaded, long-lived `QtConfig`
     // object. Reden reconstructs this adapter for each save, so load only the
@@ -221,7 +228,7 @@ fn parse_shortcut_values(contents: &str) -> Vec<uisettings::Shortcut> {
 /// Persist frontend shortcuts through upstream `QtConfig::SaveShortcutValues`.
 pub fn save_shortcut_values() -> io::Result<()> {
     let path = config_path();
-    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut contents = read_configuration_for_update(&path)?;
     let shortcuts = uisettings::with(|ui| ui.shortcuts.clone());
     for (shortcut, default) in shortcuts.iter().zip(uisettings::DEFAULT_HOTKEYS) {
         let prefix = format!("{}\\{}", shortcut.group, shortcut.name);
@@ -262,8 +269,11 @@ pub fn save_shortcut_values() -> io::Result<()> {
 
 /// Persist the four settings owned by upstream `ConfigureTasDialog`.
 pub fn save_tas_values() -> io::Result<()> {
-    let path = config_path();
-    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    save_tas_values_to(&config_path())
+}
+
+fn save_tas_values_to(path: &Path) -> io::Result<()> {
+    let mut contents = read_configuration_for_update(path)?;
     let values = common::settings::values();
     for (key, value, default) in [
         (
@@ -462,7 +472,7 @@ pub fn load_multiplayer_values() {
 /// `QtConfig::SaveMultiplayerValues`'s `Category::Multiplayer` writer.
 pub fn save_multiplayer_values() -> io::Result<()> {
     let path = config_path();
-    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut contents = read_configuration_for_update(&path)?;
     uisettings::with(|ui| {
         contents = replace_ui_string_setting(
             &contents,
@@ -527,11 +537,7 @@ pub fn save_view_values() -> io::Result<()> {
 }
 
 fn save_view_values_to(path: &Path) -> io::Result<()> {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error),
-    };
+    let contents = read_configuration_for_update(path)?;
     let updated = uisettings::with_mut(|values| save_ui_values(&contents, values));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -594,7 +600,7 @@ fn read_ui_u32_setting(
 /// `Config::SaveUIValues` key and default marker.
 pub fn save_ui_language() -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let language = uisettings::with(|values| values.language.get_value().clone());
     let updated = replace_ui_string_setting(&contents, "Paths\\language", &language, "");
     if let Some(parent) = path.parent() {
@@ -607,7 +613,7 @@ pub fn save_ui_language() -> io::Result<()> {
 /// `QtConfig::SavePathValues`'s `romsPath` key.
 pub fn save_roms_path() -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let roms_path = uisettings::with(|values| values.roms_path.clone());
     let updated = replace_ui_string_setting(&contents, "Paths\\romsPath", &roms_path, "");
     if let Some(parent) = path.parent() {
@@ -754,7 +760,7 @@ pub fn load_external_content_dirs() {
 /// `QtConfig::SaveUIValues`'s `external_content_dirs` array.
 pub fn save_external_content_dirs(directories: &[String]) -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let updated = replace_external_content_dirs(&contents, directories);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -898,7 +904,7 @@ fn merge_game_dirs(mut existing: Vec<GameDir>, source: Vec<GameDir>) -> (Vec<Gam
 /// one occupied.
 pub fn save_game_dirs(dirs: &[GameDir]) -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let updated = replace_game_dirs(&contents, dirs);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -931,7 +937,7 @@ pub fn load_favorites_expanded() {
 /// Persist upstream `UISettings::values.favorites_expanded` in UiGameList.
 pub fn save_favorites_expanded() -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let (value, default) = uisettings::with(|values| {
         (
             *values.favorites_expanded.get_value(),
@@ -957,7 +963,7 @@ pub fn save_favorites_expanded() -> io::Result<()> {
 /// rewritten block takes the position of the first old line.
 pub fn save_favorited_ids(ids: &[u64]) -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let updated = replace_favorited_ids(&contents, ids);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1236,7 +1242,7 @@ where
 /// of the INI alone.
 pub fn save_control_values() -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
 
     let mut entries: Vec<(String, String)> = Vec::new();
     {
@@ -1280,7 +1286,7 @@ pub fn load_per_game_control_values(path: &std::path::Path) {
 /// Upstream `Config::SavePlayerValues` returns before writing when the profile
 /// name is empty in a per-game configuration.
 pub fn save_per_game_control_values(path: &std::path::Path) -> io::Result<()> {
-    let contents = std::fs::read_to_string(path).unwrap_or_default();
+    let contents = read_configuration_for_update(path)?;
     let mut entries = Vec::new();
     {
         let settings = common::settings::values();
@@ -1705,6 +1711,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn specialized_writers_preserve_unreadable_ini() {
+        const CHILD: &str = "RUZU_TEST_UNREADABLE_SETTINGS_WRITERS";
+        if let Some(root) = std::env::var_os(CHILD) {
+            common::fs::path_util::set_ruzu_path(RuzuPath::ConfigDir, Path::new(&root));
+            let path = config_path();
+            std::fs::write(&path, [0xff, 0xfe]).unwrap();
+            let writers: &[fn() -> io::Result<()>] = &[
+                save_global_values, save_shortcut_values, save_tas_values,
+                save_multiplayer_values, save_view_values, save_ui_language,
+                save_roms_path, save_favorites_expanded, save_control_values,
+                || save_external_content_dirs(&[]), || save_game_dirs(&[]),
+                || save_favorited_ids(&[]), || save_per_game_control_values(&config_path()),
+            ];
+            for (index, writer) in writers.iter().enumerate() {
+                assert!(writer().is_err(), "writer {index} accepted invalid UTF-8");
+                assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe]);
+            }
+            assert_eq!(read_configuration_for_update(&Path::new(&root).join("missing.ini")).unwrap(), "");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "configuration::qt_config::tests::specialized_writers_preserve_unreadable_ini", "--test-threads=1"])
+            .env(CHILD, root.path())
+            .status().unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
     fn complete_reload_reads_core_and_frontend_in_an_isolated_process() {
         const CHILD: &str = "RUZU_TEST_COMPLETE_CONFIG_RELOAD";
         if let Some(root) = std::env::var_os(CHILD) {
@@ -1712,6 +1747,8 @@ mod tests {
             common::fs::path_util::set_ruzu_path(RuzuPath::ConfigDir, &root);
             let document = concat!(
                 "[Audio]\nvolume\\default=false\nvolume=42\n",
+                "audio_muted\\default=false\naudio_muted=true\n",
+                "muteWhenInBackground\\default=false\nmuteWhenInBackground=true\n",
                 "[UI]\nhideInactiveMouse\\default=false\nhideInactiveMouse=false\n",
                 "Paths\\gamedirs\\size=1\n",
                 "Paths\\gamedirs\\1\\path=/synthetic/homebrew\n",
@@ -1719,7 +1756,13 @@ mod tests {
             std::fs::write(config_path(), document).unwrap();
             reload_all_values();
             assert_eq!(*common::settings::values().volume.get_value(), 42);
+            {
+                let values = common::settings::values();
+                assert!(*values.audio_muted.get_value());
+                assert_eq!(common::settings::volume(&values), 0.0);
+            }
             uisettings::with(|values| {
+                assert!(*values.mute_when_in_background.get_value());
                 assert!(!*values.hide_mouse.get_value());
                 assert_eq!(values.game_dirs.len(), 1);
                 assert_eq!(values.game_dirs[0].path, "/synthetic/homebrew");
@@ -1730,7 +1773,13 @@ mod tests {
             std::fs::write(config_path(), "").unwrap();
             reload_all_values();
             assert_eq!(*common::settings::values().volume.get_value(), 100);
+            {
+                let values = common::settings::values();
+                assert!(!*values.audio_muted.get_value());
+                assert_eq!(common::settings::volume(&values), 1.0);
+            }
             uisettings::with(|values| {
+                assert!(!*values.mute_when_in_background.get_value());
                 assert!(*values.hide_mouse.get_value());
                 assert!(values.game_dirs.is_empty());
             });
@@ -1812,6 +1861,16 @@ mod tests {
         std::fs::write(&path, [0xff, 0xfe]).unwrap();
         assert!(save_view_values_to(&path).is_err());
         assert_eq!(std::fs::read(path).unwrap(), [0xff, 0xfe]);
+    }
+
+    #[test]
+    fn saving_tas_preserves_unreadable_configuration() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert!(save_tas_values_to(temporary.path()).is_err());
+        let path = temporary.path().join("invalid.ini");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(save_tas_values_to(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe]);
     }
 
     #[test]

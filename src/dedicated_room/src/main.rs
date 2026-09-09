@@ -461,16 +461,16 @@ fn main() {
             log::info!("Hosting a public room");
             pad_token(&mut token);
             settings
-                .yuzu_username
+                .eden_username
                 .set_value(username_from_display_token(&token));
-            username.clone_from(settings.yuzu_username.get_value());
+            username.clone_from(settings.eden_username.get_value());
             settings
-                .yuzu_token
+                .eden_token
                 .set_value(token_from_display_token(&token));
         } else {
             log::info!("Hosting a public room");
-            settings.yuzu_username.set_value(username.clone());
-            settings.yuzu_token.set_value(token.clone());
+            settings.eden_username.set_value(username.clone());
+            settings.eden_token.set_value(token.clone());
         }
     }
     if !announce && enable_yuzu_mods {

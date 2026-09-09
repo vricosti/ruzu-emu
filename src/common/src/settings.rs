@@ -380,6 +380,7 @@ pub struct Values {
     pub yuzu_username: Setting<String>,
     pub yuzu_token: Setting<String>,
     /// Generated frontend identity, separate from legacy authenticated credentials.
+    pub eden_username: Setting<String>,
     pub eden_token: Setting<String>,
 
     // ── Add-Ons ─────────────────────────────────────────────────────────
@@ -565,7 +566,7 @@ impl Values {
             ),
             Category::Miscellaneous => visit!(log_filter, log_flush_line, censor_username),
             Category::WebService => {
-                visit!(enable_telemetry, web_api_url, yuzu_username, yuzu_token, eden_token,)
+                visit!(enable_telemetry, web_api_url, yuzu_username, yuzu_token, eden_username, eden_token,)
             }
             Category::System => visit!(
                 cpu_clock,
@@ -1586,6 +1587,8 @@ impl Default for Values {
             ),
             yuzu_username: Setting::new(String::new(), "yuzu_username", WebService),
             yuzu_token: Setting::new(String::new(), "yuzu_token", WebService),
+            // Upstream defaults to its frontend name; retain its persisted key.
+            eden_username: Setting::new("Ruzu".to_string(), "eden_username", WebService),
             eden_token: Setting::new(String::new(), "eden_token", WebService),
 
             // Add-Ons

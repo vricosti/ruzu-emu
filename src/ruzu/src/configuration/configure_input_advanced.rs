@@ -10,6 +10,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gtk::prelude::*;
 
@@ -23,7 +24,10 @@ const SWATCH_WIDTH: i32 = 70;
 const SWATCH_HEIGHT: i32 = 26;
 
 /// Build the Controls "Advanced" tab — upstream `ConfigureInputAdvanced`.
-pub fn page(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Page {
+pub fn page(
+    input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
+    hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+) -> Page {
     let (scroller, column) = w::page();
 
     let split = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -35,9 +39,11 @@ pub fn page(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Page 
     let grid = gtk::Grid::new();
     grid.set_row_spacing(8);
     grid.set_column_spacing(10);
+    let mut controllers_color_buttons = Vec::new();
     for slot in 0..super::configure_input::NUM_PLAYERS {
         let player = player_input(slot);
-        let cell = player_colors(slot, &player);
+        let (cell, buttons) = player_colors(slot, &player);
+        controllers_color_buttons.push(buttons);
         grid.attach(&cell, (slot % 2) as i32, (slot / 2) as i32, 1, 1);
     }
     colors.append(&grid);
@@ -178,6 +184,7 @@ pub fn page(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Page 
     });
 
     Page::new("Advanced", scroller, move || {
+        apply_controller_colors(&controllers_color_buttons, &hid_core);
         let mut values = common::settings::values_mut();
         values
             .keyboard_enabled
@@ -252,7 +259,7 @@ fn device_row(label: &str, active: bool, configure_label: Option<&str>) -> Devic
 
 /// One player's four colour swatches, laid out as `configure_input_advanced.ui`
 /// arranges them: L/R Body over L/R Button.
-fn player_colors(index: usize, player: &PlayerInput) -> gtk::Box {
+fn player_colors(index: usize, player: &PlayerInput) -> (gtk::Box, [gtk::ColorButton; 4]) {
     let cell = gtk::Box::new(gtk::Orientation::Vertical, 4);
 
     let title = gtk::Label::new(Some(&format!("Player {}", index + 1)));
@@ -266,28 +273,30 @@ fn player_colors(index: usize, player: &PlayerInput) -> gtk::Box {
     content.set_margin_start(8);
     content.set_margin_end(8);
 
-    content.append(&swatch_pair(
+    let (body_row, [left_body, right_body]) = swatch_pair(
         "L Body",
         player.body_color_left,
         "R Body",
         player.body_color_right,
-    ));
-    content.append(&swatch_pair(
+    );
+    content.append(&body_row);
+    let (button_row, [left_button, right_button]) = swatch_pair(
         "L Button",
         player.button_color_left,
         "R Button",
         player.button_color_right,
-    ));
+    );
+    content.append(&button_row);
 
     frame.set_child(Some(&content));
     cell.append(&frame);
-    cell
+    (cell, [left_body, left_button, right_body, right_button])
 }
 
 /// Two captioned swatches side by side.
-fn swatch_pair(left_label: &str, left: u32, right_label: &str, right: u32) -> gtk::Box {
+fn swatch_pair(left_label: &str, left: u32, right_label: &str, right: u32) -> (gtk::Box, [gtk::ColorButton; 2]) {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    for (label, color) in [(left_label, left), (right_label, right)] {
+    let buttons = [(left_label, left), (right_label, right)].map(|(label, color)| {
         let block = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let caption = gtk::Label::new(Some(label));
         let button = gtk::ColorButton::with_rgba(&rgba_from_u32(color));
@@ -295,8 +304,36 @@ fn swatch_pair(left_label: &str, left: u32, right_label: &str, right: u32) -> gt
         block.append(&caption);
         block.append(&button);
         row.append(&block);
+        button
+    });
+    (row, buttons)
+}
+
+/// Color portion of upstream ApplyConfiguration. Release settings before
+/// ReloadColorsFromSettings, which reads them itself.
+fn apply_controller_colors(
+    buttons: &[[gtk::ColorButton; 4]],
+    hid_core: &Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+) {
+    for (index, buttons) in buttons.iter().enumerate() {
+        let colors = buttons.each_ref().map(|button| packed_rgb(&button.rgba()));
+        {
+            let mut settings = common::settings::values_mut();
+            let player = &mut settings.players.get_value_mut()[index];
+            player.body_color_left = colors[0];
+            player.button_color_left = colors[1];
+            player.body_color_right = colors[2];
+            player.button_color_right = colors[3];
+        }
+        let controller = hid_core.lock().get_emulated_controller_by_index(index);
+        controller.lock().reload_colors_from_settings();
     }
-    row
+}
+
+/// QColor::rgb returns opaque ARGB even when the stored input had no alpha.
+fn packed_rgb(color: &gtk::gdk::RGBA) -> u32 {
+    let channel = |value: f32| (value * 255.0).round() as u32;
+    0xFF00_0000 | (channel(color.red()) << 16) | (channel(color.green()) << 8) | channel(color.blue())
 }
 
 /// Convert a packed `0xRRGGBB` colour into a GDK colour.
@@ -341,5 +378,41 @@ mod tests {
     fn black_and_white_round_trip() {
         assert_eq!(rgba_from_u32(0x000000).red(), 0.0);
         assert_eq!(rgba_from_u32(0xFFFFFF).blue(), 1.0);
+    }
+
+    #[test]
+    fn color_conversion_preserves_every_channel_byte_like_qcolor_rgb() {
+        for value in 0..=255 {
+            for color in [value, value << 8, value << 16] {
+                assert_eq!(packed_rgb(&rgba_from_u32(color)), 0xFF00_0000 | color);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn chosen_controller_colors_apply_to_settings_and_live_controller() {
+        gtk::init().unwrap();
+        let hid = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        let player = player_input(0);
+        let (_widget, buttons) = player_colors(0, &player);
+        let colors = [0x123456, 0x789ABC, 0xDEF012, 0x345678];
+        for (button, color) in buttons.iter().zip(colors) {
+            button.set_rgba(&rgba_from_u32(color));
+        }
+        // A draft selection must not leak through Cancel.
+        assert_eq!(player_input(0).body_color_left, player.body_color_left);
+        apply_controller_colors(&[buttons], &hid);
+        let stored = player_input(0);
+        assert_eq!([stored.body_color_left, stored.button_color_left,
+            stored.body_color_right, stored.button_color_right],
+            colors.map(|color| 0xFF00_0000 | color));
+        let device = hid.lock().get_emulated_controller_by_index(0);
+        let actual = device.lock().get_colors();
+        for (actual, expected) in [actual.left.body, actual.left.button,
+            actual.right.body, actual.right.button].into_iter().zip(colors) {
+            assert_eq!([actual.r, actual.g, actual.b],
+                [(expected >> 16) as u8, (expected >> 8) as u8, expected as u8]);
+        }
     }
 }

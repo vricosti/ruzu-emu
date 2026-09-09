@@ -82,7 +82,7 @@ pub fn pages(
             )
         })
         .collect();
-    let advanced = configure_input_advanced::page(Rc::clone(&input_subsystem));
+    let advanced = configure_input_advanced::page(Rc::clone(&input_subsystem), Arc::clone(&hid_core));
     // Apply these only after all player pages and Advanced, as ConfigureInput
     // does. The last page closure also owns the shared bindings' lifetime.
     pages.push(Page::new(&advanced.title, advanced.widget, move || {

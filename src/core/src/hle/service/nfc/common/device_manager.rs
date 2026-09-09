@@ -69,6 +69,7 @@ impl DeviceManager {
                 controller,
                 Some(Arc::clone(&availability_change_event)),
                 &mut service_context,
+                system.unwrap_or_else(crate::core::SystemRef::null),
             ));
         }
 

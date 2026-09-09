@@ -808,6 +808,9 @@ impl StaticService {
 // =============================================================================
 
 impl SessionRequestHandler for StaticService {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }

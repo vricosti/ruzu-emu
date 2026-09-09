@@ -29,6 +29,7 @@ use super::amiibo_crypto;
 ///
 /// Manages the NFC device state machine and the stable HID callback owner.
 struct NfcDeviceState {
+    system: crate::core::SystemRef,
     npad_id: u64,
     npad_device: Option<EmulatedControllerHandle>,
     callback_key: Option<i32>,
@@ -62,7 +63,7 @@ impl NfcDevice {
     /// The no-controller constructor is retained for legacy manager callers; Cabinet
     /// uses `new_with_controller`, which owns the upstream HID callback lifecycle.
     pub fn new(npad_id: u64, service_context: &mut ServiceContext) -> Self {
-        Self::new_with_controller(npad_id, None, None, service_context)
+        Self::new_with_controller(npad_id, None, None, service_context, crate::core::SystemRef::null())
     }
 
     pub fn new_with_controller(
@@ -70,6 +71,7 @@ impl NfcDevice {
         npad_device: Option<EmulatedControllerHandle>,
         availability_change_event: Option<Arc<Event>>,
         service_context: &mut ServiceContext,
+        system: crate::core::SystemRef,
     ) -> Self {
         let activate_handle = service_context.create_event("NFC:ActivateEvent".to_string());
         let deactivate_handle = service_context.create_event("NFC:DeactivateEvent".to_string());
@@ -82,6 +84,7 @@ impl NfcDevice {
             .expect("just created deactivate event");
 
         let inner = Arc::new(Mutex::new(NfcDeviceState {
+            system,
             npad_id,
             npad_device: npad_device.clone(),
             callback_key: None,
@@ -369,7 +372,35 @@ impl NfcDeviceState {
             return Err(nfc_result::RESULT_WRONG_DEVICE_STATE);
         }
 
-        Ok(self.tag_info)
+        let mut tag_info = self.tag_info;
+        if tag_info.tag_type == TagType::TYPE2
+            && *common::settings::values().random_amiibo_id.get_value()
+        {
+            let length = usize::from(tag_info.uuid_length);
+            // The upstream buffer length is supplied by the NFC device. Do
+            // not permit malformed device metadata to overrun the UUID array.
+            if length > tag_info.uuid.len() {
+                return Err(nfc_result::RESULT_INVALID_ARGUMENT);
+            }
+            let mut rng = common::tiny_mt::TinyMT::new();
+            rng.initialize(self.get_current_posix_time() as u32);
+            rng.generate_random_bytes(&mut tag_info.uuid[..length]);
+        }
+        Ok(tag_info)
+    }
+
+    /// NfcDevice::GetCurrentPosixTime reads the standard steady clock upstream,
+    /// despite its name; it is not the host UNIX clock.
+    fn get_current_posix_time(&self) -> i64 {
+        let manager = self.system.get().service_manager().expect("NFC requires the service manager");
+        let handler = crate::hle::service::sm::sm::ServiceManager::get_service_blocking(
+            &manager, self.system, "time:u",
+        );
+        let service = handler.as_any()
+            .downcast_ref::<crate::hle::service::glue::time::r#static::StaticService>()
+            .expect("time:u must be the Glue time service");
+        service.get_standard_steady_clock().get_current_time_point()
+            .expect("NFC requires an initialized standard steady clock").time_point
     }
 
     /// Mount an amiibo tag for reading/writing.
@@ -1466,6 +1497,69 @@ impl Drop for NfcDeviceState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_identifier_uses_guest_clock_and_preserves_source_tag() {
+        const CHILD: &str = "RUZU_TEST_NFC_RANDOM_ID";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::service::nfc::common::device::tests::random_identifier_uses_guest_clock_and_preserves_source_tag"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
+            use crate::hle::service::{glue::time, psc::time as psc};
+            let system = Box::new(crate::core::System::new_for_test());
+            let system_ref = crate::core::SystemRef::from_ref(system.as_ref());
+            let sm = system.service_manager().unwrap();
+            assert!(sm.lock().unwrap().register_service("time:m".into(), 64, Box::new(|| {
+                Arc::new(psc::service_manager::TimeServiceManager::new(
+                    crate::core::SystemRef::null(), std::ptr::null(), std::ptr::null_mut(),
+                ))
+            })).is_success());
+            let manager = Arc::new(std::sync::Mutex::new(time::manager::TimeManager::new(
+                Arc::clone(&sm), crate::core::SystemRef::null(),
+            )));
+            let clock = manager.lock().unwrap().psc_time.lock().unwrap().standard_steady_clock.clone();
+            {
+                let mut clock = clock.lock().unwrap();
+                *clock = psc::clocks::standard_steady_clock_core::StandardSteadyClockCore::new(Box::new(|| 0));
+                clock.initialize([1; 16], 42_000_000_000, 0, 0, false);
+            }
+            let service = Arc::new(time::r#static::StaticService::new(
+                system_ref, psc::common::StaticServiceSetupInfo::default(), "time:u", manager,
+            ));
+            assert!(sm.lock().unwrap().register_service("time:u".into(), 64, Box::new(move || service.clone())).is_success());
+            let device = mounted_plain_device();
+            let original = [1, 2, 3, 4, 5, 6, 7, 91, 92, 93];
+            {
+                let mut state = device.inner.lock();
+                state.system = system_ref;
+                state.tag_info.uuid = original;
+                state.tag_info.uuid_length = 7;
+                state.tag_info.tag_type = TagType::TYPE2;
+            }
+            common::settings::values_mut().random_amiibo_id.set_value(false);
+            assert_eq!(device.get_tag_info().unwrap().uuid, original);
+            common::settings::values_mut().random_amiibo_id.set_value(true);
+            let mut expected = original;
+            let mut rng = common::tiny_mt::TinyMT::new();
+            rng.initialize(42);
+            rng.generate_random_bytes(&mut expected[..7]);
+            assert_eq!(device.get_tag_info().unwrap().uuid, expected);
+            assert_eq!(device.inner.lock().tag_info.uuid, original);
+            device.inner.lock().tag_info.uuid_length = 11;
+            assert_eq!(device.get_tag_info().unwrap_err(), nfc_result::RESULT_INVALID_ARGUMENT);
+            device.inner.lock().tag_info.uuid_length = 0;
+            assert_eq!(device.get_tag_info().unwrap().uuid, original);
+            device.inner.lock().tag_info.uuid_length = 7;
+            device.inner.lock().tag_info.tag_type = TagType::MIFARE;
+            assert_eq!(device.get_tag_info().unwrap().uuid, original);
+            device.inner.lock().device_state = DeviceState::TagRemoved;
+            assert_eq!(device.get_tag_info().unwrap_err(), nfc_result::RESULT_TAG_REMOVED);
+        }).unwrap().join().unwrap();
+    }
 
     fn mounted_plain_device() -> NfcDevice {
         let mut context = ServiceContext::new("NfcDeviceTest".to_string());

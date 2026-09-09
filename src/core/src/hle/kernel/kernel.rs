@@ -1910,6 +1910,9 @@ pub struct KernelCore {
     /// Upstream: `KernelCore::Impl::irs_shared_mem`.
     irs_shared_mem: Option<(u64, Arc<KSharedMemory>)>,
 
+    /// Upstream: `KernelCore::Impl::hidbus_shared_mem`.
+    hidbus_shared_mem: Option<(u64, Arc<KSharedMemory>)>,
+
     /// Kernel-wide resource limit. Upstream:
     /// `KernelCore::Impl::system_resource_limit` set by
     /// `InitializeSystemResourceLimit` at boot. Holds PhysicalMemoryMax,
@@ -2027,6 +2030,7 @@ impl KernelCore {
             memory_manager: KMemoryManager::new(),
             font_shared_mem: None,
             irs_shared_mem: None,
+            hidbus_shared_mem: None,
             system_resource_limit: None,
             memory_block_slab_manager: None,
             block_info_manager: None,
@@ -2548,6 +2552,7 @@ impl KernelCore {
         self.terminating_processes.lock().unwrap().clear();
         self.font_shared_mem = None;
         self.irs_shared_mem = None;
+        self.hidbus_shared_mem = None;
 
         // Upstream's thread/process Close() chain leaves no objects in the
         // scheduler context. Drop the Rust owning container now rather than
@@ -3398,6 +3403,39 @@ impl KernelCore {
             .map(|(object_id, shared_memory)| (*object_id, Arc::clone(shared_memory)))
     }
 
+    /// HID bus portion of `KernelCore::Impl::InitializeHackSharedMemory`.
+    /// Called once the physical memory manager is ready, alongside IRS/fonts.
+    pub fn initialize_hidbus_shared_memory(&mut self, device_memory: &DeviceMemory) -> ResultCode {
+        const HIDBUS_SHARED_MEMORY_SIZE: usize = 0x1000;
+
+        if self.hidbus_shared_mem.is_some() {
+            return crate::hle::result::RESULT_SUCCESS;
+        }
+
+        let mut shared_memory = KSharedMemory::new();
+        let result = shared_memory.initialize(
+            device_memory,
+            &mut self.memory_manager,
+            MemoryPermission::None,
+            MemoryPermission::Read,
+            HIDBUS_SHARED_MEMORY_SIZE,
+        );
+        if result.is_error() {
+            return result;
+        }
+
+        let object_id = self.create_new_object_id() as u64;
+        self.hidbus_shared_mem = Some((object_id, Arc::new(shared_memory)));
+        crate::hle::result::RESULT_SUCCESS
+    }
+
+    /// Upstream: `KernelCore::GetHidBusSharedMem()`.
+    pub fn get_hid_bus_shared_mem(&self) -> Option<(u64, Arc<KSharedMemory>)> {
+        self.hidbus_shared_mem
+            .as_ref()
+            .map(|(object_id, shared_memory)| (*object_id, Arc::clone(shared_memory)))
+    }
+
     /// Get the kernel-wide resource limit. Upstream:
     /// `KernelCore::GetSystemResourceLimit()`.
     pub fn get_system_resource_limit(
@@ -3849,6 +3887,55 @@ mod tests {
         assert_eq!(first.get_size(), 0x8000);
         assert_eq!(first_id, second_id);
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn hidbus_shared_memory_is_persistent_zeroed_and_read_only_to_guests() {
+        use crate::device_memory::dram_memory_map;
+        use crate::hle::kernel::k_memory_manager::Pool;
+        use crate::hle::kernel::k_process_page_table::KProcessPageTable;
+        use crate::hle::kernel::svc::svc_results::RESULT_INVALID_NEW_MEMORY_PERMISSION;
+
+        let device_memory = DeviceMemory::with_size(0x2000);
+        let mut kernel = KernelCore::new();
+        kernel.memory_manager_mut().initialize_pool(Pool::SECURE, dram_memory_map::BASE, 0x2000);
+        assert!(kernel.get_hid_bus_shared_mem().is_none());
+        assert!(kernel.initialize_hidbus_shared_memory(&device_memory).is_success());
+        let (first_id, first) = kernel.get_hid_bus_shared_mem().unwrap();
+        assert_eq!(first.get_size(), 0x1000);
+        // No guest mapping exists in this isolated test; the backing has one writer.
+        unsafe {
+            assert!(std::slice::from_raw_parts(first.get_pointer(0), 0x1000)
+                .iter().all(|byte| *byte == 0));
+            *first.get_pointer_mut(0xFFF) = 0xA5;
+        }
+        assert!(kernel.initialize_hidbus_shared_memory(&device_memory).is_success());
+        let (second_id, second) = kernel.get_hid_bus_shared_mem().unwrap();
+        assert_eq!(first_id, second_id);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(unsafe { *second.get_pointer(0xFFF) }, 0xA5);
+        assert_eq!(first.map(&mut KProcessPageTable::new(), 0x10000, 0x1000,
+            MemoryPermission::ReadWrite), RESULT_INVALID_NEW_MEMORY_PERMISSION);
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        drop(second);
+        assert!(weak.upgrade().is_some());
+        drop(kernel);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn hidbus_shared_memory_failure_does_not_publish_an_object() {
+        let device_memory = DeviceMemory::with_size(0x1000);
+        let mut kernel = KernelCore::new();
+        // No Secure pool is available: failed allocation must remain retryable.
+        assert!(kernel.initialize_hidbus_shared_memory(&device_memory).is_error());
+        assert!(kernel.get_hid_bus_shared_mem().is_none());
+        kernel.memory_manager_mut().initialize_pool(
+            crate::hle::kernel::k_memory_manager::Pool::SECURE,
+            crate::device_memory::dram_memory_map::BASE, 0x1000);
+        assert!(kernel.initialize_hidbus_shared_memory(&device_memory).is_success());
+        assert!(kernel.get_hid_bus_shared_mem().is_some());
     }
 
     #[test]

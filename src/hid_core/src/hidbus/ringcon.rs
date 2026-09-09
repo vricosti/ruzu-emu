@@ -528,6 +528,17 @@ impl RingController {
     }
 }
 
+impl super::hidbus_base::HidbusDevice for RingController {
+    fn base(&self) -> &HidbusBase { &self.base }
+    fn base_mut(&mut self) -> &mut HidbusBase { &mut self.base }
+    fn on_init(&mut self) { RingController::on_init(self); }
+    fn on_release(&mut self) { RingController::on_release(self); }
+    fn on_update(&mut self) { RingController::on_update(self); }
+    fn get_device_id(&self) -> u8 { RingController::get_device_id(self) }
+    fn set_command(&mut self, data: &[u8]) -> bool { RingController::set_command(self, data) }
+    fn get_reply(&self, data: &mut [u8]) -> u64 { RingController::get_reply(self, data) }
+}
+
 impl Default for RingController {
     fn default() -> Self {
         Self::new()
@@ -541,7 +552,7 @@ mod tests {
     #[test]
     fn sixaxis_polling_updates_the_ring_lifo_like_upstream() {
         let mut controller = RingController::new();
-        controller.base.activate_device();
+        crate::hidbus::hidbus_base::HidbusDevice::activate_device(&mut controller);
         controller.base.enable(true);
         controller
             .base

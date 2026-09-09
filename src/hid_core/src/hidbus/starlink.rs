@@ -62,6 +62,17 @@ impl Starlink {
     }
 }
 
+impl super::hidbus_base::HidbusDevice for Starlink {
+    fn base(&self) -> &HidbusBase { &self.base }
+    fn base_mut(&mut self) -> &mut HidbusBase { &mut self.base }
+    fn on_init(&mut self) { Starlink::on_init(self); }
+    fn on_release(&mut self) { Starlink::on_release(self); }
+    fn on_update(&mut self) { Starlink::on_update(self); }
+    fn get_device_id(&self) -> u8 { Starlink::get_device_id(self) }
+    fn set_command(&mut self, data: &[u8]) -> bool { Starlink::set_command(self, data) }
+    fn get_reply(&self, data: &mut [u8]) -> u64 { Starlink::get_reply(self, data) }
+}
+
 impl Default for Starlink {
     fn default() -> Self {
         Self::new()

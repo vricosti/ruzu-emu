@@ -225,9 +225,9 @@ pub struct RingController {
 }
 
 impl RingController {
-    pub fn new() -> Self {
+    pub fn new(runtime: std::sync::Arc<dyn super::hidbus_base::HidbusRuntime>) -> Self {
         Self {
-            base: HidbusBase::new(),
+            base: HidbusBase::new(runtime),
             input: None,
             command: RingConCommands::Error,
             total_rep_count: 0,
@@ -260,10 +260,10 @@ impl RingController {
         }
     }
 
-    pub fn new_with_input(input: Arc<Mutex<EmulatedController>>) -> Self {
+    pub fn new_with_input(input: Arc<Mutex<EmulatedController>>, runtime: Arc<dyn super::hidbus_base::HidbusRuntime>) -> Self {
         Self {
             input: Some(input),
-            ..Self::new()
+            ..Self::new(runtime)
         }
     }
 
@@ -319,6 +319,15 @@ impl RingController {
                     )
                 };
                 current_entry.polling_data.data[..bytes.len()].copy_from_slice(bytes);
+                // This accessor has explicit padding throughout; every byte
+                // is initialized by its defaults before the guest copy.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        accessor as *const _ as *const u8,
+                        std::mem::size_of_val(accessor),
+                    )
+                };
+                self.base.runtime.write_memory(self.base.transfer_memory, bytes);
             }
             _ => log::error!("Polling mode not supported {:?}", self.base.polling_mode),
         }
@@ -360,15 +369,13 @@ impl RingController {
             | RingConCommands::ReadRepCount
             | RingConCommands::ReadTotalPushCount => {
                 assert!(data.len() == 0x4, "data.size is not 0x4 bytes");
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.runtime.signal_send_command_async_event();
                 true
             }
             RingConCommands::ResetRepCount => {
                 assert!(data.len() == 0x4, "data.size is not 0x4 bytes");
                 self.total_rep_count = 0;
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.runtime.signal_send_command_async_event();
                 true
             }
             RingConCommands::SaveCalData => {
@@ -382,16 +389,14 @@ impl RingController {
                     self.user_calibration.zero.value = i16::from_le_bytes([data[12], data[13]]);
                     self.user_calibration.zero.crc = u16::from_le_bytes([data[14], data[15]]);
                 }
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.runtime.signal_send_command_async_event();
                 true
             }
             _ => {
                 log::error!("Command not implemented {:?}", self.command);
                 self.command = RingConCommands::Error;
                 // Signal a reply to avoid softlocking the game
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.runtime.signal_send_command_async_event();
                 false
             }
         }
@@ -559,19 +564,40 @@ impl super::hidbus_base::HidbusDevice for RingController {
     fn get_reply(&self, data: &mut [u8]) -> u64 { RingController::get_reply(self, data) }
 }
 
-impl Default for RingController {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::hidbus_base::tests::TestRuntime;
+
+    #[test]
+    fn command_completion_signals_match_upstream_branches() {
+        use std::sync::atomic::Ordering;
+        let runtime = Arc::new(TestRuntime::default());
+        let mut controller = RingController::new(runtime.clone());
+        assert!(!controller.set_command(&[0, 1, 2]));
+        assert_eq!(runtime.signals.load(Ordering::SeqCst), 0);
+        for (index, command) in [RingConCommands::GetFirmwareVersion, RingConCommands::ReadId,
+            RingConCommands::C020105, RingConCommands::ReadUnkCal,
+            RingConCommands::ReadFactoryCal, RingConCommands::ReadUserCal,
+            RingConCommands::ReadRepCount, RingConCommands::ReadTotalPushCount,
+            RingConCommands::ResetRepCount].into_iter().enumerate() {
+            assert!(controller.set_command(&(command as u32).to_le_bytes()));
+            assert_eq!(runtime.signals.load(Ordering::SeqCst), index + 1);
+        }
+        let mut calibration = [0u8; 0x14];
+        calibration[..4].copy_from_slice(&(RingConCommands::SaveCalData as u32).to_le_bytes());
+        calibration[4..6].copy_from_slice(&123i16.to_le_bytes());
+        assert!(controller.set_command(&calibration));
+        assert_eq!(controller.user_calibration.os_max.value, 123);
+        assert_eq!(runtime.signals.load(Ordering::SeqCst), 10);
+        assert!(!controller.set_command(&0xFFFF_FFFFu32.to_le_bytes()));
+        assert_eq!(runtime.signals.load(Ordering::SeqCst), 11);
+    }
 
     #[test]
     fn error_reply_initializes_all_bytes_and_respects_output_capacity() {
-        let controller = RingController::new();
+        let controller = RingController::new(Arc::new(TestRuntime::default()));
         let expected = [1, 0, 0, 0, 0, 0, 0, 0];
         for capacity in 0..=12 {
             let mut output = [0xA5; 12];
@@ -584,7 +610,8 @@ mod tests {
 
     #[test]
     fn sixaxis_polling_updates_the_ring_lifo_like_upstream() {
-        let mut controller = RingController::new();
+        let runtime = Arc::new(TestRuntime::default());
+        let mut controller = RingController::new(runtime.clone());
         super::super::hidbus_base::HidbusDevice::activate_device(&mut controller);
         controller.base.enable(true);
         controller
@@ -593,6 +620,13 @@ mod tests {
         controller.base.set_transfer_memory_address(0x1000);
 
         controller.on_update();
+
+        let writes = runtime.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 0x1000);
+        assert_eq!(writes[0].1.len(), 0x190);
+        assert_eq!(u64::from_le_bytes(writes[0].1[0x20..0x28].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(writes[0].1[0x28..0x30].try_into().unwrap()), 10);
 
         let accessor = &controller.base.enable_sixaxis_data;
         assert_eq!(accessor.header.result, common::ResultCode::SUCCESS);

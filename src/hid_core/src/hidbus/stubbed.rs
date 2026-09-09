@@ -12,9 +12,9 @@ pub struct HidbusStubbed {
 }
 
 impl HidbusStubbed {
-    pub fn new() -> Self {
+    pub fn new(runtime: std::sync::Arc<dyn super::hidbus_base::HidbusRuntime>) -> Self {
         Self {
-            base: HidbusBase::new(),
+            base: HidbusBase::new(runtime),
         }
     }
 
@@ -71,10 +71,4 @@ impl super::hidbus_base::HidbusDevice for HidbusStubbed {
     fn get_device_id(&self) -> u8 { HidbusStubbed::get_device_id(self) }
     fn set_command(&mut self, data: &[u8]) -> bool { HidbusStubbed::set_command(self, data) }
     fn get_reply(&self, data: &mut [u8]) -> u64 { HidbusStubbed::get_reply(self, data) }
-}
-
-impl Default for HidbusStubbed {
-    fn default() -> Self {
-        Self::new()
-    }
 }

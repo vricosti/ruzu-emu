@@ -4,6 +4,15 @@
 //! Port of hid_core/hidbus/hidbus_base.h and hidbus_base.cpp
 
 use common::ResultCode;
+use std::sync::Arc;
+
+/// Boundary for HidbusBase's kernel event and System::ApplicationMemory.
+/// The core crate supplies an owner retaining the event until the device is
+/// dropped. hid_core cannot depend on core (core already depends on hid_core).
+pub trait HidbusRuntime: Send + Sync {
+    fn signal_send_command_async_event(&self);
+    fn write_memory(&self, address: u64, data: &[u8]);
+}
 
 /// This is nn::hidbus::JoyPollingMode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -198,6 +207,7 @@ pub trait HidbusDevice {
 
 /// Base implementation for hidbus devices
 pub struct HidbusBase {
+    pub runtime: Arc<dyn HidbusRuntime>,
     pub is_activated: bool,
     pub device_enabled: bool,
     pub polling_mode_enabled: bool,
@@ -209,8 +219,9 @@ pub struct HidbusBase {
 }
 
 impl HidbusBase {
-    pub fn new() -> Self {
+    pub fn new(runtime: Arc<dyn HidbusRuntime>) -> Self {
         Self {
+            runtime,
             is_activated: false,
             device_enabled: false,
             polling_mode_enabled: false,
@@ -256,15 +267,23 @@ impl HidbusBase {
     }
 }
 
-impl Default for HidbusBase {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[derive(Default)]
+    pub(crate) struct TestRuntime {
+        pub signals: std::sync::atomic::AtomicUsize,
+        pub writes: std::sync::Mutex<Vec<(u64, Vec<u8>)>>,
+    }
+    impl HidbusRuntime for TestRuntime {
+        fn signal_send_command_async_event(&self) {
+            self.signals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn write_memory(&self, address: u64, data: &[u8]) {
+            self.writes.lock().unwrap().push((address, data.to_vec()));
+        }
+    }
 
     #[test]
     fn activation_dispatches_hooks_once_with_upstream_state_order() {
@@ -281,7 +300,7 @@ mod tests {
                 self.calls.push("release");
             }
         }
-        let mut device = Device { base: HidbusBase::new(), calls: Vec::new() };
+        let mut device = Device { base: HidbusBase::new(Arc::new(TestRuntime::default())), calls: Vec::new() };
         let erased: &mut dyn HidbusDevice = &mut device;
         erased.deactivate_device();
         erased.activate_device();
@@ -296,9 +315,9 @@ mod tests {
     #[test]
     fn concrete_backends_expose_the_hidbus_interface() {
         let devices: Vec<Box<dyn HidbusDevice>> = vec![
-            Box::new(super::super::ringcon::RingController::new()),
-            Box::new(super::super::stubbed::HidbusStubbed::new()),
-            Box::new(super::super::starlink::Starlink::new()),
+            Box::new(super::super::ringcon::RingController::new(Arc::new(TestRuntime::default()))),
+            Box::new(super::super::stubbed::HidbusStubbed::new(Arc::new(TestRuntime::default()))),
+            Box::new(super::super::starlink::Starlink::new(Arc::new(TestRuntime::default()))),
         ];
         for (mut device, expected_id) in devices.into_iter().zip([0x20, 0xff, 0x28]) {
             assert_eq!(device.get_device_id(), expected_id);
@@ -319,7 +338,7 @@ mod tests {
 
     #[test]
     fn polling_accessor_defaults_match_upstream() {
-        let base = HidbusBase::new();
+        let base = HidbusBase::new(Arc::new(TestRuntime::default()));
         assert_eq!(base.disable_sixaxis_data.header.result.raw(), u32::MAX);
         assert_eq!(base.enable_sixaxis_data.header.result.raw(), u32::MAX);
         assert_eq!(base.button_only_data.header.result.raw(), u32::MAX);

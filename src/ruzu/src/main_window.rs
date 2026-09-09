@@ -504,7 +504,7 @@ pub struct GMainWindow {
     /// First frame has completed the loading transition; independent of the
     /// launcher's selected page when rendering in another window.
     render_page_visible: Cell<bool>,
-    saved_render_window_geometry: Cell<Option<crate::uisettings::RenderWindowGeometry>>,
+    saved_render_window_geometry: Cell<Option<crate::uisettings::WindowGeometry>>,
     /// Qt saveGeometry/restoreGeometry includes the maximized state. GTK's
     /// Win32 fullscreen rectangle restoration alone does not preserve it.
     pre_fullscreen_state: RefCell<Option<(gtk::Window, bool)>>,
@@ -935,6 +935,32 @@ mod fullscreen_hotkey_tests {
 
     #[test]
     #[ignore = "requires GTK display and isolated XDG directories; run alone"]
+    fn main_geometry_restores_and_does_not_save_fullscreen_size() {
+        gtk::init().unwrap();
+        let app = Application::builder().application_id("org.ruzu.MainGeometryTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let original = crate::uisettings::WindowGeometry {
+            width: 1100, height: 800, maximized: false,
+        };
+        crate::uisettings::save_main_window_state(original).unwrap();
+        crate::uisettings::with_mut(|values| values.single_window_mode.set_value(true));
+        let main = GMainWindow::new_for_direct_game(&app);
+        assert_eq!(main.window.default_size(), (1100, 800));
+        *main.pre_fullscreen_state.borrow_mut() = Some((main.window.clone().upcast(), false));
+        main.window.set_default_size(1920, 1080);
+        main.save_main_window_geometry();
+        assert_eq!(crate::uisettings::restore_main_window_state().unwrap(), Some(original));
+        main.pre_fullscreen_state.borrow_mut().take();
+        main.window.set_default_size(1200, 850);
+        // Native Quit must use the real close callback, not app.quit().
+        main.window.present();
+        gio::prelude::ActionGroupExt::activate_action(&app, "quit", None);
+        assert_eq!(crate::uisettings::restore_main_window_state().unwrap(), Some(
+            crate::uisettings::WindowGeometry { width: 1200, height: 850, maximized: false }));
+    }
+
+    #[test]
+    #[ignore = "requires GTK display and isolated XDG directories; run alone"]
     fn detached_host_boot_presentation_and_idle_close_preserve_saved_mode() {
         gtk::init().unwrap();
         let app = Application::builder().application_id("org.ruzu.DetachedBootTest").build();
@@ -958,7 +984,7 @@ mod fullscreen_hotkey_tests {
         // Exercise the launcher's actual close handler. It must release the
         // second application window without persisting integrated mode.
         main.window.present();
-        main.window.close();
+        gio::prelude::ActionGroupExt::activate_action(&app, "exit", None);
         assert!(main.detached_render_host.borrow().is_none());
         assert!(!app.windows().contains(&host));
         assert!(!crate::uisettings::with(|values| *values.single_window_mode.get_value()));
@@ -1692,12 +1718,21 @@ impl GMainWindow {
             common::settings::values_mut().renderer_backend.set_value(fallback);
         }
         let idle_title = idle_window_title();
+        let geometry = crate::uisettings::restore_main_window_state()
+            .unwrap_or_else(|error| {
+                log::warn!("Cannot restore main window geometry: {error}");
+                None
+            })
+            .unwrap_or(crate::uisettings::WindowGeometry {
+                width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT, maximized: false,
+            });
         let window = ApplicationWindow::builder()
             .application(app)
             .title(&idle_title)
-            .default_width(DEFAULT_WIDTH)
-            .default_height(DEFAULT_HEIGHT)
+            .default_width(geometry.width)
+            .default_height(geometry.height)
             .build();
+        if geometry.maximized { window.maximize(); }
 
         // Root vertical layout. On macOS the menu bar lives in the native
         // global menu bar (installed once via `init_app_menu` on the
@@ -2050,6 +2085,7 @@ impl GMainWindow {
                     w.close_confirmation_pending.get()
                 );
                 if w.session.borrow().is_none() {
+                    w.save_main_window_geometry();
                     // A hidden application-associated render host must not
                     // keep GTK alive after the launcher is closed. Preserve
                     // the user's saved mode, but release the idle host safely.
@@ -2120,6 +2156,14 @@ impl GMainWindow {
     /// game in-process. Mirrors upstream `connect_menu(action_Load_File,
     /// OnMenuLoadFile)` etc., but the handler lives on the window.
     fn register_boot_actions(self: &Rc<Self>, app: &Application) {
+        // Both the File menu and GTK's native macOS app menu must enter
+        // MainWindow::closeEvent, not quit the loop or close a secondary host.
+        for name in ["exit", "quit"] {
+            let action = gio::SimpleAction::new(name, None);
+            action.connect_activate(glib::clone!(#[weak(rename_to = this)] self,
+                move |_, _| this.window.close()));
+            app.add_action(&action);
+        }
         let install_file_nand = gio::SimpleAction::new("install_file_nand", None);
         install_file_nand.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
@@ -2538,7 +2582,10 @@ impl GMainWindow {
     /// `HideFullscreen`, applied to the selected GTK render host.
     fn set_fullscreen(&self, fullscreen: bool) {
         let window = self.render_host().0;
-        if fullscreen { self.save_render_window_geometry(); }
+        if fullscreen {
+            self.save_main_window_geometry();
+            self.save_render_window_geometry();
+        }
         if fullscreen && self.pre_fullscreen_state.borrow().is_none() {
             *self.pre_fullscreen_state.borrow_mut() = Some((window.clone(), window.is_maximized()));
         }
@@ -5615,7 +5662,7 @@ impl GMainWindow {
             previous.window.destroy();
         } else {
             let geometry = self.saved_render_window_geometry.get().unwrap_or(
-                crate::uisettings::RenderWindowGeometry {
+                crate::uisettings::WindowGeometry {
                     width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT, maximized: false,
                 });
             let window = gtk::Window::builder()
@@ -5707,6 +5754,25 @@ impl GMainWindow {
         }
     }
 
+    /// UISettings::geometry is independent of the detached render geometry.
+    /// Like ShowFullscreen/UpdateUISettings, retain normal dimensions rather
+    /// than persisting the temporary borderless-fullscreen rectangle.
+    fn save_main_window_geometry(&self) {
+        if self.window.is_fullscreen()
+            || self.pre_fullscreen_state.borrow().as_ref().is_some_and(|(window, _)|
+                window == self.window.upcast_ref::<gtk::Window>()) {
+            return;
+        }
+        let (width, height) = self.window.default_size();
+        if width <= 0 || height <= 0 { return; }
+        let geometry = crate::uisettings::WindowGeometry {
+            width, height, maximized: self.window.is_maximized(),
+        };
+        if let Err(error) = crate::uisettings::save_main_window_state(geometry) {
+            log::warn!("Cannot save main window geometry: {error}");
+        }
+    }
+
     /// BackupGeometry / SaveWindowState for the detached GTK host. GTK's
     /// default-size properties retain the normal size while maximized.
     fn save_render_window_geometry(&self) {
@@ -5717,7 +5783,7 @@ impl GMainWindow {
             if host.window.is_fullscreen() { return; }
             let (width, height) = host.window.default_size();
             if width <= 0 || height <= 0 { return; }
-            crate::uisettings::RenderWindowGeometry {
+            crate::uisettings::WindowGeometry {
                 width, height, maximized: host.window.is_maximized(),
             }
         };

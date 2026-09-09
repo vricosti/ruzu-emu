@@ -2576,6 +2576,102 @@ mod tests {
     }
 
     #[test]
+    fn input_enable_settings_round_trip_through_disk() {
+        const CHILD: &str = "RUZU_TEST_INPUT_FLAGS_DISK";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::tests::input_enable_settings_round_trip_through_disk"])
+                .env(CHILD, "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("qt-config.ini");
+        for enabled in [true, false] {
+            {
+                let mut settings = common::settings::values_mut();
+                settings.keyboard_enabled.set_value(enabled);
+                settings.mouse_enabled.set_value(enabled);
+                settings.debug_pad_enabled.set_value(enabled);
+            }
+            let mut writer = BaseConfig::new(ConfigType::GlobalConfig);
+            writer.set_up_ini(&path);
+            writer.save_control_values();
+            writer.write_to_ini().unwrap();
+            drop(writer);
+            {
+                let mut settings = common::settings::values_mut();
+                settings.keyboard_enabled.set_value(!enabled);
+                settings.mouse_enabled.set_value(!enabled);
+                settings.debug_pad_enabled.set_value(!enabled);
+            }
+            let mut reader = BaseConfig::new(ConfigType::GlobalConfig);
+            reader.set_up_ini(&path);
+            for key in ["keyboard_enabled", "mouse_enabled", "debug_pad_enabled"] {
+                assert_eq!(reader.ini["Controls"][key], enabled.to_string());
+            }
+            reader.read_control_values();
+            let settings = common::settings::values();
+            assert_eq!(*settings.keyboard_enabled.get_value(), enabled);
+            assert_eq!(*settings.mouse_enabled.get_value(), enabled);
+            assert_eq!(*settings.debug_pad_enabled.get_value(), enabled);
+        }
+    }
+
+    #[test]
+    fn advanced_controls_registry_round_trips_through_disk() {
+        const CHILD: &str = "RUZU_TEST_ADVANCED_CONTROLS_DISK";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::tests::advanced_controls_registry_round_trips_through_disk"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        let entries = [
+            ("controller_navigation", "false"), ("enable_joycon_driver", "false"),
+            ("enable_procon_driver", "true"), ("udp_input_servers", "127.0.0.1:28000"),
+            ("enable_udp_controller", "true"), ("mouse_panning_sensitivity", "61"),
+            ("mouse_panning_x_sensitivity", "62"), ("mouse_panning_y_sensitivity", "63"),
+            ("mouse_panning_deadzone_counterweight", "24"), ("mouse_panning_decay_strength", "25"),
+            ("mouse_panning_min_decay", "26"), ("emulate_analog_keyboard", "true"),
+            ("touch_device", "min_x:20,min_y:30,max_x:900,max_y:800"),
+            ("touch_from_button_map", "2"), ("enable_ring_controller", "false"),
+            ("enable_ir_sensor", "true"), ("ir_sensor_device", "synthetic-camera"),
+            ("random_amiibo_id", "true"),
+        ];
+        common::settings::values_mut().for_each_setting_in_category_mut(Category::Controls, |setting| {
+            if let Some((_, value)) = entries.iter().find(|(key, _)| *key == setting.label()) {
+                setting.load_string(value);
+            }
+        });
+        common::settings::values_mut().mouse_panning.set_value(true);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("qt-config.ini");
+        let mut writer = BaseConfig::new(ConfigType::GlobalConfig);
+        writer.set_up_ini(&path);
+        writer.write_category(Category::Controls);
+        writer.write_to_ini().unwrap();
+        drop(writer);
+        common::settings::values_mut().for_each_setting_in_category_mut(Category::Controls, |setting| {
+            setting.load_string(&setting.default_to_string());
+        });
+        let mut reader = BaseConfig::new(ConfigType::GlobalConfig);
+        reader.set_up_ini(&path);
+        for (key, value) in entries {
+            let stored = if key == "touch_device" { format!("\"{value}\"") } else { value.to_owned() };
+            assert_eq!(reader.ini["Controls"].get(key), Some(&stored), "{key}");
+        }
+        assert!(!reader.ini["Controls"].contains_key("mouse_panning"));
+        reader.read_category(Category::Controls);
+        common::settings::values_mut().for_each_setting_in_category_mut(Category::Controls, |setting| {
+            if let Some((_, value)) = entries.iter().find(|(key, _)| *key == setting.label()) {
+                assert_eq!(setting.to_string_repr(), *value, "{}", setting.label());
+            }
+        });
+    }
+
+    #[test]
     fn enum_settings_accept_upstream_canonical_and_numeric_forms() {
         use std::str::FromStr;
 

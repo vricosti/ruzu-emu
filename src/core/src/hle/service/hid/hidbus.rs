@@ -24,6 +24,24 @@ pub struct HidbusCommandEvent {
     handle: u32,
 }
 
+/// Application memory selected by the service owner for its HIDbus devices.
+/// The shared owner keeps the selected process memory alive for each write.
+pub struct HidbusMemory {
+    memory: Arc<Mutex<crate::memory::memory::Memory>>,
+}
+
+impl HidbusMemory {
+    pub fn new(memory: Arc<Mutex<crate::memory::memory::Memory>>) -> Self {
+        Self { memory }
+    }
+}
+
+impl hid_core::hidbus::hidbus_base::HidbusMemory for HidbusMemory {
+    fn write_block(&self, address: u64, data: &[u8]) {
+        self.memory.lock().unwrap().write_block(address, data);
+    }
+}
+
 impl HidbusCommandEvent {
     pub fn new(context: Arc<Mutex<ServiceContext>>) -> Option<Self> {
         let mut owner = context.lock().unwrap();

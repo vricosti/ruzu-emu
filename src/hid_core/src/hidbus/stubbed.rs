@@ -12,9 +12,9 @@ pub struct HidbusStubbed {
 }
 
 impl HidbusStubbed {
-    pub fn new(event: Box<dyn super::hidbus_base::HidbusCommandEvent>) -> Self {
+    pub fn new(event: Box<dyn super::hidbus_base::HidbusCommandEvent>, memory: Box<dyn super::hidbus_base::HidbusMemory>) -> Self {
         Self {
-            base: HidbusBase::new(event),
+            base: HidbusBase::new(event, memory),
         }
     }
 

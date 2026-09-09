@@ -207,9 +207,15 @@ pub trait HidbusCommandEvent: Send + Sync {
     fn signal(&self);
 }
 
+/// The ApplicationMemory::WriteBlock access supplied by core across the crate boundary.
+pub trait HidbusMemory: Send + Sync {
+    fn write_block(&self, address: u64, data: &[u8]);
+}
+
 /// Base implementation for hidbus devices
 pub struct HidbusBase {
     pub send_command_async_event: Box<dyn HidbusCommandEvent>,
+    pub memory: Box<dyn HidbusMemory>,
     pub is_activated: bool,
     pub device_enabled: bool,
     pub polling_mode_enabled: bool,
@@ -221,9 +227,10 @@ pub struct HidbusBase {
 }
 
 impl HidbusBase {
-    pub fn new(send_command_async_event: Box<dyn HidbusCommandEvent>) -> Self {
+    pub fn new(send_command_async_event: Box<dyn HidbusCommandEvent>, memory: Box<dyn HidbusMemory>) -> Self {
         Self {
             send_command_async_event,
+            memory,
             is_activated: false,
             device_enabled: false,
             polling_mode_enabled: false,
@@ -270,6 +277,15 @@ impl HidbusBase {
 }
 
 #[cfg(test)]
+pub(crate) fn test_memory() -> Box<dyn HidbusMemory> {
+    struct Memory;
+    impl HidbusMemory for Memory {
+        fn write_block(&self, _: u64, _: &[u8]) {}
+    }
+    Box::new(Memory)
+}
+
+#[cfg(test)]
 pub(crate) fn test_command_event() -> Box<dyn HidbusCommandEvent> {
     struct TestEvent;
     impl HidbusCommandEvent for TestEvent {
@@ -297,7 +313,7 @@ mod tests {
                 self.calls.push("release");
             }
         }
-        let mut device = Device { base: HidbusBase::new(test_command_event()), calls: Vec::new() };
+        let mut device = Device { base: HidbusBase::new(test_command_event(), test_memory()), calls: Vec::new() };
         let dynamic: &mut dyn HidbusDevice = &mut device;
         dynamic.deactivate_device();
         dynamic.activate_device();
@@ -311,7 +327,7 @@ mod tests {
 
     #[test]
     fn polling_accessor_defaults_match_upstream() {
-        let base = HidbusBase::new(test_command_event());
+        let base = HidbusBase::new(test_command_event(), test_memory());
         assert_eq!(base.disable_sixaxis_data.header.result.raw(), u32::MAX);
         assert_eq!(base.enable_sixaxis_data.header.result.raw(), u32::MAX);
         assert_eq!(base.button_only_data.header.result.raw(), u32::MAX);

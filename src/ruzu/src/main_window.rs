@@ -1673,6 +1673,18 @@ impl GMainWindow {
         ));
         app.add_action(&renderdoc);
 
+        // Upstream InitializeHotkeys calls these Settings-owned transitions;
+        // the status timer reads the new speed mode on its next refresh.
+        for (name, toggle) in [
+            ("toggle_framerate_limit", common::settings::toggle_standard_mode as fn()),
+            ("toggle_turbo_speed", common::settings::toggle_turbo_mode as fn()),
+            ("toggle_slow_speed", common::settings::toggle_slow_mode as fn()),
+        ] {
+            let action = gio::SimpleAction::new(name, None);
+            action.connect_activate(move |_, _| toggle());
+            app.add_action(&action);
+        }
+
         let load_folder = gio::SimpleAction::new("load_folder", None);
         load_folder.connect_activate(glib::clone!(
             #[weak(rename_to = this)]

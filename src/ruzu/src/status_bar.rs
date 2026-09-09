@@ -20,7 +20,7 @@ use gtk::{gio, glib};
 
 use common::settings;
 use common::settings_enums::{
-    AntiAliasing, ConsoleMode, GpuAccuracy, RendererBackend, ScalingFilter,
+    AntiAliasing, ConsoleMode, GpuAccuracy, RendererBackend, ScalingFilter, SpeedMode,
 };
 use input_common::drivers::tas_input::{TasState, PLAYER_NUMBER};
 use ruzu_core::perf_stats::PerfStatsResults;
@@ -549,6 +549,7 @@ impl StatusBar {
         self.game_fps.set_label(&format_game_fps(
             results.average_game_fps,
             !*values.use_speed_limit.get_value(),
+            *values.current_speed_mode.get_value(),
         ));
         self.frame_time
             .set_label(&format_frame_time(results.frametime));
@@ -651,16 +652,18 @@ fn format_shaders_building(count: i32) -> String {
     )
 }
 
-fn format_game_fps(average_game_fps: f64, unlocked: bool) -> String {
+fn format_game_fps(average_game_fps: f64, unlocked: bool, mode: SpeedMode) -> String {
     let fps = format!("{:.0}", average_game_fps.round());
-    crate::i18n::tr_args(
-        if unlocked {
-            "Game: %1 FPS (Unlocked)"
-        } else {
-            "Game: %1 FPS"
-        },
-        &[fps],
-    )
+    let text = crate::i18n::tr_args("Game: %1 FPS", &[fps]);
+    // Upstream SetFPSSuffix + UpdateStatusBar; mode takes precedence over
+    // the limiter flag. Keep formatting with the other GTK status labels.
+    let suffix = match mode {
+        SpeedMode::Slow => Some(crate::i18n::tr("Slow")),
+        SpeedMode::Turbo => Some(crate::i18n::tr("Turbo")),
+        SpeedMode::Standard if unlocked => Some(crate::i18n::tr("Unlocked")),
+        SpeedMode::Standard => None,
+    };
+    suffix.map_or_else(|| text.clone(), |suffix| format!("{text} ({suffix})"))
 }
 
 fn format_frame_time(frametime_seconds: f64) -> String {
@@ -908,8 +911,12 @@ mod tests {
         assert_eq!(format_shaders_building(3), "Building: 3 shaders");
         assert_eq!(format_resolution_scale(1.0), "Scale: 1x");
         assert_eq!(format_resolution_scale(1.5), "Scale: 1.5x");
-        assert_eq!(format_game_fps(59.4, false), "Game: 59 FPS");
-        assert_eq!(format_game_fps(59.5, true), "Game: 60 FPS (Unlocked)");
+        assert_eq!(format_game_fps(59.4, false, SpeedMode::Standard), "Game: 59 FPS");
+        assert_eq!(format_game_fps(59.5, true, SpeedMode::Standard), "Game: 60 FPS (Unlocked)");
+        for unlocked in [false, true] {
+            assert_eq!(format_game_fps(60.0, unlocked, SpeedMode::Turbo), "Game: 60 FPS (Turbo)");
+            assert_eq!(format_game_fps(30.0, unlocked, SpeedMode::Slow), "Game: 30 FPS (Slow)");
+        }
         assert_eq!(format_frame_time(1.0 / 60.0), "Frame: 16.67 ms");
     }
 

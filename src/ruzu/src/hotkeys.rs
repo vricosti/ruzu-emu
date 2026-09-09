@@ -52,6 +52,9 @@ pub fn apply_accelerators(app: &gtk::Application) {
         ("Toggle Filter Bar", "app.show_filter_bar"),
         ("Toggle Status Bar", "app.show_status_bar"),
         ("Toggle Renderdoc Capture", "app.renderdoc_capture"),
+        ("Toggle Framerate Limit", "app.toggle_framerate_limit"),
+        ("Toggle Turbo Speed", "app.toggle_turbo_speed"),
+        ("Toggle Slow Speed", "app.toggle_slow_speed"),
         ("Exit ruzu", "app.quit"),
     ] {
         let accelerator = crate::uisettings::with(|values| {
@@ -132,6 +135,9 @@ mod tests {
             ("Direct Connect to Room", "app.connect_to_room"),
             ("Show Current Room", "app.show_room"),
             ("Leave Room", "app.leave_room"),
+            ("Toggle Framerate Limit", "app.toggle_framerate_limit"),
+            ("Toggle Turbo Speed", "app.toggle_turbo_speed"),
+            ("Toggle Slow Speed", "app.toggle_slow_speed"),
         ] {
             for (key, expected) in [("F7", vec!["F7"]), ("F8", vec!["F8"]), ("", vec![])] {
                 crate::uisettings::with_mut(|values| {

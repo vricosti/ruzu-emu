@@ -551,6 +551,7 @@ pub struct GMainWindow {
     /// The open configuration dialog, kept alive while it is on screen
     /// (upstream holds `ConfigureDialog` on the stack across `exec()`).
     configure_dialog: RefCell<Option<Rc<crate::configuration::ConfigureDialog>>>,
+    configure_per_game: RefCell<Option<Rc<crate::configuration::configure_per_game::ConfigurePerGame>>>,
     /// Handle to the game list, so it can be rescanned when the configured
     /// directories change.
     game_list: RefCell<Option<crate::game_list::GameListHandle>>,
@@ -1434,6 +1435,7 @@ impl GMainWindow {
             mouse_hide_timer: RefCell::new(None),
             render_geometry: Cell::new(None),
             configure_dialog: RefCell::new(None),
+            configure_per_game: RefCell::new(None),
             game_list: RefCell::new(None),
             play_time_manager,
             input_subsystem,
@@ -1495,7 +1497,7 @@ impl GMainWindow {
                 {
                     let session = this.session.borrow();
                     if let Some(session) = session.as_ref() {
-                        let _ = session.apply_renderer_settings();
+                        let _ = session.apply_settings();
                     }
                 }
             }
@@ -1868,6 +1870,7 @@ impl GMainWindow {
             }};
         }
         window_action!("install_keys", on_install_decryption_keys);
+        window_action!("configure_current_game", on_configure_per_game);
         window_action!("install_firmware_folder", on_install_firmware);
         window_action!("install_firmware_zip", on_install_firmware_from_zip);
         window_action!("verify_installed_contents", on_verify_installed_contents);
@@ -3675,6 +3678,10 @@ impl GMainWindow {
     /// transient window; the `Rc` preserves the same single-dialog lifetime
     /// until its OK/Cancel close edge.
     fn on_configure(self: &Rc<Self>) {
+        if let Some(dialog) = self.configure_per_game.borrow().as_ref() {
+            dialog.present();
+            return;
+        }
         // `QDialog::exec()` prevents a second Configure action from creating a
         // competing dialog. Preserve that single modal instance in GTK and
         // raise it if the action is invoked again through a shortcut.
@@ -3697,7 +3704,7 @@ impl GMainWindow {
                 let previous = previous_docked.replace(docked);
                 if let Some(session) = this.session.borrow().as_ref() {
                     let _ = session.docked_mode_changed(previous, docked);
-                    let _ = session.apply_renderer_settings();
+                    let _ = session.apply_settings();
                 }
                 if let Some(app) = this.window.application() {
                     crate::hotkeys::apply_accelerators(&app);
@@ -3729,6 +3736,55 @@ impl GMainWindow {
         ));
         dialog.present();
         *self.configure_dialog.borrow_mut() = Some(dialog);
+    }
+
+    /// MainWindow::OnConfigurePerGame/OpenPerGameConfiguration. The GTK modal
+    /// retains its owner across callbacks instead of blocking in QDialog::exec.
+    fn on_configure_per_game(self: &Rc<Self>) {
+        if let Some(dialog) = self.configure_dialog.borrow().as_ref() {
+            dialog.present();
+            return;
+        }
+        if let Some(dialog) = self.configure_per_game.borrow().as_ref() {
+            dialog.present();
+            return;
+        }
+        let Some(title_id) = self.session.borrow().as_ref().and_then(|session| session.program_id()) else {
+            return;
+        };
+        let Some(path) = self.current_game_path.borrow().clone() else { return; };
+        use crate::configuration::configure_per_game::{ConfigurePerGame, GameProperties};
+        let Some(properties) = GameProperties::load_from_file(title_id, std::path::Path::new(&path)) else {
+            crate::gtk_compat::show_warning(Some(&self.window), "Properties", "Could not read game metadata.");
+            return;
+        };
+        let dialog = ConfigurePerGame::new(Some(self.window.upcast_ref()), properties, Arc::clone(&self.hid_core), false);
+        let previous_docked = Cell::new(common::settings::is_docked_mode(&common::settings::values()));
+        dialog.connect_applied(glib::clone!(
+            #[weak(rename_to = this)] self,
+            move || {
+                let docked = common::settings::is_docked_mode(&common::settings::values());
+                let previous = previous_docked.replace(docked);
+                if let Some(session) = this.session.borrow().as_ref() {
+                    let _ = session.docked_mode_changed(previous, docked);
+                    let _ = session.apply_settings();
+                }
+                this.hid_core.lock().reload_input_devices();
+                this.status_bar.refresh();
+                this.show_mouse_cursor();
+                if crate::uisettings::take_game_list_reload_pending() {
+                    if let Some(game_list) = this.game_list.borrow().clone() {
+                        game_list.reload();
+                    }
+                }
+            }
+        ));
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = this)] self,
+            move || { this.configure_per_game.borrow_mut().take(); }
+        ));
+        dialog.present();
+        *self.configure_per_game.borrow_mut() = Some(dialog);
     }
 
     /// MainWindow::OnConfigure's reset branch. The dialog has stopped input
@@ -5297,6 +5353,12 @@ impl GMainWindow {
     /// before releasing the native render target, clear the loading assets,
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        // A guest-requested exit can arrive while the nonblocking GTK modal is
+        // open. Do not leave it editing the next session's settings bank.
+        let properties = self.configure_per_game.borrow_mut().take();
+        if let Some(properties) = properties {
+            properties.close();
+        }
         crate::gamemode::stop();
         self.auto_paused.set(false);
         if self.auto_muted.replace(false) {

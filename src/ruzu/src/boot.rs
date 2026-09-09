@@ -81,7 +81,7 @@ enum EmulationCommand {
     /// `System` is owned by the boot thread in Reden, so the GTK thread must
     /// marshal `Renderer().RefreshBaseSettings()` to that owner instead of
     /// touching the renderer directly.
-    ApplyRendererSettings(SyncSender<()>),
+    ApplySettings(SyncSender<()>),
     CaptureScreenshot {
         path: std::path::PathBuf,
         layout: FramebufferLayout,
@@ -355,19 +355,19 @@ impl EmulationSession {
         completed
     }
 
-    /// Apply live graphics settings to the active renderer.
+    /// Apply live time and graphics settings, following System::ApplySettings.
     ///
     /// Upstream `ConfigureDialog::ApplyConfiguration()` calls
-    /// `Core::System::ApplySettings()`, whose renderer-side operation is
-    /// `Renderer().RefreshBaseSettings()`. The renderer lives on Reden's boot
+    /// `Core::System::ApplySettings()`: RefreshTime precedes
+    /// `Renderer().RefreshBaseSettings()`. The renderer lives on Ruzu's boot
     /// thread, so this synchronous command preserves the same ordering before
     /// the configuration dialog reports that applying has completed.
-    pub fn apply_renderer_settings(&self) -> bool {
+    pub fn apply_settings(&self) -> bool {
         let Some(tx) = self.command_tx.as_ref() else {
             return false;
         };
         let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(0);
-        tx.send(EmulationCommand::ApplyRendererSettings(completed_tx))
+        tx.send(EmulationCommand::ApplySettings(completed_tx))
             .is_ok()
             && completed_rx.recv().is_ok()
     }
@@ -1031,7 +1031,8 @@ fn run_boot(
                 system.run();
                 let _ = completed.send(());
             }
-            Ok(EmulationCommand::ApplyRendererSettings(completed)) => {
+            Ok(EmulationCommand::ApplySettings(completed)) => {
+                system.refresh_time();
                 if let Some(gpu) = system
                     .gpu_core()
                     .and_then(|gpu| gpu.as_any().downcast_ref::<video_core::gpu::Gpu>())

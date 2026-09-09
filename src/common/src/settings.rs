@@ -1725,6 +1725,19 @@ pub fn is_docked_mode(values: &Values) -> bool {
     *values.use_docked_mode.get_value() == ConsoleMode::Docked
 }
 
+/// Settings::GetTimeZoneString. Rust uses the existing platform offset
+/// resolver, corresponding to Eden's non-chrono-tzdb fallback (also MinGW).
+pub fn get_time_zone_string(time_zone: TimeZone) -> String {
+    let zones = crate::time_zone::get_time_zone_strings();
+    let index = time_zone as usize;
+    assert!(index < zones.len());
+    if time_zone == TimeZone::Auto {
+        crate::time_zone::find_system_time_zone()
+    } else {
+        zones[index].to_owned()
+    }
+}
+
 /// Returns the effective audio volume as a float (0.0 to ~2.0).
 pub fn volume(values: &Values) -> f32 {
     if *values.audio_muted.get_value() {
@@ -2016,6 +2029,15 @@ pub type Settings = Values;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_time_zone_names_follow_upstream_table() {
+        for (zone, name) in [(TimeZone::Default, "GMT"), (TimeZone::Cet, "CET"),
+            (TimeZone::Japan, "Japan"), (TimeZone::Utc, "UTC"), (TimeZone::Zulu, "Zulu")] {
+            assert_eq!(get_time_zone_string(zone), name);
+        }
+        assert!(!get_time_zone_string(TimeZone::Auto).is_empty());
+    }
 
     #[test]
     fn registry_visits_each_setting_once_in_its_declared_category() {

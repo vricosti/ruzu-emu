@@ -2896,7 +2896,7 @@ fn game_matches_filter(game: &GameEntry, query: &str) -> bool {
 }
 
 /// Human-readable byte size (KiB / MiB / GiB), matching yuzu's display style.
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;

@@ -40,6 +40,7 @@ pub fn apply_accelerators(app: &gtk::Application) {
         ("Exit Fullscreen", "app.exit_fullscreen"),
         ("Load File", "app.load_file"),
         ("Configure", "app.configure"),
+        ("Configure Current Game", "app.configure_current_game"),
         ("Change Adapting Filter", "app.toggle_adapting_filter"),
         ("Change GPU Mode", "app.toggle_gpu_accuracy"),
         ("Change Docked Mode", "app.toggle_docked_mode"),
@@ -132,6 +133,7 @@ mod tests {
             .build();
         let original = crate::uisettings::with(|values| values.shortcuts.clone());
         for (name, action) in [
+            ("Configure Current Game", "app.configure_current_game"),
             ("Capture Screenshot", "app.capture_screenshot"),
             ("Load/Remove Amiibo", "app.load_amiibo"),
             ("TAS Start/Stop", "app.tas_start"),

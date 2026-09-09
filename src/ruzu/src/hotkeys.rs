@@ -79,14 +79,15 @@ pub fn apply_accelerators(app: &gtk::Application) {
 }
 
 fn gtk_accelerator_from_native(sequence: &str) -> Option<String> {
-    let mut parts = sequence.split('+').map(str::trim).collect::<Vec<_>>();
-    let key = parts.pop()?;
-    if key.is_empty() {
-        return None;
-    }
+    // Consume modifier prefixes rather than splitting the final key: '+' is
+    // itself a valid QKeySequence/GTK display label, including "Ctrl++" and
+    // "Ctrl+KP\u{2009}+" emitted by the recording dialog.
+    let normalized = sequence.replace(['\u{2009}', '\u{202f}', '\u{00a0}'], " ");
+    let mut key = normalized.trim();
     let mut accelerator = String::new();
-    for modifier in parts {
-        accelerator.push_str(match modifier.to_ascii_lowercase().as_str() {
+    while key != "+" && key != "KP +" {
+        let Some((modifier, rest)) = key.split_once('+') else { break; };
+        accelerator.push_str(match modifier.trim().to_ascii_lowercase().as_str() {
             "ctrl" | "control" => "<Control>",
             "shift" => "<Shift>",
             "alt" => "<Alt>",
@@ -94,18 +95,19 @@ fn gtk_accelerator_from_native(sequence: &str) -> Option<String> {
             "super" => "<Super>",
             _ => return None,
         });
+        key = rest.trim();
     }
-    let normalized_key = key
-        .replace(['\u{2009}', '\u{202f}', '\u{00a0}'], " ")
-        .trim()
-        .to_owned();
-    accelerator.push_str(match normalized_key.as_str() {
+    if key.is_empty() {
+        return None;
+    }
+    accelerator.push_str(match key {
         "Esc" => "Escape",
         // QKeySequence uses punctuation; GTK expects the GDK key name.
         "," => "comma",
         "." => "period",
         "-" => "minus",
         "=" => "equal",
+        "+" => "plus",
         // `gtk_accelerator_get_label` renders keypad operators as localized
         // display labels such as `KP -`, while `gtk_accelerator_parse` accepts
         // their stable GDK key names. Preserve the native label in the config
@@ -123,6 +125,36 @@ fn gtk_accelerator_from_native(sequence: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK display; run in an isolated process"]
+    fn recorded_plus_keys_roundtrip_into_live_accelerators() {
+        gtk::init().unwrap();
+        let app = gtk::Application::builder()
+            .application_id("org.ruzu.PlusHotkeyTest").build();
+        let original = crate::uisettings::with(|values| values.shortcuts.clone());
+        for key in [gtk::gdk::Key::plus, gtk::gdk::Key::KP_Add] {
+            for modifiers in [gtk::gdk::ModifierType::empty(), gtk::gdk::ModifierType::CONTROL_MASK] {
+                // This is the same label-producing API as SequenceDialog.
+                let label = gtk::accelerator_get_label(key, modifiers).to_string();
+                crate::uisettings::with_mut(|values| {
+                    values.shortcuts.iter_mut().find(|shortcut| shortcut.name == "Configure")
+                        .unwrap().keyseq = label.clone();
+                });
+                apply_accelerators(&app);
+                let installed = app.accels_for_action("app.configure");
+                assert_eq!(installed.len(), 1, "{label}");
+                assert_eq!(gtk::accelerator_parse(&installed[0]), Some((key, modifiers)), "{label}");
+            }
+        }
+        crate::uisettings::with_mut(|values| {
+            values.shortcuts.iter_mut().find(|shortcut| shortcut.name == "Configure")
+                .unwrap().keyseq.clear();
+        });
+        apply_accelerators(&app);
+        assert!(app.accels_for_action("app.configure").is_empty());
+        crate::uisettings::with_mut(|values| values.shortcuts = original);
+    }
 
     #[test]
     #[ignore = "requires GTK display; run in an isolated process"]
@@ -190,6 +222,17 @@ mod tests {
 
     #[test]
     fn converts_native_shortcut_labels_to_gtk_accelerators() {
+        for (native, expected) in [
+            ("+", "plus"), ("Ctrl++", "<Control>plus"),
+            ("Ctrl+Shift++", "<Control><Shift>plus"),
+            ("KP\u{2009}+", "KP_Add"), ("Ctrl+KP\u{2009}+", "<Control>KP_Add"),
+            ("Alt+KP +", "<Alt>KP_Add"),
+        ] {
+            assert_eq!(gtk_accelerator_from_native(native).as_deref(), Some(expected));
+        }
+        for invalid in ["", "Ctrl+", "Home+B", "Ctrl+++", "Ctrl+KP++"] {
+            assert_eq!(gtk_accelerator_from_native(invalid), None);
+        }
         for (native, gtk_key) in [("Ctrl+,", "<Control>comma"), ("Ctrl+.", "<Control>period")] {
             assert_eq!(gtk_accelerator_from_native(native).as_deref(), Some(gtk_key));
         }

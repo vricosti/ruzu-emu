@@ -623,7 +623,6 @@ impl ResourceManager {
             };
             dp.on_update(
                 &mut shared_memory.debug_pad,
-                false,
                 &button_state,
                 &stick_state,
             );

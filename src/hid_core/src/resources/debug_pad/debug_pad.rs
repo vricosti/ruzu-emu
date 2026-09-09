@@ -127,18 +127,6 @@ mod tests {
         assert_eq!(retained.pad_state.raw, 5);
         assert_eq!(retained.sampling_number, enabled.sampling_number + 1);
     }
-}
-
-impl Default for DebugPad {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
     #[test]
     fn debug_pad_setting_controls_sample_updates_like_upstream() {
         const CHILD: &str = "RUZU_TEST_DEBUG_PAD_SETTING";
@@ -181,5 +169,11 @@ mod tests {
         pad.on_update(&mut memory, &buttons, &sticks);
         assert_eq!(memory.debug_pad_lifo.buffer_count, 0);
         assert_eq!(memory.debug_pad_lifo.buffer_tail, 0);
+    }
+}
+
+impl Default for DebugPad {
+    fn default() -> Self {
+        Self::new()
     }
 }

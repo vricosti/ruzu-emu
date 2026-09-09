@@ -2631,6 +2631,11 @@ impl KProcess {
                     thread.thread_context.r[0] = 0;
                     thread.thread_context.r[1] = thread_handle as u64;
                 }
+                // Upstream KProcess::Run also publishes the handle in the TLR.
+                self.write_memory(
+                    thread.get_tls_address().get() + 0x110,
+                    &thread_handle.to_le_bytes(),
+                );
             }
 
             self.change_state(match state {
@@ -3591,6 +3596,10 @@ mod tests {
 
         assert_eq!(stack_top - stack_base, 0x100000);
         let process_guard = process.lock().unwrap();
+        assert_eq!(
+            process_guard.process_memory.read().unwrap().read_32(tls_address + 0x110),
+            main_thread_handle,
+        );
         let thread_local_start = process_guard
             .page_table
             .get_base()

@@ -400,6 +400,8 @@ pub fn create_thread(
     match process.handle_table.add(object_id) {
         Ok(handle) => {
             *out_handle = handle;
+            // Upstream CreateThread publishes the handle before returning to the caller.
+            process.write_memory(thread_tls_address.get() + 0x110, &handle.to_le_bytes());
             trace_create_thread(
                 7,
                 caller_tid,
@@ -811,6 +813,11 @@ mod tests {
         let process = process_arc.lock().unwrap();
         let object_id = process.handle_table.get_object(handle).unwrap();
         let thread = process.get_thread_by_object_id(object_id).unwrap();
+        let tls_address = thread.lock().unwrap().get_tls_address().get();
+        assert_eq!(
+            process.get_shared_memory().read().unwrap().read_32(tls_address + 0x110),
+            handle,
+        );
         drop(process);
 
         assert_eq!(

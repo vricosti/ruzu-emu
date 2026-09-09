@@ -2018,6 +2018,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registry_visits_each_setting_once_in_its_declared_category() {
+        // Eden's BasicSetting constructor registers each instance in
+        // Linkage::by_category using that instance's category. The Rust visitor
+        // must preserve this invariant without storing self-referential pointers.
+        let categories = [
+            Category::Android, Category::Audio, Category::Core, Category::Cpu,
+            Category::CpuDebug, Category::CpuUnsafe, Category::Overlay,
+            Category::Renderer, Category::RendererAdvanced, Category::RendererHacks,
+            Category::RendererExtensions, Category::RendererDebug, Category::System,
+            Category::SystemAudio, Category::DataStorage, Category::Debugging,
+            Category::DebuggingGraphics, Category::GpuDriver, Category::Miscellaneous,
+            Category::Network, Category::WebService, Category::AddOns, Category::Controls,
+            Category::Ui, Category::UiAudio, Category::UiGeneral, Category::UiLayout,
+            Category::UiGameList, Category::Screenshots, Category::Shortcuts,
+            Category::Multiplayer, Category::Services, Category::Paths, Category::Linux,
+            Category::LibraryApplet,
+        ];
+        assert_eq!(categories.len(), Category::MaxEnum as usize);
+        let mut values = Values::default();
+        let mut labels = std::collections::HashSet::new();
+        for (index, category) in categories.into_iter().enumerate() {
+            assert_eq!(category as usize, index);
+            values.for_each_setting_in_category_mut(category, |setting| {
+                assert_eq!(setting.category(), category, "{}", setting.label());
+                assert!(labels.insert(setting.label().to_owned()),
+                    "duplicate registration: {}", setting.label());
+            });
+        }
+        // Inventory of the Setting/SwitchableSetting fields in Values; plain
+        // controller arrays and frontend UI settings have separate serializers.
+        assert_eq!(labels.len(), 193);
+    }
+
+    #[test]
     fn visible_graphics_defaults_match_eden_settings_h() {
         let values = Values::default();
 

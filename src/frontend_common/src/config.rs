@@ -2356,6 +2356,52 @@ mod tests {
     }
 
     #[test]
+    fn buffer_reorder_override_survives_disk_reload_and_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        for global in [false, true] {
+            let mut source = common::settings::Values::default();
+            source.disable_buffer_reorder.set_value(global);
+            source.disable_buffer_reorder.set_global(false);
+            source.disable_buffer_reorder.set_value(!global);
+            assert!(source.disable_buffer_reorder.setting.runtime_modifiable);
+            let mut inherited = BaseConfig::new(ConfigType::PerGameConfig);
+            inherited.begin_group("Renderer");
+            inherited.read_setting_generic(&mut source.disable_buffer_reorder);
+            assert!(source.disable_buffer_reorder.using_global());
+            assert_eq!(*source.disable_buffer_reorder.get_value(), global);
+            source.disable_buffer_reorder.set_global(false);
+            for (kind, expected) in [
+                (ConfigType::GlobalConfig, global),
+                (ConfigType::PerGameConfig, !global),
+            ] {
+                let path = directory.path().join("renderer.ini");
+                let mut writer = BaseConfig::new(kind);
+                writer.set_up_ini(&path);
+                writer.begin_group("Renderer");
+                writer.write_setting_generic(&mut source.disable_buffer_reorder);
+                writer.end_group();
+                writer.write_to_ini().unwrap();
+                let mut loaded = common::settings::Values::default();
+                loaded.disable_buffer_reorder.set_value(global);
+                let mut reader = BaseConfig::new(kind);
+                reader.set_up_ini(&path);
+                reader.begin_group("Renderer");
+                reader.read_setting_generic(&mut loaded.disable_buffer_reorder);
+                assert_eq!(*loaded.disable_buffer_reorder.get_value(), expected);
+                assert_eq!(*loaded.disable_buffer_reorder.get_value_global(), global);
+                if kind == ConfigType::PerGameConfig {
+                    assert!(!loaded.disable_buffer_reorder.using_global());
+                    common::settings::restore_global_state(&mut loaded, true);
+                    assert_eq!(*loaded.disable_buffer_reorder.get_value(), !global);
+                    common::settings::restore_global_state(&mut loaded, false);
+                    assert!(loaded.disable_buffer_reorder.using_global());
+                    assert_eq!(*loaded.disable_buffer_reorder.get_value(), global);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn gpu_logging_tracking_settings_preserve_values_in_configuration() {
         for enabled in [false, true] {
             let mut config = BaseConfig::new(ConfigType::GlobalConfig);

@@ -257,7 +257,7 @@ pub struct Values {
     pub enable_nsight_aftermath: Setting<bool>,
     pub disable_shader_loop_safety_checks: Setting<bool>,
     pub enable_renderdoc_hotkey: Setting<bool>,
-    pub disable_buffer_reorder: Setting<bool>,
+    pub disable_buffer_reorder: SwitchableSetting<bool>,
 
     // ── System ──────────────────────────────────────────────────────────
     pub language_index: SwitchableSetting<Language>,
@@ -1291,7 +1291,10 @@ impl Default for Values {
                 RendererDebug,
             ),
             enable_renderdoc_hotkey: Setting::new(false, "renderdoc_hotkey", RendererDebug),
-            disable_buffer_reorder: Setting::new(false, "disable_buffer_reorder", RendererDebug),
+            disable_buffer_reorder: SwitchableSetting::with_options(
+                false, "disable_buffer_reorder", RendererDebug,
+                Specialization::DEFAULT, true, true,
+            ),
 
             // System
             language_index: SwitchableSetting::ranged(
@@ -1957,6 +1960,7 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.dyna_state.set_global(true);
     values.sample_shading.set_global(true);
     values.vertex_input_dynamic_state.set_global(true);
+    values.disable_buffer_reorder.set_global(true);
     values.language_index.set_global(true);
     values.region_index.set_global(true);
     values.time_zone_index.set_global(true);

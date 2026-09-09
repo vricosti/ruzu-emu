@@ -139,8 +139,10 @@ impl ConfigureDialog {
         // Upstream constructs Advanced Graphics first and gives Graphics a
         // callback to `ExposeComputeOption` when a Vulkan device requires it.
         let advanced_graphics = configure_graphics_advanced::page(runtime_lock);
-        let graphics =
-            configure_graphics::page(advanced_graphics.expose_compute_option, runtime_lock);
+        let (ui_page, update_screenshot_info) = configure_ui::page_with_screenshot_info();
+        let graphics = configure_graphics::page_with_screenshot_info(
+            advanced_graphics.expose_compute_option, runtime_lock, update_screenshot_info,
+        );
 
         let reset_requested = Rc::new(Cell::new(false));
         let reset_callback = {
@@ -162,7 +164,7 @@ impl ConfigureDialog {
                 pages: vec![
                     configure_general::page(runtime_lock, reset_callback),
                     hotkeys_page,
-                    configure_ui::page(),
+                    ui_page,
                     configure_web::page(),
                     configure_debug_tab::page(runtime_lock),
                 ],

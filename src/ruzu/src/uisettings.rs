@@ -24,6 +24,20 @@ use common::settings_enums::{Category, ConfirmStop};
 /// Upstream `UISettings::values.is_game_list_reload_pending`.
 static GAME_LIST_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// UISettings::CalculateWidth. Integer truncation and unsigned multiplication
+/// match upstream. Stretch has no window geometry here and falls back to 16:9;
+/// the render-window caller can use its live aspect instead.
+pub(crate) fn calculate_width(height: u32, ratio: common::settings_enums::AspectRatio) -> u32 {
+    use common::settings_enums::AspectRatio;
+    let (numerator, denominator) = match ratio {
+        AspectRatio::R4_3 => (4, 3),
+        AspectRatio::R21_9 => (21, 9),
+        AspectRatio::R16_10 => (16, 10),
+        AspectRatio::R16_9 | AspectRatio::Stretch => (16, 9),
+    };
+    height.wrapping_mul(numerator) / denominator
+}
+
 /// GTK equivalent of UISettings::geometry and renderwindow_geometry.
 /// Qt's QByteArray saveGeometry payload is not a GTK serialization format.
 /// Position remains compositor-owned; width/height are normal logical size,
@@ -480,6 +494,19 @@ pub fn with_mut<R>(f: impl FnOnce(&mut Values) -> R) -> R {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn screenshot_width_matches_integer_aspect_calculation() {
+        use common::settings_enums::AspectRatio;
+        for (ratio, width) in [(AspectRatio::R16_9, 1280), (AspectRatio::R4_3, 960),
+            (AspectRatio::R21_9, 1680), (AspectRatio::R16_10, 1152),
+            (AspectRatio::Stretch, 1280)] {
+            assert_eq!(super::calculate_width(720, ratio), width);
+            assert_eq!(super::calculate_width(0, ratio), 0);
+        }
+        assert_eq!(super::calculate_width(541, AspectRatio::R16_9), 961);
+        assert_eq!(super::calculate_width(u32::MAX, AspectRatio::R4_3), (u32::MAX - 3) / 3);
+    }
+
     #[test]
     fn main_and_render_geometry_are_independent() {
         let main = super::WindowGeometry { width: 1100, height: 800, maximized: true };

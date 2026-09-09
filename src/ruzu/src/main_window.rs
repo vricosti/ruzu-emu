@@ -4049,10 +4049,6 @@ impl GMainWindow {
             height = (height as f32 * up_factor) as u32;
         }
         let width = match aspect {
-            AspectRatio::R16_9 => height * 16 / 9,
-            AspectRatio::R4_3 => height * 4 / 3,
-            AspectRatio::R21_9 => height * 21 / 9,
-            AspectRatio::R16_10 => height * 16 / 10,
             AspectRatio::Stretch => self
                 .render
                 .borrow()
@@ -4062,7 +4058,8 @@ impl GMainWindow {
                     let current = layout_owner.read().unwrap();
                     (height as f64 * current.width as f64 / current.height as f64).round() as u32
                 })
-                .unwrap_or(height * 16 / 9),
+                .unwrap_or_else(|| crate::uisettings::calculate_width(height, aspect)),
+            _ => crate::uisettings::calculate_width(height, aspect),
         };
         let layout = default_frame_layout(width, height);
         let date = glib::DateTime::now_local()

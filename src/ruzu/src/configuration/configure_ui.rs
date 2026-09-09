@@ -111,7 +111,14 @@ fn screenshot_resolutions() -> Vec<u32> {
 }
 
 /// Build the UI tab — upstream `ConfigureUi`.
-pub fn page() -> Page {
+#[cfg(test)]
+fn page() -> Page {
+    page_with_screenshot_info().0
+}
+
+pub(super) type ScreenshotInfoCallback = Rc<dyn Fn(common::settings_enums::AspectRatio, common::settings_enums::ResolutionSetup)>;
+
+pub(super) fn page_with_screenshot_info() -> (Page, ScreenshotInfoCallback) {
     let (scroller, column) = w::page();
 
     // --- "General" --------------------------------------------------------
@@ -257,6 +264,34 @@ pub fn page() -> Page {
         w::combo_row("Resolution:", &resolution_labels, resolution_index);
     screenshots.append(&resolution_row);
 
+    // ConfigureUi::UpdateScreenshotInfo / UpdateWidthText. Keep the draft
+    // Graphics selections local to this dialog, without applying settings.
+    let screenshot_info = {
+        let values = common::settings::values();
+        Rc::new(Cell::new((*values.aspect_ratio.get_value(), *values.resolution_setup.get_value())))
+    };
+    let dimensions = gtk::Label::new(None);
+    dimensions.set_xalign(0.0);
+    screenshots.append(&dimensions);
+    let refresh: Rc<dyn Fn()> = {
+        let resolution = resolution.downgrade();
+        let info = screenshot_info.clone();
+        let resolutions = resolutions.clone();
+        Rc::new(move || {
+            let Some(resolution) = resolution.upgrade() else { return };
+            let height = resolutions.get(resolution.selected() as usize).copied().unwrap_or(0);
+            let (ratio, setup) = info.get();
+            dimensions.set_text(&screenshot_dimensions_text(height, ratio, setup));
+        })
+    };
+    refresh();
+    let on_height = refresh.clone();
+    resolution.connect_selected_notify(move |_| on_height());
+    let update_screenshot_info: ScreenshotInfoCallback = Rc::new(move |ratio, setup| {
+        screenshot_info.set((ratio, setup));
+        refresh();
+    });
+
     // Upstream opens a `QFileDialog::getExistingDirectory` here.
     let entry_for_browse = path_entry.clone();
     path_browse.connect_clicked(move |button| {
@@ -277,7 +312,7 @@ pub fn page() -> Page {
 
     column.append(&screenshots_group);
 
-    Page::new("UI", scroller, move || {
+    let page = Page::new("UI", scroller, move || {
         let theme_name = uisettings::THEMES
             .get(theme.selected() as usize)
             .map(|(name, _)| name.to_string())
@@ -321,7 +356,22 @@ pub fn page() -> Page {
         // ConfigureUi::ApplyConfiguration requests a list rebuild after the
         // settings are applied; recycled GTK rows must be rebound as well.
         uisettings::request_game_list_reload();
-    })
+    });
+    (page, update_screenshot_info)
+}
+
+fn screenshot_dimensions_text(height: u32, ratio: common::settings_enums::AspectRatio, setup: common::settings_enums::ResolutionSetup) -> String {
+    use ruzu_core::frontend::framebuffer_layout::{screen_docked, screen_undocked};
+    if height != 0 {
+        return format!("{} x {}", uisettings::calculate_width(height, ratio), height);
+    }
+    let mut info = common::settings::ResolutionScalingInfo::default();
+    common::settings::translate_resolution_info(setup, &mut info);
+    let undocked = (screen_undocked::HEIGHT as f32 * info.up_factor) as u32;
+    let docked = (screen_docked::HEIGHT as f32 * info.up_factor) as u32;
+    format!("{} ({} x {}, {} x {})", crate::i18n::tr("Auto"),
+        uisettings::calculate_width(undocked, ratio), undocked,
+        uisettings::calculate_width(docked, ratio), docked)
 }
 
 /// Row index whose stored value equals `value`, or 0.
@@ -342,6 +392,69 @@ fn value_at(table: &[(u32, &str)], index: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn screenshot_preview_scales_only_automatic_height() {
+        use common::settings_enums::{AspectRatio as A, ResolutionSetup as R};
+        let fixed = super::screenshot_dimensions_text(541, A::R16_9, R::Res2X);
+        assert_eq!(fixed, "961 x 541");
+        assert!(super::screenshot_dimensions_text(0, A::R4_3, R::Res2X)
+            .ends_with("(1920 x 1440, 2880 x 2160)"));
+        assert!(super::screenshot_dimensions_text(0, A::R16_9, R::Res1_2X)
+            .ends_with("(640 x 360, 960 x 540)"));
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; run alone with isolated XDG directories"]
+    fn graphics_drafts_update_screenshot_preview_without_applying() {
+        use gtk::prelude::*;
+        use common::settings_enums::{AspectRatio as A, ResolutionSetup as R};
+        fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut all = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                all.extend(descendants(&current));
+                child = current.next_sibling();
+            }
+            all
+        }
+        gtk::init().unwrap();
+        crate::i18n::set_language("en");
+        common::settings::set_configuring_global(true);
+        {
+            let mut values = common::settings::values_mut();
+            values.aspect_ratio.set_value(A::R16_9);
+            values.resolution_setup.set_value(R::Res1X);
+        }
+        crate::uisettings::with_mut(|v| v.screenshot_height.set_value(0));
+        let (ui, update) = super::page_with_screenshot_info();
+        let graphics = crate::configuration::configure_graphics::page_with_screenshot_info(|| {}, false, update);
+        let widgets = descendants(&graphics.widget);
+        let combo = |label: &str| widgets.iter().find_map(|widget| {
+            let text = widget.downcast_ref::<gtk::Label>()?;
+            (text.label() == label).then(|| widget.next_sibling().and_downcast::<gtk::DropDown>()).flatten()
+        }).unwrap();
+        let aspect = combo("Aspect Ratio:");
+        let resolution = combo("Resolution:");
+        use crate::configuration::shared_translation as tr;
+        aspect.set_selected(tr::index_of(tr::ASPECT_RATIO, &A::R4_3));
+        resolution.set_selected(tr::index_of(tr::RESOLUTION_SETUP, &R::Res2X));
+        assert!(descendants(&ui.widget).iter().any(|widget| widget.downcast_ref::<gtk::Label>()
+            .is_some_and(|label| label.label().ends_with("(1920 x 1440, 2880 x 2160)"))));
+        let values = common::settings::values();
+        assert_eq!(*values.aspect_ratio.get_value(), A::R16_9);
+        assert_eq!(*values.resolution_setup.get_value(), R::Res1X);
+        drop(values);
+        let height = descendants(&ui.widget).iter().find_map(|widget| {
+            let label = widget.downcast_ref::<gtk::Label>()?;
+            (label.label() == "Resolution:")
+                .then(|| widget.next_sibling().and_downcast::<gtk::DropDown>()).flatten()
+        }).unwrap();
+        height.set_selected(super::screenshot_resolutions().iter().position(|&h| h == 720).unwrap() as u32);
+        assert!(descendants(&ui.widget).iter().any(|widget| widget.downcast_ref::<gtk::Label>()
+            .is_some_and(|label| label.label() == "960 x 720")));
+        crate::uisettings::with(|v| assert_eq!(*v.screenshot_height.get_value(), 0));
+    }
+
     #[test]
     #[ignore = "requires GTK display and isolated XDG directories; run alone"]
     fn ui_page_applies_row_ids_after_language_changes() {

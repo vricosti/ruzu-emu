@@ -47,6 +47,55 @@ const DEFAULT_WIDTH: i32 = 1280;
 const DEFAULT_MOUSE_HIDE_TIMEOUT: u64 = 2500;
 const DEFAULT_HEIGHT: i32 = 720;
 
+/// MainWindow::OnMute; the action refreshes the GTK volume label afterwards.
+fn on_mute(values: &mut common::settings::Values) {
+    values.audio_muted.set_value(!*values.audio_muted.get_value());
+}
+
+/// MainWindow::OnDecreaseVolume. The thresholds deliberately differ from Up.
+fn on_decrease_volume(values: &mut common::settings::Values) {
+    values.audio_muted.set_value(false);
+    let volume = *values.volume.get_value() as i32;
+    let step = if volume <= 6 { 1 } else if volume <= 30 { 2 } else { 5 };
+    values.volume.set_value((volume - step).max(0) as u8);
+}
+
+/// MainWindow::OnIncreaseVolume; Setting enforces the configured upper bound.
+fn on_increase_volume(values: &mut common::settings::Values) {
+    values.audio_muted.set_value(false);
+    let volume = *values.volume.get_value() as i32;
+    let step = if volume < 6 { 1 } else if volume < 30 { 2 } else { 5 };
+    values.volume.set_value((volume + step) as u8);
+}
+
+#[cfg(test)]
+mod audio_hotkey_tests {
+    use super::*;
+
+    #[test]
+    fn volume_shortcuts_match_upstream_steps_clamping_and_unmute() {
+        let mut values = common::settings::Values::default();
+        for (start, down, up) in [(0, 0, 1), (5, 4, 6), (6, 5, 8),
+            (7, 5, 9), (29, 27, 31), (30, 28, 35), (31, 26, 36),
+            (100, 95, 105), (199, 194, 200), (200, 195, 200)] {
+            values.volume.set_value(start);
+            values.audio_muted.set_value(true);
+            on_decrease_volume(&mut values);
+            assert_eq!(*values.volume.get_value(), down);
+            assert!(!*values.audio_muted.get_value());
+            values.volume.set_value(start);
+            values.audio_muted.set_value(true);
+            on_increase_volume(&mut values);
+            assert_eq!(*values.volume.get_value(), up);
+            assert!(!*values.audio_muted.get_value());
+            on_mute(&mut values);
+            assert_eq!(common::settings::volume(&values), 0.0);
+            on_mute(&mut values);
+            assert_eq!(*values.volume.get_value(), up);
+        }
+    }
+}
+
 /// Snapshot the TAS owner before touching GTK. SDL's macOS HID enumeration can
 /// dispatch nested main-loop callbacks while InputSubsystem is mutably borrowed.
 /// A busy owner means defer this display refresh, not that TAS has stopped.
@@ -1672,6 +1721,20 @@ impl GMainWindow {
             }
         ));
         app.add_action(&renderdoc);
+
+        for (name, change) in [
+            ("audio_mute", on_mute as fn(&mut common::settings::Values)),
+            ("audio_volume_down", on_decrease_volume as fn(&mut common::settings::Values)),
+            ("audio_volume_up", on_increase_volume as fn(&mut common::settings::Values)),
+        ] {
+            let action = gio::SimpleAction::new(name, None);
+            let bar = Rc::clone(&self.status_bar);
+            action.connect_activate(move |_, _| {
+                change(&mut common::settings::values_mut());
+                bar.refresh();
+            });
+            app.add_action(&action);
+        }
 
         // Upstream InitializeHotkeys calls these Settings-owned transitions;
         // the status timer reads the new speed mode on its next refresh.

@@ -24,6 +24,16 @@ use super::input_profiles::InputProfiles;
 /// 0..8 as "Player 1".."Player 8".
 pub const NUM_PLAYERS: usize = 8;
 
+/// Upstream ConfigureInput's shared OnDockedModeChanged entry point, also used
+/// by the controller applet and the main-window mode toggle. Must run on the
+/// System owner; frontend callers marshal it through EmulationSession.
+pub(crate) fn on_docked_mode_changed(last: bool, new: bool, system: &ruzu_core::core::System) {
+    if last == new || !system.is_powered_on() {
+        return;
+    }
+    system.get_applet_manager().operation_mode_changed();
+}
+
 /// ConfigureInput owns these global options upstream. GTK repeats the controls
 /// on each player page; bind them to a single owner instead of saving eight
 /// stale copies. These unparented widgets are the shared property sources.

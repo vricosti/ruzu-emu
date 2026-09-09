@@ -1411,6 +1411,15 @@ impl GMainWindow {
             software_keyboard,
         });
 
+        controller_applet_frontend.connect_docked_mode_changed(glib::clone!(
+            #[weak]
+            this,
+            move |last, new| {
+                if let Some(session) = this.session.borrow().as_ref() {
+                    let _ = session.docked_mode_changed(last, new);
+                };
+            }
+        ));
         controller_applet_frontend.start();
         // Qt reports application focus, not just focus of the main window.
         // Defer until GTK has completed a focus transfer to another dialog.
@@ -3604,11 +3613,15 @@ impl GMainWindow {
             Arc::clone(&self.hid_core),
             self.session.borrow().is_none(),
         );
+        let previous_docked = Cell::new(common::settings::is_docked_mode(&common::settings::values()));
         dialog.connect_applied(glib::clone!(
             #[weak(rename_to = this)]
             self,
             move || {
+                let docked = common::settings::is_docked_mode(&common::settings::values());
+                let previous = previous_docked.replace(docked);
                 if let Some(session) = this.session.borrow().as_ref() {
+                    let _ = session.docked_mode_changed(previous, docked);
                     let _ = session.apply_renderer_settings();
                 }
                 if let Some(app) = this.window.application() {

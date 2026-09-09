@@ -94,6 +94,7 @@ pub(crate) struct ControllerAppletFrontend {
     input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
     receiver: Receiver<ControllerAppletRequest>,
     active: RefCell<Option<ActiveDialog>>,
+    docked_mode_changed: RefCell<Option<Box<dyn Fn(bool, bool)>>>,
 }
 
 impl ControllerAppletFrontend {
@@ -109,7 +110,12 @@ impl ControllerAppletFrontend {
             input_subsystem,
             receiver,
             active: RefCell::new(None),
+            docked_mode_changed: RefCell::new(None),
         })
+    }
+
+    pub(crate) fn connect_docked_mode_changed(&self, callback: impl Fn(bool, bool) + 'static) {
+        *self.docked_mode_changed.borrow_mut() = Some(Box::new(callback));
     }
 
     pub(crate) fn start(self: &Rc<Self>) {
@@ -188,7 +194,11 @@ impl ControllerAppletFrontend {
         };
 
         if accepted {
-            active.state.apply_configuration();
+            active.state.apply_configuration(|previous, current| {
+                if let Some(callback) = self.docked_mode_changed.borrow().as_ref() {
+                    callback(previous, current);
+                }
+            });
         }
         self.hid_core.lock().disable_all_controller_configuration();
         active.dialog.close();
@@ -823,15 +833,20 @@ impl ControllerSelectorDialog {
         }
     }
 
-    fn apply_configuration(&self) {
+    fn apply_configuration(&self, on_docked_changed: impl FnOnce(bool, bool)) {
         let mut values = common::settings::values_mut();
+        let previous = common::settings::is_docked_mode(&values);
+        let current = self.docked.is_active();
         values
             .use_docked_mode
-            .set_value(if self.docked.is_active() {
+            .set_value(if current {
                 ConsoleMode::Docked
             } else {
                 ConsoleMode::Handheld
             });
+        drop(values);
+        on_docked_changed(previous, current);
+        let mut values = common::settings::values_mut();
         values
             .vibration_enabled
             .set_value(self.vibration.is_active());

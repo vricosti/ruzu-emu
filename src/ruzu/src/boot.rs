@@ -70,6 +70,7 @@ impl Default for BootParameters {
 }
 
 enum EmulationCommand {
+    DockedModeChanged { last: bool, new: bool, completed: SyncSender<()> },
     ToggleRenderdocCapture,
     Stop,
     ForceStop,
@@ -308,6 +309,14 @@ impl EmulationSession {
         self.command_tx.as_ref().is_some_and(|tx| {
             tx.send(EmulationCommand::ToggleRenderdocCapture).is_ok()
         })
+    }
+
+    pub fn docked_mode_changed(&self, last: bool, new: bool) -> bool {
+        if last == new { return true; }
+        let Some(tx) = self.command_tx.as_ref() else { return false; };
+        let (completed, result) = std::sync::mpsc::sync_channel(0);
+        tx.send(EmulationCommand::DockedModeChanged { last, new, completed }).is_ok()
+            && result.recv().is_ok()
     }
 
     pub fn is_paused(&self) -> bool {
@@ -1010,6 +1019,10 @@ fn run_boot(
                     }
                 }
             }
+            Ok(EmulationCommand::DockedModeChanged { last, new, completed }) => {
+                crate::configuration::configure_input::on_docked_mode_changed(last, new, &system);
+                let _ = completed.send(());
+            }
             Ok(EmulationCommand::Pause(completed)) => {
                 system.pause();
                 let _ = completed.send(());
@@ -1387,6 +1400,38 @@ mod tests {
         assert!(session.request_stop());
         assert!(matches!(command_rx.recv(), Ok(EmulationCommand::Stop)));
         assert!(!session.toggle_renderdoc_capture());
+    }
+
+    #[test]
+    fn docked_mode_notifications_skip_unchanged_state_and_acknowledge_delivery() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let mut session = EmulationSession {
+            command_tx: Some(command_tx), join: None,
+            perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
+            shaders_building: Arc::new(AtomicI32::new(0)),
+            running: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            program_id: Arc::new(AtomicU64::new(0)),
+            exit_locked: Arc::new(AtomicBool::new(false)),
+            frontend_stop_requested: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(session.docked_mode_changed(false, false));
+        assert!(matches!(command_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        let worker = std::thread::spawn(move || {
+            for expected in [(false, true), (true, false)] {
+                let command = command_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let EmulationCommand::DockedModeChanged { last, new, completed } = command else {
+                    panic!("wrong command");
+                };
+                assert_eq!((last, new), expected);
+                completed.send(()).unwrap();
+            }
+        });
+        assert!(session.docked_mode_changed(false, true));
+        assert!(session.docked_mode_changed(true, false));
+        worker.join().unwrap();
+        session.command_tx.take();
+        assert!(!session.docked_mode_changed(false, true));
     }
 
     #[test]

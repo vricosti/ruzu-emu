@@ -1102,6 +1102,23 @@ pub(super) const DEFAULT_BUTTONS: [i32; native_button::NUM_BUTTONS] = [
 /// Upstream `QtConfig::default_motions`.
 pub(super) const DEFAULT_MOTIONS: [i32; native_motion::NUM_MOTIONS] = [b'7' as i32, b'8' as i32];
 
+/// QtConfig::default_ringcon_analogs.
+const DEFAULT_RINGCON_ANALOGS: [i32; 2] = [b'A' as i32, b'D' as i32];
+
+/// QtConfig::ReadHidbusValues, using the already parsed Controls section.
+fn read_hidbus_values(values: &std::collections::BTreeMap<String, String>) -> String {
+    values.get("ring_controller").filter(|value| !value.is_empty()
+        && values.get("ring_controller\\default").is_none_or(|flag| flag != "true")).cloned()
+        .unwrap_or_else(|| generate_analog_param_from_keys(
+            0, 0, DEFAULT_RINGCON_ANALOGS[0], DEFAULT_RINGCON_ANALOGS[1], 0, 0.05,
+        ))
+}
+
+/// QtConfig::SaveHidbusValues. The Controls writer owns quoting/default flags.
+fn save_hidbus_values(entries: &mut Vec<(String, String)>, binding: &str) {
+    entries.push(("ring_controller".to_string(), binding.to_string()));
+}
+
 /// Upstream `QtConfig::default_analogs`.
 pub(super) const DEFAULT_ANALOGS: [[i32; 4]; native_analog::NUM_ANALOGS] = [
     [b'W' as i32, b'S' as i32, b'A' as i32, b'D' as i32],
@@ -1127,6 +1144,7 @@ pub fn load_control_values() {
     for (index, player) in players.iter_mut().enumerate() {
         load_player_values(player, index, &values);
     }
+    settings.ringcon_analogs = read_hidbus_values(&values);
 }
 
 fn load_player_values(
@@ -1250,6 +1268,7 @@ pub fn save_control_values() -> io::Result<()> {
         for (index, player) in settings.players.get_value().iter().enumerate() {
             append_player_entries(&mut entries, index, player);
         }
+        save_hidbus_values(&mut entries, &settings.ringcon_analogs);
     }
 
     let updated = replace_controls(&contents, &entries);
@@ -1403,6 +1422,10 @@ pub fn parse_controls(contents: &str) -> std::collections::BTreeMap<String, Stri
         };
         let key = key.trim();
         // `key\default=` is metadata about the neighbouring key, not a binding.
+        if key == "ring_controller" || key == "ring_controller\\default" {
+            values.insert(key.to_string(), unquote(value.trim()).to_string());
+            continue;
+        }
         if key.ends_with("\\default") || !key.starts_with("player_") {
             continue;
         }
@@ -1449,6 +1472,8 @@ pub fn replace_controls(contents: &str, entries: &[(String, String)]) -> String 
             return false;
         };
         key.trim().starts_with("player_")
+            || (entries.iter().any(|(key, _)| key == "ring_controller")
+                && matches!(key.trim(), "ring_controller" | "ring_controller\\default"))
     };
 
     let rendered: Vec<String> = entries
@@ -1708,6 +1733,39 @@ mod tests {
         assert_eq!(loaded_stick.get_str("left", ""), stick.get_str("left", ""));
     }
 
+    #[test]
+    fn ring_binding_round_trip_defaults_and_replacement() {
+        use super::*;
+        let default = read_hidbus_values(&parse_controls(""));
+        let params = common::param_package::ParamPackage::from_serialized(&default);
+        assert_eq!(params.get_str("engine", ""), "analog_from_button");
+        for (direction, key) in [("left", b'A'), ("right", b'D')] {
+            let button = common::param_package::ParamPackage::from_serialized(&params.get_str(direction, ""));
+            assert_eq!(button.get_int("code", 0), key as i32);
+        }
+        for input in ["[Controls]\nring_controller=\"\"\n",
+            "[Controls]\nring_controller=\"engine:sdl,axis_x:3\"\nring_controller\\default=true\n"] {
+            let restored = read_hidbus_values(&parse_controls(input));
+            let restored = common::param_package::ParamPackage::from_serialized(&restored);
+            assert_eq!(restored.get_str("engine", ""), "analog_from_button");
+            assert_eq!(restored.get_float("modifier_scale", 0.0), 0.05);
+            for (direction, key) in [("left", b'A'), ("right", b'D')] {
+                let button = common::param_package::ParamPackage::from_serialized(&restored.get_str(direction, ""));
+                assert_eq!(button.get_int("code", 0), key as i32);
+            }
+        }
+        let binding = "engine:sdl,port:0,axis_x:3,axis_y:4,deadzone:0.25";
+        let mut entries = Vec::new();
+        save_hidbus_values(&mut entries, binding);
+        let contents = "[Controls]\nring_controller=old\nring_controller\\default=true\nmouse_enabled=true\n[Other]\nring_controller=unrelated\n";
+        let saved = replace_controls(contents, &entries);
+        assert_eq!(read_hidbus_values(&parse_controls(&saved)), binding);
+        assert!(saved.contains("mouse_enabled=true"));
+        assert!(saved.contains("[Other]\nring_controller=unrelated"));
+        assert_eq!(replace_controls(&saved, &entries), saved);
+        // Per-game/profile writes that do not own the ring binding preserve it.
+        assert!(replace_controls(&saved, &[]).contains(binding));
+    }
     use super::*;
 
     #[test]

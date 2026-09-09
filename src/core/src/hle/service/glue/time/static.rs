@@ -203,11 +203,7 @@ impl StaticService {
     fn get_standard_steady_clock_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         log::debug!("Glue::Time::StaticService::GetStandardSteadyClock called");
-        let sub = service
-            .wrapped_service
-            .lock()
-            .unwrap()
-            .get_standard_steady_clock();
+        let sub = service.get_standard_steady_clock();
         Self::push_sub_service(ctx, std::sync::Arc::new(sub));
     }
 
@@ -652,9 +648,9 @@ impl StaticService {
         RESULT_SUCCESS
     }
 
-    pub fn get_standard_steady_clock(&self) -> ResultCode {
+    pub fn get_standard_steady_clock(&self) -> crate::hle::service::psc::time::steady_clock::SteadyClock {
         log::debug!("Glue::Time::StaticService::GetStandardSteadyClock called");
-        RESULT_SUCCESS
+        self.wrapped_service.lock().unwrap().get_standard_steady_clock()
     }
 
     pub fn get_time_zone_service(&self) -> Result<TimeZoneService, ResultCode> {
@@ -812,6 +808,9 @@ impl StaticService {
 // =============================================================================
 
 impl SessionRequestHandler for StaticService {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
@@ -873,6 +872,20 @@ mod tests {
             can_write_steady_clock: false,
             can_write_uninitialized_clock: false,
         }
+    }
+
+    #[test]
+    fn standard_steady_clock_getter_returns_the_wrapped_clock() {
+        let service = StaticService::new(
+            crate::core::SystemRef::null(), user_setup(), "time:u", make_time_manager(),
+        );
+        let clock = service.get_standard_steady_clock();
+        let wrapped = service.wrapped_service.lock().unwrap().get_standard_steady_clock();
+        assert_eq!(clock.service_name(), wrapped.service_name());
+        // Same backend initialization and permission gates, not a success stub.
+        assert_eq!(clock.get_test_offset(), wrapped.get_test_offset());
+        assert_eq!(clock.set_test_offset(17), wrapped.set_test_offset(17));
+        assert_eq!(clock.get_current_time_point().is_ok(), wrapped.get_current_time_point().is_ok());
     }
 
     #[test]

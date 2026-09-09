@@ -2214,6 +2214,44 @@ mod tests {
     }
 
     #[test]
+    fn rng_seed_pair_round_trips_global_and_custom_values() {
+        for seed in [0, 1, 0x8000_0000, u32::MAX] {
+            for enabled in [false, true] {
+                for custom in [false, true] {
+                    let mut values = common::settings::Values::default();
+                    values.rng_seed.set_value(42);
+                    values.rng_seed_enabled.set_value(!enabled);
+                    if custom {
+                        values.rng_seed.set_global(false);
+                        values.rng_seed_enabled.set_global(false);
+                    }
+                    values.rng_seed.set_value(seed);
+                    values.rng_seed_enabled.set_value(enabled);
+                    let mut config = BaseConfig::new(if custom {
+                        ConfigType::PerGameConfig
+                    } else {
+                        ConfigType::GlobalConfig
+                    });
+                    config.begin_group("System");
+                    config.write_setting_generic(&mut values.rng_seed);
+                    config.write_setting_generic(&mut values.rng_seed_enabled);
+                    values.rng_seed.set_value(!seed);
+                    values.rng_seed_enabled.set_value(!enabled);
+                    config.read_setting_generic(&mut values.rng_seed);
+                    config.read_setting_generic(&mut values.rng_seed_enabled);
+                    assert_eq!(*values.rng_seed.get_value(), seed);
+                    assert_eq!(*values.rng_seed_enabled.get_value(), enabled);
+                    assert_eq!(values.rng_seed.using_global(), !custom);
+                    if custom {
+                        assert_eq!(*values.rng_seed.get_value_global(), 42);
+                        assert_eq!(*values.rng_seed_enabled.get_value_global(), !enabled);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn per_game_loading_preserves_the_boot_selected_user() {
         // Config::ReadSettingGeneric excludes non-switchable settings from
         // per-title configuration, including the accepted boot-time profile.

@@ -592,6 +592,9 @@ impl Values {
                 ext_content_from_game_dirs,
             ),
             Category::Controls => visit!(
+                mouse_enabled,
+                keyboard_enabled,
+                debug_pad_enabled,
                 disable_wgi_xinput,
                 enable_raw_input,
                 vibration_enabled,

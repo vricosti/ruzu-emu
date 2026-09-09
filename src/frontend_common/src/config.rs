@@ -2576,6 +2576,50 @@ mod tests {
     }
 
     #[test]
+    fn input_enable_settings_round_trip_through_disk() {
+        const CHILD: &str = "RUZU_TEST_INPUT_FLAGS_DISK";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::tests::input_enable_settings_round_trip_through_disk"])
+                .env(CHILD, "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("qt-config.ini");
+        for enabled in [true, false] {
+            {
+                let mut settings = common::settings::values_mut();
+                settings.keyboard_enabled.set_value(enabled);
+                settings.mouse_enabled.set_value(enabled);
+                settings.debug_pad_enabled.set_value(enabled);
+            }
+            let mut writer = BaseConfig::new(ConfigType::GlobalConfig);
+            writer.set_up_ini(&path);
+            writer.save_control_values();
+            writer.write_to_ini().unwrap();
+            drop(writer);
+            {
+                let mut settings = common::settings::values_mut();
+                settings.keyboard_enabled.set_value(!enabled);
+                settings.mouse_enabled.set_value(!enabled);
+                settings.debug_pad_enabled.set_value(!enabled);
+            }
+            let mut reader = BaseConfig::new(ConfigType::GlobalConfig);
+            reader.set_up_ini(&path);
+            for key in ["keyboard_enabled", "mouse_enabled", "debug_pad_enabled"] {
+                assert_eq!(reader.ini["Controls"][key], enabled.to_string());
+            }
+            reader.read_control_values();
+            let settings = common::settings::values();
+            assert_eq!(*settings.keyboard_enabled.get_value(), enabled);
+            assert_eq!(*settings.mouse_enabled.get_value(), enabled);
+            assert_eq!(*settings.debug_pad_enabled.get_value(), enabled);
+        }
+    }
+
+    #[test]
     fn enum_settings_accept_upstream_canonical_and_numeric_forms() {
         use std::str::FromStr;
 

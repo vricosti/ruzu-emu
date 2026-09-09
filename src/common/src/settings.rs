@@ -592,15 +592,37 @@ impl Values {
                 ext_content_from_game_dirs,
             ),
             Category::Controls => visit!(
+                mouse_enabled,
+                keyboard_enabled,
+                debug_pad_enabled,
                 disable_wgi_xinput,
                 enable_raw_input,
+                controller_navigation,
+                enable_joycon_driver,
+                enable_procon_driver,
                 vibration_enabled,
                 enable_accurate_vibrations,
                 motion_enabled,
+                udp_input_servers,
+                enable_udp_controller,
                 pause_tas_on_load,
                 tas_enable,
                 tas_loop,
                 tas_show_recording_dialog,
+                mouse_panning,
+                mouse_panning_sensitivity,
+                mouse_panning_x_sensitivity,
+                mouse_panning_y_sensitivity,
+                mouse_panning_deadzone_counterweight,
+                mouse_panning_decay_strength,
+                mouse_panning_min_decay,
+                emulate_analog_keyboard,
+                touch_device,
+                touch_from_button_map_index,
+                enable_ring_controller,
+                enable_ir_sensor,
+                ir_sensor_device,
+                random_amiibo_id,
             ),
             Category::Network => visit!(network_interface, airplane_mode,),
             _ => {}
@@ -2335,6 +2357,35 @@ mod tests {
         for label in ["pause_tas_on_load", "tas_enable", "tas_loop", "tas_show_recording_dialog"] {
             assert_eq!(labels.iter().filter(|entry| entry.as_str() == label).count(), 1);
         }
+    }
+
+    #[test]
+    fn controls_registry_covers_upstream_linked_settings() {
+        let mut values = Values::default();
+        let mut actual = Vec::new();
+        values.for_each_setting_in_category_mut(Category::Controls, |setting| {
+            actual.push(setting.label().to_owned());
+            assert_eq!(setting.save(), match setting.label() {
+                "mouse_panning" => false,
+                "disable_wgi_xinput" | "enable_raw_input" => cfg!(target_os = "windows"),
+                _ => true,
+            });
+        });
+        let mut expected = [
+            "disable_wgi_xinput", "enable_raw_input", "controller_navigation",
+            "enable_joycon_driver", "enable_procon_driver", "vibration_enabled",
+            "enable_accurate_vibrations", "motion_enabled", "udp_input_servers",
+            "enable_udp_controller", "pause_tas_on_load", "tas_enable", "tas_loop",
+            "tas_show_recording_dialog", "mouse_panning", "mouse_panning_sensitivity",
+            "mouse_enabled", "mouse_panning_x_sensitivity", "mouse_panning_y_sensitivity",
+            "mouse_panning_deadzone_counterweight", "mouse_panning_decay_strength",
+            "mouse_panning_min_decay", "emulate_analog_keyboard", "keyboard_enabled",
+            "debug_pad_enabled", "touch_device", "touch_from_button_map",
+            "enable_ring_controller", "enable_ir_sensor", "ir_sensor_device", "random_amiibo_id",
+        ];
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
     }
 
     #[test]

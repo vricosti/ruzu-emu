@@ -12,9 +12,9 @@ pub struct Starlink {
 }
 
 impl Starlink {
-    pub fn new() -> Self {
+    pub fn new(event: Box<dyn super::hidbus_base::HidbusCommandEvent>) -> Self {
         Self {
-            base: HidbusBase::new(),
+            base: HidbusBase::new(event),
         }
     }
 
@@ -71,10 +71,4 @@ impl super::hidbus_base::HidbusDevice for Starlink {
     fn get_device_id(&self) -> u8 { Starlink::get_device_id(self) }
     fn set_command(&mut self, data: &[u8]) -> bool { Starlink::set_command(self, data) }
     fn get_reply(&self, data: &mut [u8]) -> u64 { Starlink::get_reply(self, data) }
-}
-
-impl Default for Starlink {
-    fn default() -> Self {
-        Self::new()
-    }
 }

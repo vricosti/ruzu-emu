@@ -200,8 +200,16 @@ pub trait HidbusDevice {
     }
 }
 
+/// Kernel-event bridge supplied by core, which cannot be a dependency of hid_core.
+/// The implementation owns the service event reservation and releases it on Drop.
+/// Production devices must receive an event; there is no optional/no-op fallback.
+pub trait HidbusCommandEvent: Send + Sync {
+    fn signal(&self);
+}
+
 /// Base implementation for hidbus devices
 pub struct HidbusBase {
+    pub send_command_async_event: Box<dyn HidbusCommandEvent>,
     pub is_activated: bool,
     pub device_enabled: bool,
     pub polling_mode_enabled: bool,
@@ -213,8 +221,9 @@ pub struct HidbusBase {
 }
 
 impl HidbusBase {
-    pub fn new() -> Self {
+    pub fn new(send_command_async_event: Box<dyn HidbusCommandEvent>) -> Self {
         Self {
+            send_command_async_event,
             is_activated: false,
             device_enabled: false,
             polling_mode_enabled: false,
@@ -260,10 +269,13 @@ impl HidbusBase {
     }
 }
 
-impl Default for HidbusBase {
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+pub(crate) fn test_command_event() -> Box<dyn HidbusCommandEvent> {
+    struct TestEvent;
+    impl HidbusCommandEvent for TestEvent {
+        fn signal(&self) {}
     }
+    Box::new(TestEvent)
 }
 
 #[cfg(test)]
@@ -285,7 +297,7 @@ mod tests {
                 self.calls.push("release");
             }
         }
-        let mut device = Device { base: HidbusBase::new(), calls: Vec::new() };
+        let mut device = Device { base: HidbusBase::new(test_command_event()), calls: Vec::new() };
         let dynamic: &mut dyn HidbusDevice = &mut device;
         dynamic.deactivate_device();
         dynamic.activate_device();
@@ -299,7 +311,7 @@ mod tests {
 
     #[test]
     fn polling_accessor_defaults_match_upstream() {
-        let base = HidbusBase::new();
+        let base = HidbusBase::new(test_command_event());
         assert_eq!(base.disable_sixaxis_data.header.result.raw(), u32::MAX);
         assert_eq!(base.enable_sixaxis_data.header.result.raw(), u32::MAX);
         assert_eq!(base.button_only_data.header.result.raw(), u32::MAX);

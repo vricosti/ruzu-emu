@@ -125,6 +125,24 @@ impl StatusBar {
         *self.on_gpu_accuracy_changed.borrow_mut() = Some(Box::new(f));
     }
 
+    /// InitializeHotkeys shares these handlers with the status buttons upstream.
+    /// Emitting the existing click also preserves the GPU live-apply callback.
+    pub fn install_graphics_hotkey_actions(&self, app: &gtk::Application) {
+        for (name, button) in [
+            ("toggle_adapting_filter", &self.filter),
+            ("toggle_gpu_accuracy", &self.accuracy),
+        ] {
+            let button = button.clone();
+            let action = gio::SimpleAction::new(name, None);
+            action.connect_activate(move |_, _| {
+                if button.is_sensitive() {
+                    button.emit_clicked();
+                }
+            });
+            app.add_action(&action);
+        }
+    }
+
     /// The widget to place at the bottom of the window.
     pub fn widget(&self) -> &gtk::Box {
         &self.root
@@ -787,6 +805,32 @@ fn install_css() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK display and isolated process for shared settings"]
+    fn graphics_hotkeys_reuse_click_and_live_apply_paths() {
+        gtk::init().unwrap();
+        let original = settings::values().clone();
+        let app = gtk::Application::builder()
+            .application_id("org.ruzu.GraphicsHotkeyTest").build();
+        let bar = StatusBar::new();
+        let applied = Rc::new(Cell::new(0));
+        let calls = applied.clone();
+        bar.connect_gpu_accuracy_changed(move || calls.set(calls.get() + 1));
+        bar.install_graphics_hotkey_actions(&app);
+        settings::values_mut().gpu_accuracy.set_value(GpuAccuracy::High);
+        app.lookup_action("toggle_gpu_accuracy").unwrap().activate(None);
+        assert_eq!(*settings::values().gpu_accuracy.get_value(), GpuAccuracy::Low);
+        assert_eq!(applied.get(), 1);
+        app.lookup_action("toggle_gpu_accuracy").unwrap().activate(None);
+        assert_eq!(*settings::values().gpu_accuracy.get_value(), GpuAccuracy::High);
+        assert_eq!(applied.get(), 2);
+        settings::values_mut().scaling_filter.set_value(ScalingFilter::SgsrEdge);
+        app.lookup_action("toggle_adapting_filter").unwrap().activate(None);
+        assert_eq!(*settings::values().scaling_filter.get_value() as u32, 0);
+        assert_eq!(applied.get(), 2);
+        *settings::values_mut() = original;
+    }
 
     #[test]
     #[ignore = "requires a GTK display and isolated process for startup probe state"]

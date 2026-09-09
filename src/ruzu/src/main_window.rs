@@ -1721,6 +1721,7 @@ impl GMainWindow {
             }
         ));
         app.add_action(&renderdoc);
+        self.status_bar.install_graphics_hotkey_actions(app);
 
         for (name, change) in [
             ("audio_mute", on_mute as fn(&mut common::settings::Values)),

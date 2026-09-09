@@ -177,6 +177,12 @@ mod tests {
         crate::i18n::set_language("fr");
         let translated = build_dialog();
         assert_eq!(translated.title().as_deref(), Some("Configurer l'Écran Tactile"));
+        let mut labels = Vec::<gtk::Label>::new();
+        collect(translated.upcast_ref(), &mut labels);
+        for expected in ["Paramètres Tactiles", "Diamètres Tactiles X", "Diamètres Tactiles Y", "Angle de Rotation"] {
+            assert!(labels.iter().any(|label| label.text() == expected), "{expected}");
+        }
+        assert!(labels.iter().any(|label| label.text().starts_with("Avertissement :") && label.text().contains("Ruzu")));
         let mut buttons = Vec::<gtk::Button>::new();
         collect(translated.upcast_ref(), &mut buttons);
         assert!(buttons.iter().any(|b| b.label().as_deref() == Some("Restaurer les paramètres par défaut")));

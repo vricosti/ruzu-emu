@@ -156,7 +156,7 @@ pub fn show(
                 v.multiplayer_nickname.set_value(nickname_text.clone())
             });
             crate::uisettings::with_mut(|v| v.multiplayer_ip.set_value(address_text.clone()));
-            crate::uisettings::with_mut(|v| v.multiplayer_port.set_value(port_value as u32));
+            crate::uisettings::with_mut(|v| v.multiplayer_port.set_value(port_value));
             if let Err(error) = crate::configuration::qt_config::save_multiplayer_values() {
                 log::error!("Could not save multiplayer settings: {error}");
             }

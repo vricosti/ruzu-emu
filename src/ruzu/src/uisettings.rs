@@ -309,7 +309,15 @@ pub struct Values {
     pub multiplayer_filter_hide_empty: Setting<bool>,
     pub multiplayer_filter_hide_full: Setting<bool>,
     pub multiplayer_ip: Setting<String>,
-    pub multiplayer_port: Setting<u32>,
+    pub multiplayer_port: Setting<u16>,
+    pub multiplayer_room_nickname: Setting<String>,
+    pub multiplayer_room_name: Setting<String>,
+    pub multiplayer_max_player: Setting<u8>,
+    pub multiplayer_room_port: Setting<u16>,
+    pub multiplayer_host_type: Setting<u8>,
+    pub multiplayer_game_id: Setting<u64>,
+    pub multiplayer_room_description: Setting<String>,
+    pub multiplayer_ban_list: (Vec<String>, Vec<String>),
     pub screenshot_height: Setting<u32>,
 
     // ── UiGameList ──────────────────────────────────────────────────────
@@ -397,7 +405,15 @@ impl Default for Values {
                 Multiplayer,
             ),
             multiplayer_ip: Setting::new(String::new(), "ip", Multiplayer),
-            multiplayer_port: Setting::new(24872, "port", Multiplayer),
+            multiplayer_port: Setting::ranged(24872, 0, u16::MAX, "port", Multiplayer),
+            multiplayer_room_nickname: Setting::new(String::new(), "room_nickname", Multiplayer),
+            multiplayer_room_name: Setting::new(String::new(), "room_name", Multiplayer),
+            multiplayer_max_player: Setting::ranged(8, 0, 8, "max_player", Multiplayer),
+            multiplayer_room_port: Setting::ranged(24872, 0, u16::MAX, "room_port", Multiplayer),
+            multiplayer_host_type: Setting::ranged(0, 0, 1, "host_type", Multiplayer),
+            multiplayer_game_id: Setting::new(0, "game_id", Multiplayer),
+            multiplayer_room_description: Setting::new(String::new(), "room_description", Multiplayer),
+            multiplayer_ban_list: (Vec::new(), Vec::new()),
             screenshot_height: Setting::new(0, "screenshot_height", Screenshots),
 
             show_add_ons: Setting::new(true, "show_add_ons", UiGameList),
@@ -415,6 +431,22 @@ impl Default for Values {
 }
 
 impl Values {
+    /// Multiplayer category of UISettings::linkage. Array data remains owned
+    /// by QtConfig's dedicated array reader/writer, as upstream.
+    pub(crate) fn for_each_multiplayer_setting_mut(
+        &mut self,
+        mut visit: impl FnMut(&mut dyn common::settings_setting::BasicSetting),
+    ) {
+        macro_rules! settings {
+            ($($field:ident),+ $(,)?) => { $(visit(&mut self.$field);)+ };
+        }
+        settings!(multiplayer_nickname, multiplayer_filter_text,
+            multiplayer_filter_games_owned, multiplayer_filter_hide_empty,
+            multiplayer_filter_hide_full, multiplayer_ip, multiplayer_port,
+            multiplayer_room_nickname, multiplayer_room_name, multiplayer_max_player,
+            multiplayer_room_port, multiplayer_host_type, multiplayer_game_id,
+            multiplayer_room_description);
+    }
     /// UI-owned scalar registry, corresponding to upstream UISettings::linkage.
     /// Config traversal stays in qt_config; containers, paths and theme use their
     /// specialized readers/writers, as they do in QtConfig.

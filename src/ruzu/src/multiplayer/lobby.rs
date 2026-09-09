@@ -281,7 +281,7 @@ fn begin_join(
     crate::uisettings::with_mut(|values| {
         values.multiplayer_nickname.set_value(nickname.clone());
         values.multiplayer_ip.set_value(address.clone());
-        values.multiplayer_port.set_value(port as u32);
+        values.multiplayer_port.set_value(port);
     });
     if let Err(error) = crate::configuration::qt_config::save_multiplayer_values() {
         log::error!("Could not save multiplayer settings: {error}");

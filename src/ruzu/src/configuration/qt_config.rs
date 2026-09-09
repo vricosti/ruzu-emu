@@ -421,113 +421,103 @@ fn read_ui_values(contents: &str, values: &mut uisettings::Values) {
         .map(|value| unquote(value).to_owned()).unwrap_or_default());
 }
 
-/// Read the three Direct Connect fields owned by upstream
+/// Read the multiplayer fields owned by upstream
 /// `QtConfig::ReadMultiplayerValues`.
 pub fn load_multiplayer_values() {
     let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
-    let values = parse_section_values(&contents, UI_SECTION);
-    uisettings::with_mut(|ui| {
-        ui.multiplayer_nickname.set_value(read_ui_string_setting(
-            &contents,
-            "Multiplayer\\nickname",
-            ui.multiplayer_nickname.get_default(),
-        ));
-        ui.multiplayer_filter_text.set_value(read_ui_string_setting(
-            &contents,
-            "Multiplayer\\filter_text",
-            ui.multiplayer_filter_text.get_default(),
-        ));
-        ui.multiplayer_filter_games_owned
-            .set_value(read_ui_bool_setting(
-                &values,
-                "Multiplayer\\filter_games_owned",
-                *ui.multiplayer_filter_games_owned.get_default(),
-            ));
-        ui.multiplayer_filter_hide_empty
-            .set_value(read_ui_bool_setting(
-                &values,
-                "Multiplayer\\filter_games_hide_empty",
-                *ui.multiplayer_filter_hide_empty.get_default(),
-            ));
-        ui.multiplayer_filter_hide_full
-            .set_value(read_ui_bool_setting(
-                &values,
-                "Multiplayer\\filter_games_hide_full",
-                *ui.multiplayer_filter_hide_full.get_default(),
-            ));
-        ui.multiplayer_ip.set_value(read_ui_string_setting(
-            &contents,
-            "Multiplayer\\ip",
-            ui.multiplayer_ip.get_default(),
-        ));
-        ui.multiplayer_port.set_value(read_ui_u32_setting(
-            &values,
-            "Multiplayer\\port",
-            *ui.multiplayer_port.get_default(),
-        ));
-    });
+    uisettings::with_mut(|ui| read_multiplayer_values(&contents, ui));
 }
 
-/// Persist the three Direct Connect fields through upstream
+fn read_multiplayer_values(contents: &str, ui: &mut uisettings::Values) {
+    let values = parse_section_values(contents, UI_SECTION);
+    ui.for_each_multiplayer_setting_mut(|setting| {
+        let key = format!("Multiplayer\\{}", setting.label());
+        let default = setting.default_to_string();
+        let value = if matches!(default.as_str(), "true" | "false") {
+            read_ui_bool_setting(&values, &key, default == "true").to_string()
+        } else if values.get(&format!("{key}\\default")).is_none_or(|value| is_true(value)) {
+            default
+        } else {
+            values.get(&key).map(|value| decode_multiplayer_value(value))
+                .unwrap_or_else(|| setting.default_to_string())
+        };
+        setting.load_string(&value);
+    });
+    for (array, field, list) in [
+        ("username_ban_list", "username", &mut ui.multiplayer_ban_list.0),
+        ("ip_ban_list", "ip", &mut ui.multiplayer_ban_list.1),
+    ] {
+        let prefix = format!("Multiplayer\\{array}");
+        let size = values.get(&format!("{prefix}\\size"))
+            .and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+        list.clear();
+        for index in 1..=size {
+            // Ban entries are plain array values, not defaulted settings.
+            // Eden's IP reader mistakenly reads "username" without advancing
+            // its index. Read the indexed "ip" keys emitted by its writer.
+            list.push(values.get(&format!("{prefix}\\{index}\\{field}"))
+                .map(|value| decode_multiplayer_value(value)).unwrap_or_default());
+        }
+    }
+}
+
+/// Persist the multiplayer fields through upstream
 /// `QtConfig::SaveMultiplayerValues`'s `Category::Multiplayer` writer.
 pub fn save_multiplayer_values() -> io::Result<()> {
     let path = config_path();
-    let mut contents = read_configuration_for_update(&path)?;
-    uisettings::with(|ui| {
-        contents = replace_ui_string_setting(
-            &contents,
-            "Multiplayer\\nickname",
-            ui.multiplayer_nickname.get_value(),
-            ui.multiplayer_nickname.get_default(),
-        );
-        contents = replace_ui_string_setting(
-            &contents,
-            "Multiplayer\\filter_text",
-            ui.multiplayer_filter_text.get_value(),
-            ui.multiplayer_filter_text.get_default(),
-        );
-        for (key, setting) in [
-            (
-                "Multiplayer\\filter_games_owned",
-                &ui.multiplayer_filter_games_owned,
-            ),
-            (
-                "Multiplayer\\filter_games_hide_empty",
-                &ui.multiplayer_filter_hide_empty,
-            ),
-            (
-                "Multiplayer\\filter_games_hide_full",
-                &ui.multiplayer_filter_hide_full,
-            ),
-        ] {
-            let value = *setting.get_value();
-            contents = replace_section_setting(
-                &contents,
-                "UI",
-                key,
-                if value { "true" } else { "false" },
-                value == *setting.get_default(),
-            );
-        }
-        contents = replace_ui_string_setting(
-            &contents,
-            "Multiplayer\\ip",
-            ui.multiplayer_ip.get_value(),
-            ui.multiplayer_ip.get_default(),
-        );
-        let port = *ui.multiplayer_port.get_value();
-        contents = replace_section_setting(
-            &contents,
-            "UI",
-            "Multiplayer\\port",
-            &port.to_string(),
-            port == *ui.multiplayer_port.get_default(),
-        );
-    });
+    let contents = read_configuration_for_update(&path)?;
+    let contents = uisettings::with_mut(|ui| write_multiplayer_values(&contents, ui));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, contents)
+}
+
+fn write_multiplayer_values(contents: &str, ui: &mut uisettings::Values) -> String {
+    // Remove only owned array keys in UI; shrinking a list must not leave stale
+    // bans that can reappear later, and other sections must remain untouched.
+    let mut in_ui = false;
+    let mut contents = contents.lines().filter(|line| {
+        let line = line.trim();
+        if line.starts_with('[') { in_ui = line == UI_SECTION; }
+        !in_ui || !line.split_once('=').is_some_and(|(key, _)|
+            key.starts_with("Multiplayer\\username_ban_list\\") || key.starts_with("Multiplayer\\ip_ban_list\\"))
+    }).collect::<Vec<_>>().join("\n");
+    ui.for_each_multiplayer_setting_mut(|setting| {
+        contents = replace_ui_string_setting(&contents,
+            &format!("Multiplayer\\{}", setting.label()),
+            &encode_multiplayer_value(&setting.to_string_global()),
+            &encode_multiplayer_value(&setting.default_to_string()));
+    });
+    for (array, field, list) in [
+        ("username_ban_list", "username", &ui.multiplayer_ban_list.0),
+        ("ip_ban_list", "ip", &ui.multiplayer_ban_list.1),
+    ] {
+        let prefix = format!("Multiplayer\\{array}");
+        contents = replace_ui_setting(&contents, &format!("{prefix}\\size"), &list.len().to_string(), None);
+        for (index, value) in list.iter().enumerate() {
+            contents = replace_ui_setting(&contents, &format!("{prefix}\\{}\\{field}", index + 1), &encode_multiplayer_value(value), None);
+        }
+    }
+    contents
+}
+
+// Keep scalar numbers/bools and legacy simple strings in their existing form.
+// Quoted escapes preserve multiline GUI text on ONE physical INI line. The
+// newline/backslash/quote form matches QSettings; Eden's current SimpleIni
+// writer does not escape line breaks and cannot roundtrip that input safely.
+fn encode_multiplayer_value(value: &str) -> String {
+    if value.trim() != value || value.chars().any(|c| c.is_control() || matches!(c, '\\' | '"' | ',' | ';' | '=')) {
+        serde_json::to_string(value).expect("serializing a string cannot fail")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn decode_multiplayer_value(value: &str) -> String {
+    // Legacy SimpleIni strings may have unescaped backslashes inside quotes.
+    // Decode valid escaped strings; otherwise preserve the legacy content.
+    serde_json::from_str::<String>(value).unwrap_or_else(|_| unquote(value).to_owned())
 }
 
 /// Persist frontend UI values through upstream `QtConfig::SaveUIValues`'s
@@ -2546,6 +2536,61 @@ mod tests {
             24873
         );
         assert!(contents.contains("Unrelated=value"));
+    }
+
+    #[test]
+    fn hosting_settings_and_ban_arrays_round_trip_and_shrink() {
+        let mut source = uisettings::Values::default();
+        source.multiplayer_room_nickname.set_value("SyntheticHost".into());
+        source.multiplayer_room_name.set_value("Synthetic room".into());
+        source.multiplayer_max_player.set_value(4);
+        source.multiplayer_room_port.set_value(25000);
+        source.multiplayer_host_type.set_value(1);
+        source.multiplayer_game_id.set_value(u64::MAX);
+        source.multiplayer_room_description.set_value("First line\n[Core]\nuse_multi_core=false\nbackslash \\n and \"quotes\" é".into());
+        source.multiplayer_ban_list = (vec!["UserOne".into(), "UserTwo".into()],
+            vec!["192.0.2.1".into(), "192.0.2.2".into()]);
+        let untouched = "[Renderer]\nbackend=1\n[UI]\nUnrelated=value\n";
+        let document = write_multiplayer_values(untouched, &mut source);
+        assert!(document.contains("backend=1"));
+        assert!(document.contains("Unrelated=value"));
+        assert!(!document.lines().any(|line| line == "[Core]"));
+        assert!(!document.lines().any(|line| line == "use_multi_core=false"));
+        // Verified against Qt6 QSettings's actual INI output, not only our
+        // own reader/writer agreeing with each other.
+        assert!(document.contains(r#"Multiplayer\room_description="First line\n[Core]\nuse_multi_core=false\nbackslash \\n and \"quotes\" é""#));
+        assert!(document.contains("Multiplayer\\ip_ban_list\\2\\ip=192.0.2.2"));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("qt-config.ini");
+        std::fs::write(&path, &document).unwrap();
+        let mut restored = uisettings::Values::default();
+        read_multiplayer_values(&std::fs::read_to_string(path).unwrap(), &mut restored);
+        let mut expected = std::collections::BTreeMap::new();
+        source.for_each_multiplayer_setting_mut(|setting| {
+            expected.insert(setting.label().to_owned(), setting.to_string_global());
+        });
+        restored.for_each_multiplayer_setting_mut(|setting| {
+            assert_eq!(setting.to_string_global(), expected[setting.label()], "{}", setting.label());
+        });
+        assert_eq!(restored.multiplayer_ban_list, source.multiplayer_ban_list);
+        source.multiplayer_ban_list = (Vec::new(), vec!["192.0.2.3".into()]);
+        let document = write_multiplayer_values(&document, &mut source);
+        assert!(!document.contains("192.0.2.1"));
+        assert!(!document.contains("192.0.2.2"));
+        assert!(!document.contains("UserOne"));
+        read_multiplayer_values(&document, &mut restored);
+        assert_eq!(restored.multiplayer_ban_list, source.multiplayer_ban_list);
+        read_multiplayer_values("[UI]\n", &mut restored);
+        assert_eq!(*restored.multiplayer_max_player.get_value(), 8);
+        assert_eq!(*restored.multiplayer_room_port.get_value(), 24872);
+        assert!(restored.multiplayer_ban_list.1.is_empty());
+        read_multiplayer_values(concat!("[UI]\n",
+            "Multiplayer\\filter_games_owned\\default=false\nMultiplayer\\filter_games_owned=1\n",
+            "Multiplayer\\max_player\\default=false\nMultiplayer\\max_player=255\n",
+            "Multiplayer\\host_type\\default=false\nMultiplayer\\host_type=255\n"), &mut restored);
+        assert!(*restored.multiplayer_filter_games_owned.get_value());
+        assert_eq!(*restored.multiplayer_max_player.get_value(), 8);
+        assert_eq!(*restored.multiplayer_host_type.get_value(), 1);
     }
 
     #[test]

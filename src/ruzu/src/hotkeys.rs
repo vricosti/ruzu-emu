@@ -104,7 +104,7 @@ pub(crate) fn install_secondary_window_shortcuts(window: &gtk::Window, owner: &g
     window.add_controller(focus);
 }
 
-fn owner_blocked_by_modal(owner: &gtk::ApplicationWindow) -> bool {
+pub(crate) fn owner_blocked_by_modal(owner: &gtk::ApplicationWindow) -> bool {
     let windows = gtk::Window::list_toplevels();
     windows.into_iter().filter_map(|widget| widget.downcast::<gtk::Window>().ok()).any(|window| {
         if !window.is_visible() || !window.is_modal() { return false; }
@@ -246,6 +246,7 @@ pub(crate) const HOTKEY_ACTIONS: &[(&str, &str)] = &[
         ("Toggle Status Bar", "app.show_status_bar"),
         ("Toggle Performance Overlay", "app.show_perf_overlay"),
         ("Toggle Renderdoc Capture", "app.renderdoc_capture"),
+        ("Toggle Mouse Panning", "app.toggle_mouse_panning"),
         ("Toggle Framerate Limit", "app.toggle_framerate_limit"),
         ("Toggle Turbo Speed", "app.toggle_turbo_speed"),
         ("Toggle Slow Speed", "app.toggle_slow_speed"),

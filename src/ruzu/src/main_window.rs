@@ -544,6 +544,7 @@ pub struct GMainWindow {
     /// when the GTK window resizes.
     render: RefCell<Option<RenderHandles>>,
     mouse_hide_timer: RefCell<Option<glib::SourceId>>,
+    mouse_constrain_timer: RefCell<Option<glib::SourceId>>,
     /// Last native render rectangle, including origin and DPI, so the child
     /// surface cannot drift over the menu/status bars after a restore.
     render_geometry: Cell<Option<RenderGeometry>>,
@@ -658,6 +659,18 @@ fn map_render_pointer(
 #[derive(Default)]
 struct LoadingEventMailbox {
     events: VecDeque<LoadingEvent>,
+}
+
+fn mouse_constraint_target(
+    position: (f64, f64), size: (f64, f64), layout: &FramebufferLayout,
+    mouse_enabled: bool, from_motion: bool,
+) -> (f64, f64) {
+    if !mouse_enabled { return ((size.0 / 2.0).floor(), (size.1 / 2.0).floor()); }
+    if !from_motion { return (position.0.clamp(0.0, size.0), position.1.clamp(0.0, size.1)); }
+    let sx = size.0 / layout.width as f64;
+    let sy = size.1 / layout.height as f64;
+    (position.0.clamp(layout.screen.left as f64 * sx, layout.screen.right.saturating_sub(1) as f64 * sx),
+     position.1.clamp(layout.screen.top as f64 * sy, layout.screen.bottom.saturating_sub(1) as f64 * sy))
 }
 
 impl LoadingEventMailbox {
@@ -905,6 +918,47 @@ mod loading_event_mailbox_tests {
 #[cfg(test)]
 mod fullscreen_hotkey_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK display and isolated XDG directories; run alone"]
+    fn mouse_panning_action_and_focus_cleanup() {
+        gtk::init().unwrap();
+        let app = Application::builder().application_id("org.ruzu.MousePanningTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let main = GMainWindow::new_for_direct_game(&app);
+        common::settings::values_mut().mouse_panning.set_value(false);
+        gio::prelude::ActionGroupExt::activate_action(&app, "toggle_mouse_panning", None);
+        assert!(*common::settings::values().mouse_panning.get_value());
+        // A launcher/inactive window must not acquire the pointer.
+        main.start_mouse_constraint();
+        assert!(main.mouse_constrain_timer.borrow().is_none());
+        assert!(!main.constrain_mouse(false));
+        let install_timer = || {
+            *main.mouse_constrain_timer.borrow_mut() = Some(glib::timeout_add_local(
+                std::time::Duration::from_secs(60), || panic!("cancelled timer fired")));
+        };
+        install_timer();
+        let controllers = main.window.observe_controllers();
+        let focus = (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i).and_downcast::<gtk::EventControllerFocus>())
+            .next().unwrap();
+        focus.emit_by_name::<()>("leave", &[]);
+        assert!(main.mouse_constrain_timer.borrow().is_none());
+        install_timer();
+        gio::prelude::ActionGroupExt::activate_action(&app, "toggle_mouse_panning", None);
+        assert!(!*common::settings::values().mouse_panning.get_value());
+        assert!(main.mouse_constrain_timer.borrow().is_none());
+        install_timer();
+        assert!(!main.begin_stop_game()); // No running session, still cancels.
+        assert!(main.mouse_constrain_timer.borrow().is_none());
+        let modal = gtk::Window::builder().transient_for(&main.window).modal(true).build();
+        modal.set_visible(true);
+        assert!(crate::hotkeys::owner_blocked_by_modal(&main.window));
+        modal.set_visible(false);
+        assert!(!crate::hotkeys::owner_blocked_by_modal(&main.window));
+        modal.destroy();
+        main.window.destroy();
+    }
 
     #[test]
     #[ignore = "requires GTK display and isolated XDG directories; run alone"]
@@ -1271,6 +1325,32 @@ mod render_pointer_tests {
     use ruzu_core::frontend::framebuffer_layout::Rectangle;
 
     #[test]
+    fn mouse_panning_centers_without_guest_mouse_emulation() {
+        let layout = default_frame_layout(2560, 1440);
+        for from_motion in [false, true] {
+            assert_eq!(mouse_constraint_target((-40.0, 900.0), (1281.0, 721.0),
+                &layout, false, from_motion), (640.0, 360.0));
+        }
+    }
+
+    #[test]
+    fn mouse_emulation_clips_motion_to_scaled_screen_but_leave_to_widget() {
+        let layout = FramebufferLayout {
+            width: 2048, height: 1536,
+            screen: Rectangle::new(0, 192, 2048, 1344), is_srgb: false,
+        };
+        let size = (1024.0, 768.0);
+        assert_eq!(mouse_constraint_target((-20.0, 0.0), size, &layout, true, true),
+            (0.0, 96.0));
+        assert_eq!(mouse_constraint_target((1100.0, 900.0), size, &layout, true, true),
+            (1023.5, 671.5));
+        assert_eq!(mouse_constraint_target((1100.0, 900.0), size, &layout, true, false),
+            (1024.0, 768.0));
+        assert_eq!(mouse_constraint_target((400.0, 300.0), size, &layout, true, true),
+            (400.0, 300.0));
+    }
+
+    #[test]
     fn maps_center_of_render_area_to_center_of_touchscreen() {
         let layout = default_frame_layout(1280, 720);
         let position = map_render_pointer(640.0, 360.0, 1280.0, 720.0, &layout).unwrap();
@@ -1501,6 +1581,7 @@ impl GMainWindow {
             is_amiibo_file_select_active: Cell::new(false),
             render: RefCell::new(None),
             mouse_hide_timer: RefCell::new(None),
+            mouse_constrain_timer: RefCell::new(None),
             render_geometry: Cell::new(None),
             configure_dialog: RefCell::new(None),
             controller_hotkeys: RefCell::new(Vec::new()),
@@ -1839,6 +1920,22 @@ impl GMainWindow {
             }
         ));
         app.add_action(&renderdoc);
+        let mouse_panning = gio::SimpleAction::new("toggle_mouse_panning", None);
+        mouse_panning.connect_activate(glib::clone!(
+            #[weak(rename_to = this)] self,
+            move |_, _| {
+                // MainWindow::InitializeHotkeys: the driver reads this live.
+                // GTK motion tracking is installed for the render area's lifetime.
+                {
+                    let mut settings = common::settings::values_mut();
+                    let enabled = !*settings.mouse_panning.get_value();
+                    settings.mouse_panning.set_value(enabled);
+                }
+                this.stop_mouse_constraint();
+                this.on_mouse_activity();
+            }
+        ));
+        app.add_action(&mouse_panning);
         self.status_bar.install_graphics_hotkey_actions(app);
 
         for (name, change) in [
@@ -2367,6 +2464,9 @@ impl GMainWindow {
                 this.on_mouse_activity();
             }
         ));
+        motion.connect_leave(glib::clone!(#[weak(rename_to = this)] self, move |_| {
+            this.start_mouse_constraint();
+        }));
         self.window.add_controller(motion);
 
         let scroll = gtk::EventControllerScroll::new(
@@ -2430,6 +2530,7 @@ impl GMainWindow {
 
     /// Port of `GRenderWindow::focusOutEvent`.
     fn release_all_input(&self) {
+        self.stop_mouse_constraint();
         let mut subsystem = self.input_subsystem.borrow_mut();
         if let Some(keyboard) = subsystem.get_keyboard_mut() {
             keyboard.release_all_keys();
@@ -2514,8 +2615,9 @@ impl GMainWindow {
     }
 
     /// Upstream `GRenderWindow::mouseMoveEvent`.
-    fn on_mouse_motion(&self, x: f64, y: f64) {
+    fn on_mouse_motion(self: &Rc<Self>, x: f64, y: f64) {
         let Some(position) = self.render_pointer_position(x, y) else {
+            self.start_mouse_constraint();
             return;
         };
         let mut subsystem = self.input_subsystem.borrow_mut();
@@ -2532,6 +2634,74 @@ impl GMainWindow {
             position.center_y,
         );
         mouse.notify_changed();
+        drop(subsystem);
+        self.constrain_mouse(true);
+        self.stop_mouse_constraint();
+    }
+
+    fn stop_mouse_constraint(&self) {
+        if let Some(timer) = self.mouse_constrain_timer.borrow_mut().take() { timer.remove(); }
+    }
+
+    fn start_mouse_constraint(self: &Rc<Self>) {
+        if self.mouse_constrain_timer.borrow().is_some() || !self.window.is_active()
+            || self.stack.visible_child_name().as_deref() != Some(PAGE_RENDER)
+            || self.shutdown_dialog.borrow().is_some()
+            || !*common::settings::values().mouse_panning.get_value() { return; }
+        let timer = glib::timeout_add_local(std::time::Duration::from_millis(10),
+            glib::clone!(#[weak(rename_to = this)] self, #[upgrade_or] glib::ControlFlow::Break, move || {
+                if this.constrain_mouse(false) { glib::ControlFlow::Continue } else {
+                    this.mouse_constrain_timer.borrow_mut().take();
+                    glib::ControlFlow::Break
+                }
+            }));
+        *self.mouse_constrain_timer.borrow_mut() = Some(timer);
+    }
+
+    /// GRenderWindow::ConstrainMouse / mouseMoveEvent warp. GTK's native child
+    /// coordinates are converted once so HiDPI does not mix device and widget pixels.
+    fn constrain_mouse(&self, from_motion: bool) -> bool {
+        let mouse_enabled = {
+            let settings = common::settings::values();
+            if !*settings.mouse_panning.get_value() { return false; }
+            *settings.mouse_enabled.get_value()
+        };
+        if !self.window.is_active() || self.stack.visible_child_name().as_deref() != Some(PAGE_RENDER) { return false; }
+        // GTK can retain the parent's active flag while presenting a modal;
+        // never pull the pointer away from its controls during that transition.
+        if self.shutdown_dialog.borrow().is_some()
+            || crate::hotkeys::owner_blocked_by_modal(&self.window) { return false; }
+        let render = self.render.borrow();
+        let Some(handles) = render.as_ref() else { return false; };
+        let layout_owner = handles.emu_window.framebuffer_layout();
+        let Ok(layout) = layout_owner.read() else { return false; };
+        let (width, height) = (self.stack.width() as f64, self.stack.height() as f64);
+        if width <= 0.0 || height <= 0.0 || layout.width == 0 || layout.height == 0
+            || layout.screen.right <= layout.screen.left || layout.screen.bottom <= layout.screen.top
+        { return false; }
+        #[cfg(target_os = "linux")]
+        let position = unsafe { crate::render_window_x11::render_pointer_position(handles.display as _, handles.child_window as _) };
+        #[cfg(target_os = "windows")]
+        let position = unsafe { crate::render_window_windows::render_pointer_position(handles.child_window as _) };
+        #[cfg(target_os = "macos")]
+        let position = unsafe { crate::render_window::render_pointer_position(handles.child_window as _) };
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        let position: Option<(f64, f64)> = None;
+        let Some((x, y)) = position else { return false; };
+        #[cfg(not(target_os = "macos"))]
+        let (x, y) = (x * width / layout.width as f64, y * height / layout.height as f64);
+        let (target_x, target_y) = mouse_constraint_target((x, y), (width, height), &layout, mouse_enabled, from_motion);
+        if (target_x - x).abs() < 0.5 && (target_y - y).abs() < 0.5 { return false; }
+        #[cfg(not(target_os = "macos"))]
+        let (target_x, target_y) = ((target_x * layout.width as f64 / width).round() as i32, (target_y * layout.height as f64 / height).round() as i32);
+        #[cfg(target_os = "linux")]
+        return unsafe { crate::render_window_x11::warp_render_pointer(handles.display as _, handles.child_window as _, target_x, target_y) };
+        #[cfg(target_os = "windows")]
+        return unsafe { crate::render_window_windows::warp_render_pointer(handles.child_window as _, target_x, target_y) };
+        #[cfg(target_os = "macos")]
+        return unsafe { crate::render_window::warp_render_pointer(handles.child_window as _, target_x, target_y) };
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        false
     }
 
     /// Upstream `GRenderWindow::mouseReleaseEvent`.
@@ -5449,6 +5619,7 @@ impl GMainWindow {
     /// thread requests guest exit, applies the upstream timeout, and reports
     /// `StopComplete` after forced teardown if necessary.
     fn begin_stop_game(self: &Rc<Self>) -> bool {
+        self.stop_mouse_constraint();
         crate::gamemode::stop();
         self.play_time_manager.stop();
         let requested = self
@@ -5491,6 +5662,7 @@ impl GMainWindow {
     /// before releasing the native render target, clear the loading assets,
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        self.stop_mouse_constraint();
         self.perf_overlay.borrow_mut().take();
         // A guest-requested exit can arrive while the nonblocking GTK modal is
         // open. Do not leave it editing the next session's settings bank.

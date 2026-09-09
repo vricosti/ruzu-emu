@@ -31,6 +31,29 @@ use objc::{class, msg_send, sel, sel_impl};
 const NS_WINDOW_STYLE_MASK_BORDERLESS: u64 = 0;
 const NS_BACKING_STORE_BUFFERED: u64 = 2;
 
+/// QCursor::setPos for the child NSWindow. Input is logical render coordinates
+/// measured from its top-left. Cocoa's global bottom-left origin is converted
+/// to Quartz's primary-display top-left origin before moving the pointer.
+pub unsafe fn warp_render_pointer(window: *mut c_void, x: f64, y: f64) -> bool {
+    use core_graphics::{display::CGDisplay, geometry::CGPoint};
+    if window.is_null() { return false; }
+    let frame: NSRect = unsafe { msg_send![window as *mut Object, frame] };
+    let primary_height = CGDisplay::main().bounds().size.height;
+    CGDisplay::warp_mouse_cursor_position(CGPoint::new(
+        frame.origin.x + x, primary_height - frame.origin.y - frame.size.height + y,
+    )).is_ok()
+}
+
+pub unsafe fn render_pointer_position(window: *mut c_void) -> Option<(f64, f64)> {
+    use core_graphics::{display::CGDisplay, event::CGEvent, event_source::{CGEventSource, CGEventSourceStateID}};
+    if window.is_null() { return None; }
+    let frame: NSRect = unsafe { msg_send![window as *mut Object, frame] };
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()?;
+    let point = CGEvent::new(source).ok()?.location();
+    Some((point.x - frame.origin.x,
+        point.y - (CGDisplay::main().bounds().size.height - frame.origin.y - frame.size.height)))
+}
+
 extern "C" {
     /// GDK macOS backend: returns the `NSWindow*` backing a `GdkMacosSurface`.
     /// Available since GTK 4.8; the symbol lives in the linked `libgtk-4`.

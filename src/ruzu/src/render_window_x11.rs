@@ -41,6 +41,24 @@ use gtk::prelude::*;
 
 use x11::{glx, xlib};
 
+/// QCursor::setPos(mapToGlobal(...)) for the native render child. Coordinates
+/// are physical child pixels, not GTK logical pixels. Caller owns both handles.
+pub unsafe fn warp_render_pointer(display: *mut xlib::Display, window: xlib::Window, x: i32, y: i32) -> bool {
+    if display.is_null() || window == 0 { return false; }
+    unsafe {
+        xlib::XWarpPointer(display, 0, window, 0, 0, 0, 0, x, y);
+        xlib::XFlush(display);
+    }
+    true
+}
+
+pub unsafe fn render_pointer_position(display: *mut xlib::Display, window: xlib::Window) -> Option<(f64, f64)> {
+    if display.is_null() || window == 0 { return None; }
+    let (mut root, mut child, mut root_x, mut root_y, mut x, mut y, mut mask) = (0, 0, 0, 0, 0, 0, 0);
+    let valid = unsafe { xlib::XQueryPointer(display, window, &mut root, &mut child, &mut root_x, &mut root_y, &mut x, &mut y, &mut mask) };
+    (valid != 0).then_some((x as f64, y as f64))
+}
+
 use ruzu_core::frontend::graphics_context::GraphicsContext;
 
 type GlxCreateContextAttribsArb = unsafe extern "C" fn(

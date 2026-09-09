@@ -47,6 +47,20 @@ const DEFAULT_WIDTH: i32 = 1280;
 const DEFAULT_MOUSE_HIDE_TIMEOUT: u64 = 2500;
 const DEFAULT_HEIGHT: i32 = 720;
 
+/// HID portion of MainWindow::OnToggleDockedMode, after dismissing its warning.
+fn select_pro_controller_for_docked_mode(hid: &parking_lot::Mutex<hid_core::hid_core::HIDCore>) {
+    use hid_core::hid_types::{NpadIdType, NpadStyleIndex};
+    let (handheld, player) = {
+        let hid = hid.lock();
+        (hid.get_emulated_controller(NpadIdType::Handheld),
+         hid.get_emulated_controller(NpadIdType::Player1))
+    };
+    handheld.lock().disconnect();
+    let mut player = player.lock();
+    player.set_npad_style_index(NpadStyleIndex::Fullkey);
+    player.connect(false);
+}
+
 /// MainWindow::OnMute; the action refreshes the GTK volume label afterwards.
 fn on_mute(values: &mut common::settings::Values) {
     values.audio_muted.set_value(!*values.audio_muted.get_value());
@@ -71,6 +85,22 @@ fn on_increase_volume(values: &mut common::settings::Values) {
 #[cfg(test)]
 mod audio_hotkey_tests {
     use super::*;
+
+    #[test]
+    fn docking_disconnects_handheld_and_connects_fullkey_player_one() {
+        use hid_core::hid_types::{NpadIdType, NpadStyleIndex};
+        let hid = parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new());
+        let handheld = hid.lock().get_emulated_controller(NpadIdType::Handheld);
+        let player = hid.lock().get_emulated_controller(NpadIdType::Player1);
+        handheld.lock().set_npad_style_index(NpadStyleIndex::Handheld);
+        handheld.lock().connect(false);
+        player.lock().disconnect();
+        assert!(handheld.lock().is_connected(false));
+        select_pro_controller_for_docked_mode(&hid);
+        assert!(!handheld.lock().is_connected(false));
+        assert!(player.lock().is_connected(false));
+        assert_eq!(player.lock().get_npad_style_index(false), NpadStyleIndex::Fullkey);
+    }
 
     #[test]
     fn volume_shortcuts_match_upstream_steps_clamping_and_unmute() {
@@ -503,6 +533,7 @@ pub struct GMainWindow {
     /// is booted before that poller receives a terminal event.
     session_generation: Cell<u64>,
     profile_selection_pending: Cell<bool>,
+    docked_mode_change_pending: Cell<bool>,
     /// Bottom status bar (renderer / accuracy / dock / filter / AA / volume).
     status_bar: Rc<StatusBar>,
     /// Last TAS state reflected in the menu labels.
@@ -1394,6 +1425,7 @@ impl GMainWindow {
             shutdown_dialog: RefCell::new(None),
             session_generation: Cell::new(0),
             profile_selection_pending: Cell::new(false),
+            docked_mode_change_pending: Cell::new(false),
             status_bar,
             tas_state: Cell::new(input_common::drivers::tas_input::TasState::Stopped),
             is_tas_recording_dialog_active: Cell::new(false),
@@ -1451,6 +1483,11 @@ impl GMainWindow {
         // Eden's `OnToggleGpuAccuracy` applies the new setting to the active
         // system. Its context-menu action and the other status actions only
         // mutate their setting and refresh their button.
+        this.status_bar.connect_docked_mode_toggle(glib::clone!(
+            #[weak]
+            this,
+            move || this.on_toggle_docked_mode()
+        ));
         this.status_bar.connect_gpu_accuracy_changed(glib::clone!(
             #[weak(rename_to = this)]
             this,
@@ -3320,6 +3357,44 @@ impl GMainWindow {
                 "Migration Tool",
                 "No compatible source emulator data was found.",
             );
+        }
+    }
+
+    /// Upstream MainWindow::OnToggleDockedMode. GTK's warning is asynchronous,
+    /// so retain the ordering with a continuation, without retaining HID locks.
+    fn on_toggle_docked_mode(self: &Rc<Self>) {
+        use hid_core::hid_types::NpadIdType;
+        if self.configure_dialog.borrow().is_some() || self.docked_mode_change_pending.replace(true) {
+            return;
+        }
+        let was_docked = common::settings::is_docked_mode(&common::settings::values());
+        let handheld = self.hid_core.lock().get_emulated_controller(NpadIdType::Handheld);
+        let replace_handheld = !was_docked && handheld.lock().is_connected(false);
+        let generation = self.session_generation.get();
+        let weak = Rc::downgrade(self);
+        let finish = move || {
+            let Some(this) = weak.upgrade() else { return };
+            this.docked_mode_change_pending.set(false);
+            if this.session_generation.get() != generation { return; }
+            if replace_handheld {
+                select_pro_controller_for_docked_mode(&this.hid_core);
+            }
+            common::settings::values_mut().use_docked_mode.set_value(if was_docked {
+                common::settings_enums::ConsoleMode::Handheld
+            } else { common::settings_enums::ConsoleMode::Docked });
+            this.status_bar.refresh();
+            if let Some(session) = this.session.borrow().as_ref() {
+                let _ = session.docked_mode_changed(was_docked, !was_docked);
+            };
+        };
+        if replace_handheld {
+            crate::gtk_compat::show_warning_then(
+                Some(&self.window), "Invalid config detected",
+                "Handheld controller can't be used on docked mode. Pro controller will be selected.",
+                finish,
+            );
+        } else {
+            finish();
         }
     }
 

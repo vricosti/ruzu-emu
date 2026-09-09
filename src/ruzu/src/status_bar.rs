@@ -44,6 +44,7 @@ pub struct StatusBar {
     /// menu deliberately does not invoke it because Eden's direct menu action
     /// only updates the value and button text.
     on_gpu_accuracy_changed: RefCell<Option<Box<dyn Fn()>>>,
+    on_docked_mode_toggle: RefCell<Option<Box<dyn Fn()>>>,
     /// Mirrors `MainWindow::emulation_running` for the renderer button. Eden
     /// disables that complete button (left click and context menu) while a
     /// title is active because the graphics API cannot be changed live.
@@ -112,6 +113,7 @@ impl StatusBar {
             game_fps,
             frame_time,
             on_gpu_accuracy_changed: RefCell::new(None),
+            on_docked_mode_toggle: RefCell::new(None),
             emulation_running: Cell::new(false),
         });
 
@@ -125,12 +127,17 @@ impl StatusBar {
         *self.on_gpu_accuracy_changed.borrow_mut() = Some(Box::new(f));
     }
 
+    pub fn connect_docked_mode_toggle(&self, callback: impl Fn() + 'static) {
+        *self.on_docked_mode_toggle.borrow_mut() = Some(Box::new(callback));
+    }
+
     /// InitializeHotkeys shares these handlers with the status buttons upstream.
     /// Emitting the existing click also preserves the GPU live-apply callback.
     pub fn install_graphics_hotkey_actions(&self, app: &gtk::Application) {
         for (name, button) in [
             ("toggle_adapting_filter", &self.filter),
             ("toggle_gpu_accuracy", &self.accuracy),
+            ("toggle_docked_mode", &self.dock),
         ] {
             let button = button.clone();
             let action = gio::SimpleAction::new(name, None);
@@ -394,16 +401,11 @@ impl StatusBar {
 
     /// Upstream `GMainWindow::OnToggleDockedMode`.
     ///
-    /// Upstream additionally disconnects a handheld controller and warns, which
-    /// needs `HIDCore`; that is not reachable from the launcher yet, so only the
-    /// console-mode flip is performed here.
+    /// MainWindow owns the HID transition, warning and System notification.
     fn on_toggle_docked_mode(&self) {
-        let mut values = settings::values_mut();
-        let mode = match *values.use_docked_mode.get_value() {
-            ConsoleMode::Docked => ConsoleMode::Handheld,
-            ConsoleMode::Handheld => ConsoleMode::Docked,
-        };
-        values.use_docked_mode.set_value(mode);
+        if let Some(callback) = self.on_docked_mode_toggle.borrow().as_ref() {
+            callback();
+        }
     }
 
     /// Upstream `GMainWindow::OnToggleAdaptingFilter`: advance one step,
@@ -818,6 +820,14 @@ mod tests {
         let calls = applied.clone();
         bar.connect_gpu_accuracy_changed(move || calls.set(calls.get() + 1));
         bar.install_graphics_hotkey_actions(&app);
+        let dock_calls = Rc::new(Cell::new(0));
+        let calls = dock_calls.clone();
+        bar.connect_docked_mode_toggle(move || calls.set(calls.get() + 1));
+        let mode = *settings::values().use_docked_mode.get_value();
+        app.lookup_action("toggle_docked_mode").unwrap().activate(None);
+        assert_eq!(dock_calls.get(), 1);
+        // No direct setting mutation: MainWindow owns the full HID transition.
+        assert_eq!(*settings::values().use_docked_mode.get_value(), mode);
         settings::values_mut().gpu_accuracy.set_value(GpuAccuracy::High);
         app.lookup_action("toggle_gpu_accuracy").unwrap().activate(None);
         assert_eq!(*settings::values().gpu_accuracy.get_value(), GpuAccuracy::Low);

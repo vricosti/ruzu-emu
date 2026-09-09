@@ -4032,17 +4032,23 @@ impl GMainWindow {
         else {
             return;
         };
-        let values = common::settings::values();
+        // Snapshot before layout calculation (which reads Settings again) or
+        // GTK calls. A waiting writer can make a recursive RwLock read block.
+        let (docked, up_factor, aspect) = {
+            let values = common::settings::values();
+            (common::settings::is_docked_mode(&values), values.resolution_info.up_factor,
+                *values.aspect_ratio.get_value())
+        };
         let mut height = crate::uisettings::with(|ui| *ui.screenshot_height.get_value());
         if height == 0 {
-            height = if common::settings::is_docked_mode(&values) {
+            height = if docked {
                 screen_docked::HEIGHT
             } else {
                 screen_undocked::HEIGHT
             };
-            height = (height as f32 * values.resolution_info.up_factor) as u32;
+            height = (height as f32 * up_factor) as u32;
         }
-        let width = match *values.aspect_ratio.get_value() {
+        let width = match aspect {
             AspectRatio::R16_9 => height * 16 / 9,
             AspectRatio::R4_3 => height * 4 / 3,
             AspectRatio::R21_9 => height * 21 / 9,
@@ -4077,6 +4083,7 @@ impl GMainWindow {
 
         #[cfg(target_os = "windows")]
         if crate::uisettings::with(|ui| *ui.enable_screenshot_save_as.get_value()) {
+            let generation = self.session_generation.get();
             if !self
                 .session
                 .borrow()
@@ -4101,6 +4108,11 @@ impl GMainWindow {
                     #[weak(rename_to = this)]
                     self,
                     move |file| {
+                        // Unlike Qt's blocking file dialog, GTK can return
+                        // after Stop/reboot. Never resume or capture a new game.
+                        if this.session_generation.get() != generation {
+                            return;
+                        }
                         let resumed = this
                             .session
                             .borrow()

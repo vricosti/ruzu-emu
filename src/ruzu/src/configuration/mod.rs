@@ -10,7 +10,7 @@
 //
 // Upstream files with no counterpart yet (each is a separate dialog reached
 // from a Configure button rather than a tab of the main dialog):
-//   configure_camera, configure_debug_controller,
+//   configure_camera,
 //   configure_ringcon,
 //   configure_touchscreen_advanced, configure_touch_widget.
 //
@@ -23,6 +23,7 @@ pub mod configure_audio;
 pub mod configure_cpu;
 pub mod configure_cpu_debug;
 pub mod configure_debug;
+pub mod configure_debug_controller;
 pub mod configure_debug_tab;
 pub mod configure_dialog;
 pub mod configure_filesystem;

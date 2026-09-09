@@ -23,7 +23,11 @@ const SWATCH_WIDTH: i32 = 70;
 const SWATCH_HEIGHT: i32 = 26;
 
 /// Build the Controls "Advanced" tab — upstream `ConfigureInputAdvanced`.
-pub fn page(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Page {
+pub fn page(
+    input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
+    hid_core: std::sync::Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    profiles: Rc<super::configure_input_player::InputProfileContext>,
+) -> Page {
     let (scroller, column) = w::page();
 
     let split = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -163,7 +167,6 @@ pub fn page(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Page 
     // widgets; log until their matching owners are ported.
     for (button, name) in [
         (&touchscreen.configure, "Touchscreen advanced"),
-        (&debug_controller.configure, "Debug controller"),
         (&ring_controller.configure, "Ring controller"),
         (&infrared.configure, "Infrared camera"),
     ] {
@@ -171,6 +174,12 @@ pub fn page(input_subsystem: Rc<RefCell<input_common::InputSubsystem>>) -> Page 
         let name = name.to_string();
         button.connect_clicked(move |_| {
             log::info!("Controls: {name} configuration not yet ported");
+        });
+    }
+    if let Some(button) = &debug_controller.configure {
+        let input = Rc::clone(&input_subsystem);
+        button.connect_clicked(move |button| {
+            super::configure_debug_controller::present(button, Rc::clone(&input), std::sync::Arc::clone(&hid_core), Rc::clone(&profiles));
         });
     }
     configure_motion_touch.connect_clicked(move |button| {

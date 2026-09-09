@@ -11,6 +11,54 @@ use hid_core::frontend::emulated_controller::{ControllerTriggerType, ControllerU
 use hid_core::hid_core::EmulatedControllerHandle;
 use hid_core::hid_types::{NpadButton, NpadButtonState, HomeButtonState, CaptureButtonState};
 
+/// GTK's native render child routes keys through MainWindow's capture handler,
+/// before application accelerators. Track consumed hardware keys there to
+/// provide QShortcut's auto-repeat contract without repeating guest input.
+#[derive(Default)]
+pub(crate) struct KeyboardShortcutState {
+    held: std::collections::HashSet<u32>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KeyboardShortcutEvent {
+    Unhandled,
+    Suppressed,
+    Activate(&'static str),
+}
+
+impl KeyboardShortcutState {
+    pub(crate) fn press(
+        &mut self, keycode: u32, binding: Option<(&'static str, bool)>,
+    ) -> KeyboardShortcutEvent {
+        let was_held = self.held.contains(&keycode);
+        let Some((action, repeat)) = binding else {
+            return if was_held { KeyboardShortcutEvent::Suppressed } else { KeyboardShortcutEvent::Unhandled };
+        };
+        self.held.insert(keycode);
+        if was_held && !repeat { KeyboardShortcutEvent::Suppressed }
+        else { KeyboardShortcutEvent::Activate(action) }
+    }
+
+    pub(crate) fn release(&mut self, keycode: u32) -> bool { self.held.remove(&keycode) }
+    pub(crate) fn clear(&mut self) { self.held.clear(); }
+}
+
+pub(crate) fn keyboard_binding(
+    app: &gtk::Application, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType,
+) -> Option<(&'static str, bool)> {
+    crate::uisettings::with(|values| {
+        HOTKEY_ACTIONS.iter().find_map(|&(name, action)| {
+            let shortcut = values.shortcuts.iter().find(|shortcut| shortcut.name == name)?;
+            let accelerator = gtk_accelerator_from_native(&shortcut.keyseq)?;
+            let (key, modifiers) = gtk::accelerator_parse(&accelerator)?;
+            let mask = gtk::accelerator_get_default_mod_mask();
+            if key.to_lower() != keyval.to_lower() || modifiers != state & mask { return None; }
+            let target = app.lookup_action(action.strip_prefix("app.")?)?;
+            target.is_enabled().then_some((action, shortcut.repeat))
+        })
+    })
+}
+
 /// ControllerButtonSequence in upstream hotkeys.h.
 #[derive(Default, Clone, Copy)]
 struct ControllerButtonSequence {
@@ -107,28 +155,6 @@ impl Drop for ControllerShortcut {
         self.state.lock().enabled = false;
         self.controller.lock().delete_callback(self.callback_key);
     }
-}
-
-pub fn matches(action: &str, keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
-    let sequence = crate::uisettings::with(|values| {
-        values
-            .shortcuts
-            .iter()
-            .find(|shortcut| shortcut.name == action)
-            .map(|shortcut| shortcut.keyseq.clone())
-    });
-    let Some(accelerator) = sequence.and_then(|value| gtk_accelerator_from_native(&value)) else {
-        return false;
-    };
-    let Some((expected_key, expected_modifiers)) = gtk::accelerator_parse(&accelerator) else {
-        return false;
-    };
-    let modifier_mask = gtk::gdk::ModifierType::SHIFT_MASK
-        | gtk::gdk::ModifierType::CONTROL_MASK
-        | gtk::gdk::ModifierType::ALT_MASK
-        | gtk::gdk::ModifierType::SUPER_MASK
-        | gtk::gdk::ModifierType::META_MASK;
-    expected_key == keyval && expected_modifiers == state & modifier_mask
 }
 
 /// Apply the subset of upstream keyboard hotkeys whose GTK actions are already
@@ -230,6 +256,50 @@ pub(crate) fn gtk_accelerator_from_native(sequence: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_repeat_release_and_focus_lifecycle() {
+        use KeyboardShortcutEvent::*;
+        let mut state = KeyboardShortcutState::default();
+        assert_eq!(state.press(10, None), Unhandled);
+        assert_eq!(state.press(10, Some(("app.pause", false))), Activate("app.pause"));
+        assert_eq!(state.press(10, Some(("app.pause", false))), Suppressed);
+        // A released modifier or disabled/rebound action must not leak the
+        // remainder of a consumed press into the guest.
+        assert_eq!(state.press(10, None), Suppressed);
+        assert!(state.release(10));
+        assert!(!state.release(10));
+        assert_eq!(state.press(10, Some(("app.audio_volume_up", true))), Activate("app.audio_volume_up"));
+        assert_eq!(state.press(10, Some(("app.audio_volume_up", true))), Activate("app.audio_volume_up"));
+        state.clear();
+        assert!(!state.release(10));
+        assert_eq!(state.press(10, Some(("app.pause", false))), Activate("app.pause"));
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; run in an isolated process"]
+    fn keyboard_lookup_honors_binding_repeat_and_action_enabled() {
+        gtk::init().unwrap();
+        let app = gtk::Application::builder().application_id("org.ruzu.KeyboardRoutingTest").build();
+        let action = gtk::gio::SimpleAction::new("audio_volume_up", None);
+        app.add_action(&action);
+        let original = crate::uisettings::with(|values| values.shortcuts.clone());
+        crate::uisettings::with_mut(|values| {
+            values.shortcuts.retain(|shortcut| shortcut.name == "Audio Volume Up");
+            values.shortcuts[0].keyseq = "Ctrl+Shift+M".into();
+            values.shortcuts[0].repeat = true;
+        });
+        let mods = gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK;
+        assert_eq!(keyboard_binding(&app, gtk::gdk::Key::M, mods), Some(("app.audio_volume_up", true)));
+        action.set_enabled(false);
+        assert_eq!(keyboard_binding(&app, gtk::gdk::Key::M, mods), None);
+        action.set_enabled(true);
+        crate::uisettings::with_mut(|values| { values.shortcuts[0].repeat = false; });
+        assert_eq!(keyboard_binding(&app, gtk::gdk::Key::M, mods), Some(("app.audio_volume_up", false)));
+        crate::uisettings::with_mut(|values| { values.shortcuts[0].keyseq.clear(); });
+        assert_eq!(keyboard_binding(&app, gtk::gdk::Key::M, mods), None);
+        crate::uisettings::with_mut(|values| values.shortcuts = original);
+    }
 
     #[test]
     fn controller_sequences_and_latch_follow_upstream() {

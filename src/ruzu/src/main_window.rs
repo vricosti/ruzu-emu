@@ -289,19 +289,6 @@ fn fullscreen_hotkey(keyval: gtk::gdk::Key) -> Option<FullscreenHotkey> {
     }
 }
 
-fn configured_fullscreen_hotkey(
-    keyval: gtk::gdk::Key,
-    state: gtk::gdk::ModifierType,
-) -> Option<FullscreenHotkey> {
-    if crate::hotkeys::matches("Fullscreen", keyval, state) {
-        Some(FullscreenHotkey::Toggle)
-    } else if crate::hotkeys::matches("Exit Fullscreen", keyval, state) {
-        Some(FullscreenHotkey::Exit)
-    } else {
-        None
-    }
-}
-
 /// Upstream `MainWindow::UsingExclusiveFullscreen`.
 fn uses_exclusive_fullscreen(mode: FullscreenMode, is_wayland: bool) -> bool {
     mode == FullscreenMode::Exclusive || is_wayland
@@ -2179,11 +2166,15 @@ impl GMainWindow {
     /// preserving them keeps imported bindings and newly captured bindings in
     /// the same key space.
     fn install_input_handlers(self: &Rc<Self>) {
+        let shortcut_state = Rc::new(RefCell::new(crate::hotkeys::KeyboardShortcutState::default()));
         let focus = gtk::EventControllerFocus::new();
         focus.connect_leave(glib::clone!(
+            #[strong]
+            shortcut_state,
             #[weak(rename_to = this)]
             self,
             move |_| {
+                shortcut_state.borrow_mut().clear();
                 this.release_all_input();
             }
         ));
@@ -2195,32 +2186,25 @@ impl GMainWindow {
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
 
         keys.connect_key_pressed(glib::clone!(
+            #[strong]
+            shortcut_state,
             #[weak(rename_to = this)]
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |_, keyval, _keycode, state| {
-                if this.session.borrow().is_some() {
-                    if crate::hotkeys::matches("Continue/Pause Emulation", keyval, state) {
-                        this.on_pause_continue_game();
-                        return glib::Propagation::Stop;
-                    }
-                    if crate::hotkeys::matches("Stop Emulation", keyval, state) {
-                        this.on_stop_game();
-                        return glib::Propagation::Stop;
-                    }
-                    if crate::hotkeys::matches("Restart Emulation", keyval, state) {
-                        this.on_restart_game();
-                        return glib::Propagation::Stop;
-                    }
-                    if let Some(hotkey) = configured_fullscreen_hotkey(keyval, state) {
-                        if let Some(app) = this.window.application() {
-                            match hotkey {
-                                FullscreenHotkey::Toggle => this.toggle_fullscreen(&app),
-                                FullscreenHotkey::Exit => this.exit_fullscreen(&app),
-                            }
+            move |_, keyval, keycode, state| {
+                if let Some(app) = this.window.application() {
+                    let binding = crate::hotkeys::keyboard_binding(&app, keyval, state);
+                    let event = shortcut_state.borrow_mut().press(keycode, binding);
+                    match event {
+                        crate::hotkeys::KeyboardShortcutEvent::Activate(action) => {
+                            // Release the state borrow before callbacks can open
+                            // dialogs, lose focus or stop the current session.
+                            gio::prelude::ActionGroupExt::activate_action(&app, action.strip_prefix("app.").unwrap(), None);
+                            return glib::Propagation::Stop;
                         }
-                        return glib::Propagation::Stop;
+                        crate::hotkeys::KeyboardShortcutEvent::Suppressed => return glib::Propagation::Stop,
+                        crate::hotkeys::KeyboardShortcutEvent::Unhandled => {}
                     }
                 }
 
@@ -2249,15 +2233,12 @@ impl GMainWindow {
             }
         ));
         keys.connect_key_released(glib::clone!(
+            #[strong]
+            shortcut_state,
             #[weak(rename_to = this)]
             self,
-            move |_, keyval, _keycode, state| {
-                if this.session.borrow().is_some()
-                    && (crate::hotkeys::matches("Continue/Pause Emulation", keyval, state)
-                        || crate::hotkeys::matches("Stop Emulation", keyval, state)
-                        || crate::hotkeys::matches("Restart Emulation", keyval, state)
-                        || configured_fullscreen_hotkey(keyval, state).is_some())
-                {
+            move |_, keyval, keycode, state| {
+                if shortcut_state.borrow_mut().release(keycode) {
                     return;
                 }
                 if this.session.borrow().is_none()

@@ -698,9 +698,28 @@ mod tests {
 
     #[test]
     fn test_get_device_nick_name() {
+        const CHILD: &str = "RUZU_TEST_DEVICE_NICKNAME";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::service::set::settings_server::tests::test_get_device_nick_name"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
         let server = ISettingsServer::new();
-        let name = server.get_device_nick_name();
-        assert_eq!(&name[..4], b"yuzu");
-        assert_eq!(name[4], 0);
+        for configured in [
+            "Homebrew console".to_owned(),
+            String::new(),
+            "x".repeat(128),
+            format!("{}é", "x".repeat(127)),
+            "界".repeat(100),
+        ] {
+            common::settings::values_mut().device_name.set_value(configured.clone());
+            let name = server.get_device_nick_name();
+            // Upstream copies min(size, 0x80) bytes, even when the boundary
+            // splits UTF-8. No extra NUL is inserted into a full payload.
+            let length = configured.len().min(0x80);
+            assert_eq!(&name[..length], &configured.as_bytes()[..length]);
+            assert!(name[length..].iter().all(|&byte| byte == 0));
+        }
     }
 }

@@ -2555,6 +2555,29 @@ mod tests {
     }
 
     #[test]
+    fn device_name_survives_ini_serialization_and_system_readback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.ini");
+        for name in ["", "Homebrew console", "Console été 界", "name=custom;value"] {
+            let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+            config.set_up_ini(&path);
+            config.begin_group("System");
+            let mut source = common::settings::Values::default();
+            source.device_name.set_value(name.to_owned());
+            config.write_setting_generic(&mut source.device_name);
+            config.end_group();
+            config.write_to_ini().unwrap();
+
+            let mut loaded_config = BaseConfig::new(ConfigType::GlobalConfig);
+            loaded_config.set_up_ini(&path);
+            loaded_config.begin_group("System");
+            let mut loaded = common::settings::Values::default();
+            loaded_config.read_system_values_into(&mut loaded);
+            assert_eq!(loaded.device_name.get_value(), name);
+        }
+    }
+
+    #[test]
     fn audio_command_dump_is_session_only_and_ignores_old_ini_values() {
         let mut config = BaseConfig::new(ConfigType::GlobalConfig);
         config.begin_group("Audio");

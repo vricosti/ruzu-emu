@@ -96,6 +96,7 @@ pub struct ConfigureDialog {
     /// configuration synchronously, before its page widgets are destroyed.
     input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    hotkey_capture: Rc<configure_hotkeys::ControllerCapture>,
     /// Index of the section currently shown in the notebook, so a re-selection
     /// of the same row doesn't rebuild the tabs (which would reset the tab
     /// position, unlike upstream's `QSignalBlocker`-guarded rebuild).
@@ -153,13 +154,14 @@ impl ConfigureDialog {
             }
         };
 
+        let (hotkeys_page, hotkey_capture) = configure_hotkeys::page(&hid_core);
         // Upstream `PopulateSelectionList`'s six rows, in order.
         let sections = vec![
             Section {
                 name: "General",
                 pages: vec![
                     configure_general::page(runtime_lock, reset_callback),
-                    configure_hotkeys::page(),
+                    hotkeys_page,
                     configure_ui::page(),
                     configure_web::page(),
                     configure_debug_tab::page(runtime_lock),
@@ -260,6 +262,7 @@ impl ConfigureDialog {
         window.set_child(Some(&root));
 
         let this = Rc::new(Self {
+            hotkey_capture,
             window,
             notebook,
             sections: Rc::new(sections),
@@ -385,7 +388,9 @@ impl ConfigureDialog {
     pub fn connect_closed(&self, callback: impl Fn() + 'static) {
         let input_subsystem = Rc::clone(&self.input_subsystem);
         let hid_core = Arc::clone(&self.hid_core);
+        let hotkey_capture = Rc::clone(&self.hotkey_capture);
         self.window.connect_close_request(move |_| {
+            hotkey_capture.cancel();
             finish_input_configuration(&input_subsystem, &hid_core);
             callback();
             glib::Propagation::Proceed

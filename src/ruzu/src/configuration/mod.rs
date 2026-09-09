@@ -32,6 +32,7 @@ pub mod configure_graphics_advanced;
 pub mod configure_graphics_extensions;
 pub mod configure_hotkeys;
 pub mod configure_input;
+pub mod configure_debug_controller;
 pub mod configure_input_advanced;
 pub mod configure_input_per_game;
 pub mod configure_input_player;

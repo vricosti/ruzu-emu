@@ -261,6 +261,7 @@ fn group_titles(layout: ControllerType) -> &'static [(&'static str, &'static str
 /// pointers); the page is built by a free function here, so the handles are
 /// collected in one struct instead.
 struct PlayerPage {
+    debug: Cell<bool>,
     /// The working copy of the player's configuration. Upstream mutates the
     /// `EmulatedController` directly and only writes it back in `ApplyConfiguration`.
     state: Rc<RefCell<PlayerInput>>,
@@ -343,6 +344,7 @@ enum CaptureTarget {
 impl PlayerPage {
     fn new(state: Rc<RefCell<PlayerInput>>) -> Rc<Self> {
         Rc::new(Self {
+            debug: Cell::new(false),
             state,
             button_widgets: RefCell::new(Vec::new()),
             analog_widgets: RefCell::new(Vec::new()),
@@ -746,6 +748,7 @@ impl PlayerPage {
     /// The decisions themselves live in the free functions below so they can be
     /// checked without a display.
     fn update_controller_layout(&self, layout: ControllerType) {
+        let layout = if self.debug.get() { ControllerType::ProController } else { layout };
         let groups = self.groups.borrow();
 
         // `layout_show`: upstream un-hides everything, then applies the
@@ -776,13 +779,20 @@ impl PlayerPage {
         // `UpdateMotionButtons`.
         let (motion_1, motion_2) = motion_visibility(layout);
         if let Some(widget) = groups.get("motion_1") {
-            widget.set_visible(motion_1);
+            widget.set_visible(motion_1 && !self.debug.get());
         }
         if let Some(widget) = groups.get("motion_2") {
-            widget.set_visible(motion_2);
+            widget.set_visible(motion_2 && !self.debug.get());
         }
 
         // `UpdateControllerButtonNames`.
+        if self.debug.get() {
+            for (index, button) in self.button_widgets.borrow().iter() {
+                if *index == native_button::Values::Home as usize || *index == native_button::Values::Screenshot as usize {
+                    button.set_sensitive(false);
+                }
+            }
+        }
         let titles = self.titles.borrow();
         for (key, text) in group_titles(layout) {
             if let Some(label) = titles.get(key) {
@@ -812,6 +822,7 @@ pub fn page(
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     profile_context: Rc<InputProfileContext>,
     global: Option<&super::configure_input::GlobalInputSettings>,
+    debug: bool,
 ) -> Page {
     let (controller, mut configuration_controllers) = {
         let hid_core = hid_core.lock();
@@ -854,6 +865,7 @@ pub fn page(
         hid_core::hid_util::npad_id_type_to_index(controller.lock().get_npad_id_type());
     let state = Rc::new(RefCell::new(player_input(controller_settings_index)));
     let page = PlayerPage::new(Rc::clone(&state));
+    page.debug.set(debug);
 
     // Upstream's `ConfigureInputPlayer` holds the player's
     // `Core::HID::EmulatedController` and hands it to the preview with
@@ -868,11 +880,13 @@ pub fn page(
     let enable_all = *common::settings::values()
         .enable_all_controllers
         .get_value();
-    let controller_types = Rc::new(set_connectable_controllers(
+    let controller_types = Rc::new(if debug {
+        vec![(ControllerType::ProController, "Pro Controller")]
+    } else { set_connectable_controllers(
         supported_styles,
         index,
         enable_all,
-    ));
+    ) });
 
     install_group_style();
 
@@ -888,12 +902,14 @@ pub fn page(
     let connect_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let connected = gtk::CheckButton::with_label("Connect Controller");
     connected.set_active(state.borrow().connected);
+    connected.set_visible(index != 9 && !debug);
     let type_labels: Vec<&str> = controller_types.iter().map(|(_, l)| *l).collect();
     let controller_type = w::combo(&type_labels, 0);
     controller_type.set_selected(get_index_from_controller_type(
         &controller_types,
         initial_type,
     ));
+    if debug { controller_type.set_selected(0); }
     connect_box.append(&connected);
     connect_box.append(&controller_type);
     header.append(&connect_box);
@@ -1503,7 +1519,9 @@ pub fn page(
             .unwrap_or(ControllerType::ProController);
 
         page_owner.refresh_devices();
-        if let Some(controller) = page_owner.controller.borrow().as_ref() {
+        // The debug dialog's connection group is not checkable upstream;
+        // its fixed layout selector must not overwrite the controller state.
+        if let Some(controller) = page_owner.controller.borrow().as_ref().filter(|_| !debug) {
             let mut controller = controller.lock();
             controller.set_npad_style_index(
                 hid_core::frontend::emulated_controller::EmulatedController::map_settings_type_to_npad(
@@ -2483,6 +2501,42 @@ fn face_buttons_group(page: &Rc<PlayerPage>) -> gtk::Box {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn debug_page_restricts_bindings_and_releases_configuration_mode() {
+        use super::*;
+        gtk::init().unwrap();
+        let state = PlayerPage::new(Rc::new(RefCell::new(PlayerInput::default())));
+        state.debug.set(true);
+        let motion1 = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let motion2 = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        state.register_group("motion_1", &motion1);
+        state.register_group("motion_2", &motion2);
+        let home = gtk::Button::new();
+        let capture = gtk::Button::new();
+        state.button_widgets.borrow_mut().extend([
+            (native_button::Values::Home as usize, home.clone()),
+            (native_button::Values::Screenshot as usize, capture.clone()),
+        ]);
+        for kind in [ControllerType::ProController, ControllerType::DualJoyconDetached] {
+            state.update_controller_layout(kind);
+            assert!(!motion1.is_visible());
+            assert!(!motion2.is_visible());
+            assert!(!home.is_sensitive());
+            assert!(!capture.is_sensitive());
+        }
+        let hid = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        let other = hid.lock().get_emulated_controller_by_index(9);
+        let input = Rc::new(RefCell::new(input_common::InputSubsystem::new()));
+        let profiles = Rc::new(InputProfileContext::new(InputProfiles::new()));
+        for apply in [false, true, false] {
+            let page = page(9, Rc::clone(&input), Arc::clone(&hid), Rc::clone(&profiles), None, true);
+            assert!(other.lock().is_configuring_mode());
+            if apply { (page.apply)(); }
+            drop(page);
+            assert!(!other.lock().is_configuring_mode());
+        }
+    }
     use super::*;
 
     #[test]

@@ -27,6 +27,7 @@ const SWATCH_HEIGHT: i32 = 26;
 pub fn page(
     input_subsystem: Rc<RefCell<input_common::InputSubsystem>>,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
+    profiles: Rc<super::configure_input_player::InputProfileContext>,
 ) -> Page {
     let (scroller, column) = w::page();
 
@@ -176,7 +177,6 @@ pub fn page(
     // The remaining per-device Configure dialogs are separate upstream
     // widgets; log until their matching owners are ported.
     for (button, name) in [
-        (&debug_controller.configure, "Debug controller"),
         (&ring_controller.configure, "Ring controller"),
         (&infrared.configure, "Infrared camera"),
     ] {
@@ -184,6 +184,13 @@ pub fn page(
         let name = name.to_string();
         button.connect_clicked(move |_| {
             log::info!("Controls: {name} configuration not yet ported");
+        });
+    }
+    if let Some(button) = &debug_controller.configure {
+        let input = Rc::clone(&input_subsystem);
+        let hid = Arc::clone(&hid_core);
+        button.connect_clicked(move |button| {
+            super::configure_debug_controller::present(button, Rc::clone(&input), Arc::clone(&hid), Rc::clone(&profiles));
         });
     }
     configure_motion_touch.connect_clicked(move |button| {
@@ -371,6 +378,12 @@ fn player_input(index: usize) -> PlayerInput {
 mod tests {
     use super::*;
 
+    fn page(input: Rc<RefCell<input_common::InputSubsystem>>, hid: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>) -> Page {
+        super::page(input, hid, Rc::new(super::super::configure_input_player::InputProfileContext::new(
+            super::super::input_profiles::InputProfiles::new(),
+        )))
+    }
+
     #[test]
     #[ignore = "requires a GTK display; run alone with --ignored"]
     fn raw_input_checkbox_loads_applies_and_has_platform_visibility() {
@@ -447,7 +460,7 @@ mod tests {
         buttons[0].set_rgba(&rgba_from_u32(0));
         drop(page);
         assert_eq!(player_input(0).body_color_left, 0xFF123400);
-        let reopened = super::page(input, hid);
+        let reopened = self::page(input, hid);
         let mut restored = Vec::new();
         collect(&reopened.widget, &mut restored);
         assert_eq!(rgb_from_rgba(&restored[0].rgba()), 0xFF123400);

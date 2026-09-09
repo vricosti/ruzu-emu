@@ -70,6 +70,7 @@ pub struct ConfigurePerGame {
     config: RefCell<BaseConfig>,
     config_path: PathBuf,
     finalized: Cell<bool>,
+    running: bool,
 }
 
 impl ConfigurePerGame {
@@ -158,6 +159,7 @@ impl ConfigurePerGame {
             config: RefCell::new(config),
             config_path,
             finalized: Cell::new(false),
+            running: !runtime_lock,
         });
 
         cancel.connect_clicked(glib::clone!(
@@ -259,10 +261,18 @@ impl ConfigurePerGame {
         }
         {
             let mut values = common::settings::values_mut();
-            common::settings::restore_global_state(&mut values, false);
-            values.players.set_global(true);
+            restore_settings_selection(&mut values, self.running);
         }
         common::settings::set_configuring_global(true);
+    }
+}
+
+/// OpenPerGameConfiguration preserves the active per-game bank while powered
+/// on. The GTK dialog owns this close edge instead of a synchronous exec caller.
+fn restore_settings_selection(values: &mut common::settings::Values, running: bool) {
+    common::settings::restore_global_state(values, running);
+    if !running {
+        values.players.set_global(true);
     }
 }
 
@@ -440,6 +450,23 @@ fn info_panel(properties: &GameProperties) -> gtk::Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_running_properties_keeps_active_custom_settings() {
+        let mut values = common::settings::Values::default();
+        values.volume.set_value(80);
+        values.volume.set_global(false);
+        values.volume.set_value(25);
+        values.players.set_global(false);
+        restore_settings_selection(&mut values, true);
+        assert_eq!(*values.volume.get_value(), 25);
+        assert!(!values.volume.using_global());
+        assert!(!values.players.using_global());
+        restore_settings_selection(&mut values, false);
+        assert_eq!(*values.volume.get_value(), 80);
+        assert!(values.volume.using_global());
+        assert!(values.players.using_global());
+    }
 
     #[test]
     fn custom_config_uses_title_id_or_filename_like_upstream() {

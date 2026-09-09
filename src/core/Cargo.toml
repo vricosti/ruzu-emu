@@ -44,6 +44,7 @@ winapi = { version = "0.3", features = [
     "iphlpapi",
     "ipifcons",
     "iptypes",
+    "libloaderapi",
     "memoryapi",
     "netioapi",
     "winerror",

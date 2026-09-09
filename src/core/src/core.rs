@@ -1102,6 +1102,9 @@ pub struct System {
     /// Shared HLE service registry.
     service_manager: Option<Arc<std::sync::Mutex<ServiceManager>>>,
 
+    /// Upstream System::Impl::renderdoc_api; initialized only when enabled.
+    renderdoc_api: Option<crate::tools::renderdoc::RenderdocApi>,
+
     /// Applet manager used to register frontend-launched applets with AM.
     applet_manager: AppletManager,
 
@@ -1311,6 +1314,7 @@ impl System {
             gpu_core: None,
             audio_core: None,
             service_manager: None,
+            renderdoc_api: None,
             applet_manager: AppletManager::new(),
             apm_controller: Arc::new(StdMutex::new(ApmController::new())),
             arp_manager: Arc::new(StdMutex::new(ARPManager::new())),
@@ -1654,6 +1658,9 @@ impl System {
         self.is_powered_on.store(true, Ordering::Relaxed);
         self.exit_locked.store(false, Ordering::Release);
         self.exit_requested.store(false, Ordering::Release);
+
+        self.renderdoc_api = (*common::settings::values().enable_renderdoc_hotkey.get_value())
+            .then(crate::tools::renderdoc::RenderdocApi::new);
 
         log::info!("System: application process setup complete (services created)");
         Ok(())
@@ -2203,6 +2210,12 @@ impl System {
     /// Check if the system is powered on (all subsystems initialized and able to run).
     pub fn is_powered_on(&self) -> bool {
         self.is_powered_on.load(Ordering::Relaxed)
+    }
+
+    /// Upstream System::GetRenderdocAPI. Unlike dereferencing an empty C++
+    /// optional, callers can safely ignore requests outside an enabled session.
+    pub fn get_renderdoc_api(&mut self) -> Option<&mut crate::tools::renderdoc::RenderdocApi> {
+        self.renderdoc_api.as_mut()
     }
 
     /// Get the telemetry session.

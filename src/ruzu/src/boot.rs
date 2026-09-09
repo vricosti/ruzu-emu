@@ -70,6 +70,7 @@ impl Default for BootParameters {
 }
 
 enum EmulationCommand {
+    ToggleRenderdocCapture,
     Stop,
     ForceStop,
     Pause(SyncSender<()>),
@@ -299,6 +300,13 @@ impl EmulationSession {
         self.command_tx.as_ref().is_some_and(|tx| {
             tx.send(EmulationCommand::CaptureScreenshot { path, layout })
                 .is_ok()
+        })
+    }
+
+    /// Marshal the upstream frontend API call to the System-owning thread.
+    pub fn toggle_renderdoc_capture(&self) -> bool {
+        self.command_tx.as_ref().is_some_and(|tx| {
+            tx.send(EmulationCommand::ToggleRenderdocCapture).is_ok()
         })
     }
 
@@ -995,6 +1003,13 @@ fn run_boot(
             Ok(EmulationCommand::CaptureScreenshot { path, layout }) => {
                 request_screenshot(&system, path, layout);
             }
+            Ok(EmulationCommand::ToggleRenderdocCapture) => {
+                if *common::settings::values().enable_renderdoc_hotkey.get_value() {
+                    if let Some(api) = system.get_renderdoc_api() {
+                        api.toggle_capture();
+                    }
+                }
+            }
             Ok(EmulationCommand::Pause(completed)) => {
                 system.pause();
                 let _ = completed.send(());
@@ -1349,6 +1364,29 @@ mod tests {
         assert!(frontend_stop_requested.load(Ordering::Acquire));
         assert!(matches!(command_rx.recv(), Ok(EmulationCommand::ForceStop)));
         assert!(!session.request_force_stop());
+    }
+
+    #[test]
+    fn renderdoc_requests_are_marshaled_and_rejected_after_stop() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let mut session = EmulationSession {
+            command_tx: Some(command_tx),
+            join: None,
+            perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
+            shaders_building: Arc::new(AtomicI32::new(0)),
+            running: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            program_id: Arc::new(AtomicU64::new(0)),
+            exit_locked: Arc::new(AtomicBool::new(false)),
+            frontend_stop_requested: Arc::new(AtomicBool::new(false)),
+        };
+        for _ in 0..2 {
+            assert!(session.toggle_renderdoc_capture());
+            assert!(matches!(command_rx.recv(), Ok(EmulationCommand::ToggleRenderdocCapture)));
+        }
+        assert!(session.request_stop());
+        assert!(matches!(command_rx.recv(), Ok(EmulationCommand::Stop)));
+        assert!(!session.toggle_renderdoc_capture());
     }
 
     #[test]

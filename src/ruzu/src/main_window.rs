@@ -1659,6 +1659,20 @@ impl GMainWindow {
         ));
         app.add_action(&load_file);
 
+        let renderdoc = gio::SimpleAction::new("renderdoc_capture", None);
+        renderdoc.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, _| {
+                if *common::settings::values().enable_renderdoc_hotkey.get_value() {
+                    if let Some(session) = this.session.borrow().as_ref() {
+                        session.toggle_renderdoc_capture();
+                    }
+                }
+            }
+        ));
+        app.add_action(&renderdoc);
+
         let load_folder = gio::SimpleAction::new("load_folder", None);
         load_folder.connect_activate(glib::clone!(
             #[weak(rename_to = this)]

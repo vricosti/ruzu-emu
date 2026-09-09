@@ -42,6 +42,7 @@ pub fn apply_accelerators(app: &gtk::Application) {
         ("Configure", "app.configure"),
         ("Toggle Filter Bar", "app.show_filter_bar"),
         ("Toggle Status Bar", "app.show_status_bar"),
+        ("Toggle Renderdoc Capture", "app.renderdoc_capture"),
         ("Exit ruzu", "app.quit"),
     ] {
         let accelerator = crate::uisettings::with(|values| {
@@ -81,6 +82,11 @@ fn gtk_accelerator_from_native(sequence: &str) -> Option<String> {
         .to_owned();
     accelerator.push_str(match normalized_key.as_str() {
         "Esc" => "Escape",
+        // QKeySequence uses punctuation; GTK expects the GDK key name.
+        "," => "comma",
+        "." => "period",
+        "-" => "minus",
+        "=" => "equal",
         // `gtk_accelerator_get_label` renders keypad operators as localized
         // display labels such as `KP -`, while `gtk_accelerator_parse` accepts
         // their stable GDK key names. Preserve the native label in the config
@@ -100,7 +106,33 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires GTK display; run in an isolated process"]
+    fn renderdoc_accelerator_is_installed_rebound_and_removed() {
+        gtk::init().unwrap();
+        for sequence in ["Ctrl+,", "Ctrl+."] {
+            assert!(gtk::accelerator_parse(&gtk_accelerator_from_native(sequence).unwrap()).is_some());
+        }
+        let app = gtk::Application::builder()
+            .application_id("org.ruzu.RenderdocHotkeyTest")
+            .build();
+        let original = crate::uisettings::with(|values| values.shortcuts.clone());
+        for (sequence, expected) in [("F7", vec!["F7"]), ("F8", vec!["F8"]), ("", vec![])] {
+            crate::uisettings::with_mut(|values| {
+                values.shortcuts.iter_mut()
+                    .find(|shortcut| shortcut.name == "Toggle Renderdoc Capture")
+                    .unwrap().keyseq = sequence.to_owned();
+            });
+            apply_accelerators(&app);
+            assert_eq!(app.accels_for_action("app.renderdoc_capture"), expected);
+        }
+        crate::uisettings::with_mut(|values| values.shortcuts = original);
+    }
+
+    #[test]
     fn converts_native_shortcut_labels_to_gtk_accelerators() {
+        for (native, gtk_key) in [("Ctrl+,", "<Control>comma"), ("Ctrl+.", "<Control>period")] {
+            assert_eq!(gtk_accelerator_from_native(native).as_deref(), Some(gtk_key));
+        }
         assert_eq!(
             gtk_accelerator_from_native("Ctrl+Shift+F4").as_deref(),
             Some("<Control><Shift>F4")

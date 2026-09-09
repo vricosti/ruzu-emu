@@ -11,6 +11,8 @@
 // `ConfigureUi::InitializeIconSizeComboBox` / `InitializeRowComboBoxes`.
 
 use gtk::prelude::*;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use crate::uisettings;
 
@@ -33,6 +35,66 @@ const FOLDER_ICON_SIZES: &[(u32, &str)] = &[
     (48, "Standard (48x48)"),
     (72, "Large (72x72)"),
 ];
+
+/// ConfigureUi's two row combo boxes. Item IDs are independent of filtered
+/// positions, equivalent to QComboBox itemData. Unlike upstream's rebuild via
+/// findData(currentData()) (an index), preserve the actual ID across updates.
+struct RowTextChoices {
+    first: gtk::DropDown,
+    second: gtk::DropDown,
+    first_ids: RefCell<Vec<u8>>,
+    second_ids: RefCell<Vec<u8>>,
+    updating: Cell<bool>,
+}
+
+fn row_text_ids(first: bool, other: Option<u8>) -> Vec<u8> {
+    (0..uisettings::GAME_LIST_ROW_TEXT.len() as u8)
+        .filter(|id| (!first || *id != 4) && Some(*id) != other)
+        .collect()
+}
+
+impl RowTextChoices {
+    fn selected(&self, first: bool) -> Option<u8> {
+        let (combo, ids) = if first { (&self.first, &self.first_ids) }
+            else { (&self.second, &self.second_ids) };
+        ids.borrow().get(combo.selected() as usize).copied()
+    }
+
+    fn update_row_combo(&self, first: bool, selected: u8, other: Option<u8>) {
+        let ids = row_text_ids(first, other);
+        let position = ids.iter().position(|id| *id == selected).unwrap_or(0) as u32;
+        let labels: Vec<String> = ids.iter().map(|id|
+            crate::i18n::tr(uisettings::GAME_LIST_ROW_TEXT[*id as usize])).collect();
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let (combo, stored) = if first { (&self.first, &self.first_ids) }
+            else { (&self.second, &self.second_ids) };
+        *stored.borrow_mut() = ids;
+        combo.set_model(Some(&gtk::StringList::new(&refs)));
+        combo.set_selected(position);
+    }
+
+    fn initialize(first: gtk::DropDown, second: gtk::DropDown, first_id: u8, second_id: u8) -> Rc<Self> {
+        let choices = Rc::new(Self { first, second, first_ids: RefCell::new(Vec::new()),
+            second_ids: RefCell::new(Vec::new()), updating: Cell::new(true) });
+        choices.update_row_combo(true, first_id, None);
+        choices.update_row_combo(false, second_id, choices.selected(true));
+        choices.update_row_combo(true, choices.selected(true).unwrap(), choices.selected(false));
+        choices.updating.set(false);
+        for first_changed in [true, false] {
+            let combo = if first_changed { &choices.first } else { &choices.second };
+            let weak = Rc::downgrade(&choices);
+            combo.connect_selected_notify(move |_| {
+                let Some(choices) = weak.upgrade() else { return; };
+                if choices.updating.get() || crate::i18n::is_retranslating() { return; }
+                let Some(selected) = choices.selected(!first_changed) else { return; };
+                choices.updating.set(true);
+                choices.update_row_combo(!first_changed, selected, choices.selected(first_changed));
+                choices.updating.set(false);
+            });
+        }
+        choices
+    }
+}
 
 /// PopulateResolutionComboBox: both console heights at every supported scale.
 fn screenshot_resolutions() -> Vec<u32> {
@@ -154,6 +216,7 @@ pub fn page() -> Page {
     let row_2_index = uisettings::with(|v| *v.row_2_text_id.get_value() as u32);
     let (row_2_row, row_2) = w::combo_row("Row 2 Text:", row_text, row_2_index);
     game_list.append(&row_2_row);
+    let row_choices = RowTextChoices::initialize(row_1, row_2, row_1_index as u8, row_2_index as u8);
 
     column.append(&game_list_group);
 
@@ -233,8 +296,8 @@ pub fn page() -> Page {
         let play_time = show_play_time.is_active();
         let ask_where = save_as.is_active();
         let path = path_entry.text().to_string();
-        let row_1_id = row_1.selected() as u8;
-        let row_2_id = row_2.selected() as u8;
+        let row_1_id = row_choices.selected(true).expect("first row always has choices");
+        let row_2_id = row_choices.selected(false).expect("second row always has choices");
 
         uisettings::with_mut(|v| {
             v.theme.set_value(theme_name);
@@ -279,6 +342,102 @@ fn value_at(table: &[(u32, &str)], index: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires GTK display and isolated XDG directories; run alone"]
+    fn ui_page_applies_row_ids_after_language_changes() {
+        use gtk::prelude::*;
+        fn find_row(widget: &gtk::Widget, label: &str) -> Option<gtk::DropDown> {
+            if let Some(first) = widget.first_child() {
+                if first.downcast_ref::<gtk::Label>().is_some_and(|text| text.label() == label) {
+                    if let Some(combo) = first.next_sibling().and_downcast::<gtk::DropDown>() {
+                        return Some(combo);
+                    }
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if let Some(combo) = find_row(&current, label) { return Some(combo); }
+                child = current.next_sibling();
+            }
+            None
+        }
+        gtk::init().unwrap();
+        crate::i18n::set_language("en");
+        crate::uisettings::with_mut(|v| {
+            v.language.set_value("en".into());
+            v.row_1_text_id.set_value(3);
+            v.row_2_text_id.set_value(2);
+        });
+        let page = super::page();
+        let first = find_row(&page.widget, "Row 1 Text:").unwrap();
+        let second = find_row(&page.widget, "Row 2 Text:").unwrap();
+        // ID 3 is at index 2 in the first filtered dropdown.
+        assert_eq!(first.selected(), 2);
+        second.set_selected(0); // Filename, ID 0.
+        for locale in ["fr", "de", "en"] {
+            crate::i18n::set_language(locale);
+            crate::i18n::translate_widget_tree(&page.widget);
+            (page.apply)();
+            crate::uisettings::with(|v| {
+                assert_eq!(*v.row_1_text_id.get_value(), 3);
+                assert_eq!(*v.row_2_text_id.get_value(), 0);
+            });
+        }
+        crate::configuration::qt_config::save_view_values().unwrap();
+        crate::uisettings::with_mut(|v| {
+            v.row_1_text_id.set_value(1);
+            v.row_2_text_id.set_value(4);
+        });
+        crate::configuration::qt_config::load_view_values();
+        crate::uisettings::with(|v| {
+            assert_eq!(*v.row_1_text_id.get_value(), 3);
+            assert_eq!(*v.row_2_text_id.get_value(), 0);
+        });
+    }
+
+    #[test]
+    fn row_choices_exclude_duplicates_and_none_only_from_first() {
+        for other in 0..5 {
+            let first = super::row_text_ids(true, Some(other));
+            let second = super::row_text_ids(false, Some(other));
+            assert!(!first.contains(&other));
+            assert!(!first.contains(&4));
+            assert!(!second.contains(&other));
+            assert_eq!(second.contains(&4), other != 4);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; run alone"]
+    fn filtered_row_choices_keep_semantic_ids_after_repeated_updates() {
+        use gtk::prelude::*;
+        gtk::init().unwrap();
+        let choices = super::RowTextChoices::initialize(
+            gtk::DropDown::from_strings(&[]), gtk::DropDown::from_strings(&[]), 3, 2);
+        assert_eq!(choices.selected(true), Some(3));
+        for id in [0, 1, 2, 4, 0, 1] {
+            let position = choices.second_ids.borrow().iter().position(|entry| *entry == id).unwrap();
+            choices.second.set_selected(position as u32);
+            assert_eq!(choices.selected(false), Some(id));
+            assert_eq!(choices.selected(true), Some(3), "other row must retain its ID");
+            assert!(!choices.first_ids.borrow().contains(&id));
+        }
+        for id in [0, 2, 3, 0] {
+            let position = choices.first_ids.borrow().iter().position(|entry| *entry == id).unwrap();
+            choices.first.set_selected(position as u32);
+            assert_eq!(choices.selected(true), Some(id));
+            assert_eq!(choices.selected(false), Some(1));
+            assert!(!choices.second_ids.borrow().contains(&id));
+        }
+        // Old files could select None on the first row or duplicate IDs.
+        for (first, second) in [(4, 4), (3, 3), (255, 255)] {
+            let choices = super::RowTextChoices::initialize(
+                gtk::DropDown::from_strings(&[]), gtk::DropDown::from_strings(&[]), first, second);
+            assert!(choices.selected(true).unwrap() < 4);
+            assert_ne!(choices.selected(true), choices.selected(false));
+        }
+    }
+
     use super::*;
 
     #[test]

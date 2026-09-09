@@ -725,8 +725,6 @@ impl ResourceManager {
 
         let hc_guard = hid_core.lock();
         let devices = hc_guard.get_emulated_devices();
-        let mouse_enabled = false;
-        let keyboard_enabled = false;
 
         // mouse->OnUpdate(core_timing)
         if let Some(ref mouse) = self.mouse {
@@ -736,7 +734,6 @@ impl ResourceManager {
             let mouse_wheel_state = devices.get_mouse_wheel();
             m.on_update(
                 &mut shared_memory.mouse,
-                mouse_enabled,
                 &mouse_button_state,
                 &crate::resources::mouse::mouse::MousePosition {
                     x: mouse_position_state.x,
@@ -754,7 +751,6 @@ impl ResourceManager {
             let mouse_wheel_state = devices.get_mouse_wheel();
             dm.on_update(
                 &mut shared_memory.debug_mouse,
-                mouse_enabled,
                 &mouse_button_state,
                 &crate::resources::mouse::mouse::MousePosition {
                     x: mouse_position_state.x,
@@ -771,7 +767,6 @@ impl ResourceManager {
             let keyboard_modifier = devices.get_keyboard_modifier();
             kb.on_update(
                 &mut shared_memory.keyboard,
-                keyboard_enabled,
                 &keyboard_state,
                 &keyboard_modifier,
             );

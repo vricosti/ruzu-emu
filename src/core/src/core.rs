@@ -988,6 +988,12 @@ pub trait AudioCoreInterface: Send {
     /// Mirror `AudioCore::Sink::Sink::GetSystemChannels`.
     fn get_audio_output_system_channels(&self) -> u32;
 
+    /// Bridge to Sink::SetSystemVolume followed by Sink::SetDeviceVolume.
+    fn set_audio_output_sink_volume(&self, volume: f32);
+
+    /// Crate-cycle bridge for IAudioOutManager::SetAllAudioOutVolume.
+    fn set_all_audio_out_volume(&self, volume: f32);
+
     /// Mirror `AudioCore::AudioIn::Manager::GetDeviceNames`.
     fn list_audio_input_device_name(&self, out_names: &mut [[u8; 0x100]], filter: bool) -> u32;
 

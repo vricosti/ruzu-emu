@@ -416,6 +416,23 @@ impl ruzu_core::core::AudioOutSessionImpl for AudioOutSession {
 }
 
 impl ruzu_core::core::AudioCoreInterface for AudioCore {
+    fn set_audio_output_sink_volume(&self, volume: f32) {
+        let mut sink = self.output_sink.lock();
+        sink.set_system_volume(volume);
+        sink.set_device_volume(volume);
+    }
+
+    fn set_all_audio_out_volume(&self, volume: f32) {
+        // IAudioOutManager::SetAllAudioOutVolume lives on the HLE service
+        // upstream. Its manager is behind this existing crate-cycle bridge in
+        // Rust; keep the manager locked while updating the same live sessions.
+        let manager = self.audio_out_manager.lock();
+        let sessions = manager.sessions.lock().clone();
+        for session in sessions.iter().flatten() {
+            session.set_volume(volume);
+        }
+    }
+
     fn get_audio_renderer_work_buffer_size(&self, params: &[u8; 0x34]) -> Option<u64> {
         let parsed = unsafe {
             core::ptr::read_unaligned(params.as_ptr() as *const AudioRendererParameterInternal)
@@ -947,6 +964,38 @@ mod tests {
 
     fn make_audio_core() -> AudioCore {
         AudioCore::new(crate::make_test_system())
+    }
+
+    #[test]
+    fn bulk_output_volume_updates_live_sessions_without_changing_membership() {
+        let audio_core = make_audio_core();
+        let create_session = |id| {
+            let event = Arc::new(AtomicBool::new(false));
+            let system = crate::out::System::new(
+                audio_core.system.clone(),
+                new_sink_handle(Box::new(crate::sink::NullSink::new("null"))),
+                event.clone(),
+                id,
+            );
+            Arc::new(AudioOut::new(system, event, Arc::new(|_| {})))
+        };
+        let first = create_session(0);
+        let second = create_session(4);
+        audio_core.audio_out_manager.lock().set_session(0, Some(first.clone()));
+        audio_core.audio_out_manager.lock().set_session(4, Some(second.clone()));
+        for volume in [0.25, 0.0, 1.0] {
+            audio_core.set_all_audio_out_volume(volume);
+            assert_eq!(first.get_volume(), volume);
+            assert_eq!(second.get_volume(), volume);
+        }
+        audio_core.audio_out_manager.lock().set_session(0, None);
+        audio_core.set_all_audio_out_volume(0.5);
+        assert_eq!(first.get_volume(), 1.0);
+        assert_eq!(second.get_volume(), 0.5);
+        let manager = audio_core.audio_out_manager.lock();
+        let sessions = manager.sessions.lock();
+        assert_eq!(sessions.iter().flatten().count(), 1);
+        assert!(Arc::ptr_eq(sessions[4].as_ref().unwrap(), &second));
     }
 
     #[test]

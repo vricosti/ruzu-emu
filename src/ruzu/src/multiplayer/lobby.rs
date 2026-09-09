@@ -653,6 +653,7 @@ fn selected_room_index(selection: &gtk::SingleSelection) -> Option<usize> {
 pub fn show(
     parent: &gtk::ApplicationWindow,
     room_member: Arc<RoomMember>,
+    announce_session: Arc<network::announce_multiplayer_session::AnnounceMultiplayerSession>,
     game_list: crate::game_list::GameListHandle,
     on_joined: impl Fn() + 'static,
 ) {
@@ -859,13 +860,10 @@ pub fn show(
             refresh.set_sensitive(false);
             refresh.set_label("Refreshing");
             let (sender, receiver) = std::sync::mpsc::channel();
+            let session = Arc::clone(&announce_session);
             std::thread::Builder::new()
                 .name("LobbyRefresh".to_string())
                 .spawn(move || {
-                    let session =
-                        network::announce_multiplayer_session::AnnounceMultiplayerSession::new(
-                            &network::network::RoomNetwork::default(),
-                        );
                     let _ = sender.send(session.get_room_list());
                 })
                 .expect("failed to spawn the LobbyRefresh thread");

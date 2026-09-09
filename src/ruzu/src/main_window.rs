@@ -508,10 +508,11 @@ pub struct GMainWindow {
     /// Qt saveGeometry/restoreGeometry includes the maximized state. GTK's
     /// Win32 fullscreen rectangle restoration alone does not preserve it.
     pre_fullscreen_state: RefCell<Option<(gtk::Window, bool)>>,
-    /// Multiplayer client. Upstream keeps it in `Core::System`'s room network;
-    /// it lives here until the room network owner is ported, because the
-    /// Multiplayer menu is currently its only user.
+    /// Shared with the process-global network owner used by guest services.
     room_member: Arc<network::room_member::RoomMember>,
+    // Upstream MultiplayerState owns one announcement session shared by its dialogs.
+    announce_multiplayer_session:
+        Arc<network::announce_multiplayer_session::AnnounceMultiplayerSession>,
     /// In-window menu bar on non-macOS platforms. Upstream hides the menu bar
     /// while the single-window render surface is fullscreen.
     menu_bar: Option<gtk::PopoverMenuBar>,
@@ -1874,6 +1875,11 @@ impl GMainWindow {
                     None
                 })),
             room_member,
+            announce_multiplayer_session: Arc::new(
+                network::announce_multiplayer_session::AnnounceMultiplayerSession::new(
+                    network::network::get_room(),
+                ),
+            ),
             menu_bar,
             stack,
             loading_screen,
@@ -3282,11 +3288,15 @@ impl GMainWindow {
         let Some(game_list) = self.game_list.borrow().clone() else {
             return;
         };
+        if !self.announce_multiplayer_session.is_running() {
+            self.announce_multiplayer_session.update_credentials();
+        }
         let parent = self.window.clone();
         let room_member = Arc::clone(&self.room_member);
         crate::multiplayer::lobby::show(
             &self.window,
             Arc::clone(&self.room_member),
+            Arc::clone(&self.announce_multiplayer_session),
             game_list,
             move || {
                 crate::multiplayer::client_room::show(&parent, Arc::clone(&room_member));
@@ -4331,6 +4341,9 @@ impl GMainWindow {
             self,
             move || {
                 let docked = common::settings::is_docked_mode(&common::settings::values());
+                if !this.announce_multiplayer_session.is_running() {
+                    this.announce_multiplayer_session.update_credentials();
+                }
                 this.initialize_camera();
                 let previous = previous_docked.replace(docked);
                 if let Some(session) = this.session.borrow().as_ref() {

@@ -18,7 +18,6 @@ use parking_lot::Mutex;
 use common::announce_multiplayer_room::{Backend, RoomList, WebResult, WebResultCode};
 use common::thread::Event;
 
-use crate::network::RoomNetwork;
 use crate::room::{Room, RoomState, NETWORK_VERSION};
 
 // ---------------------------------------------------------------------------
@@ -47,9 +46,10 @@ pub struct AnnounceMultiplayerSession {
 impl AnnounceMultiplayerSession {
     /// Creates a new session.
     ///
-    /// The explicit `RoomNetwork` reference replaces Eden's module-global
-    /// `Network::GetRoom()` owner without changing the room lifetime.
-    pub fn new(room_network: &RoomNetwork) -> Self {
+    /// The weak handle refers to the existing network owner, like Eden's
+    /// `Network::GetRoom()`. Creating a web session must not initialize or
+    /// replace the room/client used by the frontend and guest services.
+    pub fn new(room: Weak<Room>) -> Self {
         let values = common::settings::values();
         let backend: Box<dyn Backend> = Box::new(web_service::announce_room_json::RoomJson::new(
             values.web_api_url.get_value(),
@@ -63,12 +63,12 @@ impl AnnounceMultiplayerSession {
             announce_multiplayer_thread: Mutex::new(None),
             backend: Arc::new(Mutex::new(backend)),
             registered: Arc::new(AtomicBool::new(false)),
-            room: room_network.get_room(),
+            room,
         }
     }
 
     #[cfg(test)]
-    fn with_backend(room_network: &RoomNetwork, backend: Box<dyn Backend>) -> Self {
+    fn with_backend(room_network: &crate::network::RoomNetwork, backend: Box<dyn Backend>) -> Self {
         Self {
             shutdown_event: Arc::new(Event::new()),
             error_callbacks: Arc::new(Mutex::new(Vec::new())),
@@ -388,6 +388,68 @@ mod tests {
             false,
         ));
         room
+    }
+
+    #[test]
+    fn announcement_session_preserves_existing_network_owners() {
+        // Global network identity needs isolation from other RoomNetwork tests.
+        const CHILD: &str = "RUZU_TEST_ANNOUNCE_NETWORK_IDENTITY";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "announce_multiplayer_session::tests::announcement_session_preserves_existing_network_owners",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        let network = RoomNetwork::new();
+        let room = open_room(&network);
+        let member = network.get_room_member().upgrade().unwrap();
+        let strong_count = Arc::strong_count(&room);
+        let session = Arc::new(AnnounceMultiplayerSession::new(crate::network::get_room()));
+        assert!(Weak::ptr_eq(&session.room, &network.get_room()));
+        assert_eq!(Arc::strong_count(&room), strong_count);
+        *session.backend.lock() = Box::new(RecordingBackend::new(Arc::new(Mutex::new(
+            BackendState::default(),
+        ))));
+        // The GUI lends the same session to each refresh worker, not a newly
+        // initialized RoomNetwork. No HTTP request or real credentials needed.
+        for _ in 0..3 {
+            let session = Arc::clone(&session);
+            let expected_room = Arc::downgrade(&room);
+            let expected_member = Arc::downgrade(&member);
+            std::thread::spawn(move || {
+                assert!(session.get_room_list().is_empty());
+                assert!(Weak::ptr_eq(&session.room, &expected_room));
+                assert!(Weak::ptr_eq(&crate::network::get_room(), &expected_room));
+                assert!(Weak::ptr_eq(
+                    &crate::network::get_room_member(),
+                    &expected_member
+                ));
+            })
+            .join()
+            .unwrap();
+        }
+        drop(session);
+        assert_eq!(room.get_state(), RoomState::Open);
+        assert!(Arc::ptr_eq(
+            &room,
+            &crate::network::get_room().upgrade().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &member,
+            &crate::network::get_room_member().upgrade().unwrap()
+        ));
+        room.destroy();
+        crate::network::shutdown();
+        // Discovery-session creation must not initialize networking either.
+        let session = AnnounceMultiplayerSession::new(crate::network::get_room());
+        assert!(session.room.upgrade().is_none());
+        assert!(crate::network::get_room_member().upgrade().is_none());
     }
 
     #[test]

@@ -523,7 +523,7 @@ fn main() {
 
         log::info!("Room is open. Close with Q+Enter...");
 
-        let announce_session = AnnounceMultiplayerSession::new(&network);
+        let announce_session = AnnounceMultiplayerSession::new(network.get_room());
         if announce {
             announce_session.start();
         }

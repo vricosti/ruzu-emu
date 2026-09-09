@@ -119,6 +119,13 @@ pub fn page(
         "Aimed to disable SDL GUIDE button hack: synthetic GUIDE(HOME) event when SELECT(MINUS) + START(PLUS) pressed. May impact Win related trigger/rumble/etc stuff",
     ));
     disable_wgi_xinput.set_visible(cfg!(target_os = "windows"));
+    // Unlike Eden, this frontend does not embed Qt WebEngine, so its
+    // "disables web applet" qualifier does not apply to this checkbox.
+    let raw_input = w::check_row(
+        "Enable XInput 8 player support (Requires restart)",
+        *common::settings::values().enable_raw_input.get_value(),
+    );
+    raw_input.set_visible(cfg!(target_os = "windows"));
     let udp_controllers = w::check_row(
         "Enable UDP controllers (not needed for motion)",
         *common::settings::values().enable_udp_controller.get_value(),
@@ -142,6 +149,7 @@ pub fn page(
     for check in [
         &emulate_analog,
         &disable_wgi_xinput,
+        &raw_input,
         &udp_controllers,
         &controller_navigation,
         &joycon_driver,
@@ -218,6 +226,7 @@ pub fn page(
         values
             .disable_wgi_xinput
             .set_value(disable_wgi_xinput.is_active());
+        values.enable_raw_input.set_value(raw_input.is_active());
         values
             .enable_udp_controller
             .set_value(udp_controllers.is_active());
@@ -361,6 +370,38 @@ fn player_input(index: usize) -> PlayerInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn raw_input_checkbox_loads_applies_and_has_platform_visibility() {
+        fn find(widget: &gtk::Widget) -> Option<gtk::CheckButton> {
+            if let Some(check) = widget.downcast_ref::<gtk::CheckButton>() {
+                if check.label().is_some_and(|label| label.starts_with("Enable XInput 8")) {
+                    return Some(check.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(check) = find(&widget) { return Some(check); }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        gtk::init().unwrap();
+        let input = Rc::new(RefCell::new(input_common::InputSubsystem::new()));
+        let hid = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        for initial in [false, true] {
+            common::settings::values_mut().enable_raw_input.set_value(initial);
+            let page = page(Rc::clone(&input), Arc::clone(&hid));
+            let check = find(&page.widget).expect("raw input checkbox");
+            assert_eq!(check.is_visible(), cfg!(target_os = "windows"));
+            assert_eq!(check.is_active(), initial);
+            check.set_active(!initial);
+            assert_eq!(*common::settings::values().enable_raw_input.get_value(), initial);
+            (page.apply)();
+            assert_eq!(*common::settings::values().enable_raw_input.get_value(), !initial);
+        }
+    }
 
     #[test]
     #[ignore = "requires a GTK display; run alone with --ignored"]

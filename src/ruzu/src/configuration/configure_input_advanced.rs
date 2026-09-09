@@ -169,7 +169,6 @@ pub fn page(
     // The remaining per-device Configure dialogs are separate upstream
     // widgets; log until their matching owners are ported.
     for (button, name) in [
-        (&touchscreen.configure, "Touchscreen advanced"),
         (&ring_controller.configure, "Ring controller"),
         (&infrared.configure, "Infrared camera"),
     ] {
@@ -189,6 +188,10 @@ pub fn page(
     configure_motion_touch.connect_clicked(move |button| {
         super::configure_motion_touch::present(button, Rc::clone(&input_subsystem));
     });
+
+    if let Some(button) = &touchscreen.configure {
+        button.connect_clicked(super::configure_touchscreen_advanced::present);
+    }
 
     Page::new("Advanced", scroller, move || {
         for (index, buttons) in controllers_color_buttons.iter().enumerate() {

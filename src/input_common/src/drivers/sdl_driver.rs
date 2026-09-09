@@ -776,7 +776,7 @@ impl SDLDriver {
             unsafe { sdl::SDL_SetHint(name.as_ptr(), value.as_ptr()) };
         };
 
-        hint("SDL_APP_NAME", "Reden");
+        hint("SDL_APP_NAME", "Ruzu");
 
         let settings = common::settings::values();
         hint(
@@ -1484,6 +1484,31 @@ impl Drop for SDLDriver {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_input_setting_reaches_sdl_hint() {
+        const CHILD: &str = "RUZU_TEST_SDL_RAW_INPUT_HINT";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "drivers::sdl_driver::tests::raw_input_setting_reaches_sdl_hint"])
+                .env(CHILD, "1")
+                .env_remove("SDL_JOYSTICK_RAWINPUT")
+                .env_remove("SDL_APP_NAME")
+                .status().unwrap().success());
+            return;
+        }
+        for enabled in [false, true, false] {
+            common::settings::values_mut().enable_raw_input.set_value(enabled);
+            super::SDLDriver::set_hints();
+            for (name, expected) in [("SDL_JOYSTICK_RAWINPUT", if enabled { "1" } else { "0" }), ("SDL_APP_NAME", "Ruzu")] {
+                let name = std::ffi::CString::new(name).unwrap();
+                // SDL owns the string; no hint mutation occurs during this read.
+                let value = unsafe { super::sdl::SDL_GetHint(name.as_ptr()) };
+                assert!(!value.is_null());
+                assert_eq!(unsafe { std::ffi::CStr::from_ptr(value) }.to_str().unwrap(), expected);
+            }
+        }
+    }
+
     #[test]
     fn menu_and_trigger_labels_follow_controller_family() {
         use super::*;

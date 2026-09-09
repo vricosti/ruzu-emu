@@ -516,7 +516,7 @@ impl StaticService {
     ) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let type_val = rp.pop_u32();
+        let type_val = rp.pop_u8();
         let type_ = match type_val {
             0 => TimeType::UserSystemClock,
             1 => TimeType::NetworkSystemClock,
@@ -524,6 +524,8 @@ impl StaticService {
             _ => TimeType::UserSystemClock,
         };
 
+        // CMIF aligns SystemClockContext to eight bytes after the u8 TimeType.
+        rp.align_for::<SystemClockContext>();
         let user_context: SystemClockContext = rp.pop_raw();
         let network_context: SystemClockContext = rp.pop_raw();
 
@@ -819,6 +821,39 @@ impl ServiceFramework for StaticService {
 mod tests {
     use super::*;
     use crate::hle::service::psc::time::common::SteadyClockTimePoint;
+
+    #[test]
+    fn snapshot_context_ipc_preserves_eight_byte_alignment_in_both_interfaces() {
+        use crate::hle::service::psc::time::errors::{RESULT_CLOCK_MISMATCH, RESULT_CLOCK_UNINITIALIZED};
+        let manager = make_time_manager();
+        let source = [0x5a; 16];
+        manager.lock().unwrap().psc_time.lock().unwrap()
+            .standard_steady_clock.lock().unwrap().initialize(source, 0, 0, 0, false);
+        let service = StaticService::new(
+            crate::core::SystemRef::null(), user_setup(), "time:u", manager,
+        );
+        let check = |interface: &dyn ServiceFramework| {
+            for matching in [true, false] {
+                let mut ctx = HLERequestContext::new();
+                // u8 type, seven padding bytes, then two 32-byte contexts.
+                ctx.cmd_buf[2..20].copy_from_slice(&[
+                    0xaabb_cc00, 0xdead_beef,
+                    123, 0, 17, 0,
+                    if matching { 0x5a5a_5a5a } else { 0x1234_5678 },
+                    0x5a5a_5a5a, 0x5a5a_5a5a, 0x5a5a_5a5a,
+                    456, 0, 19, 0,
+                    0x5a5a_5a5a, 0x5a5a_5a5a, 0x5a5a_5a5a, 0x5a5a_5a5a,
+                ]);
+                interface.handlers()[&401].handler_callback.unwrap()(interface, &mut ctx);
+                // Matching IDs must reach calendar conversion (the test deliberately
+                // has no timezone); genuinely mismatched IDs must still be rejected.
+                let expected = if matching { RESULT_CLOCK_UNINITIALIZED } else { RESULT_CLOCK_MISMATCH };
+                assert_eq!(ctx.cmd_buf[6], expected.get_inner_value());
+            }
+        };
+        check(&service);
+        check(&*service.wrapped_service.lock().unwrap());
+    }
 
     fn make_time_manager() -> Arc<Mutex<GlueTimeManager>> {
         let service_manager = Arc::new(Mutex::new(

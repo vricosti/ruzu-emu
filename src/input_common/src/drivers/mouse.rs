@@ -451,6 +451,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn panning_settings_control_sensitivity_deadzone_and_decay() {
+        const CHILD: &str = "RUZU_TEST_MOUSE_PANNING_SETTINGS";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "drivers::mouse::tests::panning_settings_control_sensitivity_deadzone_and_decay"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        {
+            let mut settings = common::settings::values_mut();
+            settings.mouse_panning.set_value(true);
+            settings.mouse_enabled.set_value(false);
+            settings.mouse_panning_x_sensitivity.set_value(20);
+            settings.mouse_panning_y_sensitivity.set_value(40);
+            settings.mouse_panning_deadzone_counterweight.set_value(0);
+            settings.mouse_panning_decay_strength.set_value(50);
+            settings.mouse_panning_min_decay.set_value(10);
+        }
+        let mut mouse = Mouse::new("mouse-test".into());
+        mouse.move_cursor(10, 5, 0, 0);
+        assert!((mouse.last_mouse_change.0 - 0.2).abs() < 1e-6);
+        assert!((mouse.last_mouse_change.1 - 0.2).abs() < 1e-6);
+        assert!((mouse.last_motion_change.0 + 0.1).abs() < 1e-6);
+        assert!((mouse.last_motion_change.1 + 0.4).abs() < 1e-6);
+        mouse.update_stick_input();
+        // The minimum decay dominates at this low magnitude.
+        assert!((mouse.last_mouse_change.0 - 0.18).abs() < 1e-6);
+        mouse.last_mouse_change = (2.0, 0.0);
+        mouse.update_stick_input();
+        // Clamp to 1.5 before applying the 50% high-magnitude decay.
+        assert!((mouse.last_mouse_change.0 - 0.75).abs() < 1e-6);
+        common::settings::values_mut().mouse_panning_deadzone_counterweight.set_value(60);
+        mouse.last_mouse_change = (0.0, 0.0);
+        mouse.move_cursor(1, 0, 0, 0);
+        assert!((mouse.last_mouse_change.0 - 0.6).abs() < 1e-6);
+        // Native mouse input takes precedence over panning, as in Eden.
+        common::settings::values_mut().mouse_enabled.set_value(true);
+        assert!(!mouse.is_mouse_panning_enabled());
+        let previous = mouse.last_mouse_change;
+        mouse.move_cursor(100, 100, 0, 0);
+        mouse.update_stick_input();
+        assert_eq!(mouse.last_mouse_change, previous);
+        common::settings::values_mut().mouse_enabled.set_value(false);
+        common::settings::values_mut().mouse_panning.set_value(false);
+        assert!(!mouse.is_mouse_panning_enabled());
+    }
+
+    #[test]
     fn notify_changed_publishes_upstream_motion_sample() {
         let mut mouse = Mouse::new("mouse-test".to_string());
         mouse.last_motion_change = (1.0, -2.0, 3.0);

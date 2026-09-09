@@ -109,7 +109,7 @@ impl StickState {
         let mut new_angle = self.angle;
 
         let mut time_difference = self.last_update.map_or(0.5, |last_update| {
-            now.duration_since(last_update).as_secs_f32()
+            now.duration_since(last_update).as_millis() as f32 / 1000.0
         });
         if time_difference > 0.5 {
             time_difference = 0.5;
@@ -439,6 +439,49 @@ impl StickFromButton {
 impl Default for StickFromButton {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolation_uses_whole_milliseconds_and_caps_elapsed_time() {
+        let start = Instant::now();
+        let mut state = StickState::new(0.5, 0.2);
+        state.angle = 0.0;
+        state.goal_angle = common::math_util::PI * 0.25;
+        state.last_update = Some(start);
+        for (micros, expected) in [(999, 0.0), (1999, 0.0002), (500000, 0.1), (900000, 0.1)] {
+            let angle = state.get_angle(start + std::time::Duration::from_micros(micros));
+            assert!((angle - expected).abs() < 1e-7, "elapsed {micros}: {angle}");
+        }
+    }
+
+    #[test]
+    fn keyboard_analog_setting_selects_interpolated_or_direct_angle() {
+        const CHILD: &str = "RUZU_TEST_KEYBOARD_ANALOG_SETTING";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "helpers::stick_from_buttons::tests::keyboard_analog_setting_selects_interpolated_or_direct_angle"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let mut state = StickState::new(0.5, 0.2);
+        state.angle = 0.0;
+        state.goal_angle = common::math_util::PI * 0.25;
+        state.amplitude = MAX_RANGE;
+        // None selects the capped 0.5-second interval, without wall-clock sleeps.
+        state.last_update = None;
+        for enabled in [false, true, false] {
+            common::settings::values_mut().emulate_analog_keyboard.set_value(enabled);
+            let status = state.get_status();
+            let angle = if enabled { 0.1 } else { state.goal_angle };
+            assert!((status.x.raw_value - angle.cos() * MAX_RANGE).abs() < 1e-6);
+            assert!((status.y.raw_value - angle.sin() * MAX_RANGE).abs() < 1e-6);
+        }
     }
 }
 

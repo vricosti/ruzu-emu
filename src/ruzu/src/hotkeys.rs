@@ -40,6 +40,15 @@ pub fn apply_accelerators(app: &gtk::Application) {
         ("Exit Fullscreen", "app.exit_fullscreen"),
         ("Load File", "app.load_file"),
         ("Configure", "app.configure"),
+        ("Capture Screenshot", "app.capture_screenshot"),
+        ("Load/Remove Amiibo", "app.load_amiibo"),
+        ("TAS Start/Stop", "app.tas_start"),
+        ("TAS Record", "app.tas_record"),
+        ("TAS Reset", "app.tas_reset"),
+        ("Browse Public Game Lobby", "app.view_lobby"),
+        ("Direct Connect to Room", "app.connect_to_room"),
+        ("Show Current Room", "app.show_room"),
+        ("Leave Room", "app.leave_room"),
         ("Toggle Filter Bar", "app.show_filter_bar"),
         ("Toggle Status Bar", "app.show_status_bar"),
         ("Toggle Renderdoc Capture", "app.renderdoc_capture"),
@@ -104,6 +113,37 @@ fn gtk_accelerator_from_native(sequence: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK display; run in an isolated process"]
+    fn tools_and_multiplayer_hotkeys_use_the_existing_menu_actions() {
+        gtk::init().unwrap();
+        let app = gtk::Application::builder()
+            .application_id("org.ruzu.MenuHotkeyTest")
+            .build();
+        let original = crate::uisettings::with(|values| values.shortcuts.clone());
+        for (name, action) in [
+            ("Capture Screenshot", "app.capture_screenshot"),
+            ("Load/Remove Amiibo", "app.load_amiibo"),
+            ("TAS Start/Stop", "app.tas_start"),
+            ("TAS Record", "app.tas_record"),
+            ("TAS Reset", "app.tas_reset"),
+            ("Browse Public Game Lobby", "app.view_lobby"),
+            ("Direct Connect to Room", "app.connect_to_room"),
+            ("Show Current Room", "app.show_room"),
+            ("Leave Room", "app.leave_room"),
+        ] {
+            for (key, expected) in [("F7", vec!["F7"]), ("F8", vec!["F8"]), ("", vec![])] {
+                crate::uisettings::with_mut(|values| {
+                    values.shortcuts.iter_mut().find(|shortcut| shortcut.name == name)
+                        .unwrap().keyseq = key.to_owned();
+                });
+                apply_accelerators(&app);
+                assert_eq!(app.accels_for_action(action), expected, "{name}");
+            }
+        }
+        crate::uisettings::with_mut(|values| values.shortcuts = original);
+    }
 
     #[test]
     #[ignore = "requires GTK display; run in an isolated process"]

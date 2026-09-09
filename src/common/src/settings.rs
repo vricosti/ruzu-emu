@@ -2082,6 +2082,40 @@ mod tests {
         // Inventory of the Setting/SwitchableSetting fields in Values; plain
         // controller arrays and frontend UI settings have separate serializers.
         assert_eq!(labels.len(), 193);
+
+        // Eden registers a restore callback for every SwitchableSetting.
+        // Exercise all registered settings so a newly added field cannot
+        // silently be omitted from Rust's explicit RestoreGlobalState list.
+        let mut global_values = std::collections::HashMap::new();
+        for category in categories {
+            values.for_each_setting_in_category_mut(category, |setting| {
+                if setting.switchable() {
+                    global_values.insert(setting.label().to_owned(), setting.to_string_global());
+                    setting.set_global(false);
+                }
+            });
+        }
+        assert!(!global_values.is_empty());
+        values.use_squashed_iterated_blend = true;
+        restore_global_state(&mut values, true);
+        assert!(values.use_squashed_iterated_blend);
+        for category in categories {
+            values.for_each_setting_in_category_mut(category, |setting| {
+                if setting.switchable() {
+                    assert!(!setting.using_global(), "{}", setting.label());
+                }
+            });
+        }
+        restore_global_state(&mut values, false);
+        assert!(!values.use_squashed_iterated_blend);
+        for category in categories {
+            values.for_each_setting_in_category_mut(category, |setting| {
+                if setting.switchable() {
+                    assert!(setting.using_global(), "{}", setting.label());
+                    assert_eq!(setting.to_string_repr(), global_values[setting.label()]);
+                }
+            });
+        }
     }
 
     #[test]

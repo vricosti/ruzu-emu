@@ -756,8 +756,13 @@ mod tests {
         let fixture = Fixture::new();
         let weak = Arc::downgrade(&fixture.service.state);
         let event = fixture.service.update_event.clone();
+        let timing = fixture.service.timing.clone();
+        assert_eq!(timing.advance(), Some(HIDBUS_UPDATE_NS.as_nanos() as i64));
         drop(fixture);
         assert!(weak.upgrade().is_none());
+        // Retain the EventType: a missing UnscheduleEvent cannot be hidden by
+        // an expired weak event reference in CoreTiming's queue.
+        assert_eq!(timing.advance(), None);
         drop(event);
     }
 
@@ -812,5 +817,99 @@ mod tests {
             &actual,
             &fixture.service.state.lock().shared_memory
         ));
+    }
+
+    #[test]
+    fn timer_writes_application_memory_and_stops_after_finalize() {
+        use crate::core::System;
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use crate::memory::memory::Memory;
+        use common::page_table::{PageTable, PageType};
+
+        let device_memory = Box::new(DeviceMemory::with_size(0x4000));
+        let mut page_table = Box::new(PageTable::new());
+        page_table.resize(32, 12);
+        page_table.map_pages(
+            1,
+            1,
+            0x1000,
+            PageType::Memory,
+            device_memory.buffer.backing_base_pointer() as usize + 0x1000,
+        );
+        // Stable boxed backing/page table outlive all accesses through Memory.
+        let memory = Arc::new(StdMutex::new(unsafe {
+            Memory::new(
+                SystemRef::null(),
+                device_memory.as_ref(),
+                &device_memory.buffer,
+            )
+        }));
+        memory
+            .lock()
+            .unwrap()
+            .set_current_page_table(page_table.as_mut(), true);
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        process.lock().unwrap().memory = Some(memory.clone());
+        let mut system = Box::new(System::new());
+        system.set_current_process_arc(process);
+        let fixture = Fixture::new();
+        let handle = {
+            let mut state = fixture.service.state.lock();
+            state.system = SystemRef::from_ref(&system);
+            let (_, handle) = state.get_bus_handle(0, 1);
+            assert_eq!(state.initialize(handle, true), RESULT_SUCCESS);
+            let device = state.device_mut(handle).unwrap();
+            device.enable(true);
+            device.set_polling_mode(JoyPollingMode::SixAxisSensorEnable);
+            device.set_transfer_memory_address(0x1000);
+            handle
+        };
+        let tick = || {
+            fixture.service.timing.schedule_event(
+                Duration::ZERO,
+                &fixture.service.update_event,
+                false,
+            );
+            fixture.service.timing.advance();
+        };
+        let read = || unsafe {
+            std::slice::from_raw_parts(
+                device_memory.buffer.backing_base_pointer().add(0x1000),
+                0x190,
+            )
+            .to_vec()
+        };
+        tick();
+        let first = read();
+        assert_eq!(u64::from_le_bytes(first[0x20..0x28].try_into().unwrap()), 1);
+        assert_eq!(
+            u64::from_le_bytes(first[0x28..0x30].try_into().unwrap()),
+            10
+        );
+        // Entry one starts at 0x50: both sampling counters must match.
+        assert_eq!(u64::from_le_bytes(first[0x50..0x58].try_into().unwrap()), 1);
+        assert_eq!(first[0x60], 8);
+        assert_eq!(u64::from_le_bytes(first[0x68..0x70].try_into().unwrap()), 1);
+        assert_eq!(
+            fixture.service.state.lock().finalize(handle),
+            RESULT_SUCCESS
+        );
+        tick();
+        assert_eq!(read(), first);
+        {
+            let mut state = fixture.service.state.lock();
+            assert_eq!(state.initialize(handle, true), RESULT_SUCCESS);
+            let device = state.device_mut(handle).unwrap();
+            device.enable(true);
+            device.set_polling_mode(JoyPollingMode::SixAxisSensorEnable);
+            device.set_transfer_memory_address(0x1000);
+        }
+        tick();
+        assert_eq!(read(), first); // Newly initialized device starts again at sample one.
+        tick();
+        assert_eq!(
+            u64::from_le_bytes(read()[0x20..0x28].try_into().unwrap()),
+            2
+        );
     }
 }

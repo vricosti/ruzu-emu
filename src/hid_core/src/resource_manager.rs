@@ -867,7 +867,9 @@ impl ResourceManager {
         self.capture_button = Some(Arc::new(Mutex::new(CaptureButton::new())));
         self.digitizer = Some(Arc::new(Mutex::new(Digitizer::new())));
         self.palma = Some(Arc::new(Mutex::new(Palma::new())));
-        self.six_axis = Some(Arc::new(Mutex::new(SixAxis::new())));
+        self.six_axis = Some(Arc::new(Mutex::new(SixAxis::new(
+            &self.hid_core.as_ref().expect("ResourceManager requires HIDCore").lock(),
+        ))));
 
         // Wire SetAppletResource for each controller that needs it.
         // Upstream: each_resource->SetAppletResource(applet_resource, &shared_mutex)

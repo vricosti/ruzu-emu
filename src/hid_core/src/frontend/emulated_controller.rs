@@ -2477,6 +2477,64 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn six_axis_publishes_both_motion_sources_and_forwards_drift_mode() {
+        use crate::hid_core::HIDCore;
+        use crate::resources::{applet_resource::AppletResource,
+            shared_memory_holder::KSharedMemoryBacking, six_axis::six_axis::SixAxis};
+        struct Backing;
+        impl KSharedMemoryBacking for Backing {
+            fn create(&self, size: usize) -> Option<(*mut u8, Arc<dyn std::any::Any + Send + Sync>)> {
+                let mut words = vec![0u64; size.div_ceil(8)].into_boxed_slice();
+                Some((words.as_mut_ptr().cast(), Arc::new(words)))
+            }
+        }
+        // Access the private frontend state here, not through a production
+        // injection API. The consumer under test still uses GetMotions.
+        let hid = HIDCore::new();
+        let device = hid.get_emulated_controller(NpadIdType::Player1);
+        {
+            let mut device = device.lock();
+            device.set_npad_style_index(NpadStyleIndex::JoyconDual);
+            device.connect(false);
+            let mut status = device.status.lock();
+            for (index, motion) in status.motion_state.iter_mut().enumerate() {
+                let value = (index + 1) as f32;
+                motion.accel.x = value;
+                motion.gyro.y = value * 2.0;
+                motion.rotation.z = value * 3.0;
+                motion.orientation[2].x = value * 4.0;
+                motion.is_at_rest = index == 0;
+            }
+        }
+        let mut resource = AppletResource::new();
+        resource.set_shared_memory_backing(Arc::new(Backing));
+        assert!(resource.register_applet_resource_user_id(0x52, true).is_success());
+        assert!(resource.create_applet_resource(0x52).is_success());
+        let resource = Arc::new(Mutex::new(resource));
+        let mut six_axis = SixAxis::new(&hid);
+        six_axis.activation.set_applet_resource(resource.clone());
+        six_axis.activation.activate();
+        six_axis.on_update();
+        let resource = resource.lock();
+        let memory = &resource.get_shared_memory_format(0x52).unwrap().npad.npad_entry[0].internal_state;
+        for (index, lifo) in [&memory.sixaxis_dual_left_lifo, &memory.sixaxis_dual_right_lifo].into_iter().enumerate() {
+            let value = (index + 1) as f32;
+            let state = &lifo.lifo.read_current_entry().state;
+            assert_eq!(state.accel.x, value);
+            assert_eq!(state.gyro.y, value * 2.0);
+            assert_eq!(state.rotation.z, value * 3.0);
+            assert_eq!(state.orientation[2].x, value * 4.0);
+        }
+        assert!(!six_axis.controller_data[0].sixaxis_at_rest);
+        let handle = SixAxisSensorHandle {
+            npad_type: NpadStyleIndex::JoyconDual, npad_id: 0,
+            device_index: DeviceIndex::Left, ..Default::default()
+        };
+        assert!(six_axis.set_gyroscope_zero_drift_mode(&handle, GyroscopeZeroDriftMode::Tight).is_success());
+        assert_eq!(device.lock().status.lock().motion_sensitivity, IS_AT_REST_TIGHT);
+    }
+
+    #[test]
     fn reload_force_update_callbacks_can_reenter_controller_across_reloads() {
         struct Factory;
         struct Device(InputCallback);

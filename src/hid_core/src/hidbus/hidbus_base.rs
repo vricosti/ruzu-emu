@@ -16,12 +16,16 @@ pub trait HidbusRuntime: Send + Sync {
 
 /// This is nn::hidbus::JoyPollingMode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[repr(u32)]
-pub enum JoyPollingMode {
-    #[default]
-    SixAxisSensorDisable = 0,
-    SixAxisSensorEnable = 1,
-    ButtonOnly = 2,
+#[repr(transparent)]
+pub struct JoyPollingMode(pub u32);
+
+// C++ enum inputs retain unknown wire values, which OnUpdate rejects through
+// its default branch. A transparent value avoids manufacturing an invalid enum.
+#[allow(non_upper_case_globals)]
+impl JoyPollingMode {
+    pub const SixAxisSensorDisable: Self = Self(0);
+    pub const SixAxisSensorEnable: Self = Self(1);
+    pub const ButtonOnly: Self = Self(2);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -167,7 +171,7 @@ impl Default for ButtonOnlyPollingDataAccessor {
 }
 
 /// Base trait for hidbus devices
-pub trait HidbusDevice {
+pub trait HidbusDevice: Send {
     fn base(&self) -> &HidbusBase;
     fn base_mut(&mut self) -> &mut HidbusBase;
 

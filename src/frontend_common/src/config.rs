@@ -2576,6 +2576,56 @@ mod tests {
     }
 
     #[test]
+    fn player_colors_round_trip_through_disk() {
+        const CHILD: &str = "RUZU_TEST_PLAYER_COLORS_DISK";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::tests::player_colors_round_trip_through_disk"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        let expected: Vec<[u32; 4]> = (0..8)
+            .map(|index| std::array::from_fn(|channel| 0xFF123400 + index * 4 + channel as u32))
+            .collect();
+        {
+            let mut values = common::settings::values_mut();
+            values.players.set_global(true);
+            for (player, colors) in values.players.get_value_mut().iter_mut().zip(&expected) {
+                player.body_color_left = colors[0];
+                player.button_color_left = colors[1];
+                player.body_color_right = colors[2];
+                player.button_color_right = colors[3];
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("qt-config.ini");
+        let mut writer = BaseConfig::new(ConfigType::GlobalConfig);
+        writer.set_up_ini(&path);
+        writer.save_control_values();
+        writer.write_to_ini().unwrap();
+        drop(writer);
+        for player in common::settings::values_mut().players.get_value_mut() {
+            player.body_color_left = 0;
+            player.button_color_left = 0;
+            player.body_color_right = 0;
+            player.button_color_right = 0;
+        }
+        let mut reader = BaseConfig::new(ConfigType::GlobalConfig);
+        reader.set_up_ini(&path);
+        for (index, colors) in expected.iter().enumerate() {
+            for (field, color) in ["body_color_left", "button_color_left", "body_color_right", "button_color_right"].iter().zip(colors) {
+                assert_eq!(reader.ini["Controls"][&format!("player_{index}_{field}")], color.to_string());
+            }
+        }
+        reader.read_control_values();
+        let values = common::settings::values();
+        for (player, colors) in values.players.get_value().iter().zip(expected) {
+            assert_eq!([player.body_color_left, player.button_color_left,
+                player.body_color_right, player.button_color_right], colors);
+        }
+    }
+
+    #[test]
     fn input_enable_settings_round_trip_through_disk() {
         const CHILD: &str = "RUZU_TEST_INPUT_FLAGS_DISK";
         if std::env::var_os(CHILD).is_none() {

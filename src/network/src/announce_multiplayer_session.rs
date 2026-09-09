@@ -393,12 +393,19 @@ mod tests {
     #[test]
     fn register_rejects_missing_and_closed_rooms_like_upstream() {
         let state = Arc::new(Mutex::new(BackendState::default()));
-        let session = {
+        let mut session = {
             let network = RoomNetwork::new();
             AnnounceMultiplayerSession::with_backend(
                 &network,
                 Box::new(RecordingBackend::new(Arc::clone(&state))),
             )
+        };
+        // RoomNetwork also installs a process-global strong owner. Dropping
+        // that wrapper does not expire its room; exercise an actually expired
+        // weak handle without tearing down other tests' global network state.
+        session.room = {
+            let room = Arc::new(Room::new());
+            Arc::downgrade(&room)
         };
         let result = session.register();
         assert_eq!(result.result_code, WebResultCode::LibError);

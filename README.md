@@ -255,7 +255,9 @@ Python 3.9+ (`python` on Windows, `python3` on macOS) and follows these steps:
 
 The destination is the **current branch on origin**, not necessarily `main`.
 No automatic merge, rebase or force-push is performed. A failed build does not
-create a tag or push anything. Failure after tagging leaves the local commit/tag
+create a tag or push anything. Transient Git index-lock conflicts during add/commit
+are retried up to 10 times, one second apart; locks are never forcibly deleted.
+Other Git failures are not retried. Failure after tagging leaves the local commit/tag
 for review but does not publish them. Generated ZIP/installer files remain local;
 the script does not create a GitHub Release or upload its assets.
 

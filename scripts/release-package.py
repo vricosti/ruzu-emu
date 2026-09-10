@@ -6,19 +6,47 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 
 VERSION = re.compile(r"(?:v)?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
+INDEX_LOCK_ATTEMPTS = 10
 
 
 def run(repo, *args, capture=False, env=None):
+    if args[:2] in (("git", "add"), ("git", "commit")):
+        # Status refreshes (e.g. IDE integration) may briefly own index.lock.
+        # Retry only Git's explicit failure to acquire that lock. Never unlink
+        # it, retry a push, or repeat unrelated commit/hook failures.
+        environment = dict(os.environ if env is None else env)
+        environment.update(LC_ALL="C", LANGUAGE="C")
+        for attempt in range(INDEX_LOCK_ATTEMPTS):
+            result = subprocess.run(args, cwd=repo, text=True, env=environment,
+                                    stdout=subprocess.PIPE if capture else None,
+                                    stderr=subprocess.PIPE)
+            busy = (result.returncode == 128 and
+                    re.search(r"fatal: Unable to create '[^\r\n]*[/\\]index\.lock': File exists", result.stderr))
+            if busy and attempt + 1 < INDEX_LOCK_ATTEMPTS:
+                print(f"Git index is busy; retrying in 1 second ({attempt + 1}/{INDEX_LOCK_ATTEMPTS - 1}).",
+                      file=sys.stderr, flush=True)
+                time.sleep(1)
+                continue
+            if result.stderr:
+                print(result.stderr, end="", file=sys.stderr)
+            if busy:
+                print("Git index is still locked. Stop the competing Git operation and retry; "
+                      "the lock has NOT been removed.", file=sys.stderr)
+            result.check_returncode()
+            return result.stdout.strip() if capture else None
     result = subprocess.run(args, cwd=repo, check=True, text=True,
                             stdout=subprocess.PIPE if capture else None, env=env)
     return result.stdout.strip() if capture else None
 
 
 def git(repo, *args):
-    return run(repo, "git", *args, capture=True)
+    # Our read-only inspections need not refresh/write the index on disk.
+    environment = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+    return run(repo, "git", *args, capture=True, env=environment)
 
 
 def clean(repo):

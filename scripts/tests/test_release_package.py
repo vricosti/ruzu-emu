@@ -15,6 +15,39 @@ release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
 
 
+class GitIndexLockRetries(unittest.TestCase):
+    def result(self, code, stderr=""):
+        return subprocess.CompletedProcess(["git", "add"], code, stdout="", stderr=stderr)
+
+    def busy(self):
+        return self.result(128, "fatal: Unable to create 'D:/repo/.git/index.lock': File exists\n")
+
+    def test_transient_lock_retries_add_and_commit(self):
+        for command in ("add", "commit"):
+            with self.subTest(command=command), patch.object(release.subprocess, "run",
+                    side_effect=[self.busy(), self.result(0)]) as process, \
+                    patch.object(release.time, "sleep") as sleep:
+                release.run(Path("."), "git", command)
+                self.assertEqual(process.call_count, 2)
+                sleep.assert_called_once_with(1)
+
+    def test_persistent_lock_is_bounded(self):
+        with patch.object(release.subprocess, "run", return_value=self.busy()) as process, \
+                patch.object(release.time, "sleep") as sleep:
+            with self.assertRaises(subprocess.CalledProcessError):
+                release.run(Path("."), "git", "add")
+            self.assertEqual(process.call_count, release.INDEX_LOCK_ATTEMPTS)
+            self.assertEqual(sleep.call_count, release.INDEX_LOCK_ATTEMPTS - 1)
+
+    def test_unrelated_failure_is_not_retried(self):
+        with patch.object(release.subprocess, "run", return_value=self.result(128, "fatal: bad path\n")) as process, \
+                patch.object(release.time, "sleep") as sleep:
+            with self.assertRaises(subprocess.CalledProcessError):
+                release.run(Path("."), "git", "commit")
+            process.assert_called_once()
+            sleep.assert_not_called()
+
+
 class ReleasePackage(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ruzu-release-flow-")

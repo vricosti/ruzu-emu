@@ -18,7 +18,9 @@ param(
 
     [switch]$Yes,
 
-    [switch]$ForcePackage,
+    [Alias("ForcePackage")]
+    [switch]$Development,
+    [switch]$Official,
 
     [ValidateNotNullOrEmpty()]
     [string]$VcpkgRoot,
@@ -42,9 +44,12 @@ $BuildProfile = if ($PSBoundParameters.ContainsKey("Debug")) {
 else {
     "release"
 }
-$ForcePackageValue = if ($ForcePackage) { "1" } else { "0" }
-if ($ForcePackage -and $BuildAction -ne "package") {
-    throw "-ForcePackage can only be used with the package action."
+$OfficialPackageValue = if ($Official) { "1" } else { "0" }
+if ($Official -and ($BuildAction -ne "package" -or $Development)) {
+    throw "-Official requires the package action and cannot be combined with -Development."
+}
+if ($Development -and $BuildAction -ne "package") {
+    throw "-Development can only be used with the package action."
 }
 $ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDirectory
@@ -738,7 +743,7 @@ function Configure-NativeEnvironment {
         "set `"GSETTINGS_SCHEMA_DIR=$gsettingsSchemaDirectory`""
         "set `"RUZU_BUILD_ACTION=$BuildAction`""
         "set `"RUZU_BUILD_PROFILE=$BuildProfile`""
-        "set `"RUZU_FORCE_PACKAGE=$ForcePackageValue`""
+        "set `"RUZU_OFFICIAL_PACKAGE=$OfficialPackageValue`""
         "set `"PATH=$($pathEntries -join ';');%PATH%`""
     )
     Set-Content -LiteralPath $EnvironmentBatch -Value $batchLines -Encoding ASCII

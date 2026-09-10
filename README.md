@@ -208,9 +208,8 @@ Use `./build.sh package` (optionally `--skip-deps`) to build a release ZIP at
 `target/release/Ruzu-macOS-<Git revision>-<arch>-clang.zip`, containing
 `Ruzu-macOS-<Git revision>-<arch>-clang/ruzu.app`. Git supplies the archive name;
 Cargo supplies the numeric Info.plist versions. The Git naming rules are below.
-By default this starts the interactive release workflow described below.
-Use `./build.sh package --development` for a local development ZIP without
-committing, tagging or pushing.
+By default this creates a local ZIP from the current sources without committing,
+tagging or pushing. Add `--official` for the interactive release workflow below.
 
 On Windows, run `build.bat` from an ordinary Command Prompt. It detects or
 installs Visual Studio Build Tools, Rust and vcpkg, then configures the current
@@ -230,8 +229,18 @@ and installer are then generated with:
 build.bat package
 ```
 
-This starts an interactive release (Python 3.9+ is required: `python` on Windows,
-`python3` on macOS):
+This builds the current sources locally, including uncommitted changes, without
+changing the Cargo version, committing, tagging or pushing.
+Before generating package files, the script displays the directory/archive names
+(and Windows installer name) and asks for confirmation. Enter `y`/`o` to accept;
+Enter alone or a negative answer cancels without replacing existing packages.
+On Windows this happens before compilation; on macOS the binary is compiled first
+so the displayed name uses its actual architecture. In official mode, declining
+this confirmation also prevents the push (the local release commit/tag remain).
+
+To explicitly start an **official release**, use `build.bat package -Official`
+on Windows or `./build.sh package --official` on macOS. Only this mode requires
+Python 3.9+ (`python` on Windows, `python3` on macOS) and follows these steps:
 
 1. Require a clean checkout on a local branch and fetch `origin` and its tags.
 2. Propose the highest numeric version tag with its patch number incremented
@@ -251,9 +260,12 @@ for review but does not publish them. Generated ZIP/installer files remain local
 the script does not create a GitHub Release or upload its assets.
 
 For a development package (including a dirty checkout), use
-`build.bat package -ForcePackage` on Windows or
-`./build.sh package --development` on macOS. These commands only build/package;
+`build.bat package` on Windows or
+`./build.sh package` on macOS. These commands only build/package;
 they do not ask for a version, commit, tag or push.
+Explicit local mode is `-Development` on Windows and `--development` on macOS.
+These cannot be combined with `-Official` / `--official`.
+The old Windows `-ForcePackage` spelling remains a compatibility alias for `-Development`.
 
 The script builds both `ruzu.exe` and `ruzu-cmd.exe`, stages the dynamic
 `x64-windows-ruzu` vcpkg DLLs and GTK/GLib runtime data, then writes the package

@@ -413,6 +413,10 @@ fn read_ui_values(contents: &str, values: &mut uisettings::Values) {
         setting.load_string(&value);
     });
     let theme = read_section_string_setting(&ui, "theme", "colorful");
+    // Preserve an explicitly customized percentage from pre-Auto configs.
+    if !ui.contains_key("font_scale_auto") && *values.font_scale.get_value() != 100 {
+        values.font_scale_auto.set_value(false);
+    }
     let display = uisettings::THEMES.iter().find(|(name, internal)| *name == theme || *internal == theme)
         .map(|(name, _)| *name).unwrap_or(&theme);
     values.theme.set_value(display.to_owned());
@@ -1918,13 +1922,23 @@ mod tests {
         let mut source = uisettings::Values::default();
         read_ui_values("", &mut source);
         assert_eq!(*source.font_scale.get_value(), 100);
+        assert!(*source.font_scale_auto.get_value());
         for percent in [50, 100, 125, 150, 175, 200] {
             source.font_scale.set_value(percent);
             let document = save_ui_values("", &mut source);
             let mut loaded = uisettings::Values::default();
             read_ui_values(&document, &mut loaded);
             assert_eq!(*loaded.font_scale.get_value(), percent);
+            assert!(*loaded.font_scale_auto.get_value());
         }
+        source.font_scale_auto.set_value(false);
+        let document = save_ui_values("", &mut source);
+        read_ui_values(&document, &mut source);
+        assert!(!*source.font_scale_auto.get_value());
+        read_ui_values("[UI]\nfont_scale=150\nfont_scale\\default=false\n", &mut source);
+        assert!(!*source.font_scale_auto.get_value(), "preserve legacy manual customization");
+        read_ui_values("[UI]\nfont_scale=100\nfont_scale\\default=true\n", &mut source);
+        assert!(*source.font_scale_auto.get_value());
     }
 
     #[test]

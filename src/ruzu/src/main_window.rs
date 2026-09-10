@@ -7049,7 +7049,8 @@ pub fn update_ui_theme() {
     apply_global_dark_titlebar(dark);
     install_blue_accent_css();
     install_ui_theme_css(internal);
-    install_ui_font_scale(crate::uisettings::with(|v| *v.font_scale.get_value()));
+    watch_interface_font_scale();
+    refresh_interface_font_scale();
     log::debug!(
         "UI theme '{internal}' resolved to {} mode",
         if dark { "dark" } else { "light" }
@@ -7125,6 +7126,90 @@ thread_local! {
     // or leave the midnight palette installed when returning to Default/Dark.
     static UI_THEME_CSS: std::cell::RefCell<Option<gtk::CssProvider>> = const { std::cell::RefCell::new(None) };
     static UI_FONT_CSS: std::cell::RefCell<Option<gtk::CssProvider>> = const { std::cell::RefCell::new(None) };
+    static UI_FONT_SIGNATURE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static UI_FONT_WATCHING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Only compensate scaling missing from GTK; do not apply native DPI twice.
+#[cfg(any(target_os = "windows", test))]
+fn automatic_font_percent(dpi: u32, surface_scale: f64, font_dpi: f64) -> u32 {
+    if dpi == 0 || !surface_scale.is_finite() || surface_scale <= 0.0 { return 100; }
+    let font_dpi = if font_dpi.is_finite() && font_dpi > 0.0 { font_dpi } else { 96.0 };
+    (100.0 * dpi as f64 / (surface_scale * font_dpi)).round().clamp(50.0, 200.0) as u32
+}
+
+pub(crate) fn automatic_interface_font_scale(window: Option<&gtk::Window>) -> u32 {
+    #[cfg(target_os = "windows")]
+    {
+        let target = window.cloned().or_else(|| gtk::Window::list_toplevels().into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+            .find(|window| window.is_active() && window.surface().is_some())
+            .or_else(|| gtk::Window::list_toplevels().into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+                .find(|window| window.surface().is_some())));
+        if let Some(surface) = target.and_then(|w| w.surface()) {
+            let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(windows_surface_handle(&surface)) };
+            let font_dpi = gtk::Settings::default().map_or(-1.0, |s| s.gtk_xft_dpi() as f64 / 1024.0);
+            // Runtime lookup retains the GTK 4.6 minimum while using a true
+            // fractional scale when supported by a newer GDK backend.
+            let scale = if surface.find_property("scale").is_some() {
+                surface.property::<f64>("scale")
+            } else { surface.scale_factor() as f64 };
+            return automatic_font_percent(dpi, scale, font_dpi);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = window;
+    100 // Other backends retain their native GTK scaling.
+}
+
+fn watch_interface_font_scale() {
+    if UI_FONT_WATCHING.with(|watching| watching.replace(true)) { return; }
+    fn attach(window: &gtk::Window) {
+        window.connect_realize(|_| refresh_interface_font_scale());
+        window.connect_map(|_| refresh_interface_font_scale());
+    }
+    let windows = gtk::Window::toplevels();
+    windows.connect_items_changed(|windows, start, _, count| {
+        for index in start..start + count {
+            if let Some(window) = windows.item(index).and_downcast::<gtk::Window>() { attach(&window); }
+        }
+    });
+    for index in 0..windows.n_items() {
+        if let Some(window) = windows.item(index).and_downcast::<gtk::Window>() { attach(&window); }
+    }
+    // GTK Win32 truncates 125/150/175% to scale-factor=1, so scale-factor
+    // notifications alone cannot detect moves between these monitors.
+    #[cfg(target_os = "windows")]
+    glib::timeout_add_local(std::time::Duration::from_millis(250), || {
+        refresh_interface_font_scale();
+        glib::ControlFlow::Continue
+    });
+}
+
+fn refresh_interface_font_scale() {
+    let (automatic, manual) = crate::uisettings::with(|v| (*v.font_scale_auto.get_value(), *v.font_scale.get_value()));
+    if !automatic { install_ui_font_scale(manual); return; }
+    let windows = gtk::Window::toplevels();
+    let mut percentages = std::collections::BTreeSet::new();
+    for index in 0..windows.n_items() {
+        if let Some(window) = windows.item(index).and_downcast::<gtk::Window>() {
+            let percent = automatic_interface_font_scale(Some(&window));
+            let class = format!("ruzu-auto-font-{percent}");
+            for old in window.css_classes() {
+                if old.starts_with("ruzu-auto-font-") && old != class { window.remove_css_class(&old); }
+            }
+            if !window.has_css_class(&class) { window.add_css_class(&class); }
+            percentages.insert(percent);
+        }
+    }
+    replace_interface_font_css(&automatic_interface_font_css(percentages));
+}
+
+fn automatic_interface_font_css(percentages: std::collections::BTreeSet<u32>) -> String {
+    percentages.into_iter().filter(|p| *p != 100).map(|p|
+        format!(".ruzu-auto-font-{p}, .ruzu-auto-font-{p} * {{ font-size: {:.2}rem; }}\n", p as f64 / 100.0)
+    ).collect::<String>()
 }
 
 /// GTK frontend extension based on GIMP app/gui/themes.c, themes_apply_theme.
@@ -7136,14 +7221,24 @@ fn interface_font_css(percent: u32) -> Option<String> {
 }
 
 fn install_ui_font_scale(percent: u32) {
+    replace_interface_font_css(&interface_font_css(percent).unwrap_or_default());
+}
+
+fn replace_interface_font_css(css: &str) {
     let Some(display) = gtk::gdk::Display::default() else { return; };
+    let changed = UI_FONT_SIGNATURE.with(|signature| {
+        if *signature.borrow() == css { return false; }
+        *signature.borrow_mut() = css.to_owned();
+        true
+    });
+    if !changed { return; }
     UI_FONT_CSS.with(|slot| {
         if let Some(previous) = slot.borrow_mut().take() {
             gtk::style_context_remove_provider_for_display(&display, &previous);
         }
-        if let Some(css) = interface_font_css(percent) {
+        if !css.is_empty() {
             let provider = gtk::CssProvider::new();
-            provider.load_from_data(&css);
+            provider.load_from_data(css);
             gtk::style_context_add_provider_for_display(
                 &display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 3);
             *slot.borrow_mut() = Some(provider);
@@ -7154,6 +7249,19 @@ fn install_ui_font_scale(percent: u32) {
 #[cfg(test)]
 mod interface_font_tests {
     use super::*;
+
+    #[test]
+    fn automatic_font_compensates_fractional_dpi_without_double_scaling() {
+        for (dpi, scale, expected) in [(96, 1.0, 100), (120, 1.0, 125),
+            (144, 1.0, 150), (168, 1.0, 175), (192, 2.0, 100),
+            (240, 2.0, 125), (288, 3.0, 100)] {
+            assert_eq!(automatic_font_percent(dpi, scale, 96.0), expected);
+        }
+        assert_eq!(automatic_font_percent(144, 1.5, 96.0), 100);
+        assert_eq!(automatic_font_percent(144, 1.0, 144.0), 100);
+        assert_eq!(automatic_font_percent(0, 1.0, 96.0), 100);
+        assert_eq!(automatic_font_percent(144, 1.0, -1.0), 150);
+    }
 
     #[test]
     fn interface_font_scale_is_relative_bounded_and_resettable() {
@@ -7208,6 +7316,7 @@ mod interface_font_tests {
             None
         }
         let menu_label = find_label(menu.upcast_ref()).expect("menu item label");
+        assert!((50..=200).contains(&automatic_interface_font_scale(Some(&window))));
         let mut heights = Vec::new();
         for percent in [100, 150, 150, 200, 100] {
             install_ui_font_scale(percent);
@@ -7224,6 +7333,19 @@ mod interface_font_tests {
             heights.push([height, menu_label.layout().pixel_size().1,
                 dialog_label.layout().pixel_size().1]);
         }
+        // Simulate two monitors: only the first window (and its popup) needs
+        // fractional compensation. A global gtk-xft-dpi change would fail this.
+        window.add_css_class("ruzu-auto-font-150");
+        dialog.add_css_class("ruzu-auto-font-100");
+        replace_interface_font_css(&automatic_interface_font_css([100, 150].into_iter().collect()));
+        let main_loop = glib::MainLoop::new(None, false);
+        let done = main_loop.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || done.quit());
+        main_loop.run();
+        assert_eq!(label.layout().pixel_size().1, heights[1][0]);
+        assert_eq!(menu_label.layout().pixel_size().1, heights[1][1]);
+        assert_eq!(dialog_label.layout().pixel_size().1, heights[0][2]);
+        replace_interface_font_css("");
         dialog.close();
         menu.popdown();
         window.close();

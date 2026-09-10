@@ -171,12 +171,33 @@ pub(super) fn page_with_screenshot_info() -> (Page, ScreenshotInfoCallback) {
     let (theme_row, theme) = w::combo_row("Theme:", &theme_labels, theme_index);
     general.append(&theme_row);
 
-    // GTK frontend extension: GIMP-style relative font scaling (50–200%).
+    // GTK frontend extension: compensate Windows fractional DPI or use an
+    // explicit GIMP-style relative percentage. Auto seeds the manual control.
+    let automatic = uisettings::with(|v| *v.font_scale_auto.get_value());
+    let (font_mode_row, font_mode) = w::combo_row(
+        "Interface text scaling:", &["Auto", "Manual"], if automatic { 0 } else { 1 });
+    general.append(&font_mode_row);
     let (font_scale_row, font_scale) = w::spin_row(
         "Interface text size (%):",
-        uisettings::with(|v| (*v.font_scale.get_value()).clamp(50, 200)) as f64,
+        if automatic { crate::main_window::automatic_interface_font_scale(None) as f64 }
+        else { uisettings::with(|v| (*v.font_scale.get_value()).clamp(50, 200)) as f64 },
         50.0, 200.0, 10.0, "",
     );
+    font_scale.set_sensitive(!automatic);
+    let spin = font_scale.clone();
+    font_mode.connect_selected_notify(move |mode| {
+        if crate::i18n::is_retranslating() { return; }
+        let window = mode.root().and_downcast::<gtk::Window>();
+        spin.set_value(crate::main_window::automatic_interface_font_scale(window.as_ref()) as f64);
+        spin.set_sensitive(mode.selected() == 1);
+    });
+    let mode = font_mode.clone();
+    font_scale.connect_map(move |spin| {
+        if mode.selected() == 0 {
+            let window = spin.root().and_downcast::<gtk::Window>();
+            spin.set_value(crate::main_window::automatic_interface_font_scale(window.as_ref()) as f64);
+        }
+    });
     general.append(&font_scale_row);
 
     column.append(&general_group);
@@ -345,6 +366,7 @@ pub(super) fn page_with_screenshot_info() -> (Page, ScreenshotInfoCallback) {
         uisettings::with_mut(|v| {
             v.theme.set_value(theme_name);
             v.font_scale.set_value(font_scale.value_as_int() as u32);
+            v.font_scale_auto.set_value(font_mode.selected() == 0);
             v.language.set_value(language_code);
             v.show_add_ons.set_value(add_ons);
             v.show_size.set_value(size);
@@ -401,6 +423,46 @@ fn value_at(table: &[(u32, &str)], index: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires an isolated GTK display process"]
+    fn interface_font_manual_starts_at_auto_value() {
+        use gtk::prelude::*;
+        gtk::init().unwrap();
+        crate::i18n::set_language("en");
+        crate::uisettings::with_mut(|v| {
+            v.font_scale_auto.set_value(true);
+            v.font_scale.set_value(73);
+        });
+        fn find_control(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                if label.text() == name { return widget.next_sibling(); }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(found) = find_control(&widget, name) { return Some(found); }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        let page = super::page();
+        let mode = find_control(&page.widget, "Interface text scaling:").unwrap()
+            .downcast::<gtk::DropDown>().unwrap();
+        let spin = find_control(&page.widget, "Interface text size (%):").unwrap()
+            .downcast::<gtk::SpinButton>().unwrap();
+        let expected = crate::main_window::automatic_interface_font_scale(None);
+        assert_eq!(mode.selected(), 0);
+        assert!(!spin.is_sensitive());
+        assert_eq!(spin.value_as_int() as u32, expected);
+        mode.set_selected(1);
+        assert!(spin.is_sensitive());
+        assert_eq!(spin.value_as_int() as u32, expected);
+        spin.set_value(175.0);
+        mode.set_selected(0);
+        assert!(!spin.is_sensitive());
+        mode.set_selected(1);
+        assert_eq!(spin.value_as_int() as u32, expected);
+    }
+
     #[test]
     fn screenshot_preview_scales_only_automatic_height() {
         use common::settings_enums::{AspectRatio as A, ResolutionSetup as R};

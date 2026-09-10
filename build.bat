@@ -95,6 +95,7 @@ echo   %RUZU_BINARY%
 set "RUZU_BUILD_PROFILE="
 set "RUZU_BUILD_ACTION="
 set "RUZU_FORCE_PACKAGE="
+set "RUZU_OFFICIAL_PACKAGE="
 set "RUZU_BINARY="
 set "RUZU_CARGO_BINARY="
 set "RUZU_OUTPUT_DIR="
@@ -112,13 +113,14 @@ if /i "%RUZU_BUILD_PROFILE%"=="debug" (
 
 echo.
 echo Building the self-contained Windows package and NSIS installer...
-if "%RUZU_FORCE_PACKAGE%"=="1" (
-    echo Creating a development package without committing, tagging or publishing.
-    "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist\package-windows.ps1" -Profile release -ForcePackage
-) else (
+if "%RUZU_OFFICIAL_PACKAGE%"=="1" (
     python "%~dp0scripts\release-package.py" --platform windows
+) else (
+    echo Creating a development package without committing, tagging or publishing.
+    "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist\package-windows.ps1" -Profile release
 )
 set "RUZU_PACKAGE_EXIT=%ERRORLEVEL%"
+set "RUZU_OFFICIAL_PACKAGE="
 set "RUZU_BUILD_ACTION="
 set "RUZU_BUILD_PROFILE="
 set "RUZU_FORCE_PACKAGE="

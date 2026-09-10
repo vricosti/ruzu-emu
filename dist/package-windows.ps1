@@ -19,7 +19,8 @@ param(
     [string]$Version,
     [ValidateSet("release", "release-lto")]
     [string]$Profile = "release",
-    [switch]$ForcePackage,
+    [Alias("ForcePackage")]
+    [switch]$Development,
     [switch]$SkipBuild,
     [switch]$StageOnly,
     [switch]$ValidateOnly
@@ -141,7 +142,7 @@ $RevisionResolver = Join-Path $ProjectRoot "scripts\package-revision.ps1"
 $packageRevision = & $RevisionResolver -Repository $ProjectRoot
 if ($Version) { throw "-Version is no longer supported: package names are derived from Git." }
 # Retained for callers of older build scripts; development packages are now allowed.
-if ($ForcePackage) { Write-Host "-ForcePackage is no longer required." }
+if ($Development) { Write-Host "Development packaging (no commit, tag or push)." }
 $Version = $packageRevision
 $packageName = "Ruzu-Windows-$packageRevision-$Architecture-$Variant"
 $releaseCommit = & git -C $ProjectRoot rev-parse HEAD
@@ -149,6 +150,17 @@ if ($LASTEXITCODE -ne 0) { throw "Unable to resolve the release commit." }
 if ($ValidateOnly) {
     Write-Host "Windows packaging sources are valid: $packageName"
     return
+}
+
+Write-Host "Package directory: $packageName"
+if (-not $StageOnly) {
+    Write-Host "Standalone archive: $packageName.zip"
+    Write-Host "Installer: $packageName-installer.exe"
+}
+$confirmation = Read-Host "Generate this package? [y/N]"
+if ($confirmation -notmatch '^(?i:y|yes|o|oui)$') {
+    Write-Host "Packaging cancelled; no package files were changed."
+    exit 1
 }
 
 $isWindowsPlatform = if ($PSVersionTable.PSEdition -eq "Core") {

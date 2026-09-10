@@ -10,17 +10,18 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 usage() {
     cat <<'EOF'
 Usage: ./build.sh [options] [-- <extra cargo arguments>]
-       ./build.sh package [--skip-deps] [--development]
+       ./build.sh package [--skip-deps] [--official]
 
 The package command builds a macOS release and creates
 target/release/Ruzu-macOS-<Git revision>-<arch>-clang.zip containing
 Ruzu-macOS-<Git revision>-<arch>-clang/ruzu.app.
 Git revision is an exact version tag on a clean checkout, otherwise
 <branch>-<12-character commit>[-dirty]. Detached builds use branch "detached".
-By default package prompts for a release version, commits it, builds, creates
+By default package builds the current sources locally, without commits, tags or pushes.
+Only --official prompts for a release version, commits it, builds, creates
 an annotated tag, rebuilds/packages and atomically pushes the branch and tag.
 Python 3.9+ and a clean attached branch are required for this release workflow.
-Use --development for a local package without commits, tags or pushes.
+--development remains accepted as an alias for the default local mode.
 
 Options:
   --debug        Build the debug profile instead of release.
@@ -49,17 +50,23 @@ if [ "${1-}" = package ]; then
         exit 1
     fi
     package_development=0
+    package_official=0
     package_skip_deps=
     for arg in "$@"; do
         case "$arg" in
             --skip-deps) package_skip_deps=--skip-deps ;;
             --release) ;;
             --development) package_development=1 ;;
+            --official) package_official=1 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unsupported package option: $arg (use --skip-deps)." >&2; exit 1 ;;
         esac
     done
-    if [ "$package_development" = 0 ]; then
+    if [ "$package_official" = 1 ] && [ "$package_development" = 1 ]; then
+        echo "--official and --development cannot be combined." >&2
+        exit 1
+    fi
+    if [ "$package_official" = 1 ]; then
         exec python3 "$SCRIPT_DIR/scripts/release-package.py" --platform macos ${package_skip_deps:+"$package_skip_deps"}
     fi
     set -- --release ${package_skip_deps:+"$package_skip_deps"}

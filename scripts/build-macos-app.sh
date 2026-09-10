@@ -73,6 +73,14 @@ if [[ "$package" == true ]]; then
         *) echo "Unsupported macOS binary architecture." >&2; exit 1 ;;
     esac
     package_name="Ruzu-macOS-$package_revision-$package_arch-clang"
+    printf 'Package directory: %s\nStandalone archive: %s.zip\n' "$package_name" "$package_name"
+    printf 'Generate this package? [y/N]: '
+    confirmation=
+    IFS= read -r confirmation || true
+    case "$confirmation" in
+        y|Y|yes|YES|Yes|o|O|oui|OUI|Oui) ;;
+        *) echo "Packaging cancelled; no package files were changed."; exit 1 ;;
+    esac
 fi
 
 staging_root="$(mktemp -d "$build_dir/.ruzu-app.XXXXXX")"

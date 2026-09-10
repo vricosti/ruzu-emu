@@ -522,15 +522,53 @@ mod tests {
 
     #[test]
     fn applet_modes_select_guest_creation() {
-        assert!(ILibraryAppletCreator::should_create_guest_applet(
-            AppletId::MiiEdit
-        ));
-        assert!(ILibraryAppletCreator::should_create_guest_applet(
-            AppletId::ProfileSelect
-        ));
-        assert!(!ILibraryAppletCreator::should_create_guest_applet(
-            AppletId::Controller
-        ));
+        // Isolate the process-wide settings from other tests.
+        const CHILD: &str = "RUZU_TEST_APPLET_MODE_BANKS";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::service::am::service::library_applet_creator::tests::applet_modes_select_guest_creation"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        type Field = fn(&mut common::settings::Values)
+            -> &mut dyn common::settings_setting::BasicSetting;
+        // Same Name/name pairs as upstream ShouldCreateGuestApplet.
+        let fields: &[(AppletId, Field)] = &[
+            (AppletId::Cabinet, |v| &mut v.cabinet_applet_mode),
+            (AppletId::Controller, |v| &mut v.controller_applet_mode),
+            (AppletId::DataErase, |v| &mut v.data_erase_applet_mode),
+            (AppletId::Error, |v| &mut v.error_applet_mode),
+            (AppletId::NetConnect, |v| &mut v.net_connect_applet_mode),
+            (AppletId::ProfileSelect, |v| &mut v.player_select_applet_mode),
+            (AppletId::SoftwareKeyboard, |v| &mut v.swkbd_applet_mode),
+            (AppletId::MiiEdit, |v| &mut v.mii_edit_applet_mode),
+            (AppletId::Web, |v| &mut v.web_applet_mode),
+            (AppletId::Shop, |v| &mut v.shop_applet_mode),
+            (AppletId::PhotoViewer, |v| &mut v.photo_viewer_applet_mode),
+            (AppletId::OfflineWeb, |v| &mut v.offline_web_applet_mode),
+            (AppletId::LoginShare, |v| &mut v.login_share_applet_mode),
+            (AppletId::WebAuth, |v| &mut v.wifi_web_auth_applet_mode),
+            (AppletId::MyPage, |v| &mut v.my_page_applet_mode),
+        ];
+        for global in [true, false] {
+            for (selected, _) in fields {
+                {
+                    let mut values = common::settings::values_mut();
+                    for (id, field) in fields {
+                        let setting = field(&mut values);
+                        setting.set_global(global);
+                        setting.load_string(if id == selected { "LLE" } else { "HLE" });
+                    }
+                }
+                for (id, _) in fields {
+                    assert_eq!(
+                        ILibraryAppletCreator::should_create_guest_applet(*id),
+                        id == selected,
+                        "applet={id:?}, selected={selected:?}, global={global}",
+                    );
+                }
+            }
+        }
         assert!(ILibraryAppletCreator::should_create_guest_applet(
             AppletId::QLaunch
         ));

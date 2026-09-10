@@ -205,10 +205,12 @@ layout. Set `MOLTENVK_LIBRARY=/path/to/libMoltenVK.dylib` to package a specific
 MoltenVK build instead of the Homebrew installation.
 
 Use `./build.sh package` (optionally `--skip-deps`) to build a release ZIP at
-`target/release/Ruzu-macOS-v<version>.zip`, containing
-`Ruzu-macOS-v<version>/ruzu.app`. Cargo supplies the archive and Info.plist versions.
-Packaging requires a clean checkout, initialized matching submodules, and an exact
-HEAD tag `v<version>` matching Cargo. Ordinary builds do not require a release tag.
+`target/release/Ruzu-macOS-<Git revision>-<arch>-clang.zip`, containing
+`Ruzu-macOS-<Git revision>-<arch>-clang/ruzu.app`. Git supplies the archive name;
+Cargo supplies the numeric Info.plist versions. The Git naming rules are below.
+By default this starts the interactive release workflow described below.
+Use `./build.sh package --development` for a local development ZIP without
+committing, tagging or pushing.
 
 On Windows, run `build.bat` from an ordinary Command Prompt. It detects or
 installs Visual Studio Build Tools, Rust and vcpkg, then configures the current
@@ -228,15 +230,30 @@ and installer are then generated with:
 build.bat package
 ```
 
-To deliberately create a test package from another branch, use:
+This starts an interactive release (Python 3.9+ is required: `python` on Windows,
+`python3` on macOS):
 
-```bat
-build.bat package -ForcePackage
-```
+1. Require a clean checkout on a local branch and fetch `origin` and its tags.
+2. Propose the highest numeric version tag with its patch number incremented
+   (`v0.0.4` suggests `0.0.5`; without version tags, suggest `0.0.1`).
+3. Ask for the version and explicit confirmation, including the destination branch.
+4. Update the workspace version in `Cargo.toml` and refresh `Cargo.lock` with
+   `cargo update --workspace --offline`, then commit only those two files.
+5. Build. Only on success, create the annotated tag (e.g. `v0.0.5`, with message
+   `v0.0.5`). Existing tags are never overwritten.
+6. Rebuild/package with the tag present, so embedded build metadata matches
+   the release name. Push the commit and tag together using `git push --atomic`.
 
-`-ForcePackage` bypasses the release tag and clean-checkout/submodule checks and
-prints a warning. Cargo remains authoritative: a different `-Version` override
-is rejected. All build, dependency, runtime-file, and NSIS validations remain enabled.
+The destination is the **current branch on origin**, not necessarily `main`.
+No automatic merge, rebase or force-push is performed. A failed build does not
+create a tag or push anything. Failure after tagging leaves the local commit/tag
+for review but does not publish them. Generated ZIP/installer files remain local;
+the script does not create a GitHub Release or upload its assets.
+
+For a development package (including a dirty checkout), use
+`build.bat package -ForcePackage` on Windows or
+`./build.sh package --development` on macOS. These commands only build/package;
+they do not ask for a version, commit, tag or push.
 
 The script builds both `ruzu.exe` and `ruzu-cmd.exe`, stages the dynamic
 `x64-windows-ruzu` vcpkg DLLs and GTK/GLib runtime data, then writes the package
@@ -244,17 +261,26 @@ directory, standalone ZIP and NSIS installer under `target\package`. The ZIP con
 the versioned directory with both executables and their runtime dependencies.
 Windows package names include the tag prefix, for example
 `Ruzu-Windows-v0.0.2-x64-msvc.zip` and `Ruzu-Windows-v0.0.2-x64-msvc-installer.exe`.
-Normal packaging requires a clean checkout (including untracked files), initialized
-submodules matching the recorded commits, and an exact HEAD tag equal to
-`v<workspace Cargo version>`. Detached HEAD at that tag is supported; no particular
-branch name is required for Ruzu or its submodules. The advanced staging-only
+Names are derived from Git, independently of the Cargo version:
+
+- Clean commit with an exact version tag: `Ruzu-Windows-v0.0.5-x64-msvc`.
+- Other clean commit: `Ruzu-Windows-feat-ui-font-scaling-0123456789ab-x64-msvc`.
+- Modified checkout: `Ruzu-Windows-feat-ui-font-scaling-0123456789ab-dirty-x64-msvc`.
+
+The same base name is used for the directory, `.zip`, and `-installer.exe`.
+Branches are sanitized for filenames (`/` becomes `-`); untagged detached HEAD
+uses `detached`. Hashes contain 12 characters. Dirty includes staged, unstaged,
+untracked (not ignored) files and changed/uninitialized submodules. Dirty takes
+precedence over tags. Version tags match `vMAJOR.MINOR.PATCH`, optionally with a
+prerelease suffix; if several match HEAD, the first in Git refname order wins.
+macOS uses the same rule with `macOS`, `arm64`/`x64`/`universal`, and `clang`.
+
+The advanced staging-only
 and existing-binary modes remain available by invoking
 `dist\package-windows.ps1` directly with `-StageOnly` or `-SkipBuild`.
 
-Package names use `workspace.package.version` from `Cargo.toml`. When the
-checked-out commit has the matching exact tag (for example `v0.0.1` for version
-`0.0.1`), Ruzu also displays that tag as its build version. Untagged builds keep
-the development identity `<short-commit>-<branch>`.
+Cargo still supplies the numeric macOS bundle metadata; it no longer determines
+package filenames. This packaging change does not alter Ruzu's window title.
 
 There is also a headless command-line frontend:
 

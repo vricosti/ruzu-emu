@@ -798,8 +798,7 @@ if ($BuildAction -eq "package") {
         throw "Packaging is only available for release builds."
     }
     # Validate before the potentially expensive vcpkg dependency build.
-    $null = & (Join-Path $ScriptDirectory "check-release.ps1") `
-        -Repository $ProjectRoot -ForcePackage:$ForcePackage
+    $null = & (Join-Path $ScriptDirectory "package-revision.ps1") -Repository $ProjectRoot
 }
 $vcpkgRoot = Ensure-VcpkgDependencies
 Configure-NativeEnvironment -VcpkgRoot $vcpkgRoot -VSInstallPath $vsInstallPath

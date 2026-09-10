@@ -137,12 +137,17 @@ function Copy-RequiredFile {
 }
 
 Assert-PackagingSources
-$ReleaseValidator = Join-Path $ProjectRoot "scripts\check-release.ps1"
-$Version = & $ReleaseValidator -Repository $ProjectRoot -Version $Version -ForcePackage:$ForcePackage
+$RevisionResolver = Join-Path $ProjectRoot "scripts\package-revision.ps1"
+$packageRevision = & $RevisionResolver -Repository $ProjectRoot
+if ($Version) { throw "-Version is no longer supported: package names are derived from Git." }
+# Retained for callers of older build scripts; development packages are now allowed.
+if ($ForcePackage) { Write-Host "-ForcePackage is no longer required." }
+$Version = $packageRevision
+$packageName = "Ruzu-Windows-$packageRevision-$Architecture-$Variant"
 $releaseCommit = & git -C $ProjectRoot rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw "Unable to resolve the release commit." }
 if ($ValidateOnly) {
-    Write-Host "Windows packaging sources are valid for Ruzu $Version."
+    Write-Host "Windows packaging sources are valid: $packageName"
     return
 }
 
@@ -198,7 +203,7 @@ else {
 }
 $binaryDirectory = Join-Path $targetRoot $Profile
 $packageRoot = Join-Path $targetRoot "package"
-$stageDirectory = Join-Path $packageRoot "Ruzu-Windows-v$Version-$Architecture-$Variant"
+$stageDirectory = Join-Path $packageRoot $packageName
 $outputDirectory = $packageRoot
 
 if (Test-Path -LiteralPath $stageDirectory) {
@@ -266,10 +271,10 @@ if (-not (Test-Path -LiteralPath $compiledSchemas -PathType Leaf)) {
 
 Write-Host "Staged Ruzu and $($runtimeDlls.Count) vcpkg DLLs in:"
 Write-Host "  $stageDirectory"
-$null = & $ReleaseValidator -Repository $ProjectRoot -Version $Version -ForcePackage:$ForcePackage
+$currentRevision = & $RevisionResolver -Repository $ProjectRoot
 $currentCommit = & git -C $ProjectRoot rev-parse HEAD
-if ($LASTEXITCODE -ne 0 -or $currentCommit -ne $releaseCommit) {
-    throw "The release commit changed during packaging; rebuild the release."
+if ($LASTEXITCODE -ne 0 -or $currentCommit -ne $releaseCommit -or $currentRevision -ne $packageRevision) {
+    throw "The Git package identity changed during packaging; rebuild the package."
 }
 if ($StageOnly) {
     return
@@ -280,6 +285,7 @@ Push-Location $DistDirectory
 try {
     & $makeNsis `
         "/DPRODUCT_VERSION=$Version" `
+        "/DPACKAGE_NAME=$packageName" `
         "/DARCH=$Architecture" `
         "/DVARIANT=$Variant" `
         "/DBINARY_SOURCE_DIR=$stageDirectory" `
@@ -293,14 +299,14 @@ finally {
     Pop-Location
 }
 
-$installer = Join-Path $outputDirectory "Ruzu-Windows-v$Version-$Architecture-$Variant-installer.exe"
+$installer = Join-Path $outputDirectory "$packageName-installer.exe"
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "NSIS completed without producing the expected installer: $installer"
 }
 Write-Host "Created Windows installer:"
 Write-Host "  $installer"
 
-$archive = Join-Path $outputDirectory "Ruzu-Windows-v$Version-$Architecture-$Variant.zip"
+$archive = Join-Path $outputDirectory "$packageName.zip"
 Compress-Archive -LiteralPath $stageDirectory -DestinationPath $archive -CompressionLevel Optimal -Force
 if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
     throw "The standalone ZIP archive was not produced: $archive"

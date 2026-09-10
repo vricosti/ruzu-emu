@@ -113,10 +113,10 @@ if /i "%RUZU_BUILD_PROFILE%"=="debug" (
 echo.
 echo Building the self-contained Windows package and NSIS installer...
 if "%RUZU_FORCE_PACKAGE%"=="1" (
-    echo WARNING: Release tag and clean-checkout checks are disabled for this package.
+    echo Creating a development package without committing, tagging or publishing.
     "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist\package-windows.ps1" -Profile release -ForcePackage
 ) else (
-    "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist\package-windows.ps1" -Profile release
+    python "%~dp0scripts\release-package.py" --platform windows
 )
 set "RUZU_PACKAGE_EXIT=%ERRORLEVEL%"
 set "RUZU_BUILD_ACTION="

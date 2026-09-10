@@ -45,11 +45,10 @@ done
 
 cd "$repo_root"
 if [[ "$package" == true ]]; then
-    # Also validate direct invocations, before touching an existing app or archive.
-    sh "$repo_root/scripts/check-release.sh" "$repo_root" >/dev/null
+    package_revision="$(sh "$repo_root/scripts/package-revision.sh" "$repo_root")"
     release_commit="$(git rev-parse HEAD)"
 fi
-# Cargo resolves workspace-inherited versions; do not parse TOML or trust the tag.
+# Cargo supplies numeric bundle metadata only, never the archive name.
 package_id="$(cargo pkgid --offline -p ruzu)"
 version="${package_id##*#}"
 version="${version##*@}"
@@ -64,6 +63,16 @@ fi
 if [[ ! -x "$binary" ]]; then
     echo "Cargo did not produce $binary." >&2
     exit 1
+fi
+
+if [[ "$package" == true ]]; then
+    case "$(lipo -archs "$binary")" in
+        arm64) package_arch=arm64 ;;
+        x86_64) package_arch=x64 ;;
+        "x86_64 arm64"|"arm64 x86_64") package_arch=universal ;;
+        *) echo "Unsupported macOS binary architecture." >&2; exit 1 ;;
+    esac
+    package_name="Ruzu-macOS-$package_revision-$package_arch-clang"
 fi
 
 staging_root="$(mktemp -d "$build_dir/.ruzu-app.XXXXXX")"
@@ -180,14 +189,14 @@ codesign --force --sign - "$staging" >/dev/null
 codesign --verify --deep --strict "$staging"
 
 if [[ "$package" == true ]]; then
-    # Do not publish if the sources changed during compilation or bundling.
-    checked_version="$(sh "$repo_root/scripts/check-release.sh" "$repo_root")"
-    if [[ "$checked_version" != "$version" || "$(git rev-parse HEAD)" != "$release_commit" ]]; then
-        echo "Release version or commit changed while packaging; rebuild the release." >&2
+    # Reject changes to the package identity during compilation or bundling.
+    checked_revision="$(sh "$repo_root/scripts/package-revision.sh" "$repo_root")"
+    if [[ "$checked_revision" != "$package_revision" || "$(git rev-parse HEAD)" != "$release_commit" ]]; then
+        echo "Git package identity changed while packaging; rebuild the package." >&2
         exit 1
     fi
-    archive="$build_dir/Ruzu-macOS-v$version.zip"
-    package_root="$staging_root/Ruzu-macOS-v$version"
+    archive="$build_dir/$package_name.zip"
+    package_root="$staging_root/$package_name"
     mkdir "$package_root"
     mv "$staging" "$package_root/ruzu.app"
     # Keep the previous archive intact until the new signed bundle is compressed.

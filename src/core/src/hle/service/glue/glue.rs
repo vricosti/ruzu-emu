@@ -155,35 +155,10 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         });
         server_manager.register_named_service("time:r", factory, 64);
 
-        // time:s — upstream registers this in PSC::LoopProcess (psc.cpp),
-        // not in Glue. Placed here temporarily until PSC is ported.
-        // Upstream: StaticServiceSetupInfo{0, 0, 1, 0, 0, 0}
-        let psc_setup = StaticServiceSetupInfo {
-            can_write_local_clock: false,
-            can_write_user_clock: false,
-            can_write_network_clock: true,
-            can_write_timezone_device_location: false,
-            can_write_steady_clock: false,
-            can_write_uninitialized_clock: false,
-        };
-        let time_manager_psc = Arc::downgrade(&time_manager);
-        let system_psc = system;
-        let factory: SessionRequestHandlerFactory = Box::new(move || {
-            Arc::new(GlueTimeStaticService::new(
-                system_psc,
-                psc_setup,
-                "time:s",
-                time_manager_psc
-                    .upgrade()
-                    .expect("Glue time lifetime has ended"),
-            ))
-        });
-        server_manager.register_named_service("time:s", factory, 64);
     }
 
     log::debug!(
-        "Glue::LoopProcess: registered arp, bgtc, ectx, notif, time services \
-         (time:s temporary, belongs to PSC)"
+        "Glue::LoopProcess: registered arp, bgtc, ectx, notif, time:u/a/r services"
     );
 
     // Upstream keeps `time` on LoopProcess's native stack. A stopped Rust

@@ -93,6 +93,7 @@ x11 = { version = "2", features = ["glx", "xlib"] }
 junction = "2.0"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Globalization",
     "Win32_System_Com",
     "Win32_System_Console",

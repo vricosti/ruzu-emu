@@ -82,6 +82,7 @@ pub fn get_time_from_time_point_and_context(
 /// require sub-service creation, and create standalone sub-services
 /// for the "Get" methods.
 pub struct StaticService {
+    pub service_name: String,
     pub setup_info: StaticServiceSetupInfo,
     automatic_correction_enabled: AtomicBool,
     automatic_correction_time_point: Mutex<SteadyClockTimePoint>,
@@ -133,6 +134,7 @@ impl StaticService {
             (commands::CALCULATE_SPAN_BETWEEN, Some(StaticService::calculate_span_between_handler), "CalculateSpanBetween"),
         ]);
         Self {
+            service_name: "time:su".into(),
             setup_info,
             automatic_correction_enabled: AtomicBool::new(false),
             automatic_correction_time_point: Mutex::new(SteadyClockTimePoint::default()),
@@ -1176,13 +1178,17 @@ impl SessionRequestHandler for StaticService {
     }
 
     fn service_name(&self) -> &str {
-        "time:su"
+        &self.service_name
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
 impl ServiceFramework for StaticService {
     fn get_service_name(&self) -> &str {
-        "time:su"
+        &self.service_name
     }
 
     fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {

@@ -1749,6 +1749,8 @@ impl GMainWindow {
             .default_width(geometry.width)
             .default_height(geometry.height)
             .build();
+        #[cfg(target_os = "windows")]
+        preserve_native_maximized_size(window.upcast_ref());
         if geometry.maximized { window.maximize(); }
 
         // Root vertical layout. On macOS the menu bar lives in the native
@@ -5702,6 +5704,8 @@ impl GMainWindow {
                 .default_width(geometry.width)
                 .default_height(geometry.height)
                 .build();
+            #[cfg(target_os = "windows")]
+            preserve_native_maximized_size(&window);
             if geometry.maximized { window.maximize(); }
             let area = gtk::Box::new(gtk::Orientation::Vertical, 0);
             area.add_css_class("ruzu-render-bg");
@@ -7041,12 +7045,78 @@ pub fn update_ui_theme() {
         }
     }
     settings.set_gtk_application_prefer_dark_theme(dark);
+    #[cfg(target_os = "windows")]
+    apply_global_dark_titlebar(dark);
     install_blue_accent_css();
     install_ui_theme_css(internal);
     log::debug!(
         "UI theme '{internal}' resolved to {} mode",
         if dark { "dark" } else { "light" }
     );
+}
+
+/// Eden main_window.cpp: ApplyWindowsTitleBarDarkMode. Keep its attribute-20
+/// attempt and attribute-19 fallback for older Windows versions.
+#[cfg(target_os = "windows")]
+fn apply_windows_title_bar_dark_mode(hwnd: windows_sys::Win32::Foundation::HWND, enabled: bool) {
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    if hwnd.is_null() { return; }
+    let value = i32::from(enabled);
+    unsafe {
+        if DwmSetWindowAttribute(hwnd, 20, (&value as *const i32).cast(), size_of::<i32>() as u32) >= 0 {
+            return;
+        }
+        DwmSetWindowAttribute(hwnd, 19, (&value as *const i32).cast(), size_of::<i32>() as u32);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_dark_to_top_level(window: &gtk::Window, dark: bool) {
+    if let Some(surface) = window.surface() {
+        apply_windows_title_bar_dark_mode(windows_surface_handle(&surface), dark);
+    }
+}
+
+#[cfg(target_os = "windows")]
+thread_local! {
+    static TITLEBAR_DARK: Cell<bool> = const { Cell::new(false) };
+    static TITLEBAR_FILTER_INSTALLED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// GTK equivalent of Eden's TitlebarFilter: observe existing and future
+/// toplevels, including dialogs. Signals follow native-handle creation, showing,
+/// focus and state changes; weak-free callbacks do not retain the windows.
+#[cfg(target_os = "windows")]
+fn apply_global_dark_titlebar(dark: bool) {
+    fn apply_current(window: &gtk::Window) {
+        TITLEBAR_DARK.with(|dark| apply_dark_to_top_level(window, dark.get()));
+    }
+    fn attach(window: &gtk::Window) {
+        window.connect_realize(apply_current);
+        window.connect_map(apply_current);
+        window.connect_is_active_notify(apply_current);
+        window.connect_maximized_notify(apply_current);
+        window.connect_fullscreened_notify(apply_current);
+    }
+    TITLEBAR_DARK.with(|value| value.set(dark));
+    let windows = gtk::Window::toplevels();
+    let install = TITLEBAR_FILTER_INSTALLED.with(|installed| !installed.replace(true));
+    if install {
+        windows.connect_items_changed(|windows, position, _, added| {
+            for index in position..position + added {
+                if let Some(window) = windows.item(index).and_downcast::<gtk::Window>() {
+                    attach(&window);
+                    apply_current(&window);
+                }
+            }
+        });
+    }
+    for index in 0..windows.n_items() {
+        if let Some(window) = windows.item(index).and_downcast::<gtk::Window>() {
+            if install { attach(&window); }
+            apply_current(&window);
+        }
+    }
 }
 
 thread_local! {
@@ -7408,6 +7478,238 @@ fn force_menu_mnemonic_underlines(root: &gtk::Widget) {
 /// empty here.
 fn build_menu_model() -> gio::MenuModel {
     build_menu_model_for_tas_state(input_common::drivers::tas_input::TasState::Stopped)
+}
+
+/// GTK/Win32 adaptation of Qt's native maximized geometry handling. Opening a
+/// popover requests a new layout; GTK 4.22 can then resize a natively maximized
+/// HWND to its normal default size without clearing WS_MAXIMIZE. Keep the
+/// native client size authoritative while Windows owns the maximized layout.
+#[cfg(target_os = "windows")]
+fn preserve_native_maximized_size(window: &gtk::Window) {
+    window.connect_realize(|window| {
+        let Some(surface) = window.surface() else { return; };
+        let Ok(toplevel) = surface.clone().dynamic_cast::<gtk::gdk::Toplevel>() else { return; };
+        // GTK 4.22's Win32 compute_toplevel_size also clamps an explicitly
+        // maximized layout to the monitor WORKAREA height, without subtracting
+        // the native caption. That can make the GDK allocation larger than the
+        // HWND client area even though the native window rectangle is correct.
+        // Keep launcher/render-host content inside the actual client rectangle.
+        // Qt handles this non-client exclusion internally (frontend exception).
+        if let Some(child) = window.child() {
+            let bottom = child.margin_bottom();
+            let end = child.margin_end();
+            let weak = window.downgrade();
+            surface.connect_layout(move |surface, width, height| {
+                let Some(window) = weak.upgrade() else { return; };
+                let Some(child) = window.child() else { return; };
+                let hwnd = windows_surface_handle(surface);
+                let mut rect = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                if !hwnd.is_null()
+                    && unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsIconic(hwnd) } == 0
+                    && unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect) } != 0
+                    && rect.right > rect.left && rect.bottom > rect.top
+                {
+                    let scale = surface.scale_factor().max(1);
+                    child.set_margin_bottom(bottom + (height - (rect.bottom - rect.top) / scale).max(0));
+                    child.set_margin_end(end + (width - (rect.right - rect.left) / scale).max(0));
+                }
+            });
+        }
+        // gdk4 0.9's connect_compute_size trampoline casts the size struct to
+        // a pointer wrapper instead of wrapping its address. Use the C ABI
+        // directly until that binding is upgraded, otherwise set_size faults.
+        unsafe extern "C" fn compute_size(
+            _: *mut gtk::gdk::ffi::GdkToplevel,
+            size: *mut gtk::gdk::ffi::GdkToplevelSize,
+            data: gtk::glib::ffi::gpointer,
+        ) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, IsIconic, IsZoomed};
+            let weak = &*data.cast::<gtk::glib::WeakRef<gtk::Window>>();
+            let Some(window) = weak.upgrade() else { return; };
+            if window.is_fullscreen() { return; }
+            let Some(surface) = window.surface() else { return; };
+            let hwnd = windows_surface_handle(&surface);
+            if hwnd.is_null() || unsafe { IsZoomed(hwnd) == 0 || IsIconic(hwnd) != 0 } { return; }
+            let mut rect = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            if unsafe { GetClientRect(hwnd, &mut rect) } != 0 && rect.right > rect.left && rect.bottom > rect.top {
+                let scale = surface.scale_factor().max(1);
+                gtk::gdk::ffi::gdk_toplevel_size_set_size(size,
+                    (rect.right - rect.left) / scale, (rect.bottom - rect.top) / scale);
+            }
+        }
+        unsafe {
+            gtk::glib::signal::connect_raw(
+                toplevel.as_ptr().cast(), c"compute-size".as_ptr(),
+                Some(std::mem::transmute::<*const (), unsafe extern "C" fn()>(compute_size as *const ())),
+                Box::into_raw(Box::new(window.downgrade())),
+            );
+        }
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn windows_surface_handle(surface: &gtk::gdk::Surface) -> windows_sys::Win32::Foundation::HWND {
+    #[link(name = "gtk-4")]
+    extern "C" {
+        fn gdk_win32_surface_get_handle(surface: *mut std::ffi::c_void) -> windows_sys::Win32::Foundation::HWND;
+    }
+    unsafe { gdk_win32_surface_get_handle(surface.as_ptr().cast()) }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod maximized_menu_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a Windows GTK display and an isolated process"]
+    fn opening_file_menu_preserves_maximized_window() {
+        crate::configure_windows_native_decorations();
+        crate::configure_windows_gsk_renderer();
+        gtk::init().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        common::fs::path_util::set_app_directory(directory.path().to_str().unwrap());
+        let app = Application::builder().application_id("org.ruzu.MaximizedMenuTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        init_app_menu(&app);
+        apply_global_dark_titlebar(true);
+        let main = GMainWindow::new_for_direct_game(&app);
+        let window = main.window.clone();
+        let menubar = main.menu_bar.as_ref().unwrap();
+        window.present();
+        let settle = || {
+            let main_loop = gtk::glib::MainLoop::new(None, false);
+            let done = main_loop.clone();
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || done.quit());
+            main_loop.run();
+        };
+        settle();
+        #[link(name = "gtk-4")]
+        extern "C" {
+            fn gdk_win32_surface_get_handle(surface: *mut std::ffi::c_void) -> windows_sys::Win32::Foundation::HWND;
+        }
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, IsZoomed, GetWindowRect, WM_SYSCOMMAND, SC_MAXIMIZE};
+        let hwnd = unsafe { gdk_win32_surface_get_handle(window.surface().unwrap().as_ptr().cast()) };
+        let native_rect = || {
+            let mut rect = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            assert_ne!(unsafe { GetWindowRect(hwnd, &mut rect) }, 0);
+            (rect.left, rect.top, rect.right, rect.bottom)
+        };
+        let normal_rect = native_rect();
+        let assert_status_visible = || {
+            let bar = main.status_bar.widget();
+            assert!(bar.is_mapped(), "status bar must be mapped");
+            let bounds = bar.compute_bounds(&window).unwrap();
+            let surface = window.surface().unwrap();
+            let mut client = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client); }
+            assert!(bounds.height() > 0.0 && bounds.y() >= 0.0);
+            assert!(bounds.y() + bounds.height() <= (client.bottom / surface.scale_factor()) as f32,
+                "status bar {bounds:?} must fit in native client height {} at scale {}", client.bottom, surface.scale_factor());
+        };
+        // Exercise native maximize, as with the titlebar button, not just GTK's API.
+        unsafe { SendMessageW(hwnd, WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0); }
+        settle();
+        let before = window.is_maximized();
+        assert_status_visible();
+        let rect_before = native_rect();
+        let native_dark = |window: &gtk::Window| {
+            let hwnd = windows_surface_handle(&window.surface().unwrap());
+            let mut value = 0i32;
+            let result = unsafe { windows_sys::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+                hwnd, 20, (&mut value as *mut i32).cast(), size_of::<i32>() as u32) };
+            assert!(result >= 0, "DWM dark-mode query failed: {result:#x}");
+            value != 0
+        };
+        assert!(native_dark(window.upcast_ref()), "new main window must inherit dark titlebar");
+        let dialog = gtk::Window::builder().transient_for(&window).title("Titlebar regression").build();
+        dialog.present();
+        settle();
+        assert!(native_dark(&dialog), "new dialogs must inherit dark titlebars");
+        apply_global_dark_titlebar(false);
+        assert!(!native_dark(window.upcast_ref()));
+        assert!(!native_dark(&dialog));
+        apply_global_dark_titlebar(true);
+        assert!(native_dark(window.upcast_ref()));
+        assert!(native_dark(&dialog));
+        dialog.destroy();
+        settle();
+        assert_eq!(native_rect(), rect_before, "theme changes must not alter maximized geometry");
+        let item = menubar.first_child().unwrap();
+        let activated = item.activate();
+        settle();
+        let after = window.is_maximized();
+        let native_after = unsafe { IsZoomed(hwnd) != 0 };
+        let rect_after = native_rect();
+        assert_status_visible();
+        let mut child = item.first_child();
+        let mut popup_visible = false;
+        while let Some(widget) = child {
+            if widget.is::<gtk::Popover>() && widget.is_mapped() { popup_visible = true; }
+            child = widget.next_sibling();
+        }
+        assert!(before, "test window must initially be maximized");
+        assert!(activated && popup_visible, "File menu must be open");
+        assert!(after, "opening File must preserve maximized state");
+        assert!(native_after, "native HWND must remain maximized");
+        assert_eq!(rect_after, rect_before, "opening File must not move or shrink the maximized native window");
+        let mut menu = menubar.first_child();
+        while let Some(item) = menu {
+            item.activate();
+            settle();
+            assert_eq!(native_rect(), rect_before, "switching menus must preserve maximized geometry");
+            let mut child = item.first_child();
+            while let Some(widget) = child {
+                if let Some(popover) = widget.downcast_ref::<gtk::Popover>() { popover.popdown(); }
+                child = widget.next_sibling();
+            }
+            settle();
+            assert_eq!(native_rect(), rect_before, "closing menus must preserve maximized geometry");
+            assert_status_visible();
+            menu = item.next_sibling();
+        }
+        unsafe { SendMessageW(hwnd, WM_SYSCOMMAND, windows_sys::Win32::UI::WindowsAndMessaging::SC_RESTORE as usize, 0); }
+        settle();
+        assert!(!window.is_maximized());
+        assert_eq!(native_rect(), normal_rect, "native restore must recover the original normal geometry");
+        assert_status_visible();
+        window.maximize();
+        settle();
+        assert_eq!(native_rect(), rect_before, "GTK maximize must retain native geometry too");
+        assert_status_visible();
+        main.set_fullscreen(true);
+        settle();
+        assert!(window.is_fullscreen());
+        assert!(!main.status_bar.widget().is_mapped(), "fullscreen intentionally hides status bar");
+        main.set_fullscreen(false);
+        settle();
+        assert!(window.is_maximized());
+        assert_eq!(native_rect(), rect_before, "leaving fullscreen must restore maximized geometry");
+        assert_status_visible();
+        // Exercise actual GTK stylesheet replacement, not just DWM attributes,
+        // with the launcher page hidden as it is during emulation.
+        main.stack.set_visible_child_name(PAGE_RENDER);
+        for &(theme, _) in crate::uisettings::THEMES {
+            eprintln!("Applying theme {theme}");
+            crate::uisettings::with_mut(|v| v.theme.set_value(theme.into()));
+            update_ui_theme();
+            settle();
+            assert_status_visible();
+            crate::gtk_compat::ask_question(Some(&window), "Ruzu",
+                "Are you sure you want to close ruzu?", "Cancel", "Close ruzu", |_| {});
+            settle();
+            let dialogs = gtk::Window::toplevels();
+            let question = (0..dialogs.n_items()).find_map(|index|
+                dialogs.item(index).and_downcast::<gtk::MessageDialog>()).unwrap();
+            assert_eq!(native_dark(question.upcast_ref()), native_dark(window.upcast_ref()),
+                "confirmation titlebar must match {theme}");
+            assert_eq!(question.style_context().lookup_color("theme_bg_color"),
+                window.style_context().lookup_color("theme_bg_color"),
+                "confirmation palette must match {theme}");
+            question.response(gtk::ResponseType::Cancel);
+            settle();
+        }
+        window.close();
+    }
 }
 
 fn build_menu_model_for_tas_state(

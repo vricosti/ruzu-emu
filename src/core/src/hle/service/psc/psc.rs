@@ -260,6 +260,7 @@ pub fn loop_process(
     use crate::hle::service::server_manager::ServerManager;
 
     let server_manager = ServerManager::new_shared(system.clone());
+    let time_server = Arc::downgrade(&server_manager);
     {
         let mut server_manager = server_manager.lock().unwrap();
 
@@ -307,10 +308,11 @@ pub fn loop_process(
         stub(&mut server_manager, "ovln:snd");
 
         let time_sm: Arc<dyn SessionRequestHandler> = Arc::new(
-            crate::hle::service::psc::time::service_manager::TimeServiceManager::new(
+            crate::hle::service::psc::time::service_manager::TimeServiceManager::new_with_server_manager(
                 system,
                 device_memory,
                 memory_manager,
+                time_server,
             ),
         );
         let time_sm_factory = {

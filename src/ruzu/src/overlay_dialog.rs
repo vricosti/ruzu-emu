@@ -347,13 +347,16 @@ fn install_css() {
             return;
         };
         let provider = gtk::CssProvider::new();
+        // Eden's overlay palette is overridden by each theme stylesheet.
+        // The GTK shutdown panel follows the live theme's named colors instead
+        // of retaining the default theme's fixed light RGB values.
         provider.load_from_data(
             ".ruzu-overlay-dialog-panel {\
-                 background-color: rgb(240, 240, 240);\
+                 background-color: @theme_bg_color;\
                  border-radius: 6px;\
              }\
              .ruzu-overlay-dialog-text {\
-                 color: rgb(44, 44, 44);\
+                 color: @theme_fg_color;\
                  font-family: sans-serif;\
                  font-size: 18pt;\
                  font-weight: normal;\
@@ -408,6 +411,61 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[test]
+    #[ignore = "requires GTK display and isolated theme settings; run alone"]
+    fn closing_software_uses_live_theme_background_and_text() {
+        #[cfg(target_os = "windows")]
+        {
+            crate::configure_windows_native_decorations();
+            crate::configure_windows_gsk_renderer();
+        }
+        gtk::init().unwrap();
+        let app = gtk::Application::builder().application_id("org.ruzu.ShutdownThemeTest").build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let parent = gtk::ApplicationWindow::builder().application(&app)
+            .default_width(1280).default_height(720).build();
+        parent.present();
+        let overlay = OverlayDialog::closing_software(&parent);
+        let panel = overlay.window.child().unwrap();
+        let label = panel.first_child().unwrap();
+        for theme in ["Default", "Dark", "Midnight Blue", "Default"] {
+            crate::uisettings::with_mut(|v| v.theme.set_value(theme.into()));
+            crate::main_window::update_ui_theme();
+            let event_loop = gtk::glib::MainLoop::new(None, false);
+            let done = event_loop.clone();
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || done.quit());
+            event_loop.run();
+            let context = panel.style_context();
+            let background = context.lookup_color("theme_bg_color").unwrap();
+            let foreground = context.lookup_color("theme_fg_color").unwrap();
+            assert_eq!(label.style_context().color(), foreground, "text must follow {theme}");
+            // Inspect a rendered background pixel, not just the theme's named
+            // palette: fixed RGB declarations can otherwise escape the test.
+            let snapshot = gtk::Snapshot::new();
+            snapshot.render_background(&context, 0.0, 0.0, 32.0, 32.0);
+            let node = snapshot.to_node().unwrap();
+            let mut image = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 32, 32).unwrap();
+            {
+                let cr = gtk::cairo::Context::new(&image).unwrap();
+                node.draw(&cr);
+            }
+            let stride = image.stride() as usize;
+            let pixels = image.data().unwrap();
+            let offset = 16 * stride + 16 * 4;
+            let pixel = u32::from_ne_bytes(pixels[offset..offset + 4].try_into().unwrap());
+            for (actual, expected) in [
+                ((pixel >> 16) & 255, background.red()),
+                ((pixel >> 8) & 255, background.green()),
+                (pixel & 255, background.blue()),
+            ] {
+                assert!((actual as f32 - expected * 255.0).abs() <= 1.0,
+                    "rendered background must follow {theme}: pixel={pixel:#x}, expected={background:?}");
+            }
+        }
+        overlay.close();
+        parent.close();
+    }
 
     #[test]
     fn shutdown_panel_uses_edens_regular_overlay_proportions() {

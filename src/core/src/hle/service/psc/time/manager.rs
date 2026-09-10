@@ -36,7 +36,7 @@ pub struct TimeManager {
     pub ephemeral_network_clock: EphemeralNetworkSystemClockCore,
     pub time_zone: TimeZone,
     pub shared_memory: SharedMemory,
-    pub power_state_request_manager: PowerStateRequestManager,
+    pub power_state_request_manager: Arc<PowerStateRequestManager>,
     pub alarms: Alarms,
     pub local_system_clock_context_writer: LocalSystemClockContextWriter,
     pub network_system_clock_context_writer: NetworkSystemClockContextWriter,
@@ -111,7 +111,7 @@ impl TimeManager {
         };
 
         // PowerStateRequestManager
-        let power_state_request_manager = PowerStateRequestManager::new();
+        let power_state_request_manager = Arc::new(PowerStateRequestManager::new());
 
         // Alarms — gets a raw time callback from the steady clock tick source
         let alarms = Alarms::new({

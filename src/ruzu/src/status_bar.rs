@@ -776,13 +776,13 @@ fn install_css() {
             return;
         };
         let provider = gtk::CssProvider::new();
+        // Eden leaves these widgets on the application font. Inherit GTK's
+        // system font and DPI adjustments instead of fixing captions to pixels.
         provider.load_from_data(&format!(
             ".ruzu-statusbar {{ padding: 0 2px; min-height: 0; }}\
              .ruzu-statusbar button {{ padding: 2px 6px; min-height: 0; min-width: 0;\
-                 border: 1px solid transparent; box-shadow: none; background: none;\
-                 font-size: 11px; }}\
+                 border: 1px solid transparent; box-shadow: none; background: none; }}\
              .ruzu-statusbar button:hover {{ border: 1px solid #76797C; }}\
-             .ruzu-statusbar label {{ font-size: 11px; }}\
              .{togglable} {{ color: #959595; }}\
              .{togglable}.{checked} {{ color: #000000; }}\
              .{renderer} {{ color: #0066ff; }}\
@@ -809,12 +809,82 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires GTK display and an isolated process for font settings"]
+    fn footer_inherits_system_font_and_tracks_font_changes() {
+        #[cfg(target_os = "windows")]
+        {
+            crate::configure_windows_native_decorations();
+            crate::configure_windows_gsk_renderer();
+        }
+        gtk::init().unwrap();
+        let settings = gtk::Settings::default().unwrap();
+        let original_font = settings.gtk_font_name();
+        let original_dpi = settings.gtk_xft_dpi();
+        let window = gtk::Window::new();
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let reference = gtk::Label::new(Some("Scale: 1x"));
+        container.append(&reference);
+        let footer = StatusBar::new();
+        footer.res_scale.set_text("Scale: 1x");
+        footer.res_scale.set_visible(true);
+        footer.renderer.set_label("Scale: 1x");
+        let button_label = footer
+            .renderer
+            .child()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        container.append(footer.widget());
+        window.set_child(Some(&container));
+        window.present();
+        let mut sizes = Vec::new();
+        for (font, dpi) in [("Sans 10", 96), ("Sans 10", 144), ("Sans 20", 144)] {
+            settings.set_gtk_xft_dpi(dpi * 1024);
+            settings.set_gtk_font_name(Some(font));
+            // Let GTK apply the new settings and recalculate CSS/layout.
+            let main_loop = glib::MainLoop::new(None, false);
+            let done = main_loop.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+                done.quit()
+            });
+            main_loop.run();
+            sizes.push((
+                reference.layout().pixel_size(),
+                footer.res_scale.layout().pixel_size(),
+                button_label.layout().pixel_size(),
+            ));
+        }
+        settings.set_gtk_font_name(original_font.as_deref());
+        settings.set_gtk_xft_dpi(original_dpi);
+        window.close();
+        for (reference, performance, button) in &sizes {
+            assert_eq!(
+                performance, reference,
+                "performance text must inherit the system font"
+            );
+            assert_eq!(
+                button, reference,
+                "footer buttons must inherit the system font"
+            );
+        }
+        assert!(
+            sizes[1].1 .1 > sizes[0].1 .1,
+            "existing footer must respond to 150% font DPI"
+        );
+        assert!(
+            sizes[2].1 .1 > sizes[1].1 .1,
+            "existing footer must respond to font changes"
+        );
+    }
+
+    #[test]
     #[ignore = "requires GTK display and isolated process for shared settings"]
     fn graphics_hotkeys_reuse_click_and_live_apply_paths() {
         gtk::init().unwrap();
         let original = settings::values().clone();
         let app = gtk::Application::builder()
-            .application_id("org.ruzu.GraphicsHotkeyTest").build();
+            .application_id("org.ruzu.GraphicsHotkeyTest")
+            .build();
         let bar = StatusBar::new();
         let applied = Rc::new(Cell::new(0));
         let calls = applied.clone();

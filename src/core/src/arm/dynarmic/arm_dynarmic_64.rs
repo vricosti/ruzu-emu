@@ -3029,6 +3029,39 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_optimization_combinations_preserve_a64_accuracy_and_address_width() {
+        for address_bits in [32, 36, 39] {
+            for mask in 0u32..32 {
+                let enabled = |bit: u32| mask & (1u32 << bit) != 0u32;
+                let mut unsafe_flags = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+                for (bit, flag) in [
+                    (0, OptimizationFlag::UNSAFE_UNFUSE_FMA),
+                    (1, OptimizationFlag::UNSAFE_REDUCED_ERROR_FP),
+                    (2, OptimizationFlag::UNSAFE_INACCURATE_NAN),
+                    (4, OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR),
+                ] {
+                    if enabled(bit) { unsafe_flags |= flag; }
+                }
+                for (accuracy, flags, unsafe_optimizations, bits) in [
+                    (CpuAccuracy::Unsafe, unsafe_flags, true,
+                        if enabled(3) { 64 } else { address_bits }),
+                    (CpuAccuracy::Accurate, OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
+                        false, address_bits),
+                    (CpuAccuracy::Auto, OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+                        | OptimizationFlag::UNSAFE_UNFUSE_FMA, true, 64),
+                    (CpuAccuracy::Paranoid, OptimizationFlag::NO_OPTIMIZATIONS,
+                        false, address_bits),
+                ] {
+                    assert_eq!(upstream_optimization_config(address_bits, accuracy,
+                        enabled(0), enabled(1), enabled(2), enabled(3), enabled(4)),
+                        (flags, unsafe_optimizations, bits),
+                        "{accuracy:?}, settings mask {mask:#x}, address width {address_bits}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn translate_halt_reason_uses_upstream_a64_bits() {
         let hr = rdynarmic::HaltReason::STEP
             | rdynarmic::HaltReason::MEMORY_ABORT

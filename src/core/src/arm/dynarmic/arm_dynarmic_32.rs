@@ -3112,6 +3112,71 @@ mod tests {
     }
 
     #[test]
+    fn debugging_optimization_settings_cover_every_safe_flag_combination() {
+        for mask in 0u32..64 {
+            let mut settings = common::settings::Values::default();
+            settings.cpu_debug_mode.set_value(false);
+            settings.cpu_accuracy.set_value(CpuAccuracy::Debugging);
+            let mut expected = OptimizationFlag::NO_OPTIMIZATIONS;
+            // ArmDynarmic32::MakeJit's Debugging branch clears each flag
+            // independently from the default safe optimization set.
+            for (index, (setting, flag)) in [
+                (&mut settings.cpuopt_block_linking, OptimizationFlag::BLOCK_LINKING),
+                (&mut settings.cpuopt_return_stack_buffer, OptimizationFlag::RETURN_STACK_BUFFER),
+                (&mut settings.cpuopt_fast_dispatcher, OptimizationFlag::FAST_DISPATCH),
+                (&mut settings.cpuopt_context_elimination, OptimizationFlag::GET_SET_ELIMINATION),
+                (&mut settings.cpuopt_const_prop, OptimizationFlag::CONST_PROP),
+                (&mut settings.cpuopt_misc_ir, OptimizationFlag::MISC_IR_OPT),
+            ].into_iter().enumerate() {
+                let enabled = mask & (1 << index) != 0;
+                setting.set_value(enabled);
+                if enabled { expected |= flag; }
+            }
+            let (actual, unsafe_enabled) = upstream_optimization_config_from_settings(&settings);
+            assert_eq!(actual, expected, "safe settings mask {mask:#x}");
+            assert!(!unsafe_enabled);
+        }
+    }
+
+    #[test]
+    fn unsafe_optimization_settings_do_not_override_curated_accuracy_modes() {
+        let safe = OptimizationFlag::BLOCK_LINKING
+            | OptimizationFlag::RETURN_STACK_BUFFER
+            | OptimizationFlag::FAST_DISPATCH
+            | OptimizationFlag::GET_SET_ELIMINATION
+            | OptimizationFlag::CONST_PROP
+            | OptimizationFlag::MISC_IR_OPT;
+        for mask in 0u32..32 {
+            let mut settings = common::settings::Values::default();
+            settings.cpu_debug_mode.set_value(false);
+            let mut expected = safe;
+            for (index, (setting, flag)) in [
+                (&mut settings.cpuopt_unsafe_unfuse_fma, OptimizationFlag::UNSAFE_UNFUSE_FMA),
+                (&mut settings.cpuopt_unsafe_reduce_fp_error, OptimizationFlag::UNSAFE_REDUCED_ERROR_FP),
+                (&mut settings.cpuopt_unsafe_ignore_standard_fpcr, OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE),
+                (&mut settings.cpuopt_unsafe_inaccurate_nan, OptimizationFlag::UNSAFE_INACCURATE_NAN),
+                (&mut settings.cpuopt_unsafe_ignore_global_monitor, OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR),
+            ].into_iter().enumerate() {
+                let enabled = mask & (1 << index) != 0;
+                setting.set_value(enabled);
+                if enabled { expected |= flag; }
+            }
+            for (accuracy, expected_flags, expected_unsafe) in [
+                (CpuAccuracy::Unsafe, expected, true),
+                (CpuAccuracy::Accurate, safe, false),
+                (CpuAccuracy::Auto, safe | OptimizationFlag::UNSAFE_UNFUSE_FMA
+                    | OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE
+                    | OptimizationFlag::UNSAFE_INACCURATE_NAN, true),
+                (CpuAccuracy::Paranoid, OptimizationFlag::NO_OPTIMIZATIONS, false),
+            ] {
+                settings.cpu_accuracy.set_value(accuracy);
+                assert_eq!(upstream_optimization_config_from_settings(&settings),
+                    (expected_flags, expected_unsafe), "{accuracy:?}, settings mask {mask:#x}");
+            }
+        }
+    }
+
+    #[test]
     fn auto_optimization_config_matches_upstream_a32() {
         let mut settings = common::settings::Values::default();
         settings.cpu_debug_mode.set_value(false);

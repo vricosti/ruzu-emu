@@ -3,13 +3,17 @@
 //! IAudioController service ("audctl").
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::cmif_serialization::{CmifRequest, CmifResponse};
-use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::hle_ipc::{
+    HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
+};
 use crate::hle::service::kernel_helpers::ServiceContext;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::service::set::settings_types::AudioOutputMode;
+use crate::hle::service::set::system_settings_server::SystemSettingsService;
+use crate::hle::service::sm::sm::ServiceManager;
 
 /// Port of IAudioController::ForceMutePolicy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,105 +29,6 @@ pub enum ForceMutePolicy {
 pub enum HeadphoneOutputLevelMode {
     Normal = 0,
     HighPower = 1,
-}
-
-/// Port of Service::Set::AudioOutputMode used by IAudioController.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum AudioOutputMode {
-    Ch1 = 0,
-    Ch2 = 1,
-    Ch5_1 = 2,
-    Ch7_1 = 3,
-}
-
-impl AudioOutputMode {
-    fn from_raw(raw: u32) -> Self {
-        match raw {
-            0 => Self::Ch1,
-            1 => Self::Ch2,
-            2 => Self::Ch5_1,
-            3 => Self::Ch7_1,
-            _ => {
-                log::error!("Invalid audio output mode {}", raw);
-                Self::Ch7_1
-            }
-        }
-    }
-}
-
-/// Port of Service::Set::AudioOutputModeTarget used by IAudioController.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum AudioOutputModeTarget {
-    None = 0,
-    Hdmi = 1,
-    Speaker = 2,
-    Headphone = 3,
-    Type3 = 4,
-    Type4 = 5,
-}
-
-impl AudioOutputModeTarget {
-    fn from_raw(raw: u32) -> Self {
-        match raw {
-            0 => Self::None,
-            1 => Self::Hdmi,
-            2 => Self::Speaker,
-            3 => Self::Headphone,
-            4 => Self::Type3,
-            5 => Self::Type4,
-            _ => {
-                log::error!("Invalid audio output mode target {}", raw);
-                Self::None
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AudioOutputModeState {
-    hdmi: AudioOutputMode,
-    speaker: AudioOutputMode,
-    headphone: AudioOutputMode,
-    type3: AudioOutputMode,
-    type4: AudioOutputMode,
-}
-
-impl Default for AudioOutputModeState {
-    fn default() -> Self {
-        Self {
-            hdmi: AudioOutputMode::Ch7_1,
-            speaker: AudioOutputMode::Ch7_1,
-            headphone: AudioOutputMode::Ch7_1,
-            type3: AudioOutputMode::Ch7_1,
-            type4: AudioOutputMode::Ch7_1,
-        }
-    }
-}
-
-impl AudioOutputModeState {
-    fn get(&self, target: AudioOutputModeTarget) -> AudioOutputMode {
-        match target {
-            AudioOutputModeTarget::Hdmi => self.hdmi,
-            AudioOutputModeTarget::Speaker => self.speaker,
-            AudioOutputModeTarget::Headphone => self.headphone,
-            AudioOutputModeTarget::Type3 => self.type3,
-            AudioOutputModeTarget::Type4 => self.type4,
-            AudioOutputModeTarget::None => AudioOutputMode::Ch7_1,
-        }
-    }
-
-    fn set(&mut self, target: AudioOutputModeTarget, output_mode: AudioOutputMode) {
-        match target {
-            AudioOutputModeTarget::Hdmi => self.hdmi = output_mode,
-            AudioOutputModeTarget::Speaker => self.speaker = output_mode,
-            AudioOutputModeTarget::Headphone => self.headphone = output_mode,
-            AudioOutputModeTarget::Type3 => self.type3 = output_mode,
-            AudioOutputModeTarget::Type4 => self.type4 = output_mode,
-            AudioOutputModeTarget::None => {}
-        }
-    }
 }
 
 /// IPC command table for IAudioController ("audctl"):
@@ -173,19 +78,27 @@ pub struct IAudioController {
     //   m_set_sys: std::shared_ptr<Service::Set::ISystemSettingsServer> — obtained via
     //     system.ServiceManager().GetService<Service::Set::ISystemSettingsServer>("set:sys", true).
     //
-    // The Rust service framework does not yet expose upstream's concrete
-    // set:sys service owner here, so settings state is represented with an
-    // owner-local Rust equivalent.
+    // The erased Arc retains the actual registered set:sys owner, as upstream
+    // shared_ptr does. Downcasting borrows it without duplicating settings.
     service_context: ServiceContext,
     notification_event_handle: u32,
-    audio_output_modes: Mutex<AudioOutputModeState>,
-    speaker_auto_mute_enabled: Mutex<bool>,
+    m_set_sys: SessionRequestHandlerPtr,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IAudioController {
-    pub fn new() -> Self {
+    pub fn new(system: crate::core::SystemRef) -> Self {
+        let manager = system
+            .get()
+            .service_manager()
+            .expect("audio requires ServiceManager");
+        let set_sys = ServiceManager::get_service_blocking(&manager, system, "set:sys");
+        Self::with_system_settings(set_sys)
+    }
+
+    fn with_system_settings(set_sys: SessionRequestHandlerPtr) -> Self {
+        assert!(set_sys.as_any().is::<SystemSettingsService>());
         let handlers = build_handler_map(&[
             (0, None, "GetTargetVolume"),
             (1, None, "SetTargetVolume"),
@@ -326,8 +239,7 @@ impl IAudioController {
         Self {
             service_context,
             notification_event_handle,
-            audio_output_modes: Mutex::new(AudioOutputModeState::default()),
-            speaker_auto_mute_enabled: Mutex::new(false),
+            m_set_sys: set_sys,
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
@@ -364,15 +276,27 @@ impl IAudioController {
         unsafe { &*(this as *const dyn ServiceFramework as *const Self) }
     }
 
-    fn get_audio_output_mode(&self, target: AudioOutputModeTarget) -> AudioOutputMode {
-        self.audio_output_modes.lock().unwrap().get(target)
+    fn system_settings(&self) -> &SystemSettingsService {
+        self.m_set_sys
+            .as_any()
+            .downcast_ref()
+            .expect("set:sys has the wrong service type")
     }
 
-    fn set_audio_output_mode(&self, target: AudioOutputModeTarget, output_mode: AudioOutputMode) {
-        self.audio_output_modes
+    fn get_audio_output_mode(&self, target: u32) -> u32 {
+        self.system_settings()
+            .inner
             .lock()
             .unwrap()
-            .set(target, output_mode);
+            .get_audio_output_mode(target)
+    }
+
+    fn set_audio_output_mode(&self, target: u32, output_mode: u32) {
+        self.system_settings()
+            .inner
+            .lock()
+            .unwrap()
+            .set_audio_output_mode(target, output_mode);
     }
 
     fn get_target_volume_min_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -394,7 +318,7 @@ impl IAudioController {
     fn get_audio_output_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut request = CmifRequest::new(ctx);
-        let target = AudioOutputModeTarget::from_raw(request.u32());
+        let target = request.u32();
         let output_mode = service.get_audio_output_mode(target);
         log::info!(
             "IAudioController::GetAudioOutputMode target={:?} output_mode={:?}",
@@ -409,8 +333,8 @@ impl IAudioController {
     fn set_audio_output_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut request = CmifRequest::new(ctx);
-        let target = AudioOutputModeTarget::from_raw(request.u32());
-        let output_mode = AudioOutputMode::from_raw(request.u32());
+        let target = request.u32();
+        let output_mode = request.u32();
         log::info!(
             "IAudioController::SetAudioOutputMode target={:?} output_mode={:?}",
             target,
@@ -431,7 +355,7 @@ impl IAudioController {
 
     fn get_output_mode_setting_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut request = CmifRequest::new(ctx);
-        let target = AudioOutputModeTarget::from_raw(request.u32());
+        let target = request.u32();
         log::warn!(
             "IAudioController::GetOutputModeSetting (STUBBED) target={:?}",
             target
@@ -443,8 +367,8 @@ impl IAudioController {
 
     fn set_output_mode_setting_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut request = CmifRequest::new(ctx);
-        let target = AudioOutputModeTarget::from_raw(request.u32());
-        let output_mode = AudioOutputMode::from_raw(request.u32());
+        let target = request.u32();
+        let output_mode = request.u32();
         log::info!(
             "IAudioController::SetOutputModeSetting target={:?} output_mode={:?}",
             target,
@@ -500,12 +424,17 @@ impl IAudioController {
     ) {
         let service = Self::as_self(this);
         let mut request = CmifRequest::new(ctx);
-        let enabled = request.u32() != 0;
+        let enabled = request.raw::<u8>() != 0;
         log::info!(
             "IAudioController::SetSpeakerAutoMuteEnabled enabled={}",
             enabled
         );
-        *service.speaker_auto_mute_enabled.lock().unwrap() = enabled;
+        service
+            .system_settings()
+            .inner
+            .lock()
+            .unwrap()
+            .set_speaker_auto_mute_flag(enabled);
         let mut response = CmifResponse::new(ctx, 2, 0, 0);
         response.push_result(RESULT_SUCCESS);
     }
@@ -515,7 +444,12 @@ impl IAudioController {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
-        let enabled = *service.speaker_auto_mute_enabled.lock().unwrap();
+        let enabled = service
+            .system_settings()
+            .inner
+            .lock()
+            .unwrap()
+            .get_speaker_auto_mute_flag();
         log::info!(
             "IAudioController::IsSpeakerAutoMuteEnabled enabled={}",
             enabled
@@ -565,10 +499,13 @@ impl ServiceFramework for IAudioController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle::service::set::settings_types::AudioOutputModeTarget;
+    use std::sync::Arc;
 
     #[test]
-    fn audio_controller_registers_upstream_implemented_command_ids() {
-        let service = IAudioController::new();
+    fn audio_controller_registers_currently_ported_command_ids() {
+        let service =
+            IAudioController::with_system_settings(Arc::new(SystemSettingsService::new_for_test()));
 
         for cmd in [2_u32, 3, 9, 10, 12, 13, 14, 17, 18, 22, 30, 31, 34] {
             assert!(service.handlers.contains_key(&cmd));
@@ -586,17 +523,65 @@ mod tests {
     }
 
     #[test]
-    fn audio_controller_local_output_mode_state_is_target_specific() {
-        let service = IAudioController::new();
+    fn audio_controller_and_system_settings_share_modes_and_mute() {
+        let settings = Arc::new(SystemSettingsService::new_for_test());
+        let first = IAudioController::with_system_settings(settings.clone());
+        let second = IAudioController::with_system_settings(settings.clone());
+        let speaker = AudioOutputModeTarget::Speaker as u32;
+        let hdmi = AudioOutputModeTarget::Hdmi as u32;
+        let initial_hdmi = settings.inner.lock().unwrap().get_audio_output_mode(hdmi);
+        for mode in [0, 1, 2, 3, u32::MAX] {
+            let mut ctx = HLERequestContext::new();
+            ctx.command_buffer_mut()[2] = speaker;
+            ctx.command_buffer_mut()[3] = mode;
+            first.handlers[&10].handler_callback.unwrap()(&first, &mut ctx);
+            assert_eq!(ctx.command_buffer()[6], 0);
+            assert_eq!(
+                settings
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .get_audio_output_mode(speaker),
+                mode
+            );
+            assert_eq!(second.get_audio_output_mode(speaker), mode);
+            assert_eq!(second.get_audio_output_mode(hdmi), initial_hdmi);
 
-        service.set_audio_output_mode(AudioOutputModeTarget::Speaker, AudioOutputMode::Ch2);
-        assert_eq!(
-            service.get_audio_output_mode(AudioOutputModeTarget::Speaker),
-            AudioOutputMode::Ch2
-        );
-        assert_eq!(
-            service.get_audio_output_mode(AudioOutputModeTarget::Hdmi),
-            AudioOutputMode::Ch7_1
-        );
+            settings
+                .inner
+                .lock()
+                .unwrap()
+                .set_audio_output_mode(speaker, mode ^ 1);
+            let mut ctx = HLERequestContext::new();
+            ctx.command_buffer_mut()[2] = speaker;
+            second.handlers[&9].handler_callback.unwrap()(&second, &mut ctx);
+            assert_eq!(ctx.command_buffer()[6], 0);
+            assert_eq!(ctx.command_buffer()[8], mode ^ 1);
+        }
+        for enabled in [true, false] {
+            let mut ctx = HLERequestContext::new();
+            // A CMIF bool occupies one byte; padding must not enable it.
+            ctx.command_buffer_mut()[2] = 0xFFFF_FF00 | u32::from(enabled);
+            first.handlers[&30].handler_callback.unwrap()(&first, &mut ctx);
+            assert_eq!(
+                settings.inner.lock().unwrap().get_speaker_auto_mute_flag(),
+                enabled
+            );
+            settings
+                .inner
+                .lock()
+                .unwrap()
+                .set_speaker_auto_mute_flag(!enabled);
+            let mut ctx = HLERequestContext::new();
+            second.handlers[&31].handler_callback.unwrap()(&second, &mut ctx);
+            assert_eq!(ctx.command_buffer()[8], u32::from(!enabled));
+        }
+        // Retaining either controller keeps the actual settings owner alive.
+        let weak = Arc::downgrade(&settings);
+        drop(settings);
+        drop(first);
+        assert!(weak.upgrade().is_some());
+        drop(second);
+        assert!(weak.upgrade().is_none());
     }
 }

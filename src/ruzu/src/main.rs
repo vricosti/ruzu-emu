@@ -19,7 +19,9 @@ use gtk::{gio, glib};
 mod about_dialog;
 mod applets;
 mod boot;
+mod camera_capture;
 mod configuration;
+mod debugger;
 mod emu_window;
 mod file_menu;
 mod game_list;
@@ -40,6 +42,7 @@ mod multiplayer;
 mod overlay_dialog;
 #[cfg(target_os = "macos")]
 mod render_window;
+mod render;
 #[cfg(target_os = "windows")]
 mod render_window_windows;
 #[cfg(target_os = "linux")]
@@ -231,6 +234,8 @@ fn main() -> glib::ExitCode {
         &log_filter,
         uisettings::with(|values| *values.show_console.get_value()),
     );
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    debugger::console::toggle_console();
 
     #[cfg(target_os = "windows")]
     if enabled_native_windows_decorations {

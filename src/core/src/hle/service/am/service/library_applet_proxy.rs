@@ -246,6 +246,7 @@ impl ILibraryAppletProxy {
             ctx,
             Arc::new(
                 super::applet_common_functions::IAppletCommonFunctions::with_applet(
+                    proxy.system,
                     proxy.applet.clone(),
                 ),
             ),

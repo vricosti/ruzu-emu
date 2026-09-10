@@ -6,9 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
-use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command table for IDebugFunctions:
@@ -43,7 +42,31 @@ pub struct IDebugFunctions {
 impl IDebugFunctions {
     pub fn new() -> Self {
         Self {
-            handlers: build_handler_map(&[]),
+            handlers: build_handler_map(&[
+                (0, None, "NotifyMessageToHomeMenuForDebug"),
+                (1, None, "OpenMainApplication"),
+                (10, None, "PerformSystemButtonPressing"),
+                (20, None, "InvalidateTransitionLayer"),
+                (30, None, "RequestLaunchApplicationWithUserAndArgumentForDebug"),
+                (31, None, "RequestLaunchApplicationByApplicationLaunchInfoForDebug"),
+                (40, None, "GetAppletResourceUsageInfo"),
+                (50, None, "AddSystemProgramIdAndAppletIdForDebug"),
+                (51, None, "AddOperationConfirmedLibraryAppletIdForDebug"),
+                (100, None, "SetCpuBoostModeForApplet"),
+                (101, None, "CancelCpuBoostModeForApplet"),
+                (110, None, "PushToAppletBoundChannelForDebug"),
+                (111, None, "TryPopFromAppletBoundChannelForDebug"),
+                (120, None, "AlarmSettingNotificationEnableAppEventReserve"),
+                (121, None, "AlarmSettingNotificationDisableAppEventReserve"),
+                (122, None, "AlarmSettingNotificationPushAppEventNotify"),
+                (130, None, "FriendInvitationSetApplicationParameter"),
+                (131, None, "FriendInvitationClearApplicationParameter"),
+                (132, None, "FriendInvitationPushApplicationParameter"),
+                (140, None, "RestrictPowerOperationForSecureLaunchModeForDebug"),
+                (200, None, "CreateFloatingLibraryAppletAccepterForDebug"),
+                (300, None, "TerminateAllRunningApplicationsForDebug"),
+                (900, None, "GetGrcProcessLaunchedSystemEvent"),
+            ]),
             handlers_tipc: BTreeMap::new(),
         }
     }
@@ -51,9 +74,21 @@ impl IDebugFunctions {
 
 impl SessionRequestHandler for IDebugFunctions {
     fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
-        let mut rb = ResponseBuilder::new(context, 2, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        RESULT_SUCCESS
+        ServiceFramework::handle_sync_request_impl(self, context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_commands_are_explicitly_unimplemented_not_success_stubs() {
+        let service = IDebugFunctions::new();
+        let ids: Vec<_> = service.handlers().keys().copied().collect();
+        assert_eq!(ids, [0, 1, 10, 20, 30, 31, 40, 50, 51, 100, 101, 110,
+            111, 120, 121, 122, 130, 131, 132, 140, 200, 300, 900]);
+        assert!(service.handlers().values().all(|entry| entry.handler_callback.is_none()));
     }
 }
 

@@ -14,6 +14,7 @@ use crate::hle::service::psc::time::common::{
     ClockSnapshot, StaticServiceSetupInfo, SteadyClockTimePoint, SystemClockContext, TimeType,
 };
 use crate::hle::service::psc::time::r#static as psc_static;
+use crate::hle::service::psc::time::system_clock::SystemClock;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 use super::file_timestamp_worker::FileTimestampWorker;
@@ -175,12 +176,7 @@ impl StaticService {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
-        log::debug!("Glue::Time::StaticService::GetStandardUserSystemClock called");
-        let sub = service
-            .wrapped_service
-            .lock()
-            .unwrap()
-            .get_standard_user_system_clock();
+        let sub = service.get_standard_user_system_clock();
         Self::push_sub_service(ctx, std::sync::Arc::new(sub));
     }
 
@@ -190,12 +186,7 @@ impl StaticService {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
-        log::debug!("Glue::Time::StaticService::GetStandardNetworkSystemClock called");
-        let sub = service
-            .wrapped_service
-            .lock()
-            .unwrap()
-            .get_standard_network_system_clock();
+        let sub = service.get_standard_network_system_clock();
         Self::push_sub_service(ctx, std::sync::Arc::new(sub));
     }
 
@@ -203,11 +194,7 @@ impl StaticService {
     fn get_standard_steady_clock_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         log::debug!("Glue::Time::StaticService::GetStandardSteadyClock called");
-        let sub = service
-            .wrapped_service
-            .lock()
-            .unwrap()
-            .get_standard_steady_clock();
+        let sub = service.get_standard_steady_clock();
         Self::push_sub_service(ctx, std::sync::Arc::new(sub));
     }
 
@@ -235,12 +222,7 @@ impl StaticService {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
-        log::debug!("Glue::Time::StaticService::GetStandardLocalSystemClock called");
-        let sub = service
-            .wrapped_service
-            .lock()
-            .unwrap()
-            .get_standard_local_system_clock();
+        let sub = service.get_standard_local_system_clock();
         Self::push_sub_service(ctx, std::sync::Arc::new(sub));
     }
 
@@ -250,12 +232,7 @@ impl StaticService {
         ctx: &mut HLERequestContext,
     ) {
         let service = Self::as_self(this);
-        log::debug!("Glue::Time::StaticService::GetEphemeralNetworkSystemClock called");
-        let sub = service
-            .wrapped_service
-            .lock()
-            .unwrap()
-            .get_ephemeral_network_system_clock();
+        let sub = service.get_ephemeral_network_system_clock();
         Self::push_sub_service(ctx, std::sync::Arc::new(sub));
     }
 
@@ -539,7 +516,7 @@ impl StaticService {
     ) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let type_val = rp.pop_u32();
+        let type_val = rp.pop_u8();
         let type_ = match type_val {
             0 => TimeType::UserSystemClock,
             1 => TimeType::NetworkSystemClock,
@@ -547,6 +524,8 @@ impl StaticService {
             _ => TimeType::UserSystemClock,
         };
 
+        // CMIF aligns SystemClockContext to eight bytes after the u8 TimeType.
+        rp.align_for::<SystemClockContext>();
         let user_context: SystemClockContext = rp.pop_raw();
         let network_context: SystemClockContext = rp.pop_raw();
 
@@ -639,22 +618,22 @@ impl StaticService {
     }
 
     // =========================================================================
-    // Business logic methods (unchanged)
+    // Business logic methods
     // =========================================================================
 
-    pub fn get_standard_user_system_clock(&self) -> ResultCode {
+    pub fn get_standard_user_system_clock(&self) -> SystemClock {
         log::debug!("Glue::Time::StaticService::GetStandardUserSystemClock called");
-        RESULT_SUCCESS
+        self.wrapped_service.lock().unwrap().get_standard_user_system_clock()
     }
 
-    pub fn get_standard_network_system_clock(&self) -> ResultCode {
+    pub fn get_standard_network_system_clock(&self) -> SystemClock {
         log::debug!("Glue::Time::StaticService::GetStandardNetworkSystemClock called");
-        RESULT_SUCCESS
+        self.wrapped_service.lock().unwrap().get_standard_network_system_clock()
     }
 
-    pub fn get_standard_steady_clock(&self) -> ResultCode {
+    pub fn get_standard_steady_clock(&self) -> crate::hle::service::psc::time::steady_clock::SteadyClock {
         log::debug!("Glue::Time::StaticService::GetStandardSteadyClock called");
-        RESULT_SUCCESS
+        self.wrapped_service.lock().unwrap().get_standard_steady_clock()
     }
 
     pub fn get_time_zone_service(&self) -> Result<TimeZoneService, ResultCode> {
@@ -669,14 +648,14 @@ impl StaticService {
         ))
     }
 
-    pub fn get_standard_local_system_clock(&self) -> ResultCode {
+    pub fn get_standard_local_system_clock(&self) -> SystemClock {
         log::debug!("Glue::Time::StaticService::GetStandardLocalSystemClock called");
-        RESULT_SUCCESS
+        self.wrapped_service.lock().unwrap().get_standard_local_system_clock()
     }
 
-    pub fn get_ephemeral_network_system_clock(&self) -> ResultCode {
+    pub fn get_ephemeral_network_system_clock(&self) -> SystemClock {
         log::debug!("Glue::Time::StaticService::GetEphemeralNetworkSystemClock called");
-        RESULT_SUCCESS
+        self.wrapped_service.lock().unwrap().get_ephemeral_network_system_clock()
     }
 
     pub fn set_standard_steady_clock_internal_offset(&self, offset_ns: i64) -> ResultCode {
@@ -812,6 +791,9 @@ impl StaticService {
 // =============================================================================
 
 impl SessionRequestHandler for StaticService {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }
@@ -839,6 +821,39 @@ impl ServiceFramework for StaticService {
 mod tests {
     use super::*;
     use crate::hle::service::psc::time::common::SteadyClockTimePoint;
+
+    #[test]
+    fn snapshot_context_ipc_preserves_eight_byte_alignment_in_both_interfaces() {
+        use crate::hle::service::psc::time::errors::{RESULT_CLOCK_MISMATCH, RESULT_CLOCK_UNINITIALIZED};
+        let manager = make_time_manager();
+        let source = [0x5a; 16];
+        manager.lock().unwrap().psc_time.lock().unwrap()
+            .standard_steady_clock.lock().unwrap().initialize(source, 0, 0, 0, false);
+        let service = StaticService::new(
+            crate::core::SystemRef::null(), user_setup(), "time:u", manager,
+        );
+        let check = |interface: &dyn ServiceFramework| {
+            for matching in [true, false] {
+                let mut ctx = HLERequestContext::new();
+                // u8 type, seven padding bytes, then two 32-byte contexts.
+                ctx.cmd_buf[2..20].copy_from_slice(&[
+                    0xaabb_cc00, 0xdead_beef,
+                    123, 0, 17, 0,
+                    if matching { 0x5a5a_5a5a } else { 0x1234_5678 },
+                    0x5a5a_5a5a, 0x5a5a_5a5a, 0x5a5a_5a5a,
+                    456, 0, 19, 0,
+                    0x5a5a_5a5a, 0x5a5a_5a5a, 0x5a5a_5a5a, 0x5a5a_5a5a,
+                ]);
+                interface.handlers()[&401].handler_callback.unwrap()(interface, &mut ctx);
+                // Matching IDs must reach calendar conversion (the test deliberately
+                // has no timezone); genuinely mismatched IDs must still be rejected.
+                let expected = if matching { RESULT_CLOCK_UNINITIALIZED } else { RESULT_CLOCK_MISMATCH };
+                assert_eq!(ctx.cmd_buf[6], expected.get_inner_value());
+            }
+        };
+        check(&service);
+        check(&*service.wrapped_service.lock().unwrap());
+    }
 
     fn make_time_manager() -> Arc<Mutex<GlueTimeManager>> {
         let service_manager = Arc::new(Mutex::new(
@@ -872,6 +887,52 @@ mod tests {
             can_write_timezone_device_location: false,
             can_write_steady_clock: false,
             can_write_uninitialized_clock: false,
+        }
+    }
+
+    #[test]
+    fn standard_steady_clock_getter_returns_the_wrapped_clock() {
+        let service = StaticService::new(
+            crate::core::SystemRef::null(), user_setup(), "time:u", make_time_manager(),
+        );
+        let clock = service.get_standard_steady_clock();
+        let wrapped = service.wrapped_service.lock().unwrap().get_standard_steady_clock();
+        assert_eq!(clock.service_name(), wrapped.service_name());
+        // Same backend initialization and permission gates, not a success stub.
+        assert_eq!(clock.get_test_offset(), wrapped.get_test_offset());
+        assert_eq!(clock.set_test_offset(17), wrapped.set_test_offset(17));
+        assert_eq!(clock.get_current_time_point().is_ok(), wrapped.get_current_time_point().is_ok());
+    }
+
+    #[test]
+    fn system_clock_getters_share_wrapped_state_and_permissions() {
+        let time_manager = make_time_manager();
+        {
+            let manager = time_manager.lock().unwrap();
+            let mut time = manager.psc_time.lock().unwrap();
+            time.standard_steady_clock.lock().unwrap().initialize([0; 16], 0, 0, 0, false);
+            time.standard_local_system_clock.initialize(&SystemClockContext::default(), 0);
+            time.standard_network_system_clock.initialize(&SystemClockContext::default(), i64::MAX);
+            time.standard_user_system_clock.set_initialized();
+        }
+        let service = StaticService::new(
+            crate::core::SystemRef::null(), admin_setup(), "time:a", time_manager,
+        );
+        let expected = {
+            let wrapped = service.wrapped_service.lock().unwrap();
+            [wrapped.get_standard_user_system_clock(), wrapped.get_standard_local_system_clock(),
+             wrapped.get_standard_network_system_clock(), wrapped.get_ephemeral_network_system_clock()]
+        };
+        let actual = [service.get_standard_user_system_clock(), service.get_standard_local_system_clock(),
+            service.get_standard_network_system_clock(), service.get_ephemeral_network_system_clock()];
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            let actual_result = actual.set_current_time(1234);
+            // Observe the first interface's write through a separately
+            // obtained wrapper before performing a write through that one.
+            assert_eq!(actual.get_system_clock_context(), expected.get_system_clock_context());
+            let expected_result = expected.set_current_time(5678);
+            assert_eq!(actual_result, expected_result);
+            assert_eq!(actual.get_system_clock_context(), expected.get_system_clock_context());
         }
     }
 

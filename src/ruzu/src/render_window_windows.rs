@@ -36,6 +36,27 @@ const STATIC_WINDOW_CLASS: [u16; 7] = [
     0,
 ];
 
+/// QCursor::setPos for this borderless child HWND. Its client and window
+/// origins coincide; x/y are physical render pixels, matching GetWindowRect.
+pub unsafe fn warp_render_pointer(window: HWND, x: i32, y: i32) -> bool {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetCursorPos};
+    if window.is_null() { return false; }
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(window, &mut rect) } == 0 { return false; }
+    unsafe { SetCursorPos(rect.left + x, rect.top + y) != 0 }
+}
+
+pub unsafe fn render_pointer_position(window: HWND) -> Option<(f64, f64)> {
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, GetCursorPos};
+    if window.is_null() { return None; }
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    let mut point: POINT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(window, &mut rect) } == 0 || unsafe { GetCursorPos(&mut point) } == 0 { return None; }
+    Some(((point.x - rect.left) as f64, (point.y - rect.top) as f64))
+}
+
 /// A native child `HWND` covering the render area.
 #[derive(Debug, Clone, Copy)]
 pub struct EmbeddedWin32Window {
@@ -113,6 +134,29 @@ pub fn attach_render_window(
         drawable_size: (width as u32, height as u32),
         scale: scale as f32,
     })
+}
+
+/// Native part of MainWindow::ToggleWindowMode. Keep the HWND used by Vulkan;
+/// the caller subsequently resizes it in the destination GTK host.
+pub fn reparent_render_window(destination: &gtk::Window, child: HWND) -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetParent;
+    if child.is_null() { return false; }
+    let Some(surface) = destination.surface() else { return false; };
+    let parent = unsafe { gdk_win32_surface_get_handle(surface.as_ptr().cast()) };
+    if parent.is_null() { return false; }
+    // Both hosts belong to GTK in this process, with the same DPI awareness.
+    // WS_CHILD remains set: this is not a conversion to a desktop popup.
+    unsafe {
+        SetLastError(0);
+        let previous = SetParent(child, parent);
+        let error = GetLastError();
+        if previous.is_null() && error != 0 {
+            log::error!("Cannot reparent native render window: Win32 error {error}");
+            return false;
+        }
+    }
+    true
 }
 
 /// Show or hide the child render window.

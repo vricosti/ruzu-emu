@@ -1825,6 +1825,10 @@ impl Device {
             .enable_nsight_aftermath
             .get_value()
             && loaded_extensions.contains("VK_NV_device_diagnostics_config");
+        // Upstream creates the tracker before vkCreateDevice so an SDK-backed
+        // implementation can register crash callbacks before device creation.
+        let nsight_aftermath_tracker =
+            enable_nsight_aftermath.then(NsightAftermathTracker::new);
         let mut diagnostics_nv = vk::DeviceDiagnosticsConfigCreateInfoNV::default();
         if enable_nsight_aftermath {
             diagnostics_nv.p_next = device_create_info.p_next;
@@ -2089,7 +2093,7 @@ impl Device {
             loaded_extensions,
             valid_heap_memory,
             format_properties,
-            nsight_aftermath_tracker: enable_nsight_aftermath.then(NsightAftermathTracker::new),
+            nsight_aftermath_tracker,
         };
         device.initialize_gpu_logging();
         Ok(device)

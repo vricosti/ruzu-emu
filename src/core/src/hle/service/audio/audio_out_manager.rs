@@ -53,6 +53,20 @@ struct AudioOutParameterInternalWire {
 }
 
 impl IAudioOutManager {
+    /// Upstream IAudioOutManager::SetAllAudioOutVolume. The concrete manager is
+    /// reached through AudioCoreInterface to avoid a core/audio_core crate cycle.
+    pub fn set_all_audio_out_volume(&self, volume: f32) -> ResultCode {
+        if let Some(audio_core) = self.system.get().audio_core() {
+            audio_core.set_all_audio_out_volume(volume);
+            RESULT_SUCCESS
+        } else {
+            ResultCode::from_module_description(
+                crate::hle::result::ErrorModule::Audio,
+                crate::hle::service::audio::errors::RESULT_OPERATION_FAILED.1,
+            )
+        }
+    }
+
     pub fn new(system: SystemRef) -> Self {
         let handlers = build_handler_map(&[
             (0, Some(Self::list_audio_outs_handler), "ListAudioOuts"),

@@ -304,22 +304,14 @@ fn get_time_zone_string(
     time_zone_binary: &crate::hle::service::glue::time::time_zone_binary::TimeZoneBinary,
     _in_name: [u8; 0x24],
 ) -> [u8; 0x24] {
-    let time_zone_index = *common::settings::values().time_zone_index.get_value() as usize;
-    let configured_zone = if time_zone_index == 0 {
-        common::time_zone::find_system_time_zone()
-    } else {
-        common::time_zone::get_time_zone_strings()
-            .get(time_zone_index)
-            .copied()
-            .map(str::to_string)
-            .unwrap_or_else(common::time_zone::get_default_time_zone)
-    };
+    let time_zone = *common::settings::values().time_zone_index.get_value();
+    let configured_zone = common::settings::get_time_zone_string(time_zone);
 
     let mut configured_name = [0u8; 0x24];
     let configured_bytes = configured_zone.as_bytes();
     let copy_len = configured_bytes
         .len()
-        .min(configured_name.len().saturating_sub(1));
+        .min(configured_name.len());
     configured_name[..copy_len].copy_from_slice(&configured_bytes[..copy_len]);
 
     if !time_zone_binary.is_valid(&configured_name) {
@@ -328,9 +320,10 @@ fn get_time_zone_string(
         let fallback_bytes = fallback_zone.as_bytes();
         let copy_len = fallback_bytes
             .len()
-            .min(configured_name.len().saturating_sub(1));
+            .min(configured_name.len());
         configured_name[..copy_len].copy_from_slice(&fallback_bytes[..copy_len]);
     }
+    assert!(time_zone_binary.is_valid(&configured_name), "Invalid time zone");
     configured_name
 }
 

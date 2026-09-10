@@ -26,6 +26,14 @@ use super::shared_widget as w;
 
 /// Build the Graphics tab — upstream `ConfigureGraphics`.
 pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> Page {
+    page_with_screenshot_info(expose_compute_option, runtime_lock, Rc::new(|_, _| {}))
+}
+
+pub(super) fn page_with_screenshot_info(
+    expose_compute_option: impl Fn() + 'static,
+    runtime_lock: bool,
+    update_screenshot_info: super::configure_ui::ScreenshotInfoCallback,
+) -> Page {
     let (scroller, column) = w::page();
     let has_broken_vulkan = crate::uisettings::with(|values| values.has_broken_vulkan);
 
@@ -119,6 +127,25 @@ pub fn page(expose_compute_option: impl Fn() + 'static, runtime_lock: bool) -> P
         &tr::labels(tr::RESOLUTION_SETUP),
         tr::index_of(tr::RESOLUTION_SETUP, &resolution_value),
     );
+
+    // ConfigureGraphics forwards draft values, not the persisted settings.
+    // Weak widget references avoid cycles through the notify handlers.
+    let notify: Rc<dyn Fn()> = {
+        let aspect = aspect.downgrade();
+        let resolution = resolution.downgrade();
+        Rc::new(move || {
+            if crate::i18n::is_retranslating() { return; }
+            let (Some(aspect), Some(resolution)) = (aspect.upgrade(), resolution.upgrade()) else { return };
+            update_screenshot_info(
+                tr::value_at(tr::ASPECT_RATIO, aspect.selected()),
+                tr::value_at(tr::RESOLUTION_SETUP, resolution.selected()),
+            );
+        })
+    };
+    notify();
+    let on_aspect = notify.clone();
+    aspect.connect_selected_notify(move |_| on_aspect());
+    resolution.connect_selected_notify(move |_| notify());
 
     let filter_value = *common::settings::values().scaling_filter.get_value();
     let (filter_row, filter) = w::combo_row(

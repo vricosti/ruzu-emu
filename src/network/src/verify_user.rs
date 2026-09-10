@@ -27,6 +27,21 @@ pub trait Backend: Send + Sync {
     fn load_user_data(&self, verify_uid: &str, token: &str) -> UserData;
 }
 
+// The C++ VerifyUserJWT inherits this interface. The Rust adapter must live
+// on the network side of the dependency to avoid network <-> web_service.
+// All verification and claim extraction stays in web_service/verify_user_jwt.
+impl Backend for web_service::verify_user_jwt::VerifyUserJwt {
+    fn load_user_data(&self, verify_uid: &str, token: &str) -> UserData {
+        let data = self.load_user_data(verify_uid, token);
+        UserData {
+            username: data.username,
+            display_name: data.display_name,
+            avatar_url: data.avatar_url,
+            moderator: data.moderator,
+        }
+    }
+}
+
 /// A null backend where the token is ignored.
 /// No verification is performed here and the function returns an empty `UserData`.
 /// Maps to C++ `Network::VerifyUser::NullBackend`.

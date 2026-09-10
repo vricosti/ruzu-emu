@@ -1743,6 +1743,57 @@ mod tests {
     }
 
     #[test]
+    fn test_asimd_fixed_conversion_and_saturated_narrow() {
+        let env = TestEnv::new(vec![
+            0xF2F1_0F70, // VCVT.S32.F32 Q8, Q8, #15
+            0xF3F6_02A0, // VQMOVN.S32 D16, Q8
+            0xEAFF_FFFE,
+        ]);
+        let mut jit = make_jit(env);
+        for (index, value) in [0.5f32, -0.25, 2.0, -2.0].into_iter().enumerate() {
+            jit.set_ext_reg(32 + index, value.to_bits());
+        }
+        jit.set_pc(0);
+        jit.run();
+        assert_eq!(jit.get_ext_reg(32), 0xE000_4000);
+        assert_eq!(jit.get_ext_reg(33), 0x8000_7FFF);
+        assert_eq!(jit.get_ext_reg(34), 65536);
+        assert_eq!(jit.get_ext_reg(35), (-65536i32) as u32);
+        assert_ne!(jit.get_fpscr() & (1 << 27), 0, "FPSCR.QC records saturation");
+    }
+
+    #[test]
+    fn test_asimd_saturated_narrow_unsigned_and_wide() {
+        for (instruction, input, expected) in [
+            (0xF3F6_02E0, [0, 65535, 65536, u32::MAX], [0xFFFF_0000, 0xFFFF_FFFF]),
+            (0xF3FA_02A0, [0x8000_0000, 0, 0x7FFF_FFFF, u32::MAX], [0x7FFF_FFFF, 0x8000_0000]),
+            (0xF3F2_02A0, [0x0080_007F, 0xFF7F_FF80, 0x0001_0000, 0x8000_7FFF], [0x8080_7F7F, 0x807F_0100]),
+        ] {
+            let mut jit = make_jit(TestEnv::new(vec![instruction, 0xEAFF_FFFE]));
+            for (index, value) in input.into_iter().enumerate() { jit.set_ext_reg(32 + index, value); }
+            jit.set_pc(0);
+            jit.run();
+            assert_eq!([jit.get_ext_reg(32), jit.get_ext_reg(33)], expected);
+            assert_ne!(jit.get_fpscr() & (1 << 27), 0);
+        }
+    }
+
+    #[test]
+    fn test_asimd_fixed_conversion_signed_unsigned_roundtrip() {
+        for unsigned in [false, true] {
+            for fbits in [1u32, 15, 32] {
+                let base = 0xF2C0_0E70 | ((64 - fbits) << 16) | ((unsigned as u32) << 24);
+                let mut jit = make_jit(TestEnv::new(vec![base, base | 0x100, 0xEAFF_FFFE]));
+                let input = if unsigned { [0, 1, 32768, 65536] } else { [0, 1, (-32768i32) as u32, 65536] };
+                for (index, value) in input.into_iter().enumerate() { jit.set_ext_reg(32 + index, value); }
+                jit.set_pc(0);
+                jit.run();
+                for (index, value) in input.into_iter().enumerate() { assert_eq!(jit.get_ext_reg(32 + index), value, "unsigned={unsigned} fbits={fbits} lane={index}"); }
+            }
+        }
+    }
+
+    #[test]
     fn test_vshrn_vmovn_regression_sequence() {
         let env = TestEnv::new(vec![
             0xF2E0_3830, // VSHRN.I64 D19, Q8, #32
@@ -1764,6 +1815,38 @@ mod tests {
         assert_eq!(jit.get_ext_reg(37), 0x3333_3333);
         assert_eq!(jit.get_ext_reg(38), 0x2222_2222);
         assert_eq!(jit.get_ext_reg(39), 0x4444_4444);
+    }
+
+    #[test]
+    fn test_asimd_shift_left_long_all_lanes() {
+        // VSHLL Q15, D28: cover VMOVL and maximum immediate, all element sizes.
+        let input = 0x8001_FFFE_7F80_01FFu64;
+        for esize in [8u32, 16, 32] {
+            for shift in [0, esize - 1] {
+                for unsigned in [false, true] {
+                    let instruction = 0xF2C0_EA3C | ((esize + shift) << 16)
+                        | ((unsigned as u32) << 24);
+                    let mut jit = make_jit(TestEnv::new(vec![instruction, 0xEAFF_FFFE]));
+                    jit.set_ext_reg(56, input as u32);
+                    jit.set_ext_reg(57, (input >> 32) as u32);
+                    jit.set_pc(0);
+                    jit.run();
+                    let mut expected = 0u128;
+                    for lane in 0..64 / esize {
+                        let raw = (input >> (lane * esize)) & ((1u64 << esize) - 1);
+                        let extended = if unsigned { raw } else {
+                            (((raw << (64 - esize)) as i64) >> (64 - esize)) as u64
+                        };
+                        let value = ((extended as u128) << shift) & ((1u128 << (esize * 2)) - 1);
+                        expected |= value << (lane * esize * 2);
+                    }
+                    for index in 0..4 {
+                        assert_eq!(jit.get_ext_reg(60 + index), (expected >> (index * 32)) as u32,
+                            "esize={esize} shift={shift} unsigned={unsigned} word={index}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

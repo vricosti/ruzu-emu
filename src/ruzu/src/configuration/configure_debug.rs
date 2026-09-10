@@ -252,11 +252,9 @@ pub fn page(runtime_lock: bool) -> Page {
     // Upstream opens the log directory in the platform file manager.
     open_log_location.connect_clicked(|_| {
         let path = common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::LogDir);
-        let launcher = gtk::gio::AppInfo::launch_default_for_uri(
-            &format!("file://{}", path.display()),
-            gtk::gio::AppLaunchContext::NONE,
-        );
-        if let Err(err) = launcher {
+        // QUrl::fromLocalFile upstream; use the same platform path adapter as
+        // other folder actions, not a hand-built file:// URL.
+        if let Err(err) = crate::util::game::open_folder(&path) {
             log::warn!("Failed to open log location: {err}");
         }
     });
@@ -345,7 +343,7 @@ pub fn page(runtime_lock: bool) -> Page {
         let mut filter = common::logging::filter::Filter::default();
         filter.parse_filter_string(&common::settings::values().log_filter.get_value());
         common::logging::backend::set_global_filter(&filter);
-        common::logging::backend::set_color_console_backend_enabled(console);
+        crate::debugger::console::toggle_console();
         ruzu_core::crypto::key_manager::KeyManager::instance()
             .lock()
             .unwrap()

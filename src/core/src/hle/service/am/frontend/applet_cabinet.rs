@@ -361,6 +361,7 @@ impl FrontendApplet for Cabinet {
                 Some(controller),
                 Some(Arc::clone(&self.availability_change_event)),
                 &mut self.service_context,
+                self.system,
             );
             device.initialize();
             device.start_detection(NfcProtocol::ALL);

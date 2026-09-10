@@ -1,27 +1,29 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/tools/renderdoc.h and renderdoc.cpp
+//! Port of core/tools/renderdoc.h and renderdoc.cpp.
 //! RenderDoc API integration for frame capture.
 
-/// Opaque handle to RenderDoc API function pointers.
-///
-/// Corresponds to upstream `RENDERDOC_API_1_6_0*`.
-/// On Linux, this is obtained via `dlopen`/`dlsym` on `librenderdoc.so`.
-/// On Windows, via `GetModuleHandle`/`GetProcAddress` on `renderdoc.dll`.
-///
-/// Since we cannot use the actual RenderDoc C API headers directly from Rust,
-/// we store a raw pointer obtained at runtime. Full integration would require
-/// either renderdoc-sys bindings or the `renderdoc-rs` crate.
-struct RdocApi {
-    /// Raw pointer to RENDERDOC_API_1_6_0 struct, or null.
-    _api_ptr: *mut std::ffi::c_void,
+use std::ffi::c_void;
+
+type StartFrameCapture = unsafe extern "C" fn(*mut c_void, *mut c_void);
+type EndFrameCapture = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
+
+/// Prefix of renderdoc_app.h's API table through EndFrameCapture. The first
+/// nineteen entries (GetAPIVersion through SetActiveWindow) are unused here.
+/// API 1.6.0 preserves this prefix; all slots use RENDERDOC_CC (cdecl).
+#[repr(C)]
+struct ApiPrefix {
+    unused: [*const c_void; 19],
+    start_frame_capture: StartFrameCapture,
+    is_frame_capturing: unsafe extern "C" fn() -> u32,
+    end_frame_capture: EndFrameCapture,
 }
 
-// SAFETY: The RenderDoc API is designed for single-threaded capture toggle.
-// Upstream stores the pointer as a plain member without synchronization.
-unsafe impl Send for RdocApi {}
-unsafe impl Sync for RdocApi {}
+struct RdocApi {
+    start_frame_capture: StartFrameCapture,
+    end_frame_capture: EndFrameCapture,
+}
 
 /// RenderDoc API wrapper.
 ///
@@ -51,16 +53,15 @@ impl RenderdocApi {
     ///
     /// Corresponds to upstream `RenderdocAPI::ToggleCapture()`.
     pub fn toggle_capture(&mut self) {
-        if self.rdoc_api.is_none() {
-            return;
-        }
-
-        if !self.is_capturing {
-            // rdoc_api->StartFrameCapture(NULL, NULL);
-            log::info!("RenderDoc: StartFrameCapture (stubbed)");
-        } else {
-            // rdoc_api->EndFrameCapture(NULL, NULL);
-            log::info!("RenderDoc: EndFrameCapture (stubbed)");
+        let Some(api) = &self.rdoc_api else { return };
+        // SAFETY: callbacks come from a successfully negotiated, resident API.
+        // Null device/window select RenderDoc's active target, as upstream does.
+        unsafe {
+            if !self.is_capturing {
+                (api.start_frame_capture)(std::ptr::null_mut(), std::ptr::null_mut());
+            } else {
+                (api.end_frame_capture)(std::ptr::null_mut(), std::ptr::null_mut());
+            }
         }
         self.is_capturing = !self.is_capturing;
     }
@@ -73,7 +74,7 @@ impl RenderdocApi {
     ///
     /// Returns `None` if RenderDoc is not loaded.
     fn try_load_api() -> Option<RdocApi> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(unix, not(target_os = "haiku")))]
         {
             // Try to load RenderDoc if it's already in the process.
             // SAFETY: dlopen with RTLD_NOLOAD only checks if already loaded.
@@ -96,6 +97,7 @@ impl RenderdocApi {
                     b"RENDERDOC_GetAPI\0".as_ptr() as *const libc::c_char,
                 );
                 if get_api_sym.is_null() {
+                    libc::dlclose(handle);
                     return None;
                 }
 
@@ -109,17 +111,46 @@ impl RenderdocApi {
                 let ret = get_api(10600, &mut api_ptr);
                 if ret != 1 || api_ptr.is_null() {
                     log::warn!("RENDERDOC_GetAPI failed (ret={})", ret);
+                    libc::dlclose(handle);
                     return None;
                 }
                 log::info!("RenderDoc API loaded successfully");
-                Some(RdocApi { _api_ptr: api_ptr })
+                // Keep the successful dlopen reference resident, as upstream
+                // does, so these callbacks cannot outlive their library.
+                let api = &*api_ptr.cast::<ApiPrefix>();
+                Some(RdocApi {
+                    start_frame_capture: api.start_frame_capture,
+                    end_frame_capture: api.end_frame_capture,
+                })
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        unsafe {
+            use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+            let module = GetModuleHandleA(c"renderdoc.dll".as_ptr());
+            if module.is_null() {
+                return None;
+            }
+            let symbol = GetProcAddress(module, c"RENDERDOC_GetAPI".as_ptr());
+            if symbol.is_null() {
+                return None;
+            }
+            let get_api: unsafe extern "C" fn(i32, *mut *mut c_void) -> i32 =
+                std::mem::transmute(symbol);
+            let mut api_ptr = std::ptr::null_mut();
+            if get_api(10600, &mut api_ptr) != 1 || api_ptr.is_null() {
+                return None;
+            }
+            let api = &*api_ptr.cast::<ApiPrefix>();
+            Some(RdocApi {
+                start_frame_capture: api.start_frame_capture,
+                end_frame_capture: api.end_frame_capture,
+            })
+        }
+
+        #[cfg(not(any(windows, all(unix, not(target_os = "haiku")))))]
         {
-            // Windows: would use GetModuleHandleA("renderdoc.dll") + GetProcAddress.
-            // Not implemented — RenderDoc integration is Linux-only for now.
             None
         }
     }
@@ -128,5 +159,79 @@ impl RenderdocApi {
 impl Default for RenderdocApi {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn unavailable_api_does_not_enter_capture() {
+        let mut api = RenderdocApi {
+            rdoc_api: None,
+            is_capturing: false,
+        };
+        api.toggle_capture();
+        api.toggle_capture();
+        assert!(!api.is_capturing);
+    }
+
+    #[test]
+    fn toggle_calls_start_end_in_order_with_active_target() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        static INVALID: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn start(device: *mut c_void, window: *mut c_void) {
+            if !device.is_null()
+                || !window.is_null()
+                || CALLS.fetch_add(1, Ordering::SeqCst) % 2 != 0
+            {
+                INVALID.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        unsafe extern "C" fn end(device: *mut c_void, window: *mut c_void) -> u32 {
+            if !device.is_null()
+                || !window.is_null()
+                || CALLS.fetch_add(1, Ordering::SeqCst) % 2 != 1
+            {
+                INVALID.fetch_add(1, Ordering::SeqCst);
+            }
+            // Upstream toggles its state even when capture failed.
+            0
+        }
+        let mut api = RenderdocApi {
+            rdoc_api: Some(RdocApi {
+                start_frame_capture: start,
+                end_frame_capture: end,
+            }),
+            is_capturing: false,
+        };
+        for _ in 0..2 {
+            api.toggle_capture();
+            assert!(api.is_capturing);
+            api.toggle_capture();
+            assert!(!api.is_capturing);
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 4);
+        assert_eq!(INVALID.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn api_prefix_offsets_match_renderdoc_app_header() {
+        let pointer = std::mem::size_of::<*const c_void>();
+        assert_eq!(
+            std::mem::offset_of!(ApiPrefix, start_frame_capture),
+            19 * pointer
+        );
+        assert_eq!(
+            std::mem::offset_of!(ApiPrefix, is_frame_capturing),
+            20 * pointer
+        );
+        assert_eq!(
+            std::mem::offset_of!(ApiPrefix, end_frame_capture),
+            21 * pointer
+        );
+        assert_eq!(std::mem::size_of::<ApiPrefix>(), 22 * pointer);
     }
 }

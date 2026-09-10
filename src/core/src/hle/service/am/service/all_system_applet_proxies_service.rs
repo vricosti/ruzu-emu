@@ -18,12 +18,15 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 
 /// IPC command table for IAllSystemAppletProxiesService ("appletAE"):
 /// - 100: OpenSystemAppletProxy
+/// - 110: OpenSystemAppletProxyEx
 /// - 200: OpenLibraryAppletProxyOld
 /// - 201: OpenLibraryAppletProxy
 /// - 300: OpenOverlayAppletProxy (unimplemented)
 /// - 350: OpenSystemApplicationProxy (unimplemented)
 /// - 400: CreateSelfLibraryAppletCreatorForDevelop (unimplemented)
 /// - 410: GetSystemAppletControllerForDebug (unimplemented)
+/// - 450: GetSystemProcessCommonFunctions (upstream stub)
+/// - 460: GetAppletAlternativeFunctions (upstream stub)
 /// - 1000: GetDebugFunctions (unimplemented)
 pub struct IAllSystemAppletProxiesService {
     system: SystemRef,
@@ -40,6 +43,7 @@ impl IAllSystemAppletProxiesService {
                 Some(Self::open_system_applet_proxy_handler),
                 "OpenSystemAppletProxy",
             ),
+            (110, Some(Self::open_system_applet_proxy_handler), "OpenSystemAppletProxyEx"),
             (
                 200,
                 Some(Self::open_library_applet_proxy_old_handler),
@@ -54,6 +58,8 @@ impl IAllSystemAppletProxiesService {
             (350, None, "OpenSystemApplicationProxy"),
             (400, None, "CreateSelfLibraryAppletCreatorForDevelop"),
             (410, None, "GetSystemAppletControllerForDebug"),
+            (450, Some(Self::get_system_process_common_functions), "GetSystemProcessCommonFunctions"),
+            (460, Some(Self::get_applet_alternative_functions), "GetAppletAlternativeFunctions"),
             (1000, None, "GetDebugFunctions"),
         ]);
         Self {
@@ -62,6 +68,18 @@ impl IAllSystemAppletProxiesService {
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn get_system_process_common_functions(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("IAllSystemAppletProxiesService::GetSystemProcessCommonFunctions (STUBBED)");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_applet_alternative_functions(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("IAllSystemAppletProxiesService::GetAppletAlternativeFunctions (STUBBED)");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     fn get_applet_from_process_id(&self, pid: u64) -> Option<Arc<Mutex<Applet>>> {
@@ -201,6 +219,34 @@ impl IAllSystemAppletProxiesService {
 impl SessionRequestHandler for IAllSystemAppletProxiesService {
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firmware_common_commands_match_upstream_result_only_stubs() {
+        let service = IAllSystemAppletProxiesService::new(SystemRef::null(), Weak::new());
+        for command in [450, 460] {
+            let mut ctx = HLERequestContext::new();
+            service.handlers()[&command].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+            assert_eq!(ctx.cmd_buf[0], 0);
+            // Same result-only reply as Eden: no returned IPC interface/handles.
+            assert_eq!(ctx.cmd_buf[1] & 0x3ff, 10);
+        }
+    }
+
+    #[test]
+    fn extended_system_proxy_preserves_missing_applet_error() {
+        let service = IAllSystemAppletProxiesService::new(SystemRef::null(), Weak::new());
+        for command in [100, 110] {
+            let mut ctx = HLERequestContext::new();
+            service.handlers()[&command].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], RESULT_UNKNOWN.get_inner_value());
+        }
     }
 }
 

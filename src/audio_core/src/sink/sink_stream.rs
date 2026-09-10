@@ -688,6 +688,49 @@ mod tests {
     }
 
     #[test]
+    fn output_gain_combines_guest_factors_and_user_volume() {
+        const CHILD: &str = "RUZU_TEST_OUTPUT_GAIN";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sink::sink_stream::tests::output_gain_combines_guest_factors_and_user_volume"
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        {
+            let mut settings = common::settings::values_mut();
+            settings.volume.set_value(40);
+            settings.audio_muted.set_value(false);
+        }
+        // AppendBuffer multiplies the two independent guest factors and the
+        // user factor, exactly as upstream. Copying the UI factor into both
+        // guest factors changes the result from 40% to 6.4%, not 40%.
+        for (system_gain, device_gain, expected) in
+            [(1.0, 1.0, 6400), (0.5, 1.0, 3200), (0.4, 0.4, 1024)]
+        {
+            let mut stream =
+                SinkStreamBase::new(make_system(), StreamType::Render, 2, 2, String::new());
+            stream.set_system_volume(system_gain);
+            stream.set_device_volume(device_gain);
+            stream.append_buffer(
+                SinkBuffer {
+                    frames: 1,
+                    frames_played: 0,
+                    tag: 1,
+                    consumed: false,
+                },
+                &[16000, -16000],
+            );
+            assert_eq!(stream.release_buffer(2), vec![expected, -expected]);
+        }
+    }
+
+    #[test]
     fn expected_played_sample_count_is_tracked_in_frames() {
         let system = make_system();
         let mut stream = SinkStreamBase::new(system, StreamType::Out, 2, 2, String::new());

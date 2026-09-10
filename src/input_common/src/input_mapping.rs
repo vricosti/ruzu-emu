@@ -259,6 +259,33 @@ impl Default for MappingFactory {
 mod tests {
     use super::*;
 
+    #[test]
+    fn udp_controller_setting_keeps_motion_available() {
+        const CHILD: &str = "RUZU_TEST_UDP_MAPPING_SETTING";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "input_mapping::tests::udp_controller_setting_keeps_motion_available"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        let mut factory = MappingFactory::new();
+        for enabled in [false, true, false] {
+            common::settings::values_mut().enable_udp_controller.set_value(enabled);
+            let mut input = button("cemuhookudp", 4);
+            factory.begin_mapping(polling::InputType::Button);
+            factory.register_input(&input);
+            assert_eq!(factory.get_next_input().has("engine"), enabled);
+            input.r#type = EngineInputType::Motion;
+            factory.begin_mapping(polling::InputType::Motion);
+            factory.register_input(&input);
+            let mapped = factory.get_next_input();
+            assert_eq!(mapped.get_str("engine", ""), "cemuhookudp");
+            assert_eq!(mapped.get_int("motion", -1), 4);
+            assert!(factory.is_driver_valid(&button("sdl", 4)));
+            assert!(factory.is_driver_valid(&button("keyboard", 4)));
+        }
+    }
+
     fn button(engine: &str, index: i32) -> MappingData {
         MappingData {
             engine: engine.to_string(),

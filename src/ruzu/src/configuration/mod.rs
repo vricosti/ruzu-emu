@@ -10,9 +10,8 @@
 //
 // Upstream files with no counterpart yet (each is a separate dialog reached
 // from a Configure button rather than a tab of the main dialog):
-//   configure_camera, configure_debug_controller,
 //   configure_ringcon,
-//   configure_touchscreen_advanced, configure_touch_widget.
+//   configure_touch_widget.
 //
 // `qt_config` covers only the game-directory array of its upstream counterpart
 // so far; the rest of `Config::Read*Values` / `Save*Values` is handled by the
@@ -20,9 +19,11 @@
 
 pub mod configure_applets;
 pub mod configure_audio;
+pub mod configure_camera;
 pub mod configure_cpu;
 pub mod configure_cpu_debug;
 pub mod configure_debug;
+pub mod configure_debug_controller;
 pub mod configure_debug_tab;
 pub mod configure_dialog;
 pub mod configure_filesystem;
@@ -45,6 +46,8 @@ pub mod configure_profile_manager;
 pub mod configure_system;
 pub mod configure_tas;
 pub mod configure_touch_from_button;
+pub mod configure_touchscreen_advanced;
+pub mod configure_ringcon;
 pub mod configure_ui;
 pub mod configure_vibration;
 pub mod configure_web;

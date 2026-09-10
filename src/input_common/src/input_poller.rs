@@ -1986,6 +1986,57 @@ mod tests {
 
     struct TestHatMetadata;
 
+    #[test]
+    fn motion_binding_preserves_threshold_samples_and_callback_lifetime() {
+        use crate::input_engine::BasicMotion;
+        for threshold in [None, Some(0.025)] {
+            let engine = Arc::new(Mutex::new(InputEngine::new("test".to_string())));
+            let factory = InputFactory::new(Arc::clone(&engine));
+            let mut params = ParamPackage::default();
+            params.set_int("motion", 2);
+            if let Some(threshold) = threshold {
+                params.set_float("threshold", threshold);
+            }
+            let identifier = identifier_from_params(&params);
+            let mut device = factory.create(&params);
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&received);
+            device.set_callback(InputCallback {
+                on_change: Some(Arc::new(move |status| {
+                    sink.lock().push(status.motion_status.clone());
+                })),
+            });
+            let sample = BasicMotion {
+                accel_x: 0.25, accel_y: -0.5, accel_z: -1.0,
+                gyro_x: 0.125, gyro_y: -0.25, gyro_z: 0.5,
+                delta_timestamp: 5_000,
+            };
+            // Continuous motion must notify even when two samples are equal.
+            for _ in 0..2 {
+                let pending = engine.lock().set_motion(&identifier, 2, &sample);
+                pending.dispatch();
+            }
+            let values = received.lock();
+            assert_eq!(values.len(), 2);
+            for value in values.iter() {
+                assert_eq!(value.delta_timestamp, 5_000);
+                for (axis, expected) in [(&value.accel.x, 0.25), (&value.accel.y, -0.5),
+                    (&value.accel.z, -1.0), (&value.gyro.x, 0.125),
+                    (&value.gyro.y, -0.25), (&value.gyro.z, 0.5)] {
+                    assert_eq!(axis.raw_value, expected);
+                    assert_eq!(axis.properties.threshold, threshold.unwrap_or(0.007));
+                    assert_eq!(axis.properties.deadzone, 0.0);
+                    assert_eq!(axis.properties.range, 1.0);
+                }
+            }
+            drop(values);
+            drop(device);
+            let pending = engine.lock().set_motion(&identifier, 2, &sample);
+            pending.dispatch();
+            assert_eq!(received.lock().len(), 2);
+        }
+    }
+
     impl InputEngineMetadata for TestHatMetadata {
         fn get_hat_button_id(&self, direction_name: &str) -> u8 {
             match direction_name {

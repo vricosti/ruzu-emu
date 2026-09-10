@@ -68,6 +68,8 @@ use crate::hle::service::set::settings_types::PlatformRegion;
 /// - 501: SuppressDisablingSleepTemporarily (unimplemented)
 /// - 502: IsSleepEnabled (unimplemented)
 /// - 503: IsDisablingSleepSuppressed (unimplemented)
+/// - 610: Unknown610
+/// - 611: Unknown611
 /// - 900: SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled
 pub struct ICommonStateGetter {
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -141,6 +143,8 @@ impl ICommonStateGetter {
                 Some(Self::get_settings_platform_region_handler),
                 "GetSettingsPlatformRegion",
             ),
+            (610, Some(Self::unknown610), "Unknown610"),
+            (611, Some(Self::unknown611), "Unknown611"),
             (
                 900,
                 Some(Self::set_request_exit_to_library_applet_at_execute_next_program_enabled_handler),
@@ -153,6 +157,18 @@ impl ICommonStateGetter {
             system,
             applet,
         }
+    }
+
+    fn unknown610(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) Unknown610 called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn unknown611(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) Unknown611 called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     /// Port of ICommonStateGetter::GetCurrentFocusState
@@ -757,7 +773,7 @@ mod tests {
             ))),
         );
 
-        for cmd in [31u32, 32, 52, 53, 54, 300] {
+        for cmd in [31u32, 32, 52, 53, 54, 300, 610, 611] {
             assert!(
                 service
                     .handlers()
@@ -767,6 +783,25 @@ mod tests {
                 "cmd {} should have a real handler",
                 cmd
             );
+        }
+    }
+
+    #[test]
+    fn firmware_notification_stubs_return_only_success() {
+        let service = ICommonStateGetter::new(
+            SystemRef::null(),
+            Arc::new(Mutex::new(Applet::new(
+                SystemRef::null(),
+                crate::hle::service::os::process::Process::new(),
+                false,
+            ))),
+        );
+        for cmd in [610, 611] {
+            let mut ctx = HLERequestContext::new();
+            service.handlers[&cmd].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.cmd_buf[4], 0x4f43_4653);
+            assert_eq!(&ctx.cmd_buf[6..8], &[0, 0]);
+            assert_eq!(ctx.write_size, 8);
         }
     }
 

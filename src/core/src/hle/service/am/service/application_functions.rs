@@ -89,7 +89,7 @@ fn copy_display_version(version: Option<&str>) -> [u8; 16] {
 /// - 130: GetGpuErrorDetectedSystemEvent
 /// - 131: SetDelayTimeToAbortOnGpuError (unimplemented)
 /// - 140: GetFriendInvitationStorageChannelEvent
-/// - 141: TryPopFromFriendInvitationStorageChannel (unimplemented)
+/// - 141: TryPopFromFriendInvitationStorageChannel
 /// - 150: GetNotificationStorageChannelEvent (unimplemented)
 /// - 151: TryPopFromNotificationStorageChannel (unimplemented)
 /// - 160: GetHealthWarningDisappearedSystemEvent
@@ -206,6 +206,11 @@ impl IApplicationFunctions {
                 160,
                 Some(Self::get_health_warning_disappeared_system_event_handler),
                 "GetHealthWarningDisappearedSystemEvent",
+            ),
+            (
+                141,
+                Some(Self::try_pop_from_friend_invitation_storage_channel_handler),
+                "TryPopFromFriendInvitationStorageChannel",
             ),
             (210, Some(Self::get_unknown_event_210_handler), "Unknown210"),
             (330, Some(Self::unknown_330_handler), "Unknown330"),
@@ -568,6 +573,35 @@ impl IApplicationFunctions {
         }
     }
 
+    fn try_pop_from_friend_invitation_storage_channel(
+        &self,
+    ) -> Result<Arc<super::storage::IStorage>, ResultCode> {
+        log::debug!("TryPopFromFriendInvitationStorageChannel called");
+        let mut applet = self.applet.lock().unwrap();
+        let data = applet
+            .friend_invitation_storage_channel
+            .pop()
+            .ok_or(am_results::RESULT_NO_DATA_IN_CHANNEL)?;
+        Ok(Arc::new(super::storage::IStorage::new_with_system(
+            self.system,
+            data,
+        )))
+    }
+
+    fn try_pop_from_friend_invitation_storage_channel_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        match service.try_pop_from_friend_invitation_storage_channel() {
+            Ok(storage) => Self::push_interface_response(ctx, storage),
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
+        }
+    }
+
     /// EnsureSaveData (cmd 20): ensures save data exists for the given user.
     fn ensure_save_data_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service =
@@ -860,6 +894,29 @@ mod tests {
             system,
             Arc::new(Mutex::new(Applet::new(system, Process::new(), false))),
         )
+    }
+
+    #[test]
+    fn friend_invitation_channel_returns_no_data_then_pops_back() {
+        let service = make_service();
+        let entry = service.handlers().get(&141).unwrap();
+        assert_eq!(entry.name, "TryPopFromFriendInvitationStorageChannel");
+        assert!(entry.handler_callback.is_some());
+        assert_eq!(
+            service.try_pop_from_friend_invitation_storage_channel().err(),
+            Some(am_results::RESULT_NO_DATA_IN_CHANNEL),
+        );
+        service.applet.lock().unwrap().friend_invitation_storage_channel
+            .extend([vec![1, 2], vec![3, 4]]);
+        for expected in [vec![3, 4], vec![1, 2]] {
+            let storage = service.try_pop_from_friend_invitation_storage_channel().unwrap();
+            assert_eq!(storage.get_data(), expected);
+        }
+        let mut ctx = HLERequestContext::new();
+        IApplicationFunctions::try_pop_from_friend_invitation_storage_channel_handler(
+            &service, &mut ctx,
+        );
+        assert_eq!(ctx.cmd_buf[6], am_results::RESULT_NO_DATA_IN_CHANNEL.get_inner_value());
     }
 
     #[test]

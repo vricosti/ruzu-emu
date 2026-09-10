@@ -61,6 +61,56 @@ pub struct GameProperties {
     pub icon: Option<gdk::Texture>,
 }
 
+impl GameProperties {
+    /// ConfigurePerGame::LoadConfiguration: patched control metadata takes
+    /// precedence over the container's metadata, including for direct boots.
+    pub fn load_from_file(title_id: u64, path: &Path) -> Option<Self> {
+        use ruzu_core::file_sys::{control_metadata::NACP, patch_manager::PatchManager};
+        use ruzu_core::hle::service::filesystem::filesystem::FileSystemController;
+        use ruzu_core::loader::loader::{get_loader, get_file_type_string, System as LoaderSystem};
+
+        // GTK shares the frontend provider, not the worker-owned Core::System.
+        let vfs = crate::game_list::frontend_vfs();
+        let provider = crate::game_list::frontend_content_provider_union();
+        let mut controller = FileSystemController::new();
+        controller.set_content_provider(provider.clone());
+        controller.create_factories(vfs.clone(), false);
+        let controller = Arc::new(std::sync::Mutex::new(controller));
+        let mut system = LoaderSystem::new(Some(provider.clone()), Some(controller.clone()));
+        let file = ruzu_core::core::get_game_file_from_path(&vfs, &path.to_string_lossy())?;
+        let loader = get_loader(&mut system, file.clone(), 0, 0)?;
+        let (control, icon_file) = {
+            let controller = controller.lock().unwrap_or_else(|error| error.into_inner());
+            let provider = provider.lock().unwrap_or_else(|error| error.into_inner());
+            PatchManager::new(title_id, &controller, &*provider).get_control_metadata()
+        };
+        let (name, developer, version) = if let Some(control) = control {
+            (control.get_application_name(), control.get_developer_name(), control.get_version_string())
+        } else {
+            let mut name = String::new();
+            loader.read_title(&mut name);
+            let mut control = NACP::new();
+            loader.read_control_data(&mut control);
+            (name, control.get_developer_name(), "1.0.0".to_owned())
+        };
+        let icon = if let Some(file) = icon_file {
+            file.read_all_bytes()
+        } else {
+            let mut bytes = Vec::new();
+            loader.read_icon(&mut bytes);
+            bytes
+        };
+        Some(Self {
+            name, developer, version, title_id,
+            format: get_file_type_string(loader.get_file_type()).to_owned(),
+            size: crate::game_list::human_size(file.get_size() as u64),
+            filename: file.get_name(),
+            path: path.to_path_buf(),
+            icon: gdk::Texture::from_bytes(&glib::Bytes::from(&icon[..])).ok(),
+        })
+    }
+}
+
 type SettingState = BTreeMap<(u32, String), (bool, String)>;
 
 /// Upstream `ConfigurePerGame`.
@@ -70,6 +120,8 @@ pub struct ConfigurePerGame {
     config: RefCell<BaseConfig>,
     config_path: PathBuf,
     finalized: Cell<bool>,
+    running: bool,
+    on_applied: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 impl ConfigurePerGame {
@@ -99,8 +151,8 @@ impl ConfigurePerGame {
             configure_graphics_extensions::page(runtime_lock),
             configure_audio::page(runtime_lock),
             configure_input_per_game::page(hid_core),
-            configure_network::page(),
-            configure_applets::page(),
+            configure_network::page(runtime_lock),
+            configure_applets::page(runtime_lock),
         ];
 
         let window = gtk::Window::builder()
@@ -137,6 +189,7 @@ impl ConfigurePerGame {
         status.set_hexpand(true);
         let cancel = dialog_button("window-close-symbolic", "Cancel", "ruzu-properties-cancel");
         let ok = dialog_button("emblem-ok-symbolic", "OK", "ruzu-properties-ok");
+        let apply = (!runtime_lock).then(|| dialog_button("emblem-ok-symbolic", "Apply", "ruzu-properties-ok"));
 
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         footer.set_margin_top(8);
@@ -146,6 +199,9 @@ impl ConfigurePerGame {
         footer.append(&status);
         footer.append(&cancel);
         footer.append(&ok);
+        if let Some(apply) = &apply {
+            footer.append(apply);
+        }
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.append(&body);
@@ -158,6 +214,8 @@ impl ConfigurePerGame {
             config: RefCell::new(config),
             config_path,
             finalized: Cell::new(false),
+            running: !runtime_lock,
+            on_applied: RefCell::new(None),
         });
 
         cancel.connect_clicked(glib::clone!(
@@ -169,10 +227,18 @@ impl ConfigurePerGame {
             #[weak(rename_to = dialog)]
             this,
             move |_| {
-                dialog.apply_configuration();
-                dialog.window.close();
+                if dialog.apply_configuration() {
+                    dialog.window.close();
+                }
             }
         ));
+        if let Some(apply) = apply {
+            apply.connect_clicked(glib::clone!(
+                #[weak(rename_to = dialog)]
+                this,
+                move |_| { dialog.apply_configuration(); }
+            ));
+        }
         this.window.connect_close_request(glib::clone!(
             #[weak(rename_to = dialog)]
             this,
@@ -211,9 +277,17 @@ impl ConfigurePerGame {
         });
     }
 
-    fn apply_configuration(&self) {
+    pub fn connect_applied(&self, callback: impl Fn() + 'static) {
+        *self.on_applied.borrow_mut() = Some(Box::new(callback));
+    }
+
+    pub fn close(&self) {
+        self.window.close();
+    }
+
+    fn apply_configuration(&self) -> bool {
         if self.finalized.get() {
-            return;
+            return true;
         }
 
         let setting_state = prepare_custom_settings();
@@ -247,10 +321,13 @@ impl ConfigurePerGame {
                 "Properties",
                 "The custom game configuration could not be saved.",
             );
-            return;
+            return false;
         }
 
-        self.restore_global_configuration();
+        if let Some(callback) = self.on_applied.borrow().as_ref() {
+            callback();
+        }
+        true
     }
 
     fn restore_global_configuration(&self) {
@@ -259,10 +336,18 @@ impl ConfigurePerGame {
         }
         {
             let mut values = common::settings::values_mut();
-            common::settings::restore_global_state(&mut values, false);
-            values.players.set_global(true);
+            restore_settings_selection(&mut values, self.running);
         }
         common::settings::set_configuring_global(true);
+    }
+}
+
+/// OpenPerGameConfiguration preserves the active per-game bank while powered
+/// on. The GTK dialog owns this close edge instead of a synchronous exec caller.
+fn restore_settings_selection(values: &mut common::settings::Values, running: bool) {
+    common::settings::restore_global_state(values, running);
+    if !running {
+        values.players.set_global(true);
     }
 }
 
@@ -374,6 +459,7 @@ fn preserve_global_selections(state: &SettingState) {
             }
         });
     }
+    configure_audio::preserve_device_overrides(&mut values);
 }
 
 fn info_panel(properties: &GameProperties) -> gtk::Frame {
@@ -440,6 +526,122 @@ fn info_panel(properties: &GameProperties) -> gtk::Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a display and an isolated process for GTK/global settings"]
+    fn running_properties_apply_twice_then_cancel_keeps_last_applied_values() {
+        use common::fs::path_util::{get_ruzu_path, set_ruzu_path, RuzuPath};
+        fn label(widget: &gtk::Widget, text: &str) -> Option<gtk::Widget> {
+            if widget.downcast_ref::<gtk::Label>().is_some_and(|label| label.text() == text) {
+                return Some(widget.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(found) = label(&widget, text) { return Some(found); }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        fn button(window: &gtk::Window, text: &str) -> gtk::Button {
+            let mut widget = label(window.upcast_ref(), text).unwrap();
+            loop {
+                if let Ok(button) = widget.clone().downcast::<gtk::Button>() { return button; }
+                widget = widget.parent().unwrap();
+            }
+        }
+        gtk::init().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let original = get_ruzu_path(RuzuPath::ConfigDir);
+        set_ruzu_path(RuzuPath::ConfigDir, directory.path());
+        let dialog = ConfigurePerGame::new(None, GameProperties {
+            name: "Synthetic app".into(), developer: String::new(), version: "1.0".into(),
+            title_id: 0, format: "NRO".into(), size: "0 B".into(), filename: "sample.nro".into(),
+            path: directory.path().join("sample.nro"), icon: None,
+        }, Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new())), false);
+        let calls = Rc::new(Cell::new(0));
+        dialog.connect_applied({ let calls = Rc::clone(&calls); move || calls.set(calls.get() + 1) });
+        dialog.window.present();
+        let apply = button(&dialog.window, "Apply");
+        apply.emit_clicked();
+        assert_eq!(calls.get(), 1);
+        assert!(!dialog.finalized.get());
+        assert!(dialog.window.is_visible());
+        apply.emit_clicked();
+        assert_eq!(calls.get(), 2);
+        let saved = std::fs::read(&dialog.config_path).unwrap();
+        button(&dialog.window, "Cancel").emit_clicked();
+        assert!(dialog.finalized.get());
+        assert_eq!(calls.get(), 2);
+        assert_eq!(std::fs::read(&dialog.config_path).unwrap(), saved);
+        assert!(common::settings::is_configuring_global());
+        set_ruzu_path(RuzuPath::ConfigDir, &original);
+    }
+
+    #[test]
+    #[ignore = "requires a display and an isolated process for GTK/global settings"]
+    fn failed_save_keeps_properties_editable_for_retry() {
+        gtk::init().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("properties.ini");
+        // A directory where the file should be reliably rejects writes, even
+        // when the test runner has permission to bypass read-only file modes.
+        std::fs::create_dir(&config_path).unwrap();
+        let mut config = BaseConfig::new(ConfigType::PerGameConfig);
+        config.set_up_ini(&config_path);
+        common::settings::set_configuring_global(false);
+        let dialog = ConfigurePerGame {
+            window: gtk::Window::new(),
+            pages: Vec::new(),
+            config: RefCell::new(config),
+            config_path: config_path.clone(),
+            finalized: Cell::new(false),
+            running: false,
+            on_applied: RefCell::new(None),
+        };
+        let notifications = Rc::new(Cell::new(0));
+        dialog.connect_applied({
+            let notifications = Rc::clone(&notifications);
+            move || notifications.set(notifications.get() + 1)
+        });
+        assert!(!dialog.apply_configuration());
+        assert_eq!(notifications.get(), 0);
+        assert!(!dialog.finalized.get());
+        assert!(!common::settings::is_configuring_global());
+
+        std::fs::remove_dir(&config_path).unwrap();
+        assert!(dialog.apply_configuration());
+        assert_eq!(notifications.get(), 1);
+        assert!(!dialog.finalized.get());
+        assert!(dialog.apply_configuration());
+        assert_eq!(notifications.get(), 2);
+        dialog.restore_global_configuration();
+        assert_eq!(notifications.get(), 2);
+        assert!(dialog.finalized.get());
+        assert!(common::settings::is_configuring_global());
+        assert!(config_path.is_file());
+        for window in gtk::Window::list_toplevels() {
+            if let Ok(window) = window.downcast::<gtk::Window>() {
+                window.close();
+            }
+        }
+    }
+
+    #[test]
+    fn closing_running_properties_keeps_active_custom_settings() {
+        let mut values = common::settings::Values::default();
+        values.volume.set_value(80);
+        values.volume.set_global(false);
+        values.volume.set_value(25);
+        values.players.set_global(false);
+        restore_settings_selection(&mut values, true);
+        assert_eq!(*values.volume.get_value(), 25);
+        assert!(!values.volume.using_global());
+        assert!(!values.players.using_global());
+        restore_settings_selection(&mut values, false);
+        assert_eq!(*values.volume.get_value(), 80);
+        assert!(values.volume.using_global());
+        assert!(values.players.using_global());
+    }
 
     #[test]
     fn custom_config_uses_title_id_or_filename_like_upstream() {

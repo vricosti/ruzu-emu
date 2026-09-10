@@ -240,6 +240,7 @@ impl IHidServer {
                 "ResetIsSixAxisSensorDeviceNewlyAssigned",
             ),
             (91, Some(Self::activate_gesture), "ActivateGesture"),
+            (92, Some(Self::set_gesture_output_ranges), "SetGestureOutputRanges"),
             (
                 100,
                 Some(Self::set_supported_npad_style_set),
@@ -1104,11 +1105,23 @@ impl IHidServer {
     fn enable_six_axis_sensor_fusion(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let is_enabled = rp.pop_bool();
-        let _padding1 = rp.pop_u8();
-        let _padding2 = rp.pop_u16();
-        let sixaxis_handle: SixAxisSensorHandle = rp.pop_raw();
-        let aruid = rp.pop_u64();
+        // CMIF aligns this byte-aligned handle immediately after the bool.
+        // Reading each field with a word-based pop would skip real data.
+        #[derive(Clone, Copy, Default)]
+        #[repr(C)]
+        struct Parameters {
+            enabled: u8,
+            handle: SixAxisSensorHandle,
+            padding: [u8; 3],
+            aruid: u64,
+        }
+        const _: () = assert!(std::mem::size_of::<Parameters>() == 16);
+        const _: () = assert!(std::mem::offset_of!(Parameters, handle) == 1);
+        const _: () = assert!(std::mem::offset_of!(Parameters, aruid) == 8);
+        let parameters: Parameters = rp.pop_raw();
+        let is_enabled = parameters.enabled != 0;
+        let sixaxis_handle = parameters.handle;
+        let aruid = parameters.aruid;
         log::debug!("IHidServer::EnableSixAxisSensorFusion called, is_enabled={}, npad_type={:?}, npad_id={}, device_index={:?}, aruid={}",
             is_enabled, sixaxis_handle.npad_type, sixaxis_handle.npad_id, sixaxis_handle.device_index, aruid);
 
@@ -1355,11 +1368,23 @@ impl IHidServer {
     ) {
         let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let is_enabled = rp.pop_bool();
-        let _padding1 = rp.pop_u8();
-        let _padding2 = rp.pop_u16();
-        let sixaxis_handle: SixAxisSensorHandle = rp.pop_raw();
-        let aruid = rp.pop_u64();
+        // CMIF aligns this byte-aligned handle immediately after the bool.
+        // Reading each field with a word-based pop would skip real data.
+        #[derive(Clone, Copy, Default)]
+        #[repr(C)]
+        struct Parameters {
+            enabled: u8,
+            handle: SixAxisSensorHandle,
+            padding: [u8; 3],
+            aruid: u64,
+        }
+        const _: () = assert!(std::mem::size_of::<Parameters>() == 16);
+        const _: () = assert!(std::mem::offset_of!(Parameters, handle) == 1);
+        const _: () = assert!(std::mem::offset_of!(Parameters, aruid) == 8);
+        let parameters: Parameters = rp.pop_raw();
+        let is_enabled = parameters.enabled != 0;
+        let sixaxis_handle = parameters.handle;
+        let aruid = parameters.aruid;
         log::debug!("(STUBBED) IHidServer::EnableSixAxisSensorUnalteredPassthrough called, is_enabled={}, aruid={}", is_enabled, aruid);
 
         let rm = server.resource_manager.lock();
@@ -1546,6 +1571,23 @@ impl IHidServer {
         };
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(result);
+    }
+
+    // cmd 92: SetGestureOutputRanges
+    fn set_gesture_output_ranges(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let param1 = rp.pop_u32();
+        let param2 = rp.pop_u32();
+        let param3 = rp.pop_u32();
+        let param4 = rp.pop_u32();
+        // Upstream accepts these four raw u32 values without validation or
+        // state changes; the gesture-range operation itself remains stubbed.
+        log::warn!(
+            "(STUBBED) IHidServer::SetGestureOutputRanges called, param1={}, param2={}, param3={}, param4={}",
+            param1, param2, param3, param4
+        );
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 
     // cmd 100: SetSupportedNpadStyleSet
@@ -2170,8 +2212,6 @@ impl IHidServer {
         let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let is_enabled = rp.pop_bool();
-        let _padding1 = rp.pop_u8();
-        let _padding2 = rp.pop_u16();
         let npad_id_raw = rp.pop_u32();
         let aruid = rp.pop_u64();
         let npad_id: NpadIdType = unsafe { core::mem::transmute(npad_id_raw) };
@@ -2239,9 +2279,9 @@ impl IHidServer {
         let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let use_center_clamp = rp.pop_bool();
-        let _padding1 = rp.pop_u8();
-        let _padding2 = rp.pop_u16();
-        let _padding3 = rp.pop_u32();
+        // pop_bool consumes a complete u32; only one more word is needed
+        // to align the following u64 ARUID, as in CMIF ReadInArgument.
+        let _padding = rp.pop_u32();
         let aruid = rp.pop_u64();
         log::info!(
             "IHidServer::SetNpadAnalogStickUseCenterClamp called, use_center_clamp={}, aruid={}",
@@ -2590,11 +2630,23 @@ impl IHidServer {
     fn send_vibration_value_in_bool(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let server = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let is_vibrating = rp.pop_bool();
-        let _padding1 = rp.pop_u8();
-        let _padding2 = rp.pop_u16();
-        let vibration_device_handle: VibrationDeviceHandle = rp.pop_raw();
-        let aruid = rp.pop_u64();
+        // CMIF aligns this byte-aligned handle immediately after the bool.
+        // Reading each field with a word-based pop would skip real data.
+        #[derive(Clone, Copy, Default)]
+        #[repr(C)]
+        struct Parameters {
+            enabled: u8,
+            handle: VibrationDeviceHandle,
+            padding: [u8; 3],
+            aruid: u64,
+        }
+        const _: () = assert!(std::mem::size_of::<Parameters>() == 16);
+        const _: () = assert!(std::mem::offset_of!(Parameters, handle) == 1);
+        const _: () = assert!(std::mem::offset_of!(Parameters, aruid) == 8);
+        let parameters: Parameters = rp.pop_raw();
+        let is_vibrating = parameters.enabled != 0;
+        let vibration_device_handle = parameters.handle;
+        let aruid = parameters.aruid;
         log::debug!(
             "IHidServer::SendVibrationValueInBool called, is_vibrating={}, aruid={}",
             is_vibrating,
@@ -2893,8 +2945,6 @@ impl IHidServer {
     fn enable_palma_step(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let is_enabled = rp.pop_bool();
-        let _padding1 = rp.pop_u8();
-        let _padding2 = rp.pop_u16();
         let _padding3 = rp.pop_u32();
         let _connection_handle = rp.pop_u64();
         log::warn!(
@@ -3052,7 +3102,6 @@ impl IHidServer {
     fn read_palma_play_log(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let unknown = rp.pop_u16();
-        let _padding = rp.pop_u16();
         let _padding2 = rp.pop_u32();
         let _connection_handle = rp.pop_u64();
         log::warn!(
@@ -3067,7 +3116,6 @@ impl IHidServer {
     fn reset_palma_play_log(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let unknown = rp.pop_u16();
-        let _padding = rp.pop_u16();
         let _padding2 = rp.pop_u32();
         let _connection_handle = rp.pop_u64();
         log::warn!(
@@ -3082,8 +3130,6 @@ impl IHidServer {
     fn set_is_palma_all_connectable(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let is_palma_all_connectable = rp.pop_bool();
-        let _padding1 = rp.pop_u8();
-        let _padding2 = rp.pop_u16();
         let _padding3 = rp.pop_u32();
         let aruid = rp.pop_u64();
         log::warn!("(STUBBED) IHidServer::SetIsPalmaAllConnectable called, is_palma_all_connectable={}, aruid={}", is_palma_all_connectable, aruid);
@@ -3095,8 +3141,6 @@ impl IHidServer {
     fn set_is_palma_paired_connectable(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let is_palma_paired_connectable = rp.pop_bool();
-        let _padding1 = rp.pop_u8();
-        let _padding2 = rp.pop_u16();
         let _padding3 = rp.pop_u32();
         let aruid = rp.pop_u64();
         log::warn!("(STUBBED) IHidServer::SetIsPalmaPairedConnectable called, is_palma_paired_connectable={}, aruid={}", is_palma_paired_connectable, aruid);
@@ -3138,8 +3182,6 @@ impl IHidServer {
     fn enable_palma_boost_mode(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let mut rp = RequestParser::new(ctx);
         let is_enabled = rp.pop_bool();
-        let _padding1 = rp.pop_u8();
-        let _padding2 = rp.pop_u16();
         let _padding3 = rp.pop_u32();
         let aruid = rp.pop_u64();
         log::warn!(
@@ -3325,6 +3367,115 @@ impl ServiceFramework for IHidServer {
 mod tests {
     use super::*;
     use hid_core::hid_core::HIDCore;
+
+    #[test]
+    fn home_protection_decodes_bool_id_and_aruid_without_extra_padding_words() {
+        let firmware_settings = Arc::new(HidFirmwareSettings::new());
+        let resource_manager = Arc::new(parking_lot::Mutex::new(ResourceManager::new(
+            Arc::clone(&firmware_settings),
+            Arc::new(parking_lot::Mutex::new(HIDCore::new())),
+        )));
+        resource_manager.lock().initialize();
+        let npad = resource_manager.lock().get_npad().unwrap();
+        let aruid = 0x1234_5678_9abc_def0_u64;
+        assert!(npad.lock().npad_resource_mut().register_applet_resource_user_id(aruid).is_success());
+        npad.lock().npad_resource_mut().set_app_resource_user_id(aruid);
+        let untouched = npad.lock().npad_resource().get_home_protection_enabled(aruid, NpadIdType::Player1);
+        let server = IHidServer::new(
+            SystemRef::null(), resource_manager, firmware_settings,
+            Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+        );
+        let callback = server.handlers()[&132].handler_callback.unwrap();
+        for enabled in [true, false, true] {
+            let mut ctx = HLERequestContext::new();
+            // One byte bool, three padding bytes, u32 ID, u64 ARUID.
+            // Poison padding/trailing words so misalignment cannot pass by luck.
+            ctx.cmd_buf[2..8].copy_from_slice(&[
+                0xa5a5_a500 | u32::from(enabled), NpadIdType::Player2 as u32,
+                aruid as u32, (aruid >> 32) as u32, 0, 0,
+            ]);
+            callback(&server, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+            let npad = npad.lock();
+            assert_eq!(npad.npad_resource().get_home_protection_enabled(aruid, NpadIdType::Player2), Ok(enabled));
+            assert_eq!(npad.npad_resource().get_home_protection_enabled(aruid, NpadIdType::Player1), untouched);
+        }
+        let callback = server.handlers()[&134].handler_callback.unwrap();
+        for enabled in [true, false] {
+            let mut ctx = HLERequestContext::new();
+            ctx.cmd_buf[2..8].copy_from_slice(&[
+                u32::from(enabled), 0xcccc_cccc, aruid as u32, (aruid >> 32) as u32, 0, 0,
+            ]);
+            callback(&server, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+            assert_eq!(npad.lock().npad_resource().get_active_data()
+                .get_npad_analog_stick_use_center_clamp(), enabled);
+        }
+    }
+
+    #[test]
+    fn motion_boolean_commands_preserve_byte_aligned_sensor_handle() {
+        let firmware_settings = Arc::new(HidFirmwareSettings::new());
+        let resource_manager = Arc::new(parking_lot::Mutex::new(ResourceManager::new(
+            Arc::clone(&firmware_settings), Arc::new(parking_lot::Mutex::new(HIDCore::new())),
+        )));
+        resource_manager.lock().initialize();
+        let six_axis = resource_manager.lock().get_six_axis().unwrap();
+        let server = IHidServer::new(
+            SystemRef::null(), resource_manager, firmware_settings,
+            Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+        );
+        let handle = SixAxisSensorHandle {
+            npad_type: NpadStyleIndex::Fullkey, npad_id: 1,
+            device_index: DeviceIndex::Left, _padding: 0,
+        };
+        for command in [69, 84] {
+            let callback = server.handlers()[&command].handler_callback.unwrap();
+            for enabled in [true, false] {
+                let mut ctx = HLERequestContext::new();
+                ctx.cmd_buf[2..6].copy_from_slice(&[
+                    u32::from(enabled) | ((handle.npad_type as u32) << 8)
+                        | ((handle.npad_id as u32) << 16) | ((handle.device_index as u32) << 24),
+                    0xaaaa_aa00, 0x5566_7788, 0x1122_3344,
+                ]);
+                callback(&server, &mut ctx);
+                assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+                let six_axis = six_axis.lock();
+                let actual = if command == 69 {
+                    six_axis.is_six_axis_sensor_fusion_enabled(&handle)
+                } else {
+                    six_axis.is_six_axis_sensor_unaltered_passthrough_enabled(&handle)
+                };
+                assert_eq!(actual, Ok(enabled));
+            }
+        }
+    }
+
+    #[test]
+    fn gesture_output_ranges_is_registered_and_returns_success_for_raw_u32_inputs() {
+        let firmware_settings = Arc::new(HidFirmwareSettings::new());
+        let resource_manager = Arc::new(parking_lot::Mutex::new(ResourceManager::new(
+            Arc::clone(&firmware_settings),
+            Arc::new(parking_lot::Mutex::new(HIDCore::new())),
+        )));
+        let server = IHidServer::new(
+            SystemRef::null(), resource_manager, firmware_settings,
+            Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+        );
+        let info = server.handlers().get(&92).expect("HID command 92 is registered");
+        assert_eq!(info.name, "SetGestureOutputRanges");
+        let callback = info.handler_callback.expect("HID command 92 is implemented");
+        // No gesture activation or guest resource is needed. Eden does not
+        // interpret these values as signed, clamp them, or reject any range.
+        for parameters in [[0; 4], [1, 2, 3, 4], [u32::MAX, 0x8000_0000, 0, u32::MAX]] {
+            let mut ctx = HLERequestContext::new();
+            ctx.cmd_buf[2..6].copy_from_slice(&parameters);
+            callback(&server, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+            assert!(ctx.outgoing_move_objects.is_empty());
+            assert!(ctx.outgoing_copy_objects.is_empty());
+        }
+    }
 
     #[test]
     fn create_applet_resource_reports_success_and_returns_interface_after_manager_error() {

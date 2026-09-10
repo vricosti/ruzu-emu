@@ -88,6 +88,16 @@ pub fn show_warning<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, deta
     show_message_with_type(parent, message, detail, MessageType::Warning, false);
 }
 
+/// QMessageBox::warning with a continuation instead of Qt's nested event loop.
+pub fn show_warning_then<P: IsA<gtk::Window>>(
+    parent: Option<&P>, message: &str, detail: &str, callback: impl FnOnce() + 'static,
+) {
+    show_pretranslated_message_with_type_then(
+        parent, &crate::i18n::tr(message), &crate::i18n::tr(detail),
+        MessageType::Warning, false, callback,
+    );
+}
+
 /// Show a modal error using the GTK 4.0 MessageDialog API.
 pub fn show_error<P: IsA<gtk::Window>>(parent: Option<&P>, message: &str, detail: &str) {
     show_message_with_type(parent, message, detail, MessageType::Error, false);

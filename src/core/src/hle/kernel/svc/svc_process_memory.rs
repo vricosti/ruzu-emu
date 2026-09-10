@@ -72,8 +72,10 @@ pub fn set_process_memory_permission(
     }
 
     // Set the memory permission.
-    let k_perm =
-        crate::hle::kernel::k_memory_block::KMemoryPermission::from_bits_truncate(perm as u8);
+    use crate::hle::kernel::k_memory_block::{
+        convert_to_k_memory_permission, SvcMemoryPermission,
+    };
+    let k_perm = convert_to_k_memory_permission(SvcMemoryPermission::from_bits_truncate(perm as u8));
     let result = process
         .page_table
         .set_process_memory_permission(addr_kpa, size as usize, k_perm);

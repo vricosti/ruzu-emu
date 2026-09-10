@@ -189,12 +189,32 @@ struct StatusReply {
 #[repr(C)]
 struct ErrorReply {
     status: u32,
-    _padding: [u8; 3],
+    // C++ has three reserved bytes and one implicit tail byte. Make all
+    // four explicit so copying the complete eight-byte reply never reads
+    // uninitialized Rust padding.
+    _padding: [u8; 4],
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<RingConFirmwareVersion>() == 0x2);
+    assert!(std::mem::size_of::<FactoryCalibration>() == 0x10);
+    assert!(std::mem::size_of::<CalibrationValue>() == 0x4);
+    assert!(std::mem::size_of::<UserCalibration>() == 0xC);
+    assert!(std::mem::size_of::<RingConData>() == 0x8);
+    assert!(std::mem::size_of::<FirmwareVersionReply>() == 0x8);
+    assert!(std::mem::size_of::<ReadIdReply>() == 0x10);
+    assert!(std::mem::size_of::<Cmd020105Reply>() == 0x8);
+    assert!(std::mem::size_of::<ReadUnkCalReply>() == 0x8);
+    assert!(std::mem::size_of::<ReadFactoryCalReply>() == 0x14);
+    assert!(std::mem::size_of::<ReadUserCalReply>() == 0x14);
+    assert!(std::mem::size_of::<GetThreeByteReply>() == 0x8);
+    assert!(std::mem::size_of::<StatusReply>() == 0x4);
+    assert!(std::mem::size_of::<ErrorReply>() == 0x8);
+};
 
 pub struct RingController {
     base: HidbusBase,
-    input: Option<Arc<Mutex<EmulatedController>>>,
+    input: Arc<Mutex<EmulatedController>>,
     command: RingConCommands,
     total_rep_count: u8,
     total_push_count: u8,
@@ -205,10 +225,10 @@ pub struct RingController {
 }
 
 impl RingController {
-    pub fn new() -> Self {
+    pub fn new(input: Arc<Mutex<EmulatedController>>, runtime: Arc<dyn super::hidbus_base::HidbusRuntime>) -> Self {
         Self {
-            base: HidbusBase::new(),
-            input: None,
+            base: HidbusBase::new(runtime),
+            input,
             command: RingConCommands::Error,
             total_rep_count: 0,
             total_push_count: 0,
@@ -240,27 +260,12 @@ impl RingController {
         }
     }
 
-    pub fn new_with_input(input: Arc<Mutex<EmulatedController>>) -> Self {
-        Self {
-            input: Some(input),
-            ..Self::new()
-        }
-    }
-
     pub fn on_init(&mut self) {
-        if let Some(input) = &self.input {
-            input
-                .lock()
-                .set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Ring);
-        }
+        self.input.lock().set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Ring);
     }
 
     pub fn on_release(&mut self) {
-        if let Some(input) = &self.input {
-            input
-                .lock()
-                .set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Active);
-        }
+        self.input.lock().set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Active);
     }
 
     pub fn on_update(&mut self) {
@@ -299,16 +304,22 @@ impl RingController {
                     )
                 };
                 current_entry.polling_data.data[..bytes.len()].copy_from_slice(bytes);
+                // This accessor has explicit padding throughout; every byte
+                // is initialized by its defaults before the guest copy.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        accessor as *const _ as *const u8,
+                        std::mem::size_of_val(accessor),
+                    )
+                };
+                self.base.runtime.write_memory(self.base.transfer_memory, bytes);
             }
             _ => log::error!("Polling mode not supported {:?}", self.base.polling_mode),
         }
     }
 
     fn get_sensor_value(&self) -> RingConData {
-        let force = self
-            .input
-            .as_ref()
-            .map_or(0.0, |input| input.lock().get_ring_sensor_force().force);
+        let force = self.input.lock().get_ring_sensor_force().force;
         RingConData {
             status: DataValid::Valid as u32,
             data: (force * RANGE as f32) as i16 + IDLE_VALUE,
@@ -340,15 +351,13 @@ impl RingController {
             | RingConCommands::ReadRepCount
             | RingConCommands::ReadTotalPushCount => {
                 assert!(data.len() == 0x4, "data.size is not 0x4 bytes");
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.runtime.signal_send_command_async_event();
                 true
             }
             RingConCommands::ResetRepCount => {
                 assert!(data.len() == 0x4, "data.size is not 0x4 bytes");
                 self.total_rep_count = 0;
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.runtime.signal_send_command_async_event();
                 true
             }
             RingConCommands::SaveCalData => {
@@ -362,16 +371,14 @@ impl RingController {
                     self.user_calibration.zero.value = i16::from_le_bytes([data[12], data[13]]);
                     self.user_calibration.zero.crc = u16::from_le_bytes([data[14], data[15]]);
                 }
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.runtime.signal_send_command_async_event();
                 true
             }
             _ => {
                 log::error!("Command not implemented {:?}", self.command);
                 self.command = RingConCommands::Error;
                 // Signal a reply to avoid softlocking the game
-                // Upstream signals send_command_async_event here.
-                // Requires kernel event (KEvent) integration which is not yet available.
+                self.base.runtime.signal_send_command_async_event();
                 false
             }
         }
@@ -485,7 +492,7 @@ impl RingController {
     fn get_error_reply(&self, out_data: &mut [u8]) -> u64 {
         let reply = ErrorReply {
             status: DataValid::BadCRC as u32,
-            _padding: [0; 3],
+            _padding: [0; 4],
         };
         Self::get_data(&reply, out_data)
     }
@@ -528,20 +535,70 @@ impl RingController {
     }
 }
 
-impl Default for RingController {
-    fn default() -> Self {
-        Self::new()
-    }
+impl super::hidbus_base::HidbusDevice for RingController {
+    fn base(&self) -> &HidbusBase { &self.base }
+    fn base_mut(&mut self) -> &mut HidbusBase { &mut self.base }
+    fn on_init(&mut self) { RingController::on_init(self); }
+    fn on_release(&mut self) { RingController::on_release(self); }
+    fn on_update(&mut self) { RingController::on_update(self); }
+    fn get_device_id(&self) -> u8 { RingController::get_device_id(self) }
+    fn set_command(&mut self, data: &[u8]) -> bool { RingController::set_command(self, data) }
+    fn get_reply(&self, data: &mut [u8]) -> u64 { RingController::get_reply(self, data) }
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::hidbus_base::tests::TestRuntime;
+
+    fn test_input() -> Arc<Mutex<EmulatedController>> {
+        Arc::new(Mutex::new(EmulatedController::new(crate::hid_types::NpadIdType::Player1)))
+    }
+
+    #[test]
+    fn command_completion_signals_match_upstream_branches() {
+        use std::sync::atomic::Ordering;
+        let runtime = Arc::new(TestRuntime::default());
+        let mut controller = RingController::new(test_input(), runtime.clone());
+        assert!(!controller.set_command(&[0, 1, 2]));
+        assert_eq!(runtime.signals.load(Ordering::SeqCst), 0);
+        for (index, command) in [RingConCommands::GetFirmwareVersion, RingConCommands::ReadId,
+            RingConCommands::C020105, RingConCommands::ReadUnkCal,
+            RingConCommands::ReadFactoryCal, RingConCommands::ReadUserCal,
+            RingConCommands::ReadRepCount, RingConCommands::ReadTotalPushCount,
+            RingConCommands::ResetRepCount].into_iter().enumerate() {
+            assert!(controller.set_command(&(command as u32).to_le_bytes()));
+            assert_eq!(runtime.signals.load(Ordering::SeqCst), index + 1);
+        }
+        let mut calibration = [0u8; 0x14];
+        calibration[..4].copy_from_slice(&(RingConCommands::SaveCalData as u32).to_le_bytes());
+        calibration[4..6].copy_from_slice(&123i16.to_le_bytes());
+        assert!(controller.set_command(&calibration));
+        assert_eq!(controller.user_calibration.os_max.value, 123);
+        assert_eq!(runtime.signals.load(Ordering::SeqCst), 10);
+        assert!(!controller.set_command(&0xFFFF_FFFFu32.to_le_bytes()));
+        assert_eq!(runtime.signals.load(Ordering::SeqCst), 11);
+    }
+
+    #[test]
+    fn error_reply_initializes_all_bytes_and_respects_output_capacity() {
+        let controller = RingController::new(test_input(), Arc::new(TestRuntime::default()));
+        let expected = [1, 0, 0, 0, 0, 0, 0, 0];
+        for capacity in 0..=12 {
+            let mut output = [0xA5; 12];
+            let count = controller.get_reply(&mut output[..capacity]) as usize;
+            assert_eq!(count, capacity.min(expected.len()));
+            assert_eq!(&output[..count], &expected[..count]);
+            assert!(output[count..].iter().all(|byte| *byte == 0xA5));
+        }
+    }
 
     #[test]
     fn sixaxis_polling_updates_the_ring_lifo_like_upstream() {
-        let mut controller = RingController::new();
-        controller.base.activate_device();
+        let runtime = Arc::new(TestRuntime::default());
+        let mut controller = RingController::new(test_input(), runtime.clone());
+        super::super::hidbus_base::HidbusDevice::activate_device(&mut controller);
         controller.base.enable(true);
         controller
             .base
@@ -549,6 +606,13 @@ mod tests {
         controller.base.set_transfer_memory_address(0x1000);
 
         controller.on_update();
+
+        let writes = runtime.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 0x1000);
+        assert_eq!(writes[0].1.len(), 0x190);
+        assert_eq!(u64::from_le_bytes(writes[0].1[0x20..0x28].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(writes[0].1[0x28..0x30].try_into().unwrap()), 10);
 
         let accessor = &controller.base.enable_sixaxis_data;
         assert_eq!(accessor.header.result, common::ResultCode::SUCCESS);
@@ -564,5 +628,43 @@ mod tests {
             ]),
             IDLE_VALUE
         );
+    }
+
+    #[test]
+    fn polling_requires_activation_enable_mode_and_memory_then_wraps_at_ten() {
+        use super::super::hidbus_base::HidbusDevice;
+        let runtime = Arc::new(TestRuntime::default());
+        let mut controller = RingController::new(test_input(), runtime.clone());
+        controller.on_update();
+        controller.activate_device();
+        controller.on_update();
+        controller.enable(true);
+        controller.on_update();
+        controller.set_polling_mode(JoyPollingMode::SixAxisSensorEnable);
+        controller.on_update();
+        assert!(runtime.writes.lock().unwrap().is_empty());
+        controller.set_transfer_memory_address(0x1000);
+        for sampling_number in 1..=21u64 {
+            controller.on_update();
+            let accessor = &controller.base.enable_sixaxis_data;
+            assert_eq!(accessor.header.latest_entry, sampling_number % 10);
+            let entry = &accessor.entries[(sampling_number % 10) as usize];
+            assert_eq!(entry.sampling_number, sampling_number);
+            assert_eq!(entry.polling_data.sampling_number, sampling_number);
+        }
+        assert_eq!(runtime.writes.lock().unwrap().len(), 21);
+        controller.disable_polling_mode();
+        controller.on_update();
+        controller.set_polling_mode(JoyPollingMode::ButtonOnly);
+        controller.on_update();
+        controller.set_polling_mode(JoyPollingMode::SixAxisSensorDisable);
+        controller.on_update();
+        controller.set_polling_mode(JoyPollingMode::SixAxisSensorEnable);
+        controller.enable(false);
+        controller.on_update();
+        controller.enable(true);
+        controller.deactivate_device();
+        controller.on_update();
+        assert_eq!(runtime.writes.lock().unwrap().len(), 21);
     }
 }

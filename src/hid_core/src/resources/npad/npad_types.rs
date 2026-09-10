@@ -158,6 +158,28 @@ pub struct NPadGenericState {
 }
 const _: () = assert!(std::mem::size_of::<NPadGenericState>() == 0x28);
 
+/// This is nn::hid::NpadCondition, the global controller condition.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct NpadCondition {
+    pub _00: u32,
+    pub is_initialized: u32,
+    pub hold_type: u32,
+    pub is_valid: u32,
+}
+
+impl Default for NpadCondition {
+    fn default() -> Self {
+        Self {
+            _00: 0,
+            is_initialized: 1,
+            hold_type: NpadJoyHoldType::Horizontal as u32,
+            is_valid: 1,
+        }
+    }
+}
+const _: () = assert!(std::mem::size_of::<NpadCondition>() == 0x10);
+
 /// This is nn::hid::NpadSystemProperties
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]

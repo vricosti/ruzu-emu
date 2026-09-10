@@ -377,7 +377,8 @@ impl PlayerPage {
     /// itself; see `EmulatedController::reload_from_player`.
     fn refresh_devices(&self) {
         if let Some(controller) = self.controller.borrow().as_ref() {
-            controller.lock().reload_from_player(&self.state.borrow());
+            hid_core::frontend::emulated_controller::EmulatedController::reload_from_player(
+                controller, &self.state.borrow());
         }
     }
 
@@ -871,7 +872,8 @@ pub fn page(
     // `Core::HID::EmulatedController` and hands it to the preview with
     // `ui->controllerFrame->SetController(emulated_controller)`. Keep the
     // stable controller owned by HIDCore; no frontend-local adapter exists.
-    controller.lock().reload_from_player(&state.borrow());
+    hid_core::frontend::emulated_controller::EmulatedController::reload_from_player(
+        &controller, &state.borrow());
     *page.controller.borrow_mut() = Some(Arc::clone(&controller));
     *page.configuration_controllers.borrow_mut() = std::mem::take(&mut configuration_controllers);
     *page.input_subsystem.borrow_mut() = Some(Rc::clone(&input_subsystem));

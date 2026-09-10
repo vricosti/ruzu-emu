@@ -1848,17 +1848,25 @@ impl EmulatedController {
     /// to push that copy in without going through the globals. Setting the
     /// parameters one at a time through the `Set*Param` methods above would
     /// rebuild every device once per binding.
-    pub fn reload_from_player(&mut self, player: &settings_input::PlayerInput) {
-        for (index, param) in player.buttons.iter().enumerate() {
-            self.button_params[index] = ParamPackage::from_serialized(param);
+    pub fn reload_from_player(owner: &Arc<Mutex<Self>>, player: &settings_input::PlayerInput) {
+        let callbacks = {
+            let mut controller = owner.lock();
+            for (index, param) in player.buttons.iter().enumerate() {
+                controller.button_params[index] = ParamPackage::from_serialized(param);
+            }
+            for (index, param) in player.analogs.iter().enumerate() {
+                controller.stick_params[index] = ParamPackage::from_serialized(param);
+            }
+            for (index, param) in player.motions.iter().enumerate() {
+                controller.motion_params[index] = ParamPackage::from_serialized(param);
+            }
+            controller.reload_input_deferred()
+        };
+        // NFC callbacks can query the controller. Eden has no outer owner mutex;
+        // release the Rust-only lock before delivering ForceUpdate notifications.
+        for callback in callbacks {
+            callback.dispatch();
         }
-        for (index, param) in player.analogs.iter().enumerate() {
-            self.stick_params[index] = ParamPackage::from_serialized(param);
-        }
-        for (index, param) in player.motions.iter().enumerate() {
-            self.motion_params[index] = ParamPackage::from_serialized(param);
-        }
-        self.reload_input();
     }
 
     /// Port of EmulatedController::GetButtonsValues.
@@ -2669,6 +2677,14 @@ mod tests {
             assert!(!callbacks.is_empty(), "ForceUpdate must retain notifications");
             for callback in callbacks { callback.dispatch(); }
             assert!(calls.load(Ordering::SeqCst) > before);
+        }
+        let mut player = settings_input::PlayerInput::default();
+        player.analogs[0] = format!("engine:{ENGINE}");
+        for _ in 0..4 {
+            let before = calls.load(Ordering::SeqCst);
+            EmulatedController::reload_from_player(&owner, &player);
+            assert!(calls.load(Ordering::SeqCst) > before,
+                "configuration reload must deliver ForceUpdate outside the owner lock");
         }
         // Normal driver notifications remain immediate outside a reload.
         let context = Arc::clone(&owner.lock().event_context);

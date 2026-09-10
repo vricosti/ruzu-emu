@@ -16648,3 +16648,21 @@ unchanged.
 - A display-dependent regression checks focus removal before row deletion and
   preservation of an unrelated entry's focus. It is ignored in the ordinary
   Rust test harness because GTK requires the macOS main thread.
+
+## 2026-09-10 — Configure input reload: frontend/emulated_controller.rs vs hid_core/frontend/emulated_controller.{h,cpp}
+
+### Intentional differences
+- `reload_from_player` is the existing GTK working-copy adaptation of the
+  controller parameter setters. It now takes the shared owner, reloads parameters
+  and devices while locked, and delivers retained ForceUpdate callbacks after
+  unlocking, synchronously before returning. This uses the same callback mechanism
+  as HIDCore::reload_input_devices. Eden has no equivalent outer owner mutex.
+- Both configure_input_player.rs call sites use this owner-aware entry point.
+  Eden's configuration header/implementation and controller ReloadInput/setter
+  interfaces were reread: parameter order, device creation and ForceUpdate remain
+  unchanged; callback delivery moves past the Rust-only locking boundary.
+- A live sample showed Configure -> reload_from_player -> ForceUpdate -> NFC
+  NpadUpdate waiting on the controller mutex held by that same GUI call. No
+  notifications are discarded, and NFC detection is not disabled to avoid it.
+- The reentrant callback regression now also reloads the configuration working
+  copy repeatedly, asserting callbacks can acquire the owner and are delivered.

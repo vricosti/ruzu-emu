@@ -551,7 +551,8 @@ fn run_boot(
     // Content provider / filesystem / factories (upstream core.cpp:367-370).
     {
         // The game-list worker owns and refreshes the process-wide manual
-        // provider. Boot reuses the same union, matching QtCommon::provider.
+        // provider. Native cache slots belong to this System's controller,
+        // independently of the lightweight game-list metadata controllers.
         let content_provider = crate::game_list::frontend_content_provider_union();
         system.set_content_provider(content_provider);
         if system.get_filesystem().is_none() {

@@ -72,6 +72,7 @@ pub struct Applet {
     pub request_exit_to_library_applet_at_execute_next_program_enabled: bool,
 
     // Channels
+    pub friend_invitation_storage_channel: Vec<Vec<u8>>,
     pub user_channel_launch_parameter: std::collections::VecDeque<Vec<u8>>,
     pub preselected_user_launch_parameter: std::collections::VecDeque<Vec<u8>>,
 
@@ -163,6 +164,7 @@ impl Applet {
             vr_mode_enabled: false,
             lcd_backlight_off_enabled: false,
             request_exit_to_library_applet_at_execute_next_program_enabled: false,
+            friend_invitation_storage_channel: Vec::new(),
             user_channel_launch_parameter: std::collections::VecDeque::new(),
             preselected_user_launch_parameter: std::collections::VecDeque::new(),
             caller_applet: Weak::new(),

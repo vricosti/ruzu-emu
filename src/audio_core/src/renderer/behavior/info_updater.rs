@@ -635,6 +635,10 @@ impl<'a> InfoUpdater<'a> {
                 return RESULT_INVALID_UPDATE_INFO;
             };
             mix_count = dirty.count;
+            if !(0..=0x100).contains(&mix_count) {
+                log::error!("Invalid mix count from dirty parameter: count={}, magic={:#x}, expected_size={}", mix_count, dirty.magic, self.in_header.mix_size);
+                return RESULT_INVALID_UPDATE_INFO;
+            }
             self.input_offset += size_of::<MixInDirtyParameter>();
             let Ok(mix_count_usize) = usize::try_from(mix_count) else {
                 return RESULT_INVALID_UPDATE_INFO;
@@ -670,11 +674,13 @@ impl<'a> InfoUpdater<'a> {
                     && params.dest_mix_id != UNUSED_MIX_ID
                     && params.mix_id != FINAL_MIX_ID
                 {
+                    log::error!("Invalid mix destination: mix={} destination={} count={}", params.mix_id, params.dest_mix_id, mix_context.get_count());
                     return RESULT_INVALID_UPDATE_INFO;
                 }
             }
         }
         if total_buffer_count > mix_buffer_count {
+            log::error!("Mix buffer count exceeds available buffers: requested={} available={}", total_buffer_count, mix_buffer_count);
             return RESULT_INVALID_UPDATE_INFO;
         }
         let mut mix_dirty = false;
@@ -716,6 +722,7 @@ impl<'a> InfoUpdater<'a> {
             }
         }
         if self.in_header.mix_size != consumed_input_size as u32 {
+            log::error!("Consumed an incorrect mixes size, header size={}, consumed={}", self.in_header.mix_size, consumed_input_size);
             return RESULT_INVALID_UPDATE_INFO;
         }
         self.input_offset += mix_count_usize * size_of::<MixInParameter>();
@@ -1297,6 +1304,31 @@ mod tests {
         let sink = sink_context.get_info(0).unwrap();
         assert_eq!(sink.get_type(), crate::renderer::sink::SinkType::DeviceSink);
         assert!(!sink.is_used());
+    }
+
+    #[test]
+    fn update_mixes_rejects_excessive_dirty_count_before_consuming_input() {
+        let mut behavior = BehaviorInfo::new();
+        behavior.set_user_lib_revision(CURRENT_REVISION);
+        let mut input = Vec::new();
+        let mix_size = size_of::<MixInDirtyParameter>() + 257 * size_of::<MixInParameter>();
+        push_pod(&mut input, &UpdateDataHeader {
+            revision: behavior.get_process_revision(),
+            mix_size: mix_size as u32,
+            size: (size_of::<UpdateDataHeader>() + mix_size) as u32,
+            ..Default::default()
+        });
+        push_pod(&mut input, &MixInDirtyParameter { count: 257, ..Default::default() });
+        input.resize(size_of::<UpdateDataHeader>() + mix_size, 0);
+        let mut output = vec![0; size_of::<UpdateDataHeader>()];
+        let mut mix_context = MixContext::new();
+        mix_context.initialize(1, 1, &behavior);
+        let effects = EffectContext::new();
+        let mut splitters = SplitterContext::new();
+        let mut updater = InfoUpdater::new(&input, &mut output, None, &mut behavior);
+        let offset = updater.input_offset;
+        assert_eq!(updater.update_mixes(&mut mix_context, 1, &effects, &mut splitters), RESULT_INVALID_UPDATE_INFO);
+        assert_eq!(updater.input_offset, offset);
     }
 
     #[test]

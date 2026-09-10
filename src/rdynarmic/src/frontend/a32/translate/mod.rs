@@ -1,4 +1,5 @@
 mod a32_translate;
+mod a32_crc32;
 pub mod asimd;
 pub mod asimd_three_regs;
 pub mod asimd_two_regs_misc;
@@ -310,6 +311,8 @@ fn translate_arm_instruction(
 ) -> bool {
     use ArmInstId::*;
     match decoded.id {
+        CRC32 => a32_crc32::arm_crc32(ir, decoded),
+        CRC32C => a32_crc32::arm_crc32c(ir, decoded),
         // Data processing - immediate
         AndImm | EorImm | SubImm | RsbImm | AddImm | AdcImm | SbcImm | RscImm | TstImm | TeqImm
         | CmpImm | CmnImm | OrrImm | MovImm | BicImm | MvnImm => {

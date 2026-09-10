@@ -176,7 +176,7 @@ pub fn process_reverb_command(
             }
             ParameterState::Initialized => {
                 let total_samples = total_workbuffer_samples(state);
-                let Some(workbuffer) = read_f32_slice_mut(payload.workbuffer, total_samples) else {
+                let Some(workbuffer) = reverb_workbuffer_mut(payload.state, total_samples) else {
                     return;
                 };
                 initialize_reverb_effect(
@@ -193,7 +193,7 @@ pub fn process_reverb_command(
     let total_samples = total_workbuffer_samples(state);
     let mut empty_workbuffer = [];
     let workbuffer =
-        read_f32_slice_mut(payload.workbuffer, total_samples).unwrap_or(&mut empty_workbuffer);
+        reverb_workbuffer_mut(payload.state, total_samples).unwrap_or(&mut empty_workbuffer);
     apply_reverb_effect(
         &payload.parameter,
         state,
@@ -651,14 +651,49 @@ fn read_reverb_state_mut(addr: CpuAddr) -> Option<&'static mut ReverbState> {
     Some(unsafe { &mut *(addr as *mut ReverbState) })
 }
 
-fn read_f32_slice_mut(addr: CpuAddr, len: usize) -> Option<&'static mut [f32]> {
-    if addr == 0 {
+fn reverb_workbuffers() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, Vec<f32>>> {
+    static BUFFERS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<usize, Vec<f32>>>,
+    > = std::sync::OnceLock::new();
+    BUFFERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Host-side delay-line storage for the reverb effect, keyed by the reverb
+/// state address.
+///
+/// Upstream `ReverbCommand::Process` keeps the delay lines inside the
+/// host-allocated `ReverbInfo::State` and leaves the game-supplied `workbuffer`
+/// unused (reverb.cpp:202 documents it as "Game-supplied memory for the state.
+/// (Unused)"). This port lays the ring buffers out in a flat buffer instead, but
+/// that buffer must be host memory: the guest `workbuffer` address is a CPU
+/// (guest) address, not a valid host pointer, so casting it and dereferencing it
+/// crashes. We allocate the storage on the host heap, keyed by the (host) reverb
+/// state address, mirroring how `delay.rs` owns its delay lines.
+fn reverb_workbuffer_mut(state_addr: CpuAddr, total_samples: usize) -> Option<&'static mut [f32]> {
+    if state_addr == 0 {
         return None;
     }
-    crate::raw_write_trace::maybe_trace_write_at(
-        "reverb:f32_slice_mut",
-        addr,
-        len * std::mem::size_of::<f32>(),
-    );
-    Some(unsafe { std::slice::from_raw_parts_mut(addr as *mut f32, len) })
+    let mut buffers = reverb_workbuffers().lock();
+    let buffer = buffers.entry(state_addr as usize).or_default();
+    if buffer.len() < total_samples {
+        buffer.resize(total_samples, 0.0);
+    }
+    let ptr = buffer.as_mut_ptr();
+    // SAFETY: the Vec is owned by the 'static map and is not reallocated while
+    // this borrow is live — the reverb command for a given state runs on a single
+    // audio thread, and any later `resize` happens on a subsequent call once this
+    // borrow is gone. The returned slice covers the first `total_samples`
+    // elements, all of which are initialized.
+    Some(unsafe { std::slice::from_raw_parts_mut(ptr, total_samples) })
+}
+
+/// Frees the host-side reverb delay-line storage for a state address.
+///
+/// Wired from `EffectInfoBase::drop_owned_raw_state` so the buffer is released
+/// when the effect's state buffer is torn down.
+pub(crate) fn drop_reverb_workbuffer(state_addr: CpuAddr) {
+    if state_addr == 0 {
+        return;
+    }
+    reverb_workbuffers().lock().remove(&(state_addr as usize));
 }

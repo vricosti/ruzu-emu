@@ -11,6 +11,8 @@ pub struct DecodedArm {
 /// ARM instruction identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArmInstId {
+    CRC32,
+    CRC32C,
     // Data processing - immediate
     AndImm,
     EorImm,
@@ -508,7 +510,11 @@ pub fn decode_arm(instr: u32) -> DecodedArm {
     // Upstream arm.inc lists the architectural hint encodings before the
     // data-processing-immediate family. The low-nibble values 6..=15 are
     // reserved hints and, like upstream's catch-all entry, decode as NOP.
-    let id = if matches_arm(instr, 0x0FFF_FFF0, 0x0320_F000) {
+    let id = if matches_arm(instr, 0x0F90_0FF0, 0x0100_0040) {
+        ArmInstId::CRC32
+    } else if matches_arm(instr, 0x0F90_0FF0, 0x0100_0240) {
+        ArmInstId::CRC32C
+    } else if matches_arm(instr, 0x0FFF_FFF0, 0x0320_F000) {
         match instr & 0xF {
             0 => ArmInstId::NOP,
             1 => ArmInstId::YIELD,

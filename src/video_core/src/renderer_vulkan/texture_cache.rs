@@ -1297,7 +1297,7 @@ impl Framebuffer {
             num_layers = num_layers.max(base.range.extent.layers);
             images[num_images] = color_buffer.image_handle();
             image_ranges[num_images] =
-                make_subresource_range(image_aspect_mask(base.format), base.range, base.flags);
+                make_image_view_subresource_range(image_aspect_mask(base.format), base.range, base.flags);
             rt_map[index] = num_images;
             samples = color_buffer.samples();
             num_images += 1;
@@ -1325,7 +1325,7 @@ impl Framebuffer {
             num_layers = num_layers.max(base.range.extent.layers);
             images[num_images] = depth_buffer.image_handle();
             let subresource_range =
-                make_subresource_range(image_aspect_mask(base.format), base.range, base.flags);
+                make_image_view_subresource_range(image_aspect_mask(base.format), base.range, base.flags);
             image_ranges[num_images] = subresource_range;
             samples = depth_buffer.samples();
             num_images += 1;
@@ -3521,7 +3521,7 @@ impl TextureCacheRuntime {
             self.ext_4444_formats_supported,
             self.vulkan_device().supports_depth_stencil_swizzle_one(),
         );
-        let base_range = make_subresource_range(aspect_mask, view_base.range, view_base.flags);
+        let base_range = make_subresource_range(aspect_mask, view_base.range);
         let image_format_info = self.surface_format_info(image.base().info.format, false);
         let usage = image_view_usage_flags(
             format_info,
@@ -5933,6 +5933,29 @@ mod tests {
     }
 
     #[test]
+    fn volume_slice_views_preserve_layers_while_barriers_cover_the_image() {
+        let mut view = ImageViewBase::null(
+            crate::texture_cache::image_view_base::NullImageViewParams,
+        );
+        view.view_type = ImageViewType::E2DArray;
+        view.flags = ImageViewFlagBits::SLICE;
+        view.range.base.layer = 4;
+        view.range.extent.layers = 8;
+        view.range.extent.levels = 1;
+
+        let attachment = make_subresource_range(vk::ImageAspectFlags::COLOR, view.range);
+        assert_eq!((attachment.base_array_layer, attachment.layer_count), (4, 8));
+        let (kind, auxiliary) = aux_image_view_params(&view, vk::ImageAspectFlags::COLOR, None);
+        assert_eq!(kind, vk::ImageViewType::TYPE_2D_ARRAY);
+        assert_eq!((auxiliary.base_array_layer, auxiliary.layer_count), (4, 8));
+        let barrier = make_image_view_subresource_range(
+            vk::ImageAspectFlags::COLOR, view.range, view.flags,
+        );
+        assert_eq!((barrier.base_array_layer, barrier.layer_count), (0, 1));
+        assert_eq!(barrier.level_count, attachment.level_count);
+    }
+
+    #[test]
     fn storage_image_views_override_type_and_clamp_non_array_layers() {
         let mut view =
             ImageViewBase::null(crate::texture_cache::image_view_base::NullImageViewParams);
@@ -7303,25 +7326,28 @@ fn component_swizzle(source: u8) -> vk::ComponentSwizzle {
 fn make_subresource_range(
     aspect_mask: vk::ImageAspectFlags,
     range: SubresourceRange,
-    flags: ImageViewFlagBits,
 ) -> vk::ImageSubresourceRange {
-    let base_layer = if flags.contains(ImageViewFlagBits::SLICE) {
-        0
-    } else {
-        range.base.layer.max(0) as u32
-    };
-    let layer_count = if flags.contains(ImageViewFlagBits::SLICE) {
-        1
-    } else {
-        range.extent.layers.max(1) as u32
-    };
     vk::ImageSubresourceRange {
         aspect_mask,
-        base_mip_level: range.base.level.max(0) as u32,
-        level_count: range.extent.levels.max(1) as u32,
-        base_array_layer: base_layer,
-        layer_count,
+        base_mip_level: range.base.level as u32,
+        level_count: range.extent.levels as u32,
+        base_array_layer: range.base.layer as u32,
+        layer_count: range.extent.layers as u32,
     }
+}
+
+/// Upstream MakeSubresourceRange(const ImageView*): barriers address the single
+/// array layer of a 3D image, whereas view creation retains its depth slices.
+fn make_image_view_subresource_range(
+    aspect_mask: vk::ImageAspectFlags,
+    mut range: SubresourceRange,
+    flags: ImageViewFlagBits,
+) -> vk::ImageSubresourceRange {
+    if flags.contains(ImageViewFlagBits::SLICE) {
+        range.base.layer = 0;
+        range.extent.layers = 1;
+    }
+    make_subresource_range(aspect_mask, range)
 }
 
 /// Parameter selection performed by upstream `Vulkan::ImageView::MakeView`.
@@ -7332,7 +7358,7 @@ fn aux_image_view_params(
     aspect_mask: vk::ImageAspectFlags,
     texture_type: Option<TextureType>,
 ) -> (vk::ImageViewType, vk::ImageSubresourceRange) {
-    let mut range = make_subresource_range(aspect_mask, view.range, view.flags);
+    let mut range = make_subresource_range(aspect_mask, view.range);
     let view_type = if let Some(texture_type) = texture_type {
         let view_type = image_view_type_from_texture_type(texture_type);
         if !matches!(

@@ -61,8 +61,14 @@ fn set_process_memory_permission(
     size: u64,
     permission: MemoryPermission,
 ) -> Result<(), ResultCode> {
-    use crate::hle::kernel::k_memory_block::KMemoryPermission;
-    let k_perm = KMemoryPermission::from_bits_truncate(permission as u8);
+    use crate::hle::kernel::k_memory_block::{
+        convert_to_k_memory_permission, SvcMemoryPermission,
+    };
+    // Rust's page-table entry point takes internal permissions, whereas the
+    // C++ entry point converts SVC permissions inside SetProcessMemoryPermission.
+    let k_perm = convert_to_k_memory_permission(SvcMemoryPermission::from_bits_truncate(
+        permission as u8,
+    ));
     let result = process.page_table.set_process_memory_permission(
         KProcessAddress::new(address),
         size as usize,
@@ -272,4 +278,35 @@ pub fn unmap_nro(
 
     // Unmap the nro/bss.
     unmap_process_code_memory(process, base_address, &regions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hle::kernel::k_memory_block::{
+        KMemoryAttribute, KMemoryBlockDisableMergeAttribute, KMemoryPermission, KMemoryState,
+    };
+    use crate::hle::kernel::kernel::ScopedKernelForTest;
+
+    #[test]
+    fn writable_module_region_becomes_alias_code_data() {
+        let mut kernel = ScopedKernelForTest::new();
+        kernel.kernel_mut().initialize_memory_block_slab_manager(4096);
+        kernel.kernel_mut().initialize_block_info_manager(4096);
+        let mut process = KProcess::new();
+        let address = 0x1000_0000;
+        process.page_table.configure_address_space(KProcessAddress::new(address), 0x4000, 32);
+        process.page_table.get_base_mut().get_memory_block_manager_mut().update(
+            address as usize, 1, KMemoryState::ALIAS_CODE,
+            KMemoryPermission::USER_READ, KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE,
+        );
+        set_process_memory_permission(&mut process, address, PAGE_SIZE as u64,
+            MemoryPermission::ReadWrite).unwrap();
+        let info = process.page_table.get_base_mut().get_memory_block_manager()
+            .query_info(address as usize).unwrap();
+        assert_eq!(info.m_state, KMemoryState::ALIAS_CODE_DATA);
+        assert_eq!(info.m_permission, KMemoryPermission::USER_READ_WRITE);
+    }
 }

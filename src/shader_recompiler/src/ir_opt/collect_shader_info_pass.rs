@@ -744,6 +744,47 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                     program.info.used_storage_buffer_types |= Type::U32x4 as u32;
                 }
 
+                Opcode::BindlessImageAtomicIAdd32
+                | Opcode::BindlessImageAtomicSMin32
+                | Opcode::BindlessImageAtomicUMin32
+                | Opcode::BindlessImageAtomicSMax32
+                | Opcode::BindlessImageAtomicUMax32
+                | Opcode::BindlessImageAtomicInc32
+                | Opcode::BindlessImageAtomicDec32
+                | Opcode::BindlessImageAtomicAnd32
+                | Opcode::BindlessImageAtomicOr32
+                | Opcode::BindlessImageAtomicXor32
+                | Opcode::BindlessImageAtomicExchange32
+                | Opcode::BoundImageAtomicIAdd32
+                | Opcode::BoundImageAtomicSMin32
+                | Opcode::BoundImageAtomicUMin32
+                | Opcode::BoundImageAtomicSMax32
+                | Opcode::BoundImageAtomicUMax32
+                | Opcode::BoundImageAtomicInc32
+                | Opcode::BoundImageAtomicDec32
+                | Opcode::BoundImageAtomicAnd32
+                | Opcode::BoundImageAtomicOr32
+                | Opcode::BoundImageAtomicXor32
+                | Opcode::BoundImageAtomicExchange32
+                | Opcode::ImageAtomicIAdd32
+                | Opcode::ImageAtomicSMin32
+                | Opcode::ImageAtomicUMin32
+                | Opcode::ImageAtomicSMax32
+                | Opcode::ImageAtomicUMax32
+                | Opcode::ImageAtomicInc32
+                | Opcode::ImageAtomicDec32
+                | Opcode::ImageAtomicAnd32
+                | Opcode::ImageAtomicOr32
+                | Opcode::ImageAtomicXor32
+                | Opcode::ImageAtomicExchange32 => {
+                    let flags = TextureInstInfo::from_u32(inst.flags);
+                    program.info.uses_atomic_image_u32 = true;
+                    program.info.uses_image_1d |= matches!(
+                        TextureType::from_u8(flags.texture_type),
+                        TextureType::Color1D | TextureType::ColorArray1D
+                    );
+                }
+
                 // Global memory
                 Opcode::LoadGlobalU8
                 | Opcode::LoadGlobalS8
@@ -1128,6 +1169,59 @@ mod tests {
         assert!(program.info.loads.get(Attribute::generic(0, 1).0 as usize));
         assert!(program.info.loads.get(Attribute::generic(0, 2).0 as usize));
         assert!(program.info.loads.get(Attribute::generic(0, 3).0 as usize));
+    }
+
+    #[test]
+    fn collect_info_records_all_image_atomic_capabilities() {
+        for opcode in [
+            Opcode::BindlessImageAtomicIAdd32,
+            Opcode::BindlessImageAtomicSMin32,
+            Opcode::BindlessImageAtomicUMin32,
+            Opcode::BindlessImageAtomicSMax32,
+            Opcode::BindlessImageAtomicUMax32,
+            Opcode::BindlessImageAtomicInc32,
+            Opcode::BindlessImageAtomicDec32,
+            Opcode::BindlessImageAtomicAnd32,
+            Opcode::BindlessImageAtomicOr32,
+            Opcode::BindlessImageAtomicXor32,
+            Opcode::BindlessImageAtomicExchange32,
+            Opcode::BoundImageAtomicIAdd32,
+            Opcode::BoundImageAtomicSMin32,
+            Opcode::BoundImageAtomicUMin32,
+            Opcode::BoundImageAtomicSMax32,
+            Opcode::BoundImageAtomicUMax32,
+            Opcode::BoundImageAtomicInc32,
+            Opcode::BoundImageAtomicDec32,
+            Opcode::BoundImageAtomicAnd32,
+            Opcode::BoundImageAtomicOr32,
+            Opcode::BoundImageAtomicXor32,
+            Opcode::BoundImageAtomicExchange32,
+            Opcode::ImageAtomicIAdd32,
+            Opcode::ImageAtomicSMin32,
+            Opcode::ImageAtomicUMin32,
+            Opcode::ImageAtomicSMax32,
+            Opcode::ImageAtomicUMax32,
+            Opcode::ImageAtomicInc32,
+            Opcode::ImageAtomicDec32,
+            Opcode::ImageAtomicAnd32,
+            Opcode::ImageAtomicOr32,
+            Opcode::ImageAtomicXor32,
+            Opcode::ImageAtomicExchange32,
+        ] {
+            for texture_type in [TextureType::Color1D, TextureType::ColorArray1D, TextureType::Color2D, TextureType::Buffer] {
+                let mut program = Program::new(ShaderStage::Fragment);
+                program.blocks.push(Block::new());
+                program.block_mut(0).append_inst(Inst::with_flags(opcode, vec![], TextureInstInfo {
+                    texture_type: texture_type as u8,
+                    ..Default::default()
+                }.to_u32()));
+                collect_shader_info_pass(&mut program);
+                assert!(program.info.uses_atomic_image_u32, "{opcode:?}");
+                assert_eq!(program.info.uses_image_1d,
+                    matches!(texture_type, TextureType::Color1D | TextureType::ColorArray1D),
+                    "{opcode:?} {texture_type:?}");
+            }
+        }
     }
 
     #[test]

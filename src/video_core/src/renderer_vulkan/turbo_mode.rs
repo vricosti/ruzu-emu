@@ -359,8 +359,14 @@ impl TurboMode {
 
 impl Drop for TurboMode {
     fn drop(&mut self) {
-        self.state.stop_requested.store(true, Ordering::Release);
-        self.state.submission_cv.notify_all();
+        {
+            // Unlike C++'s stop-token-aware condition_variable_any::wait,
+            // std::Condvar needs the stop predicate protected by the wait mutex
+            // to prevent a notification between checking it and going to sleep.
+            let _submission_time = self.state.submission_time.lock().unwrap();
+            self.state.stop_requested.store(true, Ordering::Release);
+            self.state.submission_cv.notify_all();
+        }
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
@@ -378,6 +384,40 @@ mod tests {
         #[cfg(not(target_os = "android"))]
         assert_eq!(TURBO_BUFFER_SIZE, 2 * 1024 * 1024);
         assert_eq!(IDLE_TIMEOUT, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn stop_wakes_an_idle_worker_and_joins_it() {
+        use std::sync::mpsc;
+
+        let state = Arc::new(TurboState {
+            submission_time: Mutex::new(Instant::now() - IDLE_TIMEOUT * 2),
+            submission_cv: Condvar::new(),
+            stop_requested: AtomicBool::new(false),
+        });
+        let worker_state = Arc::clone(&state);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut submission_time = worker_state.submission_time.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            while !worker_state.stop_requested.load(Ordering::Acquire) {
+                submission_time = worker_state.submission_cv.wait(submission_time).unwrap();
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let turbo = TurboMode {
+            state,
+            thread_handle: Some(worker),
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let stopper = std::thread::spawn(move || {
+            drop(turbo);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("idle worker must stop without another submission");
+        stopper.join().unwrap();
     }
 
     #[test]

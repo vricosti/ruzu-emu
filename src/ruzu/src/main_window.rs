@@ -7049,6 +7049,7 @@ pub fn update_ui_theme() {
     apply_global_dark_titlebar(dark);
     install_blue_accent_css();
     install_ui_theme_css(internal);
+    install_ui_font_scale(crate::uisettings::with(|v| *v.font_scale.get_value()));
     log::debug!(
         "UI theme '{internal}' resolved to {} mode",
         if dark { "dark" } else { "light" }
@@ -7123,6 +7124,116 @@ thread_local! {
     // A single replaceable provider: theme switches must not accumulate styles
     // or leave the midnight palette installed when returning to Default/Dark.
     static UI_THEME_CSS: std::cell::RefCell<Option<gtk::CssProvider>> = const { std::cell::RefCell::new(None) };
+    static UI_FONT_CSS: std::cell::RefCell<Option<gtk::CssProvider>> = const { std::cell::RefCell::new(None) };
+}
+
+/// GTK frontend extension based on GIMP app/gui/themes.c, themes_apply_theme.
+/// Relative `rem` units retain the system font and avoid nested multiplication.
+/// This is a user preference, not automatic per-monitor DPI compensation.
+fn interface_font_css(percent: u32) -> Option<String> {
+    let percent = percent.clamp(50, 200);
+    (percent != 100).then(|| format!("* {{ font-size: {:.2}rem; }}", percent as f64 / 100.0))
+}
+
+fn install_ui_font_scale(percent: u32) {
+    let Some(display) = gtk::gdk::Display::default() else { return; };
+    UI_FONT_CSS.with(|slot| {
+        if let Some(previous) = slot.borrow_mut().take() {
+            gtk::style_context_remove_provider_for_display(&display, &previous);
+        }
+        if let Some(css) = interface_font_css(percent) {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_data(&css);
+            gtk::style_context_add_provider_for_display(
+                &display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 3);
+            *slot.borrow_mut() = Some(provider);
+        }
+    });
+}
+
+#[cfg(test)]
+mod interface_font_tests {
+    use super::*;
+
+    #[test]
+    fn interface_font_scale_is_relative_bounded_and_resettable() {
+        assert_eq!(interface_font_css(100), None);
+        assert_eq!(interface_font_css(150).as_deref(), Some("* { font-size: 1.50rem; }"));
+        assert_eq!(interface_font_css(0), interface_font_css(50));
+        assert_eq!(interface_font_css(u32::MAX), interface_font_css(200));
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display process"]
+    fn interface_font_scale_updates_widgets_and_resets_without_accumulation() {
+        #[cfg(target_os = "windows")]
+        {
+            crate::configure_windows_native_decorations();
+            crate::configure_windows_gsk_renderer();
+        }
+        gtk::init().unwrap();
+        // Do not measure an intermediate font size during theme transitions.
+        gtk::Settings::default().unwrap().set_gtk_enable_animations(false);
+        let window = gtk::Window::new();
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let label = gtk::Label::new(Some("Interface text"));
+        let nested = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let button = gtk::Button::with_label("Interface text");
+        let button_label = button.child().unwrap().downcast::<gtk::Label>().unwrap();
+        nested.append(&button);
+        column.append(&label);
+        column.append(&nested);
+        let menu_model = gio::Menu::new();
+        menu_model.append(Some("Interface text"), Some("app.test"));
+        let menu = gtk::PopoverMenu::from_model(Some(&menu_model));
+        let menu_button = gtk::MenuButton::new();
+        menu_button.set_popover(Some(&menu));
+        column.append(&menu_button);
+        window.set_child(Some(&column));
+        window.present();
+        menu.popup();
+        let dialog = gtk::Window::builder().transient_for(&window).build();
+        let dialog_label = gtk::Label::new(Some("Interface text"));
+        dialog.set_child(Some(&dialog_label));
+        dialog.present();
+        fn find_label(widget: &gtk::Widget) -> Option<gtk::Label> {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                if label.text() == "Interface text" { return Some(label.clone()); }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(label) = find_label(&widget) { return Some(label); }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        let menu_label = find_label(menu.upcast_ref()).expect("menu item label");
+        let mut heights = Vec::new();
+        for percent in [100, 150, 150, 200, 100] {
+            install_ui_font_scale(percent);
+            let main_loop = glib::MainLoop::new(None, false);
+            let done = main_loop.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || done.quit());
+            main_loop.run();
+            let height = label.layout().pixel_size().1;
+            eprintln!("percent={percent}: label={height}, button={}, menu={}, dialog={}",
+                button_label.layout().pixel_size().1, menu_label.layout().pixel_size().1,
+                dialog_label.layout().pixel_size().1);
+            assert_eq!(button_label.layout().pixel_size().1, height,
+                "nesting must not multiply relative font sizes");
+            heights.push([height, menu_label.layout().pixel_size().1,
+                dialog_label.layout().pixel_size().1]);
+        }
+        dialog.close();
+        menu.popdown();
+        window.close();
+        for index in 0..3 {
+            assert!(heights[1][index] > heights[0][index]);
+            assert_eq!(heights[1][index], heights[2][index]);
+            assert!(heights[3][index] > heights[1][index]);
+            assert_eq!(heights[0][index], heights[4][index]);
+        }
+    }
 }
 
 fn install_ui_theme_css(theme: &str) {

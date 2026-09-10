@@ -289,6 +289,9 @@ pub struct Values {
     pub language: Setting<String>,
     /// Widget theme name, matching one of [`THEMES`].
     pub theme: Setting<String>,
+    /// GTK frontend extension, following GIMP's relative interface font scaling.
+    /// Percentage of the system/theme font, not a replacement for monitor DPI.
+    pub font_scale: Setting<u32>,
     /// Mirror the log to a console window — upstream `show_console`.
     pub show_console: Setting<bool>,
     #[cfg(unix)]
@@ -383,6 +386,7 @@ impl Default for Values {
 
             language: Setting::new(String::new(), "language", Paths),
             theme: Setting::new(String::from("Default Colorful"), "theme", Ui),
+            font_scale: Setting::new(100, "font_scale", Ui),
             show_console: Setting::new(false, "showConsole", Ui),
             #[cfg(unix)]
             gui_force_x11: Setting::new(false, "gui_force_x11", UiGeneral),
@@ -457,7 +461,7 @@ impl Values {
         macro_rules! settings {
             ($($field:ident),+ $(,)?) => { $(visit(&mut self.$field);)+ };
         }
-        settings!(single_window_mode, fullscreen, show_filter_bar,
+        settings!(font_scale, single_window_mode, fullscreen, show_filter_bar,
             show_status_bar, show_perf_overlay, confirm_before_stopping, pause_when_in_background,
             mute_when_in_background, hide_mouse, controller_applet_disabled,
             select_user_on_boot, enable_gamemode, show_console,

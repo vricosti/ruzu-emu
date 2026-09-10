@@ -171,6 +171,14 @@ pub(super) fn page_with_screenshot_info() -> (Page, ScreenshotInfoCallback) {
     let (theme_row, theme) = w::combo_row("Theme:", &theme_labels, theme_index);
     general.append(&theme_row);
 
+    // GTK frontend extension: GIMP-style relative font scaling (50–200%).
+    let (font_scale_row, font_scale) = w::spin_row(
+        "Interface text size (%):",
+        uisettings::with(|v| (*v.font_scale.get_value()).clamp(50, 200)) as f64,
+        50.0, 200.0, 10.0, "",
+    );
+    general.append(&font_scale_row);
+
     column.append(&general_group);
 
     // --- "Game List" ------------------------------------------------------
@@ -336,6 +344,7 @@ pub(super) fn page_with_screenshot_info() -> (Page, ScreenshotInfoCallback) {
 
         uisettings::with_mut(|v| {
             v.theme.set_value(theme_name);
+            v.font_scale.set_value(font_scale.value_as_int() as u32);
             v.language.set_value(language_code);
             v.show_add_ons.set_value(add_ons);
             v.show_size.set_value(size);
@@ -523,7 +532,6 @@ mod tests {
     #[test]
     #[ignore = "requires GTK display; run alone"]
     fn filtered_row_choices_keep_semantic_ids_after_repeated_updates() {
-        use gtk::prelude::*;
         gtk::init().unwrap();
         let choices = super::RowTextChoices::initialize(
             gtk::DropDown::from_strings(&[]), gtk::DropDown::from_strings(&[]), 3, 2);

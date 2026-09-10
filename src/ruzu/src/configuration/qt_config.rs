@@ -1914,6 +1914,20 @@ mod tests {
     }
 
     #[test]
+    fn interface_font_scale_roundtrip_and_default() {
+        let mut source = uisettings::Values::default();
+        read_ui_values("", &mut source);
+        assert_eq!(*source.font_scale.get_value(), 100);
+        for percent in [50, 100, 125, 150, 175, 200] {
+            source.font_scale.set_value(percent);
+            let document = save_ui_values("", &mut source);
+            let mut loaded = uisettings::Values::default();
+            read_ui_values(&document, &mut loaded);
+            assert_eq!(*loaded.font_scale.get_value(), percent);
+        }
+    }
+
+    #[test]
     fn empty_game_directory_array_uses_installed_roots_and_legacy_path() {
         let defaults = game_dirs_with_defaults("");
         assert_eq!(defaults.iter().map(|dir| dir.path.as_str()).collect::<Vec<_>>(), ["SDMC", "UserNAND", "SysNAND"]);

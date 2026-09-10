@@ -1206,11 +1206,29 @@ impl BufferCacheRuntime for TestBufferCacheRuntime {
 
     fn copy_buffer_to_staging(
         &mut self,
-        _dst_buffer: &Self::AsyncBuffer,
-        _src_buffer: &Self::Buffer,
-        _copies: &[BufferCopy],
+        dst_buffer: &Self::AsyncBuffer,
+        src_buffer: &Self::Buffer,
+        copies: &[BufferCopy],
         _barrier: bool,
     ) {
+        let src_storage = src_buffer.storage.lock();
+        for copy in copies {
+            let src_start = copy.src_offset as usize;
+            let dst_start = copy.dst_offset as usize;
+            let size = copy.size as usize;
+            let source = &src_storage[src_start..src_start + size];
+            assert!(dst_start + size <= dst_buffer.mapped_size);
+            // Simulate the device writing its mapped allocation. The original
+            // mutable pointer is retained by StagingBufferRef; no mapped slice
+            // is live while this synchronous test-runtime copy executes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    dst_buffer.mapped_ptr.add(dst_start),
+                    size,
+                );
+            }
+        }
     }
 
     fn clear_buffer(&mut self, buffer: &Self::Buffer, offset: u32, size: u64, value: u32) {

@@ -61,7 +61,6 @@ pub(crate) fn open_folder(path: &Path) -> std::io::Result<()> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub enum ShortcutTarget {
     Desktop,
     Applications,
@@ -274,10 +273,24 @@ fn get_ruzu_command() -> PathBuf {
 }
 
 #[cfg_attr(
-    any(target_os = "macos", target_os = "android"),
+    target_os = "android",
     allow(unused_variables)
 )]
 pub fn get_shortcut_path(target: ShortcutTarget) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return match target {
+            ShortcutTarget::Desktop => gtk::glib::user_special_dir(gtk::glib::UserDirectory::Desktop),
+            ShortcutTarget::Applications => {
+                let path = gtk::glib::home_dir().join("Applications");
+                if let Err(error) = std::fs::create_dir_all(&path) {
+                    log::error!("Cannot create user Applications folder: {error}");
+                    return None;
+                }
+                Some(path)
+            }
+        };
+    }
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
     {
         return match target {
@@ -569,8 +582,107 @@ fn create_shortcut_link(
     }
 }
 
+// macOS extension: Eden returns false here. A Finder alias cannot retain argv,
+// so keep a small application bundle with a quoted launcher and embedded icon.
+#[cfg(target_os = "macos")]
+fn create_shortcut_link(
+    shortcut_path: &Path,
+    _comment: &str,
+    icon_path: &Path,
+    command: &Path,
+    arguments: &str,
+    _categories: &str,
+    _keywords: &str,
+    name: &str,
+) -> bool {
+    match create_macos_shortcut(shortcut_path, icon_path, command, arguments, name) {
+        Ok(()) => true,
+        Err(error) => {
+            log::error!("Cannot create macOS shortcut {name}: {error}");
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn create_macos_shortcut(
+    directory: &Path,
+    icon: &Path,
+    command: &Path,
+    arguments: &str,
+    name: &str,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', ':']) {
+        return Err(std::io::Error::other("Invalid shortcut name"));
+    }
+    let destination = directory.join(format!("{name}.app"));
+    if destination.symlink_metadata().is_ok() {
+        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Shortcut already exists"));
+    }
+    // Resolve before writing: a missing target must not leave a broken shortcut.
+    let command = command.canonicalize()?;
+    let argv = gtk::glib::shell_parse_argv(arguments)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let staging = tempfile::Builder::new().prefix(".ruzu-shortcut-").tempdir_in(directory)?;
+    let bundle = staging.path().join("Launcher.app");
+    let contents = bundle.join("Contents");
+    std::fs::create_dir_all(contents.join("MacOS"))?;
+    std::fs::create_dir_all(contents.join("Resources"))?;
+
+    // Never evaluate the original argument string. Parse it and quote each argv
+    // element separately so $, backticks, quotes and newlines stay literal.
+    let mut script = format!("#!/bin/sh\nexec {}", gtk::glib::shell_quote(&command).to_string_lossy());
+    for argument in argv {
+        script.push(' ');
+        script.push_str(&gtk::glib::shell_quote(argument).to_string_lossy());
+    }
+    script.push('\n');
+    let executable = contents.join("MacOS/launch");
+    std::fs::write(&executable, script)?;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+
+    let icon_entry = if icon.is_file() {
+        let iconset = staging.path().join("game.iconset");
+        std::fs::create_dir(&iconset)?;
+        for (size, filename) in [(256, "icon_256x256.png"), (512, "icon_256x256@2x.png")] {
+            let output = Command::new("/usr/bin/sips").arg("-z")
+                .args([size.to_string(), size.to_string()]).arg(icon)
+                .arg("--out").arg(iconset.join(filename)).output()?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(String::from_utf8_lossy(&output.stderr).into_owned()));
+            }
+        }
+        let output = Command::new("/usr/bin/iconutil").args(["-c", "icns"])
+            .arg(&iconset).arg("-o").arg(contents.join("Resources/game.icns")).output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(String::from_utf8_lossy(&output.stderr).into_owned()));
+        }
+        "<key>CFBundleIconFile</key><string>game.icns</string>"
+    } else {
+        ""
+    };
+    let escaped_name = gtk::glib::markup_escape_text(name);
+    std::fs::write(contents.join("Info.plist"), format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\"><dict>\
+         <key>CFBundleName</key><string>{escaped_name}</string>\
+         <key>CFBundleDisplayName</key><string>{escaped_name}</string>\
+         <key>CFBundleExecutable</key><string>launch</string>\
+         <key>CFBundlePackageType</key><string>APPL</string>\
+         <key>CFBundleVersion</key><string>1</string>\
+         {icon_entry}</dict></plist>\n"
+    ))?;
+    // Publish only after the complete bundle exists. Never delete an existing app.
+    std::fs::rename(bundle, destination)
+}
+
 #[cfg(not(any(
     target_os = "windows",
+    target_os = "macos",
     all(unix, not(target_os = "macos"), not(target_os = "android"))
 )))]
 fn create_shortcut_link(
@@ -620,6 +732,65 @@ static APPIMAGE_SHORTCUT_ALREADY_WARNED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_shortcut_preserves_argv_and_launches_through_finder() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        let directory = tempfile::tempdir().unwrap();
+        let command = directory.path().join("fake ruzu '$`.sh");
+        let log = directory.path().join("argv");
+        std::fs::write(&command, format!(
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > {}\n",
+            gtk::glib::shell_quote(&log).to_string_lossy()
+        )).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let game = "/games/L'été & $(touch injected) `test` \"quoted\"\nnew line.nsp";
+        let arguments = format!("-f -g {}", gtk::glib::shell_quote(game).to_string_lossy());
+        create_macos_shortcut(directory.path(), Path::new(""), &command, &arguments, "Game & Friends").unwrap();
+        let app = directory.path().join("Game & Friends.app");
+        let expected = format!("-f\0-g\0{game}\0").into_bytes();
+        assert!(Command::new(app.join("Contents/MacOS/launch")).status().unwrap().success());
+        assert_eq!(std::fs::read(&log).unwrap(), expected);
+        std::fs::remove_file(&log).unwrap();
+        // Exercise LaunchServices too, without starting Ruzu or opening a game.
+        let mut child = Command::new("/usr/bin/open").args(["-n", "-W"]).arg(&app).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("LaunchServices did not finish the test launcher");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(std::fs::read(&log).unwrap(), expected);
+        assert!(Command::new("/usr/bin/plutil").arg("-lint").arg(app.join("Contents/Info.plist"))
+            .status().unwrap().success());
+        assert_eq!(create_macos_shortcut(directory.path(), Path::new(""), &command, "-qlaunch", "Game & Friends")
+            .unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(app.join("Contents/MacOS/launch").is_file());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_shortcut_embeds_icon_and_cleans_up_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = Path::new("/usr/bin/true");
+        let icon = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/ruzu-rusty-lemon.png");
+        create_macos_shortcut(directory.path(), &icon, command, "-qlaunch", "Icon test").unwrap();
+        let bytes = std::fs::read(directory.path().join("Icon test.app/Contents/Resources/game.icns")).unwrap();
+        assert_eq!(&bytes[..4], b"icns");
+        assert!(create_macos_shortcut(directory.path(), &icon, command, "'unterminated", "Broken").is_err());
+        assert!(create_macos_shortcut(directory.path(), &icon, command, "-qlaunch", "../escape").is_err());
+        assert!(create_macos_shortcut(directory.path(), &icon, Path::new("/nonexistent/ruzu"), "-qlaunch", "Missing").is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn reset_metadata_removes_the_complete_game_list_cache() {

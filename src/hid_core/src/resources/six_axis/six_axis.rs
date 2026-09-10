@@ -3,13 +3,20 @@
 
 //! Port of hid_core/resources/six_axis/six_axis.h and six_axis.cpp
 
+use crate::frontend::emulated_controller::ControllerMotion;
+use crate::hid_core::{EmulatedControllerHandle, HIDCore};
 use crate::hid_result::*;
 use crate::hid_types::*;
 use crate::hid_util::*;
+use crate::resources::applet_resource::ARUID_INDEX_MAX;
 use crate::resources::controller_base::ControllerActivation;
 use common::ResultCode;
 
 pub const NPAD_COUNT: usize = 10;
+
+#[cfg(test)]
+#[path = "six_axis_tests.rs"]
+mod tests;
 
 /// Per-sixaxis-style parameters, matching upstream SixaxisParameters.
 #[derive(Debug, Clone)]
@@ -38,8 +45,9 @@ impl Default for SixaxisParameters {
 }
 
 /// Per-npad controller data for six-axis processing.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NpadControllerData {
+    pub device: Option<EmulatedControllerHandle>,
     pub sixaxis_at_rest: bool,
     pub sixaxis_sensor_enabled: bool,
     pub sixaxis_fullkey: SixaxisParameters,
@@ -61,6 +69,7 @@ pub struct NpadControllerData {
 impl Default for NpadControllerData {
     fn default() -> Self {
         Self {
+            device: None,
             sixaxis_at_rest: true,
             sixaxis_sensor_enabled: true,
             sixaxis_fullkey: SixaxisParameters::default(),
@@ -93,23 +102,190 @@ pub struct SixAxis {
 }
 
 impl SixAxis {
-    pub fn new() -> Self {
+    pub fn new(hid_core: &HIDCore) -> Self {
         Self {
             activation: ControllerActivation::new(),
-            controller_data: Box::new(std::array::from_fn(|_| NpadControllerData::default())),
+            controller_data: Box::new(std::array::from_fn(|index| NpadControllerData {
+                device: Some(hid_core.get_emulated_controller_by_index(index)),
+                ..NpadControllerData::default()
+            })),
         }
     }
 
     pub fn on_init(&mut self) {}
     pub fn on_release(&mut self) {}
 
-    /// Port of SixAxis::OnUpdate — iterates all aruids and npad indices,
-    /// reading motion state and writing into shared memory lifos.
-    /// Full implementation requires shared memory, emulated controller, and
-    /// settings integration.
+    /// Port of SixAxis::OnUpdate. ResourceManager holds its shared lock;
+    /// AppletResource's mutex protects the mapped buffers during publication.
     pub fn on_update(&mut self) {
-        // Requires full wiring to applet_resource, emulated controllers, and
-        // shared memory NpadSharedMemoryEntry.
+        let Some(resource) = self.activation.applet_resource.as_ref() else {
+            return;
+        };
+        let mut resource = resource.lock();
+        for aruid_index in 0..ARUID_INDEX_MAX {
+            let data = resource.get_aruid_data_by_index(aruid_index);
+            if !data.flag.is_assigned() {
+                continue;
+            }
+            if !self.activation.is_controller_activated() {
+                return;
+            }
+            let enabled = data.flag.enable_six_axis_sensor();
+            let Some(shared) = resource.get_shared_memory_format_by_index_mut(aruid_index) else {
+                continue;
+            };
+            for (index, controller) in self.controller_data.iter_mut().enumerate() {
+                let device = controller
+                    .device
+                    .as_ref()
+                    .expect("SixAxis requires a controller")
+                    .lock();
+                let style = device.get_npad_style_index(false);
+                if !enabled || style == NpadStyleIndex::None || !device.is_connected(false) {
+                    continue;
+                }
+                let motions = device.get_motions();
+                drop(device);
+                let memory = &mut shared.npad.npad_entry[index].internal_state;
+                controller.sixaxis_fullkey_state = SixAxisSensorState::default();
+                controller.sixaxis_handheld_state = SixAxisSensorState::default();
+                controller.sixaxis_dual_left_state = SixAxisSensorState::default();
+                controller.sixaxis_dual_right_state = SixAxisSensorState::default();
+                controller.sixaxis_left_lifo_state = SixAxisSensorState::default();
+                controller.sixaxis_right_lifo_state = SixAxisSensorState::default();
+                let motion_enabled = *common::settings::values().motion_enabled.get_value();
+                let sensor_enabled = controller.sixaxis_sensor_enabled;
+                if sensor_enabled && motion_enabled {
+                    controller.sixaxis_at_rest = motions.iter().all(|motion| motion.is_at_rest);
+                }
+                let set_motion_state =
+                    |state: &mut SixAxisSensorState, motion: &ControllerMotion| {
+                        state.delta_time = 5_000_000;
+                        state.attribute.raw = 1;
+                        if !sensor_enabled || !motion_enabled {
+                            state.accel = Vec3f {
+                                x: 0.0,
+                                y: 0.0,
+                                z: -1.0,
+                            };
+                            state.orientation = [
+                                Vec3f {
+                                    x: 1.0,
+                                    y: 0.0,
+                                    z: 0.0,
+                                },
+                                Vec3f {
+                                    x: 0.0,
+                                    y: 1.0,
+                                    z: 0.0,
+                                },
+                                Vec3f {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    z: 1.0,
+                                },
+                            ];
+                            return;
+                        }
+                        state.accel = motion.accel;
+                        state.gyro = motion.gyro;
+                        state.rotation = motion.rotation;
+                        state.orientation = motion.orientation;
+                    };
+                match style {
+                    NpadStyleIndex::Fullkey => {
+                        set_motion_state(&mut controller.sixaxis_fullkey_state, &motions[0])
+                    }
+                    NpadStyleIndex::Handheld => {
+                        set_motion_state(&mut controller.sixaxis_handheld_state, &motions[0])
+                    }
+                    NpadStyleIndex::JoyconDual => {
+                        set_motion_state(&mut controller.sixaxis_dual_left_state, &motions[0]);
+                        set_motion_state(&mut controller.sixaxis_dual_right_state, &motions[1]);
+                    }
+                    NpadStyleIndex::JoyconLeft => {
+                        set_motion_state(&mut controller.sixaxis_left_lifo_state, &motions[0])
+                    }
+                    NpadStyleIndex::JoyconRight => {
+                        set_motion_state(&mut controller.sixaxis_right_lifo_state, &motions[1])
+                    }
+                    NpadStyleIndex::Pokeball => {
+                        set_motion_state(&mut controller.sixaxis_fullkey_state, &motions[0]);
+                        controller.sixaxis_fullkey_state.delta_time = 15_000_000;
+                    }
+                    _ => {}
+                }
+                controller.sixaxis_fullkey_state.sampling_number = memory
+                    .sixaxis_fullkey_lifo
+                    .lifo
+                    .read_current_entry()
+                    .state
+                    .sampling_number
+                    .wrapping_add(1);
+                controller.sixaxis_handheld_state.sampling_number = memory
+                    .sixaxis_handheld_lifo
+                    .lifo
+                    .read_current_entry()
+                    .state
+                    .sampling_number
+                    .wrapping_add(1);
+                controller.sixaxis_dual_left_state.sampling_number = memory
+                    .sixaxis_dual_left_lifo
+                    .lifo
+                    .read_current_entry()
+                    .state
+                    .sampling_number
+                    .wrapping_add(1);
+                controller.sixaxis_dual_right_state.sampling_number = memory
+                    .sixaxis_dual_right_lifo
+                    .lifo
+                    .read_current_entry()
+                    .state
+                    .sampling_number
+                    .wrapping_add(1);
+                controller.sixaxis_left_lifo_state.sampling_number = memory
+                    .sixaxis_left_lifo
+                    .lifo
+                    .read_current_entry()
+                    .state
+                    .sampling_number
+                    .wrapping_add(1);
+                controller.sixaxis_right_lifo_state.sampling_number = memory
+                    .sixaxis_right_lifo
+                    .lifo
+                    .read_current_entry()
+                    .state
+                    .sampling_number
+                    .wrapping_add(1);
+                if index_to_npad_id_type(index) == NpadIdType::Handheld {
+                    memory
+                        .sixaxis_handheld_lifo
+                        .lifo
+                        .write_next_entry(controller.sixaxis_handheld_state);
+                } else {
+                    memory
+                        .sixaxis_fullkey_lifo
+                        .lifo
+                        .write_next_entry(controller.sixaxis_fullkey_state);
+                }
+                memory
+                    .sixaxis_dual_left_lifo
+                    .lifo
+                    .write_next_entry(controller.sixaxis_dual_left_state);
+                memory
+                    .sixaxis_dual_right_lifo
+                    .lifo
+                    .write_next_entry(controller.sixaxis_dual_right_state);
+                memory
+                    .sixaxis_left_lifo
+                    .lifo
+                    .write_next_entry(controller.sixaxis_left_lifo_state);
+                memory
+                    .sixaxis_right_lifo
+                    .lifo
+                    .write_next_entry(controller.sixaxis_right_lifo_state);
+            }
+        }
     }
 
     pub fn set_gyroscope_zero_drift_mode(
@@ -124,6 +300,12 @@ impl SixAxis {
 
         let sixaxis = self.get_sixaxis_state_mut(sixaxis_handle);
         sixaxis.gyroscope_zero_drift_mode = drift_mode;
+        self.get_controller_from_handle(sixaxis_handle)
+            .device
+            .as_ref()
+            .expect("SixAxis requires a controller")
+            .lock()
+            .set_gyroscope_zero_drift_mode(drift_mode);
         ResultCode::SUCCESS
     }
 
@@ -337,11 +519,5 @@ impl SixAxis {
         }
         let npad_index = npad_id_type_to_index(npad_id);
         &mut self.controller_data[npad_index]
-    }
-}
-
-impl Default for SixAxis {
-    fn default() -> Self {
-        Self::new()
     }
 }

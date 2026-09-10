@@ -229,7 +229,7 @@ fn get_available_network_interfaces_linux() -> Vec<NetworkInterface> {
                 name,
                 ip_address: ip_addr,
                 subnet_mask,
-                gateway: Ipv4Addr::from(gateway),
+                gateway,
                 kind: HostAdapterKind::Ethernet,
             });
 
@@ -250,18 +250,24 @@ unsafe fn sockaddr_to_ipv4(addr: *const libc::sockaddr) -> Ipv4Addr {
 }
 
 #[cfg(target_os = "linux")]
-fn find_gateway_linux(iface_name: &str) -> u32 {
-    use std::io::BufRead;
-
+fn find_gateway_linux(iface_name: &str) -> Ipv4Addr {
     let file = match std::fs::File::open("/proc/net/route") {
         Ok(f) => f,
         Err(_) => {
             log::error!("Failed to open /proc/net/route");
-            return 0;
+            return Ipv4Addr::UNSPECIFIED;
         }
     };
 
     let reader = std::io::BufReader::new(file);
+    parse_gateway_linux(reader, iface_name)
+}
+
+// Mechanical extraction of the routing-table scan for synthetic tests.
+// Upstream stores the parsed word in in_addr::s_addr, not a host-order IPv4
+// integer. Preserve its native byte representation when constructing Ipv4Addr.
+#[cfg(target_os = "linux")]
+fn parse_gateway_linux(reader: impl std::io::BufRead, iface_name: &str) -> Ipv4Addr {
     let mut lines = reader.lines();
 
     // Skip header
@@ -284,15 +290,15 @@ fn find_gateway_linux(iface_name: &str) -> u32 {
             continue;
         }
         let gateway = u32::from_str_radix(parts[2], 16).unwrap_or(0);
-        let flags = u16::from_str_radix(parts[3], 16).unwrap_or(0);
+        let flags = u32::from_str_radix(parts[3], 16).unwrap_or(0);
         // RTF_GATEWAY = 0x2
         if (flags & 0x2) == 0 {
             continue;
         }
-        return gateway;
+        return Ipv4Addr::from(gateway.to_ne_bytes());
     }
 
-    0
+    Ipv4Addr::UNSPECIFIED
 }
 
 /// Get the currently selected network interface.
@@ -398,6 +404,22 @@ pub fn select_first_network_interface() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_route_gateway_preserves_in_addr_bytes_and_selection() {
+        let gateway = Ipv4Addr::new(192, 0, 2, 1);
+        let word = u32::from_ne_bytes(gateway.octets());
+        let routes = format!(
+            "Iface Destination Gateway Flags\nother 00000000 {word:08X} 0003\neth-test 00000001 {word:08X} 0003\neth-test 00000000 {word:08X} 0001\neth-test 00000000 {word:08X} 10003\n"
+        );
+        assert_eq!(parse_gateway_linux(routes.as_bytes(), "eth-test"), gateway);
+        assert_eq!(parse_gateway_linux(routes.as_bytes(), "missing"), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(parse_gateway_linux(b"Iface Destination Gateway Flags\n".as_slice(), "eth-test"), Ipv4Addr::UNSPECIFIED);
+        // Route flags are u32 upstream; a high flag must not hide RTF_GATEWAY.
+        let ordinary = format!("header\neth-test 00000000 {word:08X} 0003\n");
+        assert_eq!(parse_gateway_linux(ordinary.as_bytes(), "eth-test"), gateway);
+    }
 
     fn interface(name: &str) -> NetworkInterface {
         NetworkInterface {

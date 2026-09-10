@@ -297,7 +297,6 @@ mod tests {
     fn indexed_image_atomics_emit_texel_pointer_and_real_atomics() {
         let mut program = Program::new(ShaderStage::Fragment);
         program.blocks.push(Block::new());
-        program.info.uses_atomic_image_u32 = true;
         program.info.image_descriptors.push(ImageDescriptor {
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32Uint,
@@ -345,6 +344,11 @@ mod tests {
             ));
         }
         program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+
+        // Exercise the production metadata pass rather than supplying the
+        // capability by hand: this must declare the image atomic pointer type.
+        crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+        assert!(program.info.uses_atomic_image_u32);
 
         let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
         ctx.emit_program(&program);

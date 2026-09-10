@@ -30,9 +30,11 @@ gtk = { version = "0.9", package = "gtk4", features = ["v4_6"] }
 # rendered to a file in tests and compared against upstream by eye.
 cairo-rs = { version = "0.20", features = ["png"] }
 log = { workspace = true }
+sdl3-sys = { workspace = true }
 serde_json = { workspace = true }
 ash = { workspace = true }
 libc = "0.2"
+getrandom = "0.2"
 tempfile = { workspace = true }
 zip = { version = "4.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
@@ -62,7 +64,7 @@ frontend_common = { path = "../frontend_common" }
 video_core = { workspace = true }
 audio_core = { path = "../audio_core" }
 parking_lot = { workspace = true }
-network = { version = "0.0.2", path = "../network" }
+network = { version = "0.0.4", path = "../network" }
 web_service.workspace = true
 
 # macOS-only: embed a CAMetalLayer into the GTK window's NSView so the Vulkan
@@ -93,6 +95,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",

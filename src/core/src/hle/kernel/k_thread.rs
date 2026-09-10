@@ -3230,6 +3230,7 @@ impl KThread {
     /// Wait cancel.
     /// Matches upstream `KThread::WaitCancel()`.
     pub fn wait_cancel(&mut self) {
+        let _scheduler_lock = self.lock_scheduler();
         if self.get_state() == ThreadState::WAITING && self.cancellable {
             self.wait_cancelled = false;
             self.synced_index = -1;
@@ -4432,6 +4433,51 @@ mod tests {
 
         assert_eq!(thread.get_state(), ThreadState::RUNNABLE);
         assert!(!thread.is_wait_cancelled());
+    }
+
+    #[test]
+    fn wait_cancel_serializes_with_wait_registration() {
+        use super::super::{k_scheduler_lock::KScopedSchedulerLock, kernel};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mut kernel = Box::new(kernel::KernelCore::new());
+        kernel.initialize();
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().set_state(ThreadState::RUNNABLE);
+        let target = Arc::clone(&thread);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _identity = kernel::get_current_emu_thread().unwrap();
+            ready_tx.send(()).unwrap();
+            cancel_rx.recv().unwrap();
+            target.lock().unwrap().wait_cancel();
+            done_tx.send(()).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let scheduler_guard = KScopedSchedulerLock::new(kernel::scheduler_lock().unwrap());
+        assert!(!thread.lock().unwrap().is_wait_cancelled());
+        cancel_tx.send(()).unwrap();
+        let premature_completion = done_rx.recv_timeout(Duration::from_millis(100));
+        {
+            let mut guard = thread.lock().unwrap();
+            guard.begin_wait();
+            guard.set_cancellable();
+        }
+        drop(scheduler_guard);
+        worker.join().unwrap();
+        assert!(
+            matches!(premature_completion, Err(mpsc::RecvTimeoutError::Timeout)),
+            "cancellation escaped the scheduler-protected registration window"
+        );
+        let target = thread.lock().unwrap();
+        assert_eq!(target.get_state(), ThreadState::RUNNABLE);
+        assert!(!target.is_wait_cancelled());
+        assert_eq!(target.wait_result, RESULT_CANCELLED.get_inner_value());
+        drop(target);
+        kernel.shutdown();
     }
 
     #[test]

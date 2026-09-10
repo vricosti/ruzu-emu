@@ -151,6 +151,16 @@ mod tests {
 
     #[test]
     fn test_room_network_init_and_shutdown() {
+        // Other tests legitimately install their own global RoomNetwork.
+        // Verify global identity/teardown in a process with no competing test.
+        const CHILD: &str = "RUZU_TEST_NETWORK_GLOBAL_LIFETIME";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "network::tests::test_room_network_init_and_shutdown"])
+                .env(CHILD, "1")
+                .status().unwrap().success());
+            return;
+        }
         let mut rn = RoomNetwork::new();
         assert!(rn.init());
         let room = rn.get_room().upgrade().unwrap();

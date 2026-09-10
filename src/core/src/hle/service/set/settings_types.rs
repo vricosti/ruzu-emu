@@ -215,6 +215,8 @@ pub enum Language {
     SimplifiedChinese = 15,
     TraditionalChinese = 16,
     BrazilianPortuguese = 17,
+    Polish = 18,
+    Thai = 19,
 }
 
 /// nn::settings::LanguageCode - NUL-terminated string stored in a u64.
@@ -341,7 +343,7 @@ impl Default for PlatformRegion {
 
 // --- Language code and layout tables ---
 
-pub const AVAILABLE_LANGUAGE_CODES: [LanguageCode; 18] = [
+pub const AVAILABLE_LANGUAGE_CODES: [LanguageCode; 20] = [
     LanguageCode::Ja,
     LanguageCode::EnUs,
     LanguageCode::Fr,
@@ -360,9 +362,11 @@ pub const AVAILABLE_LANGUAGE_CODES: [LanguageCode; 18] = [
     LanguageCode::ZhHans,
     LanguageCode::ZhHant,
     LanguageCode::PtBr,
+    LanguageCode::Pl,
+    LanguageCode::Th,
 ];
 
-pub const LANGUAGE_TO_LAYOUT: [(LanguageCode, KeyboardLayout); 18] = [
+pub const LANGUAGE_TO_LAYOUT: [(LanguageCode, KeyboardLayout); 20] = [
     (LanguageCode::Ja, KeyboardLayout::Japanese),
     (LanguageCode::EnUs, KeyboardLayout::EnglishUs),
     (LanguageCode::Fr, KeyboardLayout::French),
@@ -381,6 +385,8 @@ pub const LANGUAGE_TO_LAYOUT: [(LanguageCode, KeyboardLayout); 18] = [
     (LanguageCode::ZhHans, KeyboardLayout::ChineseSimplified),
     (LanguageCode::ZhHant, KeyboardLayout::ChineseTraditional),
     (LanguageCode::PtBr, KeyboardLayout::Portuguese),
+    (LanguageCode::Pl, KeyboardLayout::EnglishUsInternational),
+    (LanguageCode::Th, KeyboardLayout::EnglishUsInternational),
 ];
 
 // --- Bitfield flag structs ---

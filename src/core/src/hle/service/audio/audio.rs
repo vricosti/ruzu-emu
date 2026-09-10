@@ -534,12 +534,16 @@ pub fn loop_process(system: crate::core::SystemRef) {
             }),
             16,
         );
-        // Depends on audout:u and audin:u in the upstream constructor.
+    }
+    // Construct after audout:u/audin:u, as upstream. The constructor waits for
+    // set:sys: do not run it inside the SM-locked registration factory.
+    let audio_controller: SessionRequestHandlerPtr =
+        std::sync::Arc::new(super::audio_controller::IAudioController::new(system));
+    {
+        let mut server_manager = server_manager.lock().unwrap();
         server_manager.register_named_service(
             "audctl",
-            Box::new(|| -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(super::audio_controller::IAudioController::new())
-            }),
+            Box::new(move || std::sync::Arc::clone(&audio_controller)),
             16,
         );
 

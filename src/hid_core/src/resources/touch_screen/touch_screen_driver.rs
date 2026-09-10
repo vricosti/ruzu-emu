@@ -150,6 +150,7 @@ impl TouchScreenDriver {
         }
 
         self.touch_status.entry_count = active_count as i32;
+        let settings = common::settings::values();
         for id in 0..MAX_TOUCH_FINGERS {
             if id < active_count {
                 let touch_entry = &mut self.touch_status.states[id];
@@ -157,10 +158,9 @@ impl TouchScreenDriver {
                     (active_fingers[id].position_x * TOUCH_SENSOR_WIDTH as f32) as u32;
                 touch_entry.position_y =
                     (active_fingers[id].position_y * TOUCH_SENSOR_HEIGHT as f32) as u32;
-                // Upstream reads diameter and rotation from Settings::values.touchscreen
-                touch_entry.diameter_x = 15;
-                touch_entry.diameter_y = 15;
-                touch_entry.rotation_angle = 0;
+                touch_entry.diameter_x = settings.touchscreen.diameter_x;
+                touch_entry.diameter_y = settings.touchscreen.diameter_y;
+                touch_entry.rotation_angle = settings.touchscreen.rotation_angle as i32;
                 touch_entry.finger = active_fingers[id].id;
                 touch_entry.attribute = active_fingers[id].attribute;
             }
@@ -180,5 +180,49 @@ impl TouchScreenDriver {
     /// Port of TouchDriver::GetTouchMode.
     pub fn get_touch_mode(&self) -> TouchScreenModeForNx {
         self.touch_mode
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touch_samples_follow_current_geometry_settings() {
+        // Isolate process-global settings from concurrent HID tests.
+        const CHILD: &str = "RUZU_TEST_TOUCH_GEOMETRY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "resources::touch_screen::touch_screen_driver::tests::touch_samples_follow_current_geometry_settings", "--nocapture"])
+                .env(CHILD, "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let hid = Arc::new(Mutex::new(HIDCore::new()));
+        let mut driver = TouchScreenDriver::new(hid);
+        let mut input = [(0, false, 0.0, 0.0); MAX_TOUCH_FINGERS];
+        input[0] = (3, true, 0.25, 0.5);
+        input[1] = (7, true, 0.5, 0.25);
+        for (x, y, angle) in [(70, 80, 90), (0, 99, u32::MAX)] {
+            {
+                let mut settings = common::settings::values_mut();
+                settings.touchscreen.diameter_x = x;
+                settings.touchscreen.diameter_y = y;
+                settings.touchscreen.rotation_angle = angle;
+            }
+            driver.process_touch_input(&input);
+            let mut state = TouchScreenState::default();
+            driver.get_next_touch_state(&mut state);
+            assert_eq!(state.entry_count, 2);
+            for entry in &state.states[..2] {
+                assert_eq!(entry.diameter_x, x);
+                assert_eq!(entry.diameter_y, y);
+                assert_eq!(entry.rotation_angle, angle as i32);
+            }
+            assert_eq!(state.states[0].finger, 3);
+            assert_eq!(state.states[1].finger, 7);
+            assert_eq!(state.states[2].diameter_x, 0);
+        }
     }
 }

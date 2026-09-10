@@ -1112,7 +1112,7 @@ impl<'a> PatchManager<'a> {
             None => return (None, None),
         };
 
-        let romfs = self.patch_romfs(None, base_romfs, ContentRecordType::Control, None, true);
+        let romfs = self.patch_romfs(Some(nca), base_romfs, ContentRecordType::Control, None, true);
 
         let extracted = match extract_romfs(Some(romfs)) {
             Some(dir) => dir,

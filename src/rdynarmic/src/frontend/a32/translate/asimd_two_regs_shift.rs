@@ -5,6 +5,57 @@ use crate::ir::value::Value;
 
 use super::asimd::to_vector_reg;
 
+/// Port of TranslatorVisitor::asimd_VSHLL, including its VMOVL alias.
+pub fn arm_asimd_vshll(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
+    let (u, d, imm6, vd, _, _, m, vm) = decode_two_reg_shift(inst);
+    if (imm6 >> 3) == 0 {
+        return super::decode_error(ir);
+    }
+    if (vd & 1) != 0 {
+        return super::undefined_instruction(ir);
+    }
+    let (esize, shift_amount) = element_size_and_shift_amount(false, false, imm6);
+    let d = to_vector_reg(true, d, vd).unwrap();
+    let m = to_vector_reg(false, m, vm).unwrap();
+    let reg_m = ir.get_vector(m);
+    let extended = if u {
+        ir.ir().vector_zero_extend(esize, reg_m)
+    } else {
+        ir.ir().vector_sign_extend(esize, reg_m)
+    };
+    let result = ir.ir().vector_logical_shift_left(esize * 2, extended, shift_amount as u8);
+    ir.set_vector(d, result);
+    true
+}
+
+/// Port of TranslatorVisitor::asimd_VCVT_fixed in asimd_two_regs_shift.cpp.
+pub fn arm_asimd_vcvt_fixed(ir: &mut A32IREmitter, inst: &DecodedArm) -> bool {
+    let (u, d, imm6, vd, _, q, m, vm) = decode_two_reg_shift(inst);
+    let to_fixed = ((inst.raw >> 8) & 1) != 0;
+    if (imm6 >> 3) == 0 {
+        return super::decode_error(ir);
+    }
+    if q && ((vd | vm) & 1) != 0 {
+        return super::undefined_instruction(ir);
+    }
+    if imm6 & 0x20 == 0 {
+        return super::undefined_instruction(ir);
+    }
+    let d = to_vector_reg(q, d, vd).unwrap();
+    let m = to_vector_reg(q, m, vm).unwrap();
+    let fbits = (64 - imm6) as u8;
+    let reg_m = ir.get_vector(m);
+    use crate::common::fp::rounding_mode::RoundingMode;
+    let result = match (to_fixed, u) {
+        (true, false) => ir.ir().fp_vector_to_signed_fixed(32, reg_m, fbits, RoundingMode::TowardsZero as u8, false),
+        (true, true) => ir.ir().fp_vector_to_unsigned_fixed(32, reg_m, fbits, RoundingMode::TowardsZero as u8, false),
+        (false, false) => ir.ir().fp_vector_from_signed_fixed(32, reg_m, fbits, RoundingMode::ToNearestTieEven as u8, false),
+        (false, true) => ir.ir().fp_vector_from_unsigned_fixed(32, reg_m, fbits, RoundingMode::ToNearestTieEven as u8, false),
+    };
+    ir.set_vector(d, result);
+    true
+}
+
 fn decode_two_reg_shift(inst: &DecodedArm) -> (bool, bool, u32, u32, bool, bool, bool, u32) {
     let u = ((inst.raw >> 24) & 1) != 0;
     let d = ((inst.raw >> 22) & 1) != 0;
@@ -300,6 +351,53 @@ mod tests {
         };
         assert!(ok);
         block.instructions.iter().map(|inst| inst.opcode).collect()
+    }
+
+    #[test]
+    fn shift_left_long_rejects_invalid_immediate_and_odd_destination() {
+        use crate::frontend::a32::types::Exception;
+        for (raw, exception) in [
+            (0xF2C0_EA3C, Exception::DecodeError),
+            (0xF2D0_FA3C, Exception::UndefinedInstruction),
+        ] {
+            let loc = A32LocationDescriptor::at(0x2000);
+            let mut block = Block::new(loc.to_location());
+            let decoded = crate::frontend::a32::decoder::decode_arm(raw);
+            {
+                let mut ir = A32IREmitter::with_location(&mut block, loc);
+                assert!(!arm_asimd_vshll(&mut ir, &decoded));
+            }
+            let raised = block.instructions.iter().find(|inst| inst.opcode == Opcode::A32ExceptionRaised).unwrap();
+            assert_eq!(raised.args[1], Value::ImmU64(exception.as_u32() as u64));
+        }
+    }
+
+    #[test]
+    fn fixed_conversion_rejects_invalid_immediates_and_odd_quad_registers() {
+        use crate::frontend::a32::types::Exception;
+        for (raw, exception) in [
+            (0xF2C0_0F70, Exception::DecodeError),
+            (0xF2D0_0F70, Exception::UndefinedInstruction),
+            (0xF2F1_1F70, Exception::UndefinedInstruction),
+            (0xF2F1_0F71, Exception::UndefinedInstruction),
+        ] {
+            let loc = A32LocationDescriptor::at(0x2000);
+            let mut block = Block::new(loc.to_location());
+            let decoded = crate::frontend::a32::decoder::decode_arm(raw);
+            if (raw >> 19) & 7 == 0 {
+                // The more-specific modified-immediate encoding wins in the
+                // decoder. Exercise VCVT's defensive DecodeError guard directly.
+                assert_eq!(decoded.id, ArmInstId::AsimdVmovImm);
+            } else {
+                assert_eq!(decoded.id, ArmInstId::AsimdVcvtFixed);
+            }
+            {
+                let mut ir = A32IREmitter::with_location(&mut block, loc);
+                assert!(!arm_asimd_vcvt_fixed(&mut ir, &decoded));
+            }
+            let raised = block.instructions.iter().find(|inst| inst.opcode == Opcode::A32ExceptionRaised).unwrap();
+            assert_eq!(raised.args[1], Value::ImmU64(exception.as_u32() as u64));
+        }
     }
 
     #[test]

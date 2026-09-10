@@ -20,7 +20,7 @@ use gtk::{gio, glib};
 
 use common::settings;
 use common::settings_enums::{
-    AntiAliasing, ConsoleMode, GpuAccuracy, RendererBackend, ScalingFilter,
+    AntiAliasing, ConsoleMode, GpuAccuracy, RendererBackend, ScalingFilter, SpeedMode,
 };
 use input_common::drivers::tas_input::{TasState, PLAYER_NUMBER};
 use ruzu_core::perf_stats::PerfStatsResults;
@@ -44,6 +44,7 @@ pub struct StatusBar {
     /// menu deliberately does not invoke it because Eden's direct menu action
     /// only updates the value and button text.
     on_gpu_accuracy_changed: RefCell<Option<Box<dyn Fn()>>>,
+    on_docked_mode_toggle: RefCell<Option<Box<dyn Fn()>>>,
     /// Mirrors `MainWindow::emulation_running` for the renderer button. Eden
     /// disables that complete button (left click and context menu) while a
     /// title is active because the graphics API cannot be changed live.
@@ -112,6 +113,7 @@ impl StatusBar {
             game_fps,
             frame_time,
             on_gpu_accuracy_changed: RefCell::new(None),
+            on_docked_mode_toggle: RefCell::new(None),
             emulation_running: Cell::new(false),
         });
 
@@ -123,6 +125,29 @@ impl StatusBar {
     /// Register upstream `OnToggleGpuAccuracy`'s live-apply callback.
     pub fn connect_gpu_accuracy_changed(&self, f: impl Fn() + 'static) {
         *self.on_gpu_accuracy_changed.borrow_mut() = Some(Box::new(f));
+    }
+
+    pub fn connect_docked_mode_toggle(&self, callback: impl Fn() + 'static) {
+        *self.on_docked_mode_toggle.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// InitializeHotkeys shares these handlers with the status buttons upstream.
+    /// Emitting the existing click also preserves the GPU live-apply callback.
+    pub fn install_graphics_hotkey_actions(&self, app: &gtk::Application) {
+        for (name, button) in [
+            ("toggle_adapting_filter", &self.filter),
+            ("toggle_gpu_accuracy", &self.accuracy),
+            ("toggle_docked_mode", &self.dock),
+        ] {
+            let button = button.clone();
+            let action = gio::SimpleAction::new(name, None);
+            action.connect_activate(move |_, _| {
+                if button.is_sensitive() {
+                    button.emit_clicked();
+                }
+            });
+            app.add_action(&action);
+        }
     }
 
     /// The widget to place at the bottom of the window.
@@ -376,16 +401,11 @@ impl StatusBar {
 
     /// Upstream `GMainWindow::OnToggleDockedMode`.
     ///
-    /// Upstream additionally disconnects a handheld controller and warns, which
-    /// needs `HIDCore`; that is not reachable from the launcher yet, so only the
-    /// console-mode flip is performed here.
+    /// MainWindow owns the HID transition, warning and System notification.
     fn on_toggle_docked_mode(&self) {
-        let mut values = settings::values_mut();
-        let mode = match *values.use_docked_mode.get_value() {
-            ConsoleMode::Docked => ConsoleMode::Handheld,
-            ConsoleMode::Handheld => ConsoleMode::Docked,
-        };
-        values.use_docked_mode.set_value(mode);
+        if let Some(callback) = self.on_docked_mode_toggle.borrow().as_ref() {
+            callback();
+        }
     }
 
     /// Upstream `GMainWindow::OnToggleAdaptingFilter`: advance one step,
@@ -549,6 +569,7 @@ impl StatusBar {
         self.game_fps.set_label(&format_game_fps(
             results.average_game_fps,
             !*values.use_speed_limit.get_value(),
+            *values.current_speed_mode.get_value(),
         ));
         self.frame_time
             .set_label(&format_frame_time(results.frametime));
@@ -651,16 +672,18 @@ fn format_shaders_building(count: i32) -> String {
     )
 }
 
-fn format_game_fps(average_game_fps: f64, unlocked: bool) -> String {
+fn format_game_fps(average_game_fps: f64, unlocked: bool, mode: SpeedMode) -> String {
     let fps = format!("{:.0}", average_game_fps.round());
-    crate::i18n::tr_args(
-        if unlocked {
-            "Game: %1 FPS (Unlocked)"
-        } else {
-            "Game: %1 FPS"
-        },
-        &[fps],
-    )
+    let text = crate::i18n::tr_args("Game: %1 FPS", &[fps]);
+    // Upstream SetFPSSuffix + UpdateStatusBar; mode takes precedence over
+    // the limiter flag. Keep formatting with the other GTK status labels.
+    let suffix = match mode {
+        SpeedMode::Slow => Some(crate::i18n::tr("Slow")),
+        SpeedMode::Turbo => Some(crate::i18n::tr("Turbo")),
+        SpeedMode::Standard if unlocked => Some(crate::i18n::tr("Unlocked")),
+        SpeedMode::Standard => None,
+    };
+    suffix.map_or_else(|| text.clone(), |suffix| format!("{text} ({suffix})"))
 }
 
 fn format_frame_time(frametime_seconds: f64) -> String {
@@ -786,6 +809,40 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires GTK display and isolated process for shared settings"]
+    fn graphics_hotkeys_reuse_click_and_live_apply_paths() {
+        gtk::init().unwrap();
+        let original = settings::values().clone();
+        let app = gtk::Application::builder()
+            .application_id("org.ruzu.GraphicsHotkeyTest").build();
+        let bar = StatusBar::new();
+        let applied = Rc::new(Cell::new(0));
+        let calls = applied.clone();
+        bar.connect_gpu_accuracy_changed(move || calls.set(calls.get() + 1));
+        bar.install_graphics_hotkey_actions(&app);
+        let dock_calls = Rc::new(Cell::new(0));
+        let calls = dock_calls.clone();
+        bar.connect_docked_mode_toggle(move || calls.set(calls.get() + 1));
+        let mode = *settings::values().use_docked_mode.get_value();
+        app.lookup_action("toggle_docked_mode").unwrap().activate(None);
+        assert_eq!(dock_calls.get(), 1);
+        // No direct setting mutation: MainWindow owns the full HID transition.
+        assert_eq!(*settings::values().use_docked_mode.get_value(), mode);
+        settings::values_mut().gpu_accuracy.set_value(GpuAccuracy::High);
+        app.lookup_action("toggle_gpu_accuracy").unwrap().activate(None);
+        assert_eq!(*settings::values().gpu_accuracy.get_value(), GpuAccuracy::Low);
+        assert_eq!(applied.get(), 1);
+        app.lookup_action("toggle_gpu_accuracy").unwrap().activate(None);
+        assert_eq!(*settings::values().gpu_accuracy.get_value(), GpuAccuracy::High);
+        assert_eq!(applied.get(), 2);
+        settings::values_mut().scaling_filter.set_value(ScalingFilter::SgsrEdge);
+        app.lookup_action("toggle_adapting_filter").unwrap().activate(None);
+        assert_eq!(*settings::values().scaling_filter.get_value() as u32, 0);
+        assert_eq!(applied.get(), 2);
+        *settings::values_mut() = original;
+    }
+
+    #[test]
     #[ignore = "requires a GTK display and isolated process for startup probe state"]
     fn crashed_vulkan_probe_locks_frontend_selectors_until_restart() {
         gtk::init().expect("GTK display required");
@@ -908,8 +965,12 @@ mod tests {
         assert_eq!(format_shaders_building(3), "Building: 3 shaders");
         assert_eq!(format_resolution_scale(1.0), "Scale: 1x");
         assert_eq!(format_resolution_scale(1.5), "Scale: 1.5x");
-        assert_eq!(format_game_fps(59.4, false), "Game: 59 FPS");
-        assert_eq!(format_game_fps(59.5, true), "Game: 60 FPS (Unlocked)");
+        assert_eq!(format_game_fps(59.4, false, SpeedMode::Standard), "Game: 59 FPS");
+        assert_eq!(format_game_fps(59.5, true, SpeedMode::Standard), "Game: 60 FPS (Unlocked)");
+        for unlocked in [false, true] {
+            assert_eq!(format_game_fps(60.0, unlocked, SpeedMode::Turbo), "Game: 60 FPS (Turbo)");
+            assert_eq!(format_game_fps(30.0, unlocked, SpeedMode::Slow), "Game: 30 FPS (Slow)");
+        }
         assert_eq!(format_frame_time(1.0 / 60.0), "Frame: 16.67 ms");
     }
 

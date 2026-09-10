@@ -257,7 +257,7 @@ pub struct Values {
     pub enable_nsight_aftermath: Setting<bool>,
     pub disable_shader_loop_safety_checks: Setting<bool>,
     pub enable_renderdoc_hotkey: Setting<bool>,
-    pub disable_buffer_reorder: Setting<bool>,
+    pub disable_buffer_reorder: SwitchableSetting<bool>,
 
     // ── System ──────────────────────────────────────────────────────────
     pub language_index: SwitchableSetting<Language>,
@@ -380,6 +380,7 @@ pub struct Values {
     pub yuzu_username: Setting<String>,
     pub yuzu_token: Setting<String>,
     /// Generated frontend identity, separate from legacy authenticated credentials.
+    pub eden_username: Setting<String>,
     pub eden_token: Setting<String>,
 
     // ── Add-Ons ─────────────────────────────────────────────────────────
@@ -565,7 +566,7 @@ impl Values {
             ),
             Category::Miscellaneous => visit!(log_filter, log_flush_line, censor_username),
             Category::WebService => {
-                visit!(enable_telemetry, web_api_url, yuzu_username, yuzu_token, eden_token,)
+                visit!(enable_telemetry, web_api_url, yuzu_username, yuzu_token, eden_username, eden_token,)
             }
             Category::System => visit!(
                 cpu_clock,
@@ -592,15 +593,37 @@ impl Values {
                 ext_content_from_game_dirs,
             ),
             Category::Controls => visit!(
+                mouse_enabled,
+                keyboard_enabled,
+                debug_pad_enabled,
                 disable_wgi_xinput,
                 enable_raw_input,
+                controller_navigation,
+                enable_joycon_driver,
+                enable_procon_driver,
                 vibration_enabled,
                 enable_accurate_vibrations,
                 motion_enabled,
+                udp_input_servers,
+                enable_udp_controller,
                 pause_tas_on_load,
                 tas_enable,
                 tas_loop,
                 tas_show_recording_dialog,
+                mouse_panning,
+                mouse_panning_sensitivity,
+                mouse_panning_x_sensitivity,
+                mouse_panning_y_sensitivity,
+                mouse_panning_deadzone_counterweight,
+                mouse_panning_decay_strength,
+                mouse_panning_min_decay,
+                emulate_analog_keyboard,
+                touch_device,
+                touch_from_button_map_index,
+                enable_ring_controller,
+                enable_ir_sensor,
+                ir_sensor_device,
+                random_amiibo_id,
             ),
             Category::Network => visit!(network_interface, airplane_mode,),
             _ => {}
@@ -740,7 +763,14 @@ impl Default for Values {
                 true,
                 true,
             ),
-            dump_audio_commands: Setting::new(false, "dump_audio_commands", Audio),
+            dump_audio_commands: Setting::with_options(
+                false,
+                "dump_audio_commands",
+                Audio,
+                Specialization::DEFAULT,
+                false,
+                false,
+            ),
 
             // Core
             use_multi_core: SwitchableSetting::new(true, "use_multi_core", Core),
@@ -1261,13 +1291,16 @@ impl Default for Values {
                 RendererDebug,
             ),
             enable_renderdoc_hotkey: Setting::new(false, "renderdoc_hotkey", RendererDebug),
-            disable_buffer_reorder: Setting::new(false, "disable_buffer_reorder", RendererDebug),
+            disable_buffer_reorder: SwitchableSetting::with_options(
+                false, "disable_buffer_reorder", RendererDebug,
+                Specialization::DEFAULT, true, true,
+            ),
 
             // System
             language_index: SwitchableSetting::ranged(
                 Language::EnglishAmerican,
                 Language::Japanese,
-                Language::PortugueseBrazilian,
+                Language::Thai,
                 "language_index",
                 System,
             ),
@@ -1303,8 +1336,8 @@ impl Default for Values {
             ),
             custom_rtc_offset: SwitchableSetting::ranged_with_options(
                 0i64,
-                i32::MIN as i64,
-                i32::MAX as i64,
+                i64::MIN,
+                i64::MAX,
                 "custom_rtc_offset",
                 System,
                 Specialization::COUNTABLE,
@@ -1564,6 +1597,8 @@ impl Default for Values {
             ),
             yuzu_username: Setting::new(String::new(), "yuzu_username", WebService),
             yuzu_token: Setting::new(String::new(), "yuzu_token", WebService),
+            // Upstream defaults to its frontend name; retain its persisted key.
+            eden_username: Setting::new("Ruzu".to_string(), "eden_username", WebService),
             eden_token: Setting::new(String::new(), "eden_token", WebService),
 
             // Add-Ons
@@ -1698,6 +1733,19 @@ pub fn is_nce_enabled() -> bool {
 /// Returns true if the console is in docked mode.
 pub fn is_docked_mode(values: &Values) -> bool {
     *values.use_docked_mode.get_value() == ConsoleMode::Docked
+}
+
+/// Settings::GetTimeZoneString. Rust uses the existing platform offset
+/// resolver, corresponding to Eden's non-chrono-tzdb fallback (also MinGW).
+pub fn get_time_zone_string(time_zone: TimeZone) -> String {
+    let zones = crate::time_zone::get_time_zone_strings();
+    let index = time_zone as usize;
+    assert!(index < zones.len());
+    if time_zone == TimeZone::Auto {
+        crate::time_zone::find_system_time_zone()
+    } else {
+        zones[index].to_owned()
+    }
 }
 
 /// Returns the effective audio volume as a float (0.0 to ~2.0).
@@ -1912,6 +1960,7 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.dyna_state.set_global(true);
     values.sample_shading.set_global(true);
     values.vertex_input_dynamic_state.set_global(true);
+    values.disable_buffer_reorder.set_global(true);
     values.language_index.set_global(true);
     values.region_index.set_global(true);
     values.time_zone_index.set_global(true);
@@ -1991,6 +2040,83 @@ pub type Settings = Values;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_time_zone_names_follow_upstream_table() {
+        for (zone, name) in [(TimeZone::Default, "GMT"), (TimeZone::Cet, "CET"),
+            (TimeZone::Japan, "Japan"), (TimeZone::Utc, "UTC"), (TimeZone::Zulu, "Zulu")] {
+            assert_eq!(get_time_zone_string(zone), name);
+        }
+        assert!(!get_time_zone_string(TimeZone::Auto).is_empty());
+    }
+
+    #[test]
+    fn registry_visits_each_setting_once_in_its_declared_category() {
+        // Eden's BasicSetting constructor registers each instance in
+        // Linkage::by_category using that instance's category. The Rust visitor
+        // must preserve this invariant without storing self-referential pointers.
+        let categories = [
+            Category::Android, Category::Audio, Category::Core, Category::Cpu,
+            Category::CpuDebug, Category::CpuUnsafe, Category::Overlay,
+            Category::Renderer, Category::RendererAdvanced, Category::RendererHacks,
+            Category::RendererExtensions, Category::RendererDebug, Category::System,
+            Category::SystemAudio, Category::DataStorage, Category::Debugging,
+            Category::DebuggingGraphics, Category::GpuDriver, Category::Miscellaneous,
+            Category::Network, Category::WebService, Category::AddOns, Category::Controls,
+            Category::Ui, Category::UiAudio, Category::UiGeneral, Category::UiLayout,
+            Category::UiGameList, Category::Screenshots, Category::Shortcuts,
+            Category::Multiplayer, Category::Services, Category::Paths, Category::Linux,
+            Category::LibraryApplet,
+        ];
+        assert_eq!(categories.len(), Category::MaxEnum as usize);
+        let mut values = Values::default();
+        let mut labels = std::collections::HashSet::new();
+        for (index, category) in categories.into_iter().enumerate() {
+            assert_eq!(category as usize, index);
+            values.for_each_setting_in_category_mut(category, |setting| {
+                assert_eq!(setting.category(), category, "{}", setting.label());
+                assert!(labels.insert(setting.label().to_owned()),
+                    "duplicate registration: {}", setting.label());
+            });
+        }
+        // Inventory of the Setting/SwitchableSetting fields in Values; plain
+        // controller arrays and frontend UI settings have separate serializers.
+        assert_eq!(labels.len(), 193);
+
+        // Eden registers a restore callback for every SwitchableSetting.
+        // Exercise all registered settings so a newly added field cannot
+        // silently be omitted from Rust's explicit RestoreGlobalState list.
+        let mut global_values = std::collections::HashMap::new();
+        for category in categories {
+            values.for_each_setting_in_category_mut(category, |setting| {
+                if setting.switchable() {
+                    global_values.insert(setting.label().to_owned(), setting.to_string_global());
+                    setting.set_global(false);
+                }
+            });
+        }
+        assert!(!global_values.is_empty());
+        values.use_squashed_iterated_blend = true;
+        restore_global_state(&mut values, true);
+        assert!(values.use_squashed_iterated_blend);
+        for category in categories {
+            values.for_each_setting_in_category_mut(category, |setting| {
+                if setting.switchable() {
+                    assert!(!setting.using_global(), "{}", setting.label());
+                }
+            });
+        }
+        restore_global_state(&mut values, false);
+        assert!(!values.use_squashed_iterated_blend);
+        for category in categories {
+            values.for_each_setting_in_category_mut(category, |setting| {
+                if setting.switchable() {
+                    assert!(setting.using_global(), "{}", setting.label());
+                    assert_eq!(setting.to_string_repr(), global_values[setting.label()]);
+                }
+            });
+        }
+    }
 
     #[test]
     fn visible_graphics_defaults_match_eden_settings_h() {
@@ -2334,6 +2460,49 @@ mod tests {
         });
         for label in ["pause_tas_on_load", "tas_enable", "tas_loop", "tas_show_recording_dialog"] {
             assert_eq!(labels.iter().filter(|entry| entry.as_str() == label).count(), 1);
+        }
+    }
+
+    #[test]
+    fn controls_registry_covers_upstream_linked_settings() {
+        let mut values = Values::default();
+        let mut actual = Vec::new();
+        values.for_each_setting_in_category_mut(Category::Controls, |setting| {
+            actual.push(setting.label().to_owned());
+            assert_eq!(setting.save(), match setting.label() {
+                "mouse_panning" => false,
+                "disable_wgi_xinput" | "enable_raw_input" => cfg!(target_os = "windows"),
+                _ => true,
+            });
+        });
+        let mut expected = [
+            "disable_wgi_xinput", "enable_raw_input", "controller_navigation",
+            "enable_joycon_driver", "enable_procon_driver", "vibration_enabled",
+            "enable_accurate_vibrations", "motion_enabled", "udp_input_servers",
+            "enable_udp_controller", "pause_tas_on_load", "tas_enable", "tas_loop",
+            "tas_show_recording_dialog", "mouse_panning", "mouse_panning_sensitivity",
+            "mouse_enabled", "mouse_panning_x_sensitivity", "mouse_panning_y_sensitivity",
+            "mouse_panning_deadzone_counterweight", "mouse_panning_decay_strength",
+            "mouse_panning_min_decay", "emulate_analog_keyboard", "keyboard_enabled",
+            "debug_pad_enabled", "touch_device", "touch_from_button_map",
+            "enable_ring_controller", "enable_ir_sensor", "ir_sensor_device", "random_amiibo_id",
+        ];
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rtc_offset_preserves_signed_64_bit_values() {
+        use crate::settings_setting::BasicSetting;
+        let mut values = Values::default();
+        for offset in [i64::MIN, -4_000_000_000, 4_000_000_000, (1i64 << 53) + 1, i64::MAX] {
+            values.custom_rtc_offset.set_value(offset);
+            assert_eq!(*values.custom_rtc_offset.get_value(), offset);
+            let serialized = values.custom_rtc_offset.to_string_repr();
+            values.custom_rtc_offset.set_value(0);
+            values.custom_rtc_offset.load_string(&serialized);
+            assert_eq!(*values.custom_rtc_offset.get_value(), offset);
         }
     }
 

@@ -4,15 +4,28 @@
 //! Port of hid_core/hidbus/hidbus_base.h and hidbus_base.cpp
 
 use common::ResultCode;
+use std::sync::Arc;
+
+/// Boundary for HidbusBase's kernel event and System::ApplicationMemory.
+/// The core crate supplies an owner retaining the event until the device is
+/// dropped. hid_core cannot depend on core (core already depends on hid_core).
+pub trait HidbusRuntime: Send + Sync {
+    fn signal_send_command_async_event(&self);
+    fn write_memory(&self, address: u64, data: &[u8]);
+}
 
 /// This is nn::hidbus::JoyPollingMode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[repr(u32)]
-pub enum JoyPollingMode {
-    #[default]
-    SixAxisSensorDisable = 0,
-    SixAxisSensorEnable = 1,
-    ButtonOnly = 2,
+#[repr(transparent)]
+pub struct JoyPollingMode(pub u32);
+
+// C++ enum inputs retain unknown wire values, which OnUpdate rejects through
+// its default branch. A transparent value avoids manufacturing an invalid enum.
+#[allow(non_upper_case_globals)]
+impl JoyPollingMode {
+    pub const SixAxisSensorDisable: Self = Self(0);
+    pub const SixAxisSensorEnable: Self = Self(1);
+    pub const ButtonOnly: Self = Self(2);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,16 +171,29 @@ impl Default for ButtonOnlyPollingDataAccessor {
 }
 
 /// Base trait for hidbus devices
-pub trait HidbusDevice {
-    fn activate_device(&mut self);
-    fn deactivate_device(&mut self);
-    fn is_device_activated(&self) -> bool;
-    fn enable(&mut self, enable: bool);
-    fn is_enabled(&self) -> bool;
-    fn is_polling_mode(&self) -> bool;
-    fn get_polling_mode(&self) -> JoyPollingMode;
-    fn set_polling_mode(&mut self, mode: JoyPollingMode);
-    fn disable_polling_mode(&mut self);
+pub trait HidbusDevice: Send {
+    fn base(&self) -> &HidbusBase;
+    fn base_mut(&mut self) -> &mut HidbusBase;
+
+    /// HidbusBase::ActivateDevice, including virtual OnInit dispatch.
+    fn activate_device(&mut self) {
+        if self.base().is_activated { return; }
+        self.base_mut().is_activated = true;
+        self.on_init();
+    }
+    /// HidbusBase::DeactivateDevice calls OnRelease before clearing activation.
+    fn deactivate_device(&mut self) {
+        if self.base().is_activated { self.on_release(); }
+        self.base_mut().is_activated = false;
+    }
+    fn is_device_activated(&self) -> bool { self.base().is_device_activated() }
+    fn enable(&mut self, enable: bool) { self.base_mut().enable(enable); }
+    fn is_enabled(&self) -> bool { self.base().is_enabled() }
+    fn is_polling_mode(&self) -> bool { self.base().is_polling_mode() }
+    fn get_polling_mode(&self) -> JoyPollingMode { self.base().get_polling_mode() }
+    fn set_polling_mode(&mut self, mode: JoyPollingMode) { self.base_mut().set_polling_mode(mode); }
+    fn disable_polling_mode(&mut self) { self.base_mut().disable_polling_mode(); }
+    fn set_transfer_memory_address(&mut self, address: u64) { self.base_mut().set_transfer_memory_address(address); }
 
     fn on_init(&mut self) {}
     fn on_release(&mut self) {}
@@ -185,6 +211,7 @@ pub trait HidbusDevice {
 
 /// Base implementation for hidbus devices
 pub struct HidbusBase {
+    pub runtime: Arc<dyn HidbusRuntime>,
     pub is_activated: bool,
     pub device_enabled: bool,
     pub polling_mode_enabled: bool,
@@ -196,8 +223,9 @@ pub struct HidbusBase {
 }
 
 impl HidbusBase {
-    pub fn new() -> Self {
+    pub fn new(runtime: Arc<dyn HidbusRuntime>) -> Self {
         Self {
+            runtime,
             is_activated: false,
             device_enabled: false,
             polling_mode_enabled: false,
@@ -207,14 +235,6 @@ impl HidbusBase {
             button_only_data: ButtonOnlyPollingDataAccessor::default(),
             transfer_memory: 0,
         }
-    }
-
-    pub fn activate_device(&mut self) {
-        self.is_activated = true;
-    }
-
-    pub fn deactivate_device(&mut self) {
-        self.is_activated = false;
     }
 
     pub fn is_device_activated(&self) -> bool {
@@ -251,24 +271,95 @@ impl HidbusBase {
     }
 }
 
-impl Default for HidbusBase {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[derive(Default)]
+    pub(crate) struct TestRuntime {
+        pub signals: std::sync::atomic::AtomicUsize,
+        pub writes: std::sync::Mutex<Vec<(u64, Vec<u8>)>>,
+    }
+    impl HidbusRuntime for TestRuntime {
+        fn signal_send_command_async_event(&self) {
+            self.signals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn write_memory(&self, address: u64, data: &[u8]) {
+            self.writes.lock().unwrap().push((address, data.to_vec()));
+        }
+    }
+
+    #[test]
+    fn activation_dispatches_hooks_once_with_upstream_state_order() {
+        struct Device { base: HidbusBase, calls: Vec<&'static str> }
+        impl HidbusDevice for Device {
+            fn base(&self) -> &HidbusBase { &self.base }
+            fn base_mut(&mut self) -> &mut HidbusBase { &mut self.base }
+            fn on_init(&mut self) {
+                assert!(self.base.is_activated);
+                self.calls.push("init");
+            }
+            fn on_release(&mut self) {
+                assert!(self.base.is_activated);
+                self.calls.push("release");
+            }
+        }
+        let mut device = Device { base: HidbusBase::new(Arc::new(TestRuntime::default())), calls: Vec::new() };
+        let erased: &mut dyn HidbusDevice = &mut device;
+        erased.deactivate_device();
+        erased.activate_device();
+        erased.activate_device();
+        erased.deactivate_device();
+        erased.deactivate_device();
+        erased.activate_device();
+        assert!(erased.is_device_activated());
+        assert_eq!(device.calls, ["init", "release", "init"]);
+    }
+
+    #[test]
+    fn concrete_backends_expose_the_hidbus_interface() {
+        let devices: Vec<Box<dyn HidbusDevice>> = vec![
+            Box::new(super::super::ringcon::RingController::new(
+                Arc::new(parking_lot::Mutex::new(crate::frontend::emulated_controller::EmulatedController::new(crate::hid_types::NpadIdType::Player1))),
+                Arc::new(TestRuntime::default()))),
+            Box::new(super::super::stubbed::HidbusStubbed::new(Arc::new(TestRuntime::default()))),
+            Box::new(super::super::starlink::Starlink::new(Arc::new(TestRuntime::default()))),
+        ];
+        for (mut device, expected_id) in devices.into_iter().zip([0x20, 0xff, 0x28]) {
+            assert_eq!(device.get_device_id(), expected_id);
+            device.activate_device();
+            device.enable(true);
+            device.set_polling_mode(JoyPollingMode::SixAxisSensorEnable);
+            device.set_transfer_memory_address(0x1000);
+            assert!(device.is_device_activated());
+            assert!(device.is_enabled());
+            assert!(device.is_polling_mode());
+            assert_eq!(device.base().transfer_memory, 0x1000);
+            device.disable_polling_mode();
+            device.deactivate_device();
+            assert!(!device.is_device_activated());
+            assert!(!device.is_polling_mode());
+        }
+    }
 
     #[test]
     fn polling_accessor_defaults_match_upstream() {
-        let base = HidbusBase::new();
+        let base = HidbusBase::new(Arc::new(TestRuntime::default()));
         assert_eq!(base.disable_sixaxis_data.header.result.raw(), u32::MAX);
         assert_eq!(base.enable_sixaxis_data.header.result.raw(), u32::MAX);
         assert_eq!(base.button_only_data.header.result.raw(), u32::MAX);
         assert_eq!(base.disable_sixaxis_data.entries.len(), 0xB);
         assert_eq!(base.enable_sixaxis_data.entries.len(), 0xB);
         assert_eq!(base.button_only_data.entries.len(), 0xB);
+    }
+
+    #[test]
+    fn device_owns_its_runtime_until_destruction() {
+        let runtime = Arc::new(TestRuntime::default());
+        let weak = Arc::downgrade(&runtime);
+        let device = super::super::stubbed::HidbusStubbed::new(runtime);
+        assert!(weak.upgrade().is_some());
+        drop(device);
+        assert!(weak.upgrade().is_none());
     }
 }

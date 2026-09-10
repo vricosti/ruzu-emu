@@ -5685,6 +5685,41 @@ mod tests {
     }
 
     #[test]
+    fn test_a32_crc32_execution_all_widths_and_polynomials() {
+        for polynomial in [0u32, 0x200] {
+            for size in 0..3u32 {
+                // CRC destination aliases the accumulator; high data bits must be ignored.
+                let word = 0xe100_0042 | polynomial | (size << 21);
+                let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
+                    0x1000, &[word, 0xef00_0000],
+                )));
+                config.enable_cycle_counting = false;
+                config.code_cache_size = 16 * 1024 * 1024;
+                config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+                let mut jit = A32Jit::new(config).unwrap();
+                let accumulator = 0x89ab_cdefu32;
+                let data = 0xfedc_ba98u32;
+                let mut expected = accumulator;
+                let divisor = if polynomial == 0 { 0xedb8_8320 } else { 0x82f6_3b78 };
+                for byte in data.to_le_bytes().into_iter().take(1 << size) {
+                    expected ^= byte as u32;
+                    for _ in 0..8 {
+                        expected = (expected >> 1) ^ if expected & 1 != 0 { divisor } else { 0 };
+                    }
+                }
+                jit.set_register(0, accumulator);
+                jit.set_register(2, data);
+                jit.set_register(15, 0x1000);
+                jit.set_cpsr(0xa800_0010);
+                assert!(jit.run().contains(HaltReason::SVC));
+                assert_eq!(jit.get_register(0), expected, "size={size}, polynomial={polynomial}");
+                assert_eq!(jit.get_register(2), data);
+                assert_eq!(jit.get_cpsr(), 0xa800_0010);
+            }
+        }
+    }
+
+    #[test]
     fn test_a32_scalar_saturation_results_and_q_flag() {
         let mut config = A32UserConfig::new(Box::new(MockCallbacks::new(
             0x1000,

@@ -13,6 +13,7 @@ use super::application_manager_interface::IApplicationManagerInterface;
 use super::content_management_interface::IContentManagementInterface;
 use super::ecommerce_interface::IECommerceInterface;
 use super::download_task_interface::IDownloadTaskInterface;
+use super::dynamic_rights_interface::IDynamicRightsInterface;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
@@ -51,7 +52,7 @@ impl IServiceGetterInterface {
         let handlers = build_handler_map(&[
             (
                 commands::GET_DYNAMIC_RIGHTS_INTERFACE,
-                None,
+                Some(Self::get_dynamic_rights_interface_handler),
                 "GetDynamicRightsInterface",
             ),
             (
@@ -114,9 +115,17 @@ impl IServiceGetterInterface {
     }
 
     /// GetDynamicRightsInterface (cmd 7988).
-    pub fn get_dynamic_rights_interface(&self) {
+    pub fn get_dynamic_rights_interface(&self) -> IDynamicRightsInterface {
         log::debug!("IServiceGetterInterface::get_dynamic_rights_interface called");
-        // Returns IDynamicRightsInterface.
+        IDynamicRightsInterface::new()
+    }
+
+    fn get_dynamic_rights_interface_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let interface = Arc::new(service.get_dynamic_rights_interface());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(interface);
     }
 
     /// GetReadOnlyApplicationControlDataInterface (cmd 7989).
@@ -222,6 +231,13 @@ impl IServiceGetterInterface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_rights_getter_returns_upstream_interface() {
+        let service = IServiceGetterInterface::new(crate::core::SystemRef::null(), "ns:am2");
+        assert!(service.handlers[&7988].handler_callback.is_some());
+        assert_eq!(service.get_dynamic_rights_interface().handlers().len(), 29);
+    }
 
     #[test]
     fn download_task_getter_returns_upstream_commands() {

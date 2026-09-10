@@ -10,7 +10,9 @@ use crate::hle::service::am::am_types::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::file_sys::fs_save_data_types::{SaveDataAttribute, SaveDataSpaceId, SaveDataType};
+use crate::file_sys::fs_save_data_types::{
+    SaveDataAttribute, SaveDataSize, SaveDataSpaceId, SaveDataType,
+};
 use crate::file_sys::patch_manager::PatchManager;
 use crate::file_sys::registered_cache::get_update_title_id;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -87,7 +89,7 @@ fn copy_display_version(version: Option<&str>) -> [u8; 16] {
 /// - 130: GetGpuErrorDetectedSystemEvent
 /// - 131: SetDelayTimeToAbortOnGpuError (unimplemented)
 /// - 140: GetFriendInvitationStorageChannelEvent
-/// - 141: TryPopFromFriendInvitationStorageChannel (unimplemented)
+/// - 141: TryPopFromFriendInvitationStorageChannel
 /// - 150: GetNotificationStorageChannelEvent (unimplemented)
 /// - 151: TryPopFromNotificationStorageChannel (unimplemented)
 /// - 160: GetHealthWarningDisappearedSystemEvent
@@ -142,6 +144,12 @@ impl IApplicationFunctions {
                 27,
                 Some(Self::create_cache_storage_handler),
                 "CreateCacheStorage",
+            ),
+            (25, Some(Self::extend_save_data_handler), "ExtendSaveData"),
+            (
+                26,
+                Some(Self::get_save_data_size_handler),
+                "GetSaveDataSize",
             ),
             (
                 28,
@@ -198,6 +206,11 @@ impl IApplicationFunctions {
                 160,
                 Some(Self::get_health_warning_disappeared_system_event_handler),
                 "GetHealthWarningDisappearedSystemEvent",
+            ),
+            (
+                141,
+                Some(Self::try_pop_from_friend_invitation_storage_channel_handler),
+                "TryPopFromFriendInvitationStorageChannel",
             ),
             (210, Some(Self::get_unknown_event_210_handler), "Unknown210"),
             (330, Some(Self::unknown_330_handler), "Unknown330"),
@@ -365,6 +378,89 @@ impl IApplicationFunctions {
         applet.jit_service_launched = true;
     }
 
+    fn get_save_data_size(&self, save_type: SaveDataType, user_id: [u64; 2]) -> SaveDataSize {
+        let program_id = self.applet.lock().unwrap().program_id;
+        let filesystem = self.system.get().get_filesystem_controller();
+        let controller = filesystem.lock().unwrap().open_save_data_controller();
+        controller.read_save_data_size(self.system.get(), save_type, program_id, user_id)
+    }
+
+    fn extend_save_data(
+        &self,
+        save_type: SaveDataType,
+        user_id: [u64; 2],
+        size: SaveDataSize,
+    ) -> u64 {
+        let program_id = self.applet.lock().unwrap().program_id;
+        let filesystem = self.system.get().get_filesystem_controller();
+        let controller = filesystem.lock().unwrap().open_save_data_controller();
+        controller.write_save_data_size(save_type, program_id, user_id, size);
+        // Upstream reports zero required space after persisting the size pair.
+        0
+    }
+
+    /// CMIF packs the byte-sized type followed immediately by UUID's byte array.
+    /// Reading these separately with the word-based parser would skip UUID bytes.
+    fn parse_save_data_identity(rp: &mut RequestParser<'_>) -> Option<(SaveDataType, [u64; 2])> {
+        let raw = rp.pop_raw::<[u8; 17]>();
+        let save_type = match raw[0] {
+            0 => SaveDataType::System,
+            1 => SaveDataType::Account,
+            2 => SaveDataType::Bcat,
+            3 => SaveDataType::Device,
+            4 => SaveDataType::Temporary,
+            5 => SaveDataType::Cache,
+            6 => SaveDataType::SystemBcat,
+            _ => return None, // Never construct an invalid Rust enum from guest bytes.
+        };
+        Some((
+            save_type,
+            [
+                u64::from_le_bytes(raw[1..9].try_into().unwrap()),
+                u64::from_le_bytes(raw[9..17].try_into().unwrap()),
+            ],
+        ))
+    }
+
+    fn get_save_data_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let Some((save_type, user_id)) =
+            Self::parse_save_data_identity(&mut RequestParser::new(ctx))
+        else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(ResultCode::new(
+                crate::file_sys::errors::RESULT_INVALID_ARGUMENT.raw(),
+            ));
+            return;
+        };
+        let size = service.get_save_data_size(save_type, user_id);
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(size.normal);
+        rb.push_u64(size.journal);
+    }
+
+    fn extend_save_data_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut rp = RequestParser::new(ctx);
+        let Some((save_type, user_id)) = Self::parse_save_data_identity(&mut rp) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(ResultCode::new(
+                crate::file_sys::errors::RESULT_INVALID_ARGUMENT.raw(),
+            ));
+            return;
+        };
+        rp.align_for::<u64>();
+        let size = SaveDataSize {
+            normal: rp.pop_u64(),
+            journal: rp.pop_u64(),
+        };
+        let required_size = service.extend_save_data(save_type, user_id, size);
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(required_size);
+    }
+
     fn notify_running_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service =
             unsafe { &*(this as *const dyn ServiceFramework as *const IApplicationFunctions) };
@@ -470,6 +566,35 @@ impl IApplicationFunctions {
                 ));
                 Self::push_interface_response(ctx, storage);
             }
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
+        }
+    }
+
+    fn try_pop_from_friend_invitation_storage_channel(
+        &self,
+    ) -> Result<Arc<super::storage::IStorage>, ResultCode> {
+        log::debug!("TryPopFromFriendInvitationStorageChannel called");
+        let mut applet = self.applet.lock().unwrap();
+        let data = applet
+            .friend_invitation_storage_channel
+            .pop()
+            .ok_or(am_results::RESULT_NO_DATA_IN_CHANNEL)?;
+        Ok(Arc::new(super::storage::IStorage::new_with_system(
+            self.system,
+            data,
+        )))
+    }
+
+    fn try_pop_from_friend_invitation_storage_channel_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        match service.try_pop_from_friend_invitation_storage_channel() {
+            Ok(storage) => Self::push_interface_response(ctx, storage),
             Err(result) => {
                 let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
                 rb.push_result(result);
@@ -772,6 +897,29 @@ mod tests {
     }
 
     #[test]
+    fn friend_invitation_channel_returns_no_data_then_pops_back() {
+        let service = make_service();
+        let entry = service.handlers().get(&141).unwrap();
+        assert_eq!(entry.name, "TryPopFromFriendInvitationStorageChannel");
+        assert!(entry.handler_callback.is_some());
+        assert_eq!(
+            service.try_pop_from_friend_invitation_storage_channel().err(),
+            Some(am_results::RESULT_NO_DATA_IN_CHANNEL),
+        );
+        service.applet.lock().unwrap().friend_invitation_storage_channel
+            .extend([vec![1, 2], vec![3, 4]]);
+        for expected in [vec![3, 4], vec![1, 2]] {
+            let storage = service.try_pop_from_friend_invitation_storage_channel().unwrap();
+            assert_eq!(storage.get_data(), expected);
+        }
+        let mut ctx = HLERequestContext::new();
+        IApplicationFunctions::try_pop_from_friend_invitation_storage_channel_handler(
+            &service, &mut ctx,
+        );
+        assert_eq!(ctx.cmd_buf[6], am_results::RESULT_NO_DATA_IN_CHANNEL.get_inner_value());
+    }
+
+    #[test]
     fn cache_storage_handlers_match_upstream_command_table() {
         let service = make_service();
         let create = service.handlers().get(&27).unwrap();
@@ -781,6 +929,39 @@ mod tests {
         assert_eq!(create.name, "CreateCacheStorage");
         assert!(max.handler_callback.is_some());
         assert_eq!(max.name, "GetSaveDataSizeMax");
+    }
+
+    #[test]
+    fn save_size_commands_and_packed_identity_match_cmif() {
+        let service = make_service();
+        for (id, name) in [(25, "ExtendSaveData"), (26, "GetSaveDataSize")] {
+            let handler = service.handlers().get(&id).unwrap();
+            assert_eq!(handler.name, name);
+            assert!(handler.handler_callback.is_some());
+        }
+        let mut ctx = HLERequestContext::new();
+        let mut raw = [0xCCu8; 40];
+        raw[0] = SaveDataType::Account as u8;
+        let uuid = *b"synthetic-user!!";
+        raw[1..17].copy_from_slice(&uuid);
+        raw[24..32].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        raw[32..40].copy_from_slice(&8192u64.to_le_bytes());
+        for (slot, bytes) in ctx.cmd_buf[2..12].iter_mut().zip(raw.chunks_exact(4)) {
+            *slot = u32::from_le_bytes(bytes.try_into().unwrap());
+        }
+        let mut rp = RequestParser::new(&mut ctx);
+        let (kind, user) = IApplicationFunctions::parse_save_data_identity(&mut rp).unwrap();
+        assert_eq!(kind, SaveDataType::Account);
+        assert_eq!(
+            user,
+            [
+                u64::from_le_bytes(uuid[..8].try_into().unwrap()),
+                u64::from_le_bytes(uuid[8..].try_into().unwrap())
+            ]
+        );
+        rp.align_for::<u64>();
+        assert_eq!(rp.pop_u64(), 1 << 40);
+        assert_eq!(rp.pop_u64(), 8192);
     }
 
     #[test]

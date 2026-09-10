@@ -2178,7 +2178,19 @@ impl Memory {
         };
 
         let first_ptr = self.get_pointer_impl(src_addr);
-        if !first_ptr.is_null() {
+        // Upstream WalkBlock resolves each guest page independently. A successful
+        // host read only proves accessibility, not that adjacent guest pages map
+        // to adjacent physical storage. Keep the single-syscall adaptation only
+        // after checking every page covered by the range.
+        let mut contiguous = !first_ptr.is_null();
+        let mut checked = ((PAGE_SIZE - (src_addr & PAGE_MASK)) as usize).min(size);
+        while contiguous && checked < size {
+            let ptr = self.get_pointer_impl(src_addr + checked as u64);
+            contiguous = !ptr.is_null()
+                && (first_ptr as usize).checked_add(checked) == Some(ptr as usize);
+            checked += (PAGE_SIZE as usize).min(size - checked);
+        }
+        if contiguous {
             self.handle_rasterizer_download_for_read_range(src_addr, size);
             let read = vm_read(first_ptr as *const u8, dest);
             if read == size as isize {
@@ -3027,6 +3039,33 @@ mod process_fastmem_tests {
                 &device_memory.buffer,
             )
         }
+    }
+
+    #[test]
+    fn checked_read_follows_noncontiguous_guest_pages() {
+        let device_memory = DeviceMemory::with_size(0x20_000);
+        let mut memory = memory_for_device(&device_memory);
+        let mut page_table = PageTable::new();
+        page_table.resize(32, PAGE_BITS);
+        memory.set_current_page_table(&mut page_table, false);
+        for (guest, physical, value) in [(0x4000, 0x2000, 0x31), (0x5000, 0x6000, 0x72)] {
+            memory.map_memory_region(
+                &mut page_table, guest, PAGE_SIZE,
+                dram_memory_map::BASE + physical,
+                MemoryPermission::READ_WRITE, false,
+            );
+            assert!(memory.write_block(guest, &vec![value; PAGE_SIZE as usize]));
+        }
+        let mut actual = vec![0; PAGE_SIZE as usize + 16];
+        let mut expected = actual.clone();
+        assert!(memory.read_block(0x4ff0, &mut expected[..32]));
+        assert!(memory.read_block_checked(0x4ff0, &mut actual[..32]));
+        assert_eq!(&actual[..32], &expected[..32]);
+        // A mapped physical neighbour must not make an unmapped guest page readable.
+        actual.fill(0xaa);
+        assert!(!memory.read_block_checked(0x5ff0, &mut actual));
+        assert_eq!(&actual[..16], &[0x72; 16]);
+        assert!(actual[16..].iter().all(|&byte| byte == 0));
     }
 
     #[test]

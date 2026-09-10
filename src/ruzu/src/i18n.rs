@@ -560,6 +560,7 @@ mod tests {
             ("Create Shortcut", "Créer un raccourci"),
             ("Add to Desktop", "Ajouter au bureau"),
             ("Add to Applications Menu", "Ajouter au menu des applications"),
+            ("Add to Applications Folder", "Ajouter au dossier Applications"),
             (
                 "Start Game without Custom Configuration",
                 "Démarrer le jeu sans configuration custom",

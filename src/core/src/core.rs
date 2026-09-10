@@ -42,6 +42,29 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+/// Clock-update portion of Impl::RefreshTime, mechanically separated so the
+/// ordering and persisted contexts can be tested without a running frontend.
+fn refresh_system_clocks(
+    settings: &crate::hle::service::set::system_settings_server::SystemSettingsService,
+    user: &crate::hle::service::psc::time::system_clock::SystemClock,
+    local: &crate::hle::service::psc::time::system_clock::SystemClock,
+    network: &crate::hle::service::psc::time::system_clock::SystemClock,
+    new_time: i64,
+) {
+    settings.inner.lock().unwrap().set_user_system_clock_context([0; 0x20]);
+    let _ = user.set_current_time(new_time);
+    let _ = local.set_current_time(new_time);
+    let context = network.get_system_clock_context().unwrap_or_default();
+    // SystemClockContext is 8 + 8 + 16 bytes, with no implicit padding. Encode
+    // each field explicitly rather than relying on a raw host-memory copy.
+    let mut bytes = [0u8; 0x20];
+    bytes[..8].copy_from_slice(&context.offset.to_le_bytes());
+    bytes[8..16].copy_from_slice(&context.steady_time_point.time_point.to_le_bytes());
+    bytes[16..].copy_from_slice(&context.steady_time_point.clock_source_id);
+    settings.inner.lock().unwrap().set_network_system_clock_context(bytes);
+    let _ = network.set_current_time(new_time);
+}
+
 /// Open a game file, joining the standard `00`, `01`, …, `0F` FAT32 split
 /// layout and resolving extracted-directory launches through their `main`
 /// file. Port of upstream `Core::GetGameFileFromPath` in `core.cpp`.
@@ -965,6 +988,12 @@ pub trait AudioCoreInterface: Send {
     /// Mirror `AudioCore::Sink::Sink::GetSystemChannels`.
     fn get_audio_output_system_channels(&self) -> u32;
 
+    /// Bridge to Sink::SetSystemVolume followed by Sink::SetDeviceVolume.
+    fn set_audio_output_sink_volume(&self, volume: f32);
+
+    /// Crate-cycle bridge for IAudioOutManager::SetAllAudioOutVolume.
+    fn set_all_audio_out_volume(&self, volume: f32);
+
     /// Mirror `AudioCore::AudioIn::Manager::GetDeviceNames`.
     fn list_audio_input_device_name(&self, out_names: &mut [[u8; 0x100]], filter: bool) -> u32;
 
@@ -1101,6 +1130,9 @@ pub struct System {
 
     /// Shared HLE service registry.
     service_manager: Option<Arc<std::sync::Mutex<ServiceManager>>>,
+
+    /// Upstream System::Impl::renderdoc_api; initialized only when enabled.
+    renderdoc_api: Option<crate::tools::renderdoc::RenderdocApi>,
 
     /// Applet manager used to register frontend-launched applets with AM.
     applet_manager: AppletManager,
@@ -1311,6 +1343,7 @@ impl System {
             gpu_core: None,
             audio_core: None,
             service_manager: None,
+            renderdoc_api: None,
             applet_manager: AppletManager::new(),
             apm_controller: Arc::new(StdMutex::new(ApmController::new())),
             arp_manager: Arc::new(StdMutex::new(ARPManager::new())),
@@ -1551,7 +1584,7 @@ impl System {
 
             // Upstream `KernelCore::Impl::InitializeHackSharedMemory` runs
             // after the physical memory manager is ready. Initialize the
-            // persistent objects here so every font and `irs` session returns
+            // persistent objects here so every font, IRS and HID bus session returns
             // the same respective backing.
             let result = kernel.initialize_font_shared_memory(device_memory);
             assert!(
@@ -1562,6 +1595,11 @@ impl System {
             assert!(
                 result.is_success(),
                 "failed to initialize IRS shared memory"
+            );
+            let result = kernel.initialize_hidbus_shared_memory(device_memory);
+            assert!(
+                result.is_success(),
+                "failed to initialize HID bus shared memory"
             );
         }
 
@@ -1649,6 +1687,9 @@ impl System {
         self.is_powered_on.store(true, Ordering::Relaxed);
         self.exit_locked.store(false, Ordering::Release);
         self.exit_requested.store(false, Ordering::Release);
+
+        self.renderdoc_api = (*common::settings::values().enable_renderdoc_hotkey.get_value())
+            .then(crate::tools::renderdoc::RenderdocApi::new);
 
         log::info!("System: application process setup complete (services created)");
         Ok(())
@@ -2198,6 +2239,58 @@ impl System {
     /// Check if the system is powered on (all subsystems initialized and able to run).
     pub fn is_powered_on(&self) -> bool {
         self.is_powered_on.load(Ordering::Relaxed)
+    }
+
+    /// System::Impl::RefreshTime, called before the renderer refresh when
+    /// applying settings. No settings/service-manager lock crosses a service
+    /// call: clock updates can notify workers that acquire these same locks.
+    pub fn refresh_time(&self) {
+        use crate::hle::service::glue::time::r#static::StaticService as GlueStatic;
+        use crate::hle::service::psc::time::r#static::StaticService as PscStatic;
+        use crate::hle::service::set::system_settings_server::SystemSettingsService;
+
+        if !self.is_powered_on() {
+            return;
+        }
+        let manager = self.service_manager().expect("powered system has services");
+        let system = SystemRef::from_ref(self);
+        let settings_handler = ServiceManager::get_service_blocking(&manager, system, "set:sys");
+        let admin_handler = ServiceManager::get_service_blocking(&manager, system, "time:a");
+        let static_handler = ServiceManager::get_service_blocking(&manager, system, "time:s");
+        let settings = settings_handler.as_any().downcast_ref::<SystemSettingsService>()
+            .expect("set:sys is a settings service");
+        let admin = admin_handler.as_any().downcast_ref::<GlueStatic>()
+            .expect("time:a is a Glue time service");
+        let static_service = static_handler.as_any().downcast_ref::<PscStatic>()
+            .expect("time:s is a PSC time service");
+        let user = admin.get_standard_user_system_clock();
+        let local = admin.get_standard_local_system_clock();
+        let network = static_service.get_standard_network_system_clock();
+        let timezone = admin.get_time_zone_service().expect("time:a exposes timezone service");
+
+        let (zone, offset) = {
+            let values = common::settings::values();
+            (*values.time_zone_index.get_value(),
+             if *values.custom_rtc_enabled.get_value() { *values.custom_rtc_offset.get_value() } else { 0 })
+        };
+        let zone = common::settings::get_time_zone_string(zone);
+        let mut name = [0u8; 0x24];
+        let length = name.len().min(zone.len());
+        name[..length].copy_from_slice(&zone.as_bytes()[..length]);
+        let _ = timezone.set_device_location_name(&name);
+
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs() as i64,
+            Err(error) => -(error.duration().as_secs() as i64),
+        };
+        // Upstream adds u64 then passes the unchanged bit pattern to s64.
+        refresh_system_clocks(settings, &user, &local, &network, now.wrapping_add(offset));
+    }
+
+    /// Upstream System::GetRenderdocAPI. Unlike dereferencing an empty C++
+    /// optional, callers can safely ignore requests outside an enabled session.
+    pub fn get_renderdoc_api(&mut self) -> Option<&mut crate::tools::renderdoc::RenderdocApi> {
+        self.renderdoc_api.as_mut()
     }
 
     /// Get the telemetry session.
@@ -3194,6 +3287,59 @@ mod exit_state_tests {
         assert!(state.load(Ordering::Acquire));
         system.set_exit_locked(false);
         assert!(!state.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn refresh_time_preserves_clock_order_context_bytes_and_releases_settings_lock() {
+        use crate::hle::result::{ResultCode, RESULT_SUCCESS};
+        use crate::hle::service::psc::time::common::{SystemClockContext, SteadyClockTimePoint};
+        use crate::hle::service::psc::time::system_clock::{SystemClock, SystemClockBackend};
+        use crate::hle::service::set::system_settings_server::SystemSettingsService;
+
+        struct Clock {
+            id: u8,
+            settings: Arc<SystemSettingsService>,
+            events: Arc<StdMutex<Vec<(u8, i64)>>>,
+        }
+        impl SystemClockBackend for Clock {
+            fn is_initialized(&self) -> bool { true }
+            fn get_current_time(&self) -> Result<i64, ResultCode> { Ok(0) }
+            fn get_context(&self) -> Result<SystemClockContext, ResultCode> {
+                assert!(self.settings.inner.try_lock().is_ok());
+                self.events.lock().unwrap().push((self.id, 0));
+                Ok(SystemClockContext {
+                    offset: -19,
+                    steady_time_point: SteadyClockTimePoint { time_point: 42, clock_source_id: [0xA5; 16] },
+                })
+            }
+            fn set_current_time(&self, time: i64) -> ResultCode {
+                let settings = self.settings.inner.try_lock().expect("caller must release settings lock");
+                assert_eq!(settings.get_user_system_clock_context(), [0; 0x20]);
+                if self.id == 2 {
+                    let stored = settings.get_network_system_clock_context();
+                    assert_eq!(&stored[..8], &(-19i64).to_le_bytes());
+                    assert_eq!(&stored[8..16], &42i64.to_le_bytes());
+                    assert_eq!(&stored[16..], &[0xA5; 16]);
+                }
+                self.events.lock().unwrap().push((self.id, time));
+                RESULT_SUCCESS
+            }
+            fn set_context_and_write(&self, _: &SystemClockContext) -> ResultCode {
+                panic!("RefreshTime must set current time, not replace clock contexts")
+            }
+        }
+        let settings = Arc::new(SystemSettingsService::new_for_test());
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let clocks: Vec<_> = (0..3).map(|id| SystemClock::with_backend(true, false, Arc::new(Clock {
+            id, settings: Arc::clone(&settings), events: Arc::clone(&events),
+        }))).collect();
+        for time in [1234, -1, i64::MIN] {
+            events.lock().unwrap().clear();
+            refresh_system_clocks(&settings, &clocks[0], &clocks[1], &clocks[2], time);
+            assert_eq!(*events.lock().unwrap(), [(0, time), (1, time), (2, 0), (2, time)]);
+        }
+        // Must not try to discover services before System is powered on.
+        System::new().refresh_time();
     }
 
     #[test]

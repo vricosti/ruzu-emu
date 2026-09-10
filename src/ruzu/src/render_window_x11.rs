@@ -41,6 +41,24 @@ use gtk::prelude::*;
 
 use x11::{glx, xlib};
 
+/// QCursor::setPos(mapToGlobal(...)) for the native render child. Coordinates
+/// are physical child pixels, not GTK logical pixels. Caller owns both handles.
+pub unsafe fn warp_render_pointer(display: *mut xlib::Display, window: xlib::Window, x: i32, y: i32) -> bool {
+    if display.is_null() || window == 0 { return false; }
+    unsafe {
+        xlib::XWarpPointer(display, 0, window, 0, 0, 0, 0, x, y);
+        xlib::XFlush(display);
+    }
+    true
+}
+
+pub unsafe fn render_pointer_position(display: *mut xlib::Display, window: xlib::Window) -> Option<(f64, f64)> {
+    if display.is_null() || window == 0 { return None; }
+    let (mut root, mut child, mut root_x, mut root_y, mut x, mut y, mut mask) = (0, 0, 0, 0, 0, 0, 0);
+    let valid = unsafe { xlib::XQueryPointer(display, window, &mut root, &mut child, &mut root_x, &mut root_y, &mut x, &mut y, &mut mask) };
+    (valid != 0).then_some((x as f64, y as f64))
+}
+
 use ruzu_core::frontend::graphics_context::GraphicsContext;
 
 type GlxCreateContextAttribsArb = unsafe extern "C" fn(
@@ -469,6 +487,41 @@ pub fn attach_render_window(
     })
 }
 
+/// Native part of GRenderWindow reparenting in MainWindow::ToggleWindowMode.
+/// Keep the drawable (and therefore the Vulkan surface/GLX context target)
+/// alive. The GTK caller resizes it and restores focus after changing hosts.
+/// Both GTK hosts must use the same X display and screen.
+pub fn reparent_render_window(
+    destination: &gtk::Window,
+    display: *mut c_void,
+    child: u64,
+) -> bool {
+    let Some(surface) = destination.surface() else { return false };
+    let Some(surface) = surface.downcast_ref::<gdk4_x11::X11Surface>() else { return false };
+    let owner = surface.display();
+    let Some(owner) = owner.downcast_ref::<gdk4_x11::X11Display>() else { return false };
+    let native_display = unsafe { owner.xdisplay() };
+    if native_display.is_null() || native_display.cast::<c_void>() != display || child == 0 {
+        return false;
+    }
+    // Trap asynchronous X errors; a failed reparent must not terminate GTK or
+    // leave the frontend believing that the surface changed owners.
+    owner.error_trap_push();
+    let mut child_attributes: xlib::XWindowAttributes = unsafe { std::mem::zeroed() };
+    let mut parent_attributes: xlib::XWindowAttributes = unsafe { std::mem::zeroed() };
+    let valid = unsafe {
+        xlib::XGetWindowAttributes(native_display, child, &mut child_attributes) != 0
+            && xlib::XGetWindowAttributes(native_display, surface.xid(), &mut parent_attributes) != 0
+    };
+    if valid && child_attributes.root == parent_attributes.root {
+        // XReparentWindow preserves mapped/unmapped state. Do not show a child
+        // which is still hidden behind the loading page.
+        unsafe { xlib::XReparentWindow(native_display, child, surface.xid(), 0, 0); }
+    }
+    let error = owner.error_trap_pop();
+    valid && child_attributes.root == parent_attributes.root && error == 0
+}
+
 /// Show or hide the child render window.
 ///
 /// The macOS path fades its child `NSWindow` via `setAlphaValue`; X11 has no
@@ -538,5 +591,53 @@ pub fn destroy_render_window(display: *mut c_void, window: u64, colormap: usize)
             xlib::XFreeColormap(xdisplay, colormap as xlib::Colormap);
         }
         xlib::XFlush(xdisplay);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an X11 GTK display; run alone"]
+    fn reparent_preserves_drawable_and_hidden_state() {
+        gtk::init().unwrap();
+        // Explicit backend for this native X11 test only. Do not change the
+        // user's backend environment or the application's default display.
+        let x11 = gdk4_x11::X11Display::open(None).expect("X11 test display");
+        let first = gtk::Window::builder().display(&x11).build();
+        let second = gtk::Window::builder().display(&x11).build();
+        gtk::prelude::WidgetExt::realize(&first);
+        gtk::prelude::WidgetExt::realize(&second);
+        let embedded = attach_render_window(&first, Some((0.0, 0.0, 64.0, 64.0)))
+            .expect("X11 render child");
+        let display = embedded.display.cast::<xlib::Display>();
+        let query = || unsafe {
+            let mut root = 0;
+            let mut parent = 0;
+            let mut children = std::ptr::null_mut();
+            let mut count = 0;
+            assert_ne!(xlib::XQueryTree(display, embedded.window, &mut root, &mut parent,
+                &mut children, &mut count), 0);
+            if !children.is_null() { xlib::XFree(children.cast()); }
+            let mut attributes: xlib::XWindowAttributes = std::mem::zeroed();
+            assert_ne!(xlib::XGetWindowAttributes(display, embedded.window, &mut attributes), 0);
+            (parent, attributes.map_state, attributes.width, attributes.height)
+        };
+        let xid = |window: &gtk::Window| window.surface().unwrap()
+            .downcast::<gdk4_x11::X11Surface>().unwrap().xid();
+        set_render_window_hidden(embedded.display, embedded.window, true);
+        let original = query();
+        assert_eq!(original.0, xid(&first));
+        for destination in [&second, &first, &second, &first] {
+            assert!(reparent_render_window(destination, embedded.display, embedded.window));
+            let current = query();
+            assert_eq!(current, (xid(destination), xlib::IsUnmapped, original.2, original.3));
+        }
+        assert!(!reparent_render_window(&second, std::ptr::null_mut(), embedded.window));
+        assert_eq!(query().0, xid(&first));
+        destroy_render_window(embedded.display, embedded.window, embedded.colormap);
+        first.destroy();
+        second.destroy();
     }
 }

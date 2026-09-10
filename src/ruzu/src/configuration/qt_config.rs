@@ -154,16 +154,23 @@ pub fn load_global_values() {
     config.initialize(&path);
 }
 
+// Mechanical shared preflight for this module's read/modify/write adapters.
+// Eden retains its parsed Config object; Rust must not replace unreadable input
+// with an empty document before updating one category.
+fn read_configuration_for_update(path: &Path) -> io::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Persist the generic global categories through upstream's
 /// `Config::SaveValues` owner. Qt-owned controls and UI values are written by
 /// their specialized writers after this pass.
 pub fn save_global_values() -> io::Result<()> {
     let path = config_path();
-    match std::fs::read_to_string(&path) {
-        Ok(_) => {},
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-        Err(error) => return Err(error),
-    }
+    read_configuration_for_update(&path)?;
     let mut config = BaseConfig::new(ConfigType::GlobalConfig);
     // Upstream writes through the already-loaded, long-lived `QtConfig`
     // object. Reden reconstructs this adapter for each save, so load only the
@@ -221,7 +228,7 @@ fn parse_shortcut_values(contents: &str) -> Vec<uisettings::Shortcut> {
 /// Persist frontend shortcuts through upstream `QtConfig::SaveShortcutValues`.
 pub fn save_shortcut_values() -> io::Result<()> {
     let path = config_path();
-    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut contents = read_configuration_for_update(&path)?;
     let shortcuts = uisettings::with(|ui| ui.shortcuts.clone());
     for (shortcut, default) in shortcuts.iter().zip(uisettings::DEFAULT_HOTKEYS) {
         let prefix = format!("{}\\{}", shortcut.group, shortcut.name);
@@ -262,8 +269,11 @@ pub fn save_shortcut_values() -> io::Result<()> {
 
 /// Persist the four settings owned by upstream `ConfigureTasDialog`.
 pub fn save_tas_values() -> io::Result<()> {
-    let path = config_path();
-    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    save_tas_values_to(&config_path())
+}
+
+fn save_tas_values_to(path: &Path) -> io::Result<()> {
+    let mut contents = read_configuration_for_update(path)?;
     let values = common::settings::values();
     for (key, value, default) in [
         (
@@ -411,113 +421,103 @@ fn read_ui_values(contents: &str, values: &mut uisettings::Values) {
         .map(|value| unquote(value).to_owned()).unwrap_or_default());
 }
 
-/// Read the three Direct Connect fields owned by upstream
+/// Read the multiplayer fields owned by upstream
 /// `QtConfig::ReadMultiplayerValues`.
 pub fn load_multiplayer_values() {
     let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
-    let values = parse_section_values(&contents, UI_SECTION);
-    uisettings::with_mut(|ui| {
-        ui.multiplayer_nickname.set_value(read_ui_string_setting(
-            &contents,
-            "Multiplayer\\nickname",
-            ui.multiplayer_nickname.get_default(),
-        ));
-        ui.multiplayer_filter_text.set_value(read_ui_string_setting(
-            &contents,
-            "Multiplayer\\filter_text",
-            ui.multiplayer_filter_text.get_default(),
-        ));
-        ui.multiplayer_filter_games_owned
-            .set_value(read_ui_bool_setting(
-                &values,
-                "Multiplayer\\filter_games_owned",
-                *ui.multiplayer_filter_games_owned.get_default(),
-            ));
-        ui.multiplayer_filter_hide_empty
-            .set_value(read_ui_bool_setting(
-                &values,
-                "Multiplayer\\filter_games_hide_empty",
-                *ui.multiplayer_filter_hide_empty.get_default(),
-            ));
-        ui.multiplayer_filter_hide_full
-            .set_value(read_ui_bool_setting(
-                &values,
-                "Multiplayer\\filter_games_hide_full",
-                *ui.multiplayer_filter_hide_full.get_default(),
-            ));
-        ui.multiplayer_ip.set_value(read_ui_string_setting(
-            &contents,
-            "Multiplayer\\ip",
-            ui.multiplayer_ip.get_default(),
-        ));
-        ui.multiplayer_port.set_value(read_ui_u32_setting(
-            &values,
-            "Multiplayer\\port",
-            *ui.multiplayer_port.get_default(),
-        ));
-    });
+    uisettings::with_mut(|ui| read_multiplayer_values(&contents, ui));
 }
 
-/// Persist the three Direct Connect fields through upstream
+fn read_multiplayer_values(contents: &str, ui: &mut uisettings::Values) {
+    let values = parse_section_values(contents, UI_SECTION);
+    ui.for_each_multiplayer_setting_mut(|setting| {
+        let key = format!("Multiplayer\\{}", setting.label());
+        let default = setting.default_to_string();
+        let value = if matches!(default.as_str(), "true" | "false") {
+            read_ui_bool_setting(&values, &key, default == "true").to_string()
+        } else if values.get(&format!("{key}\\default")).is_none_or(|value| is_true(value)) {
+            default
+        } else {
+            values.get(&key).map(|value| decode_multiplayer_value(value))
+                .unwrap_or_else(|| setting.default_to_string())
+        };
+        setting.load_string(&value);
+    });
+    for (array, field, list) in [
+        ("username_ban_list", "username", &mut ui.multiplayer_ban_list.0),
+        ("ip_ban_list", "ip", &mut ui.multiplayer_ban_list.1),
+    ] {
+        let prefix = format!("Multiplayer\\{array}");
+        let size = values.get(&format!("{prefix}\\size"))
+            .and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+        list.clear();
+        for index in 1..=size {
+            // Ban entries are plain array values, not defaulted settings.
+            // Eden's IP reader mistakenly reads "username" without advancing
+            // its index. Read the indexed "ip" keys emitted by its writer.
+            list.push(values.get(&format!("{prefix}\\{index}\\{field}"))
+                .map(|value| decode_multiplayer_value(value)).unwrap_or_default());
+        }
+    }
+}
+
+/// Persist the multiplayer fields through upstream
 /// `QtConfig::SaveMultiplayerValues`'s `Category::Multiplayer` writer.
 pub fn save_multiplayer_values() -> io::Result<()> {
     let path = config_path();
-    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
-    uisettings::with(|ui| {
-        contents = replace_ui_string_setting(
-            &contents,
-            "Multiplayer\\nickname",
-            ui.multiplayer_nickname.get_value(),
-            ui.multiplayer_nickname.get_default(),
-        );
-        contents = replace_ui_string_setting(
-            &contents,
-            "Multiplayer\\filter_text",
-            ui.multiplayer_filter_text.get_value(),
-            ui.multiplayer_filter_text.get_default(),
-        );
-        for (key, setting) in [
-            (
-                "Multiplayer\\filter_games_owned",
-                &ui.multiplayer_filter_games_owned,
-            ),
-            (
-                "Multiplayer\\filter_games_hide_empty",
-                &ui.multiplayer_filter_hide_empty,
-            ),
-            (
-                "Multiplayer\\filter_games_hide_full",
-                &ui.multiplayer_filter_hide_full,
-            ),
-        ] {
-            let value = *setting.get_value();
-            contents = replace_section_setting(
-                &contents,
-                "UI",
-                key,
-                if value { "true" } else { "false" },
-                value == *setting.get_default(),
-            );
-        }
-        contents = replace_ui_string_setting(
-            &contents,
-            "Multiplayer\\ip",
-            ui.multiplayer_ip.get_value(),
-            ui.multiplayer_ip.get_default(),
-        );
-        let port = *ui.multiplayer_port.get_value();
-        contents = replace_section_setting(
-            &contents,
-            "UI",
-            "Multiplayer\\port",
-            &port.to_string(),
-            port == *ui.multiplayer_port.get_default(),
-        );
-    });
+    let contents = read_configuration_for_update(&path)?;
+    let contents = uisettings::with_mut(|ui| write_multiplayer_values(&contents, ui));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, contents)
+}
+
+fn write_multiplayer_values(contents: &str, ui: &mut uisettings::Values) -> String {
+    // Remove only owned array keys in UI; shrinking a list must not leave stale
+    // bans that can reappear later, and other sections must remain untouched.
+    let mut in_ui = false;
+    let mut contents = contents.lines().filter(|line| {
+        let line = line.trim();
+        if line.starts_with('[') { in_ui = line == UI_SECTION; }
+        !in_ui || !line.split_once('=').is_some_and(|(key, _)|
+            key.starts_with("Multiplayer\\username_ban_list\\") || key.starts_with("Multiplayer\\ip_ban_list\\"))
+    }).collect::<Vec<_>>().join("\n");
+    ui.for_each_multiplayer_setting_mut(|setting| {
+        contents = replace_ui_string_setting(&contents,
+            &format!("Multiplayer\\{}", setting.label()),
+            &encode_multiplayer_value(&setting.to_string_global()),
+            &encode_multiplayer_value(&setting.default_to_string()));
+    });
+    for (array, field, list) in [
+        ("username_ban_list", "username", &ui.multiplayer_ban_list.0),
+        ("ip_ban_list", "ip", &ui.multiplayer_ban_list.1),
+    ] {
+        let prefix = format!("Multiplayer\\{array}");
+        contents = replace_ui_setting(&contents, &format!("{prefix}\\size"), &list.len().to_string(), None);
+        for (index, value) in list.iter().enumerate() {
+            contents = replace_ui_setting(&contents, &format!("{prefix}\\{}\\{field}", index + 1), &encode_multiplayer_value(value), None);
+        }
+    }
+    contents
+}
+
+// Keep scalar numbers/bools and legacy simple strings in their existing form.
+// Quoted escapes preserve multiline GUI text on ONE physical INI line. The
+// newline/backslash/quote form matches QSettings; Eden's current SimpleIni
+// writer does not escape line breaks and cannot roundtrip that input safely.
+fn encode_multiplayer_value(value: &str) -> String {
+    if value.trim() != value || value.chars().any(|c| c.is_control() || matches!(c, '\\' | '"' | ',' | ';' | '=')) {
+        serde_json::to_string(value).expect("serializing a string cannot fail")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn decode_multiplayer_value(value: &str) -> String {
+    // Legacy SimpleIni strings may have unescaped backslashes inside quotes.
+    // Decode valid escaped strings; otherwise preserve the legacy content.
+    serde_json::from_str::<String>(value).unwrap_or_else(|_| unquote(value).to_owned())
 }
 
 /// Persist frontend UI values through upstream `QtConfig::SaveUIValues`'s
@@ -527,11 +527,7 @@ pub fn save_view_values() -> io::Result<()> {
 }
 
 fn save_view_values_to(path: &Path) -> io::Result<()> {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error),
-    };
+    let contents = read_configuration_for_update(path)?;
     let updated = uisettings::with_mut(|values| save_ui_values(&contents, values));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -594,7 +590,7 @@ fn read_ui_u32_setting(
 /// `Config::SaveUIValues` key and default marker.
 pub fn save_ui_language() -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let language = uisettings::with(|values| values.language.get_value().clone());
     let updated = replace_ui_string_setting(&contents, "Paths\\language", &language, "");
     if let Some(parent) = path.parent() {
@@ -607,7 +603,7 @@ pub fn save_ui_language() -> io::Result<()> {
 /// `QtConfig::SavePathValues`'s `romsPath` key.
 pub fn save_roms_path() -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let roms_path = uisettings::with(|values| values.roms_path.clone());
     let updated = replace_ui_string_setting(&contents, "Paths\\romsPath", &roms_path, "");
     if let Some(parent) = path.parent() {
@@ -734,10 +730,28 @@ fn parse_section_values(
 /// Read the configured game directories — upstream `Config::ReadUIValues`'s
 /// `gamedirs` array.
 pub fn load_game_dirs() -> Vec<GameDir> {
-    match std::fs::read_to_string(config_path()) {
-        Ok(contents) => parse_game_dirs(&contents),
-        Err(_) => Vec::new(),
+    game_dirs_with_defaults(&std::fs::read_to_string(config_path()).unwrap_or_default())
+}
+
+/// ReadPathValues' empty-array fallback. Imports still use parse_game_dirs so
+/// importing a file without game paths does not fabricate source directories.
+fn game_dirs_with_defaults(contents: &str) -> Vec<GameDir> {
+    let mut directories = parse_game_dirs(contents);
+    if directories.is_empty() {
+        directories.extend(["SDMC", "UserNAND", "SysNAND"].map(|path| GameDir {
+            path: path.into(), deep_scan: false, expanded: true,
+        }));
+        let mut config = BaseConfig::new(ConfigType::GlobalConfig);
+        config.load_ini(contents);
+        config.begin_group("UI");
+        config.begin_group("Paths");
+        let legacy = config.read_string_setting("gameListRootDir", Some("."));
+        if legacy != "." {
+            directories.push(GameDir { path: legacy,
+                deep_scan: config.read_boolean_setting("gameListDeepScan", Some(false)), expanded: true });
+        }
     }
+    directories
 }
 
 /// Read `Settings::values.external_content_dirs` from the QSettings array
@@ -754,7 +768,7 @@ pub fn load_external_content_dirs() {
 /// `QtConfig::SaveUIValues`'s `external_content_dirs` array.
 pub fn save_external_content_dirs(directories: &[String]) -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let updated = replace_external_content_dirs(&contents, directories);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -898,7 +912,7 @@ fn merge_game_dirs(mut existing: Vec<GameDir>, source: Vec<GameDir>) -> (Vec<Gam
 /// one occupied.
 pub fn save_game_dirs(dirs: &[GameDir]) -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let updated = replace_game_dirs(&contents, dirs);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -931,7 +945,7 @@ pub fn load_favorites_expanded() {
 /// Persist upstream `UISettings::values.favorites_expanded` in UiGameList.
 pub fn save_favorites_expanded() -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let (value, default) = uisettings::with(|values| {
         (
             *values.favorites_expanded.get_value(),
@@ -957,7 +971,7 @@ pub fn save_favorites_expanded() -> io::Result<()> {
 /// rewritten block takes the position of the first old line.
 pub fn save_favorited_ids(ids: &[u64]) -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
     let updated = replace_favorited_ids(&contents, ids);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1096,6 +1110,24 @@ pub(super) const DEFAULT_BUTTONS: [i32; native_button::NUM_BUTTONS] = [
 /// Upstream `QtConfig::default_motions`.
 pub(super) const DEFAULT_MOTIONS: [i32; native_motion::NUM_MOTIONS] = [b'7' as i32, b'8' as i32];
 
+/// QtConfig::default_ringcon_analogs.
+pub(super) const DEFAULT_RINGCON_ANALOGS: [i32; 2] = [b'A' as i32, b'D' as i32];
+
+/// QtConfig::ReadHidbusValues, using the already parsed Controls section.
+fn read_hidbus_values(values: &std::collections::BTreeMap<String, String>) -> String {
+    values.get("ring_controller").filter(|value| !value.is_empty()
+         && values.get("ring_controller\\default").is_some_and(|flag|
+             matches!(flag.to_ascii_lowercase().as_str(), "false" | "no" | "off" | "0"))).cloned()
+        .unwrap_or_else(|| generate_analog_param_from_keys(
+            0, 0, DEFAULT_RINGCON_ANALOGS[0], DEFAULT_RINGCON_ANALOGS[1], 0, 0.05,
+        ))
+}
+
+/// QtConfig::SaveHidbusValues. The Controls writer owns quoting/default flags.
+fn save_hidbus_values(entries: &mut Vec<(String, String)>, binding: &str) {
+    entries.push(("ring_controller".to_string(), binding.to_string()));
+}
+
 /// Upstream `QtConfig::default_analogs`.
 pub(super) const DEFAULT_ANALOGS: [[i32; 4]; native_analog::NUM_ANALOGS] = [
     [b'W' as i32, b'S' as i32, b'A' as i32, b'D' as i32],
@@ -1121,6 +1153,7 @@ pub fn load_control_values() {
     for (index, player) in players.iter_mut().enumerate() {
         load_player_values(player, index, &values);
     }
+    settings.ringcon_analogs = read_hidbus_values(&values);
 }
 
 fn load_player_values(
@@ -1236,7 +1269,7 @@ where
 /// of the INI alone.
 pub fn save_control_values() -> io::Result<()> {
     let path = config_path();
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = read_configuration_for_update(&path)?;
 
     let mut entries: Vec<(String, String)> = Vec::new();
     {
@@ -1244,6 +1277,7 @@ pub fn save_control_values() -> io::Result<()> {
         for (index, player) in settings.players.get_value().iter().enumerate() {
             append_player_entries(&mut entries, index, player);
         }
+        save_hidbus_values(&mut entries, &settings.ringcon_analogs);
     }
 
     let updated = replace_controls(&contents, &entries);
@@ -1280,7 +1314,7 @@ pub fn load_per_game_control_values(path: &std::path::Path) {
 /// Upstream `Config::SavePlayerValues` returns before writing when the profile
 /// name is empty in a per-game configuration.
 pub fn save_per_game_control_values(path: &std::path::Path) -> io::Result<()> {
-    let contents = std::fs::read_to_string(path).unwrap_or_default();
+    let contents = read_configuration_for_update(path)?;
     let mut entries = Vec::new();
     {
         let settings = common::settings::values();
@@ -1373,12 +1407,13 @@ fn append_player_entries(entries: &mut Vec<(String, String)>, index: usize, play
     entries.push((format!("{prefix}profile_name"), player.profile_name.clone()));
 }
 
-/// Parse the `player_N_…` keys out of the `[Controls]` section.
+/// Parse player bindings and the global ring binding from `[Controls]`.
 ///
 /// Upstream writes each binding as a `key\default=` line followed by the value,
 /// quoted because the parameter string contains commas. Both the quotes and the
 /// companion `\default` line are handled here; keys whose `\default` is `true`
-/// still carry their value, so they are read like any other.
+/// still carry their value, so player keys are read like any other. The ring
+/// binding retains its marker for `ReadHidbusValues` default selection.
 pub fn parse_controls(contents: &str) -> std::collections::BTreeMap<String, String> {
     let mut values = std::collections::BTreeMap::new();
     let mut in_section = false;
@@ -1397,6 +1432,10 @@ pub fn parse_controls(contents: &str) -> std::collections::BTreeMap<String, Stri
         };
         let key = key.trim();
         // `key\default=` is metadata about the neighbouring key, not a binding.
+        if key == "ring_controller" || key == "ring_controller\\default" {
+            values.insert(key.to_string(), unquote(value.trim()).to_string());
+            continue;
+        }
         if key.ends_with("\\default") || !key.starts_with("player_") {
             continue;
         }
@@ -1431,7 +1470,7 @@ fn parse_profile_controls(contents: &str) -> std::collections::BTreeMap<String, 
     values
 }
 
-/// Replace the `player_N_…` lines of `contents` with `entries`.
+/// Replace player bindings and, when supplied, the global ring binding.
 ///
 /// The rewritten block is dropped where the first existing binding sat, so a
 /// hand-edited file keeps its shape; a file with no `[Controls]` section at all
@@ -1443,6 +1482,8 @@ pub fn replace_controls(contents: &str, entries: &[(String, String)]) -> String 
             return false;
         };
         key.trim().starts_with("player_")
+            || (entries.iter().any(|(key, _)| key == "ring_controller")
+                && matches!(key.trim(), "ring_controller" | "ring_controller\\default"))
     };
 
     let rendered: Vec<String> = entries
@@ -1654,7 +1695,118 @@ fn is_true(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_controller_bindings_survive_disk_reload() {
+        use super::*;
+        const CHILD: &str = "RUZU_TEST_DEBUG_BINDINGS_DISK";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "configuration::qt_config::tests::debug_controller_bindings_survive_disk_reload"])
+                .env(CHILD, root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .status().unwrap().success());
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        common::fs::path_util::set_ruzu_path(RuzuPath::ConfigDir, &root);
+        load_control_values();
+        let hid = hid_core::hid_core::HIDCore::new();
+        let controller = hid.get_emulated_controller_by_index(9);
+        let button = common::param_package::ParamPackage::from_serialized("engine:keyboard,code:71");
+        let stick = common::param_package::ParamPackage::from_serialized("engine:analog_from_button,left:engine$0keyboard$1code$065");
+        {
+            let mut controller = controller.lock();
+            controller.set_button_param(0, button.clone());
+            controller.set_stick_param(0, stick.clone());
+            controller.save_current_config();
+        }
+        save_control_values().unwrap();
+        let disk = parse_controls(&std::fs::read_to_string(config_path()).unwrap());
+        assert_eq!(disk["player_9_button_a"], button.serialize());
+        assert_eq!(disk["player_9_lstick"], stick.serialize());
+        {
+            let mut settings = common::settings::values_mut();
+            settings.players.get_value_mut()[9].buttons[0].clear();
+            settings.players.get_value_mut()[9].analogs[0].clear();
+        }
+        load_control_values();
+        let mut controller = controller.lock();
+        controller.reload_from_settings();
+        let loaded_button = controller.get_button_param(0);
+        assert_eq!(loaded_button.get_str("engine", ""), "keyboard");
+        assert_eq!(loaded_button.get_int("code", -1), 71);
+        let loaded_stick = controller.get_stick_param(0);
+        assert_eq!(loaded_stick.get_str("engine", ""), "analog_from_button");
+        assert_eq!(loaded_stick.get_str("left", ""), stick.get_str("left", ""));
+    }
+
+    #[test]
+    fn ring_binding_round_trip_defaults_and_replacement() {
+        use super::*;
+        let default = read_hidbus_values(&parse_controls(""));
+        let params = common::param_package::ParamPackage::from_serialized(&default);
+        assert_eq!(params.get_str("engine", ""), "analog_from_button");
+        for (direction, key) in [("left", b'A'), ("right", b'D')] {
+            let button = common::param_package::ParamPackage::from_serialized(&params.get_str(direction, ""));
+            assert_eq!(button.get_int("code", 0), key as i32);
+        }
+        for input in ["[Controls]\nring_controller=\"\"\n",
+             "[Controls]\nring_controller=\"engine:sdl,axis_x:3\"\n",
+            "[Controls]\nring_controller=\"engine:sdl,axis_x:3\"\nring_controller\\default=true\n"] {
+            let restored = read_hidbus_values(&parse_controls(input));
+            let restored = common::param_package::ParamPackage::from_serialized(&restored);
+            assert_eq!(restored.get_str("engine", ""), "analog_from_button");
+            assert_eq!(restored.get_float("modifier_scale", 0.0), 0.05);
+            for (direction, key) in [("left", b'A'), ("right", b'D')] {
+                let button = common::param_package::ParamPackage::from_serialized(&restored.get_str(direction, ""));
+                assert_eq!(button.get_int("code", 0), key as i32);
+            }
+        }
+        let binding = "engine:sdl,port:0,axis_x:3,axis_y:4,deadzone:0.25";
+        let mut entries = Vec::new();
+        save_hidbus_values(&mut entries, binding);
+        let contents = "[Controls]\nring_controller=old\nring_controller\\default=true\nmouse_enabled=true\n[Other]\nring_controller=unrelated\n";
+        let saved = replace_controls(contents, &entries);
+        assert_eq!(read_hidbus_values(&parse_controls(&saved)), binding);
+        assert!(saved.contains("mouse_enabled=true"));
+        assert!(saved.contains("[Other]\nring_controller=unrelated"));
+        assert_eq!(replace_controls(&saved, &entries), saved);
+        // Per-game/profile writes that do not own the ring binding preserve it.
+        assert!(replace_controls(&saved, &[]).contains(binding));
+    }
     use super::*;
+
+    #[test]
+    fn specialized_writers_preserve_unreadable_ini() {
+        const CHILD: &str = "RUZU_TEST_UNREADABLE_SETTINGS_WRITERS";
+        if let Some(root) = std::env::var_os(CHILD) {
+            common::fs::path_util::set_ruzu_path(RuzuPath::ConfigDir, Path::new(&root));
+            let path = config_path();
+            std::fs::write(&path, [0xff, 0xfe]).unwrap();
+            let writers: &[fn() -> io::Result<()>] = &[
+                save_global_values, save_shortcut_values, save_tas_values,
+                save_multiplayer_values, save_view_values, save_ui_language,
+                save_roms_path, save_favorites_expanded, save_control_values,
+                || save_external_content_dirs(&[]), || save_game_dirs(&[]),
+                || save_favorited_ids(&[]), || save_per_game_control_values(&config_path()),
+            ];
+            for (index, writer) in writers.iter().enumerate() {
+                assert!(writer().is_err(), "writer {index} accepted invalid UTF-8");
+                assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe]);
+            }
+            assert_eq!(read_configuration_for_update(&Path::new(&root).join("missing.ini")).unwrap(), "");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "configuration::qt_config::tests::specialized_writers_preserve_unreadable_ini", "--test-threads=1"])
+            .env(CHILD, root.path())
+            .status().unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn complete_reload_reads_core_and_frontend_in_an_isolated_process() {
@@ -1664,14 +1816,30 @@ mod tests {
             common::fs::path_util::set_ruzu_path(RuzuPath::ConfigDir, &root);
             let document = concat!(
                 "[Audio]\nvolume\\default=false\nvolume=42\n",
+                "audio_muted\\default=false\naudio_muted=true\n",
+                "muteWhenInBackground\\default=false\nmuteWhenInBackground=true\n",
                 "[UI]\nhideInactiveMouse\\default=false\nhideInactiveMouse=false\n",
                 "Paths\\gamedirs\\size=1\n",
                 "Paths\\gamedirs\\1\\path=/synthetic/homebrew\n",
+                "[Controls]\nring_controller\\default=false\n",
+                "ring_controller=\"engine:sdl,axis_x:3\"\n",
             );
             std::fs::write(config_path(), document).unwrap();
             reload_all_values();
             assert_eq!(*common::settings::values().volume.get_value(), 42);
+            {
+                let values = common::settings::values();
+                assert!(*values.audio_muted.get_value());
+                assert_eq!(common::settings::volume(&values), 0.0);
+            }
+            assert_eq!(common::settings::values().ringcon_analogs, "engine:sdl,axis_x:3");
+            common::settings::values_mut().ringcon_analogs = "engine:sdl,axis_x:4".into();
+            save_control_values().unwrap();
+            common::settings::values_mut().ringcon_analogs.clear();
+            load_control_values();
+            assert_eq!(common::settings::values().ringcon_analogs, "engine:sdl,axis_x:4");
             uisettings::with(|values| {
+                assert!(*values.mute_when_in_background.get_value());
                 assert!(!*values.hide_mouse.get_value());
                 assert_eq!(values.game_dirs.len(), 1);
                 assert_eq!(values.game_dirs[0].path, "/synthetic/homebrew");
@@ -1682,9 +1850,15 @@ mod tests {
             std::fs::write(config_path(), "").unwrap();
             reload_all_values();
             assert_eq!(*common::settings::values().volume.get_value(), 100);
+            {
+                let values = common::settings::values();
+                assert!(!*values.audio_muted.get_value());
+                assert_eq!(common::settings::volume(&values), 1.0);
+            }
             uisettings::with(|values| {
+                assert!(!*values.mute_when_in_background.get_value());
                 assert!(*values.hide_mouse.get_value());
-                assert!(values.game_dirs.is_empty());
+                assert_eq!(values.game_dirs.iter().map(|dir| dir.path.as_str()).collect::<Vec<_>>(), ["SDMC", "UserNAND", "SysNAND"]);
             });
             return;
         }
@@ -1740,6 +1914,20 @@ mod tests {
     }
 
     #[test]
+    fn empty_game_directory_array_uses_installed_roots_and_legacy_path() {
+        let defaults = game_dirs_with_defaults("");
+        assert_eq!(defaults.iter().map(|dir| dir.path.as_str()).collect::<Vec<_>>(), ["SDMC", "UserNAND", "SysNAND"]);
+        assert!(defaults.iter().all(|dir| dir.expanded && !dir.deep_scan));
+        let legacy = game_dirs_with_defaults("[UI]\nPaths\\gameListRootDir=/homebrew\nPaths\\gameListRootDir\\default=false\nPaths\\gameListDeepScan=true\nPaths\\gameListDeepScan\\default=false\n");
+        assert_eq!(legacy.len(), 4);
+        assert_eq!(legacy[3].path, "/homebrew");
+        assert!(legacy[3].deep_scan);
+        let existing = game_dirs_with_defaults("[UI]\nPaths\\gamedirs\\size=1\nPaths\\gamedirs\\1\\path=/homebrew\n");
+        assert_eq!(existing.len(), 1, "do not replace an explicitly configured list");
+        assert!(parse_game_dirs("").is_empty(), "source import does not synthesize directories");
+    }
+
+    #[test]
     fn frontend_reader_honors_defaults_legacy_bools_and_upstream_plain_paths() {
         let mut values = uisettings::Values::default();
         read_ui_values(concat!("[UI]\n",
@@ -1764,6 +1952,16 @@ mod tests {
         std::fs::write(&path, [0xff, 0xfe]).unwrap();
         assert!(save_view_values_to(&path).is_err());
         assert_eq!(std::fs::read(path).unwrap(), [0xff, 0xfe]);
+    }
+
+    #[test]
+    fn saving_tas_preserves_unreadable_configuration() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert!(save_tas_values_to(temporary.path()).is_err());
+        let path = temporary.path().join("invalid.ini");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(save_tas_values_to(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe]);
     }
 
     #[test]
@@ -2338,6 +2536,61 @@ mod tests {
             24873
         );
         assert!(contents.contains("Unrelated=value"));
+    }
+
+    #[test]
+    fn hosting_settings_and_ban_arrays_round_trip_and_shrink() {
+        let mut source = uisettings::Values::default();
+        source.multiplayer_room_nickname.set_value("SyntheticHost".into());
+        source.multiplayer_room_name.set_value("Synthetic room".into());
+        source.multiplayer_max_player.set_value(4);
+        source.multiplayer_room_port.set_value(25000);
+        source.multiplayer_host_type.set_value(1);
+        source.multiplayer_game_id.set_value(u64::MAX);
+        source.multiplayer_room_description.set_value("First line\n[Core]\nuse_multi_core=false\nbackslash \\n and \"quotes\" é".into());
+        source.multiplayer_ban_list = (vec!["UserOne".into(), "UserTwo".into()],
+            vec!["192.0.2.1".into(), "192.0.2.2".into()]);
+        let untouched = "[Renderer]\nbackend=1\n[UI]\nUnrelated=value\n";
+        let document = write_multiplayer_values(untouched, &mut source);
+        assert!(document.contains("backend=1"));
+        assert!(document.contains("Unrelated=value"));
+        assert!(!document.lines().any(|line| line == "[Core]"));
+        assert!(!document.lines().any(|line| line == "use_multi_core=false"));
+        // Verified against Qt6 QSettings's actual INI output, not only our
+        // own reader/writer agreeing with each other.
+        assert!(document.contains(r#"Multiplayer\room_description="First line\n[Core]\nuse_multi_core=false\nbackslash \\n and \"quotes\" é""#));
+        assert!(document.contains("Multiplayer\\ip_ban_list\\2\\ip=192.0.2.2"));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("qt-config.ini");
+        std::fs::write(&path, &document).unwrap();
+        let mut restored = uisettings::Values::default();
+        read_multiplayer_values(&std::fs::read_to_string(path).unwrap(), &mut restored);
+        let mut expected = std::collections::BTreeMap::new();
+        source.for_each_multiplayer_setting_mut(|setting| {
+            expected.insert(setting.label().to_owned(), setting.to_string_global());
+        });
+        restored.for_each_multiplayer_setting_mut(|setting| {
+            assert_eq!(setting.to_string_global(), expected[setting.label()], "{}", setting.label());
+        });
+        assert_eq!(restored.multiplayer_ban_list, source.multiplayer_ban_list);
+        source.multiplayer_ban_list = (Vec::new(), vec!["192.0.2.3".into()]);
+        let document = write_multiplayer_values(&document, &mut source);
+        assert!(!document.contains("192.0.2.1"));
+        assert!(!document.contains("192.0.2.2"));
+        assert!(!document.contains("UserOne"));
+        read_multiplayer_values(&document, &mut restored);
+        assert_eq!(restored.multiplayer_ban_list, source.multiplayer_ban_list);
+        read_multiplayer_values("[UI]\n", &mut restored);
+        assert_eq!(*restored.multiplayer_max_player.get_value(), 8);
+        assert_eq!(*restored.multiplayer_room_port.get_value(), 24872);
+        assert!(restored.multiplayer_ban_list.1.is_empty());
+        read_multiplayer_values(concat!("[UI]\n",
+            "Multiplayer\\filter_games_owned\\default=false\nMultiplayer\\filter_games_owned=1\n",
+            "Multiplayer\\max_player\\default=false\nMultiplayer\\max_player=255\n",
+            "Multiplayer\\host_type\\default=false\nMultiplayer\\host_type=255\n"), &mut restored);
+        assert!(*restored.multiplayer_filter_games_owned.get_value());
+        assert_eq!(*restored.multiplayer_max_player.get_value(), 8);
+        assert_eq!(*restored.multiplayer_host_type.get_value(), 1);
     }
 
     #[test]

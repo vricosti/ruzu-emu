@@ -134,17 +134,16 @@ impl Packet {
     }
 
     pub fn read_string(&mut self) -> Option<String> {
+        self.read_string_bytes()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Packet::Read(std::string&): protocol strings are bytes, not necessarily
+    /// UTF-8 (notably after the server's byte-count chat truncation). Text-only
+    /// consumers use read_string; relays must preserve the original bytes.
+    pub fn read_string_bytes(&mut self) -> Option<Vec<u8>> {
         let length = self.read_u32()? as usize;
-        if length == 0 {
-            return Some(String::new());
-        }
-        if !self.check_size(length) {
-            return None;
-        }
-        let s =
-            String::from_utf8_lossy(&self.data[self.read_pos..self.read_pos + length]).into_owned();
-        self.read_pos += length;
-        Some(s)
+        self.read_raw(length)
     }
 
     pub fn read_vec_u8(&mut self) -> Option<Vec<u8>> {
@@ -222,10 +221,15 @@ impl Packet {
     }
 
     pub fn write_string(&mut self, value: &str) {
+        self.write_string_bytes(value.as_bytes());
+    }
+
+    /// Packet::Write(const std::string&), including embedded NUL/invalid UTF-8.
+    pub fn write_string_bytes(&mut self, value: &[u8]) {
         let length = value.len() as u32;
         self.write_u32(length);
         if length > 0 {
-            self.data.extend_from_slice(value.as_bytes());
+            self.data.extend_from_slice(&value[..length as usize]);
         }
     }
 
@@ -263,6 +267,43 @@ impl Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_strings_preserve_arbitrary_bytes_and_byte_truncation() {
+        let bytes = [b'a', 0, 0xff, 0xc3];
+        let mut packet = Packet::new();
+        packet.write_string_bytes(&bytes);
+        assert_eq!(packet.get_data(), &[0, 0, 0, 4, b'a', 0, 0xff, 0xc3]);
+        assert_eq!(packet.read_string_bytes().unwrap(), bytes);
+        assert!(packet.end_of_packet());
+        assert!(packet.is_valid());
+
+        // A byte limit may cut a multibyte character. Forward those bytes just
+        // as std::string::resize does, without inserting replacement characters.
+        let mut message = vec![b'a'; 499];
+        message.extend_from_slice("é".as_bytes());
+        message.truncate(500);
+        packet.clear();
+        packet.write_string_bytes(&message);
+        assert_eq!(packet.read_string_bytes().unwrap(), message);
+    }
+
+    #[test]
+    fn protocol_string_lengths_preserve_packet_failure_state() {
+        let mut packet = Packet::new();
+        packet.write_string_bytes(&[]);
+        packet.write_u32(3);
+        packet.append(&[1, 2]);
+        assert_eq!(packet.read_string_bytes(), Some(Vec::new()));
+        assert_eq!(packet.read_string_bytes(), None);
+        assert!(!packet.is_valid());
+        packet.append(&[3]);
+        assert_eq!(packet.read_string_bytes(), None);
+        packet.clear();
+        packet.append(&[0, 0]);
+        assert_eq!(packet.read_string_bytes(), None);
+        assert!(!packet.is_valid());
+    }
 
     #[test]
     fn test_write_read_u8() {

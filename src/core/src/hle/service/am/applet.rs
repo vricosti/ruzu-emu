@@ -47,6 +47,7 @@ pub struct Applet {
     pub terminate_result: u32,
     pub display_logical_width: i32,
     pub display_logical_height: i32,
+    pub display_magnification: common::math_util::Rectangle<f32>,
     pub home_button_double_click_enabled: bool,
     pub home_button_short_pressed_blocked: bool,
     pub home_button_long_pressed_blocked: bool,
@@ -71,6 +72,7 @@ pub struct Applet {
     pub request_exit_to_library_applet_at_execute_next_program_enabled: bool,
 
     // Channels
+    pub friend_invitation_storage_channel: Vec<Vec<u8>>,
     pub user_channel_launch_parameter: std::collections::VecDeque<Vec<u8>>,
     pub preselected_user_launch_parameter: std::collections::VecDeque<Vec<u8>>,
 
@@ -143,6 +145,7 @@ impl Applet {
             terminate_result: 0,
             display_logical_width: 0,
             display_logical_height: 0,
+            display_magnification: common::math_util::Rectangle::new(0.0, 0.0, 1.0, 1.0),
             home_button_double_click_enabled: false,
             home_button_short_pressed_blocked: false,
             home_button_long_pressed_blocked: false,
@@ -161,6 +164,7 @@ impl Applet {
             vr_mode_enabled: false,
             lcd_backlight_off_enabled: false,
             request_exit_to_library_applet_at_execute_next_program_enabled: false,
+            friend_invitation_storage_channel: Vec::new(),
             user_channel_launch_parameter: std::collections::VecDeque::new(),
             preselected_user_launch_parameter: std::collections::VecDeque::new(),
             caller_applet: Weak::new(),

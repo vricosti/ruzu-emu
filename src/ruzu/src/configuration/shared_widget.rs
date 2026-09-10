@@ -238,6 +238,62 @@ pub fn check_row(label: &str, active: bool) -> gtk::CheckButton {
     check
 }
 
+/// Counterpart of Widget::CreateHexEdit's eight-digit hexadecimal validator.
+pub fn create_hex_edit(value: u32) -> gtk::Entry {
+    let entry = gtk::Entry::new();
+    entry.set_max_length(8);
+    entry.set_text(&format!("{value:08X}"));
+    entry.connect_insert_text(|entry, text, _position| {
+        if !hex_edit_text_is_valid(text) {
+            entry.stop_signal_emission_by_name("insert-text");
+        }
+    });
+    entry
+}
+
+fn hex_edit_text_is_valid(text: &str) -> bool {
+    text.len() <= 8 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod hex_edit_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn hex_entry_rejects_invalid_insertions_and_bounds_complete_text() {
+        gtk::init().expect("GTK display required");
+        let entry = create_hex_edit(u32::MAX);
+        assert_eq!(entry.text().as_str(), "FFFFFFFF");
+        entry.delete_text(0, -1);
+        assert_eq!(entry.text().as_str(), "");
+        let mut position = 0;
+        entry.insert_text("abcd", &mut position);
+        assert_eq!(entry.text().as_str(), "abcd");
+        for invalid in ["G", "0x12", "-1", " ", "é"] {
+            entry.insert_text(invalid, &mut position);
+            assert_eq!(entry.text().as_str(), "abcd");
+        }
+        entry.insert_text("1234", &mut position);
+        assert_eq!(entry.text().as_str(), "abcd1234");
+        entry.insert_text("F", &mut position);
+        assert_eq!(entry.text().as_str(), "abcd1234");
+        entry.delete_text(0, -1);
+        entry.insert_text("00000000", &mut 0);
+        assert_eq!(entry.text().as_str(), "00000000");
+    }
+
+    #[test]
+    fn matches_upstream_hex_validator() {
+        for text in ["", "0", "00000000", "FFFFFFFF", "abcdef01"] {
+            assert!(hex_edit_text_is_valid(text), "{text:?}");
+        }
+        for text in ["100000000", "0x12", "-1", "+1", " 12", "12 ", "G", "é", "１２"] {
+            assert!(!hex_edit_text_is_valid(text), "{text:?}");
+        }
+    }
+}
+
 /// Text entry row — upstream `ConfigurationShared::Widget::CreateLineEdit`.
 pub fn entry_row(label: &str, text: &str) -> (gtk::Box, gtk::Entry) {
     let entry = gtk::Entry::new();

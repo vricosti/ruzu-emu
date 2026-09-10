@@ -7,6 +7,7 @@
 //! Qt signals, the channel keeps all window ownership on GTK's main thread.
 
 use std::cell::RefCell;
+use gtk::prelude::Cast;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -117,7 +118,7 @@ struct ActiveDialog {
 /// GTK-main-thread owner corresponding to Eden's `MainWindow` error-display
 /// slots and `OverlayDialog` lifetime.
 pub(crate) struct ErrorAppletFrontend {
-    parent: gtk::ApplicationWindow,
+    parent: RefCell<gtk::Window>,
     hid_core: Arc<Mutex<HIDCore>>,
     receiver: Receiver<ErrorAppletRequest>,
     active: RefCell<Option<ActiveDialog>>,
@@ -130,11 +131,18 @@ impl ErrorAppletFrontend {
         receiver: Receiver<ErrorAppletRequest>,
     ) -> Rc<Self> {
         Rc::new(Self {
-            parent: parent.clone(),
+            parent: RefCell::new(parent.clone().upcast()),
             hid_core,
             receiver,
             active: RefCell::new(None),
         })
+    }
+
+    /// ErrorDisplayDisplayError parents the overlay to GRenderWindow upstream.
+    pub(crate) fn set_parent(&self, parent: &gtk::Window) {
+        *self.parent.borrow_mut() = parent.clone();
+        let dialog = self.active.borrow().as_ref().map(|active| active.dialog.clone());
+        if let Some(dialog) = dialog { dialog.set_parent(parent); }
     }
 
     pub(crate) fn start(self: &Rc<Self>) {
@@ -167,7 +175,7 @@ impl ErrorAppletFrontend {
         self.finish_active(false);
 
         let dialog = crate::overlay_dialog::ErrorOverlayDialog::new(
-            &self.parent,
+            &self.parent.borrow().clone(),
             Arc::clone(&self.hid_core),
             &error_code,
             &error_text,

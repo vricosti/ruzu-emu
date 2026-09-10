@@ -39,7 +39,7 @@ pub fn show(
 
     let nickname_value = crate::uisettings::with(|v| v.multiplayer_nickname.get_value().clone());
     let nickname_value = if nickname_value.is_empty() {
-        let web_username = common::settings::values().yuzu_username.get_value().clone();
+        let web_username = common::settings::values().eden_username.get_value().clone();
         if web_username.is_empty() {
             nickname_value
         } else {
@@ -156,7 +156,7 @@ pub fn show(
                 v.multiplayer_nickname.set_value(nickname_text.clone())
             });
             crate::uisettings::with_mut(|v| v.multiplayer_ip.set_value(address_text.clone()));
-            crate::uisettings::with_mut(|v| v.multiplayer_port.set_value(port_value as u32));
+            crate::uisettings::with_mut(|v| v.multiplayer_port.set_value(port_value));
             if let Err(error) = crate::configuration::qt_config::save_multiplayer_values() {
                 log::error!("Could not save multiplayer settings: {error}");
             }

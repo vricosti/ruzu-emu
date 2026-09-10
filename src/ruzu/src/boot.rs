@@ -70,6 +70,8 @@ impl Default for BootParameters {
 }
 
 enum EmulationCommand {
+    DockedModeChanged { last: bool, new: bool, completed: SyncSender<()> },
+    ToggleRenderdocCapture,
     Stop,
     ForceStop,
     Pause(SyncSender<()>),
@@ -79,7 +81,7 @@ enum EmulationCommand {
     /// `System` is owned by the boot thread in Reden, so the GTK thread must
     /// marshal `Renderer().RefreshBaseSettings()` to that owner instead of
     /// touching the renderer directly.
-    ApplyRendererSettings(SyncSender<()>),
+    ApplySettings(SyncSender<()>),
     CaptureScreenshot {
         path: std::path::PathBuf,
         layout: FramebufferLayout,
@@ -302,6 +304,21 @@ impl EmulationSession {
         })
     }
 
+    /// Marshal the upstream frontend API call to the System-owning thread.
+    pub fn toggle_renderdoc_capture(&self) -> bool {
+        self.command_tx.as_ref().is_some_and(|tx| {
+            tx.send(EmulationCommand::ToggleRenderdocCapture).is_ok()
+        })
+    }
+
+    pub fn docked_mode_changed(&self, last: bool, new: bool) -> bool {
+        if last == new { return true; }
+        let Some(tx) = self.command_tx.as_ref() else { return false; };
+        let (completed, result) = std::sync::mpsc::sync_channel(0);
+        tx.send(EmulationCommand::DockedModeChanged { last, new, completed }).is_ok()
+            && result.recv().is_ok()
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
     }
@@ -338,19 +355,19 @@ impl EmulationSession {
         completed
     }
 
-    /// Apply live graphics settings to the active renderer.
+    /// Apply live time and graphics settings, following System::ApplySettings.
     ///
     /// Upstream `ConfigureDialog::ApplyConfiguration()` calls
-    /// `Core::System::ApplySettings()`, whose renderer-side operation is
-    /// `Renderer().RefreshBaseSettings()`. The renderer lives on Reden's boot
+    /// `Core::System::ApplySettings()`: RefreshTime precedes
+    /// `Renderer().RefreshBaseSettings()`. The renderer lives on Ruzu's boot
     /// thread, so this synchronous command preserves the same ordering before
     /// the configuration dialog reports that applying has completed.
-    pub fn apply_renderer_settings(&self) -> bool {
+    pub fn apply_settings(&self) -> bool {
         let Some(tx) = self.command_tx.as_ref() else {
             return false;
         };
         let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(0);
-        tx.send(EmulationCommand::ApplyRendererSettings(completed_tx))
+        tx.send(EmulationCommand::ApplySettings(completed_tx))
             .is_ok()
             && completed_rx.recv().is_ok()
     }
@@ -995,6 +1012,17 @@ fn run_boot(
             Ok(EmulationCommand::CaptureScreenshot { path, layout }) => {
                 request_screenshot(&system, path, layout);
             }
+            Ok(EmulationCommand::ToggleRenderdocCapture) => {
+                if *common::settings::values().enable_renderdoc_hotkey.get_value() {
+                    if let Some(api) = system.get_renderdoc_api() {
+                        api.toggle_capture();
+                    }
+                }
+            }
+            Ok(EmulationCommand::DockedModeChanged { last, new, completed }) => {
+                crate::configuration::configure_input::on_docked_mode_changed(last, new, &system);
+                let _ = completed.send(());
+            }
             Ok(EmulationCommand::Pause(completed)) => {
                 system.pause();
                 let _ = completed.send(());
@@ -1003,7 +1031,8 @@ fn run_boot(
                 system.run();
                 let _ = completed.send(());
             }
-            Ok(EmulationCommand::ApplyRendererSettings(completed)) => {
+            Ok(EmulationCommand::ApplySettings(completed)) => {
+                system.refresh_time();
                 if let Some(gpu) = system
                     .gpu_core()
                     .and_then(|gpu| gpu.as_any().downcast_ref::<video_core::gpu::Gpu>())
@@ -1349,6 +1378,61 @@ mod tests {
         assert!(frontend_stop_requested.load(Ordering::Acquire));
         assert!(matches!(command_rx.recv(), Ok(EmulationCommand::ForceStop)));
         assert!(!session.request_force_stop());
+    }
+
+    #[test]
+    fn renderdoc_requests_are_marshaled_and_rejected_after_stop() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let mut session = EmulationSession {
+            command_tx: Some(command_tx),
+            join: None,
+            perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
+            shaders_building: Arc::new(AtomicI32::new(0)),
+            running: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            program_id: Arc::new(AtomicU64::new(0)),
+            exit_locked: Arc::new(AtomicBool::new(false)),
+            frontend_stop_requested: Arc::new(AtomicBool::new(false)),
+        };
+        for _ in 0..2 {
+            assert!(session.toggle_renderdoc_capture());
+            assert!(matches!(command_rx.recv(), Ok(EmulationCommand::ToggleRenderdocCapture)));
+        }
+        assert!(session.request_stop());
+        assert!(matches!(command_rx.recv(), Ok(EmulationCommand::Stop)));
+        assert!(!session.toggle_renderdoc_capture());
+    }
+
+    #[test]
+    fn docked_mode_notifications_skip_unchanged_state_and_acknowledge_delivery() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let mut session = EmulationSession {
+            command_tx: Some(command_tx), join: None,
+            perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
+            shaders_building: Arc::new(AtomicI32::new(0)),
+            running: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            program_id: Arc::new(AtomicU64::new(0)),
+            exit_locked: Arc::new(AtomicBool::new(false)),
+            frontend_stop_requested: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(session.docked_mode_changed(false, false));
+        assert!(matches!(command_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        let worker = std::thread::spawn(move || {
+            for expected in [(false, true), (true, false)] {
+                let command = command_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let EmulationCommand::DockedModeChanged { last, new, completed } = command else {
+                    panic!("wrong command");
+                };
+                assert_eq!((last, new), expected);
+                completed.send(()).unwrap();
+            }
+        });
+        assert!(session.docked_mode_changed(false, true));
+        assert!(session.docked_mode_changed(true, false));
+        worker.join().unwrap();
+        session.command_tx.take();
+        assert!(!session.docked_mode_changed(false, true));
     }
 
     #[test]

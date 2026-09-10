@@ -263,6 +263,9 @@ impl EffectInfoBase {
                         address,
                     )
                 }
+                EffectType::Reverb => {
+                    crate::renderer::command::effect::reverb::drop_reverb_workbuffer(address)
+                }
                 _ => {}
             }
         }

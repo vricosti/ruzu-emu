@@ -18,7 +18,7 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 20: PushToAppletBoundChannel (unimplemented)
 /// - 21: TryPopFromAppletBoundChannel (unimplemented)
 /// - 40: GetDisplayLogicalResolution (unimplemented)
-/// - 42: SetDisplayMagnification (unimplemented)
+/// - 42: SetDisplayMagnification
 /// - 50: SetHomeButtonDoubleClickEnabled
 /// - 51: GetHomeButtonDoubleClickEnabled
 /// - 52: IsHomeButtonShortPressedBlocked (unimplemented)
@@ -33,6 +33,7 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// - 100: SetApplicationCoreUsageMode (unimplemented)
 /// - 300: GetCurrentApplicationId
 pub struct IAppletCommonFunctions {
+    system: crate::core::SystemRef,
     applet: Option<std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
@@ -47,7 +48,7 @@ impl IAppletCommonFunctions {
             (20, None, "PushToAppletBoundChannel"),
             (21, None, "TryPopFromAppletBoundChannel"),
             (40, None, "GetDisplayLogicalResolution"),
-            (42, None, "SetDisplayMagnification"),
+            (42, Some(Self::set_display_magnification_handler), "SetDisplayMagnification"),
             (
                 50,
                 Some(Self::set_home_button_double_click_enabled_handler),
@@ -85,8 +86,13 @@ impl IAppletCommonFunctions {
                 Some(Self::get_current_application_id_handler),
                 "GetCurrentApplicationId",
             ),
+            (310, None, "IsSystemAppletHomeMenu"),
+            (320, Some(Self::set_gpu_time_slice_boost), "SetGpuTimeSliceBoost"),
+            (321, None, "SetGpuTimeSliceBoostDueToApplication"),
+            (350, Some(Self::unknown350), "Unknown350"),
         ]);
         Self {
+            system: crate::core::SystemRef::null(),
             applet: None,
             handlers,
             handlers_tipc: BTreeMap::new(),
@@ -94,6 +100,7 @@ impl IAppletCommonFunctions {
     }
 
     pub fn with_applet(
+        system: crate::core::SystemRef,
         applet: std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>,
     ) -> Self {
         let handlers = build_handler_map(&[
@@ -103,7 +110,7 @@ impl IAppletCommonFunctions {
             (20, None, "PushToAppletBoundChannel"),
             (21, None, "TryPopFromAppletBoundChannel"),
             (40, None, "GetDisplayLogicalResolution"),
-            (42, None, "SetDisplayMagnification"),
+            (42, Some(Self::set_display_magnification_handler), "SetDisplayMagnification"),
             (
                 50,
                 Some(Self::set_home_button_double_click_enabled_handler),
@@ -141,12 +148,47 @@ impl IAppletCommonFunctions {
                 Some(Self::get_current_application_id_handler),
                 "GetCurrentApplicationId",
             ),
+            (310, None, "IsSystemAppletHomeMenu"),
+            (320, Some(Self::set_gpu_time_slice_boost), "SetGpuTimeSliceBoost"),
+            (321, None, "SetGpuTimeSliceBoostDueToApplication"),
+            (350, Some(Self::unknown350), "Unknown350"),
         ]);
         Self {
+            system,
             applet: Some(applet),
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn set_gpu_time_slice_boost(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let time_span = RequestParser::new(ctx).pop_i64();
+        log::warn!("(STUBBED) SetGpuTimeSliceBoost called, time_span={}", time_span);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn set_display_magnification_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const IAppletCommonFunctions) };
+        let mut rp = RequestParser::new(ctx);
+        let x = rp.pop_f32();
+        let y = rp.pop_f32();
+        let width = rp.pop_f32();
+        let height = rp.pop_f32();
+        if let Some(applet) = &service.applet {
+            applet.lock().unwrap().display_magnification =
+                common::math_util::Rectangle::new(x, y, x + width, y + height);
+        }
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn unknown350(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) Unknown350 called");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u16(0);
     }
 
     /// Port of IAppletCommonFunctions::SetHomeButtonDoubleClickEnabled
@@ -173,10 +215,10 @@ impl IAppletCommonFunctions {
 
     /// Port of IAppletCommonFunctions::GetCurrentApplicationId
     pub fn get_current_application_id(&self) -> u64 {
-        let program_id = if let Some(ref applet) = self.applet {
-            applet.lock().unwrap().program_id
-        } else {
+        let program_id = if self.system.is_null() {
             0
+        } else {
+            self.system.get().get_application_process_program_id()
         };
         log::debug!("GetCurrentApplicationId: {:016X}", program_id & !0xFFF);
         program_id & !0xFFF
@@ -244,6 +286,67 @@ impl SessionRequestHandler for IAppletCommonFunctions {
 
     fn service_name(&self) -> &str {
         "am::IAppletCommonFunctions"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::SystemRef;
+    use crate::hle::service::am::applet::Applet;
+    use crate::hle::service::os::process::Process;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn current_application_id_does_not_report_the_library_applet_program() {
+        let mut system = Box::new(crate::core::System::new_for_test());
+        let mut process = crate::hle::kernel::k_process::KProcess::new();
+        process.program_id = 0x1234_5678_9abc_def0;
+        system.set_current_process_arc(Arc::new(crate::hle::kernel::k_process::ProcessLock::new(process)));
+        let system_ref = SystemRef::from_ref(&system);
+        let mut applet = Applet::new(SystemRef::null(), Process::new(), false);
+        applet.program_id = 0x4321_0000_0000_1111;
+        let service = IAppletCommonFunctions::with_applet(system_ref, Arc::new(Mutex::new(applet)));
+        let mut ctx = HLERequestContext::new();
+        service.handlers()[&300].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+        assert_eq!(ctx.cmd_buf[8], 0x9abc_d000);
+        assert_eq!(ctx.cmd_buf[9], 0x1234_5678);
+    }
+
+    #[test]
+    fn display_magnification_preserves_signed_extents_and_applet_ownership() {
+        let applet = Arc::new(Mutex::new(Applet::new(SystemRef::null(), Process::new(), false)));
+        assert_eq!(applet.lock().unwrap().display_magnification,
+            common::math_util::Rectangle::new(0.0, 0.0, 1.0, 1.0));
+        let service = IAppletCommonFunctions::with_applet(SystemRef::null(), applet.clone());
+        let mut ctx = HLERequestContext::new();
+        ctx.cmd_buf[2..6].copy_from_slice(&[-2.0_f32, 3.0, 0.5, -4.0].map(f32::to_bits));
+        service.handlers()[&42].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+        assert_eq!(applet.lock().unwrap().display_magnification,
+            common::math_util::Rectangle::new(-2.0, 3.0, -1.5, -1.0));
+    }
+
+    #[test]
+    fn firmware_common_commands_return_upstream_payloads_in_both_constructors() {
+        let applet = Arc::new(Mutex::new(Applet::new(SystemRef::null(), Process::new(), false)));
+        for service in [IAppletCommonFunctions::new(), IAppletCommonFunctions::with_applet(SystemRef::null(), applet)] {
+            let mut ctx = HLERequestContext::new();
+            ctx.cmd_buf.fill(u32::MAX);
+            service.handlers()[&350].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+            assert_eq!(ctx.cmd_buf[8], 0);
+            assert_eq!(ctx.cmd_buf[0], 0);
+            for time_span in [0_i64, -1, i64::MIN, i64::MAX] {
+                let mut ctx = HLERequestContext::new();
+                ctx.cmd_buf[2] = time_span as u32;
+                ctx.cmd_buf[3] = (time_span as u64 >> 32) as u32;
+                service.handlers()[&320].handler_callback.unwrap()(&service, &mut ctx);
+                assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+                assert_eq!(ctx.cmd_buf[1] & 0x3ff, 10);
+            }
+        }
     }
 }
 

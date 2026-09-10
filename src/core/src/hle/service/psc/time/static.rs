@@ -962,7 +962,7 @@ impl StaticService {
     ) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
-        let type_val = rp.pop_u32();
+        let type_val = rp.pop_u8();
         let type_ = match type_val {
             0 => TimeType::UserSystemClock,
             1 => TimeType::NetworkSystemClock,
@@ -971,6 +971,8 @@ impl StaticService {
         };
 
         // Read user_context and network_context from inline parameters.
+        // CMIF aligns SystemClockContext to eight bytes after the u8 TimeType.
+        rp.align_for::<SystemClockContext>();
         let user_context: SystemClockContext = rp.pop_raw();
         let network_context: SystemClockContext = rp.pop_raw();
 

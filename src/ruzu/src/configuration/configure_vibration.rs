@@ -127,6 +127,7 @@ pub fn present(
             .enable_accurate_vibrations
             .get_value(),
     );
+    accurate.set_sensitive(common::settings::is_configuring_global());
     content.append(&accurate);
 
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -260,6 +261,38 @@ fn stop_vibrations(controllers: &[EmulatedControllerHandle]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display; run alone in its own test process"]
+    fn accurate_vibration_is_editable_only_in_global_configuration() {
+        gtk::init().expect("GTK display required");
+        fn find_accurate(widget: &gtk::Widget) -> Option<gtk::CheckButton> {
+            if let Some(check) = widget.downcast_ref::<gtk::CheckButton>() {
+                if check.label().as_deref() == Some("Enable accurate vibrations") {
+                    return Some(check.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if let Some(check) = find_accurate(&widget) { return Some(check); }
+            }
+            None
+        }
+        let source = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let core = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        for global in [true, false] {
+            common::settings::set_configuring_global(global);
+            present(&source, Arc::clone(&core));
+            let window = gtk::Window::list_toplevels().into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+                .find(|window| window.title().as_deref() == Some("Configure Vibration"))
+                .unwrap();
+            assert_eq!(find_accurate(window.upcast_ref()).unwrap().is_sensitive(), global);
+            window.close();
+        }
+        common::settings::set_configuring_global(true);
+    }
 
     #[test]
     fn vibration_dialog_covers_all_upstream_player_slots() {

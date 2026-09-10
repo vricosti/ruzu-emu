@@ -11,6 +11,8 @@ pub struct DecodedArm {
 /// ARM instruction identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArmInstId {
+    CRC32,
+    CRC32C,
     // Data processing - immediate
     AndImm,
     EorImm,
@@ -269,6 +271,7 @@ pub enum ArmInstId {
     // ASIMD
     AsimdVmovImm,
     AsimdVmovn,
+    AsimdVqmovn,
     AsimdVrhadd,
     AsimdVqrdmulh,
     AsimdVmulFloat,
@@ -292,6 +295,8 @@ pub enum ArmInstId {
     AsimdVrecpe,
     AsimdVrsqrte,
     AsimdVcvtInteger,
+    AsimdVcvtFixed,
+    AsimdVshll,
     AsimdVmaxFloat,
     AsimdVminFloat,
     AsimdVtrn,
@@ -505,7 +510,11 @@ pub fn decode_arm(instr: u32) -> DecodedArm {
     // Upstream arm.inc lists the architectural hint encodings before the
     // data-processing-immediate family. The low-nibble values 6..=15 are
     // reserved hints and, like upstream's catch-all entry, decode as NOP.
-    let id = if matches_arm(instr, 0x0FFF_FFF0, 0x0320_F000) {
+    let id = if matches_arm(instr, 0x0F90_0FF0, 0x0100_0040) {
+        ArmInstId::CRC32
+    } else if matches_arm(instr, 0x0F90_0FF0, 0x0100_0240) {
+        ArmInstId::CRC32C
+    } else if matches_arm(instr, 0x0FFF_FFF0, 0x0320_F000) {
         match instr & 0xF {
             0 => ArmInstId::NOP,
             1 => ArmInstId::YIELD,
@@ -743,6 +752,8 @@ fn decode_arm_unconditional(instr: u32) -> ArmInstId {
         _ if matches_arm(instr, 0xFFB3_0F90, 0xF3B2_0180) => ArmInstId::AsimdVzip,
         // VMOVN:        111100111D11zz10dddd001000M0mmmm
         _ if matches_arm(instr, 0xFFB3_0FD0, 0xF3B2_0200) => ArmInstId::AsimdVmovn,
+        // VQMOVN: 111100111D11zz10dddd00101oM0mmmm
+        _ if matches_arm(instr, 0xFFB3_0F90, 0xF3B2_0280) => ArmInstId::AsimdVqmovn,
         // VCGT (zero):  111100111D11zz01dddd0F000QM0mmmm
         _ if matches_arm(instr, 0xFFB3_0B90, 0xF3B1_0000) => ArmInstId::AsimdVcgtZero,
         // VCGE (zero):  111100111D11zz01dddd0F001QM0mmmm
@@ -773,6 +784,10 @@ fn decode_arm_unconditional(instr: u32) -> ArmInstId {
         _ if matches_arm(instr, 0xFFB3_0F90, 0xF3B1_0300) => ArmInstId::AsimdVabsInt,
         // VCVT_integer: 111100111D11zz11dddd011oUQM0mmmm
         _ if matches_arm(instr, 0xFFB3_0E10, 0xF3B3_0600) => ArmInstId::AsimdVcvtInteger,
+        // VCVT (fixed-point): 1111001U1Diiiiiidddd111o0QM1mmmm
+        _ if matches_arm(instr, 0xFE80_0E90, 0xF280_0E10) => ArmInstId::AsimdVcvtFixed,
+        // VSHLL (including the zero-shift VMOVL alias).
+        _ if matches_arm(instr, 0xFE80_0FD0, 0xF280_0A10) => ArmInstId::AsimdVshll,
         // Generic coprocessor instructions in the unconditional encoding space.
         // Specific VFP/ASIMD encodings above retain priority, matching Eden's
         // DecodeVFP/DecodeASIMD-before-DecodeArm dispatch order.

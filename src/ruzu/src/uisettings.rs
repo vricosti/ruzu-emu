@@ -24,6 +24,120 @@ use common::settings_enums::{Category, ConfirmStop};
 /// Upstream `UISettings::values.is_game_list_reload_pending`.
 static GAME_LIST_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// UISettings::CalculateWidth. Integer truncation and unsigned multiplication
+/// match upstream. Stretch has no window geometry here and falls back to 16:9;
+/// the render-window caller can use its live aspect instead.
+pub(crate) fn calculate_width(height: u32, ratio: common::settings_enums::AspectRatio) -> u32 {
+    use common::settings_enums::AspectRatio;
+    let (numerator, denominator) = match ratio {
+        AspectRatio::R4_3 => (4, 3),
+        AspectRatio::R21_9 => (21, 9),
+        AspectRatio::R16_10 => (16, 10),
+        AspectRatio::R16_9 | AspectRatio::Stretch => (16, 9),
+    };
+    height.wrapping_mul(numerator) / denominator
+}
+
+/// GTK equivalent of UISettings::geometry and renderwindow_geometry.
+/// Qt's QByteArray saveGeometry payload is not a GTK serialization format.
+/// Position remains compositor-owned; width/height are normal logical size,
+/// never the fullscreen/maximized framebuffer dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowGeometry {
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+
+const RENDER_WINDOW_GEOMETRY_GROUP: &str = "GTKRenderWindow";
+const MAIN_WINDOW_GEOMETRY_GROUP: &str = "GTKMainWindow";
+
+fn parse_window_state(contents: &str) -> Result<gtk::glib::KeyFile, gtk::glib::Error> {
+    let file = gtk::glib::KeyFile::new();
+    if !contents.trim().is_empty() {
+        file.load_from_data(contents, gtk::glib::KeyFileFlags::KEEP_COMMENTS
+            | gtk::glib::KeyFileFlags::KEEP_TRANSLATIONS)?;
+    }
+    Ok(file)
+}
+
+#[cfg(test)]
+fn read_render_window_geometry(contents: &str) -> Result<Option<WindowGeometry>, gtk::glib::Error> {
+    read_window_geometry(contents, RENDER_WINDOW_GEOMETRY_GROUP)
+}
+
+fn read_window_geometry(contents: &str, group: &str) -> Result<Option<WindowGeometry>, gtk::glib::Error> {
+    let file = parse_window_state(contents)?;
+    let (Ok(width), Ok(height)) = (file.integer(group, "width"), file.integer(group, "height")) else {
+        return Ok(None);
+    };
+    if width <= 0 || height <= 0 { return Ok(None); }
+    Ok(Some(WindowGeometry {
+        width, height, maximized: file.boolean(group, "maximized").unwrap_or(false),
+    }))
+}
+
+#[cfg(test)]
+fn write_render_window_geometry(contents: &str, geometry: WindowGeometry) -> Result<String, gtk::glib::Error> {
+    write_window_geometry(contents, RENDER_WINDOW_GEOMETRY_GROUP, geometry)
+}
+
+fn write_window_geometry(contents: &str, group: &str, geometry: WindowGeometry) -> Result<String, gtk::glib::Error> {
+    let file = parse_window_state(contents)?;
+    file.set_integer(group, "width", geometry.width);
+    file.set_integer(group, "height", geometry.height);
+    file.set_boolean(group, "maximized", geometry.maximized);
+    Ok(file.to_data().to_string())
+}
+
+fn window_state_path() -> std::path::PathBuf {
+    common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::ConfigDir)
+        .join("window_state.ini")
+}
+
+/// UISettings::RestoreWindowState, GTK geometry section only. Preserve Qt's
+/// independent geometry/state keys rather than reinterpret their opaque bytes.
+pub(crate) fn restore_render_window_state() -> std::io::Result<Option<WindowGeometry>> {
+    restore_window_state(RENDER_WINDOW_GEOMETRY_GROUP)
+}
+
+pub(crate) fn restore_main_window_state() -> std::io::Result<Option<WindowGeometry>> {
+    restore_window_state(MAIN_WINDOW_GEOMETRY_GROUP)
+}
+
+fn restore_window_state(group: &str) -> std::io::Result<Option<WindowGeometry>> {
+    match std::fs::read_to_string(window_state_path()) {
+        Ok(contents) => read_window_geometry(&contents, group).map_err(std::io::Error::other),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// UISettings::SaveWindowState. Do not erase unrelated state or silently
+/// overwrite a file that could not be parsed/read.
+pub(crate) fn save_render_window_state(geometry: WindowGeometry) -> std::io::Result<()> {
+    save_window_state(RENDER_WINDOW_GEOMETRY_GROUP, geometry)
+}
+
+pub(crate) fn save_main_window_state(geometry: WindowGeometry) -> std::io::Result<()> {
+    save_window_state(MAIN_WINDOW_GEOMETRY_GROUP, geometry)
+}
+
+fn save_window_state(group: &str, geometry: WindowGeometry) -> std::io::Result<()> {
+    if geometry.width <= 0 || geometry.height <= 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid window size"));
+    }
+    let path = window_state_path();
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let updated = write_window_geometry(&contents, group, geometry).map_err(std::io::Error::other)?;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    std::fs::write(path, updated)
+}
+
 pub fn request_game_list_reload() {
     GAME_LIST_RELOAD_PENDING.store(true, Ordering::Release);
 }
@@ -68,7 +182,7 @@ pub struct DefaultHotkey {
 }
 
 const WINDOW_SHORTCUT: i32 = 1;
-const APPLICATION_SHORTCUT: i32 = 2;
+pub(crate) const APPLICATION_SHORTCUT: i32 = 2;
 const WIDGET_WITH_CHILDREN_SHORTCUT: i32 = 3;
 
 /// Kept in the exact upstream positional order required by its shortcut
@@ -159,9 +273,9 @@ pub struct Values {
     // ── Ui ──────────────────────────────────────────────────────────────
     pub single_window_mode: Setting<bool>,
     pub fullscreen: Setting<bool>,
-    pub display_titlebar: Setting<bool>,
     pub show_filter_bar: Setting<bool>,
     pub show_status_bar: Setting<bool>,
+    pub show_perf_overlay: Setting<bool>,
 
     pub confirm_before_stopping: Setting<ConfirmStop>,
     pub pause_when_in_background: Setting<bool>,
@@ -195,12 +309,19 @@ pub struct Values {
     pub multiplayer_filter_hide_empty: Setting<bool>,
     pub multiplayer_filter_hide_full: Setting<bool>,
     pub multiplayer_ip: Setting<String>,
-    pub multiplayer_port: Setting<u32>,
+    pub multiplayer_port: Setting<u16>,
+    pub multiplayer_room_nickname: Setting<String>,
+    pub multiplayer_room_name: Setting<String>,
+    pub multiplayer_max_player: Setting<u8>,
+    pub multiplayer_room_port: Setting<u16>,
+    pub multiplayer_host_type: Setting<u8>,
+    pub multiplayer_game_id: Setting<u64>,
+    pub multiplayer_room_description: Setting<String>,
+    pub multiplayer_ban_list: (Vec<String>, Vec<String>),
     pub screenshot_height: Setting<u32>,
 
     // ── UiGameList ──────────────────────────────────────────────────────
     pub show_add_ons: Setting<bool>,
-    pub show_compat: Setting<bool>,
     pub show_size: Setting<bool>,
     pub show_types: Setting<bool>,
     pub show_play_time: Setting<bool>,
@@ -225,9 +346,9 @@ impl Default for Values {
 
             single_window_mode: Setting::new(true, "singleWindowMode", Ui),
             fullscreen: Setting::new(false, "fullscreen", Ui),
-            display_titlebar: Setting::new(true, "displayTitleBars", Ui),
             show_filter_bar: Setting::new(true, "showFilterBar", Ui),
             show_status_bar: Setting::new(true, "showStatusBar", Ui),
+            show_perf_overlay: Setting::new(false, "show_perf_overlay", UiGameList),
 
             confirm_before_stopping: Setting::with_options(
                 ConfirmStop::AskAlways, "confirmStop", UiGeneral,
@@ -284,11 +405,18 @@ impl Default for Values {
                 Multiplayer,
             ),
             multiplayer_ip: Setting::new(String::new(), "ip", Multiplayer),
-            multiplayer_port: Setting::new(24872, "port", Multiplayer),
+            multiplayer_port: Setting::ranged(24872, 0, u16::MAX, "port", Multiplayer),
+            multiplayer_room_nickname: Setting::new(String::new(), "room_nickname", Multiplayer),
+            multiplayer_room_name: Setting::new(String::new(), "room_name", Multiplayer),
+            multiplayer_max_player: Setting::ranged(8, 0, 8, "max_player", Multiplayer),
+            multiplayer_room_port: Setting::ranged(24872, 0, u16::MAX, "room_port", Multiplayer),
+            multiplayer_host_type: Setting::ranged(0, 0, 1, "host_type", Multiplayer),
+            multiplayer_game_id: Setting::new(0, "game_id", Multiplayer),
+            multiplayer_room_description: Setting::new(String::new(), "room_description", Multiplayer),
+            multiplayer_ban_list: (Vec::new(), Vec::new()),
             screenshot_height: Setting::new(0, "screenshot_height", Screenshots),
 
             show_add_ons: Setting::new(true, "show_add_ons", UiGameList),
-            show_compat: Setting::new(false, "show_compat", UiGameList),
             show_size: Setting::new(true, "show_size", UiGameList),
             show_types: Setting::new(true, "show_types", UiGameList),
             show_play_time: Setting::new(true, "show_play_time", UiGameList),
@@ -303,6 +431,22 @@ impl Default for Values {
 }
 
 impl Values {
+    /// Multiplayer category of UISettings::linkage. Array data remains owned
+    /// by QtConfig's dedicated array reader/writer, as upstream.
+    pub(crate) fn for_each_multiplayer_setting_mut(
+        &mut self,
+        mut visit: impl FnMut(&mut dyn common::settings_setting::BasicSetting),
+    ) {
+        macro_rules! settings {
+            ($($field:ident),+ $(,)?) => { $(visit(&mut self.$field);)+ };
+        }
+        settings!(multiplayer_nickname, multiplayer_filter_text,
+            multiplayer_filter_games_owned, multiplayer_filter_hide_empty,
+            multiplayer_filter_hide_full, multiplayer_ip, multiplayer_port,
+            multiplayer_room_nickname, multiplayer_room_name, multiplayer_max_player,
+            multiplayer_room_port, multiplayer_host_type, multiplayer_game_id,
+            multiplayer_room_description);
+    }
     /// UI-owned scalar registry, corresponding to upstream UISettings::linkage.
     /// Config traversal stays in qt_config; containers, paths and theme use their
     /// specialized readers/writers, as they do in QtConfig.
@@ -313,11 +457,11 @@ impl Values {
         macro_rules! settings {
             ($($field:ident),+ $(,)?) => { $(visit(&mut self.$field);)+ };
         }
-        settings!(single_window_mode, fullscreen, display_titlebar, show_filter_bar,
-            show_status_bar, confirm_before_stopping, pause_when_in_background,
+        settings!(single_window_mode, fullscreen, show_filter_bar,
+            show_status_bar, show_perf_overlay, confirm_before_stopping, pause_when_in_background,
             mute_when_in_background, hide_mouse, controller_applet_disabled,
             select_user_on_boot, enable_gamemode, show_console,
-            enable_screenshot_save_as, screenshot_height, show_add_ons, show_compat,
+            enable_screenshot_save_as, screenshot_height, show_add_ons,
             show_size, show_types, show_play_time, game_icon_size, folder_icon_size,
             row_1_text_id, row_2_text_id, cache_game_list, favorites_expanded);
         #[cfg(unix)]
@@ -382,6 +526,60 @@ pub fn with_mut<R>(f: impl FnOnce(&mut Values) -> R) -> R {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn screenshot_width_matches_integer_aspect_calculation() {
+        use common::settings_enums::AspectRatio;
+        for (ratio, width) in [(AspectRatio::R16_9, 1280), (AspectRatio::R4_3, 960),
+            (AspectRatio::R21_9, 1680), (AspectRatio::R16_10, 1152),
+            (AspectRatio::Stretch, 1280)] {
+            assert_eq!(super::calculate_width(720, ratio), width);
+            assert_eq!(super::calculate_width(0, ratio), 0);
+        }
+        assert_eq!(super::calculate_width(541, AspectRatio::R16_9), 961);
+        assert_eq!(super::calculate_width(u32::MAX, AspectRatio::R4_3), (u32::MAX - 3) / 3);
+    }
+
+    #[test]
+    fn main_and_render_geometry_are_independent() {
+        let main = super::WindowGeometry { width: 1100, height: 800, maximized: true };
+        let render = super::WindowGeometry { width: 960, height: 540, maximized: false };
+        let state = super::write_window_geometry("[General]\nstate=opaque\n",
+            super::MAIN_WINDOW_GEOMETRY_GROUP, main).unwrap();
+        let state = super::write_render_window_geometry(&state, render).unwrap();
+        assert_eq!(super::read_window_geometry(&state, super::MAIN_WINDOW_GEOMETRY_GROUP).unwrap(), Some(main));
+        assert_eq!(super::read_render_window_geometry(&state).unwrap(), Some(render));
+        let changed = super::WindowGeometry { width: 1200, ..main };
+        let state = super::write_window_geometry(&state, super::MAIN_WINDOW_GEOMETRY_GROUP, changed).unwrap();
+        assert_eq!(super::read_window_geometry(&state, super::MAIN_WINDOW_GEOMETRY_GROUP).unwrap(), Some(changed));
+        assert_eq!(super::read_render_window_geometry(&state).unwrap(), Some(render));
+        assert_eq!(super::parse_window_state(&state).unwrap().value("General", "state").unwrap(), "opaque");
+    }
+
+    #[test]
+    fn render_geometry_round_trip_preserves_other_window_state() {
+        let original = "[General]\ngeometryRenderWindow=@ByteArray(opaque)\nstate=other\n";
+        let geometry = super::WindowGeometry { width: 960, height: 720, maximized: true };
+        let written = super::write_render_window_geometry(original, geometry).unwrap();
+        assert_eq!(super::read_render_window_geometry(&written).unwrap(), Some(geometry));
+        let file = super::parse_window_state(&written).unwrap();
+        assert_eq!(file.value("General", "geometryRenderWindow").unwrap(), "@ByteArray(opaque)");
+        assert_eq!(file.value("General", "state").unwrap(), "other");
+        assert_eq!(super::write_render_window_geometry(&written, geometry).unwrap(), written);
+    }
+
+    #[test]
+    fn render_geometry_rejects_incomplete_invalid_or_malformed_state() {
+        for contents in ["", "[GTKRenderWindow]\nwidth=640\n",
+            "[GTKRenderWindow]\nwidth=-1\nheight=480\n",
+            "[GTKRenderWindow]\nwidth=640\nheight=0\n",
+            "[GTKRenderWindow]\nwidth=invalid\nheight=480\n"] {
+            assert_eq!(super::read_render_window_geometry(contents).unwrap(), None);
+        }
+        let malformed = "not an ini file";
+        assert!(super::read_render_window_geometry(malformed).is_err());
+        assert!(super::write_render_window_geometry(malformed,
+            super::WindowGeometry { width: 640, height: 480, maximized: false }).is_err());
+    }
     use super::*;
 
     #[test]

@@ -801,7 +801,23 @@ mod tests {
     }
 
     #[test]
-    fn repeat_emits_upstream_loop_safety_counter() {
+    fn repeat_respects_loop_safety_setting() {
+        const CHILD: &str = "RUZU_TEST_LOOP_SAFETY_MODE";
+        let Ok(mode) = std::env::var(CHILD) else {
+            // Settings are process-global. Keep both cases isolated from other
+            // shader tests, including when the suite runs in parallel.
+            for mode in ["enabled", "disabled"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "backend::spirv::emit_spirv::tests::repeat_respects_loop_safety_setting"])
+                    .env(CHILD, mode)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "loop safety {mode}");
+            }
+            return;
+        };
+        let disabled = mode == "disabled";
+        common::settings::values_mut().disable_shader_loop_safety_checks.set_value(disabled);
         let mut program = ir::Program::new(ShaderStage::Fragment);
         program.blocks = vec![Block::new(), Block::new(), Block::new()];
         program.syntax_list = vec![
@@ -829,6 +845,24 @@ mod tests {
         define_main(&mut ctx, &program);
 
         let module = ctx.builder.module_ref();
+        if disabled {
+            assert!(!module.types_global_values.iter().any(|inst| {
+                inst.class.opcode == spirv::Op::Variable
+                    && matches!(inst.operands.first(), Some(Operand::StorageClass(spirv::StorageClass::Private)))
+            }), "disabled safety must not allocate counters");
+            let instructions: Vec<_> = module.functions.iter()
+                .flat_map(|function| function.blocks.iter())
+                .flat_map(|block| block.instructions.iter()).collect();
+            assert!(!instructions.iter().any(|inst| matches!(inst.class.opcode,
+                spirv::Op::ISub | spirv::Op::SGreaterThanEqual | spirv::Op::LogicalAnd)));
+            let condition = module.types_global_values.iter()
+                .find(|inst| inst.class.opcode == spirv::Op::ConstantTrue)
+                .and_then(|inst| inst.result_id).unwrap();
+            assert!(instructions.iter().any(|inst| inst.class.opcode == spirv::Op::BranchConditional
+                && inst.operands.first() == Some(&Operand::IdRef(condition))),
+                "repeat must branch directly on the original condition");
+            return;
+        }
         let safety_counter = module
             .types_global_values
             .iter()

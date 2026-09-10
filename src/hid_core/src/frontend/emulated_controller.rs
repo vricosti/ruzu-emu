@@ -317,6 +317,9 @@ fn is_controller_supported(npad: NpadStyleIndex, supported: NpadStyleTag) -> boo
 /// must be able to write them without holding a borrow of the controller.
 #[derive(Debug)]
 pub struct ControllerStatus {
+    // Shared with read-only callback views; the counter still belongs to this
+    // controller and advances only in StatusUpdate, as upstream.
+    turbo_button_state: u32,
     // Data from input_common
     pub button_values: Vec<ButtonStatus>,
     pub stick_values: Vec<StickStatus>,
@@ -358,6 +361,7 @@ pub struct ControllerStatus {
 impl ControllerStatus {
     fn new() -> Self {
         Self {
+            turbo_button_state: 0,
             button_values: vec![
                 ButtonStatus::default();
                 settings_input::native_button::NUM_BUTTONS
@@ -937,6 +941,28 @@ fn irs_format_to_camera(format: ImageTransferProcessorFormat) -> CameraFormat {
     }
 }
 
+/// Read-only access to the same three button getters used by ControllerShortcut
+/// upstream. Rust callbacks cannot borrow/re-lock the controller owner, which
+/// may be dispatching the callback; retain only its shared input status instead.
+#[derive(Clone)]
+pub struct ControllerButtonStateReader {
+    status: Arc<Mutex<ControllerStatus>>,
+}
+
+impl ControllerButtonStateReader {
+    pub fn read(&self) -> (NpadButtonState, HomeButtonState, CaptureButtonState) {
+        let status = self.status.lock();
+        if status.is_configuring {
+            return Default::default();
+        }
+        (
+            NpadButtonState { raw: status.npad_button_state.raw & EmulatedController::get_turbo_button_mask(&status) },
+            status.home_button_state,
+            status.capture_button_state,
+        )
+    }
+}
+
 pub struct EmulatedController {
     npad_id_type: NpadIdType,
     npad_type: NpadStyleIndex,
@@ -944,7 +970,6 @@ pub struct EmulatedController {
     is_configuring: bool,
     is_initialized: bool,
     system_buttons_enabled: bool,
-    turbo_button_state: u32,
     nfc_handles: usize,
     last_vibration_value: [VibrationValue; 2],
     last_vibration_timepoint: [Option<Instant>; 2],
@@ -1064,7 +1089,6 @@ impl EmulatedController {
             is_configuring: false,
             is_initialized: false,
             system_buttons_enabled: true,
-            turbo_button_state: 0,
             nfc_handles: 0,
             last_vibration_value: [DEFAULT_VIBRATION_VALUE; 2],
             last_vibration_timepoint: [None; 2],
@@ -1683,7 +1707,7 @@ impl EmulatedController {
             });
         }
 
-        self.turbo_button_state = 0;
+        self.status.lock().turbo_button_state = 0;
         self.is_initialized = true;
     }
 
@@ -1955,6 +1979,11 @@ impl EmulatedController {
         is_controller_supported(npad, *self.event_context.supported_style_tag.lock())
     }
 
+    /// Borrow-independent view of the existing button getters for callbacks.
+    pub fn button_state_reader(&self) -> ControllerButtonStateReader {
+        ControllerButtonStateReader { status: Arc::clone(&self.status) }
+    }
+
     /// Port of EmulatedController::GetHomeButtons.
     pub fn get_home_buttons(&self) -> HomeButtonState {
         let status = self.status.lock();
@@ -1980,7 +2009,7 @@ impl EmulatedController {
             return NpadButtonState::default();
         }
         NpadButtonState {
-            raw: status.npad_button_state.raw & self.get_turbo_button_mask(&status),
+            raw: status.npad_button_state.raw & Self::get_turbo_button_mask(&status),
         }
     }
 
@@ -2346,9 +2375,9 @@ impl EmulatedController {
 
     /// Port of EmulatedController::StatusUpdate.
     pub fn status_update(&mut self) {
-        self.turbo_button_state = (self.turbo_button_state + 1) % (TURBO_BUTTON_DELAY * 2);
         let force_updates = {
-            let status = self.status.lock();
+            let mut status = self.status.lock();
+            status.turbo_button_state = (status.turbo_button_state + 1) % (TURBO_BUTTON_DELAY * 2);
             std::array::from_fn::<_, 2, _>(|index| {
                 status.motion_values[index].raw_status.force_update
             })
@@ -2361,9 +2390,9 @@ impl EmulatedController {
     }
 
     /// Port of EmulatedController::GetTurboButtonMask.
-    fn get_turbo_button_mask(&self, status: &ControllerStatus) -> NpadButton {
+    fn get_turbo_button_mask(status: &ControllerStatus) -> NpadButton {
         // Apply no mask when disabled
-        if self.turbo_button_state < TURBO_BUTTON_DELAY {
+        if status.turbo_button_state < TURBO_BUTTON_DELAY {
             return NpadButton::ALL;
         }
 
@@ -2475,6 +2504,120 @@ mod tests {
     use super::*;
     use common::input::{AnalogStatus, InputType};
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    #[test]
+    fn callback_button_reader_preserves_press_and_release_under_owner_lock() {
+        let owner = Arc::new(Mutex::new(EmulatedController::new(NpadIdType::Player1)));
+        let reader = owner.lock().button_state_reader();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let callback_reader = reader.clone();
+        let key = owner.lock().set_callback(ControllerUpdateCallback {
+            on_change: Arc::new(move |_| { tx.send(callback_reader.read()).unwrap(); }),
+            is_npad_service: false,
+        });
+        let worker_owner = Arc::clone(&owner);
+        let worker = std::thread::spawn(move || {
+            let mut controller = worker_owner.lock();
+            controller.status.lock().npad_button_state.raw = NpadButton::A;
+            controller.trigger_on_change(ControllerTriggerType::Button, true);
+            controller.status.lock().npad_button_state.raw = NpadButton::empty();
+            controller.trigger_on_change(ControllerTriggerType::Button, true);
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap().0.raw, NpadButton::A);
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().0.raw.is_empty());
+        worker.join().unwrap();
+        owner.lock().delete_callback(key);
+        drop(owner);
+        // Reader ownership keeps only the status alive, not devices/callbacks.
+        assert!(reader.read().0.raw.is_empty());
+    }
+
+    #[test]
+    fn callback_button_reader_matches_getters_across_turbo_and_configuration() {
+        let mut controller = EmulatedController::new(NpadIdType::Player1);
+        let reader = controller.button_state_reader();
+        {
+            let mut status = controller.status.lock();
+            status.npad_button_state.raw = NpadButton::A | NpadButton::B;
+            status.home_button_state.raw = 1;
+            status.capture_button_state.raw = 1;
+            status.button_values[settings_input::native_button::Values::A as usize].turbo = true;
+        }
+        for tick in 0..TURBO_BUTTON_DELAY * 2 {
+            let (npad, home, capture) = reader.read();
+            assert_eq!(npad.raw, controller.get_npad_buttons().raw);
+            assert_eq!(home.raw, controller.get_home_buttons().raw);
+            assert_eq!(capture.raw, controller.get_capture_buttons().raw);
+            assert_eq!(npad.raw.contains(NpadButton::A), tick < TURBO_BUTTON_DELAY);
+            assert!(npad.raw.contains(NpadButton::B));
+            controller.status_update();
+        }
+        controller.enable_configuration();
+        let (npad, home, capture) = reader.read();
+        assert!(npad.raw.is_empty());
+        assert_eq!((home.raw, capture.raw), (0, 0));
+        controller.disable_configuration();
+        assert_eq!(reader.read().0.raw, controller.get_npad_buttons().raw);
+    }
+
+    #[test]
+    fn six_axis_publishes_both_motion_sources_and_forwards_drift_mode() {
+        use crate::hid_core::HIDCore;
+        use crate::resources::{applet_resource::AppletResource,
+            shared_memory_holder::KSharedMemoryBacking, six_axis::six_axis::SixAxis};
+        struct Backing;
+        impl KSharedMemoryBacking for Backing {
+            fn create(&self, size: usize) -> Option<(*mut u8, Arc<dyn std::any::Any + Send + Sync>)> {
+                let mut words = vec![0u64; size.div_ceil(8)].into_boxed_slice();
+                Some((words.as_mut_ptr().cast(), Arc::new(words)))
+            }
+        }
+        // Access the private frontend state here, not through a production
+        // injection API. The consumer under test still uses GetMotions.
+        let hid = HIDCore::new();
+        let device = hid.get_emulated_controller(NpadIdType::Player1);
+        {
+            let mut device = device.lock();
+            device.set_npad_style_index(NpadStyleIndex::JoyconDual);
+            device.connect(false);
+            let mut status = device.status.lock();
+            for (index, motion) in status.motion_state.iter_mut().enumerate() {
+                let value = (index + 1) as f32;
+                motion.accel.x = value;
+                motion.gyro.y = value * 2.0;
+                motion.rotation.z = value * 3.0;
+                motion.orientation[2].x = value * 4.0;
+                motion.is_at_rest = index == 0;
+            }
+        }
+        let mut resource = AppletResource::new();
+        resource.set_shared_memory_backing(Arc::new(Backing));
+        assert!(resource.register_applet_resource_user_id(0x52, true).is_success());
+        assert!(resource.create_applet_resource(0x52).is_success());
+        let resource = Arc::new(Mutex::new(resource));
+        let mut six_axis = SixAxis::new(&hid);
+        six_axis.activation.set_applet_resource(resource.clone());
+        six_axis.activation.activate();
+        six_axis.on_update();
+        let resource = resource.lock();
+        let memory = &resource.get_shared_memory_format(0x52).unwrap().npad.npad_entry[0].internal_state;
+        for (index, lifo) in [&memory.sixaxis_dual_left_lifo, &memory.sixaxis_dual_right_lifo].into_iter().enumerate() {
+            let value = (index + 1) as f32;
+            let state = &lifo.lifo.read_current_entry().state;
+            assert_eq!(state.accel.x, value);
+            assert_eq!(state.gyro.y, value * 2.0);
+            assert_eq!(state.rotation.z, value * 3.0);
+            assert_eq!(state.orientation[2].x, value * 4.0);
+        }
+        assert!(!six_axis.controller_data[0].sixaxis_at_rest);
+        let handle = SixAxisSensorHandle {
+            npad_type: NpadStyleIndex::JoyconDual, npad_id: 0,
+            device_index: DeviceIndex::Left, ..Default::default()
+        };
+        assert!(six_axis.set_gyroscope_zero_drift_mode(&handle, GyroscopeZeroDriftMode::Tight).is_success());
+        assert_eq!(device.lock().status.lock().motion_sensitivity, IS_AT_REST_TIGHT);
+    }
 
     #[test]
     fn reload_force_update_callbacks_can_reenter_controller_across_reloads() {

@@ -654,7 +654,7 @@ impl Services {
     }
 
     fn loop_process_spl(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {
-        crate::hle::service::spl::spl::loop_process(system);
+        crate::hle::service::spl::spl_module::loop_process(system);
     }
 
     fn loop_process_ssl(_sm: &Arc<Mutex<ServiceManager>>, system: crate::core::SystemRef) {

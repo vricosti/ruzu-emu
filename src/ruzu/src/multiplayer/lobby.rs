@@ -243,8 +243,8 @@ fn local_game_icon(
 /// signed JWT. Anonymous users send an empty token.
 fn external_room_token(verify_uid: &str) -> String {
     let values = common::settings::values();
-    let username = values.yuzu_username.get_value().clone();
-    let credential = values.yuzu_token.get_value().clone();
+    let username = values.eden_username.get_value().clone();
+    let credential = values.eden_token.get_value().clone();
     if username.is_empty() || credential.is_empty() {
         return String::new();
     }
@@ -281,7 +281,7 @@ fn begin_join(
     crate::uisettings::with_mut(|values| {
         values.multiplayer_nickname.set_value(nickname.clone());
         values.multiplayer_ip.set_value(address.clone());
-        values.multiplayer_port.set_value(port as u32);
+        values.multiplayer_port.set_value(port);
     });
     if let Err(error) = crate::configuration::qt_config::save_multiplayer_values() {
         log::error!("Could not save multiplayer settings: {error}");
@@ -653,6 +653,7 @@ fn selected_room_index(selection: &gtk::SingleSelection) -> Option<usize> {
 pub fn show(
     parent: &gtk::ApplicationWindow,
     room_member: Arc<RoomMember>,
+    announce_session: Arc<network::announce_multiplayer_session::AnnounceMultiplayerSession>,
     game_list: crate::game_list::GameListHandle,
     on_joined: impl Fn() + 'static,
 ) {
@@ -672,7 +673,7 @@ pub fn show(
 
     let saved_nickname =
         crate::uisettings::with(|values| values.multiplayer_nickname.get_value().clone());
-    let web_username = common::settings::values().yuzu_username.get_value().clone();
+    let web_username = common::settings::values().eden_username.get_value().clone();
     let nickname_value = if saved_nickname.is_empty() || saved_nickname == "Eden" {
         let chosen = if web_username.is_empty() {
             generated_nickname()
@@ -859,13 +860,10 @@ pub fn show(
             refresh.set_sensitive(false);
             refresh.set_label("Refreshing");
             let (sender, receiver) = std::sync::mpsc::channel();
+            let session = Arc::clone(&announce_session);
             std::thread::Builder::new()
                 .name("LobbyRefresh".to_string())
                 .spawn(move || {
-                    let session =
-                        network::announce_multiplayer_session::AnnounceMultiplayerSession::new(
-                            &network::network::RoomNetwork::default(),
-                        );
                     let _ = sender.send(session.get_room_list());
                 })
                 .expect("failed to spawn the LobbyRefresh thread");

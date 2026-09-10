@@ -67,6 +67,7 @@ pub(super) fn translate_arm(
             && !options.define_unpredictable_behaviour;
 
         if !is_unconditional_space
+            && !matches!(decoded.id, ArmInstId::CRC32 | ArmInstId::CRC32C)
             && !unconditional_unpredictable_bkpt
             && !is_condition_passed(&mut cond_state, block, *current, 4, cond)
         {
@@ -129,6 +130,7 @@ pub(super) fn translate_single_arm_instruction(
     let mut cond_state = ConditionalState::None;
 
     let should_translate = is_unconditional_space
+        || matches!(decoded.id, ArmInstId::CRC32 | ArmInstId::CRC32C)
         || unconditional_unpredictable_bkpt
         || is_condition_passed(&mut cond_state, block, descriptor, 4, cond);
     let should_continue = if should_translate {

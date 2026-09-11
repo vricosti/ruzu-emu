@@ -1283,75 +1283,25 @@ impl Device {
             }
         }
         let masked_driver_version = (device_properties.driver_version << 3) >> 3;
-        if is_radv
-            && supports_extended_dynamic_state
-            && masked_driver_version < vk::make_api_version(0, 21, 2, 0)
-        {
-            log::warn!("RADV versions older than 21.2 have broken VK_EXT_extended_dynamic_state");
-            supports_extended_dynamic_state = false;
-            extended_dynamic_state_features.extended_dynamic_state = vk::FALSE;
-        }
-        if is_radv && supports_extended_dynamic_state2 {
-            if masked_driver_version < vk::make_api_version(0, 22, 3, 1) {
-                log::warn!(
-                    "RADV versions older than 22.3.1 have broken VK_EXT_extended_dynamic_state2"
-                );
-                supports_extended_dynamic_state2 = false;
-                supports_extended_dynamic_state2_extra = false;
-                extended_dynamic_state2_features.extended_dynamic_state2 = vk::FALSE;
-                extended_dynamic_state2_features.extended_dynamic_state2_logic_op = vk::FALSE;
-                extended_dynamic_state2_features.extended_dynamic_state2_patch_control_points =
-                    vk::FALSE;
-            }
-        }
-        if is_qualcomm
-            && supports_extended_dynamic_state2
-            && masked_driver_version >= vk::make_api_version(0, 0, 676, 0)
-            && masked_driver_version < vk::make_api_version(0, 0, 680, 0)
-        {
-            log::warn!("Qualcomm Adreno 7xx drivers have broken VK_EXT_extended_dynamic_state2");
-            supports_extended_dynamic_state2 = false;
-            supports_extended_dynamic_state2_extra = false;
-            extended_dynamic_state2_features.extended_dynamic_state2 = vk::FALSE;
-            extended_dynamic_state2_features.extended_dynamic_state2_logic_op = vk::FALSE;
-            extended_dynamic_state2_features.extended_dynamic_state2_patch_control_points =
-                vk::FALSE;
-        }
-        if is_radv && has_extended_dynamic_state3 {
-            log::warn!("RADV has broken extendedDynamicState3ColorBlendEquation");
-            extended_dynamic_state3_features.extended_dynamic_state3_color_blend_enable = vk::FALSE;
-            extended_dynamic_state3_features.extended_dynamic_state3_color_blend_equation =
-                vk::FALSE;
-            if masked_driver_version < vk::make_api_version(0, 23, 1, 0) {
-                log::warn!("RADV versions older than 23.1.0 have broken depth clamp dynamic state");
-                extended_dynamic_state3_features.extended_dynamic_state3_depth_clamp_enable =
-                    vk::FALSE;
-            }
-        }
-        if is_amd_driver && has_extended_dynamic_state3 {
-            log::warn!("AMD drivers have broken extendedDynamicState3ColorBlendEquation");
+        // Upstream only blacklists dynamic color blend state on the Samsung
+        // proprietary driver. RADV and AMD proprietary keep the dynamic path;
+        // forcing the static fallback there diverged from upstream rendering.
+        if driver_id == vk::DriverId::SAMSUNG_PROPRIETARY && has_extended_dynamic_state3 {
+            log::warn!("Samsung: Disabling broken extendedDynamicState3ColorBlendEquation");
             extended_dynamic_state3_features.extended_dynamic_state3_color_blend_enable = vk::FALSE;
             extended_dynamic_state3_features.extended_dynamic_state3_color_blend_equation =
                 vk::FALSE;
         }
-        if is_radv
-            && supports_vertex_input_dynamic_state
-            && supported_extensions.contains("VK_KHR_fragment_shading_rate")
+        // Upstream: Intel Windows < 27.20.100.0 and NVIDIA proprietary
+        // < 580.119.02 have broken VK_EXT_vertex_input_dynamic_state. No other
+        // driver (RADV, Qualcomm) is blacklisted upstream.
+        if supports_vertex_input_dynamic_state
+            && ((is_intel_windows
+                && masked_driver_version < vk::make_api_version(27, 20, 100, 0))
+                || (is_nvidia
+                    && masked_driver_version < vk::make_api_version(580, 119, 2, 0)))
         {
-            log::warn!("RADV has broken VK_EXT_vertex_input_dynamic_state on RDNA2 hardware");
-            supports_vertex_input_dynamic_state = false;
-            vertex_input_dynamic_state_features.vertex_input_dynamic_state = vk::FALSE;
-        }
-        if is_qualcomm && supports_vertex_input_dynamic_state {
-            log::warn!("Qualcomm drivers have broken VK_EXT_vertex_input_dynamic_state");
-            supports_vertex_input_dynamic_state = false;
-            vertex_input_dynamic_state_features.vertex_input_dynamic_state = vk::FALSE;
-        }
-        if is_intel_windows
-            && supports_vertex_input_dynamic_state
-            && masked_driver_version < vk::make_api_version(27, 20, 100, 0)
-        {
-            log::warn!("Intel has broken VK_EXT_vertex_input_dynamic_state");
+            log::warn!("Disabling broken VK_EXT_vertex_input_dynamic_state");
             supports_vertex_input_dynamic_state = false;
             vertex_input_dynamic_state_features.vertex_input_dynamic_state = vk::FALSE;
         }
@@ -1367,6 +1317,13 @@ impl Device {
         if is_amd_driver && !supports_shader_float16 {
             log::warn!("AMD GCN4 and earlier have broken cube image compatibility");
             has_broken_cube_compatibility = true;
+        }
+        // Upstream disables float16 math on every AMD proprietary/RADV driver
+        // (checked after the GCN4 cube-compatibility test, which reads the flag).
+        if is_amd_driver && supports_shader_float16 {
+            log::warn!("AMD drivers (2026+) have broken float16 math");
+            supports_shader_float16 = false;
+            shader_float16_int8_features.shader_float16 = vk::FALSE;
         }
         if is_qualcomm && masked_driver_version < vk::make_api_version(0, 255, 615, 512) {
             has_broken_parallel_compiling = true;

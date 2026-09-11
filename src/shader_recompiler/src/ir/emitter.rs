@@ -2395,6 +2395,16 @@ impl<'a> Emitter<'a> {
         ))
     }
 
+    /// Port of `IREmitter::QuadBroadcast`.
+    pub fn quad_broadcast(&mut self, value: Value, lane: Value) -> Value {
+        self.emit(Inst::new(Opcode::QuadBroadcast, vec![value, lane]))
+    }
+
+    /// Port of `IREmitter::QuadSwap`.
+    pub fn quad_swap(&mut self, value: Value, direction: Value) -> Value {
+        self.emit(Inst::new(Opcode::QuadSwap, vec![value, direction]))
+    }
+
     pub fn shuffle_index(
         &mut self,
         value: Value,

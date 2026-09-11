@@ -1060,6 +1060,57 @@ mod tests {
     use crate::ir::program::Program;
     use crate::ir::types::ShaderStage;
 
+    /// SHFL with immediate index/mask operands: `mode` in bits [31:30],
+    /// index immediate in [24:20] (flag bit 28), mask immediate in [46:34]
+    /// (flag bit 29).
+    fn shfl_imm(mode: u64, index: u64, mask: u64) -> u64 {
+        0xEF10_0000_0000_0000
+            | 0x01
+            | (0x02 << 8)
+            | (index << 20)
+            | (1 << 28)
+            | (1 << 29)
+            | (mode << 30)
+            | (mask << 34)
+    }
+
+    fn translated_opcodes(stage: ShaderStage, insn: u64) -> Vec<Opcode> {
+        let mut program = Program::new(stage);
+        program.blocks.push(Block::new());
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        tv.translate_instruction(insn);
+        tv.ir.program.blocks[0].iter().map(|inst| inst.opcode).collect()
+    }
+
+    #[test]
+    fn fragment_quad_shuffles_lower_to_quad_ops_like_upstream() {
+        // Upstream QUAD_MASK = (28 << 8) | 3.
+        const QUAD_MASK: u64 = (28 << 8) | 3;
+        let idx = translated_opcodes(ShaderStage::Fragment, shfl_imm(0, 2, QUAD_MASK));
+        assert!(idx.contains(&Opcode::QuadBroadcast), "{idx:?}");
+        assert!(!idx.contains(&Opcode::ShuffleIndex), "{idx:?}");
+
+        let bfly = translated_opcodes(ShaderStage::Fragment, shfl_imm(3, 1, QUAD_MASK));
+        assert!(bfly.contains(&Opcode::QuadSwap), "{bfly:?}");
+        assert!(!bfly.contains(&Opcode::ShuffleButterfly), "{bfly:?}");
+
+        // Out-of-quad index, other mask, or a BFLY xor of 0 keep the generic path.
+        let far = translated_opcodes(ShaderStage::Fragment, shfl_imm(0, 4, QUAD_MASK));
+        assert!(far.contains(&Opcode::ShuffleIndex), "{far:?}");
+        let other_mask = translated_opcodes(ShaderStage::Fragment, shfl_imm(0, 2, 0x1F1F));
+        assert!(other_mask.contains(&Opcode::ShuffleIndex), "{other_mask:?}");
+        let xor0 = translated_opcodes(ShaderStage::Fragment, shfl_imm(3, 0, QUAD_MASK));
+        assert!(xor0.contains(&Opcode::ShuffleButterfly), "{xor0:?}");
+    }
+
+    #[test]
+    fn quad_shuffle_lowering_is_fragment_only() {
+        const QUAD_MASK: u64 = (28 << 8) | 3;
+        let vertex = translated_opcodes(ShaderStage::VertexB, shfl_imm(0, 2, QUAD_MASK));
+        assert!(vertex.contains(&Opcode::ShuffleIndex), "{vertex:?}");
+        assert!(!vertex.contains(&Opcode::QuadBroadcast), "{vertex:?}");
+    }
+
     #[test]
     fn kil_translate_is_noop_like_upstream() {
         let mut program = Program::new(ShaderStage::Fragment);

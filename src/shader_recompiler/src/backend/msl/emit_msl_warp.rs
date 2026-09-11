@@ -266,3 +266,35 @@ pub fn emit_dpdy(
 ) -> Result<(), MslError> {
     emit_derivative(context, inst_ref, inst, "dfdy")
 }
+
+/// Metal counterpart of `EmitQuadBroadcast` (`quad_broadcast`).
+pub fn emit_quad_broadcast(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let lane = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let expression = if context.supports_subgroups() {
+        format!("quad_broadcast({value}, ushort(({lane}) & 3u))")
+    } else {
+        value
+    };
+    context.define(inst_ref, Type::U32, expression, false)
+}
+
+/// Metal counterpart of `EmitQuadSwap` (`quad_shuffle_xor` of `direction + 1`).
+pub fn emit_quad_swap(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let value = context.value_expression(inst.arg(0), inst_ref, 0)?;
+    let direction = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let expression = if context.supports_subgroups() {
+        format!("quad_shuffle_xor({value}, ushort(({direction}) + 1u))")
+    } else {
+        value
+    };
+    context.define(inst_ref, Type::U32, expression, false)
+}

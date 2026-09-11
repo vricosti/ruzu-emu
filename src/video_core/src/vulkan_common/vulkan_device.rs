@@ -99,6 +99,26 @@ impl Default for PhysicalDeviceDepthBiasControlFeaturesExt {
     }
 }
 
+// ash 0.37 predates VK_KHR_shader_quad_control (Vulkan 1.3.279). Keep its
+// feature ABI payload here until the workspace binding is upgraded.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PhysicalDeviceShaderQuadControlFeaturesKhr {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    shader_quad_control: vk::Bool32,
+}
+
+impl Default for PhysicalDeviceShaderQuadControlFeaturesKhr {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_235_000),
+            p_next: std::ptr::null_mut(),
+            shader_quad_control: vk::FALSE,
+        }
+    }
+}
+
 // ash 0.37 predates VK_KHR_maintenance5. Keep its feature/property ABI
 // payloads in the upstream device owner until the workspace binding is
 // upgraded.
@@ -388,6 +408,7 @@ pub struct DeviceExtensions {
     pub custom_border_color: bool,
     pub color_write_enable: bool,
     pub depth_bias_control: bool,
+    pub shader_quad_control: bool,
     pub depth_clip_control: bool,
     pub descriptor_buffer: bool,
     pub extended_dynamic_state: bool,
@@ -725,6 +746,7 @@ impl Device {
         let has_custom_border_color = supported_extensions.contains("VK_EXT_custom_border_color");
         let has_color_write_enable = supported_extensions.contains("VK_EXT_color_write_enable");
         let has_depth_bias_control = supported_extensions.contains("VK_EXT_depth_bias_control");
+        let has_shader_quad_control = supported_extensions.contains("VK_KHR_shader_quad_control");
         let has_line_rasterization = supported_extensions.contains("VK_EXT_line_rasterization");
         let has_transform_feedback = supported_extensions.contains("VK_EXT_transform_feedback");
         let has_pipeline_executable_properties =
@@ -793,6 +815,7 @@ impl Device {
         let mut color_write_enable_features =
             vk::PhysicalDeviceColorWriteEnableFeaturesEXT::default();
         let mut depth_bias_control_features = PhysicalDeviceDepthBiasControlFeaturesExt::default();
+        let mut shader_quad_control_features = PhysicalDeviceShaderQuadControlFeaturesKhr::default();
         let mut line_rasterization_features =
             vk::PhysicalDeviceLineRasterizationFeaturesEXT::default();
         let mut transform_feedback_features =
@@ -951,6 +974,12 @@ impl Device {
                 depth_bias_control_features.p_next = features2.p_next;
                 features2.p_next = (&mut depth_bias_control_features
                     as *mut PhysicalDeviceDepthBiasControlFeaturesExt)
+                    .cast();
+            }
+            if has_shader_quad_control {
+                shader_quad_control_features.p_next = features2.p_next;
+                features2.p_next = (&mut shader_quad_control_features
+                    as *mut PhysicalDeviceShaderQuadControlFeaturesKhr)
                     .cast();
             }
             if has_maintenance5 {
@@ -1490,6 +1519,9 @@ impl Device {
         let supports_null_descriptor =
             configure_robustness2_features(&mut robustness2_features, has_robustness2);
         let supports_device_fault = has_device_fault && device_fault_features.device_fault != 0;
+        // Upstream: `extensions.shader_quad_control = features.shader_quad_control.shaderQuadControl`.
+        let supports_shader_quad_control =
+            has_shader_quad_control && shader_quad_control_features.shader_quad_control != 0;
         let mut supports_shader_demote_to_helper_invocation = has_shader_demote_to_helper_invocation
             && shader_demote_features.shader_demote_to_helper_invocation != 0;
         if is_mvk && supports_shader_demote_to_helper_invocation {
@@ -1550,6 +1582,11 @@ impl Device {
             &mut loaded_extensions,
             "VK_EXT_depth_bias_control",
             supports_depth_bias_control,
+        );
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            "VK_KHR_shader_quad_control",
+            supports_shader_quad_control,
         );
         remove_extension_if_unsupported(
             &mut loaded_extensions,
@@ -1920,6 +1957,7 @@ impl Device {
                 maintenance6: supports_maintenance6,
                 device_fault: supports_device_fault,
                 shader_demote_to_helper_invocation: supports_shader_demote_to_helper_invocation,
+                shader_quad_control: supports_shader_quad_control,
                 draw_indirect_count: has_draw_indirect_count,
                 sampler_filter_minmax: supports_sampler_filter_minmax,
                 shader_float_controls: has_shader_float_controls,
@@ -3100,6 +3138,11 @@ impl Device {
         self.extensions.shader_demote_to_helper_invocation
     }
 
+    /// Port of `Device::IsKhrShaderQuadControlSupported`.
+    pub fn is_khr_shader_quad_control_supported(&self) -> bool {
+        self.extensions.shader_quad_control
+    }
+
     pub fn is_khr_shader_float_controls_supported(&self) -> bool {
         self.extensions.shader_float_controls
     }
@@ -3537,6 +3580,7 @@ fn initial_loaded_extensions(
         "VK_EXT_custom_border_color",
         "VK_EXT_depth_bias_control",
         "VK_EXT_depth_clip_control",
+        "VK_KHR_shader_quad_control",
         "VK_EXT_descriptor_buffer",
         "VK_EXT_extended_dynamic_state",
         "VK_EXT_extended_dynamic_state2",

@@ -318,6 +318,7 @@ pub struct Info {
     pub uses_is_helper_invocation: bool,
     pub uses_subgroup_invocation_id: bool,
     pub uses_subgroup_shuffles: bool,
+    pub uses_quad_shuffles: bool,
     pub uses_patches: [bool; 30],
 
     pub interpolation: [Interpolation; 32],

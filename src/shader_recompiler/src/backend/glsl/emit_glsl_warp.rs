@@ -49,6 +49,20 @@ pub fn emit_shuffle_down(ctx: &mut EmitContext, v: &str, delta: &str) {
 pub fn emit_shuffle_butterfly(ctx: &mut EmitContext, v: &str, mask: &str) {
     ctx.add_fmt(format!("u_0=subgroupShuffleXor({},{});", v, mask));
 }
+/// Port of `EmitQuadBroadcast` (GLSL).
+pub fn emit_quad_broadcast(ctx: &mut EmitContext, v: &str, lane: &str) {
+    ctx.add_fmt(format!(
+        "u_0=readInvocationARB({},((gl_SubGroupInvocationARB&~3u)|({}&3u)));",
+        v, lane
+    ));
+}
+/// Port of `EmitQuadSwap` (GLSL).
+pub fn emit_quad_swap(ctx: &mut EmitContext, v: &str, direction: &str) {
+    ctx.add_fmt(format!(
+        "u_0=readInvocationARB({},(gl_SubGroupInvocationARB^({}+1u)));",
+        v, direction
+    ));
+}
 pub fn emit_dpdx_fine(ctx: &mut EmitContext, p: &str) {
     ctx.add_fmt(format!("f_0=dFdxFine({});", p));
 }

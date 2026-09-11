@@ -173,6 +173,31 @@ fn define_entry_point(program: &ir::Program, ctx: &mut SpirvEmitContext, main: s
             spirv::ExecutionModel::Geometry
         }
         ShaderStage::Fragment => {
+            if ctx.profile.support_shader_quad_control && program.info.uses_quad_shuffles {
+                // rspirv's bundled `spirv` enums predate SPV_KHR_quad_control, so
+                // the capability (QuadControlKHR = 5087) and execution mode
+                // (RequireFullQuadsKHR = 5089) are pushed as raw words, exactly
+                // like `Builder::capability` / `Builder::execution_mode` do.
+                const QUAD_CONTROL_KHR_CAPABILITY: u32 = 5087;
+                const REQUIRE_FULL_QUADS_KHR_EXECUTION_MODE: u32 = 5089;
+                ctx.builder.extension("SPV_KHR_quad_control");
+                let module = ctx.builder.module_mut();
+                module.capabilities.push(rspirv::dr::Instruction::new(
+                    spirv::Op::Capability,
+                    None,
+                    None,
+                    vec![rspirv::dr::Operand::LiteralBit32(QUAD_CONTROL_KHR_CAPABILITY)],
+                ));
+                module.execution_modes.push(rspirv::dr::Instruction::new(
+                    spirv::Op::ExecutionMode,
+                    None,
+                    None,
+                    vec![
+                        rspirv::dr::Operand::IdRef(main),
+                        rspirv::dr::Operand::LiteralBit32(REQUIRE_FULL_QUADS_KHR_EXECUTION_MODE),
+                    ],
+                ));
+            }
             ctx.builder.execution_mode(
                 main,
                 if ctx.profile.lower_left_origin_mode {
@@ -377,6 +402,14 @@ pub(crate) fn setup_capabilities(
             ctx.builder
                 .capability(spirv::Capability::GroupNonUniformVote);
         }
+    }
+    if info.uses_quad_shuffles {
+        if profile.support_quad_shuffles {
+            ctx.builder
+                .capability(spirv::Capability::GroupNonUniformQuad);
+        }
+        ctx.builder
+            .capability(spirv::Capability::GroupNonUniformShuffle);
     }
     if info.uses_int64_bit_atomics && profile.support_int64_atomics {
         ctx.builder.capability(spirv::Capability::Int64Atomics);

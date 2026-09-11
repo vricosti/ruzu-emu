@@ -605,6 +605,9 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 | Opcode::ShuffleButterfly => {
                     program.info.uses_subgroup_shuffles = true;
                 }
+                Opcode::QuadBroadcast | Opcode::QuadSwap => {
+                    program.info.uses_quad_shuffles = true;
+                }
                 Opcode::SubgroupEqMask
                 | Opcode::SubgroupLtMask
                 | Opcode::SubgroupLeMask

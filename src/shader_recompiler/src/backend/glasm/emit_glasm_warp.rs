@@ -69,6 +69,24 @@ pub fn emit_shuffle_butterfly(ctx: &mut EmitContext) {
     ctx.add_line("SHFXOR.U RC,RC.x,RC.y,RC.z;");
 }
 
+/// Port of `EmitQuadBroadcast` (GLASM): value in RC.x, lane in RC.y.
+pub fn emit_quad_broadcast(ctx: &mut EmitContext) {
+    let sn = ctx.stage_name;
+    ctx.add_fmt(format!(
+        "AND.U RC.z,{}.threadid,~3;\n\
+         AND.U RC.y,RC.y,3;\n\
+         OR.U RC.z,RC.z,RC.y;\n\
+         SHFIDX.U RC,RC.x,RC.z,0x1C03;\n\
+         MOV.U RC.x,RC.y;",
+        sn
+    ));
+}
+
+/// Port of `EmitQuadSwap` (GLASM): value in RC.x, direction in RC.y.
+pub fn emit_quad_swap(ctx: &mut EmitContext) {
+    ctx.add_line("ADD.U RC.y,RC.y,1;\nSHFXOR.U RC,RC.x,RC.y,0x1C03;\nMOV.U RC.x,RC.y;");
+}
+
 pub fn emit_f_swizzle_add(ctx: &mut EmitContext) {
     let sn = ctx.stage_name;
     ctx.add_fmt(format!(

@@ -2113,6 +2113,36 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
                 ),
             );
         }
+        Opcode::QuadBroadcast => {
+            let args = consume_args(ctx, program, &inst_snapshot, 2);
+            let value = &args[0];
+            let lane = &args[1];
+            add_assign(
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32,
+                format!(
+                    "readInvocationARB({},((gl_SubGroupInvocationARB&~3u)|({}&3u)))",
+                    value, lane
+                ),
+            );
+        }
+        Opcode::QuadSwap => {
+            let args = consume_args(ctx, program, &inst_snapshot, 2);
+            let value = &args[0];
+            let direction = &args[1];
+            add_assign(
+                ctx,
+                program,
+                inst_ref,
+                GlslVarType::U32,
+                format!(
+                    "readInvocationARB({},(gl_SubGroupInvocationARB^({}+1u)))",
+                    value, direction
+                ),
+            );
+        }
 
         // ── Special variables (port of upstream EmitContext getters) ──
         Opcode::SampleId => {

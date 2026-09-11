@@ -630,6 +630,8 @@ pub enum Opcode {
     ShuffleUp,
     ShuffleDown,
     ShuffleButterfly,
+    QuadBroadcast,
+    QuadSwap,
     FSwizzleAdd,
     DPdxFine,
     DPdyFine,
@@ -3445,6 +3447,16 @@ impl Opcode {
                 name: "ShuffleButterfly",
                 return_type: U32,
                 arg_types: &[U32, U32, U32, U32],
+            },
+            Opcode::QuadBroadcast => OpcodeMeta {
+                name: "QuadBroadcast",
+                return_type: U32,
+                arg_types: &[U32, U32],
+            },
+            Opcode::QuadSwap => OpcodeMeta {
+                name: "QuadSwap",
+                return_type: U32,
+                arg_types: &[U32, U32],
             },
             Opcode::FSwizzleAdd => OpcodeMeta {
                 name: "FSwizzleAdd",

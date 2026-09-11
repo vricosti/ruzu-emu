@@ -512,3 +512,49 @@ pub fn emit_dpdx_coarse(ctx: &mut SpirvEmitContext, value: Word) -> Word {
 pub fn emit_dpdy_coarse(ctx: &mut SpirvEmitContext, value: Word) -> Word {
     ctx.builder.d_pdy_coarse(ctx.f32_type, None, value).unwrap()
 }
+
+/// Port of `EmitQuadBroadcast`: broadcast `value` from lane `lane` of the
+/// invocation's quad (OpGroupNonUniformQuadBroadcast when supported, else a
+/// shuffle from `(thread_id & ~3) | (lane & 3)`).
+pub fn emit_quad_broadcast(ctx: &mut SpirvEmitContext, value: Word, lane: Word) -> Word {
+    let scope = subgroup_scope(ctx);
+    if ctx.profile.support_quad_shuffles {
+        return ctx
+            .builder
+            .group_non_uniform_quad_broadcast(ctx.u32_type, None, scope, value, lane)
+            .unwrap();
+    }
+    let thread_id = get_thread_id(ctx);
+    let not_three = ctx.constant_u32(!3u32);
+    let three = ctx.constant_u32(3);
+    let base = ctx
+        .builder
+        .bitwise_and(ctx.u32_type, None, thread_id, not_three)
+        .unwrap();
+    let local_lane = ctx
+        .builder
+        .bitwise_and(ctx.u32_type, None, lane, three)
+        .unwrap();
+    let src_thread_id = ctx
+        .builder
+        .bitwise_or(ctx.u32_type, None, base, local_lane)
+        .unwrap();
+    ctx.builder
+        .group_non_uniform_shuffle(ctx.u32_type, None, scope, value, src_thread_id)
+        .unwrap()
+}
+
+/// Port of `EmitQuadSwap`: swap within the quad along `direction`
+/// (0 = horizontal, 1 = vertical, 2 = diagonal) via a shuffle-xor of
+/// `direction + 1`.
+pub fn emit_quad_swap(ctx: &mut SpirvEmitContext, value: Word, direction: Word) -> Word {
+    let scope = subgroup_scope(ctx);
+    let one = ctx.constant_u32(1);
+    let xor_mask = ctx
+        .builder
+        .i_add(ctx.u32_type, None, direction, one)
+        .unwrap();
+    ctx.builder
+        .group_non_uniform_shuffle_xor(ctx.u32_type, None, scope, value, xor_mask)
+        .unwrap()
+}

@@ -150,6 +150,8 @@ pub(super) fn make_shader_profile(device: &Device) -> Profile {
         support_workgroup_layout_16bit_access: device
             .is_workgroup_memory_explicit_layout_16bit_access_supported(),
         support_vote: device.is_subgroup_feature_supported(vk::SubgroupFeatureFlags::VOTE),
+        support_shader_quad_control: device.is_khr_shader_quad_control_supported(),
+        support_quad_shuffles: device.is_subgroup_feature_supported(vk::SubgroupFeatureFlags::QUAD),
         supported_subgroup_stages: supported_subgroup_stages(device),
         support_viewport_index_layer_non_geometry: device
             .is_ext_shader_viewport_index_layer_supported(),

@@ -5551,6 +5551,18 @@ impl SpirvEmitContext {
                 };
                 self.set_value(block_idx, inst_idx, id);
             }
+            Opcode::QuadBroadcast | Opcode::QuadSwap => {
+                let value = self.resolve_value(inst.arg(0));
+                let operand = self.resolve_value(inst.arg(1));
+                let id = match inst.opcode {
+                    Opcode::QuadBroadcast => {
+                        super::emit_spirv_warp::emit_quad_broadcast(self, value, operand)
+                    }
+                    Opcode::QuadSwap => super::emit_spirv_warp::emit_quad_swap(self, value, operand),
+                    _ => unreachable!(),
+                };
+                self.set_value(block_idx, inst_idx, id);
+            }
             Opcode::FSwizzleAdd => {
                 let op_a = self.resolve_value(inst.arg(0));
                 let op_b = self.resolve_value(inst.arg(1));

@@ -763,6 +763,8 @@ fn emit_inst(
         | Opcode::ShuffleUp
         | Opcode::ShuffleDown
         | Opcode::ShuffleButterfly => emit_msl_warp::emit_shuffle(context, inst_ref, inst),
+        Opcode::QuadBroadcast => emit_msl_warp::emit_quad_broadcast(context, inst_ref, inst),
+        Opcode::QuadSwap => emit_msl_warp::emit_quad_swap(context, inst_ref, inst),
         Opcode::FSwizzleAdd => emit_msl_warp::emit_fswizzle_add(context, inst_ref, inst),
         Opcode::DPdxFine | Opcode::DPdxCoarse => emit_msl_warp::emit_dpdx(context, inst_ref, inst),
         Opcode::DPdyFine | Opcode::DPdyCoarse => emit_msl_warp::emit_dpdy(context, inst_ref, inst),

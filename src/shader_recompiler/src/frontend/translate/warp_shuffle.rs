@@ -4,7 +4,12 @@
 //! Port of upstream `impl/warp_shuffle.cpp`.
 
 use super::{bit, field, TranslatorVisitor};
+use crate::ir::types::ShaderStage;
 use crate::ir::value::{Pred, Value};
+
+// Upstream `QUAD_MASK`: segmentation mask 28 (lanes stay within their quad)
+// with clamp 3.
+const QUAD_MASK: u32 = (28 << 8) | 3;
 
 /// SHFL — Warp shuffle.
 ///
@@ -34,6 +39,30 @@ pub fn shfl(v: &mut TranslatorVisitor<'_>, insn: u64) {
     };
 
     // clamp = mask[4:0], seg_mask = mask[12:8]
+    // Upstream: a fragment-stage shuffle with immediate operands and the quad
+    // mask is lowered to the quad group operations (QuadBroadcast / QuadSwap),
+    // which are always in bounds.
+    let is_quad_candidate = src_b_flag
+        && src_b_imm == QUAD_MASK
+        && src_a_flag
+        && v.ir.program.stage == ShaderStage::Fragment;
+    if is_quad_candidate {
+        // mode 0 = IDX, mode 3 = BFLY
+        if mode == 0 && src_a_imm <= 3 {
+            let value = v.x(src_reg);
+            let result = v.ir.quad_broadcast(value, Value::ImmU32(src_a_imm));
+            v.set_x(dest_reg, result);
+            v.ir.set_pred(Pred(pred_idx as u8), Value::ImmU1(true));
+            return;
+        }
+        if mode == 3 && (1..=3).contains(&src_a_imm) {
+            let value = v.x(src_reg);
+            let result = v.ir.quad_swap(value, Value::ImmU32(src_a_imm - 1));
+            v.set_x(dest_reg, result);
+            v.ir.set_pred(Pred(pred_idx as u8), Value::ImmU1(true));
+            return;
+        }
+    }
     let clamp =
         v.ir.bit_field_u_extract(src_b, Value::ImmU32(0), Value::ImmU32(5));
     let seg_mask =

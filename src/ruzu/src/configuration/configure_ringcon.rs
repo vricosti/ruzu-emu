@@ -48,8 +48,10 @@ impl ConfigureRingController {
     }
 
     fn apply_configuration(&self) {
+        hid_core::hid_core::with_controller(&self.controller, |controller| {
+            controller.disable_configuration()
+        });
         let mut controller = self.controller.lock();
-        controller.disable_configuration();
         controller.save_current_config();
         controller.enable_configuration();
     }
@@ -147,10 +149,13 @@ impl Drop for ConfigureRingController {
                 mouse.release_button(button);
             }
         }
-        let mut controller = self.controller.lock();
-        controller.set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Active);
-        controller.disable_configuration();
-        controller.delete_callback(self.callback_key);
+        self.controller
+            .lock()
+            .set_polling_mode(EmulatedDeviceIndex::RightIndex, PollingMode::Active);
+        hid_core::hid_core::with_controller(&self.controller, |controller| {
+            controller.disable_configuration()
+        });
+        self.controller.lock().delete_callback(self.callback_key);
     }
 }
 

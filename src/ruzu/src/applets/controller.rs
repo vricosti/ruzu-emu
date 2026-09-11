@@ -1056,15 +1056,17 @@ fn update_controller(
     controller_type: Option<NpadStyleIndex>,
     connected: bool,
 ) {
-    let mut controller = controller.lock();
-    if controller.is_connected(true) {
-        controller.disconnect();
+    use hid_core::hid_core::with_controller;
+    if controller.lock().is_connected(true) {
+        with_controller(controller, |controller| controller.disconnect());
     }
     if let Some(controller_type) = controller_type {
-        controller.set_npad_style_index(controller_type);
+        with_controller(controller, |controller| {
+            controller.set_npad_style_index(controller_type)
+        });
     }
     if connected {
-        controller.connect(true);
+        with_controller(controller, |controller| controller.connect(true));
     }
 }
 

@@ -404,10 +404,13 @@ impl PlayerPage {
             hid_core::frontend::emulated_controller::EmulatedController::map_settings_type_to_npad(
                 controller_type,
             );
+        use hid_core::hid_core::with_controller;
         let controllers = self.configuration_controllers.borrow();
         if controllers.len() != 2 {
             if let Some(controller) = self.controller.borrow().as_ref() {
-                controller.lock().set_npad_style_index(npad_type);
+                with_controller(controller, |controller| {
+                    controller.set_npad_style_index(npad_type)
+                });
             }
             return;
         }
@@ -430,23 +433,23 @@ impl PlayerPage {
             .as_ref()
             .is_some_and(|controller| controller.lock().is_connected(true));
 
-        player_one.lock().set_npad_style_index(npad_type);
-        handheld.lock().set_npad_style_index(npad_type);
+        with_controller(&player_one, |player_one| player_one.set_npad_style_index(npad_type));
+        with_controller(&handheld, |handheld| handheld.set_npad_style_index(npad_type));
 
         let selected = if is_connected {
             if npad_type == hid_core::hid_types::NpadStyleIndex::Handheld {
-                player_one.lock().disconnect();
-                handheld.lock().connect(true);
+                with_controller(&player_one, |player_one| player_one.disconnect());
+                with_controller(&handheld, |handheld| handheld.connect(true));
                 handheld
             } else {
-                handheld.lock().disconnect();
-                player_one.lock().connect(true);
+                with_controller(&handheld, |handheld| handheld.disconnect());
+                with_controller(&player_one, |player_one| player_one.connect(true));
                 player_one
             }
         } else {
             current.unwrap_or(player_one)
         };
-        selected.lock().set_npad_style_index(npad_type);
+        with_controller(&selected, |selected| selected.set_npad_style_index(npad_type));
         *self.controller.borrow_mut() = Some(selected);
     }
 
@@ -910,7 +913,9 @@ impl Drop for PlayerPage {
             }
         }
         for controller in self.configuration_controllers.get_mut() {
-            controller.lock().disable_configuration();
+            hid_core::hid_core::with_controller(controller, |controller| {
+                controller.disable_configuration()
+            });
         }
     }
 }
@@ -949,7 +954,7 @@ pub fn page(
         handheld.lock().enable_configuration();
 
         let selected = if handheld.lock().is_connected(true) {
-            player_one.lock().disconnect();
+            hid_core::hid_core::with_controller(&player_one, |player_one| player_one.disconnect());
             Arc::clone(&handheld)
         } else {
             Arc::clone(&player_one)
@@ -1329,11 +1334,13 @@ pub fn page(
             page.state.borrow_mut().connected = is_connected;
             let controller = page.controller.borrow().as_ref().cloned();
             if let Some(controller) = controller {
-                if is_connected {
-                    controller.lock().connect(true);
-                } else {
-                    controller.lock().disconnect();
-                }
+                hid_core::hid_core::with_controller(&controller, |controller| {
+                    if is_connected {
+                        controller.connect(true);
+                    } else {
+                        controller.disconnect();
+                    }
+                });
             }
         });
     }
@@ -1674,22 +1681,26 @@ pub fn page(
         page_owner.refresh_devices();
         if !debug {
         if let Some(controller) = page_owner.controller.borrow().as_ref() {
-            let mut controller = controller.lock();
-            controller.set_npad_style_index(
+            use hid_core::hid_core::with_controller;
+            let npad_type =
                 hid_core::frontend::emulated_controller::EmulatedController::map_settings_type_to_npad(
                     selected_controller_type,
-                ),
-            );
-            if is_connected {
-                controller.connect(true);
-            } else {
-                controller.disconnect();
-            }
+                );
+            with_controller(controller, |controller| controller.set_npad_style_index(npad_type));
+            with_controller(controller, |controller| {
+                if is_connected {
+                    controller.connect(true);
+                } else {
+                    controller.disconnect();
+                }
+            });
         }
         }
         for controller in page_owner.configuration_controllers.borrow().iter() {
+            hid_core::hid_core::with_controller(controller, |controller| {
+                controller.disable_configuration()
+            });
             let mut controller = controller.lock();
-            controller.disable_configuration();
             controller.save_current_config();
             controller.enable_configuration();
         }

@@ -11,6 +11,8 @@ use common::ResultCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use crate::hid_core::with_controller;
+
 use crate::frontend::emulated_controller::{
     apply_simple_npad_stick_buttons, get_simple_npad_button_state, AnalogSticks, BatteryLevelState,
     ControllerColors, ControllerTriggerType, ControllerUpdateCallback, EmulatedDeviceIndex,
@@ -414,6 +416,11 @@ impl NPad {
                 };
 
                 let mut device = device.lock();
+                // Notifications a `connect` below raises are delivered only
+                // after this guard is released; see `with_controller`.
+                let mut connect_callbacks: Vec<
+                    crate::frontend::emulated_controller::DeferredControllerCallback,
+                > = Vec::new();
                 let controller_type = device.get_npad_style_index(false);
                 let npad_id = device.get_npad_id_type();
                 let is_connected = device.is_connected(false);
@@ -458,7 +465,7 @@ impl NPad {
                         colors,
                         battery,
                     );
-                    device.connect(false);
+                    connect_callbacks = device.run_deferred(|device| device.connect(false)).1;
                     device.set_led_pattern();
                     if controller_type == NpadStyleIndex::JoyconDual {
                         if controller.is_dual_left_connected {
@@ -497,6 +504,10 @@ impl NPad {
                 }
 
                 if !enable_input || !controller.shared_memory_assigned || !controller.is_active {
+                    drop(device);
+                    for callback in connect_callbacks {
+                        callback.dispatch();
+                    }
                     continue;
                 }
 
@@ -508,6 +519,9 @@ impl NPad {
                 apply_simple_npad_stick_buttons(&mut stick_state, simple_buttons);
                 let trigger_state = device.get_triggers();
                 drop(device);
+                for callback in connect_callbacks {
+                    callback.dispatch();
+                }
 
                 Self::request_pad_state_update(
                     controller,
@@ -842,7 +856,7 @@ impl NPad {
 
     fn disconnect_npad(npad: &mut NpadInternalState, controller: &mut NpadControllerData) {
         if let Some(device) = &controller.device {
-            device.lock().disconnect();
+            with_controller(device, |device| device.disconnect());
         }
         Self::disconnect_controller(npad, controller);
     }
@@ -855,10 +869,10 @@ impl NPad {
         let Some(device) = controller.device.as_ref().cloned() else {
             return;
         };
+        with_controller(&device, |device| device.set_npad_style_index(controller_type));
+        with_controller(&device, |device| device.connect(false));
         let (is_connected, body_colors, battery_level) = {
-            let mut device = device.lock();
-            device.set_npad_style_index(controller_type);
-            device.connect(false);
+            let device = device.lock();
             (
                 device.is_connected(false),
                 device.get_colors(),

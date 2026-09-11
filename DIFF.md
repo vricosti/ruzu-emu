@@ -16666,3 +16666,42 @@ unchanged.
   notifications are discarded, and NFC detection is not disabled to avoid it.
 - The reentrant callback regression now also reloads the configuration working
   copy repeatedly, asserting callbacks can acquire the owner and are delivered.
+
+## 2026-09-11 — Controller notifications under the shared owner: hid_core/hid_core.rs, frontend/emulated_controller.rs vs hid_core/hid_core.{h,cpp}, frontend/emulated_controller.{h,cpp}
+
+### Intentional differences
+- Eden's `EmulatedController` is reached through a raw pointer and fires
+  `ControllerUpdateCallback`s inline from `Connect`, `Disconnect`,
+  `SetNpadStyleIndex`, `DisableConfiguration` and every `ForceUpdate`. A callback
+  may call straight back into the controller — `NfcDevice::NpadUpdate` does,
+  through `HasNfc`/`AddNfcHandle`/`RemoveNfcHandle`. The Rust owner is a
+  non-reentrant `Arc<Mutex<EmulatedController>>`, so any such call made while the
+  owner is locked deadlocks the moment an NFC device is registered on that
+  controller. A live sample showed the Properties dialog hung in
+  `ConfigurePerGame::apply_configuration -> reload_from_settings -> disconnect ->
+  NfcDevice::npad_update -> finalize -> controller.lock()` after a game had opened
+  `nfp:user`.
+- `hid_core::with_controller(handle, f)` is the single entry point for any call
+  that can raise a notification: it locks, runs `f`, and delivers the retained
+  notifications after the guard is released. `EmulatedController::run_deferred`
+  retains them in firing order through the existing `deferred_input_callbacks`
+  queue, which now serves both the controller's own transitions and the drivers'
+  ForceUpdate path; the separate `defer_callback_dispatch` flag and its queue are
+  gone. `reload_controller_from_settings` is upstream's `ReloadFromSettings` as
+  two such calls, so `Connect`/`Disconnect` notifications are delivered before
+  `ReloadInput`, as upstream's inline order has it.
+- Every production site that locked a controller and then called a firing method
+  now goes through `with_controller`, one firing call per closure so the delivered
+  notifications interleave with the caller's own sequence as upstream's inline
+  ones do: docked-mode toggle, Properties/Controls apply, controller-type and
+  connect changes, dialog teardown, hotkey/ring capture, the controller applets
+  (frontend and GUI), `HIDCore::disable_all_controller_configuration`, and the
+  NPad service's disconnect/update paths (`OnUpdate` retains the `connect`
+  notifications until its device guard is dropped).
+- Notifications raised from inside one controller method (`DisableConfiguration`'s
+  internal `Disconnect`/`SetNpadStyleIndex`/`Connect`) are delivered after that
+  method returns rather than between its steps; nothing is discarded.
+- Regressions: `controller_reload_with_a_registered_nfc_device_must_not_deadlock`
+  (core, with a negative control proving the bare pattern still hangs) and
+  `with_controller_delivers_reentrant_callbacks_after_releasing_the_owner`
+  (hid_core).

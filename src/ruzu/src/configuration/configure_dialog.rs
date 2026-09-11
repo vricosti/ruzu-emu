@@ -421,7 +421,9 @@ fn finish_input_configuration(
         controllers
     };
     for controller in controllers {
-        controller.lock().disable_configuration();
+        hid_core::hid_core::with_controller(&controller, |controller| {
+            controller.disable_configuration()
+        });
     }
 }
 

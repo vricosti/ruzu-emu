@@ -180,7 +180,9 @@ impl ControllerCapture {
             started: Instant::now(), buttons: NpadButton::empty(), home: false, screenshot: false,
         });
         row.set_controller_hotkey(&crate::i18n::tr("[waiting]"));
-        self.controller.lock().disable_configuration();
+        hid_core::hid_core::with_controller(&self.controller, |controller| {
+            controller.disable_configuration()
+        });
         let weak = Rc::downgrade(self);
         *self.timer.borrow_mut() = Some(gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
             let Some(capture) = weak.upgrade() else { return gtk::glib::ControlFlow::Break; };

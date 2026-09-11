@@ -20,6 +20,45 @@ pub const AVAILABLE_CONTROLLERS: usize = 10;
 /// `std::unique_ptr<EmulatedController>`.
 pub type EmulatedControllerHandle = Arc<Mutex<EmulatedController>>;
 
+/// Runs `f` on the locked controller and delivers every notification it
+/// raised only after the lock is released.
+///
+/// Upstream fires `ControllerUpdateCallback`s inline from `Connect`,
+/// `Disconnect`, `SetNpadStyleIndex`, `DisableConfiguration` and every
+/// `ForceUpdate`, and a callback may call straight back into the controller
+/// (`NfcDevice::NpadUpdate` does, through `HasNfc`/`AddNfcHandle`/
+/// `RemoveNfcHandle`). Upstream has no lock to re-enter; the Rust owner is a
+/// non-reentrant mutex, so notifications raised under it are queued by
+/// `EmulatedController::run_deferred` and delivered here, in the order
+/// upstream would have fired them, once the guard is gone.
+///
+/// Reach the owner through this for any call that can raise a notification,
+/// one call per closure so the queued callbacks interleave with the caller's
+/// own sequence the way upstream's inline ones do. A bare
+/// `controller.lock().connect(..)` deadlocks the moment an NFC device is
+/// registered on that controller - the Properties dialog hang after a game
+/// had opened `nfp:user`.
+pub fn with_controller<R>(
+    controller: &EmulatedControllerHandle,
+    f: impl FnOnce(&mut EmulatedController) -> R,
+) -> R {
+    let (result, callbacks) = controller.lock().run_deferred(f);
+    for callback in callbacks {
+        callback.dispatch();
+    }
+    result
+}
+
+/// Upstream `EmulatedController::ReloadFromSettings` for a shared owner: the
+/// parameter/connection half, then `ReloadInput`, each delivering its
+/// notifications before the next runs, as the inline upstream calls do.
+pub fn reload_controller_from_settings(controller: &EmulatedControllerHandle) {
+    with_controller(controller, |controller| {
+        controller.reload_from_settings_before_input_reload()
+    });
+    with_controller(controller, |controller| controller.reload_input());
+}
+
 pub struct HIDCore {
     player_1: EmulatedControllerHandle,
     player_2: EmulatedControllerHandle,
@@ -191,40 +230,33 @@ impl HIDCore {
     }
 
     pub fn disable_all_controller_configuration(&mut self) {
-        self.player_1.lock().disable_configuration();
-        self.player_2.lock().disable_configuration();
-        self.player_3.lock().disable_configuration();
-        self.player_4.lock().disable_configuration();
-        self.player_5.lock().disable_configuration();
-        self.player_6.lock().disable_configuration();
-        self.player_7.lock().disable_configuration();
-        self.player_8.lock().disable_configuration();
-        self.other.lock().disable_configuration();
-        self.handheld.lock().disable_configuration();
+        for controller in [
+            &self.player_1,
+            &self.player_2,
+            &self.player_3,
+            &self.player_4,
+            &self.player_5,
+            &self.player_6,
+            &self.player_7,
+            &self.player_8,
+            &self.other,
+            &self.handheld,
+        ] {
+            with_controller(controller, |controller| controller.disable_configuration());
+        }
     }
 
     pub fn reload_input_devices(&mut self) {
-        fn reload(controller: &EmulatedControllerHandle) {
-            let callbacks = controller.lock().reload_from_settings_deferred();
-            for callback in callbacks {
-                callback.dispatch();
-            }
-            let callbacks = controller.lock().reload_input_deferred();
-            for callback in callbacks {
-                callback.dispatch();
-            }
-        }
-
-        reload(&self.player_1);
-        reload(&self.player_2);
-        reload(&self.player_3);
-        reload(&self.player_4);
-        reload(&self.player_5);
-        reload(&self.player_6);
-        reload(&self.player_7);
-        reload(&self.player_8);
-        reload(&self.other);
-        reload(&self.handheld);
+        reload_controller_from_settings(&self.player_1);
+        reload_controller_from_settings(&self.player_2);
+        reload_controller_from_settings(&self.player_3);
+        reload_controller_from_settings(&self.player_4);
+        reload_controller_from_settings(&self.player_5);
+        reload_controller_from_settings(&self.player_6);
+        reload_controller_from_settings(&self.player_7);
+        reload_controller_from_settings(&self.player_8);
+        reload_controller_from_settings(&self.other);
+        reload_controller_from_settings(&self.handheld);
         self.console.reload_from_settings();
         self.devices.reload_from_settings();
     }
@@ -262,5 +294,45 @@ mod tests {
         let by_index = hid_core.get_emulated_controller_by_index(0);
 
         assert!(Arc::ptr_eq(&by_id, &by_index));
+    }
+
+    /// A callback that re-enters the controller - as `NfcDevice::npad_update`
+    /// does - must run after the owner is released, and every notification
+    /// the closure raised must arrive, in the order upstream fires them.
+    #[test]
+    fn with_controller_delivers_reentrant_callbacks_after_releasing_the_owner() {
+        use crate::frontend::emulated_controller::{
+            ControllerTriggerType, ControllerUpdateCallback,
+        };
+
+        let hid_core = HIDCore::new();
+        let controller = hid_core.get_emulated_controller_by_index(0);
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&delivered);
+        let owner = Arc::downgrade(&controller);
+        controller.lock().set_callback(ControllerUpdateCallback {
+            on_change: Arc::new(move |trigger| {
+                let connected = owner
+                    .upgrade()
+                    .map(|controller| controller.lock().is_connected(false));
+                log.lock().push((trigger, connected));
+            }),
+            is_npad_service: false,
+        });
+
+        with_controller(&controller, |controller| {
+            controller.set_npad_style_index(NpadStyleIndex::JoyconDual)
+        });
+        with_controller(&controller, |controller| controller.connect(false));
+        with_controller(&controller, |controller| controller.disconnect());
+
+        assert_eq!(
+            *delivered.lock(),
+            [
+                (ControllerTriggerType::Type, Some(false)),
+                (ControllerTriggerType::Connected, Some(true)),
+                (ControllerTriggerType::Disconnected, Some(false)),
+            ]
+        );
     }
 }

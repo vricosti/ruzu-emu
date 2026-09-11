@@ -81,7 +81,7 @@ pub fn page(hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>) -> P
                     }
                     settings.players.set_global(true);
                 }
-                controllers[index].lock().reload_from_settings();
+                hid_core::hid_core::reload_controller_from_settings(&controllers[index]);
                 continue;
             }
             let Some(profile_name) = profile_names.get(selected - 1) else {
@@ -111,9 +111,9 @@ pub fn page(hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>) -> P
                 }
             };
             if loaded {
-                controllers[index].lock().reload_from_settings();
+                hid_core::hid_core::reload_controller_from_settings(&controllers[index]);
                 if index == 0 {
-                    handheld_controller.lock().reload_from_settings();
+                    hid_core::hid_core::reload_controller_from_settings(&handheld_controller);
                 }
             }
         }

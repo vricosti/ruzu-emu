@@ -55,10 +55,10 @@ fn select_pro_controller_for_docked_mode(hid: &parking_lot::Mutex<hid_core::hid_
         (hid.get_emulated_controller(NpadIdType::Handheld),
          hid.get_emulated_controller(NpadIdType::Player1))
     };
-    handheld.lock().disconnect();
-    let mut player = player.lock();
-    player.set_npad_style_index(NpadStyleIndex::Fullkey);
-    player.connect(false);
+    use hid_core::hid_core::with_controller;
+    with_controller(&handheld, |handheld| handheld.disconnect());
+    with_controller(&player, |player| player.set_npad_style_index(NpadStyleIndex::Fullkey));
+    with_controller(&player, |player| player.connect(false));
 }
 
 /// MainWindow::OnMute; the action refreshes the GTK volume label afterwards.

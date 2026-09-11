@@ -258,8 +258,10 @@ struct ControllerEventContext {
     is_connected: AtomicBool,
     supported_style_tag: Mutex<NpadStyleTag>,
     callback_list: Mutex<HashMap<i32, ControllerUpdateCallback>>,
-    // ForceUpdate can synchronously enter the driver callback path while the
-    // Rust controller owner is locked. Retain notifications until it is released.
+    // While `EmulatedController::run_deferred` is active, every notification -
+    // the controller's own transitions and the drivers' ForceUpdate path alike -
+    // is retained here in firing order instead of being delivered under the
+    // Rust controller owner lock.
     deferred_input_callbacks: Mutex<Option<Vec<DeferredControllerCallback>>>,
 }
 
@@ -981,8 +983,6 @@ pub struct EmulatedController {
     mutex: Mutex<()>,
     event_context: Arc<ControllerEventContext>,
     last_callback_key: i32,
-    defer_callback_dispatch: bool,
-    deferred_callbacks: Vec<DeferredControllerCallback>,
 
     // The parameters each input device is built from — upstream's
     // `button_params`, `stick_params`, `motion_params`, `trigger_params`,
@@ -1097,8 +1097,6 @@ impl EmulatedController {
             mutex: Mutex::new(()),
             event_context,
             last_callback_key: 0,
-            defer_callback_dispatch: false,
-            deferred_callbacks: Vec::new(),
             button_params: vec![
                 ParamPackage::default();
                 settings_input::native_button::NUM_BUTTONS
@@ -1550,13 +1548,7 @@ impl EmulatedController {
     /// after, so a device that already has a value reports it without waiting
     /// for the next change.
     pub(crate) fn reload_input_deferred(&mut self) -> Vec<DeferredControllerCallback> {
-        {
-            let mut pending = self.event_context.deferred_input_callbacks.lock();
-            assert!(pending.is_none());
-            *pending = Some(Vec::new());
-        }
-        self.reload_input();
-        self.event_context.deferred_input_callbacks.lock().take().unwrap()
+        self.run_deferred(|controller| controller.reload_input()).1
     }
 
     pub fn reload_input(&mut self) {
@@ -1717,7 +1709,7 @@ impl EmulatedController {
         self.reload_input();
     }
 
-    fn reload_from_settings_before_input_reload(&mut self) {
+    pub(crate) fn reload_from_settings_before_input_reload(&mut self) {
         let player_index = crate::hid_util::npad_id_type_to_index(self.npad_id_type);
         let (buttons, analogs, motions, ringcon_analog, controller_type, connected) = {
             let settings = common::settings::values();
@@ -1766,16 +1758,24 @@ impl EmulatedController {
         }
     }
 
-    /// Perform `ReloadFromSettings` while retaining the callbacks that Eden
-    /// invokes after each state transition. `HIDCore` dispatches the returned
-    /// callbacks only after releasing the Rust controller-owner mutex; Eden's
-    /// controller pointer has no equivalent outer mutex to re-enter.
-    pub(crate) fn reload_from_settings_deferred(&mut self) -> Vec<DeferredControllerCallback> {
-        assert!(!self.defer_callback_dispatch);
-        self.defer_callback_dispatch = true;
-        self.reload_from_settings_before_input_reload();
-        self.defer_callback_dispatch = false;
-        std::mem::take(&mut self.deferred_callbacks)
+    /// Runs `f`, retaining every notification it raises - from this
+    /// controller's own transitions and from the input devices' `ForceUpdate`
+    /// alike, in the order upstream fires them inline - for the caller to
+    /// deliver once the Rust owner mutex is released. Upstream's controller
+    /// pointer has no such mutex to re-enter; `hid_core::with_controller` is
+    /// the entry point that pairs this with the release.
+    pub(crate) fn run_deferred<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, Vec<DeferredControllerCallback>) {
+        {
+            let mut pending = self.event_context.deferred_input_callbacks.lock();
+            assert!(pending.is_none(), "controller notifications are already being retained");
+            *pending = Some(Vec::new());
+        }
+        let result = f(self);
+        let callbacks = self.event_context.deferred_input_callbacks.lock().take().unwrap();
+        (result, callbacks)
     }
 
     /// Port of EmulatedController::SetButtonParam.
@@ -2489,20 +2489,6 @@ impl EmulatedController {
     }
 
     fn trigger_on_change(&mut self, trigger_type: ControllerTriggerType, is_service_update: bool) {
-        if self.defer_callback_dispatch {
-            self.deferred_callbacks.extend(
-                self.event_context
-                    .callback_list
-                    .lock()
-                    .values()
-                    .filter(|callback| is_service_update || !callback.is_npad_service)
-                    .map(|callback| DeferredControllerCallback {
-                        callback: Arc::clone(&callback.on_change),
-                        trigger_type,
-                    }),
-            );
-            return;
-        }
         trigger_on_change(&self.event_context, trigger_type, is_service_update);
     }
 }
@@ -2705,12 +2691,11 @@ mod tests {
             is_npad_service: false,
         });
 
-        controller.defer_callback_dispatch = true;
-        controller.trigger_on_change(ControllerTriggerType::Disconnected, true);
-        controller.defer_callback_dispatch = false;
+        let ((), callbacks) = controller.run_deferred(|controller| {
+            controller.trigger_on_change(ControllerTriggerType::Disconnected, true)
+        });
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let callbacks = std::mem::take(&mut controller.deferred_callbacks);
         drop(controller);
         for callback in callbacks {
             callback.dispatch();

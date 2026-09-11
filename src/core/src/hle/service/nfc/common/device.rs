@@ -1561,6 +1561,105 @@ mod tests {
         }).unwrap().join().unwrap();
     }
 
+    /// `NfcDevice::npad_update` re-enters its controller from inside the
+    /// controller's own change callback (`Connected` -> `initialize` ->
+    /// `has_nfc`/`add_nfc_handle`; `Disconnected` -> `finalize` ->
+    /// `remove_nfc_handle`), exactly as upstream does. Upstream's controller
+    /// is a bare pointer; the Rust owner is a non-reentrant mutex, so any
+    /// caller that reloads a controller while holding that mutex deadlocks
+    /// the moment an NFC device is registered on it - the Properties dialog
+    /// hang seen after a game opened `nfp:user`.
+    #[test]
+    fn controller_reload_with_a_registered_nfc_device_must_not_deadlock() {
+        use hid_core::hid_core::{reload_controller_from_settings, HIDCore};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let hid_core = HIDCore::new();
+        let mut context = ServiceContext::new("NfcDeviceDeadlockTest".to_string());
+        // Production default: player 1 is connected, so a reload fires
+        // `Disconnected` then `Connected`, and the NFC device re-enters the
+        // controller on both (`finalize` and `initialize`).
+        {
+            let mut settings = common::settings::values_mut();
+            let players = settings.players.get_value_mut();
+            players[0].connected = true;
+            players[1].connected = true;
+        }
+        let mut wire = |index: usize| {
+            let controller = hid_core.get_emulated_controller_by_index(index);
+            // A reload only fires `Disconnected` from a connected controller.
+            // Nothing is registered yet, so this cannot re-enter anything.
+            controller.lock().connect(false);
+            let device = NfcDevice::new_with_controller(
+                index as u64,
+                Some(Arc::clone(&controller)),
+                None,
+                &mut context,
+                crate::core::SystemRef::null(),
+            );
+            let mut state = device.inner.lock();
+            assert!(state.callback_key.is_some());
+            // The state a game leaves behind once `NFP::Initialize` succeeded:
+            // only then does `Disconnected` -> `finalize` reach
+            // `controller.lock().remove_nfc_handle()`. A never-initialized
+            // device stays `Unavailable` and never re-enters the controller.
+            state.device_state = DeviceState::Initialized;
+            drop(state);
+            (controller, device)
+        };
+
+        // The owner-aware entry point must complete and still deliver the
+        // notifications upstream fires inline from Disconnect/Connect.
+        let (controller, device) = wire(0);
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&delivered);
+        controller.lock().set_callback(ControllerUpdateCallback {
+            on_change: Arc::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+            is_npad_service: false,
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fixed = Arc::clone(&controller);
+        std::thread::spawn(move || {
+            reload_controller_from_settings(&fixed);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "reload_controller_from_settings deadlocked with an NFC device registered"
+        );
+        // `Disconnected` and `Connected` were both delivered once the owner
+        // was released, and each re-entered the controller: `finalize` ->
+        // `remove_nfc_handle` took the device from `Initialized` to
+        // `Unavailable`; `initialize` -> `has_nfc` then kept it there, because
+        // upstream fires `Connected` before `ReloadInput` marks the controller
+        // initialized - the same first-reload result Eden produces.
+        assert!(delivered.load(Ordering::SeqCst) >= 2);
+        assert_eq!(device.get_current_state(), DeviceState::Unavailable);
+
+        // Negative control, on its own controller: the pattern the fix
+        // replaces must still hang, or this test proves nothing. The stuck
+        // thread keeps that controller's lock forever, so everything whose
+        // Drop would take it again is leaked rather than joined.
+        let (hazard_controller, hazard_device) = wire(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let hazard = Arc::clone(&hazard_controller);
+        std::thread::spawn(move || {
+            hazard.lock().reload_from_settings();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_err(),
+            "reload_from_settings under the owner lock no longer deadlocks; \
+             the negative control is stale"
+        );
+        std::mem::forget(hazard_device);
+        std::mem::forget(hazard_controller);
+        std::mem::forget(hid_core);
+    }
+
     fn mounted_plain_device() -> NfcDevice {
         let mut context = ServiceContext::new("NfcDeviceTest".to_string());
         let device = NfcDevice::new(0, &mut context);

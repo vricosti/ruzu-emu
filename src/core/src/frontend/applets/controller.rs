@@ -115,39 +115,37 @@ impl ControllerApplet for DefaultControllerApplet {
             (handheld, controllers)
         };
 
-        handheld.lock().disconnect();
+        use hid_core::hid_core::with_controller;
+        with_controller(&handheld, |handheld| handheld.disconnect());
 
         for (index, controller) in controllers.into_iter().enumerate() {
-            let mut controller = controller.lock();
-            controller.disconnect();
+            with_controller(&controller, |controller| controller.disconnect());
 
             if index >= min_supported_players {
                 continue;
             }
 
-            if parameters.allow_pro_controller {
-                controller.set_npad_style_index(NpadStyleIndex::Fullkey);
-                controller.connect(true);
+            let style = if parameters.allow_pro_controller {
+                NpadStyleIndex::Fullkey
             } else if parameters.allow_dual_joycons {
-                controller.set_npad_style_index(NpadStyleIndex::JoyconDual);
-                controller.connect(true);
+                NpadStyleIndex::JoyconDual
             } else if parameters.allow_left_joycon && parameters.allow_right_joycon {
-                controller.set_npad_style_index(if index % 2 == 0 {
+                if index % 2 == 0 {
                     NpadStyleIndex::JoyconLeft
                 } else {
                     NpadStyleIndex::JoyconRight
-                });
-                controller.connect(true);
+                }
             } else if index == 0
                 && parameters.enable_single_mode
                 && parameters.allow_handheld
                 && !common::settings::is_docked_mode(&common::settings::values())
             {
-                controller.set_npad_style_index(NpadStyleIndex::Handheld);
-                controller.connect(true);
+                NpadStyleIndex::Handheld
             } else {
                 panic!("Unable to add a new controller based on the given parameters");
-            }
+            };
+            with_controller(&controller, |controller| controller.set_npad_style_index(style));
+            with_controller(&controller, |controller| controller.connect(true));
         }
 
         callback(true);

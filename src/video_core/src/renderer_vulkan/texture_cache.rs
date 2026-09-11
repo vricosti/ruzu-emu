@@ -3357,11 +3357,19 @@ impl TextureCacheRuntime {
         let mut format_list = vk::ImageFormatListCreateInfo::builder()
             .view_formats(&view_formats)
             .build();
+        let has_storage_compatible_view = view_formats.iter().any(|&view_format| {
+            self.vulkan_device().is_format_supported(
+                view_format,
+                vk::FormatFeatureFlags::STORAGE_IMAGE,
+                FormatType::Optimal,
+            )
+        });
         apply_image_format_list(
             &mut image_info,
             &mut format_list,
             &view_formats,
             self.image_format_list_supported,
+            has_storage_compatible_view,
         );
         let memory_usage = self
             .can_report_memory_usage()
@@ -6235,12 +6243,45 @@ mod tests {
             .view_formats(&formats)
             .build();
         let mut image_info = vk::ImageCreateInfo::default();
-        apply_image_format_list(&mut image_info, &mut format_list, &formats, true);
+        apply_image_format_list(&mut image_info, &mut format_list, &formats, true, false);
 
         assert!(image_info
             .flags
-            .contains(vk::ImageCreateFlags::MUTABLE_FORMAT));
+            .contains(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE));
+        assert!(!image_info.usage.contains(vk::ImageUsageFlags::STORAGE));
         assert!(!image_info.p_next.is_null());
+    }
+
+    #[test]
+    fn mutable_image_gains_storage_usage_when_a_view_format_supports_storage() {
+        // Upstream `MakeImageCreateInfo`: an sRGB ASTC-transcoded image is not
+        // storage-capable itself, but its A8B8G8R8_UNORM storage view (used by
+        // the ASTC compute decoder) is, so the image must carry STORAGE usage.
+        let formats = [
+            vk::Format::A8B8G8R8_SRGB_PACK32,
+            vk::Format::A8B8G8R8_UNORM_PACK32,
+        ];
+        let mut format_list = vk::ImageFormatListCreateInfo::builder()
+            .view_formats(&formats)
+            .build();
+        let mut image_info = vk::ImageCreateInfo::default();
+        apply_image_format_list(&mut image_info, &mut format_list, &formats, false, true);
+
+        assert!(image_info
+            .flags
+            .contains(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE));
+        assert!(image_info.usage.contains(vk::ImageUsageFlags::STORAGE));
+        assert!(image_info.p_next.is_null());
+
+        // A single view format keeps the create info untouched.
+        let single = [vk::Format::A8B8G8R8_SRGB_PACK32];
+        let mut single_list = vk::ImageFormatListCreateInfo::builder()
+            .view_formats(&single)
+            .build();
+        let mut single_info = vk::ImageCreateInfo::default();
+        apply_image_format_list(&mut single_info, &mut single_list, &single, true, true);
+        assert!(single_info.flags.is_empty());
+        assert!(!single_info.usage.contains(vk::ImageUsageFlags::STORAGE));
     }
 
     #[test]
@@ -7148,11 +7189,21 @@ fn apply_image_format_list(
     format_list: &mut vk::ImageFormatListCreateInfo,
     view_formats: &[vk::Format],
     image_format_list_supported: bool,
+    has_storage_compatible_view: bool,
 ) {
     if view_formats.len() <= 1 {
         return;
     }
-    image_info.flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
+    // Upstream `MakeImageCreateInfo`: a mutable-format image also needs
+    // EXTENDED_USAGE, and STORAGE usage whenever one of its view formats
+    // supports storage images (e.g. the A8B8G8R8_UNORM storage view the ASTC
+    // compute decoder writes through on an sRGB image, whose own format is
+    // not storage-capable).
+    image_info.flags |=
+        vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE;
+    if has_storage_compatible_view {
+        image_info.usage |= vk::ImageUsageFlags::STORAGE;
+    }
     if image_format_list_supported {
         image_info.p_next = (format_list as *mut vk::ImageFormatListCreateInfo).cast();
     }

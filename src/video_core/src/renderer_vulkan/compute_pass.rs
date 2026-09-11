@@ -391,7 +391,7 @@ impl ComputePass {
                 .build();
 
             let pipelines = match unsafe {
-                logical.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
+                logical.create_compute_pipelines(device.static_pipeline_cache(), &[pipeline_ci], None)
             } {
                 Ok(pipelines) => pipelines,
                 Err((pipelines, error)) => {

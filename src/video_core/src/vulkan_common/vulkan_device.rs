@@ -464,6 +464,11 @@ pub struct Device {
     allocator: VmaAllocator,
     /// Logical device wrapper.
     logical: LogicalDevice,
+    /// Pipeline cache shared by every ad-hoc pipeline (blits, present,
+    /// compute passes). Upstream `Device::static_pipeline_cache`.
+    static_pipeline_cache: vk::PipelineCache,
+    /// Only the presenting device owns (loads/saves) the on-disk cache.
+    owns_static_pipeline_cache: bool,
     descriptor_buffer: Option<ash::extensions::ext::DescriptorBuffer>,
     synchronization2: Option<ash::extensions::khr::Synchronization2>,
     /// Device dispatch (ash device handle).
@@ -1850,12 +1855,19 @@ impl Device {
             is_integrated,
         );
 
+        // Upstream: `owns_static_pipeline_cache = surface != VkSurfaceKHR{}`
+        // followed by `LoadStaticPipelineCache()`.
+        let owns_static_pipeline_cache = surface != vk::SurfaceKHR::null();
+        let static_pipeline_cache =
+            load_static_pipeline_cache(&logical.device, owns_static_pipeline_cache);
         let device = Self {
             instance,
             physical,
             allocator,
             _dld: ash::Device::clone(&logical.device),
             logical,
+            static_pipeline_cache,
+            owns_static_pipeline_cache,
             descriptor_buffer,
             synchronization2,
             graphics_queue,
@@ -2332,6 +2344,40 @@ impl Device {
     }
 
     /// Returns the logical ash device.
+    /// Port of `Device::StaticPipelineCache`.
+    pub fn static_pipeline_cache(&self) -> vk::PipelineCache {
+        self.static_pipeline_cache
+    }
+
+    /// Port of `Device::SaveStaticPipelineCache`: write the cache with its
+    /// header; a failed write removes the (possibly truncated) file.
+    fn save_static_pipeline_cache(&self) {
+        if !self.owns_static_pipeline_cache
+            || self.static_pipeline_cache == vk::PipelineCache::null()
+        {
+            return;
+        }
+        let Some(filename) = static_pipeline_cache_filename() else {
+            return;
+        };
+        let data = unsafe {
+            self.logical
+                .device
+                .get_pipeline_cache_data(self.static_pipeline_cache)
+                .unwrap_or_default()
+        };
+        if data.is_empty() {
+            return;
+        }
+        let mut output = Vec::with_capacity(STATIC_CACHE_MAGIC_NUMBER.len() + 4 + data.len());
+        output.extend_from_slice(&STATIC_CACHE_MAGIC_NUMBER);
+        output.extend_from_slice(&STATIC_CACHE_VERSION.to_ne_bytes());
+        output.extend_from_slice(&data);
+        if std::fs::write(&filename, &output).is_err() {
+            let _ = std::fs::remove_file(&filename);
+        }
+    }
+
     pub fn get_logical(&self) -> &ash::Device {
         &self.logical.device
     }
@@ -3236,7 +3282,81 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
+        // Upstream `Device::~Device` saves the static pipeline cache first;
+        // the cache object is then destroyed before the logical device.
+        self.save_static_pipeline_cache();
+        if self.static_pipeline_cache != vk::PipelineCache::null() {
+            unsafe {
+                self.logical
+                    .device
+                    .destroy_pipeline_cache(self.static_pipeline_cache, None);
+            }
+            self.static_pipeline_cache = vk::PipelineCache::null();
+        }
         self.shutdown_gpu_logging();
+    }
+}
+
+/// On-disk header of the static pipeline cache (upstream
+/// `STATIC_CACHE_MAGIC_NUMBER` / `STATIC_CACHE_VERSION`).
+const STATIC_CACHE_MAGIC_NUMBER: [u8; 8] = *b"edenstpc";
+const STATIC_CACHE_VERSION: u32 = 1;
+
+/// Port of `StaticPipelineCacheFilename`: `None` when the shader directory
+/// cannot be created.
+fn static_pipeline_cache_filename() -> Option<std::path::PathBuf> {
+    let shader_dir =
+        common::fs::path_util::get_ruzu_path(common::fs::path_util::RuzuPath::ShaderDir);
+    if std::fs::create_dir_all(&shader_dir).is_err() {
+        return None;
+    }
+    Some(shader_dir.join("vulkan_static_pipelines.bin"))
+}
+
+/// Validates the magic number and version of a static pipeline cache file
+/// and returns the raw `VkPipelineCache` payload.
+fn parse_static_pipeline_cache_blob(file: &[u8]) -> Option<&[u8]> {
+    const HEADER: usize = STATIC_CACHE_MAGIC_NUMBER.len() + std::mem::size_of::<u32>();
+    if file.len() < HEADER {
+        return None;
+    }
+    let (magic, rest) = file.split_at(STATIC_CACHE_MAGIC_NUMBER.len());
+    let (version, payload) = rest.split_at(std::mem::size_of::<u32>());
+    let version = u32::from_ne_bytes(version.try_into().ok()?);
+    if magic != STATIC_CACHE_MAGIC_NUMBER || version != STATIC_CACHE_VERSION {
+        return None;
+    }
+    Some(payload)
+}
+
+/// Port of `Device::LoadStaticPipelineCache`: create the static pipeline
+/// cache, seeded from disk when this device owns the cache and the file is
+/// valid; otherwise (or on any error) create it empty.
+fn load_static_pipeline_cache(logical: &ash::Device, owns: bool) -> vk::PipelineCache {
+    let create = |initial_data: &[u8]| {
+        let ci = vk::PipelineCacheCreateInfo::builder()
+            .initial_data(initial_data)
+            .build();
+        match unsafe { logical.create_pipeline_cache(&ci, None) } {
+            Ok(cache) => cache,
+            Err(err) => {
+                log::error!("Failed to create the static pipeline cache: {err:?}");
+                vk::PipelineCache::null()
+            }
+        }
+    };
+    if !owns {
+        return create(&[]);
+    }
+    let Some(filename) = static_pipeline_cache_filename() else {
+        return create(&[]);
+    };
+    let Ok(file) = std::fs::read(&filename) else {
+        return create(&[]);
+    };
+    match parse_static_pipeline_cache_blob(&file) {
+        Some(payload) => create(payload),
+        None => create(&[]),
     }
 }
 
@@ -4610,5 +4730,36 @@ mod tests {
             features.shader_storage_texel_buffer_array_non_uniform_indexing,
             vk::TRUE
         );
+    }
+}
+
+#[cfg(test)]
+mod static_pipeline_cache_tests {
+    use super::{parse_static_pipeline_cache_blob, STATIC_CACHE_MAGIC_NUMBER, STATIC_CACHE_VERSION};
+
+    fn blob(magic: &[u8; 8], version: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = magic.to_vec();
+        out.extend_from_slice(&version.to_ne_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn static_pipeline_cache_header_is_edenstpc_version_1() {
+        assert_eq!(&STATIC_CACHE_MAGIC_NUMBER, b"edenstpc");
+        assert_eq!(STATIC_CACHE_VERSION, 1);
+        let file = blob(&STATIC_CACHE_MAGIC_NUMBER, STATIC_CACHE_VERSION, &[1, 2, 3]);
+        assert_eq!(parse_static_pipeline_cache_blob(&file), Some(&[1u8, 2, 3][..]));
+        // An empty payload is still a valid file (upstream creates the cache
+        // with a null pointer in that case).
+        let empty = blob(&STATIC_CACHE_MAGIC_NUMBER, STATIC_CACHE_VERSION, &[]);
+        assert_eq!(parse_static_pipeline_cache_blob(&empty), Some(&[][..]));
+    }
+
+    #[test]
+    fn static_pipeline_cache_rejects_short_wrong_magic_or_version() {
+        assert_eq!(parse_static_pipeline_cache_blob(b"edenstpc\x01"), None);
+        assert_eq!(parse_static_pipeline_cache_blob(&blob(b"edenstpd", 1, &[0])), None);
+        assert_eq!(parse_static_pipeline_cache_blob(&blob(b"edenstpc", 2, &[0])), None);
     }
 }

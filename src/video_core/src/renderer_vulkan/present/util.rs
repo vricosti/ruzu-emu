@@ -750,7 +750,7 @@ pub fn create_wrapped_compute_pipeline(
     let pipelines = unsafe {
         device
             .get_logical()
-            .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
+            .create_compute_pipelines(device.static_pipeline_cache(), &[pipeline_ci], None)
             .expect("Failed to create wrapped compute pipeline")
     };
     pipelines[0]
@@ -841,7 +841,7 @@ fn create_wrapped_pipeline_impl(
     let pipelines = unsafe {
         device
             .get_logical()
-            .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
+            .create_graphics_pipelines(device.static_pipeline_cache(), &[pipeline_ci], None)
             .expect("Failed to create wrapped pipeline")
     };
     pipelines[0]

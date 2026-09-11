@@ -2644,7 +2644,7 @@ impl BlitImageHelper {
             .build();
         let pipeline = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .create_graphics_pipelines(unsafe { self.device_owner.as_ref() }.static_pipeline_cache(), &[create_info], None)
                 .map_err(|(_, err)| err)?[0]
         };
         self.blit_msaa_color_keys.push(*key);
@@ -2740,7 +2740,7 @@ impl BlitImageHelper {
             .build();
         let pipeline = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .create_graphics_pipelines(unsafe { self.device_owner.as_ref() }.static_pipeline_cache(), &[create_info], None)
                 .map_err(|(_, err)| err)?[0]
         };
         keys.push(renderpass);
@@ -2820,7 +2820,7 @@ impl BlitImageHelper {
             .build();
         let pipeline = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .create_graphics_pipelines(unsafe { self.device_owner.as_ref() }.static_pipeline_cache(), &[create_info], None)
                 .map_err(|(_, err)| err)?[0]
         };
         self.msaa_copy_keys.push(*key);
@@ -2914,7 +2914,7 @@ impl BlitImageHelper {
             .build();
         let pipeline = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .create_graphics_pipelines(unsafe { self.device_owner.as_ref() }.static_pipeline_cache(), &[pipeline_info], None)
                 .map_err(|(_, err)| err)?[0]
         };
         self.blit_color_keys.push(*key);
@@ -2988,7 +2988,7 @@ impl BlitImageHelper {
             .build();
         let pipeline = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .create_graphics_pipelines(unsafe { self.device_owner.as_ref() }.static_pipeline_cache(), &[pipeline_info], None)
                 .map_err(|(_, err)| err)?[0]
         };
         self.blit_depth_stencil_keys.push(*key);
@@ -3081,7 +3081,7 @@ impl BlitImageHelper {
             .build();
         let pipeline = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .create_graphics_pipelines(unsafe { self.device_owner.as_ref() }.static_pipeline_cache(), &[pipeline_info], None)
                 .map_err(|(_, err)| err)?[0]
         };
         self.clear_color_keys.push(*key);
@@ -3191,7 +3191,7 @@ impl BlitImageHelper {
             .build();
         let pipeline = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .create_graphics_pipelines(unsafe { self.device_owner.as_ref() }.static_pipeline_cache(), &[pipeline_info], None)
                 .map_err(|(_, err)| err)?[0]
         };
         self.clear_stencil_keys.push(*key);
@@ -3304,7 +3304,7 @@ impl BlitImageHelper {
         let create_info = create_info.build();
         unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .create_graphics_pipelines(unsafe { self.device_owner.as_ref() }.static_pipeline_cache(), &[create_info], None)
                 .map_err(|(_, err)| err)
                 .map(|pipelines| pipelines[0])
         }
@@ -3415,7 +3415,7 @@ impl BlitImageHelper {
         let create_info = create_info.build();
         unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .create_graphics_pipelines(unsafe { self.device_owner.as_ref() }.static_pipeline_cache(), &[create_info], None)
                 .map_err(|(_, err)| err)
                 .map(|pipelines| pipelines[0])
         }

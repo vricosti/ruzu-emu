@@ -1376,6 +1376,10 @@ impl Default for ShaderPools {
 // extended dynamic state owns them, matching upstream. Version 16 entries
 // can contain per-draw strides and therefore produce duplicate pipelines.
 const CACHE_VERSION: u32 = 18;
+// Upstream: flush the Vulkan pipeline cache to disk at most once per
+// max(30 s, 1 s per MiB of cache) once 128 new pipelines were built.
+const VULKAN_CACHE_FLUSH_PIPELINES: usize = 128;
+const VULKAN_CACHE_FLUSH_MIN_SECONDS: u64 = 30;
 const VULKAN_CACHE_MAGIC_NUMBER: [u8; 8] = *b"yuzuvkch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1383,6 +1387,29 @@ enum VulkanPipelineCacheHeaderError {
     TooSmall,
     InvalidMagic,
     VersionMismatch,
+}
+
+/// Port of `SerializeVulkanPipelineCache`: write the Vulkan pipeline cache
+/// data with the magic number and cache version header.
+fn serialize_vulkan_pipeline_cache_blob(
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    filename: &std::path::Path,
+) {
+    if cache == vk::PipelineCache::null() {
+        log::error!("Refusing to serialize a null Vulkan pipeline cache");
+        return;
+    }
+    let data = unsafe { device.get_pipeline_cache_data(cache).unwrap_or_default() };
+
+    let mut output = Vec::with_capacity(VULKAN_CACHE_MAGIC_NUMBER.len() + 4 + data.len());
+    output.extend_from_slice(&VULKAN_CACHE_MAGIC_NUMBER);
+    output.extend_from_slice(&CACHE_VERSION.to_le_bytes());
+    output.extend_from_slice(&data);
+
+    if let Err(e) = std::fs::write(filename, &output) {
+        log::error!("Failed to write Vulkan pipeline cache: {}", e);
+    }
 }
 
 fn parse_vulkan_pipeline_cache_blob(
@@ -1536,7 +1563,7 @@ where
         log::error!("Skipping {hash:#016x}");
         return None;
     }
-    log::info!("{hash:#016x}");
+    log::debug!("{hash:#016x}");
     if *common::settings::values().dump_guest_shaders.get_value() {
         env.dump(hash, key.unique_hash);
     }
@@ -1730,6 +1757,12 @@ pub struct PipelineCache {
     workers: ThreadWorker,
     /// Upstream `Common::ThreadWorker serialization_thread`.
     serialization_thread: ThreadWorker,
+    // Periodic Vulkan pipeline cache flush state (upstream fields of the same
+    // names). The atomics are shared with the serialization worker.
+    pipelines_since_flush: usize,
+    last_flush: Option<std::time::Instant>,
+    last_cache_size: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    flush_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PipelineCache {
@@ -1866,6 +1899,10 @@ impl PipelineCache {
                 1,
                 "VkPipelineSerialization".to_string(),
             ),
+            pipelines_since_flush: 0,
+            last_flush: None,
+            last_cache_size: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            flush_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         pipeline_cache
     }
@@ -1940,7 +1977,9 @@ impl PipelineCache {
             let mut env = ComputeEnvironment::from_kepler_compute(kepler_compute, gpu_memory);
             env.generic_environment_mut().set_cached_size(shader_size);
             self.main_pools.release_contents();
-            let pipeline = self.create_compute_pipeline_from_environment(&key, &mut env)?;
+            let pipeline = self.create_compute_pipeline_from_environment(&key, &mut env);
+            self.queue_vulkan_pipeline_cache_flush();
+            let pipeline = pipeline?;
             if !self.pipeline_cache_filename.as_os_str().is_empty() {
                 let key_bytes = compute_key_to_cache_bytes(&key);
                 let filename = self.pipeline_cache_filename.clone();
@@ -2019,6 +2058,7 @@ impl PipelineCache {
             let pipeline = self
                 .create_graphics_pipeline(shared_cache, &key)
                 .map(Rc::new);
+            self.queue_vulkan_pipeline_cache_flush();
             self.graphics_cache.insert(key.clone(), pipeline);
         }
 
@@ -2131,6 +2171,16 @@ impl PipelineCache {
         if self.use_vulkan_pipeline_cache {
             self.vulkan_pipeline_cache =
                 self.load_vulkan_pipeline_cache(&self.vulkan_pipeline_cache_filename.clone());
+            // Upstream: record the loaded cache size and start the flush timer.
+            let size = unsafe {
+                self.device
+                    .get_pipeline_cache_data(self.vulkan_pipeline_cache)
+                    .map(|data| data.len())
+                    .unwrap_or(0)
+            };
+            self.last_cache_size
+                .store(size, std::sync::atomic::Ordering::Relaxed);
+            self.last_flush = Some(std::time::Instant::now());
         }
 
         use std::cell::{Cell, RefCell};
@@ -2317,24 +2367,54 @@ impl PipelineCache {
     ///
     /// Serializes the Vulkan pipeline cache to disk.
     pub fn serialize_vulkan_pipeline_cache(&self, filename: &std::path::Path) {
-        if self.vulkan_pipeline_cache == vk::PipelineCache::null() {
-            log::error!("Refusing to serialize a null Vulkan pipeline cache");
+        serialize_vulkan_pipeline_cache_blob(&self.device, self.vulkan_pipeline_cache, filename);
+    }
+
+    /// Port of `PipelineCache::QueueVulkanPipelineCacheFlush`: after
+    /// `VULKAN_CACHE_FLUSH_PIPELINES` new pipelines, and no more often than
+    /// `max(VULKAN_CACHE_FLUSH_MIN_SECONDS, cache size in MiB)` seconds,
+    /// serialize the Vulkan pipeline cache on the serialization thread.
+    fn queue_vulkan_pipeline_cache_flush(&mut self) {
+        use std::sync::atomic::Ordering;
+        if !self.use_vulkan_pipeline_cache
+            || self.vulkan_pipeline_cache_filename.as_os_str().is_empty()
+        {
             return;
         }
-        let data = unsafe {
-            self.device
-                .get_pipeline_cache_data(self.vulkan_pipeline_cache)
-                .unwrap_or_default()
-        };
-
-        let mut output = Vec::with_capacity(VULKAN_CACHE_MAGIC_NUMBER.len() + 4 + data.len());
-        output.extend_from_slice(&VULKAN_CACHE_MAGIC_NUMBER);
-        output.extend_from_slice(&CACHE_VERSION.to_le_bytes());
-        output.extend_from_slice(&data);
-
-        if let Err(e) = std::fs::write(filename, &output) {
-            log::error!("Failed to write Vulkan pipeline cache: {}", e);
+        self.pipelines_since_flush += 1;
+        if self.pipelines_since_flush < VULKAN_CACHE_FLUSH_PIPELINES {
+            return;
         }
+        let now = std::time::Instant::now();
+        let megabytes = self.last_cache_size.load(Ordering::Relaxed) / (1024 * 1024);
+        let interval =
+            std::time::Duration::from_secs(VULKAN_CACHE_FLUSH_MIN_SECONDS.max(megabytes as u64));
+        if let Some(last_flush) = self.last_flush {
+            if now.duration_since(last_flush) < interval {
+                return;
+            }
+        }
+        if self.flush_in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.pipelines_since_flush = 0;
+        self.last_flush = Some(now);
+        let device = self.device.clone();
+        let cache = self.vulkan_pipeline_cache;
+        let filename = self.vulkan_pipeline_cache_filename.clone();
+        let last_cache_size = std::sync::Arc::clone(&self.last_cache_size);
+        let flush_in_flight = std::sync::Arc::clone(&self.flush_in_flight);
+        self.serialization_thread.queue_stateless_work(move || {
+            serialize_vulkan_pipeline_cache_blob(&device, cache, &filename);
+            let size = unsafe {
+                device
+                    .get_pipeline_cache_data(cache)
+                    .map(|data| data.len())
+                    .unwrap_or(0)
+            };
+            last_cache_size.store(size, Ordering::Relaxed);
+            flush_in_flight.store(false, Ordering::Release);
+        });
     }
 
     /// Port of loading Vulkan pipeline cache from disk.

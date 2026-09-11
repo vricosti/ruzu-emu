@@ -245,9 +245,6 @@ settings_enum! {
         X4,
         X8,
         X16,
-        X32,
-        X64,
-        None,
     }
 }
 

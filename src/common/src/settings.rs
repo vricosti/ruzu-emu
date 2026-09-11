@@ -1131,7 +1131,7 @@ impl Default for Values {
                     AnisotropyMode::Automatic
                 },
                 AnisotropyMode::Automatic,
-                AnisotropyMode::None,
+                AnisotropyMode::X16,
                 "max_anisotropy",
                 RendererAdvanced,
             ),

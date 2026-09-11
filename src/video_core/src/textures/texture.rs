@@ -983,23 +983,23 @@ impl TscEntry {
         }
         let settings = common::settings::values();
         let anisotropy_mode = *settings.max_anisotropy.get_value();
-        let added_anisotropy = match anisotropy_mode {
-            common::settings_enums::AnisotropyMode::Automatic => {
-                (settings.resolution_info.up_scale >> settings.resolution_info.down_shift)
-                    .wrapping_sub(1)
-            }
+        let added_anisotropy: i32 = match anisotropy_mode {
             common::settings_enums::AnisotropyMode::Default
             | common::settings_enums::AnisotropyMode::X2
             | common::settings_enums::AnisotropyMode::X4
             | common::settings_enums::AnisotropyMode::X8
-            | common::settings_enums::AnisotropyMode::X16
-            | common::settings_enums::AnisotropyMode::X32
-            | common::settings_enums::AnisotropyMode::X64 => {
-                (anisotropy_mode as u32).wrapping_sub(1)
+            | common::settings_enums::AnisotropyMode::X16 => anisotropy_mode as i32 - 1,
+            common::settings_enums::AnisotropyMode::Automatic => {
+                let resolution_scale =
+                    settings.resolution_info.up_scale >> settings.resolution_info.down_shift;
+                if resolution_scale > 1 {
+                    (resolution_scale - 1) as i32
+                } else {
+                    0
+                }
             }
-            common::settings_enums::AnisotropyMode::None => return 1.0,
         };
-        (1u32 << (max_anisotropy + added_anisotropy)) as f32
+        (1u32 << (max_anisotropy as i32 + added_anisotropy) as u32) as f32
     }
 
     /// Port of `TSCEntry::MinLod()`.

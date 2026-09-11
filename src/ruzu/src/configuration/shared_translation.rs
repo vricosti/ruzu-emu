@@ -238,9 +238,6 @@ pub const ANISOTROPY_MODE: &[(AnisotropyMode, &str)] = &[
     (AnisotropyMode::X4, "4x"),
     (AnisotropyMode::X8, "8x"),
     (AnisotropyMode::X16, "16x"),
-    (AnisotropyMode::X32, "32x"),
-    (AnisotropyMode::X64, "64x"),
-    (AnisotropyMode::None, "None"),
 ];
 
 pub const LANGUAGE: &[(Language, &str)] = &[

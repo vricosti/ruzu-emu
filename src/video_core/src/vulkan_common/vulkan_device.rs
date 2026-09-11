@@ -503,6 +503,9 @@ pub struct Device {
     graphics_family: u32,
     /// Main present queue family index.
     present_family: u32,
+    /// Whether the graphics queue family reports `VK_QUEUE_SPARSE_BINDING_BIT`.
+    /// Upstream `graphics_family_sparse_binding`.
+    graphics_family_sparse_binding: bool,
 
     /// Tracked extensions.
     pub extensions: DeviceExtensions,
@@ -684,6 +687,9 @@ impl Device {
             log::error!("Device lacks a graphics queue");
             VulkanError::new(vk::Result::ERROR_FEATURE_NOT_PRESENT)
         })?;
+        let graphics_family_sparse_binding = queue_families[graphics_family as usize]
+            .queue_flags
+            .contains(vk::QueueFlags::SPARSE_BINDING);
         let present_family = if surface == vk::SurfaceKHR::null() {
             graphics_family
         } else {
@@ -1894,6 +1900,7 @@ impl Device {
             instance_version,
             graphics_family,
             present_family,
+            graphics_family_sparse_binding,
             extensions: DeviceExtensions {
                 bit16_storage: loaded_extensions.contains("VK_KHR_16bit_storage"),
                 shader_atomic_int64: supports_shader_atomic_int64,
@@ -2433,6 +2440,13 @@ impl Device {
     /// Returns the main graphics queue.
     pub fn get_graphics_queue(&self) -> vk::Queue {
         self.graphics_queue
+    }
+
+    /// Upstream `IsSparseBindingSupported()`: the enabled feature set (ruzu
+    /// enables the queried `VkPhysicalDeviceFeatures2` chain unchanged) plus
+    /// the graphics queue capability.
+    pub fn is_sparse_binding_supported(&self) -> bool {
+        self.device_features.sparse_binding != 0 && self.graphics_family_sparse_binding
     }
 
     /// Returns the main present queue.

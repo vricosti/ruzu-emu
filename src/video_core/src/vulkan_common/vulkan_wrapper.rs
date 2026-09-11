@@ -22,6 +22,16 @@ use super::vk_enum_string_helper::string_vk_result;
 // Exception / error type — port of `vk::Exception`
 // ---------------------------------------------------------------------------
 
+/// Where a buffer's memory lives, for sparse aliasing.
+///
+/// Upstream `vk::MemoryLocation` (Eden a538cd9aff).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryLocation {
+    pub memory: vk::DeviceMemory,
+    pub offset: vk::DeviceSize,
+    pub memory_type: u32,
+}
+
 /// Vulkan error generated from a `VkResult`.
 ///
 /// Port of `vk::Exception`.

@@ -286,6 +286,14 @@ impl crate::buffer_cache::buffer_cache_base::GpuMemoryAccess for GpuMemoryAccess
     fn get_memory_layout_size(&self, gpu_addr: u64) -> u64 {
         self.mm.lock().get_memory_layout_size(gpu_addr)
     }
+    fn get_id(&self) -> usize {
+        self.mm.lock().get_id()
+    }
+
+    fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
+        self.mm.lock().get_submapped_range(gpu_addr, size)
+    }
+
 }
 
 /// Adapter that implements `DeviceMemoryAccess` for the buffer cache by

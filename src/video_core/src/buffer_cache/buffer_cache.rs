@@ -37,6 +37,7 @@ use crate::surface::PixelFormat;
 
 use super::buffer_cache_base::*;
 use super::memory_tracker_base::MemoryTrackerBase;
+use super::virtual_range_cache::{VirtualRangeCache, VirtualSegments};
 use super::word_manager::DeviceTracker;
 
 // ---------------------------------------------------------------------------
@@ -166,6 +167,11 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     /// Upstream: `Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache`
     /// where `LRUItemParams::ObjectType = BufferId` and `LRUItemParams::TickType = u64`.
     lru_cache: LeastRecentlyUsedCache<BufferId, u64>,
+    /// Upstream `virtual_ranges` / `graphics_segments` / `compute_segments`
+    /// (multi-range storage buffers, Eden a538cd9aff).
+    virtual_ranges: VirtualRangeCache,
+    graphics_segments: Vec<MultiRangeSegment>,
+    compute_segments: Vec<MultiRangeSegment>,
 
     /// Deferred destruction ring for buffers removed from the cache.
     ///
@@ -235,6 +241,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             gpu_modified_ranges: RangeSet::new(),
             committed_gpu_modified_ranges: VecDeque::new(),
             lru_cache: LeastRecentlyUsedCache::new(),
+            virtual_ranges: VirtualRangeCache::new(),
+            graphics_segments: Vec::new(),
+            compute_segments: Vec::new(),
             delayed_destruction_ring: DelayedDestructionRing::new(),
             async_buffers: VecDeque::new(),
             pending_downloads: VecDeque::new(),
@@ -438,6 +447,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     // Public API — memory writes
     // -----------------------------------------------------------------------
 
+    /// Upstream `BufferCache<P>::UnmapGPUMemory`: invalidates cached virtual
+    /// ranges (only meaningful for runtimes with multi-range storage).
+    pub fn unmap_gpu_memory(&self, as_id: usize, gpu_addr: u64, size: usize) {
+        if self.runtime.supports_multi_range_storage() {
+            self.virtual_ranges.unmap(as_id, gpu_addr, size as u64);
+        }
+    }
+
     /// Notify the cache that a CPU write happened at `[device_addr, device_addr+size)`.
     ///
     /// Upstream: `BufferCache<P>::WriteMemory`
@@ -638,6 +655,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             device_addr,
             size,
             buffer_id: NULL_BUFFER_ID,
+            ..NULL_BINDING
         };
         if stage < NUM_STAGES as usize && (index as usize) < NUM_GRAPHICS_UNIFORM_BUFFERS as usize {
             cs.uniform_buffers[stage][index as usize] = binding;
@@ -1199,7 +1217,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         sync_info: ObtainBufferSynchronize,
         post_op: ObtainBufferOperation,
     ) -> (BufferId, u32) {
-        let buffer_id = self.find_buffer(device_addr, size);
+        let buffer_id = self.find_buffer(device_addr, size, false);
 
         match sync_info {
             ObtainBufferSynchronize::FullSynchronize => {
@@ -1502,8 +1520,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.has_deleted_buffers = false;
             }
-            let buffer_a = self.find_buffer(cpu_src_address, amount as u32);
-            let buffer_b = self.find_buffer(cpu_dest_address, amount as u32);
+            let buffer_a = self.find_buffer(cpu_src_address, amount as u32, false);
+            let buffer_b = self.find_buffer(cpu_dest_address, amount as u32, false);
             if let Some(cs) = self.channel_caches.current_channel_state() {
                 if !cs.has_deleted_buffers {
                     break (buffer_a, buffer_b);
@@ -1598,7 +1616,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.gpu_modified_ranges
             .subtract(cpu_dst_address, size as usize);
 
-        let buffer_id = self.find_buffer(cpu_dst_address, size as u32);
+        let buffer_id = self.find_buffer(cpu_dst_address, size as u32, false);
         let offset = self.slot_buffers[buffer_id].offset(cpu_dst_address);
         self.runtime
             .clear_buffer(&self.slot_buffers[buffer_id], offset, size, value);
@@ -2245,6 +2263,119 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.runtime.set_enable_storage_buffers(enable);
     }
 
+    /// Upstream `BufferCache<P>::ResolveMultiRangeStorage`: records the
+    /// host-contiguous segments of `binding` into the graphics or compute
+    /// segment pool when the range is split across mappings.
+    fn resolve_multi_range_storage(
+        &mut self,
+        binding: &mut Binding,
+        is_written: bool,
+        compute: bool,
+    ) {
+        binding.segment_first = 0;
+        binding.segment_count = 0;
+        if !self.runtime.supports_multi_range_storage() {
+            return;
+        }
+        if binding.gpu_addr == 0 || binding.size == 0 {
+            return;
+        }
+        if is_written && !self.runtime.prefers_sparse_sources() {
+            return;
+        }
+        let Some(gpu_memory) = self.gpu_memory.as_deref() else {
+            return;
+        };
+        let segments: VirtualSegments = {
+            let found = self
+                .virtual_ranges
+                .query(gpu_memory, binding.gpu_addr, binding.size);
+            if found.len() < 2 {
+                return;
+            }
+            found.clone()
+        };
+        let prefer_sparse = self.runtime.prefers_sparse_sources();
+        let mut pool = if compute {
+            std::mem::take(&mut self.compute_segments)
+        } else {
+            std::mem::take(&mut self.graphics_segments)
+        };
+        let first = pool.len() as u32;
+        let mut resolved = true;
+        for segment in &segments {
+            let buffer_id = self.find_buffer(segment.device_addr, segment.size, prefer_sparse);
+            if !buffer_id.is_valid() {
+                pool.truncate(first as usize);
+                resolved = false;
+                break;
+            }
+            pool.push(MultiRangeSegment {
+                buffer_id,
+                device_addr: segment.device_addr,
+                size: segment.size,
+            });
+        }
+        if resolved {
+            binding.segment_first = first;
+            binding.segment_count = segments.len() as u32;
+        }
+        if compute {
+            self.compute_segments = pool;
+        } else {
+            self.graphics_segments = pool;
+        }
+    }
+
+    /// Upstream `BufferCache<P>::BindMultiRangeStorage`: binds the segments
+    /// resolved for `binding` as one runtime buffer. Returns false when the
+    /// regular single-buffer path must be used.
+    fn bind_multi_range_storage(
+        &mut self,
+        binding: &Binding,
+        is_written: bool,
+        compute: bool,
+    ) -> bool {
+        if !self.runtime.supports_multi_range_storage() {
+            return false;
+        }
+        if binding.segment_count < 2 {
+            return false;
+        }
+        let pool = if compute {
+            &self.compute_segments
+        } else {
+            &self.graphics_segments
+        };
+        let first = binding.segment_first as usize;
+        let count = binding.segment_count as usize;
+        if first + count > pool.len() {
+            return false;
+        }
+        let segments: SmallVec<[MultiRangeSegment; 8]> =
+            pool[first..first + count].iter().copied().collect();
+        let as_id = self.gpu_memory.as_deref().map_or(0, GpuMemoryAccess::get_id);
+        let key = ((as_id as u64) << 48) ^ binding.gpu_addr;
+        self.runtime.reset_multi_range();
+        for segment in &segments {
+            self.touch_buffer(segment.buffer_id);
+            if self.synchronize_buffer(segment.buffer_id, segment.device_addr, segment.size) {
+                self.runtime.invalidate_multi_range(key);
+            }
+            let offset = self.slot_buffers[segment.buffer_id].offset(segment.device_addr);
+            self.slot_buffers[segment.buffer_id].mark_usage(offset as u64, segment.size as u64);
+            if is_written {
+                self.mark_written_buffer(segment.buffer_id, segment.device_addr, segment.size);
+            }
+            self.runtime.push_multi_range_source(
+                &self.slot_buffers[segment.buffer_id],
+                offset,
+                segment.size,
+            );
+        }
+        self.runtime.bind_multi_range_storage_buffer(key, is_written)
+    }
+
     fn bind_host_graphics_storage_buffers(&mut self, stage: usize) {
         // Upstream: iterates enabled storage buffers, synchronizes, then calls
         // runtime.BindStorageBuffer.
@@ -2258,13 +2389,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mut binding_index = 0u32;
         Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
+            let is_written = ((written_mask >> idx) & 1) != 0;
+            if self.bind_multi_range_storage(&binding, is_written, false) {
+                return;
+            }
             self.touch_buffer(binding.buffer_id);
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
 
             let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
             self.slot_buffers[binding.buffer_id].mark_usage(offset as u64, binding.size as u64);
 
-            let is_written = ((written_mask >> idx) & 1) != 0;
             if is_written {
                 self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
             }
@@ -2442,13 +2576,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mut binding_index = 0u32;
         Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
+            let is_written = ((written_mask >> idx) & 1) != 0;
+            if self.bind_multi_range_storage(&binding, is_written, true) {
+                return;
+            }
             self.touch_buffer(binding.buffer_id);
             self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
 
             let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
             self.slot_buffers[binding.buffer_id].mark_usage(offset as u64, binding.size as u64);
 
-            let is_written = ((written_mask >> idx) & 1) != 0;
             if is_written {
                 self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
             }
@@ -2514,6 +2651,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Upstream: `BufferCache<P>::DoUpdateGraphicsBuffers`
     fn do_update_graphics_buffers(&mut self, is_indexed: bool) {
+        self.graphics_segments.clear();
         self.buffer_operations(|cache| {
             if is_indexed {
                 cache.update_index_buffer();
@@ -2566,6 +2704,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
     /// Upstream: `BufferCache<P>::DoUpdateComputeBuffers`
     fn do_update_compute_buffers(&mut self) {
+        self.compute_segments.clear();
         self.buffer_operations(|cache| {
             cache.update_compute_uniform_buffers();
             cache.update_compute_storage_buffers();
@@ -2593,18 +2732,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             let buffer_size = inline_index_size.wrapping_add(CACHING_PAGESIZE as u32 - 1)
                 & !(CACHING_PAGESIZE as u32 - 1);
             if self.inline_buffer_id == NULL_BUFFER_ID {
-                self.inline_buffer_id = self.create_buffer(0, buffer_size);
+                self.inline_buffer_id = self.create_buffer(0, buffer_size, false);
             }
             if (self.slot_buffers[self.inline_buffer_id].size_bytes() as u32) < buffer_size {
                 let old_id = self.inline_buffer_id;
                 self.slot_buffers.erase(old_id);
-                self.inline_buffer_id = self.create_buffer(0, buffer_size);
+                self.inline_buffer_id = self.create_buffer(0, buffer_size, false);
             }
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.index_buffer = Binding {
                     device_addr: 0,
                     size: inline_index_size,
                     buffer_id: self.inline_buffer_id,
+                    ..NULL_BINDING
                 };
             }
             return;
@@ -2640,12 +2780,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         }
         let device_addr = device_addr.unwrap();
-        let buffer_id = self.find_buffer(device_addr, size);
+        let buffer_id = self.find_buffer(device_addr, size, false);
         if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.index_buffer = Binding {
                 device_addr,
                 size,
                 buffer_id,
+                ..NULL_BINDING
             };
         }
     }
@@ -2672,18 +2813,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             let buffer_size = inline_index_size.wrapping_add(CACHING_PAGESIZE as u32 - 1)
                 & !(CACHING_PAGESIZE as u32 - 1);
             if self.inline_buffer_id == NULL_BUFFER_ID {
-                self.inline_buffer_id = self.create_buffer(0, buffer_size);
+                self.inline_buffer_id = self.create_buffer(0, buffer_size, false);
             }
             if (self.slot_buffers[self.inline_buffer_id].size_bytes() as u32) < buffer_size {
                 let old_id = self.inline_buffer_id;
                 self.slot_buffers.erase(old_id);
-                self.inline_buffer_id = self.create_buffer(0, buffer_size);
+                self.inline_buffer_id = self.create_buffer(0, buffer_size, false);
             }
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.index_buffer = Binding {
                     device_addr: 0,
                     size: inline_index_size,
                     buffer_id: self.inline_buffer_id,
+                    ..NULL_BINDING
                 };
             }
             return;
@@ -2716,12 +2858,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         }
         let device_addr = device_addr.unwrap();
-        let buffer_id = self.find_buffer(device_addr, size);
+        let buffer_id = self.find_buffer(device_addr, size, false);
         if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.index_buffer = Binding {
                 device_addr,
                 size,
                 buffer_id,
+                ..NULL_BINDING
             };
         }
     }
@@ -2799,11 +2942,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
 
         let device_addr = device_addr.unwrap();
-        let buffer_id = self.find_buffer(device_addr, size);
+        let buffer_id = self.find_buffer(device_addr, size, false);
         let binding = Binding {
             device_addr,
             size,
             buffer_id,
+            ..NULL_BINDING
         };
         if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.vertex_buffers[index as usize] = binding;
@@ -2852,11 +2996,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
 
         let device_addr = device_addr.unwrap();
-        let buffer_id = self.find_buffer(device_addr, size);
+        let buffer_id = self.find_buffer(device_addr, size, false);
         let binding = Binding {
             device_addr,
             size,
             buffer_id,
+            ..NULL_BINDING
         };
         if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.vertex_buffers[index as usize] = binding;
@@ -2878,11 +3023,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 .and_then(|gm| gm.gpu_to_cpu_address(gpu_addr));
             match device_addr {
                 Some(addr) => {
-                    let buffer_id = cache.find_buffer(addr, size as u32);
+                    let buffer_id = cache.find_buffer(addr, size as u32, false);
                     Binding {
                         device_addr: addr,
                         size: size as u32,
                         buffer_id,
+                        ..NULL_BINDING
                     }
                 }
                 None => NULL_BINDING,
@@ -2914,11 +3060,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mut resolve_binding = |cache: &mut Self, gpu_addr: u64, size: u64| -> Binding {
             match gpu_to_cpu_address(gpu_addr) {
                 Some(addr) => {
-                    let buffer_id = cache.find_buffer(addr, size as u32);
+                    let buffer_id = cache.find_buffer(addr, size as u32, false);
                     Binding {
                         device_addr: addr,
                         size: size as u32,
                         buffer_id,
+                        ..NULL_BINDING
                     }
                 }
                 None => NULL_BINDING,
@@ -2968,7 +3115,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             } else {
                 return;
             };
-            let buffer_id = self.find_buffer(device_addr, size);
+            let buffer_id = self.find_buffer(device_addr, size, false);
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.uniform_buffers[stage][idx as usize].buffer_id = buffer_id;
             }
@@ -2981,6 +3128,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         };
         let mask = cs.enabled_storage_buffers[stage];
+        let written_mask = cs.written_storage_buffers[stage];
 
         Self::for_each_enabled_bit(mask, |idx| {
             let (device_addr, size) = if let Some(cs) = self.channel_caches.current_channel_state()
@@ -2990,9 +3138,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             } else {
                 return;
             };
-            let buffer_id = self.find_buffer(device_addr, size);
+            let buffer_id = self.find_buffer(device_addr, size, false);
+            let Some(mut binding) = self
+                .channel_caches
+                .current_channel_state()
+                .map(|cs| cs.storage_buffers[stage][idx as usize])
+            else {
+                return;
+            };
+            binding.buffer_id = buffer_id;
+            let is_written = ((written_mask >> idx) & 1) != 0;
+            self.resolve_multi_range_storage(&mut binding, is_written, false);
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
-                cs.storage_buffers[stage][idx as usize].buffer_id = buffer_id;
+                cs.storage_buffers[stage][idx as usize] = binding;
             }
         });
     }
@@ -3012,7 +3170,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             } else {
                 return;
             };
-            let buffer_id = self.find_buffer(device_addr, size);
+            let buffer_id = self.find_buffer(device_addr, size, false);
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.texture_buffers[stage][idx as usize].buffer_id = buffer_id;
             }
@@ -3056,12 +3214,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         }
         let device_addr = device_addr.unwrap();
-        let buffer_id = self.find_buffer(device_addr, size);
+        let buffer_id = self.find_buffer(device_addr, size, false);
         if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.transform_feedback_buffers[index as usize] = Binding {
                 device_addr,
                 size,
                 buffer_id,
+                ..NULL_BINDING
             };
         }
     }
@@ -3101,7 +3260,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     }
                 }
             }
-            binding.buffer_id = self.find_buffer(binding.device_addr, binding.size);
+            binding.buffer_id = self.find_buffer(binding.device_addr, binding.size, false);
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.compute_uniform_buffers[idx as usize] = binding;
             }
@@ -3114,6 +3273,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return;
         };
         let mask = cs.enabled_compute_storage_buffers;
+        let written_mask = cs.written_compute_storage_buffers;
 
         Self::for_each_enabled_bit(mask, |idx| {
             let (device_addr, size) = if let Some(cs) = self.channel_caches.current_channel_state()
@@ -3123,9 +3283,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             } else {
                 return;
             };
-            let buffer_id = self.find_buffer(device_addr, size);
+            let buffer_id = self.find_buffer(device_addr, size, false);
+            let Some(mut binding) = self
+                .channel_caches
+                .current_channel_state()
+                .map(|cs| cs.compute_storage_buffers[idx as usize])
+            else {
+                return;
+            };
+            binding.buffer_id = buffer_id;
+            let is_written = ((written_mask >> idx) & 1) != 0;
+            self.resolve_multi_range_storage(&mut binding, is_written, true);
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
-                cs.compute_storage_buffers[idx as usize].buffer_id = buffer_id;
+                cs.compute_storage_buffers[idx as usize] = binding;
             }
         });
     }
@@ -3145,7 +3315,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             } else {
                 return;
             };
-            let buffer_id = self.find_buffer(device_addr, size);
+            let buffer_id = self.find_buffer(device_addr, size, false);
             if let Some(cs) = self.channel_caches.current_channel_state_mut() {
                 cs.compute_texture_buffers[idx as usize].buffer_id = buffer_id;
             }
@@ -3171,20 +3341,25 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Find or create a buffer covering `[device_addr, device_addr+size)`.
     ///
     /// Upstream: `BufferCache<P>::FindBuffer`
-    fn find_buffer(&mut self, device_addr: VAddr, size: u32) -> BufferId {
+    fn find_buffer(&mut self, device_addr: VAddr, size: u32, sparse_compatible: bool) -> BufferId {
         if device_addr == 0 {
             return NULL_BUFFER_ID;
         }
         let page = device_addr >> CACHING_PAGEBITS;
         let buffer_id = self.page_table[page as usize];
         if !buffer_id.is_valid() {
-            return self.create_buffer(device_addr, size);
+            return self.create_buffer(device_addr, size, sparse_compatible);
         }
         self.wait_for_gpu_fence_if_needed(buffer_id);
-        if self.slot_buffers[buffer_id].is_in_bounds(device_addr, size as u64) {
-            return buffer_id;
+        let buffer = &self.slot_buffers[buffer_id];
+        if buffer.is_in_bounds(device_addr, size as u64) {
+            // Upstream: `if constexpr (requires { buffer.IsSparseCompatible(); })`.
+            let usable = !(sparse_compatible && !buffer.is_sparse_compatible());
+            if usable {
+                return buffer_id;
+            }
         }
-        self.create_buffer(device_addr, size)
+        self.create_buffer(device_addr, size, sparse_compatible)
     }
 
     /// Port of `BufferCache<P>::WaitForGpuFenceIfNeeded`.
@@ -3343,7 +3518,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::CreateBuffer`
     ///
-    fn create_buffer(&mut self, device_addr: VAddr, wanted_size: u32) -> BufferId {
+    fn create_buffer(
+        &mut self,
+        device_addr: VAddr,
+        wanted_size: u32,
+        sparse_compatible: bool,
+    ) -> BufferId {
         // Align start and end to caching page boundaries.
         let device_addr_end = device_addr
             .wrapping_add(wanted_size as u64)
@@ -3355,7 +3535,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let overlap = self.resolve_overlaps(device_addr, wanted_size);
         let size = overlap.end.wrapping_sub(overlap.begin) as u32;
 
-        let new_buffer = P::Buffer::new(&mut self.runtime, overlap.begin, size as u64);
+        let new_buffer =
+            P::Buffer::new(&mut self.runtime, overlap.begin, size as u64, sparse_compatible);
 
         let new_buffer_id = self.slot_buffers.insert(new_buffer);
         self.runtime
@@ -3700,6 +3881,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::DeleteBuffer`
     fn delete_buffer(&mut self, buffer_id: BufferId, do_not_mark: bool) {
+        // Upstream: `if constexpr (requires { runtime.OnBufferDeleted(buffer); })`.
+        self.runtime.on_buffer_deleted(&self.slot_buffers[buffer_id]);
         let Some(cs) = self.channel_caches.current_channel_state_mut() else {
             return;
         };
@@ -3919,14 +4102,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             .wrapping_add(DEVICE_PAGESIZE - 1)
             & !(DEVICE_PAGESIZE - 1);
 
+        let mut binding_size = cpu_end.wrapping_sub(aligned_device_addr.unwrap()) as u32;
+        if is_written {
+            binding_size = aligned_size;
+        }
         Binding {
             device_addr: aligned_device_addr.unwrap(),
-            size: if is_written {
-                aligned_size
-            } else {
-                cpu_end.wrapping_sub(aligned_device_addr.unwrap()) as u32
-            },
+            gpu_addr: aligned_gpu_addr,
+            size: binding_size,
             buffer_id: NULL_BUFFER_ID,
+            ..NULL_BINDING
         }
     }
 
@@ -4025,7 +4210,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.clear_download(dest_address, copy_size as u64);
         self.gpu_modified_ranges.subtract(dest_address, copy_size);
 
-        let buffer_id = self.find_buffer(dest_address, copy_size as u32);
+        let buffer_id = self.find_buffer(dest_address, copy_size as u32, false);
         self.synchronize_buffer(buffer_id, dest_address, copy_size as u32);
 
         if P::USE_MEMORY_MAPS_FOR_UPLOADS {
@@ -4495,7 +4680,7 @@ mod tests {
             bytes,
             expose_pointer: false,
         }));
-        let buffer_id = cache.create_buffer(device_addr, 4);
+        let buffer_id = cache.create_buffer(device_addr, 4, false);
         let copy = BufferCopy {
             src_offset: 0,
             dst_offset: u64::from(cache.slot_buffers[buffer_id].offset(device_addr)),
@@ -4557,7 +4742,7 @@ mod tests {
             assert!(!BufferCache::<TestParams, DummyTracker>::is_range_granular(
                 address, payload.len(),
             ));
-            let id = cache.create_buffer(address, payload.len() as u32);
+            let id = cache.create_buffer(address, payload.len() as u32, false);
             let offset = u64::from(cache.slot_buffers[id].offset(address));
             cache.slot_buffers[id].immediate_upload(offset, &payload);
             cache.memory_tracker.unmark_region_as_cpu_modified(address, 32);
@@ -4686,11 +4871,12 @@ mod tests {
         cache.bind_to_channel(owner.bind_id);
         let address = 0x2_0000;
         let size = 0x180;
-        let buffer_id = cache.create_buffer(address, size);
+        let buffer_id = cache.create_buffer(address, size, false);
         cache.current_channel_state_mut().unwrap().index_buffer = Binding {
             device_addr: address,
             size,
             buffer_id,
+            ..NULL_BINDING
         };
         cache.slot_buffers[buffer_id].reset_usage_tracking();
 
@@ -4712,11 +4898,12 @@ mod tests {
         cache.bind_to_channel(owner.bind_id);
         let address = 0x3_0000;
         let size = 0x200;
-        let buffer_id = cache.create_buffer(address, size);
+        let buffer_id = cache.create_buffer(address, size, false);
         let binding = Binding {
             device_addr: address,
             size,
             buffer_id,
+            ..NULL_BINDING
         };
         cache.update_vertex_buffer_slot(0, binding);
         cache.set_geometry_dirty(DirtyFlag::VertexBuffer(0));
@@ -4748,8 +4935,8 @@ mod tests {
         cache.set_gpu_memory(Box::new(IdentityGpuMemory));
         let src = 0x1_0000;
         let dst = 0x2_0000;
-        cache.create_buffer(src, 0x1000);
-        cache.create_buffer(dst, 0x1000);
+        cache.create_buffer(src, 0x1000, false);
+        cache.create_buffer(dst, 0x1000, false);
         cache.async_downloads.add(dst, 0x200);
         cache.uncommitted_gpu_modified_ranges.add(dst, 0x200);
         let mut committed = RangeSet::new();
@@ -4786,8 +4973,8 @@ mod tests {
         cache.set_device_memory(Box::new(SharedDeviceMemory {
             bytes: std::sync::Arc::clone(&bytes),
         }));
-        let src_buffer = cache.create_buffer(src as u64, 0x1000);
-        let dst_buffer = cache.create_buffer(dst as u64, 0x1000);
+        let src_buffer = cache.create_buffer(src as u64, 0x1000, false);
+        let dst_buffer = cache.create_buffer(dst as u64, 0x1000, false);
 
         assert!(cache.dma_copy(src as u64, dst as u64, amount as u64));
         assert!(cache.slot_buffers[src_buffer].is_region_used(0, amount as u64));
@@ -4806,7 +4993,7 @@ mod tests {
         );
         cache.set_gpu_memory(Box::new(IdentityGpuMemory));
         let dst = 0x2_0000;
-        let buffer = cache.create_buffer(dst, 0x1000);
+        let buffer = cache.create_buffer(dst, 0x1000, false);
 
         assert!(cache.dma_clear(dst, 0x20, 0x3f80_0000));
         assert!(cache.slot_buffers[buffer].is_region_used(0, 0x80));
@@ -4822,7 +5009,7 @@ mod tests {
         bind_test_channel(&mut cache, 20);
         let address = 0x2_0000;
         let size = 0x180;
-        let buffer_id = cache.create_buffer(address, 0x1000);
+        let buffer_id = cache.create_buffer(address, 0x1000, false);
         cache.slot_buffers[buffer_id].reset_usage_tracking();
         let channel = cache.current_channel_state_mut().unwrap();
         channel.enabled_storage_buffers[0] = 1;
@@ -4830,11 +5017,155 @@ mod tests {
             device_addr: address,
             size,
             buffer_id,
+            ..NULL_BINDING
         };
 
         cache.bind_host_graphics_storage_buffers(0);
 
         assert!(cache.slot_buffers[buffer_id].is_region_used(0, size as u64));
+    }
+
+    /// GPU address space whose pages `0x1_0000` and `0x1_1000` map to
+    /// non-contiguous device pages (`0x2_0000`, `0x5_0000`).
+    struct SplitGpuMemory;
+
+    impl GpuMemoryAccess for SplitGpuMemory {
+        fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
+            match gpu_addr & !0xFFF {
+                0x1_0000 => Some(0x2_0000 + (gpu_addr & 0xFFF)),
+                0x1_1000 => Some(0x5_0000 + (gpu_addr & 0xFFF)),
+                _ => None,
+            }
+        }
+        fn read_u64(&self, _gpu_addr: u64) -> Option<u64> {
+            None
+        }
+        fn read_u32(&self, _gpu_addr: u64) -> Option<u32> {
+            None
+        }
+        fn is_within_gpu_address_range(&self, _gpu_addr: u64) -> bool {
+            true
+        }
+        fn max_continuous_range(&self, _gpu_addr: u64, size: u64) -> u64 {
+            size
+        }
+        fn get_memory_layout_size(&self, _gpu_addr: u64) -> u64 {
+            0x2000
+        }
+        fn get_id(&self) -> usize {
+            3
+        }
+        fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
+            assert_eq!((gpu_addr, size), (0x1_0000, 0x2000));
+            vec![(0x1_0000, 0x1000), (0x1_1000, 0x1000)]
+        }
+    }
+
+    fn split_storage_cache(runtime: TestBufferCacheRuntime) -> BufferCache<TestParams, DummyTracker> {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker, runtime);
+        bind_test_channel(&mut cache, 22);
+        cache.set_gpu_memory(Box::new(SplitGpuMemory));
+        let channel = cache.current_channel_state_mut().unwrap();
+        channel.enabled_storage_buffers[0] = 1;
+        channel.storage_buffers[0][0] = Binding {
+            device_addr: 0x2_0000,
+            gpu_addr: 0x1_0000,
+            size: 0x2000,
+            buffer_id: NULL_BUFFER_ID,
+            ..NULL_BINDING
+        };
+        cache
+    }
+
+    /// Eden a538cd9aff: a storage buffer split across two host mappings is
+    /// resolved into two segments and bound through the multi-range path
+    /// instead of the single-buffer descriptor.
+    #[test]
+    fn split_storage_buffer_binds_through_multi_range_segments() {
+        let mut cache = split_storage_cache(TestBufferCacheRuntime::with_multi_range(false));
+
+        cache.update_storage_buffers(0);
+        let binding = cache.current_channel_state().unwrap().storage_buffers[0][0];
+        assert!(binding.buffer_id.is_valid());
+        assert_eq!(binding.segment_first, 0);
+        assert_eq!(binding.segment_count, 2);
+        assert_eq!(cache.graphics_segments.len(), 2);
+        assert_eq!(cache.graphics_segments[0].device_addr, 0x2_0000);
+        assert_eq!(cache.graphics_segments[0].size, 0x1000);
+        assert_eq!(cache.graphics_segments[1].device_addr, 0x5_0000);
+        assert_eq!(cache.graphics_segments[1].size, 0x1000);
+        assert_ne!(
+            cache.graphics_segments[0].buffer_id,
+            cache.graphics_segments[1].buffer_id
+        );
+
+        cache.bind_host_graphics_storage_buffers(0);
+        let key = (3u64 << 48) ^ 0x1_0000;
+        assert_eq!(cache.runtime.multi_range_binds, vec![(key, false)]);
+        assert_eq!(cache.runtime.multi_range_sources.len(), 2);
+        assert_eq!(cache.runtime.multi_range_sources[0].1, 0);
+        assert_eq!(cache.runtime.multi_range_sources[0].2, 0x1000);
+        assert_eq!(cache.runtime.multi_range_sources[1].2, 0x1000);
+        assert!(cache.runtime.storage_binds.is_empty());
+        for segment in cache.graphics_segments.clone() {
+            let offset = cache.slot_buffers[segment.buffer_id].offset(segment.device_addr);
+            assert!(cache.slot_buffers[segment.buffer_id].is_region_used(offset as u64, 0x1000));
+        }
+
+        // The next graphics update starts from an empty pool.
+        cache.do_update_graphics_buffers(false);
+        let binding = cache.current_channel_state().unwrap().storage_buffers[0][0];
+        assert_eq!(binding.segment_first, 0);
+        assert_eq!(binding.segment_count, 2);
+        assert_eq!(cache.graphics_segments.len(), 2);
+    }
+
+    #[test]
+    fn split_storage_buffer_falls_back_without_multi_range_runtime() {
+        let mut cache = split_storage_cache(TestBufferCacheRuntime::default());
+        cache.update_storage_buffers(0);
+        let binding = cache.current_channel_state().unwrap().storage_buffers[0][0];
+        assert_eq!(binding.segment_count, 0);
+        assert!(cache.graphics_segments.is_empty());
+
+        cache.bind_host_graphics_storage_buffers(0);
+        assert!(cache.runtime.multi_range_binds.is_empty());
+        assert_eq!(cache.runtime.storage_binds.len(), 1);
+        assert_eq!(cache.runtime.storage_binds[0].1, 0x2000);
+    }
+
+    /// Written storage buffers only use multi-range when the runtime can alias
+    /// the sources (sparse); gathered copies would lose the writes.
+    #[test]
+    fn written_split_storage_buffer_requires_sparse_sources() {
+        let mut cache = split_storage_cache(TestBufferCacheRuntime::with_multi_range(false));
+        cache.current_channel_state_mut().unwrap().written_storage_buffers[0] = 1;
+        cache.update_storage_buffers(0);
+        assert_eq!(
+            cache.current_channel_state().unwrap().storage_buffers[0][0].segment_count,
+            0
+        );
+
+        let mut cache = split_storage_cache(TestBufferCacheRuntime::with_multi_range(true));
+        cache.current_channel_state_mut().unwrap().written_storage_buffers[0] = 1;
+        cache.update_storage_buffers(0);
+        assert_eq!(
+            cache.current_channel_state().unwrap().storage_buffers[0][0].segment_count,
+            2
+        );
+        cache.bind_host_graphics_storage_buffers(0);
+        assert_eq!(cache.runtime.multi_range_binds, vec![((3u64 << 48) ^ 0x1_0000, true)]);
+    }
+
+    #[test]
+    fn deleting_a_buffer_notifies_the_runtime_before_unbinding() {
+        let mut cache = split_storage_cache(TestBufferCacheRuntime::with_multi_range(false));
+        cache.update_storage_buffers(0);
+        let segment_buffer = cache.graphics_segments[0].buffer_id;
+        let raw = cache.slot_buffers[segment_buffer].raw_handle();
+        cache.delete_buffer(segment_buffer, false);
+        assert_eq!(cache.runtime.deleted_buffers, vec![raw]);
     }
 
     #[test]
@@ -4850,7 +5181,7 @@ mod tests {
         cache.bind_to_channel(owner.bind_id);
         let address = 0x3_0000;
         let size = 0x200;
-        let buffer_id = cache.create_buffer(address, 0x1000);
+        let buffer_id = cache.create_buffer(address, 0x1000, false);
         cache.slot_buffers[buffer_id].reset_usage_tracking();
         cache
             .current_channel_state_mut()
@@ -4859,6 +5190,7 @@ mod tests {
             device_addr: address,
             size,
             buffer_id,
+            ..NULL_BINDING
         };
 
         cache.bind_host_transform_feedback_buffers();
@@ -4890,7 +5222,7 @@ mod tests {
         owner.maxwell_3d = Some(Box::new(Maxwell3D::new()));
         cache.create_channel(&owner);
         cache.bind_to_channel(owner.bind_id);
-        let buffer_id = cache.create_buffer(0x10000, 0x1000);
+        let buffer_id = cache.create_buffer(0x10000, 0x1000, false);
         let channel = cache.current_channel_state_mut().unwrap();
         channel.index_buffer.buffer_id = buffer_id;
         channel.vertex_buffers[0].buffer_id = buffer_id;
@@ -4927,11 +5259,12 @@ mod tests {
             &tracker,
             TestBufferCacheRuntime::default(),
         );
-        let buffer_id = cache.create_buffer(0x10000, 0x1000);
+        let buffer_id = cache.create_buffer(0x10000, 0x1000, false);
         let binding = Binding {
             device_addr: 0x10100,
             size: 0x80,
             buffer_id,
+            ..NULL_BINDING
         };
 
         cache.update_vertex_buffer_slot(3, binding);
@@ -4967,8 +5300,8 @@ mod tests {
             &tracker,
             TestBufferCacheRuntime::default(),
         );
-        let left = cache.create_buffer(0x00A0_0000, 0x1_0000);
-        let right = cache.create_buffer(0x0120_0000, 0x2_0000);
+        let left = cache.create_buffer(0x00A0_0000, 0x1_0000, false);
+        let right = cache.create_buffer(0x0120_0000, 0x2_0000, false);
         cache.slot_buffers[right].increase_stream_score(STREAM_LEAP_THRESHOLD + 1);
 
         let overlap = cache.resolve_overlaps(0x0120_0000, 0x1_0000);
@@ -4998,7 +5331,7 @@ mod tests {
 
         let device_addr = 0x1_0080;
         let payload = [0x12, 0x34, 0x56, 0x78];
-        let buffer_id = cache.create_buffer(device_addr, payload.len() as u32);
+        let buffer_id = cache.create_buffer(device_addr, payload.len() as u32, false);
         let offset = cache.slot_buffers[buffer_id].offset(device_addr);
         cache.slot_buffers[buffer_id].immediate_upload(u64::from(offset), &payload);
         cache
@@ -5024,7 +5357,7 @@ mod tests {
             &tracker,
             TestBufferCacheRuntime::default(),
         );
-        let buffer_id = cache.create_buffer(0x10_0000, 3 * CACHING_PAGESIZE as u32);
+        let buffer_id = cache.create_buffer(0x10_0000, 3 * CACHING_PAGESIZE as u32, false);
         let mut visited: SmallVec<[BufferId; 4]> = SmallVec::new();
 
         cache.for_each_buffer_in_range(0x10_1000, 2 * CACHING_PAGESIZE, |id, _| {
@@ -5210,7 +5543,7 @@ mod tests {
             &tracker,
             TestBufferCacheRuntime::default(),
         );
-        let id = cache.find_buffer(0, 0x100);
+        let id = cache.find_buffer(0, 0x100, false);
         assert_eq!(id, NULL_BUFFER_ID);
     }
 
@@ -5223,9 +5556,9 @@ mod tests {
         );
         let addr = 0x0001_0000u64;
         let size = 0x1000u32;
-        let id1 = cache.find_buffer(addr, size);
+        let id1 = cache.find_buffer(addr, size, false);
         // Finding again should return the same buffer.
-        let id2 = cache.find_buffer(addr, size);
+        let id2 = cache.find_buffer(addr, size, false);
         assert_eq!(id1, id2);
         assert_ne!(id1, NULL_BUFFER_ID);
         assert_eq!(cache.slot_buffers[id1].raw_handle(), 0);

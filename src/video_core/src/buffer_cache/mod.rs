@@ -11,4 +11,5 @@ pub mod buffer_cache;
 pub mod buffer_cache_base;
 pub mod memory_tracker_base;
 pub mod usage_tracker;
+pub mod virtual_range_cache;
 pub mod word_manager;

@@ -17,6 +17,7 @@ use crate::gpu_logging::{get_instance, is_active};
 use super::vma::VmaAllocator;
 use super::vulkan_device::Device;
 use super::vulkan_wrapper::VulkanError;
+use super::vulkan_wrapper::MemoryLocation;
 
 // ---------------------------------------------------------------------------
 // MemoryUsage — port of `Vulkan::MemoryUsage`
@@ -302,6 +303,8 @@ pub struct AllocatedBuffer {
     allocation: Option<vk_mem::Allocation>,
     mapped_ptr: *mut u8,
     size: vk::DeviceSize,
+    /// Upstream `vk::Buffer::location` (memory, offset, type) for sparse aliasing.
+    location: MemoryLocation,
     coherent: bool,
 }
 
@@ -347,6 +350,11 @@ impl AllocatedBuffer {
 
     pub fn is_host_coherent(&self) -> bool {
         self.coherent
+    }
+
+    /// Upstream `vk::Buffer::Location()`.
+    pub fn location(&self) -> MemoryLocation {
+        self.location
     }
 
     /// Port of `vk::Buffer::Flush`.
@@ -561,6 +569,81 @@ impl MemoryAllocator {
             allocation: Some(allocation),
             mapped_ptr: allocation_info.mapped_data.cast(),
             size: ci.size,
+            location: MemoryLocation {
+                memory: allocation_info.device_memory,
+                offset: allocation_info.offset,
+                memory_type: allocation_info.memory_type,
+            },
+            coherent: property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT),
+        })
+    }
+
+    /// Creates a buffer whose memory offset is aligned to at least
+    /// `min_alignment` (sparse block size), so it can be aliased into a
+    /// sparse buffer.
+    ///
+    /// Port of `MemoryAllocator::CreateBuffer(ci, usage, min_alignment)`
+    /// (`vmaCreateBufferWithAlignment`).
+    pub fn create_buffer_with_alignment(
+        &self,
+        ci: &vk::BufferCreateInfo,
+        usage: MemoryUsage,
+        min_alignment: vk::DeviceSize,
+    ) -> Result<AllocatedBuffer, VulkanError> {
+        if min_alignment <= 1 {
+            return self.create_buffer(ci, usage);
+        }
+        let anv_flags = if usage == MemoryUsage::Stream
+            && self.driver_id == vk::DriverId::INTEL_OPEN_SOURCE_MESA
+        {
+            vk::MemoryPropertyFlags::HOST_CACHED
+        } else {
+            vk::MemoryPropertyFlags::empty()
+        };
+        let allocation_ci = vk_mem::AllocationCreateInfo {
+            flags: vk_mem::AllocationCreateFlags::WITHIN_BUDGET | memory_usage_vma_flags(usage),
+            usage: memory_usage_vma(usage),
+            required_flags: vk::MemoryPropertyFlags::empty(),
+            preferred_flags: memory_usage_preferred_vma_flags(usage) | anv_flags,
+            memory_type_bits: if usage == MemoryUsage::Stream {
+                0
+            } else {
+                self.valid_memory_types
+            },
+            ..Default::default()
+        };
+        let allocator = self.allocator.lock().expect("VMA allocator mutex poisoned");
+        let (buffer, allocation) = unsafe {
+            allocator
+                .create_buffer_with_alignment(ci, &allocation_ci, min_alignment)
+                .map_err(VulkanError::new)?
+        };
+        let allocation_info = allocator.get_allocation_info(&allocation);
+        let property_flags =
+            self.properties.memory_types[allocation_info.memory_type as usize].property_flags;
+        drop(allocator);
+        if is_active()
+            && *common::settings::values()
+                .gpu_log_memory_tracking
+                .get_value()
+        {
+            get_instance().log_memory_allocation(
+                memory_handle_for_gpu_log(allocation_info.device_memory),
+                allocation_info.size,
+                property_flags.as_raw(),
+            );
+        }
+        Ok(AllocatedBuffer {
+            allocator: Arc::clone(&self.allocator),
+            buffer,
+            allocation: Some(allocation),
+            mapped_ptr: allocation_info.mapped_data.cast(),
+            size: ci.size,
+            location: MemoryLocation {
+                memory: allocation_info.device_memory,
+                offset: allocation_info.offset,
+                memory_type: allocation_info.memory_type,
+            },
             coherent: property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT),
         })
     }

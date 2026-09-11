@@ -18,6 +18,7 @@ pub mod fence_manager;
 pub mod fixed_pipeline_state;
 pub mod graphics_pipeline;
 pub mod master_semaphore;
+pub mod multi_range_buffer;
 pub mod maxwell_to_vk;
 pub mod pipeline_cache;
 pub mod pipeline_helper;

@@ -104,10 +104,27 @@ pub const DEFAULT_SKIP_CACHE_SIZE: u32 = 4 * 1024;
 pub struct Binding {
     /// Device address of the binding.
     pub device_addr: VAddr,
+    /// GPU virtual address of the binding (storage buffers only; used to
+    /// resolve multi-range segments). Upstream `gpu_addr`.
+    pub gpu_addr: u64,
     /// Size of the binding in bytes.
     pub size: u32,
     /// Buffer slot that backs this binding.
     pub buffer_id: BufferId,
+    /// First entry in the per-pass `MultiRangeSegment` pool. Upstream `segment_first`.
+    pub segment_first: u32,
+    /// Number of pool entries (0 or 1 means single-range). Upstream `segment_count`.
+    pub segment_count: u32,
+}
+
+/// One host-contiguous piece of a multi-range storage buffer binding.
+///
+/// Upstream `VideoCommon::MultiRangeSegment`.
+#[derive(Debug, Clone, Copy)]
+pub struct MultiRangeSegment {
+    pub buffer_id: BufferId,
+    pub device_addr: VAddr,
+    pub size: u32,
 }
 
 impl Default for Binding {
@@ -143,8 +160,11 @@ impl Default for TextureBufferBinding {
 /// Sentinel null binding.
 pub const NULL_BINDING: Binding = Binding {
     device_addr: 0,
+    gpu_addr: 0,
     size: 0,
     buffer_id: NULL_BUFFER_ID,
+    segment_first: 0,
+    segment_count: 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -399,7 +419,19 @@ pub trait BufferCacheBuffer:
     type Runtime: BufferCacheRuntime<Buffer = Self>;
 
     fn null(runtime: &mut Self::Runtime, params: super::buffer_base::NullBufferParams) -> Self;
-    fn new(runtime: &mut Self::Runtime, cpu_addr: VAddr, size_bytes: u64) -> Self;
+    /// Upstream `Buffer(Runtime&, DAddr cpu_addr, u64 size_bytes, bool sparse_compatible)`.
+    fn new(
+        runtime: &mut Self::Runtime,
+        cpu_addr: VAddr,
+        size_bytes: u64,
+        sparse_compatible: bool,
+    ) -> Self;
+
+    /// Upstream `Buffer::IsSparseCompatible()` (only the Vulkan buffer defines it;
+    /// `FindBuffer` probes it with `requires`).
+    fn is_sparse_compatible(&self) -> bool {
+        false
+    }
 
     fn immediate_upload(&self, offset: u64, data: &[u8]);
     fn immediate_download(&self, offset: u64, data: &mut [u8]);
@@ -637,6 +669,39 @@ pub trait BufferCacheRuntime {
     ///
     /// Upstream: `Runtime::TickFrame(SlotVector<Buffer>&)`
     fn tick_frame(&mut self, slot_buffers: &mut SlotVector<Self::Buffer>);
+
+    // -- Multi-range storage buffers (Eden a538cd9aff) --
+    //
+    // Upstream probes `requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }`
+    // and `requires { runtime.OnBufferDeleted(buffer); }`; the Rust trait carries the
+    // same optional surface through defaults that disable the feature.
+
+    /// Whether the runtime implements `BindMultiRangeStorageBuffer`.
+    fn supports_multi_range_storage(&self) -> bool {
+        false
+    }
+
+    /// Upstream: `Runtime::PrefersSparseSources()`
+    fn prefers_sparse_sources(&self) -> bool {
+        false
+    }
+
+    /// Upstream: `Runtime::ResetMultiRange()`
+    fn reset_multi_range(&mut self) {}
+
+    /// Upstream: `Runtime::PushMultiRangeSource(buffer, offset, size)`
+    fn push_multi_range_source(&mut self, _buffer: &Self::Buffer, _offset: u32, _size: u32) {}
+
+    /// Upstream: `Runtime::BindMultiRangeStorageBuffer(key, is_written)`
+    fn bind_multi_range_storage_buffer(&mut self, _key: u64, _is_written: bool) -> bool {
+        false
+    }
+
+    /// Upstream: `Runtime::InvalidateMultiRange(key)`
+    fn invalidate_multi_range(&mut self, _key: u64) {}
+
+    /// Upstream: `Runtime::OnBufferDeleted(buffer)`
+    fn on_buffer_deleted(&mut self, _buffer: &Self::Buffer) {}
 
     /// Whether the runtime can report actual device memory usage.
     ///
@@ -1035,7 +1100,12 @@ impl BufferCacheBuffer for TestBuffer {
         }
     }
 
-    fn new(_runtime: &mut Self::Runtime, cpu_addr: VAddr, size_bytes: u64) -> Self {
+    fn new(
+        _runtime: &mut Self::Runtime,
+        cpu_addr: VAddr,
+        size_bytes: u64,
+        _sparse_compatible: bool,
+    ) -> Self {
         Self {
             base: BufferBase::new(cpu_addr, size_bytes),
             storage: parking_lot::Mutex::new(vec![0; size_bytes as usize]),
@@ -1083,6 +1153,17 @@ pub(crate) struct TestBufferCacheRuntime {
     max_dynamic_storage_buffers: u32,
     can_report_memory_usage: bool,
     device_local_memory: u64,
+    /// Emulates a runtime implementing `BindMultiRangeStorageBuffer`.
+    pub(crate) multi_range: bool,
+    pub(crate) prefers_sparse: bool,
+    /// `(raw_handle, offset, size)` pushed since the last `reset_multi_range`.
+    pub(crate) multi_range_sources: Vec<(u64, u32, u32)>,
+    /// `(key, is_written)` of every `bind_multi_range_storage_buffer` call.
+    pub(crate) multi_range_binds: Vec<(u64, bool)>,
+    pub(crate) invalidated_multi_ranges: Vec<u64>,
+    pub(crate) deleted_buffers: Vec<u64>,
+    /// `(offset, size, is_written)` of every regular `bind_storage_buffer` call.
+    pub(crate) storage_binds: Vec<(u32, u32, bool)>,
 }
 
 #[cfg(test)]
@@ -1099,6 +1180,16 @@ impl TestBufferCacheRuntime {
         Self {
             can_report_memory_usage: true,
             device_local_memory,
+            ..Self::default()
+        }
+    }
+
+    /// Runtime emulating `BindMultiRangeStorageBuffer` support (optionally with
+    /// sparse-aliasable sources).
+    pub(crate) fn with_multi_range(prefers_sparse: bool) -> Self {
+        Self {
+            multi_range: true,
+            prefers_sparse,
             ..Self::default()
         }
     }
@@ -1285,10 +1376,41 @@ impl BufferCacheRuntime for TestBufferCacheRuntime {
         _stage: usize,
         _binding_index: u32,
         _buffer: &mut Self::Buffer,
-        _offset: u32,
-        _size: u32,
-        _is_written: bool,
+        offset: u32,
+        size: u32,
+        is_written: bool,
     ) {
+        self.storage_binds.push((offset, size, is_written));
+    }
+
+    fn supports_multi_range_storage(&self) -> bool {
+        self.multi_range
+    }
+
+    fn prefers_sparse_sources(&self) -> bool {
+        self.prefers_sparse
+    }
+
+    fn reset_multi_range(&mut self) {
+        self.multi_range_sources.clear();
+    }
+
+    fn push_multi_range_source(&mut self, buffer: &Self::Buffer, offset: u32, size: u32) {
+        self.multi_range_sources
+            .push((buffer.raw_handle(), offset, size));
+    }
+
+    fn bind_multi_range_storage_buffer(&mut self, key: u64, is_written: bool) -> bool {
+        self.multi_range_binds.push((key, is_written));
+        !self.multi_range_sources.is_empty()
+    }
+
+    fn invalidate_multi_range(&mut self, key: u64) {
+        self.invalidated_multi_ranges.push(key);
+    }
+
+    fn on_buffer_deleted(&mut self, buffer: &Self::Buffer) {
+        self.deleted_buffers.push(buffer.raw_handle());
     }
 
     fn bind_texture_buffer(
@@ -1379,6 +1501,19 @@ pub trait GpuMemoryAccess {
     ///
     /// Upstream: `gpu_memory->GetMemoryLayoutSize(gpu_addr)`
     fn get_memory_layout_size(&self, gpu_addr: u64) -> u64;
+
+    /// Upstream: `Tegra::MemoryManager::GetID()`; identifies the address space
+    /// in the virtual range cache keys.
+    fn get_id(&self) -> usize {
+        0
+    }
+
+    /// Upstream: `Tegra::MemoryManager::GetSubmappedRange(gpu_addr, size)`:
+    /// `(gpu_addr, size)` runs that are contiguous in host memory. The default
+    /// reports nothing, which disables multi-range resolution.
+    fn get_submapped_range(&self, _gpu_addr: u64, _size: u64) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1464,7 +1599,7 @@ mod tests {
     #[test]
     fn default_backend_write_notification_preserves_base_tick_semantics() {
         let mut runtime = TestBufferCacheRuntime::default();
-        let mut buffer = TestBuffer::new(&mut runtime, 0x1000, 4);
+        let mut buffer = TestBuffer::new(&mut runtime, 0x1000, 4, false);
         assert_eq!(buffer.write_tick(), 0);
         for tick in [19, 19, 0, u64::MAX] {
             BufferCacheBuffer::set_write_tick(&mut buffer, tick);
@@ -1475,7 +1610,7 @@ mod tests {
     #[test]
     fn default_region_notification_preserves_write_tick_semantics() {
         let mut runtime = TestBufferCacheRuntime::default();
-        let mut buffer = TestBuffer::new(&mut runtime, 0x1000, 8);
+        let mut buffer = TestBuffer::new(&mut runtime, 0x1000, 8, false);
         for (tick, offset, size) in [(19, 0, 4), (19, 4, 4), (0, 0, 0), (u64::MAX, 0, 8)] {
             buffer.mark_written_region(tick, offset, size);
             assert_eq!(buffer.write_tick(), tick);

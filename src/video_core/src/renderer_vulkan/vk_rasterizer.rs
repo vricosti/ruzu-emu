@@ -521,6 +521,14 @@ impl GpuMemoryAccess for GpuMemoryAccessAdapter {
     fn get_memory_layout_size(&self, gpu_addr: u64) -> u64 {
         unsafe { self.mm.as_ref().get_memory_layout_size(gpu_addr) }
     }
+
+    fn get_id(&self) -> usize {
+        unsafe { self.mm.as_ref().get_id() }
+    }
+
+    fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
+        unsafe { self.mm.as_ref().get_submapped_range(gpu_addr, size) }
+    }
 }
 
 struct DeviceMemoryAccessAdapter {
@@ -3631,6 +3639,10 @@ impl RasterizerInterface for RasterizerVulkan {
         let _texture_guard = unsafe { (*texture_mutex).lock() };
         self.texture_cache
             .base
+            .unmap_gpu_memory(as_id, addr, size as usize);
+        // Upstream: `buffer_cache.UnmapGPUMemory(as_id, addr, size)` (outside the
+        // texture cache lock; the buffer cache defers the invalidation itself).
+        self.common_buffer_cache
             .unmap_gpu_memory(as_id, addr, size as usize);
     }
 

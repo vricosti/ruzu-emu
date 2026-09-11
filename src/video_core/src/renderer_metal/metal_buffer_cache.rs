@@ -225,7 +225,12 @@ impl BufferCacheBuffer for Buffer {
         Self::null(runtime)
     }
 
-    fn new(runtime: &mut Self::Runtime, cpu_addr: u64, size_bytes: u64) -> Self {
+    fn new(
+        runtime: &mut Self::Runtime,
+        cpu_addr: u64,
+        size_bytes: u64,
+        _sparse_compatible: bool,
+    ) -> Self {
         Self::new(runtime, cpu_addr, size_bytes)
     }
 

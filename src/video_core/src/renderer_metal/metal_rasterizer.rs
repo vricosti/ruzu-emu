@@ -353,6 +353,14 @@ impl GpuMemoryAccess for GpuMemoryAccessAdapter {
     fn get_memory_layout_size(&self, gpu_addr: u64) -> u64 {
         self.memory_manager.lock().get_memory_layout_size(gpu_addr)
     }
+    fn get_id(&self) -> usize {
+        self.memory_manager.lock().get_id()
+    }
+
+    fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
+        self.memory_manager.lock().get_submapped_range(gpu_addr, size)
+    }
+
 }
 
 struct DeviceMemoryAccessAdapter {

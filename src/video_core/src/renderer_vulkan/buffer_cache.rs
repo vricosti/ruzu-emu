@@ -16,6 +16,7 @@ use smallvec::SmallVec;
 
 use super::compute_pass::{QuadIndexedPass, Uint8Pass};
 use super::descriptor_pool::DescriptorPool;
+use super::multi_range_buffer::{MultiRangeBufferCache, MultiRangeSource};
 use super::scheduler::Scheduler;
 use super::staging_buffer_pool::StagingBufferPool;
 use super::update_descriptor::{ComputePassDescriptorQueue, UpdateDescriptorQueue};
@@ -33,7 +34,7 @@ use crate::vulkan_common::vulkan_memory_allocator::{
     AllocatedBuffer, MemoryAllocator, MemoryUsage,
 };
 use crate::vulkan_common::vulkan_wrapper::{
-    PIPELINE_STAGE_GRAPHICS_COMPUTE, PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+    PIPELINE_STAGE_GRAPHICS_COMPUTE, PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, MemoryLocation,
 };
 
 /// Cached Vulkan buffer view for texture/image buffer descriptors.
@@ -58,6 +59,9 @@ pub struct Buffer {
     tracker: UsageTracker,
     last_usage_tick: u64,
     is_null: bool,
+    /// Upstream `sparse_compatible`: allocated with the sparse block alignment
+    /// so it can be aliased into a multi-range sparse buffer.
+    sparse_compatible: bool,
 }
 
 impl Buffer {
@@ -96,14 +100,21 @@ impl Buffer {
             tracker: UsageTracker::new(4096),
             last_usage_tick: 0,
             is_null: !runtime.has_null_descriptor,
+            sparse_compatible: false,
         }
     }
 
-    fn new(runtime: &mut BufferCacheRuntime, cpu_addr: u64, size_bytes: u64) -> Self {
+    fn new(
+        runtime: &mut BufferCacheRuntime,
+        cpu_addr: u64,
+        size_bytes: u64,
+        sparse_compatible: bool,
+    ) -> Self {
         let allocation = runtime
-            .create_gpu_buffer(
+            .create_gpu_buffer_with_alignment(
                 size_bytes,
                 common_buffer_usage_flags(runtime.vulkan_device()),
+                runtime.sparse_alignment_for(sparse_compatible),
             )
             .unwrap_or_else(|error| {
                 panic!(
@@ -128,7 +139,15 @@ impl Buffer {
             tracker: UsageTracker::new(size_bytes as usize),
             last_usage_tick: 0,
             is_null: false,
+            sparse_compatible,
         }
+    }
+
+    /// Upstream `Buffer::Location()`.
+    fn location(&self) -> MemoryLocation {
+        self.allocation
+            .as_ref()
+            .map_or(MemoryLocation::default(), AllocatedBuffer::location)
     }
 
     fn handle(&self) -> vk::Buffer {
@@ -222,8 +241,17 @@ impl BufferCacheBuffer for Buffer {
         Buffer::null(runtime)
     }
 
-    fn new(runtime: &mut Self::Runtime, cpu_addr: u64, size_bytes: u64) -> Self {
-        Buffer::new(runtime, cpu_addr, size_bytes)
+    fn new(
+        runtime: &mut Self::Runtime,
+        cpu_addr: u64,
+        size_bytes: u64,
+        sparse_compatible: bool,
+    ) -> Self {
+        Buffer::new(runtime, cpu_addr, size_bytes, sparse_compatible)
+    }
+
+    fn is_sparse_compatible(&self) -> bool {
+        self.sparse_compatible
     }
 
     fn immediate_upload(&self, _offset: u64, _data: &[u8]) {
@@ -447,6 +475,11 @@ pub struct BufferCacheRuntime {
     uniform_buffer_alignment: u32,
     limit_dynamic_storage_buffers: bool,
     max_dynamic_storage_buffers: u32,
+
+    /// Upstream `multi_range_buffers` / `multi_range_sources` / `multi_range_total`.
+    multi_range_buffers: MultiRangeBufferCache,
+    multi_range_sources: SmallVec<[MultiRangeSource; 16]>,
+    multi_range_total: vk::DeviceSize,
 }
 
 impl BufferCacheRuntime {
@@ -524,7 +557,18 @@ impl BufferCacheRuntime {
             uniform_buffer_alignment,
             limit_dynamic_storage_buffers,
             max_dynamic_storage_buffers,
+            multi_range_buffers: MultiRangeBufferCache::new(vulkan_device),
+            multi_range_sources: SmallVec::new(),
+            multi_range_total: 0,
         })
+    }
+
+    /// Upstream `SparseAlignmentFor(sparse_compatible)`.
+    fn sparse_alignment_for(&self, sparse_compatible: bool) -> vk::DeviceSize {
+        if !sparse_compatible || !self.multi_range_buffers.use_sparse {
+            return 0;
+        }
+        self.multi_range_buffers.block_size
     }
 
     /// Port of `BufferCacheRuntime::BindVertexBuffer`.
@@ -830,6 +874,34 @@ impl BufferCacheRuntime {
             .create_buffer(&buffer_info, MemoryUsage::DeviceLocal)
     }
 
+    /// Upstream `CreateBuffer(device, memory_allocator, size, sparse_alignment)`:
+    /// `sparse_alignment > 1` requests the block-aligned allocation path.
+    fn create_gpu_buffer_with_alignment(
+        &self,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        sparse_alignment: vk::DeviceSize,
+    ) -> Result<AllocatedBuffer, crate::vulkan_common::vulkan_wrapper::VulkanError> {
+        if sparse_alignment <= 1 {
+            return self.create_gpu_buffer(size, usage);
+        }
+        let usage = if self.vulkan_device().is_buffer_device_address_supported() {
+            usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+        } else {
+            usage
+        };
+        let buffer_info = vk::BufferCreateInfo::builder()
+            .size(size)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .build();
+        self.memory_allocator().create_buffer_with_alignment(
+            &buffer_info,
+            MemoryUsage::DeviceLocal,
+            sparse_alignment,
+        )
+    }
+
     fn make_buffer_copies(copies: &[BufferCopy]) -> SmallVec<[vk::BufferCopy; 8]> {
         copies
             .iter()
@@ -932,6 +1004,92 @@ impl BufferCacheRuntime {
 }
 
 impl base::BufferCacheRuntime for BufferCacheRuntime {
+    fn supports_multi_range_storage(&self) -> bool {
+        true
+    }
+
+    fn prefers_sparse_sources(&self) -> bool {
+        self.multi_range_buffers.use_sparse
+    }
+
+    fn reset_multi_range(&mut self) {
+        self.multi_range_sources.clear();
+        self.multi_range_total = 0;
+    }
+
+    fn push_multi_range_source(&mut self, buffer: &Buffer, offset: u32, size: u32) {
+        let location = buffer.location();
+        self.multi_range_sources.push(MultiRangeSource {
+            handle: buffer.handle(),
+            memory: location.memory,
+            memory_offset: location.offset,
+            offset: vk::DeviceSize::from(offset),
+            size: vk::DeviceSize::from(size),
+            write_tick: buffer.write_tick(),
+            memory_type: location.memory_type,
+        });
+        self.multi_range_total += vk::DeviceSize::from(size);
+    }
+
+    /// Upstream `BufferCacheRuntime::BindMultiRangeStorageBuffer`.
+    fn bind_multi_range_storage_buffer(&mut self, key: u64, is_written: bool) -> bool {
+        if self.multi_range_sources.is_empty() || self.multi_range_total == 0 {
+            return false;
+        }
+        let device = self.device_owner;
+        let mut scheduler = self.scheduler;
+        let memory_allocator = self.memory_allocator;
+        let sources: SmallVec<[MultiRangeSource; 16]> = self.multi_range_sources.clone();
+        let total = self.multi_range_total;
+        // SAFETY: the runtime holds non-owning pointers to objects that outlive
+        // it (see the struct fields), exactly like upstream's references.
+        let r = unsafe {
+            self.multi_range_buffers.get(
+                device.get(),
+                scheduler.as_mut(),
+                memory_allocator.as_ref(),
+                key,
+                &sources,
+                total,
+            )
+        };
+        if r.handle == vk::Buffer::null() {
+            return false;
+        }
+        if is_written && !r.sparse {
+            return false;
+        }
+        if r.needs_gather {
+            self.pre_copy_barrier();
+            let mut dst_offset: vk::DeviceSize = 0;
+            for source in &sources {
+                let copy = [BufferCopy {
+                    src_offset: source.offset,
+                    dst_offset,
+                    size: source.size,
+                }];
+                self.copy_buffer_handles(r.handle, source.handle, &copy, false, false);
+                dst_offset += source.size;
+            }
+            self.post_copy_barrier();
+            self.multi_range_buffers.mark_gathered(key);
+        }
+        self.guest_descriptor_queue()
+            .add_buffer_with_address(r.handle, r.address, 0, r.size);
+        true
+    }
+
+    fn invalidate_multi_range(&mut self, key: u64) {
+        self.multi_range_buffers.invalidate(key);
+    }
+
+    fn on_buffer_deleted(&mut self, buffer: &Buffer) {
+        let mut scheduler = self.scheduler;
+        // SAFETY: see `bind_multi_range_storage_buffer`.
+        let scheduler = unsafe { scheduler.as_mut() };
+        self.multi_range_buffers.drop_owner(scheduler, buffer.handle());
+    }
+
     type Buffer = Buffer;
     type AsyncBuffer = super::staging_buffer_pool::StagingBufferRef;
 

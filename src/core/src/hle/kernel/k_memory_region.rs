@@ -383,6 +383,22 @@ impl KMemoryRegionTree {
         true
     }
 
+    /// Inline wrapper from upstream k_memory_region.h.
+    pub fn get_random_aligned_region_with_guard(
+        &self,
+        size: usize,
+        alignment: usize,
+        type_id: u32,
+        guard_size: usize,
+    ) -> u64 {
+        self.get_random_aligned_region(
+            size.wrapping_add(guard_size.wrapping_mul(2)),
+            alignment,
+            type_id,
+        )
+        .wrapping_add(guard_size as u64)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.regions.is_empty()
     }

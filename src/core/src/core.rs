@@ -1515,72 +1515,24 @@ impl System {
         kernel.initialize();
         kernel.set_system_ref(system_ref);
 
-        // Initialize the kernel physical memory manager pools.
-        // Upstream traverses the memory layout tree; we statically partition
-        // the 4 GiB DRAM into:
-        //
-        //   [0x8000_0000 .. 0x8400_0000)  — kernel-reserved low DRAM (code,
-        //                                   slab heap, identity mappings).
-        //   [0x8400_0000 .. 0xE000_0000)  — Application pool (~2.94 GiB) for
-        //                                   user processes' stacks, heaps, etc.
-        //   [0xE000_0000 .. 0xF000_0000)  — Applet pool (256 MiB) for applets.
-        //   [0xF000_0000 .. 0x1_0000_0000) — Secure pool (256 MiB) for shared
-        //                                    memory and kernel-private allocs.
-        //
-        // Order matters: the pool with the LARGEST start address must be
-        // initialized first so KMemoryManager's pool head linkage walks
-        // correctly when allocation is requested.
+        // Construct the configured board layout before allocator setup.
         {
-            use crate::device_memory::dram_memory_map;
-            const SECURE_POOL_OFFSET: u64 = 0xF000_0000;
-            const SECURE_POOL_SIZE: usize = 256 * 1024 * 1024;
-            const APPLET_POOL_OFFSET: u64 = 0xE000_0000;
-            const APPLET_POOL_SIZE: usize = 256 * 1024 * 1024;
-            const APPLICATION_POOL_OFFSET: u64 = 0x0400_0000;
-            const APPLICATION_POOL_SIZE: usize = 0xE000_0000_usize - 0x0400_0000_usize;
-
-            // Populate the kernel-wide physical memory layout, then drive
-            // KMemoryManager init off the resulting region tree. Upstream:
-            //
-            //   for (auto& it : Kernel().MemoryLayout().GetPhysicalMemoryRegionTree()) {
-            //       if (it.IsDerivedFrom(KMemoryRegionType_DramUserPool)) {
-            //           m_managers[it.GetAttributes()].Initialize(...);
-            //       }
-            //   }
-            //
-            // ruzu's `populate_default_dram_user_pools` seeds the tree
-            // from the same pool offsets/sizes that were previously
-            // hardcoded as direct `initialize_pool` calls; the manager
-            // then walks the tree via `initialize_from_layout`.
-            kernel.initialize_memory_layout(
-                (
-                    dram_memory_map::BASE + APPLICATION_POOL_OFFSET,
-                    APPLICATION_POOL_SIZE,
-                ),
-                (dram_memory_map::BASE + APPLET_POOL_OFFSET, APPLET_POOL_SIZE),
-                (dram_memory_map::BASE + SECURE_POOL_OFFSET, SECURE_POOL_SIZE),
-            );
+            kernel.derive_initial_memory_layout();
             let layout_arc = kernel
                 .get_memory_layout()
                 .expect("memory layout just initialized");
-            {
+            let (total_size, kernel_size, pt_address, pt_size) = {
                 let layout = layout_arc.lock().unwrap();
-                kernel.memory_manager_mut().initialize_from_layout(&*layout);
-            }
-
-            // Initialize the kernel-wide system resource limit. Upstream:
-            // `KernelCore::Impl::InitializeSystemResourceLimit` (kernel.cpp:214).
-            // total_size = sum of all pool sizes; kernel_size is the kernel's
-            // own reserved region (the [DRAM_BASE..APPLICATION_POOL_OFFSET)
-            // span between 0x80000000 and 0x84000000 = 64 MiB).
-            let total_size = (SECURE_POOL_SIZE + APPLET_POOL_SIZE + APPLICATION_POOL_SIZE) as i64;
-            let kernel_size = APPLICATION_POOL_OFFSET as i64;
-            kernel.initialize_system_resource_limit(total_size, kernel_size);
-
-            kernel.initialize_resource_managers(
-                0xFFFF_E000_0000_0000,
-                crate::hle::kernel::k_memory_layout::KERNEL_PAGE_TABLE_HEAP_SIZE,
-            );
+                let (total, reserved) = layout.get_total_and_kernel_memory_sizes();
+                let pt = layout.get_virtual_memory_region_tree().find_first_derived(
+                    crate::hle::kernel::k_memory_region_type::K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_KERNEL_PT_HEAP,
+                ).expect("derived layout must contain the page-table heap");
+                kernel.initialize_system_resource_limit(total as i64, reserved as i64);
+                (total, reserved, pt.get_address(), pt.get_size())
+            };
+            debug_assert!(total_size >= kernel_size);
+            kernel.initialize_memory_layout();
+            kernel.initialize_resource_managers(pt_address, pt_size);
 
             // Upstream `KernelCore::Impl::InitializeHackSharedMemory` runs
             // after the physical memory manager is ready. Initialize the
@@ -3340,6 +3292,35 @@ mod exit_state_tests {
         }
         // Must not try to discover services before System is powered on.
         System::new().refresh_time();
+    }
+
+    #[test]
+    fn memory_layout_changes_survive_kernel_start_and_stop() {
+        const CHILD: &str = "RUZU_TEST_MEMORY_KERNEL_LIFECYCLE";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "core::exit_state_tests::memory_layout_changes_survive_kernel_start_and_stop"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        for mode in [common::settings::MemoryLayout::Memory4Gb,
+            common::settings::MemoryLayout::Memory12Gb,
+            common::settings::MemoryLayout::Memory4Gb] {
+            {
+                let mut settings = common::settings::values_mut();
+                settings.memory_layout_mode.set_global(true);
+                settings.memory_layout_mode.set_value(mode);
+            }
+            let mut system = Box::new(System::new());
+            system.initialize();
+            system.initialize_kernel();
+            let expected = crate::hle::kernel::board::k_system_control::init::get_intended_memory_size();
+            assert_eq!(system.device_memory.as_ref().unwrap().buffer.backing_size(), expected);
+            let layout = system.kernel.as_ref().unwrap().get_memory_layout().unwrap();
+            assert_eq!(layout.lock().unwrap().get_total_and_kernel_memory_sizes().0, expected);
+            system.shutdown_main_process();
+        }
     }
 
     #[test]

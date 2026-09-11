@@ -150,7 +150,7 @@ struct SharedManualContentProvider {
 
 impl ContentProvider for SharedManualContentProvider {
     fn refresh(&mut self) {
-        self.inner.get_mut().unwrap().refresh();
+        self.inner.lock().unwrap().refresh();
     }
 
     fn has_entry(
@@ -219,32 +219,35 @@ impl ContentProvider for SharedManualContentProvider {
 struct FrontendContentProviders {
     vfs: Arc<RealVfsFilesystem>,
     manual: Box<SharedManualContentProvider>,
-    union: Arc<Mutex<ContentProviderUnion>>,
 }
 
 fn frontend_content_providers() -> &'static FrontendContentProviders {
     static PROVIDERS: OnceLock<FrontendContentProviders> = OnceLock::new();
     PROVIDERS.get_or_init(|| {
-        let mut manual = Box::new(SharedManualContentProvider {
+        let manual = Box::new(SharedManualContentProvider {
             inner: Mutex::new(ManualContentProvider::default()),
         });
-        let union = Arc::new(Mutex::new(ContentProviderUnion::new()));
-        unsafe {
-            union.lock().unwrap().set_slot(
-                ContentProviderUnionSlot::FrontendManual,
-                (&mut *manual as *mut SharedManualContentProvider) as *mut dyn ContentProvider,
-            );
-        }
         FrontendContentProviders {
             vfs: RealVfsFilesystem::new(),
             manual,
-            union,
         }
     })
 }
 
 pub(crate) fn frontend_content_provider_union() -> Arc<Mutex<ContentProviderUnion>> {
-    Arc::clone(&frontend_content_providers().union)
+    // Eden's native cache slots belong to its System and filesystem controller.
+    // Our lightweight metadata controllers must not replace the running
+    // System's slots or leave it pointing at caches destroyed after a scan.
+    // Share only the process-lifetime, mutex-protected manual provider.
+    let manual = &*frontend_content_providers().manual as *const SharedManualContentProvider;
+    let mut union = ContentProviderUnion::new();
+    // SAFETY: the OnceLock owns the boxed adapter for the process lifetime;
+    // its ContentProvider methods synchronize access through its mutex.
+    unsafe {
+        union.set_slot(ContentProviderUnionSlot::FrontendManual,
+            manual.cast_mut() as *mut dyn ContentProvider);
+    }
+    Arc::new(Mutex::new(union))
 }
 
 pub(crate) fn frontend_vfs() -> Arc<RealVfsFilesystem> {
@@ -2667,7 +2670,7 @@ impl MetadataReader {
     fn new() -> Self {
         let providers = frontend_content_providers();
         let vfs = Arc::clone(&providers.vfs);
-        let content_provider = Arc::clone(&providers.union);
+        let content_provider = frontend_content_provider_union();
         let mut controller = FileSystemController::new();
         controller.set_content_provider(content_provider.clone());
         controller.create_factories(vfs.clone(), false);
@@ -2946,6 +2949,33 @@ pub(crate) fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_and_runtime_registries_keep_native_cache_slots_independent() {
+        use ruzu_core::file_sys::nca_metadata::ContentRecordType;
+        let mut native_cache = Box::new(ManualContentProvider::default());
+        let title_id = 0x05AA_0000_0000_1000;
+        let file: VirtualFile = Arc::new(
+            ruzu_core::file_sys::vfs::vfs_vector::VectorVfsFile::new(
+                Vec::new(), "synthetic.nca".into(), None));
+        native_cache.add_entry(TitleType::Application, ContentRecordType::Program,
+            title_id, file);
+        let runtime = frontend_content_provider_union();
+        let metadata = frontend_content_provider_union();
+        assert!(!Arc::ptr_eq(&runtime, &metadata));
+        // Synthetic cache owner outlives both registries. The test needs no
+        // files, keys, GTK display, or mutation of the shared manual contents.
+        unsafe {
+            runtime.lock().unwrap().set_slot(ContentProviderUnionSlot::External,
+                &mut *native_cache as *mut dyn ContentProvider);
+        }
+        assert!(!metadata.lock().unwrap().has_entry(title_id, ContentRecordType::Program));
+        metadata.lock().unwrap().clear_slot(ContentProviderUnionSlot::External);
+        drop(metadata);
+        assert!(runtime.lock().unwrap().has_entry(title_id, ContentRecordType::Program));
+        let next_metadata = frontend_content_provider_union();
+        assert!(!next_metadata.lock().unwrap().has_entry(title_id, ContentRecordType::Program));
+    }
 
     #[test]
     #[ignore = "requires GTK on the platform main thread and a display"]

@@ -557,10 +557,23 @@ mod tests {
     #[test]
     fn debugger_binds_an_ephemeral_port_and_stops_on_drop() {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let debugger = Debugger::new(process, 0, Arc::new(Box::new(|| {})));
-
-        assert!(debugger.is_initialized());
-        assert_ne!(debugger.port(), Some(0));
+        let mut port = 0;
+        for _ in 0..4 {
+            let debugger = Debugger::new(process.clone(), port, Arc::new(Box::new(|| {})));
+            assert!(debugger.is_initialized());
+            let bound_port = debugger.port().expect("initialized listener port");
+            assert_ne!(bound_port, 0);
+            if port != 0 {
+                assert_eq!(bound_port, port, "must honor the requested port");
+            }
+            drop(debugger);
+            // ShutdownServer joins the listener thread upstream. A subsequent
+            // application must be able to bind the configured port immediately.
+            let listener = TcpListener::bind(("0.0.0.0", bound_port))
+                .expect("debugger destruction must release its listener");
+            drop(listener);
+            port = bound_port;
+        }
     }
 
     #[test]

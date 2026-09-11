@@ -4087,8 +4087,8 @@ mod tests {
         fn update_pages_cached_batch(&self, _ranges: &[(VAddr, usize)], _delta: i32) {}
     }
 
-    struct TestParams;
-    impl BufferCacheParams for TestParams {
+    struct TestParams<const MAPPED: bool = false>;
+    impl<const MAPPED: bool> BufferCacheParams for TestParams<MAPPED> {
         type Runtime = TestBufferCacheRuntime;
         type Buffer = TestBuffer;
         type AsyncBuffer = StagingBufferRef;
@@ -4098,9 +4098,9 @@ mod tests {
         const HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT: bool = true;
         const NEEDS_BIND_UNIFORM_INDEX: bool = false;
         const NEEDS_BIND_STORAGE_INDEX: bool = false;
-        const USE_MEMORY_MAPS: bool = false;
+        const USE_MEMORY_MAPS: bool = MAPPED;
         const SEPARATE_IMAGE_BUFFER_BINDINGS: bool = false;
-        const USE_MEMORY_MAPS_FOR_UPLOADS: bool = false;
+        const USE_MEMORY_MAPS_FOR_UPLOADS: bool = MAPPED;
     }
 
     struct TestOpenGlParams;
@@ -4507,6 +4507,84 @@ mod tests {
         let mut observed = [0xff; 4];
         cache.slot_buffers[buffer_id].immediate_download(copy.dst_offset, &mut observed);
         assert_eq!(observed, [0; 4]);
+    }
+
+    #[test]
+    fn non_granular_upload_readback_setting_preserves_gpu_bytes_only_when_enabled() {
+        check_upload_readback_setting::<false>();
+    }
+
+    #[test]
+    fn mapped_upload_readback_setting_preserves_gpu_bytes_only_when_enabled() {
+        check_upload_readback_setting::<true>();
+    }
+
+    fn check_upload_readback_setting<const MAPPED: bool>() {
+        struct RestoreReadback(bool, bool);
+        impl Drop for RestoreReadback {
+            fn drop(&mut self) {
+                let mut values = common::settings::values_mut();
+                values.enable_gpu_buffer_readback.setting.set_value(self.0);
+                values.enable_gpu_buffer_readback.set_global(self.1);
+            }
+        }
+        let previous = {
+            let values = common::settings::values();
+            RestoreReadback(
+                *values.enable_gpu_buffer_readback.get_value_global(),
+                values.enable_gpu_buffer_readback.using_global(),
+            )
+        };
+        for enabled in [false, true] {
+            {
+                let mut values = common::settings::values_mut();
+                values.enable_gpu_buffer_readback.set_global(true);
+                values.enable_gpu_buffer_readback.set_value(enabled);
+            }
+            let tracker = DummyTracker;
+            let mut cache = BufferCache::<TestParams<MAPPED>, DummyTracker>::new(
+                &tracker,
+                TestBufferCacheRuntime::default(),
+            );
+            let guest_bytes = Arc::new(parking_lot::Mutex::new(vec![0x11; 0x2_0000]));
+            cache.set_device_memory(Box::new(SharedDeviceMemory {
+                bytes: Arc::clone(&guest_bytes),
+            }));
+            // Cross a device page so ImmediateUploadMemory takes the readback
+            // branch in Eden, rather than its direct-pointer granular branch.
+            let address = 0x1_0ff0;
+            let payload = [0x77; 32];
+            assert!(!BufferCache::<TestParams, DummyTracker>::is_range_granular(
+                address, payload.len(),
+            ));
+            let id = cache.create_buffer(address, payload.len() as u32);
+            let offset = u64::from(cache.slot_buffers[id].offset(address));
+            cache.slot_buffers[id].immediate_upload(offset, &payload);
+            cache.memory_tracker.unmark_region_as_cpu_modified(address, 32);
+            cache.memory_tracker.mark_region_as_gpu_modified(address, 32);
+            cache.gpu_modified_ranges.add(address, 32);
+
+            let mut copies = [BufferCopy {
+                src_offset: 0,
+                dst_offset: offset,
+                size: 32,
+            }];
+            if MAPPED {
+                cache.mapped_upload_memory(id, 32, &mut copies);
+            } else {
+                cache.immediate_upload_memory(id, 32, &copies);
+            }
+
+            let expected = if enabled { payload } else { [0x11; 32] };
+            let mut uploaded = [0; 32];
+            cache.slot_buffers[id].immediate_download(offset, &mut uploaded);
+            assert_eq!(uploaded, expected, "readback={enabled}");
+            assert_eq!(
+                &guest_bytes.lock()[address as usize..address as usize + 32],
+                &expected,
+            );
+        }
+        drop(previous);
     }
 
     #[test]

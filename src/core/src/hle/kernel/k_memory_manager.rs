@@ -378,22 +378,42 @@ impl KMemoryManager {
     /// ```
     pub fn initialize_from_layout(&mut self, layout: &super::k_memory_layout::KMemoryLayout) {
         use super::k_memory_region_type::*;
-        for region in layout.get_physical_memory_region_tree().iter() {
-            if !region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_USER_POOL) {
-                continue;
+        self.m_num_managers = 0;
+        self.m_managers.clear();
+        self.m_pool_managers_head.fill(None);
+        self.m_pool_managers_tail.fill(None);
+        while self.m_num_managers < MAX_MANAGER_COUNT {
+            let mut combined: Option<(u64, usize, Pool)> = None;
+            for region in layout.get_physical_memory_region_tree().iter() {
+                if !region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_USER_POOL)
+                    || region.get_attributes() as usize != self.m_num_managers {
+                    continue;
+                }
+                assert_ne!(region.get_address(), 0);
+                assert_ne!(region.get_end_address(), 0);
+                assert!(region.get_size() > 0);
+                let pool = if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_APPLICATION_POOL) {
+                    Pool::Application
+                } else if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_APPLET_POOL) {
+                    Pool::Applet
+                } else if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_SYSTEM_NON_SECURE_POOL) {
+                    Pool::SystemNonSecure
+                } else if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_SYSTEM_POOL) {
+                    Pool::System
+                } else {
+                    continue;
+                };
+                match &mut combined {
+                    Some((address, size, previous_pool)) => {
+                        assert_eq!(region.get_address(), *address + *size as u64);
+                        assert_eq!(pool, *previous_pool);
+                        *size = (region.get_end_address() - *address) as usize;
+                    }
+                    None => combined = Some((region.get_address(), region.get_size(), pool)),
+                }
             }
-            let pool = if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_APPLICATION_POOL) {
-                Pool::Application
-            } else if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_APPLET_POOL) {
-                Pool::Applet
-            } else if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_SYSTEM_NON_SECURE_POOL) {
-                Pool::SystemNonSecure
-            } else if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_SYSTEM_POOL) {
-                Pool::System
-            } else {
-                continue;
-            };
-            self.initialize_pool(pool, region.get_address(), region.get_size());
+            let Some((address, size, pool)) = combined else { break; };
+            self.initialize_pool(pool, address, size);
         }
     }
 
@@ -855,6 +875,24 @@ impl Default for KMemoryManager {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn layout_manager_attributes_order_and_coalesce_regions() {
+        use super::*;
+        use crate::hle::kernel::{k_memory_layout::KMemoryLayout, k_memory_region_type::*};
+        let mut layout = KMemoryLayout::new();
+        let tree = layout.get_physical_memory_region_tree_mut();
+        tree.insert_directly(0x10000, 0x11fff, 1, K_MEMORY_REGION_TYPE_DRAM_APPLET_POOL.get_value());
+        tree.insert_directly(0x20000, 0x21fff, 0, K_MEMORY_REGION_TYPE_DRAM_APPLICATION_POOL.get_value());
+        tree.insert_directly(0x22000, 0x23fff, 0, K_MEMORY_REGION_TYPE_DRAM_APPLICATION_POOL.get_value());
+        let mut manager = KMemoryManager::new();
+        manager.initialize_from_layout(&layout);
+        assert_eq!(manager.m_num_managers, 2);
+        assert_eq!(manager.m_managers[0].m_pool, Pool::Application);
+        assert_eq!(manager.m_managers[1].m_pool, Pool::Applet);
+        assert_eq!(manager.get_size(Pool::Application), 0x4000);
+        assert_eq!(manager.get_free_size(Pool::Application), 0x4000);
+    }
+
     use super::*;
 
     #[test]

@@ -2038,6 +2038,70 @@ mod tests {
     }
 
     #[test]
+    fn astc_recompression_setting_preserves_solid_color_and_output_size() {
+        use common::settings_enums::AstcRecompression;
+        struct Restore(AstcRecompression, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let mut values = common::settings::values_mut();
+                values.astc_recompression.setting.set_value(self.0);
+                values.astc_recompression.set_global(self.1);
+            }
+        }
+        let _restore = {
+            let values = common::settings::values();
+            Restore(
+                *values.astc_recompression.get_value_global(),
+                values.astc_recompression.using_global(),
+            )
+        };
+        // ASTC LDR void-extent block, opaque red in 16-bit channels.
+        let block = [0xfc, 0x0d, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0xff, 0xff];
+        let info = ImageInfo {
+            format: PixelFormat::Astc2d4x4Unorm,
+            image_type: ImageType::E2D,
+            size: Extent3D {
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            ..ImageInfo::default()
+        };
+        for (mode, size, compressed_format) in [
+            (AstcRecompression::Uncompressed, 64, None),
+            (AstcRecompression::Bc1, 8, Some(PixelFormat::Bc1RgbaUnorm)),
+            (AstcRecompression::Bc3, 16, Some(PixelFormat::Bc3Unorm)),
+        ] {
+            {
+                let mut values = common::settings::values_mut();
+                values.astc_recompression.set_global(true);
+                values.astc_recompression.set_value(mode);
+            }
+            assert_eq!(calculate_converted_size_bytes(&info), size);
+            let mut copies = full_download_copies(&info);
+            let mut output = vec![0xa5; size as usize];
+            convert_image(&block, &info, &mut output, &mut copies);
+            let pixels = if let Some(format) = compressed_format {
+                assert_eq!(copies[0].buffer_size, size as usize);
+                let mut decoded = vec![0; 64];
+                crate::texture_cache::decode_bc::decompress_bcn(
+                    &output, &mut decoded, &mut copies[0], format,
+                );
+                decoded
+            } else {
+                output
+            };
+            for pixel in pixels.chunks_exact(4) {
+                assert_eq!(pixel, [255, 0, 0, 255], "mode={mode:?}");
+            }
+        }
+    }
+
+    #[test]
     fn calculate_converted_size_uses_converted_bytes_per_texel() {
         let info = ImageInfo {
             format: PixelFormat::Bc5Unorm,

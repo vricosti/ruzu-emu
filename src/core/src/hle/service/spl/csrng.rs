@@ -105,14 +105,25 @@ mod tests {
             assert!(status.success());
             return;
         }
-        for seed in [0, 1, u32::MAX] {
+        for (global, seed) in [true, false].into_iter()
+            .flat_map(|global| [0, 1, u32::MAX].map(|seed| (global, seed)))
+        {
             {
                 let mut settings = common::settings::values_mut();
+                settings.rng_seed_enabled.set_global(true);
+                settings.rng_seed.set_global(true);
+                settings.rng_seed_enabled.set_value(true);
+                settings.rng_seed.set_value(!seed);
+                settings.rng_seed_enabled.set_global(global);
+                settings.rng_seed.set_global(global);
                 settings.rng_seed_enabled.set_value(true);
                 settings.rng_seed.set_value(seed);
             }
             let actual = Csrng::new(None);
             let expected = Csrng::new(Some(seed));
+            // Module::Interface seeds its member at construction, not on each
+            // request. A later settings edit must not reseed this service.
+            common::settings::values_mut().rng_seed.set_value(!seed);
             for _ in 0..2 {
                 let mut a = [0; 32];
                 let mut b = [0; 32];
@@ -121,9 +132,12 @@ mod tests {
                 assert_eq!(a, b);
             }
         }
-        common::settings::values_mut()
-            .rng_seed_enabled
-            .set_value(false);
+        {
+            let mut settings = common::settings::values_mut();
+            settings.rng_seed_enabled.set_global(true);
+            settings.rng_seed.set_global(true);
+            settings.rng_seed_enabled.set_value(false);
+        }
         let seconds = || {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

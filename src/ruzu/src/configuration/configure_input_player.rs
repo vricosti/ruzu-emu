@@ -19,7 +19,7 @@
 // starts the same polling and timeout lifecycle as upstream's `HandleClick`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -303,6 +303,16 @@ struct PlayerPage {
     /// input can be filtered the way `IsInputAcceptable` does.
     input_devices: RefCell<Vec<common::param_package::ParamPackage>>,
     selected_device: Cell<usize>,
+
+    /// Host keys and mouse button currently held down by the capture handlers.
+    ///
+    /// Upstream only presses (`ConfigureInputPlayer::keyPressEvent` and
+    /// `mousePressEvent` have no release counterpart), which leaves the driver
+    /// holding the key after the binding is taken. Tracking what was pressed
+    /// lets the release handlers below undo it, the same divergence
+    /// `configure_ringcon` already makes.
+    pressed_keys: RefCell<HashSet<i32>>,
+    pressed_mouse: Cell<Option<input_common::drivers::mouse::MouseButton>>,
 }
 
 /// The analog controls of one stick.
@@ -359,6 +369,8 @@ impl PlayerPage {
             trigger_controls: RefCell::new(Vec::new()),
             input_devices: RefCell::new(Vec::new()),
             selected_device: Cell::new(0),
+            pressed_keys: RefCell::new(HashSet::new()),
+            pressed_mouse: Cell::new(None),
         })
     }
 
@@ -680,6 +692,93 @@ impl PlayerPage {
         // waiting, so an aborted capture restores its previous text.
         let _ = capture.button;
         self.update_ui();
+    }
+
+    /// Upstream `ConfigureInputPlayer::keyPressEvent`.
+    ///
+    /// `input_setter` is this page's `capture`; upstream does nothing when no
+    /// capture is waiting, and leaves Escape alone so the dialog can close.
+    fn key_pressed(&self, key: gtk::gdk::Key) -> glib::Propagation {
+        if self.capture.borrow().is_none() || key == gtk::gdk::Key::Escape {
+            return glib::Propagation::Proceed;
+        }
+        let code = crate::main_window::gdk_key_to_qt_key(key);
+        self.pressed_keys.borrow_mut().insert(code);
+        let subsystem = self.input_subsystem.borrow().clone();
+        if let Some(subsystem) = subsystem {
+            if let Some(keyboard) = subsystem.borrow().get_keyboard() {
+                keyboard.press_key(code);
+            }
+        }
+        glib::Propagation::Stop
+    }
+
+    /// Releases what `key_pressed` pressed. Upstream has no key-release
+    /// handler, which leaves the driver holding the key after the binding is
+    /// taken; `configure_ringcon` already makes the same divergence.
+    fn key_released(&self, key: gtk::gdk::Key) {
+        let code = crate::main_window::gdk_key_to_qt_key(key);
+        if !self.pressed_keys.borrow_mut().remove(&code) {
+            return;
+        }
+        let subsystem = self.input_subsystem.borrow().clone();
+        if let Some(subsystem) = subsystem {
+            if let Some(keyboard) = subsystem.borrow().get_keyboard() {
+                keyboard.release_key(code);
+            }
+        }
+    }
+
+    /// Upstream `ConfigureInputPlayer::mousePressEvent`. Returns whether the
+    /// click was taken as an input, so the caller can claim the gesture.
+    fn mouse_pressed(&self, gdk_button: u32) -> bool {
+        if self.capture.borrow().is_none() {
+            return false;
+        }
+        let button = mouse_button(gdk_button);
+        let subsystem = self.input_subsystem.borrow().clone();
+        let Some(subsystem) = subsystem else {
+            return false;
+        };
+        let mut subsystem = subsystem.borrow_mut();
+        let Some(mouse) = subsystem.get_mouse_mut() else {
+            return false;
+        };
+        self.pressed_mouse.set(Some(button));
+        mouse.press_button(0, 0, button);
+        mouse.notify_changed();
+        true
+    }
+
+    /// Releases what `mouse_pressed` pressed; see `key_released`.
+    fn mouse_released(&self) {
+        let Some(button) = self.pressed_mouse.take() else {
+            return;
+        };
+        let subsystem = self.input_subsystem.borrow().clone();
+        if let Some(subsystem) = subsystem {
+            if let Some(mouse) = subsystem.borrow_mut().get_mouse_mut() {
+                mouse.release_button(button);
+            }
+        }
+    }
+
+    /// Upstream `ConfigureInputPlayer::wheelEvent`, which forwards
+    /// `QWheelEvent::angleDelta()` — eighths of a degree, positive when the
+    /// wheel turns away from the user, hence the sign flip against GDK's
+    /// scroll deltas.
+    fn wheel_scrolled(&self, dx: f64, dy: f64) -> glib::Propagation {
+        if self.capture.borrow().is_none() {
+            return glib::Propagation::Proceed;
+        }
+        let subsystem = self.input_subsystem.borrow().clone();
+        if let Some(subsystem) = subsystem {
+            if let Some(mouse) = subsystem.borrow_mut().get_mouse_mut() {
+                mouse.mouse_wheel_change((-dx * 120.0) as i32, (-dy * 120.0) as i32);
+                mouse.notify_changed();
+            }
+        }
+        glib::Propagation::Stop
     }
 
     /// Upstream `ConfigureInputPlayer::IsInputAcceptable`: with a device
@@ -1505,6 +1604,58 @@ pub fn page(
         .child(&column)
         .build();
 
+    // Upstream `ConfigureInputPlayer::keyPressEvent`, `mousePressEvent` and
+    // `wheelEvent`: while a capture is waiting, host keyboard and mouse events
+    // are pushed into their drivers so the poll loop in `handle_click` can pick
+    // them up. Without this the keyboard and mouse engines never produce an
+    // event during a capture and every keyboard binding times out.
+    //
+    // Qt delivers the event to the dialog once the focused button has ignored
+    // it; GTK has no such fallthrough, so the controllers run in the capture
+    // phase and swallow the event only while a capture is in progress.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = Rc::downgrade(&page);
+    keys.connect_key_pressed(move |_, key, _, _| match weak.upgrade() {
+        Some(page) => page.key_pressed(key),
+        None => glib::Propagation::Proceed,
+    });
+    let weak = Rc::downgrade(&page);
+    keys.connect_key_released(move |_, key, _, _| {
+        if let Some(page) = weak.upgrade() {
+            page.key_released(key);
+        }
+    });
+    scroller.add_controller(keys);
+
+    let clicks = gtk::GestureClick::new();
+    clicks.set_button(0);
+    clicks.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = Rc::downgrade(&page);
+    clicks.connect_pressed(move |gesture, _, _, _| {
+        if let Some(page) = weak.upgrade() {
+            if page.mouse_pressed(gesture.current_button()) {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+            }
+        }
+    });
+    let weak = Rc::downgrade(&page);
+    clicks.connect_released(move |_, _, _, _| {
+        if let Some(page) = weak.upgrade() {
+            page.mouse_released();
+        }
+    });
+    scroller.add_controller(clicks);
+
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = Rc::downgrade(&page);
+    scroll.connect_scroll(move |_, dx, dy| match weak.upgrade() {
+        Some(page) => page.wheel_scrolled(dx, dy),
+        None => glib::Propagation::Proceed,
+    });
+    scroller.add_controller(scroll);
+
     // Upstream owns ConfigureInputPlayer for as long as its QWidget exists.
     // `Page` owns this apply closure for the same lifetime, so keep the Rust
     // controller here while widget callbacks retain only Weak references.
@@ -1552,6 +1703,20 @@ pub fn page(
             }
         }
     })
+}
+
+/// GDK button numbers in the order upstream's `GRenderWindow::QtButtonToMouseButton`
+/// maps Qt's, so a captured mouse binding names the same button.
+fn mouse_button(button: u32) -> input_common::drivers::mouse::MouseButton {
+    use input_common::drivers::mouse::MouseButton::*;
+    match button {
+        1 => Left,
+        2 => Wheel,
+        3 => Right,
+        8 => Backward,
+        9 => Forward,
+        _ => Extra,
+    }
 }
 
 /// Upstream `ConfigureInputPlayer::UpdateMappingWithDefaults`.
@@ -2503,6 +2668,60 @@ fn face_buttons_group(page: &Rc<PlayerPage>) -> gtk::Box {
 
 #[cfg(test)]
 mod tests {
+    /// The Controls page must forward host key presses to the keyboard driver
+    /// while a capture is waiting, the way upstream's `keyPressEvent` does.
+    /// Without it the mapping session never sees an event and every keyboard
+    /// binding — click L, press F — simply times out.
+    #[test]
+    #[ignore = "requires a GTK display; run alone with --ignored"]
+    fn a_key_press_during_a_capture_reaches_the_mapping_session() {
+        use super::*;
+        gtk::init().unwrap();
+
+        let subsystem = Rc::new(RefCell::new(input_common::InputSubsystem::new()));
+        subsystem.borrow_mut().initialize();
+        let page = PlayerPage::new(Rc::new(RefCell::new(PlayerInput::default())));
+        *page.input_subsystem.borrow_mut() = Some(Rc::clone(&subsystem));
+
+        // With no capture waiting, upstream ignores the key and lets it through.
+        assert_eq!(
+            page.key_pressed(gtk::gdk::Key::f),
+            glib::Propagation::Proceed
+        );
+        assert!(!subsystem.borrow_mut().get_next_input().has("engine"));
+
+        let button = gtk::Button::new();
+        page.handle_click(CaptureTarget::Button(0), &button);
+        assert_eq!(button.label().as_deref(), Some(WAITING));
+
+        // Escape stays with the dialog so it can still be closed.
+        assert_eq!(
+            page.key_pressed(gtk::gdk::Key::Escape),
+            glib::Propagation::Proceed
+        );
+        assert!(!subsystem.borrow_mut().get_next_input().has("engine"));
+
+        assert_eq!(page.key_pressed(gtk::gdk::Key::f), glib::Propagation::Stop);
+        let params = subsystem.borrow_mut().get_next_input();
+        assert_eq!(params.get_str("engine", ""), "keyboard");
+        assert_eq!(
+            params.get_int("code", 0),
+            crate::main_window::gdk_key_to_qt_key(gtk::gdk::Key::f)
+        );
+
+        // The release undoes the press, so the new binding does not read as held.
+        page.key_released(gtk::gdk::Key::f);
+        assert!(page.pressed_keys.borrow().is_empty());
+
+        page.finish_capture(Some(params));
+        assert_eq!(
+            common::param_package::ParamPackage::from_serialized(&page.state.borrow().buttons[0])
+                .get_int("code", 0),
+            crate::main_window::gdk_key_to_qt_key(gtk::gdk::Key::f)
+        );
+        subsystem.borrow_mut().shutdown();
+    }
+
     #[test]
     #[ignore = "requires a GTK display; run alone with --ignored"]
     fn debug_page_applies_to_selected_settings_bank() {

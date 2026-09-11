@@ -47,11 +47,11 @@ case "${ID:-}" in
             wayland-protocols-devel
         "
         ;;
-    arch|manjaro|endeavouros)
+    arch|manjaro|endeavouros|cachyos)
         PACKAGE_MANAGER=pacman
         REQUIRED_PACKAGES="
             base-devel alsa-lib ca-certificates clang cmake curl
-            dbus ffmpeg git glslang gtk4 jack2 libdecor libdrm libpulse
+            dbus ffmpeg git glslang gtk4 jack libdecor libdrm libpulse
             libx11 libxcursor libxext libxfixes libxi libxkbcommon
             libxrandr libxss libxtst mesa ninja openssl opus pipewire pkgconf
             systemd-libs vulkan-headers vulkan-icd-loader vulkan-tools
@@ -103,7 +103,11 @@ package_installed() {
             rpm -q "$package_name" >/dev/null 2>&1
             ;;
         pacman)
-            pacman -Q "$package_name" >/dev/null 2>&1
+            # -T resolves provides (e.g. pipewire-jack already satisfies the
+            # virtual "jack" package on systems that ship PipeWire's JACK
+            # emulation instead of jack2), unlike -Q which only matches the
+            # literal package name.
+            pacman -T "$package_name" >/dev/null 2>&1
             ;;
         apk)
             apk info -e "$package_name" >/dev/null 2>&1

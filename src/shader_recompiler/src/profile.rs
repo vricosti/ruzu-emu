@@ -81,6 +81,8 @@ pub struct Profile {
     pub has_broken_signed_operations: bool,
     /// Float controls break when fp16 is enabled.
     pub has_broken_fp16_float_controls: bool,
+    /// Declaring fp32 denorm flush to zero miscompiles on some drivers
+    pub has_broken_fp32_denorm_flush: bool,
     /// Dynamic vec4 indexing is broken on some OpenGL drivers.
     pub has_gl_component_indexing_bug: bool,
     /// The precise type qualifier is broken in the fragment stage of some drivers.
@@ -173,6 +175,7 @@ impl Default for Profile {
             has_broken_unsigned_image_offsets: false,
             has_broken_signed_operations: false,
             has_broken_fp16_float_controls: false,
+            has_broken_fp32_denorm_flush: false,
             has_gl_component_indexing_bug: false,
             has_gl_precise_bug: false,
             has_gl_cbuf_ftou_bug: false,

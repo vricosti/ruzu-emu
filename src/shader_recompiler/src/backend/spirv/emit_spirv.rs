@@ -220,7 +220,10 @@ fn setup_denorm_control(
 ) {
     let info = &program.info;
     if !(info.uses_fp32_denorms_flush && info.uses_fp32_denorms_preserve) {
-        if info.uses_fp32_denorms_flush && profile.support_fp32_denorm_flush {
+        if info.uses_fp32_denorms_flush
+            && profile.support_fp32_denorm_flush
+            && !profile.has_broken_fp32_denorm_flush
+        {
             add_float_execution_mode(
                 ctx,
                 main,

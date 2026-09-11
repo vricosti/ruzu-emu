@@ -193,6 +193,7 @@ fn opengl_shader_profile(device: &Device) -> ShaderProfile {
         has_broken_unsigned_image_offsets: true,
         has_broken_signed_operations: true,
         has_broken_fp16_float_controls: false,
+        has_broken_fp32_denorm_flush: false,
         has_gl_component_indexing_bug: device.has_component_indexing_bug(),
         has_gl_precise_bug: device.has_precise_bug(),
         has_gl_cbuf_ftou_bug: device.has_cbuf_ftou_bug(),

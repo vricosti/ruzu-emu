@@ -133,6 +133,7 @@ pub(super) fn make_shader_profile(device: &Device) -> Profile {
         support_fp32_denorm_preserve: float_control.shader_denorm_preserve_float32 != 0,
         support_fp16_denorm_flush: float_control.shader_denorm_flush_to_zero_float16 != 0,
         support_fp32_denorm_flush: float_control.shader_denorm_flush_to_zero_float32 != 0,
+        has_broken_fp32_denorm_flush: driver_id == vk::DriverId::QUALCOMM_PROPRIETARY,
         support_fp16_signed_zero_nan_preserve: float_control
             .shader_signed_zero_inf_nan_preserve_float16
             != 0,

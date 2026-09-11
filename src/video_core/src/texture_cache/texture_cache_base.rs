@@ -333,6 +333,9 @@ pub trait TextureCacheParams {
     const HAS_EMULATED_COPIES: bool;
     const HAS_DEVICE_MEMORY_INFO: bool;
     const IMPLEMENTS_ASYNC_DOWNLOADS: bool;
+    /// Upstream `P::HAS_MSAA_DOWNLOADS`: whether the runtime can resolve
+    /// multisampled images into a downloadable scratch image.
+    const HAS_MSAA_DOWNLOADS: bool = false;
 
     /// Construct the concrete object that upstream inserts directly into
     /// `SlotVector<Image>`.
@@ -416,6 +419,26 @@ pub trait TextureCacheParams {
     fn can_upload_msaa(cache: &TextureCacheBase<Self>) -> bool
     where
         Self: Sized;
+
+    /// Backend `Runtime::CanDownloadMsaa(info)` primitive; only consulted when
+    /// `HAS_MSAA_DOWNLOADS` is set.
+    fn can_download_msaa(
+        _cache: &TextureCacheBase<Self>,
+        _info: &super::image_info::ImageInfo,
+    ) -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
+    /// Backend `Runtime::FlushDeferredClear()` primitive: realizes a pending
+    /// deferred clear before its framebuffer can be moved or freed.
+    fn flush_deferred_clear(_cache: &mut TextureCacheBase<Self>)
+    where
+        Self: Sized,
+    {
+    }
 
     /// Backend `Runtime::TransitionImageLayout` primitive.
     fn transition_image_layout(cache: &mut TextureCacheBase<Self>, image_id: ImageId)

@@ -35,6 +35,8 @@ pub const GUEST_WARP_SIZE: u32 = 32;
 const ONE_GIB: u64 = 1024 * 1024 * 1024;
 const KHR_MAINTENANCE_5_EXTENSION_NAME: &str = "VK_KHR_maintenance5";
 const KHR_MAINTENANCE_6_EXTENSION_NAME: &str = "VK_KHR_maintenance6";
+const KHR_CREATE_RENDERPASS_2_EXTENSION_NAME: &str = "VK_KHR_create_renderpass2";
+const KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME: &str = "VK_KHR_depth_stencil_resolve";
 
 /// `vk-mem` 0.3 embeds a VMA revision whose allocator creation contract ends
 /// at Vulkan 1.3. Ruzu also creates its Vulkan instance for 1.3, so a newer
@@ -443,6 +445,11 @@ pub struct DeviceExtensions {
     pub tooling_info: bool,
     pub vertex_attribute_divisor: bool,
     pub draw_indirect_count: bool,
+    /// `VK_KHR_create_renderpass2`.
+    pub create_renderpass2: bool,
+    /// `VK_KHR_depth_stencil_resolve`; requires `create_renderpass2` or
+    /// Vulkan 1.2.
+    pub depth_stencil_resolve: bool,
     pub driver_properties: bool,
     pub push_descriptor: bool,
     pub sampler_mirror_clamp_to_edge: bool,
@@ -491,6 +498,10 @@ pub struct Device {
     owns_static_pipeline_cache: bool,
     descriptor_buffer: Option<ash::extensions::ext::DescriptorBuffer>,
     synchronization2: Option<ash::extensions::khr::Synchronization2>,
+    /// `VK_KHR_create_renderpass2` entry points for devices below Vulkan 1.2.
+    khr_create_render_pass2: Option<ash::extensions::khr::CreateRenderPass2>,
+    /// Upstream `properties.depth_stencil_resolve`.
+    depth_stencil_resolve_properties: vk::PhysicalDeviceDepthStencilResolveProperties,
     /// Device dispatch (ash device handle).
     _dld: ash::Device,
     /// Main graphics queue.
@@ -597,7 +608,6 @@ pub struct Device {
     pub has_nsight_graphics: bool,
     pub has_radeon_gpu_profiler: bool,
     pub supports_d24_depth: bool,
-    pub cant_blit_msaa: bool,
     pub must_emulate_scaled_formats: bool,
     pub must_emulate_bgr565: bool,
     pub dynamic_state3_blending: bool,
@@ -786,6 +796,13 @@ impl Device {
             .contains("VK_EXT_shader_demote_to_helper_invocation")
             || device_properties.api_version >= vk::API_VERSION_1_3;
         let has_draw_indirect_count = supported_extensions.contains("VK_KHR_draw_indirect_count");
+        let has_create_renderpass2 = device_properties.api_version >= vk::API_VERSION_1_2
+            || supported_extensions.contains(KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
+        // Upstream: `extensions.depth_stencil_resolve && (instance_version >= 1.2 ||
+        // extensions.create_renderpass2)`.
+        let has_depth_stencil_resolve = supported_extensions
+            .contains(KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME)
+            && (device_properties.api_version >= vk::API_VERSION_1_2 || has_create_renderpass2);
         let has_synchronization2 = device_properties.api_version >= vk::API_VERSION_1_3
             || supported_extensions.contains("VK_KHR_synchronization2");
         let has_sampler_filter_minmax =
@@ -825,7 +842,8 @@ impl Device {
         let mut color_write_enable_features =
             vk::PhysicalDeviceColorWriteEnableFeaturesEXT::default();
         let mut depth_bias_control_features = PhysicalDeviceDepthBiasControlFeaturesExt::default();
-        let mut shader_quad_control_features = PhysicalDeviceShaderQuadControlFeaturesKhr::default();
+        let mut shader_quad_control_features =
+            PhysicalDeviceShaderQuadControlFeaturesKhr::default();
         let mut line_rasterization_features =
             vk::PhysicalDeviceLineRasterizationFeaturesEXT::default();
         let mut transform_feedback_features =
@@ -1097,6 +1115,8 @@ impl Device {
         let mut maintenance5_properties = PhysicalDeviceMaintenance5PropertiesKhr::default();
         let mut custom_border_color_properties =
             vk::PhysicalDeviceCustomBorderColorPropertiesEXT::default();
+        let mut depth_stencil_resolve_properties =
+            vk::PhysicalDeviceDepthStencilResolveProperties::default();
         let mut properties2_builder = vk::PhysicalDeviceProperties2::builder()
             .push_next(&mut driver_properties)
             .push_next(&mut subgroup_properties);
@@ -1121,6 +1141,10 @@ impl Device {
         }
         if has_transform_feedback {
             properties2_builder = properties2_builder.push_next(&mut transform_feedback_properties);
+        }
+        if has_depth_stencil_resolve || device_properties.api_version >= vk::API_VERSION_1_2 {
+            properties2_builder =
+                properties2_builder.push_next(&mut depth_stencil_resolve_properties);
         }
         let mut properties2 = properties2_builder.build();
         if has_maintenance5 {
@@ -1285,7 +1309,6 @@ impl Device {
         }
         let mut supports_push_descriptor = has_push_descriptor;
         let mut must_emulate_scaled_formats = false;
-        let mut cant_blit_msaa = false;
         let mut has_broken_cube_compatibility = false;
         let mut has_broken_parallel_compiling = false;
 
@@ -1316,10 +1339,6 @@ impl Device {
                 log::warn!("Volta and older have broken VK_KHR_push_descriptor");
                 supports_push_descriptor = false;
             }
-            if nv_major_version >= 510 {
-                log::warn!("NVIDIA drivers >= 510 do not support MSAA image blits");
-                cant_blit_msaa = true;
-            }
         }
         let masked_driver_version = (device_properties.driver_version << 3) >> 3;
         // Upstream only blacklists dynamic color blend state on the Samsung
@@ -1335,10 +1354,8 @@ impl Device {
         // < 580.119.02 have broken VK_EXT_vertex_input_dynamic_state. No other
         // driver (RADV, Qualcomm) is blacklisted upstream.
         if supports_vertex_input_dynamic_state
-            && ((is_intel_windows
-                && masked_driver_version < vk::make_api_version(27, 20, 100, 0))
-                || (is_nvidia
-                    && masked_driver_version < vk::make_api_version(580, 119, 2, 0)))
+            && ((is_intel_windows && masked_driver_version < vk::make_api_version(27, 20, 100, 0))
+                || (is_nvidia && masked_driver_version < vk::make_api_version(580, 119, 2, 0)))
         {
             log::warn!("Disabling broken VK_EXT_vertex_input_dynamic_state");
             supports_vertex_input_dynamic_state = false;
@@ -1348,10 +1365,6 @@ impl Device {
             log::warn!("Intel has broken float16 math");
             supports_shader_float16 = false;
             shader_float16_int8_features.shader_float16 = vk::FALSE;
-        }
-        if is_intel_windows {
-            log::warn!("Intel proprietary drivers do not support MSAA image blits");
-            cant_blit_msaa = true;
         }
         if is_amd_driver && !supports_shader_float16 {
             log::warn!("AMD GCN4 and earlier have broken cube image compatibility");
@@ -1653,6 +1666,12 @@ impl Device {
             KHR_MAINTENANCE_6_EXTENSION_NAME,
             supports_maintenance6,
         );
+        // Upstream: `RemoveExtensionIfUnsuitable(extensions.depth_stencil_resolve, ...)`.
+        remove_extension_if_unsupported(
+            &mut loaded_extensions,
+            KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,
+            has_depth_stencil_resolve,
+        );
         remove_extension_if_unsupported(
             &mut loaded_extensions,
             "VK_EXT_shader_demote_to_helper_invocation",
@@ -1814,8 +1833,7 @@ impl Device {
             && loaded_extensions.contains("VK_NV_device_diagnostics_config");
         // Upstream creates the tracker before vkCreateDevice so an SDK-backed
         // implementation can register crash callbacks before device creation.
-        let nsight_aftermath_tracker =
-            enable_nsight_aftermath.then(NsightAftermathTracker::new);
+        let nsight_aftermath_tracker = enable_nsight_aftermath.then(NsightAftermathTracker::new);
         let mut diagnostics_nv = vk::DeviceDiagnosticsConfigCreateInfoNV::default();
         if enable_nsight_aftermath {
             diagnostics_nv.p_next = device_create_info.p_next;
@@ -1855,6 +1873,11 @@ impl Device {
         let synchronization2 = (supports_synchronization2
             && device_properties.api_version < vk::API_VERSION_1_3)
             .then(|| ash::extensions::khr::Synchronization2::new(&instance, &logical.device));
+        // Upstream loads `vkCreateRenderPass2KHR` when the core entry point is
+        // missing; ash's core table only carries it for Vulkan 1.2 devices.
+        let khr_create_render_pass2 = (has_create_renderpass2
+            && device_properties.api_version < vk::API_VERSION_1_2)
+            .then(|| ash::extensions::khr::CreateRenderPass2::new(&instance, &logical.device));
 
         let instance_version = unsafe {
             let props = instance.get_physical_device_properties(physical);
@@ -1895,6 +1918,11 @@ impl Device {
             owns_static_pipeline_cache,
             descriptor_buffer,
             synchronization2,
+            khr_create_render_pass2,
+            depth_stencil_resolve_properties: vk::PhysicalDeviceDepthStencilResolveProperties {
+                p_next: std::ptr::null_mut(),
+                ..depth_stencil_resolve_properties
+            },
             graphics_queue,
             present_queue,
             instance_version,
@@ -1948,6 +1976,8 @@ impl Device {
                 shader_demote_to_helper_invocation: supports_shader_demote_to_helper_invocation,
                 shader_quad_control: supports_shader_quad_control,
                 draw_indirect_count: has_draw_indirect_count,
+                create_renderpass2: has_create_renderpass2,
+                depth_stencil_resolve: has_depth_stencil_resolve,
                 sampler_filter_minmax: supports_sampler_filter_minmax,
                 shader_float_controls: has_shader_float_controls,
                 astc_decode_mode: loaded_extensions.contains("VK_EXT_astc_decode_mode"),
@@ -2061,7 +2091,6 @@ impl Device {
             has_nsight_graphics,
             has_radeon_gpu_profiler,
             supports_d24_depth,
-            cant_blit_msaa,
             must_emulate_scaled_formats,
             must_emulate_bgr565: emulate_bgr565,
             dynamic_state3_blending,
@@ -2771,14 +2800,14 @@ impl Device {
         if limit == 0 {
             return true;
         }
-        let mut used = self.custom_border_color_samplers_used.load(Ordering::Relaxed);
+        let mut used = self
+            .custom_border_color_samplers_used
+            .load(Ordering::Relaxed);
         while used + count <= limit {
-            match self.custom_border_color_samplers_used.compare_exchange_weak(
-                used,
-                used + count,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .custom_border_color_samplers_used
+                .compare_exchange_weak(used, used + count, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return true,
                 Err(current) => used = current,
             }
@@ -3019,6 +3048,51 @@ impl Device {
 
     pub fn is_khr_draw_indirect_count_supported(&self) -> bool {
         self.extensions.draw_indirect_count
+    }
+
+    /// Returns true if the device supports VK_KHR_create_renderpass2.
+    pub fn is_khr_create_render_pass2_supported(&self) -> bool {
+        self.extensions.create_renderpass2 || self.instance_version >= vk::API_VERSION_1_2
+    }
+
+    /// Returns true if the device supports VK_KHR_depth_stencil_resolve.
+    pub fn is_khr_depth_stencil_resolve_supported(&self) -> bool {
+        (self.extensions.depth_stencil_resolve || self.instance_version >= vk::API_VERSION_1_2)
+            && self.is_khr_create_render_pass2_supported()
+    }
+
+    /// Returns the supported resolve modes for the depth aspect.
+    pub fn get_depth_resolve_modes(&self) -> vk::ResolveModeFlags {
+        self.depth_stencil_resolve_properties
+            .supported_depth_resolve_modes
+    }
+
+    /// Returns the supported resolve modes for the stencil aspect.
+    pub fn get_stencil_resolve_modes(&self) -> vk::ResolveModeFlags {
+        self.depth_stencil_resolve_properties
+            .supported_stencil_resolve_modes
+    }
+
+    /// Returns true if only one of the depth and stencil aspects may be resolved.
+    pub fn supports_independent_resolve_none(&self) -> bool {
+        self.depth_stencil_resolve_properties
+            .independent_resolve_none
+            == vk::TRUE
+    }
+
+    /// Upstream `vk::Device::CreateRenderPass2`: the core Vulkan 1.2 entry
+    /// point, or `vkCreateRenderPass2KHR` on devices exposing only the
+    /// extension.
+    pub fn create_render_pass2(
+        &self,
+        ci: &vk::RenderPassCreateInfo2,
+    ) -> Result<vk::RenderPass, vk::Result> {
+        unsafe {
+            match &self.khr_create_render_pass2 {
+                Some(loader) => loader.create_render_pass2(ci, None),
+                None => self.get_logical().create_render_pass2(ci, None),
+            }
+        }
     }
 
     pub fn is_ext_transform_feedback_supported(&self) -> bool {
@@ -3329,10 +3403,6 @@ impl Device {
         self.exact_depth_bias_control_supported
     }
 
-    pub fn cant_blit_msaa(&self) -> bool {
-        self.cant_blit_msaa
-    }
-
     pub fn must_emulate_scaled_formats(&self) -> bool {
         self.must_emulate_scaled_formats
     }
@@ -3627,6 +3697,8 @@ fn initial_loaded_extensions(
         "VK_EXT_shader_viewport_index_layer",
         "VK_EXT_tooling_info",
         "VK_EXT_vertex_attribute_divisor",
+        KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,
+        KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,
         "VK_KHR_draw_indirect_count",
         "VK_KHR_driver_properties",
         "VK_KHR_push_descriptor",
@@ -4766,7 +4838,9 @@ mod tests {
 
 #[cfg(test)]
 mod static_pipeline_cache_tests {
-    use super::{parse_static_pipeline_cache_blob, STATIC_CACHE_MAGIC_NUMBER, STATIC_CACHE_VERSION};
+    use super::{
+        parse_static_pipeline_cache_blob, STATIC_CACHE_MAGIC_NUMBER, STATIC_CACHE_VERSION,
+    };
 
     fn blob(magic: &[u8; 8], version: u32, payload: &[u8]) -> Vec<u8> {
         let mut out = magic.to_vec();
@@ -4780,7 +4854,10 @@ mod static_pipeline_cache_tests {
         assert_eq!(&STATIC_CACHE_MAGIC_NUMBER, b"edenstpc");
         assert_eq!(STATIC_CACHE_VERSION, 1);
         let file = blob(&STATIC_CACHE_MAGIC_NUMBER, STATIC_CACHE_VERSION, &[1, 2, 3]);
-        assert_eq!(parse_static_pipeline_cache_blob(&file), Some(&[1u8, 2, 3][..]));
+        assert_eq!(
+            parse_static_pipeline_cache_blob(&file),
+            Some(&[1u8, 2, 3][..])
+        );
         // An empty payload is still a valid file (upstream creates the cache
         // with a null pointer in that case).
         let empty = blob(&STATIC_CACHE_MAGIC_NUMBER, STATIC_CACHE_VERSION, &[]);
@@ -4790,7 +4867,13 @@ mod static_pipeline_cache_tests {
     #[test]
     fn static_pipeline_cache_rejects_short_wrong_magic_or_version() {
         assert_eq!(parse_static_pipeline_cache_blob(b"edenstpc\x01"), None);
-        assert_eq!(parse_static_pipeline_cache_blob(&blob(b"edenstpd", 1, &[0])), None);
-        assert_eq!(parse_static_pipeline_cache_blob(&blob(b"edenstpc", 2, &[0])), None);
+        assert_eq!(
+            parse_static_pipeline_cache_blob(&blob(b"edenstpd", 1, &[0])),
+            None
+        );
+        assert_eq!(
+            parse_static_pipeline_cache_blob(&blob(b"edenstpc", 2, &[0])),
+            None
+        );
     }
 }

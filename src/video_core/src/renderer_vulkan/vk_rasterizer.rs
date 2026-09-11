@@ -848,7 +848,6 @@ impl RasterizerVulkan {
         instance: ash::Instance,
         physical_device: vk::PhysicalDevice,
         driver_id: vk::DriverId,
-        cant_blit_msaa: bool,
         depth_bounds_supported: bool,
         depth_range_unrestricted: bool,
         nv_viewport_swizzle: bool,
@@ -987,7 +986,6 @@ impl RasterizerVulkan {
                 render_pass_cache.as_mut(),
                 descriptor_pool.as_mut(),
                 compute_pass_desc_queue.as_mut(),
-                cant_blit_msaa,
                 image_format_list_supported,
                 optimal_astc_supported,
                 must_emulate_bgr565,
@@ -3014,39 +3012,12 @@ impl RasterizerInterface for RasterizerVulkan {
                 && (!target.has_aspect_stencil_bit() || use_stencil)
                 && !stencil_partial);
         let clear_layer = (clear_state.flags >> 10) & 0xFFFF;
-        const ENABLE_DEFERRED_CLEAR: bool = true;
-        let can_defer_clear = ENABLE_DEFERRED_CLEAR
-            && !clear_view.use_scissor()
-            && clear_layer == 0
-            && !self.scheduler.is_render_pass_active()
-            && (!use_color || color_full_channels)
-            && ds_deferrable;
-        if !can_defer_clear {
-            self.scheduler.request_renderpass(&target);
-        }
-
-        self.query_cache.notify_segment(true);
-        self.query_cache.counter_enable(
-            &mut self.scheduler,
-            QueryType::ZPassPixelCount64 as u32,
-            clear_view.zpass_pixel_count_enabled(),
-        );
         let resolution = &common::settings::values().resolution_info;
         let (up_scale, down_shift) = if self.texture_cache.base.is_rescaling {
             (resolution.up_scale, resolution.down_shift)
         } else {
             (1, 0)
         };
-        if self.state_tracker.touch_viewports() {
-            let viewport_transforms = clear_view.viewport_transforms();
-            self.record_viewports(
-                &viewport_transforms,
-                clear_view.viewport_scale_offset_enabled(),
-                clear_view.window_origin_lower_left(),
-                render_targets.surface_clip,
-                clear_view.depth_mode(),
-            );
-        }
 
         let mut clear_rect_2d = if clear_view.use_scissor() {
             scissor_state(
@@ -3108,6 +3079,41 @@ impl RasterizerInterface for RasterizerVulkan {
             base_array_layer: clear_layer,
             layer_count,
         };
+
+        // A scissored clear covering the whole render area can still be
+        // deferred into the render-pass load op.
+        let clear_covers_render_area = clear_rect.rect.offset.x == 0
+            && clear_rect.rect.offset.y == 0
+            && clear_rect.rect.extent.width >= render_area.width
+            && clear_rect.rect.extent.height >= render_area.height;
+        const ENABLE_DEFERRED_CLEAR: bool = true;
+        let can_defer_clear = ENABLE_DEFERRED_CLEAR
+            && (!clear_view.use_scissor() || clear_covers_render_area)
+            && clear_layer == 0
+            && !self.scheduler.is_render_pass_active()
+            && (!use_color || color_full_channels)
+            && ds_deferrable;
+        if !can_defer_clear {
+            self.scheduler.request_renderpass(&target);
+        }
+
+        self.query_cache.notify_segment(true);
+        self.query_cache.counter_enable(
+            &mut self.scheduler,
+            QueryType::ZPassPixelCount64 as u32,
+            clear_view.zpass_pixel_count_enabled(),
+        );
+        if self.state_tracker.touch_viewports() {
+            let viewport_transforms = clear_view.viewport_transforms();
+            self.record_viewports(
+                &viewport_transforms,
+                clear_view.viewport_scale_offset_enabled(),
+                clear_view.window_origin_lower_left(),
+                render_targets.surface_clip,
+                clear_view.depth_mode(),
+            );
+        }
+
         let color_attachment = ((clear_state.flags >> 6) & 0xF) as usize;
         if use_color && target.has_aspect_color_bit(color_attachment) {
             let format = crate::surface::pixel_format_from_render_target_format(
@@ -3544,7 +3550,10 @@ impl RasterizerInterface for RasterizerVulkan {
     fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
         // This override bypasses RasterizerInterface's default implementation,
         // so it must honor the same opt-in invalidation setting explicitly.
-        if *common::settings::values().skip_cpu_inner_invalidation.get_value() {
+        if *common::settings::values()
+            .skip_cpu_inner_invalidation
+            .get_value()
+        {
             return;
         }
         unsafe {

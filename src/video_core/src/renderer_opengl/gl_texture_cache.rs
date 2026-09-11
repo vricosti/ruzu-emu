@@ -2708,6 +2708,7 @@ impl TextureCacheParams {
     pub const HAS_EMULATED_COPIES: bool = true;
     pub const HAS_DEVICE_MEMORY_INFO: bool = true;
     pub const IMPLEMENTS_ASYNC_DOWNLOADS: bool = true;
+    pub const HAS_MSAA_DOWNLOADS: bool = false;
 }
 
 impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCacheParams {
@@ -2726,6 +2727,14 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
     const HAS_EMULATED_COPIES: bool = Self::HAS_EMULATED_COPIES;
     const HAS_DEVICE_MEMORY_INFO: bool = Self::HAS_DEVICE_MEMORY_INFO;
     const IMPLEMENTS_ASYNC_DOWNLOADS: bool = Self::IMPLEMENTS_ASYNC_DOWNLOADS;
+    const HAS_MSAA_DOWNLOADS: bool = Self::HAS_MSAA_DOWNLOADS;
+
+    /// Port of `OpenGL::TextureCacheRuntime::FlushDeferredClear() {}`: no
+    /// deferred clears on the OpenGL backend.
+    fn flush_deferred_clear(
+        _cache: &mut crate::texture_cache::texture_cache_base::TextureCacheBase<Self>,
+    ) {
+    }
 
     fn create_image(
         runtime: Option<&mut TextureCacheRuntime>,
@@ -3487,7 +3496,8 @@ impl TextureCache {
         let mut images = SmallVec::<[ImageId; 16]>::new();
         self.base
             .for_each_image_in_region(cpu_addr, size, |image_id, image| {
-                if !image.is_safe_download() {
+                // OpenGL has no MSAA download path (`HAS_MSAA_DOWNLOADS = false`).
+                if !image.is_safe_gpu_copy() || image.info.num_samples != 1 {
                     return false;
                 }
                 image.flags.remove(ImageFlagBits::GPU_MODIFIED);

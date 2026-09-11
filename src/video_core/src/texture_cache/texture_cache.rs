@@ -178,13 +178,8 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         let copies = if flags.contains(ImageFlagBits::CONVERTED) {
             self.unswizzle_data_buffer
                 .resize_destructive(unswizzled_size_bytes);
-            let mut copies = unswizzle_image(
-                &(),
-                gpu_addr,
-                &info,
-                input,
-                &mut self.unswizzle_data_buffer,
-            );
+            let mut copies =
+                unswizzle_image(&(), gpu_addr, &info, input, &mut self.unswizzle_data_buffer);
             convert_image(
                 &self.unswizzle_data_buffer,
                 &info,
@@ -193,13 +188,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             );
             copies
         } else {
-            unswizzle_image(
-                &(),
-                gpu_addr,
-                &info,
-                input,
-                P::staging_mapped_span(staging),
-            )
+            unswizzle_image(&(), gpu_addr, &info, input, P::staging_mapped_span(staging))
         };
         drop(swizzle_data);
         P::upload_image(self, image_id, staging, &copies);
@@ -927,7 +916,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 continue;
             }
             let must_download =
-                image.is_safe_download() && !image.flags.contains(ImageFlagBits::BAD_OVERLAP);
+                self.is_downloadable(image) && !image.flags.contains(ImageFlagBits::BAD_OVERLAP);
             if !*high_priority_mode && must_download {
                 continue;
             }
@@ -1109,8 +1098,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         };
 
         let mut images = SmallVec::<[ImageId; 16]>::new();
+        // SAFETY: `for_each_image_in_region` only walks `slot_images`; the
+        // closure reads the runtime and `P::HAS_MSAA_DOWNLOADS` through this
+        // shared view (upstream captures `this`).
+        let cache: *const Self = self;
         self.for_each_image_in_region(cpu_addr, size, |image_id, image| {
-            if !image.is_safe_download() {
+            if !Self::is_downloadable_with(unsafe { &*cache }, image) {
                 return false;
             }
             image.flags.remove(ImageFlagBits::GPU_MODIFIED);
@@ -1329,16 +1322,42 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// Port of `TextureCache<P>::ScaleUp`.
     pub(crate) fn scale_up(&mut self, image_id: ImageId) -> bool {
         let has_copy = self.slot_images[image_id].has_scaled;
-        if !P::scale_up_image(self, image_id, false) {
-            return false;
-        }
-        if !has_copy {
+        let rescaled = P::scale_up_image(self, image_id, false);
+        // Upstream accounts the scaled allocation as soon as it exists, even
+        // when the helper blit failed afterwards.
+        if !has_copy && self.slot_images[image_id].has_scaled {
             self.total_used_memory = self
                 .total_used_memory
                 .wrapping_add(Self::scaled_image_memory_size(&self.slot_images[image_id]));
         }
+        if !rescaled {
+            return false;
+        }
         self.invalidate_scale(image_id);
         true
+    }
+
+    /// Port of `TextureCache<P>::IsDownloadable`: a GPU-owned image can be
+    /// downloaded when it is single sampled, or when the runtime can resolve
+    /// its sample count (`P::HAS_MSAA_DOWNLOADS`).
+    pub(crate) fn is_downloadable(&self, image: &ImageBase) -> bool {
+        if !image.is_safe_gpu_copy() {
+            return false;
+        }
+        if image.info.num_samples == 1 {
+            return true;
+        }
+        if P::HAS_MSAA_DOWNLOADS {
+            P::can_download_msaa(self, &image.info)
+        } else {
+            false
+        }
+    }
+
+    /// `is_downloadable` evaluated through a raw runtime pointer for callers
+    /// that hold the slot images mutably (upstream captures `this`).
+    fn is_downloadable_with(cache: &Self, image: &ImageBase) -> bool {
+        cache.is_downloadable(image)
     }
 
     /// Port of `TextureCache<P>::ScaleDown`.
@@ -2244,6 +2263,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 None
             };
 
+        P::flush_deferred_clear(self);
         let framebuffer = P::create_framebuffer(
             self.runtime.as_deref_mut(),
             color_buffers,
@@ -2681,7 +2701,12 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
         for copy_object in self.join_copies_to_do.clone() {
             if copy_object.is_alias {
-                if !self.slot_images[copy_object.id].is_safe_download() {
+                if !self.slot_images[copy_object.id].is_safe_gpu_copy() {
+                    continue;
+                }
+                if self.slot_images[copy_object.id].info.num_samples
+                    != self.slot_images[new_image_id].info.num_samples
+                {
                     continue;
                 }
                 let Some(&alias_index) = self.join_alias_indices.get(&copy_object.id) else {
@@ -3261,6 +3286,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
     /// Port of `TextureCache<P>::RemoveFramebuffers`.
     fn remove_framebuffers(&mut self, removed_views: &[ImageViewId]) {
+        P::flush_deferred_clear(self);
         let last_framebuffer_id = self.last_framebuffer_id;
         let mut removed_framebuffers = Vec::new();
         self.framebuffers.retain(|key, framebuffer_id| {
@@ -7403,8 +7429,15 @@ mod tests {
                 ImageInfo {
                     format: surface::PixelFormat::A8B8G8R8Unorm,
                     image_type: ImageType::E2D,
-                    resources: SubresourceExtent { levels: 1, layers: 1 },
-                    size: Extent3D { width: 64, height: 32, depth: 1 },
+                    resources: SubresourceExtent {
+                        levels: 1,
+                        layers: 1,
+                    },
+                    size: Extent3D {
+                        width: 64,
+                        height: 32,
+                        depth: 1,
+                    },
                     ..ImageInfo::default()
                 },
                 0x20000,

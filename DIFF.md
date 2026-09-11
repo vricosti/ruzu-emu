@@ -1,5 +1,107 @@
 # Upstream parity notes
 
+## 2026-09-11 — Vulkan MSAA/BlitHelpers vs eden 3e07b466eb (`[vulkan] Adjustments on MSAA and BlitHelpers`)
+
+### Intentional differences
+- `CreateRenderPass2` lives on `vulkan_device.rs` (`Device::create_render_pass2`) rather than `vulkan_wrapper.rs`. ash already loads the core 1.2 entry; the KHR path is the same `vkCreateRenderPass2KHR` dispatch Eden added to its wrapper.
+- Helper blits snapshot a `BlitFramebufferInfo` and call `request_renderpass_raw` because the helper cannot hold a typed `Framebuffer*`. Resolve shadows are copied into that snapshot and marked through a hook installed by `TextureCacheRuntime`, matching `BeginRenderPassImpl` → `MarkResolveShadowsUpToDate`.
+- OpenGL `FlushDeferredClear` is an empty method, as in Eden. OpenGL `DownloadMemory` inlines the `IsDownloadable` predicate because `HAS_MSAA_DOWNLOADS` is false on that backend.
+- Scratch/helper framebuffers have zero resolve shadows; only game framebuffers carry the MSAA image handles.
+
+### Unintentional differences (to fix)
+- None remaining in the convert/blit/MSAA runtime path.
+
+### Missing items
+- None in the convert/blit/MSAA runtime path. Shader selection, CopyMSAA/CopyMSAADepth, resolve consume, scratch images, device flags, deferred-clear flush, and ScaleUp/ScaleDown helper fallbacks are present.
+
+### Binary layout verification
+- n/a (GPU runtime, not a serialized payload).
+
+## 2026-09-11 — src/core/src/hle/service/am/service/library_applet_creator.rs vs core/hle/service/am/service/library_applet_creator.{h,cpp}
+
+### Intentional differences
+
+- The guest-applet selection test runs in an isolated process and checks all
+  fifteen upstream Name/name pairs with one LLE preference at a time. Nine
+  switchable preferences exercise global and custom banks; the six nonswitchable
+  hidden preferences retain global ownership. It tests the existing selection
+  function, not firmware availability or execution of the selected applet.
+  No production implementation changed.
+
+## 2026-09-11 — src/video_core/src/texture_cache/util.rs vs video_core/texture_cache/util.{h,cpp}
+
+### Intentional differences
+
+- A synthetic test passes a single opaque-red ASTC LDR void-extent block through
+  CalculateConvertedSizeBytes and ConvertImage for Uncompressed/BC1/BC3. It
+  checks 64/8/16 output bytes respectively and decodes BC1/BC3 with the separate
+  block decoder to compare the resulting pixels. This covers setting dispatch
+  and data flow without a device or title. It does not establish fidelity for
+  arbitrary lossy textures, mip chains, sRGB sampling or native GPU decoding.
+  The production implementation is unchanged.
+
+## 2026-09-11 — src/video_core/src/buffer_cache/{buffer_cache.rs,buffer_cache_base.rs} vs video_core/buffer_cache/buffer_cache{,_base}.h
+
+### Intentional differences
+
+- Test-only runtime now copies buffer bytes into host staging allocations to
+  model device-to-staging CopyBuffer; it previously discarded those copies.
+  Unlike a native backend, this copy completes synchronously and does not model
+  driver barriers. The existing test parameter type can select mapped uploads,
+  allowing the same guest/GPU data assertions to exercise both upload paths.
+- The mapped-readback toggle regression follows MappedUploadMemory's optional
+  download before reading guest memory, then staging-to-buffer copy. This tests
+  actual data effects but not nonzero native staging offsets or hardware fence
+  completion. No production logic or settings defaults changed.
+
+## 2026-09-11 — src/video_core/src/buffer_cache/buffer_cache.rs vs video_core/buffer_cache/buffer_cache{,_base}.h
+
+### Intentional differences
+
+- The synthetic readback-toggle regression uses the existing host-memory test
+  buffer/runtime instead of a graphics device. A 32-byte range crosses a device
+  page and has distinct guest and GPU contents; the test checks both resulting
+  contents with readback disabled and enabled. Expectations follow upstream
+  ImmediateUploadMemory's non-granular branch (optional DownloadBufferMemory,
+  guest read, then ImmediateUpload). This does not validate the separate mapped
+  staging path or GPU-driver synchronization. Production code is unchanged.
+
+## 2026-09-11 — src/video_core/src/renderer_vulkan/turbo_mode.rs vs video_core/renderer_vulkan/vk_turbo_mode.{h,cpp}
+
+### Intentional differences
+
+- Rust uses an explicit stop flag and `Condvar` instead of `std::jthread` and
+  the stop-token-aware `condition_variable_any::wait`. Destruction now takes
+  the submission mutex while publishing stop and notifying the worker, then
+  releases it before joining. This prevents a lost stop notification between
+  the worker's predicate check and sleep, preserving the upstream interruptible
+  idle wait. The 100 ms activity threshold and GPU submission loop are unchanged.
+- A host-only regression constructs the existing worker owner with a synthetic
+  idle thread and checks that destruction wakes and joins it without another
+  queue submission. This does not exercise GPU fences or prove shutdown after
+  a driver hang; the Vulkan fence wait remains unbounded as in upstream.
+
+## 2026-09-10 — src/rdynarmic/src/frontend/a32/{decoder.rs,translate/a32_crc32.rs,translate/mod.rs,translate/translate_arm.rs} vs dynarmic/frontend/A32/{decoder/arm.inc,translate/impl/a32_crc32.cpp,translate/impl/a32_translate_impl.h,translate/translate_arm.cpp}
+
+### Intentional differences
+
+- The existing Rust decoder uses mask/value matches and `DecodedArm`, rather
+  than generated visitor arguments. The CRC32/CRC32C masks preserve both size
+  bits and all register and condition fields; their implementations and shared
+  variant helper live in `a32_crc32.rs`, matching the upstream owner.
+- Rust ordinarily gates conditions in the block/single-instruction dispatcher.
+  CRC instructions bypass that gate because upstream's CRC visitor never calls
+  `ArmConditionPassed`: it rejects PC operands, size 3 and non-AL conditions,
+  in that order, regardless of whether the condition would pass.
+- The port calls existing shared IR CRC emitters through `ir.ir()` rather than
+  inherited emitter methods. Both polynomials and all three A32 widths retain
+  upstream operand order; no host-backend change is needed.
+
+Synthetic tests cover the six operations, invalid conditions/size/PC operands,
+execution against a bitwise reference, accumulator aliasing, discarded upper
+data bits, unchanged source register and unchanged CPSR. The full rdynarmic
+suite passes: 1145 library tests (4 ignored), plus three auxiliary tests.
+
 ## 2026-09-08 — src/core/src/hle/kernel/board/k_system_control.rs vs core/hle/kernel/board/nintendo/nx/k_system_control.{h,cpp}
 
 ### Intentional differences
@@ -6033,6 +6135,16 @@ Eden files:
   frontend contract.
 
 ## 2026-08-22 — `src/core/src/debugger/debugger.rs` vs Eden `src/core/debugger/debugger.{h,cpp}`
+
+2026-09-11 lifecycle revalidation: reread constructor and ShutdownServer;
+the focused regression now checks four server lifetimes and immediate reuse of
+the configured listening port after Drop joins its worker. No production
+implementation change in this test slice.
+
+Remaining server scheduling difference: Rust polls nonblocking sockets every
+10ms without a client and 1ms with a client; Eden's Boost.Asio loop waits for
+readiness and signal-pipe notifications. This is not equivalent idle wakeup
+behavior; replacing the server event loop requires a separate structural slice.
 
 ### Intentional differences
 
@@ -16743,3 +16855,164 @@ unchanged.
   itself is unchanged; it only deadlocks when the GPU thread blocks indefinitely.
 - The GPU hang that TOTK provokes under the Metal renderer is a separate,
   unresolved renderer defect.
+## 2026-09-11 — src/ruzu/src/game_list.rs and boot.rs vs core/core.cpp and qt_common/game_list/worker.{h,cpp}
+
+### Intentional differences
+- GTK metadata reads use lightweight filesystem controllers instead of Eden's
+  long-lived GUI System. Each reader and boot now receives its own content
+  provider union, so native cache pointers remain scoped to their owning
+  controller rather than being overwritten by unrelated scans. The manual
+  frontend provider remains process-owned and shared through its mutex adapter;
+  refresh now takes that mutex too. Eden's System owns its union and registers
+  its filesystem factories there (core.cpp and filesystem/filesystem.{h,cpp}).
+- A synthetic registry isolation regression creates and destroys a metadata
+  registry while a separate runtime registry retains its native content entry.
+  It requires no user files or emulated title. This does not certify every
+  raw-pointer lifecycle in ContentProviderUnion or concurrent scan cancellation.
+
+## 2026-09-11 — src/core/src/hle/kernel/k_memory_layout.rs vs core/hle/kernel/k_memory_layout.{h,cpp}
+
+### Missing items
+- Runtime memory-layout wiring is still incomplete: System initializes fixed
+  user pools rather than calling the upstream KernelCore::DeriveInitialMemoryLayout
+  sequence. The prerequisite investigation is recorded locally in
+  MEMORY_LAYOUT_SETTINGS_STATE.md. Correcting GetResourceRegionSizeForInit to
+  include the board's secure applet reserve removes its zero-size placeholder,
+  but does not by itself make the extended-memory setting effective.
+
+## 2026-09-11 — src/core/src/hle/kernel/{k_memory_layout,k_memory_region}.rs vs core/hle/kernel/{k_memory_layout.cpp,k_memory_region.h}
+
+### Intentional differences
+- GetRandomAlignedRegion uses wrapping addition for the upstream unsigned
+  overflow rejection; its read-only receiver does not require mutable tree
+  access. The implementation stays in k_memory_layout.rs, while the guarded
+  inline wrapper remains in k_memory_region.rs, matching upstream ownership.
+- A missing candidate region produces an explicit Rust panic instead of
+  dereferencing a null C++ pointer. The caller must supply a covering region
+  tree with space for the request; impossible allocations retain upstream's
+  retry semantics rather than inventing a fallback address.
+
+### Missing items
+- KernelCore::DeriveInitialMemoryLayout remains the missing caller. These
+  helpers alone do not activate the configured DRAM layout at runtime.
+
+## 2026-09-11 — src/core/src/hle/kernel/init/init_slab_setup.rs vs core/hle/kernel/init/init_slab_setup.{h,cpp}
+
+### Intentional differences
+- CalculateTotalSlabHeapSize now uses Rust host type sizes and alignments for
+  the same 18 categories and count expressions as FOREACH_SLAB_TYPE, including
+  the previously omitted KObjectName. These are host implementation objects,
+  not guest ABI payloads; Rust object sizes are not C++ object sizes.
+- The function takes the owning kernel's resource-count structure directly
+  rather than the whole KernelCore, as before. No counts or state move owners.
+
+### Missing items
+- InitializeSlabHeaps still uses the existing lazy host-allocation model, not
+  upstream's reserved-backing allocation and randomized slab placement. This
+  arithmetic correction must not be mistaken for completing that lifecycle.
+  Runtime DeriveInitialMemoryLayout and the full extended-memory setting
+  remain the interrupted slice recorded in MEMORY_LAYOUT_SETTINGS_STATE.md.
+
+## 2026-09-11 — src/core/src/hle/kernel/kernel.rs vs core/hle/kernel/kernel.{h,cpp}
+
+### Intentional differences
+- DeriveInitialMemoryLayout stays on KernelCore in kernel.rs. Temporary ordered
+  address/region snapshots permit mutating physical and virtual trees without
+  overlapping Rust borrows. The per-region insertion and pairing order follows
+  the upstream implementation.
+- Unsigned physical/virtual offset arithmetic uses wrapping operations. The
+  zero-size SecureUnknownRegion branch and the unused cur_phys_addr/cur_size
+  bookkeeping are omitted; neither creates a region or mapping upstream.
+- Slab reservations use the corresponding Rust host-object size calculation;
+  the existing host slab allocation model is not changed by this method.
+
+### Missing items
+- The method is tested but not yet connected to production initialization.
+  The existing fixed pools remain active until memory-manager initialization,
+  backing allocation, resource limits and GPU address-width prerequisites are
+  checked together. An isolated test validates all five DRAM sizes, application
+  and applet pool capacities and paired region sizes/attributes/addresses;
+  it does not validate resident allocations or an emulated boot.
+
+## 2026-09-11 — src/core/src/hle/kernel/k_memory_manager.rs vs core/hle/kernel/k_memory_manager.{h,cpp}
+
+### Intentional differences
+- InitializeFromLayout retains host-owned reference-count/bitmap storage and
+  takes the region tree explicitly. Manager creation now follows region
+  attributes, coalescing adjacent regions for one manager as Initialize does,
+  instead of creating one manager per physical tree node. The temporary fixed
+  pool builder in k_memory_layout.rs assigns distinct manager attributes too.
+- Rust resets owned manager vectors and index chains before initialization;
+  it does not use placement initialization over a C++ fixed array.
+
+### Missing items
+- The existing host initializer frees the full pool rather than reserving an
+  initial-process image if it overlaps. Both currently active fixed pools and
+  the tested derived pools exclude the upstream initial image interval at DRAM
+  base, so that branch is not exercised by this wiring. Do not claim parity
+  for arbitrary user-pool layouts overlapping that interval.
+
+## 2026-09-11 — src/video_core/src/host1x/gpu_device_memory_manager.rs vs core/device_memory_manager.{h,inc}
+
+### Intentional differences
+- The reverse physical-page table covers 34 address bits for 10/12 GiB modes.
+  Current Eden keeps a 33-bit maximum for all extended modes, covering only
+  8 GiB despite offering 10/12 GiB settings. Retaining that limit would reject
+  valid upper physical pages once the configured backing is connected. The
+  4 GiB mode remains 32-bit and 6/8 GiB remain 33-bit; no default-mode table
+  growth. Ownership remains in the existing active Maxwell manager module.
+- A child-process regression checks constructor table capacity and physical
+  compression/decompression for the last page of all five configured sizes.
+  It allocates metadata only; synthetic host addresses are never dereferenced.
+  This is not a rendered-frame or resident-memory validation.
+
+## 2026-09-11 — src/core/src/{core,device_memory}.rs vs core/{core,device_memory}.{h,cpp}
+
+### Intentional differences
+- The existing Rust System::initialize_kernel orchestration calls the
+  KernelCore-owned region derivation, derives resource limits from total/kernel
+  regions, initializes pool managers and uses the derived virtual page-table
+  heap for dynamic resources. Fixed 4 GiB pool extents and the synthetic
+  page-table heap address are no longer used by the runtime path.
+- DeviceMemory::new now obtains its backing size from the board setting,
+  as upstream does. System still creates a fresh backing on initialize rather
+  than using Eden's reuse/ReinitializeIfNecessary policy.
+
+### Missing items
+- Rust still starts its kernel thread scaffolding before the System-owned
+  memory setup, unlike Eden's internal Initialize sequence. This slice does
+  not claim complete kernel initialization lifecycle parity; runtime boot,
+  stop and restart validation remain required before delivery.
+
+Follow-up: removed the obsolete fixed-pool builder. InitializeMemoryLayout
+now initializes the physical manager from KernelCore's derived tree, preserving
+the upstream method's owner. Host-owned allocator metadata remains the existing
+adaptation. An isolated regression initializes dynamic resources and font/IRS/
+HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
+
+## 2026-09-11 — src/common/src/thread.rs and src/core/src/cpu_manager.rs vs common/thread.h and core/cpu_manager.{h,cpp}
+
+### Intentional differences
+- Barrier's stop-aware wait takes the existing Rust AtomicBool stop state.
+  request_stop holds the barrier mutex while setting it and notifying waiters,
+  replacing condition_variable_any's stop-token callback without polling.
+  Normal Sync, generation advancement and the upstream last-arrival success
+  result are preserved. A cancelled wait does not decrement the arrival count,
+  matching upstream; CpuManager creates a fresh barrier on initialization.
+- CpuManager keeps its existing shared stop flag for all CPU workers rather
+  than one jthread token per worker. Shutdown now notifies the startup barrier
+  before joining, allowing cancellation when no GPU participant ever arrives.
+  HEAD already contained the uninterruptible barrier and join sequence; the
+  new pre-GPU lifecycle test exposed that existing difference.
+
+## 2026-09-11 — src/core/src/hle/kernel/k_memory_layout.rs vs core/hle/kernel/k_memory_layout.h
+
+### Intentional differences
+- MainMemorySizeMax now reflects the largest exposed layout, 12 GiB, rather
+  than Eden's retained 8 GiB bound. This makes KernelPageTableHeapSize cover
+  GetMaximumOverheadSize for every supported mode. The formula and constant
+  ownership are unchanged. As upstream sizes from a static maximum, this also
+  enlarges the reserved kernel regions in smaller modes; application/applet
+  pool targets stay unchanged and the system pool absorbs the reservation.
+  The separate per-SVC allocation-size limit is not a total-DRAM limit and is
+  not changed by this correction.

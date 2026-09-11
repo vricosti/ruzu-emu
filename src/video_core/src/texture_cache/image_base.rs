@@ -230,18 +230,18 @@ impl ImageBase {
         self.image_view_ids.push(image_view_id);
     }
 
-    /// Whether it is safe to download this image to the CPU.
+    /// Whether the GPU contents of this image are the authoritative copy and
+    /// may be read back or copied. The MSAA restriction lives in
+    /// `TextureCache::IsDownloadable`.
     ///
-    /// Port of `ImageBase::IsSafeDownload`.
-    pub fn is_safe_download(&self) -> bool {
+    /// Port of `ImageBase::IsSafeGpuCopy`.
+    pub fn is_safe_gpu_copy(&self) -> bool {
+        // Skip images that were not modified from the GPU
         if !self.flags.contains(ImageFlagBits::GPU_MODIFIED) {
             return false;
         }
+        // Skip images that .are. modified from the CPU
         if self.flags.contains(ImageFlagBits::CPU_MODIFIED) {
-            return false;
-        }
-        if self.info.num_samples > 1 {
-            log::warn!("MSAA image downloads are not implemented");
             return false;
         }
         true
@@ -547,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn msaa_download_is_not_safe() {
+    fn msaa_image_is_still_a_safe_gpu_copy() {
         let info = ImageInfo {
             format: PixelFormat::A8B8G8R8Unorm,
             image_type: ImageType::E2D,
@@ -563,6 +563,6 @@ mod tests {
         image.flags.remove(ImageFlagBits::CPU_MODIFIED);
         image.flags.insert(ImageFlagBits::GPU_MODIFIED);
 
-        assert!(!image.is_safe_download());
+        assert!(image.is_safe_gpu_copy());
     }
 }

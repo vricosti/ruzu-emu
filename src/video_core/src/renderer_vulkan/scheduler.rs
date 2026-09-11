@@ -812,6 +812,7 @@ impl Scheduler {
             framebuffer.images(),
             framebuffer.image_ranges(),
         );
+        framebuffer.mark_resolve_shadows_up_to_date();
     }
 
     /// Port of `Scheduler::DeferColorClear`.
@@ -887,11 +888,14 @@ impl Scheduler {
         } else {
             0
         };
+        let depth_stencil_discard =
+            deferred.depth_stencil && framebuffer.discards_msaa_depth_stencil();
         let renderpass = framebuffer
             .render_pass_variant(
                 deferred.color_clear_mask,
                 deferred.depth_stencil,
                 color_discard_mask,
+                depth_stencil_discard,
             )
             .expect("failed to create deferred-clear render-pass variant");
         self.end_render_pass();
@@ -907,6 +911,17 @@ impl Scheduler {
             framebuffer.images(),
             framebuffer.image_ranges(),
         );
+        framebuffer.mark_resolve_shadows_up_to_date();
+    }
+
+    /// Port of `Scheduler::FlushDeferredClear`: realizes any pending deferred
+    /// clear before its framebuffer can be moved or freed.
+    pub fn flush_deferred_clear(&mut self) {
+        if self.deferred_clear.framebuffer.is_none() {
+            return;
+        }
+        self.realize_deferred_clear();
+        self.end_render_pass();
     }
 
     pub fn request_renderpass_raw(
@@ -1377,10 +1392,16 @@ mod tests {
         let pacing = std::sync::Arc::new(std::sync::Mutex::new(super::FramePacing::new(now)));
         let presentation = pacing.clone();
         let interval = std::time::Duration::from_secs_f64(1.0 / 60.0);
-        assert_eq!(std::thread::spawn(move || {
-            presentation.lock().unwrap().deadline(now, true, 60.0)
-        }).join().unwrap(), Some(now + interval));
-        assert_eq!(pacing.lock().unwrap().deadline(now, true, 60.0), Some(now + interval * 2));
+        assert_eq!(
+            std::thread::spawn(move || { presentation.lock().unwrap().deadline(now, true, 60.0) })
+                .join()
+                .unwrap(),
+            Some(now + interval)
+        );
+        assert_eq!(
+            pacing.lock().unwrap().deadline(now, true, 60.0),
+            Some(now + interval * 2)
+        );
     }
 
     use super::*;

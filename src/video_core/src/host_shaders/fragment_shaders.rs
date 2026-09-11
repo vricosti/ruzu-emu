@@ -9,6 +9,7 @@
 
 pub const BLIT_COLOR_FLOAT_FRAG: &str = include_str!("blit_color_float.frag");
 pub const BLIT_COLOR_MSAA_FRAG: &str = include_str!("blit_color_msaa.frag");
+pub const BLIT_DEPTH_FRAG: &str = include_str!("blit_depth.frag");
 pub const BLIT_DEPTH_MSAA_FRAG: &str = include_str!("blit_depth_msaa.frag");
 pub const BLIT_DEPTH_STENCIL_MSAA_FRAG: &str = include_str!("blit_depth_stencil_msaa.frag");
 pub const CONVERT_ABGR8_TO_D24S8_FRAG: &str = include_str!("convert_abgr8_to_d24s8.frag");
@@ -18,7 +19,15 @@ pub const CONVERT_D32F_TO_ABGR8_FRAG: &str = include_str!("convert_d32f_to_abgr8
 pub const CONVERT_DEPTH_TO_FLOAT_FRAG: &str = include_str!("convert_depth_to_float.frag");
 pub const CONVERT_FLOAT_TO_DEPTH_FRAG: &str = include_str!("convert_float_to_depth.frag");
 pub const CONVERT_MSAA_TO_NON_MSAA_FRAG: &str = include_str!("convert_msaa_to_non_msaa.frag");
+pub const CONVERT_MSAA_TO_NON_MSAA_DEPTH_FRAG: &str =
+    include_str!("convert_msaa_to_non_msaa_depth.frag");
+pub const CONVERT_MSAA_TO_NON_MSAA_DEPTH_STENCIL_FRAG: &str =
+    include_str!("convert_msaa_to_non_msaa_depth_stencil.frag");
 pub const CONVERT_NON_MSAA_TO_MSAA_FRAG: &str = include_str!("convert_non_msaa_to_msaa.frag");
+pub const CONVERT_NON_MSAA_TO_MSAA_DEPTH_FRAG: &str =
+    include_str!("convert_non_msaa_to_msaa_depth.frag");
+pub const CONVERT_NON_MSAA_TO_MSAA_DEPTH_STENCIL_FRAG: &str =
+    include_str!("convert_non_msaa_to_msaa_depth_stencil.frag");
 pub const CONVERT_S8D24_TO_ABGR8_FRAG: &str = include_str!("convert_s8d24_to_abgr8.frag");
 pub const FIDELITYFX_FSR_FRAG: &str = include_str!("fidelityfx_fsr.frag");
 pub const FXAA_FRAG: &str = include_str!("fxaa.frag");

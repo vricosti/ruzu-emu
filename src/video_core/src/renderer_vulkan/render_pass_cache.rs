@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use ash::vk;
 use log::debug;
+use smallvec::SmallVec;
 
 use super::maxwell_to_vk;
 use crate::surface::{PixelFormat, SurfaceType};
@@ -67,16 +68,132 @@ fn color_attachment_ops(
     (load_op, store_op)
 }
 
+/// Upstream `ResolveAspects` (anonymous namespace).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolveAspects {
+    depth: bool,
+    stencil: bool,
+}
+
+/// Upstream `ResolveModes` (anonymous namespace).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolveModes {
+    depth: vk::ResolveModeFlags,
+    stencil: vk::ResolveModeFlags,
+}
+
+/// Port of the anonymous-namespace `GetResolveAspects`.
+const fn get_resolve_aspects(format: PixelFormat) -> ResolveAspects {
+    let surface_type = get_surface_type(format);
+    ResolveAspects {
+        depth: matches!(surface_type, SurfaceType::Depth | SurfaceType::DepthStencil),
+        stencil: matches!(
+            surface_type,
+            SurfaceType::Stencil | SurfaceType::DepthStencil
+        ),
+    }
+}
+
+/// Device-independent core of the anonymous-namespace `PickResolveModes`.
+fn pick_resolve_modes_with(
+    depth_resolve_modes: vk::ResolveModeFlags,
+    stencil_resolve_modes: vk::ResolveModeFlags,
+    independent_resolve_none: bool,
+    format: PixelFormat,
+) -> ResolveModes {
+    const MODE: vk::ResolveModeFlags = vk::ResolveModeFlags::SAMPLE_ZERO;
+
+    let aspects = get_resolve_aspects(format);
+    let depth_mode_supported = depth_resolve_modes.contains(MODE);
+    let stencil_mode_supported = stencil_resolve_modes.contains(MODE);
+
+    let mut modes = ResolveModes {
+        depth: vk::ResolveModeFlags::NONE,
+        stencil: vk::ResolveModeFlags::NONE,
+    };
+    if aspects.depth && depth_mode_supported {
+        modes.depth = MODE;
+    }
+    if aspects.stencil && stencil_mode_supported {
+        modes.stencil = MODE;
+    }
+    if modes.depth == modes.stencil || independent_resolve_none {
+        return modes;
+    }
+    if modes.depth != vk::ResolveModeFlags::NONE && stencil_mode_supported {
+        modes.stencil = MODE;
+    } else if modes.stencil != vk::ResolveModeFlags::NONE && depth_mode_supported {
+        modes.depth = MODE;
+    }
+    modes
+}
+
+/// Port of the anonymous-namespace `PickResolveModes`.
+fn pick_resolve_modes(device: &Device, format: PixelFormat) -> ResolveModes {
+    pick_resolve_modes_with(
+        device.get_depth_resolve_modes(),
+        device.get_stencil_resolve_modes(),
+        device.supports_independent_resolve_none(),
+        format,
+    )
+}
+
+/// Device-independent core of `SupportsDepthStencilResolve`.
+fn supports_depth_stencil_resolve_with(
+    khr_depth_stencil_resolve_supported: bool,
+    depth_resolve_modes: vk::ResolveModeFlags,
+    stencil_resolve_modes: vk::ResolveModeFlags,
+    independent_resolve_none: bool,
+    depth_format: PixelFormat,
+) -> bool {
+    if depth_format == PixelFormat::Invalid || !khr_depth_stencil_resolve_supported {
+        return false;
+    }
+    let aspects = get_resolve_aspects(depth_format);
+    if !aspects.depth && !aspects.stencil {
+        return false;
+    }
+    let modes = pick_resolve_modes_with(
+        depth_resolve_modes,
+        stencil_resolve_modes,
+        independent_resolve_none,
+        depth_format,
+    );
+    if (aspects.depth && modes.depth == vk::ResolveModeFlags::NONE)
+        || (aspects.stencil && modes.stencil == vk::ResolveModeFlags::NONE)
+    {
+        return false;
+    }
+    modes.depth == modes.stencil || independent_resolve_none
+}
+
+/// Port of `Vulkan::SupportsDepthStencilResolve`: whether a render pass can
+/// resolve `depth_format` through `VK_KHR_depth_stencil_resolve`.
+pub fn supports_depth_stencil_resolve(device: &Device, depth_format: PixelFormat) -> bool {
+    supports_depth_stencil_resolve_with(
+        device.is_khr_depth_stencil_resolve_supported(),
+        device.get_depth_resolve_modes(),
+        device.get_stencil_resolve_modes(),
+        device.supports_independent_resolve_none(),
+        depth_format,
+    )
+}
+
 /// Port of upstream `RenderPassKey`.
+///
+/// Upstream hashes the key manually (`std::hash<RenderPassKey>`); the Rust
+/// map derives `Hash` over the same fields.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RenderPassKey {
     pub color_formats: [PixelFormat; 8],
     pub depth_format: PixelFormat,
     pub samples: vk::SampleCountFlags,
     pub resolve_color: bool,
+    pub resolve_depth_stencil: bool,
     pub color_clear_mask: u32,
     pub depth_stencil_clear: bool,
     pub color_discard_mask: u32,
+    pub depth_stencil_discard: bool,
 }
 
 impl Default for RenderPassKey {
@@ -86,12 +203,17 @@ impl Default for RenderPassKey {
             depth_format: PixelFormat::Invalid,
             samples: vk::SampleCountFlags::TYPE_1,
             resolve_color: false,
+            resolve_depth_stencil: false,
             color_clear_mask: 0,
             depth_stencil_clear: false,
             color_discard_mask: 0,
+            depth_stencil_discard: false,
         }
     }
 }
+
+/// Upstream `MAX_ATTACHMENTS`: colors + color resolves + depth + depth resolve.
+const MAX_ATTACHMENTS: usize = 2 * 8 + 2;
 
 /// Caches VkRenderPass objects by render target configuration.
 ///
@@ -171,7 +293,7 @@ impl RenderPassCache {
     }
 
     fn create_render_pass(&self, key: &RenderPassKey) -> Result<vk::RenderPass, vk::Result> {
-        let mut attachments = Vec::new();
+        let mut attachments = SmallVec::<[vk::AttachmentDescription; MAX_ATTACHMENTS]>::new();
         let mut color_refs = Vec::new();
         let mut num_attachments = 0usize;
         let mut num_colors = 0u32;
@@ -218,11 +340,16 @@ impl RenderPassCache {
             } else {
                 vk::AttachmentLoadOp::LOAD
             };
+            let store_op = if key.depth_stencil_discard {
+                vk::AttachmentStoreOp::DONT_CARE
+            } else {
+                vk::AttachmentStoreOp::STORE
+            };
             attachments.push(self.attachment_description(
                 key.depth_format,
                 key.samples,
                 load_op,
-                vk::AttachmentStoreOp::STORE,
+                store_op,
             ));
         } else {
             depth_ref = None;
@@ -253,6 +380,26 @@ impl RenderPassCache {
                 description.initial_layout = vk::ImageLayout::UNDEFINED;
                 attachments.push(description);
             }
+        }
+
+        let do_resolve_depth_stencil = key.resolve_depth_stencil
+            && has_depth
+            && key.samples != vk::SampleCountFlags::TYPE_1
+            && supports_depth_stencil_resolve(self.device(), key.depth_format);
+        let mut depth_resolve_reference = vk::AttachmentReference::default();
+        if do_resolve_depth_stencil {
+            depth_resolve_reference = vk::AttachmentReference {
+                attachment: attachments.len() as u32,
+                layout: vk::ImageLayout::GENERAL,
+            };
+            let mut resolve_desc = self.attachment_description(
+                key.depth_format,
+                vk::SampleCountFlags::TYPE_1,
+                vk::AttachmentLoadOp::DONT_CARE,
+                vk::AttachmentStoreOp::STORE,
+            );
+            resolve_desc.initial_layout = vk::ImageLayout::UNDEFINED;
+            attachments.push(resolve_desc);
         }
 
         let mut subpass = vk::SubpassDescription::builder()
@@ -286,6 +433,89 @@ impl RenderPassCache {
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
             .dependency_flags(vk::DependencyFlags::BY_REGION)
             .build();
+
+        if self.device().is_khr_create_render_pass2_supported() {
+            let descriptions2: SmallVec<[vk::AttachmentDescription2; MAX_ATTACHMENTS]> =
+                attachments
+                    .iter()
+                    .map(|description| {
+                        vk::AttachmentDescription2::builder()
+                            .flags(description.flags)
+                            .format(description.format)
+                            .samples(description.samples)
+                            .load_op(description.load_op)
+                            .store_op(description.store_op)
+                            .stencil_load_op(description.stencil_load_op)
+                            .stencil_store_op(description.stencil_store_op)
+                            .initial_layout(description.initial_layout)
+                            .final_layout(description.final_layout)
+                            .build()
+                    })
+                    .collect();
+            let promote = |reference: &vk::AttachmentReference| {
+                vk::AttachmentReference2::builder()
+                    .attachment(reference.attachment)
+                    .layout(reference.layout)
+                    .aspect_mask(vk::ImageAspectFlags::empty())
+                    .build()
+            };
+            let mut references2 = [vk::AttachmentReference2::default(); 8];
+            let mut resolve_references2 = [vk::AttachmentReference2::default(); 8];
+            for index in 0..8 {
+                references2[index] =
+                    promote(color_refs.get(index).unwrap_or(&vk::AttachmentReference {
+                        attachment: vk::ATTACHMENT_UNUSED,
+                        layout: vk::ImageLayout::GENERAL,
+                    }));
+                resolve_references2[index] =
+                    promote(resolve_refs.get(index).unwrap_or(&vk::AttachmentReference {
+                        attachment: vk::ATTACHMENT_UNUSED,
+                        layout: vk::ImageLayout::GENERAL,
+                    }));
+            }
+            let depth_reference2 =
+                promote(depth_ref.as_ref().unwrap_or(&vk::AttachmentReference {
+                    attachment: vk::ATTACHMENT_UNUSED,
+                    layout: vk::ImageLayout::GENERAL,
+                }));
+            let depth_resolve_reference2 = promote(&depth_resolve_reference);
+            let resolve_modes = pick_resolve_modes(self.device(), key.depth_format);
+            let mut depth_stencil_resolve = vk::SubpassDescriptionDepthStencilResolve::builder()
+                .depth_resolve_mode(resolve_modes.depth)
+                .stencil_resolve_mode(resolve_modes.stencil)
+                .depth_stencil_resolve_attachment(&depth_resolve_reference2)
+                .build();
+            let mut subpass2 = vk::SubpassDescription2::builder()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .view_mask(0)
+                .color_attachments(&references2[..num_attachments]);
+            if do_resolve_color {
+                subpass2 = subpass2.resolve_attachments(&resolve_references2[..num_attachments]);
+            }
+            if has_depth {
+                subpass2 = subpass2.depth_stencil_attachment(&depth_reference2);
+            }
+            if do_resolve_depth_stencil {
+                subpass2 = subpass2.push_next(&mut depth_stencil_resolve);
+            }
+            let subpass2 = subpass2.build();
+            let dependency2 = vk::SubpassDependency2::builder()
+                .src_subpass(dependency.src_subpass)
+                .dst_subpass(dependency.dst_subpass)
+                .src_stage_mask(dependency.src_stage_mask)
+                .dst_stage_mask(dependency.dst_stage_mask)
+                .src_access_mask(dependency.src_access_mask)
+                .dst_access_mask(dependency.dst_access_mask)
+                .dependency_flags(dependency.dependency_flags)
+                .view_offset(0)
+                .build();
+            let render_pass_info = vk::RenderPassCreateInfo2::builder()
+                .attachments(&descriptions2)
+                .subpasses(std::slice::from_ref(&subpass2))
+                .dependencies(std::slice::from_ref(&dependency2))
+                .build();
+            return self.device().create_render_pass2(&render_pass_info);
+        }
 
         let render_pass_info = vk::RenderPassCreateInfo::builder()
             .attachments(&attachments)
@@ -334,9 +564,131 @@ mod tests {
         assert_eq!(key.depth_format, PixelFormat::Invalid);
         assert_eq!(key.samples, vk::SampleCountFlags::TYPE_1);
         assert!(!key.resolve_color);
+        assert!(!key.resolve_depth_stencil);
         assert_eq!(key.color_clear_mask, 0);
         assert!(!key.depth_stencil_clear);
         assert_eq!(key.color_discard_mask, 0);
+        assert!(!key.depth_stencil_discard);
+    }
+
+    #[test]
+    fn resolve_aspects_follow_render_pass_surface_types() {
+        assert_eq!(
+            get_resolve_aspects(PixelFormat::D32Float),
+            ResolveAspects {
+                depth: true,
+                stencil: false
+            }
+        );
+        assert_eq!(
+            get_resolve_aspects(PixelFormat::S8Uint),
+            ResolveAspects {
+                depth: false,
+                stencil: true
+            }
+        );
+        assert_eq!(
+            get_resolve_aspects(PixelFormat::D24UnormS8Uint),
+            ResolveAspects {
+                depth: true,
+                stencil: true
+            }
+        );
+        assert_eq!(
+            get_resolve_aspects(PixelFormat::A8B8G8R8Unorm),
+            ResolveAspects {
+                depth: false,
+                stencil: false
+            }
+        );
+    }
+
+    #[test]
+    fn pick_resolve_modes_uses_sample_zero_and_pairs_aspects_without_independent_none() {
+        let zero = vk::ResolveModeFlags::SAMPLE_ZERO;
+        let none = vk::ResolveModeFlags::NONE;
+        // Depth/stencil with both modes supported.
+        let modes = pick_resolve_modes_with(zero, zero, false, PixelFormat::D24UnormS8Uint);
+        assert_eq!((modes.depth, modes.stencil), (zero, zero));
+        // Depth only: stencil stays NONE when the device allows independent NONE.
+        let modes = pick_resolve_modes_with(zero, zero, true, PixelFormat::D32Float);
+        assert_eq!((modes.depth, modes.stencil), (zero, none));
+        // Depth only without independent NONE: stencil is forced to the same mode.
+        let modes = pick_resolve_modes_with(zero, zero, false, PixelFormat::D32Float);
+        assert_eq!((modes.depth, modes.stencil), (zero, zero));
+        // Stencil only without independent NONE and depth supported: depth follows.
+        let modes = pick_resolve_modes_with(zero, zero, false, PixelFormat::S8Uint);
+        assert_eq!((modes.depth, modes.stencil), (zero, zero));
+        // Depth mode unsupported: nothing can resolve.
+        let modes = pick_resolve_modes_with(none, zero, false, PixelFormat::D24UnormS8Uint);
+        assert_eq!((modes.depth, modes.stencil), (none, zero));
+    }
+
+    #[test]
+    fn supports_depth_stencil_resolve_requires_extension_aspects_and_modes() {
+        let zero = vk::ResolveModeFlags::SAMPLE_ZERO;
+        let none = vk::ResolveModeFlags::NONE;
+        assert!(!supports_depth_stencil_resolve_with(
+            false,
+            zero,
+            zero,
+            true,
+            PixelFormat::D32Float
+        ));
+        assert!(!supports_depth_stencil_resolve_with(
+            true,
+            zero,
+            zero,
+            true,
+            PixelFormat::Invalid
+        ));
+        assert!(!supports_depth_stencil_resolve_with(
+            true,
+            zero,
+            zero,
+            true,
+            PixelFormat::A8B8G8R8Unorm
+        ));
+        assert!(supports_depth_stencil_resolve_with(
+            true,
+            zero,
+            zero,
+            false,
+            PixelFormat::D24UnormS8Uint
+        ));
+        // Depth-only format with a stencil mode forced on and no independent NONE
+        // is still fine (modes are equal).
+        assert!(supports_depth_stencil_resolve_with(
+            true,
+            zero,
+            zero,
+            false,
+            PixelFormat::D32Float
+        ));
+        // Stencil resolve unsupported by the device: depth/stencil formats fail.
+        assert!(!supports_depth_stencil_resolve_with(
+            true,
+            zero,
+            none,
+            true,
+            PixelFormat::D24UnormS8Uint
+        ));
+        assert!(supports_depth_stencil_resolve_with(
+            true,
+            zero,
+            none,
+            true,
+            PixelFormat::D32Float
+        ));
+        // Depth-only format, no independent NONE, stencil unsupported: depth mode
+        // stays SAMPLE_ZERO while stencil is NONE, so the pair is rejected.
+        assert!(!supports_depth_stencil_resolve_with(
+            true,
+            zero,
+            none,
+            false,
+            PixelFormat::D32Float
+        ));
     }
 
     #[test]

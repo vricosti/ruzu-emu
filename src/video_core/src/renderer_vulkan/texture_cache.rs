@@ -50,7 +50,7 @@ use super::blit_image::{
 use super::compute_pass::{AstcDecoderPass, BlockLinearUnswizzle3DPass};
 use super::descriptor_pool::DescriptorPool;
 use super::maxwell_to_vk;
-use super::render_pass_cache::{RenderPassCache, RenderPassKey};
+use super::render_pass_cache::{supports_depth_stencil_resolve, RenderPassCache, RenderPassKey};
 use super::scheduler::Scheduler;
 use super::staging_buffer_pool::{StagingBufferPool, StagingBufferRef};
 use super::update_descriptor::ComputePassDescriptorQueue;
@@ -64,8 +64,10 @@ use crate::vulkan_common::vulkan_wrapper::{
     PIPELINE_STAGE_GRAPHICS_COMPUTE, PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
 };
 
+const ENABLE_MSAA_TILER_RESOLVE: bool = true;
 const ENABLE_MSAA_RESOLVE_CONSUME: bool = true;
 const ENABLE_MSAA_COLOR_DISCARD: bool = true;
+const ENABLE_MSAA_DEPTH_STENCIL_DISCARD: bool = true;
 
 fn assert_fail_soft(condition: bool, message: &str) {
     if condition {
@@ -505,24 +507,29 @@ impl Image {
         runtime: &mut TextureCacheRuntime,
         scale_up: bool,
     ) -> bool {
+        let aspect_mask = self.aspect;
+        let has_stencil = aspect_mask.contains(vk::ImageAspectFlags::STENCIL);
         let view = if scale_up {
             self.scale_view
         } else {
             self.normal_view
         };
         if view == vk::ImageView::null() {
+            // Upstream builds one `ImageView` over the whole image aspect and
+            // lazily derives its depth/stencil views; the helper blits read
+            // through those.
             let render_target_view = match runtime.create_blit_image_view(
                 self.handle(),
                 self.format,
-                vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+                aspect_mask,
             ) {
                 Ok(view) => view,
                 Err(err) => {
                     log::warn!(
-                        "TextureCacheVulkan: failed to create BlitScaleHelper depth/stencil target view gpu=0x{:X} err={:?}",
-                        self.base().gpu_addr,
-                        err
-                    );
+                            "TextureCacheVulkan: failed to create BlitScaleHelper depth/stencil target view gpu=0x{:X} err={:?}",
+                            self.base().gpu_addr,
+                            err
+                        );
                     return false;
                 }
             };
@@ -546,27 +553,30 @@ impl Image {
                     return false;
                 }
             };
-            let stencil_view = match runtime.create_blit_image_view(
-                self.handle(),
-                self.format,
-                vk::ImageAspectFlags::STENCIL,
-            ) {
-                Ok(view) => view,
-                Err(err) => {
-                    unsafe {
-                        runtime
-                            .device()
-                            .destroy_image_view(render_target_view, None);
-                        runtime.device().destroy_image_view(depth_view, None);
+            let mut stencil_view = vk::ImageView::null();
+            if has_stencil {
+                stencil_view = match runtime.create_blit_image_view(
+                    self.handle(),
+                    self.format,
+                    vk::ImageAspectFlags::STENCIL,
+                ) {
+                    Ok(view) => view,
+                    Err(err) => {
+                        unsafe {
+                            runtime
+                                .device()
+                                .destroy_image_view(render_target_view, None);
+                            runtime.device().destroy_image_view(depth_view, None);
+                        }
+                        log::warn!(
+                            "TextureCacheVulkan: failed to create BlitScaleHelper stencil view gpu=0x{:X} err={:?}",
+                            self.base().gpu_addr,
+                            err
+                        );
+                        return false;
                     }
-                    log::warn!(
-                        "TextureCacheVulkan: failed to create BlitScaleHelper stencil view gpu=0x{:X} err={:?}",
-                        self.base().gpu_addr,
-                        err
-                    );
-                    return false;
-                }
-            };
+                };
+            }
             if scale_up {
                 self.scale_view = render_target_view;
                 self.scale_depth_view = depth_view;
@@ -579,6 +589,7 @@ impl Image {
         }
 
         let is_2d = self.base().info.image_type == ImageType::E2D;
+        let num_samples = self.base().info.num_samples;
         let scaled_width = runtime.resolution.scale_up_u32(self.base().info.size.width);
         let scaled_height = if is_2d {
             runtime
@@ -587,9 +598,11 @@ impl Image {
         } else {
             self.base().info.size.height
         };
+        let (samples_x, samples_y) =
+            crate::texture_cache::samples_helper::samples_log2(num_samples as i32);
         let extent = vk::Extent2D {
-            width: scaled_width.max(self.base().info.size.width),
-            height: scaled_height.max(self.base().info.size.height),
+            width: scaled_width.max(self.base().info.size.width) >> samples_x,
+            height: scaled_height.max(self.base().info.size.height) >> samples_y,
         };
         let (view, framebuffer) = if scale_up {
             (self.scale_view, self.scale_framebuffer)
@@ -602,6 +615,7 @@ impl Image {
                 view,
                 self.base().info.format,
                 extent,
+                convert_sample_count(num_samples),
             ) {
                 Ok(framebuffer) => framebuffer,
                 Err(err) => {
@@ -636,26 +650,26 @@ impl Image {
         let Some(framebuffer) = framebuffer else {
             return false;
         };
-        let src_width = if scale_up {
+        let src_width = (if scale_up {
             self.base().info.size.width
         } else {
             scaled_width
-        };
-        let src_height = if scale_up {
+        }) >> samples_x;
+        let src_height = (if scale_up {
             self.base().info.size.height
         } else {
             scaled_height
-        };
-        let dst_width = if scale_up {
+        }) >> samples_y;
+        let dst_width = (if scale_up {
             scaled_width
         } else {
             self.base().info.size.width
-        };
-        let dst_height = if scale_up {
+        }) >> samples_x;
+        let dst_height = (if scale_up {
             scaled_height
         } else {
             self.base().info.size.height
-        };
+        }) >> samples_y;
         let src_region = BlitRegion2D {
             start: BlitOffset2D { x: 0, y: 0 },
             end: BlitOffset2D {
@@ -671,14 +685,52 @@ impl Image {
             },
         };
         let src_image_view = self.blit_image_view(vk::ImageView::null(), depth_view, stencil_view);
-        runtime.blit_image_helper().blit_depth_stencil(
-            framebuffer,
-            src_image_view,
-            &dst_region,
-            &src_region,
-            BlitFilter::Point,
-            BlitOperation::SrcCopy,
-        )
+        let can_blit_stencil = has_stencil
+            && runtime
+                .vulkan_device()
+                .is_ext_shader_stencil_export_supported();
+        if num_samples > 1 {
+            runtime.blit_image_helper().blit_depth_stencil_msaa(
+                framebuffer,
+                src_image_view,
+                &dst_region,
+                &src_region,
+            )
+        } else if can_blit_stencil {
+            runtime.blit_image_helper().blit_depth_stencil(
+                framebuffer,
+                src_image_view,
+                &dst_region,
+                &src_region,
+                BlitFilter::Point,
+                BlitOperation::SrcCopy,
+            )
+        } else {
+            runtime.blit_image_helper().blit_depth(
+                framebuffer,
+                src_image_view,
+                &dst_region,
+                &src_region,
+            )
+        }
+    }
+
+    /// Port of `Image::BlitScaleHelper`: dispatches on the image aspect to the
+    /// color or depth/stencil helper blit (kept as two functions in ruzu).
+    fn blit_scale_helper(&mut self, runtime: &mut TextureCacheRuntime, scale_up: bool) -> bool {
+        if self.aspect == vk::ImageAspectFlags::COLOR {
+            return self.blit_scale_helper_color(runtime, scale_up);
+        }
+        if self.aspect.contains(vk::ImageAspectFlags::DEPTH) {
+            return self.blit_scale_helper_depth_stencil(runtime, scale_up);
+        }
+        // TODO: Use helper blits where applicable
+        self.base_mut().flags.remove(ImageFlagBits::RESCALED);
+        log::error!(
+            "Device does not support scaling format {:?}",
+            self.base().info.format
+        );
+        false
     }
 
     fn scale_up(&mut self, runtime: &mut TextureCacheRuntime, mut ignore: bool) -> bool {
@@ -713,35 +765,26 @@ impl Image {
             self.base_mut().flags.remove(ImageFlagBits::RESCALED);
             return false;
         };
-        self.current_image = scaled.handle();
+        let scaled = scaled.handle();
+        self.current_image = scaled;
         self.layout = vk::ImageLayout::GENERAL;
         if ignore {
             return true;
         }
         if runtime.needs_scale_helper(&self.base().info, self.format) {
-            if self.aspect == vk::ImageAspectFlags::COLOR {
-                return self.blit_scale_helper_color(runtime, true);
+            if !self.blit_scale_helper(runtime, true) {
+                self.current_image = self.original_image.handle();
+                return false;
             }
-            if self.aspect == (vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
-                && self.base().info.num_samples == 1
-            {
-                return self.blit_scale_helper_depth_stencil(runtime, true);
-            }
-            log::warn!(
-                "TextureCacheVulkan: ScaleUp needs unsupported BlitScaleHelper aspect for image gpu=0x{:X} format={:?}",
-                self.base().gpu_addr,
-                self.base().info.format
+        } else {
+            runtime.blit_scale(
+                self.original_image.handle(),
+                scaled,
+                self.base().info.clone(),
+                self.aspect,
+                true,
             );
-            self.base_mut().flags.remove(ImageFlagBits::RESCALED);
-            return false;
         }
-        runtime.blit_scale(
-            self.original_image.handle(),
-            scaled.handle(),
-            self.base().info.clone(),
-            self.aspect,
-            true,
-        );
         true
     }
 
@@ -766,29 +809,20 @@ impl Image {
             return true;
         }
         if runtime.needs_scale_helper(&self.base().info, self.format) {
-            if self.aspect == vk::ImageAspectFlags::COLOR {
-                return self.blit_scale_helper_color(runtime, false);
+            if !self.blit_scale_helper(runtime, false) {
+                self.current_image = scaled;
+                self.base_mut().flags.insert(ImageFlagBits::RESCALED);
+                return false;
             }
-            if self.aspect == (vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
-                && self.base().info.num_samples == 1
-            {
-                return self.blit_scale_helper_depth_stencil(runtime, false);
-            }
-            log::warn!(
-                "TextureCacheVulkan: ScaleDown needs unsupported BlitScaleHelper aspect for image gpu=0x{:X} format={:?}",
-                self.base().gpu_addr,
-                self.base().info.format
+        } else {
+            runtime.blit_scale(
+                scaled,
+                self.original_image.handle(),
+                self.base().info.clone(),
+                self.aspect,
+                false,
             );
-            self.base_mut().flags.remove(ImageFlagBits::RESCALED);
-            return false;
         }
-        runtime.blit_scale(
-            scaled,
-            self.original_image.handle(),
-            self.base().info.clone(),
-            self.aspect,
-            false,
-        );
         true
     }
 
@@ -811,51 +845,94 @@ impl Image {
             return false;
         }
         let aspect = self.aspect_mask();
+        let msaa_upload_is_depth = aspect.contains(vk::ImageAspectFlags::DEPTH);
         let wants_msaa_upload = wants_msaa_upload(&self.base().info, aspect);
 
         if wants_msaa_upload {
-            let mut temp_info = self.base().info.clone();
-            temp_info.num_samples = 1;
-            let temp_image = match runtime.create_msaa_upload_image(&temp_info) {
+            let msaa_upload_copies_stencil = msaa_upload_is_depth
+                && aspect.contains(vk::ImageAspectFlags::STENCIL)
+                && runtime
+                    .vulkan_device()
+                    .is_ext_shader_stencil_export_supported();
+            let mut upload_aspect_mask = aspect;
+            if msaa_upload_is_depth {
+                upload_aspect_mask = vk::ImageAspectFlags::DEPTH;
+                if msaa_upload_copies_stencil {
+                    upload_aspect_mask |= vk::ImageAspectFlags::STENCIL;
+                }
+            }
+            let image_ci = make_msaa_scratch_image_create_info(
+                runtime,
+                &self.base().info,
+                vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            );
+            let temp_vk_image = match runtime.acquire_msaa_scratch_image(&image_ci) {
                 Ok(image) => image,
                 Err(err) => {
                     log::warn!(
-                        "Image::upload_memory: failed to create temporary MSAA upload image: {err:?}"
+                        "Image::upload_memory: failed to acquire the MSAA scratch image: {err:?}"
                     );
                     return false;
                 }
             };
-            let temp_handle = temp_image.handle();
-            let vk_copies = transform_buffer_image_copies(copies, staging_offset, aspect);
-            let device = runtime.device().clone();
+
             runtime
                 .scheduler()
                 .request_outside_render_pass_operation_context();
+            let vk_copies =
+                transform_buffer_image_copies(copies, staging_offset, upload_aspect_mask);
+            let src_buffer = staging_buffer;
+            let vk_aspect_mask = upload_aspect_mask;
+            let device = runtime.device().clone();
             runtime.scheduler().record(move |cmd| {
                 copy_buffer_to_image(
                     &device,
                     cmd,
-                    staging_buffer,
-                    temp_handle,
-                    aspect,
+                    src_buffer,
+                    temp_vk_image,
+                    vk_aspect_mask,
                     false,
                     &vk_copies,
                 );
             });
+
             let image_copies = make_msaa_upload_copies(copies, self.base().info.num_samples);
-            let copied = runtime.copy_msaa_upload(
-                self.original_image.handle(),
-                self.base().info.format,
-                temp_handle,
-                self.base().info.format,
-                self.base().info.num_samples,
-                &image_copies,
-            );
-            runtime.keep_msaa_upload_image_alive(temp_image);
+            let format = self.base().info.format;
+            let num_samples = self.base().info.num_samples;
+            let dst_image = self.handle();
+            // SAFETY: both pointers refer to independently boxed services owned
+            // by RasterizerVulkan and remain valid for the runtime lifetime.
+            let copied = unsafe {
+                if msaa_upload_is_depth {
+                    runtime.blit_image_helper.as_mut().copy_msaa_depth(
+                        runtime.render_pass_cache.as_ref(),
+                        dst_image,
+                        format,
+                        temp_vk_image,
+                        format,
+                        num_samples,
+                        &image_copies,
+                        msaa_upload_copies_stencil,
+                        false,
+                    )
+                } else {
+                    runtime.blit_image_helper.as_mut().copy_msaa(
+                        runtime.render_pass_cache.as_ref(),
+                        dst_image,
+                        format,
+                        temp_vk_image,
+                        format,
+                        num_samples,
+                        &image_copies,
+                        false,
+                    )
+                }
+            };
+            self.initialized = true;
+            runtime.release_msaa_scratch_image(temp_vk_image);
             if !copied {
                 return false;
             }
-            self.initialized = true;
             self.layout = vk::ImageLayout::GENERAL;
             if is_rescaled && !self.scale_up(runtime, false) {
                 return false;
@@ -864,10 +941,6 @@ impl Image {
         }
 
         if self.base().info.num_samples > 1 {
-            log::warn!(
-                "MSAA upload not implemented for format {:?}",
-                self.base().info.format
-            );
             if is_rescaled && !self.scale_up(runtime, false) {
                 return false;
             }
@@ -916,6 +989,213 @@ impl Image {
         let is_rescaled = self.is_rescaled();
         if is_rescaled && !self.scale_down(runtime, false) {
             return false;
+        }
+
+        if self.base().info.num_samples > 1 {
+            if runtime.can_download_msaa(&self.base().info) {
+                let aspect_mask = self.aspect_mask();
+                let msaa_download_is_depth = aspect_mask.contains(vk::ImageAspectFlags::DEPTH);
+                let msaa_download_copies_stencil = msaa_download_is_depth
+                    && aspect_mask.contains(vk::ImageAspectFlags::STENCIL)
+                    && runtime
+                        .vulkan_device()
+                        .is_ext_shader_stencil_export_supported();
+                let mut scratch_usage = vk::ImageUsageFlags::TRANSFER_SRC;
+                if msaa_download_is_depth {
+                    scratch_usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+                } else {
+                    scratch_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+                }
+                let image_ci =
+                    make_msaa_scratch_image_create_info(runtime, &self.base().info, scratch_usage);
+                let temp_vk_image = match runtime.acquire_msaa_scratch_image(&image_ci) {
+                    Ok(image) => image,
+                    Err(err) => {
+                        log::warn!(
+                            "Image::download_memory: failed to acquire the MSAA scratch image: {err:?}"
+                        );
+                        return false;
+                    }
+                };
+
+                let temp_aspect_mask = aspect_mask;
+                let attachment_access = if msaa_download_is_depth {
+                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                } else {
+                    vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                };
+                let attachment_stage = if msaa_download_is_depth {
+                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+                } else {
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                };
+
+                let device = runtime.device().clone();
+                runtime
+                    .scheduler()
+                    .request_outside_render_pass_operation_context();
+                runtime.scheduler().record(move |cmd| unsafe {
+                    let init_barrier = vk::ImageMemoryBarrier::builder()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(attachment_access)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(temp_vk_image)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: temp_aspect_mask,
+                            base_mip_level: 0,
+                            level_count: vk::REMAINING_MIP_LEVELS,
+                            base_array_layer: 0,
+                            layer_count: vk::REMAINING_ARRAY_LAYERS,
+                        })
+                        .build();
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        attachment_stage,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[init_barrier],
+                    );
+                });
+
+                let image_copies = copies
+                    .iter()
+                    .map(|copy| ImageCopy {
+                        src_offset: copy.image_offset,
+                        dst_offset: copy.image_offset,
+                        src_subresource: copy.image_subresource,
+                        dst_subresource: copy.image_subresource,
+                        extent: copy.image_extent,
+                    })
+                    .collect::<Vec<_>>();
+
+                let format = self.base().info.format;
+                let num_samples = self.base().info.num_samples;
+                let src_image = self.handle();
+                // SAFETY: both pointers refer to independently boxed services
+                // owned by RasterizerVulkan and remain valid for the runtime
+                // lifetime.
+                let copied = unsafe {
+                    if msaa_download_is_depth {
+                        runtime.blit_image_helper.as_mut().copy_msaa_depth(
+                            runtime.render_pass_cache.as_ref(),
+                            temp_vk_image,
+                            format,
+                            src_image,
+                            format,
+                            num_samples,
+                            &image_copies,
+                            msaa_download_copies_stencil,
+                            true,
+                        )
+                    } else {
+                        runtime.blit_image_helper.as_mut().copy_msaa(
+                            runtime.render_pass_cache.as_ref(),
+                            temp_vk_image,
+                            format,
+                            src_image,
+                            format,
+                            num_samples,
+                            &image_copies,
+                            true,
+                        )
+                    }
+                };
+                if !copied {
+                    log::warn!("Image::download_memory: MSAA copy into the scratch image failed");
+                }
+
+                let buffers = buffers.to_vec();
+                let vk_copies = offsets
+                    .iter()
+                    .map(|offset| transform_buffer_image_copies(copies, *offset, aspect_mask))
+                    .collect::<Vec<_>>();
+                let image = temp_vk_image;
+                let device = runtime.device().clone();
+                runtime
+                    .scheduler()
+                    .request_outside_render_pass_operation_context();
+                runtime.scheduler().record(move |cmd| unsafe {
+                    let read_barrier = vk::ImageMemoryBarrier::builder()
+                        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(image)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask,
+                            base_mip_level: 0,
+                            level_count: vk::REMAINING_MIP_LEVELS,
+                            base_array_layer: 0,
+                            layer_count: vk::REMAINING_ARRAY_LAYERS,
+                        })
+                        .build();
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[read_barrier],
+                    );
+
+                    for (buffer, copies) in buffers.iter().zip(vk_copies.iter()) {
+                        device.cmd_copy_image_to_buffer(
+                            cmd,
+                            image,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            *buffer,
+                            copies,
+                        );
+                    }
+
+                    let memory_write_barrier = vk::MemoryBarrier::builder()
+                        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                        )
+                        .build();
+                    let image_write_barrier = vk::ImageMemoryBarrier::builder()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(image)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask,
+                            base_mip_level: 0,
+                            level_count: vk::REMAINING_MIP_LEVELS,
+                            base_array_layer: 0,
+                            layer_count: vk::REMAINING_ARRAY_LAYERS,
+                        })
+                        .build();
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        PIPELINE_STAGE_GRAPHICS_COMPUTE,
+                        vk::DependencyFlags::empty(),
+                        &[memory_write_barrier],
+                        &[],
+                        &[image_write_barrier],
+                    );
+                });
+                runtime.release_msaa_scratch_image(temp_vk_image);
+            }
+            if is_rescaled && !self.scale_up(runtime, true) {
+                return false;
+            }
+            return true;
         }
 
         let image = self.original_image.handle();
@@ -1210,20 +1490,8 @@ impl Drop for ImageView {
 }
 
 /// Backend-owned framebuffer corresponding to upstream `Vulkan::Framebuffer`.
-struct PendingImageViews {
-    device: ash::Device,
-    handles: Vec<vk::ImageView>,
-}
-
-impl Drop for PendingImageViews {
-    fn drop(&mut self) {
-        unsafe {
-            for view in self.handles.drain(..) {
-                self.device.destroy_image_view(view, None);
-            }
-        }
-    }
-}
+/// Upstream `Framebuffer::NUM_MEMOIZED_RENDER_PASS_VARIANTS`.
+const NUM_MEMOIZED_RENDER_PASS_VARIANTS: usize = 8;
 
 pub struct Framebuffer {
     device: Option<ash::Device>,
@@ -1239,11 +1507,16 @@ pub struct Framebuffer {
     has_depth: bool,
     has_stencil: bool,
     is_rescaled: bool,
-    resolve_images: Vec<AllocatedImage>,
-    resolve_image_views: Vec<vk::ImageView>,
+    resolve_shadow_images: [vk::Image; NUM_RT + 1],
+    num_resolve_shadows: u32,
+    runtime_ptr: Option<NonNull<TextureCacheRuntime>>,
     render_pass_key: RenderPassKey,
     render_pass_cache: NonNull<RenderPassCache>,
     discard_msaa_color: bool,
+    discard_msaa_depth_stencil: bool,
+    variant_keys: std::cell::Cell<[u32; NUM_MEMOIZED_RENDER_PASS_VARIANTS]>,
+    variant_render_passes: std::cell::Cell<[vk::RenderPass; NUM_MEMOIZED_RENDER_PASS_VARIANTS]>,
+    num_memoized_variants: std::cell::Cell<u32>,
 }
 
 impl Drop for Framebuffer {
@@ -1252,9 +1525,6 @@ impl Drop for Framebuffer {
             return;
         };
         unsafe {
-            for view in self.resolve_image_views.drain(..) {
-                device.destroy_image_view(view, None);
-            }
             if self.framebuffer != vk::Framebuffer::null() {
                 device.destroy_framebuffer(self.framebuffer, None);
                 self.framebuffer = vk::Framebuffer::null();
@@ -1272,7 +1542,7 @@ impl Framebuffer {
         depth_buffer: Option<NonNull<ImageView>>,
         key: &RenderTargets,
     ) -> Result<Box<Self>, vk::Result> {
-        let mut attachments = SmallVec::<[vk::ImageView; NUM_RT + 1]>::new();
+        let mut attachments = SmallVec::<[vk::ImageView; NUM_RT * 2 + 2]>::new();
         let mut render_pass_key = RenderPassKey::default();
         let mut num_layers = 1i32;
         let mut width = u32::MAX;
@@ -1305,8 +1575,11 @@ impl Framebuffer {
             render_pass_key.color_formats[index] = base.format;
             num_layers = num_layers.max(base.range.extent.layers);
             images[num_images] = color_buffer.image_handle();
-            image_ranges[num_images] =
-                make_image_view_subresource_range(image_aspect_mask(base.format), base.range, base.flags);
+            image_ranges[num_images] = make_image_view_subresource_range(
+                image_aspect_mask(base.format),
+                base.range,
+                base.flags,
+            );
             rt_map[index] = num_images;
             samples = color_buffer.samples();
             num_images += 1;
@@ -1315,6 +1588,8 @@ impl Framebuffer {
 
         let mut has_depth = false;
         let mut has_stencil = false;
+        let mut depth_image = vk::Image::null();
+        let mut depth_aspect_mask = vk::ImageAspectFlags::empty();
         if let Some(depth_buffer) = depth_buffer {
             // SAFETY: the typed image-view slot outlives cached framebuffers.
             let depth_buffer = unsafe { depth_buffer.as_ref() };
@@ -1333,8 +1608,11 @@ impl Framebuffer {
             render_pass_key.depth_format = base.format;
             num_layers = num_layers.max(base.range.extent.layers);
             images[num_images] = depth_buffer.image_handle();
-            let subresource_range =
-                make_image_view_subresource_range(image_aspect_mask(base.format), base.range, base.flags);
+            let subresource_range = make_image_view_subresource_range(
+                image_aspect_mask(base.format),
+                base.range,
+                base.flags,
+            );
             image_ranges[num_images] = subresource_range;
             samples = depth_buffer.samples();
             num_images += 1;
@@ -1344,17 +1622,35 @@ impl Framebuffer {
             has_stencil = subresource_range
                 .aspect_mask
                 .contains(vk::ImageAspectFlags::STENCIL);
+            depth_image = depth_buffer.image_handle();
+            depth_aspect_mask = subresource_range.aspect_mask;
         } else {
             render_pass_key.depth_format = PixelFormat::Invalid;
         }
 
         render_pass_key.samples = samples;
-        let do_resolve_color = samples != vk::SampleCountFlags::TYPE_1
+        let do_resolve_color = ENABLE_MSAA_TILER_RESOLVE
+            && samples != vk::SampleCountFlags::TYPE_1
             && num_colors > 0
             && runtime.vulkan_device().is_tiler();
         render_pass_key.resolve_color = do_resolve_color;
+
+        let do_resolve_depth_stencil = ENABLE_MSAA_TILER_RESOLVE
+            && samples != vk::SampleCountFlags::TYPE_1
+            && depth_image != vk::Image::null()
+            && runtime.vulkan_device().is_tiler()
+            && supports_depth_stencil_resolve(
+                runtime.vulkan_device(),
+                render_pass_key.depth_format,
+            );
+        render_pass_key.resolve_depth_stencil = do_resolve_depth_stencil;
+
         let discard_msaa_color =
             ENABLE_MSAA_RESOLVE_CONSUME && ENABLE_MSAA_COLOR_DISCARD && do_resolve_color;
+        let discard_msaa_depth_stencil = ENABLE_MSAA_RESOLVE_CONSUME
+            && ENABLE_MSAA_DEPTH_STENCIL_DISCARD
+            && do_resolve_depth_stencil;
+
         let render_pass = runtime.render_pass_cache().get(&render_pass_key)?;
         let render_pass_cache = runtime.render_pass_cache;
         let mut render_area = vk::Extent2D {
@@ -1371,11 +1667,8 @@ impl Framebuffer {
         }
 
         let layers = num_layers.max(1) as u32;
-        let mut resolve_images = Vec::new();
-        let mut pending_resolve_views = PendingImageViews {
-            device: runtime.device().clone(),
-            handles: Vec::new(),
-        };
+        let mut resolve_shadow_images = [vk::Image::null(); NUM_RT + 1];
+        let mut num_resolve_shadows = 0u32;
         if do_resolve_color {
             for index in 0..NUM_RT {
                 let format = render_pass_key.color_formats[index];
@@ -1383,62 +1676,30 @@ impl Framebuffer {
                     continue;
                 }
                 let vk_format = runtime.surface_format(format, true);
-                if ENABLE_MSAA_RESOLVE_CONSUME {
-                    let msaa_image = images[rt_map[index]];
-                    attachments.push(runtime.get_or_create_resolve_shadow(
-                        msaa_image,
-                        vk_format,
-                        render_area,
-                        layers,
-                    )?);
-                    continue;
-                }
-
-                let image_info = vk::ImageCreateInfo::builder()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(vk_format)
-                    .extent(vk::Extent3D {
-                        width: render_area.width,
-                        height: render_area.height,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(layers)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(
-                        vk::ImageUsageFlags::COLOR_ATTACHMENT
-                            | vk::ImageUsageFlags::SAMPLED
-                            | vk::ImageUsageFlags::TRANSFER_SRC,
-                    )
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .build();
-                let resolve_image = runtime
-                    .memory_allocator()
-                    .create_image(&image_info)
-                    .map_err(|error| error.result)?;
-                let view_info = vk::ImageViewCreateInfo::builder()
-                    .image(resolve_image.handle())
-                    .view_type(if layers > 1 {
-                        vk::ImageViewType::TYPE_2D_ARRAY
-                    } else {
-                        vk::ImageViewType::TYPE_2D
-                    })
-                    .format(vk_format)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: layers,
-                    })
-                    .build();
-                let resolve_view = unsafe { runtime.device().create_image_view(&view_info, None) }?;
-                attachments.push(resolve_view);
-                resolve_images.push(resolve_image);
-                pending_resolve_views.handles.push(resolve_view);
+                let msaa_image = images[rt_map[index]];
+                attachments.push(runtime.get_or_create_resolve_shadow(
+                    msaa_image,
+                    vk_format,
+                    render_area,
+                    layers,
+                    vk::ImageAspectFlags::COLOR,
+                )?);
+                resolve_shadow_images[num_resolve_shadows as usize] = msaa_image;
+                num_resolve_shadows += 1;
             }
+        }
+
+        if do_resolve_depth_stencil {
+            let vk_format = runtime.surface_format(render_pass_key.depth_format, true);
+            attachments.push(runtime.get_or_create_resolve_shadow(
+                depth_image,
+                vk_format,
+                render_area,
+                layers,
+                depth_aspect_mask,
+            )?);
+            resolve_shadow_images[num_resolve_shadows as usize] = depth_image;
+            num_resolve_shadows += 1;
         }
 
         let framebuffer_info = vk::FramebufferCreateInfo::builder()
@@ -1461,7 +1722,6 @@ impl Framebuffer {
                 return Err(error.result);
             }
         }
-        let resolve_image_views = std::mem::take(&mut pending_resolve_views.handles);
 
         Ok(Box::new(Self {
             device: Some(runtime.device().clone()),
@@ -1477,11 +1737,18 @@ impl Framebuffer {
             has_depth,
             has_stencil,
             is_rescaled: key.is_rescaled,
-            resolve_images,
-            resolve_image_views,
+            resolve_shadow_images,
+            num_resolve_shadows,
+            runtime_ptr: Some(NonNull::from(&mut *runtime)),
             render_pass_key,
             render_pass_cache,
             discard_msaa_color,
+            discard_msaa_depth_stencil,
+            variant_keys: std::cell::Cell::new([0; NUM_MEMOIZED_RENDER_PASS_VARIANTS]),
+            variant_render_passes: std::cell::Cell::new(
+                [vk::RenderPass::null(); NUM_MEMOIZED_RENDER_PASS_VARIANTS],
+            ),
+            num_memoized_variants: std::cell::Cell::new(0),
         }))
     }
 
@@ -1491,40 +1758,94 @@ impl Framebuffer {
         }
     }
 
+    /// Port of `Framebuffer::MarkResolveShadowsUpToDate`: records that a
+    /// render pass has begun, so its resolve attachments will hold valid
+    /// contents once it ends.
+    pub fn mark_resolve_shadows_up_to_date(&self) {
+        let Some(mut runtime_ptr) = self.runtime_ptr else {
+            return;
+        };
+        // SAFETY: the runtime is boxed by the texture cache, outlives every
+        // cached framebuffer, and no Rust reference to it is live while the
+        // scheduler begins a render pass (upstream keeps the same raw
+        // `TextureCacheRuntime*` in the framebuffer).
+        let runtime = unsafe { runtime_ptr.as_mut() };
+        for index in 0..self.num_resolve_shadows as usize {
+            runtime.mark_resolve_shadow_up_to_date(self.resolve_shadow_images[index]);
+        }
+    }
+
     /// Port of `Framebuffer::RenderPassVariant`.
     pub fn render_pass_variant(
         &self,
         color_clear_mask: u32,
         depth_stencil_clear: bool,
         color_discard_mask: u32,
+        depth_stencil_discard: bool,
     ) -> Result<vk::RenderPass, vk::Result> {
-        if color_clear_mask == 0 && !depth_stencil_clear && color_discard_mask == 0 {
+        if color_clear_mask == 0
+            && !depth_stencil_clear
+            && color_discard_mask == 0
+            && !depth_stencil_discard
+        {
             return Ok(self.render_pass);
+        }
+        let variant_key = render_pass_variant_key(
+            color_clear_mask,
+            depth_stencil_clear,
+            color_discard_mask,
+            depth_stencil_discard,
+        );
+        let mut variant_keys = self.variant_keys.get();
+        let mut variant_render_passes = self.variant_render_passes.get();
+        let num_memoized_variants = self.num_memoized_variants.get() as usize;
+        for index in 0..num_memoized_variants {
+            if variant_keys[index] == variant_key {
+                return Ok(variant_render_passes[index]);
+            }
         }
         let mut key = self.render_pass_key.clone();
         key.color_clear_mask = color_clear_mask;
         key.depth_stencil_clear = depth_stencil_clear;
         key.color_discard_mask = color_discard_mask;
+        key.depth_stencil_discard = depth_stencil_discard;
         // SAFETY: the boxed cache outlives all framebuffer owners.
-        unsafe { self.render_pass_cache.as_ref() }.get(&key)
-    }
-
-    /// Port of `Vulkan::Framebuffer::HasResolveColor`.
-    pub fn has_resolve_color(&self) -> bool {
-        !self.resolve_images.is_empty()
-    }
-
-    /// Port of `Vulkan::Framebuffer::ResolveColorImage`.
-    pub fn resolve_color_image(&self, index: usize) -> vk::Image {
-        self.resolve_images
-            .get(index)
-            .map_or(vk::Image::null(), AllocatedImage::handle)
+        let variant = unsafe { self.render_pass_cache.as_ref() }.get(&key)?;
+        if num_memoized_variants < NUM_MEMOIZED_RENDER_PASS_VARIANTS {
+            variant_keys[num_memoized_variants] = variant_key;
+            variant_render_passes[num_memoized_variants] = variant;
+            self.variant_keys.set(variant_keys);
+            self.variant_render_passes.set(variant_render_passes);
+            self.num_memoized_variants
+                .set(num_memoized_variants as u32 + 1);
+        }
+        Ok(variant)
     }
 
     /// Port of `Vulkan::Framebuffer::DiscardsMsaaColor`.
     pub fn discards_msaa_color(&self) -> bool {
         self.discard_msaa_color
     }
+
+    /// Port of `Vulkan::Framebuffer::DiscardsMsaaDepthStencil`.
+    pub fn discards_msaa_depth_stencil(&self) -> bool {
+        self.discard_msaa_depth_stencil
+    }
+}
+
+/// Memoization key of `Framebuffer::RenderPassVariant`
+/// (`static_assert(NUM_RT <= 8)` upstream).
+fn render_pass_variant_key(
+    color_clear_mask: u32,
+    depth_stencil_clear: bool,
+    color_discard_mask: u32,
+    depth_stencil_discard: bool,
+) -> u32 {
+    const _: () = assert!(NUM_RT <= 8);
+    color_clear_mask
+        | (color_discard_mask << 8)
+        | ((depth_stencil_clear as u32) << 16)
+        | ((depth_stencil_discard as u32) << 17)
 }
 
 /// Upstream `Sampler::VariantKey`: what a sampler variant changes relative to
@@ -1765,7 +2086,10 @@ impl CachedSampler {
         if !custom_border {
             create_info = create_info.border_color(convert_border_color(color));
         }
-        let device = self.device.as_ref().expect("CachedSampler requires a device");
+        let device = self
+            .device
+            .as_ref()
+            .expect("CachedSampler requires a device");
         let handle = unsafe { device.create_sampler(&create_info.build(), None)? };
         self.variants.borrow_mut().push((key, handle));
         Ok(handle)
@@ -1848,13 +2172,26 @@ impl RenderTargetFramebuffer {
         color_clear_mask: u32,
         depth_stencil_clear: bool,
         color_discard_mask: u32,
+        depth_stencil_discard: bool,
     ) -> Result<vk::RenderPass, vk::Result> {
-        self.owner()
-            .render_pass_variant(color_clear_mask, depth_stencil_clear, color_discard_mask)
+        self.owner().render_pass_variant(
+            color_clear_mask,
+            depth_stencil_clear,
+            color_discard_mask,
+            depth_stencil_discard,
+        )
     }
 
     pub fn discards_msaa_color(&self) -> bool {
         self.owner().discards_msaa_color()
+    }
+
+    pub fn discards_msaa_depth_stencil(&self) -> bool {
+        self.owner().discards_msaa_depth_stencil()
+    }
+
+    pub fn mark_resolve_shadows_up_to_date(&self) {
+        self.owner().mark_resolve_shadows_up_to_date();
     }
 
     /// Port of `Vulkan::Framebuffer::HasAspectColorBit`.
@@ -1866,6 +2203,7 @@ impl RenderTargetFramebuffer {
     }
 
     pub fn blit_framebuffer_info(&self) -> BlitFramebufferInfo {
+        let owner = self.owner();
         BlitFramebufferInfo {
             framebuffer: self.handle(),
             render_pass: self.render_pass(),
@@ -1875,6 +2213,8 @@ impl RenderTargetFramebuffer {
             num_images: self.num_images(),
             samples: self.samples(),
             has_stencil: self.has_aspect_stencil_bit(),
+            resolve_shadow_images: owner.resolve_shadow_images,
+            num_resolve_shadows: owner.num_resolve_shadows as usize,
         }
     }
 }
@@ -1910,7 +2250,46 @@ struct ResolveShadow {
     format: vk::Format,
     extent: vk::Extent2D,
     layers: u32,
+    aspect_mask: vk::ImageAspectFlags,
     up_to_date: bool,
+}
+
+/// Port of `TextureCacheRuntime::MsaaScratchKey`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MsaaScratchKey {
+    format: vk::Format,
+    image_type: vk::ImageType,
+    width: u32,
+    height: u32,
+    depth: u32,
+    levels: u32,
+    layers: u32,
+    usage: vk::ImageUsageFlags,
+    flags: vk::ImageCreateFlags,
+}
+
+impl MsaaScratchKey {
+    fn from_create_info(image_ci: &vk::ImageCreateInfo) -> Self {
+        Self {
+            format: image_ci.format,
+            image_type: image_ci.image_type,
+            width: image_ci.extent.width,
+            height: image_ci.extent.height,
+            depth: image_ci.extent.depth,
+            levels: image_ci.mip_levels,
+            layers: image_ci.array_layers,
+            usage: image_ci.usage,
+            flags: image_ci.flags,
+        }
+    }
+}
+
+/// Port of `TextureCacheRuntime::MsaaScratchImage`.
+struct MsaaScratchImage {
+    key: MsaaScratchKey,
+    image: AllocatedImage,
+    tick: u64,
+    unused_frames: u32,
 }
 
 pub struct TextureCacheRuntime {
@@ -1935,12 +2314,12 @@ pub struct TextureCacheRuntime {
     buffers: [Option<AllocatedBuffer>; Self::INDEXING_SLOTS],
     device_memory_info: DeviceMemoryInfo,
     sentenced_resources: Vec<SentencedVkResource>,
-    pending_msaa_images: Vec<(u64, AllocatedImage)>,
+    msaa_scratch_images: Vec<MsaaScratchImage>,
     resolve_shadows: HashMap<vk::Image, ResolveShadow, BuildUnorderedDenseHasher>,
+    pending_resolve_shadows: Vec<(u64, ResolveShadow)>,
     current_tick: u64,
     optimal_bcn_supported: bool,
     optimal_astc_supported: bool,
-    cant_blit_msaa: bool,
     image_format_list_supported: bool,
     must_emulate_bgr565: bool,
     ext_4444_formats_supported: bool,
@@ -1970,7 +2349,6 @@ impl TextureCacheRuntime {
         render_pass_cache: &mut RenderPassCache,
         descriptor_pool: &mut DescriptorPool,
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
-        cant_blit_msaa: bool,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         must_emulate_bgr565: bool,
@@ -2049,12 +2427,12 @@ impl TextureCacheRuntime {
             buffers: std::array::from_fn(|_| None),
             device_memory_info,
             sentenced_resources: Vec::new(),
-            pending_msaa_images: Vec::new(),
+            msaa_scratch_images: Vec::new(),
             resolve_shadows: HashMap::default(),
+            pending_resolve_shadows: Vec::new(),
             current_tick: 0,
             optimal_bcn_supported,
             optimal_astc_supported,
-            cant_blit_msaa,
             image_format_list_supported,
             must_emulate_bgr565,
             ext_4444_formats_supported,
@@ -2151,6 +2529,16 @@ impl TextureCacheRuntime {
     fn blit_image_helper(&mut self) -> &mut BlitImageHelper {
         // SAFETY: see `scheduler`.
         unsafe { self.blit_image_helper.as_mut() }
+    }
+
+    fn install_blit_resolve_shadow_hook(&mut self) {
+        let mut helper = self.blit_image_helper;
+        let runtime = NonNull::from(self).cast::<()>();
+        unsafe {
+            helper
+                .as_mut()
+                .set_resolve_shadow_hook(runtime, mark_resolve_shadows_thunk);
+        }
     }
 
     fn upload_staging_buffer(&mut self, size: vk::DeviceSize, deferred: bool) -> StagingBufferRef {
@@ -2375,20 +2763,27 @@ impl TextureCacheRuntime {
         format: vk::Format,
         extent: vk::Extent2D,
         layers: u32,
+        aspect_mask: vk::ImageAspectFlags,
     ) -> Result<vk::ImageView, vk::Result> {
-        let reusable = self.resolve_shadows.get(&msaa_image).is_some_and(|shadow| {
-            shadow.format == format
+        if let Some(shadow) = self.resolve_shadows.get(&msaa_image) {
+            if shadow.format == format
                 && shadow.extent.width == extent.width
                 && shadow.extent.height == extent.height
                 && shadow.layers == layers
-        });
-        if reusable {
-            let shadow = self.resolve_shadows.get_mut(&msaa_image).unwrap();
-            shadow.up_to_date = true;
-            return Ok(shadow.view);
+                && shadow.aspect_mask == aspect_mask
+            {
+                return Ok(shadow.view);
+            }
+        }
+        let mut shadow_usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        if aspect_mask.intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL) {
+            shadow_usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        } else {
+            shadow_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
         }
         if let Some(old) = self.resolve_shadows.remove(&msaa_image) {
-            unsafe { self.device.destroy_image_view(old.view, None) };
+            let tick = self.scheduler().current_tick();
+            self.pending_resolve_shadows.push((tick, old));
         }
 
         let image_info = vk::ImageCreateInfo::builder()
@@ -2403,11 +2798,7 @@ impl TextureCacheRuntime {
             .array_layers(layers)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(
-                vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_SRC,
-            )
+            .usage(shadow_usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .build();
@@ -2424,7 +2815,7 @@ impl TextureCacheRuntime {
             })
             .format(format)
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
@@ -2440,27 +2831,98 @@ impl TextureCacheRuntime {
                 format,
                 extent,
                 layers,
-                up_to_date: true,
+                aspect_mask,
+                up_to_date: false,
             },
         );
         Ok(view)
     }
 
+    /// Port of `TextureCacheRuntime::GetValidResolveShadow`.
     fn get_valid_resolve_shadow(&self, msaa_image: vk::Image) -> Option<&ResolveShadow> {
         self.resolve_shadows
             .get(&msaa_image)
             .filter(|shadow| shadow.up_to_date)
     }
 
+    /// Port of `TextureCacheRuntime::MarkResolveShadowUpToDate`.
+    fn mark_resolve_shadow_up_to_date(&mut self, msaa_image: vk::Image) {
+        if let Some(shadow) = self.resolve_shadows.get_mut(&msaa_image) {
+            shadow.up_to_date = true;
+        }
+    }
+
+    /// Port of `TextureCacheRuntime::InvalidateResolveShadow`.
     fn invalidate_resolve_shadow(&mut self, msaa_image: vk::Image) {
         if let Some(shadow) = self.resolve_shadows.get_mut(&msaa_image) {
             shadow.up_to_date = false;
         }
     }
 
+    /// Port of `TextureCacheRuntime::EraseResolveShadow`: the shadow is
+    /// retired once the GPU tick that may still reference it is free.
     fn erase_resolve_shadow(&mut self, msaa_image: vk::Image) {
-        if let Some(shadow) = self.resolve_shadows.remove(&msaa_image) {
-            unsafe { self.device.destroy_image_view(shadow.view, None) };
+        let Some(shadow) = self.resolve_shadows.remove(&msaa_image) else {
+            return;
+        };
+        let tick = self.scheduler().current_tick();
+        self.pending_resolve_shadows.push((tick, shadow));
+    }
+
+    /// Port of `TextureCacheRuntime::CanDownloadMsaa`.
+    fn can_download_msaa(&self, info: &ImageInfo) -> bool {
+        can_download_msaa_aspect(
+            image_aspect_mask(info.format),
+            self.vulkan_device()
+                .is_ext_shader_stencil_export_supported(),
+        )
+    }
+
+    /// Port of `TextureCacheRuntime::FlushDeferredClear`.
+    fn flush_deferred_clear(&mut self) {
+        self.scheduler().flush_deferred_clear();
+    }
+
+    /// Port of `TextureCacheRuntime::AcquireMsaaScratchImage`: reuses a
+    /// GPU-free scratch image with the same key or allocates a new one.
+    fn acquire_msaa_scratch_image(
+        &mut self,
+        image_ci: &vk::ImageCreateInfo,
+    ) -> Result<vk::Image, vk::Result> {
+        let key = MsaaScratchKey::from_create_info(image_ci);
+        // SAFETY: see `scheduler()`; only the scheduler field is borrowed here
+        // so the scratch list can be mutated alongside.
+        let scheduler = unsafe { self.scheduler.as_ref() };
+        for scratch in &mut self.msaa_scratch_images {
+            if scratch.key != key || !scheduler.is_free(scratch.tick) {
+                continue;
+            }
+            scratch.tick = u64::MAX;
+            scratch.unused_frames = 0;
+            return Ok(scratch.image.handle());
+        }
+        let image = self
+            .memory_allocator()
+            .create_image(image_ci)
+            .map_err(|error| error.result)?;
+        let handle = image.handle();
+        self.msaa_scratch_images.push(MsaaScratchImage {
+            key,
+            image,
+            tick: u64::MAX,
+            unused_frames: 0,
+        });
+        Ok(handle)
+    }
+
+    /// Port of `TextureCacheRuntime::ReleaseMsaaScratchImage`.
+    fn release_msaa_scratch_image(&mut self, image: vk::Image) {
+        let tick = self.scheduler().current_tick();
+        for scratch in &mut self.msaa_scratch_images {
+            if scratch.image.handle() == image {
+                scratch.tick = tick;
+                return;
+            }
         }
     }
 
@@ -2826,11 +3288,16 @@ impl TextureCacheRuntime {
         if aspect_mask == (vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
             && !self.is_blit_depth_stencil_supported(src.base().format)
         {
+            // Use shader-based depth/stencil blits if hardware doesn't support
+            // the format. MSAA resolves (MSAA->single) use vkCmdResolveImage.
             assert_fail_soft(
                 !(is_src_msaa || is_dst_msaa),
                 "MSAA depth/stencil helper blit is not implemented",
             );
-            if src.depth_view().is_err() || src.stencil_view().is_err() {
+            if src.depth_view().is_err() {
+                return false;
+            }
+            if self.shader_stencil_export_supported && src.stencil_view().is_err() {
                 return false;
             }
             let src_image_view = blit_image_view_from_backend(src, false);
@@ -2863,18 +3330,38 @@ impl TextureCacheRuntime {
                 &src_region,
             );
         }
-        if is_msaa_to_msaa && self.cant_blit_msaa {
-            log::warn!(
-                "TextureCacheRuntime::blit_image: MSAA depth/stencil blit is unsupported on this driver"
+        if is_msaa_to_msaa {
+            if src.depth_view().is_err() {
+                return false;
+            }
+            let blit_stencil = dst_framebuffer.has_stencil && self.shader_stencil_export_supported;
+            if blit_stencil && src.stencil_view().is_err() {
+                return false;
+            }
+            let src_image_view = blit_image_view_from_backend(src, false);
+            return self.blit_image_helper().blit_depth_stencil_msaa(
+                dst_framebuffer,
+                src_image_view,
+                &dst_region,
+                &src_region,
             );
-            return false;
+        }
+
+        let is_resolve = is_src_msaa && !is_dst_msaa;
+        if is_resolve && !have_same_extent(&dst_region, &src_region) {
+            let src_image_view = blit_image_view_from_backend(src, false);
+            return self.blit_image_helper().blit_color_msaa(
+                dst_framebuffer,
+                src_image_view,
+                &dst_region,
+                &src_region,
+            );
         }
 
         let dst_image = dst.image_handle();
         let src_image = src.image_handle();
         let dst_layers = make_image_subresource_layers_from_view(dst);
         let src_layers = make_image_subresource_layers_from_view(src);
-        let is_resolve = is_src_msaa && !is_dst_msaa;
         let device = self.device.clone();
         let scheduler = self.scheduler();
         scheduler.request_outside_render_pass_operation_context();
@@ -2984,6 +3471,7 @@ impl TextureCacheRuntime {
         true
     }
 
+    /// Port of `TextureCacheRuntime::ConvertImage`.
     fn convert_image(
         &mut self,
         dst_framebuffer: BlitFramebufferInfo,
@@ -2991,8 +3479,87 @@ impl TextureCacheRuntime {
         src_format: PixelFormat,
         src_view: BlitImageView,
     ) -> bool {
+        if dst_framebuffer.render_pass == vk::RenderPass::null() {
+            // Upstream returns silently without a render pass.
+            return true;
+        }
+
+        match dst_format {
+            PixelFormat::R16Unorm if src_format == PixelFormat::D16Unorm => {
+                return self
+                    .blit_image_helper()
+                    .convert_d16_to_r16(dst_framebuffer, src_view);
+            }
+            PixelFormat::A8B8G8R8Srgb | PixelFormat::B8G8R8A8Srgb | PixelFormat::B8G8R8A8Unorm
+                if src_format == PixelFormat::D32Float =>
+            {
+                return self
+                    .blit_image_helper()
+                    .convert_d32f_to_abgr8(dst_framebuffer, src_view);
+            }
+            PixelFormat::A8B8G8R8Unorm if src_format == PixelFormat::S8UintD24Unorm => {
+                return self
+                    .blit_image_helper()
+                    .convert_d24s8_to_abgr8(dst_framebuffer, src_view);
+            }
+            PixelFormat::A8B8G8R8Unorm if src_format == PixelFormat::D24UnormS8Uint => {
+                return self
+                    .blit_image_helper()
+                    .convert_s8d24_to_abgr8(dst_framebuffer, src_view);
+            }
+            PixelFormat::A8B8G8R8Unorm if src_format == PixelFormat::D32Float => {
+                return self
+                    .blit_image_helper()
+                    .convert_d32f_to_abgr8(dst_framebuffer, src_view);
+            }
+            PixelFormat::R32Float if src_format == PixelFormat::D32Float => {
+                return self
+                    .blit_image_helper()
+                    .convert_d32_to_r32(dst_framebuffer, src_view);
+            }
+            PixelFormat::D16Unorm if src_format == PixelFormat::R16Unorm => {
+                return self
+                    .blit_image_helper()
+                    .convert_r16_to_d16(dst_framebuffer, src_view);
+            }
+            PixelFormat::S8UintD24Unorm
+                if src_format == PixelFormat::A8B8G8R8Unorm
+                    || src_format == PixelFormat::B8G8R8A8Unorm =>
+            {
+                return self
+                    .blit_image_helper()
+                    .convert_abgr8_to_d24s8(dst_framebuffer, src_view);
+            }
+            PixelFormat::D32Float
+                if src_format == PixelFormat::A8B8G8R8Unorm
+                    || src_format == PixelFormat::B8G8R8A8Unorm
+                    || src_format == PixelFormat::A8B8G8R8Srgb
+                    || src_format == PixelFormat::B8G8R8A8Srgb =>
+            {
+                return self
+                    .blit_image_helper()
+                    .convert_abgr8_to_d32f(dst_framebuffer, src_view);
+            }
+            PixelFormat::D32Float if src_format == PixelFormat::R32Float => {
+                return self
+                    .blit_image_helper()
+                    .convert_r32_to_d32(dst_framebuffer, src_view);
+            }
+            PixelFormat::D24UnormS8Uint
+                if src_format == PixelFormat::A8B8G8R8Unorm
+                    || src_format == PixelFormat::B8G8R8A8Unorm
+                    || src_format == PixelFormat::A8B8G8R8Srgb
+                    || src_format == PixelFormat::B8G8R8A8Srgb =>
+            {
+                return self
+                    .blit_image_helper()
+                    .convert_abgr8_to_d24s8(dst_framebuffer, src_view);
+            }
+            _ => {}
+        }
+
         if src_format == PixelFormat::D32Float
-            && color_blit_from_d32_destination(dst_format)
+            && crate::surface::get_format_type(dst_format) == SurfaceType::ColorTexture
             && (dst_format == PixelFormat::B5G6R5Unorm
                 || *common::settings::values().fix_bloom_effects.get_value())
         {
@@ -3012,62 +3579,13 @@ impl TextureCacheRuntime {
                 BlitOperation::SrcCopy,
             );
         }
-        match dst_format {
-            PixelFormat::R16Unorm if src_format == PixelFormat::D16Unorm => self
-                .blit_image_helper()
-                .convert_d16_to_r16(dst_framebuffer, src_view),
-            PixelFormat::A8B8G8R8Srgb if src_format == PixelFormat::D32Float => self
-                .blit_image_helper()
-                .convert_d32f_to_abgr8(dst_framebuffer, src_view),
-            PixelFormat::A8B8G8R8Unorm if src_format == PixelFormat::S8UintD24Unorm => self
-                .blit_image_helper()
-                .convert_d24s8_to_abgr8(dst_framebuffer, src_view),
-            PixelFormat::A8B8G8R8Unorm if src_format == PixelFormat::D24UnormS8Uint => self
-                .blit_image_helper()
-                .convert_s8d24_to_abgr8(dst_framebuffer, src_view),
-            PixelFormat::A8B8G8R8Unorm if src_format == PixelFormat::D32Float => self
-                .blit_image_helper()
-                .convert_d32f_to_abgr8(dst_framebuffer, src_view),
-            PixelFormat::B8G8R8A8Srgb if src_format == PixelFormat::D32Float => self
-                .blit_image_helper()
-                .convert_d32f_to_abgr8(dst_framebuffer, src_view),
-            PixelFormat::B8G8R8A8Unorm if src_format == PixelFormat::D32Float => self
-                .blit_image_helper()
-                .convert_d32f_to_abgr8(dst_framebuffer, src_view),
-            PixelFormat::R32Float if src_format == PixelFormat::D32Float => self
-                .blit_image_helper()
-                .convert_d32_to_r32(dst_framebuffer, src_view),
-            PixelFormat::D16Unorm if src_format == PixelFormat::R16Unorm => self
-                .blit_image_helper()
-                .convert_r16_to_d16(dst_framebuffer, src_view),
-            PixelFormat::S8UintD24Unorm
-                if src_format == PixelFormat::A8B8G8R8Unorm
-                    || src_format == PixelFormat::B8G8R8A8Unorm =>
-            {
-                self.blit_image_helper()
-                    .convert_abgr8_to_d24s8(dst_framebuffer, src_view)
-            }
-            PixelFormat::D32Float
-                if src_format == PixelFormat::A8B8G8R8Unorm
-                    || src_format == PixelFormat::B8G8R8A8Unorm
-                    || src_format == PixelFormat::A8B8G8R8Srgb
-                    || src_format == PixelFormat::B8G8R8A8Srgb =>
-            {
-                self.blit_image_helper()
-                    .convert_abgr8_to_d32f(dst_framebuffer, src_view)
-            }
-            PixelFormat::D32Float if src_format == PixelFormat::R32Float => self
-                .blit_image_helper()
-                .convert_r32_to_d32(dst_framebuffer, src_view),
-            _ => {
-                log::warn!(
-                    "TextureCacheRuntime::convert_image: unimplemented format copy from {:?} to {:?}",
-                    src_format,
-                    dst_format
-                );
-                false
-            }
-        }
+
+        log::debug!(
+            "Unimplemented texture conversion from {:?} to {:?} format type",
+            src_format,
+            dst_format
+        );
+        false
     }
 
     fn is_blit_depth_stencil_supported(&self, format: PixelFormat) -> bool {
@@ -3129,11 +3647,9 @@ impl TextureCacheRuntime {
         self.surface_format_info(format, with_srgb).format
     }
 
+    /// Port of `Image::NeedsScaleHelper`.
     fn needs_scale_helper(&self, info: &ImageInfo, format: vk::Format) -> bool {
-        if info.num_samples > 1
-            && (self.cant_blit_msaa
-                || image_aspect_mask(info.format) == vk::ImageAspectFlags::COLOR)
-        {
+        if info.num_samples > 1 {
             return true;
         }
         let blit_usage = vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST;
@@ -3181,6 +3697,7 @@ impl TextureCacheRuntime {
         Ok(view)
     }
 
+    /// Port of `TextureCacheRuntime::CopyImageMSAA`.
     fn copy_image_msaa(&mut self, dst: &mut Image, src: &mut Image, copies: &[ImageCopy]) -> bool {
         if copies.is_empty() {
             return true;
@@ -3191,40 +3708,52 @@ impl TextureCacheRuntime {
         } else {
             dst.base().info.num_samples
         };
-        if dst.aspect_mask() != vk::ImageAspectFlags::COLOR
-            || crate::surface::is_pixel_format_integer(dst.base().info.format)
-        {
-            log::warn!("Copying images with different samples is not supported");
-            return false;
-        }
         if ENABLE_MSAA_RESOLVE_CONSUME
             && msaa_to_non_msaa
             && copies.len() == 1
             && src.base().info.format == dst.base().info.format
         {
             let copy = copies[0];
-            let shadow_image = self
+            let dst_aspect_mask = dst.aspect_mask();
+            let shadow = self
                 .get_valid_resolve_shadow(src.handle())
                 .filter(|shadow| {
-                    copy.src_offset.x == 0
+                    shadow.aspect_mask == dst_aspect_mask
+                        && copy.src_offset.x == 0
                         && copy.src_offset.y == 0
                         && copy.src_subresource.base_level == 0
                         && copy.extent.width <= shadow.extent.width
                         && copy.extent.height <= shadow.extent.height
+                        && (copy.src_subresource.base_layer + copy.src_subresource.num_layers)
+                            as u32
+                            <= shadow.layers
                 })
-                .map(|shadow| shadow.image.handle());
-            if let Some(shadow_image) = shadow_image {
+                .map(|shadow| (shadow.image.handle(), shadow.aspect_mask));
+            if let Some((shadow_image, aspect_mask)) = shadow {
+                let mut attachment_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
+                let mut attachment_write = vk::AccessFlags::COLOR_ATTACHMENT_WRITE;
+                let mut attachment_read_write = vk::AccessFlags::COLOR_ATTACHMENT_READ
+                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE;
+                if aspect_mask
+                    .intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
+                {
+                    attachment_stage = vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
+                    attachment_write = vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE;
+                    attachment_read_write = vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE;
+                }
                 let dst_image = dst.handle();
                 let region = vk::ImageCopy {
                     src_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        aspect_mask,
                         mip_level: 0,
                         base_array_layer: copy.src_subresource.base_layer as u32,
                         layer_count: copy.src_subresource.num_layers as u32,
                     },
                     src_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
                     dst_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        aspect_mask,
                         mip_level: copy.dst_subresource.base_level as u32,
                         base_array_layer: copy.dst_subresource.base_layer as u32,
                         layer_count: copy.dst_subresource.num_layers as u32,
@@ -3244,8 +3773,8 @@ impl TextureCacheRuntime {
                 let scheduler = self.scheduler();
                 scheduler.request_outside_render_pass_operation_context();
                 scheduler.record(move |cmd| unsafe {
-                    let full_color_range = vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                    let full_range = vk::ImageSubresourceRange {
+                        aspect_mask,
                         base_mip_level: 0,
                         level_count: vk::REMAINING_MIP_LEVELS,
                         base_array_layer: 0,
@@ -3253,19 +3782,19 @@ impl TextureCacheRuntime {
                     };
                     let pre_barriers = [
                         vk::ImageMemoryBarrier::builder()
-                            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                            .src_access_mask(attachment_write)
                             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                             .old_layout(vk::ImageLayout::GENERAL)
                             .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .image(shadow_image)
-                            .subresource_range(full_color_range)
+                            .subresource_range(full_range)
                             .build(),
                         vk::ImageMemoryBarrier::builder()
                             .src_access_mask(
                                 vk::AccessFlags::SHADER_WRITE
-                                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                                    | attachment_write
                                     | vk::AccessFlags::TRANSFER_WRITE,
                             )
                             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -3274,7 +3803,7 @@ impl TextureCacheRuntime {
                             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .image(dst_image)
-                            .subresource_range(full_color_range)
+                            .subresource_range(full_range)
                             .build(),
                     ];
                     let post_barriers = [
@@ -3284,14 +3813,13 @@ impl TextureCacheRuntime {
                             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .image(shadow_image)
-                            .subresource_range(full_color_range)
+                            .subresource_range(full_range)
                             .build(),
                         vk::ImageMemoryBarrier::builder()
                             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                             .dst_access_mask(
                                 vk::AccessFlags::SHADER_READ
-                                    | vk::AccessFlags::COLOR_ATTACHMENT_READ
-                                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                                    | attachment_read_write
                                     | vk::AccessFlags::TRANSFER_READ
                                     | vk::AccessFlags::TRANSFER_WRITE,
                             )
@@ -3300,13 +3828,12 @@ impl TextureCacheRuntime {
                             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .image(dst_image)
-                            .subresource_range(full_color_range)
+                            .subresource_range(full_range)
                             .build(),
                     ];
                     device.cmd_pipeline_barrier(
                         cmd,
-                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                            | vk::PipelineStageFlags::TRANSFER,
+                        attachment_stage | vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::DependencyFlags::empty(),
                         &[],
@@ -3333,6 +3860,32 @@ impl TextureCacheRuntime {
                 });
                 return true;
             }
+        }
+        let dst_aspect_mask = dst.aspect_mask();
+        if dst_aspect_mask.contains(vk::ImageAspectFlags::DEPTH) {
+            let copies_stencil = dst_aspect_mask.contains(vk::ImageAspectFlags::STENCIL)
+                && self
+                    .vulkan_device()
+                    .is_ext_shader_stencil_export_supported();
+            // SAFETY: both pointers refer to independently boxed services owned
+            // by RasterizerVulkan and remain valid for the runtime lifetime.
+            return unsafe {
+                self.blit_image_helper.as_mut().copy_msaa_depth(
+                    self.render_pass_cache.as_ref(),
+                    dst.handle(),
+                    dst.base().info.format,
+                    src.handle(),
+                    src.base().info.format,
+                    num_samples,
+                    copies,
+                    copies_stencil,
+                    msaa_to_non_msaa,
+                )
+            };
+        }
+        if !dst_aspect_mask.contains(vk::ImageAspectFlags::COLOR) {
+            log::warn!("Copying images with different samples is not supported");
+            return false;
         }
         unsafe {
             self.blit_image_helper.as_mut().copy_msaa(
@@ -3388,26 +3941,32 @@ impl TextureCacheRuntime {
         let scheduler = self.scheduler();
         scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmd| unsafe {
+            let scaled_width = resolution.scale_up_u32(extent.width);
+            let scaled_height = if is_2d {
+                resolution.scale_up_u32(extent.height)
+            } else {
+                extent.height
+            };
             let src_size = vk::Offset2D {
                 x: if up_scaling {
                     extent.width as i32
                 } else {
-                    resolution.scale_up_i32(extent.width as i32)
+                    scaled_width as i32
                 },
-                y: if is_2d && up_scaling {
+                y: if up_scaling {
                     extent.height as i32
                 } else {
-                    resolution.scale_up_i32(extent.height as i32)
+                    scaled_height as i32
                 },
             };
             let dst_size = vk::Offset2D {
                 x: if up_scaling {
-                    resolution.scale_up_i32(extent.width as i32)
+                    scaled_width as i32
                 } else {
                     extent.width as i32
                 },
-                y: if is_2d && up_scaling {
-                    resolution.scale_up_i32(extent.height as i32)
+                y: if up_scaling {
+                    scaled_height as i32
                 } else {
                     extent.height as i32
                 },
@@ -3532,7 +4091,12 @@ impl TextureCacheRuntime {
 
     fn create_image_from_info(&mut self, info: &ImageInfo) -> Result<AllocatedImage, vk::Result> {
         let format_info = self.surface_format_info(info.format, false);
-        let mut image_info = make_image_create_info(info, format_info);
+        let mut image_info = make_image_create_info(
+            info,
+            format_info,
+            self.vulkan_device()
+                .is_storage_image_multisample_supported(),
+        );
         let view_formats = self.view_formats[info.format as usize].clone();
         let mut format_list = vk::ImageFormatListCreateInfo::builder()
             .view_formats(&view_formats)
@@ -3566,46 +4130,6 @@ impl TextureCacheRuntime {
                 );
                 err.result
             })
-    }
-
-    fn create_msaa_upload_image(&mut self, info: &ImageInfo) -> Result<AllocatedImage, vk::Result> {
-        let format_info = self.surface_format_info(info.format, true);
-        let mut image_info = make_image_create_info(info, format_info);
-        image_info.format = format_info.format;
-        image_info.usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
-        self.memory_allocator()
-            .create_image(&image_info)
-            .map_err(|err| err.result)
-    }
-
-    fn copy_msaa_upload(
-        &mut self,
-        dst_image: vk::Image,
-        dst_format: PixelFormat,
-        src_image: vk::Image,
-        src_format: PixelFormat,
-        num_samples: u32,
-        copies: &[ImageCopy],
-    ) -> bool {
-        // SAFETY: both pointers refer to independently boxed services owned by
-        // RasterizerVulkan and remain valid for the runtime lifetime.
-        unsafe {
-            self.blit_image_helper.as_mut().copy_msaa(
-                self.render_pass_cache.as_ref(),
-                dst_image,
-                dst_format,
-                src_image,
-                src_format,
-                num_samples,
-                copies,
-                false,
-            )
-        }
-    }
-
-    fn keep_msaa_upload_image_alive(&mut self, image: AllocatedImage) {
-        let tick = self.scheduler().current_tick();
-        self.pending_msaa_images.push((tick, image));
     }
 
     /// Port of `Vulkan::ImageView(TextureCacheRuntime&, NullImageViewParams)`.
@@ -3643,7 +4167,12 @@ impl TextureCacheRuntime {
 
         let info = null_image_info();
         let format_info = self.surface_format_info(info.format, false);
-        let image_info = make_image_create_info(&info, format_info);
+        let image_info = make_image_create_info(
+            &info,
+            format_info,
+            self.vulkan_device()
+                .is_storage_image_multisample_supported(),
+        );
         // Upstream passes an empty view-format span for the fallback image.
         let null_image = self
             .memory_allocator()
@@ -3978,6 +4507,8 @@ impl TextureCacheRuntime {
             num_images: 1,
             samples,
             has_stencil: false,
+            resolve_shadow_images: [vk::Image::null(); NUM_RT + 1],
+            num_resolve_shadows: 0,
         })
     }
 
@@ -3987,10 +4518,11 @@ impl TextureCacheRuntime {
         view: vk::ImageView,
         format: PixelFormat,
         extent: vk::Extent2D,
+        samples: vk::SampleCountFlags,
     ) -> Result<BlitFramebufferInfo, vk::Result> {
         let rp_key = RenderPassKey {
             depth_format: format,
-            samples: vk::SampleCountFlags::TYPE_1,
+            samples,
             ..RenderPassKey::default()
         };
         let render_pass = self.render_pass_cache().get(&rp_key)?;
@@ -3999,7 +4531,7 @@ impl TextureCacheRuntime {
         images[0] = image;
         let mut image_ranges = [vk::ImageSubresourceRange::default(); NUM_RT + 1];
         image_ranges[0] = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+            aspect_mask: image_aspect_mask(format),
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
@@ -4012,8 +4544,10 @@ impl TextureCacheRuntime {
             images,
             image_ranges,
             num_images: 1,
-            samples: vk::SampleCountFlags::TYPE_1,
+            samples,
             has_stencil: image_aspect_mask(format).contains(vk::ImageAspectFlags::STENCIL),
+            resolve_shadow_images: [vk::Image::null(); NUM_RT + 1],
+            num_resolve_shadows: 0,
         })
     }
 
@@ -4059,11 +4593,32 @@ impl TextureCacheRuntime {
 
     /// `gpu_tick` is `Scheduler::known_gpu_tick()` — the last tick the GPU
     /// has fully completed.
+    /// Port of `TextureCacheRuntime::TickFrame` (plus ruzu's sentenced
+    /// resource ring).
     fn tick_frame(&mut self, gpu_tick: u64) {
+        const MAX_UNUSED_SCRATCH_FRAMES: u32 = 60;
         let scheduler_tick = gpu_tick;
         self.current_tick = scheduler_tick;
-        self.pending_msaa_images
-            .retain(|(retire_tick, _)| *retire_tick > gpu_tick);
+        {
+            // SAFETY: see `scheduler()`; only the scheduler field is borrowed.
+            let scheduler = unsafe { self.scheduler.as_ref() };
+            self.msaa_scratch_images.retain_mut(|scratch| {
+                if !scheduler.is_free(scratch.tick) {
+                    scratch.unused_frames = 0;
+                    return true;
+                }
+                scratch.unused_frames += 1;
+                scratch.unused_frames <= MAX_UNUSED_SCRATCH_FRAMES
+            });
+            let pending = std::mem::take(&mut self.pending_resolve_shadows);
+            let (retired, kept): (Vec<_>, Vec<_>) = pending
+                .into_iter()
+                .partition(|(tick, _)| scheduler.is_free(*tick));
+            self.pending_resolve_shadows = kept;
+            for (_, shadow) in retired {
+                unsafe { self.device.destroy_image_view(shadow.view, None) };
+            }
+        }
         let mut retained = Vec::with_capacity(self.sentenced_resources.len());
         let mut ready = Vec::new();
         for sentenced in self.sentenced_resources.drain(..) {
@@ -4086,55 +4641,12 @@ impl TextureCacheRuntime {
     }
 }
 
-fn color_blit_from_d32_destination(format: PixelFormat) -> bool {
-    matches!(
-        format,
-        PixelFormat::A8B8G8R8Unorm
-            | PixelFormat::A8B8G8R8Snorm
-            | PixelFormat::A8B8G8R8Sint
-            | PixelFormat::A8B8G8R8Uint
-            | PixelFormat::R5G6B5Unorm
-            | PixelFormat::B5G6R5Unorm
-            | PixelFormat::A1R5G5B5Unorm
-            | PixelFormat::A2B10G10R10Unorm
-            | PixelFormat::A2B10G10R10Uint
-            | PixelFormat::A2R10G10B10Unorm
-            | PixelFormat::A1B5G5R5Unorm
-            | PixelFormat::A5B5G5R1Unorm
-            | PixelFormat::R8Unorm
-            | PixelFormat::R8Snorm
-            | PixelFormat::R8Sint
-            | PixelFormat::R8Uint
-            | PixelFormat::R16G16B16A16Float
-            | PixelFormat::R16G16B16A16Unorm
-            | PixelFormat::R16G16B16A16Snorm
-            | PixelFormat::R16G16B16A16Sint
-            | PixelFormat::R16G16B16A16Uint
-            | PixelFormat::B10G11R11Float
-            | PixelFormat::R32G32B32A32Uint
-            | PixelFormat::Bc1RgbaUnorm
-            | PixelFormat::Bc2Unorm
-            | PixelFormat::Bc3Unorm
-            | PixelFormat::Bc4Unorm
-            | PixelFormat::Bc4Snorm
-            | PixelFormat::Bc5Unorm
-            | PixelFormat::Bc5Snorm
-            | PixelFormat::Bc7Unorm
-            | PixelFormat::Bc6hUfloat
-            | PixelFormat::Bc6hSfloat
-            | PixelFormat::Astc2d4x4Unorm
-            | PixelFormat::B8G8R8A8Unorm
-            | PixelFormat::R32G32B32A32Float
-            | PixelFormat::R32G32B32A32Sint
-            | PixelFormat::R32G32Float
-            | PixelFormat::R32G32Sint
-            | PixelFormat::R32Float
-    )
-}
-
 impl Drop for TextureCacheRuntime {
     fn drop(&mut self) {
         for (_, shadow) in self.resolve_shadows.drain() {
+            unsafe { self.device.destroy_image_view(shadow.view, None) };
+        }
+        for (_, shadow) in self.pending_resolve_shadows.drain(..) {
             unsafe { self.device.destroy_image_view(shadow.view, None) };
         }
         let resources = self
@@ -4307,8 +4819,18 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
         cache.runtime_mut().free_deferred_staging_buffer(buffer);
     }
 
+    const HAS_MSAA_DOWNLOADS: bool = true;
+
     fn can_upload_msaa(cache: &CommonTextureCache<Self>) -> bool {
         cache.runtime().can_upload_msaa()
+    }
+
+    fn can_download_msaa(cache: &CommonTextureCache<Self>, info: &ImageInfo) -> bool {
+        cache.runtime().can_download_msaa(info)
+    }
+
+    fn flush_deferred_clear(cache: &mut CommonTextureCache<Self>) {
+        cache.runtime_mut().flush_deferred_clear();
     }
 
     fn transition_image_layout(cache: &mut CommonTextureCache<Self>, image_id: ImageId) {
@@ -4644,7 +5166,6 @@ impl TextureCache {
         render_pass_cache: &mut RenderPassCache,
         descriptor_pool: &mut DescriptorPool,
         compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
-        cant_blit_msaa: bool,
         image_format_list_supported: bool,
         optimal_astc_supported: bool,
         must_emulate_bgr565: bool,
@@ -4666,7 +5187,6 @@ impl TextureCache {
             render_pass_cache,
             descriptor_pool,
             compute_pass_descriptor_queue,
-            cant_blit_msaa,
             image_format_list_supported,
             optimal_astc_supported,
             must_emulate_bgr565,
@@ -4675,6 +5195,7 @@ impl TextureCache {
             sampler_filter_minmax_supported,
             has_null_descriptor,
         ));
+        runtime.install_blit_resolve_shadow_hook();
         base.configure_device_memory_budget(runtime.get_device_local_memory());
         let null_view_base = NonNull::from(base.slot_image_views[NULL_IMAGE_VIEW_ID].base.as_mut());
         let null_image_view = runtime.make_null_image_view(null_view_base)?;
@@ -4707,9 +5228,13 @@ impl TextureCache {
         }
 
         let mut images = SmallVec::<[ImageId; 16]>::new();
+        // SAFETY: `for_each_image_in_region` only walks `slot_images`; the
+        // closure reads the runtime through this shared view (upstream
+        // captures `this`).
+        let base: *const CommonTextureCache<TextureCacheParams> = &self.base;
         self.base
             .for_each_image_in_region(cpu_addr, size, |image_id, image| {
-                if !image.is_safe_download() {
+                if !unsafe { &*base }.is_downloadable(image) {
                     return false;
                 }
                 image.flags.remove(ImageFlagBits::GPU_MODIFIED);
@@ -5339,6 +5864,8 @@ impl TextureCache {
             num_images: framebuffer.num_images,
             samples: framebuffer.samples,
             has_stencil: framebuffer.has_stencil,
+            resolve_shadow_images: framebuffer.resolve_shadow_images,
+            num_resolve_shadows: framebuffer.num_resolve_shadows as usize,
         })
     }
 
@@ -5686,10 +6213,8 @@ impl TextureCache {
             || min_filter == vk::Filter::LINEAR
             || mipmap_mode == vk::SamplerMipmapMode::LINEAR;
         let has_depth_comparison = tsc.depth_compare_enabled() != 0;
-        let mut has_minmax_reduction =
-            reduction_mode != vk::SamplerReductionMode::WEIGHTED_AVERAGE;
-        let has_srgb_border_color =
-            tsc.srgb_conversion() != 0 && srgb_border_color != border_color;
+        let mut has_minmax_reduction = reduction_mode != vk::SamplerReductionMode::WEIGHTED_AVERAGE;
+        let has_srgb_border_color = tsc.srgb_conversion() != 0 && srgb_border_color != border_color;
         if has_minmax_reduction && !runtime.sampler_filter_minmax_supported {
             log::warn!("VK_EXT_sampler_filter_minmax is required");
             has_minmax_reduction = false;
@@ -6094,9 +6619,8 @@ mod tests {
 
     #[test]
     fn volume_slice_views_preserve_layers_while_barriers_cover_the_image() {
-        let mut view = ImageViewBase::null(
-            crate::texture_cache::image_view_base::NullImageViewParams,
-        );
+        let mut view =
+            ImageViewBase::null(crate::texture_cache::image_view_base::NullImageViewParams);
         view.view_type = ImageViewType::E2DArray;
         view.flags = ImageViewFlagBits::SLICE;
         view.range.base.layer = 4;
@@ -6104,13 +6628,15 @@ mod tests {
         view.range.extent.levels = 1;
 
         let attachment = make_subresource_range(vk::ImageAspectFlags::COLOR, view.range);
-        assert_eq!((attachment.base_array_layer, attachment.layer_count), (4, 8));
+        assert_eq!(
+            (attachment.base_array_layer, attachment.layer_count),
+            (4, 8)
+        );
         let (kind, auxiliary) = aux_image_view_params(&view, vk::ImageAspectFlags::COLOR, None);
         assert_eq!(kind, vk::ImageViewType::TYPE_2D_ARRAY);
         assert_eq!((auxiliary.base_array_layer, auxiliary.layer_count), (4, 8));
-        let barrier = make_image_view_subresource_range(
-            vk::ImageAspectFlags::COLOR, view.range, view.flags,
-        );
+        let barrier =
+            make_image_view_subresource_range(vk::ImageAspectFlags::COLOR, view.range, view.flags);
         assert_eq!((barrier.base_array_layer, barrier.layer_count), (0, 1));
         assert_eq!(barrier.level_count, attachment.level_count);
     }
@@ -6234,12 +6760,115 @@ mod tests {
     }
 
     #[test]
-    fn d32_color_blit_destination_list_matches_upstream_boundaries() {
-        assert!(color_blit_from_d32_destination(PixelFormat::B5G6R5Unorm));
-        assert!(color_blit_from_d32_destination(PixelFormat::Bc1RgbaUnorm));
-        assert!(color_blit_from_d32_destination(PixelFormat::R32Float));
-        assert!(!color_blit_from_d32_destination(PixelFormat::R16Float));
-        assert!(!color_blit_from_d32_destination(PixelFormat::D32Float));
+    fn have_same_extent_compares_region_sizes_like_upstream() {
+        let region = |x0, y0, x1, y1| BlitRegion2D {
+            start: BlitOffset2D { x: x0, y: y0 },
+            end: BlitOffset2D { x: x1, y: y1 },
+        };
+        assert!(have_same_extent(
+            &region(0, 0, 64, 32),
+            &region(8, 8, 72, 40)
+        ));
+        assert!(!have_same_extent(
+            &region(0, 0, 64, 32),
+            &region(0, 0, 32, 16)
+        ));
+        assert!(!have_same_extent(
+            &region(0, 0, 64, 32),
+            &region(0, 0, 64, 16)
+        ));
+    }
+
+    #[test]
+    fn render_pass_variant_key_packs_masks_like_upstream() {
+        assert_eq!(render_pass_variant_key(0, false, 0, false), 0);
+        assert_eq!(render_pass_variant_key(0b101, false, 0, false), 0b101);
+        assert_eq!(render_pass_variant_key(0, false, 0b11, false), 0b11 << 8);
+        assert_eq!(render_pass_variant_key(0, true, 0, false), 1 << 16);
+        assert_eq!(render_pass_variant_key(0, false, 0, true), 1 << 17);
+        assert_eq!(
+            render_pass_variant_key(0xFF, true, 0xFF, true),
+            0xFF | (0xFF << 8) | (1 << 16) | (1 << 17)
+        );
+    }
+
+    #[test]
+    fn can_download_msaa_follows_upstream_aspect_rules() {
+        assert!(can_download_msaa_aspect(vk::ImageAspectFlags::COLOR, false));
+        assert!(can_download_msaa_aspect(vk::ImageAspectFlags::DEPTH, false));
+        assert!(!can_download_msaa_aspect(
+            vk::ImageAspectFlags::STENCIL,
+            true
+        ));
+        assert!(!can_download_msaa_aspect(
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+            false
+        ));
+        assert!(can_download_msaa_aspect(
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+            true
+        ));
+    }
+
+    #[test]
+    fn msaa_scratch_key_captures_upstream_create_info_fields() {
+        let info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            num_samples: 4,
+            size: Extent3D {
+                width: 64,
+                height: 32,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let format_info = maxwell_to_vk::FormatInfo {
+            format: vk::Format::R8G8B8A8_UNORM,
+            attachable: true,
+            storage: true,
+        };
+        let mut image_ci = make_image_create_info(&info, format_info, false);
+        image_ci.usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
+        let key = MsaaScratchKey::from_create_info(&image_ci);
+        assert_eq!(key.format, vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(key.image_type, vk::ImageType::TYPE_2D);
+        assert_eq!((key.width, key.height, key.depth), (32, 16, 1));
+        assert_eq!((key.levels, key.layers), (1, 1));
+        assert_eq!(
+            key.usage,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED
+        );
+        assert_eq!(key.flags, image_ci.flags);
+        let mut other = image_ci;
+        other.extent.width += 1;
+        assert_ne!(key, MsaaScratchKey::from_create_info(&other));
+    }
+
+    #[test]
+    fn msaa_images_only_get_storage_usage_with_multisample_storage_support() {
+        let info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            num_samples: 4,
+            ..ImageInfo::default()
+        };
+        let format_info = maxwell_to_vk::FormatInfo {
+            format: vk::Format::R8G8B8A8_UNORM,
+            attachable: true,
+            storage: true,
+        };
+        assert!(!make_image_create_info(&info, format_info, false)
+            .usage
+            .contains(vk::ImageUsageFlags::STORAGE));
+        assert!(make_image_create_info(&info, format_info, true)
+            .usage
+            .contains(vk::ImageUsageFlags::STORAGE));
+        let single = ImageInfo {
+            num_samples: 1,
+            ..info
+        };
+        assert!(make_image_create_info(&single, format_info, false)
+            .usage
+            .contains(vk::ImageUsageFlags::STORAGE));
     }
 
     #[test]
@@ -6297,7 +6926,7 @@ mod tests {
         assert_eq!(info.num_samples, 1);
 
         let format_info = maxwell_to_vk::surface_format_table(info.format);
-        let image_info = make_image_create_info(&info, format_info);
+        let image_info = make_image_create_info(&info, format_info, false);
         assert_eq!(image_info.format, vk::Format::A8B8G8R8_UNORM_PACK32);
         assert!(image_info.usage.contains(
             vk::ImageUsageFlags::TRANSFER_SRC
@@ -6387,8 +7016,12 @@ mod tests {
         ] {
             assert!(needs_explicit_border_color_format(format), "{format:?}");
         }
-        assert!(!needs_explicit_border_color_format(vk::Format::A8B8G8R8_UNORM_PACK32));
-        assert!(!needs_explicit_border_color_format(vk::Format::R5G6B5_UNORM_PACK16));
+        assert!(!needs_explicit_border_color_format(
+            vk::Format::A8B8G8R8_UNORM_PACK32
+        ));
+        assert!(!needs_explicit_border_color_format(
+            vk::Format::R5G6B5_UNORM_PACK16
+        ));
     }
 
     #[test]
@@ -6504,9 +7137,16 @@ mod tests {
                 vk::Image::null(),
             ],
             image_ranges: [color_range; NUM_RT + 1],
-            resolve_images: Vec::new(),
-            resolve_image_views: Vec::new(),
+            resolve_shadow_images: [vk::Image::null(); NUM_RT + 1],
+            num_resolve_shadows: 0,
+            runtime_ptr: None,
             discard_msaa_color: false,
+            discard_msaa_depth_stencil: false,
+            variant_keys: std::cell::Cell::new([0; NUM_MEMOIZED_RENDER_PASS_VARIANTS]),
+            variant_render_passes: std::cell::Cell::new(
+                [vk::RenderPass::null(); NUM_MEMOIZED_RENDER_PASS_VARIANTS],
+            ),
+            num_memoized_variants: std::cell::Cell::new(0),
         };
         let framebuffer = owner.render_target_framebuffer();
 
@@ -6581,13 +7221,13 @@ mod tests {
         let mut format_info = maxwell_to_vk::surface_format_table(PixelFormat::A2B10G10R10Unorm);
         assert!(format_info.storage);
         assert!(
-            image_usage_flags(format_info, PixelFormat::A2B10G10R10Unorm)
+            image_usage_flags(format_info, PixelFormat::A2B10G10R10Unorm, true)
                 .contains(vk::ImageUsageFlags::STORAGE)
         );
 
         format_info.storage = false;
         assert!(
-            !image_usage_flags(format_info, PixelFormat::A2B10G10R10Unorm)
+            !image_usage_flags(format_info, PixelFormat::A2B10G10R10Unorm, true)
                 .contains(vk::ImageUsageFlags::STORAGE)
         );
     }
@@ -6599,8 +7239,8 @@ mod tests {
         let image_format_info = maxwell_to_vk::surface_format_table(image_format);
         let view_format_info = maxwell_to_vk::surface_format_table(view_format);
 
-        let image_usage = image_usage_flags(image_format_info, image_format);
-        let requested_view_usage = image_usage_flags(view_format_info, view_format);
+        let image_usage = image_usage_flags(image_format_info, image_format, true);
+        let requested_view_usage = image_usage_flags(view_format_info, view_format, true);
         let view_usage = image_view_usage_flags(
             view_format_info,
             view_format,
@@ -6924,23 +7564,28 @@ mod tests {
     }
 
     #[test]
-    fn msaa_upload_is_limited_to_non_integer_color_images() {
+    fn msaa_upload_covers_color_and_depth_images_like_upstream() {
         let mut info = ImageInfo {
             format: PixelFormat::A8B8G8R8Unorm,
             num_samples: 4,
             ..ImageInfo::default()
         };
         assert!(wants_msaa_upload(&info, vk::ImageAspectFlags::COLOR));
-        assert!(!wants_msaa_upload(&info, vk::ImageAspectFlags::DEPTH));
+        assert!(wants_msaa_upload(&info, vk::ImageAspectFlags::DEPTH));
+        assert!(wants_msaa_upload(
+            &info,
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        ));
+        assert!(!wants_msaa_upload(&info, vk::ImageAspectFlags::STENCIL));
         info.format = PixelFormat::A8B8G8R8Uint;
-        assert!(!wants_msaa_upload(&info, vk::ImageAspectFlags::COLOR));
+        assert!(wants_msaa_upload(&info, vk::ImageAspectFlags::COLOR));
         info.format = PixelFormat::A8B8G8R8Unorm;
         info.num_samples = 1;
         assert!(!wants_msaa_upload(&info, vk::ImageAspectFlags::COLOR));
     }
 
     #[test]
-    fn framebuffer_without_owned_resolve_images_matches_upstream_accessors() {
+    fn framebuffer_without_resolve_shadows_matches_upstream_accessors() {
         let framebuffer = Framebuffer {
             device: None,
             framebuffer: vk::Framebuffer::null(),
@@ -6957,17 +7602,75 @@ mod tests {
             images: [vk::Image::null(); NUM_RT + 1],
             image_ranges: [vk::ImageSubresourceRange::default(); NUM_RT + 1],
             num_images: 0,
-            resolve_images: Vec::new(),
-            resolve_image_views: Vec::new(),
+            resolve_shadow_images: [vk::Image::null(); NUM_RT + 1],
+            num_resolve_shadows: 0,
+            runtime_ptr: None,
             discard_msaa_color: false,
+            discard_msaa_depth_stencil: false,
+            variant_keys: std::cell::Cell::new([0; NUM_MEMOIZED_RENDER_PASS_VARIANTS]),
+            variant_render_passes: std::cell::Cell::new(
+                [vk::RenderPass::null(); NUM_MEMOIZED_RENDER_PASS_VARIANTS],
+            ),
+            num_memoized_variants: std::cell::Cell::new(0),
         };
 
-        assert!(!framebuffer.has_resolve_color());
-        assert_eq!(framebuffer.resolve_color_image(0), vk::Image::null());
+        assert!(!framebuffer.discards_msaa_color());
+        assert!(!framebuffer.discards_msaa_depth_stencil());
+        // No runtime: marking is a no-op (upstream null `runtime_ptr` guard).
+        framebuffer.mark_resolve_shadows_up_to_date();
+        // The base variant never touches the cache.
+        assert_eq!(
+            framebuffer.render_pass_variant(0, false, 0, false),
+            Ok(vk::RenderPass::null())
+        );
+        assert_eq!(framebuffer.num_memoized_variants.get(), 0);
         let handle = framebuffer.render_target_framebuffer();
         assert_eq!(handle.num_images(), framebuffer.num_images);
         assert_eq!(*handle.images(), framebuffer.images);
         assert_eq!(handle.framebuffer_owner, NonNull::from(&framebuffer));
+        let info = handle.blit_framebuffer_info();
+        assert_eq!(info.num_resolve_shadows, 0);
+        assert!(info
+            .resolve_shadow_images
+            .iter()
+            .all(|image| *image == vk::Image::null()));
+    }
+
+    #[test]
+    fn blit_framebuffer_info_copies_resolve_shadow_images() {
+        let mut framebuffer = Framebuffer {
+            device: None,
+            framebuffer: vk::Framebuffer::null(),
+            render_pass: vk::RenderPass::null(),
+            render_pass_key: RenderPassKey::default(),
+            render_pass_cache: NonNull::dangling(),
+            render_area: vk::Extent2D::default(),
+            num_color_buffers: 0,
+            has_depth: false,
+            has_stencil: false,
+            is_rescaled: false,
+            samples: vk::SampleCountFlags::TYPE_1,
+            rt_map: [0; NUM_RT],
+            images: [vk::Image::null(); NUM_RT + 1],
+            image_ranges: [vk::ImageSubresourceRange::default(); NUM_RT + 1],
+            num_images: 0,
+            resolve_shadow_images: [vk::Image::null(); NUM_RT + 1],
+            num_resolve_shadows: 1,
+            runtime_ptr: None,
+            discard_msaa_color: false,
+            discard_msaa_depth_stencil: false,
+            variant_keys: std::cell::Cell::new([0; NUM_MEMOIZED_RENDER_PASS_VARIANTS]),
+            variant_render_passes: std::cell::Cell::new(
+                [vk::RenderPass::null(); NUM_MEMOIZED_RENDER_PASS_VARIANTS],
+            ),
+            num_memoized_variants: std::cell::Cell::new(0),
+        };
+        framebuffer.resolve_shadow_images[0] = vk::Image::from_raw(0xABC);
+        let info = framebuffer
+            .render_target_framebuffer()
+            .blit_framebuffer_info();
+        assert_eq!(info.num_resolve_shadows, 1);
+        assert_eq!(info.resolve_shadow_images[0], vk::Image::from_raw(0xABC));
     }
 
     #[test]
@@ -7003,10 +7706,41 @@ mod tests {
     }
 }
 
+unsafe fn mark_resolve_shadows_thunk(runtime: NonNull<()>, images: &[vk::Image]) {
+    let runtime = unsafe { runtime.cast::<TextureCacheRuntime>().as_mut() };
+    for &image in images {
+        runtime.mark_resolve_shadow_up_to_date(image);
+    }
+}
+
+/// Any MSAA color or depth image goes through the scratch copy.
 fn wants_msaa_upload(info: &ImageInfo, aspect: vk::ImageAspectFlags) -> bool {
     info.num_samples > 1
-        && aspect.contains(vk::ImageAspectFlags::COLOR)
-        && !crate::surface::is_pixel_format_integer(info.format)
+        && (aspect.contains(vk::ImageAspectFlags::COLOR)
+            || aspect.contains(vk::ImageAspectFlags::DEPTH))
+}
+
+/// Aspect rules of `TextureCacheRuntime::CanDownloadMsaa`.
+fn can_download_msaa_aspect(
+    aspect_mask: vk::ImageAspectFlags,
+    shader_stencil_export_supported: bool,
+) -> bool {
+    if aspect_mask.contains(vk::ImageAspectFlags::COLOR) {
+        return true;
+    }
+    if !aspect_mask.contains(vk::ImageAspectFlags::DEPTH) {
+        return false;
+    }
+    if aspect_mask.contains(vk::ImageAspectFlags::STENCIL) {
+        return shader_stencil_export_supported;
+    }
+    true
+}
+
+/// Port of `HaveSameExtent`.
+fn have_same_extent(dst_region: &BlitRegion2D, src_region: &BlitRegion2D) -> bool {
+    dst_region.end.x - dst_region.start.x == src_region.end.x - src_region.start.x
+        && dst_region.end.y - dst_region.start.y == src_region.end.y - src_region.start.y
 }
 
 fn make_msaa_upload_copies(copies: &[BufferImageCopy], num_samples: u32) -> Vec<ImageCopy> {
@@ -7292,6 +8026,7 @@ fn null_image_info() -> ImageInfo {
 fn image_usage_flags(
     format_info: maxwell_to_vk::FormatInfo,
     format: PixelFormat,
+    allow_storage: bool,
 ) -> vk::ImageUsageFlags {
     let mut usage = vk::ImageUsageFlags::TRANSFER_SRC
         | vk::ImageUsageFlags::TRANSFER_DST
@@ -7305,7 +8040,7 @@ fn image_usage_flags(
             SurfaceType::Invalid => {}
         }
     }
-    if format_info.storage {
+    if format_info.storage && allow_storage {
         usage |= vk::ImageUsageFlags::STORAGE;
     }
     usage
@@ -7321,8 +8056,8 @@ fn image_view_usage_flags(
     image_format_info: maxwell_to_vk::FormatInfo,
     image_format: PixelFormat,
 ) -> vk::ImageUsageFlags {
-    image_usage_flags(view_format_info, view_format)
-        & image_usage_flags(image_format_info, image_format)
+    image_usage_flags(view_format_info, view_format, true)
+        & image_usage_flags(image_format_info, image_format, true)
 }
 
 /// Port of upstream `IsLdrAstcFormat`.
@@ -7331,9 +8066,13 @@ fn is_ldr_astc_format(format: vk::Format) -> bool {
         .contains(&format.as_raw())
 }
 
+/// Port of `MakeImageCreateInfo`. Upstream reads
+/// `device.IsStorageImageMultisampleSupported()` directly; the free helper
+/// takes that capability so it stays testable without a device.
 fn make_image_create_info(
     info: &ImageInfo,
     format_info: maxwell_to_vk::FormatInfo,
+    storage_image_multisample_supported: bool,
 ) -> vk::ImageCreateInfo {
     let mut flags = vk::ImageCreateFlags::empty();
     if info.image_type == ImageType::E2D
@@ -7347,6 +8086,7 @@ fn make_image_create_info(
     }
     let (samples_x, samples_y) =
         crate::texture_cache::samples_helper::samples_log2(info.num_samples as i32);
+    let allow_storage = info.num_samples == 1 || storage_image_multisample_supported;
     vk::ImageCreateInfo::builder()
         .flags(flags)
         .image_type(convert_image_type(info.image_type))
@@ -7360,10 +8100,32 @@ fn make_image_create_info(
         .array_layers(info.resources.layers.max(1) as u32)
         .samples(convert_sample_count(info.num_samples))
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(image_usage_flags(format_info, info.format))
+        .usage(image_usage_flags(format_info, info.format, allow_storage))
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .build()
+}
+
+/// Port of `MakeMsaaScratchImageCreateInfo`: single-sample image sharing the
+/// MSAA image's sRGB-resolved format with the requested usage.
+fn make_msaa_scratch_image_create_info(
+    runtime: &TextureCacheRuntime,
+    info: &ImageInfo,
+    usage: vk::ImageUsageFlags,
+) -> vk::ImageCreateInfo {
+    let mut temp_info = info.clone();
+    temp_info.num_samples = 1;
+    let format_info = runtime.surface_format_info(temp_info.format, false);
+    let mut image_ci = make_image_create_info(
+        &temp_info,
+        format_info,
+        runtime
+            .vulkan_device()
+            .is_storage_image_multisample_supported(),
+    );
+    image_ci.format = runtime.surface_format(info.format, true);
+    image_ci.usage = usage;
+    image_ci
 }
 
 fn apply_image_format_list(
@@ -7381,8 +8143,7 @@ fn apply_image_format_list(
     // supports storage images (e.g. the A8B8G8R8_UNORM storage view the ASTC
     // compute decoder writes through on an sRGB image, whose own format is
     // not storage-capable).
-    image_info.flags |=
-        vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE;
+    image_info.flags |= vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE;
     if has_storage_compatible_view {
         image_info.usage |= vk::ImageUsageFlags::STORAGE;
     }

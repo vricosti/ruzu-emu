@@ -171,8 +171,21 @@ pub struct UserConfig {
     pub page_table: Option<*mut *mut c_void>,
     pub optimizations: OptimizationFlag,
     pub page_table_address_space_bits: u32,
-    pub page_table_pointer_mask_bits: i32,
-    pub page_table_log2_stride: usize,
+    /// Applies a bit mask to the bits in host pointers from the page table.
+    /// The intention behind this is to allow users of Dynarmic to pack attributes in the
+    /// same integer and update the pointer attribute pair atomically.
+    /// If the configured value is ~(0b111ULL), all pointers will be forcefully aligned to 8 bytes.
+    pub page_table_pointer_mask: u64,
+    /// Log2 of the size per page entry, value should be either 3 or 4
+    pub page_table_log2_stride: u32,
+    /// Setting this value has Dynarmic check the specified bit of the page pointer provided by
+    /// page table. If the bit is set to 1, Dynarmic will treat it as unmapped.
+    /// This bit should be included as part of `page_table_pointer_mask`.
+    pub page_table_marked_bit: Option<u8>,
+    /// If this value is set, Dynarmic will sign extend the page table pointer by this bit.
+    /// Useful for compacting bits into the page table and should be used as part of
+    /// `page_table_pointer_mask`.
+    pub page_table_sign_extension: Option<u8>,
     pub cntfrq_el0: u32,
     pub ctr_el0: u32,
     pub dczid_el0: u32,
@@ -211,8 +224,10 @@ impl UserConfig {
             page_table: None,
             optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
             page_table_address_space_bits: 36,
-            page_table_pointer_mask_bits: 0,
+            page_table_pointer_mask: 0,
             page_table_log2_stride: 3,
+            page_table_marked_bit: None,
+            page_table_sign_extension: None,
             cntfrq_el0: 600_000_000,
             ctr_el0: 0x8444_c004,
             dczid_el0: 4,
@@ -385,7 +400,10 @@ mod tests {
     fn user_config_defaults_match_upstream() {
         let config = UserConfig::new(Box::new(DefaultCallbacks));
         assert_eq!(config.page_table_address_space_bits, 36);
+        assert_eq!(config.page_table_pointer_mask, 0);
         assert_eq!(config.page_table_log2_stride, 3);
+        assert_eq!(config.page_table_marked_bit, None);
+        assert_eq!(config.page_table_sign_extension, None);
         assert_eq!(config.cntfrq_el0, 600_000_000);
         assert_eq!(config.ctr_el0, 0x8444_c004);
         assert_eq!(config.dczid_el0, 4);

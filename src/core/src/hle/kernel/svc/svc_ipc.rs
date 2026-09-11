@@ -952,8 +952,12 @@ mod tests {
             let base_page = mapped_start / PAGE_SIZE;
             let num_pages = mapped_size.div_ceil(PAGE_SIZE);
             for page in base_page..base_page + num_pages {
-                let target = page * PAGE_SIZE;
-                page_table.map_pages(page, 1, target as u64, PageType::Memory, host_base + target);
+                // Identity-map the page onto the device backing at the same offset
+                // (entry = host page pointer - vaddr).
+                page_table
+                    .entries
+                    .get_and_fault(page)
+                    .store(false, PageType::Memory, 1, host_base);
             }
         }
         memory

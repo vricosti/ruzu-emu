@@ -49,43 +49,84 @@ fn imm9_unscaled(imm: i32) -> u32 {
     (imm as u32) & 0x1ff
 }
 
-fn logical_imm32(imm: u32) -> (u32, u32, u32) {
-    match imm {
-        0x1 => (0, 0, 0),
-        0x2 => (0, 31, 0),
-        0x3 => (0, 0, 1),
-        0xff => (0, 0, 7),
-        0x70 => (0, 28, 2),
-        0x300 => (0, 24, 1),
-        0xfc00 => (0, 22, 5),
-        0x0101_0101 => (0, 0, 48),
-        0x0800_0000 => (0, 5, 0),
-        0x1000_0000 => (0, 4, 0),
-        0x2000_0000 => (0, 3, 0),
-        0x3000_0000 => (0, 4, 1),
-        0x8080_8080 => (0, 1, 48),
-        0x1111_1111 => (0, 0, 56),
-        0xf000_0000 => (0, 4, 3),
-        0xffff_0000 => (0, 16, 15),
-        _ => panic!("unsupported AArch64 32-bit logical immediate: {imm:#x}"),
+/// Encodes an AArch64 logical immediate (`N:immr:imms`) for a `reg_size`
+/// bit register, following the reference algorithm (element size search,
+/// rotation to the canonical `0^m 1^n` form). Returns `None` when `imm` is
+/// not representable (all-zero, all-one or non-periodic patterns).
+fn encode_logical_imm(imm: u64, reg_size: u32) -> Option<(u32, u32, u32)> {
+    fn is_shifted_mask(value: u64) -> bool {
+        value != 0 && {
+            let shifted = value >> value.trailing_zeros();
+            shifted & shifted.wrapping_add(1) == 0
+        }
     }
+
+    let full = if reg_size == 64 {
+        u64::MAX
+    } else {
+        (1u64 << reg_size) - 1
+    };
+    let mut imm = imm & full;
+    if imm == 0 || imm == full {
+        return None;
+    }
+    if reg_size == 32 {
+        // Replicate the 32-bit pattern so the 64-bit search below applies.
+        imm |= imm << 32;
+    }
+
+    // Determine the element size.
+    let mut size = 64u32;
+    loop {
+        size /= 2;
+        let mask = (1u64 << size) - 1;
+        if (imm & mask) != ((imm >> size) & mask) {
+            size *= 2;
+            break;
+        }
+        if size <= 2 {
+            break;
+        }
+    }
+
+    // Determine the rotation to make the element be: 0^m 1^n.
+    let mask = u64::MAX >> (64 - size);
+    let element = imm & mask;
+    let (cto, rotation_start) = if is_shifted_mask(element) {
+        let i = element.trailing_zeros();
+        ((element >> i).trailing_ones(), i)
+    } else {
+        let filled = element | !mask;
+        if !is_shifted_mask(!filled) {
+            return None;
+        }
+        let clo = filled.leading_ones();
+        let i = 64 - clo;
+        (clo + filled.trailing_ones() - (64 - size), i)
+    };
+
+    // Encode in immr the number of RORs it would take to get *from* 0^m 1^n
+    // to our target value.
+    let immr = (size - rotation_start) & (size - 1);
+    // Bits [0, log2(size)] of imms are zero, ones above that; OR the
+    // (ones count - 1) into the low bits.
+    let n_imms = (!(size as u64 - 1) << 1) | (cto as u64 - 1);
+    // The seventh bit, toggled, is the N field.
+    let n = (((n_imms >> 6) & 1) ^ 1) as u32;
+    if reg_size == 32 && n != 0 {
+        return None;
+    }
+    Some((n, immr, (n_imms & 0x3f) as u32))
+}
+
+fn logical_imm32(imm: u32) -> (u32, u32, u32) {
+    encode_logical_imm(imm as u64, 32)
+        .unwrap_or_else(|| panic!("unsupported AArch64 32-bit logical immediate: {imm:#x}"))
 }
 
 fn logical_imm64(imm: u64) -> (u32, u32, u32) {
-    match imm {
-        0x1 => (1, 0, 0),
-        0x3 => (1, 0, 1),
-        0x4 => (1, 62, 0),
-        0x7 => (1, 0, 2),
-        0xf => (1, 0, 3),
-        0xfff => (1, 0, 11),
-        0x00ff_ffff_ffff_ffff => (1, 0, 55),
-        0xffff_ffff_ffff_fffc => (1, 62, 61),
-        0xffff_ffff_ffff_ffe0 => (1, 59, 58),
-        0xffff_ffff_f800_0000 => (1, 37, 36),
-        0xffff_ffff_f000_0000 => (1, 36, 35),
-        _ => panic!("unsupported AArch64 64-bit logical immediate: {imm:#x}"),
-    }
+    encode_logical_imm(imm, 64)
+        .unwrap_or_else(|| panic!("unsupported AArch64 64-bit logical immediate: {imm:#x}"))
 }
 
 fn simd_size(size: u8) -> u32 {
@@ -503,6 +544,34 @@ pub fn cbz_w(rt: u8, pc_offset_bytes: i32) -> u32 {
 /// `cbz xT, label`.
 pub fn cbz_x(rt: u8, pc_offset_bytes: i32) -> u32 {
     0xb400_0000 | (imm19(pc_offset_bytes) << 5) | reg5(rt)
+}
+
+fn imm14(pc_offset_bytes: i32) -> u32 {
+    assert!(
+        pc_offset_bytes % 4 == 0,
+        "AArch64 branch offset must be instruction-aligned: {pc_offset_bytes}"
+    );
+    let imm = pc_offset_bytes / 4;
+    assert!(
+        (-(1 << 13)..(1 << 13)).contains(&imm),
+        "AArch64 branch offset out of imm14 range: {pc_offset_bytes}"
+    );
+    (imm as u32) & 0x3fff
+}
+
+/// `tbnz xT, #bit, label` (64-bit form; `b5` carries bit 5 of the bit number).
+pub fn tbnz_x(rt: u8, bit: u8, pc_offset_bytes: i32) -> u32 {
+    assert!(bit < 64, "AArch64 TBNZ bit out of range: {bit}");
+    let b5 = (bit as u32 >> 5) & 1;
+    let b40 = bit as u32 & 0x1f;
+    0x3700_0000 | (b5 << 31) | (b40 << 19) | (imm14(pc_offset_bytes) << 5) | reg5(rt)
+}
+
+/// `sbfm xD, xN, #immr, #imms` (64-bit, N=1).
+pub fn sbfm_x(rd: u8, rn: u8, immr: u8, imms: u8) -> u32 {
+    assert!(immr < 64, "AArch64 SBFM immr out of range: {immr}");
+    assert!(imms < 64, "AArch64 SBFM imms out of range: {imms}");
+    0x9340_0000 | ((immr as u32) << 16) | ((imms as u32) << 10) | (reg5(rn) << 5) | reg5(rd)
 }
 
 /// `blr xN`.
@@ -3069,6 +3138,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn logical_immediates_match_reference_encodings() {
+        for (imm, expected) in [
+            (0x1u64, (1, 0, 0)),
+            (0x3, (1, 0, 1)),
+            (0x4, (1, 62, 0)),
+            (0x7, (1, 0, 2)),
+            (0xf, (1, 0, 3)),
+            (0xfff, (1, 0, 11)),
+            (0x00ff_ffff_ffff_ffff, (1, 0, 55)),
+            (0xffff_ffff_ffff_fffc, (1, 62, 61)),
+            (0xffff_ffff_ffff_ffe0, (1, 59, 58)),
+            (0xffff_ffff_f800_0000, (1, 37, 36)),
+            (0xffff_ffff_f000_0000, (1, 36, 35)),
+            (0x8000_0000_0000_0001, (1, 1, 1)),
+            (0x0101_0101_0101_0101, (0, 0, 48)),
+        ] {
+            assert_eq!(logical_imm64(imm), expected, "imm {imm:#x}");
+        }
+        for (imm, expected) in [
+            (0x1u32, (0, 0, 0)),
+            (0x2, (0, 31, 0)),
+            (0x3, (0, 0, 1)),
+            (0xff, (0, 0, 7)),
+            (0x70, (0, 28, 2)),
+            (0x300, (0, 24, 1)),
+            (0xfc00, (0, 22, 5)),
+            (0x0101_0101, (0, 0, 48)),
+            (0x0800_0000, (0, 5, 0)),
+            (0x1000_0000, (0, 4, 0)),
+            (0x2000_0000, (0, 3, 0)),
+            (0x3000_0000, (0, 4, 1)),
+            (0x8080_8080, (0, 1, 48)),
+            (0x1111_1111, (0, 0, 56)),
+            (0xf000_0000, (0, 4, 3)),
+            (0xffff_0000, (0, 16, 15)),
+            (0x8000_0001, (0, 1, 1)),
+        ] {
+            assert_eq!(logical_imm32(imm), expected, "imm {imm:#x}");
+        }
+        assert_eq!(encode_logical_imm(0, 64), None);
+        assert_eq!(encode_logical_imm(u64::MAX, 64), None);
+        assert_eq!(encode_logical_imm(0x1234_5678, 64), None);
+        assert_eq!(encode_logical_imm(0x1234_5678, 32), None);
+    }
+
+    #[test]
     fn encodes_known_arm64_words() {
         assert_eq!(nop(), 0xd503_201f);
         assert_eq!(brk(0), 0xd420_0000);
@@ -3170,6 +3285,11 @@ mod tests {
         assert_eq!(b_cond(Cond::LE, 8), 0x5400_004d);
         assert_eq!(cbz_w(16, 8), 0x3400_0050);
         assert_eq!(cbz_x(16, 8), 0xb400_0050);
+        assert_eq!(tbnz_x(0, 0, 8), 0x3700_0040);
+        assert_eq!(tbnz_x(0, 57, 8), 0xb7c8_0040);
+        assert_eq!(tbnz_x(16, 5, -8), 0x372f_ffd0);
+        assert_eq!(sbfm_x(0, 0, 0, 57), 0x9340_e400);
+        assert_eq!(sbfm_x(16, 17, 0, 31), 0x9340_7e30);
         assert_eq!(blr(17), 0xd63f_0220);
         assert_eq!(ldarb_w(16, 17), 0x08df_fe30);
         assert_eq!(ldarh_w(16, 17), 0x48df_fe30);
@@ -3206,6 +3326,14 @@ mod tests {
         assert_eq!(str_w_reg_uxtw(16, 17, 18), 0xb832_4a30);
         assert_eq!(str_x_reg_uxtw(16, 17, 18), 0xf832_4a30);
         assert_eq!(and_w_imm(30, 30, 0x70), 0x121c_0bde);
+        // Eden `PageTable::ATTRIBUTE_MASK` (44 ones at bits 12..55), the mask
+        // the page-table lookup ANDs with (oaknut encodes it as N=1,
+        // immr=52, imms=43).
+        assert_eq!(
+            and_x_imm(16, 16, 0x00ff_ffff_ffff_f000),
+            0x9200_0000 | (1 << 22) | (52 << 16) | (43 << 10) | (16 << 5) | 16
+        );
+        assert_eq!(logical_imm64(0x00ff_ffff_ffff_f000), (1, 52, 43));
         assert_eq!(and_w_imm(16, 17, 0xf000_0000), 0x1204_0e30);
         assert_eq!(and_w_imm(16, 17, 0x0800_0000), 0x1205_0230);
         assert_eq!(and_w_imm(16, 17, 0x2000_0000), 0x1203_0230);

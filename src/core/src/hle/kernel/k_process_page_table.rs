@@ -276,15 +276,10 @@ impl KProcessPageTable {
     }
 
     pub fn get_physical_address(&self, address: KProcessAddress) -> Option<KPhysicalAddress> {
-        // Query the page table implementation for the physical address.
-        // Upstream: m_impl->GetPhysicalAddress(virt_addr)
-        if let Some(ref impl_) = self.base.m_impl {
-            impl_
-                .get_physical_address(address.get())
-                .map(KPhysicalAddress::new)
-        } else {
-            None
-        }
+        // Upstream: `m_page_table.GetPhysicalAddress(out, virt_addr)` (locks the table).
+        self.base
+            .get_physical_address(address.get() as usize)
+            .map(KPhysicalAddress::new)
     }
 
     /// Upstream: `KProcessPageTable::InvalidateProcessDataCache`.

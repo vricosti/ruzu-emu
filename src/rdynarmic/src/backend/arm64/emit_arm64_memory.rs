@@ -588,9 +588,22 @@ fn inline_page_table_emit_vaddr_lookup<const BITSIZE: usize>(
     ))?;
     code.write_u32(inst::ldr_x_reg_lsl(XSCRATCH0, XPAGETABLE, XSCRATCH0))?;
 
-    if ctx.conf.page_table_pointer_mask_bits != 0 {
-        let mask = u64::MAX << ctx.conf.page_table_pointer_mask_bits;
-        code.write_u32(inst::and_x_imm(XSCRATCH0, XSCRATCH0, mask))?;
+    if let Some(marked_bit) = ctx.conf.page_table_marked_bit {
+        // check for marked bit
+        fallback.tbnz_x(code, XSCRATCH0, marked_bit)?;
+    }
+
+    if ctx.conf.page_table_pointer_mask != 0 {
+        code.write_u32(inst::and_x_imm(
+            XSCRATCH0,
+            XSCRATCH0,
+            ctx.conf.page_table_pointer_mask,
+        ))?;
+    }
+
+    // TODO: combine this with page_table_pointer_mask
+    if let Some(sign_extension) = ctx.conf.page_table_sign_extension {
+        code.write_u32(inst::sbfm_x(XSCRATCH0, XSCRATCH0, 0, sign_extension))?;
     }
 
     fallback.cbz_x(code, XSCRATCH0)?;
@@ -1080,7 +1093,7 @@ mod tests {
         config.page_table_address_space_bits = 39;
         config.silently_mirror_page_table = false;
         config.absolute_offset_page_table = true;
-        config.page_table_pointer_mask_bits = 5;
+        config.page_table_pointer_mask = u64::MAX << 5;
 
         let mut code = BlockOfCode::with_size(4096).unwrap();
         let mut info = empty_block_info(&code);
@@ -1124,6 +1137,73 @@ mod tests {
             inst::and_x_imm(XSCRATCH0, XSCRATCH0, 0xffff_ffff_ffff_ffe0)
         );
         assert_eq!(read_instruction(&code, 28), inst::cbz_x(XSCRATCH0, 12));
+    }
+
+    /// Eden's packed page entries (5f142c7926): the lookup checks the marked
+    /// bit (`TBNZ`), masks the attributes with the 64-bit mask and sign
+    /// extends (`SBFM`) before the null check.
+    #[test]
+    fn page_table_marked_bit_mask_and_sign_extension_emit_tbnz_and_sbfm() {
+        let mut config = config();
+        config.check_halt_on_memory_access = false;
+        config.page_table_pointer = 0x1000_0000;
+        config.page_table_address_space_bits = 39;
+        config.silently_mirror_page_table = false;
+        config.absolute_offset_page_table = true;
+        config.page_table_pointer_mask = 0x00ff_ffff_ffff_f000;
+        config.page_table_marked_bit = Some(0);
+        config.page_table_sign_extension = Some(57);
+
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut info = empty_block_info(&code);
+        let mut block = block_with_inst(
+            Opcode::A64ReadMemory32,
+            &[
+                Value::ImmU64(LocationDescriptor::new(0x4000).value()),
+                Value::ImmU64(0x1234),
+                Value::ImmAccType(AccType::Normal),
+            ],
+        );
+
+        context_emit_with_deferred(
+            &mut block,
+            &mut code,
+            &mut info,
+            &config,
+            |code, ctx, inst| emit_read_memory::<32>(code, ctx, inst),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_instruction(&code, 4),
+            inst::lsr_x_imm(XSCRATCH0, test_gpr(0), 12)
+        );
+        assert_eq!(
+            read_instruction(&code, 8),
+            inst::tst_x_imm(XSCRATCH0, 0xffff_ffff_f800_0000)
+        );
+        assert_eq!(read_instruction(&code, 12), inst::b_cond(Cond::NE, 36));
+        assert_eq!(
+            read_instruction(&code, 16),
+            inst::lsl_x_imm(XSCRATCH0, XSCRATCH0, 3)
+        );
+        assert_eq!(
+            read_instruction(&code, 20),
+            inst::ldr_x_reg_lsl(XSCRATCH0, XPAGETABLE, XSCRATCH0)
+        );
+        assert_eq!(
+            read_instruction(&code, 24),
+            inst::tbnz_x(XSCRATCH0, 0, 24)
+        );
+        assert_eq!(
+            read_instruction(&code, 28),
+            inst::and_x_imm(XSCRATCH0, XSCRATCH0, 0x00ff_ffff_ffff_f000)
+        );
+        assert_eq!(
+            read_instruction(&code, 32),
+            inst::sbfm_x(XSCRATCH0, XSCRATCH0, 0, 57)
+        );
+        assert_eq!(read_instruction(&code, 36), inst::cbz_x(XSCRATCH0, 12));
     }
 
     #[test]

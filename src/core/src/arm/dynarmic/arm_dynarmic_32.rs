@@ -14,7 +14,7 @@ use crate::arm::arm_interface::{
 };
 use crate::hle::kernel::k_process::SharedProcessMemory;
 use crate::memory::memory::Memory;
-use common::page_table::PageInfo;
+use common::page_table::{PageEntryData, PageTable};
 use common::settings_enums::CpuAccuracy;
 
 use rdynarmic::interface::a32::config::{
@@ -25,13 +25,13 @@ use rdynarmic::interface::optimization_flags::OptimizationFlag;
 
 use super::dynarmic_cp15::DynarmicCP15;
 
-// Eden indexes `PageEntryData` records (32 bytes); ruzu's split page-table
-// storage exposes the contiguous `PageInfo` buffer directly. Keep the same
-// log2-stride contract while deriving it from the actual Rust entry layout.
-const PAGE_TABLE_LOG2_STRIDE: usize = std::mem::size_of::<PageInfo>().trailing_zeros() as usize;
+// Eden leaves `page_table_log2_stride` at Dynarmic's default (3) now that
+// `PageEntryData` is 8 bytes (5f142c7926); keep the contract checked against
+// the Rust entry layout.
+const PAGE_TABLE_LOG2_STRIDE: u32 = 3;
 const _: () = assert!(
-    1usize << PAGE_TABLE_LOG2_STRIDE == std::mem::size_of::<PageInfo>(),
-    "PageInfo size must be a power of two"
+    1usize << PAGE_TABLE_LOG2_STRIDE == std::mem::size_of::<PageEntryData>(),
+    "PageEntryData must be 8 bytes"
 );
 
 static A32_TRACE_AFTER_WATCH_ARMED: AtomicBool = AtomicBool::new(false);
@@ -2420,7 +2420,7 @@ impl ArmDynarmic32 {
                         .page_table
                         .get_base()
                         .get_impl()
-                        .map(|page_table| page_table.pointers.data() as *const u8)
+                        .map(|page_table| page_table.entries.data() as *const u8)
                         .filter(|p| !p.is_null())
                 };
                 let fastmem_pointer = {
@@ -2436,6 +2436,35 @@ impl ArmDynarmic32 {
                 .filter(|p| !p.is_null());
                 (page_table_pointer, fastmem_pointer)
             };
+
+        // Upstream: `if (DeviceMemory().buffer.BackingBasePointer() +
+        // KSystemControl::Init::GetIntendedMemorySize()) < (1ULL << 39)`.
+        // Systems like FreeBSD allocate memory really low by default, and since we pack our
+        // page table entries, we have to manually sign extend when our actual pointer is
+        // negative. The backing base comes from the value cached on the process page table
+        // when its Memory bridge was attached (no lock, like upstream's direct
+        // `DeviceMemory()` read); the bridge itself is only consulted as a fallback.
+        let kernel_process =
+            unsafe { &*(process as *const _ as *const crate::hle::kernel::k_process::KProcess) };
+        let page_table_sign_extension = Some(
+            kernel_process
+                .page_table
+                .get_base()
+                .m_device_backing_base
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .filter(|backing_base| *backing_base != 0)
+        .or_else(|| {
+            core_memory
+                .as_ref()
+                .and_then(|memory| memory.try_lock().ok()?.device_memory_backing_base())
+        })
+        .filter(|backing_base| {
+                let intended_memory_size =
+                    crate::hle::kernel::board::k_system_control::init::get_intended_memory_size();
+                (*backing_base as u64) + (intended_memory_size as u64) < (1u64 << 39)
+        })
+        .map(|_| PageTable::SIGN_BIT as u8);
 
         let svc_swi = Arc::new(AtomicU32::new(0));
         let last_exception_address = Arc::new(AtomicU64::new(0));
@@ -2536,10 +2565,10 @@ impl ArmDynarmic32 {
             code_cache_size: code_cache_size
                 .try_into()
                 .expect("A32 code cache size must fit u32"),
-            page_table_pointer_mask_bits: PageInfo::ATTRIBUTE_BITS
-                .try_into()
-                .expect("A32 page-table pointer mask must fit i32"),
+            page_table_pointer_mask: PageTable::ATTRIBUTE_MASK,
             page_table_log2_stride: PAGE_TABLE_LOG2_STRIDE,
+            page_table_marked_bit: Some(0),
+            page_table_sign_extension,
             arch_version: rdynarmic::interface::a32::arch_version::ArchVersion::V8,
             processor_id: core_index.try_into().expect("A32 processor id must fit u8"),
             detect_misaligned_access_via_page_table: 16 | 32 | 64 | 128,
@@ -3069,7 +3098,7 @@ mod tests {
     fn page_table_stride_matches_exposed_page_info_buffer() {
         assert_eq!(
             1usize << PAGE_TABLE_LOG2_STRIDE,
-            std::mem::size_of::<PageInfo>()
+            std::mem::size_of::<PageEntryData>()
         );
     }
 

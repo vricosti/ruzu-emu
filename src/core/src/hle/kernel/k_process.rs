@@ -735,7 +735,7 @@ impl KProcess {
         memory.set_gpu_dirty_managers(system.gpu_dirty_memory_managers());
         let memory_arc = Arc::new(Mutex::new(memory));
         // Wire into page table so page-table-level operations can use it
-        self.page_table.get_base_mut().m_memory = Some(memory_arc.clone());
+        self.page_table.get_base_mut().set_memory(memory_arc.clone());
         self.memory = Some(memory_arc);
         self.debugger_enabled = system.debugger_enabled();
     }

@@ -231,8 +231,10 @@ pub struct EmitConfig {
     pub silently_mirror_fastmem: bool,
     pub page_table_pointer: u64,
     pub page_table_address_space_bits: usize,
-    pub page_table_pointer_mask_bits: u32,
+    pub page_table_pointer_mask: u64,
     pub page_table_log2_stride: usize,
+    pub page_table_marked_bit: Option<u8>,
+    pub page_table_sign_extension: Option<u8>,
     pub silently_mirror_page_table: bool,
     pub absolute_offset_page_table: bool,
     pub detect_misaligned_access_via_page_table: u32,
@@ -266,8 +268,10 @@ impl EmitConfig {
             page_table_address_space_bits: 32,
             silently_mirror_page_table: true,
             absolute_offset_page_table: config.absolute_offset_page_table,
-            page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
-            page_table_log2_stride: config.page_table_log2_stride,
+            page_table_pointer_mask: config.page_table_pointer_mask,
+            page_table_log2_stride: config.page_table_log2_stride as usize,
+            page_table_marked_bit: config.page_table_marked_bit,
+            page_table_sign_extension: config.page_table_sign_extension,
             detect_misaligned_access_via_page_table: config.detect_misaligned_access_via_page_table
                 as u32,
             only_detect_misalignment_via_page_table_on_page_boundary: config
@@ -293,8 +297,10 @@ impl EmitConfig {
             silently_mirror_fastmem: true,
             page_table_pointer: config.page_table.map_or(0, |p| p as u64),
             page_table_address_space_bits: 32,
-            page_table_pointer_mask_bits: memory.page_table_pointer_mask_bits,
-            page_table_log2_stride: config.page_table_log2_stride,
+            page_table_pointer_mask: memory.page_table_pointer_mask,
+            page_table_log2_stride: memory.page_table_log2_stride,
+            page_table_marked_bit: memory.page_table_marked_bit,
+            page_table_sign_extension: memory.page_table_sign_extension,
             silently_mirror_page_table: true,
             absolute_offset_page_table: memory.absolute_offset_page_table,
             detect_misaligned_access_via_page_table: memory.detect_misaligned_access_via_page_table,
@@ -326,8 +332,10 @@ impl EmitConfig {
             page_table_address_space_bits: config.page_table_address_space_bits as usize,
             silently_mirror_page_table: config.silently_mirror_page_table,
             absolute_offset_page_table: config.absolute_offset_page_table,
-            page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
-            page_table_log2_stride: config.page_table_log2_stride,
+            page_table_pointer_mask: config.page_table_pointer_mask,
+            page_table_log2_stride: config.page_table_log2_stride as usize,
+            page_table_marked_bit: config.page_table_marked_bit,
+            page_table_sign_extension: config.page_table_sign_extension,
             detect_misaligned_access_via_page_table: config.detect_misaligned_access_via_page_table
                 as u32,
             only_detect_misalignment_via_page_table_on_page_boundary: config
@@ -356,8 +364,10 @@ impl EmitConfig {
             silently_mirror_fastmem: memory.silently_mirror_fastmem,
             page_table_pointer: config.page_table.map_or(0, |p| p as u64),
             page_table_address_space_bits: memory.page_table_address_space_bits,
-            page_table_pointer_mask_bits: memory.page_table_pointer_mask_bits,
-            page_table_log2_stride: config.page_table_log2_stride,
+            page_table_pointer_mask: memory.page_table_pointer_mask,
+            page_table_log2_stride: memory.page_table_log2_stride,
+            page_table_marked_bit: memory.page_table_marked_bit,
+            page_table_sign_extension: memory.page_table_sign_extension,
             silently_mirror_page_table: memory.silently_mirror_page_table,
             absolute_offset_page_table: memory.absolute_offset_page_table,
             detect_misaligned_access_via_page_table: memory.detect_misaligned_access_via_page_table,
@@ -2524,8 +2534,10 @@ mod tests {
         config.silently_mirror_fastmem = false;
         config.recompile_on_fastmem_failure = true;
         config.page_table_address_space_bits = 40;
-        config.page_table_pointer_mask_bits = 3;
+        config.page_table_pointer_mask = !0b111u64;
         config.page_table_log2_stride = 4;
+        config.page_table_marked_bit = Some(0);
+        config.page_table_sign_extension = Some(57);
         config.silently_mirror_page_table = false;
         config.absolute_offset_page_table = true;
         config.detect_misaligned_access_via_page_table = 16 | 32 | 64;
@@ -2541,8 +2553,10 @@ mod tests {
         assert!(!cfg.silently_mirror_fastmem);
         assert!(cfg.recompile_on_fastmem_failure);
         assert_eq!(cfg.page_table_address_space_bits, 40);
-        assert_eq!(cfg.page_table_pointer_mask_bits, 3);
+        assert_eq!(cfg.page_table_pointer_mask, !0b111u64);
         assert_eq!(cfg.page_table_log2_stride, 4);
+        assert_eq!(cfg.page_table_marked_bit, Some(0));
+        assert_eq!(cfg.page_table_sign_extension, Some(57));
         assert!(!cfg.silently_mirror_page_table);
         assert!(cfg.absolute_offset_page_table);
         assert_eq!(cfg.detect_misaligned_access_via_page_table, 16 | 32 | 64);

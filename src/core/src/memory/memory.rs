@@ -8,10 +8,10 @@
 #[cfg(target_os = "android")]
 use common::heap_tracker::HeapTracker;
 use common::host_memory::HostMemory;
-use common::page_table::{PageInfo, PageTable, PageType};
+use common::page_table::{PageEntryData, PageTable, PageType};
 use common::scratch_buffer::ScratchBuffer;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU16, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -122,6 +122,9 @@ pub struct Memory {
     /// Serializes non-core host threads sharing the last per-core GPU cache
     /// slot. Upstream owner: `std::mutex sys_core_guard`.
     sys_core_guard: Arc<Mutex<()>>,
+    /// Upstream `std::atomic<u16> block_count`: identifier handed to every
+    /// `map_pages` call so `PageEntryData::block()` tells mappings apart.
+    block_count: AtomicU16,
 }
 
 #[derive(Default)]
@@ -437,6 +440,7 @@ impl Memory {
             gpu_dirty_managers: Vec::new(),
             smmu_scratch_buffers: std::array::from_fn(|_| Mutex::new(ScratchBuffer::new())),
             sys_core_guard: Arc::new(Mutex::new(())),
+            block_count: AtomicU16::new(0),
         }
     }
 
@@ -764,7 +768,7 @@ impl Memory {
     /// Map a physical memory region into the guest virtual address space.
     ///
     /// Matches upstream `Memory::Impl::MapMemoryRegion`:
-    /// - Updates PageTable entries (pointers, backing_addr, blocks) per page
+    /// - Updates the packed `PageEntryData` entries per page
     /// - Maps into fastmem arena if available
     ///
     /// # Arguments
@@ -923,11 +927,15 @@ impl Memory {
         let mut protect_bytes: u64 = 0;
         let mut protect_begin: u64 = 0;
 
+        page_table.entries.commit_region(
+            (vaddr >> PAGE_BITS) as usize,
+            ((vaddr + size) >> PAGE_BITS) as usize,
+        );
         let mut addr = vaddr;
         while addr < vaddr + size {
             let page_idx = (addr >> PAGE_BITS) as usize;
-            let page_type = if page_idx < page_table.pointers.size() {
-                page_table.pointers[page_idx].page_type()
+            let page_type = if page_idx < page_table.entries.size() {
+                page_table.entries.get_unchecked(page_idx).page_type()
             } else {
                 PageType::Unmapped
             };
@@ -986,12 +994,12 @@ impl Memory {
         }
         let pt = unsafe { &*self.current_page_table };
         let page_idx = (vaddr >> PAGE_BITS) as usize;
-        if page_idx >= pt.pointers.size() {
+        if page_idx >= pt.entries.size() {
             return std::ptr::null_mut();
         }
 
-        let raw = pt.pointers[page_idx].raw_value();
-        let pointer = PageInfo::extract_pointer(raw);
+        let raw = pt.entries[page_idx].raw();
+        let pointer = PageEntryData::extract_pointer(raw, false);
         if pointer != 0 {
             // Upstream stores a biased host pointer and reconstructs with
             // unchecked unsigned addition: `pointer + vaddr`.
@@ -999,7 +1007,7 @@ impl Memory {
         }
 
         // Slow path: check page type
-        match PageInfo::extract_type(raw) {
+        match PageType::from_bits(raw.type_bits()) {
             PageType::Unmapped => std::ptr::null_mut(),
             PageType::Memory => {
                 // Upstream: ASSERT_MSG(false, "Mapped memory page without a pointer")
@@ -1025,25 +1033,35 @@ impl Memory {
         }
         let pt = unsafe { &*self.current_page_table };
         let page_idx = (vaddr >> PAGE_BITS) as usize;
-        if page_idx >= pt.backing_addr.size() {
+        if page_idx >= pt.entries.size() {
             return std::ptr::null_mut();
         }
-        let backing = pt.backing_addr[page_idx] as usize;
-        if backing == 0 {
+        // Upstream: `if (u64 paddr = entries[page].Pointer(true); paddr)
+        //               return reinterpret_cast<u8*>(paddr) + vaddr;`
+        let paddr = pt.entries[page_idx].pointer(true);
+        if paddr == 0 {
             return std::ptr::null_mut();
         }
-        let phys_addr = (backing as u64).wrapping_add(vaddr);
-        if phys_addr < dram_memory_map::BASE {
-            return std::ptr::null_mut();
-        }
-        unsafe { (*self.device_memory).get_pointer(phys_addr) }
+        paddr.wrapping_add(vaddr as usize) as *mut u8
     }
 
     /// Get pointer from rasterizer cached memory (slow path).
-    /// Matches upstream `Memory::Impl::GetPointerFromRasterizerCachedMemory`.
+    /// Matches upstream `Memory::Impl::GetPointerFromRasterizerCachedMemory`
+    /// (same body as the debug-memory lookup upstream).
     fn get_pointer_from_rasterizer_cached_memory(&self, vaddr: u64) -> *mut u8 {
-        // For now, same as debug memory (rasterizer cache not yet implemented).
-        self.get_pointer_from_debug_memory(vaddr)
+        if self.current_page_table.is_null() {
+            return std::ptr::null_mut();
+        }
+        let pt = unsafe { &*self.current_page_table };
+        let page_idx = (vaddr >> PAGE_BITS) as usize;
+        if page_idx >= pt.entries.size() {
+            return std::ptr::null_mut();
+        }
+        let paddr = pt.entries[page_idx].pointer(true);
+        if paddr == 0 {
+            return std::ptr::null_mut();
+        }
+        paddr.wrapping_add(vaddr as usize) as *mut u8
     }
 
     /// Mark or unmark a process virtual-address range for debugger memory
@@ -1071,25 +1089,28 @@ impl Memory {
         let num_pages = ((vaddr.wrapping_add(size).wrapping_sub(1)) >> PAGE_BITS)
             .wrapping_sub(vaddr >> PAGE_BITS)
             .wrapping_add(1);
+
+        page_table.entries.commit_region(
+            (vaddr >> PAGE_BITS) as usize,
+            ((vaddr >> PAGE_BITS) + num_pages) as usize,
+        );
         let mut current_vaddr = vaddr;
         for _ in 0..num_pages {
             let page_index = (current_vaddr >> PAGE_BITS) as usize;
-            let entry = &page_table.pointers[page_index];
-            match (debug, PageInfo::extract_type(entry.raw_value())) {
+            let entry = page_table.entries.get_unchecked(page_index);
+            let (pointer, page_type, block) = entry.pointer_type_block(true);
+            match (debug, page_type) {
                 (true, PageType::Unmapped) => {
                     debug_assert!(false, "Attempted to mark unmapped pages as debug");
                 }
-                (true, PageType::Memory) => entry.store(0, PageType::DebugMemory),
+                (true, PageType::Memory) => entry.mark_debug(pointer, block),
                 (true, PageType::RasterizerCachedMemory | PageType::DebugMemory)
                 | (false, PageType::RasterizerCachedMemory | PageType::Memory) => {}
                 (false, PageType::Unmapped) => {
                     debug_assert!(false, "Attempted to mark unmapped pages as non-debug");
                 }
                 (false, PageType::DebugMemory) => {
-                    let page = current_vaddr & !PAGE_MASK;
-                    let pointer = self.get_pointer_from_debug_memory(page);
-                    let encoded = (pointer as usize).wrapping_sub(page as usize);
-                    entry.store(encoded, PageType::Memory);
+                    entry.store(false, PageType::Memory, block, pointer);
                 }
             }
             current_vaddr = current_vaddr.wrapping_add(PAGE_SIZE);
@@ -1104,9 +1125,9 @@ impl Memory {
     /// (`core/memory.cpp:793-844`). Walks each CPU page in the range and
     /// transitions its `PageType`:
     /// - `Memory`/`DebugMemory` → `RasterizerCachedMemory` when `cached`.
-    /// - `RasterizerCachedMemory` → `Memory` when uncached (pointer recovered
-    ///   via `get_pointer_from_rasterizer_cached_memory`, which uses the
-    ///   per-page `backing_addr` table that survives the type transition).
+    /// - `RasterizerCachedMemory` → `Memory` when uncached (the host pointer
+    ///   survives the transition inside the marked entry and is read back with
+    ///   `pointer_type_block(true)`).
     /// - `Unmapped` pages skipped (matches upstream — a process need not map
     ///   the GPU-cached region into its own AS, e.g. VRAM-only buffers).
     ///
@@ -1144,22 +1165,27 @@ impl Memory {
         // so single-byte writes still touch one page, and a write straddling
         // a page boundary touches two pages — even when `size < PAGE_SIZE`.
         let num_pages = ((vaddr + size - 1) >> PAGE_BITS) - (vaddr >> PAGE_BITS) + 1;
+        pt.entries.commit_region(
+            (vaddr >> PAGE_BITS) as usize,
+            ((vaddr >> PAGE_BITS) + num_pages) as usize,
+        );
         record_rasterizer_mark_cached_stage(3);
         let mut current_vaddr = vaddr;
         record_rasterizer_mark_cached_stage(4);
         for _ in 0..num_pages {
             record_rasterizer_mark_cached_stage(5);
             let page_idx = (current_vaddr >> PAGE_BITS) as usize;
-            if page_idx < pt.pointers.size() {
-                let entry = &pt.pointers[page_idx];
-                let ptype = PageInfo::extract_type(entry.raw_value());
+            if page_idx < pt.entries.size() {
+                let entry = pt.entries.get_unchecked(page_idx);
+                let ptype = entry.page_type();
                 if cached {
                     match ptype {
                         PageType::Memory | PageType::DebugMemory => {
-                            // Switch to RasterizerCachedMemory. Pointer is
-                            // stored as 0; readers go through the slow path
+                            // Switch to RasterizerCachedMemory: the entry is
+                            // marked so the fast path sees a null pointer and
+                            // readers go through the slow path
                             // (`get_pointer_from_rasterizer_cached_memory`).
-                            entry.store(0, PageType::RasterizerCachedMemory);
+                            entry.mark_rasterizer_cached();
                         }
                         // Unmapped → skip (no CPU backing to track).
                         // RasterizerCachedMemory → already cached, common
@@ -1168,18 +1194,16 @@ impl Memory {
                     }
                 } else {
                     if ptype == PageType::RasterizerCachedMemory {
-                        let pointer = self.get_pointer_from_rasterizer_cached_memory(current_vaddr);
-                        if !pointer.is_null() {
-                            // Encode pointer as `ptr - vaddr` so the fastmem
-                            // path can recover the host address with one
-                            // addition (matches the PageInfo layout used by
-                            // `map_pages`).
-                            let encoded = (pointer as usize).wrapping_sub(current_vaddr as usize);
-                            entry.store(encoded, PageType::Memory);
+                        let (ptr, _, block) = entry.pointer_type_block(true);
+                        if ptr == 0 {
+                            // It's possible that this function has been called
+                            // while updating the pagetable after unmapping a
+                            // VMA. In that case the underlying VMA will no
+                            // longer exist, and we should just leave the
+                            // pagetable entry blank.
+                            entry.store(false, PageType::Unmapped, block, 0);
                         } else {
-                            // The backing VMA may already have been removed
-                            // while its page table was being updated.
-                            entry.store(0, PageType::Unmapped);
+                            entry.store(false, PageType::Memory, block, ptr);
                         }
                     }
                 }
@@ -1292,10 +1316,10 @@ impl Memory {
         }
         let pt = unsafe { &*self.current_page_table };
         let page_idx = (vaddr >> PAGE_BITS) as usize;
-        if page_idx >= pt.pointers.size() {
+        if page_idx >= pt.entries.size() {
             return None;
         }
-        Some(PageInfo::extract_type(pt.pointers[page_idx].raw_value()))
+        Some(pt.entries[page_idx].page_type())
     }
 
     fn page_debug_at(&self, vaddr: u64) -> Option<(PageType, usize, u64, Option<u64>)> {
@@ -1304,19 +1328,17 @@ impl Memory {
         }
         let pt = unsafe { &*self.current_page_table };
         let page_idx = (vaddr >> PAGE_BITS) as usize;
-        if page_idx >= pt.pointers.size() || page_idx >= pt.backing_addr.size() {
+        if page_idx >= pt.entries.size() {
             return None;
         }
-        let raw = pt.pointers[page_idx].raw_value();
-        let pointer = PageInfo::extract_pointer(raw);
-        let ptype = PageInfo::extract_type(raw);
-        let backing = pt.backing_addr[page_idx];
-        let phys = if backing == 0 {
+        let (pointer, ptype, block) = pt.entries[page_idx].pointer_type_block(true);
+        let phys = if pointer == 0 {
             None
         } else {
-            Some(backing.wrapping_add(vaddr))
+            let host = pointer.wrapping_add(vaddr as usize);
+            Some(unsafe { (*self.device_memory).get_physical_addr_uintptr(host) })
         };
-        Some((ptype, pointer, backing, phys))
+        Some((ptype, pointer, block as u64, phys))
     }
 
     fn perform_cache_operation<F>(
@@ -2661,10 +2683,10 @@ impl Memory {
         }
         let pt = unsafe { &*self.current_page_table };
         let page = (vaddr >> PAGE_BITS) as usize;
-        if page >= pt.pointers.size() {
+        if page >= pt.entries.size() {
             return false;
         }
-        let (pointer, ptype) = pt.pointers[page].pointer_type();
+        let (pointer, ptype, _) = pt.entries[page].pointer_type_block(false);
         pointer != 0 || ptype == PageType::RasterizerCachedMemory || ptype == PageType::DebugMemory
     }
 
@@ -3114,20 +3136,13 @@ mod process_fastmem_tests {
 
         memory.mark_region_debug(VADDR, PAGE_SIZE, true);
         let page = (VADDR >> PAGE_BITS) as usize;
-        assert_eq!(
-            PageInfo::extract_type(page_table.pointers[page].raw_value()),
-            PageType::DebugMemory
-        );
+        assert_eq!(page_table.entries[page].page_type(), PageType::DebugMemory);
+        // The fast path must see a null pointer while debug-marked.
+        assert_eq!(page_table.entries[page].pointer(false), 0);
 
         memory.mark_region_debug(VADDR, PAGE_SIZE, false);
-        assert_eq!(
-            PageInfo::extract_type(page_table.pointers[page].raw_value()),
-            PageType::Memory
-        );
-        assert_ne!(
-            PageInfo::extract_pointer(page_table.pointers[page].raw_value()),
-            0
-        );
+        assert_eq!(page_table.entries[page].page_type(), PageType::Memory);
+        assert_ne!(page_table.entries[page].pointer(false), 0);
     }
 
     #[cfg(target_os = "linux")]
@@ -3254,7 +3269,7 @@ mod zero_phys_block_tests {
 mod rasterizer_download_tests {
     use std::sync::{Arc, Mutex};
 
-    use common::page_table::{PageInfo, PageTable, PageType};
+    use common::page_table::{PageTable, PageType};
 
     use super::{dram_memory_map, DeviceMemory, Memory, PAGE_BITS, PAGE_SIZE};
     use crate::core::{System, SystemRef};
@@ -3465,13 +3480,16 @@ mod rasterizer_download_tests {
         let device_addr = dram_memory_map::BASE + 0x2000;
         let host_ptr = (device_memory.buffer.backing_base_pointer() as usize)
             .wrapping_add((device_addr - dram_memory_map::BASE) as usize);
-        page_table.map_pages(
-            (vaddr >> PAGE_BITS) as usize,
-            1,
-            device_addr,
-            PageType::RasterizerCachedMemory,
-            host_ptr,
-        );
+        // A rasterizer-cached page is a marked entry keeping its host pointer.
+        page_table
+            .entries
+            .get_and_fault((vaddr >> PAGE_BITS) as usize)
+            .store(
+                true,
+                PageType::RasterizerCachedMemory,
+                1,
+                host_ptr.wrapping_sub(vaddr as usize),
+            );
 
         let mut memory = unsafe {
             Memory::new(
@@ -3635,24 +3653,27 @@ mod rasterizer_download_tests {
         let (_device_memory, mut page_table, memory, vaddr, _device_addr) =
             make_rasterizer_cached_memory(&system);
         let page = (vaddr >> PAGE_BITS) as usize;
-        page_table.backing_addr[page] = 0;
+        page_table
+            .entries
+            .get_and_fault(page)
+            .store(true, PageType::RasterizerCachedMemory, 1, 0);
 
         memory.rasterizer_mark_region_cached(vaddr, PAGE_SIZE, false);
 
-        assert_eq!(
-            PageInfo::extract_type(page_table.pointers[page].raw_value()),
-            PageType::Unmapped
-        );
+        assert_eq!(page_table.entries[page].page_type(), PageType::Unmapped);
     }
 
     #[test]
     fn rasterizer_cache_rejects_ranges_outside_address_space() {
         let system = System::new_for_test();
-        let (_device_memory, page_table, memory, _vaddr, _device_addr) =
+        let (_device_memory, mut page_table, memory, _vaddr, _device_addr) =
             make_rasterizer_cached_memory(&system);
         let max_addr = 1u64 << page_table.current_address_space_width_in_bits;
         let last_page = ((max_addr >> PAGE_BITS) - 1) as usize;
-        page_table.pointers[last_page].store(0x1000, PageType::Memory);
+        page_table
+            .entries
+            .get_and_fault(last_page)
+            .store(false, PageType::Memory, 1, 0x1000);
 
         memory.rasterizer_mark_region_cached(
             max_addr - PAGE_SIZE as u64,
@@ -3660,10 +3681,7 @@ mod rasterizer_download_tests {
             true,
         );
 
-        assert_eq!(
-            PageInfo::extract_type(page_table.pointers[last_page].raw_value()),
-            PageType::Memory
-        );
+        assert_eq!(page_table.entries[last_page].page_type(), PageType::Memory);
     }
 
     #[cfg(not(target_os = "android"))]
@@ -3711,7 +3729,7 @@ impl Memory {
     ) {
         let end = base_page + num_pages;
         debug_assert!(
-            (end as usize) <= page_table.pointers.size(),
+            (end as usize) <= page_table.entries.size(),
             "out of range mapping at {:#x}",
             base_page * PAGE_SIZE
         );
@@ -3723,33 +3741,36 @@ impl Memory {
                 base_page * PAGE_SIZE
             );
 
-            let mut page = base_page as usize;
-            while page < end as usize {
-                page_table.pointers[page].store(0usize, page_type);
-                page_table.backing_addr[page] = 0u64;
-                page_table.blocks[page] = 0u64;
-                page += 1;
-            }
+            page_table
+                .entries
+                .zero_region(base_page as usize, end as usize);
         } else {
-            let orig_base = base_page;
+            let current_block = self.block_count.fetch_add(1, Ordering::Relaxed);
+            assert!(current_block != 65535);
+
+            page_table
+                .entries
+                .commit_region(base_page as usize, end as usize);
             let mut page = base_page as usize;
             while page < end as usize {
-                // Compute host pointer: DeviceMemory base + physical offset - virtual page offset.
-                // The result is intended to be used as host_ptr + page*PAGE_SIZE, so the per-iteration
-                // delta is a constant — debug builds otherwise hit "subtract with overflow" when the
-                // virtual page index is numerically larger than the physical offset (release-mode
-                // wraparound is the intended behavior; restore it explicitly).
+                // Upstream: `host_ptr = DeviceMemory().GetPointer<u8>(target) - (base << PAGEBITS)`.
+                // The result is intended to be used as host_ptr + page*PAGE_SIZE, so the
+                // per-iteration delta is a constant — debug builds otherwise hit "subtract with
+                // overflow" when the virtual page index is numerically larger than the physical
+                // offset (release-mode wraparound is the intended behavior; restore it explicitly).
                 let host_ptr = unsafe {
                     let dm = &*self.device_memory;
                     (dm.buffer.backing_base_pointer() as usize)
                         .wrapping_add((target - dram_memory_map::BASE) as usize)
                         .wrapping_sub(page << PAGE_BITS)
                 };
-                let backing = (target as usize).wrapping_sub(page << PAGE_BITS);
+                let entry = page_table.entries.get_unchecked(page);
 
-                page_table.pointers[page].store(host_ptr, page_type);
-                page_table.backing_addr[page] = backing as u64;
-                page_table.blocks[page] = orig_base << (PAGE_BITS as u64);
+                entry.store(false, page_type, current_block, host_ptr);
+                debug_assert!(
+                    page_table.entries[page].pointer(false) != 0,
+                    "memory mapping base yield a nullptr within the table"
+                );
 
                 page += 1;
                 target += PAGE_SIZE;

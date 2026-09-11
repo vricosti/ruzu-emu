@@ -5,7 +5,6 @@
 use crate::alignment::align_up;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::free_region_manager::FreeRegionManager;
-use crate::virtual_buffer::VirtualBuffer;
 use log::error;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
@@ -59,6 +58,25 @@ struct HostMemoryImpl {
 
 #[cfg(target_os = "windows")]
 impl HostMemoryImpl {
+    /// Upstream `Impl::Allocate(size_t size)` (Windows).
+    fn allocate(size: usize) -> *mut u8 {
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+        };
+        let ptr = unsafe {
+            VirtualAlloc(ptr::null_mut(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        if ptr.is_null() {
+            error!(
+                "Failed to allocate fallback buffer with size {:#x}, error {}",
+                size,
+                unsafe { GetLastError() }
+            );
+        }
+        ptr as *mut u8
+    }
+
     fn new(backing_size: usize, virtual_size: usize) -> Result<Self, String> {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
@@ -534,6 +552,30 @@ struct HostMemoryImpl {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl HostMemoryImpl {
+    /// Upstream `Impl::Allocate(size_t size)` (POSIX): plain anonymous
+    /// read-write mapping used as the non-fastmem fallback backing buffer.
+    fn allocate(size: usize) -> *mut u8 {
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            error!(
+                "Failed to allocate fallback buffer with size {:#x}, {}",
+                size,
+                std::io::Error::last_os_error()
+            );
+            return ptr::null_mut();
+        }
+        ptr as *mut u8
+    }
+
     fn new(backing_size: usize, virtual_size: usize) -> Result<Self, String> {
         unsafe {
             // Verify page size
@@ -568,7 +610,7 @@ impl HostMemoryImpl {
                 ptr::null_mut(),
                 backing_size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
+                libc::MAP_SHARED | map_nocore(),
                 fd,
                 0,
             );
@@ -585,7 +627,7 @@ impl HostMemoryImpl {
                 ptr::null_mut(),
                 virtual_size,
                 libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | map_noreserve(),
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | map_noreserve() | map_nocore(),
                 -1,
                 0,
             );
@@ -842,6 +884,13 @@ fn map_noreserve() -> i32 {
     0
 }
 
+/// Upstream `#ifndef MAP_NOCORE #define MAP_NOCORE 0 #endif` (POSIX): only
+/// FreeBSD-like systems define it; Linux and macOS use 0.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn map_nocore() -> i32 {
+    0
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for HostMemoryImpl {
     fn drop(&mut self) {
@@ -874,10 +923,11 @@ pub struct HostMemory {
     backing_base: *mut u8,
     virtual_base: *mut u8,
     virtual_base_offset: usize,
-    /// Fallback if fastmem is not supported.
-    /// Kept alive to ensure the backing memory is not freed.
-    #[allow(dead_code)]
-    fallback_buffer: Option<VirtualBuffer<u8>>,
+    /// Windows requires it for kernels whom lack proper support for some functions!
+    ///
+    /// Upstream `bool fallback_buffer{false}`: when set, `backing_base` was
+    /// allocated by `HostMemoryImpl::allocate` and is released in `Drop`.
+    fallback_buffer: bool,
 }
 
 impl HostMemory {
@@ -909,18 +959,43 @@ impl HostMemory {
                         backing_base,
                         virtual_base,
                         virtual_base_offset,
-                        fallback_buffer: None,
+                        fallback_buffer: false,
                     };
                 }
                 Err(e) => {
-                    error!("Fastmem unavailable ({}), falling back to VirtualBuffer", e);
+                    log::warn!(
+                        "Platform can support fastmem, but can't create it ({})",
+                        e
+                    );
                 }
             }
         }
 
-        // Fallback path
-        let mut fallback = VirtualBuffer::<u8>::with_count(backing_size);
-        let backing_base = fallback.data_mut();
+        // Upstream: `fallback_buffer = true; backing_base = impl->Allocate(backing_size);
+        // virtual_base = nullptr; impl.reset();`
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+        let backing_base = HostMemoryImpl::allocate(backing_size);
+        // Upstream `#if defined(__OPENORBIS__) || defined(__managarm__)`: the platform
+        // doesn't support fastmem at all.
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+        let backing_base = {
+            log::warn!("Platform doesn't support fastmem");
+            let ptr = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    backing_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                ptr::null_mut()
+            } else {
+                ptr as *mut u8
+            }
+        };
         Self {
             backing_size,
             virtual_size,
@@ -929,7 +1004,7 @@ impl HostMemory {
             backing_base,
             virtual_base: ptr::null_mut(),
             virtual_base_offset: 0,
-            fallback_buffer: Some(fallback),
+            fallback_buffer: true,
         }
     }
 
@@ -1056,6 +1131,25 @@ impl HostMemory {
         let addr = address as usize;
         let base = self.virtual_base as usize;
         addr >= base && addr < base + self.virtual_size
+    }
+}
+
+/// Upstream `HostMemory::~HostMemory()`: only the fallback buffer is owned
+/// directly; the fastmem arena is released by `HostMemoryImpl`'s `Drop`.
+impl Drop for HostMemory {
+    fn drop(&mut self) {
+        if self.fallback_buffer && !self.backing_base.is_null() {
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+                // Upstream passes `backing_size`; `MEM_RELEASE` requires a zero size.
+                VirtualFree(self.backing_base as *mut _, 0, MEM_RELEASE);
+            }
+            #[cfg(not(target_os = "windows"))]
+            unsafe {
+                libc::munmap(self.backing_base as *mut _, self.backing_size);
+            }
+        }
     }
 }
 

@@ -2163,14 +2163,12 @@ mod tests {
             let num_pages = mapped_size.div_ceil(PAGE_SIZE);
             let host_base = device_memory.buffer.backing_base_pointer() as usize;
             for page in base_page..base_page + num_pages {
-                let target = (page * PAGE_SIZE) as u64;
-                page_table.map_pages(
-                    page,
-                    1,
-                    target,
-                    PageType::Memory,
-                    host_base + target as usize,
-                );
+                // Identity-map the page onto the device backing at the same offset
+                // (entry = host page pointer - vaddr).
+                page_table
+                    .entries
+                    .get_and_fault(page)
+                    .store(false, PageType::Memory, 1, host_base);
             }
 
             memory

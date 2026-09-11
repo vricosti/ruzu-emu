@@ -541,8 +541,12 @@ mod tests {
             let device = Box::new(DeviceMemory::new());
             let mut table = Box::new(PageTable::new());
             table.resize(32, 12);
-            table.map_pages(3, 1, 0x3000, PageType::Memory,
-                device.buffer.backing_base_pointer() as usize + 0x3000);
+                        table.entries.get_and_fault(3).store(
+                false,
+                PageType::Memory,
+                1,
+                device.buffer.backing_base_pointer() as usize,
+            );
             let memory = Arc::new(Mutex::new(unsafe {
                 Memory::new(SystemRef::null(), device.as_ref() as *const _, &device.buffer as *const _)
             }));

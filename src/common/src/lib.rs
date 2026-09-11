@@ -55,7 +55,7 @@ pub mod host_memory;
 pub mod memory_detect;
 pub mod multi_level_page_table;
 pub mod page_table;
-pub mod virtual_buffer;
+pub mod sparse_large_vector;
 
 // Threading subsystem
 pub mod detached_tasks;

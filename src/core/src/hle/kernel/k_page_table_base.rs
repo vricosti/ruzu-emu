@@ -26,8 +26,10 @@ use super::k_resource_limit::{KResourceLimit, LimitableResource};
 use super::svc::svc_types::PageInfo;
 use super::svc_types::{CreateProcessFlag, MemoryState as SvcMemoryState, ADDRESS_SPACE_MASK};
 use crate::core::SystemRef;
+use crate::device_memory::dram_memory_map;
 use crate::hle::kernel::svc::svc_results;
 use crate::memory::memory::Memory;
+use common::page_table::{PageTable, TraversalContext, TraversalEntry};
 
 /// RAII wrapper for acquiring two page-table light locks in a stable address
 /// order. Mirrors the helper local to upstream `k_page_table_base.cpp`.
@@ -346,6 +348,11 @@ pub struct KPageTableBase {
     /// Reference to the Memory bridge (MapMemoryRegion/UnmapRegion/ProtectRegion).
     /// Upstream: `Core::Memory::Memory* m_memory`
     pub(crate) m_memory: Option<Arc<Mutex<Memory>>>,
+    /// Host backing base of the process `DeviceMemory` (0 = unknown), cached
+    /// when the Memory bridge is attached so `device_physical_addr` never has
+    /// to take the Memory lock. Upstream reads `m_system.DeviceMemory()`
+    /// directly; ruzu page tables can exist without a `System` (tests).
+    pub(crate) m_device_backing_base: std::sync::atomic::AtomicUsize,
     pub(crate) m_address_space_start: usize,
     pub(crate) m_address_space_end: usize,
     pub(crate) m_heap_region_start: usize,
@@ -398,6 +405,7 @@ impl KPageTableBase {
             m_system: SystemRef::null(),
             m_impl: None,
             m_memory: None,
+            m_device_backing_base: std::sync::atomic::AtomicUsize::new(0),
             m_address_space_start: 0,
             m_address_space_end: 0,
             m_heap_region_start: 0,
@@ -1040,7 +1048,11 @@ impl KPageTableBase {
         self.m_resource_limit = resource_limit;
         self.m_system = memory
             .as_ref()
-            .map(|memory| memory.lock().unwrap().system_ref())
+            .map(|memory| {
+                let memory = memory.lock().unwrap();
+                self.remember_device_backing_base(&memory);
+                memory.system_ref()
+            })
             .unwrap_or_else(SystemRef::null);
         self.m_memory = memory;
         let as_width = Self::get_address_space_width_from_flags(as_flags) as u32;
@@ -1322,8 +1334,21 @@ impl KPageTableBase {
     /// Set the Memory bridge and initialize the page table implementation.
     /// Must be called after InitializeForProcess.
     pub fn set_memory(&mut self, memory: Arc<Mutex<Memory>>) {
-        self.m_system = memory.lock().unwrap().system_ref();
+        {
+            let memory = memory.lock().unwrap();
+            self.remember_device_backing_base(&memory);
+            self.m_system = memory.system_ref();
+        }
         self.m_memory = Some(memory);
+    }
+
+    /// Cache the `DeviceMemory` backing base behind the Memory bridge (see
+    /// `m_device_backing_base`).
+    fn remember_device_backing_base(&self, memory: &Memory) {
+        if let Some(backing_base) = memory.device_memory_backing_base() {
+            self.m_device_backing_base
+                .store(backing_base, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Initialize the Common::PageTable impl.
@@ -2629,6 +2654,108 @@ impl KPageTableBase {
         0
     }
 
+    /// Upstream `m_system.DeviceMemory().GetPhysicalAddr(ptr)`. Tests build
+    /// page tables without a `System`; they still carry the process `Memory`,
+    /// whose device backing base gives the same translation.
+    fn device_physical_addr(&self, host_ptr: usize) -> Option<u64> {
+        if !self.m_system.is_null() {
+            return Some(
+                self.m_system
+                    .get()
+                    .device_memory()
+                    .get_physical_addr_uintptr(host_ptr),
+            );
+        }
+        let mut backing_base = self
+            .m_device_backing_base
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if backing_base == 0 {
+            // Page tables assembled by tests assign `m_memory` directly; fetch
+            // the base lazily without blocking on a lock held by the caller.
+            let memory = self.m_memory.as_ref()?.try_lock().ok()?;
+            backing_base = memory.device_memory_backing_base()?;
+            self.remember_device_backing_base(&memory);
+        }
+        Some(host_ptr.wrapping_sub(backing_base) as u64 + dram_memory_map::BASE)
+    }
+
+    /// Upstream `KPageTableBase::BeginTraversal` (Eden 5f142c7926 moved the
+    /// traversal from `Common::PageTable` into the kernel page table).
+    ///
+    /// Returns the first entry and the context to continue with, or `None`
+    /// when upstream would return `false`.
+    pub(crate) fn begin_traversal(
+        &self,
+        impl_pt: &PageTable,
+        address: u64,
+    ) -> Option<(TraversalEntry, TraversalContext)> {
+        let mut out_context = TraversalContext {
+            next_offset: address,
+            next_page: address >> PAGE_BITS,
+        };
+        let entry = self.continue_traversal(impl_pt, &mut out_context)?;
+        Some((entry, out_context))
+    }
+
+    /// Upstream `KPageTableBase::ContinueTraversal`.
+    pub(crate) fn continue_traversal(
+        &self,
+        impl_pt: &PageTable,
+        context: &mut TraversalContext,
+    ) -> Option<TraversalEntry> {
+        // Setup invalid defaults.
+        let mut out_entry = TraversalEntry {
+            phys_addr: 0,
+            block_size: PAGE_SIZE,
+        };
+        // Validate that we can read the actual entry.
+        let page = context.next_page as usize;
+        if page < impl_pt.entries.size() {
+            // Validate that the entry is mapped.
+            let paddr = impl_pt.entries[page].pointer(true);
+            if paddr != 0 {
+                // Populate the results and return true
+                out_entry.phys_addr = self
+                    .device_physical_addr(paddr.wrapping_add(context.next_offset as usize))
+                    .unwrap_or(0);
+                context.next_page += 1;
+                context.next_offset += PAGE_SIZE as u64;
+                return Some(out_entry);
+            }
+        }
+        context.next_page += 1;
+        context.next_offset += PAGE_SIZE as u64;
+        // Otherwise return false
+        None
+    }
+
+    /// Upstream `KPageTableBase::GetPhysicalAddressLocked`.
+    ///
+    /// Returns `None` only outside the address space (upstream `false`); like
+    /// upstream, an unmapped entry (null pointer) still translates
+    /// `0 + virt_addr` rather than failing.
+    fn get_physical_address_locked(&self, virt_addr: usize) -> Option<u64> {
+        if virt_addr > (1usize << self.m_address_space_width) {
+            return None;
+        }
+
+        let impl_pt = self.m_impl.as_ref()?;
+        let page = virt_addr >> PAGE_BITS;
+        if page >= impl_pt.entries.size() {
+            return None;
+        }
+        let pointer = impl_pt.entries[page].pointer(true);
+        self.device_physical_addr(pointer.wrapping_add(virt_addr))
+    }
+
+    /// Upstream `KPageTableBase::GetPhysicalAddress`: locks the table, then
+    /// resolves through `get_physical_address_locked`.
+    pub fn get_physical_address(&self, virt_addr: usize) -> Option<u64> {
+        // Lock the table.
+        let _lk = KScopedLightLock::new(&self.m_general_lock);
+        self.get_physical_address_locked(virt_addr)
+    }
+
     fn physical_contiguous_ranges(
         &self,
         address: usize,
@@ -2637,7 +2764,7 @@ impl KPageTableBase {
         let Some(impl_pt) = self.m_impl.as_ref() else {
             return Err(svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
         };
-        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(address as u64)
+        let Some((first_entry, mut traversal_context)) = self.begin_traversal(impl_pt, address as u64)
         else {
             return Err(svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
         };
@@ -2655,7 +2782,7 @@ impl KPageTableBase {
         let mut ranges = Vec::new();
 
         while consumed_size < size {
-            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+            let Some(next_entry) = self.continue_traversal(impl_pt, &mut traversal_context) else {
                 return Err(svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
             };
             let next_size = (size - consumed_size).min(next_entry.block_size);
@@ -2917,11 +3044,7 @@ impl KPageTableBase {
         // Get the physical address, if requested. Upstream:
         //   ASSERT(this->GetPhysicalAddressLocked(out_paddr, addr));
         if let Some(out_paddr) = out_paddr {
-            *out_paddr = match self
-                .m_impl
-                .as_ref()
-                .and_then(|p| p.get_physical_address(addr as u64))
-            {
+            *out_paddr = match self.get_physical_address_locked(addr) {
                 Some(p) => p,
                 None => {
                     log::error!(
@@ -4745,10 +4868,7 @@ impl KPageTableBase {
         // describes the actual phys for arbitrary VAs. Callers expect the
         // contiguous run starting at `addr`; we trust check_memory_state_range
         // already verified the VA range is uniformly mapped.
-        let phys_addr = self
-            .m_impl
-            .as_ref()
-            .and_then(|p| p.get_physical_address(addr as u64))?;
+        let phys_addr = self.get_physical_address_locked(addr)?;
         let is_heap = state == KMemoryState::NORMAL;
         Some((phys_addr, size, is_heap))
     }
@@ -4779,7 +4899,7 @@ impl KPageTableBase {
         let Some(impl_pt) = self.m_impl.as_ref() else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
-        let Some((mut entry, mut context)) = impl_pt.begin_traversal(addr as u64) else {
+        let Some((mut entry, mut context)) = self.begin_traversal(impl_pt, addr as u64) else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
 
@@ -4788,7 +4908,7 @@ impl KPageTableBase {
         let mut total_size = cur_size;
 
         while total_size < size {
-            let Some(next_entry) = impl_pt.continue_traversal(&mut context) else {
+            let Some(next_entry) = self.continue_traversal(impl_pt, &mut context) else {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             };
             entry = next_entry;
@@ -4888,7 +5008,7 @@ impl KPageTableBase {
         let Some(impl_pt) = self.m_impl.as_ref() else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
-        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(src_addr as u64)
+        let Some((first_entry, mut traversal_context)) = self.begin_traversal(impl_pt, src_addr as u64)
         else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
@@ -4940,7 +5060,7 @@ impl KPageTableBase {
         };
 
         while total_size < size {
-            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+            let Some(next_entry) = self.continue_traversal(impl_pt, &mut traversal_context) else {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             };
 
@@ -5007,7 +5127,7 @@ impl KPageTableBase {
         let Some(impl_pt) = self.m_impl.as_ref() else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
-        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(dst_addr as u64)
+        let Some((first_entry, mut traversal_context)) = self.begin_traversal(impl_pt, dst_addr as u64)
         else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
@@ -5068,7 +5188,7 @@ impl KPageTableBase {
         };
 
         while total_size < size {
-            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+            let Some(next_entry) = self.continue_traversal(impl_pt, &mut traversal_context) else {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             };
 
@@ -5141,7 +5261,7 @@ impl KPageTableBase {
         let Some(impl_pt) = self.m_impl.as_ref() else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
-        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(src_addr as u64)
+        let Some((first_entry, mut traversal_context)) = self.begin_traversal(impl_pt, src_addr as u64)
         else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
@@ -5193,7 +5313,7 @@ impl KPageTableBase {
         };
 
         while total_size < size {
-            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+            let Some(next_entry) = self.continue_traversal(impl_pt, &mut traversal_context) else {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             };
 
@@ -5259,7 +5379,7 @@ impl KPageTableBase {
         let Some(memory) = self.m_memory.as_ref() else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
-        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(src_addr as u64)
+        let Some((first_entry, mut traversal_context)) = self.begin_traversal(impl_pt, src_addr as u64)
         else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
@@ -5287,7 +5407,7 @@ impl KPageTableBase {
         };
 
         while total_size < size {
-            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+            let Some(next_entry) = self.continue_traversal(impl_pt, &mut traversal_context) else {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             };
 
@@ -5351,7 +5471,7 @@ impl KPageTableBase {
         let Some(impl_pt) = self.m_impl.as_ref() else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
-        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(dst_addr as u64)
+        let Some((first_entry, mut traversal_context)) = self.begin_traversal(impl_pt, dst_addr as u64)
         else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
@@ -5403,7 +5523,7 @@ impl KPageTableBase {
         };
 
         while total_size < size {
-            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+            let Some(next_entry) = self.continue_traversal(impl_pt, &mut traversal_context) else {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             };
 
@@ -5470,7 +5590,7 @@ impl KPageTableBase {
         let Some(impl_pt) = self.m_impl.as_ref() else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
-        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(dst_addr as u64)
+        let Some((first_entry, mut traversal_context)) = self.begin_traversal(impl_pt, dst_addr as u64)
         else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
@@ -5498,7 +5618,7 @@ impl KPageTableBase {
         };
 
         while total_size < size {
-            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+            let Some(next_entry) = self.continue_traversal(impl_pt, &mut traversal_context) else {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             };
 
@@ -5664,11 +5784,11 @@ impl KPageTableBase {
         let Some(dst_impl) = dst_table.m_impl.as_ref() else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
-        let Some((mut src_entry, mut src_context)) = src_impl.begin_traversal(src_addr as u64)
+        let Some((mut src_entry, mut src_context)) = self.begin_traversal(src_impl, src_addr as u64)
         else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
-        let Some((mut dst_entry, mut dst_context)) = dst_impl.begin_traversal(dst_addr as u64)
+        let Some((mut dst_entry, mut dst_context)) = self.begin_traversal(dst_impl, dst_addr as u64)
         else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
@@ -5702,7 +5822,7 @@ impl KPageTableBase {
 
             if offset + cur_copy_size != size {
                 if cur_src_addr + cur_min_size as u64 == cur_src_block_addr + cur_src_size as u64 {
-                    let Some(next_entry) = src_impl.continue_traversal(&mut src_context) else {
+                    let Some(next_entry) = self.continue_traversal(src_impl, &mut src_context) else {
                         return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
                     };
                     updated_src = cur_src_addr + cur_min_size as u64 != next_entry.phys_addr;
@@ -5712,7 +5832,7 @@ impl KPageTableBase {
                 if cur_dst_addr + cur_min_size as u64
                     == dst_entry.phys_addr + dst_entry.block_size as u64
                 {
-                    let Some(next_entry) = dst_impl.continue_traversal(&mut dst_context) else {
+                    let Some(next_entry) = self.continue_traversal(dst_impl, &mut dst_context) else {
                         return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
                     };
                     updated_dst = cur_dst_addr + cur_min_size as u64 != next_entry.phys_addr;
@@ -6408,7 +6528,7 @@ impl KPageTableBase {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             };
             let Some((first_entry, mut traversal_context)) =
-                src_impl.begin_traversal(mapping_src_start as u64)
+                self.begin_traversal(src_impl, mapping_src_start as u64)
             else {
                 rollback_ipc_server_mapping(
                     self,
@@ -6424,7 +6544,7 @@ impl KPageTableBase {
             let mut next_src_addr = mapping_src_start + PAGE_SIZE;
 
             while next_src_addr < mapping_src_end {
-                let Some(next_entry) = src_impl.continue_traversal(&mut traversal_context) else {
+                let Some(next_entry) = self.continue_traversal(src_impl, &mut traversal_context) else {
                     rollback_ipc_server_mapping(
                         self,
                         Some(updater.page_list()),
@@ -7234,11 +7354,11 @@ impl KPageTableBase {
             return result;
         }
 
-        if let Some(impl_pt) = self.m_impl.as_ref() {
+        if self.m_impl.is_some() {
             for page in 0..num_pages {
                 let va = dst + page * PAGE_SIZE;
                 let expected = phys_addr + (page * PAGE_SIZE) as u64;
-                if impl_pt.get_physical_address(va as u64) != Some(expected) {
+                if self.get_physical_address_locked(va) != Some(expected) {
                     return svc_results::RESULT_INVALID_MEMORY_REGION.get_inner_value();
                 }
             }
@@ -7462,7 +7582,7 @@ impl KPageTableBase {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
 
-        let Some((first_entry, mut traversal_context)) = impl_pt.begin_traversal(addr as u64)
+        let Some((first_entry, mut traversal_context)) = self.begin_traversal(impl_pt, addr as u64)
         else {
             return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
         };
@@ -7479,7 +7599,7 @@ impl KPageTableBase {
         let mut total_size = cur_size;
 
         while total_size < size {
-            let Some(next_entry) = impl_pt.continue_traversal(&mut traversal_context) else {
+            let Some(next_entry) = self.continue_traversal(impl_pt, &mut traversal_context) else {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             };
 
@@ -9307,13 +9427,9 @@ mod tests {
             0
         );
 
-        let dst_impl = dst.m_impl.as_ref().unwrap();
+        assert_eq!(dst.get_physical_address(out_addr), Some(phys_addr));
         assert_eq!(
-            dst_impl.get_physical_address(out_addr as u64),
-            Some(phys_addr)
-        );
-        assert_eq!(
-            dst_impl.get_physical_address((out_addr + PAGE_SIZE) as u64),
+            dst.get_physical_address(out_addr + PAGE_SIZE),
             Some(phys_addr + PAGE_SIZE as u64)
         );
         assert_eq!(dst.m_mapped_ipc_server_memory, 0);

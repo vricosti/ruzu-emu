@@ -829,12 +829,12 @@ mod tests {
         let device_memory = Box::new(DeviceMemory::with_size(0x4000));
         let mut page_table = Box::new(PageTable::new());
         page_table.resize(32, 12);
-        page_table.map_pages(
-            1,
-            1,
-            0x1000,
+        // Identity-map page 1 onto the device backing (entry = host page - vaddr).
+        page_table.entries.get_and_fault(1).store(
+            false,
             PageType::Memory,
-            device_memory.buffer.backing_base_pointer() as usize + 0x1000,
+            1,
+            device_memory.buffer.backing_base_pointer() as usize,
         );
         // Stable boxed backing/page table outlive all accesses through Memory.
         let memory = Arc::new(StdMutex::new(unsafe {

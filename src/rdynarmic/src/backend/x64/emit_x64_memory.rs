@@ -25,6 +25,7 @@ use rxbyak::{
     RegExp,
 };
 
+use crate::backend::common::emit_context::MemoryEmitConfig;
 use crate::backend::x64::emit_context::{DeferredEmit, DeferredEmitCtx, EmitContext};
 use crate::backend::x64::host_feature::HostFeature;
 use crate::backend::x64::reg_alloc::RegAlloc;
@@ -404,9 +405,8 @@ pub fn emit_fastmem_vaddr_a64(
 /// at the host-mapped page+offset.
 ///
 /// Mirrors upstream `EmitVAddrLookup<A64EmitContext>` in
-/// `emit_x64_memory.h:102-152`. ruzu does not currently set
-/// `page_table_present = true` so this path is dead code, but it is
-/// ported for upstream parity.
+/// `emit_x64_memory.h`. Live whenever the caller provides `page_table`
+/// (`page_table_present`); ruzu wires Eden's packed 8-byte entries here.
 ///
 /// Convention: the emitter assumes `r14` holds the page-table pointer
 /// (matching upstream which passes `page_table` via `r14`).
@@ -422,7 +422,7 @@ pub fn emit_vaddr_lookup_a64(
     let unused_top_bits = 64 - mem_conf.page_table_address_space_bits;
 
     let page = ra.scratch_gpr();
-    let tmp = if mem_conf.absolute_offset_page_table {
+    let tmp = if mem_conf.absolute_offset_page_table && mem_conf.page_table_pointer_mask == 0 {
         page
     } else {
         ra.scratch_gpr()
@@ -470,13 +470,7 @@ pub fn emit_vaddr_lookup_a64(
         .mov(page, qword_ptr(RegExp::from(rxbyak::R14) + tmp))
         .unwrap();
 
-    if mem_conf.page_table_pointer_mask_bits == 0 {
-        ra.asm.test(page, page).unwrap();
-    } else {
-        let mask = (!0u32 << mem_conf.page_table_pointer_mask_bits) as i32;
-        ra.asm.and_(page, mask).unwrap();
-    }
-    ra.asm.je(&abort, rxbyak::JmpType::Near).unwrap();
+    emit_page_entry_attribute_check(ra.asm, mem_conf, abort, page, tmp);
 
     if mem_conf.absolute_offset_page_table {
         return RegExp::from(page) + vaddr;
@@ -485,6 +479,40 @@ pub fn emit_vaddr_lookup_a64(
     ra.asm.mov(tmp, vaddr).unwrap();
     ra.asm.and_(tmp, PAGE_MASK as i32).unwrap();
     RegExp::from(page) + tmp
+}
+
+/// Shared tail of upstream `EmitVAddrLookup<A32/A64EmitContext>` after the
+/// entry load: marked-bit check, attribute mask, optional sign extension and
+/// the null-entry abort (`jz`).
+fn emit_page_entry_attribute_check(
+    asm: &mut CodeAssembler,
+    mem_conf: &MemoryEmitConfig,
+    abort: Label,
+    page: Reg,
+    tmp: Reg,
+) {
+    // check for marked bit, use as unmapped if marked
+    if let Some(marked_bit) = mem_conf.page_table_marked_bit {
+        asm.bt_imm(page, marked_bit).unwrap();
+        asm.jc(&abort, rxbyak::JmpType::Near).unwrap();
+    }
+    // mask away attributes
+    if mem_conf.page_table_pointer_mask == 0 {
+        asm.test(page, page).unwrap();
+    } else if mem_conf.page_table_pointer_mask <= i32::MAX as u64 {
+        // upstream: `std::in_range<s32>(page_table_pointer_mask)`
+        asm.and_(page, mem_conf.page_table_pointer_mask as i32)
+            .unwrap();
+    } else {
+        asm.mov(tmp, mem_conf.page_table_pointer_mask as i64).unwrap();
+        asm.and_(page, tmp).unwrap();
+    }
+    if let Some(sign_extension) = mem_conf.page_table_sign_extension {
+        asm.shl(page, sign_extension).unwrap();
+        asm.sar(page, sign_extension).unwrap();
+    }
+
+    asm.je(&abort, rxbyak::JmpType::Near).unwrap();
 }
 
 /// Emit the A32 page-table lookup from upstream
@@ -499,7 +527,7 @@ pub fn emit_vaddr_lookup_a32(
 ) -> RegExp {
     let mem_conf = &ctx.config.memory;
     let page = ra.scratch_gpr();
-    let tmp = if mem_conf.absolute_offset_page_table {
+    let tmp = if mem_conf.absolute_offset_page_table && mem_conf.page_table_pointer_mask == 0 {
         page
     } else {
         ra.scratch_gpr()
@@ -507,34 +535,23 @@ pub fn emit_vaddr_lookup_a32(
 
     emit_detect_misaligned_vaddr(ra.asm, ctx, bitsize, abort, vaddr, tmp);
 
-    // Upstream A32 assumes the virtual address was zero-extended from 32 bits.
+    ra.asm.mov(tmp, vaddr).unwrap();
+    ra.asm.shr(tmp, PAGE_BITS as u8).unwrap();
     ra.asm
-        .mov(tmp.cvt32().unwrap(), vaddr.cvt32().unwrap())
-        .unwrap();
-    ra.asm.shr(tmp.cvt32().unwrap(), PAGE_BITS as u8).unwrap();
-    ra.asm
-        .shl(tmp.cvt32().unwrap(), mem_conf.page_table_log2_stride as u8)
+        .shl(tmp, mem_conf.page_table_log2_stride as u8)
         .unwrap();
     ra.asm
         .mov(page, qword_ptr(RegExp::from(rxbyak::R14) + tmp))
         .unwrap();
 
-    if mem_conf.page_table_pointer_mask_bits == 0 {
-        ra.asm.test(page, page).unwrap();
-    } else {
-        let mask = (!0u32 << mem_conf.page_table_pointer_mask_bits) as i32;
-        ra.asm.and_(page, mask).unwrap();
-    }
-    ra.asm.je(&abort, rxbyak::JmpType::Near).unwrap();
+    emit_page_entry_attribute_check(ra.asm, mem_conf, abort, page, tmp);
 
     if mem_conf.absolute_offset_page_table {
         return RegExp::from(page) + vaddr;
     }
 
-    ra.asm
-        .mov(tmp.cvt32().unwrap(), vaddr.cvt32().unwrap())
-        .unwrap();
-    ra.asm.and_(tmp.cvt32().unwrap(), PAGE_MASK as i32).unwrap();
+    ra.asm.mov(tmp, vaddr).unwrap();
+    ra.asm.and_(tmp, PAGE_MASK as u32 as i32).unwrap();
     RegExp::from(page) + tmp
 }
 
@@ -545,7 +562,68 @@ fn _suppress_unused_warnings(_: DeferredEmit) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rxbyak::{R13, RAX};
+    use rxbyak::{R13, RAX, RCX};
+
+    fn page_entry_check_bytes(mem_conf: &MemoryEmitConfig) -> Vec<u8> {
+        let mut asm = CodeAssembler::new(4096).unwrap();
+        let abort = asm.create_label();
+        emit_page_entry_attribute_check(&mut asm, mem_conf, abort, RAX, RCX);
+        asm.bind(&abort).unwrap();
+        asm.code().to_vec()
+    }
+
+    /// Eden's packed 8-byte page entries (5f142c7926): `bt page, marked;
+    /// jc abort; mov tmp, mask64; and page, tmp; shl/sar page, sign;
+    /// jz abort` — the mask does not fit `s32`, so it goes through `tmp`.
+    #[test]
+    fn page_entry_attribute_check_marked_bit_mask64_and_sign_extension() {
+        let mem_conf = MemoryEmitConfig {
+            page_table_pointer_mask: 0x00FF_FFFF_FFFF_F000,
+            page_table_marked_bit: Some(0),
+            page_table_sign_extension: Some(57),
+            ..MemoryEmitConfig::default()
+        };
+        let expected: Vec<u8> = [
+            &[0x48, 0x0F, 0xBA, 0xE0, 0x00][..], // bt rax, 0
+            &[0x0F, 0x82, 0x1B, 0x00, 0x00, 0x00], // jc near abort (+27)
+            &[
+                0x48, 0xB9, 0x00, 0xF0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+            ], // mov rcx, 0x00FFFFFFFFFFF000
+            &[0x48, 0x21, 0xC8],       // and rax, rcx
+            &[0x48, 0xC1, 0xE0, 0x39], // shl rax, 57
+            &[0x48, 0xC1, 0xF8, 0x39], // sar rax, 57
+            &[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00], // je near abort (+0)
+        ]
+        .concat();
+        assert_eq!(page_entry_check_bytes(&mem_conf), expected);
+    }
+
+    /// A mask that fits `s32` uses the immediate form (`std::in_range<s32>`).
+    #[test]
+    fn page_entry_attribute_check_small_mask_uses_immediate_and() {
+        let mem_conf = MemoryEmitConfig {
+            page_table_pointer_mask: 0x7FFF_F000,
+            ..MemoryEmitConfig::default()
+        };
+        let expected: Vec<u8> = [
+            &[0x48, 0x25, 0x00, 0xF0, 0xFF, 0x7F][..], // and rax, 0x7FFFF000
+            &[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00],     // je near abort
+        ]
+        .concat();
+        assert_eq!(page_entry_check_bytes(&mem_conf), expected);
+    }
+
+    /// No attributes: upstream keeps `test page, page; jz abort`.
+    #[test]
+    fn page_entry_attribute_check_without_mask_tests_register() {
+        let mem_conf = MemoryEmitConfig::default();
+        let expected: Vec<u8> = [
+            &[0x48, 0x85, 0xC0][..],               // test rax, rax
+            &[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00], // je near abort
+        ]
+        .concat();
+        assert_eq!(page_entry_check_bytes(&mem_conf), expected);
+    }
 
     /// Verify is_ordered matches upstream IsOrdered semantics.
     #[test]

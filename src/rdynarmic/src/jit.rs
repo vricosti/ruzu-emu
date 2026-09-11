@@ -1727,6 +1727,93 @@ mod tests {
         drop(page_memory);
     }
 
+    /// Eden's packed 8-byte page entries (5f142c7926): the low 12 bits carry
+    /// `marked | type | block` attributes, so the lookup must mask them with
+    /// `ATTRIBUTE_MASK` before adding the guest address, and treat a marked
+    /// entry as unmapped (callback fallback).
+    #[repr(align(4096))]
+    struct AlignedPage([u8; 0x1000]);
+
+    fn a32_packed_page_entry_config(
+        entry: u64,
+    ) -> (A32UserConfig, Vec<u64>, Box<AlignedPage>) {
+        const ATTRIBUTE_MASK: u64 = ((1u64 << 44) - 1) << 12;
+        let code: [u32; 2] = [
+            0xE590_1000, // ldr r1, [r0]
+            0xEF00_0000, // svc #0
+        ];
+        let mut callback_memory = vec![0u8; 0x10_000];
+        for (index, instruction) in code.iter().enumerate() {
+            callback_memory[index * 4..index * 4 + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        callback_memory[0x3000..0x3004].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let mut page_memory = Box::new(AlignedPage([0u8; 0x1000]));
+        page_memory.0[0..4].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        let mut page_table = vec![0u64; 1 << (16 - 12)];
+        let packed_pointer = (page_memory.0.as_ptr() as u64).wrapping_sub(0x3000);
+        assert_eq!(packed_pointer & !ATTRIBUTE_MASK, 0, "test pointer must be attribute-free");
+        page_table[3] = packed_pointer | entry;
+
+        let mut config =
+            A32UserConfig::new(Box::new(MockCallbacks::from_memory(0, callback_memory)));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 16 * 1024 * 1024;
+        config.optimizations = OptimizationFlag::NO_OPTIMIZATIONS;
+        config.unsafe_optimizations = false;
+        config.global_monitor = None;
+        config.fastmem_pointer = None;
+        config.define_unpredictable_behaviour = false;
+        config.arch_version = crate::interface::a32::arch_version::ArchVersion::V8;
+        config.hook_hint_instructions = false;
+        config.processor_id = 0;
+        config.wall_clock_cntpct = false;
+        config.hook_isb = false;
+        config.page_table =
+            Some((page_table.as_ptr()) as *mut [*mut u8; A32UserConfig::NUM_PAGE_TABLE_ENTRIES]);
+        config.page_table_log2_stride = 3;
+        config.page_table_pointer_mask = ATTRIBUTE_MASK;
+        config.page_table_marked_bit = Some(0);
+        config.absolute_offset_page_table = true;
+        (config, page_table, page_memory)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a32_page_table_masks_packed_entry_attributes() {
+        // `Memory` type (0b01 << 1) with block id 0x1AB spread over `block`/`block2`.
+        let attributes = (0b01u64 << 1) | ((0x1ABu64 & 0x1FF) << 3) | ((0x1ABu64 >> 9) << 57);
+        let (config, page_table, page_memory) = a32_packed_page_entry_config(attributes);
+        let mut jit = A32Jit::new(config).expect("A32 JIT");
+        jit.set_register(0, 0x3000);
+        jit.set_register(15, 0);
+
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(1), 0xCAFE_BABE);
+
+        drop(jit);
+        drop(page_table);
+        drop(page_memory);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a32_page_table_marked_entry_falls_back_to_callbacks() {
+        // `MarkRasterizerCached` sets the low three bits; the host pointer stays
+        // in the entry but the inline lookup must not use it.
+        let (config, page_table, page_memory) = a32_packed_page_entry_config(0b111);
+        let mut jit = A32Jit::new(config).expect("A32 JIT");
+        jit.set_register(0, 0x3000);
+        jit.set_register(15, 0);
+
+        assert!(jit.run().contains(HaltReason::SVC));
+        assert_eq!(jit.get_register(1), 0xDEAD_BEEF);
+
+        drop(jit);
+        drop(page_table);
+        drop(page_memory);
+    }
+
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     #[test]
     fn a32_fastmem_fault_recompiles_to_page_table() {
@@ -2522,7 +2609,7 @@ mod tests {
         config.page_table_address_space_bits = 16;
         config.silently_mirror_page_table = true;
         config.absolute_offset_page_table = true;
-        config.page_table_pointer_mask_bits = 0;
+        config.page_table_pointer_mask = 0;
         config.page_table_log2_stride = 3;
         config.detect_misaligned_access_via_page_table = 0;
         config.only_detect_misalignment_via_page_table_on_page_boundary = false;
@@ -2704,7 +2791,7 @@ mod tests {
         config.page_table_address_space_bits = 16;
         config.silently_mirror_page_table = true;
         config.absolute_offset_page_table = true;
-        config.page_table_pointer_mask_bits = 0;
+        config.page_table_pointer_mask = 0;
         config.page_table_log2_stride = 3;
         config.detect_misaligned_access_via_page_table = 0;
         config.only_detect_misalignment_via_page_table_on_page_boundary = false;
@@ -4811,7 +4898,7 @@ mod tests {
         config.page_table_address_space_bits = 39;
         config.silently_mirror_page_table = false;
         config.absolute_offset_page_table = true;
-        config.page_table_pointer_mask_bits = 0;
+        config.page_table_pointer_mask = 0;
         config.page_table_log2_stride = 3;
         config.detect_misaligned_access_via_page_table = 0;
         config.only_detect_misalignment_via_page_table_on_page_boundary = false;

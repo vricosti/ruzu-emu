@@ -10,7 +10,7 @@
 
 use common::multi_level_page_table::MultiLevelPageTable;
 use common::range_map::RangeMap;
-use common::virtual_buffer::VirtualBuffer;
+use common::sparse_large_vector::SparseLargeVector;
 
 use crate::cache_types::CacheType;
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
@@ -108,7 +108,7 @@ fn gpu_va_trace_enabled() -> bool {
 /// It is wrapped by the outer `MemoryManager` struct that adds the `Arc<Mutex<>>` layer.
 ///
 /// Architecture:
-/// - Big page table (`big_page_table_dev`): `VirtualBuffer<u32>` storing `dev_addr >> CPU_PAGE_BITS`
+/// - Big page table (`big_page_table_dev`): `SparseLargeVector<u32>` storing `dev_addr >> CPU_PAGE_BITS`
 ///   per big page (default 64KB).
 /// - Small page table (`page_table`): `MultiLevelPageTable<u32>` storing `dev_addr >> CPU_PAGE_BITS`
 ///   per 4KB page.
@@ -135,7 +135,7 @@ pub struct GpuMemoryManager {
     entries: Vec<u64>,
 
     // Big page table (addresses < split_address)
-    big_page_table_dev: VirtualBuffer<u32>,
+    big_page_table_dev: SparseLargeVector<u32>,
     /// Bitpacked entry types for big pages, 2 bits each, 32 per u64.
     big_entries: Vec<u64>,
     /// Continuity bitmap for big pages, 1 bit each, 64 per u64.
@@ -231,8 +231,8 @@ impl GpuMemoryManager {
             effective_page_bits as usize,
         );
 
-        let mut big_page_table_dev = VirtualBuffer::<u32>::new();
-        big_page_table_dev.resize(big_page_table_size as usize);
+        let mut big_page_table_dev = SparseLargeVector::<u32>::new();
+        big_page_table_dev.resize_and_clear(big_page_table_size as usize);
 
         let big_entries = vec![0u64; (big_page_table_size as usize) / ENTRIES_PER_U64];
         let big_page_continuous = vec![0u64; (big_page_table_size as usize) / CONTINUOUS_BITS];
@@ -474,7 +474,7 @@ impl GpuMemoryManager {
                 let current_dev_addr = dev_addr + offset;
                 let index = self.page_entry_index_big(current_gpu_addr);
                 let sub_value = (current_dev_addr >> CPU_PAGE_BITS) as u32;
-                self.big_page_table_dev[index] = sub_value;
+                self.big_page_table_dev.set(index, sub_value);
                 let is_continuous = self.is_device_big_page_continuous(current_dev_addr);
                 self.set_big_page_continuous(index, is_continuous);
             }

@@ -2377,20 +2377,24 @@ mod tests {
         };
         let mut page_table = Box::new(PageTable::new());
         page_table.resize(36, PAGE_BITS as usize);
-        page_table.map_pages(
-            0x4000_0000 >> PAGE_BITS,
-            1,
-            target,
-            PageType::Memory,
-            host_ptr as usize,
-        );
-        page_table.map_pages(
-            0x4000_1000 >> PAGE_BITS,
-            1,
-            target + PAGE_SIZE,
-            PageType::Memory,
-            unsafe { host_ptr.add(PAGE_SIZE as usize) } as usize,
-        );
+        page_table
+            .entries
+            .get_and_fault((0x4000_0000 >> PAGE_BITS) as usize)
+            .store(
+                false,
+                PageType::Memory,
+                1,
+                (host_ptr as usize).wrapping_sub(0x4000_0000),
+            );
+        page_table
+            .entries
+            .get_and_fault((0x4000_1000 >> PAGE_BITS) as usize)
+            .store(
+                false,
+                PageType::Memory,
+                1,
+                (host_ptr as usize).wrapping_sub(0x4000_0000),
+            );
         memory.set_current_page_table(&mut *page_table, true);
 
         let asid = mgr.smmu_register_process(Some(Arc::new(Mutex::new(memory))));
@@ -2433,20 +2437,24 @@ mod tests {
         };
         let mut page_table = Box::new(PageTable::new());
         page_table.resize(36, PAGE_BITS as usize);
-        page_table.map_pages(
-            0x4000_0000 >> PAGE_BITS,
-            1,
-            first_target,
-            PageType::Memory,
-            first_host_ptr as usize,
-        );
-        page_table.map_pages(
-            0x4000_1000 >> PAGE_BITS,
-            1,
-            second_target,
-            PageType::Memory,
-            second_host_ptr as usize,
-        );
+        page_table
+            .entries
+            .get_and_fault((0x4000_0000 >> PAGE_BITS) as usize)
+            .store(
+                false,
+                PageType::Memory,
+                1,
+                (first_host_ptr as usize).wrapping_sub(0x4000_0000),
+            );
+        page_table
+            .entries
+            .get_and_fault((0x4000_1000 >> PAGE_BITS) as usize)
+            .store(
+                false,
+                PageType::Memory,
+                2,
+                (second_host_ptr as usize).wrapping_sub(0x4000_1000),
+            );
         memory.set_current_page_table(&mut *page_table, true);
 
         let asid = mgr.smmu_register_process(Some(Arc::new(Mutex::new(memory))));
@@ -2474,20 +2482,24 @@ mod tests {
         };
         let mut page_table = Box::new(PageTable::new());
         page_table.resize(36, PAGE_BITS as usize);
-        page_table.map_pages(
-            0x4000_0000 >> PAGE_BITS,
-            1,
-            target,
-            PageType::Memory,
-            host_ptr as usize,
-        );
-        page_table.map_pages(
-            0x4000_1000 >> PAGE_BITS,
-            1,
-            target + PAGE_SIZE,
-            PageType::Memory,
-            unsafe { host_ptr.add(PAGE_SIZE as usize) } as usize,
-        );
+        page_table
+            .entries
+            .get_and_fault((0x4000_0000 >> PAGE_BITS) as usize)
+            .store(
+                false,
+                PageType::Memory,
+                1,
+                (host_ptr as usize).wrapping_sub(0x4000_0000),
+            );
+        page_table
+            .entries
+            .get_and_fault((0x4000_1000 >> PAGE_BITS) as usize)
+            .store(
+                false,
+                PageType::Memory,
+                1,
+                (host_ptr as usize).wrapping_sub(0x4000_0000),
+            );
         memory.set_current_page_table(&mut *page_table, true);
 
         let asid = mgr.smmu_register_process(Some(Arc::new(Mutex::new(memory))));

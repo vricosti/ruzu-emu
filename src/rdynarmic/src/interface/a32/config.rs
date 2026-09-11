@@ -138,8 +138,21 @@ pub struct UserConfig {
     pub fastmem_pointer: Option<*mut u8>,
     pub optimizations: OptimizationFlag,
     pub code_cache_size: u32,
-    pub page_table_pointer_mask_bits: i32,
-    pub page_table_log2_stride: usize,
+    /// Applies a bit mask to the bits in host pointers from the page table.
+    /// The intention behind this is to allow users of Dynarmic to pack attributes in the
+    /// same integer and update the pointer attribute pair atomically.
+    /// If the configured value is ~(0b111ULL), all pointers will be forcefully aligned to 8 bytes.
+    pub page_table_pointer_mask: u64,
+    /// Log2 of the size per page entry, value should be either 3 or 4
+    pub page_table_log2_stride: u32,
+    /// Setting this value has Dynarmic check the specified bit of the page pointer provided by
+    /// page table. If the bit is set to 1, Dynarmic will treat it as unmapped.
+    /// This bit should be included as part of `page_table_pointer_mask`.
+    pub page_table_marked_bit: Option<u8>,
+    /// If this value is set, Dynarmic will sign extend the page table pointer by this bit.
+    /// Useful for compacting bits into the page table and should be used as part of
+    /// `page_table_pointer_mask`.
+    pub page_table_sign_extension: Option<u8>,
     pub arch_version: ArchVersion,
     pub processor_id: u8,
     pub detect_misaligned_access_via_page_table: u8,
@@ -173,8 +186,10 @@ impl UserConfig {
             fastmem_pointer: None,
             optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
             code_cache_size: Self::DEFAULT_CODE_CACHE_SIZE,
-            page_table_pointer_mask_bits: 0,
+            page_table_pointer_mask: 0,
             page_table_log2_stride: 3,
+            page_table_marked_bit: None,
+            page_table_sign_extension: None,
             arch_version: ArchVersion::V8,
             processor_id: 0,
             detect_misaligned_access_via_page_table: 0,
@@ -297,7 +312,10 @@ mod tests {
         assert_eq!(UserConfig::PAGE_BITS, 12);
         assert_eq!(UserConfig::NUM_PAGE_TABLE_ENTRIES, 1 << 20);
         assert_eq!(config.code_cache_size, 128 * 1024 * 1024);
+        assert_eq!(config.page_table_pointer_mask, 0);
         assert_eq!(config.page_table_log2_stride, 3);
+        assert_eq!(config.page_table_marked_bit, None);
+        assert_eq!(config.page_table_sign_extension, None);
         assert_eq!(config.arch_version, ArchVersion::V8);
         assert!(config.recompile_on_fastmem_failure);
         assert!(config.recompile_on_exclusive_fastmem_failure);

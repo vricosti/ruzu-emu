@@ -13,6 +13,7 @@ enum PendingBranch {
     Cond { offset: usize, cond: Cond },
     CbzX { offset: usize, rt: u8 },
     CbnzX { offset: usize, rt: u8 },
+    TbnzX { offset: usize, rt: u8, bit: u8 },
 }
 
 #[derive(Default, Debug)]
@@ -49,6 +50,10 @@ impl Label {
                 PendingBranch::CbnzX { offset, rt } => {
                     let pc_offset = branch_pc_offset(offset, target_offset)?;
                     code.patch_u32(offset, inst::cbnz_x(rt, pc_offset))?;
+                }
+                PendingBranch::TbnzX { offset, rt, bit } => {
+                    let pc_offset = branch_pc_offset(offset, target_offset)?;
+                    code.patch_u32(offset, inst::tbnz_x(rt, bit, pc_offset))?;
                 }
             }
         }
@@ -95,6 +100,18 @@ impl Label {
             code.patch_u32(offset, inst::cbnz_x(rt, pc_offset))?;
         } else {
             self.pending.push(PendingBranch::CbnzX { offset, rt });
+        }
+        Ok(offset)
+    }
+
+    /// `tbnz xT, #bit, label` (oaknut `TBNZ(XReg, imm, Label&)`).
+    pub fn tbnz_x(&mut self, code: &mut BlockOfCode, rt: u8, bit: u8) -> Result<usize, String> {
+        let offset = code.write_u32(inst::tbnz_x(rt, bit, 0))?;
+        if let Some(target_offset) = self.offset {
+            let pc_offset = branch_pc_offset(offset, target_offset)?;
+            code.patch_u32(offset, inst::tbnz_x(rt, bit, pc_offset))?;
+        } else {
+            self.pending.push(PendingBranch::TbnzX { offset, rt, bit });
         }
         Ok(offset)
     }

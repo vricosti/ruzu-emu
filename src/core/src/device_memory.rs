@@ -40,8 +40,15 @@ impl DeviceMemory {
     /// # Safety
     /// The pointer must be within the backing memory range.
     pub unsafe fn get_physical_addr(&self, ptr: *const u8) -> u64 {
-        let offset = ptr as usize - self.buffer.backing_base_pointer() as usize;
-        offset as u64 + dram_memory_map::BASE
+        self.get_physical_addr_uintptr(ptr as usize)
+    }
+
+    /// Upstream `GetPhysicalAddr(uintptr_t ptr)` overload (Eden 5f142c7926):
+    /// the integer form used by the page-table traversal, where the host
+    /// pointer comes packed out of a `PageEntryData`.
+    pub fn get_physical_addr_uintptr(&self, ptr: usize) -> u64 {
+        (ptr.wrapping_sub(self.buffer.backing_base_pointer() as usize)) as u64
+            + dram_memory_map::BASE
     }
 
     /// Gets the raw physical address (without DramMemoryMap::Base offset).

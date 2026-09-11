@@ -780,8 +780,10 @@ impl A64Jit {
                     page_table_address_space_bits: config.page_table_address_space_bits as usize,
                     silently_mirror_page_table: config.silently_mirror_page_table,
                     absolute_offset_page_table: config.absolute_offset_page_table,
-                    page_table_pointer_mask_bits: config.page_table_pointer_mask_bits as u32,
-                    page_table_log2_stride: config.page_table_log2_stride,
+                    page_table_pointer_mask: config.page_table_pointer_mask,
+                    page_table_log2_stride: config.page_table_log2_stride as usize,
+                    page_table_marked_bit: config.page_table_marked_bit,
+                    page_table_sign_extension: config.page_table_sign_extension,
                     detect_misaligned_access_via_page_table: config
                         .detect_misaligned_access_via_page_table
                         as u32,

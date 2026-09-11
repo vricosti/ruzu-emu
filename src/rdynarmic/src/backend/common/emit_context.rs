@@ -32,10 +32,17 @@ pub struct MemoryEmitConfig {
     /// If true, page-table entries are stored as `host_ptr - vaddr` so the
     /// lookup result is `page + vaddr` directly.
     pub absolute_offset_page_table: bool,
-    /// Number of low bits in page-table entries that are attribute flags.
-    pub page_table_pointer_mask_bits: u32,
+    /// Bit mask applied to page-table entries to strip packed attributes
+    /// (upstream `page_table_pointer_mask`; 0 means no attributes).
+    pub page_table_pointer_mask: u64,
     /// Log2 byte stride between page-table entries; upstream permits 3 or 4.
     pub page_table_log2_stride: usize,
+    /// Entry bit that marks a page as unmapped for the inline lookup
+    /// (upstream `page_table_marked_bit`).
+    pub page_table_marked_bit: Option<u8>,
+    /// Sign-extend the masked entry by this bit (upstream
+    /// `page_table_sign_extension`).
+    pub page_table_sign_extension: Option<u8>,
     /// Bitmask of access widths to detect misalignment for via the page-table
     /// path. `16 | 32 | 64 | 128` matches upstream zuyu.
     pub detect_misaligned_access_via_page_table: u32,
@@ -61,8 +68,10 @@ impl Default for MemoryEmitConfig {
             page_table_address_space_bits: 64,
             silently_mirror_page_table: true,
             absolute_offset_page_table: false,
-            page_table_pointer_mask_bits: 0,
+            page_table_pointer_mask: 0,
             page_table_log2_stride: 3,
+            page_table_marked_bit: None,
+            page_table_sign_extension: None,
             detect_misaligned_access_via_page_table: 0,
             only_detect_misalignment_via_page_table_on_page_boundary: false,
             check_halt_on_memory_access: false,

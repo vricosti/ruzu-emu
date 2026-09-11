@@ -18,7 +18,7 @@ use crate::vulkan_common::vulkan_memory_allocator::{AllocatedImage, MemoryAlloca
 use super::util;
 
 pub const SGSR_STAGE_COUNT: usize = 1;
-type PushConstants = [u32; 4 + 2 + 1];
+type PushConstants = [u32; 4 + 2 + 2 + 1];
 
 struct Images {
     descriptor_sets: Vec<vk::DescriptorSet>,
@@ -223,18 +223,23 @@ impl Sgsr {
 
         let input_width = input_image_extent.width as f32;
         let input_height = input_image_extent.height as f32;
-        let viewport_width = (crop_rect[2] - crop_rect[0]) * input_width;
-        let viewport_height = (crop_rect[3] - crop_rect[1]) * input_height;
-        let sharpening =
-            *common::settings::values().fsr_sharpening_slider.get_value() as f32 / 100.0;
+        let crop_width = (crop_rect[2] - crop_rect[0]) * input_width;
+        let crop_height = (crop_rect[3] - crop_rect[1]) * input_height;
+        const EDGE_SHARPNESS_MAX: f32 = 2.0;
+        let edge_sharpness = EDGE_SHARPNESS_MAX
+            - *common::settings::values().fsr_sharpening_slider.get_value() as f32 / 200.0;
+        // Layout matches the shaders' push constant block:
+        //   vec4 viewport_info; vec2 resize_factor; vec2 crop_offset; float edge_sharpness.
         let push_constants: PushConstants = [
-            (1.0 / viewport_width).abs().to_bits(),
-            (1.0 / viewport_height).abs().to_bits(),
-            viewport_width.abs().to_bits(),
-            viewport_height.abs().to_bits(),
-            (viewport_width / input_width).to_bits(),
-            (viewport_height / input_height).to_bits(),
-            sharpening.to_bits(),
+            (1.0 / input_width).to_bits(),
+            (1.0 / input_height).to_bits(),
+            input_width.to_bits(),
+            input_height.to_bits(),
+            (crop_width / input_width).to_bits(),
+            (crop_height / input_height).to_bits(),
+            crop_rect[0].min(crop_rect[2]).to_bits(),
+            crop_rect[1].min(crop_rect[3]).to_bits(),
+            edge_sharpness.to_bits(),
         ];
 
         self.upload_images(device, scheduler);

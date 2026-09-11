@@ -729,13 +729,26 @@ impl MetalScheduler {
     ) -> Result<(), MetalSchedulerError> {
         let status = command_buffer.status();
         if status == MTLCommandBufferStatus::Completed {
-            Ok(())
-        } else {
-            let reason = command_buffer.error()
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "no driver error description".to_owned());
-            Err(MetalSchedulerError::CommandBufferFailed(status, reason))
+            return Ok(());
         }
+        let reason = command_buffer.error()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no driver error description".to_owned());
+        if status == MTLCommandBufferStatus::Error {
+            // A committed buffer the driver failed (a GPU hang, typically) is
+            // Metal's device loss. Eden's `vk::Check` throws out of the Vulkan
+            // worker and terminates the process; the Vulkan port aborts the
+            // same way. Continuing instead leaves this cohort at the queue
+            // head, so every later flush fails before `commit` and the fences
+            // created for those flushes retain never-enqueued buffers until
+            // the queue's command-buffer limit makes `commandBuffer` block
+            // forever - under the rasterizer lock, ahead of every CPU write
+            // and of shutdown.
+            log::error!("Metal command buffer failed: {reason}");
+            crate::vulkan_common::vulkan_device::report_device_loss();
+            std::process::abort();
+        }
+        Err(MetalSchedulerError::CommandBufferFailed(status, reason))
     }
 }
 

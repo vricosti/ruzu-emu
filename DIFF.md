@@ -16719,3 +16719,27 @@ unchanged.
   `selection_mutex`; a manager abandoned mid-update is logged and left leaked
   rather than hanging shutdown). Regression:
   `finalize_services_releases_sessions_of_an_abandoned_guest_manager`.
+
+## 2026-09-11 — Metal device loss: renderer_metal/metal_scheduler.rs vs renderer_vulkan/vk_scheduler.cpp, vulkan_common/vulkan_device.cpp
+
+### Intentional differences
+- Eden has no Metal backend; its device-loss contract is Vulkan's: on
+  `VK_ERROR_DEVICE_LOST` the scheduler calls `Device::ReportLoss` and
+  `vk::Check` throws out of the worker thread, which terminates the process. The
+  Rust Vulkan worker aborts explicitly for the same reason. The Metal scheduler
+  now does the same when a *committed* command buffer completes with
+  `MTLCommandBufferStatus::Error` (a GPU hang, `kIOGPUCommandBufferCallbackErrorHang`
+  in the observed session): it logs the driver reason, reuses
+  `vulkan_device::report_device_loss` for the same message and log-flush wait,
+  and aborts. `NotEnqueued` and other non-terminal statuses keep returning
+  `CommandBufferFailed`, as the retirement tests rely on.
+- Without this the failed cohort stays at the queue head by design, every later
+  `flush` fails before `commit`, and each `create_fence` retains a never-enqueued
+  buffer; after 64 of them (`MTLCommandQueue`'s default limit) `commandBuffer`
+  blocks forever while the GPU thread holds the rasterizer lock. A live sample
+  showed that wedging a CPU core (guest write → `Memory` lock → rasterizer lock),
+  `HLE:vi` (parcel write → `Memory` lock) and shutdown (`Container::on_terminate`
+  → `SurfaceFlinger::destroy_layer` → VI lock held by `HLE:vi`). The lock order
+  itself is unchanged; it only deadlocks when the GPU thread blocks indefinitely.
+- The GPU hang that TOTK provokes under the Metal renderer is a separate,
+  unresolved renderer defect.

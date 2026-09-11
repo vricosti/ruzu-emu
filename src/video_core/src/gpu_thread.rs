@@ -354,8 +354,17 @@ impl ThreadManager {
     /// Rust drops fields in declaration order and frees its boxed scheduler,
     /// so `Gpu::drop` calls this explicitly before either borrowed owner.
     pub(crate) fn shutdown(&mut self) {
-        self.request_stop();
+        self.notify_shutdown();
+    }
+
+    /// Port of `ThreadManager::NotifyShutdown`.
+    ///
+    /// Request an immediate stop and join the GPU thread if it is still
+    /// running, so that nothing it references is torn down underneath it
+    /// (upstream: "STOP now, and DESTROY yourself"). Idempotent.
+    pub fn notify_shutdown(&mut self) {
         if let Some(thread) = self.thread.take() {
+            self.request_stop();
             let _ = thread.join();
         }
     }
@@ -498,6 +507,21 @@ mod tests {
         manager.shutdown();
         assert!(manager.thread.is_none());
         manager.shutdown();
+        assert!(manager.thread.is_none());
+    }
+
+    #[test]
+    fn notify_shutdown_stops_joins_and_is_idempotent() {
+        let mut manager = ThreadManager::new(SystemRef::null());
+        let state = Arc::clone(&manager.state);
+        let stop = Arc::clone(&manager.stop);
+        manager.thread = Some(std::thread::spawn(move || {
+            let _ = state.pop_wait(&stop);
+        }));
+        manager.notify_shutdown();
+        assert!(manager.thread.is_none());
+        assert!(manager.stop.load(Ordering::Relaxed));
+        manager.notify_shutdown();
         assert!(manager.thread.is_none());
     }
 

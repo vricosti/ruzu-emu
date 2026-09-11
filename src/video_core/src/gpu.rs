@@ -638,6 +638,15 @@ impl Gpu {
 
     /// Notify shutdown.
     pub fn notify_shutdown(&self) {
+        // Upstream `GPU::Impl::NotifyShutdown` first calls
+        // `gpu_thread.NotifyShutdown()`: request an immediate stop and join
+        // the GPU thread, so it cannot keep running against objects the rest
+        // of the shutdown sequence is tearing down. The worker only blocks in
+        // the stop-aware `pop_wait` and never locks `gpu_thread` itself.
+        self.gpu_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .notify_shutdown();
         let _lock = self.sync_requests.lock().unwrap();
         self.shutting_down.store(true, Ordering::Relaxed);
         self.sync_request_cv.notify_all();

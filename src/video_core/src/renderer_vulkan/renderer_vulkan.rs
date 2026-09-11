@@ -396,7 +396,7 @@ impl RendererVulkan {
             device.is_ext_4444_formats_supported(),
             device.is_khr_image_format_list_supported(),
             device.is_optimal_astc_supported(),
-            device.is_ext_custom_border_color_supported(),
+            device.is_custom_border_color_usable(),
             device.is_ext_sampler_filter_minmax_supported(),
             device.get_max_viewports(),
             device.get_max_vertex_input_attributes(),

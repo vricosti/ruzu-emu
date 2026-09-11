@@ -227,12 +227,11 @@ fn border_color_swizzle_supported(
     extension_available: bool,
     custom_border_color_supported: bool,
     border_color_swizzle: vk::Bool32,
-    border_color_swizzle_from_image: vk::Bool32,
 ) -> bool {
-    extension_available
-        && custom_border_color_supported
-        && border_color_swizzle != vk::FALSE
-        && border_color_swizzle_from_image != vk::FALSE
+    // Upstream no longer requires `borderColorSwizzleFromImage`: samplers that
+    // need it carry an explicit border color component mapping instead
+    // (`Device::NeedsBorderColorSwizzleMapping`).
+    extension_available && custom_border_color_supported && border_color_swizzle != vk::FALSE
 }
 
 macro_rules! clear_feature_preserving_chain {
@@ -615,7 +614,12 @@ pub struct Device {
     pub supports_conditional_barriers: bool,
     pub device_access_memory: u64,
     pub sets_per_pool: u32,
-    sampler_heap_budget: usize,
+    /// `VkPhysicalDeviceCustomBorderColorPropertiesEXT::maxCustomBorderColorSamplers`
+    /// (0 when the extension is absent).
+    max_custom_border_color_samplers: u32,
+    /// Samplers currently carrying a custom border color; upstream
+    /// `custom_border_color_samplers_used`.
+    custom_border_color_samplers_used: std::sync::atomic::AtomicUsize,
     pub nvidia_arch: NvidiaArchitecture,
 
     /// Reported Vulkan extensions.
@@ -1085,6 +1089,8 @@ impl Device {
         let mut descriptor_buffer_properties =
             vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
         let mut maintenance5_properties = PhysicalDeviceMaintenance5PropertiesKhr::default();
+        let mut custom_border_color_properties =
+            vk::PhysicalDeviceCustomBorderColorPropertiesEXT::default();
         let mut properties2_builder = vk::PhysicalDeviceProperties2::builder()
             .push_next(&mut driver_properties)
             .push_next(&mut subgroup_properties);
@@ -1096,6 +1102,10 @@ impl Device {
         }
         if has_descriptor_buffer {
             properties2_builder = properties2_builder.push_next(&mut descriptor_buffer_properties);
+        }
+        if has_custom_border_color {
+            properties2_builder =
+                properties2_builder.push_next(&mut custom_border_color_properties);
         }
         if supported_extensions.contains("VK_EXT_subgroup_size_control")
             || subgroup_size_control_features.subgroup_size_control != 0
@@ -1169,7 +1179,6 @@ impl Device {
             has_border_color_swizzle,
             supports_custom_border_color,
             border_color_swizzle_features.border_color_swizzle,
-            border_color_swizzle_features.border_color_swizzle_from_image,
         );
         let supports_depth_bias_control = has_depth_bias_control
             && depth_bias_control_features.depth_bias_control != 0
@@ -1274,18 +1283,8 @@ impl Device {
         let mut has_broken_cube_compatibility = false;
         let mut has_broken_parallel_compiling = false;
 
-        if is_qualcomm || is_turnip {
-            log::warn!("Qualcomm and Turnip drivers have broken VK_EXT_custom_border_color");
-            supports_custom_border_color = false;
-            supports_border_color_swizzle = false;
-            custom_border_color_features.custom_border_colors = vk::FALSE;
-            custom_border_color_features.custom_border_color_without_format = vk::FALSE;
-        }
         if is_qualcomm {
             must_emulate_scaled_formats = true;
-            log::warn!("Qualcomm drivers have broken VK_EXT_border_color_swizzle");
-            border_color_swizzle_features.border_color_swizzle = vk::FALSE;
-            border_color_swizzle_features.border_color_swizzle_from_image = vk::FALSE;
             log::warn!("Qualcomm drivers have broken VK_EXT_color_write_enable");
             supports_color_write_enable = false;
             color_write_enable_features.color_write_enable = vk::FALSE;
@@ -1388,23 +1387,6 @@ impl Device {
             log::warn!("Turnip requires higher-than-reported vertex binding limits");
             device_properties.limits.max_vertex_input_bindings = 32;
         }
-        let sampler_heap_budget = if is_qualcomm {
-            derive_sampler_heap_budget(
-                device_properties.limits.max_sampler_allocation_count as usize,
-            )
-        } else {
-            0
-        };
-        if sampler_heap_budget != 0 {
-            let sampler_limit = device_properties.limits.max_sampler_allocation_count as usize;
-            log::warn!(
-                "Qualcomm driver reports max {} samplers; reserving {} (25%) and allowing Reden to use {} (75%) to avoid heap exhaustion",
-                sampler_limit,
-                sampler_limit / 4,
-                sampler_heap_budget,
-            );
-        }
-
         let (dynamic_state_level, vertex_input_dynamic_state_enabled, emulate_bgr565) = {
             let values = common::settings::values();
             (
@@ -2094,7 +2076,9 @@ impl Device {
             supports_conditional_barriers,
             device_access_memory,
             sets_per_pool: if is_amd_driver { 96 } else { 64 },
-            sampler_heap_budget,
+            max_custom_border_color_samplers: custom_border_color_properties
+                .max_custom_border_color_samplers,
+            custom_border_color_samplers_used: std::sync::atomic::AtomicUsize::new(0),
             nvidia_arch,
             supported_extensions,
             loaded_extensions,
@@ -2765,9 +2749,36 @@ impl Device {
         self.synchronization2.as_ref()
     }
 
-    /// Port of upstream `Device::GetSamplerHeapBudget`.
-    pub fn get_sampler_heap_budget(&self) -> Option<usize> {
-        (self.sampler_heap_budget != 0).then_some(self.sampler_heap_budget)
+    /// Port of `Device::TryReserveCustomBorderColorSamplers`: takes budget for
+    /// samplers carrying a custom border color, false when exhausted.
+    pub fn try_reserve_custom_border_color_samplers(&self, count: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let limit = self.max_custom_border_color_samplers as usize;
+        if limit == 0 {
+            return true;
+        }
+        let mut used = self.custom_border_color_samplers_used.load(Ordering::Relaxed);
+        while used + count <= limit {
+            match self.custom_border_color_samplers_used.compare_exchange_weak(
+                used,
+                used + count,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(current) => used = current,
+            }
+        }
+        false
+    }
+
+    /// Port of `Device::ReleaseCustomBorderColorSamplers`.
+    pub fn release_custom_border_color_samplers(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.custom_border_color_samplers_used
+            .fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Port of upstream `Device::IsTransformFeedbackDrawSupported`.
@@ -3004,16 +3015,17 @@ impl Device {
         self.transform_feedback_geometry_streams_supported
     }
 
-    pub fn is_ext_custom_border_color_supported(&self) -> bool {
+    /// Port of `Device::IsCustomBorderColorUsable`: custom border colors can be
+    /// created without a format (`extensions.custom_border_color` already
+    /// folds `customBorderColors` and `customBorderColorWithoutFormat`).
+    pub fn is_custom_border_color_usable(&self) -> bool {
         self.extensions.custom_border_color
     }
 
-    pub fn is_custom_border_colors_supported(&self) -> bool {
-        self.extensions.custom_border_color
-    }
-
-    pub fn is_custom_border_color_without_format_supported(&self) -> bool {
-        self.extensions.custom_border_color
+    /// Port of `Device::NeedsBorderColorSwizzleMapping`: samplers must carry an
+    /// explicit border color component mapping.
+    pub fn needs_border_color_swizzle_mapping(&self) -> bool {
+        self.extensions.border_color_swizzle && !self.border_color_swizzle_from_image_supported
     }
 
     pub fn is_ext_border_color_swizzle_supported(&self) -> bool {
@@ -3558,15 +3570,6 @@ fn sampler_filter_minmax_supported(
     shader_float16_supported: bool,
 ) -> bool {
     extension_available && (!is_amd || shader_float16_supported)
-}
-
-fn derive_sampler_heap_budget(sampler_limit: usize) -> usize {
-    if sampler_limit == 0 {
-        return 0;
-    }
-    const MIN_SAMPLER_BUDGET: usize = 1024;
-    let reserved = sampler_limit / 4;
-    MIN_SAMPLER_BUDGET.max(sampler_limit - reserved)
 }
 
 fn initial_loaded_extensions(
@@ -4266,36 +4269,13 @@ mod tests {
 
     #[test]
     fn border_color_swizzle_requires_extension_custom_border_color_and_both_features() {
-        assert!(border_color_swizzle_supported(
-            true,
-            true,
-            vk::TRUE,
-            vk::TRUE
-        ));
-        assert!(!border_color_swizzle_supported(
-            false,
-            true,
-            vk::TRUE,
-            vk::TRUE
-        ));
-        assert!(!border_color_swizzle_supported(
-            true,
-            false,
-            vk::TRUE,
-            vk::TRUE
-        ));
-        assert!(!border_color_swizzle_supported(
-            true,
-            true,
-            vk::FALSE,
-            vk::TRUE
-        ));
-        assert!(!border_color_swizzle_supported(
-            true,
-            true,
-            vk::TRUE,
-            vk::FALSE
-        ));
+        assert!(border_color_swizzle_supported(true, true, vk::TRUE));
+        assert!(!border_color_swizzle_supported(false, true, vk::TRUE));
+        assert!(!border_color_swizzle_supported(true, false, vk::TRUE));
+        assert!(!border_color_swizzle_supported(true, true, vk::FALSE));
+        // `borderColorSwizzleFromImage` no longer gates the extension upstream;
+        // samplers carry an explicit component mapping when it is missing
+        // (`Device::needs_border_color_swizzle_mapping`).
     }
 
     #[test]
@@ -4698,13 +4678,6 @@ mod tests {
 
         assert_eq!(limits.max_vertex_input_attributes, 16);
         assert_eq!(limits.max_vertex_input_bindings, 16);
-    }
-
-    #[test]
-    fn qualcomm_sampler_heap_budget_matches_upstream_reservation() {
-        assert_eq!(derive_sampler_heap_budget(0), 0);
-        assert_eq!(derive_sampler_heap_budget(4096), 3072);
-        assert_eq!(derive_sampler_heap_budget(512), 1024);
     }
 
     #[test]

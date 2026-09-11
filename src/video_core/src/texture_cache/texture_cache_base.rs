@@ -849,8 +849,6 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     // Modification tick
     pub modification_tick: u64,
     pub frame_tick: u64,
-    pub sampler_heap_budget: Option<usize>,
-    pub last_sampler_gc_frame: u64,
 
     // Async decode
     pub async_decodes: Vec<Arc<AsyncDecodeContext>>,
@@ -1166,8 +1164,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             committed_downloads: VecDeque::new(),
             modification_tick: 0,
             frame_tick: 0,
-            sampler_heap_budget: None,
-            last_sampler_gc_frame: u64::MAX,
             async_decodes: Vec::new(),
             texture_decode_worker: ThreadWorker::new_stateless_with_placement(
                 1,
@@ -1266,10 +1262,6 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
     pub fn update_total_used_memory_from_runtime(&mut self, device_memory_usage: u64) {
         self.total_used_memory = device_memory_usage;
-    }
-
-    pub fn set_sampler_heap_budget(&mut self, budget: Option<usize>) {
-        self.sampler_heap_budget = budget;
     }
 
     /// Notify the cache that a new frame has been queued.

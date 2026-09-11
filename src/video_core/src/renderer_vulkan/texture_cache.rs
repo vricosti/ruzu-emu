@@ -1049,6 +1049,15 @@ pub struct ImageView {
     pub samples: vk::SampleCountFlags,
     pub buffer_size: u32,
     pub supports_depth_comparison: bool,
+    /// Upstream `ImageView::RequiresBorderColorFormat`: formats whose custom
+    /// border color needs an explicit format (B4G4R4A4 / B5G6R5 / B5G5R5A1).
+    pub requires_border_color_format: bool,
+    /// Upstream `ImageView::SupportsMinmaxFilter`.
+    pub supports_minmax_filter: bool,
+    /// Upstream `ImageView::Swizzle`.
+    pub swizzle_mapping: vk::ComponentMapping,
+    /// Upstream `ImageView::HasIdentitySwizzle`.
+    pub has_identity_swizzle: bool,
 }
 
 impl ImageView {
@@ -1518,69 +1527,248 @@ impl Framebuffer {
     }
 }
 
+/// Upstream `Sampler::VariantKey`: what a sampler variant changes relative to
+/// the base sampler for a given image view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SamplerVariantKey {
+    reduce_anisotropy: bool,
+    force_nearest: bool,
+    drop_depth_comparison: bool,
+    drop_reduction: bool,
+    drop_custom_border: bool,
+    srgb_border: bool,
+    swizzle: [vk::ComponentSwizzle; 4],
+}
+
+impl SamplerVariantKey {
+    fn has_swizzle(&self) -> bool {
+        self.swizzle != [vk::ComponentSwizzle::IDENTITY; 4]
+    }
+}
+
+/// The parameters upstream keeps in `Sampler::base_ci`.
+#[derive(Clone, Copy, Debug)]
+struct SamplerBaseInfo {
+    mag_filter: vk::Filter,
+    min_filter: vk::Filter,
+    mipmap_mode: vk::SamplerMipmapMode,
+    address_mode_u: vk::SamplerAddressMode,
+    address_mode_v: vk::SamplerAddressMode,
+    address_mode_w: vk::SamplerAddressMode,
+    mip_lod_bias: f32,
+    anisotropy_enable: bool,
+    max_anisotropy: f32,
+    compare_enable: bool,
+    compare_op: vk::CompareOp,
+    min_lod: f32,
+    max_lod: f32,
+}
+
+/// Upstream `Sampler::MAX_VARIANTS`.
+const MAX_SAMPLER_VARIANTS: usize = 32;
+
 /// Backend-owned sampler corresponding to an upstream `TSCEntry`.
+///
+/// Port of upstream `Vulkan::Sampler`: a base sampler plus lazily created
+/// variants keyed by what the sampled image view requires. Upstream mutates
+/// the variant list from `HandleFor`; the port keeps the `&self` API used by
+/// the descriptor code through interior mutability (samplers are only used
+/// from the GPU thread).
 pub struct CachedSampler {
     device: Option<ash::Device>,
-    sampler: vk::Sampler,
-    sampler_default_anisotropy: vk::Sampler,
-    sampler_nearest: vk::Sampler,
-    sampler_noncompare: vk::Sampler,
+    device_owner: Option<NonNull<Device>>,
+    base: SamplerBaseInfo,
+    reduction_mode: vk::SamplerReductionMode,
+    border_color: [f32; 4],
+    srgb_border_color: [f32; 4],
+    default_anisotropy: f32,
+    has_added_anisotropy: bool,
+    has_linear_filtering: bool,
+    has_depth_comparison: bool,
+    has_minmax_reduction: bool,
+    has_custom_border_colors: bool,
+    has_srgb_border_color: bool,
+    needs_swizzle_mapping: bool,
+    variants: std::cell::RefCell<Vec<(SamplerVariantKey, vk::Sampler)>>,
+    /// Upstream `CustomBorderColorBudget::held`.
+    custom_border_color_budget_held: std::cell::Cell<usize>,
 }
 
 impl Drop for CachedSampler {
     fn drop(&mut self) {
-        let Some(device) = self.device.as_ref() else {
-            return;
-        };
-        unsafe {
-            for handle in [
-                self.sampler,
-                self.sampler_default_anisotropy,
-                self.sampler_nearest,
-                self.sampler_noncompare,
-            ] {
-                if handle != vk::Sampler::null() {
-                    device.destroy_sampler(handle, None);
+        if let Some(device) = self.device.as_ref() {
+            unsafe {
+                for (_, handle) in self.variants.get_mut().drain(..) {
+                    if handle != vk::Sampler::null() {
+                        device.destroy_sampler(handle, None);
+                    }
                 }
             }
+        }
+        // Upstream `CustomBorderColorBudget::~CustomBorderColorBudget`.
+        let held = self.custom_border_color_budget_held.replace(0);
+        if let Some(owner) = self.device_owner {
+            unsafe { owner.as_ref() }.release_custom_border_color_samplers(held);
         }
     }
 }
 
 impl CachedSampler {
-    /// Port of `Vulkan::Sampler::Handle`.
+    /// Port of `Vulkan::Sampler::Handle`: the base variant.
     pub fn handle(&self) -> vk::Sampler {
-        self.sampler
+        self.variants
+            .borrow()
+            .first()
+            .map_or(vk::Sampler::null(), |(_, handle)| *handle)
     }
 
-    /// Port of `Vulkan::Sampler::HandleWithDefaultAnisotropy`.
-    pub fn handle_with_default_anisotropy(&self) -> vk::Sampler {
-        self.sampler_default_anisotropy
+    /// Port of `Vulkan::Sampler::HandleFor`: the sampler variant suited to
+    /// `image_view`, created on first use.
+    pub fn handle_for(&self, image_view: &ImageView, is_depth: bool) -> vk::Sampler {
+        let mut key = self.make_key(image_view, is_depth);
+        if self.variants.borrow().len() >= MAX_SAMPLER_VARIANTS {
+            key.srgb_border = false;
+            key.swizzle = [vk::ComponentSwizzle::IDENTITY; 4];
+        }
+        if let Some(existing) = self.find(&key) {
+            return existing;
+        }
+        match self.emplace(key) {
+            Ok(handle) => handle,
+            Err(err) => {
+                log::error!("Failed to create a sampler variant: {err:?}");
+                self.handle()
+            }
+        }
     }
 
-    /// Port of `Vulkan::Sampler::HasAddedAnisotropy`.
-    pub fn has_added_anisotropy(&self) -> bool {
-        self.sampler_default_anisotropy != vk::Sampler::null()
+    /// Port of `Vulkan::Sampler::MakeKey`.
+    fn make_key(&self, image_view: &ImageView, is_depth: bool) -> SamplerVariantKey {
+        let base = image_view.base();
+        let mut key = SamplerVariantKey {
+            reduce_anisotropy: self.has_added_anisotropy && !base.supports_anisotropy(),
+            force_nearest: self.has_linear_filtering
+                && crate::surface::is_pixel_format_integer(base.format),
+            drop_depth_comparison: is_depth
+                && self.has_depth_comparison
+                && !image_view.supports_depth_comparison,
+            drop_reduction: self.has_minmax_reduction && !image_view.supports_minmax_filter,
+            drop_custom_border: self.has_custom_border_colors
+                && image_view.requires_border_color_format,
+            srgb_border: self.has_srgb_border_color
+                && crate::surface::is_pixel_format_srgb(base.format),
+            swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
+        };
+        if self.needs_swizzle_mapping && !key.drop_custom_border && !image_view.has_identity_swizzle
+        {
+            let mapping = image_view.swizzle_mapping;
+            key.swizzle = [mapping.r, mapping.g, mapping.b, mapping.a];
+        }
+        key
     }
 
-    /// Port of `Vulkan::Sampler::HandleWithNearestFilter`.
-    pub fn handle_with_nearest_filter(&self) -> vk::Sampler {
-        self.sampler_nearest
+    /// Port of `Vulkan::Sampler::Find`.
+    fn find(&self, key: &SamplerVariantKey) -> Option<vk::Sampler> {
+        self.variants
+            .borrow()
+            .iter()
+            .find(|(variant_key, _)| variant_key == key)
+            .map(|(_, handle)| *handle)
     }
 
-    /// Port of `Vulkan::Sampler::HasLinearFiltering`.
-    pub fn has_linear_filtering(&self) -> bool {
-        self.sampler_nearest != vk::Sampler::null()
+    /// Port of `CustomBorderColorBudget::TryAcquire`.
+    fn try_acquire_custom_border_color_budget(&self, count: usize) -> bool {
+        let Some(owner) = self.device_owner else {
+            return false;
+        };
+        if !unsafe { owner.as_ref() }.try_reserve_custom_border_color_samplers(count) {
+            return false;
+        }
+        self.custom_border_color_budget_held
+            .set(self.custom_border_color_budget_held.get() + count);
+        true
     }
 
-    /// Port of `Vulkan::Sampler::HandleWithoutDepthComparison`.
-    pub fn handle_without_depth_comparison(&self) -> vk::Sampler {
-        self.sampler_noncompare
-    }
+    /// Port of `Vulkan::Sampler::Emplace`.
+    fn emplace(&self, mut key: SamplerVariantKey) -> Result<vk::Sampler, vk::Result> {
+        let mut custom_border = self.has_custom_border_colors && !key.drop_custom_border;
+        if custom_border && !self.try_acquire_custom_border_color_budget(1) {
+            custom_border = false;
+            key.drop_custom_border = true;
+            key.swizzle = [vk::ComponentSwizzle::IDENTITY; 4];
+            if let Some(existing) = self.find(&key) {
+                return Ok(existing);
+            }
+        }
+        let color = if key.srgb_border {
+            self.srgb_border_color
+        } else {
+            self.border_color
+        };
+        let mut border_ci = vk::SamplerCustomBorderColorCreateInfoEXT::builder()
+            .custom_border_color(vk::ClearColorValue { float32: color })
+            .format(vk::Format::UNDEFINED)
+            .build();
+        let mut mapping_ci = vk::SamplerBorderColorComponentMappingCreateInfoEXT::builder()
+            .components(vk::ComponentMapping {
+                r: key.swizzle[0],
+                g: key.swizzle[1],
+                b: key.swizzle[2],
+                a: key.swizzle[3],
+            })
+            .srgb(false)
+            .build();
+        let mut reduction_ci = vk::SamplerReductionModeCreateInfo::builder()
+            .reduction_mode(self.reduction_mode)
+            .build();
 
-    /// Port of `Vulkan::Sampler::HasDepthComparison`.
-    pub fn has_depth_comparison(&self) -> bool {
-        self.sampler_noncompare != vk::Sampler::null()
+        let base = &self.base;
+        let mut create_info = vk::SamplerCreateInfo::builder()
+            .mag_filter(base.mag_filter)
+            .min_filter(base.min_filter)
+            .mipmap_mode(base.mipmap_mode)
+            .address_mode_u(base.address_mode_u)
+            .address_mode_v(base.address_mode_v)
+            .address_mode_w(base.address_mode_w)
+            .mip_lod_bias(base.mip_lod_bias)
+            .anisotropy_enable(base.anisotropy_enable)
+            .max_anisotropy(base.max_anisotropy)
+            .compare_enable(base.compare_enable)
+            .compare_op(base.compare_op)
+            .min_lod(base.min_lod)
+            .max_lod(base.max_lod)
+            .border_color(vk::BorderColor::FLOAT_CUSTOM_EXT);
+        if custom_border {
+            create_info = create_info.push_next(&mut border_ci);
+            if key.has_swizzle() {
+                create_info = create_info.push_next(&mut mapping_ci);
+            }
+        }
+        if self.has_minmax_reduction && !key.drop_reduction {
+            create_info = create_info.push_next(&mut reduction_ci);
+        }
+        if key.force_nearest {
+            create_info = create_info
+                .mag_filter(vk::Filter::NEAREST)
+                .min_filter(vk::Filter::NEAREST)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .anisotropy_enable(false)
+                .max_anisotropy(1.0);
+        } else if key.reduce_anisotropy {
+            create_info = create_info
+                .anisotropy_enable(self.default_anisotropy > 1.0)
+                .max_anisotropy(self.default_anisotropy);
+        }
+        if key.drop_depth_comparison {
+            create_info = create_info.compare_enable(false);
+        }
+        if !custom_border {
+            create_info = create_info.border_color(convert_border_color(color));
+        }
+        let device = self.device.as_ref().expect("CachedSampler requires a device");
+        let handle = unsafe { device.create_sampler(&create_info.build(), None)? };
+        self.variants.borrow_mut().push((key, handle));
+        Ok(handle)
     }
 }
 
@@ -1758,7 +1946,6 @@ pub struct TextureCacheRuntime {
     ext_4444_formats_supported: bool,
     custom_border_color_supported: bool,
     sampler_filter_minmax_supported: bool,
-    sampler_heap_budget: Option<usize>,
     has_null_descriptor: bool,
 }
 
@@ -1790,7 +1977,6 @@ impl TextureCacheRuntime {
         ext_4444_formats_supported: bool,
         custom_border_color_supported: bool,
         sampler_filter_minmax_supported: bool,
-        sampler_heap_budget: Option<usize>,
         has_null_descriptor: bool,
     ) -> Self {
         let device_memory_info = query_device_memory_info(&instance, physical_device);
@@ -1874,7 +2060,6 @@ impl TextureCacheRuntime {
             ext_4444_formats_supported,
             custom_border_color_supported,
             sampler_filter_minmax_supported,
-            sampler_heap_budget,
             has_null_descriptor,
         };
         runtime.initialize_view_formats();
@@ -1938,11 +2123,6 @@ impl TextureCacheRuntime {
 
     fn can_report_memory_usage(&self) -> bool {
         self.device_memory_info.can_report_memory_usage
-    }
-
-    /// Port of `TextureCacheRuntime::GetSamplerHeapBudget`.
-    fn get_sampler_heap_budget(&self) -> Option<usize> {
-        self.sampler_heap_budget
     }
 
     fn scheduler(&mut self) -> &mut Scheduler {
@@ -3454,6 +3634,10 @@ impl TextureCacheRuntime {
                 samples: vk::SampleCountFlags::TYPE_1,
                 buffer_size: 0,
                 supports_depth_comparison: false,
+                requires_border_color_format: false,
+                supports_minmax_filter: false,
+                swizzle_mapping: vk::ComponentMapping::default(),
+                has_identity_swizzle: true,
             });
         }
 
@@ -3486,6 +3670,10 @@ impl TextureCacheRuntime {
             samples: vk::SampleCountFlags::TYPE_1,
             buffer_size: 0,
             supports_depth_comparison: false,
+            requires_border_color_format: false,
+            supports_minmax_filter: false,
+            swizzle_mapping: vk::ComponentMapping::default(),
+            has_identity_swizzle: true,
         };
         for index in 0..view.image_views.len() {
             match view.make_view(
@@ -3622,6 +3810,23 @@ impl TextureCacheRuntime {
             samples: convert_sample_count(image.base().info.num_samples),
             buffer_size: image.base().guest_size_bytes,
             supports_depth_comparison: self.supports_depth_comparison(format),
+            requires_border_color_format: needs_explicit_border_color_format(format),
+            supports_minmax_filter: {
+                let device = self.vulkan_device();
+                let properties = unsafe {
+                    device
+                        .get_instance()
+                        .get_physical_device_format_properties(device.get_physical(), format)
+                };
+                properties
+                    .optimal_tiling_features
+                    .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_MINMAX)
+            },
+            swizzle_mapping: components,
+            has_identity_swizzle: components.r == vk::ComponentSwizzle::R
+                && components.g == vk::ComponentSwizzle::G
+                && components.b == vk::ComponentSwizzle::B
+                && components.a == vk::ComponentSwizzle::A,
         })
     }
 
@@ -3658,6 +3863,10 @@ impl TextureCacheRuntime {
                 .width
                 .wrapping_mul(crate::surface::bytes_per_block(base_ref.format)),
             supports_depth_comparison: false,
+            requires_border_color_format: false,
+            supports_minmax_filter: false,
+            swizzle_mapping: vk::ComponentMapping::default(),
+            has_identity_swizzle: true,
         }
     }
 
@@ -4442,7 +4651,6 @@ impl TextureCache {
         ext_4444_formats_supported: bool,
         custom_border_color_supported: bool,
         sampler_filter_minmax_supported: bool,
-        sampler_heap_budget: Option<usize>,
         has_null_descriptor: bool,
     ) -> Result<Self, vk::Result> {
         let mut base = CommonTextureCache::<TextureCacheParams>::new_for_backend(device_memory);
@@ -4465,11 +4673,9 @@ impl TextureCache {
             ext_4444_formats_supported,
             custom_border_color_supported,
             sampler_filter_minmax_supported,
-            sampler_heap_budget,
             has_null_descriptor,
         ));
         base.configure_device_memory_budget(runtime.get_device_local_memory());
-        base.set_sampler_heap_budget(runtime.get_sampler_heap_budget());
         let null_view_base = NonNull::from(base.slot_image_views[NULL_IMAGE_VIEW_ID].base.as_mut());
         let null_image_view = runtime.make_null_image_view(null_view_base)?;
         base.slot_image_views[NULL_IMAGE_VIEW_ID].backend = Some(null_image_view);
@@ -5443,20 +5649,58 @@ impl TextureCache {
         runtime: &TextureCacheRuntime,
         tsc: &TscEntry,
     ) -> Result<CachedSampler, vk::Result> {
-        let mag_filter = texture_filter_from_raw(tsc.mag_filter());
-        let min_filter = texture_filter_from_raw(tsc.min_filter());
+        let device = runtime.vulkan_device();
+        let mag_filter_raw = texture_filter_from_raw(tsc.mag_filter());
+        let min_filter_raw = texture_filter_from_raw(tsc.min_filter());
         let mipmap_filter = texture_mipmap_filter_from_raw(tsc.mipmap_filter());
-        let wrap_u = wrap_mode_from_raw(tsc.wrap_u());
-        let wrap_v = wrap_mode_from_raw(tsc.wrap_v());
-        let wrap_p = wrap_mode_from_raw(tsc.wrap_p());
-        let max_anisotropy = tsc.computed_max_anisotropy().clamp(1.0, 16.0);
         let border_color = tsc.computed_border_color();
+        let srgb_border_color = tsc.srgb_border_color();
+        // Some games have samplers with garbage. Sanitize them here.
+        let max_anisotropy = tsc.computed_max_anisotropy().clamp(1.0, 16.0);
+        let default_anisotropy = (1u32 << tsc.max_anisotropy_raw()) as f32;
+        let mag_filter = maxwell_to_vk::sampler::filter(mag_filter_raw);
+        let min_filter = maxwell_to_vk::sampler::filter(min_filter_raw);
+        let mipmap_mode = maxwell_to_vk::sampler::mipmap_mode(mipmap_filter);
+        let wrap_u = maxwell_to_vk::sampler::wrap_mode(
+            device,
+            wrap_mode_from_raw(tsc.wrap_u()),
+            mag_filter_raw,
+        );
+        let wrap_v = maxwell_to_vk::sampler::wrap_mode(
+            device,
+            wrap_mode_from_raw(tsc.wrap_v()),
+            mag_filter_raw,
+        );
+        let wrap_p = maxwell_to_vk::sampler::wrap_mode(
+            device,
+            wrap_mode_from_raw(tsc.wrap_p()),
+            mag_filter_raw,
+        );
+        let samples_border = wrap_u == vk::SamplerAddressMode::CLAMP_TO_BORDER
+            || wrap_v == vk::SamplerAddressMode::CLAMP_TO_BORDER
+            || wrap_p == vk::SamplerAddressMode::CLAMP_TO_BORDER;
+        let reduction_mode =
+            maxwell_to_vk::sampler_reduction(sampler_reduction_from_raw(tsc.reduction_filter()));
+        let has_added_anisotropy = max_anisotropy > default_anisotropy;
+        let has_linear_filtering = mag_filter == vk::Filter::LINEAR
+            || min_filter == vk::Filter::LINEAR
+            || mipmap_mode == vk::SamplerMipmapMode::LINEAR;
+        let has_depth_comparison = tsc.depth_compare_enabled() != 0;
+        let mut has_minmax_reduction =
+            reduction_mode != vk::SamplerReductionMode::WEIGHTED_AVERAGE;
+        let has_srgb_border_color =
+            tsc.srgb_conversion() != 0 && srgb_border_color != border_color;
+        if has_minmax_reduction && !runtime.sampler_filter_minmax_supported {
+            log::warn!("VK_EXT_sampler_filter_minmax is required");
+            has_minmax_reduction = false;
+        }
+        let has_custom_border_colors = samples_border && runtime.custom_border_color_supported;
+        let needs_swizzle_mapping =
+            has_custom_border_colors && device.needs_border_color_swizzle_mapping();
         let [custom_border_color_extension, border_color_swizzle_extension] =
             sampler_extension_usage(
-                runtime.custom_border_color_supported,
-                runtime
-                    .vulkan_device()
-                    .is_ext_border_color_swizzle_supported(),
+                has_custom_border_colors,
+                device.is_ext_border_color_swizzle_supported(),
             );
         if let Some(extension) = custom_border_color_extension {
             if is_active() {
@@ -5468,139 +5712,47 @@ impl TextureCache {
                 get_instance().log_extension_usage(extension, "Sampler::Sampler");
             }
         }
-        let reduction = sampler_reduction_from_raw(tsc.reduction_filter());
-        let reduction_mode = maxwell_to_vk::sampler_reduction(reduction);
-        let create_sampler = |anisotropy: f32, force_nearest: bool, disable_compare: bool| {
-            let mut custom_border_color = vk::SamplerCustomBorderColorCreateInfoEXT::builder()
-                .custom_border_color(vk::ClearColorValue {
-                    float32: border_color,
-                })
-                .format(vk::Format::UNDEFINED)
-                .build();
-            let mut reduction_info = vk::SamplerReductionModeCreateInfo::builder()
-                .reduction_mode(reduction_mode)
-                .build();
-            let mut sampler_info = vk::SamplerCreateInfo::builder()
-                .mag_filter(if force_nearest {
-                    vk::Filter::NEAREST
-                } else {
-                    maxwell_to_vk::sampler::filter(mag_filter)
-                })
-                .min_filter(if force_nearest {
-                    vk::Filter::NEAREST
-                } else {
-                    maxwell_to_vk::sampler::filter(min_filter)
-                })
-                .mipmap_mode(if force_nearest {
-                    vk::SamplerMipmapMode::NEAREST
-                } else {
-                    maxwell_to_vk::sampler::mipmap_mode(mipmap_filter)
-                })
-                .address_mode_u(maxwell_to_vk::sampler::wrap_mode(
-                    runtime.vulkan_device(),
-                    wrap_u,
-                    mag_filter,
-                ))
-                .address_mode_v(maxwell_to_vk::sampler::wrap_mode(
-                    runtime.vulkan_device(),
-                    wrap_v,
-                    mag_filter,
-                ))
-                .address_mode_w(maxwell_to_vk::sampler::wrap_mode(
-                    runtime.vulkan_device(),
-                    wrap_p,
-                    mag_filter,
-                ))
-                .mip_lod_bias(tsc.lod_bias())
-                .anisotropy_enable(!force_nearest && anisotropy > 1.0)
-                .max_anisotropy(if force_nearest { 1.0 } else { anisotropy })
-                .compare_enable(!disable_compare && tsc.depth_compare_enabled() != 0)
-                .compare_op(maxwell_to_vk::sampler::depth_compare_function(
-                    crate::textures::texture::DepthCompareFunc::from_raw(tsc.depth_compare_func()),
-                ))
-                .min_lod(if mipmap_filter == TextureMipmapFilter::None {
-                    0.0
-                } else {
-                    tsc.min_lod()
-                })
-                .max_lod(if mipmap_filter == TextureMipmapFilter::None {
-                    0.25
-                } else {
-                    tsc.max_lod()
-                })
-                .border_color(convert_border_color(border_color));
-            if runtime.custom_border_color_supported {
-                sampler_info = sampler_info
-                    .push_next(&mut custom_border_color)
-                    .border_color(vk::BorderColor::FLOAT_CUSTOM_EXT);
-            }
-            if runtime.sampler_filter_minmax_supported {
-                sampler_info = sampler_info.push_next(&mut reduction_info);
-            } else if reduction_mode != vk::SamplerReductionMode::WEIGHTED_AVERAGE {
-                log::warn!("VK_EXT_sampler_filter_minmax is required");
-            }
-            unsafe { runtime.device().create_sampler(&sampler_info.build(), None) }
-        };
-
-        let sampler = create_sampler(max_anisotropy, false, false)?;
-        let max_anisotropy_default = (1u32 << tsc.max_anisotropy_raw()) as f32;
-        let sampler_default_anisotropy = if max_anisotropy > max_anisotropy_default {
-            match create_sampler(max_anisotropy_default, false, false) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    unsafe {
-                        runtime.device().destroy_sampler(sampler, None);
-                    }
-                    return Err(error);
-                }
-            }
+        let (min_lod, max_lod) = if mipmap_filter == TextureMipmapFilter::None {
+            (0.0, 0.25)
         } else {
-            vk::Sampler::null()
+            (tsc.min_lod(), tsc.max_lod())
         };
-        let has_linear_filtering = maxwell_to_vk::sampler::filter(mag_filter) == vk::Filter::LINEAR
-            || maxwell_to_vk::sampler::filter(min_filter) == vk::Filter::LINEAR
-            || maxwell_to_vk::sampler::mipmap_mode(mipmap_filter) == vk::SamplerMipmapMode::LINEAR;
-        let sampler_nearest = if has_linear_filtering {
-            match create_sampler(1.0, true, false) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    runtime.destroy_sampler(CachedSampler {
-                        device: Some(runtime.device().clone()),
-                        sampler,
-                        sampler_default_anisotropy,
-                        sampler_nearest: vk::Sampler::null(),
-                        sampler_noncompare: vk::Sampler::null(),
-                    });
-                    return Err(error);
-                }
-            }
-        } else {
-            vk::Sampler::null()
-        };
-        let sampler_noncompare = if tsc.depth_compare_enabled() != 0 {
-            match create_sampler(max_anisotropy, false, true) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    runtime.destroy_sampler(CachedSampler {
-                        device: Some(runtime.device().clone()),
-                        sampler,
-                        sampler_default_anisotropy,
-                        sampler_nearest,
-                        sampler_noncompare: vk::Sampler::null(),
-                    });
-                    return Err(error);
-                }
-            }
-        } else {
-            vk::Sampler::null()
-        };
-        Ok(CachedSampler {
+        let sampler = CachedSampler {
             device: Some(runtime.device().clone()),
-            sampler,
-            sampler_default_anisotropy,
-            sampler_nearest,
-            sampler_noncompare,
-        })
+            device_owner: Some(NonNull::from(device)),
+            base: SamplerBaseInfo {
+                mag_filter,
+                min_filter,
+                mipmap_mode,
+                address_mode_u: wrap_u,
+                address_mode_v: wrap_v,
+                address_mode_w: wrap_p,
+                mip_lod_bias: tsc.lod_bias(),
+                anisotropy_enable: max_anisotropy > 1.0,
+                max_anisotropy,
+                compare_enable: has_depth_comparison,
+                compare_op: maxwell_to_vk::sampler::depth_compare_function(
+                    crate::textures::texture::DepthCompareFunc::from_raw(tsc.depth_compare_func()),
+                ),
+                min_lod,
+                max_lod,
+            },
+            reduction_mode,
+            border_color,
+            srgb_border_color,
+            default_anisotropy,
+            has_added_anisotropy,
+            has_linear_filtering,
+            has_depth_comparison,
+            has_minmax_reduction,
+            has_custom_border_colors,
+            has_srgb_border_color,
+            needs_swizzle_mapping,
+            variants: std::cell::RefCell::new(Vec::with_capacity(1)),
+            custom_border_color_budget_held: std::cell::Cell::new(0),
+        };
+        sampler.emplace(SamplerVariantKey::default())?;
+        Ok(sampler)
     }
     /// Get or create a framebuffer for the given render target configuration.
     pub fn get_or_create_framebuffer(
@@ -6224,6 +6376,36 @@ mod tests {
                 | ImageFlagBits::CONVERTED
                 | ImageFlagBits::COSTLY_LOAD
         ));
+    }
+
+    #[test]
+    fn explicit_border_color_formats_match_upstream() {
+        for format in [
+            vk::Format::B4G4R4A4_UNORM_PACK16,
+            vk::Format::B5G6R5_UNORM_PACK16,
+            vk::Format::B5G5R5A1_UNORM_PACK16,
+        ] {
+            assert!(needs_explicit_border_color_format(format), "{format:?}");
+        }
+        assert!(!needs_explicit_border_color_format(vk::Format::A8B8G8R8_UNORM_PACK32));
+        assert!(!needs_explicit_border_color_format(vk::Format::R5G6B5_UNORM_PACK16));
+    }
+
+    #[test]
+    fn sampler_variant_key_default_has_no_swizzle() {
+        let key = SamplerVariantKey::default();
+        assert!(!key.has_swizzle());
+        let swizzled = SamplerVariantKey {
+            swizzle: [
+                vk::ComponentSwizzle::B,
+                vk::ComponentSwizzle::G,
+                vk::ComponentSwizzle::R,
+                vk::ComponentSwizzle::A,
+            ],
+            ..SamplerVariantKey::default()
+        };
+        assert!(swizzled.has_swizzle());
+        assert_ne!(key, swizzled);
     }
 
     #[test]
@@ -7321,6 +7503,16 @@ fn sanitize_depth_stencil_swizzle(swizzle: &mut [u8; 4], supports_depth_stencil_
             *source = crate::texture_cache::image_view_info::SwizzleSource::Zero as u8;
         }
     });
+}
+
+/// Port of `NeedsExplicitBorderColorFormat`.
+fn needs_explicit_border_color_format(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::B4G4R4A4_UNORM_PACK16
+            | vk::Format::B5G6R5_UNORM_PACK16
+            | vk::Format::B5G5R5A1_UNORM_PACK16
+    )
 }
 
 fn image_view_components(

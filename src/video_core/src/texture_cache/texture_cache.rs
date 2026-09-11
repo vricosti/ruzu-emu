@@ -27,7 +27,7 @@ use crate::surface;
 use common::hash::BuildUnorderedDenseHasher;
 use parking_lot::Mutex as ParkingMutex;
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -1908,68 +1908,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         self.current_channel_state_mut()
             .samplers
             .insert(*config, id);
-        self.enforce_sampler_budget();
         id
-    }
-
-    /// Port of `TextureCache<P>::EnforceSamplerBudget`.
-    fn enforce_sampler_budget(&mut self) {
-        let Some(budget) = self.sampler_heap_budget else {
-            return;
-        };
-        if self.slot_samplers.size() < budget
-            || !self.channel_caches.has_current_channel_state()
-            || self.last_sampler_gc_frame == self.frame_tick
-        {
-            return;
-        }
-        self.last_sampler_gc_frame = self.frame_tick;
-        self.trim_inactive_samplers(budget);
-    }
-
-    /// Port of `TextureCache<P>::TrimInactiveSamplers`.
-    fn trim_inactive_samplers(&mut self, budget: usize) {
-        const SAMPLER_GC_SLACK: usize = 1024;
-        let active_sampler_ids: HashSet<SamplerId, BuildUnorderedDenseHasher> = {
-            let channel = self.current_channel_state();
-            channel.sampler_ids.values().copied().collect()
-        };
-        let cached_samplers: Vec<_> = self
-            .current_channel_state()
-            .samplers
-            .iter()
-            .map(|(config, id)| (*config, *id))
-            .collect();
-        let mut removed_configs = Vec::new();
-        let mut removed = 0usize;
-        for (config, sampler_id) in cached_samplers {
-            if !sampler_id.is_valid() || sampler_id == CORRUPT_ID {
-                removed_configs.push(config);
-                continue;
-            }
-            if active_sampler_ids.contains(&sampler_id) {
-                continue;
-            }
-            self.slot_samplers.erase(sampler_id);
-            removed_configs.push(config);
-            removed += 1;
-            if self.slot_samplers.size().wrapping_add(SAMPLER_GC_SLACK) <= budget {
-                break;
-            }
-        }
-        if !removed_configs.is_empty() {
-            let channel = self.current_channel_state_mut();
-            for config in removed_configs {
-                channel.samplers.remove(&config);
-            }
-        }
-        if removed != 0 {
-            log::warn!(
-                "Sampler cache exceeded {} entries on this driver; reclaimed {} inactive samplers",
-                budget,
-                removed,
-            );
-        }
     }
 
     // ── Render targets ─────────────────────────────────────────────────
@@ -4959,37 +4898,6 @@ mod tests {
         assert_eq!(image_id.index, 1);
         assert_ne!(sampler_id, crate::texture_cache::types::NULL_SAMPLER_ID);
         assert_eq!(sampler_id.index, 1);
-    }
-
-    #[test]
-    fn sampler_budget_reclaims_only_inactive_sampler_slots_once_per_frame() {
-        use crate::control::channel_state::ChannelState;
-
-        let mut cache = test_cache();
-        let channel = ChannelState::new(10);
-        cache.create_channel(&channel);
-        cache.bind_to_channel(10);
-        let mut first = crate::textures::texture::TscEntry::default();
-        first.raw[0] = 1;
-        let mut second = crate::textures::texture::TscEntry::default();
-        second.raw[0] = 2;
-        let first_id = cache.find_sampler(&first, false);
-        let second_id = cache.find_sampler(&second, false);
-        cache
-            .current_channel_state_mut()
-            .sampler_ids
-            .insert(0, first_id);
-        cache.set_sampler_heap_budget(Some(cache.slot_samplers.size()));
-
-        cache.enforce_sampler_budget();
-
-        assert!(cache.slot_samplers.contains(first_id));
-        assert!(!cache.slot_samplers.contains(second_id));
-        assert!(cache.current_channel_state().samplers.contains_key(&first));
-        assert!(!cache.current_channel_state().samplers.contains_key(&second));
-
-        cache.enforce_sampler_budget();
-        assert!(!cache.slot_samplers.contains(second_id));
     }
 
     #[test]

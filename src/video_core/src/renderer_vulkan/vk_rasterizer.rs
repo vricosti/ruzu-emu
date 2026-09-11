@@ -986,7 +986,6 @@ impl RasterizerVulkan {
                 ext_4444_formats_supported,
                 custom_border_color_supported,
                 sampler_filter_minmax_supported,
-                vulkan_device.get_sampler_heap_budget(),
                 has_null_descriptor,
             )
             .map_err(|e| RendererError::InitFailed(format!("texture cache: {:?}", e)))?,

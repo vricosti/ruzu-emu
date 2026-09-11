@@ -531,31 +531,12 @@ pub fn push_image_descriptors(
                     vk_image_view = null_image_view;
                 }
             }
-            let supports_anisotropy =
-                image_view.is_some_and(|view| view.base().supports_anisotropy());
-            let format = image_view.map_or(crate::surface::PixelFormat::Invalid, |view| {
-                view.base().format
-            });
-            let supports_depth_comparison =
-                image_view.is_some_and(|view| view.supports_depth_comparison);
+            // Upstream: `sampler.HandleFor(image_view, desc.is_depth)`.
             let sampler = texture_cache
                 .sampler(samplers[*sampler_cursor])
-                .map(|sampler| {
-                    let mut handle = if sampler.has_added_anisotropy() && !supports_anisotropy {
-                        sampler.handle_with_default_anisotropy()
-                    } else {
-                        sampler.handle()
-                    };
-                    if sampler.has_linear_filtering()
-                        && crate::surface::is_pixel_format_integer(format)
-                    {
-                        handle = sampler.handle_with_nearest_filter();
-                    }
-                    if desc.is_depth && sampler.has_depth_comparison() && !supports_depth_comparison
-                    {
-                        handle = sampler.handle_without_depth_comparison();
-                    }
-                    handle
+                .map(|sampler| match image_view {
+                    Some(view) => sampler.handle_for(view, desc.is_depth),
+                    None => sampler.handle(),
                 })
                 .unwrap_or(fallback_sampler);
             descriptor_queue.add_sampled_image(vk_image_view, sampler);

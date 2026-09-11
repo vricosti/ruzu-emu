@@ -12,9 +12,10 @@ usage() {
 Usage: ./build.sh [options] [-- <extra cargo arguments>]
        ./build.sh package [--skip-deps] [--official]
 
-The package command builds a macOS release and creates
+The package command builds a release and creates, on macOS,
 target/release/Ruzu-macOS-<Git revision>-<arch>-clang.zip containing
-Ruzu-macOS-<Git revision>-<arch>-clang/ruzu.app.
+Ruzu-macOS-<Git revision>-<arch>-clang/ruzu.app, and on Linux the Debian
+archive target/release/Ruzu-<Distro><Version>-<Git revision>-<arch>.deb.
 Git revision is an exact version tag on a clean checkout, otherwise
 <branch>-<12-character commit>[-dirty]. Detached builds use branch "detached".
 By default package builds the current sources locally, without commits, tags or pushes.
@@ -45,10 +46,11 @@ esac
 
 if [ "${1-}" = package ]; then
     shift
-    if [ "$(uname -s)" != Darwin ]; then
-        echo "The package command currently supports macOS only." >&2
-        exit 1
-    fi
+    case "$(uname -s)" in
+        Darwin) package_platform=macos ;;
+        Linux) package_platform=linux ;;
+        *) echo "The package command supports macOS and Linux only." >&2; exit 1 ;;
+    esac
     package_development=0
     package_official=0
     package_skip_deps=
@@ -67,12 +69,17 @@ if [ "${1-}" = package ]; then
         exit 1
     fi
     if [ "$package_official" = 1 ]; then
-        exec python3 "$SCRIPT_DIR/scripts/release-package.py" --platform macos ${package_skip_deps:+"$package_skip_deps"}
+        exec python3 "$SCRIPT_DIR/scripts/release-package.py" --platform "$package_platform" ${package_skip_deps:+"$package_skip_deps"}
     fi
     set -- --release ${package_skip_deps:+"$package_skip_deps"}
     sh "$SCRIPT_DIR/scripts/package-revision.sh" "$SCRIPT_DIR" >/dev/null
-    RUZU_MACOS_PACKAGE=1
-    export RUZU_MACOS_PACKAGE
+    if [ "$package_platform" = macos ]; then
+        RUZU_MACOS_PACKAGE=1
+        export RUZU_MACOS_PACKAGE
+    else
+        RUZU_LINUX_PACKAGE=1
+        export RUZU_LINUX_PACKAGE
+    fi
 fi
 
 case "$(uname -s)" in

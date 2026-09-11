@@ -136,4 +136,18 @@ install_packages() {
     esac
 }
 
+post_build_platform() {
+    if [ "${RUZU_LINUX_PACKAGE:-0}" != 1 ]; then
+        return 0
+    fi
+    if [ ! -x "${PLATFORM_SCRIPT_DIR}/../target/release/ruzu" ]; then
+        echo
+        echo "Skipping the Debian package: target/release/ruzu was not built."
+        return 0
+    fi
+    echo
+    echo "Packaging the Debian archive..."
+    sh "${PLATFORM_SCRIPT_DIR}/package-linux.sh"
+}
+
 run_pipeline "$@"

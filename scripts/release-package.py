@@ -86,8 +86,12 @@ def build(repo, platform, package, skip_deps):
             run(repo, "cargo", "build", "--locked", "--release", "-p", "ruzu", "-p", "ruzu_cmd")
     else:
         environment = os.environ.copy()
-        environment["RUZU_MACOS_PACKAGE"] = "1" if package else "0"
-        args = ["sh", str(repo / "scripts/build-macos.sh"), "--release"]
+        if platform == "linux":
+            environment["RUZU_LINUX_PACKAGE"] = "1" if package else "0"
+            args = ["sh", str(repo / "scripts/build-linux.sh"), "--release"]
+        else:
+            environment["RUZU_MACOS_PACKAGE"] = "1" if package else "0"
+            args = ["sh", str(repo / "scripts/build-macos.sh"), "--release"]
         if skip_deps or package:
             args.append("--skip-deps")
         run(repo, *args, env=environment)
@@ -151,7 +155,7 @@ def release(repo, platform, skip_deps=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--platform", choices=("windows", "macos"), required=True)
+    parser.add_argument("--platform", choices=("windows", "macos", "linux"), required=True)
     parser.add_argument("--skip-deps", action="store_true")
     args = parser.parse_args()
     try:

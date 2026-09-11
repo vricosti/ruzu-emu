@@ -14,11 +14,6 @@ pub mod dram_memory_map {
     pub const SLAB_HEAP_BASE: u64 = KERNEL_RESERVE_BASE + 0x85000;
 }
 
-/// Default intended memory size (4 GB DRAM).
-/// In the C++ code this comes from KSystemControl::Init::GetIntendedMemorySize().
-/// We hardcode the default value here; the kernel module can override if needed.
-const DEFAULT_INTENDED_MEMORY_SIZE: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
-
 /// Virtual reserve size for the host memory mapping.
 const VIRTUAL_RESERVE_SIZE: usize = 1 << 39; // 512 GiB
 
@@ -30,7 +25,7 @@ pub struct DeviceMemory {
 impl DeviceMemory {
     /// Creates a new DeviceMemory with the default intended memory size.
     pub fn new() -> Self {
-        Self::with_size(DEFAULT_INTENDED_MEMORY_SIZE)
+        Self::with_size(crate::hle::kernel::board::k_system_control::init::get_intended_memory_size())
     }
 
     /// Creates a new DeviceMemory with a specific backing size.
@@ -97,5 +92,48 @@ impl DeviceMemory {
 impl Default for DeviceMemory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_backing_reaches_last_byte_after_layout_changes() {
+        use common::settings::MemoryLayout;
+        const CHILD: &str = "RUZU_TEST_CONFIGURED_DRAM_BACKING";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "device_memory::tests::configured_backing_reaches_last_byte_after_layout_changes"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        for (mode, gib) in [
+            (MemoryLayout::Memory4Gb, 4usize),
+            (MemoryLayout::Memory6Gb, 6),
+            (MemoryLayout::Memory8Gb, 8),
+            (MemoryLayout::Memory10Gb, 10),
+            (MemoryLayout::Memory12Gb, 12),
+            (MemoryLayout::Memory4Gb, 4),
+        ] {
+            {
+                let mut settings = common::settings::values_mut();
+                settings.memory_layout_mode.set_global(true);
+                settings.memory_layout_mode.set_value(mode);
+            }
+            let memory = DeviceMemory::new();
+            assert_eq!(memory.buffer.backing_size(), gib << 30);
+            // Sparse backing: touch only the boundary pages, not all guest RAM.
+            unsafe {
+                let first = memory.get_pointer(dram_memory_map::BASE);
+                let last = memory.get_pointer(dram_memory_map::BASE + (gib << 30) as u64 - 1);
+                first.write_volatile(0x12);
+                last.write_volatile(0x34);
+                assert_eq!(first.read_volatile(), 0x12);
+                assert_eq!(last.read_volatile(), 0x34);
+            }
+        }
     }
 }

@@ -264,6 +264,24 @@ impl Barrier {
     /// Blocks until all `count` threads have called sync().
     /// Returns true for all threads when the barrier is reached.
     pub fn sync(&self) -> bool {
+        self.sync_impl(None)
+    }
+
+    /// Stop-token variant of upstream Barrier::Sync. The owner must request
+    /// cancellation through request_stop so the condition variable is notified.
+    pub fn sync_with_stop(&self, stop: &AtomicBool) -> bool {
+        self.sync_impl(Some(stop))
+    }
+
+    /// Rust counterpart of the stop callback used by condition_variable_any.
+    /// Holding the wait mutex closes the predicate-check-to-sleep window.
+    pub fn request_stop(&self, stop: &AtomicBool) {
+        let _guard = self.mutex.lock().unwrap();
+        stop.store(true, Ordering::Release);
+        self.condvar.notify_all();
+    }
+
+    fn sync_impl(&self, stop: Option<&AtomicBool>) -> bool {
         let mut state = self.mutex.lock().unwrap();
         let current_generation = state.generation;
 
@@ -274,10 +292,11 @@ impl Barrier {
             self.condvar.notify_all();
             true
         } else {
-            while current_generation == state.generation {
+            while current_generation == state.generation
+                && !stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 state = self.condvar.wait(state).unwrap();
             }
-            true
+            !stop.is_some_and(|flag| flag.load(Ordering::Acquire))
         }
     }
 }
@@ -285,6 +304,37 @@ impl Barrier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn barrier_stop_wakes_waiters_without_final_participant() {
+        use std::sync::Arc;
+        let barrier = Arc::new(Barrier::new(2));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_barrier = barrier.clone();
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_barrier.sync_with_stop(&worker_stop)).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while barrier.mutex.lock().unwrap().waiting == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        barrier.request_stop(&stop);
+        assert!(!rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn barrier_observes_stop_before_wait_and_preserves_last_arrival_semantics() {
+        let stop = AtomicBool::new(false);
+        let barrier = Barrier::new(2);
+        barrier.request_stop(&stop);
+        assert!(!barrier.sync_with_stop(&stop));
+        // Upstream returns true for the last arrival, even with a stopped token.
+        assert!(barrier.sync_with_stop(&stop));
+    }
 
     #[test]
     fn test_event_set_wait() {

@@ -1935,9 +1935,7 @@ pub struct KernelCore {
 
     /// Kernel-wide physical memory layout. Upstream:
     /// `KernelCore::Impl::memory_layout` populated at boot by
-    /// `KMemoryLayoutInit` from the SoC region tree. ruzu populates with
-    /// `populate_default_dram_user_pools` at boot — the same data
-    /// `core.rs` previously hardcoded inline for `initialize_pool` calls.
+    /// `derive_initial_memory_layout` from the configured SoC region tree.
     memory_layout: Option<Arc<Mutex<super::k_memory_layout::KMemoryLayout>>>,
 
     // -- Core timing --
@@ -3475,30 +3473,168 @@ impl KernelCore {
 
     /// Get the kernel-wide physical memory layout. Upstream:
     /// `KernelCore::MemoryLayout()`. Populated by
-    /// `initialize_memory_layout` at boot.
+    /// `derive_initial_memory_layout` at boot.
     pub fn get_memory_layout(&self) -> Option<Arc<Mutex<super::k_memory_layout::KMemoryLayout>>> {
         self.memory_layout.clone()
     }
 
-    /// Populate the kernel-wide physical memory layout with the three
-    /// Switch DRAM user pools (Application / Applet / SystemNonSecure).
-    /// Mirrors the upstream init pass that walks the SoC region tree.
-    pub fn initialize_memory_layout(
-        &mut self,
-        application: (u64, usize),
-        applet: (u64, usize),
-        system: (u64, usize),
-    ) {
-        let mut layout = super::k_memory_layout::KMemoryLayout::new();
-        layout.populate_default_dram_user_pools(
-            application.0,
-            application.1,
-            applet.0,
-            applet.1,
-            system.0,
-            system.1,
+    /// Port of KernelCore::Impl::DeriveInitialMemoryLayout (kernel.cpp).
+    /// Construct the region trees before initializing their allocators.
+    pub(crate) fn derive_initial_memory_layout(&mut self) {
+        use super::board::{k_memory_layout as board, k_system_control as control};
+        use super::k_memory_layout::*;
+        use super::k_memory_region_type::*;
+        use common::alignment::{align_down, align_up};
+
+        let mut layout = KMemoryLayout::new();
+        layout.get_virtual_memory_region_tree_mut().insert_directly(
+            KERNEL_VIRTUAL_ADDRESS_SPACE_BASE as u64,
+            (KERNEL_VIRTUAL_ADDRESS_SPACE_BASE + KERNEL_VIRTUAL_ADDRESS_SPACE_SIZE - 1) as u64,
+            0, 0,
         );
+        layout.get_physical_memory_region_tree_mut().insert_directly(
+            KERNEL_PHYSICAL_ADDRESS_SPACE_BASE as u64,
+            (KERNEL_PHYSICAL_ADDRESS_SPACE_BASE + KERNEL_PHYSICAL_ADDRESS_SPACE_SIZE - 1) as u64,
+            0, 0,
+        );
+        const GIB: u64 = 1 << 30;
+        const MIB: usize = 1 << 20;
+        let page = super::k_memory_block::PAGE_SIZE as u64;
+        let aslr = KERNEL_ASLR_ALIGNMENT as u64;
+        let kernel_start = align_down(KERNEL_VIRTUAL_ADDRESS_CODE_BASE as u64, GIB);
+        let kernel_size = if kernel_start + GIB - 1 <= KERNEL_VIRTUAL_ADDRESS_SPACE_LAST as u64 {
+            GIB as usize
+        } else {
+            (KERNEL_VIRTUAL_ADDRESS_SPACE_END as u64 - kernel_start) as usize
+        };
+        assert!(layout.get_virtual_memory_region_tree_mut().insert(
+            kernel_start, kernel_size, K_MEMORY_REGION_TYPE_KERNEL.get_value(), 0, 0));
+        let code_start = align_down(KERNEL_VIRTUAL_ADDRESS_CODE_BASE as u64, page);
+        let code_size = (align_up(KERNEL_VIRTUAL_ADDRESS_CODE_END as u64, page) - code_start) as usize;
+        assert!(layout.get_virtual_memory_region_tree_mut().insert(
+            code_start, code_size, K_MEMORY_REGION_TYPE_KERNEL_CODE.get_value(), 0, 0));
+        board::setup_device_physical_memory_regions(&mut layout);
+
+        let mut misc_needed = hardware_properties::NUM_CPU_CORES as u64 * 3 * (page + page);
+        for region in layout.get_physical_memory_region_tree().iter() {
+            if region.has_type_attribute(K_MEMORY_REGION_ATTR_SHOULD_KERNEL_MAP) {
+                assert_ne!(region.get_end_address(), 0);
+                misc_needed += page + align_up(region.get_last_address(), page)
+                    - align_down(region.get_address(), page);
+            }
+        }
+        let misc_size = align_up((misc_needed * 3).max((32 * MIB) as u64), aslr) as usize;
+        assert!(misc_size > 0);
+        let misc_start = layout.get_virtual_memory_region_tree().get_random_aligned_region(
+            misc_size, aslr as usize, K_MEMORY_REGION_TYPE_KERNEL.get_value());
+        assert!(layout.get_virtual_memory_region_tree_mut().insert(
+            misc_start, misc_size, K_MEMORY_REGION_TYPE_KERNEL_MISC.get_value(), 0, 0));
+        let extra = control::init::should_increase_thread_resource_limit();
+        let stack_start = layout.get_virtual_memory_region_tree().get_random_aligned_region(
+            14 * MIB, aslr as usize, K_MEMORY_REGION_TYPE_KERNEL.get_value());
+        assert!(layout.get_virtual_memory_region_tree_mut().insert(
+            stack_start, 14 * MIB, K_MEMORY_REGION_TYPE_KERNEL_STACK.get_value(), 0, 0));
+        let resource_size = KMemoryLayout::get_resource_region_size_for_init(extra);
+        let slab_size = align_up(super::init::init_slab_setup::calculate_total_slab_heap_size(
+            &self.slab_resource_counts) as u64, page) as usize;
+        assert!(slab_size <= resource_size);
+        let code_phys = KERNEL_PHYSICAL_ADDRESS_CODE_BASE as u64;
+        let slab_phys = code_phys + code_size as u64;
+        let slab_end = slab_phys + slab_size as u64;
+        let slab_needed = align_up(slab_end, aslr) - align_down(slab_phys, aslr);
+        let slab_start = layout.get_virtual_memory_region_tree().get_random_aligned_region(
+            slab_needed as usize, aslr as usize, K_MEMORY_REGION_TYPE_KERNEL.get_value())
+            + slab_phys % aslr;
+        assert!(layout.get_virtual_memory_region_tree_mut().insert(
+            slab_start, slab_size, K_MEMORY_REGION_TYPE_KERNEL_SLAB.get_value(), 0, 0));
+        let temp_start = layout.get_virtual_memory_region_tree().get_random_aligned_region(
+            128 * MIB, aslr as usize, K_MEMORY_REGION_TYPE_KERNEL.get_value());
+        assert!(layout.get_virtual_memory_region_tree_mut().insert(
+            temp_start, 128 * MIB, K_MEMORY_REGION_TYPE_KERNEL_TEMP.get_value(), 0, 0));
+
+        // Distinct tree borrows preserve the upstream per-region mutation order.
+        let device_regions: Vec<u64> = layout.get_physical_memory_region_tree().iter()
+            .filter(|r| r.is_derived_from(K_MEMORY_REGION_TYPE_KERNEL)
+                && r.has_type_attribute(K_MEMORY_REGION_ATTR_SHOULD_KERNEL_MAP)
+                && !r.has_type_attribute(K_MEMORY_REGION_ATTR_DID_KERNEL_MAP))
+            .map(|r| r.get_address()).collect();
+        for address in device_regions {
+            let region = layout.get_physical_memory_region_tree_mut().find_modifiable(address).unwrap();
+            assert_ne!(region.get_end_address(), 0);
+            region.set_type_attribute(K_MEMORY_REGION_ATTR_DID_KERNEL_MAP);
+            let map_phys = align_down(region.get_address(), page);
+            let map_size = (align_up(region.get_end_address(), page) - map_phys) as usize;
+            let map_virt = layout.get_virtual_memory_region_tree().get_random_aligned_region_with_guard(
+                map_size, page as usize, K_MEMORY_REGION_TYPE_KERNEL_MISC.get_value(), page as usize);
+            assert!(layout.get_virtual_memory_region_tree_mut().insert(
+                map_virt, map_size, K_MEMORY_REGION_TYPE_KERNEL_MISC_MAPPED_DEVICE.get_value(), 0, 0));
+            layout.get_physical_memory_region_tree_mut().find_modifiable(address).unwrap()
+                .set_pair_address(map_virt + address - map_phys);
+        }
+        board::setup_dram_physical_memory_regions(&mut layout);
+        assert!(layout.get_physical_memory_region_tree_mut().insert(
+            code_phys, code_size, K_MEMORY_REGION_TYPE_DRAM_KERNEL_CODE.get_value(), 0, 0));
+        assert!(layout.get_physical_memory_region_tree_mut().insert(
+            slab_phys, slab_size, K_MEMORY_REGION_TYPE_DRAM_KERNEL_SLAB.get_value(), 0, 0));
+        let secure_end = slab_end + control::SECURE_APPLET_MEMORY_SIZE as u64;
+        if control::SECURE_APPLET_MEMORY_SIZE > 0 {
+            assert!(layout.get_physical_memory_region_tree_mut().insert(
+                slab_end, control::SECURE_APPLET_MEMORY_SIZE,
+                K_MEMORY_REGION_TYPE_DRAM_KERNEL_SECURE_APPLET_MEMORY.get_value(), 0, 0));
+        }
+        // Upstream SecureUnknownRegionSize is zero.
+        let resource_end = slab_phys + resource_size as u64;
+        let pt_heap_size = (resource_end - secure_end) as usize;
+        assert!(pt_heap_size / (4 * MIB) > 2);
+        assert!(layout.get_physical_memory_region_tree_mut().insert(
+            secure_end, pt_heap_size, K_MEMORY_REGION_TYPE_DRAM_KERNEL_PT_HEAP.get_value(), 0, 0));
+        for region in layout.get_physical_memory_region_tree_mut().iter_mut() {
+            if region.get_type() == K_MEMORY_REGION_TYPE_DRAM.get_value() {
+                assert_ne!(region.get_end_address(), 0);
+                region.set_type_attribute(K_MEMORY_REGION_ATTR_LINEAR_MAPPED);
+            }
+        }
+        let extents = layout.get_physical_memory_region_tree()
+            .get_derived_region_extents_raw(K_MEMORY_REGION_ATTR_LINEAR_MAPPED);
+        assert_ne!(extents.get_end_address(), 0);
+        let aligned_phys = align_down(extents.get_address(), GIB);
+        let linear_size = (align_up(extents.get_end_address(), GIB) - aligned_phys) as usize;
+        let linear_start = layout.get_virtual_memory_region_tree().get_random_aligned_region_with_guard(
+            linear_size, GIB as usize, K_MEMORY_REGION_TYPE_NONE.get_value(), GIB as usize);
+        let difference = linear_start.wrapping_sub(aligned_phys);
+        let linear_regions: Vec<_> = layout.get_physical_memory_region_tree().iter()
+            .filter(|r| r.has_type_attribute(K_MEMORY_REGION_ATTR_LINEAR_MAPPED)).cloned().collect();
+        for region in linear_regions {
+            assert_ne!(region.get_end_address(), 0);
+            let virtual_address = region.get_address().wrapping_add(difference);
+            assert!(layout.get_virtual_memory_region_tree_mut().insert(
+                virtual_address, region.get_size(),
+                get_type_for_virtual_linear_mapping(region.get_type()).get_value(), 0, 0));
+            layout.get_physical_memory_region_tree_mut().find_modifiable(region.get_address()).unwrap()
+                .set_pair_address(virtual_address);
+            layout.get_virtual_memory_region_tree_mut().find_modifiable(virtual_address).unwrap()
+                .set_pair_address(region.get_address());
+        }
+        assert!(layout.get_physical_memory_region_tree_mut().insert(
+            resource_end, KERNEL_PAGE_TABLE_HEAP_SIZE, K_MEMORY_REGION_TYPE_DRAM_KERNEL_INIT_PT.get_value(), 0, 0));
+        assert!(layout.get_virtual_memory_region_tree_mut().insert(
+            resource_end.wrapping_add(difference), KERNEL_PAGE_TABLE_HEAP_SIZE,
+            K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_KERNEL_INIT_PT.get_value(), 0, 0));
+        for region in layout.get_physical_memory_region_tree_mut().iter_mut() {
+            if region.get_type() == (K_MEMORY_REGION_TYPE_DRAM.get_value() | K_MEMORY_REGION_ATTR_LINEAR_MAPPED) {
+                region.set_type(K_MEMORY_REGION_TYPE_DRAM_POOL_PARTITION.get_value());
+            }
+        }
+        board::setup_pool_partition_memory_regions(&mut layout);
+        layout.initialize_linear_memory_region_trees(aligned_phys, linear_start);
         self.memory_layout = Some(Arc::new(Mutex::new(layout)));
+    }
+
+    /// Port of KernelCore::Impl::InitializeMemoryLayout: initialize the
+    /// physical allocator from the previously derived board layout.
+    pub fn initialize_memory_layout(&mut self) {
+        let layout = self.memory_layout.as_ref().expect("derive memory layout first");
+        self.memory_manager.initialize_from_layout(&layout.lock().unwrap());
     }
 
     /// Port of `KernelCore::Impl::InitializeResourceManagers`.
@@ -3831,6 +3967,118 @@ impl KernelCore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn derived_layout_initializes_dynamic_resources_and_shared_memory() {
+        use super::*;
+        use crate::hle::kernel::k_memory_region_type::*;
+        const CHILD: &str = "RUZU_TEST_DERIVED_KERNEL_RESOURCES";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::kernel::kernel::tests::derived_layout_initializes_dynamic_resources_and_shared_memory"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        for global in [true, false] {
+            {
+                let mut settings = common::settings::values_mut();
+                settings.memory_layout_mode.set_global(global);
+                settings.memory_layout_mode.set_value(if global {
+                    common::settings::MemoryLayout::Memory4Gb
+                } else {
+                    common::settings::MemoryLayout::Memory12Gb
+                });
+            }
+            let backing = DeviceMemory::new();
+            let mut kernel = KernelCore::new();
+            super::super::init::init_slab_setup::initialize_slab_resource_counts(
+                &mut kernel.slab_resource_counts);
+            kernel.derive_initial_memory_layout();
+            let (total, reserved, pt_address, pt_size) = {
+                let layout = kernel.memory_layout.as_ref().unwrap().lock().unwrap();
+                let (total, reserved) = layout.get_total_and_kernel_memory_sizes();
+                let pt = layout.get_virtual_memory_region_tree().find_first_derived(
+                    K_MEMORY_REGION_TYPE_VIRTUAL_DRAM_KERNEL_PT_HEAP).unwrap();
+                (total, reserved, pt.get_address(), pt.get_size())
+            };
+            assert_eq!(total, backing.buffer.backing_size());
+            kernel.initialize_system_resource_limit(total as i64, reserved as i64);
+            kernel.initialize_memory_layout();
+            kernel.initialize_resource_managers(pt_address, pt_size);
+            assert!(kernel.initialize_font_shared_memory(&backing).is_success());
+            assert!(kernel.initialize_irs_shared_memory(&backing).is_success());
+            assert!(kernel.initialize_hidbus_shared_memory(&backing).is_success());
+        }
+    }
+
+    #[test]
+    fn derived_memory_layout_pairs_user_pools() {
+        use super::*;
+        use crate::hle::kernel::k_memory_region_type::*;
+        const CHILD: &str = "RUZU_TEST_DERIVED_MEMORY_LAYOUT";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::kernel::kernel::tests::derived_memory_layout_pairs_user_pools"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(result.success());
+            return;
+        }
+        let mut kernel = KernelCore::new();
+        super::super::init::init_slab_setup::initialize_slab_resource_counts(
+            &mut kernel.slab_resource_counts);
+        for mode in [common::settings::MemoryLayout::Memory4Gb,
+            common::settings::MemoryLayout::Memory6Gb,
+            common::settings::MemoryLayout::Memory8Gb,
+            common::settings::MemoryLayout::Memory10Gb,
+            common::settings::MemoryLayout::Memory12Gb] {
+            {
+                let mut settings = common::settings::values_mut();
+                settings.memory_layout_mode.set_global(true);
+                settings.memory_layout_mode.set_value(mode);
+            }
+            kernel.derive_initial_memory_layout();
+            let layout = kernel.memory_layout.as_ref().unwrap().lock().unwrap();
+            let mut application = 0;
+            let mut applet = 0;
+            for region in layout.get_physical_memory_region_tree().iter() {
+                if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_USER_POOL) {
+                    let pair = layout.find_virtual(region.get_pair_address()).unwrap();
+                    assert_eq!(pair.get_pair_address(), region.get_address());
+                    assert_eq!(pair.get_size(), region.get_size());
+                    assert_eq!(pair.get_attributes(), region.get_attributes());
+                }
+                if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_APPLICATION_POOL) {
+                    application += region.get_size();
+                }
+                if region.is_derived_from(K_MEMORY_REGION_TYPE_DRAM_APPLET_POOL) {
+                    applet += region.get_size();
+                }
+            }
+            assert_eq!(application, super::super::board::k_system_control::init::get_application_pool_size());
+            assert_eq!(applet, super::super::board::k_system_control::init::get_applet_pool_size());
+            let mut manager = super::super::k_memory_manager::KMemoryManager::new();
+            manager.initialize_from_layout(&layout);
+            for (pool, expected) in [
+                (super::super::k_memory_manager::Pool::Application, application),
+                (super::super::k_memory_manager::Pool::Applet, applet),
+            ] {
+                assert_eq!(manager.get_size(pool), expected);
+                assert_eq!(manager.get_free_size(pool), expected);
+                let option = super::super::k_memory_manager::KMemoryManager::encode_option(
+                    pool, super::super::k_memory_manager::Direction::FromBack);
+                let address = manager.allocate_and_open_continuous(1, 1, option);
+                assert_ne!(address, 0);
+                assert!(layout.find_physical(address).unwrap()
+                    .is_derived_from(K_MEMORY_REGION_TYPE_DRAM_USER_POOL));
+                assert_eq!(manager.get_free_size(pool), expected - 4096);
+                manager.close(address, 1);
+                assert_eq!(manager.get_free_size(pool), expected);
+            }
+            assert_eq!(layout.get_main_memory_physical_extents().get_size(),
+                super::super::board::k_system_control::init::get_intended_memory_size());
+        }
+    }
+
     use super::*;
     use crate::core::SystemRef;
 

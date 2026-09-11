@@ -139,7 +139,9 @@ pub const SMMU_PAGE_BITS: u32 = 12;
 pub const SMMU_PAGE_SIZE: u64 = 1 << SMMU_PAGE_BITS;
 pub const SMMU_DEVICE_PAGE_COUNT: usize = 1usize << (DEVICE_VIRTUAL_BITS - SMMU_PAGE_BITS as usize);
 const PHYSICAL_MIN_BITS: usize = 32;
-const PHYSICAL_MAX_BITS: usize = 33;
+// Eden's 33-bit maximum only covers 8 GiB. The exposed 10/12 GiB modes
+// require 34 bits for the reverse physical-page table.
+const PHYSICAL_MAX_BITS: usize = 34;
 
 /// Base and limit for upstream `DeviceMemoryManagerAllocator`.
 ///
@@ -334,10 +336,10 @@ impl TranslationCache {
 }
 
 fn smmu_physical_bits() -> usize {
-    if *common::settings::values().memory_layout_mode.get_value() == MemoryLayout::Memory4Gb {
-        PHYSICAL_MIN_BITS
-    } else {
-        PHYSICAL_MAX_BITS
+    match *common::settings::values().memory_layout_mode.get_value() {
+        MemoryLayout::Memory4Gb => PHYSICAL_MIN_BITS,
+        MemoryLayout::Memory6Gb | MemoryLayout::Memory8Gb => PHYSICAL_MIN_BITS + 1,
+        MemoryLayout::Memory10Gb | MemoryLayout::Memory12Gb => PHYSICAL_MAX_BITS,
     }
 }
 
@@ -1956,6 +1958,43 @@ mod tests {
                 .len(),
             expected
         );
+    }
+
+    #[test]
+    fn extended_memory_reverse_table_covers_last_configured_page() {
+        const CHILD: &str = "RUZU_TEST_EXTENDED_REVERSE_TABLE";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host1x::gpu_device_memory_manager::tests::extended_memory_reverse_table_covers_last_configured_page"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        for (mode, gib, bits) in [
+            (MemoryLayout::Memory4Gb, 4usize, 32),
+            (MemoryLayout::Memory6Gb, 6, 33),
+            (MemoryLayout::Memory8Gb, 8, 33),
+            (MemoryLayout::Memory10Gb, 10, 34),
+            (MemoryLayout::Memory12Gb, 12, 34),
+        ] {
+            {
+                let mut settings = common::settings::values_mut();
+                settings.memory_layout_mode.set_global(true);
+                settings.memory_layout_mode.set_value(mode);
+            }
+            let manager = MaxwellDeviceMemoryManager::default();
+            assert_eq!(smmu_physical_bits(), bits);
+            assert_eq!(manager.smmu_physical_page_count, 1usize << (bits - 12));
+            // Synthetic addresses are never dereferenced; only metadata is allocated.
+            let base = 0x1000usize;
+            manager.smmu_set_physical_base_for_test(base);
+            let last_page = (gib << 30) - SMMU_PAGE_SIZE as usize;
+            let compressed = manager.smmu_compressed_physical_from_device_memory(base + last_page)
+                .expect("last configured physical page must be representable");
+            assert_eq!(compressed as usize, (last_page >> 12) + 1);
+            assert_eq!(manager.smmu_host_ptr_from_compressed_physical(compressed, 0),
+                Some(base + last_page));
+        }
     }
 
     #[test]

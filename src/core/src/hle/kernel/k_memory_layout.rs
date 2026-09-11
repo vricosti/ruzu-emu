@@ -6,6 +6,34 @@ use super::k_memory_block::PAGE_SIZE;
 use super::k_memory_region::{DerivedRegionExtents, KMemoryRegion, KMemoryRegionTree};
 use super::k_memory_region_type::*;
 
+// Upstream defines this KMemoryRegionTree method in k_memory_layout.cpp.
+impl KMemoryRegionTree {
+    pub fn get_random_aligned_region(&self, size: usize, alignment: usize, type_id: u32) -> u64 {
+        let extents = self.get_derived_region_extents_raw(type_id);
+        assert_eq!(extents.get_address() % alignment as u64, 0);
+        let first_index = extents.get_address() / alignment as u64;
+        let last_index = extents.get_last_address() / alignment as u64;
+        loop {
+            let candidate = super::board::k_system_control::generate_random_range(
+                first_index,
+                last_index,
+            ) * alignment as u64;
+            let end = candidate.wrapping_add(size as u64);
+            if candidate >= end {
+                continue;
+            }
+            let last = end - 1;
+            if last > extents.get_last_address() {
+                continue;
+            }
+            let region = self.find(candidate).expect("candidate must belong to the region tree");
+            if last <= region.get_last_address() && region.get_type() == type_id {
+                return candidate;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constants from k_memory_layout.h
 // ---------------------------------------------------------------------------
@@ -20,7 +48,9 @@ pub const fn get_maximum_overhead_size(size: usize) -> usize {
 }
 
 pub const MAIN_MEMORY_SIZE: usize = 4 * (1 << 30); // 4 GiB
-pub const MAIN_MEMORY_SIZE_MAX: usize = 8 * (1 << 30); // 8 GiB
+// The exposed layouts reach 12 GiB. Eden's older 8 GiB bound undersizes
+// GetMaximumOverheadSize for the two larger layouts.
+pub const MAIN_MEMORY_SIZE_MAX: usize = 12 * (1 << 30);
 
 pub const RESERVED_EARLY_DRAM_SIZE: usize = 384 * 1024;
 pub const DRAM_PHYSICAL_ADDRESS: usize = 0x80000000;
@@ -190,11 +220,9 @@ impl KMemoryLayout {
     }
 
     /// Port of KMemoryLayout::GetResourceRegionSizeForInit.
-    /// Note: KSystemControl::SecureAppletMemorySize is 0 in most configurations.
     pub fn get_resource_region_size_for_init(use_extra_resource: bool) -> usize {
-        let secure_applet_memory_size: usize = 0; // KSystemControl::SecureAppletMemorySize
         KERNEL_RESOURCE_SIZE
-            + secure_applet_memory_size
+            + super::board::k_system_control::SECURE_APPLET_MEMORY_SIZE
             + if use_extra_resource {
                 KERNEL_SLAB_HEAP_ADDITIONAL_SIZE + KERNEL_PAGE_BUFFER_ADDITIONAL_SIZE
             } else {
@@ -223,57 +251,71 @@ impl KMemoryLayout {
         (total_size, kernel_size)
     }
 
-    /// Pre-populate the physical tree with DramUserPool entries for the
-    /// three Switch user pools (Application / Applet / SystemNonSecure).
-    /// Mirrors upstream's `Kernel::Init::SetupDramPhysicalMemoryRegions`
-    /// — ruzu doesn't run the full setup pass yet, so this seeds the
-    /// tree from the same constants `core.rs` previously hardcoded for
-    /// `KMemoryManager::initialize_pool` calls.
-    ///
-    /// `KMemoryManager::initialize_from_layout` then walks the tree and
-    /// creates one Impl per pool region, matching upstream's
-    /// `for (it : layout.GetPhysicalMemoryRegionTree()) if (DramUserPool)`
-    /// loop in `KMemoryManager::Initialize`.
-    pub fn populate_default_dram_user_pools(
-        &mut self,
-        application_phys_start: u64,
-        application_size: usize,
-        applet_phys_start: u64,
-        applet_size: usize,
-        system_phys_start: u64,
-        system_size: usize,
-    ) {
-        let mut insert_pool = |start: u64, size: usize, type_id: u32| {
-            if size == 0 {
-                return;
-            }
-            self.m_physical_tree.insert_directly(
-                start,
-                start + size as u64 - 1,
-                0, /* no attributes */
-                type_id,
-            );
-        };
-        insert_pool(
-            application_phys_start,
-            application_size,
-            K_MEMORY_REGION_TYPE_DRAM_APPLICATION_POOL.get_value(),
-        );
-        insert_pool(
-            applet_phys_start,
-            applet_size,
-            K_MEMORY_REGION_TYPE_DRAM_APPLET_POOL.get_value(),
-        );
-        insert_pool(
-            system_phys_start,
-            system_size,
-            K_MEMORY_REGION_TYPE_DRAM_SYSTEM_POOL.get_value(),
-        );
-    }
 }
 
 impl Default for KMemoryLayout {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_table_reservation_covers_every_supported_memory_layout() {
+        for gib in [4usize, 6, 8, 10, 12] {
+            let memory_size = gib << 30;
+            assert!(memory_size <= MAIN_MEMORY_SIZE_MAX);
+            assert!(get_maximum_overhead_size(memory_size) <= KERNEL_PAGE_TABLE_HEAP_SIZE);
+        }
+        assert_eq!(KERNEL_PAGE_TABLE_HEAP_SIZE, (12 + 6144) * PAGE_SIZE);
+    }
+
+    #[test]
+    fn aligned_region_requires_exact_type_and_single_region_fit() {
+        let mut tree = KMemoryRegionTree::new();
+        let parent = K_MEMORY_REGION_TYPE_KERNEL.get_value();
+        let child = K_MEMORY_REGION_TYPE_KERNEL_CODE.get_value();
+        tree.insert_directly(0x1000, 0x2fff, 0, child);
+        tree.insert_directly(0x3000, 0x3fff, 0, parent);
+        tree.insert_directly(0x4000, 0x5fff, 0, parent);
+        for _ in 0..32 {
+            assert_eq!(tree.get_random_aligned_region(0x2000, 0x1000, parent), 0x4000);
+        }
+    }
+
+    #[test]
+    fn aligned_region_with_guard_reserves_both_margins() {
+        let mut tree = KMemoryRegionTree::new();
+        let kind = K_MEMORY_REGION_TYPE_KERNEL.get_value();
+        tree.insert_directly(0x8000, 0xbfff, 0, kind);
+        assert_eq!(
+            tree.get_random_aligned_region_with_guard(0x2000, 0x1000, kind, 0x1000),
+            0x9000
+        );
+    }
+
+    #[test]
+    fn aligned_region_rejects_wrapping_end_addresses() {
+        let mut tree = KMemoryRegionTree::new();
+        let kind = K_MEMORY_REGION_TYPE_KERNEL.get_value();
+        // Keep the tree's nonzero-end invariant; the last aligned candidate
+        // still wraps when the requested page size is added.
+        tree.insert_directly(u64::MAX - 0x1fff, u64::MAX - 1, 0, kind);
+        assert_eq!(tree.get_random_aligned_region(0x1000, 0x1000, kind), u64::MAX - 0x1fff);
+    }
+
+    #[test]
+    fn resource_region_includes_secure_applet_memory_in_both_modes() {
+        // KMemoryLayout::GetResourceRegionSizeForInit adds the NX board's
+        // SecureAppletMemorySize independently of the extra-resource flag.
+        let base = KERNEL_RESOURCE_SIZE + 4 * 1024 * 1024;
+        assert_eq!(KMemoryLayout::get_resource_region_size_for_init(false), base);
+        assert_eq!(
+            KMemoryLayout::get_resource_region_size_for_init(true),
+            base + KERNEL_SLAB_HEAP_ADDITIONAL_SIZE + KERNEL_PAGE_BUFFER_ADDITIONAL_SIZE
+        );
     }
 }

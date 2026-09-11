@@ -455,7 +455,11 @@ impl CpuManager {
     /// Shuts down all CPU threads.
     /// Upstream: `CpuManager::Shutdown()` (cpu_manager.cpp:33-40).
     pub fn shutdown(&mut self) {
-        self.stop_requested.store(true, Ordering::Relaxed);
+        if let Some(barrier) = &self.gpu_barrier {
+            barrier.request_stop(&self.stop_requested);
+        } else {
+            self.stop_requested.store(true, Ordering::Release);
+        }
         for i in 0..self.num_cores {
             if let Some(thread) = self.core_data[i].host_thread.take() {
                 let _ = thread.join();
@@ -2060,7 +2064,9 @@ impl CpuManager {
 
         // Running.
         // Upstream: if (!gpu_barrier->Sync(token)) { return; }
-        gpu_barrier.sync();
+        if !gpu_barrier.sync_with_stop(stop_requested) {
+            return;
+        }
         if stop_requested.load(Ordering::Relaxed) {
             return;
         }

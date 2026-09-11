@@ -20,10 +20,12 @@ use crate::vulkan_common::vulkan_wrapper::VulkanError;
 
 // Port of the anonymous-namespace constants in `vk_staging_buffer_pool.cpp`.
 const MAX_ALIGNMENT: vk::DeviceSize = 256;
-#[cfg(any(target_os = "windows", target_os = "android"))]
-const MAX_STREAM_BUFFER_SIZE: vk::DeviceSize = 256 * 1024 * 1024;
-#[cfg(not(any(target_os = "windows", target_os = "android")))]
+// Upstream: only FreeBSD keeps the smaller stream buffer; every other
+// platform (including Linux) uses 256 MiB.
+#[cfg(target_os = "freebsd")]
 const MAX_STREAM_BUFFER_SIZE: vk::DeviceSize = 128 * 1024 * 1024;
+#[cfg(not(target_os = "freebsd"))]
+const MAX_STREAM_BUFFER_SIZE: vk::DeviceSize = 256 * 1024 * 1024;
 
 /// Port of upstream `StagingBufferRef`.
 #[derive(Clone, Copy)]

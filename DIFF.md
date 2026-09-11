@@ -16705,3 +16705,17 @@ unchanged.
   (core, with a negative control proving the bare pattern still hangs) and
   `with_controller_delivers_reentrant_callbacks_after_releasing_the_owner`
   (hid_core).
+- The same sample showed the NFP `DeviceManager`, and therefore its controller
+  callbacks, alive 10 s after `System: shutdown complete`. Of 58 `ServerManager`
+  loops only the 9 on host threads logged an exit; the 49 on guest fibers never
+  observed `stop_requested` before `shutdown_cores`, and `CpuManager::shutdown`
+  abandons a fiber without unwinding its stack, so the `Arc<Mutex<ServerManager>>`
+  it holds - and every session's `SessionRequestManager` and service object -
+  leaked for the life of the process. Upstream's `~ServerManager` waits for
+  `m_stopped`, then deletes ports and sessions and closes its events.
+  `ServerManager::release_owners` is that post-wait body; `KernelCore::
+  finalize_services_after_cpu_shutdown` runs it on every deferred manager through
+  `try_lock` (an abandoned loop parks outside the owner mutex, holding only its
+  `selection_mutex`; a manager abandoned mid-update is logged and left leaked
+  rather than hanging shutdown). Regression:
+  `finalize_services_releases_sessions_of_an_abandoned_guest_manager`.

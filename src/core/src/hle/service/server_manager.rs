@@ -1129,6 +1129,51 @@ impl ServerManager {
         log::info!("ServerManager({}): event loop exited", self.name);
     }
 
+    /// The part of upstream `ServerManager::~ServerManager` past
+    /// `m_stopped.Wait()`: delete every port and session, then close the
+    /// wakeup and deferral events. Deleting a session runs
+    /// `KServerSession::Destroy`, which is what releases the
+    /// `SessionRequestManager` and the service object behind it.
+    ///
+    /// Rust needs this as a method because the owner is not always dropped:
+    /// a cooperative guest fiber that never observed the stop request is
+    /// abandoned by `CpuManager::shutdown` with its `Arc<Mutex<ServerManager>>`
+    /// still on the stack, so `Drop` never runs and every service object it
+    /// served - an `nfp:user` `DeviceManager` and its controller callbacks,
+    /// for one - would outlive the emulation session.
+    pub(crate) fn release_owners(&mut self) {
+        log::info!(
+            "ServerManager({}): releasing {} port(s) and {} session(s){}",
+            self.name,
+            self.ports.len(),
+            self.sessions.len(),
+            if self.is_stopped() { "" } else { " of an abandoned loop" }
+        );
+
+        // Clean up ports.
+        for mut port in self.ports.drain(..) {
+            port.holder.unlink_from_multi_wait();
+        }
+
+        // Clean up sessions.
+        while !self.sessions.is_empty() {
+            self.destroy_session(0);
+        }
+        self.deferred_sessions.clear();
+
+        // Close wakeup event.
+        if let Some(holder) = self.wakeup_holder.as_deref_mut() {
+            holder.unlink_from_multi_wait();
+        }
+        self.wakeup_holder = None;
+        if let Some(holder) = self.deferral_holder.as_deref_mut() {
+            holder.unlink_from_multi_wait();
+        }
+        self.deferral_holder = None;
+        // Write event is owned by ServiceManager
+        self.deferral_event = None;
+    }
+
     fn is_wakeup_holder(&self, selected: *mut MultiWaitHolder) -> bool {
         self.wakeup_holder
             .as_ref()

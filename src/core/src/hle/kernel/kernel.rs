@@ -2631,6 +2631,27 @@ impl KernelCore {
 
         for tracked in deferred {
             ServerManager::join_host_threads(&tracked.host_threads, &tracked.name);
+
+            // Upstream's `~ServerManager` runs once its guest thread has
+            // stopped. A cooperative fiber that never observed the stop
+            // request was abandoned by `CpuManager::shutdown` with this owner
+            // still on its stack, so Rust's `Drop` never runs; release the
+            // ports and sessions - and with them every service object - here.
+            // An abandoned loop parks outside the owner mutex (only its
+            // `selection_mutex` stays held), so the lock is free unless the
+            // fiber was abandoned mid-update; then the owners stay leaked
+            // rather than shutdown hanging on them.
+            match tracked.manager.try_lock() {
+                Ok(mut manager) => manager.release_owners(),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    poisoned.into_inner().release_owners()
+                }
+                Err(std::sync::TryLockError::WouldBlock) => log::warn!(
+                    "KernelCore::finalize_services_after_cpu_shutdown: ServerManager({}) \
+                     is still locked by an abandoned guest fiber; its service objects leak",
+                    tracked.name
+                ),
+            }
         }
 
         let service_owners = {
@@ -4278,6 +4299,45 @@ mod tests {
         assert!(!dropped.load(Ordering::Acquire));
         kernel.finalize_services_after_cpu_shutdown();
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    /// A manager whose loop never observed the stop request keeps its owner
+    /// on an abandoned fiber stack, so `Drop` never runs. Post-CPU
+    /// finalization must still release its sessions - and the service object
+    /// each `SessionRequestManager` carries - as `~ServerManager` does.
+    #[test]
+    fn finalize_services_releases_sessions_of_an_abandoned_guest_manager() {
+        use crate::hle::kernel::k_server_session::KServerSession;
+        use crate::hle::result::RESULT_SUCCESS;
+        use crate::hle::service::hle_ipc::SessionRequestManager;
+
+        let kernel = KernelCore::new();
+        let manager = ServerManager::new_shared(SystemRef::null());
+        let request_manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+        let service_owner = Arc::downgrade(&request_manager);
+        {
+            let server_session = Arc::new(Mutex::new(KServerSession::new()));
+            server_session.lock().unwrap().initialize(0x1000);
+            assert_eq!(
+                manager
+                    .lock()
+                    .unwrap()
+                    .register_session(server_session, request_manager),
+                RESULT_SUCCESS
+            );
+        }
+        kernel.track_server_manager_for_test(Arc::clone(&manager));
+        kernel.close_services();
+
+        // The loop was never entered, as with a fiber abandoned mid-wait.
+        assert!(!manager.lock().unwrap().is_stopped());
+        assert!(service_owner.upgrade().is_some());
+
+        kernel.finalize_services_after_cpu_shutdown();
+
+        // `manager` is still alive here, standing in for the abandoned
+        // fiber's stack reference; its owners must be gone regardless.
+        assert!(service_owner.upgrade().is_none());
     }
 
     #[test]

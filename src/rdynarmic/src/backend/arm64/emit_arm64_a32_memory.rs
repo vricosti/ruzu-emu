@@ -2,29 +2,35 @@
 //!
 //! Upstream owner: `backend/arm64/emit_arm64_a32_memory.cpp`.
 
-use crate::backend::arm64::abi::XSTATE;
+use rhazel::CodeGenerator;
+
+use crate::backend::arm64::abi::regs;
+#[cfg(test)]
 use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_arm64_memory::{
     emit_exclusive_read_memory, emit_exclusive_write_memory, emit_read_memory, emit_write_memory,
 };
 use crate::backend::arm64::emit_context::EmitContext;
+#[cfg(test)]
 use crate::backend::arm64::inst;
 use crate::backend::arm64::jit_state::A32JitState;
 use crate::ir::value::InstRef;
 
+#[cfg(test)]
 const WZR: u8 = 31;
+#[cfg(test)]
+use crate::backend::arm64::abi::XSTATE;
 
-pub fn emit_a32_clear_exclusive(code: &mut BlockOfCode) -> Result<(), String> {
-    code.write_u32(inst::str_w_unsigned(
-        WZR,
-        XSTATE,
+pub fn emit_a32_clear_exclusive(code: &mut CodeGenerator<'_>) -> Result<(), String> {
+    code.str(
+        rhazel::WZR,
+        regs::XSTATE,
         core::mem::offset_of!(A32JitState, exclusive_state) as u32,
-    ))?;
-    Ok(())
+    )
 }
 
 pub fn emit_a32_read_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -32,7 +38,7 @@ pub fn emit_a32_read_memory<const BITSIZE: usize>(
 }
 
 pub fn emit_a32_exclusive_read_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -40,7 +46,7 @@ pub fn emit_a32_exclusive_read_memory<const BITSIZE: usize>(
 }
 
 pub fn emit_a32_write_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -48,7 +54,7 @@ pub fn emit_a32_write_memory<const BITSIZE: usize>(
 }
 
 pub fn emit_a32_exclusive_write_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -130,10 +136,10 @@ mod tests {
 
     fn context_emit(
         block: &mut Block,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         emitted_block_info: &mut EmittedBlockInfo,
         config: &EmitConfig,
-        emit: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
+        emit: impl FnOnce(&mut CodeGenerator<'_>, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut reg_alloc = RegAlloc::default();
         let mut fpsr = FpsrManager::new(config.state_fpsr_offset);
@@ -171,7 +177,8 @@ mod tests {
 
     #[test]
     fn clear_exclusive_stores_wzr_to_a32_exclusive_state() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
         emit_a32_clear_exclusive(&mut code).unwrap();
 
@@ -188,7 +195,8 @@ mod tests {
     #[test]
     fn a32_read_memory_wrapper_uses_common_callback_only_emitter() {
         let config = config();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A32ReadMemory32,

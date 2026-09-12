@@ -3,12 +3,12 @@
 //! Upstream owner: `backend/arm64/emit_arm64_a32.cpp`.
 
 use crate::backend::arm64::abi::{XHALT, XSCRATCH0, XSCRATCH1, XSCRATCH2, XSTATE, XTICKS};
+#[cfg(test)]
 use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_arm64::{
     emit_block_link_relocation, emit_relocation, BlockRelocationType, LinkTarget,
 };
 use crate::backend::arm64::emit_context::EmitContext;
-use crate::backend::arm64::inst;
 use crate::backend::arm64::jit_state::A32JitState;
 use crate::backend::arm64::label::Label;
 use crate::backend::arm64::reg_alloc::RegAlloc;
@@ -21,11 +21,13 @@ use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};
 use crate::ir::opcode::Opcode;
 use crate::ir::terminal::Terminal;
 use crate::ir::value::InstRef;
+use rhazel::{BarrierOp, CodeGenerator, QReg, WReg, XReg, SP};
+use rhazel::{DReg, SReg, SystemReg};
 
 const WZR: u8 = 31;
 
 pub fn emit_a32_set_check_bit(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -33,33 +35,29 @@ pub fn emit_a32_set_check_bit(
     if args[0].is_immediate() {
         if args[0].get_immediate_u1() {
             emit_mov_w_imm(code, XSCRATCH0, 1)?;
-            code.write_u32(inst::strb_w_unsigned(
-                XSCRATCH0,
-                31,
+            code.strb(
+                WReg::new(XSCRATCH0),
+                SP,
                 StackLayout::check_bit_offset() as u32,
-            ))?;
+            )?;
         } else {
-            code.write_u32(inst::strb_w_unsigned(
-                WZR,
-                31,
-                StackLayout::check_bit_offset() as u32,
-            ))?;
+            code.strb(WReg::new(WZR), SP, StackLayout::check_bit_offset() as u32)?;
         }
         return Ok(());
     }
 
     let mut bit = ctx.reg_alloc.read_w(args[0]);
     let bit_reg = bit.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::strb_w_unsigned(
-        bit_reg,
-        31,
+    code.strb(
+        WReg::new(bit_reg),
+        SP,
         StackLayout::check_bit_offset() as u32,
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_get_register(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -68,16 +66,16 @@ pub fn emit_a32_get_register(
 
     let mut result = ctx.reg_alloc.write_w(inst_ref);
     let result_reg = result.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::ldr_w_unsigned(
-        result_reg,
-        XSTATE,
+    code.ldr(
+        WReg::new(result_reg),
+        XReg::new(XSTATE),
         a32_reg_offset(reg),
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_register(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -87,12 +85,12 @@ pub fn emit_a32_set_register(
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut value = ctx.reg_alloc.read_w(args[1]);
     let value_reg = value.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::str_w_unsigned(value_reg, XSTATE, a32_reg_offset(reg)))?;
+    code.str(WReg::new(value_reg), XReg::new(XSTATE), a32_reg_offset(reg))?;
     Ok(())
 }
 
 pub fn emit_a32_get_extended_register32(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -101,42 +99,46 @@ pub fn emit_a32_get_extended_register32(
 
     let mut result = ctx.reg_alloc.write_s(inst_ref);
     let result_reg = result.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::ldr_s_unsigned(
-        result_reg,
-        XSTATE,
+    code.ldr(
+        SReg::new(result_reg),
+        XReg::new(XSTATE),
         a32_ext_reg_single_offset(reg),
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_get_vector(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     let reg = ctx.block.get(inst_ref).arg(0).get_a32_ext_reg();
     ensure_double_or_quad_ext_reg(reg)?;
 
-    let mut result = ctx.reg_alloc.write_q(inst_ref);
+    let mut result = if reg.is_double() {
+        ctx.reg_alloc.write_d(inst_ref)
+    } else {
+        ctx.reg_alloc.write_q(inst_ref)
+    };
     let result_reg = result.realize(code, ctx.block)? as u8;
     if reg.is_double() {
-        code.write_u32(inst::ldr_d_unsigned(
-            result_reg,
-            XSTATE,
+        code.ldr(
+            DReg::new(result_reg),
+            XReg::new(XSTATE),
             a32_ext_reg_double_offset(reg),
-        ))?;
+        )?;
     } else {
-        code.write_u32(inst::ldr_q_unsigned(
-            result_reg,
-            XSTATE,
+        code.ldr(
+            QReg::new(result_reg),
+            XReg::new(XSTATE),
             a32_ext_reg_quad_offset(reg),
-        ))?;
+        )?;
     }
     Ok(())
 }
 
 pub fn emit_a32_get_extended_register64(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -145,16 +147,16 @@ pub fn emit_a32_get_extended_register64(
 
     let mut result = ctx.reg_alloc.write_d(inst_ref);
     let result_reg = result.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::ldr_d_unsigned(
-        result_reg,
-        XSTATE,
+    code.ldr(
+        DReg::new(result_reg),
+        XReg::new(XSTATE),
         a32_ext_reg_double_offset(reg),
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_extended_register32(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -164,16 +166,16 @@ pub fn emit_a32_set_extended_register32(
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut value = ctx.reg_alloc.read_s(args[1]);
     let value_reg = value.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::str_s_unsigned(
-        value_reg,
-        XSTATE,
+    code.str(
+        SReg::new(value_reg),
+        XReg::new(XSTATE),
         a32_ext_reg_single_offset(reg),
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_extended_register64(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -183,16 +185,16 @@ pub fn emit_a32_set_extended_register64(
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut value = ctx.reg_alloc.read_d(args[1]);
     let value_reg = value.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::str_d_unsigned(
-        value_reg,
-        XSTATE,
+    code.str(
+        DReg::new(value_reg),
+        XReg::new(XSTATE),
         a32_ext_reg_double_offset(reg),
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_vector(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -200,26 +202,30 @@ pub fn emit_a32_set_vector(
     ensure_double_or_quad_ext_reg(reg)?;
 
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
-    let mut value = ctx.reg_alloc.read_q(args[1]);
+    let mut value = if reg.is_double() {
+        ctx.reg_alloc.read_d(args[1])
+    } else {
+        ctx.reg_alloc.read_q(args[1])
+    };
     let value_reg = value.realize(code, ctx.block)? as u8;
     if reg.is_double() {
-        code.write_u32(inst::str_d_unsigned(
-            value_reg,
-            XSTATE,
+        code.str(
+            DReg::new(value_reg),
+            XReg::new(XSTATE),
             a32_ext_reg_double_offset(reg),
-        ))?;
+        )?;
     } else {
-        code.write_u32(inst::str_q_unsigned(
-            value_reg,
-            XSTATE,
+        code.str(
+            QReg::new(value_reg),
+            XReg::new(XSTATE),
             a32_ext_reg_quad_offset(reg),
-        ))?;
+        )?;
     }
     Ok(())
 }
 
 pub fn emit_a32_get_cpsr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -231,45 +237,72 @@ pub fn emit_a32_get_cpsr(
         core::mem::offset_of!(A32JitState, cpsr_q)
     );
 
-    code.write_u32(inst::ldp_w_offset(
-        XSCRATCH0,
-        XSCRATCH1,
-        XSTATE,
+    code.ldp(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+        XReg::new(XSTATE),
         a32_cpsr_nzcv_offset() as i32,
-    ))?;
-    code.write_u32(inst::ldr_w_unsigned(
-        cpsr_reg,
-        XSTATE,
+    )?;
+    code.ldr(
+        WReg::new(cpsr_reg),
+        XReg::new(XSTATE),
         a32_cpsr_jaifm_offset(),
-    ))?;
-    code.write_u32(inst::orr_w(cpsr_reg, cpsr_reg, XSCRATCH0))?;
-    code.write_u32(inst::orr_w(cpsr_reg, cpsr_reg, XSCRATCH1))?;
+    )?;
+    code.orr(
+        WReg::new(cpsr_reg),
+        WReg::new(cpsr_reg),
+        WReg::new(XSCRATCH0),
+    )?;
+    code.orr(
+        WReg::new(cpsr_reg),
+        WReg::new(cpsr_reg),
+        WReg::new(XSCRATCH1),
+    )?;
 
-    code.write_u32(inst::ldr_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    code.ldr(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         a32_cpsr_ge_offset(),
-    ))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0x8080_8080))?;
+    )?;
+    code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0x8080_8080)?;
     emit_mov_w_imm(code, XSCRATCH1, 0x0020_4081)?;
-    code.write_u32(inst::mul_w(XSCRATCH0, XSCRATCH0, XSCRATCH1))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0xf000_0000))?;
-    code.write_u32(inst::orr_w_lsr(cpsr_reg, cpsr_reg, XSCRATCH0, 12))?;
+    code.mul(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+    )?;
+    code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0xf000_0000)?;
+    code.orr_lsr(
+        WReg::new(cpsr_reg),
+        WReg::new(cpsr_reg),
+        WReg::new(XSCRATCH0),
+        12,
+    )?;
 
-    code.write_u32(inst::ldr_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    code.ldr(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         a32_upper_location_descriptor_offset(),
-    ))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0b11))?;
-    code.write_u32(inst::orr_w_lsl(XSCRATCH0, XSCRATCH0, XSCRATCH0, 3))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0x1111_1111))?;
-    code.write_u32(inst::orr_w_lsl(cpsr_reg, cpsr_reg, XSCRATCH0, 5))?;
+    )?;
+    code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0b11)?;
+    code.orr_lsl(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        3,
+    )?;
+    code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0x1111_1111)?;
+    code.orr_lsl(
+        WReg::new(cpsr_reg),
+        WReg::new(cpsr_reg),
+        WReg::new(XSCRATCH0),
+        5,
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_cpsr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -277,118 +310,142 @@ pub fn emit_a32_set_cpsr(
     let mut cpsr = ctx.reg_alloc.read_w(args[0]);
     let cpsr_reg = cpsr.realize(code, ctx.block)? as u8;
 
-    code.write_u32(inst::and_w_imm(XSCRATCH0, cpsr_reg, 0xf000_0000))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH1, cpsr_reg, 1 << 27))?;
+    code.and_imm(WReg::new(XSCRATCH0), WReg::new(cpsr_reg), 0xf000_0000)?;
+    code.and_imm(WReg::new(XSCRATCH1), WReg::new(cpsr_reg), 1 << 27)?;
 
     debug_assert_eq!(
         core::mem::offset_of!(A32JitState, cpsr_nzcv) + core::mem::size_of::<u32>(),
         core::mem::offset_of!(A32JitState, cpsr_q)
     );
-    code.write_u32(inst::stp_w_offset(
-        XSCRATCH0,
-        XSCRATCH1,
-        XSTATE,
+    code.stp(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+        XReg::new(XSTATE),
         a32_cpsr_nzcv_offset() as i32,
-    ))?;
+    )?;
 
-    code.write_u32(inst::ubfx_w(XSCRATCH0, cpsr_reg, 16, 4))?;
+    code.ubfx(WReg::new(XSCRATCH0), WReg::new(cpsr_reg), 16, 4)?;
     emit_mov_w_imm(code, XSCRATCH1, 0x0020_4081)?;
-    code.write_u32(inst::mul_w(XSCRATCH0, XSCRATCH0, XSCRATCH1))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0x0101_0101))?;
-    code.write_u32(inst::lsl_w_imm(XSCRATCH1, XSCRATCH0, 8))?;
-    code.write_u32(inst::sub_w_reg(XSCRATCH0, XSCRATCH1, XSCRATCH0))?;
+    code.mul(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+    )?;
+    code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0x0101_0101)?;
+    code.lsl(WReg::new(XSCRATCH1), WReg::new(XSCRATCH0), 8)?;
+    code.sub(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+        WReg::new(XSCRATCH0),
+    )?;
 
     emit_mov_w_imm(code, XSCRATCH1, 0x0100_01df)?;
-    code.write_u32(inst::and_w_reg(XSCRATCH1, cpsr_reg, XSCRATCH1))?;
+    code.and(
+        WReg::new(XSCRATCH1),
+        WReg::new(cpsr_reg),
+        WReg::new(XSCRATCH1),
+    )?;
 
     debug_assert_eq!(
         core::mem::offset_of!(A32JitState, cpsr_jaifm) + core::mem::size_of::<u32>(),
         core::mem::offset_of!(A32JitState, cpsr_ge)
     );
-    code.write_u32(inst::stp_w_offset(
-        XSCRATCH1,
-        XSCRATCH0,
-        XSTATE,
+    code.stp(
+        WReg::new(XSCRATCH1),
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         a32_cpsr_jaifm_offset() as i32,
-    ))?;
+    )?;
 
-    code.write_u32(inst::and_w_imm(XSCRATCH0, cpsr_reg, 0xfc00))?;
-    code.write_u32(inst::lsr_w_imm(XSCRATCH1, cpsr_reg, 17))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH1, XSCRATCH1, 0x300))?;
-    code.write_u32(inst::orr_w(XSCRATCH0, XSCRATCH0, XSCRATCH1))?;
+    code.and_imm(WReg::new(XSCRATCH0), WReg::new(cpsr_reg), 0xfc00)?;
+    code.lsr(WReg::new(XSCRATCH1), WReg::new(cpsr_reg), 17)?;
+    code.and_imm(WReg::new(XSCRATCH1), WReg::new(XSCRATCH1), 0x300)?;
+    code.orr(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+    )?;
 
-    code.write_u32(inst::lsr_w_imm(XSCRATCH1, cpsr_reg, 8))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH1, XSCRATCH1, 0x2))?;
-    code.write_u32(inst::orr_w(XSCRATCH0, XSCRATCH0, XSCRATCH1))?;
-    code.write_u32(inst::ldr_w_unsigned(
-        XSCRATCH1,
-        XSTATE,
+    code.lsr(WReg::new(XSCRATCH1), WReg::new(cpsr_reg), 8)?;
+    code.and_imm(WReg::new(XSCRATCH1), WReg::new(XSCRATCH1), 0x2)?;
+    code.orr(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+    )?;
+    code.ldr(
+        WReg::new(XSCRATCH1),
+        XReg::new(XSTATE),
         a32_upper_location_descriptor_offset(),
-    ))?;
-    code.write_u32(inst::bfxil_w(XSCRATCH0, cpsr_reg, 5, 1))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH1, XSCRATCH1, 0xffff_0000))?;
-    code.write_u32(inst::orr_w(XSCRATCH0, XSCRATCH0, XSCRATCH1))?;
-    code.write_u32(inst::str_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    )?;
+    code.bfxil(WReg::new(XSCRATCH0), WReg::new(cpsr_reg), 5, 1)?;
+    code.and_imm(WReg::new(XSCRATCH1), WReg::new(XSCRATCH1), 0xffff_0000)?;
+    code.orr(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+    )?;
+    code.str(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         a32_upper_location_descriptor_offset(),
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_cpsr_nzcv(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut nzcv = ctx.reg_alloc.read_w(args[0]);
     let nzcv_reg = nzcv.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::str_w_unsigned(
-        nzcv_reg,
-        XSTATE,
+    code.str(
+        WReg::new(nzcv_reg),
+        XReg::new(XSTATE),
         a32_cpsr_nzcv_offset(),
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_cpsr_nzcv_raw(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut nzcv = ctx.reg_alloc.read_w(args[0]);
     let nzcv_reg = nzcv.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::str_w_unsigned(
-        nzcv_reg,
-        XSTATE,
+    code.str(
+        WReg::new(nzcv_reg),
+        XReg::new(XSTATE),
         a32_cpsr_nzcv_offset(),
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_cpsr_nzcvq(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut nzcv = ctx.reg_alloc.read_w(args[0]);
     let nzcv_reg = nzcv.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::and_w_imm(XSCRATCH0, nzcv_reg, 0xf000_0000))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH1, nzcv_reg, 0x0800_0000))?;
-    code.write_u32(inst::stp_w_offset(
-        XSCRATCH0,
-        XSCRATCH1,
-        XSTATE,
+    code.and_imm(WReg::new(XSCRATCH0), WReg::new(nzcv_reg), 0xf000_0000)?;
+    code.and_imm(WReg::new(XSCRATCH1), WReg::new(nzcv_reg), 0x0800_0000)?;
+    code.stp(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+        XReg::new(XSTATE),
         a32_cpsr_nzcv_offset() as i32,
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_cpsr_nz(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -396,23 +453,27 @@ pub fn emit_a32_set_cpsr_nz(
     let mut nz = ctx.reg_alloc.read_w(args[0]);
     let nz_reg = nz.realize(code, ctx.block)? as u8;
 
-    code.write_u32(inst::ldr_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    code.ldr(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         a32_cpsr_nzcv_offset(),
-    ))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0x3000_0000))?;
-    code.write_u32(inst::orr_w(XSCRATCH0, XSCRATCH0, nz_reg))?;
-    code.write_u32(inst::str_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    )?;
+    code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0x3000_0000)?;
+    code.orr(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(nz_reg),
+    )?;
+    code.str(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         a32_cpsr_nzcv_offset(),
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_cpsr_nzc(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -421,97 +482,105 @@ pub fn emit_a32_set_cpsr_nzc(
     if args[0].is_immediate() {
         if args[1].is_immediate() {
             let carry = args[1].get_immediate_u1();
-            code.write_u32(inst::ldr_w_unsigned(
-                XSCRATCH0,
-                XSTATE,
+            code.ldr(
+                WReg::new(XSCRATCH0),
+                XReg::new(XSTATE),
                 a32_cpsr_nzcv_offset(),
-            ))?;
-            code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0x1000_0000))?;
+            )?;
+            code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0x1000_0000)?;
             if carry {
-                code.write_u32(inst::orr_w_imm(XSCRATCH0, XSCRATCH0, 0x2000_0000))?;
+                code.orr_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0x2000_0000)?;
             }
-            code.write_u32(inst::str_w_unsigned(
-                XSCRATCH0,
-                XSTATE,
+            code.str(
+                WReg::new(XSCRATCH0),
+                XReg::new(XSTATE),
                 a32_cpsr_nzcv_offset(),
-            ))?;
+            )?;
         } else {
             let mut c = ctx.reg_alloc.read_w(args[1]);
             let c_reg = c.realize(code, ctx.block)? as u8;
-            code.write_u32(inst::ldr_w_unsigned(
-                XSCRATCH0,
-                XSTATE,
+            code.ldr(
+                WReg::new(XSCRATCH0),
+                XReg::new(XSTATE),
                 a32_cpsr_nzcv_offset(),
-            ))?;
-            code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0x1000_0000))?;
-            code.write_u32(inst::orr_w(XSCRATCH0, XSCRATCH0, c_reg))?;
-            code.write_u32(inst::str_w_unsigned(
-                XSCRATCH0,
-                XSTATE,
+            )?;
+            code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0x1000_0000)?;
+            code.orr(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), WReg::new(c_reg))?;
+            code.str(
+                WReg::new(XSCRATCH0),
+                XReg::new(XSTATE),
                 a32_cpsr_nzcv_offset(),
-            ))?;
+            )?;
         }
     } else if args[1].is_immediate() {
         let carry = args[1].get_immediate_u1();
         let mut nz = ctx.reg_alloc.read_w(args[0]);
         let nz_reg = nz.realize(code, ctx.block)? as u8;
-        code.write_u32(inst::ldr_w_unsigned(
-            XSCRATCH0,
-            XSTATE,
+        code.ldr(
+            WReg::new(XSCRATCH0),
+            XReg::new(XSTATE),
             a32_cpsr_nzcv_offset(),
-        ))?;
-        code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0x1000_0000))?;
-        code.write_u32(inst::orr_w(XSCRATCH0, XSCRATCH0, nz_reg))?;
+        )?;
+        code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0x1000_0000)?;
+        code.orr(
+            WReg::new(XSCRATCH0),
+            WReg::new(XSCRATCH0),
+            WReg::new(nz_reg),
+        )?;
         if carry {
-            code.write_u32(inst::orr_w_imm(XSCRATCH0, XSCRATCH0, 0x2000_0000))?;
+            code.orr_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0x2000_0000)?;
         }
-        code.write_u32(inst::str_w_unsigned(
-            XSCRATCH0,
-            XSTATE,
+        code.str(
+            WReg::new(XSCRATCH0),
+            XReg::new(XSTATE),
             a32_cpsr_nzcv_offset(),
-        ))?;
+        )?;
     } else {
         let mut nz = ctx.reg_alloc.read_w(args[0]);
         let mut c = ctx.reg_alloc.read_w(args[1]);
         RegAlloc::realize_all(code, ctx.block, &mut [&mut nz, &mut c])?;
         let nz_reg = nz.index().expect("realized W NZ") as u8;
         let c_reg = c.index().expect("realized W C") as u8;
-        code.write_u32(inst::ldr_w_unsigned(
-            XSCRATCH0,
-            XSTATE,
+        code.ldr(
+            WReg::new(XSCRATCH0),
+            XReg::new(XSTATE),
             a32_cpsr_nzcv_offset(),
-        ))?;
-        code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0x1000_0000))?;
-        code.write_u32(inst::orr_w(XSCRATCH0, XSCRATCH0, nz_reg))?;
-        code.write_u32(inst::orr_w(XSCRATCH0, XSCRATCH0, c_reg))?;
-        code.write_u32(inst::str_w_unsigned(
-            XSCRATCH0,
-            XSTATE,
+        )?;
+        code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0x1000_0000)?;
+        code.orr(
+            WReg::new(XSCRATCH0),
+            WReg::new(XSCRATCH0),
+            WReg::new(nz_reg),
+        )?;
+        code.orr(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), WReg::new(c_reg))?;
+        code.str(
+            WReg::new(XSCRATCH0),
+            XReg::new(XSTATE),
             a32_cpsr_nzcv_offset(),
-        ))?;
+        )?;
     }
 
     Ok(())
 }
 
 pub fn emit_a32_get_c_flag(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     let mut flag = ctx.reg_alloc.write_w(inst_ref);
     let flag_reg = flag.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::ldr_w_unsigned(
-        flag_reg,
-        XSTATE,
+    code.ldr(
+        WReg::new(flag_reg),
+        XReg::new(XSTATE),
         a32_cpsr_nzcv_offset(),
-    ))?;
-    code.write_u32(inst::and_w_imm(flag_reg, flag_reg, 1 << 29))?;
+    )?;
+    code.and_imm(WReg::new(flag_reg), WReg::new(flag_reg), 1 << 29)?;
     Ok(())
 }
 
 pub fn emit_a32_or_q_flag(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -519,37 +588,42 @@ pub fn emit_a32_or_q_flag(
     let mut flag = ctx.reg_alloc.read_w(args[0]);
     let flag_reg = flag.realize(code, ctx.block)? as u8;
 
-    code.write_u32(inst::ldr_w_unsigned(XSCRATCH0, XSTATE, a32_cpsr_q_offset()))?;
-    code.write_u32(inst::orr_w_lsl(XSCRATCH0, XSCRATCH0, flag_reg, 27))?;
-    code.write_u32(inst::str_w_unsigned(XSCRATCH0, XSTATE, a32_cpsr_q_offset()))?;
+    code.ldr(WReg::new(XSCRATCH0), XReg::new(XSTATE), a32_cpsr_q_offset())?;
+    code.orr_lsl(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(flag_reg),
+        27,
+    )?;
+    code.str(WReg::new(XSCRATCH0), XReg::new(XSTATE), a32_cpsr_q_offset())?;
     Ok(())
 }
 
 pub fn emit_a32_get_ge_flags(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     let mut ge = ctx.reg_alloc.write_s(inst_ref);
     let ge_reg = ge.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::ldr_s_unsigned(ge_reg, XSTATE, a32_cpsr_ge_offset()))?;
+    code.ldr(SReg::new(ge_reg), XReg::new(XSTATE), a32_cpsr_ge_offset())?;
     Ok(())
 }
 
 pub fn emit_a32_set_ge_flags(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut ge = ctx.reg_alloc.read_s(args[0]);
     let ge_reg = ge.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::str_s_unsigned(ge_reg, XSTATE, a32_cpsr_ge_offset()))?;
+    code.str(SReg::new(ge_reg), XReg::new(XSTATE), a32_cpsr_ge_offset())?;
     Ok(())
 }
 
 pub fn emit_a32_set_ge_flags_compressed(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -557,22 +631,30 @@ pub fn emit_a32_set_ge_flags_compressed(
     let mut ge = ctx.reg_alloc.read_w(args[0]);
     let ge_reg = ge.realize(code, ctx.block)? as u8;
 
-    code.write_u32(inst::lsr_w_imm(XSCRATCH0, ge_reg, 16))?;
+    code.lsr(WReg::new(XSCRATCH0), WReg::new(ge_reg), 16)?;
     emit_mov_w_imm(code, XSCRATCH1, 0x0020_4081)?;
-    code.write_u32(inst::mul_w(XSCRATCH0, XSCRATCH0, XSCRATCH1))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0x0101_0101))?;
-    code.write_u32(inst::lsl_w_imm(XSCRATCH1, XSCRATCH0, 8))?;
-    code.write_u32(inst::sub_w_reg(XSCRATCH0, XSCRATCH1, XSCRATCH0))?;
-    code.write_u32(inst::str_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    code.mul(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+    )?;
+    code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0x0101_0101)?;
+    code.lsl(WReg::new(XSCRATCH1), WReg::new(XSCRATCH0), 8)?;
+    code.sub(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+        WReg::new(XSCRATCH0),
+    )?;
+    code.str(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         a32_cpsr_ge_offset(),
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_bx_write_pc(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -586,11 +668,11 @@ pub fn emit_a32_bx_write_pc(
         let new_upper = upper_without_t | u32::from(thumb);
         let combined = ((new_upper as u64) << 32) | ((new_pc & mask) as u64);
         emit_mov_x_imm(code, XSCRATCH0, combined)?;
-        code.write_u32(inst::stur_x(
-            XSCRATCH0,
-            XSTATE,
+        code.stur(
+            XReg::new(XSCRATCH0),
+            XReg::new(XSTATE),
             a32_pc_and_upper_offset() as i32,
-        ))?;
+        )?;
         return Ok(());
     }
 
@@ -599,23 +681,32 @@ pub fn emit_a32_bx_write_pc(
     drop(pc);
     ctx.reg_alloc.spill_flags(code)?;
 
-    code.write_u32(inst::ands_w_imm(XSCRATCH0, pc_reg, 1))?;
+    code.ands_imm(WReg::new(XSCRATCH0), WReg::new(pc_reg), 1)?;
     emit_mov_w_imm(code, XSCRATCH1, 3)?;
-    code.write_u32(inst::csel_w(XSCRATCH1, XSCRATCH0, XSCRATCH1, Cond::NE))?;
-    code.write_u32(inst::bic_w(XSCRATCH1, pc_reg, XSCRATCH1))?;
+    code.csel(
+        WReg::new(XSCRATCH1),
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+        Cond::NE,
+    )?;
+    code.bic(
+        WReg::new(XSCRATCH1),
+        WReg::new(pc_reg),
+        WReg::new(XSCRATCH1),
+    )?;
     emit_mov_w_imm(code, XSCRATCH0, upper_without_t)?;
-    code.write_u32(inst::cinc_w(XSCRATCH0, XSCRATCH0, Cond::NE))?;
-    code.write_u32(inst::stp_w_offset(
-        XSCRATCH1,
-        XSCRATCH0,
-        XSTATE,
+    code.cinc(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), Cond::NE)?;
+    code.stp(
+        WReg::new(XSCRATCH1),
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         a32_pc_and_upper_offset() as i32,
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_update_upper_location_descriptor(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
 ) -> Result<(), String> {
     if ctx
@@ -631,7 +722,7 @@ pub fn emit_a32_update_upper_location_descriptor(
 }
 
 pub fn emit_a32_call_supervisor(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -641,14 +732,14 @@ pub fn emit_a32_call_supervisor(
 
     emit_a32_add_ticks_before_call(code, ctx)?;
     emit_mov_w_imm(code, XSCRATCH0, HaltReason::SVC.bits())?;
-    code.write_u32(inst::stlr_w(XSCRATCH0, XHALT))?;
+    code.stlr(WReg::new(XSCRATCH0), XReg::new(XHALT))?;
     emit_mov_w_imm(code, X1, args[0].get_immediate_u32())?;
     emit_relocation(code, ctx.emitted_block_info, LinkTarget::CallSVC)?;
     emit_a32_get_ticks_remaining_after_call(code, ctx)
 }
 
 pub fn emit_a32_exception_raised(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -663,18 +754,18 @@ pub fn emit_a32_exception_raised(
     emit_a32_get_ticks_remaining_after_call(code, ctx)
 }
 
-pub fn emit_a32_data_synchronization_barrier(code: &mut BlockOfCode) -> Result<(), String> {
-    code.write_u32(inst::dsb_sy())?;
+pub fn emit_a32_data_synchronization_barrier(code: &mut CodeGenerator<'_>) -> Result<(), String> {
+    code.dsb(BarrierOp::SY)?;
     Ok(())
 }
 
-pub fn emit_a32_data_memory_barrier(code: &mut BlockOfCode) -> Result<(), String> {
-    code.write_u32(inst::dmb_sy())?;
+pub fn emit_a32_data_memory_barrier(code: &mut CodeGenerator<'_>) -> Result<(), String> {
+    code.dmb(BarrierOp::SY)?;
     Ok(())
 }
 
 pub fn emit_a32_instruction_synchronization_barrier(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
 ) -> Result<(), String> {
     if !ctx.conf.hook_isb {
@@ -691,7 +782,7 @@ pub fn emit_a32_instruction_synchronization_barrier(
 }
 
 pub fn emit_a32_get_fpscr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -703,26 +794,38 @@ pub fn emit_a32_get_fpscr(
         core::mem::offset_of!(A32JitState, fpsr) + core::mem::size_of::<u32>(),
         core::mem::offset_of!(A32JitState, fpsr_nzcv)
     );
-    code.write_u32(inst::ldr_w_unsigned(
-        fpscr_reg,
-        XSTATE,
+    code.ldr(
+        WReg::new(fpscr_reg),
+        XReg::new(XSTATE),
         a32_upper_location_descriptor_offset(),
-    ))?;
-    code.write_u32(inst::ldp_w_offset(
-        XSCRATCH0,
-        XSCRATCH1,
-        XSTATE,
+    )?;
+    code.ldp(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+        XReg::new(XSTATE),
         a32_fpsr_offset() as i32,
-    ))?;
+    )?;
     emit_mov_w_imm(code, XSCRATCH2, 0xffff_0000)?;
-    code.write_u32(inst::and_w_reg(fpscr_reg, fpscr_reg, XSCRATCH2))?;
-    code.write_u32(inst::orr_w(XSCRATCH0, XSCRATCH0, XSCRATCH1))?;
-    code.write_u32(inst::orr_w(fpscr_reg, fpscr_reg, XSCRATCH0))?;
+    code.and(
+        WReg::new(fpscr_reg),
+        WReg::new(fpscr_reg),
+        WReg::new(XSCRATCH2),
+    )?;
+    code.orr(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+    )?;
+    code.orr(
+        WReg::new(fpscr_reg),
+        WReg::new(fpscr_reg),
+        WReg::new(XSCRATCH0),
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_fpscr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -735,62 +838,78 @@ pub fn emit_a32_set_fpscr(
         core::mem::offset_of!(A32JitState, fpsr) + core::mem::size_of::<u32>(),
         core::mem::offset_of!(A32JitState, fpsr_nzcv)
     );
-    code.write_u32(inst::ldr_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    code.ldr(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         a32_upper_location_descriptor_offset(),
-    ))?;
+    )?;
     emit_mov_w_imm(code, XSCRATCH1, 0x07f7_0000)?;
-    code.write_u32(inst::and_w_reg(XSCRATCH1, fpscr_reg, XSCRATCH1))?;
+    code.and(
+        WReg::new(XSCRATCH1),
+        WReg::new(fpscr_reg),
+        WReg::new(XSCRATCH1),
+    )?;
     emit_mov_w_imm(code, XSCRATCH2, 0x0000_ffff)?;
-    code.write_u32(inst::and_w_reg(XSCRATCH0, XSCRATCH0, XSCRATCH2))?;
-    code.write_u32(inst::orr_w(XSCRATCH0, XSCRATCH0, XSCRATCH1))?;
-    code.write_u32(inst::str_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    code.and(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH2),
+    )?;
+    code.orr(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+    )?;
+    code.str(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         a32_upper_location_descriptor_offset(),
-    ))?;
+    )?;
 
     emit_mov_w_imm(code, XSCRATCH0, 0x0800_009f)?;
-    code.write_u32(inst::and_w_reg(XSCRATCH0, fpscr_reg, XSCRATCH0))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH1, fpscr_reg, 0xf000_0000))?;
-    code.write_u32(inst::stp_w_offset(
-        XSCRATCH0,
-        XSCRATCH1,
-        XSTATE,
+    code.and(
+        WReg::new(XSCRATCH0),
+        WReg::new(fpscr_reg),
+        WReg::new(XSCRATCH0),
+    )?;
+    code.and_imm(WReg::new(XSCRATCH1), WReg::new(fpscr_reg), 0xf000_0000)?;
+    code.stp(
+        WReg::new(XSCRATCH0),
+        WReg::new(XSCRATCH1),
+        XReg::new(XSTATE),
         a32_fpsr_offset() as i32,
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_get_fpscr_nzcv(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     let mut nzcv = ctx.reg_alloc.write_w(inst_ref);
     let nzcv_reg = nzcv.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::ldr_w_unsigned(
-        nzcv_reg,
-        XSTATE,
+    code.ldr(
+        WReg::new(nzcv_reg),
+        XReg::new(XSTATE),
         a32_fpsr_nzcv_offset(),
-    ))?;
+    )?;
     Ok(())
 }
 
 pub fn emit_a32_set_fpscr_nzcv(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut nzcv = ctx.reg_alloc.read_w(args[0]);
     let nzcv_reg = nzcv.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::str_w_unsigned(
-        nzcv_reg,
-        XSTATE,
+    code.str(
+        WReg::new(nzcv_reg),
+        XReg::new(XSTATE),
         a32_fpsr_nzcv_offset(),
-    ))?;
+    )?;
     Ok(())
 }
 
@@ -889,7 +1008,10 @@ fn a32_ext_reg_quad_offset(reg: ExtReg) -> u32 {
     a32_ext_reg_base_offset() + 2 * core::mem::size_of::<u64>() as u32 * reg.index() as u32
 }
 
-pub fn emit_a32_terminal(code: &mut BlockOfCode, ctx: &mut EmitContext<'_>) -> Result<(), String> {
+pub fn emit_a32_terminal(
+    code: &mut CodeGenerator<'_>,
+    ctx: &mut EmitContext<'_>,
+) -> Result<(), String> {
     let location = A32LocationDescriptor::from_location(ctx.block.location);
     emit_a32_terminal_inner(
         code,
@@ -901,7 +1023,7 @@ pub fn emit_a32_terminal(code: &mut BlockOfCode, ctx: &mut EmitContext<'_>) -> R
 }
 
 pub fn emit_a32_condition_failed_terminal(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
 ) -> Result<(), String> {
     let location = A32LocationDescriptor::from_location(ctx.block.location);
@@ -920,7 +1042,7 @@ pub fn emit_a32_condition_failed_terminal(
 }
 
 pub(crate) fn emit_a32_check_memory_abort(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     current_location: LocationDescriptor,
     end: &mut Label,
@@ -930,12 +1052,9 @@ pub(crate) fn emit_a32_check_memory_abort(
     }
 
     let current_location = A32LocationDescriptor::from_location(current_location);
-    code.write_u32(inst::ldar_x(XSCRATCH0, XHALT))?;
-    code.write_u32(inst::tst_x_imm(
-        XSCRATCH0,
-        HaltReason::MEMORY_ABORT.bits() as u64,
-    ))?;
-    end.b_cond(code, Cond::EQ)?;
+    code.ldar(XReg::new(XSCRATCH0), XReg::new(XHALT))?;
+    code.tst_imm(XReg::new(XSCRATCH0), HaltReason::MEMORY_ABORT.bits() as u64)?;
+    code.b_cond(Cond::EQ, end)?;
     emit_set_upper_location_descriptor(
         code,
         ctx,
@@ -943,16 +1062,16 @@ pub(crate) fn emit_a32_check_memory_abort(
         ctx.block.location,
     )?;
     emit_mov_w_imm(code, XSCRATCH0, current_location.pc())?;
-    code.write_u32(inst::str_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    code.str(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         core::mem::offset_of!(A32JitState, regs) as u32 + core::mem::size_of::<u32>() as u32 * 15,
-    ))?;
+    )?;
     emit_relocation(code, ctx.emitted_block_info, LinkTarget::ReturnFromRunCode)
 }
 
 fn emit_a32_terminal_inner(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     terminal: Terminal,
     initial_location: LocationDescriptor,
@@ -997,153 +1116,134 @@ fn emit_a32_terminal_inner(
         }
         Terminal::If { cond, then_, else_ } => {
             let emit_cond = ctx.conf.emit_cond;
-            let pass_branch_offset = emit_cond(code, ctx, cond)?;
+            let mut pass = emit_cond(code, ctx, cond)?;
             emit_a32_terminal_inner(code, ctx, *else_, initial_location, is_single_step)?;
-            patch_branch_to_current(code, pass_branch_offset, |pc_offset| {
-                inst::b_cond(cond, pc_offset)
-            })?;
+            code.l(&mut pass)?;
             emit_a32_terminal_inner(code, ctx, *then_, initial_location, is_single_step)
         }
         Terminal::CheckBit { then_, else_ } => {
-            code.write_u32(inst::ldrb_w_unsigned(
-                XSCRATCH0,
-                31,
+            code.ldrb(
+                WReg::new(XSCRATCH0),
+                SP,
                 crate::backend::arm64::stack_layout::StackLayout::check_bit_offset() as u32,
-            ))?;
-            let fail_branch_offset = code.write_u32(inst::cbz_w(XSCRATCH0, 0))?;
+            )?;
+            let mut fail = Label::new();
+            code.cbz(WReg::new(XSCRATCH0), &mut fail)?;
             emit_a32_terminal_inner(code, ctx, *then_, initial_location, is_single_step)?;
-            patch_branch_to_current(code, fail_branch_offset, |pc_offset| {
-                inst::cbz_w(XSCRATCH0, pc_offset)
-            })?;
+            code.l(&mut fail)?;
             emit_a32_terminal_inner(code, ctx, *else_, initial_location, is_single_step)
         }
         Terminal::CheckHalt { else_ } => {
-            code.write_u32(inst::ldar_w(XSCRATCH0, XHALT))?;
-            let fail_branch_offset = code.write_u32(inst::cbnz_w(XSCRATCH0, 0))?;
+            code.ldar(WReg::new(XSCRATCH0), XReg::new(XHALT))?;
+            let mut fail = Label::new();
+            code.cbnz(WReg::new(XSCRATCH0), &mut fail)?;
             emit_a32_terminal_inner(code, ctx, *else_, initial_location, is_single_step)?;
-            patch_branch_to_current(code, fail_branch_offset, |pc_offset| {
-                inst::cbnz_w(XSCRATCH0, pc_offset)
-            })?;
+            code.l(&mut fail)?;
             emit_relocation(code, ctx.emitted_block_info, LinkTarget::ReturnToDispatcher)
         }
     }
 }
 
-fn emit_pop_rsb_hint(code: &mut BlockOfCode) -> Result<(), String> {
-    code.write_u32(inst::ldr_w_unsigned(
-        XSCRATCH2,
-        31,
+fn emit_pop_rsb_hint(code: &mut CodeGenerator<'_>) -> Result<(), String> {
+    code.ldr(
+        WReg::new(XSCRATCH2),
+        SP,
         StackLayout::rsb_ptr_offset() as u32,
-    ))?;
-    code.write_u32(inst::and_w_imm(XSCRATCH2, XSCRATCH2, RSB_INDEX_MASK as u32))?;
-    code.write_u32(inst::add_x_reg_sp(X2, 31, XSCRATCH2))?;
-    code.write_u32(inst::sub_w_imm(
-        XSCRATCH2,
-        XSCRATCH2,
+    )?;
+    code.and_imm(
+        WReg::new(XSCRATCH2),
+        WReg::new(XSCRATCH2),
+        (RSB_INDEX_MASK as u32) as u64,
+    )?;
+    code.add_ext(XReg::new(X2), SP, XReg::new(XSCRATCH2))?;
+    code.sub_imm(
+        WReg::new(XSCRATCH2),
+        WReg::new(XSCRATCH2),
         core::mem::size_of::<RSBEntry>() as u32,
-    ))?;
-    code.write_u32(inst::str_w_unsigned(
-        XSCRATCH2,
-        31,
+    )?;
+    code.str(
+        WReg::new(XSCRATCH2),
+        SP,
         StackLayout::rsb_ptr_offset() as u32,
-    ))?;
-    code.write_u32(inst::ldp_x_offset(
-        XSCRATCH0,
-        XSCRATCH1,
-        X2,
+    )?;
+    code.ldp(
+        XReg::new(XSCRATCH0),
+        XReg::new(XSCRATCH1),
+        XReg::new(X2),
         StackLayout::rsb_offset() as i32,
-    ))?;
+    )?;
 
     debug_assert_eq!(
         core::mem::offset_of!(A32JitState, regs) + 16 * core::mem::size_of::<u32>(),
         core::mem::offset_of!(A32JitState, upper_location_descriptor)
     );
-    code.write_u32(inst::ldur_x(
-        X0,
-        XSTATE,
+    code.ldur(
+        XReg::new(X0),
+        XReg::new(XSTATE),
         core::mem::offset_of!(A32JitState, regs) as i32 + 15 * core::mem::size_of::<u32>() as i32,
-    ))?;
-    code.write_u32(inst::cmp_x_reg(X0, XSCRATCH0))?;
-    let fail_branch_offset = code.write_u32(inst::b_cond(Cond::NE, 0))?;
-    code.write_u32(inst::br(XSCRATCH1))?;
-    patch_branch_to_current(code, fail_branch_offset, |pc_offset| {
-        inst::b_cond(Cond::NE, pc_offset)
-    })
+    )?;
+    code.cmp(XReg::new(X0), XReg::new(XSCRATCH0))?;
+    let mut fail = Label::new();
+    code.b_cond(Cond::NE, &mut fail)?;
+    code.br(XReg::new(XSCRATCH1))?;
+    code.l(&mut fail)
 }
 
 pub(crate) fn emit_a32_cond(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     cond: Cond,
-) -> Result<usize, String> {
-    code.write_u32(inst::ldr_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+) -> Result<Label, String> {
+    let mut pass = Label::new();
+    code.ldr(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         ctx.conf.state_nzcv_offset as u32,
-    ))?;
-    code.write_u32(inst::msr_nzcv(XSCRATCH0))?;
-    code.write_u32(inst::b_cond(cond, 0))
+    )?;
+    code.msr(SystemReg::NZCV, XReg::new(XSCRATCH0))?;
+    code.b_cond(cond, &mut pass)?;
+    Ok(pass)
 }
 
 fn emit_guarded_block_link_relocation(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     next: LocationDescriptor,
 ) -> Result<(), String> {
-    let branch_offset = if ctx.conf.enable_cycle_counting {
-        code.write_u32(inst::cmp_x_imm(XTICKS, 0))?;
-        code.write_u32(inst::b_cond(Cond::LE, 0))?
+    let mut fail = Label::new();
+    if ctx.conf.enable_cycle_counting {
+        code.cmp_imm(XReg::new(XTICKS), 0)?;
+        code.b_cond(Cond::LE, &mut fail)?;
     } else {
-        code.write_u32(inst::ldar_w(XSCRATCH0, XHALT))?;
-        code.write_u32(inst::cbnz_w(XSCRATCH0, 0))?
-    };
+        code.ldar(WReg::new(XSCRATCH0), XReg::new(XHALT))?;
+        code.cbnz(WReg::new(XSCRATCH0), &mut fail)?;
+    }
     emit_block_link_relocation(
         code,
         ctx.emitted_block_info,
         next,
         BlockRelocationType::Branch,
     )?;
-
-    let fail_offset = code.code_size();
-    let pc_offset = i32::try_from(fail_offset as isize - branch_offset as isize)
-        .map_err(|_| "A32 LinkBlock guard branch offset overflow".to_string())?;
-    let patched_guard = if ctx.conf.enable_cycle_counting {
-        inst::b_cond(Cond::LE, pc_offset)
-    } else {
-        inst::cbnz_w(XSCRATCH0, pc_offset)
-    };
-    code.patch_u32(branch_offset, patched_guard)?;
-    Ok(())
-}
-
-fn patch_branch_to_current(
-    code: &mut BlockOfCode,
-    branch_offset: usize,
-    encode: impl FnOnce(i32) -> u32,
-) -> Result<(), String> {
-    let target_offset = code.code_size();
-    let pc_offset = i32::try_from(target_offset as isize - branch_offset as isize)
-        .map_err(|_| "A32 terminal branch offset overflow".to_string())?;
-    code.patch_u32(branch_offset, encode(pc_offset))
+    code.l(&mut fail)
 }
 
 fn emit_set_pc_and_return_to_dispatcher(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     next: LocationDescriptor,
 ) -> Result<(), String> {
     let next = A32LocationDescriptor::from_location(next);
     emit_mov_w_imm(code, XSCRATCH0, next.pc())?;
-    code.write_u32(inst::str_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    code.str(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         core::mem::offset_of!(A32JitState, regs) as u32 + core::mem::size_of::<u32>() as u32 * 15,
-    ))?;
+    )?;
     emit_relocation(code, ctx.emitted_block_info, LinkTarget::ReturnToDispatcher)
 }
 
 fn emit_set_upper_location_descriptor(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     new_location: LocationDescriptor,
     old_location: LocationDescriptor,
@@ -1161,34 +1261,34 @@ fn emit_set_upper_location_descriptor(
     }
     if old_upper != new_upper {
         emit_mov_w_imm(code, XSCRATCH0, new_upper)?;
-        code.write_u32(inst::str_w_unsigned(
-            XSCRATCH0,
-            XSTATE,
+        code.str(
+            WReg::new(XSCRATCH0),
+            XReg::new(XSTATE),
             core::mem::offset_of!(A32JitState, upper_location_descriptor) as u32,
-        ))?;
+        )?;
     }
     Ok(())
 }
 
 fn emit_a32_add_ticks_before_call(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
 ) -> Result<(), String> {
     if !ctx.conf.enable_cycle_counting {
         return Ok(());
     }
 
-    code.write_u32(inst::ldr_x_unsigned(
-        X1,
-        31,
+    code.ldr(
+        XReg::new(X1),
+        SP,
         StackLayout::cycles_to_run_offset() as u32,
-    ))?;
-    code.write_u32(inst::sub_x_reg(X1, X1, XTICKS))?;
+    )?;
+    code.sub(XReg::new(X1), XReg::new(X1), XReg::new(XTICKS))?;
     emit_relocation(code, ctx.emitted_block_info, LinkTarget::AddTicks)
 }
 
 fn emit_a32_get_ticks_remaining_after_call(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
 ) -> Result<(), String> {
     if !ctx.conf.enable_cycle_counting {
@@ -1196,30 +1296,30 @@ fn emit_a32_get_ticks_remaining_after_call(
     }
 
     emit_relocation(code, ctx.emitted_block_info, LinkTarget::GetTicksRemaining)?;
-    code.write_u32(inst::str_x_unsigned(
-        X0,
-        31,
+    code.str(
+        XReg::new(X0),
+        SP,
         StackLayout::cycles_to_run_offset() as u32,
-    ))?;
-    code.write_u32(inst::mov_x(XTICKS, X0))?;
+    )?;
+    code.mov(XReg::new(XTICKS), XReg::new(X0))?;
     Ok(())
 }
 
-fn emit_mov_w_imm(code: &mut BlockOfCode, reg: u8, imm: u32) -> Result<(), String> {
-    code.write_u32(inst::movz_w(reg, (imm & 0xffff) as u16, 0))?;
+fn emit_mov_w_imm(code: &mut CodeGenerator<'_>, reg: u8, imm: u32) -> Result<(), String> {
+    code.movz(WReg::new(reg), (imm & 0xffff) as u16, 0)?;
     let high = (imm >> 16) as u16;
     if high != 0 {
-        code.write_u32(inst::movk_w(reg, high, 16))?;
+        code.movk(WReg::new(reg), high, 16)?;
     }
     Ok(())
 }
 
-fn emit_mov_x_imm(code: &mut BlockOfCode, reg: u8, imm: u64) -> Result<(), String> {
-    code.write_u32(inst::movz_x(reg, (imm & 0xffff) as u16, 0))?;
+fn emit_mov_x_imm(code: &mut CodeGenerator<'_>, reg: u8, imm: u64) -> Result<(), String> {
+    code.movz(XReg::new(reg), (imm & 0xffff) as u16, 0)?;
     for shift in [16, 32, 48] {
         let part = ((imm >> shift) & 0xffff) as u16;
         if part != 0 {
-            code.write_u32(inst::movk_x(reg, part, shift as u8))?;
+            code.movk(XReg::new(reg), part, shift as u8)?;
         }
     }
     Ok(())
@@ -1232,6 +1332,28 @@ const X2: u8 = 2;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::arm64::inst;
+
+    #[test]
+    fn typed_a32_immediates_preserve_relocation_sensitive_sequence_lengths() {
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
+        emit_mov_w_imm(&mut code, 7, 0).unwrap();
+        emit_mov_w_imm(&mut code, 7, 0xffff_0000).unwrap();
+        emit_mov_x_imm(&mut code, 8, 0x1234_0000_abcd_0000).unwrap();
+        assert_eq!(
+            emitted_words(&code),
+            [
+                inst::movz_w(7, 0, 0),
+                inst::movz_w(7, 0, 0),
+                inst::movk_w(7, 0xffff, 16),
+                inst::movz_x(8, 0, 0),
+                inst::movk_x(8, 0xabcd, 16),
+                inst::movk_x(8, 0x1234, 48),
+            ]
+        );
+    }
+
     use crate::backend::arm64::emit_arm64::{
         BlockRelocation, EmitConfig, EmittedBlockInfo, Relocation,
     };
@@ -1317,27 +1439,27 @@ mod tests {
 
     fn with_context(
         block: &mut Block,
-        code: &mut BlockOfCode,
-        f: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>),
+        code: &mut CodeGenerator<'_>,
+        f: impl FnOnce(&mut CodeGenerator<'_>, &mut EmitContext<'_>),
     ) -> EmittedBlockInfo {
         with_context_config(block, code, config(), f)
     }
 
     fn with_context_config(
         block: &mut Block,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         config: A32UserConfig,
-        f: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>),
+        f: impl FnOnce(&mut CodeGenerator<'_>, &mut EmitContext<'_>),
     ) -> EmittedBlockInfo {
         with_context_config_mut(block, code, config, |_| {}, f)
     }
 
     fn with_context_config_mut(
         block: &mut Block,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         config: A32UserConfig,
         mutate_conf: impl FnOnce(&mut EmitConfig),
-        f: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>),
+        f: impl FnOnce(&mut CodeGenerator<'_>, &mut EmitContext<'_>),
     ) -> EmittedBlockInfo {
         let mut conf = EmitConfig::from_a32_config(&config);
         mutate_conf(&mut conf);
@@ -1368,7 +1490,8 @@ mod tests {
 
     #[test]
     fn return_to_dispatch_terminal_emits_relocation_placeholder() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         block.terminal = Terminal::ReturnToDispatch;
 
@@ -1388,7 +1511,8 @@ mod tests {
 
     #[test]
     fn check_memory_abort_emits_upstream_abort_path_when_enabled() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let current_location = A32LocationDescriptor::at(0x2004).to_location();
 
@@ -1425,7 +1549,8 @@ mod tests {
 
     #[test]
     fn check_memory_abort_emits_nothing_when_disabled() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let current_location = A32LocationDescriptor::at(0x2004).to_location();
 
@@ -1441,7 +1566,8 @@ mod tests {
 
     #[test]
     fn link_block_fast_updates_pc_then_returns_to_dispatcher_without_block_linking() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(
             A32LocationDescriptor::new(0x1000, PSR::default(), FPSCR::default(), true)
                 .to_location(),
@@ -1473,7 +1599,8 @@ mod tests {
 
     #[test]
     fn link_block_updates_pc_then_returns_to_dispatcher_without_block_linking() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(
             A32LocationDescriptor::new(0x1000, PSR::default(), FPSCR::default(), true)
                 .to_location(),
@@ -1504,7 +1631,8 @@ mod tests {
 
     #[test]
     fn link_block_with_block_linking_checks_halt_then_links_or_falls_back() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(
             A32LocationDescriptor::new(0x1000, PSR::default(), FPSCR::default(), false)
                 .to_location(),
@@ -1549,7 +1677,8 @@ mod tests {
 
     #[test]
     fn link_block_with_cycle_counting_checks_ticks_then_links_or_falls_back() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(
             A32LocationDescriptor::new(0x1000, PSR::default(), FPSCR::default(), false)
                 .to_location(),
@@ -1594,7 +1723,8 @@ mod tests {
 
     #[test]
     fn fast_dispatch_hint_returns_to_dispatcher_like_upstream_todo_path() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         block.terminal = Terminal::FastDispatchHint;
 
@@ -1609,7 +1739,8 @@ mod tests {
 
     #[test]
     fn pop_rsb_hint_with_rsb_optimization_emits_upstream_prediction_path() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         block.terminal = Terminal::PopRSBHint;
 
@@ -1653,7 +1784,8 @@ mod tests {
 
     #[test]
     fn check_halt_branches_to_dispatcher_when_halted() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         block.terminal = Terminal::CheckHalt {
             else_: Box::new(Terminal::ReturnToDispatch),
@@ -1678,7 +1810,8 @@ mod tests {
 
     #[test]
     fn check_bit_branches_between_then_and_else_terminals() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         block.terminal = Terminal::CheckBit {
             then_: Box::new(Terminal::ReturnToDispatch),
@@ -1708,7 +1841,8 @@ mod tests {
 
     #[test]
     fn if_terminal_restores_nzcv_then_branches_to_then_terminal() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         block.terminal = Terminal::If {
             cond: Cond::NE,
@@ -1740,7 +1874,8 @@ mod tests {
 
     #[test]
     fn set_check_bit_immediate_true_sets_stack_check_bit() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let inst_ref = block.append(Opcode::A32SetCheckBit, &[Value::ImmU1(true)]);
 
@@ -1763,7 +1898,8 @@ mod tests {
 
     #[test]
     fn set_check_bit_immediate_false_clears_stack_check_bit() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let inst_ref = block.append(Opcode::A32SetCheckBit, &[Value::ImmU1(false)]);
 
@@ -1783,7 +1919,8 @@ mod tests {
 
     #[test]
     fn get_register_loads_from_a32_jitstate_regs() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let inst_ref = block.append(Opcode::A32GetRegister, &[Reg::R3.into()]);
 
@@ -1803,7 +1940,8 @@ mod tests {
 
     #[test]
     fn set_register_stores_to_a32_jitstate_regs() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let inst_ref = block.append(
             Opcode::A32SetRegister,
@@ -1825,7 +1963,8 @@ mod tests {
 
     #[test]
     fn get_extended_register32_loads_s_from_a32_ext_regs() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let inst_ref = block.append(Opcode::A32GetExtendedRegister32, &[ExtReg::S3.into()]);
 
@@ -1845,7 +1984,8 @@ mod tests {
 
     #[test]
     fn get_extended_register64_loads_d_from_a32_ext_regs() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let inst_ref = block.append(Opcode::A32GetExtendedRegister64, &[ExtReg::D5.into()]);
 
@@ -1865,7 +2005,8 @@ mod tests {
 
     #[test]
     fn get_vector_loads_d_or_q_from_a32_ext_regs() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let get_d = block.append(Opcode::A32GetVector, &[ExtReg::D6.into()]);
         let get_q = block.append(Opcode::A32GetVector, &[ExtReg::Q2.into()]);
@@ -1886,7 +2027,8 @@ mod tests {
 
     #[test]
     fn set_extended_register32_stores_s_to_a32_ext_regs() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let src = block.append(Opcode::A32GetExtendedRegister32, &[ExtReg::S0.into()]);
         let set = block.append(
@@ -1910,7 +2052,8 @@ mod tests {
 
     #[test]
     fn set_extended_register64_stores_d_to_a32_ext_regs() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let src = block.append(Opcode::A32GetExtendedRegister64, &[ExtReg::D1.into()]);
         let set = block.append(
@@ -1934,7 +2077,8 @@ mod tests {
 
     #[test]
     fn set_vector_stores_d_or_q_to_a32_ext_regs() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let src_d = block.append(Opcode::A32GetVector, &[ExtReg::D1.into()]);
         let set_d = block.append(
@@ -1967,7 +2111,8 @@ mod tests {
 
     #[test]
     fn get_cpsr_reconstructs_full_cpsr_from_split_state_like_upstream() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let get = block.append(Opcode::A32GetCpsr, &[]);
 
@@ -1999,7 +2144,8 @@ mod tests {
 
     #[test]
     fn set_cpsr_decomposes_full_cpsr_into_split_state_like_upstream() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let src = block.append(Opcode::A32GetRegister, &[Reg::R0.into()]);
         let set = block.append(Opcode::A32SetCpsr, &[Value::Inst(src)]);
@@ -2045,7 +2191,8 @@ mod tests {
 
     #[test]
     fn set_cpsr_nzcv_stores_nzcv_to_a32_jitstate() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let src = block.append(Opcode::A32GetRegister, &[Reg::R0.into()]);
         let set = block.append(Opcode::A32SetCpsrNZCV, &[Value::Inst(src)]);
@@ -2066,7 +2213,8 @@ mod tests {
 
     #[test]
     fn set_cpsr_nzcv_raw_stores_raw_nzcv_to_a32_jitstate() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let src = block.append(Opcode::A32GetRegister, &[Reg::R1.into()]);
         let set = block.append(Opcode::A32SetCpsrNZCVRaw, &[Value::Inst(src)]);
@@ -2087,7 +2235,8 @@ mod tests {
 
     #[test]
     fn set_cpsr_nzcvq_splits_nzcv_and_q_into_adjacent_state_words() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let src = block.append(Opcode::A32GetRegister, &[Reg::R2.into()]);
         let set = block.append(Opcode::A32SetCpsrNZCVQ, &[Value::Inst(src)]);
@@ -2110,7 +2259,8 @@ mod tests {
 
     #[test]
     fn get_c_flag_loads_and_masks_cpsr_nzcv() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let inst_ref = block.append(Opcode::A32GetCFlag, &[]);
 
@@ -2129,7 +2279,8 @@ mod tests {
 
     #[test]
     fn set_cpsr_nz_preserves_cv_and_ors_in_nz() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let src = block.append(Opcode::A32GetRegister, &[Reg::R3.into()]);
         let set = block.append(Opcode::A32SetCpsrNZ, &[Value::Inst(src)]);
@@ -2153,7 +2304,8 @@ mod tests {
 
     #[test]
     fn set_cpsr_nzc_empty_nz_immediate_carry_sets_carry_only() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let set = block.append(
             Opcode::A32SetCpsrNZC,
@@ -2177,7 +2329,8 @@ mod tests {
 
     #[test]
     fn set_cpsr_nzc_non_immediate_nz_preserves_v_and_optional_carry() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let nz = block.append(Opcode::A32GetRegister, &[Reg::R4.into()]);
         let set = block.append(
@@ -2204,7 +2357,8 @@ mod tests {
 
     #[test]
     fn or_q_flag_loads_shifts_and_stores_q() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let flag = block.append(Opcode::A32GetCFlag, &[]);
         let set = block.append(Opcode::A32OrQFlag, &[Value::Inst(flag)]);
@@ -2228,7 +2382,8 @@ mod tests {
 
     #[test]
     fn ge_flags_load_and_store_s_register_state() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let ge = block.append(Opcode::A32GetGEFlags, &[]);
         let set = block.append(Opcode::A32SetGEFlags, &[Value::Inst(ge)]);
@@ -2249,7 +2404,8 @@ mod tests {
 
     #[test]
     fn set_ge_flags_compressed_expands_bits_to_byte_lanes() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x1000).to_location());
         let src = block.append(Opcode::A32GetRegister, &[Reg::R5.into()]);
         let set = block.append(Opcode::A32SetGEFlagsCompressed, &[Value::Inst(src)]);
@@ -2277,7 +2433,8 @@ mod tests {
 
     #[test]
     fn bx_write_pc_immediate_stores_pc_and_upper_descriptor_together() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x2000).to_location());
         block.end_location = A32LocationDescriptor::at(0x2004)
             .set_t_flag(false)
@@ -2303,7 +2460,8 @@ mod tests {
 
     #[test]
     fn bx_write_pc_register_updates_pc_alignment_and_t_flag_like_upstream() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x2000).to_location());
         block.end_location = A32LocationDescriptor::at(0x2004)
             .set_t_flag(true)
@@ -2339,7 +2497,8 @@ mod tests {
 
     #[test]
     fn update_upper_location_descriptor_skips_when_bx_write_pc_exists() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(
             A32LocationDescriptor::at(0x2000)
                 .set_t_flag(false)
@@ -2364,7 +2523,8 @@ mod tests {
 
     #[test]
     fn update_upper_location_descriptor_emits_when_end_upper_changes() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(
             A32LocationDescriptor::at(0x2000)
                 .set_t_flag(false)
@@ -2394,7 +2554,8 @@ mod tests {
 
     #[test]
     fn call_supervisor_emits_svc_relocation_with_immediate_in_w1() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x2000).to_location());
         let svc = block.append(Opcode::A32CallSupervisor, &[Value::ImmU32(0x42)]);
 
@@ -2419,7 +2580,8 @@ mod tests {
 
     #[test]
     fn call_supervisor_with_cycle_counting_wraps_callback_like_upstream() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x2000).to_location());
         let svc = block.append(Opcode::A32CallSupervisor, &[Value::ImmU32(0x42)]);
 
@@ -2468,7 +2630,8 @@ mod tests {
 
     #[test]
     fn exception_raised_emits_pc_exception_args_and_relocation() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x2000).to_location());
         let exception = block.append(
             Opcode::A32ExceptionRaised,
@@ -2498,7 +2661,8 @@ mod tests {
 
     #[test]
     fn barriers_emit_upstream_sy_barriers() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
         emit_a32_data_synchronization_barrier(&mut code).unwrap();
         emit_a32_data_memory_barrier(&mut code).unwrap();
@@ -2508,7 +2672,8 @@ mod tests {
 
     #[test]
     fn instruction_synchronization_barrier_respects_hook_flag() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x2000).to_location());
         let isb = block.append(Opcode::A32InstructionSynchronizationBarrier, &[]);
 
@@ -2543,7 +2708,8 @@ mod tests {
 
     #[test]
     fn fpscr_get_and_set_preserve_upstream_state_split() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x2000).to_location());
         let get = block.append(Opcode::A32GetFpscr, &[]);
         let set = block.append(Opcode::A32SetFpscr, &[Value::Inst(get)]);
@@ -2583,7 +2749,8 @@ mod tests {
 
     #[test]
     fn fpscr_nzcv_get_and_set_use_fpsr_nzcv_word() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A32LocationDescriptor::at(0x2000).to_location());
         let get = block.append(Opcode::A32GetFpscrNZCV, &[]);
         let set = block.append(Opcode::A32SetFpscrNZCV, &[Value::Inst(get)]);

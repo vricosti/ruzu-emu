@@ -1,7 +1,8 @@
-//! ARM64 register allocator ownership shell.
+//! ARM64 register allocation and typed host instruction emission.
 //!
 //! Upstream owner: `backend/arm64/reg_alloc.h/.cpp`.
 
+use rhazel::{BReg, CodeGenerator, DReg, HReg, QReg, SReg, SystemReg, VReg, WReg, XReg, SP};
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -14,8 +15,10 @@ use crate::ir::types::Type;
 use crate::ir::value::{InstRef, Value};
 
 use super::abi::{ABI_CALLER_SAVE, FPR_ORDER, GPR_ORDER, XSCRATCH0};
+#[cfg(test)]
 use super::block_of_code::BlockOfCode;
 use super::fpsr_manager::FpsrManager;
+#[cfg(test)]
 use super::inst;
 use super::stack_layout::{StackLayout, SPILL_COUNT};
 
@@ -81,7 +84,11 @@ impl RAReg {
         }
     }
 
-    pub fn realize(&mut self, code: &mut BlockOfCode, block: &Block) -> Result<usize, String> {
+    pub fn realize(
+        &mut self,
+        code: &mut CodeGenerator<'_>,
+        block: &Block,
+    ) -> Result<usize, String> {
         // RAReg guards are created only by RegAlloc methods, and the pointed
         // allocator must outlive them exactly like upstream's RegAlloc&.
         let reg_alloc = unsafe { self.reg_alloc.as_mut() };
@@ -110,6 +117,48 @@ impl RAReg {
 
     pub fn index(&self) -> Option<usize> {
         self.reg
+    }
+
+    fn realized(&self, what: &str) -> u8 {
+        self.reg
+            .unwrap_or_else(|| panic!("{what} used before RegAlloc::realize")) as u8
+    }
+
+    // Upstream `RAReg<T>` converts to its operand type `T` once realized; the
+    // Rust handle has no static width, so the emitter names the view it wants.
+
+    /// `RAReg<oaknut::WReg>`
+    pub fn w(&self) -> WReg {
+        WReg::new(self.realized("W register"))
+    }
+    /// `RAReg<oaknut::XReg>`
+    pub fn x(&self) -> XReg {
+        XReg::new(self.realized("X register"))
+    }
+    /// `RAReg<oaknut::BReg>`
+    pub fn b(&self) -> BReg {
+        BReg::new(self.realized("B register"))
+    }
+    /// `RAReg<oaknut::HReg>`
+    pub fn h(&self) -> HReg {
+        HReg::new(self.realized("H register"))
+    }
+    /// `RAReg<oaknut::SReg>`
+    pub fn s(&self) -> SReg {
+        SReg::new(self.realized("S register"))
+    }
+    /// `RAReg<oaknut::DReg>`
+    pub fn d(&self) -> DReg {
+        DReg::new(self.realized("D register"))
+    }
+    /// `RAReg<oaknut::QReg>`
+    pub fn q(&self) -> QReg {
+        QReg::new(self.realized("Q register"))
+    }
+    /// The vector register, to be arranged (`RAReg<oaknut::QReg>` used as
+    /// `Qreg->B16()` and friends upstream).
+    pub fn v(&self) -> VReg {
+        VReg::new(self.realized("V register"))
     }
 }
 
@@ -459,7 +508,7 @@ impl RegAlloc {
     }
 
     pub fn realize_all(
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         block: &Block,
         regs: &mut [&mut RAReg],
     ) -> Result<(), String> {
@@ -643,7 +692,7 @@ impl RegAlloc {
         self.spills.iter().position(|spill| spill.values.is_empty())
     }
 
-    pub fn spill_gpr(&mut self, code: &mut BlockOfCode, index: usize) -> Result<(), String> {
+    pub fn spill_gpr(&mut self, code: &mut CodeGenerator<'_>, index: usize) -> Result<(), String> {
         assert!(index < self.gprs.len());
         assert!(self.gprs[index].locked == 0 && !self.gprs[index].realized);
         if self.gprs[index].values.is_empty() {
@@ -653,16 +702,16 @@ impl RegAlloc {
         let new_location_index = self
             .find_free_spill()
             .ok_or_else(|| "ARM64 RegAlloc: all spill locations are full".to_string())?;
-        code.write_u32(inst::str_x_unsigned(
-            index as u8,
-            31,
+        code.str(
+            XReg::new(index as u8),
+            SP,
             StackLayout::spill_offset(new_location_index) as u32,
-        ))?;
+        )?;
         self.spills[new_location_index] = std::mem::take(&mut self.gprs[index]);
         Ok(())
     }
 
-    pub fn spill_fpr(&mut self, code: &mut BlockOfCode, index: usize) -> Result<(), String> {
+    pub fn spill_fpr(&mut self, code: &mut CodeGenerator<'_>, index: usize) -> Result<(), String> {
         assert!(index < self.fprs.len());
         assert!(self.fprs[index].locked == 0 && !self.fprs[index].realized);
         if self.fprs[index].values.is_empty() {
@@ -672,16 +721,16 @@ impl RegAlloc {
         let new_location_index = self
             .find_free_spill()
             .ok_or_else(|| "ARM64 RegAlloc: all spill locations are full".to_string())?;
-        code.write_u32(inst::str_q_unsigned(
-            index as u8,
-            31,
+        code.str(
+            QReg::new(index as u8),
+            SP,
             StackLayout::spill_offset(new_location_index) as u32,
-        ))?;
+        )?;
         self.spills[new_location_index] = std::mem::take(&mut self.fprs[index]);
         Ok(())
     }
 
-    pub fn spill_flags(&mut self, code: &mut BlockOfCode) -> Result<(), String> {
+    pub fn spill_flags(&mut self, code: &mut CodeGenerator<'_>) -> Result<(), String> {
         assert!(self.flags.locked == 0 && !self.flags.realized);
         if self.flags.values.is_empty() {
             return Ok(());
@@ -691,14 +740,14 @@ impl RegAlloc {
             .allocate_register(&self.gprs, &self.gpr_order)
             .ok_or_else(|| "ARM64 RegAlloc: no GPR available to spill flags".to_string())?;
         self.spill_gpr(code, new_location_index)?;
-        code.write_u32(inst::mrs_nzcv(new_location_index as u8))?;
+        code.mrs(XReg::new(new_location_index as u8), SystemReg::NZCV)?;
         self.gprs[new_location_index] = std::mem::take(&mut self.flags);
         Ok(())
     }
 
     pub(crate) fn prepare_for_call(
         &mut self,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         fpsr_manager: &mut FpsrManager,
         args: [Option<Argument>; 4],
     ) -> Result<(), String> {
@@ -741,7 +790,7 @@ impl RegAlloc {
 
     pub(crate) fn read_write_flags(
         &mut self,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         block: &Block,
         read: Argument,
         write: Option<InstRef>,
@@ -764,18 +813,18 @@ impl RegAlloc {
                 if !self.flags.values.is_empty() {
                     self.spill_flags(code)?;
                 }
-                code.write_u32(inst::msr_nzcv(current_location.index as u8))?;
+                code.msr(SystemReg::NZCV, XReg::new(current_location.index as u8))?;
             }
             HostLocKind::Spill => {
                 if !self.flags.values.is_empty() {
                     self.spill_flags(code)?;
                 }
-                code.write_u32(inst::ldr_w_unsigned(
-                    XSCRATCH0,
-                    31,
+                code.ldr(
+                    WReg::new(XSCRATCH0),
+                    SP,
                     StackLayout::spill_offset(current_location.index) as u32,
-                ))?;
-                code.write_u32(inst::msr_nzcv(XSCRATCH0))?;
+                )?;
+                code.msr(SystemReg::NZCV, XReg::new(XSCRATCH0))?;
             }
             HostLocKind::Fpr => {
                 panic!("Invalid current location for flags");
@@ -793,7 +842,7 @@ impl RegAlloc {
 
     pub(crate) fn generate_immediate(
         &mut self,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         kind: HostLocKind,
         value: Value,
     ) -> Result<usize, String> {
@@ -816,14 +865,14 @@ impl RegAlloc {
                 self.spill_fpr(code, new_location_index)?;
                 self.fprs[new_location_index].setup_scratch_location();
                 emit_mov_x_imm(code, XSCRATCH0, value.get_imm_as_u64())?;
-                code.write_u32(inst::fmov_d_from_x(new_location_index as u8, XSCRATCH0))?;
+                code.fmov_from_gp(DReg::new(new_location_index as u8), XReg::new(XSCRATCH0))?;
                 Ok(new_location_index)
             }
             HostLocKind::Flags => {
                 self.spill_flags(code)?;
                 self.flags.setup_scratch_location();
                 emit_mov_x_imm(code, XSCRATCH0, value.get_imm_as_u64())?;
-                code.write_u32(inst::msr_nzcv(XSCRATCH0))?;
+                code.msr(SystemReg::NZCV, XReg::new(XSCRATCH0))?;
                 Ok(0)
             }
             HostLocKind::Spill => {
@@ -834,7 +883,7 @@ impl RegAlloc {
 
     pub(crate) fn realize_read(
         &mut self,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         required_kind: HostLocKind,
         value: Value,
     ) -> Result<usize, String> {
@@ -889,7 +938,7 @@ impl RegAlloc {
 
     pub(crate) fn realize_write(
         &mut self,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         block: &Block,
         kind: HostLocKind,
         value: InstRef,
@@ -928,7 +977,7 @@ impl RegAlloc {
 
     pub(crate) fn realize_read_write(
         &mut self,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         block: &Block,
         kind: HostLocKind,
         read_value: Value,
@@ -957,7 +1006,7 @@ impl RegAlloc {
 
     pub fn load_copy_into_gpr(
         &self,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         value: Value,
         reg: u8,
     ) -> Result<(), String> {
@@ -971,20 +1020,20 @@ impl RegAlloc {
             .expect("RegAlloc::load_copy_into_gpr: value not found");
         match current_location.kind {
             HostLocKind::Gpr => {
-                code.write_u32(inst::mov_x(reg, current_location.index as u8))?;
+                code.mov(XReg::new(reg), XReg::new(current_location.index as u8))?;
             }
             HostLocKind::Fpr => {
-                code.write_u32(inst::fmov_x_from_d(reg, current_location.index as u8))?;
+                code.fmov_to_gp(XReg::new(reg), DReg::new(current_location.index as u8))?;
             }
             HostLocKind::Spill => {
-                code.write_u32(inst::ldr_x_unsigned(
-                    reg,
-                    31,
+                code.ldr(
+                    XReg::new(reg),
+                    SP,
                     StackLayout::spill_offset(current_location.index) as u32,
-                ))?;
+                )?;
             }
             HostLocKind::Flags => {
-                code.write_u32(inst::mrs_nzcv(reg))?;
+                code.mrs(XReg::new(reg), SystemReg::NZCV)?;
             }
         }
         Ok(())
@@ -992,13 +1041,13 @@ impl RegAlloc {
 
     pub fn load_copy_into_fpr(
         &self,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         value: Value,
         reg: u8,
     ) -> Result<(), String> {
         if value.is_immediate() {
             emit_mov_x_imm(code, XSCRATCH0, value.get_imm_as_u64())?;
-            code.write_u32(inst::fmov_d_from_x(reg, XSCRATCH0))?;
+            code.fmov_from_gp(DReg::new(reg), XReg::new(XSCRATCH0))?;
             return Ok(());
         }
 
@@ -1007,17 +1056,20 @@ impl RegAlloc {
             .expect("RegAlloc::load_copy_into_fpr: value not found");
         match current_location.kind {
             HostLocKind::Gpr => {
-                code.write_u32(inst::fmov_d_from_x(reg, current_location.index as u8))?;
+                code.fmov_from_gp(DReg::new(reg), XReg::new(current_location.index as u8))?;
             }
             HostLocKind::Fpr => {
-                code.write_u32(inst::mov_v16b(reg, current_location.index as u8))?;
+                code.mov_v(
+                    VReg::new(reg).b16(),
+                    VReg::new(current_location.index as u8).b16(),
+                )?;
             }
             HostLocKind::Spill => {
-                code.write_u32(inst::ldr_q_unsigned(
-                    reg,
-                    31,
+                code.ldr(
+                    QReg::new(reg),
+                    SP,
                     StackLayout::spill_offset(current_location.index) as u32,
-                ))?;
+                )?;
             }
             HostLocKind::Flags => {
                 panic!("Moving from flags into fprs is not currently supported");
@@ -1057,15 +1109,8 @@ fn find_host_loc<const N: usize>(
         .map(|index| HostLoc { kind, index })
 }
 
-fn emit_mov_x_imm(code: &mut BlockOfCode, reg: u8, imm: u64) -> Result<(), String> {
-    code.write_u32(inst::movz_x(reg, (imm & 0xffff) as u16, 0))?;
-    for shift in [16, 32, 48] {
-        let chunk = ((imm >> shift) & 0xffff) as u16;
-        if chunk != 0 {
-            code.write_u32(inst::movk_x(reg, chunk, shift as u8))?;
-        }
-    }
-    Ok(())
+fn emit_mov_x_imm(code: &mut CodeGenerator<'_>, reg: u8, imm: u64) -> Result<(), String> {
+    code.mov_imm(XReg::new(reg), imm)
 }
 
 #[cfg(test)]
@@ -1329,7 +1374,8 @@ mod tests {
 
     #[test]
     fn spill_gpr_and_fpr_emit_upstream_stack_stores_and_move_locations() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut reg_alloc = RegAlloc::default();
         let gpr_value = InstRef(1);
         let fpr_value = InstRef(2);
@@ -1359,7 +1405,8 @@ mod tests {
 
     #[test]
     fn spill_flags_spills_selected_gpr_then_reads_nzcv_into_it() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut reg_alloc = RegAlloc::new(vec![4], Vec::new());
         let old_gpr_value = InstRef(7);
         let flags_value = InstRef(8);
@@ -1384,7 +1431,8 @@ mod tests {
 
     #[test]
     fn load_copy_into_gpr_matches_upstream_sources() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut reg_alloc = RegAlloc::default();
 
         reg_alloc.gprs[2].setup_location(InstRef(1), 1);
@@ -1417,7 +1465,8 @@ mod tests {
 
     #[test]
     fn load_copy_into_fpr_matches_upstream_sources() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut reg_alloc = RegAlloc::default();
 
         reg_alloc.gprs[5].setup_location(InstRef(5), 1);
@@ -1445,7 +1494,8 @@ mod tests {
 
     #[test]
     fn load_copy_into_registers_materializes_immediates() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let reg_alloc = RegAlloc::default();
 
         reg_alloc
@@ -1467,7 +1517,8 @@ mod tests {
 
     #[test]
     fn generate_immediate_realizes_upstream_target_kinds() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut reg_alloc = RegAlloc::new(vec![1], vec![2]);
 
         assert_eq!(
@@ -1502,7 +1553,8 @@ mod tests {
 
     #[test]
     fn realize_read_reuses_or_moves_existing_locations() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut reg_alloc = RegAlloc::new(vec![4], vec![7]);
 
         reg_alloc.gprs[3].setup_location(InstRef(1), 1);
@@ -1550,7 +1602,8 @@ mod tests {
 
     #[test]
     fn realize_write_and_read_write_define_destinations() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(LocationDescriptor::new(0x2000));
         let write = block.append(
             Opcode::Add64,
@@ -1595,7 +1648,8 @@ mod tests {
 
     #[test]
     fn read_write_flags_matches_upstream_gpr_and_spill_sources() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(LocationDescriptor::new(0x3000));
         let read_gpr = block.append(
             Opcode::Add32,
@@ -1653,7 +1707,8 @@ mod tests {
 
     #[test]
     fn prepare_for_call_spills_state_then_loads_abi_arguments() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut fpsr = FpsrManager::new(12);
         let mut reg_alloc = RegAlloc::new(vec![18], Vec::new());
 
@@ -1699,7 +1754,8 @@ mod tests {
 
     #[test]
     fn rareg_locks_realizes_and_releases_read_registers() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(LocationDescriptor::new(0x4000));
         let source = block.append(
             Opcode::Add64,
@@ -1734,7 +1790,8 @@ mod tests {
 
     #[test]
     fn rareg_realize_all_handles_multiple_registers_then_drop_resets_realized() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(LocationDescriptor::new(0x5000));
         let source = block.append(
             Opcode::Add64,
@@ -1778,7 +1835,8 @@ mod tests {
 
     #[test]
     fn rareg_read_write_locks_source_copies_into_destination_and_releases() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(LocationDescriptor::new(0x6000));
         let source = block.append(
             Opcode::Add64,

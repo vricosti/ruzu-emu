@@ -153,15 +153,20 @@ mod tests {
         let location = state.get_location_descriptor();
 
         let mut block_code = super::super::block_of_code::BlockOfCode::with_size(4096).unwrap();
-        block_code
-            .write_u32(super::super::inst::movz_w(0, 0x42, 0))
-            .unwrap();
-        block_code.write_u32(super::super::inst::ret_lr()).unwrap();
+        // Guest blocks are entered with BR, not BL. Return through the prelude
+        // to restore its stack frame and callee-save registers before RET.
+        let return_address = process.address_space().prelude_info().return_from_run_code;
+        {
+            let mut code = rhazel::CodeGenerator::new(&mut block_code);
+            code.mov_imm(rhazel::W0, 0x42).unwrap();
+            code.mov_imm(rhazel::X16, return_address as usize as u64).unwrap();
+            code.br(rhazel::X16).unwrap();
+        }
         block_code.seal();
 
         let block_info = EmittedBlockInfo {
             entry_point: block_code.code_base_ptr(),
-            size: 8,
+            size: block_code.code_size(),
             relocations: vec![],
             block_relocations: crate::backend::arm64::fast_hash::FastHashMap::default(),
             fastmem_patch_info: crate::backend::arm64::fast_hash::FastHashMap::default(),

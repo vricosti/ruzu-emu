@@ -2,22 +2,18 @@
 //!
 //! Upstream owner: `backend/arm64/emit_arm64_packed.cpp`.
 
-use crate::backend::arm64::block_of_code::BlockOfCode;
+use rhazel::{CodeGenerator, D2, V0, V1, V2};
+
 use crate::backend::arm64::emit_context::EmitContext;
-use crate::backend::arm64::inst;
-use crate::backend::arm64::reg_alloc::RegAlloc;
+use crate::backend::arm64::reg_alloc::{RAReg, RegAlloc};
 use crate::ir::opcode::Opcode;
 use crate::ir::value::InstRef;
 
-const V0: u8 = 0;
-const V1: u8 = 1;
-const V2: u8 = 2;
-
 fn emit_packed_op(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
-    emit: impl FnOnce(&mut BlockOfCode, u8, u8, u8) -> Result<(), String>,
+    emit: impl FnOnce(&mut CodeGenerator<'_>, &RAReg, &RAReg, &RAReg) -> Result<(), String>,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
 
@@ -26,19 +22,14 @@ fn emit_packed_op(
     let mut b = ctx.reg_alloc.read_d(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
 
-    emit(
-        code,
-        result.index().expect("result realized") as u8,
-        a.index().expect("a realized") as u8,
-        b.index().expect("b realized") as u8,
-    )
+    emit(code, &result, &a, &b)
 }
 
 fn emit_saturated_packed_op(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
-    emit: impl FnOnce(u8, u8, u8) -> u32,
+    emit: impl FnOnce(&mut CodeGenerator<'_>, &RAReg, &RAReg, &RAReg) -> Result<(), String>,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
 
@@ -48,16 +39,11 @@ fn emit_saturated_packed_op(
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
     ctx.fpsr.spill(code)?;
 
-    code.write_u32(emit(
-        result.index().expect("result realized") as u8,
-        a.index().expect("a realized") as u8,
-        b.index().expect("b realized") as u8,
-    ))?;
-    Ok(())
+    emit(code, &result, &a, &b)
 }
 
 pub fn emit_packed_add_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -69,22 +55,21 @@ pub fn emit_packed_add_u8(
     let mut a = ctx.reg_alloc.read_d(args[0]);
     let mut b = ctx.reg_alloc.read_d(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, a, b) = (result.v(), a.v(), b.v());
 
-    code.write_u32(inst::add_v(result, a, b, 8, false))?;
+    code.add_v(result.b8(), a.b8(), b.b8())?;
 
     if let Some(ge_inst) = ge_inst {
         let mut ge = ctx.reg_alloc.write_d(ge_inst);
-        let ge = ge.realize(code, ctx.block)? as u8;
-        code.write_u32(inst::cmhi_v(ge, a, result, 8, false))?;
+        ge.realize(code, ctx.block)?;
+        let ge = ge.v();
+        code.cmhi(ge.b8(), a.b8(), result.b8())?;
     }
     Ok(())
 }
 
 pub fn emit_packed_add_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -96,23 +81,22 @@ pub fn emit_packed_add_s8(
     let mut a = ctx.reg_alloc.read_d(args[0]);
     let mut b = ctx.reg_alloc.read_d(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, a, b) = (result.v(), a.v(), b.v());
 
-    code.write_u32(inst::add_v(result, a, b, 8, false))?;
+    code.add_v(result.b8(), a.b8(), b.b8())?;
 
     if let Some(ge_inst) = ge_inst {
         let mut ge = ctx.reg_alloc.write_d(ge_inst);
-        let ge = ge.realize(code, ctx.block)? as u8;
-        code.write_u32(inst::shadd_v(ge, a, b, 8, false))?;
-        code.write_u32(inst::cmge_v_zero(ge, ge, 8, false))?;
+        ge.realize(code, ctx.block)?;
+        let ge = ge.v();
+        code.shadd(ge.b8(), a.b8(), b.b8())?;
+        code.cmge_zero(ge.b8(), ge.b8())?;
     }
     Ok(())
 }
 
 pub fn emit_packed_sub_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -124,23 +108,22 @@ pub fn emit_packed_sub_u8(
     let mut a = ctx.reg_alloc.read_d(args[0]);
     let mut b = ctx.reg_alloc.read_d(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, a, b) = (result.v(), a.v(), b.v());
 
-    code.write_u32(inst::sub_v(result, a, b, 8, false))?;
+    code.sub_v(result.b8(), a.b8(), b.b8())?;
 
     if let Some(ge_inst) = ge_inst {
         let mut ge = ctx.reg_alloc.write_d(ge_inst);
-        let ge = ge.realize(code, ctx.block)? as u8;
-        code.write_u32(inst::uhsub_v(ge, a, b, 8, false))?;
-        code.write_u32(inst::cmge_v_zero(ge, ge, 8, false))?;
+        ge.realize(code, ctx.block)?;
+        let ge = ge.v();
+        code.uhsub(ge.b8(), a.b8(), b.b8())?;
+        code.cmge_zero(ge.b8(), ge.b8())?;
     }
     Ok(())
 }
 
 pub fn emit_packed_sub_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -152,23 +135,22 @@ pub fn emit_packed_sub_s8(
     let mut a = ctx.reg_alloc.read_d(args[0]);
     let mut b = ctx.reg_alloc.read_d(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, a, b) = (result.v(), a.v(), b.v());
 
-    code.write_u32(inst::sub_v(result, a, b, 8, false))?;
+    code.sub_v(result.b8(), a.b8(), b.b8())?;
 
     if let Some(ge_inst) = ge_inst {
         let mut ge = ctx.reg_alloc.write_d(ge_inst);
-        let ge = ge.realize(code, ctx.block)? as u8;
-        code.write_u32(inst::shsub_v(ge, a, b, 8, false))?;
-        code.write_u32(inst::cmge_v_zero(ge, ge, 8, false))?;
+        ge.realize(code, ctx.block)?;
+        let ge = ge.v();
+        code.shsub(ge.b8(), a.b8(), b.b8())?;
+        code.cmge_zero(ge.b8(), ge.b8())?;
     }
     Ok(())
 }
 
 pub fn emit_packed_add_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -180,22 +162,21 @@ pub fn emit_packed_add_u16(
     let mut a = ctx.reg_alloc.read_d(args[0]);
     let mut b = ctx.reg_alloc.read_d(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, a, b) = (result.v(), a.v(), b.v());
 
-    code.write_u32(inst::add_v(result, a, b, 16, false))?;
+    code.add_v(result.h4(), a.h4(), b.h4())?;
 
     if let Some(ge_inst) = ge_inst {
         let mut ge = ctx.reg_alloc.write_d(ge_inst);
-        let ge = ge.realize(code, ctx.block)? as u8;
-        code.write_u32(inst::cmhi_v(ge, a, result, 16, false))?;
+        ge.realize(code, ctx.block)?;
+        let ge = ge.v();
+        code.cmhi(ge.h4(), a.h4(), result.h4())?;
     }
     Ok(())
 }
 
 pub fn emit_packed_add_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -207,23 +188,22 @@ pub fn emit_packed_add_s16(
     let mut a = ctx.reg_alloc.read_d(args[0]);
     let mut b = ctx.reg_alloc.read_d(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, a, b) = (result.v(), a.v(), b.v());
 
-    code.write_u32(inst::add_v(result, a, b, 16, false))?;
+    code.add_v(result.h4(), a.h4(), b.h4())?;
 
     if let Some(ge_inst) = ge_inst {
         let mut ge = ctx.reg_alloc.write_d(ge_inst);
-        let ge = ge.realize(code, ctx.block)? as u8;
-        code.write_u32(inst::shadd_v(ge, a, b, 16, false))?;
-        code.write_u32(inst::cmge_v_zero(ge, ge, 16, false))?;
+        ge.realize(code, ctx.block)?;
+        let ge = ge.v();
+        code.shadd(ge.h4(), a.h4(), b.h4())?;
+        code.cmge_zero(ge.h4(), ge.h4())?;
     }
     Ok(())
 }
 
 pub fn emit_packed_sub_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -235,23 +215,22 @@ pub fn emit_packed_sub_u16(
     let mut a = ctx.reg_alloc.read_d(args[0]);
     let mut b = ctx.reg_alloc.read_d(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, a, b) = (result.v(), a.v(), b.v());
 
-    code.write_u32(inst::sub_v(result, a, b, 16, false))?;
+    code.sub_v(result.h4(), a.h4(), b.h4())?;
 
     if let Some(ge_inst) = ge_inst {
         let mut ge = ctx.reg_alloc.write_d(ge_inst);
-        let ge = ge.realize(code, ctx.block)? as u8;
-        code.write_u32(inst::uhsub_v(ge, a, b, 16, false))?;
-        code.write_u32(inst::cmge_v_zero(ge, ge, 16, false))?;
+        ge.realize(code, ctx.block)?;
+        let ge = ge.v();
+        code.uhsub(ge.h4(), a.h4(), b.h4())?;
+        code.cmge_zero(ge.h4(), ge.h4())?;
     }
     Ok(())
 }
 
 pub fn emit_packed_sub_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -263,23 +242,22 @@ pub fn emit_packed_sub_s16(
     let mut a = ctx.reg_alloc.read_d(args[0]);
     let mut b = ctx.reg_alloc.read_d(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, a, b) = (result.v(), a.v(), b.v());
 
-    code.write_u32(inst::sub_v(result, a, b, 16, false))?;
+    code.sub_v(result.h4(), a.h4(), b.h4())?;
 
     if let Some(ge_inst) = ge_inst {
         let mut ge = ctx.reg_alloc.write_d(ge_inst);
-        let ge = ge.realize(code, ctx.block)? as u8;
-        code.write_u32(inst::shsub_v(ge, a, b, 16, false))?;
-        code.write_u32(inst::cmge_v_zero(ge, ge, 16, false))?;
+        ge.realize(code, ctx.block)?;
+        let ge = ge.v();
+        code.shsub(ge.h4(), a.h4(), b.h4())?;
+        code.cmge_zero(ge.h4(), ge.h4())?;
     }
     Ok(())
 }
 
 fn emit_packed_add_sub<const ADD_IS_HI: bool, const IS_SIGNED: bool, const IS_HALVING: bool>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -291,60 +269,53 @@ fn emit_packed_add_sub<const ADD_IS_HI: bool, const IS_SIGNED: bool, const IS_HA
     let mut a = ctx.reg_alloc.read_d(args[0]);
     let mut b = ctx.reg_alloc.read_d(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, a, b) = (result.v(), a.v(), b.v());
 
-    code.write_u32(if IS_SIGNED {
-        inst::sxtl_v(V0, a, 16)
+    if IS_SIGNED {
+        code.sxtl(V0.s4(), a.h4())?;
+        code.sxtl(V1.s4(), b.h4())?;
     } else {
-        inst::uxtl_v(V0, a, 16)
-    })?;
-    code.write_u32(if IS_SIGNED {
-        inst::sxtl_v(V1, b, 16)
-    } else {
-        inst::uxtl_v(V1, b, 16)
-    })?;
-    code.write_u32(inst::ext_v16b(V1, V1, V1, 4, false))?;
+        code.uxtl(V0.s4(), a.h4())?;
+        code.uxtl(V1.s4(), b.h4())?;
+    }
+    code.ext(V1.b8(), V1.b8(), V1.b8(), 4)?;
 
-    code.write_u32(inst::movi_v8b_imm(
-        V2,
-        if ADD_IS_HI { 0b1111_0000 } else { 0b0000_1111 },
-    ))?;
+    code.movi_rep(D2, if ADD_IS_HI { 0b1111_0000 } else { 0b0000_1111 })?;
 
-    code.write_u32(inst::eor_v8b(V1, V1, V2))?;
-    code.write_u32(inst::sub_v(V1, V1, V2, 32, false))?;
-    code.write_u32(inst::sub_v(result, V0, V1, 32, false))?;
+    code.eor_v(V1.b8(), V1.b8(), V2.b8())?;
+    code.sub_v(V1.s2(), V1.s2(), V2.s2())?;
+    code.sub_v(result.s2(), V0.s2(), V1.s2())?;
 
     if IS_HALVING {
-        code.write_u32(if IS_SIGNED {
-            inst::sshr_v(result, result, 32, 1, false)
+        if IS_SIGNED {
+            code.sshr(result.s2(), result.s2(), 1)?;
         } else {
-            inst::ushr_v(result, result, 32, 1, false)
-        })?;
+            code.ushr(result.s2(), result.s2(), 1)?;
+        }
     }
 
     if let Some(ge_inst) = ge_inst {
         assert!(!IS_HALVING);
         let mut ge = ctx.reg_alloc.write_d(ge_inst);
-        let ge = ge.realize(code, ctx.block)? as u8;
+        ge.realize(code, ctx.block)?;
+        let ge = ge.v();
 
         if IS_SIGNED {
-            code.write_u32(inst::cmge_v_zero(ge, result, 32, false))?;
-            code.write_u32(inst::xtn_v(ge, ge, 32))?;
+            code.cmge_zero(ge.s2(), result.s2())?;
+            code.xtn(ge.h4(), ge.s4())?;
         } else {
-            code.write_u32(inst::cmeq_v_zero(ge, result, 16, false))?;
-            code.write_u32(inst::eor_v8b(ge, ge, V2))?;
-            code.write_u32(inst::shrn_v(ge, ge, 32, 16))?;
+            code.cmeq_zero(ge.h4(), result.h4())?;
+            code.eor_v(ge.b8(), ge.b8(), V2.b8())?;
+            code.shrn(ge.h4(), ge.s4(), 16)?;
         }
     }
 
-    code.write_u32(inst::xtn_v(result, result, 32))?;
+    code.xtn(result.h4(), result.s4())?;
     Ok(())
 }
 
 pub fn emit_packed_add_sub_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -352,7 +323,7 @@ pub fn emit_packed_add_sub_u16(
 }
 
 pub fn emit_packed_add_sub_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -360,7 +331,7 @@ pub fn emit_packed_add_sub_s16(
 }
 
 pub fn emit_packed_sub_add_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -368,7 +339,7 @@ pub fn emit_packed_sub_add_u16(
 }
 
 pub fn emit_packed_sub_add_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -376,95 +347,87 @@ pub fn emit_packed_sub_add_s16(
 }
 
 pub fn emit_packed_halving_add_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
-        code.write_u32(inst::uhadd_v(result, a, b, 8, false))?;
-        Ok(())
+        code.uhadd(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_halving_add_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
-        code.write_u32(inst::shadd_v(result, a, b, 8, false))?;
-        Ok(())
+        code.shadd(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_halving_sub_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
-        code.write_u32(inst::uhsub_v(result, a, b, 8, false))?;
-        Ok(())
+        code.uhsub(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_halving_sub_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
-        code.write_u32(inst::shsub_v(result, a, b, 8, false))?;
-        Ok(())
+        code.shsub(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_halving_add_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
-        code.write_u32(inst::uhadd_v(result, a, b, 16, false))?;
-        Ok(())
+        code.uhadd(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_halving_add_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
-        code.write_u32(inst::shadd_v(result, a, b, 16, false))?;
-        Ok(())
+        code.shadd(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_halving_sub_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
-        code.write_u32(inst::uhsub_v(result, a, b, 16, false))?;
-        Ok(())
+        code.uhsub(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_halving_sub_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
-        code.write_u32(inst::shsub_v(result, a, b, 16, false))?;
-        Ok(())
+        code.shsub(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_halving_add_sub_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -472,7 +435,7 @@ pub fn emit_packed_halving_add_sub_u16(
 }
 
 pub fn emit_packed_halving_add_sub_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -480,7 +443,7 @@ pub fn emit_packed_halving_add_sub_s16(
 }
 
 pub fn emit_packed_halving_sub_add_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -488,7 +451,7 @@ pub fn emit_packed_halving_sub_add_u16(
 }
 
 pub fn emit_packed_halving_sub_add_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -496,101 +459,102 @@ pub fn emit_packed_halving_sub_add_s16(
 }
 
 pub fn emit_packed_saturated_add_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_saturated_packed_op(code, ctx, inst_ref, |result, a, b| {
-        inst::uqadd_v(result, a, b, 8, false)
+    emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
+        code.uqadd(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_saturated_add_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_saturated_packed_op(code, ctx, inst_ref, |result, a, b| {
-        inst::sqadd_v(result, a, b, 8, false)
+    emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
+        code.sqadd(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_saturated_sub_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_saturated_packed_op(code, ctx, inst_ref, |result, a, b| {
-        inst::uqsub_v(result, a, b, 8, false)
+    emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
+        code.uqsub(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_saturated_sub_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_saturated_packed_op(code, ctx, inst_ref, |result, a, b| {
-        inst::sqsub_v(result, a, b, 8, false)
+    emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
+        code.sqsub(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_saturated_add_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_saturated_packed_op(code, ctx, inst_ref, |result, a, b| {
-        inst::uqadd_v(result, a, b, 16, false)
+    emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
+        code.uqadd(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_saturated_add_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_saturated_packed_op(code, ctx, inst_ref, |result, a, b| {
-        inst::sqadd_v(result, a, b, 16, false)
+    emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
+        code.sqadd(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_saturated_sub_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_saturated_packed_op(code, ctx, inst_ref, |result, a, b| {
-        inst::uqsub_v(result, a, b, 16, false)
+    emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
+        code.uqsub(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_saturated_sub_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_saturated_packed_op(code, ctx, inst_ref, |result, a, b| {
-        inst::sqsub_v(result, a, b, 16, false)
+    emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
+        code.sqsub(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_abs_diff_sum_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
-        code.write_u32(inst::movi_v8b_imm(V2, 0b0000_1111))?;
-        code.write_u32(inst::uabd_v(result, a, b, 8, false))?;
-        code.write_u32(inst::and_v8b(result, result, V2))?;
-        code.write_u32(inst::uaddlv_from_v(result, result, 8, false))?;
+        let (result, a, b) = (result.v(), a.v(), b.v());
+        code.movi_rep(D2, 0b0000_1111)?;
+        code.uabd(result.b8(), a.b8(), b.b8())?;
+        code.and_v(result.b8(), result.b8(), V2.b8())?;
+        code.uaddlv(result.h(), result.b8())?;
         Ok(())
     })
 }
 
 pub fn emit_packed_select(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -601,18 +565,15 @@ pub fn emit_packed_select(
     let mut a = ctx.reg_alloc.read_d(args[1]);
     let mut b = ctx.reg_alloc.read_d(args[2]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut ge, &mut a, &mut b])?;
-    let result = result.index().expect("result realized") as u8;
-    let ge = ge.index().expect("ge realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, ge, a, b) = (result.v(), ge.v(), a.v(), b.v());
 
-    code.write_u32(inst::fmov_d(result, ge))?;
-    code.write_u32(inst::bsl_v8b(result, b, a))?;
+    code.fmov(result.d(), ge.d())?;
+    code.bsl(result.b8(), b.b8(), a.b8())?;
     Ok(())
 }
 
 pub fn emit_packed_instruction(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {

@@ -9,10 +9,13 @@ use super::abi::{
     self, to_reg_list_gpr, to_reg_list_vec, ABI_CALLEE_SAVE, ABI_CALLER_SAVE, XFASTMEM, XHALT,
     XPAGETABLE, XSCRATCH0, XSCRATCH1, XSTATE, XTICKS,
 };
+#[cfg(test)]
 use super::block_of_code::BlockOfCode;
+#[cfg(test)]
 use super::inst;
 use super::jit_state::{A32JitState, A64JitState};
 use super::stack_layout::{RSBEntry, StackLayout, RSB_COUNT};
+use rhazel::{CodeGenerator, SystemReg, WReg, XReg};
 
 pub type RunCodeFn = unsafe extern "C" fn(
     entry_point: *const u8,
@@ -137,12 +140,12 @@ pub(crate) fn report_dispatcher_failure(label: &str, pc: u64, detail: &str) {
     let _ = std::io::stderr().flush();
 }
 
-pub fn emit_bootstrap_prelude(code: &mut BlockOfCode) -> Result<PreludeInfo, String> {
+pub fn emit_bootstrap_prelude(code: &mut CodeGenerator<'_>) -> Result<PreludeInfo, String> {
     emit_bootstrap_prelude_with_dispatcher(code, None)
 }
 
 pub fn emit_bootstrap_prelude_with_dispatcher(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     dispatcher: Option<DispatcherCallback>,
 ) -> Result<PreludeInfo, String> {
     emit_bootstrap_prelude_with_options(
@@ -158,7 +161,7 @@ pub fn emit_bootstrap_prelude_with_dispatcher(
 }
 
 pub fn emit_bootstrap_prelude_with_options(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     options: PreludeOptions,
 ) -> Result<PreludeInfo, String> {
     let dispatcher = options.dispatcher;
@@ -231,68 +234,72 @@ pub fn emit_bootstrap_prelude_with_options(
 }
 
 fn emit_return_to_dispatcher(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     return_from_run_code_offset: usize,
     dispatcher: Option<DispatcherCallback>,
 ) -> Result<(), String> {
     let Some(dispatcher) = dispatcher else {
         let return_to_dispatcher_offset = code.code_size();
-        code.write_u32(inst::b_imm(
-            return_from_run_code_offset as isize - return_to_dispatcher_offset as isize,
-        ))?;
+        code.b_offset(return_from_run_code_offset as isize - return_to_dispatcher_offset as isize)?;
         return Ok(());
     };
 
-    code.write_u32(inst::ldar_w(XSCRATCH0, XHALT))?;
-    let halt_branch_offset = code.write_u32(inst::cbnz_w(XSCRATCH0, 0))?;
+    code.ldar(WReg::new(XSCRATCH0), rhazel::XRegSp::new(XHALT))?;
+    let halt_branch_offset = {
+        let offset = code.code_size();
+        code.cbnz_offset(WReg::new(XSCRATCH0), 0)?;
+        offset
+    };
     let cycle_branch_offset = if dispatcher.ticks.is_some() {
-        code.write_u32(inst::cmp_x_imm(XTICKS, 0))?;
-        Some(code.write_u32(inst::b_cond(Cond::LE, 0))?)
+        code.cmp_imm(XReg::new(XTICKS), 0)?;
+        Some({
+            let offset = code.code_size();
+            code.b_cond_offset(Cond::LE, 0)?;
+            offset
+        })
     } else {
         None
     };
-    let load_this_offset = code.write_u32(inst::nop())?;
-    code.write_u32(inst::mov_x(X1, XSTATE))?;
-    let load_fn_offset = code.write_u32(inst::nop())?;
-    code.write_u32(inst::blr(XSCRATCH0))?;
-    code.write_u32(inst::br(X0))?;
+    let load_this_offset = {
+        let offset = code.code_size();
+        code.nop()?;
+        offset
+    };
+    code.mov(XReg::new(X1), XReg::new(XSTATE))?;
+    let load_fn_offset = {
+        let offset = code.code_size();
+        code.nop()?;
+        offset
+    };
+    code.blr(XReg::new(XSCRATCH0))?;
+    code.br(XReg::new(X0))?;
 
     let halt_branch_pc_offset =
         i32::try_from(return_from_run_code_offset as isize - halt_branch_offset as isize)
             .map_err(|_| "ARM64 return_to_dispatcher halt branch offset overflow".to_string())?;
-    code.patch_u32(
-        halt_branch_offset,
-        inst::cbnz_w(XSCRATCH0, halt_branch_pc_offset),
-    )?;
+    CodeGenerator::patch_at(code, halt_branch_offset, false)
+        .cbnz_offset(WReg::new(XSCRATCH0), halt_branch_pc_offset)?;
     if let Some(cycle_branch_offset) = cycle_branch_offset {
         let cycle_branch_pc_offset =
             i32::try_from(return_from_run_code_offset as isize - cycle_branch_offset as isize)
                 .map_err(|_| {
                     "ARM64 return_to_dispatcher cycle branch offset overflow".to_string()
                 })?;
-        code.patch_u32(
-            cycle_branch_offset,
-            inst::b_cond(Cond::LE, cycle_branch_pc_offset),
-        )?;
+        CodeGenerator::patch_at(code, cycle_branch_offset, false)
+            .b_cond_offset(Cond::LE, cycle_branch_pc_offset)?;
     }
 
     let pc_after_body = code.code_size();
     let this_data_offset = (pc_after_body + 7) & !7;
     let fn_data_offset = this_data_offset + 8;
 
-    code.patch_u32(
-        load_this_offset,
-        inst::ldr_x_lit(
-            X0,
-            (this_data_offset as isize - load_this_offset as isize) as i32,
-        ),
+    CodeGenerator::patch_at(code, load_this_offset, false).ldr_literal(
+        XReg::new(X0),
+        (this_data_offset as isize - load_this_offset as isize) as i32,
     )?;
-    code.patch_u32(
-        load_fn_offset,
-        inst::ldr_x_lit(
-            XSCRATCH0,
-            (fn_data_offset as isize - load_fn_offset as isize) as i32,
-        ),
+    CodeGenerator::patch_at(code, load_fn_offset, false).ldr_literal(
+        XReg::new(XSCRATCH0),
+        (fn_data_offset as isize - load_fn_offset as isize) as i32,
     )?;
     code.align(8)?;
     let written_this_offset = code.write_u64(dispatcher.this_ptr as usize as u64)?;
@@ -311,7 +318,7 @@ fn emit_return_to_dispatcher(
 /// then branches to the function. The explicit data words mirror the literal
 /// pool used by upstream oaknut code.
 pub fn emit_call_trampoline(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     this_ptr: *const c_void,
     fn_ptr: *const c_void,
 ) -> Result<*const u8, String> {
@@ -319,15 +326,15 @@ pub fn emit_call_trampoline(
     let this_data_offset = (target_offset + 12 + 7) & !7;
     let fn_data_offset = this_data_offset + 8;
 
-    code.write_u32(inst::ldr_x_lit(
-        X0,
+    code.ldr_literal(
+        XReg::new(X0),
         (this_data_offset as isize - target_offset as isize) as i32,
-    ))?;
-    code.write_u32(inst::ldr_x_lit(
-        XSCRATCH0,
+    )?;
+    code.ldr_literal(
+        XReg::new(XSCRATCH0),
         (fn_data_offset as isize - (target_offset + 4) as isize) as i32,
-    ))?;
-    code.write_u32(inst::br(XSCRATCH0))?;
+    )?;
+    code.br(XReg::new(XSCRATCH0))?;
     code.align(8)?;
     let written_this_offset = code.write_u64(this_ptr as usize as u64)?;
     let written_fn_offset = code.write_u64(fn_ptr as usize as u64)?;
@@ -346,7 +353,7 @@ pub fn emit_call_trampoline(
 /// callback as `(this, Xscratch0)`, then moves the return value back into
 /// Xscratch0 before returning to generated code.
 pub fn emit_wrapped_read_call_trampoline(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     this_ptr: *const c_void,
     fn_ptr: *const c_void,
 ) -> Result<*const u8, String> {
@@ -359,13 +366,13 @@ pub fn emit_wrapped_read_call_trampoline(
         this_ptr,
         fn_ptr,
         |code| {
-            code.write_u32(inst::mov_x(X1, XSCRATCH0))?;
+            code.mov(XReg::new(X1), XReg::new(XSCRATCH0))?;
             Ok(())
         },
         |code| {
-            code.write_u32(inst::mov_x(XSCRATCH0, X0))?;
+            code.mov(XReg::new(XSCRATCH0), XReg::new(X0))?;
             abi::emit_pop_registers(code, save_regs, 0)?;
-            code.write_u32(inst::ret_lr())?;
+            code.ret()?;
             Ok(())
         },
     )?;
@@ -378,7 +385,7 @@ pub fn emit_wrapped_read_call_trampoline(
 /// The wrapped write path passes the guest address/value through Xscratch0 and
 /// Xscratch1, preserving generated-code caller-save state around the host call.
 pub fn emit_wrapped_write_call_trampoline(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     this_ptr: *const c_void,
     fn_ptr: *const c_void,
 ) -> Result<*const u8, String> {
@@ -390,13 +397,13 @@ pub fn emit_wrapped_write_call_trampoline(
         this_ptr,
         fn_ptr,
         |code| {
-            code.write_u32(inst::mov_x(X1, XSCRATCH0))?;
-            code.write_u32(inst::mov_x(X2, XSCRATCH1))?;
+            code.mov(XReg::new(X1), XReg::new(XSCRATCH0))?;
+            code.mov(XReg::new(X2), XReg::new(XSCRATCH1))?;
             Ok(())
         },
         |code| {
             abi::emit_pop_registers(code, ABI_CALLER_SAVE, 0)?;
-            code.write_u32(inst::ret_lr())?;
+            code.ret()?;
             Ok(())
         },
     )?;
@@ -405,7 +412,7 @@ pub fn emit_wrapped_write_call_trampoline(
 }
 
 pub fn emit_read128_call_trampoline(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     this_ptr: *const c_void,
     fn_ptr: *const c_void,
 ) -> Result<*const u8, String> {
@@ -419,10 +426,10 @@ pub fn emit_read128_call_trampoline(
         fn_ptr,
         |_| Ok(()),
         |code| {
-            code.write_u32(inst::fmov_d_from_x(0, X0))?;
-            code.write_u32(inst::fmov_v_d1_from_x(0, X1))?;
+            code.fmov_from_gp(rhazel::DReg::new(0), XReg::new(X0))?;
+            code.fmov_high_from_gp(rhazel::VReg::new(0).d2(), XReg::new(X1))?;
             abi::emit_pop_registers(code, save_regs, 0)?;
-            code.write_u32(inst::ret_lr())?;
+            code.ret()?;
             Ok(())
         },
     )?;
@@ -431,7 +438,7 @@ pub fn emit_read128_call_trampoline(
 }
 
 pub fn emit_wrapped_read128_call_trampoline(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     this_ptr: *const c_void,
     fn_ptr: *const c_void,
 ) -> Result<*const u8, String> {
@@ -444,14 +451,14 @@ pub fn emit_wrapped_read128_call_trampoline(
         this_ptr,
         fn_ptr,
         |code| {
-            code.write_u32(inst::mov_x(X1, XSCRATCH0))?;
+            code.mov(XReg::new(X1), XReg::new(XSCRATCH0))?;
             Ok(())
         },
         |code| {
-            code.write_u32(inst::fmov_d_from_x(0, X0))?;
-            code.write_u32(inst::fmov_v_d1_from_x(0, X1))?;
+            code.fmov_from_gp(rhazel::DReg::new(0), XReg::new(X0))?;
+            code.fmov_high_from_gp(rhazel::VReg::new(0).d2(), XReg::new(X1))?;
             abi::emit_pop_registers(code, save_regs, 0)?;
-            code.write_u32(inst::ret_lr())?;
+            code.ret()?;
             Ok(())
         },
     )?;
@@ -460,14 +467,14 @@ pub fn emit_wrapped_read128_call_trampoline(
 }
 
 pub fn emit_write128_call_trampoline(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     this_ptr: *const c_void,
     fn_ptr: *const c_void,
 ) -> Result<*const u8, String> {
     let target_offset = code.code_size();
     emit_load_this_and_branch(code, this_ptr, fn_ptr, |code| {
-        code.write_u32(inst::fmov_x_from_d(X2, 0))?;
-        code.write_u32(inst::fmov_x_from_v_d1(X3, 0))?;
+        code.fmov_to_gp(XReg::new(X2), rhazel::DReg::new(0))?;
+        code.fmov_high_to_gp(XReg::new(X3), rhazel::VReg::new(0).d2())?;
         Ok(())
     })?;
 
@@ -475,7 +482,7 @@ pub fn emit_write128_call_trampoline(
 }
 
 pub fn emit_wrapped_write128_call_trampoline(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     this_ptr: *const c_void,
     fn_ptr: *const c_void,
 ) -> Result<*const u8, String> {
@@ -487,14 +494,14 @@ pub fn emit_wrapped_write128_call_trampoline(
         this_ptr,
         fn_ptr,
         |code| {
-            code.write_u32(inst::mov_x(X1, XSCRATCH0))?;
-            code.write_u32(inst::fmov_x_from_d(X2, 0))?;
-            code.write_u32(inst::fmov_x_from_v_d1(X3, 0))?;
+            code.mov(XReg::new(X1), XReg::new(XSCRATCH0))?;
+            code.fmov_to_gp(XReg::new(X2), rhazel::DReg::new(0))?;
+            code.fmov_high_to_gp(XReg::new(X3), rhazel::VReg::new(0).d2())?;
             Ok(())
         },
         |code| {
             abi::emit_pop_registers(code, ABI_CALLER_SAVE, 0)?;
-            code.write_u32(inst::ret_lr())?;
+            code.ret()?;
             Ok(())
         },
     )?;
@@ -503,37 +510,31 @@ pub fn emit_wrapped_write128_call_trampoline(
 }
 
 fn emit_load_this_and_call(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     this_ptr: *const c_void,
     fn_ptr: *const c_void,
-    emit_argument_moves: impl FnOnce(&mut BlockOfCode) -> Result<(), String>,
-    emit_after_call: impl FnOnce(&mut BlockOfCode) -> Result<(), String>,
+    emit_argument_moves: impl FnOnce(&mut CodeGenerator<'_>) -> Result<(), String>,
+    emit_after_call: impl FnOnce(&mut CodeGenerator<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
     let ldr_this_offset = code.code_size();
-    code.write_u32(inst::nop())?;
+    code.nop()?;
     emit_argument_moves(code)?;
     let ldr_fn_offset = code.code_size();
-    code.write_u32(inst::nop())?;
-    code.write_u32(inst::blr(XSCRATCH0))?;
+    code.nop()?;
+    code.blr(XReg::new(XSCRATCH0))?;
     emit_after_call(code)?;
 
     let pc_after_body = code.code_size();
     let this_data_offset = (pc_after_body + 7) & !7;
     let fn_data_offset = this_data_offset + 8;
 
-    code.patch_u32(
-        ldr_this_offset,
-        inst::ldr_x_lit(
-            X0,
-            (this_data_offset as isize - ldr_this_offset as isize) as i32,
-        ),
+    CodeGenerator::patch_at(code, ldr_this_offset, false).ldr_literal(
+        XReg::new(X0),
+        (this_data_offset as isize - ldr_this_offset as isize) as i32,
     )?;
-    code.patch_u32(
-        ldr_fn_offset,
-        inst::ldr_x_lit(
-            XSCRATCH0,
-            (fn_data_offset as isize - ldr_fn_offset as isize) as i32,
-        ),
+    CodeGenerator::patch_at(code, ldr_fn_offset, false).ldr_literal(
+        XReg::new(XSCRATCH0),
+        (fn_data_offset as isize - ldr_fn_offset as isize) as i32,
     )?;
     code.align(8)?;
     let written_this_offset = code.write_u64(this_ptr as usize as u64)?;
@@ -547,35 +548,29 @@ fn emit_load_this_and_call(
 }
 
 fn emit_load_this_and_branch(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     this_ptr: *const c_void,
     fn_ptr: *const c_void,
-    emit_argument_moves: impl FnOnce(&mut BlockOfCode) -> Result<(), String>,
+    emit_argument_moves: impl FnOnce(&mut CodeGenerator<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
     let ldr_this_offset = code.code_size();
-    code.write_u32(inst::nop())?;
+    code.nop()?;
     emit_argument_moves(code)?;
     let ldr_fn_offset = code.code_size();
-    code.write_u32(inst::nop())?;
-    code.write_u32(inst::br(XSCRATCH0))?;
+    code.nop()?;
+    code.br(XReg::new(XSCRATCH0))?;
 
     let pc_after_body = code.code_size();
     let this_data_offset = (pc_after_body + 7) & !7;
     let fn_data_offset = this_data_offset + 8;
 
-    code.patch_u32(
-        ldr_this_offset,
-        inst::ldr_x_lit(
-            X0,
-            (this_data_offset as isize - ldr_this_offset as isize) as i32,
-        ),
+    CodeGenerator::patch_at(code, ldr_this_offset, false).ldr_literal(
+        XReg::new(X0),
+        (this_data_offset as isize - ldr_this_offset as isize) as i32,
     )?;
-    code.patch_u32(
-        ldr_fn_offset,
-        inst::ldr_x_lit(
-            XSCRATCH0,
-            (fn_data_offset as isize - ldr_fn_offset as isize) as i32,
-        ),
+    CodeGenerator::patch_at(code, ldr_fn_offset, false).ldr_literal(
+        XReg::new(XSCRATCH0),
+        (fn_data_offset as isize - ldr_fn_offset as isize) as i32,
     )?;
     code.align(8)?;
     let written_this_offset = code.write_u64(this_ptr as usize as u64)?;
@@ -596,7 +591,7 @@ const X19: u8 = 19;
 const WZR: u8 = 31;
 
 fn emit_run_like_entry(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     step: bool,
     ticks: Option<TickCallbacks>,
     options: PreludeOptions,
@@ -604,9 +599,9 @@ fn emit_run_like_entry(
     // Args match upstream: X0=entry_point, X1=jit_state, X2=halt_reason.
     let saved_registers = ABI_CALLEE_SAVE | abi::to_reg_list_gpr(abi::LR);
     abi::emit_push_registers(code, saved_registers, core::mem::size_of::<StackLayout>())?;
-    code.write_u32(inst::mov_x(X19, X0))?;
-    code.write_u32(inst::mov_x(XSTATE, X1))?;
-    code.write_u32(inst::mov_x(XHALT, X2))?;
+    code.mov(XReg::new(X19), XReg::new(X0))?;
+    code.mov(XReg::new(XSTATE), XReg::new(X1))?;
+    code.mov(XReg::new(XHALT), XReg::new(X2))?;
     if options.page_table_pointer != 0 {
         emit_mov_x_imm(code, XPAGETABLE, options.page_table_pointer)?;
     }
@@ -620,14 +615,15 @@ fn emit_run_like_entry(
     };
     if let Some(ticks) = ticks {
         if step {
-            code.write_u32(inst::movz_x(XTICKS, 1, 0))?;
+            code.movz(XReg::new(XTICKS), 1, 0)?;
         } else {
             emit_call_get_ticks_remaining(code, ticks)?;
         }
-        code.write_u32(inst::str_x_unsigned_sp(
-            XTICKS,
+        code.str(
+            XReg::new(XTICKS),
+            rhazel::SP,
             StackLayout::cycles_to_run_offset() as u32,
-        ))?;
+        )?;
     }
 
     emit_guest_fpcr_setup(code, options.isa)?;
@@ -635,56 +631,69 @@ fn emit_run_like_entry(
     if step {
         // Upstream uses an LDAXR/STLXR retry loop to set HaltReason::Step
         // without overwriting an external halt reason.
-        code.write_u32(inst::ldaxr_w(XSCRATCH0, XHALT))?;
-        code.write_u32(inst::cbnz_w(XSCRATCH0, 20))?;
-        code.write_u32(inst::movz_w(XSCRATCH0, HaltReason::STEP.bits() as u16, 0))?;
-        code.write_u32(inst::stlxr_w(XSCRATCH1, XSCRATCH0, XHALT))?;
-        code.write_u32(inst::cbnz_w(XSCRATCH1, -16))?;
+        code.ldaxr(WReg::new(XSCRATCH0), rhazel::XRegSp::new(XHALT))?;
+        code.cbnz_offset(WReg::new(XSCRATCH0), 20)?;
+        code.movz(WReg::new(XSCRATCH0), HaltReason::STEP.bits() as u16, 0)?;
+        code.stlxr(
+            WReg::new(XSCRATCH1),
+            WReg::new(XSCRATCH0),
+            rhazel::XRegSp::new(XHALT),
+        )?;
+        code.cbnz_offset(WReg::new(XSCRATCH1), -16)?;
     }
 
     if !step {
         let cbnz_offset = 8;
-        code.write_u32(inst::ldar_w(XSCRATCH0, XHALT))?;
-        code.write_u32(inst::cbnz_w(XSCRATCH0, cbnz_offset))?;
+        code.ldar(WReg::new(XSCRATCH0), rhazel::XRegSp::new(XHALT))?;
+        code.cbnz_offset(WReg::new(XSCRATCH0), cbnz_offset)?;
     }
-    code.write_u32(inst::br(X19))?;
+    code.br(XReg::new(X19))?;
 
     let return_from_run_code_offset = code.code_size();
-    code.write_u32(inst::nop())?;
+    code.nop()?;
     if let Some(ticks) = ticks {
-        code.write_u32(inst::ldr_x_unsigned_sp(
-            X1,
+        code.ldr(
+            XReg::new(X1),
+            rhazel::SP,
             StackLayout::cycles_to_run_offset() as u32,
-        ))?;
-        code.write_u32(inst::sub_x_reg(X1, X1, XTICKS))?;
+        )?;
+        code.sub(XReg::new(X1), XReg::new(X1), XReg::new(XTICKS))?;
         emit_mov_x_imm(code, X0, ticks.this_ptr as usize as u64)?;
         emit_mov_x_imm(code, XSCRATCH0, ticks.add_ticks_fn_ptr as usize as u64)?;
-        code.write_u32(inst::blr(XSCRATCH0))?;
+        code.blr(XReg::new(XSCRATCH0))?;
     }
     emit_restore_host_fpcr(code)?;
-    code.write_u32(inst::ldaxr_w(X0, XHALT))?;
-    code.write_u32(inst::stlxr_w(XSCRATCH0, WZR, XHALT))?;
-    code.write_u32(inst::cbnz_w(XSCRATCH0, -8))?;
+    code.ldaxr(WReg::new(X0), rhazel::XRegSp::new(XHALT))?;
+    code.stlxr(
+        WReg::new(XSCRATCH0),
+        WReg::new(WZR),
+        rhazel::XRegSp::new(XHALT),
+    )?;
+    code.cbnz_offset(WReg::new(XSCRATCH0), -8)?;
     abi::emit_pop_registers(code, saved_registers, core::mem::size_of::<StackLayout>())?;
-    code.write_u32(inst::ret_lr())?;
+    code.ret()?;
     Ok(RunLikeEntryInfo {
         return_from_run_code_offset,
         rsb_literal_load_offset,
     })
 }
 
-fn emit_a32_rsb_init(code: &mut BlockOfCode) -> Result<usize, String> {
-    let load_offset = code.write_u32(inst::nop())?;
+fn emit_a32_rsb_init(code: &mut CodeGenerator<'_>) -> Result<usize, String> {
+    let load_offset = {
+        let offset = code.code_size();
+        code.nop()?;
+        offset
+    };
     for i in 0..RSB_COUNT {
         let code_ptr_offset =
             StackLayout::rsb_entry_offset(i) + core::mem::offset_of!(RSBEntry, code_ptr);
-        code.write_u32(inst::str_x_unsigned_sp(XSCRATCH0, code_ptr_offset as u32))?;
+        code.str(XReg::new(XSCRATCH0), rhazel::SP, code_ptr_offset as u32)?;
     }
     Ok(load_offset)
 }
 
 fn emit_and_patch_rsb_return_to_dispatcher_literal(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     return_to_dispatcher_offset: usize,
     load_offsets: &[Option<usize>],
 ) -> Result<(), String> {
@@ -693,66 +702,67 @@ fn emit_and_patch_rsb_return_to_dispatcher_literal(
     }
 
     code.align(8)?;
-    let literal_offset = code.write_u64(unsafe {
-        code.code_base_ptr().add(return_to_dispatcher_offset) as usize as u64
-    })?;
+    let literal_value =
+        unsafe { code.code_base_ptr().add(return_to_dispatcher_offset) as usize as u64 };
+    let literal_offset = code.write_u64(literal_value)?;
     for &load_offset in load_offsets.iter().flatten() {
         let pc_offset = i32::try_from(literal_offset as isize - load_offset as isize)
             .map_err(|_| "ARM64 RSB return_to_dispatcher literal offset overflow".to_string())?;
-        code.patch_u32(load_offset, inst::ldr_x_lit(XSCRATCH0, pc_offset))?;
+        CodeGenerator::patch_at(code, load_offset, false)
+            .ldr_literal(XReg::new(XSCRATCH0), pc_offset)?;
     }
 
     Ok(())
 }
 
-fn emit_guest_fpcr_setup(code: &mut BlockOfCode, isa: PreludeIsa) -> Result<(), String> {
+fn emit_guest_fpcr_setup(code: &mut CodeGenerator<'_>, isa: PreludeIsa) -> Result<(), String> {
     match isa {
         PreludeIsa::A32 => {
-            code.write_u32(inst::ldr_w_unsigned(
-                XSCRATCH0,
-                XSTATE,
+            code.ldr(
+                WReg::new(XSCRATCH0),
+                rhazel::XRegSp::new(XSTATE),
                 core::mem::offset_of!(A32JitState, upper_location_descriptor) as u32,
-            ))?;
-            code.write_u32(inst::and_w_imm(XSCRATCH0, XSCRATCH0, 0xffff_0000))?;
-            code.write_u32(inst::mrs_fpcr(XSCRATCH1))?;
-            code.write_u32(inst::str_w_unsigned(
-                XSCRATCH1,
-                31,
+            )?;
+            code.and_imm(WReg::new(XSCRATCH0), WReg::new(XSCRATCH0), 0xffff_0000)?;
+            code.mrs(XReg::new(XSCRATCH1), SystemReg::FPCR)?;
+            code.str(
+                WReg::new(XSCRATCH1),
+                rhazel::XRegSp::new(31),
                 StackLayout::save_host_fpcr_offset() as u32,
-            ))?;
-            code.write_u32(inst::msr_fpcr(XSCRATCH0))?;
+            )?;
+            code.msr(SystemReg::FPCR, XReg::new(XSCRATCH0))?;
             Ok(())
         }
         PreludeIsa::A64 => {
-            code.write_u32(inst::mrs_fpcr(XSCRATCH1))?;
-            code.write_u32(inst::str_w_unsigned(
-                XSCRATCH1,
-                31,
+            code.mrs(XReg::new(XSCRATCH1), SystemReg::FPCR)?;
+            code.str(
+                WReg::new(XSCRATCH1),
+                rhazel::XRegSp::new(31),
                 StackLayout::save_host_fpcr_offset() as u32,
-            ))?;
-            code.write_u32(inst::ldr_w_unsigned(
-                XSCRATCH0,
-                XSTATE,
+            )?;
+            code.ldr(
+                WReg::new(XSCRATCH0),
+                rhazel::XRegSp::new(XSTATE),
                 core::mem::offset_of!(A64JitState, fpcr) as u32,
-            ))?;
-            code.write_u32(inst::msr_fpcr(XSCRATCH0))?;
+            )?;
+            code.msr(SystemReg::FPCR, XReg::new(XSCRATCH0))?;
             Ok(())
         }
     }
 }
 
-fn emit_restore_host_fpcr(code: &mut BlockOfCode) -> Result<(), String> {
-    code.write_u32(inst::ldr_w_unsigned(
-        XSCRATCH0,
-        31,
+fn emit_restore_host_fpcr(code: &mut CodeGenerator<'_>) -> Result<(), String> {
+    code.ldr(
+        WReg::new(XSCRATCH0),
+        rhazel::XRegSp::new(31),
         StackLayout::save_host_fpcr_offset() as u32,
-    ))?;
-    code.write_u32(inst::msr_fpcr(XSCRATCH0))?;
+    )?;
+    code.msr(SystemReg::FPCR, XReg::new(XSCRATCH0))?;
     Ok(())
 }
 
 fn emit_call_get_ticks_remaining(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ticks: TickCallbacks,
 ) -> Result<(), String> {
     emit_mov_x_imm(code, X0, ticks.this_ptr as usize as u64)?;
@@ -761,16 +771,16 @@ fn emit_call_get_ticks_remaining(
         XSCRATCH0,
         ticks.get_ticks_remaining_fn_ptr as usize as u64,
     )?;
-    code.write_u32(inst::blr(XSCRATCH0))?;
-    code.write_u32(inst::mov_x(XTICKS, X0))?;
+    code.blr(XReg::new(XSCRATCH0))?;
+    code.mov(XReg::new(XTICKS), XReg::new(X0))?;
     Ok(())
 }
 
-fn emit_mov_x_imm(code: &mut BlockOfCode, rd: u8, imm: u64) -> Result<(), String> {
-    code.write_u32(inst::movz_x(rd, imm as u16, 0))?;
-    code.write_u32(inst::movk_x(rd, (imm >> 16) as u16, 16))?;
-    code.write_u32(inst::movk_x(rd, (imm >> 32) as u16, 32))?;
-    code.write_u32(inst::movk_x(rd, (imm >> 48) as u16, 48))?;
+fn emit_mov_x_imm(code: &mut CodeGenerator<'_>, rd: u8, imm: u64) -> Result<(), String> {
+    code.movz(XReg::new(rd), imm as u16, 0)?;
+    code.movk(XReg::new(rd), (imm >> 16) as u16, 16)?;
+    code.movk(XReg::new(rd), (imm >> 32) as u16, 32)?;
+    code.movk(XReg::new(rd), (imm >> 48) as u16, 48)?;
     Ok(())
 }
 
@@ -799,7 +809,7 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     fn write_branch_to_return_from_run_code(
-        block: &mut BlockOfCode,
+        block: &mut CodeGenerator<'_>,
         return_from_run_code: *const u8,
     ) {
         let source = unsafe { block.code_base_ptr().add(block.code_size()) };
@@ -821,7 +831,8 @@ mod tests {
 
     #[test]
     fn emits_distinct_run_and_step_entries() {
-        let mut code = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code_storage = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let prelude = emit_bootstrap_prelude(&mut code).expect("prelude");
         assert_ne!(prelude.run_code as usize, prelude.step_code as usize);
         assert_eq!(prelude.return_from_run_code_offset, 92);
@@ -840,7 +851,8 @@ mod tests {
 
     #[test]
     fn a32_run_entry_saves_guest_fpcr_and_restores_host_fpcr() {
-        let mut code = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code_storage = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let prelude = emit_bootstrap_prelude(&mut code).expect("prelude");
         let upper_location_descriptor =
             core::mem::offset_of!(A32JitState, upper_location_descriptor) as u32;
@@ -893,7 +905,8 @@ mod tests {
 
     #[test]
     fn a32_rsb_option_seeds_entries_with_return_to_dispatcher_literal() {
-        let mut code = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code_storage = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let prelude = emit_bootstrap_prelude_with_options(
             &mut code,
             PreludeOptions {
@@ -938,7 +951,8 @@ mod tests {
 
     #[test]
     fn a32_run_entries_load_page_table_and_fastmem_before_rsb_setup() {
-        let mut code = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code_storage = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let page_table = 0x1111_2222_3333_4444;
         let fastmem = 0x5555_6666_7777_8888;
         let prelude = emit_bootstrap_prelude_with_options(
@@ -993,7 +1007,8 @@ mod tests {
 
     #[test]
     fn a64_run_entry_loads_fpcr_from_a64_state() {
-        let mut code = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code_storage = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let prelude = emit_bootstrap_prelude_with_options(
             &mut code,
             PreludeOptions {
@@ -1047,7 +1062,8 @@ mod tests {
 
     #[test]
     fn call_trampoline_matches_upstream_literal_shape() {
-        let mut code = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code_storage = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let this_ptr = 0x1111_2222usize as *const c_void;
         let fn_ptr = 0x3333_4444usize as *const c_void;
         let trampoline = emit_call_trampoline(&mut code, this_ptr, fn_ptr).unwrap();
@@ -1064,7 +1080,8 @@ mod tests {
 
     #[test]
     fn wrapped_call_trampoline_keeps_literals_after_executable_body() {
-        let mut code = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code_storage = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let this_ptr = 0x1111_2222usize as *const c_void;
         let fn_ptr = 0x3333_4444usize as *const c_void;
         let trampoline = emit_wrapped_read_call_trampoline(&mut code, this_ptr, fn_ptr).unwrap();
@@ -1087,7 +1104,8 @@ mod tests {
 
     #[test]
     fn read128_trampoline_packs_pair_return_into_q0_before_ret() {
-        let mut code = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code_storage = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let this_ptr = 0x1111_2222usize as *const c_void;
         let fn_ptr = 0x3333_4444usize as *const c_void;
         let trampoline = emit_read128_call_trampoline(&mut code, this_ptr, fn_ptr).unwrap();
@@ -1123,7 +1141,8 @@ mod tests {
             this_ptr as usize
         }
 
-        let mut code = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code_storage = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let this_ptr = 0x1234_5678usize as *const c_void;
         let trampoline = emit_call_trampoline(
             &mut code,
@@ -1140,10 +1159,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn run_code_calls_entry_and_clears_halt_reason() {
-        let mut prelude_code = BlockOfCode::with_size(4096).expect("prelude cache");
+        let mut prelude_code_storage = BlockOfCode::with_size(4096).expect("prelude cache");
+        let mut prelude_code = rhazel::CodeGenerator::new(&mut prelude_code_storage);
         let prelude = emit_bootstrap_prelude(&mut prelude_code).unwrap();
 
-        let mut block = BlockOfCode::with_size(4096).expect("block cache");
+        let mut block_storage = BlockOfCode::with_size(4096).expect("block cache");
+        let mut block = rhazel::CodeGenerator::new(&mut block_storage);
         block.write_u32(inst::movz_w(0, 0x77, 0)).unwrap();
         write_branch_to_return_from_run_code(&mut block, prelude.return_from_run_code);
         block.seal();
@@ -1164,12 +1185,14 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn run_code_returns_existing_halt_without_calling_entry() {
-        let mut block = BlockOfCode::with_size(4096).expect("block cache");
+        let mut block_storage = BlockOfCode::with_size(4096).expect("block cache");
+        let mut block = rhazel::CodeGenerator::new(&mut block_storage);
         block.write_u32(inst::movz_w(0, 0x77, 0)).unwrap();
         block.write_u32(inst::ret_lr()).unwrap();
         block.seal();
 
-        let mut prelude_code = BlockOfCode::with_size(4096).expect("prelude cache");
+        let mut prelude_code_storage = BlockOfCode::with_size(4096).expect("prelude cache");
+        let mut prelude_code = rhazel::CodeGenerator::new(&mut prelude_code_storage);
         let prelude = emit_bootstrap_prelude(&mut prelude_code).unwrap();
 
         let mut state = A32JitState::new();
@@ -1188,10 +1211,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn step_code_returns_step_halt_reason() {
-        let mut prelude_code = BlockOfCode::with_size(4096).expect("prelude cache");
+        let mut prelude_code_storage = BlockOfCode::with_size(4096).expect("prelude cache");
+        let mut prelude_code = rhazel::CodeGenerator::new(&mut prelude_code_storage);
         let prelude = emit_bootstrap_prelude(&mut prelude_code).unwrap();
 
-        let mut block = BlockOfCode::with_size(4096).expect("block cache");
+        let mut block_storage = BlockOfCode::with_size(4096).expect("block cache");
+        let mut block = rhazel::CodeGenerator::new(&mut block_storage);
         block.write_u32(inst::movz_w(3, 0x77, 0)).unwrap();
         block
             .write_u32(inst::str_w_unsigned(
@@ -1220,12 +1245,14 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn step_code_returns_existing_halt_without_overwriting_it() {
-        let mut block = BlockOfCode::with_size(4096).expect("block cache");
+        let mut block_storage = BlockOfCode::with_size(4096).expect("block cache");
+        let mut block = rhazel::CodeGenerator::new(&mut block_storage);
         block.write_u32(inst::movz_w(0, 0x77, 0)).unwrap();
         block.write_u32(inst::ret_lr()).unwrap();
         block.seal();
 
-        let mut prelude_code = BlockOfCode::with_size(4096).expect("prelude cache");
+        let mut prelude_code_storage = BlockOfCode::with_size(4096).expect("prelude cache");
+        let mut prelude_code = rhazel::CodeGenerator::new(&mut prelude_code_storage);
         let prelude = emit_bootstrap_prelude(&mut prelude_code).unwrap();
 
         let mut state = A32JitState::new();

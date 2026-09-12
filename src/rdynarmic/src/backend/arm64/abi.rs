@@ -4,8 +4,9 @@
 //! matter to rdynarmic's generated code: X0-X7 are integer arguments, X19-X28
 //! are callee-saved, FP/LR are X29/X30, and SP must be 16-byte aligned.
 
+#[cfg(test)]
 use super::block_of_code::BlockOfCode;
-use super::inst;
+use rhazel::{CodeGenerator, QReg, XReg, SP};
 
 pub type RegisterList = u64;
 
@@ -96,34 +97,30 @@ pub fn calculate_frame_info(registers: RegisterList, frame_size: usize) -> Frame
 }
 
 pub fn emit_push_registers(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     registers: RegisterList,
     frame_size: usize,
 ) -> Result<(), String> {
     let frame_info = calculate_frame_info(registers, frame_size);
 
-    code.write_u32(inst::sub_sp_imm(
-        (frame_info.gprs_size + frame_info.fprs_size) as u32,
-    ))?;
+    code.sub_imm(SP, SP, (frame_info.gprs_size + frame_info.fprs_size) as u32)?;
     emit_store_gprs(code, &frame_info.gprs, 0)?;
     emit_store_fprs(code, &frame_info.fprs, frame_info.gprs_size)?;
-    code.write_u32(inst::sub_sp_imm(frame_info.frame_size as u32))?;
+    code.sub_imm(SP, SP, frame_info.frame_size as u32)?;
     Ok(())
 }
 
 pub fn emit_pop_registers(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     registers: RegisterList,
     frame_size: usize,
 ) -> Result<(), String> {
     let frame_info = calculate_frame_info(registers, frame_size);
 
-    code.write_u32(inst::add_sp_imm(frame_info.frame_size as u32))?;
+    code.add_imm(SP, SP, frame_info.frame_size as u32)?;
     emit_load_gprs(code, &frame_info.gprs, 0)?;
     emit_load_fprs(code, &frame_info.fprs, frame_info.gprs_size)?;
-    code.write_u32(inst::add_sp_imm(
-        (frame_info.gprs_size + frame_info.fprs_size) as u32,
-    ))?;
+    code.add_imm(SP, SP, (frame_info.gprs_size + frame_info.fprs_size) as u32)?;
     Ok(())
 }
 
@@ -134,56 +131,77 @@ fn list_to_indexes(list: u32) -> Vec<u8> {
         .collect()
 }
 
-fn emit_store_gprs(code: &mut BlockOfCode, gprs: &[u8], offset: usize) -> Result<(), String> {
+fn emit_store_gprs(code: &mut CodeGenerator<'_>, gprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in gprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 16;
-        code.write_u32(inst::stp_x_offset_sp(pair[0], pair[1], pair_offset as i32))?;
+        code.stp(
+            XReg::new(pair[0]),
+            XReg::new(pair[1]),
+            SP,
+            pair_offset as i32,
+        )?;
     }
     if let Some(&reg) = gprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (gprs.len() - 1) * 8;
-        code.write_u32(inst::str_x_unsigned_sp(reg, reg_offset as u32))?;
+        code.str(XReg::new(reg), SP, reg_offset as u32)?;
     }
     Ok(())
 }
 
-fn emit_load_gprs(code: &mut BlockOfCode, gprs: &[u8], offset: usize) -> Result<(), String> {
+fn emit_load_gprs(code: &mut CodeGenerator<'_>, gprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in gprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 16;
-        code.write_u32(inst::ldp_x_offset_sp(pair[0], pair[1], pair_offset as i32))?;
+        code.ldp(
+            XReg::new(pair[0]),
+            XReg::new(pair[1]),
+            SP,
+            pair_offset as i32,
+        )?;
     }
     if let Some(&reg) = gprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (gprs.len() - 1) * 8;
-        code.write_u32(inst::ldr_x_unsigned_sp(reg, reg_offset as u32))?;
+        code.ldr(XReg::new(reg), SP, reg_offset as u32)?;
     }
     Ok(())
 }
 
-fn emit_store_fprs(code: &mut BlockOfCode, fprs: &[u8], offset: usize) -> Result<(), String> {
+fn emit_store_fprs(code: &mut CodeGenerator<'_>, fprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in fprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 32;
-        code.write_u32(inst::stp_q_offset_sp(pair[0], pair[1], pair_offset as i32))?;
+        code.stp_q(
+            QReg::new(pair[0]),
+            QReg::new(pair[1]),
+            SP,
+            pair_offset as i32,
+        )?;
     }
     if let Some(&reg) = fprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (fprs.len() - 1) * 16;
-        code.write_u32(inst::str_q_unsigned_sp(reg, reg_offset as u32))?;
+        code.str(QReg::new(reg), SP, reg_offset as u32)?;
     }
     Ok(())
 }
 
-fn emit_load_fprs(code: &mut BlockOfCode, fprs: &[u8], offset: usize) -> Result<(), String> {
+fn emit_load_fprs(code: &mut CodeGenerator<'_>, fprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in fprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 32;
-        code.write_u32(inst::ldp_q_offset_sp(pair[0], pair[1], pair_offset as i32))?;
+        code.ldp_q(
+            QReg::new(pair[0]),
+            QReg::new(pair[1]),
+            SP,
+            pair_offset as i32,
+        )?;
     }
     if let Some(&reg) = fprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (fprs.len() - 1) * 16;
-        code.write_u32(inst::ldr_q_unsigned_sp(reg, reg_offset as u32))?;
+        code.ldr(QReg::new(reg), SP, reg_offset as u32)?;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::inst;
     use super::*;
 
     #[test]
@@ -231,8 +249,38 @@ mod tests {
     }
 
     #[test]
+    fn push_pop_odd_register_lists_keep_single_transfer_offsets() {
+        let registers = to_reg_list_gpr(19) | to_reg_list_vec(8);
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
+        emit_push_registers(&mut code, registers, 32).unwrap();
+        emit_pop_registers(&mut code, registers, 32).unwrap();
+        let expected = [
+            inst::sub_sp_imm(32),
+            inst::str_x_unsigned_sp(19, 0),
+            inst::str_q_unsigned_sp(8, 16),
+            inst::sub_sp_imm(32),
+            inst::add_sp_imm(32),
+            inst::ldr_x_unsigned_sp(19, 0),
+            inst::ldr_q_unsigned_sp(8, 16),
+            inst::add_sp_imm(32),
+        ];
+        assert_eq!(code.code_size(), expected.len() * 4);
+        for (index, expected) in expected.into_iter().enumerate() {
+            let actual = unsafe {
+                code.code_base_ptr()
+                    .add(index * 4)
+                    .cast::<u32>()
+                    .read_unaligned()
+            };
+            assert_eq!(actual, expected, "instruction {index}");
+        }
+    }
+
+    #[test]
     fn push_pop_registers_emit_upstream_order() {
-        let mut code = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code_storage = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         emit_push_registers(&mut code, ABI_CALLEE_SAVE, 1184).unwrap();
         emit_pop_registers(&mut code, ABI_CALLEE_SAVE, 1184).unwrap();
 
@@ -252,4 +300,26 @@ mod tests {
         assert_eq!(read(22), inst::ldp_q_offset_sp(14, 15, 192));
         assert_eq!(read(23), inst::add_sp_imm(224));
     }
+}
+
+/// The ABI registers as typed `rhazel` operands — upstream's `Xstate`,
+/// `Xscratch0`, `Wscratch0`, … — for emitters on `rhazel::CodeGenerator`.
+/// The `u8` constants above serve the encoders directly and go away once
+/// every emitter has moved.
+pub mod regs {
+    use rhazel::{WReg, XReg};
+
+    pub const XSTATE: XReg = XReg::new(super::XSTATE);
+    pub const XHALT: XReg = XReg::new(super::XHALT);
+    pub const XTICKS: XReg = XReg::new(super::XTICKS);
+    pub const XFASTMEM: XReg = XReg::new(super::XFASTMEM);
+    pub const XPAGETABLE: XReg = XReg::new(super::XPAGETABLE);
+    pub const XSCRATCH0: XReg = XReg::new(super::XSCRATCH0);
+    pub const XSCRATCH1: XReg = XReg::new(super::XSCRATCH1);
+    pub const XSCRATCH2: XReg = XReg::new(super::XSCRATCH2);
+    pub const WSCRATCH0: WReg = WReg::new(super::XSCRATCH0);
+    pub const WSCRATCH1: WReg = WReg::new(super::XSCRATCH1);
+    pub const WSCRATCH2: WReg = WReg::new(super::XSCRATCH2);
+    pub const FP: XReg = XReg::new(super::FP);
+    pub const LR: XReg = XReg::new(super::LR);
 }

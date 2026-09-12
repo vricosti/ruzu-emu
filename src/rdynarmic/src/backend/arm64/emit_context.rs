@@ -45,7 +45,14 @@ pub struct EmitContext<'a> {
     pub emitted_block_info: &'a mut EmittedBlockInfo,
     pub fpsr: &'a mut FpsrManager,
     pub fastmem: &'a mut FastmemManager<'a>,
-    pub deferred_emits: Vec<Box<dyn FnMut() -> Result<(), String> + 'a>>,
+    // Upstream captures the generator/context by reference. Passing them when
+    // draining keeps the same ordering without retaining aliased raw pointers.
+    pub deferred_emits: Vec<
+        Box<
+            dyn FnMut(&mut rhazel::CodeGenerator<'_>, &mut EmitContext<'a>) -> Result<(), String>
+                + 'a,
+        >,
+    >,
 }
 
 impl EmitContext<'_> {

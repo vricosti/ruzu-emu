@@ -2,18 +2,20 @@
 //!
 //! Upstream owner: `backend/arm64/emit_arm64_cryptography.cpp`.
 
-use crate::backend::arm64::block_of_code::BlockOfCode;
+use rhazel::{CodeGenerator, WReg};
+
 use crate::backend::arm64::emit_context::EmitContext;
-use crate::backend::arm64::inst;
-use crate::backend::arm64::reg_alloc::RegAlloc;
+use crate::backend::arm64::reg_alloc::{RAReg, RegAlloc};
 use crate::ir::value::InstRef;
 
+/// Upstream `EmitCRC<bitsize>`: `emit` receives the realized W output and
+/// input plus the data register, read as W or X per `data_is_64_bit`.
 fn emit_crc(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
     data_is_64_bit: bool,
-    emit: fn(u8, u8, u8) -> u32,
+    emit: fn(&mut CodeGenerator<'_>, WReg, WReg, &RAReg) -> Result<(), String>,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut output = ctx.reg_alloc.write_w(inst_ref);
@@ -25,148 +27,162 @@ fn emit_crc(
     };
     RegAlloc::realize_all(code, ctx.block, &mut [&mut output, &mut input, &mut data])?;
 
-    code.write_u32(emit(
-        output.index().expect("CRC output realized") as u8,
-        input.index().expect("CRC input realized") as u8,
-        data.index().expect("CRC data realized") as u8,
-    ))?;
-    Ok(())
+    emit(code, output.w(), input.w(), &data)
 }
 
 pub fn emit_crc32_castagnoli_8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_crc(code, ctx, inst_ref, false, inst::crc32cb_w)
+    emit_crc(code, ctx, inst_ref, false, |code, output, input, data| {
+        code.crc32cb(output, input, data.w())
+    })
 }
 
 pub fn emit_crc32_castagnoli_16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_crc(code, ctx, inst_ref, false, inst::crc32ch_w)
+    emit_crc(code, ctx, inst_ref, false, |code, output, input, data| {
+        code.crc32ch(output, input, data.w())
+    })
 }
 
 pub fn emit_crc32_castagnoli_32(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_crc(code, ctx, inst_ref, false, inst::crc32cw_w)
+    emit_crc(code, ctx, inst_ref, false, |code, output, input, data| {
+        code.crc32cw(output, input, data.w())
+    })
 }
 
 pub fn emit_crc32_castagnoli_64(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_crc(code, ctx, inst_ref, true, inst::crc32cx_x)
+    emit_crc(code, ctx, inst_ref, true, |code, output, input, data| {
+        code.crc32cx(output, input, data.x())
+    })
 }
 
 pub fn emit_crc32_iso_8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_crc(code, ctx, inst_ref, false, inst::crc32b_w)
+    emit_crc(code, ctx, inst_ref, false, |code, output, input, data| {
+        code.crc32b(output, input, data.w())
+    })
 }
 
 pub fn emit_crc32_iso_16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_crc(code, ctx, inst_ref, false, inst::crc32h_w)
+    emit_crc(code, ctx, inst_ref, false, |code, output, input, data| {
+        code.crc32h(output, input, data.w())
+    })
 }
 
 pub fn emit_crc32_iso_32(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_crc(code, ctx, inst_ref, false, inst::crc32w_w)
+    emit_crc(code, ctx, inst_ref, false, |code, output, input, data| {
+        code.crc32w(output, input, data.w())
+    })
 }
 
 pub fn emit_crc32_iso_64(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_crc(code, ctx, inst_ref, true, inst::crc32x_x)
+    emit_crc(code, ctx, inst_ref, true, |code, output, input, data| {
+        code.crc32x(output, input, data.x())
+    })
 }
 
+/// Upstream `EmitAES` with `MOVI Doutput, #0` before the round: the round
+/// operates on `Voutput.16B` in place, so the destination is zeroed first.
 fn emit_aes_single_round(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
-    emit: fn(u8, u8) -> u32,
+    emit: fn(&mut CodeGenerator<'_>, &RAReg, &RAReg) -> Result<(), String>,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut output = ctx.reg_alloc.write_q(inst_ref);
     let mut input = ctx.reg_alloc.read_q(args[0]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut output, &mut input])?;
 
-    let output = output.index().expect("AES output realized") as u8;
-    let input = input.index().expect("AES input realized") as u8;
-    code.write_u32(inst::movi_d_imm0(output))?;
-    code.write_u32(emit(output, input))?;
-    Ok(())
+    code.movi_zero(output.d())?;
+    emit(code, &output, &input)
 }
 
 fn emit_aes_mix(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
-    emit: fn(u8, u8) -> u32,
+    emit: fn(&mut CodeGenerator<'_>, &RAReg, &RAReg) -> Result<(), String>,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut output = ctx.reg_alloc.write_q(inst_ref);
     let mut input = ctx.reg_alloc.read_q(args[0]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut output, &mut input])?;
 
-    code.write_u32(emit(
-        output.index().expect("AES output realized") as u8,
-        input.index().expect("AES input realized") as u8,
-    ))?;
-    Ok(())
+    emit(code, &output, &input)
 }
 
 pub fn emit_aes_decrypt_single_round(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_aes_single_round(code, ctx, inst_ref, inst::aesd_v16b)
+    emit_aes_single_round(code, ctx, inst_ref, |code, output, input| {
+        code.aesd(output.v().b16(), input.v().b16())
+    })
 }
 
 pub fn emit_aes_encrypt_single_round(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_aes_single_round(code, ctx, inst_ref, inst::aese_v16b)
+    emit_aes_single_round(code, ctx, inst_ref, |code, output, input| {
+        code.aese(output.v().b16(), input.v().b16())
+    })
 }
 
 pub fn emit_aes_inverse_mix_columns(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_aes_mix(code, ctx, inst_ref, inst::aesimc_v16b)
+    emit_aes_mix(code, ctx, inst_ref, |code, output, input| {
+        code.aesimc(output.v().b16(), input.v().b16())
+    })
 }
 
 pub fn emit_aes_mix_columns(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_aes_mix(code, ctx, inst_ref, inst::aesmc_v16b)
+    emit_aes_mix(code, ctx, inst_ref, |code, output, input| {
+        code.aesmc(output.v().b16(), input.v().b16())
+    })
 }
 
 pub fn emit_sha256_hash(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -178,27 +194,18 @@ pub fn emit_sha256_hash(
         let mut y = ctx.reg_alloc.read_q(args[1]);
         let mut w = ctx.reg_alloc.read_q(args[2]);
         RegAlloc::realize_all(code, ctx.block, &mut [&mut x, &mut y, &mut w])?;
-        code.write_u32(inst::sha256h_q(
-            x.index().expect("SHA256 x realized") as u8,
-            y.index().expect("SHA256 y realized") as u8,
-            w.index().expect("SHA256 w realized") as u8,
-        ))?;
+        code.sha256h(x.q(), y.q(), w.v().s4())
     } else {
         let mut x = ctx.reg_alloc.read_q(args[0]);
         let mut y = ctx.reg_alloc.read_write_q(args[1], inst_ref);
         let mut w = ctx.reg_alloc.read_q(args[2]);
         RegAlloc::realize_all(code, ctx.block, &mut [&mut x, &mut y, &mut w])?;
-        code.write_u32(inst::sha256h2_q(
-            y.index().expect("SHA256 y realized") as u8,
-            x.index().expect("SHA256 x realized") as u8,
-            w.index().expect("SHA256 w realized") as u8,
-        ))?;
+        code.sha256h2(y.q(), x.q(), w.v().s4())
     }
-    Ok(())
 }
 
 pub fn emit_sha256_message_schedule_0(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -206,15 +213,11 @@ pub fn emit_sha256_message_schedule_0(
     let mut a = ctx.reg_alloc.read_write_q(args[0], inst_ref);
     let mut b = ctx.reg_alloc.read_q(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut a, &mut b])?;
-    code.write_u32(inst::sha256su0_v4s(
-        a.index().expect("SHA256 a realized") as u8,
-        b.index().expect("SHA256 b realized") as u8,
-    ))?;
-    Ok(())
+    code.sha256su0(a.v().s4(), b.v().s4())
 }
 
 pub fn emit_sha256_message_schedule_1(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -223,10 +226,5 @@ pub fn emit_sha256_message_schedule_1(
     let mut b = ctx.reg_alloc.read_q(args[1]);
     let mut c = ctx.reg_alloc.read_q(args[2]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut a, &mut b, &mut c])?;
-    code.write_u32(inst::sha256su1_v4s(
-        a.index().expect("SHA256 a realized") as u8,
-        b.index().expect("SHA256 b realized") as u8,
-        c.index().expect("SHA256 c realized") as u8,
-    ))?;
-    Ok(())
+    code.sha256su1(a.v().s4(), b.v().s4(), c.v().s4())
 }

@@ -3,7 +3,7 @@
 //! This mirrors the cache ownership layer in upstream
 //! `backend/arm64/address_space.h/.cpp`: it owns executable memory, prelude
 //! entry points, block-entry maps, reverse lookup maps, and invalidation state.
-//! Actual ARM64 IR emission/link patching is added in later backend slices.
+//! IR emission and link patching use typed generators over the owned code memory.
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::c_void;
@@ -19,6 +19,7 @@ use super::emit_arm64::{
     LinkTarget,
 };
 use super::fast_hash::{arm64_code_cache_profile_enabled, FastHashMap, FastHashSet};
+#[cfg(test)]
 use super::inst;
 use super::prelude::{self, DispatcherCallback, PreludeInfo};
 
@@ -98,7 +99,7 @@ impl AddressSpace {
             return Err("ARM64 prelude already emitted".to_string());
         }
         self.prelude_info = Some(prelude::emit_bootstrap_prelude_with_options(
-            &mut self.code,
+            &mut rhazel::CodeGenerator::new(&mut self.code),
             options,
         )?);
         Ok(())
@@ -129,7 +130,11 @@ impl AddressSpace {
 
         self.code.unprotect();
         let location = block.location;
-        let block_info = emit_arm64(&mut self.code, block, config)?;
+        let block_info = emit_arm64(
+            &mut rhazel::CodeGenerator::new(&mut self.code),
+            block,
+            config,
+        )?;
         let relinked_ranges = self.record_emitted_block(location, block_info.clone())?;
         let block_offset = (block_info.entry_point as usize)
             .checked_sub(self.code.code_base_ptr() as usize)
@@ -278,7 +283,11 @@ impl AddressSpace {
         this_ptr: *const c_void,
         fn_ptr: *const c_void,
     ) -> Result<CodePtr, String> {
-        let target = prelude::emit_call_trampoline(&mut self.code, this_ptr, fn_ptr)?;
+        let target = prelude::emit_call_trampoline(
+            &mut rhazel::CodeGenerator::new(&mut self.code),
+            this_ptr,
+            fn_ptr,
+        )?;
         self.finish_prelude_trampoline(target)
     }
 
@@ -287,7 +296,11 @@ impl AddressSpace {
         this_ptr: *const c_void,
         fn_ptr: *const c_void,
     ) -> Result<CodePtr, String> {
-        let target = prelude::emit_wrapped_read_call_trampoline(&mut self.code, this_ptr, fn_ptr)?;
+        let target = prelude::emit_wrapped_read_call_trampoline(
+            &mut rhazel::CodeGenerator::new(&mut self.code),
+            this_ptr,
+            fn_ptr,
+        )?;
         self.finish_prelude_trampoline(target)
     }
 
@@ -296,7 +309,11 @@ impl AddressSpace {
         this_ptr: *const c_void,
         fn_ptr: *const c_void,
     ) -> Result<CodePtr, String> {
-        let target = prelude::emit_wrapped_write_call_trampoline(&mut self.code, this_ptr, fn_ptr)?;
+        let target = prelude::emit_wrapped_write_call_trampoline(
+            &mut rhazel::CodeGenerator::new(&mut self.code),
+            this_ptr,
+            fn_ptr,
+        )?;
         self.finish_prelude_trampoline(target)
     }
 
@@ -305,7 +322,11 @@ impl AddressSpace {
         this_ptr: *const c_void,
         fn_ptr: *const c_void,
     ) -> Result<CodePtr, String> {
-        let target = prelude::emit_read128_call_trampoline(&mut self.code, this_ptr, fn_ptr)?;
+        let target = prelude::emit_read128_call_trampoline(
+            &mut rhazel::CodeGenerator::new(&mut self.code),
+            this_ptr,
+            fn_ptr,
+        )?;
         self.finish_prelude_trampoline(target)
     }
 
@@ -314,8 +335,11 @@ impl AddressSpace {
         this_ptr: *const c_void,
         fn_ptr: *const c_void,
     ) -> Result<CodePtr, String> {
-        let target =
-            prelude::emit_wrapped_read128_call_trampoline(&mut self.code, this_ptr, fn_ptr)?;
+        let target = prelude::emit_wrapped_read128_call_trampoline(
+            &mut rhazel::CodeGenerator::new(&mut self.code),
+            this_ptr,
+            fn_ptr,
+        )?;
         self.finish_prelude_trampoline(target)
     }
 
@@ -324,7 +348,11 @@ impl AddressSpace {
         this_ptr: *const c_void,
         fn_ptr: *const c_void,
     ) -> Result<CodePtr, String> {
-        let target = prelude::emit_write128_call_trampoline(&mut self.code, this_ptr, fn_ptr)?;
+        let target = prelude::emit_write128_call_trampoline(
+            &mut rhazel::CodeGenerator::new(&mut self.code),
+            this_ptr,
+            fn_ptr,
+        )?;
         self.finish_prelude_trampoline(target)
     }
 
@@ -333,8 +361,11 @@ impl AddressSpace {
         this_ptr: *const c_void,
         fn_ptr: *const c_void,
     ) -> Result<CodePtr, String> {
-        let target =
-            prelude::emit_wrapped_write128_call_trampoline(&mut self.code, this_ptr, fn_ptr)?;
+        let target = prelude::emit_wrapped_write128_call_trampoline(
+            &mut rhazel::CodeGenerator::new(&mut self.code),
+            this_ptr,
+            fn_ptr,
+        )?;
         self.finish_prelude_trampoline(target)
     }
 
@@ -440,8 +471,12 @@ impl AddressSpace {
         for relocation in &block_info.relocations {
             let source = relocation_source(block_info.entry_point, relocation.code_offset)?;
             let target = self.resolve_link_target(relocation.target)?;
-            let instruction = branch_instruction(source, target, relocation.target.is_bl_target())?;
-            self.patch_instruction(source, instruction)?;
+            let mut code = self.patch_generator(source)?;
+            if relocation.target.is_bl_target() {
+                code.bl_to(target)?;
+            } else {
+                code.b_to(target)?;
+            }
         }
 
         for (target_descriptor, list) in &block_info.block_relocations {
@@ -567,12 +602,12 @@ impl AddressSpace {
             let source = relocation_source(entry_point, relocation.code_offset)?;
             match relocation.relocation_type {
                 BlockRelocationType::Branch => {
-                    let instruction = if let Some(target) = target_ptr {
-                        branch_instruction(source, target, false)?
+                    let mut code = self.patch_generator(source)?;
+                    if let Some(target) = target_ptr {
+                        code.b_to(target)?;
                     } else {
-                        inst::nop()
-                    };
-                    self.patch_instruction(source, instruction)?;
+                        code.nop()?;
+                    }
                 }
                 BlockRelocationType::MoveToScratch1 => {
                     let target = target_ptr.unwrap_or(
@@ -581,16 +616,15 @@ impl AddressSpace {
                             .ok_or_else(|| "ARM64 prelude has not been emitted".to_string())?
                             .return_to_dispatcher,
                     );
-                    let instructions = adrl_instructions(source, target, XSCRATCH1)?;
-                    self.patch_instruction(source, instructions[0])?;
-                    self.patch_instruction(unsafe { source.add(4) }, instructions[1])?;
+                    self.patch_generator(source)?
+                        .adrl(rhazel::XReg::new(XSCRATCH1), target)?;
                 }
             }
         }
         Ok(())
     }
 
-    fn patch_instruction(&mut self, source: CodePtr, instruction: u32) -> Result<(), String> {
+    fn patch_generator(&mut self, source: CodePtr) -> Result<rhazel::CodeGenerator<'_>, String> {
         let base = self.code.code_base_ptr() as usize;
         let source = source as usize;
         if source < base {
@@ -599,7 +633,11 @@ impl AddressSpace {
             ));
         }
         let offset = source - base;
-        self.code.patch_u32_deferred_icache(offset, instruction)
+        Ok(rhazel::CodeGenerator::patch_at(
+            &mut self.code,
+            offset,
+            true,
+        ))
     }
 
     fn relink_for_descriptor(
@@ -722,17 +760,7 @@ fn relocation_source(entry_point: CodePtr, code_offset: isize) -> Result<CodePtr
     Ok(unsafe { entry_point.add(code_offset as usize) })
 }
 
-fn branch_instruction(source: CodePtr, target: CodePtr, link: bool) -> Result<u32, String> {
-    let offset = (target as isize)
-        .checked_sub(source as isize)
-        .ok_or_else(|| "ARM64 branch offset overflow".to_string())?;
-    Ok(if link {
-        inst::bl_imm(offset)
-    } else {
-        inst::b_imm(offset)
-    })
-}
-
+#[cfg(test)]
 fn adrl_instructions(source: CodePtr, target: CodePtr, rd: u8) -> Result<[u32; 2], String> {
     let source_page = (source as usize) & !0xfff;
     let target_page = (target as usize) & !0xfff;

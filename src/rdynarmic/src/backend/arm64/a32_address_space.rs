@@ -1346,7 +1346,8 @@ mod tests {
         let prelude = address_space.address_space().prelude_info();
         assert_eq!(bootstrap_end, 352);
         assert!(prelude.end_of_prelude > bootstrap_end);
-        assert_eq!(prelude.end_of_prelude, 800);
+        // Thirteen normal callbacks: 3 instructions, alignment, 2 u64 literals.
+        assert_eq!(prelude.end_of_prelude, bootstrap_end + 13 * 32);
         assert!(prelude.read_memory_8.is_some());
         assert!(prelude.write_memory_64.is_some());
         assert!(prelude.call_svc.is_some());

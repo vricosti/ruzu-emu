@@ -5,7 +5,7 @@
 //! are callee-saved, FP/LR are X29/X30, and SP must be 16-byte aligned.
 
 use super::block_of_code::BlockOfCode;
-use super::inst;
+use rhazel::{CodeGenerator, QReg, XReg, SP};
 
 pub type RegisterList = u64;
 
@@ -101,13 +101,12 @@ pub fn emit_push_registers(
     frame_size: usize,
 ) -> Result<(), String> {
     let frame_info = calculate_frame_info(registers, frame_size);
+    let code = &mut CodeGenerator::new(code);
 
-    code.write_u32(inst::sub_sp_imm(
-        (frame_info.gprs_size + frame_info.fprs_size) as u32,
-    ))?;
+    code.sub_imm(SP, SP, (frame_info.gprs_size + frame_info.fprs_size) as u32)?;
     emit_store_gprs(code, &frame_info.gprs, 0)?;
     emit_store_fprs(code, &frame_info.fprs, frame_info.gprs_size)?;
-    code.write_u32(inst::sub_sp_imm(frame_info.frame_size as u32))?;
+    code.sub_imm(SP, SP, frame_info.frame_size as u32)?;
     Ok(())
 }
 
@@ -117,13 +116,12 @@ pub fn emit_pop_registers(
     frame_size: usize,
 ) -> Result<(), String> {
     let frame_info = calculate_frame_info(registers, frame_size);
+    let code = &mut CodeGenerator::new(code);
 
-    code.write_u32(inst::add_sp_imm(frame_info.frame_size as u32))?;
+    code.add_imm(SP, SP, frame_info.frame_size as u32)?;
     emit_load_gprs(code, &frame_info.gprs, 0)?;
     emit_load_fprs(code, &frame_info.fprs, frame_info.gprs_size)?;
-    code.write_u32(inst::add_sp_imm(
-        (frame_info.gprs_size + frame_info.fprs_size) as u32,
-    ))?;
+    code.add_imm(SP, SP, (frame_info.gprs_size + frame_info.fprs_size) as u32)?;
     Ok(())
 }
 
@@ -134,50 +132,50 @@ fn list_to_indexes(list: u32) -> Vec<u8> {
         .collect()
 }
 
-fn emit_store_gprs(code: &mut BlockOfCode, gprs: &[u8], offset: usize) -> Result<(), String> {
+fn emit_store_gprs(code: &mut CodeGenerator<'_>, gprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in gprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 16;
-        code.write_u32(inst::stp_x_offset_sp(pair[0], pair[1], pair_offset as i32))?;
+        code.stp(XReg::new(pair[0]), XReg::new(pair[1]), SP, pair_offset as i32)?;
     }
     if let Some(&reg) = gprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (gprs.len() - 1) * 8;
-        code.write_u32(inst::str_x_unsigned_sp(reg, reg_offset as u32))?;
+        code.str(XReg::new(reg), SP, reg_offset as u32)?;
     }
     Ok(())
 }
 
-fn emit_load_gprs(code: &mut BlockOfCode, gprs: &[u8], offset: usize) -> Result<(), String> {
+fn emit_load_gprs(code: &mut CodeGenerator<'_>, gprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in gprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 16;
-        code.write_u32(inst::ldp_x_offset_sp(pair[0], pair[1], pair_offset as i32))?;
+        code.ldp(XReg::new(pair[0]), XReg::new(pair[1]), SP, pair_offset as i32)?;
     }
     if let Some(&reg) = gprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (gprs.len() - 1) * 8;
-        code.write_u32(inst::ldr_x_unsigned_sp(reg, reg_offset as u32))?;
+        code.ldr(XReg::new(reg), SP, reg_offset as u32)?;
     }
     Ok(())
 }
 
-fn emit_store_fprs(code: &mut BlockOfCode, fprs: &[u8], offset: usize) -> Result<(), String> {
+fn emit_store_fprs(code: &mut CodeGenerator<'_>, fprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in fprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 32;
-        code.write_u32(inst::stp_q_offset_sp(pair[0], pair[1], pair_offset as i32))?;
+        code.stp_q(QReg::new(pair[0]), QReg::new(pair[1]), SP, pair_offset as i32)?;
     }
     if let Some(&reg) = fprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (fprs.len() - 1) * 16;
-        code.write_u32(inst::str_q_unsigned_sp(reg, reg_offset as u32))?;
+        code.str(QReg::new(reg), SP, reg_offset as u32)?;
     }
     Ok(())
 }
 
-fn emit_load_fprs(code: &mut BlockOfCode, fprs: &[u8], offset: usize) -> Result<(), String> {
+fn emit_load_fprs(code: &mut CodeGenerator<'_>, fprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in fprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 32;
-        code.write_u32(inst::ldp_q_offset_sp(pair[0], pair[1], pair_offset as i32))?;
+        code.ldp_q(QReg::new(pair[0]), QReg::new(pair[1]), SP, pair_offset as i32)?;
     }
     if let Some(&reg) = fprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (fprs.len() - 1) * 16;
-        code.write_u32(inst::ldr_q_unsigned_sp(reg, reg_offset as u32))?;
+        code.ldr(QReg::new(reg), SP, reg_offset as u32)?;
     }
     Ok(())
 }
@@ -185,6 +183,7 @@ fn emit_load_fprs(code: &mut BlockOfCode, fprs: &[u8], offset: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::inst;
 
     #[test]
     fn arm64_abi_register_sets_match_aapcs64() {
@@ -228,6 +227,29 @@ mod tests {
         assert_eq!(frame.gprs_size, 96);
         assert_eq!(frame.fprs_size, 128);
         assert_eq!(frame.frame_size, 1184);
+    }
+
+    #[test]
+    fn push_pop_odd_register_lists_keep_single_transfer_offsets() {
+        let registers = to_reg_list_gpr(19) | to_reg_list_vec(8);
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        emit_push_registers(&mut code, registers, 32).unwrap();
+        emit_pop_registers(&mut code, registers, 32).unwrap();
+        let expected = [
+            inst::sub_sp_imm(32),
+            inst::str_x_unsigned_sp(19, 0),
+            inst::str_q_unsigned_sp(8, 16),
+            inst::sub_sp_imm(32),
+            inst::add_sp_imm(32),
+            inst::ldr_x_unsigned_sp(19, 0),
+            inst::ldr_q_unsigned_sp(8, 16),
+            inst::add_sp_imm(32),
+        ];
+        assert_eq!(code.code_size(), expected.len() * 4);
+        for (index, expected) in expected.into_iter().enumerate() {
+            let actual = unsafe { code.code_base_ptr().add(index * 4).cast::<u32>().read_unaligned() };
+            assert_eq!(actual, expected, "instruction {index}");
+        }
     }
 
     #[test]

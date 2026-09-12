@@ -1,5 +1,63 @@
 # Upstream parity notes
 
+## 2026-09-12 - src/rdynarmic/src/backend/arm64/abi.rs vs dynarmic/backend/arm64/abi.h and abi.cpp
+
+### Intentional differences
+- ABI register save/restore now emits through rhazel CodeGenerator, with typed
+  X/Q registers and SP. FrameInfo, constants, register ordering and the two-step
+  stack adjustment remain owned by abi.rs and match the C++ implementation.
+- Private load/store helpers represent the upstream DO_IT macro mechanically;
+  their signatures now take CodeGenerator. Public functions temporarily keep
+  BlockOfCode and wrap it until the remaining backend consumers are migrated.
+- Q-register pair overloads use the Rust suffix `_q`. Paired and odd register
+  lists are checked for instruction order and stack offsets.
+- Release validation: 971 rdynarmic library tests plus three binary/integration
+  tests pass. The optional Eden C++ oracle is absent; differential comparisons
+  requiring it were not performed. No game smoke test has been performed yet.
+
+### Missing items
+- Remaining backend emitter signatures and raw encoder consumers are tracked in
+  RHAZEL_CODEGEN_STATE.md; this is not a claim of complete migration.
+
+## 2026-09-12 - rhazel Q-register pair transfers vs Oaknut mnemonics_fpsimd_v8.0.inc.hpp
+
+### Intentional differences
+- `externals/rhazel/src/code_generator.rs` names the Q-register overloads
+  `ldp_q`/`stp_q` to distinguish them from its existing generic GP methods.
+  `inst.rs` owns the encodings; existing SP-only helpers delegate to the same
+  encoders. Base register, signed imm7 scaled by 16, operand order and absence
+  of writeback match Oaknut's offset overloads. Clang independently verified
+  SP and X7 bases, the -1024/+1008 limits and Q31 operands.
+
+## 2026-09-12 - rhazel narrowing operands vs Oaknut mnemonics_fpsimd_v8.0.inc.hpp
+
+### Intentional differences
+- `externals/rhazel/src/code_generator.rs` and `src/reg.rs` express Oaknut's
+  SXTL/UXTL/XTN/SHRN overload pairs through associated-type traits. The three
+  supported source/destination arrangements remain exactly those of Oaknut.
+- `externals/rhazel/src/inst.rs::shrn_v` retains the raw encoder below the typed
+  interface. Its immediate is now source width minus shift, matching all three
+  Oaknut SHRN overloads, instead of twice the source width minus shift.
+- Verification: all six boundary encodings were compared with Clang's AArch64
+  assembler independently of rhazel. 22 rhazel unit tests and two compile-fail
+  operand-pair doctests pass in release.
+
+### Missing items
+- The broader typed emitter migration remains in progress; this entry verifies
+  narrowing/widening operands, not the full assembler catalogue.
+
+## 2026-09-12 - ARM64 core test fixtures vs dynarmic/backend/arm64/a32_address_space.cpp and a64_address_space.cpp
+
+### Intentional differences
+- `src/rdynarmic/src/backend/arm64/a32_core.rs` and `a64_core.rs` synthesize a
+  minimal test block. It now branches to `return_from_run_code` rather than
+  executing RET directly: upstream enters guest blocks with BR and restores the
+  stack, callee-save registers and host FPCR in the return prelude. No production
+  core execution logic changed.
+- `a32_address_space.rs` checks the normal-only test helper's thirteen
+  trampolines (32 bytes each), rather than a stale fourteen-trampoline size.
+  The full callback installation test remains separate.
+
 ## 2026-09-12 — AArch64 assembler moved to externals/rhazel vs dynarmic/backend/arm64 + merry::oaknut
 
 ### Intentional differences

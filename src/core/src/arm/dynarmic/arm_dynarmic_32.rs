@@ -4,6 +4,7 @@
 //! Port of zuyu/src/core/arm/dynarmic/arm_dynarmic_32.h and arm_dynarmic_32.cpp
 //! ARM32 dynarmic backend.
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +34,11 @@ const _: () = assert!(
     1usize << PAGE_TABLE_LOG2_STRIDE == std::mem::size_of::<PageEntryData>(),
     "PageEntryData must be 8 bytes"
 );
+
+/// Upstream `Dynarmic::CODE_PAGE_SIZE` / `YUZU_PAGESIZE`.
+const CODE_PAGE_SIZE: u64 = 4096;
+const CODE_PAGE_MASK: u64 = CODE_PAGE_SIZE - 1;
+const CODE_PAGE_WORDS: usize = (CODE_PAGE_SIZE as usize) / std::mem::size_of::<u32>();
 
 static A32_TRACE_AFTER_WATCH_ARMED: AtomicBool = AtomicBool::new(false);
 
@@ -1941,6 +1947,11 @@ struct DynarmicCallbacks32 {
     /// Set after jit creation via `set_pc_ptr()`.
     /// Not in upstream, but needed since we don't have debugger.
     jit_pc_ptr: Option<*const u32>,
+    /// Upstream `Dynarmic::CodePage cached_code_page`.
+    cached_code_page: UnsafeCell<[u32; CODE_PAGE_WORDS]>,
+    /// Upstream `u64 last_code_addr`. Shared with `ArmDynarmic32` so
+    /// `ClearInstructionCache` can force a refetch.
+    last_code_addr: Arc<AtomicU64>,
 }
 
 // Safety: The raw pointers (parent, process, jit_pc_ptr) all point to
@@ -1956,6 +1967,7 @@ impl DynarmicCallbacks32 {
         debugger_enabled: bool,
         watchpoints: SharedWatchpointArray,
         halted_watchpoint: Arc<Mutex<Option<DebugWatchpoint>>>,
+        last_code_addr: Arc<AtomicU64>,
     ) -> Self {
         log::info!(
             "DynarmicCallbacks32: core_memory={}",
@@ -1978,7 +1990,27 @@ impl DynarmicCallbacks32 {
             watchpoints,
             halted_watchpoint,
             jit_pc_ptr: None,
+            cached_code_page: UnsafeCell::new([0; CODE_PAGE_WORDS]),
+            last_code_addr,
         }
+    }
+
+    fn cached_code_word(&self, vaddr: u64, fill_page: impl FnOnce(&mut [u8])) -> u32 {
+        let aligned = vaddr & !CODE_PAGE_MASK;
+        if self.last_code_addr.load(Ordering::Relaxed) != aligned {
+            let page = unsafe { &mut *self.cached_code_page.get() };
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    page.as_mut_ptr().cast::<u8>(),
+                    CODE_PAGE_SIZE as usize,
+                )
+            };
+            bytes.fill(0);
+            fill_page(bytes);
+            self.last_code_addr.store(aligned, Ordering::Relaxed);
+        }
+        let page = unsafe { &*self.cached_code_page.get() };
+        page[((vaddr & CODE_PAGE_MASK) as usize) / std::mem::size_of::<u32>()]
     }
 
     /// Get a reference to the parent ArmDynarmic32.
@@ -2076,22 +2108,24 @@ impl A32UserCallbacks for DynarmicCallbacks32 {
     fn memory_read_code(&self, vaddr: u32) -> Option<u32> {
         let vaddr = vaddr as u64;
         // Upstream returns nullopt when instruction fetch targets an invalid
-        // virtual range. Do not use fastmem here: an invalid guest PC must end
-        // translation, not turn into a host SIGSEGV while reading code bytes.
+        // virtual range, then caches a 4 KiB code page keyed by last_code_addr.
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
-            if m.is_valid_virtual_address_range(vaddr, 4) {
-                Some(m.read_32(vaddr))
-            } else {
-                None
+            if !m.is_valid_virtual_address_range(vaddr, 4) {
+                return None;
             }
+            Some(self.cached_code_word(vaddr, |bytes| {
+                m.read_block(vaddr & !CODE_PAGE_MASK, bytes);
+            }))
         } else {
             let mem = self.memory.read().unwrap();
-            if mem.is_valid_range(vaddr, 4) {
-                Some(mem.read_32(vaddr))
-            } else {
-                None
+            if !mem.is_valid_range(vaddr, 4) {
+                return None;
             }
+            Some(self.cached_code_word(vaddr, |bytes| {
+                let filled = mem.read_bytes(vaddr & !CODE_PAGE_MASK, bytes.len());
+                bytes.copy_from_slice(&filled);
+            }))
         }
     }
 
@@ -2331,6 +2365,10 @@ impl A32UserCallbacks for DynarmicCallbacks32 {
     fn set_pc_ptr(&mut self, ptr: *const u32) {
         self.jit_pc_ptr = Some(ptr);
     }
+
+    fn instruction_synchronization_barrier_raised(&mut self) {
+        self.last_code_addr.store(u64::MAX, Ordering::Relaxed);
+    }
 }
 
 /// ARM32 Dynarmic JIT backend.
@@ -2379,6 +2417,9 @@ pub struct ArmDynarmic32 {
     /// Cached fastmem pointer for bounded instruction tracing.
     /// Temporary diagnostic state, not an upstream field.
     trace_fastmem_ptr: *const u8,
+
+    /// Shared with `DynarmicCallbacks32::last_code_addr`.
+    last_code_addr: Arc<AtomicU64>,
 }
 
 impl ArmDynarmic32 {
@@ -2460,14 +2501,15 @@ impl ArmDynarmic32 {
                 .and_then(|memory| memory.try_lock().ok()?.device_memory_backing_base())
         })
         .filter(|backing_base| {
-                let intended_memory_size =
-                    crate::hle::kernel::board::k_system_control::init::get_intended_memory_size();
-                (*backing_base as u64) + (intended_memory_size as u64) < (1u64 << 39)
+            let intended_memory_size =
+                crate::hle::kernel::board::k_system_control::init::get_intended_memory_size();
+            (*backing_base as u64) + (intended_memory_size as u64) < (1u64 << 39)
         })
         .map(|_| PageTable::SIGN_BIT as u8);
 
         let svc_swi = Arc::new(AtomicU32::new(0));
         let last_exception_address = Arc::new(AtomicU64::new(0));
+        let last_code_addr = Arc::new(AtomicU64::new(u64::MAX));
         let parent_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let base = ArmInterfaceBase::new(uses_wall_clock);
         let halted_watchpoint = Arc::new(Mutex::new(None));
@@ -2479,6 +2521,7 @@ impl ArmDynarmic32 {
             debugger_enabled,
             base.shared_watchpoint_array(),
             Arc::clone(&halted_watchpoint),
+            Arc::clone(&last_code_addr),
         );
         let cp15 = Arc::new(DynarmicCP15::new(parent_ptr.clone()));
 
@@ -2660,6 +2703,7 @@ impl ArmDynarmic32 {
             cp15,
             last_exception_address,
             trace_fastmem_ptr: fastmem_pointer.unwrap_or(std::ptr::null_mut()) as *const u8,
+            last_code_addr,
         };
 
         // NOTE: The parent pointer is NOT set here because `result` will be moved
@@ -2913,6 +2957,7 @@ impl ArmInterface for ArmDynarmic32 {
     }
 
     fn clear_instruction_cache(&mut self) {
+        self.last_code_addr.store(u64::MAX, Ordering::Relaxed);
         if let Some(jit) = self.jit.as_mut() {
             jit.clear_cache();
         }
@@ -3085,6 +3130,7 @@ impl ArmInterface for ArmDynarmic32 {
 mod tests {
     use super::*;
     use crate::hle::kernel::k_process::ProcessMemoryData;
+    use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
     use std::sync::RwLock;
 
     #[test]
@@ -3115,10 +3161,40 @@ mod tests {
             false,
             ArmInterfaceBase::new(false).shared_watchpoint_array(),
             Arc::new(Mutex::new(None)),
+            Arc::new(AtomicU64::new(u64::MAX)),
         );
 
         assert_eq!(callbacks.memory_read_code(0x1000), Some(0x12345678));
         assert_eq!(callbacks.memory_read_code(0), None);
+    }
+
+    #[test]
+    fn memory_read_code_caches_the_page_until_isb() {
+        let mut backing = ProcessMemoryData::new();
+        backing.base = 0x1000;
+        backing.data = vec![0; 8];
+        backing.data[0..4].copy_from_slice(&0x12345678u32.to_le_bytes());
+        backing.data[4..8].copy_from_slice(&0xAABBCCDDu32.to_le_bytes());
+        let memory = Arc::new(RwLock::new(backing));
+        let last_code_addr = Arc::new(AtomicU64::new(u64::MAX));
+        let mut callbacks = DynarmicCallbacks32::new(
+            Arc::clone(&memory),
+            None,
+            std::ptr::null(),
+            Arc::new(AtomicPtr::new(std::ptr::null_mut())),
+            false,
+            ArmInterfaceBase::new(false).shared_watchpoint_array(),
+            Arc::new(Mutex::new(None)),
+            Arc::clone(&last_code_addr),
+        );
+
+        assert_eq!(callbacks.memory_read_code(0x1000), Some(0x12345678));
+        assert_eq!(callbacks.memory_read_code(0x1004), Some(0xAABBCCDD));
+        memory.write().unwrap().data[0..4].copy_from_slice(&0x11111111u32.to_le_bytes());
+        assert_eq!(callbacks.memory_read_code(0x1000), Some(0x12345678));
+        callbacks.instruction_synchronization_barrier_raised();
+        assert_eq!(last_code_addr.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(callbacks.memory_read_code(0x1000), Some(0x11111111));
     }
 
     #[test]
@@ -3150,16 +3226,36 @@ mod tests {
             // ArmDynarmic32::MakeJit's Debugging branch clears each flag
             // independently from the default safe optimization set.
             for (index, (setting, flag)) in [
-                (&mut settings.cpuopt_block_linking, OptimizationFlag::BLOCK_LINKING),
-                (&mut settings.cpuopt_return_stack_buffer, OptimizationFlag::RETURN_STACK_BUFFER),
-                (&mut settings.cpuopt_fast_dispatcher, OptimizationFlag::FAST_DISPATCH),
-                (&mut settings.cpuopt_context_elimination, OptimizationFlag::GET_SET_ELIMINATION),
-                (&mut settings.cpuopt_const_prop, OptimizationFlag::CONST_PROP),
+                (
+                    &mut settings.cpuopt_block_linking,
+                    OptimizationFlag::BLOCK_LINKING,
+                ),
+                (
+                    &mut settings.cpuopt_return_stack_buffer,
+                    OptimizationFlag::RETURN_STACK_BUFFER,
+                ),
+                (
+                    &mut settings.cpuopt_fast_dispatcher,
+                    OptimizationFlag::FAST_DISPATCH,
+                ),
+                (
+                    &mut settings.cpuopt_context_elimination,
+                    OptimizationFlag::GET_SET_ELIMINATION,
+                ),
+                (
+                    &mut settings.cpuopt_const_prop,
+                    OptimizationFlag::CONST_PROP,
+                ),
                 (&mut settings.cpuopt_misc_ir, OptimizationFlag::MISC_IR_OPT),
-            ].into_iter().enumerate() {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let enabled = mask & (1 << index) != 0;
                 setting.set_value(enabled);
-                if enabled { expected |= flag; }
+                if enabled {
+                    expected |= flag;
+                }
             }
             let (actual, unsafe_enabled) = upstream_optimization_config_from_settings(&settings);
             assert_eq!(actual, expected, "safe settings mask {mask:#x}");
@@ -3180,27 +3276,58 @@ mod tests {
             settings.cpu_debug_mode.set_value(false);
             let mut expected = safe;
             for (index, (setting, flag)) in [
-                (&mut settings.cpuopt_unsafe_unfuse_fma, OptimizationFlag::UNSAFE_UNFUSE_FMA),
-                (&mut settings.cpuopt_unsafe_reduce_fp_error, OptimizationFlag::UNSAFE_REDUCED_ERROR_FP),
-                (&mut settings.cpuopt_unsafe_ignore_standard_fpcr, OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE),
-                (&mut settings.cpuopt_unsafe_inaccurate_nan, OptimizationFlag::UNSAFE_INACCURATE_NAN),
-                (&mut settings.cpuopt_unsafe_ignore_global_monitor, OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR),
-            ].into_iter().enumerate() {
+                (
+                    &mut settings.cpuopt_unsafe_unfuse_fma,
+                    OptimizationFlag::UNSAFE_UNFUSE_FMA,
+                ),
+                (
+                    &mut settings.cpuopt_unsafe_reduce_fp_error,
+                    OptimizationFlag::UNSAFE_REDUCED_ERROR_FP,
+                ),
+                (
+                    &mut settings.cpuopt_unsafe_ignore_standard_fpcr,
+                    OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE,
+                ),
+                (
+                    &mut settings.cpuopt_unsafe_inaccurate_nan,
+                    OptimizationFlag::UNSAFE_INACCURATE_NAN,
+                ),
+                (
+                    &mut settings.cpuopt_unsafe_ignore_global_monitor,
+                    OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let enabled = mask & (1 << index) != 0;
                 setting.set_value(enabled);
-                if enabled { expected |= flag; }
+                if enabled {
+                    expected |= flag;
+                }
             }
             for (accuracy, expected_flags, expected_unsafe) in [
                 (CpuAccuracy::Unsafe, expected, true),
                 (CpuAccuracy::Accurate, safe, false),
-                (CpuAccuracy::Auto, safe | OptimizationFlag::UNSAFE_UNFUSE_FMA
-                    | OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE
-                    | OptimizationFlag::UNSAFE_INACCURATE_NAN, true),
-                (CpuAccuracy::Paranoid, OptimizationFlag::NO_OPTIMIZATIONS, false),
+                (
+                    CpuAccuracy::Auto,
+                    safe | OptimizationFlag::UNSAFE_UNFUSE_FMA
+                        | OptimizationFlag::UNSAFE_IGNORE_STANDARD_FPCR_VALUE
+                        | OptimizationFlag::UNSAFE_INACCURATE_NAN,
+                    true,
+                ),
+                (
+                    CpuAccuracy::Paranoid,
+                    OptimizationFlag::NO_OPTIMIZATIONS,
+                    false,
+                ),
             ] {
                 settings.cpu_accuracy.set_value(accuracy);
-                assert_eq!(upstream_optimization_config_from_settings(&settings),
-                    (expected_flags, expected_unsafe), "{accuracy:?}, settings mask {mask:#x}");
+                assert_eq!(
+                    upstream_optimization_config_from_settings(&settings),
+                    (expected_flags, expected_unsafe),
+                    "{accuracy:?}, settings mask {mask:#x}"
+                );
             }
         }
     }

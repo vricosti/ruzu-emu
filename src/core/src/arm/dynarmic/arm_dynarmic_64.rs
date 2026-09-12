@@ -4,6 +4,7 @@
 //! Port of zuyu/src/core/arm/dynarmic/arm_dynarmic_64.h and arm_dynarmic_64.cpp
 //! ARM64 dynarmic backend.
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -35,6 +36,11 @@ const _: () = assert!(
     1usize << PAGE_TABLE_LOG2_STRIDE == std::mem::size_of::<PageEntryData>(),
     "PageEntryData must be 8 bytes"
 );
+
+/// Upstream `Dynarmic::CODE_PAGE_SIZE` / `YUZU_PAGESIZE`.
+const CODE_PAGE_SIZE: u64 = 4096;
+const CODE_PAGE_MASK: u64 = CODE_PAGE_SIZE - 1;
+const CODE_PAGE_WORDS: usize = (CODE_PAGE_SIZE as usize) / std::mem::size_of::<u32>();
 
 /// Host-backend-specific access to the active A64 JIT state.
 ///
@@ -814,6 +820,10 @@ struct DynarmicCallbacks64 {
     jit_pc_ptr: Option<*const u64>,
     /// Stable TPIDR_EL0 backing pointer used by generated code and snapshots.
     tpidr_el0_ptr: Option<*const u64>,
+    /// Upstream `Dynarmic::CodePage cached_code_page`.
+    cached_code_page: UnsafeCell<[u32; CODE_PAGE_WORDS]>,
+    /// Upstream `u64 last_code_addr`.
+    last_code_addr: Arc<AtomicU64>,
 }
 
 // Safety: the installed JIT state pointers remain valid for the callback/JIT lifetime.
@@ -834,6 +844,7 @@ impl DynarmicCallbacks64 {
         watchpoints: SharedWatchpointArray,
         halted_watchpoint: Arc<Mutex<Option<DebugWatchpoint>>>,
         tpidr_el0_ptr: Option<*const u64>,
+        last_code_addr: Arc<AtomicU64>,
     ) -> Self {
         Self {
             memory,
@@ -854,7 +865,27 @@ impl DynarmicCallbacks64 {
             halt_reason_ptr: None,
             jit_pc_ptr: None,
             tpidr_el0_ptr,
+            cached_code_page: UnsafeCell::new([0; CODE_PAGE_WORDS]),
+            last_code_addr,
         }
+    }
+
+    fn cached_code_word(&self, vaddr: u64, fill_page: impl FnOnce(&mut [u8])) -> u32 {
+        let aligned = vaddr & !CODE_PAGE_MASK;
+        if self.last_code_addr.load(Ordering::Relaxed) != aligned {
+            let page = unsafe { &mut *self.cached_code_page.get() };
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    page.as_mut_ptr().cast::<u8>(),
+                    CODE_PAGE_SIZE as usize,
+                )
+            };
+            bytes.fill(0);
+            fill_page(bytes);
+            self.last_code_addr.store(aligned, Ordering::Relaxed);
+        }
+        let page = unsafe { &*self.cached_code_page.get() };
+        page[((vaddr & CODE_PAGE_MASK) as usize) / std::mem::size_of::<u32>()]
     }
 
     /// Rust equivalent of upstream `m_parent.m_jit->HaltExecution(hr)`.
@@ -1003,21 +1034,25 @@ impl A64UserCallbacks for DynarmicCallbacks64 {
                 );
             }
         }
-        // Upstream: returns std::nullopt if IsValidVirtualAddressRange fails.
+        // Upstream: returns std::nullopt if IsValidVirtualAddressRange fails,
+        // then caches a 4 KiB code page keyed by last_code_addr.
         if let Some(ref cm) = self.core_memory {
             let m = cm.lock().unwrap();
-            if m.is_valid_virtual_address_range(vaddr, 4) {
-                Some(m.read_32(vaddr))
-            } else {
-                None
+            if !m.is_valid_virtual_address_range(vaddr, 4) {
+                return None;
             }
+            Some(self.cached_code_word(vaddr, |bytes| {
+                m.read_block(vaddr & !CODE_PAGE_MASK, bytes);
+            }))
         } else {
             let mem = self.memory.read().unwrap();
-            if mem.is_valid_range(vaddr, 4) {
-                Some(mem.read_32(vaddr))
-            } else {
-                None
+            if !mem.is_valid_range(vaddr, 4) {
+                return None;
             }
+            Some(self.cached_code_word(vaddr, |bytes| {
+                let filled = mem.read_bytes(vaddr & !CODE_PAGE_MASK, bytes.len());
+                bytes.copy_from_slice(&filled);
+            }))
         }
     }
 
@@ -2087,20 +2122,22 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
     }
 
     fn instruction_cache_operation_raised(&mut self, op: InstructionCacheOperation, vaddr: u64) {
+        self.last_code_addr.store(u64::MAX, Ordering::Relaxed);
         match op {
             InstructionCacheOperation::InvalidateByVaToPoU => {
-                log::trace!(
-                    "IC IVAU @ {:#x} (no-op, cache invalidation handled at JIT level)",
-                    vaddr
-                );
+                log::trace!("IC IVAU @ {vaddr:#x}");
             }
             InstructionCacheOperation::InvalidateAllToPoU => {
-                log::trace!("IC IALLU (no-op, cache invalidation handled at JIT level)");
+                log::trace!("IC IALLU");
             }
             InstructionCacheOperation::InvalidateAllToPoUInnerSharable => {
                 log::debug!("Unprocessed instruction cache operation: {op:?}");
             }
         }
+    }
+
+    fn instruction_synchronization_barrier_raised(&mut self) {
+        self.last_code_addr.store(u64::MAX, Ordering::Relaxed);
     }
 
     fn call_svc(&mut self, svc_num: u32) {
@@ -2228,6 +2265,9 @@ pub struct ArmDynarmic64 {
 
     /// Last exception address reported by dynarmic for the current halt.
     last_exception_address: Arc<AtomicU64>,
+
+    /// Shared with `DynarmicCallbacks64::last_code_addr`.
+    last_code_addr: Arc<AtomicU64>,
 }
 
 impl ArmDynarmic64 {
@@ -2308,9 +2348,9 @@ impl ArmDynarmic64 {
                 .and_then(|memory| memory.try_lock().ok()?.device_memory_backing_base())
         })
         .filter(|backing_base| {
-                let intended_memory_size =
-                    crate::hle::kernel::board::k_system_control::init::get_intended_memory_size();
-                (*backing_base as u64) + (intended_memory_size as u64) < (1u64 << 39)
+            let intended_memory_size =
+                crate::hle::kernel::board::k_system_control::init::get_intended_memory_size();
+            (*backing_base as u64) + (intended_memory_size as u64) < (1u64 << 39)
         })
         .map(|_| PageTable::SIGN_BIT as u8);
 
@@ -2325,6 +2365,7 @@ impl ArmDynarmic64 {
         let breakpoint_context = Arc::new(Mutex::new(ThreadContext::default()));
         let base = ArmInterfaceBase::new(uses_wall_clock);
         let halted_watchpoint = Arc::new(Mutex::new(None));
+        let last_code_addr = Arc::new(AtomicU64::new(u64::MAX));
         let callbacks = DynarmicCallbacks64::new(
             shared_memory,
             core_memory,
@@ -2338,6 +2379,7 @@ impl ArmDynarmic64 {
             base.shared_watchpoint_array(),
             Arc::clone(&halted_watchpoint),
             Some(tpidr_el0_ptr),
+            Arc::clone(&last_code_addr),
         );
 
         log::warn!(
@@ -2554,6 +2596,7 @@ impl ArmDynarmic64 {
             tpidrro_el0,
             tpidr_el0,
             last_exception_address,
+            last_code_addr,
         }
     }
 }
@@ -2637,6 +2680,7 @@ impl ArmInterface for ArmDynarmic64 {
     }
 
     fn clear_instruction_cache(&mut self) {
+        self.last_code_addr.store(u64::MAX, Ordering::Relaxed);
         if let Some(jit) = self.jit.as_mut() {
             jit.clear_cache();
         }
@@ -2893,6 +2937,41 @@ mod tests {
     }
 
     #[test]
+    fn memory_read_code_caches_the_page_until_isb() {
+        let mut backing = ProcessMemoryData::new();
+        backing.base = 0x1000;
+        backing.data = vec![0; 8];
+        backing.data[0..4].copy_from_slice(&0x12345678u32.to_le_bytes());
+        backing.data[4..8].copy_from_slice(&0xAABBCCDDu32.to_le_bytes());
+        let memory = Arc::new(RwLock::new(backing));
+        let last_code_addr = Arc::new(AtomicU64::new(u64::MAX));
+        let interface = ArmInterfaceBase::new(false);
+        let mut callbacks = DynarmicCallbacks64::new(
+            Arc::clone(&memory),
+            None,
+            Arc::new(AtomicU32::new(0)),
+            false,
+            Arc::new(CoreTiming::new()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(Mutex::new(Default::default())),
+            0,
+            false,
+            interface.shared_watchpoint_array(),
+            Arc::new(Mutex::new(None)),
+            None,
+            Arc::clone(&last_code_addr),
+        );
+
+        assert_eq!(callbacks.memory_read_code(0x1000), Some(0x12345678));
+        assert_eq!(callbacks.memory_read_code(0x1004), Some(0xAABBCCDD));
+        memory.write().unwrap().data[0..4].copy_from_slice(&0x11111111u32.to_le_bytes());
+        assert_eq!(callbacks.memory_read_code(0x1000), Some(0x12345678));
+        callbacks.instruction_synchronization_barrier_raised();
+        assert_eq!(last_code_addr.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(callbacks.memory_read_code(0x1000), Some(0x11111111));
+    }
+
+    #[test]
     fn parse_watch_ranges_accepts_hex_and_default_size() {
         assert_eq!(
             parse_watch_ranges("0x10,0x20:16"),
@@ -2948,6 +3027,7 @@ mod tests {
             base.shared_watchpoint_array(),
             Arc::clone(&halted_watchpoint),
             None,
+            Arc::new(AtomicU64::new(u64::MAX)),
         );
         let mut config = A64UserConfig::new(Box::new(callbacks));
         config.code_cache_size = 8 * 1024 * 1024;
@@ -2960,6 +3040,7 @@ mod tests {
             tpidrro_el0: Box::new(0x1234),
             tpidr_el0: Box::new(0),
             last_exception_address,
+            last_code_addr: Arc::new(AtomicU64::new(u64::MAX)),
         };
         let input = ThreadContext {
             r: std::array::from_fn(|i| 0xFEDC_BA98_0000_0000 | i as u64),
@@ -3067,22 +3148,50 @@ mod tests {
                     (2, OptimizationFlag::UNSAFE_INACCURATE_NAN),
                     (4, OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR),
                 ] {
-                    if enabled(bit) { unsafe_flags |= flag; }
+                    if enabled(bit) {
+                        unsafe_flags |= flag;
+                    }
                 }
                 for (accuracy, flags, unsafe_optimizations, bits) in [
-                    (CpuAccuracy::Unsafe, unsafe_flags, true,
-                        if enabled(3) { 64 } else { address_bits }),
-                    (CpuAccuracy::Accurate, OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
-                        false, address_bits),
-                    (CpuAccuracy::Auto, OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
-                        | OptimizationFlag::UNSAFE_UNFUSE_FMA, true, 64),
-                    (CpuAccuracy::Paranoid, OptimizationFlag::NO_OPTIMIZATIONS,
-                        false, address_bits),
+                    (
+                        CpuAccuracy::Unsafe,
+                        unsafe_flags,
+                        true,
+                        if enabled(3) { 64 } else { address_bits },
+                    ),
+                    (
+                        CpuAccuracy::Accurate,
+                        OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
+                        false,
+                        address_bits,
+                    ),
+                    (
+                        CpuAccuracy::Auto,
+                        OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+                            | OptimizationFlag::UNSAFE_UNFUSE_FMA,
+                        true,
+                        64,
+                    ),
+                    (
+                        CpuAccuracy::Paranoid,
+                        OptimizationFlag::NO_OPTIMIZATIONS,
+                        false,
+                        address_bits,
+                    ),
                 ] {
-                    assert_eq!(upstream_optimization_config(address_bits, accuracy,
-                        enabled(0), enabled(1), enabled(2), enabled(3), enabled(4)),
+                    assert_eq!(
+                        upstream_optimization_config(
+                            address_bits,
+                            accuracy,
+                            enabled(0),
+                            enabled(1),
+                            enabled(2),
+                            enabled(3),
+                            enabled(4)
+                        ),
                         (flags, unsafe_optimizations, bits),
-                        "{accuracy:?}, settings mask {mask:#x}, address width {address_bits}");
+                        "{accuracy:?}, settings mask {mask:#x}, address width {address_bits}"
+                    );
                 }
             }
         }
@@ -3140,6 +3249,7 @@ mod tests {
             interface.shared_watchpoint_array(),
             Arc::clone(&halted_watchpoint),
             None,
+            Arc::new(AtomicU64::new(u64::MAX)),
         );
         let halt_reason = AtomicU32::new(0);
         callbacks.set_halt_reason_ptr(halt_reason.as_ptr());

@@ -54,7 +54,7 @@ pub struct ContentRecord {
     pub nca_id: [u8; 0x10],
     pub size: [u8; 0x6],
     pub record_type: ContentRecordType,
-    pub _padding: u8,
+    pub id_offset: u8,
 }
 
 const _: () = assert!(std::mem::size_of::<ContentRecord>() == 0x38);
@@ -66,7 +66,7 @@ impl Default for ContentRecord {
             nca_id: [0u8; 0x10],
             size: [0u8; 0x6],
             record_type: ContentRecordType::Meta,
-            _padding: 0,
+            id_offset: 0,
         }
     }
 }
@@ -77,7 +77,7 @@ pub const EMPTY_META_CONTENT_RECORD: ContentRecord = ContentRecord {
     nca_id: [0u8; 0x10],
     size: [0u8; 0x6],
     record_type: ContentRecordType::Meta,
-    _padding: 0,
+    id_offset: 0,
 };
 
 /// Meta record — 0x10 bytes.

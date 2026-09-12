@@ -10,6 +10,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use crate::file_sys::common_funcs::get_base_title_id_with_program_index;
+use crate::file_sys::nca_metadata::ContentRecordType;
+use crate::file_sys::registered_cache::{get_update_title_id, ContentProvider};
 use crate::file_sys::vfs::vfs_types::VirtualFile;
 use crate::hle::service::filesystem::filesystem::FileSystemController;
 
@@ -621,6 +624,60 @@ fn get_file_loader(
     }
 }
 
+struct IndexedProgram {
+    file: VirtualFile,
+    program_id: u64,
+    update_only: bool,
+}
+
+/// Maps to upstream anonymous `ResolveIndexedProgram` in `loader.cpp`.
+fn resolve_indexed_program(
+    system: &System,
+    program_id: u64,
+    program_index: usize,
+) -> Option<IndexedProgram> {
+    if program_index == 0 || program_id == 0 {
+        return None;
+    }
+
+    let target_id = get_base_title_id_with_program_index(program_id, program_index as u64);
+    let Some(provider) = system.content_provider.as_ref() else {
+        log::warn!(
+            "No program NCA for {:016X} (index {}), falling back to the container",
+            target_id,
+            program_index
+        );
+        return None;
+    };
+    let provider = provider.lock().unwrap();
+
+    if let Some(base) = provider.get_entry_raw(target_id, ContentRecordType::Program) {
+        log::info!("Program index {program_index} resolved to {target_id:016X}");
+        return Some(IndexedProgram {
+            file: base,
+            program_id: target_id,
+            update_only: false,
+        });
+    }
+
+    let update_id = get_update_title_id(target_id);
+    if let Some(update) = provider.get_entry_raw(update_id, ContentRecordType::Program) {
+        log::info!(
+            "Program index {program_index} has no base program, loading it from update {update_id:016X}"
+        );
+        return Some(IndexedProgram {
+            file: update,
+            program_id: target_id,
+            update_only: true,
+        });
+    }
+
+    log::warn!(
+        "No program NCA for {target_id:016X} (index {program_index}), falling back to the container"
+    );
+    None
+}
+
 /// Identifies a bootable file and returns a suitable loader.
 ///
 /// Maps to upstream `Loader::GetLoader`.
@@ -632,6 +689,17 @@ pub fn get_loader(
 ) -> Option<Box<dyn AppLoader>> {
     // `VirtualFile` is non-nullable in Rust, so upstream's `if (!file)` guard
     // is represented by the type rather than a runtime branch.
+    if let Some(indexed) = resolve_indexed_program(system, program_id, program_index) {
+        return Some(Box::new(super::nca::AppLoaderNca::new_with_update_only(
+            indexed.file,
+            if indexed.update_only {
+                indexed.program_id
+            } else {
+                0
+            },
+        )));
+    }
+
     let mut file_type = identify_file(&file);
     let filename_type = guess_from_filename(&file.get_name());
 
@@ -726,5 +794,13 @@ mod tests {
         assert_eq!(registration.main_region_begin, 0x7100_0000_00);
         assert_eq!(registration.main_region_size, 0x20_0000);
         assert!(system.take_cheat_registration().is_none());
+    }
+
+    #[test]
+    fn resolve_indexed_program_requires_a_nonzero_index_and_program_id() {
+        let system = System::new(None, None);
+        assert!(resolve_indexed_program(&system, 0x0100_0000_0001_0000, 0).is_none());
+        assert!(resolve_indexed_program(&system, 0, 1).is_none());
+        assert!(resolve_indexed_program(&system, 0x0100_0000_0001_0000, 1).is_none());
     }
 }

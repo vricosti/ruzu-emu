@@ -64,6 +64,7 @@ pub struct AppLoaderNca {
     file: VirtualFile,
     is_loaded: bool,
     nca: NCA,
+    update_only_program_id: u64,
     directory_loader: Option<AppLoaderDeconstructedRomDirectory>,
 }
 
@@ -92,12 +93,29 @@ impl AppLoaderNca {
     ///
     /// Maps to upstream `AppLoader_NCA::AppLoader_NCA`.
     pub fn new(file: VirtualFile) -> Self {
-        let nca = NCA::new(file.clone(), None);
+        Self::new_with_update_only(file, 0)
+    }
+
+    /// Create a new NCA loader for an update-only indexed program.
+    ///
+    /// Maps to upstream `AppLoader_NCA(file, update_only_program_id)`.
+    pub fn new_with_update_only(file: VirtualFile, update_only_program_id: u64) -> Self {
+        let nca = NCA::new_with_options(file.clone(), None, update_only_program_id != 0);
         Self {
             file,
             is_loaded: false,
             nca,
+            update_only_program_id,
             directory_loader: None,
+        }
+    }
+
+    /// Maps to upstream `AppLoader_NCA::GetProgramId`.
+    pub fn program_id(&self) -> u64 {
+        if self.update_only_program_id != 0 {
+            self.update_only_program_id
+        } else {
+            self.nca.get_title_id()
         }
     }
 }
@@ -179,7 +197,7 @@ impl AppLoader for AppLoaderNca {
             });
             fsc.lock().unwrap().register_process(
                 process.process_id,
-                self.nca.get_title_id(),
+                self.program_id(),
                 romfs_factory,
             );
         }
@@ -269,7 +287,7 @@ impl AppLoader for AppLoaderNca {
             return ResultStatus::ErrorNotInitialized;
         }
 
-        *out_program_id = self.nca.get_title_id();
+        *out_program_id = self.program_id();
         ResultStatus::Success
     }
 

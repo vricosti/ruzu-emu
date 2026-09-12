@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::card_image::XCI;
+use super::common_funcs::AOC_TITLE_ID_MASK;
 use super::content_archive::{NCAContentType, NCA};
 use super::control_metadata::NACP;
 use super::nca_metadata::{
@@ -1060,12 +1061,42 @@ impl RegisteredCache {
 }
 
 /// Check a map of CNMTs for a content record matching the given title ID and type.
+///
+/// Port of upstream `CheckMapForContentRecord`: indexed programs store
+/// `id_offset` on the content record of the base title.
 fn check_map_for_content_record(
     map: &BTreeMap<u64, CNMT>,
     title_id: u64,
     record_type: ContentRecordType,
 ) -> Option<NcaId> {
-    let cnmt = map.get(&title_id)?;
+    let mut cnmt = map.get(&title_id);
+    let mut id_offset = 0u8;
+
+    if cnmt.is_none() {
+        let program_index = title_id & AOC_TITLE_ID_MASK;
+        if program_index == 0 {
+            return None;
+        }
+        cnmt = map.get(&(title_id & !AOC_TITLE_ID_MASK));
+        if cnmt.is_none() {
+            return None;
+        }
+        id_offset = program_index as u8;
+    }
+
+    let cnmt = cnmt?;
+    if let Some(record) = cnmt
+        .get_content_records()
+        .iter()
+        .find(|rec| rec.record_type == record_type && rec.id_offset == id_offset)
+    {
+        return Some(record.nca_id);
+    }
+
+    if id_offset != 0 {
+        return None;
+    }
+
     cnmt.get_content_records()
         .iter()
         .find(|rec| rec.record_type == record_type)
@@ -1985,6 +2016,47 @@ mod registered_cache_install_tests {
         assert_eq!(copy_calls.load(Ordering::Relaxed), 1);
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn check_map_for_content_record_uses_id_offset_for_indexed_programs() {
+        let mut map = BTreeMap::new();
+        let mut header = CNMTHeader::default();
+        header.title_id = 0x0100_0000_0001_0000;
+        let base_record = ContentRecord {
+            nca_id: [0x11; 0x10],
+            record_type: ContentRecordType::Program,
+            id_offset: 0,
+            ..ContentRecord::default()
+        };
+        let indexed_record = ContentRecord {
+            nca_id: [0x22; 0x10],
+            record_type: ContentRecordType::Program,
+            id_offset: 2,
+            ..ContentRecord::default()
+        };
+        map.insert(
+            header.title_id,
+            CNMT::from_parts(
+                header,
+                OptionalHeader::default(),
+                vec![base_record, indexed_record],
+                Vec::new(),
+            ),
+        );
+
+        assert_eq!(
+            check_map_for_content_record(&map, header.title_id, ContentRecordType::Program),
+            Some([0x11; 0x10])
+        );
+        assert_eq!(
+            check_map_for_content_record(&map, header.title_id + 2, ContentRecordType::Program),
+            Some([0x22; 0x10])
+        );
+        assert_eq!(
+            check_map_for_content_record(&map, header.title_id + 3, ContentRecordType::Program),
+            None
+        );
     }
 }
 

@@ -1,5 +1,24 @@
 # Upstream parity notes
 
+## 2026-09-11 — last_code_addr / ResolveIndexedProgram vs eden arm_dynarmic_{32,64} and 54cd5fb8eb
+
+### Intentional differences
+- `last_code_addr` is an `Arc<AtomicU64>` shared between the JIT callbacks (`&self` `memory_read_code`) and `ClearInstructionCache`, because rdynarmic's `UserCallbacks` trait takes `&self` for code fetch and the callbacks are moved into the JIT. Eden mutates `m_cb->last_code_addr` directly.
+- The 4 KiB code page is an `UnsafeCell<[u32; 1024]>` on the per-core callback. The JIT is single-threaded per core, matching Eden's unsynchronized `CodePage`.
+- A64 `InstructionCacheOperationRaised` still does not call `InvalidateCacheRange` / `ClearInstructionCache` on the parent JIT (no `m_parent` back-pointer on A64 yet). It does invalidate `last_code_addr`, matching the first line of the Eden handler.
+- `hook_isb` stays false, as in Eden `UserConfig`. The ISB callback still resets `last_code_addr` so enabling the hook later is enough.
+- `NCA::new` keeps the two-argument form; `new_with_options(..., allow_missing_base)` is the Eden third parameter.
+
+### Unintentional differences (to fix)
+- None in these two slices.
+
+### Missing items
+- A64 parent-pointer IC cache flush (`InvalidateByVAToPoU` / `InvalidateAllToPoU` calling the JIT), independent of the code-page cache.
+- `jit_context.rs` already had the code-page cache.
+
+### Binary layout verification
+- `ContentRecord`: 0x38 bytes; the former `_padding` byte is `id_offset` as in Eden `nca_metadata.h`.
+
 ## 2026-09-11 — Vulkan MSAA/BlitHelpers vs eden 3e07b466eb (`[vulkan] Adjustments on MSAA and BlitHelpers`)
 
 ### Intentional differences

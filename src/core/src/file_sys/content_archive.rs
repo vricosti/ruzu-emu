@@ -90,6 +90,17 @@ impl NCA {
     ///
     /// Corresponds to upstream `NCA::NCA`.
     pub fn new(file: VirtualFile, base_nca: Option<&NCA>) -> Self {
+        Self::new_with_options(file, base_nca, false)
+    }
+
+    /// Construct an NCA, optionally allowing an update NCA without a base.
+    ///
+    /// Corresponds to upstream `NCA::NCA(file, base_nca, allow_missing_base)`.
+    pub fn new_with_options(
+        file: VirtualFile,
+        base_nca: Option<&NCA>,
+        allow_missing_base: bool,
+    ) -> Self {
         let file_name = file.get_name();
         let keys = KeyManager::instance();
         let mut nca = Self {
@@ -251,7 +262,7 @@ impl NCA {
             }
         }
 
-        if nca.is_update && base_nca.is_none() {
+        if nca.is_update && base_nca.is_none() && !allow_missing_base {
             nca.status = ResultStatus::ErrorMissingBKTRBaseRomFS;
         } else {
             nca.status = ResultStatus::Success;

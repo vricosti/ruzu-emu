@@ -2,12 +2,16 @@
 //!
 //! Upstream owner: `backend/arm64/emit_arm64_vector_floating_point.cpp`.
 
+use rhazel::{
+    CodeGenerator, SystemReg, VReg2D, VReg4S, VRegArranged, D1, SP, V0, V1, X0, X1, X2, X3,
+};
+
+use crate::backend::arm64::abi::regs::{WSCRATCH0, XSCRATCH0, XSTATE};
 use crate::backend::arm64::abi::{
-    emit_pop_registers, emit_push_registers, to_reg_list_vec, ABI_CALLER_SAVE, XSCRATCH0, XSTATE,
+    emit_pop_registers, emit_push_registers, to_reg_list_vec, ABI_CALLER_SAVE,
 };
 use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_context::EmitContext;
-use crate::backend::arm64::inst;
 use crate::backend::arm64::reg_alloc::RegAlloc;
 use crate::common::fp::fpcr::Fpcr as CommonFpcr;
 use crate::common::fp::fpsr::Fpsr;
@@ -15,12 +19,6 @@ use crate::common::fp::op::fp_round_int::fp_round_int;
 use crate::common::fp::rounding_mode::RoundingMode as CommonRoundingMode;
 use crate::ir::opcode::Opcode;
 use crate::ir::value::InstRef;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VectorFpSize {
-    F32,
-    F64,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RoundingMode {
@@ -46,40 +44,21 @@ impl RoundingMode {
     }
 }
 
-fn emit_mov_w_imm(code: &mut BlockOfCode, reg: u8, imm: u32) -> Result<(), String> {
-    code.write_u32(inst::movz_w(reg, (imm & 0xffff) as u16, 0))?;
-    let upper = ((imm >> 16) & 0xffff) as u16;
-    if upper != 0 {
-        code.write_u32(inst::movk_w(reg, upper, 16))?;
-    }
-    Ok(())
-}
-
-fn emit_mov_x_imm(code: &mut BlockOfCode, reg: u8, imm: u64) -> Result<(), String> {
-    code.write_u32(inst::movz_x(reg, (imm & 0xffff) as u16, 0))?;
-    for shift in [16, 32, 48] {
-        let part = ((imm >> shift) & 0xffff) as u16;
-        if part != 0 {
-            code.write_u32(inst::movk_x(reg, part, shift))?;
-        }
-    }
-    Ok(())
-}
-
+/// Upstream `MaybeStandardFPSCRValue`.
 fn maybe_standard_fpcr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &EmitContext<'_>,
     fpcr_controlled: bool,
-    emit: impl FnOnce(&mut BlockOfCode) -> Result<(), String>,
+    emit: impl FnOnce(&mut CodeGenerator<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
     let current_fpcr = ctx.fpcr(true);
     let target_fpcr = ctx.fpcr(fpcr_controlled);
     if target_fpcr != current_fpcr {
-        emit_mov_w_imm(code, XSCRATCH0, target_fpcr.value())?;
-        code.write_u32(inst::msr_fpcr(XSCRATCH0))?;
+        code.mov_imm(WSCRATCH0, u64::from(target_fpcr.value()))?;
+        code.msr(SystemReg::FPCR, XSCRATCH0)?;
         emit(code)?;
-        emit_mov_w_imm(code, XSCRATCH0, current_fpcr.value())?;
-        code.write_u32(inst::msr_fpcr(XSCRATCH0))?;
+        code.mov_imm(WSCRATCH0, u64::from(current_fpcr.value()))?;
+        code.msr(SystemReg::FPCR, XSCRATCH0)?;
         return Ok(());
     }
 
@@ -93,11 +72,13 @@ fn fpcr_rounding_mode(
     RoundingMode::from_u8(((ctx.fpcr(fpcr_controlled).value() >> 22) & 0b11) as u8)
 }
 
-fn emit_three_op_arranged(
-    code: &mut BlockOfCode,
+/// Upstream `EmitThreeOpArranged<fsize>`: `V` is the arrangement the
+/// operands are viewed through (`VReg4S` for 32, `VReg2D` for 64).
+fn emit_three_op_arranged<V: VRegArranged>(
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
-    emit: impl FnOnce(u8, u8, u8) -> u32,
+    emit: impl FnOnce(&mut CodeGenerator<'_>, V, V, V) -> Result<(), String>,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut result = ctx.reg_alloc.write_q(inst_ref);
@@ -107,20 +88,20 @@ fn emit_three_op_arranged(
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
     ctx.fpsr.load(code)?;
 
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
-    maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| {
-        code.write_u32(emit(result, a, b))?;
-        Ok(())
-    })
+    let (result, a, b) = (
+        V::from_vreg(result.v()),
+        V::from_vreg(a.v()),
+        V::from_vreg(b.v()),
+    );
+    maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| emit(code, result, a, b))
 }
 
-fn emit_two_op_arranged(
-    code: &mut BlockOfCode,
+/// Upstream `EmitTwoOpArranged<fsize>`.
+fn emit_two_op_arranged<V: VRegArranged>(
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
-    emit: impl FnOnce(u8, u8) -> u32,
+    emit: impl FnOnce(&mut CodeGenerator<'_>, V, V) -> Result<(), String>,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut result = ctx.reg_alloc.write_q(inst_ref);
@@ -129,12 +110,8 @@ fn emit_two_op_arranged(
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a])?;
     ctx.fpsr.load(code)?;
 
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| {
-        code.write_u32(emit(result, a))?;
-        Ok(())
-    })
+    let (result, a) = (V::from_vreg(result.v()), V::from_vreg(a.v()));
+    maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| emit(code, result, a))
 }
 
 pub fn emit_fp_vector_abs16(
@@ -142,11 +119,11 @@ pub fn emit_fp_vector_abs16(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut result = ctx.reg_alloc.read_write_q(args[0], inst_ref);
-    let result = result.realize(code, ctx.block)? as u8;
-    code.write_u32(inst::bic_v8h_sign_bit(result))?;
-    Ok(())
+    result.realize(code, ctx.block)?;
+    code.bic_imm(result.v().h8(), 0b1000_0000, 8)
 }
 
 pub fn emit_fp_vector_abs32(
@@ -154,7 +131,8 @@ pub fn emit_fp_vector_abs32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_two_op_arranged(code, ctx, inst_ref, inst::fabs_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| code.fabs(result, a))
 }
 
 pub fn emit_fp_vector_abs64(
@@ -162,14 +140,15 @@ pub fn emit_fp_vector_abs64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_two_op_arranged(code, ctx, inst_ref, inst::fabs_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| code.fabs(result, a))
 }
 
-fn emit_round_int(
-    code: &mut BlockOfCode,
+/// Upstream `EmitRoundInt<fsize>`.
+fn emit_round_int<V: VRegArranged>(
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
-    size: VectorFpSize,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let rounding_mode = RoundingMode::from_u8(args[1].get_immediate_u8())?;
@@ -188,46 +167,19 @@ fn emit_round_int(
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut operand])?;
     ctx.fpsr.load(code)?;
 
-    let result = result.index().expect("result realized") as u8;
-    let operand = operand.index().expect("operand realized") as u8;
+    let (result, operand) = (V::from_vreg(result.v()), V::from_vreg(operand.v()));
     maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| {
-        let instruction = match (size, exact, rounding_mode) {
-            (VectorFpSize::F32, true, _) => inst::frintx_v4s(result, operand),
-            (VectorFpSize::F64, true, _) => inst::frintx_v2d(result, operand),
-            (VectorFpSize::F32, false, RoundingMode::ToNearestTieEven) => {
-                inst::frintn_v4s(result, operand)
-            }
-            (VectorFpSize::F64, false, RoundingMode::ToNearestTieEven) => {
-                inst::frintn_v2d(result, operand)
-            }
-            (VectorFpSize::F32, false, RoundingMode::TowardsPlusInfinity) => {
-                inst::frintp_v4s(result, operand)
-            }
-            (VectorFpSize::F64, false, RoundingMode::TowardsPlusInfinity) => {
-                inst::frintp_v2d(result, operand)
-            }
-            (VectorFpSize::F32, false, RoundingMode::TowardsMinusInfinity) => {
-                inst::frintm_v4s(result, operand)
-            }
-            (VectorFpSize::F64, false, RoundingMode::TowardsMinusInfinity) => {
-                inst::frintm_v2d(result, operand)
-            }
-            (VectorFpSize::F32, false, RoundingMode::TowardsZero) => {
-                inst::frintz_v4s(result, operand)
-            }
-            (VectorFpSize::F64, false, RoundingMode::TowardsZero) => {
-                inst::frintz_v2d(result, operand)
-            }
-            (VectorFpSize::F32, false, RoundingMode::ToNearestTieAwayFromZero) => {
-                inst::frinta_v4s(result, operand)
-            }
-            (VectorFpSize::F64, false, RoundingMode::ToNearestTieAwayFromZero) => {
-                inst::frinta_v2d(result, operand)
-            }
-            (_, false, RoundingMode::ToOdd) => unreachable!(),
-        };
-        code.write_u32(instruction)?;
-        Ok(())
+        if exact {
+            return code.frintx(result, operand);
+        }
+        match rounding_mode {
+            RoundingMode::ToNearestTieEven => code.frintn(result, operand),
+            RoundingMode::TowardsPlusInfinity => code.frintp(result, operand),
+            RoundingMode::TowardsMinusInfinity => code.frintm(result, operand),
+            RoundingMode::TowardsZero => code.frintz(result, operand),
+            RoundingMode::ToNearestTieAwayFromZero => code.frinta(result, operand),
+            RoundingMode::ToOdd => unreachable!(),
+        }
     })
 }
 
@@ -289,7 +241,7 @@ fn round_int16_fallback(rounding: u8, exact: bool) -> usize {
 }
 
 fn emit_round_int16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -306,34 +258,34 @@ fn emit_round_int16(
     ctx.reg_alloc.spill_flags(code)?;
     ctx.fpsr.spill(code)?;
 
-    let input = input.index().expect("input realized") as u8;
-    let result = result.index().expect("result realized") as u8;
-    let saved_registers = ABI_CALLER_SAVE & !to_reg_list_vec(result);
+    let (input, result) = (input.q(), result.q());
+    let saved_registers = ABI_CALLER_SAVE & !to_reg_list_vec(result.index());
     const STACK_SIZE: usize = 2 * 16;
     emit_push_registers(code, saved_registers, STACK_SIZE)?;
 
-    emit_mov_x_imm(code, XSCRATCH0, fallback as u64)?;
-    code.write_u32(inst::add_x_imm(0, 31, 0))?;
-    code.write_u32(inst::add_x_imm(1, 31, 16))?;
-    emit_mov_w_imm(code, 2, ctx.fpcr(fpcr_controlled).value())?;
-    code.write_u32(inst::add_x_imm(
-        3,
+    code.mov_imm(XSCRATCH0, fallback as u64)?;
+    code.add_imm(X0, SP, 0)?;
+    code.add_imm(X1, SP, 16)?;
+    code.mov_imm(X2, u64::from(ctx.fpcr(fpcr_controlled).value()))?;
+    code.add_imm(
+        X3,
         XSTATE,
         u32::try_from(ctx.conf.state_fpsr_offset)
             .map_err(|_| "ARM64 FP vector: FPSR state offset exceeds u32".to_string())?,
-    ))?;
-    code.write_u32(inst::str_q_unsigned_sp(input, 16))?;
-    code.write_u32(inst::blr(XSCRATCH0))?;
-    code.write_u32(inst::ldr_q_unsigned_sp(result, 0))?;
+    )?;
+    code.str(input, X1, 0)?;
+    code.blr(XSCRATCH0)?;
+    code.ldr(result, SP, 0)?;
 
     emit_pop_registers(code, saved_registers, STACK_SIZE)
 }
 
-fn emit_fma(
-    code: &mut BlockOfCode,
+/// Upstream `EmitFMA<fsize>`.
+fn emit_fma<V: VRegArranged>(
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
-    emit: impl FnOnce(u8, u8, u8) -> u32,
+    emit: impl FnOnce(&mut CodeGenerator<'_>, V, V, V) -> Result<(), String>,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut result = ctx.reg_alloc.read_write_q(args[0], inst_ref);
@@ -343,20 +295,19 @@ fn emit_fma(
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut m, &mut n])?;
     ctx.fpsr.load(code)?;
 
-    let result = result.index().expect("result realized") as u8;
-    let m = m.index().expect("m realized") as u8;
-    let n = n.index().expect("n realized") as u8;
-    maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| {
-        code.write_u32(emit(result, m, n))?;
-        Ok(())
-    })
+    let (result, m, n) = (
+        V::from_vreg(result.v()),
+        V::from_vreg(m.v()),
+        V::from_vreg(n.v()),
+    );
+    maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| emit(code, result, m, n))
 }
 
-fn emit_from_fixed(
-    code: &mut BlockOfCode,
+/// Upstream `EmitFromFixed<fsize, is_signed>`.
+fn emit_from_fixed<V: VRegArranged>(
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
-    size: VectorFpSize,
     signed: bool,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
@@ -371,47 +322,31 @@ fn emit_from_fixed(
         ));
     }
 
-    match size {
-        VectorFpSize::F32 if fbits > 32 => {
-            return Err(format!(
-                "ARM64 FP vector: 32-bit fixed-to-FP has invalid fbits={fbits}"
-            ));
-        }
-        VectorFpSize::F64 if fbits > 64 => {
-            return Err(format!(
-                "ARM64 FP vector: 64-bit fixed-to-FP has invalid fbits={fbits}"
-            ));
-        }
-        _ => {}
+    if fbits > V::SIZE {
+        return Err(format!(
+            "ARM64 FP vector: {}-bit fixed-to-FP has invalid fbits={fbits}",
+            V::SIZE
+        ));
     }
 
     let mut result = ctx.reg_alloc.write_q(inst_ref);
     let mut operand = ctx.reg_alloc.read_q(args[0]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut operand])?;
 
-    let result = result.index().expect("result realized") as u8;
-    let operand = operand.index().expect("operand realized") as u8;
-    maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| {
-        let word = match (size, signed, fbits) {
-            (VectorFpSize::F32, true, 0) => inst::scvtf_v4s(result, operand),
-            (VectorFpSize::F64, true, 0) => inst::scvtf_v2d(result, operand),
-            (VectorFpSize::F32, false, 0) => inst::ucvtf_v4s(result, operand),
-            (VectorFpSize::F64, false, 0) => inst::ucvtf_v2d(result, operand),
-            (VectorFpSize::F32, true, _) => inst::scvtf_v4s_fixed(result, operand, fbits),
-            (VectorFpSize::F64, true, _) => inst::scvtf_v2d_fixed(result, operand, fbits),
-            (VectorFpSize::F32, false, _) => inst::ucvtf_v4s_fixed(result, operand, fbits),
-            (VectorFpSize::F64, false, _) => inst::ucvtf_v2d_fixed(result, operand, fbits),
-        };
-        code.write_u32(word)?;
-        Ok(())
+    let (result, operand) = (V::from_vreg(result.v()), V::from_vreg(operand.v()));
+    maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| match (signed, fbits) {
+        (true, 0) => code.scvtf(result, operand),
+        (false, 0) => code.ucvtf(result, operand),
+        (true, _) => code.scvtf_fixed(result, operand, fbits),
+        (false, _) => code.ucvtf_fixed(result, operand, fbits),
     })
 }
 
-fn emit_to_fixed(
-    code: &mut BlockOfCode,
+/// Upstream `EmitToFixed<fsize, is_signed>`.
+fn emit_to_fixed<V: VRegArranged>(
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
-    size: VectorFpSize,
     signed: bool,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
@@ -419,18 +354,11 @@ fn emit_to_fixed(
     let rounding_mode = RoundingMode::from_u8(args[2].get_immediate_u8())?;
     let fpcr_controlled = args[3].get_immediate_u1();
 
-    match size {
-        VectorFpSize::F32 if fbits > 32 => {
-            return Err(format!(
-                "ARM64 FP vector: FP-to-32-bit fixed has invalid fbits={fbits}"
-            ));
-        }
-        VectorFpSize::F64 if fbits > 64 => {
-            return Err(format!(
-                "ARM64 FP vector: FP-to-64-bit fixed has invalid fbits={fbits}"
-            ));
-        }
-        _ => {}
+    if fbits > V::SIZE {
+        return Err(format!(
+            "ARM64 FP vector: FP-to-{}-bit fixed has invalid fbits={fbits}",
+            V::SIZE
+        ));
     }
     if fbits != 0 && rounding_mode != RoundingMode::TowardsZero {
         return Err(format!(
@@ -447,86 +375,23 @@ fn emit_to_fixed(
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut operand])?;
     ctx.fpsr.load(code)?;
 
-    let result = result.index().expect("result realized") as u8;
-    let operand = operand.index().expect("operand realized") as u8;
+    let (result, operand) = (V::from_vreg(result.v()), V::from_vreg(operand.v()));
     maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| {
-        let word = match (size, signed, rounding_mode, fbits) {
-            (VectorFpSize::F32, true, RoundingMode::TowardsZero, 0) => {
-                inst::fcvtzs_v4s(result, operand)
-            }
-            (VectorFpSize::F64, true, RoundingMode::TowardsZero, 0) => {
-                inst::fcvtzs_v2d(result, operand)
-            }
-            (VectorFpSize::F32, false, RoundingMode::TowardsZero, 0) => {
-                inst::fcvtzu_v4s(result, operand)
-            }
-            (VectorFpSize::F64, false, RoundingMode::TowardsZero, 0) => {
-                inst::fcvtzu_v2d(result, operand)
-            }
-            (VectorFpSize::F32, true, RoundingMode::TowardsZero, _) => {
-                inst::fcvtzs_v4s_fixed(result, operand, fbits)
-            }
-            (VectorFpSize::F64, true, RoundingMode::TowardsZero, _) => {
-                inst::fcvtzs_v2d_fixed(result, operand, fbits)
-            }
-            (VectorFpSize::F32, false, RoundingMode::TowardsZero, _) => {
-                inst::fcvtzu_v4s_fixed(result, operand, fbits)
-            }
-            (VectorFpSize::F64, false, RoundingMode::TowardsZero, _) => {
-                inst::fcvtzu_v2d_fixed(result, operand, fbits)
-            }
-            (VectorFpSize::F32, true, RoundingMode::ToNearestTieEven, 0) => {
-                inst::fcvtns_v4s(result, operand)
-            }
-            (VectorFpSize::F64, true, RoundingMode::ToNearestTieEven, 0) => {
-                inst::fcvtns_v2d(result, operand)
-            }
-            (VectorFpSize::F32, true, RoundingMode::TowardsPlusInfinity, 0) => {
-                inst::fcvtps_v4s(result, operand)
-            }
-            (VectorFpSize::F64, true, RoundingMode::TowardsPlusInfinity, 0) => {
-                inst::fcvtps_v2d(result, operand)
-            }
-            (VectorFpSize::F32, true, RoundingMode::TowardsMinusInfinity, 0) => {
-                inst::fcvtms_v4s(result, operand)
-            }
-            (VectorFpSize::F64, true, RoundingMode::TowardsMinusInfinity, 0) => {
-                inst::fcvtms_v2d(result, operand)
-            }
-            (VectorFpSize::F32, true, RoundingMode::ToNearestTieAwayFromZero, 0) => {
-                inst::fcvtas_v4s(result, operand)
-            }
-            (VectorFpSize::F64, true, RoundingMode::ToNearestTieAwayFromZero, 0) => {
-                inst::fcvtas_v2d(result, operand)
-            }
-            (VectorFpSize::F32, false, RoundingMode::ToNearestTieEven, 0) => {
-                inst::fcvtnu_v4s(result, operand)
-            }
-            (VectorFpSize::F64, false, RoundingMode::ToNearestTieEven, 0) => {
-                inst::fcvtnu_v2d(result, operand)
-            }
-            (VectorFpSize::F32, false, RoundingMode::TowardsPlusInfinity, 0) => {
-                inst::fcvtpu_v4s(result, operand)
-            }
-            (VectorFpSize::F64, false, RoundingMode::TowardsPlusInfinity, 0) => {
-                inst::fcvtpu_v2d(result, operand)
-            }
-            (VectorFpSize::F32, false, RoundingMode::TowardsMinusInfinity, 0) => {
-                inst::fcvtmu_v4s(result, operand)
-            }
-            (VectorFpSize::F64, false, RoundingMode::TowardsMinusInfinity, 0) => {
-                inst::fcvtmu_v2d(result, operand)
-            }
-            (VectorFpSize::F32, false, RoundingMode::ToNearestTieAwayFromZero, 0) => {
-                inst::fcvtau_v4s(result, operand)
-            }
-            (VectorFpSize::F64, false, RoundingMode::ToNearestTieAwayFromZero, 0) => {
-                inst::fcvtau_v2d(result, operand)
-            }
+        match (signed, rounding_mode, fbits) {
+            (true, RoundingMode::TowardsZero, 0) => code.fcvtzs(result, operand),
+            (false, RoundingMode::TowardsZero, 0) => code.fcvtzu(result, operand),
+            (true, RoundingMode::TowardsZero, _) => code.fcvtzs_fixed(result, operand, fbits),
+            (false, RoundingMode::TowardsZero, _) => code.fcvtzu_fixed(result, operand, fbits),
+            (true, RoundingMode::ToNearestTieEven, 0) => code.fcvtns(result, operand),
+            (true, RoundingMode::TowardsPlusInfinity, 0) => code.fcvtps(result, operand),
+            (true, RoundingMode::TowardsMinusInfinity, 0) => code.fcvtms(result, operand),
+            (true, RoundingMode::ToNearestTieAwayFromZero, 0) => code.fcvtas(result, operand),
+            (false, RoundingMode::ToNearestTieEven, 0) => code.fcvtnu(result, operand),
+            (false, RoundingMode::TowardsPlusInfinity, 0) => code.fcvtpu(result, operand),
+            (false, RoundingMode::TowardsMinusInfinity, 0) => code.fcvtmu(result, operand),
+            (false, RoundingMode::ToNearestTieAwayFromZero, 0) => code.fcvtau(result, operand),
             _ => unreachable!("validated FP vector to-fixed arguments"),
-        };
-        code.write_u32(word)?;
-        Ok(())
+        }
     })
 }
 
@@ -535,7 +400,10 @@ pub fn emit_fp_vector_add32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fadd_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fadd(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_add64(
@@ -543,7 +411,10 @@ pub fn emit_fp_vector_add64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fadd_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fadd(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_sub32(
@@ -551,7 +422,10 @@ pub fn emit_fp_vector_sub32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fsub_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fsub(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_sub64(
@@ -559,7 +433,10 @@ pub fn emit_fp_vector_sub64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fsub_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fsub(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_mul32(
@@ -567,7 +444,10 @@ pub fn emit_fp_vector_mul32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fmul_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fmul(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_mul64(
@@ -575,7 +455,10 @@ pub fn emit_fp_vector_mul64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fmul_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fmul(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_mul_x32(
@@ -583,7 +466,10 @@ pub fn emit_fp_vector_mul_x32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fmulx_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fmulx(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_mul_x64(
@@ -591,7 +477,10 @@ pub fn emit_fp_vector_mul_x64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fmulx_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fmulx(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_neg32(
@@ -599,7 +488,8 @@ pub fn emit_fp_vector_neg32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_two_op_arranged(code, ctx, inst_ref, inst::fneg_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| code.fneg(result, a))
 }
 
 pub fn emit_fp_vector_neg64(
@@ -607,7 +497,8 @@ pub fn emit_fp_vector_neg64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_two_op_arranged(code, ctx, inst_ref, inst::fneg_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| code.fneg(result, a))
 }
 
 pub fn emit_fp_vector_sqrt32(
@@ -615,7 +506,8 @@ pub fn emit_fp_vector_sqrt32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_two_op_arranged(code, ctx, inst_ref, inst::fsqrt_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| code.fsqrt(result, a))
 }
 
 pub fn emit_fp_vector_sqrt64(
@@ -623,7 +515,8 @@ pub fn emit_fp_vector_sqrt64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_two_op_arranged(code, ctx, inst_ref, inst::fsqrt_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| code.fsqrt(result, a))
 }
 
 pub fn emit_fp_vector_recip_estimate32(
@@ -631,7 +524,8 @@ pub fn emit_fp_vector_recip_estimate32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_two_op_arranged(code, ctx, inst_ref, inst::frecpe_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| code.frecpe(result, a))
 }
 
 pub fn emit_fp_vector_recip_estimate64(
@@ -639,7 +533,8 @@ pub fn emit_fp_vector_recip_estimate64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_two_op_arranged(code, ctx, inst_ref, inst::frecpe_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| code.frecpe(result, a))
 }
 
 pub fn emit_fp_vector_rsqrt_estimate32(
@@ -647,7 +542,8 @@ pub fn emit_fp_vector_rsqrt_estimate32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_two_op_arranged(code, ctx, inst_ref, inst::frsqrte_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| code.frsqrte(result, a))
 }
 
 pub fn emit_fp_vector_rsqrt_estimate64(
@@ -655,7 +551,8 @@ pub fn emit_fp_vector_rsqrt_estimate64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_two_op_arranged(code, ctx, inst_ref, inst::frsqrte_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| code.frsqrte(result, a))
 }
 
 pub fn emit_fp_vector_div32(
@@ -663,7 +560,10 @@ pub fn emit_fp_vector_div32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fdiv_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fdiv(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_div64(
@@ -671,7 +571,10 @@ pub fn emit_fp_vector_div64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fdiv_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fdiv(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_max32(
@@ -679,7 +582,10 @@ pub fn emit_fp_vector_max32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fmax_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fmax(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_max64(
@@ -687,7 +593,10 @@ pub fn emit_fp_vector_max64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fmax_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fmax(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_max_numeric32(
@@ -695,7 +604,10 @@ pub fn emit_fp_vector_max_numeric32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fmaxnm_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fmaxnm(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_max_numeric64(
@@ -703,7 +615,10 @@ pub fn emit_fp_vector_max_numeric64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fmaxnm_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fmaxnm(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_min32(
@@ -711,7 +626,10 @@ pub fn emit_fp_vector_min32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fmin_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fmin(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_min64(
@@ -719,7 +637,10 @@ pub fn emit_fp_vector_min64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fmin_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fmin(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_min_numeric32(
@@ -727,7 +648,10 @@ pub fn emit_fp_vector_min_numeric32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fminnm_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fminnm(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_min_numeric64(
@@ -735,7 +659,10 @@ pub fn emit_fp_vector_min_numeric64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fminnm_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fminnm(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_equal32(
@@ -743,7 +670,10 @@ pub fn emit_fp_vector_equal32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fcmeq_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fcmeq(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_equal64(
@@ -751,7 +681,10 @@ pub fn emit_fp_vector_equal64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fcmeq_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fcmeq(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_greater32(
@@ -759,7 +692,10 @@ pub fn emit_fp_vector_greater32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fcmgt_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fcmgt(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_greater64(
@@ -767,7 +703,10 @@ pub fn emit_fp_vector_greater64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fcmgt_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fcmgt(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_greater_equal32(
@@ -775,7 +714,10 @@ pub fn emit_fp_vector_greater_equal32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fcmge_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fcmge(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_greater_equal64(
@@ -783,7 +725,10 @@ pub fn emit_fp_vector_greater_equal64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::fcmge_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.fcmge(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_mul_add32(
@@ -791,7 +736,8 @@ pub fn emit_fp_vector_mul_add32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_fma(code, ctx, inst_ref, inst::fmla_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_fma::<VReg4S>(code, ctx, inst_ref, |code, result, m, n| code.fmla(result, m, n))
 }
 
 pub fn emit_fp_vector_mul_add64(
@@ -799,7 +745,8 @@ pub fn emit_fp_vector_mul_add64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_fma(code, ctx, inst_ref, inst::fmla_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_fma::<VReg2D>(code, ctx, inst_ref, |code, result, m, n| code.fmla(result, m, n))
 }
 
 pub fn emit_fp_vector_paired_add32(
@@ -807,7 +754,10 @@ pub fn emit_fp_vector_paired_add32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::faddp_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.faddp(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_paired_add64(
@@ -815,7 +765,10 @@ pub fn emit_fp_vector_paired_add64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::faddp_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.faddp(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_paired_add_lower32(
@@ -823,6 +776,7 @@ pub fn emit_fp_vector_paired_add_lower32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut result = ctx.reg_alloc.write_q(inst_ref);
     let mut a = ctx.reg_alloc.read_q(args[0]);
@@ -831,14 +785,11 @@ pub fn emit_fp_vector_paired_add_lower32(
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
     ctx.fpsr.load(code)?;
 
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, a, b) = (result.v(), a.v(), b.v());
     maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| {
-        code.write_u32(inst::zip1_v(0, a, b, 64, true))?;
-        code.write_u32(inst::movi_d_imm0(1))?;
-        code.write_u32(inst::faddp_v4s(result, 0, 1))?;
-        Ok(())
+        code.zip1(V0.d2(), a.d2(), b.d2())?;
+        code.movi_zero(D1)?;
+        code.faddp(result.s4(), V0.s4(), V1.s4())
     })
 }
 
@@ -847,6 +798,7 @@ pub fn emit_fp_vector_paired_add_lower64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut result = ctx.reg_alloc.write_q(inst_ref);
     let mut a = ctx.reg_alloc.read_q(args[0]);
@@ -855,13 +807,10 @@ pub fn emit_fp_vector_paired_add_lower64(
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
     ctx.fpsr.load(code)?;
 
-    let result = result.index().expect("result realized") as u8;
-    let a = a.index().expect("a realized") as u8;
-    let b = b.index().expect("b realized") as u8;
+    let (result, a, b) = (result.v(), a.v(), b.v());
     maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| {
-        code.write_u32(inst::zip1_v(0, a, b, 64, true))?;
-        code.write_u32(inst::faddp_d_from_v2d(result, 0))?;
-        Ok(())
+        code.zip1(V0.d2(), a.d2(), b.d2())?;
+        code.faddp_scalar(result.d(), V0.d2())
     })
 }
 
@@ -870,6 +819,7 @@ pub fn emit_fp_vector_from_half32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let rounding_mode = RoundingMode::from_u8(args[1].get_immediate_u8())?;
     if rounding_mode != RoundingMode::ToNearestTieEven {
@@ -883,11 +833,9 @@ pub fn emit_fp_vector_from_half32(
     let mut operand = ctx.reg_alloc.read_d(args[0]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut operand])?;
     ctx.fpsr.load(code)?;
-    let result = result.index().expect("result realized") as u8;
-    let operand = operand.index().expect("operand realized") as u8;
+    let (result, operand) = (result.v(), operand.v());
     maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| {
-        code.write_u32(inst::fcvtl_v4s_from_v4h(result, operand))?;
-        Ok(())
+        code.fcvtl(result.s4(), operand.h4())
     })
 }
 
@@ -896,6 +844,7 @@ pub fn emit_fp_vector_to_half32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let rounding_mode = RoundingMode::from_u8(args[1].get_immediate_u8())?;
     if rounding_mode != RoundingMode::ToNearestTieEven {
@@ -909,11 +858,9 @@ pub fn emit_fp_vector_to_half32(
     let mut operand = ctx.reg_alloc.read_q(args[0]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut operand])?;
     ctx.fpsr.load(code)?;
-    let result = result.index().expect("result realized") as u8;
-    let operand = operand.index().expect("operand realized") as u8;
+    let (result, operand) = (result.v(), operand.v());
     maybe_standard_fpcr(code, ctx, fpcr_controlled, |code| {
-        code.write_u32(inst::fcvtn_v4h_from_v4s(result, operand))?;
-        Ok(())
+        code.fcvtn(result.h4(), operand.s4())
     })
 }
 
@@ -922,7 +869,8 @@ pub fn emit_fp_vector_from_signed_fixed32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_from_fixed(code, ctx, inst_ref, VectorFpSize::F32, true)
+    let code = &mut CodeGenerator::new(code);
+    emit_from_fixed::<VReg4S>(code, ctx, inst_ref, true)
 }
 
 pub fn emit_fp_vector_from_signed_fixed64(
@@ -930,7 +878,8 @@ pub fn emit_fp_vector_from_signed_fixed64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_from_fixed(code, ctx, inst_ref, VectorFpSize::F64, true)
+    let code = &mut CodeGenerator::new(code);
+    emit_from_fixed::<VReg2D>(code, ctx, inst_ref, true)
 }
 
 pub fn emit_fp_vector_from_unsigned_fixed32(
@@ -938,7 +887,8 @@ pub fn emit_fp_vector_from_unsigned_fixed32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_from_fixed(code, ctx, inst_ref, VectorFpSize::F32, false)
+    let code = &mut CodeGenerator::new(code);
+    emit_from_fixed::<VReg4S>(code, ctx, inst_ref, false)
 }
 
 pub fn emit_fp_vector_from_unsigned_fixed64(
@@ -946,7 +896,8 @@ pub fn emit_fp_vector_from_unsigned_fixed64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_from_fixed(code, ctx, inst_ref, VectorFpSize::F64, false)
+    let code = &mut CodeGenerator::new(code);
+    emit_from_fixed::<VReg2D>(code, ctx, inst_ref, false)
 }
 
 pub fn emit_fp_vector_to_signed_fixed32(
@@ -954,7 +905,8 @@ pub fn emit_fp_vector_to_signed_fixed32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_to_fixed(code, ctx, inst_ref, VectorFpSize::F32, true)
+    let code = &mut CodeGenerator::new(code);
+    emit_to_fixed::<VReg4S>(code, ctx, inst_ref, true)
 }
 
 pub fn emit_fp_vector_to_signed_fixed64(
@@ -962,7 +914,8 @@ pub fn emit_fp_vector_to_signed_fixed64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_to_fixed(code, ctx, inst_ref, VectorFpSize::F64, true)
+    let code = &mut CodeGenerator::new(code);
+    emit_to_fixed::<VReg2D>(code, ctx, inst_ref, true)
 }
 
 pub fn emit_fp_vector_to_unsigned_fixed32(
@@ -970,7 +923,8 @@ pub fn emit_fp_vector_to_unsigned_fixed32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_to_fixed(code, ctx, inst_ref, VectorFpSize::F32, false)
+    let code = &mut CodeGenerator::new(code);
+    emit_to_fixed::<VReg4S>(code, ctx, inst_ref, false)
 }
 
 pub fn emit_fp_vector_to_unsigned_fixed64(
@@ -978,7 +932,8 @@ pub fn emit_fp_vector_to_unsigned_fixed64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_to_fixed(code, ctx, inst_ref, VectorFpSize::F64, false)
+    let code = &mut CodeGenerator::new(code);
+    emit_to_fixed::<VReg2D>(code, ctx, inst_ref, false)
 }
 
 pub fn emit_fp_vector_round_int16(
@@ -986,6 +941,7 @@ pub fn emit_fp_vector_round_int16(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
     emit_round_int16(code, ctx, inst_ref)
 }
 
@@ -994,7 +950,8 @@ pub fn emit_fp_vector_round_int32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_round_int(code, ctx, inst_ref, VectorFpSize::F32)
+    let code = &mut CodeGenerator::new(code);
+    emit_round_int::<VReg4S>(code, ctx, inst_ref)
 }
 
 pub fn emit_fp_vector_round_int64(
@@ -1002,7 +959,8 @@ pub fn emit_fp_vector_round_int64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_round_int(code, ctx, inst_ref, VectorFpSize::F64)
+    let code = &mut CodeGenerator::new(code);
+    emit_round_int::<VReg2D>(code, ctx, inst_ref)
 }
 
 pub fn emit_fp_vector_recip_step_fused32(
@@ -1010,7 +968,10 @@ pub fn emit_fp_vector_recip_step_fused32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::frecps_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.frecps(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_recip_step_fused64(
@@ -1018,7 +979,10 @@ pub fn emit_fp_vector_recip_step_fused64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::frecps_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.frecps(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_rsqrt_step_fused32(
@@ -1026,7 +990,10 @@ pub fn emit_fp_vector_rsqrt_step_fused32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::frsqrts_v4s)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
+        code.frsqrts(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_rsqrt_step_fused64(
@@ -1034,7 +1001,10 @@ pub fn emit_fp_vector_rsqrt_step_fused64(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    emit_three_op_arranged(code, ctx, inst_ref, inst::frsqrts_v2d)
+    let code = &mut CodeGenerator::new(code);
+    emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
+        code.frsqrts(result, a, b)
+    })
 }
 
 pub fn emit_fp_vector_instruction(

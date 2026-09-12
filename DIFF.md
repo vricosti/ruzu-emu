@@ -47,7 +47,10 @@
   arrangement like upstream's `EmitThreeOpArranged<fsize>`, via
   `VRegArranged::from_vreg`; the RoundInt16 fallback now emits upstream's
   `MOV X2`, `STR Qarg1, [X1]`, `LDR Qresult, [SP]` instead of the W2 /
-  SP-relative forms the u8 port used); each public emitter
+  SP-relative forms the u8 port used), `emit_arm64_a64.rs` (forward guards
+  now use `Label`s as upstream's `oaknut::Label fail`; only the `If`
+  terminal keeps the offset-patching path until `EmitConfig::emit_cond`
+  takes a label with `emit_arm64.rs`); each public emitter
   still takes `&mut BlockOfCode` and wraps it, so the dispatcher and tests are
   untouched until every file has moved, when the signatures flip to
   `&mut CodeGenerator` in one mechanical sweep.

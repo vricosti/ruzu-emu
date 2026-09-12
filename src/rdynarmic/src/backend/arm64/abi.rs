@@ -17,10 +17,6 @@ pub const XPAGETABLE: u8 = 24;
 
 pub const XSCRATCH0: u8 = 16;
 pub const XSCRATCH1: u8 = 17;
-/// Upstream `Wscratch0` / `Wscratch1`: the scratch registers as typed W
-/// operands for `rhazel::CodeGenerator` mnemonics.
-pub const WSCRATCH0: rhazel::WReg = rhazel::WReg::new(XSCRATCH0);
-pub const WSCRATCH1: rhazel::WReg = rhazel::WReg::new(XSCRATCH1);
 pub const XSCRATCH2: u8 = 30;
 
 /// Matches upstream `GPR_ORDER`.
@@ -256,4 +252,26 @@ mod tests {
         assert_eq!(read(22), inst::ldp_q_offset_sp(14, 15, 192));
         assert_eq!(read(23), inst::add_sp_imm(224));
     }
+}
+
+/// The ABI registers as typed `rhazel` operands — upstream's `Xstate`,
+/// `Xscratch0`, `Wscratch0`, … — for emitters on `rhazel::CodeGenerator`.
+/// The `u8` constants above serve the encoders directly and go away once
+/// every emitter has moved.
+pub mod regs {
+    use rhazel::{WReg, XReg};
+
+    pub const XSTATE: XReg = XReg::new(super::XSTATE);
+    pub const XHALT: XReg = XReg::new(super::XHALT);
+    pub const XTICKS: XReg = XReg::new(super::XTICKS);
+    pub const XFASTMEM: XReg = XReg::new(super::XFASTMEM);
+    pub const XPAGETABLE: XReg = XReg::new(super::XPAGETABLE);
+    pub const XSCRATCH0: XReg = XReg::new(super::XSCRATCH0);
+    pub const XSCRATCH1: XReg = XReg::new(super::XSCRATCH1);
+    pub const XSCRATCH2: XReg = XReg::new(super::XSCRATCH2);
+    pub const WSCRATCH0: WReg = WReg::new(super::XSCRATCH0);
+    pub const WSCRATCH1: WReg = WReg::new(super::XSCRATCH1);
+    pub const WSCRATCH2: WReg = WReg::new(super::XSCRATCH2);
+    pub const FP: XReg = XReg::new(super::FP);
+    pub const LR: XReg = XReg::new(super::LR);
 }

@@ -2,9 +2,12 @@
 //!
 //! Upstream owner: `backend/arm64/emit_arm64_a32_coprocessor.cpp`.
 
-use crate::backend::arm64::abi::{XSCRATCH0, XSCRATCH1};
+use rhazel::CodeGenerator;
+
+use crate::backend::arm64::abi::regs::{XSCRATCH0, XSCRATCH1};
 use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_context::EmitContext;
+#[cfg(test)]
 use crate::backend::arm64::inst;
 use crate::backend::arm64::reg_alloc::{Argument, HostLoc, HostLocKind, RegAlloc};
 use crate::interface::a32::coprocessor::{
@@ -30,11 +33,12 @@ fn call_coproc_callback(
     ctx.reg_alloc
         .prepare_for_call(code, ctx.fpsr, [None, arg0, arg1, None])?;
 
+    let code = &mut CodeGenerator::new(code);
     if let Some(user_arg) = callback.user_arg {
-        emit_mov_x_imm(code, X0, user_arg as usize as u64)?;
+        code.mov_imm(rhazel::X0, user_arg as usize as u64)?;
     }
-    emit_mov_x_imm(code, XSCRATCH0, callback.function as usize as u64)?;
-    code.write_u32(inst::blr(XSCRATCH0))?;
+    code.mov_imm(XSCRATCH0, callback.function as usize as u64)?;
+    code.blr(XSCRATCH0)?;
 
     if let Some(inst_ref) = inst_ref {
         ctx.reg_alloc.define_as_register(
@@ -101,9 +105,9 @@ pub fn emit_a32_coproc_send_one_word(
         CallbackOrAccessOneWord::Memory(destination_ptr) => {
             let mut value = ctx.reg_alloc.read_w(args[1]);
             RegAlloc::realize_all(code, ctx.block, &mut [&mut value])?;
-            let value = value.index().expect("coprocessor source must be realized") as u8;
-            emit_mov_x_imm(code, XSCRATCH0, destination_ptr as usize as u64)?;
-            code.write_u32(inst::str_w_unsigned(value, XSCRATCH0, 0))?;
+            let code = &mut CodeGenerator::new(code);
+            code.mov_imm(XSCRATCH0, destination_ptr as usize as u64)?;
+            code.str(value.w(), XSCRATCH0, 0)?;
         }
     }
     Ok(())
@@ -135,12 +139,11 @@ pub fn emit_a32_coproc_send_two_words(
             let mut value1 = ctx.reg_alloc.read_w(args[1]);
             let mut value2 = ctx.reg_alloc.read_w(args[2]);
             RegAlloc::realize_all(code, ctx.block, &mut [&mut value1, &mut value2])?;
-            let value1 = value1.index().expect("coprocessor source must be realized") as u8;
-            let value2 = value2.index().expect("coprocessor source must be realized") as u8;
-            emit_mov_x_imm(code, XSCRATCH0, destination_ptrs[0] as usize as u64)?;
-            emit_mov_x_imm(code, XSCRATCH1, destination_ptrs[1] as usize as u64)?;
-            code.write_u32(inst::str_w_unsigned(value1, XSCRATCH0, 0))?;
-            code.write_u32(inst::str_w_unsigned(value2, XSCRATCH1, 0))?;
+            let code = &mut CodeGenerator::new(code);
+            code.mov_imm(XSCRATCH0, destination_ptrs[0] as usize as u64)?;
+            code.mov_imm(XSCRATCH1, destination_ptrs[1] as usize as u64)?;
+            code.str(value1.w(), XSCRATCH0, 0)?;
+            code.str(value2.w(), XSCRATCH1, 0)?;
         }
     }
     Ok(())
@@ -172,11 +175,9 @@ pub fn emit_a32_coproc_get_one_word(
         CallbackOrAccessOneWord::Memory(source_ptr) => {
             let mut value = ctx.reg_alloc.write_w(inst_ref);
             RegAlloc::realize_all(code, ctx.block, &mut [&mut value])?;
-            let value = value
-                .index()
-                .expect("coprocessor destination must be realized") as u8;
-            emit_mov_x_imm(code, XSCRATCH0, source_ptr as usize as u64)?;
-            code.write_u32(inst::ldr_w_unsigned(value, XSCRATCH0, 0))?;
+            let code = &mut CodeGenerator::new(code);
+            code.mov_imm(XSCRATCH0, source_ptr as usize as u64)?;
+            code.ldr(value.w(), XSCRATCH0, 0)?;
         }
     }
     Ok(())
@@ -206,14 +207,12 @@ pub fn emit_a32_coproc_get_two_words(
         CallbackOrAccessTwoWords::Memory(source_ptrs) => {
             let mut value = ctx.reg_alloc.write_x(inst_ref);
             RegAlloc::realize_all(code, ctx.block, &mut [&mut value])?;
-            let value = value
-                .index()
-                .expect("coprocessor destination must be realized") as u8;
-            emit_mov_x_imm(code, XSCRATCH0, source_ptrs[0] as usize as u64)?;
-            emit_mov_x_imm(code, XSCRATCH1, source_ptrs[1] as usize as u64)?;
-            code.write_u32(inst::ldr_x_unsigned(value, XSCRATCH0, 0))?;
-            code.write_u32(inst::ldr_w_unsigned(XSCRATCH1, XSCRATCH1, 0))?;
-            code.write_u32(inst::bfi_x(value, XSCRATCH1, 32, 32))?;
+            let code = &mut CodeGenerator::new(code);
+            code.mov_imm(XSCRATCH0, source_ptrs[0] as usize as u64)?;
+            code.mov_imm(XSCRATCH1, source_ptrs[1] as usize as u64)?;
+            code.ldr(value.x(), XSCRATCH0, 0)?;
+            code.ldr(XSCRATCH1.to_w(), XSCRATCH1, 0)?;
+            code.bfi(value.x(), XSCRATCH1, 32, 32)?;
         }
     }
     Ok(())
@@ -265,17 +264,6 @@ pub fn emit_a32_coproc_store_words(
         emit_coprocessor_exception();
     };
     call_coproc_callback(code, ctx, action, None, Some(args[1]), None)
-}
-
-fn emit_mov_x_imm(code: &mut BlockOfCode, reg: u8, imm: u64) -> Result<(), String> {
-    code.write_u32(inst::movz_x(reg, (imm & 0xffff) as u16, 0))?;
-    for shift in [16, 32, 48] {
-        let chunk = ((imm >> shift) & 0xffff) as u16;
-        if chunk != 0 {
-            code.write_u32(inst::movk_x(reg, chunk, shift as u8))?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -538,7 +526,7 @@ mod tests {
         );
         assert_eq!(
             read_instruction(&code, code.code_size() - 4),
-            inst::str_w_unsigned(test_gpr(0), XSCRATCH0, 0)
+            inst::str_w_unsigned(test_gpr(0), XSCRATCH0.index(), 0)
         );
 
         let mut code = BlockOfCode::with_size(4096).unwrap();
@@ -558,7 +546,7 @@ mod tests {
 
         assert_eq!(
             read_instruction(&code, code.code_size() - 4),
-            inst::ldr_w_unsigned(test_gpr(0), XSCRATCH0, 0)
+            inst::ldr_w_unsigned(test_gpr(0), XSCRATCH0.index(), 0)
         );
     }
 
@@ -602,7 +590,7 @@ mod tests {
         assert!(info.relocations.is_empty());
         assert_eq!(
             read_instruction(&code, code.code_size() - 4),
-            inst::blr(XSCRATCH0)
+            inst::blr(XSCRATCH0.index())
         );
     }
 }

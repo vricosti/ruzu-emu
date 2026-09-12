@@ -2,26 +2,15 @@
 //!
 //! Upstream owner: `backend/arm64/emit_arm64_saturation.cpp`.
 
-use rhazel::{CodeGenerator, WReg, WZR};
+use rhazel::{CodeGenerator, WZR};
 
-use crate::backend::arm64::abi::{WSCRATCH0, WSCRATCH1};
+use crate::backend::arm64::abi::regs::{WSCRATCH0, WSCRATCH1};
 use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_context::EmitContext;
 use crate::backend::arm64::reg_alloc::RegAlloc;
 use crate::ir::cond::Cond;
 use crate::ir::opcode::Opcode;
 use crate::ir::value::InstRef;
-
-/// Upstream `code.MOV(Wreg, imm)`: MOVZ plus a MOVK for the high half when
-/// it is non-zero.
-fn emit_mov_w_imm(code: &mut CodeGenerator<'_>, reg: WReg, imm: u32) -> Result<(), String> {
-    code.movz(reg, (imm & 0xffff) as u16, 0)?;
-    let high = (imm >> 16) as u16;
-    if high != 0 {
-        code.movk(reg, high, 16)?;
-    }
-    Ok(())
-}
 
 pub fn emit_signed_saturated_add_with_flag32(
     code: &mut BlockOfCode,
@@ -49,7 +38,7 @@ pub fn emit_signed_saturated_add_with_flag32(
     let (result, a, b, overflow) = (result.w(), a.w(), b.w(), overflow.w());
     code.adds(result, a, b)?;
     code.asr(WSCRATCH0, result, 31)?;
-    emit_mov_w_imm(code, WSCRATCH1, 0x8000_0000)?;
+    code.mov_imm(WSCRATCH1, 0x8000_0000 as u64)?;
     code.eor(WSCRATCH0, WSCRATCH0, WSCRATCH1)?;
     code.csel(result, result, WSCRATCH0, Cond::VC)?;
     code.cinc(overflow, WZR, Cond::VS)?;
@@ -82,7 +71,7 @@ pub fn emit_signed_saturated_sub_with_flag32(
     let (result, a, b, overflow) = (result.w(), a.w(), b.w(), overflow.w());
     code.subs(result, a, b)?;
     code.asr(WSCRATCH0, result, 31)?;
-    emit_mov_w_imm(code, WSCRATCH1, 0x8000_0000)?;
+    code.mov_imm(WSCRATCH1, 0x8000_0000 as u64)?;
     code.eor(WSCRATCH0, WSCRATCH0, WSCRATCH1)?;
     code.csel(result, result, WSCRATCH0, Cond::VC)?;
     code.cinc(overflow, WZR, Cond::VS)?;
@@ -122,8 +111,8 @@ pub fn emit_signed_saturation(
     ctx.reg_alloc.spill_flags(code)?;
 
     let (operand, result) = (operand.w(), result.w());
-    emit_mov_w_imm(code, WSCRATCH0, negative_saturated_value)?;
-    emit_mov_w_imm(code, WSCRATCH1, positive_saturated_value)?;
+    code.mov_imm(WSCRATCH0, negative_saturated_value as u64)?;
+    code.mov_imm(WSCRATCH1, positive_saturated_value as u64)?;
     code.cmp(operand, WSCRATCH0)?;
     code.csel(result, operand, WSCRATCH0, Cond::GT)?;
     code.cmp(operand, WSCRATCH1)?;
@@ -158,7 +147,7 @@ pub fn emit_unsigned_saturation(
     let saturated_value = (1u32 << bit_size) - 1;
 
     let (result, operand) = (result.w(), operand.w());
-    emit_mov_w_imm(code, WSCRATCH0, saturated_value)?;
+    code.mov_imm(WSCRATCH0, saturated_value as u64)?;
     code.cmp_imm(operand, 0)?;
     code.csel(result, operand, WZR, Cond::GT)?;
     code.cmp(operand, WSCRATCH0)?;

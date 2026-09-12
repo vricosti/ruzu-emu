@@ -997,11 +997,9 @@ fn emit_a32_terminal_inner(
         }
         Terminal::If { cond, then_, else_ } => {
             let emit_cond = ctx.conf.emit_cond;
-            let pass_branch_offset = emit_cond(code, ctx, cond)?;
+            let mut pass = emit_cond(code, ctx, cond)?;
             emit_a32_terminal_inner(code, ctx, *else_, initial_location, is_single_step)?;
-            patch_branch_to_current(code, pass_branch_offset, |pc_offset| {
-                inst::b_cond(cond, pc_offset)
-            })?;
+            pass.bind(code)?;
             emit_a32_terminal_inner(code, ctx, *then_, initial_location, is_single_step)
         }
         Terminal::CheckBit { then_, else_ } => {
@@ -1075,14 +1073,16 @@ pub(crate) fn emit_a32_cond(
     code: &mut BlockOfCode,
     ctx: &mut EmitContext<'_>,
     cond: Cond,
-) -> Result<usize, String> {
+) -> Result<Label, String> {
+    let mut pass = Label::new();
     code.write_u32(inst::ldr_w_unsigned(
         XSCRATCH0,
         XSTATE,
         ctx.conf.state_nzcv_offset as u32,
     ))?;
     code.write_u32(inst::msr_nzcv(XSCRATCH0))?;
-    code.write_u32(inst::b_cond(cond, 0))
+    pass.b_cond(code, cond)?;
+    Ok(pass)
 }
 
 fn emit_guarded_block_link_relocation(

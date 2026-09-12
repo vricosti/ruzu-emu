@@ -2,9 +2,10 @@
 //!
 //! Upstream owner: `backend/arm64/fpsr_manager.h/.cpp`.
 
-use super::abi::{XSCRATCH0, XSCRATCH1, XSTATE};
+use rhazel::{CodeGenerator, SystemReg, WReg, XZR};
+
+use super::abi::regs::{WSCRATCH0, WSCRATCH1, XSCRATCH1, XSTATE};
 use super::block_of_code::BlockOfCode;
-use super::inst;
 
 #[derive(Debug)]
 pub struct FpsrManager {
@@ -31,10 +32,11 @@ impl FpsrManager {
                 self.state_fpsr_offset
             )
         })?;
-        code.write_u32(inst::ldr_w_unsigned(XSCRATCH0, XSTATE, offset))?;
-        code.write_u32(inst::mrs_fpsr(XSCRATCH1))?;
-        code.write_u32(inst::orr_w(XSCRATCH0, XSCRATCH0, XSCRATCH1))?;
-        code.write_u32(inst::str_w_unsigned(XSCRATCH0, XSTATE, offset))?;
+        let code = &mut CodeGenerator::new(code);
+        code.ldr(WSCRATCH0, XSTATE, offset)?;
+        code.mrs(XSCRATCH1, SystemReg::FPSR)?;
+        code.orr(WSCRATCH0, WSCRATCH0, WSCRATCH1)?;
+        code.str(WSCRATCH0, XSTATE, offset)?;
 
         self.fpsr_loaded = false;
         Ok(())
@@ -45,13 +47,32 @@ impl FpsrManager {
             return Ok(());
         }
 
-        code.write_u32(inst::msr_fpsr(31))?;
+        CodeGenerator::new(code).msr(SystemReg::FPSR, XZR)?;
         self.fpsr_loaded = true;
         Ok(())
     }
 
     pub fn overwrite(&mut self) {
         self.fpsr_loaded = false;
+    }
+
+    /// Upstream `FpsrManager::GetFpsr`: the state copy, OR-ed with the live
+    /// FPSR while it is loaded. Does not spill.
+    pub fn get_fpsr(&self, code: &mut BlockOfCode, dest: WReg) -> Result<(), String> {
+        let code = &mut CodeGenerator::new(code);
+        let offset = u32::try_from(self.state_fpsr_offset).map_err(|_| {
+            format!(
+                "ARM64 FPSR state offset does not fit in u32: {}",
+                self.state_fpsr_offset
+            )
+        })?;
+        code.ldr(dest, XSTATE, offset)?;
+
+        if self.fpsr_loaded {
+            code.mrs(XSCRATCH1, SystemReg::FPSR)?;
+            code.orr(dest, dest, WSCRATCH1)?;
+        }
+        Ok(())
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -68,6 +89,8 @@ impl Default for FpsrManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::arm64::abi::{XSCRATCH0, XSCRATCH1 as XSCRATCH1_INDEX, XSTATE};
+    use crate::backend::arm64::inst;
 
     fn emitted_words(code: &BlockOfCode) -> Vec<u32> {
         let count = code.code_size() / core::mem::size_of::<u32>();
@@ -111,9 +134,31 @@ mod tests {
             vec![
                 inst::msr_fpsr(31),
                 inst::ldr_w_unsigned(XSCRATCH0, XSTATE, 12),
-                inst::mrs_fpsr(XSCRATCH1),
-                inst::orr_w(XSCRATCH0, XSCRATCH0, XSCRATCH1),
+                inst::mrs_fpsr(XSCRATCH1_INDEX),
+                inst::orr_w(XSCRATCH0, XSCRATCH0, XSCRATCH1_INDEX),
                 inst::str_w_unsigned(XSCRATCH0, XSTATE, 12),
+            ]
+        );
+    }
+
+    #[test]
+    fn get_fpsr_ors_live_fpsr_only_while_loaded() {
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut fpsr = FpsrManager::new(12);
+
+        fpsr.get_fpsr(&mut code, rhazel::W3).unwrap();
+        fpsr.load(&mut code).unwrap();
+        fpsr.get_fpsr(&mut code, rhazel::W3).unwrap();
+
+        assert!(fpsr.is_loaded());
+        assert_eq!(
+            emitted_words(&code),
+            vec![
+                inst::ldr_w_unsigned(3, XSTATE, 12),
+                inst::msr_fpsr(31),
+                inst::ldr_w_unsigned(3, XSTATE, 12),
+                inst::mrs_fpsr(XSCRATCH1_INDEX),
+                inst::orr_w(3, 3, XSCRATCH1_INDEX),
             ]
         );
     }

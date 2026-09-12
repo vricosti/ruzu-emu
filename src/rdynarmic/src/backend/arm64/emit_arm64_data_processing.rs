@@ -2,6 +2,8 @@
 //!
 //! Upstream owner: `backend/arm64/emit_arm64_data_processing.cpp`.
 
+use rhazel::{CodeGenerator, WZR};
+
 use crate::backend::arm64::abi::{XSCRATCH0, XSCRATCH1, XSTATE};
 use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_context::EmitContext;
@@ -13,6 +15,38 @@ use crate::ir::inst::MAX_ARGS;
 use crate::ir::opcode::Opcode;
 use crate::ir::types::Type;
 use crate::ir::value::InstRef;
+
+pub fn emit_is_zero32(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
+    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+    let mut result = ctx.reg_alloc.write_w(inst_ref);
+    let mut operand = ctx.reg_alloc.read_w(args[0]);
+    RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut operand])?;
+    ctx.reg_alloc.spill_flags(code)?;
+
+    code.cmp_imm(operand.w(), 0)?;
+    code.cinc(result.w(), WZR, Cond::EQ)
+}
+
+pub fn emit_is_zero64(
+    code: &mut BlockOfCode,
+    ctx: &mut EmitContext<'_>,
+    inst_ref: InstRef,
+) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
+    let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
+    let mut result = ctx.reg_alloc.write_w(inst_ref);
+    let mut operand = ctx.reg_alloc.read_x(args[0]);
+    RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut operand])?;
+    ctx.reg_alloc.spill_flags(code)?;
+
+    code.cmp_imm(operand.x(), 0)?;
+    code.cinc(result.w(), WZR, Cond::EQ)
+}
 
 pub fn emit_pack_2x32_to_1x64(
     code: &mut BlockOfCode,

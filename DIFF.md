@@ -1,5 +1,30 @@
 # Upstream parity notes
 
+## 2026-09-12 — AArch64 assembler moved to externals/rhazel vs dynarmic/backend/arm64 + merry::oaknut
+
+### Intentional differences
+- Upstream's arm64 backend owns no assembler: it links `merry::oaknut`
+  (`find_package(oaknut 2.0.1)`), and `backend/arm64/*.cpp` only emit through
+  `oaknut::CodeGenerator`/`Label`. ruzu now mirrors that boundary the way the x64
+  backend mirrors xbyak with rxbyak: `inst.rs`, `label.rs` and `block_of_code.rs`
+  moved unchanged from `src/rdynarmic/src/backend/arm64/` into
+  `externals/rhazel/src/`, which replaces rhazel's earlier unused NCE-subset
+  generator. `backend/arm64/mod.rs` re-exports them (`pub use rhazel::{inst,
+  label, block_of_code}`), so every `crate::backend::arm64::inst::…` path and all
+  ~1300 call sites are untouched; emitters, register allocation, address spaces
+  and the prelude stay in rdynarmic, as upstream's do.
+- `rhazel::Cond` is oaknut's `Cond`: the same architectural 4-bit encoding as
+  `IR::Cond`, converted at the backend boundary (`impl From<ir::Cond> for
+  rhazel::Cond`, the counterpart of upstream's `static_cast<oaknut::Cond>`);
+  the four condition-taking encoders and `Label::b_cond` accept `impl Into<Cond>`
+  so call sites keep passing `IR::Cond`. `pub(crate)` items that crossed the
+  crate boundary (`BlockOfCode::patch_u32_deferred_icache`) became `pub`.
+- The moved unit tests run under `cargo test -p rhazel` now; `encodes_known_arm64_words`
+  (`shrn_v`) fails there exactly as it did in rdynarmic before the move.
+- Still rdynarmic-private, to converge later: the free-function encoder style
+  (`inst::add_x(rd, rn, rm)`) rather than oaknut's `CodeGenerator` methods and
+  typed registers. That is a call-site rewrite, done file by file if at all.
+
 ## 2026-09-12 — src/rdynarmic/src/backend/arm64/label.rs TBNZ far fallback (MK8D)
 
 ### Intentional differences

@@ -18,6 +18,7 @@ no_execute_support = []
 
 [dependencies]
 rxbyak = { path = "../../externals/rxbyak" }
+rhazel = { path = "../../externals/rhazel" }
 bitflags = "2"
 log = "0.4"
 thiserror = "2"

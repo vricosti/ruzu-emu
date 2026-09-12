@@ -127,6 +127,40 @@ pub struct SharedMemory {
 unsafe impl Send for SharedMemory {}
 unsafe impl Sync for SharedMemory {}
 
+/// Copyable view of the mapped time shared-memory page, used by context writers.
+///
+/// Eden's `LocalSystemClockContextWriter` / `NetworkSystemClockContextWriter`
+/// hold `SharedMemory&` and write through `m_shared_memory_ptr`. The mapped
+/// address is stable for the lifetime of `SharedMemory`.
+#[derive(Clone, Copy)]
+pub struct SharedMemoryWriterHandle {
+    ptr: *mut SharedMemoryStruct,
+}
+
+// SAFETY: writes use the same lock-free protocol as `SharedMemory`.
+unsafe impl Send for SharedMemoryWriterHandle {}
+unsafe impl Sync for SharedMemoryWriterHandle {}
+
+impl SharedMemoryWriterHandle {
+    pub fn set_local_system_context(&self, context: &SystemClockContext) {
+        let s = unsafe { &mut *self.ptr };
+        write_lock_free(
+            &mut s.local_system_clock_contexts.counter,
+            &mut s.local_system_clock_contexts.value,
+            *context,
+        );
+    }
+
+    pub fn set_network_system_context(&self, context: &SystemClockContext) {
+        let s = unsafe { &mut *self.ptr };
+        write_lock_free(
+            &mut s.network_system_clock_contexts.counter,
+            &mut s.network_system_clock_contexts.value,
+            *context,
+        );
+    }
+}
+
 impl SharedMemory {
     /// Create a new SharedMemory backed by DeviceMemory.
     ///
@@ -202,20 +236,31 @@ impl SharedMemory {
         self.shared_memory_ptr
     }
 
+    /// Copyable handle for context writers. Eden's writers hold `SharedMemory&`;
+    /// the mapped pointer is stable for the lifetime of this object.
+    pub fn writer_handle(&self) -> SharedMemoryWriterHandle {
+        SharedMemoryWriterHandle {
+            ptr: self.shared_memory_ptr,
+        }
+    }
+
     /// Internal helper: get a safe reference to the shared memory struct.
     fn shared(&self) -> &SharedMemoryStruct {
         unsafe { &*self.shared_memory_ptr }
     }
 
     /// Internal helper: get a safe mutable reference to the shared memory struct.
-    fn shared_mut(&mut self) -> &mut SharedMemoryStruct {
+    ///
+    /// Writes go through the lock-free double-buffer protocol, so `&self` is
+    /// enough — matching upstream's `m_shared_memory_ptr` mutation.
+    fn shared_mut(&self) -> &mut SharedMemoryStruct {
         unsafe { &mut *self.shared_memory_ptr }
     }
 
     /// SetLocalSystemContext.
     ///
     /// Corresponds to `SharedMemory::SetLocalSystemContext` in upstream.
-    pub fn set_local_system_context(&mut self, context: &SystemClockContext) {
+    pub fn set_local_system_context(&self, context: &SystemClockContext) {
         let s = self.shared_mut();
         write_lock_free(
             &mut s.local_system_clock_contexts.counter,
@@ -227,7 +272,7 @@ impl SharedMemory {
     /// SetNetworkSystemContext.
     ///
     /// Corresponds to `SharedMemory::SetNetworkSystemContext` in upstream.
-    pub fn set_network_system_context(&mut self, context: &SystemClockContext) {
+    pub fn set_network_system_context(&self, context: &SystemClockContext) {
         let s = self.shared_mut();
         write_lock_free(
             &mut s.network_system_clock_contexts.counter,
@@ -239,7 +284,7 @@ impl SharedMemory {
     /// SetSteadyClockTimePoint.
     ///
     /// Corresponds to `SharedMemory::SetSteadyClockTimePoint` in upstream.
-    pub fn set_steady_clock_time_point(&mut self, clock_source_id: ClockSourceId, time_point: i64) {
+    pub fn set_steady_clock_time_point(&self, clock_source_id: ClockSourceId, time_point: i64) {
         let s = self.shared_mut();
         write_lock_free(
             &mut s.steady_time_points.counter,
@@ -254,7 +299,7 @@ impl SharedMemory {
     /// SetContinuousAdjustment.
     ///
     /// Corresponds to `SharedMemory::SetContinuousAdjustment` in upstream.
-    pub fn set_continuous_adjustment(&mut self, time_point: &ContinuousAdjustmentTimePoint) {
+    pub fn set_continuous_adjustment(&self, time_point: &ContinuousAdjustmentTimePoint) {
         let s = self.shared_mut();
         write_lock_free(
             &mut s.continuous_adjustment_time_points.counter,
@@ -266,7 +311,7 @@ impl SharedMemory {
     /// SetAutomaticCorrection.
     ///
     /// Corresponds to `SharedMemory::SetAutomaticCorrection` in upstream.
-    pub fn set_automatic_correction(&mut self, automatic_correction: bool) {
+    pub fn set_automatic_correction(&self, automatic_correction: bool) {
         let s = self.shared_mut();
         write_lock_free(
             &mut s.automatic_corrections.counter,
@@ -280,7 +325,7 @@ impl SharedMemory {
     /// Corresponds to `SharedMemory::UpdateBaseTime` in upstream.
     /// Reads the current steady clock time point, updates its time_point field,
     /// and writes it back.
-    pub fn update_base_time(&mut self, time: i64) {
+    pub fn update_base_time(&self, time: i64) {
         let s = self.shared_mut();
         let mut time_point =
             read_lock_free(&s.steady_time_points.counter, &s.steady_time_points.value);
@@ -356,7 +401,7 @@ mod tests {
 
     #[test]
     fn write_and_read_local_system_context() {
-        let mut sm = SharedMemory::new_for_test();
+        let sm = SharedMemory::new_for_test();
         let ctx = SystemClockContext {
             offset: 12345,
             steady_time_point: SteadyClockTimePoint {
@@ -372,7 +417,7 @@ mod tests {
 
     #[test]
     fn write_and_read_automatic_correction() {
-        let mut sm = SharedMemory::new_for_test();
+        let sm = SharedMemory::new_for_test();
         assert!(!sm.get_automatic_correction());
         sm.set_automatic_correction(true);
         assert!(sm.get_automatic_correction());
@@ -382,7 +427,7 @@ mod tests {
 
     #[test]
     fn update_base_time_preserves_clock_source_id() {
-        let mut sm = SharedMemory::new_for_test();
+        let sm = SharedMemory::new_for_test();
         let source_id = [42u8; 16];
         sm.set_steady_clock_time_point(source_id, 100);
 

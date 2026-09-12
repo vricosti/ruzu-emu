@@ -1488,6 +1488,11 @@ fn main() {
         log::error!("Failed to load ROM '{}': {:?}", filepath, load_result,);
         std::process::exit(-1);
     }
+    // Eden yuzu_cmd calls ApplySettings around Initialize/Load. RefreshTime
+    // no-ops until Glue registers time:a (after System::run); Glue::LoopProcess
+    // calls it at that point. This extra ApplySettings is for timezone/custom
+    // RTC if the services are already up.
+    system.apply_settings();
 
     let mut multiplayer_network = None;
     if let Some(multiplayer) = multiplayer {

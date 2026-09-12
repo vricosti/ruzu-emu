@@ -42,12 +42,12 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         let mut server_manager = server_manager.lock().unwrap();
 
         // ARP — stub until real implementations
-        register_stub(&mut server_manager, "arp:r");
-        register_stub(&mut server_manager, "arp:w");
+        register_stub(&mut server_manager, "arp:r", 16);
+        register_stub(&mut server_manager, "arp:w", 8);
 
         // BackGround Task Controller — stub
-        register_stub(&mut server_manager, "bgtc:t");
-        register_stub(&mut server_manager, "bgtc:sc");
+        register_stub(&mut server_manager, "bgtc:t", 64);
+        register_stub(&mut server_manager, "bgtc:sc", 64);
 
         // Error Context
         use crate::hle::service::glue::ectx::{EctxAW, EctxR, EctxW};
@@ -161,6 +161,16 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
         "Glue::LoopProcess: registered arp, bgtc, ectx, notif, time:u/a/r services"
     );
 
+    // First moment time:a and time:s both exist. Eden's TimeManager host thread
+    // reaches this point during Services(), before the game's first screen;
+    // ruzu only gets here after System::run unsuspends guest service fibers.
+    // RefreshTime writes host POSIX time into the clocks (and shared memory
+    // via the context writers) so Tomodachi Life does not keep the 2023 NAND
+    // initial-year offset.
+    if !system.is_null() {
+        system.get().refresh_time();
+    }
+
     // Upstream keeps `time` on LoopProcess's native stack. A stopped Rust
     // guest fiber can discard that stack without running local destructors.
     // Transfer the strong owner to the existing post-fiber service lifecycle
@@ -179,9 +189,9 @@ pub fn loop_process(service_manager: &Arc<Mutex<ServiceManager>>, system: crate:
 }
 
 /// Helper to register a stub service on a ServerManager.
-fn register_stub(server_manager: &mut ServerManager, name: &str) {
+fn register_stub(server_manager: &mut ServerManager, name: &str, max_sessions: u32) {
     let svc_name = name.to_string();
     let factory: SessionRequestHandlerFactory =
         Box::new(move || Arc::new(GenericStubService::new(&svc_name)));
-    server_manager.register_named_service(name, factory, 64);
+    server_manager.register_named_service(name, factory, max_sessions);
 }

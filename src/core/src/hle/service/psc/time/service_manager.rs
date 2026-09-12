@@ -88,15 +88,21 @@ impl TimeServiceManager {
         let network_operation = OperationEvent::new();
         let ephemeral_operation = OperationEvent::new();
         {
-            let mut time_guard = time.lock().unwrap();
+            let time_guard = time.lock().unwrap();
             time_guard
                 .local_system_clock_context_writer
+                .lock()
+                .unwrap()
                 .link(local_operation.clone());
             time_guard
                 .network_system_clock_context_writer
+                .lock()
+                .unwrap()
                 .link(network_operation.clone());
             time_guard
                 .ephemeral_network_clock_context_writer
+                .lock()
+                .unwrap()
                 .link(ephemeral_operation.clone());
         }
 
@@ -360,14 +366,12 @@ impl TimeServiceManager {
         time_value: i64,
     ) -> ResultCode {
         let mut time = self.time.lock().unwrap();
+        let writer = Arc::clone(&time.local_system_clock_context_writer);
+        time.standard_local_system_clock
+            .clock
+            .set_context_writer(writer);
         time.standard_local_system_clock
             .initialize(context, time_value);
-        let context = time
-            .standard_local_system_clock
-            .clock
-            .get_context()
-            .unwrap_or(*context);
-        time.shared_memory.set_local_system_context(&context);
         drop(time);
         self.check_and_setup_services_s_and_p();
         RESULT_SUCCESS
@@ -382,14 +386,12 @@ impl TimeServiceManager {
         if let Ok(local_context) = time.standard_local_system_clock.clock.get_context() {
             context = local_context;
         }
+        let writer = Arc::clone(&time.network_system_clock_context_writer);
+        time.standard_network_system_clock
+            .clock
+            .set_context_writer(writer);
         time.standard_network_system_clock
             .initialize(&context, accuracy);
-        let context = time
-            .standard_network_system_clock
-            .clock
-            .get_context()
-            .unwrap_or(context);
-        time.shared_memory.set_network_system_context(&context);
         drop(time);
         self.check_and_setup_services_s_and_p();
         RESULT_SUCCESS
@@ -448,6 +450,10 @@ impl TimeServiceManager {
 
     pub fn setup_ephemeral_network_system_clock_core(&self) -> ResultCode {
         let mut time = self.time.lock().unwrap();
+        let writer = Arc::clone(&time.ephemeral_network_clock_context_writer);
+        time.ephemeral_network_clock
+            .clock
+            .set_context_writer(writer);
         time.ephemeral_network_clock.clock.set_initialized();
         drop(time);
         self.check_and_setup_services_s_and_p();
@@ -1032,6 +1038,36 @@ mod tests {
                 steady_time_point: SteadyClockTimePoint::default(),
             }
         );
+    }
+
+    #[test]
+    fn set_current_time_after_setup_updates_shared_memory() {
+        let service =
+            TimeServiceManager::new(SystemRef::null(), std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(
+            service.setup_standard_local_system_clock_core(&SystemClockContext::default(), 1000),
+            RESULT_SUCCESS
+        );
+        let local = service
+            .get_static_service_as_admin()
+            .get_standard_local_system_clock();
+        assert_eq!(local.set_current_time(5_000_000), RESULT_SUCCESS);
+        assert_eq!(local.get_current_time(), Ok(5_000_000));
+        let shared_time = service.shared_time();
+        let time = shared_time.lock().unwrap();
+        let shm = time.shared_memory.get_local_system_context();
+        let core = time
+            .standard_local_system_clock
+            .clock
+            .get_context()
+            .unwrap();
+        assert_eq!(shm, core);
+        let time_point = time
+            .standard_local_system_clock
+            .clock
+            .get_current_time_point()
+            .unwrap();
+        assert_eq!(shm.offset + time_point.time_point, 5_000_000);
     }
 
     #[test]

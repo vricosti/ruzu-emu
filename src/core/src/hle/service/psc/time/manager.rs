@@ -38,9 +38,9 @@ pub struct TimeManager {
     pub shared_memory: SharedMemory,
     pub power_state_request_manager: Arc<PowerStateRequestManager>,
     pub alarms: Alarms,
-    pub local_system_clock_context_writer: LocalSystemClockContextWriter,
-    pub network_system_clock_context_writer: NetworkSystemClockContextWriter,
-    pub ephemeral_network_clock_context_writer: EphemeralNetworkSystemClockContextWriter,
+    pub local_system_clock_context_writer: Arc<Mutex<LocalSystemClockContextWriter>>,
+    pub network_system_clock_context_writer: Arc<Mutex<NetworkSystemClockContextWriter>>,
+    pub ephemeral_network_clock_context_writer: Arc<Mutex<EphemeralNetworkSystemClockContextWriter>>,
 }
 
 impl TimeManager {
@@ -121,14 +121,27 @@ impl TimeManager {
             })
         });
 
-        // Context writers
-        // In upstream, these hold references to shared_memory and system_clock.
-        // Here we use callback-based design; callbacks will be wired during
-        // initialization when the TimeManager is set up.
-        let local_system_clock_context_writer = LocalSystemClockContextWriter::new();
-        let network_system_clock_context_writer = NetworkSystemClockContextWriter::new();
+        // Context writers. Eden constructs them with SharedMemory&; SetContext
+        // then writes the guest time page. Wire the mapped pointer here so
+        // RefreshTime / SetCurrentTime update shared memory, not only the cores.
+        let shm_handle = shared_memory.writer_handle();
+        let mut local_system_clock_context_writer = LocalSystemClockContextWriter::new();
+        local_system_clock_context_writer.set_shared_memory_callback({
+            let shm_handle = shm_handle;
+            Box::new(move |context| shm_handle.set_local_system_context(context))
+        });
+        let mut network_system_clock_context_writer = NetworkSystemClockContextWriter::new();
+        network_system_clock_context_writer.set_shared_memory_callback({
+            let shm_handle = shm_handle;
+            Box::new(move |context| shm_handle.set_network_system_context(context))
+        });
         let ephemeral_network_clock_context_writer =
             EphemeralNetworkSystemClockContextWriter::new();
+        let local_system_clock_context_writer = Arc::new(Mutex::new(local_system_clock_context_writer));
+        let network_system_clock_context_writer =
+            Arc::new(Mutex::new(network_system_clock_context_writer));
+        let ephemeral_network_clock_context_writer =
+            Arc::new(Mutex::new(ephemeral_network_clock_context_writer));
 
         Self {
             standard_steady_clock,

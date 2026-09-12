@@ -29,7 +29,27 @@ pub struct SystemClockCore {
     get_time_point: Box<dyn Fn() -> Result<SteadyClockTimePoint, ResultCode> + Send + Sync>,
     /// Shared reference to the context writer.
     /// Corresponds to `ContextWriter* m_context_writer` in upstream.
-    context_writer: Option<Arc<Mutex<dyn ContextWriter>>>,
+    ///
+    /// Stored as `Arc<dyn ErasedContextWriter>` so `Arc<Mutex<ConcreteWriter>>`
+    /// can be attached without coercing `Mutex<T>` to `Mutex<dyn Trait>`.
+    context_writer: Option<Arc<dyn ErasedContextWriter>>,
+}
+
+/// Type-erased `Arc<Mutex<impl ContextWriter>>` so Setup* can attach the
+/// TimeManager-owned writers the same way Eden assigns `ContextWriter&`.
+trait ErasedContextWriter: Send + Sync {
+    fn write(&self, context: &SystemClockContext) -> ResultCode;
+    fn link(&self, operation_event: OperationEvent);
+}
+
+impl<T: ContextWriter + Send> ErasedContextWriter for Mutex<T> {
+    fn write(&self, context: &SystemClockContext) -> ResultCode {
+        self.lock().unwrap().write(context)
+    }
+
+    fn link(&self, operation_event: OperationEvent) {
+        self.lock().unwrap().link(operation_event);
+    }
 }
 
 impl SystemClockCore {
@@ -56,7 +76,10 @@ impl SystemClockCore {
     ///
     /// Corresponds to upstream `m_context_writer = writer;` in the
     /// ServiceManager setup code.
-    pub fn set_context_writer(&mut self, writer: Arc<Mutex<dyn ContextWriter>>) {
+    pub fn set_context_writer<T: ContextWriter + Send + 'static>(
+        &mut self,
+        writer: Arc<Mutex<T>>,
+    ) {
         self.context_writer = Some(writer);
     }
 
@@ -122,7 +145,7 @@ impl SystemClockCore {
         }
 
         if let Some(ref writer) = self.context_writer {
-            let rc = writer.lock().unwrap().write(context);
+            let rc = writer.write(context);
             if rc != RESULT_SUCCESS {
                 return rc;
             }
@@ -137,7 +160,7 @@ impl SystemClockCore {
     /// The operation event will be signaled whenever the context changes.
     pub fn link_operation_event(&mut self, operation_event: OperationEvent) {
         if let Some(ref writer) = self.context_writer {
-            writer.lock().unwrap().link(operation_event);
+            writer.link(operation_event);
         }
     }
 }

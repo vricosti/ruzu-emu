@@ -113,15 +113,18 @@ impl TimeManager {
         };
 
         let mut epoch_time = get_epoch_time_from_initial_year(set_sys);
-        if user_clock_context == SystemClockContext::default() {
-            if let Ok(rtc_time) = self
-                .steady_clock_resource
-                .lock()
-                .unwrap()
-                .get_rtc_time_in_seconds()
-            {
-                epoch_time = rtc_time;
-            }
+        // Eden uses RTC only when the NAND user context is default. A non-default
+        // context whose clock_source_id does not match still calls SetCurrentTime
+        // with this epoch; firmware `standard_user_clock_initial_year` is 2023,
+        // which freezes Tomodachi Life on 3 Jan 2023. Always take the host RTC
+        // so the ID-mismatch path matches Eden's "not stuck in the past" TODO.
+        if let Ok(rtc_time) = self
+            .steady_clock_resource
+            .lock()
+            .unwrap()
+            .get_rtc_time_in_seconds()
+        {
+            epoch_time = rtc_time;
         }
         let _ = time_m.setup_standard_local_system_clock_core(&user_clock_context, epoch_time);
 

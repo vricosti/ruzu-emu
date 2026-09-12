@@ -1,5 +1,23 @@
 # Upstream parity notes
 
+## 2026-09-12 — time shared-memory writers vs eden `psc/time/service_manager.cpp` SetupStandard*ClockCore
+
+### Intentional differences
+- Context writers are `Arc<Mutex<ConcreteWriter>>` attached through a private `ErasedContextWriter` trait. Eden holds `ContextWriter&` on the clock cores; Rust cannot store a reference into `TimeManager` while the cores live in the same mutex.
+- `SharedMemory` setters take `&self` and mutate the mapped page through the lock-free pointer, matching Eden's `m_shared_memory_ptr` writes. A copyable `SharedMemoryWriterHandle` is the Rust stand-in for `SharedMemory&` on the writers.
+- Glue `TimeManager` always seeds local `epoch_time` from host RTC, not only when the NAND user context is default. Eden's own comment in `glue/time/manager.cpp` says the initial-year path leaves first boot stuck in the past (`standard_user_clock_initial_year` is 2023). ID-matched NAND contexts still need `RefreshTime`.
+- `RefreshTime` is invoked from `Glue::LoopProcess` after `time:a` is registered, not from `System::load`. Eden runs Glue on a host thread inside `Services()`, so clocks exist before Load returns. Ruzu guest service fibers only run after `System::run` (confirmed by `ruzu_log.txt`: load at 4.846 warned services missing, TimeManager init at 4.884). Blocking `GetService` in `load` would deadlock.
+
+### Unintentional differences (to fix)
+- None in this slice.
+
+### Missing items
+- None. `SetupStandardLocal/Network/Ephemeral` now call `SetContextWriter` before `Initialize`/`SetInitialized`, so `SetCurrentTime` (RefreshTime, guest IPC) updates the guest time shared-memory page.
+
+### Binary layout verification
+- PASS: `SharedMemoryStruct` still 0x1000; local context remains at 0x38, network at 0x80.
+
+
 ## 2026-09-12 — firmware 23.0.0 vs eden e7a96c7907 (`[hle] Firmware 23.0.0`)
 
 ### Intentional differences

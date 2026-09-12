@@ -2034,6 +2034,14 @@ impl System {
 
         self.status = SystemResultStatus::Success;
 
+        // Do not call RefreshTime here. Eden starts Glue/PSC LoopProcess on
+        // host threads inside Services(), so time:a/time:s exist before Load
+        // returns. Ruzu's guest_service fibers only enter LoopProcess after
+        // System::run unsuspends the kernel — ruzu_log.txt at 4.846 warned
+        // "time services not registered" then TimeManager initialized at 4.884.
+        // Blocking GetService here would deadlock waiting for run(). Glue
+        // calls refresh_time after registering time:a.
+
         log::info!("Successfully loaded ROM: {}", filepath);
         SystemResultStatus::Success
     }
@@ -2193,6 +2201,12 @@ impl System {
         self.is_powered_on.load(Ordering::Relaxed)
     }
 
+    /// Port of `System::ApplySettings`. RefreshTime first; renderer refresh
+    /// stays with the frontend (GPU lives outside this crate).
+    pub fn apply_settings(&self) {
+        self.refresh_time();
+    }
+
     /// System::Impl::RefreshTime, called before the renderer refresh when
     /// applying settings. No settings/service-manager lock crosses a service
     /// call: clock updates can notify workers that acquire these same locks.
@@ -2205,10 +2219,19 @@ impl System {
             return;
         }
         let manager = self.service_manager().expect("powered system has services");
-        let system = SystemRef::from_ref(self);
-        let settings_handler = ServiceManager::get_service_blocking(&manager, system, "set:sys");
-        let admin_handler = ServiceManager::get_service_blocking(&manager, system, "time:a");
-        let static_handler = ServiceManager::get_service_blocking(&manager, system, "time:s");
+        // Eden GetService(..., true) can block: Glue/PSC already run on host
+        // threads. Ruzu's guest fibers only register time:a/time:s after
+        // System::run. Blocking here from Load/ApplySettings deadlocks.
+        let (settings_handler, admin_handler, static_handler) = {
+            let sm = manager.lock().unwrap();
+            (sm.get_service("set:sys"), sm.get_service("time:a"), sm.get_service("time:s"))
+        };
+        let (Some(settings_handler), Some(admin_handler), Some(static_handler)) =
+            (settings_handler, admin_handler, static_handler)
+        else {
+            log::debug!("System::RefreshTime: time services not registered yet");
+            return;
+        };
         let settings = settings_handler.as_any().downcast_ref::<SystemSettingsService>()
             .expect("set:sys is a settings service");
         let admin = admin_handler.as_any().downcast_ref::<GlueStatic>()
@@ -2236,7 +2259,9 @@ impl System {
             Err(error) => -(error.duration().as_secs() as i64),
         };
         // Upstream adds u64 then passes the unchanged bit pattern to s64.
-        refresh_system_clocks(settings, &user, &local, &network, now.wrapping_add(offset));
+        let posix = now.wrapping_add(offset);
+        log::info!("System::RefreshTime: writing host POSIX time {posix} to local/network clocks");
+        refresh_system_clocks(settings, &user, &local, &network, posix);
     }
 
     /// Upstream System::GetRenderdocAPI. Unlike dereferencing an empty C++
@@ -3292,6 +3317,7 @@ mod exit_state_tests {
         }
         // Must not try to discover services before System is powered on.
         System::new().refresh_time();
+        System::new().apply_settings();
     }
 
     #[test]

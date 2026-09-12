@@ -341,6 +341,59 @@ mod tests {
     use crate::hle::kernel::k_thread::KThread;
 
     #[test]
+    fn single_core_preemption_releases_guards_and_enables_resumed_thread() {
+        let host = Fiber::thread_to_fiber();
+        let original = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut thread = original.lock().unwrap();
+            thread.set_current_core(0);
+            thread.host_context = Some(host.clone());
+        }
+        let resumed = Arc::new(KThreadLock::new(KThread::new()));
+        resumed.lock().unwrap().disable_dispatch();
+        let scheduler = Arc::new(std::sync::Mutex::new(KScheduler::new(1)));
+        scheduler.lock().unwrap().physical_cores = vec![
+            Arc::new(super::super::physical_core::PhysicalCore::new(0, false)),
+            Arc::new(super::super::physical_core::PhysicalCore::new(1, false)),
+        ];
+        let scheduler_weak = Arc::downgrade(&scheduler);
+        let original_weak = Arc::downgrade(&original);
+        let resumed_weak = Arc::downgrade(&resumed);
+        let host_weak = Arc::downgrade(&host);
+        let switch = Fiber::new(Box::new(move || {
+            let scheduler = scheduler_weak.upgrade().unwrap();
+            // Both locks must be available while the caller is suspended.
+            let this_fiber = Arc::downgrade(
+                scheduler.try_lock().unwrap().switch_fiber.as_ref().unwrap(),
+            );
+            drop(scheduler);
+            assert_eq!(
+                original_weak
+                    .upgrade()
+                    .unwrap()
+                    .try_lock()
+                    .unwrap()
+                    .get_disable_dispatch_count(),
+                1
+            );
+            let resumed = resumed_weak.upgrade().unwrap();
+            crate::hle::kernel::kernel::set_current_emu_thread(Some(&resumed));
+            Fiber::yield_to(this_fiber, &host_weak.upgrade().unwrap());
+        }));
+        scheduler.lock().unwrap().switch_fiber = Some(switch);
+        crate::hle::kernel::kernel::set_current_emu_thread(Some(&original));
+        let ptr = {
+            let mut guard = scheduler.lock().unwrap();
+            &mut *guard as *mut KScheduler
+        };
+        unsafe { KScheduler::preempt_single_core_raw(ptr) };
+        assert_eq!(resumed.lock().unwrap().get_disable_dispatch_count(), 0);
+        assert_eq!(original.lock().unwrap().get_disable_dispatch_count(), 1);
+        crate::hle::kernel::kernel::set_current_emu_thread(None);
+        host.exit();
+    }
+
+    #[test]
     fn nested_hle_ipc_context_coalesces_host_fiber_switch_requests() {
         let outer = HleIpcHostFiberContext::enter();
         let inner = HleIpcHostFiberContext::enter();
@@ -531,6 +584,34 @@ mod tests {
 
         assert_eq!(current_thread.lock().unwrap().get_current_core(), 1);
         assert_eq!(next_thread.lock().unwrap().get_current_core(), 1);
+    }
+
+    #[test]
+    fn switch_thread_same_selection_restores_identity_after_other_core_ran() {
+        let selected = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut thread = selected.lock().unwrap();
+            thread.thread_id = 40;
+            thread.set_current_core(0);
+        }
+        let other_core = Arc::new(KThreadLock::new(KThread::new()));
+        {
+            let mut thread = other_core.lock().unwrap();
+            thread.thread_id = 41;
+            thread.set_current_core(3);
+        }
+        let mut scheduler = KScheduler::new(0);
+        scheduler.current_thread = Some(Arc::downgrade(&selected));
+        scheduler.current_thread_id = Some(40);
+        scheduler.idle_thread = Some(Arc::downgrade(&selected));
+        scheduler.idle_thread_id = Some(40);
+        super::super::kernel::set_current_emu_thread(Some(&other_core));
+        scheduler.switch_thread_impl(None, 40);
+        let running = super::super::kernel::get_current_thread_pointer().unwrap();
+        assert!(Arc::ptr_eq(&running, &selected));
+        assert_eq!(scheduler.current_thread_id, Some(40));
+        assert_eq!(other_core.lock().unwrap().get_current_core(), 3);
+        super::super::kernel::set_current_emu_thread(None);
     }
 
     #[test]
@@ -1605,7 +1686,10 @@ impl KScheduler {
     /// Preempt single core.
     /// Matches upstream `KScheduler::PreemptSingleCore()`:
     /// disables dispatch, unloads thread, yields to switch fiber, enables dispatch.
-    pub fn preempt_single_core(&mut self) {
+    /// # Safety
+    /// Called on the single CPU host thread, with the scheduler owner alive
+    /// and no scheduler guard or reference retained across the fiber switch.
+    pub unsafe fn preempt_single_core_raw(sched: *mut Self) {
         // Upstream:
         //   GetCurrentThread(m_kernel).DisableDispatch();
         //   auto* thread = GetCurrentThreadPointer(m_kernel);
@@ -1616,7 +1700,7 @@ impl KScheduler {
 
         let cur_thread = super::kernel::get_current_thread_pointer();
         if let Some(ref cur_thread) = cur_thread {
-            self.ensure_switch_fiber();
+            (*sched).ensure_switch_fiber();
             cur_thread.lock().unwrap().disable_dispatch();
 
             // Unload the current thread.
@@ -1637,7 +1721,7 @@ impl KScheduler {
                 cur_thread.lock().unwrap().enable_dispatch();
                 return;
             };
-            if previous_core_index >= self.physical_cores.len() {
+            if previous_core_index >= (*sched).physical_cores.len() {
                 log::error!(
                     "KScheduler::preempt_single_core: current thread core {} is out of range",
                     previous_core
@@ -1645,7 +1729,7 @@ impl KScheduler {
                 cur_thread.lock().unwrap().enable_dispatch();
                 return;
             }
-            self.unload_on_core(cur_thread, previous_core);
+            (*sched).unload_on_core(cur_thread, previous_core);
 
             // Upstream (k_scheduler.cpp KScheduler::PreemptSingleCore):
             //   Common::Fiber::YieldTo(thread->GetHostContext(), *m_switch_fiber);
@@ -1659,10 +1743,13 @@ impl KScheduler {
             // host-thread path that tries to lock the same KThread (e.g.,
             // handle_interrupt's `thread.get_thread_id()` or scheduler
             // fiber operations).
-            if let Some(ref switch_fiber) = &self.switch_fiber {
+            // Own the fiber locally rather than borrowing the scheduler
+            // while that same scheduler executes on its switch fiber.
+            let switch_fiber = (*sched).switch_fiber.clone();
+            if let Some(switch_fiber) = switch_fiber {
                 let host_ctx = cur_thread.lock().unwrap().host_context.clone();
                 if let Some(host_ctx) = host_ctx {
-                    Fiber::yield_to(Arc::downgrade(&host_ctx), switch_fiber);
+                    Fiber::yield_to(Arc::downgrade(&host_ctx), &switch_fiber);
                 }
             }
 
@@ -3399,6 +3486,15 @@ impl KScheduler {
 
         // If same thread, nothing to do.
         if Some(next_thread_id) == cur_thread_id {
+            // In single-core mode another virtual core's fiber may have run
+            // since this scheduler last selected its current thread. Our
+            // per-scheduler selection is unchanged, but host TLS is shared by
+            // all four cores. Restore the executing identity before resuming;
+            // otherwise PreemptSingleCore unloads the other core's thread.
+            // Keep the per-core accounting fast path unchanged.
+            if let Some(ref current) = cur_thread {
+                super::kernel::set_current_emu_thread(Some(current));
+            }
             log::trace!("switch_thread_impl: same thread, skipping");
             return;
         }

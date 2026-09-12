@@ -17329,3 +17329,39 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   pool targets stay unchanged and the system pool absorbs the reservation.
   The separate per-SVC allocation-size limit is not a total-DRAM limit and is
   not changed by this correction.
+
+## 2026-09-12 — src/core/src/cpu_manager.rs vs core/cpu_manager.{h,cpp}
+
+### Intentional differences
+- CpuManager's current-core and idle-count fields use shared atomic storage.
+  Guest and idle fibers clone that storage before entering their loops, so
+  suspended fibers neither create private counters nor retain exclusive
+  CpuManager references. The idle count is only advanced by the single CPU
+  host thread; relaxed atomic access provides Rust interior mutability.
+- The scheduler transition uses a raw-pointer entry after dropping its mutex.
+  The scheduler Arc stays alive across the transition. After resumption, the
+  current-core field is loaded again before testing IsIdle, as in upstream.
+
+## 2026-09-12 — src/core/src/hle/kernel/k_scheduler.rs vs core/hle/kernel/k_scheduler.{h,cpp}
+
+### Intentional differences
+- SwitchThread retains Ruzu's per-scheduler current-thread accounting, but
+  restores host TLS even when that scheduler selects the same thread again.
+  In single-core emulation other virtual cores use the same OS-thread TLS
+  between visits. Upstream compares against GetCurrentThreadPointer (TLS),
+  so its ordinary switch path updates that identity; Ruzu's per-scheduler
+  early return previously skipped the necessary identity refresh.
+- PreemptSingleCore takes a raw scheduler pointer on the CPU host thread,
+  rather than a mutable borrow spanning YieldTo. The switch fiber is cloned
+  into a local owner before yielding; temporary scheduler/thread guards are
+  gone before the destination fiber runs. DisableDispatch, unloading through
+  the previous core, yielding, then enabling the resumed current thread keep
+  upstream ordering.
+
+## 2026-09-12 — src/core/src/hle/kernel/kernel.rs vs core/hle/kernel/kernel.cpp and k_thread.cpp
+
+### Intentional differences
+- The existing Rust kernel bootstrap supplies the idle closure directly,
+  while upstream InitializeIdleThread obtains GetIdleThreadStartFunc from
+  CpuManager. Both now call the mode-selecting IdleThreadFunction; single-core
+  no longer substitutes PhysicalCore::Idle's host-blocking multicore loop.

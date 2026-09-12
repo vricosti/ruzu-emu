@@ -53,9 +53,11 @@ pub struct CpuManager {
     /// Whether we're in multicore mode.
     is_multicore: bool,
     /// Currently active core index.
-    current_core: AtomicUsize,
+    current_core: Arc<AtomicUsize>,
     /// Count of idle iterations (single-core).
-    idle_count: usize,
+    // Shared across suspended single-core fibers, without an exclusive borrow
+    // of CpuManager spanning a yield. Upstream owns the same counter here.
+    idle_count: Arc<AtomicUsize>,
     /// Number of active cores.
     num_cores: usize,
     /// Stop flag for graceful thread shutdown.
@@ -360,8 +362,8 @@ impl CpuManager {
             core_data: Default::default(),
             is_async_gpu: false,
             is_multicore: false,
-            current_core: AtomicUsize::new(0),
-            idle_count: 0,
+            current_core: Arc::new(AtomicUsize::new(0)),
+            idle_count: Arc::new(AtomicUsize::new(0)),
             num_cores: 0,
             stop_requested: Arc::new(AtomicBool::new(false)),
         }
@@ -616,7 +618,7 @@ impl CpuManager {
         // If it returns, this core has no user thread — run idle loop.
         // This happens for cores 1-3 when only core 0 has the application thread.
         log::info!("GuestActivate: no user thread on this core, entering idle loop");
-        Self::multi_core_run_idle_thread(kernel);
+        Self::idle_thread_function(kernel);
     }
 
     /// Guest thread function — dispatches to multicore or single-core variant.
@@ -626,7 +628,7 @@ impl CpuManager {
         kernel: &KernelCore,
         core_timing: &Arc<CoreTiming>,
         current_core: &AtomicUsize,
-        idle_count: &mut usize,
+        idle_count: &AtomicUsize,
         is_multicore: bool,
     ) {
         if is_multicore {
@@ -639,17 +641,24 @@ impl CpuManager {
     /// Idle thread function — dispatches to multicore or single-core variant.
     ///
     /// Upstream: `CpuManager::IdleThreadFunction()` (cpu_manager.cpp:50-56).
-    pub fn idle_thread_function(
-        kernel: &KernelCore,
-        core_timing: &Arc<CoreTiming>,
-        current_core: &AtomicUsize,
-        idle_count: &mut usize,
-        is_multicore: bool,
-    ) {
-        if is_multicore {
+    pub fn idle_thread_function(kernel: &KernelCore) {
+        if kernel.is_multicore() {
             Self::multi_core_run_idle_thread(kernel);
         } else {
-            Self::single_core_run_idle_thread(kernel, core_timing, current_core, idle_count);
+            let system = kernel.system();
+            assert!(
+                !system.is_null(),
+                "single-core idle requires its owning System"
+            );
+            let (current_core, idle_count) = {
+                let manager = system.get().get_cpu_manager();
+                (manager.current_core.clone(), manager.idle_count.clone())
+            };
+            let core_timing = kernel
+                .core_timing()
+                .expect("single-core CoreTiming")
+                .clone();
+            Self::single_core_run_idle_thread(kernel, &core_timing, &current_core, &idle_count);
         }
     }
 
@@ -1806,17 +1815,24 @@ impl CpuManager {
     /// Upstream: `CpuManager::GuestThreadFunction()` → `SingleCoreRunGuestThread()`.
     /// In upstream, CpuManager is a class with member fields (core_timing,
     /// current_core, idle_count). Here we access core_timing via kernel and
-    /// use local state for current_core/idle_count.
+    /// share CpuManager's current_core/idle_count across every guest/idle fiber.
     pub fn single_core_run_guest_thread_entry(kernel: &KernelCore) {
         if let Some(core_timing) = kernel.core_timing() {
             let core_timing = core_timing.clone();
-            let current_core = AtomicUsize::new(0);
-            let mut idle_count: usize = 0;
+            let system = kernel.system();
+            assert!(
+                !system.is_null(),
+                "single-core guest requires its owning System"
+            );
+            let (current_core, idle_count) = {
+                let manager = system.get().get_cpu_manager();
+                (manager.current_core.clone(), manager.idle_count.clone())
+            };
             Self::single_core_run_guest_thread(
                 kernel,
                 &core_timing,
                 &current_core,
-                &mut idle_count,
+                &idle_count,
             );
         } else {
             log::error!("SingleCoreRunGuestThread: no CoreTiming available");
@@ -1832,7 +1848,7 @@ impl CpuManager {
         kernel: &KernelCore,
         core_timing: &Arc<CoreTiming>,
         current_core: &AtomicUsize,
-        idle_count: &mut usize,
+        idle_count: &AtomicUsize,
     ) {
         // Upstream: kernel.CurrentScheduler()->OnThreadStart();
         if let Some(scheduler_arc) = kernel.current_scheduler() {
@@ -1909,7 +1925,7 @@ impl CpuManager {
         kernel: &KernelCore,
         core_timing: &Arc<CoreTiming>,
         current_core: &AtomicUsize,
-        idle_count: &mut usize,
+        idle_count: &AtomicUsize,
     ) {
         if let Some(scheduler_arc) = kernel.current_scheduler() {
             if let Some(thread_arc) = kernel.get_current_emu_thread() {
@@ -1921,7 +1937,7 @@ impl CpuManager {
             Self::shutdown_if_requested(kernel);
             Self::preempt_single_core_inner(kernel, core_timing, current_core, idle_count, false);
             core_timing.add_ticks(1000);
-            *idle_count += 1;
+            idle_count.fetch_add(1, Ordering::Relaxed);
             Self::handle_interrupt(kernel);
             Self::shutdown_if_requested(kernel);
         }
@@ -1943,10 +1959,10 @@ impl CpuManager {
     ) {
         // Without kernel access, delegate to the inner version using stored state.
         // This path is used by the legacy System::run_main_loop path.
-        if self.idle_count >= 4 || from_running_environment {
+        if self.idle_count.load(Ordering::Relaxed) >= 4 || from_running_environment {
             if !from_running_environment {
                 core_timing.idle();
-                self.idle_count = 0;
+                self.idle_count.store(0, Ordering::Relaxed);
             }
             let _ = core_timing.advance();
         }
@@ -1965,13 +1981,13 @@ impl CpuManager {
         kernel: &KernelCore,
         core_timing: &Arc<CoreTiming>,
         current_core: &AtomicUsize,
-        idle_count: &mut usize,
+        idle_count: &AtomicUsize,
         from_running_environment: bool,
     ) {
-        if *idle_count >= 4 || from_running_environment {
+        if idle_count.load(Ordering::Relaxed) >= 4 || from_running_environment {
             if !from_running_environment {
                 core_timing.idle();
-                *idle_count = 0;
+                idle_count.store(0, Ordering::Relaxed);
             }
             kernel.set_is_phantom_mode_for_single_core(true);
             let _ = core_timing.advance();
@@ -1985,14 +2001,22 @@ impl CpuManager {
 
         // Upstream: kernel.Scheduler(current_core).PreemptSingleCore();
         if let Some(scheduler) = kernel.scheduler(next_core) {
-            scheduler.lock().unwrap().preempt_single_core();
+            let sched_ptr = {
+                let mut guard = scheduler.lock().unwrap();
+                &mut *guard as *mut super::hle::kernel::k_scheduler::KScheduler
+            };
+            // Single-core transitions run on the sole CPU host thread. Keep
+            // the Arc alive, but release the mutex before the switch fiber runs.
+            unsafe {
+                super::hle::kernel::k_scheduler::KScheduler::preempt_single_core_raw(sched_ptr);
+            }
         }
 
         // We've now been scheduled again, and we may have exchanged schedulers.
         // Reload the scheduler in case it's different.
-        if let Some(scheduler) = kernel.scheduler(next_core) {
+        if let Some(scheduler) = kernel.scheduler(current_core.load(Ordering::Relaxed)) {
             if !scheduler.lock().unwrap().is_idle() {
-                *idle_count = 0;
+                idle_count.store(0, Ordering::Relaxed);
             }
         }
     }
@@ -2137,5 +2161,34 @@ impl CpuManager {
 impl Default for CpuManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod single_core_tests {
+    use super::*;
+
+    #[test]
+    fn single_core_preemption_rotates_the_shared_manager_index() {
+        let manager = CpuManager::new();
+        let guest_core = manager.current_core.clone();
+        let idle_core = manager.current_core.clone();
+        let idle_count = manager.idle_count.clone();
+        let mut kernel = KernelCore::new();
+        kernel.set_multicore(false);
+        let timing = Arc::new(CoreTiming::new());
+        timing.set_multicore(false);
+        for (index, core) in [&guest_core, &idle_core, &guest_core, &idle_core]
+            .into_iter()
+            .enumerate()
+        {
+            CpuManager::preempt_single_core_inner(&kernel, &timing, core, &idle_count, false);
+            assert_eq!(manager.current_core(), (index + 1) % 4);
+            idle_count.fetch_add(1, Ordering::Relaxed);
+        }
+        assert_eq!(manager.idle_count.load(Ordering::Relaxed), 4);
+        CpuManager::preempt_single_core_inner(&kernel, &timing, &idle_core, &idle_count, false);
+        assert_eq!(manager.current_core(), 1);
+        assert_eq!(manager.idle_count.load(Ordering::Relaxed), 0);
     }
 }

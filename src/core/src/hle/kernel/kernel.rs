@@ -3944,19 +3944,10 @@ impl KernelCore {
                 // Upstream: InitializeIdleThread passes GetIdleThreadStartFunc().
                 // IdleThreadFunction calls MultiCoreRunIdleThread or SingleCoreRunIdleThread.
                 let kp = kernel_ptr;
-                let is_mc = self.is_multicore;
                 let idle_func: Box<dyn FnOnce() + Send> = Box::new(move || {
                     // Safety: kernel_ptr is valid for the lifetime of this fiber.
                     let kernel = unsafe { &*(kp as *const KernelCore) };
-                    if is_mc {
-                        crate::cpu_manager::CpuManager::multi_core_run_idle_thread_entry(kernel);
-                    } else {
-                        // Single-core idle requires CoreTiming and additional state
-                        // that are not available from the fiber context yet.
-                        // For now, run the multicore idle path which is functionally
-                        // equivalent (idle + handle interrupt loop).
-                        crate::cpu_manager::CpuManager::multi_core_run_idle_thread_entry(kernel);
-                    }
+                    crate::cpu_manager::CpuManager::idle_thread_function(kernel);
                 });
 
                 t.initialize_kernel_idle_thread(core_id, thread_id, object_id, Some(idle_func));

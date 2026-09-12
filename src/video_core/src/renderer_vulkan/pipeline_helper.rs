@@ -124,11 +124,10 @@ pub unsafe fn write_descriptor_buffer(
             let entry = unsafe { &*payload };
             payload = unsafe { payload.add(1) };
             let address = unsafe { entry.address };
-            let address_info = vk::DescriptorAddressInfoEXT::builder()
+            let address_info = vk::DescriptorAddressInfoEXT::default()
                 .address(address.address)
                 .range(address.range)
-                .format(address.format)
-                .build();
+                .format(address.format);
             let data = match binding.descriptor_type {
                 vk::DescriptorType::UNIFORM_BUFFER => vk::DescriptorDataEXT {
                     p_uniform_buffer: &address_info,
@@ -183,7 +182,7 @@ pub struct DescriptorInfo {
 pub struct DescriptorLayoutBuilder {
     device: DeviceReference,
     is_compute: bool,
-    bindings: Vec<vk::DescriptorSetLayoutBinding>,
+    bindings: Vec<vk::DescriptorSetLayoutBinding<'static>>,
     entries: Vec<vk::DescriptorUpdateTemplateEntry>,
     binding: u32,
     num_descriptors: u32,
@@ -295,8 +294,8 @@ impl DescriptorLayoutBuilder {
         }
         let binding_flags = vec![vk::DescriptorBindingFlags::PARTIALLY_BOUND; self.bindings.len()];
         let mut binding_flags_info =
-            vk::DescriptorSetLayoutBindingFlagsCreateInfo::builder().binding_flags(&binding_flags);
-        let mut ci = vk::DescriptorSetLayoutCreateInfo::builder()
+            vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
+        let mut ci = vk::DescriptorSetLayoutCreateInfo::default()
             .flags(flags)
             .bindings(&self.bindings);
         if !use_push_descriptor && device.is_descriptor_binding_partially_bound_supported() {
@@ -335,6 +334,7 @@ impl DescriptorLayoutBuilder {
             },
             pipeline_layout,
             set: 0,
+            ..Default::default()
         };
         unsafe {
             self.device
@@ -386,6 +386,7 @@ impl DescriptorLayoutBuilder {
             },
             push_constant_range_count: 1,
             p_push_constant_ranges: &range,
+            ..Default::default()
         };
         unsafe {
             self.device
@@ -411,6 +412,7 @@ impl DescriptorLayoutBuilder {
                 descriptor_count: desc.count,
                 stage_flags: stage,
                 p_immutable_samplers: std::ptr::null(),
+                ..Default::default()
             });
             self.entries.push(vk::DescriptorUpdateTemplateEntry {
                 dst_binding: self.binding,

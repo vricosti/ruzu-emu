@@ -82,9 +82,8 @@ impl Buffer {
                     .vulkan_device()
                     .get_logical()
                     .get_buffer_device_address(
-                        &vk::BufferDeviceAddressInfo::builder()
-                            .buffer(buffer)
-                            .build(),
+                        &vk::BufferDeviceAddressInfo::default()
+                            .buffer(buffer),
                     )
             }
         } else {
@@ -184,12 +183,11 @@ impl Buffer {
             requested_format,
         )
         .format;
-        let info = vk::BufferViewCreateInfo::builder()
+        let info = vk::BufferViewCreateInfo::default()
             .buffer(self.handle())
             .format(format)
             .offset(offset as vk::DeviceSize)
-            .range(size as vk::DeviceSize)
-            .build();
+            .range(size as vk::DeviceSize);
         let view = unsafe {
             device
                 .get_logical()
@@ -470,7 +468,7 @@ pub struct BufferCacheRuntime {
     null_buffer: Option<AllocatedBuffer>,
     has_null_descriptor: bool,
     extended_dynamic_state_supported: bool,
-    transform_feedback: Option<vk::ExtTransformFeedbackFn>,
+    transform_feedback: Option<ash::ext::transform_feedback::DeviceFn>,
     max_vertex_input_bindings: u32,
     uniform_buffer_alignment: u32,
     limit_dynamic_storage_buffers: bool,
@@ -519,7 +517,7 @@ impl BufferCacheRuntime {
             None
         };
         let transform_feedback = transform_feedback_supported.then(|| {
-            vk::ExtTransformFeedbackFn::load(|name| unsafe {
+            ash::ext::transform_feedback::DeviceFn::load(|name| unsafe {
                 std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
             })
         });
@@ -688,9 +686,8 @@ impl BufferCacheRuntime {
             self.vulkan_device()
                 .get_logical()
                 .get_buffer_device_address(
-                    &vk::BufferDeviceAddressInfo::builder()
-                        .buffer(buffer)
-                        .build(),
+                    &vk::BufferDeviceAddressInfo::default()
+                        .buffer(buffer),
                 )
         }
     }
@@ -792,15 +789,14 @@ impl BufferCacheRuntime {
                     dst_offset: 0,
                     size,
                 };
-                let barrier = vk::BufferMemoryBarrier::builder()
+                let barrier = vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::INDEX_READ)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .buffer(dst_buffer)
                     .offset(0)
-                    .size(size)
-                    .build();
+                    .size(size);
                 device.cmd_copy_buffer(cmdbuf, src_buffer, dst_buffer, &[copy]);
                 device.cmd_pipeline_barrier(
                     cmdbuf,
@@ -865,11 +861,10 @@ impl BufferCacheRuntime {
         } else {
             usage
         };
-        let buffer_info = vk::BufferCreateInfo::builder()
+        let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         self.memory_allocator()
             .create_buffer(&buffer_info, MemoryUsage::DeviceLocal)
     }
@@ -890,11 +885,10 @@ impl BufferCacheRuntime {
         } else {
             usage
         };
-        let buffer_info = vk::BufferCreateInfo::builder()
+        let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         self.memory_allocator().create_buffer_with_alignment(
             &buffer_info,
             MemoryUsage::DeviceLocal,
@@ -966,14 +960,12 @@ impl BufferCacheRuntime {
             .request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
-            let read_barrier = vk::MemoryBarrier::builder()
+            let read_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
-                .build();
-            let write_barrier = vk::MemoryBarrier::builder()
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+            let write_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .build();
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             unsafe {
                 if barrier {
                     device.cmd_pipeline_barrier(
@@ -1183,10 +1175,9 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             .request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
-            let read_barrier = vk::MemoryBarrier::builder()
+            let read_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
-                .build();
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
             unsafe {
                 device.cmd_pipeline_barrier(
                     cmdbuf,
@@ -1207,10 +1198,9 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             .request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
-            let write_barrier = vk::MemoryBarrier::builder()
+            let write_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .build();
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             unsafe {
                 device.cmd_pipeline_barrier(
                     cmdbuf,
@@ -1279,14 +1269,12 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             .request_outside_render_pass_operation_context();
         self.scheduler().record(move |cmdbuf| {
             let device = device.get().get_logical();
-            let read_barrier = vk::MemoryBarrier::builder()
+            let read_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
-                .build();
-            let write_barrier = vk::MemoryBarrier::builder()
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+            let write_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .build();
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             unsafe {
                 device.cmd_pipeline_barrier(
                     cmdbuf,

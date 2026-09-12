@@ -109,22 +109,24 @@ pub struct BlockLinearUnswizzle3DPushConstants {
 }
 
 /// Memory barrier for shader write -> vertex attribute read.
-fn write_barrier_vertex() -> vk::MemoryBarrier {
+fn write_barrier_vertex() -> vk::MemoryBarrier<'static> {
     vk::MemoryBarrier {
         s_type: vk::StructureType::MEMORY_BARRIER,
         p_next: std::ptr::null(),
         src_access_mask: vk::AccessFlags::SHADER_WRITE,
         dst_access_mask: vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
+        ..Default::default()
     }
 }
 
 /// Memory barrier for shader write -> index read.
-fn write_barrier_index() -> vk::MemoryBarrier {
+fn write_barrier_index() -> vk::MemoryBarrier<'static> {
     vk::MemoryBarrier {
         s_type: vk::StructureType::MEMORY_BARRIER,
         p_next: std::ptr::null(),
         src_access_mask: vk::AccessFlags::SHADER_WRITE,
         dst_access_mask: vk::AccessFlags::INDEX_READ,
+        ..Default::default()
     }
 }
 
@@ -139,13 +141,14 @@ const INPUT_OUTPUT_BANK_INFO: DescriptorBankInfo = DescriptorBankInfo {
     score: 2,
 };
 
-fn input_output_bindings() -> [vk::DescriptorSetLayoutBinding; 2] {
+fn input_output_bindings() -> [vk::DescriptorSetLayoutBinding<'static>; 2] {
     [0, 1].map(|binding| vk::DescriptorSetLayoutBinding {
         binding,
         descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
         descriptor_count: 1,
         stage_flags: vk::ShaderStageFlags::COMPUTE,
         p_immutable_samplers: std::ptr::null(),
+        ..Default::default()
     })
 }
 
@@ -160,13 +163,14 @@ fn input_output_descriptor_template() -> [vk::DescriptorUpdateTemplateEntry; 1] 
     }]
 }
 
-fn queries_scan_bindings() -> [vk::DescriptorSetLayoutBinding; 3] {
+fn queries_scan_bindings() -> [vk::DescriptorSetLayoutBinding<'static>; 3] {
     [0, 1, 2].map(|binding| vk::DescriptorSetLayoutBinding {
         binding,
         descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
         descriptor_count: 1,
         stage_flags: vk::ShaderStageFlags::COMPUTE,
         p_immutable_samplers: std::ptr::null(),
+        ..Default::default()
     })
 }
 
@@ -265,17 +269,15 @@ impl ComputePass {
     ) -> Result<Self, vk::Result> {
         let logical = device.get_logical();
         // Create descriptor set layout
-        let layout_ci = vk::DescriptorSetLayoutCreateInfo::builder()
-            .bindings(bindings)
-            .build();
+        let layout_ci = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(bindings);
         let descriptor_set_layout =
             unsafe { logical.create_descriptor_set_layout(&layout_ci, None)? };
         // Create pipeline layout
         let set_layouts = [descriptor_set_layout];
-        let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::builder()
+        let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
-            .push_constant_ranges(push_constants)
-            .build();
+            .push_constant_ranges(push_constants);
         let layout = match unsafe { logical.create_pipeline_layout(&pipeline_layout_ci, None) } {
             Ok(layout) => layout,
             Err(error) => {
@@ -306,6 +308,7 @@ impl ComputePass {
                 pipeline_bind_point: vk::PipelineBindPoint::COMPUTE,
                 pipeline_layout: layout,
                 set: 0,
+                ..Default::default()
             };
             match unsafe { logical.create_descriptor_update_template(&template_ci, None) } {
                 Ok(descriptor_template) => descriptor_template,
@@ -349,7 +352,7 @@ impl ComputePass {
 
         // Create shader module and pipeline
         let (module, pipeline) = if !code.is_empty() {
-            let module_ci = vk::ShaderModuleCreateInfo::builder().code(code).build();
+            let module_ci = vk::ShaderModuleCreateInfo::default().code(code);
             let module = match unsafe { logical.create_shader_module(&module_ci, None) } {
                 Ok(module) => module,
                 Err(error) => {
@@ -370,10 +373,9 @@ impl ComputePass {
 
             let main_name = std::ffi::CString::new("main").unwrap();
             let mut subgroup_size_ci =
-                vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::builder()
-                    .required_subgroup_size(optional_subgroup_size.unwrap_or(32))
-                    .build();
-            let mut stage_ci = vk::PipelineShaderStageCreateInfo::builder()
+                vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                    .required_subgroup_size(optional_subgroup_size.unwrap_or(32));
+            let mut stage_ci = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
                 .name(&main_name);
@@ -383,12 +385,11 @@ impl ComputePass {
             ) {
                 stage_ci = stage_ci.push_next(&mut subgroup_size_ci);
             }
-            let stage_ci = stage_ci.build();
+            let stage_ci = stage_ci;
 
-            let pipeline_ci = vk::ComputePipelineCreateInfo::builder()
+            let pipeline_ci = vk::ComputePipelineCreateInfo::default()
                 .stage(stage_ci)
-                .layout(layout)
-                .build();
+                .layout(layout);
 
             let pipelines = match unsafe {
                 logical.create_compute_pipelines(device.static_pipeline_cache(), &[pipeline_ci], None)
@@ -789,14 +790,12 @@ impl ConditionalRenderingResolvePass {
             let descriptor_set = descriptor_allocator
                 .commit()
                 .expect("conditional rendering descriptor allocation failed");
-            let read_barrier = vk::MemoryBarrier::builder()
+            let read_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                .build();
-            let write_barrier = vk::MemoryBarrier::builder()
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            let write_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT)
-                .build();
+                .dst_access_mask(vk::AccessFlags::CONDITIONAL_RENDERING_READ_EXT);
             device.update_descriptor_set_with_template(
                 descriptor_set,
                 descriptor_template,
@@ -954,11 +953,10 @@ impl QueriesPrefixScanPass {
                 let descriptor_set = descriptor_allocator
                     .commit()
                     .expect("query prefix-scan descriptor allocation failed");
-                let read_barrier = vk::MemoryBarrier::builder()
+                let read_barrier = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                    .build();
-                let write_barrier = vk::MemoryBarrier::builder()
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                let write_barrier = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(
                         vk::AccessFlags::SHADER_READ
@@ -972,8 +970,7 @@ impl QueriesPrefixScanPass {
                             } else {
                                 vk::AccessFlags::empty()
                             },
-                    )
-                    .build();
+                    );
                 device.update_descriptor_set_with_template(
                     descriptor_set,
                     descriptor_template,
@@ -1053,6 +1050,7 @@ impl AstcDecoderPass {
                 descriptor_count: 1,
                 stage_flags: vk::ShaderStageFlags::COMPUTE,
                 p_immutable_samplers: std::ptr::null(),
+                ..Default::default()
             },
             vk::DescriptorSetLayoutBinding {
                 binding: ASTC_BINDING_OUTPUT_IMAGE,
@@ -1060,6 +1058,7 @@ impl AstcDecoderPass {
                 descriptor_count: 1,
                 stage_flags: vk::ShaderStageFlags::COMPUTE,
                 p_immutable_samplers: std::ptr::null(),
+                ..Default::default()
             },
         ];
         let templates: [vk::DescriptorUpdateTemplateEntry; ASTC_NUM_BINDINGS] = [
@@ -1135,7 +1134,7 @@ impl AstcDecoderPass {
         scheduler.request_outside_render_pass_operation_context();
         let device = device_handle.clone();
         scheduler.record(move |cmdbuf| unsafe {
-            let image_barrier = vk::ImageMemoryBarrier::builder()
+            let image_barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(if is_initialized {
                     vk::AccessFlags::SHADER_WRITE
                 } else {
@@ -1157,8 +1156,7 @@ impl AstcDecoderPass {
                     level_count: vk::REMAINING_MIP_LEVELS,
                     base_array_layer: 0,
                     layer_count: vk::REMAINING_ARRAY_LAYERS,
-                })
-                .build();
+                });
             device.cmd_pipeline_barrier(
                 cmdbuf,
                 if is_initialized {
@@ -1243,7 +1241,7 @@ impl AstcDecoderPass {
 
         let device = device_handle;
         scheduler.record(move |cmdbuf| unsafe {
-            let image_barrier = vk::ImageMemoryBarrier::builder()
+            let image_barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .old_layout(vk::ImageLayout::GENERAL)
@@ -1257,8 +1255,7 @@ impl AstcDecoderPass {
                     level_count: vk::REMAINING_MIP_LEVELS,
                     base_array_layer: 0,
                     layer_count: vk::REMAINING_ARRAY_LAYERS,
-                })
-                .build();
+                });
             device.cmd_pipeline_barrier(
                 cmdbuf,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1480,16 +1477,15 @@ impl BlockLinearUnswizzle3DPass {
             );
             device.cmd_dispatch(cmdbuf, dispatch_x, dispatch_y, dispatch_z);
 
-            let buffer_barrier = vk::BufferMemoryBarrier::builder()
+            let buffer_barrier = vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(output_buffer)
                 .offset(0)
-                .size(barrier_size)
-                .build();
-            let pre_barrier = vk::ImageMemoryBarrier::builder()
+                .size(barrier_size);
+            let pre_barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(if is_first_chunk {
                     vk::AccessFlags::empty()
                 } else {
@@ -1511,8 +1507,7 @@ impl BlockLinearUnswizzle3DPass {
                     level_count: 1,
                     base_array_layer: 0,
                     layer_count: 1,
-                })
-                .build();
+                });
             device.cmd_pipeline_barrier(
                 cmdbuf,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1550,7 +1545,7 @@ impl BlockLinearUnswizzle3DPass {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[copy],
             );
-            let post_barrier = vk::ImageMemoryBarrier::builder()
+            let post_barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -1564,8 +1559,7 @@ impl BlockLinearUnswizzle3DPass {
                     level_count: 1,
                     base_array_layer: 0,
                     layer_count: 1,
-                })
-                .build();
+                });
             device.cmd_pipeline_barrier(
                 cmdbuf,
                 vk::PipelineStageFlags::TRANSFER,

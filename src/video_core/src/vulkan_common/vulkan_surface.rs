@@ -54,11 +54,10 @@ pub unsafe fn create_surface(
     let surface = match window_info.window_type {
         #[cfg(target_os = "linux")]
         WindowSystemType::X11 => {
-            let xlib_surface_fn = ash::extensions::khr::XlibSurface::new(entry, instance);
-            let create_info = vk::XlibSurfaceCreateInfoKHR::builder()
+            let xlib_surface_fn = ash::khr::xlib_surface::Instance::new(entry, instance);
+            let create_info = vk::XlibSurfaceCreateInfoKHR::default()
                 .dpy(window_info.display_connection as *mut _)
-                .window(window_info.render_surface as u64)
-                .build();
+                .window(window_info.render_surface as u64);
             xlib_surface_fn
                 .create_xlib_surface(&create_info, None)
                 .map_err(|_| {
@@ -68,11 +67,10 @@ pub unsafe fn create_surface(
         }
         #[cfg(target_os = "linux")]
         WindowSystemType::Wayland => {
-            let wayland_surface_fn = ash::extensions::khr::WaylandSurface::new(entry, instance);
-            let create_info = vk::WaylandSurfaceCreateInfoKHR::builder()
+            let wayland_surface_fn = ash::khr::wayland_surface::Instance::new(entry, instance);
+            let create_info = vk::WaylandSurfaceCreateInfoKHR::default()
                 .display(window_info.display_connection as *mut _)
-                .surface(window_info.render_surface as *mut _)
-                .build();
+                .surface(window_info.render_surface as *mut _);
             wayland_surface_fn
                 .create_wayland_surface(&create_info, None)
                 .map_err(|_| {
@@ -82,11 +80,10 @@ pub unsafe fn create_surface(
         }
         #[cfg(target_os = "windows")]
         WindowSystemType::Windows => {
-            let win32_surface_fn = ash::extensions::khr::Win32Surface::new(entry, instance);
-            let create_info = vk::Win32SurfaceCreateInfoKHR::builder()
+            let win32_surface_fn = ash::khr::win32_surface::Instance::new(entry, instance);
+            let create_info = vk::Win32SurfaceCreateInfoKHR::default()
                 .hinstance(std::ptr::null_mut())
-                .hwnd(window_info.render_surface as *const _)
-                .build();
+                .hwnd(window_info.render_surface as *const _);
             win32_surface_fn
                 .create_win32_surface(&create_info, None)
                 .map_err(|_| {
@@ -96,10 +93,9 @@ pub unsafe fn create_surface(
         }
         #[cfg(target_os = "macos")]
         WindowSystemType::Cocoa => {
-            let metal_surface_fn = ash::extensions::ext::MetalSurface::new(entry, instance);
-            let create_info = vk::MetalSurfaceCreateInfoEXT::builder()
-                .layer(window_info.render_surface as *const _)
-                .build();
+            let metal_surface_fn = ash::ext::metal_surface::Instance::new(entry, instance);
+            let create_info = vk::MetalSurfaceCreateInfoEXT::default()
+                .layer(window_info.render_surface as *const _);
             metal_surface_fn
                 .create_metal_surface(&create_info, None)
                 .map_err(|_| {
@@ -109,10 +105,9 @@ pub unsafe fn create_surface(
         }
         #[cfg(target_os = "android")]
         WindowSystemType::Android => {
-            let android_surface_fn = ash::extensions::khr::AndroidSurface::new(entry, instance);
-            let create_info = vk::AndroidSurfaceCreateInfoKHR::builder()
-                .window(window_info.render_surface as *mut _)
-                .build();
+            let android_surface_fn = ash::khr::android_surface::Instance::new(entry, instance);
+            let create_info = vk::AndroidSurfaceCreateInfoKHR::default()
+                .window(window_info.render_surface as *mut _);
             android_surface_fn
                 .create_android_surface(&create_info, None)
                 .map_err(|_| {
@@ -122,11 +117,10 @@ pub unsafe fn create_surface(
         }
         #[cfg(target_os = "haiku")]
         WindowSystemType::Xcb => {
-            let xcb_surface_fn = ash::extensions::khr::XcbSurface::new(entry, instance);
-            let create_info = vk::XcbSurfaceCreateInfoKHR::builder()
+            let xcb_surface_fn = ash::khr::xcb_surface::Instance::new(entry, instance);
+            let create_info = vk::XcbSurfaceCreateInfoKHR::default()
                 .connection(window_info.display_connection.cast())
-                .window(window_info.render_surface as usize as u32)
-                .build();
+                .window(window_info.render_surface as usize as u32);
             xcb_surface_fn
                 .create_xcb_surface(&create_info, None)
                 .map_err(|_| {

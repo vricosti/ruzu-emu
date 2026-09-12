@@ -272,7 +272,7 @@ impl RenderPassCache {
     ) -> vk::AttachmentDescription {
         let (stencil_load_op, stencil_store_op) =
             attachment_stencil_ops(pixel_format, load_op, store_op);
-        vk::AttachmentDescription::builder()
+        vk::AttachmentDescription::default()
             .format(
                 maxwell_to_vk::surface_format(
                     self.device(),
@@ -289,7 +289,7 @@ impl RenderPassCache {
             .stencil_store_op(stencil_store_op)
             .initial_layout(vk::ImageLayout::GENERAL)
             .final_layout(vk::ImageLayout::GENERAL)
-            .build()
+            
     }
 
     fn create_render_pass(&self, key: &RenderPassKey) -> Result<vk::RenderPass, vk::Result> {
@@ -402,7 +402,7 @@ impl RenderPassCache {
             attachments.push(resolve_desc);
         }
 
-        let mut subpass = vk::SubpassDescription::builder()
+        let mut subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_refs[..num_attachments]);
         if do_resolve_color {
@@ -411,13 +411,13 @@ impl RenderPassCache {
         if let Some(ref dr) = depth_ref {
             subpass = subpass.depth_stencil_attachment(dr);
         }
-        let subpass = subpass.build();
+        let subpass = subpass;
 
         // Upstream permits attachment writes to become fragment-shader reads
         // within the same render pass (feedback-loop handling). Keep the
         // dependency by-region so synchronization is limited to overlapping
         // framebuffer regions.
-        let dependency = vk::SubpassDependency::builder()
+        let dependency = vk::SubpassDependency::default()
             .src_subpass(0)
             .dst_subpass(0)
             .src_stage_mask(
@@ -431,15 +431,14 @@ impl RenderPassCache {
                     | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
             )
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .dependency_flags(vk::DependencyFlags::BY_REGION)
-            .build();
+            .dependency_flags(vk::DependencyFlags::BY_REGION);
 
         if self.device().is_khr_create_render_pass2_supported() {
             let descriptions2: SmallVec<[vk::AttachmentDescription2; MAX_ATTACHMENTS]> =
                 attachments
                     .iter()
                     .map(|description| {
-                        vk::AttachmentDescription2::builder()
+                        vk::AttachmentDescription2::default()
                             .flags(description.flags)
                             .format(description.format)
                             .samples(description.samples)
@@ -449,15 +448,15 @@ impl RenderPassCache {
                             .stencil_store_op(description.stencil_store_op)
                             .initial_layout(description.initial_layout)
                             .final_layout(description.final_layout)
-                            .build()
+                            
                     })
                     .collect();
             let promote = |reference: &vk::AttachmentReference| {
-                vk::AttachmentReference2::builder()
+                vk::AttachmentReference2::default()
                     .attachment(reference.attachment)
                     .layout(reference.layout)
                     .aspect_mask(vk::ImageAspectFlags::empty())
-                    .build()
+                    
             };
             let mut references2 = [vk::AttachmentReference2::default(); 8];
             let mut resolve_references2 = [vk::AttachmentReference2::default(); 8];
@@ -480,12 +479,11 @@ impl RenderPassCache {
                 }));
             let depth_resolve_reference2 = promote(&depth_resolve_reference);
             let resolve_modes = pick_resolve_modes(self.device(), key.depth_format);
-            let mut depth_stencil_resolve = vk::SubpassDescriptionDepthStencilResolve::builder()
+            let mut depth_stencil_resolve = vk::SubpassDescriptionDepthStencilResolve::default()
                 .depth_resolve_mode(resolve_modes.depth)
                 .stencil_resolve_mode(resolve_modes.stencil)
-                .depth_stencil_resolve_attachment(&depth_resolve_reference2)
-                .build();
-            let mut subpass2 = vk::SubpassDescription2::builder()
+                .depth_stencil_resolve_attachment(&depth_resolve_reference2);
+            let mut subpass2 = vk::SubpassDescription2::default()
                 .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
                 .view_mask(0)
                 .color_attachments(&references2[..num_attachments]);
@@ -498,8 +496,8 @@ impl RenderPassCache {
             if do_resolve_depth_stencil {
                 subpass2 = subpass2.push_next(&mut depth_stencil_resolve);
             }
-            let subpass2 = subpass2.build();
-            let dependency2 = vk::SubpassDependency2::builder()
+            let subpass2 = subpass2;
+            let dependency2 = vk::SubpassDependency2::default()
                 .src_subpass(dependency.src_subpass)
                 .dst_subpass(dependency.dst_subpass)
                 .src_stage_mask(dependency.src_stage_mask)
@@ -507,21 +505,18 @@ impl RenderPassCache {
                 .src_access_mask(dependency.src_access_mask)
                 .dst_access_mask(dependency.dst_access_mask)
                 .dependency_flags(dependency.dependency_flags)
-                .view_offset(0)
-                .build();
-            let render_pass_info = vk::RenderPassCreateInfo2::builder()
+                .view_offset(0);
+            let render_pass_info = vk::RenderPassCreateInfo2::default()
                 .attachments(&descriptions2)
                 .subpasses(std::slice::from_ref(&subpass2))
-                .dependencies(std::slice::from_ref(&dependency2))
-                .build();
+                .dependencies(std::slice::from_ref(&dependency2));
             return self.device().create_render_pass2(&render_pass_info);
         }
 
-        let render_pass_info = vk::RenderPassCreateInfo::builder()
+        let render_pass_info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
             .subpasses(std::slice::from_ref(&subpass))
-            .dependencies(std::slice::from_ref(&dependency))
-            .build();
+            .dependencies(std::slice::from_ref(&dependency));
 
         unsafe {
             self.device()

@@ -59,8 +59,8 @@ use crate::texture_cache::types::NULL_IMAGE_ID;
 use crate::vulkan_common::vulkan_device::{Device, DeviceReference};
 use crate::vulkan_common::vulkan_memory_allocator::MemoryAllocator;
 
-type VertexInputBindings = SmallVec<[vk::VertexInputBindingDescription2EXT; 32]>;
-type VertexInputAttributes = SmallVec<[vk::VertexInputAttributeDescription2EXT; 32]>;
+type VertexInputBindings = SmallVec<[vk::VertexInputBindingDescription2EXT<'static>; 32]>;
+type VertexInputAttributes = SmallVec<[vk::VertexInputAttributeDescription2EXT<'static>; 32]>;
 
 struct VertexInputDescriptions {
     bindings: VertexInputBindings,
@@ -68,7 +68,7 @@ struct VertexInputDescriptions {
 }
 
 impl VertexInputDescriptions {
-    unsafe fn set(&self, extension: &vk::ExtVertexInputDynamicStateFn, cmdbuf: vk::CommandBuffer) {
+    unsafe fn set(&self, extension: &ash::ext::vertex_input_dynamic_state::DeviceFn, cmdbuf: vk::CommandBuffer) {
         (extension.cmd_set_vertex_input_ext)(
             cmdbuf,
             self.bindings.len() as u32,
@@ -639,12 +639,12 @@ pub struct RasterizerVulkan {
     supports_d24_depth: bool,
     depth_range_unrestricted: bool,
     nv_viewport_swizzle: bool,
-    extended_dynamic_state2: Option<ash::extensions::ext::ExtendedDynamicState2>,
-    extended_dynamic_state3: Option<ash::extensions::ext::ExtendedDynamicState3>,
-    color_write_enable: Option<vk::ExtColorWriteEnableFn>,
-    vertex_input_dynamic_state: Option<vk::ExtVertexInputDynamicStateFn>,
-    draw_indirect_count: Option<ash::extensions::khr::DrawIndirectCount>,
-    push_descriptor: Option<ash::extensions::khr::PushDescriptor>,
+    extended_dynamic_state2: Option<ash::ext::extended_dynamic_state2::Device>,
+    extended_dynamic_state3: Option<ash::ext::extended_dynamic_state3::Device>,
+    color_write_enable: Option<ash::ext::color_write_enable::DeviceFn>,
+    vertex_input_dynamic_state: Option<ash::ext::vertex_input_dynamic_state::DeviceFn>,
+    draw_indirect_count: Option<ash::khr::draw_indirect_count::Device>,
+    push_descriptor: Option<ash::khr::push_descriptor::Device>,
     max_viewports: u32,
     max_vertex_input_attributes: u32,
     max_vertex_input_bindings: u32,
@@ -1043,21 +1043,21 @@ impl RasterizerVulkan {
         };
 
         let draw_indirect_count = draw_indirect_count_supported
-            .then(|| ash::extensions::khr::DrawIndirectCount::new(&instance, &device));
+            .then(|| ash::khr::draw_indirect_count::Device::new(&instance, &device));
         let push_descriptor = push_descriptor_supported
-            .then(|| ash::extensions::khr::PushDescriptor::new(&instance, &device));
+            .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
         let extended_dynamic_state2 = extended_dynamic_state2_logic_op_supported
-            .then(|| ash::extensions::ext::ExtendedDynamicState2::new(&instance, &device));
+            .then(|| ash::ext::extended_dynamic_state2::Device::new(&instance, &device));
         let extended_dynamic_state3 = (extended_dynamic_state3_blending_supported
             || extended_dynamic_state3_enables_supported)
-            .then(|| ash::extensions::ext::ExtendedDynamicState3::new(&instance, &device));
+            .then(|| ash::ext::extended_dynamic_state3::Device::new(&instance, &device));
         let color_write_enable = color_write_enable_supported.then(|| {
-            vk::ExtColorWriteEnableFn::load(|name| unsafe {
+            ash::ext::color_write_enable::DeviceFn::load(|name| unsafe {
                 std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
             })
         });
         let vertex_input_dynamic_state = vertex_input_dynamic_state_supported.then(|| {
-            vk::ExtVertexInputDynamicStateFn::load(|name| unsafe {
+            ash::ext::vertex_input_dynamic_state::DeviceFn::load(|name| unsafe {
                 std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
             })
         });
@@ -1973,7 +1973,7 @@ impl RasterizerVulkan {
                 continue;
             }
             attributes.push(
-                vk::VertexInputAttributeDescription2EXT::builder()
+                vk::VertexInputAttributeDescription2EXT::default()
                     .location(index as u32)
                     .binding(binding as u32)
                     .format(maxwell_to_vk::vertex_format(
@@ -1981,8 +1981,7 @@ impl RasterizerVulkan {
                         attribute.attrib_type,
                         attribute.size,
                     ))
-                    .offset(attribute.offset)
-                    .build(),
+                    .offset(attribute.offset),
             );
         }
 
@@ -1990,7 +1989,7 @@ impl RasterizerVulkan {
             let stream = draw.vertex_stream(binding);
             let is_instanced = draw.vertex_stream_instance(binding) != 0;
             bindings.push(
-                vk::VertexInputBindingDescription2EXT::builder()
+                vk::VertexInputBindingDescription2EXT::default()
                     .binding(binding as u32)
                     .stride(stream.stride)
                     .input_rate(if is_instanced {
@@ -1998,8 +1997,7 @@ impl RasterizerVulkan {
                     } else {
                         vk::VertexInputRate::VERTEX
                     })
-                    .divisor(if is_instanced { stream.frequency } else { 1 })
-                    .build(),
+                    .divisor(if is_instanced { stream.frequency } else { 1 }),
             );
         }
 
@@ -3299,10 +3297,9 @@ impl RasterizerInterface for RasterizerVulkan {
             .request_outside_render_pass_operation_context();
         self.scheduler.record(move |cmdbuf| unsafe {
             let barrier_device = barrier_device.get().get_logical();
-            let barrier = vk::MemoryBarrier::builder()
+            let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ)
-                .build();
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ);
             barrier_device.cmd_pipeline_barrier(
                 cmdbuf,
                 vk::PipelineStageFlags::ALL_GRAPHICS
@@ -4037,7 +4034,7 @@ fn find_memory_type(
 }
 
 fn create_fallback_sampler(device: &ash::Device) -> Result<vk::Sampler, RendererError> {
-    let sampler_info = vk::SamplerCreateInfo::builder()
+    let sampler_info = vk::SamplerCreateInfo::default()
         .mag_filter(vk::Filter::NEAREST)
         .min_filter(vk::Filter::NEAREST)
         .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
@@ -4045,8 +4042,7 @@ fn create_fallback_sampler(device: &ash::Device) -> Result<vk::Sampler, Renderer
         .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
         .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
         .min_lod(0.0)
-        .max_lod(0.0)
-        .build();
+        .max_lod(0.0);
 
     unsafe {
         device
@@ -4076,11 +4072,10 @@ fn create_host_buffer(
     size: u64,
     usage: vk::BufferUsageFlags,
 ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), RendererError> {
-    let buf_info = vk::BufferCreateInfo::builder()
+    let buf_info = vk::BufferCreateInfo::default()
         .size(size)
         .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .build();
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
     let buffer = unsafe {
         device
@@ -4097,10 +4092,9 @@ fn create_host_buffer(
     )
     .ok_or_else(|| RendererError::InitFailed("no host-visible memory".into()))?;
 
-    let alloc_info = vk::MemoryAllocateInfo::builder()
+    let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
-        .memory_type_index(mem_type)
-        .build();
+        .memory_type_index(mem_type);
     let memory = unsafe {
         device
             .allocate_memory(&alloc_info, None)
@@ -4398,14 +4392,12 @@ mod tests {
         let mut attributes = VertexInputAttributes::new();
         for index in 0..32 {
             bindings.push(
-                vk::VertexInputBindingDescription2EXT::builder()
-                    .binding(index)
-                    .build(),
+                vk::VertexInputBindingDescription2EXT::default()
+                    .binding(index),
             );
             attributes.push(
-                vk::VertexInputAttributeDescription2EXT::builder()
-                    .location(index)
-                    .build(),
+                vk::VertexInputAttributeDescription2EXT::default()
+                    .location(index),
             );
         }
         assert!(!bindings.spilled());

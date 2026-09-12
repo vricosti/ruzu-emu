@@ -156,19 +156,17 @@ impl MultiRangeBufferCache {
     /// sparse block alignment and the compatible memory types.
     fn query_block_size(&self, device: &Device, memory_type_bits: &mut u32) -> vk::DeviceSize {
         let logical = device.get_logical();
-        let probe_ci = vk::BufferCreateInfo::builder()
+        let probe_ci = vk::BufferCreateInfo::default()
             .flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_ALIASED)
             .size(Self::DEFAULT_BLOCK_SIZE)
             .usage(self.sparse_usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let Ok(probe) = (unsafe { logical.create_buffer(&probe_ci, None) }) else {
             return 0;
         };
         let owned = SparseBuffer::new(probe, device);
-        let reqs_info = vk::BufferMemoryRequirementsInfo2::builder()
-            .buffer(owned.handle())
-            .build();
+        let reqs_info = vk::BufferMemoryRequirementsInfo2::default()
+            .buffer(owned.handle());
         let mut reqs2 = vk::MemoryRequirements2::default();
         unsafe { logical.get_buffer_memory_requirements2(&reqs_info, &mut reqs2) };
         *memory_type_bits = reqs2.memory_requirements.memory_type_bits;
@@ -226,12 +224,11 @@ impl MultiRangeBufferCache {
         total: vk::DeviceSize,
     ) -> Option<SparseBuffer> {
         let logical = device.get_logical();
-        let buffer_ci = vk::BufferCreateInfo::builder()
+        let buffer_ci = vk::BufferCreateInfo::default()
             .flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_ALIASED)
             .size(total)
             .usage(self.sparse_usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let raw = unsafe { logical.create_buffer(&buffer_ci, None) }.ok()?;
         let handle = SparseBuffer::new(raw, device);
         let mut binds: Vec<vk::SparseMemoryBind> = Vec::with_capacity(sources.len());
@@ -246,13 +243,11 @@ impl MultiRangeBufferCache {
             });
             resource_offset += source.size;
         }
-        let buffer_bind = vk::SparseBufferMemoryBindInfo::builder()
+        let buffer_bind = vk::SparseBufferMemoryBindInfo::default()
             .buffer(raw)
-            .binds(&binds)
-            .build();
-        let bind_info = vk::BindSparseInfo::builder()
-            .buffer_binds(std::slice::from_ref(&buffer_bind))
-            .build();
+            .binds(&binds);
+        let bind_info = vk::BindSparseInfo::default()
+            .buffer_binds(std::slice::from_ref(&buffer_bind));
         let fence = unsafe { logical.create_fence(&vk::FenceCreateInfo::default(), None) }.ok()?;
         let bind_result = {
             let submit_mutex = scheduler.submit_mutex();
@@ -383,11 +378,10 @@ impl MultiRangeBufferCache {
             if device.is_buffer_device_address_supported() {
                 flags |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
             }
-            let gather_ci = vk::BufferCreateInfo::builder()
+            let gather_ci = vk::BufferCreateInfo::default()
                 .size(total)
                 .usage(flags)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .build();
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
             // Upstream goes through `vk::Check`, which throws before the entry
             // is cached; a failed allocation must not be memoized as a null
             // buffer or the key would never retry multi-range binding.
@@ -409,9 +403,8 @@ impl MultiRangeBufferCache {
             if address_handle != vk::Buffer::null() {
                 entry.address = unsafe {
                     device.get_logical().get_buffer_device_address(
-                        &vk::BufferDeviceAddressInfo::builder()
-                            .buffer(address_handle)
-                            .build(),
+                        &vk::BufferDeviceAddressInfo::default()
+                            .buffer(address_handle),
                     )
                 };
             }

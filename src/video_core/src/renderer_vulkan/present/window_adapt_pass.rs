@@ -95,10 +95,9 @@ impl WindowAdaptPass {
             size: std::mem::size_of::<PresentPushConstants>() as u32,
         };
         let set_layouts = [descriptor_set_layout];
-        let create_info = vk::PipelineLayoutCreateInfo::builder()
+        let create_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
-            .push_constant_ranges(std::slice::from_ref(&range))
-            .build();
+            .push_constant_ranges(std::slice::from_ref(&range));
         unsafe {
             device
                 .get_logical()

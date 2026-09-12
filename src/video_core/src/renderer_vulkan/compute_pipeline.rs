@@ -299,18 +299,18 @@ impl ComputePipeline {
                 let device = device_ref.get().get_logical();
                 let main_name = std::ffi::CString::new("main").unwrap();
                 let mut subgroup_size =
-                    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::builder()
+                    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
                         .required_subgroup_size(
                             crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE,
                         );
-                let mut stage_builder = vk::PipelineShaderStageCreateInfo::builder()
+                let mut stage_builder = vk::PipelineShaderStageCreateInfo::default()
                     .stage(vk::ShaderStageFlags::COMPUTE)
                     .module(spv_module)
                     .name(&main_name);
                 if supports_subgroup_size_control {
                     stage_builder = stage_builder.push_next(&mut subgroup_size);
                 }
-                let stage_ci = stage_builder.build();
+                let stage_ci = stage_builder;
 
                 let mut flags = vk::PipelineCreateFlags::empty();
                 if capture_statistics {
@@ -319,11 +319,10 @@ impl ComputePipeline {
                 if uses_descriptor_buffer {
                     flags |= vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT;
                 }
-                let ci = vk::ComputePipelineCreateInfo::builder()
+                let ci = vk::ComputePipelineCreateInfo::default()
                     .flags(flags)
                     .stage(stage_ci)
-                    .layout(pipeline_layout)
-                    .build();
+                    .layout(pipeline_layout);
 
                 if let Ok(pipelines) =
                     unsafe { device.create_compute_pipelines(pipeline_cache, &[ci], None) }
@@ -402,7 +401,7 @@ impl ComputePipeline {
         buffer_cache: &mut VulkanCommonBufferCache,
         texture_cache: &mut TextureCache,
         fallback_sampler: vk::Sampler,
-        push_descriptor: Option<ash::extensions::khr::PushDescriptor>,
+        push_descriptor: Option<ash::khr::push_descriptor::Device>,
         read_gpu: &dyn Fn(u64, &mut [u8]) -> bool,
     ) -> bool {
         // SAFETY: both owners are boxed by RasterizerVulkan and outlive every
@@ -569,10 +568,9 @@ impl ComputePipeline {
             let vulkan_device = device.get();
             let logical = vulkan_device.get_logical();
             if let Some((address, usage)) = descriptor_buffer_binding {
-                let binding_info = vk::DescriptorBufferBindingInfoEXT::builder()
+                let binding_info = vk::DescriptorBufferBindingInfoEXT::default()
                     .address(address)
-                    .usage(usage)
-                    .build();
+                    .usage(usage);
                 vulkan_device
                     .descriptor_buffer_extension()
                     .expect("descriptor-buffer compute pipeline requires extension")
@@ -952,12 +950,11 @@ fn compute_descriptor_set_layout_bindings(
             return;
         }
         bindings.push(
-            vk::DescriptorSetLayoutBinding::builder()
+            vk::DescriptorSetLayoutBinding::default()
                 .binding(binding)
                 .descriptor_type(descriptor_type)
                 .descriptor_count(count)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                .build(),
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         );
         binding += 1;
     };

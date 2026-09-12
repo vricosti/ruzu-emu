@@ -400,8 +400,8 @@ mod tests {
             "VK_FORMAT_ASTC_10x10_UNORM_BLOCK"
         );
         assert_eq!(
-            string_vk_format(vk::Format::ASTC_4X4X4_SFLOAT_BLOCK_EXT),
-            "VK_FORMAT_ASTC_4x4x4_SFLOAT_BLOCK_EXT"
+            string_vk_format(vk::Format::ASTC_12X12_SRGB_BLOCK),
+            "VK_FORMAT_ASTC_12x12_SRGB_BLOCK"
         );
         assert_eq!(
             string_vk_format(vk::Format::R10X6_UNORM_PACK16),

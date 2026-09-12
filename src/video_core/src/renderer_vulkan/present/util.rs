@@ -40,11 +40,10 @@ pub fn create_wrapped_buffer(
     size: vk::DeviceSize,
     usage: MemoryUsage,
 ) -> AllocatedBuffer {
-    let buffer_ci = vk::BufferCreateInfo::builder()
+    let buffer_ci = vk::BufferCreateInfo::default()
         .size(size)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .build();
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
     allocator
         .create_buffer(&buffer_ci, usage)
         .expect("Failed to create wrapped buffer")
@@ -61,8 +60,8 @@ pub fn create_wrapped_image(
         .expect("Failed to create wrapped image")
 }
 
-fn wrapped_image_create_info(dimensions: vk::Extent2D, format: vk::Format) -> vk::ImageCreateInfo {
-    vk::ImageCreateInfo::builder()
+fn wrapped_image_create_info(dimensions: vk::Extent2D, format: vk::Format) -> vk::ImageCreateInfo<'static> {
+    vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
         .extent(vk::Extent3D {
@@ -82,7 +81,7 @@ fn wrapped_image_create_info(dimensions: vk::Extent2D, format: vk::Format) -> vk
         )
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-        .build()
+        
 }
 
 /// Port of `TransitionImageLayout`.
@@ -100,7 +99,7 @@ pub fn transition_image_layout(
         | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
         | vk::AccessFlags::SHADER_READ;
 
-    let barrier = vk::ImageMemoryBarrier::builder()
+    let barrier = vk::ImageMemoryBarrier::default()
         .src_access_mask(flags)
         .dst_access_mask(flags)
         .old_layout(source_layout)
@@ -114,8 +113,7 @@ pub fn transition_image_layout(
             level_count: 1,
             base_array_layer: 0,
             layer_count: 1,
-        })
-        .build();
+        });
 
     unsafe {
         device.cmd_pipeline_barrier(
@@ -141,18 +139,17 @@ pub fn upload_image(
     initial_contents: &[u8],
 ) {
     let logical = device.get_logical();
-    let upload_ci = vk::BufferCreateInfo::builder()
+    let upload_ci = vk::BufferCreateInfo::default()
         .size(initial_contents.len() as vk::DeviceSize)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .build();
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let mut upload_buffer = allocator
         .create_buffer(&upload_ci, MemoryUsage::Upload)
         .expect("Failed to create image upload buffer");
     upload_buffer.mapped_slice_mut()[..initial_contents.len()].copy_from_slice(initial_contents);
     upload_buffer.flush();
 
-    let region = vk::BufferImageCopy::builder()
+    let region = vk::BufferImageCopy::default()
         .buffer_offset(0)
         .buffer_row_length(dimensions.width)
         .buffer_image_height(dimensions.height)
@@ -167,8 +164,7 @@ pub fn upload_image(
             width: dimensions.width,
             height: dimensions.height,
             depth: 1,
-        })
-        .build();
+        });
 
     scheduler.request_outside_render_pass_operation_context();
     let device = logical.clone();
@@ -210,7 +206,7 @@ pub fn download_color_image(
     buffer: vk::Buffer,
     extent: vk::Extent3D,
 ) {
-    let read_barrier = vk::ImageMemoryBarrier::builder()
+    let read_barrier = vk::ImageMemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
         .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
         .old_layout(vk::ImageLayout::GENERAL)
@@ -224,10 +220,9 @@ pub fn download_color_image(
             level_count: vk::REMAINING_MIP_LEVELS,
             base_array_layer: 0,
             layer_count: vk::REMAINING_ARRAY_LAYERS,
-        })
-        .build();
+        });
 
-    let image_write_barrier = vk::ImageMemoryBarrier::builder()
+    let image_write_barrier = vk::ImageMemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::empty())
         .dst_access_mask(vk::AccessFlags::MEMORY_WRITE)
         .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -241,15 +236,13 @@ pub fn download_color_image(
             level_count: vk::REMAINING_MIP_LEVELS,
             base_array_layer: 0,
             layer_count: vk::REMAINING_ARRAY_LAYERS,
-        })
-        .build();
+        });
 
-    let memory_write_barrier = vk::MemoryBarrier::builder()
+    let memory_write_barrier = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-        .build();
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
 
-    let copy = vk::BufferImageCopy::builder()
+    let copy = vk::BufferImageCopy::default()
         .buffer_offset(0)
         .buffer_row_length(0)
         .buffer_image_height(0)
@@ -260,8 +253,7 @@ pub fn download_color_image(
             layer_count: 1,
         })
         .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-        .image_extent(extent)
-        .build();
+        .image_extent(extent);
 
     unsafe {
         device.cmd_pipeline_barrier(
@@ -339,7 +331,7 @@ pub fn create_wrapped_image_view(
     image: vk::Image,
     format: vk::Format,
 ) -> vk::ImageView {
-    let view_ci = vk::ImageViewCreateInfo::builder()
+    let view_ci = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(format)
@@ -350,8 +342,7 @@ pub fn create_wrapped_image_view(
             level_count: 1,
             base_array_layer: 0,
             layer_count: 1,
-        })
-        .build();
+        });
 
     unsafe {
         device
@@ -390,10 +381,9 @@ pub fn create_wrapped_render_pass(
         layout: vk::ImageLayout::GENERAL,
     };
 
-    let subpass = vk::SubpassDescription::builder()
+    let subpass = vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(std::slice::from_ref(&color_attachment_ref))
-        .build();
+        .color_attachments(std::slice::from_ref(&color_attachment_ref));
 
     let dependency = vk::SubpassDependency {
         src_subpass: vk::SUBPASS_EXTERNAL,
@@ -406,11 +396,10 @@ pub fn create_wrapped_render_pass(
         dependency_flags: vk::DependencyFlags::empty(),
     };
 
-    let render_pass_ci = vk::RenderPassCreateInfo::builder()
+    let render_pass_ci = vk::RenderPassCreateInfo::default()
         .attachments(std::slice::from_ref(&attachment))
         .subpasses(std::slice::from_ref(&subpass))
-        .dependencies(std::slice::from_ref(&dependency))
-        .build();
+        .dependencies(std::slice::from_ref(&dependency));
 
     unsafe {
         device
@@ -428,13 +417,12 @@ pub fn create_wrapped_framebuffer(
     extent: vk::Extent2D,
 ) -> vk::Framebuffer {
     let attachments = [dest_image_view];
-    let framebuffer_ci = vk::FramebufferCreateInfo::builder()
+    let framebuffer_ci = vk::FramebufferCreateInfo::default()
         .render_pass(render_pass)
         .attachments(&attachments)
         .width(extent.width)
         .height(extent.height)
-        .layers(1)
-        .build();
+        .layers(1);
 
     unsafe {
         device
@@ -450,7 +438,7 @@ pub fn create_wrapped_framebuffer(
 
 /// Port of `CreateWrappedSampler`.
 pub fn create_wrapped_sampler(device: &Device, filter: vk::Filter) -> vk::Sampler {
-    let sampler_ci = vk::SamplerCreateInfo::builder()
+    let sampler_ci = vk::SamplerCreateInfo::default()
         .mag_filter(filter)
         .min_filter(filter)
         .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
@@ -465,8 +453,7 @@ pub fn create_wrapped_sampler(device: &Device, filter: vk::Filter) -> vk::Sample
         .min_lod(0.0)
         .max_lod(0.0)
         .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
-        .unnormalized_coordinates(false)
-        .build();
+        .unnormalized_coordinates(false);
 
     unsafe {
         device
@@ -478,7 +465,7 @@ pub fn create_wrapped_sampler(device: &Device, filter: vk::Filter) -> vk::Sample
 
 /// Port of `CreateBilinearSampler`.
 pub fn create_bilinear_sampler(device: &Device) -> vk::Sampler {
-    let sampler_ci = vk::SamplerCreateInfo::builder()
+    let sampler_ci = vk::SamplerCreateInfo::default()
         .mag_filter(vk::Filter::LINEAR)
         .min_filter(vk::Filter::LINEAR)
         .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
@@ -493,8 +480,7 @@ pub fn create_bilinear_sampler(device: &Device) -> vk::Sampler {
         .min_lod(0.0)
         .max_lod(0.0)
         .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
-        .unnormalized_coordinates(false)
-        .build();
+        .unnormalized_coordinates(false);
 
     unsafe {
         device
@@ -506,7 +492,7 @@ pub fn create_bilinear_sampler(device: &Device) -> vk::Sampler {
 
 /// Port of `CreateNearestNeighborSampler`.
 pub fn create_nearest_neighbor_sampler(device: &Device) -> vk::Sampler {
-    let sampler_ci = vk::SamplerCreateInfo::builder()
+    let sampler_ci = vk::SamplerCreateInfo::default()
         .mag_filter(vk::Filter::NEAREST)
         .min_filter(vk::Filter::NEAREST)
         .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
@@ -521,8 +507,7 @@ pub fn create_nearest_neighbor_sampler(device: &Device) -> vk::Sampler {
         .min_lod(0.0)
         .max_lod(0.0)
         .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
-        .unnormalized_coordinates(false)
-        .build();
+        .unnormalized_coordinates(false);
 
     unsafe {
         device
@@ -532,28 +517,8 @@ pub fn create_nearest_neighbor_sampler(device: &Device) -> vk::Sampler {
     }
 }
 
-/// Rust counterpart of `VkCubicFilterWeightsQCOM`.
-///
-/// ash 0.37 predates `VK_QCOM_filter_cubic_weights`, so the extension enum and
-/// sampler pNext payload are declared locally with their Vulkan ABI values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(i32)]
-pub enum CubicFilterWeights {
-    CatmullRom = 0,
-    ZeroTangentCardinal = 1,
-    BSpline = 2,
-    MitchellNetravali = 3,
-}
-
-#[repr(C)]
-struct SamplerCubicWeightsCreateInfoQcom {
-    s_type: vk::StructureType,
-    p_next: *const std::ffi::c_void,
-    cubic_weights: CubicFilterWeights,
-}
-
-const SAMPLER_CUBIC_WEIGHTS_CREATE_INFO_QCOM: vk::StructureType =
-    vk::StructureType::from_raw(1_000_519_000);
+/// Upstream passes `VkCubicFilterWeightsQCOM` values directly.
+pub type CubicFilterWeights = vk::CubicFilterWeightsQCOM;
 
 /// Port of `CreateCubicSampler`.
 pub fn create_cubic_sampler(device: &Device, qcom_weights: CubicFilterWeights) -> vk::Sampler {
@@ -562,7 +527,7 @@ pub fn create_cubic_sampler(device: &Device, qcom_weights: CubicFilterWeights) -
     } else {
         vk::Filter::LINEAR
     };
-    let mut sampler_ci = vk::SamplerCreateInfo::builder()
+    let mut sampler_ci = vk::SamplerCreateInfo::default()
         .mag_filter(filter)
         .min_filter(filter)
         .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
@@ -577,15 +542,10 @@ pub fn create_cubic_sampler(device: &Device, qcom_weights: CubicFilterWeights) -
         .min_lod(0.0)
         .max_lod(0.0)
         .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
-        .unnormalized_coordinates(false)
-        .build();
-    let qcom_ci = SamplerCubicWeightsCreateInfoQcom {
-        s_type: SAMPLER_CUBIC_WEIGHTS_CREATE_INFO_QCOM,
-        p_next: std::ptr::null(),
-        cubic_weights: qcom_weights,
-    };
-    if qcom_weights != CubicFilterWeights::CatmullRom {
-        sampler_ci.p_next = std::ptr::from_ref(&qcom_ci).cast();
+        .unnormalized_coordinates(false);
+    let mut qcom_ci = vk::SamplerCubicWeightsCreateInfoQCOM::default().cubic_weights(qcom_weights);
+    if qcom_weights != CubicFilterWeights::CATMULL_ROM {
+        sampler_ci = sampler_ci.push_next(&mut qcom_ci);
     }
 
     unsafe {
@@ -602,7 +562,7 @@ pub fn create_cubic_sampler(device: &Device, qcom_weights: CubicFilterWeights) -
 
 /// Port of `CreateWrappedShaderModule`.
 pub fn create_wrapped_shader_module(device: &Device, code: &[u32]) -> vk::ShaderModule {
-    let shader_ci = vk::ShaderModuleCreateInfo::builder().code(code).build();
+    let shader_ci = vk::ShaderModuleCreateInfo::default().code(code);
 
     unsafe {
         device
@@ -625,10 +585,9 @@ pub fn create_wrapped_descriptor_pool(
 ) -> vk::DescriptorPool {
     let pool_sizes = wrapped_descriptor_pool_sizes(max_descriptors, types);
 
-    let pool_ci = vk::DescriptorPoolCreateInfo::builder()
+    let pool_ci = vk::DescriptorPoolCreateInfo::default()
         .max_sets(max_sets as u32)
-        .pool_sizes(&pool_sizes)
-        .build();
+        .pool_sizes(&pool_sizes);
 
     unsafe {
         device
@@ -659,9 +618,8 @@ pub fn create_wrapped_descriptor_set_layout(
 ) -> vk::DescriptorSetLayout {
     let bindings = wrapped_descriptor_set_layout_bindings(types, stages);
 
-    let layout_ci = vk::DescriptorSetLayoutCreateInfo::builder()
-        .bindings(&bindings)
-        .build();
+    let layout_ci = vk::DescriptorSetLayoutCreateInfo::default()
+        .bindings(&bindings);
 
     unsafe {
         device
@@ -674,7 +632,7 @@ pub fn create_wrapped_descriptor_set_layout(
 fn wrapped_descriptor_set_layout_bindings(
     types: &[vk::DescriptorType],
     stages: vk::ShaderStageFlags,
-) -> Vec<vk::DescriptorSetLayoutBinding> {
+) -> Vec<vk::DescriptorSetLayoutBinding<'_>> {
     types
         .iter()
         .enumerate()
@@ -684,6 +642,7 @@ fn wrapped_descriptor_set_layout_bindings(
             descriptor_count: 1,
             stage_flags: stages,
             p_immutable_samplers: std::ptr::null(),
+            ..Default::default()
         })
         .collect()
 }
@@ -694,10 +653,9 @@ pub fn create_wrapped_descriptor_sets(
     pool: vk::DescriptorPool,
     layouts: &[vk::DescriptorSetLayout],
 ) -> Vec<vk::DescriptorSet> {
-    let alloc_info = vk::DescriptorSetAllocateInfo::builder()
+    let alloc_info = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(pool)
-        .set_layouts(layouts)
-        .build();
+        .set_layouts(layouts);
 
     unsafe {
         device
@@ -716,9 +674,8 @@ pub fn create_wrapped_pipeline_layout(
     layout: vk::DescriptorSetLayout,
 ) -> vk::PipelineLayout {
     let layouts = [layout];
-    let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::builder()
-        .set_layouts(&layouts)
-        .build();
+    let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&layouts);
 
     unsafe {
         device
@@ -735,17 +692,15 @@ pub fn create_wrapped_compute_pipeline(
     shader: vk::ShaderModule,
 ) -> vk::Pipeline {
     let main_name = c"main";
-    let stage = vk::PipelineShaderStageCreateInfo::builder()
+    let stage = vk::PipelineShaderStageCreateInfo::default()
         .stage(vk::ShaderStageFlags::COMPUTE)
         .module(shader)
-        .name(main_name)
-        .build();
-    let pipeline_ci = vk::ComputePipelineCreateInfo::builder()
+        .name(main_name);
+    let pipeline_ci = vk::ComputePipelineCreateInfo::default()
         .stage(stage)
         .layout(layout)
         .base_pipeline_handle(vk::Pipeline::null())
-        .base_pipeline_index(0)
-        .build();
+        .base_pipeline_index(0);
 
     let pipelines = unsafe {
         device
@@ -774,57 +729,50 @@ fn create_wrapped_pipeline_impl(
     let main_name = c"main";
 
     let shader_stages = [
-        vk::PipelineShaderStageCreateInfo::builder()
+        vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
             .module(vert_shader)
-            .name(main_name)
-            .build(),
-        vk::PipelineShaderStageCreateInfo::builder()
+            .name(main_name),
+        vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::FRAGMENT)
             .module(frag_shader)
-            .name(main_name)
-            .build(),
+            .name(main_name),
     ];
 
-    let vertex_input_ci = vk::PipelineVertexInputStateCreateInfo::builder().build();
+    let vertex_input_ci = vk::PipelineVertexInputStateCreateInfo::default();
 
     let input_assembly_ci = wrapped_pipeline_input_assembly_state(device.is_molten_vk());
 
-    let viewport_state_ci = vk::PipelineViewportStateCreateInfo::builder()
+    let viewport_state_ci = vk::PipelineViewportStateCreateInfo::default()
         .viewport_count(1)
-        .scissor_count(1)
-        .build();
+        .scissor_count(1);
 
-    let rasterization_ci = vk::PipelineRasterizationStateCreateInfo::builder()
+    let rasterization_ci = vk::PipelineRasterizationStateCreateInfo::default()
         .depth_clamp_enable(false)
         .rasterizer_discard_enable(false)
         .polygon_mode(vk::PolygonMode::FILL)
         .cull_mode(vk::CullModeFlags::NONE)
         .front_face(vk::FrontFace::CLOCKWISE)
         .depth_bias_enable(false)
-        .line_width(1.0)
-        .build();
+        .line_width(1.0);
 
-    let multisampling_ci = vk::PipelineMultisampleStateCreateInfo::builder()
+    let multisampling_ci = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1)
         .sample_shading_enable(false)
-        .min_sample_shading(0.0)
-        .build();
+        .min_sample_shading(0.0);
 
     let blend_attachments = [blending];
-    let color_blend_ci = vk::PipelineColorBlendStateCreateInfo::builder()
+    let color_blend_ci = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op_enable(false)
         .logic_op(vk::LogicOp::COPY)
         .attachments(&blend_attachments)
-        .blend_constants([0.0, 0.0, 0.0, 0.0])
-        .build();
+        .blend_constants([0.0, 0.0, 0.0, 0.0]);
 
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dynamic_state_ci = vk::PipelineDynamicStateCreateInfo::builder()
-        .dynamic_states(&dynamic_states)
-        .build();
+    let dynamic_state_ci = vk::PipelineDynamicStateCreateInfo::default()
+        .dynamic_states(&dynamic_states);
 
-    let pipeline_ci = vk::GraphicsPipelineCreateInfo::builder()
+    let pipeline_ci = vk::GraphicsPipelineCreateInfo::default()
         .stages(&shader_stages)
         .vertex_input_state(&vertex_input_ci)
         .input_assembly_state(&input_assembly_ci)
@@ -835,8 +783,7 @@ fn create_wrapped_pipeline_impl(
         .dynamic_state(&dynamic_state_ci)
         .layout(layout)
         .render_pass(renderpass)
-        .subpass(0)
-        .build();
+        .subpass(0);
 
     let pipelines = unsafe {
         device
@@ -849,11 +796,11 @@ fn create_wrapped_pipeline_impl(
 
 fn wrapped_pipeline_input_assembly_state(
     is_molten_vk: bool,
-) -> vk::PipelineInputAssemblyStateCreateInfo {
-    vk::PipelineInputAssemblyStateCreateInfo::builder()
+) -> vk::PipelineInputAssemblyStateCreateInfo<'static> {
+    vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_STRIP)
         .primitive_restart_enable(is_molten_vk)
-        .build()
+        
 }
 
 /// Port of `CreateWrappedPipeline` — no blending.
@@ -958,13 +905,13 @@ pub fn create_wrapped_coverage_blending_pipeline(
 /// Pushes a new `VkDescriptorImageInfo` into `images` and returns a
 /// `VkWriteDescriptorSet` pointing at it. The caller must keep `images` alive
 /// until after `vkUpdateDescriptorSets`.
-pub fn create_write_descriptor_set<'a>(
-    images: &'a mut Vec<vk::DescriptorImageInfo>,
+pub fn create_write_descriptor_set(
+    images: &mut Vec<vk::DescriptorImageInfo>,
     sampler: vk::Sampler,
     view: vk::ImageView,
     set: vk::DescriptorSet,
     binding: u32,
-) -> vk::WriteDescriptorSet {
+) -> vk::WriteDescriptorSet<'static> {
     assert_fail_soft(images.capacity() > images.len(), || {
         "CreateWriteDescriptorSet requires pre-reserved image storage".to_owned()
     });
@@ -985,6 +932,7 @@ pub fn create_write_descriptor_set<'a>(
         p_image_info: last as *const _,
         p_buffer_info: std::ptr::null(),
         p_texel_buffer_view: std::ptr::null(),
+        ..Default::default()
     }
 }
 
@@ -1003,14 +951,13 @@ pub fn begin_render_pass(
     framebuffer: vk::Framebuffer,
     extent: vk::Extent2D,
 ) {
-    let renderpass_bi = vk::RenderPassBeginInfo::builder()
+    let renderpass_bi = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
         .framebuffer(framebuffer)
         .render_area(vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent,
-        })
-        .build();
+        });
 
     let viewport = vk::Viewport {
         x: 0.0,
@@ -1038,46 +985,19 @@ mod tests {
     use super::{
         create_write_descriptor_set, wrapped_descriptor_pool_sizes,
         wrapped_descriptor_set_layout_bindings, wrapped_pipeline_input_assembly_state,
-        CubicFilterWeights, SamplerCubicWeightsCreateInfoQcom,
-        SAMPLER_CUBIC_WEIGHTS_CREATE_INFO_QCOM,
+        CubicFilterWeights,
     };
     use ash::vk;
 
     #[test]
     fn qcom_cubic_weight_values_match_vulkan() {
-        assert_eq!(CubicFilterWeights::CatmullRom as i32, 0);
-        assert_eq!(CubicFilterWeights::ZeroTangentCardinal as i32, 1);
-        assert_eq!(CubicFilterWeights::BSpline as i32, 2);
-        assert_eq!(CubicFilterWeights::MitchellNetravali as i32, 3);
+        assert_eq!(CubicFilterWeights::CATMULL_ROM.as_raw(), 0);
+        assert_eq!(CubicFilterWeights::ZERO_TANGENT_CARDINAL.as_raw(), 1);
+        assert_eq!(CubicFilterWeights::B_SPLINE.as_raw(), 2);
+        assert_eq!(CubicFilterWeights::MITCHELL_NETRAVALI.as_raw(), 3);
         assert_eq!(
-            SAMPLER_CUBIC_WEIGHTS_CREATE_INFO_QCOM.as_raw(),
+            vk::StructureType::SAMPLER_CUBIC_WEIGHTS_CREATE_INFO_QCOM.as_raw(),
             1_000_519_000
-        );
-    }
-
-    #[test]
-    fn qcom_sampler_payload_matches_vulkan_c_layout() {
-        let pointer_offset = std::mem::size_of::<usize>();
-        assert_eq!(std::mem::size_of::<CubicFilterWeights>(), 4);
-        assert_eq!(
-            std::mem::align_of::<SamplerCubicWeightsCreateInfoQcom>(),
-            std::mem::align_of::<usize>()
-        );
-        assert_eq!(
-            std::mem::offset_of!(SamplerCubicWeightsCreateInfoQcom, s_type),
-            0
-        );
-        assert_eq!(
-            std::mem::offset_of!(SamplerCubicWeightsCreateInfoQcom, p_next),
-            pointer_offset
-        );
-        assert_eq!(
-            std::mem::offset_of!(SamplerCubicWeightsCreateInfoQcom, cubic_weights),
-            pointer_offset + std::mem::size_of::<usize>()
-        );
-        assert_eq!(
-            std::mem::size_of::<SamplerCubicWeightsCreateInfoQcom>(),
-            pointer_offset * 3
         );
     }
 

@@ -118,7 +118,7 @@ struct GraphicsPipelineEngine {
     draw: NonNull<Maxwell3DDrawView<'static>>,
     dirty_flags: NonNull<[bool; 256]>,
     gpu_memory: GraphicsGpuMemory,
-    push_descriptor: Option<ash::extensions::khr::PushDescriptor>,
+    push_descriptor: Option<ash::khr::push_descriptor::Device>,
     fallback_sampler: vk::Sampler,
 }
 
@@ -778,7 +778,7 @@ impl GraphicsPipeline {
         draw: &mut Maxwell3DDrawView<'_>,
         dirty_flags: &mut [bool; 256],
         gpu_memory: MemoryManagerHandle,
-        push_descriptor: Option<ash::extensions::khr::PushDescriptor>,
+        push_descriptor: Option<ash::khr::push_descriptor::Device>,
         fallback_sampler: vk::Sampler,
     ) {
         let draw = NonNull::from(draw).cast::<Maxwell3DDrawView<'static>>();
@@ -799,7 +799,7 @@ impl GraphicsPipeline {
         dirty_flags: &mut [bool; 256],
         read: &GpuReader<'_>,
         read_unsafe: &GpuUnsafeReader<'_>,
-        push_descriptor: Option<ash::extensions::khr::PushDescriptor>,
+        push_descriptor: Option<ash::khr::push_descriptor::Device>,
         fallback_sampler: vk::Sampler,
     ) {
         // SAFETY: `configure` consumes and clears this state immediately in
@@ -1221,7 +1221,7 @@ impl GraphicsPipeline {
         guest_descriptor_queue: &mut UpdateDescriptorQueue,
         descriptor_buffer_ring: &mut DescriptorBufferRing,
         prepared: PreparedGraphicsDescriptors,
-        push_descriptor: Option<ash::extensions::khr::PushDescriptor>,
+        push_descriptor: Option<ash::khr::push_descriptor::Device>,
     ) -> bool {
         let descriptor_data = DescriptorData(guest_descriptor_queue.update_data());
         let descriptor_entries = unsafe {
@@ -1356,10 +1356,9 @@ impl GraphicsPipeline {
             let vulkan_device = device.get();
             let logical = vulkan_device.get_logical();
             if let Some((address, usage)) = descriptor_buffer_binding {
-                let binding_info = vk::DescriptorBufferBindingInfoEXT::builder()
+                let binding_info = vk::DescriptorBufferBindingInfoEXT::default()
                     .address(address)
-                    .usage(usage)
-                    .build();
+                    .usage(usage);
                 vulkan_device
                     .descriptor_buffer_extension()
                     .expect("descriptor-buffer pipeline requires VK_EXT_descriptor_buffer")
@@ -1493,15 +1492,15 @@ impl GraphicsPipeline {
                 device.get_max_vertex_input_bindings(),
             );
         assert!(vertex_attributes.len() <= device.get_max_vertex_input_attributes() as usize);
-        let mut vertex_divisor_state = vk::PipelineVertexInputDivisorStateCreateInfoEXT::builder()
+        let mut vertex_divisor_state = vk::PipelineVertexInputDivisorStateCreateInfoEXT::default()
             .vertex_binding_divisors(&vertex_divisors);
-        let mut vertex_input_builder = vk::PipelineVertexInputStateCreateInfo::builder()
+        let mut vertex_input_builder = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vertex_bindings)
             .vertex_attribute_descriptions(&vertex_attributes);
         if !vertex_divisors.is_empty() {
             vertex_input_builder = vertex_input_builder.push_next(&mut vertex_divisor_state);
         }
-        let vertex_input = vertex_input_builder.build();
+        let vertex_input = vertex_input_builder;
 
         let input_assembly_topology =
             input_assembly_topology_for_state(fixed_state, &build.shader_modules);
@@ -1512,23 +1511,21 @@ impl GraphicsPipeline {
                 device.is_topology_list_primitive_restart_supported(),
                 device.is_patch_list_primitive_restart_supported(),
             );
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(input_assembly_topology)
-            .primitive_restart_enable(primitive_restart_enable)
-            .build();
-        let tessellation = vk::PipelineTessellationStateCreateInfo::builder()
-            .patch_control_points(patch_control_points_for_state(fixed_state))
-            .build();
+            .primitive_restart_enable(primitive_restart_enable);
+        let tessellation = vk::PipelineTessellationStateCreateInfo::default()
+            .patch_control_points(patch_control_points_for_state(fixed_state));
 
         let swizzles = fixed_state.viewport_swizzles.map(unpack_viewport_swizzle);
         let mut swizzle_state =
-            vk::PipelineViewportSwizzleStateCreateInfoNV::builder().viewport_swizzles(&swizzles);
-        let mut depth_clip_control = vk::PipelineViewportDepthClipControlCreateInfoEXT::builder()
+            vk::PipelineViewportSwizzleStateCreateInfoNV::default().viewport_swizzles(&swizzles);
+        let mut depth_clip_control = vk::PipelineViewportDepthClipControlCreateInfoEXT::default()
             .negative_one_to_one(fixed_state.ndc_minus_one_to_one());
         let num_viewports = device
             .get_max_viewports()
             .min(crate::engines::maxwell_3d::NUM_VIEWPORTS as u32);
-        let mut viewport_state_builder = vk::PipelineViewportStateCreateInfo::builder()
+        let mut viewport_state_builder = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(num_viewports)
             .scissor_count(num_viewports);
         if device.is_nv_viewport_swizzle_supported() {
@@ -1537,13 +1534,13 @@ impl GraphicsPipeline {
         if device.is_ext_depth_clip_control_supported() {
             viewport_state_builder = viewport_state_builder.push_next(&mut depth_clip_control);
         }
-        let viewport_state = viewport_state_builder.build();
+        let viewport_state = viewport_state_builder;
 
         let smooth_lines_supported =
             device.is_ext_line_rasterization_supported() && device.supports_smooth_lines();
         let stippled_lines_supported = device.is_ext_line_rasterization_supported()
             && device.supports_stippled_rectangular_lines();
-        let mut line_state = vk::PipelineRasterizationLineStateCreateInfoEXT::builder()
+        let mut line_state = vk::PipelineRasterizationLineStateCreateInfoEXT::default()
             .line_rasterization_mode(if fixed_state.smooth_lines() && smooth_lines_supported {
                 vk::LineRasterizationModeEXT::RECTANGULAR_SMOOTH
             } else {
@@ -1553,7 +1550,7 @@ impl GraphicsPipeline {
             .line_stipple_factor(fixed_state.line_stipple_factor)
             .line_stipple_pattern(fixed_state.line_stipple_pattern as u16);
         let mut conservative_state =
-            vk::PipelineRasterizationConservativeStateCreateInfoEXT::builder()
+            vk::PipelineRasterizationConservativeStateCreateInfoEXT::default()
                 .conservative_rasterization_mode(if fixed_state.conservative_raster_enable() {
                     vk::ConservativeRasterizationModeEXT::OVERESTIMATE
                 } else {
@@ -1573,9 +1570,9 @@ impl GraphicsPipeline {
             vk::ProvokingVertexModeEXT::LAST_VERTEX
         };
         let mut provoking_state =
-            vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT::builder()
+            vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT::default()
                 .provoking_vertex_mode(provoking_mode);
-        let mut rasterization_builder = vk::PipelineRasterizationStateCreateInfo::builder()
+        let mut rasterization_builder = vk::PipelineRasterizationStateCreateInfo::default()
             .depth_clamp_enable(!dynamic.depth_clamp_disabled())
             .rasterizer_discard_enable(!dynamic.rasterize_enable())
             .polygon_mode(maxwell_to_vk::polygon_mode(fixed_state.polygon_mode()))
@@ -1596,11 +1593,11 @@ impl GraphicsPipeline {
         if device.is_ext_provoking_vertex_supported() {
             rasterization_builder = rasterization_builder.push_next(&mut provoking_state);
         }
-        let rasterization = rasterization_builder.build();
+        let rasterization = rasterization_builder;
 
         let sample_shading = *common::settings::values().sample_shading.get_value();
         let supports_alpha_output = build.fragment_has_color0_output;
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(maxwell_to_vk::msaa_mode(
                 MsaaMode::from_raw(fixed_state.msaa_mode_raw()).unwrap_or_else(|| {
                     debug_assert!(false, "Invalid msaa_mode={}", fixed_state.msaa_mode_raw());
@@ -1616,15 +1613,14 @@ impl GraphicsPipeline {
                 supports_alpha_output
                     && device.supports_alpha_to_one()
                     && fixed_state.alpha_to_one_enabled(),
-            )
-            .build();
+            );
 
         let depth_bounds_enabled =
             dynamic.depth_bounds_enable() && device.is_depth_bounds_supported();
         if dynamic.depth_bounds_enable() && !device.is_depth_bounds_supported() {
             warn!("Depth bounds is enabled but not supported");
         }
-        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::builder()
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(dynamic.depth_test_enable())
             .depth_write_enable(dynamic.depth_write_enable())
             .depth_compare_op(if dynamic.depth_test_enable() {
@@ -1637,8 +1633,7 @@ impl GraphicsPipeline {
             .front(stencil_face_state(dynamic.front_stencil(), dynamic.raw2))
             .back(stencil_face_state(dynamic.back_stencil(), dynamic.raw2))
             .min_depth_bounds(fixed_state.depth_bounds_min as f32)
-            .max_depth_bounds(fixed_state.depth_bounds_max as f32)
-            .build();
+            .max_depth_bounds(fixed_state.depth_bounds_max as f32);
 
         let blend_attachments = (0..num_attachments(fixed_state))
             .map(|index| {
@@ -1657,7 +1652,7 @@ impl GraphicsPipeline {
                 if mask[3] {
                     write_mask |= vk::ColorComponentFlags::A;
                 }
-                vk::PipelineColorBlendAttachmentState::builder()
+                vk::PipelineColorBlendAttachmentState::default()
                     .blend_enable(attachment.is_enabled())
                     .src_color_blend_factor(maxwell_to_vk::blend_factor(
                         attachment.source_rgb_factor(),
@@ -1674,16 +1669,15 @@ impl GraphicsPipeline {
                     ))
                     .alpha_blend_op(maxwell_to_vk::blend_equation(attachment.equation_alpha()))
                     .color_write_mask(write_mask)
-                    .build()
+                    
             })
             .collect::<Vec<_>>();
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(dynamic.logic_op_enable())
             .logic_op(vk::LogicOp::from_raw(
                 pack_logic_op(dynamic.logic_op()) as i32
             ))
-            .attachments(&blend_attachments)
-            .build();
+            .attachments(&blend_attachments);
 
         let dynamic_support = DynamicState3Support {
             depth_clamp_enable: device.supports_dynamic_state3_depth_clamp_enable(),
@@ -1696,9 +1690,8 @@ impl GraphicsPipeline {
             alpha_to_one_enable: device.supports_dynamic_state3_alpha_to_one_enable(),
         };
         let dynamic_states = dynamic_states_for_fixed_state(fixed_state, dynamic_support);
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
 
         let mut flags = vk::PipelineCreateFlags::empty();
         if device.is_khr_pipeline_executable_properties_enabled()
@@ -1709,7 +1702,7 @@ impl GraphicsPipeline {
         if build.uses_descriptor_buffer {
             flags |= vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT;
         }
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .flags(flags)
             .stages(&shader_stages)
             .vertex_input_state(&vertex_input)
@@ -1723,8 +1716,7 @@ impl GraphicsPipeline {
             .dynamic_state(&dynamic_state)
             .layout(build.pipeline_layout)
             .render_pass(render_pass)
-            .subpass(0)
-            .build();
+            .subpass(0);
 
         match unsafe {
             build
@@ -1886,10 +1878,10 @@ fn graphics_stage_flags(stage_index: usize) -> vk::ShaderStageFlags {
     }
 }
 
-fn shader_stage_create_infos(
+fn shader_stage_create_infos<'a>(
     shader_modules: &[vk::ShaderModule; NUM_VK_GRAPHICS_STAGES],
-    entry_name: &std::ffi::CStr,
-) -> Vec<vk::PipelineShaderStageCreateInfo> {
+    entry_name: &'a std::ffi::CStr,
+) -> Vec<vk::PipelineShaderStageCreateInfo<'a>> {
     shader_modules
         .iter()
         .enumerate()
@@ -1898,11 +1890,10 @@ fn shader_stage_create_infos(
                 return None;
             }
             Some(
-                vk::PipelineShaderStageCreateInfo::builder()
+                vk::PipelineShaderStageCreateInfo::default()
                     .stage(graphics_stage_flags(stage_index))
                     .module(module)
-                    .name(entry_name)
-                    .build(),
+                    .name(entry_name),
             )
         })
         .collect()

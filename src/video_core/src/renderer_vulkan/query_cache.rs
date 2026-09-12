@@ -150,10 +150,9 @@ impl SamplesQueryBank {
         index: usize,
         host_query_reset_supported: bool,
     ) -> Result<Arc<Self>, vk::Result> {
-        let create_info = vk::QueryPoolCreateInfo::builder()
+        let create_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::OCCLUSION)
-            .query_count(SAMPLES_QUERY_BANK_SIZE as u32)
-            .build();
+            .query_count(SAMPLES_QUERY_BANK_SIZE as u32);
         let query_pool = unsafe { device.create_query_pool(&create_info, None)? };
         let bank = Arc::new(Self {
             base: parking_lot::Mutex::new(BankBase::new(SAMPLES_QUERY_BANK_SIZE)),
@@ -233,7 +232,6 @@ impl SamplesQueryBank {
             self.device.get_query_pool_results(
                 self.query_pool,
                 start as u32,
-                size as u32,
                 &mut host_results[start..start + size],
                 vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
             )
@@ -387,15 +385,14 @@ impl SamplesStreamer {
         )?;
         let accumulation_buffer = memory_allocator
             .create_buffer(
-                &vk::BufferCreateInfo::builder()
+                &vk::BufferCreateInfo::default()
                     .size(SAMPLES_QUERY_SIZE as u64)
                     .usage(
                         vk::BufferUsageFlags::TRANSFER_DST
                             | vk::BufferUsageFlags::TRANSFER_SRC
                             | vk::BufferUsageFlags::STORAGE_BUFFER,
                     )
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .build(),
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 MemoryUsage::DeviceLocal,
             )
             .map_err(|error| error.result)?;
@@ -450,21 +447,19 @@ impl SamplesStreamer {
             | vk::BufferUsageFlags::STORAGE_BUFFER;
         let resolve = memory_allocator
             .create_buffer(
-                &vk::BufferCreateInfo::builder()
+                &vk::BufferCreateInfo::default()
                     .size(size)
                     .usage(usage)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .build(),
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 MemoryUsage::DeviceLocal,
             )
             .map_err(|error| error.result)?;
         let intermediary = memory_allocator
             .create_buffer(
-                &vk::BufferCreateInfo::builder()
+                &vk::BufferCreateInfo::default()
                     .size(size)
                     .usage(usage)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .build(),
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 MemoryUsage::DeviceLocal,
             )
             .map_err(|error| error.result)?;
@@ -680,15 +675,14 @@ impl SamplesStreamer {
                     SAMPLES_QUERY_SIZE as u64,
                     vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
                 );
-                let barrier = vk::BufferMemoryBarrier::builder()
+                let barrier = vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .buffer(resolve_buffer)
                     .offset(offset)
-                    .size((amount * SAMPLES_QUERY_SIZE) as u64)
-                    .build();
+                    .size((amount * SAMPLES_QUERY_SIZE) as u64);
                 device.cmd_pipeline_barrier(
                     cmdbuf,
                     vk::PipelineStageFlags::TRANSFER,
@@ -1211,19 +1205,17 @@ impl TfbQueryBank {
         memory_allocator: &MemoryAllocator,
     ) -> Result<Arc<Self>, vk::Result> {
         let size = TFB_QUERY_SIZE * TFB_QUERY_BANK_SIZE as u64;
-        let device_info = vk::BufferCreateInfo::builder()
+        let device_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = memory_allocator
             .create_buffer(&device_info, MemoryUsage::DeviceLocal)
             .map_err(|error| error.result)?;
-        let readback_info = vk::BufferCreateInfo::builder()
+        let readback_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let readback = memory_allocator
             .create_buffer(&readback_info, MemoryUsage::Download)
             .map_err(|error| error.result)?;
@@ -1338,7 +1330,7 @@ fn make_tfb_counter_config(
 
 pub(crate) struct TfbCounterState {
     device: ash::Device,
-    transform_feedback: Option<vk::ExtTransformFeedbackFn>,
+    transform_feedback: Option<ash::ext::transform_feedback::DeviceFn>,
     counters_buffer: AllocatedBuffer,
     counter_buffers: [vk::Buffer; NUM_TFB_STREAMS],
     offsets: [vk::DeviceSize; NUM_TFB_STREAMS],
@@ -1438,10 +1430,9 @@ impl TfbCounterState {
             let offsets = self.offsets;
             let device = self.device.clone();
             scheduler.record(move |cmdbuf| unsafe {
-                let barrier = vk::MemoryBarrier::builder()
+                let barrier = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT)
-                    .dst_access_mask(vk::AccessFlags::TRANSFORM_FEEDBACK_COUNTER_READ_EXT)
-                    .build();
+                    .dst_access_mask(vk::AccessFlags::TRANSFORM_FEEDBACK_COUNTER_READ_EXT);
                 device.cmd_pipeline_barrier(
                     cmdbuf,
                     vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT,
@@ -1526,7 +1517,7 @@ impl TfbCounterStreamer {
         transform_feedback_supported: bool,
     ) -> Result<Self, vk::Result> {
         let transform_feedback = transform_feedback_supported.then(|| {
-            vk::ExtTransformFeedbackFn::load(|name| unsafe {
+            ash::ext::transform_feedback::DeviceFn::load(|name| unsafe {
                 std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
             })
         });
@@ -1537,11 +1528,10 @@ impl TfbCounterStreamer {
             } else {
                 vk::BufferUsageFlags::empty()
             };
-        let create_info = vk::BufferCreateInfo::builder()
+        let create_info = vk::BufferCreateInfo::default()
             .size(TFB_QUERY_SIZE * NUM_TFB_STREAMS as u64)
             .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let counters_buffer = memory_allocator
             .create_buffer(&create_info, MemoryUsage::DeviceLocal)
             .map_err(|error| error.result)?;
@@ -1647,10 +1637,9 @@ impl TfbCounterStreamer {
         let bank = report.0.bank.buffer.handle();
         let destination_offset = report.0.slot as u64 * TFB_QUERY_SIZE;
         scheduler.record(move |cmdbuf| unsafe {
-            let counter_barrier = vk::MemoryBarrier::builder()
+            let counter_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .build();
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
             device.cmd_pipeline_barrier(
                 cmdbuf,
                 vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT,
@@ -1733,10 +1722,9 @@ impl TfbCounterStreamer {
         }
         let device = self.device.clone();
         scheduler.record(move |cmdbuf| unsafe {
-            let barrier = vk::MemoryBarrier::builder()
+            let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .build();
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             device.cmd_pipeline_barrier(
                 cmdbuf,
                 vk::PipelineStageFlags::TRANSFER,
@@ -1846,7 +1834,7 @@ fn write_query_result(
 pub(crate) struct QueryRuntimeState {
     host_conditional_rendering_active: bool,
     host_conditional_rendering_paused: bool,
-    conditional_rendering: Option<vk::ExtConditionalRenderingFn>,
+    conditional_rendering: Option<ash::ext::conditional_rendering::DeviceFn>,
     hcr_buffer: vk::Buffer,
     hcr_offset: u64,
     hcr_flags: vk::ConditionalRenderingFlagsEXT,
@@ -1876,7 +1864,7 @@ impl QueryRuntimeState {
 
     pub(crate) fn pause_host_conditional_rendering(
         &mut self,
-    ) -> Option<vk::ExtConditionalRenderingFn> {
+    ) -> Option<ash::ext::conditional_rendering::DeviceFn> {
         if !self.host_conditional_rendering_active || self.host_conditional_rendering_paused {
             return None;
         }
@@ -1887,7 +1875,7 @@ impl QueryRuntimeState {
     fn resume_host_conditional_rendering(
         &mut self,
     ) -> Option<(
-        vk::ExtConditionalRenderingFn,
+        ash::ext::conditional_rendering::DeviceFn,
         vk::Buffer,
         u64,
         vk::ConditionalRenderingFlagsEXT,
@@ -2180,7 +2168,7 @@ impl QueryCacheRuntime {
     ) -> Result<Self, vk::Result> {
         let conditional_rendering_supported = vulkan_device.is_ext_conditional_rendering();
         let conditional_rendering = conditional_rendering_supported.then(|| {
-            vk::ExtConditionalRenderingFn::load(|name| unsafe {
+            ash::ext::conditional_rendering::DeviceFn::load(|name| unsafe {
                 std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr()))
             })
         });
@@ -2203,11 +2191,10 @@ impl QueryCacheRuntime {
             };
         let hcr_resolve_buffer = memory_allocator
             .create_buffer(
-                &vk::BufferCreateInfo::builder()
+                &vk::BufferCreateInfo::default()
                     .size(std::mem::size_of::<u32>() as u64)
                     .usage(hcr_buffer_usage)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .build(),
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 MemoryUsage::DeviceLocal,
             )
             .map_err(|error| error.result)?;
@@ -2303,12 +2290,11 @@ impl QueryCacheRuntime {
                         | vk::PipelineStageFlags::COMPUTE_SHADER
                         | vk::PipelineStageFlags::TRANSFER,
                     vk::PipelineStageFlags::TRANSFER,
-                    vk::MemoryBarrier::builder()
+                    vk::MemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                         .dst_access_mask(
                             vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
-                        )
-                        .build(),
+                        ),
                 )
             } else {
                 (
@@ -2317,12 +2303,11 @@ impl QueryCacheRuntime {
                         | vk::PipelineStageFlags::COMPUTE_SHADER
                         | vk::PipelineStageFlags::TRANSFER
                         | vk::PipelineStageFlags::HOST,
-                    vk::MemoryBarrier::builder()
+                    vk::MemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                         .dst_access_mask(
                             vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-                        )
-                        .build(),
+                        ),
                 )
             };
             device.cmd_pipeline_barrier(
@@ -2373,11 +2358,10 @@ impl QueryCacheRuntime {
             return;
         };
         unsafe { backend.scheduler.as_mut() }.record(move |cmdbuf| unsafe {
-            let begin_info = vk::ConditionalRenderingBeginInfoEXT::builder()
+            let begin_info = vk::ConditionalRenderingBeginInfoEXT::default()
                 .buffer(buffer)
                 .offset(offset)
-                .flags(flags)
-                .build();
+                .flags(flags);
             (conditional_rendering.cmd_begin_conditional_rendering_ext)(cmdbuf, &begin_info);
         });
     }
@@ -2871,7 +2855,7 @@ impl QueryCache {
         })
     }
 
-    pub fn transform_feedback_dispatch(&self) -> Option<vk::ExtTransformFeedbackFn> {
+    pub fn transform_feedback_dispatch(&self) -> Option<ash::ext::transform_feedback::DeviceFn> {
         self.runtime
             .tfb_streamer
             .as_ref()

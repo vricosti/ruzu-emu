@@ -179,10 +179,9 @@ fn allocate_pool(
         info.images,
     );
 
-    let pool_ci = vk::DescriptorPoolCreateInfo::builder()
+    let pool_ci = vk::DescriptorPoolCreateInfo::default()
         .max_sets(sets_per_pool)
-        .pool_sizes(&pool_sizes)
-        .build();
+        .pool_sizes(&pool_sizes);
 
     let pool = unsafe { logical.create_descriptor_pool(&pool_ci, None)? };
     bank.pools.push(pool);
@@ -296,10 +295,9 @@ impl DescriptorAllocator {
         let logical = device.get_logical();
         let layouts = vec![layout; count];
         let mut bank = unsafe { bank.as_mut() }.lock().unwrap();
-        let mut allocate_info = vk::DescriptorSetAllocateInfo::builder()
+        let mut allocate_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(*bank.pools.last().expect("descriptor bank has no pool"))
-            .set_layouts(&layouts)
-            .build();
+            .set_layouts(&layouts);
         match unsafe { logical.allocate_descriptor_sets(&allocate_info) } {
             Ok(sets) => Ok(sets),
             Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY) => {

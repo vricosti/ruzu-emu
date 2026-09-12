@@ -240,10 +240,9 @@ impl Fsr {
             size: std::mem::size_of::<PushConstants>() as u32,
         };
         let set_layouts = [self.descriptor_set_layout];
-        let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::builder()
+        let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
-            .push_constant_ranges(std::slice::from_ref(&push_constant_range))
-            .build();
+            .push_constant_ranges(std::slice::from_ref(&push_constant_range));
         self.pipeline_layout = unsafe {
             device
                 .get_logical()

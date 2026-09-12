@@ -86,11 +86,10 @@ impl TurboResources {
 
     fn initialize(&mut self) -> Result<(), VulkanError> {
         let dld = self.device.get_logical();
-        let buffer_info = vk::BufferCreateInfo::builder()
+        let buffer_info = vk::BufferCreateInfo::default()
             .size(TURBO_BUFFER_SIZE)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         self.buffer = Some(
             self.allocator
                 .create_buffer(&buffer_info, MemoryUsage::DeviceLocal)?,
@@ -100,10 +99,9 @@ impl TurboResources {
             ty: vk::DescriptorType::STORAGE_BUFFER,
             descriptor_count: 1,
         }];
-        let descriptor_pool_info = vk::DescriptorPoolCreateInfo::builder()
+        let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
-            .pool_sizes(&pool_sizes)
-            .build();
+            .pool_sizes(&pool_sizes);
         self.descriptor_pool = unsafe {
             dld.create_descriptor_pool(&descriptor_pool_info, None)
                 .map_err(VulkanError::new)?
@@ -115,20 +113,19 @@ impl TurboResources {
             descriptor_count: 1,
             stage_flags: vk::ShaderStageFlags::COMPUTE,
             p_immutable_samplers: std::ptr::null(),
+            ..Default::default()
         }];
-        let descriptor_set_layout_info = vk::DescriptorSetLayoutCreateInfo::builder()
-            .bindings(&layout_bindings)
-            .build();
+        let descriptor_set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&layout_bindings);
         self.descriptor_set_layout = unsafe {
             dld.create_descriptor_set_layout(&descriptor_set_layout_info, None)
                 .map_err(VulkanError::new)?
         };
 
         let set_layouts = [self.descriptor_set_layout];
-        let descriptor_set_info = vk::DescriptorSetAllocateInfo::builder()
+        let descriptor_set_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts)
-            .build();
+            .set_layouts(&set_layouts);
         self.descriptor_set = unsafe {
             dld.allocate_descriptor_sets(&descriptor_set_info)
                 .map_err(VulkanError::new)?[0]
@@ -136,24 +133,22 @@ impl TurboResources {
 
         self.shader = build_shader(dld, VULKAN_TURBO_MODE_COMP_SPV).map_err(VulkanError::new)?;
 
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder()
-            .set_layouts(&set_layouts)
-            .build();
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts);
         self.pipeline_layout = unsafe {
             dld.create_pipeline_layout(&pipeline_layout_info, None)
                 .map_err(VulkanError::new)?
         };
 
         let entry_name = CString::new("main").unwrap();
-        let stage = vk::PipelineShaderStageCreateInfo::builder()
+        let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(self.shader)
-            .name(&entry_name)
-            .build();
-        let pipeline_info = [vk::ComputePipelineCreateInfo::builder()
+            .name(&entry_name);
+        let pipeline_info = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(self.pipeline_layout)
-            .build()];
+            ];
         self.pipeline = unsafe {
             dld.create_compute_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
                 .map_err(|(_, result)| VulkanError::new(result))?[0]
@@ -163,22 +158,20 @@ impl TurboResources {
             dld.create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(VulkanError::new)?
         };
-        let command_pool_info = vk::CommandPoolCreateInfo::builder()
+        let command_pool_info = vk::CommandPoolCreateInfo::default()
             .flags(
                 vk::CommandPoolCreateFlags::TRANSIENT
                     | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
             )
-            .queue_family_index(self.device.get_graphics_family())
-            .build();
+            .queue_family_index(self.device.get_graphics_family());
         self.command_pool = unsafe {
             dld.create_command_pool(&command_pool_info, None)
                 .map_err(VulkanError::new)?
         };
-        let command_buffer_info = vk::CommandBufferAllocateInfo::builder()
+        let command_buffer_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1)
-            .build();
+            .command_buffer_count(1);
         self.command_buffer = unsafe {
             dld.allocate_command_buffers(&command_buffer_info)
                 .map_err(VulkanError::new)?[0]
@@ -201,17 +194,16 @@ impl TurboResources {
                 offset: 0,
                 range: vk::WHOLE_SIZE,
             }];
-            let descriptor_write = [vk::WriteDescriptorSet::builder()
+            let descriptor_write = [vk::WriteDescriptorSet::default()
                 .dst_set(self.descriptor_set)
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&descriptor_buffer_info)
-                .build()];
+                ];
             dld.update_descriptor_sets(&descriptor_write, &[]);
 
-            let begin_info = vk::CommandBufferBeginInfo::builder()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
-                .build();
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             dld.begin_command_buffer(self.command_buffer, &begin_info)?;
             dld.cmd_fill_buffer(self.command_buffer, buffer, 0, vk::WHOLE_SIZE, 0);
             dld.cmd_bind_descriptor_sets(
@@ -231,9 +223,9 @@ impl TurboResources {
             dld.end_command_buffer(self.command_buffer)?;
 
             let command_buffers = [self.command_buffer];
-            let submit_info = [vk::SubmitInfo::builder()
+            let submit_info = [vk::SubmitInfo::default()
                 .command_buffers(&command_buffers)
-                .build()];
+                ];
             dld.queue_submit(self.device.get_graphics_queue(), &submit_info, self.fence)?;
             dld.wait_for_fences(&[self.fence], true, u64::MAX)?;
         }

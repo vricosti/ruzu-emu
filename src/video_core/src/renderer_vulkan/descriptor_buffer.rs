@@ -98,15 +98,14 @@ impl DescriptorBufferRing {
         ring.chunk_capacity = chunk_size - ring.alignment;
         ring.chunks_per_frame = (frame_size / chunk_size) as usize;
 
-        let buffer_info = vk::BufferCreateInfo::builder()
+        let buffer_info = vk::BufferCreateInfo::default()
             .size(chunk_size)
             .usage(
                 vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT
                     | vk::BufferUsageFlags::SAMPLER_DESCRIPTOR_BUFFER_EXT
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let total_chunks = ring.chunks_per_frame * FRAMES_IN_FLIGHT;
         ring.chunks.reserve(total_chunks);
         ring.chunk_addresses.reserve(total_chunks);
@@ -126,9 +125,8 @@ impl DescriptorBufferRing {
             device.set_buffer_name(buffer.buffer(), "Descriptor buffer");
             let raw_address = unsafe {
                 device.get_logical().get_buffer_device_address(
-                    &vk::BufferDeviceAddressInfo::builder()
-                        .buffer(buffer.buffer())
-                        .build(),
+                    &vk::BufferDeviceAddressInfo::default()
+                        .buffer(buffer.buffer()),
                 )
             };
             let address = align_up(raw_address, ring.alignment);
@@ -207,14 +205,14 @@ impl DescriptorBufferRing {
         }
     }
 
-    pub fn binding_info(&self, chunk: u32) -> vk::DescriptorBufferBindingInfoEXT {
-        vk::DescriptorBufferBindingInfoEXT::builder()
+    pub fn binding_info(&self, chunk: u32) -> vk::DescriptorBufferBindingInfoEXT<'_> {
+        vk::DescriptorBufferBindingInfoEXT::default()
             .address(self.chunk_addresses[chunk as usize])
             .usage(
                 vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT
                     | vk::BufferUsageFlags::SAMPLER_DESCRIPTOR_BUFFER_EXT,
             )
-            .build()
+            
     }
 
     pub fn is_valid(&self) -> bool {

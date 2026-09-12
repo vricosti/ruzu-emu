@@ -369,7 +369,7 @@ impl AllocatedBuffer {
             .allocator
             .lock()
             .expect("VMA allocator mutex poisoned")
-            .flush_allocation(allocation, 0, vk::WHOLE_SIZE as usize);
+            .flush_allocation(allocation, 0, vk::WHOLE_SIZE);
     }
 
     pub fn invalidate(&self) {
@@ -383,7 +383,7 @@ impl AllocatedBuffer {
             .allocator
             .lock()
             .expect("VMA allocator mutex poisoned")
-            .invalidate_allocation(allocation, 0, vk::WHOLE_SIZE as usize);
+            .invalidate_allocation(allocation, 0, vk::WHOLE_SIZE);
     }
 }
 

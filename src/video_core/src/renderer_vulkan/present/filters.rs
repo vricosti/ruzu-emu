@@ -58,7 +58,7 @@ fn uses_hardware_cubic(
     weights: CubicFilterWeights,
 ) -> bool {
     filter_cubic_supported
-        && (qcom_filter_cubic_weights_supported || weights == CubicFilterWeights::CatmullRom)
+        && (qcom_filter_cubic_weights_supported || weights == CubicFilterWeights::CATMULL_ROM)
 }
 
 /// Port of `MakeBicubic`.
@@ -80,14 +80,16 @@ pub fn make_bicubic(
     }
 
     let (shader, shader_name) = match weights {
-        CubicFilterWeights::CatmullRom => (PRESENT_BICUBIC_FRAG_SPV, "present_bicubic.frag"),
-        CubicFilterWeights::ZeroTangentCardinal => {
+        CubicFilterWeights::CATMULL_ROM => (PRESENT_BICUBIC_FRAG_SPV, "present_bicubic.frag"),
+        CubicFilterWeights::ZERO_TANGENT_CARDINAL => {
             (PRESENT_ZERO_TANGENT_FRAG_SPV, "present_zero_tangent.frag")
         }
-        CubicFilterWeights::BSpline => (PRESENT_BSPLINE_FRAG_SPV, "present_bspline.frag"),
-        CubicFilterWeights::MitchellNetravali => {
+        CubicFilterWeights::B_SPLINE => (PRESENT_BSPLINE_FRAG_SPV, "present_bspline.frag"),
+        CubicFilterWeights::MITCHELL_NETRAVALI => {
             (PRESENT_MITCHELL_FRAG_SPV, "present_mitchell.frag")
         }
+        // Upstream switches on the enum and falls back to Catmull-Rom.
+        _ => (PRESENT_BICUBIC_FRAG_SPV, "present_bicubic.frag"),
     };
     let sampler = util::create_bilinear_sampler(device);
     let fragment_shader =
@@ -191,33 +193,33 @@ mod tests {
         assert!(uses_hardware_cubic(
             true,
             false,
-            CubicFilterWeights::CatmullRom
+            CubicFilterWeights::CATMULL_ROM
         ));
         assert!(!uses_hardware_cubic(
             false,
             true,
-            CubicFilterWeights::CatmullRom
+            CubicFilterWeights::CATMULL_ROM
         ));
         assert!(!uses_hardware_cubic(
             true,
             false,
-            CubicFilterWeights::ZeroTangentCardinal
+            CubicFilterWeights::ZERO_TANGENT_CARDINAL
         ));
         assert!(!uses_hardware_cubic(
             true,
             false,
-            CubicFilterWeights::BSpline
+            CubicFilterWeights::B_SPLINE
         ));
         assert!(!uses_hardware_cubic(
             true,
             false,
-            CubicFilterWeights::MitchellNetravali
+            CubicFilterWeights::MITCHELL_NETRAVALI
         ));
         for weights in [
-            CubicFilterWeights::CatmullRom,
-            CubicFilterWeights::ZeroTangentCardinal,
-            CubicFilterWeights::BSpline,
-            CubicFilterWeights::MitchellNetravali,
+            CubicFilterWeights::CATMULL_ROM,
+            CubicFilterWeights::ZERO_TANGENT_CARDINAL,
+            CubicFilterWeights::B_SPLINE,
+            CubicFilterWeights::MITCHELL_NETRAVALI,
         ] {
             assert!(uses_hardware_cubic(true, true, weights));
         }

@@ -2,20 +2,23 @@
 //!
 //! Upstream owner: `backend/arm64/emit_arm64_saturation.cpp`.
 
-use crate::backend::arm64::abi::{XSCRATCH0, XSCRATCH1};
+use rhazel::{CodeGenerator, WReg, WZR};
+
+use crate::backend::arm64::abi::{WSCRATCH0, WSCRATCH1};
 use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_context::EmitContext;
-use crate::backend::arm64::inst;
 use crate::backend::arm64::reg_alloc::RegAlloc;
 use crate::ir::cond::Cond;
 use crate::ir::opcode::Opcode;
 use crate::ir::value::InstRef;
 
-fn emit_mov_w_imm(code: &mut BlockOfCode, reg: u8, imm: u32) -> Result<(), String> {
-    code.write_u32(inst::movz_w(reg, (imm & 0xffff) as u16, 0))?;
+/// Upstream `code.MOV(Wreg, imm)`: MOVZ plus a MOVK for the high half when
+/// it is non-zero.
+fn emit_mov_w_imm(code: &mut CodeGenerator<'_>, reg: WReg, imm: u32) -> Result<(), String> {
+    code.movz(reg, (imm & 0xffff) as u16, 0)?;
     let high = (imm >> 16) as u16;
     if high != 0 {
-        code.write_u32(inst::movk_w(reg, high, 16))?;
+        code.movk(reg, high, 16)?;
     }
     Ok(())
 }
@@ -25,6 +28,7 @@ pub fn emit_signed_saturated_add_with_flag32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
     let overflow_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetOverflowFromOp)
@@ -42,16 +46,13 @@ pub fn emit_signed_saturated_add_with_flag32(
     )?;
     ctx.reg_alloc.spill_flags(code)?;
 
-    let result = result.index().expect("realized W result") as u8;
-    let a = a.index().expect("realized W a") as u8;
-    let b = b.index().expect("realized W b") as u8;
-    let overflow = overflow.index().expect("realized W overflow") as u8;
-    code.write_u32(inst::adds_w_reg(result, a, b))?;
-    code.write_u32(inst::asr_w_imm(XSCRATCH0, result, 31))?;
-    emit_mov_w_imm(code, XSCRATCH1, 0x8000_0000)?;
-    code.write_u32(inst::eor_w_reg(XSCRATCH0, XSCRATCH0, XSCRATCH1))?;
-    code.write_u32(inst::csel_w(result, result, XSCRATCH0, Cond::VC))?;
-    code.write_u32(inst::cinc_w(overflow, 31, Cond::VS))?;
+    let (result, a, b, overflow) = (result.w(), a.w(), b.w(), overflow.w());
+    code.adds(result, a, b)?;
+    code.asr(WSCRATCH0, result, 31)?;
+    emit_mov_w_imm(code, WSCRATCH1, 0x8000_0000)?;
+    code.eor(WSCRATCH0, WSCRATCH0, WSCRATCH1)?;
+    code.csel(result, result, WSCRATCH0, Cond::VC)?;
+    code.cinc(overflow, WZR, Cond::VS)?;
     Ok(())
 }
 
@@ -60,6 +61,7 @@ pub fn emit_signed_saturated_sub_with_flag32(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
     let overflow_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetOverflowFromOp)
@@ -77,16 +79,13 @@ pub fn emit_signed_saturated_sub_with_flag32(
     )?;
     ctx.reg_alloc.spill_flags(code)?;
 
-    let result = result.index().expect("realized W result") as u8;
-    let a = a.index().expect("realized W a") as u8;
-    let b = b.index().expect("realized W b") as u8;
-    let overflow = overflow.index().expect("realized W overflow") as u8;
-    code.write_u32(inst::subs_w_reg(result, a, b))?;
-    code.write_u32(inst::asr_w_imm(XSCRATCH0, result, 31))?;
-    emit_mov_w_imm(code, XSCRATCH1, 0x8000_0000)?;
-    code.write_u32(inst::eor_w_reg(XSCRATCH0, XSCRATCH0, XSCRATCH1))?;
-    code.write_u32(inst::csel_w(result, result, XSCRATCH0, Cond::VC))?;
-    code.write_u32(inst::cinc_w(overflow, 31, Cond::VS))?;
+    let (result, a, b, overflow) = (result.w(), a.w(), b.w(), overflow.w());
+    code.subs(result, a, b)?;
+    code.asr(WSCRATCH0, result, 31)?;
+    emit_mov_w_imm(code, WSCRATCH1, 0x8000_0000)?;
+    code.eor(WSCRATCH0, WSCRATCH0, WSCRATCH1)?;
+    code.csel(result, result, WSCRATCH0, Cond::VC)?;
+    code.cinc(overflow, WZR, Cond::VS)?;
     Ok(())
 }
 
@@ -95,6 +94,7 @@ pub fn emit_signed_saturation(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
     let overflow_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetOverflowFromOp);
@@ -108,10 +108,7 @@ pub fn emit_signed_saturation(
         if let Some(overflow_inst) = overflow_inst {
             let mut overflow = ctx.reg_alloc.write_w(overflow_inst);
             RegAlloc::realize_all(code, ctx.block, &mut [&mut overflow])?;
-            code.write_u32(inst::mov_w(
-                overflow.index().expect("realized W overflow") as u8,
-                31,
-            ))?;
+            code.mov(overflow.w(), WZR)?;
         }
         return Ok(());
     }
@@ -124,21 +121,19 @@ pub fn emit_signed_saturation(
     RegAlloc::realize_all(code, ctx.block, &mut [&mut operand, &mut result])?;
     ctx.reg_alloc.spill_flags(code)?;
 
-    let operand = operand.index().expect("realized W operand") as u8;
-    let result = result.index().expect("realized W result") as u8;
-    emit_mov_w_imm(code, XSCRATCH0, negative_saturated_value)?;
-    emit_mov_w_imm(code, XSCRATCH1, positive_saturated_value)?;
-    code.write_u32(inst::cmp_w_reg(operand, XSCRATCH0))?;
-    code.write_u32(inst::csel_w(result, operand, XSCRATCH0, Cond::GT))?;
-    code.write_u32(inst::cmp_w_reg(operand, XSCRATCH1))?;
-    code.write_u32(inst::csel_w(result, result, XSCRATCH1, Cond::LT))?;
+    let (operand, result) = (operand.w(), result.w());
+    emit_mov_w_imm(code, WSCRATCH0, negative_saturated_value)?;
+    emit_mov_w_imm(code, WSCRATCH1, positive_saturated_value)?;
+    code.cmp(operand, WSCRATCH0)?;
+    code.csel(result, operand, WSCRATCH0, Cond::GT)?;
+    code.cmp(operand, WSCRATCH1)?;
+    code.csel(result, result, WSCRATCH1, Cond::LT)?;
 
     if let Some(overflow_inst) = overflow_inst {
         let mut overflow = ctx.reg_alloc.write_w(overflow_inst);
         RegAlloc::realize_all(code, ctx.block, &mut [&mut overflow])?;
-        let overflow = overflow.index().expect("realized W overflow") as u8;
-        code.write_u32(inst::cmp_w_reg(result, operand))?;
-        code.write_u32(inst::cinc_w(overflow, 31, Cond::NE))?;
+        code.cmp(result, operand)?;
+        code.cinc(overflow.w(), WZR, Cond::NE)?;
     }
     Ok(())
 }
@@ -148,6 +143,7 @@ pub fn emit_unsigned_saturation(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
     let overflow_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetOverflowFromOp);
@@ -161,22 +157,17 @@ pub fn emit_unsigned_saturation(
     assert!(bit_size <= 31);
     let saturated_value = (1u32 << bit_size) - 1;
 
-    let result = result.index().expect("realized W result") as u8;
-    let operand = operand.index().expect("realized W operand") as u8;
-    emit_mov_w_imm(code, XSCRATCH0, saturated_value)?;
-    code.write_u32(inst::cmp_w_imm(operand, 0))?;
-    code.write_u32(inst::csel_w(result, operand, 31, Cond::GT))?;
-    code.write_u32(inst::cmp_w_reg(operand, XSCRATCH0))?;
-    code.write_u32(inst::csel_w(result, result, XSCRATCH0, Cond::LT))?;
+    let (result, operand) = (result.w(), operand.w());
+    emit_mov_w_imm(code, WSCRATCH0, saturated_value)?;
+    code.cmp_imm(operand, 0)?;
+    code.csel(result, operand, WZR, Cond::GT)?;
+    code.cmp(operand, WSCRATCH0)?;
+    code.csel(result, result, WSCRATCH0, Cond::LT)?;
 
     if let Some(overflow_inst) = overflow_inst {
         let mut overflow = ctx.reg_alloc.write_w(overflow_inst);
         RegAlloc::realize_all(code, ctx.block, &mut [&mut overflow])?;
-        code.write_u32(inst::cinc_w(
-            overflow.index().expect("realized W overflow") as u8,
-            31,
-            Cond::HI,
-        ))?;
+        code.cinc(overflow.w(), WZR, Cond::HI)?;
     }
     Ok(())
 }

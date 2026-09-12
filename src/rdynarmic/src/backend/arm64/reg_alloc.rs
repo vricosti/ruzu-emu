@@ -2,6 +2,7 @@
 //!
 //! Upstream owner: `backend/arm64/reg_alloc.h/.cpp`.
 
+use rhazel::{BReg, DReg, HReg, QReg, SReg, VReg, WReg, XReg};
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -110,6 +111,49 @@ impl RAReg {
 
     pub fn index(&self) -> Option<usize> {
         self.reg
+    }
+
+    fn realized(&self, what: &str) -> u8 {
+        self.reg
+            .unwrap_or_else(|| panic!("{what} used before RegAlloc::realize"))
+            as u8
+    }
+
+    // Upstream `RAReg<T>` converts to its operand type `T` once realized; the
+    // Rust handle has no static width, so the emitter names the view it wants.
+
+    /// `RAReg<oaknut::WReg>`
+    pub fn w(&self) -> WReg {
+        WReg::new(self.realized("W register"))
+    }
+    /// `RAReg<oaknut::XReg>`
+    pub fn x(&self) -> XReg {
+        XReg::new(self.realized("X register"))
+    }
+    /// `RAReg<oaknut::BReg>`
+    pub fn b(&self) -> BReg {
+        BReg::new(self.realized("B register"))
+    }
+    /// `RAReg<oaknut::HReg>`
+    pub fn h(&self) -> HReg {
+        HReg::new(self.realized("H register"))
+    }
+    /// `RAReg<oaknut::SReg>`
+    pub fn s(&self) -> SReg {
+        SReg::new(self.realized("S register"))
+    }
+    /// `RAReg<oaknut::DReg>`
+    pub fn d(&self) -> DReg {
+        DReg::new(self.realized("D register"))
+    }
+    /// `RAReg<oaknut::QReg>`
+    pub fn q(&self) -> QReg {
+        QReg::new(self.realized("Q register"))
+    }
+    /// The vector register, to be arranged (`RAReg<oaknut::QReg>` used as
+    /// `Qreg->B16()` and friends upstream).
+    pub fn v(&self) -> VReg {
+        VReg::new(self.realized("V register"))
     }
 }
 

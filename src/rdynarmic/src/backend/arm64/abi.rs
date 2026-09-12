@@ -17,6 +17,10 @@ pub const XPAGETABLE: u8 = 24;
 
 pub const XSCRATCH0: u8 = 16;
 pub const XSCRATCH1: u8 = 17;
+/// Upstream `Wscratch0` / `Wscratch1`: the scratch registers as typed W
+/// operands for `rhazel::CodeGenerator` mnemonics.
+pub const WSCRATCH0: rhazel::WReg = rhazel::WReg::new(XSCRATCH0);
+pub const WSCRATCH1: rhazel::WReg = rhazel::WReg::new(XSCRATCH1);
 pub const XSCRATCH2: u8 = 30;
 
 /// Matches upstream `GPR_ORDER`.

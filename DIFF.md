@@ -24,6 +24,21 @@
 - Still rdynarmic-private, to converge later: the free-function encoder style
   (`inst::add_x(rd, rn, rm)`) rather than oaknut's `CodeGenerator` methods and
   typed registers. That is a call-site rewrite, done file by file if at all.
+- Step 2 (in progress, file by file): rhazel now has oaknut's operand types
+  (`reg.rs`: `XReg`/`WReg`/`XRegSp`/`WRegWsp`, `B`/`H`/`S`/`D`/`QReg`, `VReg` with
+  `.b8()…d2()` arrangements, `X0…`, `W0…`, `V0…`, `XZR`/`SP`) and a
+  `CodeGenerator` (`code_generator.rs`) with one snake_case method per oaknut
+  mnemonic. Rust has no overloading, so a method is generic over the operand
+  traits (`GpReg` selects `sf`, `VRegArranged` selects size/`Q`), and overloads
+  that differ by operand kind keep a suffix (`cmp`/`cmp_imm`, `b`/`b_cond`). It
+  derefs to `BlockOfCode`, so unmigrated emitters and `Label`s keep working; the
+  encoders stay in `inst.rs` underneath. `RAReg` gained `w()`/`x()`/`q()`/`v()`…
+  views, upstream's `RAReg<T>` conversions, and `abi.rs` `WSCRATCH0/1`
+  (`Wscratch0/1`). Migrated so far: `emit_arm64_cryptography.rs`,
+  `emit_arm64_saturation.rs`, `emit_arm64_vector_saturation.rs`; each public
+  emitter still takes `&mut BlockOfCode` and wraps it, so the dispatcher and
+  tests are untouched until every file has moved, when the signatures flip to
+  `&mut CodeGenerator` in one mechanical sweep.
 
 ## 2026-09-12 — src/rdynarmic/src/backend/arm64/label.rs TBNZ far fallback (MK8D)
 

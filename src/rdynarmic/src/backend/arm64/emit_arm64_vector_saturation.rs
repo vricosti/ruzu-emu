@@ -2,21 +2,21 @@
 //!
 //! Upstream owner: `backend/arm64/emit_arm64_vector_saturation.cpp`.
 
+use rhazel::CodeGenerator;
+
 use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_context::EmitContext;
-use crate::backend::arm64::inst;
-use crate::backend::arm64::reg_alloc::RegAlloc;
+use crate::backend::arm64::reg_alloc::{RAReg, RegAlloc};
 use crate::ir::opcode::Opcode;
 use crate::ir::value::InstRef;
 
-type ThreeOpEmitter = fn(u8, u8, u8, u8, bool) -> u32;
-
+/// Upstream `EmitSaturatedArithmetic`: realize result and operands, load
+/// FPSR, then let the opcode-specific closure pick the arrangement.
 fn emit(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
-    size: u8,
-    emit: ThreeOpEmitter,
+    emit: fn(&mut CodeGenerator<'_>, &RAReg, &RAReg, &RAReg) -> Result<(), String>,
 ) -> Result<(), String> {
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut result = ctx.reg_alloc.write_q(inst_ref);
@@ -24,14 +24,7 @@ fn emit(
     let mut b = ctx.reg_alloc.read_q(args[1]);
     RegAlloc::realize_all(code, ctx.block, &mut [&mut result, &mut a, &mut b])?;
     ctx.fpsr.load(code)?;
-    code.write_u32(emit(
-        result.index().expect("result realized") as u8,
-        a.index().expect("a realized") as u8,
-        b.index().expect("b realized") as u8,
-        size,
-        true,
-    ))?;
-    Ok(())
+    emit(code, &result, &a, &b)
 }
 
 pub fn emit_vector_saturation_instruction(
@@ -39,23 +32,56 @@ pub fn emit_vector_saturation_instruction(
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
+    let code = &mut CodeGenerator::new(code);
     match ctx.block.get(inst_ref).opcode {
-        Opcode::VectorSignedSaturatedAdd8 => emit(code, ctx, inst_ref, 8, inst::sqadd_v),
-        Opcode::VectorSignedSaturatedAdd16 => emit(code, ctx, inst_ref, 16, inst::sqadd_v),
-        Opcode::VectorSignedSaturatedAdd32 => emit(code, ctx, inst_ref, 32, inst::sqadd_v),
-        Opcode::VectorSignedSaturatedAdd64 => emit(code, ctx, inst_ref, 64, inst::sqadd_v),
-        Opcode::VectorSignedSaturatedSub8 => emit(code, ctx, inst_ref, 8, inst::sqsub_v),
-        Opcode::VectorSignedSaturatedSub16 => emit(code, ctx, inst_ref, 16, inst::sqsub_v),
-        Opcode::VectorSignedSaturatedSub32 => emit(code, ctx, inst_ref, 32, inst::sqsub_v),
-        Opcode::VectorSignedSaturatedSub64 => emit(code, ctx, inst_ref, 64, inst::sqsub_v),
-        Opcode::VectorUnsignedSaturatedAdd8 => emit(code, ctx, inst_ref, 8, inst::uqadd_v),
-        Opcode::VectorUnsignedSaturatedAdd16 => emit(code, ctx, inst_ref, 16, inst::uqadd_v),
-        Opcode::VectorUnsignedSaturatedAdd32 => emit(code, ctx, inst_ref, 32, inst::uqadd_v),
-        Opcode::VectorUnsignedSaturatedAdd64 => emit(code, ctx, inst_ref, 64, inst::uqadd_v),
-        Opcode::VectorUnsignedSaturatedSub8 => emit(code, ctx, inst_ref, 8, inst::uqsub_v),
-        Opcode::VectorUnsignedSaturatedSub16 => emit(code, ctx, inst_ref, 16, inst::uqsub_v),
-        Opcode::VectorUnsignedSaturatedSub32 => emit(code, ctx, inst_ref, 32, inst::uqsub_v),
-        Opcode::VectorUnsignedSaturatedSub64 => emit(code, ctx, inst_ref, 64, inst::uqsub_v),
+        Opcode::VectorSignedSaturatedAdd8 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.sqadd(r.v().b16(), a.v().b16(), b.v().b16())
+        }),
+        Opcode::VectorSignedSaturatedAdd16 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.sqadd(r.v().h8(), a.v().h8(), b.v().h8())
+        }),
+        Opcode::VectorSignedSaturatedAdd32 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.sqadd(r.v().s4(), a.v().s4(), b.v().s4())
+        }),
+        Opcode::VectorSignedSaturatedAdd64 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.sqadd(r.v().d2(), a.v().d2(), b.v().d2())
+        }),
+        Opcode::VectorSignedSaturatedSub8 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.sqsub(r.v().b16(), a.v().b16(), b.v().b16())
+        }),
+        Opcode::VectorSignedSaturatedSub16 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.sqsub(r.v().h8(), a.v().h8(), b.v().h8())
+        }),
+        Opcode::VectorSignedSaturatedSub32 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.sqsub(r.v().s4(), a.v().s4(), b.v().s4())
+        }),
+        Opcode::VectorSignedSaturatedSub64 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.sqsub(r.v().d2(), a.v().d2(), b.v().d2())
+        }),
+        Opcode::VectorUnsignedSaturatedAdd8 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.uqadd(r.v().b16(), a.v().b16(), b.v().b16())
+        }),
+        Opcode::VectorUnsignedSaturatedAdd16 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.uqadd(r.v().h8(), a.v().h8(), b.v().h8())
+        }),
+        Opcode::VectorUnsignedSaturatedAdd32 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.uqadd(r.v().s4(), a.v().s4(), b.v().s4())
+        }),
+        Opcode::VectorUnsignedSaturatedAdd64 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.uqadd(r.v().d2(), a.v().d2(), b.v().d2())
+        }),
+        Opcode::VectorUnsignedSaturatedSub8 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.uqsub(r.v().b16(), a.v().b16(), b.v().b16())
+        }),
+        Opcode::VectorUnsignedSaturatedSub16 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.uqsub(r.v().h8(), a.v().h8(), b.v().h8())
+        }),
+        Opcode::VectorUnsignedSaturatedSub32 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.uqsub(r.v().s4(), a.v().s4(), b.v().s4())
+        }),
+        Opcode::VectorUnsignedSaturatedSub64 => emit(code, ctx, inst_ref, |code, r, a, b| {
+            code.uqsub(r.v().d2(), a.v().d2(), b.v().d2())
+        }),
         opcode => Err(format!(
             "unimplemented ARM64 vector saturation opcode: {opcode:?}"
         )),

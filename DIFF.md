@@ -17365,3 +17365,23 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   while upstream InitializeIdleThread obtains GetIdleThreadStartFunc from
   CpuManager. Both now call the mode-selecting IdleThreadFunction; single-core
   no longer substitutes PhysicalCore::Idle's host-blocking multicore loop.
+
+## 2026-09-12 — src/core/src/hle/service/mm/mm_u.rs vs core/hle/service/mm/mm_u.{h,cpp}
+
+### Intentional differences
+- `Module` is an open u32 newtype with upstream's named values, preserving
+  arbitrary request bit patterns without constructing an invalid Rust enum.
+  MM_U's session vector and wrapping request counter share one mutex; the
+  service factory clones one handler instance across connections, corresponding
+  to upstream RegisterNamedService's shared object. Session lookup remains
+  ordered and changes/removes only the first matching module or request ID.
+- The existing Rust GetOld response continues to declare three parameter words
+  for the two-word Result and one-word minimum. Upstream's found-session branch
+  declares two but pushes three; reproducing that header would truncate the
+  returned minimum. The absent-session branch upstream already declares three.
+- Handler bridges and private business methods remain within mm_u.rs; old
+  initialization mechanically reuses the same session-insertion operation.
+  Session is not serialized as a raw struct: IPC reads/writes explicit u32
+  words, with signed maximum reconstructed from the incoming bit pattern.
+  As upstream, maximum and event-clear mode are retained without implementing
+  a hardware clock transition or event. No delay has been added to SetAndWait.

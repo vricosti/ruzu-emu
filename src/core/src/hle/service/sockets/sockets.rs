@@ -388,12 +388,12 @@ pub fn loop_process(system: crate::core::SystemRef) {
         let nsd_u: SessionRequestHandlerPtr = Arc::new(Nsd::new("nsd:u"));
         let sfdnsres: SessionRequestHandlerPtr = Arc::new(Sfdnsres::new());
 
-        server_manager.register_named_service("ethc:c", Box::new(|| Arc::new(EthcC::new())), 64);
-        server_manager.register_named_service("ethc:i", Box::new(|| Arc::new(EthcI::new())), 64);
-        server_manager.register_named_service_handler("bsd:s", bsd_s, 64);
-        server_manager.register_named_service_handler("bsd:u", bsd_u, 64);
-        server_manager.register_named_service_handler("bsd:a", bsd_a, 64);
-        server_manager.register_named_service_handler("bsd:nu", bsd_nu, 64);
+        server_manager.register_named_service("ethc:c", Box::new(|| Arc::new(EthcC::new())), 5);
+        server_manager.register_named_service("ethc:i", Box::new(|| Arc::new(EthcI::new())), 5);
+        server_manager.register_named_service_handler("bsd:s", bsd_s, 0x7E);
+        server_manager.register_named_service_handler("bsd:u", bsd_u, 0x0f);
+        server_manager.register_named_service_handler("bsd:a", bsd_a, 0x17);
+        server_manager.register_named_service_handler("bsd:nu", bsd_nu, 4);
         server_manager.register_named_service_handler("bsdcfg", bsdcfg, 64);
         server_manager.register_named_service_handler("ifcfg", ifcfg, 64);
         server_manager.register_named_service(
@@ -408,7 +408,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
         );
         server_manager.register_named_service_handler("nsd:a", nsd_a, 64);
         server_manager.register_named_service_handler("nsd:u", nsd_u, 64);
-        server_manager.register_named_service_handler("sfdnsres", sfdnsres, 64);
+        server_manager.register_named_service_handler("sfdnsres", sfdnsres, 30);
     }
 
     // Wait for the main thread to finish spawning all initial services before

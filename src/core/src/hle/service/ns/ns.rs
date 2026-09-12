@@ -96,7 +96,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
                         super::service_getter_interface::IServiceGetterInterface::new(system, name),
                     )
                 }),
-                64,
+                5,
             );
         }
 
@@ -106,7 +106,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr {
                 Arc::new(super::develop_interface::IDevelopInterface::new())
             }),
-            64,
+            5,
         );
 
         // ns:su -> ISystemUpdateInterface
@@ -115,7 +115,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr {
                 Arc::new(super::system_update_interface::ISystemUpdateInterface::new())
             }),
-            64,
+            5,
         );
 
         // ns:vm -> IVulnerabilityManagerInterface
@@ -126,7 +126,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
                     super::vulnerability_manager_interface::IVulnerabilityManagerInterface::new(),
                 )
             }),
-            64,
+            5,
         );
 
         // pdm:qry -> IQueryService

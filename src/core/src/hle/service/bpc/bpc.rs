@@ -312,12 +312,72 @@ impl ServiceFramework for BpcW {
     }
 }
 
-/// Registers "bpc" and "bpc:r" services.
+/// IPC command IDs for BPC_AMS service
+pub mod bpc_ams_commands {
+    pub const REBOOT_TO_FATAL_ERROR: u32 = 65000;
+    pub const SET_REBOOT_PAYLOAD: u32 = 65001;
+}
+
+/// BPC_AMS service. All commands are unimplemented stubs in upstream.
+pub struct BpcAms {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl BpcAms {
+    pub fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (
+                    bpc_ams_commands::REBOOT_TO_FATAL_ERROR,
+                    None,
+                    "RebootToFatalError",
+                ),
+                (
+                    bpc_ams_commands::SET_REBOOT_PAYLOAD,
+                    None,
+                    "SetRebootPayload",
+                ),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+}
+
+impl SessionRequestHandler for BpcAms {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "bpc:ams"
+    }
+}
+
+impl ServiceFramework for BpcAms {
+    fn get_service_name(&self) -> &str {
+        "bpc:ams"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+/// Registers BPC services.
 ///
 /// Corresponds to `LoopProcess` in upstream `bpc.cpp`:
 /// ```cpp
-/// server_manager->RegisterNamedService("bpc", std::make_shared<BPC>(system));
-/// server_manager->RegisterNamedService("bpc:r", std::make_shared<BPC_R>(system));
+/// server_manager->RegisterNamedService("bpc", std::make_shared<BPC>(system), 13);
+/// server_manager->RegisterNamedService("bpc:r", std::make_shared<BPC_R>(system), 13);
+/// server_manager->RegisterNamedService("bpc:c", std::make_shared<BPC_C>(system), 13);
+/// server_manager->RegisterNamedService("bpc:b", std::make_shared<BPC_B>(system), 13);
+/// server_manager->RegisterNamedService("bpc:w", std::make_shared<BPC_W>(system), 13);
+/// server_manager->RegisterNamedService("bpc:ams", std::make_shared<BPC_AMS>(system), 4);
 /// ```
 pub fn loop_process(system: crate::core::SystemRef) {
     let server_manager = crate::hle::service::server_manager::ServerManager::new_shared(system);
@@ -326,27 +386,32 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             "bpc",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BPC::new()) }),
-            64,
+            13,
         );
         server_manager.register_named_service(
             "bpc:r",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcR::new()) }),
-            64,
+            13,
         );
         server_manager.register_named_service(
             "bpc:c",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcC::new()) }),
-            64,
+            13,
         );
         server_manager.register_named_service(
             "bpc:b",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcB::new()) }),
-            64,
+            13,
         );
         server_manager.register_named_service(
             "bpc:w",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcW::new()) }),
-            64,
+            13,
+        );
+        server_manager.register_named_service(
+            "bpc:ams",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BpcAms::new()) }),
+            4,
         );
     }
     crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
@@ -361,5 +426,32 @@ mod tests {
         assert_eq!(BpcC::new().handlers().len(), 6);
         assert_eq!(BpcB::new().handlers().len(), 2);
         assert_eq!(BpcW::new().handlers().len(), 3);
+    }
+
+    #[test]
+    fn bpc_ams_commands_match_upstream() {
+        let service = BpcAms::new();
+        let keys: Vec<u32> = service.handlers().keys().copied().collect();
+        assert_eq!(keys, [65000, 65001]);
+        assert_eq!(service.handlers()[&65000].name, "RebootToFatalError");
+        assert_eq!(service.handlers()[&65001].name, "SetRebootPayload");
+        assert_eq!(service.service_name(), "bpc:ams");
+    }
+
+    #[test]
+    fn bpc_ams_register_service_uses_max_sessions_4() {
+        use crate::hle::service::hle_ipc::SessionRequestHandlerFactory;
+        use crate::hle::service::sm::sm::ServiceManager;
+        use std::sync::Arc;
+
+        let mut sm = ServiceManager::new();
+        let factory: SessionRequestHandlerFactory =
+            Box::new(|| -> SessionRequestHandlerPtr { Arc::new(BpcAms::new()) });
+        let port = sm
+            .register_service_with_port("bpc:ams".to_string(), 4, factory)
+            .expect("register");
+        assert_eq!(port.lock().unwrap().client.get_max_sessions(), 4);
+        let handler = sm.get_service("bpc:ams").expect("handler");
+        assert_eq!(handler.service_name(), "bpc:ams");
     }
 }

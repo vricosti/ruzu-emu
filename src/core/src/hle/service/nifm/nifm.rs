@@ -1115,7 +1115,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             "nifm:a",
             Box::new(|| -> SessionRequestHandlerPtr { Arc::new(NetworkInterface::new("nifm:a")) }),
-            16,
+            2,
         );
         server_manager.register_named_service(
             "nifm:s",
@@ -1125,7 +1125,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             "nifm:u",
             Box::new(|| -> SessionRequestHandlerPtr { Arc::new(NetworkInterface::new("nifm:u")) }),
-            16,
+            5,
         );
     }
 

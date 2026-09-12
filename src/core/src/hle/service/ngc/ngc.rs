@@ -348,19 +348,19 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(NgctServiceImpl::new())
             }),
-            64,
-        );
-        server_manager.register_named_service(
-            "ngc:u",
-            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(NgcServiceImpl::new()) }),
-            64,
+            4,
         );
         server_manager.register_named_service(
             "ngct:s",
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(NgctServiceWithManagementApi::new())
             }),
-            64,
+            4,
+        );
+        server_manager.register_named_service(
+            "ngc:u",
+            Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(NgcServiceImpl::new()) }),
+            4,
         );
     }
 

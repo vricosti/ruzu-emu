@@ -715,19 +715,19 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             "usb:pd",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(IPdManager::new()) }),
-            16,
+            6,
         );
         server_manager.register_named_service(
             "usb:pd:c",
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(IPdCradleManager::new())
             }),
-            16,
+            4,
         );
         server_manager.register_named_service(
             "usb:pm",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(IPmMainService::new()) }),
-            16,
+            5,
         );
         server_manager.register_named_service(
             "usb:pd:m",
@@ -761,7 +761,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
                 Box::new(|| -> SessionRequestHandlerPtr {
                     std::sync::Arc::new(IPmObserverService::new())
                 }),
-                16,
+                2,
             );
         }
     }

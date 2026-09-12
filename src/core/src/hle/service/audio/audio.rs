@@ -456,35 +456,35 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(IAudioSystemManagerForApplet::new())
             }),
-            16,
+            30,
         );
         server_manager.register_named_service(
             "aud:d",
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(IAudioSystemManagerForDebugger::new())
             }),
-            16,
+            30,
         );
         server_manager.register_named_service(
             "audout:d",
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(IAudioOutManagerForDebugger::new())
             }),
-            16,
+            30,
         );
         server_manager.register_named_service(
             "audin:d",
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(IAudioInManagerForDebugger::new())
             }),
-            16,
+            30,
         );
         server_manager.register_named_service(
             "audrec:d",
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(IFinalOutputRecorderManagerForDebugger::new())
             }),
-            16,
+            30,
         );
         // This surprising factory is literal upstream behavior: `audren:d`
         // is registered with IAudioInManager, not IAudioRendererManagerForDebugger.
@@ -493,7 +493,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(move || -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(super::audio_in_manager::IAudioInManager::new(system))
             }),
-            16,
+            30,
         );
 
         server_manager.register_named_service(
@@ -501,7 +501,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(move || -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(super::audio_in_manager::IAudioInManager::new(system))
             }),
-            16,
+            30,
         );
 
         server_manager.register_named_service(
@@ -509,7 +509,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(IAudioInManagerForApplet::new())
             }),
-            16,
+            30,
         );
 
         server_manager.register_named_service(
@@ -517,7 +517,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(move || -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(super::audio_out_manager::IAudioOutManager::new(system))
             }),
-            16,
+            30,
         );
 
         server_manager.register_named_service(
@@ -525,14 +525,14 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(IAudioOutManagerForApplet::new())
             }),
-            16,
+            30,
         );
         server_manager.register_named_service(
             "auddev",
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(IAudioSnoopManager::new())
             }),
-            16,
+            30,
         );
     }
     // Construct after audout:u/audin:u, as upstream. The constructor waits for
@@ -544,7 +544,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             "audctl",
             Box::new(move || std::sync::Arc::clone(&audio_controller)),
-            16,
+            30,
         );
 
         server_manager.register_named_service(
@@ -552,7 +552,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(super::final_output_recorder_manager_for_applet::IFinalOutputRecorderManagerForApplet::new())
             }),
-            16,
+            30,
         );
 
         server_manager.register_named_service(
@@ -562,7 +562,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
                     super::final_output_recorder_manager::IFinalOutputRecorderManager::new(),
                 )
             }),
-            16,
+            30,
         );
 
         server_manager.register_named_service(
@@ -572,7 +572,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
                     system,
                 ))
             }),
-            16,
+            30,
         );
 
         server_manager.register_named_service(
@@ -580,7 +580,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(IAudioRendererManagerForApplet::new())
             }),
-            16,
+            30,
         );
 
         server_manager.register_named_service(
@@ -590,7 +590,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
                     super::hardware_opus_decoder_manager::IHardwareOpusDecoderManager::new(system),
                 )
             }),
-            16,
+            25,
         );
     }
 

@@ -207,17 +207,17 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             "ldr:dmnt",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(DebugMonitor::new()) }),
-            64,
+            3,
         );
         server_manager.register_named_service(
             "ldr:pm",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(ProcessManager::new()) }),
-            64,
+            1,
         );
         server_manager.register_named_service(
             "ldr:shel",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(Shell::new()) }),
-            64,
+            3,
         );
     }
 

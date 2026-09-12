@@ -30,9 +30,7 @@ use crate::hle::service::hle_ipc::{
 };
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::server_manager::ServerManager;
-use crate::hle::service::service::{
-    build_handler_map, FunctionInfo, ServiceFramework, SERVER_SESSION_COUNT_MAX,
-};
+use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use crate::hle::service::sm::sm_controller::Controller;
 
 // --- SM result codes (matching upstream sm.cpp) ---
@@ -154,7 +152,7 @@ impl ServiceManager {
     /// Matches upstream `ServiceManager::RegisterService(KServerPort**, name, max_sessions, handler)`:
     /// ```cpp
     /// auto* port = Kernel::KPort::Create(kernel);
-    /// port->Initialize(ServerSessionCountMax, false, 0);
+    /// port->Initialize(kernel, max_sessions, false, 0);
     /// Kernel::KPort::Register(kernel, port);
     /// service_ports.emplace(name, std::addressof(port->GetClientPort()));
     /// registered_services.emplace(name, handler);
@@ -181,7 +179,7 @@ impl ServiceManager {
     pub fn register_service_with_port(
         &mut self,
         name: String,
-        _max_sessions: u32,
+        max_sessions: u32,
         handler: SessionRequestHandlerFactory,
     ) -> Result<Arc<Mutex<KPort>>, ResultCode> {
         let trace_boot = std::env::var_os("RUZU_APPLET_BOOT_TRACE")
@@ -198,7 +196,7 @@ impl ServiceManager {
 
         // Create and initialize a KPort (matching upstream).
         let mut port = KPort::new();
-        port.initialize(SERVER_SESSION_COUNT_MAX as i32, false, 0);
+        port.initialize(max_sessions as i32, false, 0);
         let port = Arc::new(Mutex::new(port));
 
         // Store the port and handler factory.
@@ -899,7 +897,7 @@ impl ServiceFramework for Sm {
     }
 
     fn get_max_sessions(&self) -> u32 {
-        4
+        64
     }
 
     fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
@@ -1126,6 +1124,28 @@ mod tests {
         assert!(validate_service_name("12345678").is_success());
         assert!(validate_service_name("").is_error());
         assert!(validate_service_name("123456789").is_error());
+    }
+
+    #[test]
+    fn register_service_uses_passed_max_sessions_not_server_session_count_max() {
+        let mut sm = ServiceManager::new();
+        let factory: SessionRequestHandlerFactory =
+            Box::new(|| -> SessionRequestHandlerPtr { panic!("test") });
+        let port = sm
+            .register_service_with_port("maxsess".to_string(), 13, factory)
+            .expect("register");
+        assert_eq!(port.lock().unwrap().client.get_max_sessions(), 13);
+        assert_ne!(
+            13,
+            crate::hle::service::service::SERVER_SESSION_COUNT_MAX as i32
+        );
+    }
+
+    #[test]
+    fn sm_service_framework_max_sessions_is_64() {
+        let manager = Arc::new(Mutex::new(ServiceManager::new()));
+        let sm = Sm::new(Arc::clone(&manager), crate::core::SystemRef::null());
+        assert_eq!(sm.get_max_sessions(), 64);
     }
 
     #[test]

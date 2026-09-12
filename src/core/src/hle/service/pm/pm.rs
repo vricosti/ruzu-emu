@@ -738,7 +738,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             "pm:bm",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(BootMode::new()) }),
-            16,
+            4, // Nx = 4, Ams = 8
         );
         server_manager.register_named_service(
             "pm:dmnt",
@@ -748,18 +748,18 @@ pub fn loop_process(system: crate::core::SystemRef) {
             16,
         );
         server_manager.register_named_service(
-            "pm:info",
-            Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(Info::new(system))
-            }),
-            16,
-        );
-        server_manager.register_named_service(
             "pm:shell",
             Box::new(move || -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(Shell::new(system))
             }),
-            16,
+            3, // Nx = 3, AMS = 8
+        );
+        server_manager.register_named_service(
+            "pm:info",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(Info::new(system))
+            }),
+            25, // 48-(4+16+3)
         );
     }
 

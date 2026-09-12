@@ -32,7 +32,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
                 Box::new(move || -> SessionRequestHandlerPtr {
                     Arc::new(super::service_creator::IServiceCreator::new(system, &n))
                 }),
-                64,
+                32,
             );
         }
 
@@ -52,7 +52,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
                         perms, &n,
                     ))
                 }),
-                64,
+                32,
             );
         }
     }

@@ -113,12 +113,12 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             "grc:c",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(GRC::new()) }),
-            16,
+            4,
         );
         server_manager.register_named_service(
             "grc:d",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(GrcD::new()) }),
-            16,
+            4,
         );
     }
 

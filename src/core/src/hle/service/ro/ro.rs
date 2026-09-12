@@ -1079,7 +1079,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
                     NrrKind::User,
                 ))
             }),
-            16,
+            2,
         );
 
         let jit_plugin_ro = Arc::clone(&ro);
@@ -1092,12 +1092,12 @@ pub fn loop_process(system: crate::core::SystemRef) {
                     NrrKind::JitPlugin,
                 ))
             }),
-            16,
+            2,
         );
         server_manager.register_named_service(
             "ro:dmnt",
             Box::new(|| -> SessionRequestHandlerPtr { Arc::new(IDebugMonitorInterface::new()) }),
-            16,
+            2,
         );
     }
 

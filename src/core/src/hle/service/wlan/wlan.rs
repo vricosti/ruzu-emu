@@ -467,50 +467,50 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             "wlan:lcl",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(ILocalManager::new()) }),
-            64,
+            10,
         );
         server_manager.register_named_service(
             "wlan:lg",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(ILocalGetFrame::new()) }),
-            64,
+            10,
         );
         server_manager.register_named_service(
             "wlan:lga",
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(ILocalGetActionFrame::new())
             }),
-            64,
+            10,
         );
         server_manager.register_named_service(
             "wlan:sg",
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(ISocketGetFrame::new())
             }),
-            64,
+            10,
         );
         server_manager.register_named_service(
             "wlan:soc",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(ISocketManager::new()) }),
-            64,
+            10,
         );
         server_manager.register_named_service(
             "wlan:dtc",
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(IDetectManager::new()) }),
-            64,
+            4,
         );
         server_manager.register_named_service(
             "wlan:p",
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(IPrivateServiceCreator::new())
             }),
-            64,
+            30,
         );
         server_manager.register_named_service(
             "wlan:nd",
             Box::new(|| -> SessionRequestHandlerPtr {
                 std::sync::Arc::new(ISfDriverServiceCreator::new())
             }),
-            64,
+            5,
         );
     }
     ServerManager::run_server_shared(server_manager);

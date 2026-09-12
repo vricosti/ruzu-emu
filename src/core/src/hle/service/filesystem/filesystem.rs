@@ -1358,12 +1358,12 @@ pub fn register_services(system: crate::core::SystemRef, fsc: Arc<Mutex<FileSyst
             Box::new(|| -> SessionRequestHandlerPtr {
                 Arc::new(super::fsp::fsp_ldr::FspLdr::new())
             }),
-            64,
+            61,
         );
         server_manager.register_named_service(
             "fsp:pr",
             Box::new(|| -> SessionRequestHandlerPtr { Arc::new(super::fsp::fsp_pr::FspPr::new()) }),
-            64,
+            61,
         );
         let fsc_for_closure = fsc.clone();
         server_manager.register_named_service(
@@ -1374,7 +1374,7 @@ pub fn register_services(system: crate::core::SystemRef, fsc: Arc<Mutex<FileSyst
                     fsc_for_closure.clone(),
                 ))
             }),
-            64,
+            61,
         );
     }
 

@@ -42,25 +42,25 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service(
             "set",
             Box::new(move || -> SessionRequestHandlerPtr { settings.clone() }),
-            64,
+            60,
         );
 
         // "set:cal" -> IFactorySettingsServer
         server_manager.register_named_service(
             "set:cal",
             Box::new(move || -> SessionRequestHandlerPtr { factory_settings.clone() }),
-            64,
+            60,
         );
 
         // "set:fd" -> IFirmwareDebugSettingsServer
         server_manager.register_named_service(
             "set:fd",
             Box::new(move || -> SessionRequestHandlerPtr { firmware_debug_settings.clone() }),
-            64,
+            60,
         );
 
         // "set:sys" -> ISystemSettingsServer (via SystemSettingsService wrapper)
-        server_manager.register_named_service("set:sys", make_system_settings_factory(), 64);
+        server_manager.register_named_service("set:sys", make_system_settings_factory(), 60);
     }
 
     ServerManager::run_server_shared(server_manager);

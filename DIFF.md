@@ -1,5 +1,20 @@
 # Upstream parity notes
 
+## 2026-09-12 — src/rdynarmic/src/backend/arm64/label.rs TBNZ far fallback (MK8D)
+
+### Intentional differences
+- Oaknut `TBNZ` encodes only imm14 (±32 KiB) and throws if the deferred memory-fallback label is farther. Rust panics in `extern "C"` `return_to_dispatcher`. Forward `Label::tbnz_x` now emits inverted `TBZ` + `B` (imm26), matching the fallback-at-end-of-block layout Eden also uses, without aborting.
+- Dispatcher `catch_unwind` still logs guest PC + payload if another emit panic occurs.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None for this MK8D abort (`AArch64 branch offset out of imm14 range: 37564` at A32 `pc=0x1966f60`).
+
+### Binary layout verification
+- n/a (instruction encoding tests cover TBZ/TBNZ).
+
 ## 2026-09-12 — time shared-memory writers vs eden `psc/time/service_manager.cpp` SetupStandard*ClockCore
 
 ### Intentional differences

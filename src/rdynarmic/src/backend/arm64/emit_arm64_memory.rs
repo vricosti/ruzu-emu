@@ -1182,7 +1182,7 @@ mod tests {
             read_instruction(&code, 8),
             inst::tst_x_imm(XSCRATCH0, 0xffff_ffff_f800_0000)
         );
-        assert_eq!(read_instruction(&code, 12), inst::b_cond(Cond::NE, 36));
+        assert_eq!(read_instruction(&code, 12), inst::b_cond(Cond::NE, 40));
         assert_eq!(
             read_instruction(&code, 16),
             inst::lsl_x_imm(XSCRATCH0, XSCRATCH0, 3)
@@ -1191,19 +1191,17 @@ mod tests {
             read_instruction(&code, 20),
             inst::ldr_x_reg_lsl(XSCRATCH0, XPAGETABLE, XSCRATCH0)
         );
+        assert_eq!(read_instruction(&code, 24), inst::tbz_x(XSCRATCH0, 0, 8));
+        assert_eq!(read_instruction(&code, 28), inst::b_imm(24));
         assert_eq!(
-            read_instruction(&code, 24),
-            inst::tbnz_x(XSCRATCH0, 0, 24)
-        );
-        assert_eq!(
-            read_instruction(&code, 28),
+            read_instruction(&code, 32),
             inst::and_x_imm(XSCRATCH0, XSCRATCH0, 0x00ff_ffff_ffff_f000)
         );
         assert_eq!(
-            read_instruction(&code, 32),
+            read_instruction(&code, 36),
             inst::sbfm_x(XSCRATCH0, XSCRATCH0, 0, 57)
         );
-        assert_eq!(read_instruction(&code, 36), inst::cbz_x(XSCRATCH0, 12));
+        assert_eq!(read_instruction(&code, 40), inst::cbz_x(XSCRATCH0, 12));
     }
 
     #[test]

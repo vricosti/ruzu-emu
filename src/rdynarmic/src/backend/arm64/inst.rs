@@ -559,12 +559,30 @@ fn imm14(pc_offset_bytes: i32) -> u32 {
     (imm as u32) & 0x3fff
 }
 
-/// `tbnz xT, #bit, label` (64-bit form; `b5` carries bit 5 of the bit number).
-pub fn tbnz_x(rt: u8, bit: u8, pc_offset_bytes: i32) -> u32 {
-    assert!(bit < 64, "AArch64 TBNZ bit out of range: {bit}");
+fn tbz_tbnz(rt: u8, bit: u8, pc_offset_bytes: i32, tbnz: bool) -> u32 {
+    assert!(bit < 64, "AArch64 TBZ/TBNZ bit out of range: {bit}");
     let b5 = (bit as u32 >> 5) & 1;
     let b40 = bit as u32 & 0x1f;
-    0x3700_0000 | (b5 << 31) | (b40 << 19) | (imm14(pc_offset_bytes) << 5) | reg5(rt)
+    let op = if tbnz { 0x3700_0000 } else { 0x3600_0000 };
+    op | (b5 << 31) | (b40 << 19) | (imm14(pc_offset_bytes) << 5) | reg5(rt)
+}
+
+/// `tbz xT, #bit, label` (64-bit form; `b5` carries bit 5 of the bit number).
+pub fn tbz_x(rt: u8, bit: u8, pc_offset_bytes: i32) -> u32 {
+    tbz_tbnz(rt, bit, pc_offset_bytes, false)
+}
+
+/// `tbnz xT, #bit, label` (64-bit form; `b5` carries bit 5 of the bit number).
+pub fn tbnz_x(rt: u8, bit: u8, pc_offset_bytes: i32) -> u32 {
+    tbz_tbnz(rt, bit, pc_offset_bytes, true)
+}
+
+pub fn tbnz_offset_in_range(pc_offset_bytes: i32) -> bool {
+    if pc_offset_bytes % 4 != 0 {
+        return false;
+    }
+    let imm = pc_offset_bytes / 4;
+    (-(1 << 13)..(1 << 13)).contains(&imm)
 }
 
 /// `sbfm xD, xN, #immr, #imms` (64-bit, N=1).
@@ -3286,6 +3304,7 @@ mod tests {
         assert_eq!(cbz_w(16, 8), 0x3400_0050);
         assert_eq!(cbz_x(16, 8), 0xb400_0050);
         assert_eq!(tbnz_x(0, 0, 8), 0x3700_0040);
+        assert_eq!(tbz_x(0, 0, 8), 0x3600_0040);
         assert_eq!(tbnz_x(0, 57, 8), 0xb7c8_0040);
         assert_eq!(tbnz_x(16, 5, -8), 0x372f_ffd0);
         assert_eq!(sbfm_x(0, 0, 0, 57), 0x9340_e400);

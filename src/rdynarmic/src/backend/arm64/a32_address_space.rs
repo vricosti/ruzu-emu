@@ -1081,16 +1081,27 @@ extern "C" fn a32_return_to_dispatcher(
     address_space: *mut c_void,
     thread_ctx: *mut c_void,
 ) -> CodePtr {
-    let result = unsafe {
+    let pc = unsafe { (*thread_ctx.cast::<A32JitState>()).regs[15] as u64 };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         let address_space = &mut *(address_space.cast::<A32AddressSpace>());
         let thread_ctx = &mut *(thread_ctx.cast::<A32JitState>());
         address_space.get_or_emit(thread_ctx.get_location_descriptor())
-    };
-
-    match result {
-        Ok(code_ptr) => code_ptr,
-        Err(error) => {
-            eprintln!("A32 ARM64 return_to_dispatcher failed: {error}");
+    })) {
+        Ok(Ok(code_ptr)) => code_ptr,
+        Ok(Err(error)) => {
+            super::prelude::report_dispatcher_failure(
+                "A32 ARM64 return_to_dispatcher failed",
+                pc,
+                &error,
+            );
+            std::process::abort();
+        }
+        Err(payload) => {
+            super::prelude::report_dispatcher_failure(
+                "A32 ARM64 return_to_dispatcher panicked",
+                pc,
+                &super::prelude::panic_payload_message(&*payload),
+            );
             std::process::abort();
         }
     }

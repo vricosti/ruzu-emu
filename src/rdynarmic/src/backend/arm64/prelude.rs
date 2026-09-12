@@ -1,4 +1,6 @@
+use std::any::Any;
 use std::ffi::c_void;
+use std::io::Write;
 
 use crate::interface::halt_reason::HaltReason;
 use crate::ir::cond::Cond;
@@ -115,6 +117,26 @@ struct RunLikeEntryInfo {
 /// dispatcher callback, `return_to_dispatcher` follows upstream's generated
 /// callback shape: check halt, call back into `GetOrEmit(context)`, then branch
 /// to the returned block.
+/// Format a `catch_unwind` payload so dispatcher failures reach `ruzu_log`
+/// instead of aborting the GUI with an empty IPS backtrace.
+pub(crate) fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+pub(crate) fn report_dispatcher_failure(label: &str, pc: u64, detail: &str) {
+    let line = format!("{label} at pc={pc:#x}: {detail}");
+    log::error!("{line}");
+    eprintln!("{line}");
+    log::logger().flush();
+    let _ = std::io::stderr().flush();
+}
+
 pub fn emit_bootstrap_prelude(code: &mut BlockOfCode) -> Result<PreludeInfo, String> {
     emit_bootstrap_prelude_with_dispatcher(code, None)
 }
@@ -785,6 +807,16 @@ mod tests {
             .checked_sub(source as isize)
             .expect("branch offset");
         block.write_u32(inst::b_imm(pc_offset)).unwrap();
+    }
+
+    #[test]
+    fn panic_payload_message_reads_string_and_str() {
+        let owned: Box<dyn Any + Send> = Box::new(String::from("realized W result"));
+        assert_eq!(panic_payload_message(&*owned), "realized W result");
+        let borrowed: Box<dyn Any + Send> = Box::new("location not set");
+        assert_eq!(panic_payload_message(&*borrowed), "location not set");
+        let other: Box<dyn Any + Send> = Box::new(1u32);
+        assert_eq!(panic_payload_message(&*other), "unknown panic payload");
     }
 
     #[test]

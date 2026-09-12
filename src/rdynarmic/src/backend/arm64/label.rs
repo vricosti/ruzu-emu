@@ -13,7 +13,6 @@ enum PendingBranch {
     Cond { offset: usize, cond: Cond },
     CbzX { offset: usize, rt: u8 },
     CbnzX { offset: usize, rt: u8 },
-    TbnzX { offset: usize, rt: u8, bit: u8 },
 }
 
 #[derive(Default, Debug)]
@@ -50,10 +49,6 @@ impl Label {
                 PendingBranch::CbnzX { offset, rt } => {
                     let pc_offset = branch_pc_offset(offset, target_offset)?;
                     code.patch_u32(offset, inst::cbnz_x(rt, pc_offset))?;
-                }
-                PendingBranch::TbnzX { offset, rt, bit } => {
-                    let pc_offset = branch_pc_offset(offset, target_offset)?;
-                    code.patch_u32(offset, inst::tbnz_x(rt, bit, pc_offset))?;
                 }
             }
         }
@@ -105,15 +100,21 @@ impl Label {
     }
 
     /// `tbnz xT, #bit, label` (oaknut `TBNZ(XReg, imm, Label&)`).
+    ///
+    /// TBNZ only encodes a ±32 KiB imm14. Memory fallbacks are deferred to the
+    /// end of the IR block, which can be farther than that (MK8D A32 write
+    /// path: 37564 bytes). Forward TBNZ is therefore always inverted to
+    /// `TBZ + B` so the long branch uses imm26.
     pub fn tbnz_x(&mut self, code: &mut BlockOfCode, rt: u8, bit: u8) -> Result<usize, String> {
-        let offset = code.write_u32(inst::tbnz_x(rt, bit, 0))?;
         if let Some(target_offset) = self.offset {
-            let pc_offset = branch_pc_offset(offset, target_offset)?;
-            code.patch_u32(offset, inst::tbnz_x(rt, bit, pc_offset))?;
-        } else {
-            self.pending.push(PendingBranch::TbnzX { offset, rt, bit });
+            let here = code.code_size();
+            let pc_offset = branch_pc_offset(here, target_offset)?;
+            if inst::tbnz_offset_in_range(pc_offset) {
+                return code.write_u32(inst::tbnz_x(rt, bit, pc_offset));
+            }
         }
-        Ok(offset)
+        code.write_u32(inst::tbz_x(rt, bit, 8))?;
+        self.b(code)
     }
 }
 
@@ -187,5 +188,36 @@ mod tests {
                 inst::nop()
             ]
         );
+    }
+
+    #[test]
+    fn forward_tbnz_uses_tbz_skip_and_long_branch() {
+        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut label = Label::new();
+
+        label.tbnz_x(&mut code, 0, 0).unwrap();
+        for _ in 0..8 {
+            code.write_u32(inst::nop()).unwrap();
+        }
+        label.bind(&mut code).unwrap();
+
+        let words = emitted_words(&code);
+        assert_eq!(words[0], inst::tbz_x(0, 0, 8));
+        assert_eq!(words[1], inst::b_imm(36));
+        assert_eq!(words.len(), 10);
+    }
+
+    #[test]
+    fn far_forward_tbnz_stays_in_imm26_range() {
+        let mut code = BlockOfCode::with_size(64 * 1024).unwrap();
+        let mut label = Label::new();
+        label.tbnz_x(&mut code, 16, 5).unwrap();
+        for _ in 0..10_000 {
+            code.write_u32(inst::nop()).unwrap();
+        }
+        label.bind(&mut code).unwrap();
+        let words = emitted_words(&code);
+        assert_eq!(words[0], inst::tbz_x(16, 5, 8));
+        assert_eq!(words[1], inst::b_imm(40_004));
     }
 }

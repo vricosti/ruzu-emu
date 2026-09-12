@@ -3,7 +3,7 @@ use crate::adsp::apps::opus::{Direction, Message, OpusDecoder as AdspOpusDecoder
 use crate::errors::{
     RESULT_BUFFER_TOO_SMALL, RESULT_INVALID_OPUS_DSP_RETURN_CODE, RESULT_LIB_OPUS_ALLOC_FAIL,
     RESULT_LIB_OPUS_BAD_ARG, RESULT_LIB_OPUS_INTERNAL_ERROR, RESULT_LIB_OPUS_INVALID_PACKET,
-    RESULT_LIB_OPUS_INVALID_STATE, RESULT_LIB_OPUS_UNIMPLEMENTED,
+    RESULT_LIB_OPUS_INVALID_STATE, RESULT_LIB_OPUS_UNIMPLEMENTED, RESULT_OUT_OF_OPUS_DECODERS,
 };
 use crate::Result;
 use common::alignment::align_up;
@@ -13,10 +13,17 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Firmware limit of concurrent hardware Opus decoder instances.
+const MAX_OPUS_DECODERS: usize = 24;
+
 struct AdspBackend {
     decoder: Arc<Mutex<AdspOpusDecoder>>,
     shared_memory: SharedMemoryHandle,
     next_buffer_id: AtomicU64,
+    /// Occupancy table matching Eden `std::array<OpusDecoder*, 24>`.
+    /// Slots store a move-stable decoder id rather than `this`, because ruzu
+    /// moves `OpusDecoder` into a Mutex after Initialize.
+    decoders: Mutex<[Option<u64>; MAX_OPUS_DECODERS]>,
 }
 
 pub struct HardwareOpus {
@@ -63,8 +70,27 @@ impl HardwareOpus {
                 decoder,
                 shared_memory,
                 next_buffer_id: AtomicU64::new(buffer_id + 0x10_0000),
+                decoders: Mutex::new([None; MAX_OPUS_DECODERS]),
             }),
             buffer_id,
+        }
+    }
+
+    /// Port of `HardwareOpus::RegisterDecoder`.
+    pub fn register_decoder(&self, decoder_id: u64) -> Result {
+        let mut decoders = self.backend.decoders.lock();
+        let Some(slot) = decoders.iter_mut().find(|slot| slot.is_none()) else {
+            return RESULT_OUT_OF_OPUS_DECODERS;
+        };
+        *slot = Some(decoder_id);
+        ResultCode::SUCCESS
+    }
+
+    /// Port of `HardwareOpus::UnregisterDecoder`.
+    pub fn unregister_decoder(&self, decoder_id: u64) {
+        let mut decoders = self.backend.decoders.lock();
+        if let Some(slot) = decoders.iter_mut().find(|slot| **slot == Some(decoder_id)) {
+            *slot = None;
         }
     }
 
@@ -532,5 +558,23 @@ mod tests {
             opus.get_work_buffer_size(2),
             crate::adsp::apps::opus::opus_decode_object::OpusDecodeObject::get_work_buffer_size(2)
         );
+    }
+
+    #[test]
+    fn register_decoder_rejects_a_twenty_fifth_instance() {
+        let decoder = Arc::new(Mutex::new(AdspOpusDecoder::new(crate::make_test_system())));
+        {
+            let decoder = decoder.lock();
+            decoder.send(Direction::Dsp, Message::Start);
+            assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
+        }
+        let opus = HardwareOpus::new_from_adsp(decoder);
+        for id in 1..=24 {
+            assert_eq!(opus.register_decoder(id), ResultCode::SUCCESS);
+        }
+        assert_eq!(opus.register_decoder(25), RESULT_OUT_OF_OPUS_DECODERS);
+        opus.unregister_decoder(1);
+        assert_eq!(opus.register_decoder(26), ResultCode::SUCCESS);
+        opus.unregister_decoder(99);
     }
 }

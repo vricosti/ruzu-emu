@@ -25,5 +25,6 @@ pub const RESULT_LIB_OPUS_INTERNAL_ERROR: ResultCode = ResultCode::new(MODULE_HW
 pub const RESULT_BUFFER_TOO_SMALL: ResultCode = ResultCode::new(MODULE_HWOPUS, 3);
 pub const RESULT_LIB_OPUS_BAD_ARG: ResultCode = ResultCode::new(MODULE_HWOPUS, 2);
 pub const RESULT_INVALID_OPUS_DSP_RETURN_CODE: ResultCode = ResultCode::new(MODULE_HWOPUS, 259);
+pub const RESULT_OUT_OF_OPUS_DECODERS: ResultCode = ResultCode::new(MODULE_HWOPUS, 385);
 pub const RESULT_INVALID_OPUS_SAMPLE_RATE: ResultCode = ResultCode::new(MODULE_HWOPUS, 1001);
 pub const RESULT_INVALID_OPUS_CHANNEL_COUNT: ResultCode = ResultCode::new(MODULE_HWOPUS, 1002);

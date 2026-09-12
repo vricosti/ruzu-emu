@@ -8,10 +8,15 @@ use common::alignment::align_up;
 use common::ResultCode;
 use parking_lot::Mutex;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static NEXT_DECODER_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct OpusDecoder {
     hardware_opus: HardwareOpus,
+    /// Move-stable occupancy token for `HardwareOpus::decoders`.
+    decoder_id: u64,
     shared_buffer: Vec<u8>,
     shared_buffer_size: u64,
     in_data_offset: usize,
@@ -31,6 +36,7 @@ impl OpusDecoder {
     pub fn new(hardware_opus: HardwareOpus) -> Self {
         Self {
             hardware_opus,
+            decoder_id: NEXT_DECODER_ID.fetch_add(1, Ordering::Relaxed),
             shared_buffer: Vec::new(),
             shared_buffer_size: 0,
             in_data_offset: 0,
@@ -52,6 +58,11 @@ impl OpusDecoder {
     }
 
     pub fn initialize(&mut self, params: &OpusParametersEx, transfer_memory_size: u64) -> Result {
+        let rc = self.hardware_opus.register_decoder(self.decoder_id);
+        if rc.is_error() {
+            return rc;
+        }
+
         let frame_size = if params.use_large_frame_size {
             5760
         } else {
@@ -68,6 +79,7 @@ impl OpusDecoder {
             16,
         );
         if transfer_memory_size < self.buffer_size + input_size as u64 {
+            self.hardware_opus.unregister_decoder(self.decoder_id);
             return RESULT_BUFFER_TOO_SMALL;
         }
         self.out_data_offset = transfer_memory_size as usize - self.buffer_size as usize;
@@ -84,6 +96,7 @@ impl OpusDecoder {
                 self.shared_memory_mapped = false;
                 let _ = self.hardware_opus.unmap_memory(self.shared_buffer_size);
             }
+            self.hardware_opus.unregister_decoder(self.decoder_id);
             return rc;
         }
         self.sample_rate = params.sample_rate as i32;
@@ -100,6 +113,11 @@ impl OpusDecoder {
         params: &OpusMultiStreamParametersEx,
         transfer_memory_size: u64,
     ) -> Result {
+        let rc = self.hardware_opus.register_decoder(self.decoder_id);
+        if rc.is_error() {
+            return rc;
+        }
+
         let frame_size = if params.use_large_frame_size {
             5760
         } else {
@@ -116,6 +134,7 @@ impl OpusDecoder {
             16,
         );
         if transfer_memory_size < self.buffer_size + input_size as u64 {
+            self.hardware_opus.unregister_decoder(self.decoder_id);
             return RESULT_BUFFER_TOO_SMALL;
         }
         self.out_data_offset = transfer_memory_size as usize - self.buffer_size as usize;
@@ -135,6 +154,7 @@ impl OpusDecoder {
                 self.shared_memory_mapped = false;
                 let _ = self.hardware_opus.unmap_memory(self.shared_buffer_size);
             }
+            self.hardware_opus.unregister_decoder(self.decoder_id);
             return rc;
         }
         self.sample_rate = params.sample_rate as i32;
@@ -295,6 +315,7 @@ impl Drop for OpusDecoder {
             let _ = self
                 .hardware_opus
                 .shutdown_decode_object(self.shared_buffer_size);
+            self.hardware_opus.unregister_decoder(self.decoder_id);
         }
     }
 }
@@ -561,5 +582,75 @@ mod tests {
         );
         assert_eq!(out_data_size, (size_of::<OpusPacketHeader>() + 3) as u32);
         assert!(out_samples > 0);
+    }
+
+    #[test]
+    fn twenty_fifth_shared_hardware_decoder_returns_out_of_opus_decoders() {
+        let adsp_decoder = Arc::new(Mutex::new(AdspOpusDecoder::new(crate::make_test_system())));
+        {
+            let decoder = adsp_decoder.lock();
+            decoder.send(Direction::Dsp, Message::Start);
+            assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
+        }
+        let hardware = HardwareOpus::new_from_adsp(adsp_decoder);
+        let params = OpusParametersEx {
+            sample_rate: 48_000,
+            channel_count: 2,
+            use_large_frame_size: false,
+            ..Default::default()
+        };
+
+        let mut live = Vec::new();
+        for _ in 0..24 {
+            let mut decoder = OpusDecoder::new(hardware.clone());
+            assert_eq!(decoder.initialize(&params, 0x10000), ResultCode::SUCCESS);
+            live.push(decoder);
+        }
+
+        let mut extra = OpusDecoder::new(hardware.clone());
+        assert_eq!(
+            extra.initialize(&params, 0x10000),
+            crate::errors::RESULT_OUT_OF_OPUS_DECODERS
+        );
+        assert_eq!(
+            crate::errors::RESULT_OUT_OF_OPUS_DECODERS.description(),
+            385
+        );
+        assert_eq!(crate::errors::RESULT_OUT_OF_OPUS_DECODERS.module(), 111);
+
+        live.pop();
+        assert_eq!(extra.initialize(&params, 0x10000), ResultCode::SUCCESS);
+    }
+
+    #[test]
+    fn failed_initialize_does_not_consume_a_decoder_slot() {
+        let adsp_decoder = Arc::new(Mutex::new(AdspOpusDecoder::new(crate::make_test_system())));
+        {
+            let decoder = adsp_decoder.lock();
+            decoder.send(Direction::Dsp, Message::Start);
+            assert_eq!(decoder.receive(Direction::Host), Message::StartOK);
+        }
+        let hardware = HardwareOpus::new_from_adsp(adsp_decoder);
+        let params = OpusParametersEx {
+            sample_rate: 48_000,
+            channel_count: 2,
+            use_large_frame_size: false,
+            ..Default::default()
+        };
+
+        let mut failed = OpusDecoder::new(hardware.clone());
+        assert_eq!(failed.initialize(&params, 16), RESULT_BUFFER_TOO_SMALL);
+
+        let mut live = Vec::new();
+        for _ in 0..24 {
+            let mut decoder = OpusDecoder::new(hardware.clone());
+            assert_eq!(decoder.initialize(&params, 0x10000), ResultCode::SUCCESS);
+            live.push(decoder);
+        }
+        let mut extra = OpusDecoder::new(hardware.clone());
+        assert_eq!(
+            extra.initialize(&params, 0x10000),
+            crate::errors::RESULT_OUT_OF_OPUS_DECODERS
+        );
     }
 }

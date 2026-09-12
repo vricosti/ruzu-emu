@@ -197,11 +197,10 @@ impl StagingBufferPool {
         if vulkan_device.is_buffer_device_address_supported() {
             usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
         }
-        let stream_ci = vk::BufferCreateInfo::builder()
+        let stream_ci = vk::BufferCreateInfo::default()
             .size(stream_capacity)
             .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let allocation = memory_allocator.create_buffer(&stream_ci, MemoryUsage::Stream)?;
         assert!(
             !allocation.mapped_ptr().is_null(),
@@ -210,9 +209,8 @@ impl StagingBufferPool {
         let stream_buffer_address = if vulkan_device.is_buffer_device_address_supported() {
             unsafe {
                 vulkan_device.get_logical().get_buffer_device_address(
-                    &vk::BufferDeviceAddressInfo::builder()
-                        .buffer(allocation.handle())
-                        .build(),
+                    &vk::BufferDeviceAddressInfo::default()
+                        .buffer(allocation.handle()),
                 )
             }
         } else {
@@ -517,7 +515,7 @@ impl StagingBufferPool {
         usage: MemoryUsage,
     ) -> Option<OwnedStagingBuffer> {
         let supports_device_address = self.device_owner.get().is_buffer_device_address_supported();
-        let buf_info = vk::BufferCreateInfo::builder()
+        let buf_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage({
                 let mut flags = vk::BufferUsageFlags::TRANSFER_SRC
@@ -538,8 +536,7 @@ impl StagingBufferPool {
                 }
                 flags
             })
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         // SAFETY: the allocator is boxed by RendererVulkan and outlives the
         // rasterizer and its staging pool, matching upstream's reference member.
@@ -564,9 +561,8 @@ impl StagingBufferPool {
                     .get()
                     .get_logical()
                     .get_buffer_device_address(
-                        &vk::BufferDeviceAddressInfo::builder()
-                            .buffer(buffer)
-                            .build(),
+                        &vk::BufferDeviceAddressInfo::default()
+                            .buffer(buffer),
                     )
             }
         } else {

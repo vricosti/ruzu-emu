@@ -280,12 +280,11 @@ fn update_one_texture_descriptor_set(
         image_view,
         image_layout: vk::ImageLayout::GENERAL,
     };
-    let write = vk::WriteDescriptorSet::builder()
+    let write = vk::WriteDescriptorSet::default()
         .dst_set(descriptor_set)
         .dst_binding(0)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .image_info(std::slice::from_ref(&image_info))
-        .build();
+        .image_info(std::slice::from_ref(&image_info));
     unsafe {
         device.update_descriptor_sets(&[write], &[]);
     }
@@ -311,18 +310,16 @@ fn update_two_textures_descriptor_set(
         },
     ];
     let writes = [
-        vk::WriteDescriptorSet::builder()
+        vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(std::slice::from_ref(&image_infos[0]))
-            .build(),
-        vk::WriteDescriptorSet::builder()
+            .image_info(std::slice::from_ref(&image_infos[0])),
+        vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
             .dst_binding(1)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(std::slice::from_ref(&image_infos[1]))
-            .build(),
+            .image_info(std::slice::from_ref(&image_infos[1])),
     ];
     unsafe {
         device.update_descriptor_sets(&writes, &[]);
@@ -431,7 +428,7 @@ fn record_shader_read_barrier(
     let device = device.clone();
     scheduler.request_outside_render_pass_operation_context();
     scheduler.record(move |cmdbuf| unsafe {
-        let barrier = vk::ImageMemoryBarrier::builder()
+        let barrier = vk::ImageMemoryBarrier::default()
             .src_access_mask(
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                     | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
@@ -444,8 +441,7 @@ fn record_shader_read_barrier(
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(src_image_view.image)
-            .subresource_range(src_image_view.subresource_range)
-            .build();
+            .subresource_range(src_image_view.subresource_range);
         device.cmd_pipeline_barrier(
             cmdbuf,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
@@ -464,14 +460,14 @@ fn record_shader_read_barrier(
 }
 
 /// Port of anonymous `GetPipelineInputAssemblyStateCreateInfo`.
-fn pipeline_input_assembly_state(device: &Device) -> vk::PipelineInputAssemblyStateCreateInfo {
-    vk::PipelineInputAssemblyStateCreateInfo::builder()
+fn pipeline_input_assembly_state(device: &Device) -> vk::PipelineInputAssemblyStateCreateInfo<'_> {
+    vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
         .primitive_restart_enable(device.is_molten_vk())
-        .build()
+        
 }
 
-fn pipeline_depth_stencil_state() -> vk::PipelineDepthStencilStateCreateInfo {
+fn pipeline_depth_stencil_state() -> vk::PipelineDepthStencilStateCreateInfo<'static> {
     let stencil = vk::StencilOpState {
         fail_op: vk::StencilOp::REPLACE,
         pass_op: vk::StencilOp::REPLACE,
@@ -481,7 +477,7 @@ fn pipeline_depth_stencil_state() -> vk::PipelineDepthStencilStateCreateInfo {
         write_mask: u32::MAX,
         reference: 0,
     };
-    vk::PipelineDepthStencilStateCreateInfo::builder()
+    vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(true)
         .depth_write_enable(true)
         .depth_compare_op(vk::CompareOp::ALWAYS)
@@ -489,12 +485,12 @@ fn pipeline_depth_stencil_state() -> vk::PipelineDepthStencilStateCreateInfo {
         .stencil_test_enable(true)
         .front(stencil)
         .back(stencil)
-        .build()
+        
 }
 
 /// Depth/stencil state of upstream `FindOrEmplaceMSAACopyDepthPipeline`: depth
 /// always written, stencil replaced from `gl_FragStencilRefARB` when copied.
-fn msaa_copy_depth_stencil_state(copy_stencil: bool) -> vk::PipelineDepthStencilStateCreateInfo {
+fn msaa_copy_depth_stencil_state(copy_stencil: bool) -> vk::PipelineDepthStencilStateCreateInfo<'static> {
     const REPLACE_STENCIL_OP: vk::StencilOpState = vk::StencilOpState {
         fail_op: vk::StencilOp::REPLACE,
         pass_op: vk::StencilOp::REPLACE,
@@ -509,7 +505,7 @@ fn msaa_copy_depth_stencil_state(copy_stencil: bool) -> vk::PipelineDepthStencil
     } else {
         vk::StencilOpState::default()
     };
-    vk::PipelineDepthStencilStateCreateInfo::builder()
+    vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(true)
         .depth_write_enable(true)
         .depth_compare_op(vk::CompareOp::ALWAYS)
@@ -519,17 +515,17 @@ fn msaa_copy_depth_stencil_state(copy_stencil: bool) -> vk::PipelineDepthStencil
         .back(stencil)
         .min_depth_bounds(0.0)
         .max_depth_bounds(0.0)
-        .build()
+        
 }
 
-fn pipeline_depth_only_state() -> vk::PipelineDepthStencilStateCreateInfo {
-    vk::PipelineDepthStencilStateCreateInfo::builder()
+fn pipeline_depth_only_state() -> vk::PipelineDepthStencilStateCreateInfo<'static> {
+    vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(true)
         .depth_write_enable(true)
         .depth_compare_op(vk::CompareOp::ALWAYS)
         .depth_bounds_test_enable(false)
         .stencil_test_enable(false)
-        .build()
+        
 }
 
 fn sample_count_flag(num_samples: u32) -> vk::SampleCountFlags {
@@ -550,7 +546,7 @@ fn make_msaa_copy_view(
     base_layer: u32,
     aspect_mask: vk::ImageAspectFlags,
 ) -> Result<vk::ImageView, vk::Result> {
-    let create_info = vk::ImageViewCreateInfo::builder()
+    let create_info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(format)
@@ -566,8 +562,7 @@ fn make_msaa_copy_view(
             level_count: 1,
             base_array_layer: base_layer,
             layer_count: 1,
-        })
-        .build();
+        });
     unsafe { device.create_image_view(&create_info, None) }
 }
 
@@ -579,7 +574,7 @@ fn make_reinterpret_view(
     base_level: u32,
     base_layer: u32,
 ) -> Result<vk::ImageView, vk::Result> {
-    let create_info = vk::ImageViewCreateInfo::builder()
+    let create_info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(format)
@@ -595,8 +590,7 @@ fn make_reinterpret_view(
             level_count: 1,
             base_array_layer: base_layer,
             layer_count: 1,
-        })
-        .build();
+        });
     unsafe { device.create_image_view(&create_info, None) }
 }
 
@@ -755,10 +749,10 @@ impl BlitImageHelper {
             descriptor_count: 1,
             stage_flags: vk::ShaderStageFlags::FRAGMENT,
             p_immutable_samplers: std::ptr::null(),
+            ..Default::default()
         };
-        let one_tex_layout_ci = vk::DescriptorSetLayoutCreateInfo::builder()
-            .bindings(std::slice::from_ref(&one_tex_binding))
-            .build();
+        let one_tex_layout_ci = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(std::slice::from_ref(&one_tex_binding));
         let one_texture_set_layout = unsafe {
             device
                 .create_descriptor_set_layout(&one_tex_layout_ci, None)
@@ -773,6 +767,7 @@ impl BlitImageHelper {
                 descriptor_count: 1,
                 stage_flags: vk::ShaderStageFlags::FRAGMENT,
                 p_immutable_samplers: std::ptr::null(),
+                ..Default::default()
             },
             vk::DescriptorSetLayoutBinding {
                 binding: 1,
@@ -780,11 +775,11 @@ impl BlitImageHelper {
                 descriptor_count: 1,
                 stage_flags: vk::ShaderStageFlags::FRAGMENT,
                 p_immutable_samplers: std::ptr::null(),
+                ..Default::default()
             },
         ];
-        let two_tex_layout_ci = vk::DescriptorSetLayoutCreateInfo::builder()
-            .bindings(&two_tex_bindings)
-            .build();
+        let two_tex_layout_ci = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&two_tex_bindings);
         let two_textures_set_layout = unsafe {
             device
                 .create_descriptor_set_layout(&two_tex_layout_ci, None)
@@ -814,10 +809,9 @@ impl BlitImageHelper {
             size: std::mem::size_of::<PushConstants>() as u32,
         };
         let one_tex_layouts = [one_texture_set_layout];
-        let one_tex_pl_ci = vk::PipelineLayoutCreateInfo::builder()
+        let one_tex_pl_ci = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&one_tex_layouts)
-            .push_constant_ranges(std::slice::from_ref(&push_range))
-            .build();
+            .push_constant_ranges(std::slice::from_ref(&push_range));
         let one_texture_pipeline_layout = unsafe {
             device
                 .create_pipeline_layout(&one_tex_pl_ci, None)
@@ -826,10 +820,9 @@ impl BlitImageHelper {
 
         // Create two-texture pipeline layout with push constants
         let two_tex_layouts = [two_textures_set_layout];
-        let two_tex_pl_ci = vk::PipelineLayoutCreateInfo::builder()
+        let two_tex_pl_ci = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&two_tex_layouts)
-            .push_constant_ranges(std::slice::from_ref(&push_range))
-            .build();
+            .push_constant_ranges(std::slice::from_ref(&push_range));
         let two_textures_pipeline_layout = unsafe {
             device
                 .create_pipeline_layout(&two_tex_pl_ci, None)
@@ -842,9 +835,8 @@ impl BlitImageHelper {
             offset: 0,
             size: 4 * std::mem::size_of::<f32>() as u32, // 4 floats for color
         };
-        let clear_pl_ci = vk::PipelineLayoutCreateInfo::builder()
-            .push_constant_ranges(std::slice::from_ref(&clear_push_range))
-            .build();
+        let clear_pl_ci = vk::PipelineLayoutCreateInfo::default()
+            .push_constant_ranges(std::slice::from_ref(&clear_push_range));
         let clear_color_pipeline_layout = unsafe {
             device
                 .create_pipeline_layout(&clear_pl_ci, None)
@@ -856,19 +848,17 @@ impl BlitImageHelper {
             offset: 0,
             size: std::mem::size_of::<MsaaCopyPushConstants>() as u32,
         };
-        let msaa_copy_pl_ci = vk::PipelineLayoutCreateInfo::builder()
+        let msaa_copy_pl_ci = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&one_tex_layouts)
-            .push_constant_ranges(std::slice::from_ref(&msaa_copy_push_range))
-            .build();
+            .push_constant_ranges(std::slice::from_ref(&msaa_copy_push_range));
         let msaa_copy_pipeline_layout = unsafe {
             device
                 .create_pipeline_layout(&msaa_copy_pl_ci, None)
                 .expect("Failed to create MSAA copy pipeline layout")
         };
-        let msaa_copy_depth_stencil_pl_ci = vk::PipelineLayoutCreateInfo::builder()
+        let msaa_copy_depth_stencil_pl_ci = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&two_tex_layouts)
-            .push_constant_ranges(std::slice::from_ref(&msaa_copy_push_range))
-            .build();
+            .push_constant_ranges(std::slice::from_ref(&msaa_copy_push_range));
         let msaa_copy_depth_stencil_pipeline_layout = unsafe {
             device
                 .create_pipeline_layout(&msaa_copy_depth_stencil_pl_ci, None)
@@ -964,7 +954,7 @@ impl BlitImageHelper {
         };
 
         // Create samplers
-        let linear_sampler_ci = vk::SamplerCreateInfo::builder()
+        let linear_sampler_ci = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
             .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
@@ -973,15 +963,14 @@ impl BlitImageHelper {
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
             .compare_op(vk::CompareOp::NEVER)
             .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
-            .unnormalized_coordinates(true)
-            .build();
+            .unnormalized_coordinates(true);
         let linear_sampler = unsafe {
             device
                 .create_sampler(&linear_sampler_ci, None)
                 .expect("Failed to create linear sampler")
         };
 
-        let nearest_sampler_ci = vk::SamplerCreateInfo::builder()
+        let nearest_sampler_ci = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::NEAREST)
             .min_filter(vk::Filter::NEAREST)
             .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
@@ -990,8 +979,7 @@ impl BlitImageHelper {
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
             .compare_op(vk::CompareOp::NEVER)
             .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
-            .unnormalized_coordinates(true)
-            .build();
+            .unnormalized_coordinates(true);
         let nearest_sampler = unsafe {
             device
                 .create_sampler(&nearest_sampler_ci, None)
@@ -1419,7 +1407,7 @@ impl BlitImageHelper {
             let access = vk::AccessFlags::COLOR_ATTACHMENT_READ
                 | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                 | vk::AccessFlags::SHADER_READ;
-            let barrier = vk::ImageMemoryBarrier::builder()
+            let barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(access)
                 .dst_access_mask(access)
                 .old_layout(vk::ImageLayout::GENERAL)
@@ -1433,8 +1421,7 @@ impl BlitImageHelper {
                     level_count: 1,
                     base_array_layer: 0,
                     layer_count: 1,
-                })
-                .build();
+                });
             device.cmd_pipeline_barrier(
                 cmdbuf,
                 vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1445,14 +1432,13 @@ impl BlitImageHelper {
                 &[barrier],
             );
 
-            let begin = vk::RenderPassBeginInfo::builder()
+            let begin = vk::RenderPassBeginInfo::default()
                 .render_pass(dst_framebuffer.render_pass)
                 .framebuffer(dst_framebuffer.framebuffer)
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
                     extent: dst_framebuffer.render_area,
-                })
-                .build();
+                });
             device.cmd_begin_render_pass(cmdbuf, &begin, vk::SubpassContents::INLINE);
             let descriptor_set = descriptor_allocator
                 .commit()
@@ -2366,13 +2352,12 @@ impl BlitImageHelper {
                 };
 
                 let attachments = [dst_view];
-                let framebuffer_info = vk::FramebufferCreateInfo::builder()
+                let framebuffer_info = vk::FramebufferCreateInfo::default()
                     .render_pass(render_pass)
                     .attachments(&attachments)
                     .width(dst_mip_extent.width)
                     .height(dst_mip_extent.height)
-                    .layers(1)
-                    .build();
+                    .layers(1);
                 let framebuffer = match unsafe {
                     self.device.create_framebuffer(&framebuffer_info, None)
                 } {
@@ -2549,13 +2534,12 @@ impl BlitImageHelper {
                     extent: dst_extent,
                 };
                 let attachments = [dst_view];
-                let framebuffer_info = vk::FramebufferCreateInfo::builder()
+                let framebuffer_info = vk::FramebufferCreateInfo::default()
                     .render_pass(renderpass)
                     .attachments(&attachments)
                     .width((dst_offset.x as u32).wrapping_add(dst_extent.width))
                     .height((dst_offset.y as u32).wrapping_add(dst_extent.height))
-                    .layers(1)
-                    .build();
+                    .layers(1);
                 let framebuffer =
                     match unsafe { self.device.create_framebuffer(&framebuffer_info, None) } {
                         Ok(framebuffer) => framebuffer,
@@ -2593,7 +2577,7 @@ impl BlitImageHelper {
                         layer_count: vk::REMAINING_ARRAY_LAYERS,
                     };
                     let pre_barriers = [
-                        vk::ImageMemoryBarrier::builder()
+                        vk::ImageMemoryBarrier::default()
                             .src_access_mask(aspect_info.pre_src_access)
                             .dst_access_mask(aspect_info.pre_src_dst_access)
                             .old_layout(vk::ImageLayout::GENERAL)
@@ -2601,9 +2585,8 @@ impl BlitImageHelper {
                             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .image(src_image)
-                            .subresource_range(barrier_range)
-                            .build(),
-                        vk::ImageMemoryBarrier::builder()
+                            .subresource_range(barrier_range),
+                        vk::ImageMemoryBarrier::default()
                             .src_access_mask(aspect_info.pre_src_access)
                             .dst_access_mask(aspect_info.pre_dst_dst_access)
                             .old_layout(vk::ImageLayout::GENERAL)
@@ -2611,8 +2594,7 @@ impl BlitImageHelper {
                             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .image(dst_image)
-                            .subresource_range(barrier_range)
-                            .build(),
+                            .subresource_range(barrier_range),
                     ];
                     device.cmd_pipeline_barrier(
                         cmdbuf,
@@ -2623,11 +2605,10 @@ impl BlitImageHelper {
                         &[],
                         &pre_barriers,
                     );
-                    let begin_info = vk::RenderPassBeginInfo::builder()
+                    let begin_info = vk::RenderPassBeginInfo::default()
                         .render_pass(renderpass)
                         .framebuffer(framebuffer)
-                        .render_area(render_area)
-                        .build();
+                        .render_area(render_area);
                     device.cmd_begin_render_pass(cmdbuf, &begin_info, vk::SubpassContents::INLINE);
                     let descriptor_set = if src_stencil_handle != vk::ImageView::null() {
                         let descriptor_set = two_textures_allocator
@@ -2685,7 +2666,7 @@ impl BlitImageHelper {
                     );
                     device.cmd_draw(cmdbuf, 3, 1, 0, 0);
                     device.cmd_end_render_pass(cmdbuf);
-                    let post_barrier = vk::ImageMemoryBarrier::builder()
+                    let post_barrier = vk::ImageMemoryBarrier::default()
                         .src_access_mask(aspect_info.post_src_access)
                         .dst_access_mask(aspect_info.post_dst_access)
                         .old_layout(vk::ImageLayout::GENERAL)
@@ -2693,8 +2674,7 @@ impl BlitImageHelper {
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .image(dst_image)
-                        .subresource_range(barrier_range)
-                        .build();
+                        .subresource_range(barrier_range);
                     device.cmd_pipeline_barrier(
                         cmdbuf,
                         aspect_info.post_src_stages,
@@ -2964,54 +2944,46 @@ impl BlitImageHelper {
         }
         let main = CString::new("main").unwrap();
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.full_screen_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.blit_color_msaa_frag)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(key.samples)
             .sample_shading_enable(true)
-            .min_sample_shading(1.0)
-            .build();
-        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+            .min_sample_shading(1.0);
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(
                 vk::ColorComponentFlags::R
                     | vk::ColorComponentFlags::G
                     | vk::ColorComponentFlags::B
                     | vk::ColorComponentFlags::A,
-            )
-            .build();
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
-            .attachments(std::slice::from_ref(&blend_attachment))
-            .build();
+            );
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(std::slice::from_ref(&blend_attachment));
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
-        let create_info = vk::GraphicsPipelineCreateInfo::builder()
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+        let create_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -3022,8 +2994,7 @@ impl BlitImageHelper {
             .dynamic_state(&dynamic_state)
             .layout(self.one_texture_pipeline_layout)
             .render_pass(key.renderpass)
-            .subpass(0)
-            .build();
+            .subpass(0);
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
@@ -3065,52 +3036,46 @@ impl BlitImageHelper {
             self.blit_depth_msaa_frag
         };
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.full_screen_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(fragment_shader)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-            .build();
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let depth_stencil = if resolve_stencil {
             pipeline_depth_stencil_state()
         } else {
             pipeline_depth_only_state()
         };
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder().build();
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default();
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
         let layout = if resolve_stencil {
             self.two_textures_pipeline_layout
         } else {
             self.one_texture_pipeline_layout
         };
-        let create_info = vk::GraphicsPipelineCreateInfo::builder()
+        let create_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -3122,8 +3087,7 @@ impl BlitImageHelper {
             .dynamic_state(&dynamic_state)
             .layout(layout)
             .render_pass(renderpass)
-            .subpass(0)
-            .build();
+            .subpass(0);
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
@@ -3165,50 +3129,42 @@ impl BlitImageHelper {
             };
         }
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.clear_color_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(fragment_shader)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(key.samples)
             .sample_shading_enable(!key.msaa_to_non_msaa)
-            .min_sample_shading(if key.msaa_to_non_msaa { 0.0 } else { 1.0 })
-            .build();
-        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+            .min_sample_shading(if key.msaa_to_non_msaa { 0.0 } else { 1.0 });
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(
                 vk::ColorComponentFlags::R
                     | vk::ColorComponentFlags::G
                     | vk::ColorComponentFlags::B
                     | vk::ColorComponentFlags::A,
-            )
-            .build();
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
-            .attachments(std::slice::from_ref(&blend_attachment))
-            .build();
+            );
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(std::slice::from_ref(&blend_attachment));
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
-        let create_info = vk::GraphicsPipelineCreateInfo::builder()
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+        let create_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -3219,8 +3175,7 @@ impl BlitImageHelper {
             .dynamic_state(&dynamic_state)
             .layout(self.msaa_copy_pipeline_layout)
             .render_pass(key.renderpass)
-            .subpass(0)
-            .build();
+            .subpass(0);
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
@@ -3268,46 +3223,40 @@ impl BlitImageHelper {
             self.convert_non_msaa_to_msaa_depth_frag
         };
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.clear_color_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(fragment_shader)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(key.samples)
             .sample_shading_enable(!key.msaa_to_non_msaa)
-            .min_sample_shading(if key.msaa_to_non_msaa { 0.0 } else { 1.0 })
-            .build();
+            .min_sample_shading(if key.msaa_to_non_msaa { 0.0 } else { 1.0 });
         let depth_stencil = msaa_copy_depth_stencil_state(copy_stencil);
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder().build();
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default();
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
         let layout = if copy_stencil {
             self.msaa_copy_depth_stencil_pipeline_layout
         } else {
             self.msaa_copy_pipeline_layout
         };
-        let create_info = vk::GraphicsPipelineCreateInfo::builder()
+        let create_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -3319,8 +3268,7 @@ impl BlitImageHelper {
             .dynamic_state(&dynamic_state)
             .layout(layout)
             .render_pass(key.renderpass)
-            .subpass(0)
-            .build();
+            .subpass(0);
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
@@ -3362,54 +3310,48 @@ impl BlitImageHelper {
             self.blit_depth_msaa_frag
         };
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.full_screen_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(fragment_shader)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(key.samples)
             .sample_shading_enable(true)
-            .min_sample_shading(1.0)
-            .build();
+            .min_sample_shading(1.0);
         let depth_stencil = if blit_stencil {
             pipeline_depth_stencil_state()
         } else {
             pipeline_depth_only_state()
         };
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder().build();
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default();
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
         let layout = if blit_stencil {
             self.two_textures_pipeline_layout
         } else {
             self.one_texture_pipeline_layout
         };
-        let create_info = vk::GraphicsPipelineCreateInfo::builder()
+        let create_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -3421,8 +3363,7 @@ impl BlitImageHelper {
             .dynamic_state(&dynamic_state)
             .layout(layout)
             .render_pass(key.renderpass)
-            .subpass(0)
-            .build();
+            .subpass(0);
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
@@ -3451,43 +3392,37 @@ impl BlitImageHelper {
         }
         let main = CString::new("main").unwrap();
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.full_screen_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.blit_depth_frag)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-            .build();
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let depth_stencil = pipeline_depth_only_state();
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder().build();
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default();
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
-        let create_info = vk::GraphicsPipelineCreateInfo::builder()
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+        let create_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -3499,8 +3434,7 @@ impl BlitImageHelper {
             .dynamic_state(&dynamic_state)
             .layout(self.one_texture_pipeline_layout)
             .render_pass(renderpass)
-            .subpass(0)
-            .build();
+            .subpass(0);
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
@@ -3528,37 +3462,32 @@ impl BlitImageHelper {
         }
         let main = CString::new("main").unwrap();
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.full_screen_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.blit_color_to_color_frag)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .depth_clamp_enable(false)
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
             .depth_bias_enable(false)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-            .sample_shading_enable(false)
-            .build();
-        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+            .sample_shading_enable(false);
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(false)
             .src_color_blend_factor(vk::BlendFactor::ZERO)
             .dst_color_blend_factor(vk::BlendFactor::ZERO)
@@ -3571,22 +3500,19 @@ impl BlitImageHelper {
                     | vk::ColorComponentFlags::G
                     | vk::ColorComponentFlags::B
                     | vk::ColorComponentFlags::A,
-            )
-            .build();
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
+            );
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .logic_op(vk::LogicOp::CLEAR)
-            .attachments(std::slice::from_ref(&blend_attachment))
-            .build();
+            .attachments(std::slice::from_ref(&blend_attachment));
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -3597,8 +3523,7 @@ impl BlitImageHelper {
             .dynamic_state(&dynamic_state)
             .layout(self.one_texture_pipeline_layout)
             .render_pass(key.renderpass)
-            .subpass(0)
-            .build();
+            .subpass(0);
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
@@ -3623,47 +3548,41 @@ impl BlitImageHelper {
         }
         let main = CString::new("main").unwrap();
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.full_screen_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.blit_depth_stencil_frag)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .depth_clamp_enable(false)
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
             .depth_bias_enable(false)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-            .sample_shading_enable(false)
-            .build();
+            .sample_shading_enable(false);
         let depth_stencil = pipeline_depth_stencil_state();
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder().build();
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default();
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -3675,8 +3594,7 @@ impl BlitImageHelper {
             .dynamic_state(&dynamic_state)
             .layout(self.two_textures_pipeline_layout)
             .render_pass(key.renderpass)
-            .subpass(0)
-            .build();
+            .subpass(0);
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
@@ -3701,38 +3619,33 @@ impl BlitImageHelper {
         }
         let main = CString::new("main").unwrap();
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.clear_color_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.clear_color_frag)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .depth_clamp_enable(false)
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
             .depth_bias_enable(false)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-            .sample_shading_enable(false)
-            .build();
+            .sample_shading_enable(false);
         let depth_stencil = pipeline_depth_stencil_state();
-        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(true)
             .src_color_blend_factor(vk::BlendFactor::CONSTANT_COLOR)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_CONSTANT_COLOR)
@@ -3745,22 +3658,19 @@ impl BlitImageHelper {
                     | vk::ColorComponentFlags::G
                     | vk::ColorComponentFlags::B
                     | vk::ColorComponentFlags::A,
-            )
-            .build();
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
+            );
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .logic_op(vk::LogicOp::CLEAR)
-            .attachments(std::slice::from_ref(&blend_attachment))
-            .build();
+            .attachments(std::slice::from_ref(&blend_attachment));
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -3772,8 +3682,7 @@ impl BlitImageHelper {
             .dynamic_state(&dynamic_state)
             .layout(self.clear_color_pipeline_layout)
             .render_pass(key.renderpass)
-            .subpass(0)
-            .build();
+            .subpass(0);
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
@@ -3798,16 +3707,14 @@ impl BlitImageHelper {
         }
         let main = CString::new("main").unwrap();
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.clear_color_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.clear_stencil_frag)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
         let stencil = vk::StencilOpState {
             fail_op: vk::StencilOp::KEEP,
@@ -3818,35 +3725,31 @@ impl BlitImageHelper {
             write_mask: key.stencil_mask as u32,
             reference: key.stencil_ref,
         };
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .depth_clamp_enable(false)
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
             .depth_bias_enable(false)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-            .sample_shading_enable(false)
-            .build();
-        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::builder()
+            .sample_shading_enable(false);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(key.depth_clear)
             .depth_write_enable(key.depth_clear)
             .depth_compare_op(vk::CompareOp::ALWAYS)
             .depth_bounds_test_enable(false)
             .stencil_test_enable(true)
             .front(stencil)
-            .back(stencil)
-            .build();
-        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+            .back(stencil);
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(false)
             .src_color_blend_factor(vk::BlendFactor::ZERO)
             .dst_color_blend_factor(vk::BlendFactor::ZERO)
@@ -3859,22 +3762,19 @@ impl BlitImageHelper {
                     | vk::ColorComponentFlags::G
                     | vk::ColorComponentFlags::B
                     | vk::ColorComponentFlags::A,
-            )
-            .build();
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
+            );
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .logic_op(vk::LogicOp::CLEAR)
-            .attachments(std::slice::from_ref(&blend_attachment))
-            .build();
+            .attachments(std::slice::from_ref(&blend_attachment));
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -3886,8 +3786,7 @@ impl BlitImageHelper {
             .dynamic_state(&dynamic_state)
             .layout(self.clear_color_pipeline_layout)
             .render_pass(key.renderpass)
-            .subpass(0)
-            .build();
+            .subpass(0);
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
@@ -3934,62 +3833,55 @@ impl BlitImageHelper {
         }
         let main = CString::new("main").unwrap();
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.full_screen_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(module)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-            .build();
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let depth_stencil = pipeline_depth_stencil_state();
-        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(
                 vk::ColorComponentFlags::R
                     | vk::ColorComponentFlags::G
                     | vk::ColorComponentFlags::B
                     | vk::ColorComponentFlags::A,
-            )
-            .build();
+            );
         let color_blend = if is_target_depth {
-            vk::PipelineColorBlendStateCreateInfo::builder().build()
+            vk::PipelineColorBlendStateCreateInfo::default()
         } else {
-            vk::PipelineColorBlendStateCreateInfo::builder()
+            vk::PipelineColorBlendStateCreateInfo::default()
                 .attachments(std::slice::from_ref(&blend_attachment))
-                .build()
+                
         };
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
         let layout = if single_texture {
             self.one_texture_pipeline_layout
         } else {
             self.two_textures_pipeline_layout
         };
-        let mut create_info = vk::GraphicsPipelineCreateInfo::builder()
+        let mut create_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -4004,7 +3896,7 @@ impl BlitImageHelper {
         if is_target_depth {
             create_info = create_info.depth_stencil_state(&depth_stencil);
         }
-        let create_info = create_info.build();
+        let create_info = create_info;
         unsafe {
             self.device
                 .create_graphics_pipelines(
@@ -4054,57 +3946,50 @@ impl BlitImageHelper {
         };
         let main = CString::new("main").unwrap();
         let stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.full_screen_vert)
-                .name(&main)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
+                .name(&main),
+            vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(fragment_shader)
-                .name(&main)
-                .build(),
+                .name(&main),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder().build();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = pipeline_input_assembly_state(unsafe { self.device_owner.as_ref() });
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
-            .scissor_count(1)
-            .build();
-        let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::CLOCKWISE)
-            .line_width(1.0)
-            .build();
-        let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-            .build();
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let depth_stencil = pipeline_depth_stencil_state();
-        let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(
                 vk::ColorComponentFlags::R
                     | vk::ColorComponentFlags::G
                     | vk::ColorComponentFlags::B
                     | vk::ColorComponentFlags::A,
-            )
-            .build();
+            );
         let color_blend = if is_target_depth {
-            vk::PipelineColorBlendStateCreateInfo::builder().build()
+            vk::PipelineColorBlendStateCreateInfo::default()
         } else {
-            vk::PipelineColorBlendStateCreateInfo::builder()
+            vk::PipelineColorBlendStateCreateInfo::default()
                 .attachments(std::slice::from_ref(&blend_attachment))
-                .build()
+                
         };
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states)
-            .build();
-        let mut create_info = vk::GraphicsPipelineCreateInfo::builder()
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+        let mut create_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -4119,7 +4004,7 @@ impl BlitImageHelper {
         if is_target_depth {
             create_info = create_info.depth_stencil_state(&depth_stencil);
         }
-        let create_info = create_info.build();
+        let create_info = create_info;
         unsafe {
             self.device
                 .create_graphics_pipelines(

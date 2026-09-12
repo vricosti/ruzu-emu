@@ -166,8 +166,8 @@ fn choose_alpha_flags(capabilities: &vk::SurfaceCapabilitiesKHR) -> vk::Composit
 /// Port of `Swapchain` class.
 pub struct Swapchain {
     surface: vk::SurfaceKHR,
-    surface_loader: ash::extensions::khr::Surface,
-    swapchain_loader: ash::extensions::khr::Swapchain,
+    surface_loader: ash::khr::surface::Instance,
+    swapchain_loader: ash::khr::swapchain::Device,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     present_queue: vk::Queue,
@@ -206,7 +206,7 @@ impl Swapchain {
     /// Port of `Swapchain::Swapchain`.
     pub fn new(
         instance: &ash::Instance,
-        surface_loader: ash::extensions::khr::Surface,
+        surface_loader: ash::khr::surface::Instance,
         surface: vk::SurfaceKHR,
         device: &Device,
         submit_mutex: Arc<Mutex<()>>,
@@ -214,7 +214,7 @@ impl Swapchain {
         width: u32,
         height: u32,
     ) -> Result<Self, VulkanError> {
-        let swapchain_loader = ash::extensions::khr::Swapchain::new(instance, device.get_logical());
+        let swapchain_loader = ash::khr::swapchain::Device::new(instance, device.get_logical());
         let mut swapchain = Swapchain {
             surface,
             surface_loader,
@@ -374,15 +374,14 @@ impl Swapchain {
         let wait_semaphores = [render_semaphore];
         let swapchains = [self.swapchain];
         let image_indices = [self.image_index];
-        let present_info = vk::PresentInfoKHR::builder()
+        let present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(if render_semaphore == vk::Semaphore::null() {
                 &[]
             } else {
                 &wait_semaphores
             })
             .swapchains(&swapchains)
-            .image_indices(&image_indices)
-            .build();
+            .image_indices(&image_indices);
         let _submit_lock = self.submit_mutex.lock().unwrap();
         match unsafe {
             self.swapchain_loader
@@ -562,7 +561,7 @@ impl Swapchain {
         self.extent = choose_swap_extent(&updated_capabilities, self.width, self.height);
 
         let queue_indices = [self.graphics_family, self.present_family];
-        let mut create_info = vk::SwapchainCreateInfoKHR::builder()
+        let mut create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(requested_image_count)
             .image_format(self.surface_format.format)
@@ -596,10 +595,9 @@ impl Swapchain {
             vk::Format::R8G8B8A8_UNORM,
             vk::Format::R8G8B8A8_SRGB,
         ];
-        let mut format_list = vk::ImageFormatListCreateInfo::builder()
-            .view_formats(&view_formats)
-            .build();
-        let mut create_info = create_info.build();
+        let mut format_list = vk::ImageFormatListCreateInfo::default()
+            .view_formats(&view_formats);
+        let mut create_info = create_info;
         if self.mutable_format_enabled {
             create_info.flags |= vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT;
             create_info.p_next = (&mut format_list as *mut vk::ImageFormatListCreateInfo).cast();
@@ -632,7 +630,7 @@ impl Swapchain {
     fn create_semaphores(&mut self) -> Result<(), VulkanError> {
         self.present_semaphores.clear();
         self.render_semaphores.clear();
-        let semaphore_ci = vk::SemaphoreCreateInfo::builder().build();
+        let semaphore_ci = vk::SemaphoreCreateInfo::default();
         for _i in 0..self.image_count {
             let present = unsafe {
                 self.device

@@ -408,7 +408,7 @@ impl SchedulerWorkerState {
 
 struct WorkerContext {
     device: ash::Device,
-    device_fault: Option<vk::ExtDeviceFaultFn>,
+    device_fault: Option<ash::ext::device_fault::DeviceFn>,
     device_fault_reported: bool,
     master_semaphore: Arc<MasterSemaphore>,
     command_pool: CommandPool,
@@ -570,9 +570,8 @@ impl WorkerContext {
     fn allocate_worker_command_buffer(&mut self) -> Result<(), vk::Result> {
         self.current_cmdbuf = self.command_pool.commit()?;
         self.upload_cmdbuf = self.command_pool.commit()?;
-        let begin_info = vk::CommandBufferBeginInfo::builder()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
-            .build();
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
             self.device
                 .reset_command_buffer(self.current_cmdbuf, vk::CommandBufferResetFlags::empty())?;
@@ -588,10 +587,9 @@ impl WorkerContext {
 
     fn submit_execution(&mut self, submit: &SubmitRequest) -> Result<(), vk::Result> {
         unsafe {
-            let write_barrier = vk::MemoryBarrier::builder()
+            let write_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .build();
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             self.device.cmd_pipeline_barrier(
                 self.upload_cmdbuf,
                 vk::PipelineStageFlags::TRANSFER,
@@ -645,8 +643,8 @@ impl Scheduler {
         graphics_family: u32,
         timeline_semaphore_supported: bool,
         synchronization2_core: bool,
-        synchronization2_khr: Option<ash::extensions::khr::Synchronization2>,
-        device_fault: Option<vk::ExtDeviceFaultFn>,
+        synchronization2_khr: Option<ash::khr::synchronization2::Device>,
+        device_fault: Option<ash::ext::device_fault::DeviceFn>,
         transform_feedback_supported: bool,
     ) -> Result<Self, vk::Result> {
         if !timeline_semaphore_supported {
@@ -983,12 +981,11 @@ impl Scheduler {
                 .log_render_pass_begin(&render_pass_log_info(render_area.extent, num_images));
         }
         self.record(move |cmdbuf| unsafe {
-            let rp_begin = vk::RenderPassBeginInfo::builder()
+            let rp_begin = vk::RenderPassBeginInfo::default()
                 .render_pass(renderpass)
                 .framebuffer(framebuffer)
                 .render_area(render_area)
-                .clear_values(&values[..clear_value_count])
-                .build();
+                .clear_values(&values[..clear_value_count]);
             device.cmd_begin_render_pass(cmdbuf, &rp_begin, vk::SubpassContents::INLINE);
         });
 
@@ -1054,7 +1051,7 @@ impl Scheduler {
                     vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                         | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
                 };
-                barriers[index] = vk::ImageMemoryBarrier::builder()
+                barriers[index] = vk::ImageMemoryBarrier::default()
                     .src_access_mask(src_access_mask)
                     .dst_access_mask(
                         vk::AccessFlags::SHADER_READ
@@ -1069,8 +1066,7 @@ impl Scheduler {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(images[index])
-                    .subresource_range(range)
-                    .build();
+                    .subresource_range(range);
             }
             device.cmd_pipeline_barrier(
                 cmdbuf,
@@ -1084,12 +1080,11 @@ impl Scheduler {
                 &barriers[..num_images],
             );
             if transform_feedback_supported {
-                let xfb_output_barrier = vk::MemoryBarrier::builder()
+                let xfb_output_barrier = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFORM_FEEDBACK_WRITE_EXT)
                     .dst_access_mask(
                         vk::AccessFlags::VERTEX_ATTRIBUTE_READ | vk::AccessFlags::TRANSFER_READ,
-                    )
-                    .build();
+                    );
                 device.cmd_pipeline_barrier(
                     cmdbuf,
                     vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT,

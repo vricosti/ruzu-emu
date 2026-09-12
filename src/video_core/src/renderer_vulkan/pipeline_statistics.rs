@@ -70,11 +70,11 @@ impl PipelineStatistics {
     /// pipeline and accumulates them.
     pub fn collect(&self, device: &Device, pipeline: vk::Pipeline) {
         let pipeline_executable_properties_fn =
-            ash::extensions::khr::PipelineExecutableProperties::new(
+            ash::khr::pipeline_executable_properties::Device::new(
                 device.get_instance(),
                 device.get_logical(),
             );
-        let pipeline_info = vk::PipelineInfoKHR::builder().pipeline(pipeline).build();
+        let pipeline_info = vk::PipelineInfoKHR::default().pipeline(pipeline);
 
         let properties = unsafe {
             pipeline_executable_properties_fn
@@ -83,10 +83,9 @@ impl PipelineStatistics {
         };
 
         for (executable, _prop) in properties.iter().enumerate() {
-            let executable_info = vk::PipelineExecutableInfoKHR::builder()
+            let executable_info = vk::PipelineExecutableInfoKHR::default()
                 .pipeline(pipeline)
-                .executable_index(executable as u32)
-                .build();
+                .executable_index(executable as u32);
 
             let statistics = unsafe {
                 pipeline_executable_properties_fn

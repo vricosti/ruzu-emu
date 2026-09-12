@@ -198,12 +198,12 @@ unsafe impl Send for RendererVulkan {}
 /// It is a separate owner so Rust can destroy the surface after the logical
 /// device and before the instance, matching the effective C++ member order.
 pub(super) struct OwnedSurface {
-    loader: ash::extensions::khr::Surface,
+    loader: ash::khr::surface::Instance,
     handle: vk::SurfaceKHR,
 }
 
 impl OwnedSurface {
-    pub(super) fn new(loader: ash::extensions::khr::Surface, handle: vk::SurfaceKHR) -> Self {
+    pub(super) fn new(loader: ash::khr::surface::Instance, handle: vk::SurfaceKHR) -> Self {
         Self { loader, handle }
     }
 
@@ -285,7 +285,7 @@ impl RendererVulkan {
             vulkan_surface::create_surface(&instance.entry, &instance.instance, &surface_info)?
         };
         let surface_loader =
-            ash::extensions::khr::Surface::new(&instance.entry, &instance.instance);
+            ash::khr::surface::Instance::new(&instance.entry, &instance.instance);
         let surface = Arc::new(std::sync::Mutex::new(OwnedSurface::new(
             surface_loader,
             surface_handle,
@@ -298,7 +298,7 @@ impl RendererVulkan {
         let mut memory_allocator = Box::new(MemoryAllocator::new(&device));
         let mut state_tracker = Box::new(StateTracker::new());
         let device_fault = device.is_device_fault_supported().then(|| {
-            vk::ExtDeviceFaultFn::load(|name| unsafe {
+            ash::ext::device_fault::DeviceFn::load(|name| unsafe {
                 instance
                     .instance
                     .get_device_proc_addr(device.get_logical().handle(), name.as_ptr())
@@ -740,11 +740,10 @@ impl RendererVulkan {
     }
 
     fn create_download_buffer(&self, size: vk::DeviceSize) -> AllocatedBuffer {
-        let ci = vk::BufferCreateInfo::builder()
+        let ci = vk::BufferCreateInfo::default()
             .size(size.max(1))
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         self.memory_allocator
             .create_buffer(&ci, MemoryUsage::Download)
             .expect("Failed to create Vulkan download buffer")

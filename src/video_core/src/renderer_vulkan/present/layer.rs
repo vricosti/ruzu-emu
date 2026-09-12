@@ -377,7 +377,7 @@ impl Layer {
         let device = self.device.clone();
         let scheduler = unsafe { self.scheduler.as_mut() };
         scheduler.record(move |cmdbuf| unsafe {
-            let upload_barrier = vk::ImageMemoryBarrier::builder()
+            let upload_barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .old_layout(vk::ImageLayout::UNDEFINED)
@@ -391,8 +391,7 @@ impl Layer {
                     level_count: 1,
                     base_array_layer: 0,
                     layer_count: 1,
-                })
-                .build();
+                });
             device.cmd_pipeline_barrier(
                 cmdbuf,
                 vk::PipelineStageFlags::HOST,
@@ -403,7 +402,7 @@ impl Layer {
                 &[upload_barrier],
             );
 
-            let copy = vk::BufferImageCopy::builder()
+            let copy = vk::BufferImageCopy::default()
                 .buffer_offset(image_offset)
                 .buffer_row_length(0)
                 .buffer_image_height(0)
@@ -418,8 +417,7 @@ impl Layer {
                     width: image_width,
                     height: image_height,
                     depth: 1,
-                })
-                .build();
+                });
             device.cmd_copy_buffer_to_image(
                 cmdbuf,
                 staging_buffer,
@@ -428,7 +426,7 @@ impl Layer {
                 &[copy],
             );
 
-            let shader_barrier = vk::ImageMemoryBarrier::builder()
+            let shader_barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -442,8 +440,7 @@ impl Layer {
                     level_count: 1,
                     base_array_layer: 0,
                     layer_count: 1,
-                })
-                .build();
+                });
             device.cmd_pipeline_barrier(
                 cmdbuf,
                 vk::PipelineStageFlags::TRANSFER,
@@ -510,6 +507,7 @@ impl Layer {
             p_image_info: &image_info,
             p_buffer_info: std::ptr::null(),
             p_texel_buffer_view: std::ptr::null(),
+            ..Default::default()
         };
 
         unsafe {
@@ -565,7 +563,7 @@ impl Layer {
     /// Port of `Layer::CreateStagingBuffer`.
     fn create_staging_buffer(&mut self, _device: &Device, framebuffer: &FramebufferConfig) {
         let size = self.calculate_buffer_size(framebuffer);
-        let ci = vk::BufferCreateInfo::builder()
+        let ci = vk::BufferCreateInfo::default()
             .size(size)
             .usage(
                 vk::BufferUsageFlags::TRANSFER_SRC
@@ -573,8 +571,7 @@ impl Layer {
                     | vk::BufferUsageFlags::VERTEX_BUFFER
                     | vk::BufferUsageFlags::UNIFORM_BUFFER,
             )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let allocator = unsafe { self.memory_allocator.as_ref() };
         self.buffer = Some(
             allocator

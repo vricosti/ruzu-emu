@@ -17,7 +17,7 @@ use super::vulkan_wrapper::VulkanError;
 /// Counterpart of upstream's `vk::DebugUtilsMessenger`: the extension loader
 /// carries the instance dispatch table required to destroy the handle.
 pub struct DebugUtilsMessenger {
-    loader: ash::extensions::ext::DebugUtils,
+    loader: ash::ext::debug_utils::Instance,
     handle: vk::DebugUtilsMessengerEXT,
 }
 
@@ -165,9 +165,9 @@ pub fn create_debug_utils_callback(
     entry: &ash::Entry,
     instance: &ash::Instance,
 ) -> Result<DebugUtilsMessenger, VulkanError> {
-    let debug_utils = ash::extensions::ext::DebugUtils::new(entry, instance);
+    let debug_utils = ash::ext::debug_utils::Instance::new(entry, instance);
 
-    let create_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
+    let create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
         .message_severity(
             vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
                 | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
@@ -179,8 +179,7 @@ pub fn create_debug_utils_callback(
                 | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
                 | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
         )
-        .pfn_user_callback(Some(debug_utils_callback))
-        .build();
+        .pfn_user_callback(Some(debug_utils_callback));
 
     let messenger = unsafe {
         debug_utils

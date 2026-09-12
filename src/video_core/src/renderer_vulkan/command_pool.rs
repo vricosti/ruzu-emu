@@ -74,21 +74,19 @@ impl CommandPool {
             // single usage cycle. They are also going to be reset when committed.
             pools.push(Pool::default());
             let pool = pools.last_mut().expect("new command pool entry is missing");
-            let pool_ci = vk::CommandPoolCreateInfo::builder()
+            let pool_ci = vk::CommandPoolCreateInfo::default()
                 .flags(
                     vk::CommandPoolCreateFlags::TRANSIENT
                         | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
                 )
-                .queue_family_index(graphics_family)
-                .build();
+                .queue_family_index(graphics_family);
 
             pool.handle = unsafe { device.create_command_pool(&pool_ci, None)? };
 
-            let alloc_info = vk::CommandBufferAllocateInfo::builder()
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(pool.handle)
                 .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(COMMAND_BUFFER_POOL_SIZE as u32)
-                .build();
+                .command_buffer_count(COMMAND_BUFFER_POOL_SIZE as u32);
 
             pool.cmdbufs = unsafe { device.allocate_command_buffers(&alloc_info)? };
             Ok(())

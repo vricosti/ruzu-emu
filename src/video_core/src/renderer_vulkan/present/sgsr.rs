@@ -123,10 +123,9 @@ impl Sgsr {
             size: std::mem::size_of::<PushConstants>() as u32,
         };
         let set_layouts = [descriptor_set_layout];
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder()
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
-            .push_constant_ranges(std::slice::from_ref(&push_constant_range))
-            .build();
+            .push_constant_ranges(std::slice::from_ref(&push_constant_range));
         let pipeline_layout = unsafe {
             logical
                 .create_pipeline_layout(&pipeline_layout_info, None)
@@ -172,12 +171,11 @@ impl Sgsr {
             image_view,
             image_layout: vk::ImageLayout::GENERAL,
         };
-        let update = vk::WriteDescriptorSet::builder()
+        let update = vk::WriteDescriptorSet::default()
             .dst_set(images.descriptor_sets[0])
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(std::slice::from_ref(&image_info))
-            .build();
+            .image_info(std::slice::from_ref(&image_info));
         unsafe {
             device.get_logical().update_descriptor_sets(&[update], &[]);
         }

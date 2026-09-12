@@ -11,7 +11,7 @@ use ash::vk;
 ///
 /// Creates a `VkShaderModule` from SPIR-V `u32` words.
 pub fn build_shader(device: &ash::Device, code: &[u32]) -> Result<vk::ShaderModule, vk::Result> {
-    let create_info = vk::ShaderModuleCreateInfo::builder().code(code).build();
+    let create_info = vk::ShaderModuleCreateInfo::default().code(code);
 
     unsafe { device.create_shader_module(&create_info, None) }
 }

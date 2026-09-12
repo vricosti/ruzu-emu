@@ -1145,9 +1145,8 @@ impl GraphicsPipelineBuilder {
                 continue;
             };
             self.device_owner.get().save_shader(&compiled.spirv_words);
-            let create_info = vk::ShaderModuleCreateInfo::builder()
-                .code(&compiled.spirv_words)
-                .build();
+            let create_info = vk::ShaderModuleCreateInfo::default()
+                .code(&compiled.spirv_words);
             modules[index] = match unsafe {
                 self.device_owner
                     .get()
@@ -1589,9 +1588,8 @@ where
     };
     vulkan_device.save_shader(&compiled.spirv_words);
     let device = vulkan_device.get_logical().clone();
-    let create_info = vk::ShaderModuleCreateInfo::builder()
-        .code(&compiled.spirv_words)
-        .build();
+    let create_info = vk::ShaderModuleCreateInfo::default()
+        .code(&compiled.spirv_words);
     let spv_module = unsafe { device.create_shader_module(&create_info, None).ok()? };
     let should_log = is_active();
     let should_dump = *common::settings::values().gpu_log_shader_dumps.get_value();
@@ -1772,9 +1770,8 @@ impl PipelineCache {
         &self,
         initial_data: &[u8],
     ) -> Result<vk::PipelineCache, vk::Result> {
-        let cache_ci = vk::PipelineCacheCreateInfo::builder()
-            .initial_data(initial_data)
-            .build();
+        let cache_ci = vk::PipelineCacheCreateInfo::default()
+            .initial_data(initial_data);
         unsafe { self.device.create_pipeline_cache(&cache_ci, None) }
     }
 

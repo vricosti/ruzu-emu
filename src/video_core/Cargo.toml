@@ -14,7 +14,6 @@ gl.workspace = true
 log.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
-vulkano.workspace = true
 ash.workspace = true
 vk-mem.workspace = true
 raw-window-handle.workspace = true

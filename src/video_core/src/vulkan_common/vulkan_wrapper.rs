@@ -73,11 +73,12 @@ fn set_object_name_with(
     let Some(set_name) = set_name else {
         return Ok(());
     };
-    let name_info = vk::DebugUtilsObjectNameInfoEXT::builder()
-        .object_type(object_type)
-        .object_handle(object_handle)
-        .object_name(name);
-    check(unsafe { set_name(device, &*name_info) })
+    // ash 0.38 only offers the typed `object_handle<T: Handle>` setter; the
+    // upstream helper receives the raw type/handle pair, so fill the fields.
+    let mut name_info = vk::DebugUtilsObjectNameInfoEXT::default().object_name(name);
+    name_info.object_type = object_type;
+    name_info.object_handle = object_handle;
+    check(unsafe { set_name(device, &name_info) })
 }
 
 /// Rust counterpart of upstream's file-local `SetObjectName` helper.
@@ -222,7 +223,7 @@ pub fn sort_physical_devices(devices: &mut Vec<vk::PhysicalDevice>, instance: &a
 fn enumerate_physical_device_tool_properties(
     get_properties: Option<vk::PFN_vkGetPhysicalDeviceToolProperties>,
     physical_device: vk::PhysicalDevice,
-) -> Vec<vk::PhysicalDeviceToolProperties> {
+) -> Vec<vk::PhysicalDeviceToolProperties<'static>> {
     let Some(get_properties) = get_properties else {
         return Vec::new();
     };
@@ -243,7 +244,7 @@ pub fn get_physical_device_tool_properties(
     entry: &ash::Entry,
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
-) -> Vec<vk::PhysicalDeviceToolProperties> {
+) -> Vec<vk::PhysicalDeviceToolProperties<'static>> {
     let name =
         unsafe { CStr::from_bytes_with_nul_unchecked(b"vkGetPhysicalDeviceToolProperties\0") };
     let function = unsafe { entry.get_instance_proc_addr(instance.handle(), name.as_ptr()) }.map(
@@ -261,14 +262,14 @@ pub fn get_physical_device_tool_properties(
 // Instance wrapper — thin wrapper around ash::Instance
 // ---------------------------------------------------------------------------
 
-fn make_application_info(application_name: &CStr) -> vk::ApplicationInfo {
-    vk::ApplicationInfo::builder()
+fn make_application_info(application_name: &CStr) -> vk::ApplicationInfo<'_> {
+    vk::ApplicationInfo::default()
         .application_name(application_name)
         .application_version(vk::make_api_version(0, 1, 3, 0))
         .engine_name(application_name)
         .engine_version(vk::make_api_version(0, 1, 3, 0))
         .api_version(vk::API_VERSION_1_3)
-        .build()
+        
 }
 
 /// RAII wrapper around an `ash::Instance`.
@@ -297,12 +298,11 @@ impl Instance {
         let flags = vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
         #[cfg(not(target_os = "macos"))]
         let flags = vk::InstanceCreateFlags::empty();
-        let create_info = vk::InstanceCreateInfo::builder()
+        let create_info = vk::InstanceCreateInfo::default()
             .application_info(&application_info)
             .enabled_layer_names(layers)
             .enabled_extension_names(extensions)
-            .flags(flags)
-            .build();
+            .flags(flags);
 
         let instance = unsafe {
             entry
@@ -403,7 +403,7 @@ impl Drop for LogicalDevice {
 ///
 /// Port of `vk::AvailableVersion` from `vulkan_wrapper.cpp`.
 pub fn available_version(entry: &ash::Entry) -> u32 {
-    match entry.try_enumerate_instance_version() {
+    match unsafe { entry.try_enumerate_instance_version() } {
         Ok(Some(version)) => version,
         Ok(None) => vk::API_VERSION_1_0,
         Err(e) => {
@@ -426,14 +426,14 @@ pub fn available_version(entry: &ash::Entry) -> u32 {
 pub fn enumerate_instance_extension_properties(
     entry: &ash::Entry,
 ) -> Option<Vec<vk::ExtensionProperties>> {
-    entry.enumerate_instance_extension_properties(None).ok()
+    unsafe { entry.enumerate_instance_extension_properties(None) }.ok()
 }
 
 /// Enumerates instance layer properties.
 ///
 /// Port of `vk::EnumerateInstanceLayerProperties`.
 pub fn enumerate_instance_layer_properties(entry: &ash::Entry) -> Option<Vec<vk::LayerProperties>> {
-    entry.enumerate_instance_layer_properties().ok()
+    unsafe { entry.enumerate_instance_layer_properties() }.ok()
 }
 
 /// Port of `vk::GetDriverName`.

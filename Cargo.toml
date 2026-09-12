@@ -48,9 +48,8 @@ clap = { version = "4", features = ["derive"] }
 # hosts without a system SDL3 development package.
 sdl3 = { version = "=0.18.4", default-features = false, features = ["build-from-source-static", "raw-window-handle"] }
 sdl3-sys = { version = "=0.6.8", default-features = false, features = ["build-from-source-static"] }
-ash = "0.37"
-vk-mem = "0.3"
-vulkano = "0.34"
+ash = "0.38"
+vk-mem = "0.4"
 raw-window-handle = "0.6"
 libc = "0.2"
 

@@ -331,11 +331,10 @@ impl Image {
         {
             return true;
         }
-        let create_info = vk::BufferCreateInfo::builder()
+        let create_info = vk::BufferCreateInfo::default()
             .size(required_size.max(1))
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = match runtime
             .memory_allocator()
             .create_buffer(&create_info, MemoryUsage::DeviceLocal)
@@ -1037,7 +1036,7 @@ impl Image {
                     .scheduler()
                     .request_outside_render_pass_operation_context();
                 runtime.scheduler().record(move |cmd| unsafe {
-                    let init_barrier = vk::ImageMemoryBarrier::builder()
+                    let init_barrier = vk::ImageMemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::empty())
                         .dst_access_mask(attachment_access)
                         .old_layout(vk::ImageLayout::UNDEFINED)
@@ -1051,8 +1050,7 @@ impl Image {
                             level_count: vk::REMAINING_MIP_LEVELS,
                             base_array_layer: 0,
                             layer_count: vk::REMAINING_ARRAY_LAYERS,
-                        })
-                        .build();
+                        });
                     device.cmd_pipeline_barrier(
                         cmd,
                         vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -1122,7 +1120,7 @@ impl Image {
                     .scheduler()
                     .request_outside_render_pass_operation_context();
                 runtime.scheduler().record(move |cmd| unsafe {
-                    let read_barrier = vk::ImageMemoryBarrier::builder()
+                    let read_barrier = vk::ImageMemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                         .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                         .old_layout(vk::ImageLayout::GENERAL)
@@ -1136,8 +1134,7 @@ impl Image {
                             level_count: vk::REMAINING_MIP_LEVELS,
                             base_array_layer: 0,
                             layer_count: vk::REMAINING_ARRAY_LAYERS,
-                        })
-                        .build();
+                        });
                     device.cmd_pipeline_barrier(
                         cmd,
                         PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
@@ -1158,13 +1155,12 @@ impl Image {
                         );
                     }
 
-                    let memory_write_barrier = vk::MemoryBarrier::builder()
+                    let memory_write_barrier = vk::MemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                         .dst_access_mask(
                             vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-                        )
-                        .build();
-                    let image_write_barrier = vk::ImageMemoryBarrier::builder()
+                        );
+                    let image_write_barrier = vk::ImageMemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::empty())
                         .dst_access_mask(vk::AccessFlags::MEMORY_WRITE)
                         .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -1178,8 +1174,7 @@ impl Image {
                             level_count: vk::REMAINING_MIP_LEVELS,
                             base_array_layer: 0,
                             layer_count: vk::REMAINING_ARRAY_LAYERS,
-                        })
-                        .build();
+                        });
                     device.cmd_pipeline_barrier(
                         cmd,
                         vk::PipelineStageFlags::TRANSFER,
@@ -1210,7 +1205,7 @@ impl Image {
         let scheduler = runtime.scheduler();
         scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmd| unsafe {
-            let read_barrier = vk::ImageMemoryBarrier::builder()
+            let read_barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                 .old_layout(vk::ImageLayout::GENERAL)
@@ -1224,8 +1219,7 @@ impl Image {
                     level_count: vk::REMAINING_MIP_LEVELS,
                     base_array_layer: 0,
                     layer_count: vk::REMAINING_ARRAY_LAYERS,
-                })
-                .build();
+                });
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -1246,11 +1240,10 @@ impl Image {
                 );
             }
 
-            let memory_write_barrier = vk::MemoryBarrier::builder()
+            let memory_write_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .build();
-            let image_write_barrier = vk::ImageMemoryBarrier::builder()
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            let image_write_barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::MEMORY_WRITE)
                 .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -1264,8 +1257,7 @@ impl Image {
                     level_count: vk::REMAINING_MIP_LEVELS,
                     base_array_layer: 0,
                     layer_count: vk::REMAINING_ARRAY_LAYERS,
-                })
-                .build();
+                });
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TRANSFER,
@@ -1356,7 +1348,7 @@ impl ImageView {
     ) -> Result<vk::ImageView, vk::Result> {
         let (view_type, subresource_range) =
             aux_image_view_params(self.base(), aspect_mask, texture_type);
-        let view_info = vk::ImageViewCreateInfo::builder()
+        let view_info = vk::ImageViewCreateInfo::default()
             .image(self.image_handle)
             .view_type(view_type)
             .format(format)
@@ -1366,8 +1358,7 @@ impl ImageView {
                 b: vk::ComponentSwizzle::IDENTITY,
                 a: vk::ComponentSwizzle::IDENTITY,
             })
-            .subresource_range(subresource_range)
-            .build();
+            .subresource_range(subresource_range);
         unsafe { self.device.create_image_view(&view_info, None) }
     }
 
@@ -1702,13 +1693,12 @@ impl Framebuffer {
             num_resolve_shadows += 1;
         }
 
-        let framebuffer_info = vk::FramebufferCreateInfo::builder()
+        let framebuffer_info = vk::FramebufferCreateInfo::default()
             .render_pass(render_pass)
             .attachments(&attachments)
             .width(render_area.width)
             .height(render_area.height)
-            .layers(layers)
-            .build();
+            .layers(layers);
         let framebuffer = unsafe { runtime.device().create_framebuffer(&framebuffer_info, None) }?;
         if runtime.vulkan_device().has_debugging_tool_attached() {
             let name = crate::texture_cache::formatter::render_targets_name(key);
@@ -2026,25 +2016,22 @@ impl CachedSampler {
         } else {
             self.border_color
         };
-        let mut border_ci = vk::SamplerCustomBorderColorCreateInfoEXT::builder()
+        let mut border_ci = vk::SamplerCustomBorderColorCreateInfoEXT::default()
             .custom_border_color(vk::ClearColorValue { float32: color })
-            .format(vk::Format::UNDEFINED)
-            .build();
-        let mut mapping_ci = vk::SamplerBorderColorComponentMappingCreateInfoEXT::builder()
+            .format(vk::Format::UNDEFINED);
+        let mut mapping_ci = vk::SamplerBorderColorComponentMappingCreateInfoEXT::default()
             .components(vk::ComponentMapping {
                 r: key.swizzle[0],
                 g: key.swizzle[1],
                 b: key.swizzle[2],
                 a: key.swizzle[3],
             })
-            .srgb(false)
-            .build();
-        let mut reduction_ci = vk::SamplerReductionModeCreateInfo::builder()
-            .reduction_mode(self.reduction_mode)
-            .build();
+            .srgb(false);
+        let mut reduction_ci = vk::SamplerReductionModeCreateInfo::default()
+            .reduction_mode(self.reduction_mode);
 
         let base = &self.base;
-        let mut create_info = vk::SamplerCreateInfo::builder()
+        let mut create_info = vk::SamplerCreateInfo::default()
             .mag_filter(base.mag_filter)
             .min_filter(base.min_filter)
             .mipmap_mode(base.mipmap_mode)
@@ -2090,7 +2077,7 @@ impl CachedSampler {
             .device
             .as_ref()
             .expect("CachedSampler requires a device");
-        let handle = unsafe { device.create_sampler(&create_info.build(), None)? };
+        let handle = unsafe { device.create_sampler(&create_info, None)? };
         self.variants.borrow_mut().push((key, handle));
         Ok(handle)
     }
@@ -2588,7 +2575,7 @@ impl TextureCacheRuntime {
         let scheduler = self.scheduler();
         scheduler.request_outside_render_pass_operation_context();
         scheduler.record(move |cmd| unsafe {
-            let barrier = vk::ImageMemoryBarrier::builder()
+            let barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
                 .old_layout(vk::ImageLayout::UNDEFINED)
@@ -2602,8 +2589,7 @@ impl TextureCacheRuntime {
                     level_count: vk::REMAINING_MIP_LEVELS,
                     base_array_layer: 0,
                     layer_count: vk::REMAINING_ARRAY_LAYERS,
-                })
-                .build();
+                });
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -2727,7 +2713,7 @@ impl TextureCacheRuntime {
         }
 
         let new_size = needed_size.checked_next_power_of_two()? as vk::DeviceSize;
-        let create_info = vk::BufferCreateInfo::builder()
+        let create_info = vk::BufferCreateInfo::default()
             .size(new_size)
             .usage(
                 vk::BufferUsageFlags::TRANSFER_SRC
@@ -2735,8 +2721,7 @@ impl TextureCacheRuntime {
                     | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
                     | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
             )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = match self
             .memory_allocator()
             .create_buffer(&create_info, MemoryUsage::DeviceLocal)
@@ -2786,7 +2771,7 @@ impl TextureCacheRuntime {
             self.pending_resolve_shadows.push((tick, old));
         }
 
-        let image_info = vk::ImageCreateInfo::builder()
+        let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D {
@@ -2800,13 +2785,12 @@ impl TextureCacheRuntime {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(shadow_usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .build();
+            .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = self
             .memory_allocator()
             .create_image(&image_info)
             .map_err(|error| error.result)?;
-        let view_info = vk::ImageViewCreateInfo::builder()
+        let view_info = vk::ImageViewCreateInfo::default()
             .image(image.handle())
             .view_type(if layers > 1 {
                 vk::ImageViewType::TYPE_2D_ARRAY
@@ -2820,8 +2804,7 @@ impl TextureCacheRuntime {
                 level_count: 1,
                 base_array_layer: 0,
                 layer_count: layers,
-            })
-            .build();
+            });
         let view = unsafe { self.device.create_image_view(&view_info, None)? };
         self.resolve_shadows.insert(
             msaa_image,
@@ -3029,15 +3012,13 @@ impl TextureCacheRuntime {
                 dst_range.add_layers(copy.image_subresource);
             }
 
-            let read_barrier = vk::MemoryBarrier::builder()
+            let read_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
-                .build();
-            let write_barrier = vk::MemoryBarrier::builder()
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+            let write_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .build();
-            let pre_barriers = [vk::ImageMemoryBarrier::builder()
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            let pre_barriers = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(
                     vk::AccessFlags::SHADER_WRITE
                         | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
@@ -3051,8 +3032,8 @@ impl TextureCacheRuntime {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(src_image)
                 .subresource_range(src_range.subresource_range(src_aspect))
-                .build()];
-            let middle_in_barriers = [vk::ImageMemoryBarrier::builder()
+                ];
+            let middle_in_barriers = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::empty())
                 .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -3061,8 +3042,8 @@ impl TextureCacheRuntime {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(src_image)
                 .subresource_range(src_range.subresource_range(src_aspect))
-                .build()];
-            let middle_out_barriers = [vk::ImageMemoryBarrier::builder()
+                ];
+            let middle_out_barriers = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(
                     vk::AccessFlags::SHADER_WRITE
                         | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
@@ -3076,8 +3057,8 @@ impl TextureCacheRuntime {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(dst_image)
                 .subresource_range(dst_range.subresource_range(dst_aspect))
-                .build()];
-            let post_barriers = [vk::ImageMemoryBarrier::builder()
+                ];
+            let post_barriers = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(
                     vk::AccessFlags::SHADER_READ
@@ -3095,7 +3076,7 @@ impl TextureCacheRuntime {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(dst_image)
                 .subresource_range(dst_range.subresource_range(dst_aspect))
-                .build()];
+                ];
 
             device.cmd_pipeline_barrier(
                 cmd,
@@ -3374,7 +3355,7 @@ impl TextureCacheRuntime {
                 layer_count: vk::REMAINING_ARRAY_LAYERS,
             };
             let read_barriers = [
-                vk::ImageMemoryBarrier::builder()
+                vk::ImageMemoryBarrier::default()
                     .src_access_mask(
                         vk::AccessFlags::SHADER_WRITE
                             | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
@@ -3386,9 +3367,8 @@ impl TextureCacheRuntime {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(src_image)
-                    .subresource_range(full_range)
-                    .build(),
-                vk::ImageMemoryBarrier::builder()
+                    .subresource_range(full_range),
+                vk::ImageMemoryBarrier::default()
                     .src_access_mask(
                         vk::AccessFlags::SHADER_WRITE
                             | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
@@ -3400,10 +3380,9 @@ impl TextureCacheRuntime {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(dst_image)
-                    .subresource_range(full_range)
-                    .build(),
+                    .subresource_range(full_range),
             ];
-            let write_barrier = vk::ImageMemoryBarrier::builder()
+            let write_barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(
                     vk::AccessFlags::SHADER_READ
@@ -3418,8 +3397,7 @@ impl TextureCacheRuntime {
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(dst_image)
-                .subresource_range(full_range)
-                .build();
+                .subresource_range(full_range);
             device.cmd_pipeline_barrier(
                 cmd,
                 PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
@@ -3670,10 +3648,9 @@ impl TextureCacheRuntime {
             return Ok(image.storage_image_views[index]);
         }
 
-        let mut usage_info = vk::ImageViewUsageCreateInfo::builder()
-            .usage(vk::ImageUsageFlags::STORAGE)
-            .build();
-        let view_info = vk::ImageViewCreateInfo::builder()
+        let mut usage_info = vk::ImageViewUsageCreateInfo::default()
+            .usage(vk::ImageUsageFlags::STORAGE);
+        let view_info = vk::ImageViewCreateInfo::default()
             .push_next(&mut usage_info)
             .image(image.handle())
             .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
@@ -3690,8 +3667,7 @@ impl TextureCacheRuntime {
                 level_count: 1,
                 base_array_layer: 0,
                 layer_count: vk::REMAINING_ARRAY_LAYERS,
-            })
-            .build();
+            });
         let view = unsafe { self.device.create_image_view(&view_info, None)? };
         image.storage_image_views[index] = view;
         Ok(view)
@@ -3781,7 +3757,7 @@ impl TextureCacheRuntime {
                         layer_count: vk::REMAINING_ARRAY_LAYERS,
                     };
                     let pre_barriers = [
-                        vk::ImageMemoryBarrier::builder()
+                        vk::ImageMemoryBarrier::default()
                             .src_access_mask(attachment_write)
                             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                             .old_layout(vk::ImageLayout::GENERAL)
@@ -3789,9 +3765,8 @@ impl TextureCacheRuntime {
                             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .image(shadow_image)
-                            .subresource_range(full_range)
-                            .build(),
-                        vk::ImageMemoryBarrier::builder()
+                            .subresource_range(full_range),
+                        vk::ImageMemoryBarrier::default()
                             .src_access_mask(
                                 vk::AccessFlags::SHADER_WRITE
                                     | attachment_write
@@ -3803,19 +3778,17 @@ impl TextureCacheRuntime {
                             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .image(dst_image)
-                            .subresource_range(full_range)
-                            .build(),
+                            .subresource_range(full_range),
                     ];
                     let post_barriers = [
-                        vk::ImageMemoryBarrier::builder()
+                        vk::ImageMemoryBarrier::default()
                             .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                             .new_layout(vk::ImageLayout::GENERAL)
                             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .image(shadow_image)
-                            .subresource_range(full_range)
-                            .build(),
-                        vk::ImageMemoryBarrier::builder()
+                            .subresource_range(full_range),
+                        vk::ImageMemoryBarrier::default()
                             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                             .dst_access_mask(
                                 vk::AccessFlags::SHADER_READ
@@ -3828,8 +3801,7 @@ impl TextureCacheRuntime {
                             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                             .image(dst_image)
-                            .subresource_range(full_range)
-                            .build(),
+                            .subresource_range(full_range),
                     ];
                     device.cmd_pipeline_barrier(
                         cmd,
@@ -4012,7 +3984,7 @@ impl TextureCacheRuntime {
                 layer_count: vk::REMAINING_ARRAY_LAYERS,
             };
             let read_barriers = [
-                vk::ImageMemoryBarrier::builder()
+                vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                     .old_layout(vk::ImageLayout::GENERAL)
@@ -4020,9 +3992,8 @@ impl TextureCacheRuntime {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(src_image)
-                    .subresource_range(subresource_range)
-                    .build(),
-                vk::ImageMemoryBarrier::builder()
+                    .subresource_range(subresource_range),
+                vk::ImageMemoryBarrier::default()
                     .src_access_mask(
                         vk::AccessFlags::SHADER_WRITE
                             | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
@@ -4034,11 +4005,10 @@ impl TextureCacheRuntime {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(dst_image)
-                    .subresource_range(subresource_range)
-                    .build(),
+                    .subresource_range(subresource_range),
             ];
             let write_barriers = [
-                vk::ImageMemoryBarrier::builder()
+                vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::empty())
                     .dst_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ)
                     .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -4046,9 +4016,8 @@ impl TextureCacheRuntime {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(src_image)
-                    .subresource_range(subresource_range)
-                    .build(),
-                vk::ImageMemoryBarrier::builder()
+                    .subresource_range(subresource_range),
+                vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ)
                     .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -4056,8 +4025,7 @@ impl TextureCacheRuntime {
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(dst_image)
-                    .subresource_range(subresource_range)
-                    .build(),
+                    .subresource_range(subresource_range),
             ];
             device.cmd_pipeline_barrier(
                 cmd,
@@ -4098,9 +4066,8 @@ impl TextureCacheRuntime {
                 .is_storage_image_multisample_supported(),
         );
         let view_formats = self.view_formats[info.format as usize].clone();
-        let mut format_list = vk::ImageFormatListCreateInfo::builder()
-            .view_formats(&view_formats)
-            .build();
+        let mut format_list = vk::ImageFormatListCreateInfo::default()
+            .view_formats(&view_formats);
         let has_storage_compatible_view = view_formats.iter().any(|&view_format| {
             self.vulkan_device().is_format_supported(
                 view_format,
@@ -4265,11 +4232,10 @@ impl TextureCacheRuntime {
             if let Some(layer_count) = layer_count {
                 range.layer_count = layer_count;
             }
-            let mut usage_info = vk::ImageViewUsageCreateInfo::builder().usage(usage).build();
-            let mut astc_decode_mode = vk::ImageViewASTCDecodeModeEXT::builder()
-                .decode_mode(vk::Format::R8G8B8A8_UNORM)
-                .build();
-            let mut view_info_builder = vk::ImageViewCreateInfo::builder()
+            let mut usage_info = vk::ImageViewUsageCreateInfo::default().usage(usage);
+            let mut astc_decode_mode = vk::ImageViewASTCDecodeModeEXT::default()
+                .decode_mode(vk::Format::R8G8B8A8_UNORM);
+            let mut view_info_builder = vk::ImageViewCreateInfo::default()
                 .push_next(&mut usage_info)
                 .image(image.handle())
                 .view_type(image_view_type_from_texture_type(texture_type))
@@ -4281,7 +4247,7 @@ impl TextureCacheRuntime {
             {
                 view_info_builder = view_info_builder.push_next(&mut astc_decode_mode);
             }
-            let view_info = view_info_builder.build();
+            let view_info = view_info_builder;
             let view = unsafe { self.device.create_image_view(&view_info, None)? };
             self.vulkan_device().set_image_view_name(view, &view_name);
             Ok(view)
@@ -4409,9 +4375,8 @@ impl TextureCacheRuntime {
             return true;
         }
         let mut properties3 = vk::FormatProperties3::default();
-        let mut properties2 = vk::FormatProperties2::builder()
-            .push_next(&mut properties3)
-            .build();
+        let mut properties2 = vk::FormatProperties2::default()
+            .push_next(&mut properties3);
         unsafe {
             self.instance.get_physical_device_format_properties2(
                 self.physical_device,
@@ -4430,13 +4395,12 @@ impl TextureCacheRuntime {
         attachments: &[vk::ImageView],
         extent: vk::Extent2D,
     ) -> Result<vk::Framebuffer, vk::Result> {
-        let fb_info = vk::FramebufferCreateInfo::builder()
+        let fb_info = vk::FramebufferCreateInfo::default()
             .render_pass(render_pass)
             .attachments(attachments)
             .width(extent.width)
             .height(extent.height)
-            .layers(1)
-            .build();
+            .layers(1);
         unsafe { self.device.create_framebuffer(&fb_info, None) }
     }
 
@@ -4454,7 +4418,7 @@ impl TextureCacheRuntime {
         format: vk::Format,
         aspect_mask: vk::ImageAspectFlags,
     ) -> Result<vk::ImageView, vk::Result> {
-        let view_info = vk::ImageViewCreateInfo::builder()
+        let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(format)
@@ -4470,8 +4434,7 @@ impl TextureCacheRuntime {
                 level_count: 1,
                 base_array_layer: 0,
                 layer_count: 1,
-            })
-            .build();
+            });
         unsafe { self.device.create_image_view(&view_info, None) }
     }
 
@@ -6294,13 +6257,12 @@ impl TextureCache {
             attachments.push(dv);
         }
 
-        let fb_info = vk::FramebufferCreateInfo::builder()
+        let fb_info = vk::FramebufferCreateInfo::default()
             .render_pass(render_pass)
             .attachments(&attachments)
             .width(width)
             .height(height)
-            .layers(1)
-            .build();
+            .layers(1);
 
         unsafe {
             self.base
@@ -6386,7 +6348,7 @@ unsafe fn cmd_transition_layout(
         ),
     };
 
-    let barrier = vk::ImageMemoryBarrier::builder()
+    let barrier = vk::ImageMemoryBarrier::default()
         .old_layout(old_layout)
         .new_layout(new_layout)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -6400,8 +6362,7 @@ unsafe fn cmd_transition_layout(
             layer_count: 1,
         })
         .src_access_mask(src_access)
-        .dst_access_mask(dst_access)
-        .build();
+        .dst_access_mask(dst_access);
 
     device.cmd_pipeline_barrier(
         cmd,
@@ -6488,8 +6449,8 @@ fn make_image_copy(copy: &ImageCopy, aspect: vk::ImageAspectFlags) -> vk::ImageC
 }
 
 struct CopyImageBarriers {
-    pre: [vk::ImageMemoryBarrier; 2],
-    post: [vk::ImageMemoryBarrier; 2],
+    pre: [vk::ImageMemoryBarrier<'static>; 2],
+    post: [vk::ImageMemoryBarrier<'static>; 2],
 }
 
 fn make_copy_image_barriers(
@@ -6510,7 +6471,7 @@ fn make_copy_image_barriers(
         | vk::AccessFlags::TRANSFER_WRITE;
     CopyImageBarriers {
         pre: [
-            vk::ImageMemoryBarrier::builder()
+            vk::ImageMemoryBarrier::default()
                 .src_access_mask(write_access)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                 .old_layout(vk::ImageLayout::GENERAL)
@@ -6518,9 +6479,8 @@ fn make_copy_image_barriers(
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(src_image)
-                .subresource_range(src_range.subresource_range(aspect))
-                .build(),
-            vk::ImageMemoryBarrier::builder()
+                .subresource_range(src_range.subresource_range(aspect)),
+            vk::ImageMemoryBarrier::default()
                 .src_access_mask(write_access)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .old_layout(vk::ImageLayout::GENERAL)
@@ -6528,11 +6488,10 @@ fn make_copy_image_barriers(
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(dst_image)
-                .subresource_range(dst_range.subresource_range(aspect))
-                .build(),
+                .subresource_range(dst_range.subresource_range(aspect)),
         ],
         post: [
-            vk::ImageMemoryBarrier::builder()
+            vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::empty())
                 .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -6540,9 +6499,8 @@ fn make_copy_image_barriers(
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(src_image)
-                .subresource_range(src_range.subresource_range(aspect))
-                .build(),
-            vk::ImageMemoryBarrier::builder()
+                .subresource_range(src_range.subresource_range(aspect)),
+            vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(
                     vk::AccessFlags::SHADER_READ
@@ -6559,8 +6517,7 @@ fn make_copy_image_barriers(
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(dst_image)
-                .subresource_range(dst_range.subresource_range(aspect))
-                .build(),
+                .subresource_range(dst_range.subresource_range(aspect)),
         ],
     }
 }
@@ -7054,9 +7011,8 @@ mod tests {
             vk::Format::A2B10G10R10_UNORM_PACK32,
             vk::Format::A8B8G8R8_UNORM_PACK32,
         ];
-        let mut format_list = vk::ImageFormatListCreateInfo::builder()
-            .view_formats(&formats)
-            .build();
+        let mut format_list = vk::ImageFormatListCreateInfo::default()
+            .view_formats(&formats);
         let mut image_info = vk::ImageCreateInfo::default();
         apply_image_format_list(&mut image_info, &mut format_list, &formats, true, false);
 
@@ -7076,9 +7032,8 @@ mod tests {
             vk::Format::A8B8G8R8_SRGB_PACK32,
             vk::Format::A8B8G8R8_UNORM_PACK32,
         ];
-        let mut format_list = vk::ImageFormatListCreateInfo::builder()
-            .view_formats(&formats)
-            .build();
+        let mut format_list = vk::ImageFormatListCreateInfo::default()
+            .view_formats(&formats);
         let mut image_info = vk::ImageCreateInfo::default();
         apply_image_format_list(&mut image_info, &mut format_list, &formats, false, true);
 
@@ -7090,9 +7045,8 @@ mod tests {
 
         // A single view format keeps the create info untouched.
         let single = [vk::Format::A8B8G8R8_SRGB_PACK32];
-        let mut single_list = vk::ImageFormatListCreateInfo::builder()
-            .view_formats(&single)
-            .build();
+        let mut single_list = vk::ImageFormatListCreateInfo::default()
+            .view_formats(&single);
         let mut single_info = vk::ImageCreateInfo::default();
         apply_image_format_list(&mut single_info, &mut single_list, &single, true, true);
         assert!(single_info.flags.is_empty());
@@ -7772,7 +7726,7 @@ fn transform_buffer_image_copies(
     aspect: vk::ImageAspectFlags,
 ) -> Vec<vk::BufferImageCopy> {
     let make = |copy: &BufferImageCopy, aspect_mask: vk::ImageAspectFlags| {
-        vk::BufferImageCopy::builder()
+        vk::BufferImageCopy::default()
             .buffer_offset(base_offset + copy.buffer_offset as vk::DeviceSize)
             .buffer_row_length(copy.buffer_row_length)
             .buffer_image_height(copy.buffer_image_height)
@@ -7792,7 +7746,7 @@ fn transform_buffer_image_copies(
                 height: copy.image_extent.height,
                 depth: copy.image_extent.depth,
             })
-            .build()
+            
     };
     if aspect == (vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL) {
         let mut result = Vec::with_capacity(copies.len() * 2);
@@ -7832,7 +7786,7 @@ fn copy_buffer_to_image(
         range.add_layers(copy.image_subresource);
     }
     let subresource_range = range.subresource_range(aspect_mask);
-    let read_barrier = vk::ImageMemoryBarrier::builder()
+    let read_barrier = vk::ImageMemoryBarrier::default()
         .src_access_mask(write_access)
         .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
         .old_layout(if is_initialized {
@@ -7844,9 +7798,8 @@ fn copy_buffer_to_image(
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
-        .subresource_range(subresource_range)
-        .build();
-    let write_barrier = vk::ImageMemoryBarrier::builder()
+        .subresource_range(subresource_range);
+    let write_barrier = vk::ImageMemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
         .dst_access_mask(write_access | read_access)
         .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -7854,8 +7807,7 @@ fn copy_buffer_to_image(
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
-        .subresource_range(subresource_range)
-        .build();
+        .subresource_range(subresource_range);
     unsafe {
         device.cmd_pipeline_barrier(
             cmd,
@@ -8073,7 +8025,7 @@ fn make_image_create_info(
     info: &ImageInfo,
     format_info: maxwell_to_vk::FormatInfo,
     storage_image_multisample_supported: bool,
-) -> vk::ImageCreateInfo {
+) -> vk::ImageCreateInfo<'static> {
     let mut flags = vk::ImageCreateFlags::empty();
     if info.image_type == ImageType::E2D
         && info.resources.layers >= 6
@@ -8087,7 +8039,7 @@ fn make_image_create_info(
     let (samples_x, samples_y) =
         crate::texture_cache::samples_helper::samples_log2(info.num_samples as i32);
     let allow_storage = info.num_samples == 1 || storage_image_multisample_supported;
-    vk::ImageCreateInfo::builder()
+    vk::ImageCreateInfo::default()
         .flags(flags)
         .image_type(convert_image_type(info.image_type))
         .format(format_info.format)
@@ -8103,7 +8055,7 @@ fn make_image_create_info(
         .usage(image_usage_flags(format_info, info.format, allow_storage))
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-        .build()
+        
 }
 
 /// Port of `MakeMsaaScratchImageCreateInfo`: single-sample image sharing the
@@ -8112,7 +8064,7 @@ fn make_msaa_scratch_image_create_info(
     runtime: &TextureCacheRuntime,
     info: &ImageInfo,
     usage: vk::ImageUsageFlags,
-) -> vk::ImageCreateInfo {
+) -> vk::ImageCreateInfo<'static> {
     let mut temp_info = info.clone();
     temp_info.num_samples = 1;
     let format_info = runtime.surface_format_info(temp_info.format, false);

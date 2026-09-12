@@ -352,22 +352,22 @@ impl BlitScreen {
             ScalingFilter::Bicubic => filters::make_bicubic(
                 device,
                 self.swapchain_view_format,
-                filters::CubicFilterWeights::CatmullRom,
+                filters::CubicFilterWeights::CATMULL_ROM,
             ),
             ScalingFilter::ZeroTangent => filters::make_bicubic(
                 device,
                 self.swapchain_view_format,
-                filters::CubicFilterWeights::ZeroTangentCardinal,
+                filters::CubicFilterWeights::ZERO_TANGENT_CARDINAL,
             ),
             ScalingFilter::BSpline => filters::make_bicubic(
                 device,
                 self.swapchain_view_format,
-                filters::CubicFilterWeights::BSpline,
+                filters::CubicFilterWeights::B_SPLINE,
             ),
             ScalingFilter::Mitchell => filters::make_bicubic(
                 device,
                 self.swapchain_view_format,
-                filters::CubicFilterWeights::MitchellNetravali,
+                filters::CubicFilterWeights::MITCHELL_NETRAVALI,
             ),
             ScalingFilter::Spline1 => filters::make_spline1(device, self.swapchain_view_format),
             ScalingFilter::Gaussian => filters::make_gaussian(device, self.swapchain_view_format),
@@ -414,13 +414,12 @@ impl BlitScreen {
         render_pass: vk::RenderPass,
     ) -> vk::Framebuffer {
         let attachments = [image_view];
-        let fb_ci = vk::FramebufferCreateInfo::builder()
+        let fb_ci = vk::FramebufferCreateInfo::default()
             .render_pass(render_pass)
             .attachments(&attachments)
             .width(extent.width)
             .height(extent.height)
-            .layers(1)
-            .build();
+            .layers(1);
 
         unsafe {
             device

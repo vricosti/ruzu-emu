@@ -297,13 +297,12 @@ impl PresentManager {
         let effective_count = image_count.min(MAX_FRAMES_IN_FLIGHT);
 
         // Create command pool
-        let pool_ci = vk::CommandPoolCreateInfo::builder()
+        let pool_ci = vk::CommandPoolCreateInfo::default()
             .flags(
                 vk::CommandPoolCreateFlags::TRANSIENT
                     | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
             )
-            .queue_family_index(graphics_family)
-            .build();
+            .queue_family_index(graphics_family);
         let cmdpool = unsafe {
             device
                 .create_command_pool(&pool_ci, None)
@@ -311,11 +310,10 @@ impl PresentManager {
         };
 
         // Allocate command buffers
-        let alloc_info = vk::CommandBufferAllocateInfo::builder()
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(cmdpool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(effective_count as u32)
-            .build();
+            .command_buffer_count(effective_count as u32);
         let cmdbufs = unsafe {
             device
                 .allocate_command_buffers(&alloc_info)
@@ -326,10 +324,9 @@ impl PresentManager {
         let mut frames = Vec::with_capacity(effective_count);
         let mut free_queue = VecDeque::with_capacity(effective_count);
 
-        let semaphore_ci = vk::SemaphoreCreateInfo::builder().build();
-        let fence_ci = vk::FenceCreateInfo::builder()
-            .flags(vk::FenceCreateFlags::SIGNALED)
-            .build();
+        let semaphore_ci = vk::SemaphoreCreateInfo::default();
+        let fence_ci = vk::FenceCreateInfo::default()
+            .flags(vk::FenceCreateFlags::SIGNALED);
 
         for i in 0..effective_count {
             let render_ready = unsafe {
@@ -515,7 +512,7 @@ impl PresentManager {
         };
         let frame_image_format = self.ctx.swapchain.lock().unwrap().get_image_format();
 
-        let image_ci = vk::ImageCreateInfo::builder()
+        let image_ci = vk::ImageCreateInfo::default()
             .flags(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
             .image_type(vk::ImageType::TYPE_2D)
             .format(frame_image_format)
@@ -536,8 +533,7 @@ impl PresentManager {
                     | storage_usage,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .build();
+            .initial_layout(vk::ImageLayout::UNDEFINED);
 
         let image = unsafe { self.memory_allocator.as_ref() }
             .create_image(&image_ci)
@@ -545,7 +541,7 @@ impl PresentManager {
         frame.set_image_allocation(image);
 
         // Create image view
-        let view_ci = vk::ImageViewCreateInfo::builder()
+        let view_ci = vk::ImageViewCreateInfo::default()
             .image(frame.image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(image_view_format)
@@ -556,8 +552,7 @@ impl PresentManager {
                 level_count: 1,
                 base_array_layer: 0,
                 layer_count: 1,
-            })
-            .build();
+            });
 
         frame.image_view = unsafe {
             self.device
@@ -567,7 +562,7 @@ impl PresentManager {
 
         frame.storage_view = vk::ImageView::null();
         if self.storage_supported {
-            let storage_view_ci = vk::ImageViewCreateInfo::builder()
+            let storage_view_ci = vk::ImageViewCreateInfo::default()
                 .image(frame.image)
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .format(frame_image_format)
@@ -578,8 +573,7 @@ impl PresentManager {
                     level_count: 1,
                     base_array_layer: 0,
                     layer_count: 1,
-                })
-                .build();
+                });
             frame.storage_view = unsafe {
                 self.device
                     .create_image_view(&storage_view_ci, None)
@@ -589,13 +583,12 @@ impl PresentManager {
 
         // Create framebuffer
         let attachments = [frame.image_view];
-        let fb_ci = vk::FramebufferCreateInfo::builder()
+        let fb_ci = vk::FramebufferCreateInfo::default()
             .render_pass(render_pass)
             .attachments(&attachments)
             .width(width)
             .height(height)
-            .layers(1)
-            .build();
+            .layers(1);
 
         frame.framebuffer = unsafe {
             self.device
@@ -801,9 +794,8 @@ impl PresentThreadContext {
     ) {
         let cmdbuf = frame.cmdbuf;
 
-        let begin_info = vk::CommandBufferBeginInfo::builder()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
-            .build();
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
         unsafe {
             self.device
@@ -831,6 +823,7 @@ impl PresentThreadContext {
                     base_array_layer: 0,
                     layer_count: vk::REMAINING_ARRAY_LAYERS,
                 },
+                ..Default::default()
             },
             // Frame image: GENERAL -> TRANSFER_SRC_OPTIMAL
             vk::ImageMemoryBarrier {
@@ -850,6 +843,7 @@ impl PresentThreadContext {
                     base_array_layer: 0,
                     layer_count: vk::REMAINING_ARRAY_LAYERS,
                 },
+                ..Default::default()
             },
         ];
 
@@ -873,6 +867,7 @@ impl PresentThreadContext {
                     base_array_layer: 0,
                     layer_count: vk::REMAINING_ARRAY_LAYERS,
                 },
+                ..Default::default()
             },
             // Frame image: TRANSFER_SRC_OPTIMAL -> GENERAL
             vk::ImageMemoryBarrier {
@@ -892,6 +887,7 @@ impl PresentThreadContext {
                     base_array_layer: 0,
                     layer_count: vk::REMAINING_ARRAY_LAYERS,
                 },
+                ..Default::default()
             },
         ];
 
@@ -960,12 +956,11 @@ impl PresentThreadContext {
         let cmdbufs = [cmdbuf];
         let signal_semaphores = [render_semaphore];
 
-        let submit_info = vk::SubmitInfo::builder()
+        let submit_info = vk::SubmitInfo::default()
             .wait_semaphores(&wait_semaphores)
             .wait_dst_stage_mask(&wait_stages)
             .command_buffers(&cmdbufs)
-            .signal_semaphores(&signal_semaphores)
-            .build();
+            .signal_semaphores(&signal_semaphores);
 
         let submit_result = unsafe {
             let _submit_lock = self.submit_mutex.lock().unwrap();

@@ -72,8 +72,21 @@ pub fn system_version() -> Option<VirtualDir> {
 
     let file: VirtualFile = Arc::new(VectorVfsFile::new(data, "file".to_string(), None));
 
+    // Eden omits `/digest` when VERSION_DIGEST is empty (firmware 23.0.0).
+    let files = if api_version::VERSION_DIGEST.is_empty() {
+        vec![file]
+    } else {
+        let mut digest_data = vec![0u8; 0x40];
+        let digest_bytes = api_version::VERSION_DIGEST.as_bytes();
+        let digest_len = digest_bytes.len().min(0x40);
+        digest_data[..digest_len].copy_from_slice(&digest_bytes[..digest_len]);
+        let digest_file: VirtualFile =
+            Arc::new(VectorVfsFile::new(digest_data, "digest".to_string(), None));
+        vec![file, digest_file]
+    };
+
     Some(Arc::new(VectorVfsDirectory::new(
-        vec![file],
+        files,
         vec![],
         "data".to_string(),
         None,
@@ -88,14 +101,16 @@ mod tests {
     fn test_get_long_display_version() {
         let ver = get_long_display_version();
         assert!(ver.contains("NintendoSDK"));
-        assert!(ver.contains("12.1.0"));
+        assert!(ver.contains("23.0.0"));
     }
 
     #[test]
     fn test_system_version_archive_structure() {
         let dir = system_version().expect("system_version should return Some");
         assert_eq!(dir.get_name(), "data");
+        // Firmware 23.0.0 has an empty VERSION_DIGEST, so `/digest` is omitted.
         assert_eq!(dir.get_files().len(), 1);
+        assert_eq!(dir.get_files()[0].get_name(), "file");
     }
 
     #[test]
@@ -108,8 +123,8 @@ mod tests {
 
         let data = file.read_all_bytes();
         // Check version fields.
-        assert_eq!(data[0], 12); // HOS_VERSION_MAJOR
-        assert_eq!(data[1], 1); // HOS_VERSION_MINOR
+        assert_eq!(data[0], 23); // HOS_VERSION_MAJOR
+        assert_eq!(data[1], 0); // HOS_VERSION_MINOR
         assert_eq!(data[2], 0); // HOS_VERSION_MICRO
         assert_eq!(data[4], 1); // SDK_REVISION_MAJOR
         assert_eq!(data[5], 0); // SDK_REVISION_MINOR

@@ -1,5 +1,21 @@
 # Upstream parity notes
 
+## 2026-09-12 — firmware 23.0.0 vs eden e7a96c7907 (`[hle] Firmware 23.0.0`)
+
+### Intentional differences
+- `VERSION_DIGEST` is a Rust `&str` rather than `char[0x40]`. Empty string is the same check as `VERSION_DIGEST[0] == '\0'`; a non-empty digest is still copied into a 0x40-byte file.
+- `IFileSystem` is constructed as `IFileSystem::new(dir, size_getter)` (no `System&`); SizeGetter still uses `NandUser` as Eden's `SizeGetter::FromStorageId(fsc, NandUser)`.
+- `FSP_SRV` cmd 210 reuses the existing `SetCurrentProcess` handler, matching Eden's table alias.
+
+### Unintentional differences (to fix)
+- None in this slice.
+
+### Missing items
+- None. `GetInfo` Unknown37/38, AM Unknown240, PCTL 1459/1460, OpenDataFileSystemByCurrentProcess, applet CreateProcess range 1..=HOS_VERSION_MAJOR, and SystemVersion digest omission are present.
+
+### Binary layout verification
+- PASS: `PlayTimerRemainingTimeDisplayInfo` is 0x18 (`state` + 7 pad + two u64).
+
 ## 2026-09-11 — last_code_addr / ResolveIndexedProgram vs eden arm_dynarmic_{32,64} and 54cd5fb8eb
 
 ### Intentional differences

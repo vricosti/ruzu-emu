@@ -221,7 +221,12 @@ impl ILibraryAppletCreator {
             return None;
         }
 
-        let process = create_process(self.system, program_id, 14, 22)?;
+        let process = create_process(
+            self.system,
+            program_id,
+            1,
+            crate::hle::api_version::HOS_VERSION_MAJOR,
+        )?;
         let applet = Arc::new(Mutex::new(Applet::new(self.system, process, false)));
         let broker = Arc::new(AppletDataBroker::new());
 
@@ -530,8 +535,8 @@ mod tests {
                 .env(CHILD, "1").status().unwrap().success());
             return;
         }
-        type Field = fn(&mut common::settings::Values)
-            -> &mut dyn common::settings_setting::BasicSetting;
+        type Field =
+            fn(&mut common::settings::Values) -> &mut dyn common::settings_setting::BasicSetting;
         // Same Name/name pairs as upstream ShouldCreateGuestApplet.
         let fields: &[(AppletId, Field)] = &[
             (AppletId::Cabinet, |v| &mut v.cabinet_applet_mode),
@@ -539,7 +544,9 @@ mod tests {
             (AppletId::DataErase, |v| &mut v.data_erase_applet_mode),
             (AppletId::Error, |v| &mut v.error_applet_mode),
             (AppletId::NetConnect, |v| &mut v.net_connect_applet_mode),
-            (AppletId::ProfileSelect, |v| &mut v.player_select_applet_mode),
+            (AppletId::ProfileSelect, |v| {
+                &mut v.player_select_applet_mode
+            }),
             (AppletId::SoftwareKeyboard, |v| &mut v.swkbd_applet_mode),
             (AppletId::MiiEdit, |v| &mut v.mii_edit_applet_mode),
             (AppletId::Web, |v| &mut v.web_applet_mode),

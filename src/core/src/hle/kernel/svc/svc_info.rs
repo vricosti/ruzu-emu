@@ -347,6 +347,17 @@ fn get_info_impl(
             RESULT_SUCCESS
         }
 
+        InfoType::Unknown37 | InfoType::Unknown38 => {
+            log::warn!(
+                "(STUBBED) svc::GetInfo called, info_id={:#x}, info_sub_id={:#x}, handle={:#08x}",
+                info_id_type as u32,
+                info_sub_id,
+                handle
+            );
+            *result = 0;
+            RESULT_SUCCESS
+        }
+
         InfoType::MesosphereCurrentProcess => {
             if handle != INVALID_HANDLE {
                 return RESULT_INVALID_HANDLE;
@@ -551,6 +562,16 @@ mod tests {
             RESULT_SUCCESS
         );
         assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn unknown_37_and_38_return_zero() {
+        let system = test_system();
+        for info in [InfoType::Unknown37, InfoType::Unknown38] {
+            let mut result = u64::MAX;
+            assert_eq!(get_info(&system, &mut result, info, 0, 0), RESULT_SUCCESS);
+            assert_eq!(result, 0);
+        }
     }
 
     #[test]

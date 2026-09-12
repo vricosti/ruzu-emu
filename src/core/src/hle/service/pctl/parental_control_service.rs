@@ -19,24 +19,44 @@ mod suspension_event_tests {
 
     #[test]
     fn suspension_event_returns_stable_unsignaled_handle() {
-        let service = IParentalControlService::new(crate::core::SystemRef::null(), Capability::SYSTEM);
+        let service =
+            IParentalControlService::new(crate::core::SystemRef::null(), Capability::SYSTEM);
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         let readable = Arc::new(Mutex::new(KReadableEvent::new()));
         readable.lock().unwrap().initialize(1, 2);
-        service.request_suspension_event.attach_kernel_event(readable.clone(), process.clone());
+        service
+            .request_suspension_event
+            .attach_kernel_event(readable.clone(), process.clone());
         let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
         for _ in 0..2 {
             let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
             service.handlers[&1457].handler_callback.unwrap()(&service, &mut ctx);
-            assert!(matches!(ctx.outgoing_copy_objects.as_slice(), [KAutoObjectRef::ObjectId(2)]));
+            assert!(matches!(
+                ctx.outgoing_copy_objects.as_slice(),
+                [KAutoObjectRef::ObjectId(2)]
+            ));
             assert!(!readable.lock().unwrap().is_signaled());
         }
+    }
+
+    #[test]
+    fn firmware_23_play_timer_display_commands_are_registered() {
+        let service =
+            IParentalControlService::new(crate::core::SystemRef::null(), Capability::SYSTEM);
+        assert_eq!(
+            service.handlers[&1459].name,
+            "GetPlayTimerRemainingTimeDisplayInfo"
+        );
+        assert_eq!(service.handlers[&1460].name, "Unknown1460");
     }
 }
 
 use super::pctl_results::*;
-use super::pctl_types::{ApplicationInfo, Capability, PlayTimerSettings, RestrictionSettings};
+use super::pctl_types::{
+    ApplicationInfo, Capability, PlayTimerRemainingTimeDisplayInfo, PlayTimerSettings,
+    RestrictionSettings,
+};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
@@ -113,6 +133,8 @@ pub mod commands {
     pub const GET_PLAY_TIMER_SETTINGS: u32 = 1456;
     pub const GET_PLAY_TIMER_EVENT_TO_REQUEST_SUSPENSION: u32 = 1457;
     pub const IS_PLAY_TIMER_ALARM_DISABLED: u32 = 1458;
+    pub const GET_PLAY_TIMER_REMAINING_TIME_DISPLAY_INFO: u32 = 1459;
+    pub const UNKNOWN_1460: u32 = 1460;
     pub const NOTIFY_WRONG_PIN_CODE_INPUT_MANY_TIMES: u32 = 1471;
     pub const CANCEL_NETWORK_REQUEST: u32 = 1472;
     pub const GET_UNLINKED_EVENT: u32 = 1473;
@@ -190,7 +212,10 @@ pub struct IParentalControlService {
 }
 
 impl IParentalControlService {
-    fn get_play_timer_event_to_request_suspension_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_play_timer_event_to_request_suspension_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         let Some(id) = service.request_suspension_event.copy_object_id(ctx) else {
             ResponseBuilder::new(ctx, 2, 0, 0).push_result(crate::hle::result::RESULT_UNKNOWN);
@@ -540,6 +565,16 @@ impl IParentalControlService {
                 commands::IS_PLAY_TIMER_ALARM_DISABLED,
                 Some(Self::is_play_timer_alarm_disabled_handler),
                 "IsPlayTimerAlarmDisabled",
+            ),
+            (
+                commands::GET_PLAY_TIMER_REMAINING_TIME_DISPLAY_INFO,
+                Some(Self::get_play_timer_remaining_time_display_info_handler),
+                "GetPlayTimerRemainingTimeDisplayInfo",
+            ),
+            (
+                commands::UNKNOWN_1460,
+                Some(Self::unknown_1460_handler),
+                "Unknown1460",
             ),
             (
                 commands::NOTIFY_WRONG_PIN_CODE_INPUT_MANY_TIMES,
@@ -1404,6 +1439,28 @@ impl IParentalControlService {
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_bool(false);
+    }
+
+    fn get_play_timer_remaining_time_display_info_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::debug!("IParentalControlService::GetPlayTimerRemainingTimeDisplayInfo called");
+        let info = PlayTimerRemainingTimeDisplayInfo::default();
+        // 0x18 bytes = 6 u32 words. Response: 2 (header) + 6 (data) = 8.
+        let mut rb = ResponseBuilder::new(ctx, 8, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&info);
+    }
+
+    fn unknown_1460_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let in_unk = rp.pop_u8();
+        log::debug!("IParentalControlService::Unknown1460 called, in_unk={in_unk}");
+        let info = PlayTimerRemainingTimeDisplayInfo::default();
+        let mut rb = ResponseBuilder::new(ctx, 8, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&info);
     }
 }
 

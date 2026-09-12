@@ -188,6 +188,9 @@ pub enum InfoType {
     ThreadTickCount = 25,
     IsSvcPermitted = 26,
     IoRegionHint = 27,
+    TransferMemoryHint = 34,
+    Unknown37 = 37,
+    Unknown38 = 38,
     MesosphereMeta = 65000,
     MesosphereCurrentProcess = 65001,
 }
@@ -223,6 +226,9 @@ impl InfoType {
             25 => Self::ThreadTickCount,
             26 => Self::IsSvcPermitted,
             27 => Self::IoRegionHint,
+            34 => Self::TransferMemoryHint,
+            37 => Self::Unknown37,
+            38 => Self::Unknown38,
             65000 => Self::MesosphereMeta,
             65001 => Self::MesosphereCurrentProcess,
             _ => {

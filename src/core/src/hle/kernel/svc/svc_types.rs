@@ -180,6 +180,9 @@ pub enum InfoType {
     /// normal alias region, used by processes that opt into 39-bit AS
     /// extension. Returns 0 when no extra region is configured.
     AliasRegionExtraSize = 28,
+    TransferMemoryHint = 34,
+    Unknown37 = 37,
+    Unknown38 = 38,
     MesosphereMeta = 65000,
     MesosphereCurrentProcess = 65001,
 }
@@ -216,6 +219,9 @@ impl InfoType {
             26 => Self::IsSvcPermitted,
             27 => Self::IoRegionHint,
             28 => Self::AliasRegionExtraSize,
+            34 => Self::TransferMemoryHint,
+            37 => Self::Unknown37,
+            38 => Self::Unknown38,
             65000 => Self::MesosphereMeta,
             65001 => Self::MesosphereCurrentProcess,
             _ => {

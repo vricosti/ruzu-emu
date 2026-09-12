@@ -117,7 +117,12 @@ impl IApplicationCreator {
             .unwrap()
             .get_entry_raw(application_id, ContentRecordType::Program)?;
 
-        let process = create_process(self.system, application_id, 1, 22)?;
+        let process = create_process(
+            self.system,
+            application_id,
+            1,
+            crate::hle::api_version::HOS_VERSION_MAJOR,
+        )?;
         let mut applet = Applet::new(self.system, process, true);
         applet.program_id = application_id;
         applet.applet_id = AppletId::Starter;

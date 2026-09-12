@@ -55,3 +55,57 @@ pub struct PlayTimerSettings {
     pub settings: [u32; 13],
 }
 const _: () = assert!(core::mem::size_of::<PlayTimerSettings>() == 0x34);
+
+/// nn::pctl::detail::PlayTimerDisplayState.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlayTimerDisplayState {
+    TimesUp = 0,
+    BedtimeAlarm = 1,
+    RemainingTime = 2,
+    Unknown3 = 3,
+    Unknown4 = 4,
+    Unknown5 = 5,
+    TimerDisabled = 6,
+    #[default]
+    NotConfigured = 7,
+}
+
+/// nn::pctl::PlayTimerRemainingTimeDisplayInfo.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PlayTimerRemainingTimeDisplayInfo {
+    pub state: PlayTimerDisplayState,
+    pub _padding: [u8; 7],
+    pub unknown_08: u64,
+    pub remaining_time: u64,
+}
+const _: () = assert!(core::mem::size_of::<PlayTimerRemainingTimeDisplayInfo>() == 0x18);
+
+impl Default for PlayTimerRemainingTimeDisplayInfo {
+    fn default() -> Self {
+        Self {
+            state: PlayTimerDisplayState::NotConfigured,
+            _padding: [0; 7],
+            unknown_08: 0,
+            remaining_time: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn play_timer_remaining_time_display_info_is_0x18() {
+        assert_eq!(
+            core::mem::size_of::<PlayTimerRemainingTimeDisplayInfo>(),
+            0x18
+        );
+        assert_eq!(
+            PlayTimerRemainingTimeDisplayInfo::default().state,
+            PlayTimerDisplayState::NotConfigured
+        );
+    }
+}

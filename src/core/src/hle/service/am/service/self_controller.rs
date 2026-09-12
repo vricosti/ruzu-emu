@@ -56,6 +56,7 @@ const RESULT_FATAL_SECTION_COUNT_IMBALANCE: ResultCode =
 /// - 120: SaveCurrentScreenshot
 /// - 130: SetRecordVolumeMuted
 /// - 230: Unknown230
+/// - 240: Unknown240
 pub struct ISelfController {
     /// Matches upstream `Core::System& system`.
     system: SystemRef,
@@ -265,6 +266,7 @@ impl ISelfController {
                 "SetRecordVolumeMuted",
             ),
             (230, Some(Self::unknown_230_handler), "Unknown230"),
+            (240, Some(Self::unknown_240_handler), "Unknown240"),
             (1000, None, "GetDebugStorageChannel"),
         ]);
         Self {
@@ -980,6 +982,14 @@ impl ISelfController {
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u16(0);
+    }
+
+    fn unknown_240_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let in_val = rp.pop_u32();
+        log::warn!("(STUBBED) Unknown240 called, in_val={in_val}");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
     }
 }
 

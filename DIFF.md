@@ -34,10 +34,17 @@
   derefs to `BlockOfCode`, so unmigrated emitters and `Label`s keep working; the
   encoders stay in `inst.rs` underneath. `RAReg` gained `w()`/`x()`/`q()`/`v()`…
   views, upstream's `RAReg<T>` conversions, and `abi.rs` `WSCRATCH0/1`
-  (`Wscratch0/1`). Migrated so far: `emit_arm64_cryptography.rs`,
-  `emit_arm64_saturation.rs`, `emit_arm64_vector_saturation.rs`; each public
-  emitter still takes `&mut BlockOfCode` and wraps it, so the dispatcher and
-  tests are untouched until every file has moved, when the signatures flip to
+  (`Wscratch0/1`); `abi::regs` holds the typed fixed registers (`XSTATE`,
+  `XHALT`, `XSCRATCH0…`, `FP`, `LR`). Mnemonics oaknut overloads across GP and
+  SIMD operands (`ADD`/`SUB`/`AND`/`EOR`) keep the bare name for the GP form
+  and take `_v` for the vector form; `VRegBytes` (`8B`/`16B`) bounds the
+  logical/permute mnemonics oaknut declares only for those arrangements, and
+  widening/narrowing forms name both arrangements (`sxtl(V0.s4(), a.h4())`).
+  Migrated so far: `emit_arm64_cryptography.rs`, `emit_arm64_saturation.rs`,
+  `emit_arm64_vector_saturation.rs`, `emit_arm64_a32_coprocessor.rs`, the
+  `a32`/`a64` memory wrappers, `emit_arm64_packed.rs`; each public emitter
+  still takes `&mut BlockOfCode` and wraps it, so the dispatcher and tests are
+  untouched until every file has moved, when the signatures flip to
   `&mut CodeGenerator` in one mechanical sweep.
 
 ## 2026-09-12 — src/rdynarmic/src/backend/arm64/label.rs TBNZ far fallback (MK8D)

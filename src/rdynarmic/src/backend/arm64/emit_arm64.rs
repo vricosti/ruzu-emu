@@ -27,9 +27,9 @@ use crate::backend::arm64::emit_arm64_a32_memory::{
 use crate::backend::arm64::emit_arm64_a64::{
     emit_a64_call_supervisor, emit_a64_check_memory_abort, emit_a64_cond,
     emit_a64_condition_failed_terminal, emit_a64_data_cache_operation_raised,
-    emit_a64_data_memory_barrier, emit_a64_data_synchronization_barrier,
-    emit_a64_exception_raised, emit_a64_get_c_flag, emit_a64_get_cntfrq, emit_a64_get_cntpct,
-    emit_a64_get_ctr, emit_a64_get_d, emit_a64_get_dczid, emit_a64_get_fpcr, emit_a64_get_fpsr,
+    emit_a64_data_memory_barrier, emit_a64_data_synchronization_barrier, emit_a64_exception_raised,
+    emit_a64_get_c_flag, emit_a64_get_cntfrq, emit_a64_get_cntpct, emit_a64_get_ctr,
+    emit_a64_get_d, emit_a64_get_dczid, emit_a64_get_fpcr, emit_a64_get_fpsr,
     emit_a64_get_nzcv_raw, emit_a64_get_q, emit_a64_get_s, emit_a64_get_sp, emit_a64_get_tpidr,
     emit_a64_get_tpidrro, emit_a64_get_w, emit_a64_get_x,
     emit_a64_instruction_cache_operation_raised, emit_a64_instruction_synchronization_barrier,
@@ -49,28 +49,27 @@ use crate::backend::arm64::emit_arm64_cryptography::{
     emit_sha256_message_schedule_1,
 };
 use crate::backend::arm64::emit_arm64_data_processing::{
-    emit_is_zero32, emit_is_zero64,
     emit_add32, emit_add64, emit_and32, emit_and64, emit_and_not32, emit_and_not64,
     emit_arithmetic_shift_right32, emit_arithmetic_shift_right64,
     emit_arithmetic_shift_right_masked32, emit_arithmetic_shift_right_masked64,
     emit_byte_reverse_dual, emit_byte_reverse_half, emit_byte_reverse_word,
     emit_conditional_select32, emit_conditional_select64, emit_count_leading_zeros32,
     emit_count_leading_zeros64, emit_eor32, emit_eor64, emit_extract_register32,
-    emit_extract_register64, emit_get_nzcv_from_op, emit_least_significant_byte,
-    emit_least_significant_half, emit_least_significant_word, emit_logical_shift_left32,
-    emit_logical_shift_left64, emit_logical_shift_left_masked32, emit_logical_shift_left_masked64,
-    emit_logical_shift_right32, emit_logical_shift_right64, emit_logical_shift_right_masked32,
-    emit_logical_shift_right_masked64, emit_max_signed32, emit_max_signed64, emit_max_unsigned32,
-    emit_max_unsigned64, emit_min_signed32, emit_min_signed64, emit_min_unsigned32,
-    emit_min_unsigned64, emit_most_significant_word, emit_mul32, emit_mul64, emit_not32,
-    emit_not64, emit_or32, emit_or64, emit_pack_2x32_to_1x64, emit_pack_2x64_to_1x128,
-    emit_replicate_bit32, emit_replicate_bit64, emit_rotate_right32, emit_rotate_right64,
-    emit_rotate_right_extended, emit_rotate_right_masked32, emit_rotate_right_masked64,
-    emit_sign_extend_byte_to_long, emit_sign_extend_byte_to_word, emit_sign_extend_half_to_long,
-    emit_sign_extend_half_to_word, emit_sign_extend_word_to_long, emit_signed_div32,
-    emit_signed_div64, emit_signed_multiply_high64, emit_sub32, emit_sub64, emit_test_bit,
-    emit_unsigned_div32, emit_unsigned_div64, emit_unsigned_multiply_high64, emit_zero_extend,
-    emit_zero_extend_long_to_quad,
+    emit_extract_register64, emit_get_nzcv_from_op, emit_is_zero32, emit_is_zero64,
+    emit_least_significant_byte, emit_least_significant_half, emit_least_significant_word,
+    emit_logical_shift_left32, emit_logical_shift_left64, emit_logical_shift_left_masked32,
+    emit_logical_shift_left_masked64, emit_logical_shift_right32, emit_logical_shift_right64,
+    emit_logical_shift_right_masked32, emit_logical_shift_right_masked64, emit_max_signed32,
+    emit_max_signed64, emit_max_unsigned32, emit_max_unsigned64, emit_min_signed32,
+    emit_min_signed64, emit_min_unsigned32, emit_min_unsigned64, emit_most_significant_word,
+    emit_mul32, emit_mul64, emit_not32, emit_not64, emit_or32, emit_or64, emit_pack_2x32_to_1x64,
+    emit_pack_2x64_to_1x128, emit_replicate_bit32, emit_replicate_bit64, emit_rotate_right32,
+    emit_rotate_right64, emit_rotate_right_extended, emit_rotate_right_masked32,
+    emit_rotate_right_masked64, emit_sign_extend_byte_to_long, emit_sign_extend_byte_to_word,
+    emit_sign_extend_half_to_long, emit_sign_extend_half_to_word, emit_sign_extend_word_to_long,
+    emit_signed_div32, emit_signed_div64, emit_signed_multiply_high64, emit_sub32, emit_sub64,
+    emit_test_bit, emit_unsigned_div32, emit_unsigned_div64, emit_unsigned_multiply_high64,
+    emit_zero_extend, emit_zero_extend_long_to_quad,
 };
 use crate::backend::arm64::emit_arm64_floating_point::{
     emit_fp_abs32, emit_fp_abs64, emit_fp_add32, emit_fp_add64, emit_fp_compare32,
@@ -206,11 +205,12 @@ pub struct EmittedBlockInfo {
     pub fastmem_patch_info: FastHashMap<isize, FastmemPatchInfo>,
 }
 
-pub type EmitTerminal = for<'a> fn(&mut BlockOfCode, &mut EmitContext<'a>) -> Result<(), String>;
+pub type EmitTerminal =
+    for<'a> fn(&mut CodeGenerator<'_>, &mut EmitContext<'a>) -> Result<(), String>;
 pub type EmitCond =
-    for<'a> fn(&mut BlockOfCode, &mut EmitContext<'a>, Cond) -> Result<Label, String>;
+    for<'a> fn(&mut CodeGenerator<'_>, &mut EmitContext<'a>, Cond) -> Result<Label, String>;
 pub type EmitCheckMemoryAbort = for<'a> fn(
-    &mut BlockOfCode,
+    &mut CodeGenerator<'_>,
     &mut EmitContext<'a>,
     LocationDescriptor,
     &mut Label,
@@ -417,7 +417,7 @@ fn descriptor_to_a64_fpcr(descriptor: LocationDescriptor) -> Fpcr {
 /// IR generation and emit-config construction; real AArch64 machine-code
 /// emission is still missing.
 pub fn emit_arm64(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     mut block: Block,
     config: EmitConfig,
 ) -> Result<EmittedBlockInfo, String> {
@@ -466,13 +466,13 @@ pub fn emit_arm64(
         ctx.reg_alloc.assert_no_more_uses(ctx.block);
         emit_add_cycles(code, &ctx, ctx.block.cycle_count)?;
         (ctx.conf.emit_terminal)(code, &mut ctx)?;
-        CodeGenerator::new(code).brk(0)?;
+        code.brk(0)?;
 
         let mut deferred_emits = std::mem::take(&mut ctx.deferred_emits);
         for deferred_emit in &mut deferred_emits {
-            deferred_emit()?;
+            deferred_emit(code, &mut ctx)?;
         }
-        CodeGenerator::new(code).brk(0)?;
+        code.brk(0)?;
 
         ctx.emitted_block_info.size = code.code_size()
             - (ctx.emitted_block_info.entry_point as usize - code.code_base_ptr() as usize);
@@ -481,7 +481,7 @@ pub fn emit_arm64(
 }
 
 fn emit_a32_block_prologue_counter_if_enabled(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     block: &Block,
     config: &EmitConfig,
 ) -> Result<(), String> {
@@ -509,8 +509,7 @@ fn emit_a32_block_prologue_counter_if_enabled(
     Ok(())
 }
 
-fn emit_increment_u64_counter(code: &mut BlockOfCode, counter: u64) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
+fn emit_increment_u64_counter(code: &mut CodeGenerator<'_>, counter: u64) -> Result<(), String> {
     code.mov_imm(XSCRATCH0, counter)?;
     code.ldr(XSCRATCH1, XSCRATCH0, 0)?;
     code.add_imm(XSCRATCH1, XSCRATCH1, 1)?;
@@ -518,7 +517,7 @@ fn emit_increment_u64_counter(code: &mut BlockOfCode, counter: u64) -> Result<()
 }
 
 fn emit_ir_instruction(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -560,9 +559,8 @@ fn emit_ir_instruction(
                 .define_as_existing(ctx.block, inst_ref, args[0]);
             Ok(())
         }
-        Opcode::Breakpoint => CodeGenerator::new(code).brk(0),
+        Opcode::Breakpoint => code.brk(0),
         Opcode::CallHostFunction => {
-            let code = &mut CodeGenerator::new(code);
             let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
             ctx.reg_alloc.prepare_for_call(
                 code,
@@ -1293,7 +1291,7 @@ fn emit_ir_instruction(
 }
 
 fn emit_push_rsb(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -1303,7 +1301,6 @@ fn emit_push_rsb(
     {
         return Ok(());
     }
-    let code = &mut CodeGenerator::new(code);
 
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     if !args[0].is_immediate() {
@@ -1312,7 +1309,11 @@ fn emit_push_rsb(
     let target = LocationDescriptor::new(args[0].get_immediate_u64());
 
     code.ldr(WSCRATCH2, SP, StackLayout::rsb_ptr_offset() as u32)?;
-    code.add_imm(WSCRATCH2, WSCRATCH2, core::mem::size_of::<RSBEntry>() as u32)?;
+    code.add_imm(
+        WSCRATCH2,
+        WSCRATCH2,
+        core::mem::size_of::<RSBEntry>() as u32,
+    )?;
     code.and_imm(WSCRATCH2, WSCRATCH2, RSB_INDEX_MASK as u64)?;
     code.str(WSCRATCH2, SP, StackLayout::rsb_ptr_offset() as u32)?;
     code.add_ext(XSCRATCH2, SP, XSCRATCH2)?;
@@ -1324,15 +1325,19 @@ fn emit_push_rsb(
         target,
         BlockRelocationType::MoveToScratch1,
     )?;
-    code.stp(XSCRATCH0, XSCRATCH1, XSCRATCH2, StackLayout::rsb_offset() as i32)
+    code.stp(
+        XSCRATCH0,
+        XSCRATCH1,
+        XSCRATCH2,
+        StackLayout::rsb_offset() as i32,
+    )
 }
 
 fn emit_get_c_flag_from_nzcv(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut carry = ctx.reg_alloc.write_w(inst_ref);
     let mut nzcv = ctx.reg_alloc.read_w(args[0]);
@@ -1345,14 +1350,14 @@ fn optional_argument(arg: Argument) -> Option<Argument> {
 }
 
 fn emit_add_cycles(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &EmitContext<'_>,
     cycles_to_add: u64,
 ) -> Result<(), String> {
     if !ctx.conf.enable_cycle_counting || cycles_to_add == 0 {
         return Ok(());
     }
-    let code = &mut CodeGenerator::new(code);
+
     if cycles_to_add < 4096 {
         code.sub_imm(XTICKS, XTICKS, cycles_to_add as u32)
     } else if cycles_to_add & 0xfff == 0 && cycles_to_add >> 12 < 4096 {
@@ -1365,7 +1370,7 @@ fn emit_add_cycles(
 
 /// Upstream owner: `backend/arm64/emit_arm64.cpp::EmitRelocation`.
 pub fn emit_relocation(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     emitted_block_info: &mut EmittedBlockInfo,
     link_target: LinkTarget,
 ) -> Result<(), String> {
@@ -1373,12 +1378,12 @@ pub fn emit_relocation(
         code_offset: emitted_block_offset(code, emitted_block_info)?,
         target: link_target,
     });
-    CodeGenerator::new(code).nop()
+    code.nop()
 }
 
 /// Upstream owner: `backend/arm64/emit_arm64.cpp::EmitBlockLinkRelocation`.
 pub fn emit_block_link_relocation(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     emitted_block_info: &mut EmittedBlockInfo,
     descriptor: LocationDescriptor,
     relocation_type: BlockRelocationType,
@@ -1393,7 +1398,6 @@ pub fn emit_block_link_relocation(
             relocation_type,
         });
 
-    let code = &mut CodeGenerator::new(code);
     match relocation_type {
         BlockRelocationType::Branch => code.nop(),
         BlockRelocationType::MoveToScratch1 => {
@@ -1591,7 +1595,8 @@ mod tests {
             );
             block.rebuild_pseudo_op_links();
 
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
             emit_arm64(
                 &mut code,
                 block,
@@ -1619,7 +1624,8 @@ mod tests {
             );
             block.rebuild_pseudo_op_links();
 
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
             emit_arm64(
                 &mut code,
                 block,
@@ -1673,7 +1679,8 @@ mod tests {
                 opcode,
                 &[Value::ImmU32(0x1020_3040), Value::ImmU32(0x0102_0304)],
             );
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
             emit_arm64(
                 &mut code,
@@ -1692,7 +1699,8 @@ mod tests {
                 Value::ImmU32(0xaabb_ccdd),
             ],
         );
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         emit_arm64(
             &mut code,
             block,
@@ -1718,7 +1726,8 @@ mod tests {
             &[Value::ImmA64Reg(A64Reg::R1), Value::Inst(ge)],
         );
         block.rebuild_pseudo_op_links();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
         let info = emit_arm64(
             &mut code,
@@ -1758,7 +1767,8 @@ mod tests {
                 Value::ImmU32(0xaabb_ccdd),
             ],
         );
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
         let info = emit_arm64(
             &mut code,
@@ -1774,7 +1784,8 @@ mod tests {
         assert!(words.contains(&inst::uxtl_v(0, 9, 16)));
         assert!(words.contains(&inst::uxtl_v(1, 10, 16)));
         assert!(words.contains(&inst::ext_v16b(1, 1, 1, 4, false)));
-        assert!(words.contains(&inst::movi_v8b_imm(2, 0xf0)));
+        assert!(words.contains(&0x2f07_e602)); // MOVI D2, RepImm{0xf0}
+        assert!(words.contains(&0x2f00_e5e2)); // MOVI D2, RepImm{0x0f}
         assert!(words.contains(&inst::eor_v8b(1, 1, 2)));
         assert!(words.contains(&inst::sub_v(8, 0, 1, 32, false)));
         assert!(words.contains(&inst::xtn_v(8, 8, 32)));
@@ -1800,7 +1811,8 @@ mod tests {
 
     #[test]
     fn emit_relocation_records_offset_and_writes_nop() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         code.write_u32(inst::nop()).unwrap();
 
@@ -1818,7 +1830,8 @@ mod tests {
 
     #[test]
     fn emit_block_link_relocation_branch_records_offset_and_writes_nop() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let target = LocationDescriptor::new(0x4000);
 
@@ -1837,7 +1850,8 @@ mod tests {
 
     #[test]
     fn emit_block_link_relocation_move_to_scratch1_writes_brk_then_nop() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let target = LocationDescriptor::new(0x8000);
 
@@ -1862,7 +1876,8 @@ mod tests {
 
     #[test]
     fn emit_push_rsb_matches_upstream_stack_update_and_relocation_order() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = return_to_dispatch_block();
         let target = LocationDescriptor::new(0);
         block
@@ -2031,7 +2046,8 @@ mod tests {
 
     #[test]
     fn emit_arm64_empty_a64_block_returns_to_dispatcher() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let info = emit_arm64(
             &mut code,
             return_to_dispatch_block(),
@@ -2057,7 +2073,8 @@ mod tests {
     fn emit_arm64_breakpoint_then_returns_to_dispatcher() {
         let mut block = return_to_dispatch_block();
         block.append(Opcode::Breakpoint, &[]);
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
         let info = emit_arm64(
             &mut code,
@@ -2086,7 +2103,8 @@ mod tests {
         let lo = block.append(Opcode::A64GetX, &[Value::ImmA64Reg(A64Reg::R0)]);
         let hi = block.append(Opcode::A64GetX, &[Value::ImmA64Reg(A64Reg::R1)]);
         block.append(Opcode::Pack2x64To1x128, &[Value::Inst(lo), Value::Inst(hi)]);
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
         emit_arm64(
             &mut code,
@@ -2112,7 +2130,7 @@ mod tests {
         );
         assert_eq!(
             read_instruction(&code, 12),
-            inst::fmov_v_d1_from_x(result_reg, hi_reg)
+            inst::mov_to_v_element(result_reg, hi_reg, 64, 1)
         );
     }
 
@@ -2126,7 +2144,8 @@ mod tests {
             let mut block = return_to_dispatch_block();
             let input = block.append(Opcode::A64GetQ, &[Value::ImmA64Vec(A64Vec::V0)]);
             block.append(opcode, &[Value::Inst(input)]);
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
             emit_arm64(
                 &mut code,
@@ -2148,7 +2167,8 @@ mod tests {
             let mut block = return_to_dispatch_block();
             let input = block.append(Opcode::A64GetQ, &[Value::ImmA64Vec(A64Vec::V0)]);
             block.append(opcode, &[Value::Inst(input)]);
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
             emit_arm64(
                 &mut code,
@@ -2177,7 +2197,8 @@ mod tests {
             let mut block = return_to_dispatch_block();
             let input = block.append(Opcode::A64GetW, &[Value::ImmA64Reg(A64Reg::R0)]);
             block.append(opcode, &[Value::Inst(input), data]);
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
             emit_arm64(
                 &mut code,
@@ -2211,7 +2232,8 @@ mod tests {
             Opcode::SHA256MessageSchedule1,
             &[Value::Inst(x), Value::Inst(y), Value::Inst(w)],
         );
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
         emit_arm64(
             &mut code,
@@ -2276,7 +2298,8 @@ mod tests {
             let mut block = return_to_dispatch_block();
             let input = block.append(get_opcode, &[input]);
             block.append(opcode, &[Value::Inst(input), shift]);
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
             emit_arm64(
                 &mut code,
@@ -2303,7 +2326,8 @@ mod tests {
             let op1 = block.append(get_opcode, &[Value::ImmA64Reg(A64Reg::R0)]);
             let op2 = block.append(get_opcode, &[Value::ImmA64Reg(A64Reg::R1)]);
             block.append(opcode, &[Value::Inst(op1), Value::Inst(op2)]);
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
             emit_arm64(
                 &mut code,
@@ -2326,7 +2350,8 @@ mod tests {
             let a = block.append(get_opcode, &[Value::ImmA64Vec(A64Vec::V0)]);
             let b = block.append(get_opcode, &[Value::ImmA64Vec(A64Vec::V1)]);
             block.append(opcode, &[Value::Inst(a), Value::Inst(b)]);
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
             emit_arm64(
                 &mut code,
@@ -2351,7 +2376,8 @@ mod tests {
             let a = block.append(get_opcode, &[Value::ImmA64Vec(A64Vec::V0)]);
             let b = block.append(get_opcode, &[Value::ImmA64Vec(A64Vec::V1)]);
             block.append(opcode, &[Value::Inst(a), Value::Inst(b)]);
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
             emit_arm64(
                 &mut code,
                 block,
@@ -2371,7 +2397,8 @@ mod tests {
             let mut block = return_to_dispatch_block();
             let input = block.append(get_opcode, &[Value::ImmA64Vec(A64Vec::V0)]);
             block.append(opcode, &[Value::Inst(input)]);
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
             emit_arm64(
                 &mut code,
                 block,
@@ -2388,7 +2415,8 @@ mod tests {
             let input = block.append(Opcode::A64GetS, &[Value::ImmA64Vec(A64Vec::V0)]);
             let half = block.append(Opcode::LeastSignificantHalf, &[Value::Inst(input)]);
             block.append(opcode, &[Value::Inst(half), Value::ImmU8(0)]);
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
             emit_arm64(
                 &mut code,
                 block,
@@ -2404,7 +2432,8 @@ mod tests {
             let mut block = return_to_dispatch_block();
             let input = block.append(get_opcode, &[Value::ImmA64Vec(A64Vec::V0)]);
             block.append(opcode, &[Value::Inst(input), Value::ImmU8(0)]);
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
             emit_arm64(
                 &mut code,
                 block,
@@ -2425,7 +2454,8 @@ mod tests {
                 opcode,
                 &[Value::Inst(input), Value::ImmU8(7), Value::ImmU8(3)],
             );
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
             emit_arm64(
                 &mut code,
                 block,
@@ -2447,7 +2477,8 @@ mod tests {
                 opcode,
                 &[Value::Inst(half), Value::ImmU8(7), Value::ImmU8(0)],
             );
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
             emit_arm64(
                 &mut code,
                 block,
@@ -2467,7 +2498,8 @@ mod tests {
                 opcode,
                 &[Value::Inst(a), Value::Inst(b), Value::ImmU1(true)],
             );
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
             emit_arm64(
                 &mut code,
                 block,
@@ -2483,7 +2515,8 @@ mod tests {
                 opcode,
                 &[Value::Inst(input), Value::ImmU8(0), Value::ImmU1(true)],
             );
-            let mut code = BlockOfCode::with_size(4096).unwrap();
+            let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+            let mut code = rhazel::CodeGenerator::new(&mut code_storage);
             emit_arm64(
                 &mut code,
                 block,
@@ -2497,7 +2530,8 @@ mod tests {
     fn emit_arm64_subtracts_small_cycle_counts_before_terminal() {
         let mut block = return_to_dispatch_block();
         block.cycle_count = 7;
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
         let info = emit_arm64(
             &mut code,
@@ -2527,7 +2561,8 @@ mod tests {
     fn emit_arm64_uses_shifted_immediate_for_aligned_cycle_count() {
         let mut block = return_to_dispatch_block();
         block.cycle_count = 4096;
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
         let info = emit_arm64(
             &mut code,
@@ -2547,7 +2582,8 @@ mod tests {
     fn emit_arm64_uses_register_for_large_unaligned_cycle_count() {
         let mut block = return_to_dispatch_block();
         block.cycle_count = 4097;
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
         let info = emit_arm64(
             &mut code,
@@ -2568,7 +2604,8 @@ mod tests {
     fn emit_arm64_a64_set_pc_stores_immediate_pc_before_terminal() {
         let mut block = return_to_dispatch_block();
         block.append(Opcode::A64SetPC, &[Value::ImmU64(0x1234_5678)]);
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
 
         let info = emit_arm64(
             &mut code,
@@ -2616,7 +2653,8 @@ mod tests {
                 Value::ImmAccType(AccType::Normal),
             ],
         );
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut config = a32_config(false);
         config.fastmem_pointer = None;
         config.page_table = None;

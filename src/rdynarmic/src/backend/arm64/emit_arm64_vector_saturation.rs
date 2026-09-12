@@ -4,7 +4,6 @@
 
 use rhazel::CodeGenerator;
 
-use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_context::EmitContext;
 use crate::backend::arm64::reg_alloc::{RAReg, RegAlloc};
 use crate::ir::opcode::Opcode;
@@ -28,11 +27,10 @@ fn emit(
 }
 
 pub fn emit_vector_saturation_instruction(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     match ctx.block.get(inst_ref).opcode {
         Opcode::VectorSignedSaturatedAdd8 => emit(code, ctx, inst_ref, |code, r, a, b| {
             code.sqadd(r.v().b16(), a.v().b16(), b.v().b16())

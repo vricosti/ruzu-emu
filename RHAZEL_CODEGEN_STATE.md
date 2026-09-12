@@ -29,10 +29,42 @@ passes after the ABI conversion: 971 library tests and three binary/integration
 tests. The C++ differential oracle is absent; tests that skip when it is absent
 must not be counted as successful differential comparisons.
 
-## Remaining scope
+## Integrated migration
 
-- Complete typed mnemonics needed by scalar/vector/memory/A32 emitters and register
-  allocation; keep JIT-specific logic in rdynarmic.
-- Remove transitional generator wrappers only after all consumers are migrated.
-- Independently validate encodings and run A32/A64 JIT tests, then release game
-  smoke tests. No successful game validation has been performed in this pass yet.
+Scalar FP, data processing, vectors, A32/memory, RegAlloc, prelude and AddressSpace
+use typed mnemonics. All emitter interfaces take CodeGenerator; one generator is
+borrowed at each address-space emission boundary. Per-function wrappers and
+production raw instruction encoders are removed. Deferred emissions receive the
+generator/context explicitly rather than retaining raw pointers to them.
+Link/Relink patch generators preserve the append cursor and owner-managed I-cache
+invalidation ranges. Unit tests retain raw encoders as expected-word references.
+
+Final integrated verification: 973 rdynarmic library tests and four additional
+binary/integration tests pass in release. rhazel passes 40 unit tests, 13
+integration tests and two compile-fail doctests. Neither crate emits warnings.
+The final release build produced ruzu, ruzu-cmd and ruzu.app. Freebrick reaches
+its correctly displayed menu under Vulkan in a bounded smoke run, with continuing
+GPU submissions. The standalone CLI requires LIBVULKAN_PATH pointing to the
+bundle's MoltenVK on this machine; no installed library/configuration was changed.
+This is a startup/menu smoke test, not exhaustive gameplay or a performance claim.
+
+## Review corrections completed
+
+The final review found and fixed a pre-existing packed-op discrepancy: MOVI V2.8B
+broadcasts the immediate byte, whereas upstream MOVI D2, RepImm expands each
+immediate bit into a byte mask. Both packed-operation call sites now use the
+D-register overload. Independent words, all 256 masks and upstream scratch
+sequences are covered by passing native tests. Patch-slot overflow is rejected
+before writing; unsupported label/append access on patch cursors is rejected
+before mutation. Patch tests cover both publication modes and cursor separation.
+
+## Scope boundaries
+
+This completes the backend's assembler API migration, not the entire Oaknut
+instruction catalogue or every pre-existing Dynarmic optimization difference.
+The C++ differential oracle is absent locally; optional oracle tests returning
+early are not evidence of a successful C++ differential comparison.
+
+The migration slice is complete. The two original WIP commits are squashed into
+0ad0aec7; final assembler changes are committed in rhazel as e95f5f5. Commits are
+local and have not been pushed.

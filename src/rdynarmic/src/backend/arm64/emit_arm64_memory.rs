@@ -3,16 +3,17 @@
 //! Upstream owner: `backend/arm64/emit_arm64_memory.cpp`.
 
 use crate::backend::arm64::abi::{XFASTMEM, XPAGETABLE, XSCRATCH0, XSCRATCH1, XSTATE};
+#[cfg(test)]
 use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_arm64::{emit_relocation, LinkTarget};
 use crate::backend::arm64::emit_context::EmitContext;
-use crate::backend::arm64::inst;
 use crate::backend::arm64::label::Label;
 use crate::backend::arm64::reg_alloc::RegAlloc;
 use crate::backend::arm64::reg_alloc::{HostLoc, HostLocKind};
 use crate::ir::acc_type::AccType;
 use crate::ir::cond::Cond;
 use crate::ir::value::InstRef;
+use rhazel::{BarrierOp, CodeGenerator, QReg, VReg, WReg, XReg};
 
 const X0: u8 = 0;
 const Q0: u8 = 0;
@@ -130,7 +131,7 @@ fn exclusive_write_memory_link_target(bitsize: usize) -> Result<LinkTarget, Stri
 }
 
 pub fn emit_read_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -146,7 +147,7 @@ pub fn emit_read_memory<const BITSIZE: usize>(
 }
 
 pub fn emit_exclusive_read_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -155,7 +156,7 @@ pub fn emit_exclusive_read_memory<const BITSIZE: usize>(
 }
 
 pub fn emit_write_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -171,7 +172,7 @@ pub fn emit_write_memory<const BITSIZE: usize>(
 }
 
 pub fn emit_exclusive_write_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -197,7 +198,7 @@ fn ensure_memory_bitsize(bitsize: usize) -> Result<(), String> {
 }
 
 fn callback_only_emit_read_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -212,7 +213,7 @@ fn callback_only_emit_read_memory<const BITSIZE: usize>(
         read_memory_link_target(BITSIZE)?,
     )?;
     if ordered {
-        code.write_u32(inst::dmb_ish())?;
+        code.dmb(BarrierOp::ISH)?;
     }
 
     define_read_result::<BITSIZE>(code, ctx, inst_ref)?;
@@ -220,7 +221,7 @@ fn callback_only_emit_read_memory<const BITSIZE: usize>(
 }
 
 fn callback_only_emit_exclusive_read_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -229,19 +230,19 @@ fn callback_only_emit_exclusive_read_memory<const BITSIZE: usize>(
         .prepare_for_call(code, ctx.fpsr, [None, Some(args[1]), None, None])?;
     let ordered = is_ordered(args[2].get_immediate_acc_type());
 
-    code.write_u32(inst::movz_w(XSCRATCH0, 1, 0))?;
-    code.write_u32(inst::strb_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    code.movz(WReg::new(XSCRATCH0), 1, 0)?;
+    code.strb(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         ctx.conf.state_exclusive_state_offset as u32,
-    ))?;
+    )?;
     emit_relocation(
         code,
         ctx.emitted_block_info,
         exclusive_read_memory_link_target(BITSIZE)?,
     )?;
     if ordered {
-        code.write_u32(inst::dmb_ish())?;
+        code.dmb(BarrierOp::ISH)?;
     }
 
     define_read_result::<BITSIZE>(code, ctx, inst_ref)?;
@@ -249,12 +250,12 @@ fn callback_only_emit_exclusive_read_memory<const BITSIZE: usize>(
 }
 
 fn define_read_result<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     if BITSIZE == 128 {
-        code.write_u32(inst::mov_v16b(Q8, Q0))?;
+        code.mov_v(VReg::new(Q8).b16(), VReg::new(Q0).b16())?;
         ctx.reg_alloc.define_as_register(
             ctx.block,
             inst_ref,
@@ -277,7 +278,7 @@ fn define_read_result<const BITSIZE: usize>(
 }
 
 fn callback_only_emit_write_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -287,7 +288,7 @@ fn callback_only_emit_write_memory<const BITSIZE: usize>(
     let ordered = is_ordered(args[3].get_immediate_acc_type());
 
     if ordered {
-        code.write_u32(inst::dmb_ish())?;
+        code.dmb(BarrierOp::ISH)?;
     }
     emit_relocation(
         code,
@@ -295,13 +296,13 @@ fn callback_only_emit_write_memory<const BITSIZE: usize>(
         write_memory_link_target(BITSIZE)?,
     )?;
     if ordered {
-        code.write_u32(inst::dmb_ish())?;
+        code.dmb(BarrierOp::ISH)?;
     }
     Ok(())
 }
 
 fn callback_only_emit_exclusive_write_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -311,29 +312,30 @@ fn callback_only_emit_exclusive_write_memory<const BITSIZE: usize>(
     let ordered = is_ordered(args[3].get_immediate_acc_type());
 
     if ordered {
-        code.write_u32(inst::dmb_ish())?;
+        code.dmb(BarrierOp::ISH)?;
     }
-    code.write_u32(inst::movz_w(X0, 1, 0))?;
-    code.write_u32(inst::ldrb_w_unsigned(
-        XSCRATCH0,
-        XSTATE,
+    code.movz(WReg::new(X0), 1, 0)?;
+    code.ldrb(
+        WReg::new(XSCRATCH0),
+        XReg::new(XSTATE),
         ctx.conf.state_exclusive_state_offset as u32,
-    ))?;
-    let end_branch_offset = code.write_u32(inst::cbz_w(XSCRATCH0, 0))?;
-    code.write_u32(inst::strb_w_unsigned(
-        WZR,
-        XSTATE,
+    )?;
+    let mut end = Label::new();
+    code.cbz(WReg::new(XSCRATCH0), &mut end)?;
+    code.strb(
+        WReg::new(WZR),
+        XReg::new(XSTATE),
         ctx.conf.state_exclusive_state_offset as u32,
-    ))?;
+    )?;
     emit_relocation(
         code,
         ctx.emitted_block_info,
         exclusive_write_memory_link_target(BITSIZE)?,
     )?;
     if ordered {
-        code.write_u32(inst::dmb_ish())?;
+        code.dmb(BarrierOp::ISH)?;
     }
-    patch_branch_to_current(code, end_branch_offset)?;
+    code.l(&mut end)?;
 
     ctx.reg_alloc.define_as_register(
         ctx.block,
@@ -347,7 +349,7 @@ fn callback_only_emit_exclusive_write_memory<const BITSIZE: usize>(
 }
 
 fn fastmem_emit_read_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -355,6 +357,8 @@ fn fastmem_emit_read_memory<const BITSIZE: usize>(
     let mut xaddr = ctx.reg_alloc.read_x(args[1]);
     let mut rvalue = if BITSIZE == 128 {
         ctx.reg_alloc.write_q(inst_ref)
+    } else if BITSIZE == 64 {
+        ctx.reg_alloc.write_x(inst_ref)
     } else {
         ctx.reg_alloc.write_w(inst_ref)
     };
@@ -370,7 +374,7 @@ fn fastmem_emit_read_memory<const BITSIZE: usize>(
 }
 
 fn fastmem_emit_write_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -378,6 +382,8 @@ fn fastmem_emit_write_memory<const BITSIZE: usize>(
     let mut xaddr = ctx.reg_alloc.read_x(args[1]);
     let mut rvalue = if BITSIZE == 128 {
         ctx.reg_alloc.read_q(args[2])
+    } else if BITSIZE == 64 {
+        ctx.reg_alloc.read_x(args[2])
     } else {
         ctx.reg_alloc.read_w(args[2])
     };
@@ -393,7 +399,7 @@ fn fastmem_emit_write_memory<const BITSIZE: usize>(
 }
 
 fn inline_page_table_emit_read_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -401,6 +407,8 @@ fn inline_page_table_emit_read_memory<const BITSIZE: usize>(
     let mut xaddr = ctx.reg_alloc.read_x(args[1]);
     let mut rvalue = if BITSIZE == 128 {
         ctx.reg_alloc.write_q(inst_ref)
+    } else if BITSIZE == 64 {
+        ctx.reg_alloc.write_x(inst_ref)
     } else {
         ctx.reg_alloc.write_w(inst_ref)
     };
@@ -418,30 +426,26 @@ fn inline_page_table_emit_read_memory<const BITSIZE: usize>(
         inline_page_table_emit_vaddr_lookup::<BITSIZE>(code, ctx, xaddr_reg, &mut fallback)?;
     emit_memory_ldr::<BITSIZE>(code, rvalue_reg, xbase, xoffset, ordered, false)?;
 
-    end.bind(code)?;
-    let code_ptr = code as *mut BlockOfCode;
-    let ctx_ptr = ctx as *mut EmitContext<'_>;
+    code.l(&mut end)?;
     let current_location = ctx.block.location;
-    ctx.deferred_emits.push(Box::new(move || {
-        let code = unsafe { &mut *code_ptr };
-        let ctx = unsafe { &mut *ctx_ptr };
-        fallback.bind(code)?;
-        code.write_u32(inst::mov_x(XSCRATCH0, xaddr_reg))?;
+    ctx.deferred_emits.push(Box::new(move |code, ctx| {
+        code.l(&mut fallback)?;
+        code.mov(XReg::new(XSCRATCH0), XReg::new(xaddr_reg))?;
         emit_relocation(
             code,
             ctx.emitted_block_info,
             wrapped_read_memory_link_target(BITSIZE)?,
         )?;
         if ordered {
-            code.write_u32(inst::dmb_ish())?;
+            code.dmb(BarrierOp::ISH)?;
         }
         if BITSIZE == 128 {
-            code.write_u32(inst::mov_v16b(rvalue_reg, Q0))?;
+            code.mov_v(VReg::new(rvalue_reg).b16(), VReg::new(Q0).b16())?;
         } else {
-            code.write_u32(inst::mov_x(rvalue_reg, XSCRATCH0))?;
+            code.mov(XReg::new(rvalue_reg), XReg::new(XSCRATCH0))?;
         }
         (ctx.conf.emit_check_memory_abort)(code, ctx, current_location, &mut end)?;
-        end.b(code)?;
+        code.b(&mut end)?;
         Ok(())
     }));
 
@@ -449,7 +453,7 @@ fn inline_page_table_emit_read_memory<const BITSIZE: usize>(
 }
 
 fn inline_page_table_emit_write_memory<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -457,6 +461,8 @@ fn inline_page_table_emit_write_memory<const BITSIZE: usize>(
     let mut xaddr = ctx.reg_alloc.read_x(args[1]);
     let mut rvalue = if BITSIZE == 128 {
         ctx.reg_alloc.read_q(args[2])
+    } else if BITSIZE == 64 {
+        ctx.reg_alloc.read_x(args[2])
     } else {
         ctx.reg_alloc.read_w(args[2])
     };
@@ -475,22 +481,18 @@ fn inline_page_table_emit_write_memory<const BITSIZE: usize>(
         inline_page_table_emit_vaddr_lookup::<BITSIZE>(code, ctx, xaddr_reg, &mut fallback)?;
     emit_memory_str::<BITSIZE>(code, rvalue_reg, xbase, xoffset, ordered, false)?;
 
-    end.bind(code)?;
-    let code_ptr = code as *mut BlockOfCode;
-    let ctx_ptr = ctx as *mut EmitContext<'_>;
+    code.l(&mut end)?;
     let current_location = ctx.block.location;
-    ctx.deferred_emits.push(Box::new(move || {
-        let code = unsafe { &mut *code_ptr };
-        let ctx = unsafe { &mut *ctx_ptr };
-        fallback.bind(code)?;
-        code.write_u32(inst::mov_x(XSCRATCH0, xaddr_reg))?;
+    ctx.deferred_emits.push(Box::new(move |code, ctx| {
+        code.l(&mut fallback)?;
+        code.mov(XReg::new(XSCRATCH0), XReg::new(xaddr_reg))?;
         if BITSIZE == 128 {
-            code.write_u32(inst::mov_v16b(Q0, rvalue_reg))?;
+            code.mov_v(VReg::new(Q0).b16(), VReg::new(rvalue_reg).b16())?;
         } else {
-            code.write_u32(inst::mov_x(XSCRATCH1, rvalue_reg))?;
+            code.mov(XReg::new(XSCRATCH1), XReg::new(rvalue_reg))?;
         }
         if ordered {
-            code.write_u32(inst::dmb_ish())?;
+            code.dmb(BarrierOp::ISH)?;
         }
         emit_relocation(
             code,
@@ -498,10 +500,10 @@ fn inline_page_table_emit_write_memory<const BITSIZE: usize>(
             wrapped_write_memory_link_target(BITSIZE)?,
         )?;
         if ordered {
-            code.write_u32(inst::dmb_ish())?;
+            code.dmb(BarrierOp::ISH)?;
         }
         (ctx.conf.emit_check_memory_abort)(code, ctx, current_location, &mut end)?;
-        end.b(code)?;
+        code.b(&mut end)?;
         Ok(())
     }));
 
@@ -509,7 +511,7 @@ fn inline_page_table_emit_write_memory<const BITSIZE: usize>(
 }
 
 fn emit_inline_watch_fallback<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     xaddr: u8,
     fallback: &mut Label,
 ) -> Result<(), String> {
@@ -527,31 +529,31 @@ fn emit_inline_watch_fallback<const BITSIZE: usize>(
         let mut next_range = Label::new();
 
         emit_mov_x_imm_local(code, XSCRATCH0, overlap_start)?;
-        code.write_u32(inst::cmp_x_reg(xaddr, XSCRATCH0))?;
-        next_range.b_cond(code, Cond::LO)?;
+        code.cmp(XReg::new(xaddr), XReg::new(XSCRATCH0))?;
+        code.b_cond(Cond::LO, &mut next_range)?;
 
         emit_mov_x_imm_local(code, XSCRATCH0, end)?;
-        code.write_u32(inst::cmp_x_reg(xaddr, XSCRATCH0))?;
-        fallback.b_cond(code, Cond::LO)?;
+        code.cmp(XReg::new(xaddr), XReg::new(XSCRATCH0))?;
+        code.b_cond(Cond::LO, fallback)?;
 
-        next_range.bind(code)?;
+        code.l(&mut next_range)?;
     }
     Ok(())
 }
 
-fn emit_mov_x_imm_local(code: &mut BlockOfCode, reg: u8, imm: u64) -> Result<(), String> {
-    code.write_u32(inst::movz_x(reg, (imm & 0xffff) as u16, 0))?;
+fn emit_mov_x_imm_local(code: &mut CodeGenerator<'_>, reg: u8, imm: u64) -> Result<(), String> {
+    code.movz(XReg::new(reg), (imm & 0xffff) as u16, 0)?;
     for shift in [16, 32, 48] {
         let part = ((imm >> shift) & 0xffff) as u16;
         if part != 0 {
-            code.write_u32(inst::movk_x(reg, part, shift as u8))?;
+            code.movk(XReg::new(reg), part, shift as u8)?;
         }
     }
     Ok(())
 }
 
 fn inline_page_table_emit_vaddr_lookup<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     xaddr: u8,
     fallback: &mut Label,
@@ -566,58 +568,64 @@ fn inline_page_table_emit_vaddr_lookup<const BITSIZE: usize>(
     emit_detect_misaligned_vaddr::<BITSIZE>(code, ctx, xaddr, fallback)?;
 
     if ctx.conf.silently_mirror_page_table || unused_top_bits == 0 {
-        code.write_u32(inst::ubfx_x(
-            XSCRATCH0,
-            xaddr,
+        code.ubfx(
+            XReg::new(XSCRATCH0),
+            XReg::new(xaddr),
             PAGE_BITS as u8,
             valid_page_index_bits as u8,
-        ))?;
+        )?;
     } else {
-        code.write_u32(inst::lsr_x_imm(XSCRATCH0, xaddr, PAGE_BITS as u8))?;
-        code.write_u32(inst::tst_x_imm(
-            XSCRATCH0,
-            u64::MAX << valid_page_index_bits,
-        ))?;
-        fallback.b_cond(code, Cond::NE)?;
+        code.lsr(XReg::new(XSCRATCH0), XReg::new(xaddr), PAGE_BITS as u8)?;
+        code.tst_imm(XReg::new(XSCRATCH0), u64::MAX << valid_page_index_bits)?;
+        code.b_cond(Cond::NE, fallback)?;
     }
 
-    code.write_u32(inst::lsl_x_imm(
-        XSCRATCH0,
-        XSCRATCH0,
+    code.lsl(
+        XReg::new(XSCRATCH0),
+        XReg::new(XSCRATCH0),
         ctx.conf.page_table_log2_stride as u8,
-    ))?;
-    code.write_u32(inst::ldr_x_reg_lsl(XSCRATCH0, XPAGETABLE, XSCRATCH0))?;
+    )?;
+    code.ldr_reg(
+        XReg::new(XSCRATCH0),
+        XReg::new(XPAGETABLE),
+        XReg::new(XSCRATCH0),
+    )?;
 
     if let Some(marked_bit) = ctx.conf.page_table_marked_bit {
         // check for marked bit
-        fallback.tbnz_x(code, XSCRATCH0, marked_bit)?;
+        code.tbnz(XReg::new(XSCRATCH0), marked_bit, fallback)?;
     }
 
     if ctx.conf.page_table_pointer_mask != 0 {
-        code.write_u32(inst::and_x_imm(
-            XSCRATCH0,
-            XSCRATCH0,
+        code.and_imm(
+            XReg::new(XSCRATCH0),
+            XReg::new(XSCRATCH0),
             ctx.conf.page_table_pointer_mask,
-        ))?;
+        )?;
     }
 
     // TODO: combine this with page_table_pointer_mask
     if let Some(sign_extension) = ctx.conf.page_table_sign_extension {
-        code.write_u32(inst::sbfm_x(XSCRATCH0, XSCRATCH0, 0, sign_extension))?;
+        code.sbfm(
+            XReg::new(XSCRATCH0),
+            XReg::new(XSCRATCH0),
+            0,
+            sign_extension,
+        )?;
     }
 
-    fallback.cbz_x(code, XSCRATCH0)?;
+    code.cbz(XReg::new(XSCRATCH0), fallback)?;
 
     if ctx.conf.absolute_offset_page_table {
         Ok((XSCRATCH0, xaddr))
     } else {
-        code.write_u32(inst::and_x_imm(XSCRATCH1, xaddr, PAGE_MASK))?;
+        code.and_imm(XReg::new(XSCRATCH1), XReg::new(xaddr), PAGE_MASK)?;
         Ok((XSCRATCH0, XSCRATCH1))
     }
 }
 
 fn emit_detect_misaligned_vaddr<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &EmitContext<'_>,
     xaddr: u8,
     fallback: &mut Label,
@@ -637,18 +645,18 @@ fn emit_detect_misaligned_vaddr<const BITSIZE: usize>(
             128 => 0b1111,
             _ => return Err(format!("Invalid ARM64 memory bitsize: {BITSIZE}")),
         };
-        code.write_u32(inst::tst_x_imm(xaddr, align_mask))?;
-        fallback.b_cond(code, Cond::NE)?;
+        code.tst_imm(XReg::new(xaddr), align_mask)?;
+        code.b_cond(Cond::NE, fallback)?;
     } else {
-        code.write_u32(inst::and_x_imm(XSCRATCH0, xaddr, PAGE_MASK))?;
-        code.write_u32(inst::cmp_x_imm(XSCRATCH0, (PAGE_SIZE - BITSIZE / 8) as u32))?;
-        fallback.b_cond(code, Cond::HI)?;
+        code.and_imm(XReg::new(XSCRATCH0), XReg::new(xaddr), PAGE_MASK)?;
+        code.cmp_imm(XReg::new(XSCRATCH0), (PAGE_SIZE - BITSIZE / 8) as u32)?;
+        code.b_cond(Cond::HI, fallback)?;
     }
     Ok(())
 }
 
 fn emit_memory_ldr<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     value_idx: u8,
     xbase: u8,
     xoffset: u8,
@@ -659,54 +667,54 @@ fn emit_memory_ldr<const BITSIZE: usize>(
         emit_add_address(code, XSCRATCH0, xbase, xoffset, extend32)?;
         match BITSIZE {
             8 => {
-                code.write_u32(inst::ldarb_w(value_idx, XSCRATCH0))?;
+                code.ldarb(WReg::new(value_idx), XReg::new(XSCRATCH0))?;
             }
             16 => {
-                code.write_u32(inst::ldarh_w(value_idx, XSCRATCH0))?;
+                code.ldarh(WReg::new(value_idx), XReg::new(XSCRATCH0))?;
             }
             32 => {
-                code.write_u32(inst::ldar_w(value_idx, XSCRATCH0))?;
+                code.ldar(WReg::new(value_idx), XReg::new(XSCRATCH0))?;
             }
             64 => {
-                code.write_u32(inst::ldar_x(value_idx, XSCRATCH0))?;
+                code.ldar(XReg::new(value_idx), XReg::new(XSCRATCH0))?;
             }
             128 => {
-                code.write_u32(inst::ldr_q_unsigned(value_idx, XSCRATCH0, 0))?;
-                code.write_u32(inst::dmb_ish())?;
+                code.ldr(QReg::new(value_idx), XReg::new(XSCRATCH0), 0)?;
+                code.dmb(BarrierOp::ISH)?;
             }
             _ => return Err(format!("Invalid ARM64 memory bitsize: {BITSIZE}")),
         }
     } else {
         match (BITSIZE, extend32) {
             (8, false) => {
-                code.write_u32(inst::ldrb_w_reg_lsl(value_idx, xbase, xoffset))?;
+                code.ldrb_reg(WReg::new(value_idx), XReg::new(xbase), XReg::new(xoffset))?;
             }
             (16, false) => {
-                code.write_u32(inst::ldrh_w_reg_lsl(value_idx, xbase, xoffset))?;
+                code.ldrh_reg(WReg::new(value_idx), XReg::new(xbase), XReg::new(xoffset))?;
             }
             (32, false) => {
-                code.write_u32(inst::ldr_w_reg_lsl(value_idx, xbase, xoffset))?;
+                code.ldr_reg(WReg::new(value_idx), XReg::new(xbase), XReg::new(xoffset))?;
             }
             (64, false) => {
-                code.write_u32(inst::ldr_x_reg_lsl(value_idx, xbase, xoffset))?;
+                code.ldr_reg(XReg::new(value_idx), XReg::new(xbase), XReg::new(xoffset))?;
             }
             (128, false) => {
-                code.write_u32(inst::ldr_q_reg_lsl(value_idx, xbase, xoffset))?;
+                code.ldr_q_reg(QReg::new(value_idx), XReg::new(xbase), XReg::new(xoffset))?;
             }
             (8, true) => {
-                code.write_u32(inst::ldrb_w_reg_uxtw(value_idx, xbase, xoffset))?;
+                code.ldrb_reg(WReg::new(value_idx), XReg::new(xbase), WReg::new(xoffset))?;
             }
             (16, true) => {
-                code.write_u32(inst::ldrh_w_reg_uxtw(value_idx, xbase, xoffset))?;
+                code.ldrh_reg(WReg::new(value_idx), XReg::new(xbase), WReg::new(xoffset))?;
             }
             (32, true) => {
-                code.write_u32(inst::ldr_w_reg_uxtw(value_idx, xbase, xoffset))?;
+                code.ldr_reg(WReg::new(value_idx), XReg::new(xbase), WReg::new(xoffset))?;
             }
             (64, true) => {
-                code.write_u32(inst::ldr_x_reg_uxtw(value_idx, xbase, xoffset))?;
+                code.ldr_reg(XReg::new(value_idx), XReg::new(xbase), WReg::new(xoffset))?;
             }
             (128, true) => {
-                code.write_u32(inst::ldr_q_reg_uxtw(value_idx, xbase, xoffset))?;
+                code.ldr_q_reg(QReg::new(value_idx), XReg::new(xbase), WReg::new(xoffset))?;
             }
             _ => return Err(format!("Invalid ARM64 memory bitsize: {BITSIZE}")),
         }
@@ -715,7 +723,7 @@ fn emit_memory_ldr<const BITSIZE: usize>(
 }
 
 fn emit_memory_str<const BITSIZE: usize>(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     value_idx: u8,
     xbase: u8,
     xoffset: u8,
@@ -726,55 +734,55 @@ fn emit_memory_str<const BITSIZE: usize>(
         emit_add_address(code, XSCRATCH0, xbase, xoffset, extend32)?;
         match BITSIZE {
             8 => {
-                code.write_u32(inst::stlrb_w(value_idx, XSCRATCH0))?;
+                code.stlrb(WReg::new(value_idx), XReg::new(XSCRATCH0))?;
             }
             16 => {
-                code.write_u32(inst::stlrh_w(value_idx, XSCRATCH0))?;
+                code.stlrh(WReg::new(value_idx), XReg::new(XSCRATCH0))?;
             }
             32 => {
-                code.write_u32(inst::stlr_w(value_idx, XSCRATCH0))?;
+                code.stlr(WReg::new(value_idx), XReg::new(XSCRATCH0))?;
             }
             64 => {
-                code.write_u32(inst::stlr_x(value_idx, XSCRATCH0))?;
+                code.stlr(XReg::new(value_idx), XReg::new(XSCRATCH0))?;
             }
             128 => {
-                code.write_u32(inst::dmb_ish())?;
-                code.write_u32(inst::str_q_unsigned(value_idx, XSCRATCH0, 0))?;
-                code.write_u32(inst::dmb_ish())?;
+                code.dmb(BarrierOp::ISH)?;
+                code.str(QReg::new(value_idx), XReg::new(XSCRATCH0), 0)?;
+                code.dmb(BarrierOp::ISH)?;
             }
             _ => return Err(format!("Invalid ARM64 memory bitsize: {BITSIZE}")),
         }
     } else {
         match (BITSIZE, extend32) {
             (8, false) => {
-                code.write_u32(inst::strb_w_reg_lsl(value_idx, xbase, xoffset))?;
+                code.strb_reg(WReg::new(value_idx), XReg::new(xbase), XReg::new(xoffset))?;
             }
             (16, false) => {
-                code.write_u32(inst::strh_w_reg_lsl(value_idx, xbase, xoffset))?;
+                code.strh_reg(WReg::new(value_idx), XReg::new(xbase), XReg::new(xoffset))?;
             }
             (32, false) => {
-                code.write_u32(inst::str_w_reg_lsl(value_idx, xbase, xoffset))?;
+                code.str_reg(WReg::new(value_idx), XReg::new(xbase), XReg::new(xoffset))?;
             }
             (64, false) => {
-                code.write_u32(inst::str_x_reg_lsl(value_idx, xbase, xoffset))?;
+                code.str_reg(XReg::new(value_idx), XReg::new(xbase), XReg::new(xoffset))?;
             }
             (128, false) => {
-                code.write_u32(inst::str_q_reg_lsl(value_idx, xbase, xoffset))?;
+                code.str_q_reg(QReg::new(value_idx), XReg::new(xbase), XReg::new(xoffset))?;
             }
             (8, true) => {
-                code.write_u32(inst::strb_w_reg_uxtw(value_idx, xbase, xoffset))?;
+                code.strb_reg(WReg::new(value_idx), XReg::new(xbase), WReg::new(xoffset))?;
             }
             (16, true) => {
-                code.write_u32(inst::strh_w_reg_uxtw(value_idx, xbase, xoffset))?;
+                code.strh_reg(WReg::new(value_idx), XReg::new(xbase), WReg::new(xoffset))?;
             }
             (32, true) => {
-                code.write_u32(inst::str_w_reg_uxtw(value_idx, xbase, xoffset))?;
+                code.str_reg(WReg::new(value_idx), XReg::new(xbase), WReg::new(xoffset))?;
             }
             (64, true) => {
-                code.write_u32(inst::str_x_reg_uxtw(value_idx, xbase, xoffset))?;
+                code.str_reg(XReg::new(value_idx), XReg::new(xbase), WReg::new(xoffset))?;
             }
             (128, true) => {
-                code.write_u32(inst::str_q_reg_uxtw(value_idx, xbase, xoffset))?;
+                code.str_q_reg(QReg::new(value_idx), XReg::new(xbase), WReg::new(xoffset))?;
             }
             _ => return Err(format!("Invalid ARM64 memory bitsize: {BITSIZE}")),
         }
@@ -783,30 +791,104 @@ fn emit_memory_str<const BITSIZE: usize>(
 }
 
 fn emit_add_address(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     rd: u8,
     xbase: u8,
     xoffset: u8,
     extend32: bool,
 ) -> Result<(), String> {
     if extend32 {
-        code.write_u32(inst::add_x_reg_uxtw(rd, xbase, xoffset))?;
+        code.add_uxtw(XReg::new(rd), XReg::new(xbase), WReg::new(xoffset))?;
     } else {
-        code.write_u32(inst::add_x_reg(rd, xbase, xoffset))?;
+        code.add(XReg::new(rd), XReg::new(xbase), XReg::new(xoffset))?;
     }
     Ok(())
-}
-
-fn patch_branch_to_current(code: &mut BlockOfCode, branch_offset: usize) -> Result<(), String> {
-    let target_offset = code.code_size();
-    let pc_offset = i32::try_from(target_offset as isize - branch_offset as isize)
-        .map_err(|_| "ARM64 memory branch offset overflow".to_string())?;
-    code.patch_u32(branch_offset, inst::cbz_w(XSCRATCH0, pc_offset))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::arm64::inst;
+
+    #[test]
+    fn typed_memory_accesses_preserve_width_extension_and_barrier_order() {
+        fn check<const BITS: usize>() {
+            for extend32 in [false, true] {
+                for ordered in [false, true] {
+                    let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+                    let mut code = rhazel::CodeGenerator::new(&mut code_storage);
+                    emit_memory_ldr::<BITS>(&mut code, 7, 8, 9, ordered, extend32).unwrap();
+                    emit_memory_str::<BITS>(&mut code, 7, 8, 9, ordered, extend32).unwrap();
+
+                    let mut expected = Vec::new();
+                    if ordered {
+                        let address = if extend32 {
+                            inst::add_x_reg_uxtw(XSCRATCH0, 8, 9)
+                        } else {
+                            inst::add_x_reg(XSCRATCH0, 8, 9)
+                        };
+                        expected.push(address);
+                        expected.push(match BITS {
+                            8 => inst::ldarb_w(7, XSCRATCH0),
+                            16 => inst::ldarh_w(7, XSCRATCH0),
+                            32 => inst::ldar_w(7, XSCRATCH0),
+                            64 => inst::ldar_x(7, XSCRATCH0),
+                            128 => inst::ldr_q_unsigned(7, XSCRATCH0, 0),
+                            _ => unreachable!(),
+                        });
+                        if BITS == 128 {
+                            expected.push(inst::dmb_ish());
+                        }
+                        expected.push(address);
+                        if BITS == 128 {
+                            expected.push(inst::dmb_ish());
+                        }
+                        expected.push(match BITS {
+                            8 => inst::stlrb_w(7, XSCRATCH0),
+                            16 => inst::stlrh_w(7, XSCRATCH0),
+                            32 => inst::stlr_w(7, XSCRATCH0),
+                            64 => inst::stlr_x(7, XSCRATCH0),
+                            128 => inst::str_q_unsigned(7, XSCRATCH0, 0),
+                            _ => unreachable!(),
+                        });
+                        if BITS == 128 {
+                            expected.push(inst::dmb_ish());
+                        }
+                    } else {
+                        let (load, store): (fn(u8, u8, u8) -> u32, fn(u8, u8, u8) -> u32) =
+                            match (BITS, extend32) {
+                                (8, false) => (inst::ldrb_w_reg_lsl, inst::strb_w_reg_lsl),
+                                (16, false) => (inst::ldrh_w_reg_lsl, inst::strh_w_reg_lsl),
+                                (32, false) => (inst::ldr_w_reg_lsl, inst::str_w_reg_lsl),
+                                (64, false) => (inst::ldr_x_reg_lsl, inst::str_x_reg_lsl),
+                                (128, false) => (inst::ldr_q_reg_lsl, inst::str_q_reg_lsl),
+                                (8, true) => (inst::ldrb_w_reg_uxtw, inst::strb_w_reg_uxtw),
+                                (16, true) => (inst::ldrh_w_reg_uxtw, inst::strh_w_reg_uxtw),
+                                (32, true) => (inst::ldr_w_reg_uxtw, inst::str_w_reg_uxtw),
+                                (64, true) => (inst::ldr_x_reg_uxtw, inst::str_x_reg_uxtw),
+                                (128, true) => (inst::ldr_q_reg_uxtw, inst::str_q_reg_uxtw),
+                                _ => unreachable!(),
+                            };
+                        expected.extend([load(7, 8, 9), store(7, 8, 9)]);
+                    }
+                    let actual: Vec<_> = (0..code.code_size())
+                        .step_by(4)
+                        .map(|offset| read_instruction(&code, offset))
+                        .collect();
+                    assert_eq!(
+                        actual, expected,
+                        "bits={BITS}, ordered={ordered}, extend32={extend32}"
+                    );
+                }
+            }
+        }
+        check::<8>();
+        check::<16>();
+        check::<32>();
+        check::<64>();
+        check::<128>();
+    }
+
     use crate::backend::arm64::emit_arm64::{EmitConfig, EmittedBlockInfo, Relocation};
     use crate::backend::arm64::fastmem::FastmemManager;
     use crate::backend::arm64::fpsr_manager::FpsrManager;
@@ -890,21 +972,21 @@ mod tests {
 
     fn context_emit(
         block: &mut Block,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         emitted_block_info: &mut EmittedBlockInfo,
         config: &EmitConfig,
-        emit: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
+        emit: impl FnOnce(&mut CodeGenerator<'_>, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
     ) -> Result<RegAlloc, String> {
         context_emit_with_setup(block, code, emitted_block_info, config, |_, _| Ok(()), emit)
     }
 
     fn context_emit_with_setup(
         block: &mut Block,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         emitted_block_info: &mut EmittedBlockInfo,
         config: &EmitConfig,
         setup: impl FnOnce(&Block, &mut RegAlloc) -> Result<(), String>,
-        emit: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
+        emit: impl FnOnce(&mut CodeGenerator<'_>, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
     ) -> Result<RegAlloc, String> {
         let mut reg_alloc = RegAlloc::default();
         setup(block, &mut reg_alloc)?;
@@ -927,10 +1009,10 @@ mod tests {
 
     fn context_emit_with_deferred(
         block: &mut Block,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         emitted_block_info: &mut EmittedBlockInfo,
         config: &EmitConfig,
-        emit: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
+        emit: impl FnOnce(&mut CodeGenerator<'_>, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
     ) -> Result<RegAlloc, String> {
         let mut reg_alloc = RegAlloc::default();
         let mut fpsr = FpsrManager::new(config.state_fpsr_offset);
@@ -953,7 +1035,7 @@ mod tests {
             code.write_u32(inst::brk(0))?;
             let mut deferred_emits = std::mem::take(&mut ctx.deferred_emits);
             for deferred_emit in &mut deferred_emits {
-                deferred_emit()?;
+                deferred_emit(code, &mut ctx)?;
             }
         }
         Ok(reg_alloc)
@@ -961,12 +1043,12 @@ mod tests {
 
     fn context_emit_inst(
         block: &mut Block,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         emitted_block_info: &mut EmittedBlockInfo,
         config: &EmitConfig,
         inst_ref: InstRef,
         setup: impl FnOnce(&Block, &mut RegAlloc) -> Result<(), String>,
-        emit: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
+        emit: impl FnOnce(&mut CodeGenerator<'_>, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
     ) -> Result<RegAlloc, String> {
         let mut reg_alloc = RegAlloc::default();
         setup(block, &mut reg_alloc)?;
@@ -1020,7 +1102,8 @@ mod tests {
         config.silently_mirror_page_table = true;
         config.absolute_offset_page_table = false;
 
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A64ReadMemory32,
@@ -1095,7 +1178,8 @@ mod tests {
         config.absolute_offset_page_table = true;
         config.page_table_pointer_mask = u64::MAX << 5;
 
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A64ReadMemory32,
@@ -1154,7 +1238,8 @@ mod tests {
         config.page_table_marked_bit = Some(0);
         config.page_table_sign_extension = Some(57);
 
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A64ReadMemory32,
@@ -1213,7 +1298,8 @@ mod tests {
         config.silently_mirror_page_table = true;
         config.absolute_offset_page_table = false;
 
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A64WriteMemory64,
@@ -1290,7 +1376,8 @@ mod tests {
     #[test]
     fn callback_only_read_memory_records_relocation_and_return_register() {
         let config = config();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A64ReadMemory32,
@@ -1328,7 +1415,8 @@ mod tests {
     #[test]
     fn callback_only_read_memory_128_moves_q0_to_q8_and_defines_fpr() {
         let config = config();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A64ReadMemory128,
@@ -1370,7 +1458,8 @@ mod tests {
     #[test]
     fn callback_only_ordered_write_memory_wraps_callback_with_dmb() {
         let config = config();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A64WriteMemory64,
@@ -1409,7 +1498,8 @@ mod tests {
     #[test]
     fn callback_only_write_memory_128_passes_value_in_q0() {
         let config = config();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let location = LocationDescriptor::new(0x4000).value();
         let mut block = Block::new(A64LocationDescriptor::new(0x4000, 0, false).to_location());
@@ -1475,7 +1565,8 @@ mod tests {
     #[test]
     fn callback_only_exclusive_read_sets_exclusive_state_before_callback() {
         let config = config();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A64ExclusiveReadMemory32,
@@ -1518,7 +1609,8 @@ mod tests {
     #[test]
     fn callback_only_exclusive_read_memory_128_sets_state_and_defines_fpr() {
         let config = config();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A64ExclusiveReadMemory128,
@@ -1569,7 +1661,8 @@ mod tests {
     #[test]
     fn callback_only_exclusive_write_fails_without_reservation() {
         let config = config();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A64ExclusiveWriteMemory32,
@@ -1623,7 +1716,8 @@ mod tests {
     #[test]
     fn callback_only_exclusive_write_memory_128_passes_value_in_q0() {
         let config = config();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let location = LocationDescriptor::new(0x4000).value();
         let mut block = Block::new(A64LocationDescriptor::new(0x4000, 0, false).to_location());

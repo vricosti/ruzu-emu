@@ -4,6 +4,7 @@
 //! matter to rdynarmic's generated code: X0-X7 are integer arguments, X19-X28
 //! are callee-saved, FP/LR are X29/X30, and SP must be 16-byte aligned.
 
+#[cfg(test)]
 use super::block_of_code::BlockOfCode;
 use rhazel::{CodeGenerator, QReg, XReg, SP};
 
@@ -96,12 +97,11 @@ pub fn calculate_frame_info(registers: RegisterList, frame_size: usize) -> Frame
 }
 
 pub fn emit_push_registers(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     registers: RegisterList,
     frame_size: usize,
 ) -> Result<(), String> {
     let frame_info = calculate_frame_info(registers, frame_size);
-    let code = &mut CodeGenerator::new(code);
 
     code.sub_imm(SP, SP, (frame_info.gprs_size + frame_info.fprs_size) as u32)?;
     emit_store_gprs(code, &frame_info.gprs, 0)?;
@@ -111,12 +111,11 @@ pub fn emit_push_registers(
 }
 
 pub fn emit_pop_registers(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     registers: RegisterList,
     frame_size: usize,
 ) -> Result<(), String> {
     let frame_info = calculate_frame_info(registers, frame_size);
-    let code = &mut CodeGenerator::new(code);
 
     code.add_imm(SP, SP, frame_info.frame_size as u32)?;
     emit_load_gprs(code, &frame_info.gprs, 0)?;
@@ -135,7 +134,12 @@ fn list_to_indexes(list: u32) -> Vec<u8> {
 fn emit_store_gprs(code: &mut CodeGenerator<'_>, gprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in gprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 16;
-        code.stp(XReg::new(pair[0]), XReg::new(pair[1]), SP, pair_offset as i32)?;
+        code.stp(
+            XReg::new(pair[0]),
+            XReg::new(pair[1]),
+            SP,
+            pair_offset as i32,
+        )?;
     }
     if let Some(&reg) = gprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (gprs.len() - 1) * 8;
@@ -147,7 +151,12 @@ fn emit_store_gprs(code: &mut CodeGenerator<'_>, gprs: &[u8], offset: usize) -> 
 fn emit_load_gprs(code: &mut CodeGenerator<'_>, gprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in gprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 16;
-        code.ldp(XReg::new(pair[0]), XReg::new(pair[1]), SP, pair_offset as i32)?;
+        code.ldp(
+            XReg::new(pair[0]),
+            XReg::new(pair[1]),
+            SP,
+            pair_offset as i32,
+        )?;
     }
     if let Some(&reg) = gprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (gprs.len() - 1) * 8;
@@ -159,7 +168,12 @@ fn emit_load_gprs(code: &mut CodeGenerator<'_>, gprs: &[u8], offset: usize) -> R
 fn emit_store_fprs(code: &mut CodeGenerator<'_>, fprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in fprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 32;
-        code.stp_q(QReg::new(pair[0]), QReg::new(pair[1]), SP, pair_offset as i32)?;
+        code.stp_q(
+            QReg::new(pair[0]),
+            QReg::new(pair[1]),
+            SP,
+            pair_offset as i32,
+        )?;
     }
     if let Some(&reg) = fprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (fprs.len() - 1) * 16;
@@ -171,7 +185,12 @@ fn emit_store_fprs(code: &mut CodeGenerator<'_>, fprs: &[u8], offset: usize) -> 
 fn emit_load_fprs(code: &mut CodeGenerator<'_>, fprs: &[u8], offset: usize) -> Result<(), String> {
     for (pair_index, pair) in fprs.chunks_exact(2).enumerate() {
         let pair_offset = offset + pair_index * 32;
-        code.ldp_q(QReg::new(pair[0]), QReg::new(pair[1]), SP, pair_offset as i32)?;
+        code.ldp_q(
+            QReg::new(pair[0]),
+            QReg::new(pair[1]),
+            SP,
+            pair_offset as i32,
+        )?;
     }
     if let Some(&reg) = fprs.chunks_exact(2).remainder().first() {
         let reg_offset = offset + (fprs.len() - 1) * 16;
@@ -182,8 +201,8 @@ fn emit_load_fprs(code: &mut CodeGenerator<'_>, fprs: &[u8], offset: usize) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::inst;
+    use super::*;
 
     #[test]
     fn arm64_abi_register_sets_match_aapcs64() {
@@ -232,7 +251,8 @@ mod tests {
     #[test]
     fn push_pop_odd_register_lists_keep_single_transfer_offsets() {
         let registers = to_reg_list_gpr(19) | to_reg_list_vec(8);
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         emit_push_registers(&mut code, registers, 32).unwrap();
         emit_pop_registers(&mut code, registers, 32).unwrap();
         let expected = [
@@ -247,14 +267,20 @@ mod tests {
         ];
         assert_eq!(code.code_size(), expected.len() * 4);
         for (index, expected) in expected.into_iter().enumerate() {
-            let actual = unsafe { code.code_base_ptr().add(index * 4).cast::<u32>().read_unaligned() };
+            let actual = unsafe {
+                code.code_base_ptr()
+                    .add(index * 4)
+                    .cast::<u32>()
+                    .read_unaligned()
+            };
             assert_eq!(actual, expected, "instruction {index}");
         }
     }
 
     #[test]
     fn push_pop_registers_emit_upstream_order() {
-        let mut code = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code_storage = BlockOfCode::with_size(4096).expect("code cache");
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         emit_push_registers(&mut code, ABI_CALLEE_SAVE, 1184).unwrap();
         emit_pop_registers(&mut code, ABI_CALLEE_SAVE, 1184).unwrap();
 

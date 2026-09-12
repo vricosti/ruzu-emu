@@ -2,9 +2,8 @@
 //!
 //! Upstream owner: `backend/arm64/emit_arm64_packed.cpp`.
 
-use rhazel::{CodeGenerator, V0, V1, V2};
+use rhazel::{CodeGenerator, D2, V0, V1, V2};
 
-use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_context::EmitContext;
 use crate::backend::arm64::reg_alloc::{RAReg, RegAlloc};
 use crate::ir::opcode::Opcode;
@@ -44,11 +43,10 @@ fn emit_saturated_packed_op(
 }
 
 pub fn emit_packed_add_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let ge_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetGEFromOp);
@@ -71,11 +69,10 @@ pub fn emit_packed_add_u8(
 }
 
 pub fn emit_packed_add_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let ge_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetGEFromOp);
@@ -99,11 +96,10 @@ pub fn emit_packed_add_s8(
 }
 
 pub fn emit_packed_sub_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let ge_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetGEFromOp);
@@ -127,11 +123,10 @@ pub fn emit_packed_sub_u8(
 }
 
 pub fn emit_packed_sub_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let ge_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetGEFromOp);
@@ -155,11 +150,10 @@ pub fn emit_packed_sub_s8(
 }
 
 pub fn emit_packed_add_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let ge_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetGEFromOp);
@@ -182,11 +176,10 @@ pub fn emit_packed_add_u16(
 }
 
 pub fn emit_packed_add_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let ge_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetGEFromOp);
@@ -210,11 +203,10 @@ pub fn emit_packed_add_s16(
 }
 
 pub fn emit_packed_sub_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let ge_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetGEFromOp);
@@ -238,11 +230,10 @@ pub fn emit_packed_sub_u16(
 }
 
 pub fn emit_packed_sub_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let ge_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetGEFromOp);
@@ -289,7 +280,7 @@ fn emit_packed_add_sub<const ADD_IS_HI: bool, const IS_SIGNED: bool, const IS_HA
     }
     code.ext(V1.b8(), V1.b8(), V1.b8(), 4)?;
 
-    code.movi(V2.b8(), if ADD_IS_HI { 0b1111_0000 } else { 0b0000_1111 })?;
+    code.movi_rep(D2, if ADD_IS_HI { 0b1111_0000 } else { 0b0000_1111 })?;
 
     code.eor_v(V1.b8(), V1.b8(), V2.b8())?;
     code.sub_v(V1.s2(), V1.s2(), V2.s2())?;
@@ -324,262 +315,237 @@ fn emit_packed_add_sub<const ADD_IS_HI: bool, const IS_SIGNED: bool, const IS_HA
 }
 
 pub fn emit_packed_add_sub_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_add_sub::<true, false, false>(code, ctx, inst_ref)
 }
 
 pub fn emit_packed_add_sub_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_add_sub::<true, true, false>(code, ctx, inst_ref)
 }
 
 pub fn emit_packed_sub_add_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_add_sub::<false, false, false>(code, ctx, inst_ref)
 }
 
 pub fn emit_packed_sub_add_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_add_sub::<false, true, false>(code, ctx, inst_ref)
 }
 
 pub fn emit_packed_halving_add_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.uhadd(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_halving_add_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.shadd(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_halving_sub_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.uhsub(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_halving_sub_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.shsub(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_halving_add_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.uhadd(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_halving_add_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.shadd(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_halving_sub_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.uhsub(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_halving_sub_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.shsub(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_halving_add_sub_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_add_sub::<true, false, true>(code, ctx, inst_ref)
 }
 
 pub fn emit_packed_halving_add_sub_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_add_sub::<true, true, true>(code, ctx, inst_ref)
 }
 
 pub fn emit_packed_halving_sub_add_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_add_sub::<false, false, true>(code, ctx, inst_ref)
 }
 
 pub fn emit_packed_halving_sub_add_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_add_sub::<false, true, true>(code, ctx, inst_ref)
 }
 
 pub fn emit_packed_saturated_add_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.uqadd(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_saturated_add_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.sqadd(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_saturated_sub_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.uqsub(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_saturated_sub_s8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.sqsub(result.v().b8(), a.v().b8(), b.v().b8())
     })
 }
 
 pub fn emit_packed_saturated_add_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.uqadd(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_saturated_add_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.sqadd(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_saturated_sub_u16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.uqsub(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_saturated_sub_s16(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_saturated_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         code.sqsub(result.v().h4(), a.v().h4(), b.v().h4())
     })
 }
 
 pub fn emit_packed_abs_diff_sum_u8(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_packed_op(code, ctx, inst_ref, |code, result, a, b| {
         let (result, a, b) = (result.v(), a.v(), b.v());
-        code.movi(V2.b8(), 0b0000_1111)?;
+        code.movi_rep(D2, 0b0000_1111)?;
         code.uabd(result.b8(), a.b8(), b.b8())?;
         code.and_v(result.b8(), result.b8(), V2.b8())?;
         code.uaddlv(result.h(), result.b8())?;
@@ -588,11 +554,10 @@ pub fn emit_packed_abs_diff_sum_u8(
 }
 
 pub fn emit_packed_select(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
 
     let mut result = ctx.reg_alloc.write_d(inst_ref);
@@ -608,7 +573,7 @@ pub fn emit_packed_select(
 }
 
 pub fn emit_packed_instruction(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {

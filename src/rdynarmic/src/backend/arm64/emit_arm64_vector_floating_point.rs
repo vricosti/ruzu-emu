@@ -10,7 +10,6 @@ use crate::backend::arm64::abi::regs::{WSCRATCH0, XSCRATCH0, XSTATE};
 use crate::backend::arm64::abi::{
     emit_pop_registers, emit_push_registers, to_reg_list_vec, ABI_CALLER_SAVE,
 };
-use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_context::EmitContext;
 use crate::backend::arm64::reg_alloc::RegAlloc;
 use crate::common::fp::fpcr::Fpcr as CommonFpcr;
@@ -115,11 +114,10 @@ fn emit_two_op_arranged<V: VRegArranged>(
 }
 
 pub fn emit_fp_vector_abs16(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut result = ctx.reg_alloc.read_write_q(args[0], inst_ref);
     result.realize(code, ctx.block)?;
@@ -127,20 +125,18 @@ pub fn emit_fp_vector_abs16(
 }
 
 pub fn emit_fp_vector_abs32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| code.fabs(result, a))
 }
 
 pub fn emit_fp_vector_abs64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| code.fabs(result, a))
 }
 
@@ -396,387 +392,362 @@ fn emit_to_fixed<V: VRegArranged>(
 }
 
 pub fn emit_fp_vector_add32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fadd(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_add64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fadd(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_sub32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fsub(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_sub64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fsub(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_mul32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fmul(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_mul64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fmul(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_mul_x32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fmulx(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_mul_x64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fmulx(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_neg32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| code.fneg(result, a))
 }
 
 pub fn emit_fp_vector_neg64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| code.fneg(result, a))
 }
 
 pub fn emit_fp_vector_sqrt32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| code.fsqrt(result, a))
 }
 
 pub fn emit_fp_vector_sqrt64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| code.fsqrt(result, a))
 }
 
 pub fn emit_fp_vector_recip_estimate32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
-    emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| code.frecpe(result, a))
+    emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| {
+        code.frecpe(result, a)
+    })
 }
 
 pub fn emit_fp_vector_recip_estimate64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
-    emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| code.frecpe(result, a))
+    emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| {
+        code.frecpe(result, a)
+    })
 }
 
 pub fn emit_fp_vector_rsqrt_estimate32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
-    emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| code.frsqrte(result, a))
+    emit_two_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a| {
+        code.frsqrte(result, a)
+    })
 }
 
 pub fn emit_fp_vector_rsqrt_estimate64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
-    emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| code.frsqrte(result, a))
+    emit_two_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a| {
+        code.frsqrte(result, a)
+    })
 }
 
 pub fn emit_fp_vector_div32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fdiv(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_div64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fdiv(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_max32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fmax(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_max64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fmax(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_max_numeric32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fmaxnm(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_max_numeric64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fmaxnm(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_min32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fmin(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_min64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fmin(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_min_numeric32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fminnm(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_min_numeric64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fminnm(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_equal32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fcmeq(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_equal64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fcmeq(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_greater32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fcmgt(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_greater64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fcmgt(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_greater_equal32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.fcmge(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_greater_equal64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.fcmge(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_mul_add32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
-    emit_fma::<VReg4S>(code, ctx, inst_ref, |code, result, m, n| code.fmla(result, m, n))
+    emit_fma::<VReg4S>(code, ctx, inst_ref, |code, result, m, n| {
+        code.fmla(result, m, n)
+    })
 }
 
 pub fn emit_fp_vector_mul_add64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
-    emit_fma::<VReg2D>(code, ctx, inst_ref, |code, result, m, n| code.fmla(result, m, n))
+    emit_fma::<VReg2D>(code, ctx, inst_ref, |code, result, m, n| {
+        code.fmla(result, m, n)
+    })
 }
 
 pub fn emit_fp_vector_paired_add32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.faddp(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_paired_add64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.faddp(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_paired_add_lower32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut result = ctx.reg_alloc.write_q(inst_ref);
     let mut a = ctx.reg_alloc.read_q(args[0]);
@@ -794,11 +765,10 @@ pub fn emit_fp_vector_paired_add_lower32(
 }
 
 pub fn emit_fp_vector_paired_add_lower64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut result = ctx.reg_alloc.write_q(inst_ref);
     let mut a = ctx.reg_alloc.read_q(args[0]);
@@ -815,11 +785,10 @@ pub fn emit_fp_vector_paired_add_lower64(
 }
 
 pub fn emit_fp_vector_from_half32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let rounding_mode = RoundingMode::from_u8(args[1].get_immediate_u8())?;
     if rounding_mode != RoundingMode::ToNearestTieEven {
@@ -840,11 +809,10 @@ pub fn emit_fp_vector_from_half32(
 }
 
 pub fn emit_fp_vector_to_half32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let rounding_mode = RoundingMode::from_u8(args[1].get_immediate_u8())?;
     if rounding_mode != RoundingMode::ToNearestTieEven {
@@ -865,150 +833,135 @@ pub fn emit_fp_vector_to_half32(
 }
 
 pub fn emit_fp_vector_from_signed_fixed32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_from_fixed::<VReg4S>(code, ctx, inst_ref, true)
 }
 
 pub fn emit_fp_vector_from_signed_fixed64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_from_fixed::<VReg2D>(code, ctx, inst_ref, true)
 }
 
 pub fn emit_fp_vector_from_unsigned_fixed32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_from_fixed::<VReg4S>(code, ctx, inst_ref, false)
 }
 
 pub fn emit_fp_vector_from_unsigned_fixed64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_from_fixed::<VReg2D>(code, ctx, inst_ref, false)
 }
 
 pub fn emit_fp_vector_to_signed_fixed32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_to_fixed::<VReg4S>(code, ctx, inst_ref, true)
 }
 
 pub fn emit_fp_vector_to_signed_fixed64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_to_fixed::<VReg2D>(code, ctx, inst_ref, true)
 }
 
 pub fn emit_fp_vector_to_unsigned_fixed32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_to_fixed::<VReg4S>(code, ctx, inst_ref, false)
 }
 
 pub fn emit_fp_vector_to_unsigned_fixed64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_to_fixed::<VReg2D>(code, ctx, inst_ref, false)
 }
 
 pub fn emit_fp_vector_round_int16(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_round_int16(code, ctx, inst_ref)
 }
 
 pub fn emit_fp_vector_round_int32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_round_int::<VReg4S>(code, ctx, inst_ref)
 }
 
 pub fn emit_fp_vector_round_int64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_round_int::<VReg2D>(code, ctx, inst_ref)
 }
 
 pub fn emit_fp_vector_recip_step_fused32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.frecps(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_recip_step_fused64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.frecps(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_rsqrt_step_fused32(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg4S>(code, ctx, inst_ref, |code, result, a, b| {
         code.frsqrts(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_rsqrt_step_fused64(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     emit_three_op_arranged::<VReg2D>(code, ctx, inst_ref, |code, result, a, b| {
         code.frsqrts(result, a, b)
     })
 }
 
 pub fn emit_fp_vector_instruction(
-    code: &mut BlockOfCode,
+    code: &mut rhazel::CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {

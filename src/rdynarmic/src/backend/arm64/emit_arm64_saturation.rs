@@ -5,7 +5,6 @@
 use rhazel::{CodeGenerator, WZR};
 
 use crate::backend::arm64::abi::regs::{WSCRATCH0, WSCRATCH1};
-use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_context::EmitContext;
 use crate::backend::arm64::reg_alloc::RegAlloc;
 use crate::ir::cond::Cond;
@@ -13,11 +12,10 @@ use crate::ir::opcode::Opcode;
 use crate::ir::value::InstRef;
 
 pub fn emit_signed_saturated_add_with_flag32(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let overflow_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetOverflowFromOp)
@@ -46,11 +44,10 @@ pub fn emit_signed_saturated_add_with_flag32(
 }
 
 pub fn emit_signed_saturated_sub_with_flag32(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let overflow_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetOverflowFromOp)
@@ -79,11 +76,10 @@ pub fn emit_signed_saturated_sub_with_flag32(
 }
 
 pub fn emit_signed_saturation(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let overflow_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetOverflowFromOp);
@@ -128,11 +124,10 @@ pub fn emit_signed_saturation(
 }
 
 pub fn emit_unsigned_saturation(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let overflow_inst = ctx
         .block
         .get_associated_pseudo_operation(inst_ref, Opcode::GetOverflowFromOp);

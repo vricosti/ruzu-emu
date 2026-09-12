@@ -5,6 +5,7 @@
 use rhazel::{CodeGenerator, SystemReg, WReg, XZR};
 
 use super::abi::regs::{WSCRATCH0, WSCRATCH1, XSCRATCH1, XSTATE};
+#[cfg(test)]
 use super::block_of_code::BlockOfCode;
 
 #[derive(Debug)]
@@ -21,7 +22,7 @@ impl FpsrManager {
         }
     }
 
-    pub fn spill(&mut self, code: &mut BlockOfCode) -> Result<(), String> {
+    pub fn spill(&mut self, code: &mut CodeGenerator<'_>) -> Result<(), String> {
         if !self.fpsr_loaded {
             return Ok(());
         }
@@ -32,7 +33,7 @@ impl FpsrManager {
                 self.state_fpsr_offset
             )
         })?;
-        let code = &mut CodeGenerator::new(code);
+
         code.ldr(WSCRATCH0, XSTATE, offset)?;
         code.mrs(XSCRATCH1, SystemReg::FPSR)?;
         code.orr(WSCRATCH0, WSCRATCH0, WSCRATCH1)?;
@@ -42,12 +43,12 @@ impl FpsrManager {
         Ok(())
     }
 
-    pub fn load(&mut self, code: &mut BlockOfCode) -> Result<(), String> {
+    pub fn load(&mut self, code: &mut CodeGenerator<'_>) -> Result<(), String> {
         if self.fpsr_loaded {
             return Ok(());
         }
 
-        CodeGenerator::new(code).msr(SystemReg::FPSR, XZR)?;
+        code.msr(SystemReg::FPSR, XZR)?;
         self.fpsr_loaded = true;
         Ok(())
     }
@@ -58,8 +59,7 @@ impl FpsrManager {
 
     /// Upstream `FpsrManager::GetFpsr`: the state copy, OR-ed with the live
     /// FPSR while it is loaded. Does not spill.
-    pub fn get_fpsr(&self, code: &mut BlockOfCode, dest: WReg) -> Result<(), String> {
-        let code = &mut CodeGenerator::new(code);
+    pub fn get_fpsr(&self, code: &mut CodeGenerator<'_>, dest: WReg) -> Result<(), String> {
         let offset = u32::try_from(self.state_fpsr_offset).map_err(|_| {
             format!(
                 "ARM64 FPSR state offset does not fit in u32: {}",
@@ -106,7 +106,8 @@ mod tests {
 
     #[test]
     fn load_emits_fpsr_clear_once() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut fpsr = FpsrManager::new(12);
 
         fpsr.load(&mut code).unwrap();
@@ -118,7 +119,8 @@ mod tests {
 
     #[test]
     fn spill_emits_upstream_sequence_only_when_loaded() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut fpsr = FpsrManager::new(12);
 
         fpsr.spill(&mut code).unwrap();
@@ -143,7 +145,8 @@ mod tests {
 
     #[test]
     fn get_fpsr_ors_live_fpsr_only_while_loaded() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut fpsr = FpsrManager::new(12);
 
         fpsr.get_fpsr(&mut code, rhazel::W3).unwrap();
@@ -165,7 +168,8 @@ mod tests {
 
     #[test]
     fn overwrite_marks_fpsr_not_loaded_without_emitting() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut fpsr = FpsrManager::new(12);
 
         fpsr.load(&mut code).unwrap();

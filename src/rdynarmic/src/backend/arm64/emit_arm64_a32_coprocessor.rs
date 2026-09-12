@@ -5,6 +5,7 @@
 use rhazel::CodeGenerator;
 
 use crate::backend::arm64::abi::regs::{XSCRATCH0, XSCRATCH1};
+#[cfg(test)]
 use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_context::EmitContext;
 #[cfg(test)]
@@ -23,7 +24,7 @@ fn emit_coprocessor_exception() -> ! {
 }
 
 fn call_coproc_callback(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     callback: Callback,
     inst_ref: Option<InstRef>,
@@ -33,7 +34,6 @@ fn call_coproc_callback(
     ctx.reg_alloc
         .prepare_for_call(code, ctx.fpsr, [None, arg0, arg1, None])?;
 
-    let code = &mut CodeGenerator::new(code);
     if let Some(user_arg) = callback.user_arg {
         code.mov_imm(rhazel::X0, user_arg as usize as u64)?;
     }
@@ -54,7 +54,7 @@ fn call_coproc_callback(
 }
 
 pub fn emit_a32_coproc_internal_operation(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -79,7 +79,7 @@ pub fn emit_a32_coproc_internal_operation(
 }
 
 pub fn emit_a32_coproc_send_one_word(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -105,7 +105,7 @@ pub fn emit_a32_coproc_send_one_word(
         CallbackOrAccessOneWord::Memory(destination_ptr) => {
             let mut value = ctx.reg_alloc.read_w(args[1]);
             RegAlloc::realize_all(code, ctx.block, &mut [&mut value])?;
-            let code = &mut CodeGenerator::new(code);
+
             code.mov_imm(XSCRATCH0, destination_ptr as usize as u64)?;
             code.str(value.w(), XSCRATCH0, 0)?;
         }
@@ -114,7 +114,7 @@ pub fn emit_a32_coproc_send_one_word(
 }
 
 pub fn emit_a32_coproc_send_two_words(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -139,7 +139,7 @@ pub fn emit_a32_coproc_send_two_words(
             let mut value1 = ctx.reg_alloc.read_w(args[1]);
             let mut value2 = ctx.reg_alloc.read_w(args[2]);
             RegAlloc::realize_all(code, ctx.block, &mut [&mut value1, &mut value2])?;
-            let code = &mut CodeGenerator::new(code);
+
             code.mov_imm(XSCRATCH0, destination_ptrs[0] as usize as u64)?;
             code.mov_imm(XSCRATCH1, destination_ptrs[1] as usize as u64)?;
             code.str(value1.w(), XSCRATCH0, 0)?;
@@ -150,7 +150,7 @@ pub fn emit_a32_coproc_send_two_words(
 }
 
 pub fn emit_a32_coproc_get_one_word(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -175,7 +175,7 @@ pub fn emit_a32_coproc_get_one_word(
         CallbackOrAccessOneWord::Memory(source_ptr) => {
             let mut value = ctx.reg_alloc.write_w(inst_ref);
             RegAlloc::realize_all(code, ctx.block, &mut [&mut value])?;
-            let code = &mut CodeGenerator::new(code);
+
             code.mov_imm(XSCRATCH0, source_ptr as usize as u64)?;
             code.ldr(value.w(), XSCRATCH0, 0)?;
         }
@@ -184,7 +184,7 @@ pub fn emit_a32_coproc_get_one_word(
 }
 
 pub fn emit_a32_coproc_get_two_words(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -207,7 +207,7 @@ pub fn emit_a32_coproc_get_two_words(
         CallbackOrAccessTwoWords::Memory(source_ptrs) => {
             let mut value = ctx.reg_alloc.write_x(inst_ref);
             RegAlloc::realize_all(code, ctx.block, &mut [&mut value])?;
-            let code = &mut CodeGenerator::new(code);
+
             code.mov_imm(XSCRATCH0, source_ptrs[0] as usize as u64)?;
             code.mov_imm(XSCRATCH1, source_ptrs[1] as usize as u64)?;
             code.ldr(value.x(), XSCRATCH0, 0)?;
@@ -219,7 +219,7 @@ pub fn emit_a32_coproc_get_two_words(
 }
 
 pub fn emit_a32_coproc_load_words(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -243,7 +243,7 @@ pub fn emit_a32_coproc_load_words(
 }
 
 pub fn emit_a32_coproc_store_words(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -454,10 +454,10 @@ mod tests {
 
     fn emit_test(
         block: &mut Block,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         info: &mut EmittedBlockInfo,
         config: &EmitConfig,
-        emit: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
+        emit: impl FnOnce(&mut CodeGenerator<'_>, &mut EmitContext<'_>, InstRef) -> Result<(), String>,
     ) {
         let mut reg_alloc = RegAlloc::default();
         let mut fpsr = FpsrManager::new(config.state_fpsr_offset);
@@ -502,7 +502,8 @@ mod tests {
     #[test]
     fn configured_coprocessor_memory_accesses_are_emitted() {
         let config = config();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A32CoprocSendOneWord,
@@ -529,7 +530,8 @@ mod tests {
             inst::str_w_unsigned(test_gpr(0), XSCRATCH0.index(), 0)
         );
 
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A32CoprocGetOneWord,
@@ -552,7 +554,8 @@ mod tests {
 
     #[test]
     fn ignored_cp15_write_consumes_register_operand() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(
             A32LocationDescriptor::new(0x1000, PSR::new(0), FPSCR::new(0), false).to_location(),
         );
@@ -572,7 +575,8 @@ mod tests {
     #[test]
     fn configured_get_two_words_callback_is_called_directly() {
         let config = config();
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut info = empty_block_info(&code);
         let mut block = block_with_inst(
             Opcode::A32CoprocGetTwoWords,

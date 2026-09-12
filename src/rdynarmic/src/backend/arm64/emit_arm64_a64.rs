@@ -7,6 +7,7 @@ use rhazel::{BarrierOp, CodeGenerator, SystemReg, SP, W0, W1, WZR, X0, X1, X2};
 use crate::backend::arm64::abi::regs::{
     WSCRATCH0, WSCRATCH2, XHALT, XSCRATCH0, XSCRATCH1, XSCRATCH2, XSTATE, XTICKS,
 };
+#[cfg(test)]
 use crate::backend::arm64::block_of_code::BlockOfCode;
 use crate::backend::arm64::emit_arm64::{
     emit_block_link_relocation, emit_relocation, BlockRelocationType, LinkTarget,
@@ -23,8 +24,10 @@ use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};
 use crate::ir::terminal::Terminal;
 use crate::ir::value::InstRef;
 
-pub fn emit_a64_terminal(code: &mut BlockOfCode, ctx: &mut EmitContext<'_>) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
+pub fn emit_a64_terminal(
+    code: &mut CodeGenerator<'_>,
+    ctx: &mut EmitContext<'_>,
+) -> Result<(), String> {
     let location = A64LocationDescriptor::from_location(ctx.block.location);
     emit_a64_terminal_inner(
         code,
@@ -36,10 +39,9 @@ pub fn emit_a64_terminal(code: &mut BlockOfCode, ctx: &mut EmitContext<'_>) -> R
 }
 
 pub fn emit_a64_condition_failed_terminal(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let location = A64LocationDescriptor::from_location(ctx.block.location);
     let Some(condition_failed_location) = ctx.block.condition_failed_location else {
         return Err("A64 condition-failed terminal requested without location".to_string());
@@ -56,7 +58,7 @@ pub fn emit_a64_condition_failed_terminal(
 }
 
 pub(crate) fn emit_a64_check_memory_abort(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     current_location: LocationDescriptor,
     end: &mut Label,
@@ -64,7 +66,6 @@ pub(crate) fn emit_a64_check_memory_abort(
     if !ctx.conf.check_halt_on_memory_access {
         return Ok(());
     }
-    let code = &mut CodeGenerator::new(code);
 
     let current_location = A64LocationDescriptor::from_location(current_location);
     code.ldar(XSCRATCH0, XHALT)?;
@@ -80,11 +81,10 @@ pub(crate) fn emit_a64_check_memory_abort(
 }
 
 pub fn emit_a64_call_supervisor(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     ctx.reg_alloc
         .prepare_for_call(code, ctx.fpsr, [None, None, None, None])?;
@@ -108,11 +108,10 @@ pub fn emit_a64_call_supervisor(
 }
 
 pub fn emit_a64_exception_raised(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     ctx.reg_alloc
         .prepare_for_call(code, ctx.fpsr, [None, None, None, None])?;
@@ -137,7 +136,7 @@ pub fn emit_a64_exception_raised(
 }
 
 pub fn emit_a64_data_cache_operation_raised(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -152,7 +151,7 @@ pub fn emit_a64_data_cache_operation_raised(
 }
 
 pub fn emit_a64_instruction_cache_operation_raised(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -248,7 +247,11 @@ fn emit_pop_rsb_hint(code: &mut CodeGenerator<'_>) -> Result<(), String> {
     code.ldr(WSCRATCH2, SP, StackLayout::rsb_ptr_offset() as u32)?;
     code.and_imm(WSCRATCH2, WSCRATCH2, RSB_INDEX_MASK as u64)?;
     code.add_ext(X2, SP, XSCRATCH2)?;
-    code.sub_imm(WSCRATCH2, WSCRATCH2, core::mem::size_of::<RSBEntry>() as u32)?;
+    code.sub_imm(
+        WSCRATCH2,
+        WSCRATCH2,
+        core::mem::size_of::<RSBEntry>() as u32,
+    )?;
     code.str(WSCRATCH2, SP, StackLayout::rsb_ptr_offset() as u32)?;
     code.ldp(XSCRATCH0, XSCRATCH1, X2, StackLayout::rsb_offset() as i32)?;
 
@@ -259,11 +262,10 @@ fn emit_pop_rsb_hint(code: &mut CodeGenerator<'_>) -> Result<(), String> {
 }
 
 pub(crate) fn emit_a64_cond(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     cond: Cond,
 ) -> Result<Label, String> {
-    let code = &mut CodeGenerator::new(code);
     let mut pass = Label::new();
     code.ldr(WSCRATCH0, XSTATE, ctx.conf.state_nzcv_offset as u32)?;
     code.msr(SystemReg::NZCV, XSCRATCH0)?;
@@ -308,13 +310,11 @@ fn emit_set_pc_and_return_to_dispatcher(
     emit_relocation(code, ctx.emitted_block_info, LinkTarget::ReturnToDispatcher)
 }
 
-
 pub(crate) fn emit_a64_set_check_bit(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     if args[0].is_immediate() {
         if args[0].get_immediate_u1() {
@@ -332,11 +332,10 @@ pub(crate) fn emit_a64_set_check_bit(
 }
 
 pub(crate) fn emit_a64_get_c_flag(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let mut flag = ctx.reg_alloc.write_w(inst_ref);
     flag.realize(code, ctx.block)?;
     code.ldr(flag.w(), XSTATE, a64_nzcv_offset())?;
@@ -344,11 +343,10 @@ pub(crate) fn emit_a64_get_c_flag(
 }
 
 pub(crate) fn emit_a64_get_nzcv_raw(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let mut nzcv = ctx.reg_alloc.write_w(inst_ref);
     nzcv.realize(code, ctx.block)?;
     code.ldr(nzcv.w(), XSTATE, a64_nzcv_offset())
@@ -356,11 +354,10 @@ pub(crate) fn emit_a64_get_nzcv_raw(
 
 /// Upstream `A64SetNZCVRaw` and `A64SetNZCV` share this body.
 pub(crate) fn emit_a64_set_nzcv(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut nzcv = ctx.reg_alloc.read_w(args[0]);
     nzcv.realize(code, ctx.block)?;
@@ -368,11 +365,10 @@ pub(crate) fn emit_a64_set_nzcv(
 }
 
 pub(crate) fn emit_a64_get_w(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let offset = a64_reg_offset(args[0].value.get_a64_reg())?;
     let mut result = ctx.reg_alloc.write_w(inst_ref);
@@ -382,11 +378,10 @@ pub(crate) fn emit_a64_get_w(
 }
 
 pub(crate) fn emit_a64_get_x(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let offset = a64_reg_offset(args[0].value.get_a64_reg())?;
     let mut result = ctx.reg_alloc.write_x(inst_ref);
@@ -396,11 +391,10 @@ pub(crate) fn emit_a64_get_x(
 }
 
 pub(crate) fn emit_a64_get_s(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let offset = a64_vec_offset(args[0].value.get_a64_vec());
     let mut result = ctx.reg_alloc.write_s(inst_ref);
@@ -409,11 +403,10 @@ pub(crate) fn emit_a64_get_s(
 }
 
 pub(crate) fn emit_a64_get_d(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let offset = a64_vec_offset(args[0].value.get_a64_vec());
     let mut result = ctx.reg_alloc.write_d(inst_ref);
@@ -422,11 +415,10 @@ pub(crate) fn emit_a64_get_d(
 }
 
 pub(crate) fn emit_a64_get_q(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let offset = a64_vec_offset(args[0].value.get_a64_vec());
     let mut result = ctx.reg_alloc.write_q(inst_ref);
@@ -435,29 +427,27 @@ pub(crate) fn emit_a64_get_q(
 }
 
 pub(crate) fn emit_a64_get_sp(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let mut result = ctx.reg_alloc.write_x(inst_ref);
     result.realize(code, ctx.block)?;
     code.ldr(result.x(), XSTATE, a64_sp_offset())
 }
 
 pub(crate) fn emit_a64_get_fpcr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let mut result = ctx.reg_alloc.write_w(inst_ref);
     result.realize(code, ctx.block)?;
     code.ldr(result.w(), XSTATE, a64_fpcr_offset())
 }
 
 pub(crate) fn emit_a64_get_fpsr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -467,11 +457,10 @@ pub(crate) fn emit_a64_get_fpsr(
 }
 
 pub(crate) fn emit_a64_set_w(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let offset = a64_reg_offset(args[0].value.get_a64_reg())?;
     let mut value = ctx.reg_alloc.read_w(args[1]);
@@ -482,11 +471,10 @@ pub(crate) fn emit_a64_set_w(
 }
 
 pub(crate) fn emit_a64_set_x(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let offset = a64_reg_offset(args[0].value.get_a64_reg())?;
     let mut value = ctx.reg_alloc.read_x(args[1]);
@@ -496,11 +484,10 @@ pub(crate) fn emit_a64_set_x(
 }
 
 pub(crate) fn emit_a64_set_s(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let offset = a64_vec_offset(args[0].value.get_a64_vec());
     let mut value = ctx.reg_alloc.read_s(args[1]);
@@ -510,11 +497,10 @@ pub(crate) fn emit_a64_set_s(
 }
 
 pub(crate) fn emit_a64_set_d(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let offset = a64_vec_offset(args[0].value.get_a64_vec());
     let mut value = ctx.reg_alloc.read_d(args[1]);
@@ -524,11 +510,10 @@ pub(crate) fn emit_a64_set_d(
 }
 
 pub(crate) fn emit_a64_set_q(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let offset = a64_vec_offset(args[0].value.get_a64_vec());
     let mut value = ctx.reg_alloc.read_q(args[1]);
@@ -537,11 +522,10 @@ pub(crate) fn emit_a64_set_q(
 }
 
 pub(crate) fn emit_a64_set_sp(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut value = ctx.reg_alloc.read_x(args[0]);
     value.realize(code, ctx.block)?;
@@ -549,11 +533,10 @@ pub(crate) fn emit_a64_set_sp(
 }
 
 pub(crate) fn emit_a64_set_fpcr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut value = ctx.reg_alloc.read_w(args[0]);
     value.realize(code, ctx.block)?;
@@ -562,11 +545,10 @@ pub(crate) fn emit_a64_set_fpcr(
 }
 
 pub(crate) fn emit_a64_set_fpsr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut value = ctx.reg_alloc.read_w(args[0]);
     value.realize(code, ctx.block)?;
@@ -575,27 +557,28 @@ pub(crate) fn emit_a64_set_fpsr(
 }
 
 pub(crate) fn emit_a64_set_pc(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut value = ctx.reg_alloc.read_x(args[0]);
     value.realize(code, ctx.block)?;
     code.str(value.x(), XSTATE, a64_pc_offset())
 }
 
-pub(crate) fn emit_a64_data_synchronization_barrier(code: &mut BlockOfCode) -> Result<(), String> {
-    CodeGenerator::new(code).dsb(BarrierOp::SY)
+pub(crate) fn emit_a64_data_synchronization_barrier(
+    code: &mut CodeGenerator<'_>,
+) -> Result<(), String> {
+    code.dsb(BarrierOp::SY)
 }
 
-pub(crate) fn emit_a64_data_memory_barrier(code: &mut BlockOfCode) -> Result<(), String> {
-    CodeGenerator::new(code).dmb(BarrierOp::SY)
+pub(crate) fn emit_a64_data_memory_barrier(code: &mut CodeGenerator<'_>) -> Result<(), String> {
+    code.dmb(BarrierOp::SY)
 }
 
 pub(crate) fn emit_a64_instruction_synchronization_barrier(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
 ) -> Result<(), String> {
     if !ctx.conf.hook_isb {
@@ -612,22 +595,20 @@ pub(crate) fn emit_a64_instruction_synchronization_barrier(
 }
 
 pub(crate) fn emit_a64_get_cntfrq(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let mut value = ctx.reg_alloc.write_x(inst_ref);
     value.realize(code, ctx.block)?;
     code.mov_imm(value.x(), ctx.conf.cntfreq_el0)
 }
 
 pub(crate) fn emit_a64_get_cntpct(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     ctx.reg_alloc
         .prepare_for_call(code, ctx.fpsr, [None, None, None, None])?;
 
@@ -653,29 +634,27 @@ pub(crate) fn emit_a64_get_cntpct(
 }
 
 pub(crate) fn emit_a64_get_ctr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let mut value = ctx.reg_alloc.write_w(inst_ref);
     value.realize(code, ctx.block)?;
     code.mov_imm(value.w(), u64::from(ctx.conf.ctr_el0))
 }
 
 pub(crate) fn emit_a64_get_dczid(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
-    let code = &mut CodeGenerator::new(code);
     let mut value = ctx.reg_alloc.write_w(inst_ref);
     value.realize(code, ctx.block)?;
     code.mov_imm(value.w(), u64::from(ctx.conf.dczid_el0))
 }
 
 pub(crate) fn emit_a64_get_tpidr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -683,7 +662,7 @@ pub(crate) fn emit_a64_get_tpidr(
 }
 
 pub(crate) fn emit_a64_get_tpidrro(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
@@ -691,14 +670,13 @@ pub(crate) fn emit_a64_get_tpidrro(
 }
 
 pub(crate) fn emit_a64_set_tpidr(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
 ) -> Result<(), String> {
     if ctx.conf.tpidr_el0.is_null() {
         return Err("A64SetTPIDR emitted without tpidr_el0 backing pointer".to_string());
     }
-    let code = &mut CodeGenerator::new(code);
 
     let args = ctx.reg_alloc.get_argument_info(ctx.block, inst_ref);
     let mut value = ctx.reg_alloc.read_x(args[0]);
@@ -711,7 +689,7 @@ pub(crate) fn emit_a64_set_tpidr(
 /// Upstream dereferences an unset pointer at run time; this port rejects it
 /// at emit time instead.
 fn emit_load_system_u64_pointer(
-    code: &mut BlockOfCode,
+    code: &mut CodeGenerator<'_>,
     ctx: &mut EmitContext<'_>,
     inst_ref: InstRef,
     ptr: u64,
@@ -719,7 +697,6 @@ fn emit_load_system_u64_pointer(
     if ptr == 0 {
         return Err("A64 system register emitted without backing pointer".to_string());
     }
-    let code = &mut CodeGenerator::new(code);
 
     let mut value = ctx.reg_alloc.write_x(inst_ref);
     value.realize(code, ctx.block)?;
@@ -764,12 +741,12 @@ fn a64_fpcr_offset() -> u32 {
 mod tests {
     use super::*;
     use crate::backend::arm64::abi::{XHALT, XSCRATCH0, XSCRATCH1, XSCRATCH2, XSTATE, XTICKS};
-    use crate::backend::arm64::inst;
     use crate::backend::arm64::emit_arm64::{
         BlockRelocation, EmitConfig, EmittedBlockInfo, Relocation,
     };
     use crate::backend::arm64::fastmem::FastmemManager;
     use crate::backend::arm64::fpsr_manager::FpsrManager;
+    use crate::backend::arm64::inst;
     use crate::backend::arm64::reg_alloc::RegAlloc;
     use crate::interface::a64::config::{
         Exception as A64Exception, UserCallbacks as A64UserCallbacks, UserConfig as A64UserConfig,
@@ -852,17 +829,17 @@ mod tests {
 
     fn with_context(
         block: &mut Block,
-        code: &mut BlockOfCode,
-        f: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>),
+        code: &mut CodeGenerator<'_>,
+        f: impl FnOnce(&mut CodeGenerator<'_>, &mut EmitContext<'_>),
     ) -> EmittedBlockInfo {
         with_context_config(block, code, config(), f)
     }
 
     fn with_context_config(
         block: &mut Block,
-        code: &mut BlockOfCode,
+        code: &mut CodeGenerator<'_>,
         config: A64UserConfig,
-        f: impl FnOnce(&mut BlockOfCode, &mut EmitContext<'_>),
+        f: impl FnOnce(&mut CodeGenerator<'_>, &mut EmitContext<'_>),
     ) -> EmittedBlockInfo {
         let conf = EmitConfig::from_a64_config(&config);
         let mut reg_alloc = RegAlloc::default();
@@ -892,7 +869,8 @@ mod tests {
 
     #[test]
     fn data_cache_callback_uses_operation_and_value_arguments() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         let inst_ref = block.append(
             Opcode::A64DataCacheOperationRaised,
@@ -926,7 +904,8 @@ mod tests {
 
     #[test]
     fn instruction_cache_callback_uses_operation_and_value_arguments() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         let inst_ref = block.append(
             Opcode::A64InstructionCacheOperationRaised,
@@ -956,7 +935,8 @@ mod tests {
 
     #[test]
     fn return_to_dispatch_terminal_emits_relocation_placeholder() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         block.terminal = Terminal::ReturnToDispatch;
 
@@ -976,7 +956,8 @@ mod tests {
 
     #[test]
     fn check_memory_abort_emits_upstream_abort_path_when_enabled() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         let current_location = A64LocationDescriptor::new(0x2004, 0, false).to_location();
 
@@ -1012,7 +993,8 @@ mod tests {
 
     #[test]
     fn check_memory_abort_emits_nothing_when_disabled() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         let current_location = A64LocationDescriptor::new(0x2004, 0, false).to_location();
 
@@ -1028,7 +1010,8 @@ mod tests {
 
     #[test]
     fn link_block_fast_updates_pc_then_returns_to_dispatcher_without_block_linking() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, true).to_location());
         let next = A64LocationDescriptor::new(0x1234_5678_9abc, 0, false).to_location();
         block.terminal = Terminal::LinkBlockFast { next };
@@ -1057,7 +1040,8 @@ mod tests {
 
     #[test]
     fn link_block_updates_pc_then_returns_to_dispatcher_without_block_linking() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, true).to_location());
         let next = A64LocationDescriptor::new(0x2004, 0, false).to_location();
         block.terminal = Terminal::LinkBlock { next };
@@ -1084,7 +1068,8 @@ mod tests {
 
     #[test]
     fn link_block_with_block_linking_checks_halt_then_links_or_falls_back() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         let next = A64LocationDescriptor::new(0x2004, 0, false).to_location();
         block.terminal = Terminal::LinkBlock { next };
@@ -1125,7 +1110,8 @@ mod tests {
 
     #[test]
     fn link_block_with_cycle_counting_checks_ticks_then_links_or_falls_back() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         let next = A64LocationDescriptor::new(0x2004, 0, false).to_location();
         block.terminal = Terminal::LinkBlock { next };
@@ -1166,7 +1152,8 @@ mod tests {
 
     #[test]
     fn fast_dispatch_hint_returns_to_dispatcher_like_upstream_todo_path() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         block.terminal = Terminal::FastDispatchHint;
 
@@ -1181,7 +1168,8 @@ mod tests {
 
     #[test]
     fn pop_rsb_hint_with_rsb_optimization_emits_upstream_prediction_path() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         block.terminal = Terminal::PopRSBHint;
 
@@ -1239,7 +1227,8 @@ mod tests {
 
     #[test]
     fn check_halt_branches_to_dispatcher_when_halted() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         block.terminal = Terminal::CheckHalt {
             else_: Box::new(Terminal::ReturnToDispatch),
@@ -1264,7 +1253,8 @@ mod tests {
 
     #[test]
     fn check_bit_branches_between_then_and_else_terminals() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         block.terminal = Terminal::CheckBit {
             then_: Box::new(Terminal::ReturnToDispatch),
@@ -1294,7 +1284,8 @@ mod tests {
 
     #[test]
     fn if_terminal_restores_nzcv_then_branches_to_then_terminal() {
-        let mut code = BlockOfCode::with_size(4096).unwrap();
+        let mut code_storage = BlockOfCode::with_size(4096).unwrap();
+        let mut code = rhazel::CodeGenerator::new(&mut code_storage);
         let mut block = Block::new(A64LocationDescriptor::new(0x1000, 0, false).to_location());
         block.terminal = Terminal::If {
             cond: Cond::NE,

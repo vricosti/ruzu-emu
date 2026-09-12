@@ -1,5 +1,117 @@
 # Upstream parity notes
 
+## 2026-09-12 - ARM64 emitter interfaces vs dynarmic/backend/arm64/emit_arm64.h and matching .cpp owners
+
+### Intentional differences
+- All `emit_arm64*.rs` owners now receive `&mut CodeGenerator`, including A32,
+  A64, their memory/coprocessor owners, cryptography, saturation, packed, scalar
+  FP, vector, vector FP and vector saturation. `abi.rs`, `reg_alloc.rs`,
+  `fpsr_manager.rs` and `prelude.rs` use the same borrowed generator. This
+  supersedes the temporary BlockOfCode wrappers recorded below.
+- Rust borrows a generator at each AddressSpace emission boundary rather than
+  storing a self-referential generator beside its code buffer. Executable memory,
+  linking, invalidation and cache ownership remain in AddressSpace.
+- `emit_context.rs` passes generator/context references to deferred closures at
+  execution rather than capturing C++ references or aliased Rust raw pointers.
+  `emit_arm64.rs` drains them after terminal emission and before the final BRK,
+  matching `emit_arm64.cpp`; memory fallback labels keep their original order.
+- Unit tests may use raw encoders as expected-word references. A source-boundary
+  test prevents raw instruction writes and BlockOfCode emitter interfaces from
+  reappearing in production emitter owners.
+- Final release validation: 973 rdynarmic library tests, four additional tests,
+  and 55 rhazel tests including doctests pass. Both emulator executables and the
+  macOS app build. Freebrick's menu displays under Vulkan with continuing GPU
+  submissions. The optional C++ oracle is absent, so its comparisons are not
+  counted as validated; this pass does not claim performance or full gameplay.
+
+### Missing items
+- This verifies the assembler interface migration, not unrelated existing JIT
+  scheduling or fastmem capabilities. See the scope-specific notes below.
+
+## 2026-09-12 - emit_arm64_data_processing.rs and emit_arm64_vector.rs vs matching Dynarmic .cpp owners
+
+### Intentional differences
+- Typed W/X and arranged SIMD methods replace raw instruction callbacks without
+  moving IR logic into rhazel. Rust suffixes and generic operand traits represent
+  C++ overloads. Table lists retain consecutive-register encoding and validation.
+- Upstream comparison also corrected X-width ASR carry shifts after SXTW, carry
+  guard lifetime, MostSignificantWord realization order, and explicit register
+  width requests for sign extension, reduction and element access.
+- Packing now uses upstream MOV to the high D element, replacing the old FMOV
+  high-lane encoding. The expected-word regression was updated accordingly.
+- Independent Oaknut-derived fixtures cover 60 integer and 292 vector encodings;
+  a native ARM64 regression covers sign-extended variable shifts 32, 33 and 63.
+
+### Missing items
+- Pre-existing register-only bit-operation selection differs from upstream's
+  MaybeBitImm optimization. MOV-immediate materialization retains the existing
+  deterministic MOVZ/MOVK sequences. Neither optimization is silently claimed
+  ported by the typed API migration.
+
+## 2026-09-12 - emit_arm64_floating_point.rs vs dynarmic/backend/arm64/emit_arm64_floating_point.cpp and emit_arm64.h
+
+### Intentional differences
+- All 72 entry points retain ownership, operand order, allocation/FPSR ordering,
+  rounding and conversion branches. Scalar S/D traits and precision-specific
+  method names express Oaknut overloads in Rust. Fused operations retain b,c,a
+  order; fixed conversions retain signed-16 correction and FPCR restore order.
+- `rhazel/src/code_generator/scalar_fp.rs` implements the mnemonic overloads from
+  Oaknut's FPSIMD definitions; 145 independent fixtures and invalid scale/shift
+  tests cover their words. Existing early Rust validation remains unchanged.
+
+## 2026-09-12 - emit_arm64_a32.rs and emit_arm64_memory.rs vs matching Dynarmic .cpp/.h owners
+
+### Intentional differences
+- Typed state/memory accesses preserve offsets, W/X/Q widths, barriers, page-table
+  checks, ordered accesses, exclusive failure exits and deferred fallback order.
+  CodeGenerator labels replace local raw branch patches at the same targets.
+- `rhazel/src/code_generator/a32_memory.rs` owns the corresponding Oaknut memory
+  overloads. Tests cover all five access sizes, both offset extensions and both
+  ordering modes, including SP and signed unscaled offsets.
+- The existing marked-bit forward TBNZ expansion remains TBZ plus B to preserve
+  long fallback reach. Existing instruction lengths and relocation slots remain.
+
+### Missing items
+- Existing A32 SVC halt-store scheduling, restricted fastmem configurations and
+  captured block location for abort callbacks differ from upstream independently
+  of the assembler API. Changing those contracts is outside this migration.
+
+## 2026-09-12 - reg_alloc.rs, prelude.rs and address_space.rs vs Dynarmic reg_alloc.h/.cpp and address_space.h/.cpp
+
+### Intentional differences
+- RegAlloc spills/copies and FPSR operations now emit typed operands with unchanged
+  state/stack offsets and ownership. Prelude remains a separate existing Rust
+  owner for upstream AddressSpace prelude methods; no method moved in this pass.
+- Link/Relink use a generator at the patch offset, matching Oaknut's separate
+  patch pointer. B/BL and ADRL compute relative to that pointer; appending remains
+  unaffected. AddressSpace still owns deferred I-cache range publication.
+- The rhazel patch buffer rejects checked-add overflow before pointer arithmetic;
+  this validates Rust's bounded allocation rather than relying on an unchecked
+  C++ code pointer. Independent patch tests cover branch/page limits, cursor
+  separation and immediate/deferred publication on ARM64.
+- Patch generators intentionally accept direct-target/relative mnemonics only;
+  label operations return an error before mutation, and mutable dereferencing of
+  their append buffer is rejected. Upstream supports labels on arbitrary code
+  pointers; no migrated patch caller needs that overload. Normal emission labels
+  remain supported. Tests cover rejection without cursor, buffer or label changes.
+
+### Binary layout verification
+- State structs, callback ABI and serialized layouts are unchanged. Q stack
+  transfers, prelude offsets and relocation slots are checked by existing tests;
+  mnemonic tests compare literal instruction words independent of the wrappers.
+
+## 2026-09-12 - emit_arm64_packed.rs vs dynarmic/backend/arm64/emit_arm64_packed.cpp
+
+### Intentional differences
+- Mixed add/sub and absolute-difference sum now use `movi_rep(D2, mask)`,
+  matching upstream `MOVI(D2, RepImm{mask})`. The old byte broadcast was a real
+  pre-existing divergence: 0x0f must expand to 0x00000000ffffffff, not eight 0x0f
+  bytes. `rhazel/src/inst.rs` owns the encoding and `code_generator/vector.rs`
+  owns its typed D-register overload.
+- Verified against Oaknut's DReg/RepImm definition and independent literal words;
+  native ARM64 tests execute all 256 masks and upstream packed scratch sequences,
+  including high-byte garbage filtering and results larger than 15.
+
 ## 2026-09-12 - src/rdynarmic/src/backend/arm64/abi.rs vs dynarmic/backend/arm64/abi.h and abi.cpp
 
 ### Intentional differences

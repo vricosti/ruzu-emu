@@ -15,6 +15,26 @@
 ### Binary layout verification
 - n/a (instruction encoding tests cover TBZ/TBNZ).
 
+## 2026-09-11 — src/video_core/src/renderer_metal/metal_texture_cache.rs MSAA scratch download (ruzu Metal; Eden has no Metal backend)
+
+Eden's texture-cache backends are OpenGL (`HAS_MSAA_DOWNLOADS = false`) and Vulkan (`HAS_MSAA_DOWNLOADS = true`, scratch image + `CopyMSAA` / `CopyMSAADepth`). There is no Eden Metal tree to port. This slice is a native Metal implementation of the same common-cache contract (`P::HAS_MSAA_DOWNLOADS` + `Runtime::CanDownloadMsaa` + scratch expand then buffer readback), using Vulkan's `Image::DownloadMemory` MSAA path as the behavioral reference.
+
+### Native Metal choices (not Eden-Metal divergences)
+- `HAS_MSAA_DOWNLOADS` and `can_download_msaa` live on `MetalTextureCacheParams` / `MetalTextureCacheRuntime`.
+- Scratch images are pooled `MetalImage`s keyed by guest format, type and extent. Vulkan keys `VkImageCreateInfo` including usage/flags; Metal usage comes from `texture_usage`.
+- Sample expansion uses the existing Metal color `CopyMSAA` helper into the scratch image, then the ordinary single-sample download. Vulkan's depth `CopyMSAADepth` / shader-stencil-export path is not implemented, so depth, stencil and integer color stay undownloadable.
+- `CanDownloadMsaa` also requires Metal's native sample count to equal the guest count. A clamped sample count would not match the guest expanded grid.
+
+### Unintentional differences (to fix)
+- None in this slice.
+
+### Missing relative to the Vulkan reference
+- MSAA uploads (`CanUploadMSAA` remains false).
+- Depth/stencil MSAA expansion (`CopyMSAADepth`).
+- Integer-color MSAA expansion.
+
+### Binary layout verification
+- n/a (GPU runtime, not a serialized payload).
 ## 2026-09-12 — time shared-memory writers vs eden `psc/time/service_manager.cpp` SetupStandard*ClockCore
 
 ### Intentional differences

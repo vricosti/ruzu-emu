@@ -23,6 +23,7 @@ use crate::engines::fermi_2d::{Filter, Operation};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::surface::{get_format_type, PixelFormat, SurfaceType};
 use crate::texture_cache::image_base::ImageBase;
+use crate::texture_cache::image_info::ImageInfo;
 use crate::texture_cache::image_view_base::ImageViewBase;
 use crate::texture_cache::image_view_info::ImageViewInfo;
 use crate::texture_cache::render_targets::RenderTargets;
@@ -30,8 +31,9 @@ use crate::texture_cache::texture_cache_base::{
     DescriptorSyncRegs, ImageViewInOut, TextureCacheBase as CommonTextureCache, TextureCacheParams,
 };
 use crate::texture_cache::types::{
-    BufferImageCopy, FramebufferId, ImageCopy, ImageId, ImageType, ImageViewId, ImageViewType,
-    Region2D, SamplerId, NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID, NUM_RT,
+    BufferImageCopy, Extent2D, Extent3D, FramebufferId, ImageCopy, ImageId, ImageType, ImageViewId,
+    ImageViewType, Region2D, SamplerId, SubresourceBase, SubresourceExtent, SubresourceRange,
+    NULL_IMAGE_ID, NULL_IMAGE_VIEW_ID, NULL_SAMPLER_ID, NUM_RT,
 };
 use shader_recompiler::shader_info::TextureType;
 
@@ -64,6 +66,8 @@ pub enum MetalTextureCacheError {
     Image(#[from] MetalImageError),
     #[error(transparent)]
     ImageView(#[from] MetalImageViewError),
+    #[error(transparent)]
+    Framebuffer(#[from] MetalFramebufferError),
     #[error("Metal image copy requires byte-compatible formats")]
     IncompatibleFormats,
     #[error("native Metal image copy does not support multisample textures")]
@@ -77,6 +81,43 @@ pub enum MetalTextureCacheError {
 // Native-only optimization budget. Allocation failure keeps the ordinary path.
 const SAMPLING_SNAPSHOT_HEAP_BYTES: usize = 64 * 1024 * 1024;
 const SAMPLING_SNAPSHOT_VIEW_LIMIT: usize = 64;
+const MAX_UNUSED_MSAA_SCRATCH_FRAMES: u32 = 60;
+
+/// Pooled scratch identity for MSAA downloads. Eden has no Metal backend;
+/// Vulkan `TextureCacheRuntime::MsaaScratchKey` is the cache-contract reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MsaaScratchKey {
+    format: PixelFormat,
+    image_type: ImageType,
+    width: u32,
+    height: u32,
+    depth: u32,
+    levels: u32,
+    layers: u32,
+}
+
+impl MsaaScratchKey {
+    fn from_info(info: &ImageInfo) -> Self {
+        Self {
+            format: info.format,
+            image_type: info.image_type,
+            width: info.size.width.max(1),
+            height: info.size.height.max(1),
+            depth: info.size.depth.max(1),
+            levels: info.resources.levels.max(1) as u32,
+            layers: info.resources.layers.max(1) as u32,
+        }
+    }
+}
+
+/// Pooled single-sample scratch used by MSAA downloads. Eden has no Metal
+/// backend; Vulkan `TextureCacheRuntime::MsaaScratchImage` is the reference.
+struct MsaaScratchImage {
+    key: MsaaScratchKey,
+    image: MetalImage,
+    tick: u64,
+    unused_frames: u32,
+}
 
 struct SamplingSnapshot {
     // Holding the source prevents pointer reuse from aliasing an old cache key.
@@ -159,6 +200,7 @@ pub struct MetalTextureCacheRuntime {
     blit_image_helper: NonNull<MetalBlitHelper>,
     depth_stencil_copy: Option<MetalDepthStencilCopy>,
     sampling_snapshots: SamplingSnapshotCache,
+    msaa_scratch_images: Vec<MsaaScratchImage>,
     memory_profile_last_report: Option<Instant>,
 }
 
@@ -176,6 +218,7 @@ impl MetalTextureCacheRuntime {
             blit_image_helper: NonNull::from(blit_image_helper),
             depth_stencil_copy: None,
             sampling_snapshots: SamplingSnapshotCache::default(),
+            msaa_scratch_images: Vec::new(),
             memory_profile_last_report: std::env::var_os("RUZU_PROFILE_METAL_SUBMISSIONS")
                 .is_some().then(Instant::now),
         }
@@ -271,11 +314,26 @@ impl MetalTextureCacheRuntime {
         let scheduler = unsafe { self.scheduler.as_mut() };
         let pool = unsafe { self.staging_buffer_pool.as_mut() };
         pool.tick_frame(scheduler)?;
+        self.msaa_scratch_images.retain_mut(|scratch| {
+            if !scheduler.is_free(scratch.tick).unwrap_or(false) {
+                scratch.unused_frames = 0;
+                return true;
+            }
+            scratch.unused_frames += 1;
+            scratch.unused_frames <= MAX_UNUSED_MSAA_SCRATCH_FRAMES
+        });
         Ok(())
     }
 
-    /// CPU-facing download for single-sample images. The common GC excludes
-    /// multisample images from safe downloads, as upstream does.
+    /// Common-cache `Runtime::CanDownloadMsaa`. Eden has no Metal backend;
+    /// Vulkan's aspect rules are the reference. Metal only expands float color
+    /// through `CopyMSAA` into a single-sample scratch image.
+    pub fn can_download_msaa(&self, info: &ImageInfo) -> bool {
+        can_download_msaa_info(info, self.device.profile().best_supported_sample_count(info.num_samples))
+    }
+
+    /// CPU-facing download. MSAA images go through a single-sample scratch
+    /// expansion (`CopyMSAA`) before the ordinary buffer readback.
     pub fn download_single_sample_memory(
         &mut self,
         image: &MetalImage,
@@ -283,8 +341,17 @@ impl MetalTextureCacheRuntime {
         copies: &[BufferImageCopy],
     ) -> Result<(), MetalTextureCacheError> {
         if image.guest_samples() > 1 || image.samples() > 1 {
-            return Err(MetalImageError::InvalidCopy("download requires a resolved single-sample image").into());
+            return self.download_msaa_memory(image, output, copies);
         }
+        self.download_resolved_memory(image, output, copies)
+    }
+
+    fn download_resolved_memory(
+        &mut self,
+        image: &MetalImage,
+        output: &mut [u8],
+        copies: &[BufferImageCopy],
+    ) -> Result<(), MetalTextureCacheError> {
         match image.guest_format() {
             PixelFormat::D24UnormS8Uint | PixelFormat::S8UintD24Unorm => {
                 return self.download_depth24_stencil8_memory(image, output, copies);
@@ -314,6 +381,144 @@ impl MetalTextureCacheRuntime {
         }
         self.finish()?;
         output.copy_from_slice(buffer.mapped_span());
+        Ok(())
+    }
+
+    fn download_msaa_memory(
+        &mut self,
+        image: &MetalImage,
+        output: &mut [u8],
+        copies: &[BufferImageCopy],
+    ) -> Result<(), MetalTextureCacheError> {
+        let source_info = guest_image_info(image);
+        if !self.can_download_msaa(&source_info) {
+            return Err(MetalImageError::InvalidCopy(
+                "download requires a resolved single-sample image",
+            )
+            .into());
+        }
+        let scratch_info = msaa_scratch_info(&source_info);
+        let key = MsaaScratchKey::from_info(&scratch_info);
+        let tick = self.scheduler().current_tick();
+        let scratch = self.acquire_msaa_scratch_image(&scratch_info)?;
+        let result = self
+            .copy_msaa_color_to_scratch(image, &scratch, copies)
+            .and_then(|()| self.download_resolved_memory(&scratch, output, copies));
+        self.release_msaa_scratch_image(key, scratch, tick);
+        result
+    }
+
+    fn acquire_msaa_scratch_image(
+        &mut self,
+        info: &ImageInfo,
+    ) -> Result<MetalImage, MetalTextureCacheError> {
+        let key = MsaaScratchKey::from_info(info);
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        let index = self.msaa_scratch_images.iter().position(|scratch| {
+            scratch.key == key && scheduler.is_free(scratch.tick).unwrap_or(false)
+        });
+        if let Some(index) = index {
+            return Ok(self.msaa_scratch_images.swap_remove(index).image);
+        }
+        Ok(MetalImage::new(&self.device, info)?)
+    }
+
+    fn release_msaa_scratch_image(&mut self, key: MsaaScratchKey, image: MetalImage, tick: u64) {
+        self.msaa_scratch_images.push(MsaaScratchImage {
+            key,
+            image,
+            tick,
+            unused_frames: 0,
+        });
+    }
+
+    fn copy_msaa_color_to_scratch(
+        &mut self,
+        source: &MetalImage,
+        destination: &MetalImage,
+        copies: &[BufferImageCopy],
+    ) -> Result<(), MetalTextureCacheError> {
+        let source_info = guest_image_info(source);
+        let destination_info = guest_image_info(destination);
+        for copy in copies {
+            if copy.image_offset.z != 0 || copy.image_extent.depth > 1 {
+                return Err(MetalTextureCacheError::InvalidCopy(
+                    "MSAA download copies must be 2D",
+                ));
+            }
+            let layers = copy.image_subresource.num_layers.max(1);
+            for layer in 0..layers {
+                let range = SubresourceRange {
+                    base: SubresourceBase {
+                        level: copy.image_subresource.base_level,
+                        layer: copy.image_subresource.base_layer.saturating_add(layer),
+                    },
+                    extent: SubresourceExtent {
+                        levels: 1,
+                        layers: 1,
+                    },
+                };
+                let view_info = ImageViewInfo::for_render_target(
+                    ImageViewType::E2D,
+                    source.guest_format(),
+                    range,
+                );
+                let mut source_base = Box::new(ImageViewBase::new(
+                    &view_info,
+                    &source_info,
+                    ImageId { index: 1 },
+                    0,
+                ));
+                let mut destination_base = Box::new(ImageViewBase::new(
+                    &view_info,
+                    &destination_info,
+                    ImageId { index: 2 },
+                    0,
+                ));
+                let source_view = MetalImageView::new(
+                    NonNull::from(source_base.as_mut()),
+                    &view_info,
+                    source,
+                )?;
+                let destination_view = MetalImageView::new(
+                    NonNull::from(destination_base.as_mut()),
+                    &view_info,
+                    destination,
+                )?;
+                let mut colors = [None; NUM_RT];
+                colors[0] = Some(&destination_view);
+                let level = copy.image_subresource.base_level.max(0) as u32;
+                let framebuffer = MetalFramebuffer::new(
+                    colors,
+                    None,
+                    &RenderTargets {
+                        size: Extent2D {
+                            width: (destination_info.size.width >> level).max(1),
+                            height: (destination_info.size.height >> level).max(1),
+                        },
+                        ..RenderTargets::default()
+                    },
+                )?;
+                let region = MetalBlitRegion {
+                    start: (copy.image_offset.x, copy.image_offset.y),
+                    end: (
+                        copy.image_offset.x.saturating_add(copy.image_extent.width as i32),
+                        copy.image_offset.y.saturating_add(copy.image_extent.height as i32),
+                    ),
+                };
+                let scheduler = unsafe { self.scheduler.as_mut() };
+                let helper = unsafe { self.blit_image_helper.as_mut() };
+                helper.copy_msaa_to_single_sample_color(
+                    scheduler,
+                    &framebuffer,
+                    &source_view,
+                    region,
+                    region,
+                    source.samples(),
+                )?;
+                destination.mark_contents_modified();
+            }
+        }
         Ok(())
     }
 
@@ -765,6 +970,9 @@ impl TextureCacheParams for MetalTextureCacheParams {
     const HAS_EMULATED_COPIES: bool = false;
     const HAS_DEVICE_MEMORY_INFO: bool = false;
     const IMPLEMENTS_ASYNC_DOWNLOADS: bool = false;
+    // Eden has no Metal backend. Vulkan sets this true after scratch CopyMSAA
+    // downloads; OpenGL leaves it false. Metal follows the Vulkan contract.
+    const HAS_MSAA_DOWNLOADS: bool = true;
 
     fn create_image(
         runtime: Option<&mut Self::Runtime>,
@@ -954,6 +1162,10 @@ impl TextureCacheParams for MetalTextureCacheParams {
 
     fn can_upload_msaa(_cache: &CommonTextureCache<Self>) -> bool {
         false
+    }
+
+    fn can_download_msaa(cache: &CommonTextureCache<Self>, info: &ImageInfo) -> bool {
+        cache.runtime().can_download_msaa(info)
     }
 
     fn transition_image_layout(_cache: &mut CommonTextureCache<Self>, _image_id: ImageId) {
@@ -2090,6 +2302,54 @@ fn mip_size(image: &MetalImage, level: usize) -> MTLSize {
     }
 }
 
+fn guest_image_info(image: &MetalImage) -> ImageInfo {
+    let (samples_x, samples_y) =
+        crate::texture_cache::samples_helper::samples_log2(image.guest_samples().max(1) as i32);
+    ImageInfo {
+        format: image.guest_format(),
+        image_type: image.image_type(),
+        size: Extent3D {
+            width: image.size().0 << samples_x.max(0) as u32,
+            height: image.size().1 << samples_y.max(0) as u32,
+            depth: image.size().2,
+        },
+        resources: SubresourceExtent {
+            levels: image.levels() as i32,
+            layers: image.layers() as i32,
+        },
+        num_samples: image.guest_samples(),
+        ..ImageInfo::default()
+    }
+}
+
+fn msaa_scratch_info(info: &ImageInfo) -> ImageInfo {
+    let mut scratch = info.clone();
+    scratch.num_samples = 1;
+    scratch
+}
+
+/// Aspect/format rules of Metal `CopyMSAA` downloads. Native sample count
+/// must match the guest count so the expanded grid stays bit-identical.
+fn can_download_msaa_info(info: &ImageInfo, native_samples: u32) -> bool {
+    if !matches!(info.num_samples, 2 | 4 | 8 | 16) || native_samples != info.num_samples {
+        return false;
+    }
+    if !matches!(info.image_type, ImageType::E2D | ImageType::Linear) {
+        return false;
+    }
+    if crate::surface::default_block_width(info.format) > 1
+        || crate::surface::default_block_height(info.format) > 1
+    {
+        return false;
+    }
+    if get_format_type(info.format) != SurfaceType::ColorTexture
+        || crate::surface::is_pixel_format_integer(info.format)
+    {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3035,6 +3295,7 @@ kernel void inspect_packed(texture2d<float, access::read> image [[texture(0)]],
         assert!(!MetalTextureCacheParams::HAS_EMULATED_COPIES);
         assert!(!MetalTextureCacheParams::HAS_DEVICE_MEMORY_INFO);
         assert!(!MetalTextureCacheParams::IMPLEMENTS_ASYNC_DOWNLOADS);
+        assert!(MetalTextureCacheParams::HAS_MSAA_DOWNLOADS);
     }
 
     #[test]
@@ -3618,6 +3879,191 @@ kernel void inspect_packed(texture2d<float, access::read> image [[texture(0)]],
         assert!(result
             .chunks_exact(4)
             .all(|pixel| pixel == [255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn can_download_msaa_follows_copy_msaa_color_rules() {
+        let color = |samples, format| ImageInfo {
+            format,
+            image_type: ImageType::E2D,
+            size: Extent3D {
+                width: 8,
+                height: 8,
+                depth: 1,
+            },
+            resources: SubresourceExtent { levels: 1, layers: 1 },
+            num_samples: samples,
+            ..ImageInfo::default()
+        };
+        assert!(can_download_msaa_info(&color(4, PixelFormat::A8B8G8R8Unorm), 4));
+        assert!(!can_download_msaa_info(&color(1, PixelFormat::A8B8G8R8Unorm), 1));
+        assert!(!can_download_msaa_info(&color(4, PixelFormat::A8B8G8R8Unorm), 2));
+        assert!(!can_download_msaa_info(&color(4, PixelFormat::A8B8G8R8Uint), 4));
+        assert!(!can_download_msaa_info(&color(4, PixelFormat::D32Float), 4));
+        assert!(!can_download_msaa_info(&color(4, PixelFormat::D32FloatS8Uint), 4));
+        assert!(!can_download_msaa_info(
+            &ImageInfo {
+                format: PixelFormat::A8B8G8R8Unorm,
+                image_type: ImageType::E3D,
+                size: Extent3D {
+                    width: 8,
+                    height: 8,
+                    depth: 4,
+                },
+                resources: SubresourceExtent { levels: 1, layers: 1 },
+                num_samples: 4,
+                ..ImageInfo::default()
+            },
+            4
+        ));
+        assert!(!can_download_msaa_info(&color(4, PixelFormat::Bc3Unorm), 4));
+    }
+
+    #[test]
+    fn downloads_msaa_color_through_scratch_copy_without_averaging_samples() {
+        use objc2_foundation::NSString;
+        use objc2_metal::{
+            MTLCompileOptions, MTLCullMode, MTLLanguageVersion, MTLLibrary,
+            MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPipelineDescriptor, MTLViewport,
+        };
+
+        let device = MetalDevice::new().unwrap();
+        let source_image = multisample_image(&device);
+        let mut scheduler = MetalScheduler::new(&device);
+        let mut staging_buffer_pool = MetalStagingBufferPool::new(&device).unwrap();
+        let mut blit_helper = MetalBlitHelper::new(&device).unwrap();
+        let mut runtime = MetalTextureCacheRuntime::new(
+            device.clone(),
+            &mut scheduler,
+            &mut staging_buffer_pool,
+            &mut blit_helper,
+        );
+        let info = guest_image_info(&source_image);
+        assert!(runtime.can_download_msaa(&info));
+
+        let shader = NSString::from_str(
+            r#"
+#include <metal_stdlib>
+using namespace metal;
+struct VOut { float4 position [[position]]; };
+vertex VOut v(uint vid [[vertex_id]]) {
+    float2 p = float2(vid & 1u, vid >> 1u);
+    return { float4(p * 2.0f - 1.0f, 0.0f, 1.0f) };
+}
+fragment float4 f(VOut input [[stage_in]], uint sample [[sample_id]]) {
+    return float4(float(sample), floor(input.position.x), floor(input.position.y), 3.0f) / 3.0f;
+}
+"#,
+        );
+        let options = MTLCompileOptions::new();
+        options.setLanguageVersion(MTLLanguageVersion::Version2_3);
+        let library = device
+            .device()
+            .newLibraryWithSource_options_error(&shader, Some(&options))
+            .unwrap();
+        let vertex = library
+            .newFunctionWithName(&NSString::from_str("v"))
+            .unwrap();
+        let fragment = library
+            .newFunctionWithName(&NSString::from_str("f"))
+            .unwrap();
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        descriptor.setVertexFunction(Some(&vertex));
+        descriptor.setFragmentFunction(Some(&fragment));
+        descriptor.setRasterSampleCount(source_image.samples() as usize);
+        unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) }
+            .setPixelFormat(source_image.handle().pixelFormat());
+        let pipeline = device
+            .device()
+            .newRenderPipelineStateWithDescriptor_error(&descriptor)
+            .unwrap();
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        attachment.setTexture(Some(source_image.handle()));
+        attachment.setLoadAction(MTLLoadAction::DontCare);
+        attachment.setStoreAction(MTLStoreAction::Store);
+        pass.setRenderTargetWidth(4);
+        pass.setRenderTargetHeight(4);
+        pass.setDefaultRasterSampleCount(source_image.samples() as usize);
+        runtime.scheduler().begin_render_pass(&pass).unwrap();
+        runtime
+            .scheduler()
+            .with_render_encoder(|encoder| unsafe {
+                encoder.setRenderPipelineState(&pipeline);
+                encoder.setCullMode(MTLCullMode::None);
+                encoder.setViewport(MTLViewport {
+                    originX: 0.0,
+                    originY: 0.0,
+                    width: 4.0,
+                    height: 4.0,
+                    znear: 0.0,
+                    zfar: 1.0,
+                });
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+            })
+            .unwrap();
+        runtime.scheduler().end_render_pass();
+
+        let copy = BufferImageCopy {
+            buffer_size: 256,
+            image_extent: Extent3D {
+                width: 8,
+                height: 8,
+                depth: 1,
+            },
+            ..BufferImageCopy::default()
+        };
+        let mut output = vec![0xcd; 256];
+        runtime
+            .download_single_sample_memory(&source_image, &mut output, &[copy])
+            .unwrap();
+        let mut expected = vec![0u8; 256];
+        for y in 0..8usize {
+            for x in 0..8usize {
+                let sample = x % 2 + 2 * (y % 2);
+                let offset = (y * 8 + x) * 4;
+                expected[offset..offset + 4].copy_from_slice(&[
+                    (sample * 85) as u8,
+                    ((x / 2) * 85) as u8,
+                    ((y / 2) * 85) as u8,
+                    255,
+                ]);
+            }
+        }
+        assert_eq!(output, expected, "MSAA downloads must expand samples, not resolve");
+        assert_eq!(runtime.msaa_scratch_images.len(), 1);
+
+        let mut again = vec![0xcd; 256];
+        runtime
+            .download_single_sample_memory(&source_image, &mut again, &[copy])
+            .unwrap();
+        assert_eq!(again, expected);
+        assert_eq!(
+            runtime.msaa_scratch_images.len(),
+            1,
+            "matching scratch images must be reused"
+        );
+
+        let depth = MetalImage::new(
+            &device,
+            &ImageInfo {
+                format: PixelFormat::D32Float,
+                image_type: ImageType::E2D,
+                resources: SubresourceExtent { levels: 1, layers: 1 },
+                size: Extent3D {
+                    width: 8,
+                    height: 8,
+                    depth: 1,
+                },
+                num_samples: 4,
+                ..ImageInfo::default()
+            },
+        )
+        .unwrap();
+        assert!(!runtime.can_download_msaa(&guest_image_info(&depth)));
+        assert!(runtime
+            .download_single_sample_memory(&depth, &mut [0; 4], &[copy])
+            .is_err());
     }
 
     fn depth_stencil_copy() -> BufferImageCopy {

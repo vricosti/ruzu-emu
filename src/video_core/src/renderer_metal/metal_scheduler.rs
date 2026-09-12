@@ -786,7 +786,7 @@ mod tests {
         let mut scheduler = MetalScheduler::new(&device);
         let mut pool = MetalStagingBufferPool::new(&device).unwrap();
         let mut runtime = BufferCacheRuntime::new(&device, &mut scheduler, &mut pool);
-        let mut destination = Buffer::new(&mut runtime, 0x1000, 128);
+        let mut destination = Buffer::new(&mut runtime, 0x1000, 128, false);
         let mut stream = pool.request_upload_buffer(&mut scheduler, 4, false).unwrap();
         let mut dedicated = pool.request_upload_buffer(&mut scheduler, 4, true).unwrap();
         stream.mapped_span_mut().fill(1);

@@ -32,6 +32,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
   <a href="#ports-produced-along-the-way">Ports</a> |
   <a href="#platforms">Platforms</a> |
   <a href="#building">Building</a> |
+  <a href="https://discord.gg/ZebAZ6yFF">Discord</a> |
   <a href="#legal">License</a>
 </p>
 
@@ -67,6 +68,10 @@ much as the code is.
 
 **Now ruzu can fly on its own.**
 
+## Community
+
+Join the [ruzu Discord community](https://discord.gg/ZebAZ6yFF) to discuss the emulator and share your experience.
+
 ## Screenshots
 
 | Game configuration | SuperTuxKart running in ruzu |
@@ -81,7 +86,7 @@ a standalone Rust crate in its own right:
 | Crate | Ports | Upstream |
 |---|---|---|
 | [**rxbyak**](https://github.com/vricosti/rxbyak) | Xbyak, a C++ JIT assembler — x86-64 machine-code encoding, bit-identical to upstream | [herumi/xbyak](https://github.com/herumi/xbyak) |
-| **rdynarmic**| dynarmic, an ARM dynamic recompiler — AArch32 and AArch64 frontends, x86-64 and ARM64 backends, ~650 IR opcodes | [eden/dynarmic]([https://github.com/lioncash/dynarmic](https://github.com/eden-emulator/mirror/tree/master/src/dynarmic)) |
+| **rdynarmic**| dynarmic, an ARM dynamic recompiler — AArch32 and AArch64 frontends, x86-64 and ARM64 backends, ~650 IR opcodes | [eden/dynarmic](https://github.com/eden-emulator/mirror/tree/master/src/dynarmic) |
 
 rdynarmic's ARM32 and ARM64 translation is validated by **differential fuzzing
 against the C++ dynarmic oracle**: the same instruction encodings are fed to

@@ -2998,7 +2998,7 @@ impl BlitImageHelper {
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
-                    unsafe { self.device_owner.as_ref() }.static_pipeline_cache(),
+                    self.device_owner.as_ref().static_pipeline_cache(),
                     &[create_info],
                     None,
                 )
@@ -3091,7 +3091,7 @@ impl BlitImageHelper {
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
-                    unsafe { self.device_owner.as_ref() }.static_pipeline_cache(),
+                    self.device_owner.as_ref().static_pipeline_cache(),
                     &[create_info],
                     None,
                 )
@@ -3179,7 +3179,7 @@ impl BlitImageHelper {
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
-                    unsafe { self.device_owner.as_ref() }.static_pipeline_cache(),
+                    self.device_owner.as_ref().static_pipeline_cache(),
                     &[create_info],
                     None,
                 )
@@ -3527,7 +3527,7 @@ impl BlitImageHelper {
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
-                    unsafe { self.device_owner.as_ref() }.static_pipeline_cache(),
+                    self.device_owner.as_ref().static_pipeline_cache(),
                     &[pipeline_info],
                     None,
                 )
@@ -3598,7 +3598,7 @@ impl BlitImageHelper {
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
-                    unsafe { self.device_owner.as_ref() }.static_pipeline_cache(),
+                    self.device_owner.as_ref().static_pipeline_cache(),
                     &[pipeline_info],
                     None,
                 )
@@ -3686,7 +3686,7 @@ impl BlitImageHelper {
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
-                    unsafe { self.device_owner.as_ref() }.static_pipeline_cache(),
+                    self.device_owner.as_ref().static_pipeline_cache(),
                     &[pipeline_info],
                     None,
                 )
@@ -3790,7 +3790,7 @@ impl BlitImageHelper {
         let pipeline = unsafe {
             self.device
                 .create_graphics_pipelines(
-                    unsafe { self.device_owner.as_ref() }.static_pipeline_cache(),
+                    self.device_owner.as_ref().static_pipeline_cache(),
                     &[pipeline_info],
                     None,
                 )
@@ -3900,7 +3900,7 @@ impl BlitImageHelper {
         unsafe {
             self.device
                 .create_graphics_pipelines(
-                    unsafe { self.device_owner.as_ref() }.static_pipeline_cache(),
+                    self.device_owner.as_ref().static_pipeline_cache(),
                     &[create_info],
                     None,
                 )
@@ -4008,7 +4008,7 @@ impl BlitImageHelper {
         unsafe {
             self.device
                 .create_graphics_pipelines(
-                    unsafe { self.device_owner.as_ref() }.static_pipeline_cache(),
+                    self.device_owner.as_ref().static_pipeline_cache(),
                     &[create_info],
                     None,
                 )

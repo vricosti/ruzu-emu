@@ -329,7 +329,7 @@ impl TimeServiceManager {
         internal_offset: i64,
         test_offset: i64,
     ) -> ResultCode {
-        let mut time = self.time.lock().unwrap();
+        let time = self.time.lock().unwrap();
         time.standard_steady_clock.lock().unwrap().initialize(
             clock_source_id,
             rtc_offset,
@@ -504,7 +504,7 @@ impl TimeServiceManager {
     }
 
     pub fn set_standard_steady_clock_base_time(&self, base_time: i64) -> ResultCode {
-        let mut time = self.time.lock().unwrap();
+        let time = self.time.lock().unwrap();
         time.standard_steady_clock
             .lock()
             .unwrap()

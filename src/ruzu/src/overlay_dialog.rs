@@ -91,6 +91,10 @@ impl OverlayDialog {
         }
     }
 
+    pub fn is_active(&self) -> bool {
+        self.window.is_active()
+    }
+
     pub fn close(self) {
         // `Window::close` emits `close-request` too. Eden ignores only the
         // user's Escape/WM request while the status dialog is active; its

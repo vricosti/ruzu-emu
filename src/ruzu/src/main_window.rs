@@ -6350,6 +6350,13 @@ impl GMainWindow {
     /// before releasing the native render target, clear the loading assets,
     /// restore the game list, and then report an error when applicable.
     fn on_emulation_stopped(self: &Rc<Self>, failure: Option<(String, String)>) {
+        // Snapshot activation before destroying any modal/native window. A GTK
+        // widget focus change alone does not restore Win32 foreground ownership.
+        // Do not steal focus if the user switched away while shutdown ran.
+        let restore_activation = !self.close_confirmed.get()
+            && (self.window.is_active()
+                || self.render_host().0.is_active()
+                || self.shutdown_dialog.borrow().as_ref().is_some_and(|dialog| dialog.is_active()));
         self.finalize_camera();
         self.stop_mouse_constraint();
         if self.pre_fullscreen_state.borrow().is_some() {
@@ -6375,9 +6382,6 @@ impl GMainWindow {
             close_after_stop,
         );
         self.stop_confirmation_pending.set(false);
-        if let Some(dialog) = self.shutdown_dialog.borrow_mut().take() {
-            dialog.close();
-        }
         if let Some(mut session) = self.session.borrow_mut().take() {
             session.stop();
         }
@@ -6415,6 +6419,16 @@ impl GMainWindow {
             update_menu_state(&app, false, true);
         }
         self.refresh_menu_model();
+
+        // Eden uses deleteLater for the shutdown overlay. Keep it alive until
+        // the launcher is ready too, then restore its toplevel activation after
+        // closing the overlay and hiding/destroying the render windows.
+        if let Some(dialog) = self.shutdown_dialog.borrow_mut().take() {
+            dialog.close();
+        }
+        if restore_activation {
+            self.window.present();
+        }
 
         if let Some((message, detail)) = failure {
             self.alert(&message, &detail);
@@ -7977,6 +7991,59 @@ fn windows_surface_handle(surface: &gtk::gdk::Surface) -> windows_sys::Win32::Fo
 #[cfg(all(test, target_os = "windows"))]
 mod maximized_menu_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a Windows GTK display and an isolated process"]
+    fn stopping_emulation_preserves_foreground_without_stealing_it() {
+        crate::configure_windows_native_decorations();
+        crate::configure_windows_gsk_renderer();
+        gtk::init().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        common::fs::path_util::set_app_directory(directory.path().to_str().unwrap());
+        let app = Application::builder().application_id("org.ruzu.StopFocusTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        init_app_menu(&app);
+        let main = GMainWindow::new_for_direct_game(&app);
+        let settle = || {
+            let main_loop = glib::MainLoop::new(None, false);
+            let done = main_loop.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || done.quit());
+            main_loop.run();
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+        main.window.present();
+        settle();
+        let hwnd = windows_surface_handle(&main.window.surface().unwrap());
+        assert_ne!(unsafe { SetForegroundWindow(hwnd) }, 0, "test must start in foreground");
+        settle();
+        assert_eq!(unsafe { GetForegroundWindow() }, hwnd);
+        *main.shutdown_dialog.borrow_mut() = Some(
+            crate::overlay_dialog::OverlayDialog::closing_software(&main.window));
+        settle();
+        assert!(main.shutdown_dialog.borrow().as_ref().unwrap().is_active());
+        main.on_emulation_stopped(None);
+        settle();
+        assert!(main.shutdown_dialog.borrow().is_none());
+        assert_eq!(unsafe { GetForegroundWindow() }, hwnd);
+
+        *main.shutdown_dialog.borrow_mut() = Some(
+            crate::overlay_dialog::OverlayDialog::closing_software(&main.window));
+        settle();
+        // Stand in for another application's window after a deliberate Alt+Tab.
+        let other = gtk::Window::builder().title("Other window").build();
+        other.present();
+        settle();
+        let other_hwnd = windows_surface_handle(&other.surface().unwrap());
+        assert_ne!(unsafe { SetForegroundWindow(other_hwnd) }, 0);
+        settle();
+        assert_eq!(unsafe { GetForegroundWindow() }, other_hwnd);
+        assert!(!main.shutdown_dialog.borrow().as_ref().unwrap().is_active());
+        main.on_emulation_stopped(None);
+        settle();
+        assert_eq!(unsafe { GetForegroundWindow() }, other_hwnd);
+        other.destroy();
+        main.window.destroy();
+    }
 
     #[test]
     #[ignore = "requires a Windows GTK display and an isolated process"]

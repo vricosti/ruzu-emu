@@ -529,6 +529,7 @@ type ContextMenuHandler = Rc<dyn Fn(GameEntry, gtk::Widget, u32, f64, f64)>;
 /// Stack page names.
 const PAGE_LIST: &str = "list";
 const PAGE_EMPTY: &str = "empty";
+const PAGE_LOADING: &str = "loading";
 
 /// Handle to a built game list, letting the owner rescan it after the
 /// configured directories change (e.g. once a yuzu config has been imported).
@@ -702,6 +703,14 @@ pub fn build<
     let stack = gtk::Stack::new();
     stack.add_named(&scroller, Some(PAGE_LIST));
     stack.add_named(&empty.root, Some(PAGE_EMPTY));
+    let loading = gtk::Spinner::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .width_request(32)
+        .height_request(32)
+        .spinning(true)
+        .build();
+    stack.add_named(&loading, Some(PAGE_LOADING));
 
     // --- Toolbar ----------------------------------------------------------
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1019,6 +1028,9 @@ impl GameListView {
     }
 
     fn handle_navigation(&self, key: NavigationKey) -> bool {
+        if self.stack.visible_child_name().as_deref() != Some(PAGE_LIST) {
+            return false;
+        }
         let Some(model) = self.selection.model() else {
             return false;
         };
@@ -1826,27 +1838,12 @@ impl GameListView {
         let directory_to_select =
             preferred_directory_path(previously_selected.as_deref(), &scannable);
 
-        self.store.remove_all();
-        self.all_games.borrow_mut().clear();
-        for dir in &scannable {
-            self.store.append(&GameEntry::new_folder(
-                &dir.path,
-                dir.deep_scan,
-                gio::ListStore::new::<GameEntry>(),
-            ));
-        }
-        self.rebuild_favorites();
-
-        self.stack.set_visible_child_name(if scannable.is_empty() {
-            PAGE_EMPTY
-        } else {
-            PAGE_LIST
-        });
-
-        if let Some(path) = directory_to_select.as_deref() {
-            self.select_directory(path);
-        }
-        self.apply_filter(&self.filter_entry.text());
+        // Do not publish provisional directory rows: installed roots may only
+        // be removed by GameListScanResult::is_empty after scanning finishes.
+        // Keep the previous model hidden until the filtered replacement is ready.
+        self.stack.set_visible_child_name(PAGE_LOADING);
+        self.filter_bar.set_sensitive(false);
+        self.filter_result.set_visible(false);
 
         let generation = self.scan_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let current_generation = Arc::clone(&self.scan_generation);
@@ -1892,6 +1889,13 @@ impl GameListView {
             });
         if let Err(error) = spawn_result {
             log::error!("Failed to start GameListWorker: {error}");
+            self.stack.set_visible_child_name(if self.store.n_items() == 0 {
+                PAGE_EMPTY
+            } else {
+                PAGE_LIST
+            });
+            self.filter_bar.set_sensitive(true);
+            self.filter_result.set_visible(true);
         }
     }
 
@@ -1952,6 +1956,8 @@ impl GameListView {
         }
         self.apply_filter(&self.filter_entry.text());
         self.stack.set_visible_child_name(if is_empty { PAGE_EMPTY } else { PAGE_LIST });
+        self.filter_bar.set_sensitive(true);
+        self.filter_result.set_visible(true);
     }
 
     /// Eden `GameTree::UpdateColumnVisibility`.
@@ -2949,6 +2955,60 @@ pub(crate) fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK on the platform main thread and a display"]
+    fn scans_only_reveal_final_directory_rows() {
+        gtk::init().unwrap();
+        uisettings::with_mut(|values| {
+            values.game_dirs.clear();
+            values.favorited_ids.clear();
+        });
+        let hid = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        let play_time = Arc::new(frontend_common::play_time_manager::PlayTimeManager::new());
+        let (_, handle) = build(&hid, &play_time, |_, _| {}, |_, _, _| {}, || {}, || false);
+        let view = &handle.0;
+        assert_eq!(view.stack.visible_child_name().as_deref(), Some(PAGE_LOADING));
+        assert_eq!(view.store.n_items(), 0);
+
+        // Supersede the real empty worker, then drive result delivery ourselves.
+        let deliver = |paths: &[&str]| {
+            let generation = view.scan_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            view.scan_result_sender.send(GameListScanResult {
+                generation,
+                directories: paths.iter().map(|path| ScannedDirectory {
+                    path: (*path).to_owned(), deep_scan: false, games: Vec::new(),
+                }).collect(),
+                directory_to_select: None,
+            }).unwrap();
+            view.process_scan_results();
+        };
+        deliver(&["SDMC", "UserNAND", "SysNAND", "/custom"]);
+        assert_eq!(view.stack.visible_child_name().as_deref(), Some(PAGE_LIST));
+        assert_eq!(view.store.n_items(), 1);
+        assert_eq!(view.store.item(0).unwrap().downcast::<GameEntry>().unwrap().path(), "/custom");
+
+        handle.reload();
+        let old_generation = view.scan_generation.load(Ordering::Acquire);
+        handle.reload();
+        assert_eq!(view.stack.visible_child_name().as_deref(), Some(PAGE_LOADING));
+        assert!(!view.handle_navigation(NavigationKey::Enter));
+        assert!(!view.filter_result.is_visible());
+        // The previous final model is retained but hidden, never replaced by
+        // provisional SDMC/UserNAND/SysNAND rows during either scan.
+        assert_eq!(view.store.n_items(), 1);
+        view.scan_generation.fetch_add(1, Ordering::AcqRel);
+        view.scan_result_sender.send(GameListScanResult {
+            generation: old_generation, directories: Vec::new(), directory_to_select: None,
+        }).unwrap();
+        view.process_scan_results();
+        assert_eq!(view.stack.visible_child_name().as_deref(), Some(PAGE_LOADING));
+        deliver(&["SDMC", "UserNAND", "SysNAND"]);
+        assert_eq!(view.stack.visible_child_name().as_deref(), Some(PAGE_EMPTY));
+        assert_eq!(view.store.n_items(), 0);
+        assert!(view.filter_result.is_visible());
+        assert!(view.filter_bar.is_sensitive());
+    }
 
     #[test]
     fn metadata_and_runtime_registries_keep_native_cache_slots_independent() {

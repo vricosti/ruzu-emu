@@ -1,5 +1,19 @@
 # Upstream parity notes
 
+## 2026-09-13 - rdynarmic/common/mod.rs vs dynarmic/CMakeLists.txt
+
+### Intentional differences
+- `spin_lock_x64` is gated with `cfg(target_arch = "x86_64")`, matching
+  upstream's architecture-specific source list and xbyak linkage. This aligns
+  the module with Cargo's target-specific rxbyak dependency and prevents ARM64
+  builds from importing an unavailable x64 assembler. Spin-lock emission and
+  its x64 tests are unchanged; no state or binary layout changes.
+- Validation: release rdynarmic tests pass on aarch64-apple-darwin (971 library
+  tests and four additional tests). The x86_64 target is not installed locally;
+  this pass does not claim a cross-target build.
+- Full release workspace build and macOS app bundling pass. The five existing
+  capture_harness dead-code warnings are independent of this architecture guard.
+
 ## 2026-09-12 - ARM64 emitter interfaces vs dynarmic/backend/arm64/emit_arm64.h and matching .cpp owners
 
 ### Intentional differences

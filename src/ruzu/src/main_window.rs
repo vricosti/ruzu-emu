@@ -2205,6 +2205,27 @@ impl GMainWindow {
         ));
         app.add_action(&load_file);
 
+        app.add_action(&empty_recent_files_action());
+        let recent = gio::SimpleAction::new("open_recent_file", Some(glib::VariantTy::STRING));
+        recent.connect_activate(glib::clone!(
+            #[weak(rename_to = this)] self,
+            move |_, target| {
+                if let Some(path) = target.and_then(|target| target.get::<String>()) {
+                    this.on_menu_recent_file(path);
+                }
+            }
+        ));
+        app.add_action(&recent);
+        let clear = gio::SimpleAction::new("clear_recent_files", None);
+        clear.connect_activate(glib::clone!(
+            #[weak(rename_to = this)] self,
+            move |_, _| {
+                crate::uisettings::with_mut(|values| values.recent_files.clear());
+                this.update_recent_files();
+            }
+        ));
+        app.add_action(&clear);
+
         let renderdoc = gio::SimpleAction::new("renderdoc_capture", None);
         renderdoc.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
@@ -4966,6 +4987,32 @@ impl GMainWindow {
         self.boot_game_with_parameters(filepath, crate::boot::BootParameters::default());
     }
 
+    fn store_recent_file(&self, filepath: &str) {
+        crate::uisettings::with_mut(|values| store_recent_file(&mut values.recent_files, filepath));
+        self.update_recent_files();
+    }
+
+    fn update_recent_files(&self) {
+        self.refresh_menu_model();
+        if let Err(error) = crate::configuration::qt_config::save_recent_files() {
+            log::error!("Could not save recent files: {error}");
+        }
+    }
+
+    fn on_menu_recent_file(self: &Rc<Self>, filepath: String) {
+        if std::path::Path::new(&filepath).exists() {
+            self.boot_game(filepath);
+        } else {
+            crate::gtk_compat::show_message(
+                Some(&self.window),
+                &crate::i18n::tr("File not found"),
+                &crate::i18n::tr_args("File \"%1\" not found", &[filepath.clone()]),
+            );
+            crate::uisettings::with_mut(|values| values.recent_files.retain(|path| path != &filepath));
+            self.update_recent_files();
+        }
+    }
+
     fn boot_game_with_parameters(
         self: &Rc<Self>,
         filepath: String,
@@ -4973,6 +5020,11 @@ impl GMainWindow {
     ) {
         if self.profile_selection_pending.get() {
             return;
+        }
+        if parameters.applet.program_id == 0 || parameters.applet.program_id
+            > ruzu_core::hle::service::am::am_types::AppletProgramId::MaxProgramId as u64
+        {
+            self.store_recent_file(&filepath);
         }
         if crate::uisettings::with(|values| *values.select_user_on_boot.get_value()) {
             self.select_and_set_current_user(filepath, parameters);
@@ -7706,11 +7758,144 @@ fn force_menu_mnemonic_underlines(root: &gtk::Widget) {
 /// Build the GMenu model that mirrors upstream `main.ui`'s menu bar.
 ///
 /// Qt `&` mnemonics become GTK `_` mnemonics. Qt separators (`<addaction
-/// name="separator"/>`) map to GMenu `<section>` boundaries. Dynamically
-/// populated menus upstream (Recent Files, Debugging) are declared but left
-/// empty here.
+/// name="separator"/>`) map to GMenu `<section>` boundaries.
+/// Recent Files is rebuilt from UISettings, with a disabled item instead of
+/// an empty submenu when no history exists.
 fn build_menu_model() -> gio::MenuModel {
     build_menu_model_for_tas_state(input_common::drivers::tas_input::TasState::Stopped)
+}
+
+fn empty_recent_files_action() -> gio::SimpleAction {
+    // MainWindow::UpdateRecentFiles disables this entry when no files exist.
+    let action = gio::SimpleAction::new("recent_files", None);
+    action.set_enabled(false);
+    action
+}
+
+const MAX_RECENT_FILES_ITEM: usize = 10;
+
+fn store_recent_file(files: &mut Vec<String>, filepath: &str) {
+    files.insert(0, filepath.to_owned());
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|path| seen.insert(path.clone()));
+    files.truncate(MAX_RECENT_FILES_ITEM);
+}
+
+fn update_recent_files_menu(section: &gio::Menu, files: &[String]) {
+    if files.is_empty() {
+        return; // The XML supplies the disabled, submenu-free empty state.
+    }
+    section.remove_all();
+    let recent = gio::Menu::new();
+    for (index, path) in files.iter().take(MAX_RECENT_FILES_ITEM).enumerate() {
+        let filename = std::path::Path::new(path).file_name()
+            .map(|name| name.to_string_lossy()).unwrap_or_else(|| path.as_str().into());
+        let item = gio::MenuItem::new(Some(&format!("_{}. {}", index + 1, filename.replace('_', "__"))), None);
+        item.set_action_and_target_value(Some("app.open_recent_file"), Some(&path.to_variant()));
+        recent.append_item(&item);
+    }
+    let clear = gio::Menu::new();
+    clear.append(Some(&crate::i18n::tr("_Clear Recent Files")), Some("app.clear_recent_files"));
+    recent.append_section(None, &clear);
+    section.append_submenu(Some(&crate::i18n::tr("_Recent Files")), &recent);
+}
+
+#[cfg(test)]
+mod recent_files_tests {
+    use super::*;
+
+    #[test]
+    fn recent_files_reorders_deduplicates_and_limits_history() {
+        let mut files: Vec<String> = (0..12).map(|i| format!("/homebrew/demo{i}.nro")).collect();
+        files.push(files[5].clone());
+        store_recent_file(&mut files, "/homebrew/demo5.nro");
+        assert_eq!(files.len(), 10);
+        assert_eq!(files[0], "/homebrew/demo5.nro");
+        assert_eq!(files[1], "/homebrew/demo0.nro");
+        assert_eq!(files.iter().filter(|path| *path == "/homebrew/demo5.nro").count(), 1);
+        store_recent_file(&mut files, "/homebrew/new.nro");
+        assert_eq!(files[0], "/homebrew/new.nro");
+        assert_eq!(files[1], "/homebrew/demo5.nro");
+        assert_eq!(files.len(), 10);
+    }
+
+    #[test]
+    fn recent_files_menu_uses_literal_path_targets_and_clear_action() {
+        let section = gio::Menu::new();
+        let path = "/homebrew/Free_Demo & friends.nro".to_owned();
+        update_recent_files_menu(&section, &[path.clone()]);
+        let menu = section.item_link(0, gio::MENU_LINK_SUBMENU).unwrap();
+        assert_eq!(menu.n_items(), 2);
+        assert_eq!(menu.item_attribute_value(0, "label", None).unwrap().get::<String>().unwrap(),
+            "_1. Free__Demo & friends.nro");
+        assert_eq!(menu.item_attribute_value(0, "target", None).unwrap().get::<String>().unwrap(), path);
+        assert_eq!(menu.item_attribute_value(0, "action", None).unwrap().get::<String>().unwrap(),
+            "app.open_recent_file");
+        let clear = menu.item_link(1, gio::MENU_LINK_SECTION).unwrap();
+        assert_eq!(clear.item_attribute_value(0, "action", None).unwrap().get::<String>().unwrap(),
+            "app.clear_recent_files");
+    }
+
+    #[test]
+    fn empty_history_is_disabled_and_has_no_submenu() {
+        let action = empty_recent_files_action();
+        assert_eq!(action.name(), "recent_files");
+        assert!(!action.is_enabled());
+        let label = MENU_UI.find(
+            "<attribute name=\"label\" translatable=\"yes\">_Recent Files</attribute>",
+        ).unwrap();
+        let before = &MENU_UI[..label];
+        assert!(before.trim_end().ends_with("<item>"));
+        let entry = MENU_UI[label..].split_once("</item>").unwrap().0;
+        assert!(entry.contains("<attribute name=\"action\">app.recent_files</attribute>"));
+        assert!(!entry.contains("<submenu"));
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display process"]
+    fn empty_history_widget_is_insensitive() {
+        gtk::init().unwrap();
+        let actions = gio::SimpleActionGroup::new();
+        actions.add_action(&empty_recent_files_action());
+        let menu = build_menu_model();
+        let file_menu = menu.item_link(0, gio::MENU_LINK_SUBMENU).unwrap();
+        let popover = gtk::PopoverMenu::from_model(Some(&file_menu));
+        let button = gtk::MenuButton::builder().popover(&popover).build();
+        let window = gtk::Window::builder().child(&button).build();
+        window.insert_action_group("app", Some(&actions));
+
+        fn find_label(widget: &gtk::Widget) -> Option<gtk::Label> {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                if label.text().contains("Recent Files") {
+                    return Some(label.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(label) = find_label(&widget) {
+                    return Some(label);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+
+        let label = find_label(popover.upcast_ref()).expect("Recent Files menu item");
+        assert!(!label.is_sensitive());
+        crate::uisettings::with_mut(|values| values.recent_files = vec!["/homebrew/brick.nro".into()]);
+        let populated = build_menu_model();
+        let file = populated.item_link(0, gio::MENU_LINK_SUBMENU).unwrap();
+        let section = file.item_link(2, gio::MENU_LINK_SECTION).unwrap();
+        let submenu = section.item_link(0, gio::MENU_LINK_SUBMENU).expect("populated history submenu");
+        assert_eq!(submenu.item_attribute_value(0, "target", None).unwrap().get::<String>().unwrap(),
+            "/homebrew/brick.nro");
+        crate::uisettings::with_mut(|values| values.recent_files.clear());
+        let cleared = build_menu_model();
+        let file = cleared.item_link(0, gio::MENU_LINK_SUBMENU).unwrap();
+        let section = file.item_link(2, gio::MENU_LINK_SECTION).unwrap();
+        assert!(section.item_link(0, gio::MENU_LINK_SUBMENU).is_none());
+        window.close();
+    }
 }
 
 /// GTK/Win32 adaptation of Qt's native maximized geometry handling. Opening a
@@ -7958,6 +8143,10 @@ fn build_menu_model_for_state(
     let menu_ui = menu_ui_for_state(state, is_paused);
     let translated = crate::i18n::translate_builder_xml(&menu_ui);
     let builder = gtk::Builder::from_string(&translated);
+    let recent = builder.object::<gio::Menu>("recent-files-section")
+        .expect("recent files section present");
+    let files = crate::uisettings::with(|values| values.recent_files.clone());
+    update_recent_files_menu(&recent, &files);
     builder
         .object::<gio::MenuModel>("menubar")
         .expect("menubar object present in menu UI definition")
@@ -8167,10 +8356,11 @@ const MENU_UI: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
           <attribute name="action">app.load_folder</attribute>
         </item>
       </section>
-      <section>
-        <submenu>
+      <section id="recent-files-section">
+        <item>
           <attribute name="label" translatable="yes">_Recent Files</attribute>
-        </submenu>
+          <attribute name="action">app.recent_files</attribute>
+        </item>
       </section>
       <section>
         <item>

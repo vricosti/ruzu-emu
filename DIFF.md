@@ -17385,3 +17385,26 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   words, with signed maximum reconstructed from the incoming bit pattern.
   As upstream, maximum and event-clear mode are retained without implementing
   a hardware clock transition or event. No delay has been added to SetAndWait.
+
+## 2026-09-13 — src/ruzu/src/main_window.rs vs yuzu/main_window.{h,cpp} (recent files)
+
+### Intentional differences
+- GTK rebuilds a GMenu with string action targets instead of retaining ten
+  QActions. An empty history uses a disabled item without a submenu link.
+  Full paths remain action targets; GTK's menu model has no QAction tooltip
+  equivalent. Literal underscores in filenames are escaped for GTK mnemonics.
+- StoreRecentFile, UpdateRecentFiles and OnMenuRecentFile remain owned by
+  main_window.rs, including the ten-entry limit and system-applet exclusion.
+  Clear and missing-file removal are persisted immediately through the existing
+  targeted INI writer, rather than waiting for Qt's next SaveAllValues.
+
+## 2026-09-13 — src/ruzu/src/configuration/qt_config.rs and uisettings.rs vs qt_common/config/qt_config.{h,cpp} and uisettings.h (recent files)
+
+### Intentional differences
+- The GTK frontend uses its existing targeted INI reader/writer to preserve
+  unrelated configuration. Paths/recentFiles is a plain setting without a
+  default marker, with Eden's comma-space separator and empty-part removal.
+  The writer preserves path spelling instead of Config::AdjustOutputString's
+  slash normalization; both representations are accepted by the reader.
+  Vec<String> replaces QStringList in the UI settings owner. The upstream
+  separator limitation for filenames containing comma-space is retained.

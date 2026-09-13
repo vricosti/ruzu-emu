@@ -7,8 +7,8 @@
 //
 // The window-dependent File actions (Load File / Load Folder → in-process boot)
 // live on `GMainWindow` (see `main_window.rs`), since they need the render
-// surface, loading screen, and stack. Recent Files remains a dynamic menu
-// placeholder.
+// surface, loading screen, and stack. Recent Files is also owned there so that
+// every launch route shares the same history and boot implementation.
 
 use gtk::prelude::*;
 use gtk::{gio, glib, Application};

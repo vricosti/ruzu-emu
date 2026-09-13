@@ -63,6 +63,7 @@ pub fn reload_all_values() {
     log::info!("Loaded {} configured game directory(ies)", game_dirs.len());
     uisettings::with_mut(|values| values.game_dirs = game_dirs);
     load_roms_path();
+    load_recent_files();
     load_external_content_dirs();
     let favorited_ids = load_favorited_ids();
     uisettings::with_mut(|values| values.favorited_ids = favorited_ids);
@@ -367,6 +368,32 @@ pub fn load_ui_language() {
     let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
     let language = read_ui_string_setting(&contents, "Paths\\language", "");
     uisettings::with_mut(|values| values.language.set_value(language));
+}
+
+/// Read recent_files from upstream QtConfig::ReadPathValues.
+pub fn load_recent_files() {
+    let contents = std::fs::read_to_string(config_path()).unwrap_or_default();
+    uisettings::with_mut(|values| values.recent_files = read_recent_files(&contents));
+}
+
+fn read_recent_files(contents: &str) -> Vec<String> {
+    parse_section_values(contents, UI_SECTION)
+        .get("Paths\\recentFiles")
+        .map(|value| unquote(value).split(", ").filter(|path| !path.is_empty())
+            .map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// QtConfig::SavePathValues stores recentFiles without a default marker.
+pub fn save_recent_files() -> io::Result<()> {
+    let path = config_path();
+    let contents = read_configuration_for_update(&path)?;
+    let files = uisettings::with(|values| values.recent_files.join(", "));
+    let updated = replace_ui_setting(&contents, "Paths\\recentFiles", &files, None);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, updated)
 }
 
 /// Read `UISettings::values.roms_path` from upstream `QtConfig::ReadPathValues`.
@@ -1700,6 +1727,48 @@ fn is_true(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn recent_files_persist_and_reload_from_disk() {
+        const CHILD: &str = "RUZU_TEST_RECENT_FILES_CONFIG";
+        if let Some(root) = std::env::var_os(CHILD) {
+            common::fs::path_util::set_ruzu_path(RuzuPath::ConfigDir, Path::new(&root));
+            std::fs::write(config_path(), "[Other]\nkeep=true\n").unwrap();
+            let files = vec!["/homebrew/Free Demo.nro".to_owned(), "C:\\homebrew\\brick.nro".to_owned()];
+            uisettings::with_mut(|values| values.recent_files = files.clone());
+            save_recent_files().unwrap();
+            uisettings::with_mut(|values| values.recent_files.clear());
+            load_recent_files();
+            assert_eq!(uisettings::with(|values| values.recent_files.clone()), files);
+            uisettings::with_mut(|values| values.recent_files.clear());
+            save_recent_files().unwrap();
+            load_recent_files();
+            assert!(uisettings::with(|values| values.recent_files.is_empty()));
+            assert!(std::fs::read_to_string(config_path()).unwrap().contains("keep=true"));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "configuration::qt_config::tests::recent_files_persist_and_reload_from_disk", "--test-threads=1"])
+            .env(CHILD, root.path()).status().unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn recent_files_round_trip_uses_upstream_plain_paths_key() {
+        use super::*;
+        let contents = "[UI]\nPaths\\recentFiles=old.nro\nPaths\\recentFiles\\default=true\nPaths\\romsPath=/homebrew\n[Other]\nkeep=true\n";
+        let files = [r"C:\homebrew\Free Demo.nro", "/homebrew/brick.nro"];
+        let updated = replace_ui_setting(contents, "Paths\\recentFiles", &files.join(", "), None);
+        assert_eq!(read_recent_files(&updated), files);
+        assert!(updated.contains("Paths\\romsPath=/homebrew"));
+        assert!(updated.contains("[Other]\nkeep=true"));
+        assert!(!updated.contains("recentFiles\\default"));
+        let cleared = replace_ui_setting(&updated, "Paths\\recentFiles", "", None);
+        assert!(read_recent_files(&cleared).is_empty());
+        assert_eq!(read_recent_files("[UI]\nPaths\\recentFiles=\"demo.nro, , next.nro\"\n"),
+            ["demo.nro", "next.nro"]);
+        assert!(read_recent_files("").is_empty());
+    }
+    #[test]
     fn debug_controller_bindings_survive_disk_reload() {
         use super::*;
         const CHILD: &str = "RUZU_TEST_DEBUG_BINDINGS_DISK";
@@ -1793,7 +1862,7 @@ mod tests {
             let writers: &[fn() -> io::Result<()>] = &[
                 save_global_values, save_shortcut_values, save_tas_values,
                 save_multiplayer_values, save_view_values, save_ui_language,
-                save_roms_path, save_favorites_expanded, save_control_values,
+                save_roms_path, save_recent_files, save_favorites_expanded, save_control_values,
                 || save_external_content_dirs(&[]), || save_game_dirs(&[]),
                 || save_favorited_ids(&[]), || save_per_game_control_values(&config_path()),
             ];

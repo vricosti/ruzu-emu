@@ -82,8 +82,10 @@ pub unsafe fn create_surface(
         WindowSystemType::Windows => {
             let win32_surface_fn = ash::khr::win32_surface::Instance::new(entry, instance);
             let create_info = vk::Win32SurfaceCreateInfoKHR::default()
-                .hinstance(std::ptr::null_mut())
-                .hwnd(window_info.render_surface as *const _);
+                // ash 0.38 represents Win32 handles as pointer-sized integers.
+                // Preserve upstream's null HINSTANCE and the HWND bit pattern.
+                .hinstance(0)
+                .hwnd(window_info.render_surface as vk::HWND);
             win32_surface_fn
                 .create_win32_surface(&create_info, None)
                 .map_err(|_| {

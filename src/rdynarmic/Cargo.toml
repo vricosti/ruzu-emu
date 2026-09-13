@@ -17,13 +17,18 @@ profile_opcodes = []
 no_execute_support = []
 
 [dependencies]
-rxbyak = { path = "../../externals/rxbyak" }
-rhazel = { path = "../../externals/rhazel" }
 bitflags = "2"
 log = "0.4"
 thiserror = "2"
 libc = "0.2"
 hashbrown = "0.16"
+
+# Match dynarmic's architecture-specific xbyak/oaknut linkage and backend modules.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+rxbyak = { path = "../../externals/rxbyak" }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+rhazel = { path = "../../externals/rhazel" }
 
 [[bin]]
 name = "a32_diff"

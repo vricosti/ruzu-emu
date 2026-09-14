@@ -81,12 +81,24 @@ class PackageRevision(unittest.TestCase):
         self.hash = self.git("rev-parse", "HEAD")[:12]
         self.check(f"main-{self.hash}")
 
-    def test_dirty_overrides_tag_staged_and_unstaged(self):
+    def test_dirty_preserves_tag_staged_and_unstaged(self):
         self.git("tag", "v0.0.5")
         (self.repo / "tracked.txt").write_text("modified\n")
-        self.check(f"main-{self.hash}-dirty")
+        self.check("v0.0.5-dirty")
         self.git("add", "tracked.txt")
-        self.check(f"main-{self.hash}-dirty")
+        self.check("v0.0.5-dirty")
+
+    def test_untracked_preserves_detached_tag(self):
+        self.git("tag", "-a", "v0.0.5", "-m", "release")
+        self.git("switch", "--detach", "v0.0.5")
+        (self.repo / "new.txt").write_text("untracked")
+        self.check("v0.0.5-dirty")
+
+    def test_ignored_build_output_preserves_tag(self):
+        self.git("tag", "v0.0.5")
+        (self.repo / "output").mkdir()
+        (self.repo / "output/artifact.zip").write_text("ignored")
+        self.check("v0.0.5")
 
     def test_untracked_and_ignored(self):
         (self.repo / "output").mkdir()
@@ -105,7 +117,7 @@ class PackageRevision(unittest.TestCase):
         self.git("commit", "-qm", "submodule")
         self.hash = self.git("rev-parse", "HEAD")[:12]
         self.git("tag", "v0.0.5")
-        self.check(f"main-{self.hash}-dirty")
+        self.check("v0.0.5-dirty")
 
 
 if __name__ == "__main__":

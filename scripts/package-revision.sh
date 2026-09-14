@@ -16,8 +16,8 @@ dirty=
 if [ -n "$status" ] || printf '%s\n' "$submodules" | grep -Eq '^[-+U]'; then dirty=-dirty; fi
 tags=$(git tag --points-at HEAD --sort=refname)
 tag=$(printf '%s\n' "$tags" | sed -nE '/^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9][A-Za-z0-9.-]*)?$/p' | head -n 1)
-if [ -n "$tag" ] && [ -z "$dirty" ]; then
-    printf '%s\n' "$tag"
+if [ -n "$tag" ]; then
+    printf '%s%s\n' "$tag" "$dirty"
 else
     printf '%s-%s%s\n' "$branch" "$hash" "$dirty"
 fi

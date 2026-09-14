@@ -22,6 +22,6 @@ $submodules = @(Read-Git @('submodule', 'status', '--recursive'))
 if ($submodules | Where-Object { $_ -match '^[-+U]' }) { $dirty = $true }
 $tags = @(Read-Git @('tag', '--points-at', 'HEAD', '--sort=refname'))
 $tag = $tags | Where-Object { $_ -match '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9][A-Za-z0-9.-]*)?$' } | Select-Object -First 1
-if ($tag -and -not $dirty) { return $tag }
 $suffix = if ($dirty) { '-dirty' } else { '' }
+if ($tag) { return "$tag$suffix" }
 "$branch-$hash$suffix"

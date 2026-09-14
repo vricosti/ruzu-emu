@@ -116,7 +116,8 @@ echo Building the self-contained Windows package and NSIS installer...
 if "%RUZU_OFFICIAL_PACKAGE%"=="1" (
     python "%~dp0scripts\release-package.py" --platform windows
 ) else (
-    echo Creating a development package without committing, tagging or publishing.
+    echo Creating a local package without committing, tagging or publishing.
+    echo Naming uses the exact local version tag at HEAD, otherwise branch-hash; local changes append -dirty.
     "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0dist\package-windows.ps1" -Profile release
 )
 set "RUZU_PACKAGE_EXIT=%ERRORLEVEL%"

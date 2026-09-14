@@ -16,8 +16,9 @@ The package command builds a release and creates, on macOS,
 target/release/Ruzu-macOS-<Git revision>-<arch>-clang.zip containing
 Ruzu-macOS-<Git revision>-<arch>-clang/ruzu.app, and on Linux the Debian
 archive target/release/Ruzu-<Distro><Version>-<Git revision>-<arch>.deb.
-Git revision is an exact version tag on a clean checkout, otherwise
-<branch>-<12-character commit>[-dirty]. Detached builds use branch "detached".
+Git revision is an exact local version tag at HEAD (even on a branch), otherwise
+<branch>-<12-character commit>. Both forms append -dirty for local changes.
+Detached builds without a version tag use branch "detached".
 By default package builds the current sources locally, without commits, tags or pushes.
 Only --official prompts for a release version, commits it, builds, creates
 an annotated tag, rebuilds/packages and atomically pushes the branch and tag.

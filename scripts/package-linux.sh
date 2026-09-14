@@ -2,8 +2,8 @@
 # Package the already-built Linux release of ruzu as a Debian archive.
 #
 # Linux counterpart of build-macos-app.sh --package: the archive name comes
-# from scripts/package-revision.sh (an exact version tag on a clean checkout,
-# otherwise <branch>-<12-character commit>[-dirty]), Cargo supplies the numeric
+# from scripts/package-revision.sh (an exact version tag, otherwise
+# <branch>-<12-character commit>, with -dirty appended for local changes), Cargo supplies the numeric
 # Debian version only, and the binary is never rebuilt here.
 #
 # Produces target/release/Ruzu-<Distro><Version>-<Git revision>-<arch>.deb,
@@ -39,9 +39,9 @@ esac
 # the commit so the Debian version stays unique and monotonic (+ sorts after).
 deb_version=$version
 case "$package_revision" in
+    *-dirty) deb_version="$version+git$(printf '%.12s' "$release_commit").dirty" ;;
     v[0-9]*) ;;
-    *) deb_version="$version+git$(printf '%.12s' "$release_commit")"
-       case "$package_revision" in *-dirty) deb_version="$deb_version.dirty" ;; esac ;;
+    *) deb_version="$version+git$(printf '%.12s' "$release_commit")" ;;
 esac
 
 arch=$(dpkg --print-architecture)

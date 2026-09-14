@@ -236,6 +236,15 @@ pub trait RasterizerInterface {
     /// Notify that caches of the specified region are desynced with guest.
     fn on_cache_invalidation(&mut self, addr: u64, size: u64);
 
+    /// Synchronize a completed CPU write while draining dirty memory on the GPU
+    /// thread. Unlike `on_cache_invalidation`, this may enqueue backend work.
+    /// Eden uses OnCacheInvalidation for both paths; separating them allows its
+    /// BufferCache::CachedWriteMemory to preserve GPU-newer bytes sharing a page
+    /// without issuing graphics commands from a CPU-thread invalidation.
+    fn cached_write_memory(&mut self, addr: u64, size: u64) {
+        self.on_cache_invalidation(addr, size);
+    }
+
     /// Notify of a CPU write to the specified region.
     fn on_cpu_write(&mut self, addr: u64, size: u64) -> bool;
 

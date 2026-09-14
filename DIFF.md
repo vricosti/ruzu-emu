@@ -17422,3 +17422,32 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   slash normalization; both representations are accepted by the reader.
   Vec<String> replaces QStringList in the UI settings owner. The upstream
   separator limitation for filenames containing comma-space is retained.
+
+## 2026-09-14 — src/video_core/src/gpu.rs and rasterizer_interface.rs vs video_core/gpu.{h,cpp} and rasterizer_interface.h
+
+### Intentional differences
+- The GPU-thread dirty-memory drain calls a distinct CachedWriteMemory hook.
+  Eden routes both this drain and direct CPU-thread invalidations through
+  OnCacheInvalidation. Completed partial-page writes need byte-exact uploads
+  that preserve neighboring GPU-owned bytes; those uploads cannot safely run
+  from the direct CPU-thread path. The original invalidation hook remains
+  unchanged. The drain callback is mechanically extracted in gpu.rs for a
+  routing regression; collection and thread ownership have not moved.
+
+## 2026-09-14 — src/video_core/src/renderer_vulkan/vk_rasterizer.rs and renderer_opengl/gl_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.{h,cpp} and renderer_opengl/gl_rasterizer.{h,cpp}
+
+### Intentional differences
+- The completed-write hook uses the existing upstream-owned
+  BufferCache::CachedWriteMemory operation rather than WriteMemory. It uploads
+  only the CPU-written bytes when a boundary page also contains GPU-newer data;
+  otherwise the existing lazy CPU-dirty path is retained. Texture invalidation,
+  shader invalidation, cache ownership and sequential per-cache locks remain
+  in their renderer owners. Direct OnCacheInvalidation remains metadata-only.
+
+## 2026-09-14 — src/video_core/src/renderer_metal/metal_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- Eden has no native Metal rasterizer. The same GPU-thread completed-write hook
+  routes through the common BufferCache::CachedWriteMemory implementation;
+  existing Metal texture/shader invalidation and direct invalidation remain
+  separate. Native Metal runtime validation requires a macOS host.

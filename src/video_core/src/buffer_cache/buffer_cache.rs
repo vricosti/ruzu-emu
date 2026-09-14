@@ -5317,6 +5317,59 @@ mod tests {
         assert!(cache.slot_buffers[right].is_picked());
     }
 
+    fn completed_cpu_writes_preserve_gpu_bytes_in_shared_pages<const MAPPED: bool>() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams<MAPPED>, DummyTracker>::new(
+            &tracker,
+            TestBufferCacheRuntime::default(),
+        );
+        let memory = Arc::new(parking_lot::Mutex::new(vec![0x11; 0x2_0000]));
+        cache.set_device_memory(Box::new(SharedDeviceMemory {
+            bytes: Arc::clone(&memory),
+        }));
+        let base = 0x1_0000;
+        let size = 0x2000;
+        let id = cache.create_buffer(base, size as u32, false);
+        cache.synchronize_buffer(id, base, size as u32);
+        // GPU-only output straddles two pages; CPU backing remains stale.
+        cache.slot_buffers[id].immediate_upload(0x800, &[0xa5; 0x1000]);
+        cache.mark_written_buffer(id, base + 0x800, 0x1000);
+        let mut expected = vec![0x11; size];
+        expected[0x800..0x1800].fill(0xa5);
+        for (offset, amount, value) in [
+            (0x100, 0x100, 0x22),
+            (0x1900, 0x100, 0x33),
+            (0x880, 32, 0x44),
+        ] {
+            memory.lock()[base as usize + offset..base as usize + offset + amount]
+                .fill(value);
+            // This is a completed write from the GPU dirty-memory drain,
+            // not an invalidation performed before a CPU store.
+            cache.cached_write_memory(base + offset as u64, amount as u64);
+            expected[offset..offset + amount].fill(value);
+        }
+        // Later geometry synchronization must not reupload stale neighboring
+        // CPU bytes simply because they share a page with the small writes.
+        cache.synchronize_buffer(id, base, size as u32);
+        let mut observed = vec![0; size];
+        cache.slot_buffers[id].immediate_download(0, &mut observed);
+        assert_eq!(observed, expected);
+        assert!(cache.is_region_gpu_modified(base + 0x800, 0x80));
+        assert!(!cache.is_region_gpu_modified(base + 0x880, 32));
+        cache.download_buffer_memory_range(id, base, size as u64);
+        assert_eq!(&memory.lock()[base as usize..base as usize + size], &expected);
+    }
+
+    #[test]
+    fn completed_cpu_writes_preserve_gpu_neighbors_immediate() {
+        completed_cpu_writes_preserve_gpu_bytes_in_shared_pages::<false>();
+    }
+
+    #[test]
+    fn completed_cpu_writes_preserve_gpu_neighbors_mapped() {
+        completed_cpu_writes_preserve_gpu_bytes_in_shared_pages::<true>();
+    }
+
     #[test]
     fn synchronous_download_is_not_disabled_by_the_unused_upstream_debug_constant() {
         let tracker = DummyTracker;

@@ -93,6 +93,16 @@ case "${ID:-}" in
         ;;
 esac
 
+if [ "${RUZU_LINUX_APPIMAGE:-0}" = 1 ]; then
+    case "$PACKAGE_MANAGER" in
+        apt) REQUIRED_PACKAGES="$REQUIRED_PACKAGES python3 file binutils librsvg2-dev libgirepository1.0-dev" ;;
+        dnf) REQUIRED_PACKAGES="$REQUIRED_PACKAGES python3 file binutils librsvg2-devel gobject-introspection-devel" ;;
+        pacman) REQUIRED_PACKAGES="$REQUIRED_PACKAGES python file binutils librsvg gobject-introspection" ;;
+        zypper) REQUIRED_PACKAGES="$REQUIRED_PACKAGES python3 file binutils librsvg-devel gobject-introspection-devel" ;;
+        *) echo "AppImage packaging requires glibc Linux, not musl." >&2; exit 1 ;;
+    esac
+fi
+
 package_installed() {
     package_name=$1
     case "$PACKAGE_MANAGER" in
@@ -141,6 +151,10 @@ install_packages() {
 }
 
 post_build_platform() {
+    if [ "${RUZU_LINUX_APPIMAGE:-0}" = 1 ]; then
+        python3 "${PLATFORM_SCRIPT_DIR}/package-appimage.py"
+        return
+    fi
     if [ "${RUZU_LINUX_PACKAGE:-0}" != 1 ]; then
         return 0
     fi

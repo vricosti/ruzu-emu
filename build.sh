@@ -11,6 +11,12 @@ usage() {
     cat <<'EOF'
 Usage: ./build.sh [options] [-- <extra cargo arguments>]
        ./build.sh package [--skip-deps] [--official]
+       ./build.sh appimage [--skip-deps]
+
+The appimage command builds a Linux x86_64 release and packages it as
+target/release/Ruzu-<Git revision>-x86_64.AppImage (no commit, tag or push).
+The host glibc and graphics drivers must be compatible; test on Steam Deck
+before distributing the package.
 
 The package command builds a release and creates, on macOS,
 target/release/Ruzu-macOS-<Git revision>-<arch>-clang.zip containing
@@ -44,6 +50,28 @@ case "${1-}" in
         exit 0
         ;;
 esac
+
+if [ "${1-}" = appimage ]; then
+    shift
+    appimage_skip_deps=
+    for arg in "$@"; do
+        case "$arg" in
+            --skip-deps) appimage_skip_deps=--skip-deps ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Unsupported appimage option: $arg" >&2; exit 1 ;;
+        esac
+    done
+    if [ "$(uname -s)/$(uname -m)" != Linux/x86_64 ]; then
+        echo "AppImage packaging requires Linux x86_64 (no cross-compilation)." >&2
+        exit 1
+    fi
+    if [ -n "${CARGO_TARGET_DIR-}${CARGO_BUILD_TARGET-}" ]; then
+        echo "AppImage packaging uses native target/release; unset CARGO_TARGET_DIR and CARGO_BUILD_TARGET." >&2
+        exit 1
+    fi
+    export RUZU_LINUX_APPIMAGE=1
+    set -- --release ${appimage_skip_deps:+"$appimage_skip_deps"} -- --bin ruzu
+fi
 
 if [ "${1-}" = package ]; then
     shift

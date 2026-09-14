@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Ruzu
+Comment=Nintendo Switch emulator
+Exec=ruzu %f
+Icon=ruzu
+Terminal=false
+Categories=Game;Emulator;

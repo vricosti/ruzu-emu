@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk::{gio, glib, ButtonsType, FileChooserAction, MessageType, ResponseType};
+use crate::util::controller_navigation::{ControllerNavigation, NavigationKey};
 
 /// Open an external URI using the platform's default application.
 ///
@@ -204,10 +205,12 @@ pub(crate) fn focus_dialog_response<D: IsA<gtk::Dialog> + Clone + 'static>(
     }
 
     let dialog = dialog.clone().upcast::<gtk::Dialog>();
+    dialog.set_focus_visible(true);
     glib::idle_add_local_once(move || {
         if let Some(widget) = dialog.widget_for_response(response) {
             gtk::prelude::GtkWindowExt::set_focus(&dialog, Some(&widget));
             widget.grab_focus();
+            dialog.set_focus_visible(true);
         }
     });
 }
@@ -219,6 +222,22 @@ pub fn ask_question<P: IsA<gtk::Window>>(
     detail: &str,
     cancel_label: &str,
     accept_label: &str,
+    callback: impl FnOnce(bool) + 'static,
+) {
+    ask_question_with_navigation(
+        parent, message, detail, cancel_label, accept_label, None, callback,
+    );
+}
+
+/// GTK modal equivalent of ControllerNavigation's keyboard events. The caller
+/// owns the decision to enable controller input; no emulated game is required.
+pub fn ask_question_with_navigation<P: IsA<gtk::Window>>(
+    parent: Option<&P>,
+    message: &str,
+    detail: &str,
+    cancel_label: &str,
+    accept_label: &str,
+    navigation: Option<ControllerNavigation>,
     callback: impl FnOnce(bool) + 'static,
 ) {
     let title = message;
@@ -248,8 +267,14 @@ pub fn ask_question<P: IsA<gtk::Window>>(
     dialog.connect_response({
         let callback = Rc::clone(&callback);
         move |dialog, response| {
-            complete_question(&callback, response == ResponseType::Accept);
+            // Qt returns from its modal question before the caller opens the
+            // next dialog. Take the continuation before close-request's reject
+            // fallback, then dismiss this window before handing focus onward.
+            let callback = callback.borrow_mut().take();
             dialog.close();
+            if let Some(callback) = callback {
+                callback(response == ResponseType::Accept);
+            }
         }
     });
     dialog.connect_close_request(move |_| {
@@ -261,7 +286,73 @@ pub fn ask_question<P: IsA<gtk::Window>>(
         complete_question(&callback, false);
         glib::Propagation::Proceed
     });
+    if let Some(navigation) = navigation {
+        install_question_navigation(&dialog, navigation);
+    }
     dialog.present();
+    focus_dialog_response(&dialog, ResponseType::Accept);
+}
+
+fn install_question_navigation(dialog: &gtk::MessageDialog, navigation: ControllerNavigation) {
+    // Match the profile-selection applet: HID callbacks queue input, GTK drains
+    // it on its main thread, and dropping the source unregisters both callbacks.
+    let weak = dialog.downgrade();
+    glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+        let Some(dialog) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if !dialog.is_visible() {
+            return glib::ControlFlow::Break;
+        }
+        if !dialog.is_active() {
+            navigation.discard_pending_keys();
+            return glib::ControlFlow::Continue;
+        }
+        for key in navigation.take_pending_keys() {
+            if question_navigation_key(&dialog, key) {
+                return glib::ControlFlow::Break;
+            }
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Return true after responding, so later queued input cannot reach a closed
+/// dialog or the file chooser/next startup question opened by its continuation.
+fn question_navigation_key(dialog: &gtk::MessageDialog, key: NavigationKey) -> bool {
+    match key {
+        NavigationKey::Left | NavigationKey::Up => {
+            focus_question_response(dialog, ResponseType::Cancel);
+        }
+        NavigationKey::Right | NavigationKey::Down => {
+            focus_question_response(dialog, ResponseType::Accept);
+        }
+        NavigationKey::Enter => {
+            let focused = gtk::prelude::GtkWindowExt::focus(dialog);
+            let cancel = dialog.widget_for_response(ResponseType::Cancel);
+            let response = if focused.is_some() && focused == cancel {
+                ResponseType::Cancel
+            } else {
+                ResponseType::Accept
+            };
+            dialog.response(response);
+            return true;
+        }
+        NavigationKey::Escape => {
+            dialog.response(ResponseType::Cancel);
+            return true;
+        }
+    }
+    false
+}
+
+fn focus_question_response(dialog: &gtk::MessageDialog, response: ResponseType) {
+    dialog.set_default_response(response);
+    if let Some(widget) = dialog.widget_for_response(response) {
+        gtk::prelude::GtkWindowExt::set_focus(dialog, Some(&widget));
+        widget.grab_focus();
+    }
+    dialog.set_focus_visible(true);
 }
 
 fn question_window_title(title: &str) -> Option<&str> {
@@ -288,6 +379,92 @@ fn complete_question(callback: &QuestionCallback, accepted: bool) {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    #[ignore = "requires GTK and a display; run alone with --test-threads=1"]
+    fn question_focus_and_controller_responses() {
+        use input_common::drivers::virtual_gamepad::VirtualButton;
+        gtk::init().unwrap();
+        let parent = gtk::Window::new();
+        parent.present();
+        let context = glib::MainContext::default();
+        for (keys, expected) in [
+            (vec![NavigationKey::Enter], true),
+            (vec![NavigationKey::Left, NavigationKey::Enter], false),
+            (vec![NavigationKey::Left, NavigationKey::Right, NavigationKey::Enter], true),
+            (vec![NavigationKey::Up, NavigationKey::Down, NavigationKey::Enter], true),
+            (vec![NavigationKey::Escape], false),
+        ] {
+            let replies = Rc::new(RefCell::new(Vec::new()));
+            let reply = Rc::clone(&replies);
+            ask_question(Some(&parent), "Question navigation test", "Choose an action",
+                         "No", "Yes", move |value| reply.borrow_mut().push(value));
+            let dialog = gtk::Window::list_toplevels().into_iter()
+                .find_map(|widget| widget.downcast::<gtk::MessageDialog>().ok()).unwrap();
+            for _ in 0..100 {
+                if !context.pending() { break; }
+                context.iteration(false);
+            }
+            assert_eq!(gtk::prelude::GtkWindowExt::focus(&dialog),
+                       dialog.widget_for_response(ResponseType::Accept));
+            assert!(dialog.gets_focus_visible());
+            for key in keys {
+                let completed = question_navigation_key(&dialog, key);
+                assert_eq!(completed, matches!(key, NavigationKey::Enter | NavigationKey::Escape));
+            }
+            assert_eq!(&*replies.borrow(), &[expected]);
+            assert!(!dialog.is_visible());
+            dialog.destroy();
+        }
+        // Exercise the real input-engine -> HID -> ControllerNavigation ->
+        // modal timer path before any emulation session exists.
+        let mut input = input_common::InputSubsystem::new();
+        input.initialize();
+        let hid = std::sync::Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        hid.lock().reload_input_devices();
+        hid.lock().get_emulated_controller(hid_core::hid_types::NpadIdType::Player1)
+            .lock().set_npad_style_index(hid_core::hid_types::NpadStyleIndex::Fullkey);
+        let replies = Rc::new(RefCell::new(Vec::new()));
+        let reply = Rc::clone(&replies);
+        ask_question_with_navigation(Some(&parent), "Controller question test", "Choose an action",
+            "No", "Yes", Some(ControllerNavigation::new(&hid)),
+            move |value| reply.borrow_mut().push(value));
+        let dialog = gtk::Window::list_toplevels().into_iter()
+            .find_map(|widget| widget.downcast::<gtk::MessageDialog>().ok()).unwrap();
+        let pump_until = |condition: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !condition() && std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(condition());
+        };
+        pump_until(&|| dialog.is_active());
+        input.get_virtual_gamepad_mut().unwrap().set_button_state(0, VirtualButton::ButtonLeft, true);
+        pump_until(&|| gtk::prelude::GtkWindowExt::focus(&dialog)
+            == dialog.widget_for_response(ResponseType::Cancel));
+        assert!(dialog.gets_focus_visible());
+        input.get_virtual_gamepad_mut().unwrap().set_button_state(0, VirtualButton::ButtonLeft, false);
+        input.get_virtual_gamepad_mut().unwrap().set_button_state(0, VirtualButton::ButtonA, true);
+        pump_until(&|| !replies.borrow().is_empty());
+        assert_eq!(&*replies.borrow(), &[false]);
+        assert!(!dialog.is_visible());
+        input.get_virtual_gamepad_mut().unwrap().set_button_state(0, VirtualButton::ButtonA, false);
+        dialog.destroy();
+        hid.lock().unload_input_devices();
+        input.shutdown();
+        // Closing a controller-enabled dialog must not be prevented by the
+        // polling callback retaining the GTK window.
+        let hid = std::sync::Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        let dialog = gtk::MessageDialog::new(None::<&gtk::Window>, gtk::DialogFlags::MODAL,
+                                           MessageType::Question, ButtonsType::None, "Lifecycle");
+        let weak = dialog.downgrade();
+        install_question_navigation(&dialog, ControllerNavigation::new(&hid));
+        dialog.destroy();
+        drop(dialog);
+        assert!(weak.upgrade().is_none());
+        parent.destroy();
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

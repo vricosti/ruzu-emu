@@ -3229,12 +3229,13 @@ impl GMainWindow {
     /// it only hides the firmware version and disables firmware applets.
     fn on_check_firmware_decryption(self: &Rc<Self>) {
         if should_warn_about_missing_keys(frontend_common::content_manager::are_keys_present()) {
-            crate::gtk_compat::ask_question(
+            crate::gtk_compat::ask_question_with_navigation(
                 Some(&self.window),
                 MISSING_KEYS_TITLE,
                 MISSING_KEYS_DETAIL,
                 "No",
                 "Yes",
+                Some(crate::util::controller_navigation::ControllerNavigation::new(&self.hid_core)),
                 glib::clone!(
                     #[weak(rename_to = this)]
                     self,

@@ -17474,3 +17474,25 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   to ColumnView's list child, using the existing GTK 4.6 action instead of the
   newer GTK 4.12 scroll_to API. GTK calculates visibility from actual row sizes;
   no fixed icon-height arithmetic or unrelated scrolling state is introduced.
+
+## 2026-09-14 — src/ruzu/src/gtk_compat.rs and main_window.rs vs qt_common/abstract/frontend.h, yuzu/libqt_common.cpp and yuzu/main_window.{h,cpp}
+
+### Intentional differences
+- The startup missing-keys question explicitly attaches the existing GTK
+  ControllerNavigation adapter. Eden's OnCheckFirmwareDecryption calls the
+  synchronous QtCommon::Frontend::Warning; GTK requires modal-local delivery of
+  controller actions. The existing native-controller mapping and navigation
+  setting remain owned by util/controller_navigation.rs, corresponding to
+  yuzu/util/controller_navigation.{h,cpp}; no guest session is required.
+- The question explicitly focuses Yes after presentation and makes GTK's focus
+  indication visible. Directional input selects No/Yes, A activates the focused
+  response and B rejects, using ControllerNavigation's Enter/Escape mapping
+  (not the error overlay's single-button A/B activation).
+- The shared GTK focus helper enables the toolkit focus indicator after focus
+  assignment, including its post-map retry; this also benefits its existing
+  single-button message callers without changing their response handling.
+- A weak-window GLib timer drains controller events only for the active modal;
+  inactive input is discarded and closing the dialog drops the navigation
+  registration. GTK's asynchronous continuation runs after the question closes,
+  matching the ordering of Qt's modal return before opening the file chooser.
+  The continuation remains one-shot when close-request also fires.

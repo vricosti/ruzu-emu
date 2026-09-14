@@ -936,6 +936,41 @@ mod fullscreen_hotkey_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires GTK display with a window manager and isolated XDG directories; run alone"]
+    fn startup_maximization_survives_native_mapping() {
+        #[cfg(target_os = "linux")]
+        gtk::gdk::set_allowed_backends("x11");
+        gtk::init().unwrap();
+        let app = Application::builder().application_id("org.ruzu.StartupMaximizeTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        crate::uisettings::save_main_window_state(crate::uisettings::WindowGeometry {
+            width: 1100, height: 800, maximized: false,
+        }).unwrap();
+        let main = GMainWindow::new_for_direct_game(&app);
+        main.present();
+        let context = glib::MainContext::default();
+        let pump = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        pump();
+        let surface = main.window.surface().unwrap().downcast::<gtk::gdk::Toplevel>().unwrap();
+        assert!(surface.state().contains(gtk::gdk::ToplevelState::MAXIMIZED),
+            "native state: {:?}, GTK maximized: {}", surface.state(), main.window.is_maximized());
+        main.window.unmaximize();
+        pump();
+        assert!(!surface.state().contains(gtk::gdk::ToplevelState::MAXIMIZED));
+        main.window.set_visible(false);
+        main.present();
+        pump();
+        assert!(!surface.state().contains(gtk::gdk::ToplevelState::MAXIMIZED));
+        main.window.destroy();
+    }
+
+    #[test]
     #[ignore = "requires GTK display and isolated XDG directories; run alone"]
     fn main_geometry_restores_and_does_not_save_fullscreen_size() {
         gtk::init().unwrap();
@@ -948,6 +983,10 @@ mod fullscreen_hotkey_tests {
         crate::uisettings::with_mut(|values| values.single_window_mode.set_value(true));
         let main = GMainWindow::new_for_direct_game(&app);
         assert_eq!(main.window.default_size(), (1100, 800));
+        // Startup maximization overrides a saved normal state, without losing
+        // the dimensions to restore when the user unmaximizes the window.
+        assert!(main.window.is_maximized());
+        main.window.unmaximize();
         *main.pre_fullscreen_state.borrow_mut() = Some((main.window.clone().upcast(), false));
         main.window.set_default_size(1920, 1080);
         main.save_main_window_geometry();
@@ -1751,7 +1790,21 @@ impl GMainWindow {
             .build();
         #[cfg(target_os = "windows")]
         preserve_native_maximized_size(window.upcast_ref());
-        if geometry.maximized { window.maximize(); }
+        // Start maximized by product policy, unlike Eden's saved-state restore.
+        // Keep the saved normal size for a later user-requested unmaximize.
+        window.maximize();
+        // Some window managers discard the pre-map request. Reissue it once
+        // after the first map, never on later maps or user size changes.
+        let startup_maximize_pending = Cell::new(true);
+        window.connect_map(move |window| {
+            if startup_maximize_pending.replace(false) {
+                glib::idle_add_local_once(glib::clone!(#[weak] window, move || {
+                    if !window.is_fullscreen() {
+                        window.maximize();
+                    }
+                }));
+            }
+        });
 
         // Root vertical layout. On macOS the menu bar lives in the native
         // global menu bar (installed once via `init_app_menu` on the

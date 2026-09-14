@@ -565,7 +565,7 @@ impl GameListHandle {
 
     /// Give keyboard navigation back to the list after returning from a game.
     pub fn focus(&self) {
-        self.0.column_view.grab_focus();
+        self.0.select_position(0);
     }
 
     pub fn release_focus(&self) {
@@ -621,9 +621,8 @@ pub fn build<
     });
 
     let selection = gtk::SingleSelection::new(Some(tree));
-    // Upstream opens the game list with nothing selected; GTK's default is to
-    // auto-select the first row, which would highlight a game the user never
-    // picked.
+    // Defer initial selection until the scanned list is actually shown, not
+    // while its model is being rebuilt behind the loading page.
     selection.set_autoselect(false);
     selection.set_can_unselect(true);
     selection.set_selected(gtk::INVALID_LIST_POSITION);
@@ -634,9 +633,6 @@ pub fn build<
     // The banding comes from the CSS below, not from GTK's separators.
     column_view.set_show_row_separators(false);
     column_view.set_show_column_separators(false);
-    column_view.connect_map(|view| {
-        view.grab_focus();
-    });
 
     let on_activate: Rc<dyn Fn(String, StartGameType)> = Rc::new(on_activate);
     let on_create_shortcut: Rc<dyn Fn(u64, String, crate::util::game::ShortcutTarget)> =
@@ -798,6 +794,14 @@ pub fn build<
         scan_result_receiver: RefCell::new(scan_result_receiver),
     });
     *context_view.borrow_mut() = Rc::downgrade(&view);
+    column_view.connect_map({
+        let view = Rc::downgrade(&view);
+        move |_| {
+            if let Some(view) = view.upgrade() {
+                view.select_position(0);
+            }
+        }
+    });
 
     // Activate (double-click / Enter) → boot a game; on a directory row, toggle
     // it open instead, which is what a tree row activation should do.
@@ -1090,8 +1094,7 @@ impl GameListView {
     }
 
     fn select_position(&self, position: u32) {
-        self.selection.set_selected(position);
-        self.column_view.grab_focus();
+        select_visible_position(&self.column_view, &self.selection, position);
     }
 
     /// `GameList::PopupContextMenu`: show the menu owned by the clicked row.
@@ -2221,6 +2224,26 @@ fn release_list_focus(view: &gtk::ColumnView) {
     }
 }
 
+/// GTK counterpart of the item-view navigation/ensure-visible behavior owned
+/// by Eden's GameList view. ColumnView::scroll_to requires GTK 4.12; dispatch
+/// the list child's existing GTK 4.6 action instead, without assuming row
+/// heights (icons, scaling and expanded directory children vary).
+fn select_visible_position(view: &gtk::ColumnView, selection: &gtk::SingleSelection, position: u32) {
+    if position >= selection.n_items() {
+        return;
+    }
+    selection.set_selected(position);
+    view.grab_focus();
+    let mut child = view.first_child();
+    while let Some(widget) = child {
+        if widget.activate_action("list.scroll-to-item", Some(&position.to_variant())).is_ok() {
+            return;
+        }
+        child = widget.next_sibling();
+    }
+    log::warn!("Game list has no scroll-to-item action");
+}
+
 /// The "Name" column: expander, icon, and label, so a directory row can be
 /// collapsed and its games are indented under it. Upstream likewise puts the
 /// icon inside the Name column rather than in a column of its own.
@@ -3076,6 +3099,63 @@ mod tests {
         assert_eq!(gtk::prelude::RootExt::focus(&window), previous);
         window.destroy();
         release_list_focus(&gtk::ColumnView::new(None::<gtk::SingleSelection>));
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; run alone"]
+    fn navigation_keeps_selection_visible_in_both_directions() {
+        #[cfg(target_os = "linux")]
+        gtk::gdk::set_allowed_backends("x11");
+        gtk::init().unwrap();
+        let model = gtk::StringList::new(&["Directory"]);
+        for i in 1..100 { model.append(&format!("Homebrew {i}")); }
+        let selection = gtk::SingleSelection::new(Some(model));
+        selection.set_autoselect(false);
+        selection.set_selected(gtk::INVALID_LIST_POSITION);
+        let view = gtk::ColumnView::new(Some(selection.clone()));
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(|_, item| {
+            item.downcast_ref::<gtk::ListItem>().unwrap()
+                .set_child(Some(&gtk::Label::new(None)));
+        });
+        factory.connect_bind(|_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+            let label = item.child().and_downcast::<gtk::Label>().unwrap();
+            label.set_text(&item.item().and_downcast::<gtk::StringObject>().unwrap().string());
+            label.set_height_request(if item.position() % 2 == 0 { 40 } else { 60 });
+        });
+        view.append_column(&gtk::ColumnViewColumn::new(Some("Name"), Some(factory)));
+        let scroller = gtk::ScrolledWindow::builder().child(&view).build();
+        let window = gtk::Window::builder().default_width(400).default_height(240)
+            .child(&scroller).build();
+        window.present();
+        let pump = || {
+            let context = glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        pump();
+        select_visible_position(&view, &selection, 0);
+        pump();
+        assert_eq!(selection.selected(), 0);
+        let focus = gtk::prelude::RootExt::focus(&window).unwrap();
+        assert!(focus == *view.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&view));
+        select_visible_position(&view, &selection, 99);
+        pump();
+        let adjustment = scroller.vadjustment();
+        assert_eq!(selection.selected(), 99);
+        assert!(adjustment.value() > 0.0);
+        assert!(adjustment.value() + adjustment.page_size() >= adjustment.upper() - 2.0);
+        select_visible_position(&view, &selection, 0);
+        pump();
+        assert_eq!(selection.selected(), 0);
+        assert!(adjustment.value() < 2.0);
+        select_visible_position(&view, &selection, gtk::INVALID_LIST_POSITION);
+        assert_eq!(selection.selected(), 0);
+        window.destroy();
     }
 
     #[test]

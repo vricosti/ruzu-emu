@@ -3074,6 +3074,23 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.shader_cache.invalidate_region(addr, size as usize);
     }
 
+    fn cached_write_memory(&mut self, addr: u64, size: u64) {
+        if addr == 0 || size == 0 {
+            return;
+        }
+        unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let _texture_guard = (*texture_mutex).lock();
+            self.texture_cache.write_memory(addr, size as usize);
+        }
+        unsafe {
+            let buffer_mutex: *const _ = &self.buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.buffer_cache.cached_write_memory(addr, size);
+        }
+        self.shader_cache.invalidate_region(addr, size as usize);
+    }
+
     fn on_cpu_write(&mut self, addr: u64, size: u64) -> bool {
         debug_assert!(addr != 0 || size != 0);
         // Mirrors upstream `RasterizerOpenGL::OnCPUWrite`

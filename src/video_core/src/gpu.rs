@@ -501,9 +501,17 @@ impl Gpu {
             return;
         }
         let rasterizer = unsafe { rasterizer.as_mut() };
-        system.get().gather_gpu_dirty_memory(&mut |addr, size| {
-            rasterizer.on_cache_invalidation(addr, size as u64);
-        });
+        system
+            .get()
+            .gather_gpu_dirty_memory(&mut Self::callback_writes(rasterizer));
+    }
+
+    // Mechanical extraction of GPU::InvalidateGPUCache's callback_writes so
+    // its completed-write routing can be exercised without a live System.
+    fn callback_writes(
+        rasterizer: &mut dyn crate::rasterizer_interface::RasterizerInterface,
+    ) -> impl FnMut(u64, usize) + '_ {
+        move |addr, size| rasterizer.cached_write_memory(addr, size as u64)
     }
 
     /// Signal the ending of command list.
@@ -1178,6 +1186,7 @@ mod tests {
         accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,
         initialized_channels: Arc<StdMutex<Vec<i32>>>,
         bound_channels: Arc<StdMutex<Vec<i32>>>,
+        cache_writes: Vec<(&'static str, u64, u64)>,
     }
 
     impl RasterizerInterface for FakeRasterizer {
@@ -1253,7 +1262,12 @@ mod tests {
             _which: crate::cache_types::CacheType,
         ) {
         }
-        fn on_cache_invalidation(&mut self, _addr: u64, _size: u64) {}
+        fn on_cache_invalidation(&mut self, addr: u64, size: u64) {
+            self.cache_writes.push(("invalidate", addr, size));
+        }
+        fn cached_write_memory(&mut self, addr: u64, size: u64) {
+            self.cache_writes.push(("completed_write", addr, size));
+        }
         fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
             false
         }
@@ -1320,6 +1334,33 @@ mod tests {
     }
 
     #[test]
+    fn dirty_memory_drain_routes_completed_writes_without_metadata_invalidation() {
+        let mut rasterizer = FakeRasterizer {
+            accelerate_dma: Default::default(),
+            initialized_channels: Default::default(),
+            bound_channels: Default::default(),
+            cache_writes: Vec::new(),
+        };
+        {
+            let mut callback = Gpu::callback_writes(&mut rasterizer);
+            callback(0x1_0100, 16);
+            callback(0x1_0800, 32);
+        }
+        assert_eq!(
+            rasterizer.cache_writes,
+            [
+                ("completed_write", 0x1_0100, 16),
+                ("completed_write", 0x1_0800, 32),
+            ]
+        );
+        rasterizer.on_cache_invalidation(0x2_0000, 64);
+        assert_eq!(
+            rasterizer.cache_writes.last(),
+            Some(&("invalidate", 0x2_0000, 64))
+        );
+    }
+
+    #[test]
     fn init_channel_initializes_without_changing_the_bound_channel() {
         let gpu = Gpu::new(false, false);
         let channel_state = gpu.create_channel(7);
@@ -1330,6 +1371,7 @@ mod tests {
         let initialized_channels = Arc::new(StdMutex::new(Vec::new()));
         let bound_channels = Arc::new(StdMutex::new(Vec::new()));
         let rasterizer = Box::new(FakeRasterizer {
+            cache_writes: Vec::new(),
             accelerate_dma: Default::default(),
             initialized_channels: initialized_channels.clone(),
             bound_channels: bound_channels.clone(),
@@ -1368,6 +1410,7 @@ mod tests {
 
         let bound_channels = Arc::new(StdMutex::new(Vec::new()));
         let rasterizer = Box::new(FakeRasterizer {
+            cache_writes: Vec::new(),
             accelerate_dma: Default::default(),
             initialized_channels: Arc::new(StdMutex::new(Vec::new())),
             bound_channels: bound_channels.clone(),
@@ -1429,6 +1472,7 @@ mod tests {
         let initialized_channels = Arc::new(StdMutex::new(Vec::new()));
         let bound_channels = Arc::new(StdMutex::new(Vec::new()));
         let rasterizer = Box::new(FakeRasterizer {
+            cache_writes: Vec::new(),
             accelerate_dma: Default::default(),
             initialized_channels: initialized_channels.clone(),
             bound_channels: bound_channels.clone(),

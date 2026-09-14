@@ -2165,6 +2165,21 @@ impl RasterizerInterface for MetalRasterizer {
         self.shader_cache.on_cache_invalidation(addr, size as usize);
     }
 
+    fn cached_write_memory(&mut self, addr: u64, size: u64) {
+        if addr == 0 || size == 0 {
+            return;
+        }
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let _texture_guard = unsafe { (*texture_mutex).lock() };
+        self.texture_cache.base.write_memory(addr, size as usize);
+        drop(_texture_guard);
+        let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        let _buffer_guard = unsafe { (*buffer_mutex).lock() };
+        self.common_buffer_cache.cached_write_memory(addr, size);
+        drop(_buffer_guard);
+        self.shader_cache.on_cache_invalidation(addr, size as usize);
+    }
+
     fn on_cpu_write(&mut self, addr: u64, size: u64) -> bool {
         debug_assert!(addr != 0 || size != 0);
         let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;

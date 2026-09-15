@@ -17496,3 +17496,93 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   registration. GTK's asynchronous continuation runs after the question closes,
   matching the ordering of Qt's modal return before opening the file chooser.
   The continuation remains one-shot when close-request also fires.
+
+## 2026-09-15 — src/ruzu/src/util/controller_navigation.rs vs yuzu/util/controller_navigation.{h,cpp}
+
+### Intentional differences
+- User-requested interface navigation extends the upstream Enter/Escape/arrows
+  with L/R focus traversal and Plus menu access. GTK widget actions and focus
+  traversal replace posted QKeyEvents; no system-wide keyboard injection is used.
+- The main-window-owned receiver routes only to its active window or transient
+  dialogs. Applets with their own input semantics, binding capture, and gameplay
+  exclude general navigation. Input is drained while excluded, and a target
+  change discards the current batch to prevent modal-to-launcher fall-through.
+- First-run navigation also listens to unmapped SDL devices via the existing
+  InputSubsystem GetInputDevices/GetButtonMappingForDevice/GetAnalogMappingForDevice
+  interfaces and InputDevice callbacks. Mapped pads retain the HID path. This
+  does not change any player binding or send input to the guest. Device discovery
+  is refreshed once per second; removed-device callbacks retain an obsolete
+  queue rather than writing into the new reader generation.
+- GTK's menu scroller must not become the selected menu action at the last item.
+  The adapter preserves item focus and supports switching top-level menus. The
+  version-specific file-list implementation uses GTK's own cursor actions:
+  TreeView on older GTK and ColumnView/ListView on newer GTK.
+- Tests are isolated in controller_navigation_tests.rs; display/SDL-global tests
+  run separately from parallel unit tests. They cover focus, scrolling, menu
+  activation, modal/capture/gameplay exclusion and an unmapped virtual SDL pad.
+
+## 2026-09-15 — src/ruzu/src/game_list.rs vs yuzu/game/game_list.{h,cpp}
+
+### Intentional differences
+- Eden posts controller keys directly to its current game view. The requested
+  whole-interface GTK navigation instead has one main-window receiver; this
+  module still owns row selection, activation and tree expansion, but only when
+  its view has focus (excluding anchored popovers). The redundant list timer is
+  removed. The empty-library Add Game Directory button receives visible focus.
+
+## 2026-09-15 — src/ruzu/src/main_window.rs vs yuzu/main_window.{h,cpp}
+
+### Intentional differences
+- GMainWindow installs general interface navigation after input initialization
+  and game-list construction, supplies its session guard, and retains action
+  ownership. Its startup question enables unmapped-SDL navigation too.
+- With controller navigation enabled, macOS also gets an in-window menu model:
+  GTK focus actions cannot operate Cocoa's global menu. Native global menu
+  registration remains unchanged. Linux/Windows retain their in-window menus.
+
+## 2026-09-15 — src/ruzu/src/gtk_compat.rs vs yuzu/main_window.{h,cpp} and qt_common/abstract/frontend.h
+
+### Intentional differences
+- With controller navigation enabled, open/open-multiple/save/select-folder use
+  an in-process GtkFileChooserDialog, since native/portal dialogs expose no GTK
+  focus tree. Disabled navigation retains FileChooserNative. File filters,
+  initial locations, multiple selection and toolkit validation are retained;
+  response callbacks run once after close. The helper owns toolkit mechanics,
+  not file installation or game scanning. GTK tests exercise entering a nested
+  folder, accepting it, and cancellation without duplicate callbacks.
+- Controller-enabled questions mark themselves as owning navigation, preserving
+  their directional Yes/No semantics without a second generic receiver.
+
+## 2026-09-15 — src/ruzu/src/applets/controller.rs vs yuzu/applets/qt_controller.{h,cpp}
+
+### Intentional differences
+- The GTK controller-selector marks its existing modal input ownership so the
+  general interface receiver does not duplicate A/B/arrows. The new L/R keys
+  traverse GTK controls; connection validation and response handling stay here.
+
+## 2026-09-15 — src/ruzu/src/applets/profile_select.rs vs yuzu/applets/qt_profile_select.{h,cpp}
+
+### Intentional differences
+- The boot selector marks its modal-local navigation ownership; its existing
+  selection and confirmation handler, rather than the general GTK receiver,
+  continues to consume controller input.
+
+## 2026-09-15 — src/ruzu/src/applets/software_keyboard.rs vs yuzu/applets/qt_software_keyboard.{h,cpp}
+
+### Intentional differences
+- The software keyboard marks its own controller ownership. In particular B
+  remains the keyboard's backspace action, not generic modal cancellation.
+
+## 2026-09-15 — src/ruzu/src/overlay_dialog.rs vs yuzu/util/overlay_dialog.{h,cpp}
+
+### Intentional differences
+- The error overlay marks its existing input ownership. Its upstream-derived
+  single-button A/B confirmation is not replaced by the generic dialog mapping.
+
+## 2026-09-15 — src/ruzu/src/configuration/configure_input_player.rs and configure_hotkeys.rs vs yuzu/configuration/configure_input_player.{h,cpp} and configure_hotkeys.{h,cpp}
+
+### Intentional differences
+- While capturing controller bindings, the GTK pages exclude general interface
+  navigation until completion/cancellation. Upstream owns polling here too and
+  ConfigureInputPlayer grabs keyboard/mouse; the GTK marker prevents the newly
+  added controller-to-widget path from activating controls during that capture.

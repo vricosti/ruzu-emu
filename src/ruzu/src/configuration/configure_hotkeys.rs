@@ -175,6 +175,9 @@ pub struct ControllerCapture {
 impl ControllerCapture {
     fn start(self: &Rc<Self>, source: &gtk::Widget, row: &HotkeyRow) {
         if self.active.borrow().is_some() { return; }
+        if let Some(window) = source.root().and_downcast::<gtk::Window>() {
+            window.add_css_class("ruzu-controller-capture");
+        }
         *self.active.borrow_mut() = Some(PendingControllerCapture {
             row: row.clone(), previous: row.controller_hotkey(), source: source.downgrade(),
             started: Instant::now(), buttons: NpadButton::empty(), home: false, screenshot: false,
@@ -212,6 +215,9 @@ impl ControllerCapture {
 
     fn finish(&self, cancel: bool) {
         let Some(active) = self.active.borrow_mut().take() else { return; };
+        if let Some(window) = active.source.upgrade().and_then(|source| source.root()).and_downcast::<gtk::Window>() {
+            window.remove_css_class("ruzu-controller-capture");
+        }
         if cancel || (active.buttons.is_empty() && !active.home && !active.screenshot) {
             active.row.set_controller_hotkey(&active.previous);
         } else {

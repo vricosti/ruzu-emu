@@ -112,6 +112,7 @@ pub fn select_for_boot(
         }
     });
     let navigation = crate::util::controller_navigation::ControllerNavigation::new(hid);
+    dialog.add_css_class("ruzu-applet-navigation");
     let weak = dialog.downgrade();
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
         use crate::util::controller_navigation::NavigationKey;

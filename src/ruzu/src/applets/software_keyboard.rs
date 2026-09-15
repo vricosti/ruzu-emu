@@ -510,6 +510,7 @@ impl SoftwareKeyboardFrontend {
             .title("Software Keyboard")
             .build();
         dialog.set_default_size(860, 520);
+        dialog.add_css_class("ruzu-applet-navigation");
 
         let content = dialog.content_area();
         content.set_spacing(0);

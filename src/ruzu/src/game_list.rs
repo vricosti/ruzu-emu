@@ -46,7 +46,7 @@ use ruzu_core::loader::loader::{
 use crate::configuration::qt_config;
 use crate::main_window::StartGameType;
 use crate::uisettings::{self, GameDir};
-use crate::util::controller_navigation::{ControllerNavigation, NavigationKey};
+use crate::util::controller_navigation::NavigationKey;
 mod worker;
 
 /// Upstream's colorful-theme `folder`, `bad_folder` and `star` icons. Keep
@@ -475,7 +475,6 @@ struct GameListView {
     /// store clears the selection, which would otherwise disable the
     /// per-directory toolbar actions after every single use of them.
     selection: gtk::SingleSelection,
-    controller_navigation: ControllerNavigation,
     hid_core: Arc<parking_lot::Mutex<hid_core::hid_core::HIDCore>>,
     play_time_manager: Arc<frontend_common::play_time_manager::PlayTimeManager>,
     on_activate: Rc<dyn Fn(String, StartGameType)>,
@@ -539,6 +538,17 @@ const PAGE_LOADING: &str = "loading";
 pub struct GameListHandle(Rc<GameListView>);
 
 impl GameListHandle {
+    /// Keep tree navigation in its owner; other focused controls belong to GTK.
+    pub(crate) fn controller_key(&self, key: NavigationKey) -> bool {
+        let view = &self.0;
+        let focused = view.parent_window().and_then(|w| gtk::prelude::GtkWindowExt::focus(&w));
+        if focused.is_some_and(|w| w.ancestor(gtk::Popover::static_type()).is_none()
+            && (w == view.column_view || w.is_ancestor(&view.column_view))) {
+            view.handle_navigation(key)
+        } else {
+            false
+        }
+    }
     /// Re-read the configured directories and rebuild the list.
     pub fn reload(&self) {
         self.0.reload();
@@ -778,7 +788,6 @@ pub fn build<
         favorites_root,
         all_games: RefCell::new(Vec::new()),
         selection: selection.clone(),
-        controller_navigation: ControllerNavigation::new(hid_core),
         hid_core: Arc::clone(hid_core),
         play_time_manager: Arc::clone(play_time_manager),
         on_activate,
@@ -833,30 +842,6 @@ pub fn build<
         }
     });
     column_view.add_controller(keys);
-
-    // HID callbacks can run outside GTK's main context. Drain their actions on
-    // the UI thread and discard presses while the game list is not active,
-    // matching upstream's `IsPoweredOn` / `isActiveWindow` guards.
-    glib::timeout_add_local(std::time::Duration::from_millis(1), {
-        let view = Rc::downgrade(&view);
-        move || {
-            let Some(view) = view.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            let list_is_active = view.root.is_mapped()
-                && view
-                    .parent_window()
-                    .is_some_and(|window| window.is_active());
-            if list_is_active {
-                for key in view.controller_navigation.take_pending_keys() {
-                    view.handle_navigation(key);
-                }
-            } else {
-                view.controller_navigation.discard_pending_keys();
-            }
-            glib::ControlFlow::Continue
-        }
-    });
 
     // `GameListWorker::ProcessEvents`: transfer plain scan results back to
     // GTK, where GObjects and textures must be created.
@@ -964,6 +949,12 @@ fn build_empty_state() -> EmptyState {
     add_button.add_css_class("suggested-action");
     add_button.set_halign(gtk::Align::Center);
     root.append(&add_button);
+    add_button.connect_map(|button| {
+        button.grab_focus();
+        if let Some(window) = button.root().and_downcast::<gtk::Window>() {
+            window.set_focus_visible(true);
+        }
+    });
 
     EmptyState { root, add_button }
 }
@@ -1088,7 +1079,7 @@ impl GameListView {
                     self.activate_position(selected);
                 }
             }
-            NavigationKey::Escape => return false,
+            NavigationKey::Escape | NavigationKey::Previous | NavigationKey::Next | NavigationKey::Menu => return false,
         }
         true
     }

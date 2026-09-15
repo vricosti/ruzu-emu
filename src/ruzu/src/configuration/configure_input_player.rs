@@ -606,6 +606,9 @@ impl PlayerPage {
             _ => WAITING,
         });
         button.grab_focus();
+        if let Some(window) = button.root().and_downcast::<gtk::Window>() {
+            window.add_css_class("ruzu-controller-capture");
+        }
 
         let input_type = match target {
             CaptureTarget::Button(_) | CaptureTarget::AnalogModifier(_) => {
@@ -649,6 +652,9 @@ impl PlayerPage {
         let Some(capture) = self.capture.borrow_mut().take() else {
             return;
         };
+        if let Some(window) = capture.button.root().and_downcast::<gtk::Window>() {
+            window.remove_css_class("ruzu-controller-capture");
+        }
         if let Some(subsystem) = self.input_subsystem.borrow().as_ref() {
             subsystem.borrow_mut().stop_mapping();
         }

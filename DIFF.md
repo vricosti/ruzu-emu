@@ -17586,3 +17586,134 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   navigation until completion/cancellation. Upstream owns polling here too and
   ConfigureInputPlayer grabs keyboard/mouse; the GTK marker prevents the newly
   added controller-to-widget path from activating controls during that capture.
+
+## 2026-09-16 — src/core/src/hle/service/am/service/application_functions.rs vs core/hle/service/am/service/application_functions.{h,cpp}
+
+### Intentional differences
+- QueryApplicationPlayStatistics and QueryApplicationPlayStatisticsByUid use
+  explicit RequestParser/ResponseBuilder handlers instead of the C++ CMIF
+  templates. Both now register commands 110/111 and return success with a signed
+  zero entry count, matching the upstream stubs. The unused output scratch bytes
+  are zero-initialized deterministically before writing the MapAlias B buffer;
+  upstream writes its scratch allocation without populating statistics records.
+- Synthetic tests exercise both command registrations, the signed-count reply,
+  and B-buffer writes (including partial record sizes) without modifying a C
+  buffer supplied alongside it.
+
+## 2026-09-16 — src/core/src/hle/service/am/service/application_functions.rs and am/applet.rs vs core/hle/service/am/service/application_functions.{h,cpp} and am/applet.{h,cpp}
+
+### Intentional differences
+- Newly wired commands 12, 29–33, 60, 101–102, 120–122 and 150 use explicit
+  Rust request/reply shims rather than C++ CMIF templates. Cache storage metadata
+  uses RawNACP field offsets and little-endian decoding from a zero-filled byte
+  allocation, avoiding an unaligned typed reference. The u32/u64 response retains
+  CMIF padding. The original ARP error is propagated.
+- Applet owns media_playback_state and its notification event. The event uses
+  the existing lazy Rust kernel-event bridge, unlike upstream eager Event
+  construction; repeated requests retain the same initially unsignaled object.
+- Incoming user-channel storage uses the existing domain manager and checked
+  downcast instead of C++ SharedPointer deserialization. Non-domain input is
+  rejected, matching the upstream CMIF assertion.
+
+## 2026-09-16 — src/core/src/core.rs vs core/core.{h,cpp}
+
+### Intentional differences
+- GetUserChannel returns a mutex guard instead of an unrestricted mutable C++
+  reference. This permits the AM service to preserve the channel before invoking
+  ExecuteProgram without casting a shared System reference to mutable. The guard
+  is released before the frontend callback. Snapshot/clear/take use the same
+  mutex; existing deque ordering and transfer semantics are retained.
+
+## 2026-09-16 — src/core/src/hle/service/filesystem/fsp/fs_i_filesystem.rs vs core/hle/service/filesystem/fsp/fs_i_filesystem.{h,cpp}
+
+### Intentional differences
+- RenameDirectory uses explicit X-buffer path decoding and Result conversion,
+  as the adjacent RenameFile port, instead of upstream CMIF templates. It delegates
+  to the existing FSA backend and propagates its result. No alternate directory
+  move implementation was introduced.
+
+## 2026-09-16 — src/core/src/hle/service/ssl/ssl.rs vs core/hle/service/ssl/ssl.{h,cpp}
+
+### Intentional differences
+- GetOption, SetNextAlpnProto and GetNextAlpnProto use the connection's existing
+  Mutex-owned state. Option bytes and the bounded ALPN copy/count follow upstream;
+  SkipDefaultVerify and EnableAlpn now also round-trip through SetOption. These
+  fields and ALPN bytes are stored only, as in the upstream handlers; this change
+  does not add a new backend TLS policy. Context GetOption retains upstream's
+  result-only success stub rather than inventing an option payload.
+
+## 2026-09-16 — src/core/src/hle/service/audio/audio_controller.rs and audio/errors.rs vs core/hle/service/audio/audio_controller.{h,cpp} and audio/errors.h
+
+### Intentional differences
+- Target volume/mute arrays are mutex-owned Rust fields. Sink system/device
+  volume updates use the existing AudioCoreInterface bridge; live audout sessions
+  are updated via IAudioOutManager as upstream. An absent optional audio core
+  replaces the upstream exception path. Target validation uses Audio result 900.
+  Inactive target mute still changes the global muted setting, matching upstream.
+
+## 2026-09-16 — src/core/src/hle/service/nifm/nifm.rs vs core/hle/service/nifm/nifm.{h,cpp}
+
+### Intentional differences
+- IScanRequest's worker captures Arc-owned atomic state/results and its completion
+  event instead of a raw this pointer. A mutex serializes worker replacement;
+  the worker never takes that mutex. Result/state are published before signaling
+  completion. Drop closes the service-owned events then joins, with Arc ownership
+  retaining the completion event until the worker exits. ServiceContext performs
+  the existing Rust kernel-event/handle bridging.
+
+## 2026-09-16 — src/core/src/internal_network/wifi_scanner.rs and wifi_scanner_dummy.rs vs core/internal_network/wifi_scanner.h and wifi_scanner_dummy.cpp
+
+### Intentional differences
+- Ruzu currently selects the upstream ENABLE_WIFI_SCAN=OFF backend, which is
+  Eden's default and the local Eden build setting. The scan worker returns empty
+  results and ResultPendingConnection, not invented networks. ScanData explicitly
+  initializes the padding byte; its flags offset is 36 and total size is 40.
+
+### Missing items
+- The optional ENABLE_WIFI_SCAN=ON native scanner (iwlib/Windows WLAN) is not
+  exposed by Ruzu. This slice implements the disabled configuration, not hardware
+  Wi-Fi discovery.
+
+## 2026-09-16 — src/core/src/hle/service/ldn/user_local_communication_service.rs vs core/hle/service/ldn/user_local_communication_service.{h,cpp}
+
+### Intentional differences
+- The 27 upstream non-null commands use explicit CMIF request/reply shims instead
+  of the C++ templates. The three null commands remain unimplemented. Upstream's
+  four success stubs retain that behavior; ScanPrivate retains its unusual
+  empty-output requirement, opposite to Scan's requirement.
+- LANDiscovery is Arc/Mutex-owned for room-thread callbacks. The callback holds
+  a Weak backend, not a raw service pointer. Registration retains the originating
+  room weakly so Finalize/Drop unbind from that same room, even if the global room
+  changes. Reinitialization removes the old callback rather than leaking it.
+  Unbinding never holds the backend mutex: packet delivery holds the room callback
+  mutex before acquiring the backend. State notifications use ServiceContext's
+  existing Event bridge; the callback owns its event until backend destruction.
+- Enum-containing guest arguments use checked decoders rather than unchecked
+  memcpy; invalid representations return BadInput, avoiding Rust undefined
+  behavior. Raw signed communication-version bits are still truncated to u16.
+
+## 2026-09-16 — src/core/src/hle/service/ldn/lan_discovery.rs vs core/hle/service/ldn/lan_discovery.{h,cpp}
+
+### Intentional differences
+- Scan takes a reference to the owning mutex, releasing it alongside packet_mutex
+  throughout upstream's one-second reply window. Keeping a mutable guard across
+  that window would prevent ReceivePacket from collecting any replies. Other
+  operations retain exclusive backend access. Tests inject a reply during Scan
+  and verify that duplicate BSSID responses keep the first entry, as upstream.
+- The existing station representation indexes parent-owned nodes rather than
+  storing self-referential pointers. OverrideInfo is applied by UpdateNodes;
+  OnClose's Reset and parent update are performed by ReceivePacket. This avoids
+  simultaneous mutable parent/child references; no station owns a duplicate node.
+- Packet decoding checks sizes, enum discriminants and SSID length before copying
+  into Rust values. Invalid packets are discarded rather than invoking undefined
+  behavior through C++ memcpy/memcmp. HashMap traversal order can differ from the
+  upstream unordered_map; filtering and signed s16 result-capacity semantics are
+  retained. GetNodeInfo's caller now preserves existing node reserved bytes.
+
+## 2026-09-16 — src/core/src/hle/service/ldn/ldn_types.rs vs core/hle/service/ldn/ldn_types.h
+
+### Intentional differences
+- The new from_bytes helpers validate Rust enum representations before unaligned
+  reads. Explicit reserved/padding fields remain part of the wire structs;
+  synthesized outputs are initialized with Default. Request offsets, packed(4)
+  private configuration, and signed connection-version truncation are tested.

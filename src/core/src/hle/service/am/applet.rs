@@ -61,6 +61,7 @@ pub struct Applet {
 
     // Application functions
     pub game_play_recording_supported: bool,
+    pub media_playback_state: bool,
     pub game_play_recording_state: GamePlayRecordingState,
     pub jit_service_launched: bool,
     pub application_crash_report_enabled: bool,
@@ -105,6 +106,7 @@ pub struct Applet {
     pub gpu_error_detected_event_handle: Option<Handle>,
     pub friend_invitation_storage_channel_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub friend_invitation_storage_channel_event_handle: Option<Handle>,
+    pub notification_storage_channel_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub health_warning_disappeared_system_event: Option<Arc<Mutex<KReadableEvent>>>,
     pub health_warning_disappeared_system_event_handle: Option<Handle>,
     pub unknown_event: Option<Arc<Mutex<KReadableEvent>>>,
@@ -157,6 +159,7 @@ impl Applet {
             handling_capture_button_long_pressed_message_enabled_for_applet: false,
             application_core_usage_mode: 0,
             game_play_recording_supported: false,
+            media_playback_state: false,
             game_play_recording_state: GamePlayRecordingState::Disabled,
             jit_service_launched: false,
             application_crash_report_enabled: false,
@@ -190,6 +193,7 @@ impl Applet {
             gpu_error_detected_event_handle: None,
             friend_invitation_storage_channel_event: None,
             friend_invitation_storage_channel_event_handle: None,
+            notification_storage_channel_event: None,
             health_warning_disappeared_system_event: None,
             health_warning_disappeared_system_event_handle: None,
             unknown_event: None,
@@ -363,6 +367,17 @@ impl Applet {
             ctx,
             &mut self.friend_invitation_storage_channel_event,
             false,
+        )
+    }
+
+    /// Same persistent event ownership as upstream Applet; use the existing
+    /// Rust lazy kernel-event bridge, as for the adjacent invitation event.
+    pub fn ensure_notification_storage_channel_event_object_id(
+        &mut self,
+        ctx: &HLERequestContext,
+    ) -> Option<u64> {
+        Self::ensure_persistent_readable_event_object_id(
+            ctx, &mut self.notification_storage_channel_event, false,
         )
     }
 

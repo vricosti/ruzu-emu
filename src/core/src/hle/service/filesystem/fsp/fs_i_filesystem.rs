@@ -75,6 +75,7 @@ impl IFileSystem {
                 "DeleteDirectoryRecursively",
             ),
             (5, Some(Self::rename_file_handler), "RenameFile"),
+            (6, Some(Self::rename_directory_handler), "RenameDirectory"),
             (7, Some(Self::get_entry_type_handler), "GetEntryType"),
             (8, Some(Self::open_file_handler), "OpenFile"),
             (9, Some(Self::open_directory_handler), "OpenDirectory"),
@@ -204,6 +205,14 @@ impl IFileSystem {
             new_path
         );
         match self.backend.rename_file(old_path, new_path) {
+            Ok(()) => RESULT_SUCCESS,
+            Err(rc) => ResultCode::new(rc.0),
+        }
+    }
+
+    fn rename_directory(&self, old_path: &str, new_path: &str) -> ResultCode {
+        log::debug!("IFileSystem::RenameDirectory called. directory '{}' to directory '{}'", old_path, new_path);
+        match self.backend.rename_directory(old_path, new_path) {
             Ok(()) => RESULT_SUCCESS,
             Err(rc) => ResultCode::new(rc.0),
         }
@@ -484,6 +493,19 @@ impl IFileSystem {
         Self::reply_result_only(ctx, result);
     }
 
+    fn rename_directory_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = Self::as_self(this);
+        let old_path = match Self::read_path(ctx, 0) {
+            Ok(path) => path,
+            Err(rc) => return Self::reply_result_only(ctx, rc),
+        };
+        let new_path = match Self::read_path(ctx, 1) {
+            Ok(path) => path,
+            Err(rc) => return Self::reply_result_only(ctx, rc),
+        };
+        Self::reply_result_only(ctx, service.rename_directory(&old_path, &new_path));
+    }
+
     fn get_entry_type_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let path = match Self::read_path(ctx, 0) {
@@ -701,6 +723,30 @@ mod tests {
     use super::IFileSystem;
     use crate::file_sys::fssrv::fssrv_sf_path::Path as SfPath;
     use crate::hle::service::hle_ipc::HLERequestContext;
+
+    #[test]
+    fn rename_directory_is_registered_and_preserves_backend_results() {
+        use crate::file_sys::vfs::vfs_vector::VectorVfsDirectory;
+        use crate::file_sys::vfs::vfs_types::VirtualDir;
+        use crate::hle::service::service::ServiceFramework;
+        use super::SizeGetter;
+        use std::sync::Arc;
+        let child: VirtualDir = Arc::new(VectorVfsDirectory::new(vec![], vec![], "old".into(), None));
+        let root: VirtualDir = Arc::new(VectorVfsDirectory::new(vec![], vec![child.clone()], "root".into(), None));
+        let service = IFileSystem::new(root, SizeGetter {
+            get_free_size: Box::new(|| 0), get_total_size: Box::new(|| 0),
+        });
+        let entry = &service.handlers()[&6];
+        assert_eq!(entry.name, "RenameDirectory");
+        assert!(entry.handler_callback.is_some());
+        assert!(service.rename_directory("/old", "/new").is_success());
+        assert_eq!(child.get_name(), "new");
+        assert_eq!(service.rename_directory("/absent", "/new").get_inner_value(),
+            crate::file_sys::errors::RESULT_PATH_NOT_FOUND.0);
+        let mut ctx = HLERequestContext::new();
+        entry.handler_callback.unwrap()(&service, &mut ctx);
+        assert_ne!(ctx.cmd_buf[6], 0); // Missing X paths must not return success.
+    }
 
     #[test]
     fn decode_path_bytes_round_trips_full_nested_path() {

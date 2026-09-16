@@ -518,3 +518,130 @@ pub struct ConnectNetworkData {
     pub option: ConnectOption,
 }
 const _: () = assert!(std::mem::size_of::<ConnectNetworkData>() == 0x7C);
+
+// C++ memcpy accepts enum bit patterns which cannot be represented by Rust
+// enums. Validate discriminants before constructing these guest wire values.
+fn valid_security_mode(data: &[u8]) -> bool {
+    data.get(..2)
+        .is_some_and(|v| u16::from_le_bytes(v.try_into().unwrap()) <= 2)
+}
+
+fn valid_network_channel(data: &[u8]) -> bool {
+    let offset = std::mem::offset_of!(NetworkConfig, channel);
+    data.get(offset..offset + 2).is_some_and(|v| {
+        matches!(
+            i16::from_le_bytes(v.try_into().unwrap()),
+            0 | 1 | 6 | 11 | 36 | 40 | 44 | 48
+        )
+    })
+}
+
+impl CreateNetworkConfig {
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < std::mem::size_of::<Self>()
+            || !valid_security_mode(data)
+            || !valid_network_channel(&data[std::mem::offset_of!(Self, network_config)..])
+        {
+            return None;
+        }
+        Some(unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<Self>()) })
+    }
+}
+
+impl CreateNetworkConfigPrivate {
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < std::mem::size_of::<Self>()
+            || !valid_security_mode(data)
+            || !valid_network_channel(&data[std::mem::offset_of!(Self, network_config)..])
+        {
+            return None;
+        }
+        Some(unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<Self>()) })
+    }
+}
+
+impl ConnectNetworkData {
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < std::mem::size_of::<Self>() || !valid_security_mode(data) {
+            return None;
+        }
+        Some(unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<Self>()) })
+    }
+}
+
+impl ScanFilter {
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < std::mem::size_of::<Self>() {
+            return None;
+        }
+        let offset = std::mem::offset_of!(Self, network_type);
+        if u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) > 3
+            || data[std::mem::offset_of!(Self, ssid)] as usize > SSID_LENGTH_MAX
+        {
+            return None;
+        }
+        Some(unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<Self>()) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn guest_request_layouts_and_signed_version_are_preserved() {
+        assert_eq!(offset_of!(CreateNetworkConfig, network_config), 0x78);
+        assert_eq!(
+            offset_of!(CreateNetworkConfigPrivate, security_parameter),
+            0x44
+        );
+        assert_eq!(offset_of!(CreateNetworkConfigPrivate, network_config), 0x98);
+        assert_eq!(align_of::<CreateNetworkConfigPrivate>(), 4);
+        assert_eq!(offset_of!(NetworkInfo, common), 0x20);
+        assert_eq!(offset_of!(NetworkInfo, ldn), 0x50);
+        assert_eq!(offset_of!(LdnNetworkInfo, nodes), 0x18);
+        assert_eq!(offset_of!(LdnNetworkInfo, random_authentication_id), 0x428);
+        let mut bytes = vec![0; size_of::<ConnectNetworkData>() + 1];
+        let version = 1 + offset_of!(ConnectNetworkData, local_communication_version);
+        bytes[version..version + 4].copy_from_slice(&(-2i32).to_le_bytes());
+        let decoded = ConnectNetworkData::from_bytes(&bytes[1..]).unwrap();
+        assert_eq!(decoded.local_communication_version, -2);
+        assert_eq!(decoded.local_communication_version as u16, 0xfffe);
+    }
+
+    #[test]
+    fn guest_enum_payloads_are_checked_before_materializing_rust_values() {
+        let mut public = vec![0; size_of::<CreateNetworkConfig>()];
+        let mut private = vec![0; size_of::<CreateNetworkConfigPrivate>()];
+        let mut connect = vec![0; size_of::<ConnectNetworkData>()];
+        let mut filter = vec![0; size_of::<ScanFilter>()];
+        assert!(CreateNetworkConfig::from_bytes(&public).is_some());
+        assert!(CreateNetworkConfigPrivate::from_bytes(&private).is_some());
+        assert!(ConnectNetworkData::from_bytes(&connect).is_some());
+        assert!(ScanFilter::from_bytes(&filter).is_some());
+        public[0] = 3;
+        private[0] = 3;
+        connect[0] = 3;
+        filter[offset_of!(ScanFilter, network_type)] = 4;
+        assert!(CreateNetworkConfig::from_bytes(&public).is_none());
+        assert!(CreateNetworkConfigPrivate::from_bytes(&private).is_none());
+        assert!(ConnectNetworkData::from_bytes(&connect).is_none());
+        assert!(ScanFilter::from_bytes(&filter).is_none());
+        public[0] = 0;
+        private[0] = 0;
+        filter[offset_of!(ScanFilter, network_type)] = 0;
+        public[offset_of!(CreateNetworkConfig, network_config)
+            + offset_of!(NetworkConfig, channel)] = 2;
+        private[offset_of!(CreateNetworkConfigPrivate, network_config)
+            + offset_of!(NetworkConfig, channel)] = 2;
+        filter[offset_of!(ScanFilter, ssid)] = 255;
+        assert!(CreateNetworkConfig::from_bytes(&public).is_none());
+        assert!(CreateNetworkConfigPrivate::from_bytes(&private).is_none());
+        assert!(ScanFilter::from_bytes(&filter).is_none());
+        assert!(CreateNetworkConfig::from_bytes(&[]).is_none());
+        assert!(CreateNetworkConfigPrivate::from_bytes(&[]).is_none());
+        assert!(ConnectNetworkData::from_bytes(&[]).is_none());
+        assert!(ScanFilter::from_bytes(&[]).is_none());
+    }
+}

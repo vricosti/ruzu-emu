@@ -53,6 +53,8 @@ pub enum IoMode {
 pub enum OptionType {
     DoNotCloseSocket = 0,
     GetServerCertChain = 1,
+    SkipDefaultVerify = 2,
+    EnableAlpn = 3,
 }
 
 /// nn::ssl::sf::SslVersion
@@ -142,6 +144,9 @@ struct SslConnectionState {
     fd_to_close: Option<i32>,
     do_not_close_socket: bool,
     get_server_cert_chain: bool,
+    skip_default_verify: bool,
+    enable_alpn: bool,
+    next_alpn_proto: Vec<u8>,
     socket_fd: Option<i32>,
     did_handshake: bool,
 }
@@ -173,6 +178,9 @@ impl ISslConnection {
                 fd_to_close: None,
                 do_not_close_socket: false,
                 get_server_cert_chain: false,
+                skip_default_verify: false,
+                enable_alpn: false,
+                next_alpn_proto: Vec::new(),
                 socket_fd: None,
                 did_handshake: false,
             }),
@@ -220,11 +228,11 @@ impl ISslConnection {
                 (20, None, "SetRenegotiationMode"),
                 (21, None, "GetRenegotiationMode"),
                 (22, Some(ISslConnection::set_option_handler), "SetOption"),
-                (23, None, "GetOption"),
+                (23, Some(Self::get_option_handler), "GetOption"),
                 (24, None, "GetVerifyCertErrors"),
                 (25, None, "GetCipherInfo"),
-                (26, None, "SetNextAlpnProto"),
-                (27, None, "GetNextAlpnProto"),
+                (26, Some(Self::set_next_alpn_proto_handler), "SetNextAlpnProto"),
+                (27, Some(Self::get_next_alpn_proto_handler), "GetNextAlpnProto"),
                 (28, None, "SetDtlsSocketDescriptor"),
                 (29, None, "GetDtlsHandshakeTimeout"),
                 (30, None, "SetPrivateOption"),
@@ -511,6 +519,12 @@ impl ISslConnection {
             option if option == OptionType::GetServerCertChain as u32 => {
                 state.get_server_cert_chain = parameters.value != 0;
             }
+            option if option == OptionType::SkipDefaultVerify as u32 => {
+                state.skip_default_verify = parameters.value != 0;
+            }
+            option if option == OptionType::EnableAlpn as u32 => {
+                state.enable_alpn = parameters.value != 0;
+            }
             option => log::warn!(
                 "ISslConnection::SetOption unknown option={}, value={}",
                 option,
@@ -519,6 +533,46 @@ impl ISslConnection {
         }
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl ISslConnection {
+    fn get_option_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let option = RequestParser::new(ctx).pop_u32();
+        let state = service.state.lock().unwrap();
+        let value = match option {
+            0 => state.do_not_close_socket,
+            1 => state.get_server_cert_chain,
+            2 => state.skip_default_verify,
+            3 => state.enable_alpn,
+            _ => {
+                log::warn!("ISslConnection::GetOption unknown option={}", option);
+                false
+            }
+        };
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&(value as u8));
+    }
+
+    fn set_next_alpn_proto_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        service.state.lock().unwrap().next_alpn_proto = ctx.read_buffer(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_next_alpn_proto_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let state = service.state.lock().unwrap();
+        let size = state.next_alpn_proto.len().min(ctx.get_write_buffer_size(0));
+        if size != 0 {
+            ctx.write_buffer(&state.next_alpn_proto[..size], 0);
+        }
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(size as u32);
     }
 }
 
@@ -582,7 +636,7 @@ impl ISslContext {
             shared_data: Arc::new(Mutex::new(SslContextSharedData::default())),
             handlers: build_handler_map(&[
                 (0, Some(ISslContext::set_option_handler), "SetOption"),
-                (1, None, "GetOption"),
+                (1, Some(Self::get_option_handler), "GetOption"),
                 (
                     2,
                     Some(ISslContext::create_connection_handler),
@@ -644,6 +698,13 @@ impl ISslContext {
         let mut rp = RequestParser::new(ctx);
         let params = rp.pop_raw::<ContextOptionParameters>();
         service.set_option(params.option, params.value);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_option_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let option = RequestParser::new(ctx).pop_u32();
+        log::warn!("(STUBBED) ISslContext::GetOption option={}", option);
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -1079,7 +1140,92 @@ pub fn serialize_server_certs(certs: &[Vec<u8>], get_server_cert_chain: bool) ->
 mod tests {
     use super::*;
 
+    #[test]
+    fn connection_options_round_trip_and_unknown_option_returns_zero() {
+        let service = ISslConnection::new(SystemRef::null(), SslVersion::default(),
+            Arc::new(Mutex::new(SslContextSharedData::default())), Box::new(TestSslBackend));
+        for option in 0..4 {
+            for value in [0i32, 1, -1, 0] {
+                let mut ctx = HLERequestContext::new();
+                ctx.cmd_buf[2] = option;
+                ctx.cmd_buf[3] = value as u32;
+                service.handlers()[&22].handler_callback.unwrap()(&service, &mut ctx);
+                assert_eq!(ctx.cmd_buf[6], 0);
+                let mut ctx = HLERequestContext::new();
+                ctx.cmd_buf[2] = option;
+                service.handlers()[&23].handler_callback.unwrap()(&service, &mut ctx);
+                assert_eq!(ctx.cmd_buf[6], 0);
+                assert_eq!(ctx.cmd_buf[8], u32::from(value != 0));
+            }
+        }
+        let mut ctx = HLERequestContext::new();
+        ctx.cmd_buf[2] = u32::MAX;
+        service.handlers()[&23].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.cmd_buf[8], 0);
+    }
+
+    #[test]
+    fn alpn_empty_buffers_and_context_option_match_upstream_replies() {
+        let service = ISslConnection::new(SystemRef::null(), SslVersion::default(),
+            Arc::new(Mutex::new(SslContextSharedData::default())), Box::new(TestSslBackend));
+        service.state.lock().unwrap().next_alpn_proto = vec![2, b'h', b'2'];
+        let mut ctx = HLERequestContext::new();
+        service.handlers()[&27].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.cmd_buf[8], 0); // no writable buffer
+        service.handlers()[&26].handler_callback.unwrap()(&service, &mut ctx);
+        assert!(service.state.lock().unwrap().next_alpn_proto.is_empty());
+        let context = ISslContext::new(SystemRef::null(), SslVersion::default());
+        let mut ctx = HLERequestContext::new();
+        ctx.cmd_buf[2] = u32::MAX;
+        context.handlers()[&1].handler_callback.unwrap()(&context, &mut ctx);
+        assert_eq!(ctx.cmd_buf[6], 0);
+    }
+
     struct TestSslBackend;
+
+    #[test]
+    fn alpn_round_trip_truncates_to_output_buffer() {
+        use crate::device_memory::DeviceMemory;
+        use crate::memory::memory::Memory;
+        use crate::hle::ipc;
+        use common::page_table::{PageTable, PageType};
+        let backing = Box::new(DeviceMemory::new());
+        let mut table = Box::new(PageTable::new());
+        table.resize(32, 12);
+        table.entries.get_and_fault(3).store(false, PageType::Memory, 1,
+            backing.buffer.backing_base_pointer() as usize);
+        let memory = Arc::new(Mutex::new(unsafe {
+            Memory::new(SystemRef::null(), backing.as_ref(), &backing.buffer)
+        }));
+        memory.lock().unwrap().set_current_page_table(table.as_mut(), true);
+        let service = ISslConnection::new(SystemRef::null(), SslVersion::default(),
+            Arc::new(Mutex::new(SslContextSharedData::default())), Box::new(TestSslBackend));
+        for size in [0, 1, 3, 5] {
+            memory.lock().unwrap().write_block(0x3010, &[2, b'h', b'2']);
+            memory.lock().unwrap().write_block(0x3040, &[0xCC; 8]);
+            let mut request = [0u32; ipc::COMMAND_BUFFER_LENGTH];
+            request[0] = ipc::CommandType::Request as u32 | (1 << 20) | (1 << 24);
+            request[1] = 8;
+            request[2] = 3;
+            request[3] = 0x3010;
+            request[5] = size;
+            request[6] = 0x3040;
+            request[8] = 0x4943_4653;
+            let mut ctx = HLERequestContext::new();
+            ctx.populate_from_incoming_command_buffer(&request);
+            ctx.set_memory(memory.clone());
+            service.handlers()[&26].handler_callback.unwrap()(&service, &mut ctx);
+            ctx.populate_from_incoming_command_buffer(&request);
+            service.handlers()[&27].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.cmd_buf[8], size.min(3));
+            let mut actual = [0; 8];
+            memory.lock().unwrap().read_block(0x3040, &mut actual);
+            let mut expected = [0xCC; 8];
+            let copied = size.min(3) as usize;
+            expected[..copied].copy_from_slice(&[2, b'h', b'2'][..copied]);
+            assert_eq!(actual, expected);
+        }
+    }
 
     impl SslConnectionBackend for TestSslBackend {
         fn set_socket(&mut self, _socket_fd: i32) {}

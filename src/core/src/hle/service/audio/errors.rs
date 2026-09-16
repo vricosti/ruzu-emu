@@ -23,6 +23,8 @@ pub const RESULT_INVALID_ADDRESS_INFO: (u32, u32) = (ERROR_MODULE_AUDIO, 42);
 pub const RESULT_NOT_SUPPORTED: (u32, u32) = (ERROR_MODULE_AUDIO, 513);
 pub const RESULT_INVALID_HANDLE: (u32, u32) = (ERROR_MODULE_AUDIO, 1536);
 pub const RESULT_INVALID_REVISION: (u32, u32) = (ERROR_MODULE_AUDIO, 1537);
+pub const RESULT_INVALID_ARGUMENT: crate::hle::result::ResultCode =
+    crate::hle::result::ResultCode::from_module_description(crate::hle::result::ErrorModule::Audio, 900);
 
 // HwOpus error codes
 pub const RESULT_LIB_OPUS_ALLOC_FAIL: (u32, u32) = (ERROR_MODULE_HW_OPUS, 7);

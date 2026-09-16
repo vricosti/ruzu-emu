@@ -7,10 +7,8 @@
 //! LANDiscovery: manages LAN-based local communication discovery, network creation,
 //! scanning, and station management.
 //!
-//! Note: This is a complex networking subsystem. The full implementation depends on
-//! the internal network layer (RoomNetwork, RoomMember). Core data structures and
-//! state management are ported here; network I/O will be wired when the network
-//! layer is available.
+//! Packet transport uses the shared RoomMember. The service owns this backend
+//! through Arc<Mutex<_>>; scan releases that ownership during the reply window.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -29,6 +27,9 @@ use network::room_member::{LdnPacket, LdnPacketType};
 pub const FAKE_SSID: &str = "YuzuFakeSsidForLdn";
 
 /// LanStation represents a single station connected to the LAN network.
+/// Rust uses node_id to index the parent's nodes instead of retaining C++'s
+/// self-referential node_info/discovery pointers. UpdateNodes applies OverrideInfo,
+/// and ReceivePacket performs OnClose's Reset followed by the parent update.
 pub struct LanStation {
     pub node_id: i8,
     pub status: NodeStatus,
@@ -211,7 +212,8 @@ impl LANDiscovery {
         self.network_info.network_id.session_id.low = next_u64();
         self.network_info.network_id.intent_id = network_config.intent_id;
 
-        let mut node = NodeInfo::default();
+        // Upstream updates node0 in place; retain its reserved bytes as well.
+        let mut node = self.network_info.ldn.nodes[0];
         if self.get_node_info(
             &mut node,
             user_config,
@@ -254,7 +256,7 @@ impl LANDiscovery {
             return RESULT_INVALID_NODE_COUNT;
         }
 
-        let mut node_info = NodeInfo::default();
+        let mut node_info = self.node_info;
         if self.get_node_info(&mut node_info, user_config, local_communication_version)
             != RESULT_SUCCESS
         {
@@ -318,19 +320,22 @@ impl LANDiscovery {
         RESULT_SUCCESS
     }
 
-    pub fn scan(&mut self, filter: &ScanFilter, capacity: usize) -> Vec<NetworkInfo> {
+    pub fn scan(discovery: &Mutex<Self>, filter: &ScanFilter, capacity: usize) -> Vec<NetworkInfo> {
         {
-            let packet_mutex = Arc::clone(&self.packet_mutex);
+            let mut discovery = discovery.lock().unwrap();
+            let packet_mutex = Arc::clone(&discovery.packet_mutex);
             let _lock = packet_mutex.lock().unwrap();
-            self.scan_results.clear();
-            self.send_broadcast(LdnPacketType::Scan);
+            discovery.scan_results.clear();
+            discovery.send_broadcast(LdnPacketType::Scan);
         }
         log::info!("Waiting for scan replies");
         std::thread::sleep(Duration::from_secs(1));
 
-        let packet_mutex = Arc::clone(&self.packet_mutex);
+        let discovery = discovery.lock().unwrap();
+        let packet_mutex = Arc::clone(&discovery.packet_mutex);
         let _lock = packet_mutex.lock().unwrap();
-        self.scan_results
+        discovery
+            .scan_results
             .values()
             .filter(|info| {
                 if Self::is_flag_set(filter.flag, ScanFilterFlag::LOCAL_COMMUNICATION_ID)
@@ -361,7 +366,8 @@ impl LANDiscovery {
                 }
                 true
             })
-            .take(capacity)
+            // Upstream compares its signed s16 count to a cast of the capacity.
+            .take((capacity as i16).max(0) as usize)
             .copied()
             .collect()
     }
@@ -516,7 +522,7 @@ impl LANDiscovery {
             }
             LdnPacketType::ScanResp => {
                 if let Some(info) = read_network_info(&packet.data) {
-                    self.scan_results.insert(info.common.bssid, info);
+                    self.scan_results.entry(info.common.bssid).or_insert(info);
                 }
             }
             LdnPacketType::Connect => {
@@ -638,13 +644,17 @@ fn read_node_info(data: &[u8]) -> Option<NodeInfo> {
     read_copy_payload(data)
 }
 
-fn read_network_info(data: &[u8]) -> Option<NetworkInfo> {
+pub(super) fn read_network_info(data: &[u8]) -> Option<NetworkInfo> {
     if data.len() < std::mem::size_of::<NetworkInfo>() {
         return None;
     }
 
     let common = std::mem::offset_of!(NetworkInfo, common);
     let ldn = std::mem::offset_of!(NetworkInfo, ldn);
+    // Reject lengths which would make Ssid's comparison read outside its array.
+    if data[common + std::mem::offset_of!(CommonNetworkInfo, ssid)] as usize > SSID_LENGTH_MAX {
+        return None;
+    }
     let channel_offset = common + std::mem::offset_of!(CommonNetworkInfo, channel);
     let link_level_offset = common + std::mem::offset_of!(CommonNetworkInfo, link_level);
     let network_type_offset = common + std::mem::offset_of!(CommonNetworkInfo, network_type);
@@ -677,6 +687,56 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn scan_receives_packets_during_wait_and_retains_first_response() {
+        let discovery = Arc::new(Mutex::new(LANDiscovery::new()));
+        let sentinel = MacAddress { raw: [0xff; 6] };
+        discovery
+            .lock()
+            .unwrap()
+            .scan_results
+            .insert(sentinel, NetworkInfo::default());
+        let worker = discovery.clone();
+        let scan =
+            std::thread::spawn(move || LANDiscovery::scan(&worker, &ScanFilter::default(), 1));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(mut guard) = discovery.try_lock() {
+                if !guard.scan_results.contains_key(&sentinel) {
+                    let mut info = NetworkInfo::default();
+                    info.ldn.node_count = 2;
+                    let payload = |info: &NetworkInfo| unsafe {
+                        std::slice::from_raw_parts(
+                            (info as *const NetworkInfo).cast(),
+                            std::mem::size_of::<NetworkInfo>(),
+                        )
+                        .to_vec()
+                    };
+                    let mut packet = LdnPacket {
+                        packet_type: LdnPacketType::ScanResp,
+                        broadcast: false,
+                        local_ip: [0; 4],
+                        remote_ip: [0; 4],
+                        data: payload(&info),
+                    };
+                    guard.receive_packet(&packet);
+                    info.ldn.node_count = 3;
+                    packet.data = payload(&info);
+                    guard.receive_packet(&packet);
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scan did not release discovery"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let results = scan.join().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].ldn.node_count, 2);
+    }
 
     #[test]
     fn station_ids_match_the_upstream_one_through_seven_range() {
@@ -739,5 +799,9 @@ mod tests {
         assert!(read_network_info(bytes).is_some());
         assert!(read_network_info(&invalid).is_none());
         assert!(read_network_info(&invalid[..0x20]).is_none());
+        let mut invalid = bytes.to_vec();
+        invalid[std::mem::offset_of!(NetworkInfo, common)
+            + std::mem::offset_of!(CommonNetworkInfo, ssid)] = 255;
+        assert!(read_network_info(&invalid).is_none());
     }
 }

@@ -365,6 +365,12 @@ fn push_interface_response(ctx: &mut HLERequestContext, object: SessionRequestHa
 
 /// IScanRequest.
 pub struct IScanRequest {
+    service_context: crate::hle::service::kernel_helpers::ServiceContext,
+    evt_scan_complete: u32,
+    evt_processing: u32,
+    worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    state: Arc<std::sync::atomic::AtomicU8>,
+    worker_result: Arc<std::sync::atomic::AtomicU32>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -372,16 +378,99 @@ pub struct IScanRequest {
 impl IScanRequest {
     pub fn new() -> Self {
         let handlers = build_handler_map(&[
-            (0, None, "Submit"),
-            (1, None, "IsProcessing"),
-            (2, None, "GetResult"),
-            (3, None, "GetSystemEventReadableHandle"),
-            (4, None, "SetChannels"),
+            (0, Some(Self::submit_handler), "Submit"),
+            (1, Some(Self::is_processing_handler), "IsProcessing"),
+            (2, Some(Self::get_result_handler), "GetResult"),
+            (3, Some(Self::get_system_event_readable_handle_handler), "GetSystemEventReadableHandle"),
+            (4, Some(Self::set_channels_handler), "SetChannels"),
         ]);
+        let mut service_context = crate::hle::service::kernel_helpers::ServiceContext::new("IScanRequest".into());
+        let evt_scan_complete = service_context.create_event("IScanRequest:Complete".into());
+        let evt_processing = service_context.create_event("IScanRequest:Processing".into());
         Self {
+            service_context,
+            evt_scan_complete,
+            evt_processing,
+            worker: std::sync::Mutex::new(None),
+            state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            worker_result: Arc::new(std::sync::atomic::AtomicU32::new(RESULT_PENDING_CONNECTION.get_inner_value())),
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn submit_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut worker = service.worker.lock().unwrap();
+        if service.state.load(SeqCst) == 2 {
+            if let Some(previous) = worker.take() { previous.join().expect("scan worker"); }
+            service.state.store(0, SeqCst);
+            service.worker_result.store(RESULT_PENDING_CONNECTION.get_inner_value(), SeqCst);
+        }
+        if service.state.load(SeqCst) == 0 {
+            service.state.store(1, SeqCst);
+            service.service_context.get_event(service.evt_processing).unwrap().signal();
+            let state = service.state.clone();
+            let result = service.worker_result.clone();
+            let complete = service.service_context.get_event(service.evt_scan_complete).unwrap();
+            *worker = Some(std::thread::spawn(move || Self::worker_thread(state, result, complete)));
+        }
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn worker_thread(state: Arc<std::sync::atomic::AtomicU8>, result: Arc<std::sync::atomic::AtomicU32>, complete: Arc<crate::hle::service::os::event::Event>) {
+        let results = crate::internal_network::wifi_scanner::scan_wifi_networks(std::time::Duration::from_secs(3));
+        let success = !results.is_empty();
+        *LAST_SCAN_RESULTS.lock().unwrap() = results;
+        Self::finish(&state, &result, &complete, if success { RESULT_SUCCESS } else { RESULT_PENDING_CONNECTION });
+    }
+
+    fn finish(state: &std::sync::atomic::AtomicU8, result: &std::sync::atomic::AtomicU32, complete: &crate::hle::service::os::event::Event, rc: ResultCode) {
+        use std::sync::atomic::Ordering::SeqCst;
+        result.store(rc.get_inner_value(), SeqCst);
+        state.store(2, SeqCst);
+        complete.signal();
+    }
+
+    fn is_processing_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let processing = service.state.load(std::sync::atomic::Ordering::SeqCst) == 1;
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&(processing as u8));
+    }
+
+    fn get_result_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let result = ResultCode::new(service.worker_result.load(std::sync::atomic::Ordering::SeqCst));
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(result);
+    }
+
+    fn get_system_event_readable_handle_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let complete = service.service_context.get_event(service.evt_scan_complete).and_then(|e| e.copy_handle(ctx)).unwrap_or(0);
+        let processing = service.service_context.get_event(service.evt_processing).and_then(|e| e.copy_handle(ctx)).unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 2, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_objects(complete);
+        rb.push_copy_objects(processing);
+    }
+
+    fn set_channels_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) IScanRequest::SetChannels called");
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+}
+
+static LAST_SCAN_RESULTS: std::sync::Mutex<Vec<crate::internal_network::wifi_scanner::ScanData>> = std::sync::Mutex::new(Vec::new());
+
+impl Drop for IScanRequest {
+    fn drop(&mut self) {
+        self.state.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.service_context.close_event(self.evt_scan_complete);
+        self.service_context.close_event(self.evt_processing);
+        if let Some(worker) = self.worker.get_mut().unwrap().take() { let _ = worker.join(); }
     }
 }
 
@@ -1135,6 +1224,28 @@ pub fn loop_process(system: crate::core::SystemRef) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_request_default_backend_signals_completion_and_can_resubmit() {
+        let service = IScanRequest::new();
+        for id in 0..5 { assert!(service.handlers()[&id].handler_callback.is_some()); }
+        for _ in 0..3 {
+            let mut ctx = HLERequestContext::new();
+            service.handlers()[&0].handler_callback.unwrap()(&service, &mut ctx);
+            // Join deterministically instead of depending on host scheduling.
+            service.worker.lock().unwrap().take().unwrap().join().unwrap();
+            assert_eq!(service.state.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(service.service_context.get_event(service.evt_processing).unwrap().is_signaled());
+            assert!(service.service_context.get_event(service.evt_scan_complete).unwrap().is_signaled());
+            service.handlers()[&1].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.cmd_buf[8], 0);
+            service.handlers()[&2].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], RESULT_PENDING_CONNECTION.get_inner_value());
+        }
+        let mut ctx = HLERequestContext::new();
+        service.handlers()[&0].handler_callback.unwrap()(&service, &mut ctx);
+        drop(service); // Drop joins its last worker.
+    }
 
     #[test]
     fn airplane_mode_suppresses_host_connectivity() {

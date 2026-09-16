@@ -79,8 +79,8 @@ fn copy_display_version(version: Option<&str>) -> [u8; 16] {
 /// - 100: InitializeApplicationCopyrightFrameBuffer
 /// - 101: SetApplicationCopyrightImage
 /// - 102: SetApplicationCopyrightVisibility
-/// - 110: QueryApplicationPlayStatistics (unimplemented)
-/// - 111: QueryApplicationPlayStatisticsByUid (unimplemented)
+/// - 110: QueryApplicationPlayStatistics
+/// - 111: QueryApplicationPlayStatisticsByUid
 /// - 120: ExecuteProgram (unimplemented)
 /// - 121: ClearUserChannel (unimplemented)
 /// - 122: UnpopToUserChannel (unimplemented)
@@ -119,6 +119,19 @@ impl IApplicationFunctions {
         applet: std::sync::Arc<std::sync::Mutex<crate::hle::service::am::applet::Applet>>,
     ) -> Self {
         let handlers = build_handler_map(&[
+            (12, Some(Self::create_application_and_request_to_start_handler), "CreateApplicationAndRequestToStart"),
+            (120, Some(Self::execute_program_handler), "ExecuteProgram"),
+            (29, Some(Self::get_cache_storage_max_handler), "GetCacheStorageMax"),
+            (30, Some(Self::begin_blocking_home_button_short_and_long_pressed_handler), "BeginBlockingHomeButtonShortAndLongPressed"),
+            (31, Some(Self::end_blocking_home_button_short_and_long_pressed_handler), "EndBlockingHomeButtonShortAndLongPressed"),
+            (32, Some(Self::begin_blocking_home_button_handler), "BeginBlockingHomeButton"),
+            (33, Some(Self::end_blocking_home_button_handler), "EndBlockingHomeButton"),
+            (60, Some(Self::set_media_playback_state_for_application_handler), "SetMediaPlaybackStateForApplication"),
+            (101, Some(Self::set_application_copyright_image_handler), "SetApplicationCopyrightImage"),
+            (102, Some(Self::set_application_copyright_visibility_handler), "SetApplicationCopyrightVisibility"),
+            (121, Some(Self::clear_user_channel_handler), "ClearUserChannel"),
+            (122, Some(Self::unpop_to_user_channel_handler), "UnpopToUserChannel"),
+            (150, Some(Self::get_notification_storage_channel_event_handler), "GetNotificationStorageChannelEvent"),
             (
                 1,
                 Some(Self::pop_launch_parameter_handler),
@@ -186,6 +199,16 @@ impl IApplicationFunctions {
                 100,
                 Some(Self::initialize_application_copyright_frame_buffer_handler),
                 "InitializeApplicationCopyrightFrameBuffer",
+            ),
+            (
+                110,
+                Some(Self::query_application_play_statistics_handler),
+                "QueryApplicationPlayStatistics",
+            ),
+            (
+                111,
+                Some(Self::query_application_play_statistics_by_uid_handler),
+                "QueryApplicationPlayStatisticsByUid",
             ),
             (
                 123,
@@ -263,6 +286,119 @@ impl IApplicationFunctions {
         applet.home_button_short_pressed_blocked = false;
     }
 
+    fn get_cache_storage_max_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        use crate::file_sys::control_metadata::RawNACP;
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let program_id = service.applet.lock().unwrap().program_id;
+        let (result, data) = service.system.get().arp_manager().lock().unwrap().get_control_property(program_id);
+        let mut index = 0;
+        let mut size = 0;
+        if result.is_success() {
+            let data = data.expect("successful ARP control property");
+            let mut raw = vec![0; std::mem::size_of::<RawNACP>()];
+            let count = raw.len().min(data.len());
+            raw[..count].copy_from_slice(&data[..count]);
+            let offset = std::mem::offset_of!(RawNACP, cache_storage_max_index);
+            index = u16::from_le_bytes(raw[offset..offset + 2].try_into().unwrap()) as u32;
+            let offset = std::mem::offset_of!(RawNACP, cache_storage_data_and_journal_max_size);
+            size = u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap());
+        }
+        // CMIF aligns the u64 output after the u32 output.
+        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+        rb.push_result(result);
+        rb.push_u32(index);
+        rb.push_u32(0);
+        rb.push_u64(size);
+    }
+
+    fn begin_blocking_home_button_short_and_long_pressed_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let unused = RequestParser::new(ctx).pop_i64();
+        service.begin_blocking_home_button_short_and_long_pressed(unused);
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn end_blocking_home_button_short_and_long_pressed_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        service.end_blocking_home_button_short_and_long_pressed();
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn begin_blocking_home_button_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let timeout_ns = RequestParser::new(ctx).pop_i64();
+        log::warn!("(STUBBED) BeginBlockingHomeButton timeout_ns={}", timeout_ns);
+        {
+            let mut applet = service.applet.lock().unwrap();
+            applet.home_button_long_pressed_blocked = true;
+            applet.home_button_short_pressed_blocked = true;
+            applet.home_button_double_click_enabled = true;
+        }
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn end_blocking_home_button_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        {
+            let mut applet = service.applet.lock().unwrap();
+            applet.home_button_long_pressed_blocked = false;
+            applet.home_button_short_pressed_blocked = false;
+            applet.home_button_double_click_enabled = false;
+        }
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn set_media_playback_state_for_application_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let enabled = RequestParser::new(ctx).pop_raw::<u8>() != 0;
+        service.applet.lock().unwrap().media_playback_state = enabled;
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn set_application_copyright_image_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) SetApplicationCopyrightImage called");
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn set_application_copyright_visibility_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let visible = RequestParser::new(ctx).pop_raw::<u8>() != 0;
+        service.set_application_copyright_visibility(visible);
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn clear_user_channel_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        service.applet.lock().unwrap().user_channel_launch_parameter.clear();
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn unpop_to_user_channel_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        use crate::hle::service::am::service::storage::IStorage;
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        // Upstream CMIF SharedPointer input requires a domain object ID.
+        assert!(ctx.get_domain_message_header().is_some_and(|header| header.input_object_count() > 0));
+        let id = RequestParser::new(ctx).pop_u32();
+        let handler = {
+            let manager = ctx.get_manager().expect("input interface manager");
+            let manager = manager.lock().unwrap();
+            assert!(manager.is_domain());
+            manager.domain_handler(id.checked_sub(1).expect("input interface ID") as usize)
+                .expect("input storage object").clone()
+        };
+        let storage = handler.as_any().downcast_ref::<IStorage>().expect("IStorage input interface");
+        service.applet.lock().unwrap().user_channel_launch_parameter.push_back(storage.get_data());
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn get_notification_storage_channel_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let id = service.applet.lock().unwrap().ensure_notification_storage_channel_event_object_id(ctx).unwrap_or(0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(id);
+    }
+
     /// Port of IApplicationFunctions::IsGamePlayRecordingSupported
     pub fn is_game_play_recording_supported(&self) -> bool {
         log::warn!("(STUBBED) IsGamePlayRecordingSupported called");
@@ -286,16 +422,49 @@ impl IApplicationFunctions {
 
     /// Port of IApplicationFunctions::ExecuteProgram
     pub fn execute_program(&self, _kind: ProgramSpecifyKind, value: u64) {
+        assert!(matches!(_kind, ProgramSpecifyKind::ExecuteProgram | ProgramSpecifyKind::RestartProgram));
         log::info!(
             "ExecuteProgram called with kind={:?}, value={}",
             _kind,
             value
         );
         if !self.system.is_null() {
+            let channel = self.applet.lock().unwrap().user_channel_launch_parameter.clone();
+            *self.system.get().get_user_channel() = channel;
             self.system.get().execute_program(value as usize);
         } else {
             log::error!("ExecuteProgram: no System reference");
         }
+    }
+
+    fn execute_program_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut rp = RequestParser::new(ctx);
+        let kind = match rp.pop_u32() {
+            0 => ProgramSpecifyKind::ExecuteProgram,
+            2 => ProgramSpecifyKind::RestartProgram,
+            value => panic!("invalid ExecuteProgram kind {value}"),
+        };
+        rp.pop_u32(); // CMIF u64 alignment
+        let value = rp.pop_u64();
+        service.execute_program(kind, value);
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn create_application_and_request_to_start_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        use crate::file_sys::registered_cache::get_base_title_id;
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let id = RequestParser::new(ctx).pop_u64();
+        let current = service.applet.lock().unwrap().program_id;
+        let result = if id == 0 || get_base_title_id(id) == get_base_title_id(current) {
+            let index = if id == 0 { 0 } else { id - get_base_title_id(id) };
+            service.execute_program(ProgramSpecifyKind::ExecuteProgram, index);
+            RESULT_SUCCESS
+        } else {
+            log::error!("Launching a different application is not implemented");
+            ResultCode::new(u32::MAX)
+        };
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(result);
     }
 
     /// Port of IApplicationFunctions::GetPreviousProgramIndex
@@ -777,7 +946,38 @@ impl IApplicationFunctions {
         rb.push_result(RESULT_SUCCESS);
     }
 
-    /// GetGpuErrorDetectedSystemEvent (cmd 110): returns an event handle
+    /// Port of QueryApplicationPlayStatistics (cmd 110).
+    fn query_application_play_statistics_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("(STUBBED) QueryApplicationPlayStatistics called");
+        // Eden returns no entries but CMIF still writes its output scratch
+        // buffer. Initialize those unused bytes rather than exposing scratch.
+        let output = vec![0u8; ctx.get_write_buffer_size(0)];
+        ctx.write_buffer_b(&output, 0);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(0);
+    }
+
+    /// Port of QueryApplicationPlayStatisticsByUid (cmd 111).
+    fn query_application_play_statistics_by_uid_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let mut rp = RequestParser::new(ctx);
+        let _user_id = rp.pop_raw::<[u8; 16]>();
+        log::warn!("(STUBBED) QueryApplicationPlayStatisticsByUid called");
+        // No statistics, matching upstream for every UID/application list.
+        let output = vec![0u8; ctx.get_write_buffer_size(0)];
+        ctx.write_buffer_b(&output, 0);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(0);
+    }
+
+    /// GetGpuErrorDetectedSystemEvent (cmd 130): returns an event handle
     fn get_gpu_error_detected_system_event_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
@@ -929,6 +1129,212 @@ mod tests {
         assert_eq!(create.name, "CreateCacheStorage");
         assert!(max.handler_callback.is_some());
         assert_eq!(max.name, "GetSaveDataSizeMax");
+    }
+
+    #[test]
+    fn play_statistics_commands_return_success_and_zero_entries() {
+        let service = make_service();
+        for (id, name) in [
+            (110, "QueryApplicationPlayStatistics"),
+            (111, "QueryApplicationPlayStatisticsByUid"),
+        ] {
+            let entry = service.handlers().get(&id).expect("registered statistics command");
+            assert_eq!(entry.name, name);
+            for user_word in [0, 0x1234_5678, u32::MAX] {
+                let mut ctx = HLERequestContext::new();
+                ctx.cmd_buf[2..6].fill(user_word);
+                ctx.cmd_buf[6..10].fill(0xCCCC_CCCC);
+                entry.handler_callback.unwrap()(&service, &mut ctx);
+                // CMIF success (u64), followed by a signed 32-bit entry count.
+                assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+                assert_eq!(ctx.cmd_buf[7], 0);
+                assert_eq!(ctx.cmd_buf[8], 0);
+                assert!(ctx.outgoing_copy_objects.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn home_button_commands_preserve_double_click_ownership() {
+        let service = make_service();
+        for (command, blocked, double_click) in [
+            (32, true, true), (31, false, true), (30, true, true), (33, false, false),
+        ] {
+            let mut ctx = HLERequestContext::new();
+            ctx.cmd_buf[2] = u32::MAX;
+            ctx.cmd_buf[3] = u32::MAX;
+            service.handlers()[&command].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], 0);
+            let applet = service.applet.lock().unwrap();
+            assert_eq!(applet.home_button_short_pressed_blocked, blocked);
+            assert_eq!(applet.home_button_long_pressed_blocked, blocked);
+            assert_eq!(applet.home_button_double_click_enabled, double_click);
+        }
+    }
+
+    #[test]
+    fn media_playback_and_user_channel_commands_update_applet_state() {
+        let service = make_service();
+        for enabled in [true, false] {
+            let mut ctx = HLERequestContext::new();
+            ctx.cmd_buf[2] = u32::from(enabled);
+            service.handlers()[&60].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(service.applet.lock().unwrap().media_playback_state, enabled);
+        }
+        service.applet.lock().unwrap().user_channel_launch_parameter.push_back(vec![1, 2, 3]);
+        let mut ctx = HLERequestContext::new();
+        service.handlers()[&121].handler_callback.unwrap()(&service, &mut ctx);
+        assert!(service.applet.lock().unwrap().user_channel_launch_parameter.is_empty());
+        for id in [101, 102] {
+            let mut ctx = HLERequestContext::new();
+            service.handlers()[&id].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], 0);
+        }
+    }
+
+    #[test]
+    fn notification_event_is_persistent_and_initially_unsignaled() {
+        let service = make_service();
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+        for _ in 0..2 {
+            let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0x2000);
+            service.handlers()[&150].handler_callback.unwrap()(&service, &mut ctx);
+            let id = match ctx.outgoing_copy_objects.as_slice() {
+                [KAutoObjectRef::ObjectId(id)] => *id,
+                _ => panic!("expected one copied event"),
+            };
+            assert_ne!(id, 0);
+            let applet = service.applet.lock().unwrap();
+            let event = applet.notification_storage_channel_event.as_ref().unwrap().lock().unwrap();
+            assert_eq!(id, event.object_id);
+            assert!(!event.is_signaled.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn unpop_user_channel_copies_domain_storage() {
+        use crate::hle::service::hle_ipc::SessionRequestManager;
+        use crate::hle::service::am::service::storage::IStorage;
+        let service = make_service();
+        let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+        {
+            let mut manager = manager.lock().unwrap();
+            manager.set_session_handler(Arc::new(IStorage::new(vec![7, 8, 9])));
+            manager.convert_to_domain();
+        }
+        let mut ctx = HLERequestContext::new();
+        ctx.set_session_request_manager(manager);
+        let mut request = [0u32; crate::hle::ipc::COMMAND_BUFFER_LENGTH];
+        request[0] = crate::hle::ipc::CommandType::Request as u32;
+        request[1] = 16;
+        request[4] = 1 | (1 << 8); // SendMessage, one input object
+        request[5] = 16;
+        request[6] = 1;
+        request[8] = 0x4943_4653;
+        request[10] = 122;
+        request[12] = 1;
+        ctx.populate_from_incoming_command_buffer(&request);
+        service.handlers()[&122].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(service.applet.lock().unwrap().user_channel_launch_parameter.front(), Some(&vec![7, 8, 9]));
+    }
+
+    #[test]
+    fn cache_storage_max_reads_control_metadata_and_preserves_arp_error() {
+        use crate::file_sys::control_metadata::RawNACP;
+        use crate::hle::service::glue::glue_manager::ApplicationLaunchProperty;
+        let system = crate::core::System::new();
+        let system_ref = crate::core::SystemRef::from_ref(&system);
+        let applet = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
+        applet.lock().unwrap().program_id = 0x100;
+        let service = IApplicationFunctions::new(system_ref, applet);
+        let mut ctx = HLERequestContext::new();
+        service.handlers()[&29].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.cmd_buf[6], crate::hle::service::glue::errors::RESULT_PROCESS_ID_NOT_REGISTERED.get_inner_value());
+        let mut nacp = vec![0; std::mem::size_of::<RawNACP>()];
+        let index = std::mem::offset_of!(RawNACP, cache_storage_max_index);
+        nacp[index..index + 2].copy_from_slice(&42u16.to_le_bytes());
+        let size = std::mem::offset_of!(RawNACP, cache_storage_data_and_journal_max_size);
+        nacp[size..size + 8].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
+        assert!(system.arp_manager().lock().unwrap().register(0x100, ApplicationLaunchProperty::default(), nacp).is_success());
+        let mut ctx = HLERequestContext::new();
+        service.handlers()[&29].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(&ctx.cmd_buf[6..12], &[0, 0, 42, 0, 0x9abc_def0, 0x1234_5678]);
+    }
+
+    #[test]
+    fn execute_program_preserves_user_channel_before_frontend_restart() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let mut system = crate::core::System::new();
+        system.register_execute_program_callback(Box::new(move |index| seen_cb.lock().unwrap().push(index)));
+        let system_ref = crate::core::SystemRef::from_ref(&system);
+        let applet = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
+        applet.lock().unwrap().user_channel_launch_parameter.push_back(vec![4, 5]);
+        applet.lock().unwrap().program_id = 0x2000;
+        let service = IApplicationFunctions::new(system_ref, applet);
+        let mut ctx = HLERequestContext::new();
+        ctx.cmd_buf[2] = 2; // RestartProgram
+        ctx.cmd_buf[4] = 3;
+        service.handlers()[&120].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(*seen.lock().unwrap(), vec![3]);
+        assert_eq!(system.get_user_channel_snapshot().front(), Some(&vec![4, 5]));
+        let mut ctx = HLERequestContext::new();
+        ctx.cmd_buf[2] = 0x2002;
+        service.handlers()[&12].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(*seen.lock().unwrap(), vec![3, 2]);
+        let mut ctx = HLERequestContext::new();
+        ctx.cmd_buf[2] = 0x4000;
+        service.handlers()[&12].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.cmd_buf[6], u32::MAX);
+        assert_eq!(*seen.lock().unwrap(), vec![3, 2]);
+    }
+
+    #[test]
+    fn play_statistics_zeroes_only_the_map_alias_output_buffer() {
+        use crate::device_memory::DeviceMemory;
+        use crate::memory::memory::Memory;
+        use common::page_table::{PageTable, PageType};
+        use crate::hle::ipc;
+
+        // Keep both backing objects alive until the IPC memory bridge is dropped.
+        let backing = Box::new(DeviceMemory::new());
+        let mut table = Box::new(PageTable::new());
+        table.resize(32, 12);
+        table.entries.get_and_fault(3).store(
+            false, PageType::Memory, 1, backing.buffer.backing_base_pointer() as usize,
+        );
+        let memory = Arc::new(Mutex::new(unsafe {
+            Memory::new(crate::core::SystemRef::null(), backing.as_ref(), &backing.buffer)
+        }));
+        memory.lock().unwrap().set_current_page_table(table.as_mut(), true);
+        let service = make_service();
+        for id in [110, 111] {
+            for size in [0, 0x18, 0x30, 0x31] {
+                memory.lock().unwrap().write_block(0x3000, &[0xCC; 128]);
+                let mut ctx = HLERequestContext::new();
+                let mut request = [0u32; ipc::COMMAND_BUFFER_LENGTH];
+                request[0] = ipc::CommandType::Request as u32 | (1 << 24);
+                request[1] = 15 | (3 << 10);
+                request[2] = size;
+                request[3] = 0x3010;
+                request[8] = 0x4943_4653;
+                request[10] = id;
+                // Alias input/output selection must not overwrite the C buffer.
+                request[20] = 0x3060;
+                request[21] = 16 << 16;
+                ctx.populate_from_incoming_command_buffer(&request);
+                ctx.set_memory(memory.clone());
+                service.handlers()[&id].handler_callback.unwrap()(&service, &mut ctx);
+                let mut bytes = [0; 128];
+                memory.lock().unwrap().read_block(0x3000, &mut bytes);
+                let mut expected = [0xCC; 128];
+                expected[16..16 + size as usize].fill(0);
+                assert_eq!(bytes, expected, "command {id}, buffer size {size}");
+                assert_eq!(ctx.cmd_buf[8], 0);
+            }
+        }
     }
 
     #[test]

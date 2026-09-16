@@ -260,8 +260,7 @@ impl SystemRef {
     /// This is the narrow Rust counterpart to upstream callers that mutate
     /// `Core::System&` to `swap(m_system.GetUserChannel())`.
     pub fn take_user_channel(&self) -> VecDeque<Vec<u8>> {
-        assert!(!self.0.is_null(), "SystemRef is null");
-        unsafe { (&mut *(self.0 as *mut System)).take_user_channel() }
+        self.get().take_user_channel()
     }
 
     /// Run the speed limiter against the current CoreTiming timestamp.
@@ -1242,7 +1241,7 @@ pub struct System {
     build_id: [u8; 0x20],
 
     /// User channel for inter-process data transfer.
-    user_channel: VecDeque<Vec<u8>>,
+    user_channel: StdMutex<VecDeque<Vec<u8>>>,
 
     /// General channel shared by AM common-state and home-menu services.
     /// Upstream owner: `System::Impl::{general_channel,general_channel_event}`.
@@ -1371,7 +1370,7 @@ impl System {
             status: SystemResultStatus::Success,
             status_details: String::new(),
             build_id: [0u8; 0x20],
-            user_channel: VecDeque::new(),
+            user_channel: StdMutex::new(VecDeque::new()),
             general_channel: Mutex::new(GeneralChannelState::default()),
             execute_program_callback: None,
             exit_callback: None,
@@ -2368,7 +2367,7 @@ impl System {
     /// Clear the user channel.
     /// Upstream: `system.GetUserChannel().clear()`.
     pub fn clear_user_channel(&mut self) {
-        self.user_channel.clear();
+        self.user_channel.lock().unwrap().clear();
     }
 
     /// Set the AudioCore subsystem.
@@ -2649,23 +2648,24 @@ impl System {
         self.cheat_engine = Some(cheat_engine);
     }
 
-    /// Gets a mutable reference to the user channel.
-    /// Used to transfer data between programs.
-    pub fn get_user_channel(&mut self) -> &mut VecDeque<Vec<u8>> {
-        &mut self.user_channel
+    /// Upstream GetUserChannel exposes a mutable reference. A guard preserves
+    /// the same System ownership while allowing shared service references to
+    /// transfer data without manufacturing an aliased mutable System reference.
+    pub fn get_user_channel(&self) -> std::sync::MutexGuard<'_, VecDeque<Vec<u8>>> {
+        self.user_channel.lock().unwrap()
     }
 
     /// Transfers and clears the current user channel.
     /// Matches `std::deque::swap(m_system.GetUserChannel())` users.
-    pub fn take_user_channel(&mut self) -> VecDeque<Vec<u8>> {
-        std::mem::take(&mut self.user_channel)
+    pub fn take_user_channel(&self) -> VecDeque<Vec<u8>> {
+        std::mem::take(&mut *self.user_channel.lock().unwrap())
     }
 
     /// Returns a snapshot (clone) of the user channel for reading from a
     /// shared reference (e.g. from AppletManager::set_window_system).
     /// Upstream: `m_system.GetUserChannel()` used in SetWindowSystem for swap.
     pub fn get_user_channel_snapshot(&self) -> std::collections::VecDeque<Vec<u8>> {
-        self.user_channel.clone()
+        self.user_channel.lock().unwrap().clone()
     }
 
     /// Gets mutable access to the general-channel stack.

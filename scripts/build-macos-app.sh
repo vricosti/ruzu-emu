@@ -117,25 +117,16 @@ iconutil -c icns "$iconset" -o "$resources/ruzu.icns"
 rm -rf "$iconset"
 
 moltenvk="${MOLTENVK_LIBRARY:-}"
-if [[ -z "$moltenvk" ]]; then
-    eden_moltenvk="$repo_root/../eden/build/bin/eden.app/Contents/Frameworks/libMoltenVK.dylib"
-    if [[ -f "$eden_moltenvk" ]]; then
-        moltenvk="$eden_moltenvk"
+if [[ -n "$moltenvk" ]]; then
+    if [[ ! -f "$moltenvk" ]]; then
+        echo "MOLTENVK_LIBRARY does not name a file: $moltenvk" >&2
+        exit 1
     fi
+    echo "Using explicit MoltenVK override: $moltenvk"
+    install -m 755 "$moltenvk" "$frameworks/libMoltenVK.dylib"
+else
+    python3 "$repo_root/scripts/fetch-moltenvk.py" "$frameworks/libMoltenVK.dylib"
 fi
-if [[ -z "$moltenvk" ]] && command -v brew >/dev/null 2>&1; then
-    brew_moltenvk="$(brew --prefix molten-vk 2>/dev/null || true)"
-    if [[ -n "$brew_moltenvk" ]]; then
-        moltenvk="$brew_moltenvk/lib/libMoltenVK.dylib"
-    fi
-fi
-
-if [[ -z "$moltenvk" || ! -f "$moltenvk" ]]; then
-    echo "MoltenVK was not found." >&2
-    echo "Build Eden, install it with scripts/build-macos.sh, or set MOLTENVK_LIBRARY." >&2
-    exit 1
-fi
-install -m 755 "$moltenvk" "$frameworks/libMoltenVK.dylib"
 
 # GTK is not a macOS system framework. Bundle the runtime data that cannot be
 # discovered through Mach-O dependency traversal before collecting all dylibs.

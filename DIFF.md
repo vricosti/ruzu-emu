@@ -17726,3 +17726,13 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   reads. Explicit reserved/padding fields remain part of the wire structs;
   synthesized outputs are initialized with Default. Request offsets, packed(4)
   private configuration, and signed connection-version truncation are tested.
+
+## 2026-09-16 — scripts/fetch-moltenvk.py and scripts/build-macos-app.sh vs cpmfile.json and externals/CMakeLists.txt
+
+### Intentional differences
+- App packaging downloads the same v1.4.1-ryujinx archive and verifies Eden's
+  SHA-512 using Python rather than CPM. The archive's regular dylib member is
+  copied directly instead of following CPM's extracted dylib symlink. Version,
+  archive contents and universal architectures are unchanged before app signing.
+- MOLTENVK_LIBRARY remains an explicit packaging override. Otherwise no local
+  Eden build or Homebrew MoltenVK is selected. Runtime loader ordering is unchanged.

@@ -1235,6 +1235,16 @@ impl ServerManager {
             session.server_session.lock().unwrap().destroy();
         }
 
+        // Eden's Session owns the request manager; its kernel endpoint does
+        // not. Rust caches an additional Arc on that endpoint for dispatch.
+        // Remove it at the same ownership boundary, even when an HLE wait
+        // registry still retains the endpoint. Otherwise the handler's Drop
+        // (e.g. RoInterface::UnregisterProcess) never runs between applets.
+        // Keep the detached owner outside the endpoint/process guards: service
+        // destructors can call back into those objects.
+        let endpoint_manager = session.server_session.lock().unwrap().manager.take();
+        drop(endpoint_manager);
+
         // Upstream stores raw `Session*` entries in `m_deferred_sessions`; a
         // destroyed session pointer must no longer be retried. Rust stores
         // stable ids, so remove matching deferred ids at the ownership boundary.
@@ -2399,6 +2409,45 @@ mod tests {
 
         assert_eq!(manager.session_index_by_id(deferred_id), Some(0));
         assert_eq!(manager.deferred_sessions, vec![deferred_id]);
+    }
+
+    #[test]
+    fn destroy_session_releases_ro_context_despite_retained_kernel_endpoint() {
+        use crate::hle::ipc;
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+        use crate::hle::kernel::svc_common::PseudoHandle;
+        use crate::hle::service::ro::ro::{RoContext, RoInterface};
+        use crate::hle::service::ro::ro_types::NrrKind;
+        use crate::hle::service::service::ServiceFramework;
+
+        let mut manager = ServerManager::new(SystemRef::null());
+        let ro = Arc::new(Mutex::new(RoContext::new()));
+        let mut retained_endpoints = Vec::new();
+        for pid in 100..106 {
+            let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+            process.lock().unwrap().process_id = pid;
+            let thread = Arc::new(KThreadLock::new(KThread::new()));
+            thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+            let mut ctx = HLERequestContext::new_with_thread(thread, 0x2000);
+            ctx.populate_from_incoming_command_buffer(&[
+                ipc::CommandType::Request as u32, 1u32 << 31,
+                1 | (1 << 1), 0, 0, PseudoHandle::CurrentProcess as u32,
+            ]);
+            let handler = Arc::new(RoInterface::new("ldr:ro", ro.clone(), NrrKind::User));
+            handler.handlers()[&4].handler_callback.unwrap()(handler.as_ref(), &mut ctx);
+            assert_eq!(ro.lock().unwrap().validate_process(0, pid), Ok(()));
+            let weak_handler = Arc::downgrade(&handler);
+            let request_manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+            request_manager.lock().unwrap().set_session_handler(handler);
+            let endpoint = Arc::new(Mutex::new(KServerSession::new()));
+            endpoint.lock().unwrap().set_manager(request_manager.clone());
+            manager.register_session(endpoint.clone(), request_manager);
+            // HLE wait registries can retain the endpoint beyond Session.
+            retained_endpoints.push(endpoint);
+            manager.destroy_session(0);
+            assert!(weak_handler.upgrade().is_none(), "closed session retained RoInterface");
+        }
     }
 
     #[test]

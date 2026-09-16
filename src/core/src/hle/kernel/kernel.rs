@@ -1884,7 +1884,7 @@ pub struct KernelCore {
     process_list_lock: Mutex<()>,
 
     /// Processes removed from the upstream-visible process list by
-    /// `terminate_all_processes`, but retained until cooperative CPU fibers
+    /// `terminate_all_processes` or with outstanding session parents, retained until cooperative CPU fibers
     /// have stopped and Rust can safely release their thread owners.
     terminating_processes: Mutex<Vec<Arc<ProcessLock>>>,
 
@@ -2820,6 +2820,15 @@ impl KernelCore {
             .lock()
             .unwrap()
             .retain(|registered| !Arc::ptr_eq(registered, process));
+        // Upstream sessions retain their owning KProcess until PostDestroy.
+        // Preserve the registry owner for asynchronous server close even after
+        // the applet has removed its process from the visible list.
+        if !process.lock().unwrap().session_objects.is_empty() {
+            let mut retiring = self.terminating_processes.lock().unwrap();
+            if !retiring.iter().any(|owner| Arc::ptr_eq(owner, process)) {
+                retiring.push(Arc::clone(process));
+            }
+        }
     }
 
     /// Return the live kernel process list.
@@ -2898,6 +2907,10 @@ impl KernelCore {
         self.get_process_list()
             .into_iter()
             .find(|process| process.lock().unwrap().get_process_id() == process_id)
+            .or_else(|| {
+                let retiring = self.terminating_processes.lock().unwrap().clone();
+                retiring.into_iter().find(|process| process.lock().unwrap().get_process_id() == process_id)
+            })
     }
 
     /// Rust counterpart to upstream `KernelCore::GetProcessList()` scans that
@@ -2987,13 +3000,20 @@ impl KernelCore {
 
     /// Rust helper for server-session owner lookup via the kernel process list.
     pub fn get_session_owner_process_id(&self, session_object_id: u64) -> Option<u64> {
+        // Applets are registered in process_list, not service_processes.
+        // Snapshot first: do not hold the registry mutex while locking owners.
+        let mut owners = self.get_process_list();
+        owners.extend(self.terminating_processes.lock().unwrap().iter().cloned());
+        for process in owners {
+            let process = process.lock().unwrap();
+            if let Some(session) = process.get_session_by_object_id(session_object_id) {
+                return session.lock().unwrap().process_id;
+            }
+        }
         if let Some(process) = self.system_ref.get().current_process_arc.as_ref().cloned() {
             let process_guard = process.lock().unwrap();
-            if process_guard
-                .get_server_session_by_object_id(session_object_id)
-                .is_some()
-            {
-                return Some(process_guard.get_process_id());
+            if let Some(session) = process_guard.get_session_by_object_id(session_object_id) {
+                return session.lock().unwrap().process_id;
             }
         }
 
@@ -3004,8 +3024,8 @@ impl KernelCore {
             .find_map(|process| {
                 let process_guard = process.lock().unwrap();
                 process_guard
-                    .get_server_session_by_object_id(session_object_id)
-                    .map(|_| process_guard.get_process_id())
+                    .get_session_by_object_id(session_object_id)
+                    .and_then(|session| session.lock().unwrap().process_id)
             })
             .or_else(|| {
                 self.host_service_processes
@@ -3015,8 +3035,8 @@ impl KernelCore {
                     .find_map(|process| {
                         let process_guard = process.lock().unwrap();
                         process_guard
-                            .get_server_session_by_object_id(session_object_id)
-                            .map(|_| process_guard.get_process_id())
+                            .get_session_by_object_id(session_object_id)
+                            .and_then(|session| session.lock().unwrap().process_id)
                     })
             })
     }
@@ -4369,6 +4389,47 @@ mod tests {
         assert!(kernel
             .get_process_by_id(0x1234)
             .is_some_and(|found| Arc::ptr_eq(&found, &process)));
+    }
+
+    #[test]
+    fn applet_session_owner_survives_process_removal_until_server_close() {
+        let kernel = KernelCore::new();
+        let port = Arc::new(Mutex::new(KPort::new()));
+        port.lock().unwrap().initialize(2, false, 0);
+        // HLE wait resolution mirrors the session into a service process,
+        // registered before the applet. This is not its resource/port owner.
+        let mirror = Arc::new(ProcessLock::from_value(KProcess::new()));
+        mirror.lock().unwrap().process_id = 50;
+        kernel.register_process(mirror.clone());
+        for pid in 100..105 {
+            let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+            process.lock().unwrap().process_id = pid;
+            kernel.register_process(process.clone());
+            let (session_id, server) = {
+                let mut owner = process.lock().unwrap();
+                owner.register_client_port_object(0x1234, port.clone());
+                let (session_id, client_id) = port.lock().unwrap().client
+                    .create_session(&mut owner, &kernel, Some(0x1234), 0).unwrap();
+                mirror.lock().unwrap().register_session_object(
+                    session_id, owner.get_session_by_object_id(session_id).unwrap());
+                let client = owner.get_client_session_by_object_id(client_id).unwrap();
+                client.lock().unwrap().destroy_with_process(&mut owner);
+                owner.unregister_client_session_object_by_object_id(client_id);
+                (session_id, owner.get_server_session_by_object_id(session_id).unwrap())
+            };
+            // These owners are neither the main application nor HLE services.
+            assert_eq!(kernel.get_session_owner_process_id(session_id), Some(pid));
+            kernel.remove_process(&process);
+            kernel.remove_process(&process); // retirement is idempotent
+            assert_eq!(kernel.get_process_list().len(), 1);
+            drop(process);
+            let owner_id = kernel.get_session_owner_process_id(session_id).unwrap();
+            let owner = kernel.get_process_by_id(owner_id).unwrap();
+            server.lock().unwrap().destroy_with_process(&mut owner.lock().unwrap());
+            assert!(owner.lock().unwrap().session_objects.is_empty());
+            assert_eq!(port.lock().unwrap().client.get_num_sessions(), 0);
+        }
+        assert_eq!(kernel.terminating_processes.lock().unwrap().len(), 5);
     }
 
     #[test]

@@ -2185,13 +2185,15 @@ impl KProcess {
         // Session/service destruction may call back into the owning process.
         // Release these owners after the process termination path returns,
         // matching the deferred destruction performed by the kernel worker.
-        let sessions = std::mem::take(&mut self.session_objects);
+        // Keep parent sessions discoverable until the server endpoint closes.
+        // Eden's KServerSession retains its parent reference beyond client
+        // handle-table teardown. Removing this registry now prevents Destroy
+        // from finding the parent and releasing its KClientPort slot.
         KWorkerTaskManager::add_task_static(
             0,
             WorkerType::Exit,
             Box::new(move || {
                 drop(client_sessions);
-                drop(sessions);
             }),
         );
 
@@ -2879,6 +2881,10 @@ impl KProcess {
     }
 
     pub fn register_session_object(&mut self, object_id: u64, session: Arc<Mutex<KSession>>) {
+        // Bind Eden's KSession::m_process at first registration. HLE wait
+        // registries may subsequently mirror this Arc into another process;
+        // those aliases must never become the session's resource/port owner.
+        session.lock().unwrap().process_id.get_or_insert(self.process_id);
         self.session_objects.insert(object_id, session);
     }
 
@@ -4155,7 +4161,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_handle_table_closes_client_sessions_and_detaches_owners() {
+    fn finalize_handle_table_retains_parent_until_server_closes() {
         let mut process = KProcess::new();
         assert_eq!(
             process.initialize_handle_table(),
@@ -4182,8 +4188,34 @@ mod tests {
         assert_eq!(process.handle_table.get_count(), 0);
         assert!(process.client_session_objects.is_empty());
         assert!(process.client_session_parent_ids.is_empty());
-        assert!(process.session_objects.is_empty());
+        assert!(process.session_objects.contains_key(&0x1000));
         assert!(server_session.lock().unwrap().client_closed);
+        server_session.lock().unwrap().destroy_with_process(&mut process);
+        assert!(process.session_objects.is_empty());
+    }
+
+    #[test]
+    fn repeated_process_exit_releases_limited_port_sessions() {
+        use crate::hle::kernel::{k_port::KPort, kernel::KernelCore};
+        let kernel = KernelCore::new();
+        let port = Arc::new(Mutex::new(KPort::new()));
+        port.lock().unwrap().initialize(2, false, 0);
+        for _ in 0..5 {
+            let mut process = KProcess::new();
+            process.initialize_handle_table();
+            process.register_client_port_object(0x1234, port.clone());
+            let (session_id, client_id) = port.lock().unwrap().client
+                .create_session(&mut process, &kernel, Some(0x1234), 0).unwrap();
+            process.handle_table.add(client_id).unwrap();
+            let server = process.get_server_session_by_object_id(session_id).unwrap();
+            process.finalize_handle_table();
+            KWorkerTaskManager::wait_for_global_idle();
+            assert_eq!(port.lock().unwrap().client.get_num_sessions(), 1);
+            assert!(process.get_session_by_object_id(session_id).is_some());
+            server.lock().unwrap().destroy_with_process(&mut process);
+            assert_eq!(port.lock().unwrap().client.get_num_sessions(), 0);
+            assert!(process.session_objects.is_empty());
+        }
     }
 
     #[test]

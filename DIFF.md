@@ -18295,3 +18295,65 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
 - Commands 5/9 return a native holder interface, 8 an empty stopper interface; 16 returns u32 zero; 24/25 return exactly 0x30 zero bytes; 21 returns result only. Tests exercise registered callbacks, actual child sessions, copy-object event registration and payload lengths.
 - All 11 OLSC tests pass. Full `cargo test -p core --locked --offline` was attempted again and terminates with STATUS_ACCESS_VIOLATION; a green full-crate result is not claimed. Runtime Options retest remains pending.
 
+## 2026-09-17 — src/core/src/hle/kernel/kernel.rs session-owner lookup vs Eden kernel.{h,cpp} and k_session.{h,cpp}
+
+### Intentional differences
+- Eden KSession directly retains KProcess through Initialize/Open and PostDestroy/Close. Rust ID-based lookup now includes guest applets in the live process list, not only main/HLE processes. Removed applet owners with outstanding sessions enter the existing deferred-finalization list, and internal process-ID lookup can still find them. Public GetProcessList still excludes removed processes.
+- Final Rust owner release remains deferred until CPU shutdown, matching the existing cooperative-fiber lifetime constraint rather than C++ immediate intrusive destruction. No session limit was increased. Registry snapshots avoid holding list mutexes while inspecting processes.
+
+### Unintentional differences (to fix)
+- No further difference identified in the owner-lookup slice; actual application retest is still required. Retained process resources may outlive the last session until CPU shutdown, as explicitly noted above; this is not a claim of exact global destruction timing.
+
+### Missing items
+- Full document content-path implementation remains separate; no invented success reply added.
+
+### Binary layout verification
+- Not applicable (host ownership). Kernel header/implementation and KSession owner lifecycle re-read after changes. Regression covers an applet neither main nor HLE, removal from the public list, repeated removal, release of the caller Arc, owner lookup and server close over five cycles with a two-session port. Focused test passes; full core suite still terminates with STATUS_ACCESS_VIOLATION. Release build/standalone refresh succeeded (4m08s); runtime verification pending.
+
+## 2026-09-17 — src/core/src/hle/kernel/k_process.rs vs eden/src/core/hle/kernel/k_process.{h,cpp}
+
+### Intentional differences
+- Rust's typed parent-session registry substitutes for upstream intrusive references. FinalizeHandleTable closes client endpoints but now retains parent sessions while server endpoints are alive, allowing server Destroy to find/finalize the parent and notify KClientPort. Client-owner drops remain deferred outside ProcessLock to avoid reentrant destruction.
+
+### Unintentional differences (to fix)
+- None identified in this narrow parent-registry lifetime correction. Broader process finalization still uses the existing Rust deferred CPU shutdown lifecycle and is not re-audited here.
+
+### Missing items
+- No additional prerequisite for this correction. Document command 21 is a separate missing implementation recorded in DOCUMENT_LOADING_STATE.md.
+
+### Binary layout verification
+- Not applicable: host ownership only; no wire structures changed. Re-read upstream process header/implementation and KSession::Finalize after implementation. Two focused regressions pass: retain parent until server close and five process exits using a two-session port with count returning to zero each cycle. Full core suite still terminates with STATUS_ACCESS_VIOLATION. Release rebuild/standalone refresh succeeded (4m11s); runtime retest pending.
+
+## 2026-09-17 — src/core/src/hle/kernel/{k_process,kernel}.rs vs core/hle/kernel/{k_process,kernel,k_session}.{h,cpp}: session owner identity
+
+### Intentional differences
+- Eden KSession::Initialize stores m_process once; Finalize/PostDestroy release the original port/process resources. Rust already stores process_id in KSession but left it unset. Bind it once at first process-registry insertion, the Rust publication boundary, not when adding HLE wait-registry aliases. This is registry adaptation, not a new upstream helper.
+- Kernel owner lookup returns that recorded identity, not the first process whose registry contains the shared session. Eden accesses m_process directly; Rust resolves the ID through its existing live/retiring process registries. Re-read upstream headers/implementations and compared ownership and finalization ordering; no changes to endpoint close order or port capacity.
+
+### Unintentional differences (to fix)
+- Fixed: a host-service mirror could win the registry scan and make server close finalize against a process without the original client port, leaking the port slot. Regression failed before the fix (owner 50 instead of 100).
+
+### Missing items
+- Existing HLE mirror registry retention is not redesigned here. Live repeated document-page testing remains necessary.
+
+### Binary layout verification
+- Not applicable: internal object identity only; no guest structure or IPC layout changes. Regression mirrors each session before lookup, retires each applet, closes the server using the resolved owner, and checks all five iterations return the two-slot port count to zero.
+- Validation: regression failed before the fix and passes after it; three KClientPort, six KSession and one handle-table finalization tests pass. Full core suite again terminates with 0xc0000005 (D:/tmp/ruzu-session-owner-core-tests.log); no full-suite success claim.
+- Release build/standalone refresh succeeded in 4m21s, with the two pre-existing GUI dead-code warnings. Runtime repeated-page verification remains pending.
+
+## 2026-09-17 — src/core/src/hle/service/server_manager.rs vs core/hle/service/server_manager.{h,cpp}: release HLE handler on session close
+
+### Intentional differences
+- Rust caches a request-manager Arc on KServerSession for HLE dispatch; Eden's endpoint has no such owning reference. DestroySession now detaches that cache after kernel endpoint cleanup and outside endpoint/process guards, before the Session wrapper drops its own manager. This preserves Eden's Session destructor ordering and releases handlers even if an HLE wait registry retains the kernel endpoint.
+- Header, Session class/destructor and DestroySession implementation re-read after implementation. RO capacity and RoInterface destructor are unchanged; Eden's destructor unregisters its process context, as Rust Drop already does.
+
+### Unintentional differences (to fix)
+- Fixed retained endpoint -> manager -> RoInterface ownership, which prevented context destruction. The Windows dump identified panic `RoContext: no free process context available` in RegisterProcess, followed by a cannot-unwind abort through Fiber::fiber_start_func.
+
+### Missing items
+- The broader HLE endpoint mirror registry design is unchanged. Runtime switching between document pages still requires retesting.
+
+### Binary layout verification
+- Not applicable: internal lifetime only. Regression uses real RoInterface command 4, retains each kernel endpoint, destroys the ServerManager session, verifies the handler is gone and context 0 is reused across six processes. Test failed before the fix with `closed session retained RoInterface`.
+- Validation: the regression now passes, along with all 26 ServerManager tests and nine RO tests. Full core suite still aborts with 0xc0000005 (D:/tmp/ruzu-ro-destruction-core-tests.log); no full-suite success claim.
+- build.bat succeeded in 3m59s and refreshed the standalone Release executable, with the two pre-existing GUI warnings. Actual document switching remains to be retested.

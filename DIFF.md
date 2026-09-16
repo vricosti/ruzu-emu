@@ -18324,6 +18324,21 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
 ### Binary layout verification
 - Not applicable: host ownership only; no wire structures changed. Re-read upstream process header/implementation and KSession::Finalize after implementation. Two focused regressions pass: retain parent until server close and five process exits using a two-session port with count returning to zero each cycle. Full core suite still terminates with STATUS_ACCESS_VIOLATION. Release rebuild/standalone refresh succeeded (4m11s); runtime retest pending.
 
+## 2026-09-17 — src/core/src/hle/service/am/frontend/applet_web_browser.rs vs eden/src/core/hle/service/am/frontend/applet_web_browser.{h,cpp}
+
+### Intentional differences
+- Rust's accessor owns the Applet mutex during Execute, whereas Eden calls the frontend without that lock. Direct exits and inline callbacks publish output and completion, then let the existing accessor signal the state change before returning from IPC. Deferred callbacks still acquire the mutex and signal completion themselves. This avoids recursive locking without moving frontend ownership or changing Shop's cancellation result.
+- The optional execution flag in the mechanical callback helper distinguishes direct synchronous exits from frontend callbacks. Removed the second synchronous Exit call after local/external frontend calls, which also attempted recursive locking.
+
+### Unintentional differences (to fix)
+- The broader accessor locking model remains different from Eden. RequestExit with a frontend that invokes its stored callback synchronously from Close remains a separate lifecycle risk; this patch covers Execute and its immediate/deferred results, not an accessor-wide ownership refactor.
+
+### Missing items
+- Shop remains unimplemented, like Eden: it returns EndButtonPressed. This change does not implement Nintendo eShop connectivity or WebSession.
+
+### Binary layout verification
+- Unchanged legacy 0x1010-byte / TLV 0x2000-byte output serialization. Regression checks Shop's EndButtonPressed and inline Web WindowClosed results while the owner mutex is held, plus deferred completion without an accessor. Upstream header, Execute, WebBrowserExit and frontend call sites re-read after implementation. All six focused browser/type tests pass. Full `cargo test -p core --locked --offline` again ends with STATUS_ACCESS_VIOLATION; full-crate validation is not claimed. Release build succeeded on 2026-09-17 (5m01s); standalone executable hash matches target/release and 65 runtime DLLs are present. Runtime retest remains pending.
+
 ## 2026-09-17 — src/core/src/hle/kernel/{k_process,kernel}.rs vs core/hle/kernel/{k_process,kernel,k_session}.{h,cpp}: session owner identity
 
 ### Intentional differences

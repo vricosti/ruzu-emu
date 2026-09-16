@@ -432,7 +432,7 @@ impl WebBrowser {
             &self.applet,
             &self.broker,
             &self.complete,
-            &self.frontend_executing,
+            None,
         );
     }
 
@@ -445,7 +445,7 @@ impl WebBrowser {
         applet: &Weak<Mutex<Applet>>,
         broker: &AppletDataBroker,
         complete: &AtomicBool,
-        frontend_executing: &AtomicBool,
+        frontend_executing: Option<&AtomicBool>,
     ) {
         log::debug!(
             "WebBrowser exit: exit_reason={exit_reason:?}, last_url={last_url}, last_url_size={}",
@@ -455,7 +455,10 @@ impl WebBrowser {
             .get_out_data()
             .push(build_exit_output(header, version, exit_reason, &last_url));
         complete.store(true, Ordering::Release);
-        if !frontend_executing.load(Ordering::Acquire) {
+        // Direct Execute exits and inline frontend callbacks run under the
+        // accessor's Applet mutex. It publishes completion on return. Only
+        // a callback arriving after the frontend call must acquire it here.
+        if frontend_executing.is_some_and(|executing| !executing.load(Ordering::Acquire)) {
             exit(applet);
         }
     }
@@ -525,14 +528,11 @@ impl WebBrowser {
             Box::new(move || Self::extract_offline_romfs(system, romfs.clone(), &cache_dir)),
             Box::new(move |reason, last_url| {
                 Self::finish(
-                    header, version, reason, last_url, &applet, &broker, &complete, &executing,
+                    header, version, reason, last_url, &applet, &broker, &complete, Some(&executing),
                 )
             }),
         );
         self.frontend_executing.store(false, Ordering::Release);
-        if self.complete.load(Ordering::Acquire) {
-            exit(&self.applet);
-        }
     }
 
     fn execute_web(&self) {
@@ -560,14 +560,11 @@ impl WebBrowser {
                     };
                 }
                 Self::finish(
-                    header, version, reason, last_url, &applet, &broker, &complete, &executing,
+                    header, version, reason, last_url, &applet, &broker, &complete, Some(&executing),
                 )
             }),
         );
         self.frontend_executing.store(false, Ordering::Release);
-        if self.complete.load(Ordering::Acquire) {
-            exit(&self.applet);
-        }
     }
 }
 
@@ -692,6 +689,60 @@ fn copy_common_arguments(data: &[u8]) -> Option<CommonArguments> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synchronous_exits_return_while_accessor_owns_applet_lock() {
+        use crate::core::System;
+        use crate::frontend::applets::web_browser::DefaultWebBrowserApplet;
+        use crate::hle::service::os::process::Process;
+
+        let system = Box::new(System::new());
+        let system_ref = SystemRef::from_ref(&system);
+        for shim in [ShimKind::SHOP, ShimKind::WEB] {
+            let owner = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
+            let broker = Arc::new(AppletDataBroker::new());
+            let mut browser = WebBrowser::new(
+                system_ref, Arc::downgrade(&owner), broker.clone(),
+                LibraryAppletMode::AllForeground, Arc::new(DefaultWebBrowserApplet),
+            );
+            browser.web_arg_header.shim_kind = shim;
+            let guard = owner.lock().unwrap();
+            // SHOP exercises a direct exit; WEB exercises an inline callback.
+            browser.execute();
+            assert!(browser.is_complete());
+            assert!(!guard.is_completed); // accessor publishes this after Execute
+            let output = broker.get_out_data().pop().unwrap();
+            assert_eq!(output.len(), 0x1010);
+            let expected = if shim == ShimKind::SHOP {
+                WebExitReason::END_BUTTON_PRESSED
+            } else {
+                WebExitReason::WINDOW_CLOSED
+            };
+            assert_eq!(&output[..4], &expected.0.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn asynchronous_exit_publishes_completion_without_accessor() {
+        use crate::core::System;
+        use crate::hle::service::os::process::Process;
+
+        let system = Box::new(System::new());
+        let owner = Arc::new(Mutex::new(Applet::new(
+            SystemRef::from_ref(&system), Process::new(), false,
+        )));
+        let broker = AppletDataBroker::new();
+        let complete = AtomicBool::new(false);
+        let executing = AtomicBool::new(false);
+        WebBrowser::finish(
+            WebArgHeader::default(), WebAppletVersion::default(),
+            WebExitReason::WINDOW_CLOSED, String::new(), &Arc::downgrade(&owner),
+            &broker, &complete, Some(&executing),
+        );
+        assert!(complete.load(Ordering::Acquire));
+        assert!(owner.lock().unwrap().is_completed);
+        assert!(broker.get_out_data().pop().is_ok());
+    }
 
     fn tlv(kind: WebArgInputTlvType, data: &[u8]) -> Vec<u8> {
         let mut result = Vec::new();

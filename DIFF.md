@@ -18324,6 +18324,20 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
 ### Binary layout verification
 - Not applicable: host ownership only; no wire structures changed. Re-read upstream process header/implementation and KSession::Finalize after implementation. Two focused regressions pass: retain parent until server close and five process exits using a two-session port with count returning to zero each cycle. Full core suite still terminates with STATUS_ACCESS_VIOLATION. Release rebuild/standalone refresh succeeded (4m11s); runtime retest pending.
 
+## 2026-09-17 — src/core/src/hle/service/ns/{document_interface,service_getter_interface}.rs vs eden/src/core/hle/service/ns equivalents
+
+### Intentional differences
+- Explicit RequestParser/ResponseBuilder callbacks replace C++ CMIF templates. Command 7999 returns a fresh Arc-backed document service; commands 23/92 remain owned by document_interface.rs. Existing Rust business methods use Result and split ContentPath fields, with the callback parsing the original 16-byte structure first. The diagnostic service name retains its existing ns:: prefix.
+
+### Unintentional differences (to fix)
+- Other getter commands 7993–7995 still lack child-service wiring; their interfaces are outside this document-service slice and require their own IPC prerequisite audit.
+
+### Missing items
+- None for the document interface relative to Eden: command 21 intentionally remains unimplemented upstream too. No claim of complete NS parity.
+
+### Binary layout verification
+- PASS: regression invokes command 7999, inspects the real child session, then exercises commands 23 and 92. ContentPath is 16 bytes with program_id at offset 8; arbitrary padding is accepted. Command 23 returns only the 64-bit result, 92 returns result plus u64 application-process ID (not caller/runtime ID). Header/implementation pairs re-read after changes; focused regression passes. Full core tests again terminate with STATUS_ACCESS_VIOLATION. Release build and standalone refresh succeeded (4m09s); runtime Support Information retest remains pending.
+
 ## 2026-09-17 — src/core/src/hle/service/am/frontend/applet_web_browser.rs vs eden/src/core/hle/service/am/frontend/applet_web_browser.{h,cpp}
 
 ### Intentional differences
@@ -18338,6 +18352,71 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
 
 ### Binary layout verification
 - Unchanged legacy 0x1010-byte / TLV 0x2000-byte output serialization. Regression checks Shop's EndButtonPressed and inline Web WindowClosed results while the owner mutex is held, plus deferred completion without an accessor. Upstream header, Execute, WebBrowserExit and frontend call sites re-read after implementation. All six focused browser/type tests pass. Full `cargo test -p core --locked --offline` again ends with STATUS_ACCESS_VIOLATION; full-crate validation is not claimed. Release build succeeded on 2026-09-17 (5m01s); standalone executable hash matches target/release and 65 runtime DLLs are present. Runtime retest remains pending.
+
+## 2026-09-17 — src/core/src/file_sys/registered_cache.rs vs core/file_sys/registered_cache.h/.cpp
+
+### Intentional differences
+- User-authorized extension beyond Eden: `ContentProviderUnion::get_entry_content_path` exposes a guest content-root path for a catalogued entry. Eden's NS command 21 and FSP command 8 are unimplemented. Existing GetEntryUnparsed/provider ownership and split/NAX backing are reused; no host path is returned or opened from guest input.
+- External/frontend container entries use a virtual UserContent mount, without copying/installing files or manufacturing a gamecard handle. Registered storage retains its actual relative path; content filenames must be valid NCA IDs.
+
+### Unintentional differences (to fix)
+- No change to existing provider iteration/lifetime semantics in this slice. This is not a full provider audit.
+
+### Missing items
+- Exact physical gamecard mount handles are not modeled by this extension.
+
+### Binary layout verification
+- N/A: returns a Rust String, no raw IPC payload. Upstream header and GetEntryUnparsed/GetEntryRaw/ListEntriesFilterOrigin/GetSlotForEntry re-read; there is no corresponding upstream path method. Focused storage-root/missing-entry/name regression and all four manual-provider tests pass.
+
+## 2026-09-17 — src/core/src/hle/service/filesystem/fsp/fsp_srv.rs vs core/hle/service/filesystem/fsp/fsp_srv.h/.cpp
+
+### Intentional differences
+- User-authorized implementation beyond Eden's null OpenFileSystemWithId (8), plus firmware >=16 command 10. Wire contract from switchbrew/libnx `nx/source/services/fs.c` and `nx/include/switch/services/fs.h`. FSP owns parsing, archive validation and returning IFileSystem; registered-cache union owns catalogued guest paths. Eden's OpenFileSystemWithPatch header/body re-read for the ExtractRomFS/IFileSystem boundary.
+- Mounts document/control/data RomFS from actual catalogued NCAs, with the base archive supplied for updates. No host path opens. Filesystem errors used on missing/invalid content; exact NS/HOS error-number equivalence is not claimed. Capacity queries use zero for this read-only content mount.
+
+### Unintentional differences (to fix)
+- None identified in the verified IPC layout. This is a scoped extension, not a complete FSP implementation.
+
+### Missing items
+- Other filesystem types (logo/meta/package/code/registered-update) are explicitly unsupported for these commands. Physical gamecard mount handles and full content-attribute storage policy are not emulated; the documented attribute mask is accepted and catalog origin determines backing storage.
+
+### Binary layout verification
+- Both request structs are 16 bytes; program ID at offset 8, modern fs type at offset 4 and attributes at 0. Padding is explicit. Return uses existing session/domain IFileSystem serialization and null-object error handling. Layout and missing-path/unsupported-kind regression tests added.
+
+## 2026-09-17 — src/core/src/hle/service/ns/document_interface.rs vs core/hle/service/ns/document_interface.h/.cpp
+
+### Intentional differences
+- User-authorized command 21 implementation beyond Eden's null handler, following Switchbrew NS_services#GetApplicationContentPath and NCM_services#ContentType. Uses CNMT ContentRecordType values, prefers installed patch content, fails when the requested document is absent. Provider catalogue substitutes for the hardware NS application table. Application ID zero/invalid content types fail; filesystem result codes are used where an exact NS code is undocumented.
+- Guest path creation stays with provider ownership, IPC/content selection stays here. Commands 23/92 are unchanged. Getter's existing child-interface regression now expects command 21 to be implemented.
+
+### Unintentional differences (to fix)
+- No known mismatch in the documented input/output layout. Hardware application-table permissions are not modeled by this scoped extension.
+
+### Missing items
+- Does not create missing game documents or implement online content. Other FSP mount types remain outside the document slice.
+
+### Binary layout verification
+- Reuses explicit-padding ContentPath (16 bytes; u8 at 0, u64 at 8) solely as a wire layout. NUL-terminated path in a zero-initialized 0x300-byte array, output capacity checked before write; result-only normal response. Header/cpp re-read after implementation: upstream command 21 is null, 23/92 untouched. Tests cover type discrimination, absent content, invalid IDs/types and patch precedence.
+- Validation: five document-focused tests and all eight FspSrv tests pass. Full `cargo test -p core --locked --offline` terminates with STATUS_ACCESS_VIOLATION again (D:/tmp/ruzu-document-core-tests.log); full-crate success and actual document rendering are not claimed.
+- Release build and standalone refresh succeeded in 4m11s. The two existing GUI dead-code warnings remain (`read_ui_u32_setting`, `FullscreenHotkey`). User will perform the Home Menu rendering retest; no GUI instance launched.
+
+## 2026-09-17 — src/core/src/hle/service/ns/document_interface.rs vs core/hle/service/ns/document_interface.{h,cpp}: output attributes
+
+### Intentional differences
+- Eden command 21 remains null (header and implementation re-read). This authorized extension is verified against the installed Web applet's IPC client, not inferred from Eden's stub.
+- Offline main NSO-relative offsets (not runtime PCs): proxy 0x65b5f8 selects command 21; response parser 0x655808 reads a u8 at SFCO+0x10 and stores it through the output pointer; caller 0x64d2d8 forwards that byte into the content mount. No runtime load-base assumptions.
+- Catalogue-backed full archives return ContentAttributes::None (0). FSP attribute validation is retained.
+
+### Unintentional differences (to fix)
+- Corrected the preceding entry's incomplete result-only response: it omitted Out<u8>, leaving stale guest TLS bytes (observed 0x53), which caused FSP InvalidArgument and guest fatal instead of a document page.
+
+### Missing items
+- Live document rendering still needs user verification; this fix does not supply missing documents or online data.
+
+### Binary layout verification
+- Response now reserves three normal words: 64-bit Result storage followed by u8 attributes and zero padding. Regression invokes the handler and serializes the actual reply into mapped guest TLS seeded with 0x53535353; checks output size, attributes, path termination and error replies.
+- Validation: two document-path tests and eight FSP tests pass without new warnings. Full core suite still aborts with STATUS_ACCESS_VIOLATION (0xc0000005); log: D:/tmp/ruzu-document-attributes-core-tests.log. No full-suite success claim.
+- build.bat succeeded in 4m14s; standalone Release refreshed, two pre-existing GUI warnings remain. No GUI launched and no runtime rendering success claimed.
 
 ## 2026-09-17 — src/core/src/hle/kernel/{k_process,kernel}.rs vs core/hle/kernel/{k_process,kernel,k_session}.{h,cpp}: session owner identity
 

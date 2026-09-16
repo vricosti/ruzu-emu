@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::application_manager_interface::IApplicationManagerInterface;
 use super::content_management_interface::IContentManagementInterface;
+use super::document_interface::IDocumentInterface;
 use super::ecommerce_interface::IECommerceInterface;
 use super::download_task_interface::IDownloadTaskInterface;
 use super::dynamic_rights_interface::IDynamicRightsInterface;
@@ -104,7 +105,7 @@ impl IServiceGetterInterface {
             ),
             (
                 commands::GET_DOCUMENT_INTERFACE,
-                None,
+                Some(Self::get_document_interface_handler),
                 "GetDocumentInterface",
             ),
         ]);
@@ -241,14 +242,67 @@ impl IServiceGetterInterface {
     }
 
     /// GetDocumentInterface (cmd 7999).
-    pub fn get_document_interface(&self) {
+    pub fn get_document_interface(&self) -> IDocumentInterface {
         log::debug!("IServiceGetterInterface::get_document_interface called");
+        IDocumentInterface::new(self.system)
+    }
+
+    fn get_document_interface_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = this.as_any().downcast_ref::<Self>().unwrap();
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(Arc::new(service.get_document_interface()));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_getter_returns_session_with_upstream_replies() {
+        use crate::core::{System, SystemRef};
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+        use crate::hle::service::hle_ipc::{KAutoObjectRef, SessionRequestManager};
+        use std::sync::Mutex;
+
+        let mut system = Box::new(System::new());
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let application_id = 0x0100_1234_5678_ABCD;
+        process.lock().unwrap().program_id = application_id;
+        system.set_current_process_arc(process.clone());
+        system.set_runtime_program_id(0xDEAD); // not the application process ID
+        let service = IServiceGetterInterface::new(SystemRef::from_ref(&system), "ns:am2");
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+        let mut ctx = HLERequestContext::new_with_thread(thread, 0);
+        ctx.set_session_request_manager(Arc::new(Mutex::new(SessionRequestManager::new())));
+        service.handlers()[&7999].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.outgoing_move_objects.len(), 1);
+        let KAutoObjectRef::ObjectId(id) = ctx.outgoing_move_objects[0] else { panic!("missing child session") };
+        let server = process.lock().unwrap().get_server_session_by_object_id(id).unwrap();
+        let manager = server.lock().unwrap().get_manager().unwrap().clone();
+        let child = manager.lock().unwrap().session_handler().unwrap().clone();
+        let document = child.as_any().downcast_ref::<IDocumentInterface>().unwrap();
+        assert_eq!(document.handlers().len(), 3);
+        assert!(document.handlers()[&21].handler_callback.is_some());
+        for command in [23, 92] {
+            let mut ctx = HLERequestContext::new();
+            // Exercise full-width caller/path input and nonzero ContentPath padding.
+            ctx.command_buffer_mut().fill(u32::MAX);
+            document.handlers()[&command].handler_callback.unwrap()(document, &mut ctx);
+            let offset = ctx.get_data_payload_offset() as usize;
+            assert_eq!(&ctx.command_buffer()[offset..offset + 2], &[0, 0]);
+            assert_eq!(ctx.write_size as usize, offset + if command == 23 { 2 } else { 4 });
+            if command == 92 {
+                let words = ctx.command_buffer();
+                assert_eq!(u64::from(words[offset + 2]) | (u64::from(words[offset + 3]) << 32), application_id);
+            }
+        }
+        assert_eq!(std::mem::size_of::<super::super::ns_types::ContentPath>(), 16);
+        assert_eq!(std::mem::offset_of!(super::super::ns_types::ContentPath, program_id), 8);
+    }
 
     #[test]
     fn read_only_getters_return_wired_interfaces() {
@@ -332,6 +386,7 @@ mod tests {
 }
 
 impl SessionRequestHandler for IServiceGetterInterface {
+    fn as_any(&self) -> &dyn std::any::Any { self }
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }

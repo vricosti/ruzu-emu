@@ -1359,6 +1359,41 @@ impl ContentProvider for ContentProviderUnion {
 }
 
 impl ContentProviderUnion {
+    /// HLE extension for NS document paths and FSP OpenFileSystemWithId (both
+    /// unimplemented in Eden). Keep the path tied to a specific provider entry,
+    /// including its NAX/split-file backing, rather than exposing a host path.
+    /// External container entries are mounted in the virtual UserContent root;
+    /// this does not claim they have been installed into NAND.
+    pub fn get_entry_content_path(
+        &self,
+        slot: ContentProviderUnionSlot,
+        title_id: u64,
+        record_type: ContentRecordType,
+    ) -> Option<String> {
+        let provider = *self.providers.get(&slot)?;
+        let file = unsafe { (*provider).get_entry_unparsed(title_id, record_type) }?;
+        let full_path = file.get_full_path().replace('\\', "/");
+        let components: Vec<_> = full_path.split('/').collect();
+        // A split archive's VFS name is "00"; the NCA name is its parent.
+        let end = components.iter().rposition(|name| {
+            name.is_ascii() && follows_nca_id_format(name)
+        })?;
+        let start = components[..end].iter().rposition(|name| *name == "registered")
+            .unwrap_or(end);
+        let relative = &components[start..=end];
+        if relative.iter().any(|part| part.is_empty() || *part == "." || *part == ".." || part.contains(':')) {
+            return None;
+        }
+        let root = match slot {
+            ContentProviderUnionSlot::SysNAND => "@SystemContent",
+            ContentProviderUnionSlot::SDMC => "@SdCardContent",
+            ContentProviderUnionSlot::UserNAND
+            | ContentProviderUnionSlot::External
+            | ContentProviderUnionSlot::FrontendManual => "@UserContent",
+        };
+        Some(format!("{root}://{}", relative.join("/")))
+    }
+
     /// List entries with their origin slot.
     /// Corresponds to upstream `ContentProviderUnion::ListEntriesFilterOrigin`.
     pub fn list_entries_filter_origin(
@@ -2190,5 +2225,27 @@ mod manual_content_provider_tests {
             union.get_slot_for_entry(title_id, ContentRecordType::Program),
             Some(ContentProviderUnionSlot::FrontendManual)
         );
+    }
+
+    #[test]
+    fn document_content_paths_use_catalogued_nca_names_and_storage_roots() {
+        let mut manual = ManualContentProvider::new();
+        manual.add_entry(TitleType::Application, ContentRecordType::HtmlDocument, 42,
+            file("0123456789abcdef0123456789abcdef.nca"));
+        manual.add_entry(TitleType::Application, ContentRecordType::HtmlDocument, 43,
+            file("not-a-content-id.nca"));
+        let mut union = ContentProviderUnion::new();
+        for (slot, root) in [
+            (ContentProviderUnionSlot::SysNAND, "@SystemContent"),
+            (ContentProviderUnionSlot::UserNAND, "@UserContent"),
+            (ContentProviderUnionSlot::SDMC, "@SdCardContent"),
+            (ContentProviderUnionSlot::FrontendManual, "@UserContent"),
+        ] {
+            unsafe { union.set_slot(slot, &mut manual); }
+            assert_eq!(union.get_entry_content_path(slot, 42, ContentRecordType::HtmlDocument),
+                Some(format!("{root}://0123456789abcdef0123456789abcdef.nca")));
+            assert!(union.get_entry_content_path(slot, 43, ContentRecordType::HtmlDocument).is_none());
+            assert!(union.get_entry_content_path(slot, 42, ContentRecordType::LegalInformation).is_none());
+        }
     }
 }

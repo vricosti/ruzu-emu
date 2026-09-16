@@ -3990,9 +3990,17 @@ impl GMainWindow {
         let Some(path) = self.system_applet_path(program_id, applet_name) else {
             return;
         };
-        self.boot_game_with_parameters(
-            path,
-            crate::boot::BootParameters {
+        // GTK activates the action before unwinding the nested menu popovers.
+        // Boot disables the focused applet action; doing that inside activation
+        // can make the still-active menu bar select/open Emulation instead.
+        // Let GTK finish closing the menu before changing its action state.
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(this) = weak.upgrade() else { return };
+            if this.session.borrow().is_some() || this.profile_selection_pending.get() {
+                return;
+            }
+            this.boot_game_with_parameters(path, crate::boot::BootParameters {
                 applet: FrontendAppletParameters {
                     program_id,
                     applet_id,
@@ -4003,8 +4011,8 @@ impl GMainWindow {
                 },
                 cabinet_mode,
                 use_global_configuration: false,
-            },
-        );
+            });
+        });
     }
 
     fn on_home_menu(self: &Rc<Self>) {

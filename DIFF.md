@@ -18170,3 +18170,14 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   writes only the bounded data prefix rather than C++'s unspecified scratch tail.
 - SetUsers retains the upstream inert behavior without logging unused inputs.
   GetCurrentLibraryApplet returns a null interface, not an invented child.
+
+## 2026-09-16 — src/ruzu/src/main_window.rs vs yuzu/main_window.{h,cpp}
+
+### Intentional differences
+- LaunchFirmwareApplet retains the same boot parameters, but GTK queues the
+  boot continuation until after menu activation returns. Unlike Qt's QAction
+  activation, GTK's nested popovers can still own focus when the action runs;
+  synchronously disabling the selected applet action can transfer that focus
+  to another menu. A weak window reference and a fresh running-session/profile
+  selection check prevent a delayed launch after destruction or a competing
+  launch. This changes frontend event ordering only, not guest applet dispatch.

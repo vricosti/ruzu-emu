@@ -14,6 +14,8 @@ use super::content_management_interface::IContentManagementInterface;
 use super::ecommerce_interface::IECommerceInterface;
 use super::download_task_interface::IDownloadTaskInterface;
 use super::dynamic_rights_interface::IDynamicRightsInterface;
+use super::read_only_application_record_interface::IReadOnlyApplicationRecordInterface;
+use super::read_only_application_control_data_interface::IReadOnlyApplicationControlDataInterface;
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::ResponseBuilder;
@@ -57,12 +59,12 @@ impl IServiceGetterInterface {
             ),
             (
                 commands::GET_READ_ONLY_APPLICATION_CONTROL_DATA_INTERFACE,
-                None,
+                Some(Self::get_read_only_application_control_data_interface_handler),
                 "GetReadOnlyApplicationControlDataInterface",
             ),
             (
                 commands::GET_READ_ONLY_APPLICATION_RECORD_INTERFACE,
-                None,
+                Some(Self::get_read_only_application_record_interface_handler),
                 "GetReadOnlyApplicationRecordInterface",
             ),
             (
@@ -129,17 +131,33 @@ impl IServiceGetterInterface {
     }
 
     /// GetReadOnlyApplicationControlDataInterface (cmd 7989).
-    pub fn get_read_only_application_control_data_interface(&self) {
+    pub fn get_read_only_application_control_data_interface(&self) -> IReadOnlyApplicationControlDataInterface {
         log::debug!(
             "IServiceGetterInterface::get_read_only_application_control_data_interface called"
         );
-        // Returns IReadOnlyApplicationControlDataInterface.
+        IReadOnlyApplicationControlDataInterface::new(self.system)
     }
 
     /// GetReadOnlyApplicationRecordInterface (cmd 7991).
-    pub fn get_read_only_application_record_interface(&self) {
+    pub fn get_read_only_application_record_interface(&self) -> IReadOnlyApplicationRecordInterface {
         log::debug!("IServiceGetterInterface::get_read_only_application_record_interface called");
-        // Returns IReadOnlyApplicationRecordInterface.
+        IReadOnlyApplicationRecordInterface::new(self.system)
+    }
+
+    fn get_read_only_application_control_data_interface_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let interface = Arc::new(service.get_read_only_application_control_data_interface());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(interface);
+    }
+
+    fn get_read_only_application_record_interface_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let interface = Arc::new(service.get_read_only_application_record_interface());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(interface);
     }
 
     /// GetECommerceInterface (cmd 7992).
@@ -231,6 +249,27 @@ impl IServiceGetterInterface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_getters_return_wired_interfaces() {
+        let service = IServiceGetterInterface::new(crate::core::SystemRef::null(), "ns:am2");
+        for command in [7989, 7991] {
+            assert!(service.handlers[&command].handler_callback.is_some());
+        }
+        let record = service.get_read_only_application_record_interface();
+        assert!(record.handlers()[&3].handler_callback.is_some());
+        for (command, expected) in [(0, 1), (2, 0)] {
+            let mut ctx = HLERequestContext::new();
+            record.handlers()[&command].handler_callback.unwrap()(&record, &mut ctx);
+            assert_eq!(ctx.command_buffer()[6], 0);
+            assert_eq!(ctx.command_buffer()[8], expected);
+        }
+        assert!(record.handlers()[&1].handler_callback.is_none());
+        let control = service.get_read_only_application_control_data_interface();
+        for command in [0, 1, 2, 5, 10, 13, 19, 23] {
+            assert!(control.handlers()[&command].handler_callback.is_some());
+        }
+    }
 
     #[test]
     fn dynamic_rights_getter_returns_upstream_interface() {

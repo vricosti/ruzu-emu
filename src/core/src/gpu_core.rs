@@ -39,7 +39,7 @@ pub enum BlendMode {
     Coverage,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FramebufferConfig {
     pub address: u64,
     pub offset: u32,
@@ -50,6 +50,25 @@ pub struct FramebufferConfig {
     pub transform_flags: BufferTransformFlags,
     pub crop_rect: Rectangle<i32>,
     pub blending: BlendMode,
+    // Mirrors Tegra::FramebufferConfig across the core/video_core crate boundary.
+    pub layer_stack_mask: u32,
+}
+
+impl Default for FramebufferConfig {
+    fn default() -> Self {
+        Self {
+            address: 0,
+            offset: 0,
+            width: 0,
+            height: 0,
+            stride: 0,
+            pixel_format: PixelFormat::default(),
+            transform_flags: BufferTransformFlags::default(),
+            crop_rect: Rectangle::default(),
+            blending: BlendMode::default(),
+            layer_stack_mask: crate::hle::service::nvnflinger::hwc_layer::DEFAULT_LAYER_STACK_MASK,
+        }
+    }
 }
 
 /// Mirrors upstream `VideoCore::RasterizerDownloadArea` across the `core` /

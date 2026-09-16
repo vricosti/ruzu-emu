@@ -3,7 +3,7 @@
 //! IAudioController service ("audctl").
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 use super::errors::RESULT_INVALID_ARGUMENT;
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 
@@ -75,6 +75,8 @@ pub enum HeadphoneOutputLevelMode {
 /// | 34  | acquire_target_notification              | AcquireTargetNotification                             |
 /// | 35-42, 10000-10106, 50000 | nullptr            | (various debug/play report commands)                  |
 pub struct IAudioController {
+    // Rust counterpart of upstream enable_shared_from_this; never owns itself.
+    self_reference: Weak<Self>,
     // Upstream fields:
     //   service_context: KernelHelpers::ServiceContext — owns the notification_event lifecycle.
     //   notification_event: Kernel::KEvent* — created via service_context.CreateEvent("IAudioController:NotificationEvent").
@@ -95,7 +97,7 @@ pub struct IAudioController {
 }
 
 impl IAudioController {
-    pub fn new(system: crate::core::SystemRef) -> Self {
+    pub fn new(system: crate::core::SystemRef) -> Arc<Self> {
         let manager = system
             .get()
             .service_manager()
@@ -103,7 +105,25 @@ impl IAudioController {
         let set_sys = ServiceManager::get_service_blocking(&manager, system, "set:sys");
         let mut service = Self::with_system_settings(set_sys);
         service.system = system;
-        service
+        service.into_shared()
+    }
+
+    fn into_shared(mut self) -> Arc<Self> {
+        Arc::new_cyclic(|reference| {
+            self.self_reference = reference.clone();
+            self
+        })
+    }
+
+    fn unknown5000(&self) -> Arc<Self> {
+        self.self_reference.upgrade().expect("audio controller requires shared ownership")
+    }
+
+    fn unknown5000_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let controller = Self::as_self(this).unknown5000();
+        let mut response = ResponseBuilder::new(ctx, 2, 0, 1);
+        response.push_result(RESULT_SUCCESS);
+        response.push_ipc_interface(controller);
     }
 
     fn with_system_settings(set_sys: SessionRequestHandlerPtr) -> Self {
@@ -220,6 +240,8 @@ impl IAudioController {
             (40, None, "GetSystemInformationForDebug"),
             (41, None, "SetVolumeButtonLongPressTime"),
             (42, None, "SetNativeVolumeForDebug"),
+            (43, None, "Unknown43"),
+            (5000, Some(Self::unknown5000_handler), "Unknown5000"),
             (10000, None, "NotifyAudioOutputTargetForPlayReport"),
             (10001, None, "NotifyAudioOutputChannelCountForPlayReport"),
             (
@@ -238,7 +260,11 @@ impl IAudioController {
                 "BindAudioOutputChannelCountUpdateEventForPlayReport",
             ),
             (10106, None, "GetDefaultAudioOutputTargetForPlayReport"),
+            (10200, None, "Unknown10200"),
             (50000, None, "SetAnalogInputBoostGainForPrototyping"),
+            (50001, None, "OverrideDefaultTargetForDebug"),
+            (50003, None, "SetForceOverrideExternalDeviceNameForDebug"),
+            (50004, None, "ClearForceOverrideExternalDeviceNameForDebug"),
         ]);
 
         let mut service_context = ServiceContext::new("audctl".to_string());
@@ -246,6 +272,7 @@ impl IAudioController {
             service_context.create_event("IAudioController:NotificationEvent".to_string());
 
         Self {
+            self_reference: Weak::new(),
             service_context,
             notification_event_handle,
             m_set_sys: set_sys,
@@ -588,6 +615,7 @@ impl IAudioController {
 }
 
 impl SessionRequestHandler for IAudioController {
+    fn as_any(&self) -> &dyn std::any::Any { self }
     fn handle_sync_request(&self, context: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, context)
     }
@@ -612,6 +640,24 @@ mod tests {
     use super::*;
     use crate::hle::service::set::settings_types::AudioOutputModeTarget;
     use std::sync::Arc;
+
+    #[test]
+    fn duplicate_controller_preserves_identity_state_and_lifetime() {
+        let controller = IAudioController::with_system_settings(
+            Arc::new(SystemSettingsService::new_for_test())).into_shared();
+        let duplicate = controller.unknown5000();
+        assert!(Arc::ptr_eq(&controller, &duplicate));
+        assert!(controller.handlers[&5000].handler_callback.is_some());
+        // A non-active target avoids changing global UI settings in this test.
+        assert_eq!(controller.set_target_volume(0, 7), RESULT_SUCCESS);
+        assert_eq!(duplicate.get_target_volume(0), Ok(7));
+        let weak = Arc::downgrade(&controller);
+        drop(controller);
+        assert_eq!(duplicate.get_target_volume(0), Ok(7));
+        assert!(weak.upgrade().is_some());
+        drop(duplicate);
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test]
     fn audio_controller_registers_currently_ported_command_ids() {

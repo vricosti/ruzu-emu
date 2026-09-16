@@ -1798,6 +1798,22 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn a32_page_table_sign_bit_preserves_host_pointer() {
+        let (mut config, page_table, page_memory) = a32_packed_page_entry_config(2);
+        config.page_table_sign_extension = Some(57);
+        let mut jit = A32Jit::new(config).expect("A32 JIT");
+        jit.set_register(0, 0x3000);
+        jit.set_register(15, 0);
+        assert!(jit.run().contains(HaltReason::SVC));
+        // The callback returns DEAD_BEEF; this must read the actual mapped page.
+        assert_eq!(jit.get_register(1), 0xCAFE_BABE);
+        drop(jit);
+        drop(page_table);
+        drop(page_memory);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn a32_page_table_marked_entry_falls_back_to_callbacks() {
         // `MarkRasterizerCached` sets the low three bits; the host pointer stays
         // in the entry but the inline lookup must not use it.

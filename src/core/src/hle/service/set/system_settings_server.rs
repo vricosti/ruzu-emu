@@ -214,6 +214,9 @@ pub mod commands {
     pub const SET_HEADPHONE_VOLUME_UPDATE_FLAG: u32 = 118;
     pub const GET_PANEL_CRC_MODE: u32 = 203;
     pub const SET_PANEL_CRC_MODE: u32 = 204;
+    pub const GET_HTTP_AUTH_CONFIGS: u32 = 315;
+    pub const GET_ACCOUNT_USER_SETTINGS: u32 = 319;
+    pub const GET_DEFAULT_ACCOUNT_USER_SETTINGS: u32 = 321;
 }
 
 /// ISystemSettingsServer — "set:sys" service.
@@ -1026,6 +1029,21 @@ impl ISystemSettingsServer {
         self.system_settings.touch_screen_mode
     }
 
+    pub fn get_http_auth_configs(&self) -> i32 {
+        log::warn!("(STUBBED) GetHttpAuthConfigs called");
+        0
+    }
+
+    pub fn get_account_user_settings(&self) -> (u32, AccountUserSettings) {
+        log::warn!("(STUBBED) GetAccountUserSettings called");
+        (0, AccountUserSettings::default())
+    }
+
+    pub fn get_default_account_user_settings(&self) -> AccountUserSettings {
+        log::warn!("(STUBBED) GetDefaultAccountUserSettings called");
+        AccountUserSettings::default()
+    }
+
     pub fn set_touch_screen_mode(&mut self, mode: u32) {
         log::debug!("ISystemSettingsServer::SetTouchScreenMode called");
         self.system_settings.touch_screen_mode = mode;
@@ -1723,6 +1741,9 @@ impl SystemSettingsService {
                     Some(Self::set_panel_crc_mode_handler),
                     "SetPanelCrcMode",
                 ),
+                (commands::GET_HTTP_AUTH_CONFIGS, Some(Self::get_http_auth_configs_handler), "GetHttpAuthConfigs"),
+                (commands::GET_ACCOUNT_USER_SETTINGS, Some(Self::get_account_user_settings_handler), "GetAccountUserSettings"),
+                (commands::GET_DEFAULT_ACCOUNT_USER_SETTINGS, Some(Self::get_default_account_user_settings_handler), "GetDefaultAccountUserSettings"),
             ]),
             handlers_tipc: BTreeMap::new(),
         }
@@ -3094,6 +3115,33 @@ impl SystemSettingsService {
         rb.push_i32(mode);
     }
 
+    fn get_http_auth_configs_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let count = Self::as_self(this).inner.lock().unwrap().get_http_auth_configs();
+        // Upstream returns no entries. Do not copy its uninitialized scratch tail.
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_i32(count);
+    }
+
+    fn get_account_user_settings_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let (count, settings) = Self::as_self(this).inner.lock().unwrap().get_account_user_settings();
+        if ctx.get_write_buffer_size(0) < settings.data.len() {
+            ResponseBuilder::new(ctx, 2, 0, 0).push_result(crate::hle::result::RESULT_UNKNOWN);
+            return;
+        }
+        ctx.write_buffer(&settings.data, 0);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    fn get_default_account_user_settings_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let settings = Self::as_self(this).inner.lock().unwrap().get_default_account_user_settings();
+        let mut rb = ResponseBuilder::new(ctx, 18, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&settings);
+    }
+
     fn set_panel_crc_mode_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
@@ -3133,6 +3181,33 @@ impl ServiceFramework for SystemSettingsService {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn account_user_settings_commands_return_initialized_payloads() {
+        assert_eq!(std::mem::size_of::<AccountUserSettings>(), 0x40);
+        assert_eq!(std::mem::align_of::<AccountUserSettings>(), 1);
+        let service = SystemSettingsService::new_for_test();
+        let (count, settings) = service.inner.lock().unwrap().get_account_user_settings();
+        assert_eq!(count, 0);
+        assert_eq!(settings.data, [0; 0x40]);
+        for command in [315, 321] {
+            let mut ctx = HLERequestContext::new();
+            ctx.command_buffer_mut().fill(0xaaaaaaaa);
+            service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.command_buffer()[6], 0);
+            let count = if command == 315 { 1 } else { 16 };
+            assert!(ctx.command_buffer()[8..8 + count].iter().all(|word| *word == 0));
+        }
+        let mut ctx = HLERequestContext::new();
+        service.handlers[&319].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], crate::hle::result::RESULT_UNKNOWN.0);
+        ctx.set_buffer_b_descriptors_for_test(vec![crate::hle::ipc::BufferDescriptorABW {
+            size_bits_0_31: 0x40, address_bits_0_31: 0, raw_word2: 0,
+        }]);
+        service.handlers[&319].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], 0);
+        assert_eq!(ctx.command_buffer()[8], 0);
+    }
 
     #[test]
     fn generated_serial_payloads_match_crc_region_and_zero_tail() {

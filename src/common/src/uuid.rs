@@ -126,6 +126,14 @@ impl UUID {
 
         uuid
     }
+
+    /// Port of UUID::MakeRFC4122V5: consume the first 16 SHA-1 digest bytes.
+    pub fn make_rfc4122_v5(sha1: [u8; 16]) -> Self {
+        let mut uuid = Self::from_bytes(sha1);
+        uuid.uuid[8] = 0x80 | (uuid.uuid[8] & 0x3f);
+        uuid.uuid[6] = 0x50 | (uuid.uuid[6] & 0x0f);
+        uuid
+    }
 }
 
 impl Default for UUID {
@@ -252,6 +260,20 @@ fn rand_seed() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uuid_v5_preserves_digest_except_version_and_variant_bits() {
+        let input = [0xff; 16];
+        let uuid = UUID::make_rfc4122_v5(input);
+        let mut expected = input;
+        expected[6] = 0x5f;
+        expected[8] = 0xbf;
+        assert_eq!(uuid.uuid, expected);
+        assert_eq!(std::mem::size_of::<UUID>(), 16);
+        let zero = UUID::make_rfc4122_v5([0; 16]);
+        assert_eq!(zero.uuid[6], 0x50);
+        assert_eq!(zero.uuid[8], 0x80);
+    }
 
     #[test]
     fn test_uuid_default() {

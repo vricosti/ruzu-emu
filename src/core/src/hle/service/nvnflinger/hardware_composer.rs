@@ -198,6 +198,7 @@ impl HardwareComposer {
                         ),
                     crop_rect: item.crop,
                     acquire_fence: item.fence,
+                    layer_stack_mask: layer_guard.layer_stack_mask,
                 });
                 if should_trace_hwc_dense() {
                     log::info!(

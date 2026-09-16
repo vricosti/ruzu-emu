@@ -15,6 +15,7 @@ use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::os::event::Event;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// IPC command table for IApplicationManagerInterface.
 /// Entries with `true` are implemented upstream; `false` means nullptr/stub.
@@ -139,8 +140,9 @@ pub const IAPPLICATION_MANAGER_INTERFACE_COMMANDS: &[(u32, bool, &str)] = &[
     (404, false, "InvalidateApplicationControlCache"),
     (405, false, "ListApplicationControlCacheEntryInfo"),
     (406, false, "GetApplicationControlProperty"),
-    (407, false, "ListApplicationTitle"),
-    (408, false, "ListApplicationIcon"),
+    (407, true, "ListApplicationTitle"),
+    (408, true, "ListApplicationIcon"),
+    (419, true, "RequestDownloadApplicationControlDataInBackground"),
     (502, false, "RequestCheckGameCardRegistration"),
     (503, false, "RequestGameCardRegistrationGoldPoint"),
     (504, false, "RequestRegisterGameCard"),
@@ -336,7 +338,13 @@ pub const IAPPLICATION_MANAGER_INTERFACE_COMMANDS: &[(u32, bool, &str)] = &[
     (3013, false, "IsGameCardEnabled"),
     (3014, false, "IsLocalContentShareEnabled"),
     (3050, false, "ListAssignELicenseTaskResult"),
+    (936, true, "Unknown936"),
     (4022, true, "Unknown4022"),
+    (4023, true, "Unknown4023"),
+    (4042, true, "Unknown4042"),
+    (4053, true, "Unknown4053"),
+    (4088, true, "Unknown4088"),
+    (4105, true, "Unknown4105"),
     (9999, false, "GetApplicationCertificate"),
 ];
 
@@ -351,7 +359,7 @@ pub struct IApplicationManagerInterface {
     gamecard_update_detection_event: Event,
     gamecard_mount_failure_event: Event,
     gamecard_waken_ready_event: Event,
-    unknown_event: Event,
+    unknown_event: Arc<Event>,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
@@ -367,7 +375,15 @@ impl IApplicationManagerInterface {
                     52 => Some(Self::get_game_card_update_detection_event_handler as _),
                     505 => Some(Self::get_game_card_mount_failure_event_handler as _),
                     511 => Some(Self::get_game_card_waken_ready_event_handler as _),
-                    4022 => Some(Self::unknown4022_handler as _),
+                    4022 | 4088 => Some(Self::unknown4022_handler as _),
+                    4023 => Some(Self::unknown4023_handler as _),
+                    4053 => Some(Self::unknown4053_handler as _),
+                    407 => Some(Self::list_application_title as _),
+                    408 => Some(Self::list_application_icon as _),
+                    419 => Some(Self::request_download_application_control_data_in_background as _),
+                    936 => Some(Self::unknown936_handler as _),
+                    4042 => Some(Self::unknown4042_handler as _),
+                    4105 => Some(Self::unknown4105_handler as _),
                     2 => Some(Self::get_application_record_update_system_event_handler as _),
                     70 => Some(Self::resume_all_handler as _),
                     71 => Some(Self::get_storage_size_handler as _),
@@ -386,13 +402,13 @@ impl IApplicationManagerInterface {
             gamecard_update_detection_event: Event::new(),
             gamecard_mount_failure_event: Event::new(),
             gamecard_waken_ready_event: Event::new(),
-            unknown_event: Event::new(),
+            unknown_event: Arc::new(Event::new()),
             handlers: build_handler_map(&functions),
             handlers_tipc: BTreeMap::new(),
         }
     }
 
-    fn list_application_record_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn list_application_record_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         use crate::file_sys::nca_metadata::{ContentRecordType, TitleType};
         let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         let offset = RequestParser::new(ctx).pop_u32() as i32;
@@ -530,6 +546,71 @@ impl IApplicationManagerInterface {
         rb.push_copy_object_id(object_id);
     }
 
+    fn list_application_title(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        use super::read_only_application_control_data_interface::IReadOnlyApplicationControlDataInterface as Control;
+        Control::list_application_title(&Control::new(service.system), ctx);
+    }
+
+    fn list_application_icon(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        use super::read_only_application_control_data_interface::IReadOnlyApplicationControlDataInterface as Control;
+        Control::list_application_icon(&Control::new(service.system), ctx);
+    }
+
+    fn request_download_application_control_data_in_background(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut rp = RequestParser::new(ctx);
+        let source = rp.pop_u64();
+        let application_id = rp.pop_u64();
+        log::info!("RequestDownloadApplicationControlDataInBackground source={source} application_id={application_id:016x}");
+        service.unknown_event.signal();
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn unknown4023_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) Unknown4023 called");
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(0);
+    }
+
+    fn unknown4053_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) Unknown4053 called");
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn unknown936_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) Unknown936 called");
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u64(0);
+    }
+
+    fn unknown4042_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut rp = RequestParser::new(ctx);
+        let arg1 = rp.pop_u64();
+        let arg2 = rp.pop_u64();
+        log::warn!("(STUBBED) Unknown4042 called, arg1={arg1:016X}, arg2={arg2:016X}");
+        let Some(object_id) = service.unknown_event.copy_object_id(ctx) else {
+            let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+            rb.push_result(RESULT_UNKNOWN);
+            return;
+        };
+        let result = super::async_result::IAsyncResult::new(Some(Arc::clone(&service.unknown_event)));
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object_id);
+        rb.push_ipc_interface(Arc::new(result));
+    }
+
+    fn unknown4105_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) Unknown4105 called");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
     fn parse_storage_id(raw: u8) -> Option<StorageId> {
         match raw {
             0 => Some(StorageId::None),
@@ -664,12 +745,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn firmware_stubs_preserve_output_widths() {
+        let service = IApplicationManagerInterface::new(SystemRef::null());
+        for command in [936, 4023, 4053, 4105] {
+            let mut ctx = HLERequestContext::new();
+            service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.command_buffer()[6], 0);
+            if command == 936 || command == 4023 {
+                assert_eq!(&ctx.command_buffer()[8..10], &[0, 0]);
+            }
+            assert!(ctx.outgoing_copy_objects.is_empty());
+        }
+        assert!(service.handlers[&4042].handler_callback.is_some());
+    }
+
+    #[test]
     fn resume_all_command_returns_upstream_success() {
         let service = IApplicationManagerInterface::new(SystemRef::null());
         let mut ctx = HLERequestContext::new();
         service.handlers[&70].handler_callback.unwrap()(&service, &mut ctx);
         assert_eq!(ctx.command_buffer()[6], 0);
         assert!(ctx.outgoing_copy_objects.is_empty());
+    }
+
+    #[test]
+    fn control_data_background_request_signals_the_existing_event() {
+        let service = IApplicationManagerInterface::new(SystemRef::null());
+        assert!(!service.unknown_event.is_signaled());
+        let mut ctx = HLERequestContext::new();
+        ctx.command_buffer_mut()[2..6].copy_from_slice(&[1, 0, 0x9abc_def0, 0x1234_5678]);
+        service.handlers[&419].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], 0);
+        assert!(service.unknown_event.is_signaled());
+        for command in [407, 408] {
+            let mut ctx = HLERequestContext::new();
+            service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+            // Null test context cannot export the completion event, matching
+            // a direct call to the read-only interface, not a fake success.
+            assert_eq!(ctx.command_buffer()[6], RESULT_UNKNOWN.0);
+        }
     }
 
     #[test]
@@ -718,9 +832,11 @@ mod tests {
             readable.lock().unwrap().initialize(1, object_id);
             process.lock().unwrap().register_readable_event_object(object_id, readable.clone());
             event.attach_kernel_event(readable.clone(), process.clone());
-            for _ in 0..2 {
+            for iteration in 0..2 {
                 let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
-                service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+                // 4088 aliases 4022 and must return the very same native event.
+                let dispatch = if command == 4022 && iteration == 1 { 4088 } else { command };
+                service.handlers[&dispatch].handler_callback.unwrap()(&service, &mut ctx);
                 assert!(matches!(ctx.outgoing_copy_objects.as_slice(),
                     [KAutoObjectRef::ObjectId(id)] if *id == object_id));
                 assert_eq!(readable.lock().unwrap().is_signaled(), expected_signal);

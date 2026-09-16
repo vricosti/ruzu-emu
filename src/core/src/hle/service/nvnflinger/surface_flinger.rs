@@ -333,6 +333,13 @@ impl SurfaceFlinger {
         }
     }
 
+    pub fn set_layer_stack_mask(&self, consumer_binder_id: i32, layer_stack_mask: u32) {
+        if let Some(layer) = self.find_layer(consumer_binder_id) {
+            layer.lock().unwrap().layer_stack_mask = layer_stack_mask;
+            log::debug!("Layer {} stack mask set to {:#x}", consumer_binder_id, layer_stack_mask);
+        }
+    }
+
     pub fn set_layer_is_overlay(&self, consumer_binder_id: i32, is_overlay: bool) {
         if let Some(layer) = self.find_layer(consumer_binder_id) {
             layer.lock().unwrap().is_overlay = is_overlay;

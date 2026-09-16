@@ -470,7 +470,7 @@ pub fn emit_vaddr_lookup_a64(
         .mov(page, qword_ptr(RegExp::from(rxbyak::R14) + tmp))
         .unwrap();
 
-    emit_page_entry_attribute_check(ra.asm, mem_conf, abort, page, tmp);
+    emit_page_entry_attribute_check(ra.asm, mem_conf, abort, page, tmp, false);
 
     if mem_conf.absolute_offset_page_table {
         return RegExp::from(page) + vaddr;
@@ -490,6 +490,7 @@ fn emit_page_entry_attribute_check(
     abort: Label,
     page: Reg,
     tmp: Reg,
+    is_a32: bool,
 ) {
     // check for marked bit, use as unmapped if marked
     if let Some(marked_bit) = mem_conf.page_table_marked_bit {
@@ -508,8 +509,11 @@ fn emit_page_entry_attribute_check(
         asm.and_(page, tmp).unwrap();
     }
     if let Some(sign_extension) = mem_conf.page_table_sign_extension {
-        asm.shl(page, sign_extension).unwrap();
-        asm.sar(page, sign_extension).unwrap();
+        // Eden's A32 specialization interprets this as the sign-bit index;
+        // its A64 specialization still takes a shift count.
+        let shift = if is_a32 { 63 - sign_extension } else { sign_extension };
+        asm.shl(page, shift).unwrap();
+        asm.sar(page, shift).unwrap();
     }
 
     asm.je(&abort, rxbyak::JmpType::Near).unwrap();
@@ -537,14 +541,15 @@ pub fn emit_vaddr_lookup_a32(
 
     ra.asm.mov(tmp, vaddr).unwrap();
     ra.asm.shr(tmp, PAGE_BITS as u8).unwrap();
-    ra.asm
-        .shl(tmp, mem_conf.page_table_log2_stride as u8)
-        .unwrap();
-    ra.asm
-        .mov(page, qword_ptr(RegExp::from(rxbyak::R14) + tmp))
-        .unwrap();
+    if mem_conf.page_table_log2_stride > 3 {
+        ra.asm.shl(tmp, mem_conf.page_table_log2_stride as u8).unwrap();
+        ra.asm.mov(page, qword_ptr(RegExp::from(rxbyak::R14) + tmp)).unwrap();
+    } else {
+        ra.asm.mov(page, qword_ptr(RegExp::from(rxbyak::R14)
+            + tmp * (1u8 << mem_conf.page_table_log2_stride))).unwrap();
+    }
 
-    emit_page_entry_attribute_check(ra.asm, mem_conf, abort, page, tmp);
+    emit_page_entry_attribute_check(ra.asm, mem_conf, abort, page, tmp, true);
 
     if mem_conf.absolute_offset_page_table {
         return RegExp::from(page) + vaddr;
@@ -564,10 +569,34 @@ mod tests {
     use super::*;
     use rxbyak::{R13, RAX, RCX};
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a32_page_entry_sign_extension_uses_bit_index() {
+        for (entry, expected) in [
+            (0x0000_1234_5678_9000u64, 0x0000_1234_5678_9000u64),
+            (0x0200_0000_0000_1000, 0xfe00_0000_0000_1000),
+            (0, 0),
+        ] {
+            let mut asm = CodeAssembler::new(4096).unwrap();
+            let abort = asm.create_label();
+            asm.mov(RAX, entry as i64).unwrap();
+            let config = MemoryEmitConfig {
+                page_table_sign_extension: Some(57),
+                ..MemoryEmitConfig::default()
+            };
+            emit_page_entry_attribute_check(&mut asm, &config, abort, RAX, RCX, true);
+            asm.bind(&abort).unwrap();
+            asm.ret().unwrap();
+            asm.ready().unwrap();
+            let evaluate: unsafe extern "C" fn() -> u64 = unsafe { asm.as_fn() };
+            assert_eq!(unsafe { evaluate() }, expected);
+        }
+    }
+
     fn page_entry_check_bytes(mem_conf: &MemoryEmitConfig) -> Vec<u8> {
         let mut asm = CodeAssembler::new(4096).unwrap();
         let abort = asm.create_label();
-        emit_page_entry_attribute_check(&mut asm, mem_conf, abort, RAX, RCX);
+        emit_page_entry_attribute_check(&mut asm, mem_conf, abort, RAX, RCX, false);
         asm.bind(&abort).unwrap();
         asm.code().to_vec()
     }

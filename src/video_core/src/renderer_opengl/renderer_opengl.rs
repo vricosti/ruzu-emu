@@ -134,6 +134,8 @@ pub struct RendererOpenGL {
     capture_renderbuffer: OGLRenderbuffer,
     capture_framebuffer: OGLFramebuffer,
     screenshot_framebuffer: OGLFramebuffer,
+    applet_capture_layers: Vec<FramebufferConfig>,
+    screenshot_layer_scratch: Vec<FramebufferConfig>,
     rasterizer: Box<RasterizerOpenGL>,
     /// Concrete owner of the shared OpenGL program manager.
     ///
@@ -332,6 +334,8 @@ impl RendererOpenGL {
             capture_renderbuffer,
             capture_framebuffer,
             screenshot_framebuffer: OGLFramebuffer::new(),
+            applet_capture_layers: Vec::new(),
+            screenshot_layer_scratch: Vec::new(),
             rasterizer,
             program_manager,
             state_tracker,
@@ -403,6 +407,14 @@ impl RendererOpenGL {
     ///
     /// Port of `RendererOpenGL::RenderAppletCaptureLayer()`.
     fn render_applet_capture_layer(&mut self, framebuffers: &[FramebufferConfig]) {
+        let capture_layers = crate::framebuffer_config::filter_layer_stack(
+            framebuffers,
+            ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId::LastFrame,
+            &mut self.applet_capture_layers,
+        );
+        if capture_layers.is_empty() {
+            return;
+        }
         unsafe {
             let mut old_read_fb = 0;
             let mut old_draw_fb = 0;
@@ -417,7 +429,7 @@ impl RendererOpenGL {
             );
 
             self.blit_applet
-                .draw_screen(framebuffers, &capture::LAYOUT, true);
+                .draw_screen(capture_layers, &capture::LAYOUT, true);
 
             gl::BindFramebuffer(gl::READ_FRAMEBUFFER, old_read_fb as u32);
             gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, old_draw_fb as u32);
@@ -439,7 +451,15 @@ impl RendererOpenGL {
             .clone();
         let dst = self.base_data.settings.screenshot_bits;
 
-        self.render_to_buffer(framebuffers, &layout, dst);
+        // RenderToBuffer needs &mut self; retain scratch capacity across captures.
+        let mut scratch = std::mem::take(&mut self.screenshot_layer_scratch);
+        let screenshot_layers = crate::framebuffer_config::filter_layer_stack(
+            framebuffers,
+            self.base_data.settings.screenshot_layer_stack,
+            &mut scratch,
+        );
+        self.render_to_buffer(screenshot_layers, &layout, dst);
+        self.screenshot_layer_scratch = scratch;
 
         if let Some(callback) = self.base_data.settings.screenshot_complete_callback.take() {
             callback(true);
@@ -545,8 +565,9 @@ impl RendererBase for RendererOpenGL {
         data: *mut std::ffi::c_void,
         callback: Box<dyn FnOnce(bool) + Send>,
         layout: FramebufferLayout,
+        layer_stack: ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId,
     ) {
-        self.base_data.request_screenshot(data, callback, layout);
+        self.base_data.request_screenshot(data, callback, layout, layer_stack);
     }
 
     fn set_shader_cache_gpu_reader(&mut self, reader: crate::renderer_base::ShaderCacheGpuReader) {

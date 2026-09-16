@@ -27,6 +27,28 @@ impl Default for LayerBlending {
     }
 }
 
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerStackId {
+    Default = 0,
+    Lcd = 1,
+    Screenshot = 2,
+    Recording = 3,
+    LastFrame = 4,
+    Arbitrary = 5,
+    ApplicationForDebug = 6,
+    Null = 10,
+}
+
+pub const fn layer_stack_bit(id: LayerStackId) -> u32 {
+    1u32 << id as u32
+}
+
+pub const DEFAULT_LAYER_STACK_MASK: u32 = layer_stack_bit(LayerStackId::Default)
+    | layer_stack_bit(LayerStackId::Screenshot)
+    | layer_stack_bit(LayerStackId::Recording)
+    | layer_stack_bit(LayerStackId::LastFrame);
+
 pub struct HwcLayer {
     pub buffer_handle: u32,
     pub offset: u32,
@@ -39,4 +61,27 @@ pub struct HwcLayer {
     pub transform: BufferTransformFlags,
     pub crop_rect: Rectangle<i32>,
     pub acquire_fence: Fence,
+    pub layer_stack_mask: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stack_ids_and_default_mask_match_upstream() {
+        for (id, bit) in [
+            (LayerStackId::Default, 0x1),
+            (LayerStackId::Lcd, 0x2),
+            (LayerStackId::Screenshot, 0x4),
+            (LayerStackId::Recording, 0x8),
+            (LayerStackId::LastFrame, 0x10),
+            (LayerStackId::Arbitrary, 0x20),
+            (LayerStackId::ApplicationForDebug, 0x40),
+            (LayerStackId::Null, 0x400),
+        ] {
+            assert_eq!(layer_stack_bit(id), bit);
+        }
+        assert_eq!(DEFAULT_LAYER_STACK_MASK, 0x1d);
+    }
 }

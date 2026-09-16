@@ -9,6 +9,7 @@
 pub mod account_proxy_interface;
 pub mod application_manager_interface;
 pub mod application_version_interface;
+pub mod async_result;
 pub mod content_management_interface;
 pub mod develop_interface;
 pub mod document_interface;

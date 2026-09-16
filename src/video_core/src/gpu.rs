@@ -1105,6 +1105,7 @@ impl GpuCoreInterface for Gpu {
                 pixel_format: layer.pixel_format,
                 transform_flags: layer.transform_flags,
                 crop_rect: layer.crop_rect,
+                layer_stack_mask: layer.layer_stack_mask,
                 blending: match layer.blending {
                     CoreBlendMode::Opaque => crate::framebuffer_config::BlendMode::Opaque,
                     CoreBlendMode::Premultiplied => {

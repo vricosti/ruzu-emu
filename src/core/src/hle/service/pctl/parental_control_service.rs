@@ -18,26 +18,75 @@ mod suspension_event_tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn suspension_event_returns_stable_unsignaled_handle() {
+    fn play_timer_settings_preserve_modern_payload_and_legacy_zero_reply() {
+        assert_eq!(std::mem::size_of::<PlayTimerSettingsOld>(), 0x34);
+        assert_eq!(std::mem::size_of::<PlayTimerSettings>(), 0x44);
+        assert_eq!(std::mem::align_of::<PlayTimerSettings>(), 4);
+        let service = IParentalControlService::new(crate::core::SystemRef::null(), Capability::SYSTEM);
+        assert_eq!(service.get_play_timer_settings().unwrap().settings, [0; 17]);
+        let mut ctx = HLERequestContext::new();
+        let words: [u32; 17] = std::array::from_fn(|i| 0x8000_0000 | i as u32);
+        ctx.command_buffer_mut()[2..19].copy_from_slice(&words);
+        service.handlers[&195101].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], 0);
+        for (command, count) in [(145601, 17), (1456, 13)] {
+            let mut ctx = HLERequestContext::new();
+            ctx.command_buffer_mut().fill(0xcccc_cccc);
+            service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.command_buffer()[6], 0);
+            let expected = if command == 145601 { words.to_vec() } else { vec![0; 13] };
+            assert_eq!(&ctx.command_buffer()[8..8 + count], expected.as_slice());
+        }
+        let other = IParentalControlService::new(crate::core::SystemRef::null(), Capability::SYSTEM);
+        assert_eq!(other.get_play_timer_settings().unwrap().settings, [0; 17]);
+    }
+
+    #[test]
+    fn parental_events_return_distinct_stable_unsignaled_objects() {
         let service =
             IParentalControlService::new(crate::core::SystemRef::null(), Capability::SYSTEM);
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
-        let readable = Arc::new(Mutex::new(KReadableEvent::new()));
-        readable.lock().unwrap().initialize(1, 2);
-        service
-            .request_suspension_event
-            .attach_kernel_event(readable.clone(), process.clone());
         let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
-        for _ in 0..2 {
-            let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
-            service.handlers[&1457].handler_callback.unwrap()(&service, &mut ctx);
-            assert!(matches!(
-                ctx.outgoing_copy_objects.as_slice(),
-                [KAutoObjectRef::ObjectId(2)]
-            ));
-            assert!(!readable.lock().unwrap().is_signaled());
+        for (command, event, id) in [
+            (1432, &service.synchronization_event, 2),
+            (1473, &service.unlinked_event, 4),
+            (1457, &service.request_suspension_event, 6),
+        ] {
+            let readable = Arc::new(Mutex::new(KReadableEvent::new()));
+            readable.lock().unwrap().initialize(id - 1, id);
+            event.attach_kernel_event(readable.clone(), process.clone());
+            for _ in 0..2 {
+                let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
+                service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+                assert!(matches!(
+                    ctx.outgoing_copy_objects.as_slice(),
+                    [KAutoObjectRef::ObjectId(actual)] if *actual == id
+                ));
+                assert!(!readable.lock().unwrap().is_signaled());
+                assert!(process.lock().unwrap().get_readable_event_by_object_id(id).is_some());
+            }
         }
+    }
+
+    #[test]
+    fn event_getters_do_not_report_success_without_a_kernel_context() {
+        let service = IParentalControlService::new(crate::core::SystemRef::null(), Capability::SYSTEM);
+        for command in [1432, 1473, 1457] {
+            let mut ctx = HLERequestContext::new();
+            service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+            assert_ne!(ctx.command_buffer()[6], 0);
+            assert!(ctx.outgoing_copy_objects.is_empty());
+        }
+    }
+
+    #[test]
+    fn remaining_time_returns_upstream_signed_maximum() {
+        let service = IParentalControlService::new(crate::core::SystemRef::null(), Capability::SYSTEM);
+        let mut ctx = HLERequestContext::new();
+        service.handlers[&1454].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], 0);
+        assert_eq!(ctx.command_buffer()[8], i32::MAX as u32);
     }
 
     #[test]
@@ -54,7 +103,7 @@ mod suspension_event_tests {
 
 use super::pctl_results::*;
 use super::pctl_types::{
-    ApplicationInfo, Capability, PlayTimerRemainingTimeDisplayInfo, PlayTimerSettings,
+    ApplicationInfo, Capability, PlayTimerRemainingTimeDisplayInfo, PlayTimerSettings, PlayTimerSettingsOld,
     RestrictionSettings,
 };
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
@@ -130,7 +179,9 @@ pub mod commands {
     pub const IS_PLAY_TIMER_ENABLED: u32 = 1453;
     pub const GET_PLAY_TIMER_REMAINING_TIME: u32 = 1454;
     pub const IS_RESTRICTED_BY_PLAY_TIMER: u32 = 1455;
-    pub const GET_PLAY_TIMER_SETTINGS: u32 = 1456;
+    pub const GET_PLAY_TIMER_SETTINGS_OLD: u32 = 1456;
+    pub const GET_PLAY_TIMER_SETTINGS: u32 = 145601;
+    pub const SET_PLAY_TIMER_SETTINGS: u32 = 195101;
     pub const GET_PLAY_TIMER_EVENT_TO_REQUEST_SUSPENSION: u32 = 1457;
     pub const IS_PLAY_TIMER_ALARM_DISABLED: u32 = 1458;
     pub const GET_PLAY_TIMER_REMAINING_TIME_DISPLAY_INFO: u32 = 1459;
@@ -205,13 +256,44 @@ pub struct IParentalControlService {
     settings: ParentalControlSettings,
     restriction_settings: RestrictionSettings,
     pin_code: [u8; 8],
+    synchronization_event: Event,
+    unlinked_event: Event,
     request_suspension_event: Event,
+    raw_play_timer_settings: std::sync::Mutex<PlayTimerSettings>,
     capability: Capability,
     handlers: BTreeMap<u32, FunctionInfo>,
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
 }
 
 impl IParentalControlService {
+    fn get_synchronization_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let Some(id) = service.synchronization_event.copy_object_id(ctx) else {
+            ResponseBuilder::new(ctx, 2, 0, 0).push_result(crate::hle::result::RESULT_UNKNOWN);
+            return;
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(id);
+    }
+
+    fn get_unlinked_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let Some(id) = service.unlinked_event.copy_object_id(ctx) else {
+            ResponseBuilder::new(ctx, 2, 0, 0).push_result(crate::hle::result::RESULT_UNKNOWN);
+            return;
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(id);
+    }
+
+    fn get_play_timer_remaining_time_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(i32::MAX as u32);
+    }
+
     fn get_play_timer_event_to_request_suspension_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
@@ -523,7 +605,7 @@ impl IParentalControlService {
             ),
             (
                 commands::GET_SYNCHRONIZATION_EVENT,
-                Some(Self::stub_handler),
+                Some(Self::get_synchronization_event_handler),
                 "GetSynchronizationEvent",
             ),
             (
@@ -543,7 +625,7 @@ impl IParentalControlService {
             ),
             (
                 commands::GET_PLAY_TIMER_REMAINING_TIME,
-                Some(Self::stub_handler),
+                Some(Self::get_play_timer_remaining_time_handler),
                 "GetPlayTimerRemainingTime",
             ),
             (
@@ -552,9 +634,9 @@ impl IParentalControlService {
                 "IsRestrictedByPlayTimer",
             ),
             (
-                commands::GET_PLAY_TIMER_SETTINGS,
-                Some(Self::get_play_timer_settings_handler),
-                "GetPlayTimerSettings",
+                commands::GET_PLAY_TIMER_SETTINGS_OLD,
+                Some(Self::get_play_timer_settings_old_handler),
+                "GetPlayTimerSettingsOld",
             ),
             (
                 commands::GET_PLAY_TIMER_EVENT_TO_REQUEST_SUSPENSION,
@@ -588,7 +670,7 @@ impl IParentalControlService {
             ),
             (
                 commands::GET_UNLINKED_EVENT,
-                Some(Self::stub_handler),
+                Some(Self::get_unlinked_event_handler),
                 "GetUnlinkedEvent",
             ),
             (
@@ -751,6 +833,8 @@ impl IParentalControlService {
                 Some(Self::stub_handler),
                 "RequestUpdateExemptionListAsync",
             ),
+            (commands::GET_PLAY_TIMER_SETTINGS, Some(Self::get_play_timer_settings_handler), "GetPlayTimerSettings"),
+            (commands::SET_PLAY_TIMER_SETTINGS, Some(Self::set_play_timer_settings_handler), "SetPlayTimerSettingsForDebug"),
         ]);
         Self {
             system,
@@ -758,7 +842,10 @@ impl IParentalControlService {
             settings: ParentalControlSettings::default(),
             restriction_settings: RestrictionSettings::default(),
             pin_code: [0u8; 8],
+            synchronization_event: Event::new(),
+            unlinked_event: Event::new(),
             request_suspension_event: Event::new(),
+            raw_play_timer_settings: std::sync::Mutex::new(PlayTimerSettings::default()),
             capability,
             handlers,
             handlers_tipc: BTreeMap::new(),
@@ -1124,12 +1211,21 @@ impl IParentalControlService {
         Ok(false)
     }
 
-    /// GetPlayTimerSettings (cmd 1456).
-    ///
-    /// Corresponds to upstream `IParentalControlService::GetPlayTimerSettings`.
+    /// GetPlayTimerSettingsOld (1456) remains zero-filled independently of the new state.
+    pub fn get_play_timer_settings_old(&self) -> Result<PlayTimerSettingsOld, ResultCode> {
+        Ok(PlayTimerSettingsOld::default())
+    }
+
+    /// GetPlayTimerSettings (145601), matching upstream's stored raw settings.
     pub fn get_play_timer_settings(&self) -> Result<PlayTimerSettings, ResultCode> {
         log::warn!("(STUBBED) GetPlayTimerSettings called");
-        Ok(PlayTimerSettings::default())
+        Ok(*self.raw_play_timer_settings.lock().unwrap())
+    }
+
+    pub fn set_play_timer_settings(&self, settings: PlayTimerSettings) -> ResultCode {
+        log::warn!("(STUBBED) SetPlayTimerSettings called");
+        *self.raw_play_timer_settings.lock().unwrap() = settings;
+        RESULT_SUCCESS
     }
 
     /// IsPlayTimerAlarmDisabled (cmd 1458).
@@ -1422,13 +1518,29 @@ impl IParentalControlService {
         rb.push_bool(false);
     }
 
-    fn get_play_timer_settings_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        log::warn!("(STUBBED) IParentalControlService::GetPlayTimerSettings called");
-        let settings = PlayTimerSettings::default();
-        // PlayTimerSettings is 0x34 bytes = 13 u32 words. Response: 2 (header) + 13 (data) = 15.
+    fn get_play_timer_settings_old_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let settings = service.get_play_timer_settings_old().unwrap();
         let mut rb = ResponseBuilder::new(ctx, 15, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_raw(&settings);
+        for word in settings.settings { rb.push_u32(word); }
+    }
+
+    fn get_play_timer_settings_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let settings = service.get_play_timer_settings().unwrap();
+        let mut rb = ResponseBuilder::new(ctx, 19, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        for word in settings.settings { rb.push_u32(word); }
+    }
+
+    fn set_play_timer_settings_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let mut rp = RequestParser::new(ctx);
+        let mut settings = PlayTimerSettings::default();
+        for word in &mut settings.settings { *word = rp.pop_u32(); }
+        let result = service.set_play_timer_settings(settings);
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(result);
     }
 
     fn is_play_timer_alarm_disabled_handler(

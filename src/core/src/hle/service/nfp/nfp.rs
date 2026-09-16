@@ -19,6 +19,174 @@ use crate::hle::service::hle_ipc::{
 use crate::hle::service::ipc_helpers::ResponseBuilder;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
+/// IPC command table for Interface (IUser / ISystem / IDebug).
+///
+/// Corresponds to the function table in upstream nfp.cpp constructors.
+pub mod interface_commands {
+    pub const INITIALIZE: u32 = 0;
+    pub const FINALIZE: u32 = 1;
+    pub const LIST_DEVICES: u32 = 2;
+    pub const START_DETECTION: u32 = 3;
+    pub const STOP_DETECTION: u32 = 4;
+    pub const MOUNT: u32 = 5;
+    pub const UNMOUNT: u32 = 6;
+    pub const OPEN_APPLICATION_AREA: u32 = 7;
+    pub const GET_APPLICATION_AREA: u32 = 8;
+    pub const SET_APPLICATION_AREA: u32 = 9;
+    pub const FLUSH: u32 = 10;
+    pub const RESTORE: u32 = 11;
+    pub const CREATE_APPLICATION_AREA: u32 = 12;
+    pub const GET_TAG_INFO: u32 = 13;
+    pub const GET_REGISTER_INFO: u32 = 14;
+    pub const GET_COMMON_INFO: u32 = 15;
+    pub const GET_MODEL_INFO: u32 = 16;
+    pub const ATTACH_ACTIVATE_EVENT: u32 = 17;
+    pub const ATTACH_DEACTIVATE_EVENT: u32 = 18;
+    pub const GET_STATE: u32 = 19;
+    pub const GET_DEVICE_STATE: u32 = 20;
+    pub const GET_NFC_NPAD_ID: u32 = 21;
+    pub const GET_APPLICATION_AREA_SIZE: u32 = 22;
+    pub const ATTACH_AVAILABILITY_CHANGE_EVENT: u32 = 23;
+    pub const RECREATE_APPLICATION_AREA: u32 = 24;
+    pub const START_DETECTION_WITH_FILTER: u32 = 25;
+    // System/Debug commands
+    pub const FORMAT: u32 = 100;
+    pub const GET_ADMIN_INFO: u32 = 101;
+    pub const GET_REGISTER_INFO_PRIVATE: u32 = 102;
+    pub const SET_REGISTER_INFO_PRIVATE: u32 = 103;
+    pub const DELETE_REGISTER_INFO: u32 = 104;
+    pub const DELETE_APPLICATION_AREA: u32 = 105;
+    pub const EXISTS_APPLICATION_AREA: u32 = 106;
+    // Debug commands
+    pub const GET_ALL: u32 = 200;
+    pub const SET_ALL: u32 = 201;
+    pub const FLUSH_DEBUG: u32 = 202;
+    pub const BREAK_TAG: u32 = 203;
+    pub const READ_BACKUP_DATA: u32 = 204;
+    pub const WRITE_BACKUP_DATA: u32 = 205;
+    pub const WRITE_NTF: u32 = 206;
+    // InitializeSystem/Debug/Finalize commands
+    pub const INITIALIZE_SYSTEM: u32 = 400;
+    pub const FINALIZE_SYSTEM: u32 = 401;
+    pub const INITIALIZE_DEBUG: u32 = 500;
+    pub const FINALIZE_DEBUG: u32 = 501;
+}
+
+// Rust shares the inherited Interface handlers. Keep registration in nfp.rs,
+// the owner of the upstream IUser/ISystem/IDebug constructor tables.
+impl super::nfp_interface::Interface {
+    pub(super) fn make_handlers() -> BTreeMap<u32, FunctionInfo> {
+        build_handler_map(&[
+            (
+                interface_commands::INITIALIZE,
+                Some(Self::initialize_handler),
+                "Initialize",
+            ),
+            (interface_commands::FINALIZE, Some(Self::finalize_handler), "Finalize"),
+            (
+                interface_commands::LIST_DEVICES,
+                Some(Self::list_devices_handler),
+                "ListDevices",
+            ),
+            (
+                interface_commands::START_DETECTION,
+                Some(Self::start_detection_handler),
+                "StartDetection",
+            ),
+            (
+                interface_commands::STOP_DETECTION,
+                Some(Self::stop_detection_handler),
+                "StopDetection",
+            ),
+            (interface_commands::MOUNT, Some(Self::mount_handler), "Mount"),
+            (interface_commands::UNMOUNT, Some(Self::unmount_handler), "Unmount"),
+            (
+                interface_commands::OPEN_APPLICATION_AREA,
+                Some(Self::open_application_area_handler),
+                "OpenApplicationArea",
+            ),
+            (
+                interface_commands::GET_APPLICATION_AREA,
+                Some(Self::get_application_area_handler),
+                "GetApplicationArea",
+            ),
+            (
+                interface_commands::SET_APPLICATION_AREA,
+                Some(Self::set_application_area_handler),
+                "SetApplicationArea",
+            ),
+            (interface_commands::FLUSH, Some(Self::flush_handler), "Flush"),
+            (interface_commands::RESTORE, Some(Self::restore_handler), "Restore"),
+            (
+                interface_commands::CREATE_APPLICATION_AREA,
+                Some(Self::create_application_area_handler),
+                "CreateApplicationArea",
+            ),
+            (
+                interface_commands::GET_TAG_INFO,
+                Some(Self::get_tag_info_handler),
+                "GetTagInfo",
+            ),
+            (
+                interface_commands::GET_REGISTER_INFO,
+                Some(Self::get_register_info_handler),
+                "GetRegisterInfo",
+            ),
+            (
+                interface_commands::GET_COMMON_INFO,
+                Some(Self::get_common_info_handler),
+                "GetCommonInfo",
+            ),
+            (
+                interface_commands::GET_MODEL_INFO,
+                Some(Self::get_model_info_handler),
+                "GetModelInfo",
+            ),
+            (
+                interface_commands::ATTACH_ACTIVATE_EVENT,
+                Some(Self::attach_activate_event_handler),
+                "AttachActivateEvent",
+            ),
+            (
+                interface_commands::ATTACH_DEACTIVATE_EVENT,
+                Some(Self::attach_deactivate_event_handler),
+                "AttachDeactivateEvent",
+            ),
+            (
+                interface_commands::GET_STATE,
+                Some(Self::get_state_handler),
+                "GetState",
+            ),
+            (
+                interface_commands::GET_DEVICE_STATE,
+                Some(Self::get_device_state_handler),
+                "GetDeviceState",
+            ),
+            (
+                interface_commands::GET_NFC_NPAD_ID,
+                Some(Self::get_npad_id_handler),
+                "GetNpadId",
+            ),
+            (
+                interface_commands::GET_APPLICATION_AREA_SIZE,
+                Some(Self::get_application_area_size_handler),
+                "GetApplicationAreaSize",
+            ),
+            (
+                interface_commands::ATTACH_AVAILABILITY_CHANGE_EVENT,
+                Some(Self::attach_availability_change_event_handler),
+                "AttachAvailabilityChangeEvent",
+            ),
+            (
+                interface_commands::RECREATE_APPLICATION_AREA,
+                Some(Self::recreate_application_area_handler),
+                "RecreateApplicationArea",
+            ),
+            (interface_commands::START_DETECTION_WITH_FILTER, Some(Self::start_detection_handler), "StartDetectionWithFilter"),
+        ])
+    }
+}
+
 /// IPC command table for IUserManager.
 pub mod user_manager_commands {
     pub const CREATE_USER_INTERFACE: u32 = 0;
@@ -63,6 +231,7 @@ pub mod iuser_commands {
     pub const GET_APPLICATION_AREA_SIZE: u32 = 22;
     pub const ATTACH_AVAILABILITY_CHANGE_EVENT: u32 = 23;
     pub const RECREATE_APPLICATION_AREA: u32 = 24;
+    pub const START_DETECTION_WITH_FILTER: u32 = 25;
 }
 
 /// IPC command table for ISystem (from nfp.cpp).
@@ -89,6 +258,7 @@ pub mod isystem_commands {
     pub const GET_DEVICE_STATE: u32 = 20;
     pub const GET_NPAD_ID: u32 = 21;
     pub const ATTACH_AVAILABILITY_CHANGE_EVENT: u32 = 23;
+    pub const START_DETECTION_WITH_FILTER: u32 = 25;
     pub const FORMAT: u32 = 100;
     pub const GET_ADMIN_INFO: u32 = 101;
     pub const GET_REGISTER_INFO_PRIVATE: u32 = 102;
@@ -127,6 +297,7 @@ pub mod idebug_commands {
     pub const GET_APPLICATION_AREA_SIZE: u32 = 22;
     pub const ATTACH_AVAILABILITY_CHANGE_EVENT: u32 = 23;
     pub const RECREATE_APPLICATION_AREA: u32 = 24;
+    pub const START_DETECTION_WITH_FILTER: u32 = 25;
     pub const FORMAT: u32 = 100;
     pub const GET_ADMIN_INFO: u32 = 101;
     pub const GET_REGISTER_INFO_PRIVATE: u32 = 102;
@@ -375,6 +546,21 @@ pub fn loop_process(system: crate::core::SystemRef) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filtered_detection_uses_the_existing_detection_handler_on_all_interfaces() {
+        let system = crate::core::SystemRef::null();
+        for interface in [
+            IUserManager::new(system).create_user_interface(),
+            ISystemManager::new(system).create_system_interface(),
+            IDebugManager::new(system).create_debug_interface(),
+        ] {
+            let original = interface.handlers()[&3].handler_callback.unwrap();
+            let filtered = &interface.handlers()[&25];
+            assert_eq!(filtered.name, "StartDetectionWithFilter");
+            assert!(std::ptr::fn_addr_eq(original, filtered.handler_callback.unwrap()));
+        }
+    }
 
     #[test]
     fn manager_handler_tables_match_upstream() {

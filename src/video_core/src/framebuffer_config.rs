@@ -6,6 +6,9 @@
 use common::math_util::Rectangle;
 use ruzu_core::hle::service::nvnflinger::buffer_transform_flags::BufferTransformFlags;
 use ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat;
+use ruzu_core::hle::service::nvnflinger::hwc_layer::{
+    layer_stack_bit, LayerStackId, DEFAULT_LAYER_STACK_MASK,
+};
 
 /// Represents a pointer in the device-specific virtual address space.
 pub type DAddr = u64;
@@ -19,7 +22,7 @@ pub enum BlendMode {
 }
 
 /// Port of `Tegra::FramebufferConfig`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FramebufferConfig {
     pub address: DAddr,
     pub offset: u32,
@@ -30,6 +33,44 @@ pub struct FramebufferConfig {
     pub transform_flags: BufferTransformFlags,
     pub crop_rect: Rectangle<i32>,
     pub blending: BlendMode,
+    pub layer_stack_mask: u32,
+}
+
+impl Default for FramebufferConfig {
+    fn default() -> Self {
+        Self {
+            address: 0,
+            offset: 0,
+            width: 0,
+            height: 0,
+            stride: 0,
+            pixel_format: PixelFormat::default(),
+            transform_flags: BufferTransformFlags::default(),
+            crop_rect: Rectangle::default(),
+            blending: BlendMode::default(),
+            layer_stack_mask: DEFAULT_LAYER_STACK_MASK,
+        }
+    }
+}
+
+/// Port of Tegra::FilterLayerStack. The all-matching path borrows the input
+/// without touching scratch; otherwise the returned slice borrows scratch.
+pub fn filter_layer_stack<'a>(
+    layers: &'a [FramebufferConfig],
+    stack: LayerStackId,
+    scratch: &'a mut Vec<FramebufferConfig>,
+) -> &'a [FramebufferConfig] {
+    let bit = layer_stack_bit(stack);
+    if layers.iter().all(|layer| layer.layer_stack_mask & bit != 0) {
+        return layers;
+    }
+    scratch.clear();
+    for layer in layers {
+        if layer.layer_stack_mask & bit != 0 {
+            scratch.push(layer.clone());
+        }
+    }
+    scratch
 }
 
 /// Port of `Tegra::NormalizeCrop`.
@@ -86,6 +127,26 @@ pub fn normalize_crop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stack_filter_preserves_order_and_borrows_when_all_match() {
+        let layers = vec![
+            FramebufferConfig { address: 1, ..Default::default() },
+            FramebufferConfig { address: 2, layer_stack_mask: 1, ..Default::default() },
+            FramebufferConfig { address: 3, ..Default::default() },
+        ];
+        let mut scratch = vec![FramebufferConfig::default()];
+        assert_eq!(FramebufferConfig::default().layer_stack_mask, 0x1d);
+        let all = filter_layer_stack(&layers, LayerStackId::Default, &mut scratch);
+        assert_eq!(all.as_ptr(), layers.as_ptr());
+        assert_eq!(scratch.len(), 1);
+        let filtered = filter_layer_stack(&layers, LayerStackId::LastFrame, &mut scratch);
+        assert_eq!(filtered.iter().map(|layer| layer.address).collect::<Vec<_>>(), [1, 3]);
+        assert!(filter_layer_stack(&layers, LayerStackId::Null, &mut scratch).is_empty());
+        scratch.push(FramebufferConfig::default());
+        assert!(filter_layer_stack(&[], LayerStackId::Default, &mut scratch).is_empty());
+        assert_eq!(scratch.len(), 1);
+    }
 
     #[test]
     fn zero_width_crop_uses_framebuffer_dimensions() {

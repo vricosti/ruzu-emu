@@ -894,13 +894,34 @@ impl IApplicationFunctions {
     }
 
     /// GetPseudoDeviceId (cmd 50): returns a pseudo device ID (UUID).
-    fn get_pseudo_device_id_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn get_pseudo_device_id(&self) -> Result<common::uuid::UUID, ResultCode> {
         log::warn!("(STUBBED) GetPseudoDeviceId called");
-        let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
-        rb.push_result(RESULT_SUCCESS);
-        // Push 128-bit UUID (all zeros for stub)
-        rb.push_u64(0);
-        rb.push_u64(0);
+        let program_id = self.applet.lock().unwrap().program_id;
+        let (metadata, _) =
+            PatchManager::get_metadata_from_base_or_update(self.system.get(), program_id);
+        let metadata = metadata.ok_or(crate::hle::result::RESULT_UNKNOWN)?;
+        // NACP::raw is private in Rust. Read the same little-endian seed bytes
+        // through its existing wire-format accessor, without a second owner.
+        let raw = metadata.get_raw_bytes();
+        let offset = std::mem::offset_of!(crate::file_sys::control_metadata::RawNACP, seed_for_pseudo_device_id);
+        let digest = openssl::sha::sha1(&raw[offset..offset + 8]);
+        Ok(common::uuid::UUID::make_rfc4122_v5(digest[..16].try_into().unwrap()))
+    }
+
+    fn get_pseudo_device_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        match service.get_pseudo_device_id() {
+            Ok(uuid) => {
+                let mut rb = ResponseBuilder::new(ctx, 6, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                rb.push_u64(u64::from_le_bytes(uuid.uuid[..8].try_into().unwrap()));
+                rb.push_u64(u64::from_le_bytes(uuid.uuid[8..].try_into().unwrap()));
+            }
+            Err(result) => {
+                let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+                rb.push_result(result);
+            }
+        }
     }
 
     /// InitializeGamePlayRecording (cmd 66)
@@ -1094,6 +1115,15 @@ mod tests {
             system,
             Arc::new(Mutex::new(Applet::new(system, Process::new(), false))),
         )
+    }
+
+    #[test]
+    fn pseudo_device_id_without_metadata_returns_unknown() {
+        let system = crate::core::System::new();
+        let system_ref = crate::core::SystemRef::from_ref(&system);
+        let applet = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
+        let service = IApplicationFunctions::new(system_ref, applet);
+        assert_eq!(service.get_pseudo_device_id(), Err(crate::hle::result::RESULT_UNKNOWN));
     }
 
     #[test]

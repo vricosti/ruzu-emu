@@ -295,6 +295,17 @@ impl Container {
         Ok(z_index)
     }
 
+    pub fn set_layer_stack_mask(&self, layer_id: u64, layer_stack_mask: u32) -> Result<(), ResultCode> {
+        let inner = self.inner.lock().unwrap();
+        let layer = inner
+            .layers
+            .get_layer_by_id(layer_id)
+            .ok_or(vi_results::RESULT_NOT_FOUND)?;
+        self.surface_flinger
+            .set_layer_stack_mask(layer.get_consumer_binder_id(), layer_stack_mask);
+        Ok(())
+    }
+
     pub fn set_layer_is_overlay(&self, layer_id: u64, is_overlay: bool) -> Result<(), ResultCode> {
         let inner = self.inner.lock().unwrap();
         let layer = inner

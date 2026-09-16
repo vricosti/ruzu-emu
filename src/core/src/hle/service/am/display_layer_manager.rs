@@ -30,6 +30,7 @@ pub struct DisplayLayerManager {
     system_shared_buffer_id: u64,
     system_shared_layer_id: u64,
     applet_id: AppletId,
+    library_applet_mode: LibraryAppletMode,
     buffer_sharing_enabled: bool,
     blending_enabled: bool,
     visible: bool,
@@ -52,6 +53,7 @@ impl DisplayLayerManager {
             system_shared_buffer_id: 0,
             system_shared_layer_id: 0,
             applet_id: AppletId::default(),
+            library_applet_mode: LibraryAppletMode::AllForeground,
             buffer_sharing_enabled: false,
             blending_enabled: false,
             visible: true,
@@ -94,6 +96,7 @@ impl DisplayLayerManager {
         self.system_shared_buffer_id = 0;
         self.system_shared_layer_id = 0;
         self.applet_id = applet_id;
+        self.library_applet_mode = mode;
         self.buffer_sharing_enabled = false;
         self.blending_enabled = mode == LibraryAppletMode::PartialForeground
             || mode == LibraryAppletMode::PartialForegroundIndirectDisplay;
@@ -137,7 +140,10 @@ impl DisplayLayerManager {
             display_id,
             process.lock().unwrap().get_process_id(),
         )?;
-        manager_display_service.set_layer_visibility(self.visible, layer_id)?;
+        let _ = manager_display_service.set_layer_visibility(self.visible, layer_id);
+        let _ = display_service
+            .get_container()
+            .set_layer_stack_mask(layer_id, self.get_layer_stack_mask());
 
         if self.applet_id != AppletId::Application {
             let _ = manager_display_service.set_layer_blending(self.blending_enabled, layer_id);
@@ -218,6 +224,27 @@ impl DisplayLayerManager {
         Ok((self.system_shared_buffer_id, self.system_shared_layer_id))
     }
 
+    fn get_layer_stack_mask(&self) -> u32 {
+        use crate::hle::service::nvnflinger::hwc_layer::{layer_stack_bit, LayerStackId};
+        const DISPLAYED: u32 = layer_stack_bit(LayerStackId::Default);
+        const SCREENSHOT: u32 = layer_stack_bit(LayerStackId::Screenshot);
+        const RECORDING: u32 = layer_stack_bit(LayerStackId::Recording);
+        const LAST_FRAME: u32 = layer_stack_bit(LayerStackId::LastFrame);
+        const DEBUG: u32 = layer_stack_bit(LayerStackId::ApplicationForDebug);
+
+        match self.applet_id {
+            AppletId::Application => return DISPLAYED | SCREENSHOT | RECORDING | LAST_FRAME | DEBUG,
+            AppletId::OverlayDisplay | AppletId::QLaunch => return DISPLAYED,
+            _ => {}
+        }
+        match self.library_applet_mode {
+            LibraryAppletMode::AllForeground | LibraryAppletMode::AllForegroundInitiallyHidden => {
+                DISPLAYED | SCREENSHOT | LAST_FRAME
+            }
+            _ => DISPLAYED | SCREENSHOT,
+        }
+    }
+
     pub fn set_window_visibility(&mut self, visible: bool) {
         if self.visible == visible {
             return;
@@ -275,5 +302,38 @@ impl DisplayLayerManager {
 impl Drop for DisplayLayerManager {
     fn drop(&mut self) {
         self.finalize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applet_masks_follow_identity_then_library_mode() {
+        let mut manager = DisplayLayerManager::new();
+        for mode in [
+            LibraryAppletMode::AllForeground,
+            LibraryAppletMode::AllForegroundInitiallyHidden,
+            LibraryAppletMode::PartialForeground,
+            LibraryAppletMode::PartialForegroundIndirectDisplay,
+            LibraryAppletMode::NoUi,
+        ] {
+            manager.library_applet_mode = mode;
+            for (id, expected) in [
+                (AppletId::Application, 0x5d),
+                (AppletId::OverlayDisplay, 0x01),
+                (AppletId::QLaunch, 0x01),
+            ] {
+                manager.applet_id = id;
+                assert_eq!(manager.get_layer_stack_mask(), expected);
+            }
+            manager.applet_id = AppletId::default();
+            let expected = match mode {
+                LibraryAppletMode::AllForeground | LibraryAppletMode::AllForegroundInitiallyHidden => 0x15,
+                _ => 0x05,
+            };
+            assert_eq!(manager.get_layer_stack_mask(), expected);
+        }
     }
 }

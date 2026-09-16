@@ -538,7 +538,7 @@ pub fn loop_process(system: crate::core::SystemRef) {
     // Construct after audout:u/audin:u, as upstream. The constructor waits for
     // set:sys: do not run it inside the SM-locked registration factory.
     let audio_controller: SessionRequestHandlerPtr =
-        std::sync::Arc::new(super::audio_controller::IAudioController::new(system));
+        super::audio_controller::IAudioController::new(system);
     {
         let mut server_manager = server_manager.lock().unwrap();
         server_manager.register_named_service(

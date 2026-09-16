@@ -37,6 +37,7 @@ impl ITransferTaskListController {
             (7, s, "Unknown7"),
             (8, s, "Unknown8"),
             (9, s, "GetNativeHandleHolder2"),
+            (21, Some(Self::get_transfer_task_progress_handler), "GetTransferTaskProgress"),
         ]);
         Self {
             handlers,
@@ -47,6 +48,13 @@ impl ITransferTaskListController {
     fn stub_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let cmd = ctx.get_command();
         log::warn!("(STUBBED) ITransferTaskListController command {}", cmd);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// Upstream deliberately returns success without a progress payload.
+    fn get_transfer_task_progress_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) GetTransferTaskProgress called");
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
     }
@@ -81,5 +89,21 @@ impl ServiceFramework for ITransferTaskListController {
 
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
         &self.handlers_tipc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_task_progress_returns_only_success() {
+        let service = ITransferTaskListController::new();
+        let mut ctx = HLERequestContext::new();
+        let function = &service.handlers()[&21];
+        assert_eq!(function.name, "GetTransferTaskProgress");
+        function.handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.command_buffer()[6], 0);
+        assert!(ctx.outgoing_copy_objects.is_empty());
     }
 }

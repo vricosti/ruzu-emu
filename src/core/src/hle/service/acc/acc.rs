@@ -790,8 +790,12 @@ impl IProfileCommon {
                 "GetImageSize",
             ),
             (11, Some(IProfileCommon::load_image_handler), "LoadImage"),
+            (20, Some(IProfileCommon::unknown20), "Unknown20"),
+            (21, Some(IProfileCommon::unknown21), "Unknown21"),
+            (30, Some(IProfileCommon::unknown30), "Unknown30"),
         ];
         if editor_commands {
+            entries.push((110, Some(IProfileCommon::unknown110), "Unknown110"));
             entries.push((100, Some(IProfileCommon::store_handler), "Store"));
             entries.push((
                 101,
@@ -816,6 +820,26 @@ impl IProfileCommon {
 
     fn as_self(this: &dyn ServiceFramework) -> &IProfileCommon {
         unsafe { &*(this as *const dyn ServiceFramework as *const IProfileCommon) }
+    }
+
+    fn unknown20(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("(STUBBED) IProfileCommon::Unknown20 called");
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn unknown21(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("(STUBBED) IProfileCommon::Unknown21 called");
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn unknown30(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("(STUBBED) IProfileCommon::Unknown30 called");
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn unknown110(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::debug!("(STUBBED) IProfileCommon::Unknown110 called");
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
     }
 
     fn trace_profile(
@@ -2505,6 +2529,27 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn profile_unknown_commands_match_upstream_editor_scope_and_reply() {
+        use super::*;
+        let manager = Arc::new(Mutex::new(ProfileManager::new()));
+        for editor in [false, true] {
+            let service = IProfileCommon::new(manager.clone(), 0, "profile-test", editor);
+            for command in [20, 21, 30, 110] {
+                if command == 110 && !editor {
+                    assert!(!service.handlers.contains_key(&command));
+                    continue;
+                }
+                let mut ctx = HLERequestContext::new();
+                service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+                let mut reference = HLERequestContext::new();
+                ResponseBuilder::new(&mut reference, 2, 0, 0).push_result(RESULT_SUCCESS);
+                assert_eq!(ctx.command_buffer(), reference.command_buffer());
+                assert!(ctx.outgoing_copy_objects.is_empty());
+                assert!(ctx.outgoing_move_objects.is_empty());
+            }
+        }
+    }
     use super::*;
     use crate::hle::service::hle_ipc::HLERequestContext;
 

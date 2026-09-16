@@ -1217,6 +1217,7 @@ fn request_screenshot(
             }
         }),
         layout,
+        ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId::Default,
     );
 }
 

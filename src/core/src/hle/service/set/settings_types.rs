@@ -8,6 +8,19 @@
 /// Setting item name buffer type. Upstream: `SettingItemName`.
 pub type SettingItemName = [u8; 0x48];
 
+/// nn::settings::system::AccountUserSettings, opaque in upstream settings_types.h.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct AccountUserSettings {
+    pub data: [u8; 0x40],
+}
+
+impl Default for AccountUserSettings {
+    fn default() -> Self { Self { data: [0; 0x40] } }
+}
+
+const _: () = assert!(std::mem::size_of::<AccountUserSettings>() == 0x40);
+
 /// nn::settings::system::AudioOutputMode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]

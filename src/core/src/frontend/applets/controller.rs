@@ -105,25 +105,59 @@ impl ControllerApplet for DefaultControllerApplet {
         } else {
             parameters.min_players as usize
         };
+        let max_supported_players = if parameters.enable_single_mode {
+            1
+        } else {
+            parameters.max_players as usize
+        };
+        let mut num_selected_players = 0;
+        let mut keep_connected = [false; AVAILABLE_CONTROLLERS];
 
         let (handheld, controllers) = {
             let hid_core = self.hid_core.lock();
             let handheld = hid_core.get_emulated_controller(NpadIdType::Handheld);
-            let controllers = (0..AVAILABLE_CONTROLLERS - 2)
+            let controllers = (0..AVAILABLE_CONTROLLERS - 1)
                 .map(|index| hid_core.get_emulated_controller_by_index(index))
                 .collect::<Vec<_>>();
             (handheld, controllers)
         };
 
         use hid_core::hid_core::with_controller;
-        with_controller(&handheld, |handheld| handheld.disconnect());
-
-        for (index, controller) in controllers.into_iter().enumerate() {
-            with_controller(&controller, |controller| controller.disconnect());
-
-            if index >= min_supported_players {
+        for (index, controller) in controllers.iter().enumerate() {
+            let controller = controller.lock();
+            if !parameters.keep_controllers_connected
+                || !controller.is_connected(false)
+                || num_selected_players >= max_supported_players
+            {
                 continue;
             }
+            keep_connected[index] = match controller.get_npad_style_index(false) {
+                NpadStyleIndex::Fullkey => parameters.allow_pro_controller,
+                NpadStyleIndex::JoyconDual => parameters.allow_dual_joycons,
+                NpadStyleIndex::JoyconLeft => parameters.allow_left_joycon,
+                NpadStyleIndex::JoyconRight => parameters.allow_right_joycon,
+                NpadStyleIndex::GameCube => parameters.allow_gamecube_controller,
+                NpadStyleIndex::Handheld => parameters.enable_single_mode
+                    && parameters.allow_handheld
+                    && !common::settings::is_docked_mode(&common::settings::values()),
+                _ => false,
+            };
+            num_selected_players += usize::from(keep_connected[index]);
+        }
+        if !keep_connected[AVAILABLE_CONTROLLERS - 2] {
+            with_controller(&handheld, |handheld| handheld.disconnect());
+        }
+
+        for (index, controller) in controllers.into_iter().take(AVAILABLE_CONTROLLERS - 2).enumerate() {
+            if keep_connected[index] {
+                continue;
+            }
+            with_controller(&controller, |controller| controller.disconnect());
+
+            if num_selected_players >= min_supported_players {
+                continue;
+            }
+            num_selected_players += 1;
 
             let style = if parameters.allow_pro_controller {
                 NpadStyleIndex::Fullkey
@@ -159,6 +193,62 @@ mod tests {
     use hid_core::hid_types::NpadStyleIndex;
 
     use super::*;
+
+    #[test]
+    fn default_applet_reserves_valid_players_before_filling_empty_slots() {
+        use hid_core::hid_core::with_controller;
+        let hid = Arc::new(Mutex::new(HIDCore::new()));
+        let player_1 = hid.lock().get_emulated_controller_by_index(0);
+        let player_2 = hid.lock().get_emulated_controller_by_index(1);
+        let player_3 = hid.lock().get_emulated_controller_by_index(2);
+        for controller in [&player_2, &player_3] {
+            with_controller(controller, |controller| {
+                controller.set_npad_style_index(NpadStyleIndex::JoyconDual);
+                controller.connect(true);
+            });
+        }
+        let applet = DefaultControllerApplet::new(hid);
+        applet.reconfigure_controllers(Box::new(|success| assert!(success)), &ControllerParameters {
+            min_players: 2,
+            max_players: 2,
+            keep_controllers_connected: true,
+            allow_pro_controller: true,
+            allow_dual_joycons: true,
+            ..Default::default()
+        });
+        assert!(!player_1.lock().is_connected(false));
+        for controller in [&player_2, &player_3] {
+            assert!(controller.lock().is_connected(false));
+            assert_eq!(controller.lock().get_npad_style_index(false), NpadStyleIndex::JoyconDual);
+        }
+    }
+
+    #[test]
+    fn default_applet_single_mode_keeps_only_first_valid_player() {
+        use hid_core::hid_core::with_controller;
+        let hid = Arc::new(Mutex::new(HIDCore::new()));
+        let first = hid.lock().get_emulated_controller_by_index(0);
+        let second = hid.lock().get_emulated_controller_by_index(1);
+        for controller in [&first, &second] {
+            with_controller(controller, |controller| {
+                controller.set_npad_style_index(NpadStyleIndex::GameCube);
+                controller.connect(true);
+            });
+        }
+        DefaultControllerApplet::new(hid).reconfigure_controllers(
+            Box::new(|success| assert!(success)),
+            &ControllerParameters {
+                max_players: 4,
+                enable_single_mode: true,
+                keep_controllers_connected: true,
+                allow_gamecube_controller: true,
+                ..Default::default()
+            },
+        );
+        assert!(first.lock().is_connected(false));
+        assert_eq!(first.lock().get_npad_style_index(false), NpadStyleIndex::GameCube);
+        assert!(!second.lock().is_connected(false));
+    }
 
     #[test]
     fn default_applet_connects_minimum_players_as_fullkey() {

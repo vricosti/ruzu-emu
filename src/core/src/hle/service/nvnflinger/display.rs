@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::buffer_item_consumer::BufferItemConsumer;
-use super::hwc_layer::LayerBlending;
+use super::hwc_layer::{LayerBlending, DEFAULT_LAYER_STACK_MASK};
 
 /// A single layer within the display stack.
 pub struct Layer {
@@ -16,6 +16,7 @@ pub struct Layer {
     pub visible: bool,
     pub z_index: i32,
     pub is_overlay: bool,
+    pub layer_stack_mask: u32,
 }
 
 impl Layer {
@@ -27,6 +28,7 @@ impl Layer {
             visible: true,
             z_index: 0,
             is_overlay: false,
+            layer_stack_mask: DEFAULT_LAYER_STACK_MASK,
         }
     }
 }
@@ -116,5 +118,6 @@ mod tests {
         assert_eq!(layer.blending, LayerBlending::None);
         assert_eq!(layer.z_index, 0);
         assert!(!layer.is_overlay);
+        assert_eq!(layer.layer_stack_mask, DEFAULT_LAYER_STACK_MASK);
     }
 }

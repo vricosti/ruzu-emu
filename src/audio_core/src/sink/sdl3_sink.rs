@@ -209,6 +209,8 @@ impl Drop for SDLSinkStream {
 }
 
 pub struct SDLSink {
+    // Sink's protected field in C++; traits cannot contain instance fields.
+    device_volume: f32,
     output_device: String,
     input_device: String,
     device_channels: u32,
@@ -233,6 +235,7 @@ impl SDLSink {
             // output names. Preserve the name for either stream direction;
             // Eden leaves input_device empty and ignores the capture setting.
             input_device: output_device.clone(),
+            device_volume: 1.0,
             output_device,
             device_channels: 2,
             system_channels: 2,
@@ -334,6 +337,7 @@ impl Sink for SDLSink {
                 callback_state: Some(callback_state),
             }),
         });
+        handle.set_device_volume(self.device_volume);
         self.streams.push(handle.clone());
         handle
     }
@@ -357,12 +361,11 @@ impl Sink for SDLSink {
     }
 
     fn get_device_volume(&self) -> f32 {
-        self.streams
-            .first()
-            .map_or(1.0, |stream| stream.get_device_volume())
+        self.device_volume
     }
 
     fn set_device_volume(&mut self, volume: f32) {
+        self.device_volume = volume;
         for stream in &self.streams {
             stream.set_device_volume(volume);
         }

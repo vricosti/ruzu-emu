@@ -46,15 +46,23 @@ pub struct RestrictionSettings {
 }
 const _: () = assert!(core::mem::size_of::<RestrictionSettings>() == 0x3);
 
-/// nn::pctl::PlayTimerSettings.
+/// Legacy nn::pctl::PlayTimerSettings.
 ///
 /// Corresponds to `PlayTimerSettings` in upstream pctl_types.h.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct PlayTimerSettings {
+pub struct PlayTimerSettingsOld {
     pub settings: [u32; 13],
 }
-const _: () = assert!(core::mem::size_of::<PlayTimerSettings>() == 0x34);
+const _: () = assert!(core::mem::size_of::<PlayTimerSettingsOld>() == 0x34);
+
+/// Current nn::pctl::PlayTimerSettings, matching upstream's 21.0.0+ layout.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlayTimerSettings {
+    pub settings: [u32; 17],
+}
+const _: () = assert!(core::mem::size_of::<PlayTimerSettings>() == 0x44);
 
 /// nn::pctl::detail::PlayTimerDisplayState.
 #[repr(u8)]

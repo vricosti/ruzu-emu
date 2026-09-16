@@ -140,8 +140,9 @@ impl RendererBase for RendererNull {
         data: *mut std::ffi::c_void,
         callback: Box<dyn FnOnce(bool) + Send>,
         layout: ruzu_core::frontend::framebuffer_layout::FramebufferLayout,
+        layer_stack: ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId,
     ) {
-        self.base_data.request_screenshot(data, callback, layout);
+        self.base_data.request_screenshot(data, callback, layout, layer_stack);
     }
 
     fn set_gpu_ticks_getter(&mut self, getter: crate::renderer_base::GpuTicksGetter) {
@@ -181,6 +182,7 @@ mod tests {
                 bottom: 720,
             },
             blending: crate::framebuffer_config::BlendMode::Opaque,
+            layer_stack_mask: ruzu_core::hle::service::nvnflinger::hwc_layer::DEFAULT_LAYER_STACK_MASK,
         }
     }
 
@@ -232,6 +234,7 @@ mod tests {
             (&mut pixel as *mut u32).cast(),
             Box::new(move |invert_y| tx.send(invert_y).unwrap()),
             layout,
+            ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId::Default,
         );
 
         assert!(renderer.is_screenshot_pending());

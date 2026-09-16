@@ -154,6 +154,8 @@ impl Drop for CubebSinkStream {
 }
 
 pub struct CubebSink {
+    // Sink's protected field in C++; traits cannot contain instance fields.
+    device_volume: f32,
     ctx: Option<Context>,
     output_device: cubeb::DeviceId,
     input_device: cubeb::DeviceId,
@@ -295,6 +297,7 @@ impl CubebSink {
 
         Self {
             ctx,
+            device_volume: 1.0,
             output_device,
             input_device,
             device_channels,
@@ -352,6 +355,7 @@ impl Sink for CubebSink {
                 #[cfg(windows)]
                 com_apartment,
             ));
+            handle.set_device_volume(self.device_volume);
             self.streams.push(handle.clone());
             return handle;
         };
@@ -465,6 +469,7 @@ impl Sink for CubebSink {
                     #[cfg(windows)]
                     com_apartment,
                 ));
+                handle.set_device_volume(self.device_volume);
                 self.streams.push(handle.clone());
                 handle
             }
@@ -476,6 +481,7 @@ impl Sink for CubebSink {
                     #[cfg(windows)]
                     com_apartment,
                 ));
+                handle.set_device_volume(self.device_volume);
                 self.streams.push(handle.clone());
                 handle
             }
@@ -501,14 +507,11 @@ impl Sink for CubebSink {
     }
 
     fn get_device_volume(&self) -> f32 {
-        if let Some(entry) = self.streams.first() {
-            entry.get_device_volume()
-        } else {
-            1.0
-        }
+        self.device_volume
     }
 
     fn set_device_volume(&mut self, volume: f32) {
+        self.device_volume = volume;
         for entry in &self.streams {
             entry.set_device_volume(volume);
         }
@@ -535,6 +538,33 @@ mod tests {
     use crate::sink::sink_stream::{SinkBuffer, StreamType};
     fn make_system() -> SharedSystem {
         crate::make_test_system()
+    }
+
+    #[test]
+    fn device_volume_survives_stream_close_and_reopen_without_backend() {
+        let mut sink = CubebSink {
+            device_volume: 1.0,
+            ctx: None,
+            output_device: std::ptr::null(),
+            input_device: std::ptr::null(),
+            device_channels: 2,
+            system_channels: 2,
+            streams: Vec::new(),
+            #[cfg(windows)]
+            com_init_result: -1,
+        };
+        sink.set_device_volume(0.25);
+        assert_eq!(sink.get_device_volume(), 0.25);
+        let first = sink.acquire_sink_stream(make_system(), 2, "volume", StreamType::Out);
+        assert_eq!(first.get_device_volume(), 0.25);
+        sink.set_device_volume(0.75);
+        assert_eq!(first.get_device_volume(), 0.75);
+        sink.close_stream(&first);
+        assert_eq!(sink.get_device_volume(), 0.75);
+        let next = sink.acquire_sink_stream(make_system(), 2, "volume", StreamType::Out);
+        assert_eq!(next.get_device_volume(), 0.75);
+        sink.close_streams();
+        assert_eq!(sink.get_device_volume(), 0.75);
     }
 
     #[test]

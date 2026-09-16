@@ -37,10 +37,21 @@ impl SinkStream for NullSinkStreamImpl {
     }
 }
 
-#[derive(Default)]
 pub struct NullSink {
+    // Sink's protected field in C++; traits cannot contain instance fields.
+    device_volume: f32,
     null_sink: Option<SinkStreamHandle>,
     recording_for_test: bool,
+}
+
+impl Default for NullSink {
+    fn default() -> Self {
+        Self {
+            device_volume: 1.0,
+            null_sink: None,
+            recording_for_test: false,
+        }
+    }
 }
 
 impl NullSink {
@@ -51,8 +62,8 @@ impl NullSink {
     #[cfg(test)]
     pub fn new_recording_for_test(_device_id: &str) -> Self {
         Self {
-            null_sink: None,
             recording_for_test: true,
+            ..Self::default()
         }
     }
 }
@@ -84,15 +95,21 @@ impl Sink for NullSink {
         } else {
             new_stream_handle(NullSinkStreamImpl::new(system, stream_type))
         };
+        stream.set_device_volume(self.device_volume);
         self.null_sink = Some(stream.clone());
         stream
     }
 
     fn get_device_volume(&self) -> f32 {
-        1.0
+        self.device_volume
     }
 
-    fn set_device_volume(&mut self, _volume: f32) {}
+    fn set_device_volume(&mut self, volume: f32) {
+        self.device_volume = volume;
+        if let Some(stream) = &self.null_sink {
+            stream.set_device_volume(volume);
+        }
+    }
 
     fn set_system_volume(&mut self, _volume: f32) {}
 
@@ -111,6 +128,22 @@ mod tests {
 
     fn make_system() -> SharedSystem {
         crate::make_test_system()
+    }
+
+    #[test]
+    fn device_volume_persists_before_and_after_stream_acquisition() {
+        let mut sink = NullSink::default();
+        assert_eq!(sink.get_device_volume(), 1.0);
+        sink.set_device_volume(0.25);
+        assert_eq!(sink.get_device_volume(), 0.25);
+        let stream = sink.acquire_sink_stream(make_system(), 2, "volume", StreamType::Render);
+        assert_eq!(stream.get_device_volume(), 0.25);
+        sink.set_device_volume(0.75);
+        assert_eq!(stream.get_device_volume(), 0.75);
+        sink.close_streams();
+        assert_eq!(sink.get_device_volume(), 0.75);
+        let next = sink.acquire_sink_stream(make_system(), 2, "volume", StreamType::Render);
+        assert_eq!(next.get_device_volume(), 0.75);
     }
 
     #[test]

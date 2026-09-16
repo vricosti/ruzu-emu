@@ -1844,7 +1844,6 @@ fn render_pass_variant_key(
 struct SamplerVariantKey {
     reduce_anisotropy: bool,
     force_nearest: bool,
-    drop_depth_comparison: bool,
     drop_reduction: bool,
     drop_custom_border: bool,
     srgb_border: bool,
@@ -1895,6 +1894,8 @@ pub struct CachedSampler {
     default_anisotropy: f32,
     has_added_anisotropy: bool,
     has_linear_filtering: bool,
+    // Still retained in Eden's Sampler after removing the comparison fallback.
+    #[allow(dead_code)]
     has_depth_comparison: bool,
     has_minmax_reduction: bool,
     has_custom_border_colors: bool,
@@ -1954,15 +1955,12 @@ impl CachedSampler {
     }
 
     /// Port of `Vulkan::Sampler::MakeKey`.
-    fn make_key(&self, image_view: &ImageView, is_depth: bool) -> SamplerVariantKey {
+    fn make_key(&self, image_view: &ImageView, _is_depth: bool) -> SamplerVariantKey {
         let base = image_view.base();
         let mut key = SamplerVariantKey {
             reduce_anisotropy: self.has_added_anisotropy && !base.supports_anisotropy(),
             force_nearest: self.has_linear_filtering
                 && crate::surface::is_pixel_format_integer(base.format),
-            drop_depth_comparison: is_depth
-                && self.has_depth_comparison
-                && !image_view.supports_depth_comparison,
             drop_reduction: self.has_minmax_reduction && !image_view.supports_minmax_filter,
             drop_custom_border: self.has_custom_border_colors
                 && image_view.requires_border_color_format,
@@ -2066,9 +2064,6 @@ impl CachedSampler {
             create_info = create_info
                 .anisotropy_enable(self.default_anisotropy > 1.0)
                 .max_anisotropy(self.default_anisotropy);
-        }
-        if key.drop_depth_comparison {
-            create_info = create_info.compare_enable(false);
         }
         if !custom_border {
             create_info = create_info.border_color(convert_border_color(color));
@@ -6770,6 +6765,7 @@ mod tests {
     #[test]
     fn msaa_scratch_key_captures_upstream_create_info_fields() {
         let info = ImageInfo {
+            image_type: ImageType::E2D,
             format: PixelFormat::A8B8G8R8Unorm,
             num_samples: 4,
             size: Extent3D {
@@ -6996,6 +6992,118 @@ mod tests {
         };
         assert!(swizzled.has_swizzle());
         assert_ne!(key, swizzled);
+    }
+
+    #[test]
+    fn sampler_variants_preserve_guest_depth_comparison() {
+        use ash::vk::Handle;
+        unsafe extern "system" fn create_sampler(
+            _: vk::Device,
+            info: *const vk::SamplerCreateInfo<'_>,
+            _: *const vk::AllocationCallbacks<'_>,
+            output: *mut vk::Sampler,
+        ) -> vk::Result {
+            // Encode the actual Vulkan comparison state in the mock handle.
+            let info = unsafe { &*info };
+            unsafe {
+                *output = vk::Sampler::from_raw(
+                    1 + u64::from(info.compare_enable)
+                        + ((info.compare_op.as_raw() as u64) << 8),
+                );
+            }
+            vk::Result::SUCCESS
+        }
+        unsafe extern "system" fn destroy_sampler(
+            _: vk::Device,
+            _: vk::Sampler,
+            _: *const vk::AllocationCallbacks<'_>,
+        ) {
+        }
+        let device = unsafe {
+            ash::Device::load_with(
+                |name| match name.to_bytes() {
+                    b"vkCreateSampler" => create_sampler as *const () as *const _,
+                    b"vkDestroySampler" => destroy_sampler as *const () as *const _,
+                    _ => std::ptr::null(),
+                },
+                vk::Device::null(),
+            )
+        };
+        let mut view_base = ImageViewBase::null(
+            crate::texture_cache::image_view_base::NullImageViewParams,
+        );
+        view_base.format = PixelFormat::S8UintD24Unorm;
+        // MakeKey never dereferences the device owner. No real image handles
+        // are created, so dropping this fixture performs no Vulkan operation.
+        let view = ImageView {
+            vulkan_device: NonNull::dangling(),
+            device: device.clone(),
+            base: NonNull::from(&mut view_base),
+            image_handle: vk::Image::null(),
+            image_views: [vk::ImageView::null(); shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
+            render_target: vk::ImageView::null(),
+            typeless_storage_view: vk::ImageView::null(),
+            depth_view: vk::ImageView::null(),
+            stencil_view: vk::ImageView::null(),
+            color_view: vk::ImageView::null(),
+            storage_signeds: [vk::ImageView::null(); shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
+            storage_unsigneds: [vk::ImageView::null(); shader_recompiler::shader_info::NUM_TEXTURE_TYPES as usize],
+            null_image: None,
+            samples: vk::SampleCountFlags::TYPE_1,
+            buffer_size: 0,
+            supports_depth_comparison: false,
+            requires_border_color_format: false,
+            supports_minmax_filter: false,
+            swizzle_mapping: vk::ComponentMapping::default(),
+            has_identity_swizzle: true,
+        };
+        let mut sampler = CachedSampler {
+            device: Some(device),
+            device_owner: None,
+            base: SamplerBaseInfo {
+                mag_filter: vk::Filter::LINEAR,
+                min_filter: vk::Filter::LINEAR,
+                mipmap_mode: vk::SamplerMipmapMode::LINEAR,
+                address_mode_u: vk::SamplerAddressMode::REPEAT,
+                address_mode_v: vk::SamplerAddressMode::REPEAT,
+                address_mode_w: vk::SamplerAddressMode::REPEAT,
+                mip_lod_bias: 0.0,
+                anisotropy_enable: true,
+                max_anisotropy: 4.0,
+                compare_enable: true,
+                compare_op: vk::CompareOp::LESS_OR_EQUAL,
+                min_lod: 0.0,
+                max_lod: 1.0,
+            },
+            reduction_mode: vk::SamplerReductionMode::WEIGHTED_AVERAGE,
+            border_color: [0.0; 4],
+            srgb_border_color: [0.0; 4],
+            default_anisotropy: 1.0,
+            has_added_anisotropy: true,
+            has_linear_filtering: true,
+            has_depth_comparison: true,
+            has_minmax_reduction: false,
+            has_custom_border_colors: false,
+            has_srgb_border_color: false,
+            needs_swizzle_mapping: false,
+            variants: std::cell::RefCell::new(Vec::new()),
+            custom_border_color_budget_held: std::cell::Cell::new(0),
+        };
+        for enabled in [true, false] {
+            sampler.base.compare_enable = enabled;
+            for key in [
+                sampler.make_key(&view, true),
+                SamplerVariantKey::default(),
+                SamplerVariantKey { force_nearest: true, ..Default::default() },
+                SamplerVariantKey { reduce_anisotropy: true, ..Default::default() },
+                SamplerVariantKey { drop_reduction: true, ..Default::default() },
+            ] {
+                assert_eq!(
+                    sampler.emplace(key).unwrap().as_raw(),
+                    1 + u64::from(enabled) + ((vk::CompareOp::LESS_OR_EQUAL.as_raw() as u64) << 8),
+                );
+            }
+        }
     }
 
     #[test]

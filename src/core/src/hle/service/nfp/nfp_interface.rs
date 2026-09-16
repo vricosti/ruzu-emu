@@ -21,59 +21,9 @@ use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::nfc::common::device_manager::DeviceManager;
 use crate::hle::service::nfc::nfc_result;
 use crate::hle::service::nfc::nfc_types::NfcProtocol;
-use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
+use crate::hle::service::service::{FunctionInfo, ServiceFramework};
 
-/// IPC command table for Interface (IUser / ISystem / IDebug).
-///
-/// Corresponds to the function table in upstream nfp.cpp constructors.
-pub mod commands {
-    pub const INITIALIZE: u32 = 0;
-    pub const FINALIZE: u32 = 1;
-    pub const LIST_DEVICES: u32 = 2;
-    pub const START_DETECTION: u32 = 3;
-    pub const STOP_DETECTION: u32 = 4;
-    pub const MOUNT: u32 = 5;
-    pub const UNMOUNT: u32 = 6;
-    pub const OPEN_APPLICATION_AREA: u32 = 7;
-    pub const GET_APPLICATION_AREA: u32 = 8;
-    pub const SET_APPLICATION_AREA: u32 = 9;
-    pub const FLUSH: u32 = 10;
-    pub const RESTORE: u32 = 11;
-    pub const CREATE_APPLICATION_AREA: u32 = 12;
-    pub const GET_TAG_INFO: u32 = 13;
-    pub const GET_REGISTER_INFO: u32 = 14;
-    pub const GET_COMMON_INFO: u32 = 15;
-    pub const GET_MODEL_INFO: u32 = 16;
-    pub const ATTACH_ACTIVATE_EVENT: u32 = 17;
-    pub const ATTACH_DEACTIVATE_EVENT: u32 = 18;
-    pub const GET_STATE: u32 = 19;
-    pub const GET_DEVICE_STATE: u32 = 20;
-    pub const GET_NFC_NPAD_ID: u32 = 21;
-    pub const GET_APPLICATION_AREA_SIZE: u32 = 22;
-    pub const ATTACH_AVAILABILITY_CHANGE_EVENT: u32 = 23;
-    pub const RECREATE_APPLICATION_AREA: u32 = 24;
-    // System/Debug commands
-    pub const FORMAT: u32 = 100;
-    pub const GET_ADMIN_INFO: u32 = 101;
-    pub const GET_REGISTER_INFO_PRIVATE: u32 = 102;
-    pub const SET_REGISTER_INFO_PRIVATE: u32 = 103;
-    pub const DELETE_REGISTER_INFO: u32 = 104;
-    pub const DELETE_APPLICATION_AREA: u32 = 105;
-    pub const EXISTS_APPLICATION_AREA: u32 = 106;
-    // Debug commands
-    pub const GET_ALL: u32 = 200;
-    pub const SET_ALL: u32 = 201;
-    pub const FLUSH_DEBUG: u32 = 202;
-    pub const BREAK_TAG: u32 = 203;
-    pub const READ_BACKUP_DATA: u32 = 204;
-    pub const WRITE_BACKUP_DATA: u32 = 205;
-    pub const WRITE_NTF: u32 = 206;
-    // InitializeSystem/Debug/Finalize commands
-    pub const INITIALIZE_SYSTEM: u32 = 400;
-    pub const FINALIZE_SYSTEM: u32 = 401;
-    pub const INITIALIZE_DEBUG: u32 = 500;
-    pub const FINALIZE_DEBUG: u32 = 501;
-}
+pub use super::nfp::interface_commands as commands;
 
 /// NFP State, mirroring NFC::State for the base class behavior.
 ///
@@ -103,114 +53,7 @@ pub struct Interface {
 
 impl Interface {
     pub fn new(system: crate::core::SystemRef, name: &str) -> Self {
-        // IUser command table from upstream nfp.cpp
-        let handlers = build_handler_map(&[
-            (
-                commands::INITIALIZE,
-                Some(Self::initialize_handler),
-                "Initialize",
-            ),
-            (commands::FINALIZE, Some(Self::finalize_handler), "Finalize"),
-            (
-                commands::LIST_DEVICES,
-                Some(Self::list_devices_handler),
-                "ListDevices",
-            ),
-            (
-                commands::START_DETECTION,
-                Some(Self::start_detection_handler),
-                "StartDetection",
-            ),
-            (
-                commands::STOP_DETECTION,
-                Some(Self::stop_detection_handler),
-                "StopDetection",
-            ),
-            (commands::MOUNT, Some(Self::mount_handler), "Mount"),
-            (commands::UNMOUNT, Some(Self::unmount_handler), "Unmount"),
-            (
-                commands::OPEN_APPLICATION_AREA,
-                Some(Self::open_application_area_handler),
-                "OpenApplicationArea",
-            ),
-            (
-                commands::GET_APPLICATION_AREA,
-                Some(Self::get_application_area_handler),
-                "GetApplicationArea",
-            ),
-            (
-                commands::SET_APPLICATION_AREA,
-                Some(Self::set_application_area_handler),
-                "SetApplicationArea",
-            ),
-            (commands::FLUSH, Some(Self::flush_handler), "Flush"),
-            (commands::RESTORE, Some(Self::restore_handler), "Restore"),
-            (
-                commands::CREATE_APPLICATION_AREA,
-                Some(Self::create_application_area_handler),
-                "CreateApplicationArea",
-            ),
-            (
-                commands::GET_TAG_INFO,
-                Some(Self::get_tag_info_handler),
-                "GetTagInfo",
-            ),
-            (
-                commands::GET_REGISTER_INFO,
-                Some(Self::get_register_info_handler),
-                "GetRegisterInfo",
-            ),
-            (
-                commands::GET_COMMON_INFO,
-                Some(Self::get_common_info_handler),
-                "GetCommonInfo",
-            ),
-            (
-                commands::GET_MODEL_INFO,
-                Some(Self::get_model_info_handler),
-                "GetModelInfo",
-            ),
-            (
-                commands::ATTACH_ACTIVATE_EVENT,
-                Some(Self::attach_activate_event_handler),
-                "AttachActivateEvent",
-            ),
-            (
-                commands::ATTACH_DEACTIVATE_EVENT,
-                Some(Self::attach_deactivate_event_handler),
-                "AttachDeactivateEvent",
-            ),
-            (
-                commands::GET_STATE,
-                Some(Self::get_state_handler),
-                "GetState",
-            ),
-            (
-                commands::GET_DEVICE_STATE,
-                Some(Self::get_device_state_handler),
-                "GetDeviceState",
-            ),
-            (
-                commands::GET_NFC_NPAD_ID,
-                Some(Self::get_npad_id_handler),
-                "GetNpadId",
-            ),
-            (
-                commands::GET_APPLICATION_AREA_SIZE,
-                Some(Self::get_application_area_size_handler),
-                "GetApplicationAreaSize",
-            ),
-            (
-                commands::ATTACH_AVAILABILITY_CHANGE_EVENT,
-                Some(Self::attach_availability_change_event_handler),
-                "AttachAvailabilityChangeEvent",
-            ),
-            (
-                commands::RECREATE_APPLICATION_AREA,
-                Some(Self::recreate_application_area_handler),
-                "RecreateApplicationArea",
-            ),
-        ]);
+        let handlers = Self::make_handlers();
 
         Self {
             system,
@@ -740,7 +583,7 @@ impl Interface {
 
     /// Initialize (cmd 0).
     /// Upstream: NfcInterface::Initialize
-    fn initialize_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn initialize_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         log::info!("NFP::Initialize called");
         let result = service.initialize();
@@ -750,7 +593,7 @@ impl Interface {
 
     /// Finalize (cmd 1).
     /// Upstream: NfcInterface::Finalize
-    fn finalize_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn finalize_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         log::info!("NFP::Finalize called");
         let _result = service.finalize();
@@ -760,7 +603,7 @@ impl Interface {
 
     /// ListDevices (cmd 2).
     /// Upstream: NfcInterface::ListDevices
-    fn list_devices_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn list_devices_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let max_allowed = ctx.get_write_buffer_size(0) / 8; // sizeof(u64) = 8
         log::debug!("NFP::ListDevices called");
@@ -785,7 +628,7 @@ impl Interface {
     /// StartDetection (cmd 3).
     /// Upstream: NfcInterface::StartDetection
     /// For NFP backend, tag_protocol is always NfcProtocol::All (not read from params).
-    fn start_detection_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn start_detection_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -803,7 +646,7 @@ impl Interface {
 
     /// StopDetection (cmd 4).
     /// Upstream: NfcInterface::StopDetection
-    fn stop_detection_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn stop_detection_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -817,7 +660,7 @@ impl Interface {
 
     /// Mount (cmd 5).
     /// Upstream: Interface::Mount
-    fn mount_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn mount_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -850,7 +693,7 @@ impl Interface {
 
     /// Unmount (cmd 6).
     /// Upstream: Interface::Unmount
-    fn unmount_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn unmount_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -864,7 +707,7 @@ impl Interface {
 
     /// OpenApplicationArea (cmd 7).
     /// Upstream: Interface::OpenApplicationArea
-    fn open_application_area_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn open_application_area_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -883,7 +726,7 @@ impl Interface {
 
     /// GetApplicationArea (cmd 8).
     /// Upstream: Interface::GetApplicationArea
-    fn get_application_area_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn get_application_area_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -910,7 +753,7 @@ impl Interface {
 
     /// SetApplicationArea (cmd 9).
     /// Upstream: Interface::SetApplicationArea
-    fn set_application_area_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn set_application_area_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -929,7 +772,7 @@ impl Interface {
 
     /// Flush (cmd 10).
     /// Upstream: Interface::Flush
-    fn flush_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn flush_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -943,7 +786,7 @@ impl Interface {
 
     /// Restore (cmd 11).
     /// Upstream: Interface::Restore
-    fn restore_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn restore_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -957,7 +800,7 @@ impl Interface {
 
     /// CreateApplicationArea (cmd 12).
     /// Upstream: Interface::CreateApplicationArea
-    fn create_application_area_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn create_application_area_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -978,7 +821,7 @@ impl Interface {
 
     /// GetTagInfo (cmd 13).
     /// Upstream: NfcInterface::GetTagInfo
-    fn get_tag_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn get_tag_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -1002,7 +845,7 @@ impl Interface {
 
     /// GetRegisterInfo (cmd 14).
     /// Upstream: Interface::GetRegisterInfo
-    fn get_register_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn get_register_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -1029,7 +872,7 @@ impl Interface {
 
     /// GetCommonInfo (cmd 15).
     /// Upstream: Interface::GetCommonInfo
-    fn get_common_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn get_common_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -1053,7 +896,7 @@ impl Interface {
 
     /// GetModelInfo (cmd 16).
     /// Upstream: Interface::GetModelInfo
-    fn get_model_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn get_model_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -1077,7 +920,7 @@ impl Interface {
 
     /// AttachActivateEvent (cmd 17).
     /// Upstream: NfcInterface::AttachActivateEvent
-    fn attach_activate_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn attach_activate_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -1098,7 +941,7 @@ impl Interface {
 
     /// AttachDeactivateEvent (cmd 18).
     /// Upstream: NfcInterface::AttachDeactivateEvent
-    fn attach_deactivate_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn attach_deactivate_event_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -1118,7 +961,7 @@ impl Interface {
 
     /// GetState (cmd 19).
     /// Upstream: NfcInterface::GetState
-    fn get_state_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn get_state_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         log::debug!("NFP::GetState called");
 
@@ -1131,7 +974,7 @@ impl Interface {
 
     /// GetDeviceState (cmd 20).
     /// Upstream: NfcInterface::GetDeviceState
-    fn get_device_state_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn get_device_state_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -1149,7 +992,7 @@ impl Interface {
 
     /// GetNpadId (cmd 21).
     /// Upstream: NfcInterface::GetNpadId
-    fn get_npad_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn get_npad_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();
@@ -1170,7 +1013,7 @@ impl Interface {
 
     /// GetApplicationAreaSize (cmd 22).
     /// Upstream: Interface::GetApplicationAreaSize
-    fn get_application_area_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn get_application_area_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let _device_handle = rp.pop_u64();
@@ -1188,7 +1031,7 @@ impl Interface {
 
     /// AttachAvailabilityChangeEvent (cmd 23).
     /// Upstream: NfcInterface::AttachAvailabilityChangeEvent
-    fn attach_availability_change_event_handler(
+    pub(super) fn attach_availability_change_event_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
@@ -1206,7 +1049,7 @@ impl Interface {
 
     /// RecreateApplicationArea (cmd 24).
     /// Upstream: Interface::RecreateApplicationArea
-    fn recreate_application_area_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn recreate_application_area_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let device_handle = rp.pop_u64();

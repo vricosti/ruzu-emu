@@ -7,10 +7,14 @@ use crate::framebuffer_config::{normalize_crop, BlendMode, FramebufferConfig};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::MTLTexture;
 
+#[derive(Clone)]
 pub struct Layer {
     pub texture: Retained<ProtocolObject<dyn MTLTexture>>,
     pub crop: [f32; 4],
     pub blending: BlendMode,
+    // Metal resolves textures before capture selection; retain the guest mask
+    // on that snapshot so RendererMetal can select the same stacks as Vulkan/GL.
+    pub layer_stack_mask: u32,
 }
 
 impl Layer {
@@ -25,6 +29,7 @@ impl Layer {
             texture,
             crop: [crop.left, crop.top, crop.right, crop.bottom],
             blending: config.blending,
+            layer_stack_mask: config.layer_stack_mask,
         }
     }
 
@@ -33,6 +38,7 @@ impl Layer {
             texture,
             crop: [0.0, 0.0, 1.0, 1.0],
             blending: BlendMode::Opaque,
+            layer_stack_mask: ruzu_core::hle::service::nvnflinger::hwc_layer::DEFAULT_LAYER_STACK_MASK,
         }
     }
 }

@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::framebuffer_config::FramebufferConfig;
+use ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId;
 pub use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 
 /// Context used by renderers that do not require a host graphics context.
@@ -24,6 +25,7 @@ pub struct RendererSettings {
     pub screenshot_bits: *mut std::ffi::c_void,
     pub screenshot_complete_callback: Option<Box<dyn FnOnce(bool) + Send>>,
     pub screenshot_framebuffer_layout: FramebufferLayout,
+    pub screenshot_layer_stack: LayerStackId,
 }
 
 // Safety: screenshot_bits is only accessed on the render thread.
@@ -37,6 +39,7 @@ impl Default for RendererSettings {
             screenshot_bits: std::ptr::null_mut(),
             screenshot_complete_callback: None,
             screenshot_framebuffer_layout: FramebufferLayout::default(),
+            screenshot_layer_stack: LayerStackId::Default,
         }
     }
 }
@@ -102,6 +105,7 @@ pub trait RendererBase: Send {
         data: *mut std::ffi::c_void,
         callback: Box<dyn FnOnce(bool) + Send>,
         layout: FramebufferLayout,
+        layer_stack: LayerStackId,
     );
 
     /// Install a *GPU virtual address* reader on the renderer's shader cache.
@@ -207,6 +211,7 @@ impl RendererBaseData {
         data: *mut std::ffi::c_void,
         callback: Box<dyn FnOnce(bool) + Send>,
         layout: FramebufferLayout,
+        layer_stack: LayerStackId,
     ) {
         if self.is_screenshot_pending() {
             log::error!("A screenshot is already requested or in progress, ignoring the request");
@@ -219,6 +224,7 @@ impl RendererBaseData {
                 .spawn(move || callback(invert_y));
         }));
         self.settings.screenshot_framebuffer_layout = layout;
+        self.settings.screenshot_layer_stack = layer_stack;
         self.settings
             .screenshot_requested
             .store(true, Ordering::SeqCst);
@@ -250,9 +256,18 @@ mod tests {
             (&mut pixel as *mut u32).cast(),
             Box::new(move |invert_y| tx.send(invert_y).unwrap()),
             layout,
+            LayerStackId::Screenshot,
         );
 
         assert!(renderer.is_screenshot_pending());
+        assert_eq!(renderer.settings.screenshot_layer_stack, LayerStackId::Screenshot);
+        renderer.request_screenshot(
+            std::ptr::null_mut(),
+            Box::new(|_| panic!("duplicate request must be rejected")),
+            FramebufferLayout::default(),
+            LayerStackId::LastFrame,
+        );
+        assert_eq!(renderer.settings.screenshot_layer_stack, LayerStackId::Screenshot);
         assert_eq!(
             renderer.settings.screenshot_bits,
             (&mut pixel as *mut u32).cast()

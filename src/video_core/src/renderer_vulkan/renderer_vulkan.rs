@@ -132,6 +132,8 @@ pub struct RendererVulkan {
     // resources, device, surface, then instance.
     /// Applet capture frame. Its raw Vulkan handles are released in `Drop`.
     applet_frame: Frame,
+    applet_capture_layers: Vec<FramebufferConfig>,
+    screenshot_layer_scratch: Vec<FramebufferConfig>,
     /// Optional maximum-clock workload owner.
     #[allow(dead_code)]
     turbo_mode: Option<TurboMode>,
@@ -428,6 +430,8 @@ impl RendererVulkan {
 
         let renderer = RendererVulkan {
             applet_frame: Frame::default(),
+            applet_capture_layers: Vec::new(),
+            screenshot_layer_scratch: Vec::new(),
             turbo_mode,
             rasterizer,
             blit_applet,
@@ -675,12 +679,21 @@ impl RendererVulkan {
             .screenshot_framebuffer_layout
             .clone();
         let buffer_size = screenshot_buffer_size(&layout);
-        let dst_buffer = self.render_to_buffer(
+        // Temporarily move scratch out while RenderToBuffer mutably borrows self.
+        // Restore it after rendering so the renderer retains its allocation.
+        let mut scratch = std::mem::take(&mut self.screenshot_layer_scratch);
+        let screenshot_layers = crate::framebuffer_config::filter_layer_stack(
             framebuffers,
+            self.base_data.settings.screenshot_layer_stack,
+            &mut scratch,
+        );
+        let dst_buffer = self.render_to_buffer(
+            screenshot_layers,
             &layout,
             vk::Format::B8G8R8A8_UNORM,
             buffer_size,
         );
+        self.screenshot_layer_scratch = scratch;
         let dst = self.base_data.settings.screenshot_bits.cast::<u8>();
         if !dst.is_null() {
             let copy_len = buffer_size as usize;
@@ -702,6 +715,14 @@ impl RendererVulkan {
     /// Renders framebuffers to the applet capture frame at 1280x720
     /// using the applet-specific blit screen and filter configuration.
     fn render_applet_capture_layer(&mut self, framebuffers: &[FramebufferConfig]) {
+        let capture_layers = crate::framebuffer_config::filter_layer_stack(
+            framebuffers,
+            ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId::LastFrame,
+            &mut self.applet_capture_layers,
+        );
+        if capture_layers.is_empty() {
+            return;
+        }
         let layout = capture_framebuffer_layout();
         if self.applet_frame.image == vk::Image::null() {
             let image = create_wrapped_image(
@@ -732,7 +753,7 @@ impl RendererVulkan {
             &self.memory_allocator,
             &self.device_memory,
             &mut self.applet_frame,
-            framebuffers,
+            capture_layers,
             &layout,
             1,
             CAPTURE_FORMAT,
@@ -844,8 +865,9 @@ impl RendererBase for RendererVulkan {
         data: *mut std::ffi::c_void,
         callback: Box<dyn FnOnce(bool) + Send>,
         layout: FramebufferLayout,
+        layer_stack: ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId,
     ) {
-        self.base_data.request_screenshot(data, callback, layout);
+        self.base_data.request_screenshot(data, callback, layout, layer_stack);
     }
 
     fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {

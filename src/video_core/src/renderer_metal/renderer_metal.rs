@@ -167,6 +167,20 @@ impl RendererMetal {
     /// Eden RenderAppletCaptureLayer: preserve a composed image even while hidden.
     /// Same-queue ordering makes subsequent capture downloads see the last frame.
     fn render_applet_capture_layer(&mut self, layers: &[Layer]) -> Result<(), MetalRendererError> {
+        use ruzu_core::hle::service::nvnflinger::hwc_layer::{layer_stack_bit, LayerStackId};
+        let bit = layer_stack_bit(LayerStackId::LastFrame);
+        // This backend already resolved FramebufferConfig into retained textures.
+        let filtered;
+        let layers = if layers.iter().all(|layer| layer.layer_stack_mask & bit != 0) {
+            layers
+        } else {
+            filtered = layers.iter().filter(|layer| layer.layer_stack_mask & bit != 0)
+                .cloned().collect::<Vec<_>>();
+            &filtered
+        };
+        if layers.is_empty() {
+            return Ok(());
+        }
         if self.applet_frame.is_none() {
             let descriptor = MTLTextureDescriptor::new();
             descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
@@ -323,6 +337,17 @@ impl RendererMetal {
         if !self.base_data.is_screenshot_pending() {
             return Ok(());
         }
+        let bit = ruzu_core::hle::service::nvnflinger::hwc_layer::layer_stack_bit(
+            self.base_data.settings.screenshot_layer_stack,
+        );
+        let filtered;
+        let sources = if sources.iter().all(|layer| layer.layer_stack_mask & bit != 0) {
+            sources
+        } else {
+            filtered = sources.iter().filter(|layer| layer.layer_stack_mask & bit != 0)
+                .cloned().collect::<Vec<_>>();
+            &filtered
+        };
         let result = (|| {
             let destination = self.base_data.settings.screenshot_bits.cast::<u8>();
             if destination.is_null() {
@@ -407,8 +432,9 @@ impl RendererBase for RendererMetal {
         data: *mut std::ffi::c_void,
         callback: Box<dyn FnOnce(bool) + Send>,
         layout: FramebufferLayout,
+        layer_stack: ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId,
     ) {
-        self.base_data.request_screenshot(data, callback, layout);
+        self.base_data.request_screenshot(data, callback, layout, layer_stack);
     }
 
     fn set_guest_memory_writer(&mut self, writer: crate::renderer_base::GuestMemoryWriter) {
@@ -557,6 +583,7 @@ mod tests {
                         texture: foreground.clone(),
                         crop: [0.0, 0.0, 1.0, 1.0],
                         blending: mode,
+                        layer_stack_mask: ruzu_core::hle::service::nvnflinger::hwc_layer::DEFAULT_LAYER_STACK_MASK,
                     },
                 ];
                 let (download, _) = renderer.render_to_buffer(&layers, &layout).unwrap();
@@ -579,6 +606,11 @@ mod tests {
                 &*first,
                 &**renderer.applet_frame.as_ref().unwrap()
             ));
+            let mut excluded = Layer::opaque(first.clone());
+            excluded.layer_stack_mask = 1; // Display only, not LastFrame.
+            let capture_tick = renderer.rasterizer.scheduler().current_tick();
+            renderer.render_applet_capture_layer(&[excluded]).unwrap();
+            assert_eq!(renderer.rasterizer.scheduler().current_tick(), capture_tick);
             let tiled = renderer.get_applet_capture_buffer();
             assert_eq!(tiled.len(), crate::capture::TILED_SIZE as usize);
             let mut linear = vec![
@@ -617,6 +649,7 @@ mod tests {
                 ..Default::default()
             };
             let layer = Layer::configure_draw(source, &config, 3, 2);
+            assert_eq!(layer.layer_stack_mask, config.layer_stack_mask);
             let layout = FramebufferLayout {
                 width: 2,
                 height: 2,
@@ -678,6 +711,7 @@ mod tests {
                 unsafe { pixels.as_mut_ptr().add(4).cast() },
                 Box::new(move |invert_y| tx.send(invert_y).unwrap()),
                 layout.clone(),
+                ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId::Default,
             );
             assert!(renderer.is_screenshot_pending());
             assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
@@ -686,6 +720,7 @@ mod tests {
                 std::ptr::null_mut(),
                 Box::new(move |value| duplicate_tx.send(value).unwrap()),
                 layout,
+                ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId::Default,
             );
             assert!(matches!(
                 duplicate_rx.try_recv(),
@@ -746,6 +781,7 @@ mod tests {
                     height: 0,
                     ..FramebufferLayout::default()
                 },
+                ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId::Default,
             );
             assert!(matches!(
                 renderer.render_screenshot(&[Layer::opaque(source.clone())]),

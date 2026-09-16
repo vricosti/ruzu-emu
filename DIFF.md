@@ -17736,3 +17736,322 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   archive contents and universal architectures are unchanged before app signing.
 - MOLTENVK_LIBRARY remains an explicit packaging override. Otherwise no local
   Eden build or Homebrew MoltenVK is selected. Runtime loader ordering is unchanged.
+## 2026-09-16 — src/rdynarmic/src/backend/x64/emit_x64_memory.rs vs dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+
+### Intentional differences
+- The existing shared page-entry attribute emitter takes an architecture selector:
+  Eden 1575f55abe changes the A32 specialization to interpret sign_extension as
+  a bit index, while its A64 specialization retains shift-count semantics.
+  A32 scaled addressing follows the corrected 7bf95be2c2 multiplier, not the
+  intermediate invalid scale. Native Rust regression tests also live in jit.rs.
+
+## 2026-09-16 — src/audio_core/src/sink/{cubeb_sink,sdl3_sink,null_sink}.rs vs audio_core/sink/{sink,cubeb_sink,sdl3_sink,null_sink}.{h,cpp}
+
+### Intentional differences
+- Rust's Sink trait cannot own the protected device_volume field. Each concrete
+  sink stores it alongside its existing device/system channel state, initialized
+  to 1.0. Acquisition applies this stored value, including Cubeb initialization
+  failure paths; setting volume updates existing streams. Close does not reset it.
+- Existing explicit stream finalization and Arc ownership are retained rather
+  than replacing the earlier callback/deadlock lifecycle adaptations. NullSink
+  keeps its single stream and no-op close methods, as upstream does.
+
+## 2026-09-16 — src/core/src/frontend/applets/controller.rs vs core/frontend/applets/controller.{h,cpp}
+
+### Intentional differences
+- The fallback applet snapshots Arc controller handles under the HID lock and
+  locks controllers individually; it does not hold the HID lock during callbacks.
+  The reservation pass includes Handheld but excludes Other, precedes disconnects,
+  respects the maximum, and fills only the remaining minimum, as in b77308ced6.
+
+## 2026-09-16 — src/video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.{h,cpp}
+
+### Intentional differences
+- Sampler variants retain RefCell ownership and ash construction of pNext chains.
+  The depth-comparison fallback removed in fa4e7c6992 is removed here too; the
+  guest compareEnable/compareOp remain intact. A mocked Vulkan entry point checks
+  the emitted sampler state without requiring a GPU. The now-unused cached flag
+  remains in its upstream owner, explicitly allowed as dead code.
+
+## 2026-09-16 — src/core/src/hle/service/ssl/mod.rs vs core/CMakeLists.txt
+
+### Intentional differences
+- Cargo continues to require OpenSSL; unlike Eden's optional CMake target it does
+  not select ssl_backend_none when the dependency is unavailable. The deleted
+  Schannel/SecureTransport placeholders had no runtime callers. Their removal
+  follows ee73920d28 and does not change the backend selected by ssl.rs.
+
+## 2026-09-16 — src/common/src/uuid.rs vs common/uuid.{h,cpp}
+
+### Intentional differences
+- MakeRFC4122V5 takes a fixed [u8; 16] rather than a mutable span; it copies the
+  same digest bytes and changes only byte 6's version and byte 8's variant bits.
+  The caller cannot supply a short digest or a null output pointer.
+
+## 2026-09-16 — src/core/src/hle/service/am/service/application_functions.rs vs core/hle/service/am/service/application_functions.{h,cpp}
+
+### Intentional differences
+- GetPseudoDeviceId returns Result<UUID> rather than accepting a nullable output
+  pointer. NACP's private raw field is read through GetRawBytes at the seed's
+  declared offset; the same eight little-endian bytes feed OpenSSL SHA-1. The
+  digest prefix goes through common::UUID::make_rfc4122_v5. Missing metadata
+  returns ResultUnknown instead of the previous successful all-zero placeholder.
+
+## 2026-09-16 — src/core/src/hle/service/ns/{async_result,application_manager_interface}.rs vs core/hle/service/ns/{async_result,application_manager_interface}.{h,cpp}
+
+### Intentional differences
+- IAsyncResult retains Option<Arc<Event>> instead of a borrowed Event pointer.
+  Closing the application-manager interface cannot leave a dangling cancellation
+  target. The existing Event bridge supplies the kernel endpoint; failure to
+  export it returns ResultUnknown instead of emitting an invalid handle.
+- Commands 936 and 4105 preserve their upstream stub payloads. Command 4042
+  returns the existing unknown event without signaling it; only Cancel signals
+  it. Get and GetErrorContext remain unimplemented as in the final upstream file.
+
+## 2026-09-16 — src/core/src/hle/service/nfp/{nfp,nfp_interface}.rs vs core/hle/service/nfp/{nfp,nfp_interface}.{h,cpp}
+
+### Intentional differences
+- Registration now belongs to nfp.rs; Rust's existing shared Interface type
+  retains the handlers instead of inheriting them. Command 25 uses the exact
+  command-3 callback for every manager-created interface, as in 42642f8bad.
+
+### Missing items
+- Preexisting system/debug-specific registration and initialization differ from
+  Eden: Rust still shares the user command table and lacks IPC wrappers for
+  several privileged/debug commands. Their IPC wrappers must be restored in
+  nfp_interface.rs before replacing the system/debug tables in nfp.rs; this
+  slice does not claim full NFP parity.
+
+## 2026-09-16 — src/core/src/hle/service/ns/read_only_application_control_data_interface.rs vs core/hle/service/ns/read_only_application_control_data_interface.{h,cpp}
+
+### Intentional differences
+- IAsyncValue stays local to this module as in the C++ translation unit. Event
+  owns the kernel bridge instead of ServiceContext plus a raw KEvent pointer;
+  the initially signaled state is propagated when exported to the IPC caller.
+- The list-title ID memcpy is mechanically isolated in decode_application_ids
+  for a regression test: u64 little-endian entries, incomplete trailing bytes
+  ignored. LanguageEntry is serialized field-by-field into a zeroed 0x300-byte
+  array (developer string at 0x200), avoiding raw Rust-memory copying.
+- Transfer-memory Arc is retained during writes. Handle lookup and metadata
+  lookup locks are released before writing through ApplicationMemory. A range
+  larger than the transfer object, or overflowing the address space, returns
+  ResultUnknown rather than overwriting adjacent guest memory as unchecked
+  upstream writes can. Event-export or application-memory setup failure also
+  returns ResultUnknown instead of returning an invalid handle.
+- IAsyncValue::Get rejects buffers shorter than four bytes instead of the
+  upstream unchecked memcpy. Its handler zero-initializes the output temporary;
+  upstream CMIF uses resize_destructive on ScratchBuffer and initializes only
+  the four offset bytes, leaving the tail unspecified. Rust must not expose
+  uninitialized host bytes. Signed size widening and offset bits are preserved.
+
+- Commands 5/19/23 now share a mechanical extraction of their identical buffer
+  preparation in this same module. Raw inputs preserve adjacent source/flag bytes
+  and eight-byte application-ID alignment; the preexisting command 0 parser also
+  now skips its alignment word. Outputs retain available size even when the icon
+  is truncated to the caller's buffer, and preserve the different flag encodings.
+- With user approval, SanitizeJPEGImageSize corrects the erroneous stb call:
+  STBIR_FILTER_BOX was passed as flags, with red designated alpha. Rust uses
+  area-box resampling in linear RGB with no alpha, and image's JPEG encoder at
+  quality 90 (common/stb exception). Pixels and compressed bytes deliberately
+  differ from Eden's actual default-filter/alpha behavior. Dimensions, conditional
+  resize, invalid-input early return and post-decode 0x20000 cap are retained.
+  Encoder failure preserves the original image instead of clearing it.
+- ListApplicationIcon decodes full u64 IDs instead of indexing individual bytes.
+  It preserves two metadata passes, count/size/payload order, transfer-owner
+  memory selection and signed async length conversion. Missing-icon lengths are
+  explicitly zeroed, rather than retaining stale transfer-memory bytes. Bounds
+  are checked before each write rather than asserted after it; an error can leave
+  an already-written prefix, but cannot write beyond the transfer object.
+- Tests exercise JPEG dimensions/channel treatment, unchanged already-sized and
+  invalid inputs, size cap, flags, zero filling, short output rejection and CMIF
+  response words. Full title/icon transfer-memory IPC and event export still
+  require runtime validation; these tests do not establish that coverage.
+
+## 2026-09-16 — src/core/src/hle/service/nvnflinger/{hwc_layer,display,hardware_composer,surface_flinger}.rs vs core/hle/service/nvnflinger/{hwc_layer,display}.h and {hardware_composer,surface_flinger}.{h,cpp}
+
+### Intentional differences
+- Layer-stack state uses the existing Arc/Mutex layer ownership: SurfaceFlinger
+  locks the selected layer to update the raw u32 mask, and HardwareComposer reads
+  it under its existing layer guard. Constants remain in hwc_layer.rs. These
+  host-only structures are not copied as guest ABI payloads.
+
+## 2026-09-16 — src/core/src/hle/service/vi/container.rs vs core/hle/service/vi/container.{h,cpp}
+
+### Intentional differences
+- SetLayerStackMask returns Result<(), ResultCode>; the container mutex spans
+  lookup and forwarding to SurfaceFlinger, preserving upstream NotFound and
+  success behavior without normalizing or restricting the mask.
+
+## 2026-09-16 — src/core/src/{gpu_core.rs,hle/service/nvdrv/devices/nvdisp_disp0.rs} and src/video_core/src/{gpu.rs,framebuffer_config.rs,renderer_null/renderer_null.rs} vs core/hle/service/nvdrv/devices/nvdisp_disp0.{h,cpp} and video_core/{gpu.h,gpu.cpp,framebuffer_config.h,framebuffer_config.cpp}
+
+### Intentional differences
+- The existing core/video_core trait bridge needs a second framebuffer carrier
+  in gpu_core.rs to avoid a cyclic crate dependency. Both carriers now initialize
+  the upstream mask, and nvdisp plus GPU forwarding preserve it unchanged.
+- FilterLayerStack returns a lifetime-bound slice of the input or scratch rather
+  than std::span. The all-matching and empty-input cases leave scratch untouched;
+  filtering clears scratch and preserves source order. Clone copies value fields.
+- The null-renderer test fixture explicitly initializes the added mask; no
+  null-renderer runtime behavior was changed.
+
+## 2026-09-16 — src/video_core/src/renderer_base.rs vs video_core/renderer_base.{h,cpp}
+
+### Intentional differences
+- Rust requires the layer-stack argument explicitly; callers formerly relying
+  on the C++ default pass LayerStackId::Default. RequestScreenshot publishes the
+  stack before the pending flag, and rejects duplicate requests without changing
+  the stored stack, buffer, layout or callback. Tests exercise this ordering.
+
+## 2026-09-16 — src/video_core/src/renderer_{vulkan,opengl}/renderer_{vulkan,opengl}.rs vs video_core/renderer_{vulkan,opengl}/renderer_{vulkan,opengl}.{h,cpp}
+
+### Intentional differences
+- Screenshot scratch is temporarily moved out with mem::take while RenderToBuffer
+  borrows the renderer mutably, then restored before callback delivery. Its
+  allocation is retained between captures. Applet filtering borrows disjoint
+  renderer fields directly. Both use upstream stack selection and preserve the
+  previous applet image when the filtered list is empty.
+
+## 2026-09-16 — src/video_core/src/renderer_metal/{renderer_metal.rs,present/layer.rs} vs video_core/renderer_{vulkan,opengl}/renderer_{vulkan,opengl}.{h,cpp}
+
+### Intentional differences
+- There is no upstream native Metal renderer. Metal resolves guest framebuffers
+  into retained texture snapshots before capture; those snapshots now retain the
+  layer mask. Capture methods apply the same bit predicate and empty-applet rule
+  to those snapshots. Excluded-layer cases copy retained snapshots into a local
+  vector; all-matching cases borrow the originals. Native execution requires macOS
+  and has not been validated on this Linux host.
+
+## 2026-09-16 — src/video_core/src/renderer_null/renderer_null.rs and src/ruzu/src/boot.rs vs video_core/renderer_base.{h,cpp}
+
+### Intentional differences
+- The null-renderer trait implementation forwards the newly explicit stack
+  argument. GTK's screenshot call supplies Default, matching the C++ default
+  argument; it does not change which layers user-triggered screenshots select.
+
+## 2026-09-16 — src/core/src/hle/service/am/display_layer_manager.rs vs core/hle/service/am/display_layer_manager.{h,cpp}
+
+### Intentional differences
+- This slice ports mode storage and GetLayerStackMask without changing the
+  existing Z/overlay policy. The managed-layer creation now forwards the mask
+  after visibility, ignoring both setter results as upstream does.
+
+### Unintentional differences (to fix)
+- The remaining 5d150cac5c Z/overlay/shared-layer-set changes are withheld pending
+  review: upstream SetLayerZIndex(layer, true) writes integer 1 after the explicit
+  overlay Z=3, undoing that value. This is not a boolean overlay setter. The port
+  still uses its previous Z/overlay behavior and does not claim full AM parity.
+
+## 2026-09-16 — src/core/src/hle/service/olsc/transfer_task_list_controller.rs vs core/hle/service/olsc/transfer_task_list_controller.{h,cpp}
+
+### Missing items
+- Command 21 is now implemented with the upstream result-only response. Existing
+  commands 0–9 still have a simplified table and child-interface wrappers; the
+  other upstream commands 10–30 (except 21) remain absent. Replacing that old
+  table requires porting the child objects, not merely adding successful stubs.
+
+## 2026-09-16 — src/core/src/hle/service/audio/{audio_controller,audio}.rs vs core/hle/service/audio/{audio_controller.h,audio_controller.cpp,audio.cpp}
+
+### Intentional differences
+- Unknown5000 returns the same controller through a new IPC interface reference,
+  as upstream shared_from_this does. Arc::new_cyclic plus Weak<Self> implements
+  that ownership without a strong-reference cycle. The constructor returns Arc
+  and audio.rs registers it directly, preserving the existing construction order.
+  No second controller, notification event or independent volume state is created.
+- The shared-ownership helper is Rust construction glue for enable_shared_from_this;
+  command ownership remains in audio_controller.rs. The regression checks pointer
+  identity, shared volume state, survival after dropping the original reference,
+  and destruction after dropping the last duplicate.
+
+### Unintentional differences (to fix)
+- Preexisting constructor volume initialization differs from current Eden:
+  Rust initializes target volumes to 15 and mute states to false; Eden maps UI
+  settings and applies them to sinks/audout during construction. This slice does
+  not change that side-effectful initialization or claim full audio parity.
+
+## 2026-09-16 — src/core/src/hle/service/pctl/{pctl_types,parental_control_service}.rs vs core/hle/service/pctl/{pctl_types.h,parental_control_service.h,parental_control_service.cpp}
+
+### Intentional differences
+- raw_play_timer_settings remains owned by each parental-control interface,
+  protected by a Rust mutex because IPC handlers borrow the service immutably.
+  GetPlayTimerSettings (145601) reads that state; SetPlayTimerSettings (195101)
+  stores it. The old command 1456 retains its separate, always-zero reply.
+- Replies serialize each u32 explicitly rather than copying raw host memory.
+  Both structs contain only u32 arrays: old 13 words/0x34 bytes, current
+  17 words/0x44 bytes, alignment 4, no padding. Tests check those sizes, initial
+  zeros, complete high-bit-preserving IPC round trips and per-interface isolation.
+- Eden lists 145601 twice; Rust registers it once with the same handler.
+
+### Missing items
+- This slice does not replace the preexisting generic success handlers for
+  other parental-control commands. In particular synchronization/unlinked event
+  commands still need their actual event owners and output handles ported.
+
+## 2026-09-16 — src/core/src/hle/service/ns/{application_manager_interface,read_only_application_control_data_interface}.rs vs core/hle/service/ns/{application_manager_interface,read_only_application_control_data_interface}.{h,cpp}
+
+### Intentional differences
+- The application-manager wrappers for ListApplicationTitle/Icon (407/408)
+  delegate to the matching read-only service as upstream does. Rust exposes
+  those entry points to the parent module only; their implementation stays in
+  read_only_application_control_data_interface.rs.
+- Command 419 signals the existing Rust Event bridge. Command 4088 aliases the
+  4022 handler, preserving native event identity rather than creating a second
+  event. Unknown4023 writes the explicit zero u64; Unknown4053 returns only the
+  result, matching the upstream stubs rather than a generic success dispatcher.
+- Regression tests exercise the response widths, background-request signal,
+  alias event identity and forwarding errors when a test context cannot export
+  a completion event. This does not validate the full HOME runtime sequence.
+
+## 2026-09-16 — src/core/src/hle/service/ns/{read_only_application_record_interface,service_getter_interface,application_manager_interface}.rs vs core/hle/service/ns/{read_only_application_record_interface,service_getter_interface,application_manager_interface}.{h,cpp}
+
+### Intentional differences
+- The read-only record service now retains the non-owning SystemRef required
+  for listing. Its command 3 delegates to the existing application-manager IPC
+  entry point rather than duplicating record filtering and serialization; that
+  entry point is exposed only to the parent module. Commands 0/2 invoke the
+  upstream true/false methods, and NotifyApplicationFailure remains unimplemented.
+- Getters 7989/7991 now return newly constructed Arc-backed child services, as
+  upstream constructs shared_ptr children. Their method owners and fresh-instance
+  lifetime remain unchanged; they no longer consist of log-only empty methods.
+- Tests cover getter registration, child command availability and actual child
+  response words for existence and corruption. Record-list registration is
+  checked; exercising its delegation requires a live System/content provider.
+
+## 2026-09-16 — src/core/src/hle/service/set/{settings_types,system_settings_server}.rs vs core/hle/service/set/{settings_types.h,system_settings_server.h,system_settings_server.cpp}
+
+### Intentional differences
+- AccountUserSettings is an explicitly zero-initialized 0x40-byte array (alignment
+  one, no padding). GetAccountUserSettings returns it through the mapped buffer
+  plus a zero u32 count; GetDefaultAccountUserSettings returns it inline. Both
+  keep upstream's empty default, without changing saved user settings.
+- The existing Rust settings service wrapper locks its inner settings owner
+  only while obtaining the response, releasing it before IPC buffer writes.
+  Undersized mapped output returns ResultUnknown rather than an unchecked copy.
+- GetHttpAuthConfigs returns the upstream zero s32 count without copying its
+  uninitialized OutBuffer scratch bytes. The guest buffer remains untouched when
+  there are no entries. Tests cover default bytes/layout, inline response words,
+  mapped-output size validation and zero count (not an actual guest-memory copy).
+
+## 2026-09-16 — src/core/src/hle/service/acc/acc.rs vs core/hle/service/acc/acc.{h,cpp}
+
+### Intentional differences
+- The existing Rust profile factories share IProfileCommon with an editor flag,
+  rather than C++ subclasses whose only difference is that flag. Unknown20/21/30
+  remain owned by IProfileCommon; Unknown110 is registered only for editors.
+  Their separate handlers retain upstream's result-only responses and do not
+  access or modify the profile. Comments mentioning additional output bytes in
+  Eden are not treated as implemented behavior. Tests compare complete response
+  buffers with a result-only reply and check editor-only registration.
+
+## 2026-09-16 — src/core/src/hle/service/pctl/parental_control_service.rs vs core/hle/service/pctl/parental_control_service.{h,cpp}
+
+### Intentional differences
+- Synchronization and unlinked events use the same lazy kernel bridge as the
+  existing suspension event, rather than eagerly allocating through Eden's
+  ServiceContext. The three event owners remain separate per service instance;
+  getters return copies of their persistent, initially unsignaled readable ends.
+  A missing IPC/kernel context returns an error, never success with a null handle.
+- GetPlayTimerRemainingTime writes the upstream signed maximum through a u32 IPC
+  word, preserving its exact bit pattern. No guest scheduling workaround is used.
+- Tests cover distinct/stable registered readable objects, unsignaled state,
+  missing-context failure and the remaining-time reply; they do not substitute
+  for checking the final guest handle and navigation in the running applet.

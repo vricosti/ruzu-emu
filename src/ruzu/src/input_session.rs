@@ -122,6 +122,28 @@ impl Control {
                 self.held = Some((ids, Instant::now() + duration));
                 Ok(result)
             }
+            Some("set_buttons") => {
+                // Replay replaces the held set without retriggering unchanged buttons.
+                let (ids, duration) = if request.get("buttons") == Some(&json!([])) {
+                    (Vec::new(), Duration::from_secs(1))
+                } else {
+                    parse_press(&request)?
+                };
+                let old = self.held.as_ref().map(|(ids, _)| ids.clone()).unwrap_or_default();
+                let released = old.iter().copied().filter(|id| !ids.contains(id)).collect();
+                let pressed = ids.iter().copied().filter(|id| !old.contains(id)).collect();
+                // Retain the union until both operations succeed, so errors cannot
+                // leave injected buttons outside the watchdog's ownership.
+                let mut owned = old;
+                for id in &ids {
+                    if !owned.contains(id) { owned.push(*id); }
+                }
+                self.held = Some((owned, Instant::now() + duration));
+                (self.handler)(Command::Buttons { ids: released, pressed: false })?;
+                (self.handler)(Command::Buttons { ids: pressed, pressed: true })?;
+                self.held = if ids.is_empty() { None } else { Some((ids, Instant::now() + duration)) };
+                Ok(json!({"updated": true}))
+            }
             Some("capture") => {
                 let name = request
                     .get("name")
@@ -136,7 +158,7 @@ impl Control {
                 }
                 (self.handler)(Command::Capture(path))
             }
-            _ => Err("expected status, press, release or capture".into()),
+            _ => Err("expected status, press, set_buttons, release or capture".into()),
         }
     }
 
@@ -281,6 +303,37 @@ mod tests {
         ] {
             assert!(!valid_capture_name(name));
         }
+    }
+
+    #[test]
+    fn replay_sets_preserve_overlaps_and_watchdog_releases() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let directory = tempfile::tempdir().unwrap();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let output = events.clone();
+        let mut control = Control {
+            socket: UnixDatagram::unbound().unwrap(),
+            directory: directory.path().into(),
+            held: None,
+            handler: Box::new(move |event| {
+                if let Command::Buttons { ids, pressed } = event {
+                    if !ids.is_empty() { output.borrow_mut().push((ids, pressed)); }
+                }
+                Ok(Value::Null)
+            }),
+        };
+        control.socket.set_nonblocking(true).unwrap();
+        for buttons in [json!(["L"]), json!(["L", "R"]), json!(["L", "R"]), json!(["R"])] {
+            control.execute(json!({"command":"set_buttons", "buttons":buttons, "hold_ms":1000})).unwrap();
+        }
+        assert!(control.execute(json!({"command":"set_buttons", "buttons":["INVALID"], "hold_ms":1000})).is_err());
+        control.held.as_mut().unwrap().1 = Instant::now();
+        control.poll();
+        assert_eq!(&*events.borrow(), &[
+            (vec![6], true), (vec![7], true), (vec![6], false), (vec![7], false),
+        ]);
+        assert!(control.held.is_none());
     }
 
     #[test]

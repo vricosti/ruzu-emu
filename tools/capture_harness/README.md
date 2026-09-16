@@ -233,8 +233,30 @@ for the mapped HID button state and inspect a fresh screenshot between menu
 steps. For a user-specified 40 s startup / 7 s between A presses, wait 40 s after
 launch, then issue individual bounded presses with at least 7 s between them.
 Stop when the desired scene is visible; do not blindly keep pressing in gameplay.
-Only explicit command timestamps are replayable this way; this interface does
-not record physical input. Existing TAS recording remains a separate facility.
+For manual menu navigation, the Python helper can sample the mapped guest buttons
+and replay their state changes:
+
+```bash
+python3 tools/capture_harness/gui_control.py /tmp/ruzu-input-UNIQUE record menu.json --duration 180
+# Navigate manually, release all buttons, then stop the recorder with Ctrl-C.
+# Return to exactly the same starting menu before replaying:
+python3 tools/capture_harness/gui_control.py /tmp/ruzu-input-UNIQUE replay menu.json
+```
+
+This records player 1's logical buttons every 20 ms, not raw keyboard events or
+analog sticks. Taps shorter than the polling interval can be missed. It is not
+frame-synchronized TAS: different loading times can change the destination menu.
+Start with released buttons and do not manually operate the controller during
+replay. Home, Capture and the right Joy-Con's SL/SR are ignored, not replayed.
+Avoid using them to navigate while recording. Recordings
+are title-checked, never overwritten, and marked incomplete if recording fails.
+A sampling/replay delay over 250 ms aborts instead of silently continuing with
+bad timing. Replay checks the running session and refreshes a one-second GUI
+watchdog, preserving overlapping holds without retriggering unchanged buttons.
+Cancellation releases injected buttons; if the client disappears, the watchdog
+releases them when the GUI next processes events. Existing TAS remains separate.
+
+This GUI bridge is Ruzu-specific tooling, not an Eden emulation-core port.
 
 `status` also returns the existing GUI performance snapshot (`game_fps`,
 `system_fps`, `frame_seconds`), without resetting the emulator's counters. Avoid

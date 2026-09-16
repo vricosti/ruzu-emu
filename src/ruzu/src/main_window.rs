@@ -1808,17 +1808,15 @@ impl GMainWindow {
 
         // Root vertical layout. On macOS the menu bar lives in the native
         // global menu bar (installed once via `init_app_menu` on the
-        // application's `startup`). Controller navigation also needs an
-        // in-window menu there: GTK cannot focus Cocoa's global menu.
+        // application's `startup`). Do not duplicate it for controller
+        // navigation: the native macOS menu remains mouse/keyboard-only.
         // Every other platform has no global menu
         // bar, so the same `GMenuModel` is rendered in-window as a
         // `PopoverMenuBar` — the position upstream's `QMenuBar` occupies.
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         install_menu_css();
 
-        let menu_bar = if !cfg!(target_os = "macos")
-            || *common::settings::values().controller_navigation.get_value()
-        {
+        let menu_bar = if !cfg!(target_os = "macos") {
             let menubar = gtk::PopoverMenuBar::from_model(Some(&build_menu_model()));
             menubar.set_halign(gtk::Align::Fill);
             menubar.set_hexpand(true);
@@ -4284,8 +4282,10 @@ impl GMainWindow {
                 let buttons: Vec<bool> = controller.get_buttons_values().iter().map(|value| value.value).collect();
                 let performance = self.session.borrow().as_ref().and_then(EmulationSession::perf_stats)
                     .map(|stats| json!({"game_fps": stats.average_game_fps,
+                        "emulation_speed": stats.emulation_speed,
                         "system_fps": stats.system_fps, "frame_seconds": stats.frametime}));
                 Ok(json!({"pid": std::process::id(), "has_session": self.session.borrow().is_some(),
+                    "program_id": self.session.borrow().as_ref().and_then(EmulationSession::program_id),
                     "generation": self.session_generation.get(), "buttons": buttons,
                     "performance": performance}))
             }

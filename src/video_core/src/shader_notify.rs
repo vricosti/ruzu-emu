@@ -93,6 +93,12 @@ impl ShaderNotify {
 pub struct ShaderNotifyHandle(NonNull<ShaderNotify>);
 
 impl ShaderNotifyHandle {
+    /// Balance the upstream start/complete pair across Rust early returns and unwinding.
+    pub fn build_scope(self) -> ShaderBuildScope {
+        self.mark_shader_building();
+        ShaderBuildScope(self)
+    }
+
     /// The caller must ensure the pointee outlives every copied handle and all
     /// worker closures containing one.
     pub(crate) unsafe fn new(shader_notify: &ShaderNotify) -> Self {
@@ -113,6 +119,15 @@ impl ShaderNotifyHandle {
 unsafe impl Send for ShaderNotifyHandle {}
 unsafe impl Sync for ShaderNotifyHandle {}
 
+#[must_use = "keep the notification scope alive until compilation completes"]
+pub struct ShaderBuildScope(ShaderNotifyHandle);
+
+impl Drop for ShaderBuildScope {
+    fn drop(&mut self) {
+        self.0.mark_shader_complete();
+    }
+}
+
 impl Default for ShaderNotify {
     fn default() -> Self {
         Self::new()
@@ -122,6 +137,29 @@ impl Default for ShaderNotify {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_scope_balances_success_error_and_unwind() {
+        let notify = ShaderNotify::new();
+        let handle = unsafe { ShaderNotifyHandle::new(&notify) };
+        {
+            let _build = handle.build_scope();
+            assert_eq!(notify.num_building.load(Ordering::SeqCst), 1);
+            assert_eq!(notify.num_complete.load(Ordering::SeqCst), 0);
+        }
+        let failed = || -> Result<(), ()> {
+            let _build = handle.build_scope();
+            Err(())?;
+            Ok(())
+        };
+        assert!(failed().is_err());
+        assert!(std::panic::catch_unwind(|| {
+            let _build = handle.build_scope();
+            panic!("test compilation failure");
+        }).is_err());
+        assert_eq!(notify.num_building.load(Ordering::SeqCst), 3);
+        assert_eq!(notify.num_complete.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn reports_started_builds_until_the_completion_timeout() {

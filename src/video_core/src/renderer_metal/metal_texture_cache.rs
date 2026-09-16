@@ -340,6 +340,7 @@ impl MetalTextureCacheRuntime {
         output: &mut [u8],
         copies: &[BufferImageCopy],
     ) -> Result<(), MetalTextureCacheError> {
+        let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::Download);
         if image.guest_samples() > 1 || image.samples() > 1 {
             return self.download_msaa_memory(image, output, copies);
         }
@@ -1179,6 +1180,7 @@ impl TextureCacheParams for MetalTextureCacheParams {
         staging: &Self::AsyncBuffer,
         copies: &[BufferImageCopy],
     ) {
+        let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::Upload);
         let image = cache.slot_images[image_id]
             .backend
             .take()

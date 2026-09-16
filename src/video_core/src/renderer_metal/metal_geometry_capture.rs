@@ -13,7 +13,7 @@ use super::metal_geometry_pipeline::{
 use super::metal_graphics_pipeline::MetalPreparedStage;
 use super::metal_primitive_assembler::MetalPrimitiveAssembly;
 use super::metal_scheduler::MetalScheduler;
-use super::metal_shader::{compile_msl_library, MetalShaderError};
+use super::metal_shader::MetalShaderError;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -175,7 +175,7 @@ void geometry_replay_mesh(const object_data GeometryReplayPayload& payload [[pay
             input_vertices = layout.input_vertices,
             arguments = arguments.join(", ")
         );
-        let library = compile_msl_library(device.device(), &source, artifact.language_version)?;
+        let library = device.shader_cache().library(device.device(), &source, artifact.language_version)?;
         let function = |name: &str| {
             library
                 .newFunctionWithName(&NSString::from_str(name))

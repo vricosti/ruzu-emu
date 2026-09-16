@@ -690,6 +690,7 @@ impl MetalScheduler {
     }
 
     fn wait_for_cohort(entry: &InFlightCommandBuffer) -> Result<(), MetalSchedulerError> {
+        let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::GpuWait);
         Self::check_cohort_errors(entry)?;
         if let Some(prefix) = &entry.upload_prefix {
             prefix.waitUntilCompleted();

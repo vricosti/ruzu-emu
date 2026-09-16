@@ -1,5 +1,20 @@
 # Upstream parity notes
 
+## 2026-09-16 - renderer_metal CPU stall diagnostics (native tooling)
+
+### Intentional differences
+- `metal_stall_profiler.rs` has no Eden counterpart: optional CPU wall-time
+  probes supplement the native GPU counters without changing rendering state.
+- `metal_pipeline_cache.rs`, `metal_shader.rs`, `metal_scheduler.rs`,
+  `metal_presenter.rs`, `metal_buffer_cache.rs` and `metal_texture_cache.rs`
+  retain their operation ownership and ordering. Scope timers observe existing
+  calls; no new waits, resource lifetimes, queue submissions or cache policy.
+- Timing storage is bounded and thread-local. Logs explicitly label inclusive
+  operation times and submission gaps, not actual display or GPU execution time.
+  Activation and interpretation are documented in docs/metal-stall-profiling.md.
+- No guest binary layouts change. This is diagnostic instrumentation, not a
+  performance correction or evidence of a particular game's pause cause.
+
 ## 2026-09-16 - renderer_metal/metal_rasterizer.rs vs renderer_vulkan/vk_rasterizer.{h,cpp}
 
 ### Intentional differences
@@ -18201,3 +18216,35 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   to another menu. A weak window reference and a fresh running-session/profile
   selection check prevent a delayed launch after destruction or a competing
   launch. This changes frontend event ordering only, not guest applet dispatch.
+
+## 2026-09-16 — Metal library reuse and shader build notifications
+
+### Intentional differences
+- `renderer_metal/metal_shader_cache.rs`, `metal_device.rs`, `metal_shader.rs`,
+  `metal_pipeline_cache.rs`, `metal_geometry_capture.rs`,
+  `metal_geometry_pipeline.rs`, and `metal_tessellation_pipeline.rs`: Eden has
+  no native Metal equivalent. A device-owned cache shares exact-source libraries
+  and entry-point functions across pipeline variants and disk-load workers.
+  Language version participates in identity; math mode remains fixed by the
+  compiler wrapper. Binding/execution metadata is reconstructed per artifact;
+  native pipeline keys and draw ordering are unchanged. The global lookup lock
+  is released before compilation; per-entry locking serializes identical requests.
+  Errors remain retryable. FIFO retention bounds source keys and entry count;
+  live modules keep their own retained native references after eviction.
+- `shader_notify.rs` vs Eden `video_core/shader_notify.{h,cpp}` and
+  `renderer_vulkan/vk_{graphics,compute}_pipeline.cpp`: the existing upstream
+  start/complete protocol and two-second report window are preserved. A Rust
+  scope guard balances notifications on success, errors, and unwinding.
+  Metal counts module-build and pipeline-build phases separately, since native
+  library compilation is distinct from pipeline construction. Cache hits in the
+  pipeline cache do not start a new phase; a module-build phase can reuse libraries.
+- `renderer_metal/{metal_rasterizer,renderer_metal}.rs`, `ruzu/boot.rs`, and
+  `ruzu_cmd/main.rs`: GUI and CLI pass the GPU-owned notification handle to the
+  native pipeline cache; standalone headless renderer tests may omit it. Eden's
+  Vulkan pipeline constructors likewise accept an optional notification pointer.
+
+### Verification
+- Native tests cover exact source/version identity, bounded eviction, concurrent
+  reuse across device clones, distinct entry points, and retryable errors.
+- The shared notification test covers successful completion, early error return,
+  and unwinding. No GPU wait, dropped draw, or asynchronous fallback is introduced.

@@ -673,14 +673,25 @@ pub fn compile_native_msl_artifact(
     device: &ProtocolObject<dyn MTLDevice>,
     artifact: MetalShaderArtifact,
 ) -> Result<MetalShaderModule, MetalShaderError> {
+    compile_native_msl_artifact_cached(device, artifact, None)
+}
+
+fn compile_native_msl_artifact_cached(
+    device: &ProtocolObject<dyn MTLDevice>,
+    artifact: MetalShaderArtifact,
+    cache: Option<&super::metal_shader_cache::MetalShaderCache>,
+) -> Result<MetalShaderModule, MetalShaderError> {
     validate_native_binding_layout(&MetalDeviceProfile::query(device), &artifact.bindings)?;
     let language_version = artifact.language_version;
     let execution = artifact.execution;
-    let library = compile_msl_library(device, &artifact.source.source, artifact.language_version)?;
-    let entry_point = NSString::from_str(&artifact.entry_point);
-    let function = library
-        .newFunctionWithName(&entry_point)
-        .ok_or_else(|| MetalShaderError::MissingEntryPoint(artifact.entry_point.clone()))?;
+    let (library, function) = if let Some(cache) = cache {
+        cache.function(device, &artifact.source.source, language_version, &artifact.entry_point)?
+    } else {
+        let library = compile_msl_library(device, &artifact.source.source, language_version)?;
+        let function = library.newFunctionWithName(&NSString::from_str(&artifact.entry_point))
+            .ok_or_else(|| MetalShaderError::MissingEntryPoint(artifact.entry_point.clone()))?;
+        (library, function)
+    };
     Ok(MetalShaderModule {
         source: artifact.source,
         bindings: artifact.bindings,
@@ -722,6 +733,7 @@ pub(crate) fn compile_msl_library(
     version: MslVersion,
 ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, MetalShaderError> {
     let compile_options = MTLCompileOptions::new();
+    let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::MslCompile);
     compile_options.setLanguageVersion(metal_language_version(version)?);
     if objc2::available!(macos = 15.0, ..) {
         compile_options.setMathMode(MTLMathMode::Safe);
@@ -782,6 +794,30 @@ pub fn compile_direct_msl_shader_with_bindings(
     options: &MetalShaderCompileOptions,
     bindings: &mut Bindings,
 ) -> Result<MetalShaderModule, DirectMslCompileError> {
+    compile_direct_msl_shader_impl(device, program, profile, runtime_info, options, bindings, None)
+}
+
+pub(super) fn compile_cached_direct_msl_shader_with_bindings(
+    device: &super::metal_device::MetalDevice,
+    program: &Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MetalShaderCompileOptions,
+    bindings: &mut Bindings,
+) -> Result<MetalShaderModule, DirectMslCompileError> {
+    compile_direct_msl_shader_impl(device.device(), program, profile, runtime_info, options,
+        bindings, Some(device.shader_cache()))
+}
+
+fn compile_direct_msl_shader_impl(
+    device: &ProtocolObject<dyn MTLDevice>,
+    program: &Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MetalShaderCompileOptions,
+    bindings: &mut Bindings,
+    cache: Option<&super::metal_shader_cache::MetalShaderCache>,
+) -> Result<MetalShaderModule, DirectMslCompileError> {
     let artifact = emit_direct_msl_artifact_with_bindings(
         device,
         program,
@@ -800,7 +836,7 @@ pub fn compile_direct_msl_shader_with_bindings(
             requested: requested_execution,
         });
     }
-    Ok(compile_native_msl_artifact(device, artifact)?)
+    Ok(compile_native_msl_artifact_cached(device, artifact, cache)?)
 }
 
 fn metal_language_version(version: MslVersion) -> Result<MTLLanguageVersion, MetalShaderError> {

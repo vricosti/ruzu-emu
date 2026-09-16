@@ -36,7 +36,7 @@ use super::metal_pipeline_cache::{MetalRenderPipelineKey, MetalVertexInputState}
 use super::metal_primitive_assembler::{MetalPrimitiveAssembly, MetalVertexStream};
 use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
 use super::metal_staging_buffer_pool::MetalStagingBufferPool;
-use super::metal_shader::{compile_msl_library, MetalShaderError, MetalShaderModule};
+use super::metal_shader::{MetalShaderError, MetalShaderModule};
 use super::metal_geometry_capture::{MetalGeometryCapture, MetalGeometryCapturedDraw};
 
 pub enum MetalGeometryShader {
@@ -460,7 +460,7 @@ kernel void geometry_vertices({parameters}) {{
             vertex_entry = vertex.entry_point,
             arguments = arguments.join(", ")
         );
-        let library = compile_msl_library(device.device(), &source, vertex.language_version)?;
+        let library = device.shader_cache().library(device.device(), &source, vertex.language_version)?;
         let function = library
             .newFunctionWithName(&NSString::from_str("geometry_vertices"))
             .ok_or_else(|| MetalShaderError::MissingEntryPoint("geometry_vertices".into()))?;
@@ -677,7 +677,7 @@ void geometry_object(object_data MslGeometryPayload& payload [[payload]], mesh_g
             params = DRAW_PARAMS,
             input_vertices = layout.input_vertices
         );
-        let library = compile_msl_library(device.device(), &source, version)?;
+        let library = device.shader_cache().library(device.device(), &source, version)?;
         let function = library
             .newFunctionWithName(&NSString::from_str("geometry_object"))
             .ok_or_else(|| MetalShaderError::MissingEntryPoint("geometry_object".into()))?;

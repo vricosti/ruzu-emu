@@ -443,6 +443,10 @@ pub struct MetalRasterizer {
 }
 
 impl MetalRasterizer {
+    pub(super) fn set_shader_notify(&mut self, notify: crate::shader_notify::ShaderNotifyHandle) {
+        self.pipeline_cache.set_shader_notify(notify);
+    }
+
     pub fn new(
         device: MetalDevice,
         syncpoints: Arc<SyncpointManager>,

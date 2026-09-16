@@ -88,11 +88,15 @@ impl RendererMetal {
         frame_end_notify: Arc<dyn Fn() + Send + Sync>,
         syncpoints: Arc<SyncpointManager>,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
+        shader_notify: Option<crate::shader_notify::ShaderNotifyHandle>,
     ) -> Result<Self, MetalRendererError> {
         let device = MetalDevice::new()?;
         let layer = unsafe { MetalLayer::from_raw(window_info.render_surface, &device)? };
         let presenter = MetalPresenter::new(layer, &device)?;
-        let rasterizer = MetalRasterizer::new(device.clone(), syncpoints, device_memory)?;
+        let mut rasterizer = MetalRasterizer::new(device.clone(), syncpoints, device_memory)?;
+        if let Some(notify) = shader_notify {
+            rasterizer.set_shader_notify(notify);
+        }
         log::info!("Metal device: {}", device.name());
         Ok(Self {
             device,
@@ -481,6 +485,7 @@ mod tests {
             Arc::new(|| {}),
             Arc::new(SyncpointManager::new()),
             Arc::new(MaxwellDeviceMemoryManager::default()),
+            None,
         )
         .unwrap()
     }

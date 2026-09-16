@@ -235,12 +235,14 @@ impl BufferCacheBuffer for Buffer {
     }
 
     fn immediate_upload(&self, offset: u64, data: &[u8]) {
+        let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::Upload);
         self.allocation
             .write(offset as usize, data)
             .expect("Metal immediate buffer upload exceeded its allocation");
     }
 
     fn immediate_download(&self, offset: u64, data: &mut [u8]) {
+        let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::Download);
         self.allocation
             .read(offset as usize, data)
             .expect("Metal immediate buffer download exceeded its allocation");
@@ -736,6 +738,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         _barrier: bool,
         can_reorder_upload: bool,
     ) {
+        let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::Upload);
         let upload_prefix = can_reorder_upload
             && Arc::ptr_eq(&src.buffer, unsafe { self.staging_pool.as_ref() }.stream_buf());
         let work = if upload_prefix {
@@ -755,6 +758,7 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         copies: &[BufferCopy],
         _barrier: bool,
     ) {
+        let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::Download);
         self.encode_copies(&dst.buffer, &src.allocation, copies, ComputeWork::BufferDownload, false);
     }
 

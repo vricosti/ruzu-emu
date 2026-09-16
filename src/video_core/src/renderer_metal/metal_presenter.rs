@@ -28,11 +28,13 @@ impl MetalPresenter {
         layers: &[Layer],
     ) -> Result<(), MetalPresenterError> {
         scheduler.flush()?;
+        let drawable_timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::Drawable);
         let drawable = self
             .layer
             .as_ref()
             .nextDrawable()
             .ok_or(MetalPresenterError::NoDrawable)?;
+        drop(drawable_timing);
         let command = scheduler.begin()?;
         let target = drawable.texture();
         self.draw_layers(
@@ -52,6 +54,7 @@ impl MetalPresenter {
         let drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
         command.presentDrawable(drawable);
         scheduler.commit_presentation(command)?;
+        super::metal_stall_profiler::presented();
         Ok(())
     }
 

@@ -10,6 +10,7 @@ use objc2_metal::{
     MTLReadWriteTextureTier,
 };
 use thiserror::Error;
+use std::sync::Arc;
 
 use shader_recompiler::backend::msl::MslVersion;
 
@@ -31,6 +32,7 @@ pub struct MetalDevice {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     profile: MetalDeviceProfile,
+    shader_cache: Arc<super::metal_shader_cache::MetalShaderCache>,
 }
 
 /// Runtime capability snapshot used by every Metal backend policy decision.
@@ -320,11 +322,16 @@ impl MetalDevice {
             device,
             command_queue,
             profile,
+            shader_cache: Arc::new(super::metal_shader_cache::MetalShaderCache::default()),
         })
     }
 
     pub fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.device
+    }
+
+    pub(super) fn shader_cache(&self) -> &super::metal_shader_cache::MetalShaderCache {
+        &self.shader_cache
     }
 
     pub fn command_queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {

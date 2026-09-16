@@ -36,7 +36,9 @@ use super::metal_geometry_pipeline::{
 use super::metal_pipeline_cache::MetalRenderPipelineKey;
 use super::metal_primitive_assembler::MetalPatchAssembly;
 use super::metal_scheduler::{MetalScheduler, MetalSchedulerError};
-use super::metal_shader::{compile_msl_library, validate_native_binding_layout, MetalShaderError};
+use super::metal_shader::{validate_native_binding_layout, MetalShaderError};
+#[cfg(test)]
+use super::metal_shader::compile_msl_library;
 use super::metal_staging_buffer_pool::MetalStagingBufferPool;
 
 pub struct MetalTessellationControlPipeline {
@@ -378,7 +380,7 @@ static_assert(sizeof(MslControlPatch) == {patch_stride}, "TES patch stride");
             entry = artifact.entry_point,
             arguments = arguments.join(", "),
         );
-        let library = compile_msl_library(device.device(), &source, artifact.language_version)?;
+        let library = device.shader_cache().library(device.device(), &source, artifact.language_version)?;
         let function = library
             .newFunctionWithName(&NSString::from_str("tessellation_evaluate"))
             .ok_or_else(|| MetalShaderError::MissingEntryPoint("tessellation_evaluate".into()))?;
@@ -573,7 +575,7 @@ kernel void tessellation_factors(const device MslControlPatch* patches [[buffer(
             patch_stride = layout.patch_stride(),
             components = edges + inners
         );
-        let library = compile_msl_library(device.device(), &source, MslVersion::V2_3)?;
+        let library = device.shader_cache().library(device.device(), &source, MslVersion::V2_3)?;
         let function = library
             .newFunctionWithName(&NSString::from_str("tessellation_factors"))
             .ok_or_else(|| MetalShaderError::MissingEntryPoint("tessellation_factors".into()))?;
@@ -716,7 +718,7 @@ kernel void tessellation_control({parameters}) {{
             entry = artifact.entry_point,
             arguments = arguments.join(", ")
         );
-        let library = compile_msl_library(device.device(), &source, artifact.language_version)?;
+        let library = device.shader_cache().library(device.device(), &source, artifact.language_version)?;
         let function = library
             .newFunctionWithName(&NSString::from_str("tessellation_control"))
             .ok_or_else(|| MetalShaderError::MissingEntryPoint("tessellation_control".into()))?;

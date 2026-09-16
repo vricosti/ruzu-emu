@@ -788,6 +788,7 @@ fn run_boot(
                             frame_end_notify,
                             syncpoints.clone(),
                             Arc::clone(&device_memory),
+                            Some(unsafe { gpu.shader_notify_handle() }),
                         )
                         .map_err(|error| format!("Failed to create Metal renderer: {error}"))?,
                     )

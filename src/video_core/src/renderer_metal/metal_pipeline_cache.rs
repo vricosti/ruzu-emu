@@ -71,7 +71,7 @@ use super::metal_geometry_pipeline::{
 use super::metal_tessellation_pipeline::{MetalTessellationPipeline, MetalTessellationPipelineError,
     MetalTessellationShaderStages};
 use super::metal_shader::{
-    compile_direct_msl_shader_with_bindings, direct_msl_options, DirectMslCompileError,
+    compile_cached_direct_msl_shader_with_bindings, direct_msl_options, DirectMslCompileError,
     MetalShaderBindingLayout, MetalShaderCompileOptions, MetalShaderError, MetalShaderModule,
 };
 #[cfg(feature = "metal-spirv-validation")]
@@ -746,6 +746,8 @@ where
 }
 
 pub struct MetalPipelineCache {
+    // Headless cache tests have no GPU/UI notification owner.
+    shader_notify: Option<crate::shader_notify::ShaderNotifyHandle>,
     device: MetalDevice,
     profile: Profile,
     host_info: HostTranslateInfo,
@@ -777,6 +779,7 @@ impl MetalPipelineCache {
             device,
             profile,
             host_info,
+            shader_notify: None,
             render_pipelines: HashMap::new(),
             geometry_pipelines: HashMap::new(),
             tessellation_pipelines: HashMap::new(),
@@ -798,6 +801,10 @@ impl MetalPipelineCache {
 
     pub fn device(&self) -> &MetalDevice {
         &self.device
+    }
+
+    pub(super) fn set_shader_notify(&mut self, notify: crate::shader_notify::ShaderNotifyHandle) {
+        self.shader_notify = Some(notify);
     }
 
     pub fn profile(&self) -> &Profile {
@@ -920,16 +927,16 @@ impl MetalPipelineCache {
                         profile, &translated_stage.runtime_info, &msl_options, &mut direct_bindings)
                         .map_err(DirectMslCompileError::from)?)
                 } else {
-                    MetalGeometryShader::Mesh(Arc::new(compile_direct_msl_shader_with_bindings(
-                        device.device(), &translated_stage.program, profile,
+                    MetalGeometryShader::Mesh(Arc::new(compile_cached_direct_msl_shader_with_bindings(
+                        device, &translated_stage.program, profile,
                         &translated_stage.runtime_info, &stage_options, &mut direct_bindings)?))
                 };
                 geometry = Some((shader, translated_stage.runtime_info.clone(), layout,
                     translated_stage.program.invocations));
                 continue;
             }
-            let active = Arc::new(compile_direct_msl_shader_with_bindings(
-                device.device(),
+            let active = Arc::new(compile_cached_direct_msl_shader_with_bindings(
+                device,
                 &translated_stage.program,
                 profile,
                 &translated_stage.runtime_info,
@@ -1115,6 +1122,8 @@ impl MetalPipelineCache {
         self.graphics_key.fixed_state.refresh(draw, &features);
         let key = self.graphics_key.clone();
         if !self.graphics_shader_modules.contains_key(&key) {
+            let _notification = self.shader_notify.map(|notify| notify.build_scope());
+            let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::ShaderBuild);
             let mut environments = GraphicsEnvironments::default();
             shared_cache.get_graphics_environments(&mut environments, &key.unique_hashes);
             let Some(stages) = Self::build_graphics_shader_stages(
@@ -1151,6 +1160,8 @@ impl MetalPipelineCache {
             Entry::Occupied(entry) => return Ok(Arc::clone(entry.get())),
             Entry::Vacant(entry) => entry,
         };
+        let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::TessellationPipeline);
+        let _notification = self.shader_notify.map(|notify| notify.build_scope());
         let pipeline = MetalTessellationPipeline::new(&self.device, &key, stages,
             fragment.map(MetalShaderModule::function), 64)?;
         Ok(Arc::clone(entry.insert(Arc::new(pipeline))))
@@ -1173,6 +1184,8 @@ impl MetalPipelineCache {
             Entry::Occupied(entry) => return Ok(Arc::clone(entry.get())),
             Entry::Vacant(entry) => entry,
         };
+        let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::GeometryPipeline);
+        let _notification = self.shader_notify.map(|notify| notify.build_scope());
         let pipeline = MetalGeometryPipeline::new(&self.device, &key, stages, fragment)?;
         Ok(Arc::clone(entry.insert(Arc::new(pipeline))))
     }
@@ -1208,6 +1221,7 @@ impl MetalPipelineCache {
             Entry::Occupied(entry) => return Ok(entry.into_mut()),
             Entry::Vacant(entry) => entry,
         };
+        let _notification = self.shader_notify.map(|notify| notify.build_scope());
         let pipeline = {
             let descriptor = MTLRenderPipelineDescriptor::new();
             descriptor.setVertexFunction(Some(vertex.function()));
@@ -1242,6 +1256,7 @@ impl MetalPipelineCache {
                 attachment.setWriteMask(state.write_mask);
             }
 
+            let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::RenderPipeline);
             let state = self
                 .device
                 .device()
@@ -1355,6 +1370,7 @@ impl MetalPipelineCache {
             Entry::Occupied(entry) => return Ok(entry.into_mut()),
             Entry::Vacant(entry) => entry,
         };
+        let _notification = self.shader_notify.map(|notify| notify.build_scope());
         let state = Self::create_compute_pipeline_state(&self.device, shader)?;
         Ok(entry.insert(MetalComputePipeline {
             key,
@@ -1369,6 +1385,7 @@ impl MetalPipelineCache {
         device: &MetalDevice,
         shader: &MetalShaderModule,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, MetalPipelineError> {
+        let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::ComputePipeline);
         device
             .device()
             .newComputePipelineStateWithFunction_error(shader.function())
@@ -1407,8 +1424,8 @@ impl MetalPipelineCache {
         let options =
             MetalShaderCompileOptions::for_compute_device(device.profile(), key.workgroup_size);
         let mut bindings = Bindings::default();
-        let shader = Arc::new(compile_direct_msl_shader_with_bindings(
-            device.device(),
+        let shader = Arc::new(compile_cached_direct_msl_shader_with_bindings(
+            device,
             &program,
             profile,
             &runtime_info,
@@ -1494,6 +1511,7 @@ impl MetalPipelineCache {
             workgroup_size: [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z],
         };
         if !self.compute_pipelines.contains_key(&key) {
+            let _notification = self.shader_notify.map(|notify| notify.build_scope());
             let Some(gpu_memory) = shared_cache.current_gpu_memory() else {
                 return Ok(None);
             };
@@ -2451,7 +2469,7 @@ mod tests {
         runtime_info: &RuntimeInfo,
     ) -> MetalShaderModule {
         let mut bindings = Bindings::default();
-        compile_direct_msl_shader_with_bindings(
+        super::super::metal_shader::compile_direct_msl_shader_with_bindings(
             cache.device().device(),
             program,
             cache.profile(),

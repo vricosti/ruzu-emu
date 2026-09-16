@@ -178,6 +178,7 @@ impl ErrorOverlayDialog {
             .child(&root)
             .build();
         window.set_default_widget(Some(&action));
+        window.add_css_class("ruzu-applet-navigation");
 
         let dialog = Rc::new(Self { window, action });
         dialog.install_keyboard_navigation();

@@ -1808,15 +1808,17 @@ impl GMainWindow {
 
         // Root vertical layout. On macOS the menu bar lives in the native
         // global menu bar (installed once via `init_app_menu` on the
-        // application's `startup`), so the window itself only holds the central
-        // stack and the status bar. Every other platform has no global menu
+        // application's `startup`). Controller navigation also needs an
+        // in-window menu there: GTK cannot focus Cocoa's global menu.
+        // Every other platform has no global menu
         // bar, so the same `GMenuModel` is rendered in-window as a
         // `PopoverMenuBar` — the position upstream's `QMenuBar` occupies.
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         install_menu_css();
 
-        #[cfg(not(target_os = "macos"))]
-        let menu_bar = {
+        let menu_bar = if !cfg!(target_os = "macos")
+            || *common::settings::values().controller_navigation.get_value()
+        {
             let menubar = gtk::PopoverMenuBar::from_model(Some(&build_menu_model()));
             menubar.set_halign(gtk::Align::Fill);
             menubar.set_hexpand(true);
@@ -1828,9 +1830,9 @@ impl GMainWindow {
             });
             root.append(&menubar);
             Some(menubar)
+        } else {
+            None
         };
-        #[cfg(target_os = "macos")]
-        let menu_bar = None;
 
         // --- Central stack (upstream `centralwidget`) ------------------------
         // Pages: game list, loading screen, (later) render view.
@@ -2090,6 +2092,20 @@ impl GMainWindow {
         this.stack.add_named(&game_list, Some(PAGE_GAME_LIST));
         this.stack.set_visible_child_name(PAGE_GAME_LIST);
         *this.game_list.borrow_mut() = Some(game_list_handle);
+        crate::util::controller_navigation::install_interface_navigation(
+            this.window.upcast_ref(),
+            &this.hid_core,
+            &this.input_subsystem,
+            glib::clone!(#[weak] this, #[upgrade_or] false, move || {
+                let idle = this.session.borrow().is_none();
+                idle
+            }),
+            glib::clone!(#[weak] this, #[upgrade_or] false, move |key| {
+                // Clone the handle: activation can reenter the main window.
+                let list = this.game_list.borrow().clone();
+                list.is_some_and(|list| list.controller_key(key))
+            }),
+        );
 
         // Upstream calls `show()` before checking decryption components. An
         // idle callback alone can run before the compositor maps the parent,
@@ -3235,7 +3251,7 @@ impl GMainWindow {
                 MISSING_KEYS_DETAIL,
                 "No",
                 "Yes",
-                Some(crate::util::controller_navigation::ControllerNavigation::new(&self.hid_core)),
+                Some(crate::util::controller_navigation::ControllerNavigation::for_interface(&self.hid_core, &self.input_subsystem)),
                 glib::clone!(
                     #[weak(rename_to = this)]
                     self,

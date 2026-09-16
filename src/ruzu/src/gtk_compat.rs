@@ -294,6 +294,7 @@ pub fn ask_question_with_navigation<P: IsA<gtk::Window>>(
 }
 
 fn install_question_navigation(dialog: &gtk::MessageDialog, navigation: ControllerNavigation) {
+    dialog.add_css_class("ruzu-applet-navigation");
     // Match the profile-selection applet: HID callbacks queue input, GTK drains
     // it on its main thread, and dropping the source unregisters both callbacks.
     let weak = dialog.downgrade();
@@ -321,10 +322,10 @@ fn install_question_navigation(dialog: &gtk::MessageDialog, navigation: Controll
 /// dialog or the file chooser/next startup question opened by its continuation.
 fn question_navigation_key(dialog: &gtk::MessageDialog, key: NavigationKey) -> bool {
     match key {
-        NavigationKey::Left | NavigationKey::Up => {
+        NavigationKey::Left | NavigationKey::Up | NavigationKey::Previous => {
             focus_question_response(dialog, ResponseType::Cancel);
         }
-        NavigationKey::Right | NavigationKey::Down => {
+        NavigationKey::Right | NavigationKey::Down | NavigationKey::Next => {
             focus_question_response(dialog, ResponseType::Accept);
         }
         NavigationKey::Enter => {
@@ -342,6 +343,7 @@ fn question_navigation_key(dialog: &gtk::MessageDialog, key: NavigationKey) -> b
             dialog.response(ResponseType::Cancel);
             return true;
         }
+        NavigationKey::Menu => {}
     }
     false
 }
@@ -379,6 +381,82 @@ fn complete_question(callback: &QuestionCallback, accepted: bool) {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    #[ignore = "requires GTK and desktop focus; run alone with --test-threads=1"]
+    fn controller_file_chooser_browses_folders_and_completes_once() {
+        use crate::util::controller_navigation::navigate_window;
+        gtk::init().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("nested");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::create_dir(directory.path().join("other")).unwrap();
+        let replies = Rc::new(RefCell::new(Vec::new()));
+        run_controller_file_chooser(None::<&gtk::Window>, "Ruzu controller folder test",
+            FileChooserAction::SelectFolder, false, Some(directory.path()), None, &[], None,
+            { let replies = replies.clone(); move |files| replies.borrow_mut().push(files) });
+        let dialog = gtk::Window::list_toplevels().into_iter()
+            .find_map(|w| w.downcast::<gtk::FileChooserDialog>().ok()).unwrap();
+        let pump_until = |condition: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !condition() && std::time::Instant::now() < deadline {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(condition(), "GTK chooser did not reach the expected state (desktop focus required)");
+        };
+        pump_until(&|| dialog.is_active() && dialog.current_folder().and_then(|f| f.path()).as_deref() == Some(directory.path()));
+        fn find_view(widget: &gtk::Widget) -> Option<gtk::Widget> {
+            if !widget.is_visible() { return None; }
+            if widget.is::<gtk::TreeView>() || widget.is::<gtk::ColumnView>() { return Some(widget.clone()); }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(view) = find_view(&widget) { return Some(view); }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        pump_until(&|| find_view(dialog.upcast_ref()).is_some());
+        let view = find_view(dialog.upcast_ref()).unwrap();
+        if let Some(tree) = view.downcast_ref::<gtk::TreeView>() {
+            pump_until(&|| tree.model().is_some_and(|m| m.iter_n_children(None) == 2));
+            tree.grab_focus();
+            gtk::prelude::TreeViewExt::set_cursor(tree, &gtk::TreePath::from_indices(&[0]), None, false);
+        } else {
+            let column = view.downcast_ref::<gtk::ColumnView>().unwrap();
+            pump_until(&|| column.model().is_some_and(|m| m.n_items() == 2));
+            column.grab_focus();
+            column.model().unwrap().select_item(0, true);
+            navigate_window(dialog.upcast_ref(), NavigationKey::Down);
+            assert!(column.model().unwrap().is_selected(1));
+            navigate_window(dialog.upcast_ref(), NavigationKey::Up);
+            assert!(column.model().unwrap().is_selected(0));
+        }
+        navigate_window(dialog.upcast_ref(), NavigationKey::Enter);
+        pump_until(&|| dialog.current_folder().and_then(|f| f.path()).as_deref() == Some(child.as_path()));
+        let accept = dialog.widget_for_response(ResponseType::Accept).unwrap();
+        accept.grab_focus();
+        navigate_window(dialog.upcast_ref(), NavigationKey::Enter);
+        pump_until(&|| !replies.borrow().is_empty());
+        assert_eq!(replies.borrow().len(), 1);
+        assert_eq!(replies.borrow()[0][0].path(), Some(child));
+        assert!(!dialog.is_visible());
+        dialog.close();
+        assert_eq!(replies.borrow().len(), 1);
+        dialog.destroy();
+
+        let cancelled = Rc::new(Cell::new(0));
+        run_controller_file_chooser(None::<&gtk::Window>, "Ruzu controller cancel test",
+            FileChooserAction::Open, false, Some(directory.path()), None, &[], None,
+            { let cancelled = cancelled.clone(); move |files| { assert!(files.is_empty()); cancelled.set(cancelled.get() + 1); } });
+        let dialog = gtk::Window::list_toplevels().into_iter()
+            .find_map(|w| w.downcast::<gtk::FileChooserDialog>().ok()).unwrap();
+        navigate_window(dialog.upcast_ref(), NavigationKey::Escape);
+        pump_until(&|| cancelled.get() == 1);
+        assert!(!dialog.is_visible());
+        dialog.destroy();
+        assert_eq!(cancelled.get(), 1);
+    }
 
     #[test]
     #[ignore = "requires GTK and a display; run alone with --test-threads=1"]
@@ -511,6 +589,11 @@ pub fn open_file<P: IsA<gtk::Window>>(
     default_filter: Option<&gtk::FileFilter>,
     callback: impl FnOnce(Option<gio::File>) + 'static,
 ) {
+    if *common::settings::values().controller_navigation.get_value() {
+        run_controller_file_chooser(parent, title, FileChooserAction::Open, false,
+            None, None, filters, default_filter, move |files| callback(files.into_iter().next()));
+        return;
+    }
     let title = crate::i18n::tr(title);
     let dialog = gtk::FileChooserNative::new(
         Some(&title),
@@ -550,6 +633,11 @@ pub fn open_files<P: IsA<gtk::Window>>(
     default_filter: Option<&gtk::FileFilter>,
     callback: impl FnOnce(Vec<gio::File>) + 'static,
 ) {
+    if *common::settings::values().controller_navigation.get_value() {
+        run_controller_file_chooser(parent, title, FileChooserAction::Open, true,
+            initial_folder, None, filters, default_filter, callback);
+        return;
+    }
     let title = crate::i18n::tr(title);
     let dialog = gtk::FileChooserNative::new(
         Some(&title),
@@ -602,6 +690,12 @@ pub fn save_file<P: IsA<gtk::Window>>(
     default_filter: Option<&gtk::FileFilter>,
     callback: impl FnOnce(Option<gio::File>) + 'static,
 ) {
+    if *common::settings::values().controller_navigation.get_value() {
+        run_controller_file_chooser(parent, title, FileChooserAction::Save, false,
+            initial_file.parent(), initial_file.file_name().and_then(|name| name.to_str()),
+            filters, default_filter, move |files| callback(files.into_iter().next()));
+        return;
+    }
     let title = crate::i18n::tr(title);
     let dialog = gtk::FileChooserNative::new(
         Some(&title),
@@ -646,6 +740,11 @@ pub fn select_folder<P: IsA<gtk::Window>>(
     title: &str,
     callback: impl FnOnce(Option<gio::File>) + 'static,
 ) {
+    if *common::settings::values().controller_navigation.get_value() {
+        run_controller_file_chooser(parent, title, FileChooserAction::SelectFolder, false,
+            None, None, &[], None, move |files| callback(files.into_iter().next()));
+        return;
+    }
     let title = crate::i18n::tr(title);
     let dialog = gtk::FileChooserNative::new(
         Some(&title),
@@ -666,4 +765,64 @@ pub fn select_folder<P: IsA<gtk::Window>>(
         drop(keep_alive);
         callback(folder);
     });
+}
+
+/// Native/portal file pickers may run outside our process and expose no GTK
+/// focus tree. With controller navigation enabled, keep the standard GTK file
+/// chooser in-process. GTK still owns filesystem browsing and validation;
+/// frontend callers retain installation/scanning and response ownership.
+#[allow(clippy::too_many_arguments)]
+fn run_controller_file_chooser<P: IsA<gtk::Window>>(
+    parent: Option<&P>, title: &str, action: FileChooserAction, multiple: bool,
+    initial_folder: Option<&std::path::Path>, initial_name: Option<&str>,
+    filters: &[gtk::FileFilter], default_filter: Option<&gtk::FileFilter>,
+    callback: impl FnOnce(Vec<gio::File>) + 'static,
+) {
+    let accept = crate::i18n::tr(match action {
+        FileChooserAction::SelectFolder => "Select",
+        FileChooserAction::Save => "Save",
+        _ => "Open",
+    });
+    let cancel = crate::i18n::tr("Cancel");
+    let dialog = gtk::FileChooserDialog::new(
+        Some(&crate::i18n::tr(title)), parent, action,
+        &[(&cancel, ResponseType::Cancel), (&accept, ResponseType::Accept)],
+    );
+    dialog.set_modal(true);
+    dialog.set_default_size(900, 600);
+    dialog.set_default_response(ResponseType::Accept);
+    dialog.set_select_multiple(multiple);
+    for filter in filters { dialog.add_filter(filter); }
+    if let Some(filter) = default_filter { dialog.set_filter(filter); }
+    if let Some(folder) = initial_folder {
+        if let Err(error) = dialog.set_current_folder(Some(&gio::File::for_path(folder))) {
+            log::debug!("Could not select initial file-chooser folder: {error}");
+        }
+    }
+    if let Some(name) = initial_name { dialog.set_current_name(name); }
+    let callback = Rc::new(RefCell::new(Some(callback)));
+    dialog.connect_response({
+        let callback = callback.clone();
+        move |dialog, response| {
+            let files = if response == ResponseType::Accept {
+                let model = dialog.files();
+                (0..model.n_items())
+                    .filter_map(|i| model.item(i)?.downcast::<gio::File>().ok()).collect()
+            } else { Vec::new() };
+            let callback = callback.borrow_mut().take();
+            dialog.close();
+            if let Some(callback) = callback { callback(files); }
+        }
+    });
+    dialog.connect_close_request(move |_| {
+        let callback = callback.borrow_mut().take();
+        if let Some(callback) = callback { callback(Vec::new()); }
+        glib::Propagation::Proceed
+    });
+    dialog.connect_map(|dialog| {
+        glib::idle_add_local_once(glib::clone!(#[weak] dialog, move || {
+            dialog.set_focus_visible(true);
+        }));
+    });
+    dialog.present();
 }

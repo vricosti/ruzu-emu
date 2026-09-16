@@ -541,6 +541,7 @@ impl ControllerSelectorDialog {
         });
 
         state.load_configuration();
+        dialog.add_css_class("ruzu-applet-navigation");
         *state.controller_navigation.borrow_mut() =
             Some(ControllerNavigation::new(&state.hid_core));
         state.connect_signals();
@@ -709,7 +710,10 @@ impl ControllerSelectorDialog {
             NavigationKey::Down => {
                 dialog.child_focus(gtk::DirectionType::Down);
             }
-            NavigationKey::Left | NavigationKey::Right => {}
+            NavigationKey::Left | NavigationKey::Right | NavigationKey::Menu => {}
+            NavigationKey::Previous | NavigationKey::Next => {
+                crate::util::controller_navigation::navigate_window(dialog.upcast_ref(), key);
+            }
         }
     }
 

@@ -1,5 +1,25 @@
 # Upstream parity notes
 
+## 2026-09-16 - renderer_metal/metal_rasterizer.rs vs renderer_vulkan/vk_rasterizer.{h,cpp}
+
+### Intentional differences
+- Metal combines UpdateDepthBias and UpdateDepthBiasEnable in the native encoder
+  call. The pure conversion uses Eden's point/line/polygon topology groups and
+  depth_bias / 2 units. Disabled offset writes zero constant, slope and clamp;
+  Metal has no separate enable switch. This also matches MoltenVK's enabled and
+  disabled setDepthBias paths in MVKCommandEncoderState.mm.
+- The existing title-specific Vulkan D24-to-D32 workaround is not generalized
+  to Metal by this change; depth format representation is a separate concern.
+- No serialized or guest-visible layout changes. Tests cover all 15 topologies,
+  independent enables, negative bias/clamp, and resetting a previously enabled bias.
+- Legacy override discriminants outside Eden's 15-entry lookup table return
+  UnsupportedTopology instead of indexing out of bounds; native Metal already
+  rejects these in primitive conversion. All 10 rasterizer module tests pass.
+- Visual validation: the recorded menu sequence reaches character selection
+  with the rebuilt release GUI using native Metal. The user confirms that the
+  reported eye flicker is corrected. Both bias enable handling and constant
+  scaling changed together; their individual contributions were not isolated.
+
 ## 2026-09-13 - rdynarmic/common/mod.rs vs dynarmic/CMakeLists.txt
 
 ### Intentional differences

@@ -215,6 +215,31 @@ fn metal_primitive_type(
     }
 }
 
+// Eden RasterizerVulkan::UpdateDepthBias/UpdateDepthBiasEnable. Metal has
+// no separate enable switch: disabling polygon offset must clear encoder state.
+fn metal_depth_bias(
+    rasterizer: &crate::engines::maxwell_3d::RasterizerInfo,
+    topology: PrimitiveTopology,
+) -> Result<(f32, f32, f32), MetalRasterizerError> {
+    let enabled = match topology {
+        PrimitiveTopology::Points => rasterizer.polygon_offset_point_enable,
+        PrimitiveTopology::Lines | PrimitiveTopology::LineLoop
+        | PrimitiveTopology::LineStrip | PrimitiveTopology::LinesAdjacency
+        | PrimitiveTopology::LineStripAdjacency => rasterizer.polygon_offset_line_enable,
+        PrimitiveTopology::Triangles | PrimitiveTopology::TriangleStrip
+        | PrimitiveTopology::TriangleFan | PrimitiveTopology::Quads
+        | PrimitiveTopology::QuadStrip | PrimitiveTopology::Polygon
+        | PrimitiveTopology::TrianglesAdjacency | PrimitiveTopology::TriangleStripAdjacency
+        | PrimitiveTopology::Patches => rasterizer.polygon_offset_fill_enable,
+        _ => return Err(MetalRasterizerError::UnsupportedTopology(topology)),
+    };
+    if enabled {
+        Ok((rasterizer.depth_bias / 2.0, rasterizer.slope_scale_depth_bias, rasterizer.depth_bias_clamp))
+    } else {
+        Ok((0.0, 0.0, 0.0))
+    }
+}
+
 fn bind_stage(
     encoder: &objc2::runtime::ProtocolObject<dyn MTLRenderCommandEncoder>,
     stage: &MetalPreparedStage,
@@ -817,6 +842,8 @@ impl MetalRasterizer {
             draw_params.is_indexed = false;
         }
         let rasterizer = draw.rasterizer();
+        let (depth_bias, depth_bias_slope, depth_bias_clamp) =
+            metal_depth_bias(&rasterizer, draw.draw_state().topology)?;
         let blend_color = draw.blend_color();
         let depth_stencil = draw.depth_stencil();
         let vertex_layouts = pipeline_key.vertex_input.layouts;
@@ -1092,9 +1119,9 @@ impl MetalRasterizer {
                 FrontFace::CCW => MTLWinding::CounterClockwise,
             });
             encoder.setDepthBias_slopeScale_clamp(
-                rasterizer.depth_bias,
-                rasterizer.slope_scale_depth_bias,
-                rasterizer.depth_bias_clamp,
+                depth_bias,
+                depth_bias_slope,
+                depth_bias_clamp,
             );
             encoder.setBlendColorRed_green_blue_alpha(
                 blend_color.r,
@@ -2458,6 +2485,38 @@ mod tests {
     use super::*;
     use crate::engines::draw_manager::{DrawState, Maxwell3DDrawRegisters};
     use crate::engines::maxwell_3d::{DepthMode, ScissorInfo, SurfaceClipInfo, ViewportTransformInfo};
+
+    #[test]
+    fn depth_bias_uses_guest_topology_enables_and_half_units() {
+        use crate::engines::maxwell_3d::RasterizerInfo;
+        use PrimitiveTopology::*;
+        let groups: &[&[PrimitiveTopology]] = &[
+            &[Points],
+            &[Lines, LineLoop, LineStrip, LinesAdjacency, LineStripAdjacency],
+            &[Triangles, TriangleStrip, TriangleFan, Quads, QuadStrip, Polygon,
+              TrianglesAdjacency, TriangleStripAdjacency, Patches],
+        ];
+        for enabled_group in 0..3 {
+            let mut state = RasterizerInfo {
+                depth_bias: -6.0, slope_scale_depth_bias: 2.0, depth_bias_clamp: -0.5,
+                polygon_offset_point_enable: enabled_group == 0,
+                polygon_offset_line_enable: enabled_group == 1,
+                polygon_offset_fill_enable: enabled_group == 2,
+                ..Default::default()
+            };
+            for (group, topologies) in groups.iter().enumerate() {
+                for &topology in *topologies {
+                    assert_eq!(metal_depth_bias(&state, topology).unwrap(),
+                        if group == enabled_group { (-3.0, 2.0, -0.5) } else { (0.0, 0.0, 0.0) });
+                }
+            }
+            state.polygon_offset_point_enable = false;
+            state.polygon_offset_line_enable = false;
+            state.polygon_offset_fill_enable = false;
+            assert_eq!(metal_depth_bias(&state, groups[enabled_group][0]).unwrap(), (0.0, 0.0, 0.0));
+        }
+        assert!(metal_depth_bias(&RasterizerInfo::default(), LegacyPoints).is_err());
+    }
 
     #[test]
     fn viewport_transform_preserves_signed_extents_and_origin() {

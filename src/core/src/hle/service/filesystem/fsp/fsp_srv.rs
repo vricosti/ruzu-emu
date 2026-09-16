@@ -211,6 +211,10 @@ impl FspSrv {
             save_data_controller: std::sync::Mutex::new(None),
             romfs_controller: std::sync::Mutex::new(None),
             handlers: build_handler_map(&[
+                (32, Some(Self::extend_save_data_file_system_handler), "ExtendSaveDataFileSystem"),
+                (57, Some(Self::read_save_data_file_system_extra_data_by_save_data_space_id_handler), "ReadSaveDataFileSystemExtraDataBySaveDataSpaceId"),
+                (67, Some(Self::find_save_data_with_filter_handler), "FindSaveDataWithFilter"),
+                (83, Some(Self::open_save_data_transfer_prohibiter_handler), "OpenSaveDataTransferProhibiter"),
                 (
                     23,
                     Some(Self::create_save_data_file_system_by_system_save_data_id_handler),
@@ -914,6 +918,34 @@ impl FspSrv {
         rb.push_result(RESULT_SUCCESS);
     }
 
+    fn extend_save_data_file_system_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        // Upstream has no save-ID index and deliberately leaves extension inert.
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn read_save_data_file_system_extra_data_by_save_data_space_id_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bytes = vec![0; ctx.get_write_buffer_size(0)];
+        ctx.write_buffer(&bytes, 0);
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn find_save_data_with_filter_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        // Eden returns TargetNotFound, not an empty success. CMIF value-initializes
+        // the count; Rust also clears the otherwise unspecified scratch buffer.
+        let bytes = vec![0; ctx.get_write_buffer_size(0)];
+        ctx.write_buffer(&bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(ResultCode::new(RESULT_TARGET_NOT_FOUND.raw()));
+        rb.push_i64(0);
+    }
+
+    fn open_save_data_transfer_prohibiter_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let child = Arc::new(super::save_data_transfer_prohibiter::ISaveDataTransferProhibiter::new());
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(child);
+    }
+
     fn flush_access_log_on_sd_card_handler(
         _this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
@@ -986,6 +1018,22 @@ impl ServiceFramework for FspSrv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_metadata_stubs_have_upstream_result_and_payload_widths() {
+        let service = FspSrv::new();
+        for command in [32, 57, 67] {
+            let mut ctx = HLERequestContext::new();
+            service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+            let mut expected = HLERequestContext::new();
+            let mut rb = ResponseBuilder::new(&mut expected, if command == 67 { 4 } else { 2 }, 0, 0);
+            rb.push_result(if command == 67 { ResultCode::new(RESULT_TARGET_NOT_FOUND.raw()) } else { RESULT_SUCCESS });
+            if command == 67 { rb.push_i64(0); }
+            drop(rb);
+            assert_eq!(ctx.command_buffer(), expected.command_buffer());
+        }
+        assert!(service.handlers[&83].handler_callback.is_some());
+    }
 
     #[test]
     fn create_system_save_creates_a_reopenable_directory() {

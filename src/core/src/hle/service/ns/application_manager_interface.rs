@@ -229,10 +229,11 @@ pub const IAPPLICATION_MANAGER_INTERFACE_COMMANDS: &[(u32, bool, &str)] = &[
     (1600, false, "GetSystemSeedForPseudoDeviceId"),
     (1601, false, "ResetSystemSeedForPseudoDeviceId"),
     (1700, false, "ListApplicationDownloadingContentMeta"),
-    (1701, true, "GetApplicationView"),
+    (1701, true, "GetApplicationViewDeprecated"),
     (1702, false, "GetApplicationDownloadTaskStatus"),
     (1703, false, "GetApplicationViewDownloadErrorContext"),
     (1704, true, "GetApplicationViewWithPromotionInfo"),
+    (1706, true, "GetApplicationView"),
     (1705, false, "IsPatchAutoDeletableApplication"),
     (1800, false, "IsNotificationSetupCompleted"),
     (1801, false, "GetLastNotificationInfoCount"),
@@ -371,6 +372,12 @@ impl IApplicationManagerInterface {
             .map(|&(command_id, _, name)| {
                 let handler = match command_id {
                     0 => Some(Self::list_application_record_handler as _),
+                    38 => Some(Self::check_application_launch_version_handler as _),
+                    43 => Some(Self::check_sd_card_mount_status_handler as _),
+                    48 => Some(Self::get_free_space_size_handler as _),
+                    55 => Some(Self::get_application_desired_language_handler as _),
+                    59 => Some(Self::convert_application_language_to_language_code_handler as _),
+                    400 => Some(Self::get_application_control_data_handler as _),
                     44 => Some(Self::get_sd_card_mount_status_changed_event_handler as _),
                     52 => Some(Self::get_game_card_update_detection_event_handler as _),
                     505 => Some(Self::get_game_card_mount_failure_event_handler as _),
@@ -387,6 +394,13 @@ impl IApplicationManagerInterface {
                     2 => Some(Self::get_application_record_update_system_event_handler as _),
                     70 => Some(Self::resume_all_handler as _),
                     71 => Some(Self::get_storage_size_handler as _),
+                    1701 => Some(Self::get_application_view_deprecated_handler as _),
+                    1704 => Some(Self::get_application_view_with_promotion_info_handler as _),
+                    1706 => Some(Self::get_application_view_handler as _),
+                    2050 => Some(Self::get_application_rights_on_client_handler as _),
+                    906 => Some(Self::is_application_update_requested_handler as _),
+                    1300 => Some(Self::is_any_application_entity_installed_handler as _),
+                    2100 => Some(Self::get_application_terminate_result_handler as _),
                     2520 => {
                         Some(Self::is_qualification_transition_supported_by_process_id_handler as _)
                     }
@@ -406,6 +420,114 @@ impl IApplicationManagerInterface {
             handlers: build_handler_map(&functions),
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn check_sd_card_mount_status_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        use super::content_management_interface::IContentManagementInterface;
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let delegate = IContentManagementInterface::new(service.system);
+        IContentManagementInterface::check_sd_card_mount_status_handler(&delegate, ctx);
+    }
+
+    fn get_free_space_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        use super::content_management_interface::IContentManagementInterface;
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let delegate = IContentManagementInterface::new(service.system);
+        IContentManagementInterface::get_free_space_size_handler(&delegate, ctx);
+    }
+
+    fn get_application_desired_language_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        use super::read_only_application_control_data_interface::IReadOnlyApplicationControlDataInterface;
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let delegate = IReadOnlyApplicationControlDataInterface::new(service.system);
+        IReadOnlyApplicationControlDataInterface::get_application_desired_language_handler(&delegate, ctx);
+    }
+
+    fn convert_application_language_to_language_code_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        use super::read_only_application_control_data_interface::IReadOnlyApplicationControlDataInterface;
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let delegate = IReadOnlyApplicationControlDataInterface::new(service.system);
+        IReadOnlyApplicationControlDataInterface::convert_application_language_to_language_code_handler(&delegate, ctx);
+    }
+
+    fn get_application_control_data_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        use super::read_only_application_control_data_interface::IReadOnlyApplicationControlDataInterface;
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let delegate = IReadOnlyApplicationControlDataInterface::new(service.system);
+        IReadOnlyApplicationControlDataInterface::get_application_control_data_handler(&delegate, ctx);
+    }
+
+    fn check_application_launch_version_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let application_id = RequestParser::new(ctx).pop_u64();
+        check_application_launch_version(application_id);
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn is_application_update_requested_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let id = RequestParser::new(ctx).pop_u64();
+        let (required, version) = is_application_update_requested(id);
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(u32::from(required));
+        rb.push_u32(version);
+    }
+
+    fn is_any_application_entity_installed_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let installed = is_any_application_entity_installed();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(u32::from(installed));
+    }
+
+    fn get_application_terminate_result_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let _application_id = RequestParser::new(ctx).pop_u64();
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    fn get_application_rights_on_client_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let _flags = rp.pop_u32();
+        rp.skip(1); // CMIF aligns the following u64 (and Uid) to eight bytes.
+        let application_id = rp.pop_u64();
+        let uid = rp.pop_raw::<[u8; 16]>();
+        let bytes = get_application_rights_on_client(application_id, uid, ctx.get_write_buffer_size(0));
+        let count = (bytes.len() / size_of::<ApplicationRightsOnClient>()) as u32;
+        ctx.write_buffer(&bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
+    }
+
+    fn get_application_view_deprecated_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bytes = application_view_bytes(&ctx.read_buffer(0), ctx.get_write_buffer_size(0), false, false);
+        ctx.write_buffer(&bytes, 0);
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn get_application_view_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let bytes = application_view_bytes(&ctx.read_buffer(0), ctx.get_write_buffer_size(0), true, false);
+        ctx.write_buffer(&bytes, 0);
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    fn get_application_view_with_promotion_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        use crate::hle::service::set::settings_types::GetFirmwareVersionType;
+        use crate::hle::service::set::system_settings_server::get_firmware_version_impl_for_system;
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        // Upstream's frontend_common FirmwareManager wrapper simply calls SET;
+        // call its owner directly to avoid a core -> frontend crate dependency.
+        let fw = get_firmware_version_impl_for_system(service.system.get(), GetFirmwareVersionType::Version2)
+            .unwrap_or_default();
+        let is_fw20 = fw.major >= 20;
+        let bytes = application_view_bytes(&ctx.read_buffer(0), ctx.get_write_buffer_size(0), is_fw20, true);
+        let per_entry = if is_fw20 { 0x78 } else { 0x70 };
+        let count = (bytes.len() / per_entry) as u32;
+        ctx.write_buffer(&bytes, 0);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(count);
     }
 
     pub(super) fn list_application_record_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -723,8 +845,41 @@ pub fn is_qualification_transition_supported_by_process_id(process_id: u64) -> b
     true
 }
 
-/// Stub: GetApplicationView fills stub data upstream.
-pub fn get_application_view(application_ids: &[u64], out_views: &mut [ApplicationView]) {
+// Mechanical output construction of upstream GetApplicationRightsOnClient.
+fn get_application_rights_on_client(application_id: u64, uid: [u8; 16], capacity: usize) -> Vec<u8> {
+    if capacity < size_of::<ApplicationRightsOnClient>() { return Vec::new(); }
+    let mut bytes = vec![0; size_of::<ApplicationRightsOnClient>()];
+    bytes[..8].copy_from_slice(&application_id.to_le_bytes());
+    bytes[8..24].copy_from_slice(&uid);
+    bytes
+}
+
+// Mechanical buffer serialization shared by the three view IPC adapters above.
+// Their formats and firmware selection remain owned by this upstream interface.
+fn application_view_bytes(ids: &[u8], capacity: usize, is_fw20: bool, promotion: bool) -> Vec<u8> {
+    let view_size = if is_fw20 { size_of::<ApplicationViewV20>() } else { size_of::<ApplicationViewV19>() };
+    let stride = view_size + if promotion { size_of::<PromotionInfo>() } else { 0 };
+    let count = (ids.len() / 8).min(capacity / stride);
+    let mut bytes = vec![0; count * stride];
+    for (id, dst) in ids.chunks_exact(8).zip(bytes.chunks_exact_mut(stride)) {
+        let view = ApplicationViewData {
+            application_id: u64::from_le_bytes(id.try_into().unwrap()),
+            version: 0x70000,
+            flags: 0x401f17,
+            ..Default::default()
+        };
+        if promotion {
+            write_application_view_with_promotion(dst, &ApplicationViewWithPromotionData {
+                view, promotion: PromotionInfo::default(),
+            }, is_fw20);
+        } else {
+            write_application_view(dst, &view, is_fw20);
+        }
+    }
+    bytes
+}
+
+pub fn get_application_view(application_ids: &[u64], out_views: &mut [ApplicationViewV20]) {
     let size = core::cmp::min(application_ids.len(), out_views.len());
     log::warn!(
         "(STUBBED) IApplicationManagerInterface::GetApplicationView called, size={}",
@@ -732,9 +887,9 @@ pub fn get_application_view(application_ids: &[u64], out_views: &mut [Applicatio
     );
 
     for i in 0..size {
-        let mut view = ApplicationView::default();
+        let mut view = ApplicationViewV20::default();
         view.application_id = application_ids[i];
-        view.unk = 0x70000;
+        view.version = 0x70000;
         view.flags = 0x401f17;
         out_views[i] = view;
     }
@@ -743,6 +898,107 @@ pub fn get_application_view(application_ids: &[u64], out_views: &mut [Applicatio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_implemented_commands_are_wired() {
+        let service = IApplicationManagerInterface::new(SystemRef::null());
+        for &(id, implemented, name) in IAPPLICATION_MANAGER_INTERFACE_COMMANDS {
+            if implemented {
+                assert!(service.handlers[&id].handler_callback.is_some(), "{id}: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn forwarded_queries_keep_the_delegates_ipc_response() {
+        use super::super::content_management_interface::IContentManagementInterface;
+        use super::super::read_only_application_control_data_interface::IReadOnlyApplicationControlDataInterface;
+        let system = crate::core::System::new();
+        let system_ref = SystemRef::from_ref(&system);
+        let service = IApplicationManagerInterface::new(system_ref);
+        let content = IContentManagementInterface::new(system_ref);
+        let control = IReadOnlyApplicationControlDataInterface::new(system_ref);
+        for (id, direct) in [
+            (43, &content as &dyn ServiceFramework), (48, &content),
+            (55, &control), (59, &control), (400, &control)] {
+            let callback: fn(&dyn ServiceFramework, &mut HLERequestContext) = match id {
+                43 => IContentManagementInterface::check_sd_card_mount_status_handler,
+                48 => IContentManagementInterface::get_free_space_size_handler,
+                55 => IReadOnlyApplicationControlDataInterface::get_application_desired_language_handler,
+                59 => IReadOnlyApplicationControlDataInterface::convert_application_language_to_language_code_handler,
+                _ => IReadOnlyApplicationControlDataInterface::get_application_control_data_handler,
+            };
+            let mut ctx = HLERequestContext::new();
+            let mut expected = HLERequestContext::new();
+            service.handlers[&id].handler_callback.unwrap()(&service, &mut ctx);
+            callback(direct, &mut expected);
+            assert_eq!(ctx.command_buffer(), expected.command_buffer(), "command {id}");
+        }
+    }
+
+    #[test]
+    fn application_rights_returns_at_most_one_record_with_zero_flags_and_padding() {
+        let id = 0xfedc_ba98_7654_3210;
+        let uid = [0x5a; 16];
+        assert!(get_application_rights_on_client(id, uid, 31).is_empty());
+        for capacity in [32, 64, 96] {
+            let bytes = get_application_rights_on_client(id, uid, capacity);
+            assert_eq!(bytes.len(), 32);
+            assert_eq!(&bytes[..8], &id.to_le_bytes());
+            assert_eq!(&bytes[8..24], &uid);
+            assert_eq!(&bytes[24..], &[0; 8]);
+        }
+    }
+
+    #[test]
+    fn launch_version_check_is_a_result_only_reply() {
+        let service = IApplicationManagerInterface::new(SystemRef::null());
+        let mut ctx = HLERequestContext::new();
+        service.handlers[&38].handler_callback.unwrap()(&service, &mut ctx);
+        let mut expected = HLERequestContext::new();
+        ResponseBuilder::new(&mut expected, 2, 0, 0).push_result(RESULT_SUCCESS);
+        assert_eq!(ctx.command_buffer(), expected.command_buffer());
+    }
+
+    #[test]
+    fn application_status_replies_match_upstream_width_and_values() {
+        let service = IApplicationManagerInterface::new(SystemRef::null());
+        for (command, output) in [(906, vec![0, 0]), (1300, vec![1]), (2100, vec![0])] {
+            let mut ctx = HLERequestContext::new();
+            service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+            let mut expected = HLERequestContext::new();
+            let mut rb = ResponseBuilder::new(&mut expected, 2 + output.len() as u32, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+            for value in output { rb.push_u32(value); }
+            drop(rb);
+            assert_eq!(ctx.command_buffer(), expected.command_buffer());
+        }
+    }
+
+    #[test]
+    fn application_views_use_correct_stride_and_bounded_entry_count() {
+        let ids: Vec<u8> = [0x1122_3344_5566_7788u64, 0xfedc_ba98_7654_3210]
+            .into_iter().flat_map(u64::to_le_bytes).collect();
+        for (is_fw20, promotion, stride) in [(false, false, 0x50), (true, false, 0x58),
+            (false, true, 0x70), (true, true, 0x78)] {
+            assert!(application_view_bytes(&ids, stride - 1, is_fw20, promotion).is_empty());
+            for (capacity, count) in [(stride, 1), (stride * 2 - 1, 1), (stride * 3, 2)] {
+                let bytes = application_view_bytes(&ids, capacity, is_fw20, promotion);
+                assert_eq!(bytes.len(), count * stride);
+                for i in 0..count {
+                    let view = &bytes[i * stride..(i + 1) * stride];
+                    assert_eq!(&view[..8], &ids[i * 8..i * 8 + 8]);
+                    assert_eq!(&view[8..12], &0x70000u32.to_le_bytes());
+                    assert_eq!(&view[12..16], &0x401f17u32.to_le_bytes());
+                    assert!(view[16..].iter().all(|b| *b == 0));
+                }
+            }
+        }
+        let service = IApplicationManagerInterface::new(SystemRef::null());
+        for command in [1701, 1704, 1706] {
+            assert!(service.handlers().get(&command).unwrap().handler_callback.is_some());
+        }
+    }
 
     #[test]
     fn firmware_stubs_preserve_output_widths() {

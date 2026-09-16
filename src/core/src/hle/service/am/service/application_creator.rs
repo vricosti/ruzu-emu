@@ -93,6 +93,7 @@ impl IApplicationCreator {
             .track_applet(Arc::clone(&applet), true);
 
         Some(Arc::new(IApplicationAccessor::new(
+            self.system,
             applet,
             self.window_system.clone(),
         )))
@@ -136,6 +137,7 @@ impl IApplicationCreator {
             .unwrap()
             .track_applet(Arc::clone(&applet), true);
         let accessor = Arc::new(IApplicationAccessor::new(
+            self.system,
             applet,
             self.window_system.clone(),
         ));

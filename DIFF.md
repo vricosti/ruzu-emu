@@ -18055,3 +18055,118 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
 - Tests cover distinct/stable registered readable objects, unsignaled state,
   missing-context failure and the remaining-time reply; they do not substitute
   for checking the final guest handle and navigation in the running applet.
+
+## 2026-09-16 — src/core/src/hle/service/ns/ns_types.rs vs core/hle/service/ns/ns_types.h
+
+### Intentional differences
+- ApplicationViewV20 explicitly owns its four alignment-padding bytes. The view
+  writers serialize little-endian fields into slices, zeroing padding rather than
+  leaving C++ struct alignment bytes unspecified. V19/V20 sizes remain 0x50/0x58;
+  promotion adds 0x20. The upstream partial-write ordering is retained when a
+  destination can hold the view but not its promotion record.
+
+## 2026-09-16 — src/core/src/hle/service/set/system_settings_server.rs vs core/hle/service/set/system_settings_server.{h,cpp}
+
+### Intentional differences
+- The system-aware firmware reader is named get_firmware_version_impl_for_system
+  to coexist with the older context-free entry point used during service setup.
+  It reads SystemVersion from the filesystem controller, then the synthesized
+  archive if no RomFS was available. Rust returns an error if even synthesis
+  fails instead of dereferencing a missing directory. Byte decoding is a local
+  mechanical helper for malformed-size and Version1 revision-masking tests.
+
+### Unintentional differences (to fix)
+- Existing context-free firmware consumers still use the older fixed version;
+  migrating their initialization ownership is outside this Home Menu slice.
+  The NS promotion-view command uses the new installed-version reader.
+
+## 2026-09-16 — src/core/src/hle/service/ns/application_manager_interface.rs vs core/hle/service/ns/application_manager_interface.{h,cpp}
+
+### Intentional differences
+- Commands 1701/1704/1706 share a mechanical byte-serialization helper in their
+  owning interface instead of C++ typed OutArray views. Only complete entries
+  are written, bounded by both buffers. Fields retain upstream's stub values;
+  this does not implement application execution or network availability.
+- GetApplicationViewWithPromotionInfo calls the SET firmware reader directly,
+  avoiding a core-to-frontend dependency on Eden's thin FirmwareManager wrapper.
+  As upstream does, a failed version read leaves a zero version for ABI choice.
+- GetApplicationRightsOnClient uses an explicit 0x20 little-endian record and
+  CMIF's eight-byte input alignment. It returns at most one entry with the
+  requested application/user, zero flags and deterministic padding, as in the
+  upstream stub; it does not invent license checks or grant additional rights.
+- CheckApplicationLaunchVersion now dispatches to its existing local stub and
+  emits the upstream result-only reply; the implementation previously existed
+  without an IPC callback.
+- Update-request, installed-entity and terminate-result queries now serialize
+  their upstream stub outputs. Five forwarding methods reuse the existing
+  content/control interface IPC adapters, with identical request layouts, rather
+  than duplicating marshaling. The delegate owns the behavior as in Eden.
+
+## 2026-09-16 — src/core/src/hle/service/ns/content_management_interface.rs and read_only_application_control_data_interface.rs vs core/hle/service/ns/content_management_interface.{h,cpp} and read_only_application_control_data_interface.{h,cpp}
+
+### Intentional differences
+- The five IPC adapters used by application-manager forwarding are visible only
+  to sibling NS modules. Eden forwards typed arguments to public methods; Rust
+  forwards the identical IPC layout to those methods' existing adapters. Their
+  behavior and validation were not moved into application-manager.
+
+## 2026-09-16 — src/core/src/hle/service/am/service/library_applet_accessor.rs vs core/hle/service/am/service/library_applet_accessor.{h,cpp}
+
+### Intentional differences
+- Unknown170 copies the applet-owned persistent unknown event through the
+  existing lazy kernel bridge. Eden allocates that event with the applet's
+  ServiceContext. Without a kernel context Rust returns an error instead of
+  returning success with a null handle. The accessor does not signal the event.
+
+## 2026-09-16 — src/core/src/hle/service/pctl/parental_control_service.rs vs core/hle/service/pctl/parental_control_service.{h,cpp}
+
+### Intentional differences
+- Both launch-permission command IDs (1002 and 1019) share the existing Rust
+  handler, matching Eden's registration. Unlike C++, that stub does not decode
+  its unused arguments for logging; both replies are result-only success and
+  neither mutates parental-control state. A regression compares complete replies.
+
+## 2026-09-16 — src/core/src/hle/service/acc/acc.rs vs core/hle/service/acc/acc.{h,cpp}
+
+### Intentional differences
+- IAdministrator does not retain a SystemRef: no implemented method uses the
+  system. Like upstream its constructor ignores the supplied UUID. The entire
+  command table is retained, with only IsLinkedWithNintendoAccount implemented
+  (false). No network connection or account-linking behavior is introduced.
+- The existing Rust Interface factory returns an Arc-backed child handler;
+  ACC_SU marshals the same single IPC object as upstream command 250. UUID
+  parsing stays in the adapter and creation stays in Interface.
+
+## 2026-09-16 — src/core/src/hle/service/filesystem/fsp/save_data_transfer_prohibiter.rs vs core/hle/service/filesystem/fsp/save_data_transfer_prohibiter.{h,cpp}
+
+### Intentional differences
+- The commandless transfer-prohibiter now implements the Rust IPC traits with
+  empty handler maps instead of being only a marker type. No System reference
+  is stored because the upstream object has no methods using it. Lifetime is
+  owned by the returned session, as upstream; it does not alter save files.
+
+## 2026-09-16 — src/core/src/hle/service/filesystem/fsp/fsp_srv.rs vs core/hle/service/filesystem/fsp/fsp_srv.{h,cpp}
+
+### Intentional differences
+- FindSaveDataWithFilter returns upstream TargetNotFound and the CMIF-initialized
+  zero count instead of the old generic success. Rust clears its output bytes,
+  whose C++ scratch contents are unspecified on this failing stub path.
+- ReadSaveDataFileSystemExtraDataBySaveDataSpaceId clears the whole output;
+  OpenSaveDataTransferProhibiter returns its commandless session. Extension
+  remains inert, exactly as upstream. Unused stub arguments are not decoded for
+  logging. These callbacks do not delete, resize or overwrite host save files.
+
+## 2026-09-16 — src/core/src/hle/service/am/service/application_accessor.rs and application_creator.rs vs core/hle/service/am/service/application_accessor.{h,cpp} and application_creator.{h,cpp}
+
+### Intentional differences
+- ApplicationCreator now passes the existing SystemRef into the accessor, the
+  equivalent of ServiceFramework's upstream System reference, for ARP lookup.
+- State-change events use Applet's persistent lazy kernel bridge rather than
+  C++ ServiceContext allocation. Missing IPC context returns an error, not a
+  successful null handle. The event is distinct from Applet's unknown event.
+- Launch-parameter input resolves the domain IStorage as the upstream CMIF
+  wrapper does; Rust locks Applet while queuing its copied bytes. Invalid kinds
+  return ResultUnknown and leave the queue untouched. Control-property copying
+  writes only the bounded data prefix rather than C++'s unspecified scratch tail.
+- SetUsers retains the upstream inert behavior without logging unused inputs.
+  GetCurrentLibraryApplet returns a null interface, not an invented child.

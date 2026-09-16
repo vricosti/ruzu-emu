@@ -635,7 +635,7 @@ impl IReadOnlyApplicationControlDataInterface {
         rb.push_ipc_interface(value);
     }
 
-    fn get_application_control_data_handler(
+    pub(super) fn get_application_control_data_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
@@ -671,7 +671,7 @@ impl IReadOnlyApplicationControlDataInterface {
         }
     }
 
-    fn get_application_desired_language_handler(
+    pub(super) fn get_application_desired_language_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
@@ -694,7 +694,7 @@ impl IReadOnlyApplicationControlDataInterface {
         }
     }
 
-    fn convert_application_language_to_language_code_handler(
+    pub(super) fn convert_application_language_to_language_code_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {

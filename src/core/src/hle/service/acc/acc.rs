@@ -377,6 +377,11 @@ impl Interface {
         )
     }
 
+    /// Port of Module::Interface::GetBaasAccountAdministrator.
+    pub fn get_baas_account_administrator(&self, uuid: u128) -> (ResultCode, SessionRequestHandlerPtr) {
+        (RESULT_SUCCESS, Arc::new(IAdministrator::new(uuid)))
+    }
+
     fn store_save_data_thumbnail_result(
         &self,
         uuid: u128,
@@ -466,6 +471,92 @@ fn new_ensure_token_id_cache_async_interface() -> EnsureTokenIdCacheAsyncInterfa
     let context = AsyncContextBase::new(EnsureTokenIdCacheAsyncState);
     context.mark_complete();
     context
+}
+
+// IAdministrator is owned by acc.cpp upstream. Only the linkage query is
+// implemented there; all online/account mutation commands remain unimplemented.
+struct IAdministrator {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IAdministrator {
+    fn new(_uuid: u128) -> Self {
+        Self {
+            handlers: build_handler_map(&[
+            (0, None, "CheckAvailability"),
+            (1, None, "GetAccountId"),
+            (2, None, "EnsureIdTokenCacheAsync"),
+            (3, None, "LoadIdTokenCache"),
+            (100, None, "SetSystemProgramIdentification"),
+            (101, None, "RefreshNotificationTokenAsync"),
+            (110, None, "GetServiceEntryRequirementCache"),
+            (111, None, "InvalidateServiceEntryRequirementCache"),
+            (112, None, "InvalidateTokenCache"),
+            (113, None, "GetServiceEntryRequirementCacheForOnlinePlay"),
+            (120, None, "GetNintendoAccountId"),
+            (121, None, "CalculateNintendoAccountAuthenticationFingerprint"),
+            (130, None, "GetNintendoAccountUserResourceCache"),
+            (131, None, "RefreshNintendoAccountUserResourceCacheAsync"),
+            (132, None, "RefreshNintendoAccountUserResourceCacheAsyncIfSecondsElapsed"),
+            (133, None, "GetNintendoAccountVerificationUrlCache"),
+            (134, None, "RefreshNintendoAccountVerificationUrlCacheAsync"),
+            (135, None, "RefreshNintendoAccountVerificationUrlCacheAsyncIfSecondsElapsed"),
+            (140, None, "GetNetworkServiceLicenseCache"),
+            (141, None, "RefreshNetworkServiceLicenseCacheAsync"),
+            (142, None, "RefreshNetworkServiceLicenseCacheAsyncIfSecondsElapsed"),
+            (143, None, "GetNetworkServiceLicenseCacheEx"),
+            (150, None, "CreateAuthorizationRequest"),
+            (160, None, "RequiresUpdateNetworkServiceAccountIdTokenCache"),
+            (161, None, "RequireReauthenticationOfNetworkServiceAccount"),
+            (170, None, "CreateDeviceHistoryRequest"),
+            (180, None, "GetRequestForNintendoAccountReauthentication"),
+            (200, None, "IsRegistered"),
+            (201, None, "RegisterAsync"),
+            (202, None, "UnregisterAsync"),
+            (203, None, "DeleteRegistrationInfoLocally"),
+            (220, None, "SynchronizeProfileAsync"),
+            (221, None, "UploadProfileAsync"),
+            (222, None, "SynchronizaProfileAsyncIfSecondsElapsed"),
+            (250, Some(Self::is_linked_with_nintendo_account_handler as _), "IsLinkedWithNintendoAccount"),
+            (251, None, "CreateProcedureToLinkWithNintendoAccount"),
+            (252, None, "ResumeProcedureToLinkWithNintendoAccount"),
+            (255, None, "CreateProcedureToUpdateLinkageStateOfNintendoAccount"),
+            (256, None, "ResumeProcedureToUpdateLinkageStateOfNintendoAccount"),
+            (260, None, "CreateProcedureToLinkNnidWithNintendoAccount"),
+            (261, None, "ResumeProcedureToLinkNnidWithNintendoAccount"),
+            (280, None, "ProxyProcedureToAcquireApplicationAuthorizationForNintendoAccount"),
+            (290, None, "GetRequestForNintendoAccountUserResourceView"),
+            (300, None, "TryRecoverNintendoAccountUserStateAsync"),
+            (400, None, "IsServiceEntryRequirementCacheRefreshRequiredForOnlinePlay"),
+            (401, None, "RefreshServiceEntryRequirementCacheForOnlinePlayAsync"),
+            (900, None, "GetAuthenticationInfoForWin"),
+            (901, None, "ImportAsyncForWin"),
+            (997, None, "DebugUnlinkNintendoAccountAsync"),
+            (998, None, "DebugSetAvailabilityErrorDetail"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn is_linked_with_nintendo_account_handler(_: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(false);
+    }
+}
+
+impl SessionRequestHandler for IAdministrator {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+    fn service_name(&self) -> &str { "IAdministrator" }
+}
+
+impl ServiceFramework for IAdministrator {
+    fn get_service_name(&self) -> &str { "IAdministrator" }
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers }
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> { &self.handlers_tipc }
 }
 
 /// Port of upstream `IManagerForSystemService` in `acc.cpp`.
@@ -1282,7 +1373,7 @@ impl AccSU {
                 "ResumeProcedureToRegisterUserWithNintendoAccount",
             ),
             (230, None, "AuthenticateServiceAsync"),
-            (250, None, "GetBaasAccountAdministrator"),
+            (250, Some(Self::get_baas_account_administrator_handler), "GetBaasAccountAdministrator"),
             (290, None, "ProxyProcedureForGuestLoginWithNintendoAccount"),
             (
                 291,
@@ -1326,6 +1417,15 @@ impl AccSU {
         let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
         rb.push_result(RESULT_SUCCESS);
         rb.push_u32(count);
+    }
+
+    fn get_baas_account_administrator_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let svc = unsafe { &*(this as *const dyn ServiceFramework as *const AccSU) };
+        let uuid = RequestParser::new(ctx).pop_raw::<u128>();
+        let (result, administrator) = svc.interface.get_baas_account_administrator(uuid);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(result);
+        rb.push_ipc_interface(administrator);
     }
 
     fn get_baas_account_manager_for_system_service_handler(
@@ -2529,6 +2629,28 @@ pub fn loop_process(system: crate::core::SystemRef) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn administrator_has_only_the_upstream_unlinked_query() {
+        use super::*;
+        let service = IAdministrator::new(0x1122334455667788);
+        for (&id, info) in service.handlers() {
+            assert_eq!(info.handler_callback.is_some(), id == 250, "command {id}");
+        }
+        let mut ctx = HLERequestContext::new();
+        service.handlers[&250].handler_callback.unwrap()(&service, &mut ctx);
+        let mut expected = HLERequestContext::new();
+        let mut rb = ResponseBuilder::new(&mut expected, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_bool(false);
+        drop(rb);
+        assert_eq!(ctx.command_buffer(), expected.command_buffer());
+        let interface = make_interface(crate::core::SystemRef::null());
+        let (result, child) = interface.get_baas_account_administrator(0);
+        assert_eq!(result, RESULT_SUCCESS);
+        assert_eq!(child.service_name(), "IAdministrator");
+        let acc_su = AccSU::new(Arc::new(Module), Arc::new(Mutex::new(ProfileManager::new())), crate::core::SystemRef::null());
+        assert!(acc_su.handlers[&250].handler_callback.is_some());
+    }
     #[test]
     fn profile_unknown_commands_match_upstream_editor_scope_and_reply() {
         use super::*;

@@ -98,6 +98,7 @@ impl ILibraryAppletAccessor {
                 Some(Self::get_indirect_layer_consumer_handle_handler),
                 "GetIndirectLayerConsumerHandle",
             ),
+            (170, Some(Self::unknown170_handler), "Unknown170"),
         ]);
         Self {
             system,
@@ -106,6 +107,18 @@ impl ILibraryAppletAccessor {
             handlers,
             handlers_tipc: BTreeMap::new(),
         }
+    }
+
+    fn unknown170_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let handle = service.applet.lock().unwrap().ensure_unknown_event_object_id(ctx);
+        let Some(handle) = handle else {
+            ResponseBuilder::new(ctx, 2, 0, 0).push_result(crate::hle::result::RESULT_UNKNOWN);
+            return;
+        };
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(handle);
     }
 
     fn get_applet_state_changed_event_handler(
@@ -448,6 +461,31 @@ mod tests {
     use super::*;
     use crate::hle::service::am::applet::Applet;
     use crate::hle::service::os::process::Process;
+
+    #[test]
+    fn unknown170_copies_the_same_unsignaled_applet_event() {
+        use crate::hle::service::hle_ipc::KAutoObjectRef;
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+        let applet = Arc::new(Mutex::new(Applet::new(SystemRef::null(), Process::new(), false)));
+        let accessor = ILibraryAppletAccessor::new(SystemRef::null(), Arc::new(AppletDataBroker::new()), Arc::clone(&applet));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+        let mut previous = None;
+        for _ in 0..2 {
+            let mut ctx = HLERequestContext::new_with_thread(Arc::clone(&thread), 0x2000);
+            accessor.handlers[&170].handler_callback.unwrap()(&accessor, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+            let [KAutoObjectRef::ObjectId(id)] = ctx.outgoing_copy_objects.as_slice() else { panic!("expected copy object"); };
+            if let Some(old) = previous { assert_eq!(*id, old); }
+            previous = Some(*id);
+            let applet = applet.lock().unwrap();
+            let event = applet.unknown_event.as_ref().unwrap().lock().unwrap();
+            assert_eq!(event.object_id, *id);
+            assert!(!event.is_signaled.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
 
     #[test]
     fn frontend_start_does_not_fake_a_running_guest_process() {

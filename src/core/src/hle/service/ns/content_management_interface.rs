@@ -130,7 +130,7 @@ impl IContentManagementInterface {
         }
     }
 
-    fn check_sd_card_mount_status_handler(
+    pub(super) fn check_sd_card_mount_status_handler(
         this: &dyn ServiceFramework,
         ctx: &mut HLERequestContext,
     ) {
@@ -163,7 +163,7 @@ impl IContentManagementInterface {
         }
     }
 
-    fn get_free_space_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    pub(super) fn get_free_space_size_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let service = Self::as_self(this);
         let mut rp = RequestParser::new(ctx);
         let Some(storage_id) = Self::parse_storage_id(rp.pop_u8()) else {

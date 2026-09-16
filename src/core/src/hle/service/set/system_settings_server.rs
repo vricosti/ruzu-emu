@@ -1239,6 +1239,69 @@ pub fn get_firmware_version_impl(fw_type: GetFirmwareVersionType) -> FirmwareVer
     out
 }
 
+/// System-aware counterpart of upstream GetFirmwareVersionImpl. The older
+/// context-free helper remains for services constructed without a live System.
+pub fn get_firmware_version_impl_for_system(
+    system: &crate::core::System,
+    fw_type: GetFirmwareVersionType,
+) -> Result<FirmwareVersionFormat, ResultCode> {
+    use crate::file_sys::registered_cache::ContentProvider;
+    use crate::file_sys::nca_metadata::ContentRecordType;
+    use crate::file_sys::romfs::extract_romfs;
+    use crate::file_sys::system_archive::system_archive::synthesize_system_archive;
+
+    const FIRMWARE_VERSION_SYSTEM_DATA_ID: u64 = 0x0100_0000_0000_0809;
+    let fsc = system.get_filesystem_controller();
+    let nca = fsc.lock().unwrap().get_system_nand_contents().and_then(|cache| {
+        cache.get_entry(FIRMWARE_VERSION_SYSTEM_DATA_ID, ContentRecordType::Data)
+    });
+    let romfs = extract_romfs(nca.and_then(|nca| nca.get_romfs()))
+        .or_else(|| extract_romfs(synthesize_system_archive(FIRMWARE_VERSION_SYSTEM_DATA_ID)))
+        .ok_or(ResultCode(crate::file_sys::errors::RESULT_INVALID_ARGUMENT.0))?;
+    let file = romfs.get_file("file")
+        .ok_or(ResultCode(crate::file_sys::errors::RESULT_INVALID_ARGUMENT.0))?;
+    read_firmware_version_data(&file.read_all_bytes(), fw_type)
+}
+
+// Mechanical byte-decoding portion of GetFirmwareVersionImpl, kept here so
+// malformed archives and Version1's revision masking can be tested in isolation.
+fn read_firmware_version_data(
+    data: &[u8],
+    fw_type: GetFirmwareVersionType,
+) -> Result<FirmwareVersionFormat, ResultCode> {
+    if data.len() != std::mem::size_of::<FirmwareVersionFormat>() {
+        return Err(ResultCode(crate::file_sys::errors::RESULT_OUT_OF_RANGE.0));
+    }
+    // All fields are u8 or byte arrays, repr(C), alignment 1, with explicit
+    // padding. Every bit pattern is valid and the complete payload is copied.
+    let mut out = unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<FirmwareVersionFormat>()) };
+    if fw_type == GetFirmwareVersionType::Version1 {
+        out.revision_minor = 0;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod firmware_archive_tests {
+    use super::*;
+
+    #[test]
+    fn installed_version_preserves_bytes_except_v1_revision_minor() {
+        let mut data = [0xa5; 0x100];
+        data[0] = 20;
+        data[5] = 9;
+        let v2 = read_firmware_version_data(&data, GetFirmwareVersionType::Version2).unwrap();
+        assert_eq!((v2.major, v2.revision_minor), (20, 9));
+        assert_eq!(v2.platform, [0xa5; 0x20]);
+        let v1 = read_firmware_version_data(&data, GetFirmwareVersionType::Version1).unwrap();
+        assert_eq!((v1.major, v1.revision_minor), (20, 0));
+        for size in [0, 0xff, 0x101] {
+            assert_eq!(read_firmware_version_data(&vec![0; size], GetFirmwareVersionType::Version2).err(),
+                Some(ResultCode(crate::file_sys::errors::RESULT_OUT_OF_RANGE.0)));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ServiceFramework wiring — makes ISystemSettingsServer a real IPC service
 // ---------------------------------------------------------------------------

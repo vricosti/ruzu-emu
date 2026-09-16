@@ -18,6 +18,19 @@ mod suspension_event_tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn modern_launch_permission_alias_matches_legacy_result_only_reply() {
+        let service = IParentalControlService::new(crate::core::SystemRef::null(), Capability::SYSTEM);
+        let mut expected = HLERequestContext::new();
+        ResponseBuilder::new(&mut expected, 2, 0, 0).push_result(RESULT_SUCCESS);
+        for command in [1002, 1019] {
+            let mut ctx = HLERequestContext::new();
+            service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.command_buffer(), expected.command_buffer());
+            assert!(ctx.outgoing_copy_objects.is_empty());
+        }
+    }
+
+    #[test]
     fn play_timer_settings_preserve_modern_payload_and_legacy_zero_reply() {
         assert_eq!(std::mem::size_of::<PlayTimerSettingsOld>(), 0x34);
         assert_eq!(std::mem::size_of::<PlayTimerSettings>(), 0x44);
@@ -330,6 +343,11 @@ impl IParentalControlService {
             ),
             (
                 commands::CONFIRM_LAUNCH_APPLICATION_PERMISSION,
+                Some(Self::confirm_launch_application_permission_handler),
+                "ConfirmLaunchApplicationPermission",
+            ),
+            (
+                1019,
                 Some(Self::confirm_launch_application_permission_handler),
                 "ConfirmLaunchApplicationPermission",
             ),

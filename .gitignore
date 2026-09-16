@@ -3,6 +3,9 @@
 /target-clean-head/
 /build/
 
+# Python bytecode
+*.pyc
+
 screenshots/
 bugs/
 

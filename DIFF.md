@@ -17587,6 +17587,15 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   ConfigureInputPlayer grabs keyboard/mouse; the GTK marker prevents the newly
   added controller-to-widget path from activating controls during that capture.
 
+## 2026-09-16 — scripts/steamdeck/package.py vs Eden-CI/Workflow .ci/package/linux.sh
+
+### Intentional differences
+- Set OPTIMIZE_LAUNCH=0 instead of Eden's 1. appimagetool 0.5.1 mounts and
+  executes an image to profile its startup when this option is enabled; this
+  requires FUSE. The dedicated container remains unprivileged without /dev/fuse
+  or SYS_ADMIN. Only optional startup file-layout profiling is skipped; Zen 2
+  compilation, dependency deployment and the upstream X11 hook are unchanged.
+
 ## 2026-09-16 — src/core/src/hle/service/am/service/application_functions.rs vs core/hle/service/am/service/application_functions.{h,cpp}
 
 ### Intentional differences

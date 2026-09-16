@@ -12,6 +12,11 @@ usage() {
 Usage: ./build.sh [options] [-- <extra cargo arguments>]
        ./build.sh package [--skip-deps] [--official]
        ./build.sh appimage [--skip-deps]
+       ./build.sh steamdeck [--jobs N] [--dry-run]
+
+The steamdeck command builds a dedicated Zen 2 AppImage in Docker, with
+bundled runtime libraries and X11 forced like Eden's AppImage.
+Output: target/steamdeck/artifacts/. See docs/steamdeck-appimage.md.
 
 The appimage command builds a Linux x86_64 release and packages it as
 target/release/Ruzu-<Git revision>-x86_64.AppImage (no commit, tag or push).
@@ -50,6 +55,11 @@ case "${1-}" in
         exit 0
         ;;
 esac
+
+if [ "${1-}" = steamdeck ]; then
+    shift
+    exec python3 "$SCRIPT_DIR/scripts/package-steamdeck.py" "$@"
+fi
 
 if [ "${1-}" = appimage ]; then
     shift

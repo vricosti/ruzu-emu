@@ -18248,3 +18248,50 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
   reuse across device clones, distinct entry points, and retryable errors.
 - The shared notification test covers successful completion, early error return,
   and unwinding. No GPU wait, dropped draw, or asynchronous fallback is introduced.
+
+## 2026-09-16 — src/core/src/hle/service/olsc/daemon_controller.rs vs eden/src/core/hle/service/olsc/daemon_controller.{h,cpp}
+
+### Intentional differences
+- Command 12 uses an explicit RequestParser/ResponseBuilder bridge instead of C++ CMIF serialization. GetAutonomyTaskStatus remains in IDaemonController, consumes the UUID, and returns RESULT_SUCCESS plus u8 status 0 exactly as upstream. No task state is consulted, matching Eden.
+
+### Unintentional differences (to fix)
+- Other commands retain pre-existing generic success handlers: 0–6 lack the upstream per-account/application state, and 11 lacks the stopper object response. These require a separate stateful service implementation beyond this command-12 repair; they are not claimed corrected here.
+- Existing handler names outside command 12 differ, command 10 is a success stub instead of unimplemented, and command 13 is absent.
+
+### Missing items
+- Per-account/application transfer state, corresponding setters/getters, task registration and stopper-object IPC wiring remain outside this slice.
+
+### Binary layout verification
+- ResponseBuilder zeroes the response buffer; command 12 now declares three parameter words (64-bit result, then u8 status with zero padding), rather than the previous result-only reply. Regression exercises the registered callback, UUID edge values, response length and deterministic padding. Upstream header and implementation re-read after the change.
+- Targeted regression passes. Full `cargo test -p core --locked --offline --quiet -- --test-threads=1` fails in debugger/filesystem/kernel tests and terminates with STATUS_ACCESS_VIOLATION before completing; the full crate is not validated. Home Menu Options needs a runtime retest.
+
+## 2026-09-16 — olsc/native_handle_holder.rs and stopper_object.rs vs Eden equivalents
+
+### Intentional differences
+- Native handle holder uses the existing ServiceContext/Event bridge and an internal event ID instead of a KEvent pointer. Event creation remains in the constructor, signaling in GetNativeHandle, and explicit close in Drop. IPC translates the readable object into a copy handle for the client process.
+- Empty stopper service uses Rust trait implementations and an empty command map; it has no extra behavior, as in Eden.
+
+### Unintentional differences (to fix)
+- None in these two interface slices; event infrastructure retains its existing Rust bridge.
+
+### Missing items
+- None in these two interfaces. Transfer controller wiring is implemented below.
+
+### Binary layout verification
+- GetNativeHandle returns a 64-bit result and one copy object, with no extra payload. Headers and implementations re-read after implementation. All 11 OLSC tests pass, including event re-signaling and readable copy-object registration.
+
+## 2026-09-16 — olsc/transfer_task_list_controller.rs vs Eden transfer_task_list_controller.{h,cpp}
+
+### Intentional differences
+- Per-command Rust callbacks perform CMIF serialization explicitly instead of Eden's D<> templates. Each method remains in its upstream-owned module. Shared child interfaces use Arc.
+
+### Unintentional differences (to fix)
+- None identified after re-reading both upstream files and comparing all 31 registrations and seven implemented commands.
+
+### Missing items
+- Upstream's null handlers remain null; no invented success stubs.
+
+### Binary layout verification
+- Commands 5/9 return a native holder interface, 8 an empty stopper interface; 16 returns u32 zero; 24/25 return exactly 0x30 zero bytes; 21 returns result only. Tests exercise registered callbacks, actual child sessions, copy-object event registration and payload lengths.
+- All 11 OLSC tests pass. Full `cargo test -p core --locked --offline` was attempted again and terminates with STATUS_ACCESS_VIOLATION; a green full-crate result is not claimed. Runtime Options retest remains pending.
+

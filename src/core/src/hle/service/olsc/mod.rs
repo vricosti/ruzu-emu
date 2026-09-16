@@ -9,4 +9,5 @@ pub mod olsc;
 pub mod olsc_service_for_application;
 pub mod olsc_service_for_system_service;
 pub mod remote_storage_controller;
+pub mod stopper_object;
 pub mod transfer_task_list_controller;

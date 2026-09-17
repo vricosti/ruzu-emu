@@ -4,9 +4,10 @@
 ./build.sh steamdeck --jobs 2
 ```
 
-Requires Python 3, a running Docker daemon and a Linux x86_64 build machine
-supporting the Zen 2 instruction set (the optimized executable is traced during
-packaging). Reserve at least 35 GiB on the checkout filesystem and additional
+Requires Python 3, a running Docker daemon and a Linux x86_64 build machine.
+The host does not need Zen 2 instructions: Cargo uses an explicit target to keep
+host build scripts/procedural macros baseline-compatible, and packaging does not
+execute Ruzu. Reserve at least 35 GiB on the checkout filesystem and additional
 space for Docker images. No packages are installed on the host; no privileged
 container, FUSE mount, host GPU, display, controller, configuration or save-data
 mount is required. Docker must be configured separately by the user.
@@ -25,10 +26,18 @@ branches nor commits, tags or pushes anything.
 - Rust 1.92.0 container pinned by image digest, Debian native packages from a
   fixed snapshot, Cargo dependencies from `Cargo.lock`.
 - Rust uses `-C target-cpu=znver2`; C/C++ use `-march=znver2 -mtune=znver2`.
+  The resulting AppImage still requires a Zen 2-compatible CPU to run. A build
+  succeeding on an Intel host does not prove execution compatibility (for example,
+  SHA instructions are absent on some Intel CPUs). Use `./build.sh appimage` for
+  the generic Linux package instead.
   Release debug information is omitted; panic unwinding is unchanged.
 - `quick-sharun` is pinned by commit and SHA256. That version pins and verifies
   its own sharun, appimagetool and helper downloads. It packages GTK4, glibc and
   the OpenGL/Vulkan user-space stack, rather than depending on Ubuntu's glibc.
+- Runtime tracing is disabled (`STRACE_MODE=0`). ELF dependency inspection is
+  supplemented with explicit GTK4/SDL/PulseAudio/PipeWire deployment and the
+  dynamically loaded ALSA/JACK/audio/input libraries. Missing explicit libraries
+  fail packaging instead of silently producing an incomplete bundle.
 - Unlike Eden, optional `OPTIMIZE_LAUNCH` profiling is disabled: it mounts and
   executes the image using FUSE during packaging. Building therefore does not
   require `/dev/fuse` or `SYS_ADMIN`. This does not disable Zen 2 compilation

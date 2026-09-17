@@ -41,18 +41,27 @@ class SteamDeckTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
 
     def test_missing_docker_stops_without_writes(self):
-        with patch.object(HOST.shutil, "which", return_value=None), \
-             patch.object(HOST.Path, "read_text", return_value="avx2 bmi2 fma"):
+        with patch.object(HOST.shutil, "which", return_value=None):
             with self.assertRaisesRegex(RuntimeError, "Docker is required"):
                 HOST.preflight(ROOT)
 
     def test_low_disk_stops_before_build(self):
         with patch.object(HOST.shutil, "which", return_value="docker"), \
-             patch.object(HOST.Path, "read_text", return_value="avx2 bmi2 fma"), \
              patch.object(HOST.subprocess, "run"), \
              patch.object(HOST.shutil, "disk_usage", return_value=HOST.shutil._ntuple_diskusage(100, 99, 1)):
             with self.assertRaisesRegex(RuntimeError, "35 GiB"):
                 HOST.preflight(ROOT)
+
+    def test_host_without_zen2_features_can_build(self):
+        with patch.object(HOST.platform, "system", return_value="Linux"), \
+             patch.object(HOST.platform, "machine", return_value="x86_64"), \
+             patch.object(HOST.Path, "read_text", side_effect=AssertionError("no CPU gate")), \
+             patch.object(HOST.shutil, "which", return_value="docker"), \
+             patch.object(HOST.subprocess, "run"), \
+             patch.object(HOST.subprocess, "check_output", return_value=""), \
+             patch.object(HOST.shutil, "disk_usage", return_value=HOST.shutil._ntuple_diskusage(
+                 2 * HOST.MIN_FREE_BYTES, 0, 2 * HOST.MIN_FREE_BYTES)):
+            HOST.preflight(ROOT)
 
     def test_target_flags_and_downloads_are_pinned(self):
         dockerfile = (ROOT / "scripts/steamdeck/Dockerfile").read_text()
@@ -64,6 +73,7 @@ class SteamDeckTests(unittest.TestCase):
         self.assertIn("target-cpu=znver2", entry)
         self.assertIn("-march=znver2 -mtune=znver2", entry)
         self.assertIn("cargo build --locked --release", entry)
+        self.assertIn("--target x86_64-unknown-linux-gnu", entry)
         self.assertIn("unset CARGO_TARGET_DIR", entry)
         self.assertIn("--target-dir /output/build", entry)
         self.assertNotIn("panic=abort", entry)
@@ -71,9 +81,14 @@ class SteamDeckTests(unittest.TestCase):
     def test_packaging_contract_and_checksum(self):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)
-            binary = output / "build/release/ruzu"
+            binary = output / "build/x86_64-unknown-linux-gnu/release/ruzu"
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"synthetic binary")
+            libraries = output / "system-libraries"
+            libraries.mkdir()
+            for name in ("libasound.so.2", "libjack.so.0", "libpulse.so.0",
+                         "libpipewire-0.3.so.0", "libudev.so.1", "libdecor-0.so.0"):
+                (libraries / name).touch()
             seen = []
 
             def run(command, **kwargs):
@@ -83,11 +98,18 @@ class SteamDeckTests(unittest.TestCase):
                 env = kwargs["env"]
                 self.assertEqual(env["ADD_HOOKS"], "wayland-is-broken.hook")
                 self.assertEqual(env["OPTIMIZE_LAUNCH"], "0")
+                self.assertEqual(env["STRACE_MODE"], "0")
+                self.assertEqual(env["GTK_DIR"], "gtk-4.0")
+                for name in ("DEPLOY_SDL", "DEPLOY_PULSE", "DEPLOY_PIPEWIRE"):
+                    self.assertEqual(env[name], "1")
                 for name in ("DEPLOY_GTK", "DEPLOY_GLIBC", "DEPLOY_VULKAN", "DEPLOY_OPENGL"):
                     self.assertEqual(env[name], "1")
                 self.assertTrue(env["XDG_CONFIG_HOME"].startswith(temp))
                 appdir = Path(env["APPDIR"])
-                if command[0] == "xvfb-run":
+                if command[1] != "--make-appimage":
+                    self.assertEqual(command[0], "/opt/quick-sharun")
+                    self.assertIn(str(libraries / "libasound.so.2"), command)
+                    self.assertIn(str(libraries / "libjack.so.0"), command)
                     (appdir / "lib").mkdir(parents=True)
                     (appdir / "lib/libc.so.6").touch()
                     (appdir / "bin").mkdir()
@@ -96,9 +118,9 @@ class SteamDeckTests(unittest.TestCase):
                     self.assertTrue((appdir / "share/doc/ruzu/build-info.txt").is_file())
                     (Path(env["OUTPATH"]) / env["OUTNAME"]).write_bytes(b"synthetic AppImage")
 
-            with patch.dict(PACKAGE.os.environ, {"OPTIMIZE_LAUNCH": "1"}), \
+            with patch.dict(PACKAGE.os.environ, {"OPTIMIZE_LAUNCH": "1", "STRACE_MODE": "1"}), \
                  patch.object(PACKAGE.subprocess, "run", side_effect=run):
-                PACKAGE.package("test-revision", ROOT, output)
+                PACKAGE.package("test-revision", ROOT, output, libraries)
             artifact = output / "artifacts/Ruzu-SteamDeck-test-revision-x86_64.AppImage"
             checksum = hashlib.sha256(artifact.read_bytes()).hexdigest()
             self.assertEqual(Path(str(artifact) + ".sha256").read_text(),
@@ -109,6 +131,12 @@ class SteamDeckTests(unittest.TestCase):
     def test_bad_revision_rejected_before_packaging(self):
         with self.assertRaisesRegex(ValueError, "Invalid artifact"):
             PACKAGE.package("../escape")
+
+    def test_missing_dynamic_library_stops_before_packaging(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(PACKAGE.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "Missing runtime library"):
+                PACKAGE.package("test", ROOT, Path(temp), Path(temp))
+            run.assert_not_called()
 
 
 if __name__ == "__main__":

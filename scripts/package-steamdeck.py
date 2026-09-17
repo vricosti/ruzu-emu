@@ -35,10 +35,11 @@ def commands(root, jobs):
 def preflight(root):
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise RuntimeError("Steam Deck packaging requires a Linux x86_64 build host")
-    # Cargo build scripts and quick-sharun's tracing run the optimized binaries.
-    flags = Path("/proc/cpuinfo").read_text().split()
-    if not {"avx2", "bmi2", "fma"}.issubset(flags):
-        raise RuntimeError("The build host must support AVX2, BMI2 and FMA (Zen 2 target)")
+    # A target build need not run on its host. Cargo uses an explicit target
+    # and packaging disables tracing/launch profiling of the optimized binary.
+    print("Building for Steam Deck (Zen 2), not for the host CPU. "
+          "The AppImage requires a compatible CPU to run; use ./build.sh appimage "
+          "for a generic Linux package.")
     if not shutil.which("docker"):
         raise RuntimeError("Docker is required; no host packages will be installed automatically")
     subprocess.run(["docker", "info"], check=True, stdout=subprocess.DEVNULL)

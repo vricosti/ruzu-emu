@@ -13,7 +13,8 @@ export CARGO_PROFILE_RELEASE_DEBUG=0
 # that nested project's target directory. An exported CARGO_TARGET_DIR redirects
 # the nested build as well, but cubeb-sys does not adjust its link-search path.
 unset CARGO_TARGET_DIR
-cargo build --locked --release --target-dir /output/build --bin ruzu --jobs "$1"
+# Explicit target keeps target RUSTFLAGS off host build scripts/proc macros.
+cargo build --locked --release --target x86_64-unknown-linux-gnu --target-dir /output/build --bin ruzu --jobs "$1"
 [ "$revision" = "$(sh scripts/package-revision.sh /source)" ] || {
     echo 'Git revision changed during compilation; retry on a stable checkout.' >&2
     exit 1

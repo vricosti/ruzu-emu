@@ -26,13 +26,15 @@ pub(crate) fn install_interface_navigation(
     let navigation = ControllerNavigation::for_interface(hid, input);
     let weak = main.downgrade();
     let previous_target = gtk::glib::WeakRef::<gtk::Window>::new();
+    let mut repeat = NavigationRepeat::default();
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
         let Some(main) = weak.upgrade() else {
             return gtk::glib::ControlFlow::Break;
         };
         // Drain even when inactive, so releases update the edge detector and
         // presses received in another window never become deferred actions.
-        let keys = navigation.take_pending_keys();
+        let mut keys = navigation.take_pending_keys();
+        let held = navigation.held_vertical_direction();
         let target = gtk::Window::list_toplevels()
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Window>().ok())
@@ -45,10 +47,15 @@ pub(crate) fn install_interface_navigation(
         let changed = previous_target.upgrade() != target;
         previous_target.set(target.as_ref());
         let Some(target) = target else {
+            repeat.suppress(held);
             return gtk::glib::ControlFlow::Continue;
         };
         if changed {
+            repeat.suppress(held);
             return gtk::glib::ControlFlow::Continue;
+        }
+        if let Some(key) = repeat.poll(held, std::time::Instant::now()) {
+            if !keys.contains(&key) { keys.push(key); }
         }
         for key in keys {
             if target == main && list_key(key) {
@@ -82,7 +89,19 @@ fn belongs_to(window: &gtk::Window, main: &gtk::Window) -> bool {
 
 /// Invoke GTK's widget actions, not emulated keyboard/controller bindings.
 /// GTK owns focus ordering, scrolling and selection inside its file chooser.
+/// Focus the menu bar without opening a menu or activating an action.
+pub(crate) fn focus_menu_bar(window: &gtk::Window) -> bool {
+    super::inline_menu::focus_bar(window)
+        || find_widget::<gtk::PopoverMenuBar>(window.upcast_ref())
+            .and_then(|menu| menu.first_child())
+            .is_some_and(|item| item.grab_focus())
+}
+
 pub(crate) fn navigate_window(window: &gtk::Window, key: NavigationKey) {
+    if super::inline_menu::navigate(window, key) {
+        window.set_focus_visible(true);
+        return;
+    }
     if key == NavigationKey::Menu {
         if let Some(menu) = find_widget::<gtk::PopoverMenuBar>(window.upcast_ref()) {
             if let Some(item) = menu.first_child() {
@@ -251,6 +270,28 @@ fn activate_key_binding(focus: &gtk::Widget, key: NavigationKey) -> bool {
         NavigationKey::Right => gtk::gdk::Key::Right,
         _ => return false,
     };
+    // Run owner-defined focus transitions before GTK's built-in spatial search.
+    // The same capture-phase shortcuts handle physical keyboard presses.
+    let mut owner = Some(focus.clone());
+    while let Some(widget) = owner {
+        if widget.is::<gtk::Popover>() || widget.is::<gtk::Window>() { break; }
+        for controller in widget.observe_controllers().iter::<gtk::glib::Object>().flatten()
+            .filter_map(|object| object.downcast::<gtk::EventController>().ok()) {
+            if controller.name().as_deref() != Some("ruzu-directional-navigation") { continue; }
+            let Some(controller) = controller.downcast_ref::<gtk::ShortcutController>() else { continue; };
+            for shortcut in controller.iter::<gtk::glib::Object>().flatten()
+                .filter_map(|object| object.downcast::<gtk::Shortcut>().ok()) {
+                let Some(trigger) = shortcut.trigger().and_downcast::<gtk::KeyvalTrigger>() else { continue; };
+                if trigger.keyval() == keyval && trigger.modifiers().is_empty()
+                    && shortcut.action().is_some_and(|action| action.activate(
+                        gtk::ShortcutActionFlags::empty(), &widget, shortcut.arguments().as_ref()))
+                {
+                    return true;
+                }
+            }
+        }
+        owner = widget.parent();
+    }
     let mut current = Some(focus.clone());
     while let Some(widget) = current {
         if widget.is::<gtk::Popover>() || widget.is::<gtk::Window>() {
@@ -344,6 +385,38 @@ struct NavigationState {
     pending_keys: VecDeque<NavigationKey>,
 }
 
+// Frontend-only repeat: guest input and applet confirmation remain edge-triggered.
+#[derive(Default)]
+struct NavigationRepeat {
+    held: Option<NavigationKey>,
+    next: Option<std::time::Instant>,
+    suppressed: bool,
+}
+
+impl NavigationRepeat {
+    fn suppress(&mut self, held: Option<NavigationKey>) {
+        self.held = held;
+        self.next = None;
+        self.suppressed = held.is_some();
+    }
+
+    fn poll(&mut self, held: Option<NavigationKey>, now: std::time::Instant) -> Option<NavigationKey> {
+        let held = held.filter(|key| matches!(key, NavigationKey::Up | NavigationKey::Down));
+        if held.is_none() { *self = Self::default(); return None; }
+        if self.suppressed { return None; }
+        if self.held != held {
+            self.held = held;
+            self.next = Some(now + std::time::Duration::from_millis(400));
+            return None;
+        }
+        if self.next.is_some_and(|next| now >= next) {
+            // Do not replay a backlog if the UI thread was busy.
+            self.next = Some(now + std::time::Duration::from_millis(80));
+            held
+        } else { None }
+    }
+}
+
 impl Default for NavigationState {
     fn default() -> Self {
         Self {
@@ -422,6 +495,7 @@ impl ControllerNavigation {
         *navigation.interface_pad.borrow_mut() = Some(InterfacePad {
             input: std::rc::Rc::downgrade(input),
             devices: Vec::new(),
+            pad_states: Vec::new(),
             identity: String::new(),
             state: Arc::new(Mutex::new(NavigationState::default())),
             refresh_at: std::time::Instant::now(),
@@ -449,6 +523,28 @@ impl ControllerNavigation {
             }
         }
         keys
+    }
+
+    fn held_vertical_direction(&self) -> Option<NavigationKey> {
+        if !*common::settings::values().controller_navigation.get_value() { return None; }
+        let controller = self.player_1_controller.lock();
+        let style = controller.get_npad_style_index(false);
+        drop(controller);
+        let direction = vertical_direction(&self.state.lock(), style);
+        let mut up = direction == Some(NavigationKey::Up);
+        let mut down = direction == Some(NavigationKey::Down);
+        if let Some(pad) = self.interface_pad.borrow().as_ref() {
+            for state in &pad.pad_states {
+                let direction = vertical_direction(&state.lock(), NpadStyleIndex::Fullkey);
+                up |= direction == Some(NavigationKey::Up);
+                down |= direction == Some(NavigationKey::Down);
+            }
+        }
+        match (up, down) {
+            (true, false) => Some(NavigationKey::Up),
+            (false, true) => Some(NavigationKey::Down),
+            _ => None,
+        }
     }
 
     /// Discard events received while the list is hidden or inactive.
@@ -485,6 +581,7 @@ impl ControllerNavigation {
 /// HID path. The input factories, mappings and callbacks remain owned by
 /// InputSubsystem; this reader never changes player configuration.
 struct InterfacePad {
+    pad_states: Vec<Arc<Mutex<NavigationState>>>,
     input: std::rc::Weak<std::cell::RefCell<input_common::InputSubsystem>>,
     devices: Vec<Box<dyn common::input::InputDevice>>,
     identity: String,
@@ -501,6 +598,7 @@ impl InterfacePad {
         self.refresh_at = now + std::time::Duration::from_secs(1);
         let Some(input) = self.input.upgrade() else {
             self.devices.clear();
+            self.pad_states.clear();
             return;
         };
         let input = input.borrow();
@@ -535,12 +633,14 @@ impl InterfacePad {
         }
         self.identity = identity;
         self.devices.clear();
+        self.pad_states.clear();
         // An already-dispatched callback from a removed device can finish on
         // another thread. Give new readers a new queue so that callback cannot
         // deliver stale input after reconnection or a mapping change.
         self.state = Arc::new(Mutex::new(NavigationState::default()));
         for candidate in candidates {
             let pad_state = Arc::new(Mutex::new(NavigationState::default()));
+            self.pad_states.push(pad_state.clone());
             let mappings = input.get_button_mapping_for_device(&candidate);
             use native_button::Values as Button;
             for (button, key) in [
@@ -774,6 +874,21 @@ fn controller_update_stick(
     }
     if let Some(key) = stick_navigation_key(controller_type, &state.stick_values) {
         state.pending_keys.push_back(key);
+    }
+}
+
+fn vertical_direction(state: &NavigationState, style: NpadStyleIndex) -> Option<NavigationKey> {
+    let standard = matches!(style, NpadStyleIndex::Fullkey | NpadStyleIndex::JoyconDual
+        | NpadStyleIndex::Handheld | NpadStyleIndex::GameCube);
+    let stick = stick_navigation_key(style, &state.stick_values);
+    let up = (standard && state.button_values[native_button::Values::DUp as usize].value)
+        || stick == Some(NavigationKey::Up);
+    let down = (standard && state.button_values[native_button::Values::DDown as usize].value)
+        || stick == Some(NavigationKey::Down);
+    match (up, down) {
+        (true, false) => Some(NavigationKey::Up),
+        (false, true) => Some(NavigationKey::Down),
+        _ => None,
     }
 }
 

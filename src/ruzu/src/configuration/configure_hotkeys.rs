@@ -317,6 +317,7 @@ fn install_context_menu(
                         Ok(())
                     };
                     if let Some(popover) = popover.upgrade() { popover.popdown(); }
+                    if crate::util::inline_menu::enabled() { crate::util::inline_menu::hide_context_menu(); }
                     if let Err(action) = result {
                         let parent = source.upgrade().and_then(|source| source.root()).and_downcast::<gtk::Window>();
                         crate::gtk_compat::show_warning(parent.as_ref(),
@@ -329,6 +330,11 @@ fn install_context_menu(
                 }
             });
             content.append(&button);
+        }
+        if crate::util::inline_menu::enabled() {
+            popover.unparent();
+            crate::util::inline_menu::show_content(&source, &content, x, y);
+            return;
         }
         popover.set_child(Some(&content));
         popover.connect_closed(|popover| popover.unparent());

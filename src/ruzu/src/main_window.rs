@@ -516,6 +516,7 @@ pub struct GMainWindow {
     /// In-window menu bar on non-macOS platforms. Upstream hides the menu bar
     /// while the single-window render surface is fullscreen.
     menu_bar: Option<gtk::PopoverMenuBar>,
+    inline_menu_bar: Option<crate::util::inline_menu::InlineMenuBar>,
     /// Central stack swapping between the game list, loading screen, and render
     /// view (upstream swaps `centralwidget`).
     stack: gtk::Stack,
@@ -1816,7 +1817,12 @@ impl GMainWindow {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         install_menu_css();
 
-        let menu_bar = if !cfg!(target_os = "macos") {
+        let inline_menu_bar = crate::util::inline_menu::enabled().then(|| {
+            let bar = crate::util::inline_menu::InlineMenuBar::new(&build_menu_model());
+            root.append(bar.row());
+            bar
+        });
+        let menu_bar = if !cfg!(target_os = "macos") && inline_menu_bar.is_none() {
             let menubar = gtk::PopoverMenuBar::from_model(Some(&build_menu_model()));
             menubar.set_halign(gtk::Align::Fill);
             menubar.set_hexpand(true);
@@ -1862,7 +1868,15 @@ impl GMainWindow {
             }));
         root.append(status_bar.widget());
 
-        window.set_child(Some(&root));
+        if let Some(bar) = &inline_menu_bar {
+            let overlay = gtk::Overlay::new();
+            overlay.add_css_class(crate::util::inline_menu::OVERLAY_CSS_CLASS);
+            overlay.set_child(Some(&root));
+            window.set_child(Some(&overlay));
+            bar.attach_to(&overlay);
+        } else {
+            window.set_child(Some(&root));
+        }
 
         // Proof path for the embedded render surface: when RUZU_EMBED_METAL=1,
         // attach a CAMetalLayer to the window's NSView once realized (see
@@ -1936,6 +1950,7 @@ impl GMainWindow {
                 ),
             ),
             menu_bar,
+            inline_menu_bar,
             stack,
             loading_screen,
             session: RefCell::new(None),
@@ -1974,6 +1989,20 @@ impl GMainWindow {
             error_applet_frontend: Rc::clone(&error_applet_frontend),
         });
 
+        if this.inline_menu_bar.is_some() {
+            let weak = Rc::downgrade(&this);
+            crate::util::inline_menu::set_render_window_suppressor(Rc::new(move |hidden| {
+                let Some(this) = weak.upgrade() else { return };
+                // Native X children paint above GTK's parent surface. Restore
+                // only a still-live, visible render page, never a stopped game.
+                #[cfg(target_os = "linux")]
+                if let Some(render) = this.render.borrow().as_ref().filter(|_| this.detached_render_host.borrow().is_none()) {
+                    crate::render_window_x11::set_render_window_hidden(
+                        render.display as *mut _, render.child_window as _,
+                        hidden || !this.render_page_visible.get());
+                };
+            }));
+        }
         controller_applet_frontend.connect_docked_mode_changed(glib::clone!(
             #[weak]
             this,
@@ -2595,7 +2624,8 @@ impl GMainWindow {
         let ratio = emulation_aspect_ratio(aspect, height as f32 / width as f32);
         let render_width = (height as f32 / ratio) as i32;
         let extra_height = if self.detached_render_host.borrow().is_none() {
-            let menu_height = self.menu_bar.as_ref().map_or(0, |menu| menu.height());
+            let menu_height = self.menu_bar.as_ref().map_or(0, |menu| menu.height())
+                + self.inline_menu_bar.as_ref().map_or(0, |menu| menu.height());
             let status_height = if crate::uisettings::with(|values| *values.show_status_bar.get_value()) {
                 self.status_bar.widget().height()
             } else { 0 };
@@ -2750,6 +2780,9 @@ impl GMainWindow {
     fn update_fullscreen_chrome(&self, fullscreen: bool) {
         let fullscreen = fullscreen && self.detached_render_host.borrow().is_none();
         if let Some(menu_bar) = self.menu_bar.as_ref() {
+            menu_bar.set_visible(!fullscreen);
+        }
+        if let Some(menu_bar) = self.inline_menu_bar.as_ref() {
             menu_bar.set_visible(!fullscreen);
         }
         let show_status_bar = crate::uisettings::with(|values| *values.show_status_bar.get_value());
@@ -4395,6 +4428,9 @@ impl GMainWindow {
         if let Some(menu_bar) = self.menu_bar.as_ref() {
             menu_bar.set_menu_model(Some(&menu));
         }
+        if let Some(menu_bar) = self.inline_menu_bar.as_ref() {
+            menu_bar.set_model(&menu);
+        }
     }
 
     fn on_configure_tas(self: &Rc<Self>) {
@@ -4798,7 +4834,7 @@ impl GMainWindow {
         description.set_wrap(true);
         description.set_xalign(0.0);
         content.append(&description);
-        content.append(&choices);
+        content.append(&crate::configuration::shared_widget::popup_safe_dropdown(&choices));
         dialog.add_button(&crate::i18n::tr("Cancel"), gtk::ResponseType::Cancel);
         dialog.add_button(&crate::i18n::tr("OK"), gtk::ResponseType::Accept);
 
@@ -6167,7 +6203,8 @@ impl GMainWindow {
         let Some(handles) = render.as_ref() else { return; };
         #[cfg(target_os = "linux")]
         crate::render_window_x11::set_render_window_hidden(
-            handles.display as *mut _, handles.child_window as _, false);
+            handles.display as *mut _, handles.child_window as _,
+            self.detached_render_host.borrow().is_none() && crate::util::inline_menu::render_suppressed());
         #[cfg(target_os = "windows")]
         crate::render_window_windows::set_render_window_hidden(handles.child_window as _, false);
         #[cfg(target_os = "macos")]

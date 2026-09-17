@@ -158,7 +158,7 @@ pub fn present(
     touch_map.set_active(Some(touch_map_index.get() as u32));
     let configure_touch_map = gtk::Button::with_label("Configure");
     touch_grid.attach(&gtk::Label::new(Some("Touch From Button Map:")), 0, 1, 1, 1);
-    touch_grid.attach(&touch_map, 1, 1, 1, 1);
+    touch_grid.attach(&super::shared_widget::popup_safe_combo(&touch_map), 1, 1, 1, 1);
     touch_grid.attach(&configure_touch_map, 2, 1, 1, 1);
     touch_frame.set_child(Some(&touch_grid));
     content.append(&touch_frame);

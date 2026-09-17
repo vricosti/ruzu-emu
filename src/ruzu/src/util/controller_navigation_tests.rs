@@ -4,6 +4,52 @@ use super::*;
 use gtk::glib;
 
 #[test]
+fn vertical_repeat_delay_release_direction_change_and_no_backlog() {
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let mut repeat = NavigationRepeat::default();
+    let down = Some(NavigationKey::Down);
+    assert_eq!(repeat.poll(down, start), None);
+    assert_eq!(repeat.poll(down, start + Duration::from_millis(399)), None);
+    assert_eq!(repeat.poll(down, start + Duration::from_millis(400)), down);
+    assert_eq!(repeat.poll(down, start + Duration::from_millis(479)), None);
+    assert_eq!(repeat.poll(down, start + Duration::from_millis(480)), down);
+    let later = start + Duration::from_secs(10);
+    assert_eq!(repeat.poll(down, later), down);
+    assert_eq!(repeat.poll(down, later), None);
+    let up = Some(NavigationKey::Up);
+    assert_eq!(repeat.poll(up, later), None);
+    assert_eq!(repeat.poll(up, later + Duration::from_millis(400)), up);
+    assert_eq!(repeat.poll(None, later), None);
+    assert_eq!(repeat.poll(up, later), None);
+    repeat.suppress(up);
+    assert_eq!(repeat.poll(up, later + Duration::from_secs(1)), None);
+    assert_eq!(repeat.poll(down, later + Duration::from_secs(2)), None);
+    assert_eq!(repeat.poll(None, later), None);
+    assert_eq!(repeat.poll(down, later), None);
+    assert_eq!(repeat.poll(down, later + Duration::from_millis(400)), down);
+    for key in [NavigationKey::Enter, NavigationKey::Escape, NavigationKey::Menu, NavigationKey::Left, NavigationKey::Right] {
+        assert_eq!(repeat.poll(Some(key), later), None);
+        assert_eq!(repeat.poll(Some(key), later + Duration::from_secs(5)), None);
+    }
+}
+
+#[test]
+fn vertical_repeat_uses_dpad_and_rotated_stick_not_sideways_confirmation() {
+    let mut state = NavigationState::default();
+    state.button_values[native_button::Values::DDown as usize].value = true;
+    assert_eq!(vertical_direction(&state, NpadStyleIndex::Fullkey), Some(NavigationKey::Down));
+    assert_eq!(vertical_direction(&state, NpadStyleIndex::JoyconLeft), None);
+    state.stick_values[native_analog::Values::LStick as usize].up = true;
+    assert_eq!(vertical_direction(&state, NpadStyleIndex::Fullkey), None);
+    state.button_values[native_button::Values::DDown as usize].value = false;
+    assert_eq!(vertical_direction(&state, NpadStyleIndex::Fullkey), Some(NavigationKey::Up));
+    state.stick_values[native_analog::Values::LStick as usize].up = false;
+    state.stick_values[native_analog::Values::LStick as usize].left = true;
+    assert_eq!(vertical_direction(&state, NpadStyleIndex::JoyconLeft), Some(NavigationKey::Down));
+}
+
+#[test]
 fn interface_device_identity_ignores_parameter_order_and_display_name() {
     use common::param_package::ParamPackage;
     let first =

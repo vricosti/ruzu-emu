@@ -5,3 +5,4 @@ pub mod controller_navigation;
 pub mod game;
 pub mod mod_install;
 pub mod sequence_dialog;
+pub(crate) mod inline_menu;

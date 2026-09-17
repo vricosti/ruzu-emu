@@ -1022,7 +1022,7 @@ pub fn page(
         initial_type,
     ));
     connect_box.append(&connected);
-    connect_box.append(&controller_type);
+    connect_box.append(&w::popup_safe_dropdown(&controller_type));
     header.append(&connect_box);
 
     let device_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -1062,7 +1062,7 @@ pub fn page(
     *page.input_devices.borrow_mut() = input_devices.clone();
     page.selected_device.set(initial_device);
     device_box.append(&device_label);
-    device_box.append(&input_device);
+    device_box.append(&w::popup_safe_dropdown(&input_device));
     header.append(&device_box);
 
     // Adopting the pad without its mapping would leave every binding on
@@ -1096,7 +1096,7 @@ pub fn page(
     let save_profile = gtk::Button::with_label("Save");
     let new_profile = gtk::Button::with_label("New");
     let delete_profile = gtk::Button::with_label("Delete");
-    profile_row.append(&profile);
+    profile_row.append(&w::popup_safe_dropdown(&profile));
     profile_row.append(&save_profile);
     profile_row.append(&new_profile);
     profile_row.append(&delete_profile);

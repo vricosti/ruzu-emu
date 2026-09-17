@@ -91,7 +91,7 @@ pub fn choose_mod_folders(
         ));
         type_prompt.set_xalign(0.0);
         dialog.content_area().append(&type_prompt);
-        dialog.content_area().append(&mod_type);
+        dialog.content_area().append(&crate::configuration::shared_widget::popup_safe_combo(&mod_type));
     }
 
     let root = root.to_path_buf();

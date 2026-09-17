@@ -405,10 +405,10 @@ impl ControllerSelectorDialog {
             let controller =
                 gtk::DropDown::new(Some(gtk::StringList::new(&refs)), gtk::Expression::NONE);
             controller.set_hexpand(true);
-            player.append(&controller);
+            player.append(&crate::configuration::shared_widget::popup_safe_dropdown(&controller));
 
             let profile = gtk::DropDown::from_strings(&[&crate::i18n::tr("Use Current Config")]);
-            player.append(&profile);
+            player.append(&crate::configuration::shared_widget::popup_safe_dropdown(&profile));
 
             players_grid.attach(&player, (index % 4) as i32, (index / 4) as i32, 1, 1);
 

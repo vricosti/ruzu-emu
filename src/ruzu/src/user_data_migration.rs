@@ -139,7 +139,7 @@ fn show_dialog<P: IsA<gtk::Window>>(
     source_combo.set_active(Some(0));
     source_combo.set_hexpand(true);
     source_row.append(&source_label);
-    source_row.append(&source_combo);
+    source_row.append(&crate::configuration::shared_widget::popup_safe_combo(&source_combo));
     content.append(&source_row);
 
     let method_box = gtk::Box::new(gtk::Orientation::Vertical, 6);

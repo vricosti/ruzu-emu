@@ -69,7 +69,7 @@ fn build(
     );
     content.append(&super::shared_widget::labeled_row(
         "Input device:",
-        &selection,
+        &super::shared_widget::popup_safe_dropdown(&selection),
     ));
     let picture = gtk::Picture::new();
     picture.set_size_request(320, 240);

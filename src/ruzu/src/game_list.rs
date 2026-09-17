@@ -452,6 +452,7 @@ impl GameEntry {
 /// way upstream re-runs `GameListWorker` after the directory list changes.
 struct GameListView {
     root: gtk::Box,
+    toolbar: gtk::Box,
     stack: gtk::Stack,
     filter_bar: gtk::Box,
     filter_entry: gtk::SearchEntry,
@@ -541,6 +542,9 @@ impl GameListHandle {
     /// Keep tree navigation in its owner; other focused controls belong to GTK.
     pub(crate) fn controller_key(&self, key: NavigationKey) -> bool {
         let view = &self.0;
+        if view.navigate_from_toolbar(key) {
+            return true;
+        }
         let focused = view.parent_window().and_then(|w| gtk::prelude::GtkWindowExt::focus(&w));
         if focused.is_some_and(|w| w.ancestor(gtk::Popover::static_type()).is_none()
             && (w == view.column_view || w.is_ancestor(&view.column_view))) {
@@ -773,6 +777,7 @@ pub fn build<
 
     let view = Rc::new(GameListView {
         root: root.clone(),
+        toolbar: toolbar.clone(),
         stack,
         filter_bar,
         filter_entry: filter_entry.clone(),
@@ -842,6 +847,22 @@ pub fn build<
         }
     });
     column_view.add_controller(keys);
+
+    let toolbar_keys = gtk::EventControllerKey::new();
+    toolbar_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    toolbar_keys.connect_key_pressed({
+        let view = Rc::downgrade(&view);
+        move |_, keyval, _, _| {
+            if navigation_key_for_gdk(keyval).is_some_and(|key| {
+                view.upgrade().is_some_and(|view| view.navigate_from_toolbar(key))
+            }) {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        }
+    });
+    toolbar.add_controller(toolbar_keys);
 
     // `GameListWorker::ProcessEvents`: transfer plain scan results back to
     // GTK, where GObjects and textures must be created.
@@ -1022,6 +1043,36 @@ impl GameListView {
         }
     }
 
+    // GTK's directional focus search does not reliably enter a ColumnView
+    // from the toolbar. Keep the explicit handoff in the game-list owner.
+    fn navigate_from_toolbar(&self, key: NavigationKey) -> bool {
+        if !matches!(key, NavigationKey::Up | NavigationKey::Down) {
+            return false;
+        }
+        let focused = self.parent_window().and_then(|window| {
+            gtk::prelude::GtkWindowExt::focus(&window)
+        });
+        if !focused.is_some_and(|widget| {
+            widget.ancestor(gtk::Popover::static_type()).is_none()
+                && (widget == self.toolbar || widget.is_ancestor(&self.toolbar))
+        }) {
+            return false;
+        }
+        if key == NavigationKey::Up {
+            return self.parent_window().is_some_and(|window| {
+                crate::util::controller_navigation::focus_menu_bar(&window)
+            });
+        }
+        if self.stack.visible_child_name().as_deref() != Some(PAGE_LIST)
+            || self.selection.n_items() == 0
+        {
+            return false;
+        }
+        let selected = self.selection.selected();
+        self.select_position(if selected < self.selection.n_items() { selected } else { 0 });
+        true
+    }
+
     fn handle_navigation(&self, key: NavigationKey) -> bool {
         if self.stack.visible_child_name().as_deref() != Some(PAGE_LIST) {
             return false;
@@ -1045,6 +1096,9 @@ impl GameListView {
                 self.select_position(next);
             }
             NavigationKey::Up => {
+                if selected == 0 {
+                    return self.toolbar.child_focus(gtk::DirectionType::TabForward);
+                }
                 let next = if selected == gtk::INVALID_LIST_POSITION {
                     0
                 } else {
@@ -2380,6 +2434,10 @@ fn show_context_menu(
     // `from_model` defaults to GTK's touch-oriented sliding pages, which only
     // open after clicking the chevron. Eden's QMenu uses traditional nested
     // popovers that open when the pointer enters their row.
+    if crate::util::inline_menu::enabled() {
+        crate::util::inline_menu::show_context_menu(anchor, "game-list", menu.upcast_ref(), actions.upcast_ref(), x, y);
+        return;
+    }
     let popover = gtk::PopoverMenu::from_model_full(menu, context_menu_flags());
     // Upstream `QMenu` uses straight edges with the default Fusion style.
     // Override GTK themes that round popovers so the title menu matches it.
@@ -2969,6 +3027,71 @@ pub(crate) fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK on the platform main thread and a display"]
+    fn toolbar_and_list_navigation_preserves_selection() {
+        gtk::init().unwrap();
+        uisettings::with_mut(|values| {
+            values.game_dirs.clear();
+            values.favorited_ids.clear();
+        });
+        let hid = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        let play_time = Arc::new(frontend_common::play_time_manager::PlayTimeManager::new());
+        let (root, handle) = build(&hid, &play_time, |_, _| {}, |_, _, _| {}, || {}, || false);
+        let view = &handle.0;
+        let generation = view.scan_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        view.scan_result_sender.send(GameListScanResult {
+            generation,
+            directories: ["/synthetic/first", "/synthetic/second"].into_iter().map(|path| {
+                ScannedDirectory { path: path.into(), deep_scan: false, games: Vec::new() }
+            }).collect(),
+            directory_to_select: None,
+        }).unwrap();
+        view.process_scan_results();
+        let window = gtk::Window::builder().default_width(640).default_height(400).build();
+        let menu_model = gio::Menu::new();
+        let submenu = gio::Menu::new();
+        submenu.append(Some("Test"), Some("win.test"));
+        menu_model.append_submenu(Some("File"), &submenu);
+        let menu = gtk::PopoverMenuBar::from_model(Some(&menu_model));
+        let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        layout.append(&menu);
+        layout.append(&root);
+        window.set_child(Some(&layout));
+        window.present();
+        let context = glib::MainContext::default();
+        while context.pending() { context.iteration(false); }
+        for button in [view.toolbar.first_child().unwrap(), view.refresh_button.clone().upcast()] {
+            for selected in [gtk::INVALID_LIST_POSITION, 0, 1] {
+                view.selection.set_selected(selected);
+                button.grab_focus();
+                assert!(!handle.controller_key(NavigationKey::Left));
+                assert!(handle.controller_key(NavigationKey::Down));
+                assert_eq!(view.selection.selected(), if selected == gtk::INVALID_LIST_POSITION { 0 } else { selected });
+                let focused = gtk::prelude::GtkWindowExt::focus(&window).unwrap();
+                assert!(focused == view.column_view || focused.is_ancestor(&view.column_view));
+            }
+        }
+        view.select_position(0);
+        assert!(handle.controller_key(NavigationKey::Down));
+        assert_eq!(view.selection.selected(), 1);
+        assert!(handle.controller_key(NavigationKey::Up));
+        assert_eq!(view.selection.selected(), 0);
+        assert!(handle.controller_key(NavigationKey::Up));
+        let focused = gtk::prelude::GtkWindowExt::focus(&window).unwrap();
+        assert!(focused.is_ancestor(&view.toolbar));
+        assert!(handle.controller_key(NavigationKey::Up));
+        let focused = gtk::prelude::GtkWindowExt::focus(&window).unwrap();
+        assert!(focused.is_ancestor(&menu));
+        assert_eq!(view.selection.selected(), 0);
+        for page in [PAGE_LOADING, PAGE_EMPTY] {
+            view.stack.set_visible_child_name(page);
+            view.refresh_button.grab_focus();
+            assert!(!handle.controller_key(NavigationKey::Down));
+        }
+        window.destroy();
+    }
 
     #[test]
     #[ignore = "requires GTK on the platform main thread and a display"]

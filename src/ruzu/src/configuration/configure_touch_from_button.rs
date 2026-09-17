@@ -59,7 +59,7 @@ pub fn present(
     let delete_profile = gtk::Button::with_label("Delete");
     let rename_profile = gtk::Button::with_label("Rename");
     delete_profile.set_sensitive(maps.borrow().len() > 1);
-    profile_row.append(&profiles);
+    profile_row.append(&super::shared_widget::popup_safe_combo(&profiles));
     profile_row.append(&new_profile);
     profile_row.append(&delete_profile);
     profile_row.append(&rename_profile);

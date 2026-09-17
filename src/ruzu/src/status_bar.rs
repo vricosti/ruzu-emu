@@ -253,6 +253,10 @@ impl StatusBar {
             );
         }
 
+        if crate::util::inline_menu::enabled() {
+            crate::util::inline_menu::show_context_menu(anchor, "status", menu.upcast_ref(), action_group.upcast_ref(), x, y);
+            return;
+        }
         let popover = gtk::PopoverMenu::from_model(Option::<&gio::Menu>::None);
         popover.add_css_class("ruzu-context-menu");
         popover.set_has_arrow(false);

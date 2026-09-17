@@ -216,6 +216,11 @@ pub fn page(runtime_lock: bool, on_reset: impl Fn() + 'static) -> Page {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&scroller);
     root.append(&reset);
+    #[cfg(target_os = "linux")]
+    let last_general = &force_x11;
+    #[cfg(not(target_os = "linux"))]
+    let last_general = &enable_gamemode;
+    install_external_content_navigation(&root, last_general, &external_list, &external_buttons, &add_external, &reset);
 
     let confirm_before_stopping_policy = uisettings::with(|v| w::SettingEditPolicy::for_setting(
         &v.confirm_before_stopping, runtime_lock, true,
@@ -305,8 +310,115 @@ fn normalize_external_directory(path: &std::path::Path) -> String {
     normalized
 }
 
+// The nested external-content scroller must not trap vertical navigation when
+// empty or at a list boundary. Keep these page-specific transitions here.
+fn install_external_content_navigation(
+    root: &gtk::Box, last_general: &gtk::CheckButton, list: &gtk::ListBox,
+    buttons: &gtk::Box, add: &gtk::Button, reset: &gtk::Button,
+) {
+    let shortcuts = gtk::ShortcutController::new();
+    shortcuts.set_name(Some("ruzu-directional-navigation"));
+    shortcuts.set_propagation_phase(gtk::PropagationPhase::Capture);
+    for key in [gtk::gdk::Key::Up, gtk::gdk::Key::Down] {
+        let (last_general, list, buttons, add, reset) =
+            (last_general.downgrade(), list.downgrade(), buttons.downgrade(), add.downgrade(), reset.downgrade());
+        let action = gtk::CallbackAction::new(move |widget, _| {
+            let (Some(last_general), Some(list), Some(buttons), Some(add), Some(reset)) =
+                (last_general.upgrade(), list.upgrade(), buttons.upgrade(), add.upgrade(), reset.upgrade())
+            else { return glib::Propagation::Proceed; };
+            let focus = widget.root().and_downcast::<gtk::Window>()
+                .and_then(|window| gtk::prelude::GtkWindowExt::focus(&window));
+            let Some(focus) = focus else { return glib::Propagation::Proceed; };
+            let down = key == gtk::gdk::Key::Down;
+            let target: Option<gtk::Widget> = if focus == last_general && down {
+                Some(list.row_at_index(0).map(|row| row.upcast()).unwrap_or_else(|| add.clone().upcast()))
+            } else if focus == reset && !down {
+                Some(add.clone().upcast())
+            } else if focus.is_ancestor(&buttons) {
+                if down { Some(reset.clone().upcast()) } else {
+                    Some(list.last_child().unwrap_or_else(|| last_general.clone().upcast()))
+                }
+            } else if focus == list || focus.is_ancestor(&list) {
+                let row = focus.clone().downcast::<gtk::ListBoxRow>().ok()
+                    .or_else(|| focus.ancestor(gtk::ListBoxRow::static_type()).and_downcast::<gtk::ListBoxRow>());
+                if down && row.as_ref().is_none_or(|row| list.row_at_index(row.index() + 1).is_none()) {
+                    Some(add.clone().upcast())
+                } else if !down && row.as_ref().is_none_or(|row| row.index() == 0) {
+                    Some(last_general.clone().upcast())
+                } else { None }
+            } else { None };
+            if target.is_some_and(|target| target.is_sensitive() && target.grab_focus()) {
+                glib::Propagation::Stop
+            } else { glib::Propagation::Proceed }
+        });
+        shortcuts.add_shortcut(gtk::Shortcut::new(
+            Some(gtk::KeyvalTrigger::new(key, gtk::gdk::ModifierType::empty())), Some(action)));
+    }
+    root.add_controller(shortcuts);
+}
+
 #[cfg(test)]
 mod tests {
+    use gtk::prelude::*;
+
+    #[test]
+    #[ignore = "requires GTK on the platform main thread and a display"]
+    fn external_content_does_not_trap_vertical_focus() {
+        use crate::util::controller_navigation::{navigate_window, NavigationKey as Key};
+        gtk::init().unwrap();
+        common::settings::values_mut().external_content_dirs.clear();
+        let page = super::page(true, || panic!("navigation must not reset settings"));
+        fn collect(widget: &gtk::Widget, result: &mut Vec<gtk::Widget>) {
+            result.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                collect(&current, result);
+                child = current.next_sibling();
+            }
+        }
+        let mut widgets = Vec::new();
+        collect(&page.widget, &mut widgets);
+        let last = widgets.iter().filter_map(|w| w.downcast_ref::<gtk::CheckButton>()).last().unwrap();
+        let list = widgets.iter().find_map(|w| w.downcast_ref::<gtk::ListBox>()).unwrap();
+        let button = |label: &str| widgets.iter().filter_map(|w| w.downcast_ref::<gtk::Button>())
+            .find(|b| b.label().as_deref() == Some(label)).unwrap();
+        let add = button(&crate::i18n::tr("Add Directory"));
+        let reset = button("Reset All Settings");
+        let window = gtk::Window::builder().default_width(700).default_height(420).child(&page.widget).build();
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        while context.pending() { context.iteration(false); }
+        let assert_focus = |widget: &gtk::Widget| {
+            assert_eq!(gtk::prelude::GtkWindowExt::focus(&window).as_ref(), Some(widget));
+        };
+        last.grab_focus();
+        navigate_window(&window, Key::Down);
+        assert_focus(add.upcast_ref());
+        navigate_window(&window, Key::Down);
+        assert_focus(reset.upcast_ref());
+        navigate_window(&window, Key::Up);
+        assert_focus(add.upcast_ref());
+        navigate_window(&window, Key::Up);
+        assert_focus(last.upcast_ref());
+        for path in ["/synthetic/first", "/synthetic/second"] {
+            super::append_external_directory_row(list, path);
+        }
+        while context.pending() { context.iteration(false); }
+        last.grab_focus();
+        navigate_window(&window, Key::Down);
+        assert_focus(list.row_at_index(0).unwrap().upcast_ref());
+        navigate_window(&window, Key::Down);
+        assert_focus(list.row_at_index(1).unwrap().upcast_ref());
+        navigate_window(&window, Key::Down);
+        assert_focus(add.upcast_ref());
+        navigate_window(&window, Key::Up);
+        assert_focus(list.row_at_index(1).unwrap().upcast_ref());
+        navigate_window(&window, Key::Up);
+        navigate_window(&window, Key::Up);
+        assert_focus(last.upcast_ref());
+        assert!(common::settings::values().external_content_dirs.is_empty());
+        window.destroy();
+    }
     use super::*;
 
     #[test]

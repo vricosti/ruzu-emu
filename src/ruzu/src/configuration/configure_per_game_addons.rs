@@ -391,6 +391,11 @@ fn install_context_menu_gesture(
         });
         actions.add_action(&open);
 
+        if crate::util::inline_menu::enabled() {
+            crate::util::inline_menu::show_context_menu(menu_anchor.upcast_ref(), "addons", menu.upcast_ref(), actions.upcast_ref(), x, y);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            return;
+        }
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
         popover.set_has_arrow(false);
         popover.insert_action_group("addons", Some(&actions));

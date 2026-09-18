@@ -237,6 +237,20 @@ fn bind_axis(bindings: &[sdl::SDL_GamepadBinding], axis: sdl::SDL_GamepadAxis) -
     unsafe { bind_axis_raw(bindings, axis).input.axis.axis }
 }
 
+/// Raw joystick axes need the direction from SDL's gamepad mapping as well
+/// as its axis index. Apple's MFi driver, for example, reverses both Y axes.
+/// This is additional to InputFromStick's SDL-to-Nintendo Y conversion.
+fn binding_reverses_axis(binding: &sdl::SDL_GamepadBinding) -> bool {
+    if binding.input_type != sdl::SDL_GAMEPAD_BINDTYPE_AXIS
+        || binding.output_type != sdl::SDL_GAMEPAD_BINDTYPE_AXIS {
+        return false;
+    }
+    unsafe {
+        (binding.input.axis.axis_min > binding.input.axis.axis_max)
+            != (binding.output.axis.axis_min > binding.output.axis.axis_max)
+    }
+}
+
 fn are_stick_axes_inverted(
     axis_x: i32,
     axis_y: i32,
@@ -995,7 +1009,9 @@ impl SDLDriver {
         let left_identifier = left_source.lock().pad_identifier();
         mapping.insert(
             native_analog::Values::LStick as i32,
-            self.build_analog_param(&left_identifier, left_x, left_y),
+            self.build_analog_param(&left_identifier, left_x, left_y,
+                binding_reverses_axis(&bind_axis_raw(&bindings, Axis::LEFTX)),
+                binding_reverses_axis(&bind_axis_raw(&bindings, Axis::LEFTY))),
         );
 
         let right_x = bind_axis(&bindings, Axis::RIGHTX);
@@ -1003,7 +1019,9 @@ impl SDLDriver {
         let right_identifier = joystick.lock().pad_identifier();
         mapping.insert(
             native_analog::Values::RStick as i32,
-            self.build_analog_param(&right_identifier, right_x, right_y),
+            self.build_analog_param(&right_identifier, right_x, right_y,
+                binding_reverses_axis(&bind_axis_raw(&bindings, Axis::RIGHTX)),
+                binding_reverses_axis(&bind_axis_raw(&bindings, Axis::RIGHTY))),
         );
 
         mapping
@@ -1278,6 +1296,8 @@ impl SDLDriver {
         identifier: &PadIdentifier,
         axis_x: i32,
         axis_y: i32,
+        invert_x: bool,
+        invert_y: bool,
     ) -> ParamPackage {
         let (offset_x, offset_y) = {
             let mut engine = self.state.engine.lock();
@@ -1298,8 +1318,8 @@ impl SDLDriver {
         params.set_str("axis_y", axis_y.to_string());
         params.set_str("offset_x", offset_x.to_string());
         params.set_str("offset_y", offset_y.to_string());
-        params.set_str("invert_x", "+".to_string());
-        params.set_str("invert_y", "+".to_string());
+        params.set_str("invert_x", if invert_x { "-" } else { "+" }.to_owned());
+        params.set_str("invert_y", if invert_y { "-" } else { "+" }.to_owned());
         params
     }
 
@@ -1654,5 +1674,26 @@ mod tests {
         assert!(are_stick_axes_inverted(4, 2, 1, 2, 3, 4));
         assert!(!are_stick_axes_inverted(1, 3, 1, 2, 3, 4));
         assert!(!are_stick_axes_inverted(3, 8, 1, 2, 3, 4));
+    }
+
+    #[test]
+    fn analog_mapping_preserves_sdl_axis_direction() {
+        let mut binding = sdl::SDL_GamepadBinding::default();
+        binding.input_type = sdl::SDL_GAMEPAD_BINDTYPE_AXIS;
+        binding.output_type = sdl::SDL_GAMEPAD_BINDTYPE_AXIS;
+        for (input_min, input_max, output_min, output_max, reversed) in [
+            (-32768, 32767, -32768, 32767, false),
+            (32767, -32768, -32768, 32767, true),
+            (-32768, 32767, 32767, -32768, true),
+            (32767, -32768, 32767, -32768, false),
+        ] {
+            binding.input.axis.axis_min = input_min;
+            binding.input.axis.axis_max = input_max;
+            binding.output.axis.axis_min = output_min;
+            binding.output.axis.axis_max = output_max;
+            assert_eq!(binding_reverses_axis(&binding), reversed);
+        }
+        binding.input_type = sdl::SDL_GAMEPAD_BINDTYPE_BUTTON;
+        assert!(!binding_reverses_axis(&binding));
     }
 }

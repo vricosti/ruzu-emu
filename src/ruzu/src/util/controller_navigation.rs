@@ -42,6 +42,7 @@ pub(crate) fn install_interface_navigation(
             .filter(|w| {
                 !w.has_css_class("ruzu-applet-navigation")
                     && !w.has_css_class("ruzu-controller-capture")
+                    && interface_navigation_allowed(w)
                     && (w != &main || launcher_active())
             });
         let changed = previous_target.upgrade() != target;
@@ -58,6 +59,9 @@ pub(crate) fn install_interface_navigation(
             if !keys.contains(&key) { keys.push(key); }
         }
         for key in keys {
+            // A directional action can select Controls within the same window.
+            // Do not deliver the rest of that batch to its mapping widgets.
+            if !interface_navigation_allowed(&target) { break; }
             if target == main && list_key(key) {
                 target.set_focus_visible(true);
             } else {
@@ -74,6 +78,19 @@ pub(crate) fn install_interface_navigation(
         }
         gtk::glib::ControlFlow::Continue
     });
+}
+
+pub(crate) const INPUT_CONFIGURATION_CSS_CLASS: &str = "ruzu-input-configuration";
+
+fn interface_navigation_allowed(window: &gtk::Window) -> bool {
+    let mut current = Some(window.clone());
+    while let Some(window) = current {
+        if window.has_css_class(INPUT_CONFIGURATION_CSS_CLASS) {
+            return false;
+        }
+        current = window.transient_for();
+    }
+    true
 }
 
 fn belongs_to(window: &gtk::Window, main: &gtk::Window) -> bool {

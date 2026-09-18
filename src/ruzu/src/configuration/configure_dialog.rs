@@ -106,6 +106,7 @@ pub struct ConfigureDialog {
     /// permanent status widgets.
     on_applied: RefCell<Option<Box<dyn Fn()>>>,
     reset_requested: Rc<Cell<bool>>,
+    controller_navigation_hint: gtk::Label,
 }
 
 impl ConfigureDialog {
@@ -261,6 +262,15 @@ impl ConfigureDialog {
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.append(&split);
+        let controller_navigation_hint = gtk::Label::new(Some(
+            "Controller navigation is paused in Controls. Use the mouse, touchscreen or keyboard to configure inputs or select another section.",
+        ));
+        controller_navigation_hint.set_wrap(true);
+        controller_navigation_hint.set_xalign(0.0);
+        controller_navigation_hint.set_margin_start(10);
+        controller_navigation_hint.set_margin_end(10);
+        controller_navigation_hint.set_visible(false);
+        root.append(&controller_navigation_hint);
         root.append(&buttons);
         window.set_child(Some(&root));
 
@@ -274,6 +284,7 @@ impl ConfigureDialog {
             shown: RefCell::new(None),
             on_applied: RefCell::new(None),
             reset_requested,
+            controller_navigation_hint,
         });
 
         // Upstream connects `itemSelectionChanged` to `UpdateVisibleTabs`.
@@ -333,6 +344,16 @@ impl ConfigureDialog {
         let Some(section) = self.sections.get(section_index) else {
             return;
         };
+        // GTK interface navigation uses the same physical pad being configured.
+        // Suspend only its UI actions, not input polling or binding capture.
+        let configuring_inputs = section.name == "Controls";
+        let marker = crate::util::controller_navigation::INPUT_CONFIGURATION_CSS_CLASS;
+        if configuring_inputs {
+            self.window.add_css_class(marker);
+        } else {
+            self.window.remove_css_class(marker);
+        }
+        self.controller_navigation_hint.set_visible(configuring_inputs);
 
         while self.notebook.n_pages() > 0 {
             self.notebook.remove_page(Some(0));

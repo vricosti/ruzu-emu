@@ -4,6 +4,26 @@ use super::*;
 use gtk::glib;
 
 #[test]
+#[ignore = "requires GTK on the platform main thread and a display"]
+fn controls_navigation_suspension_is_local_inherited_and_reversible() {
+    gtk::init().unwrap();
+    let main = gtk::Window::new();
+    let config = gtk::Window::builder().transient_for(&main).build();
+    let child = gtk::Window::builder().transient_for(&config).build();
+    assert!(interface_navigation_allowed(&config));
+    config.add_css_class(INPUT_CONFIGURATION_CSS_CLASS);
+    assert!(!interface_navigation_allowed(&config));
+    assert!(!interface_navigation_allowed(&child));
+    assert!(interface_navigation_allowed(&main));
+    config.remove_css_class(INPUT_CONFIGURATION_CSS_CLASS);
+    assert!(interface_navigation_allowed(&config));
+    assert!(interface_navigation_allowed(&child));
+    child.destroy();
+    config.destroy();
+    main.destroy();
+}
+
+#[test]
 fn vertical_repeat_delay_release_direction_change_and_no_backlog() {
     use std::time::{Duration, Instant};
     let start = Instant::now();

@@ -789,7 +789,9 @@ impl MslEmitContext {
             }
             Stage::VertexB | Stage::Geometry | Stage::TessellationEval => {
                 source.push_str("struct MslVertexOut {\n");
-                source.push_str("    float4 position [[position]];\n");
+                // Multipass depth/color shaders must agree on raster positions.
+                // Metal also requires preserveInvariance on the library options.
+                source.push_str("    float4 position [[position, invariant]];\n");
                 if emits_point_size {
                     source.push_str("    float point_size [[point_size]];\n");
                 }

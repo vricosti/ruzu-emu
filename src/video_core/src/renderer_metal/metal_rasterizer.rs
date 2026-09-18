@@ -805,9 +805,13 @@ impl MetalRasterizer {
         let depth_key = self
             .pipeline_cache
             .make_depth_stencil_key(&stages, &draw.depth_stencil());
-        if feedback_requested && !prepared.snapshot_read_only_depth_feedback(
+        // Eden's feedback check skips an exact attachment view. Native Metal
+        // sampling snapshots must also cover that case, independently of the
+        // common barrier heuristic. The snapshot helper rejects writable depth.
+        let depth_snapshotted = prepared.snapshot_read_only_depth_feedback(
             &mut self.texture_cache, depth_key.may_write_depth_stencil(),
-        )? {
+        )?;
+        if feedback_requested && !depth_snapshotted {
             self.scheduler.end_render_pass();
         }
         self.scheduler.profile_depth_feedback(
@@ -1101,7 +1105,10 @@ impl MetalRasterizer {
             .begin_or_reuse_render_pass(&render_pass, render_pass_key)?;
         self.update_viewports_state(draw)?;
         self.update_scissors_state(draw, render_area)?;
-        self.scheduler.profile_graphics_draw(stages.key().unique_hashes);
+        self.scheduler.profile_graphics_draw(stages.key().unique_hashes, depth_key);
+        if let Some(dump) = self.scheduler.pass_dump_mut() {
+            dump.resources(stages.key().unique_hashes, &prepared, &self.texture_cache);
+        }
         self.texture_cache.mark_render_target_contents_modified(u32::MAX, depth_key.may_write_depth_stencil());
         self.scheduler.with_render_encoder(|encoder| {
             MetalQueryCache::configure_draw(encoder, visibility_query);

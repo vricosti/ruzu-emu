@@ -735,6 +735,9 @@ pub(crate) fn compile_msl_library(
     let compile_options = MTLCompileOptions::new();
     let _timing = super::metal_stall_profiler::Span::start(super::metal_stall_profiler::Operation::MslCompile);
     compile_options.setLanguageVersion(metal_language_version(version)?);
+    // Safe math alone does not guarantee matching positions across libraries.
+    // Paired with [[position, invariant]] in the direct MSL raster outputs.
+    compile_options.setPreserveInvariance(true);
     if objc2::available!(macos = 15.0, ..) {
         compile_options.setMathMode(MTLMathMode::Safe);
     } else {

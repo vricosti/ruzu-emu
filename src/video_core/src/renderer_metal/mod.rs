@@ -17,6 +17,8 @@ pub mod metal_device;
 pub mod metal_fence_manager;
 pub mod metal_format;
 pub mod metal_framebuffer;
+mod metal_frame_capture;
+mod metal_pass_dump;
 pub mod metal_geometry_pipeline;
 pub mod metal_geometry_capture;
 pub mod metal_graphics_pipeline;

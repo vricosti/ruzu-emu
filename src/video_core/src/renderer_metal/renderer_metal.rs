@@ -70,6 +70,7 @@ pub struct RendererMetal {
     base_data: RendererBaseData,
     dummy_context: MetalDummyContext,
     applet_frame: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    frame_capture: Option<super::metal_frame_capture::MetalFrameCapture>,
 }
 
 // SAFETY: construction happens on the boot thread and ownership is then moved
@@ -109,6 +110,7 @@ impl RendererMetal {
             base_data: RendererBaseData::new(),
             dummy_context: MetalDummyContext,
             applet_frame: None,
+            frame_capture: super::metal_frame_capture::MetalFrameCapture::from_environment(),
         })
     }
 
@@ -397,6 +399,17 @@ impl RendererBase for RendererMetal {
 
     fn composite(&mut self, layers: &[FramebufferConfig]) {
         self.composite_impl(layers);
+        if let Some(capture) = self.frame_capture.as_mut().filter(|capture| capture.needs_boundary()) {
+            // Capture only command buffers created and committed inside the
+            // interval. Flush partial recording without adding a GPU idle wait.
+            match self.rasterizer.scheduler().flush() {
+                Ok(_) => capture.frame_boundary(self.device.device()),
+                Err(error) => {
+                    capture.abort();
+                    log::error!("Metal capture boundary flush failed: {error}");
+                }
+            }
+        }
     }
 
     fn get_applet_capture_buffer(&mut self) -> Vec<u8> {

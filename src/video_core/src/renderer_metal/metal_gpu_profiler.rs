@@ -23,6 +23,7 @@ const SAMPLE_COUNT: usize = 1024;
 const SAMPLE_PAGES: usize = 16;
 const TOTAL_SAMPLE_COUNT: usize = SAMPLE_COUNT * SAMPLE_PAGES;
 const MAX_RENDER_END_SITES: usize = 64;
+const MAX_DRAW_STATES: usize = 256;
 const DEPTH_ALIAS_KEY_WORDS: usize = 29;
 
 #[derive(Default)]
@@ -123,6 +124,8 @@ pub(super) struct StageSamples {
     current_render: Option<usize>,
     render_ends: RenderEndSites,
     depth_feedback: DepthFeedbackSamples,
+    draw_states: Vec<(usize, [u64; 6], MetalDepthStencilKey)>,
+    omitted_draw_states: u64,
 }
 
 #[derive(Debug)]
@@ -194,6 +197,8 @@ impl MetalGpuProfiler {
                 current_render: None,
                 render_ends: RenderEndSites::default(),
                 depth_feedback: DepthFeedbackSamples::default(),
+                draw_states: Vec::new(),
+                omitted_draw_states: 0,
             }),
             last_capture: None,
             capture_count: 0,
@@ -299,6 +304,15 @@ impl MetalGpuProfiler {
         }
         log::info!("[METAL_DEPTH_ALIAS_COVERAGE] tick={tick} checks={} requested={} omitted={}", samples.depth_feedback.checks, samples.depth_feedback.requested, samples.depth_feedback.omitted);
         samples.depth_feedback = DepthFeedbackSamples::default();
+        for (draw, (pass_index, shaders, state)) in samples.draw_states.iter().enumerate() {
+            let pass = &samples.render_samples[*pass_index];
+            log::info!("[METAL_DRAW_STATE] tick={tick} draw={draw} pass={} shaders={shaders:X?} depth_state={state:?} colors={:?} depth={:?}",
+                pass.index, pass.colors, pass.depth);
+        }
+        log::info!("[METAL_DRAW_STATE_COVERAGE] tick={tick} recorded={} omitted={}",
+            samples.draw_states.len(), samples.omitted_draw_states);
+        samples.draw_states.clear();
+        samples.omitted_draw_states = 0;
         samples.count = 0;
         samples.omitted = 0;
         samples.seen = [0; 4];
@@ -311,6 +325,15 @@ impl MetalGpuProfiler {
 }
 
 impl StageSamples {
+    pub(super) fn observe_draw_state(&mut self, shaders: [u64; 6], state: MetalDepthStencilKey) {
+        let Some(pass) = self.current_render else { return };
+        if self.draw_states.len() == MAX_DRAW_STATES {
+            self.omitted_draw_states = self.omitted_draw_states.saturating_add(1);
+            return;
+        }
+        self.draw_states.push((pass, shaders, state));
+    }
+
     pub(super) fn observe_depth_feedback<'a>(
         &mut self,
         descriptor: &MTLRenderPassDescriptor,
@@ -529,6 +552,14 @@ mod tests {
         let mut samples = profiler.acquire().unwrap();
         let descriptor = MTLRenderPassDescriptor::new();
         samples.attach_render(&descriptor);
+        let depth = MetalDepthStencilKey {
+            depth_compare: objc2_metal::MTLCompareFunction::Equal,
+            depth_write_enabled: false,
+            stencil_enabled: false,
+            front: Default::default(), back: Default::default(),
+        };
+        samples.observe_draw_state([1; 6], depth);
+        assert_eq!(samples.draw_states[0], (0, [1; 6], depth));
         samples.observe_graphics_draw([1; 6]);
         samples.observe_graphics_draw([2; 6]);
         samples.observe_graphics_draw([1; 6]);
@@ -544,6 +575,8 @@ mod tests {
         assert!(pass.mixed_shaders);
         assert_eq!(pass.colors, [[0; 3]; NUM_RT]);
         samples.attach_compute(&MTLComputePassDescriptor::new());
+        samples.observe_draw_state([3; 6], depth);
+        assert_eq!(samples.draw_states.len(), 1);
         samples.observe_graphics_draw([3; 6]);
         samples.observe_helper_draw(RenderHelper::Clear);
         assert_eq!(samples.render_samples[0].draws, 3);
@@ -551,7 +584,10 @@ mod tests {
         for _ in 0..TOTAL_SAMPLE_COUNT {
             samples.attach_render(&descriptor);
             samples.observe_graphics_draw([4; 6]);
+            samples.observe_draw_state([4; 6], depth);
         }
+        assert_eq!(samples.draw_states.len(), MAX_DRAW_STATES);
+        assert!(samples.omitted_draw_states > 0);
         assert!(samples.render_samples.len() <= TOTAL_SAMPLE_COUNT / 4);
         assert!(samples.current_render.is_none());
         assert_eq!(samples.render_samples.last().unwrap().draws, 1);
@@ -562,6 +598,8 @@ mod tests {
         let returned = profiler.available.as_ref().unwrap();
         assert!(returned.render_samples.is_empty());
         assert!(returned.current_render.is_none());
+        assert!(returned.draw_states.is_empty());
+        assert_eq!(returned.omitted_draw_states, 0);
     }
 
     #[test]

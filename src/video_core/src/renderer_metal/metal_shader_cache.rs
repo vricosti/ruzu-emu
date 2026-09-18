@@ -3,7 +3,8 @@
 
 //! Native Metal library reuse; Eden has no corresponding Metal compiler cache.
 //! Device ownership fixes the compiler/device identity. Language version and the
-//! complete source form the key; math mode is fixed by compile_msl_library.
+//! complete source form the key; math mode and position invariance are fixed by
+//! compile_msl_library.
 //! New variable compiler options must be added to the key before being exposed.
 
 use super::metal_shader::{compile_msl_library, MetalShaderError};

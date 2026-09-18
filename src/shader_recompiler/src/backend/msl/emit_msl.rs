@@ -2008,7 +2008,7 @@ mod tests {
         assert!(artifact
             .source
             .source
-            .contains("float4 position [[position]]"));
+            .contains("float4 position [[position, invariant]]"));
         assert!(!artifact
             .source
             .source

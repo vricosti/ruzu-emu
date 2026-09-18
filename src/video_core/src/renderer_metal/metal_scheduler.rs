@@ -62,6 +62,7 @@ pub struct MetalScheduler {
     non_render_serial: u64,
     command_journal: Option<Arc<CommandJournal>>,
     active_workload: Option<CommandWorkload>,
+    pass_dump: Option<super::metal_pass_dump::MetalPassDump>,
 }
 
 enum ActiveEncoder {
@@ -157,6 +158,10 @@ impl SubmissionProfiler {
 }
 
 impl MetalScheduler {
+    pub(super) fn pass_dump_mut(&mut self) -> Option<&mut super::metal_pass_dump::MetalPassDump> {
+        self.pass_dump.as_mut()
+    }
+
     pub fn new(device: &MetalDevice) -> Self {
         Self {
             queue: device.retained_command_queue(),
@@ -179,6 +184,7 @@ impl MetalScheduler {
             non_render_serial: 0,
             command_journal: CommandJournal::from_environment(),
             active_workload: None,
+            pass_dump: super::metal_pass_dump::MetalPassDump::from_environment(),
         }
     }
 
@@ -393,6 +399,7 @@ impl MetalScheduler {
             )
             .ok_or(MetalSchedulerError::NoRenderEncoder)?;
         self.active_encoder = Some(ActiveEncoder::Render(encoder));
+        if let Some(dump) = self.pass_dump.as_mut() { dump.begin(descriptor); }
         Ok(())
     }
 
@@ -406,13 +413,17 @@ impl MetalScheduler {
         Ok(record(encoder))
     }
 
-    pub(crate) fn profile_graphics_draw(&mut self, shaders: [u64; 6]) {
+    pub(crate) fn profile_graphics_draw(
+        &mut self, shaders: [u64; 6], depth: super::metal_pipeline_cache::MetalDepthStencilKey,
+    ) {
         if matches!(self.active_encoder.as_ref(), Some(ActiveEncoder::Render(_))) {
+            if let Some(dump) = self.pass_dump.as_mut() { dump.draw(shaders); }
             if let Some(workload) = self.active_workload.as_mut() {
                 workload.observe_draw(shaders);
             }
             if let Some(samples) = self.active_stage_samples.as_mut() {
                 samples.observe_graphics_draw(shaders);
+                samples.observe_draw_state(shaders, depth);
             }
         }
     }
@@ -491,6 +502,7 @@ impl MetalScheduler {
 
     #[track_caller]
     fn end_active_encoder(&mut self) {
+        let was_render = matches!(self.active_encoder.as_ref(), Some(ActiveEncoder::Render(_)));
         if matches!(self.active_encoder.as_ref(), Some(ActiveEncoder::Render(_))) {
             if let Some(samples) = self.active_stage_samples.as_mut() {
                 samples.observe_render_end();
@@ -499,6 +511,11 @@ impl MetalScheduler {
         self.active_render_pass_key = None;
         if let Some(encoder) = self.active_encoder.take() {
             encoder.end_encoding();
+        }
+        if was_render {
+            if let (Some(dump), Some(command_buffer)) = (self.pass_dump.as_mut(), self.active.as_ref()) {
+                dump.end(command_buffer);
+            }
         }
     }
 

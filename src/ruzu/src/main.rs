@@ -334,6 +334,15 @@ fn main() -> glib::ExitCode {
     });
 
     let result = app.run();
+    // Eden's long-lived QtConfig saves global values in its destructor. GTK
+    // uses short-lived config adapters, so persist runtime changes explicitly.
+    // A secondary invocation only forwards arguments to the existing window;
+    // it must not overwrite that process's configuration with its stale copy.
+    if main_window().is_some() {
+        if let Err(error) = configuration::qt_config::save_global_values() {
+            log::error!("Could not save global settings on exit: {error}");
+        }
+    }
     common::logging::backend::stop();
     result
 }

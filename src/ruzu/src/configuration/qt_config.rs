@@ -1882,6 +1882,58 @@ mod tests {
     }
 
     #[test]
+    fn runtime_settings_round_trip_preserves_global_values_and_unrelated_keys() {
+        const CHILD: &str = "RUZU_TEST_RUNTIME_SETTINGS_SAVE";
+        let Some(root) = std::env::var_os(CHILD) else {
+            let root = tempfile::tempdir().unwrap();
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "configuration::qt_config::tests::runtime_settings_round_trip_preserves_global_values_and_unrelated_keys", "--test-threads=1"])
+                .env(CHILD, root.path()).status().unwrap().success());
+            return;
+        };
+        use common::settings_enums::{AntiAliasing, ConsoleMode, GpuAccuracy, RendererBackend, ScalingFilter};
+        common::fs::path_util::set_ruzu_path(RuzuPath::ConfigDir, Path::new(&root));
+        std::fs::write(config_path(), "[UI]\ncustom_marker=preserved\n").unwrap();
+        {
+            let mut values = common::settings::values_mut();
+            values.renderer_backend.set_global(true);
+            values.renderer_backend.set_value(RendererBackend::Vulkan);
+            values.gpu_accuracy.set_value(GpuAccuracy::High);
+            values.use_docked_mode.set_value(ConsoleMode::Handheld);
+            values.scaling_filter.set_value(ScalingFilter::NearestNeighbor);
+            values.anti_aliasing.set_value(AntiAliasing::Fxaa);
+            values.volume.set_value(37);
+            values.audio_muted.set_value(true);
+            // An active per-title renderer must never leak into the global file.
+            values.renderer_backend.set_global(false);
+            values.renderer_backend.set_value(RendererBackend::Null);
+        }
+        save_global_values().unwrap();
+        assert!(std::fs::read_to_string(config_path()).unwrap().contains("custom_marker=preserved"));
+        {
+            let mut values = common::settings::values_mut();
+            assert_eq!(*values.renderer_backend.get_value(), RendererBackend::Null);
+            values.renderer_backend.set_global(true);
+            values.renderer_backend.set_value(RendererBackend::OpenGlGlsl);
+            values.gpu_accuracy.set_value(GpuAccuracy::Low);
+            values.use_docked_mode.set_value(ConsoleMode::Docked);
+            values.scaling_filter.set_value(ScalingFilter::Bilinear);
+            values.anti_aliasing.set_value(AntiAliasing::None);
+            values.volume.set_value(100);
+            values.audio_muted.set_value(false);
+        }
+        load_global_values();
+        let values = common::settings::values();
+        assert_eq!(*values.renderer_backend.get_value(), RendererBackend::Vulkan);
+        assert_eq!(*values.gpu_accuracy.get_value(), GpuAccuracy::High);
+        assert_eq!(*values.use_docked_mode.get_value(), ConsoleMode::Handheld);
+        assert_eq!(*values.scaling_filter.get_value(), ScalingFilter::NearestNeighbor);
+        assert_eq!(*values.anti_aliasing.get_value(), AntiAliasing::Fxaa);
+        assert_eq!(*values.volume.get_value(), 37);
+        assert!(*values.audio_muted.get_value());
+    }
+
+    #[test]
     fn complete_reload_reads_core_and_frontend_in_an_isolated_process() {
         const CHILD: &str = "RUZU_TEST_COMPLETE_CONFIG_RELOAD";
         if let Some(root) = std::env::var_os(CHILD) {

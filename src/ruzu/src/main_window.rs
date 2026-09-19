@@ -5157,6 +5157,11 @@ impl GMainWindow {
         {
             self.store_recent_file(&filepath);
         }
+        // Eden's BootGame saves the global configuration before loading the
+        // title's overrides. Status-bar changes otherwise exist only in memory.
+        if let Err(error) = crate::configuration::qt_config::save_global_values() {
+            log::error!("Could not save global settings before boot: {error}");
+        }
         if crate::uisettings::with(|values| *values.select_user_on_boot.get_value()) {
             self.select_and_set_current_user(filepath, parameters);
         } else {

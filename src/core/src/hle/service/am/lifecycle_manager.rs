@@ -159,6 +159,16 @@ pub struct LifecycleManager {
 }
 
 impl LifecycleManager {
+    /// Upstream ResetForRelaunch: retain notification policy and reset activity.
+    pub fn reset_for_relaunch(&mut self) {
+        self.unordered_messages.clear();
+        self.activity_state = ActivityState::BackgroundVisible;
+        self.requested_focus_state = FocusState::default();
+        self.acknowledged_focus_state = FocusState::default();
+        self.has_focus_state_changed = true;
+        self.suspend_mode = SuspendMode::NoOverride;
+        self.forced_suspend = false;
+    }
     pub fn new(is_application: bool) -> Self {
         let system_event = Arc::new(Event::new());
         Self {
@@ -583,6 +593,27 @@ impl LifecycleManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relaunch_resets_activity_without_resetting_notification_policy() {
+        let mut lifecycle = LifecycleManager::new(false);
+        lifecycle.unordered_messages.push_back(AppletMessage::Exit);
+        lifecycle.requested_focus_state = FocusState::InFocus;
+        lifecycle.acknowledged_focus_state = FocusState::InFocus;
+        lifecycle.has_focus_state_changed = false;
+        lifecycle.forced_suspend = true;
+        lifecycle.suspend_mode = SuspendMode::ForceSuspend;
+        lifecycle.resume_notification_enabled = true;
+        lifecycle.reset_for_relaunch();
+        assert!(lifecycle.unordered_messages.is_empty());
+        assert_eq!(lifecycle.activity_state, ActivityState::BackgroundVisible);
+        assert_eq!(lifecycle.requested_focus_state, FocusState::Unknown);
+        assert_eq!(lifecycle.acknowledged_focus_state, FocusState::Unknown);
+        assert!(lifecycle.has_focus_state_changed);
+        assert!(!lifecycle.forced_suspend);
+        assert_eq!(lifecycle.suspend_mode, SuspendMode::NoOverride);
+        assert!(lifecycle.resume_notification_enabled);
+    }
 
     #[test]
     fn request_exit_signals_then_pop_clears_system_event() {

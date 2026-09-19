@@ -78,6 +78,10 @@ pub struct Applet {
     pub preselected_user_launch_parameter: std::collections::VecDeque<Vec<u8>>,
 
     // Caller applet — upstream: std::weak_ptr<Applet> caller_applet
+    pub context_stack: Vec<Option<Arc<dyn crate::hle::service::hle_ipc::SessionRequestHandler>>>,
+    pub reserved_applet: Option<Arc<Mutex<Applet>>>,
+    pub unwind_after_reserved: bool,
+    pub is_winding: bool,
     pub caller_applet: Weak<Mutex<Applet>>,
     pub caller_applet_broker: Option<Arc<AppletDataBroker>>,
     pub frontend: Option<Box<dyn FrontendApplet>>,
@@ -171,6 +175,10 @@ impl Applet {
             user_channel_launch_parameter: std::collections::VecDeque::new(),
             preselected_user_launch_parameter: std::collections::VecDeque::new(),
             caller_applet: Weak::new(),
+            context_stack: Vec::new(),
+            reserved_applet: None,
+            unwind_after_reserved: false,
+            is_winding: false,
             caller_applet_broker: None,
             frontend: None,
             child_applets: Vec::new(),

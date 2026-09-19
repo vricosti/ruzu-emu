@@ -29,8 +29,8 @@ use crate::hle::service::set::settings_types::PlatformRegion;
 /// - 8: GetBootMode
 /// - 9: GetCurrentFocusState
 /// - 10: RequestToAcquireSleepLock
-/// - 11: ReleaseSleepLock (unimplemented)
-/// - 12: ReleaseSleepLockTransiently (unimplemented)
+/// - 11: ReleaseSleepLock
+/// - 12: ReleaseSleepLockTransiently
 /// - 13: GetAcquiredSleepLockEvent
 /// - 14: GetWakeupCount (unimplemented)
 /// - 20: PushToGeneralChannel
@@ -93,6 +93,8 @@ impl ICommonStateGetter {
             (8, Some(Self::get_boot_mode_handler), "GetBootMode"),
             (9, Some(Self::get_current_focus_state_handler), "GetCurrentFocusState"),
             (10, Some(Self::request_to_acquire_sleep_lock_handler), "RequestToAcquireSleepLock"),
+            (11, Some(Self::release_sleep_lock_handler), "ReleaseSleepLock"),
+            (12, Some(Self::release_sleep_lock_transiently_handler), "ReleaseSleepLockTransiently"),
             (13, Some(Self::get_acquired_sleep_lock_event_handler), "GetAcquiredSleepLockEvent"),
             (
                 20,
@@ -406,6 +408,33 @@ impl ICommonStateGetter {
                     .unwrap()
                     .signal_sleep_lock_event(&mut process);
             }
+        }
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// Port of ICommonStateGetter::ReleaseSleepLock.
+    fn release_sleep_lock_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        log::warn!("(STUBBED) ReleaseSleepLock called");
+        if let Some(event) = service.applet.lock().unwrap().sleep_lock_event.as_ref() {
+            event.lock().unwrap().clear();
+        }
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// Port of ICommonStateGetter::ReleaseSleepLockTransiently.
+    fn release_sleep_lock_transiently_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let service =
+            unsafe { &*(this as *const dyn ServiceFramework as *const ICommonStateGetter) };
+        log::warn!("(STUBBED) ReleaseSleepLockTransiently called");
+        if let Some(event) = service.applet.lock().unwrap().sleep_lock_event.as_ref() {
+            event.lock().unwrap().clear();
         }
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
@@ -761,6 +790,35 @@ impl ServiceFramework for ICommonStateGetter {
 mod tests {
     use super::*;
     use common::settings_enums::ConsoleMode;
+
+    #[test]
+    fn sleep_lock_release_commands_clear_the_same_event_and_are_idempotent() {
+        use crate::hle::kernel::k_readable_event::KReadableEvent;
+
+        let applet = Arc::new(Mutex::new(Applet::new(
+            SystemRef::null(),
+            crate::hle::service::os::process::Process::new(),
+            false,
+        )));
+        let event = Arc::new(Mutex::new(KReadableEvent::new()));
+        applet.lock().unwrap().sleep_lock_event = Some(event.clone());
+        let service = ICommonStateGetter::new(SystemRef::null(), applet.clone());
+        for command in [11, 12, 11] {
+            event.lock().unwrap().signal();
+            assert!(event.lock().unwrap().is_signaled());
+            for _ in 0..2 {
+                let mut ctx = HLERequestContext::new();
+                service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+                assert!(!event.lock().unwrap().is_signaled());
+                assert_eq!(&ctx.cmd_buf[6..8], &[0, 0]);
+                assert_eq!(ctx.write_size, 8);
+                assert!(Arc::ptr_eq(
+                    applet.lock().unwrap().sleep_lock_event.as_ref().unwrap(),
+                    &event
+                ));
+            }
+        }
+    }
 
     #[test]
     fn exercised_common_state_handlers_are_registered() {

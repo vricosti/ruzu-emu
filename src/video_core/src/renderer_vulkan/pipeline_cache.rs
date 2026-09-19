@@ -2850,6 +2850,22 @@ mod tests {
     }
 
     #[test]
+    fn invalid_predicate_boolean_op_is_a_caught_shader_error() {
+        use shader_recompiler::frontend::translate::{common_funcs, TranslatorVisitor};
+        use shader_recompiler::ir::{basic_block::Block, program::Program, types::ShaderStage, value::Value};
+
+        let result = catch_shader_exception(|| {
+            let mut program = Program::new(ShaderStage::VertexB);
+            program.blocks.push(Block::new());
+            let mut visitor = TranslatorVisitor::new(&mut program, 0);
+            common_funcs::predicate_combine(
+                &mut visitor, Value::ImmU1(true), Value::ImmU1(false), 3,
+            );
+        });
+        assert_eq!(result.unwrap_err(), "Invalid bop 3 is not implemented");
+    }
+
+    #[test]
     fn shader_exception_scope_catches_only_shader_exceptions() {
         let shader_result = catch_shader_exception(|| {
             std::panic::panic_any(shader_recompiler::exception::NotImplementedException::new(

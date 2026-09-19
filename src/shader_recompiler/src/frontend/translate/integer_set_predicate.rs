@@ -103,13 +103,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Invalid boolean op 3")]
     fn isetp_rejects_invalid_boolean_op_like_upstream() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
         let mut tv = TranslatorVisitor::new(&mut program, 0);
         let insn = (1u64 << 8) | (1u64 << 39) | (3u64 << 45) | (2u64 << 49);
 
-        isetp(&mut tv, insn, MaxwellOpcode::ISETP_reg);
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            isetp(&mut tv, insn, MaxwellOpcode::ISETP_reg);
+        })).unwrap_err();
+        let error = error.downcast_ref::<crate::exception::NotImplementedException>().unwrap();
+        assert_eq!(error.to_string(), "Invalid bop 3 is not implemented");
     }
 }

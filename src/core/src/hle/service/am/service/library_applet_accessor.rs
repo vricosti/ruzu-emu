@@ -45,6 +45,10 @@ pub struct ILibraryAppletAccessor {
 }
 
 impl ILibraryAppletAccessor {
+    /// Upstream ILibraryAppletAccessor::GetApplet.
+    pub fn get_applet(&self) -> Arc<Mutex<crate::hle::service::am::applet::Applet>> {
+        self.applet.clone()
+    }
     pub fn new(
         system: SystemRef,
         broker: Arc<AppletDataBroker>,
@@ -437,6 +441,8 @@ impl ILibraryAppletAccessor {
 }
 
 impl SessionRequestHandler for ILibraryAppletAccessor {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+
     fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
         ServiceFramework::handle_sync_request_impl(self, ctx)
     }

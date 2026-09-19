@@ -13,9 +13,6 @@ use crate::frontend::a64::types::{Reg, Vec};
 use crate::ir::value::Value;
 
 fn lowest_set_bit(x: u32) -> u32 {
-    if x == 0 {
-        return 0;
-    }
     x.trailing_zeros()
 }
 
@@ -222,11 +219,44 @@ impl<'a> TranslatorVisitor<'a> {
         let operand = self.v_read(idxdsize, rn);
         let element = self.ir.ir().vector_get_element(esize, operand, index);
 
-        // Scalar DUP: zero-extend element into a 128-bit vector at lane 0.
-        // We achieve this by writing the element via v_scalar_write with
-        // datasize=esize, which sets the low `esize` bits and zeroes the
-        // rest.
-        self.v_write(esize, rd, element);
+        let result = self.ir.ir().zero_extend_to_quad(element);
+        self.v_write(128, rd, result);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::a64::decoder::decode;
+    use crate::frontend::a64::translate::TranslationOptions;
+    use crate::ir::{block::Block, location::A64LocationDescriptor, opcode::Opcode};
+
+    #[test]
+    fn scalar_dup_zero_extends_every_element_width_to_a_full_register() {
+        for size in 0..4 {
+            for index in 0..(16 >> size) {
+                let imm5 = (1 << size) | (index << (size + 1));
+                let decoded = decode(0x5e000420 | (imm5 << 16)).unwrap();
+                let location = A64LocationDescriptor::new(0x1000, 0, false);
+                let mut block = Block::new(location.to_location());
+                let mut visitor = TranslatorVisitor::new(&mut block, location, TranslationOptions::default());
+                assert!(visitor.dispatch(&decoded));
+                drop(visitor);
+                assert_eq!(block.instructions.last().unwrap().opcode, Opcode::A64SetQ);
+                assert!(block.instructions.iter().any(|i| i.opcode == Opcode::ZeroExtendLongToQuad));
+                assert!(!block.instructions.iter().any(|i| matches!(i.opcode, Opcode::A64SetS | Opcode::A64SetD)));
+            }
+        }
+    }
+
+    #[test]
+    fn zero_immediate_is_reserved_in_scalar_dup() {
+        let location = A64LocationDescriptor::new(0x1000, 0, false);
+        let mut block = Block::new(location.to_location());
+        let mut visitor = TranslatorVisitor::new(&mut block, location, TranslationOptions::default());
+        assert!(!visitor.dispatch(&decode(0x5e000420).unwrap()));
+        drop(visitor);
+        assert!(!block.instructions.iter().any(|i| i.opcode == Opcode::A64SetQ));
     }
 }

@@ -278,7 +278,12 @@ pub fn predicate_combine(
         0 => v.ir.logical_and(predicate_1, predicate_2),
         1 => v.ir.logical_or(predicate_1, predicate_2),
         2 => v.ir.logical_xor(predicate_1, predicate_2),
-        _ => panic!("Invalid boolean op {boolean_op}"),
+        // Upstream throws a Shader::NotImplementedException, which pipeline
+        // creation catches. An ordinary Rust panic bypasses that typed catch
+        // and can abort when propagated through the macro JIT callback.
+        _ => std::panic::panic_any(crate::exception::NotImplementedException::new(
+            format!("Invalid bop {boolean_op}"),
+        )),
     }
 }
 

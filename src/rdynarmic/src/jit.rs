@@ -3531,6 +3531,30 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn test_a64_scalar_dup_extracts_each_lane_and_clears_upper_bits() {
+        let source = 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100u128;
+        for size in 0..4u32 {
+            let bits = 8 << size;
+            for index in 0..128 / bits {
+                let imm5 = (1 << size) | (index << (size + 1));
+                // DUP scalar V0, V1[index]; SVC #0.
+                let code = [0x5e00_0420 | (imm5 << 16), 0xd400_0001];
+                let jit = run_a64_alu(&code, |jit| {
+                    jit.set_vector_parts(0, u64::MAX, u64::MAX);
+                    jit.set_vector_parts(1, source as u64, (source >> 64) as u64);
+                });
+                let expected = (source >> (index * bits)) & ((1u128 << bits) - 1);
+                assert_eq!(
+                    jit.get_vector_parts(0),
+                    (expected as u64, 0),
+                    "element width {bits}, lane {index}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn test_a64_fadd_vector_alias_default_nan() {
         let code = [
             0x0E24_D4A4, // FADD V4.2S, V5.2S, V4.2S

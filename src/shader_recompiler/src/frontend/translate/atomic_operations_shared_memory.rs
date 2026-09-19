@@ -37,7 +37,9 @@ impl AtomOp {
             6 => AtomOp::Or,
             7 => AtomOp::Xor,
             8 => AtomOp::Exch,
-            other => panic!("Integer Atoms Operation {}", other),
+            other => std::panic::panic_any(crate::exception::NotImplementedException::new(
+                format!("Integer Atoms Operation {other}"),
+            )),
         }
     }
 }
@@ -49,6 +51,9 @@ enum AtomsSize {
     U32 = 0,
     S32 = 1,
     U64 = 2,
+    // C++ permits this raw enum value: ATOMS treats it as unsigned 32-bit,
+    // while StoreResult's default case leaves the destination untouched.
+    Reserved = 3,
 }
 
 impl AtomsSize {
@@ -57,8 +62,7 @@ impl AtomsSize {
             0 => AtomsSize::U32,
             1 => AtomsSize::S32,
             2 => AtomsSize::U64,
-            // Reserved encoding 3 — upstream throws.
-            other => panic!("Invalid AtomsSize {}", other),
+            _ => AtomsSize::Reserved,
         }
     }
 }
@@ -98,6 +102,15 @@ fn apply_atoms_op(
     }
 }
 
+/// Port of upstream `StoreResult` (including its no-write default case).
+fn store_result(tv: &mut TranslatorVisitor, dest_reg: u32, result: Value, size: AtomsSize) {
+    match size {
+        AtomsSize::U32 | AtomsSize::S32 => tv.set_x(dest_reg, result),
+        AtomsSize::U64 => tv.set_l(dest_reg, result),
+        AtomsSize::Reserved => {}
+    }
+}
+
 /// ATOMS — Atomic Operation on Shared Memory.
 ///
 /// Port of upstream `TranslatorVisitor::ATOMS(u64 insn)`.
@@ -109,7 +122,9 @@ pub fn atoms(tv: &mut TranslatorVisitor<'_>, insn: u64) {
 
     let size_64 = size == AtomsSize::U64;
     if size_64 && op != AtomOp::Exch {
-        panic!("64-bit Atoms Operation {:?}", op);
+        std::panic::panic_any(crate::exception::NotImplementedException::new(
+            format!("64-bit Atoms Operation {}", op as u32),
+        ));
     }
     let is_signed = size == AtomsSize::S32;
     let offset = atoms_offset(tv, insn);
@@ -117,11 +132,11 @@ pub fn atoms(tv: &mut TranslatorVisitor<'_>, insn: u64) {
     if size_64 {
         let op_b = tv.l(src_reg_b);
         let result = tv.ir.shared_atomic_exchange_64(offset, op_b);
-        tv.set_l(dest_reg, result);
+        store_result(tv, dest_reg, result, size);
     } else {
         let op_b = tv.x(src_reg_b);
         let result = apply_atoms_op(tv, offset, op_b, op, is_signed);
-        tv.set_x(dest_reg, result);
+        store_result(tv, dest_reg, result, size);
     }
 }
 
@@ -146,6 +161,24 @@ mod tests {
             .iter()
             .map(|instruction| instruction.opcode)
             .collect()
+    }
+
+    #[test]
+    fn atoms_reserved_size_executes_atomic_without_writing_destination() {
+        let opcodes = translate_op(AtomOp::Add as u32, AtomsSize::Reserved);
+        assert!(opcodes.contains(&Opcode::SharedAtomicIAdd32));
+        assert!(!opcodes.contains(&Opcode::SetRegister));
+        let normal = translate_op(AtomOp::Add as u32, AtomsSize::U32);
+        assert!(normal.contains(&Opcode::SharedAtomicIAdd32));
+        assert!(normal.contains(&Opcode::SetRegister));
+    }
+
+    #[test]
+    fn unsupported_atoms_operations_raise_typed_shader_exceptions() {
+        for (op, size) in [(9, AtomsSize::U32), (0, AtomsSize::U64)] {
+            let error = std::panic::catch_unwind(|| translate_op(op, size)).unwrap_err();
+            assert!(error.is::<crate::exception::NotImplementedException>());
+        }
     }
 
     #[test]

@@ -18,8 +18,8 @@ use crate::hle::service::os::process::Process;
 /// with the HID resource manager and enables vibration. On destruction,
 /// unregisters vibration and the applet resource user ID.
 pub struct HidRegistration {
-    /// Upstream: `Process& m_process`.
-    process: *const Process,
+    /// Cached state instead of upstream's reference to a non-moving Process.
+    initialized: bool,
     /// Upstream: obtained via `system.ServiceManager().GetService<HID::IHidServer>("hid")`
     /// then `m_hid_server->GetResourceManager()`.
     resource_manager: Option<Arc<parking_lot::Mutex<ResourceManager>>>,
@@ -37,7 +37,6 @@ impl HidRegistration {
     /// - RegisterAppletResourceUserId(pid, true)
     /// - SetAruidValidForVibration(pid, true)
     pub fn new(system: SystemRef, process: &Process) -> Self {
-        let pid = process.get_process_id();
         let resource_manager = if !system.is_null() {
             system
                 .get()
@@ -58,18 +57,26 @@ impl HidRegistration {
             None
         };
 
-        if process.is_initialized() {
-            if let Some(ref rm) = resource_manager {
-                let rm = rm.lock();
-                rm.register_applet_resource_user_id(pid, true);
-                rm.set_aruid_valid_for_vibration(pid, true);
-            }
-        }
-
-        Self {
-            process: process as *const Process,
+        let mut registration = Self {
+            initialized: false,
             resource_manager,
-            pid,
+            pid: 0,
+        };
+        registration.register_current_process(process);
+        registration
+    }
+
+    /// Upstream RegisterCurrentProcess. Pass the current owner explicitly:
+    /// Applet is movable, so retaining a pointer to its Process is not safe.
+    pub fn register_current_process(&mut self, process: &Process) {
+        self.pid = process.get_process_id();
+        self.initialized = process.is_initialized();
+        if self.initialized {
+            if let Some(ref rm) = self.resource_manager {
+                let rm = rm.lock();
+                rm.register_applet_resource_user_id(self.pid, true);
+                rm.set_aruid_valid_for_vibration(self.pid, true);
+            }
         }
     }
 
@@ -92,7 +99,7 @@ impl Drop for HidRegistration {
     /// - SetAruidValidForVibration(pid, false)
     /// - UnregisterAppletResourceUserId(pid)
     fn drop(&mut self) {
-        if unsafe { self.process.as_ref() }.is_some_and(|process| process.is_initialized()) {
+        if self.initialized {
             if let Some(ref rm) = self.resource_manager {
                 let rm = rm.lock();
                 rm.set_aruid_valid_for_vibration(self.pid, false);

@@ -255,6 +255,7 @@ impl FspSrv {
                     "OpenSdCardFileSystem",
                 ),
                 (8, Some(Self::open_file_system_with_id_handler), "OpenFileSystemWithId"),
+                (7, Some(Self::open_file_system_with_patch_handler), "OpenFileSystemWithPatch"),
                 (10, Some(Self::open_file_system_with_id_and_attributes_handler), "OpenFileSystemWithIdAndAttributes"),
                 (
                     51,
@@ -381,6 +382,40 @@ impl FspSrv {
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
         rb.push_result(RESULT_SUCCESS);
         rb.push_ipc_interface(object);
+    }
+
+    fn open_file_system_with_patch_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = this.as_any().downcast_ref::<Self>().unwrap();
+        // CMIF aligns the u64 program ID to eight bytes after FileSystemProxyType.
+        let mut input = RequestParser::new(ctx);
+        let fs_type = input.pop_u32() as u8;
+        input.pop_u32();
+        let program_id = input.pop_u64();
+        match service.open_file_system_with_patch(fs_type, program_id) {
+            Ok(directory) => {
+                let size_getter = service.fsc.as_ref().map_or_else(
+                    Self::make_default_size_getter,
+                    |fsc| Self::make_size_getter_from_storage_id(Arc::clone(fsc), StorageId::NandUser),
+                );
+                Self::push_interface_response(ctx, Arc::new(IFileSystem::new(directory, size_getter)));
+            }
+            Err(error) => Self::push_error_with_null_interface(ctx, error.raw()),
+        }
+    }
+
+    fn open_file_system_with_patch(&self, fs_type: u8, program_id: u64)
+        -> Result<crate::file_sys::vfs::vfs_types::VirtualDir, common::ResultCode>
+    {
+        // Upstream supports Manual only. Return a protocol error for absent
+        // content instead of constructing an interface over a null directory.
+        if fs_type != super::fsp_types::FileSystemProxyType::Manual as u8 {
+            return Err(crate::file_sys::errors::RESULT_INVALID_ARGUMENT);
+        }
+        let romfs = self.romfs_controller.lock().unwrap().as_ref()
+            .and_then(|controller| controller.open_patched_romfs(program_id, ContentRecordType::HtmlDocument))
+            .ok_or(crate::file_sys::errors::RESULT_PATH_NOT_FOUND)?;
+        crate::file_sys::romfs::extract_romfs(Some(romfs))
+            .ok_or(crate::file_sys::errors::RESULT_PATH_NOT_FOUND)
     }
 
     fn open_file_system_with_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -949,7 +984,7 @@ impl FspSrv {
                 .unwrap()
                 .as_ref()
                 .and_then(|controller| {
-                    controller.open_patched_romfs_with_program_index(program_id, program_index)
+                    controller.open_patched_romfs_with_program_index(program_id, program_index, ContentRecordType::Program)
                 });
 
         let Some(patched_romfs) = patched_romfs else {
@@ -1110,6 +1145,35 @@ impl ServiceFramework for FspSrv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patched_document_open_returns_an_error_and_null_interface_when_unavailable() {
+        use crate::hle::service::hle_ipc::SessionRequestManager;
+        let service = Arc::new(FspSrv::new());
+        let manager = Arc::new(StdMutex::new(SessionRequestManager::new()));
+        manager.lock().unwrap().set_session_handler(service.clone());
+        manager.lock().unwrap().convert_to_domain();
+        for (kind, expected) in [(4, crate::file_sys::errors::RESULT_PATH_NOT_FOUND),
+            (0, crate::file_sys::errors::RESULT_INVALID_ARGUMENT)] {
+            let mut ctx = HLERequestContext::new();
+            ctx.set_session_request_manager(manager.clone());
+            // Full CMIF request, including dirty words where a missing output
+            // interface used to leave an old object ID in the guest's TLS.
+            let mut words = [0xa5a5a5a5; crate::hle::ipc::COMMAND_BUFFER_LENGTH];
+            words[0] = 4;
+            words[1] = 12;
+            words[4..8].copy_from_slice(&[0x200001, 1, 0, 0]);
+            words[8..12].copy_from_slice(&[u32::from_le_bytes(*b"SFCI"), 0, 7, 0]);
+            words[12..16].copy_from_slice(&[kind, 0, 42, 0]);
+            ctx.populate_from_incoming_command_buffer(&words);
+            service.handle_sync_request(&mut ctx);
+            ctx.write_to_outgoing_command_buffer();
+            assert_eq!(ctx.command_buffer()[10], expected.raw());
+            assert_eq!(ctx.command_buffer()[4], 1, "one output interface slot");
+            assert_eq!(ctx.command_buffer()[12], 0, "null interface, never a stale ID");
+            assert_eq!(manager.lock().unwrap().domain_handler_count(), 1);
+        }
+    }
 
     #[test]
     fn document_mount_ipc_layouts_match_libnx() {

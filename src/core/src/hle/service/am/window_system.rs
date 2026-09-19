@@ -305,6 +305,25 @@ impl WindowSystem {
     }
 
     /// Upstream: void PruneTerminatedAppletsLocked()
+    fn restart_applet_process_locked(&self, applet: &mut Applet) -> bool {
+        if self.system.is_null() || !super::process_creation::reinitialize_process(
+            self.system, &mut applet.process, applet.program_id,
+        ) {
+            log::error!("Failed to restart winding applet {:?}", applet.applet_id);
+            return false;
+        }
+        applet.aruid.pid = applet.process.get_process_id();
+        applet.is_process_running = false;
+        applet.is_completed = false;
+        applet.hid_registration.register_current_process(&applet.process);
+        applet.lifecycle_manager.reset_for_relaunch();
+        applet.is_activity_runnable = false;
+        applet.launch_reason.flag = 1;
+        // TrackAppletProcess locks Applet in Rust; the caller registers it
+        // after releasing this guard, before running the new process.
+        true
+    }
+
     fn prune_terminated_applets_locked(&self, inner: &mut WindowSystemInner) {
         let aruids: Vec<u64> = inner.applets.keys().copied().collect();
 
@@ -332,6 +351,39 @@ impl WindowSystem {
                     a.child_applets.len(),
                     a.caller_applet.strong_count() != 0
                 );
+            }
+
+            // A winding process is a transparent slot until its child finishes.
+            if a.is_winding {
+                if !a.child_applets.is_empty() {
+                    continue;
+                }
+                let unwind = a.unwind_after_reserved;
+                a.is_winding = false;
+                a.unwind_after_reserved = false;
+                if unwind && self.restart_applet_process_locked(&mut a) {
+                    let new_aruid = a.aruid.pid;
+                    drop(a);
+                    if new_aruid != aruid {
+                        inner.applets.remove(&aruid);
+                        inner.applets.insert(new_aruid, applet.clone());
+                        if let Some(endpoint) = inner.exit_requests.remove(&aruid) {
+                            inner.exit_requests.insert(new_aruid, endpoint);
+                        }
+                        // C++ stores pointers here; Rust stores process IDs.
+                        for id in [&mut inner.foreground_requested_aruid, &mut inner.home_menu_aruid,
+                            &mut inner.application_aruid, &mut inner.overlay_display_aruid] {
+                            if *id == Some(aruid) { *id = Some(new_aruid); }
+                        }
+                    }
+                    if let Some(observer) = &self.event_observer {
+                        observer.track_applet_process(&applet);
+                    }
+                    applet.lock().unwrap().process.run();
+                    if let Some(observer) = &self.event_observer { observer.request_update(); }
+                    continue;
+                }
+                a.reserved_applet = None;
             }
 
             // Terminated, so ensure all child applets are terminated.
@@ -491,6 +543,10 @@ impl WindowSystem {
             let mut found = false;
             for child in &a.child_applets {
                 let c = child.lock().unwrap();
+                if c.is_winding {
+                    found = true;
+                    break;
+                }
                 let mode = c.library_applet_mode;
                 if c.is_process_running
                     && c.window_visible
@@ -576,6 +632,31 @@ mod tests {
     use super::*;
     use crate::hle::service::os::process::Process;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn winding_parent_survives_until_its_child_completes() {
+        let window_system = WindowSystem::new(crate::core::SystemRef::null());
+        let mut parent = Applet::new(crate::core::SystemRef::null(), Process::new(), false);
+        parent.aruid.pid = 1;
+        parent.is_completed = true;
+        parent.is_winding = true;
+        let parent = Arc::new(Mutex::new(parent));
+        let mut child = Applet::new(crate::core::SystemRef::null(), Process::new(), false);
+        child.aruid.pid = 2;
+        child.caller_applet = Arc::downgrade(&parent);
+        let child = Arc::new(Mutex::new(child));
+        parent.lock().unwrap().child_applets.push(child.clone());
+        window_system.track_applet(parent.clone(), false);
+        window_system.track_applet(child.clone(), false);
+        window_system.update();
+        assert!(window_system.get_by_applet_resource_user_id(1).is_some());
+        assert_eq!(child.lock().unwrap().terminate_result, 0);
+        child.lock().unwrap().is_completed = true;
+        window_system.update();
+        window_system.update();
+        assert!(window_system.get_by_applet_resource_user_id(1).is_none());
+        assert!(window_system.get_by_applet_resource_user_id(2).is_none());
+    }
 
     #[test]
     fn empty_window_system_requests_frontend_exit() {

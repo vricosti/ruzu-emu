@@ -123,7 +123,8 @@ pub struct Memory {
     /// slot. Upstream owner: `std::mutex sys_core_guard`.
     sys_core_guard: Arc<Mutex<()>>,
     /// Upstream `std::atomic<u16> block_count`: identifier handed to every
-    /// `map_pages` call so `PageEntryData::block()` tells mappings apart.
+    /// `map_pages` call. This 16-bit tag wraps and is not a unique mapping ID;
+    /// memory range operations must verify actual per-page backing pointers.
     block_count: AtomicU16,
 }
 
@@ -3091,6 +3092,39 @@ mod process_fastmem_tests {
     }
 
     #[test]
+    fn mapping_tags_wrap_without_aliasing_noncontiguous_pages() {
+        let device_memory = DeviceMemory::with_size(0x20_000);
+        let mut memory = memory_for_device(&device_memory);
+        let mut page_table = PageTable::new();
+        page_table.resize(32, PAGE_BITS);
+        memory.set_current_page_table(&mut page_table, false);
+
+        memory.map_pages(
+            &mut page_table, 4, 1, dram_memory_map::BASE + 0x2000, PageType::Memory,
+        );
+        assert!(memory.write_block(0x4000, &[0x31; PAGE_SIZE as usize]));
+        // Keep the first mapping alive while issuing a full cycle of tags.
+        // The final mapping deliberately shares its tag, but not its backing.
+        for _ in 0..=u16::MAX {
+            memory.map_pages(
+                &mut page_table, 5, 1, dram_memory_map::BASE + 0x6000, PageType::Memory,
+            );
+        }
+        assert_eq!(page_table.entries[4].block(), page_table.entries[5].block());
+        assert!(memory.write_block(0x5000, &[0x72; PAGE_SIZE as usize]));
+        let mut actual = [0; 32];
+        assert!(memory.read_block_checked(0x4ff0, &mut actual));
+        assert_eq!(&actual[..16], &[0x31; 16]);
+        assert_eq!(&actual[16..], &[0x72; 16]);
+
+        // Reused tags also must not turn unmapped pages into valid memory.
+        memory.map_pages(&mut page_table, 5, 1, 0, PageType::Unmapped);
+        assert!(!memory.read_block_checked(0x4ff0, &mut actual));
+        assert_eq!(&actual[..16], &[0x31; 16]);
+        assert_eq!(&actual[16..], &[0; 16]);
+    }
+
+    #[test]
     fn only_application_page_tables_receive_the_fastmem_arena() {
         let device_memory = DeviceMemory::with_size(0x20_000);
         let mut application_memory = memory_for_device(&device_memory);
@@ -3746,7 +3780,15 @@ impl Memory {
                 .zero_region(base_page as usize, end as usize);
         } else {
             let current_block = self.block_count.fetch_add(1, Ordering::Relaxed);
-            assert!(current_block != 65535);
+            // Eden's ASSERT calls AssertFailSoftImpl: without debug assertions
+            // it logs and continues, allowing the u16 counter to wrap. A Rust
+            // assert instead aborts a valid mapping after 65,535 allocations.
+            // Tags are not globally unique: unlike Eden's GetSpan shortcut,
+            // our block access paths check each page's actual backing pointer.
+            if current_block == u16::MAX {
+                log::error!("Page mapping tag counter wrapped; tags may be reused");
+                common::assert::assert_fail_soft_impl();
+            }
 
             page_table
                 .entries

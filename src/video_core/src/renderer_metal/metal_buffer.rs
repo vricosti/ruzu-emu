@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLDevice, MTLResourceOptions, MTLTexture,
+    MTLBlitCommandEncoder, MTLBuffer, MTLDevice, MTLResource, MTLResourceOptions, MTLTexture,
     MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 use thiserror::Error;
@@ -235,9 +235,17 @@ impl MetalBuffer {
         }
         let bytes_per_element = bytes_per_block(format).max(1) as usize;
         let element_count = size.div_ceil(bytes_per_element).max(1);
+        let bytes_per_row = element_count.checked_mul(bytes_per_element).ok_or(
+            MetalBufferError::RangeOutOfBounds {
+                offset, end: usize::MAX, length: self.length,
+            },
+        )?;
+        // Validate the actual native footprint, including a partial last texel.
+        self.checked_range(offset, bytes_per_row)?;
         let descriptor = MTLTextureDescriptor::new();
         descriptor.setTextureType(MTLTextureType::TypeTextureBuffer);
         descriptor.setPixelFormat(metal_format.pixel_format);
+        descriptor.setResourceOptions(self.buffer.resourceOptions());
         unsafe {
             descriptor.setWidth(element_count);
         }
@@ -250,7 +258,7 @@ impl MetalBuffer {
                 },
         );
         self.buffer
-            .newTextureWithDescriptor_offset_bytesPerRow(&descriptor, offset, 0)
+            .newTextureWithDescriptor_offset_bytesPerRow(&descriptor, offset, bytes_per_row)
             .ok_or(MetalBufferError::TextureViewCreationFailed)
     }
 
@@ -365,6 +373,48 @@ impl MetalBuffer {
 mod tests {
     use super::*;
     use crate::renderer_metal::metal_scheduler::MetalScheduler;
+
+    #[test]
+    fn texture_buffer_views_cover_texels_and_preserve_parent_options() {
+        let device = MetalDevice::new().unwrap();
+        for buffer in [
+            MetalBuffer::new(&device, 4096).unwrap(),
+            MetalBuffer::new_stream(&device, 4096).unwrap(),
+            MetalBuffer::new_private(&device, 4096).unwrap(),
+        ] {
+            for (format, size, width, row) in [
+                (PixelFormat::R32Float, 4, 1, 4),
+                (PixelFormat::R32Float, 12, 3, 12),
+                (PixelFormat::R32G32B32A32Float, 256, 16, 256),
+            ] {
+                for writable in [false, true] {
+                    let texture = buffer.new_texture_view(&device, format, 256, size, writable).unwrap();
+                    assert_eq!(texture.textureType(), MTLTextureType::TypeTextureBuffer);
+                    assert_eq!(texture.width(), width);
+                    assert_eq!(texture.bufferBytesPerRow(), row);
+                    assert_eq!(texture.bufferOffset(), 256);
+                    assert_eq!(texture.storageMode(), buffer.handle().storageMode());
+                    assert_eq!(texture.cpuCacheMode(), buffer.handle().cpuCacheMode());
+                    assert_eq!(texture.hazardTrackingMode(), buffer.handle().hazardTrackingMode());
+                    assert_eq!(texture.usage().contains(MTLTextureUsage::ShaderWrite), writable);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn texture_buffer_views_reject_rounded_footprints_outside_allocation() {
+        let device = MetalDevice::new().unwrap();
+        let buffer = MetalBuffer::new(&device, 17).unwrap();
+        assert!(matches!(
+            buffer.new_texture_view(&device, PixelFormat::R32Float, 0, 17, false),
+            Err(MetalBufferError::RangeOutOfBounds { end: 20, .. })
+        ));
+        assert!(matches!(
+            buffer.new_texture_view(&device, PixelFormat::R32Float, 1, 4, false),
+            Err(MetalBufferError::TextureOffsetAlignment { .. })
+        ));
+    }
 
     #[test]
     fn allocation_length_respects_device_limit_without_truncating() {

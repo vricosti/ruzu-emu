@@ -4797,10 +4797,9 @@ impl Maxwell3D {
             move |parameters| unsafe { (&mut *self_ptr.0).refresh_parameters_impl(parameters) },
         );
 
-        // Upstream calls draw_manager->DrawDeferred() here.
-        self.with_draw_manager(|draw_manager, this| {
-            draw_manager.draw_deferred(this);
-        });
+        // Direct BEGIN/END instances are already submitted at END. Unlike
+        // upstream DrawDeferred, completing an unrelated macro must not emit
+        // old geometry using registers changed by that macro.
 
         params.clear();
         debug_assert!(self.macro_params.is_empty());

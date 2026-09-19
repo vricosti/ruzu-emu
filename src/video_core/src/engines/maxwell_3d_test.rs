@@ -2015,23 +2015,25 @@ fn test_general_draw_has_instance_count_one() {
 }
 
 #[test]
-fn test_instanced_draw_accumulates() {
+fn test_instanced_draw_submits_each_end() {
     let mut engine = Maxwell3D::new();
     let subsequent = 4 | (1 << 26); // Triangles + Subsequent
 
-    // 3 × Subsequent BEGIN+END → no DrawCalls yet.
+    // Each Subsequent BEGIN+END completes one instance immediately.
     for _ in 0..3 {
         engine.write_reg(DRAW_BEGIN, subsequent);
         engine.write_reg(DRAW_END, 0);
     }
 
     let draws = engine.take_draw_calls();
-    assert!(draws.is_empty());
+    assert_eq!(draws.len(), 3);
+    assert!(draws.iter().all(|draw| draw.instance_count == 1));
+    assert_eq!(draws.iter().map(|draw| draw.base_instance).collect::<Vec<_>>(), vec![1, 2, 3]);
     assert_eq!(engine.draw_manager_state().instance_count, 3);
 }
 
 #[test]
-fn test_instanced_draw_flushes_on_first() {
+fn test_instanced_draw_does_not_redraw_on_first() {
     let mut engine = Maxwell3D::new();
     let subsequent = 4 | (1 << 26);
 
@@ -2040,28 +2042,27 @@ fn test_instanced_draw_flushes_on_first() {
         engine.write_reg(DRAW_BEGIN, subsequent);
         engine.write_reg(DRAW_END, 0);
     }
-    assert!(engine.take_draw_calls().is_empty());
+    assert_eq!(engine.take_draw_calls().len(), 3);
 
-    // BEGIN(First) flushes the previous batch.
+    // BEGIN(First) resets the instance index without redrawing completed work.
     engine.write_reg(DRAW_BEGIN, 4); // First (bits[27:26]=0)
     let draws = engine.take_draw_calls();
-    assert_eq!(draws.len(), 1);
-    assert_eq!(draws[0].instance_count, 4);
+    assert!(draws.is_empty());
 }
 
 #[test]
-fn test_instance_count_resets_after_flush() {
+fn test_instance_count_resets_on_first() {
     let mut engine = Maxwell3D::new();
     let subsequent = 4 | (1 << 26);
 
-    // Accumulate 2 instances.
+    // Complete 2 instances.
     for _ in 0..2 {
         engine.write_reg(DRAW_BEGIN, subsequent);
         engine.write_reg(DRAW_END, 0);
     }
     assert_eq!(engine.draw_manager_state().instance_count, 2);
 
-    // Flush via First.
+    // Reset via First.
     engine.write_reg(DRAW_BEGIN, 4);
     engine.take_draw_calls(); // discard flush
 
@@ -2070,6 +2071,65 @@ fn test_instance_count_resets_after_flush() {
     let draws = engine.take_draw_calls();
     assert_eq!(draws.len(), 1);
     assert_eq!(draws[0].instance_count, 1);
+}
+
+#[test]
+fn direct_instances_keep_the_shader_active_at_draw_end() {
+    let mut engine = Maxwell3D::new();
+    let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+    let rasterizer = TestRasterizer::new(calls.clone());
+    engine.bind_rasterizer(&rasterizer);
+    let vertex = PIPELINE_BASE + PIPELINE_STRIDE;
+    engine.write_reg(vertex, 1 | (1 << 4));
+    engine.write_reg(vertex + 1, 0x100);
+    let stream = VERTEX_STREAM_BASE + 4 * VERTEX_STREAM_STRIDE;
+    engine.write_reg(stream, (1 << 12) | 44);
+    engine.write_reg(stream + 2, 0x1000);
+    engine.write_reg(VB_COUNT, 3);
+    engine.write_reg(DRAW_BEGIN, 4);
+    engine.write_reg(DRAW_END, 0);
+    engine.write_reg(DRAW_BEGIN, 4 | (1 << 26));
+    engine.write_reg(DRAW_END, 0);
+
+    // The next command sequence may replace the shader before its next BEGIN.
+    // Neither instance of the completed sequence may use that replacement.
+    engine.write_reg(vertex + 1, 0x200);
+    engine.write_reg(stream + 2, 0x2000);
+    engine.write_reg(stream, (1 << 12) | 28);
+    engine.write_reg(DRAW_BEGIN, 4);
+    let calls = calls.lock().unwrap();
+    assert!(calls.draws.iter().all(|draw| draw.2[1] == 0x100));
+    assert_eq!(calls.draws.iter().map(|draw| draw.0).sum::<u32>(), 2);
+    assert!(calls.draw_registers.iter().all(|registers| {
+        registers.vertex_streams[4].address == 0x1000
+            && registers.vertex_streams[4].stride == 44
+    }));
+}
+
+#[test]
+fn direct_instance_indices_support_first_next_and_unchanged() {
+    for path in 0..3 {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(GLOBAL_BASE_INSTANCE_INDEX, 42);
+        for instance_id in [0, 1, 2, 0] {
+            engine.write_reg(DRAW_BEGIN, 4 | (instance_id << 26));
+            match path {
+                0 => engine.write_reg(VB_COUNT, 3),
+                1 => engine.write_reg(IB_BASE + IB_OFF_COUNT, 3),
+                _ => {
+                    for index in 0..3 {
+                        engine.write_reg(DRAW_INLINE_INDEX, index);
+                    }
+                }
+            }
+            engine.write_reg(DRAW_END, 0);
+        }
+        let draws = engine.take_draw_calls();
+        assert_eq!(draws.len(), 4);
+        assert!(draws.iter().all(|draw| draw.instance_count == 1));
+        assert_eq!(draws.iter().map(|draw| draw.base_instance).collect::<Vec<_>>(),
+            vec![42, 43, 43, 42]);
+    }
 }
 
 #[test]
@@ -2982,6 +3042,7 @@ fn test_call_multi_method_inline_indices_replay_each_shadowed_word() {
 #[test]
 fn draw_manager_instance_arithmetic_wraps_like_upstream_u32() {
     let mut engine = Maxwell3D::new();
+    engine.write_reg(GLOBAL_BASE_INSTANCE_INDEX, 2);
     engine.with_draw_manager(|draw_manager, this| {
         draw_manager.draw_state.instance_count = u32::MAX;
         draw_manager.process_method_call(INDEX_BUFFER32_SUBSEQUENT, 0, this);
@@ -2994,8 +3055,8 @@ fn draw_manager_instance_arithmetic_wraps_like_upstream_u32() {
 
         draw_manager.draw_state.draw_mode = dm::DrawMode::Instance;
         draw_manager.draw_state.instance_count = u32::MAX;
-        draw_manager.draw_deferred(this);
-        assert_eq!(draw_manager.draw_state.instance_count, 0);
+        draw_manager.draw_end(this);
+        assert_eq!(draw_manager.draw_state.base_instance, 1);
     });
 }
 

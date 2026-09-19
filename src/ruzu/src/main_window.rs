@@ -304,8 +304,8 @@ fn display_uses_wayland() -> bool {
     })
 }
 
-fn should_warn_about_missing_keys(keys_present: bool) -> bool {
-    !keys_present
+fn should_warn_about_missing_keys(keys_present: bool, hide_warning: bool) -> bool {
+    !keys_present && !hide_warning
 }
 
 fn corrected_migration_path(
@@ -1470,8 +1470,10 @@ mod startup_prerequisite_tests {
 
     #[test]
     fn startup_warning_is_shown_only_when_keys_are_missing() {
-        assert!(should_warn_about_missing_keys(false));
-        assert!(!should_warn_about_missing_keys(true));
+        assert!(should_warn_about_missing_keys(false, false));
+        assert!(!should_warn_about_missing_keys(true, false));
+        assert!(!should_warn_about_missing_keys(false, true));
+        assert!(!should_warn_about_missing_keys(true, true));
         assert!(!MISSING_KEYS_DETAIL.contains("yuzu"));
         assert_eq!(
             MISSING_KEYS_DETAIL,
@@ -3275,8 +3277,12 @@ impl GMainWindow {
     /// Missing firmware by itself does not produce a startup warning upstream;
     /// it only hides the firmware version and disables firmware applets.
     fn on_check_firmware_decryption(self: &Rc<Self>) {
-        if should_warn_about_missing_keys(frontend_common::content_manager::are_keys_present()) {
-            crate::gtk_compat::ask_question_with_navigation(
+        if should_warn_about_missing_keys(
+            frontend_common::content_manager::are_keys_present(),
+            crate::uisettings::with(|values| *values.hide_missing_keys_warning.get_value()),
+        ) {
+            let hide_warning = gtk::CheckButton::with_label(&crate::i18n::tr("Don't show again"));
+            let dialog = crate::gtk_compat::ask_question_with_navigation(
                 Some(&self.window),
                 MISSING_KEYS_TITLE,
                 MISSING_KEYS_DETAIL,
@@ -3286,7 +3292,15 @@ impl GMainWindow {
                 glib::clone!(
                     #[weak(rename_to = this)]
                     self,
+                    #[strong]
+                    hide_warning,
                     move |install| {
+                        crate::uisettings::with_mut(|values| {
+                            values.hide_missing_keys_warning.set_value(hide_warning.is_active());
+                        });
+                        if let Err(error) = crate::configuration::qt_config::save_view_values() {
+                            log::warn!("Could not persist the missing keys warning preference: {error}");
+                        }
                         if install {
                             this.on_install_decryption_keys_then(glib::clone!(
                                 #[weak(rename_to = this)]
@@ -3299,6 +3313,9 @@ impl GMainWindow {
                     }
                 ),
             );
+            dialog.message_area().downcast::<gtk::Box>()
+                .expect("MessageDialog message area is a GtkBox")
+                .append(&hide_warning);
         } else {
             self.on_check_graphics_backend();
         }

@@ -239,7 +239,7 @@ pub fn ask_question_with_navigation<P: IsA<gtk::Window>>(
     accept_label: &str,
     navigation: Option<ControllerNavigation>,
     callback: impl FnOnce(bool) + 'static,
-) {
+) -> gtk::MessageDialog {
     let title = message;
     let message = crate::i18n::tr(message);
     let detail = crate::i18n::tr(detail);
@@ -291,6 +291,7 @@ pub fn ask_question_with_navigation<P: IsA<gtk::Window>>(
     }
     dialog.present();
     focus_dialog_response(&dialog, ResponseType::Accept);
+    dialog
 }
 
 fn install_question_navigation(dialog: &gtk::MessageDialog, navigation: ControllerNavigation) {
@@ -321,6 +322,44 @@ fn install_question_navigation(dialog: &gtk::MessageDialog, navigation: Controll
 /// Return true after responding, so later queued input cannot reach a closed
 /// dialog or the file chooser/next startup question opened by its continuation.
 fn question_navigation_key(dialog: &gtk::MessageDialog, key: NavigationKey) -> bool {
+    let checkbox = dialog.message_area().last_child()
+        .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok());
+    if let Some(checkbox) = checkbox {
+        match key {
+            NavigationKey::Up | NavigationKey::Previous
+            | NavigationKey::Down | NavigationKey::Next => {
+                // MessageDialog's built-in traversal can stay confined to its
+                // action area. Include the optional content checkbox explicitly.
+                let controls = [
+                    Some(checkbox.upcast::<gtk::Widget>()),
+                    dialog.widget_for_response(ResponseType::Cancel),
+                    dialog.widget_for_response(ResponseType::Accept),
+                ];
+                let focus = gtk::prelude::GtkWindowExt::focus(dialog);
+                let current = controls.iter().position(|control| *control == focus).unwrap_or(2);
+                let next = if matches!(key, NavigationKey::Up | NavigationKey::Previous) {
+                    (current + 2) % 3
+                } else {
+                    (current + 1) % 3
+                };
+                if let Some(control) = &controls[next] {
+                    gtk::prelude::GtkWindowExt::set_focus(dialog, Some(control));
+                    control.grab_focus();
+                }
+                dialog.set_focus_visible(true);
+                return false;
+            }
+            NavigationKey::Enter => {
+                if let Some(checkbox) = gtk::prelude::GtkWindowExt::focus(dialog)
+                    .and_then(|widget| widget.downcast::<gtk::CheckButton>().ok())
+                {
+                    checkbox.set_active(!checkbox.is_active());
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
     match key {
         NavigationKey::Left | NavigationKey::Up | NavigationKey::Previous => {
             focus_question_response(dialog, ResponseType::Cancel);
@@ -494,6 +533,36 @@ mod tests {
             assert!(!dialog.is_visible());
             dialog.destroy();
         }
+        // The optional startup checkbox is reachable and toggles without
+        // answering the question; cancelling still completes it exactly once.
+        let replies = Rc::new(RefCell::new(Vec::new()));
+        let reply = Rc::clone(&replies);
+        let dialog = ask_question_with_navigation(Some(&parent), "Checkbox question test",
+            "Choose an action", "No", "Yes", None,
+            move |accepted| reply.borrow_mut().push(accepted));
+        let checkbox = gtk::CheckButton::with_label("Don't show again");
+        dialog.message_area().downcast::<gtk::Box>().unwrap().append(&checkbox);
+        for _ in 0..100 {
+            if !context.pending() { break; }
+            context.iteration(false);
+        }
+        focus_question_response(&dialog, ResponseType::Cancel);
+        for _ in 0..4 {
+            if gtk::prelude::GtkWindowExt::focus(&dialog).as_ref() == Some(checkbox.upcast_ref()) {
+                break;
+            }
+            question_navigation_key(&dialog, NavigationKey::Up);
+        }
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&dialog).as_ref(), Some(checkbox.upcast_ref()));
+        assert!(!question_navigation_key(&dialog, NavigationKey::Enter));
+        assert!(checkbox.is_active());
+        assert!(replies.borrow().is_empty());
+        assert!(!question_navigation_key(&dialog, NavigationKey::Down));
+        assert_ne!(gtk::prelude::GtkWindowExt::focus(&dialog).as_ref(), Some(checkbox.upcast_ref()));
+        assert!(question_navigation_key(&dialog, NavigationKey::Escape));
+        assert_eq!(&*replies.borrow(), &[false]);
+        dialog.destroy();
+
         // Exercise the real input-engine -> HID -> ControllerNavigation ->
         // modal timer path before any emulation session exists.
         let mut input = input_common::InputSubsystem::new();

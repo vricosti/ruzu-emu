@@ -1987,6 +1987,19 @@ mod tests {
     }
 
     #[test]
+    fn missing_keys_warning_preference_roundtrips_and_defaults_to_visible() {
+        let mut source = uisettings::Values::default();
+        assert!(!*source.hide_missing_keys_warning.get_value());
+        source.hide_missing_keys_warning.set_value(true);
+        let document = save_ui_values("", &mut source);
+        let mut loaded = uisettings::Values::default();
+        read_ui_values(&document, &mut loaded);
+        assert!(*loaded.hide_missing_keys_warning.get_value());
+        read_ui_values("", &mut loaded);
+        assert!(!*loaded.hide_missing_keys_warning.get_value());
+    }
+
+    #[test]
     fn interface_font_scale_roundtrip_and_default() {
         let mut source = uisettings::Values::default();
         read_ui_values("", &mut source);

@@ -297,6 +297,8 @@ pub struct Values {
     pub font_scale_auto: Setting<bool>,
     /// Mirror the log to a console window — upstream `show_console`.
     pub show_console: Setting<bool>,
+    /// Suppress only the startup missing-decryption-keys question.
+    pub hide_missing_keys_warning: Setting<bool>,
     #[cfg(unix)]
     pub gui_force_x11: Setting<bool>,
     #[cfg(unix)]
@@ -393,6 +395,7 @@ impl Default for Values {
             font_scale: Setting::new(100, "font_scale", Ui),
             font_scale_auto: Setting::new(true, "font_scale_auto", Ui),
             show_console: Setting::new(false, "showConsole", Ui),
+            hide_missing_keys_warning: Setting::new(false, "hide_missing_keys_warning", UiGeneral),
             #[cfg(unix)]
             gui_force_x11: Setting::new(false, "gui_force_x11", UiGeneral),
             #[cfg(unix)]
@@ -469,7 +472,7 @@ impl Values {
         settings!(font_scale, font_scale_auto, single_window_mode, fullscreen, show_filter_bar,
             show_status_bar, show_perf_overlay, confirm_before_stopping, pause_when_in_background,
             mute_when_in_background, hide_mouse, controller_applet_disabled,
-            select_user_on_boot, enable_gamemode, show_console,
+            select_user_on_boot, enable_gamemode, show_console, hide_missing_keys_warning,
             enable_screenshot_save_as, screenshot_height, show_add_ons,
             show_size, show_types, show_play_time, game_icon_size, folder_icon_size,
             row_1_text_id, row_2_text_id, cache_game_list, favorites_expanded);

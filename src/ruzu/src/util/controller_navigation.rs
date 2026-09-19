@@ -612,13 +612,17 @@ impl InterfacePad {
         if now < self.refresh_at {
             return;
         }
-        self.refresh_at = now + std::time::Duration::from_secs(1);
         let Some(input) = self.input.upgrade() else {
             self.devices.clear();
             self.pad_states.clear();
             return;
         };
-        let input = input.borrow();
+        // SDL's macOS HID discovery can reenter GTK while PumpEvents holds
+        // the mutable input borrow. Retry next tick without expiring this refresh.
+        let Ok(input) = input.try_borrow() else {
+            return;
+        };
+        self.refresh_at = now + std::time::Duration::from_secs(1);
         let mut devices = input.get_input_devices();
         devices.sort_by_key(interface_device_identity);
         let candidates: Vec<_> = devices

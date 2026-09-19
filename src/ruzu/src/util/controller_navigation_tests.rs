@@ -4,6 +4,32 @@ use super::*;
 use gtk::glib;
 
 #[test]
+fn interface_refresh_retries_after_reentrant_input_pump() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let input = Rc::new(RefCell::new(input_common::InputSubsystem::new()));
+    let hid = Arc::new(Mutex::new(HIDCore::new()));
+    let navigation = ControllerNavigation::for_interface(&hid, &input);
+    let mut interface = navigation.interface_pad.borrow_mut();
+    let pad = interface.as_mut().unwrap();
+    pad.identity = "previous-device".into();
+    let previous_state = pad.state.clone();
+    let deadline = pad.refresh_at;
+
+    let pumping = input.borrow_mut();
+    pad.refresh(&navigation.player_1_controller, &navigation.handheld_controller);
+    assert_eq!(pad.refresh_at, deadline);
+    assert_eq!(pad.identity, "previous-device");
+    assert!(Arc::ptr_eq(&pad.state, &previous_state));
+    drop(pumping);
+
+    pad.refresh(&navigation.player_1_controller, &navigation.handheld_controller);
+    assert!(pad.refresh_at > deadline);
+    assert!(pad.identity.is_empty());
+    assert!(!Arc::ptr_eq(&pad.state, &previous_state));
+}
+
+#[test]
 #[ignore = "requires GTK on the platform main thread and a display"]
 fn controls_navigation_suspension_is_local_inherited_and_reversible() {
     gtk::init().unwrap();

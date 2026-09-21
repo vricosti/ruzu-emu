@@ -47,6 +47,8 @@ mod render;
 mod render_window_windows;
 #[cfg(target_os = "linux")]
 mod render_window_x11;
+#[cfg(target_os = "linux")]
+mod render_window_wayland;
 mod startup_checks;
 mod status_bar;
 mod uisettings;

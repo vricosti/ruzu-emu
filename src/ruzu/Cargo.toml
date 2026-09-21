@@ -84,6 +84,10 @@ core-foundation = "0.9"
 # The `xlib` feature exposes `X11Display::xdisplay()`, the `Display*` that
 # `WindowSystemInfo::display_connection` needs for `VkXlibSurfaceCreateInfoKHR`.
 gdk4-x11 = { version = "0.9", features = ["xlib"] }
+gdk4-wayland = { version = "0.9", features = ["wayland_crate", "egl", "v4_4"] }
+wayland-client = "0.31"
+wayland-egl = "0.32"
+khronos-egl = { version = "6", features = ["dynamic"] }
 x11 = { version = "2", features = ["glx", "xlib"] }
 
 # Windows: create the same native child render window that upstream gets from

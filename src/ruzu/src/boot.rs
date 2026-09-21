@@ -29,15 +29,35 @@ use crate::loading_screen::LoadStage;
 /// Frontend-owned OpenGL context source. Upstream keeps this state in
 /// `GRenderWindow::main_context` and creates shared contexts from it.
 #[derive(Clone)]
-pub struct OpenGLContextSource {
+pub enum OpenGLContextSource {
     #[cfg(target_os = "linux")]
-    glx: crate::render_window_x11::GlxContextSource,
+    Glx(crate::render_window_x11::GlxContextSource),
+    #[cfg(target_os = "linux")]
+    Egl(crate::render_window_wayland::EglContextSource),
 }
 
 impl OpenGLContextSource {
     #[cfg(target_os = "linux")]
     pub fn from_glx(glx: crate::render_window_x11::GlxContextSource) -> Self {
-        Self { glx }
+        Self::Glx(glx)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_context(&self, offscreen: bool) -> Result<Box<dyn ruzu_core::frontend::graphics_context::GraphicsContext + Send>, String> {
+        match self {
+            Self::Glx(source) => if offscreen {
+                Ok(Box::new(source.create_offscreen_context()?))
+            } else { Ok(Box::new(source.create_context()?)) },
+            Self::Egl(source) => Ok(Box::new(source.create_context(offscreen)?)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn get_proc_address(&self, name: &'static str) -> *const std::ffi::c_void {
+        match self {
+            Self::Glx(_) => crate::render_window_x11::GlxContextSource::get_proc_address(name),
+            Self::Egl(source) => source.get_proc_address(name),
+        }
     }
 }
 
@@ -676,20 +696,20 @@ fn run_boot(
                 #[cfg(target_os = "linux")]
                 {
                     let source = opengl_context_source.as_ref().ok_or_else(|| {
-                        "OpenGL renderer selected without a GLX context source".to_owned()
+                        "OpenGL renderer selected without a native context source".to_owned()
                     })?;
-                    let context = Box::new(source.glx.create_context().map_err(|error| {
+                    let context = source.create_context(false).map_err(|error| {
                         format!("Failed to create OpenGL renderer context: {error}")
-                    })?);
-                    let worker_source = source.glx.clone();
+                    })?;
+                    let worker_source = source.clone();
                     let shared_context_factory: video_core::renderer_opengl::gl_shader_context::SharedContextFactory =
                         Arc::new(move || {
-                            Box::new(worker_source.create_offscreen_context().unwrap_or_else(|error| {
+                            worker_source.create_context(true).unwrap_or_else(|error| {
                                 panic!("failed to create shared OpenGL shader context: {error}")
-                            }))
+                            })
                         });
                     let mut renderer = video_core::renderer_opengl::RendererOpenGL::new(
-                        crate::render_window_x11::GlxContextSource::get_proc_address,
+                        |name| source.get_proc_address(name),
                         syncpoints.clone(),
                         Arc::clone(&device_memory),
                         // SAFETY: this renderer is immediately bound to `gpu` below;

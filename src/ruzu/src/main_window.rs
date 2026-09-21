@@ -612,6 +612,16 @@ struct RenderHandles {
     /// Linux: colormap paired with the GLX-compatible visual.
     #[cfg(target_os = "linux")]
     colormap: usize,
+    #[cfg(target_os = "linux")]
+    wayland: Option<crate::render_window_wayland::WaylandRenderWindow>,
+}
+
+#[cfg(target_os = "linux")]
+impl RenderHandles {
+    fn set_hidden(&self, hidden: bool) {
+        if let Some(window) = &self.wayland { window.set_hidden(hidden); }
+        else { crate::render_window_x11::set_render_window_hidden(self.display as _, self.child_window as _, hidden); }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -937,6 +947,44 @@ mod fullscreen_hotkey_tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires native Wayland and isolated XDG directories; run alone"]
+    fn wayland_window_mode_preserves_live_surface() {
+        assert!(std::env::var_os("RUZU_WAYLAND_TEST_ISOLATED").is_some(),
+            "Run only on an isolated nested compositor or VM; this test triggered a Mutter crash");
+        gtk::init().unwrap();
+        let app = Application::builder().application_id("org.ruzu.WaylandHostTest").build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        crate::uisettings::with_mut(|values| values.single_window_mode.set_value(true));
+        let main = GMainWindow::new_for_direct_game(&app);
+        main.window.present();
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !main.render_host_ready() {
+            assert!(std::time::Instant::now() < deadline);
+            while context.pending() { context.iteration(false); }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let window = crate::render_window_wayland::WaylandRenderWindow::new(main.window.upcast_ref(),
+            (0.0, 0.0, 64.0, 64.0), false).unwrap();
+        let info = window.window_info.clone();
+        let surface = info.render_surface;
+        *main.render.borrow_mut() = Some(RenderHandles {
+            emu_window: crate::emu_window::GtkEmuWindow::from_window_info(info, window.drawable_size),
+            child_window: 0, display: 0, colormap: 0, wayland: Some(window),
+        });
+        for single in [false, true, false, true] {
+            assert_eq!(main.switch_render_host(single), single);
+            assert!(main.detached_render_host.borrow().is_none());
+            while context.pending() { context.iteration(false); }
+            main.maybe_resize_render();
+            assert_eq!(main.render.borrow().as_ref().unwrap().emu_window.window_info().render_surface, surface);
+        }
+        main.render.borrow_mut().take();
+        main.window.destroy();
+    }
+
+    #[test]
     #[ignore = "requires GTK display with a window manager and isolated XDG directories; run alone"]
     fn startup_maximization_survives_native_mapping() {
         #[cfg(target_os = "linux")]
@@ -1051,6 +1099,7 @@ mod fullscreen_hotkey_tests {
             emu_window: crate::emu_window::GtkEmuWindow::from_window_info(Default::default(), embedded.drawable_size),
             child_window: embedded.window as usize, display: embedded.display as usize,
             colormap: embedded.colormap,
+            wayland: None,
         });
         for _ in 0..4 {
             gio::prelude::ActionGroupExt::activate_action(&app, "single_window_mode", None);
@@ -1133,6 +1182,7 @@ mod fullscreen_hotkey_tests {
             emu_window: emu, child_window: 0,
             #[cfg(target_os = "linux")] display: 0,
             #[cfg(target_os = "linux")] colormap: 0,
+            #[cfg(target_os = "linux")] wayland: None,
             #[cfg(target_os = "macos")] metal_layer: 0,
         });
         main.session_generation.set(7);
@@ -1999,9 +2049,7 @@ impl GMainWindow {
                 // only a still-live, visible render page, never a stopped game.
                 #[cfg(target_os = "linux")]
                 if let Some(render) = this.render.borrow().as_ref().filter(|_| this.detached_render_host.borrow().is_none()) {
-                    crate::render_window_x11::set_render_window_hidden(
-                        render.display as *mut _, render.child_window as _,
-                        hidden || !this.render_page_visible.get());
+                    render.set_hidden(hidden || !this.render_page_visible.get());
                 };
             }));
         }
@@ -3165,6 +3213,10 @@ impl GMainWindow {
             || crate::hotkeys::owner_blocked_by_modal(&window) { return false; }
         let render = self.render.borrow();
         let Some(handles) = render.as_ref() else { return false; };
+        // Wayland deliberately forbids global pointer warping. GTK continues
+        // to deliver ordinary motion/touch through the empty child input region.
+        #[cfg(target_os = "linux")]
+        if handles.wayland.is_some() { return false; }
         let layout_owner = handles.emu_window.framebuffer_layout();
         let Ok(layout) = layout_owner.read() else { return false; };
         let (width, height) = (area.width() as f64, area.height() as f64);
@@ -5442,7 +5494,7 @@ impl GMainWindow {
         }
     }
 
-    /// Boot `filepath` into an X11 child window embedded in the GTK window.
+    /// Boot into an X11 child or native Wayland subsurface inside the GTK host.
     ///
     /// Same shape as the macOS path above; only the native surface differs —
     /// an X11 child `Window` instead of a `CAMetalLayer` sub-view, matching
@@ -5501,40 +5553,42 @@ impl GMainWindow {
             )
         });
 
-        let Some(embedded) =
-            render::attach_render_window(&render_host, render_rect)
-        else {
-            log::error!(
-                "Cannot boot: failed to embed an X11 render surface. \
-                 Native Wayland is not supported yet — relaunch with GDK_BACKEND=x11."
-            );
-            self.alert(
-                "Unable to start the game",
-                "ruzu could not create its embedded X11 render surface. \
-                 Ensure XWayland is available and restart the application.",
-            );
-            return;
+        let is_wayland = render_host.surface().is_some_and(|surface| surface.is::<gdk4_wayland::WaylandSurface>());
+        let (window_info, drawable_size, display, child_window, colormap, wayland, opengl_source) = if is_wayland {
+            let rect = render_rect.unwrap_or((0.0, 0.0, render_host.width() as f64, render_host.height() as f64));
+            let window = match crate::render_window_wayland::WaylandRenderWindow::new(&render_host, rect, true) {
+                Ok(window) => window,
+                Err(error) => {
+                    log::error!("Cannot create Wayland render surface: {error}");
+                    self.alert("Unable to start the game", &error);
+                    return;
+                }
+            };
+            let source = window.opengl_source().map(crate::boot::OpenGLContextSource::Egl);
+            (window.window_info.clone(), window.drawable_size, 0, 0, 0, Some(window), source)
+        } else {
+            let Some(embedded) = render::attach_render_window(&render_host, render_rect) else {
+                self.alert("Unable to start the game", "ruzu could not create its embedded X11 render surface. Ensure XWayland is available and restart the application.");
+                return;
+            };
+            render::set_render_window_hidden(embedded.display, embedded.window, true);
+            let info = WindowSystemInfo {
+                type_: WindowSystemType::X11,
+                display_connection: embedded.display as usize,
+                render_surface: embedded.window as usize,
+                render_surface_scale: embedded.scale,
+            };
+            (info, embedded.drawable_size, embedded.display as usize, embedded.window as usize,
+                embedded.colormap, None, embedded.glx_context_source.map(crate::boot::OpenGLContextSource::from_glx))
         };
-
-        // Keep it hidden so the loading screen shows during load.
-        render::set_render_window_hidden(embedded.display, embedded.window, true);
-
-        let window_info = WindowSystemInfo {
-            type_: WindowSystemType::X11,
-            display_connection: embedded.display as usize,
-            render_surface: embedded.window as usize,
-            render_surface_scale: embedded.scale,
-        };
-        let emu = GtkEmuWindow::from_window_info(window_info, embedded.drawable_size);
+        let emu = GtkEmuWindow::from_window_info(window_info, drawable_size);
         let window_info = emu.window_info().clone();
         let shown_state = emu.shown_state();
         let framebuffer_layout = emu.framebuffer_layout();
 
         *self.render.borrow_mut() = Some(RenderHandles {
             emu_window: emu,
-            display: embedded.display as usize,
-            child_window: embedded.window as usize,
-            colormap: embedded.colormap,
+            display, child_window, colormap, wayland,
         });
         self.render_geometry.set(None);
 
@@ -5607,9 +5661,7 @@ impl GMainWindow {
             window_info,
             shown_state,
             framebuffer_layout,
-            embedded
-                .glx_context_source
-                .map(crate::boot::OpenGLContextSource::from_glx),
+            opengl_source,
             Arc::clone(&self.hid_core),
             self.controller_applet_for_boot(),
             self.error_applet_for_boot(),
@@ -5840,8 +5892,9 @@ impl GMainWindow {
         let render = self.render.borrow();
         let Some(handles) = render.as_ref() else { return true; };
         #[cfg(target_os = "linux")]
-        return crate::render_window_x11::reparent_render_window(
-            destination, handles.display as *mut _, handles.child_window as _);
+        return if let Some(window) = &handles.wayland { window.reparent(destination) }
+        else { crate::render_window_x11::reparent_render_window(
+            destination, handles.display as *mut _, handles.child_window as _) };
         #[cfg(target_os = "windows")]
         return crate::render_window_windows::reparent_render_window(destination, handles.child_window as _);
         #[cfg(target_os = "macos")]
@@ -5854,6 +5907,13 @@ impl GMainWindow {
     /// the checkable setting only after this transition succeeds.
     fn switch_render_host(self: &Rc<Self>, single_window: bool) -> bool {
         if single_window == self.detached_render_host.borrow().is_none() { return true; }
+        #[cfg(target_os = "linux")]
+        if self.render.borrow().as_ref().is_some_and(|render| render.wayland.is_some()) {
+            // Reject before touching fullscreen, input or either GTK host.
+            // See WaylandRenderWindow::reparent for the compositor failure.
+            log::warn!("Stop emulation before changing window mode on native Wayland");
+            return false;
+        }
         self.save_render_window_geometry();
         let fullscreen = self.pre_fullscreen_state.borrow().is_some();
         // Restore the old host before moving the surface; otherwise its saved
@@ -6087,10 +6147,13 @@ impl GMainWindow {
         }
     }
 
-    /// Linux counterpart of `maybe_resize_render`: move/resize the X11 child
+    /// Linux counterpart of `maybe_resize_render`: move/resize the native child
     /// window to the stack's new bounds and rebuild the frame layout.
     #[cfg(target_os = "linux")]
     fn maybe_resize_render(&self) {
+        if let Some(window) = self.render.borrow().as_ref().and_then(|handles| handles.wayland.as_ref()) {
+            window.dispatch_pending();
+        }
         let (render_host, render_area) = self.render_host();
         let Some(rect) = render_area.compute_bounds(&render_host) else {
             return;
@@ -6116,12 +6179,14 @@ impl GMainWindow {
             rect.width() as f64,
             rect.height() as f64,
         );
-        if let Some((dw, dh)) = crate::render_window_x11::resize_render_window(
+        let size = if let Some(window) = &handles.wayland { window.resize(gr) } else {
+            crate::render_window_x11::resize_render_window(
             &render_host,
             handles.display as *mut _,
             handles.child_window as u64,
             gr,
-        ) {
+        ) };
+        if let Some((dw, dh)) = size {
             self.render_geometry.set(Some(geometry));
             handles.emu_window.update_framebuffer_layout(dw, dh);
         }
@@ -6224,9 +6289,7 @@ impl GMainWindow {
         let render = self.render.borrow();
         let Some(handles) = render.as_ref() else { return; };
         #[cfg(target_os = "linux")]
-        crate::render_window_x11::set_render_window_hidden(
-            handles.display as *mut _, handles.child_window as _,
-            self.detached_render_host.borrow().is_none() && crate::util::inline_menu::render_suppressed());
+        handles.set_hidden(self.detached_render_host.borrow().is_none() && crate::util::inline_menu::render_suppressed());
         #[cfg(target_os = "windows")]
         crate::render_window_windows::set_render_window_hidden(handles.child_window as _, false);
         #[cfg(target_os = "macos")]
@@ -6532,11 +6595,10 @@ impl GMainWindow {
 
         if let Some(handles) = self.render.borrow_mut().take() {
             #[cfg(target_os = "linux")]
-            crate::render_window_x11::destroy_render_window(
-                handles.display as *mut _,
-                handles.child_window as u64,
-                handles.colormap,
-            );
+            if handles.wayland.is_none() {
+                crate::render_window_x11::destroy_render_window(
+                    handles.display as *mut _, handles.child_window as u64, handles.colormap);
+            }
             #[cfg(target_os = "macos")]
             crate::render_window::set_render_view_hidden(handles.child_window as *mut _, true);
             #[cfg(target_os = "windows")]

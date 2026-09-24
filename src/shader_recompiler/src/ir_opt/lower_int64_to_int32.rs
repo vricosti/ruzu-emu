@@ -825,6 +825,12 @@ fn lower_float_to_int64(
 
 fn replacement_opcode(opcode: Opcode) -> Option<Opcode> {
     Some(match opcode {
+        Opcode::GlobalAtomicCompareExchange64 | Opcode::StorageAtomicCompareExchange64 => {
+            // Splitting CAS into two 32-bit operations would lose atomicity.
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "64-bit compare-exchange on a host without int64 support",
+            ));
+        }
         Opcode::PackUint2x32 | Opcode::UnpackUint2x32 => Opcode::Identity,
         Opcode::SharedAtomicExchange64 => Opcode::SharedAtomicExchange32x2,
         Opcode::GlobalAtomicIAdd64 => Opcode::GlobalAtomicIAdd32x2,

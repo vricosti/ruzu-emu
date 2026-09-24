@@ -5442,6 +5442,7 @@ impl SpirvEmitContext {
             | Opcode::StorageAtomicAnd32
             | Opcode::StorageAtomicOr32
             | Opcode::StorageAtomicXor32
+            | Opcode::StorageAtomicCompareExchange32
             | Opcode::StorageAtomicExchange32
             | Opcode::StorageAtomicIAdd64
             | Opcode::StorageAtomicSMin64
@@ -5451,6 +5452,7 @@ impl SpirvEmitContext {
             | Opcode::StorageAtomicAnd64
             | Opcode::StorageAtomicOr64
             | Opcode::StorageAtomicXor64
+            | Opcode::StorageAtomicCompareExchange64
             | Opcode::StorageAtomicExchange64
             | Opcode::StorageAtomicIAdd32x2
             | Opcode::StorageAtomicSMin32x2
@@ -5802,6 +5804,7 @@ impl SpirvEmitContext {
             | Opcode::GlobalAtomicAnd32
             | Opcode::GlobalAtomicOr32
             | Opcode::GlobalAtomicXor32
+            | Opcode::GlobalAtomicCompareExchange32
             | Opcode::GlobalAtomicExchange32
             | Opcode::GlobalAtomicIAdd64
             | Opcode::GlobalAtomicSMin64
@@ -5811,6 +5814,7 @@ impl SpirvEmitContext {
             | Opcode::GlobalAtomicAnd64
             | Opcode::GlobalAtomicOr64
             | Opcode::GlobalAtomicXor64
+            | Opcode::GlobalAtomicCompareExchange64
             | Opcode::GlobalAtomicExchange64
             | Opcode::GlobalAtomicIAdd32x2
             | Opcode::GlobalAtomicSMin32x2
@@ -5828,10 +5832,10 @@ impl SpirvEmitContext {
             | Opcode::GlobalAtomicMinF32x2
             | Opcode::GlobalAtomicMaxF16x2
             | Opcode::GlobalAtomicMaxF32x2 => {
-                panic!(
-                    "SPIR-V: opcode {:?} is not implemented upstream",
+                std::panic::panic_any(crate::exception::NotImplementedException::new(format!(
+                    "SPIR-V opcode {:?}",
                     inst.opcode
-                );
+                )));
             }
 
             // Structured control flow is emitted from `Program::syntax_list`,

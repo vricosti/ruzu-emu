@@ -1834,6 +1834,21 @@ fn emit_inst(ctx: &mut EmitContext, program: &mut ir::Program, inst_ref: InstRef
         Opcode::StorageAtomicXor32 => {
             emit_storage_atomic_native(ctx, program, inst_ref, &inst_snapshot, "atomicXor", None);
         }
+        Opcode::StorageAtomicCompareExchange32 => {
+            super::emit_glsl_atomic::emit_storage_compare_exchange(
+                ctx,
+                program,
+                inst_ref,
+                &inst_snapshot,
+            );
+        }
+        Opcode::StorageAtomicCompareExchange64
+        | Opcode::GlobalAtomicCompareExchange32
+        | Opcode::GlobalAtomicCompareExchange64 => {
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "GLSL native 64-bit or unlowered global CAS",
+            ));
+        }
         Opcode::StorageAtomicExchange32 => {
             emit_storage_atomic_native(
                 ctx,
@@ -2760,6 +2775,39 @@ mod tests {
         assert!(source.contains("smem[(8u+4)>>2]=u2_0.y;"));
         assert!(!source.contains("packUint2x32(uvec2(smem"));
         assert!(!source.contains("unpackUint2x32(u2_0)"));
+    }
+
+    #[test]
+    fn glsl_storage_cas_returns_old_word() {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.info.storage_buffers_descriptors.push(
+            crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: true,
+            },
+        );
+        program.blocks.push(Block::new());
+        program.block_mut(0).append_inst(Inst::new(
+            Opcode::StorageAtomicCompareExchange32,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(16),
+                Value::ImmU32(17),
+                Value::ImmU32(29),
+            ],
+        ));
+        let source = emit_glsl(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &mut program,
+            &mut Bindings::default(),
+        );
+        assert!(
+            source.contains("atomicCompSwap(cs_ssbo0[16u>>2],17u,29u)"),
+            "{source}"
+        );
     }
 
     #[test]

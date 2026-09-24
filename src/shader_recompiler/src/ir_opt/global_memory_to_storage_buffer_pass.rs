@@ -77,6 +77,7 @@ fn is_global_memory(opcode: Opcode) -> bool {
             | Opcode::GlobalAtomicAnd32
             | Opcode::GlobalAtomicOr32
             | Opcode::GlobalAtomicXor32
+            | Opcode::GlobalAtomicCompareExchange32
             | Opcode::GlobalAtomicExchange32
             | Opcode::GlobalAtomicIAdd64
             | Opcode::GlobalAtomicSMin64
@@ -86,6 +87,7 @@ fn is_global_memory(opcode: Opcode) -> bool {
             | Opcode::GlobalAtomicAnd64
             | Opcode::GlobalAtomicOr64
             | Opcode::GlobalAtomicXor64
+            | Opcode::GlobalAtomicCompareExchange64
             | Opcode::GlobalAtomicExchange64
             | Opcode::GlobalAtomicIAdd32x2
             | Opcode::GlobalAtomicSMin32x2
@@ -126,6 +128,7 @@ fn is_global_memory_write(opcode: Opcode) -> bool {
             | Opcode::GlobalAtomicAnd32
             | Opcode::GlobalAtomicOr32
             | Opcode::GlobalAtomicXor32
+            | Opcode::GlobalAtomicCompareExchange32
             | Opcode::GlobalAtomicExchange32
             | Opcode::GlobalAtomicIAdd64
             | Opcode::GlobalAtomicSMin64
@@ -135,6 +138,7 @@ fn is_global_memory_write(opcode: Opcode) -> bool {
             | Opcode::GlobalAtomicAnd64
             | Opcode::GlobalAtomicOr64
             | Opcode::GlobalAtomicXor64
+            | Opcode::GlobalAtomicCompareExchange64
             | Opcode::GlobalAtomicExchange64
             | Opcode::GlobalAtomicIAdd32x2
             | Opcode::GlobalAtomicSMin32x2
@@ -181,6 +185,7 @@ fn global_to_storage(opcode: Opcode) -> Option<Opcode> {
         Opcode::GlobalAtomicAnd32 => Opcode::StorageAtomicAnd32,
         Opcode::GlobalAtomicOr32 => Opcode::StorageAtomicOr32,
         Opcode::GlobalAtomicXor32 => Opcode::StorageAtomicXor32,
+        Opcode::GlobalAtomicCompareExchange32 => Opcode::StorageAtomicCompareExchange32,
         Opcode::GlobalAtomicExchange32 => Opcode::StorageAtomicExchange32,
         Opcode::GlobalAtomicIAdd64 => Opcode::StorageAtomicIAdd64,
         Opcode::GlobalAtomicSMin64 => Opcode::StorageAtomicSMin64,
@@ -190,6 +195,7 @@ fn global_to_storage(opcode: Opcode) -> Option<Opcode> {
         Opcode::GlobalAtomicAnd64 => Opcode::StorageAtomicAnd64,
         Opcode::GlobalAtomicOr64 => Opcode::StorageAtomicOr64,
         Opcode::GlobalAtomicXor64 => Opcode::StorageAtomicXor64,
+        Opcode::GlobalAtomicCompareExchange64 => Opcode::StorageAtomicCompareExchange64,
         Opcode::GlobalAtomicExchange64 => Opcode::StorageAtomicExchange64,
         Opcode::GlobalAtomicIAdd32x2 => Opcode::StorageAtomicIAdd32x2,
         Opcode::GlobalAtomicSMin32x2 => Opcode::StorageAtomicSMin32x2,
@@ -463,14 +469,12 @@ fn replace_write(program: &mut Program, inst: InstRef, storage_index: u32, offse
 }
 
 fn replace_atomic(program: &mut Program, inst: InstRef, storage_index: u32, offset: Value) {
-    let source = program.block(inst.block).inst(inst.inst).args[1];
+    // CAS has both a comparator and a replacement; preserve all data operands.
+    let sources = program.block(inst.block).inst(inst.inst).args[1..].to_vec();
     let new_opcode = storage_opcode(program.block(inst.block).inst(inst.inst).opcode);
-    let value = insert_before(
-        program,
-        inst,
-        new_opcode,
-        vec![Value::ImmU32(storage_index), offset, source],
-    );
+    let mut args = vec![Value::ImmU32(storage_index), offset];
+    args.extend(sources);
+    let value = insert_before(program, inst, new_opcode, args);
     replace_uses_with(program, inst, value);
     program
         .block_mut(inst.block)
@@ -510,6 +514,7 @@ fn replace(program: &mut Program, storage_inst: StorageInst, storage_index: u32,
         | Opcode::GlobalAtomicAnd32
         | Opcode::GlobalAtomicOr32
         | Opcode::GlobalAtomicXor32
+        | Opcode::GlobalAtomicCompareExchange32
         | Opcode::GlobalAtomicExchange32
         | Opcode::GlobalAtomicIAdd64
         | Opcode::GlobalAtomicSMin64
@@ -519,6 +524,7 @@ fn replace(program: &mut Program, storage_inst: StorageInst, storage_index: u32,
         | Opcode::GlobalAtomicAnd64
         | Opcode::GlobalAtomicOr64
         | Opcode::GlobalAtomicXor64
+        | Opcode::GlobalAtomicCompareExchange64
         | Opcode::GlobalAtomicExchange64
         | Opcode::GlobalAtomicIAdd32x2
         | Opcode::GlobalAtomicSMin32x2
@@ -625,6 +631,108 @@ mod tests {
     use super::*;
     use crate::ir::basic_block::Block;
     use crate::ir::types::ShaderStage;
+
+    #[test]
+    fn cas_lowering_preserves_both_operands_and_side_effects() {
+        for (global, storage, compare, replacement) in [
+            (
+                Opcode::GlobalAtomicCompareExchange32,
+                Opcode::StorageAtomicCompareExchange32,
+                Value::ImmU32(17),
+                Value::ImmU32(29),
+            ),
+            (
+                Opcode::GlobalAtomicCompareExchange64,
+                Opcode::StorageAtomicCompareExchange64,
+                Value::ImmU64(0x100000011),
+                Value::ImmU64(0x200000029),
+            ),
+        ] {
+            assert!(is_global_memory(global));
+            assert!(is_global_memory_write(global));
+            assert!(global.may_have_side_effects());
+            assert!(storage.may_have_side_effects());
+            let mut program = Program::new(ShaderStage::Compute);
+            program.blocks.push(Block::new());
+            let index = program.block_mut(0).append_inst(Inst::new(
+                global,
+                vec![Value::ImmU64(4096), compare, replacement],
+            ));
+            replace_atomic(
+                &mut program,
+                InstRef {
+                    block: 0,
+                    inst: index,
+                },
+                3,
+                Value::ImmU32(24),
+            );
+            let emitted = program
+                .block(0)
+                .iter()
+                .find(|i| i.opcode == storage)
+                .unwrap();
+            assert_eq!(
+                emitted.args,
+                vec![Value::ImmU32(3), Value::ImmU32(24), compare, replacement]
+            );
+        }
+    }
+
+    #[test]
+    fn cas_global_pass_discovers_writable_descriptor_and_tracks_width() {
+        use crate::ir::emitter::Emitter;
+        use crate::ir::types::Type;
+        for wide in [false, true] {
+            let mut program = Program::new(ShaderStage::Compute);
+            program.blocks.push(Block::new());
+            program.post_order_blocks = vec![0];
+            let cbuf = program.block_mut(0).append_inst(Inst::new(
+                Opcode::GetCbufU32,
+                vec![Value::ImmU32(0), Value::ImmU32(0x100)],
+            ));
+            let mut ir = Emitter::new(&mut program, 0);
+            let pair = ir.composite_construct_u32x2(
+                Value::Inst(InstRef {
+                    block: 0,
+                    inst: cbuf,
+                }),
+                Value::ImmU32(0),
+            );
+            let address = ir.pack_uint_2x32(pair);
+            let (compare, replacement) = if wide {
+                (Value::ImmU64(17), Value::ImmU64(29))
+            } else {
+                (Value::ImmU32(17), Value::ImmU32(29))
+            };
+            ir.global_atomic_compare_exchange(address, compare, replacement, wide);
+            global_memory_to_storage_buffer_pass(
+                &mut program,
+                &HostTranslateInfo {
+                    support_int64: true,
+                    min_ssbo_alignment: 0x100,
+                    ..Default::default()
+                },
+            );
+            super::super::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+            assert_eq!(program.info.storage_buffers_descriptors.len(), 1);
+            assert!(program.info.storage_buffers_descriptors[0].is_written);
+            let opcode = if wide {
+                Opcode::StorageAtomicCompareExchange64
+            } else {
+                Opcode::StorageAtomicCompareExchange32
+            };
+            let atomic = program
+                .block(0)
+                .iter()
+                .find(|i| i.opcode == opcode)
+                .unwrap();
+            assert_eq!(&atomic.args[2..], &[compare, replacement]);
+            let ty = if wide { Type::U64 } else { Type::U32 };
+            assert_ne!(program.info.used_storage_buffer_types & ty as u32, 0);
+            assert_eq!(program.info.uses_int64_bit_atomics, wide);
+        }
+    }
 
     #[test]
     fn global_load_with_u32_low_address_rewrites_to_storage_load() {

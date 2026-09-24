@@ -27,6 +27,14 @@ pub fn emit_program(ctx: &mut EmitContext, program: &ir::Program) {
 /// Emit a single IR instruction as GLASM.
 fn emit_inst(ctx: &mut EmitContext, inst: &ir::instruction::Inst) {
     match inst.opcode {
+        Opcode::GlobalAtomicCompareExchange32
+        | Opcode::GlobalAtomicCompareExchange64
+        | Opcode::StorageAtomicCompareExchange32
+        | Opcode::StorageAtomicCompareExchange64 => {
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "GLASM compare-exchange",
+            ));
+        }
         // Arithmetic - float
         Opcode::FPAdd32 => ctx.add_line("ADD.F RC.x,RC.x,RC.y;"),
         Opcode::FPMul32 => ctx.add_line("MUL.F RC.x,RC.x,RC.y;"),

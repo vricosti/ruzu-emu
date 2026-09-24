@@ -299,6 +299,7 @@ fn visit_usages(info: &mut Info, opcode: Opcode) {
             | Opcode::GlobalAtomicAnd64
             | Opcode::GlobalAtomicOr64
             | Opcode::GlobalAtomicXor64
+            | Opcode::GlobalAtomicCompareExchange64
             | Opcode::GlobalAtomicExchange64
             | Opcode::StorageAtomicIAdd64
             | Opcode::StorageAtomicSMin64
@@ -308,6 +309,7 @@ fn visit_usages(info: &mut Info, opcode: Opcode) {
             | Opcode::StorageAtomicAnd64
             | Opcode::StorageAtomicOr64
             | Opcode::StorageAtomicXor64
+            | Opcode::StorageAtomicCompareExchange64
             | Opcode::StorageAtomicExchange64
     ) {
         info.uses_int64 = true;
@@ -466,6 +468,7 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 | Opcode::GlobalAtomicAnd64
                 | Opcode::GlobalAtomicOr64
                 | Opcode::GlobalAtomicXor64
+                | Opcode::GlobalAtomicCompareExchange64
                 | Opcode::GlobalAtomicExchange64
                 | Opcode::StorageAtomicIAdd64
                 | Opcode::StorageAtomicSMin64
@@ -475,6 +478,7 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 | Opcode::StorageAtomicAnd64
                 | Opcode::StorageAtomicOr64
                 | Opcode::StorageAtomicXor64
+                | Opcode::StorageAtomicCompareExchange64
                 | Opcode::StorageAtomicExchange64 => {
                     program.info.used_storage_buffer_types |=
                         (Type::U64 as u32) | (Type::U32x2 as u32);
@@ -727,6 +731,7 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 | Opcode::StorageAtomicAnd32
                 | Opcode::StorageAtomicOr32
                 | Opcode::StorageAtomicXor32
+                | Opcode::StorageAtomicCompareExchange32
                 | Opcode::StorageAtomicExchange32 => {
                     program.info.used_storage_buffer_types |= Type::U32 as u32;
                 }
@@ -820,6 +825,7 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 | Opcode::GlobalAtomicAnd32
                 | Opcode::GlobalAtomicOr32
                 | Opcode::GlobalAtomicXor32
+                | Opcode::GlobalAtomicCompareExchange32
                 | Opcode::GlobalAtomicExchange32
                 | Opcode::GlobalAtomicIAdd64
                 | Opcode::GlobalAtomicSMin64
@@ -829,6 +835,7 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 | Opcode::GlobalAtomicAnd64
                 | Opcode::GlobalAtomicOr64
                 | Opcode::GlobalAtomicXor64
+                | Opcode::GlobalAtomicCompareExchange64
                 | Opcode::GlobalAtomicExchange64
                 | Opcode::GlobalAtomicIAdd32x2
                 | Opcode::GlobalAtomicSMin32x2

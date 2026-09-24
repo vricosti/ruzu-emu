@@ -18451,3 +18451,230 @@ HID bus backing for global 4 GiB and per-game 12 GiB; this is not a game boot.
 - Not applicable: internal lifetime only. Regression uses real RoInterface command 4, retains each kernel endpoint, destroys the ServerManager session, verifies the handler is gone and context 0 is reused across six processes. Test failed before the fix with `closed session retained RoInterface`.
 - Validation: the regression now passes, along with all 26 ServerManager tests and nine RO tests. Full core suite still aborts with 0xc0000005 (D:/tmp/ruzu-ro-destruction-core-tests.log); no full-suite success claim.
 - build.bat succeeded in 3m59s and refreshed the standalone Release executable, with the two pre-existing GUI warnings. Actual document switching remains to be retested.
+
+## 2026-09-24 — Issue #14: ATOM.CAS support and GPU panic
+
+User-authorized extension beyond Eden, which throws for ATOM_cas. Encoding reference:
+https://github.com/chaotic-cx/mesa-mirror/blob/main/src/nouveau/compiler/nak/sm50.rs
+(`OpAtom::legalize` and `OpAtom::encode`). Only packed layout is implemented.
+
+Validation: 592 shader_recompiler tests passed with RUZU_SPIRV_VAL enabled;
+Vulkan SDK spirv-val accepted native 32/64-bit CAS modules for Vulkan 1.2.
+Final build.bat Release build succeeded in 2m30s and refreshed
+build/x86_64-pc-windows-msvc/release/ruzu.exe. Five pre-existing GUI warnings
+remain. The original failing game has not been tested in this implementation pass.
+
+Scope: Vulkan supports 32/64-bit storage CAS (64-bit requires native GPU support);
+GLSL/native MSL support 32-bit storage CAS. Unsupported capabilities, unlowered
+global CAS and GLASM CAS fail explicitly. ATOMS_cas and SUATOM_cas are separate
+instructions and remain outside this change.
+
+## 2026-09-24 — src/shader_recompiler/src/ir/opcodes.rs vs Eden src/shader_recompiler/frontend/ir/opcodes.inc and microinstruction.cpp
+
+### Intentional differences
+- Add Global/StorageAtomicCompareExchange32/64 metadata and side effects; comparator and replacement are separate operands.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/ir/emitter.rs vs Eden src/shader_recompiler/frontend/ir/ir_emitter.h and ir_emitter.cpp
+
+### Intentional differences
+- Add the compare-exchange builder to the existing emitter owner, returning the old memory value.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/ir_opt/global_memory_to_storage_buffer_pass.rs vs Eden src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+
+### Intentional differences
+- Extend global read/write classification and mapping; preserve both CAS data operands during ReplaceAtomic. Tests cover descriptor discovery, write tracking and operand preservation.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/ir_opt/collect_shader_info_pass.rs vs Eden src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+
+### Intentional differences
+- Track CAS storage views, global memory usage and native int64 atomic requirements alongside existing exchange operations.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/ir_opt/lower_int64_to_int32.rs vs Eden src/shader_recompiler/ir_opt/lower_int64_to_int32.cpp
+
+### Intentional differences
+- Reject 64-bit CAS with a typed shader exception when int64 lowering is required; two non-atomic words would not preserve CAS semantics.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/backend/spirv/emit_spirv_atomic.rs vs Eden src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp and emit_spirv_instructions.h
+
+### Intentional differences
+- Emit native OpAtomicCompareExchange with replacement before comparator, Device scope and relaxed ordering. Wide CAS requires native int64 atomics and descriptor aliasing. No non-atomic fallback.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs Eden src/shader_recompiler/backend/spirv/spirv_emit_context.h and spirv_emit_context.cpp
+
+### Intentional differences
+- Dispatch storage CAS to the atomic owner; include global CAS in the unsupported-opcode branch and use a typed shader exception there, matching upstream exception handling.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/backend/glsl/emit_glsl_atomic.rs vs Eden src/shader_recompiler/backend/glsl/emit_glsl_atomic.cpp
+
+### Intentional differences
+- Emit atomicCompSwap for 32-bit storage CAS through the existing variable allocator, returning the old word.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/backend/glsl/emit_glsl.rs vs Eden src/shader_recompiler/backend/glsl/emit_glsl.cpp and emit_glsl.h
+
+### Intentional differences
+- Dispatch storage CAS to the atomic owner; reject wide and unlowered global CAS explicitly. Add generated-source regression.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/backend/msl/emit_msl_atomic.rs vs Eden src/shader_recompiler/backend/glsl/emit_glsl_atomic.cpp (ownership analogue; Eden has no native MSL backend)
+
+### Intentional differences
+- Implement strong 32-bit storage CAS using Metal weak compare-exchange, retrying only spurious failures and preserving the original comparator.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/backend/msl/emit_msl.rs vs Eden src/shader_recompiler/backend/glsl/emit_glsl.cpp (ownership analogue; Eden has no native MSL backend)
+
+### Intentional differences
+- Dispatch 32-bit storage CAS and reject unsupported wide/global cases via MslError. Test generated operand order and weak-CAS retry condition.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/backend/glasm/emit_glasm.rs vs Eden src/shader_recompiler/backend/glasm/emit_glasm.cpp
+
+### Intentional differences
+- Reject CAS with a typed shader exception rather than allowing the missing-opcode placeholder.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/frontend/translate/not_implemented.rs vs Eden src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp and impl.h
+
+### Intentional differences
+- Remove only ATOM_cas from the stub owner. The method remains on TranslatorVisitor and is implemented in the existing global atomic module.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- None identified in the modified slice during the implementation review.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-09-24 — src/shader_recompiler/src/frontend/translate/atomic_operations_global_memory.rs vs Eden src/shader_recompiler/frontend/maxwell/translate/impl/atomic_operations_global_memory.cpp and impl.h
+
+### Intentional differences
+- Add ATOM.CAS using Mesa NAK SM50 encoding: destination bits 0..8, address 8..16, packed source 20..28, displacement 28..48, extended address bit 48, width bit 49, layout bits 50..52. Packed sources contain comparator then replacement; all sources are read before destination writes. RZ discards the result, not the memory effect. Reject unsupported layouts and invalid wide tuples with typed errors. Reuse AtomOffset with explicit extended-RZ absolute addressing.
+- CAS is an explicit extension beyond upstream, retaining existing module ownership.
+
+### Unintentional differences (to fix)
+- Fixed two existing AtomOpNotApplicable mismatches found on upstream reread: U32 INC/DEC are loads, and S64 bitwise/exchange operations must not be rejected. Regression assertions updated.
+
+### Missing items
+- Capability/backend limits and pending game validation are recorded in the issue summary above.
+
+### Binary layout verification
+- No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.

@@ -176,6 +176,26 @@ pub fn emit_storage_atomic(
     context.define(inst_ref, Type::U32, expression, false)
 }
 
+/// Strong CAS built from Metal's weak primitive: retry only spurious failures.
+pub fn emit_storage_compare_exchange(
+    context: &mut MslEmitContext,
+    inst_ref: InstRef,
+    inst: &Inst,
+) -> Result<(), MslError> {
+    let binding = immediate_binding(inst)?;
+    let word = context.storage_buffer_word_expression(inst_ref, binding, inst.arg(1), 0)?;
+    let compare = context.value_expression(inst.arg(2), inst_ref, 2)?;
+    let replacement = context.value_expression(inst.arg(3), inst_ref, 3)?;
+    let prefix = format!("cas_{}_{}", inst_ref.block, inst_ref.inst);
+    context.emit_statement(&format!("uint {prefix}_compare = {compare};"));
+    context.emit_statement(&format!("uint {prefix}_replacement = {replacement};"));
+    context.emit_statement(&format!("uint {prefix}_old = {prefix}_compare;"));
+    context.emit_statement(&format!(
+        "while (!atomic_compare_exchange_weak_explicit(reinterpret_cast<device atomic_uint*>(&{word}), &{prefix}_old, {prefix}_replacement, memory_order_relaxed, memory_order_relaxed) && {prefix}_old == {prefix}_compare) {{}}"
+    ));
+    context.define(inst_ref, Type::U32, format!("{prefix}_old"), false)
+}
+
 pub fn emit_storage_atomic_fp(
     context: &mut MslEmitContext,
     inst_ref: InstRef,

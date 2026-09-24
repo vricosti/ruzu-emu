@@ -718,6 +718,43 @@ fn pack_half_2x16(ctx: &mut SpirvEmitContext, value: Word) -> Word {
         .unwrap()
 }
 
+/// Ruzu extension; never fall back to non-atomic loads/stores for CAS.
+fn storage_compare_exchange(
+    ctx: &mut SpirvEmitContext,
+    binding: ir::Value,
+    offset: ir::Value,
+    compare: Word,
+    replacement: Word,
+    wide: bool,
+) -> Word {
+    let (pointer, ty) = if wide {
+        if !ctx.profile.support_int64_atomics || !ctx.profile.support_descriptor_aliasing {
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "64-bit storage CAS without native int64 atomics and descriptor aliasing",
+            ));
+        }
+        (
+            storage_pointer_typed(ctx, StorageDefinitionKind::U64, binding, offset, 8),
+            ctx.u64_type,
+        )
+    } else {
+        (storage_pointer(ctx, binding, offset), ctx.u32_type)
+    };
+    let (scope, semantics) = atomic_args(ctx);
+    ctx.builder
+        .atomic_compare_exchange(
+            ty,
+            None,
+            pointer,
+            scope,
+            semantics,
+            semantics,
+            replacement,
+            compare,
+        )
+        .unwrap()
+}
+
 pub fn emit_storage_atomic(
     ctx: &mut SpirvEmitContext,
     inst: &ir::Inst,
@@ -728,6 +765,17 @@ pub fn emit_storage_atomic(
     let offset = *inst.arg(1);
     let value = ctx.resolve_value(inst.arg(2));
     let result = match inst.opcode {
+        Opcode::StorageAtomicCompareExchange32 | Opcode::StorageAtomicCompareExchange64 => {
+            let replacement = ctx.resolve_value(inst.arg(3));
+            storage_compare_exchange(
+                ctx,
+                binding,
+                offset,
+                value,
+                replacement,
+                inst.opcode == Opcode::StorageAtomicCompareExchange64,
+            )
+        }
         Opcode::StorageAtomicIAdd32 => emit_storage_atomic_iadd_32(ctx, binding, offset, value),
         Opcode::StorageAtomicSMin32 => emit_storage_atomic_smin_32(ctx, binding, offset, value),
         Opcode::StorageAtomicUMin32 => emit_storage_atomic_umin_32(ctx, binding, offset, value),
@@ -863,6 +911,109 @@ mod tests {
                     .any(|instruction| instruction.class.opcode == opcode)
             })
         })
+    }
+
+    #[test]
+    fn cas_emits_native_compare_exchange_with_replacement_before_comparator() {
+        for wide in [false, true] {
+            let mut program = ir::Program::new(ShaderStage::Compute);
+            program.blocks.push(Block::new());
+            let opcode = if wide {
+                Opcode::StorageAtomicCompareExchange64
+            } else {
+                Opcode::StorageAtomicCompareExchange32
+            };
+            let (compare, replacement) = if wide {
+                (Value::ImmU64(17), Value::ImmU64(29))
+            } else {
+                (Value::ImmU32(17), Value::ImmU32(29))
+            };
+            program.block_mut(0).append_inst(Inst::new(
+                opcode,
+                vec![Value::ImmU32(0), Value::ImmU32(16), compare, replacement],
+            ));
+            program.info.used_storage_buffer_types = if wide {
+                Type::U64 as u32
+            } else {
+                Type::U32 as u32
+            };
+            program.info.uses_int64 = wide;
+            program.info.uses_int64_bit_atomics = wide;
+            program.info.storage_buffers_descriptors = vec![StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: true,
+            }];
+            program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+            let profile = Profile {
+                support_int64: true,
+                support_int64_atomics: true,
+                support_descriptor_aliasing: true,
+                ..Profile::default()
+            };
+            let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
+            ctx.emit_program(&program);
+            let atom = ctx
+                .builder
+                .module_ref()
+                .functions
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.instructions)
+                .find(|i| i.class.opcode == spirv::Op::AtomicCompareExchange)
+                .unwrap();
+            for (operand, expected) in [(4, 29u64), (5, 17u64)] {
+                let id = atom.operands[operand].unwrap_id_ref();
+                let constant = ctx
+                    .builder
+                    .module_ref()
+                    .types_global_values
+                    .iter()
+                    .find(|i| i.result_id == Some(id))
+                    .unwrap();
+                assert_eq!(
+                    constant.operands[0],
+                    if wide {
+                        rspirv::dr::Operand::LiteralBit64(expected)
+                    } else {
+                        rspirv::dr::Operand::LiteralBit32(expected as u32)
+                    }
+                );
+            }
+            assert!(!contains_opcode(&ctx, spirv::Op::Store));
+            if let Some(validator) = std::env::var_os("RUZU_SPIRV_VAL") {
+                use rspirv::binary::Assemble;
+                let words = ctx.builder.module().assemble();
+                let path = std::env::temp_dir()
+                    .join(format!("ruzu-cas-{}-{wide}.spv", std::process::id()));
+                let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                std::fs::write(&path, bytes).unwrap();
+                let output = std::process::Command::new(validator)
+                    .args(["--target-env", "vulkan1.2"])
+                    .arg(&path)
+                    .output()
+                    .unwrap();
+                let _ = std::fs::remove_file(path);
+                assert!(
+                    output.status.success(),
+                    "CAS SPIR-V invalid: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cas_64_rejects_missing_native_atomics() {
+        let program = ir::Program::new(ShaderStage::Compute);
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            storage_compare_exchange(&mut ctx, Value::ImmU32(0), Value::ImmU32(0), 0, 0, true);
+        }));
+        assert!(result
+            .unwrap_err()
+            .is::<crate::exception::NotImplementedException>());
     }
 
     fn emit_exchange_64(profile: Profile) -> SpirvEmitContext {

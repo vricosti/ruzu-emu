@@ -1,5 +1,6 @@
 """Packaging regressions without a GPU, network, root access or Cargo build."""
 import hashlib
+import io
 import importlib.util
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+from contextlib import redirect_stdout
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("package_appimage", ROOT / "scripts/package-appimage.py")
@@ -16,6 +18,45 @@ SPEC.loader.exec_module(PACKAGE)
 
 
 class AppImageTests(unittest.TestCase):
+    def test_generic_package_name_and_guidance(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("target/release/ruzu", "dist/linux/AppRun", "LICENSE"):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"test")
+            metadata = []
+
+            def fake_run(*args, **kwargs):
+                output = ""
+                if args[0] == "readelf":
+                    output = "Advanced Micro Devices X86-64"
+                elif args[0] == "sh":
+                    output = "v0.1.1-rc1\n"
+                elif "--output" in args:
+                    Path(kwargs["env"]["OUTPUT"]).write_bytes(b"packaged")
+                    appdir = Path(args[args.index("--appdir") + 1])
+                    metadata.append((appdir / "usr/share/doc/ruzu/build-info.txt").read_text())
+                return subprocess.CompletedProcess(args, 0, stdout=output)
+
+            output = io.StringIO()
+            with patch.dict(os.environ, {"CARGO_TARGET_DIR": "", "CARGO_BUILD_TARGET": "",
+                                         "XDG_CACHE_HOME": str(root / "cache")}), \
+                    patch.object(PACKAGE.platform, "system", return_value="Linux"), \
+                    patch.object(PACKAGE.platform, "machine", return_value="x86_64"), \
+                    patch.object(PACKAGE.shutil, "which", return_value="/mock/tool"), \
+                    patch.object(PACKAGE, "download", side_effect=lambda cache, name, _: cache / name), \
+                    patch.object(PACKAGE, "run", side_effect=fake_run), \
+                    patch.object(PACKAGE, "remove_plugin_overrides"), \
+                    patch.object(PACKAGE, "glibc_requirement", return_value="2.39"), \
+                    redirect_stdout(output):
+                PACKAGE.package(root)
+            artifact = root / "target/release/Ruzu-Linux-v0.1.1-rc1-x86_64.AppImage"
+            self.assertEqual(artifact.read_bytes(), b"packaged")
+            self.assertIn(str(artifact), output.getvalue())
+            self.assertIn("target Linux distributions", output.getvalue())
+            self.assertNotIn("Steam Deck", output.getvalue() + "".join(metadata))
+
     def test_plugin_overrides_removed_before_final_packaging(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -113,7 +113,7 @@ def package(root):
     deploy_image = download(cache, "linuxdeploy-x86_64.AppImage", LINUXDEPLOY)
     download(cache, "linuxdeploy-plugin-gtk.sh", GTK_PLUGIN)
     runtime = download(cache, "runtime-x86_64", RUNTIME)
-    output_name = f"Ruzu-{revision}-x86_64.AppImage"
+    output_name = f"Ruzu-Linux-{revision}-x86_64.AppImage"
     with tempfile.TemporaryDirectory(prefix="appimage-", dir=binary.parent) as temp:
         work = Path(temp)
         run(str(deploy_image), "--appimage-extract", cwd=work, stdout=subprocess.DEVNULL)
@@ -142,7 +142,7 @@ def package(root):
         shutil.copy2(root / "LICENSE", info / "LICENSE")
         (info / "build-info.txt").write_text(
             f"Revision: {revision}\nArchitecture: x86_64\nRequired GLIBC: {minimum}\n"
-            "Graphics drivers: supplied by host. Steam Deck validation required.\n")
+            "Graphics drivers: supplied by host. Target Linux distribution validation required.\n")
         run(str(deploy), "--appdir", str(appdir), "--custom-apprun", str(launcher),
             "--output", "appimage", *excludes, env=env, cwd=work)
         current_revision = run("sh", str(root / "scripts/package-revision.sh"), str(root),
@@ -157,7 +157,7 @@ def package(root):
         artifact.replace(binary.parent / output_name)
     print(f"Created {binary.parent / output_name}\nSHA256: {checksum}\n"
           f"Requires GLIBC >= {minimum} and compatible host graphics drivers.\n"
-          "Test on Steam Deck before distribution; packaging is not a compatibility guarantee.")
+          "Test on the target Linux distributions before distribution; packaging is not a compatibility guarantee.")
 
 
 if __name__ == "__main__":

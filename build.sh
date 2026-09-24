@@ -19,8 +19,8 @@ bundled runtime libraries and X11 forced like Eden's AppImage.
 Output: target/steamdeck/artifacts/. See docs/steamdeck-appimage.md.
 
 The appimage command builds a Linux x86_64 release and packages it as
-target/release/Ruzu-<Git revision>-x86_64.AppImage (no commit, tag or push).
-The host glibc and graphics drivers must be compatible; test on Steam Deck
+target/release/Ruzu-Linux-<Git revision>-x86_64.AppImage (no commit, tag or push).
+The host glibc and graphics drivers must be compatible; test on target Linux distributions
 before distributing the package.
 
 The package command builds a release and creates, on macOS,

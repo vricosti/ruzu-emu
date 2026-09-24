@@ -1,8 +1,8 @@
 //! Port of eden/src/common/sparse_large_vector.h and
-//! eden/src/common/sparse_large_vector.cpp (Eden 5f142c7926, which replaced
-//! `virtual_buffer.h/.cpp`).
+//! eden/src/common/sparse_large_vector.cpp (Eden 38df54edfe: decommit zeroed
+//! pages; originally 5f142c7926, which replaced `virtual_buffer.h/.cpp`).
 //! Status: COMPLET
-//! Derniere synchro: 2026-09-11
+//! Derniere synchro: 2026-09-24
 //!
 //! A large page-aligned buffer with optimized memory usage for zero-writes.
 //! The whole region is only *reserved* (read-only on POSIX, `MEM_RESERVE` on
@@ -83,9 +83,10 @@ mod win {
     /// Upstream `static std::once_flag flag` guarding
     /// `AddVectoredExceptionHandler(1, FakePageFaultHandler)`.
     pub(super) static INSTALL_HANDLER: Once = Once::new();
-    // Serialize demand-read commits with normal write commits so a competing
-    // reader cannot downgrade a page while another thread starts using it.
-    static COMMIT_LOCK: Mutex<()> = Mutex::new(());
+    // Serialize demand-read commits, normal write commits and decommits.
+    // Ordinary JIT loads do not take this lock. Owners still serialize table
+    // mutations (KPageTableBase::m_general_lock); this is not a data-access lock.
+    pub(super) static COMMIT_LOCK: Mutex<()> = Mutex::new(());
 
     /// Upstream `FakePageFaultHandler`: workaround for handling non-committed
     /// memory accessed by Dynarmic; usually the result of an error.
@@ -198,6 +199,72 @@ mod win {
 
 #[cfg(windows)]
 pub use win::commit_vector_page;
+
+/// Upstream `Common::DecommitVectorPage` (38df54edfe).
+/// Keeps the virtual reservation but discards backing for one whole host page.
+/// Unlike upstream, returns OS failure so the caller cannot silently publish
+/// a cleared bitmap while stale data remains readable by the JIT.
+///
+/// # Safety
+/// `base` must be host-page aligned in a live vector reservation. The caller
+/// must serialize mutations and ensure no outstanding references need its data.
+/// On non-Linux Unix, the page must be writable for the explicit zero-fill.
+pub unsafe fn decommit_vector_page(base: usize) -> bool {
+    debug_assert_eq!(base & (host_page_size() as usize - 1), 0);
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_DECOMMIT};
+        let Ok(_guard) = win::COMMIT_LOCK.lock() else {
+            return false;
+        };
+        unsafe { VirtualFree(base as *mut _, host_page_size() as usize, MEM_DECOMMIT) != 0 }
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // Anonymous private mappings read as zero after MADV_DONTNEED.
+        unsafe {
+            libc::madvise(
+                base as *mut _,
+                host_page_size() as usize,
+                libc::MADV_DONTNEED,
+            ) == 0
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+    {
+        // Upstream: MADV_FREE, with MADV_DONTNEED fallback where unavailable.
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+            target_os = "solaris",
+            target_os = "haiku",
+            target_os = "emscripten",
+            target_os = "illumos"
+        ))]
+        let advice = libc::MADV_FREE;
+        #[cfg(not(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+            target_os = "solaris",
+            target_os = "haiku",
+            target_os = "emscripten",
+            target_os = "illumos"
+        )))]
+        let advice = libc::MADV_DONTNEED;
+        if unsafe { libc::madvise(base as *mut _, host_page_size() as usize, advice) } != 0 {
+            return false;
+        }
+        // MADV_FREE alone does not guarantee zeroes on the next read.
+        unsafe { ptr::write_bytes(base as *mut u8, 0, host_page_size() as usize) };
+        true
+    }
+}
 
 /// Upstream `Common::AllocateMemoryPages`: reserves `size` bytes (page
 /// aligned). The pages are read-only on POSIX and reserved-only on Windows
@@ -412,10 +479,8 @@ impl<T> SparseLargeVector<T> {
     /// Zeroes the elements in `[start, end_)`, skipping host pages that were
     /// never committed (they already read as zero).
     ///
-    /// Upstream `ZeroRegion`. Upstream checks `IsCommittedPage(start / sizeof(T))`
-    /// for the first partial page; `start` is already an element index (every
-    /// other `IsCommittedPage` caller passes one), so the port checks
-    /// `is_committed_page(start)`.
+    /// Upstream `ZeroRegion` at 38df54edfe: the first partial page uses an
+    /// element index, whole pages are decommitted, partial edges are zeroed.
     pub fn zero_region(&mut self, start: usize, end_: usize) {
         let host_page_size = host_page_size();
         let mut base = unsafe { self.base_ptr.add(start) } as u64;
@@ -436,14 +501,17 @@ impl<T> SparseLargeVector<T> {
 
         let mut page = base;
         while page < end {
-            if !self.is_committed_page((page - self.base_ptr as u64) as usize / size_of::<T>()) {
+            let index = (page - self.base_ptr as u64) as usize / size_of::<T>();
+            if !self.is_committed_page(index) {
                 page += host_page_size;
                 continue;
             }
 
-            unsafe {
-                ptr::write_bytes(page as *mut u8, 0, host_page_size.min(end - page) as usize)
-            };
+            if end - page >= host_page_size {
+                self.decommit_page(index);
+            } else {
+                unsafe { ptr::write_bytes(page as *mut u8, 0, (end - page) as usize) };
+            }
             page += host_page_size;
         }
     }
@@ -507,6 +575,25 @@ impl<T> SparseLargeVector<T> {
         }
     }
 
+    /// Upstream `DecommitPage`. As upstream, mutations require exclusive
+    /// ownership / the caller's page-table lock, not a lock on every JIT read.
+    fn decommit_page(&mut self, index: usize) {
+        let page_index = (index * size_of::<T>()) >> host_page_bits();
+        let word = &self.committed_pages[page_index >> 6];
+        let mask = 1u64 << (page_index & 63);
+        let page = (unsafe { self.base_ptr.add(index) } as usize) & host_page_mask() as usize;
+        word.fetch_and(!mask, Ordering::Release);
+        if !unsafe { decommit_vector_page(page) } {
+            // Restore bookkeeping before failing; never continue with stale
+            // backing and a bitmap claiming the page contains only zeros.
+            word.fetch_or(mask, Ordering::Release);
+            panic!(
+                "Failed to decommit SparseLargeVector page: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
     /// Upstream `CommitPage`.
     fn commit_page(&self, index: usize) {
         let page_index = (index * size_of::<T>()) >> host_page_bits();
@@ -563,6 +650,169 @@ unsafe impl<T: Sync> Sync for SparseLargeVector<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_region_decommits_full_pages_preserving_partial_edges() {
+        let per_page = host_page_size() as usize / size_of::<u64>();
+        let mut v = SparseLargeVector::<u64>::with_count(per_page * 4);
+        for i in 0..v.size() {
+            v.set(i, 123);
+        }
+        let base = v.data();
+        v.zero_region(per_page - 1, per_page * 3 + 1);
+        assert_eq!(v.data(), base, "reservation address must stay stable");
+        assert!(v.is_committed_page(0));
+        assert!(!v.is_committed_page(per_page));
+        assert!(!v.is_committed_page(per_page * 2));
+        assert!(v.is_committed_page(per_page * 3));
+        for i in 0..v.size() {
+            assert_eq!(
+                v[i],
+                if (per_page - 1..per_page * 3 + 1).contains(&i) {
+                    0
+                } else {
+                    123
+                }
+            );
+        }
+        v.commit_region(per_page, per_page * 3);
+        *v.get_unchecked_mut(per_page + 7) = 456;
+        assert_eq!(v[per_page + 7], 456);
+        assert_eq!(v[per_page * 2], 0);
+    }
+
+    #[test]
+    fn zero_region_first_partial_page_uses_element_index() {
+        let per_page = host_page_size() as usize / size_of::<u64>();
+        let mut v = SparseLargeVector::<u64>::with_count(per_page * 4);
+        // Page zero stays uncommitted. Dividing this index by sizeof(T)
+        // again (the upstream bug) incorrectly queries page zero.
+        v.set(per_page * 2 + 2, 99);
+        v.set(per_page * 2 + 3, 99);
+        v.zero_region(per_page * 2 + 3, per_page * 2 + 4);
+        assert_eq!(v[per_page * 2 + 2], 99);
+        assert_eq!(v[per_page * 2 + 3], 0);
+        assert!(v.is_committed_page(per_page * 2));
+    }
+
+    #[test]
+    fn aligned_zero_region_clears_bitmap_across_word_boundary_and_reuses_pages() {
+        let per_page = host_page_size() as usize / size_of::<u64>();
+        let mut v = SparseLargeVector::<u64>::with_count(per_page * 66);
+        for _ in 0..32 {
+            for page in [0, 62, 63, 64, 65] {
+                v.set(per_page * page, 77);
+            }
+            v.zero_region(0, per_page);
+            v.zero_region(per_page * 63, per_page * 65);
+            for page in [0, 63, 64] {
+                assert!(!v.is_committed_page(per_page * page));
+                assert_eq!(v[per_page * page], 0);
+            }
+            for page in [62, 65] {
+                assert!(v.is_committed_page(per_page * page));
+                assert_eq!(v[per_page * page], 77);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_commit_and_decommit_operations_are_serialized() {
+        let page = host_page_size() as usize;
+        let base = allocate_memory_pages(page) as usize;
+        let barrier = std::sync::Barrier::new(5);
+        // Exercise the shared OS-operation lock without racing Rust data
+        // accesses or pretending the vector supports concurrent mutations.
+        std::thread::scope(|scope| {
+            for write in [false, true, false, true] {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..256 {
+                        assert!(commit_vector_page(base, write));
+                    }
+                });
+            }
+            barrier.wait();
+            for _ in 0..256 {
+                assert!(unsafe { decommit_vector_page(base) });
+            }
+        });
+        assert!(commit_vector_page(base, true));
+        assert_eq!(unsafe { (base as *const u64).read_volatile() }, 0);
+        free_memory_pages(base as *mut u8, page);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_decommit_releases_backing_and_concurrent_raw_reads_recover() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RESERVE, PAGE_READONLY,
+            PAGE_READWRITE,
+        };
+        const CHILD: &str = "RUZU_SPARSE_DECOMMIT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "sparse_large_vector::tests::windows_decommit_releases_backing_and_concurrent_raw_reads_recover"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(
+                status.success(),
+                "decommit/raw-read subprocess failed: {status}"
+            );
+            return;
+        }
+        fn query(address: usize) -> MEMORY_BASIC_INFORMATION {
+            let mut info = unsafe { std::mem::zeroed() };
+            assert_ne!(
+                unsafe {
+                    VirtualQuery(
+                        address as *const _,
+                        &mut info,
+                        size_of::<MEMORY_BASIC_INFORMATION>(),
+                    )
+                },
+                0
+            );
+            info
+        }
+        let per_page = host_page_size() as usize / size_of::<u64>();
+        let mut v = SparseLargeVector::<u64>::with_count(per_page * 2);
+        let address = v.data() as usize;
+        for _ in 0..16 {
+            v.set(0, 42);
+            assert_eq!(query(address).Protect, PAGE_READWRITE);
+            v.zero_region(0, per_page);
+            let info = query(address);
+            assert_eq!(
+                info.State, MEM_RESERVE,
+                "must release backing, not just clear bitmap"
+            );
+            assert_eq!(info.AllocationBase as usize, address);
+            assert_eq!(v[0], 0);
+            assert_eq!(
+                query(address).State,
+                MEM_RESERVE,
+                "ordinary zero read must not commit"
+            );
+            let barrier = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        assert_eq!(unsafe { (address as *const u64).read_volatile() }, 0);
+                    });
+                }
+            });
+            assert_eq!(query(address).State, MEM_COMMIT);
+            assert_eq!(query(address).Protect, PAGE_READONLY);
+            assert!(!v.is_committed_page(0));
+            v.set(0, 17);
+            assert_eq!(query(address).Protect, PAGE_READWRITE);
+            assert_eq!(v[0], 17);
+        }
+    }
 
     #[cfg(windows)]
     #[test]

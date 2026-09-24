@@ -9,7 +9,9 @@
 //! Windows) and individual host pages are committed on demand, tracked in an
 //! atomic bitmap (`committed_pages`, 64 pages per word).
 //!
-//! Rust adaptations (documented, no behavioural change):
+//! Rust adaptations:
+//! - Windows fault recovery uses the inaccessible data address and live byte
+//!   ranges, and upgrades fault-committed zero pages before normal writes.
 //! - upstream `HostPageSize`/`HostPageBits`/`HostPageMask` are runtime globals
 //!   on POSIX; here they are the functions [`host_page_size`],
 //!   [`host_page_bits`] and [`host_page_mask`] on every platform.
@@ -64,7 +66,7 @@ const MAP_NOCORE: libc::c_int = 0;
 
 #[cfg(windows)]
 mod win {
-    use super::{host_page_bits, host_page_size};
+    use super::host_page_size;
     use std::sync::{Mutex, Once};
     use windows_sys::Win32::Foundation::{GetLastError, EXCEPTION_ACCESS_VIOLATION};
     use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -72,8 +74,8 @@ mod win {
         EXCEPTION_POINTERS,
     };
     use windows_sys::Win32::System::Memory::{
-        VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RESERVE,
-        PAGE_READONLY, PAGE_READWRITE,
+        VirtualAlloc, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
+        MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE,
     };
 
     /// Upstream `static std::vector<std::pair<u64, u64>> vector_regions`.
@@ -81,70 +83,55 @@ mod win {
     /// Upstream `static std::once_flag flag` guarding
     /// `AddVectoredExceptionHandler(1, FakePageFaultHandler)`.
     pub(super) static INSTALL_HANDLER: Once = Once::new();
+    // Serialize demand-read commits with normal write commits so a competing
+    // reader cannot downgrade a page while another thread starts using it.
+    static COMMIT_LOCK: Mutex<()> = Mutex::new(());
 
     /// Upstream `FakePageFaultHandler`: workaround for handling non-committed
     /// memory accessed by Dynarmic; usually the result of an error.
     ///
-    /// The region comparison against the page-shifted fault address is
-    /// ported as written upstream.
+    /// Intentional correction to upstream: ExceptionAddress is the instruction
+    /// pointer, not the inaccessible data address. Registered ranges are byte
+    /// addresses, not page numbers. Only recover reads inside a live vector.
     pub(super) unsafe extern "system" fn fake_page_fault_handler(
         info: *mut EXCEPTION_POINTERS,
     ) -> i32 {
+        if info.is_null() || unsafe { (*info).ExceptionRecord.is_null() } {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         let record = unsafe { &*(*info).ExceptionRecord };
-        let code = record.ExceptionCode;
-        let exception_addr = record.ExceptionAddress as u64;
-
-        if code != EXCEPTION_ACCESS_VIOLATION {
-            // Not our problem
+        if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
+            || record.NumberParameters < 2
+            || record.ExceptionInformation[0] != 0
+        {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-
-        let mut addr = 0u64;
-        let mut addr2 = 0u64;
-
-        let regions = VECTOR_REGIONS.lock().unwrap();
-        for region in regions.iter() {
-            let addr_shifted = exception_addr >> host_page_bits();
-            if region.0 <= addr_shifted && addr_shifted <= region.1 {
-                addr = addr_shifted;
-            }
-
-            // Page-boundary accesses
-            let addr_ = (exception_addr + 0x40) >> host_page_bits();
-            if addr_ != addr_shifted && region.0 <= addr_ && addr_ <= region.1 {
-                addr2 = addr_;
-            }
-
-            if addr != 0 || addr2 != 0 {
-                break;
-            }
-        }
-        drop(regions);
-
-        if addr == 0 && addr2 == 0 {
-            // Not our problem
+        let address = record.ExceptionInformation[1] as u64;
+        let Ok(regions) = VECTOR_REGIONS.lock() else {
+            return EXCEPTION_CONTINUE_SEARCH;
+        };
+        if !regions
+            .iter()
+            .any(|&(start, end)| start <= address && address < end)
+        {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-
-        log::error!(
-            "Accessing an unallocated region of a SparseLargeVector at {:#x}; this shouldn't happen and is likely a Dynarmic error!",
-            exception_addr
-        );
-
-        // Commit this region
-        if addr != 0 && !commit_vector_page((addr << host_page_bits()) as usize, false) {
-            return EXCEPTION_CONTINUE_SEARCH;
+        // Keep the region registered/allocated until commit finishes. If an
+        // instruction spans pages, Windows reports the next missing page on
+        // retry; never speculate outside the reservation with address + 0x40.
+        let page = address & super::host_page_mask();
+        if commit_vector_page(page as usize, false) {
+            EXCEPTION_CONTINUE_EXECUTION
+        } else {
+            EXCEPTION_CONTINUE_SEARCH
         }
-        // Commit next region if needed
-        if addr2 != 0 && !commit_vector_page((addr2 << host_page_bits()) as usize, false) {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-
-        EXCEPTION_CONTINUE_EXECUTION
     }
 
     /// Upstream `Common::CommitVectorPage`.
     pub fn commit_vector_page(addr: usize, write: bool) -> bool {
+        let Ok(_commit_guard) = COMMIT_LOCK.lock() else {
+            return false;
+        };
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let res = unsafe {
             VirtualQuery(
@@ -159,6 +146,22 @@ mod win {
                 addr,
                 unsafe { GetLastError() }
             );
+        } else if info.State == MEM_COMMIT {
+            if info.Protect == PAGE_READWRITE || (!write && info.Protect == PAGE_READONLY) {
+                return true;
+            }
+            if write && info.Protect == PAGE_READONLY {
+                let mut old_protect = 0;
+                return unsafe {
+                    VirtualProtect(
+                        addr as *const _,
+                        host_page_size() as usize,
+                        PAGE_READWRITE,
+                        &mut old_protect,
+                    )
+                } != 0;
+            }
+            return false;
         } else if info.State != MEM_RESERVE {
             log::error!(
                 "Tried to commit an unreserved large buffer region at {:#x} that is not mapped or is already committed (state {:#x})",
@@ -185,7 +188,10 @@ mod win {
 
     pub(super) fn install_fake_page_fault_handler() {
         INSTALL_HANDLER.call_once(|| unsafe {
-            AddVectoredExceptionHandler(1, Some(fake_page_fault_handler));
+            assert!(
+                !AddVectoredExceptionHandler(1, Some(fake_page_fault_handler)).is_null(),
+                "Failed to install SparseLargeVector page-fault handler"
+            );
         });
     }
 }
@@ -283,7 +289,9 @@ pub fn free_memory_pages(base: *mut u8, mut size: usize) {
     {
         use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
         let _ = size;
+        let mut regions = win::VECTOR_REGIONS.lock().unwrap();
         assert!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } != 0);
+        regions.retain(|&(start, _)| start != base as u64);
     }
     #[cfg(not(windows))]
     {
@@ -434,11 +442,7 @@ impl<T> SparseLargeVector<T> {
             }
 
             unsafe {
-                ptr::write_bytes(
-                    page as *mut u8,
-                    0,
-                    host_page_size.min(end - page) as usize,
-                )
+                ptr::write_bytes(page as *mut u8, 0, host_page_size.min(end - page) as usize)
             };
             page += host_page_size;
         }
@@ -512,7 +516,10 @@ impl<T> SparseLargeVector<T> {
         let page = (unsafe { self.base_ptr.add(index) } as usize) & host_page_mask() as usize;
         #[cfg(windows)]
         {
-            win::commit_vector_page(page, true);
+            assert!(
+                win::commit_vector_page(page, true),
+                "Failed to commit SparseLargeVector page"
+            );
         }
         #[cfg(not(windows))]
         unsafe {
@@ -556,6 +563,102 @@ unsafe impl<T: Sync> Sync for SparseLargeVector<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_raw_read_recovers_and_can_be_upgraded() {
+        // Isolate the real access violation so a broken handler fails this
+        // test without terminating the rest of the test harness.
+        const CHILD: &str = "RUZU_SPARSE_VECTOR_FAULT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sparse_large_vector::tests::windows_raw_read_recovers_and_can_be_upgraded",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "raw page-table read failed: {status}");
+            return;
+        }
+        let mut v = SparseLargeVector::<u64>::with_count(1024);
+        assert_eq!(unsafe { v.data().read_volatile() }, 0);
+        assert!(!v.is_committed_page(0));
+        v.set(0, 42);
+        assert_eq!(unsafe { v.data().read_volatile() }, 42);
+        assert!(commit_vector_page(v.data() as usize, false));
+        v.set(0, 43);
+        assert_eq!(v[0], 43);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_fault_handler_rejects_unrelated_accesses() {
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, EXCEPTION_RECORD,
+        };
+        let v = SparseLargeVector::<u64>::with_count(1024);
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        record.NumberParameters = 2;
+        record.ExceptionInformation[1] = v.data() as usize;
+        for access in [1, 8] {
+            record.ExceptionInformation[0] = access;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: ptr::null_mut(),
+            };
+            assert_eq!(
+                unsafe { win::fake_page_fault_handler(&mut pointers) },
+                EXCEPTION_CONTINUE_SEARCH
+            );
+        }
+        record.ExceptionInformation[0] = 0;
+        record.ExceptionInformation[1] = 0;
+        let mut pointers = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { win::fake_page_fault_handler(&mut pointers) },
+            EXCEPTION_CONTINUE_SEARCH
+        );
+        assert_eq!(
+            unsafe { win::fake_page_fault_handler(ptr::null_mut()) },
+            EXCEPTION_CONTINUE_SEARCH
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_jit_read_fault_uses_data_address_not_instruction_address() {
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_POINTERS, EXCEPTION_RECORD,
+        };
+        let mut v = SparseLargeVector::<u64>::with_count(1024);
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        record.ExceptionAddress =
+            windows_jit_read_fault_uses_data_address_not_instruction_address as *const () as *mut _;
+        record.NumberParameters = 2;
+        record.ExceptionInformation[0] = 0;
+        record.ExceptionInformation[1] = v.data() as usize;
+        let mut pointers = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { win::fake_page_fault_handler(&mut pointers) },
+            EXCEPTION_CONTINUE_EXECUTION
+        );
+        assert_eq!(unsafe { v.data().read_volatile() }, 0);
+        // A fault-committed read-only page must later become writable normally.
+        v.set(0, 42);
+        assert_eq!(v[0], 42);
+    }
 
     #[test]
     fn host_page_constants_are_consistent() {

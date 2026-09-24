@@ -10,6 +10,117 @@ use std::path::{Path, PathBuf};
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
 use ruzu_core::crypto::key_manager::KeyManager;
 
+/// Requested extension to Eden's firmware verification: check every installed
+/// archive, including archives whose metadata cannot be decrypted/indexed.
+/// This checks readability, not the full integrity of every content block.
+pub fn check_firmware_decryption() -> Result<(), String> {
+    let key_filename = if *common::settings::values().use_dev_keys.get_value() {
+        "dev.keys"
+    } else {
+        "prod.keys"
+    };
+    check_firmware_directory(
+        &get_ruzu_path(RuzuPath::NANDDir).join("system/Contents/registered"),
+        &get_ruzu_path(RuzuPath::KeysDir).join(key_filename),
+    )
+}
+
+fn check_firmware_directory(root: &Path, key_file: &Path) -> Result<(), String> {
+    use ruzu_core::file_sys::{
+        content_archive::NCA,
+        fs_filesystem::OpenMode,
+        vfs::{vfs_concat::ConcatenatedVfsFile, vfs_real::RealVfsFilesystem},
+    };
+
+    // This is a compatibility check, not a first-run installation requirement.
+    // Missing keys are handled by the existing frontend onboarding instead.
+    if !key_file.is_file() {
+        return Ok(());
+    }
+    let vfs = RealVfsFilesystem::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", directory.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            let is_nca = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("nca"));
+            let file = if path.is_dir() {
+                if !is_nca {
+                    // Registered-cache hash directories are one level deep.
+                    // Do not recurse indefinitely through nested directory links.
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if directory == root
+                        && name.len() == 8
+                        && name.starts_with("000000")
+                        && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    {
+                        pending.push(path);
+                    }
+                    continue;
+                }
+                let mut chunks = Vec::new();
+                for index in 0..256 {
+                    let upper = path.join(format!("{index:02X}"));
+                    let lower = path.join(format!("{index:02x}"));
+                    let chunk = if upper.is_file() { upper } else { lower };
+                    if !chunk.is_file() {
+                        break;
+                    }
+                    chunks.push(
+                        vfs.arc_open_file(&chunk.to_string_lossy(), OpenMode::READ)
+                            .ok_or_else(|| format!("Cannot read {}", chunk.display()))?,
+                    );
+                }
+                ConcatenatedVfsFile::make_concatenated_file(
+                    entry.file_name().to_string_lossy().into_owned(),
+                    chunks,
+                )
+            } else if is_nca {
+                vfs.arc_open_file(&path.to_string_lossy(), OpenMode::READ)
+            } else {
+                continue;
+            };
+            let file = file.ok_or_else(|| format!("Cannot read {}", path.display()))?;
+            let nca = NCA::new(file, None);
+            if let Some(reason) = firmware_archive_error(nca.get_status(), nca.get_key_generation())
+            {
+                return Err(format!(
+                    "{}\nTitle: {:016X}\n{reason}",
+                    path.display(),
+                    nca.get_title_id()
+                ));
+            }
+        }
+    }
+    // No firmware is allowed, as before (e.g. homebrew). Never synthesize an
+    // archive as evidence that an installed encrypted archive is readable.
+    Ok(())
+}
+
+fn firmware_archive_error(
+    status: ruzu_core::file_sys::partition_filesystem::ResultStatus,
+    generation: u8,
+) -> Option<String> {
+    use ruzu_core::file_sys::partition_filesystem::ResultStatus;
+    match status {
+        ResultStatus::Success => None,
+        ResultStatus::ErrorMissingKeyAreaKey => Some(format!(
+            "Missing key-area key, revision {:02X} ({status:?}).",
+            generation.max(1) - 1
+        )),
+        // A bad header can mean incorrect keys OR a damaged archive. Do not
+        // falsely diagnose every decryption/read failure as an outdated key file.
+        _ => Some(format!("Archive could not be read ({status:?}).")),
+    }
+}
+
 /// Upstream `FirmwareManager::KeyInstallResult`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyInstallResult {
@@ -287,6 +398,51 @@ fn same_file(first: &Path, second: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firmware_scan_allows_absent_firmware_but_rejects_unindexed_broken_archives() {
+        let root = tempfile::tempdir().unwrap();
+        let keys = root.path().join("prod.keys");
+        // Neither firmware nor keys, then keys only: no incompatibility alert.
+        assert!(check_firmware_directory(&root.path().join("absent"), &keys).is_ok());
+        fs::write(&keys, b"synthetic presence marker").unwrap();
+        assert!(check_firmware_directory(&root.path().join("absent"), &keys).is_ok());
+        assert!(check_firmware_directory(root.path(), &keys).is_ok());
+        let nested = root.path().join("000000AB");
+        fs::create_dir(&nested).unwrap();
+        let broken = nested.join("0123456789abcdef0123456789abcdef.nca");
+        fs::write(&broken, b"broken archive without metadata").unwrap();
+        // Firmware without keys must not be reported as an incompatible pair.
+        assert!(check_firmware_directory(root.path(), &root.path().join("missing.keys")).is_ok());
+        assert!(check_firmware_directory(root.path(), &keys)
+            .unwrap_err()
+            .contains("ErrorBadNCAHeader"));
+        fs::remove_file(&broken).unwrap();
+        fs::create_dir(&broken).unwrap();
+        fs::write(broken.join("00"), b"broken split archive").unwrap();
+        assert!(check_firmware_directory(root.path(), &keys)
+            .unwrap_err()
+            .contains("ErrorBadNCAHeader"));
+    }
+
+    #[test]
+    fn firmware_decryption_reports_missing_revision_and_preserves_other_errors() {
+        use ruzu_core::file_sys::partition_filesystem::ResultStatus;
+        assert_eq!(firmware_archive_error(ResultStatus::Success, 0x17), None);
+        assert!(
+            firmware_archive_error(ResultStatus::ErrorMissingKeyAreaKey, 0x17)
+                .unwrap()
+                .contains("revision 16")
+        );
+        assert!(
+            firmware_archive_error(ResultStatus::ErrorMissingKeyAreaKey, 0)
+                .unwrap()
+                .contains("revision 00")
+        );
+        let damaged = firmware_archive_error(ResultStatus::ErrorBadNCAHeader, 0).unwrap();
+        assert!(damaged.contains("ErrorBadNCAHeader"));
+        assert!(!damaged.contains("revision"));
+    }
 
     fn archive(path: &Path, entries: &[(&str, &[u8])]) {
         use std::io::Write;

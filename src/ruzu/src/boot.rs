@@ -540,6 +540,17 @@ fn run_boot(
     let tas_hid_core = Arc::clone(&hid_core);
     let mut system = System::new_with_hid_core(hid_core);
     let _ = exit_locked_tx.send(system.exit_locked_state());
+    // Ruzu-specific preflight: do not fall back to synthetic system archives
+    // when installed firmware cannot be decrypted with the configured keys.
+    if let Err(detail) = frontend_common::firmware_manager::check_firmware_decryption() {
+        log::error!("Firmware decryption check failed: {detail}");
+        loading_event(LoadingEvent::Failed {
+            message: crate::i18n::tr("Unable to read the installed firmware"),
+            detail: format!("{}\n\n{detail}", crate::i18n::tr(
+                "The installed firmware could not be read with the configured keys. Install matching prod.keys and firmware dumped from your console. If the keys are correct, reinstall the complete firmware. The game has not been started.")),
+        });
+        return;
+    }
     system.initialize();
     if controller_applet.is_some() || error_applet.is_some() || software_keyboard.is_some() {
         log::info!(

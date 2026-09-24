@@ -971,6 +971,12 @@ fn main() {
     // Matches upstream: Settings::LogSettings() called in EmuWindow constructor.
     common::settings::log_settings(&common::settings::values());
 
+    // Ruzu-specific firmware preflight, shared with the GTK launcher.
+    if let Err(detail) = frontend_common::firmware_manager::check_firmware_decryption() {
+        eprintln!("Unable to read the installed firmware. Install matching prod.keys and firmware dumped from your console. If the keys are correct, reinstall the complete firmware.\n{detail}");
+        std::process::exit(1);
+    }
+
     // Initialise core system.
     // Maps to C++ `Core::System system{}; system.Initialize();`.
     let mut system = ruzu_core::core::System::new();

@@ -3,6 +3,10 @@
     "_notes": "Switch NSO load-base registry. Each entry maps a game/build to the verified base addresses of its NSOs. Always verify with `find_base.py` before adding — never guess."
   },
 
+  "MK8D 0100152000022000 1.7.1 capture 2026-09-24 1b67e605": {
+    "_notes": "Per-run relocation only. Verified 32 runtime bytes at PC 0xDDFC00 match raw module offset 0x92BC00 in RUZU_DUMP_MODULES capture 1b67e605b2034aed82c7c06f33cedfd5. Do not reuse across launches.",
+    "main": "0x004B4000"
+  },
   "VMRD 0100152000022000 v0": {
     "_notes": "VMRD — main verified by byte-pattern match at runtime PC 0x71EE40 (pattern '00009fe7...' matches .text NSO offset 0x518E40). subsdk0 verified by runtime bytes at 0x0151FC2C/0x0151FC94 matching subsdk0 .text offsets 0xDC2C/0xDC94.",
     "main":   "0x00206000",

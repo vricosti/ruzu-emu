@@ -1,5 +1,7 @@
 {
   "fr": {
+    "Unable to read the installed firmware": "Impossible de lire le firmware installé",
+    "The installed firmware could not be read with the configured keys. Install matching prod.keys and firmware dumped from your console. If the keys are correct, reinstall the complete firmware. The game has not been started.": "Le firmware installé ne peut pas être lu avec les clés configurées. Installez un fichier prod.keys et un firmware compatibles, extraits de votre console. Si les clés sont correctes, réinstallez le firmware complet. Le jeu n’a pas été démarré.",
     "&Clear Recent Files": "&Effacer les fichiers récents",
     "File \"%1\" not found": "Fichier \"%1\" non trouvé",
     "Interface text scaling:": "Mise à l’échelle du texte :",

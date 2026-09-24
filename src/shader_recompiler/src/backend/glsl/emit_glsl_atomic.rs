@@ -7,6 +7,27 @@
 
 use super::glsl_emit_context::EmitContext;
 
+/// Ruzu extension: compare first, replacement second, return the old word.
+pub fn emit_storage_compare_exchange(
+    ctx: &mut EmitContext,
+    program: &mut crate::ir::Program,
+    inst_ref: crate::ir::value::InstRef,
+    inst: &crate::ir::Inst,
+) {
+    let binding = inst.arg(0).imm_u32();
+    let offset = ctx.var_alloc.consume(program, inst.arg(1));
+    let compare = ctx.var_alloc.consume(program, inst.arg(2));
+    let replacement = ctx.var_alloc.consume(program, inst.arg(3));
+    let dst = ctx.var_alloc.define(
+        program.block_mut(inst_ref.block).inst_mut(inst_ref.inst),
+        super::var_alloc::GlslVarType::U32,
+    );
+    ctx.add_fmt(format!(
+        "{dst}=atomicCompSwap({}_ssbo{binding}[{offset}>>2],{compare},{replacement});",
+        ctx.stage_name
+    ));
+}
+
 pub fn emit_storage_atomic_iadd32(ctx: &mut EmitContext, binding: &str, offset: &str) {
     ctx.add_fmt(format!("u_0=atomicAdd(ssbo{}[{}/4],u_1);", binding, offset));
 }

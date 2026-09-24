@@ -136,11 +136,10 @@ fn atom_offset(tv: &mut TranslatorVisitor<'_>, insn: u64) -> Value {
 
 fn atom_op_not_applicable(size: AtomSize, op: AtomOp) -> bool {
     match size {
-        AtomSize::S32 | AtomSize::U64 => matches!(op, AtomOp::Inc | AtomOp::Dec),
-        AtomSize::S64 => !matches!(op, AtomOp::Min | AtomOp::Max),
+        AtomSize::U32 | AtomSize::S32 | AtomSize::U64 => matches!(op, AtomOp::Inc | AtomOp::Dec),
+        AtomSize::S64 => matches!(op, AtomOp::Add | AtomOp::Inc | AtomOp::Dec),
         AtomSize::F32 => op != AtomOp::Add,
         AtomSize::F16x2 => !matches!(op, AtomOp::Add | AtomOp::Min | AtomOp::Max),
-        AtomSize::U32 => false,
     }
 }
 
@@ -230,6 +229,57 @@ pub fn red(tv: &mut TranslatorVisitor<'_>, insn: u64) {
     global_atomic(tv, Reg::RZ.0 as u32, operand_reg, offset, size, op, true);
 }
 
+impl TranslatorVisitor<'_> {
+    /// Ruzu extension beyond Eden's not_implemented.cpp. Encoding follows
+    /// Mesa NAK sm50.rs, OpAtom::legalize/encode: comparator then replacement
+    /// in a packed register tuple, bit 49 selects width, bits 50..52 layout.
+    /// Only packed layout is known to work on Maxwell hardware.
+    pub fn translate_atom_cas(&mut self, insn: u64) {
+        if field(insn, 50, 2) != 0 {
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "ATOM.CAS non-packed operand layout",
+            ));
+        }
+        let wide = bit(insn, 49);
+        let src = field(insn, 20, 8);
+        let dst = field(insn, 0, 8);
+        let rz = u32::from(Reg::RZ.0);
+        if wide && ((src != rz && (src & 1 != 0 || src > 252)) || (dst != rz && dst & 1 != 0)) {
+            std::panic::panic_any(crate::exception::InvalidArgument::new(
+                "ATOM.CAS invalid 64-bit register tuple",
+            ));
+        }
+        let offset = if bit(insn, 48) && field(insn, 8, 8) == rz {
+            Value::ImmU64(u64::from(field(insn, 28, 20)))
+        } else {
+            atom_offset(self, insn)
+        };
+        // Read all inputs before writing a destination that may alias them.
+        let (compare, replacement) = if src == rz {
+            let zero = if wide {
+                Value::ImmU64(0)
+            } else {
+                Value::ImmU32(0)
+            };
+            (zero, zero)
+        } else if wide {
+            (self.l(src), self.l(src + 2))
+        } else {
+            (self.x(src), self.x(src + 1))
+        };
+        let result = self
+            .ir
+            .global_atomic_compare_exchange(offset, compare, replacement, wide);
+        if dst != rz {
+            if wide {
+                self.set_l(dst, result);
+            } else {
+                self.set_x(dst, result);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +287,74 @@ mod tests {
     use crate::ir::opcodes::Opcode;
     use crate::ir::program::Program;
     use crate::ir::types::ShaderStage;
+
+    #[test]
+    fn cas_decodes_packed_registers_for_both_widths() {
+        for wide in [false, true] {
+            let mut program = Program::new(ShaderStage::Compute);
+            program.blocks.push(Block::new());
+            let insn = 0xeef0000000000000 | ((wide as u64) << 49) | (4 << 20) | (8 << 8) | 4;
+            TranslatorVisitor::new(&mut program, 0).translate_atom_cas(insn);
+            let opcode = if wide {
+                Opcode::GlobalAtomicCompareExchange64
+            } else {
+                Opcode::GlobalAtomicCompareExchange32
+            };
+            let instructions: Vec<_> = program.block(0).iter().collect();
+            let cas_index = instructions
+                .iter()
+                .position(|i| i.opcode == opcode)
+                .unwrap();
+            assert_eq!(instructions[cas_index].args.len(), 3);
+            assert!(instructions[..cas_index]
+                .iter()
+                .all(|i| i.opcode != Opcode::SetRegister));
+            let reads: Vec<_> = instructions[..cas_index]
+                .iter()
+                .filter(|i| i.opcode == Opcode::GetRegister)
+                .map(|i| i.args[0])
+                .collect();
+            let registers = if wide {
+                vec![8, 4, 5, 6, 7]
+            } else {
+                vec![8, 4, 5]
+            };
+            assert_eq!(
+                reads,
+                registers
+                    .into_iter()
+                    .map(|r| Value::Reg(Reg(r)))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn cas_zero_destination_still_emits_memory_side_effect() {
+        for wide in [false, true] {
+            let mut program = Program::new(ShaderStage::Compute);
+            program.blocks.push(Block::new());
+            let insn = 0xeef0000000000000 | ((wide as u64) << 49) | (255 << 20) | (255 << 8) | 255;
+            TranslatorVisitor::new(&mut program, 0).translate_atom_cas(insn);
+            let instructions: Vec<_> = program.block(0).iter().collect();
+            assert!(instructions
+                .iter()
+                .any(|i| i.opcode.may_have_side_effects()));
+            assert!(!instructions.iter().any(|i| i.opcode == Opcode::SetRegister));
+        }
+    }
+
+    #[test]
+    fn cas_reserved_layout_is_a_typed_shader_error() {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            TranslatorVisitor::new(&mut program, 0).translate_atom_cas(0xeefc000000000000);
+        }));
+        assert!(result
+            .unwrap_err()
+            .is::<crate::exception::NotImplementedException>());
+    }
 
     fn translate_atom(size: AtomSize, op: AtomOp) -> Vec<Opcode> {
         let mut program = Program::new(ShaderStage::Compute);
@@ -257,7 +375,8 @@ mod tests {
     fn atom_integer_sizes_select_upstream_opcodes() {
         assert!(translate_atom(AtomSize::U32, AtomOp::Add).contains(&Opcode::GlobalAtomicIAdd32));
         assert!(translate_atom(AtomSize::S64, AtomOp::Min).contains(&Opcode::GlobalAtomicSMin64));
-        assert!(translate_atom(AtomSize::U32, AtomOp::Inc).contains(&Opcode::GlobalAtomicInc32));
+        assert!(translate_atom(AtomSize::U32, AtomOp::Inc).contains(&Opcode::LoadGlobal32));
+        assert!(translate_atom(AtomSize::S64, AtomOp::And).contains(&Opcode::GlobalAtomicAnd64));
     }
 
     #[test]

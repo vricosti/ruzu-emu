@@ -540,6 +540,7 @@ pub enum Opcode {
     GlobalAtomicOr32,
     GlobalAtomicXor32,
     GlobalAtomicExchange32,
+    GlobalAtomicCompareExchange32,
     GlobalAtomicIAdd64,
     GlobalAtomicSMin64,
     GlobalAtomicUMin64,
@@ -549,6 +550,7 @@ pub enum Opcode {
     GlobalAtomicOr64,
     GlobalAtomicXor64,
     GlobalAtomicExchange64,
+    GlobalAtomicCompareExchange64,
     GlobalAtomicIAdd32x2,
     GlobalAtomicSMin32x2,
     GlobalAtomicUMin32x2,
@@ -576,6 +578,7 @@ pub enum Opcode {
     StorageAtomicOr32,
     StorageAtomicXor32,
     StorageAtomicExchange32,
+    StorageAtomicCompareExchange32,
     StorageAtomicIAdd64,
     StorageAtomicSMin64,
     StorageAtomicUMin64,
@@ -585,6 +588,7 @@ pub enum Opcode {
     StorageAtomicOr64,
     StorageAtomicXor64,
     StorageAtomicExchange64,
+    StorageAtomicCompareExchange64,
     StorageAtomicIAdd32x2,
     StorageAtomicSMin32x2,
     StorageAtomicUMin32x2,
@@ -804,6 +808,7 @@ impl Opcode {
                 | Opcode::GlobalAtomicOr32
                 | Opcode::GlobalAtomicXor32
                 | Opcode::GlobalAtomicExchange32
+                | Opcode::GlobalAtomicCompareExchange32
                 | Opcode::GlobalAtomicIAdd64
                 | Opcode::GlobalAtomicSMin64
                 | Opcode::GlobalAtomicUMin64
@@ -813,6 +818,7 @@ impl Opcode {
                 | Opcode::GlobalAtomicOr64
                 | Opcode::GlobalAtomicXor64
                 | Opcode::GlobalAtomicExchange64
+                | Opcode::GlobalAtomicCompareExchange64
                 | Opcode::GlobalAtomicIAdd32x2
                 | Opcode::GlobalAtomicSMin32x2
                 | Opcode::GlobalAtomicUMin32x2
@@ -840,6 +846,7 @@ impl Opcode {
                 | Opcode::StorageAtomicOr32
                 | Opcode::StorageAtomicXor32
                 | Opcode::StorageAtomicExchange32
+                | Opcode::StorageAtomicCompareExchange32
                 | Opcode::StorageAtomicIAdd64
                 | Opcode::StorageAtomicSMin64
                 | Opcode::StorageAtomicUMin64
@@ -849,6 +856,7 @@ impl Opcode {
                 | Opcode::StorageAtomicOr64
                 | Opcode::StorageAtomicXor64
                 | Opcode::StorageAtomicExchange64
+                | Opcode::StorageAtomicCompareExchange64
                 | Opcode::StorageAtomicIAdd32x2
                 | Opcode::StorageAtomicSMin32x2
                 | Opcode::StorageAtomicUMin32x2
@@ -2997,6 +3005,11 @@ impl Opcode {
                 return_type: U32,
                 arg_types: &[U64, U32],
             },
+            Opcode::GlobalAtomicCompareExchange32 => OpcodeMeta {
+                name: "GlobalAtomicCompareExchange32",
+                return_type: U32,
+                arg_types: &[U64, U32, U32],
+            },
             Opcode::GlobalAtomicExchange32 => OpcodeMeta {
                 name: "GlobalAtomicExchange32",
                 return_type: U32,
@@ -3041,6 +3054,11 @@ impl Opcode {
                 name: "GlobalAtomicXor64",
                 return_type: U64,
                 arg_types: &[U64, U64],
+            },
+            Opcode::GlobalAtomicCompareExchange64 => OpcodeMeta {
+                name: "GlobalAtomicCompareExchange64",
+                return_type: U64,
+                arg_types: &[U64, U64, U64],
             },
             Opcode::GlobalAtomicExchange64 => OpcodeMeta {
                 name: "GlobalAtomicExchange64",
@@ -3179,6 +3197,11 @@ impl Opcode {
                 return_type: U32,
                 arg_types: &[U32, U32, U32],
             },
+            Opcode::StorageAtomicCompareExchange32 => OpcodeMeta {
+                name: "StorageAtomicCompareExchange32",
+                return_type: U32,
+                arg_types: &[U32, U32, U32, U32],
+            },
             Opcode::StorageAtomicExchange32 => OpcodeMeta {
                 name: "StorageAtomicExchange32",
                 return_type: U32,
@@ -3223,6 +3246,11 @@ impl Opcode {
                 name: "StorageAtomicXor64",
                 return_type: U64,
                 arg_types: &[U32, U32, U64],
+            },
+            Opcode::StorageAtomicCompareExchange64 => OpcodeMeta {
+                name: "StorageAtomicCompareExchange64",
+                return_type: U64,
+                arg_types: &[U32, U32, U64, U64],
             },
             Opcode::StorageAtomicExchange64 => OpcodeMeta {
                 name: "StorageAtomicExchange64",

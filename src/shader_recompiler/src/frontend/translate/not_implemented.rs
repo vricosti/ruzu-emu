@@ -11,10 +11,6 @@
 use super::TranslatorVisitor;
 
 impl<'a> TranslatorVisitor<'a> {
-    pub fn translate_atom_cas(&mut self, _insn: u64) {
-        panic!("Instruction ATOM_cas not implemented (upstream throws NotImplementedException)");
-    }
-
     pub fn translate_atoms_cas(&mut self, _insn: u64) {
         panic!("Instruction ATOMS_cas not implemented (upstream throws NotImplementedException)");
     }

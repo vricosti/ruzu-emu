@@ -784,6 +784,14 @@ fn emit_inst(
         Opcode::SharedAtomicExchange64 | Opcode::SharedAtomicExchange32x2 => {
             emit_msl_atomic::emit_shared_atomic_wide_fallback(context, inst_ref, inst)
         }
+        Opcode::StorageAtomicCompareExchange32 => {
+            emit_msl_atomic::emit_storage_compare_exchange(context, inst_ref, inst)
+        }
+        Opcode::StorageAtomicCompareExchange64
+        | Opcode::GlobalAtomicCompareExchange32
+        | Opcode::GlobalAtomicCompareExchange64 => Err(MslError::UnsupportedProgramFeature(
+            "native 64-bit or unlowered global CAS",
+        )),
         Opcode::StorageAtomicIAdd32
         | Opcode::StorageAtomicSMin32
         | Opcode::StorageAtomicUMin32
@@ -3265,6 +3273,35 @@ mod tests {
         assert!(source.contains("threadgroup atomic_uint* atomic_pointer"));
         assert!(source.contains("smem[((0x00000004u) >> 2u)] = 0x00000007u;"));
         assert!(source.contains("threadgroup_barrier(mem_flags::mem_threadgroup);"));
+    }
+
+    #[test]
+    fn emits_storage_cas_retrying_only_spurious_failure() {
+        let mut program = empty_program(Stage::Compute);
+        program.info.storage_buffers_descriptors.push(
+            crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0,
+                cbuf_offset: 0,
+                count: 1,
+                is_written: true,
+            },
+        );
+        program.blocks[0].append_new_inst(
+            Opcode::StorageAtomicCompareExchange32,
+            vec![
+                Value::ImmU32(0),
+                Value::ImmU32(16),
+                Value::ImmU32(17),
+                Value::ImmU32(29),
+            ],
+        );
+        crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+        let artifact = emit_msl(&program, &Profile::default(), &RuntimeInfo::default()).unwrap();
+        let source = artifact.source.source;
+        assert!(source.contains("_compare = 0x00000011u;"), "{source}");
+        assert!(source.contains("_replacement = 0x0000001Du;"));
+        assert!(source.contains("atomic_compare_exchange_weak_explicit(reinterpret_cast<device atomic_uint*>(&ssbo0[4u])"));
+        assert!(source.contains("&& cas_0_0_old == cas_0_0_compare"));
     }
 
     #[test]

@@ -1063,6 +1063,22 @@ impl<'a> Emitter<'a> {
         )
     }
 
+    /// Ruzu extension: one indivisible compare/exchange, returning the old value.
+    pub fn global_atomic_compare_exchange(
+        &mut self,
+        offset: Value,
+        compare: Value,
+        replacement: Value,
+        is_64_bit: bool,
+    ) -> Value {
+        let opcode = if is_64_bit {
+            Opcode::GlobalAtomicCompareExchange64
+        } else {
+            Opcode::GlobalAtomicCompareExchange32
+        };
+        self.emit(Inst::new(opcode, vec![offset, compare, replacement]))
+    }
+
     pub fn global_atomic_exchange(
         &mut self,
         offset: Value,

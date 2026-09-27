@@ -4418,11 +4418,23 @@ impl Maxwell3D {
         let addr_low = self.regs[cb_base + 2] as u64;
         let buffer_address = (addr_high << 32) | addr_low;
 
-        assert_ne!(buffer_address, 0);
+        // Eden's ASSERT logs and calls AssertFailSoftImpl; it does not terminate
+        // normal emulation when use_debug_asserts is disabled. These checks
+        // concern guest register state, not Rust host-memory bounds.
+        if buffer_address == 0 {
+            log::error!("Maxwell3D::ProcessCBMultiData assertion failed: buffer_address != 0");
+            common::assert::assert_fail_soft_impl();
+        }
 
         let offset = self.regs[cb_base + 3];
         let size = self.regs[cb_base];
-        assert!(offset <= size);
+        if offset > size {
+            log::error!(
+                "Maxwell3D::ProcessCBMultiData assertion failed: offset <= size; address={buffer_address:#x} offset={offset:#x} size={size:#x} words={}",
+                data.len()
+            );
+            common::assert::assert_fail_soft_impl();
+        }
 
         let copy_size = data.len() as u32 * 4;
         let address = buffer_address.wrapping_add(offset as u64);

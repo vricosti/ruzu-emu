@@ -924,6 +924,31 @@ fn test_cb_data_increments_offset() {
 }
 
 #[test]
+fn cb_write_past_declared_size_follows_upstream_fail_soft_policy() {
+    assert!(!*common::settings::values().use_debug_asserts.get_value());
+    // Declared CB size is not the mapped allocation's extent. Eden logs the
+    // assertion then still writes the data and advances the offset.
+    let backing = vec![0u8; 0x1000];
+    let mut engine = new_descriptor_owner_backed_engine(&backing, 0x10000);
+    engine.write_reg(CB_CONFIG_BASE, 0x100);
+    engine.write_reg(CB_CONFIG_BASE + 1, 0);
+    engine.write_reg(CB_CONFIG_BASE + 2, 0x10000);
+    engine.write_reg(CB_CONFIG_BASE + 3, 0x168);
+    engine.process_cb_multi_data(&[0x12345678, 0xabcdef01]);
+    assert_eq!(&backing[0x168..0x170], &[0x78, 0x56, 0x34, 0x12, 1, 0xef, 0xcd, 0xab]);
+    assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 0x170);
+}
+
+#[test]
+fn cb_zero_base_follows_upstream_fail_soft_policy() {
+    assert!(!*common::settings::values().use_debug_asserts.get_value());
+    let mut engine = Maxwell3D::new();
+    engine.write_reg(CB_CONFIG_BASE, 0x100);
+    engine.process_cb_multi_data(&[7]);
+    assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 4);
+}
+
+#[test]
 fn test_cb_bind_multiple_stages() {
     let mut engine = Maxwell3D::new();
 

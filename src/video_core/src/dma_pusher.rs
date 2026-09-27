@@ -560,8 +560,13 @@ impl DmaPusher {
             return;
         }
 
-        let subchannel = self.subchannels[self.dma_state.subchannel as usize]
-            .expect("DMA method requires a bound subchannel");
+        let subchannel =
+            self.subchannels[self.dma_state.subchannel as usize].unwrap_or_else(|| {
+                panic!(
+                    "DMA method requires a bound subchannel: state={:?} argument={argument:#010x}",
+                    self.dma_state
+                )
+            });
         let subchannel = unsafe { subchannel.as_mut() };
         if !subchannel.execution_mask()[self.dma_state.method as usize] {
             subchannel.push_method_sink(self.dma_state.method, argument);
@@ -616,6 +621,34 @@ mod tests {
     use crate::renderer_null::null_rasterizer::RasterizerNull;
     use common::settings;
     use common::settings_enums::GpuAccuracy;
+
+
+    #[test]
+    fn increasing_fermi_command_preserves_pending_arguments_across_every_split() {
+        // Upstream ProcessCommands retains method_count/method/subchannel across
+        // spans. Parameter words must not become headers at a GPFIFO boundary.
+        let mut words = vec![CommandHeader { raw: (1 << 29) | (13 << 16) | (3 << 13) | 0x80 }];
+        words.extend((0..13).map(|value| CommandHeader { raw: 0x100 + value }));
+        for split in 0..=words.len() {
+            let memory = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+            let mut channel = Box::new(ChannelState::new(7));
+            let mut engine = crate::engines::fermi_2d::Fermi2D::new(Arc::clone(&memory));
+            let mut dma = DmaPusher::new(
+                std::ptr::null(), SystemRef::null(), memory, &mut *channel,
+            );
+            dma.bind_subchannel(&mut engine, 3, EngineTypes::Fermi2D);
+            dma.process_commands(&words[..split]);
+            if split > 0 {
+                assert_eq!(dma.dma_state.method_count, (words.len() - split) as u32);
+            }
+            dma.process_commands(&words[split..]);
+            assert_eq!(dma.dma_state.method_count, 0);
+            assert_eq!(dma.dma_state.method, 0x8d);
+            assert_eq!(dma.dma_state.subchannel, 3);
+            engine.consume_sink();
+            assert_eq!(engine.dst_format(), 0x100);
+        }
+    }
 
     #[test]
     fn command_header_scratch_has_upstream_word_layout() {

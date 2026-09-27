@@ -2120,7 +2120,7 @@ impl GMainWindow {
         this.start_input_driver_updates();
         this.start_status_bar_updates();
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let weak = Rc::downgrade(&this);
             crate::input_session::start(move |command| {
@@ -4358,7 +4358,7 @@ impl GMainWindow {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn input_session_command(&self, command: crate::input_session::Command) -> Result<serde_json::Value, String> {
         use crate::input_session::Command;
         use hid_core::hid_types::NpadIdType;

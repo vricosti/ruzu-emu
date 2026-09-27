@@ -32,7 +32,7 @@ mod gui_settings;
 mod homebrew_vfs;
 mod hotkeys;
 mod i18n;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod input_session;
 mod install_dialog;
 mod loading_screen;

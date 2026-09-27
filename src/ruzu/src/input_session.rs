@@ -3,8 +3,12 @@
 //! This diagnostic frontend facility has no Eden counterpart.
 
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::UnixDatagram;
+#[cfg(unix)]
+use std::os::unix::net::UnixDatagram as ControlSocket;
+#[cfg(windows)]
+use std::net::UdpSocket as ControlSocket;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -17,7 +21,9 @@ pub(crate) enum Command {
 }
 
 struct Control {
-    socket: UnixDatagram,
+    socket: ControlSocket,
+    #[cfg(windows)]
+    token: String,
     directory: PathBuf,
     held: Option<(Vec<i32>, Instant)>,
     handler: Box<dyn FnMut(Command) -> Result<Value, String>>,
@@ -30,13 +36,28 @@ pub(crate) fn start(handler: impl FnMut(Command) -> Result<Value, String> + 'sta
         return;
     };
     let directory = PathBuf::from(directory);
-    let setup = || -> io::Result<UnixDatagram> {
+    #[cfg(unix)]
+    let setup = || -> io::Result<ControlSocket> {
         std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
-        let socket = UnixDatagram::bind(directory.join("control.sock"))?;
+        let socket = ControlSocket::bind(directory.join("control.sock"))?;
         socket.set_nonblocking(true)?;
         Ok(socket)
     };
-    let socket = match setup() {
+    #[cfg(windows)]
+    let setup = || -> io::Result<(ControlSocket, String)> {
+        // Use a fresh directory under the user's private profile (inherited ACL).
+        std::fs::create_dir(&directory)?;
+        let socket = ControlSocket::bind("127.0.0.1:0")?;
+        socket.set_nonblocking(true)?;
+        let mut secret = [0u8; 32];
+        getrandom::getrandom(&mut secret).map_err(|error| io::Error::other(error.to_string()))?;
+        let token: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+        std::fs::write(directory.join("control.json"), json!({
+            "port": socket.local_addr()?.port(), "token": token,
+        }).to_string())?;
+        Ok((socket, token))
+    };
+    let transport = match setup() {
         Ok(socket) => socket,
         Err(error) => {
             log::error!(
@@ -46,12 +67,18 @@ pub(crate) fn start(handler: impl FnMut(Command) -> Result<Value, String> + 'sta
             return;
         }
     };
+    #[cfg(unix)]
+    let socket = transport;
+    #[cfg(windows)]
+    let (socket, token) = transport;
     log::info!(
         "Input session ready: {}",
-        directory.join("control.sock").display()
+        directory.display()
     );
     let mut control = Control {
         socket,
+        #[cfg(windows)]
+        token,
         directory,
         held: None,
         handler: Box::new(handler),
@@ -82,17 +109,32 @@ impl Control {
                     break;
                 }
             };
+            #[cfg(windows)]
+            if !peer.ip().is_loopback() {
+                continue;
+            }
             let result = if len > 4096 {
                 Err("request exceeds 4096 bytes".into())
             } else {
                 serde_json::from_slice(&bytes[..len])
                     .map_err(|error| error.to_string())
-                    .and_then(|request| self.execute(request))
+                    .and_then(|request: Value| {
+                        #[cfg(windows)]
+                        if request.get("token").and_then(Value::as_str) != Some(self.token.as_str()) {
+                            return Err("invalid session token".into());
+                        }
+                        self.execute(request)
+                    })
             };
             let reply = match result {
                 Ok(value) => json!({"ok": true, "result": value}),
                 Err(error) => json!({"ok": false, "error": error}),
             };
+            #[cfg(windows)]
+            if let Err(error) = self.socket.send_to(reply.to_string().as_bytes(), peer) {
+                log::warn!("Input session reply: {error}");
+            }
+            #[cfg(unix)]
             if let Some(path) = peer.as_pathname() {
                 if let Err(error) = self.socket.send_to(reply.to_string().as_bytes(), path) {
                     log::warn!("Input session reply to {}: {error}", path.display());
@@ -176,6 +218,8 @@ impl Drop for Control {
     fn drop(&mut self) {
         self.release();
         let _ = std::fs::remove_file(self.directory.join("control.sock"));
+        #[cfg(windows)]
+        let _ = std::fs::remove_file(self.directory.join("control.json"));
     }
 }
 
@@ -243,11 +287,51 @@ fn valid_capture_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn test_socket() -> ControlSocket {
+        #[cfg(unix)]
+        { ControlSocket::unbound().unwrap() }
+        #[cfg(windows)]
+        { ControlSocket::bind("127.0.0.1:0").unwrap() }
+    }
+
     #[test]
+    #[cfg(windows)]
+    fn windows_transport_rejects_unauthenticated_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = test_socket();
+        let address = socket.local_addr().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let received = calls.clone();
+        let mut control = Control {
+            socket,
+            token: "test-token".into(),
+            directory: directory.path().into(),
+            held: None,
+            handler: Box::new(move |_| {
+                received.set(received.get() + 1);
+                Ok(json!({"received": true}))
+            }),
+        };
+        let client = test_socket();
+        client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        for (token, accepted) in [(None, false), (Some("wrong"), false), (Some("test-token"), true)] {
+            client.send_to(json!({"command":"status", "token":token}).to_string().as_bytes(), address).unwrap();
+            control.poll();
+            let mut bytes = [0; 1024];
+            let len = client.recv(&mut bytes).unwrap();
+            let reply: Value = serde_json::from_slice(&bytes[..len]).unwrap();
+            assert_eq!(reply["ok"], accepted);
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn datagram_requests_receive_replies() {
         let directory = tempfile::tempdir().unwrap();
         let server_path = directory.path().join("control.sock");
-        let socket = UnixDatagram::bind(&server_path).unwrap();
+        let socket = ControlSocket::bind(&server_path).unwrap();
         socket.set_nonblocking(true).unwrap();
         let mut control = Control {
             socket,
@@ -255,7 +339,7 @@ mod tests {
             held: None,
             handler: Box::new(|_| Ok(json!({"received": true}))),
         };
-        let client = UnixDatagram::bind(directory.path().join("reply.sock")).unwrap();
+        let client = ControlSocket::bind(directory.path().join("reply.sock")).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         client.send_to(br#"{"command":"status"}"#, &server_path).unwrap();
         control.poll();
@@ -313,7 +397,9 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         let output = events.clone();
         let mut control = Control {
-            socket: UnixDatagram::unbound().unwrap(),
+            socket: test_socket(),
+            #[cfg(windows)]
+            token: "test-token".into(),
             directory: directory.path().into(),
             held: None,
             handler: Box::new(move |event| {
@@ -344,7 +430,9 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         let output = events.clone();
         let mut control = Control {
-            socket: UnixDatagram::unbound().unwrap(),
+            socket: test_socket(),
+            #[cfg(windows)]
+            token: "test-token".into(),
             directory: directory.path().into(),
             held: None,
             handler: Box::new(move |event| {

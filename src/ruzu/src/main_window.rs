@@ -8119,6 +8119,39 @@ fn preserve_native_maximized_size(window: &gtk::Window) {
     window.connect_realize(|window| {
         let Some(surface) = window.surface() else { return; };
         let Ok(toplevel) = surface.clone().dynamic_cast::<gtk::gdk::Toplevel>() else { return; };
+        // GTK 4.22 Win32: when Windows itself restores a maximized HWND (restore
+        // button, caption double-click, drag from the caption), GDK keeps the
+        // work-area size and ignores every later resize, so dragging an edge
+        // only moves the window. A GTK-driven unmaximize refreshes GDK's cached
+        // toplevel layout even when its public maximized state is already false.
+        // Defer that refresh until after the native layout, without maximizing
+        // again (which visibly flashes the window).
+        {
+            let weak = window.downgrade();
+            let was_zoomed = std::cell::Cell::new(false);
+            surface.connect_layout(move |surface, _, _| {
+                let hwnd = windows_surface_handle(surface);
+                if hwnd.is_null() { return; }
+                let zoomed = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsZoomed(hwnd) } != 0;
+                if !was_zoomed.replace(zoomed) || zoomed { return; }
+                let Some(window) = weak.upgrade() else { return; };
+                if window.is_fullscreen() { return; }
+                let weak = window.downgrade();
+                let restored_surface = surface.downgrade();
+                gtk::glib::idle_add_local_once(move || {
+                    let Some(window) = weak.upgrade() else { return; };
+                    let Some(surface) = restored_surface.upgrade() else { return; };
+                    if !window.is_mapped() || window.is_fullscreen()
+                        || window.surface().as_ref() != Some(&surface) { return; }
+                    let hwnd = windows_surface_handle(&surface);
+                    if hwnd.is_null() || unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::IsZoomed(hwnd) != 0
+                            || windows_sys::Win32::UI::WindowsAndMessaging::IsIconic(hwnd) != 0
+                    } { return; }
+                    window.unmaximize();
+                });
+            });
+        }
         // GTK 4.22's Win32 compute_toplevel_size also clamps an explicitly
         // maximized layout to the monitor WORKAREA height, without subtracting
         // the native caption. That can make the GDK allocation larger than the
@@ -8189,6 +8222,65 @@ fn windows_surface_handle(surface: &gtk::gdk::Surface) -> windows_sys::Win32::Fo
 #[cfg(all(test, target_os = "windows"))]
 mod maximized_menu_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a Windows GTK display and an isolated process"]
+    fn native_restore_allows_resize_without_remaximizing() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowRect, IsZoomed, SendMessageW, SetWindowPos, ShowWindow,
+            SC_RESTORE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, WM_SYSCOMMAND,
+        };
+        crate::configure_windows_native_decorations();
+        crate::configure_windows_gsk_renderer();
+        gtk::init().unwrap();
+        let window = gtk::Window::builder().default_width(800).default_height(600).build();
+        preserve_native_maximized_size(&window);
+        let settle = || {
+            let main_loop = gtk::glib::MainLoop::new(None, false);
+            let done = main_loop.clone();
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || done.quit());
+            main_loop.run();
+        };
+        window.maximize();
+        window.present();
+        settle();
+        let surface = window.surface().unwrap();
+        let hwnd = windows_surface_handle(&surface);
+        let remaximized = std::rc::Rc::new(std::cell::Cell::new(false));
+        let watching = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = remaximized.clone();
+        let enabled = watching.clone();
+        surface.connect_layout(move |surface, _, _| {
+            if enabled.get() && unsafe { IsZoomed(windows_surface_handle(surface)) } != 0 {
+                observed.set(true);
+            }
+        });
+        for system_command in [true, false] {
+            assert_ne!(unsafe { IsZoomed(hwnd) }, 0);
+            watching.set(true);
+            unsafe {
+                if system_command {
+                    SendMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE as usize, 0);
+                } else {
+                    ShowWindow(hwnd, SW_RESTORE);
+                }
+            }
+            settle();
+            assert!(!window.is_maximized());
+            assert!(!remaximized.get(), "restore must not temporarily maximize again");
+            assert_ne!(unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), 150, 150, 1100, 700,
+                SWP_NOACTIVATE | SWP_NOZORDER) }, 0);
+            settle();
+            let mut rect = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            assert_ne!(unsafe { GetWindowRect(hwnd, &mut rect) }, 0);
+            assert_eq!((rect.right - rect.left, rect.bottom - rect.top), (1100, 700),
+                "GDK must accept native resizing after restore");
+            watching.set(false);
+            window.maximize();
+            settle();
+        }
+        window.destroy();
+    }
 
     #[test]
     #[ignore = "requires a Windows GTK display and an isolated process"]
@@ -8277,6 +8369,10 @@ mod maximized_menu_tests {
             assert_ne!(unsafe { GetWindowRect(hwnd, &mut rect) }, 0);
             (rect.left, rect.top, rect.right, rect.bottom)
         };
+        // The launcher starts maximized; establish the normal reference
+        // geometry before testing a native maximize/restore round trip.
+        window.unmaximize();
+        settle();
         let normal_rect = native_rect();
         let assert_status_visible = || {
             let bar = main.status_bar.widget();

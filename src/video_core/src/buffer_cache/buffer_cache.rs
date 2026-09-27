@@ -626,12 +626,22 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         gpu_addr: u64,
         size: u32,
     ) {
+        // The guest can explicitly bind address zero (e.g. an unused shader CB).
+        // Preserve the existing null-buffer representation and declared size.
+        // Upstream dereferences an empty optional here; do not reproduce that UB
+        // or silently accept arbitrary nonzero unmapped addresses.
+        if gpu_addr == 0 {
+            self.bind_graphics_uniform_buffer_with_device_addr(stage, index, 0, size);
+            return;
+        }
         // Upstream: const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
         let device_addr = self
             .gpu_memory
             .as_ref()
             .and_then(|gm| gm.gpu_to_cpu_address(gpu_addr))
-            .expect("uniform-buffer GPU address must map to device memory");
+            .unwrap_or_else(|| panic!(
+                "uniform-buffer GPU address must map to device memory: stage={stage} index={index} gpu_addr={gpu_addr:#x} size={size:#x}"
+            ));
         self.bind_graphics_uniform_buffer_with_device_addr(stage, index, device_addr, size);
     }
 
@@ -4396,6 +4406,32 @@ mod tests {
         let channel = ChannelState::new(bind_id);
         cache.create_channel(&channel);
         cache.bind_to_channel(bind_id);
+    }
+
+    #[test]
+    fn explicit_zero_uniform_buffer_address_binds_null_without_translation() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker, TestBufferCacheRuntime::default(),
+        );
+        bind_test_channel(&mut cache, 7);
+        cache.bind_graphics_uniform_buffer(4, 6, 0, 0x100);
+        let binding = cache.channel_caches.current_channel_state().unwrap().uniform_buffers[4][6];
+        assert_eq!(binding.device_addr, 0);
+        assert_eq!(binding.size, 0x100);
+        assert_eq!(binding.buffer_id, NULL_BUFFER_ID);
+        assert_eq!(cache.find_buffer(binding.device_addr, binding.size, false), NULL_BUFFER_ID);
+    }
+
+    #[test]
+    #[should_panic(expected = "gpu_addr=0x1234")]
+    fn nonzero_unmapped_uniform_buffer_address_is_not_silently_null() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker, TestBufferCacheRuntime::default(),
+        );
+        bind_test_channel(&mut cache, 7);
+        cache.bind_graphics_uniform_buffer(4, 6, 0x1234, 0x100);
     }
 
     #[test]

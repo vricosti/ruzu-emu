@@ -34,7 +34,7 @@ use crate::vulkan_common::vulkan_memory_allocator::{
     AllocatedBuffer, MemoryAllocator, MemoryUsage,
 };
 use crate::vulkan_common::vulkan_wrapper::{
-    PIPELINE_STAGE_GRAPHICS_COMPUTE, PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, MemoryLocation,
+    MemoryLocation, PIPELINE_STAGE_GRAPHICS_COMPUTE, PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
 };
 
 /// Cached Vulkan buffer view for texture/image buffer descriptors.
@@ -82,8 +82,7 @@ impl Buffer {
                     .vulkan_device()
                     .get_logical()
                     .get_buffer_device_address(
-                        &vk::BufferDeviceAddressInfo::default()
-                            .buffer(buffer),
+                        &vk::BufferDeviceAddressInfo::default().buffer(buffer),
                     )
             }
         } else {
@@ -685,10 +684,7 @@ impl BufferCacheRuntime {
         unsafe {
             self.vulkan_device()
                 .get_logical()
-                .get_buffer_device_address(
-                    &vk::BufferDeviceAddressInfo::default()
-                        .buffer(buffer),
-                )
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
         }
     }
 
@@ -907,14 +903,20 @@ impl BufferCacheRuntime {
             .collect()
     }
 
-    fn texel_buffer_format(&self, format: PixelFormat) -> vk::Format {
-        super::maxwell_to_vk::surface_format(
-            self.vulkan_device(),
-            FormatType::Buffer,
-            false,
-            format,
-        )
-        .format
+    fn texel_buffer_format(
+        device_address: vk::DeviceAddress,
+        format: PixelFormat,
+        resolve: impl FnOnce(PixelFormat) -> vk::Format,
+    ) -> vk::Format {
+        // Unlike upstream's unconditional conversion, do not interpret the Invalid
+        // sentinel of an unbound texture buffer as a real surface format.
+        // VUID-VkDescriptorAddressInfoEXT-None-09508 permits UNDEFINED at address 0.
+        // Legacy descriptors ignore this address-format pair entirely.
+        if device_address == 0 {
+            vk::Format::UNDEFINED
+        } else {
+            resolve(format)
+        }
     }
 
     fn bind_buffer_descriptor(&mut self, buffer: &Buffer, offset: u32, size: u32) {
@@ -1079,7 +1081,8 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         let mut scheduler = self.scheduler;
         // SAFETY: see `bind_multi_range_storage_buffer`.
         let scheduler = unsafe { scheduler.as_mut() };
-        self.multi_range_buffers.drop_owner(scheduler, buffer.handle());
+        self.multi_range_buffers
+            .drop_owner(scheduler, buffer.handle());
     }
 
     type Buffer = Buffer;
@@ -1499,7 +1502,15 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     ) {
         let view = buffer.view(offset, size, format);
         let device_address = buffer.device_address();
-        let vk_format = self.texel_buffer_format(format);
+        let vk_format = Self::texel_buffer_format(device_address, format, |format| {
+            super::maxwell_to_vk::surface_format(
+                self.vulkan_device(),
+                FormatType::Buffer,
+                false,
+                format,
+            )
+            .format
+        });
         self.guest_descriptor_queue().add_texel_buffer_with_address(
             view,
             device_address,
@@ -1518,7 +1529,15 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     ) {
         let view = buffer.view(offset, size, format);
         let device_address = buffer.device_address();
-        let vk_format = self.texel_buffer_format(format);
+        let vk_format = Self::texel_buffer_format(device_address, format, |format| {
+            super::maxwell_to_vk::surface_format(
+                self.vulkan_device(),
+                FormatType::Buffer,
+                false,
+                format,
+            )
+            .format
+        });
         self.guest_descriptor_queue().add_texel_buffer_with_address(
             view,
             device_address,
@@ -1677,6 +1696,38 @@ fn prepare_transform_feedback_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_texel_buffer_does_not_resolve_invalid_surface_format() {
+        assert_eq!(
+            BufferCacheRuntime::texel_buffer_format(0, PixelFormat::Invalid, |_| {
+                panic!("a null descriptor must not resolve its sentinel format")
+            }),
+            vk::Format::UNDEFINED,
+        );
+    }
+
+    #[test]
+    fn non_null_texel_buffer_resolves_the_original_format() {
+        let mut called = false;
+        let format =
+            BufferCacheRuntime::texel_buffer_format(0x1000, PixelFormat::R32Uint, |format| {
+                called = true;
+                assert_eq!(format, PixelFormat::R32Uint);
+                vk::Format::R32_UINT
+            });
+        assert!(called);
+        assert_eq!(format, vk::Format::R32_UINT);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid non-null format")]
+    fn non_null_texel_buffer_does_not_hide_invalid_formats() {
+        BufferCacheRuntime::texel_buffer_format(0x1000, PixelFormat::Invalid, |format| {
+            assert_ne!(format, PixelFormat::Invalid, "invalid non-null format");
+            vk::Format::UNDEFINED
+        });
+    }
 
     #[test]
     fn runtime_keeps_upstream_device_reference() {

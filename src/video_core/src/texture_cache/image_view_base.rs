@@ -135,7 +135,9 @@ impl ImageViewBase {
         Self {
             image_id: NULL_IMAGE_ID,
             gpu_addr: 0,
-            format: PixelFormat::Invalid,
+            // Upstream's format{} value-initializes the enum to zero. Null
+            // views still expose this format to descriptor/backend queries.
+            format: PixelFormat::A8B8G8R8Unorm,
             view_type: ImageViewType::E1D,
             range: SubresourceRange::default(),
             size: Extent3D {
@@ -213,6 +215,15 @@ mod tests {
     use super::*;
     use crate::texture_cache::format_lookup_table::PixelFormat;
     use common::slot_vector::SlotId;
+
+    #[test]
+    fn null_image_view_preserves_upstream_zero_initialized_format() {
+        let view = ImageViewBase::null(NullImageViewParams);
+        // C++ PixelFormat format{} is the first enumerator, not Invalid.
+        assert_eq!(view.format, PixelFormat::A8B8G8R8Unorm);
+        assert_eq!(view.image_id, NULL_IMAGE_ID);
+        assert_eq!(view.gpu_addr, 0);
+    }
 
     #[test]
     fn image_view_base_keeps_constructing_after_incompatible_format_assert_like_upstream() {

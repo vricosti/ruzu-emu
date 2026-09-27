@@ -408,8 +408,9 @@ pub(crate) const WINDOW_ORIGIN: u32 = reg_index!(0x13AC);
 pub(crate) const VERTEX_ARRAY_INSTANCE_FIRST: u32 = reg_index!(0x1214);
 /// Vertex array instance subsequent (triggers subsequent instance draw).
 pub(crate) const VERTEX_ARRAY_INSTANCE_SUBSEQUENT: u32 = reg_index!(0x1218);
-/// Inline index 4x8 (index0 triggers 4-byte inline index push).
-pub(crate) const INLINE_INDEX_4X8_INDEX0: u32 = reg_index!(0x1300);
+/// `regs.inline_index_4x8.index0`: the second word of the two-word
+/// `InlineIndex4x8` block at 0x1300 (the first word is `count`/`start`).
+pub(crate) const INLINE_INDEX_4X8_INDEX0: u32 = reg_index!(0x1304);
 /// Invalidate texture data cache register.
 const INVALIDATE_TEXTURE_DATA_CACHE: u32 = reg_index!(0x0F74);
 /// Tiled cache barrier register.
@@ -430,8 +431,9 @@ const RENDER_ENABLE_MODE: u32 = RENDER_ENABLE_BASE + 2;
 /// Render enable override register.
 const RENDER_ENABLE_OVERRIDE: u32 = reg_index!(0x1944);
 const PRIMITIVE_TOPOLOGY_CONTROL: u32 = reg_index!(0x1948);
-/// Inline index 2x16 even (triggers 2-short inline index push).
-pub(crate) const INLINE_INDEX_2X16_EVEN: u32 = reg_index!(0x15EC);
+/// `regs.inline_index_2x16.even`: the second word of the two-word
+/// `InlineIndex2x16` block at 0x15EC (the first word is `count`/`start_odd`).
+pub(crate) const INLINE_INDEX_2X16_EVEN: u32 = reg_index!(0x15F0);
 /// Topology override register.
 pub(crate) const TOPOLOGY_OVERRIDE: u32 = reg_index!(0x1970);
 /// Index buffer 32-bit first register.

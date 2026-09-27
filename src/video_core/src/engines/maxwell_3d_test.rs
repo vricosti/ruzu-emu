@@ -2201,6 +2201,55 @@ fn test_inline_index_clears_after_draw() {
 }
 
 #[test]
+fn inline_index_2x16_triggers_on_the_even_odd_word_like_upstream() {
+    // Upstream `InlineIndex2x16` at 0x15EC is {count/start_odd, even/odd};
+    // `inline_index_2x16.even` is the second word, byte offset 0x15F0.
+    let count_word = 0x15EC / 4;
+    let even_odd_word = 0x15F0 / 4;
+    let mut engine = Maxwell3D::new();
+    engine.write_reg(DRAW_BEGIN, 4);
+    engine.write_reg(count_word, 6);
+    assert!(engine.draw_manager_state().inline_index_draw_indexes.is_empty());
+    for word in [0x0001_0000, 0x0000_0002, 0x0003_0002] {
+        engine.write_reg(even_odd_word, word);
+    }
+    engine.write_reg(DRAW_END, 0);
+
+    let draws = engine.take_draw_calls();
+    assert_eq!(draws.len(), 1);
+    assert!(draws[0].indexed);
+    assert_eq!(draws[0].index_format, IndexFormat::UnsignedInt);
+    assert_eq!(draws[0].index_buffer_count, 6);
+    assert_eq!(
+        draws[0].inline_index_data,
+        bytemuck::cast_slice::<u32, u8>(&[0, 1, 2, 0, 2, 3])
+    );
+}
+
+#[test]
+fn inline_index_4x8_triggers_on_the_index_word_like_upstream() {
+    // Upstream `InlineIndex4x8` at 0x1300 is {count/start, index0..3};
+    // `inline_index_4x8.index0` is the second word, byte offset 0x1304.
+    let count_word = 0x1300 / 4;
+    let index_word = 0x1304 / 4;
+    let mut engine = Maxwell3D::new();
+    engine.write_reg(DRAW_BEGIN, 4);
+    engine.write_reg(count_word, 4);
+    assert!(engine.draw_manager_state().inline_index_draw_indexes.is_empty());
+    engine.write_reg(index_word, 0x0302_0100);
+    engine.write_reg(DRAW_END, 0);
+
+    let draws = engine.take_draw_calls();
+    assert_eq!(draws.len(), 1);
+    assert!(draws[0].indexed);
+    assert_eq!(draws[0].index_buffer_count, 4);
+    assert_eq!(
+        draws[0].inline_index_data,
+        bytemuck::cast_slice::<u32, u8>(&[0, 1, 2, 3])
+    );
+}
+
+#[test]
 fn test_inline_index_keeps_draw_mode_owned_by_draw_manager() {
     let mut engine = Maxwell3D::new();
     engine.write_reg(DRAW_BEGIN, 4);

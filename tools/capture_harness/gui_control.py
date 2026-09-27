@@ -133,6 +133,20 @@ def replay(directory, source):
 
 
 def request(directory, payload):
+    if sys.platform == "win32":
+        endpoint = json.loads((directory / "control.json").read_text())
+        port = endpoint["port"]
+        token = endpoint["token"]
+        if type(port) is not int or not 1 <= port <= 65535 or not isinstance(token, str) or len(token) != 64:
+            raise ValueError("invalid Windows session endpoint")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            client.settimeout(10)
+            client.connect(("127.0.0.1", port))
+            client.send(json.dumps({**payload, "token": token}).encode())
+            response = json.loads(client.recv(16384))
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "input command failed"))
+        return response["result"]
     with tempfile.TemporaryDirectory(prefix="client-", dir=directory) as client_dir:
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
             reply_address = str(Path(client_dir) / "reply")

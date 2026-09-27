@@ -211,7 +211,15 @@ RENDERDOC_INCLUDE=/path/to/renderdoc/include \
 The tests use synthetic input sinks and a fake RenderDoc API. They do not inject input into your desktop,
 launch a game, or access a GPU. Physical controller mapping and scene progression still need a manual
 record/replay test on the intended emulator configuration.
-## Ruzu GUI control on macOS / Unix
+## Ruzu GUI control on Windows / macOS / Unix
+
+On Windows the same helper uses authenticated UDP restricted to `127.0.0.1`.
+Set `RUZU_INPUT_SESSION_DIR` to a **new directory under your private user profile**
+(for example beneath `%LOCALAPPDATA%`). The GUI writes `control.json` containing
+the ephemeral port and a random session token. Do not share this file or place
+the session in a shared directory. No endpoint is created without this opt-in.
+Use `python` instead of `python3` if appropriate. Commands and recording format
+are identical; Linux evdev sessions remain Linux-only.
 
 For process-local logical buttons rather than Linux physical-device sessions,
 launch the GUI with `RUZU_INPUT_SESSION_DIR=/tmp/ruzu-input-UNIQUE`. The directory

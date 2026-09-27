@@ -15,6 +15,20 @@ SPEC.loader.exec_module(CONTROL)
 
 
 class ReplyAddressTests(unittest.TestCase):
+    def test_windows_uses_authenticated_loopback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = "a" * 64
+            (root / "control.json").write_text(json.dumps({"port": 12345, "token": token}))
+            with patch.object(CONTROL.sys, "platform", "win32"), patch.object(CONTROL.socket, "socket") as factory:
+                client = factory.return_value.__enter__.return_value
+                client.recv.return_value = b'{"ok":true,"result":{"received":true}}'
+                payload = {"command": "status"}
+                self.assertEqual(CONTROL.request(root, payload), {"received": True})
+                client.connect.assert_called_once_with(("127.0.0.1", 12345))
+                self.assertEqual(json.loads(client.send.call_args.args[0]), {**payload, "token": token})
+                self.assertNotIn("token", payload)
+
     def test_darwin_reply_address_includes_terminator(self):
         self.check_address("darwin", True)
 
@@ -24,14 +38,14 @@ class ReplyAddressTests(unittest.TestCase):
     def check_address(self, platform, terminated):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(CONTROL.sys, "platform", platform):
-                with patch.object(CONTROL.socket, "socket") as factory:
+                with patch.object(CONTROL.socket, "AF_UNIX", 1, create=True), patch.object(CONTROL.socket, "socket") as factory:
                     client = factory.return_value.__enter__.return_value
                     client.recv.return_value = b'{"ok":true,"result":{"received":true}}'
                     result = CONTROL.request(Path(directory), {"command": "status"})
                     self.assertEqual(result, {"received": True})
                     bound = client.bind.call_args.args[0]
                     self.assertEqual(bound.endswith("\0"), terminated)
-                    self.assertTrue(bound.rstrip("\0").endswith("/reply"))
+                    self.assertEqual(Path(bound.rstrip("\0")).name, "reply")
                     self.assertEqual(
                         client.sendto.call_args.args[1],
                         str(Path(directory) / "control.sock"),

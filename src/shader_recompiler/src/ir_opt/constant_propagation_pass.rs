@@ -23,6 +23,12 @@ pub fn constant_propagation_pass(program: &mut Program) {
 }
 
 fn constant_propagation_pass_impl(mut env: Option<&mut dyn Environment>, program: &mut Program) {
+    // CollectShaderInfoPass runs later. Inspect the IR, including depth-only
+    // prepasses, instead of relying on stores_frag_depth being populated.
+    let preserves_depth_interpolation = program
+        .blocks
+        .iter()
+        .any(|block| block.iter().any(|inst| inst.opcode == Opcode::SetFragDepth));
     let block_order = if program.post_order_blocks.is_empty() {
         (0..program.blocks.len() as u32).collect::<Vec<_>>()
     } else {
@@ -85,7 +91,7 @@ fn constant_propagation_pass_impl(mut env: Option<&mut dyn Environment>, program
             ) {
                 propagate(program.block_mut(block_index).inst_mut(inst_index));
             }
-            fold_instruction_reference(program, inst_ref);
+            fold_instruction_reference(program, inst_ref, preserves_depth_interpolation);
         }
     }
 }
@@ -471,7 +477,11 @@ fn propagate(inst: &mut Inst) {
     }
 }
 
-fn fold_instruction_reference(program: &mut Program, inst_ref: InstRef) {
+fn fold_instruction_reference(
+    program: &mut Program,
+    inst_ref: InstRef,
+    preserves_depth_interpolation: bool,
+) {
     let opcode = program.block(inst_ref.block).inst(inst_ref.inst).opcode;
     match opcode {
         Opcode::IAdd32 => fold_add32(program, inst_ref),
@@ -539,7 +549,7 @@ fn fold_instruction_reference(program: &mut Program, inst_ref: InstRef) {
             Opcode::CompositeConstructF32x4,
             Opcode::CompositeInsertF32x4,
         ),
-        Opcode::FPMul32 => fold_fp_mul32(program, inst_ref),
+        Opcode::FPMul32 => fold_fp_mul32(program, inst_ref, preserves_depth_interpolation),
         Opcode::LogicalNot => fold_logical_not(program, inst_ref),
         Opcode::FSwizzleAdd => fold_fswizzle_add(program, inst_ref),
         Opcode::ImageSampleImplicitLod
@@ -1595,7 +1605,11 @@ fn fold_derivative_y_from_correction(
 }
 
 /// Port of upstream `FoldFPMul32`.
-fn fold_fp_mul32(program: &mut Program, inst_ref: InstRef) {
+fn fold_fp_mul32(
+    program: &mut Program,
+    inst_ref: InstRef,
+    preserves_depth_interpolation: bool,
+) {
     let inst = program.block(inst_ref.block).inst(inst_ref.inst).clone();
     if let (Some(Value::ImmF32(lhs)), Some(Value::ImmF32(rhs))) =
         (inst.args.first().copied(), inst.args.get(1).copied())
@@ -1618,6 +1632,15 @@ fn fold_fp_mul32(program: &mut Program, inst_ref: InstRef) {
     }
     if let Some(replacement) = fold_derivative_y_from_correction(program, lhs_value, rhs_value) {
         replace_with_identity(program, inst_ref, replacement);
+        return;
+    }
+    // Intentional correction to upstream FoldFPMul32: (a*w)*rcp(w) is not
+    // bit-equivalent to a. Folding only one of two depth-writing shaders (the
+    // other may hide rcp(w) behind a Phi) breaks equal-depth testing: a depth
+    // prepass and a G-buffer pass then differ by one depth ULP and drop
+    // fragment scanlines. Preserve the guest arithmetic for depth-exporting shaders;
+    // do not remove their depth offsets or weaken the depth comparison.
+    if preserves_depth_interpolation {
         return;
     }
     let (Some(lhs_ref), Some(rhs_ref)) = (
@@ -2297,6 +2320,51 @@ mod tests {
         let folded = program.block(0).inst(4);
         assert_eq!(folded.opcode, Opcode::Identity);
         assert_eq!(folded.args, vec![inst(0, 0)]);
+    }
+
+    #[test]
+    fn depth_export_preserves_interpolation_rounding() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        let block = program.block_mut(0);
+        block.append_inst(Inst::new(
+            Opcode::GetAttribute,
+            vec![Value::Attribute(Attribute::generic(1, 2)), Value::ImmU32(0)],
+        ));
+        block.append_inst(Inst::new(
+            Opcode::GetAttribute,
+            vec![Value::Attribute(Attribute::POSITION_W), Value::ImmU32(0)],
+        ));
+        block.append_inst(Inst::new(Opcode::FPMul32, vec![inst(0, 0), inst(0, 1)]));
+        block.append_inst(Inst::new(Opcode::FPRecip32, vec![inst(0, 1)]));
+        block.append_inst(Inst::new(Opcode::FPMul32, vec![inst(0, 2), inst(0, 3)]));
+        // Shader info is collected after this pass; inspect the actual export,
+        // not the (still false) cached stores_frag_depth flag.
+        block.append_inst(Inst::new(Opcode::SetFragDepth, vec![inst(0, 4)]));
+
+        constant_propagation_pass(&mut program);
+
+        assert_eq!(program.block(0).inst(4).opcode, Opcode::FPMul32);
+        assert_eq!(program.block(0).inst(4).args, vec![inst(0, 2), inst(0, 3)]);
+    }
+
+    #[test]
+    fn captured_pixel_depth_changes_when_interpolation_roundtrip_is_removed() {
+        // Inputs captured from a single pixel of a depth prepass/G-buffer pair.
+        // Prepass and G-buffer have identical inputs but the latter used to
+        // fold (attribute * position_w) * reciprocal(position_w) to attribute.
+        let attribute = 0.0999755859375_f32;
+        let position_w = 0.0003517017175909132_f32;
+        let position_z = 0.0035170172341167927_f32;
+        let reciprocal_w = 1.0_f32 / position_w;
+        let uncorrected = attribute * position_w;
+        let corrected = uncorrected * reciprocal_w;
+        let numerator = position_z * reciprocal_w;
+        let prepass = numerator * (1.0_f32 / (reciprocal_w + corrected));
+        let folded = numerator * (1.0_f32 / (reciprocal_w + attribute));
+
+        assert_eq!(folded.to_bits(), prepass.to_bits() + 1);
+        assert_ne!(prepass, folded, "Equal depth testing rejects the folded result");
     }
 
     #[test]

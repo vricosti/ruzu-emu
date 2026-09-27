@@ -198,6 +198,16 @@ const KEYBOARD_CSS: &str = "
 .swkbd-ok:disabled { background: #9aa8e8; color: #eeeeee; }
 .swkbd-selected { outline: 3px solid #3050e0; outline-offset: -3px; }
 .swkbd-hints { background-color: #f2f2f2; padding: 6px 12px; color: #333333; }
+.swkbd-dark .swkbd-header { background-color: #333333; }
+.swkbd-dark .swkbd-keys { background-color: #232323; }
+.swkbd-dark .swkbd-keys button { background: #3a3a3a; border: 1px solid #2c2c2c; color: #ececec; }
+.swkbd-dark .swkbd-keys button:hover { background: #474747; }
+.swkbd-dark .swkbd-keys button:disabled { color: #6e6e6e; }
+.swkbd-dark .swkbd-keys .swkbd-ok { background: #3050e0; color: #ffffff; }
+.swkbd-dark .swkbd-keys .swkbd-ok:hover { background: #2742c4; }
+.swkbd-dark .swkbd-keys .swkbd-ok:disabled { background: #2a3566; color: #8a8a8a; }
+.swkbd-dark .swkbd-selected { outline-color: #6f8bff; }
+.swkbd-dark .swkbd-hints { background-color: #232323; color: #d0d0d0; }
 ";
 
 /// Controller actions of upstream `QtSoftwareKeyboardDialog::TranslateButtonPress`
@@ -511,6 +521,11 @@ impl SoftwareKeyboardFrontend {
             .build();
         dialog.set_default_size(860, 520);
         dialog.add_css_class("ruzu-applet-navigation");
+        // Eden's dark themes carry no keyboard-specific rules, so the dialog
+        // inherits their dark palette; only the light default theme is light.
+        if dialog.settings().is_gtk_application_prefer_dark_theme() {
+            dialog.add_css_class("swkbd-dark");
+        }
 
         let content = dialog.content_area();
         content.set_spacing(0);

@@ -2287,7 +2287,7 @@ impl GMainWindow {
                     return glib::Propagation::Stop;
                 }
 
-                crate::gtk_compat::ask_question(
+                crate::gtk_compat::ask_cancel_default_question(
                     Some(&w.window),
                     "Ruzu",
                     "Are you sure you want to close ruzu?",
@@ -6419,7 +6419,7 @@ impl GMainWindow {
             }
             StopConfirmation::None => unreachable!(),
         };
-        crate::gtk_compat::ask_question(
+        crate::gtk_compat::ask_cancel_default_question(
             Some(&self.window),
             "ruzu",
             detail,

@@ -206,6 +206,19 @@ pub(crate) fn focus_dialog_response<D: IsA<gtk::Dialog> + Clone + 'static>(
 
     let dialog = dialog.clone().upcast::<gtk::Dialog>();
     dialog.set_focus_visible(true);
+    // Native activation can arrive after present() and the first idle on
+    // Windows. Apply the initial focus once when that activation completes,
+    // without resetting the user's selected button on later focus changes.
+    let activated = std::cell::Cell::new(dialog.is_active());
+    dialog.connect_is_active_notify(move |dialog| {
+        if dialog.is_active() && !activated.replace(true) {
+            if let Some(widget) = dialog.widget_for_response(response) {
+                gtk::prelude::GtkWindowExt::set_focus(dialog, Some(&widget));
+                widget.grab_focus();
+                dialog.set_focus_visible(true);
+            }
+        }
+    });
     glib::idle_add_local_once(move || {
         if let Some(widget) = dialog.widget_for_response(response) {
             gtk::prelude::GtkWindowExt::set_focus(&dialog, Some(&widget));
@@ -240,6 +253,35 @@ pub fn ask_question_with_navigation<P: IsA<gtk::Window>>(
     navigation: Option<ControllerNavigation>,
     callback: impl FnOnce(bool) + 'static,
 ) -> gtk::MessageDialog {
+    question_dialog(parent, message, detail, cancel_label, accept_label,
+                    navigation, ResponseType::Accept, callback)
+}
+
+/// Destructive confirmations start on Cancel, while ordinary applet questions
+/// retain their existing accepting default. Intentional divergence: Eden's
+/// Qt close/stop confirmations default to Yes.
+pub fn ask_cancel_default_question<P: IsA<gtk::Window>>(
+    parent: Option<&P>,
+    message: &str,
+    detail: &str,
+    cancel_label: &str,
+    accept_label: &str,
+    callback: impl FnOnce(bool) + 'static,
+) -> gtk::MessageDialog {
+    question_dialog(parent, message, detail, cancel_label, accept_label,
+                    None, ResponseType::Cancel, callback)
+}
+
+fn question_dialog<P: IsA<gtk::Window>>(
+    parent: Option<&P>,
+    message: &str,
+    detail: &str,
+    cancel_label: &str,
+    accept_label: &str,
+    navigation: Option<ControllerNavigation>,
+    initial_response: ResponseType,
+    callback: impl FnOnce(bool) + 'static,
+) -> gtk::MessageDialog {
     let title = message;
     let message = crate::i18n::tr(message);
     let detail = crate::i18n::tr(detail);
@@ -260,7 +302,7 @@ pub fn ask_question_with_navigation<P: IsA<gtk::Window>>(
     }
     dialog.add_button(&cancel_label, ResponseType::Cancel);
     dialog.add_button(&accept_label, ResponseType::Accept);
-    dialog.set_default_response(ResponseType::Accept);
+    dialog.set_default_response(initial_response);
 
     let callback: Rc<RefCell<Option<Box<dyn FnOnce(bool)>>>> =
         Rc::new(RefCell::new(Some(Box::new(callback))));
@@ -290,7 +332,7 @@ pub fn ask_question_with_navigation<P: IsA<gtk::Window>>(
         install_question_navigation(&dialog, navigation);
     }
     dialog.present();
-    focus_dialog_response(&dialog, ResponseType::Accept);
+    focus_dialog_response(&dialog, initial_response);
     dialog
 }
 
@@ -495,6 +537,43 @@ mod tests {
         assert!(!dialog.is_visible());
         dialog.destroy();
         assert_eq!(cancelled.get(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires GTK and a display; run alone with --test-threads=1"]
+    fn destructive_question_initially_focuses_cancel() {
+        gtk::init().unwrap();
+        let parent = gtk::Window::new();
+        parent.present();
+        let replies = Rc::new(RefCell::new(Vec::new()));
+        let reply = Rc::clone(&replies);
+        let dialog = ask_cancel_default_question(Some(&parent), "Ruzu",
+            "Are you sure you want to close ruzu?", "Cancel", "Close ruzu",
+            move |accepted| reply.borrow_mut().push(accepted));
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            context.iteration(false);
+            if dialog.is_active() && gtk::prelude::GtkWindowExt::focus(&dialog)
+                == dialog.widget_for_response(ResponseType::Cancel) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(dialog.is_active());
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&dialog),
+                   dialog.widget_for_response(ResponseType::Cancel));
+        assert!(dialog.gets_focus_visible());
+        // Subsequent activation notifications must not reset a chosen button.
+        focus_question_response(&dialog, ResponseType::Accept);
+        dialog.notify("is-active");
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&dialog),
+                   dialog.widget_for_response(ResponseType::Accept));
+        focus_question_response(&dialog, ResponseType::Cancel);
+        assert!(question_navigation_key(&dialog, NavigationKey::Enter));
+        assert_eq!(&*replies.borrow(), &[false]);
+        dialog.destroy();
+        parent.destroy();
     }
 
     #[test]

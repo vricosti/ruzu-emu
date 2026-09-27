@@ -556,6 +556,10 @@ impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
 /// shader compilation, pipeline caching, buffer management, dynamic state
 /// tracking, and command batching for efficient GPU rendering.
 pub struct RasterizerVulkan {
+    // Rust drops fields in declaration order, opposite to C++. Eden declares
+    // the fence manager after the caches: join its callback thread before any
+    // query/buffer/texture owner captured by those callbacks is destroyed.
+    fence_manager: GenericFenceManager<VkFence>,
     /// Non-owning counterpart of upstream `const Device& device`.
     ///
     /// Recorded commands copy this pointer-sized reference and resolve the
@@ -608,7 +612,6 @@ pub struct RasterizerVulkan {
     accelerate_dma: AccelerateDMA,
     common_buffer_cache: Box<VulkanCommonBufferCache>,
     texture_cache: Box<TextureCache>,
-    fence_manager: GenericFenceManager<VkFence>,
     fence_backend: VkFenceBackend,
     // Rust drops fields in declaration order. Keep this owner after every
     // cache that retains a non-owning pointer to it, matching C++ reverse
@@ -3010,12 +3013,7 @@ impl RasterizerInterface for RasterizerVulkan {
                 && (!target.has_aspect_stencil_bit() || use_stencil)
                 && !stencil_partial);
         let clear_layer = (clear_state.flags >> 10) & 0xFFFF;
-        let resolution = &common::settings::values().resolution_info;
-        let (up_scale, down_shift) = if self.texture_cache.base.is_rescaling {
-            (resolution.up_scale, resolution.down_shift)
-        } else {
-            (1, 0)
-        };
+        let (up_scale, down_shift) = clear_rescaling(self.texture_cache.base.is_rescaling);
 
         let mut clear_rect_2d = if clear_view.use_scissor() {
             scissor_state(
@@ -4133,11 +4131,56 @@ fn create_host_buffer(
     Ok((buffer, memory, mapped))
 }
 
+/// Mechanical extraction of Clear's two resolution scalars. Eden reads the
+/// global directly; Rust must release its settings read guard before invoking
+/// RecordViewports (or any other operation that reads settings again). A pending
+/// UI writer otherwise turns the nested read into a deadlock.
+fn clear_rescaling(is_rescaling: bool) -> (u32, u32) {
+    if is_rescaling {
+        let values = common::settings::values();
+        (values.resolution_info.up_scale, values.resolution_info.down_shift)
+    } else {
+        (1, 0)
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_rescaling_releases_settings_before_viewport_work() {
+        let expected = {
+            let values = common::settings::values();
+            (values.resolution_info.up_scale, values.resolution_info.down_shift)
+        };
+        let scale = clear_rescaling(true);
+        assert_eq!(scale, expected);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _settings = common::settings::values_mut();
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Clear must not retain a settings reader while the UI writes");
+        writer.join().unwrap();
+        // Viewport work can acquire its own read while Clear retains the scalars.
+        let _viewport_settings = common::settings::values();
+        assert_eq!(scale, expected);
+    }
+
+    #[test]
+    fn unscaled_clear_does_not_read_settings() {
+        let writer = common::settings::values_mut();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let clear = std::thread::spawn(move || tx.send(clear_rescaling(false)).unwrap());
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(writer);
+        clear.join().unwrap();
+        assert_eq!(result.unwrap(), (1, 0));
+    }
 
     #[test]
     fn gpu_tick_scope_exit_borrows_callback_without_arc_clone() {

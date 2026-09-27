@@ -8,21 +8,20 @@
 //!
 //! Key differences from upstream:
 //! - Uses the Rust `openssl` crate's safe wrappers instead of raw C OpenSSL API.
-//! - Uses `SslStream<TcpStreamAdapter>` instead of custom BIO callbacks.
-//!   The upstream custom BIO approach is needed because they use their own
-//!   socket abstraction (Network::SocketBase). Here we adapt the socket FD
-//!   into a TcpStream and use openssl's built-in stream integration.
+//! - Uses `SslStream<SocketAdapter>` for BIO callbacks; its Read/Write bridge
+//!   forwards to the same shared Network::SocketBase as upstream.
 //! - SSLKEYLOGFILE support uses `SslContextBuilder::set_keylog_callback`.
 
 use std::io::{self, Read as IoRead, Write as IoWrite};
-use std::net::TcpStream;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use openssl::ssl::{
     HandshakeError, MidHandshakeSslStream, SslConnector, SslMethod, SslStream, SslVerifyMode,
 };
 
 use crate::hle::result::ResultCode;
+use crate::internal_network::sockets::SocketBase;
+use crate::internal_network::network::Errno as NetworkErrno;
 
 use super::ssl_backend::{SslConnectionBackend, RESULT_INTERNAL_ERROR, RESULT_WOULD_BLOCK};
 
@@ -77,58 +76,41 @@ fn shared_connector() -> Result<SslConnector, ResultCode> {
     }
 }
 
-// =========================================================================
-// TcpStreamAdapter — wraps a raw FD for use with SslStream
-// =========================================================================
-
-/// Wraps a duplicated TcpStream for use with OpenSSL's SslStream.
-///
-/// In upstream, custom BIO callbacks (ReadCallback, WriteCallback, CtrlCallback)
-/// bridge OpenSSL to the emulator's Network::SocketBase. Here we duplicate the
-/// socket FD into a TcpStream, which gives us standard Read/Write impls that
-/// OpenSSL's SslStream can use directly.
-struct TcpStreamAdapter {
-    stream: TcpStream,
+// Rust Read/Write bridge for upstream's BIO ReadCallback/WriteCallback.
+// Retains the same shared SocketBase; never duplicates or takes ownership of
+// its native descriptor and never bypasses ProxySocket.
+struct SocketAdapter {
+    socket: Arc<Mutex<Box<dyn SocketBase>>>,
+    got_read_eof: bool,
 }
 
-impl TcpStreamAdapter {
-    /// Create an adapter by duplicating the given file descriptor.
-    ///
-    /// Corresponds to upstream `SetSocket(shared_ptr<SocketBase> socket)` which
-    /// stores the socket reference. Here we dup the FD to avoid taking ownership.
-    #[cfg(unix)]
-    fn from_fd(fd: i32) -> io::Result<Self> {
-        use std::os::fd::FromRawFd;
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let stream = unsafe { TcpStream::from_raw_fd(dup_fd) };
-        Ok(Self { stream })
-    }
-
-    #[cfg(not(unix))]
-    fn from_fd(_fd: i32) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "TcpStreamAdapter::from_fd is only supported on Unix",
-        ))
-    }
-}
-
-impl IoRead for TcpStreamAdapter {
+impl IoRead for SocketAdapter {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buf)
+        let (actual, error) = self.socket.lock().unwrap().recv(0, buf);
+        match error {
+            NetworkErrno::Success => {
+                if actual == 0 { self.got_read_eof = true; }
+                Ok(actual as usize)
+            }
+            NetworkErrno::Again => Err(io::ErrorKind::WouldBlock.into()),
+            _ => Err(io::Error::new(io::ErrorKind::Other, format!("Socket recv returned {error:?}"))),
+        }
     }
 }
 
-impl IoWrite for TcpStreamAdapter {
+impl IoWrite for SocketAdapter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stream.write(buf)
+        let (actual, error) = self.socket.lock().unwrap().send(buf, 0);
+        match error {
+            NetworkErrno::Success => Ok(actual as usize),
+            NetworkErrno::Again => Err(io::ErrorKind::WouldBlock.into()),
+            _ => Err(io::Error::new(io::ErrorKind::Other, format!("Socket send returned {error:?}"))),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
+        // Upstream BIO_CTRL_FLUSH has nothing to flush.
+        Ok(())
     }
 }
 
@@ -137,9 +119,9 @@ impl IoWrite for TcpStreamAdapter {
 // =========================================================================
 
 enum TlsStreamState {
-    Socket(TcpStreamAdapter),
-    Handshaking(MidHandshakeSslStream<TcpStreamAdapter>),
-    Connected(SslStream<TcpStreamAdapter>),
+    Socket(SocketAdapter),
+    Handshaking(MidHandshakeSslStream<SocketAdapter>),
+    Connected(SslStream<SocketAdapter>),
 }
 
 /// OpenSSL-backed SSL connection.
@@ -157,10 +139,6 @@ struct SslConnectionBackendOpenSsl {
     stream_state: Option<TlsStreamState>,
     /// Hostname for SNI and verification.
     hostname: Option<String>,
-    /// Whether we got a read EOF from the peer.
-    ///
-    /// Corresponds to `got_read_eof` in upstream.
-    got_read_eof: bool,
 }
 
 impl SslConnectionBackendOpenSsl {
@@ -169,13 +147,31 @@ impl SslConnectionBackendOpenSsl {
             connector: shared_connector()?,
             stream_state: None,
             hostname: None,
-            got_read_eof: false,
         })
+    }
+
+    // Same decision table as upstream HandleReturn, including WANT_WRITE
+    // during a read and protocol errors (which must not be reported as EOF).
+    fn handle_return(&self, result: Result<usize, openssl::ssl::Error>) -> Result<usize, ResultCode> {
+        use openssl::ssl::ErrorCode;
+        match result {
+            Ok(actual) => Ok(actual),
+            Err(error) => match error.code() {
+                ErrorCode::ZERO_RETURN => Ok(0),
+                ErrorCode::WANT_READ | ErrorCode::WANT_WRITE => Err(RESULT_WOULD_BLOCK),
+                ErrorCode::SYSCALL if matches!(self.stream_state.as_ref(),
+                    Some(TlsStreamState::Connected(stream)) if stream.get_ref().got_read_eof) => Ok(0),
+                _ => {
+                    log::error!("SSL I/O failed: {error}");
+                    Err(RESULT_INTERNAL_ERROR)
+                }
+            },
+        }
     }
 
     fn finish_handshake(
         &mut self,
-        result: Result<SslStream<TcpStreamAdapter>, HandshakeError<TcpStreamAdapter>>,
+        result: Result<SslStream<SocketAdapter>, HandshakeError<SocketAdapter>>,
     ) -> ResultCode {
         match result {
             Ok(stream) => {
@@ -193,6 +189,8 @@ impl SslConnectionBackendOpenSsl {
             }
             Err(HandshakeError::Failure(mid)) => {
                 log::error!("SSL handshake failed: {}", mid.error());
+                // Upstream retains the SSL object and socket after errors too.
+                self.stream_state = Some(TlsStreamState::Handshaking(mid));
                 RESULT_INTERNAL_ERROR
             }
             Err(HandshakeError::SetupFailure(error)) => {
@@ -204,20 +202,24 @@ impl SslConnectionBackendOpenSsl {
 }
 
 impl SslConnectionBackend for SslConnectionBackendOpenSsl {
+    fn pending(&self) -> i32 {
+        // SSL_pending counts decrypted application bytes, not bytes waiting on
+        // the underlying socket. Before creating SSL there cannot be any.
+        match self.stream_state.as_ref() {
+            Some(TlsStreamState::Connected(stream)) => stream.ssl().pending() as i32,
+            Some(TlsStreamState::Handshaking(stream)) => stream.ssl().pending() as i32,
+            Some(TlsStreamState::Socket(_)) | None => 0,
+        }
+    }
+
     /// SetSocket.
     ///
     /// Corresponds to `SSLConnectionBackendOpenSSL::SetSocket` in upstream.
-    fn set_socket(&mut self, socket_fd: i32) {
-        log::debug!("SSLConnectionBackendOpenSSL::SetSocket: fd={}", socket_fd);
-        match TcpStreamAdapter::from_fd(socket_fd) {
-            Ok(adapter) => {
-                self.stream_state = Some(TlsStreamState::Socket(adapter));
-            }
-            Err(e) => {
-                log::error!("Failed to dup socket fd {}: {}", socket_fd, e);
-                self.stream_state = None;
-            }
-        }
+    fn set_socket(&mut self, socket: Arc<Mutex<Box<dyn SocketBase>>>) {
+        self.stream_state = Some(TlsStreamState::Socket(SocketAdapter {
+            socket,
+            got_read_eof: false,
+        }));
     }
 
     /// SetHostName.
@@ -274,39 +276,8 @@ impl SslConnectionBackend for SslConnectionBackendOpenSsl {
             return Err(RESULT_INTERNAL_ERROR);
         };
 
-        match stream.ssl_read(data) {
-            Ok(0) => {
-                // SSL_ERROR_ZERO_RETURN — peer sent close_notify.
-                // Upstream HandleReturn: *actual = 0; return ResultSuccess.
-                self.got_read_eof = true;
-                Ok(0)
-            }
-            Ok(n) => Ok(n),
-            Err(e) => {
-                match e.into_io_error() {
-                    Ok(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        // SSL_ERROR_WANT_READ or SSL_ERROR_WANT_WRITE
-                        Err(RESULT_WOULD_BLOCK)
-                    }
-                    Ok(err) => {
-                        // SSL_ERROR_SYSCALL with got_read_eof => return success(0)
-                        if self.got_read_eof {
-                            log::debug!("SSL read: SSL_ERROR_SYSCALL because server hung up");
-                            Ok(0)
-                        } else {
-                            log::error!("SSL read error: {}", err);
-                            Err(RESULT_INTERNAL_ERROR)
-                        }
-                    }
-                    Err(_ssl_err) => {
-                        // SSL protocol error (SSL_ERROR_ZERO_RETURN, etc.)
-                        log::debug!("SSL read: connection closed");
-                        self.got_read_eof = true;
-                        Ok(0)
-                    }
-                }
-            }
-        }
+        let result = stream.ssl_read(data);
+        self.handle_return(result)
     }
 
     /// Write.
@@ -318,20 +289,8 @@ impl SslConnectionBackend for SslConnectionBackendOpenSsl {
             return Err(RESULT_INTERNAL_ERROR);
         };
 
-        match stream.ssl_write(data) {
-            Ok(n) => Ok(n),
-            Err(e) => match e.into_io_error() {
-                Ok(err) if err.kind() == io::ErrorKind::WouldBlock => Err(RESULT_WOULD_BLOCK),
-                Ok(err) => {
-                    log::error!("SSL write error: {}", err);
-                    Err(RESULT_INTERNAL_ERROR)
-                }
-                Err(_ssl_err) => {
-                    log::error!("SSL write: protocol error");
-                    Err(RESULT_INTERNAL_ERROR)
-                }
-            },
-        }
+        let result = stream.ssl_write(data);
+        self.handle_return(result)
     }
 
     /// GetServerCerts.
@@ -377,6 +336,138 @@ pub fn create_ssl_connection_backend() -> Result<Box<dyn SslConnectionBackend>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream;
+    use crate::internal_network::sockets::Socket;
+
+    fn shared_tcp_socket(stream: TcpStream) -> Arc<Mutex<Box<dyn SocketBase>>> {
+        #[cfg(unix)]
+        let handle = { use std::os::fd::IntoRawFd; stream.into_raw_fd() };
+        #[cfg(windows)]
+        let handle = { use std::os::windows::io::IntoRawSocket; stream.into_raw_socket() as usize };
+        Arc::new(Mutex::new(Box::new(Socket::from_fd(handle))))
+    }
+
+    #[test]
+    fn shared_transport_keeps_identity_propagates_close_and_tracks_raw_eof() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let socket = shared_tcp_socket(client);
+        let weak = Arc::downgrade(&socket);
+        let mut adapter = SocketAdapter { socket: Arc::clone(&socket), got_read_eof: false };
+        assert_eq!(socket.lock().unwrap().set_non_block(true), NetworkErrno::Success);
+        assert_eq!(adapter.read(&mut [0; 1]).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(!adapter.got_read_eof);
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(socket.lock().unwrap().set_non_block(false), NetworkErrno::Success);
+        assert_eq!(adapter.read(&mut [0; 1]).unwrap(), 0);
+        assert!(adapter.got_read_eof);
+        assert_eq!(socket.lock().unwrap().close(), NetworkErrno::Success);
+        assert!(adapter.write(b"x").is_err());
+        drop(socket);
+        assert!(weak.upgrade().is_some());
+        drop(adapter);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn shared_socket_nonblocking_handshake_preserves_ssl_state() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let socket = shared_tcp_socket(client);
+        assert_eq!(socket.lock().unwrap().set_non_block(true), NetworkErrno::Success);
+        let mut backend = SslConnectionBackendOpenSsl::new().unwrap();
+        backend.set_socket(Arc::clone(&socket));
+        backend.set_host_name("localhost");
+        for _ in 0..2 {
+            assert_eq!(backend.do_handshake(), RESULT_WOULD_BLOCK);
+            let Some(TlsStreamState::Handshaking(stream)) = backend.stream_state.as_ref() else {
+                panic!("handshake state discarded");
+            };
+            assert!(Arc::ptr_eq(&stream.get_ref().socket, &socket));
+        }
+        let weak = Arc::downgrade(&socket);
+        drop(socket);
+        assert!(weak.upgrade().is_some());
+        drop(backend);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn pending_counts_decrypted_bytes_without_consuming_them() {
+        use openssl::asn1::Asn1Time;
+        use openssl::hash::MessageDigest;
+        use openssl::pkey::PKey;
+        use openssl::rsa::Rsa;
+        use openssl::ssl::SslAcceptor;
+        use openssl::x509::{X509NameBuilder, X509};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let mut backend = SslConnectionBackendOpenSsl::new().unwrap();
+        assert_eq!(backend.pending(), 0);
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "localhost").unwrap();
+        let name = name.build();
+        let mut cert = X509::builder().unwrap();
+        cert.set_version(2).unwrap();
+        cert.set_subject_name(&name).unwrap();
+        cert.set_issuer_name(&name).unwrap();
+        cert.set_pubkey(&key).unwrap();
+        cert.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        cert.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();
+        cert.sign(&key, MessageDigest::sha256()).unwrap();
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acceptor.set_private_key(&key).unwrap();
+        acceptor.set_certificate(&cert.build()).unwrap();
+        let acceptor = acceptor.build();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        for stream in [&socket, &peer] {
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+        let server = std::thread::spawn(move || {
+            let mut stream = acceptor.accept(peer).unwrap();
+            // One TLS record: reading one byte leaves five decrypted bytes.
+            assert_eq!(stream.ssl_write(b"abcdef").unwrap(), 6);
+            let mut ack = [0];
+            stream.read_exact(&mut ack).unwrap();
+            assert_eq!(ack, [1]);
+            // Deliberately violate TLS framing after a valid exchange. This
+            // must be an SSL protocol error, not a successful EOF.
+            stream.get_mut().write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+        });
+        let shared_socket = shared_tcp_socket(socket);
+        backend.set_socket(Arc::clone(&shared_socket));
+        assert_eq!(backend.pending(), 0);
+        let Some(TlsStreamState::Socket(adapter)) = backend.stream_state.take() else {
+            unreachable!();
+        };
+        let mut config = backend.connector.configure().unwrap();
+        // The local fixture is self-signed; production verification is unchanged.
+        config.set_verify(SslVerifyMode::NONE);
+        let stream = config.connect("localhost", adapter).unwrap_or_else(|_| panic!("local TLS handshake failed"));
+        backend.stream_state = Some(TlsStreamState::Connected(stream));
+        let mut first = [0];
+        assert_eq!(backend.read(&mut first).unwrap(), 1);
+        assert_eq!(first, [b'a']);
+        assert_eq!(backend.pending(), 5);
+        assert_eq!(backend.pending(), 5);
+        let mut rest = [0; 5];
+        assert_eq!(backend.read(&mut rest).unwrap(), 5);
+        assert_eq!(&rest, b"bcdef");
+        assert_eq!(backend.pending(), 0);
+        assert_eq!(backend.write(&[1]).unwrap(), 1);
+        assert_eq!(backend.read(&mut first), Err(RESULT_INTERNAL_ERROR));
+        server.join().unwrap();
+    }
 
     #[test]
     fn openssl_backend_creates_successfully() {
@@ -431,11 +522,8 @@ mod tests {
         );
 
         let mut backend = SslConnectionBackendOpenSsl::new().unwrap();
-        backend.set_socket(sockets[0]);
+        backend.set_socket(Arc::new(Mutex::new(Box::new(Socket::from_fd(sockets[0])))));
         backend.set_host_name("localhost");
-        unsafe {
-            libc::close(sockets[0]);
-        }
 
         assert_eq!(backend.do_handshake(), RESULT_WOULD_BLOCK);
         assert!(matches!(

@@ -26,12 +26,9 @@ enum IpsFileType {
 
 /// Identify the IPS file type from its 5-byte magic.
 fn identify_magic(magic: &[u8]) -> IpsFileType {
-    if magic.len() != 5 {
-        return IpsFileType::Error;
-    }
-    if magic == b"PATCH" {
+    if magic.starts_with(b"PATCH") {
         IpsFileType::Ips
-    } else if magic == b"IPS32" {
+    } else if magic.starts_with(b"IPS32") {
         IpsFileType::Ips32
     } else {
         IpsFileType::Error
@@ -41,8 +38,8 @@ fn identify_magic(magic: &[u8]) -> IpsFileType {
 /// Check if the data represents the EOF marker for the given IPS type.
 fn is_eof(file_type: IpsFileType, data: &[u8]) -> bool {
     match file_type {
-        IpsFileType::Ips => data == b"EOF",
-        IpsFileType::Ips32 => data == b"EEOF",
+        IpsFileType::Ips => data.starts_with(b"EOF"),
+        IpsFileType::Ips32 => data.starts_with(b"EEOF"),
         IpsFileType::Error => false,
     }
 }
@@ -143,21 +140,6 @@ pub fn patch_ips(source: &VirtualFile, ips: &VirtualFile) -> Option<VirtualFile>
 // IPSwitch text patch compiler
 // =============================================================================
 
-/// Escape character map for IPSwitch string replacements.
-const ESCAPE_MAP: &[(&str, &str)] = &[
-    ("\\a", "\x07"),
-    ("\\b", "\x08"),
-    ("\\f", "\x0C"),
-    ("\\n", "\n"),
-    ("\\r", "\r"),
-    ("\\t", "\t"),
-    ("\\v", "\x0B"),
-    ("\\\\", "\\"),
-    ("\\'", "'"),
-    ("\\\"", "\""),
-    ("\\?", "?"),
-];
-
 /// A single IPSwitch patch (a set of offset-to-bytes records).
 struct IpSwitchPatch {
     enabled: bool,
@@ -182,14 +164,30 @@ fn starts_with(base: &str, check: &str) -> bool {
     base.starts_with(check)
 }
 
-fn escape_string_sequences(mut input: String) -> String {
-    for &(from, to) in ESCAPE_MAP {
-        // Replace all occurrences
-        while let Some(idx) = input.find(from) {
-            input.replace_range(idx..idx + from.len(), to);
-        }
+fn escape_string_sequences(input: String) -> String {
+    // Upstream EscapeStringSequences consumes each escape once, without
+    // interpreting the resulting text again (in particular an escaped slash).
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        output.push(if ch == '\\' {
+            match chars.next() {
+                Some('a') => '\x07',
+                Some('b') => '\x08',
+                Some('e') => '\x1b',
+                Some('f') => '\x0c',
+                Some('n') => '\n',
+                Some('r') => '\r',
+                Some('t') => '\t',
+                Some('v') => '\x0b',
+                Some(other) => other,
+                None => '\\',
+            }
+        } else {
+            ch
+        });
     }
-    input
+    output
 }
 
 /// Parse an integer using the base-prefix rules of C's `strtoll(..., 0)`.
@@ -348,10 +346,6 @@ impl IpSwitchCompiler {
                 self.last_comment = comment.trim_start().to_string();
             } else if starts_with(&line, "@enabled") || starts_with(&line, "@disabled") {
                 let enabled = starts_with(&line, "@enabled");
-                if i == 0 {
-                    return;
-                }
-
                 log::info!(
                     "[IPSwitchCompiler ('{}')] Parsing patch '{}' ({})",
                     self.patch_text.get_name(),
@@ -490,6 +484,7 @@ mod tests {
 
     #[test]
     fn test_identify_magic() {
+        assert_eq!(identify_magic(b"PATCHrecord"), IpsFileType::Ips);
         assert_eq!(identify_magic(b"PATCH"), IpsFileType::Ips);
         assert_eq!(identify_magic(b"IPS32"), IpsFileType::Ips32);
         assert_eq!(identify_magic(b"OTHER"), IpsFileType::Error);
@@ -498,6 +493,8 @@ mod tests {
 
     #[test]
     fn test_is_eof() {
+        assert!(is_eof(IpsFileType::Ips, b"EOFextra"));
+        assert!(is_eof(IpsFileType::Ips32, b"EEOFextra"));
         assert!(is_eof(IpsFileType::Ips, b"EOF"));
         assert!(!is_eof(IpsFileType::Ips, b"EEOF"));
         assert!(is_eof(IpsFileType::Ips32, b"EEOF"));
@@ -529,6 +526,9 @@ mod tests {
 
     #[test]
     fn test_escape_string_sequences() {
+        assert_eq!(escape_string_sequences(r"\\n".into()), r"\n");
+        assert_eq!(escape_string_sequences("\\e\\z\\".into()), "\x1bz\\");
+        assert_eq!(escape_string_sequences("x".repeat(1024)), "x".repeat(1024));
         assert_eq!(
             escape_string_sequences("hello\\nworld".to_string()),
             "hello\nworld"
@@ -537,6 +537,23 @@ mod tests {
             escape_string_sequences("tab\\there".to_string()),
             "tab\there"
         );
+    }
+
+    #[test]
+    fn ipswitch_applies_records_larger_than_256_bytes() {
+        for record in ["AB".repeat(1024), format!("\"{}\"", "x".repeat(1024))] {
+            let expected = if record.starts_with('"') { b'x' } else { 0xab };
+            let patch_text: VirtualFile = Arc::new(VectorVfsFile::new(
+                format!("@enabled\n00000000 {record}\n@stop\n").into_bytes(),
+                "long.pchtxt".into(), None,
+            ));
+            let source: VirtualFile = Arc::new(VectorVfsFile::new(
+                vec![0; 1025], "input".into(), None,
+            ));
+            let result = IpSwitchCompiler::new(patch_text).apply(&source).unwrap().read_all_bytes();
+            assert_eq!(&result[..1024], vec![expected; 1024]);
+            assert_eq!(result[1024], 0);
+        }
     }
 
     #[test]

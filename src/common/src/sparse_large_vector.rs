@@ -434,12 +434,13 @@ impl<T> SparseLargeVector<T> {
     ///
     /// Upstream `GetAndFault`.
     pub fn get_and_fault(&mut self, index: usize) -> &mut T {
-        if index > self.alloc_size / size_of::<T>() {
+        if index >= self.alloc_size / size_of::<T>() {
             unreachable!("Out of bounds RW access on SparseLargeVector @ {}", index);
         }
 
         if !self.is_committed_page(index) {
-            self.commit_page(index);
+            assert!(self.commit_page(index),
+                "Cannot access SparseLargeVector index {} with RW permission", index);
         }
         unsafe { &mut *self.base_ptr.add(index) }
     }
@@ -466,12 +467,12 @@ impl<T> SparseLargeVector<T> {
 
     /// Upstream `Set`.
     pub fn set(&mut self, index: usize, value: T) {
-        if index > self.alloc_size / size_of::<T>() {
+        if index >= self.alloc_size / size_of::<T>() {
             log::error!("Out of bounds write on SparseLargeVector @ {}", index);
             return;
         }
-        if !self.is_committed_page(index) {
-            self.commit_page(index);
+        if !self.is_committed_page(index) && !self.commit_page(index) {
+            return;
         }
         unsafe { ptr::write(self.base_ptr.add(index), value) };
     }
@@ -595,29 +596,36 @@ impl<T> SparseLargeVector<T> {
     }
 
     /// Upstream `CommitPage`.
-    fn commit_page(&self, index: usize) {
+    fn commit_page(&self, index: usize) -> bool {
+        if index >= self.size() {
+            return false;
+        }
         let page_index = (index * size_of::<T>()) >> host_page_bits();
         let Some(word) = self.committed_pages.get(page_index >> 6) else {
-            return;
+            return false;
         };
         let page = (unsafe { self.base_ptr.add(index) } as usize) & host_page_mask() as usize;
         #[cfg(windows)]
         {
-            assert!(
-                win::commit_vector_page(page, true),
-                "Failed to commit SparseLargeVector page"
-            );
+            if !win::commit_vector_page(page, true) {
+                return false;
+            }
         }
         #[cfg(not(windows))]
         unsafe {
-            libc::mprotect(
+            if libc::mprotect(
                 page as *mut _,
                 host_page_size() as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
-            );
+            ) != 0 {
+                log::error!("Failed to commit large buffer region at index {}, error {}",
+                    index, std::io::Error::last_os_error());
+                return false;
+            }
         }
 
         word.fetch_or(1u64 << (page_index & 63), Ordering::Release);
+        true
     }
 }
 
@@ -650,6 +658,38 @@ unsafe impl<T: Sync> Sync for SparseLargeVector<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_past_end_never_commits_or_returns_a_reference() {
+        let mut v = SparseLargeVector::<u64>::with_count(1);
+        assert!(!v.commit_page(v.size()));
+        v.set(v.size(), 123);
+        assert!(!v.is_committed_page(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            v.get_and_fault(v.size());
+        }));
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejected_commit_keeps_bitmap_clear_and_prevents_writes() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_NOACCESS};
+        let mut v = SparseLargeVector::<u64>::with_count(host_page_size() as usize / 8);
+        // A committed NOACCESS page must not be silently made writable by
+        // Ruzu's demand-read/permission-promotion policy.
+        assert!(!unsafe { VirtualAlloc(v.base_ptr.cast(), host_page_size() as usize,
+            MEM_COMMIT, PAGE_NOACCESS) }.is_null());
+        assert!(!v.commit_page(0));
+        assert!(!v.is_committed_page(0));
+        v.set(0, 123); // Must return without touching the protected page.
+        assert!(!v.is_committed_page(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            v.get_and_fault(0);
+        }));
+        assert!(result.is_err());
+        assert!(!v.is_committed_page(0));
+    }
 
     #[test]
     fn zero_region_decommits_full_pages_preserving_partial_edges() {

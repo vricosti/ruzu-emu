@@ -459,10 +459,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::WriteMemory`
     pub fn write_memory(&mut self, device_addr: VAddr, size: u64) {
-        if self
-            .memory_tracker
-            .is_region_gpu_modified(device_addr, size)
-        {
+        if self.is_region_gpu_modified(device_addr, size as usize) {
             self.clear_download(device_addr, size);
             self.gpu_modified_ranges
                 .subtract(device_addr, size as usize);
@@ -1238,16 +1235,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         match post_op {
             ObtainBufferOperation::MarkAsWritten => {
-                self.mark_written_buffer(buffer_id, device_addr, size);
+                self.mark_written_buffer(buffer_id, device_addr, size, false);
             }
             ObtainBufferOperation::DiscardWrite => {
-                let device_addr_start = device_addr & !63u64; // AlignDown(device_addr, 64)
-                let device_addr_end =
-                    device_addr.wrapping_add(size as u64).wrapping_add(63) & !63u64;
-                let new_size = device_addr_end.wrapping_sub(device_addr_start);
-                self.clear_download(device_addr_start, new_size);
+                self.clear_download(device_addr, size as u64);
                 self.gpu_modified_ranges
-                    .subtract(device_addr_start, new_size as usize);
+                    .subtract(device_addr, size as usize);
             }
             _ => {}
         }
@@ -1590,6 +1583,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if has_new_downloads {
             self.memory_tracker
                 .mark_region_as_gpu_modified(cpu_dest_address, amount);
+            let should_sync = {
+                let values = common::settings::values();
+                common::settings::is_gpu_fence_behavior_balanced(&values)
+                    || common::settings::is_gpu_fence_behavior_accurate(&values)
+            };
+            if should_sync {
+                self.runtime.finish();
+            }
         }
 
         // Match DeviceGuestMemoryScoped<UnsafeReadWrite>: the host buffer copy
@@ -2375,7 +2376,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             let offset = self.slot_buffers[segment.buffer_id].offset(segment.device_addr);
             self.slot_buffers[segment.buffer_id].mark_usage(offset as u64, segment.size as u64);
             if is_written {
-                self.mark_written_buffer(segment.buffer_id, segment.device_addr, segment.size);
+                self.mark_written_buffer(segment.buffer_id, segment.device_addr, segment.size, false);
             }
             self.runtime.push_multi_range_source(
                 &self.slot_buffers[segment.buffer_id],
@@ -2410,7 +2411,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             self.slot_buffers[binding.buffer_id].mark_usage(offset as u64, binding.size as u64);
 
             if is_written {
-                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
+                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size, false);
             }
 
             let buffer = &mut self.slot_buffers[binding.buffer_id];
@@ -2443,7 +2444,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
             let is_written = ((written_mask >> idx) & 1) != 0;
             if is_written {
-                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
+                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size, false);
             }
             let is_image = P::SEPARATE_IMAGE_BUFFER_BINDINGS && ((image_mask >> idx) & 1) != 0;
 
@@ -2490,7 +2491,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             {
                 self.touch_buffer(binding.buffer_id);
                 self.synchronize_buffer(binding.buffer_id, binding.device_addr, binding.size);
-                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
+                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size, false);
                 buffer_id = binding.buffer_id;
                 offset = self.slot_buffers[buffer_id].offset(binding.device_addr);
                 size = binding.size;
@@ -2597,7 +2598,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             self.slot_buffers[binding.buffer_id].mark_usage(offset as u64, binding.size as u64);
 
             if is_written {
-                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
+                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size, true);
             }
 
             let buffer = &mut self.slot_buffers[binding.buffer_id];
@@ -2642,7 +2643,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
             let is_written = ((written_mask >> idx) & 1) != 0;
             if is_written {
-                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size);
+                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size, false);
             }
             let is_image = P::SEPARATE_IMAGE_BUFFER_BINDINGS && ((image_mask >> idx) & 1) != 0;
 
@@ -3335,11 +3336,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Mark a buffer region as GPU-written.
     ///
     /// Upstream: `BufferCache<P>::MarkWrittenBuffer`
-    fn mark_written_buffer(&mut self, buffer_id: BufferId, device_addr: VAddr, size: u32) {
+    fn mark_written_buffer(&mut self, buffer_id: BufferId, device_addr: VAddr, size: u32, needs_sync: bool) {
         if !P::IS_OPENGL {
             let buffer = &mut self.slot_buffers[buffer_id];
             let offset = device_addr.wrapping_sub(buffer.cpu_addr());
-            buffer.mark_written_region(self.runtime.current_tick(), offset, u64::from(size));
+            let tick = needs_sync.then(|| self.runtime.current_tick());
+            buffer.mark_written_region(tick, offset, u64::from(size));
         }
         self.memory_tracker
             .mark_region_as_gpu_modified(device_addr, size as u64);
@@ -3360,9 +3362,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if !buffer_id.is_valid() {
             return self.create_buffer(device_addr, size, sparse_compatible);
         }
-        self.wait_for_gpu_fence_if_needed(buffer_id);
-        let buffer = &self.slot_buffers[buffer_id];
-        if buffer.is_in_bounds(device_addr, size as u64) {
+        if self.slot_buffers[buffer_id].is_in_bounds(device_addr, size as u64) {
+            let should_sync = common::settings::is_gpu_fence_behavior_accurate(
+                &common::settings::values(),
+            );
+            if should_sync {
+                self.synchronize_buffer_writes(buffer_id);
+            }
+            let buffer = &self.slot_buffers[buffer_id];
             // Upstream: `if constexpr (requires { buffer.IsSparseCompatible(); })`.
             let usable = !(sparse_compatible && !buffer.is_sparse_compatible());
             if usable {
@@ -3372,25 +3379,13 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.create_buffer(device_addr, size, sparse_compatible)
     }
 
-    /// Port of `BufferCache<P>::WaitForGpuFenceIfNeeded`.
-    fn wait_for_gpu_fence_if_needed(&mut self, buffer_id: BufferId) {
+    /// Port of `BufferCache<P>::SynchronizeBufferWrites`.
+    fn synchronize_buffer_writes(&mut self, buffer_id: BufferId) {
         if P::IS_OPENGL {
             return;
         }
-        let (accurate, strict) = {
-            let values = common::settings::values();
-            (
-                common::settings::is_gpu_fence_behavior_accurate(&values),
-                common::settings::is_gpu_fence_behavior_strict(&values),
-            )
-        };
-        if !accurate && !strict {
-            return;
-        }
-        let gpu_tick_delay = if strict { 0 } else { 3 };
         let buffer_tick = self.slot_buffers[buffer_id].write_tick();
-        let gpu_tick = self.runtime.known_gpu_tick();
-        if buffer_tick > gpu_tick.wrapping_add(gpu_tick_delay) {
+        if !self.runtime.is_free(buffer_tick) {
             self.runtime.wait(buffer_tick);
         }
     }
@@ -3635,17 +3630,30 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let buffer_start = self.slot_buffers[buffer_id].cpu_addr_cached;
 
         let upload_copies = &mut self.upload_copies;
+        let gpu_modified_ranges = &self.gpu_modified_ranges;
+        let mut add_upload = |start: VAddr, end: VAddr| {
+            if start == end {
+                return;
+            }
+            let range_size = end - start;
+            upload_copies.push(BufferCopy {
+                src_offset: total_size_bytes,
+                dst_offset: start - buffer_start,
+                size: range_size,
+            });
+            total_size_bytes += range_size;
+            largest_copy = largest_copy.max(range_size);
+        };
         self.memory_tracker.for_each_upload_range(
             device_addr,
             size as u64,
             &mut |device_addr_out, range_size| {
-                upload_copies.push(BufferCopy {
-                    src_offset: total_size_bytes,
-                    dst_offset: device_addr_out - buffer_start,
-                    size: range_size,
+                let mut upload_start = device_addr_out;
+                gpu_modified_ranges.for_each_in_range(device_addr_out, range_size as usize, |gpu_start, gpu_end| {
+                    add_upload(upload_start, gpu_start);
+                    upload_start = gpu_end;
                 });
-                total_size_bytes += range_size;
-                largest_copy = largest_copy.max(range_size);
+                add_upload(upload_start, device_addr_out + range_size);
             },
         );
 
@@ -3715,12 +3723,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 }
                 continue;
             }
-            if *common::settings::values()
-                .enable_gpu_buffer_readback
-                .get_value()
-            {
-                self.download_buffer_memory_range(_buffer_id, device_addr, copy.size);
-            }
             if let Some(ref dm) = self.device_memory {
                 let immediate_buffer =
                     Self::immediate_buffer(&mut self.immediate_buffer_alloc, largest_copy as usize);
@@ -3746,12 +3748,6 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mut staging = self.runtime.upload_staging_buffer(total_size_bytes);
         for copy in copies.iter_mut() {
             let device_addr = self.slot_buffers[buffer_id].cpu_addr() + copy.dst_offset;
-            if *common::settings::values()
-                .enable_gpu_buffer_readback
-                .get_value()
-            {
-                self.download_buffer_memory_range(buffer_id, device_addr, copy.size);
-            }
             if let Some(ref dm) = self.device_memory {
                 let src_start = copy.src_offset as usize;
                 let src_end = src_start + copy.size as usize;
@@ -4731,81 +4727,37 @@ mod tests {
     }
 
     #[test]
-    fn non_granular_upload_readback_setting_preserves_gpu_bytes_only_when_enabled() {
-        check_upload_readback_setting::<false>();
+    fn direct_upload_does_not_read_gpu_bytes_back_to_guest_memory() {
+        check_upload_without_readback::<false>();
+        check_upload_without_readback::<true>();
     }
 
-    #[test]
-    fn mapped_upload_readback_setting_preserves_gpu_bytes_only_when_enabled() {
-        check_upload_readback_setting::<true>();
-    }
-
-    fn check_upload_readback_setting<const MAPPED: bool>() {
-        struct RestoreReadback(bool, bool);
-        impl Drop for RestoreReadback {
-            fn drop(&mut self) {
-                let mut values = common::settings::values_mut();
-                values.enable_gpu_buffer_readback.setting.set_value(self.0);
-                values.enable_gpu_buffer_readback.set_global(self.1);
-            }
+    fn check_upload_without_readback<const MAPPED: bool>() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams<MAPPED>, DummyTracker>::new(
+            &tracker, TestBufferCacheRuntime::default(),
+        );
+        let guest_bytes = Arc::new(parking_lot::Mutex::new(vec![0x11; 0x2_0000]));
+        cache.set_device_memory(Box::new(SharedDeviceMemory { bytes: Arc::clone(&guest_bytes) }));
+        let address = 0x1_0ff0;
+        let id = cache.create_buffer(address, 32, false);
+        let offset = u64::from(cache.slot_buffers[id].offset(address));
+        cache.slot_buffers[id].immediate_upload(offset, &[0x77; 32]);
+        cache.memory_tracker.unmark_region_as_cpu_modified(address, 32);
+        cache.memory_tracker.mark_region_as_gpu_modified(address, 32);
+        cache.gpu_modified_ranges.add(address, 32);
+        // SynchronizeBuffer filters GPU-owned ranges before this low-level copy.
+        // UploadMemory itself must neither download GPU data nor mutate guest RAM.
+        let mut copies = [BufferCopy { src_offset: 0, dst_offset: offset, size: 32 }];
+        if MAPPED {
+            cache.mapped_upload_memory(id, 32, &mut copies);
+        } else {
+            cache.immediate_upload_memory(id, 32, &copies);
         }
-        let previous = {
-            let values = common::settings::values();
-            RestoreReadback(
-                *values.enable_gpu_buffer_readback.get_value_global(),
-                values.enable_gpu_buffer_readback.using_global(),
-            )
-        };
-        for enabled in [false, true] {
-            {
-                let mut values = common::settings::values_mut();
-                values.enable_gpu_buffer_readback.set_global(true);
-                values.enable_gpu_buffer_readback.set_value(enabled);
-            }
-            let tracker = DummyTracker;
-            let mut cache = BufferCache::<TestParams<MAPPED>, DummyTracker>::new(
-                &tracker,
-                TestBufferCacheRuntime::default(),
-            );
-            let guest_bytes = Arc::new(parking_lot::Mutex::new(vec![0x11; 0x2_0000]));
-            cache.set_device_memory(Box::new(SharedDeviceMemory {
-                bytes: Arc::clone(&guest_bytes),
-            }));
-            // Cross a device page so ImmediateUploadMemory takes the readback
-            // branch in Eden, rather than its direct-pointer granular branch.
-            let address = 0x1_0ff0;
-            let payload = [0x77; 32];
-            assert!(!BufferCache::<TestParams, DummyTracker>::is_range_granular(
-                address, payload.len(),
-            ));
-            let id = cache.create_buffer(address, payload.len() as u32, false);
-            let offset = u64::from(cache.slot_buffers[id].offset(address));
-            cache.slot_buffers[id].immediate_upload(offset, &payload);
-            cache.memory_tracker.unmark_region_as_cpu_modified(address, 32);
-            cache.memory_tracker.mark_region_as_gpu_modified(address, 32);
-            cache.gpu_modified_ranges.add(address, 32);
-
-            let mut copies = [BufferCopy {
-                src_offset: 0,
-                dst_offset: offset,
-                size: 32,
-            }];
-            if MAPPED {
-                cache.mapped_upload_memory(id, 32, &mut copies);
-            } else {
-                cache.immediate_upload_memory(id, 32, &copies);
-            }
-
-            let expected = if enabled { payload } else { [0x11; 32] };
-            let mut uploaded = [0; 32];
-            cache.slot_buffers[id].immediate_download(offset, &mut uploaded);
-            assert_eq!(uploaded, expected, "readback={enabled}");
-            assert_eq!(
-                &guest_bytes.lock()[address as usize..address as usize + 32],
-                &expected,
-            );
-        }
-        drop(previous);
+        let mut uploaded = [0; 32];
+        cache.slot_buffers[id].immediate_download(offset, &mut uploaded);
+        assert_eq!(uploaded, [0x11; 32]);
+        assert_eq!(&guest_bytes.lock()[address as usize..address as usize + 32], &[0x11; 32]);
     }
 
     #[test]
@@ -4984,6 +4936,85 @@ mod tests {
         assert!(cache.async_downloads.empty());
         assert!(cache.uncommitted_gpu_modified_ranges.empty());
         assert!(cache.committed_gpu_modified_ranges[0].empty());
+    }
+
+    #[test]
+    fn fence_policy_targets_compute_writes_and_gpu_owned_dma_copies() {
+        use common::settings_enums::GpuFenceBehavior;
+        struct RestoreFence(GpuFenceBehavior, bool);
+        impl Drop for RestoreFence {
+            fn drop(&mut self) {
+                let mut values = common::settings::values_mut();
+                values.gpu_fence_behavior.setting.set_value(self.0);
+                values.gpu_fence_behavior.set_global(self.1);
+            }
+        }
+        let _restore = {
+            let values = common::settings::values();
+            RestoreFence(*values.gpu_fence_behavior.get_value_global(), values.gpu_fence_behavior.using_global())
+        };
+        for policy in [GpuFenceBehavior::Default, GpuFenceBehavior::Immediate,
+                       GpuFenceBehavior::Balanced, GpuFenceBehavior::Accurate] {
+            {
+                let mut values = common::settings::values_mut();
+                values.gpu_fence_behavior.set_global(true);
+                values.gpu_fence_behavior.set_value(policy);
+            }
+            let tracker = DummyTracker;
+            let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker, TestBufferCacheRuntime::default());
+            let address = 0x10000;
+            let id = cache.create_buffer(address, 0x1000, false);
+            cache.runtime.current_tick = 9;
+            cache.runtime.completed_tick = 8;
+            cache.mark_written_buffer(id, address, 4, false);
+            assert_eq!(cache.slot_buffers[id].write_tick(), 0);
+            assert!(cache.is_region_gpu_modified(address, 4));
+            cache.mark_written_buffer(id, address + 4, 4, true);
+            assert_eq!(cache.slot_buffers[id].write_tick(), 9);
+            assert_eq!(cache.find_buffer(address, 8, false), id);
+            assert_eq!(cache.runtime.waited_ticks, if policy == GpuFenceBehavior::Accurate { vec![9] } else { vec![] });
+            // A gap of just one tick must wait too; repeated completed use must not.
+            assert_eq!(cache.find_buffer(address, 8, false), id);
+            assert_eq!(cache.runtime.waited_ticks.len(), usize::from(policy == GpuFenceBehavior::Accurate));
+
+            // Out-of-bounds growth must not take the existing-buffer wait path.
+            let mut growing = BufferCache::<TestParams, DummyTracker>::new(&tracker, TestBufferCacheRuntime::default());
+            let id = growing.create_buffer(address, 0x1000, false);
+            growing.runtime.current_tick = 9;
+            growing.mark_written_buffer(id, address, 4, true);
+            let enlarged_size = growing.slot_buffers[id].size_bytes() as u32 + 1;
+            growing.find_buffer(address, enlarged_size, false);
+            assert!(growing.runtime.queried_ticks.is_empty());
+
+            for gpu_owned in [false, true] {
+                let mut dma = BufferCache::<TestParams, DummyTracker>::new(&tracker, TestBufferCacheRuntime::default());
+                dma.set_gpu_memory(Box::new(IdentityGpuMemory));
+                dma.create_buffer(address, 0x1000, false);
+                dma.create_buffer(0x20000, 0x1000, false);
+                if gpu_owned { dma.gpu_modified_ranges.add(address, 4); }
+                let before = dma.runtime.finish_count;
+                assert!(dma.dma_copy(address, 0x20000, 4));
+                let expected = gpu_owned && matches!(policy, GpuFenceBehavior::Balanced | GpuFenceBehavior::Accurate);
+                assert_eq!(dma.runtime.finish_count - before, usize::from(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn compute_storage_binding_requests_a_write_tick() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker, TestBufferCacheRuntime::default());
+        bind_test_channel(&mut cache, 17);
+        let address = 0x10000;
+        let id = cache.create_buffer(address, 0x1000, false);
+        cache.runtime.current_tick = 23;
+        let cs = cache.channel_caches.current_channel_state_mut().unwrap();
+        cs.enabled_compute_storage_buffers = 1;
+        cs.written_compute_storage_buffers = 1;
+        cs.compute_storage_buffers[0] = Binding { buffer_id: id, device_addr: address, size: 4, ..NULL_BINDING };
+        cache.bind_host_compute_storage_buffers();
+        assert_eq!(cache.slot_buffers[id].write_tick(), 23);
+        assert!(cache.is_region_gpu_modified(address, 4));
     }
 
     #[test]
@@ -5369,7 +5400,7 @@ mod tests {
         cache.synchronize_buffer(id, base, size as u32);
         // GPU-only output straddles two pages; CPU backing remains stale.
         cache.slot_buffers[id].immediate_upload(0x800, &[0xa5; 0x1000]);
-        cache.mark_written_buffer(id, base + 0x800, 0x1000);
+        cache.mark_written_buffer(id, base + 0x800, 0x1000, false);
         let mut expected = vec![0x11; size];
         expected[0x800..0x1800].fill(0xa5);
         for (offset, amount, value) in [
@@ -5400,6 +5431,63 @@ mod tests {
     fn completed_cpu_writes_preserve_gpu_neighbors_immediate() {
         completed_cpu_writes_preserve_gpu_bytes_in_shared_pages::<false>();
     }
+
+    #[test]
+    fn discard_and_cpu_write_clear_only_the_exact_gpu_owned_bytes() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker, TestBufferCacheRuntime::default());
+        let base = 0x10000;
+        cache.create_buffer(base, 0x1000, false);
+        cache.gpu_modified_ranges.add(base, 128);
+        cache.uncommitted_gpu_modified_ranges.add(base, 128);
+        cache.obtain_cpu_buffer(base + 17, 7, ObtainBufferSynchronize::NoSynchronize, ObtainBufferOperation::DiscardWrite);
+        assert!(cache.is_region_gpu_modified(base + 16, 1));
+        assert!(!cache.is_region_gpu_modified(base + 17, 7));
+        assert!(cache.is_region_gpu_modified(base + 24, 1));
+        // No coarse GPU bit is set: byte-granular ownership must still be cleared.
+        assert!(!cache.memory_tracker.is_region_gpu_modified(base + 50, 4));
+        cache.write_memory(base + 50, 4);
+        assert!(!cache.is_region_gpu_modified(base + 50, 4));
+        assert!(cache.is_region_gpu_modified(base + 49, 1));
+        assert!(cache.is_region_gpu_modified(base + 54, 1));
+    }
+
+    fn cpu_upload_skips_gpu_subranges<const MAPPED: bool>() {
+        for ranges in [vec![(0x20usize, 0x30usize), (0x100, 0x20), (0xff0, 0x10)], vec![(0, 0x1000)]] {
+            let tracker = DummyTracker;
+            let mut cache = BufferCache::<TestParams<MAPPED>, DummyTracker>::new(&tracker, TestBufferCacheRuntime::default());
+            cache.set_device_memory(Box::new(ImmediateDeviceMemory {
+                bytes: vec![0x11; 0x20000],
+                expose_pointer: true,
+            }));
+            let base = 0x10000;
+            let id = cache.create_buffer(base, 0x1000, false);
+            cache.synchronize_buffer(id, base, 0x1000);
+            let mut expected = vec![0x22; 0x1000];
+            for &(offset, length) in &ranges {
+                cache.slot_buffers[id].immediate_upload(offset as u64, &vec![0xa5; length]);
+                cache.mark_written_buffer(id, base + offset as u64, length as u32, false);
+                expected[offset..offset + length].fill(0xa5);
+            }
+            // Dirty CPU pages still include stale bytes belonging exclusively to GPU.
+            cache.set_device_memory(Box::new(ImmediateDeviceMemory {
+                bytes: vec![0x22; 0x20000],
+                expose_pointer: true,
+            }));
+            cache.memory_tracker.mark_region_as_cpu_modified(base, 0x1000);
+            let clean = cache.synchronize_buffer(id, base, 0x1000);
+            assert_eq!(clean, ranges == vec![(0, 0x1000)]);
+            let mut observed = vec![0; 0x1000];
+            cache.slot_buffers[id].immediate_download(0, &mut observed);
+            assert_eq!(observed, expected);
+        }
+    }
+
+    #[test]
+    fn page_upload_preserves_gpu_subranges_immediate() { cpu_upload_skips_gpu_subranges::<false>(); }
+
+    #[test]
+    fn page_upload_preserves_gpu_subranges_mapped() { cpu_upload_skips_gpu_subranges::<true>(); }
 
     #[test]
     fn completed_cpu_writes_preserve_gpu_neighbors_mapped() {

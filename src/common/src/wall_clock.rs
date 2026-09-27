@@ -167,7 +167,8 @@ impl WallClock for StandardWallClock {
 ///
 /// Mirrors upstream `Common::CreateOptimalClock`:
 /// - On x86_64, use RDTSC-backed `NativeClock` iff the TSC is invariant and
-///   runs at >= 1 GHz (nanosecond resolution). Otherwise fall back to
+///   runs above 1 GHz. Q0.64 cannot represent the exact ratio 1 at 1 GHz.
+///   Otherwise fall back to
 ///   `StandardWallClock` (std::time-based).
 /// - On aarch64, use CNTVCT_EL0-backed `NativeClock`.
 /// - Otherwise, `StandardWallClock`.
@@ -175,12 +176,7 @@ pub fn create_optimal_clock() -> Box<dyn WallClock> {
     #[cfg(target_arch = "x86_64")]
     {
         let caps = crate::x64::cpu_detect::get_cpu_caps();
-        if caps.invariant_tsc && caps.tsc_frequency >= NS_PER_SEC {
-            return Box::new(crate::x64::native_clock::NativeClock::new(
-                caps.tsc_frequency,
-            ));
-        }
-        return Box::new(StandardWallClock::new());
+        return create_x64_clock(caps.invariant_tsc, caps.tsc_frequency);
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -188,6 +184,16 @@ pub fn create_optimal_clock() -> Box<dyn WallClock> {
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
+        Box::new(StandardWallClock::new())
+    }
+}
+
+/// Mechanical extraction of Eden's g_wall_clock x64 selection for boundary tests.
+#[cfg(target_arch = "x86_64")]
+fn create_x64_clock(invariant: bool, frequency: u64) -> Box<dyn WallClock> {
+    if invariant && frequency > NS_PER_SEC {
+        Box::new(crate::x64::native_clock::NativeClock::new(frequency))
+    } else {
         Box::new(StandardWallClock::new())
     }
 }
@@ -200,6 +206,20 @@ pub fn create_standard_wall_clock() -> Box<dyn WallClock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn native_selection_excludes_the_unrepresentable_one_ghz_ratio() {
+        for frequency in [0, NS_PER_SEC - 1, NS_PER_SEC] {
+            assert!(!create_x64_clock(true, frequency).is_native());
+        }
+        for frequency in [NS_PER_SEC + 1, 2_500_000_000, 4_000_000_000] {
+            assert!(create_x64_clock(true, frequency).is_native());
+            assert!(!create_x64_clock(false, frequency).is_native());
+            assert_ne!(crate::uint128::get_fixed_point64_factor(NS_PER_SEC, frequency), 0);
+        }
+        assert_eq!(crate::uint128::get_fixed_point64_factor(NS_PER_SEC, NS_PER_SEC), 0);
+    }
 
     #[test]
     fn test_standard_wall_clock() {

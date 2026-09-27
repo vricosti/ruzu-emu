@@ -216,8 +216,10 @@ impl BufferCacheBuffer for Buffer {
         self.allocation.mark_content_modified();
     }
 
-    fn mark_written_region(&mut self, tick: u64, offset: u64, size: u64) {
-        self.base.set_write_tick(tick);
+    fn mark_written_region(&mut self, tick: Option<u64>, offset: u64, size: u64) {
+        if let Some(tick) = tick {
+            self.base.set_write_tick(tick);
+        }
         self.allocation.mark_content_range_modified(offset, size);
     }
 
@@ -651,8 +653,8 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         unsafe { self.scheduler.as_ref() }.current_tick()
     }
 
-    fn known_gpu_tick(&self) -> u64 {
-        unsafe { self.scheduler.as_ref() }.completed_tick()
+    fn is_free(&mut self, tick: u64) -> bool {
+        self.scheduler().is_free(tick).expect("Metal tick query failed")
     }
 
     fn wait(&mut self, tick: u64) {
@@ -1269,14 +1271,17 @@ mod tests {
         let (_device, _scheduler, _pool, mut runtime) = runtime();
         let mut buffer = Buffer::new(&mut runtime, 0x1000, 8);
         let initial = buffer.allocation.content_generation();
-        buffer.mark_written_region(9, 0, 4);
+        buffer.mark_written_region(Some(9), 0, 4);
         assert_eq!(buffer.write_tick(), 9);
         assert_eq!(buffer.allocation.content_generation(), initial + 1);
-        buffer.mark_written_region(9, 4, 4);
+        buffer.mark_written_region(Some(9), 4, 4);
         assert_eq!(buffer.allocation.content_generation(), initial + 2);
-        buffer.mark_written_region(10, u64::MAX, 4);
+        buffer.mark_written_region(Some(10), u64::MAX, 4);
         assert_eq!(buffer.write_tick(), 10);
         assert_eq!(buffer.allocation.content_generation(), initial + 3);
+        buffer.mark_written_region(None, 0, 4);
+        assert_eq!(buffer.write_tick(), 10);
+        assert_eq!(buffer.allocation.content_generation(), initial + 4);
     }
 
     #[test]
@@ -1323,7 +1328,7 @@ mod tests {
         let upload = MetalBuffer::new(&device, 4).unwrap();
         upload.write(0, &[9, 10, 11, 0xff]).unwrap();
         let tick = scheduler.current_tick();
-        source.mark_written_region(tick, 4, 4);
+        source.mark_written_region(Some(tick), 4, 4);
         upload.encode_copy(&mut scheduler, &source.allocation, 0, 4, 4).unwrap();
         let reused = runtime.uint8_index_buffer(&mut source, 0, 4).0;
         let updated = runtime.uint8_index_buffer(&mut source, 4, 4).0;

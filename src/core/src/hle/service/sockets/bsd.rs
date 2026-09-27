@@ -7,6 +7,7 @@
 //! BSD socket service -- "bsd:u" and "bsd:s".
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use super::sockets::{
     Domain, Errno, FcntlCmd, Linger, OptName, PollEvents, PollFD, Protocol, ShutdownHow,
@@ -126,7 +127,7 @@ fn socket_blocked_by_airplane_mode(airplane_mode: bool, connection_based: bool) 
 /// Corresponds to `BSD::FileDescriptor` in upstream bsd.h.
 pub struct FileDescriptor {
     /// Platform socket (corresponds to upstream shared_ptr<SocketBase>).
-    pub socket: Box<dyn SocketBase>,
+    pub socket: Arc<Mutex<Box<dyn SocketBase>>>,
     pub flags: i32,
     pub is_connection_based: bool,
 }
@@ -219,7 +220,7 @@ impl Bsd {
     ///
     /// Corresponds to `BSD::IsFileDescriptorValid` in upstream bsd.cpp.
     fn is_file_descriptor_valid(&self, fd: i32) -> bool {
-        if fd > MAX_FD as i32 || fd < 0 {
+        if fd >= MAX_FD as i32 || fd < 0 {
             log::error!("Invalid file descriptor handle={}", fd);
             return false;
         }
@@ -281,7 +282,7 @@ impl Bsd {
         }
 
         self.file_descriptors[fd as usize] = Some(FileDescriptor {
-            socket: Box::new(socket),
+            socket: Arc::new(Mutex::new(Box::new(socket))),
             flags: 0,
             is_connection_based: is_connection_based(ty),
         });
@@ -348,7 +349,7 @@ impl Bsd {
 
         // Validate fds
         for pollfd in fds.iter_mut() {
-            if pollfd.fd > MAX_FD as i32 || pollfd.fd < 0 {
+            if pollfd.fd >= MAX_FD as i32 || pollfd.fd < 0 {
                 log::error!("File descriptor handle={} is invalid", pollfd.fd);
                 pollfd.revents = 0;
                 return (0, Errno::SUCCESS);
@@ -367,7 +368,7 @@ impl Bsd {
             .map(|pollfd| {
                 let descriptor = self.file_descriptors[pollfd.fd as usize].as_ref().unwrap();
                 net_sockets::PollFD {
-                    fd: descriptor.socket.get_fd(),
+                    fd: descriptor.socket.lock().unwrap().get_fd(),
                     events: translate_poll_events(PollEvents::from_bits_retain(pollfd.events))
                         .bits(),
                     revents: 0,
@@ -419,7 +420,7 @@ impl Bsd {
             .as_mut()
             .unwrap()
             .socket
-            .accept();
+            .lock().unwrap().accept();
 
         if bsd_errno != NetErrno::Success {
             return (-1, translate_errno(bsd_errno));
@@ -440,7 +441,7 @@ impl Bsd {
         }
 
         self.file_descriptors[new_fd as usize] = Some(FileDescriptor {
-            socket: accept_result.socket.unwrap(),
+            socket: Arc::new(Mutex::new(accept_result.socket.unwrap())),
             flags: 0,
             is_connection_based: is_conn_based,
         });
@@ -468,7 +469,7 @@ impl Bsd {
         let net_addr = translate_sockaddr_to_network(&guest_addr);
 
         let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
-        translate_errno(descriptor.socket.bind(net_addr))
+        translate_errno(descriptor.socket.lock().unwrap().bind(net_addr))
     }
 
     /// ConnectImpl -- connect to remote address.
@@ -491,7 +492,7 @@ impl Bsd {
         let net_addr = translate_sockaddr_to_network(&guest_addr);
 
         let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
-        let result = translate_errno(descriptor.socket.connect(net_addr));
+        let result = translate_errno(descriptor.socket.lock().unwrap().connect(net_addr));
         if result == Errno::ISCONN {
             log::debug!("returned ISCONN - socket already connected");
             return Errno::SUCCESS;
@@ -508,7 +509,7 @@ impl Bsd {
         }
 
         let descriptor = self.file_descriptors[fd as usize].as_ref().unwrap();
-        let (addr_in, bsd_errno) = descriptor.socket.get_peer_name();
+        let (addr_in, bsd_errno) = descriptor.socket.lock().unwrap().get_peer_name();
         if bsd_errno != NetErrno::Success {
             return translate_errno(bsd_errno);
         }
@@ -536,7 +537,7 @@ impl Bsd {
         }
 
         let descriptor = self.file_descriptors[fd as usize].as_ref().unwrap();
-        let (addr_in, bsd_errno) = descriptor.socket.get_sock_name();
+        let (addr_in, bsd_errno) = descriptor.socket.lock().unwrap().get_sock_name();
         if bsd_errno != NetErrno::Success {
             return translate_errno(bsd_errno);
         }
@@ -563,7 +564,7 @@ impl Bsd {
             return Errno::BADF;
         }
         let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
-        translate_errno(descriptor.socket.listen(backlog))
+        translate_errno(descriptor.socket.lock().unwrap().listen(backlog))
     }
 
     /// FcntlImpl -- file control operations.
@@ -583,7 +584,7 @@ impl Bsd {
             }
             FcntlCmd::SETFL => {
                 let enable = (arg & FLAG_O_NONBLOCK) != 0;
-                let bsd_errno = translate_errno(descriptor.socket.set_non_block(enable));
+                let bsd_errno = translate_errno(descriptor.socket.lock().unwrap().set_non_block(enable));
                 if bsd_errno != Errno::SUCCESS {
                     return (-1, bsd_errno);
                 }
@@ -620,7 +621,7 @@ impl Bsd {
 
         match optname {
             OptName::ERROR => {
-                let (pending_err, getsockopt_err) = descriptor.socket.get_pending_error();
+                let (pending_err, getsockopt_err) = descriptor.socket.lock().unwrap().get_pending_error();
                 if getsockopt_err == NetErrno::Success {
                     let translated_pending_err = translate_errno(pending_err);
                     if optval.len() != std::mem::size_of::<Errno>() {
@@ -674,7 +675,7 @@ impl Bsd {
             return translate_errno(
                 descriptor
                     .socket
-                    .set_linger(linger.onoff != 0, linger.linger),
+                    .lock().unwrap().set_linger(linger.onoff != 0, linger.linger),
             );
         }
 
@@ -684,20 +685,20 @@ impl Bsd {
         match optname {
             OptName::REUSEADDR => {
                 assert!(value == 0 || value == 1);
-                translate_errno(descriptor.socket.set_reuse_addr(value != 0))
+                translate_errno(descriptor.socket.lock().unwrap().set_reuse_addr(value != 0))
             }
             OptName::KEEPALIVE => {
                 assert!(value == 0 || value == 1);
-                translate_errno(descriptor.socket.set_keep_alive(value != 0))
+                translate_errno(descriptor.socket.lock().unwrap().set_keep_alive(value != 0))
             }
             OptName::BROADCAST => {
                 assert!(value == 0 || value == 1);
-                translate_errno(descriptor.socket.set_broadcast(value != 0))
+                translate_errno(descriptor.socket.lock().unwrap().set_broadcast(value != 0))
             }
-            OptName::SNDBUF => translate_errno(descriptor.socket.set_snd_buf(value)),
-            OptName::RCVBUF => translate_errno(descriptor.socket.set_rcv_buf(value)),
-            OptName::SNDTIMEO => translate_errno(descriptor.socket.set_snd_timeo(value)),
-            OptName::RCVTIMEO => translate_errno(descriptor.socket.set_rcv_timeo(value)),
+            OptName::SNDBUF => translate_errno(descriptor.socket.lock().unwrap().set_snd_buf(value)),
+            OptName::RCVBUF => translate_errno(descriptor.socket.lock().unwrap().set_rcv_buf(value)),
+            OptName::SNDTIMEO => translate_errno(descriptor.socket.lock().unwrap().set_snd_timeo(value)),
+            OptName::RCVTIMEO => translate_errno(descriptor.socket.lock().unwrap().set_rcv_timeo(value)),
             OptName::NOSIGPIPE => {
                 log::warn!("(STUBBED) setting NOSIGPIPE to {}", value);
                 Errno::SUCCESS
@@ -718,7 +719,7 @@ impl Bsd {
         }
         let host_how = translate_shutdown_how(ShutdownHow(how));
         let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
-        translate_errno(descriptor.socket.shutdown(host_how))
+        translate_errno(descriptor.socket.lock().unwrap().shutdown(host_how))
     }
 
     /// RecvImpl
@@ -730,21 +731,22 @@ impl Bsd {
         }
 
         let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
+        let mut socket = descriptor.socket.lock().unwrap();
 
         // Apply MSG_DONTWAIT flag
         if (flags & FLAG_MSG_DONTWAIT) != 0 {
             flags &= !FLAG_MSG_DONTWAIT;
             if (descriptor.flags & FLAG_O_NONBLOCK) == 0 {
-                descriptor.socket.set_non_block(true);
+                socket.set_non_block(true);
             }
         }
 
         let (ret, bsd_errno) =
-            translate_result(descriptor.socket.recv(flags as i32, message.as_mut_slice()));
+            translate_result(socket.recv(flags as i32, message.as_mut_slice()));
 
         // Restore original state
         if (descriptor.flags & FLAG_O_NONBLOCK) == 0 {
-            descriptor.socket.set_non_block(false);
+            socket.set_non_block(false);
         }
 
         (ret, bsd_errno)
@@ -765,6 +767,7 @@ impl Bsd {
         }
 
         let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
+        let mut socket = descriptor.socket.lock().unwrap();
 
         let mut addr_in = NetSockAddrIn::default();
         let use_addr = if descriptor.is_connection_based {
@@ -779,13 +782,13 @@ impl Bsd {
         if (flags & FLAG_MSG_DONTWAIT) != 0 {
             flags &= !FLAG_MSG_DONTWAIT;
             if (descriptor.flags & FLAG_O_NONBLOCK) == 0 {
-                descriptor.socket.set_non_block(true);
+                socket.set_non_block(true);
             }
         }
 
         let p_addr_in = if use_addr { Some(&mut addr_in) } else { None };
 
-        let (ret, bsd_errno) = translate_result(descriptor.socket.recv_from(
+        let (ret, bsd_errno) = translate_result(socket.recv_from(
             flags as i32,
             message.as_mut_slice(),
             p_addr_in,
@@ -793,7 +796,7 @@ impl Bsd {
 
         // Restore original state
         if (descriptor.flags & FLAG_O_NONBLOCK) == 0 {
-            descriptor.socket.set_non_block(false);
+            socket.set_non_block(false);
         }
 
         if use_addr {
@@ -823,7 +826,7 @@ impl Bsd {
             return (-1, Errno::BADF);
         }
         let descriptor = self.file_descriptors[fd as usize].as_mut().unwrap();
-        translate_result(descriptor.socket.send(message, flags as i32))
+        translate_result(descriptor.socket.lock().unwrap().send(message, flags as i32))
     }
 
     /// SendToImpl
@@ -859,7 +862,7 @@ impl Bsd {
         translate_result(
             descriptor
                 .socket
-                .send_to(flags, message, p_addr_in.as_ref()),
+                .lock().unwrap().send_to(flags, message, p_addr_in.as_ref()),
         )
     }
 
@@ -876,7 +879,7 @@ impl Bsd {
                 .as_mut()
                 .unwrap()
                 .socket
-                .close(),
+                .lock().unwrap().close(),
         );
         if bsd_errno != Errno::SUCCESS {
             return bsd_errno;
@@ -901,31 +904,13 @@ impl Bsd {
             return Err(Errno::MFILE);
         }
 
-        // Upstream copies the shared_ptr (shared ownership). In Rust we create a new Socket
-        // wrapping the same underlying fd via Socket::from_fd. Note: this means the two
-        // FileDescriptors share the same OS fd, matching upstream shared_ptr semantics.
         let src = self.file_descriptors[fd as usize].as_ref().unwrap();
-        #[cfg(unix)]
-        let src_fd_val = src.socket.get_fd();
-        // Duplicate the OS-level file descriptor so both can close independently
-        #[cfg(unix)]
-        let new_os_fd = unsafe { libc::dup(src_fd_val) };
-        #[cfg(not(unix))]
-        let new_os_fd = -1;
-
-        if new_os_fd < 0 {
-            log::error!("Failed to dup socket fd");
-            return Err(Errno::BADF);
-        }
-
-        let src_flags = src.flags;
-        let src_is_conn = src.is_connection_based;
-
-        self.file_descriptors[new_fd as usize] = Some(FileDescriptor {
-            socket: Box::new(Socket::from_fd(new_os_fd)),
-            flags: src_flags,
-            is_connection_based: src_is_conn,
-        });
+        let duplicate = FileDescriptor {
+            socket: Arc::clone(&src.socket),
+            flags: src.flags,
+            is_connection_based: src.is_connection_based,
+        };
+        self.file_descriptors[new_fd as usize] = Some(duplicate);
 
         Ok(new_fd)
     }
@@ -934,35 +919,11 @@ impl Bsd {
     ///
     /// Corresponds to `BSD::GetSocket` in upstream bsd.cpp.
     /// Used by SSL service to access BSD sockets.
-    pub fn get_socket(&self, fd: i32) -> Option<&dyn SocketBase> {
+    pub fn get_socket(&self, fd: i32) -> Option<Arc<Mutex<Box<dyn SocketBase>>>> {
         if !self.is_file_descriptor_valid(fd) {
             return None;
         }
-        Some(
-            self.file_descriptors[fd as usize]
-                .as_ref()
-                .unwrap()
-                .socket
-                .as_ref(),
-        )
-    }
-
-    /// Mutable Rust counterpart to upstream `BSD::GetSocket`.
-    ///
-    /// Upstream returns a shared socket object whose mutating methods are used
-    /// by SSL. Rust keeps the descriptor table behind the shared BSD service
-    /// mutex and exposes the equivalent mutable borrow while that lock is held.
-    pub fn get_socket_mut(&mut self, fd: i32) -> Option<&mut dyn SocketBase> {
-        if !self.is_file_descriptor_valid(fd) {
-            return None;
-        }
-        Some(
-            self.file_descriptors[fd as usize]
-                .as_mut()
-                .unwrap()
-                .socket
-                .as_mut(),
-        )
+        Some(Arc::clone(&self.file_descriptors[fd as usize].as_ref()?.socket))
     }
 
     /// EventFd -- create event fd (stubbed).
@@ -985,7 +946,7 @@ impl Bsd {
     ) {
         for optional_descriptor in self.file_descriptors.iter_mut() {
             if let Some(descriptor) = optional_descriptor {
-                descriptor.socket.handle_proxy_packet(packet);
+                descriptor.socket.lock().unwrap().handle_proxy_packet(packet);
             }
         }
     }
@@ -1481,6 +1442,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn duplicate_socket_preserves_shared_object_and_descriptor_local_flags() {
+        use crate::internal_network::socket_proxy::ProxySocket;
+
+        let mut bsd = Bsd::new("bsd:s", false);
+        bsd.file_descriptors[0] = Some(FileDescriptor {
+            socket: Arc::new(Mutex::new(Box::new(ProxySocket::new()))),
+            flags: FLAG_O_NONBLOCK,
+            is_connection_based: false,
+        });
+        let source = bsd.get_socket(0).unwrap();
+        let weak = Arc::downgrade(&source);
+        // ProxySocket has no OS descriptor: duplication must not call dup().
+        assert_eq!(source.lock().unwrap().get_fd(), net_sockets::INVALID_SOCKET);
+        let duplicate_fd = bsd.duplicate_socket_impl(0).unwrap();
+        assert_eq!(duplicate_fd, 1);
+        let duplicate = bsd.get_socket(duplicate_fd).unwrap();
+        assert!(Arc::ptr_eq(&source, &duplicate));
+        assert_eq!(bsd.fcntl_impl(1, FcntlCmd::GETFL, 0), (FLAG_O_NONBLOCK, Errno::SUCCESS));
+        assert_eq!(bsd.fcntl_impl(1, FcntlCmd::SETFL, 0), (0, Errno::SUCCESS));
+        assert_eq!(bsd.fcntl_impl(0, FcntlCmd::GETFL, 0), (FLAG_O_NONBLOCK, Errno::SUCCESS));
+        assert!(!bsd.file_descriptors[1].as_ref().unwrap().is_connection_based);
+        assert!(source.lock().unwrap().is_opened());
+        assert_eq!(bsd.close_impl(1), Errno::SUCCESS);
+        assert!(bsd.get_socket(1).is_none());
+        // Eden explicitly closes the shared socket, including all aliases.
+        assert!(!source.lock().unwrap().is_opened());
+        assert!(bsd.get_socket(0).is_some());
+        assert_eq!(bsd.close_impl(0), Errno::SUCCESS);
+        drop(bsd);
+        assert!(weak.upgrade().is_some());
+        drop(source);
+        assert!(weak.upgrade().is_some());
+        drop(duplicate);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn duplicate_socket_validates_bounds_and_table_capacity() {
+        use crate::internal_network::socket_proxy::ProxySocket;
+        let mut bsd = Bsd::new("bsd:s", false);
+        for fd in [-1, 0, MAX_FD as i32, i32::MAX] {
+            assert!(bsd.get_socket(fd).is_none());
+            assert_eq!(bsd.duplicate_socket_impl(fd), Err(Errno::BADF));
+        }
+        bsd.file_descriptors[0] = Some(FileDescriptor {
+            socket: Arc::new(Mutex::new(Box::new(ProxySocket::new()))),
+            flags: 0,
+            is_connection_based: true,
+        });
+        for fd in 1..MAX_FD {
+            assert_eq!(bsd.duplicate_socket_impl(0), Ok(fd as i32));
+            assert!(bsd.file_descriptors[fd].as_ref().unwrap().is_connection_based);
+        }
+        assert_eq!(bsd.duplicate_socket_impl(0), Err(Errno::MFILE));
+        let input = PollFD { fd: MAX_FD as i32, events: 0, revents: 0 };
+        let bytes = unsafe { std::slice::from_raw_parts(
+            &input as *const PollFD as *const u8, std::mem::size_of::<PollFD>(),
+        ) };
+        let mut output = vec![0; bytes.len()];
+        assert_eq!(bsd.poll_impl(&mut output, bytes, 1, 0), (0, Errno::SUCCESS));
+    }
+
+    #[test]
     fn airplane_mode_blocks_only_connection_based_sockets() {
         assert!(socket_blocked_by_airplane_mode(true, true));
         assert!(!socket_blocked_by_airplane_mode(true, false));
@@ -1491,6 +1515,7 @@ mod tests {
 
     #[test]
     fn unknown_set_sock_opt_name_reaches_upstream_default_case() {
+        let _network = crate::internal_network::network::NetworkInstance::new();
         let mut bsd = Bsd::new("bsd:u", true);
         let (fd, errno) = bsd.socket_impl(Domain::INET, Type::DGRAM, Protocol::UDP);
         assert_eq!(errno, Errno::SUCCESS);
@@ -1533,6 +1558,7 @@ mod tests {
 
     #[test]
     fn shared_bsd_handler_exposes_one_descriptor_table() {
+        let _network = crate::internal_network::network::NetworkInstance::new();
         let handler: SessionRequestHandlerPtr = Arc::new(Mutex::new(Bsd::new("bsd:u", true)));
         let first = handler
             .as_any()

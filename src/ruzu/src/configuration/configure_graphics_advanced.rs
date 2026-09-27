@@ -171,13 +171,6 @@ pub fn page(runtime_lock: bool) -> BuildResult {
     );
     content.append(&buffer_history);
 
-    let gpu_buffer_readback = w::check_row(
-        "Enable GPU buffer readback",
-        *common::settings::values()
-            .enable_gpu_buffer_readback
-            .get_value(),
-    );
-    content.append(&gpu_buffer_readback);
 
     // Apply the same per-setting policy as Eden's shared Widget builder.
     // Snapshot before ConfigurePerGame prepares its custom values for saving.
@@ -290,12 +283,6 @@ pub fn page(runtime_lock: bool) -> BuildResult {
         configuring_global,
     );
     buffer_history.set_sensitive(history_policy.sensitive);
-    let readback_policy = w::SettingEditPolicy::new(
-        &common::settings::values().enable_gpu_buffer_readback,
-        runtime_lock,
-        configuring_global,
-    );
-    gpu_buffer_readback.set_sensitive(readback_policy.sensitive);
 
     column.append(&group);
 
@@ -319,7 +306,6 @@ pub fn page(runtime_lock: bool) -> BuildResult {
         let reactive = reactive_flushing.is_active();
         let barriers = barrier_feedback_loops.is_active();
         let history = buffer_history.is_active();
-        let readback = gpu_buffer_readback.is_active();
 
         let mut values = common::settings::values_mut();
         accuracy_policy.apply(&mut values.gpu_accuracy, accuracy_value);
@@ -340,7 +326,6 @@ pub fn page(runtime_lock: bool) -> BuildResult {
         reactive_policy.apply(&mut values.use_reactive_flushing, reactive);
         barriers_policy.apply(&mut values.barrier_feedback_loops, barriers);
         history_policy.apply(&mut values.enable_buffer_history, history);
-        readback_policy.apply(&mut values.enable_gpu_buffer_readback, readback);
     });
 
     BuildResult {

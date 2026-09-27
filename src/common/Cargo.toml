@@ -18,7 +18,12 @@ fastrand.workspace = true
 env_filter = "1.0"
 
 [build-dependencies]
+cc = "1"
 libc = "0.2"
+
+[dev-dependencies]
+# tests/build_script.rs compiles build.rs to exercise version detection.
+cc = "1"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["libloaderapi"] }

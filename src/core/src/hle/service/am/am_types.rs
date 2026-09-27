@@ -172,8 +172,10 @@ pub enum AppletMessage {
     ForceHideApplicationLogo = 57,
     FloatingApplicationDetected = 60,
     DetectShortPressingCaptureButton = 90,
+    DetectLongPressingCaptureButton = 91,
     AlbumScreenShotTaken = 92,
     AlbumRecordingSaved = 93,
+    StartupLogoDisappeared = 95,
 }
 
 #[repr(u32)]
@@ -240,6 +242,16 @@ pub enum ProgramSpecifyKind {
     ExecuteProgram = 0,
     JumpToSubApplicationProgramForDevelopment = 1,
     RestartProgram = 2,
+}
+
+/// Upstream AppletZIndex: composition sorts back-to-front.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppletZIndex {
+    Background = 0,
+    Foreground = 1,
+    ForegroundVisible = 2,
+    Overlay = 3,
 }
 
 #[repr(C)]

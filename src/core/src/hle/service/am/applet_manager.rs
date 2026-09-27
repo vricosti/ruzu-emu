@@ -396,6 +396,13 @@ impl AppletManager {
         self.system = system;
     }
 
+    /// Upstream `AppletManager::GetWindowSystem`.
+    /// Upgrade the non-owning reference only for the duration of the caller's
+    /// operation; never retain the manager lock while locking WindowSystem.
+    pub fn get_window_system(&self) -> Option<Arc<Mutex<WindowSystem>>> {
+        self.lock.lock().unwrap().window_system.as_ref().and_then(Weak::upgrade)
+    }
+
     /// Upstream: `void SetWindowSystem(WindowSystem* window_system)`
     pub fn set_window_system(&self, window_system: Option<Arc<Mutex<WindowSystem>>>) {
         let mut inner = self.lock.lock().unwrap();
@@ -705,6 +712,7 @@ mod tests {
     #[test]
     fn applet_manager_does_not_own_window_system() {
         let manager = AppletManager::new();
+        assert!(manager.get_window_system().is_none());
         let window_system = Arc::new(Mutex::new(
             WindowSystem::new(crate::core::SystemRef::null()),
         ));
@@ -713,7 +721,13 @@ mod tests {
         // The None path is non-blocking; first install a weak reference
         // directly as SetWindowSystem(Some) must wait for a pending process.
         manager.lock.lock().unwrap().window_system = Some(Arc::downgrade(&window_system));
+        let observed = manager.get_window_system().unwrap();
+        assert!(Arc::ptr_eq(&observed, &window_system));
+        assert!(manager.lock.try_lock().is_ok());
+        drop(observed);
         drop(window_system);
+
+        assert!(manager.get_window_system().is_none());
 
         assert!(
             weak.upgrade().is_none(),

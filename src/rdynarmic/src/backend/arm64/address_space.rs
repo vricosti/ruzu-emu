@@ -1059,6 +1059,63 @@ mod tests {
     }
 
     #[test]
+    fn memory_callback_relocations_preserve_adjacent_instructions() {
+        // Eden908b1e9a37: a relocation owns exactly one instruction, not
+        // space for an extra size-argument load before the branch.
+        for target in [
+            LinkTarget::ReadMemory8,
+            LinkTarget::ReadMemory16,
+            LinkTarget::ReadMemory32,
+            LinkTarget::ReadMemory64,
+            LinkTarget::WrappedReadMemory8,
+            LinkTarget::WrappedReadMemory16,
+            LinkTarget::WrappedReadMemory32,
+            LinkTarget::WrappedReadMemory64,
+            LinkTarget::WriteMemory8,
+            LinkTarget::WriteMemory16,
+            LinkTarget::WriteMemory32,
+            LinkTarget::WriteMemory64,
+            LinkTarget::WrappedWriteMemory8,
+            LinkTarget::WrappedWriteMemory16,
+            LinkTarget::WrappedWriteMemory32,
+            LinkTarget::WrappedWriteMemory64,
+        ] {
+            let mut address_space = address_space_with_prelude();
+            address_space.clear_cache().unwrap();
+            let callback = address_space.prelude_info().return_from_run_code;
+            let prelude = address_space.prelude_info_mut();
+            prelude.read_memory_8 = Some(callback);
+            prelude.read_memory_16 = Some(callback);
+            prelude.read_memory_32 = Some(callback);
+            prelude.read_memory_64 = Some(callback);
+            prelude.wrapped_read_memory_8 = Some(callback);
+            prelude.wrapped_read_memory_16 = Some(callback);
+            prelude.wrapped_read_memory_32 = Some(callback);
+            prelude.wrapped_read_memory_64 = Some(callback);
+            prelude.write_memory_8 = Some(callback);
+            prelude.write_memory_16 = Some(callback);
+            prelude.write_memory_32 = Some(callback);
+            prelude.write_memory_64 = Some(callback);
+            prelude.wrapped_write_memory_8 = Some(callback);
+            prelude.wrapped_write_memory_16 = Some(callback);
+            prelude.wrapped_write_memory_32 = Some(callback);
+            prelude.wrapped_write_memory_64 = Some(callback);
+            let before = address_space.code.write_u32(inst::ret_lr()).unwrap();
+            let entry_offset = address_space.code.write_u32(inst::nop()).unwrap();
+            let after = address_space.code.write_u32(inst::ret_lr()).unwrap();
+            let entry = unsafe { address_space.code().code_base_ptr().add(entry_offset) };
+            let mut block = fake_block(entry, 4);
+            block.relocations.push(Relocation { code_offset: 0, target });
+            address_space.record_emitted_block(LocationDescriptor::new(0x1000), block).unwrap();
+            assert_eq!(read_instruction(&address_space, entry_offset),
+                inst::bl_imm(callback as isize - entry as isize), "{target:?}");
+            assert_eq!(read_instruction(&address_space, before), inst::ret_lr(), "{target:?}");
+            assert_eq!(read_instruction(&address_space, after), inst::ret_lr(), "{target:?}");
+        }
+    }
+
+
+    #[test]
     fn branch_block_relocation_patches_when_target_is_available() {
         let mut address_space = address_space_with_prelude();
         address_space.clear_cache().unwrap();

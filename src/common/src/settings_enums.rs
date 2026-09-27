@@ -75,6 +75,22 @@ macro_rules! settings_enum {
                 (*self as u32).to_string()
             }
 
+            fn from_config_string(input: &str) -> Result<Self, ()> {
+                let numeric = input.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                let sign_len = usize::from(numeric.starts_with('+') || numeric.starts_with('-'));
+                let digit_count = numeric.as_bytes()[sign_len..].iter()
+                    .take_while(|byte| byte.is_ascii_digit()).count();
+                if digit_count != 0 {
+                    let raw = numeric[..sign_len + digit_count].parse::<i64>().map_err(|_| ())?;
+                    // Eden LoadString casts stoll to the u32 enum, then
+                    // SetValue clamps against EnumMetadata::GetLast().
+                    let last = Self::canonicalizations().last().unwrap().1 as u32;
+                    return Self::from_u32((raw as u32).min(last)).ok_or(());
+                }
+                // Preserve Ruzu's existing canonical-name input extension.
+                input.parse().map_err(|_| ())
+            }
+
             fn canonicalize_value(&self) -> String {
                 self.canonicalize().to_string()
             }
@@ -424,7 +440,6 @@ settings_enum! {
         Immediate,
         Balanced,
         Accurate,
-        Strict,
     }
 }
 

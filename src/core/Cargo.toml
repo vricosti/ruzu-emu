@@ -50,5 +50,6 @@ winapi = { version = "0.3", features = [
     "netioapi",
     "winerror",
     "winnt",
+    "winsock2",
     "ws2def",
 ] }

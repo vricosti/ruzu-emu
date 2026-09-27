@@ -101,10 +101,7 @@ impl WindowSystem {
             return;
         }
 
-        let overlay_blocks_input = inner
-            .overlay_display_aruid
-            .and_then(|aruid| inner.applets.get(&aruid))
-            .is_some_and(|applet| applet.lock().unwrap().overlay_in_foreground);
+        let overlay_blocks_input = self.does_overlay_take_input_locked(&inner);
 
         // Recursively update each applet root.
         let home_menu_aruid = inner.home_menu_aruid;
@@ -112,6 +109,11 @@ impl WindowSystem {
         let overlay_display_aruid = inner.overlay_display_aruid;
         let foreground = inner.foreground_requested_aruid;
 
+        if let Some(aruid) = overlay_display_aruid {
+            if let Some(applet) = inner.applets.get(&aruid).cloned() {
+                self.update_applet_state_locked(&inner, &applet, true, overlay_blocks_input);
+            }
+        }
         if let Some(aruid) = home_menu_aruid {
             let is_foreground = foreground == Some(aruid);
             if let Some(applet) = inner.applets.get(&aruid).cloned() {
@@ -132,11 +134,6 @@ impl WindowSystem {
                     is_foreground,
                     overlay_blocks_input,
                 );
-            }
-        }
-        if let Some(aruid) = overlay_display_aruid {
-            if let Some(applet) = inner.applets.get(&aruid).cloned() {
-                self.update_applet_state_locked(&inner, &applet, true, false);
             }
         }
     }
@@ -264,26 +261,41 @@ impl WindowSystem {
 
     /// Upstream: void OnHomeButtonPressed(ButtonPressDuration type)
     pub fn on_home_button_pressed(&self, duration: ButtonPressDuration) {
+        self.on_system_button_press(match duration {
+            ButtonPressDuration::ShortPressing => SystemButtonType::HomeButtonShortPressing,
+            ButtonPressDuration::MiddlePressing | ButtonPressDuration::LongPressing =>
+                SystemButtonType::HomeButtonLongPressing,
+        });
+    }
+
+    pub fn on_system_button_press(&self, button: SystemButtonType) {
         let inner = self.lock.lock().unwrap();
-
-        // If we don't have a home menu, nothing to do.
-        let home_aruid = match inner.home_menu_aruid {
-            Some(aruid) => aruid,
-            None => return,
+        let message = match button {
+            SystemButtonType::HomeButtonShortPressing => AppletMessage::DetectShortPressingHomeButton,
+            SystemButtonType::HomeButtonLongPressing => AppletMessage::DetectLongPressingHomeButton,
+            SystemButtonType::CaptureButtonShortPressing => AppletMessage::DetectShortPressingCaptureButton,
+            SystemButtonType::CaptureButtonLongPressing => AppletMessage::DetectLongPressingCaptureButton,
+            _ => return,
         };
+        self.send_button_applet_message_locked(&inner, message);
+    }
 
-        let home_applet = match inner.applets.get(&home_aruid) {
-            Some(a) => a,
-            None => return,
-        };
-
-        let mut a = home_applet.lock().unwrap();
-
-        // Send home button press event to home menu.
-        if duration == ButtonPressDuration::ShortPressing {
-            a.lifecycle_manager
-                .push_unordered_message(AppletMessage::DetectShortPressingHomeButton);
+    fn send_button_applet_message_locked(&self, inner: &WindowSystemInner, message: AppletMessage) {
+        for aruid in [inner.home_menu_aruid, inner.overlay_display_aruid, inner.application_aruid]
+            .into_iter().flatten() {
+            let Some(applet) = inner.applets.get(&aruid) else { continue };
+            let mut applet = applet.lock().unwrap();
+            let blocked = match message {
+                AppletMessage::DetectShortPressingHomeButton =>
+                    applet.home_button_short_pressed_blocked ||
+                    (applet.applet_id == AppletId::OverlayDisplay &&
+                     !applet.overlay_watching_short_home_button),
+                AppletMessage::DetectLongPressingHomeButton => applet.home_button_long_pressed_blocked,
+                _ => false,
+            };
+            if !blocked { applet.lifecycle_manager.push_unordered_message(message); }
         }
+        self.request_update();
     }
 
     /// Upstream: void OnCaptureButtonPressed(ButtonPressDuration type) — no-op
@@ -298,7 +310,7 @@ impl WindowSystem {
 
     // --- Private helpers ---
 
-    fn request_update(&self) {
+    pub fn request_update(&self) {
         if let Some(ref observer) = self.event_observer {
             observer.request_update();
         }
@@ -517,7 +529,16 @@ impl WindowSystem {
         true
     }
 
-    /// Upstream: void UpdateAppletStateLocked(Applet* applet, bool is_foreground)
+    fn is_overlay_open_locked(&self, overlay: &Applet) -> bool {
+        overlay.window_visible && overlay.overlay_watching_short_home_button
+    }
+
+    fn does_overlay_take_input_locked(&self, inner: &WindowSystemInner) -> bool {
+        inner.overlay_display_aruid.and_then(|aruid| inner.applets.get(&aruid))
+            .is_some_and(|overlay| self.is_overlay_open_locked(&overlay.lock().unwrap()))
+    }
+
+    /// Upstream: void UpdateAppletStateLocked(Applet*, bool, bool)
     fn update_applet_state_locked(
         &self,
         inner: &WindowSystemInner,
@@ -571,11 +592,11 @@ impl WindowSystem {
 
         // Update interactibility state.
         let should_be_interactible = if a.applet_id == AppletId::OverlayDisplay {
-            a.overlay_in_foreground
+            self.is_overlay_open_locked(&a)
         } else {
             is_foreground && a.window_visible && !overlay_blocking
         };
-        a.set_interactible_locked(should_be_interactible);
+        a.set_interactible_locked(should_be_interactible, should_be_interactible);
 
         // Update focus state and suspension.
         let is_obscured = has_obscuring_child_applets || !a.window_visible;
@@ -590,19 +611,19 @@ impl WindowSystem {
         }
 
         let z_index = if a.applet_id == AppletId::OverlayDisplay {
-            if a.overlay_in_foreground {
-                100_000
+            if self.is_overlay_open_locked(&a) {
+                AppletZIndex::Overlay
             } else {
-                -1
+                AppletZIndex::Background
             }
         } else if inherited_foreground && !is_obscured {
-            2
+            AppletZIndex::ForegroundVisible
         } else if inherited_foreground {
-            1
+            AppletZIndex::Foreground
         } else {
-            0
+            AppletZIndex::Background
         };
-        a.display_layer_manager.set_overlay_z_index(z_index);
+        a.display_layer_manager.set_overlay_z_index(z_index as i32);
 
         // Recurse into child applets.
         let children = a.child_applets.clone();
@@ -743,7 +764,7 @@ mod tests {
         overlay.aruid = AppletResourceUserId { pid: 2 };
         overlay.applet_id = AppletId::OverlayDisplay;
         overlay.is_process_running = true;
-        overlay.overlay_in_foreground = true;
+        overlay.overlay_watching_short_home_button = true;
         let overlay = Arc::new(Mutex::new(overlay));
 
         window_system.track_applet(Arc::clone(&application), true);
@@ -751,18 +772,79 @@ mod tests {
         window_system.request_application_to_get_foreground();
         window_system.update();
 
-        assert!(!application.lock().unwrap().is_interactible);
+        assert!(!application.lock().unwrap().is_pad_interactible);
         assert!(application
             .lock()
             .unwrap()
             .display_layer_manager
             .get_window_visibility());
-        assert!(overlay.lock().unwrap().is_interactible);
+        assert!(overlay.lock().unwrap().is_pad_interactible);
 
-        overlay.lock().unwrap().overlay_in_foreground = false;
+        // Watching alone is not enough: an invisible overlay must release input.
+        overlay.lock().unwrap().window_visible = false;
+        window_system.update();
+        assert!(application.lock().unwrap().is_pad_interactible);
+        assert!(application.lock().unwrap().is_touch_interactible);
+        assert!(!overlay.lock().unwrap().is_pad_interactible);
+        assert!(!overlay.lock().unwrap().is_touch_interactible);
+        overlay.lock().unwrap().window_visible = true;
+        window_system.update();
+        assert!(!application.lock().unwrap().is_touch_interactible);
+        assert!(overlay.lock().unwrap().is_touch_interactible);
+
+        overlay.lock().unwrap().overlay_watching_short_home_button = false;
         window_system.update();
 
-        assert!(application.lock().unwrap().is_interactible);
-        assert!(!overlay.lock().unwrap().is_interactible);
+        assert!(application.lock().unwrap().is_pad_interactible);
+        assert!(!overlay.lock().unwrap().is_pad_interactible);
+    }
+
+    #[test]
+    fn system_buttons_follow_watch_and_block_policies_for_all_roots() {
+        let window = WindowSystem::new(crate::core::SystemRef::null());
+        let roots: Vec<_> = [AppletId::QLaunch, AppletId::OverlayDisplay, AppletId::Application]
+            .into_iter().enumerate().map(|(index, id)| {
+                let mut applet = Applet::new(crate::core::SystemRef::null(), Process::new(), false);
+                applet.applet_id = id;
+                applet.aruid.pid = index as u64 + 1;
+                let applet = Arc::new(Mutex::new(applet));
+                window.track_applet(applet.clone(), id == AppletId::Application);
+                applet
+            }).collect();
+        let drain = |index: usize| {
+            let mut applet = roots[index].lock().unwrap();
+            let mut messages = Vec::new();
+            let mut message = AppletMessage::None;
+            while applet.lifecycle_manager.pop_message(&mut message) { messages.push(message); }
+            messages
+        };
+        // Remove initial lifecycle focus notifications from the test observation.
+        for index in 0..3 { drain(index); }
+        window.on_home_button_pressed(ButtonPressDuration::ShortPressing);
+        assert_eq!(drain(0), vec![AppletMessage::DetectShortPressingHomeButton]);
+        assert!(drain(1).is_empty());
+        assert_eq!(drain(2), vec![AppletMessage::DetectShortPressingHomeButton]);
+        roots[1].lock().unwrap().overlay_watching_short_home_button = true;
+        roots[0].lock().unwrap().home_button_short_pressed_blocked = true;
+        roots[2].lock().unwrap().home_button_long_pressed_blocked = true;
+        window.on_home_button_pressed(ButtonPressDuration::ShortPressing);
+        assert!(drain(0).is_empty());
+        assert_eq!(drain(1), vec![AppletMessage::DetectShortPressingHomeButton]);
+        drain(2);
+        for duration in [ButtonPressDuration::MiddlePressing, ButtonPressDuration::LongPressing] {
+            window.on_home_button_pressed(duration);
+            assert_eq!(drain(0), vec![AppletMessage::DetectLongPressingHomeButton]);
+            assert_eq!(drain(1), vec![AppletMessage::DetectLongPressingHomeButton]);
+            assert!(drain(2).is_empty());
+        }
+        for (button, message) in [
+            (SystemButtonType::CaptureButtonShortPressing, AppletMessage::DetectShortPressingCaptureButton),
+            (SystemButtonType::CaptureButtonLongPressing, AppletMessage::DetectLongPressingCaptureButton),
+        ] {
+            window.on_system_button_press(button);
+            for index in 0..3 { assert_eq!(drain(index), vec![message]); }
+        }
+        window.on_system_button_press(SystemButtonType::None);
+        for index in 0..3 { assert!(drain(index).is_empty()); }
     }
 }

@@ -97,6 +97,12 @@ pub trait BasicSetting {
 pub trait SettingType: Clone + PartialOrd + fmt::Display + FromStr + 'static {
     fn to_config_string(&self) -> String;
 
+    /// Deserialize before typed SetValue validation. Enum implementations clamp
+    /// raw numeric values before constructing a Rust enum (C++ allows the cast).
+    fn from_config_string(input: &str) -> Result<Self, ()> {
+        input.parse().map_err(|_| ())
+    }
+
     fn canonicalize_value(&self) -> String {
         self.to_config_string()
     }
@@ -190,7 +196,7 @@ where
             self.set_value(self.get_default().clone());
             return;
         }
-        match input.parse::<T>() {
+        match T::from_config_string(input) {
             Ok(val) => self.set_value(val),
             Err(_) => self.set_value(self.get_default().clone()),
         }
@@ -274,7 +280,7 @@ where
             self.set_value(self.get_default().clone());
             return;
         }
-        match input.parse::<T>() {
+        match T::from_config_string(input) {
             Ok(val) => self.set_value(val),
             Err(_) => self.set_value(self.get_default().clone()),
         }
@@ -392,5 +398,28 @@ mod tests {
         s.set_value(99);
         assert_eq!(s.to_string_repr(), "99");
         assert_eq!(s.to_string_global(), "10");
+    }
+
+    #[test]
+    fn removed_strict_fence_value_clamps_to_accurate_in_all_storages() {
+        use crate::settings_enums::GpuFenceBehavior as Fence;
+        let mut plain = Setting::new(Fence::Default, "fence", Category::RendererAdvanced);
+        let mut values = crate::settings::Values::default();
+        for (input, expected) in [
+            ("4", Fence::Accurate), ("3", Fence::Accurate),
+            ("1", Fence::Immediate), ("-1", Fence::Accurate),
+            ("4294967296", Fence::Default), (" 4 ", Fence::Accurate),
+            (" +4suffix", Fence::Accurate), ("-4294967295", Fence::Immediate),
+            ("9223372036854775808", Fence::Default), ("invalid", Fence::Default),
+        ] {
+            plain.load_string(input);
+            assert_eq!(*plain.get_value(), expected);
+            values.gpu_fence_behavior.set_global(true);
+            BasicSetting::load_string(&mut values.gpu_fence_behavior, input);
+            assert_eq!(*values.gpu_fence_behavior.get_value(), expected);
+            values.gpu_fence_behavior.set_global(false);
+            BasicSetting::load_string(&mut values.gpu_fence_behavior, input);
+            assert_eq!(*values.gpu_fence_behavior.get_value(), expected);
+        }
     }
 }

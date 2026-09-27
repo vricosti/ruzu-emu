@@ -274,6 +274,14 @@ impl LifecycleManager {
         }
     }
 
+    /// Upstream RequestFocusStateChangedNotification (07f40d5cac).
+    pub fn request_focus_state_changed_notification(&mut self) {
+        if self.focus_state_changed_notification_enabled {
+            self.has_focus_state_changed = true;
+            self.signal_system_event_if_needed();
+        }
+    }
+
     pub fn on_operation_and_performance_mode_changed(&mut self) {
         if self.operation_mode_changed_notification_enabled {
             self.has_operation_mode_changed = true;
@@ -671,17 +679,20 @@ mod tests {
     }
 
     #[test]
-    fn caller_resume_sequence_preserves_upstream_event_ordering() {
+    fn explicit_focus_notification_respects_enable_and_survives_until_consumed() {
         let mut lifecycle = LifecycleManager::new(true);
-        lifecycle.set_resume_notification_enabled(true);
-
-        lifecycle.get_system_event().signal();
+        let mut message = AppletMessage::None;
+        assert!(lifecycle.pop_message(&mut message)); // initial notification
+        lifecycle.set_focus_state_changed_notification_enabled(false);
+        lifecycle.request_focus_state_changed_notification();
+        assert!(!lifecycle.has_focus_state_changed);
+        assert!(!lifecycle.get_system_event().is_signaled());
+        lifecycle.set_focus_state_changed_notification_enabled(true);
+        lifecycle.request_focus_state_changed_notification();
         assert!(lifecycle.get_system_event().is_signaled());
-        lifecycle.request_resume_notification();
-        lifecycle.get_system_event().clear();
-        lifecycle.update_requested_focus_state();
-
-        assert!(lifecycle.has_resume);
+        assert!(!lifecycle.has_resume);
+        assert!(lifecycle.pop_message(&mut message));
+        assert_eq!(message, AppletMessage::FocusStateChanged);
         assert!(!lifecycle.get_system_event().is_signaled());
     }
 

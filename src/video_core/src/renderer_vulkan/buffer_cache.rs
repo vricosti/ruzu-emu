@@ -1101,8 +1101,8 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         unsafe { self.scheduler.as_ref() }.current_tick()
     }
 
-    fn known_gpu_tick(&self) -> u64 {
-        unsafe { self.scheduler.as_ref() }.known_gpu_tick()
+    fn is_free(&mut self, tick: u64) -> bool {
+        unsafe { self.scheduler.as_ref() }.is_free(tick)
     }
 
     fn wait(&mut self, tick: u64) {

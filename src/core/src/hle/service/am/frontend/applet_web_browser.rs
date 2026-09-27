@@ -235,14 +235,6 @@ fn extract_shared_fonts(system: SystemRef) {
     }
 }
 
-fn exit(applet: &Weak<Mutex<Applet>>) {
-    let Some(applet) = applet.upgrade() else {
-        return;
-    };
-    let mut applet = applet.lock().unwrap();
-    applet.is_completed = true;
-    applet.signal_state_changed_event_without_process();
-}
 
 fn write_output_tlv(out: &mut [u8], offset: usize, kind: WebArgOutputTlvType, size: u16) {
     out[offset..offset + 2].copy_from_slice(&kind.0.to_le_bytes());
@@ -425,6 +417,7 @@ impl WebBrowser {
 
     fn web_browser_exit(&self, exit_reason: WebExitReason, last_url: String) {
         Self::finish(
+            self.system,
             self.web_arg_header,
             self.web_applet_version,
             exit_reason,
@@ -438,6 +431,7 @@ impl WebBrowser {
 
     #[allow(clippy::too_many_arguments)]
     fn finish(
+        system: SystemRef,
         header: WebArgHeader,
         version: WebAppletVersion,
         exit_reason: WebExitReason,
@@ -459,7 +453,7 @@ impl WebBrowser {
         // accessor's Applet mutex. It publishes completion on return. Only
         // a callback arriving after the frontend call must acquire it here.
         if frontend_executing.is_some_and(|executing| !executing.load(Ordering::Acquire)) {
-            exit(applet);
+            super::applets::exit(system, applet);
         }
     }
 
@@ -528,7 +522,7 @@ impl WebBrowser {
             Box::new(move || Self::extract_offline_romfs(system, romfs.clone(), &cache_dir)),
             Box::new(move |reason, last_url| {
                 Self::finish(
-                    header, version, reason, last_url, &applet, &broker, &complete, Some(&executing),
+                    system, header, version, reason, last_url, &applet, &broker, &complete, Some(&executing),
                 )
             }),
         );
@@ -536,6 +530,7 @@ impl WebBrowser {
     }
 
     fn execute_web(&self) {
+        let system = self.system;
         log::info!("Opening external URL at {}", self.external_url);
         let header = self.web_arg_header;
         let version = self.web_applet_version;
@@ -560,7 +555,7 @@ impl WebBrowser {
                     };
                 }
                 Self::finish(
-                    header, version, reason, last_url, &applet, &broker, &complete, Some(&executing),
+                    system, header, version, reason, last_url, &applet, &broker, &complete, Some(&executing),
                 )
             }),
         );
@@ -655,7 +650,9 @@ impl FrontendApplet for WebBrowser {
     }
 
     fn request_exit(&mut self) {
+        self.frontend_executing.store(true, Ordering::Release);
         self.frontend.close();
+        self.frontend_executing.store(false, Ordering::Release);
     }
 
     fn get_library_applet_mode(&self) -> LibraryAppletMode {
@@ -731,16 +728,21 @@ mod tests {
         let owner = Arc::new(Mutex::new(Applet::new(
             SystemRef::from_ref(&system), Process::new(), false,
         )));
+        let parent = Arc::new(Mutex::new(Applet::new(SystemRef::null(), Process::new(), true)));
+        owner.lock().unwrap().caller_applet = Arc::downgrade(&parent);
+        parent.lock().unwrap().child_applets.push(Arc::clone(&owner));
         let broker = AppletDataBroker::new();
         let complete = AtomicBool::new(false);
         let executing = AtomicBool::new(false);
         WebBrowser::finish(
+            SystemRef::null(),
             WebArgHeader::default(), WebAppletVersion::default(),
             WebExitReason::WINDOW_CLOSED, String::new(), &Arc::downgrade(&owner),
             &broker, &complete, Some(&executing),
         );
         assert!(complete.load(Ordering::Acquire));
         assert!(owner.lock().unwrap().is_completed);
+        assert!(parent.lock().unwrap().child_applets.is_empty());
         assert!(broker.get_out_data().pop().is_ok());
     }
 

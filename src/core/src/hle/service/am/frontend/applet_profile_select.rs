@@ -208,14 +208,6 @@ impl ProfileSelect {
         }
     }
 
-    fn exit(applet: &Weak<Mutex<Applet>>) {
-        let Some(applet) = applet.upgrade() else {
-            return;
-        };
-        let mut applet = applet.lock().unwrap();
-        applet.is_completed = true;
-        applet.signal_state_changed_event_without_process();
-    }
 
     fn parameters(&self) -> ProfileSelectParameters {
         match self.profile_select_version {
@@ -246,6 +238,7 @@ impl ProfileSelect {
     }
 
     fn selection_complete(
+        system: SystemRef,
         uuid: Option<UUID>,
         applet: &Weak<Mutex<Applet>>,
         broker: &AppletDataBroker,
@@ -275,7 +268,7 @@ impl ProfileSelect {
         broker.get_out_data().push(data);
         complete.store(true, Ordering::Release);
         if !frontend_executing.load(Ordering::Acquire) {
-            Self::exit(applet);
+            super::applets::exit(system, applet);
         }
     }
 }
@@ -331,6 +324,7 @@ impl FrontendApplet for ProfileSelect {
             return;
         }
 
+        let system = self.system;
         let applet = self.applet.clone();
         let broker = Arc::clone(&self.broker);
         let complete = Arc::clone(&self.complete);
@@ -343,6 +337,7 @@ impl FrontendApplet for ProfileSelect {
         self.frontend.select_profile(
             Box::new(move |uuid| {
                 Self::selection_complete(
+                    system,
                     uuid,
                     &applet,
                     &broker,
@@ -358,7 +353,9 @@ impl FrontendApplet for ProfileSelect {
     }
 
     fn request_exit(&mut self) {
+        self.frontend_executing.store(true, Ordering::Release);
         self.frontend.close();
+        self.frontend_executing.store(false, Ordering::Release);
     }
 
     fn get_library_applet_mode(&self) -> LibraryAppletMode {

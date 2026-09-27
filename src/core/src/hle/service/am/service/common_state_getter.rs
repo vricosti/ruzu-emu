@@ -262,8 +262,22 @@ impl ICommonStateGetter {
     }
 
     /// Port of ICommonStateGetter::PerformSystemButtonPressingIfInFocus
-    pub fn perform_system_button_pressing_if_in_focus(&self, _button_type: SystemButtonType) {
-        log::warn!("(STUBBED) PerformSystemButtonPressingIfInFocus called");
+    pub fn perform_system_button_pressing_if_in_focus(&self, button_type: SystemButtonType) {
+        let mut applet = self.applet.lock().unwrap();
+        let message = match button_type {
+            SystemButtonType::HomeButtonShortPressing if !applet.home_button_short_pressed_blocked =>
+                AppletMessage::DetectShortPressingHomeButton,
+            SystemButtonType::HomeButtonLongPressing if !applet.home_button_long_pressed_blocked =>
+                AppletMessage::DetectLongPressingHomeButton,
+            SystemButtonType::CaptureButtonShortPressing
+                if applet.handling_capture_button_short_pressed_message_enabled_for_applet =>
+                AppletMessage::DetectShortPressingCaptureButton,
+            SystemButtonType::CaptureButtonLongPressing
+                if applet.handling_capture_button_long_pressed_message_enabled_for_applet =>
+                AppletMessage::DetectLongPressingCaptureButton,
+            _ => return,
+        };
+        applet.lifecycle_manager.push_unordered_message(message);
     }
 
     /// Port of ICommonStateGetter::GetOperationModeSystemInfo
@@ -790,6 +804,47 @@ impl ServiceFramework for ICommonStateGetter {
 mod tests {
     use super::*;
     use common::settings_enums::ConsoleMode;
+
+    #[test]
+    fn system_button_command_respects_individual_home_and_capture_policies() {
+        let applet = Arc::new(Mutex::new(Applet::new(SystemRef::null(),
+            crate::hle::service::os::process::Process::new(), false)));
+        let service = ICommonStateGetter::new(SystemRef::null(), applet.clone());
+        let drain = || {
+            let mut applet = applet.lock().unwrap();
+            let mut message = AppletMessage::None;
+            let mut messages = Vec::new();
+            while applet.lifecycle_manager.pop_message(&mut message) { messages.push(message); }
+            messages
+        };
+        drain();
+        for enabled in [false, true] {
+            {
+                let mut applet = applet.lock().unwrap();
+                applet.home_button_short_pressed_blocked = !enabled;
+                applet.home_button_long_pressed_blocked = !enabled;
+                applet.handling_capture_button_short_pressed_message_enabled_for_applet = enabled;
+                applet.handling_capture_button_long_pressed_message_enabled_for_applet = enabled;
+            }
+            for (raw, expected) in [
+                (1, AppletMessage::DetectShortPressingHomeButton),
+                (2, AppletMessage::DetectLongPressingHomeButton),
+                (6, AppletMessage::DetectShortPressingCaptureButton),
+                (7, AppletMessage::DetectLongPressingCaptureButton),
+            ] {
+                let mut ctx = HLERequestContext::new();
+                ctx.cmd_buf[2] = raw;
+                service.handlers[&80].handler_callback.unwrap()(&service, &mut ctx);
+                assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+                assert_eq!(drain(), if enabled { vec![expected] } else { vec![] });
+            }
+        }
+        for button in [SystemButtonType::None, SystemButtonType::PowerButtonShortPressing] {
+            service.perform_system_button_pressing_if_in_focus(button);
+            assert!(drain().is_empty());
+        }
+        assert_eq!(AppletMessage::DetectLongPressingCaptureButton as u32, 91);
+    }
 
     #[test]
     fn sleep_lock_release_commands_clear_the_same_event_and_are_idempotent() {

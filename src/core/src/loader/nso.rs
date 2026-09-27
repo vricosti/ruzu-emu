@@ -92,6 +92,11 @@ impl NsoHeader {
         assert!(segment_num < 3, "Invalid segment {}", segment_num);
         ((self.flags >> segment_num) & 1) != 0
     }
+
+    /// Upstream NSOHeader::IsZBICCompressed (firmware22+ codec flag).
+    pub fn is_zbic_compressed(&self) -> bool {
+        ((self.flags >> 7) & 1) != 0
+    }
 }
 
 // ============================================================================
@@ -163,11 +168,18 @@ const fn page_align_size(size: u32) -> u32 {
     (size + YUZU_PAGEMASK) & !YUZU_PAGEMASK
 }
 
-/// Decompress a segment using LZ4.
-///
-/// Maps to upstream `DecompressSegment`.
-fn decompress_segment(compressed_data: &[u8], expected_size: u32) -> Vec<u8> {
+/// Mechanical extraction of LoadModule's codec branch. Return None instead of
+/// upstream's assertion on corrupt compressed data; never load zeroed code.
+fn decompress_segment(compressed_data: &[u8], expected_size: u32, zbic: bool) -> Option<Vec<u8>> {
     let mut result = vec![0u8; expected_size as usize];
+    if zbic {
+        let written = common::zbic_compression::decompress_data_zbic(&mut result, compressed_data);
+        if written <= 0 {
+            log::error!("NSO ZBIC decompression failed");
+            return None;
+        }
+        return Some(result);
+    }
     match lz4_flex::block::decompress_into(compressed_data, &mut result) {
         Ok(written) => {
             if written != expected_size as usize {
@@ -176,15 +188,15 @@ fn decompress_segment(compressed_data: &[u8], expected_size: u32) -> Vec<u8> {
                     expected_size,
                     written
                 );
+                return None;
             }
         }
         Err(e) => {
             log::error!("NSO LZ4 decompression failed: {}", e);
-            // Return zeroed buffer on failure
-            result.fill(0);
+            return None;
         }
     }
-    result
+    Some(result)
 }
 
 /// Read a plain-old-data struct from a VfsFile at the given offset.
@@ -272,7 +284,8 @@ impl AppLoaderNso {
                 nso_header.segments[i].offset as usize,
             );
             if nso_header.is_segment_compressed(i) {
-                data = decompress_segment(&data, nso_header.segments[i].size);
+                data = decompress_segment(&data, nso_header.segments[i].size,
+                    nso_header.is_zbic_compressed())?;
             }
             log::info!(
                 "NSO segment[{}]: location={:#x} size={:#x} compressed={:#x} data.len={:#x}",
@@ -483,6 +496,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compression_flags_and_decoder_selection_match_upstream() {
+        let zbic_frame = b"ZBIC\x20\x05\x29\x00\x00hello";
+        let lz4_frame = lz4_flex::block::compress(b"hello");
+        for flags in 0..256 {
+            let header = NsoHeader { flags, ..Default::default() };
+            assert_eq!(header.is_zbic_compressed(), flags & 0x80 != 0);
+            for segment in 0..3 {
+                assert_eq!(header.is_segment_compressed(segment), flags & (1 << segment) != 0);
+            }
+        }
+        assert_eq!(decompress_segment(zbic_frame, 5, true), Some(b"hello".to_vec()));
+        assert_eq!(decompress_segment(&lz4_frame, 5, false), Some(b"hello".to_vec()));
+        assert!(decompress_segment(&lz4_frame, 5, true).is_none());
+        assert!(decompress_segment(zbic_frame, 5, false).is_none());
+        assert!(decompress_segment(&lz4_frame, 6, false).is_none());
+        assert!(decompress_segment(zbic_frame, 4, true).is_none());
+        assert!(decompress_segment(b"ZBICbad", 5, true).is_none());
+        assert!(decompress_segment(&[], 5, false).is_none());
+    }
+
+    #[test]
     fn argument_layout_pass_respects_setting_gate_and_byte_capacity() {
         const CHILD: &str = "RUZU_TEST_NSO_ARGUMENTS";
         if std::env::var_os(CHILD).is_none() {
@@ -526,6 +560,27 @@ mod tests {
             assert_eq!(std::mem::size_of::<NsoArgumentHeader>(), 0x20);
             assert_eq!(std::mem::offset_of!(NsoArgumentHeader, actual_size), 4);
             assert_eq!(std::mem::offset_of!(NsoArgumentHeader, _padding), 8);
+            // Exercise LoadModule's actual flag routing as well as the helper.
+            common::settings::values_mut().program_args.set_value(String::new());
+            for (flags, payload, succeeds) in [
+                (0x81u32, b"ZBIC\x20\x05\x29\x00\x00hello".to_vec(), true),
+                (0x01, lz4_flex::block::compress(b"hello"), true),
+                (0x80, b"hello".to_vec(), true), // flag7 alone does not compress
+                (0x81, b"ZBICbad".to_vec(), false),
+                (0x81, lz4_flex::block::compress(b"hello"), false),
+            ] {
+                let mut bytes = vec![0; 0x100];
+                bytes[..4].copy_from_slice(b"NSO0");
+                bytes[0x0c..0x10].copy_from_slice(&flags.to_le_bytes());
+                bytes[0x10..0x14].copy_from_slice(&0x100u32.to_le_bytes());
+                bytes[0x18..0x1c].copy_from_slice(&5u32.to_le_bytes());
+                bytes[0x60..0x64].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+                bytes.extend(payload);
+                let file = VectorVfsFile::new(bytes, "synthetic-codec".into(), None);
+                let result = AppLoaderNso::load_module(&mut process, &mut system, &file,
+                    0x10000, false, false, None);
+                assert_eq!(result, succeeds.then_some(0x11000), "flags={flags:#x}");
+            }
             drop(process);
             drop(system);
             std::fs::remove_dir_all(directory).unwrap();

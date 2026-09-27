@@ -501,7 +501,6 @@ impl QueryCacheBase {
         } else {
             !settings::is_gpu_fence_behavior_balanced(&values)
                 && !settings::is_gpu_fence_behavior_accurate(&values)
-                && !settings::is_gpu_fence_behavior_strict(&values)
         }) && is_fence;
         drop(values);
 

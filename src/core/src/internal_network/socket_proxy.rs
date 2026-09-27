@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use crate::internal_network::network::{
     Domain, Errno, Protocol, ProxyPacket, ShutdownHow, SockAddrIn, Type, FLAG_MSG_PEEK,
 };
-use crate::internal_network::sockets::{AcceptResult, SocketBase};
+use crate::internal_network::sockets::{AcceptResult, NativeSocket, SocketBase, INVALID_SOCKET};
 
 /// Proxy socket for room-based network tunneling.
 ///
@@ -234,8 +234,8 @@ impl SocketBase for ProxySocket {
         packets.push_back(decompressed);
     }
 
-    fn get_fd(&self) -> i32 {
-        -1 // ProxySocket doesn't use a real fd
+    fn get_fd(&self) -> NativeSocket {
+        INVALID_SOCKET // ProxySocket doesn't use a real fd
     }
 }
 

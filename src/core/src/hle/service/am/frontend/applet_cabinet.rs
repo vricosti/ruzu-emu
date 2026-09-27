@@ -184,16 +184,9 @@ impl Cabinet {
         }
     }
 
-    fn exit(applet: &Weak<Mutex<Applet>>) {
-        let Some(applet) = applet.upgrade() else {
-            return;
-        };
-        let mut applet = applet.lock().unwrap();
-        applet.is_completed = true;
-        applet.signal_state_changed_event_without_process();
-    }
 
     fn finish_cancel(
+        system: SystemRef,
         input: CabinetInput,
         device: &Arc<ParkingMutex<NfcDevice>>,
         broker: &AppletDataBroker,
@@ -210,12 +203,13 @@ impl Cabinet {
         ));
         complete.store(true, Ordering::Release);
         if !frontend_executing.load(Ordering::Acquire) {
-            Self::exit(applet);
+            super::applets::exit(system, applet);
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn display_completed(
+        system: SystemRef,
         apply_changes: bool,
         amiibo_name: String,
         input: CabinetInput,
@@ -227,6 +221,7 @@ impl Cabinet {
     ) {
         if !apply_changes {
             Self::finish_cancel(
+                system,
                 input,
                 &device,
                 &broker,
@@ -243,6 +238,7 @@ impl Cabinet {
         ) {
             drop(nfp_device);
             Self::finish_cancel(
+                system,
                 input,
                 &device,
                 &broker,
@@ -315,7 +311,7 @@ impl Cabinet {
         ));
         complete.store(true, Ordering::Release);
         if !frontend_executing.load(Ordering::Acquire) {
-            Self::exit(&applet);
+            super::applets::exit(system, &applet);
         }
     }
 }
@@ -375,6 +371,7 @@ impl FrontendApplet for Cabinet {
         };
         let device = Arc::clone(self.nfp_device.as_ref().unwrap());
         let input = self.applet_input_common;
+        let system = self.system;
         let broker = Arc::clone(&self.broker);
         let complete = Arc::clone(&self.is_complete);
         let applet = self.applet.clone();
@@ -384,6 +381,7 @@ impl FrontendApplet for Cabinet {
         self.frontend.show_cabinet_applet(
             Box::new(move |apply_changes, amiibo_name| {
                 Self::display_completed(
+                    system,
                     apply_changes,
                     amiibo_name,
                     input,
@@ -401,7 +399,9 @@ impl FrontendApplet for Cabinet {
     }
 
     fn request_exit(&mut self) {
+        self.frontend_executing.store(true, Ordering::Release);
         self.frontend.close();
+        self.frontend_executing.store(false, Ordering::Release);
     }
 
     fn get_library_applet_mode(&self) -> LibraryAppletMode {

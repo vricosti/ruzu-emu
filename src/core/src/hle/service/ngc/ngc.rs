@@ -11,7 +11,7 @@ use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 use crate::hle::service::hle_ipc::{
     HLERequestContext, SessionRequestHandler, SessionRequestHandlerPtr,
 };
-use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
+use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder, RESULT_NOT_SUPPORTED};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 /// IPC command IDs for NgctServiceImpl ("ngct:u")
@@ -325,6 +325,260 @@ impl ServiceFramework for NgcServiceImpl {
     }
 }
 
+/// Upstream SaveDataHandle; this is not an implemented persistent save handle.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SaveDataHandle {
+    unk0: u64,
+}
+const _: () = assert!(std::mem::size_of::<SaveDataHandle>() == 8);
+
+/// Port of upstream IUserShimScopedObject in ngc.cpp. StreamPlay remains stubbed.
+struct IUserShimScopedObject {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IUserShimScopedObject {
+    fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (450, None, "InitializeForSaveData"),
+                (451, None, "FinalizeForSaveData"),
+                (452, Some(Self::open_save_data), "OpenSaveData"),
+                (453, None, "CloseSaveData"),
+                (454, Some(Self::read_save_slot), "ReadSaveSlot"),
+                (455, Some(Self::write_save_slot), "WriteSaveSlot"),
+                (456, None, "FlushSaveSlot"),
+                (457, None, "CommitSaveData"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn open_save_data(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let _uid = RequestParser::new(ctx).pop_raw::<crate::hle::service::acc::profile_manager::Uid>();
+        log::warn!("IUserShimScopedObject::OpenSaveData stubbed");
+        let handle = SaveDataHandle::default();
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_NOT_SUPPORTED);
+        rb.push_u64(handle.unk0);
+    }
+
+    fn read_save_slot(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let _offset = rp.pop_i32();
+        rp.skip(1); // CMIF aligns the following SaveDataHandle to eight bytes.
+        let _handle = rp.pop_raw::<SaveDataHandle>();
+        log::warn!("IUserShimScopedObject::ReadSaveSlot stubbed");
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_NOT_SUPPORTED);
+        rb.push_u32(0);
+        // Eden's CMIF wrapper copies its temporary output buffer even on error.
+        // Rust initializes it rather than exposing uninitialized host memory.
+        if ctx.can_write_buffer(0) {
+            ctx.write_buffer(&vec![0; ctx.get_write_buffer_size(0)], 0);
+        }
+    }
+
+    fn write_save_slot(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let mut rp = RequestParser::new(ctx);
+        let _offset = rp.pop_i32();
+        rp.skip(1);
+        let _handle = rp.pop_raw::<SaveDataHandle>();
+        let _data = ctx.read_buffer(0);
+        log::warn!("IUserShimScopedObject::WriteSaveSlot stubbed");
+        // Upstream returns success without storing anything.
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+    }
+}
+
+impl SessionRequestHandler for IUserShimScopedObject {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "IUserShimScopedObject"
+    }
+}
+
+impl ServiceFramework for IUserShimScopedObject {
+    fn get_service_name(&self) -> &str {
+        "IUserShimScopedObject"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+/// Port of upstream IUserService in ngc.cpp. StreamPlay remains stubbed.
+struct IUserService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl IUserService {
+    fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, Some(Self::cmd0), "Cmd0"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn cmd0(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let _unk0 = RequestParser::new(ctx).pop_u32();
+        log::warn!("IUserService::Cmd0 stubbed");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(std::sync::Arc::new(IUserShimScopedObject::new()));
+    }
+}
+
+impl SessionRequestHandler for IUserService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "stpl:u"
+    }
+}
+
+impl ServiceFramework for IUserService {
+    fn get_service_name(&self) -> &str {
+        "stpl:u"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+/// Port of upstream ISystemShimScopedObject in ngc.cpp. StreamPlay remains stubbed.
+struct ISystemShimScopedObject {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl ISystemShimScopedObject {
+    fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (106, None, "Cmd106"),
+                (107, None, "Cmd107"),
+                (108, Some(Self::cmd108), "Cmd108"),
+                (207, None, "Cmd207"),
+                (208, Some(Self::cmd208), "Cmd208"),
+                (209, None, "Cmd209"),
+                (210, None, "Cmd210"),
+                (211, None, "Cmd211"),
+                (212, None, "Cmd212"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn cmd108(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("ISystemShimScopedObject::Cmd108 stubbed");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
+        rb.push_result(RESULT_NOT_SUPPORTED);
+    }
+
+    fn cmd208(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("ISystemShimScopedObject::Cmd208 stubbed");
+        let mut rb = ResponseBuilder::new(ctx, 10, 0, 0);
+        rb.push_result(RESULT_NOT_SUPPORTED);
+        for _ in 0..8 {
+            rb.push_u32(0);
+        }
+    }
+}
+
+impl SessionRequestHandler for ISystemShimScopedObject {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "ISystemShimScopedObject"
+    }
+}
+
+impl ServiceFramework for ISystemShimScopedObject {
+    fn get_service_name(&self) -> &str {
+        "ISystemShimScopedObject"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
+/// Port of upstream ISystemService in ngc.cpp. StreamPlay remains stubbed.
+struct ISystemService {
+    handlers: BTreeMap<u32, FunctionInfo>,
+    handlers_tipc: BTreeMap<u32, FunctionInfo>,
+}
+
+impl ISystemService {
+    fn new() -> Self {
+        Self {
+            handlers: build_handler_map(&[
+                (0, Some(Self::cmd0), "Cmd0"),
+            ]),
+            handlers_tipc: BTreeMap::new(),
+        }
+    }
+
+    fn cmd0(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("ISystemService::Cmd0 stubbed");
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 1);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_ipc_interface(std::sync::Arc::new(ISystemShimScopedObject::new()));
+    }
+}
+
+impl SessionRequestHandler for ISystemService {
+    fn handle_sync_request(&self, ctx: &mut HLERequestContext) -> ResultCode {
+        ServiceFramework::handle_sync_request_impl(self, ctx)
+    }
+
+    fn service_name(&self) -> &str {
+        "stpl:sys"
+    }
+}
+
+impl ServiceFramework for ISystemService {
+    fn get_service_name(&self) -> &str {
+        "stpl:sys"
+    }
+
+    fn handlers(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers
+    }
+
+    fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo> {
+        &self.handlers_tipc
+    }
+}
+
 fn fixed_zero_terminated_string(buffer: &[u8]) -> String {
     let end = buffer
         .iter()
@@ -362,6 +616,25 @@ pub fn loop_process(system: crate::core::SystemRef) {
             Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(NgcServiceImpl::new()) }),
             4,
         );
+        // Eden FirmwareManager::GetFirmwareVersion wraps this system-aware
+        // reader. The context-free legacy helper would always report18.0.0.
+        use crate::hle::service::set::system_settings_server::get_firmware_version_impl_for_system;
+        use crate::hle::service::set::settings_types::GetFirmwareVersionType;
+        let firmware = get_firmware_version_impl_for_system(
+            system.get(), GetFirmwareVersionType::Version2,
+        ).unwrap_or_default();
+        if firmware.major >= 23 {
+            server_manager.register_named_service(
+                "stpl:u",
+                Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(IUserService::new()) }),
+                4,
+            );
+            server_manager.register_named_service(
+                "stpl:sys",
+                Box::new(|| -> SessionRequestHandlerPtr { std::sync::Arc::new(ISystemService::new()) }),
+                4,
+            );
+        }
     }
 
     ServerManager::run_server_shared(server_manager);
@@ -370,6 +643,61 @@ pub fn loop_process(system: crate::core::SystemRef) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamplay_tables_and_reply_payloads_match_upstream() {
+        let user = IUserShimScopedObject::new();
+        let system = ISystemShimScopedObject::new();
+        assert_eq!(user.handlers().keys().copied().collect::<Vec<_>>(), (450..=457).collect::<Vec<_>>());
+        assert_eq!(system.handlers().keys().copied().collect::<Vec<_>>(), [106,107,108,207,208,209,210,211,212]);
+        assert_eq!(std::mem::size_of::<SaveDataHandle>(), 8);
+        assert_eq!(std::mem::align_of::<SaveDataHandle>(), 8);
+        assert_eq!(std::mem::offset_of!(SaveDataHandle, unk0), 0);
+        for (service, cases) in [
+            (&user as &dyn ServiceFramework, &[(452, 0x20b, 2), (454, 0x20b, 1), (455, 0, 0)][..]),
+            (&system as &dyn ServiceFramework, &[(108, 0x20b, 0), (208, 0x20b, 8)][..]),
+        ] {
+            for (&id, info) in service.handlers() {
+                assert_eq!(info.handler_callback.is_some(), cases.iter().any(|c| c.0 == id));
+            }
+            for &(command, result, output_words) in cases {
+                let mut ctx = HLERequestContext::new();
+                ctx.cmd_buf.fill(0xa5a5a5a5);
+                service.handlers()[&command].handler_callback.unwrap()(service, &mut ctx);
+                assert_eq!(ctx.cmd_buf[6], result);
+                assert_eq!(&ctx.cmd_buf[8..8 + output_words], vec![0; output_words]);
+            }
+        }
+    }
+
+    #[test]
+    fn streamplay_factories_return_the_corresponding_scoped_object() {
+        use crate::hle::service::hle_ipc::SessionRequestManager;
+        use std::sync::{Arc, Mutex};
+        for (service, expected) in [
+            (Arc::new(IUserService::new()) as SessionRequestHandlerPtr, "IUserShimScopedObject"),
+            (Arc::new(ISystemService::new()) as SessionRequestHandlerPtr, "ISystemShimScopedObject"),
+        ] {
+            let manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+            manager.lock().unwrap().set_session_handler(service.clone());
+            manager.lock().unwrap().convert_to_domain();
+            let mut ctx = HLERequestContext::new();
+            ctx.set_session_request_manager(manager.clone());
+            let mut words = [0; crate::hle::ipc::COMMAND_BUFFER_LENGTH];
+            words[0] = 4;
+            words[1] = 12;
+            words[4..8].copy_from_slice(&[0x200001, 1, 0, 0]);
+            words[8..12].copy_from_slice(&[u32::from_le_bytes(*b"SFCI"), 0, 0, 0]);
+            words[12] = 0x12345678;
+            ctx.populate_from_incoming_command_buffer(&words);
+            assert_eq!(service.handle_sync_request(&mut ctx), RESULT_SUCCESS);
+            ctx.write_to_outgoing_command_buffer();
+            assert_eq!(ctx.cmd_buf[10], 0);
+            let guard = manager.lock().unwrap();
+            assert_eq!(guard.domain_handler_count(), 2);
+            assert_eq!(guard.domain_handler(1).unwrap().service_name(), expected);
+        }
+    }
 
     #[test]
     fn profanity_filter_option_matches_upstream_size() {

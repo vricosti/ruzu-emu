@@ -486,12 +486,10 @@ pub fn loop_process(system: crate::core::SystemRef) {
             }),
             30,
         );
-        // This surprising factory is literal upstream behavior: `audren:d`
-        // is registered with IAudioInManager, not IAudioRendererManagerForDebugger.
         server_manager.register_named_service(
             "audren:d",
-            Box::new(move || -> SessionRequestHandlerPtr {
-                std::sync::Arc::new(super::audio_in_manager::IAudioInManager::new(system))
+            Box::new(|| -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(IAudioRendererManagerForDebugger::new())
             }),
             30,
         );
@@ -607,5 +605,10 @@ mod tests {
         assert_eq!(IAudioRendererManagerForApplet::new().handlers().len(), 8);
         assert_eq!(IAudioOutManagerForApplet::new().handlers().len(), 6);
         assert_eq!(IAudioSnoopManager::new().handlers().len(), 5);
+        let renderer_debug = IAudioRendererManagerForDebugger::new();
+        assert_eq!(renderer_debug.service_name(), "audren:d");
+        assert_eq!(renderer_debug.handlers().len(), 2);
+        assert_eq!(renderer_debug.handlers()[&0].name, "RequestSuspend");
+        assert_eq!(renderer_debug.handlers()[&1].name, "RequestResume");
     }
 }

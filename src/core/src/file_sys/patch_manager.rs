@@ -194,92 +194,6 @@ fn is_legacy_update_disabled(disabled: &[String]) -> bool {
         .any(|name| disabled.iter().any(|entry| entry == name))
 }
 
-/// Apply LayeredFS patches to a RomFS file.
-/// Corresponds to upstream static `ApplyLayeredFS`.
-fn apply_layered_fs(
-    romfs: &mut VirtualFile,
-    title_id: u64,
-    record_type: ContentRecordType,
-    fs_controller: &FileSystemController,
-) {
-    let load_dir = fs_controller.get_modification_load_root(title_id);
-    let sdmc_load_dir = fs_controller.get_sdmc_modification_load_root(title_id);
-
-    if (record_type != ContentRecordType::Program
-        && record_type != ContentRecordType::Data
-        && record_type != ContentRecordType::HtmlDocument)
-        || (load_dir.is_none() && sdmc_load_dir.is_none())
-    {
-        return;
-    }
-
-    let disabled = get_disabled_addons(title_id);
-
-    let mut patch_dirs: Vec<VirtualDir> = if let Some(ref ld) = load_dir {
-        ld.get_subdirectories()
-    } else {
-        Vec::new()
-    };
-
-    if let Some(sdmc_dir) = sdmc_load_dir {
-        if !disabled.iter().any(|d| d == "SDMC") {
-            patch_dirs.push(sdmc_dir);
-        }
-    }
-
-    patch_dirs.sort_by(|l, r| l.get_name().cmp(&r.get_name()));
-
-    let mut layers: Vec<VirtualDir> = Vec::new();
-    let mut layers_ext: Vec<VirtualDir> = Vec::new();
-
-    for subdir in &patch_dirs {
-        if disabled.iter().any(|d| d == &subdir.get_name()) {
-            continue;
-        }
-
-        if let Some(romfs_dir) = find_subdirectory_caseless(subdir, "romfs") {
-            layers.push(Arc::new(CachedVfsDirectory::new(romfs_dir)));
-        }
-
-        if let Some(ext_dir) = find_subdirectory_caseless(subdir, "romfs_ext") {
-            layers_ext.push(Arc::new(CachedVfsDirectory::new(ext_dir)));
-        }
-
-        if record_type == ContentRecordType::HtmlDocument {
-            if let Some(manual_dir) = find_subdirectory_caseless(subdir, "manual_html") {
-                layers.push(Arc::new(CachedVfsDirectory::new(manual_dir)));
-            }
-        }
-    }
-
-    // When there are no layers to apply, return early
-    if layers.is_empty() && layers_ext.is_empty() {
-        return;
-    }
-
-    let extracted = match extract_romfs(Some(romfs.clone())) {
-        Some(dir) => dir,
-        None => return,
-    };
-
-    layers.push(extracted);
-
-    let layered = match LayeredVfsDirectory::make_layered_directory(layers, String::new()) {
-        Some(dir) => dir,
-        None => return,
-    };
-
-    let layered_ext = LayeredVfsDirectory::make_layered_directory(layers_ext, String::new());
-
-    let packed = match create_romfs(Some(layered), layered_ext) {
-        Some(f) => f,
-        None => return,
-    };
-
-    log::info!("    RomFS: LayeredFS patches applied successfully");
-    *romfs = packed;
-}
-
 // ============================================================================
 // PatchType, Patch
 // ============================================================================
@@ -332,11 +246,100 @@ pub type BuildId = [u8; 0x20];
 /// need them will gracefully no-op when the reference is absent.
 pub struct PatchManager<'a> {
     title_id: u64,
+    parent_title_id: Option<u64>,
     fs_controller: Option<&'a FileSystemController>,
     content_provider: Option<&'a dyn ContentProvider>,
 }
 
 impl<'a> PatchManager<'a> {
+    /// Apply LayeredFS patches to a RomFS file.
+    /// Corresponds to upstream `PatchManager::ApplyLayeredFS`.
+    fn apply_layered_fs(
+        &self,
+        romfs: &mut VirtualFile,
+        record_type: ContentRecordType,
+    ) {
+        let load_dir = self.get_modification_load_root(false);
+        let sdmc_load_dir = self.get_modification_load_root(true);
+
+        if (record_type != ContentRecordType::Program
+            && record_type != ContentRecordType::Data
+            && record_type != ContentRecordType::HtmlDocument)
+            || (load_dir.is_none() && sdmc_load_dir.is_none())
+        {
+            return;
+        }
+
+        let disabled = self.get_disabled_addons();
+
+        let mut patch_dirs: Vec<VirtualDir> = if let Some(ref ld) = load_dir {
+            ld.get_subdirectories()
+        } else {
+            Vec::new()
+        };
+
+        if let Some(sdmc_dir) = sdmc_load_dir {
+            if !disabled.iter().any(|d| d == "SDMC") {
+                patch_dirs.push(sdmc_dir);
+            }
+        }
+
+        patch_dirs.sort_by(|l, r| l.get_name().cmp(&r.get_name()));
+
+        let mut layers: Vec<VirtualDir> = Vec::new();
+        let mut layers_ext: Vec<VirtualDir> = Vec::new();
+
+        for subdir in &patch_dirs {
+            if disabled.iter().any(|d| d == &subdir.get_name()) {
+                continue;
+            }
+
+            if let Some(romfs_dir) = find_subdirectory_caseless(subdir, "romfs") {
+                layers.push(Arc::new(CachedVfsDirectory::new(romfs_dir)));
+            }
+            if let Some(romfslite_dir) = find_subdirectory_caseless(subdir, "romfslite") {
+                layers.push(Arc::new(CachedVfsDirectory::new(romfslite_dir)));
+            }
+
+            if let Some(ext_dir) = find_subdirectory_caseless(subdir, "romfs_ext") {
+                layers_ext.push(Arc::new(CachedVfsDirectory::new(ext_dir)));
+            }
+
+            if record_type == ContentRecordType::HtmlDocument {
+                if let Some(manual_dir) = find_subdirectory_caseless(subdir, "manual_html") {
+                    layers.push(Arc::new(CachedVfsDirectory::new(manual_dir)));
+                }
+            }
+        }
+
+        // When there are no layers to apply, return early
+        if layers.is_empty() && layers_ext.is_empty() {
+            return;
+        }
+
+        let extracted = match extract_romfs(Some(romfs.clone())) {
+            Some(dir) => dir,
+            None => return,
+        };
+
+        layers.push(extracted);
+
+        let layered = match LayeredVfsDirectory::make_layered_directory(layers, String::new()) {
+            Some(dir) => dir,
+            None => return,
+        };
+
+        let layered_ext = LayeredVfsDirectory::make_layered_directory(layers_ext, String::new());
+
+        let packed = match create_romfs(Some(layered), layered_ext) {
+            Some(f) => f,
+            None => return,
+        };
+
+        log::info!("    RomFS: LayeredFS patches applied successfully");
+        *romfs = packed;
+    }
+
     /// Create a new PatchManager with all dependencies.
     /// Corresponds to upstream `PatchManager::PatchManager`.
     pub fn new(
@@ -346,6 +349,7 @@ impl<'a> PatchManager<'a> {
     ) -> Self {
         Self {
             title_id,
+            parent_title_id: content_provider.get_parent_application_id(title_id),
             fs_controller: Some(fs_controller),
             content_provider: Some(content_provider),
         }
@@ -356,6 +360,7 @@ impl<'a> PatchManager<'a> {
     pub fn new_without_deps(title_id: u64) -> Self {
         Self {
             title_id,
+            parent_title_id: None,
             fs_controller: None,
             content_provider: None,
         }
@@ -367,12 +372,33 @@ impl<'a> PatchManager<'a> {
         self.title_id
     }
 
+    fn get_modification_load_root(&self, sdmc: bool) -> Option<VirtualDir> {
+        let controller = self.fs_controller?;
+        let get_root = |id| if sdmc {
+            controller.get_sdmc_modification_load_root(id)
+        } else {
+            controller.get_modification_load_root(id)
+        };
+        let root = get_root(self.title_id);
+        let Some(parent) = self.parent_title_id else { return root };
+        LayeredVfsDirectory::make_layered_directory(
+            [root, get_root(parent)].into_iter().flatten().collect(), String::new())
+    }
+
+    fn get_disabled_addons(&self) -> Vec<String> {
+        let mut disabled = get_disabled_addons(self.title_id);
+        if let Some(parent) = self.parent_title_id {
+            disabled.extend(get_disabled_addons(parent));
+        }
+        disabled
+    }
+
     /// Patch ExeFS with updates and LayeredExeFS.
     /// Corresponds to upstream `PatchManager::PatchExeFS`.
     pub fn patch_exefs(&self, mut exefs: VirtualDir) -> VirtualDir {
         log::info!("Patching ExeFS for title_id={:016X}", self.title_id);
 
-        let disabled = get_disabled_addons(self.title_id);
+        let disabled = self.get_disabled_addons();
         let update_tid = get_update_title_id(self.title_id);
         let mut selected_update: Option<(VirtualFile, u32)> = None;
         if let Some(provider) = self.content_provider {
@@ -453,12 +479,8 @@ impl<'a> PatchManager<'a> {
         }
 
         // LayeredExeFS
-        let load_dir = self
-            .fs_controller
-            .and_then(|fc| fc.get_modification_load_root(self.title_id));
-        let sdmc_load_dir = self
-            .fs_controller
-            .and_then(|fc| fc.get_sdmc_modification_load_root(self.title_id));
+        let load_dir = self.get_modification_load_root(false);
+        let sdmc_load_dir = self.get_modification_load_root(true);
 
         let mut patch_dirs: Vec<VirtualDir> = Vec::new();
         if let Some(ref sdmc_dir) = sdmc_load_dir {
@@ -507,7 +529,7 @@ impl<'a> PatchManager<'a> {
     /// Collect IPS/IPSwitch patches from patch directories matching a build ID.
     /// Corresponds to upstream `PatchManager::CollectPatches`.
     fn collect_patches(&self, patch_dirs: &[VirtualDir], build_id: &str) -> Vec<VirtualFile> {
-        let disabled = get_disabled_addons(self.title_id);
+        let disabled = self.get_disabled_addons();
         let nso_build_id = format!("{:0<64}", build_id);
         let mut out = Vec::new();
 
@@ -602,9 +624,7 @@ impl<'a> PatchManager<'a> {
 
         log::info!("Patching NSO for name={}, build_id={}", name, build_id);
 
-        let load_dir = match self
-            .fs_controller
-            .and_then(|fc| fc.get_modification_load_root(self.title_id))
+        let load_dir = match self.get_modification_load_root(false)
         {
             Some(dir) => dir,
             None => {
@@ -688,9 +708,7 @@ impl<'a> PatchManager<'a> {
             name
         );
 
-        let load_dir = match self
-            .fs_controller
-            .and_then(|fc| fc.get_modification_load_root(self.title_id))
+        let load_dir = match self.get_modification_load_root(false)
         {
             Some(dir) => dir,
             None => {
@@ -711,9 +729,7 @@ impl<'a> PatchManager<'a> {
     /// Create the enabled cheat list for the supplied NSO build ID.
     /// Corresponds to upstream `PatchManager::CreateCheatList`.
     pub fn create_cheat_list(&self, build_id: &BuildId) -> Vec<CheatEntry> {
-        let load_dir = match self
-            .fs_controller
-            .and_then(|controller| controller.get_modification_load_root(self.title_id))
+        let load_dir = match self.get_modification_load_root(false)
         {
             Some(dir) => dir,
             None => {
@@ -725,7 +741,7 @@ impl<'a> PatchManager<'a> {
             }
         };
 
-        let disabled = get_disabled_addons(self.title_id);
+        let disabled = self.get_disabled_addons();
         let mut patch_dirs = load_dir.get_subdirectories();
         patch_dirs.sort_by(|left, right| left.get_name().cmp(&right.get_name()));
 
@@ -861,6 +877,7 @@ impl<'a> PatchManager<'a> {
         } else {
             let update_pm = PatchManager {
                 title_id: update_tid,
+                parent_title_id: self.content_provider.and_then(|cp| cp.get_parent_application_id(update_tid)),
                 fs_controller: self.fs_controller,
                 content_provider: self.content_provider,
             };
@@ -1083,9 +1100,11 @@ impl<'a> PatchManager<'a> {
         let cp = self.content_provider?;
         let update_tid = get_update_title_id(self.title_id);
         if cp.has_entry(update_tid, ContentRecordType::Program) {
-            return cp.get_entry_version(update_tid);
+            return cp.get_entry_version(update_tid).or_else(||
+                self.parent_title_id.and_then(|parent| cp.get_entry_version(get_update_title_id(parent))));
         }
-        cp.get_entry_version(self.title_id)
+        cp.get_entry_version(self.title_id).or_else(||
+            self.parent_title_id.and_then(|parent| cp.get_entry_version(parent)))
     }
 
     /// Get control metadata (NACP + icon) for this title.
@@ -1097,7 +1116,21 @@ impl<'a> PatchManager<'a> {
         };
         let base_control_nca = match cp.get_entry(self.title_id, ContentRecordType::Control) {
             Some(nca) => nca,
-            None => return (None, None),
+            None => {
+                let Some(parent) = self.parent_title_id else { return (None, None) };
+                let control_id = if cp.has_entry(parent, ContentRecordType::Control) {
+                    parent
+                } else {
+                    get_update_title_id(parent)
+                };
+                let parent = PatchManager {
+                    title_id: control_id,
+                    parent_title_id: cp.get_parent_application_id(control_id),
+                    fs_controller: self.fs_controller,
+                    content_provider: self.content_provider,
+                };
+                return parent.get_control_metadata();
+            }
         };
         self.parse_control_nca(&base_control_nca)
     }
@@ -1212,7 +1245,7 @@ impl<'a> PatchManager<'a> {
 
         // Game Updates
         let update_tid = get_update_title_id(self.title_id);
-        let disabled = get_disabled_addons(self.title_id);
+        let disabled = self.get_disabled_addons();
         let mut selected_update: Option<(VirtualFile, u32)> = None;
         if let Some(provider) = self.content_provider {
             let versions = provider.list_update_versions(update_tid);
@@ -1303,9 +1336,7 @@ impl<'a> PatchManager<'a> {
 
         // LayeredFS
         if apply_layeredfs {
-            if let Some(fc) = self.fs_controller {
-                apply_layered_fs(&mut romfs, self.title_id, record_type, fc);
-            }
+            self.apply_layered_fs(&mut romfs, record_type);
         }
 
         romfs
@@ -1321,6 +1352,125 @@ mod tests {
     use super::super::vfs::vfs_vector::{VectorVfsDirectory, VectorVfsFile};
     use super::*;
     use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct ParentTestProvider {
+        entries: std::collections::BTreeMap<(TitleType, ContentRecordType, u64), ()>,
+        versions: std::collections::BTreeMap<u64, u32>,
+        requests: Mutex<Vec<u64>>,
+    }
+
+    impl ContentProvider for ParentTestProvider {
+        fn refresh(&mut self) {}
+        fn has_entry(&self, id: u64, record: ContentRecordType) -> bool {
+            self.entries.keys().any(|&(_, r, t)| r == record && t == id)
+        }
+        fn get_entry_version(&self, id: u64) -> Option<u32> { self.versions.get(&id).copied() }
+        fn get_entry_unparsed(&self, _: u64, _: ContentRecordType) -> Option<VirtualFile> { None }
+        fn get_entry_raw(&self, id: u64, record: ContentRecordType) -> Option<VirtualFile> {
+            if record == ContentRecordType::Control { self.requests.lock().unwrap().push(id); }
+            None
+        }
+        fn list_entries_filter(&self, kind: Option<TitleType>, record: Option<ContentRecordType>, id: Option<u64>) -> Vec<ContentProviderEntry> {
+            self.entries.keys().filter(|&&(k, r, t)|
+                kind.is_none_or(|v| v == k) && record.is_none_or(|v| v == r) && id.is_none_or(|v| v == t))
+                .map(|&(_, record_type, title_id)| ContentProviderEntry { title_id, record_type }).collect()
+        }
+    }
+
+    #[test]
+    fn bundled_program_versions_and_control_lookup_follow_parent_fallbacks() {
+        let base = 0x0100_0000_0000_0000;
+        let child = base + 1;
+        let controller = FileSystemController::new();
+        for update in [false, true] {
+            for own_version in [None, Some(0), Some(42)] {
+                let mut provider = ParentTestProvider::default();
+                provider.entries.insert((TitleType::Application, ContentRecordType::Meta, base), ());
+                provider.entries.insert((TitleType::Application, ContentRecordType::Program, child), ());
+                let queried_id = if update { get_update_title_id(child) } else { child };
+                let parent_id = if update { get_update_title_id(base) } else { base };
+                if update { provider.entries.insert((TitleType::Update, ContentRecordType::Program, queried_id), ()); }
+                provider.versions.insert(parent_id, 77);
+                if let Some(version) = own_version { provider.versions.insert(queried_id, version); }
+                let manager = PatchManager::new(child, &controller, &provider);
+                assert_eq!(manager.parent_title_id, Some(base));
+                assert_eq!(manager.get_game_version(), own_version.or(Some(77)));
+                assert!(manager.get_control_metadata().0.is_none());
+                assert_eq!(*provider.requests.lock().unwrap(), vec![child, get_update_title_id(base)]);
+                provider.requests.lock().unwrap().clear();
+                provider.entries.insert((TitleType::Application, ContentRecordType::Control, base), ());
+                PatchManager::new(child, &controller, &provider).get_control_metadata();
+                assert_eq!(*provider.requests.lock().unwrap(), vec![child, base]);
+                provider.versions.remove(&parent_id);
+                provider.versions.remove(&queried_id);
+                assert_eq!(PatchManager::new(child, &controller, &provider).get_game_version(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_program_mod_roots_prioritize_child_and_inherit_disabled_names() {
+        const CHILD_PROCESS: &str = "RUZU_TEST_PARENT_MODS";
+        if std::env::var_os(CHILD_PROCESS).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD_PROCESS, "1").status().unwrap().success());
+            return;
+        }
+        let base = 0x0100_0000_0000_0000;
+        let child = base + 1;
+        let dir = |name: &str, files: Vec<VirtualFile>, dirs: Vec<VirtualDir>| -> VirtualDir {
+            Arc::new(VectorVfsDirectory::new(files, dirs, name.to_owned(), None))
+        };
+        let file = |name: &str, byte| -> VirtualFile {
+            Arc::new(VectorVfsFile::new(vec![byte], name.to_owned(), None))
+        };
+        let parent_mod = dir("shared", vec![], vec![
+            dir("exefs", vec![file("main", 1), file("rtld", 2)], vec![]),
+            dir("romfs", vec![file("same", 1)], vec![]),
+            dir("romfslite", vec![file("same", 5), file("lite", 6)], vec![]),
+        ]);
+        let child_mod = dir("shared", vec![], vec![
+            dir("exefs", vec![file("main", 3)], vec![]),
+            dir("romfs", vec![file("same", 3)], vec![]),
+        ]);
+        let load = dir("load", vec![], vec![
+            dir(&format!("{base:016X}"), vec![], vec![parent_mod]),
+            dir(&format!("{child:016X}"), vec![], vec![child_mod]),
+        ]);
+        let empty = dir("empty", vec![], vec![]);
+        let mut controller = FileSystemController::new();
+        controller.set_bis_factory(crate::file_sys::bis_factory::BisFactory::new(empty.clone(), load, empty));
+        let mut provider = ParentTestProvider::default();
+        provider.entries.insert((TitleType::Application, ContentRecordType::Meta, base), ());
+        provider.entries.insert((TitleType::Application, ContentRecordType::Program, child), ());
+        let manager = PatchManager::new(child, &controller, &provider);
+        let exefs = dir("exefs", vec![file("main", 9), file("sdk", 8)], vec![]);
+        let patched = manager.patch_exefs(exefs.clone());
+        assert_eq!(patched.get_file("main").unwrap().read_all_bytes(), vec![3]);
+        assert_eq!(patched.get_file("rtld").unwrap().read_all_bytes(), vec![2]);
+        assert_eq!(patched.get_file("sdk").unwrap().read_all_bytes(), vec![8]);
+        let original_romfs = create_romfs(Some(dir("romfs", vec![file("same", 9), file("base", 8)], vec![])), None).unwrap();
+        let patched_romfs = manager.patch_romfs(None, original_romfs.clone(), ContentRecordType::Program, None, true);
+        let patched_romfs = extract_romfs(Some(patched_romfs)).unwrap();
+        assert_eq!(patched_romfs.get_file("same").unwrap().read_all_bytes(), vec![3]);
+        assert_eq!(patched_romfs.get_file("lite").unwrap().read_all_bytes(), vec![6]);
+        assert_eq!(patched_romfs.get_file("base").unwrap().read_all_bytes(), vec![8]);
+        {
+            let mut settings = common::settings::values_mut();
+            settings.disabled_addons.insert(child, vec!["child-only".into(), "duplicate".into()]);
+            settings.disabled_addons.insert(base, vec!["shared".into(), "duplicate".into()]);
+        }
+        assert_eq!(manager.get_disabled_addons(), vec!["child-only", "duplicate", "shared", "duplicate"]);
+        let patched = manager.patch_exefs(exefs);
+        assert_eq!(patched.get_file("main").unwrap().read_all_bytes(), vec![9]);
+        assert!(patched.get_file("rtld").is_none());
+        let patched_romfs = manager.patch_romfs(None, original_romfs, ContentRecordType::Program, None, true);
+        let patched_romfs = extract_romfs(Some(patched_romfs)).unwrap();
+        assert_eq!(patched_romfs.get_file("same").unwrap().read_all_bytes(), vec![9]);
+        assert!(patched_romfs.get_file("lite").is_none());
+    }
 
     #[test]
     fn update_display_version_reads_control_metadata_from_romfs() {
@@ -1480,7 +1630,11 @@ mod tests {
                     b"original metadata"
                 );
                 assert_eq!(std::fs::read(dump.join("nso/main-ABC.nso")).unwrap(), nso);
-                assert!(!dump.join("nso/main-abc.nso").exists());
+                // Case-insensitive filesystems resolve the lowercase spelling
+                // to the same file. Inspect the stored name, not path existence.
+                let names: Vec<_> = std::fs::read_dir(dump.join("nso")).unwrap()
+                    .map(|entry| entry.unwrap().file_name()).collect();
+                assert_eq!(names, vec![std::ffi::OsString::from("main-ABC.nso")]);
                 // Re-disabling must stop exports, without disabling patch application.
                 std::fs::remove_dir_all(&dump).unwrap();
             } else {

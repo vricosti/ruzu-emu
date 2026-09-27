@@ -24,6 +24,8 @@ pub mod library_applet_creator;
 pub mod library_applet_proxy;
 pub mod library_applet_self_accessor;
 pub mod lock_accessor;
+pub mod overlay_functions;
+pub mod overlay_applet_proxy;
 pub mod process_winding_controller;
 pub mod self_controller;
 pub mod storage;

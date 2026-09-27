@@ -162,6 +162,7 @@ impl SoftwareKeyboard {
     /// `SubmitTextNormal` / `SubmitTextInline` directly; the queue is the Rust
     /// adaptation needed to avoid borrowing the applet across a GUI callback.
     fn enqueue_frontend_submission(
+        system: SystemRef,
         applet: &Weak<Mutex<Applet>>,
         queue: &Arc<Mutex<VecDeque<FrontendSubmission>>>,
         executing: &Arc<AtomicBool>,
@@ -176,19 +177,19 @@ impl SoftwareKeyboard {
             return;
         }
 
-        let Some(applet) = applet.upgrade() else {
+        let Some(owner) = applet.upgrade() else {
             return;
         };
-        let mut applet = applet.lock().unwrap();
-        let complete = if let Some(frontend) = applet.frontend.as_mut() {
+        let mut guard = owner.lock().unwrap();
+        let complete = if let Some(frontend) = guard.frontend.as_mut() {
             frontend.execute();
             frontend.is_complete()
         } else {
             false
         };
+        drop(guard);
         if complete {
-            applet.is_completed = true;
-            applet.signal_state_changed_event_without_process();
+            super::applets::exit(system, applet);
         }
     }
 
@@ -528,6 +529,7 @@ impl SoftwareKeyboard {
                 >= SwkbdAppletVersion::Version393227 as u32
                 && self.swkbd_config_new.disable_cancel_button,
         };
+        let system = self.system;
         let normal_applet = self.applet.clone();
         let inline_applet = self.applet.clone();
         let normal_queue = Arc::clone(&self.frontend_submissions);
@@ -536,6 +538,7 @@ impl SoftwareKeyboard {
         let inline_executing = Arc::clone(&self.frontend_executing);
         let normal: SubmitNormalCallback = Box::new(move |result, text, confirmed| {
             Self::enqueue_frontend_submission(
+                system,
                 &normal_applet,
                 &normal_queue,
                 &normal_executing,
@@ -544,6 +547,7 @@ impl SoftwareKeyboard {
         });
         let inline: SubmitInlineCallback = Box::new(move |reply, text, cursor| {
             Self::enqueue_frontend_submission(
+                system,
                 &inline_applet,
                 &inline_queue,
                 &inline_executing,
@@ -555,6 +559,7 @@ impl SoftwareKeyboard {
     }
 
     fn initialize_frontend_inline_keyboard(&mut self, parameters: KeyboardInitializeParameters) {
+        let system = self.system;
         let normal_applet = self.applet.clone();
         let inline_applet = self.applet.clone();
         let normal_queue = Arc::clone(&self.frontend_submissions);
@@ -566,6 +571,7 @@ impl SoftwareKeyboard {
             parameters,
             Box::new(move |result, text, confirmed| {
                 Self::enqueue_frontend_submission(
+                    system,
                     &normal_applet,
                     &normal_queue,
                     &normal_executing,
@@ -574,6 +580,7 @@ impl SoftwareKeyboard {
             }),
             Box::new(move |reply, text, cursor| {
                 Self::enqueue_frontend_submission(
+                    system,
                     &inline_applet,
                     &inline_queue,
                     &inline_executing,
@@ -1105,7 +1112,9 @@ impl FrontendApplet for SoftwareKeyboard {
     }
 
     fn request_exit(&mut self) {
+        self.frontend_executing.store(true, Ordering::Release);
         self.frontend.close();
+        self.finish_frontend_execution();
     }
     fn get_library_applet_mode(&self) -> LibraryAppletMode {
         self.applet_mode
@@ -1174,6 +1183,9 @@ mod tests {
         let system = System::new();
         let system_ref = SystemRef::from_ref(&system);
         let owner = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
+        let parent = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), true)));
+        owner.lock().unwrap().caller_applet = Arc::downgrade(&parent);
+        parent.lock().unwrap().child_applets.push(Arc::clone(&owner));
         let broker = Arc::new(AppletDataBroker::new());
         let frontend_impl = Arc::new(DeferredSoftwareKeyboardApplet {
             submit_normal: Mutex::new(None),
@@ -1219,6 +1231,7 @@ mod tests {
         assert!(owner.is_completed);
         assert!(owner.frontend.as_ref().unwrap().is_complete());
         drop(owner);
+        assert!(parent.lock().unwrap().child_applets.is_empty());
 
         let output = broker.get_out_data().pop().unwrap();
         assert_eq!(

@@ -203,7 +203,6 @@ impl CommandList {
 const NON_PULLER_METHODS: u32 = 0x40;
 const MAX_SUBCHANNELS: usize = 8;
 const MACRO_REGISTERS_START: u32 = 0xE00;
-#[allow(dead_code)]
 const COMPUTE_INLINE: u32 = 0x6D;
 
 /// Internal DMA state tracking.
@@ -346,16 +345,26 @@ impl DmaPusher {
     }
 
     fn update_current_dirty_for_fetch(&mut self, command_gpu_addr: GPUVAddr, word_count: u32) {
-        if self.dma_state.method < MACRO_REGISTERS_START {
+        if self.dma_state.method_count == 0 || word_count == 0 {
             return;
         }
         let Some(engine) = self.subchannels[self.dma_state.subchannel as usize] else {
             return;
         };
 
+        let engine_type = self.subchannel_type[self.dma_state.subchannel as usize];
+        let kepler_payload = engine_type == EngineTypes::KeplerCompute
+            && self.dma_state.method == COMPUTE_INLINE && self.dma_state.non_incrementing;
+        let macro_payload = engine_type == EngineTypes::Maxwell3D
+            && self.dma_state.method >= MACRO_REGISTERS_START;
+        if !kepler_payload && !macro_payload {
+            return;
+        }
+        let words = self.dma_state.method_count.min(word_count);
+
         let dirty = self.memory_manager.lock().is_memory_dirty(
             command_gpu_addr,
-            word_count as u64 * std::mem::size_of::<u32>() as u64,
+            words as u64 * std::mem::size_of::<u32>() as u64,
         );
         unsafe { engine.as_mut() }.set_current_dirty(dirty);
     }
@@ -622,6 +631,35 @@ mod tests {
     use common::settings;
     use common::settings_enums::GpuAccuracy;
 
+
+    #[test]
+    fn continuation_dirty_sampling_only_touches_matching_payloads() {
+        for engine_type in [EngineTypes::KeplerCompute, EngineTypes::Maxwell3D, EngineTypes::Fermi2D] {
+            for method in [COMPUTE_INLINE, MACRO_REGISTERS_START - 1, MACRO_REGISTERS_START] {
+                for non_incrementing in [false, true] {
+                    for remaining in [0, 1, 20] {
+                        for words in [0, 1, 40] {
+                            let memory = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+                            let mut channel = Box::new(ChannelState::new(7));
+                            let mut engine = crate::engines::kepler_compute::KeplerCompute::new(Arc::clone(&memory));
+                            let mut dma = DmaPusher::new(std::ptr::null(), SystemRef::null(), memory, &mut *channel);
+                            dma.bind_subchannel(&mut engine, 0, engine_type);
+                            dma.dma_state.method = method;
+                            dma.dma_state.method_count = remaining;
+                            dma.dma_state.non_incrementing = non_incrementing;
+                            engine.set_current_dirty(true);
+                            dma.update_current_dirty_for_fetch(0x10000, words);
+                            let sampled = remaining != 0 && words != 0 &&
+                                ((engine_type == EngineTypes::KeplerCompute && method == COMPUTE_INLINE && non_incrementing)
+                                || (engine_type == EngineTypes::Maxwell3D && method >= MACRO_REGISTERS_START));
+                            // Unbound memory is clean: only an actual sample resets the flag.
+                            assert_eq!(engine.current_dirty(), !sampled);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn increasing_fermi_command_preserves_pending_arguments_across_every_split() {

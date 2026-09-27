@@ -24,11 +24,10 @@ use crate::control::channel_state_cache::ChannelCacheAccessor;
 use crate::engines::maxwell_3d::{PrimitiveTopology, NUM_TRANSFORM_FEEDBACK_BUFFERS};
 use crate::query_cache::bank_base::{BankBase, BankLike, BankPool};
 use crate::query_cache::query_cache::{
-    DeviceMemoryWriter, GpuAddressTranslator, GuestStreamer, QueryCacheRuntimeHandle, StubStreamer,
+    DeviceMemoryWriter, GpuAddressTranslator, GpuTickSource, GuestStreamer, QueryCacheRuntimeHandle, StubStreamer,
     SyncValuesRuntime, SyncValuesStruct,
 };
-use crate::query_cache::query_cache_base::{LookupData, QueryCacheBase, QueryLocation};
-use crate::query_cache::query_stream::StreamerInterface;
+use crate::query_cache::query_cache_base::{LookupData, QueryCacheBase};
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 use crate::vulkan_common::vulkan_device::Device;
 use crate::vulkan_common::vulkan_memory_allocator::{
@@ -2645,7 +2644,9 @@ impl QueryCacheRuntimeHandle for QueryCacheRuntime {
 /// The generic QueryCacheBase provides the main cache logic, parameterized
 /// by the Vulkan-specific runtime type.
 pub struct QueryCache {
-    pub base: QueryCacheBase,
+    // CounterReport/UnregisterPending callbacks retain the shared owner.
+    // Keep its address stable when the surrounding rasterizer is moved.
+    pub base: Box<QueryCacheBase>,
     pub runtime: Box<QueryCacheRuntime>,
     /// Channel-bound GPU device memory manager. Used to translate the
     /// query's GPU virtual address to the underlying CPU/guest address
@@ -2657,6 +2658,13 @@ pub struct QueryCache {
     /// Source of the GPU tick counter for queries with timestamps.
     /// Mirrors `gl_query_cache::QueryCache::gpu_ticks_getter`.
     gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    gpu_tick_adapter: Option<Box<QueryGpuTickAdapter>>,
+}
+
+struct QueryGpuTickAdapter(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl GpuTickSource for QueryGpuTickAdapter {
+    fn get_ticks(&self) -> u64 { (self.0)() }
 }
 
 struct QueryGpuMemoryAdapter(Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>);
@@ -2672,6 +2680,9 @@ struct QueryDeviceMemoryAdapter(
 );
 
 impl DeviceMemoryWriter for QueryDeviceMemoryAdapter {
+    fn capture_pointer(&self, addr: u64) -> Option<usize> {
+        Some(self.0.get_pointer_mut(addr) as usize)
+    }
     fn write_u32(&mut self, addr: u64, value: u32) {
         self.0.write_u32(addr, value);
     }
@@ -2715,12 +2726,13 @@ impl QueryCache {
         )?);
 
         let mut cache = QueryCache {
-            base: QueryCacheBase::new(),
+            base: Box::new(QueryCacheBase::new()),
             runtime,
             channel_memory_manager: None,
             gpu_memory_adapter: None,
             device_memory_adapter: Some(device_memory_adapter),
             gpu_ticks_getter: None,
+            gpu_tick_adapter: None,
         };
         cache.base.bind_runtime(cache.runtime.as_mut());
         cache.base.bind_device_memory(
@@ -2751,12 +2763,13 @@ impl QueryCache {
     #[cfg(test)]
     fn new_for_test() -> Self {
         Self {
-            base: QueryCacheBase::new(),
+            base: Box::new(QueryCacheBase::new()),
             runtime: Box::new(QueryCacheRuntime::new()),
             channel_memory_manager: None,
             gpu_memory_adapter: None,
             device_memory_adapter: None,
             gpu_ticks_getter: None,
+            gpu_tick_adapter: None,
         }
     }
 
@@ -2864,6 +2877,9 @@ impl QueryCache {
 
     /// Wire the GPU tick getter used for timestamped queries.
     pub fn set_gpu_ticks_getter(&mut self, getter: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        let mut adapter = Box::new(QueryGpuTickAdapter(Arc::clone(&getter)));
+        self.base.bind_gpu(adapter.as_mut());
+        self.gpu_tick_adapter = Some(adapter);
         self.gpu_ticks_getter = Some(getter);
     }
 
@@ -2958,10 +2974,10 @@ impl QueryCache {
     pub fn commit_async_flushes(
         &mut self,
         scheduler: &mut Scheduler,
-        sync_operation: impl FnMut(Box<dyn FnOnce() + Send>),
+        mut sync_operation: impl FnMut(Box<dyn FnOnce() + Send>),
     ) {
-        self.notify_wfi(scheduler, sync_operation);
-        self.base.commit_async_flushes();
+        self.notify_wfi(scheduler, &mut sync_operation);
+        self.base.commit_async_flushes_with_callback(sync_operation);
         if let Some(samples_streamer) = self.runtime.samples_streamer.as_mut() {
             if samples_streamer.has_unsynced_queries() {
                 samples_streamer.push_unsynced_queries(scheduler);
@@ -3043,7 +3059,6 @@ impl QueryCache {
             || query_type == QueryType::StreamingPrimitivesSucceeded as u32;
         let (effective_query_type, effective_payload) =
             effective_query_type_and_payload(query_type, payload);
-        let has_timestamp = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
         let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
         let (gpu_level_high, fence_behavior) = {
             let values = common::settings::values();
@@ -3054,87 +3069,22 @@ impl QueryCache {
         };
         let host_report_is_synchronized =
             is_host_query_report_synchronized(is_fence, gpu_level_high, fence_behavior);
-        let payload_query_id = if effective_query_type == QueryType::Payload as u32 {
-            self.runtime.guest_streamer.as_deref_mut().map(|streamer| {
-                let query_id = streamer.write_counter(
-                    device_addr,
-                    has_timestamp,
-                    effective_payload,
-                    Some(subreport),
-                );
-                if is_fence {
-                    if let Some(query) = streamer.get_query_mut(query_id) {
-                        query
-                            .flags
-                            .insert(crate::query_cache::query_base::QueryFlagBits::IS_FENCE);
-                    }
-                }
-                query_id
-            })
+        // Upstream uses the shared CounterReport owner for payload and stub
+        // queries too. A standalone writeback closure leaves indexed queries
+        // alive and allows later FlushRegion to overwrite recycled guest data.
+        let shared_type = if effective_query_type == QueryType::Payload as u32 {
+            Some(QueryType::Payload)
+        } else if effective_query_type == QueryType::StreamingPrimitivesNeededMinusSucceeded as u32 {
+            Some(QueryType::StreamingPrimitivesNeededMinusSucceeded)
         } else {
             None
         };
-        let stub_query_id =
-            if effective_query_type == QueryType::StreamingPrimitivesNeededMinusSucceeded as u32 {
-                self.runtime
-                    .primitives_needed_minus_succeeded_streamer
-                    .as_deref_mut()
-                    .map(|streamer| {
-                        let query_id = streamer.write_counter(
-                            device_addr,
-                            has_timestamp,
-                            effective_payload,
-                            Some(subreport),
-                        );
-                        if is_fence {
-                            if let Some(query) = streamer.get_query_mut(query_id) {
-                                query.flags.insert(
-                                    crate::query_cache::query_base::QueryFlagBits::IS_FENCE,
-                                );
-                            }
-                        }
-                        query_id
-                    })
-            } else {
-                None
-            };
-        if !is_fence && effective_query_type == QueryType::Payload as u32 && !gpu_level_high {
-            let gpu_ticks = if has_timestamp {
-                self.gpu_ticks_getter
-                    .as_ref()
-                    .map(|getter| getter())
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            write_query_result(
-                &memory_manager,
-                gpu_addr,
-                has_timestamp,
-                effective_payload as u64,
-                gpu_ticks,
+        if let Some(counter_type) = shared_type {
+            self.base.counter_report_with_callbacks(
+                gpu_addr, counter_type, flags, effective_payload, subreport,
+                signal_fence, sync_operation,
             );
-            if let (Some(streamer), Some(query_id)) =
-                (self.runtime.guest_streamer.as_deref_mut(), payload_query_id)
-            {
-                streamer.free(query_id);
-            }
             return;
-        }
-        if let Some(query_id) = payload_query_id {
-            self.base.cache_query_location(
-                device_addr,
-                QueryLocation::new(QueryType::Payload as u32, query_id as u32),
-            );
-        }
-        if let Some(query_id) = stub_query_id {
-            self.base.cache_query_location(
-                device_addr,
-                QueryLocation::new(
-                    QueryType::StreamingPrimitivesNeededMinusSucceeded as u32,
-                    query_id as u32,
-                ),
-            );
         }
 
         let host_report = if has_samples_streamer {

@@ -425,10 +425,38 @@ impl QueryCacheBase {
     pub fn counter_report(
         &mut self,
         addr: GPUVAddr,
+        counter_type: QueryType,
+        flags: QueryPropertiesFlags,
+        payload: u32,
+        subreport: u32,
+    ) {
+        let rasterizer = self.impl_.rasterizer;
+        self.counter_report_with_callbacks(addr, counter_type, flags, payload, subreport,
+            move |operation| {
+                if let Some(rasterizer) = rasterizer {
+                    unsafe { (&mut *rasterizer).signal_fence(operation) };
+                }
+            },
+            move |operation| {
+                if let Some(rasterizer) = rasterizer {
+                    unsafe { (&mut *rasterizer).sync_operation(operation) };
+                }
+            });
+    }
+
+    /// Mechanical owner bridge for backends that pass rasterizer operations
+    /// explicitly. CounterReport's allocation, completion and retirement stay
+    /// in this upstream-owned module. The owner must outlive queued callbacks
+    /// at a stable address, as with the bound-rasterizer entry point.
+    pub fn counter_report_with_callbacks(
+        &mut self,
+        addr: GPUVAddr,
         mut counter_type: QueryType,
         flags: QueryPropertiesFlags,
         mut payload: u32,
         subreport: u32,
+        signal_fence: impl FnOnce(Box<dyn FnOnce() + Send>),
+        sync_operation: impl FnOnce(Box<dyn FnOnce() + Send>),
     ) {
         self.refresh_owner_binding();
         let has_timestamp = flags.contains(QueryPropertiesFlags::HAS_TIMEOUT);
@@ -495,6 +523,12 @@ impl QueryCacheBase {
             return;
         }
 
+        // Upstream retains resolved host pointers, not a device VA that might
+        // be mapped to different physical backing before the fence completes.
+        let pointers = self.impl_.device_memory_mut().and_then(|memory| {
+            Some((memory.capture_pointer(cpu_addr)?,
+                memory.capture_pointer(cpu_addr.wrapping_add(8))?))
+        });
         let owner = self as *mut Self as usize;
         let operation = Box::new(move || {
             let owner = owner as *mut QueryCacheBase;
@@ -545,7 +579,22 @@ impl QueryCacheBase {
             } else {
                 0
             };
-            if let Some(device_memory) = owner.impl_.device_memory_mut() {
+            if let Some((pointer, timestamp_pointer)) = pointers {
+                // Mirrors memcpy to the captured backing. Zero means the
+                // device mapping was absent when the report was created.
+                unsafe {
+                    if query_flags.intersects(QueryFlagBits::HAS_TIMESTAMP) {
+                        if timestamp_pointer != 0 {
+                            std::ptr::write_unaligned(timestamp_pointer as *mut u64, timestamp);
+                        }
+                        if pointer != 0 {
+                            std::ptr::write_unaligned(pointer as *mut u64, final_value);
+                        }
+                    } else if pointer != 0 {
+                        std::ptr::write_unaligned(pointer as *mut u32, final_value as u32);
+                    }
+                }
+            } else if let Some(device_memory) = owner.impl_.device_memory_mut() {
                 if query_flags.intersects(QueryFlagBits::HAS_TIMESTAMP) {
                     device_memory.write_u64(cpu_addr.wrapping_add(8), timestamp);
                     device_memory.write_u64(cpu_addr, final_value);
@@ -559,11 +608,9 @@ impl QueryCacheBase {
         });
 
         if is_fence {
-            if let Some(rasterizer) = self.impl_.rasterizer_mut() {
-                rasterizer.signal_fence(operation);
-            }
-        } else if let Some(rasterizer) = self.impl_.rasterizer_mut() {
-            rasterizer.sync_operation(operation);
+            signal_fence(operation);
+        } else {
+            sync_operation(operation);
         }
 
         if is_synced {
@@ -740,6 +787,20 @@ impl QueryCacheBase {
     /// mask (no-op flush batch) to keep `flushes_pending` in sync with any
     /// caller that checks `ShouldWaitAsyncFlushes`.
     pub fn commit_async_flushes(&mut self) {
+        let rasterizer = self.impl_.rasterizer;
+        self.commit_async_flushes_with_callback(move |operation| {
+            if let Some(rasterizer) = rasterizer {
+                unsafe { (&mut *rasterizer).sync_operation(operation) };
+            }
+        });
+    }
+
+    /// Same CommitAsyncFlushes ordering with an explicitly supplied
+    /// Rasterizer::SyncOperation, including the zero-mask cleanup batch.
+    pub fn commit_async_flushes_with_callback(
+        &mut self,
+        sync_operation: impl FnOnce(Box<dyn FnOnce() + Send>),
+    ) {
         self.refresh_owner_binding();
         self.notify_wfi();
         let mask = {
@@ -755,15 +816,13 @@ impl QueryCacheBase {
             mask
         };
         let owner = self.impl_.owner.map(|owner| owner as usize);
-        if let Some(rasterizer) = self.impl_.rasterizer_mut() {
-            rasterizer.sync_operation(Box::new(move || {
+        sync_operation(Box::new(move || {
                 let Some(owner) = owner else {
                     return;
                 };
                 let owner = owner as *mut QueryCacheBase;
                 unsafe { (*owner).unregister_pending() };
             }));
-        }
         if mask == 0 {
             return;
         }
@@ -1684,6 +1743,98 @@ mod tests {
 
         cache.request_guest_host_sync();
         assert_eq!(rasterizer.release_fences_calls, vec![true]);
+    }
+
+    #[test]
+    fn callback_report_keeps_physical_backing_captured_before_device_remap() {
+        struct MappedWriter { base: usize }
+        impl DeviceMemoryWriter for MappedWriter {
+            fn capture_pointer(&self, address: u64) -> Option<usize> {
+                Some(self.base + (address - 0x4400) as usize)
+            }
+            fn write_u32(&mut self, _: u64, _: u32) { panic!("must use captured pointer") }
+            fn write_u64(&mut self, _: u64, _: u64) { panic!("must use captured pointer") }
+        }
+        let _accuracy = crate::test_support::GpuAccuracyGuard::set(
+            common::settings_enums::GpuAccuracy::High);
+        let mut old_backing = Box::new([0u64; 2]);
+        let mut new_backing = Box::new([0x1234u64; 2]);
+        let mut memory = MappedWriter { base: old_backing.as_mut_ptr() as usize };
+        let mut gpu = CountingGpu { ticks: 55 };
+        let mut translation = CountingGpuMemory::default();
+        translation.translations.insert(0x8000, 0x4400);
+        let mut streamer = CountingStreamer::new(QueryType::Payload as usize, QueryBase::new());
+        let mut cache = Box::new(QueryCacheBase::new());
+        cache.impl_.register_streamer(QueryType::Payload as usize, &mut streamer);
+        cache.bind_device_memory(&mut memory);
+        cache.bind_gpu_memory(&mut translation);
+        cache.bind_gpu(&mut gpu);
+        let mut operation = None;
+        cache.counter_report_with_callbacks(0x8000, QueryType::Payload,
+            QueryPropertiesFlags::HAS_TIMEOUT, 7, 0,
+            |_| panic!("not a fence"), |op| operation = Some(op));
+        memory.base = new_backing.as_mut_ptr() as usize;
+        assert_eq!(memory.capture_pointer(0x4400), Some(new_backing.as_mut_ptr() as usize));
+        operation.unwrap()();
+        assert_eq!(*old_backing, [7, 55]);
+        assert_eq!(*new_backing, [0x1234; 2]);
+        cache.unregister_pending();
+    }
+
+    #[test]
+    fn callback_report_retirement_does_not_overwrite_recycled_command_memory() {
+        let _accuracy = crate::test_support::GpuAccuracyGuard::set(
+            common::settings_enums::GpuAccuracy::High);
+        let mut cache = Box::new(QueryCacheBase::new());
+        let mut streamer = CountingStreamer::new(QueryType::Payload as usize, QueryBase::new());
+        let mut memory = CountingDeviceMemory::default();
+        let mut translation = CountingGpuMemory::default();
+        translation.translations.insert(0x8000, 0x4400);
+        cache.impl_.register_streamer(QueryType::Payload as usize, &mut streamer);
+        cache.bind_device_memory(&mut memory);
+        cache.bind_gpu_memory(&mut translation);
+        let mut operations = Vec::<Box<dyn FnOnce() + Send>>::new();
+        cache.counter_report_with_callbacks(0x8000, QueryType::Payload,
+            QueryPropertiesFlags::HAS_TIMEOUT, 0, 0,
+            |_| panic!("not a fence"), |op| operations.push(op));
+        assert!(!cache.cached_queries.is_empty());
+        // A remapped GPU VA must not redirect an already queued result.
+        translation.translations.insert(0x8000, 0x8800);
+        cache.commit_async_flushes_with_callback(|op| operations.push(op));
+        assert_eq!(operations.len(), 2);
+        for op in operations { op(); }
+        assert_eq!(memory.writes64, vec![(0x4408, 0), (0x4400, 0)]);
+        assert_eq!(streamer.free_calls, 1);
+        assert!(cache.cached_queries.values().all(|page| page.is_empty()));
+        // The guest now reuses 0x4400 for a CB size/high address pair.
+        memory.write_u64(0x4400, 0x0000_0004_0000_1800);
+        let writes = memory.writes64.clone();
+        cache.flush_region(0x4400, 16);
+        assert_eq!(memory.writes64, writes, "retired query overwrote command words");
+    }
+
+    #[test]
+    fn callback_report_invalidation_suppresses_writeback_and_still_retires() {
+        let _accuracy = crate::test_support::GpuAccuracyGuard::set(
+            common::settings_enums::GpuAccuracy::High);
+        let mut cache = Box::new(QueryCacheBase::new());
+        let mut streamer = CountingStreamer::new(QueryType::Payload as usize, QueryBase::new());
+        let mut memory = CountingDeviceMemory::default();
+        let mut translation = CountingGpuMemory::default();
+        translation.translations.insert(0x8000, 0x4400);
+        cache.impl_.register_streamer(QueryType::Payload as usize, &mut streamer);
+        cache.bind_device_memory(&mut memory);
+        cache.bind_gpu_memory(&mut translation);
+        let mut operations = Vec::<Box<dyn FnOnce() + Send>>::new();
+        cache.counter_report_with_callbacks(0x8000, QueryType::Payload,
+            QueryPropertiesFlags::empty(), 99, 0,
+            |_| panic!("not a fence"), |op| operations.push(op));
+        cache.invalidate_region(0x4400, 4);
+        cache.commit_async_flushes_with_callback(|op| operations.push(op));
+        for op in operations { op(); }
+        assert!(memory.writes32.is_empty());
+        assert_eq!(streamer.free_calls, 1);
+        assert!(cache.impl_.pending_unregister.is_empty());
     }
 
     #[test]

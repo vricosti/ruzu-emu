@@ -86,6 +86,10 @@ pub trait QueryCacheRuntimeHandle {
 pub trait DeviceMemoryWriter {
     fn write_u32(&mut self, addr: u64, value: u32);
     fn write_u64(&mut self, addr: u64, value: u64);
+    /// Resolve upstream GetPointer at report creation, not at fence release.
+    /// Owners exposing this must keep the physical backing alive through queued
+    /// operations. Recording/test writers may instead use the address methods.
+    fn capture_pointer(&self, _addr: u64) -> Option<usize> { None }
 }
 
 /// Shared GPU address translation owner used by `QueryCacheBase::counter_report`.
@@ -120,6 +124,9 @@ pub trait RenderConditionStateSource {
 }
 
 impl DeviceMemoryWriter for MaxwellDeviceMemoryManager {
+    fn capture_pointer(&self, addr: u64) -> Option<usize> {
+        Some(self.get_pointer_mut(addr) as usize)
+    }
     fn write_u32(&mut self, addr: u64, value: u32) {
         MaxwellDeviceMemoryManager::write_u32(self, addr, value);
     }

@@ -7,7 +7,7 @@
 //! interface, plus `SimpleStreamer<Q>`, the slot-backed generic streamer owner.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::query_base::{QueryBase, VAddr};
 
@@ -99,7 +99,7 @@ pub trait StreamerInterface {
 /// Maps to C++ `SimpleStreamer<QueryType>`.
 pub struct SimpleStreamer<Q> {
     pub base: StreamerInterfaceBase,
-    pub guard: Mutex<()>,
+    pub guard: Arc<Mutex<()>>,
     pub slot_queries: VecDeque<Q>,
     pub old_queries: VecDeque<usize>,
 }
@@ -108,7 +108,7 @@ impl<Q> SimpleStreamer<Q> {
     pub fn new(id: usize) -> Self {
         Self {
             base: StreamerInterfaceBase::new(id),
-            guard: Mutex::new(()),
+            guard: Arc::new(Mutex::new(())),
             slot_queries: VecDeque::new(),
             old_queries: VecDeque::new(),
         }
@@ -138,9 +138,11 @@ impl<Q> SimpleStreamer<Q> {
     }
 
     pub fn free(&mut self, query_id: usize) {
-        // Upstream locks here because callers may only hold shared ownership.
-        // Rust already requires `&mut self`, so preserve the owner method but
-        // avoid a second borrow through the held mutex guard.
+        // Fence completion can free a slot while the GPU thread builds another.
+        // The raw owner bridge does not make &mut exclusive across threads.
+        // Clone only the mutex handle so ReleaseQuery keeps upstream ownership.
+        let guard = Arc::clone(&self.guard);
+        let _lock = guard.lock().unwrap();
         self.release_query(query_id);
     }
 
@@ -156,6 +158,27 @@ impl<Q> SimpleStreamer<Q> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_waits_for_the_same_guard_as_build_query() {
+        let mut streamer = SimpleStreamer::new(0);
+        let slot = streamer.build_query(123u32);
+        let guard = Arc::clone(&streamer.guard);
+        let held = guard.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            streamer.free(slot);
+            done_tx.send(streamer.old_queries).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let blocked = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+        drop(held);
+        worker.join().unwrap();
+        assert!(matches!(blocked, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(done_rx.recv().unwrap(), VecDeque::from([slot]));
+    }
 
     struct DummyStreamer {
         simple: SimpleStreamer<DummyQuery>,

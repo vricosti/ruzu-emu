@@ -251,6 +251,12 @@ python3 tools/capture_harness/gui_control.py /tmp/ruzu-input-UNIQUE record menu.
 python3 tools/capture_harness/gui_control.py /tmp/ruzu-input-UNIQUE replay menu.json
 ```
 
+For automated recording on Windows, pass `--stop-file PATH` with a new,
+initially absent file path. Release the buttons, then create that file to finish
+and save cleanly. Do not terminate the recording process: some launchers turn
+Ctrl-C into process termination rather than Python's `KeyboardInterrupt`, losing
+the in-memory recording. An already existing stop file is rejected.
+
 This records player 1's logical buttons every 20 ms, not raw keyboard events or
 analog sticks. Taps shorter than the polling interval can be missed. It is not
 frame-synchronized TAS: different loading times can change the destination menu.

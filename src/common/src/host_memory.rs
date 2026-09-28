@@ -228,13 +228,16 @@ impl HostMemoryImpl {
         };
         let virtual_end = virtual_offset + length;
         let mappings = self.mappings();
-        for (&start, mapping) in mappings.iter() {
-            if mapping.end <= virtual_offset {
-                continue;
-            }
-            if start >= virtual_end {
-                break;
-            }
+        // Eden uses placeholders.equal_range({virtual_offset, virtual_end}).
+        // Seek the overlapping predecessor, then visit only starts before the
+        // exclusive end; scanning from the first mapping makes each protection
+        // change linear in the size of the guest address-space map.
+        let first = mappings
+            .range(..=virtual_offset)
+            .next_back()
+            .filter(|(_, mapping)| mapping.end > virtual_offset)
+            .map_or(virtual_offset, |(&start, _)| start);
+        for (&start, mapping) in mappings.range(first..virtual_end) {
             let offset = start.max(virtual_offset);
             let protect_length = mapping.end.min(virtual_end) - offset;
             let mut old_flags = 0;
@@ -1229,5 +1232,50 @@ mod tests {
         }
 
         hm.unmap(0x20_000, 0x3_000, false);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_protect_only_changes_overlapping_mapping_pages() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualQuery, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
+        };
+
+        let hm = HostMemory::new(0x40_000, 0x80_000);
+        assert!(!hm.virtual_base_pointer().is_null());
+        for start in [0x10_000, 0x20_000, 0x24_000, 0x30_000] {
+            hm.map(start, start, 0x3_000, MemoryPermission::READ_WRITE, false);
+        }
+        let protection = |offset: usize| {
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let size = unsafe {
+                VirtualQuery(
+                    hm.virtual_base_pointer().add(offset).cast(),
+                    &mut info,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            assert_ne!(size, 0);
+            info.Protect
+        };
+
+        // Start inside a mapping, cross a hole, finish inside the next mapping.
+        hm.protect(0x21_000, 0x4_000, MemoryPermission::READ);
+        for offset in [0x10_000, 0x20_000, 0x25_000, 0x26_000, 0x30_000] {
+            assert_eq!(protection(offset), PAGE_READWRITE, "offset {offset:#x}");
+        }
+        for offset in [0x21_000, 0x22_000, 0x24_000] {
+            assert_eq!(protection(offset), PAGE_READONLY, "offset {offset:#x}");
+        }
+        // A hole touching both neighbors must not change either one.
+        hm.protect(0x23_000, 0x1_000, MemoryPermission::READ_WRITE);
+        assert_eq!(protection(0x22_000), PAGE_READONLY);
+        assert_eq!(protection(0x24_000), PAGE_READONLY);
+        // Restore across exact boundaries, then test an empty request.
+        hm.protect(0x20_000, 0x7_000, MemoryPermission::READ_WRITE);
+        hm.protect(0x21_000, 0, MemoryPermission::READ);
+        for offset in [0x20_000, 0x21_000, 0x22_000, 0x24_000, 0x25_000, 0x26_000] {
+            assert_eq!(protection(offset), PAGE_READWRITE, "offset {offset:#x}");
+        }
     }
 }

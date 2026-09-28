@@ -975,14 +975,14 @@ impl IHidSystemServer {
         rb.push_copy_objects(handle);
     }
 
-    /// Upstream: IHidSystemServer::GetRegisteredDevices (cmd 548)
+    /// Upstream: IHidSystemServer::GetRegisteredDevices (cmd 548 and 551).
     fn get_registered_devices_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         log::warn!("(STUBBED) GetRegisteredDevices called");
 
         // Upstream returns empty list with count = 0
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_u32(0);
+        rb.push_u64(0);
     }
 
     /// Upstream: nullptr (cmd 549)
@@ -2600,6 +2600,11 @@ impl IHidSystemServer {
                 "GetConnectableRegisteredDevices",
             ),
             (
+                551,
+                Some(Self::get_registered_devices_handler),
+                "GetRegisteredDevicesForControllerSupport",
+            ),
+            (
                 700,
                 Some(Self::activate_unique_pad_handler),
                 "ActivateUniquePad",
@@ -3261,6 +3266,22 @@ impl ServiceFramework for IHidSystemServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_device_commands_return_a_64_bit_empty_count() {
+        let settings = Arc::new(HidFirmwareSettings::new());
+        let hid = Arc::new(parking_lot::Mutex::new(hid_core::hid_core::HIDCore::new()));
+        let manager = Arc::new(parking_lot::Mutex::new(ResourceManager::new(settings.clone(), hid)));
+        let service = IHidSystemServer::new(manager, settings);
+        for command in [548, 551] {
+            let mut ctx = HLERequestContext::new();
+            ctx.cmd_buf.fill(0xdead_beef);
+            service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+            assert_eq!(ctx.cmd_buf[6], RESULT_SUCCESS.get_inner_value());
+            assert_eq!(&ctx.cmd_buf[8..10], &[0, 0]);
+        }
+        assert_eq!(service.handlers[&551].name, "GetRegisteredDevicesForControllerSupport");
+    }
 
     #[test]
     fn joy_detach_event_returns_a_readable_object_instead_of_null() {

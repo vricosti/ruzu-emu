@@ -68,6 +68,7 @@ pub mod thread_worker;
 // Compression
 pub mod lz4_compression;
 pub mod zstd_compression;
+pub mod zbic_compression;
 
 // System utilities
 pub mod announce_multiplayer_room;

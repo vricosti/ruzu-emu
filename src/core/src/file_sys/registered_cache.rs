@@ -287,6 +287,30 @@ pub trait ContentProvider: Send + Sync {
     fn list_entries(&self) -> Vec<ContentProviderEntry> {
         self.list_entries_filter(None, None, None)
     }
+
+    /// Upstream ContentProvider::GetParentApplicationId. A bundled program must
+    /// not have its own application metadata, and needs a matching parent CNMT.
+    fn get_parent_application_id(&self, program_id: u64) -> Option<u64> {
+        let application_id = get_base_title_id(program_id);
+        let program_index = program_id - application_id;
+        if program_index == 0 || program_index > u8::MAX as u64 {
+            return None;
+        }
+        if !self.list_entries_filter(Some(TitleType::Application),
+            Some(ContentRecordType::Meta), Some(program_id)).is_empty() {
+            return None;
+        }
+        if (!self.list_entries_filter(Some(TitleType::Application),
+            Some(ContentRecordType::Meta), Some(application_id)).is_empty()
+            && self.has_entry(program_id, ContentRecordType::Program))
+            || (!self.list_entries_filter(Some(TitleType::Update),
+                Some(ContentRecordType::Meta), Some(get_update_title_id(application_id))).is_empty()
+                && self.has_entry(get_update_title_id(program_id), ContentRecordType::Program)) {
+            Some(application_id)
+        } else {
+            None
+        }
+    }
 }
 
 // ============================================================================
@@ -2131,6 +2155,44 @@ mod manual_content_provider_tests {
 
     fn file(name: &str) -> VirtualFile {
         Arc::new(VectorVfsFile::new(Vec::new(), name.to_owned(), None))
+    }
+
+    #[test]
+    fn parent_application_requires_parent_metadata_and_matching_program_content() {
+        let base = 0x0100_0000_0000_0000;
+        for index in [0, 1, 255, 256, 0x800, 0x1001] {
+            let program = base + index;
+            for flags in 0u32..32 {
+                let mut provider = ManualContentProvider::new();
+                for (flag, title_type, record, title) in [
+                    (1, TitleType::Application, ContentRecordType::Meta, base),
+                    (2, TitleType::Application, ContentRecordType::Program, program),
+                    (4, TitleType::Update, ContentRecordType::Meta, get_update_title_id(base)),
+                    (8, TitleType::Update, ContentRecordType::Program, get_update_title_id(program)),
+                    (16, TitleType::Application, ContentRecordType::Meta, program),
+                ] {
+                    if flags & flag != 0 { provider.add_entry(title_type, record, title, file("content")); }
+                }
+                let expected = if (1..=255).contains(&index) && flags & 16 == 0
+                    && (flags & 3 == 3 || flags & 12 == 12) { Some(base) } else { None };
+                let provider: &dyn ContentProvider = &provider;
+                assert_eq!(provider.get_parent_application_id(program), expected,
+                    "index={index:x} flags={flags:05b}");
+            }
+        }
+    }
+
+    #[test]
+    fn update_metadata_does_not_make_a_secondary_program_an_independent_application() {
+        let base = 0x0100_0000_0000_0000;
+        let program = base + 1;
+        let mut provider = ManualContentProvider::new();
+        provider.add_entry(TitleType::Application, ContentRecordType::Meta, base, file("parent"));
+        provider.add_entry(TitleType::Application, ContentRecordType::Program, program, file("program"));
+        provider.add_entry(TitleType::Update, ContentRecordType::Meta, program, file("update"));
+        assert_eq!(provider.get_parent_application_id(program), Some(base));
+        provider.add_entry(TitleType::Application, ContentRecordType::Meta, program, file("own"));
+        assert_eq!(provider.get_parent_application_id(program), None);
     }
 
     #[test]

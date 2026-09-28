@@ -1109,8 +1109,7 @@ fn is_host_query_report_synchronized(
         common::settings::GpuFenceBehavior::Default => gpu_level_high,
         common::settings::GpuFenceBehavior::Immediate => false,
         common::settings::GpuFenceBehavior::Balanced
-        | common::settings::GpuFenceBehavior::Accurate
-        | common::settings::GpuFenceBehavior::Strict => true,
+        | common::settings::GpuFenceBehavior::Accurate => true,
     }
 }
 
@@ -3426,7 +3425,6 @@ mod tests {
         for behavior in [
             GpuFenceBehavior::Balanced,
             GpuFenceBehavior::Accurate,
-            GpuFenceBehavior::Strict,
         ] {
             assert!(is_host_query_report_synchronized(true, false, behavior));
         }

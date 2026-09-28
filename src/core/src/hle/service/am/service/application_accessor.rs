@@ -406,13 +406,13 @@ mod tests {
             window_system.request_home_menu_to_get_foreground();
             window_system.update();
         }
-        assert!(!applet.lock().unwrap().is_interactible);
+        assert!(!applet.lock().unwrap().is_pad_interactible);
 
         let accessor =
             IApplicationAccessor::new(crate::core::SystemRef::null(), Arc::clone(&applet), Arc::downgrade(&window_system));
         accessor.request_for_application_to_get_foreground();
         window_system.lock().unwrap().update();
 
-        assert!(applet.lock().unwrap().is_interactible);
+        assert!(applet.lock().unwrap().is_pad_interactible);
     }
 }

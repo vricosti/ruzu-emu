@@ -22,6 +22,14 @@ const ERROR_ARGUMENT_IS_NULL: ResultCode =
 pub type ProfileUsername = [u8; PROFILE_USERNAME_SIZE];
 pub type UserIdArray = [u128; MAX_USERS];
 
+/// Upstream nn::account::Uid, used by StreamPlay IPC.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Uid {
+    pub unk0: [u8; 0x10],
+}
+const _: () = assert!(std::mem::size_of::<Uid>() == 0x10);
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 struct UserRaw {
@@ -154,8 +162,8 @@ impl ProfileManager {
             manager.write_user_save_file();
         }
 
-        let current =
-            (*common::settings::values().current_user.get_value() as usize).clamp(0, MAX_USERS - 1);
+        let current = (*common::settings::values().current_user.get_value())
+            .clamp(0, MAX_USERS as i32 - 1) as usize;
         let current = if manager.user_exists_index(current) {
             current
         } else {
@@ -503,6 +511,14 @@ mod tests {
     };
     use common::fs::path_util::{set_ruzu_path, RuzuPath};
     use common::uuid::UUID;
+
+    #[test]
+    fn stpl_prerequisite_uid_layout() {
+        assert_eq!(std::mem::size_of::<super::Uid>(), 16);
+        assert_eq!(std::mem::align_of::<super::Uid>(), 1);
+        assert_eq!(std::mem::offset_of!(super::Uid, unk0), 0);
+        assert_eq!(super::Uid::default().unk0, [0; 16]);
+    }
 
     #[test]
     fn removed_profiles_stay_removed_after_disk_reload() {

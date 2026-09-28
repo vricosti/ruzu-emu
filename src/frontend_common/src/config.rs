@@ -1579,7 +1579,6 @@ mod tests {
             "use_reactive_flushing",
             "barrier_feedback_loops",
             "enable_buffer_history",
-            "enable_gpu_buffer_readback",
             // Extras / Hacks
             "skip_cpu_inner_invalidation",
             "async_presentation",
@@ -1740,7 +1739,7 @@ mod tests {
             values.dma_accuracy.set_value(DmaAccuracy::Safe);
             values
                 .gpu_fence_behavior
-                .set_value(GpuFenceBehavior::Strict);
+                .set_value(GpuFenceBehavior::Accurate);
             values.vram_usage_mode.set_value(VramUsageMode::Aggressive);
             values.nvdec_emulation.set_value(NvdecEmulation::Cpu);
             values.max_anisotropy.set_value(AnisotropyMode::X8);
@@ -1760,7 +1759,6 @@ mod tests {
             values.use_reactive_flushing.set_value(false);
             values.barrier_feedback_loops.set_value(false);
             values.enable_buffer_history.set_value(true);
-            values.enable_gpu_buffer_readback.set_value(true);
 
             values.skip_cpu_inner_invalidation.set_value(true);
             values.async_presentation.set_value(true);
@@ -1830,7 +1828,7 @@ mod tests {
             assert_eq!(*values.dma_accuracy.get_value(), DmaAccuracy::Safe);
             assert_eq!(
                 *values.gpu_fence_behavior.get_value(),
-                GpuFenceBehavior::Strict
+                GpuFenceBehavior::Accurate
             );
             assert_eq!(
                 *values.vram_usage_mode.get_value(),
@@ -1859,7 +1857,6 @@ mod tests {
             assert!(!*values.use_reactive_flushing.get_value());
             assert!(!*values.barrier_feedback_loops.get_value());
             assert!(*values.enable_buffer_history.get_value());
-            assert!(*values.enable_gpu_buffer_readback.get_value());
             assert!(*values.skip_cpu_inner_invalidation.get_value());
             assert!(*values.async_presentation.get_value());
             assert!(*values.fix_bloom_effects.get_value());

@@ -25,9 +25,11 @@ def snapshot(status):
     return [name for name, pressed in zip(BUTTONS, buttons) if pressed]
 
 
-def record(directory, output, duration):
+def record(directory, output, duration, stop_file=None):
     if not 0 < duration <= 3600:
         raise ValueError("duration must be in (0, 3600] seconds")
+    if stop_file is not None and stop_file.exists():
+        raise ValueError("stop file already exists; choose a new path")
     initial = request(directory, {"command": "status"})
     if snapshot(initial):
         raise ValueError("Release all buttons before recording")
@@ -44,6 +46,8 @@ def record(directory, output, duration):
         try:
             try:
                 while time.monotonic() - start < duration:
+                    if stop_file is not None and stop_file.exists():
+                        break
                     time.sleep(0.02)
                     status = request(directory, {"command": "status"})
                     now = time.monotonic()
@@ -192,11 +196,13 @@ def main():
     recording = commands.add_parser("record")
     recording.add_argument("file", type=Path)
     recording.add_argument("--duration", type=float, default=180)
+    recording.add_argument("--stop-file", type=Path,
+                           help="Finish cleanly when this initially absent file is created")
     playback = commands.add_parser("replay")
     playback.add_argument("file", type=Path)
     args = parser.parse_args()
     if args.command == "record":
-        result = record(args.session, args.file, args.duration)
+        result = record(args.session, args.file, args.duration, args.stop_file)
     elif args.command == "replay":
         result = replay(args.session, args.file)
     elif args.command == "capture":

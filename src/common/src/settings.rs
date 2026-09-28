@@ -232,7 +232,6 @@ pub struct Values {
     pub use_video_framerate: SwitchableSetting<bool>,
     pub barrier_feedback_loops: SwitchableSetting<bool>,
     pub enable_buffer_history: SwitchableSetting<bool>,
-    pub enable_gpu_buffer_readback: SwitchableSetting<bool>,
 
     // ── Renderer Hacks ──────────────────────────────────────────────────
     pub skip_cpu_inner_invalidation: SwitchableSetting<bool>,
@@ -509,7 +508,6 @@ impl Values {
                 use_reactive_flushing,
                 barrier_feedback_loops,
                 enable_buffer_history,
-                enable_gpu_buffer_readback,
             ),
             Category::RendererHacks => visit!(
                 skip_cpu_inner_invalidation,
@@ -1107,7 +1105,7 @@ impl Default for Values {
             gpu_fence_behavior: SwitchableSetting::ranged_with_options(
                 GpuFenceBehavior::Default,
                 GpuFenceBehavior::Default,
-                GpuFenceBehavior::Strict,
+                GpuFenceBehavior::Accurate,
                 "gpu_fence_behavior",
                 RendererAdvanced,
                 Specialization::DEFAULT,
@@ -1198,14 +1196,6 @@ impl Default for Values {
             enable_buffer_history: SwitchableSetting::with_options(
                 false,
                 "enable_buffer_history",
-                RendererAdvanced,
-                Specialization::DEFAULT,
-                true,
-                true,
-            ),
-            enable_gpu_buffer_readback: SwitchableSetting::with_options(
-                false,
-                "enable_gpu_buffer_readback",
                 RendererAdvanced,
                 Specialization::DEFAULT,
                 true,
@@ -1649,9 +1639,6 @@ pub fn is_gpu_fence_behavior_accurate(values: &Values) -> bool {
     *values.gpu_fence_behavior.get_value() == GpuFenceBehavior::Accurate
 }
 
-pub fn is_gpu_fence_behavior_strict(values: &Values) -> bool {
-    *values.gpu_fence_behavior.get_value() == GpuFenceBehavior::Strict
-}
 
 /// Upstream `Settings::IsOpenGL()`.
 pub fn is_opengl() -> bool {
@@ -1946,7 +1933,6 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.use_video_framerate.set_global(true);
     values.barrier_feedback_loops.set_global(true);
     values.enable_buffer_history.set_global(true);
-    values.enable_gpu_buffer_readback.set_global(true);
     values.skip_cpu_inner_invalidation.set_global(true);
     values.async_presentation.set_global(true);
     values.fix_bloom_effects.set_global(true);
@@ -2081,7 +2067,7 @@ mod tests {
         }
         // Inventory of the Setting/SwitchableSetting fields in Values; plain
         // controller arrays and frontend UI settings have separate serializers.
-        assert_eq!(labels.len(), 193);
+        assert_eq!(labels.len(), 192);
 
         // Eden registers a restore callback for every SwitchableSetting.
         // Exercise all registered settings so a newly added field cannot
@@ -2211,7 +2197,6 @@ mod tests {
         );
         assert!(*values.barrier_feedback_loops.get_value());
         assert!(!*values.enable_buffer_history.get_value());
-        assert!(!*values.enable_gpu_buffer_readback.get_value());
 
         assert!(!*values.skip_cpu_inner_invalidation.get_value());
         assert!(!*values.async_presentation.get_value());
@@ -2294,7 +2279,6 @@ mod tests {
             values.frame_pacing_mode.setting.runtime_modifiable,
             values.sync_memory_operations.setting.runtime_modifiable,
             values.enable_buffer_history.setting.runtime_modifiable,
-            values.enable_gpu_buffer_readback.setting.runtime_modifiable,
         ] {
             assert!(runtime_modifiable);
         }

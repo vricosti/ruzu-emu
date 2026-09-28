@@ -39,6 +39,26 @@ use super::applet_profile_select::ProfileSelect;
 use super::applet_software_keyboard::SoftwareKeyboard;
 use super::applet_web_browser::WebBrowser;
 
+/// Port of `FrontendApplet::Exit`. Call only after releasing the Applet mutex:
+/// synchronous frontend callbacks defer this work until Execute returns.
+pub fn exit(system: SystemRef, applet: &std::sync::Weak<std::sync::Mutex<Applet>>) {
+    let Some(applet) = applet.upgrade() else { return };
+    let caller = {
+        let mut child = applet.lock().unwrap();
+        child.is_completed = true;
+        child.signal_state_changed_event_without_process();
+        child.caller_applet.clone()
+    };
+    if let Some(caller) = caller.upgrade() {
+        caller.lock().unwrap().child_applets.retain(|child| !Arc::ptr_eq(child, &applet));
+    }
+    if !system.is_null() {
+        if let Some(window_system) = system.get().get_applet_manager().get_window_system() {
+            window_system.lock().unwrap().request_update();
+        }
+    }
+}
+
 /// Base trait for all frontend applet implementations.
 ///
 /// Port of FrontendApplet class.
@@ -50,8 +70,8 @@ pub trait FrontendApplet: Send + Sync {
     fn request_exit(&mut self);
     fn get_library_applet_mode(&self) -> LibraryAppletMode;
     fn is_initialized(&self) -> bool;
-    /// Rust ownership adaptation for upstream `FrontendApplet::Exit()`, whose
-    /// weak Applet reference cannot be stored while Applet owns this trait object.
+    /// Synchronous completion is applied through `exit` after the caller drops
+    /// its Applet guard; asynchronous callbacks use their weak owner directly.
     fn is_complete(&self) -> bool;
 }
 
@@ -271,6 +291,31 @@ mod tests {
     use crate::frontend::applets::controller::{ControllerParameters, ReconfigureCallback};
 
     struct TestControllerApplet;
+
+    #[test]
+    fn frontend_exit_removes_only_the_completed_child_without_retaining_it() {
+        use crate::hle::service::am::applet::Applet as GuestApplet;
+        use crate::hle::service::os::process::Process;
+        use std::sync::Mutex as StdMutex;
+        let parent = Arc::new(StdMutex::new(GuestApplet::new(SystemRef::null(), Process::new(), true)));
+        let sibling = Arc::new(StdMutex::new(GuestApplet::new(SystemRef::null(), Process::new(), false)));
+        parent.lock().unwrap().child_applets.push(Arc::clone(&sibling));
+        for _ in 0..128 {
+            let child = Arc::new(StdMutex::new(GuestApplet::new(SystemRef::null(), Process::new(), false)));
+            child.lock().unwrap().caller_applet = Arc::downgrade(&parent);
+            parent.lock().unwrap().child_applets.extend([Arc::clone(&child), Arc::clone(&child)]);
+            let weak = Arc::downgrade(&child);
+            exit(SystemRef::null(), &weak);
+            assert!(child.lock().unwrap().is_completed);
+            let children = &parent.lock().unwrap().child_applets;
+            assert_eq!(children.len(), 1);
+            assert!(Arc::ptr_eq(&children[0], &sibling));
+            drop(child);
+            assert!(weak.upgrade().is_none());
+            exit(SystemRef::null(), &weak);
+        }
+        assert!(!sibling.lock().unwrap().is_completed);
+    }
 
     impl Applet for TestControllerApplet {
         fn close(&self) {}

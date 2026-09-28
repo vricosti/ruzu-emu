@@ -83,13 +83,18 @@ impl HidRegistration {
     /// Forward input enable/disable to HID resource manager.
     ///
     /// Upstream calls:
-    /// - SetAruidValidForVibration(pid, enable)
-    /// - EnableInput(pid, enable)
-    pub fn enable_applet_to_get_input(&self, enable: bool) {
+    /// - EnablePadInput(pid, enable_pad)
+    /// - EnableTouchScreen(pid, enable_touch)
+    /// - SetAruidValidForVibration(pid, enable_pad)
+    pub fn enable_applet_to_get_input(&self, enable_pad: bool, enable_touch: bool) {
+        if !self.initialized {
+            return;
+        }
         if let Some(ref rm) = self.resource_manager {
             let rm = rm.lock();
-            rm.set_aruid_valid_for_vibration(self.pid, enable);
-            rm.enable_input(self.pid, enable);
+            rm.enable_pad_input(self.pid, enable_pad);
+            rm.enable_touch_screen(self.pid, enable_touch);
+            rm.set_aruid_valid_for_vibration(self.pid, enable_pad);
         }
     }
 }
@@ -106,5 +111,45 @@ impl Drop for HidRegistration {
                 rm.unregister_applet_resource_user_id(self.pid);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hid_core::hid_core::HIDCore;
+    use hid_core::resources::hid_firmware_settings::HidFirmwareSettings;
+
+    #[test]
+    fn pad_touch_and_vibration_are_independent_of_other_input_flags() {
+        let manager = Arc::new(parking_lot::Mutex::new(ResourceManager::new(
+            Arc::new(HidFirmwareSettings::new()),
+            Arc::new(parking_lot::Mutex::new(HIDCore::new())),
+        )));
+        let pid = 0x51;
+        manager.lock().register_applet_resource_user_id(pid, true);
+        let resource = manager.lock().get_applet_resource().unwrap();
+        let mut registration = HidRegistration {
+            initialized: true,
+            resource_manager: Some(manager),
+            pid,
+        };
+        for (pad, touch) in [(false, true), (true, false), (false, false), (true, true)] {
+            registration.enable_applet_to_get_input(pad, touch);
+            let resource = resource.lock();
+            let flags = resource.get_aruid_data(pid).unwrap().flag;
+            assert_eq!(flags.enable_pad_input(), pad);
+            assert_eq!(flags.enable_touchscreen(), touch);
+            assert_eq!(resource.is_vibration_aruid_active(pid), pad);
+            assert!(flags.enable_six_axis_sensor());
+            assert!(flags.bit_18());
+        }
+        registration.initialized = false;
+        registration.enable_applet_to_get_input(false, false);
+        let flags = resource.lock().get_aruid_data(pid).unwrap().flag;
+        assert!(flags.enable_pad_input());
+        assert!(flags.enable_touchscreen());
+        assert!(resource.lock().is_vibration_aruid_active(pid));
+        registration.initialized = true;
     }
 }

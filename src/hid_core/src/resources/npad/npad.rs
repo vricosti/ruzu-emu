@@ -1446,34 +1446,34 @@ impl NPad {
         let mut dummy_gc_state = NpadGcTriggerState::default();
 
         dummy_pad_state.sampling_number =
-            npad.fullkey_lifo.read_current_entry().sampling_number + 1;
+            npad.fullkey_lifo.read_current_entry().state.sampling_number.wrapping_add(1);
         npad.fullkey_lifo.write_next_entry(dummy_pad_state);
 
         dummy_pad_state.sampling_number =
-            npad.handheld_lifo.read_current_entry().sampling_number + 1;
+            npad.handheld_lifo.read_current_entry().state.sampling_number.wrapping_add(1);
         npad.handheld_lifo.write_next_entry(dummy_pad_state);
 
         dummy_pad_state.sampling_number =
-            npad.joy_dual_lifo.read_current_entry().sampling_number + 1;
+            npad.joy_dual_lifo.read_current_entry().state.sampling_number.wrapping_add(1);
         npad.joy_dual_lifo.write_next_entry(dummy_pad_state);
 
         dummy_pad_state.sampling_number =
-            npad.joy_left_lifo.read_current_entry().sampling_number + 1;
+            npad.joy_left_lifo.read_current_entry().state.sampling_number.wrapping_add(1);
         npad.joy_left_lifo.write_next_entry(dummy_pad_state);
 
         dummy_pad_state.sampling_number =
-            npad.joy_right_lifo.read_current_entry().sampling_number + 1;
+            npad.joy_right_lifo.read_current_entry().state.sampling_number.wrapping_add(1);
         npad.joy_right_lifo.write_next_entry(dummy_pad_state);
 
-        dummy_pad_state.sampling_number = npad.palma_lifo.read_current_entry().sampling_number + 1;
+        dummy_pad_state.sampling_number = npad.palma_lifo.read_current_entry().state.sampling_number.wrapping_add(1);
         npad.palma_lifo.write_next_entry(dummy_pad_state);
 
         dummy_pad_state.sampling_number =
-            npad.system_ext_lifo.read_current_entry().sampling_number + 1;
+            npad.system_ext_lifo.read_current_entry().state.sampling_number.wrapping_add(1);
         npad.system_ext_lifo.write_next_entry(dummy_pad_state);
 
         dummy_gc_state.sampling_number =
-            npad.gc_trigger_lifo.read_current_entry().sampling_number + 1;
+            npad.gc_trigger_lifo.read_current_entry().state.sampling_number.wrapping_add(1);
         npad.gc_trigger_lifo.write_next_entry(dummy_gc_state);
     }
 
@@ -1503,6 +1503,55 @@ impl Drop for NPad {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn callbacks_are_registered_for_all_aruid_slots_before_activation() {
+        let hid = Arc::new(Mutex::new(HIDCore::new()));
+        let mut npad = NPad::new_with_hid_core(hid.clone());
+        let keys: Vec<_> = npad.controller_data.iter().map(|row| {
+            row.iter().enumerate().map(|(index, controller)| {
+                assert!(!controller.shared_memory_assigned);
+                assert!(!controller.is_active);
+                let expected = hid.lock().get_emulated_controller_by_index(index);
+                assert!(Arc::ptr_eq(controller.device.as_ref().unwrap(), &expected));
+                controller.callback_key.expect("constructor must register callback")
+            }).collect::<Vec<_>>()
+        }).collect();
+        for index in 0..keys[0].len() {
+            let unique: std::collections::BTreeSet<_> = keys.iter().map(|row| row[index]).collect();
+            assert_eq!(unique.len(), super::ARUID_INDEX_MAX);
+        }
+        assert!(npad.activate().is_success());
+        // No applet resources yet: activation must neither defer nor replace callbacks.
+        assert!(npad.activate_for_aruid(0x51).is_success());
+        for (row, keys) in npad.controller_data.iter().zip(keys) {
+            for (controller, key) in row.iter().zip(keys) {
+                assert_eq!(controller.callback_key, Some(key));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_entries_advance_state_sampling_numbers_not_storage_counters() {
+        use super::NpadInternalState;
+        let mut npad = NpadInternalState::default();
+        for lifo in [&mut npad.fullkey_lifo, &mut npad.handheld_lifo,
+            &mut npad.joy_dual_lifo, &mut npad.joy_left_lifo,
+            &mut npad.joy_right_lifo, &mut npad.palma_lifo, &mut npad.system_ext_lifo] {
+            lifo.entries[0].sampling_number = 7;
+            lifo.entries[0].state.sampling_number = 123;
+        }
+        npad.gc_trigger_lifo.entries[0].sampling_number = 8;
+        npad.gc_trigger_lifo.entries[0].state.sampling_number = 456;
+        super::NPad::write_empty_entry(&mut npad);
+        for lifo in [&npad.fullkey_lifo, &npad.handheld_lifo,
+            &npad.joy_dual_lifo, &npad.joy_left_lifo,
+            &npad.joy_right_lifo, &npad.palma_lifo, &npad.system_ext_lifo] {
+            assert_eq!(lifo.read_current_entry().state.sampling_number, 124);
+            assert!(lifo.read_current_entry().state.npad_buttons.raw.is_empty());
+        }
+        assert_eq!(npad.gc_trigger_lifo.read_current_entry().state.sampling_number, 457);
+    }
+
     use std::any::Any;
     use std::sync::Arc;
 
@@ -1863,11 +1912,9 @@ mod tests {
         let resource = applet_resource.lock();
         let shared = resource.get_shared_memory_format(ARUID).unwrap();
         let state = &shared.npad.npad_entry[0].internal_state;
-        // `WriteEmptyEntry` derives each state sample from the preceding
-        // atomic marker, while `Lifo::WriteNextEntry` publishes twice that
-        // state sample. Nineteen upstream prefill writes therefore produce
-        // 2^19 - 1 rather than a linear sample count.
-        const EXPECTED_PREFILL_SAMPLE: i64 = (1 << 19) - 1;
+        // Eden 07f40d5cac derives the next sample from the embedded state,
+        // not the doubled atomic marker. Nineteen prefill writes yield 19.
+        const EXPECTED_PREFILL_SAMPLE: i64 = 19;
         assert_eq!(state.fullkey_lifo.buffer_count, 16);
         assert_eq!(state.fullkey_lifo.buffer_tail, 2);
         assert_eq!(

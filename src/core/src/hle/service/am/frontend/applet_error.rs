@@ -197,16 +197,9 @@ impl Error {
         }
     }
 
-    fn exit(applet: &Weak<Mutex<Applet>>) {
-        let Some(applet) = applet.upgrade() else {
-            return;
-        };
-        let mut applet = applet.lock().unwrap();
-        applet.is_completed = true;
-        applet.signal_state_changed_event_without_process();
-    }
 
     fn display_completed(
+        system: SystemRef,
         applet: &Weak<Mutex<Applet>>,
         broker: &AppletDataBroker,
         completion: &CompletionState,
@@ -214,24 +207,23 @@ impl Error {
         completion.complete.store(true, Ordering::Release);
         broker.get_out_data().push(vec![0; 0x1000]);
         if !completion.frontend_executing.load(Ordering::Acquire) {
-            Self::exit(applet);
+            super::applets::exit(system, applet);
         }
     }
 
     fn finished_callback(&self) -> FinishedCallback {
+        let system = self.system;
         let applet = self.applet.clone();
         let broker = Arc::clone(&self.broker);
         let completion = Arc::clone(&self.completion);
-        Box::new(move || Self::display_completed(&applet, &broker, &completion))
+        Box::new(move || Self::display_completed(system, &applet, &broker, &completion))
     }
 
     fn finish_frontend_execution(&self) {
         self.completion
             .frontend_executing
             .store(false, Ordering::Release);
-        if self.completion.complete.load(Ordering::Acquire) {
-            Self::exit(&self.applet);
-        }
+        // The accessor applies synchronous completion after releasing Applet.
     }
 }
 
@@ -365,7 +357,7 @@ impl FrontendApplet for Error {
             mode => {
                 log::error!("Unimplemented LibAppletError mode={:02X}!", mode.0);
                 common::assert::assert_fail_soft_impl();
-                Self::display_completed(&self.applet, &self.broker, &self.completion);
+                Self::display_completed(self.system, &self.applet, &self.broker, &self.completion);
             }
         }
 
@@ -373,7 +365,9 @@ impl FrontendApplet for Error {
     }
 
     fn request_exit(&mut self) {
+        self.completion.frontend_executing.store(true, Ordering::Release);
         self.frontend.close();
+        self.finish_frontend_execution();
     }
 
     fn get_library_applet_mode(&self) -> LibraryAppletMode {
@@ -486,7 +480,13 @@ mod tests {
             Arc::clone(&frontend) as Arc<dyn ErrorApplet>,
         );
         applet.initialize();
-        applet.execute();
+        {
+            // Match the accessor's execution guard: inline completion must not
+            // recursively lock the owner; Exit runs only after this is released.
+            let _guard = owner.lock().unwrap();
+            applet.execute();
+        }
+        super::super::applets::exit(system_ref, &Arc::downgrade(&owner));
 
         let expected = 128 | (42 << 9);
         assert_eq!(frontend.0.load(Ordering::Acquire), expected);

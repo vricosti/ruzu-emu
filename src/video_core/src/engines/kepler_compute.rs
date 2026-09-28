@@ -242,6 +242,7 @@ struct UploadInfo {
     upload_address: u64,
     exec_address: u64,
     copy_size: u32,
+    was_dirty: bool,
 }
 
 /// Corresponds to upstream's public anonymous `state` member.
@@ -260,6 +261,7 @@ pub struct KeplerCompute {
     memory_manager: Arc<Mutex<MemoryManager>>,
     upload_state: engine_upload::State,
     upload_address: u64,
+    upload_dirty: bool,
     uploads: Vec<UploadInfo>,
     /// Port of upstream owner-local `launch_description`.
     pub launch_description: LaunchParams,
@@ -289,6 +291,7 @@ impl KeplerCompute {
             )),
             memory_manager,
             upload_address: 0,
+            upload_dirty: false,
             uploads: Vec::new(),
             launch_description: LaunchParams::default(),
             state: State::default(),
@@ -313,6 +316,7 @@ impl KeplerCompute {
                     upload_address: self.upload_address,
                     exec_address: self.upload_state.exec_target_address(&regs),
                     copy_size: self.upload_state.get_upload_size(),
+                    was_dirty: self.upload_dirty,
                 };
                 self.uploads.push(info);
                 self.upload_state
@@ -320,6 +324,8 @@ impl KeplerCompute {
             }
             DATA_UPLOAD => {
                 self.upload_address = self.interface_state.current_dma_segment;
+                self.upload_dirty = self.interface_state.current_dirty;
+                self.interface_state.current_dirty = false;
                 let regs = self.upload_registers();
                 self.upload_state
                     .process_data_word(&regs, argument, _is_last_call);
@@ -328,13 +334,14 @@ impl KeplerCompute {
                 let qmd_addr = self.launch_desc_address();
                 for data in &self.uploads {
                     let offset = data.exec_address.wrapping_sub(qmd_addr);
-                    if offset / std::mem::size_of::<u32>() as u64 == LAUNCH_GRID_DIM_X_INDEX
-                        && self
+                    if offset / std::mem::size_of::<u32>() as u64 == LAUNCH_GRID_DIM_X_INDEX {
+                        let source_dirty = self
                             .memory_manager
                             .lock()
-                            .is_memory_dirty(data.upload_address, data.copy_size as u64)
-                    {
-                        self.indirect_compute = Some(data.upload_address);
+                            .is_memory_dirty(data.upload_address, data.copy_size as u64);
+                        if data.was_dirty || source_dirty {
+                            self.indirect_compute = Some(data.upload_address);
+                        }
                     }
                 }
                 self.uploads.clear();
@@ -359,6 +366,8 @@ impl KeplerCompute {
         );
         if method == DATA_UPLOAD {
             self.upload_address = self.interface_state.current_dma_segment;
+            self.upload_dirty = self.interface_state.current_dirty;
+            self.interface_state.current_dirty = false;
             let regs = self.upload_registers();
             self.upload_state
                 .process_data_multi(&regs, &args[..amount as usize]);
@@ -596,6 +605,39 @@ mod tests {
 
     fn new_test_engine() -> KeplerCompute {
         KeplerCompute::new(Arc::new(Mutex::new(MemoryManager::new(0))))
+    }
+
+    #[test]
+    fn upload_dirty_snapshot_survives_until_indirect_launch() {
+        for multi in [false, true] {
+            for was_dirty in [false, true] {
+                for source_dirty in [false, true] {
+                    let backing = vec![0u8; 0x2000];
+                    let mut engine = new_owner_backed_engine(&backing, 0x10000);
+                    let rasterizer = TestRasterizer::new(if source_dirty { 0x11000 } else { 0 }, 4);
+                    engine.memory_manager.lock().bind_rasterizer(&rasterizer);
+                    engine.bind_rasterizer(&rasterizer);
+                    engine.regs[LAUNCH_DESC_LOC as usize] = 0x100;
+                    engine.regs[UPLOAD_REG_OFFSET as usize] = 4;
+                    engine.regs[(UPLOAD_REG_OFFSET + 1) as usize] = 1;
+                    engine.regs[(UPLOAD_REG_OFFSET + 3) as usize] = 0x10030;
+                    engine.call_method(EXEC_UPLOAD, 1, true);
+                    engine.set_current_dma_segment(0x11000);
+                    engine.set_current_dirty(was_dirty);
+                    if multi { engine.call_multi_method(DATA_UPLOAD, &[42], 1, 1); }
+                    else { engine.call_method(DATA_UPLOAD, 42, true); }
+                    assert_eq!(engine.upload_dirty, was_dirty);
+                    assert!(!engine.current_dirty());
+                    engine.call_method(EXEC_UPLOAD, 1, true);
+                    assert_eq!(engine.uploads.last().unwrap().was_dirty, was_dirty);
+                    engine.call_method(LAUNCH, 1, true);
+                    assert_eq!(rasterizer.last_dispatch.borrow().as_ref().unwrap().indirect_compute_address,
+                        (was_dirty || source_dirty).then_some(0x11000));
+                    assert!(engine.uploads.is_empty());
+                    assert_eq!(engine.get_indirect_compute_address(), None);
+                }
+            }
+        }
     }
 
     fn new_owner_backed_engine(backing: &[u8], device_addr: u64) -> KeplerCompute {

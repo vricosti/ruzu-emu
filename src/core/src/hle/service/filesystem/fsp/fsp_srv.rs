@@ -230,6 +230,9 @@ impl FspSrv {
             save_data_controller: std::sync::Mutex::new(None),
             romfs_controller: std::sync::Mutex::new(None),
             handlers: build_handler_map(&[
+                (820, None, "GetContentStorageInfoIndex"),
+                (830, None, "EncryptStreamPlaySaveData"),
+                (831, None, "DecryptStreamPlaySaveData"),
                 (32, Some(Self::extend_save_data_file_system_handler), "ExtendSaveDataFileSystem"),
                 (57, Some(Self::read_save_data_file_system_extra_data_by_save_data_space_id_handler), "ReadSaveDataFileSystemExtraDataBySaveDataSpaceId"),
                 (67, Some(Self::find_save_data_with_filter_handler), "FindSaveDataWithFilter"),
@@ -1145,6 +1148,17 @@ impl ServiceFramework for FspSrv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stpl_prerequisite_fsp_command_names() {
+        let service = FspSrv::new();
+        for (id, name) in [(820, "GetContentStorageInfoIndex"),
+            (830, "EncryptStreamPlaySaveData"), (831, "DecryptStreamPlaySaveData")] {
+            let info = &service.handlers()[&id];
+            assert_eq!(info.name, name);
+            assert!(info.handler_callback.is_none());
+        }
+    }
 
     #[test]
     fn patched_document_open_returns_an_error_and_null_interface_when_unavailable() {

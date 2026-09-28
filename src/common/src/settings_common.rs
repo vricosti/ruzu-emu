@@ -195,15 +195,11 @@ where
     T: PartialOrd,
 {
     /// Load a value from a string, falling back to default on parse failure.
-    pub fn load_string(&mut self, input: &str) {
-        if input.is_empty() {
-            self.value = self.default_value.clone();
-            return;
-        }
-        match input.parse::<T>() {
-            Ok(val) => self.set_value(val),
-            Err(_) => self.value = self.default_value.clone(),
-        }
+    pub fn load_string(&mut self, input: &str)
+    where
+        T: crate::settings_setting::SettingType,
+    {
+        crate::settings_setting::BasicSetting::load_string(self, input);
     }
 }
 

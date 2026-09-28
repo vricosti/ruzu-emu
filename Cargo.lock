@@ -388,6 +388,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
+ "cc",
  "context",
  "env_filter",
  "fastrand",

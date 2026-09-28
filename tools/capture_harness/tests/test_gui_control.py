@@ -125,7 +125,34 @@ class RecordingTests(unittest.TestCase):
             with patch.object(CONTROL, "request", return_value=status) as send:
                 with self.assertRaisesRegex(ValueError, "wrong game"):
                     CONTROL.replay(Path(directory), source)
-                self.assertEqual(send.call_count, 1)
+            self.assertEqual(send.call_count, 1)
+
+    def test_record_stop_file_finishes_without_process_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, stop = root / "buttons.json", root / "stop"
+            with patch.object(CONTROL, "request", return_value=self.status()), \
+                 patch.object(CONTROL.time, "monotonic", side_effect=[0, .02, .04, .06, .08]), \
+                 patch.object(CONTROL.time, "sleep", side_effect=lambda _: stop.touch()):
+                CONTROL.record(root, output, 1, stop)
+            data = json.loads(output.read_text())
+            self.assertTrue(data["complete"])
+            CONTROL.validate_recording(data)
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                CONTROL.record(root, root / "second.json", 1, stop)
+            self.assertFalse((root / "second.json").exists())
+
+    def test_record_stop_file_does_not_mark_held_buttons_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, stop = root / "buttons.json", root / "stop"
+            pressed = self.status()
+            pressed["buttons"][0] = True
+            with patch.object(CONTROL, "request", side_effect=[self.status(), pressed]), \
+                 patch.object(CONTROL.time, "sleep", side_effect=lambda _: stop.touch()):
+                with self.assertRaisesRegex(RuntimeError, "held buttons"):
+                    CONTROL.record(root, output, 1, stop)
+            self.assertFalse(json.loads(output.read_text())["complete"])
 
     def test_session_change_leaves_incomplete_recording(self):
         with tempfile.TemporaryDirectory() as directory:

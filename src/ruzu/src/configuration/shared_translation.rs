@@ -142,7 +142,6 @@ pub const GPU_FENCE_BEHAVIOR: &[(GpuFenceBehavior, &str)] = &[
     (GpuFenceBehavior::Immediate, "Immediate"),
     (GpuFenceBehavior::Balanced, "Balanced"),
     (GpuFenceBehavior::Accurate, "Accurate"),
-    (GpuFenceBehavior::Strict, "Strict"),
 ];
 
 pub const CPU_ACCURACY: &[(CpuAccuracy, &str)] = &[

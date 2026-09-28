@@ -446,11 +446,12 @@ pub trait BufferCacheBuffer:
         self.deref_mut().set_write_tick(tick);
     }
 
-    /// Native derived-data caches may need the range already known by upstream
-    /// MarkWrittenBuffer. Other backends retain exactly setWriteTick behavior;
-    /// dispatch through the hook so existing whole-buffer invalidation remains.
-    fn mark_written_region(&mut self, tick: u64, _offset: u64, _size: u64) {
-        self.set_write_tick(tick);
+    /// Native derived-data caches need every written range, independently of
+    /// whether upstream MarkWrittenBuffer requests a synchronization tick.
+    fn mark_written_region(&mut self, tick: Option<u64>, _offset: u64, _size: u64) {
+        if let Some(tick) = tick {
+            self.set_write_tick(tick);
+        }
     }
 
     /// Backend-specific usage tracking. OpenGL intentionally implements these
@@ -733,9 +734,10 @@ pub trait BufferCacheRuntime {
         0
     }
 
-    /// Last tick completed by the host GPU.
-    fn known_gpu_tick(&self) -> u64 {
-        0
+    /// Whether the host GPU has completed the submission at `tick`.
+    /// Upstream: `Runtime::IsFree`.
+    fn is_free(&mut self, tick: u64) -> bool {
+        tick == 0
     }
 
     /// Wait until the host GPU reaches `tick`.
@@ -1149,6 +1151,11 @@ impl BufferCacheBuffer for TestBuffer {
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct TestBufferCacheRuntime {
+    pub(crate) current_tick: u64,
+    pub(crate) completed_tick: u64,
+    pub(crate) waited_ticks: Vec<u64>,
+    pub(crate) queried_ticks: Vec<u64>,
+    pub(crate) finish_count: usize,
     limit_dynamic_storage_buffers: bool,
     max_dynamic_storage_buffers: u32,
     can_report_memory_usage: bool,
@@ -1245,7 +1252,22 @@ impl BufferCacheRuntime for TestBufferCacheRuntime {
         }
     }
 
-    fn finish(&mut self) {}
+    fn finish(&mut self) {
+        self.finish_count += 1;
+        self.completed_tick = self.current_tick;
+    }
+
+    fn current_tick(&self) -> u64 { self.current_tick }
+
+    fn is_free(&mut self, tick: u64) -> bool {
+        self.queried_ticks.push(tick);
+        tick <= self.completed_tick
+    }
+
+    fn wait(&mut self, tick: u64) {
+        self.waited_ticks.push(tick);
+        self.completed_tick = self.completed_tick.max(tick);
+    }
 
     fn upload_staging_buffer(&mut self, size: u64) -> Self::AsyncBuffer {
         StagingBufferRef::host(size as usize)
@@ -1612,7 +1634,9 @@ mod tests {
         let mut runtime = TestBufferCacheRuntime::default();
         let mut buffer = TestBuffer::new(&mut runtime, 0x1000, 8, false);
         for (tick, offset, size) in [(19, 0, 4), (19, 4, 4), (0, 0, 0), (u64::MAX, 0, 8)] {
-            buffer.mark_written_region(tick, offset, size);
+            buffer.mark_written_region(Some(tick), offset, size);
+            assert_eq!(buffer.write_tick(), tick);
+            buffer.mark_written_region(None, offset, size);
             assert_eq!(buffer.write_tick(), tick);
         }
     }

@@ -75,14 +75,6 @@ fn pop_common_arguments(broker: &AppletDataBroker, applet_name: &str) {
         .unwrap_or_else(|| panic!("{applet_name} common arguments are too small"));
 }
 
-fn exit(applet: &Weak<Mutex<Applet>>) {
-    let Some(applet) = applet.upgrade() else {
-        return;
-    };
-    let mut applet = applet.lock().unwrap();
-    applet.is_completed = true;
-    applet.signal_state_changed_event_without_process();
-}
 
 struct AuthCallbackState {
     complete: AtomicBool,
@@ -141,6 +133,7 @@ impl Auth {
     }
 
     fn auth_finished(
+        system: SystemRef,
         is_successful: bool,
         applet: &Weak<Mutex<Applet>>,
         broker: &AppletDataBroker,
@@ -157,24 +150,26 @@ impl Auth {
         );
         callback_state.complete.store(true, Ordering::Release);
         if !callback_state.frontend_executing.load(Ordering::Acquire) {
-            exit(applet);
+            super::applets::exit(system, applet);
         }
     }
 
     fn verify_callback(&self) -> VerifyPinCallback {
+        let system = self.system;
         let applet = self.applet.clone();
         let broker = Arc::clone(&self.broker);
         let callback_state = Arc::clone(&self.callback_state);
         Box::new(move |successful| {
-            Self::auth_finished(successful, &applet, &broker, &callback_state)
+            Self::auth_finished(system, successful, &applet, &broker, &callback_state)
         })
     }
 
     fn successful_callback(&self) -> FinishedCallback {
+        let system = self.system;
         let applet = self.applet.clone();
         let broker = Arc::clone(&self.broker);
         let callback_state = Arc::clone(&self.callback_state);
-        Box::new(move || Self::auth_finished(true, &applet, &broker, &callback_state))
+        Box::new(move || Self::auth_finished(system, true, &applet, &broker, &callback_state))
     }
 
     fn log_unimplemented(&self) {
@@ -257,7 +252,9 @@ impl FrontendApplet for Auth {
     }
 
     fn request_exit(&mut self) {
+        self.callback_state.frontend_executing.store(true, Ordering::Release);
         self.frontend.close();
+        self.callback_state.frontend_executing.store(false, Ordering::Release);
     }
 
     fn get_library_applet_mode(&self) -> LibraryAppletMode {
@@ -313,6 +310,7 @@ impl PhotoViewer {
     }
 
     fn view_finished(
+        system: SystemRef,
         applet: &Weak<Mutex<Applet>>,
         broker: &AppletDataBroker,
         callback_state: &PhotoCallbackState,
@@ -320,15 +318,16 @@ impl PhotoViewer {
         broker.get_out_data().push(Vec::new());
         callback_state.complete.store(true, Ordering::Release);
         if !callback_state.frontend_executing.load(Ordering::Acquire) {
-            exit(applet);
+            super::applets::exit(system, applet);
         }
     }
 
     fn finished_callback(&self) -> FinishedCallback {
+        let system = self.system;
         let applet = self.applet.clone();
         let broker = Arc::clone(&self.broker);
         let callback_state = Arc::clone(&self.callback_state);
-        Box::new(move || Self::view_finished(&applet, &broker, &callback_state))
+        Box::new(move || Self::view_finished(system, &applet, &broker, &callback_state))
     }
 }
 
@@ -379,7 +378,9 @@ impl FrontendApplet for PhotoViewer {
     }
 
     fn request_exit(&mut self) {
+        self.callback_state.frontend_executing.store(true, Ordering::Release);
         self.frontend.close();
+        self.callback_state.frontend_executing.store(false, Ordering::Release);
     }
 
     fn get_library_applet_mode(&self) -> LibraryAppletMode {

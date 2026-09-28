@@ -677,14 +677,12 @@ fn set_button(
     let npad_type = status.npad_type;
     drop(status);
 
-    if !event_context.is_connected.load(Ordering::Relaxed) {
-        let should_connect = (event_context.npad_id_type == NpadIdType::Player1
-            && npad_type != NpadStyleIndex::Handheld)
-            || (event_context.npad_id_type == NpadIdType::Handheld
-                && npad_type == NpadStyleIndex::Handheld);
+    let player_index = crate::hid_util::npad_id_type_to_index(event_context.npad_id_type);
+    let should_connect = common::settings::values().players.get_value()[player_index].connected;
+    if should_connect && !event_context.is_connected.load(Ordering::Relaxed) {
         let supported =
             is_controller_supported(npad_type, *event_context.supported_style_tag.lock());
-        if should_connect && supported && !event_context.is_connected.swap(true, Ordering::Relaxed)
+        if supported && !event_context.is_connected.swap(true, Ordering::Relaxed)
         {
             trigger_on_change(event_context, ControllerTriggerType::Connected, true);
         }
@@ -2968,6 +2966,15 @@ mod tests {
     fn player_one_button_auto_connects_and_notifies_callbacks() {
         use settings_input::native_button::Values as NB;
 
+        const CHILD: &str = "RUZU_TEST_BUTTON_CONNECTION_POLICY";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "frontend::emulated_controller::tests::player_one_button_auto_connects_and_notifies_callbacks"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        common::settings::values_mut().players.get_value_mut()[0].connected = true;
+
         let status = Arc::new(Mutex::new(ControllerStatus::new()));
         status.lock().npad_type = NpadStyleIndex::Fullkey;
         let events = event_context(NpadIdType::Player1);
@@ -2999,6 +3006,30 @@ mod tests {
                 ControllerTriggerType::Button
             ]
         );
+
+        // Unlike the old unconditional P1/handheld policy, every slot follows
+        // its configured connection flag, including players other than P1.
+        for (id, style) in [
+            (NpadIdType::Player1, NpadStyleIndex::Fullkey),
+            (NpadIdType::Player2, NpadStyleIndex::Fullkey),
+            (NpadIdType::Handheld, NpadStyleIndex::Handheld),
+        ] {
+            for configured in [false, true] {
+                let index = crate::hid_util::npad_id_type_to_index(id);
+                common::settings::values_mut().players.get_value_mut()[index].connected = configured;
+                let status = Arc::new(Mutex::new(ControllerStatus::new()));
+                status.lock().npad_type = style;
+                let events = event_context(id);
+                set_button(&status, &events, &button_callback(true), NB::A as usize, UUID::new());
+                assert_eq!(events.is_connected.load(Ordering::Relaxed), configured);
+                // An already connected controller is not forcibly disconnected
+                // when its configuration flag changes during a button event.
+                events.is_connected.store(true, Ordering::Relaxed);
+                common::settings::values_mut().players.get_value_mut()[index].connected = false;
+                set_button(&status, &events, &button_callback(false), NB::A as usize, UUID::new());
+                assert!(events.is_connected.load(Ordering::Relaxed));
+            }
+        }
     }
 
     /// Home and Capture are gated on `system_buttons_enabled` upstream.

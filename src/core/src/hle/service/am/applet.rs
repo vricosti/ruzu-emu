@@ -101,9 +101,11 @@ pub struct Applet {
     pub album_image_taken_notification_enabled: bool,
     pub record_volume_muted: bool,
     pub is_activity_runnable: bool,
-    pub is_interactible: bool,
+    pub is_pad_interactible: bool,
+    pub is_touch_interactible: bool,
     pub window_visible: bool,
-    pub overlay_in_foreground: bool,
+    pub overlay_watching_short_home_button: bool,
+    pub overlay_handling_touch_input: bool,
 
     // Events
     pub gpu_error_detected_event: Option<Arc<Mutex<KReadableEvent>>>,
@@ -194,9 +196,11 @@ impl Applet {
             album_image_taken_notification_enabled: false,
             record_volume_muted: false,
             is_activity_runnable: false,
-            is_interactible: true,
+            is_pad_interactible: true,
+            is_touch_interactible: true,
             window_visible: true,
-            overlay_in_foreground: false,
+            overlay_watching_short_home_button: false,
+            overlay_handling_touch_input: false,
             gpu_error_detected_event: None,
             gpu_error_detected_event_handle: None,
             friend_invitation_storage_channel_event: None,
@@ -454,13 +458,17 @@ impl Applet {
     }
 
     /// Port of Applet::SetInteractibleLocked
-    pub fn set_interactible_locked(&mut self, interactible: bool) {
-        if self.is_interactible == interactible {
+    pub fn set_interactible_locked(&mut self, pad_interactible: bool, touch_interactible: bool) {
+        if self.is_pad_interactible == pad_interactible
+            && self.is_touch_interactible == touch_interactible {
             return;
         }
-        self.is_interactible = interactible;
+        self.is_pad_interactible = pad_interactible;
+        self.is_touch_interactible = touch_interactible;
+        let exit_requested = self.lifecycle_manager.get_exit_requested();
         self.hid_registration.enable_applet_to_get_input(
-            interactible && !self.lifecycle_manager.get_exit_requested(),
+            pad_interactible && !exit_requested,
+            touch_interactible && !exit_requested,
         );
     }
 
@@ -497,6 +505,18 @@ mod tests {
     use crate::hle::kernel::k_readable_event::KReadableEvent;
     use crate::hle::service::os::process::Process;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn interactibility_tracks_pad_and_touch_changes_independently() {
+        let mut applet = Applet::new(crate::core::SystemRef::null(), Process::new(), false);
+        assert!(applet.is_pad_interactible);
+        assert!(applet.is_touch_interactible);
+        for (pad, touch) in [(false, true), (false, false), (true, false), (true, true)] {
+            applet.set_interactible_locked(pad, touch);
+            assert_eq!(applet.is_pad_interactible, pad);
+            assert_eq!(applet.is_touch_interactible, touch);
+        }
+    }
 
     #[test]
     fn new_initializes_aruid_and_program_id_from_process() {

@@ -14,6 +14,10 @@ use crate::hle::ipc;
 use crate::hle::result::{ErrorModule, ResultCode};
 use crate::hle::service::hle_ipc::HLERequestContext;
 
+/// Upstream IPC::ResultNotSupported (HIPC description1).
+pub const RESULT_NOT_SUPPORTED: ResultCode =
+    ResultCode::from_module_description(ErrorModule::HIPC, 1);
+
 /// Result code indicating a session has been closed.
 pub const RESULT_SESSION_CLOSED: ResultCode =
     ResultCode::from_module_description(ErrorModule::HIPC, 301);
@@ -658,6 +662,11 @@ mod tests {
         assert!(RESULT_SESSION_CLOSED.is_error());
         assert_eq!(RESULT_SESSION_CLOSED.get_module(), ErrorModule::HIPC);
         assert_eq!(RESULT_SESSION_CLOSED.get_description(), 301);
+    }
+
+    #[test]
+    fn stpl_prerequisite_not_supported_result() {
+        assert_eq!(RESULT_NOT_SUPPORTED.get_inner_value(), 0x20b);
     }
 
     #[test]

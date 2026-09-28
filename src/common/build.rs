@@ -260,6 +260,17 @@ fn build_timestamp(source_date_epoch: Option<&str>) -> String {
 }
 
 fn main() {
+    // Eden's ZBIC variant is separate from the ordinary zstd dependency.
+    let zbic = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("../../externals/zbic");
+    for file in ["bridge.cpp", "vendor/src/zstd.c", "vendor/src/zstd.h", "vendor/src/zstd_errors.h"] {
+        println!("cargo:rerun-if-changed={}", zbic.join(file).display());
+    }
+    cc::Build::new()
+        .cpp(true)
+        .file(zbic.join("bridge.cpp"))
+        .warnings(false) // Unmodified third-party amalgamation, as in Eden.
+        .compile("ruzu_zbic");
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let repository = manifest_dir
         .parent()

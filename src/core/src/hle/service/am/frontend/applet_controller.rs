@@ -323,17 +323,8 @@ impl Controller {
         // `is_complete()` after Execute returns and performs Exit. A graphical
         // frontend invokes it later and must perform upstream's Exit here.
         if !completion.executing.load(Ordering::Acquire) {
-            Self::exit(applet);
+            super::applets::exit(system, applet);
         }
-    }
-
-    fn exit(applet: &Weak<Mutex<Applet>>) {
-        let Some(applet) = applet.upgrade() else {
-            return;
-        };
-        let mut applet = applet.lock().unwrap();
-        applet.is_completed = true;
-        applet.signal_state_changed_event_without_process();
     }
 }
 
@@ -561,7 +552,9 @@ impl FrontendApplet for Controller {
     }
 
     fn request_exit(&mut self) {
+        self.completion.executing.store(true, Ordering::Release);
         self.frontend.close();
+        self.completion.executing.store(false, Ordering::Release);
     }
 
     fn get_library_applet_mode(&self) -> LibraryAppletMode {
@@ -591,7 +584,10 @@ mod tests {
     }
 
     impl crate::frontend::applets::applet::Applet for DeferredControllerApplet {
-        fn close(&self) {}
+        fn close(&self) {
+            let callback = self.callback.lock().unwrap().take();
+            if let Some(callback) = callback { callback(true); }
+        }
     }
 
     impl ControllerApplet for DeferredControllerApplet {
@@ -664,9 +660,13 @@ mod tests {
 
     #[test]
     fn controller_applet_completes_after_deferred_frontend_callback() {
+        for close_during_request in [false, true] {
         let system = System::new();
         let system_ref = SystemRef::from_ref(&system);
         let applet = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), false)));
+        let parent = Arc::new(Mutex::new(Applet::new(system_ref, Process::new(), true)));
+        applet.lock().unwrap().caller_applet = Arc::downgrade(&parent);
+        parent.lock().unwrap().child_applets.push(Arc::clone(&applet));
         let broker = Arc::new(AppletDataBroker::new());
         let callback = Arc::new(Mutex::new(None));
         let frontend: Arc<dyn ControllerApplet> = Arc::new(DeferredControllerApplet {
@@ -704,10 +704,21 @@ mod tests {
         assert!(!controller.is_complete());
         assert!(!applet.lock().unwrap().is_completed);
 
-        callback.lock().unwrap().take().unwrap()(true);
+        if close_during_request {
+            {
+                let guard = applet.lock().unwrap();
+                controller.request_exit();
+                assert!(!guard.is_completed);
+            }
+            super::super::applets::exit(system_ref, &Arc::downgrade(&applet));
+        } else {
+            callback.lock().unwrap().take().unwrap()(true);
+        }
 
         assert!(controller.is_complete());
         assert!(applet.lock().unwrap().is_completed);
+        assert!(parent.lock().unwrap().child_applets.is_empty());
         assert!(broker.get_out_data().pop().is_ok());
+        }
     }
 }

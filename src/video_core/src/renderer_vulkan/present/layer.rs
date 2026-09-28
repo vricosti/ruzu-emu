@@ -8,6 +8,7 @@
 
 use ash::vk;
 use common::math_util::Rectangle;
+use ruzu_core::hle::service::nvnflinger::hwc_layer::{layer_stack_bit, LayerStackId};
 use ruzu_core::hle::service::nvnflinger::pixel_format::PixelFormat as AndroidPixelFormat;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -37,6 +38,12 @@ use ruzu_core::frontend::framebuffer_layout::FramebufferLayout;
 // ---------------------------------------------------------------------------
 // Anonymous namespace helpers (port of file-static functions)
 // ---------------------------------------------------------------------------
+
+// Mechanical extraction of ConfigureDraw's upstream applet predicate so the
+// recording-stack contract can be tested without constructing Vulkan objects.
+fn is_applet_layer(framebuffer: &FramebufferConfig) -> bool {
+    framebuffer.layer_stack_mask & layer_stack_bit(LayerStackId::Recording) == 0
+}
 
 /// Port of anonymous `GetBytesPerPixel` helper.
 fn get_bytes_per_pixel(framebuffer: &FramebufferConfig) -> u32 {
@@ -240,6 +247,7 @@ impl Layer {
             .as_ref()
             .map_or(texture_height, |info| info.scaled_height);
         let use_accelerated = texture_info.is_some();
+        let is_applet = is_applet_layer(framebuffer);
 
         self.refresh_resources(device, framebuffer);
         self.set_anti_alias_pass(device);
@@ -309,6 +317,7 @@ impl Layer {
                 render_extent,
                 crop,
             )),
+            SuperResolutionFilter::Sgsr(_) if is_applet => None,
             SuperResolutionFilter::Sgsr(sgsr) => Some(sgsr.draw(
                 device,
                 scheduler,
@@ -658,6 +667,15 @@ impl Drop for Layer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applet_classification_uses_recording_stack_not_other_stack_bits() {
+        let recording = layer_stack_bit(LayerStackId::Recording);
+        for mask in [0, !recording, recording, u32::MAX] {
+            let framebuffer = FramebufferConfig { layer_stack_mask: mask, ..Default::default() };
+            assert_eq!(is_applet_layer(&framebuffer), mask & recording == 0);
+        }
+    }
 
     fn framebuffer(pixel_format: AndroidPixelFormat) -> FramebufferConfig {
         FramebufferConfig {

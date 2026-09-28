@@ -1,12 +1,26 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/core/internal_network/sockets.h and sockets.cpp (partial)
-//! Socket abstraction layer.
+//! Port of Eden src/core/internal_network/sockets.h and the Socket/transport
+//! portions of network.cpp. Rust keeps those definitions with their declared
+//! socket owner; network.rs owns network initialization and shared types.
 
-#[cfg(unix)]
+#[cfg(windows)]
+use winapi::{shared::ws2def, um::winsock2 as ws};
+
+/// Upstream SocketBase::SOCKET is pointer-sized on Windows and int on Unix.
+#[cfg(windows)]
+pub type NativeSocket = ws::SOCKET;
+#[cfg(not(windows))]
+pub type NativeSocket = i32;
+#[cfg(windows)]
+pub(crate) const INVALID_SOCKET: NativeSocket = ws::INVALID_SOCKET;
+#[cfg(not(windows))]
+pub(crate) const INVALID_SOCKET: NativeSocket = -1;
+
+#[cfg(any(unix, windows))]
 use crate::internal_network::network::get_interrupt_socket;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::internal_network::network::PollEvents as NetworkPollEvents;
 use crate::internal_network::network::{
     Domain, Errno, Protocol, ProxyPacket, ShutdownHow, SockAddrIn, Type,
@@ -53,7 +67,7 @@ pub trait SocketBase: Send + Sync {
     fn is_opened(&self) -> bool;
     fn handle_proxy_packet(&mut self, packet: &ProxyPacket);
 
-    fn get_fd(&self) -> i32;
+    fn get_fd(&self) -> NativeSocket;
 }
 
 /// Accept result.
@@ -77,14 +91,61 @@ impl Default for AcceptResult {
 ///
 /// Corresponds to upstream `Network::Socket`.
 pub struct Socket {
-    fd: i32,
-    // Eden owns this state on every platform. Ruzu's native Windows socket
-    // backend is still pending, so only Unix currently reads it.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    fd: NativeSocket,
     is_non_blocking: bool,
 }
 
-const INVALID_SOCKET: i32 = -1;
+
+/// Convert our SockAddrIn to libc::sockaddr_in.
+#[cfg(windows)]
+fn to_sockaddr_in(addr: &SockAddrIn) -> ws2def::SOCKADDR_IN {
+    let mut native: ws2def::SOCKADDR_IN = unsafe { std::mem::zeroed() };
+    native.sin_family = ws2def::AF_INET as u16;
+    native.sin_port = addr.portno.to_be();
+    unsafe { *native.sin_addr.S_un.S_addr_mut() = u32::from_ne_bytes(addr.ip); }
+    native
+}
+
+#[cfg(windows)]
+fn from_sockaddr_in(addr: &ws2def::SOCKADDR_IN) -> SockAddrIn {
+    SockAddrIn { family: Some(if addr.sin_family == 0 { Domain::Unspecified } else { Domain::INET }), portno: u16::from_be(addr.sin_port),
+        ip: unsafe { *addr.sin_addr.S_un.S_addr() }.to_ne_bytes() }
+}
+
+/// Windows branch of upstream TranslateNativeError(CallType).
+#[cfg(windows)]
+fn translate_windows_error(error: i32, send: bool) -> Errno {
+    match error {
+        0 => Errno::Success,
+        ws::WSAEBADF => Errno::Badf,
+        ws::WSAEINVAL => Errno::Inval,
+        ws::WSAEMFILE => Errno::Mfile,
+        ws::WSAENOTCONN => Errno::Notconn,
+        ws::WSAEWOULDBLOCK => Errno::Again,
+        ws::WSAECONNREFUSED => Errno::Connrefused,
+        ws::WSAECONNABORTED if send => Errno::Pipe,
+        ws::WSAECONNABORTED => Errno::Connaborted,
+        ws::WSAECONNRESET => Errno::Connreset,
+        ws::WSAEHOSTUNREACH => Errno::Hostunreach,
+        ws::WSAENETDOWN => Errno::Netdown,
+        ws::WSAENETUNREACH => Errno::Netunreach,
+        ws::WSAEMSGSIZE => Errno::Msgsize,
+        ws::WSAETIMEDOUT => Errno::Timedout,
+        ws::WSAEINPROGRESS => Errno::Inprogress,
+        ws::WSAEISCONN => Errno::Isconn,
+        _ => { log::warn!("Unimplemented Winsock error {error}"); Errno::Other }
+    }
+}
+
+#[cfg(windows)]
+fn get_last_error() -> Errno {
+    translate_windows_error(unsafe { ws::WSAGetLastError() }, false)
+}
+
+#[cfg(windows)]
+fn get_last_send_error() -> Errno {
+    translate_windows_error(unsafe { ws::WSAGetLastError() }, true)
+}
 
 /// Convert our SockAddrIn to libc::sockaddr_in.
 #[cfg(unix)]
@@ -208,6 +269,63 @@ fn translate_poll_revents(mut revents: i16) -> NetworkPollEvents {
         ($native:ident, $event:ident) => {
             if revents & libc::$native != 0 {
                 revents &= !libc::$native;
+                result.insert(NetworkPollEvents::$event);
+            }
+        };
+    }
+
+    translate!(POLLIN, IN);
+    translate!(POLLPRI, PRI);
+    translate!(POLLOUT, OUT);
+    translate!(POLLERR, ERR);
+    translate!(POLLHUP, HUP);
+    translate!(POLLNVAL, NVAL);
+    translate!(POLLRDNORM, RD_NORM);
+    translate!(POLLRDBAND, RD_BAND);
+    translate!(POLLWRBAND, WR_BAND);
+
+    if revents != 0 {
+        log::warn!("Unhandled host poll revents={revents:#x}");
+    }
+    result
+}
+
+#[cfg(windows)]
+fn translate_poll_events(mut events: NetworkPollEvents) -> i16 {
+    let mut result = 0;
+    macro_rules! translate {
+        ($event:ident, $native:ident) => {
+            if events.contains(NetworkPollEvents::$event) {
+                events.remove(NetworkPollEvents::$event);
+                result |= ws::$native;
+            }
+        };
+    }
+
+    translate!(IN, POLLIN);
+    translate!(PRI, POLLPRI);
+    translate!(OUT, POLLOUT);
+    translate!(ERR, POLLERR);
+    translate!(HUP, POLLHUP);
+    translate!(NVAL, POLLNVAL);
+    translate!(RD_NORM, POLLRDNORM);
+    translate!(RD_BAND, POLLRDBAND);
+    translate!(WR_BAND, POLLWRBAND);
+
+    if !events.is_empty() {
+        log::warn!("Unhandled poll events={:#x}", events.bits());
+    }
+    // WSAPoll rejects other input flags, unlike POSIX poll.
+    result & (ws::POLLRDBAND | ws::POLLRDNORM | ws::POLLWRNORM)
+}
+
+#[cfg(windows)]
+fn translate_poll_revents(mut revents: i16) -> NetworkPollEvents {
+    let mut result = NetworkPollEvents::empty();
+    macro_rules! translate {
+        ($native:ident, $event:ident) => {
+            if revents & ws::$native != 0 {
+                revents &= !ws::$native;
                 result.insert(NetworkPollEvents::$event);
             }
         };
@@ -364,6 +482,25 @@ mod tests {
 }
 
 impl Socket {
+    #[cfg(windows)]
+    fn set_sock_opt<T>(&self, option: i32, value: &T) -> Errno {
+        let result = unsafe { ws::setsockopt(self.fd, ws::SOL_SOCKET, option,
+            (value as *const T).cast(), std::mem::size_of::<T>() as i32) };
+        if result == ws::SOCKET_ERROR { get_last_error() } else { Errno::Success }
+    }
+
+    #[cfg(windows)]
+    fn get_sock_opt<T: Default>(&self, option: i32) -> (T, Errno) {
+        let mut value = T::default();
+        let mut size = std::mem::size_of::<T>() as i32;
+        let result = unsafe { ws::getsockopt(self.fd, ws::SOL_SOCKET, option,
+            (&mut value as *mut T).cast(), &mut size) };
+        if result == ws::SOCKET_ERROR { (value, get_last_error()) } else {
+            assert_eq!(size as usize, std::mem::size_of::<T>());
+            (value, Errno::Success)
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             fd: INVALID_SOCKET,
@@ -371,7 +508,7 @@ impl Socket {
         }
     }
 
-    pub fn from_fd(fd: i32) -> Self {
+    pub fn from_fd(fd: NativeSocket) -> Self {
         Self {
             fd,
             is_non_blocking: false,
@@ -429,6 +566,8 @@ impl Drop for Socket {
         unsafe {
             libc::close(self.fd);
         }
+        #[cfg(windows)]
+        unsafe { ws::closesocket(self.fd); }
         self.fd = INVALID_SOCKET;
     }
 }
@@ -460,7 +599,17 @@ impl SocketBase for Socket {
             }
             return get_last_error();
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let domain = match domain { Domain::Unspecified => 0, Domain::INET => ws2def::AF_INET };
+            let kind = match type_ { Type::Unspecified => 0, Type::STREAM => ws::SOCK_STREAM,
+                Type::DGRAM => ws::SOCK_DGRAM, Type::RAW => ws::SOCK_RAW, Type::SEQPACKET => ws::SOCK_SEQPACKET };
+            let protocol = match protocol { Protocol::Unspecified => 0, Protocol::ICMP => ws2def::IPPROTO_ICMP as i32,
+                Protocol::TCP => ws2def::IPPROTO_TCP as i32, Protocol::UDP => ws2def::IPPROTO_UDP as i32 };
+            self.fd = unsafe { ws::socket(domain, kind, protocol) };
+            if self.fd == INVALID_SOCKET { get_last_error() } else { Errno::Success }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             // TODO: Windows socket creation
             let _ = (domain, type_, protocol);
@@ -473,6 +622,10 @@ impl SocketBase for Socket {
             #[cfg(unix)]
             if unsafe { libc::close(self.fd) } != 0 {
                 log::warn!("close failed, socket may already be closed");
+            }
+            #[cfg(windows)]
+            if unsafe { ws::closesocket(self.fd) } != 0 {
+                log::warn!("closesocket failed, socket may already be closed");
             }
             self.fd = INVALID_SOCKET;
         }
@@ -536,7 +689,24 @@ impl SocketBase for Socket {
                 Errno::Success,
             )
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let mut addr: ws2def::SOCKADDR_IN = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of_val(&addr) as i32;
+            if !self.is_non_blocking {
+                let mut fds = [ws::WSAPOLLFD { fd: self.fd, events: ws::POLLIN, revents: 0 },
+                    ws::WSAPOLLFD { fd: get_interrupt_socket(), events: ws::POLLIN, revents: 0 }];
+                loop {
+                    let result = unsafe { ws::WSAPoll(fds.as_mut_ptr(), 2, -1) };
+                    if fds[1].revents != 0 { return (AcceptResult::default(), Errno::Again); }
+                    if result > 0 { break; }
+                }
+            }
+            let fd = unsafe { ws::accept(self.fd, (&mut addr as *mut ws2def::SOCKADDR_IN).cast(), &mut len) };
+            if fd == INVALID_SOCKET { return (AcceptResult::default(), get_last_error()); }
+            (AcceptResult { socket: Some(Box::new(Socket::from_fd(fd))), sockaddr_in: from_sockaddr_in(&addr) }, Errno::Success)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             (AcceptResult::default(), Errno::Other)
         }
@@ -559,7 +729,14 @@ impl SocketBase for Socket {
                 get_last_error()
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let addr = to_sockaddr_in(&addr_in);
+            if unsafe { ws::connect(self.fd, (&addr as *const ws2def::SOCKADDR_IN).cast(), std::mem::size_of_val(&addr) as i32) } == 0 {
+                Errno::Success
+            } else { get_last_error() }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = addr_in;
             Errno::Other
@@ -583,7 +760,16 @@ impl SocketBase for Socket {
             }
             (from_sockaddr_in(&addr), Errno::Success)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let mut addr: ws2def::SOCKADDR_IN = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of_val(&addr) as i32;
+            if unsafe { ws::getpeername(self.fd, (&mut addr as *mut ws2def::SOCKADDR_IN).cast(), &mut len) } == ws::SOCKET_ERROR {
+                return (SockAddrIn::default(), get_last_error());
+            }
+            (from_sockaddr_in(&addr), Errno::Success)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             (SockAddrIn::default(), Errno::Other)
         }
@@ -606,7 +792,16 @@ impl SocketBase for Socket {
             }
             (from_sockaddr_in(&addr), Errno::Success)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let mut addr: ws2def::SOCKADDR_IN = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of_val(&addr) as i32;
+            if unsafe { ws::getsockname(self.fd, (&mut addr as *mut ws2def::SOCKADDR_IN).cast(), &mut len) } == ws::SOCKET_ERROR {
+                return (SockAddrIn::default(), get_last_error());
+            }
+            (from_sockaddr_in(&addr), Errno::Success)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             (SockAddrIn::default(), Errno::Other)
         }
@@ -629,7 +824,14 @@ impl SocketBase for Socket {
                 get_last_error()
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let addr = to_sockaddr_in(&addr);
+            if unsafe { ws::bind(self.fd, (&addr as *const ws2def::SOCKADDR_IN).cast(), std::mem::size_of_val(&addr) as i32) } == 0 {
+                Errno::Success
+            } else { get_last_error() }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = addr;
             Errno::Other
@@ -645,7 +847,11 @@ impl SocketBase for Socket {
                 get_last_error()
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            if unsafe { ws::listen(self.fd, backlog) } == 0 { Errno::Success } else { get_last_error() }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = backlog;
             Errno::Other
@@ -666,7 +872,12 @@ impl SocketBase for Socket {
                 get_last_error()
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let how = match how { ShutdownHow::RD => ws::SD_RECEIVE, ShutdownHow::WR => ws::SD_SEND, ShutdownHow::RDWR => ws::SD_BOTH };
+            if unsafe { ws::shutdown(self.fd, how) } == 0 { Errno::Success } else { get_last_error() }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = how;
             Errno::Other
@@ -691,7 +902,14 @@ impl SocketBase for Socket {
                 (-1, get_last_error())
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            assert_eq!(flags, 0);
+            assert!(message.len() < i32::MAX as usize);
+            let result = unsafe { ws::recv(self.fd, message.as_mut_ptr().cast(), message.len() as i32, 0) };
+            if result == ws::SOCKET_ERROR { (-1, get_last_error()) } else { (result, Errno::Success) }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (flags, message);
             (-1, Errno::Other)
@@ -737,7 +955,20 @@ impl SocketBase for Socket {
                 (-1, get_last_error())
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            assert_eq!(flags, 0);
+            assert!(message.len() < i32::MAX as usize);
+            let mut native: ws2def::SOCKADDR_IN = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of_val(&native) as i32;
+            let (address, length) = if addr.is_some() { ((&mut native as *mut ws2def::SOCKADDR_IN).cast(), &mut len as *mut i32) }
+                else { (std::ptr::null_mut(), std::ptr::null_mut()) };
+            let result = unsafe { ws::recvfrom(self.fd, message.as_mut_ptr().cast(), message.len() as i32, 0, address, length) };
+            if result == ws::SOCKET_ERROR { return (-1, get_last_error()); }
+            if let Some(addr) = addr { *addr = from_sockaddr_in(&native); }
+            (result, Errno::Success)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (flags, message, addr);
             (-1, Errno::Other)
@@ -762,7 +993,14 @@ impl SocketBase for Socket {
                 (-1, get_last_error())
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            assert_eq!(flags, 0);
+            assert!(message.len() < i32::MAX as usize);
+            let result = unsafe { ws::send(self.fd, message.as_ptr().cast(), message.len() as i32, 0) };
+            if result == ws::SOCKET_ERROR { (-1, get_last_send_error()) } else { (result, Errno::Success) }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (message, flags);
             (-1, Errno::Other)
@@ -800,7 +1038,16 @@ impl SocketBase for Socket {
                 (-1, get_last_error())
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            assert_eq!(flags, 0);
+            let native = addr.map(to_sockaddr_in);
+            let address = native.as_ref().map_or(std::ptr::null(), |a| (a as *const ws2def::SOCKADDR_IN).cast());
+            let len = if native.is_some() { std::mem::size_of::<ws2def::SOCKADDR_IN>() as i32 } else { 0 };
+            let result = unsafe { ws::sendto(self.fd, message.as_ptr().cast(), message.len() as i32, 0, address, len) };
+            if result == ws::SOCKET_ERROR { (-1, get_last_send_error()) } else { (result, Errno::Success) }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (flags, message, addr);
             (-1, Errno::Other)
@@ -816,7 +1063,12 @@ impl SocketBase for Socket {
             };
             self.set_sock_opt(libc::SO_LINGER, &value)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            assert!(linger <= u16::MAX as u32);
+            self.set_sock_opt(ws::SO_LINGER, &ws::LINGER { l_onoff: u16::from(enable), l_linger: linger as u16 })
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (enable, linger);
             Errno::Other
@@ -827,7 +1079,11 @@ impl SocketBase for Socket {
         {
             self.set_sock_opt(libc::SO_REUSEADDR, &u32::from(enable))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.set_sock_opt(ws::SO_REUSEADDR, &u32::from(enable))
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = enable;
             Errno::Other
@@ -838,7 +1094,11 @@ impl SocketBase for Socket {
         {
             self.set_sock_opt(libc::SO_KEEPALIVE, &u32::from(enable))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.set_sock_opt(ws::SO_KEEPALIVE, &u32::from(enable))
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = enable;
             Errno::Other
@@ -849,7 +1109,11 @@ impl SocketBase for Socket {
         {
             self.set_sock_opt(libc::SO_BROADCAST, &u32::from(enable))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.set_sock_opt(ws::SO_BROADCAST, &u32::from(enable))
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = enable;
             Errno::Other
@@ -860,7 +1124,11 @@ impl SocketBase for Socket {
         {
             self.set_sock_opt(libc::SO_SNDBUF, &value)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.set_sock_opt(ws::SO_SNDBUF, &value)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = value;
             Errno::Other
@@ -871,7 +1139,11 @@ impl SocketBase for Socket {
         {
             self.set_sock_opt(libc::SO_RCVBUF, &value)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.set_sock_opt(ws::SO_RCVBUF, &value)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = value;
             Errno::Other
@@ -882,7 +1154,11 @@ impl SocketBase for Socket {
         {
             self.set_sock_opt(libc::SO_SNDTIMEO, &value)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.set_sock_opt(ws::SO_SNDTIMEO, &value)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = value;
             Errno::Other
@@ -893,7 +1169,11 @@ impl SocketBase for Socket {
         {
             self.set_sock_opt(libc::SO_RCVTIMEO, &value)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.set_sock_opt(ws::SO_RCVTIMEO, &value)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = value;
             Errno::Other
@@ -918,7 +1198,15 @@ impl SocketBase for Socket {
             }
             return get_last_error();
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let mut value = u32::from(enable);
+            if unsafe { ws::ioctlsocket(self.fd, ws::FIONBIO, &mut value) } == 0 {
+                self.is_non_blocking = enable;
+                Errno::Success
+            } else { get_last_error() }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = enable;
             Errno::Other
@@ -931,7 +1219,12 @@ impl SocketBase for Socket {
             let (pending_error, get_sock_opt_error) = self.get_sock_opt::<i32>(libc::SO_ERROR);
             (translate_native_error(pending_error), get_sock_opt_error)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let (error, result) = self.get_sock_opt::<i32>(ws::SO_ERROR);
+            (translate_windows_error(error, false), result)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             (Errno::Success, Errno::Other)
         }
@@ -945,7 +1238,7 @@ impl SocketBase for Socket {
         log::warn!("ProxyPacket received, but not in Proxy mode!");
     }
 
-    fn get_fd(&self) -> i32 {
+    fn get_fd(&self) -> NativeSocket {
         self.fd
     }
 }
@@ -978,16 +1271,49 @@ pub fn poll(pollfds: &mut [PollFD], timeout: i32) -> (i32, Errno) {
             return (0, Errno::Success);
         }
 
+        for (i, fd) in fds.iter().take(num).enumerate() {
+            pollfds[i].revents = translate_poll_revents(fd.revents).bits();
+        }
         if result > 0 {
-            for (i, fd) in fds.iter().take(num).enumerate() {
-                pollfds[i].revents = translate_poll_revents(fd.revents).bits();
-            }
             (result, Errno::Success)
         } else {
             (-1, get_last_error())
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let num = pollfds.len();
+        let mut fds: Vec<ws::WSAPOLLFD> = pollfds
+            .iter()
+            .map(|pfd| ws::WSAPOLLFD {
+                fd: pfd.fd,
+                events: translate_poll_events(NetworkPollEvents::from_bits_retain(pfd.events)),
+                revents: 0,
+            })
+            .collect();
+        fds.push(ws::WSAPOLLFD {
+            fd: get_interrupt_socket(),
+            events: ws::POLLIN,
+            revents: 0,
+        });
+
+        let result = unsafe { ws::WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout) };
+
+        if result == 0 {
+            assert!(fds.iter().all(|fd| fd.revents == 0));
+            return (0, Errno::Success);
+        }
+
+        for (i, fd) in fds.iter().take(num).enumerate() {
+            pollfds[i].revents = translate_poll_revents(fd.revents).bits();
+        }
+        if result > 0 {
+            (result, Errno::Success)
+        } else {
+            (-1, get_last_error())
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (pollfds, timeout);
         (0, Errno::Success)
@@ -995,8 +1321,163 @@ pub fn poll(pollfds: &mut [PollFD], timeout: i32) -> (i32, Errno) {
 }
 
 /// Poll file descriptor entry (simplified).
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::internal_network::network::NetworkInstance;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
+
+    fn loopback(portno: u16) -> SockAddrIn {
+        SockAddrIn { family: Some(Domain::INET), ip: [127, 0, 0, 1], portno }
+    }
+
+    #[test]
+    fn windows_blocking_operations_cancel_and_restart() {
+        use crate::internal_network::network::{
+            cancel_pending_socket_operations, restart_socket_operations,
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Cancellation is process-global. Do not interrupt unrelated socket tests.
+        const CHILD: &str = "RUZU_TEST_WINDOWS_SOCKET_CANCELLATION";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "internal_network::sockets::windows_tests::windows_blocking_operations_cancel_and_restart", "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated cancellation test: {status}");
+            return;
+        }
+
+        let _network = NetworkInstance::new();
+        for _ in 0..3 {
+            restart_socket_operations();
+            let mut listener = Socket::new();
+            assert_eq!(listener.initialize(Domain::INET, Type::STREAM, Protocol::TCP), Errno::Success);
+            assert_eq!(listener.bind(loopback(0)), Errno::Success);
+            assert_eq!(listener.listen(1), Errno::Success);
+            let (sender, receiver) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let (accepted, error) = listener.accept();
+                sender.send((accepted.socket.is_none(), error)).unwrap();
+            });
+            assert!(matches!(receiver.recv_timeout(Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)));
+            cancel_pending_socket_operations();
+            assert_eq!(receiver.recv_timeout(Duration::from_secs(3)).unwrap(), (true, Errno::Again));
+            worker.join().unwrap();
+
+            restart_socket_operations();
+            let (sender, receiver) = mpsc::channel();
+            let worker = std::thread::spawn(move || sender.send(poll(&mut [], -1)).unwrap());
+            assert!(matches!(receiver.recv_timeout(Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)));
+            cancel_pending_socket_operations();
+            assert_eq!(receiver.recv_timeout(Duration::from_secs(3)).unwrap(), (1, Errno::Success));
+            worker.join().unwrap();
+        }
+        restart_socket_operations();
+        assert_eq!(poll(&mut [], 0), (0, Errno::Success));
+    }
+
+    #[test]
+    fn native_socket_width_addresses_and_error_mapping_match_winsock() {
+        assert_eq!(std::mem::size_of::<NativeSocket>(), std::mem::size_of::<usize>());
+        let address = loopback(0x1234);
+        let native = to_sockaddr_in(&address);
+        assert_eq!(native.sin_port.to_ne_bytes(), [0x12, 0x34]);
+        assert_eq!(unsafe { *native.sin_addr.S_un.S_addr() }.to_ne_bytes(), address.ip);
+        assert_eq!(from_sockaddr_in(&native).portno, address.portno);
+        assert_eq!(from_sockaddr_in(&native).ip, address.ip);
+        assert_eq!(from_sockaddr_in(&unsafe { std::mem::zeroed() }).family, Some(Domain::Unspecified));
+        assert_eq!(translate_windows_error(ws::WSAECONNABORTED, false), Errno::Connaborted);
+        assert_eq!(translate_windows_error(ws::WSAECONNABORTED, true), Errno::Pipe);
+        assert_eq!(translate_windows_error(ws::WSAEWOULDBLOCK, false), Errno::Again);
+        assert_eq!(translate_windows_error(ws::WSAEISCONN, false), Errno::Isconn);
+        assert_eq!(translate_poll_events(NetworkPollEvents::WR_BAND), 0);
+        assert_eq!(translate_poll_revents(ws::POLLWRBAND), NetworkPollEvents::WR_BAND);
+    }
+
+    #[test]
+    fn windows_tcp_connect_and_accept_transfer_data() {
+        let _network = NetworkInstance::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = Socket::new();
+        assert_eq!(client.initialize(Domain::INET, Type::STREAM, Protocol::TCP), Errno::Success);
+        assert_eq!(client.set_linger(false, 0), Errno::Success);
+        assert_eq!(client.set_keep_alive(true), Errno::Success);
+        assert_eq!(client.set_rcv_timeo(2000), Errno::Success);
+        assert_eq!(client.set_snd_timeo(2000), Errno::Success);
+        assert_eq!(client.connect(loopback(listener.local_addr().unwrap().port())), Errno::Success);
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        assert_eq!(client.get_peer_name().0.portno, listener.local_addr().unwrap().port());
+        assert_eq!(client.send(b"abc", 0), (3, Errno::Success));
+        let mut buf = [0; 3];
+        peer.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"abc");
+        peer.write_all(b"def").unwrap();
+        assert_eq!(client.recv(0, &mut buf), (3, Errno::Success));
+        assert_eq!(&buf, b"def");
+        assert_eq!(client.shutdown(ShutdownHow::WR), Errno::Success);
+        assert_eq!(peer.read(&mut buf).unwrap(), 0);
+        assert_eq!(client.close(), Errno::Success);
+        assert!(!client.is_opened());
+
+        let mut server = Socket::new();
+        assert_eq!(server.initialize(Domain::INET, Type::STREAM, Protocol::TCP), Errno::Success);
+        assert_eq!(server.bind(loopback(0)), Errno::Success);
+        assert_eq!(server.listen(1), Errno::Success);
+        let port = server.get_sock_name().0.portno;
+        let mut peer = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        let (accepted, error) = server.accept();
+        assert_eq!(error, Errno::Success);
+        assert_eq!(accepted.sockaddr_in.portno, peer.local_addr().unwrap().port());
+        let mut accepted = accepted.socket.unwrap();
+        assert_eq!(accepted.set_rcv_timeo(2000), Errno::Success);
+        peer.write_all(b"xyz").unwrap();
+        assert_eq!(accepted.recv(0, &mut buf), (3, Errno::Success));
+        assert_eq!(&buf, b"xyz");
+    }
+
+    #[test]
+    fn windows_udp_poll_nonblocking_and_options() {
+        let _network = NetworkInstance::new();
+        let mut socket = Socket::new();
+        assert_eq!(socket.initialize(Domain::INET, Type::DGRAM, Protocol::UDP), Errno::Success);
+        assert_eq!(socket.set_reuse_addr(true), Errno::Success);
+        assert_eq!(socket.set_broadcast(true), Errno::Success);
+        assert_eq!(socket.set_snd_buf(32768), Errno::Success);
+        assert_eq!(socket.set_rcv_buf(32768), Errno::Success);
+        assert_eq!(socket.set_rcv_timeo(2000), Errno::Success);
+        assert_eq!(socket.bind(loopback(0)), Errno::Success);
+        assert_eq!(socket.get_pending_error(), (Errno::Success, Errno::Success));
+        assert_eq!(socket.set_non_block(true), Errno::Success);
+        let mut data = [0; 4];
+        assert_eq!(socket.recv_from(0, &mut data, None), (-1, Errno::Again));
+        assert_eq!(socket.set_non_block(false), Errno::Success);
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        peer.send_to(b"ping", (std::net::Ipv4Addr::LOCALHOST, socket.get_sock_name().0.portno)).unwrap();
+        let mut fds = [PollFD { fd: socket.get_fd(), events: NetworkPollEvents::IN.bits(), revents: 0 }];
+        let (ready, error) = poll(&mut fds, 2000);
+        assert_eq!(error, Errno::Success);
+        assert!(ready > 0);
+        assert_ne!(fds[0].revents & NetworkPollEvents::IN.bits(), 0);
+        let mut address = SockAddrIn::default();
+        assert_eq!(socket.recv_from(0, &mut data, Some(&mut address)), (4, Errno::Success));
+        assert_eq!(&data, b"ping");
+        assert_eq!(address.portno, peer.local_addr().unwrap().port());
+        assert_eq!(socket.send_to(0, b"pong", Some(&address)), (4, Errno::Success));
+        assert_eq!(peer.recv_from(&mut data).unwrap().0, 4);
+        assert_eq!(&data, b"pong");
+    }
+}
+
+/// Poll file descriptor entry (simplified).
 pub struct PollFD {
-    pub fd: i32,
+    pub fd: NativeSocket,
     pub events: u16,
     pub revents: u16,
 }

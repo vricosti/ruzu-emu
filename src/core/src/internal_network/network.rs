@@ -6,6 +6,8 @@
 
 use bitflags::bitflags;
 use std::net::Ipv4Addr;
+#[cfg(windows)]
+use winapi::um::winsock2 as winsock;
 
 /// IPv4 address as a 4-byte array.
 pub type IPv4Address = [u8; 4];
@@ -160,7 +162,7 @@ bitflags! {
 /// Corresponds to upstream `Network::PollFD`.
 /// Note: upstream uses a SocketBase pointer; here we use a file descriptor.
 pub struct PollFD {
-    pub fd: i32, // Upstream uses SocketBase*; we use fd directly.
+    pub fd: super::sockets::NativeSocket, // Upstream uses SocketBase*; we use fd directly.
     pub events: PollEvents,
     pub revents: PollEvents,
 }
@@ -186,7 +188,7 @@ impl Drop for NetworkInstance {
 }
 
 /// Interrupt pipe for cancelling blocking socket operations.
-/// Upstream uses a pipe fd pair (Unix) or event object (Windows).
+/// Upstream uses a pipe fd pair (Unix) or a UDP socket (Windows).
 #[cfg(unix)]
 struct InterruptPipeState {
     fds: [i32; 2],
@@ -202,9 +204,46 @@ static INTERRUPT_PIPE: std::sync::Mutex<InterruptPipeState> =
         owners: 0,
     });
 
+#[cfg(windows)]
+struct InterruptSocketState {
+    socket: winsock::SOCKET,
+    owners: usize,
+    // Retain the closed handle value for WSAPoll, as upstream does, but never
+    // close it twice: Windows could have reused that value for another socket.
+    cancelled: bool,
+}
+
+#[cfg(windows)]
+static INTERRUPT_SOCKET: std::sync::Mutex<InterruptSocketState> =
+    std::sync::Mutex::new(InterruptSocketState {
+        socket: winsock::INVALID_SOCKET,
+        owners: 0,
+        cancelled: true,
+    });
+
 /// Platform-specific network initialization.
 /// Port of upstream `Network::Initialize`.
 fn initialize() {
+    #[cfg(windows)]
+    {
+        let mut state = INTERRUPT_SOCKET.lock().unwrap();
+        if state.owners == 0 {
+            let mut data = unsafe { std::mem::zeroed() };
+            let result = unsafe { winsock::WSAStartup(0x0202, &mut data) };
+            assert_eq!(result, 0, "Winsock initialization failed");
+            state.socket = unsafe {
+                winsock::socket(winapi::shared::ws2def::AF_INET, winsock::SOCK_DGRAM,
+                    winapi::shared::ws2def::IPPROTO_UDP as i32)
+            };
+            if state.socket == winsock::INVALID_SOCKET {
+                let error = unsafe { winsock::WSAGetLastError() };
+                unsafe { winsock::WSACleanup() };
+                panic!("Failed to create interrupt socket: {error}");
+            }
+            state.cancelled = false;
+        }
+        state.owners += 1;
+    }
     #[cfg(unix)]
     {
         let mut state = INTERRUPT_PIPE.lock().unwrap();
@@ -231,6 +270,23 @@ fn initialize() {
 /// Platform-specific network cleanup.
 /// Port of upstream `Network::Finalize`.
 fn finalize() {
+    #[cfg(windows)]
+    {
+        let mut state = INTERRUPT_SOCKET.lock().unwrap();
+        if state.owners == 0 {
+            return;
+        }
+        state.owners -= 1;
+        if state.owners != 0 {
+            return;
+        }
+        if !state.cancelled {
+            unsafe { winsock::closesocket(state.socket) };
+        }
+        state.socket = winsock::INVALID_SOCKET;
+        state.cancelled = true;
+        unsafe { winsock::WSACleanup() };
+    }
     #[cfg(unix)]
     {
         let mut state = INTERRUPT_PIPE.lock().unwrap();
@@ -259,9 +315,22 @@ pub(crate) fn get_interrupt_socket() -> i32 {
     INTERRUPT_PIPE.lock().unwrap().fds[0]
 }
 
+#[cfg(windows)]
+pub(crate) fn get_interrupt_socket() -> winsock::SOCKET {
+    INTERRUPT_SOCKET.lock().unwrap().socket
+}
+
 /// Cancel pending socket operations by writing to the interrupt pipe.
 /// Port of upstream `Network::CancelPendingSocketOperations`.
 pub fn cancel_pending_socket_operations() {
+    #[cfg(windows)]
+    {
+        let mut state = INTERRUPT_SOCKET.lock().unwrap();
+        if state.owners != 0 && !state.cancelled {
+            unsafe { winsock::closesocket(state.socket) };
+            state.cancelled = true;
+        }
+    }
     #[cfg(unix)]
     {
         let state = INTERRUPT_PIPE.lock().unwrap();
@@ -286,6 +355,19 @@ pub fn cancel_pending_socket_operations() {
 /// Restart socket operations after cancellation.
 /// Port of upstream `Network::RestartSocketOperations`.
 pub fn restart_socket_operations() {
+    #[cfg(windows)]
+    {
+        let mut state = INTERRUPT_SOCKET.lock().unwrap();
+        if state.owners == 0 || !state.cancelled {
+            return;
+        }
+        state.socket = unsafe {
+            winsock::socket(winapi::shared::ws2def::AF_INET, winsock::SOCK_DGRAM,
+                winapi::shared::ws2def::IPPROTO_UDP as i32)
+        };
+        assert_ne!(state.socket, winsock::INVALID_SOCKET, "Failed to recreate interrupt socket");
+        state.cancelled = false;
+    }
     #[cfg(unix)]
     {
         let state = INTERRUPT_PIPE.lock().unwrap();
@@ -308,6 +390,63 @@ pub fn restart_socket_operations() {
                 log::error!("Failed to acknowledge interrupt on shutdown: {error}");
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn winsock_lifecycle_retains_shared_interrupt_and_restarts_after_cancel() {
+        const CHILD: &str = "RUZU_TEST_WINSOCK_LIFECYCLE";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "internal_network::network::windows_tests::winsock_lifecycle_retains_shared_interrupt_and_restarts_after_cancel", "--nocapture"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        fn socket_type(socket: winsock::SOCKET) -> Result<i32, i32> {
+            let mut value = 0i32;
+            let mut size = std::mem::size_of_val(&value) as i32;
+            let result = unsafe { winsock::getsockopt(socket, winsock::SOL_SOCKET,
+                winsock::SO_TYPE, &mut value as *mut i32 as *mut i8, &mut size) };
+            if result == 0 { Ok(value) } else { Err(unsafe { winsock::WSAGetLastError() }) }
+        }
+        assert_eq!(get_interrupt_socket(), winsock::INVALID_SOCKET);
+        cancel_pending_socket_operations();
+        restart_socket_operations();
+        assert_eq!(get_interrupt_socket(), winsock::INVALID_SOCKET);
+        let first = NetworkInstance::new();
+        let second = NetworkInstance::new();
+        let initial = get_interrupt_socket();
+        assert_eq!(socket_type(initial), Ok(winsock::SOCK_DGRAM));
+        restart_socket_operations();
+        assert_eq!(get_interrupt_socket(), initial);
+        drop(first);
+        assert_eq!(socket_type(initial), Ok(winsock::SOCK_DGRAM));
+        cancel_pending_socket_operations();
+        assert_eq!(get_interrupt_socket(), initial);
+        assert_eq!(socket_type(initial), Err(winsock::WSAENOTSOCK));
+        // A new socket may reuse the cancelled handle. Repeated cancellation
+        // must not accidentally close this unrelated socket.
+        let unrelated = unsafe { winsock::socket(winapi::shared::ws2def::AF_INET,
+            winsock::SOCK_DGRAM, winapi::shared::ws2def::IPPROTO_UDP as i32) };
+        assert_ne!(unrelated, winsock::INVALID_SOCKET);
+        cancel_pending_socket_operations();
+        assert_eq!(socket_type(unrelated), Ok(winsock::SOCK_DGRAM));
+        restart_socket_operations();
+        assert_eq!(socket_type(get_interrupt_socket()), Ok(winsock::SOCK_DGRAM));
+        assert_eq!(unsafe { winsock::closesocket(unrelated) }, 0);
+        drop(second);
+        assert_eq!(get_interrupt_socket(), winsock::INVALID_SOCKET);
+        // Reinitialization after the last owner is released is supported.
+        let third = NetworkInstance::new();
+        assert_eq!(socket_type(get_interrupt_socket()), Ok(winsock::SOCK_DGRAM));
+        cancel_pending_socket_operations();
+        drop(third);
+        assert_eq!(get_interrupt_socket(), winsock::INVALID_SOCKET);
     }
 }
 

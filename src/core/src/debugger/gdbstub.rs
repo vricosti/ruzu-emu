@@ -343,7 +343,7 @@ impl GdbStub {
         };
 
         let mut bytes = vec![0; size_usize];
-        if !memory.lock().unwrap().read_block(address, &mut bytes) {
+        if !memory.access().unwrap().read_block(address, &mut bytes) {
             self.send_reply(backend, GDB_STUB_REPLY_ERR);
             return;
         }
@@ -396,7 +396,7 @@ impl GdbStub {
             return;
         };
         if !memory
-            .lock()
+            .access()
             .unwrap()
             .write_block(address, &bytes[..size_usize])
         {
@@ -426,7 +426,7 @@ impl GdbStub {
             return;
         };
         if !memory
-            .lock()
+            .access()
             .unwrap()
             .is_valid_virtual_address_range(address, size)
         {
@@ -436,11 +436,11 @@ impl GdbStub {
 
         let success = match breakpoint_type {
             BreakpointType::Software => {
-                let original_instruction = memory.lock().unwrap().read_32(address);
+                let original_instruction = memory.access().unwrap().read_32(address);
                 self.replaced_instructions
                     .insert(address, original_instruction);
                 memory
-                    .lock()
+                    .access()
                     .unwrap()
                     .write_32(address, self.arch.breakpoint_instruction());
                 crate::arm::debug::invalidate_instruction_cache_range(
@@ -495,7 +495,7 @@ impl GdbStub {
             return;
         };
         if !memory
-            .lock()
+            .access()
             .unwrap()
             .is_valid_virtual_address_range(address, size)
         {
@@ -509,7 +509,7 @@ impl GdbStub {
                     self.replaced_instructions.get(&address).copied()
                 {
                     memory
-                        .lock()
+                        .access()
                         .unwrap()
                         .write_32(address, original_instruction);
                     crate::arm::debug::invalidate_instruction_cache_range(

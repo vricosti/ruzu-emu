@@ -313,7 +313,7 @@ impl ThreadQueueImplForKConditionVariableWaitConditionVariable {
 /// Matches upstream `ReadFromUser(KernelCore&, u32*, KProcessAddress)`.
 fn read_from_user(process_guard: &KProcess, address: u64) -> Option<u32> {
     if let Some(memory) = process_guard.get_memory().as_ref() {
-        Some(memory.lock().unwrap().read_32(address))
+        Some(memory.access().unwrap().read_32(address))
     } else {
         let mem = process_guard.process_memory.read().unwrap();
         if !mem.is_valid_range(address, 4) {
@@ -328,7 +328,7 @@ fn read_from_user(process_guard: &KProcess, address: u64) -> Option<u32> {
 fn write_to_user(process_guard: &KProcess, address: u64, value: u32) -> bool {
     if let Some(memory) = process_guard.get_memory().as_ref() {
         memory
-            .lock()
+            .access()
             .unwrap()
             .write_32_no_rasterizer(address, value);
         true

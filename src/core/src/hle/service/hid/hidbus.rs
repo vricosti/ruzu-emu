@@ -118,7 +118,7 @@ impl HidbusRuntime for DeviceRuntime {
             .get()
             .memory_shared()
             .expect("HID bus application memory");
-        memory.lock().unwrap().write_block(address, bytes);
+        memory.access().unwrap().write_block(address, bytes);
     }
 }
 impl Drop for DeviceRuntime {
@@ -837,7 +837,7 @@ mod tests {
             device_memory.buffer.backing_base_pointer() as usize,
         );
         // Stable boxed backing/page table outlive all accesses through Memory.
-        let memory = Arc::new(StdMutex::new(unsafe {
+        let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
             Memory::new(
                 SystemRef::null(),
                 device_memory.as_ref(),
@@ -845,7 +845,7 @@ mod tests {
             )
         }));
         memory
-            .lock()
+            .lock_mut()
             .unwrap()
             .set_current_page_table(page_table.as_mut(), true);
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));

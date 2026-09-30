@@ -32,7 +32,6 @@ use crate::hle::kernel::svc::svc_results::{
 };
 use crate::hle::kernel::svc_types::THREAD_LOCAL_REGION_SIZE;
 use crate::hle::result::RESULT_SUCCESS;
-use crate::memory::memory::Memory;
 // RBEntry kept for structural parity with upstream m_condvar_arbiter_tree_node.
 // Currently unused: we use BTreeSet externally instead of an intrusive tree.
 
@@ -77,7 +76,7 @@ pub fn get_current_process() -> Option<Arc<ProcessLock>> {
 /// Return the memory owned by the current emulated thread's process.
 ///
 /// Upstream: `GetCurrentMemory(KernelCore&)` in `k_thread.cpp`.
-pub fn get_current_memory() -> Option<Arc<Mutex<Memory>>> {
+pub fn get_current_memory() -> Option<Arc<crate::memory::memory::SharedMemory>> {
     let process = get_current_process_pointer()?;
     let process = process.lock().ok()?;
     process.get_memory()
@@ -1011,7 +1010,7 @@ impl KThread {
         if let Some(parent) = self.parent.as_ref().and_then(|w| w.upgrade()) {
             let memory = parent.lock().unwrap().get_memory();
             memory
-                .map(|memory| memory.lock().unwrap().read_16(addr))
+                .map(|memory| memory.access().unwrap().read_16(addr))
                 .unwrap_or(0)
         } else {
             0
@@ -1033,7 +1032,7 @@ impl KThread {
 
         if let Some(parent) = self.parent.as_ref().and_then(|w| w.upgrade()) {
             if let Some(memory) = parent.lock().unwrap().get_memory() {
-                memory.lock().unwrap().write_16(addr, 1);
+                memory.access().unwrap().write_16(addr, 1);
             }
         }
     }
@@ -1053,7 +1052,7 @@ impl KThread {
 
         if let Some(parent) = self.parent.as_ref().and_then(|w| w.upgrade()) {
             if let Some(memory) = parent.lock().unwrap().get_memory() {
-                memory.lock().unwrap().write_16(addr, 0);
+                memory.access().unwrap().write_16(addr, 0);
             }
         }
     }
@@ -2186,7 +2185,7 @@ impl KThread {
             if let Some(memory) = parent.lock().unwrap().get_memory() {
                 let zero_tls = [0u8; THREAD_LOCAL_REGION_SIZE];
                 memory
-                    .lock()
+                    .access()
                     .unwrap()
                     .write_block(tls_address.get(), &zero_tls);
             }
@@ -4330,7 +4329,7 @@ mod tests {
                 .as_mut()
                 .expect("test page table backend must be initialized");
             memory
-                .lock()
+                .lock_mut()
                 .unwrap()
                 .set_current_page_table(impl_page_table.as_mut() as *mut _, true);
         }
@@ -4340,11 +4339,11 @@ mod tests {
             .get_memory()
             .expect("test process must own upstream-shaped Memory");
         memory
-            .lock()
+            .access()
             .unwrap()
             .write_16(tls_address + THREAD_LOCAL_DISABLE_COUNT_OFFSET, 3);
         memory
-            .lock()
+            .access()
             .unwrap()
             .write_16(tls_address + THREAD_LOCAL_INTERRUPT_FLAG_OFFSET, 0);
 
@@ -4371,7 +4370,7 @@ mod tests {
         thread.set_interrupt_flag();
         assert_eq!(
             memory
-                .lock()
+                .access()
                 .unwrap()
                 .read_16(tls_address + THREAD_LOCAL_INTERRUPT_FLAG_OFFSET),
             1
@@ -4390,7 +4389,7 @@ mod tests {
         thread.clear_interrupt_flag();
         assert_eq!(
             memory
-                .lock()
+                .access()
                 .unwrap()
                 .read_16(tls_address + THREAD_LOCAL_INTERRUPT_FLAG_OFFSET),
             0

@@ -5,8 +5,7 @@
 //! Dynarmic exclusive monitor implementation wrapping rdynarmic::ExclusiveMonitor.
 
 use crate::arm::exclusive_monitor::{ExclusiveMonitor, VAddr};
-use crate::memory::memory::Memory;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Dynarmic-backed exclusive monitor.
 ///
@@ -15,14 +14,14 @@ use std::sync::{Arc, Mutex};
 /// the actual memory operations in the read/write callbacks.
 pub struct DynarmicExclusiveMonitor {
     monitor: rdynarmic::ExclusiveMonitor,
-    memory: Arc<Mutex<Memory>>,
+    memory: Arc<crate::memory::memory::SharedMemory>,
 }
 
 impl DynarmicExclusiveMonitor {
     /// Create a new DynarmicExclusiveMonitor.
     ///
     /// Upstream: `DynarmicExclusiveMonitor(Memory::Memory& memory, size_t core_count)`
-    pub fn new(memory: Arc<Mutex<Memory>>, core_count: usize) -> Self {
+    pub fn new(memory: Arc<crate::memory::memory::SharedMemory>, core_count: usize) -> Self {
         Self {
             monitor: rdynarmic::ExclusiveMonitor::new(core_count),
             memory,
@@ -39,31 +38,31 @@ impl ExclusiveMonitor for DynarmicExclusiveMonitor {
     fn exclusive_read8(&mut self, core_index: usize, addr: VAddr) -> u8 {
         let mem = self.memory.clone();
         self.monitor
-            .read_and_mark(core_index, addr, || mem.lock().unwrap().read_8(addr))
+            .read_and_mark(core_index, addr, || mem.access().unwrap().read_8(addr))
     }
 
     fn exclusive_read16(&mut self, core_index: usize, addr: VAddr) -> u16 {
         let mem = self.memory.clone();
         self.monitor
-            .read_and_mark(core_index, addr, || mem.lock().unwrap().read_16(addr))
+            .read_and_mark(core_index, addr, || mem.access().unwrap().read_16(addr))
     }
 
     fn exclusive_read32(&mut self, core_index: usize, addr: VAddr) -> u32 {
         let mem = self.memory.clone();
         self.monitor
-            .read_and_mark(core_index, addr, || mem.lock().unwrap().read_32(addr))
+            .read_and_mark(core_index, addr, || mem.access().unwrap().read_32(addr))
     }
 
     fn exclusive_read64(&mut self, core_index: usize, addr: VAddr) -> u64 {
         let mem = self.memory.clone();
         self.monitor
-            .read_and_mark(core_index, addr, || mem.lock().unwrap().read_64(addr))
+            .read_and_mark(core_index, addr, || mem.access().unwrap().read_64(addr))
     }
 
     fn exclusive_read128(&mut self, core_index: usize, addr: VAddr) -> u128 {
         let mem = self.memory.clone();
         self.monitor.read_and_mark(core_index, addr, || {
-            let m = mem.lock().unwrap();
+            let m = mem.access().unwrap();
             let lo = m.read_64(addr) as u128;
             let hi = m.read_64(addr + 8) as u128;
             (hi << 64) | lo
@@ -78,7 +77,7 @@ impl ExclusiveMonitor for DynarmicExclusiveMonitor {
         let mem = self.memory.clone();
         self.monitor
             .do_exclusive_operation(core_index, vaddr, |expected: u8| {
-                mem.lock()
+                mem.access()
                     .unwrap()
                     .write_exclusive_8(vaddr, value, expected)
             })
@@ -88,7 +87,7 @@ impl ExclusiveMonitor for DynarmicExclusiveMonitor {
         let mem = self.memory.clone();
         self.monitor
             .do_exclusive_operation(core_index, vaddr, |expected: u16| {
-                mem.lock()
+                mem.access()
                     .unwrap()
                     .write_exclusive_16(vaddr, value, expected)
             })
@@ -98,7 +97,7 @@ impl ExclusiveMonitor for DynarmicExclusiveMonitor {
         let mem = self.memory.clone();
         self.monitor
             .do_exclusive_operation(core_index, vaddr, |expected: u32| {
-                mem.lock()
+                mem.access()
                     .unwrap()
                     .write_exclusive_32(vaddr, value, expected)
             })
@@ -108,7 +107,7 @@ impl ExclusiveMonitor for DynarmicExclusiveMonitor {
         let mem = self.memory.clone();
         self.monitor
             .do_exclusive_operation(core_index, vaddr, |expected: u64| {
-                mem.lock()
+                mem.access()
                     .unwrap()
                     .write_exclusive_64(vaddr, value, expected)
             })
@@ -122,7 +121,7 @@ impl ExclusiveMonitor for DynarmicExclusiveMonitor {
                 let value_hi = (value >> 64) as u64;
                 let expected_lo = expected as u64;
                 let expected_hi = (expected >> 64) as u64;
-                mem.lock().unwrap().write_exclusive_128(
+                mem.access().unwrap().write_exclusive_128(
                     vaddr,
                     value_lo,
                     value_hi,

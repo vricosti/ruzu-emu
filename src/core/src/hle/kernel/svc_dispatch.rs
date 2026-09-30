@@ -869,7 +869,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 {
                     let process = process_arc.lock().unwrap();
                     if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
-                        let mem = memory.lock().unwrap();
+                        let mem = memory.access().unwrap();
                         let current = mem.read_32(mutex_addr);
                         // Only OR if there's a holder (low 28 bits nonzero) and
                         // WAIT_MASK isn't already set.
@@ -3365,7 +3365,7 @@ fn maybe_dump_process_memory(system: &System, tid: i64) {
             break;
         }
         // Read the block contents in 4KB chunks.
-        let mem = memory.lock().unwrap();
+        let mem = memory.access().unwrap();
         let mut buf = vec![0u8; 4096];
         let mut off = 0usize;
         while off < size {

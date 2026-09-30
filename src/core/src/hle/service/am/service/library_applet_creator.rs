@@ -481,7 +481,7 @@ impl ILibraryAppletCreator {
         ctx: &HLERequestContext,
         handle: u32,
     ) -> Option<(
-        Arc<Mutex<crate::memory::memory::Memory>>,
+        Arc<crate::memory::memory::SharedMemory>,
         Arc<Mutex<crate::hle::kernel::k_transfer_memory::KTransferMemory>>,
         u64,
     )> {

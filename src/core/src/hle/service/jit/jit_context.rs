@@ -22,7 +22,6 @@ use rdynarmic::interface::a64::config::{
 use rdynarmic::A64Jit;
 use rdynarmic::HaltReason;
 
-use crate::memory::memory::Memory;
 
 const SVC0_ARM64: [u8; 8] = [
     0x01, 0x00, 0x00, 0xD4, // svc #0
@@ -133,7 +132,7 @@ impl CodePageCache {
 }
 
 struct DynarmicCallbacks64 {
-    memory: Option<Arc<Mutex<Memory>>>,
+    memory: Option<Arc<crate::memory::memory::SharedMemory>>,
     state: Arc<Mutex<ContextState>>,
     code_page: Mutex<CodePageCache>,
     halt_reason: Option<*const AtomicU32>,
@@ -145,7 +144,7 @@ struct DynarmicCallbacks64 {
 unsafe impl Send for DynarmicCallbacks64 {}
 
 impl DynarmicCallbacks64 {
-    fn new(memory: Option<Arc<Mutex<Memory>>>, state: Arc<Mutex<ContextState>>) -> Self {
+    fn new(memory: Option<Arc<crate::memory::memory::SharedMemory>>, state: Arc<Mutex<ContextState>>) -> Self {
         Self {
             memory,
             state,
@@ -159,7 +158,7 @@ impl DynarmicCallbacks64 {
         let is_process_address = self.state.lock().unwrap().is_process_address(address);
         if is_process_address {
             if let Some(memory) = self.memory.as_ref() {
-                memory.lock().unwrap().read_block(address, output);
+                memory.access().unwrap().read_block(address, output);
             } else {
                 log::error!("JIT plugin: mapped read without process memory at {address:#016x}");
             }
@@ -182,7 +181,7 @@ impl DynarmicCallbacks64 {
         let is_process_address = self.state.lock().unwrap().is_process_address(address);
         if is_process_address {
             if let Some(memory) = self.memory.as_ref() {
-                memory.lock().unwrap().write_block(address, input);
+                memory.access().unwrap().write_block(address, input);
             } else {
                 log::error!("JIT plugin: mapped write without process memory at {address:#016x}");
             }
@@ -422,11 +421,11 @@ pub struct JitContext {
 unsafe impl Send for JitContext {}
 
 impl JitContext {
-    pub fn new(memory: Arc<Mutex<Memory>>) -> Result<Self, String> {
+    pub fn new(memory: Arc<crate::memory::memory::SharedMemory>) -> Result<Self, String> {
         Self::new_impl(Some(memory))
     }
 
-    fn new_impl(memory: Option<Arc<Mutex<Memory>>>) -> Result<Self, String> {
+    fn new_impl(memory: Option<Arc<crate::memory::memory::SharedMemory>>) -> Result<Self, String> {
         let state = Arc::new(Mutex::new(ContextState::new()));
         let callbacks = DynarmicCallbacks64::new(memory, Arc::clone(&state));
         let jit = A64Jit::new(A64UserConfig::new(Box::new(callbacks)))?;

@@ -104,7 +104,7 @@ impl VmCallbacks for StandardVmCallbacks {
             data.fill(0);
             return;
         };
-        let memory = memory.lock().unwrap();
+        let memory = memory.access().unwrap();
         if !memory.is_valid_virtual_address(address) {
             data.fill(0);
             return;
@@ -122,7 +122,7 @@ impl VmCallbacks for StandardVmCallbacks {
         let Some(memory) = process.lock().unwrap().get_memory() else {
             return;
         };
-        let memory = memory.lock().unwrap();
+        let memory = memory.access().unwrap();
         if !memory.is_valid_virtual_address(address) {
             return;
         }

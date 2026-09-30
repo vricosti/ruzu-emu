@@ -7,7 +7,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::memory::memory::Memory;
 
 /// Type alias for virtual addresses.
 pub type VAddr = u64;
@@ -31,13 +30,13 @@ pub struct Entry {
 /// memory locations.
 ///
 /// Corresponds to upstream `Tools::Freezer`.
-/// Upstream stores `CoreTiming&` and `Memory&`. We store `Arc<Mutex<Memory>>`.
+/// Upstream stores `CoreTiming&` and `Memory&`. We store `Arc<crate::memory::memory::SharedMemory>`.
 /// CoreTiming event scheduling is replaced with a simple active flag — the caller
 /// (typically the debug UI) triggers frame_callback periodically.
 pub struct Freezer {
     active: AtomicBool,
     entries: Mutex<Vec<Entry>>,
-    memory: Option<Arc<Mutex<Memory>>>,
+    memory: Option<Arc<crate::memory::memory::SharedMemory>>,
 }
 
 impl Freezer {
@@ -53,7 +52,7 @@ impl Freezer {
     }
 
     /// Create a new Freezer with a memory reference.
-    pub fn with_memory(memory: Arc<Mutex<Memory>>) -> Self {
+    pub fn with_memory(memory: Arc<crate::memory::memory::SharedMemory>) -> Self {
         Self {
             active: AtomicBool::new(false),
             entries: Mutex::new(Vec::new()),
@@ -62,7 +61,7 @@ impl Freezer {
     }
 
     /// Set the memory reference.
-    pub fn set_memory(&mut self, memory: Arc<Mutex<Memory>>) {
+    pub fn set_memory(&mut self, memory: Arc<crate::memory::memory::SharedMemory>) {
         self.memory = Some(memory);
     }
 
@@ -216,7 +215,7 @@ impl Freezer {
         let Some(ref memory) = self.memory else {
             return 0;
         };
-        let mem = memory.lock().unwrap();
+        let mem = memory.access().unwrap();
         match width {
             1 => mem.read_8(addr) as u64,
             2 => mem.read_16(addr) as u64,
@@ -235,7 +234,7 @@ impl Freezer {
         let Some(ref memory) = self.memory else {
             return;
         };
-        let mem = memory.lock().unwrap();
+        let mem = memory.access().unwrap();
         match width {
             1 => mem.write_8(addr, value as u8),
             2 => mem.write_16(addr, value as u16),

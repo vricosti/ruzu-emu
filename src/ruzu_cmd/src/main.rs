@@ -1105,10 +1105,10 @@ fn main() {
             std::sync::Arc::new(std::sync::OnceLock::new());
         fn memory_raw_of(
             cell: &std::sync::OnceLock<usize>,
-            memory: &std::sync::Arc<std::sync::Mutex<ruzu_core::memory::memory::Memory>>,
+            memory: &std::sync::Arc<ruzu_core::memory::memory::SharedMemory>,
         ) -> *const ruzu_core::memory::memory::Memory {
             *cell.get_or_init(|| {
-                let guard = memory.lock().unwrap();
+                let guard = memory.access().unwrap();
                 &*guard as *const ruzu_core::memory::memory::Memory as usize
             }) as *const ruzu_core::memory::memory::Memory
         }

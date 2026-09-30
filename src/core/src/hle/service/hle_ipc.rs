@@ -724,7 +724,7 @@ pub struct HLERequestContext {
     /// The requesting thread. Matches upstream `KThread* thread`.
     thread: Option<Arc<KThreadLock>>,
     /// Guest memory bridge. Matches upstream `Core::Memory::Memory& memory`.
-    memory: Option<Arc<std::sync::Mutex<crate::memory::memory::Memory>>>,
+    memory: Option<Arc<crate::memory::memory::SharedMemory>>,
     /// Non-owning system owner obtained from upstream's `KernelCore& kernel`.
     system: SystemRef,
     /// TLS address for command buffer read/write.
@@ -769,7 +769,7 @@ pub struct HLERequestContext {
 impl HLERequestContext {
     fn owner_process_memory(
         thread: &Arc<KThreadLock>,
-    ) -> Option<Arc<std::sync::Mutex<crate::memory::memory::Memory>>> {
+    ) -> Option<Arc<crate::memory::memory::SharedMemory>> {
         let parent = {
             let thread_guard = thread.lock().unwrap();
             thread_guard.parent.as_ref()?.clone()
@@ -999,7 +999,7 @@ impl HLERequestContext {
 
     /// Set the Memory bridge for TLS reads/writes.
     /// Matches upstream `Core::Memory::Memory& memory` passed to the HLERequestContext constructor.
-    pub fn set_memory(&mut self, memory: Arc<std::sync::Mutex<crate::memory::memory::Memory>>) {
+    pub fn set_memory(&mut self, memory: Arc<crate::memory::memory::SharedMemory>) {
         self.memory = Some(memory);
     }
 
@@ -1383,7 +1383,7 @@ impl HLERequestContext {
     /// Returns a reference to the Memory bridge.
     ///
     /// Matches upstream `Core::Memory::Memory& GetMemory() const`.
-    pub fn get_memory(&self) -> Option<&Arc<std::sync::Mutex<crate::memory::memory::Memory>>> {
+    pub fn get_memory(&self) -> Option<&Arc<crate::memory::memory::SharedMemory>> {
         self.memory.as_ref()
     }
 
@@ -1537,7 +1537,7 @@ impl HLERequestContext {
         }
         let mut buf = vec![0u8; size];
         if let Some(ref memory) = self.memory {
-            let accessible = memory.lock().unwrap().read_block_checked(address, &mut buf);
+            let accessible = memory.access().unwrap().read_block_checked(address, &mut buf);
             if accessible {
                 return buf;
             }
@@ -1580,7 +1580,7 @@ impl HLERequestContext {
             // a rasterizer-bypassing path. Use the checked variant so
             // protected host pages report EFAULT instead of SIGSEGV while
             // preserving WriteBlock's rasterizer-write side effect.
-            let accessible = memory.lock().unwrap().write_block_checked(address, data);
+            let accessible = memory.access().unwrap().write_block_checked(address, data);
             if accessible {
                 return;
             }
@@ -1627,7 +1627,7 @@ impl HLERequestContext {
                 self.cmd_buf[len..].fill(0);
             }
         } else if let Some(ref memory) = self.memory {
-            let m = memory.lock().unwrap();
+            let m = memory.access().unwrap();
             for i in 0..ipc::COMMAND_BUFFER_LENGTH {
                 self.cmd_buf[i] = m.read_32(self.tls_address + (i as u64 * 4));
             }
@@ -1785,7 +1785,7 @@ impl HLERequestContext {
                         }
                     }
                     if let Some(ref memory) = self.memory {
-                        let m = memory.lock().unwrap();
+                        let m = memory.access().unwrap();
                         for i in 0..pad_count {
                             m.write_32_no_rasterizer(
                                 self.tls_address + ((index + i) as u64 * 4),
@@ -2001,7 +2001,7 @@ impl HLERequestContext {
         }
 
         if let Some(ref memory) = self.memory {
-            let m = memory.lock().unwrap();
+            let m = memory.access().unwrap();
             for i in 0..write_words {
                 m.write_32_no_rasterizer(self.tls_address + (i as u64 * 4), self.cmd_buf[i]);
             }
@@ -2139,7 +2139,7 @@ mod tests {
     struct MappedTestMemory {
         _device_memory: Box<DeviceMemory>,
         _page_table: Box<PageTable>,
-        memory: Arc<Mutex<Memory>>,
+        memory: Arc<crate::memory::memory::SharedMemory>,
     }
 
     impl MappedTestMemory {
@@ -2149,7 +2149,7 @@ mod tests {
 
             let device_memory = Box::new(DeviceMemory::new());
             let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
-            let memory = Arc::new(Mutex::new(unsafe {
+            let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
                 Memory::new(
                     SystemRef::null(),
                     device_memory.as_ref() as *const _,
@@ -2172,7 +2172,7 @@ mod tests {
             }
 
             memory
-                .lock()
+                .lock_mut()
                 .unwrap()
                 .set_current_page_table(page_table.as_mut() as *mut PageTable, true);
 
@@ -2257,7 +2257,7 @@ mod tests {
             .page_table
             .set_memory(memory.clone());
 
-        memory.lock().unwrap().write_8(0x3000, 0x7a);
+        memory.access().unwrap().write_8(0x3000, 0x7a);
 
         let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
@@ -2286,7 +2286,7 @@ mod tests {
         ctx.write_guest_memory(0x3000, &[0x11, 0x22, 0x33, 0x44]);
 
         let mut out = [0u8; 4];
-        memory.lock().unwrap().read_block(0x3000, &mut out);
+        memory.access().unwrap().read_block(0x3000, &mut out);
         assert_eq!(out, [0x11, 0x22, 0x33, 0x44]);
     }
 
@@ -2319,11 +2319,11 @@ mod tests {
         assert_eq!(ctx.write_buffer(&[0xaa, 0xbb, 0xcc, 0xdd], 0), 2);
 
         let mut b_out = [0u8; 4];
-        memory.lock().unwrap().read_block(0x3000, &mut b_out);
+        memory.access().unwrap().read_block(0x3000, &mut b_out);
         assert_eq!(b_out, [0xaa, 0xbb, 0, 0]);
 
         let mut c_out = [0u8; 4];
-        memory.lock().unwrap().read_block(0x3010, &mut c_out);
+        memory.access().unwrap().read_block(0x3010, &mut c_out);
         assert_eq!(c_out, [0, 0, 0, 0]);
     }
 
@@ -2351,7 +2351,7 @@ mod tests {
         let thread = Arc::new(KThreadLock::new(KThread::new()));
         thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
 
-        memory.lock().unwrap().write_block(0x3000, &[0xFF; 16]);
+        memory.access().unwrap().write_block(0x3000, &[0xFF; 16]);
 
         let mut ctx = HLERequestContext::new_with_thread(thread, 0x2000);
         ctx.buffer_b_descriptors = vec![ipc::BufferDescriptorABW {
@@ -2369,7 +2369,7 @@ mod tests {
         out_storage.write_back(&ctx, 0, 0);
 
         let mut out_bytes = [0xFFu8; 16];
-        memory.lock().unwrap().read_block(0x3000, &mut out_bytes);
+        memory.access().unwrap().read_block(0x3000, &mut out_bytes);
         assert_eq!(out_bytes, [0; 16]);
     }
 
@@ -2436,7 +2436,7 @@ mod tests {
 
         let tls_address = 0x3000u64;
         memory
-            .lock()
+            .access()
             .unwrap()
             .write_32(tls_address + 16, 0xdead_beef);
 
@@ -2453,7 +2453,7 @@ mod tests {
 
         assert_eq!(ctx.write_to_outgoing_command_buffer(), RESULT_SUCCESS);
 
-        let m = memory.lock().unwrap();
+        let m = memory.access().unwrap();
         assert_eq!(m.read_32(tls_address), 0x1111_1111);
         assert_eq!(m.read_32(tls_address + 4), 0x2222_2222);
         assert_eq!(m.read_32(tls_address + 8), 0x3333_3333);
@@ -2616,7 +2616,7 @@ mod tests {
             0,
         ];
         {
-            let mem = memory.lock().unwrap();
+            let mem = memory.access().unwrap();
             for (i, word) in request_words.iter().copied().enumerate() {
                 mem.write_32(tls_address + (i as u64 * 4), word);
             }
@@ -2637,7 +2637,7 @@ mod tests {
 
         assert_eq!(complete_sync_request(&manager, &mut ctx), RESULT_SUCCESS);
 
-        let mem = memory.lock().unwrap();
+        let mem = memory.access().unwrap();
         for (i, word) in request_words.iter().copied().enumerate() {
             assert_eq!(mem.read_32(tls_address + (i as u64 * 4)), word);
         }

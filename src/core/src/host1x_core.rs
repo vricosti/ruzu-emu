@@ -5,9 +5,8 @@
 //! frontend-provided Host1x implementation without depending on `video_core`.
 
 use std::any::Any;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::memory::memory::Memory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host1xChannelType {
@@ -51,7 +50,7 @@ pub trait Host1xCoreInterface: Any + Send + Sync {
     /// `DeviceMemoryManager<Traits>::registered_processes`. Rust passes the
     /// process `Memory` owner through the opaque Host1x bridge so video_core
     /// can keep the same per-ASID memory association.
-    fn smmu_register_process(&self, memory: Option<Arc<Mutex<Memory>>>) -> u32;
+    fn smmu_register_process(&self, memory: Option<Arc<crate::memory::memory::SharedMemory>>) -> u32;
 
     /// Unregister a process ASID previously returned by
     /// `smmu_register_process`, mirroring upstream

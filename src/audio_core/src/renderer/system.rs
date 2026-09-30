@@ -417,7 +417,7 @@ impl System {
         self.set_process(process);
         let transfer_memory_source_address = unsafe { (*transfer_memory).get_source_address() };
         if let Some(memory) = self.core.get().get_svc_memory() {
-            memory.lock().unwrap().zero_block(
+            memory.access().unwrap().zero_block(
                 transfer_memory_source_address,
                 transfer_memory_size as usize,
             );

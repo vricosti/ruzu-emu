@@ -13,7 +13,7 @@ use log::{error, warn};
 use std::fmt::Write;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 static MIX_BUFFER_CLIP_LOGS: AtomicU64 = AtomicU64::new(0);
 
@@ -27,7 +27,7 @@ struct MixBufferTraceStats {
 }
 
 #[derive(Clone, Default)]
-pub struct MemoryHandle(Option<Arc<Mutex<ruzu_core::memory::memory::Memory>>>);
+pub struct MemoryHandle(Option<Arc<ruzu_core::memory::memory::SharedMemory>>);
 
 impl MemoryHandle {
     fn from_process(process: *mut ()) -> Self {
@@ -48,7 +48,7 @@ impl MemoryHandle {
             #[cfg(not(test))]
             return false;
         };
-        memory.lock().unwrap().read_block_checked(address, dest)
+        memory.access().unwrap().read_block_checked(address, dest)
     }
 
     pub(crate) fn write_block(&self, address: u64, src: &[u8]) -> bool {
@@ -61,7 +61,7 @@ impl MemoryHandle {
             #[cfg(not(test))]
             return false;
         };
-        memory.lock().unwrap().write_block(address, src)
+        memory.access().unwrap().write_block(address, src)
     }
 
     #[cfg(test)]
@@ -70,7 +70,7 @@ impl MemoryHandle {
     }
 
     #[cfg(test)]
-    fn points_to(&self, memory: &Arc<Mutex<ruzu_core::memory::memory::Memory>>) -> bool {
+    fn points_to(&self, memory: &Arc<ruzu_core::memory::memory::SharedMemory>) -> bool {
         self.0
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, memory))
@@ -661,10 +661,10 @@ mod tests {
 
         let device_a = Box::new(DeviceMemory::with_size(0x20_000));
         let device_b = Box::new(DeviceMemory::with_size(0x20_000));
-        let memory_a = Arc::new(std::sync::Mutex::new(unsafe {
+        let memory_a = Arc::new(ruzu_core::memory::memory::SharedMemory::new(unsafe {
             Memory::new(system, &*device_a, &device_a.buffer)
         }));
-        let memory_b = Arc::new(std::sync::Mutex::new(unsafe {
+        let memory_b = Arc::new(ruzu_core::memory::memory::SharedMemory::new(unsafe {
             Memory::new(system, &*device_b, &device_b.buffer)
         }));
         let mut process_a = Box::new(KProcess::new());

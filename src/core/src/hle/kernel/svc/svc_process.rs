@@ -107,7 +107,7 @@ pub fn get_process_list(
         // Write the process ID to guest memory.
         drop(process);
         if let Some(memory) = system.get_svc_memory() {
-            let m = memory.lock().unwrap();
+            let m = memory.access().unwrap();
             m.write_64(out_process_ids, process_id);
         } else {
             let mut mem = system.shared_process_memory().write().unwrap();

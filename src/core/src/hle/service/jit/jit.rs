@@ -413,7 +413,7 @@ impl IJitEnvironment {
 
         let mut data = vec![0; size];
         if let Some(memory) = ctx.get_memory() {
-            memory.lock().unwrap().read_block(address, &mut data);
+            memory.access().unwrap().read_block(address, &mut data);
         }
         data
     }

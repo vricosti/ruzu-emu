@@ -7,7 +7,6 @@
 use super::am_results;
 use crate::hle::kernel::k_transfer_memory::KTransferMemory;
 use crate::hle::result::{ResultCode, RESULT_UNKNOWN};
-use crate::memory::memory::Memory;
 use std::sync::{Arc, Mutex};
 
 fn validate_offset(offset: i64, size: usize, data_size: usize) -> Result<(), ResultCode> {
@@ -77,7 +76,7 @@ pub fn create_storage(data: Vec<u8>) -> Box<dyn LibraryAppletStorage> {
 
 /// Port of upstream `TransferMemoryLibraryAppletStorage`.
 pub struct TransferMemoryLibraryAppletStorage {
-    memory: Arc<Mutex<Memory>>,
+    memory: Arc<crate::memory::memory::SharedMemory>,
     transfer_memory: Arc<Mutex<KTransferMemory>>,
     object_id: u64,
     is_writable: bool,
@@ -86,7 +85,7 @@ pub struct TransferMemoryLibraryAppletStorage {
 
 impl TransferMemoryLibraryAppletStorage {
     pub fn new(
-        memory: Arc<Mutex<Memory>>,
+        memory: Arc<crate::memory::memory::SharedMemory>,
         transfer_memory: Arc<Mutex<KTransferMemory>>,
         object_id: u64,
         is_writable: bool,
@@ -110,7 +109,7 @@ impl LibraryAppletStorage for TransferMemoryLibraryAppletStorage {
     fn read(&self, offset: i64, buffer: &mut [u8]) -> Result<(), ResultCode> {
         validate_offset(offset, buffer.len(), self.size as usize)?;
         self.memory
-            .lock()
+            .access()
             .unwrap()
             .read_block(self.source_address() + offset as u64, buffer);
         Ok(())
@@ -122,7 +121,7 @@ impl LibraryAppletStorage for TransferMemoryLibraryAppletStorage {
         }
         validate_offset(offset, buffer.len(), self.size as usize)?;
         self.memory
-            .lock()
+            .access()
             .unwrap()
             .write_block(self.source_address() + offset as u64, buffer);
         Ok(())
@@ -140,7 +139,7 @@ pub struct HandleLibraryAppletStorage {
 
 impl HandleLibraryAppletStorage {
     pub fn new(
-        memory: Arc<Mutex<Memory>>,
+        memory: Arc<crate::memory::memory::SharedMemory>,
         transfer_memory: Arc<Mutex<KTransferMemory>>,
         object_id: u64,
         size: i64,
@@ -176,7 +175,7 @@ impl LibraryAppletStorage for HandleLibraryAppletStorage {
 }
 
 pub fn create_transfer_memory_storage(
-    memory: Arc<Mutex<Memory>>,
+    memory: Arc<crate::memory::memory::SharedMemory>,
     transfer_memory: Arc<Mutex<KTransferMemory>>,
     object_id: u64,
     is_writable: bool,
@@ -192,7 +191,7 @@ pub fn create_transfer_memory_storage(
 }
 
 pub fn create_handle_storage(
-    memory: Arc<Mutex<Memory>>,
+    memory: Arc<crate::memory::memory::SharedMemory>,
     transfer_memory: Arc<Mutex<KTransferMemory>>,
     object_id: u64,
     size: i64,
@@ -214,8 +213,8 @@ mod tests {
     #[test]
     fn only_handle_storage_exposes_the_transfer_memory_handle() {
         let device_memory = Box::new(DeviceMemory::with_size(0x1000));
-        let memory = Arc::new(Mutex::new(unsafe {
-            Memory::new(
+        let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
+            crate::memory::memory::Memory::new(
                 SystemRef::null(),
                 device_memory.as_ref() as *const _,
                 &device_memory.buffer as *const _,

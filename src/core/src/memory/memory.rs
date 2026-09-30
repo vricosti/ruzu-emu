@@ -93,6 +93,34 @@ pub fn dump_rasterizer_mark_cached_stall_profile() {
 /// Matches upstream Common::MemoryPermission.
 pub use common::host_memory::MemoryPermission;
 
+/// Shared ownership adapter for upstream `Memory&`.
+///
+/// Normal operations take a shared borrow: CPU reads may wait for GPU fences,
+/// whose completion needs kernel accesses to this same memory. Serializing all
+/// operations with a mutex creates a memory -> GPU -> scheduler -> memory cycle.
+/// Only initialization/page-table selection requires an exclusive borrow.
+pub struct SharedMemory(std::sync::RwLock<Memory>);
+
+impl SharedMemory {
+    pub fn new(memory: Memory) -> Self {
+        Self(std::sync::RwLock::new(memory))
+    }
+
+    /// Borrow memory for operations using its internally synchronized state.
+    pub fn access(&self) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, Memory>> {
+        self.0.read()
+    }
+
+    pub fn try_lock(&self) -> std::sync::TryLockResult<std::sync::RwLockReadGuard<'_, Memory>> {
+        self.0.try_read()
+    }
+
+    /// Exclusive configuration access; not for guest reads/writes or GPU waits.
+    pub fn lock_mut(&self) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'_, Memory>> {
+        self.0.write()
+    }
+}
+
 /// Port of Core::Memory::Memory.
 ///
 /// Manages the mapping between guest virtual addresses, physical addresses
@@ -414,8 +442,10 @@ fn maybe_trace_write_block_values(kind: &str, dest_addr: u64, src: &[u8]) {
     }
 }
 
-// SAFETY: Memory is used behind Arc<Mutex<>> and all raw pointers are
-// to long-lived objects (DeviceMemory, HostMemory, PageTable) that outlive Memory.
+// SAFETY: pointees outlive Memory. Configuration is exclusively borrowed through
+// SharedMemory; page entries are atomic, per-core caches/scratch buffers are
+// synchronized internally, and guest backing memory follows the upstream
+// concurrent CPU/GPU memory contract (as it already does through JIT fastmem).
 unsafe impl Send for Memory {}
 unsafe impl Sync for Memory {}
 
@@ -764,6 +794,26 @@ impl Memory {
     /// changing its process-owned fastmem policy.
     pub(crate) fn set_current_page_table_raw(&mut self, page_table: *mut PageTable) {
         self.current_page_table = page_table;
+    }
+
+    /// Rust borrowing adaptation for kernel copies using an explicit page table.
+    /// Never change the live CPU page table while another core is in a GPU wait.
+    /// The caller keeps the process/page table alive for the entire operation.
+    pub(crate) fn with_page_table<T>(
+        &self,
+        page_table: *mut PageTable,
+        operation: impl FnOnce(&Memory) -> T,
+    ) -> T {
+        if page_table == self.current_page_table {
+            return operation(self);
+        }
+        // This temporary reference uses the same backing and dirty collectors.
+        // Empty download caches force validation for the other address space.
+        let mut view = unsafe { Memory::new(self.system, self.device_memory, self.buffer) };
+        view.set_current_page_table_raw(page_table);
+        view.gpu_dirty_managers = self.gpu_dirty_managers.clone();
+        view.sys_core_guard = self.sys_core_guard.clone();
+        operation(&view)
     }
 
     /// Map a physical memory region into the guest virtual address space.
@@ -1412,16 +1462,16 @@ impl Memory {
     ///
     /// Upstream `PerformCacheOperation` runs without any memory-wide lock, so
     /// its per-page `HandleRasterizerWrite` calls can contend with the GPU
-    /// thread freely. The Rust `Memory` sits behind a `Mutex`, and holding
-    /// that mutex across rasterizer notifications serializes every other
-    /// guest-memory access in the emulator (and inverts lock order against
-    /// the texture-cache mutex held by the GPU thread during draws).
+    /// thread freely. This batching originally avoided holding the former
+    /// exclusive Memory mutex across rasterizer notifications. Memory now
+    /// permits shared access; the existing two-phase notification ordering
+    /// is retained here.
     ///
-    /// Phase 1 (this method, called under the memory lock) only walks the
+    /// Phase 1 (this method, called with shared memory access) only walks the
     /// page table: it merges contiguous `RasterizerCachedMemory` pages into
     /// ranges and resolves their device addresses. Phase 2
     /// (`RasterizerWriteBatch::apply`, called after the caller has dropped
-    /// the memory lock) performs the actual rasterizer notifications.
+    /// the shared memory guard) performs the actual rasterizer notifications.
     pub fn collect_rasterizer_write_ranges(
         &self,
         dest_addr: u64,
@@ -1800,8 +1850,8 @@ impl Memory {
 
     /// Write a byte block without notifying the rasterizer.
     ///
-    /// Used for host-side HLE/service writes where ruzu already holds the global
-    /// `Mutex<Memory>`. Guest/JIT writes must keep using `write_block`.
+    /// Used for host-side HLE/service writes that intentionally bypass GPU
+    /// notification. Guest/JIT writes must keep using `write_block`.
     pub fn write_block_no_rasterizer(&self, dest_addr: u64, src: &[u8]) -> bool {
         maybe_trace_write_block_values("write_block_no_rasterizer", dest_addr, src);
         // `RUZU_TRACE_WRITE_BLOCK_AT=0xVADDR` — log every HLE-side
@@ -3065,6 +3115,102 @@ mod process_fastmem_tests {
     }
 
     #[test]
+    fn gpu_wait_does_not_exclude_scheduler_memory_access() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let device_memory = DeviceMemory::with_size(0x20_000);
+        let mut memory = memory_for_device(&device_memory);
+        let mut page_table = PageTable::new();
+        page_table.resize(32, PAGE_BITS);
+        memory.set_current_page_table(&mut page_table, false);
+        memory.map_pages(
+            &mut page_table, 4, 1, dram_memory_map::BASE + 0x2000, PageType::Memory,
+        );
+        let memory = SharedMemory::new(memory);
+        let scheduler = Mutex::new(());
+        let (cpu_waiting_tx, cpu_waiting_rx) = mpsc::channel();
+        let (fence_tx, fence_rx) = mpsc::channel();
+        let (scheduler_tx, scheduler_rx) = mpsc::channel();
+
+        // Model the captured cycle without leaving blocked test threads on
+        // failure: try_lock detects the old exclusive access, then cleanup
+        // always lets the fence/CPU finish.
+        std::thread::scope(|scope| {
+            let cpu_memory = &memory;
+            let cpu = scope.spawn(move || {
+                let access = cpu_memory.access().unwrap();
+                cpu_waiting_tx.send(()).unwrap();
+                fence_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                access.read_32(0x4000)
+            });
+            cpu_waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            scope.spawn(|| {
+                let _scheduler = scheduler.lock().unwrap();
+                let accessible = if let Ok(access) = memory.try_lock() {
+                    access.write_32_no_rasterizer(0x4000, 0x1234_5678);
+                    true
+                } else {
+                    false
+                };
+                scheduler_tx.send(accessible).unwrap();
+            });
+            let accessible = scheduler_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            scope.spawn(|| {
+                let _scheduler = scheduler.lock().unwrap();
+                fence_tx.send(()).unwrap();
+            });
+            let value = cpu.join().unwrap();
+            assert!(accessible, "CPU GPU wait excluded scheduler memory access");
+            assert_eq!(value, 0x1234_5678);
+        });
+    }
+
+    #[test]
+    fn memory_configuration_requires_exclusive_access() {
+        let memory = SharedMemory::new(unsafe {
+            Memory::new(SystemRef::null(), std::ptr::null(), std::ptr::null())
+        });
+        let access = memory.access().unwrap();
+        assert!(memory.0.try_write().is_err());
+        assert!(memory.try_lock().is_ok());
+        drop(access);
+        let configuration = memory.lock_mut().unwrap();
+        assert!(memory.try_lock().is_err());
+        drop(configuration);
+        assert!(memory.try_lock().is_ok());
+    }
+
+    #[test]
+    fn explicit_page_table_copy_keeps_live_table_and_parallel_access() {
+        let device_memory = DeviceMemory::with_size(0x20_000);
+        let mut memory = memory_for_device(&device_memory);
+        let mut live = PageTable::new();
+        let mut other = PageTable::new();
+        live.resize(32, PAGE_BITS);
+        other.resize(32, PAGE_BITS);
+        memory.set_current_page_table(&mut live, false);
+        memory.map_pages(&mut live, 4, 1, dram_memory_map::BASE + 0x2000, PageType::Memory);
+        memory.map_pages(&mut other, 4, 1, dram_memory_map::BASE + 0x6000, PageType::Memory);
+        memory.write_32(0x4000, 0x1111);
+        let memory = SharedMemory::new(memory);
+        let access = memory.access().unwrap();
+        access.with_page_table(&mut other, |view| {
+            assert!(memory.try_lock().is_ok());
+            view.write_32(0x4000, 0x2222);
+            assert_eq!(access.read_32(0x4000), 0x1111);
+            assert_eq!(view.read_32(0x4000), 0x2222);
+        });
+        assert_eq!(access.current_page_table_raw(), &mut live as *mut _);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            access.with_page_table(&mut other, |_| panic!("copy failed"));
+        }));
+        assert!(panic.is_err());
+        assert_eq!(access.current_page_table_raw(), &mut live as *mut _);
+        assert_eq!(access.read_32(0x4000), 0x1111);
+    }
+
+    #[test]
     fn checked_read_follows_noncontiguous_guest_pages() {
         let device_memory = DeviceMemory::with_size(0x20_000);
         let mut memory = memory_for_device(&device_memory);
@@ -3438,7 +3584,7 @@ mod rasterizer_download_tests {
             0
         }
 
-        fn smmu_register_process(&self, _memory: Option<Arc<Mutex<Memory>>>) -> u32 {
+        fn smmu_register_process(&self, _memory: Option<Arc<crate::memory::memory::SharedMemory>>) -> u32 {
             0
         }
 

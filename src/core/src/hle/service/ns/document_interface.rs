@@ -221,14 +221,14 @@ mod tests {
         use std::sync::Mutex;
 
         let device = Box::new(DeviceMemory::new());
-        let memory = Arc::new(Mutex::new(unsafe {
+        let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
             Memory::new(SystemRef::null(), device.as_ref(), &device.buffer)
         }));
         let mut page_table = Box::new(PageTable::new());
         page_table.resize(32, 12);
         page_table.entries.get_and_fault(3).store(
             false, PageType::Memory, 1, device.buffer.backing_base_pointer() as usize);
-        memory.lock().unwrap().set_current_page_table(page_table.as_mut(), true);
+        memory.lock_mut().unwrap().set_current_page_table(page_table.as_mut(), true);
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         process.lock().unwrap().page_table.set_memory(memory.clone());
         let thread = Arc::new(KThreadLock::new(KThread::new()));
@@ -254,13 +254,13 @@ mod tests {
             ctx.set_buffer_b_descriptors_for_test(vec![ipc::BufferDescriptorABW {
                 size_bits_0_31: 0x300, address_bits_0_31: 0x3100, raw_word2: 0,
             }]);
-            memory.lock().unwrap().write_32(0x3020, 0x53535353);
+            memory.access().unwrap().write_32(0x3020, 0x53535353);
             service.handlers()[&21].handler_callback.unwrap()(&service, &mut ctx);
             let offset = ctx.get_data_payload_offset() as usize;
             assert_eq!(ctx.command_buffer()[offset] == 0, content_type == 5);
             assert_eq!(ctx.write_size as usize, offset + 3);
             assert_eq!(ctx.write_to_outgoing_command_buffer(), RESULT_SUCCESS);
-            let mem = memory.lock().unwrap();
+            let mem = memory.access().unwrap();
             assert_eq!(mem.read_32(0x3000 + ((offset + 2) * 4) as u64), 0);
             if content_type == 5 {
                 let mut output = [0u8; 0x300];

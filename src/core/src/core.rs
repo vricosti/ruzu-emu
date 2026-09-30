@@ -1183,7 +1183,7 @@ pub struct System {
     device_memory: Option<Box<DeviceMemory>>,
     /// Core::Memory::Memory bridge (maps virtual→physical→host).
     /// Upstream: `std::unique_ptr<Core::Memory::Memory> m_memory`.
-    memory: Option<Arc<StdMutex<Memory>>>,
+    memory: Option<Arc<crate::memory::memory::SharedMemory>>,
     /// Periodic dmnt cheat VM for the current application.
     /// Upstream owner: `System::Impl::cheat_engine`.
     cheat_engine: Option<CheatEngine>,
@@ -1432,7 +1432,7 @@ impl System {
             .map(|_| Arc::new(GpuDirtyMemoryManager::new()))
             .collect();
         memory.set_gpu_dirty_managers(self.gpu_dirty_memory_managers.clone());
-        self.memory = Some(Arc::new(StdMutex::new(memory)));
+        self.memory = Some(Arc::new(crate::memory::memory::SharedMemory::new(memory)));
 
         // Read configuration from settings.
         // In C++: is_multicore = Settings::values.use_multi_core.GetValue()
@@ -2409,7 +2409,7 @@ impl System {
     /// Get the application process's Memory bridge.
     /// Upstream: `System::ApplicationMemory()` → `ApplicationProcess()->GetMemory()`.
     /// Falls back to the legacy `self.memory` if no application process is set.
-    pub fn memory_shared(&self) -> Option<Arc<StdMutex<Memory>>> {
+    pub fn memory_shared(&self) -> Option<Arc<crate::memory::memory::SharedMemory>> {
         // Try per-process Memory first (the correct upstream path)
         if let Some(ref process) = self.current_process {
             if let Some(mem) = process.get_memory() {
@@ -2969,7 +2969,7 @@ impl System {
     /// Matches upstream `GetCurrentMemory(kernel)` which returns
     /// `GetCurrentProcess(kernel).GetMemory()`.
     /// Returns None when Memory is not wired (tests).
-    pub fn get_svc_memory(&self) -> Option<Arc<StdMutex<Memory>>> {
+    pub fn get_svc_memory(&self) -> Option<Arc<crate::memory::memory::SharedMemory>> {
         crate::hle::kernel::k_thread::get_current_memory().or_else(|| {
             self.current_process_arc
                 .as_ref()?

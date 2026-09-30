@@ -5,7 +5,7 @@
 //! KProcessPageTable: thin wrapper around KPageTableBase matching upstream.
 //! All methods delegate to the inner KPageTableBase.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::k_memory_block::{
     convert_to_k_memory_permission, KMemoryAttribute, KMemoryInfo, KMemoryPermission, KMemoryState,
@@ -14,7 +14,6 @@ use super::k_memory_block::{
 use super::k_page_table_base::KPageTableBase;
 use super::k_resource_limit::KResourceLimit;
 use super::k_typed_address::{KPhysicalAddress, KProcessAddress};
-use crate::memory::memory::Memory;
 
 fn svc_perm_to_k_memory_permission(perm: u32) -> KMemoryPermission {
     convert_to_k_memory_permission(SvcMemoryPermission::from_bits_truncate(perm as u8))
@@ -49,7 +48,7 @@ impl KProcessPageTable {
         code_size: usize,
         system_resource: Option<&super::k_system_resource::KSystemResource>,
         resource_limit: Option<Arc<KResourceLimit>>,
-        memory: Option<Arc<Mutex<Memory>>>,
+        memory: Option<Arc<crate::memory::memory::SharedMemory>>,
         aslr_space_start: usize,
     ) -> u32 {
         self.base.initialize_for_process(
@@ -703,7 +702,7 @@ impl KProcessPageTable {
 
     /// Set the Memory bridge on the underlying KPageTableBase.
     /// Must be called after the address space is configured.
-    pub fn set_memory(&mut self, memory: Arc<Mutex<Memory>>) {
+    pub fn set_memory(&mut self, memory: Arc<crate::memory::memory::SharedMemory>) {
         self.base.set_memory(memory);
     }
 

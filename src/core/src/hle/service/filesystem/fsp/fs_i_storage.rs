@@ -262,7 +262,7 @@ impl IStorage {
             if let (Ok(spec), Some(memory)) =
                 (std::env::var("RUZU_ISTORAGE_READ_U32_AT"), ctx.get_memory())
             {
-                let memory = memory.lock().unwrap();
+                let memory = memory.access().unwrap();
                 let values: Vec<String> = spec
                     .split(',')
                     .filter_map(|raw| {

@@ -460,7 +460,7 @@ impl Reporter {
         // Reporter is standalone in Rust; the caller supplies its SystemRef.
         // Use application memory like upstream, not the IPC client's memory.
         let memory = system.get().memory_shared().expect("application memory is not initialized");
-        let mut function_out = get_hle_request_context_data(ctx, &memory.lock().unwrap());
+        let mut function_out = get_hle_request_context_data(ctx, &memory.access().unwrap());
         function_out["command_id"] = command_id.into();
         function_out["function_name"] = name.into();
         function_out["service_name"] = service_name.into();
@@ -537,7 +537,7 @@ mod tests {
             return;
         }
         std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
-            use std::sync::{Arc, Mutex};
+            use std::sync::Arc;
             use crate::core::{System, SystemRef};
             use crate::device_memory::DeviceMemory;
             use crate::hle::ipc;
@@ -568,13 +568,13 @@ mod tests {
                 1,
                 device.buffer.backing_base_pointer() as usize,
             );
-            let memory = Arc::new(Mutex::new(unsafe {
+            let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
                 Memory::new(SystemRef::null(), device.as_ref() as *const _, &device.buffer as *const _)
             }));
-            memory.lock().unwrap().set_current_page_table(table.as_mut() as *mut _, true);
-            memory.lock().unwrap().write_8(0x3000, 0xAB);
-            memory.lock().unwrap().write_8(0x3001, 0xCD);
-            memory.lock().unwrap().write_8(0x3010, 0xEF);
+            memory.lock_mut().unwrap().set_current_page_table(table.as_mut() as *mut _, true);
+            memory.access().unwrap().write_8(0x3000, 0xAB);
+            memory.access().unwrap().write_8(0x3001, 0xCD);
+            memory.access().unwrap().write_8(0x3010, 0xEF);
             let mut system = Box::new(System::new());
             let mut process = KProcess::new();
             process.program_id = 42;

@@ -650,10 +650,10 @@ fn run_boot(
         let memory_raw: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
         fn memory_raw_of(
             cell: &OnceLock<usize>,
-            memory: &Arc<std::sync::Mutex<ruzu_core::memory::memory::Memory>>,
+            memory: &Arc<ruzu_core::memory::memory::SharedMemory>,
         ) -> *const ruzu_core::memory::memory::Memory {
             *cell.get_or_init(|| {
-                let guard = memory.lock().unwrap();
+                let guard = memory.access().unwrap();
                 &*guard as *const ruzu_core::memory::memory::Memory as usize
             }) as *const ruzu_core::memory::memory::Memory
         }

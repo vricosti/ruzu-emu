@@ -120,7 +120,7 @@ pub fn wait_synchronization(
         let process_arc = system.current_process_arc();
         let process = process_arc.lock().unwrap();
         let h0 = if let Some(memory) = process.get_memory().as_ref() {
-            memory.lock().unwrap().read_32(user_handles)
+            memory.access().unwrap().read_32(user_handles)
         } else {
             0
         };
@@ -149,7 +149,7 @@ pub fn wait_synchronization(
     if num_handles > 0 {
         let handle_bytes = num_handles as usize * std::mem::size_of::<Handle>();
         if let Some(memory) = process.get_memory().as_ref() {
-            let m = memory.lock().unwrap();
+            let m = memory.access().unwrap();
             if !m.is_valid_virtual_address_range(user_handles, handle_bytes as u64) {
                 return RESULT_INVALID_POINTER;
             }
@@ -489,7 +489,7 @@ mod tests {
             .as_mut()
             .expect("test page table backend must be initialized");
         memory
-            .lock()
+            .lock_mut()
             .unwrap()
             .set_current_page_table(impl_pt.as_mut() as *mut _, true);
     }
@@ -513,7 +513,7 @@ mod tests {
         for handle in handles {
             bytes.extend_from_slice(&handle.to_le_bytes());
         }
-        assert!(memory.lock().unwrap().write_block(addr, &bytes));
+        assert!(memory.access().unwrap().write_block(addr, &bytes));
         addr
     }
 

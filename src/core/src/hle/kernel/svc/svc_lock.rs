@@ -141,7 +141,7 @@ pub fn arbitrate_lock(
             process
                 .get_memory()
                 .map(|memory| {
-                    let memory = memory.lock().unwrap();
+                    let memory = memory.access().unwrap();
                     if is_64bit {
                         let thread_type =
                             if memory.is_valid_virtual_address_range(tls_base + 0x1f8, 8) {

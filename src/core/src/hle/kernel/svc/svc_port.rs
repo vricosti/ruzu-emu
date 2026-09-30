@@ -39,7 +39,7 @@ fn read_port_name(system: &System, user_name: u64) -> Result<String, ResultCode>
     let mut raw = [0u8; PORT_NAME_MAX_LENGTH];
     let mut string_len = PORT_NAME_MAX_LENGTH;
     if let Some(memory) = system.get_svc_memory() {
-        let m = memory.lock().unwrap();
+        let m = memory.access().unwrap();
         for i in 0..PORT_NAME_MAX_LENGTH {
             let b = m.read_8(user_name + i as u64);
             raw[i] = b;

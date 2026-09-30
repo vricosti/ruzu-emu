@@ -167,7 +167,7 @@ fn trace_query_address_target() -> Option<u64> {
 /// Writes a MemoryInfo struct to guest memory at the given address.
 fn write_memory_info(system: &System, address: u64, info: &MemoryInfo) {
     if let Some(memory) = system.get_svc_memory() {
-        let m = memory.lock().unwrap();
+        let m = memory.access().unwrap();
         m.write_64(address, info.base_address);
         m.write_64(address + 8, info.size);
         m.write_32(address + 16, info.state);

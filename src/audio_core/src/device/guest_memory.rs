@@ -2,7 +2,6 @@ use common::VAddr;
 use parking_lot::Mutex;
 use ruzu_core::memory::memory_manager::MemoryManager;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 
 pub trait GuestMemoryProvider: Send + Sync {
     fn read_bytes(&self, addr: VAddr, size: usize) -> Option<Vec<u8>>;
@@ -50,11 +49,11 @@ impl GuestMemoryProvider for KernelMemoryProvider {
 }
 
 pub struct ProcessMemoryProvider {
-    memory: Arc<StdMutex<ruzu_core::memory::memory::Memory>>,
+    memory: Arc<ruzu_core::memory::memory::SharedMemory>,
 }
 
 impl ProcessMemoryProvider {
-    pub fn new(memory: Arc<StdMutex<ruzu_core::memory::memory::Memory>>) -> Self {
+    pub fn new(memory: Arc<ruzu_core::memory::memory::SharedMemory>) -> Self {
         Self { memory }
     }
 }
@@ -63,7 +62,7 @@ impl GuestMemoryProvider for ProcessMemoryProvider {
     fn read_bytes(&self, addr: VAddr, size: usize) -> Option<Vec<u8>> {
         let mut bytes = vec![0; size];
         self.memory
-            .lock()
+            .access()
             .ok()?
             .read_block(addr, &mut bytes)
             .then_some(bytes)
@@ -71,7 +70,7 @@ impl GuestMemoryProvider for ProcessMemoryProvider {
 
     fn write_bytes(&self, addr: VAddr, data: &[u8]) -> bool {
         self.memory
-            .lock()
+            .access()
             .is_ok_and(|memory| memory.write_block(addr, data))
     }
 }

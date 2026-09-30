@@ -790,32 +790,6 @@ impl Memory {
         }
     }
 
-    /// Temporarily select a page table for slow-path memory copies without
-    /// changing its process-owned fastmem policy.
-    pub(crate) fn set_current_page_table_raw(&mut self, page_table: *mut PageTable) {
-        self.current_page_table = page_table;
-    }
-
-    /// Rust borrowing adaptation for kernel copies using an explicit page table.
-    /// Never change the live CPU page table while another core is in a GPU wait.
-    /// The caller keeps the process/page table alive for the entire operation.
-    pub(crate) fn with_page_table<T>(
-        &self,
-        page_table: *mut PageTable,
-        operation: impl FnOnce(&Memory) -> T,
-    ) -> T {
-        if page_table == self.current_page_table {
-            return operation(self);
-        }
-        // This temporary reference uses the same backing and dirty collectors.
-        // Empty download caches force validation for the other address space.
-        let mut view = unsafe { Memory::new(self.system, self.device_memory, self.buffer) };
-        view.set_current_page_table_raw(page_table);
-        view.gpu_dirty_managers = self.gpu_dirty_managers.clone();
-        view.sys_core_guard = self.sys_core_guard.clone();
-        operation(&view)
-    }
-
     /// Map a physical memory region into the guest virtual address space.
     ///
     /// Matches upstream `Memory::Impl::MapMemoryRegion`:
@@ -1037,13 +1011,20 @@ impl Memory {
 
     #[inline]
     fn get_pointer_impl(&self, vaddr: u64) -> *mut u8 {
+        self.get_pointer_from_page_table(self.current_page_table, vaddr)
+    }
+
+    /// Explicit-table adaptation of upstream GetPointerImpl for kernel copies.
+    /// The caller retains the owning page table throughout the operation.
+    #[inline]
+    fn get_pointer_from_page_table(&self, page_table: *const PageTable, vaddr: u64) -> *mut u8 {
         // AARCH64 masks the upper 16 bits of all memory accesses.
         let vaddr = vaddr & 0xffff_ffff_ffff;
 
-        if self.current_page_table.is_null() {
+        if page_table.is_null() {
             return std::ptr::null_mut();
         }
-        let pt = unsafe { &*self.current_page_table };
+        let pt = unsafe { &*page_table };
         let page_idx = (vaddr >> PAGE_BITS) as usize;
         if page_idx >= pt.entries.size() {
             return std::ptr::null_mut();
@@ -1069,20 +1050,20 @@ impl Memory {
                 );
                 std::ptr::null_mut()
             }
-            PageType::DebugMemory => self.get_pointer_from_debug_memory(vaddr),
+            PageType::DebugMemory => self.get_pointer_from_debug_memory(page_table, vaddr),
             PageType::RasterizerCachedMemory => {
-                self.get_pointer_from_rasterizer_cached_memory(vaddr)
+                self.get_pointer_from_rasterizer_cached_memory(page_table, vaddr)
             }
         }
     }
 
     /// Get pointer from debug memory (slow path).
     /// Matches upstream `Memory::Impl::GetPointerFromDebugMemory`.
-    fn get_pointer_from_debug_memory(&self, vaddr: u64) -> *mut u8 {
-        if self.current_page_table.is_null() {
+    fn get_pointer_from_debug_memory(&self, page_table: *const PageTable, vaddr: u64) -> *mut u8 {
+        if page_table.is_null() {
             return std::ptr::null_mut();
         }
-        let pt = unsafe { &*self.current_page_table };
+        let pt = unsafe { &*page_table };
         let page_idx = (vaddr >> PAGE_BITS) as usize;
         if page_idx >= pt.entries.size() {
             return std::ptr::null_mut();
@@ -1099,11 +1080,15 @@ impl Memory {
     /// Get pointer from rasterizer cached memory (slow path).
     /// Matches upstream `Memory::Impl::GetPointerFromRasterizerCachedMemory`
     /// (same body as the debug-memory lookup upstream).
-    fn get_pointer_from_rasterizer_cached_memory(&self, vaddr: u64) -> *mut u8 {
-        if self.current_page_table.is_null() {
+    fn get_pointer_from_rasterizer_cached_memory(
+        &self,
+        page_table: *const PageTable,
+        vaddr: u64,
+    ) -> *mut u8 {
+        if page_table.is_null() {
             return std::ptr::null_mut();
         }
-        let pt = unsafe { &*self.current_page_table };
+        let pt = unsafe { &*page_table };
         let page_idx = (vaddr >> PAGE_BITS) as usize;
         if page_idx >= pt.entries.size() {
             return std::ptr::null_mut();
@@ -1266,11 +1251,17 @@ impl Memory {
     }
 
     fn handle_rasterizer_write(&self, vaddr: u64, size: usize) {
+        self.handle_rasterizer_write_on_pointer(self.get_pointer_impl(vaddr), size);
+    }
+
+    /// Upstream HandleRasterizerWrite after virtual-to-host translation.
+    /// Device-address caches and per-core scratch storage belong to Memory,
+    /// not to the process page table used for that translation.
+    fn handle_rasterizer_write_on_pointer(&self, host_ptr: *mut u8, size: usize) {
         if self.system.is_null() {
             return;
         }
 
-        let host_ptr = self.get_pointer_impl(vaddr);
         let Some(gpu) = self.system.get().gpu_core() else {
             return;
         };
@@ -1316,11 +1307,15 @@ impl Memory {
     }
 
     fn handle_rasterizer_download(&self, vaddr: u64, size: usize) {
+        self.handle_rasterizer_download_on_pointer(self.get_pointer_impl(vaddr), size);
+    }
+
+    /// Upstream HandleRasterizerDownload after virtual-to-host translation.
+    fn handle_rasterizer_download_on_pointer(&self, host_ptr: *mut u8, size: usize) {
         if self.system.is_null() {
             return;
         }
 
-        let host_ptr = self.get_pointer_impl(vaddr);
         let Some(gpu) = self.system.get().gpu_core() else {
             return;
         };
@@ -1362,10 +1357,14 @@ impl Memory {
     }
 
     fn page_type_at(&self, vaddr: u64) -> Option<PageType> {
-        if self.current_page_table.is_null() {
+        self.page_type_in_table(self.current_page_table, vaddr)
+    }
+
+    fn page_type_in_table(&self, page_table: *const PageTable, vaddr: u64) -> Option<PageType> {
+        if page_table.is_null() {
             return None;
         }
-        let pt = unsafe { &*self.current_page_table };
+        let pt = unsafe { &*page_table };
         let page_idx = (vaddr >> PAGE_BITS) as usize;
         if page_idx >= pt.entries.size() {
             return None;
@@ -2097,10 +2096,19 @@ impl Memory {
     /// Check if an address range is within the current address space.
     /// Matches upstream `AddressSpaceContains`.
     fn address_space_contains(&self, addr: u64, size: usize) -> bool {
-        if self.current_page_table.is_null() {
+        self.address_space_in_table_contains(self.current_page_table, addr, size)
+    }
+
+    fn address_space_in_table_contains(
+        &self,
+        page_table: *const PageTable,
+        addr: u64,
+        size: usize,
+    ) -> bool {
+        if page_table.is_null() {
             return false;
         }
-        let pt = unsafe { &*self.current_page_table };
+        let pt = unsafe { &*page_table };
         let max_addr = 1u64 << pt.current_address_space_width_in_bits;
         let end = addr.checked_add(size as u64);
         match end {
@@ -2112,6 +2120,17 @@ impl Memory {
     /// Read a block of data from guest memory.
     /// Matches upstream `Memory::ReadBlock` (via WalkBlock pattern).
     pub fn read_block(&self, src_addr: u64, dest: &mut [u8]) -> bool {
+        self.read_block_from_page_table(self.current_page_table, src_addr, dest)
+    }
+
+    /// ReadBlock with an explicit process table, without allocating a Memory
+    /// view or changing the live CPU table. Caller keeps the table alive.
+    pub(crate) fn read_block_from_page_table(
+        &self,
+        page_table: *const PageTable,
+        src_addr: u64,
+        dest: &mut [u8],
+    ) -> bool {
         let size = dest.len();
         let trace_read_ptr = {
             static RB_TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -2132,7 +2151,7 @@ impl Memory {
         };
 
         // Upstream: AddressSpaceContains check before walking pages.
-        if !self.address_space_contains(src_addr, size) {
+        if !self.address_space_in_table_contains(page_table, src_addr, size) {
             log::error!("Unmapped ReadBlock @ {:#018x} size={:#x}", src_addr, size);
             dest.fill(0);
             return false;
@@ -2147,7 +2166,7 @@ impl Memory {
             let page_offset = (vaddr & PAGE_MASK) as usize;
             let copy_amount = ((PAGE_SIZE as usize) - page_offset).min(remaining);
 
-            let ptr = self.get_pointer_impl(vaddr);
+            let ptr = self.get_pointer_from_page_table(page_table, vaddr);
             if ptr.is_null() {
                 log::error!("Unmapped ReadBlock @ {:#018x}", vaddr);
                 // Zero destination for unmapped pages, matching upstream.
@@ -2166,8 +2185,10 @@ impl Memory {
                         size,
                     );
                 }
-                if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
-                    self.handle_rasterizer_download(vaddr, copy_amount);
+                if self.page_type_in_table(page_table, vaddr)
+                    == Some(PageType::RasterizerCachedMemory)
+                {
+                    self.handle_rasterizer_download_on_pointer(ptr, copy_amount);
                 }
                 unsafe {
                     std::ptr::copy_nonoverlapping(ptr, dest[offset..].as_mut_ptr(), copy_amount);
@@ -2324,6 +2345,17 @@ impl Memory {
     /// Write a block of data to guest memory.
     /// Matches upstream `Memory::WriteBlock` (via WalkBlock pattern).
     pub fn write_block(&self, dest_addr: u64, src: &[u8]) -> bool {
+        self.write_block_to_page_table(self.current_page_table, dest_addr, src)
+    }
+
+    /// WriteBlock counterpart using the caller's process table and this
+    /// Memory's existing device-address caches and scratch buffers.
+    pub(crate) fn write_block_to_page_table(
+        &self,
+        page_table: *const PageTable,
+        dest_addr: u64,
+        src: &[u8],
+    ) -> bool {
         maybe_trace_write_block_values("write_block", dest_addr, src);
         let size = src.len();
 
@@ -2336,7 +2368,7 @@ impl Memory {
         }
 
         // Upstream: AddressSpaceContains check before walking pages.
-        if !self.address_space_contains(dest_addr, size) {
+        if !self.address_space_in_table_contains(page_table, dest_addr, size) {
             log::error!("Unmapped WriteBlock @ {:#018x} size={:#x}", dest_addr, size);
             if common::env_flag!("RUZU_TRACE_UNMAPPED_BT") {
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -2361,13 +2393,15 @@ impl Memory {
         while remaining > 0 {
             let page_offset = (vaddr & PAGE_MASK) as usize;
             let copy_amount = ((PAGE_SIZE as usize) - page_offset).min(remaining);
-            let ptr = self.get_pointer_impl(vaddr);
+            let ptr = self.get_pointer_from_page_table(page_table, vaddr);
             if ptr.is_null() {
                 log::error!("Unmapped WriteBlock @ {:#018x}", vaddr);
                 user_accessible = false;
             } else {
-                if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
-                    self.handle_rasterizer_write(vaddr, copy_amount);
+                if self.page_type_in_table(page_table, vaddr)
+                    == Some(PageType::RasterizerCachedMemory)
+                {
+                    self.handle_rasterizer_write_on_pointer(ptr, copy_amount);
                 }
                 unsafe {
                     std::ptr::copy_nonoverlapping(src[offset..].as_ptr(), ptr, copy_amount);
@@ -3190,24 +3224,102 @@ mod process_fastmem_tests {
         live.resize(32, PAGE_BITS);
         other.resize(32, PAGE_BITS);
         memory.set_current_page_table(&mut live, false);
-        memory.map_pages(&mut live, 4, 1, dram_memory_map::BASE + 0x2000, PageType::Memory);
-        memory.map_pages(&mut other, 4, 1, dram_memory_map::BASE + 0x6000, PageType::Memory);
+        memory.map_pages(
+            &mut live,
+            4,
+            1,
+            dram_memory_map::BASE + 0x2000,
+            PageType::Memory,
+        );
+        memory.map_pages(
+            &mut other,
+            4,
+            1,
+            dram_memory_map::BASE + 0x6000,
+            PageType::Memory,
+        );
         memory.write_32(0x4000, 0x1111);
         let memory = SharedMemory::new(memory);
         let access = memory.access().unwrap();
-        access.with_page_table(&mut other, |view| {
-            assert!(memory.try_lock().is_ok());
-            view.write_32(0x4000, 0x2222);
-            assert_eq!(access.read_32(0x4000), 0x1111);
-            assert_eq!(view.read_32(0x4000), 0x2222);
+        assert!(memory.try_lock().is_ok());
+        assert!(access.write_block_to_page_table(&other, 0x4000, &0x2222u32.to_le_bytes()));
+        assert_eq!(access.read_32(0x4000), 0x1111);
+        let mut bytes = [0u8; 4];
+        assert!(access.read_block_from_page_table(&other, 0x4000, &mut bytes));
+        assert_eq!(u32::from_le_bytes(bytes), 0x2222);
+        std::thread::scope(|scope| {
+            let cpu = scope.spawn(|| {
+                let cpu_access = memory.access().unwrap();
+                for _ in 0..1000 {
+                    assert_eq!(cpu_access.read_32(0x4000), 0x1111);
+                    std::thread::yield_now();
+                }
+            });
+            for value in 0..1000u32 {
+                assert!(access.write_block_to_page_table(&other, 0x4000, &value.to_le_bytes()));
+                assert!(access.read_block_from_page_table(&other, 0x4000, &mut bytes));
+                assert_eq!(u32::from_le_bytes(bytes), value);
+            }
+            cpu.join().unwrap();
         });
         assert_eq!(access.current_page_table_raw(), &mut live as *mut _);
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            access.with_page_table(&mut other, |_| panic!("copy failed"));
-        }));
-        assert!(panic.is_err());
-        assert_eq!(access.current_page_table_raw(), &mut live as *mut _);
         assert_eq!(access.read_32(0x4000), 0x1111);
+    }
+
+    #[test]
+    fn explicit_table_blocks_follow_page_types_and_noncontiguous_backing() {
+        let device_memory = DeviceMemory::with_size(0x20_000);
+        let memory = memory_for_device(&device_memory);
+        let mut table = PageTable::new();
+        table.resize(32, PAGE_BITS);
+        for (page, physical, page_type) in [
+            (4, 0x2000, PageType::Memory),
+            (5, 0x6000, PageType::DebugMemory),
+            (6, 0xa000, PageType::RasterizerCachedMemory),
+        ] {
+            memory.map_pages(
+                &mut table,
+                page,
+                1,
+                dram_memory_map::BASE + physical,
+                page_type,
+            );
+        }
+        // The live table is deliberately null: every translation, including
+        // cached/debug slow paths, must use the supplied table.
+        let source: Vec<u8> = (0..0x2010).map(|index| (index % 251) as u8).collect();
+        assert!(memory.write_block_to_page_table(&table, 0x4ff0, &source));
+        let mut output = vec![0u8; source.len()];
+        assert!(memory.read_block_from_page_table(&table, 0x4ff0, &mut output));
+        assert_eq!(output, source);
+        assert!(memory.current_page_table_raw().is_null());
+    }
+
+    #[test]
+    fn explicit_table_blocks_preserve_unmapped_and_range_failure_behavior() {
+        let device_memory = DeviceMemory::with_size(0x20_000);
+        let memory = memory_for_device(&device_memory);
+        let mut table = PageTable::new();
+        table.resize(32, PAGE_BITS);
+        memory.map_pages(
+            &mut table,
+            4,
+            1,
+            dram_memory_map::BASE + 0x2000,
+            PageType::Memory,
+        );
+        let source = [0x5a; 32];
+        assert!(!memory.write_block_to_page_table(&table, 0x4ff0, &source));
+        let mut output = [0xff; 32];
+        assert!(!memory.read_block_from_page_table(&table, 0x4ff0, &mut output));
+        assert_eq!(&output[..16], &[0x5a; 16]);
+        assert_eq!(&output[16..], &[0; 16]);
+        output.fill(0xff);
+        assert!(!memory.read_block_from_page_table(&table, u32::MAX as u64 - 15, &mut output));
+        assert_eq!(output, [0; 32]);
+        assert!(!memory.write_block_to_page_table(std::ptr::null(), 0x4000, &source));
+        assert!(memory.read_block_from_page_table(&table, 0x4000, &mut []));
+        assert!(memory.write_block_to_page_table(&table, 0x4000, &[]));
     }
 
     #[test]
@@ -3681,6 +3793,58 @@ mod rasterizer_download_tests {
         memory.set_current_page_table(&mut *page_table, true);
 
         (device_memory, page_table, memory, vaddr, device_addr)
+    }
+
+    #[test]
+    fn explicit_table_blocks_reuse_device_cache_and_translate_selected_table() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let applied_host_ptrs = Arc::new(Mutex::new(Vec::new()));
+        let mut system = System::new_boxed_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore {
+            reads: reads.clone(),
+            writes: writes.clone(),
+            download_size: 0x100,
+        }));
+        let (device_memory, live, memory, vaddr, device_addr) =
+            make_rasterizer_cached_memory(&system);
+        let mut other = PageTable::new();
+        other.resize(32, PAGE_BITS);
+        memory.map_pages(
+            &mut other,
+            vaddr >> PAGE_BITS,
+            1,
+            dram_memory_map::BASE + 0x6000,
+            PageType::RasterizerCachedMemory,
+        );
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            applied_host_ptrs: applied_host_ptrs.clone(),
+            aliases: vec![device_addr + 0x20],
+        }));
+        let mut bytes = [0u8; 4];
+        assert!(memory.read_block_from_page_table(&other, vaddr + 0x20, &mut bytes));
+        assert!(memory.read_block_from_page_table(&other, vaddr + 0x40, &mut bytes));
+        assert_eq!(&*reads.lock().unwrap(), &[(device_addr + 0x20, 4)]);
+        assert_eq!(
+            applied_host_ptrs.lock().unwrap()[0],
+            device_memory.buffer.backing_base_pointer() as usize + 0x6020,
+        );
+        assert!(memory.write_block_to_page_table(&other, vaddr + 0x20, &[1; 4]));
+        assert!(memory.write_block_to_page_table(&other, vaddr + 0x40, &[2; 4]));
+        assert_eq!(&*writes.lock().unwrap(), &[(device_addr + 0x20, 4)]);
+
+        // Same process VA, different device alias: the previous download
+        // cache must not suppress the new GPU synchronization.
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            applied_host_ptrs,
+            aliases: vec![device_addr + 0x2020],
+        }));
+        assert!(memory.read_block_from_page_table(&other, vaddr + 0x20, &mut bytes));
+        assert_eq!(reads.lock().unwrap().len(), 2);
+        assert_eq!(
+            memory.current_page_table_raw(),
+            &*live as *const _ as *mut _
+        );
     }
 
     #[test]

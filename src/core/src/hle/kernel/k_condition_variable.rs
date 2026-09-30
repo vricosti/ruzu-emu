@@ -1781,13 +1781,15 @@ mod tests {
     fn ensure_scheduler_lock_for_test() {
         static INIT: OnceLock<()> = OnceLock::new();
         INIT.get_or_init(|| {
-            let mut system = System::new_for_test();
+            // SystemRef stores the owner's address: initialize in its final
+            // allocation rather than moving an initialized System afterward.
+            let mut system = System::new_boxed_for_test();
             system.initialize();
             system
                 .kernel_mut()
                 .expect("test system must own a kernel")
                 .initialize();
-            Box::leak(Box::new(system));
+            Box::leak(system);
         });
     }
 

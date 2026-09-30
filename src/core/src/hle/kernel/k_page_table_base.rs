@@ -5966,17 +5966,6 @@ impl KPageTableBase {
         crate::hle::result::RESULT_SUCCESS.get_inner_value()
     }
 
-    fn with_memory_page_table<T, F>(
-        memory: &Arc<crate::memory::memory::SharedMemory>,
-        page_table: *mut common::page_table::PageTable,
-        f: F,
-    ) -> T
-    where
-        F: FnOnce(&Memory) -> T,
-    {
-        memory.access().unwrap().with_page_table(page_table, f)
-    }
-
     fn read_block_from_page_table(
         memory: &Arc<crate::memory::memory::SharedMemory>,
         page_table: *mut common::page_table::PageTable,
@@ -5984,9 +5973,11 @@ impl KPageTableBase {
         size: usize,
     ) -> Option<Vec<u8>> {
         let mut bytes = vec![0u8; size];
-        let success = Self::with_memory_page_table(memory, page_table, |memory| {
-            memory.read_block(src_addr as u64, &mut bytes)
-        });
+        let success = memory.access().unwrap().read_block_from_page_table(
+            page_table,
+            src_addr as u64,
+            &mut bytes,
+        );
         success.then_some(bytes)
     }
 
@@ -5996,9 +5987,10 @@ impl KPageTableBase {
         dst_addr: usize,
         bytes: &[u8],
     ) -> bool {
-        Self::with_memory_page_table(memory, page_table, |memory| {
-            memory.write_block(dst_addr as u64, bytes)
-        })
+        memory
+            .access()
+            .unwrap()
+            .write_block_to_page_table(page_table, dst_addr as u64, bytes)
     }
 
     pub(crate) fn read_block_from_own_page_table(

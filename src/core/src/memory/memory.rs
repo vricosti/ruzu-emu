@@ -2803,6 +2803,10 @@ impl Memory {
             log::error!("Unmapped WriteExclusive8 @ {:#018x}", vaddr);
             return true;
         }
+        // Upstream GetPointerImpl notifies the rasterizer for cached pages before the CAS.
+        if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+            self.handle_rasterizer_write(vaddr, 1);
+        }
         unsafe {
             let atomic = &*(ptr as *const std::sync::atomic::AtomicU8);
             atomic
@@ -2824,6 +2828,10 @@ impl Memory {
             trace_unmapped_guest_access("EXCLUSIVE_WRITE", vaddr, 16);
             log::error!("Unmapped WriteExclusive16 @ {:#018x}", vaddr);
             return true;
+        }
+        // Upstream GetPointerImpl notifies the rasterizer for cached pages before the CAS.
+        if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+            self.handle_rasterizer_write(vaddr, 2);
         }
         unsafe {
             let atomic = &*(ptr as *const std::sync::atomic::AtomicU16);
@@ -2847,6 +2855,10 @@ impl Memory {
             log::error!("Unmapped WriteExclusive32 @ {:#018x}", vaddr);
             return true;
         }
+        // Upstream GetPointerImpl notifies the rasterizer for cached pages before the CAS.
+        if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+            self.handle_rasterizer_write(vaddr, 4);
+        }
         unsafe {
             let atomic = &*(ptr as *const std::sync::atomic::AtomicU32);
             atomic
@@ -2868,6 +2880,10 @@ impl Memory {
             trace_unmapped_guest_access("EXCLUSIVE_WRITE", vaddr, 64);
             log::error!("Unmapped WriteExclusive64 @ {:#018x}", vaddr);
             return true;
+        }
+        // Upstream GetPointerImpl notifies the rasterizer for cached pages before the CAS.
+        if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+            self.handle_rasterizer_write(vaddr, 8);
         }
         unsafe {
             let atomic = &*(ptr as *const std::sync::atomic::AtomicU64);
@@ -2906,6 +2922,10 @@ impl Memory {
             trace_unmapped_guest_access("EXCLUSIVE_WRITE", vaddr, 128);
             log::error!("Unmapped WriteExclusive128 @ {:#018x}", vaddr);
             return true;
+        }
+        // Upstream GetPointerImpl notifies the rasterizer for cached pages before the CAS.
+        if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+            self.handle_rasterizer_write(vaddr, 16);
         }
         // 16-byte alignment is a hardware requirement for cmpxchg16b.
         // dynarmic only emits STXP for 16-byte-aligned vaddrs per ARM ARM.
@@ -3920,6 +3940,29 @@ mod rasterizer_download_tests {
 
         assert_eq!(applied_host_ptrs.lock().unwrap().len(), 1);
         assert!(reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exclusive_writes_notify_rasterizer_like_upstream() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let host1x_device_addr = 0x1234_5020;
+        let mut system = System::new_for_test();
+        system.set_gpu_core(Box::new(FakeGpuCore {
+            reads: Arc::new(Mutex::new(Vec::new())),
+            writes: writes.clone(),
+            download_size: 0x80,
+        }));
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            applied_host_ptrs: Arc::new(Mutex::new(Vec::new())),
+            aliases: vec![host1x_device_addr],
+        }));
+
+        let (_device_memory, _page_table, memory, vaddr, _backing_device_addr) =
+            make_rasterizer_cached_memory(&system);
+        assert!(memory.write_exclusive_32(vaddr + 0x20, 0x1234_5678, 0));
+
+        assert_eq!(&*writes.lock().unwrap(), &[(host1x_device_addr, 4)]);
+        assert_eq!(memory.read_32(vaddr + 0x20), 0x1234_5678);
     }
 
     #[test]

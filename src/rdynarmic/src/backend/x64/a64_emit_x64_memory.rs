@@ -529,7 +529,7 @@ fn emit_read_fallback(
     let value_reg = Reg::gpr64(value_idx);
 
     // RUZU_FALLBACK_MARK_XMM15=1 — also mark for read fallback.
-    if std::env::var("RUZU_FALLBACK_MARK_XMM15").is_ok() {
+    if crate::debug_env_var!("RUZU_FALLBACK_MARK_XMM15").is_ok() {
         asm.db(0x66).unwrap();
         asm.db(0x45).unwrap();
         asm.db(0x0F).unwrap();
@@ -603,7 +603,7 @@ fn emit_write_fallback(
     // RUZU_FALLBACK_MARK_XMM15=1 — set xmm15 to all-FFs at fallback entry
     // so a subsequent W128 callback can detect whether ANY fastmem
     // fallback fired during this block's execution.
-    if std::env::var("RUZU_FALLBACK_MARK_XMM15").is_ok() {
+    if crate::debug_env_var!("RUZU_FALLBACK_MARK_XMM15").is_ok() {
         // pcmpeqb xmm15, xmm15 → xmm15 = 0xFF...FF
         // 66 45 0F 74 FF (REX.RB to make BOTH operands xmm15)
         asm.db(0x66).unwrap();
@@ -841,7 +841,7 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
     // RUZU_NO_FASTMEM_R64=1 — force 64-bit reads through slow-path
     // callback, mirror of RUZU_NO_FASTMEM_W64. Used to test fastmem-read
     // vs slow-path-write coherency.
-    let force_callback_for_r64 = BITSIZE == 64 && std::env::var_os("RUZU_NO_FASTMEM_R64").is_some();
+    let force_callback_for_r64 = BITSIZE == 64 && crate::debug_env_var_os!("RUZU_NO_FASTMEM_R64").is_some();
     let fastmem_marker = (!force_callback_for_r64)
         .then(|| should_fastmem(ctx, inst_ref))
         .flatten();
@@ -898,7 +898,7 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
     // STK corrupt pattern (byte 5 = 0x21, byte 4 = 0x01, bytes 6,7 = 0).
     // Catches the moment a corrupt heap-shifted pointer is used as a
     // memory address. Emitted only for 64-bit reads to avoid clutter.
-    if BITSIZE == 64 && std::env::var_os("RUZU_TRAP_LDR_BYTE5_21").is_some() && vaddr_idx != 11 {
+    if BITSIZE == 64 && crate::debug_env_var_os!("RUZU_TRAP_LDR_BYTE5_21").is_some() && vaddr_idx != 11 {
         let ok = ra.asm.create_label();
         // Save scratch: push rax (no flag changes), then build the check.
         // This needs to happen BEFORE the fastmem mov so we don't fault
@@ -985,11 +985,11 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
         // filters UTF-8/string false positives such as 0x0000210100670067.
         // Vaddr is recovered by ruzu-cmd's SIGILL handler from [RSP+16],
         // matching the W64 trap stack layout.
-        let trap_value_pc = std::env::var("RUZU_TRAP_FASTMEM_R64_VALUE_PATTERN_AT")
+        let trap_value_pc = crate::debug_env_var!("RUZU_TRAP_FASTMEM_R64_VALUE_PATTERN_AT")
             .ok()
             .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
-        let trap_heapshift = std::env::var_os("RUZU_TRAP_FASTMEM_R64_HEAPSHIFT").is_some();
-        let trap_value_here = (std::env::var_os("RUZU_TRAP_FASTMEM_R64_VALUE_PATTERN").is_some()
+        let trap_heapshift = crate::debug_env_var_os!("RUZU_TRAP_FASTMEM_R64_HEAPSHIFT").is_some();
+        let trap_value_here = (crate::debug_env_var_os!("RUZU_TRAP_FASTMEM_R64_VALUE_PATTERN").is_some()
             || trap_heapshift)
             && trap_value_pc.map_or(true, |pc| {
                 A64LocationDescriptor::from_location(ctx.location).pc() == pc
@@ -1098,10 +1098,10 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
     // saw corrupt — so a non-64-bit fastmem-direct write must be
     // bypassing. Bisecting by width nails down which.
     let force_callback = match BITSIZE {
-        8 => std::env::var_os("RUZU_NO_FASTMEM_W8").is_some(),
-        16 => std::env::var_os("RUZU_NO_FASTMEM_W16").is_some(),
-        32 => std::env::var_os("RUZU_NO_FASTMEM_W32").is_some(),
-        64 => std::env::var_os("RUZU_NO_FASTMEM_W64").is_some(),
+        8 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_W8").is_some(),
+        16 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_W16").is_some(),
+        32 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_W32").is_some(),
+        64 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_W64").is_some(),
         _ => false,
     };
     let fastmem_marker = (!force_callback)
@@ -1252,17 +1252,17 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
         // filter, additionally require an exact destination. Used after the
         // bad link's source metadata address is known.
         // Vaddr is recovered from stack via sentinel marker.
-        let trap_corrupt_value = std::env::var_os("RUZU_TRAP_FASTMEM_W64_CORRUPT").is_some();
-        let trap_target_vaddr = std::env::var("RUZU_TRAP_FASTMEM_W64_VADDR")
+        let trap_corrupt_value = crate::debug_env_var_os!("RUZU_TRAP_FASTMEM_W64_CORRUPT").is_some();
+        let trap_target_vaddr = crate::debug_env_var!("RUZU_TRAP_FASTMEM_W64_VADDR")
             .ok()
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-        let trap_corrupt_target_vaddr = std::env::var("RUZU_TRAP_FASTMEM_W64_CORRUPT_VADDR")
+        let trap_corrupt_target_vaddr = crate::debug_env_var!("RUZU_TRAP_FASTMEM_W64_CORRUPT_VADDR")
             .ok()
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-        let trap_odd_bin_value = std::env::var_os("RUZU_TRAP_FASTMEM_W64_ODD_BIN_VALUE").is_some();
+        let trap_odd_bin_value = crate::debug_env_var_os!("RUZU_TRAP_FASTMEM_W64_ODD_BIN_VALUE").is_some();
         let trap_odd_bin_value_heap_dst =
-            std::env::var_os("RUZU_TRAP_FASTMEM_W64_ODD_BIN_VALUE_HEAP_DST").is_some();
-        let trap_odd_bin_value_vaddr = std::env::var("RUZU_TRAP_FASTMEM_W64_ODD_BIN_VALUE_VADDR")
+            crate::debug_env_var_os!("RUZU_TRAP_FASTMEM_W64_ODD_BIN_VALUE_HEAP_DST").is_some();
+        let trap_odd_bin_value_vaddr = crate::debug_env_var!("RUZU_TRAP_FASTMEM_W64_ODD_BIN_VALUE_VADDR")
             .ok()
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
         // RUZU_TRAP_FASTMEM_W64_VALUE_TAGGED_PHANTOM=1 — trap when a W64
@@ -1272,7 +1272,7 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
         // with low bit set). This is the value that taints chunk[+16] and
         // later causes the misaligned `str x3, [x4, #24]` at PC 0x80E441B8.
         let trap_tagged_phantom =
-            std::env::var_os("RUZU_TRAP_FASTMEM_W64_VALUE_TAGGED_PHANTOM").is_some();
+            crate::debug_env_var_os!("RUZU_TRAP_FASTMEM_W64_VALUE_TAGGED_PHANTOM").is_some();
         // Use R11 (=11) as scratch — rarely used by fastmem path. Skip if
         // value or vaddr happens to be in R11.
         if BITSIZE == 64
@@ -1342,7 +1342,7 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
         // tag-bit-set form `0x814903E1` is the result of an OR somewhere
         // downstream; the seed could be the aligned value.
         let trap_odd_bin_skip_low_bit =
-            std::env::var_os("RUZU_TRAP_FASTMEM_W64_ODD_BIN_SKIP_LOW_BIT").is_some();
+            crate::debug_env_var_os!("RUZU_TRAP_FASTMEM_W64_ODD_BIN_SKIP_LOW_BIT").is_some();
         if BITSIZE == 64
             && (trap_odd_bin_value || trap_odd_bin_value_heap_dst)
             && trap_odd_bin_value_vaddr.is_none()
@@ -1374,7 +1374,7 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
             // different mstate-region-tagged values like `0x8148_FFFF`
             // (which is the predecessor of `0x8149FFFF` in the chain at
             // PC=0x80211BF8).
-            let prefix = std::env::var("RUZU_TRAP_FASTMEM_W64_ODD_BIN_PREFIX")
+            let prefix = crate::debug_env_var!("RUZU_TRAP_FASTMEM_W64_ODD_BIN_PREFIX")
                 .ok()
                 .and_then(|s| i32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0x8149i32);
@@ -1486,7 +1486,7 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
         // corruption is from W8 or W32 fastmem-direct stores piecing the value
         // together. Bisection confirmed RUZU_NO_FASTMEM_W8/W32/W64 each
         // individually prevents the wedge.
-        let trap_any_range = std::env::var("RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE")
+        let trap_any_range = crate::debug_env_var!("RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE")
             .ok()
             .and_then(|s| {
                 let parts: Vec<&str> = s.split(':').collect();
@@ -1505,7 +1505,7 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
         // those aren't caught by vaddr- or value-filtered traps that check
         // the write's own register/destination.
         let trap_slot_after_write =
-            std::env::var("RUZU_TRAP_SLOT_AFTER_WRITE")
+            crate::debug_env_var!("RUZU_TRAP_SLOT_AFTER_WRITE")
                 .ok()
                 .and_then(|s| {
                     let parts: Vec<&str> = s.split(':').collect();

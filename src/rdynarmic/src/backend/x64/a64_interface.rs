@@ -133,17 +133,17 @@ fn a64_trace_registry() -> &'static Mutex<HashMap<usize, usize>> {
 }
 
 fn a64_trace_env_enabled() -> bool {
-    std::env::var_os("RUZU_BLOCK_TRACE_PC").is_some()
-        || std::env::var_os("RUZU_BLOCK_TRACE_CALLER_AT").is_some()
-        || std::env::var_os("RUZU_BLOCK_TRACE_BAD_X19_CALLER_AT").is_some()
-        || std::env::var_os("RUZU_BLOCK_TRACE_BAD_X0_LIVE_LR_AT").is_some()
-        || std::env::var_os("RUZU_BLOCK_TRACE_BAD_X1_LIVE_LR_AT").is_some()
-        || std::env::var_os("RUZU_BLOCK_TRACE_LIVE_LR_AT").is_some()
-        || std::env::var_os("RUZU_DUMP_MEM_AT").is_some()
-        || std::env::var_os("RUZU_DUMP_VEC_AT").is_some()
-        || std::env::var_os("RUZU_DUMP_STRING_AT").is_some()
-        || std::env::var_os("RUZU_BLOCK_COUNT_PC").is_some()
-        || std::env::var_os("RUZU_FIRST_PCS_PER_CORE").is_some()
+    crate::debug_env_var_os!("RUZU_BLOCK_TRACE_PC").is_some()
+        || crate::debug_env_var_os!("RUZU_BLOCK_TRACE_CALLER_AT").is_some()
+        || crate::debug_env_var_os!("RUZU_BLOCK_TRACE_BAD_X19_CALLER_AT").is_some()
+        || crate::debug_env_var_os!("RUZU_BLOCK_TRACE_BAD_X0_LIVE_LR_AT").is_some()
+        || crate::debug_env_var_os!("RUZU_BLOCK_TRACE_BAD_X1_LIVE_LR_AT").is_some()
+        || crate::debug_env_var_os!("RUZU_BLOCK_TRACE_LIVE_LR_AT").is_some()
+        || crate::debug_env_var_os!("RUZU_DUMP_MEM_AT").is_some()
+        || crate::debug_env_var_os!("RUZU_DUMP_VEC_AT").is_some()
+        || crate::debug_env_var_os!("RUZU_DUMP_STRING_AT").is_some()
+        || crate::debug_env_var_os!("RUZU_BLOCK_COUNT_PC").is_some()
+        || crate::debug_env_var_os!("RUZU_FIRST_PCS_PER_CORE").is_some()
         || PC_TRACE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -191,7 +191,7 @@ fn a64_trace_block_entry(inner: &mut JitInner) {
             // use-after-free wedge. Lower overhead than logging every
             // block-entry to a wide PC range; preserves the multi-core
             // race timing window better.
-            let pass_x0_filter = match std::env::var("RUZU_TRACE_FREE_X0_RANGE") {
+            let pass_x0_filter = match crate::debug_env_var!("RUZU_TRACE_FREE_X0_RANGE") {
                 Ok(spec) => {
                     let mut parts = spec.splitn(2, '-');
                     let lo_str = parts.next().unwrap_or("").trim_start_matches("0x");
@@ -207,7 +207,7 @@ fn a64_trace_block_entry(inner: &mut JitInner) {
                 // (gettid()) and emulator core index per block-entry. Used to
                 // identify which guest threads/emulator-cores enter the same
                 // guest block concurrently (multi-core race investigation).
-                let include_tid = std::env::var_os("RUZU_BLOCK_TRACE_INCLUDE_TID").is_some();
+                let include_tid = crate::debug_env_var_os!("RUZU_BLOCK_TRACE_INCLUDE_TID").is_some();
                 if include_tid {
                     #[cfg(target_os = "linux")]
                     let tid = unsafe { libc::syscall(libc::SYS_gettid) };
@@ -254,7 +254,7 @@ fn a64_trace_block_entry(inner: &mut JitInner) {
     // Targeted: when entering specific guest PCs, dump saved-LR from stack
     // (= the BL site that called the function we're now in). Gated by
     // RUZU_BLOCK_TRACE_CALLER_AT=0xPC1,0xPC2,...
-    if let Ok(env) = std::env::var("RUZU_BLOCK_TRACE_CALLER_AT") {
+    if let Ok(env) = crate::debug_env_var!("RUZU_BLOCK_TRACE_CALLER_AT") {
         let pc64 = inner.jit_state.pc;
         for raw_target in env.split(',') {
             let raw = raw_target.trim().trim_start_matches("0x");
@@ -283,7 +283,7 @@ fn a64_trace_block_entry(inner: &mut JitInner) {
     // Same stack-walk as RUZU_BLOCK_TRACE_CALLER_AT, but only prints when
     // X19 has STK's shifted-heap-pointer shape (0x00002101...). This keeps
     // the allocator/free trace low-noise enough to avoid timing perturbation.
-    if let Ok(env) = std::env::var("RUZU_BLOCK_TRACE_BAD_X19_CALLER_AT") {
+    if let Ok(env) = crate::debug_env_var!("RUZU_BLOCK_TRACE_BAD_X19_CALLER_AT") {
         let pc64 = inner.jit_state.pc;
         let x19 = inner.jit_state.reg[19];
         let bad_x19_shape = (x19 >> 40) == 0x21 && ((x19 >> 32) & 0xFF) == 0x01;
@@ -309,7 +309,7 @@ fn a64_trace_block_entry(inner: &mut JitInner) {
     // Function-entry variant for delete/free wrappers: X0 is the pointer
     // argument before wrapper code moves it to X19 and forwards it as X1 to
     // the allocator free path.
-    if let Ok(env) = std::env::var("RUZU_BLOCK_TRACE_BAD_X0_LIVE_LR_AT") {
+    if let Ok(env) = crate::debug_env_var!("RUZU_BLOCK_TRACE_BAD_X0_LIVE_LR_AT") {
         let pc64 = inner.jit_state.pc;
         let x0 = inner.jit_state.reg[0];
         let bad_x0_shape = (x0 >> 40) == 0x21 && ((x0 >> 32) & 0xFF) == 0x01;
@@ -332,7 +332,7 @@ fn a64_trace_block_entry(inner: &mut JitInner) {
     // Function-entry variant for free/delete paths: X1 is the pointer
     // argument before the prologue copies it to X19. X30 is still the live
     // caller return address, so no guest stack read is needed.
-    if let Ok(env) = std::env::var("RUZU_BLOCK_TRACE_BAD_X1_LIVE_LR_AT") {
+    if let Ok(env) = crate::debug_env_var!("RUZU_BLOCK_TRACE_BAD_X1_LIVE_LR_AT") {
         let pc64 = inner.jit_state.pc;
         let x1 = inner.jit_state.reg[1];
         let bad_x1_shape = (x1 >> 40) == 0x21 && ((x1 >> 32) & 0xFF) == 0x01;
@@ -354,7 +354,7 @@ fn a64_trace_block_entry(inner: &mut JitInner) {
 
     // Same idea but using LIVE x30 (register), useful when at the function-entry
     // PC where the prologue hasn't yet pushed x30 to stack.
-    if let Ok(env) = std::env::var("RUZU_BLOCK_TRACE_LIVE_LR_AT") {
+    if let Ok(env) = crate::debug_env_var!("RUZU_BLOCK_TRACE_LIVE_LR_AT") {
         let pc64 = inner.jit_state.pc;
         for raw_target in env.split(',') {
             let raw = raw_target.trim().trim_start_matches("0x");
@@ -388,7 +388,7 @@ fn a64_trace_block_entry(inner: &mut JitInner) {
     // Generic memory-dump-at-PC. Format: RUZU_DUMP_MEM_AT=PC:reg:size,PC:reg:size,...
     // PC is hex, reg is x register index 0..30 or `sp`, size is number of BYTES
     // to dump. Reads guest memory at the value of `reg`/SP when the block enters.
-    if let Ok(env) = std::env::var("RUZU_DUMP_MEM_AT") {
+    if let Ok(env) = crate::debug_env_var!("RUZU_DUMP_MEM_AT") {
         let pc64 = inner.jit_state.pc;
         for spec in env.split(',') {
             let parts: Vec<&str> = spec.split(':').collect();
@@ -444,7 +444,7 @@ fn a64_trace_block_entry(inner: &mut JitInner) {
 
     // Dump selected A64 vector registers at PC. Format:
     // RUZU_DUMP_VEC_AT=PC:vN/vM/...,PC:vN/...
-    if let Ok(env) = std::env::var("RUZU_DUMP_VEC_AT") {
+    if let Ok(env) = crate::debug_env_var!("RUZU_DUMP_VEC_AT") {
         let pc64 = inner.jit_state.pc;
         for spec in env.split(',') {
             let Some((pc_raw, regs_raw)) = spec.split_once(':') else {
@@ -489,7 +489,7 @@ fn a64_trace_block_entry(inner: &mut JitInner) {
     // Dump a guest std::string-like object at PC. Format:
     // RUZU_DUMP_STRING_AT=PC:reg[:max],...
     // `reg` points at an object whose first three qwords are ptr/len/cap.
-    if let Ok(env) = std::env::var("RUZU_DUMP_STRING_AT") {
+    if let Ok(env) = crate::debug_env_var!("RUZU_DUMP_STRING_AT") {
         let pc64 = inner.jit_state.pc;
         for spec in env.split(',') {
             let parts: Vec<&str> = spec.split(':').collect();
@@ -1154,7 +1154,7 @@ extern "C" fn lookup_block_trampoline(inner_ptr: u64) -> u64 {
         return code_ptr as u64;
     }
 
-    if std::env::var_os("RUZU_TRACE_A64_COMPILE_PC").is_some() {
+    if crate::debug_env_var_os!("RUZU_TRACE_A64_COMPILE_PC").is_some() {
         eprintln!(
             "[TRACE_A64_COMPILE_PC] pc=0x{:016X} lr=0x{:016X} sp=0x{:016X}",
             inner.jit_state.pc, inner.jit_state.reg[30], inner.jit_state.sp

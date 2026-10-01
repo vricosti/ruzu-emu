@@ -20,7 +20,7 @@ use super::prelude::{DispatcherCallback, PreludeIsa, PreludeOptions, TickCallbac
 
 fn trace_a64_exclusive_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_A64_EXCLUSIVE").is_some())
+    *ENABLED.get_or_init(|| crate::debug_env_var_os!("RUZU_TRACE_A64_EXCLUSIVE").is_some())
 }
 
 /// A64-specific ARM64 address-space owner.

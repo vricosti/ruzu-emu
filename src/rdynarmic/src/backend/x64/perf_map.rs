@@ -19,7 +19,7 @@ mod imp {
     }
 
     fn open_file() -> Option<File> {
-        let perf_dir = std::env::var_os("PERF_BUILDID_DIR")?;
+        let perf_dir = crate::debug_env_var_os!("PERF_BUILDID_DIR")?;
         let filename = PathBuf::from(perf_dir).join(format!("perf-{}.map", std::process::id()));
         File::create(filename).ok()
     }

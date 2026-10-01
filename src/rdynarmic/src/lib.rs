@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod common;
+pub mod debug_env;
 pub mod frontend;
 pub mod interface;
 pub mod ir;

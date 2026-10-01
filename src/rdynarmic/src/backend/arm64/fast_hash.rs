@@ -54,7 +54,7 @@ pub type FastHashSet<T> = HashSet<T, FastBuildHasher>;
 pub fn arm64_code_cache_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("RUZU_PROFILE_ARM64_CODE_CACHE")
+        crate::debug_env_var_os!("RUZU_PROFILE_ARM64_CODE_CACHE")
             .is_some_and(|value| value != std::ffi::OsStr::new("0"))
     })
 }

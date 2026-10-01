@@ -145,19 +145,19 @@ pub fn emit_a64_set_x(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, 
     // load random heap data that often happens to match our filter,
     // producing false positives. Disable this to catch the FIRST
     // corrupt SetX regardless of source.
-    let skip_loads = std::env::var_os("RUZU_TRAP_SETX_SKIP_LOADS").is_some();
+    let skip_loads = crate::debug_env_var_os!("RUZU_TRAP_SETX_SKIP_LOADS").is_some();
     let skip_due_to_load = skip_loads && source_opcode.is_some_and(is_memory_load_opcode);
     // RUZU_TRAP_SETX_SKIP_PC=0xPC,0xPC,... — skip specific guest PCs
     // (e.g., known-FP string-scan PCs).
     let block_pc = ctx.arch.extract_pc(ctx.location);
-    let skip_due_to_pc = match std::env::var("RUZU_TRAP_SETX_SKIP_PC") {
+    let skip_due_to_pc = match crate::debug_env_var!("RUZU_TRAP_SETX_SKIP_PC") {
         Ok(spec) => spec
             .split(',')
             .filter_map(|p| u64::from_str_radix(p.trim().trim_start_matches("0x"), 16).ok())
             .any(|p| p == block_pc),
         Err(_) => false,
     };
-    if std::env::var_os("RUZU_TRAP_SETX_BYTE5_21").is_some() && !skip_due_to_load && !skip_due_to_pc
+    if crate::debug_env_var_os!("RUZU_TRAP_SETX_BYTE5_21").is_some() && !skip_due_to_load && !skip_due_to_pc
     {
         let ok = ra.asm.create_label();
         // byte 7 must be zero

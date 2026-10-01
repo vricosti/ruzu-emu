@@ -312,7 +312,7 @@ impl A64EmitX64 {
 
         // RUZU_DUMP_IR_AT_PC=0xADDR[,0xADDR2,...] — dump the IR for blocks
         // whose entry PC matches any listed address, both pre- and post-opt.
-        let dump_block_at_pc: Vec<u64> = std::env::var("RUZU_DUMP_IR_AT_PC")
+        let dump_block_at_pc: Vec<u64> = crate::debug_env_var!("RUZU_DUMP_IR_AT_PC")
             .ok()
             .map(|s| {
                 s.split(',')
@@ -353,7 +353,7 @@ impl A64EmitX64 {
             self.emit_config.hook_data_cache_operations,
             self.emit_config.dczid_el0,
         );
-        let skip_getset_at_pc: Vec<u64> = std::env::var("RUZU_SKIP_GETSET_AT_PC")
+        let skip_getset_at_pc: Vec<u64> = crate::debug_env_var!("RUZU_SKIP_GETSET_AT_PC")
             .ok()
             .map(|s| {
                 s.split(',')
@@ -364,7 +364,7 @@ impl A64EmitX64 {
                     .collect()
             })
             .unwrap_or_default();
-        let skip_getset_range = std::env::var("RUZU_SKIP_GETSET_RANGE").ok().and_then(|s| {
+        let skip_getset_range = crate::debug_env_var!("RUZU_SKIP_GETSET_RANGE").ok().and_then(|s| {
             let (start, end) = s.split_once(':')?;
             let start = u64::from_str_radix(start.trim().trim_start_matches("0x"), 16).ok()?;
             let end = u64::from_str_radix(end.trim().trim_start_matches("0x"), 16).ok()?;
@@ -540,7 +540,7 @@ impl A64EmitX64 {
         // RUZU_DUMP_X64_AT_PC=0xADDR[,0xADDR2,...] — dump emitted x86 bytes
         // for the block whose guest entry PC matches. Useful for debugging
         // regalloc bugs where IR is correct but emitted x86 misbehaves.
-        if let Ok(spec) = std::env::var("RUZU_DUMP_X64_AT_PC") {
+        if let Ok(spec) = crate::debug_env_var!("RUZU_DUMP_X64_AT_PC") {
             let pcs: Vec<u64> = spec
                 .split(',')
                 .filter_map(|p| u64::from_str_radix(p.trim().trim_start_matches("0x"), 16).ok())

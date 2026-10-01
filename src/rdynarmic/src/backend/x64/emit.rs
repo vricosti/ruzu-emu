@@ -46,7 +46,7 @@ use rxbyak::{
 fn profile_opcodes_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("RDYNARMIC_PROFILE_OPCODES").is_some())
+    *CACHED.get_or_init(|| crate::debug_env_var_os!("RDYNARMIC_PROFILE_OPCODES").is_some())
 }
 
 fn rsb_offsets(ctx: &EmitContext) -> (usize, usize, usize) {
@@ -171,7 +171,7 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
         let _ = ra.asm.pop(rxbyak::RAX);
     }
 
-    let trace_emit_at_pc = std::env::var("RUZU_TRACE_A64_EMIT_PC").ok().and_then(|s| {
+    let trace_emit_at_pc = crate::debug_env_var!("RUZU_TRACE_A64_EMIT_PC").ok().and_then(|s| {
         let s = s.trim_start_matches("0x");
         u64::from_str_radix(s, 16).ok()
     });
@@ -189,7 +189,7 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
     // xmm14 != all-FFs, EITHER the block was entered MID-WAY (skipping
     // the marker), OR something between the marker and the callback
     // modified xmm14.
-    if std::env::var("RUZU_BLOCK_ENTRY_MARKER").is_ok() && !ctx.arch.is_a32() {
+    if crate::debug_env_var!("RUZU_BLOCK_ENTRY_MARKER").is_ok() && !ctx.arch.is_a32() {
         // pcmpeqb xmm14, xmm14: 66 45 0F 74 F6 (REX.RB to make BOTH
         // operands xmm14 instead of xmm6).
         ra.asm.db(0x66).unwrap();
@@ -1844,7 +1844,7 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
         // after that point in the block). Raises SIGILL when xmm1 becomes
         // non-zero so we can bisect the corruption point.
         if !ctx.arch.is_a32() && bcast64_zero_seen {
-            if let Ok(spec) = std::env::var("RUZU_PER_INST_XMM1_CHECK") {
+            if let Ok(spec) = crate::debug_env_var!("RUZU_PER_INST_XMM1_CHECK") {
                 let block_pc = ctx.arch.extract_pc(ctx.location);
                 let pcs: Vec<u64> = spec
                     .split(',')
@@ -1907,7 +1907,7 @@ fn a64_block_trace_range() -> Option<(u64, u64)> {
 
     static RANGE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
     *RANGE.get_or_init(|| {
-        let raw = std::env::var("RUZU_BLOCK_TRACE_PC").ok()?;
+        let raw = crate::debug_env_var!("RUZU_BLOCK_TRACE_PC").ok()?;
         let (lo, hi) = raw.split_once('-')?;
         let parse =
             |value: &str| u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok();
@@ -1920,7 +1920,7 @@ fn a64_dump_mem_trace_pcs() -> &'static [u64] {
 
     static PCS: OnceLock<Vec<u64>> = OnceLock::new();
     PCS.get_or_init(|| {
-        std::env::var("RUZU_DUMP_MEM_AT")
+        crate::debug_env_var!("RUZU_DUMP_MEM_AT")
             .ok()
             .into_iter()
             .flat_map(|value| {
@@ -1948,20 +1948,20 @@ fn a64_block_entry_trace_hook_enabled(ctx: &EmitContext) -> bool {
 
     static GLOBAL_HOOK_ENABLED: OnceLock<bool> = OnceLock::new();
     *GLOBAL_HOOK_ENABLED.get_or_init(|| {
-        std::env::var_os("RUZU_BLOCK_TRACE_CALLER_AT").is_some()
-            || std::env::var_os("RUZU_BLOCK_TRACE_BAD_X19_CALLER_AT").is_some()
-            || std::env::var_os("RUZU_BLOCK_TRACE_BAD_X0_LIVE_LR_AT").is_some()
-            || std::env::var_os("RUZU_BLOCK_TRACE_BAD_X1_LIVE_LR_AT").is_some()
-            || std::env::var_os("RUZU_BLOCK_TRACE_LIVE_LR_AT").is_some()
-            || std::env::var_os("RUZU_DUMP_VEC_AT").is_some()
-            || std::env::var_os("RUZU_DUMP_STRING_AT").is_some()
-            || std::env::var_os("RUZU_FIRST_PCS_PER_CORE").is_some()
+        crate::debug_env_var_os!("RUZU_BLOCK_TRACE_CALLER_AT").is_some()
+            || crate::debug_env_var_os!("RUZU_BLOCK_TRACE_BAD_X19_CALLER_AT").is_some()
+            || crate::debug_env_var_os!("RUZU_BLOCK_TRACE_BAD_X0_LIVE_LR_AT").is_some()
+            || crate::debug_env_var_os!("RUZU_BLOCK_TRACE_BAD_X1_LIVE_LR_AT").is_some()
+            || crate::debug_env_var_os!("RUZU_BLOCK_TRACE_LIVE_LR_AT").is_some()
+            || crate::debug_env_var_os!("RUZU_DUMP_VEC_AT").is_some()
+            || crate::debug_env_var_os!("RUZU_DUMP_STRING_AT").is_some()
+            || crate::debug_env_var_os!("RUZU_FIRST_PCS_PER_CORE").is_some()
     })
 }
 
 fn a64_bad_xreg_trap_for_block(ctx: &EmitContext) -> Option<usize> {
     let block_pc = ctx.arch.extract_pc(ctx.location);
-    let raw = std::env::var("RUZU_TRAP_BAD_XREG_AT").ok()?;
+    let raw = crate::debug_env_var!("RUZU_TRAP_BAD_XREG_AT").ok()?;
     for spec in raw.split(',') {
         let Some((pc_raw, reg_raw)) = spec.split_once(':') else {
             continue;

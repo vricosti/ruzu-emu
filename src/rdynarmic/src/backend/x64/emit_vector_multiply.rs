@@ -763,7 +763,7 @@ pub fn emit_vector_paired_max_unsigned8(
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    if std::env::var_os("RUZU_FORCE_PAIRED_MAX_U8_FALLBACK").is_some() {
+    if crate::debug_env_var_os!("RUZU_FORCE_PAIRED_MAX_U8_FALLBACK").is_some() {
         emit_two_arg_fallback(
             ra,
             inst_ref,

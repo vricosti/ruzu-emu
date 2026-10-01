@@ -36,7 +36,7 @@ pub(crate) fn block_count_range() -> Option<(u32, u32)> {
     use std::sync::OnceLock;
     static RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
     *RANGE.get_or_init(|| {
-        let raw = std::env::var("RUZU_BLOCK_COUNT_PC").ok()?;
+        let raw = crate::debug_env_var!("RUZU_BLOCK_COUNT_PC").ok()?;
         let mut parts = raw.splitn(2, '-');
         let lo = u32::from_str_radix(parts.next()?.trim_start_matches("0x"), 16).ok()?;
         let hi = u32::from_str_radix(parts.next()?.trim_start_matches("0x"), 16).ok()?;
@@ -80,7 +80,7 @@ pub fn block_prologue_count_range() -> Option<(u32, u32)> {
     use std::sync::OnceLock;
     static RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
     *RANGE.get_or_init(|| {
-        let raw = std::env::var("RUZU_BLOCK_PROLOGUE_COUNT_PC").ok()?;
+        let raw = crate::debug_env_var!("RUZU_BLOCK_PROLOGUE_COUNT_PC").ok()?;
         let mut parts = raw.splitn(2, '-');
         let lo = u32::from_str_radix(parts.next()?.trim_start_matches("0x"), 16).ok()?;
         let hi = u32::from_str_radix(parts.next()?.trim_start_matches("0x"), 16).ok()?;
@@ -124,7 +124,7 @@ pub fn block_prologue_top_range() -> Option<(u32, u32)> {
     use std::sync::OnceLock;
     static RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
     *RANGE.get_or_init(|| {
-        let raw = std::env::var("RUZU_BLOCK_PROLOGUE_TOP_PC").ok()?;
+        let raw = crate::debug_env_var!("RUZU_BLOCK_PROLOGUE_TOP_PC").ok()?;
         let mut parts = raw.splitn(2, '-');
         let lo = u32::from_str_radix(parts.next()?.trim_start_matches("0x"), 16).ok()?;
         let hi = u32::from_str_radix(parts.next()?.trim_start_matches("0x"), 16).ok()?;
@@ -157,7 +157,7 @@ fn block_prologue_top_limit() -> usize {
     use std::sync::OnceLock;
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        std::env::var("RUZU_BLOCK_PROLOGUE_TOP_N")
+        crate::debug_env_var!("RUZU_BLOCK_PROLOGUE_TOP_N")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(32)
@@ -176,7 +176,7 @@ fn first_pcs_capacity() -> usize {
     use std::sync::OnceLock;
     static CAP: OnceLock<usize> = OnceLock::new();
     *CAP.get_or_init(|| {
-        std::env::var("RUZU_FIRST_PCS_PER_CORE")
+        crate::debug_env_var!("RUZU_FIRST_PCS_PER_CORE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0)
@@ -383,7 +383,7 @@ pub fn a32_pc_trace_target() -> Option<u64> {
     use std::sync::OnceLock;
     static T: OnceLock<Option<u64>> = OnceLock::new();
     *T.get_or_init(|| {
-        std::env::var("RUZU_A32_PC_TRACE").ok().and_then(|s| {
+        crate::debug_env_var!("RUZU_A32_PC_TRACE").ok().and_then(|s| {
             let s = s.trim();
             let s = s
                 .strip_prefix("0x")
@@ -442,7 +442,7 @@ fn a32_pc_trace_lr_filter() -> Option<u32> {
     use std::sync::OnceLock;
     static LR: OnceLock<Option<u32>> = OnceLock::new();
     *LR.get_or_init(|| {
-        std::env::var("RUZU_A32_PC_TRACE_LR_FILTER")
+        crate::debug_env_var!("RUZU_A32_PC_TRACE_LR_FILTER")
             .ok()
             .and_then(|s| {
                 let s = s.trim();
@@ -461,7 +461,7 @@ pub fn a32_pc_trace_after_insts() -> &'static Vec<usize> {
     use std::sync::OnceLock;
     static INSTS: OnceLock<Vec<usize>> = OnceLock::new();
     INSTS.get_or_init(|| {
-        std::env::var("RUZU_A32_PC_TRACE_AFTER_INST")
+        crate::debug_env_var!("RUZU_A32_PC_TRACE_AFTER_INST")
             .ok()
             .map(|spec| {
                 spec.split(',')
@@ -481,7 +481,7 @@ fn a32_pc_trace_mem_probes() -> &'static Vec<(usize, i64)> {
     static P: OnceLock<Vec<(usize, i64)>> = OnceLock::new();
     P.get_or_init(|| {
         let mut v = Vec::new();
-        if let Ok(spec) = std::env::var("RUZU_A32_PC_TRACE_MEM") {
+        if let Ok(spec) = crate::debug_env_var!("RUZU_A32_PC_TRACE_MEM") {
             for tok in spec.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 // form: rN+0xOFF or rN-0xOFF
                 let (reg_s, sign, off_s) = if let Some(i) = tok.find('+') {
@@ -526,7 +526,7 @@ fn a32_pc_trace_abs_mem_probes() -> &'static Vec<(u64, usize)> {
     static P: OnceLock<Vec<(u64, usize)>> = OnceLock::new();
     P.get_or_init(|| {
         let mut v = Vec::new();
-        if let Ok(spec) = std::env::var("RUZU_A32_PC_TRACE_ABS_MEM") {
+        if let Ok(spec) = crate::debug_env_var!("RUZU_A32_PC_TRACE_ABS_MEM") {
             for tok in spec.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 let (addr_s, size_s) = tok.split_once(':').unwrap_or((tok, "8"));
                 let parse_hex_or_dec = |raw: &str| {
@@ -557,7 +557,7 @@ fn a32_pc_trace_first_hits() -> u64 {
     use std::sync::OnceLock;
     static N: OnceLock<u64> = OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("RUZU_A32_PC_TRACE_FIRST_HITS")
+        crate::debug_env_var!("RUZU_A32_PC_TRACE_FIRST_HITS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(1)
@@ -566,7 +566,7 @@ fn a32_pc_trace_first_hits() -> u64 {
 
 #[cfg(target_arch = "x86_64")]
 fn parse_optional_u32_env(name: &str) -> Option<u32> {
-    std::env::var(name).ok().and_then(|s| {
+    crate::debug_env::var(name).ok().and_then(|s| {
         let s = s.trim();
         let s = s
             .strip_prefix("0x")
@@ -625,7 +625,7 @@ fn a32_pc_trace_match_log_limit() -> u64 {
     use std::sync::OnceLock;
     static N: OnceLock<u64> = OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("RUZU_A32_PC_TRACE_MATCH_LIMIT")
+        crate::debug_env_var!("RUZU_A32_PC_TRACE_MATCH_LIMIT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(64)
@@ -948,7 +948,7 @@ pub(crate) fn watch_write_target() -> Option<(u64, u64)> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        let raw = std::env::var("RUZU_WATCH_WRITE").ok()?;
+        let raw = crate::debug_env_var!("RUZU_WATCH_WRITE").ok()?;
         let (addr_s, len) = match raw.split_once(':') {
             Some((a, l)) => (a, l.parse::<u64>().ok().unwrap_or(8)),
             None => (raw.as_str(), 8u64),
@@ -965,7 +965,7 @@ pub(crate) fn block_trace_range() -> Option<(u32, u32)> {
     use std::sync::OnceLock;
     static RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
     *RANGE.get_or_init(|| {
-        let raw = std::env::var("RUZU_BLOCK_TRACE_PC").ok()?;
+        let raw = crate::debug_env_var!("RUZU_BLOCK_TRACE_PC").ok()?;
         let (a, b) = raw.split_once('-')?;
         let parse = |s: &str| -> Option<u32> {
             let s = s.trim();

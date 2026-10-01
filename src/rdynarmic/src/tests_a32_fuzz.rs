@@ -116,7 +116,7 @@ mod tests {
     }
 
     fn oracle_path() -> std::path::PathBuf {
-        std::env::var_os("RDYNARMIC_A32_ORACLE")
+        crate::debug_env_var_os!("RDYNARMIC_A32_ORACLE")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -382,7 +382,7 @@ fn emit_bitsize_write_mov(
 }
 
 fn parse_fastmem_vaddr_range_env() -> Option<(u64, u64)> {
-    std::env::var("RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE")
+    crate::debug_env_var!("RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE")
         .ok()
         .and_then(|s| {
             let parts: Vec<&str> = s.split(':').collect();
@@ -402,7 +402,7 @@ fn parse_fastmem_vaddr_range_env() -> Option<(u64, u64)> {
 }
 
 fn parse_trace_fastmem_write_range_env() -> Option<(u64, u64)> {
-    std::env::var("RUZU_TRACE_FASTMEM_W_RANGE")
+    crate::debug_env_var!("RUZU_TRACE_FASTMEM_W_RANGE")
         .ok()
         .and_then(|s| {
             let parts: Vec<&str> = s.split(':').collect();
@@ -422,7 +422,7 @@ fn parse_trace_fastmem_write_range_env() -> Option<(u64, u64)> {
 }
 
 fn parse_trap_fastmem_write_value_env() -> Option<u64> {
-    std::env::var("RUZU_TRAP_FASTMEM_W_VALUE")
+    crate::debug_env_var!("RUZU_TRAP_FASTMEM_W_VALUE")
         .ok()
         .and_then(|raw| {
             let raw = raw.trim();
@@ -561,13 +561,13 @@ fn emit_a32_memory_read(
     // `RUZU_NO_FASTMEM_R{8,16,32,64}=1` — force this width's loads through
     // the slow callback path. Counterpart to the write gates above.
     let force_callback = match bitsize {
-        8 => std::env::var_os("RUZU_NO_FASTMEM_R8").is_some(),
-        16 => std::env::var_os("RUZU_NO_FASTMEM_R16").is_some(),
-        32 => std::env::var_os("RUZU_NO_FASTMEM_R32").is_some(),
-        64 => std::env::var_os("RUZU_NO_FASTMEM_R64").is_some(),
+        8 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_R8").is_some(),
+        16 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_R16").is_some(),
+        32 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_R32").is_some(),
+        64 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_R64").is_some(),
         _ => false,
     } || (bitsize == 64
-        && std::env::var("RUZU_NO_FASTMEM_R64_AT_PC")
+        && crate::debug_env_var!("RUZU_NO_FASTMEM_R64_AT_PC")
             .ok()
             .and_then(|raw| {
                 u64::from_str_radix(
@@ -760,10 +760,10 @@ fn emit_a32_memory_write(
     // `arm_dynarmic_32.rs::watch_write`. Mirrors A64's per-width gates in
     // `a64_emit_x64_memory.rs:711-716`.
     let force_callback = match bitsize {
-        8 => std::env::var_os("RUZU_NO_FASTMEM_W8").is_some(),
-        16 => std::env::var_os("RUZU_NO_FASTMEM_W16").is_some(),
-        32 => std::env::var_os("RUZU_NO_FASTMEM_W32").is_some(),
-        64 => std::env::var_os("RUZU_NO_FASTMEM_W64").is_some(),
+        8 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_W8").is_some(),
+        16 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_W16").is_some(),
+        32 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_W32").is_some(),
+        64 => crate::debug_env_var_os!("RUZU_NO_FASTMEM_W64").is_some(),
         _ => false,
     };
 
@@ -902,8 +902,8 @@ fn emit_a32_memory_write(
             let scratch_idx = if vaddr_idx == 11 { 10 } else { 11 };
             let scratch = rxbyak::Reg::gpr64(scratch_idx);
             let trap_nonzero =
-                std::env::var_os("RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE_NONZERO").is_some();
-            let trap_value = std::env::var("RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE_VALUE")
+                crate::debug_env_var_os!("RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE_NONZERO").is_some();
+            let trap_value = crate::debug_env_var!("RUZU_TRAP_FASTMEM_ANY_VADDR_RANGE_VALUE")
                 .ok()
                 .and_then(|raw| {
                     let raw = raw.trim();
@@ -1307,7 +1307,7 @@ fn emit_a32_exclusive_read(
     if ctx.config.memory.fastmem_exclusive_access
         && ctx.fastmem_available
         && ctx.config.global_monitor.is_some()
-        && std::env::var_os("RUZU_NO_EXCLUSIVE_INLINE").is_none()
+        && crate::debug_env_var_os!("RUZU_NO_EXCLUSIVE_INLINE").is_none()
     {
         emit_a32_exclusive_read_inline(ctx, ra, inst_ref, inst, bitsize);
         return;
@@ -1456,7 +1456,7 @@ fn emit_a32_exclusive_write(
     if ctx.config.memory.fastmem_exclusive_access
         && ctx.fastmem_available
         && ctx.config.global_monitor.is_some()
-        && std::env::var_os("RUZU_NO_EXCLUSIVE_INLINE").is_none()
+        && crate::debug_env_var_os!("RUZU_NO_EXCLUSIVE_INLINE").is_none()
     {
         emit_a32_exclusive_write_inline(ctx, ra, inst_ref, inst, bitsize);
         return;

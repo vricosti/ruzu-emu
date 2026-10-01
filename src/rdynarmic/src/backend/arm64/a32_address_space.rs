@@ -203,7 +203,7 @@ impl A32ExclusiveState for A32CallbackContext {
 }
 
 fn trace_a32_mem_pc(context: &A32CallbackContext, op: &str, vaddr: u64, value: Option<u64>) {
-    if std::env::var_os("RUZU_TRACE_A32_MEM_PC").is_none() {
+    if crate::debug_env_var_os!("RUZU_TRACE_A32_MEM_PC").is_none() {
         return;
     }
 
@@ -211,7 +211,7 @@ fn trace_a32_mem_pc(context: &A32CallbackContext, op: &str, vaddr: u64, value: O
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static PC_RANGE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
 
-    let after_ms = std::env::var("RUZU_TRACE_A32_MEM_PC_AFTER_MS")
+    let after_ms = crate::debug_env_var!("RUZU_TRACE_A32_MEM_PC_AFTER_MS")
         .ok()
         .and_then(|raw| raw.parse::<u128>().ok())
         .unwrap_or(0);
@@ -277,7 +277,7 @@ fn trace_a32_mem_pc(context: &A32CallbackContext, op: &str, vaddr: u64, value: O
 }
 
 fn parse_trace_a32_mem_pc_range() -> Option<(u32, u32)> {
-    let raw = std::env::var("RUZU_TRACE_A32_MEM_PC_RANGE").ok()?;
+    let raw = crate::debug_env_var!("RUZU_TRACE_A32_MEM_PC_RANGE").ok()?;
     let (lo, hi) = raw.split_once('-')?;
     let parse = |value: &str| -> Option<u32> {
         let value = value.trim();
@@ -364,7 +364,7 @@ extern "C" fn a32_arm64_add_ticks(ctx: *mut A32CallbackContext, ticks: u64) {
 
 extern "C" fn a32_arm64_get_ticks_remaining(ctx: *mut A32CallbackContext) -> u64 {
     let context = unsafe { &mut *ctx };
-    if std::env::var_os("RUZU_TRACE_A32_TICK_PC").is_some() {
+    if crate::debug_env_var_os!("RUZU_TRACE_A32_TICK_PC").is_some() {
         static TRACE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 128 {
@@ -973,7 +973,7 @@ fn log_a32_fpscr_mode_if_requested(descriptor: LocationDescriptor) {
     static SEEN: std::sync::OnceLock<Option<std::sync::Mutex<std::collections::BTreeSet<u32>>>> =
         std::sync::OnceLock::new();
     let Some(seen) = SEEN.get_or_init(|| {
-        std::env::var_os("RUZU_LOG_A32_FPSCR_MODES")
+        crate::debug_env_var_os!("RUZU_LOG_A32_FPSCR_MODES")
             .map(|_| std::sync::Mutex::new(std::collections::BTreeSet::new()))
     }) else {
         return;
@@ -997,7 +997,7 @@ fn dump_arm64_block_if_requested(block: &Block, block_info: &super::emit_arm64::
         return;
     }
 
-    let dir = std::env::var_os("RUZU_DUMP_ARM64_BLOCK_DIR")
+    let dir = crate::debug_env_var_os!("RUZU_DUMP_ARM64_BLOCK_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp/ruzu-arm64-blocks"));
     if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -1030,7 +1030,7 @@ fn dump_arm64_block_if_requested(block: &Block, block_info: &super::emit_arm64::
 fn dump_arm64_block_range() -> Option<(u32, u32)> {
     static RANGE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
     *RANGE.get_or_init(|| {
-        let raw = std::env::var("RUZU_DUMP_ARM64_BLOCK_PC").ok()?;
+        let raw = crate::debug_env_var!("RUZU_DUMP_ARM64_BLOCK_PC").ok()?;
         let (lo, hi) = raw.split_once('-')?;
         let parse = |value: &str| -> Option<u32> {
             let value = value.trim();
@@ -1059,7 +1059,7 @@ fn dump_a32_ir_if_requested(stage: &str, block: &Block) {
 fn dump_a32_ir_pcs() -> &'static [u32] {
     static PCS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
     PCS.get_or_init(|| {
-        std::env::var("RUZU_DUMP_A32_IR_AT_PC")
+        crate::debug_env_var!("RUZU_DUMP_A32_IR_AT_PC")
             .ok()
             .map(|raw| {
                 raw.split(',')

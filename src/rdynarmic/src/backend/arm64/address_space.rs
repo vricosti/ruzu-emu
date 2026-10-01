@@ -698,7 +698,7 @@ fn dump_relinked_a32_block_if_requested(
         return;
     }
 
-    let dir = std::env::var_os("RUZU_DUMP_ARM64_RELINK_DIR")
+    let dir = crate::debug_env_var_os!("RUZU_DUMP_ARM64_RELINK_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp/ruzu-arm64-relinked-blocks"));
     if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -737,7 +737,7 @@ fn dump_relinked_a32_block_if_requested(
 fn dump_arm64_relink_block_range() -> Option<(u32, u32)> {
     static RANGE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
     *RANGE.get_or_init(|| {
-        let raw = std::env::var("RUZU_DUMP_ARM64_RELINK_PC").ok()?;
+        let raw = crate::debug_env_var!("RUZU_DUMP_ARM64_RELINK_PC").ok()?;
         let (lo, hi) = raw.split_once('-')?;
         let parse = |value: &str| -> Option<u32> {
             let value = value.trim();

@@ -710,14 +710,14 @@ impl A32Jit {
 fn block_trace_verbose() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("RUZU_BLOCK_TRACE_VERBOSE").is_ok())
+    *V.get_or_init(|| crate::debug_env_var!("RUZU_BLOCK_TRACE_VERBOSE").is_ok())
 }
 
 fn block_trace_code_words() -> usize {
     use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("RUZU_BLOCK_TRACE_CODE")
+        crate::debug_env_var!("RUZU_BLOCK_TRACE_CODE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0)
@@ -732,7 +732,7 @@ fn track_pc_lr() -> Option<(u32, u32)> {
     use std::sync::OnceLock;
     static SPEC: OnceLock<Option<(u32, u32)>> = OnceLock::new();
     *SPEC.get_or_init(|| {
-        let raw = std::env::var("RUZU_TRACK_PC_LR").ok()?;
+        let raw = crate::debug_env_var!("RUZU_TRACK_PC_LR").ok()?;
         let (a, b) = raw.split_once(',')?;
         let parse = |s: &str| -> Option<u32> {
             let s = s.trim();
@@ -750,7 +750,7 @@ fn track_offsets() -> &'static [u32] {
     use std::sync::OnceLock;
     static OFFS: OnceLock<Vec<u32>> = OnceLock::new();
     OFFS.get_or_init(|| {
-        let raw = std::env::var("RUZU_TRACK_OFFSETS").unwrap_or_else(|_| "0x1c,0x70".to_string());
+        let raw = crate::debug_env_var!("RUZU_TRACK_OFFSETS").unwrap_or_else(|_| "0x1c,0x70".to_string());
         raw.split(',')
             .filter_map(|tok| {
                 let s = tok.trim();
@@ -772,7 +772,7 @@ fn a32_dump_mem_specs() -> &'static [(u32, usize, usize)] {
     use std::sync::OnceLock;
     static SPECS: OnceLock<Vec<(u32, usize, usize)>> = OnceLock::new();
     SPECS.get_or_init(|| {
-        let raw = match std::env::var("RUZU_A32_DUMP_MEM_AT") {
+        let raw = match crate::debug_env_var!("RUZU_A32_DUMP_MEM_AT") {
             Ok(raw) => raw,
             Err(_) => return Vec::new(),
         };

@@ -137,7 +137,7 @@ pub struct A32EmitX64 {
 
 impl A32EmitX64 {
     fn should_log_compile_range(location: LocationDescriptor) -> bool {
-        std::env::var_os("RUZU_A32_LOG_RANGE").is_some()
+        crate::debug_env_var_os!("RUZU_A32_LOG_RANGE").is_some()
             && matches!(
                 A32LocationDescriptor::from_location(location).pc(),
                 0x015DE500..=0x015DE6FF
@@ -467,7 +467,7 @@ impl A32EmitX64 {
                 // location has NO pending patches — i.e., no earlier-compiled
                 // block was waiting to chain into this one. High count means
                 // block-linking patches don't kick in for most new blocks.
-                if std::env::var_os("RDYNARMIC_PROFILE_PATCH").is_some() {
+                if crate::debug_env_var_os!("RDYNARMIC_PROFILE_PATCH").is_some() {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static NO_PATCH: AtomicU64 = AtomicU64::new(0);
                     let n = NO_PATCH.fetch_add(1, Ordering::Relaxed) + 1;
@@ -479,7 +479,7 @@ impl A32EmitX64 {
             }
         };
         let total_patches = info.jg.len() + info.jz.len() + info.jmp.len() + info.mov_rcx.len();
-        if std::env::var_os("RDYNARMIC_PROFILE_PATCH").is_some() {
+        if crate::debug_env_var_os!("RDYNARMIC_PROFILE_PATCH").is_some() {
             use std::sync::atomic::{AtomicU64, Ordering};
             static WITH_PATCH: AtomicU64 = AtomicU64::new(0);
             static TOTAL_PATCHED: AtomicU64 = AtomicU64::new(0);
@@ -837,7 +837,7 @@ impl A32EmitX64 {
             static RECOMPILE_SEQUENCE: std::sync::atomic::AtomicU32 =
                 std::sync::atomic::AtomicU32::new(0);
             let hit = RECOMPILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let recompile_limit = std::env::var("RUZU_FASTMEM_RECOMPILE_LIMIT")
+            let recompile_limit = crate::debug_env_var!("RUZU_FASTMEM_RECOMPILE_LIMIT")
                 .ok()
                 .and_then(|value| value.parse::<u32>().ok());
             if recompile_limit.is_some_and(|limit| hit >= limit) {

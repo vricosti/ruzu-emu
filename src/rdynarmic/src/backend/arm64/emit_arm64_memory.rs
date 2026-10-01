@@ -27,7 +27,7 @@ fn inline_watch_ranges() -> &'static [(u64, u64)] {
     use std::sync::OnceLock;
     static RANGES: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
     RANGES.get_or_init(|| {
-        let raw = std::env::var("RUZU_A32_INLINE_WATCH_ADDR").unwrap_or_default();
+        let raw = crate::debug_env_var!("RUZU_A32_INLINE_WATCH_ADDR").unwrap_or_default();
         raw.split(',')
             .map(str::trim)
             .filter(|token| !token.is_empty())

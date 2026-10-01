@@ -12815,17 +12815,16 @@ Eden files: `frontend/A32/decoder/{arm,thumb16,thumb32}.inc` and
 
 ### Intentional differences
 
-- Before marking an overlapping texture CPU-modified, Ruzu synchronously downloads any safe
-  GPU-modified image covering the write. Eden calls `WriteMemory` directly. Because texture dirty
-  state is image-wide rather than range-based, a small CPU write otherwise causes the next refresh
-  to upload stale guest bytes over the GPU-newer remainder of the image. The download still uses
-  the existing backend-owned `DownloadMemory` implementation, preserves modification-tick order,
-  and runs under the same texture-cache mutex.
+- None. Superseded on 2026-10-01: the pre-write download was reverted and `OnCPUWrite` again only
+  calls `texture_cache.WriteMemory`, like Eden (Metal never had the divergence). The download
+  wrote whole GPU images back over guest memory the guest had since reused, e.g. Unreal Engine
+  heap blocks, producing 0xFF/0x00 corruption (`FMallocBinned3 ... 0xffffffffffffffff`).
 
 ### Unintentional differences (to fix)
 
-- Resolved: partial CPU writes could replace recent GPU render-target contents with stale guest
-  backing when the image was refreshed.
+- Resolved on 2026-10-01 without writing images back on CPU writes: the stale refreshes came from
+  images backed by non-contiguous device memory being tracked as one linear range (see the
+  2026-10-01 `texture_cache.rs` JoinImages entry).
 
 ## 2026-08-31 — `src/audio_core/src/sink/{sink_stream,sink,null_sink,cubeb_sink,sdl3_sink}.rs` vs Eden `src/audio_core/sink/{sink_stream.h,sink_stream.cpp,sink.h,null_sink.h,cubeb_sink.cpp,sdl3_sink.cpp}`
 
@@ -18678,3 +18677,50 @@ instructions and remain outside this change.
 
 ### Binary layout verification
 - No serialized host/guest structure changes. Maxwell fields and internal IR operand metadata covered by regression tests where applicable.
+
+## 2026-10-01 — `src/core/src/memory/memory.rs` vs Eden `src/core/memory.cpp` (`WriteExclusive`)
+
+### Intentional differences
+
+- None.
+
+### Unintentional differences (to fix)
+
+- Fixed: `write_exclusive_{8,16,32,64,128}` never notified the rasterizer. Eden's `WriteExclusive`
+  calls `HandleRasterizerWrite` through `GetPointerImpl` for `RasterizerCachedMemory` pages before
+  the compare-and-swap, so GPU-modified state was left set after guest atomic stores.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: no layout change. `exclusive_writes_notify_rasterizer_like_upstream` covers the notification.
+
+## 2026-10-01 — `src/video_core/src/texture_cache/texture_cache.rs` vs Eden `src/video_core/texture_cache/texture_cache.h` (`JoinImages` sparse tracking)
+
+### Intentional differences
+
+- Eden sets `ImageFlagBits::Sparse` only when `info.is_sparse` (TIC) and the GPU range is not
+  continuous. Ruzu also sets it for any image whose GPU range is fully mapped but backed by
+  non-contiguous device memory. Without it, the image is registered and tracked over the linear
+  range `[cpu_addr, cpu_addr + guest_size)`, which covers unrelated allocations when a guest maps
+  heap chunks in descending order (Monster Hunter Rise maps 4 MiB nvmap heap chunks top-down).
+  CPU writes or nvmap frees in those allocations then mark GPU-rendered images CPU-modified, and
+  `RefreshContents` uploads stale guest memory over them (noise rectangles). Eden shows the same
+  corruption. Per-segment tracking reuses Eden's existing sparse registration/tracking paths, so
+  only writes to the image's real backing invalidate it.
+
+### Unintentional differences (to fix)
+
+- None.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: no layout change. `join_images_tracks_non_contiguous_render_target_per_segment` covers the
+  per-segment invalidation.

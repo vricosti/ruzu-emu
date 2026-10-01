@@ -2657,6 +2657,22 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     .flags
                     .insert(ImageFlagBits::SPARSE);
             }
+        } else if let Some(gpu_memory) = self.channel_gpu_memory.as_ref() {
+            // Ruzu divergence (DIFF.md 2026-10-01, JoinImages sparse tracking):
+            // upstream only tracks per segment when the TIC declares the
+            // texture sparse. A fully mapped image whose GPU range is backed
+            // by non-contiguous device memory is tracked per segment too;
+            // otherwise the linear `[cpu_addr, cpu_addr + size)` range covers
+            // unrelated allocations, whose CPU writes or nvmap frees then
+            // invalidate GPU-rendered contents.
+            let gpu_memory = gpu_memory.lock();
+            if gpu_memory.is_fully_mapped_range(gpu_addr, size_bytes as u64)
+                && !gpu_memory.is_continuous_range(gpu_addr, size_bytes as u64)
+            {
+                self.slot_images[new_image_id]
+                    .flags
+                    .insert(ImageFlagBits::SPARSE);
+            }
         }
 
         for overlap_id in self.join_ignore_textures.clone() {
@@ -6995,6 +7011,77 @@ mod tests {
                 .as_slice(),
             &[new_id]
         );
+    }
+
+    #[test]
+    fn join_images_tracks_non_contiguous_render_target_per_segment() {
+        use crate::memory_manager::MemoryManager;
+        use parking_lot::Mutex as ParkingMutex;
+        use std::sync::Arc;
+
+        let info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            size: crate::texture_cache::types::Extent3D {
+                width: 512,
+                height: 1,
+                depth: 1,
+            },
+            ..ImageInfo::default()
+        };
+        assert!(!info.is_sparse);
+        let size = super::super::util::calculate_guest_size_in_bytes(&info) as u64;
+        let pages = size.div_ceil(0x1000);
+        assert!(pages >= 2);
+
+        let mut cache = test_cache();
+        let gpu_memory = Arc::new(ParkingMutex::new(MemoryManager::new_with_geometry(
+            7,
+            22,
+            1 << 22,
+            16,
+            12,
+        )));
+        const GPU_BASE: u64 = 0x10000;
+        const DEV_BASE: u64 = 0x40000;
+        {
+            // Descending device pages, as produced by top-down heap allocators.
+            let mut gpu_memory = gpu_memory.lock();
+            for page in 0..pages {
+                gpu_memory.map(
+                    GPU_BASE + page * 0x1000,
+                    DEV_BASE + (pages - 1 - page) * 0x1000,
+                    0x1000,
+                    0,
+                    false,
+                );
+            }
+        }
+        cache.set_channel_gpu_memory(Arc::clone(&gpu_memory));
+        let first_dev = DEV_BASE + (pages - 1) * 0x1000;
+        let image_id = cache.join_images(&info, GPU_BASE, first_dev);
+        assert!(cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::SPARSE));
+
+        cache.slot_images[image_id]
+            .flags
+            .remove(ImageFlagBits::CPU_MODIFIED);
+        cache.slot_images[image_id]
+            .flags
+            .insert(ImageFlagBits::GPU_MODIFIED);
+
+        // Inside the linear range a contiguous image would assume, but not
+        // part of the image's real backing.
+        cache.write_memory(first_dev + 0x1000, 4);
+        assert!(!cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::CPU_MODIFIED));
+
+        // A write to the last real backing page still invalidates.
+        cache.write_memory(DEV_BASE, 4);
+        assert!(cache.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::CPU_MODIFIED));
     }
 
     #[test]

@@ -180,7 +180,7 @@ fn trace_nvmap_stack(process: &ProcessLock, kind: &str, handle: u32) {
             return;
         };
         drop(process);
-        let memory = memory.lock().unwrap();
+        let memory = memory.access().unwrap();
         let mut words = [0u32; 64];
         for (index, word) in words.iter_mut().enumerate() {
             *word = memory.read_32(sp.wrapping_add((index * 4) as u64));
@@ -212,7 +212,7 @@ fn trace_nvmap_stack(process: &ProcessLock, kind: &str, handle: u32) {
             return;
         };
         drop(process);
-        let memory = memory.lock().unwrap();
+        let memory = memory.access().unwrap();
         let trace_pointers = std::env::var_os("RUZU_TRACE_NVMAP_STACK_POINTERS").is_some();
         let mut dumped_pointers = Vec::new();
         let mut dump_pointer = |label: &str, address: u64| {
@@ -549,7 +549,7 @@ impl NvMapDevice {
         if Self::should_trace_alloc_loop() {
             let inner = handle.lock_inner();
             let host_ptr = process.lock().unwrap().get_memory().and_then(|memory| {
-                let memory = memory.lock().unwrap();
+                let memory = memory.access().unwrap();
                 let ptr = memory.get_pointer_silent(inner.address);
                 if ptr.is_null() {
                     None

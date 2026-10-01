@@ -15,7 +15,7 @@ pub fn output_debug_string(system: &System, address: u64, len: u64) -> ResultCod
 
     let len = len as usize;
     let msg = if let Some(memory) = system.get_svc_memory() {
-        let m = memory.lock().unwrap();
+        let m = memory.access().unwrap();
         let mut buf = vec![0u8; len];
         m.read_block(address, &mut buf);
         String::from_utf8_lossy(&buf).to_string()

@@ -12,7 +12,7 @@
 
 use bitflags::bitflags;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::k_address_space_info::{AddressSpaceInfoType, KAddressSpaceInfo};
 use super::k_dynamic_resource_manager::{KBlockInfoManager, KMemoryBlockSlabManager};
@@ -347,7 +347,7 @@ pub struct KPageTableBase {
     pub(crate) m_impl: Option<Box<common::page_table::PageTable>>,
     /// Reference to the Memory bridge (MapMemoryRegion/UnmapRegion/ProtectRegion).
     /// Upstream: `Core::Memory::Memory* m_memory`
-    pub(crate) m_memory: Option<Arc<Mutex<Memory>>>,
+    pub(crate) m_memory: Option<Arc<crate::memory::memory::SharedMemory>>,
     /// Host backing base of the process `DeviceMemory` (0 = unknown), cached
     /// when the Memory bridge is attached so `device_physical_addr` never has
     /// to take the Memory lock. Upstream reads `m_system.DeviceMemory()`
@@ -468,7 +468,7 @@ impl KPageTableBase {
         // The backing buffer is owned by the System's DeviceMemory. Reach it
         // through the existing Memory wrapper.
         if let Some(memory) = &self.m_memory {
-            memory.lock().unwrap().zero_phys_block(phys_addr, size);
+            memory.access().unwrap().zero_phys_block(phys_addr, size);
         }
     }
 
@@ -1040,7 +1040,7 @@ impl KPageTableBase {
         code_size: usize,
         system_resource: Option<&super::k_system_resource::KSystemResource>,
         resource_limit: Option<Arc<KResourceLimit>>,
-        memory: Option<Arc<Mutex<Memory>>>,
+        memory: Option<Arc<crate::memory::memory::SharedMemory>>,
         aslr_space_start: usize,
     ) -> u32 {
         // Store resource limit and memory references.
@@ -1049,7 +1049,7 @@ impl KPageTableBase {
         self.m_system = memory
             .as_ref()
             .map(|memory| {
-                let memory = memory.lock().unwrap();
+                let memory = memory.access().unwrap();
                 self.remember_device_backing_base(&memory);
                 memory.system_ref()
             })
@@ -1333,9 +1333,9 @@ impl KPageTableBase {
 
     /// Set the Memory bridge and initialize the page table implementation.
     /// Must be called after InitializeForProcess.
-    pub fn set_memory(&mut self, memory: Arc<Mutex<Memory>>) {
+    pub fn set_memory(&mut self, memory: Arc<crate::memory::memory::SharedMemory>) {
         {
-            let memory = memory.lock().unwrap();
+            let memory = memory.access().unwrap();
             self.remember_device_backing_base(&memory);
             self.m_system = memory.system_ref();
         }
@@ -1434,7 +1434,7 @@ impl KPageTableBase {
                 }
 
                 if let (Some(memory), Some(impl_pt)) = (&self.m_memory, &mut self.m_impl) {
-                    memory.lock().unwrap().unmap_region(
+                    memory.access().unwrap().unmap_region(
                         impl_pt,
                         virt_addr as u64,
                         size as u64,
@@ -1449,7 +1449,7 @@ impl KPageTableBase {
                 debug_assert!(virt_addr != 0);
 
                 if let (Some(memory), Some(impl_pt)) = (&self.m_memory, &mut self.m_impl) {
-                    memory.lock().unwrap().map_memory_region(
+                    memory.access().unwrap().map_memory_region(
                         impl_pt,
                         virt_addr as u64,
                         size as u64,
@@ -1490,7 +1490,7 @@ impl KPageTableBase {
             | OperationType::ChangePermissionsAndRefresh
             | OperationType::ChangePermissionsAndRefreshAndFlush => {
                 if let (Some(memory), Some(impl_pt)) = (&self.m_memory, &mut self.m_impl) {
-                    memory.lock().unwrap().protect_region(
+                    memory.access().unwrap().protect_region(
                         impl_pt,
                         virt_addr as u64,
                         size as u64,
@@ -1560,7 +1560,7 @@ impl KPageTableBase {
         for node in page_group.iter() {
             let block_size = (node.get_num_pages() * PAGE_SIZE) as u64;
             if let (Some(memory), Some(impl_pt)) = (&self.m_memory, &mut self.m_impl) {
-                memory.lock().unwrap().map_memory_region(
+                memory.access().unwrap().map_memory_region(
                     impl_pt,
                     cur_va,
                     block_size,
@@ -5034,7 +5034,7 @@ impl KPageTableBase {
             let mut local_size = cur_size;
             if local_size >= std::mem::size_of::<u32>() {
                 let copy_size = local_size & !(std::mem::size_of::<u32>() - 1);
-                if !memory.lock().unwrap().copy_phys_to_guest(
+                if !memory.access().unwrap().copy_phys_to_guest(
                     local_dst as u64,
                     local_phys,
                     copy_size,
@@ -5047,7 +5047,7 @@ impl KPageTableBase {
             }
 
             if local_size > 0
-                && !memory.lock().unwrap().copy_phys_to_guest(
+                && !memory.access().unwrap().copy_phys_to_guest(
                     local_dst as u64,
                     local_phys,
                     local_size,
@@ -5154,7 +5154,7 @@ impl KPageTableBase {
             let mut local_size = cur_size;
             if local_size >= std::mem::size_of::<u32>() {
                 let copy_size = local_size & !(std::mem::size_of::<u32>() - 1);
-                if !memory.lock().unwrap().copy_guest_to_phys(
+                if !memory.access().unwrap().copy_guest_to_phys(
                     local_phys,
                     local_src as u64,
                     copy_size,
@@ -5171,7 +5171,7 @@ impl KPageTableBase {
             }
 
             if local_size > 0 {
-                if !memory.lock().unwrap().copy_guest_to_phys(
+                if !memory.access().unwrap().copy_guest_to_phys(
                     local_phys,
                     local_src as u64,
                     local_size,
@@ -5287,7 +5287,7 @@ impl KPageTableBase {
             let mut local_size = cur_size;
             if local_size >= std::mem::size_of::<u32>() {
                 let copy_size = local_size & !(std::mem::size_of::<u32>() - 1);
-                if !memory.lock().unwrap().copy_phys_to_guest(
+                if !memory.access().unwrap().copy_phys_to_guest(
                     local_dst as u64,
                     local_phys,
                     copy_size,
@@ -5300,7 +5300,7 @@ impl KPageTableBase {
             }
 
             if local_size > 0
-                && !memory.lock().unwrap().copy_phys_to_guest(
+                && !memory.access().unwrap().copy_phys_to_guest(
                     local_dst as u64,
                     local_phys,
                     local_size,
@@ -5400,7 +5400,7 @@ impl KPageTableBase {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             }
             let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, cur_size) };
-            if !memory.lock().unwrap().read_phys_block(cur_addr, dst_slice) {
+            if !memory.access().unwrap().read_phys_block(cur_addr, dst_slice) {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             }
             0
@@ -5497,7 +5497,7 @@ impl KPageTableBase {
             let mut local_size = cur_size;
             if local_size >= std::mem::size_of::<u32>() {
                 let copy_size = local_size & !(std::mem::size_of::<u32>() - 1);
-                if !memory.lock().unwrap().copy_guest_to_phys(
+                if !memory.access().unwrap().copy_guest_to_phys(
                     local_phys,
                     local_src as u64,
                     copy_size,
@@ -5510,7 +5510,7 @@ impl KPageTableBase {
             }
 
             if local_size > 0
-                && !memory.lock().unwrap().copy_guest_to_phys(
+                && !memory.access().unwrap().copy_guest_to_phys(
                     local_phys,
                     local_src as u64,
                     local_size,
@@ -5611,7 +5611,7 @@ impl KPageTableBase {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             }
             let src_slice = unsafe { std::slice::from_raw_parts(src as *const u8, cur_size) };
-            if !memory.lock().unwrap().write_phys_block(cur_addr, src_slice) {
+            if !memory.access().unwrap().write_phys_block(cur_addr, src_slice) {
                 return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
             }
             0
@@ -5851,7 +5851,7 @@ impl KPageTableBase {
                 {
                     return svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
                 }
-                if !memory.lock().unwrap().copy_phys_to_phys(
+                if !memory.access().unwrap().copy_phys_to_phys(
                     cur_dst_addr,
                     cur_src_addr,
                     cur_copy_size,
@@ -5966,44 +5966,31 @@ impl KPageTableBase {
         crate::hle::result::RESULT_SUCCESS.get_inner_value()
     }
 
-    fn with_memory_page_table<T, F>(
-        memory: &Arc<Mutex<Memory>>,
-        page_table: *mut common::page_table::PageTable,
-        f: F,
-    ) -> T
-    where
-        F: FnOnce(&mut Memory) -> T,
-    {
-        let mut memory = memory.lock().unwrap();
-        let old_page_table = memory.current_page_table_raw();
-        memory.set_current_page_table_raw(page_table);
-        let result = f(&mut memory);
-        memory.set_current_page_table_raw(old_page_table);
-        result
-    }
-
     fn read_block_from_page_table(
-        memory: &Arc<Mutex<Memory>>,
+        memory: &Arc<crate::memory::memory::SharedMemory>,
         page_table: *mut common::page_table::PageTable,
         src_addr: usize,
         size: usize,
     ) -> Option<Vec<u8>> {
         let mut bytes = vec![0u8; size];
-        let success = Self::with_memory_page_table(memory, page_table, |memory| {
-            memory.read_block(src_addr as u64, &mut bytes)
-        });
+        let success = memory.access().unwrap().read_block_from_page_table(
+            page_table,
+            src_addr as u64,
+            &mut bytes,
+        );
         success.then_some(bytes)
     }
 
     fn write_block_to_page_table(
-        memory: &Arc<Mutex<Memory>>,
+        memory: &Arc<crate::memory::memory::SharedMemory>,
         page_table: *mut common::page_table::PageTable,
         dst_addr: usize,
         bytes: &[u8],
     ) -> bool {
-        Self::with_memory_page_table(memory, page_table, |memory| {
-            memory.write_block(dst_addr as u64, bytes)
-        })
+        memory
+            .access()
+            .unwrap()
+            .write_block_to_page_table(page_table, dst_addr as u64, bytes)
     }
 
     pub(crate) fn read_block_from_own_page_table(
@@ -7917,14 +7904,14 @@ mod tests {
 
     struct PageTableMemoryForTest {
         _device_memory: Box<DeviceMemory>,
-        memory: Arc<Mutex<Memory>>,
+        memory: Arc<crate::memory::memory::SharedMemory>,
     }
 
     impl PageTableMemoryForTest {
         fn new(backing_size: usize) -> Self {
             let device_memory = Box::new(DeviceMemory::with_size(backing_size));
             let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
-            let memory = Arc::new(Mutex::new(unsafe {
+            let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
                 Memory::new(
                     SystemRef::null(),
                     device_memory.as_ref() as *const _,
@@ -7941,7 +7928,7 @@ mod tests {
 
     fn attach_page_table_memory_for_test(
         page_table: &mut KPageTableBase,
-        memory: Arc<Mutex<Memory>>,
+        memory: Arc<crate::memory::memory::SharedMemory>,
     ) {
         attach_page_table_managers_for_test(page_table);
         page_table.m_address_space_width = 32;
@@ -7951,7 +7938,7 @@ mod tests {
             (page_table.m_memory.as_ref(), page_table.m_impl.as_mut())
         {
             memory
-                .lock()
+                .lock_mut()
                 .unwrap()
                 .set_current_page_table(page_table_impl.as_mut() as *mut _, true);
         }
@@ -7994,7 +7981,7 @@ mod tests {
         let Some(impl_pt) = page_table.m_impl.as_mut() else {
             panic!("test page table backend must be initialized before mapping source pages");
         };
-        memory.lock().unwrap().map_memory_region(
+        memory.access().unwrap().map_memory_region(
             impl_pt,
             addr as u64,
             (num_pages * PAGE_SIZE) as u64,
@@ -8532,7 +8519,7 @@ mod tests {
         let mut actual = [0u8; 7];
         assert!(page_table_memory
             .memory
-            .lock()
+            .access()
             .unwrap()
             .read_block(dst_addr as u64, &mut actual));
         assert_eq!(actual, expected);
@@ -8596,7 +8583,7 @@ mod tests {
         let expected = [0xA5, 0x5A, 0xC3, 0x3C, 0x7E, 0xE7];
         assert!(page_table_memory
             .memory
-            .lock()
+            .access()
             .unwrap()
             .write_block(src_addr as u64, &expected));
 
@@ -8607,7 +8594,7 @@ mod tests {
         let mut actual = [0u8; 6];
         assert!(page_table_memory
             .memory
-            .lock()
+            .access()
             .unwrap()
             .read_phys_block(dst_phys_addr + 0x20, &mut actual));
         assert_eq!(actual, expected);
@@ -8687,7 +8674,7 @@ mod tests {
         let mut actual = [0u8; 7];
         assert!(page_table_memory
             .memory
-            .lock()
+            .access()
             .unwrap()
             .read_block(dst_addr as u64, &mut actual));
         assert_eq!(actual, expected);
@@ -8755,7 +8742,7 @@ mod tests {
         let expected = [0xAA, 0xBB, 0xCC, 0xDD, 0x99, 0x88, 0x77];
         assert!(page_table_memory
             .memory
-            .lock()
+            .access()
             .unwrap()
             .write_block(src_addr as u64, &expected));
 
@@ -8776,7 +8763,7 @@ mod tests {
         let mut actual = [0u8; 7];
         assert!(page_table_memory
             .memory
-            .lock()
+            .access()
             .unwrap()
             .read_phys_block(dst_phys_addr + 0x20, &mut actual));
         assert_eq!(actual, expected);
@@ -8850,7 +8837,7 @@ mod tests {
         let mut actual = [0u8; 7];
         assert!(page_table_memory
             .memory
-            .lock()
+            .access()
             .unwrap()
             .read_phys_block(phys_addr + 0x30, &mut actual));
         assert_eq!(actual, expected);
@@ -8949,7 +8936,7 @@ mod tests {
         let mut actual = [0u8; 7];
         assert!(page_table_memory
             .memory
-            .lock()
+            .access()
             .unwrap()
             .read_phys_block(dst_phys_addr + 0x90, &mut actual));
         assert_eq!(actual, expected);
@@ -9063,7 +9050,7 @@ mod tests {
         let mut actual = [0u8; 5];
         assert!(page_table_memory
             .memory
-            .lock()
+            .access()
             .unwrap()
             .read_phys_block(dst_phys_addr + 0x20, &mut actual));
         assert_eq!(actual, expected);

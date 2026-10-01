@@ -315,7 +315,7 @@ mod tests {
 
     struct ProcessFixture {
         process: Arc<ProcessLock>,
-        _memory: Arc<std::sync::Mutex<Memory>>,
+        _memory: Arc<crate::memory::memory::SharedMemory>,
         _device_memory: Box<DeviceMemory>,
         _kernel: ScopedKernelForTest,
     }
@@ -332,7 +332,7 @@ mod tests {
             0x20_0000,
         );
         let device_memory = Box::new(DeviceMemory::with_size(0x20_0000));
-        let memory = Arc::new(std::sync::Mutex::new(unsafe {
+        let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
             Memory::new(
                 SystemRef::null(),
                 device_memory.as_ref() as *const _,
@@ -420,7 +420,7 @@ mod tests {
         }
         fixture
             ._memory
-            .lock()
+            .access()
             .unwrap()
             .write_block(source.get(), &[0x23; PAGE_SIZE]);
 

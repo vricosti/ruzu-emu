@@ -1396,7 +1396,7 @@ impl CpuManager {
                                     if system_ref.is_null() {
                                         None
                                     } else if let Some(memory) = system_ref.get().memory_shared() {
-                                        let mem = memory.lock().unwrap();
+                                        let mem = memory.access().unwrap();
                                         if mem.is_valid_virtual_address_range(dump_base, 0x20) {
                                             Some([
                                                 mem.read_64(dump_base),
@@ -1421,7 +1421,7 @@ impl CpuManager {
                                     let system_ref = kernel.system();
                                     if !system_ref.is_null() {
                                         if let Some(memory) = system_ref.get().memory_shared() {
-                                            let mem = memory.lock().unwrap();
+                                            let mem = memory.access().unwrap();
                                             for &reg_index in &[
                                                 0usize, 1, 8, 19, 20, 21, 22, 23, 24, 25, 26, 27,
                                                 28,
@@ -1489,7 +1489,7 @@ impl CpuManager {
                                     if let Some(memory) = system_ref.get().memory_shared() {
                                         use std::fmt::Write;
 
-                                        let mem = memory.lock().unwrap();
+                                        let mem = memory.access().unwrap();
                                         let mut regs = String::new();
                                         for i in 0..13 {
                                             let _ =
@@ -1597,7 +1597,7 @@ impl CpuManager {
                                 let system_ref = kernel.system();
                                 if !system_ref.is_null() {
                                     if let Some(memory) = system_ref.get().memory_shared() {
-                                        let mem = memory.lock().unwrap();
+                                        let mem = memory.access().unwrap();
                                         let mut regs = String::new();
                                         for i in 0..29 {
                                             let _ = write!(regs, " x{}=0x{:016X}", i, tc.r[i]);
@@ -1688,7 +1688,7 @@ impl CpuManager {
                                 if system_ref.is_null() {
                                     (0, 0, 0, 0, 0, [0; 8])
                                 } else if let Some(memory) = system_ref.get().memory_shared() {
-                                    let mem = memory.lock().unwrap();
+                                    let mem = memory.access().unwrap();
                                     (
                                         mem.read_32(tc.pc.wrapping_sub(8)),
                                         mem.read_32(tc.pc.wrapping_sub(4)),

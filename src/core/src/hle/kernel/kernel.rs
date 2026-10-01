@@ -239,6 +239,52 @@ pub fn scheduler_lock() -> Option<&'static super::k_scheduler_lock::KAbstractSch
 /// thread so the dump runs outside signal context (where Rust's Mutex is unsafe).
 static DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Optional Windows equivalent of the existing SIGUSR1 diagnostic request.
+/// The marker contains a monotonically increasing, nonzero request number.
+/// Reading it never modifies guest state or removes the caller's file.
+fn thread_dump_requested() -> bool {
+    if DUMP_REQUESTED.load(Ordering::Relaxed) {
+        return true;
+    }
+    static MARKER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    static HANDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(path) = MARKER.get_or_init(|| std::env::var_os("RUZU_THREAD_DUMP_FILE").map(Into::into)) else {
+        return false;
+    };
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else { return false };
+    let mut request = String::new();
+    if file.take(64).read_to_string(&mut request).is_err() {
+        return false;
+    }
+    take_thread_dump_request(&request, &HANDLED)
+}
+
+fn take_thread_dump_request(request: &str, handled: &std::sync::atomic::AtomicU64) -> bool {
+    let Ok(request) = request.trim().parse::<u64>() else { return false };
+    handled.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+        (request > previous).then_some(request)
+    }).is_ok()
+}
+
+#[cfg(test)]
+mod thread_dump_request_tests {
+    use super::take_thread_dump_request;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn dump_marker_is_opt_in_monotonic_and_consumed_once() {
+        let handled = AtomicU64::new(0);
+        for invalid in ["", "0", "-1", "invalid", "18446744073709551616"] {
+            assert!(!take_thread_dump_request(invalid, &handled));
+        }
+        assert!(take_thread_dump_request("1\n", &handled));
+        assert!(!take_thread_dump_request("1", &handled));
+        assert!(take_thread_dump_request("3", &handled));
+        assert!(!take_thread_dump_request("2", &handled));
+    }
+}
+
 /// Per-core SVC-entry tracker.  Each entry is packed as (tid:u32, svc:u32).
 /// Updated by `svc_dispatch::call` at entry; cleared at exit.  Used by the
 /// SIGUSR1 dumper to identify which thread/svc is currently executing on each
@@ -540,33 +586,35 @@ fn install_sigusr1_handler() {
 /// Called from the preemption thread once DUMP_REQUESTED is set.
 /// The preemption thread is a normal host thread (not a fiber) so locking is
 /// safe.
-fn dump_thread_state(kernel: &KernelCore) {
+fn dump_thread_state(kernel: &KernelCore, include_profiles: bool) {
     eprintln!("=========================================");
     eprintln!("[DUMP] === ruzu kernel thread dump ===");
-    dump_pc_sample_hist();
-    eprintln!("{}", rdynarmic::jit::block_prologue_count_summary_string());
-    eprintln!("{}", rdynarmic::jit::block_prologue_top_summary_string());
-    crate::hle::kernel::svc_dispatch::dump_svc_ring_profile();
-    crate::hle::kernel::svc_dispatch::dump_svc_summary_profile();
-    crate::hle::kernel::svc_dispatch::dump_svc_profile();
-    eprintln!(
-        "{}",
-        crate::hle::kernel::k_condition_variable::cv_stats::summary_string()
-    );
-    crate::hle::kernel::svc::svc_memory_history::dump("sigusr1_thread_dump");
-    crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
-    crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("sigusr1_thread_dump");
-    crate::hle::service::nvnflinger::buffer_queue_core::dump_bqp_wait_profile();
-    crate::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
-    crate::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
-    crate::hle::service::nvnflinger::hos_binder_driver::dump_binder_txn_profile();
-    crate::hle::service::nvnflinger::diagnostics::dump("sigusr1_thread_dump");
-    crate::hle::service::vi::conductor::dump_vsync_profile();
-    // Who holds each coarse lock right now + the full observed nesting graph
-    // (RUZU_LOCK_ORDER=1).
-    common::lock_order::dump_owners();
-    common::lock_order::dump_graph();
-    common::lock_order::dump_wait_for();
+    if include_profiles {
+        dump_pc_sample_hist();
+        eprintln!("{}", rdynarmic::jit::block_prologue_count_summary_string());
+        eprintln!("{}", rdynarmic::jit::block_prologue_top_summary_string());
+        crate::hle::kernel::svc_dispatch::dump_svc_ring_profile();
+        crate::hle::kernel::svc_dispatch::dump_svc_summary_profile();
+        crate::hle::kernel::svc_dispatch::dump_svc_profile();
+        eprintln!(
+            "{}",
+            crate::hle::kernel::k_condition_variable::cv_stats::summary_string()
+        );
+        crate::hle::kernel::svc::svc_memory_history::dump("sigusr1_thread_dump");
+        crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_profile();
+        crate::hle::service::nvdrv::nvdrv_interface::dump_nvdrv_ioctl_history("sigusr1_thread_dump");
+        crate::hle::service::nvnflinger::buffer_queue_core::dump_bqp_wait_profile();
+        crate::hle::service::nvnflinger::buffer_queue_producer::dump_bqp_slot_profile();
+        crate::hle::service::nvnflinger::hardware_composer::dump_hwc_cache_profile();
+        crate::hle::service::nvnflinger::hos_binder_driver::dump_binder_txn_profile();
+        crate::hle::service::nvnflinger::diagnostics::dump("sigusr1_thread_dump");
+        crate::hle::service::vi::conductor::dump_vsync_profile();
+        // Who holds each coarse lock right now + the full observed nesting graph
+        // (RUZU_LOCK_ORDER=1).
+        common::lock_order::dump_owners();
+        common::lock_order::dump_graph();
+        common::lock_order::dump_wait_for();
+    }
 
     fn parse_u64_auto(raw: &str) -> Option<u64> {
         let raw = raw.trim();
@@ -1189,7 +1237,7 @@ fn dump_thread_state(kernel: &KernelCore) {
                 );
                 let mut all_words: Vec<u32> = Vec::with_capacity(nwords);
                 if let Some(memory) = guard.page_table.get_base().m_memory.as_ref() {
-                    let m = memory.lock().unwrap();
+                    let m = memory.access().unwrap();
                     for i in 0..nwords {
                         all_words.push(m.read_32(start + (i as u64) * 4));
                     }
@@ -1216,7 +1264,7 @@ fn dump_thread_state(kernel: &KernelCore) {
             // whether a missing HLE signal is the root cause of a spin.
             for (addr, value) in &pokes {
                 if let Some(memory) = guard.page_table.get_base().m_memory.as_ref() {
-                    let m = memory.lock().unwrap();
+                    let m = memory.access().unwrap();
                     let old = m.read_32(*addr);
                     m.write_32(*addr, *value);
                     let readback = m.read_32(*addr);
@@ -2120,7 +2168,7 @@ impl KernelCore {
                     }
                 }
 
-                if DUMP_REQUESTED.load(Ordering::Relaxed) {
+                if thread_dump_requested() {
                     // Register snapshots are refreshed when the JIT returns.
                     // This interrupt is diagnostic-only; normal preemption
                     // uses the core mask produced when the scheduler lock is
@@ -2142,7 +2190,13 @@ impl KernelCore {
                     {
                         std::thread::yield_now();
                     }
-                    dump_thread_state(kernel);
+                    // Marker-triggered snapshots are brief by default. The
+                    // 4096-entry histories can stall timing while stderr is
+                    // drained; retain the full Unix report unless opted out.
+                    let include_profiles =
+                        std::env::var_os("RUZU_THREAD_DUMP_FILE").is_none()
+                        || common::env_flag!("RUZU_THREAD_DUMP_FULL");
+                    dump_thread_state(kernel, include_profiles);
                 }
 
                 None

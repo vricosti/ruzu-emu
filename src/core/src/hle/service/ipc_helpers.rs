@@ -600,7 +600,7 @@ mod tests {
     struct MappedResponseMemory {
         _device_memory: Box<DeviceMemory>,
         _page_table: Box<PageTable>,
-        memory: Arc<Mutex<Memory>>,
+        memory: Arc<crate::memory::memory::SharedMemory>,
     }
 
     impl MappedResponseMemory {
@@ -610,7 +610,7 @@ mod tests {
 
             let device_memory = Box::new(DeviceMemory::new());
             let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
-            let memory = Arc::new(Mutex::new(unsafe {
+            let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
                 Memory::new(
                     SystemRef::null(),
                     device_memory.as_ref() as *const _,
@@ -633,7 +633,7 @@ mod tests {
             }
 
             memory
-                .lock()
+                .lock_mut()
                 .unwrap()
                 .set_current_page_table(page_table.as_mut() as *mut PageTable, true);
 
@@ -727,7 +727,7 @@ mod tests {
 
         assert_eq!(ctx.write_to_outgoing_command_buffer(), RESULT_SUCCESS);
 
-        let mem = memory.lock().unwrap();
+        let mem = memory.access().unwrap();
         let handle_word = mem.read_32(tls_address + 12);
         assert_ne!(handle_word, 0);
         assert!(process
@@ -796,7 +796,7 @@ mod tests {
             .unwrap()
             .get_memory()
             .unwrap();
-        let mem = mem.lock().unwrap();
+        let mem = mem.access().unwrap();
         let handle_word = mem.read_32(tls_address + 12);
         assert_ne!(handle_word, 0);
         assert_eq!(

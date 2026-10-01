@@ -64,7 +64,7 @@ pub enum ArbitrationType {
 /// Read an s32 from process memory. Port of upstream `ReadFromUser`.
 fn read_from_user(process_guard: &KProcess, address: u64) -> Option<i32> {
     if let Some(memory) = process_guard.get_memory().as_ref() {
-        Some(memory.lock().unwrap().read_32(address) as i32)
+        Some(memory.access().unwrap().read_32(address) as i32)
     } else {
         let mem = process_guard.process_memory.read().unwrap();
         if !mem.is_valid_range(address, 4) {
@@ -94,7 +94,7 @@ fn decrement_if_less_than(process_guard: &KProcess, address: u64, value: i32) ->
         let expected = current as u32;
         let cas_ok = if let Some(memory) = process_guard.get_memory().as_ref() {
             memory
-                .lock()
+                .access()
                 .unwrap()
                 .write_exclusive_32(address, new_value, expected)
         } else {
@@ -134,7 +134,7 @@ fn update_if_equal(
         let expected = current as u32;
         let cas_ok = if let Some(memory) = process_guard.get_memory().as_ref() {
             memory
-                .lock()
+                .access()
                 .unwrap()
                 .write_exclusive_32(address, new_value as u32, expected)
         } else {

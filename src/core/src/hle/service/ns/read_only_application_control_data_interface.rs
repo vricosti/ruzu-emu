@@ -507,7 +507,7 @@ impl IReadOnlyApplicationControlDataInterface {
                     .filter(|end| *end <= capacity)
                     .ok_or(crate::hle::result::RESULT_UNKNOWN)?;
                 address.checked_add(end as u64).ok_or(crate::hle::result::RESULT_UNKNOWN)?;
-                memory.lock().unwrap().write_block(address + out_length as u64, bytes);
+                memory.access().unwrap().write_block(address + out_length as u64, bytes);
                 out_length = end;
                 Ok(())
             };
@@ -617,7 +617,7 @@ impl IReadOnlyApplicationControlDataInterface {
                         entry_bytes[..0x200].copy_from_slice(&entry.application_name);
                         entry_bytes[0x200..].copy_from_slice(&entry.developer_name);
                     }
-                    memory.lock().unwrap().write_block(
+                    memory.access().unwrap().write_block(
                         address + (index * TITLE_ENTRY_SIZE) as u64, &entry_bytes,
                     );
                 }

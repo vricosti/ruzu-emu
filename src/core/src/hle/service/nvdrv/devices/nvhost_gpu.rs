@@ -777,7 +777,7 @@ impl NvHostGpu {
                 );
                 return NvResult::InvalidState;
             };
-            memory.lock().unwrap().read_block(
+            memory.access().unwrap().read_block(
                 params.address,
                 command_list_headers_as_bytes_mut(&mut command_lists),
             );

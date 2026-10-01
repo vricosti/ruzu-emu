@@ -205,7 +205,7 @@ fn format_ipc_trace_words(system: &System, message_address: u64, words: usize) -
         let process = parent.lock().unwrap();
         process.page_table.get_base().m_memory.clone()?
     };
-    let mem = memory.lock().unwrap();
+    let mem = memory.access().unwrap();
     let mut formatted = String::with_capacity(words * 9);
     for i in 0..words {
         let word = mem.read_32(message_address + (i as u64 * 4));
@@ -710,7 +710,7 @@ fn read_tls_bytes(system: &System, address: u64, len: usize) -> Vec<u8> {
         return Vec::new();
     };
     let mut buf = vec![0u8; len];
-    let mem = memory.lock().unwrap();
+    let mem = memory.access().unwrap();
     let _ = mem.read_block(address, &mut buf);
     buf
 }
@@ -927,13 +927,13 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
-    fn create_mapped_test_memory() -> Arc<Mutex<Memory>> {
+    fn create_mapped_test_memory() -> Arc<crate::memory::memory::SharedMemory> {
         const PAGE_BITS: usize = 12;
         const PAGE_SIZE: usize = 1 << PAGE_BITS;
 
         let device_memory = Box::leak(Box::new(DeviceMemory::new()));
         let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
-        let memory = Arc::new(Mutex::new(unsafe {
+        let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
             Memory::new(
                 crate::core::SystemRef::null(),
                 device_memory as *const DeviceMemory,
@@ -961,7 +961,7 @@ mod tests {
             }
         }
         memory
-            .lock()
+            .lock_mut()
             .unwrap()
             .set_current_page_table(page_table as *mut PageTable, true);
         memory
@@ -1019,7 +1019,7 @@ mod tests {
     fn write_test_8(system: &System, address: u64, value: u8) {
         if let Some(memory) = system.get_svc_memory() {
             memory
-                .lock()
+                .access()
                 .unwrap()
                 .write_block_no_rasterizer(address, &[value]);
         }
@@ -1033,7 +1033,7 @@ mod tests {
     fn write_test_32(system: &System, address: u64, value: u32) {
         if let Some(memory) = system.get_svc_memory() {
             memory
-                .lock()
+                .access()
                 .unwrap()
                 .write_32_no_rasterizer(address, value);
         }
@@ -1046,7 +1046,7 @@ mod tests {
 
     fn read_test_32(system: &System, address: u64) -> u32 {
         if let Some(memory) = system.get_svc_memory() {
-            return memory.lock().unwrap().read_32(address);
+            return memory.access().unwrap().read_32(address);
         }
         system
             .shared_process_memory()
@@ -1726,7 +1726,7 @@ fn reply_and_receive_impl(
     if num_handles > 0 {
         let handle_bytes = num_handles as usize * std::mem::size_of::<Handle>();
         if let Some(memory) = process.page_table.get_base().m_memory.as_ref() {
-            let memory = memory.lock().unwrap();
+            let memory = memory.access().unwrap();
             if !memory.is_valid_virtual_address_range(handles, handle_bytes as u64) {
                 return RESULT_INVALID_POINTER;
             }

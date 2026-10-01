@@ -228,7 +228,7 @@ impl NvHostNvDecCommon {
                 );
             }
             let mut bytes = vec![0u8; word_count.saturating_mul(std::mem::size_of::<u32>())];
-            memory.lock().unwrap().read_block(address, &mut bytes);
+            memory.access().unwrap().read_block(address, &mut bytes);
             let cmdlist = bytes
                 .chunks_exact(std::mem::size_of::<u32>())
                 .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))

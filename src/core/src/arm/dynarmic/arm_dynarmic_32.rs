@@ -620,7 +620,7 @@ fn trace_unmapped_write(cb: &DynarmicCallbacks32, vaddr: u64, size: u64, value: 
     // `Memory::write_raw`. We mirror the same validity probe here so the
     // trace only emits on actual unmapped writes.
     let mapped = if let Some(ref cm) = cb.core_memory {
-        cm.lock()
+        cm.access()
             .unwrap()
             .is_valid_virtual_address_range(vaddr, size)
     } else {
@@ -857,7 +857,7 @@ fn trace_unmapped_guest_read_regs(cb: &DynarmicCallbacks32, vaddr: u64, size: u6
         return;
     }
     let mapped = if let Some(ref cm) = cb.core_memory {
-        cm.lock()
+        cm.access()
             .unwrap()
             .is_valid_virtual_address_range(vaddr, size)
     } else {
@@ -1926,7 +1926,7 @@ struct DynarmicCallbacks32 {
     parent: Arc<AtomicPtr<ArmDynarmic32>>,
     /// Upstream: `Core::Memory::Memory& m_memory`.
     /// None in tests where Memory is not wired.
-    core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+    core_memory: Option<Arc<crate::memory::memory::SharedMemory>>,
     /// Upstream: `Kernel::KProcess* m_process`.
     /// Raw pointer to the owning process, used for LogBacktrace.
     /// Safety: valid for the lifetime of the KProcess that owns this JIT.
@@ -1961,7 +1961,7 @@ unsafe impl Send for DynarmicCallbacks32 {}
 impl DynarmicCallbacks32 {
     fn new(
         memory: SharedProcessMemory,
-        core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+        core_memory: Option<Arc<crate::memory::memory::SharedMemory>>,
         process: *const crate::hle::kernel::k_process::KProcess,
         parent_ptr: Arc<AtomicPtr<ArmDynarmic32>>,
         debugger_enabled: bool,
@@ -2058,11 +2058,11 @@ impl DynarmicCallbacks32 {
     /// Access `m_memory` — returns a lock guard on the Memory bridge.
     /// Matches upstream's `m_memory` reference (Core::Memory::Memory&).
     /// Panics if core_memory is not wired (only happens in tests).
-    fn mem(&self) -> std::sync::MutexGuard<'_, Memory> {
+    fn mem(&self) -> std::sync::RwLockReadGuard<'_, Memory> {
         self.core_memory
             .as_ref()
             .expect("core_memory not wired")
-            .lock()
+            .access()
             .unwrap()
     }
 
@@ -2075,7 +2075,7 @@ impl DynarmicCallbacks32 {
 
         let valid = if let Some(core_memory) = &self.core_memory {
             core_memory
-                .lock()
+                .access()
                 .unwrap()
                 .is_valid_virtual_address_range(addr, size)
         } else {
@@ -2110,7 +2110,7 @@ impl A32UserCallbacks for DynarmicCallbacks32 {
         // Upstream returns nullopt when instruction fetch targets an invalid
         // virtual range, then caches a 4 KiB code page keyed by last_code_addr.
         if let Some(ref cm) = self.core_memory {
-            let m = cm.lock().unwrap();
+            let m = cm.access().unwrap();
             if !m.is_valid_virtual_address_range(vaddr, 4) {
                 return None;
             }
@@ -2439,7 +2439,7 @@ impl ArmDynarmic32 {
         core_index: usize,
         shared_memory: SharedProcessMemory,
         core_timing: Arc<crate::core_timing::CoreTiming>,
-        core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+        core_memory: Option<Arc<crate::memory::memory::SharedMemory>>,
         debugger_enabled: bool,
     ) -> Self {
         // Get page-table and fastmem pointers from the process memory state.

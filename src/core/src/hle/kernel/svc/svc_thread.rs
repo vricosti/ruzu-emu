@@ -560,7 +560,7 @@ pub fn get_thread_context3(system: &System, out_context: u64, thread_handle: Han
         return RESULT_INVALID_POINTER;
     };
     if !memory
-        .lock()
+        .access()
         .unwrap()
         .write_block(out_context, context_bytes)
     {

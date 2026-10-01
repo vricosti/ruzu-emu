@@ -47,7 +47,7 @@ pub fn get_thread_name(thread: &KThread) -> Option<String> {
         return None;
     }
     let memory = process.get_memory()?;
-    let mem = memory.lock().unwrap();
+    let mem = memory.access().unwrap();
 
     // Upstream: reads thread type pointer from TLS+0x1F8 (64-bit) or TLS+0x1FC (32-bit)
     // then reads version and name pointer from the thread type struct.
@@ -255,7 +255,7 @@ pub fn find_main_module_entrypoint(process: &KProcess) -> u64 {
 
 fn read_process_memory(process: &KProcess, address: u64, output: &mut [u8]) -> bool {
     if let Some(memory) = process.get_memory() {
-        return memory.lock().unwrap().read_block(address, output);
+        return memory.access().unwrap().read_block(address, output);
     }
 
     let memory = process.get_shared_memory();
@@ -289,7 +289,7 @@ pub fn get_backtrace_from_context(
 ) -> Vec<BacktraceEntry> {
     let is_64bit = process.is_64bit();
     let memory = process.get_memory();
-    let mem = memory.as_ref().map(|memory| memory.lock().unwrap());
+    let mem = memory.as_ref().map(|memory| memory.access().unwrap());
 
     let mut entries = Vec::new();
     let pc = ctx.pc;
@@ -375,7 +375,7 @@ mod tests {
         use crate::memory::memory::Memory;
         use common::host_memory::MemoryPermission;
         use common::page_table::PageTable;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
 
         // Keep the backing allocations stable and alive until Memory is dropped.
         let device = Box::new(DeviceMemory::with_size(0x20_000));
@@ -395,12 +395,12 @@ mod tests {
         process
             .page_table
             .configure_address_space(KProcessAddress::new(0), 0x1_0000_0000, 32);
-        process.memory = Some(Arc::new(Mutex::new(memory)));
+        process.memory = Some(Arc::new(crate::memory::memory::SharedMemory::new(memory)));
 
         for is_64bit in [false, true] {
             process.flags = u32::from(is_64bit);
             let memory = process.get_memory().unwrap();
-            let mem = memory.lock().unwrap();
+            let mem = memory.access().unwrap();
             // The first frame straddles two live pages; the legacy shadow stays zero.
             if is_64bit {
                 mem.write_64(0x4ffc, 0x5040);
@@ -457,7 +457,7 @@ mod tests {
                 let mut owner = process.lock().unwrap();
                 owner.flags = u32::from(is_64bit);
                 let memory = owner.get_memory().unwrap();
-                let mem = memory.lock().unwrap();
+                let mem = memory.access().unwrap();
                 assert!(mem.write_block(0x4800, b"worker\0"));
                 if is_64bit {
                     mem.write_64(0x41f8, 0x4400);

@@ -178,7 +178,9 @@ impl<'a> TranslatorVisitor<'a> {
     /// Corresponds to upstream `TranslatorVisitor::L(IR::Reg reg)`.
     pub fn l(&mut self, reg_idx: u32) -> Value {
         if reg_idx & 1 != 0 {
-            panic!("Unaligned source register {}", reg_idx);
+            std::panic::panic_any(crate::exception::NotImplementedException::new(format!(
+                "Unaligned source register {}", reg_idx
+            )));
         }
         let lo = self.x(reg_idx);
         let hi = self.x(reg_idx + 1);
@@ -205,7 +207,9 @@ impl<'a> TranslatorVisitor<'a> {
     /// Corresponds to upstream `TranslatorVisitor::L(IR::Reg, IR::U64)`.
     pub fn set_l(&mut self, reg_idx: u32, value: Value) {
         if reg_idx & 1 != 0 {
-            panic!("Unaligned destination register {}", reg_idx);
+            std::panic::panic_any(crate::exception::NotImplementedException::new(format!(
+                "Unaligned destination register {}", reg_idx
+            )));
         }
         let pair = self.ir.unpack_uint_2x32(value);
         let lo = self.ir.composite_extract_u32x2_idx(pair.clone(), 0);
@@ -291,7 +295,9 @@ impl<'a> TranslatorVisitor<'a> {
     /// Corresponds to `TranslatorVisitor::D(IR::Reg reg)` upstream.
     pub fn d(&mut self, reg_idx: u32) -> Value {
         if reg_idx & 1 != 0 {
-            panic!("Unaligned source register {}", reg_idx);
+            std::panic::panic_any(crate::exception::NotImplementedException::new(format!(
+                "Unaligned source register {}", reg_idx
+            )));
         }
         let lo = self.x(reg_idx);
         let hi = self.x(reg_idx + 1);
@@ -304,7 +310,9 @@ impl<'a> TranslatorVisitor<'a> {
     /// Corresponds to `TranslatorVisitor::D(IR::Reg dest, const IR::F64& value)` upstream.
     pub fn set_d(&mut self, reg_idx: u32, value: Value) {
         if reg_idx & 1 != 0 {
-            panic!("Unaligned destination register {}", reg_idx);
+            std::panic::panic_any(crate::exception::NotImplementedException::new(format!(
+                "Unaligned destination register {}", reg_idx
+            )));
         }
         let unpacked = self.ir.unpack_double_2x32(value);
         let lo = self.ir.composite_extract_u32x2_idx(unpacked.clone(), 0);
@@ -348,7 +356,9 @@ impl<'a> TranslatorVisitor<'a> {
         let cb_index = field(insn, 34, 5);
         let cb_offset = field(insn, 20, 14) << 2;
         if cb_index >= 18 {
-            panic!("Out of bounds constant buffer binding {cb_index}");
+            std::panic::panic_any(crate::exception::NotImplementedException::new(format!(
+                "Out of bounds constant buffer binding {cb_index}"
+            )));
         }
         let binding = Value::ImmU32(cb_index);
         let offset = Value::ImmU32(cb_offset);
@@ -360,12 +370,16 @@ impl<'a> TranslatorVisitor<'a> {
     /// Corresponds to upstream `TranslatorVisitor::GetPackedCbuf`.
     pub fn get_packed_cbuf(&mut self, insn: u64) -> Value {
         if bit(insn, 20) {
-            panic!("Unaligned packed constant buffer read");
+            std::panic::panic_any(crate::exception::NotImplementedException::new(format!(
+                "Unaligned packed constant buffer read"
+            )));
         }
         let cb_index = field(insn, 34, 5);
         let cb_offset = field(insn, 20, 14) << 2;
         if cb_index >= 18 {
-            panic!("Out of bounds constant buffer binding {cb_index}");
+            std::panic::panic_any(crate::exception::NotImplementedException::new(format!(
+                "Out of bounds constant buffer binding {cb_index}"
+            )));
         }
         let binding = Value::ImmU32(cb_index);
         let lo = self
@@ -381,7 +395,9 @@ impl<'a> TranslatorVisitor<'a> {
         let cb_index = field(insn, 34, 5);
         let cb_offset = field(insn, 20, 14) << 2;
         if cb_index >= 18 {
-            panic!("Out of bounds constant buffer binding {cb_index}");
+            std::panic::panic_any(crate::exception::NotImplementedException::new(format!(
+                "Out of bounds constant buffer binding {cb_index}"
+            )));
         }
         let binding = Value::ImmU32(cb_index);
         let offset = Value::ImmU32(cb_offset);
@@ -393,7 +409,9 @@ impl<'a> TranslatorVisitor<'a> {
         let cb_index = field(insn, 34, 5);
         let cb_offset = field(insn, 20, 14) << 2;
         if cb_index >= 18 {
-            panic!("Out of bounds constant buffer binding {cb_index}");
+            std::panic::panic_any(crate::exception::NotImplementedException::new(format!(
+                "Out of bounds constant buffer binding {cb_index}"
+            )));
         }
         let unaligned = bit(insn, 20);
         let binding = Value::ImmU32(cb_index);
@@ -1072,6 +1090,34 @@ mod tests {
             | (1 << 29)
             | (mode << 30)
             | (mask << 34)
+    }
+
+    #[test]
+    fn out_of_bounds_cbuf_binding_raises_a_typed_shader_exception() {
+        // Pipeline caches only catch typed shader exceptions; a plain panic
+        // here killed the GPU thread instead of skipping the draw.
+        let insn = 31u64 << 34;
+        for read in 0..4 {
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut program = Program::new(ShaderStage::Fragment);
+                program.blocks.push(Block::new());
+                let mut tv = TranslatorVisitor::new(&mut program, 0);
+                match read {
+                    0 => tv.get_cbuf(insn),
+                    1 => tv.get_packed_cbuf(insn),
+                    2 => tv.get_float_cbuf(insn),
+                    _ => tv.get_double_cbuf(insn),
+                };
+            }))
+            .unwrap_err();
+            let error = payload
+                .downcast_ref::<crate::exception::NotImplementedException>()
+                .expect("NotImplementedException payload");
+            assert_eq!(
+                error.to_string(),
+                "Out of bounds constant buffer binding 31 is not implemented"
+            );
+        }
     }
 
     fn translated_opcodes(stage: ShaderStage, insn: u64) -> Vec<Opcode> {

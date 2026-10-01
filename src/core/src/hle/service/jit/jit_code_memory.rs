@@ -133,7 +133,7 @@ mod tests {
         process: Arc<ProcessLock>,
         code_memory: Arc<Mutex<KCodeMemory>>,
         mapped_address: u64,
-        _memory: Arc<std::sync::Mutex<Memory>>,
+        _memory: Arc<crate::memory::memory::SharedMemory>,
         _device_memory: Box<DeviceMemory>,
         _kernel: ScopedKernelForTest,
     }
@@ -151,7 +151,7 @@ mod tests {
         );
 
         let device_memory = Box::new(DeviceMemory::with_size(0x20_0000));
-        let memory = Arc::new(std::sync::Mutex::new(unsafe {
+        let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
             Memory::new(
                 SystemRef::null(),
                 device_memory.as_ref() as *const _,

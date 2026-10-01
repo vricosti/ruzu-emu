@@ -362,7 +362,7 @@ struct SmmuRegisteredProcesses {
     /// `ShaderCache::register` → here) while a CPU core holds the Memory
     /// mutex (guest write → `handle_rasterizer_write` →
     /// `ShaderCache::invalidate_region`).
-    processes: Vec<Option<(Arc<Mutex<Memory>>, usize)>>,
+    processes: Vec<Option<(Arc<ruzu_core::memory::memory::SharedMemory>, usize)>>,
     id_pool: VecDeque<usize>,
 }
 
@@ -613,10 +613,10 @@ impl SmmuReverseMappings {
 }
 
 impl SmmuRegisteredProcesses {
-    fn register(&mut self, memory: Option<Arc<Mutex<Memory>>>) -> u32 {
+    fn register(&mut self, memory: Option<Arc<ruzu_core::memory::memory::SharedMemory>>) -> u32 {
         let entry = memory.map(|m| {
             let raw = {
-                let guard = m.lock().unwrap();
+                let guard = m.access().unwrap();
                 &*guard as *const Memory as usize
             };
             (m, raw)
@@ -638,7 +638,7 @@ impl SmmuRegisteredProcesses {
         }
     }
 
-    fn get(&self, asid: u32) -> Option<Arc<Mutex<Memory>>> {
+    fn get(&self, asid: u32) -> Option<Arc<ruzu_core::memory::memory::SharedMemory>> {
         self.processes
             .get(asid as usize)
             .and_then(|memory| memory.as_ref().map(|(m, _)| m.clone()))
@@ -905,9 +905,9 @@ impl MaxwellDeviceMemoryManager {
     /// Register an nvdrv process memory interface and return an ASID.
     ///
     /// Port of upstream `Core::DeviceMemoryManager<Traits>::RegisterProcess`.
-    pub fn smmu_register_process(&self, memory: Option<Arc<Mutex<Memory>>>) -> u32 {
+    pub fn smmu_register_process(&self, memory: Option<Arc<ruzu_core::memory::memory::SharedMemory>>) -> u32 {
         if let Some(memory) = memory.as_ref() {
-            if let Some(physical_base) = memory.lock().unwrap().device_memory_backing_base() {
+            if let Some(physical_base) = memory.access().unwrap().device_memory_backing_base() {
                 let stored_base = self.smmu_physical_base.load(Ordering::Relaxed);
                 if stored_base == 0 {
                     let _ = self.smmu_physical_base.compare_exchange(
@@ -1006,7 +1006,7 @@ impl MaxwellDeviceMemoryManager {
             let page = start_page + index as u64;
             let current_vaddr = virtual_address.wrapping_add((index as u64) << SMMU_PAGE_BITS);
             let host_ptr = {
-                let memory = memory.lock().unwrap();
+                let memory = memory.access().unwrap();
                 memory.get_pointer_silent(current_vaddr)
             };
             if host_ptr.is_null() {
@@ -1257,11 +1257,11 @@ impl MaxwellDeviceMemoryManager {
         d_address: DAddr,
         virtual_address: u64,
         size: usize,
-        memory: &Arc<Mutex<Memory>>,
+        memory: &Arc<ruzu_core::memory::memory::SharedMemory>,
     ) {
         let start_page = d_address >> SMMU_PAGE_BITS;
         let num_pages = smmu_num_pages_for_size(size) as usize;
-        let memory = memory.lock().unwrap();
+        let memory = memory.access().unwrap();
         let mut continuity = self.smmu_continuity_tracker.lock().unwrap();
         let mut last_ptr = 0usize;
         let mut page_count = 1u32;
@@ -1399,7 +1399,7 @@ impl MaxwellDeviceMemoryManager {
             })
     }
 
-    fn smmu_registered_memory(&self, asid: u32) -> Option<Arc<Mutex<Memory>>> {
+    fn smmu_registered_memory(&self, asid: u32) -> Option<Arc<ruzu_core::memory::memory::SharedMemory>> {
         self.smmu_registered_processes.lock().unwrap().get(asid)
     }
 
@@ -1882,7 +1882,7 @@ impl MaxwellDeviceMemoryManager {
     fn mark_region_caching(&self, memory: Option<usize>, address: u64, size: usize, caching: bool) {
         if let Some(memory_raw) = memory {
             // SAFETY: `memory_raw` points at the `Memory` value inside the
-            // `Arc<Mutex<Memory>>` held by the SMMU process registry; the
+            // `Arc<ruzu_core::memory::memory::SharedMemory>` held by the SMMU process registry; the
             // allocation remains stable while that registration lives.
             // Eden invokes MarkRegionCaching while holding `counter_guard` and
             // does not acquire the process Memory mutex.
@@ -2397,7 +2397,7 @@ mod tests {
             );
         memory.set_current_page_table(&mut *page_table, true);
 
-        let asid = mgr.smmu_register_process(Some(Arc::new(Mutex::new(memory))));
+        let asid = mgr.smmu_register_process(Some(Arc::new(ruzu_core::memory::memory::SharedMemory::new(memory))));
         mgr.smmu_map(0x8000, 0x4000_0000, 0x2000, asid, true);
 
         assert_eq!(mgr.get_pointer(0x8000), host_ptr);
@@ -2457,7 +2457,7 @@ mod tests {
             );
         memory.set_current_page_table(&mut *page_table, true);
 
-        let asid = mgr.smmu_register_process(Some(Arc::new(Mutex::new(memory))));
+        let asid = mgr.smmu_register_process(Some(Arc::new(ruzu_core::memory::memory::SharedMemory::new(memory))));
         mgr.smmu_map(0x8000, 0x4000_0000, 0x2000, asid, true);
 
         let mut output = vec![0u8; 0x2000];
@@ -2502,7 +2502,7 @@ mod tests {
             );
         memory.set_current_page_table(&mut *page_table, true);
 
-        let asid = mgr.smmu_register_process(Some(Arc::new(Mutex::new(memory))));
+        let asid = mgr.smmu_register_process(Some(Arc::new(ruzu_core::memory::memory::SharedMemory::new(memory))));
         mgr.smmu_map(0x8000, 0x4000_0080, 0x2000, asid, true);
 
         assert_eq!(

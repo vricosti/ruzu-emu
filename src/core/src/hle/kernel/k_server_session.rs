@@ -1065,7 +1065,7 @@ impl KServerSession {
         } else if let Some(memory) = process.get_memory() {
             let mut bytes = vec![0u8; buffer_size];
             if !memory
-                .lock()
+                .access()
                 .unwrap()
                 .read_block(message_address as u64, &mut bytes)
             {
@@ -1092,7 +1092,7 @@ impl KServerSession {
         let memory = process.get_memory()?;
         let mut bytes = vec![0u8; buffer_size];
         if !memory
-            .lock()
+            .access()
             .unwrap()
             .read_phys_block(message_paddr, &mut bytes)
         {
@@ -1124,7 +1124,7 @@ impl KServerSession {
 
         if let Some(memory) = process.get_memory() {
             return memory
-                .lock()
+                .access()
                 .unwrap()
                 .write_block(message_address as u64, &bytes);
         }
@@ -1151,7 +1151,7 @@ impl KServerSession {
             .flat_map(|word| word.to_le_bytes())
             .collect();
         let written = memory
-            .lock()
+            .access()
             .unwrap()
             .write_phys_block(message_paddr, &bytes);
         written
@@ -2011,7 +2011,7 @@ impl KServerSession {
         }
         if let Some(memory) = process.get_memory() {
             memory
-                .lock()
+                .access()
                 .unwrap()
                 .write_block(message_address as u64, &bytes);
         } else {
@@ -2868,7 +2868,7 @@ mod tests {
 
     struct SessionPageTableMemoryForTest {
         _device_memory: Box<DeviceMemory>,
-        memory: Arc<Mutex<Memory>>,
+        memory: Arc<crate::memory::memory::SharedMemory>,
     }
 
     fn make_port_session(
@@ -3032,7 +3032,7 @@ mod tests {
         fn new(backing_size: usize) -> Self {
             let device_memory = Box::new(DeviceMemory::with_size(backing_size));
             let buffer_ptr = &device_memory.buffer as *const common::host_memory::HostMemory;
-            let memory = Arc::new(Mutex::new(unsafe {
+            let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
                 Memory::new(
                     SystemRef::null(),
                     device_memory.as_ref() as *const _,
@@ -3115,7 +3115,7 @@ mod tests {
 
     fn attach_process_page_table_for_session_test(
         process: &mut KProcess,
-        memory: Arc<Mutex<Memory>>,
+        memory: Arc<crate::memory::memory::SharedMemory>,
         start: usize,
         end: usize,
         state: KMemoryState,
@@ -3152,7 +3152,7 @@ mod tests {
             .m_impl
             .as_mut()
             .expect("test page table backend must be initialized");
-        memory.lock().unwrap().map_memory_region(
+        memory.access().unwrap().map_memory_region(
             impl_pt,
             addr as u64,
             PAGE_SIZE as u64,
@@ -3174,7 +3174,7 @@ mod tests {
             .as_mut()
             .expect("test page table backend must be initialized");
         memory
-            .lock()
+            .lock_mut()
             .unwrap()
             .set_current_page_table(impl_pt.as_mut() as *mut _, true);
     }
@@ -3462,7 +3462,7 @@ mod tests {
         let process = process.lock().unwrap();
         let memory = process.get_memory().unwrap();
         let mut words = {
-            let memory = memory.lock().unwrap();
+            let memory = memory.access().unwrap();
             [
                 memory.read_32(0x2395000),
                 memory.read_32(0x2395004),

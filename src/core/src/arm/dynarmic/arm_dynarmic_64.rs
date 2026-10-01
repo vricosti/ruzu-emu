@@ -14,7 +14,6 @@ use crate::arm::arm_interface::{
     WatchpointArray,
 };
 use crate::hle::kernel::k_process::SharedProcessMemory;
-use crate::memory::memory::Memory;
 use common::page_table::{PageEntryData, PageTable};
 use common::settings_enums::CpuAccuracy;
 
@@ -545,7 +544,7 @@ fn trace_unmapped_read_64(cb: &DynarmicCallbacks64, vaddr: u64, size: u64) {
         return;
     }
     let valid = if let Some(ref cm) = cb.core_memory {
-        cm.lock()
+        cm.access()
             .unwrap()
             .is_valid_virtual_address_range(vaddr, size)
     } else {
@@ -586,7 +585,7 @@ fn trace_unmapped_read_64(cb: &DynarmicCallbacks64, vaddr: u64, size: u64) {
     if common::trace::is_enabled(common::trace::cat::A64_EXCEPTION_CTX) {
         let dump_base = x19.wrapping_add(0x50);
         let qwords = if let Some(ref cm) = cb.core_memory {
-            let mem = cm.lock().unwrap();
+            let mem = cm.access().unwrap();
             if mem.is_valid_virtual_address_range(dump_base, 0x20) {
                 Some([
                     mem.read_64(dump_base),
@@ -652,7 +651,7 @@ fn trace_unmapped_write_64(cb: &DynarmicCallbacks64, vaddr: u64, size: u64, valu
     }
 
     let valid = if let Some(ref cm) = cb.core_memory {
-        cm.lock()
+        cm.access()
             .unwrap()
             .is_valid_virtual_address_range(vaddr, size)
     } else {
@@ -788,7 +787,7 @@ struct DynarmicCallbacks64 {
     memory: SharedProcessMemory,
     /// Core::Memory::Memory bridge (reads/writes via PageTable → DeviceMemory).
     /// Matches upstream `Core::Memory::Memory& m_memory`.
-    core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+    core_memory: Option<Arc<crate::memory::memory::SharedMemory>>,
     /// SVC number from last supervisor call, shared with parent ArmDynarmic64.
     /// Upstream: callback writes to m_parent.m_svc via back-reference.
     svc: Arc<AtomicU32>,
@@ -833,7 +832,7 @@ unsafe impl Send for DynarmicCallbacks64 {}
 impl DynarmicCallbacks64 {
     fn new(
         memory: SharedProcessMemory,
-        core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+        core_memory: Option<Arc<crate::memory::memory::SharedMemory>>,
         svc: Arc<AtomicU32>,
         uses_wall_clock: bool,
         core_timing: Arc<crate::core_timing::CoreTiming>,
@@ -968,7 +967,7 @@ impl DynarmicCallbacks64 {
 
         let valid = if let Some(core_memory) = &self.core_memory {
             core_memory
-                .lock()
+                .access()
                 .unwrap()
                 .is_valid_virtual_address_range(addr, size)
         } else {
@@ -1037,7 +1036,7 @@ impl A64UserCallbacks for DynarmicCallbacks64 {
         // Upstream: returns std::nullopt if IsValidVirtualAddressRange fails,
         // then caches a 4 KiB code page keyed by last_code_addr.
         if let Some(ref cm) = self.core_memory {
-            let m = cm.lock().unwrap();
+            let m = cm.access().unwrap();
             if !m.is_valid_virtual_address_range(vaddr, 4) {
                 return None;
             }
@@ -1060,7 +1059,7 @@ impl A64UserCallbacks for DynarmicCallbacks64 {
         self.check_memory_access(vaddr, 1, DebugWatchpointType::READ);
         trace_unmapped_read_64(self, vaddr, 1);
         let value = if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().read_8(vaddr)
+            cm.access().unwrap().read_8(vaddr)
         } else {
             self.memory.read().unwrap().read_8(vaddr)
         };
@@ -1073,7 +1072,7 @@ impl A64UserCallbacks for DynarmicCallbacks64 {
         self.check_memory_access(vaddr, 2, DebugWatchpointType::READ);
         trace_unmapped_read_64(self, vaddr, 2);
         let value = if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().read_16(vaddr)
+            cm.access().unwrap().read_16(vaddr)
         } else {
             self.memory.read().unwrap().read_16(vaddr)
         };
@@ -1086,7 +1085,7 @@ impl A64UserCallbacks for DynarmicCallbacks64 {
         self.check_memory_access(vaddr, 4, DebugWatchpointType::READ);
         trace_unmapped_read_64(self, vaddr, 4);
         let value = if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().read_32(vaddr)
+            cm.access().unwrap().read_32(vaddr)
         } else {
             self.memory.read().unwrap().read_32(vaddr)
         };
@@ -1108,7 +1107,7 @@ impl A64UserCallbacks for DynarmicCallbacks64 {
             static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
             static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let cur = if let Some(ref cm) = self.core_memory {
-                let m = cm.lock().unwrap();
+                let m = cm.access().unwrap();
                 if m.is_valid_virtual_address_range(target, 8) {
                     m.read_64(target)
                 } else {
@@ -1131,7 +1130,7 @@ impl A64UserCallbacks for DynarmicCallbacks64 {
             let log_now = prev != cur && prev != u64::MAX && (cur_oor != prev_oor || cur_oor);
             // ALSO compare against fastmem-arena read for this same vaddr.
             let arena_value: u64 = if let Some(ref cm) = self.core_memory {
-                let arena = cm.lock().unwrap().fastmem_pointer();
+                let arena = cm.access().unwrap().fastmem_pointer();
                 if !arena.is_null() {
                     unsafe { std::ptr::read_unaligned(arena.add(target as usize) as *const u64) }
                 } else {
@@ -1190,7 +1189,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X}
         // sentinel value enters guest registers from memory.
         if let Some(target) = trace_r64_value() {
             let value_pre = if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().read_64(vaddr)
+                cm.access().unwrap().read_64(vaddr)
             } else {
                 self.memory.read().unwrap().read_64(vaddr)
             };
@@ -1218,7 +1217,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x19=0x{:016X} x20=0x{:016X} x21=0x{:016X}
         }
         if trace_a64_invalid_data_read_enabled() {
             let is_valid = if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().is_valid_virtual_address_range(vaddr, 8)
+                cm.access().unwrap().is_valid_virtual_address_range(vaddr, 8)
             } else {
                 self.memory.read().unwrap().is_valid_range(vaddr, 8)
             };
@@ -1274,7 +1273,7 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
                             for off in 0..size {
                                 let byte_addr = addr + off as u64;
                                 let slow_byte = if let Some(ref cm) = self.core_memory {
-                                    let m = cm.lock().unwrap();
+                                    let m = cm.access().unwrap();
                                     if m.is_valid_virtual_address_range(byte_addr, 1) {
                                         m.read_8(byte_addr)
                                     } else {
@@ -1289,7 +1288,7 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
                                     }
                                 };
                                 let arena_byte = if let Some(ref cm) = self.core_memory {
-                                    let arena_ptr = cm.lock().unwrap().fastmem_pointer();
+                                    let arena_ptr = cm.access().unwrap().fastmem_pointer();
                                     if !arena_ptr.is_null() {
                                         unsafe { *arena_ptr.add(byte_addr as usize) }
                                     } else {
@@ -1329,13 +1328,13 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
                         // a corrupt free-list head pointer at this addr.
                         let addr = jit_state.reg[22].wrapping_add(0x10);
                         let valid = if let Some(ref cm) = self.core_memory {
-                            cm.lock().unwrap().is_valid_virtual_address_range(addr, 8)
+                            cm.access().unwrap().is_valid_virtual_address_range(addr, 8)
                         } else {
                             self.memory.read().unwrap().is_valid_range(addr, 8)
                         };
                         if valid {
                             let v = if let Some(ref cm) = self.core_memory {
-                                cm.lock().unwrap().read_64(addr)
+                                cm.access().unwrap().read_64(addr)
                             } else {
                                 self.memory.read().unwrap().read_64(addr)
                             };
@@ -1351,7 +1350,7 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
                         for i in 0..96u64 {
                             let addr = base + i;
                             let valid = if let Some(ref cm) = self.core_memory {
-                                cm.lock().unwrap().is_valid_virtual_address_range(addr, 1)
+                                cm.access().unwrap().is_valid_virtual_address_range(addr, 1)
                             } else {
                                 self.memory.read().unwrap().is_valid_range(addr, 1)
                             };
@@ -1359,7 +1358,7 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
                                 break;
                             }
                             let b = if let Some(ref cm) = self.core_memory {
-                                cm.lock().unwrap().read_8(addr)
+                                cm.access().unwrap().read_8(addr)
                             } else {
                                 self.memory.read().unwrap().read_8(addr)
                             };
@@ -1389,7 +1388,7 @@ x19=0x{:016X} x20=0x{:016X} x21=0x{:016X} x22=0x{:016X} x25=0x{:016X}",
             }
         }
         let value = if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().read_64(vaddr)
+            cm.access().unwrap().read_64(vaddr)
         } else {
             self.memory.read().unwrap().read_64(vaddr)
         };
@@ -1446,7 +1445,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
             }
         }
         let value = if let Some(ref cm) = self.core_memory {
-            let m = cm.lock().unwrap();
+            let m = cm.access().unwrap();
             [m.read_64(vaddr), m.read_64(vaddr + 8)]
         } else {
             let mem = self.memory.read().unwrap();
@@ -1510,7 +1509,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         watch_write_64(self, vaddr, 1, value as u128);
         trace_a64_access_64(self, "WRITE", vaddr, 1, value as u128);
         if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().write_8(vaddr, value);
+            cm.access().unwrap().write_8(vaddr, value);
         } else {
             self.memory.write().unwrap().write_8(vaddr, value);
         }
@@ -1535,7 +1534,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         watch_write_64(self, vaddr, 2, value as u128);
         trace_a64_access_64(self, "WRITE", vaddr, 2, value as u128);
         if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().write_16(vaddr, value);
+            cm.access().unwrap().write_16(vaddr, value);
         } else {
             self.memory.write().unwrap().write_16(vaddr, value);
         }
@@ -1624,7 +1623,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         watch_write_64(self, vaddr, 4, value as u128);
         trace_a64_access_64(self, "WRITE", vaddr, 4, value as u128);
         if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().write_32(vaddr, value);
+            cm.access().unwrap().write_32(vaddr, value);
         } else {
             self.memory.write().unwrap().write_32(vaddr, value);
         }
@@ -1658,7 +1657,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
                 let n = SHOWN.fetch_add(1, Ordering::Relaxed);
                 if n < 64 || n.is_multiple_of(1000) {
                     if let Some(ref cm) = self.core_memory {
-                        let cm_guard = cm.lock().unwrap();
+                        let cm_guard = cm.access().unwrap();
                         let arena = cm_guard.fastmem_pointer();
                         // Read back the value via the slow-path Memory API
                         // (which goes through pt.pointers[idx] = backing_base + offset).
@@ -1749,7 +1748,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         watch_write_64(self, vaddr, 8, value as u128);
         trace_a64_access_64(self, "WRITE", vaddr, 8, value as u128);
         if let Some(ref cm) = self.core_memory {
-            cm.lock().unwrap().write_64(vaddr, value);
+            cm.access().unwrap().write_64(vaddr, value);
         } else {
             self.memory.write().unwrap().write_64(vaddr, value);
         }
@@ -1764,7 +1763,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
                 let n = SHOWN_POST.fetch_add(1, Ordering::Relaxed);
                 if n < 8 {
                     if let Some(ref cm) = self.core_memory {
-                        let cm_guard = cm.lock().unwrap();
+                        let cm_guard = cm.access().unwrap();
                         let arena = cm_guard.fastmem_pointer();
                         let slow = cm_guard.read_64(vaddr);
                         drop(cm_guard);
@@ -1785,7 +1784,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
                             let slow_after_arena_write = self
                                 .core_memory
                                 .as_ref()
-                                .map(|cm2| cm2.lock().unwrap().read_64(vaddr))
+                                .map(|cm2| cm2.access().unwrap().read_64(vaddr))
                                 .unwrap_or(0);
                             // Restore the original value.
                             unsafe {
@@ -1948,7 +1947,7 @@ xmm1_lo=0x{:016X} xmm1_hi=0x{:016X} xmm12_lo=0x{:016X} xmm12_hi=0x{:016X} xmm13_
             ((value_hi as u128) << 64) | (value_lo as u128),
         );
         if let Some(ref cm) = self.core_memory {
-            let m = cm.lock().unwrap();
+            let m = cm.access().unwrap();
             m.write_64(vaddr, value_lo);
             m.write_64(vaddr + 8, value_hi);
         } else {
@@ -1961,7 +1960,7 @@ xmm1_lo=0x{:016X} xmm1_hi=0x{:016X} xmm12_lo=0x{:016X} xmm12_hi=0x{:016X} xmm13_
     fn memory_write_exclusive_8(&mut self, vaddr: u64, value: u8, expected: u8) -> bool {
         self.check_memory_access(vaddr, 1, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().write_exclusive_8(vaddr, value, expected)
+                cm.access().unwrap().write_exclusive_8(vaddr, value, expected)
             } else {
                 self.memory_write_8(vaddr, value);
                 true
@@ -1971,7 +1970,7 @@ xmm1_lo=0x{:016X} xmm1_hi=0x{:016X} xmm12_lo=0x{:016X} xmm12_hi=0x{:016X} xmm13_
     fn memory_write_exclusive_16(&mut self, vaddr: u64, value: u16, expected: u16) -> bool {
         self.check_memory_access(vaddr, 2, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
-                cm.lock()
+                cm.access()
                     .unwrap()
                     .write_exclusive_16(vaddr, value, expected)
             } else {
@@ -2030,7 +2029,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         };
         let success = self.check_memory_access(vaddr, 4, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
-                cm.lock()
+                cm.access()
                     .unwrap()
                     .write_exclusive_32(vaddr, value, expected)
             } else {
@@ -2089,7 +2088,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
     fn memory_write_exclusive_64(&mut self, vaddr: u64, value: u64, expected: u64) -> bool {
         self.check_memory_access(vaddr, 8, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
-                cm.lock()
+                cm.access()
                     .unwrap()
                     .write_exclusive_64(vaddr, value, expected)
             } else {
@@ -2108,7 +2107,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         let [expected_lo, expected_hi] = expected;
         self.check_memory_access(vaddr, 16, DebugWatchpointType::WRITE)
             && if let Some(ref cm) = self.core_memory {
-                cm.lock().unwrap().write_exclusive_128(
+                cm.access().unwrap().write_exclusive_128(
                     vaddr,
                     value_lo,
                     value_hi,
@@ -2182,7 +2181,7 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
         );
         // Dump instruction window around exception PC
         if let Some(ref cm) = self.core_memory {
-            let m = cm.lock().unwrap();
+            let m = cm.access().unwrap();
             let start = pc.saturating_sub(0x10);
             for addr in (start..=pc.saturating_add(0x10)).step_by(4) {
                 if !m.is_valid_virtual_address(addr) {
@@ -2285,7 +2284,7 @@ impl ArmDynarmic64 {
         core_index: usize,
         shared_memory: SharedProcessMemory,
         core_timing: Arc<crate::core_timing::CoreTiming>,
-        core_memory: Option<Arc<std::sync::Mutex<Memory>>>,
+        core_memory: Option<Arc<crate::memory::memory::SharedMemory>>,
         debugger_enabled: bool,
     ) -> Self {
         // Fetch fastmem pointer from core_memory BEFORE it gets moved

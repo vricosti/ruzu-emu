@@ -580,7 +580,7 @@ pub struct KProcess {
     /// Per-process Memory bridge — matches upstream `Core::Memory::Memory m_memory`.
     /// Each process owns its own Memory instance with its own `current_page_table`,
     /// sharing the backing `DeviceMemory` with all other processes via `System`.
-    pub memory: Option<Arc<Mutex<crate::memory::memory::Memory>>>,
+    pub memory: Option<Arc<crate::memory::memory::SharedMemory>>,
     /// Snapshot of upstream `System::DebuggerEnabled()` for JIT construction.
     debugger_enabled: bool,
     pub debug_page_refcounts: BTreeMap<u64, u64>,
@@ -733,7 +733,7 @@ impl KProcess {
             )
         };
         memory.set_gpu_dirty_managers(system.gpu_dirty_memory_managers());
-        let memory_arc = Arc::new(Mutex::new(memory));
+        let memory_arc = Arc::new(crate::memory::memory::SharedMemory::new(memory));
         // Wire into page table so page-table-level operations can use it
         self.page_table.get_base_mut().set_memory(memory_arc.clone());
         self.memory = Some(memory_arc);
@@ -742,7 +742,7 @@ impl KProcess {
 
     /// Get the per-process Memory bridge.
     /// Matches upstream `KProcess::GetMemory()`.
-    pub fn get_memory(&self) -> Option<Arc<Mutex<crate::memory::memory::Memory>>> {
+    pub fn get_memory(&self) -> Option<Arc<crate::memory::memory::SharedMemory>> {
         self.memory
             .clone()
             .or_else(|| self.page_table.get_base().m_memory.clone())
@@ -1550,7 +1550,7 @@ impl KProcess {
         // Zero the stack in DeviceMemory.
         if let Some(memory) = self.get_memory() {
             memory
-                .lock()
+                .access()
                 .unwrap()
                 .zero_block(stack_base, aligned_stack_size as usize);
         }
@@ -1628,7 +1628,7 @@ impl KProcess {
         // Zero the TLS page in DeviceMemory.
         if let Some(memory) = self.get_memory() {
             memory
-                .lock()
+                .access()
                 .unwrap()
                 .zero_block(page_address, THREAD_LOCAL_PAGE_SIZE);
         }
@@ -1881,7 +1881,7 @@ impl KProcess {
             let memory_clone = base.m_memory.clone();
             if let (Some(memory), Some(impl_pt)) = (memory_clone, base.get_impl_mut()) {
                 let pt_ptr = impl_pt as *mut common::page_table::PageTable;
-                let mut memory = memory.lock().unwrap();
+                let mut memory = memory.lock_mut().unwrap();
                 let is_application = (flags & CreateProcessFlag::IS_APPLICATION.bits()) != 0;
                 memory.set_current_page_table(pt_ptr, is_application);
             }
@@ -1978,7 +1978,7 @@ impl KProcess {
                 self.plr_address = plr;
                 if let Some(memory) = self.get_memory() {
                     let zero_plr = [0u8; THREAD_LOCAL_REGION_SIZE];
-                    memory.lock().unwrap().write_block(plr.get(), &zero_plr);
+                    memory.access().unwrap().write_block(plr.get(), &zero_plr);
                 }
             }
         }
@@ -2553,7 +2553,7 @@ impl KProcess {
 
         // Zero the stack in DeviceMemory (if Memory is wired).
         if let Some(memory) = self.get_memory() {
-            memory.lock().unwrap().zero_block(stack_base, stack_size);
+            memory.access().unwrap().zero_block(stack_base, stack_size);
         }
         // Upstream: m_page_table.SetMaxHeapSize(m_max_process_memory -
         //           (m_main_thread_stack_size + m_code_size))
@@ -3203,7 +3203,7 @@ impl KProcess {
             *self.debug_page_refcounts.entry(page).or_default() += 1;
             if let Some(memory) = &memory {
                 memory
-                    .lock()
+                    .access()
                     .unwrap()
                     .mark_region_debug(page, PAGE_SIZE as u64, true);
             }
@@ -3243,7 +3243,7 @@ impl KProcess {
             if *refcount == 0 {
                 if let Some(memory) = &memory {
                     memory
-                        .lock()
+                        .access()
                         .unwrap()
                         .mark_region_debug(page, PAGE_SIZE as u64, false);
                 }
@@ -3258,7 +3258,7 @@ impl KProcess {
     /// Writes to DeviceMemory via Memory.
     pub fn write_memory(&mut self, guest_addr: u64, data: &[u8]) {
         if let Some(memory) = self.get_memory() {
-            memory.lock().unwrap().write_block(guest_addr, data);
+            memory.access().unwrap().write_block(guest_addr, data);
         } else {
             self.process_memory
                 .write()
@@ -3306,7 +3306,7 @@ impl KProcess {
         // Upstream: this->GetMemory().WriteBlock(base_addr, code_set.memory.data(), ...)
         if let Some(memory) = self.get_memory() {
             memory
-                .lock()
+                .access()
                 .unwrap()
                 .write_block(base_addr, &code_set.memory);
         }
@@ -3346,7 +3346,7 @@ impl KProcess {
     pub fn read_memory_vec(&self, guest_addr: u64, size: usize) -> Vec<u8> {
         if let Some(memory) = self.get_memory() {
             let mut buf = vec![0u8; size];
-            memory.lock().unwrap().read_block(guest_addr, &mut buf);
+            memory.access().unwrap().read_block(guest_addr, &mut buf);
             buf
         } else {
             let mem = self.process_memory.read().unwrap();

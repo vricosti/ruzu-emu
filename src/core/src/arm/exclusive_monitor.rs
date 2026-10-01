@@ -5,8 +5,7 @@
 //! ExclusiveMonitor for atomic operations.
 
 use crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor;
-use crate::memory::memory::Memory;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Type alias for virtual addresses
 pub type VAddr = u64;
@@ -35,7 +34,7 @@ pub trait ExclusiveMonitor {
 /// On x86_64/aarch64, creates a DynarmicExclusiveMonitor backed by
 /// `rdynarmic::ExclusiveMonitor`.
 pub fn make_exclusive_monitor(
-    memory: Arc<Mutex<Memory>>,
+    memory: Arc<crate::memory::memory::SharedMemory>,
     num_cores: usize,
 ) -> Option<Box<dyn ExclusiveMonitor>> {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

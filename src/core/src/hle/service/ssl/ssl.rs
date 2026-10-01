@@ -1278,15 +1278,15 @@ mod tests {
         table.resize(32, 12);
         table.entries.get_and_fault(3).store(false, PageType::Memory, 1,
             backing.buffer.backing_base_pointer() as usize);
-        let memory = Arc::new(Mutex::new(unsafe {
+        let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
             Memory::new(SystemRef::null(), backing.as_ref(), &backing.buffer)
         }));
-        memory.lock().unwrap().set_current_page_table(table.as_mut(), true);
+        memory.lock_mut().unwrap().set_current_page_table(table.as_mut(), true);
         let service = ISslConnection::new(SystemRef::null(), SslVersion::default(),
             Arc::new(Mutex::new(SslContextSharedData::default())), Box::new(TestSslBackend));
         for size in [0, 1, 3, 5] {
-            memory.lock().unwrap().write_block(0x3010, &[2, b'h', b'2']);
-            memory.lock().unwrap().write_block(0x3040, &[0xCC; 8]);
+            memory.access().unwrap().write_block(0x3010, &[2, b'h', b'2']);
+            memory.access().unwrap().write_block(0x3040, &[0xCC; 8]);
             let mut request = [0u32; ipc::COMMAND_BUFFER_LENGTH];
             request[0] = ipc::CommandType::Request as u32 | (1 << 20) | (1 << 24);
             request[1] = 8;
@@ -1303,7 +1303,7 @@ mod tests {
             service.handlers()[&27].handler_callback.unwrap()(&service, &mut ctx);
             assert_eq!(ctx.cmd_buf[8], size.min(3));
             let mut actual = [0; 8];
-            memory.lock().unwrap().read_block(0x3040, &mut actual);
+            memory.access().unwrap().read_block(0x3040, &mut actual);
             let mut expected = [0xCC; 8];
             let copied = size.min(3) as usize;
             expected[..copied].copy_from_slice(&[2, b'h', b'2'][..copied]);

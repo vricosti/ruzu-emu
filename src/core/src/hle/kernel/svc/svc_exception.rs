@@ -23,7 +23,7 @@ pub fn break_execution(system: &System, reason: u32, info1: u64, info2: u64) {
             return;
         }
         if let Some(memory) = system.get_svc_memory() {
-            let memory = memory.lock().unwrap();
+            let memory = memory.access().unwrap();
             if sz == 4 {
                 log::error!("debug_buffer_err_code={:X}", memory.read_32(addr));
             } else {
@@ -214,7 +214,7 @@ pub fn break64(system: &System, reason: u32, arg: u64, size: u64) {
             ],
         );
         if let Some(memory) = system.get_svc_memory() {
-            let memory = memory.lock().unwrap();
+            let memory = memory.access().unwrap();
             for offset in (0..0x100).step_by(0x20) {
                 let base = sp + offset;
                 common::trace::emit_raw(
@@ -333,7 +333,7 @@ fn dump_a64_break_context(system: &System, info1: u64, info2: u64) {
         let Some(memory) = process.get_memory() else {
             return;
         };
-        let mem = memory.lock().unwrap();
+        let mem = memory.access().unwrap();
         if info1.checked_add(info2).is_some() && mem.is_valid_virtual_address_range(info1, info2) {
             let mut hexdump = String::new();
             for index in 0..len {
@@ -354,7 +354,7 @@ fn dump_a64_stack_scan(process: &crate::hle::kernel::k_process::KProcess, sp: u6
     let Some(memory) = process.get_memory() else {
         return;
     };
-    let mem = memory.lock().unwrap();
+    let mem = memory.access().unwrap();
     if sp.checked_add(STACK_SCAN_BYTES as u64).is_none()
         || !mem.is_valid_virtual_address_range(sp, 8)
     {
@@ -455,7 +455,7 @@ fn dump_a32_break_context(system: &System, info1: u64, info2: u64, args: &[u64])
         let len = info2 as usize;
         let mut buf = vec![0u8; len];
         if let Some(memory) = system.get_svc_memory() {
-            let m = memory.lock().unwrap();
+            let m = memory.access().unwrap();
             m.read_block(info1, &mut buf);
         } else {
             let process_arc = system.current_process_arc();
@@ -488,7 +488,7 @@ fn dump_known_break_strings(system: &System) {
     let Some(memory) = system.get_svc_memory() else {
         return;
     };
-    let m = memory.lock().unwrap();
+    let m = memory.access().unwrap();
     for addr in [0x20bc7fau64, 0x20bc827, 0x2244ec7] {
         let mut buf = vec![0u8; 128];
         for index in 0..128u64 {
@@ -525,7 +525,7 @@ mod tests {
             return;
         }
         std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(|| {
-            use std::sync::{Arc, Mutex, RwLock};
+            use std::sync::{Arc, RwLock};
             use crate::core::SystemRef;
             use crate::device_memory::DeviceMemory;
             use crate::hle::kernel::k_process::{KProcess, ProcessLock, ProcessMemoryData};
@@ -547,11 +547,11 @@ mod tests {
                 1,
                 device.buffer.backing_base_pointer() as usize,
             );
-            let memory = Arc::new(Mutex::new(unsafe {
+            let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
                 Memory::new(SystemRef::null(), device.as_ref() as *const _, &device.buffer as *const _)
             }));
-            memory.lock().unwrap().set_current_page_table(table.as_mut() as *mut _, true);
-            memory.lock().unwrap().write_32(0x3000, 0x12EF_CDAB);
+            memory.lock_mut().unwrap().set_current_page_table(table.as_mut() as *mut _, true);
+            memory.access().unwrap().write_32(0x3000, 0x12EF_CDAB);
             let mut system = Box::new(System::new());
             let mut process = KProcess::new();
             process.program_id = 42;

@@ -428,7 +428,7 @@ impl Host1xCoreInterface for Host1x {
 
     fn smmu_register_process(
         &self,
-        memory: Option<std::sync::Arc<std::sync::Mutex<ruzu_core::memory::memory::Memory>>>,
+        memory: Option<std::sync::Arc<ruzu_core::memory::memory::SharedMemory>>,
     ) -> u32 {
         self.memory_manager.smmu_register_process(memory)
     }

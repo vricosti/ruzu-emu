@@ -93,7 +93,7 @@ pub fn flush_process_data_cache(
     // emulator behind rasterizer-lock contention. Collect the rasterizer
     // ranges under the lock, then notify with the lock released.
     let batch = memory
-        .lock()
+        .access()
         .unwrap()
         .collect_rasterizer_write_ranges(address, size as usize);
     batch.apply();

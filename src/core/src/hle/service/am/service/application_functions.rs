@@ -1335,14 +1335,14 @@ mod tests {
         table.entries.get_and_fault(3).store(
             false, PageType::Memory, 1, backing.buffer.backing_base_pointer() as usize,
         );
-        let memory = Arc::new(Mutex::new(unsafe {
+        let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
             Memory::new(crate::core::SystemRef::null(), backing.as_ref(), &backing.buffer)
         }));
-        memory.lock().unwrap().set_current_page_table(table.as_mut(), true);
+        memory.lock_mut().unwrap().set_current_page_table(table.as_mut(), true);
         let service = make_service();
         for id in [110, 111] {
             for size in [0, 0x18, 0x30, 0x31] {
-                memory.lock().unwrap().write_block(0x3000, &[0xCC; 128]);
+                memory.access().unwrap().write_block(0x3000, &[0xCC; 128]);
                 let mut ctx = HLERequestContext::new();
                 let mut request = [0u32; ipc::COMMAND_BUFFER_LENGTH];
                 request[0] = ipc::CommandType::Request as u32 | (1 << 24);
@@ -1358,7 +1358,7 @@ mod tests {
                 ctx.set_memory(memory.clone());
                 service.handlers()[&id].handler_callback.unwrap()(&service, &mut ctx);
                 let mut bytes = [0; 128];
-                memory.lock().unwrap().read_block(0x3000, &mut bytes);
+                memory.access().unwrap().read_block(0x3000, &mut bytes);
                 let mut expected = [0xCC; 128];
                 expected[16..16 + size as usize].fill(0);
                 assert_eq!(bytes, expected, "command {id}, buffer size {size}");

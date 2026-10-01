@@ -1353,7 +1353,7 @@ mod tests {
                     1,
                     device.buffer.backing_base_pointer() as usize,
                 );
-                let memory = Arc::new(StdMutex::new(unsafe {
+                let memory = Arc::new(crate::memory::memory::SharedMemory::new(unsafe {
                     Memory::new(
                         SystemRef::null(),
                         device.as_ref() as *const _,
@@ -1361,7 +1361,7 @@ mod tests {
                     )
                 }));
                 memory
-                    .lock()
+                    .lock_mut()
                     .unwrap()
                     .set_current_page_table(table.as_mut() as *mut _, true);
                 let log = directory.join("sdmc/FsAccessLog.txt");
@@ -1408,7 +1408,7 @@ mod tests {
                         b"\0ignored",
                     ] {
                         for (i, &byte) in message.iter().enumerate() {
-                            memory.lock().unwrap().write_8(0x3000 + i as u64, byte);
+                            memory.access().unwrap().write_8(0x3000 + i as u64, byte);
                         }
                         let mut words = [0u32; ipc::COMMAND_BUFFER_LENGTH];
                         words[0] = ipc::CommandType::Request as u32 | (1 << 20);

@@ -400,9 +400,7 @@ impl StagingBufferPool {
     /// Port of upstream `StagingBufferPool::AreRegionsActive`.
     fn are_stream_regions_active(&self, region_begin: usize, region_end: usize) -> bool {
         let gpu_tick = self.scheduler().known_gpu_tick();
-        self.stream_sync_ticks[region_begin..region_end]
-            .iter()
-            .any(|&sync_tick| gpu_tick < sync_tick)
+        stream_regions_active(&self.stream_sync_ticks, region_begin, region_end, gpu_tick)
     }
 
     fn try_get_reserved_buffer(
@@ -603,9 +601,45 @@ fn log2_ceil(value: vk::DeviceSize) -> u32 {
     }
 }
 
+/// `std::any_of` over `sync_ticks[region_begin, region_end)`.
+///
+/// Upstream can pass `region_begin > region_end`: when the wrap-around path of
+/// `GetStreamBuffer` falls back to a staging buffer it leaves `iterator` at 0
+/// with `free_iterator = size`, so a following smaller request starts its check
+/// past its own end. That reversed iterator range is undefined behaviour in
+/// C++; here it means "no region left to check", like an empty range.
+fn stream_regions_active(
+    sync_ticks: &[u64],
+    region_begin: usize,
+    region_end: usize,
+    gpu_tick: u64,
+) -> bool {
+    sync_ticks
+        .get(region_begin..region_end)
+        .is_some_and(|ticks| ticks.iter().any(|&sync_tick| gpu_tick < sync_tick))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_regions_active_checks_only_the_requested_regions() {
+        let ticks = [0, 5, 9, 0];
+        assert!(stream_regions_active(&ticks, 1, 3, 4));
+        assert!(stream_regions_active(&ticks, 2, 3, 5));
+        assert!(!stream_regions_active(&ticks, 1, 2, 5));
+        assert!(!stream_regions_active(&ticks, 0, 1, 0));
+        assert!(!stream_regions_active(&ticks, 2, 2, 0));
+    }
+
+    #[test]
+    fn stream_regions_active_treats_reversed_range_as_empty() {
+        // Regression: after a wrap-around fallback, a smaller request checked
+        // regions [2, 1) and panicked the GPU thread.
+        let ticks = [u64::MAX; 4];
+        assert!(!stream_regions_active(&ticks, 2, 1, 0));
+    }
 
     #[test]
     fn test_staging_buffer_send() {

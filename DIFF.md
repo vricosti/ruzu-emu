@@ -18747,3 +18747,27 @@ instructions and remain outside this change.
 - N/A: no field, synchronization-node, or guest ABI layout changes.
 - Regression `finish_termination_serializes_signal_and_waiter_notification` holds the scheduler lock while an exit worker starts, verifies it cannot complete in that scope, and checks lock ownership during the intrusive-list notification, successful waiter resumption, and list cleanup. The existing host-termination test covers the native condition-variable path.
 - Validation: both focused termination tests pass. `cargo test -p core -- --test-threads=1` was attempted but reports other failures and stalls in `update_highest_priority_threads_impl_requests_wait_for_non_runnable_dummy_current_thread`; a debugger snapshot confirms an HLE reschedule wait there. A diagnostic rerun skipping that case passes both termination tests again but ends with an access violation in `wait_cancel_pushes_runnable_thread_through_state_change_handler`. The full crate suite is therefore not validated; these other failures have not been attributed to this change. Logs and the debugger snapshot are retained under `C:/Temp`.
+
+## 2026-10-03 — `src/video_core/src/renderer_vulkan/staging_buffer_pool.rs` vs Eden `src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp` (`AreRegionsActive`)
+
+### Intentional differences
+
+- Eden's `AreRegionsActive` runs `std::any_of` over `[sync_ticks.begin() + region_begin, sync_ticks.begin() + region_end)`.
+  `GetStreamBuffer` can call it with `region_begin > region_end`: its wrap-around path resets `iterator = 0` and
+  `free_iterator = size`, then returns a staging buffer when those regions are still active, without advancing `iterator`. A
+  following smaller request checks from `Region(free_iterator) + 1` to `Region(iterator + size) + 1`, a reversed iterator range,
+  which is undefined behaviour in C++. Ruzu treats a reversed or out-of-bounds range as empty (no active region), since every
+  region the request needs lies below `free_iterator`. The literal slice port panicked the GPU thread
+  ("slice index starts at 2 but ends at 1") and froze the game.
+
+### Unintentional differences (to fix)
+
+- None.
+
+### Missing items
+
+- None.
+
+### Binary layout verification
+
+- N/A: no layout change. `stream_regions_active_treats_reversed_range_as_empty` covers the reversed range.

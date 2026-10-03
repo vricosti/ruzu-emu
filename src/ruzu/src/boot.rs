@@ -148,6 +148,13 @@ pub enum LoadingEvent {
     Stopped {
         before_first_frame: bool,
     },
+    /// The guest asked to chain into another program of the same title
+    /// (upstream `GRenderWindow::ExecuteProgramSignal`). Published only after
+    /// `ShutdownMainProcess`, like the other terminal events.
+    ExecuteProgram {
+        program_index: usize,
+        previous_program_id: u64,
+    },
     StopComplete,
 }
 
@@ -1016,6 +1023,16 @@ fn run_boot(
     system.register_exit_callback(Box::new(move || {
         exit_requested.store(true, Ordering::Release);
     }));
+    // Upstream registers an ExecuteProgram callback so Core can execute a
+    // sub-program; the request is forwarded to the GUI thread once this
+    // emulation thread has shut the current process down.
+    let execute_program_request = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    let execute_program_exit = Arc::clone(&guest_exit_requested);
+    let execute_program_index = Arc::clone(&execute_program_request);
+    system.register_execute_program_callback(Box::new(move |program_index| {
+        execute_program_index.store(program_index, Ordering::Release);
+        execute_program_exit.store(true, Ordering::Release);
+    }));
     if system.debugger_enabled() {
         system.initialize_debugger();
     }
@@ -1116,11 +1133,22 @@ fn run_boot(
     }
 
     log::info!("Emulation stopping: pause + shutdown");
+    // Upstream OnExecuteProgram reads the program ID before ShutdownGame.
+    let previous_program_id = system.get_application_process_program_id();
     system.detach_debugger();
     system.pause();
     system.shutdown_main_process();
+    let frontend_stop_requested = frontend_stop_requested.load(Ordering::Acquire);
+    let program_index = execute_program_request.load(Ordering::Acquire);
+    if program_index != usize::MAX && !frontend_stop_requested {
+        loading_event(LoadingEvent::ExecuteProgram {
+            program_index,
+            previous_program_id,
+        });
+        return;
+    }
     loading_event(terminal_event_after_shutdown(
-        frontend_stop_requested.load(Ordering::Acquire),
+        frontend_stop_requested,
         first_frame_displayed.load(Ordering::Acquire),
     ));
 }

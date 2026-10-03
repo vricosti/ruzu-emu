@@ -5460,6 +5460,13 @@ impl GMainWindow {
                     this.on_emulation_stopped(None);
                     return glib::ControlFlow::Break;
                 }
+                Some(LoadingEvent::ExecuteProgram {
+                    program_index,
+                    previous_program_id,
+                }) => {
+                    this.on_execute_program(program_index, previous_program_id);
+                    return glib::ControlFlow::Break;
+                }
                 None => {}
             }
             glib::ControlFlow::Continue
@@ -5651,6 +5658,13 @@ impl GMainWindow {
                     this.on_emulation_stopped(None);
                     return glib::ControlFlow::Break;
                 }
+                Some(LoadingEvent::ExecuteProgram {
+                    program_index,
+                    previous_program_id,
+                }) => {
+                    this.on_execute_program(program_index, previous_program_id);
+                    return glib::ControlFlow::Break;
+                }
                 None => {}
             }
             glib::ControlFlow::Continue
@@ -5828,6 +5842,13 @@ impl GMainWindow {
                 }
                 Some(LoadingEvent::StopComplete) => {
                     this.on_emulation_stopped(None);
+                    return glib::ControlFlow::Break;
+                }
+                Some(LoadingEvent::ExecuteProgram {
+                    program_index,
+                    previous_program_id,
+                }) => {
+                    this.on_execute_program(program_index, previous_program_id);
                     return glib::ControlFlow::Break;
                 }
                 None => {}
@@ -6638,6 +6659,39 @@ impl GMainWindow {
         } else if let Some(path) = restart_path {
             self.boot_game(path);
         }
+    }
+
+    /// Eden `MainWindow::OnExecuteProgram`: shut the running program down and
+    /// boot the requested sub-program of the same file.
+    fn on_execute_program(self: &Rc<Self>, program_index: usize, previous_program_id: u64) {
+        use ruzu_core::hle::service::am::am_types::AppletProgramId;
+        use ruzu_core::hle::service::am::applet_manager::LaunchType;
+
+        let current_path = self.current_game_path.borrow().clone();
+        log::info!(
+            "ExecuteProgram requested, program_index={} previous_program_id={:016X}",
+            program_index,
+            previous_program_id
+        );
+
+        self.on_emulation_stopped(None);
+
+        let mut parameters = crate::boot::BootParameters::default();
+        parameters.applet.program_index = program_index as i32;
+        parameters.applet.launch_type = LaunchType::ApplicationInitiated;
+        if previous_program_id > AppletProgramId::MaxProgramId as u64 {
+            parameters.applet.previous_program_index = (previous_program_id
+                - ruzu_core::file_sys::common_funcs::get_base_title_id(previous_program_id))
+                as i32;
+            parameters.applet.program_id = previous_program_id;
+        }
+
+        let Some(filename) = current_path else {
+            log::error!("ExecuteProgram requested without a booted file");
+            return;
+        };
+        log::debug!("ExecuteProgram booting from path: {filename}");
+        self.boot_game_with_parameters(filename, parameters);
     }
 
     /// Tail of Eden `MainWindow::OnStartGame`.

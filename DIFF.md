@@ -18724,3 +18724,26 @@ instructions and remain outside this change.
 
 - N/A: no layout change. `join_images_tracks_non_contiguous_render_target_per_segment` covers the
   per-segment invalidation.
+
+## 2026-10-02 — `src/core/src/hle/kernel/k_thread.rs` vs Eden `src/core/hle/kernel/k_thread.{h,cpp}` (`FinishTermination`)
+
+### Intentional differences
+
+- Scheduler-current-thread identity is read through the existing scheduler mutex and compared using Arc/Weak pointer identity instead of Eden's atomic `KThread*`. The mutex is released on each iteration, before yielding to the host; completion is still conditional on the thread leaving each core, not on an arbitrary delay.
+- The scheduler lock is obtained through the existing kernel accessor, with the thread's cached lock pointer as a fallback for isolated native tests. A kernel-less, uncached native thread has no guest scheduler to lock.
+- The existing host-only termination condition variable is signaled inside the same scheduler-locked scope as the guest synchronization notification.
+- The exit worker's captured Arc is released when its closure returns rather than calling C++ `Close(kernel)` explicitly. This change does not redesign the existing Arc-based object lifetime.
+
+### Unintentional differences (to fix)
+
+- None in the changed completion ordering: wait for core unloading, acquire scheduler lock, set `signaled`, notify guest waiters, release the worker reference. The worker no longer relies on a caller holding a lock that had already been released by `Exit`.
+
+### Missing items
+
+- No new prerequisite missing for this slice. This is not a complete audit of `StartTermination`, thread finalization, or the kernel's broader reference-counting implementation.
+
+### Binary layout verification
+
+- N/A: no field, synchronization-node, or guest ABI layout changes.
+- Regression `finish_termination_serializes_signal_and_waiter_notification` holds the scheduler lock while an exit worker starts, verifies it cannot complete in that scope, and checks lock ownership during the intrusive-list notification, successful waiter resumption, and list cleanup. The existing host-termination test covers the native condition-variable path.
+- Validation: both focused termination tests pass. `cargo test -p core -- --test-threads=1` was attempted but reports other failures and stalls in `update_highest_priority_threads_impl_requests_wait_for_non_runnable_dummy_current_thread`; a debugger snapshot confirms an HLE reschedule wait there. A diagnostic rerun skipping that case passes both termination tests again but ends with an access violation in `wait_cancel_pushes_runnable_thread_through_state_change_handler`. The full crate suite is therefore not validated; these other failures have not been attributed to this change. Logs and the debugger snapshot are retained under `C:/Temp`.

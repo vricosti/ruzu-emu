@@ -2637,21 +2637,38 @@ impl KThread {
     /// and closes the thread reference.
     pub fn finish_termination(&mut self) {
         // Upstream: Ensure the thread is not executing on any core.
-        // Upstream spin-waits checking each core's scheduler current thread.
-        // We check via the process's scheduler references if available.
         if self.parent.is_some() {
-            // Spin-wait: upstream does a tight loop per core checking
-            // scheduler.GetSchedulerCurrentThread() != this.
-            // In our model, the fiber-based context switching ensures
-            // that by the time the worker task runs, the thread has
-            // already been unloaded from its core. The spin is a safety check.
-            // We yield briefly to let any in-progress context switch complete.
-            std::thread::yield_now();
+            if let Some(kernel) = super::kernel::get_kernel_ref() {
+                for core_id in 0..NUM_CPU_CORES as usize {
+                    if let Some(scheduler) = kernel.scheduler(core_id) {
+                        loop {
+                            let current = scheduler.lock().unwrap().get_scheduler_current_thread();
+                            let is_current = current.as_ref().is_some_and(|current| {
+                                self.self_reference.as_ref().is_some_and(|this| {
+                                    std::ptr::eq(Arc::as_ptr(current), this.as_ptr())
+                                })
+                            });
+                            if !is_current {
+                                break;
+                            }
+                            // Release the scheduler mutex before yielding so
+                            // the core can finish unloading this thread.
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+            }
         }
 
         // Upstream: KScopedSchedulerLock sl{m_kernel};
-        // The scheduler lock ensures atomicity with thread state changes.
-        // The caller (do_worker_task_impl or exit) should acquire this.
+        // Signal and waiter-list traversal must be atomic with Wait's
+        // signaled check and node registration, including on the exit worker.
+        let scheduler_lock = super::kernel::scheduler_lock().or_else(|| {
+            (self.scheduler_lock_ptr != 0).then(|| unsafe {
+                &*(self.scheduler_lock_ptr as *const super::k_scheduler_lock::KAbstractSchedulerLock)
+            })
+        });
+        let _scheduler_guard = scheduler_lock.map(KScopedSchedulerLock::new);
 
         // Signal.
         // Upstream: m_signaled = true; KSynchronizationObject::NotifyAvailable();
@@ -4886,6 +4903,98 @@ mod tests {
         assert!(process_guard.get_thread_by_object_id(22).is_none());
         assert!(process_guard.get_thread_by_thread_id(11).is_none());
         assert!(!process_guard.thread_list.contains(&11));
+    }
+
+    #[test]
+    fn finish_termination_serializes_signal_and_waiter_notification() {
+        use super::super::k_synchronization_object::{SynchronizationObjectState, ThreadListNode};
+        use super::super::k_thread_queue::KThreadQueue;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        fn notify(
+            queue: &KThreadQueue,
+            waiter: &mut KThread,
+            _object: *const SynchronizationObjectState,
+            result: u32,
+        ) -> bool {
+            let lock = unsafe {
+                &*(waiter.scheduler_lock_ptr as *const k_scheduler_lock::KAbstractSchedulerLock)
+            };
+            assert!(lock.is_locked_by_current_thread(), "termination notified without scheduler lock");
+            queue.base_end_wait(waiter, result);
+            true
+        }
+
+        // Keep the test independent of process-global kernel initialization.
+        let _kernel = super::super::kernel::ScopedKernelForTest::new();
+        // This test exercises lock exclusion, not guest fiber switching.
+        static CALLBACKS: k_scheduler_lock::SchedulerCallbacks = k_scheduler_lock::SchedulerCallbacks {
+            disable_scheduling: || {},
+            enable_scheduling: |_| {},
+            update_highest_priority_threads: || 0,
+        };
+        let mut scheduler_lock = k_scheduler_lock::KAbstractSchedulerLock::new();
+        scheduler_lock.set_callbacks(&CALLBACKS);
+        let scheduler_lock = Arc::new(scheduler_lock);
+        let lock_ptr = Arc::as_ptr(&scheduler_lock) as usize;
+        let target = Arc::new(KThreadLock::new(KThread::new()));
+        let waiter = Arc::new(KThreadLock::new(KThread::new()));
+        waiter.lock().unwrap().thread_id = 81;
+        super::super::kernel::set_current_emu_thread(Some(&waiter));
+        let mut node = Box::new(ThreadListNode::new());
+        node.thread = Arc::downgrade(&waiter);
+        node.object_id = 44;
+
+        let guard = KScopedSchedulerLock::new(&scheduler_lock);
+        {
+            let mut target = target.lock().unwrap();
+            target.object_id = 44;
+            target.scheduler_lock_ptr = lock_ptr;
+            target.set_state(ThreadState::TERMINATED);
+            unsafe { target.sync_object.link_node(&mut *node); }
+        }
+        {
+            let mut waiter = waiter.lock().unwrap();
+            waiter.scheduler_lock_ptr = lock_ptr;
+            waiter.begin_wait_with_queue(KThreadQueue::with_callbacks(Some(notify), None));
+        }
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_target = target.clone();
+        let worker_lock = scheduler_lock.clone();
+        let worker = std::thread::spawn(move || {
+            let _kernel = super::super::kernel::ScopedKernelForTest::new();
+            let _keep_lock_alive = worker_lock;
+            // Distinct minimal kernels allocate identical dummy IDs. Give
+            // this host worker its own identity so the lock is not recursive.
+            let identity = Arc::new(KThreadLock::new(KThread::new()));
+            identity.lock().unwrap().thread_id = 158;
+            super::super::kernel::set_current_emu_thread(Some(&identity));
+            started_tx.send(()).unwrap();
+            worker_target.lock().unwrap().do_worker_task_impl();
+            done_tx.send(()).unwrap();
+            super::super::kernel::set_current_emu_thread(None);
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let blocked = matches!(done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout));
+        // Always release the lock before joining, including on regression.
+        drop(guard);
+        worker.join().unwrap();
+        assert!(blocked, "exit worker completed while wait registration held the scheduler lock");
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let _guard = KScopedSchedulerLock::new(&scheduler_lock);
+        assert!(target.lock().unwrap().is_signaled());
+        assert_eq!(waiter.lock().unwrap().get_state(), ThreadState::RUNNABLE);
+        assert_eq!(waiter.lock().unwrap().get_wait_result(), RESULT_SUCCESS.get_inner_value());
+        assert!(!waiter.lock().unwrap().has_wait_queue());
+        unsafe { target.lock().unwrap().sync_object.unlink_node(&mut *node); }
+        assert!(target.lock().unwrap().sync_object.is_empty());
+        drop(_guard);
+        super::super::kernel::set_current_emu_thread(None);
     }
 
     #[test]

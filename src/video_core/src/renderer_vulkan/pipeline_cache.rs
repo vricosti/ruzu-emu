@@ -2881,6 +2881,30 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_imad32i_is_caught_and_next_shader_can_compile() {
+        use shader_recompiler::frontend::translate::TranslatorVisitor;
+        use shader_recompiler::ir::{basic_block::Block, program::Program, types::ShaderStage};
+
+        let failed = catch_shader_exception(|| {
+            let mut program = Program::new(ShaderStage::Fragment);
+            program.blocks.push(Block::new());
+            TranslatorVisitor::new(&mut program, 0).translate_instruction(0x8000_0000_0007_0000);
+        });
+        assert_eq!(
+            failed.unwrap_err(),
+            "Instruction IMAD32I is not implemented is not implemented"
+        );
+
+        let next = catch_shader_exception(|| {
+            let mut program = Program::new(ShaderStage::Fragment);
+            program.blocks.push(Block::new());
+            TranslatorVisitor::new(&mut program, 0).translate_nop(0);
+            program.blocks[0].is_empty()
+        });
+        assert!(next.unwrap());
+    }
+
+    #[test]
     fn missing_file_environment_data_is_a_caught_shader_error() {
         let env = FileEnvironment::new();
         let result = catch_shader_exception(|| env.read_cbuf_value(2, 0x20));

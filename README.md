@@ -156,9 +156,40 @@ build.bat
 The script checks the Visual Studio Build Tools, Rust and vcpkg dependencies
 and stages the executable and runtime libraries under
 `build\x86_64-pc-windows-msvc\release`.
+It also copies runtime DLLs beside `target\release\ruzu.exe` (or `target\debug`
+with `-Debug`), so that executable can be launched directly from Explorer.
+
+If the C++ tools are missing, it asks before adding the Desktop development
+with C++ workload to an existing Visual Studio or Build Tools installation,
+or installing Build Tools 2026 with that workload. Refusing stops the script
+before any download or installation. After accepting, approve the Windows
+administrator prompt to install MSVC, the Windows SDK and CMake.
 
 Use `build.bat -Debug` for a debug build, or
 `build.bat -VcpkgRoot D:\path\to\vcpkg` to select an existing vcpkg installation.
+
+Installed native libraries are reused on later builds. vcpkg also keeps
+compiled packages in `%LOCALAPPDATA%\vcpkg\archives` by default, so a matching
+package can be restored without compiling its sources again.
+
+To download precompiled dependencies on a new machine, provide a shared
+[vcpkg binary cache](https://learn.microsoft.com/en-us/vcpkg/reference/binarycaching).
+The script already respects `VCPKG_BINARY_SOURCES`. For example, in PowerShell:
+
+```powershell
+# Replace the example URL with a server containing your vcpkg package archives.
+$env:VCPKG_BINARY_SOURCES = 'clear;default,readwrite;http,https://cache.example.com/{sha}.zip,read'
+.\build.bat
+```
+
+Remote packages must match the compiler, `x64-windows-ruzu` triplet, port recipes
+and dependency features. Missing or incompatible cached packages are built
+locally. A remote cache must first be populated and hosted; the Windows Ruzu
+release ZIP contains the application, rather than a dependency SDK. Sharing an
+SDK through [`vcpkg export`](https://learn.microsoft.com/en-us/vcpkg/commands/export)
+is another option, but exported SDKs are not currently accepted by
+`build.bat -VcpkgRoot`, which expects a standalone vcpkg checkout. Cargo still
+builds Ruzu and SDL3 separately.
 
 ### Packaging
 

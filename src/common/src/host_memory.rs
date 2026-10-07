@@ -221,10 +221,17 @@ impl HostMemoryImpl {
             (true, true) => PAGE_READWRITE,
             (true, false) => PAGE_READONLY,
             (false, false) => PAGE_NOACCESS,
-            (false, true) => panic!(
-                "unsupported Windows protection combination read={} write={}",
-                read, write
-            ),
+            (false, true) => {
+                error!(
+                    "host_memory.cpp: unsupported Windows protection combination read={} write={}",
+                    read, write
+                );
+                crate::assert::assert_fail_soft_impl();
+                // Upstream leaves DWORD new_flags{} unchanged after its
+                // soft assertion; VirtualProtect rejects zero and retains
+                // the previous protection.
+                0
+            }
         };
         let virtual_end = virtual_offset + length;
         let mappings = self.mappings();
@@ -1195,6 +1202,36 @@ mod tests {
         }
 
         hm.unmap(0x10_000, 0x2_000, false);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_write_only_protect_continues_with_upstream_zero_flags() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualQuery, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
+        };
+
+        let hm = HostMemory::new(0x20_000, 0x40_000);
+        hm.map(0x10_000, 0x4_000, 0x1_000, MemoryPermission::READ_WRITE, false);
+        hm.protect(0x10_000, 0x1_000, MemoryPermission::WRITE);
+
+        // The upstream unsupported combination logs, continues with zero
+        // flags and leaves the existing mapping's protection unchanged.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            VirtualQuery(
+                hm.virtual_base_pointer().add(0x10_000).cast(),
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        assert_eq!(queried, std::mem::size_of::<MEMORY_BASIC_INFORMATION>());
+        assert_eq!(info.Protect, PAGE_READWRITE);
+        unsafe {
+            hm.virtual_base_pointer().add(0x10_123).write(0xA7);
+            assert_eq!(hm.backing_base_pointer().add(0x4_123).read(), 0xA7);
+        }
+        hm.unmap(0x10_000, 0x1_000, false);
     }
 
     #[cfg(target_os = "windows")]

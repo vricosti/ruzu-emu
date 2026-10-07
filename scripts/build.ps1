@@ -60,6 +60,7 @@ else {
     Join-Path $env:TEMP "ruzu-windows-env.bat"
 }
 $VcpkgOverlayTriplets = Join-Path $ScriptDirectory "vcpkg-triplets"
+$VcpkgOverlayPorts = Join-Path $ScriptDirectory "vcpkg-ports"
 $CmakeWrapper = Join-Path $ScriptDirectory "cmake-clean-env.cmd"
 $VcpkgRootWasExplicit = $PSBoundParameters.ContainsKey("VcpkgRoot")
 $RequestedVcpkgRoot = if ($VcpkgRootWasExplicit) {
@@ -157,22 +158,26 @@ function Get-VSWherePath {
 }
 
 function Get-VSInstallation {
+    param([switch]$IncludeWithoutCppTools)
+
     $vswhere = Get-VSWherePath
     if (-not $vswhere) {
         return $null
     }
 
-    $json = & $vswhere `
-        -products "*" `
-        -version "[17.0,)" `
-        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-        -format json `
-        -utf8
+    $arguments = @("-products", "*", "-version", "[17.0,)", "-format", "json", "-utf8")
+    if (-not $IncludeWithoutCppTools) {
+        $arguments += @("-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64")
+    }
+    $json = & $vswhere @arguments
     if ($LASTEXITCODE -ne 0 -or -not $json) {
         return $null
     }
 
-    $installations = @($json | ConvertFrom-Json)
+    # Windows PowerShell 5.1 emits the JSON array as one pipeline object.
+    # Assign it directly so the next pipeline enumerates the installations,
+    # including zero installations when vswhere returns [].
+    $installations = $json | ConvertFrom-Json
     return $installations |
         Where-Object { [version]$_.installationVersion -ge [version]"17.0" } |
         Sort-Object { [version]$_.installationVersion } -Descending |
@@ -250,10 +255,56 @@ function Install-VisualStudioBuildTools {
         -FilePath $installer `
         -ArgumentList $arguments `
         -Verb RunAs `
+        -WindowStyle Hidden `
         -Wait `
         -PassThru
     if ($process.ExitCode -notin 0, 3010) {
         throw "Visual Studio $Generation Build Tools installation failed with exit code $($process.ExitCode)."
+    }
+}
+
+function Install-VisualStudioCppWorkload {
+    param([Parameter(Mandatory)]$Installation)
+
+    $installer = Join-Path (Split-Path -Parent (Get-VSWherePath)) "setup.exe"
+    if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+        throw "The Visual Studio Installer was not found: $installer"
+    }
+
+    # The same Desktop development with C++ selection uses different workload
+    # IDs in the standalone Build Tools product and in the Visual Studio IDE.
+    $workload = if ($Installation.productId -eq "Microsoft.VisualStudio.Product.BuildTools") {
+        "Microsoft.VisualStudio.Workload.VCTools"
+    }
+    else {
+        "Microsoft.VisualStudio.Workload.NativeDesktop"
+    }
+    $arguments = @(
+        "modify"
+        "--installPath"
+        "`"$($Installation.installationPath)`""
+        "--channelId"
+        $Installation.channelId
+        "--quiet"
+        "--norestart"
+        "--add"
+        $workload
+        "--add"
+        "Microsoft.VisualStudio.Component.VC.CMake.Project"
+        "--includeRecommended"
+    )
+    # setup.exe does not support the bootstrapper's --wait switch. Wait for
+    # its process, and run outside the Installer directory as Microsoft requires.
+    $process = Start-Process `
+        -FilePath $installer `
+        -ArgumentList $arguments `
+        -WorkingDirectory $ProjectRoot `
+        -Verb RunAs `
+        -WindowStyle Hidden `
+        -Wait `
+        -PassThru
+    if ($process.ExitCode -notin 0, 3010) {
+        throw "Desktop development with C++ installation failed with exit code $($process.ExitCode)."
     }
 }
 
@@ -304,25 +355,36 @@ function Ensure-WindowsBuildTools {
         )
     }
     else {
-        Write-Host "[MISSING] Visual Studio 2022 or newer with C++ tools is not installed."
-        if (-not (Confirm-Install "Install Visual Studio 2026 Build Tools with the C++ workload?")) {
-            throw "Visual Studio Build Tools installation was declined."
-        }
-
-        try {
-            Install-VisualStudioBuildTools -Generation "2026"
-        }
-        catch {
-            Write-Warning "Visual Studio 2026 installation failed: $($_.Exception.Message)"
-            if (-not (Confirm-Install "Install Visual Studio 2022 Build Tools instead?")) {
-                throw "Visual Studio 2022 fallback installation was declined."
+        $existingInstallation = Get-VSInstallation -IncludeWithoutCppTools
+        if ($existingInstallation) {
+            Write-Host "[MISSING] Desktop development with C++ is missing from Visual Studio $($existingInstallation.installationVersion)."
+            if (-not (Confirm-Install "Add Desktop development with C++ to the existing Visual Studio / Build Tools installation?")) {
+                throw "Visual Studio C++ workload installation was declined."
             }
-            Install-VisualStudioBuildTools -Generation "2022"
+            Write-Host "Adding the C++ workload, MSVC, Windows SDK, and CMake to $($existingInstallation.installationPath)..."
+            Install-VisualStudioCppWorkload -Installation $existingInstallation
+        }
+        else {
+            Write-Host "[MISSING] Visual Studio 2022 or newer / Build Tools is not installed."
+            if (-not (Confirm-Install "Install Visual Studio 2026 Build Tools with Desktop development with C++?")) {
+                throw "Visual Studio Build Tools installation was declined."
+            }
+            Write-Host "Installing Visual Studio 2026 Build Tools with Desktop development with C++..."
+            try {
+                Install-VisualStudioBuildTools -Generation "2026"
+            }
+            catch {
+                Write-Warning "Visual Studio 2026 installation failed: $($_.Exception.Message)"
+                if (-not (Confirm-Install "Install Visual Studio 2022 Build Tools instead?")) {
+                    throw "Visual Studio 2022 fallback installation was declined."
+                }
+                Install-VisualStudioBuildTools -Generation "2022"
+            }
         }
 
         $installation = Get-VSInstallation
         if (-not $installation) {
-            throw "Visual Studio 2022 or newer is unavailable after installation."
+            throw "Visual Studio C++ tools are unavailable after installing Desktop development with C++. A Windows restart may be required."
         }
         Write-Host (
             "[OK] Installed Visual Studio $($installation.installationVersion) with C++ tools."
@@ -638,6 +700,7 @@ function Ensure-VcpkgDependencies {
         ) + $VcpkgPackages + @(
             "--host-triplet=$VcpkgTriplet"
             "--overlay-triplets=$VcpkgOverlayTriplets"
+            "--overlay-ports=$VcpkgOverlayPorts"
             "--disable-metrics"
         )
         & $vcpkgExecutable @installArguments | Out-Host

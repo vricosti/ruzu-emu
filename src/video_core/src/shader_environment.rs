@@ -533,9 +533,7 @@ impl GenericEnvironment {
             log::error!(
                 "shader_environment.cpp: assert handle.first <= tic_limit (tic_index={tic_index:#x}, tic_limit={tic_limit:#x})"
             );
-            if *common::settings::values().use_debug_asserts.get_value() {
-                panic!("assertion failed: tic_index <= tic_limit");
-            }
+            common::assert::assert_fail_soft_impl();
         }
         let mut raw_bytes = [0u8; 32];
         if let Some(gpu_memory) = self.gpu_memory.as_ref() {
@@ -807,18 +805,21 @@ impl GraphicsEnvironment {
                 cbuf_index, self.stage_index
             )
         });
-        assert!(
-            binding.enabled,
-            "GraphicsEnvironment::read_cbuf_value: disabled cbuf {} for stage {}",
-            cbuf_index, self.stage_index
-        );
+        if !binding.enabled {
+            log::error!(
+                "shader_environment.cpp: assert cbuf.enabled (disabled cbuf {} for stage {})",
+                cbuf_index, self.stage_index
+            );
+            common::assert::assert_fail_soft_impl();
+        }
         let mut value = 0u32;
         if cbuf_offset < binding.size {
             value = self.base.read_u32(binding.address + cbuf_offset as u64);
         }
         self.base
             .cbuf_values
-            .insert(make_cbuf_key(cbuf_index, cbuf_offset), value);
+            .entry(make_cbuf_key(cbuf_index, cbuf_offset))
+            .or_insert(value);
         value
     }
 
@@ -1189,18 +1190,21 @@ impl ComputeEnvironment {
                 cbuf_index
             )
         });
-        assert!(
-            enabled,
-            "ComputeEnvironment::read_cbuf_value: disabled cbuf {}",
-            cbuf_index
-        );
+        if !enabled {
+            log::error!(
+                "shader_environment.cpp: assert const_buffer_enable_mask (disabled cbuf {})",
+                cbuf_index
+            );
+            common::assert::assert_fail_soft_impl();
+        }
         let mut value = 0u32;
         if cbuf_offset < cbuf.size {
             value = self.base.read_u32(cbuf.address + cbuf_offset as u64);
         }
         self.base
             .cbuf_values
-            .insert(make_cbuf_key(cbuf_index, cbuf_offset), value);
+            .entry(make_cbuf_key(cbuf_index, cbuf_offset))
+            .or_insert(value);
         value
     }
 
@@ -2826,11 +2830,37 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "disabled cbuf 2")]
-    fn graphics_environment_panics_on_disabled_live_cbuf() {
+    fn graphics_environment_disabled_live_cbuf_continues_like_upstream() {
         let maxwell = Maxwell3D::new();
         let mut env = GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::VertexB, 0, 0);
-        let _ = env.read_cbuf_value(2, 0);
+        assert_eq!(env.read_cbuf_value(2, 0), 0);
+        assert_eq!(env.base.cbuf_values.get(&make_cbuf_key(2, 0)), Some(&0));
+    }
+
+    #[test]
+    fn graphics_environment_disabled_cbuf_still_reads_in_range_and_caches_zero_outside() {
+        let gpu_base = 0x1_0000_0000;
+        let live_value = Arc::new(std::sync::atomic::AtomicU32::new(0xAABBCCDD));
+        let reader_value = Arc::clone(&live_value);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            assert_eq!(gpu_addr, gpu_base + 4);
+            dst.copy_from_slice(&reader_value.load(std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+        });
+        let mut env = GraphicsEnvironment::new();
+        env.base = GenericEnvironment::new().with_gpu_read(reader);
+        env.set_detached_const_buffer_binding(2, ConstBufferInfo {
+            address: gpu_base,
+            size: 8,
+            enabled: false,
+        });
+        assert_eq!(env.read_cbuf_value(2, 4), 0xAABBCCDD);
+        live_value.store(0x11223344, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(env.read_cbuf_value(2, 4), 0x11223344);
+        assert_eq!(env.read_cbuf_value(2, 8), 0);
+        // Upstream emplace retains the first observation for serialization,
+        // while each live read still returns the current guest value.
+        assert_eq!(env.base.cbuf_values.get(&make_cbuf_key(2, 4)), Some(&0xAABBCCDD));
+        assert_eq!(env.base.cbuf_values.get(&make_cbuf_key(2, 8)), Some(&0));
     }
 
     #[test]
@@ -2883,12 +2913,32 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "disabled cbuf 0")]
-    fn compute_environment_panics_on_disabled_live_cbuf() {
+    fn compute_environment_disabled_live_cbuf_continues_like_upstream() {
         let memory_manager = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
         let kepler = KeplerCompute::new(Arc::clone(&memory_manager));
         let mut env = ComputeEnvironment::from_kepler_compute(&kepler, memory_manager);
-        let _ = env.read_cbuf_value(0, 0);
+        assert_eq!(env.read_cbuf_value(0, 0), 0);
+        assert_eq!(env.base.cbuf_values.get(&make_cbuf_key(0, 0)), Some(&0));
+    }
+
+    #[test]
+    fn compute_environment_disabled_cbuf_still_reads_in_range_and_caches_zero_outside() {
+        let gpu_base = 0x3000_0000;
+        let mut backing = vec![0u8; 0x2000];
+        backing[4..8].copy_from_slice(&0xCAFEBABEu32.to_le_bytes());
+        let memory_manager = make_owner_backed_memory_manager(gpu_base, 0xB000, &backing);
+        let mut kepler = KeplerCompute::new(Arc::clone(&memory_manager));
+        kepler.launch_description.const_buffers[0] = ConstBufferConfig {
+            address: gpu_base,
+            size: 8,
+        };
+        let mut env = ComputeEnvironment::from_kepler_compute(&kepler, memory_manager);
+        assert_eq!(env.read_cbuf_value(0, 4), 0xCAFEBABE);
+        backing[4..8].copy_from_slice(&0x11223344u32.to_le_bytes());
+        assert_eq!(env.read_cbuf_value(0, 4), 0x11223344);
+        assert_eq!(env.read_cbuf_value(0, 8), 0);
+        assert_eq!(env.base.cbuf_values.get(&make_cbuf_key(0, 4)), Some(&0xCAFEBABE));
+        assert_eq!(env.base.cbuf_values.get(&make_cbuf_key(0, 8)), Some(&0));
     }
 
     #[test]

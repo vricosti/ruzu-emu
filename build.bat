@@ -69,6 +69,12 @@ if not errorlevel 1 (
     exit /b 1
 )
 
+rem Keep the Cargo executable launchable directly from Explorer as well.
+rem DLL discovery must work without the development terminal's PATH.
+for %%I in ("%RUZU_CARGO_BINARY%") do set "RUZU_CARGO_DIRECTORY=%%~dpI"
+copy /y "%RUZU_RUNTIME_BIN%\*.dll" "%RUZU_CARGO_DIRECTORY%" >nul
+if errorlevel 1 exit /b %errorlevel%
+
 echo Preparing the standalone Windows build...
 if exist "%RUZU_OUTPUT_DIR%" rmdir /s /q "%RUZU_OUTPUT_DIR%"
 if exist "%RUZU_OUTPUT_DIR%" (
@@ -98,6 +104,7 @@ set "RUZU_FORCE_PACKAGE="
 set "RUZU_OFFICIAL_PACKAGE="
 set "RUZU_BINARY="
 set "RUZU_CARGO_BINARY="
+set "RUZU_CARGO_DIRECTORY="
 set "RUZU_OUTPUT_DIR="
 set "RUZU_PLATFORM="
 set "RUZU_RUNTIME_BIN="

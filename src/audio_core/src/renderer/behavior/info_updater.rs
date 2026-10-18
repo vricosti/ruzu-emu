@@ -48,7 +48,7 @@ pub struct UpdateDataHeader {
     pub mix_size: u32,
     pub sinks_size: u32,
     pub performance_buffer_size: u32,
-    pub unk24: [u8; 4],
+    pub splitter_size: u32,
     pub render_info_size: u32,
     pub unk2c: [u8; 0x10],
     pub size: u32,
@@ -806,11 +806,17 @@ impl<'a> InfoUpdater<'a> {
     }
 
     pub fn update_splitter_info(&mut self, splitter_context: &mut SplitterContext) -> Result {
-        let mut consumed_size = 0u32;
-        if !splitter_context.update(&self.input_origin[self.input_offset..], &mut consumed_size) {
+        let Some(end) = self.input_offset.checked_add(self.in_header.splitter_size as usize) else {
+            return RESULT_INVALID_UPDATE_INFO;
+        };
+        // Unlike upstream's raw pointer, constrain reads to the declared transport block.
+        let Some(input) = self.input_origin.get(self.input_offset..end) else {
+            return RESULT_INVALID_UPDATE_INFO;
+        };
+        if !splitter_context.update(input) {
             return RESULT_INVALID_UPDATE_INFO;
         }
-        self.input_offset += consumed_size as usize;
+        self.input_offset = end;
         ResultCode::SUCCESS
     }
 
@@ -987,6 +993,96 @@ mod tests {
         let bytes =
             unsafe { std::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
         out.extend_from_slice(bytes);
+    }
+
+    #[test]
+    fn splitter_declared_size_preserves_following_mix_block() {
+        use crate::common::common::get_splitter_in_param_header_magic;
+        use crate::renderer::splitter::splitter_context::InParameterHeader;
+
+        for active in [false, true] {
+            let mut behavior = BehaviorInfo::new();
+            behavior.set_user_lib_revision(CURRENT_REVISION);
+            let mut splitter = SplitterContext::new();
+            if active {
+                assert!(splitter.initialize(&behavior, &AudioRendererParameterInternal {
+                    sample_rate: 48_000,
+                    sample_count: 240,
+                    mixes: 1,
+                    sub_mixes: 0,
+                    voices: 0,
+                    sinks: 0,
+                    effects: 0,
+                    perf_frames: 0,
+                    voice_drop_enabled: 0,
+                    unk_21: 0,
+                    rendering_device: 0,
+                    execution_mode: ExecutionMode::Auto,
+                    splitter_infos: 1,
+                    splitter_destinations: 1,
+                    external_context_size: 0,
+                    revision: CURRENT_REVISION,
+                }));
+            }
+            // The transport block includes reserved space beyond the parsed records.
+            let splitter_size = size_of::<InParameterHeader>() + 0x20;
+            let header = UpdateDataHeader {
+                mix_size: size_of::<MixInDirtyParameter>() as u32,
+                size: (size_of::<UpdateDataHeader>() + splitter_size
+                    + size_of::<MixInDirtyParameter>()) as u32,
+                ..Default::default()
+            };
+            let mut input = Vec::new();
+            push_pod(&mut input, &header);
+            input[0x24..0x28].copy_from_slice(&(splitter_size as u32).to_le_bytes());
+            push_pod(&mut input, &InParameterHeader {
+                magic: get_splitter_in_param_header_magic(),
+                ..Default::default()
+            });
+            input.resize(size_of::<UpdateDataHeader>() + splitter_size, 0x5a);
+            push_pod(&mut input, &MixInDirtyParameter {
+                magic: 0,
+                count: 0,
+                _unk08: [0; 0x18],
+            });
+            let mut output = vec![0; size_of::<UpdateDataHeader>()];
+            let mut mixes = MixContext::new();
+            mixes.initialize(1, 1, &behavior);
+            let mut updater = InfoUpdater::new(&input, &mut output, None, &mut behavior);
+            assert!(updater.update_splitter_info(&mut splitter).is_success());
+            assert_eq!(updater.input_offset, size_of::<UpdateDataHeader>() + splitter_size);
+            assert!(updater.update_mixes(&mut mixes, 1, &EffectContext::new(), &mut splitter).is_success());
+            assert!(updater.check_consumed_size().is_success());
+        }
+    }
+
+    #[test]
+    fn update_header_splitter_size_layout() {
+        assert_eq!(size_of::<UpdateDataHeader>(), 0x40);
+        assert_eq!(std::mem::offset_of!(UpdateDataHeader, splitter_size), 0x24);
+        assert_eq!(std::mem::offset_of!(UpdateDataHeader, render_info_size), 0x28);
+        assert_eq!(std::mem::offset_of!(UpdateDataHeader, size), 0x3c);
+    }
+
+    #[test]
+    fn splitter_block_bounds_and_empty_block() {
+        for splitter_size in [0, 1, u32::MAX] {
+            let mut behavior = BehaviorInfo::new();
+            let mut input = Vec::new();
+            push_pod(&mut input, &UpdateDataHeader {
+                splitter_size,
+                ..Default::default()
+            });
+            let mut output = vec![0; size_of::<UpdateDataHeader>()];
+            let mut updater = InfoUpdater::new(&input, &mut output, None, &mut behavior);
+            let result = updater.update_splitter_info(&mut SplitterContext::new());
+            assert_eq!(result, if splitter_size == 0 {
+                ResultCode::SUCCESS
+            } else {
+                RESULT_INVALID_UPDATE_INFO
+            });
+            assert_eq!(updater.input_offset, size_of::<UpdateDataHeader>());
+        }
     }
 
     #[test]

@@ -600,6 +600,7 @@ fn read_ui_bool_setting(
     }
 }
 
+#[cfg(test)]
 fn read_ui_u32_setting(
     values: &std::collections::BTreeMap<String, String>,
     key: &str,

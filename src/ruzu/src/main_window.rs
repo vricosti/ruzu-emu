@@ -245,6 +245,7 @@ fn boot_parameters_for_start_type(start_type: StartGameType) -> crate::boot::Boo
     parameters
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FullscreenHotkey {
     Toggle,
@@ -2041,13 +2042,13 @@ impl GMainWindow {
             error_applet_frontend: Rc::clone(&error_applet_frontend),
         });
 
+        #[cfg(target_os = "linux")]
         if this.inline_menu_bar.is_some() {
             let weak = Rc::downgrade(&this);
             crate::util::inline_menu::set_render_window_suppressor(Rc::new(move |hidden| {
                 let Some(this) = weak.upgrade() else { return };
                 // Native X children paint above GTK's parent surface. Restore
                 // only a still-live, visible render page, never a stopped game.
-                #[cfg(target_os = "linux")]
                 if let Some(render) = this.render.borrow().as_ref().filter(|_| this.detached_render_host.borrow().is_none()) {
                     render.set_hidden(hidden || !this.render_page_visible.get());
                 };

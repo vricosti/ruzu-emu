@@ -1,5 +1,18 @@
 # Upstream parity notes
 
+## 2026-10-18 - native dependency tracking and GTK build guards
+
+### Intentional differences
+- `src/video_core/build.rs` uses Cargo/pkg-config rather than Eden's
+  `CMakeModules/find/FindFFmpeg.cmake`. Track the discovered package metadata
+  so native package upgrades invalidate cached include/link paths.
+- The GTK frontend has no Qt file-parity requirement. Linux render-window
+  suppression registration is compiled only on Linux; test-only fullscreen
+  and configuration helpers remain available to tests. Runtime behavior is unchanged.
+
+### Binary layout verification
+- No binary layouts changed.
+
 ## 2026-09-16 - renderer_metal CPU stall diagnostics (native tooling)
 
 ### Intentional differences
@@ -18771,3 +18784,20 @@ instructions and remain outside this change.
 ### Binary layout verification
 
 - N/A: no layout change. `stream_regions_active_treats_reversed_range_as_empty` covers the reversed range.
+
+## 2026-10-18 — `src/audio_core/src/renderer/behavior/info_updater.rs` vs Eden `audio_core/renderer/behavior/info_updater.{h,cpp}`
+
+### Intentional differences
+
+- `UpdateSplitterInfo` uses a checked slice limited to the header's `splitter_size`, instead of upstream's raw pointer. An out-of-bounds transport block returns `RESULT_INVALID_UPDATE_INFO` before updating the context or cursor. Valid packets advance by the declared size after a successful update, matching Eden commit `28a78d76fed94255233284abb3df36b3fd41467d`.
+- Synthetic regressions cover reserved space after parsed splitter records, both active and inactive contexts, the following dirty-mix block, empty blocks and oversized declarations. The cursor regression failed before the correction. `cargo test -p audio_core -- --test-threads=1`: 220 passed, one hardware-dependent test ignored. The initial parallel run failed `timing_event_signals_audio_manager`; its cause was not established by this change. Runtime confirmation of issue #21 remains outstanding.
+
+### Binary layout verification
+
+- Tests verify the 0x40-byte header and offsets: `splitter_size` at 0x24, `render_info_size` at 0x28, `size` at 0x3c. The previously opaque four bytes are now a u32; no fields move. Default initialization still zeroes reserved bytes.
+
+## 2026-10-18 — `src/audio_core/src/renderer/splitter/splitter_context.rs` vs Eden `audio_core/renderer/splitter/splitter_context.{h,cpp}`
+
+### Intentional differences
+
+- `Update` retains Rust's existing checked header reads and negative-count rejection. The obsolete consumed-size output and final alignment calculation are removed, matching upstream's API; `InfoUpdater` owns transport cursor advancement. Internal ordering remains: inactive-context return, header validation, clear connection flags, update info, update destination data. Rust discards the last internal offset instead of assigning it to an unused local as C++ does. Headers and implementations were re-read after the change; the existing negative-count regression was adapted to the new signature.

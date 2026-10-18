@@ -41,6 +41,12 @@ fn main() {
         Ok("linux" | "freebsd") => pkg_config::Config::new().probe("libva").ok(),
         _ => None,
     };
+    for package in ["libavcodec", "libavutil"] {
+        track_pkg_config_file(package);
+    }
+    if libva.is_some() {
+        track_pkg_config_file("libva");
+    }
 
     let mut build = cc::Build::new();
     build.file("src/host1x/ffmpeg/ffmpeg_shim.c");
@@ -74,6 +80,15 @@ fn main() {
     bcn_build.compile("ruzu_video_core_bcn_shim");
 
     compile_vulkan_present_shaders(&manifest_dir);
+}
+
+fn track_pkg_config_file(package: &str) {
+    // Native package upgrades can change link/include paths without changing
+    // the environment. In particular, Homebrew removes old Cellar directories.
+    if let Ok(directory) = pkg_config::get_variable(package, "pcfiledir") {
+        let path = std::path::Path::new(&directory).join(format!("{package}.pc"));
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 }
 
 fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {

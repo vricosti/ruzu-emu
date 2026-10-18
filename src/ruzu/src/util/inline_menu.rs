@@ -691,6 +691,7 @@ thread_local! {
 }
 
 /// Registers the callback used to hide/show the embedded render window.
+#[cfg(target_os = "linux")]
 pub(crate) fn set_render_window_suppressor(suppressor: Rc<dyn Fn(bool)>) {
     RENDER_SUPPRESSOR.with(|slot| *slot.borrow_mut() = Some(suppressor));
 }
@@ -703,6 +704,7 @@ fn any_menu_open() -> bool {
     menubar_open || popup_open
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn render_suppressed() -> bool {
     RENDER_SUPPRESSED.with(Cell::get)
 }

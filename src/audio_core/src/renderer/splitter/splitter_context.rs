@@ -139,23 +139,19 @@ impl SplitterContext {
         true
     }
 
-    pub fn update(&mut self, input: &[u8], consumed_size: &mut u32) -> bool {
+    pub fn update(&mut self, input: &[u8]) -> bool {
         if self.destinations_count == 0 || self.info_count == 0 {
-            *consumed_size = 0;
             return true;
         }
 
         let Some(in_params) = read_pod::<InParameterHeader>(input, 0) else {
-            *consumed_size = 0;
             return false;
         };
 
         if in_params.magic != get_splitter_in_param_header_magic() {
-            *consumed_size = 0;
             return false;
         }
         if in_params.info_count < 0 || in_params.destination_count < 0 {
-            *consumed_size = 0;
             return false;
         }
 
@@ -165,8 +161,7 @@ impl SplitterContext {
 
         let mut offset = size_of::<InParameterHeader>() as u32;
         offset = self.update_info(input, offset, in_params.info_count as u32);
-        offset = self.update_data(input, offset, in_params.destination_count as u32);
-        *consumed_size = align_up(offset as u64, 0x10) as u32;
+        self.update_data(input, offset, in_params.destination_count as u32);
         true
     }
 
@@ -482,9 +477,7 @@ mod tests {
             )
         });
 
-        let mut consumed_size = u32::MAX;
-        assert!(!context.update(&input, &mut consumed_size));
-        assert_eq!(consumed_size, 0);
+        assert!(!context.update(&input));
     }
 
     #[test]

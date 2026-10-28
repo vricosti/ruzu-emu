@@ -188,8 +188,8 @@ impl ConfigurePerGame {
         status.set_xalign(0.0);
         status.set_hexpand(true);
         let cancel = dialog_button("window-close-symbolic", "Cancel", "ruzu-properties-cancel");
-        let ok = dialog_button("emblem-ok-symbolic", "OK", "ruzu-properties-ok");
-        let apply = (!runtime_lock).then(|| dialog_button("emblem-ok-symbolic", "Apply", "ruzu-properties-ok"));
+        let ok = dialog_button("object-select-symbolic", "OK", "ruzu-properties-ok");
+        let apply = (!runtime_lock).then(|| dialog_button("object-select-symbolic", "Apply", "ruzu-properties-ok"));
 
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         footer.set_margin_top(8);

@@ -57,7 +57,15 @@ pub fn set_process_memory_permission(
         return RESULT_INVALID_NEW_MEMORY_PERMISSION;
     }
 
-    let process_arc = resolve_process_handle(system, process_handle);
+    // Eden uses GetObject<KProcess> here, unlike Map/UnmapProcessMemory's
+    // GetObjectWithoutPseudoHandle: CurrentProcess is valid for permissions.
+    let process_arc = if process_handle
+        == crate::hle::kernel::svc_common::PseudoHandle::CurrentProcess as Handle
+    {
+        Some(system.current_process_arc().clone())
+    } else {
+        resolve_process_handle(system, process_handle)
+    };
     let process_arc = match process_arc {
         Some(p) => p,
         None => return RESULT_INVALID_HANDLE,
@@ -167,6 +175,21 @@ pub fn map_process_memory(
         if !src_process.page_table.contains(src_kpa, size as usize) {
             return RESULT_INVALID_CURRENT_MEMORY;
         }
+    }
+    // Match Eden's validation order before opening any source pages. Keep
+    // process locks disjoint; the page-table operations take their own locks.
+    {
+        let dst_process = dst_process_arc.lock().unwrap();
+        if !dst_process.page_table.can_contain(
+            dst_kpa,
+            size as usize,
+            crate::hle::kernel::k_memory_block::KMemoryState::SHARED_CODE,
+        ) {
+            return RESULT_INVALID_MEMORY_REGION;
+        }
+    }
+    {
+        let src_process = src_process_arc.lock().unwrap();
         let result = src_process.page_table.make_and_open_page_group(
             &mut page_group,
             src_kpa,
@@ -184,13 +207,6 @@ pub fn map_process_memory(
     }
 
     let mut dst_process = dst_process_arc.lock().unwrap();
-    if !dst_process.page_table.can_contain(
-        dst_kpa,
-        size as usize,
-        crate::hle::kernel::k_memory_block::KMemoryState::SHARED_CODE,
-    ) {
-        return RESULT_INVALID_MEMORY_REGION;
-    }
     let result = dst_process.page_table.map_page_group(
         dst_kpa,
         &page_group,
@@ -520,5 +536,31 @@ mod tests {
             crate::hle::kernel::svc_common::PseudoHandle::CurrentProcess as Handle,
         )
         .is_none());
+    }
+
+    #[test]
+    fn cross_process_mapping_validates_destination_before_source_state() {
+        let mut system = System::new_boxed_for_test();
+        let mut source = KProcess::new();
+        source.process_id = 0x1234;
+        source.allocate_code_memory(0x200000, 0x10000);
+        let source = Arc::new(ProcessLock::from_value(source));
+        system.kernel().unwrap().register_process(source);
+        let mut destination = KProcess::new();
+        destination.process_id = 0x1235;
+        destination.allocate_code_memory(0x200000, 0x10000);
+        destination.initialize_handle_table();
+        let handle = destination.handle_table.add(0x1234).unwrap();
+        system.set_current_process_arc(Arc::new(ProcessLock::from_value(destination)));
+
+        // Source is in range but FREE, destination is outside the address
+        // space. Eden rejects destination before inspecting source page state.
+        assert_eq!(map_process_memory(&system, 0x1_0000_0000, handle, 0x200000, PAGE_SIZE),
+            RESULT_INVALID_MEMORY_REGION);
+        assert_eq!(unmap_process_memory(&system, 0x1_0000_0000, handle, 0x200000, PAGE_SIZE),
+            RESULT_INVALID_MEMORY_REGION);
+        // Source range takes precedence over destination range.
+        assert_eq!(map_process_memory(&system, 0x1_0000_0000, handle, 0x1_0000_0000, PAGE_SIZE),
+            RESULT_INVALID_CURRENT_MEMORY);
     }
 }

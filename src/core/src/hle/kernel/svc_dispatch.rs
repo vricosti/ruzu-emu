@@ -1380,13 +1380,34 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
         // Process memory
         // =====================================================================
         Some(SvcId::SetProcessMemoryPermission) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_process_memory::set_process_memory_permission(
+                system,
+                get_arg32(args, 0),
+                gather64(args, 2, 3),
+                gather64(args, 1, 4),
+                decode_memory_permission(get_arg32(args, 5)),
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::MapProcessMemory) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_process_memory::map_process_memory(
+                system,
+                get_arg32(args, 0) as u64,
+                get_arg32(args, 1),
+                gather64(args, 2, 3),
+                get_arg32(args, 4) as u64,
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::UnmapProcessMemory) => {
-            set_arg32(args, 0, STUB_SUCCESS);
+            let result = svc_process_memory::unmap_process_memory(
+                system,
+                get_arg32(args, 0) as u64,
+                get_arg32(args, 1),
+                gather64(args, 2, 3),
+                get_arg32(args, 4) as u64,
+            );
+            set_arg32(args, 0, result.get_inner_value());
         }
         Some(SvcId::QueryProcessMemory) => {
             set_arg32(args, 0, STUB_SUCCESS);
@@ -1934,6 +1955,36 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
         Some(SvcId::GetResourceLimitCurrentValue) => {
             set_arg64(args, 0, STUB_SUCCESS as u64);
             set_arg64(args, 1, 0);
+        }
+        Some(SvcId::SetProcessMemoryPermission) => {
+            let result = svc_process_memory::set_process_memory_permission(
+                system,
+                get_arg64(args, 0) as u32,
+                get_arg64(args, 1),
+                get_arg64(args, 2),
+                decode_memory_permission(get_arg64(args, 3) as u32),
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::MapProcessMemory) => {
+            let result = svc_process_memory::map_process_memory(
+                system,
+                get_arg64(args, 0),
+                get_arg64(args, 1) as u32,
+                get_arg64(args, 2),
+                get_arg64(args, 3),
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
+        }
+        Some(SvcId::UnmapProcessMemory) => {
+            let result = svc_process_memory::unmap_process_memory(
+                system,
+                get_arg64(args, 0),
+                get_arg64(args, 1) as u32,
+                get_arg64(args, 2),
+                get_arg64(args, 3),
+            );
+            set_arg64(args, 0, result.get_inner_value() as u64);
         }
         // All remaining 64-bit SVCs return stub success
         Some(svc_id) => {
@@ -3489,6 +3540,66 @@ mod tests {
     }
 
     #[test]
+    fn process_memory_dispatch_preserves_eden_abi_and_validation() {
+        use crate::hle::kernel::svc::svc_results::*;
+        let system = test_system();
+        for is_64 in [true, false] {
+            for svc in [SvcId::MapProcessMemory, SvcId::UnmapProcessMemory] {
+                // dst, handle, src, size: source uses r2/r3 on AArch32;
+                // size is r4, not r3. Upper source bits must not be discarded.
+                for (dst, src, size, expected) in [
+                    (1, 0x200000, 0x1000, RESULT_INVALID_ADDRESS),
+                    (0x400000, 1, 0x1000, RESULT_INVALID_ADDRESS),
+                    (0x400000, 0x200000, 1, RESULT_INVALID_SIZE),
+                    (0x400000, 0x200000, 0, RESULT_INVALID_SIZE),
+                    (0x400000, u64::MAX - 0xfff, 0x1000, RESULT_INVALID_CURRENT_MEMORY),
+                    (0x400000, 0x200000, 0x1000, RESULT_INVALID_HANDLE),
+                ] {
+                    let mut args = [0; 8];
+                    args[0] = dst;
+                    args[1] = 0;
+                    if is_64 {
+                        args[2] = src;
+                        args[3] = size;
+                        call64(&system, svc as u32, &mut args);
+                    } else {
+                        scatter64(&mut args, 2, 3, src);
+                        args[4] = size;
+                        call32(&system, svc as u32, &mut args);
+                    }
+                    assert_eq!(args[0], expected.get_inner_value() as u64,
+                        "{svc:?}, AArch64={is_64}, src={src:#x}, size={size:#x}");
+                }
+            }
+            for (address, size, perm, expected) in [
+                (1, 0x1000, 1, RESULT_INVALID_ADDRESS),
+                (0x200000, 1, 1, RESULT_INVALID_SIZE),
+                (0x200000, 0, 1, RESULT_INVALID_SIZE),
+                (u64::MAX - 0xfff, 0x1000, 1, RESULT_INVALID_CURRENT_MEMORY),
+                (0x200000, u64::MAX - 0xfff, 1, RESULT_INVALID_CURRENT_MEMORY),
+                (0x200000, 0x1000, 2, RESULT_INVALID_NEW_MEMORY_PERMISSION),
+                (0x200000, 0x1000, 0xffff, RESULT_INVALID_NEW_MEMORY_PERMISSION),
+                (0x200000, 0x1000, 1, RESULT_INVALID_HANDLE),
+            ] {
+                let mut args = [0; 8];
+                if is_64 {
+                    args[1] = address;
+                    args[2] = size;
+                    args[3] = perm;
+                    call64(&system, SvcId::SetProcessMemoryPermission as u32, &mut args);
+                } else {
+                    scatter64(&mut args, 2, 3, address);
+                    scatter64(&mut args, 1, 4, size);
+                    args[5] = perm;
+                    call32(&system, SvcId::SetProcessMemoryPermission as u32, &mut args);
+                }
+                assert_eq!(args[0], expected.get_inner_value() as u64,
+                    "SetProcessMemoryPermission, AArch64={is_64}, address={address:#x}, size={size:#x}");
+            }
+        }
+    }
+
+    #[test]
     fn test_gather_scatter_64() {
         let mut args: SvcArgs = [0; 8];
         args[0] = 0xDEADBEEF;
@@ -3498,6 +3609,98 @@ mod tests {
         scatter64(&mut args, 1, 2, 0xAAAABBBB_CCCCDDDD);
         assert_eq!(args[1], 0xCCCCDDDD);
         assert_eq!(args[2], 0xAAAABBBB);
+    }
+
+    #[test]
+    fn process_memory_dispatch_maps_writable_alias_and_unmaps_it() {
+        use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState, PAGE_SIZE};
+        use crate::hle::kernel::k_memory_manager::Pool;
+        use crate::hle::kernel::kernel::ScopedKernelForTest;
+        use crate::memory::memory::{Memory, SharedMemory};
+        use crate::device_memory::DeviceMemory;
+        use crate::core::SystemRef;
+
+        let mut kernel = ScopedKernelForTest::new();
+        kernel.kernel_mut().initialize_memory_block_slab_manager(4096);
+        kernel.kernel_mut().initialize_block_info_manager(4096);
+        kernel.memory_manager_mut().initialize_pool(
+            Pool::Application, crate::device_memory::dram_memory_map::BASE + 0x100000, 16 * PAGE_SIZE);
+        let device = Box::new(DeviceMemory::with_size(0x400000));
+        let memory = Arc::new(SharedMemory::new(unsafe {
+            Memory::new(SystemRef::null(), device.as_ref() as *const _, &device.buffer as *const _)
+        }));
+        let system = test_system();
+        let process = system.current_process_arc();
+        let handle = {
+            let mut process = process.lock().unwrap();
+            process.process_id = 0x1234;
+            let id = process.get_process_id();
+            let handle = process.handle_table.add(id).unwrap();
+            let base = process.page_table.get_base_mut();
+            base.set_memory(memory.clone());
+            memory.lock_mut().unwrap().set_current_page_table(base.get_impl_mut().unwrap() as *mut _, true);
+            assert_eq!(base.map_pages_at_address(0x200000, 1,
+                KMemoryState::CODE, KMemoryPermission::USER_READ_EXECUTE), 0);
+            handle
+        };
+        memory.access().unwrap().write_64(0x200000, 0x123456789abcdef0);
+
+        for is_64 in [true, false] {
+            let invoke = |svc: SvcId| {
+                let mut args = [0; 8];
+                args[0] = 0x400000;
+                args[1] = handle as u64;
+                args[2] = 0x200000;
+                args[if is_64 { 3 } else { 4 }] = PAGE_SIZE as u64;
+                if is_64 { call64(&system, svc as u32, &mut args); }
+                else { call32(&system, svc as u32, &mut args); }
+                assert_eq!(args[0], 0, "{svc:?}, AArch64={is_64}");
+            };
+            invoke(SvcId::MapProcessMemory);
+            assert_eq!(memory.access().unwrap().read_64(0x400000),
+                memory.access().unwrap().read_64(0x200000));
+            memory.access().unwrap().write_64(0x400000, 0xfeedbeef);
+            assert_eq!(memory.access().unwrap().read_64(0x200000), 0xfeedbeef);
+            invoke(SvcId::UnmapProcessMemory);
+            assert!(!memory.access().unwrap().is_valid_virtual_address(0x400000));
+            assert_eq!(memory.access().unwrap().read_64(0x200000), 0xfeedbeef);
+            let process = process.lock().unwrap();
+            let base = process.page_table.get_base();
+            assert_eq!(base.query_info(0x400000).unwrap().m_state, KMemoryState::FREE);
+            assert_eq!(base.query_info(0x200000).unwrap().m_state, KMemoryState::CODE);
+        }
+        let mut permission_address = 0x201000;
+        for is_64 in [true, false] {
+            for permission_handle in [handle,
+                crate::hle::kernel::svc_common::PseudoHandle::CurrentProcess as u32] {
+                assert_eq!(process.lock().unwrap().page_table.get_base_mut()
+                    .map_pages_at_address(permission_address, 1, KMemoryState::CODE,
+                        KMemoryPermission::USER_READ_EXECUTE), 0);
+                // Eden changes CODE to CODE_DATA when enabling writes; that
+                // transition is terminal for this SVC's FLAG_CODE validation.
+                for permission in [MemoryPermission::Read, MemoryPermission::None, MemoryPermission::ReadWrite] {
+                    let mut args = [0; 8];
+                    args[0] = permission_handle as u64;
+                    if is_64 {
+                        args[1] = permission_address as u64;
+                        args[2] = PAGE_SIZE as u64;
+                        args[3] = permission as u64;
+                        call64(&system, SvcId::SetProcessMemoryPermission as u32, &mut args);
+                    } else {
+                        args[1] = PAGE_SIZE as u64;
+                        args[2] = permission_address as u64;
+                        args[5] = permission as u64;
+                        call32(&system, SvcId::SetProcessMemoryPermission as u32, &mut args);
+                    }
+                    assert_eq!(args[0], 0, "permission={permission:?}, AArch64={is_64}");
+                    let process = process.lock().unwrap();
+                    let info = process.page_table.get_base().query_info(permission_address).unwrap();
+                    assert_eq!(info.m_permission.contains(KMemoryPermission::USER_WRITE),
+                        permission == MemoryPermission::ReadWrite);
+                }
+                permission_address += PAGE_SIZE;
+            }
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::hle::service::am::frontend::applet_profile_select::{UiReturnArg, UiSe
 use crate::hle::result::{ResultCode, RESULT_SUCCESS, RESULT_UNKNOWN};
 use crate::hle::service::am::applet_data_broker::AppletDataBroker;
 use crate::hle::service::am::service::storage::IStorage;
+use crate::hle::service::am::service::library_applet_self_accessor::LibraryAppletInfo;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
 use crate::hle::service::ipc_helpers::{RequestParser, ResponseBuilder};
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
@@ -51,6 +52,9 @@ fn enable_single_user_play(data: &mut [u8]) {
 /// - 30: GetResult
 /// - 50: SetOutOfFocusApplicationSuspendingEnabled (unimplemented)
 /// - 60: PresetLibraryAppletGpuTimeSliceZero
+/// - 80: RequestForLibraryAppletToGetForeground (unimplemented)
+/// - 81: GetCurrentChildLibraryApplet (unimplemented)
+/// - 90: Unknown90 (upstream success stub)
 /// - 100: PushInData
 /// - 101: PopOutData
 /// - 102: PushExtraStorage (unimplemented)
@@ -59,7 +63,7 @@ fn enable_single_user_play(data: &mut [u8]) {
 /// - 105: GetPopOutDataEvent
 /// - 106: GetPopInteractiveOutDataEvent
 /// - 110: NeedsToExitProcess (unimplemented)
-/// - 120: GetLibraryAppletInfo (unimplemented)
+/// - 120: GetLibraryAppletInfo
 /// - 150: RequestForAppletToGetForeground (unimplemented)
 /// - 160: GetIndirectLayerConsumerHandle
 pub struct ILibraryAppletAccessor {
@@ -98,6 +102,9 @@ impl ILibraryAppletAccessor {
                 Some(Self::preset_library_applet_gpu_time_slice_zero_handler),
                 "PresetLibraryAppletGpuTimeSliceZero",
             ),
+            (80, None, "RequestForLibraryAppletToGetForeground"),
+            (81, None, "GetCurrentChildLibraryApplet"),
+            (90, Some(Self::unknown90_handler), "Unknown90"),
             (100, Some(Self::push_in_data_handler), "PushInData"),
             (101, Some(Self::pop_out_data_handler), "PopOutData"),
             (102, None, "PushExtraStorage"),
@@ -122,7 +129,7 @@ impl ILibraryAppletAccessor {
                 "GetPopInteractiveOutDataEvent",
             ),
             (110, None, "NeedsToExitProcess"),
-            (120, None, "GetLibraryAppletInfo"),
+            (120, Some(Self::get_library_applet_info_handler), "GetLibraryAppletInfo"),
             (150, None, "RequestForAppletToGetForeground"),
             (
                 160,
@@ -268,6 +275,28 @@ impl ILibraryAppletAccessor {
 
         let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
+    }
+
+    /// Eden ILibraryAppletAccessor::Unknown90 (firmware 20.0.0+).
+    fn unknown90_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) ILibraryAppletAccessor::Unknown90 called");
+        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
+    }
+
+    /// Eden ILibraryAppletAccessor::GetLibraryAppletInfo.
+    fn get_library_applet_info_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let service = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        log::info!("ILibraryAppletAccessor::GetLibraryAppletInfo called");
+        let info = {
+            let applet = service.applet.lock().unwrap();
+            LibraryAppletInfo {
+                applet_id: applet.applet_id,
+                library_applet_mode: applet.library_applet_mode,
+            }
+        };
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_raw(&info);
     }
 
     fn get_indirect_layer_consumer_handle_handler(
@@ -509,6 +538,46 @@ mod tests {
     use super::*;
     use crate::hle::service::am::applet::Applet;
     use crate::hle::service::os::process::Process;
+
+    #[test]
+    fn unknown90_returns_success_without_changing_applet_state() {
+        let applet = Arc::new(Mutex::new(Applet::new(SystemRef::null(), Process::new(), false)));
+        let accessor = ILibraryAppletAccessor::new(SystemRef::null(), Arc::new(AppletDataBroker::new()), Arc::clone(&applet));
+        applet.lock().unwrap().terminate_result = 0x1234;
+        for completed in [false, true] {
+            applet.lock().unwrap().is_completed = completed;
+            let mut ctx = HLERequestContext::new();
+            ctx.cmd_buf.fill(0xdeadbeef);
+            accessor.handlers[&90].handler_callback.unwrap()(&accessor, &mut ctx);
+            assert_eq!(&ctx.cmd_buf[6..8], &[0, 0]);
+            assert!(ctx.outgoing_copy_objects.is_empty());
+            let applet = applet.lock().unwrap();
+            assert_eq!(applet.is_completed, completed);
+            assert_eq!(applet.terminate_result, 0x1234);
+        }
+    }
+
+    #[test]
+    fn library_applet_info_returns_child_identity_and_mode() {
+        use crate::hle::service::am::am_types::LibraryAppletMode;
+        assert_eq!(std::mem::size_of::<LibraryAppletInfo>(), 8);
+        assert_eq!(std::mem::offset_of!(LibraryAppletInfo, applet_id), 0);
+        assert_eq!(std::mem::offset_of!(LibraryAppletInfo, library_applet_mode), 4);
+        let applet = Arc::new(Mutex::new(Applet::new(SystemRef::null(), Process::new(), false)));
+        let accessor = ILibraryAppletAccessor::new(SystemRef::null(), Arc::new(AppletDataBroker::new()), Arc::clone(&applet));
+        for id in [AppletId::ProfileSelect, AppletId::SoftwareKeyboard] {
+            let mode = LibraryAppletMode::AllForeground;
+            {
+                let mut applet = applet.lock().unwrap();
+                applet.applet_id = id;
+                applet.library_applet_mode = mode;
+            }
+            let mut ctx = HLERequestContext::new();
+            accessor.handlers[&120].handler_callback.unwrap()(&accessor, &mut ctx);
+            assert_eq!(&ctx.cmd_buf[6..10], &[0, 0, id as u32, mode as u32]);
+            assert!(ctx.outgoing_copy_objects.is_empty());
+        }
+    }
 
     #[test]
     fn single_user_play_changes_only_the_two_display_options() {

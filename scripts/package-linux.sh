@@ -3,8 +3,9 @@
 #
 # Linux counterpart of build-macos-app.sh --package: the archive name comes
 # from scripts/package-revision.sh (an exact version tag, otherwise
-# <branch>-<12-character commit>, with -dirty appended for local changes), Cargo supplies the numeric
-# Debian version only, and the binary is never rebuilt here.
+# <branch>-<12-character commit>, with -dirty appended for local changes).
+# Version tags also supply the Debian version; Cargo is the fallback for untagged
+# builds. The binary is never rebuilt here.
 #
 # Produces target/release/Ruzu-<Distro><Version>-<Git revision>-<arch>.deb,
 # for example Ruzu-Ubuntu2404-v0.0.6-amd64.deb.
@@ -28,20 +29,29 @@ fi
 package_revision=$(sh "$repo_root/scripts/package-revision.sh" "$repo_root")
 release_commit=$(git rev-parse HEAD)
 
-# Cargo supplies numeric package metadata only, never the archive name.
-package_id=$(cargo pkgid --offline -p ruzu)
-version=${package_id##*#}
-version=${version##*@}
-case "$version" in
-    *[!0-9.]*|"") echo "Linux release packaging requires a numeric major.minor.patch version: $version" >&2; exit 1 ;;
-esac
-# A clean tagged checkout ships the bare Cargo version; anything else records
-# the commit so the Debian version stays unique and monotonic (+ sorts after).
+# Match the exact version-tag grammar used by package-revision.sh, rather than
+# treating any branch starting with 'v' as a release. Preserve prerelease suffixes.
+version=$(printf '%s\n' "${package_revision%-dirty}" | sed -nE \
+    's/^v([0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9][A-Za-z0-9.-]*)?)$/\1/p')
+if ! git tag --points-at HEAD | grep -Fxq "${package_revision%-dirty}"; then
+    version=
+fi
+tagged_version=$version
+if [ -z "$version" ]; then
+    package_id=$(cargo pkgid --offline -p ruzu)
+    version=${package_id##*#}
+    version=${version##*@}
+    if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "Linux release packaging requires a numeric major.minor.patch version: $version" >&2
+        exit 1
+    fi
+fi
 deb_version=$version
 case "$package_revision" in
     *-dirty) deb_version="$version+git$(printf '%.12s' "$release_commit").dirty" ;;
-    v[0-9]*) ;;
-    *) deb_version="$version+git$(printf '%.12s' "$release_commit")" ;;
+    *) if [ -z "$tagged_version" ]; then
+           deb_version="$version+git$(printf '%.12s' "$release_commit")"
+       fi ;;
 esac
 
 arch=$(dpkg --print-architecture)

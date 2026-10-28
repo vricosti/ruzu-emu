@@ -8,6 +8,7 @@ use super::dmnt_cheat_types::{CheatEntry, CheatProcessMetadata, MemoryRegionExte
 use super::dmnt_cheat_vm::{DmntCheatVm, VmCallbacks};
 use crate::core::SystemRef;
 use crate::core_timing::{create_event, CoreTiming, EventType, UnscheduleEventType};
+use crate::hle::kernel::k_process::ProcessLock;
 use crate::hle::kernel::svc_types::ProcessActivity;
 use crate::hle::service::hid::hid_server::IHidServer;
 use hid_core::hid_types::NpadButton;
@@ -21,9 +22,12 @@ const CHEAT_ENGINE_NS: Duration = Duration::from_nanos(1_000_000_000 / 12);
 
 // ---- Helper: Extract name from cheat text ----
 
-fn extract_name(data: &str, start_index: usize, match_char: char) -> Option<(usize, &str)> {
-    let remaining = &data[start_index..];
-    if let Some(end_offset) = remaining.find(match_char) {
+fn extract_name(data: &str, start_index: usize, match_char: u8) -> Option<(usize, &[u8])> {
+    let remaining = data.as_bytes().get(start_index..)?;
+    if let Some(end_offset) = remaining.iter().position(|&byte| byte == match_char) {
+        if end_offset == 0 {
+            return None;
+        }
         let name_size = end_offset;
         // Clamp to CheatDefinition::readable_name size (0x40)
         let clamped = name_size.min(0x40);
@@ -41,11 +45,36 @@ pub struct StandardVmCallbacks {
     metadata: Arc<Mutex<CheatProcessMetadata>>,
     /// Non-owning system reference matching upstream `Core::System& m_system`.
     system: SystemRef,
+    // Eden caches a non-owning process pointer by metadata.process_id. Weak
+    // preserves that ownership while avoiding a dangling pointer on teardown.
+    cached_process: Mutex<Option<(u64, Weak<ProcessLock>)>>,
 }
 
 impl StandardVmCallbacks {
     pub fn new(system: SystemRef, metadata: Arc<Mutex<CheatProcessMetadata>>) -> Self {
-        Self { metadata, system }
+        Self {
+            metadata,
+            system,
+            cached_process: Mutex::new(None),
+        }
+    }
+
+    /// Port of StandardVmCallbacks::GetProcess.
+    fn get_process(&self) -> Option<Arc<ProcessLock>> {
+        let process_id = self.metadata.lock().unwrap().process_id;
+        let mut cache = self.cached_process.lock().unwrap();
+        if let Some((cached_id, process)) = cache.as_ref() {
+            if *cached_id == process_id {
+                if let Some(process) = process.upgrade() {
+                    return Some(process);
+                }
+            }
+        }
+        let process = self.system.get().kernel()?.get_process_by_id(process_id);
+        *cache = process
+            .as_ref()
+            .map(|process| (process_id, Arc::downgrade(process)));
+        process
     }
 
     fn is_address_in_range(&self, address: u64) -> bool {
@@ -91,16 +120,12 @@ impl StandardVmCallbacks {
 
 impl VmCallbacks for StandardVmCallbacks {
     fn memory_read_unsafe(&self, address: u64, data: &mut [u8]) {
-        if !self.is_address_in_range(address) {
+        let process = self.get_process();
+        if process.is_none() || !self.is_address_in_range(address) {
             data.fill(0);
             return;
         }
-        let Some(memory) = self
-            .system
-            .get()
-            .current_process_arc_opt()
-            .and_then(|process| process.lock().unwrap().get_memory())
-        else {
+        let Some(memory) = process.and_then(|process| process.lock().unwrap().get_memory()) else {
             data.fill(0);
             return;
         };
@@ -113,10 +138,11 @@ impl VmCallbacks for StandardVmCallbacks {
     }
 
     fn memory_write_unsafe(&self, address: u64, data: &[u8]) {
-        if !self.is_address_in_range(address) {
+        let process = self.get_process();
+        if process.is_none() || !self.is_address_in_range(address) {
             return;
         }
-        let Some(process) = self.system.get().current_process_arc_opt() else {
+        let Some(process) = process else {
             return;
         };
         let Some(memory) = process.lock().unwrap().get_memory() else {
@@ -161,7 +187,7 @@ impl VmCallbacks for StandardVmCallbacks {
     }
 
     fn pause_process(&self) {
-        let Some(process) = self.system.get().current_process_arc_opt() else {
+        let Some(process) = self.get_process() else {
             return;
         };
         let mut process = process.lock().unwrap();
@@ -171,7 +197,7 @@ impl VmCallbacks for StandardVmCallbacks {
     }
 
     fn resume_process(&self) {
-        let Some(process) = self.system.get().current_process_arc_opt() else {
+        let Some(process) = self.get_process() else {
             return;
         };
         let mut process = process.lock().unwrap();
@@ -210,16 +236,18 @@ impl CheatParser for TextCheatParser {
         let mut out = vec![CheatEntry::default()];
         let mut current_entry: Option<usize> = None;
 
-        let chars: Vec<char> = data.chars().collect();
+        // Upstream indexes bytes. Character indices break subsequent names and
+        // opcodes when a title contains UTF-8 controller symbols or accents.
+        let chars = data.as_bytes();
         let mut i = 0;
 
         while i < chars.len() {
-            if chars[i].is_whitespace() {
+            if chars[i].is_ascii_whitespace() {
                 i += 1;
                 continue;
             }
 
-            if chars[i] == '{' {
+            if chars[i] == b'{' {
                 current_entry = Some(0);
 
                 if out[0].definition.num_opcodes > 0 {
@@ -227,8 +255,7 @@ impl CheatParser for TextCheatParser {
                 }
 
                 let start = i + 1;
-                if let Some((name_size, name)) = extract_name(data, start, '}') {
-                    let name_bytes = name.as_bytes();
+                if let Some((name_size, name_bytes)) = extract_name(data, start, b'}') {
                     let copy_len = name_bytes
                         .len()
                         .min(out[0].definition.readable_name.len() - 1);
@@ -242,14 +269,13 @@ impl CheatParser for TextCheatParser {
                 }
 
                 i += 1;
-            } else if chars[i] == '[' {
+            } else if chars[i] == b'[' {
                 let idx = out.len();
                 current_entry = Some(idx);
                 out.push(CheatEntry::default());
 
                 let start = i + 1;
-                if let Some((name_size, name)) = extract_name(data, start, ']') {
-                    let name_bytes = name.as_bytes();
+                if let Some((name_size, name_bytes)) = extract_name(data, start, b']') {
                     let copy_len = name_bytes
                         .len()
                         .min(out[idx].definition.readable_name.len() - 1);
@@ -275,21 +301,18 @@ impl CheatParser for TextCheatParser {
                     return vec![];
                 }
 
-                // Read 8 hex characters
-                if i + 8 > chars.len() {
+                // Match upstream's bounded substr(i, 8), including a terminal
+                // shorter hex token and its for-loop increment past a separator.
+                let hex = &chars[i..(i + 8).min(chars.len())];
+                if !hex.iter().all(u8::is_ascii_hexdigit) {
                     return vec![];
                 }
-                let hex_str: String = chars[i..i + 8].iter().collect();
-                if !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return vec![];
-                }
-
-                let value = u32::from_str_radix(&hex_str, 16).unwrap_or(0);
+                let value = u32::from_str_radix(std::str::from_utf8(hex).unwrap(), 16).unwrap();
                 let num = out[entry_idx].definition.num_opcodes as usize;
                 out[entry_idx].definition.opcodes[num] = value;
                 out[entry_idx].definition.num_opcodes += 1;
 
-                i += 8;
+                i += 9;
             } else {
                 return vec![];
             }
@@ -455,6 +478,84 @@ impl Drop for CheatEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parser_preserves_utf8_byte_positions_and_fixed_name_capacity() {
+        let name = format!("{}é🎮", "x".repeat(62));
+        let parsed = TextCheatParser.parse(&format!(
+            "[🎮 saut]\n04000000 00000020 D503201F\n[{name}]\nFF000000\n[é]\nFF100000"
+        ));
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(
+            &parsed[1].definition.readable_name[.."🎮 saut".len()],
+            "🎮 saut".as_bytes()
+        );
+        assert_eq!(parsed[1].definition.num_opcodes, 3);
+        assert_eq!(parsed[1].definition.opcodes[2], 0xd503201f);
+        assert_eq!(
+            &parsed[2].definition.readable_name[..63],
+            &name.as_bytes()[..63]
+        );
+        assert_eq!(parsed[2].definition.readable_name[63], 0);
+        assert_eq!(parsed[3].definition.opcodes[0], 0xff100000);
+        for invalid in [
+            "[]\nFF000000",
+            "{}\nFF000000",
+            "[missing",
+            "FF000000",
+            "[x]\nGG000000",
+        ] {
+            assert!(TextCheatParser.parse(invalid).is_empty());
+        }
+    }
+
+    #[test]
+    fn parser_master_limits_and_terminal_hex_follow_upstream() {
+        let parsed = TextCheatParser.parse("{master}\nFF000000\n[x]\nFF100000");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|entry| entry.enabled));
+        assert_eq!(parsed[0].cheat_id, 0);
+        assert_eq!(parsed[1].cheat_id, 1);
+        assert!(TextCheatParser
+            .parse("{a}\nFF000000\n{b}\nFF100000")
+            .is_empty());
+        assert!(TextCheatParser
+            .parse(&format!("[x]\n{}", "FF000000\n".repeat(257)))
+            .is_empty());
+        assert_eq!(
+            TextCheatParser.parse("[x]\n123")[1].definition.opcodes[0],
+            0x123
+        );
+    }
+
+    #[test]
+    fn callbacks_resolve_metadata_process_and_invalidate_cached_id() {
+        use crate::hle::kernel::k_process::KProcess;
+        let mut system = crate::core::System::new_boxed_for_test();
+        let first = Arc::new(ProcessLock::from_value(KProcess::new()));
+        first.lock().unwrap().process_id = 0x1234;
+        let second = Arc::new(ProcessLock::from_value(KProcess::new()));
+        second.lock().unwrap().process_id = 0x1235;
+        system.kernel().unwrap().register_process(first.clone());
+        system.kernel().unwrap().register_process(second.clone());
+        system.set_current_process_arc(first.clone());
+        let mut metadata = CheatProcessMetadata::default();
+        metadata.process_id = 0x1235;
+        let metadata = Arc::new(Mutex::new(metadata));
+        let callbacks = StandardVmCallbacks::new(SystemRef::from_ref(&system), metadata.clone());
+        assert!(Arc::ptr_eq(&callbacks.get_process().unwrap(), &second));
+        assert!(Arc::ptr_eq(&callbacks.get_process().unwrap(), &second));
+        metadata.lock().unwrap().process_id = 0x1234;
+        assert!(Arc::ptr_eq(&callbacks.get_process().unwrap(), &first));
+        metadata.lock().unwrap().process_id = 0x9999;
+        assert!(callbacks.get_process().is_none());
+        let mut data = [0xff; 8];
+        callbacks.memory_read_unsafe(0x1000, &mut data);
+        assert_eq!(data, [0; 8]);
+        callbacks.memory_write_unsafe(0x1000, &[1]);
+        callbacks.pause_process();
+        callbacks.resume_process();
+    }
 
     #[test]
     fn initialize_schedules_periodic_frame_callback() {

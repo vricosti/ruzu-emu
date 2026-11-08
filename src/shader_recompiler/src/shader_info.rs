@@ -307,9 +307,37 @@ pub struct ImageDescriptor {
     pub size_shift: u32,
 }
 
+/// Task/mesh stage-buffer layout from Eglantine `shader_info.h`, revision
+/// 900ab5a8251dcdb5eee42dd2837fa936ade15303 (absent from original Eden-NX2).
+/// Each line names the attribute in a 128-byte group of 32 elements.
+#[derive(Debug, Clone, Default)]
+pub struct MeshInfo {
+    pub payload_words: u32,
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    pub topology: u32,
+    // ArrayVec preserves boost::container::static_vector's inline, bounded storage.
+    pub vertex_lines: arrayvec::ArrayVec<u32, 136>,
+    pub primitive_lines: arrayvec::ArrayVec<u32, 136>,
+}
+
+impl MeshInfo {
+    /// Vertices per primitive, also its byte count in the stage-buffer map region.
+    pub fn primitive_vertices(&self) -> u32 {
+        match self.topology {
+            0 => 1,
+            1 => 2,
+            _ => 3,
+        }
+    }
+}
+
 /// Full shader information matching upstream `Info` struct.
 #[derive(Debug, Clone, Default)]
 pub struct Info {
+    /// Upstream guest task/mesh classification, independent of a compute host backend.
+    pub is_task: bool,
+    pub is_mesh: bool,
     pub uses_workgroup_id: bool,
     pub uses_local_invocation_id: bool,
     pub uses_invocation_id: bool,
@@ -473,6 +501,24 @@ impl HasCount for ImageDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_info_matches_upstream_topology_and_bounded_line_storage() {
+        let mut mesh = MeshInfo::default();
+        assert_eq!([mesh.payload_words, mesh.max_vertices, mesh.max_primitives, mesh.topology], [0; 4]);
+        assert!(mesh.vertex_lines.is_empty());
+        assert!(mesh.primitive_lines.is_empty());
+        for (topology, vertices) in [(0, 1), (1, 2), (4, 3), (2, 3), (u32::MAX, 3)] {
+            mesh.topology = topology;
+            assert_eq!(mesh.primitive_vertices(), vertices);
+        }
+        for lines in [&mut mesh.vertex_lines, &mut mesh.primitive_lines] {
+            for attribute in 0..136 { lines.push(attribute); }
+            assert!(lines.try_push(136).is_err());
+            assert_eq!(lines.len(), 136);
+            assert_eq!(lines[135], 135);
+        }
+    }
 
     #[test]
     fn num_descriptors_preserves_upstream_u32_wrapping() {

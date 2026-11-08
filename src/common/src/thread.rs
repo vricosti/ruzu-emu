@@ -120,6 +120,18 @@ pub fn set_current_thread_priority(new_priority: ThreadPriority) {
 /// Set the current thread's name (visible in debuggers).
 /// On Linux, truncates to 15 characters as required by pthread_setname_np.
 pub fn set_current_thread_name(name: &str) {
+    #[cfg(all(windows, target_env = "msvc"))]
+    unsafe {
+        use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress};
+        let module = "KernelBase.dll\0".encode_utf16().collect::<Vec<_>>();
+        let address = GetProcAddress(GetModuleHandleW(module.as_ptr()), c"SetThreadDescription".as_ptr());
+        if !address.is_null() {
+            let set_description: unsafe extern "system" fn(windows_sys::Win32::Foundation::HANDLE, *const u16) -> i32 =
+                std::mem::transmute(address);
+            let name = name.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+            set_description(windows_sys::Win32::System::Threading::GetCurrentThread(), name.as_ptr());
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         use std::ffi::CString;
@@ -143,7 +155,7 @@ pub fn set_current_thread_name(name: &str) {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", all(windows, target_env = "msvc"))))]
     {
         let _ = name;
     }
@@ -355,6 +367,25 @@ mod tests {
     #[test]
     fn test_set_thread_name() {
         set_current_thread_name("test_thread");
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn windows_thread_description_preserves_utf16_name() {
+        std::thread::spawn(|| unsafe {
+            let expected = "ruzu GPU thread Unicode \u{03bb}";
+            set_current_thread_name(expected);
+            let mut description = std::ptr::null_mut();
+            let result = windows_sys::Win32::System::Threading::GetThreadDescription(
+                windows_sys::Win32::System::Threading::GetCurrentThread(), &mut description);
+            assert!(result >= 0, "GetThreadDescription failed: {result:#x}");
+            assert!(!description.is_null());
+            let mut length = 0;
+            while *description.add(length) != 0 { length += 1; }
+            let actual = String::from_utf16_lossy(std::slice::from_raw_parts(description, length));
+            windows_sys::Win32::Foundation::LocalFree(description.cast());
+            assert_eq!(actual, expected);
+        }).join().unwrap();
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

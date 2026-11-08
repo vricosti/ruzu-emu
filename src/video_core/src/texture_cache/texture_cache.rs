@@ -130,7 +130,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
 
     /// Port of upstream `TextureCache<P>::UploadImageContents`.
     fn upload_image_contents(&mut self, image_id: ImageId, staging: &mut P::AsyncBuffer) {
-        let (gpu_addr, guest_size_bytes, unswizzled_size_bytes, info, flags) = {
+        let (gpu_addr, guest_size_bytes, unswizzled_size_bytes, info, flags, host_level_offset) = {
             let image = &self.slot_images[image_id];
             (
                 image.gpu_addr,
@@ -138,9 +138,33 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 image.unswizzled_size_bytes as usize,
                 image.info.clone(),
                 image.flags,
+                image.host_level_offset,
             )
         };
 
+        if flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) && host_level_offset != 0 {
+            let mut uploads = full_upload_swizzles(&info);
+            let level_offset = uploads[host_level_offset as usize].buffer_offset;
+            let tail = (info.layer_stride as usize).wrapping_sub(level_offset);
+            let gpu_memory = self.channel_gpu_memory.as_ref().cloned()
+                .expect("TextureCache::UploadImageContents requires bound channel GPU memory");
+            let mapped = P::staging_mapped_span(staging);
+            for layer in 0..info.resources.layers as usize {
+                let address = gpu_addr
+                    .wrapping_add((layer as u32).wrapping_mul(info.layer_stride) as u64)
+                    .wrapping_add(level_offset as u64);
+                gpu_memory.lock().read_block_with_cache_type(
+                    address, &mut mapped[layer * tail..(layer + 1) * tail],
+                    CacheType::NO_TEXTURE_CACHE,
+                );
+            }
+            uploads.drain(..host_level_offset as usize);
+            for upload in &mut uploads {
+                upload.buffer_offset -= level_offset;
+            }
+            P::accelerate_image_upload(self, image_id, staging, &uploads, 0, 0);
+            return;
+        }
         if flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) {
             let gpu_memory = self
                 .channel_gpu_memory
@@ -162,6 +186,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             .as_ref()
             .cloned()
             .expect("TextureCache::UploadImageContents requires bound channel GPU memory");
+        let native_tiling = gpu_memory.lock().uses_native_tiling();
         let memory_manager = GpuMemoryManagerHandle::new(gpu_memory);
         let swizzle_data = GpuGuestMemory::<u8>::new_with_backup(
             &memory_manager,
@@ -179,7 +204,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             self.unswizzle_data_buffer
                 .resize_destructive(unswizzled_size_bytes);
             let mut copies =
-                unswizzle_image(&(), gpu_addr, &info, input, &mut self.unswizzle_data_buffer);
+                unswizzle_image(native_tiling, gpu_addr, &info, input, &mut self.unswizzle_data_buffer);
             convert_image(
                 &self.unswizzle_data_buffer,
                 &info,
@@ -188,7 +213,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             );
             copies
         } else {
-            unswizzle_image(&(), gpu_addr, &info, input, P::staging_mapped_span(staging))
+            unswizzle_image(native_tiling, gpu_addr, &info, input, P::staging_mapped_span(staging))
         };
         drop(swizzle_data);
         P::upload_image(self, image_id, staging, &copies);
@@ -219,6 +244,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             .as_ref()
             .cloned()
             .expect("TextureCache::QueueAsyncDecode requires bound channel GPU memory");
+        let native_tiling = gpu_memory.lock().uses_native_tiling();
         let memory_manager = GpuMemoryManagerHandle::new(gpu_memory);
         let swizzle_data = GpuGuestMemory::<u8>::new_with_backup(
             &memory_manager,
@@ -229,7 +255,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         );
         let mut local_unswizzle_data_buffer = vec![0; unswizzled_size_bytes];
         let mut copies: SmallVec<[BufferImageCopy; 16]> = unswizzle_image(
-            &(),
+            native_tiling,
             gpu_addr,
             &info,
             // SAFETY: consumed synchronously while the accessor and its memory
@@ -834,6 +860,17 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             } else {
                 50
             };
+            // Upstream diagnostic override retains recently used images for
+            // cache-thrashing investigations; absent means the normal ages.
+            static MIN_AGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let min_age = *MIN_AGE.get_or_init(|| {
+                std::env::var("EDEN_NX2_TC_MIN_AGE").ok()
+                    .and_then(|value| std::ffi::CString::new(value).ok())
+                    .map_or(0, |value| unsafe {
+                        libc::strtoull(value.as_ptr(), std::ptr::null_mut(), 10)
+                    })
+            });
+            *ticks_to_destroy = (*ticks_to_destroy).max(min_age);
             *num_iterations = if *aggressive_mode {
                 40
             } else if *high_priority_mode {
@@ -985,6 +1022,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         if let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() {
             if let Some(gpu_memory) = gpu_memory.try_lock() {
                 super::util::swizzle_image(
+                    gpu_memory.uses_native_tiling(),
                     &|gpu_addr, output| {
                         let _ = gpu_memory.read_block_unsafe(gpu_addr, output);
                     },
@@ -1008,6 +1046,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         if let Some(gpu_memory) = self.channel_gpu_memory_handle {
             let gpu_memory = unsafe { gpu_memory.as_ref() };
             super::util::swizzle_image(
+                gpu_memory.uses_native_tiling(),
                 &|gpu_addr, output| {
                     let _ = gpu_memory.read_block_unsafe(gpu_addr, output);
                 },
@@ -1028,6 +1067,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         };
         let device_memory = Arc::clone(&self.device_memory);
         super::util::swizzle_image(
+            false, // CPU-only fallback has no channel/native tiling state.
             &move |device_addr, output| {
                 let _ = device_memory.smmu_read_block_unsafe(device_addr, output);
             },
@@ -1341,7 +1381,9 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// downloaded when it is single sampled, or when the runtime can resolve
     /// its sample count (`P::HAS_MSAA_DOWNLOADS`).
     pub(crate) fn is_downloadable(&self, image: &ImageBase) -> bool {
-        if !image.is_safe_gpu_copy() {
+        if !image.is_safe_gpu_copy()
+            || image.flags.intersects(ImageFlagBits::UNBACKED | ImageFlagBits::TRIMMED_LEVELS)
+        {
             return false;
         }
         if image.info.num_samples == 1 {
@@ -1422,13 +1464,18 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         descriptor: &crate::textures::texture::TicEntry,
         gpu_to_cpu: &mut dyn FnMut(GPUVAddr, u64) -> Option<u64>,
     ) -> ImageViewId {
+        let native = self.channel_gpu_memory_handle
+            .map(|memory| unsafe { memory.as_ref() }.uses_native_tiling())
+            .unwrap_or(false);
+        let config = super::image_info::texture_view_header(*descriptor, native);
+        let descriptor = &config;
         let info = super::image_info::ImageInfo::from_tic_entry(descriptor);
         if info.image_type == ImageType::Buffer {
             let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
             let view = ImageViewBase::new_buffer(&info, &view_info, descriptor.address());
             return self.insert_typed_image_view(view_info, view, None);
         }
-        let layer_offset = descriptor.base_layer() as u64 * info.layer_stride as u64;
+        let layer_offset = descriptor.base_layer().wrapping_mul(info.layer_stride) as u64;
         let image_gpu_addr = descriptor.address().wrapping_sub(layer_offset);
         let image_size = super::util::calculate_guest_size_in_bytes(&info);
         let cpu_addr = gpu_to_cpu(image_gpu_addr, image_size as u64).unwrap_or_else(|| {
@@ -1464,13 +1511,18 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         &mut self,
         descriptor: &crate::textures::texture::TicEntry,
     ) -> ImageViewId {
+        let native = self.channel_gpu_memory_handle
+            .map(|memory| unsafe { memory.as_ref() }.uses_native_tiling())
+            .unwrap_or(false);
+        let config = super::image_info::texture_view_header(*descriptor, native);
+        let descriptor = &config;
         let info = super::image_info::ImageInfo::from_tic_entry(descriptor);
         if info.image_type == ImageType::Buffer {
             let view_info = super::image_view_info::ImageViewInfo::from_tic_entry(descriptor, 0);
             let view = ImageViewBase::new_buffer(&info, &view_info, descriptor.address());
             return self.insert_typed_image_view(view_info, view, None);
         }
-        let layer_offset = descriptor.base_layer() as u64 * info.layer_stride as u64;
+        let layer_offset = descriptor.base_layer().wrapping_mul(info.layer_stride) as u64;
         let image_gpu_addr = descriptor.address().wrapping_sub(layer_offset);
         let image_size = super::util::calculate_guest_size_in_bytes(&info) as u64;
         let cpu_addr = self.resolve_or_allocate_cpu_addr(image_gpu_addr, image_size);
@@ -1671,7 +1723,18 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         );
         let size = super::util::calculate_guest_size_in_bytes(info) as u64;
         let cpu_addr = self.resolve_or_allocate_cpu_addr(gpu_addr, size);
-        let image_id = self.join_images(info, gpu_addr, cpu_addr);
+        let mut storage_info = info.clone();
+        // The retained channel Arc owns this pointer; cache callbacks may already
+        // hold its mutex, just as upstream InsertImage borrows gpu_memory.
+        storage_info.native_tiling = self.channel_gpu_memory_handle
+            .map(|memory| unsafe { memory.as_ref() }.uses_native_tiling())
+            .unwrap_or(false);
+        if storage_info.native_tiling && info.image_type == ImageType::E3D {
+            log::info!("3D image at {:#x}: {}x{}x{} levels {} format {:?} block {:?}",
+                gpu_addr, info.size.width, info.size.height, info.size.depth,
+                info.resources.levels, info.format, info.block());
+        }
+        let image_id = self.join_images(&storage_info, gpu_addr, cpu_addr);
         self.register_image_alloc(image_id);
         image_id
     }
@@ -2323,6 +2386,8 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         if new_view
             .flags
             .contains(ImageViewFlagBits::PREEMTIVE_DOWNLOAD)
+            && !self.slot_images[new_view.image_id].flags
+                .intersects(ImageFlagBits::UNBACKED | ImageFlagBits::TRIMMED_LEVELS)
         {
             self.uncommitted_downloads.push(PendingDownload {
                 is_swizzle: true,
@@ -2392,7 +2457,18 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         cpu_addr: u64,
         _options: RelaxedOptions,
     ) -> ImageId {
-        let image_id = self.join_images(info, gpu_addr, cpu_addr);
+        let mut storage_info = info.clone();
+        // The retained channel Arc owns this pointer; cache callbacks may already
+        // hold its mutex, just as upstream InsertImage borrows gpu_memory.
+        storage_info.native_tiling = self.channel_gpu_memory_handle
+            .map(|memory| unsafe { memory.as_ref() }.uses_native_tiling())
+            .unwrap_or(false);
+        if storage_info.native_tiling && info.image_type == ImageType::E3D {
+            log::info!("3D image at {:#x}: {}x{}x{} levels {} format {:?} block {:?}",
+                gpu_addr, info.size.width, info.size.height, info.size.depth,
+                info.resources.levels, info.format, info.block());
+        }
+        let image_id = self.join_images(&storage_info, gpu_addr, cpu_addr);
         // Upstream `InsertImage` registers the new ImageId in image_allocs_table
         // immediately after the synchronous `JoinImages` lifecycle. Delaying
         // this allocation-table update makes a second lookup in the same
@@ -4361,6 +4437,9 @@ mod tests {
     }
 
     thread_local! {
+        static ACCELERATED_UPLOAD_LEVELS: std::cell::RefCell<Vec<(i32, usize)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
         static IMAGE_VIEW_PREPARE_PUBLICATION: std::cell::RefCell<Vec<bool>> = const {
             std::cell::RefCell::new(Vec::new())
         };
@@ -4534,10 +4613,14 @@ mod tests {
             _: &mut TextureCacheBase<Self>,
             _: ImageId,
             _: &Vec<u8>,
-            _: &[SwizzleParameters],
+            swizzles: &[SwizzleParameters],
             _: u32,
             _: u32,
         ) {
+            ACCELERATED_UPLOAD_LEVELS.with(|levels| {
+                *levels.borrow_mut() = swizzles.iter()
+                    .map(|swizzle| (swizzle.level, swizzle.buffer_offset)).collect();
+            });
         }
 
         fn insert_upload_memory_barrier(_: &mut TextureCacheBase<Self>) {
@@ -5758,6 +5841,26 @@ mod tests {
     }
 
     #[test]
+    fn trimmed_or_unbacked_images_cannot_download_or_queue_preemptive_copies() {
+        let mut cache = test_cache();
+        let view_id = cache.create_image_view(&color_2d_tic(0x40000000, 0));
+        let image_id = cache.slot_image_views[view_id].image_id;
+        cache.slot_image_views[view_id].flags.insert(ImageViewFlagBits::PREEMTIVE_DOWNLOAD);
+        for blocked in [ImageFlagBits::UNBACKED, ImageFlagBits::TRIMMED_LEVELS,
+                        ImageFlagBits::UNBACKED | ImageFlagBits::TRIMMED_LEVELS] {
+            cache.slot_images[image_id].flags = ImageFlagBits::GPU_MODIFIED | blocked;
+            assert!(!cache.is_downloadable(&cache.slot_images[image_id]));
+            cache.queue_preemptive_render_target_download(view_id);
+            assert!(cache.uncommitted_downloads.is_empty());
+        }
+        cache.slot_images[image_id].flags = ImageFlagBits::GPU_MODIFIED;
+        assert!(cache.is_downloadable(&cache.slot_images[image_id]));
+        cache.queue_preemptive_render_target_download(view_id);
+        assert_eq!(cache.uncommitted_downloads.len(), 1);
+        assert_eq!(cache.uncommitted_downloads[0].object_id, image_id);
+    }
+
+    #[test]
     fn bind_same_preemptive_render_target_view_has_no_download() {
         let mut cache = test_cache();
         let mut render_targets = Maxwell3DRenderTargets::default();
@@ -6104,6 +6207,26 @@ mod tests {
     }
 
     #[test]
+    fn insert_image_captures_channel_native_tiling_before_joining() {
+        let mut cache = test_cache();
+        let memory = Arc::clone(cache.channel_gpu_memory.as_ref().unwrap());
+        let info = ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            size: Extent3D { width: 16, height: 8, depth: 1 },
+            ..ImageInfo::default()
+        };
+        let legacy = cache.insert_image(&info, 0x4000);
+        assert!(!cache.slot_images[legacy].info.native_tiling);
+        memory.lock().enable_native_tiling();
+        let native = cache.insert_image(&info, 0x8000);
+        assert!(cache.slot_images[native].info.native_tiling);
+        assert!(!info.native_tiling);
+        let explicit = cache.insert_image_from_info_with_options(
+            &info, 0xc000, 0x10000, RelaxedOptions::empty());
+        assert!(cache.slot_images[explicit].info.native_tiling);
+    }
+
+    #[test]
     fn insert_image_uses_virtual_invalid_cpu_space_when_untranslated() {
         let mut cache = test_cache();
         let info = ImageInfo {
@@ -6396,6 +6519,30 @@ mod tests {
             .flags
             .contains(ImageFlagBits::REGISTERED));
         assert!(!cache.sparse_views.contains_key(&image_id));
+    }
+
+    #[test]
+    fn garbage_collector_honors_minimum_age_override() {
+        const CHILD: &str = "RUZU_TC_MIN_AGE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1").env("EDEN_NX2_TC_MIN_AGE", "150")
+                .status().unwrap().success());
+            return;
+        }
+        let mut cache = test_cache();
+        let image_id = cache.insert_image(&test_color_info(16, 16), 0x4000);
+        cache.frame_tick = 100;
+        cache.touch_image(image_id);
+        cache.expected_memory = 0;
+        cache.critical_memory = 0;
+        cache.frame_tick = 200;
+        cache.run_garbage_collector();
+        assert!(cache.slot_images.contains(image_id));
+        cache.frame_tick = 300;
+        cache.run_garbage_collector();
+        assert!(!cache.slot_images.contains(image_id));
     }
 
     #[test]
@@ -7478,6 +7625,47 @@ mod tests {
     }
 
     #[test]
+    fn trimmed_upload_reads_each_layer_tail_and_rebases_only_buffer_offsets() {
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        let backing: Vec<u8> = (0..0x12000usize)
+            .map(|i| ((i / 0x6000) * 53 + i / 0x100 + i) as u8).collect();
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x9000_0000, backing.as_ptr(), 0x4000_0000, backing.len(), 3, true,
+        );
+        device_memory.set_flush_region(Box::new(|_, _| panic!("NoTextureCache must not flush")));
+        let mut memory = MemoryManager::new_with_geometry_and_device_memory(
+            17, Arc::clone(&device_memory), 32, 0x1_0000_0000, 16, 12,
+        );
+        memory.map(0x20000, 0x9000_0000, backing.len() as u64, 0, false);
+        let mut cache = TextureCacheBase::<TestImageViewParams>::new_for_backend(device_memory);
+        cache.set_channel_gpu_memory(Arc::new(ParkingMutex::new(memory)));
+        let id = cache.insert_typed_image(ImageBase::new(ImageInfo {
+            format: surface::PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent { levels: 3, layers: 3 },
+            size: Extent3D { width: 64, height: 64, depth: 1 },
+            layer_stride: 0x6000,
+            ..ImageInfo::default()
+        }, 0x20000, 0x9000_0000));
+        cache.slot_images[id].flags.insert(ImageFlagBits::ACCELERATED_UPLOAD);
+        for (skip, offset, expected_levels) in [
+            (1, 0x4000, vec![(1, 0), (2, 0x1000)]),
+            (2, 0x5000, vec![(2, 0)]),
+        ] {
+            cache.slot_images[id].host_level_offset = skip;
+            let mut staging = vec![0xcd; map_size_bytes(&cache.slot_images[id]) as usize];
+            cache.upload_image_contents(id, &mut staging);
+            let expected: Vec<u8> = (0..3).flat_map(|layer|
+                backing[layer * 0x6000 + offset..(layer + 1) * 0x6000].iter().copied()
+            ).collect();
+            assert_eq!(staging, expected);
+            ACCELERATED_UPLOAD_LEVELS.with(|levels| assert_eq!(*levels.borrow(), expected_levels));
+        }
+    }
+
+    #[test]
     fn upload_image_contents_borrows_contiguous_memory_and_copies_fragmented_ranges() {
         use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
         use crate::textures::decoders::swizzle_texture;
@@ -7542,7 +7730,7 @@ mod tests {
                     .map(|index| (index.wrapping_mul(seed) ^ (index >> 8)) as u8)
                     .collect();
                 let mut tiled = vec![0u8; 0x2000];
-                swizzle_texture(&mut tiled, &linear, 4, 64, 32, 1, 0, 0, 0);
+                swizzle_texture(&mut tiled, &linear, 4, 64, 32, 1, 0, 0, 0, false);
                 backing[..0x1000].copy_from_slice(&tiled[..0x1000]);
                 let second_page = second_page as usize;
                 backing[second_page..second_page + 0x1000].copy_from_slice(&tiled[0x1000..]);
@@ -8449,6 +8637,26 @@ mod tests {
     }
 
     #[test]
+    fn native_texture_view_header_uses_descriptor_address_in_both_creation_paths() {
+        for translated in [false, true] {
+            let mut cache = test_cache();
+            let mut memory = MemoryManager::new(17);
+            memory.enable_native_tiling();
+            cache.set_channel_gpu_memory(Arc::new(ParkingMutex::new(memory)));
+            let descriptor = color_2d_tic(0x810690a000, 7);
+            let view_id = if translated {
+                cache.create_image_view_with_gpu_to_cpu(&descriptor, &mut |_, _| None)
+            } else {
+                cache.create_image_view(&descriptor)
+            };
+            let view = &cache.slot_image_views[view_id];
+            assert_eq!(view.range.base.layer, 0);
+            assert_eq!(cache.slot_images[view.image_id].gpu_addr, descriptor.address());
+            assert_eq!(descriptor.base_layer(), 7);
+        }
+    }
+
+    #[test]
     fn create_image_view_with_gpu_to_cpu_uses_virtual_invalid_fallback_like_upstream_insert() {
         let mut cache = test_cache();
         let mut descriptor = color_2d_tic(0, 2);
@@ -8517,6 +8725,7 @@ mod tests {
                 maybe_unaligned_layer_stride: 0x1000,
                 num_samples: 1,
                 tile_width_spacing: 0,
+                native_tiling: false,
                 rescaleable: false,
                 downscaleable: false,
                 forced_flushed: false,

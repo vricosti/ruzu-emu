@@ -151,6 +151,8 @@ pub struct Program {
     pub invocations: u32,
     /// Whether this is a passthrough geometry shader.
     pub is_geometry_passthrough: bool,
+    /// Upstream `IR::Program::mesh` (Eglantine 900ab5a8 program.h).
+    pub mesh: shader_info::MeshInfo,
 }
 
 impl Program {
@@ -169,6 +171,7 @@ impl Program {
             output_vertices: 0,
             invocations: 1,
             is_geometry_passthrough: false,
+            mesh: shader_info::MeshInfo::default(),
         }
     }
 
@@ -196,31 +199,25 @@ impl Program {
     /// indexed references instead, so the owning `Program` performs that
     /// cross-block unlink before leaving a tombstone in the block.
     pub fn erase_inst(&mut self, inst_ref: super::value::InstRef) {
-        let (opcode, referenced_insts) = {
+        let (opcode, arg_count, phi_count) = {
             let inst = self.block(inst_ref.block).inst(inst_ref.inst);
-            let mut referenced_insts = Vec::new();
-            referenced_insts.extend(inst.args.iter().filter_map(|arg| match arg {
-                super::value::Value::Inst(parent) => Some(*parent),
-                _ => None,
-            }));
-            referenced_insts.extend(inst.phi_args.iter().filter_map(|(_, arg)| match arg {
-                super::value::Value::Inst(parent) => Some(*parent),
-                _ => None,
-            }));
-            (inst.opcode, referenced_insts)
+            (inst.opcode, inst.args.len(), inst.phi_args.len())
         };
-
-        if opcode.is_pseudo_instruction() {
-            for &parent in &referenced_insts {
-                self.block_mut(parent.block)
-                    .inst_mut(parent.inst)
-                    .remove_associated_pseudo(opcode, inst_ref);
+        // Copy one indexed operand at a time, like ClearArgs -> UndoUse.
+        // Building a temporary Vec here allocates for every erased instruction.
+        for index in 0..arg_count + phi_count {
+            let value = {
+                let inst = self.block(inst_ref.block).inst(inst_ref.inst);
+                if index < arg_count { inst.args[index] }
+                else { inst.phi_args[index - arg_count].1 }
+            };
+            let super::value::Value::Inst(parent) = value else { continue; };
+            let parent_inst = self.block_mut(parent.block).inst_mut(parent.inst);
+            assert!(parent_inst.use_count > 0, "instruction use count underflow");
+            parent_inst.use_count -= 1;
+            if opcode.is_pseudo_instruction() {
+                parent_inst.remove_associated_pseudo(opcode, inst_ref);
             }
-        }
-        for parent in referenced_insts {
-            let use_count = &mut self.block_mut(parent.block).inst_mut(parent.inst).use_count;
-            assert!(*use_count > 0, "instruction use count underflow");
-            *use_count -= 1;
         }
         self.block_mut(inst_ref.block).erase_inst(inst_ref.inst);
     }
@@ -291,6 +288,30 @@ impl Program {
 mod tests {
     use super::Program;
     use crate::ir::{Inst, InstRef, Opcode, ShaderStage, Value};
+
+    #[test]
+    fn erase_phi_undoes_repeated_cross_block_uses_and_keeps_live_consumers() {
+        let mut program = Program::new(ShaderStage::Fragment);
+        let source = program.add_block();
+        let destination = program.add_block();
+        let producer = InstRef { block: source, inst: program.block_mut(source)
+            .append_inst(Inst::new(Opcode::IAdd32, vec![])) };
+        let live = program.block_mut(source).append_inst(Inst::new(
+            Opcode::Identity, vec![Value::Inst(producer)]));
+        let mut phi = Inst::new(Opcode::Phi, vec![]);
+        for predecessor in 0..256 {
+            phi.add_phi_operand(predecessor, Value::Inst(producer));
+        }
+        phi.add_phi_operand(256, Value::ImmU32(42));
+        let dead = InstRef { block: destination,
+            inst: program.block_mut(destination).append_inst(phi) };
+        program.recompute_use_counts();
+        assert_eq!(program.block(source).inst(producer.inst).use_count, 257);
+        program.erase_inst(dead);
+        assert_eq!(program.block(source).inst(producer.inst).use_count, 1);
+        assert_eq!(program.block(source).inst(live).args[0], Value::Inst(producer));
+        assert!(program.block(destination).instructions[dead.inst as usize].is_none());
+    }
 
     #[test]
     fn erase_inst_undoes_each_argument_use() {

@@ -395,6 +395,14 @@ pub fn collect_shader_info_pass(program: &mut Program) {
     let mut uses_local_memory = false;
 
     program.info.nvn_buffer_base = nvn_buffer_base(program.stage);
+    // Guest task/mesh stages can execute with the host Compute execution model.
+    // Preserve their original graphics binding slots and implicit builtin use.
+    if program.info.is_task || program.info.is_mesh {
+        assert_ne!(program.info.is_task, program.info.is_mesh);
+        program.info.nvn_buffer_base = if program.info.is_task { 0x110 } else { 0x310 };
+        program.info.uses_workgroup_id = true;
+        program.info.uses_local_invocation_id = true;
+    }
 
     // Rebuild cbuf usage from the optimized IR. Frontend translation can
     // conservatively register cbufs before DCE removes the actual load; keeping
@@ -1141,6 +1149,29 @@ mod tests {
 
         assert_eq!(program.info.nvn_buffer_base, 0x510);
         assert_eq!(program.info.nvn_buffer_used, (1 << 0) | (1 << 5));
+    }
+
+    #[test]
+    fn task_mesh_compute_fallback_keeps_guest_nvn_slots_and_implicit_builtins() {
+        for (task, mesh, base) in [
+            (true, false, 0x110),
+            (false, true, 0x310),
+            (false, false, 0x310),
+        ] {
+            let mut program = Program::new(ShaderStage::Compute);
+            program.info.is_task = task;
+            program.info.is_mesh = mesh;
+            program.blocks.push(Block::new());
+            program.block_mut(0).append_inst(Inst::new(
+                Opcode::GetCbufU32,
+                vec![Value::ImmU32(0), Value::ImmU32(base + 0x20)],
+            ));
+            collect_shader_info_pass(&mut program);
+            assert_eq!(program.info.nvn_buffer_base, base);
+            assert_eq!(program.info.nvn_buffer_used, 1 << 2);
+            assert_eq!(program.info.uses_workgroup_id, task || mesh);
+            assert_eq!(program.info.uses_local_invocation_id, task || mesh);
+        }
     }
 
     #[test]

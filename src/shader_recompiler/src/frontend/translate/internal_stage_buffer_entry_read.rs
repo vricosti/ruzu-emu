@@ -90,6 +90,39 @@ fn immediate_index(index: Value, mode: Mode) -> u32 {
 }
 
 impl<'a> TranslatorVisitor<'a> {
+    /// Pinned Eglantine ISBE_nx2 pseudo instruction. Native lowering remains
+    /// gated until task/mesh dispatch integration can supply its stage state.
+    pub fn translate_isbe_nx2(&mut self, insn: u64) {
+        let info = &self.ir.program.info;
+        if !(info.is_task ^ info.is_mesh) {
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "Stage buffer access outside task and mesh programs",
+            ));
+        }
+        let reg = self.dst_reg(insn);
+        let address_reg = self.src_a_reg(insn);
+        let base = self.x(address_reg);
+        let address = self.ir.iadd_32(base, Value::ImmU32(field(insn, 20, 24)));
+        if !bit(insn, 48) {
+            let value = self.ir.isbe_read(address);
+            self.set_x(reg, value);
+            return;
+        }
+        let value = self.x(reg);
+        if bit(insn, 45) {
+            if !bit(insn, 44) {
+                std::panic::panic_any(crate::exception::NotImplementedException::new(
+                    "U8 stage buffer attribute write",
+                ));
+            }
+            self.ir.isbe_write_attribute(address, value);
+        } else if bit(insn, 44) {
+            self.ir.isbe_write_map_u32(address, value);
+        } else {
+            self.ir.isbe_write_map_u8(address, value);
+        }
+    }
+
     /// Port of upstream `TranslatorVisitor::ISBERD(u64)`.
     pub fn translate_isberd(&mut self, insn: u64) {
         log::debug!("ISBERD called with insn={insn:#x}");
@@ -166,6 +199,109 @@ mod tests {
     use crate::ir::opcodes::Opcode;
     use crate::ir::program::Program;
     use crate::ir::types::ShaderStage;
+
+    #[test]
+    fn nx2_decode_dispatch_preserves_address_and_selects_each_region_operation() {
+        for task in [false, true] {
+            for (mode, expected) in [
+                (0, Opcode::IsbeRead),
+                (
+                    (1 << 48) | (1 << 45) | (1 << 44),
+                    Opcode::IsbeWriteAttribute,
+                ),
+                (1 << 48, Opcode::IsbeWriteMapU8),
+                ((1 << 48) | (1 << 44), Opcode::IsbeWriteMapU32),
+            ] {
+                let insn =
+                    0xefc0_0000_0000_0000u64 | mode | (0xabcdef << 20) | (7 << 16) | (19 << 8) | 13;
+                let mut program = Program::new(ShaderStage::Compute);
+                program.info.is_task = task;
+                program.info.is_mesh = !task;
+                let block = program.add_block();
+                TranslatorVisitor::new(&mut program, block).translate_instruction(insn);
+                let instructions: Vec<_> = program.blocks[block as usize].iter().collect();
+                let add = instructions
+                    .iter()
+                    .find(|i| i.opcode == Opcode::IAdd32)
+                    .unwrap();
+                assert_eq!(add.arg(1), &Value::ImmU32(0xabcdef));
+                let registers: Vec<_> = instructions
+                    .iter()
+                    .filter(|i| i.opcode == Opcode::GetRegister)
+                    .map(|i| *i.arg(0))
+                    .collect();
+                assert_eq!(
+                    registers,
+                    if expected == Opcode::IsbeRead {
+                        vec![Value::Reg(Reg(19))]
+                    } else {
+                        vec![Value::Reg(Reg(19)), Value::Reg(Reg(13))]
+                    }
+                );
+                let address = instructions
+                    .iter()
+                    .find(|i| i.opcode == expected)
+                    .unwrap()
+                    .arg(0);
+                let Value::Inst(reference) = address else {
+                    panic!("address addition");
+                };
+                assert_eq!(
+                    program.blocks[reference.block as usize]
+                        .inst(reference.inst)
+                        .opcode,
+                    Opcode::IAdd32
+                );
+                assert!(!instructions.iter().any(|i| i.opcode == Opcode::LaneId));
+                assert_eq!(
+                    instructions.last().unwrap().opcode,
+                    if expected == Opcode::IsbeRead {
+                        Opcode::SetRegister
+                    } else {
+                        expected
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nx2_count_address_reduces_to_the_required_immediate_byte_three() {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.info.is_mesh = true;
+        let block = program.add_block();
+        let insn = 0xefc0_0000_0000_0000u64
+            | (1 << 48)
+            | (1 << 44)
+            | (3 << 20)
+            | (7 << 16)
+            | (255 << 8)
+            | 255;
+        TranslatorVisitor::new(&mut program, block).translate_instruction(insn);
+        crate::ir_opt::constant_propagation_pass::constant_propagation_pass(&mut program);
+        crate::ir_opt::dead_code_elimination_pass::dead_code_elimination_pass(&mut program);
+        let count = program.blocks[block as usize]
+            .iter()
+            .find(|i| i.opcode == Opcode::IsbeWriteMapU32)
+            .unwrap();
+        assert_eq!(count.arg(0), &Value::ImmU32(3));
+        assert_eq!(count.arg(1), &Value::ImmU32(0));
+    }
+
+    #[test]
+    fn nx2_rejects_ordinary_stages_and_byte_attribute_writes() {
+        for mesh in [false, true] {
+            let mut program = Program::new(ShaderStage::Compute);
+            program.info.is_mesh = mesh;
+            let block = program.add_block();
+            let insn = 0xefc0_0000_0000_0000u64 | (1 << 48) | (1 << 45) | (7 << 16);
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                TranslatorVisitor::new(&mut program, block).translate_instruction(insn)
+            }))
+            .unwrap_err();
+            assert!(error.is::<crate::exception::NotImplementedException>());
+        }
+    }
 
     fn translate(insn: u64) -> Vec<Opcode> {
         let mut program = Program::new(ShaderStage::Geometry);

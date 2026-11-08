@@ -167,6 +167,18 @@ fn alpha_test(ctx: &mut SpirvEmitContext) {
 /// sets fixed pipeline point size.
 pub fn emit_prologue(ctx: &mut SpirvEmitContext) {
     log::trace!("SPIR-V: emit_prologue");
+    if ctx.is_task || ctx.is_mesh {
+        assert_ne!(
+            ctx.mesh_dispatch_buffer, 0,
+            "compute dispatch mapping prerequisite"
+        );
+        if ctx.is_task {
+            super::emit_spirv_mesh::emit_task_payload_prologue(ctx);
+        } else {
+            super::emit_spirv_mesh::emit_mesh_prologue(ctx);
+        }
+        return;
+    }
     if ctx.stage == ShaderStage::Fragment && ctx.runtime_info.dual_source_blend {
         let default_color = ctx.builder.constant_composite(
             ctx.f32_vec4_type,
@@ -247,6 +259,20 @@ pub fn emit_prologue(ctx: &mut SpirvEmitContext) {
 /// For fragment shaders, run alpha test.
 pub fn emit_epilogue(ctx: &mut SpirvEmitContext) {
     log::trace!("SPIR-V: emit_epilogue");
+    if ctx.is_task || ctx.is_mesh {
+        assert_ne!(
+            ctx.mesh_guest_workgroup_id, 0,
+            "collective compute entrypoint prerequisite"
+        );
+        if ctx.is_task {
+            let base = ctx.mesh_payload_base;
+            super::emit_spirv_mesh::emit_task_payload_export(ctx, base);
+        } else {
+            let record = ctx.mesh_output_record;
+            super::emit_spirv_mesh::emit_mesh_output_export(ctx, record);
+        }
+        return;
+    }
     if ctx.stage == ShaderStage::VertexB
         && ctx.runtime_info.convert_depth_mode
         && !ctx.profile.support_native_ndc

@@ -39,6 +39,204 @@ use crate::texture_cache::texture_cache_base::{ComputeDescriptorSyncRegs, ImageV
 use crate::textures::texture::texture_pair;
 use crate::vulkan_common::vulkan_device::DeviceReference;
 
+/// Vulkan owner for one compute-backed guest task/mesh stage. Resource slots
+/// stay graphics slots (0 or 2); only host execution and descriptors are compute.
+/// As with ComputePipeline, the scheduler/cache must keep this owner alive until
+/// every recorded command using its handles has completed.
+pub(crate) struct MeshComputeStage {
+    device: DeviceReference,
+    pub resource_stage: usize,
+    pub info: ShaderInfo,
+    pub pipeline: vk::Pipeline,
+    pub pipeline_layout: vk::PipelineLayout,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_template: vk::DescriptorUpdateTemplate,
+    module: vk::ShaderModule,
+    allocator: Mutex<Option<DescriptorAllocator>>,
+    bank: super::descriptor_pool::DescriptorBankInfo,
+    guest_entries: usize,
+    graphics_resources: Box<super::graphics_pipeline::MeshGraphicsResources>,
+}
+
+fn add_mesh_stage_descriptors(
+    builder: &mut DescriptorLayoutBuilder,
+    info: &ShaderInfo,
+    shader: &shader_recompiler::backend::spirv::emit_spirv::MeshComputeSpirv,
+    resource_stage: usize,
+) -> Result<super::descriptor_pool::DescriptorBankInfo, vk::Result> {
+    let binding_count = info.constant_buffer_descriptors.len()
+        + info.storage_buffers_descriptors.len() + info.texture_buffer_descriptors.len()
+        + info.image_buffer_descriptors.len() + info.texture_descriptors.len()
+        + info.image_descriptors.len();
+    if !(info.is_task ^ info.is_mesh) || !matches!(resource_stage, 0 | 2)
+        || (info.is_task && resource_stage != 0)
+        || shader.dispatch_binding != binding_count as u32
+        || shader.payload_binding != shader.dispatch_binding + 1
+        || shader.output_binding != info.is_mesh.then_some(shader.dispatch_binding + 2) {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+    builder.add(info, vk::ShaderStageFlags::COMPUTE);
+    let transport_count = if info.is_mesh { 3 } else { 2 };
+    for _ in 0..transport_count {
+        builder.add_descriptors(vk::DescriptorType::STORAGE_BUFFER,
+            vk::ShaderStageFlags::COMPUTE, &[super::pipeline_helper::DescriptorInfo { count: 1 }]);
+    }
+    let mut bank = super::descriptor_pool::make_bank_info(std::slice::from_ref(info));
+    bank.storage_buffers += transport_count;
+    bank.score += transport_count as i32;
+    Ok(bank)
+}
+
+impl MeshComputeStage {
+    pub fn new(
+        device: &crate::vulkan_common::vulkan_device::Device,
+        info: ShaderInfo,
+        shader: &shader_recompiler::backend::spirv::emit_spirv::MeshComputeSpirv,
+        resource_stage: usize,
+        pipeline_cache: vk::PipelineCache,
+    ) -> Result<Self, vk::Result> {
+        let mut builder = DescriptorLayoutBuilder::new(device);
+        let bank = add_mesh_stage_descriptors(&mut builder, &info, shader, resource_stage)?;
+        let guest_entries = num_descriptor_entries(&info) as usize;
+        let graphics_resources = super::graphics_pipeline::MeshGraphicsResources::new(&info, resource_stage);
+        let mut stage = Self {
+            device: DeviceReference::new(device), resource_stage, info, bank, guest_entries,
+            graphics_resources,
+            pipeline: vk::Pipeline::null(), pipeline_layout: vk::PipelineLayout::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            descriptor_template: vk::DescriptorUpdateTemplate::null(), module: vk::ShaderModule::null(),
+            allocator: Mutex::new(None),
+        };
+        // Use ordinary descriptor sets so the transport works on the same
+        // baseline Vulkan devices as the compute emulation itself.
+        stage.descriptor_set_layout = builder.create_descriptor_set_layout(false, false)?;
+        stage.pipeline_layout = builder.create_pipeline_layout(stage.descriptor_set_layout)?;
+        stage.descriptor_template = builder.create_template(stage.descriptor_set_layout, stage.pipeline_layout, false)?;
+        let logical = device.get_logical();
+        unsafe {
+            stage.module = logical.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&shader.code), None)?;
+            let name = std::ffi::CString::new("main").unwrap();
+            let mut subgroup_size = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT::default()
+                .required_subgroup_size(crate::vulkan_common::vulkan_device::GUEST_WARP_SIZE);
+            let mut shader_stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE).module(stage.module).name(&name);
+            if device.is_ext_subgroup_size_control_supported() {
+                shader_stage = shader_stage.push_next(&mut subgroup_size);
+            }
+            stage.pipeline = logical.create_compute_pipelines(pipeline_cache,
+                &[vk::ComputePipelineCreateInfo::default().stage(shader_stage).layout(stage.pipeline_layout)], None)
+                .map_err(|(partial, error)| {
+                    for pipeline in partial { logical.destroy_pipeline(pipeline, None); }
+                    error
+                })?[0];
+        }
+        Ok(stage)
+    }
+
+    /// Configure guest resources through GraphicsPipeline::ConfigureImpl's
+    /// resource phase, retaining its physical graphics slot even though this
+    /// stage executes at the host compute bind point. The boxed metadata stays
+    /// address-stable while the buffer cache borrows its uniform sizes/masks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_descriptor_set(
+        &self,
+        draw: &crate::engines::draw_manager::Maxwell3DDrawView<'_>,
+        read_gpu: &dyn Fn(u64, &mut [u8]),
+        scheduler: &mut Scheduler,
+        buffer_cache: &mut VulkanCommonBufferCache,
+        texture_cache: &mut TextureCache,
+        queue: &mut UpdateDescriptorQueue,
+        fallback_sampler: vk::Sampler,
+        is_indexed: bool,
+        pool: &DescriptorPool,
+        mapping: vk::DescriptorBufferInfo,
+        payload: vk::DescriptorBufferInfo,
+        output: Option<vk::DescriptorBufferInfo>,
+    ) -> Result<(vk::DescriptorSet, super::graphics_pipeline::PreparedMeshDescriptors), vk::Result> {
+        let prepared = self.graphics_resources.prepare(
+            draw, read_gpu, scheduler, buffer_cache, texture_cache, queue,
+            fallback_sampler, is_indexed,
+        );
+        let set = self.update_descriptor_set(pool, scheduler, &prepared.entries, mapping, payload, output)?;
+        Ok((set, prepared))
+    }
+
+    /// ComputePipeline::Configure's command-recording phase, with the already
+    /// updated task/mesh descriptor set. The cache retains this stage through
+    /// completion of all commands using its pipeline and layout.
+    pub fn record_bind(
+        &self, scheduler: &mut Scheduler, set: vk::DescriptorSet,
+        prepared: &super::graphics_pipeline::PreparedMeshDescriptors,
+    ) {
+        let device = self.device;
+        let pipeline = self.pipeline;
+        let layout = self.pipeline_layout;
+        let rescaling_data = prepared.rescaling_data;
+        let render_area_data = prepared.render_area_data;
+        let uses_render_area = self.info.uses_render_area;
+        scheduler.request_outside_render_pass_operation_context();
+        scheduler.record(move |cmdbuf| unsafe {
+            let logical = device.get().get_logical();
+            logical.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
+            logical.cmd_push_constants(cmdbuf, layout, vk::ShaderStageFlags::COMPUTE,
+                RESCALING_LAYOUT_WORDS_OFFSET, bytemuck::bytes_of(&rescaling_data));
+            if uses_render_area {
+                logical.cmd_push_constants(cmdbuf, layout, vk::ShaderStageFlags::COMPUTE,
+                    shader_recompiler::backend::spirv::emit_spirv::RENDERAREA_LAYOUT_OFFSET,
+                    bytemuck::bytes_of(&render_area_data));
+            }
+            logical.cmd_bind_descriptor_sets(cmdbuf, vk::PipelineBindPoint::COMPUTE,
+                layout, 0, &[set], &[]);
+        });
+    }
+
+    /// Guest entries are supplied in the existing graphics resource order for
+    /// resource_stage. Transport entries follow them, matching the SPIR-V ABI.
+    pub fn update_descriptor_set(
+        &self, pool: &DescriptorPool, scheduler: &Scheduler,
+        guest: &[super::update_descriptor::DescriptorUpdateEntry],
+        mapping: vk::DescriptorBufferInfo, payload: vk::DescriptorBufferInfo,
+        output: Option<vk::DescriptorBufferInfo>,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        if guest.len() != self.guest_entries || output.is_some() != self.info.is_mesh {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        let mut entries = guest.to_vec();
+        for buffer in [Some(mapping), Some(payload), output].into_iter().flatten() {
+            if buffer.buffer == vk::Buffer::null() || buffer.range == 0 {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            let mut entry = super::update_descriptor::DescriptorUpdateEntry::default();
+            entry.buffer = buffer;
+            entries.push(entry);
+        }
+        let mut allocator = self.allocator.lock().unwrap();
+        if allocator.is_none() {
+            *allocator = Some(pool.allocator(self.device.get(), scheduler, self.descriptor_set_layout, &self.bank)?);
+        }
+        let set = allocator.as_ref().unwrap().commit()?;
+        unsafe {
+            self.device.get().get_logical().update_descriptor_set_with_template(
+                set, self.descriptor_template, entries.as_ptr().cast());
+        }
+        Ok(set)
+    }
+}
+
+impl Drop for MeshComputeStage {
+    fn drop(&mut self) {
+        self.allocator.get_mut().unwrap().take();
+        let logical = self.device.get().get_logical();
+        unsafe {
+            logical.destroy_pipeline(self.pipeline, None);
+            logical.destroy_shader_module(self.module, None);
+            logical.destroy_descriptor_update_template(self.descriptor_template, None);
+            logical.destroy_pipeline_layout(self.pipeline_layout, None);
+            logical.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ComputePipelineRuntime {
     scheduler: NonNull<Scheduler>,
@@ -982,6 +1180,34 @@ fn compute_descriptor_set_layout_bindings(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mesh_transport_layout_follows_guest_bindings_and_counts_array_elements() {
+        use shader_recompiler::backend::spirv::emit_spirv::MeshComputeSpirv;
+        for mesh in [false, true] {
+            let mut info = ShaderInfo::default();
+            info.is_task = !mesh;
+            info.is_mesh = mesh;
+            info.constant_buffer_descriptors.push(ConstantBufferDescriptor { index: 0, count: 4 });
+            info.storage_buffers_descriptors.push(StorageBufferDescriptor {
+                cbuf_index: 1, cbuf_offset: 16, count: 2, is_written: false,
+            });
+            let shader = MeshComputeSpirv { code: Vec::new(), dispatch_binding: 2,
+                payload_binding: 3, output_binding: mesh.then_some(4) };
+            let mut builder = DescriptorLayoutBuilder::new_for_test();
+            let bank = add_mesh_stage_descriptors(&mut builder, &info, &shader, if mesh { 2 } else { 0 }).unwrap();
+            assert_eq!(bank.uniform_buffers, 4);
+            assert_eq!(bank.storage_buffers, if mesh { 5 } else { 4 });
+            assert_eq!(bank.score, if mesh { 9 } else { 8 });
+            let wrong = MeshComputeSpirv { dispatch_binding: 6, payload_binding: 7,
+                output_binding: mesh.then_some(8), code: Vec::new() };
+            assert!(add_mesh_stage_descriptors(&mut DescriptorLayoutBuilder::new_for_test(), &info, &wrong, 0).is_err());
+            assert!(add_mesh_stage_descriptors(&mut DescriptorLayoutBuilder::new_for_test(), &info, &shader, 4).is_err());
+            if !mesh {
+                assert!(add_mesh_stage_descriptors(&mut DescriptorLayoutBuilder::new_for_test(), &info, &shader, 2).is_err());
+            }
+        }
+    }
+
     use super::*;
     use shader_recompiler::shader_info::{
         ConstantBufferDescriptor, ImageBufferDescriptor, ImageDescriptor, StorageBufferDescriptor,

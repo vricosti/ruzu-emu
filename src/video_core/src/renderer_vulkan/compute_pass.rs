@@ -71,6 +71,7 @@ pub struct AstcPushConstants {
     pub x_shift: u32,
     pub block_height: u32,
     pub block_height_mask: u32,
+    pub native_tiling: u32,
 }
 
 /// Port of `QueriesPrefixScanPushConstants` from anonymous namespace.
@@ -1033,6 +1034,26 @@ pub struct AstcDecoderPass {
     memory_allocator: NonNull<MemoryAllocator>,
 }
 
+/// Port of `ASTCDecoderPass::Target`; the callback addresses host mip levels.
+pub struct AstcDecoderTarget<'a> {
+    pub image: vk::Image,
+    pub aspect_mask: vk::ImageAspectFlags,
+    pub initialized: bool,
+    pub level_view: &'a dyn Fn(i32) -> vk::ImageView,
+    pub wait: bool,
+}
+
+// Mechanical extraction of AssembleInto's input stride/size calculation so
+// the guest-to-host mip contract can be checked without a Vulkan device.
+fn astc_input_layout(info: &ImageInfo, skip: u32, guest_size_bytes: usize) -> (u32, usize) {
+    if skip == 0 {
+        return (info.layer_stride, guest_size_bytes);
+    }
+    let uploads = crate::texture_cache::util::full_upload_swizzles(info);
+    let stride = info.layer_stride.wrapping_sub(uploads[skip as usize].buffer_offset as u32);
+    (stride, (stride as usize).wrapping_mul(info.resources.layers as usize))
+}
+
 impl AstcDecoderPass {
     /// Port of `ASTCDecoderPass::ASTCDecoderPass`.
     pub fn new(
@@ -1117,12 +1138,36 @@ impl AstcDecoderPass {
         aspect_mask: vk::ImageAspectFlags,
         is_initialized: bool,
         info: &ImageInfo,
+        skip: u32,
         guest_size_bytes: usize,
         staging_buffer: vk::Buffer,
         staging_offset: vk::DeviceSize,
         swizzles: &[SwizzleParameters],
         storage_views: &[vk::ImageView],
     ) -> bool {
+        let level_view = |level: i32| storage_views[level as usize];
+        let target = AstcDecoderTarget {
+            image, aspect_mask, initialized: is_initialized,
+            level_view: &level_view, wait: true,
+        };
+        self.assemble_into(info, skip, guest_size_bytes, &target, staging_buffer,
+                           staging_offset, swizzles)
+    }
+
+    /// Port of `ASTCDecoderPass::AssembleInto`.
+    pub fn assemble_into(
+        &mut self,
+        info: &ImageInfo,
+        skip: u32,
+        guest_size_bytes: usize,
+        target: &AstcDecoderTarget<'_>,
+        staging_buffer: vk::Buffer,
+        staging_offset: vk::DeviceSize,
+        swizzles: &[SwizzleParameters],
+    ) -> bool {
+        let image = target.image;
+        let aspect_mask = target.aspect_mask;
+        let is_initialized = target.initialized;
         let scheduler = unsafe { self.scheduler.as_mut() };
         let device_handle = self.base.device.get().get_logical().clone();
         let block_dims = [
@@ -1175,16 +1220,18 @@ impl AstcDecoderPass {
             device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
         });
 
+        let (input_layer_stride, input_size) = astc_input_layout(info, skip, guest_size_bytes);
         for swizzle in swizzles {
-            let storage_view = storage_views[swizzle.level as usize];
+            let storage_view = (target.level_view)(swizzle.level - skip as i32);
             assert_ne!(storage_view, vk::ImageView::null());
             let input_offset = staging_offset + swizzle.buffer_offset as vk::DeviceSize;
-            let range_size = (guest_size_bytes - swizzle.buffer_offset) as vk::DeviceSize;
+            let range_size = (input_size - swizzle.buffer_offset) as vk::DeviceSize;
             let num_dispatches_x = swizzle.num_tiles.width.div_ceil(8);
             let num_dispatches_y = swizzle.num_tiles.height.div_ceil(8);
             let num_dispatches_z = info.resources.layers as u32;
 
-            let params = make_block_linear_swizzle_2d_params(swizzle, info);
+            let mut params = make_block_linear_swizzle_2d_params(swizzle, info);
+            params.layer_stride = input_layer_stride;
             assert_eq!(params.origin, [0, 0, 0]);
             assert_eq!(params.destination, [0, 0, 0]);
             assert_eq!(params.bytes_per_block_log2, 4);
@@ -1202,6 +1249,7 @@ impl AstcDecoderPass {
                 x_shift: params.x_shift,
                 block_height: params.block_height,
                 block_height_mask: params.block_height_mask,
+                native_tiling: params.native_tiling,
             };
             let descriptor_allocator = self
                 .base
@@ -1266,7 +1314,18 @@ impl AstcDecoderPass {
                 &[image_barrier],
             );
         });
-        scheduler.finish();
+        if target.wait {
+            static FLUSH_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let flush_only = *FLUSH_ONLY.get_or_init(|| {
+                std::env::var_os("RUZU_NX2_ASTC_FLUSH")
+                    .is_some_and(|value| value.to_string_lossy().starts_with('1'))
+            });
+            if flush_only {
+                scheduler.flush();
+            } else {
+                scheduler.finish();
+            }
+        }
         true
     }
 }
@@ -1588,10 +1647,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn astc_trimmed_input_layout_preserves_full_and_compact_layer_strides() {
+        use crate::texture_cache::types::{Extent3D, ImageType, SubresourceExtent};
+        let mut info = ImageInfo::default();
+        info.format = crate::surface::PixelFormat::Astc2d4x4Unorm;
+        info.image_type = ImageType::E2D;
+        info.size = Extent3D { width: 256, height: 256, depth: 1 };
+        info.resources = SubresourceExtent { levels: 3, layers: 4 };
+        info.layer_stride = 0x18000;
+        // Full input size is the guest allocation, including any last-layer
+        // padding difference. Compact input instead contains every layer tail.
+        assert_eq!(astc_input_layout(&info, 0, 0x5d000), (0x18000, 0x5d000));
+        // ASTC4x4 uses16 bytes per4x4 block: level0=0x10000, level1=0x4000.
+        assert_eq!(astc_input_layout(&info, 1, 0x5d000), (0x8000, 0x20000));
+        assert_eq!(astc_input_layout(&info, 2, 0x5d000), (0x4000, 0x10000));
+    }
+
+    #[test]
     fn astc_push_constants_size() {
+        assert_eq!(std::mem::offset_of!(AstcPushConstants, native_tiling), 28);
+        let payload = AstcPushConstants { native_tiling: 1, ..Default::default() };
+        assert_eq!(&bytemuck::bytes_of(&payload)[28..32], &1u32.to_ne_bytes());
         assert_eq!(
             std::mem::size_of::<AstcPushConstants>(),
-            7 * std::mem::size_of::<u32>()
+            8 * std::mem::size_of::<u32>()
         );
     }
 

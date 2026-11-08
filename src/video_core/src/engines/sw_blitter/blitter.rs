@@ -302,7 +302,7 @@ impl SoftwareBlitEngine {
                 src_extent_y,
                 src.block_height(),
                 src.block_depth(),
-                src_extent_x * src_bytes_per_pixel,
+                src_extent_x * src_bytes_per_pixel, false,
             );
         } else {
             process_pitch_linear(
@@ -392,7 +392,7 @@ impl SoftwareBlitEngine {
                 dst_extent_y,
                 dst.block_height(),
                 dst.block_depth(),
-                dst_extent_x * dst_bytes_per_pixel,
+                dst_extent_x * dst_bytes_per_pixel, false,
             );
         } else {
             process_pitch_linear(

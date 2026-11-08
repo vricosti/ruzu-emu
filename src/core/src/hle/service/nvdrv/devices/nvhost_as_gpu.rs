@@ -140,6 +140,15 @@ struct Allocation {
     big_pages: bool,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct IoctlNx2SyncpointShimInfo {
+    pub address: u64,
+    pub stride: u32,
+    pub count: u32,
+}
+const _: () = assert!(std::mem::size_of::<IoctlNx2SyncpointShimInfo>() == 16);
+
 struct VM {
     big_page_size: u32,
     big_page_size_bits: u32,
@@ -149,6 +158,7 @@ struct VM {
     small_page_allocator: Option<FlatAllocator>,
     big_page_allocator: Option<FlatAllocator>,
     initialised: bool,
+    absolute_big_page_limit: bool,
 }
 
 impl Default for VM {
@@ -163,6 +173,7 @@ impl Default for VM {
             small_page_allocator: None,
             big_page_allocator: None,
             initialised: false,
+            absolute_big_page_limit: false,
         }
     }
 }
@@ -175,16 +186,38 @@ impl VM {
 }
 
 /// nvhost_as_gpu device.
+#[derive(Clone, Copy)]
+struct Nx2DeviceRange {
+    address: u64,
+    heap: bool,
+}
+
+// Callback lifetime adapter for this device's upstream-owned fields. Registry
+// callbacks hold its Weak, not Weak<NvHostAsGpu>: dropping the last device Arc
+// inside a callback would otherwise re-enter RemoveListener's registry lock.
+// The device still owns registration/removal; both paths share the same mutex
+// and GMMU, and all source methods remain in NvHostAsGpu in this file.
+struct Nx2State {
+    system: SystemRef,
+    container: Container,
+    mutex: Arc<Mutex<()>>,
+    gmmu: Arc<Mutex<Option<Arc<dyn GpuMemoryManagerHandle>>>>,
+    session: Mutex<SessionId>,
+    device_ranges: Mutex<BTreeMap<(u64, u64), Nx2DeviceRange>>,
+}
+
 pub struct NvHostAsGpu {
     system: SystemRef,
     module: *const Module,
     nvmap: *const NvMap,
-    mutex: Mutex<()>,
+    mutex: Arc<Mutex<()>>,
     vm: Mutex<VM>,
     map_buffer_offsets: Mutex<HashSet<i64>>,
     mapping_map: Mutex<BTreeMap<u64, Arc<Mapping>>>,
     allocation_map: Mutex<BTreeMap<u64, Allocation>>,
-    gmmu: Mutex<Option<Arc<dyn GpuMemoryManagerHandle>>>,
+    gmmu: Arc<Mutex<Option<Arc<dyn GpuMemoryManagerHandle>>>>,
+    nx2_syncpoint_shim: Mutex<bool>,
+    nx2_state: Arc<Nx2State>,
 }
 
 // Safety: the device is accessed through the nvdrv service thread, matching the
@@ -200,21 +233,114 @@ impl NvHostAsGpu {
     }
 
     pub fn new(system: SystemRef, module: &Module, container: &Container) -> Self {
+        let mutex = Arc::new(Mutex::new(()));
+        let gmmu = Arc::new(Mutex::new(None));
+        let nx2_state = Arc::new(Nx2State {
+            system,
+            container: container.clone(),
+            mutex: Arc::clone(&mutex),
+            gmmu: Arc::clone(&gmmu),
+            session: Mutex::new(SessionId::default()),
+            device_ranges: Mutex::new(BTreeMap::new()),
+        });
         Self {
             system,
             module: module as *const _,
             nvmap: container.get_nv_map_file() as *const _,
-            mutex: Mutex::new(()),
+            mutex,
             vm: Mutex::new(VM::default()),
             map_buffer_offsets: Mutex::new(HashSet::new()),
             mapping_map: Mutex::new(BTreeMap::new()),
             allocation_map: Mutex::new(BTreeMap::new()),
-            gmmu: Mutex::new(None),
+            gmmu,
+            nx2_syncpoint_shim: Mutex::new(false),
+            nx2_state,
         }
     }
 
     fn module(&self) -> &Module {
         unsafe { &*self.module }
+    }
+
+    fn nx2_map(state: &Nx2State, gpu_address: u64, cpu_address: u64, size: u64) {
+        let _guard = state.mutex.lock().unwrap();
+        let session_id = *state.session.lock().unwrap();
+        let session = state.container.get_session_mapping(session_id);
+        let gmmu = state.gmmu.lock().unwrap().clone();
+        let (Some((asid, preallocated, mapper)), Some(gmmu)) = (session, gmmu) else {
+            log::error!("Switch 2 GPU mapping {gpu_address:#x}+{size:#x}: no address space or session");
+            return;
+        };
+        let mut ranges = state.device_ranges.lock().unwrap();
+        let range = if let Some(range) = ranges.get(&(cpu_address, size)) {
+            *range
+        } else if let Some(mapper) = mapper.filter(|mapper| preallocated && mapper.is_in_bounds(cpu_address, size as usize)) {
+            Nx2DeviceRange { address: mapper.map(cpu_address, size as usize), heap: true }
+        } else {
+            let smmu = state.system.get().host1x_core().expect("NX2 mapping requires Host1x");
+            let address = smmu.smmu_allocate(size.wrapping_add(0x1FFFF) as usize & !0x1FFFF);
+            if address == 0 {
+                log::error!("Switch 2 GPU memory {cpu_address:#x}+{size:#x}: out of SMMU space");
+                return;
+            }
+            smmu.smmu_map(address, cpu_address, size as usize, asid, true);
+            Nx2DeviceRange { address, heap: false }
+        };
+        ranges.insert((cpu_address, size), range);
+        super::nx2_stub_device::Nx2GpuMemoryRegistry::get()
+            .record_device_range(cpu_address, size, range.address);
+        gmmu.map(gpu_address, range.address, size, 0, false); // PTEKind::PITCH
+        log::debug!("Switch 2 GPU mapping {gpu_address:#x}+{size:#x} -> CPU {cpu_address:#x}");
+    }
+
+    fn nx2_unmap(state: &Nx2State, gpu_address: u64, size: u64) {
+        let _guard = state.mutex.lock().unwrap();
+        let Some(gmmu) = state.gmmu.lock().unwrap().clone() else { return };
+        state.system.get().gpu_core().expect("NX2 unmapping requires GPU")
+            .run_in_order(Box::new(move || gmmu.unmap(gpu_address, size)));
+        log::debug!("Switch 2 GPU unmapping {gpu_address:#x}+{size:#x}");
+    }
+
+    fn nx2_release(state: &Nx2State, cpu_address: u64, size: u64) {
+        let _guard = state.mutex.lock().unwrap();
+        let Some(range) = state.device_ranges.lock().unwrap().remove(&(cpu_address, size)) else { return };
+        let mapper = if range.heap {
+            state.container.get_session_mapping(*state.session.lock().unwrap())
+                .and_then(|(_, _, mapper)| mapper)
+        } else { None };
+        let system = state.system;
+        system.get().gpu_core().expect("NX2 release requires GPU").run_in_order(Box::new(move || {
+            if range.heap {
+                if let Some(mapper) = mapper {
+                    mapper.unmap(cpu_address, size as usize);
+                }
+                return;
+            }
+            let smmu = system.get().host1x_core().expect("NX2 release requires Host1x");
+            smmu.smmu_unmap(range.address, size as usize);
+            smmu.smmu_free(range.address, size.wrapping_add(0x1FFFF) as usize & !0x1FFFF);
+        }));
+        log::debug!("Switch 2 released backing {cpu_address:#x}+{size:#x}");
+    }
+
+    // Mechanical binding of the three source lambdas; called after AllocAsEx
+    // releases its mutex because registration immediately replays mappings.
+    fn nx2_register_listener(&self) {
+        let map_state = Arc::downgrade(&self.nx2_state);
+        let unmap_state = map_state.clone();
+        let release_state = map_state.clone();
+        super::nx2_stub_device::Nx2GpuMemoryRegistry::get().add_listener(
+            Arc::as_ptr(&self.nx2_state) as usize,
+            Box::new(move |gpu, cpu, size| {
+                if let Some(state) = map_state.upgrade() { Self::nx2_map(&state, gpu, cpu, size); }
+            }),
+            Box::new(move |gpu, size| {
+                if let Some(state) = unmap_state.upgrade() { Self::nx2_unmap(&state, gpu, size); }
+            }),
+            Some(Box::new(move |cpu, size| {
+                if let Some(state) = release_state.upgrade() { Self::nx2_release(&state, cpu, size); }
+            })),
+        );
     }
 
     fn nvmap(&self) -> &NvMap {
@@ -268,6 +394,26 @@ impl NvHostAsGpu {
         NvResult::Success
     }
 
+    pub fn nx2_get_syncpoint_shim_info(&self, params: &mut IoctlNx2SyncpointShimInfo) -> NvResult {
+        let _owner_guard = self.mutex.lock().unwrap();
+        let vm = self.vm.lock().unwrap();
+        let gmmu = self.gmmu.lock().unwrap();
+        let Some(gmmu) = gmmu.as_ref().filter(|_| vm.initialised) else {
+            return NvResult::NotSupported;
+        };
+        let address = vm.va_range_end.wrapping_sub(u64::from(VM::YUZU_PAGESIZE));
+        let mut enabled = self.nx2_syncpoint_shim.lock().unwrap();
+        if !*enabled {
+            *enabled = true;
+            gmmu.set_native_syncpoint_shim(address);
+        }
+        params.address = address;
+        params.stride = 4;
+        params.count = gmmu.num_shim_syncpoints();
+        log::info!("Switch 2 syncpoint shim at {address:#x} ({} syncpoints)", params.count);
+        NvResult::Success
+    }
+
     pub fn alloc_as_ex(&self, params: &mut IoctlAllocAsEx) -> NvResult {
         log::debug!(
             "nvhost_as_gpu::AllocAsEx called, big_page_size=0x{:X}",
@@ -316,6 +462,12 @@ impl NvHostAsGpu {
             vm.va_range_start = params.va_range_start;
             vm.va_range_split = params.va_range_split;
             vm.va_range_end = params.va_range_end;
+            if vm.va_range_split == 0 {
+                vm.va_range_split = vm.va_range_end;
+                vm.va_range_end = vm.va_range_end.wrapping_add(4u64 << 30);
+                vm.absolute_big_page_limit = true;
+                log::warn!("No VA split given; small pages up to {:#x}", vm.va_range_split);
+            }
         }
 
         let start_pages = (vm.va_range_start >> VM::PAGE_SIZE_BITS) as u32;
@@ -323,8 +475,9 @@ impl NvHostAsGpu {
         vm.small_page_allocator = Some(FlatAllocator::new(start_pages, end_pages));
 
         let start_big_pages = (vm.va_range_split >> vm.big_page_size_bits) as u32;
-        let end_big_pages =
-            (vm.va_range_end.wrapping_sub(vm.va_range_split) >> vm.big_page_size_bits) as u32;
+        let end_big_pages = (if vm.absolute_big_page_limit { vm.va_range_end }
+            else { vm.va_range_end.wrapping_sub(vm.va_range_split) }
+            >> vm.big_page_size_bits) as u32;
         vm.big_page_allocator = Some(FlatAllocator::new(start_big_pages, end_big_pages));
 
         let max_big_page_bits = 64 - (vm.va_range_end - 1).leading_zeros() as u64;
@@ -995,6 +1148,13 @@ impl NvHostAsGpu {
     }
 }
 
+impl Drop for NvHostAsGpu {
+    fn drop(&mut self) {
+        super::nx2_stub_device::Nx2GpuMemoryRegistry::get()
+            .remove_listener(Arc::as_ptr(&self.nx2_state) as usize);
+    }
+}
+
 impl NvDevice for NvHostAsGpu {
     fn ioctl1(&self, _fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
         match command.group() {
@@ -1035,10 +1195,19 @@ impl NvDevice for NvHostAsGpu {
                     write_struct(output, &params);
                     r
                 }
+                0xB if super::nx2_stub_device::G_NX2_DRIVER.load(std::sync::atomic::Ordering::SeqCst) => {
+                    let mut params: IoctlNx2SyncpointShimInfo = read_struct(input);
+                    let result = self.nx2_get_syncpoint_shim_info(&mut params);
+                    write_struct(output, &params);
+                    result
+                }
                 0x9 => {
                     let mut params: IoctlAllocAsEx = read_struct(input);
                     let r = self.alloc_as_ex(&mut params);
                     write_struct(output, &params);
+                    if r == NvResult::Success && super::nx2_stub_device::G_NX2_DRIVER.load(std::sync::atomic::Ordering::SeqCst) {
+                        self.nx2_register_listener();
+                    }
                     r
                 }
                 0x14 => {
@@ -1123,7 +1292,9 @@ impl NvDevice for NvHostAsGpu {
         }
     }
 
-    fn on_open(&self, _session_id: SessionId, _fd: DeviceFD) {}
+    fn on_open(&self, session_id: SessionId, _fd: DeviceFD) {
+        *self.nx2_state.session.lock().unwrap() = session_id;
+    }
     fn on_close(&self, _fd: DeviceFD) {}
 
     fn query_event(
@@ -1155,6 +1326,7 @@ mod tests {
     #[derive(Default)]
     struct FakeGpuCore {
         ops: Arc<Mutex<Vec<String>>>,
+        pending: Mutex<std::collections::VecDeque<Box<dyn FnOnce() + Send>>>,
     }
 
     struct FakeGpuMemoryManagerHandle {
@@ -1173,6 +1345,11 @@ mod tests {
     }
 
     impl GpuMemoryManagerHandle for FakeGpuMemoryManagerHandle {
+        fn set_native_syncpoint_shim(&self, address: u64) {
+            self.ops.lock().unwrap().push(format!("syncpoint_shim:{address:#x}"));
+        }
+        fn num_shim_syncpoints(&self) -> u32 { 192 }
+
         fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
             self
         }
@@ -1199,6 +1376,20 @@ mod tests {
     }
 
     impl GpuCoreInterface for FakeGpuCore {
+        fn run_in_order(&self, func: Box<dyn FnOnce() + Send>) {
+            self.pending.lock().unwrap().push_back(func);
+        }
+
+        fn set_nx2_ampere(&self, _enabled: bool) {}
+
+        fn nx2_add_semaphore_region(&self, _start: u64) {
+            panic!("NX2 semaphore registration is outside this test fixture");
+        }
+
+        fn nx2_remove_semaphore_region(&self, _start: u64) {
+            panic!("NX2 semaphore removal is outside this test fixture");
+        }
+
         fn as_any(&self) -> &(dyn std::any::Any + Send) {
             self
         }
@@ -1235,6 +1426,24 @@ mod tests {
         ) {
         }
 
+        fn run_on_gpu_thread(&self, _action: Box<dyn FnOnce() + Send>) -> u64 {
+            panic!("GPU sync operation is outside this test fixture");
+        }
+
+        fn renderer_flush_region(&self, _addr: u64, _size: u64) {
+            panic!("renderer flush is outside this test fixture");
+        }
+
+        fn request_screenshot(
+            &self,
+            _pixels: Vec<u8>,
+            _callback: Box<dyn FnOnce(Vec<u8>, bool) + Send>,
+            _layout: crate::frontend::framebuffer_layout::FramebufferLayout,
+            _layer_stack: crate::hle::service::nvnflinger::hwc_layer::LayerStackId,
+        ) {
+            panic!("screenshot is outside this test fixture");
+        }
+
         fn wait_for_composite(&self) {}
 
         fn on_cpu_write(&self, _addr: u64, _size: u64) -> bool {
@@ -1252,10 +1461,209 @@ mod tests {
         fn flush_region(&self, _addr: u64, _size: u64) {}
     }
 
-    fn system_with_fake_gpu() -> System {
-        let mut system = System::new_for_test();
+    struct FakeHost1xCore {
+        ops: Arc<Mutex<Vec<String>>>,
+        next: std::sync::atomic::AtomicU64,
+    }
+
+    impl crate::host1x_core::Host1xCoreInterface for FakeHost1xCore {
+        fn create_nx2_video_decoder(&self, _mime: &str) -> Box<dyn crate::host1x_core::Nx2VideoDecoderHandle> {
+            panic!("video decoding is outside this memory test fixture");
+        }
+
+        fn increment_guest(&self, _id: u32) {
+            panic!("guest increment is outside this fixture");
+        }
+
+        fn is_ready_guest(&self, _id: u32, _expected_value: u32) -> bool {
+            panic!("memory-test Host1x fixture does not model guest syncpoints")
+        }
+
+        fn get_guest_syncpoint_value(&self, _id: u32) -> u32 {
+            panic!("memory-test Host1x fixture does not model guest syncpoints")
+        }
+
+        fn deregister_guest_action(&self, _id: u32, _handle: u64) {
+            panic!("memory-test Host1x fixture does not model guest actions")
+        }
+
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+            self
+        }
+
+        fn get_host_syncpoint_value(&self, _id: u32) -> u32 {
+            0
+        }
+
+        fn wait_host(&self, _id: u32, _expected_value: u32) {}
+
+        fn register_guest_action(
+            &self,
+            _id: u32,
+            _expected_value: u32,
+            _action: Box<dyn FnOnce() + Send>,
+        ) -> Option<u64> {
+            None
+        }
+
+        fn register_host_action(
+            &self,
+            _id: u32,
+            _expected_value: u32,
+            _action: Box<dyn FnOnce() + Send>,
+        ) -> Option<u64> {
+            None
+        }
+
+        fn deregister_host_action(&self, _id: u32, _handle: u64) {}
+
+        fn smmu_allocate(&self, _size: usize) -> u64 {
+            self.ops.lock().unwrap().push(format!("allocate:{_size:#x}"));
+            self.next.fetch_add(0x20000, std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn smmu_register_process(&self, _memory: Option<Arc<crate::memory::memory::SharedMemory>>) -> u32 {
+            7
+        }
+
+        fn smmu_unregister_process(&self, _asid: u32) {}
+
+        fn smmu_free(&self, _d_address: u64, _size: usize) {
+            self.ops.lock().unwrap().push(format!("free:{_d_address:#x}:{_size:#x}"));
+        }
+
+        fn smmu_map(
+            &self,
+            _d_address: u64,
+            _virtual_address: u64,
+            _size: usize,
+            _asid: u32,
+            _track: bool,
+        ) {
+            self.ops.lock().unwrap().push(format!("smmu_map:{_d_address:#x}:{_virtual_address:#x}:{_size:#x}:{_asid}:{_track}"));
+        }
+
+        fn smmu_track_continuity(&self, _d_address: u64, _size: usize) {}
+
+        fn smmu_track_continuity_registered(
+            &self,
+            _d_address: u64,
+            _virtual_address: u64,
+            _size: usize,
+            _asid: u32,
+        ) {
+        }
+
+        fn smmu_unmap(&self, _d_address: u64, _size: usize) {
+            self.ops.lock().unwrap().push(format!("smmu_unmap:{_d_address:#x}:{_size:#x}"));
+        }
+
+        fn smmu_read_block(&self, _address: u64, _output: &mut [u8]) -> bool {
+            panic!("device reads are outside this fixture");
+        }
+
+        fn smmu_lookup(&self, _d_address: u64) -> usize {
+            0
+        }
+
+        fn smmu_apply_op_on_host_pointer(
+            &self,
+            _host_ptr: usize,
+            _scratch: &mut common::scratch_buffer::ScratchBuffer<u32>,
+            _operation: &mut dyn FnMut(u64),
+        ) -> usize {
+            panic!("alias invalidation is outside this fixture")
+        }
+
+        fn bind_device_memory_invalidator(&self, _callback: Box<dyn Fn(u64, usize) + Send + Sync>) {
+        }
+
+        fn bind_device_memory_flusher(&self, _callback: Box<dyn Fn(u64, usize) + Send + Sync>) {}
+
+        fn host1x_gmmu_map_low(&self, _d_address: u64, _size: usize) -> u32 {
+            0
+        }
+
+        fn host1x_gmmu_unmap_low(&self, _gpu_address: u32, _size: usize) {}
+
+        fn start_device(&self, _fd: i32, _channel_type: crate::host1x_core::Host1xChannelType, _syncpt: u32) {}
+
+        fn stop_device(&self, _fd: i32, _channel_type: crate::host1x_core::Host1xChannelType) {}
+
+        fn push_entries(&self, _fd: i32, _entries: Vec<u32>) {}
+    }
+
+    fn system_with_fake_gpu() -> Box<System> {
+        let mut system = System::new_boxed_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore::default()));
         system
+    }
+
+    #[test]
+    fn nx2_registry_replays_reuses_and_releases_after_queued_gpu_unmap() {
+        use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
+        use crate::hle::service::nvdrv::devices::nx2_stub_device::{G_NX2_DRIVER, Nx2GpuMemoryRegistry};
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        G_NX2_DRIVER.store(true, Ordering::SeqCst);
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let mut system = system_with_fake_gpu();
+        system.set_gpu_core(Box::new(FakeGpuCore { ops: Arc::clone(&ops), ..Default::default() }));
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            ops: Arc::clone(&ops), next: AtomicU64::new(0x40000),
+        }));
+        let module = Module::new(SystemRef::from_ref(&system));
+        let container = Container::new_with_system(SystemRef::from_ref(&system));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let session = container.open_session(&process);
+        let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+        gpu_as.on_open(session, 9);
+        let registry = Nx2GpuMemoryRegistry::get();
+        let cpu = 0x550000000;
+        let gpu = 0x440000000;
+        let size = 0x3000;
+        registry.map_at(gpu, cpu, size);
+        let input = vec![0; std::mem::size_of::<IoctlAllocAsEx>()];
+        let mut output = input.clone();
+        assert_eq!(gpu_as.ioctl1(9, super::Ioctl { raw: 0x4109 }, &input, &mut output), NvResult::Success);
+        assert_eq!(&*ops.lock().unwrap(), &[
+            "init_address_space", "allocate:0x20000",
+            "smmu_map:0x40000:0x550000000:0x3000:7:true",
+            "map:0x440000000:0x40000:0x3000:0x0:false",
+        ]);
+        registry.map_at(gpu + 0x10000, cpu, size);
+        assert_eq!(ops.lock().unwrap().iter().filter(|s| s.starts_with("allocate:")).count(), 1);
+        assert_eq!(registry.device_address_of(cpu + 0x100), Some(0x40100));
+        registry.unmap(gpu, size);
+        registry.unmap(gpu + 0x10000, size);
+        registry.release_backing(cpu, size);
+        assert!(gpu_as.nx2_state.device_ranges.lock().unwrap().is_empty());
+        assert_eq!(registry.device_address_of(cpu), None);
+        assert!(!ops.lock().unwrap().iter().any(|s| s.starts_with("unmap:") || s.starts_with("free:")));
+        let core = system.gpu_core().unwrap().as_any().downcast_ref::<FakeGpuCore>().unwrap();
+        assert_eq!(core.pending.lock().unwrap().len(), 3);
+        loop {
+            let next = core.pending.lock().unwrap().pop_front();
+            let Some(next) = next else { break };
+            next();
+        }
+        assert_eq!(&ops.lock().unwrap()[5..], &[
+            "unmap:0x440000000:0x3000", "unmap:0x440010000:0x3000",
+            "smmu_unmap:0x40000:0x3000", "free:0x40000:0x20000",
+        ]);
+        // Exhaustion must not publish either a device range or a GPU mapping.
+        let host = system.host1x_core().unwrap().as_any().downcast_ref::<FakeHost1xCore>().unwrap();
+        host.next.store(0, Ordering::Relaxed);
+        let before = ops.lock().unwrap().len();
+        NvHostAsGpu::nx2_map(&gpu_as.nx2_state, gpu, cpu, size);
+        assert_eq!(ops.lock().unwrap().len(), before + 1);
+        assert!(gpu_as.nx2_state.device_ranges.lock().unwrap().is_empty());
+        drop(gpu_as);
+        let before = ops.lock().unwrap().len();
+        registry.map_at(gpu, cpu, size);
+        assert_eq!(ops.lock().unwrap().len(), before);
+        registry.unmap(gpu, size);
+        container.close_session(session);
     }
 
     fn create_allocated_handle(container: &Container, size: u64, address: u64) -> Arc<Handle> {
@@ -1272,6 +1680,46 @@ mod tests {
         );
         handle.lock_inner().d_address = address;
         handle
+    }
+
+    #[test]
+    fn nx2_zero_split_geometry_and_syncpoint_shim_once() {
+        let system = system_with_fake_gpu();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let container = Container::new();
+        let gpu_as = NvHostAsGpu::new(SystemRef::from_ref(&system), &module, &container);
+        let mut info = super::IoctlNx2SyncpointShimInfo { address: 7, stride: 8, count: 9 };
+        assert_eq!(gpu_as.nx2_get_syncpoint_shim_info(&mut info), NvResult::NotSupported);
+        assert_eq!((info.address, info.stride, info.count), (7, 8, 9));
+        let mut params = IoctlAllocAsEx {
+            flags: 5,
+            va_range_start: 0x1000,
+            va_range_end: 1u64 << 39,
+            va_range_split: 0,
+            ..Default::default()
+        };
+        assert_eq!(gpu_as.alloc_as_ex(&mut params), NvResult::Success);
+        {
+            let vm = gpu_as.vm.lock().unwrap();
+            assert_eq!(vm.va_range_split, 1u64 << 39);
+            assert_eq!(vm.va_range_end, (1u64 << 39) + (4u64 << 30));
+            assert!(vm.absolute_big_page_limit);
+        }
+        let mut allocation = IoctlAllocSpace { pages: 1, page_size: 0x20000, ..Default::default() };
+        assert_eq!(gpu_as.allocate_space(&mut allocation), NvResult::Success);
+        assert_eq!(allocation.offset, 1u64 << 39);
+        for _ in 0..2 {
+            assert_eq!(gpu_as.nx2_get_syncpoint_shim_info(&mut info), NvResult::Success);
+            assert_eq!(info.address, (1u64 << 39) + (4u64 << 30) - 0x1000);
+            assert_eq!((info.stride, info.count), (4, 192));
+        }
+        let gpu = system.gpu_core().unwrap().as_any().downcast_ref::<FakeGpuCore>().unwrap();
+        assert_eq!(gpu.ops.lock().unwrap().iter().filter(|op| op.starts_with("syncpoint_shim:")).count(), 1);
+        let mut bytes = [0u8; 16];
+        super::write_struct(&mut bytes, &info);
+        assert_eq!(&bytes[..8], &info.address.to_le_bytes());
+        assert_eq!(&bytes[8..12], &4u32.to_le_bytes());
+        assert_eq!(&bytes[12..], &192u32.to_le_bytes());
     }
 
     #[test]
@@ -1456,6 +1904,7 @@ mod tests {
         let mut system = System::new_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore {
             ops: Arc::clone(&ops),
+            ..Default::default()
         }));
         let module = Module::new(SystemRef::from_ref(&system));
         let container = Container::new();
@@ -1598,6 +2047,7 @@ mod tests {
         let mut system = System::new_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore {
             ops: Arc::clone(&ops),
+            ..Default::default()
         }));
         let module = Module::new(SystemRef::from_ref(&system));
         let container = Container::new();
@@ -1677,6 +2127,7 @@ mod tests {
         let mut system = System::new_for_test();
         system.set_gpu_core(Box::new(FakeGpuCore {
             ops: Arc::clone(&ops),
+            ..Default::default()
         }));
         let module = Module::new(SystemRef::from_ref(&system));
         let container = Container::new();

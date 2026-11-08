@@ -1757,6 +1757,7 @@ mod tests {
     fn packed_half_insert_extract_eliminates_overwritten_cbuf_lane() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
+        program.post_order_blocks.push(0);
         let block = program.block_mut(0);
         block.append_inst(Inst::new(
             Opcode::GetCbufU32,

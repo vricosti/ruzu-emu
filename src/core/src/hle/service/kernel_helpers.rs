@@ -31,6 +31,9 @@ use super::os::event::Event;
 /// KEvent objects via `KEvent::Create(kernel)`. Rust retains the service-layer
 /// Event owner by handle while its bridge keeps the matching kernel objects.
 pub struct ServiceContext {
+    // Upstream retains system.Kernel(); explicit owners must not depend on
+    // whichever guest thread happens to be current when CreateEvent is called.
+    system: Option<crate::core::SystemRef>,
     name: String,
     events: BTreeMap<u32, Arc<Event>>,
     reserved_event_handles: BTreeSet<u32>,
@@ -44,6 +47,18 @@ impl ServiceContext {
     ///
     /// Upstream: obtains current process from kernel, or creates one if none exists.
     pub fn new(name: String) -> Self {
+        Self::new_impl(None, name)
+    }
+
+    pub fn new_with_system(system: crate::core::SystemRef, name: String) -> Self {
+        Self::new_impl(Some(system), name)
+    }
+
+    fn new_impl(system: Option<crate::core::SystemRef>, name: String) -> Self {
+        let kernel = match system.as_ref() {
+            Some(system) => system.get().kernel(),
+            None => crate::hle::kernel::kernel::get_kernel_ref(),
+        };
         let current_process =
             crate::hle::kernel::kernel::get_current_thread_pointer().and_then(|thread| {
                 thread
@@ -55,7 +70,7 @@ impl ServiceContext {
             });
         let (process, process_created) = match current_process {
             Some(process) => (Some(process), false),
-            None => match crate::hle::kernel::kernel::get_kernel_ref() {
+            None => match kernel {
                 Some(kernel) => {
                     let process = Arc::new(ProcessLock::from_value(KProcess::new()));
                     {
@@ -85,6 +100,7 @@ impl ServiceContext {
         };
 
         Self {
+            system,
             name,
             events: BTreeMap::new(),
             reserved_event_handles: BTreeSet::new(),
@@ -159,7 +175,10 @@ impl ServiceContext {
 
         let event = match (
             self.process.as_ref(),
-            crate::hle::kernel::kernel::get_kernel_ref(),
+            match self.system.as_ref() {
+                Some(system) => system.get().kernel(),
+                None => crate::hle::kernel::kernel::get_kernel_ref(),
+            },
         ) {
             (Some(process), Some(kernel)) => Self::create_kernel_backed_event(
                 process,
@@ -234,6 +253,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_system_keeps_kernel_event_owner_without_current_guest_thread() {
+        let _without_global_kernel = crate::hle::kernel::kernel::ScopedKernelForTest::without_kernel();
+        let system = crate::core::System::new_boxed_for_test();
+        let mut context = ServiceContext::new_with_system(
+            crate::core::SystemRef::from_ref(&system),
+            "nvdrv".to_owned(),
+        );
+        let handle = context.create_event("channel".to_owned());
+        assert_ne!(handle, 0);
+        let event = context.get_event(handle).unwrap();
+        let readable = event.readable_event().expect("real kernel readable end");
+        let id = readable.lock().unwrap().object_id;
+        assert!(context.process.as_ref().unwrap().lock().unwrap()
+            .get_readable_event_by_object_id(id).is_some());
+        assert!(Arc::ptr_eq(&readable, &event.readable_event().unwrap()));
+        context.close_event(handle);
+        assert!(context.get_event(handle).is_none());
+        // Closing the service's ownership does not invalidate a copied handle.
+        assert_eq!(readable.lock().unwrap().object_id, id);
+    }
+
+    #[test]
     fn test_service_context_creation() {
         let ctx = ServiceContext::new("test_service".to_string());
         assert_eq!(ctx.name(), "test_service");
@@ -299,6 +340,7 @@ mod tests {
         let process = Arc::new(ProcessLock::from_value(KProcess::new()));
         process.lock().unwrap().resource_limit = Some(Arc::clone(&resource_limit));
         let mut context = ServiceContext {
+            system: None,
             name: "test".to_string(),
             events: BTreeMap::new(),
             reserved_event_handles: BTreeSet::new(),

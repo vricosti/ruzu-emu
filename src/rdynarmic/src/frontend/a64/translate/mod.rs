@@ -1,5 +1,6 @@
 mod a64_translate;
 mod branch;
+mod pointer_authentication;
 mod data_processing_addsub;
 mod data_processing_bitfield;
 mod data_processing_ccmp;
@@ -20,6 +21,7 @@ mod floating_point_data_processing_one_register;
 mod floating_point_data_processing_three_register;
 mod floating_point_data_processing_two_register;
 mod helpers;
+mod load_store_atomic;
 mod load_store_exclusive;
 mod load_store_literal;
 mod load_store_multiple_structures;

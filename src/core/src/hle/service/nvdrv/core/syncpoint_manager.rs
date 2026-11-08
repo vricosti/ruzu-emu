@@ -440,12 +440,14 @@ mod tests {
         let id = manager.allocate_syncpoint(false);
 
         manager.increment_syncpoint_max_ext(id, 10);
-        assert!(manager.has_syncpoint_expired(id, 5));
-        assert!(manager.has_syncpoint_expired(id, 10));
-        assert!(!manager.has_syncpoint_expired(id, 11));
+        // Source unsigned (max - threshold) >= (min - threshold):
+        // pending values are not expired; values beyond max are expired.
+        assert!(!manager.has_syncpoint_expired(id, 5));
+        assert!(!manager.has_syncpoint_expired(id, 10));
+        assert!(manager.has_syncpoint_expired(id, 11));
 
         manager.signal_syncpoint(id);
         assert!(manager.has_syncpoint_expired(id, 10));
-        assert!(!manager.has_syncpoint_expired(id, 11));
+        assert!(manager.has_syncpoint_expired(id, 11));
     }
 }

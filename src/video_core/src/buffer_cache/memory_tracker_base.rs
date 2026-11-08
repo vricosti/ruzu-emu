@@ -18,8 +18,8 @@ use super::word_manager::{DeviceTracker, Type, WordManager, BYTES_PER_WORD};
 // Constants — match upstream exactly
 // ---------------------------------------------------------------------------
 
-/// Maximum CPU address bits tracked (34 bits = 16 GiB).
-const MAX_CPU_PAGE_BITS: usize = 34;
+/// Maximum device address bits tracked (36 bits = 64 GiB), as in Eden NX2.
+const MAX_CPU_PAGE_BITS: usize = 36;
 
 /// Bits per higher page (22 bits = 4 MiB per higher page).
 const HIGHER_PAGE_BITS: usize = 22;
@@ -44,10 +44,10 @@ type Manager<DT> = WordManager<DT, WORDS_STACK_NEEDED, HIGHER_PAGE_SIZE>;
 
 /// Diagnostic: how many out-of-range tracker queries have been logged so far.
 /// Upstream indexes a `std::array<Manager*, NUM_HIGH_PAGES>` with the raw page
-/// index (silent UB if the device address exceeds the 16 GiB device address
+/// index (silent UB if the device address exceeds the 64 GiB device address
 /// space). ruzu's bounds-checked fixed array would panic instead, so we detect
 /// and log the offending (address, size) to surface the real bug — a device
-/// address above `SMMU_VA_LIMIT` (2^34) must never reach the buffer cache.
+/// address above `SMMU_VA_LIMIT` (2^36 - 1) must never reach the buffer cache.
 static OOR_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Log an out-of-range page query (rate-limited) so the bad address source can
@@ -531,17 +531,13 @@ mod tests {
 
     /// Regression: a device address beyond the tracked address space
     /// (`>= NUM_HIGH_PAGES * HIGHER_PAGE_SIZE`, i.e. above `SMMU_VA_LIMIT`)
-    /// must not panic the GPU thread. Upstream indexes a fixed `std::array`
-    /// (silent UB); ruzu's bounds-checked `Vec` would panic, so the iteration
-    /// device address ~24 GiB reached `for_each_download_range_and_clear`.
+    /// retains the Rust bounds guard against undefined upstream indexing.
     #[test]
     fn test_out_of_range_address_does_not_panic() {
         let tracker = DummyTracker;
         let mut mem_tracker = MemoryTrackerBase::new(&tracker);
 
-        // page_index = oor_addr >> HIGHER_PAGE_BITS = NUM_HIGH_PAGES + 1689,
-        // which previously indexed past the 4096-entry top tier and panicked.
-        let oor_addr: VAddr = (5785u64) << HIGHER_PAGE_BITS;
+        let oor_addr: VAddr = (NUM_HIGH_PAGES as u64 + 1689) << HIGHER_PAGE_BITS;
 
         // iterate_pairs path (read-only query): must return "not modified",
         // not panic.
@@ -560,5 +556,34 @@ mod tests {
         // portion without panicking on the overflow pages.
         let near_limit: VAddr = ((NUM_HIGH_PAGES as u64) - 1) << HIGHER_PAGE_BITS;
         assert!(!mem_tracker.is_region_gpu_modified(near_limit, HIGHER_PAGE_SIZE * 4));
+    }
+
+    #[test]
+    fn nx2_device_addresses_above_16_gib_preserve_upload_and_download_tracking() {
+        assert_eq!(MAX_CPU_PAGE_BITS, 36);
+        assert_eq!(NUM_HIGH_PAGES, 16384);
+        let tracker = DummyTracker;
+        let mut mem_tracker = MemoryTrackerBase::new(&tracker);
+        for (address, size) in [
+            // The real game's 0x431262b00 lies within this region.
+            (0x431260000, 0x10000),
+            ((1u64 << 34) - 0x1000, 0x2000),
+            ((1u64 << 36) - 0x1000, 0x1000),
+        ] {
+            assert!(mem_tracker.is_region_cpu_modified(address, size));
+            mem_tracker.unmark_region_as_cpu_modified(address, size);
+            assert!(!mem_tracker.is_region_cpu_modified(address, size));
+            mem_tracker.mark_region_as_gpu_modified(address, size);
+            assert!(mem_tracker.is_region_gpu_modified(address, size));
+            let mut downloaded = 0;
+            mem_tracker.for_each_download_range_and_clear(address, size, &mut |start, length| {
+                assert!(start >= address && start + length <= address + size);
+                downloaded += length;
+            });
+            assert_eq!(downloaded, size);
+            assert!(!mem_tracker.is_region_gpu_modified(address, size));
+            mem_tracker.mark_region_as_cpu_modified(address, size);
+            assert!(mem_tracker.is_region_cpu_modified(address, size));
+        }
     }
 }

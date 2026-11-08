@@ -31,6 +31,169 @@ pub fn translate_program(instructions: &[u64], stage: crate::ir::types::ShaderSt
     crate::pipeline_cache::translate_program(instructions, stage)
 }
 
+/// `AddMeshLines` from Eglantine translate_program.cpp at
+/// 900ab5a8251dcdb5eee42dd2837fa936ade15303. Stage activation awaits the
+/// task/mesh execution prerequisites recorded in NX2_PORT_STATE.md.
+pub fn add_mesh_lines(
+    sph: &ProgramHeader,
+    lines: &mut arrayvec::ArrayVec<u32, 136>,
+) -> Result<(), crate::exception::NotImplementedException> {
+    // OmapSystemC bit 11 is reserved; all other bits name unsupported outputs.
+    if sph.vtg_omap_systemc() & 0xf7ff != 0 {
+        return Err(crate::exception::NotImplementedException::new(
+            "Mesh outputs past the generic attributes",
+        ));
+    }
+    for bit in 0..8 {
+        if (sph.vtg_omap_systemb() >> bit) & 1 != 0 {
+            lines.push(Attribute::PRIMITIVE_ID.0 + bit);
+        }
+    }
+    for generic in 0..32 {
+        for (element, enabled) in sph.vtg_output_generic(generic).into_iter().enumerate() {
+            if enabled {
+                lines.push(Attribute::generic(generic as u32, element as u32).0);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Mechanical extraction of the Task/Mesh initialization arm in upstream
+/// `TranslateProgram` (900ab5a8). Kept here with its original owner while the
+/// execution backend is ported. `is_task` is the upstream stage comparison;
+/// this helper does not activate a stage or substitute its execution semantics.
+pub fn initialize_mesh_program(
+    program: &mut Program,
+    registers: [u32; 3],
+    is_task: bool,
+    sph: &ProgramHeader,
+    primitive_header: &ProgramHeader,
+) -> Result<(), crate::exception::NotImplementedException> {
+    let [shader_a, shader_b, init] = registers;
+    let lines = ((init >> 12) & 0x1ff).max((init >> 22) & 0x1ff);
+    program.mesh.payload_words = lines.max(1) * 32;
+    program.mesh.topology = shader_a & 0xf;
+    program.mesh.max_vertices = (shader_a >> 4) & 0x1ff;
+    program.mesh.max_primitives = (shader_a >> 13) & 0x3ff;
+    let threads = if is_task { init & 0x3f } else { (shader_b >> 20) & 0x3f };
+    program.workgroup_size = [threads.max(1), 1, 1];
+    if !is_task {
+        if !matches!(program.mesh.topology, 0 | 1 | 4) {
+            return Err(crate::exception::NotImplementedException::new(format!(
+                "Mesh output topology {} (SET_MESH_SHADER_A {shader_a:#010x})",
+                program.mesh.topology,
+            )));
+        }
+        add_mesh_lines(sph, &mut program.mesh.vertex_lines)?;
+        add_mesh_lines(primitive_header, &mut program.mesh.primitive_lines)?;
+    }
+    Ok(())
+}
+
+/// TranslateProgram records the stage-buffer outputs after usage collection;
+/// ordinary SetAttribute scans cannot discover these stores.
+pub fn collect_mesh_output_stores(program: &mut Program) {
+    if program.info.is_mesh {
+        for &line in program
+            .mesh
+            .vertex_lines
+            .iter()
+            .chain(&program.mesh.primitive_lines)
+        {
+            program.info.stores.set(line as usize, true);
+        }
+    }
+}
+
+#[cfg(test)]
+mod mesh_line_tests {
+    use super::*;
+
+    #[test]
+    fn mesh_initialization_matches_captured_mkw_registers() {
+        let mut vertex = ProgramHeader::default();
+        vertex.raw[13] = 0xf0 << 8;
+        let mut primitive = ProgramHeader::default();
+        primitive.raw[13] = 1 << 16;
+        for (registers, vertices, primitives, threads, payload) in [
+            ([0x00020204, 0x00800000, 0x02c0b020], 32, 16, 8, 352),
+            ([0x00080804, 0x02000000, 0x00802020], 128, 64, 32, 64),
+            ([0x00080804, 0x02000000, 0x02c0b020], 128, 64, 32, 352),
+            ([0x00181004, 0x02000000, 0x00802020], 256, 192, 32, 64),
+        ] {
+            for is_task in [false, true] {
+                // Initialization is independently testable before stage execution exists.
+                let mut program = Program::new(ShaderStage::Compute);
+                initialize_mesh_program(&mut program, registers, is_task, &vertex, &primitive).unwrap();
+                assert_eq!(program.workgroup_size, [if is_task { 32 } else { threads }, 1, 1]);
+                assert_eq!(program.mesh.payload_words, payload);
+                assert_eq!(program.mesh.max_vertices, vertices);
+                assert_eq!(program.mesh.max_primitives, primitives);
+                assert_eq!(program.mesh.topology, 4);
+                assert_eq!(program.mesh.vertex_lines.as_slice(), if is_task { &[][..] } else { &[28, 29, 30, 31] });
+                assert_eq!(program.mesh.primitive_lines.as_slice(), if is_task { &[][..] } else { &[32] });
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_initialization_preserves_zero_minima_and_validation_order() {
+        let header = ProgramHeader::default();
+        let mut program = Program::new(ShaderStage::Compute);
+        initialize_mesh_program(&mut program, [0; 3], false, &header, &header).unwrap();
+        assert_eq!(program.workgroup_size, [1, 1, 1]);
+        assert_eq!(program.mesh.payload_words, 32);
+        assert_eq!((program.mesh.max_vertices, program.mesh.max_primitives), (0, 0));
+        assert!(initialize_mesh_program(&mut program, [2, 0, 0], false, &header, &header).is_err());
+        assert_eq!(program.mesh.topology, 2);
+        // Tasks do not validate mesh topology or output maps.
+        let mut invalid = header.clone();
+        invalid.raw[18] = 1;
+        initialize_mesh_program(&mut program, [2, 0, 0], true, &invalid, &invalid).unwrap();
+        // The larger local/passed line count wins, with exactly nine bits per field.
+        initialize_mesh_program(&mut program, [4, 63 << 20, (511 << 12) | (1 << 22)], false, &header, &header).unwrap();
+        assert_eq!(program.mesh.payload_words, 511 * 32);
+        assert_eq!(program.workgroup_size, [63, 1, 1]);
+    }
+
+    #[test]
+    fn mesh_lines_preserve_attribute_order_and_all_136_outputs() {
+        let mut sph = ProgramHeader::default();
+        sph.raw[13] = 0xffff_ff00;
+        sph.raw[14..17].fill(u32::MAX);
+        sph.raw[17] = 0xffff;
+        let mut lines = arrayvec::ArrayVec::new();
+        add_mesh_lines(&sph, &mut lines).unwrap();
+        assert_eq!(lines.as_slice(), &(24..160).collect::<Vec<_>>());
+
+        let mut sparse = ProgramHeader::default();
+        sparse.raw[13] = (0x81 << 8) | (0x85 << 16);
+        let mut lines = arrayvec::ArrayVec::new();
+        add_mesh_lines(&sparse, &mut lines).unwrap();
+        assert_eq!(lines.as_slice(), &[24, 31, 32, 34, 39]);
+    }
+
+    #[test]
+    fn mesh_lines_reject_unsupported_system_outputs_before_appending() {
+        for bit in 0..16 {
+            let mut sph = ProgramHeader::default();
+            sph.raw[18] = 1 << bit;
+            sph.raw[13] = 1 << 8;
+            let mut lines = arrayvec::ArrayVec::new();
+            lines.push(99);
+            let result = add_mesh_lines(&sph, &mut lines);
+            if bit == 11 {
+                assert!(result.is_ok());
+                assert_eq!(lines.as_slice(), &[99, 24]);
+            } else {
+                assert_eq!(result.unwrap_err().to_string(), "Mesh outputs past the generic attributes is not implemented");
+                assert_eq!(lines.as_slice(), &[99]);
+            }
+        }
+    }
+}
+
 /// Remove CFG blocks that upstream identifies as unreachable after structured
 /// control-flow construction.
 ///
@@ -242,6 +405,7 @@ fn optimize_program(
     } else {
         ir_opt::collect_shader_info_pass::collect_shader_info_pass(program);
     }
+    collect_mesh_output_stores(program);
     ir_opt::layer_pass::layer_pass(program, host_info);
     ir_opt::vendor_workaround_pass::vendor_workaround_pass(program);
 }

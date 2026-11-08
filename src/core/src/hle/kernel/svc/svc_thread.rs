@@ -17,7 +17,22 @@ use crate::hle::kernel::svc_common::{Handle, PseudoHandle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
 fn is_valid_virtual_core_id(core_id: i32) -> bool {
-    (0..4).contains(&core_id)
+    (0..crate::hardware_properties::NUM_CPU_CORES as i32).contains(&core_id)
+}
+
+// Eden-NX2 folds additional hardware core IDs onto the emulated cores.
+fn fold_extra_core_id(core_id: i32) -> i32 {
+    let num_cores = crate::hardware_properties::NUM_CPU_CORES as i32;
+    if core_id >= num_cores && core_id < 2 * num_cores {
+        core_id - num_cores
+    } else {
+        core_id
+    }
+}
+
+fn fold_extra_core_mask(mask: u64) -> u64 {
+    let low = (1u64 << crate::hardware_properties::NUM_CPU_CORES) - 1;
+    (mask & low) | ((mask >> crate::hardware_properties::NUM_CPU_CORES) & low)
 }
 
 fn sleep_timeout_tick_from_ns(current_tick: i64, ns: i64) -> i64 {
@@ -174,6 +189,7 @@ pub fn create_thread(
         if core_id == IDEAL_CORE_USE_PROCESS_VALUE {
             core_id = process.get_ideal_core_id();
         }
+        core_id = fold_extra_core_id(core_id);
         let process_core_mask = process.get_core_mask();
 
         if !is_valid_virtual_core_id(core_id) {
@@ -686,6 +702,9 @@ pub fn set_thread_core_mask(
         if affinity_mask == 0 {
             return RESULT_INVALID_COMBINATION;
         }
+        // Validate the original mask against process capabilities before folding.
+        affinity_mask = fold_extra_core_mask(affinity_mask);
+        core_id = fold_extra_core_id(core_id);
         if is_valid_virtual_core_id(core_id) {
             if ((1u64 << core_id) & affinity_mask) == 0 {
                 return RESULT_INVALID_COMBINATION;
@@ -745,6 +764,32 @@ pub fn get_thread_id(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nx2_core_id_folding_preserves_sentinels_and_bounds() {
+        for core in 0..6 {
+            assert!(super::is_valid_virtual_core_id(core));
+            assert_eq!(super::fold_extra_core_id(core), core);
+            assert_eq!(super::fold_extra_core_id(core + 6), core);
+        }
+        for core in [i32::MIN, -3, -2, -1, 12, i32::MAX] {
+            assert_eq!(super::fold_extra_core_id(core), core);
+            assert!(!super::is_valid_virtual_core_id(core));
+        }
+    }
+
+    #[test]
+    fn nx2_core_mask_folding_unions_low_and_extra_cores() {
+        for core in 0..6 {
+            assert_eq!(super::fold_extra_core_mask(1 << core), 1 << core);
+            assert_eq!(super::fold_extra_core_mask(1 << (core + 6)), 1 << core);
+            assert_eq!(super::fold_extra_core_mask((1 << core) | (1 << (core + 6))), 1 << core);
+        }
+        assert_eq!(super::fold_extra_core_mask(0), 0);
+        assert_eq!(super::fold_extra_core_mask(u64::MAX), 0x3f);
+        assert_eq!(super::fold_extra_core_mask(1 << 12), 0);
+        assert_eq!(super::fold_extra_core_mask((1 << 5) | (1 << 6)), 0x21);
+    }
+
     use super::*;
     use crate::core::System;
     use crate::hle::kernel::k_process::{KProcess, ProcessLock};

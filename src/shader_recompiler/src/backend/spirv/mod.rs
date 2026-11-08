@@ -21,6 +21,7 @@ pub mod emit_spirv_image_atomic;
 pub mod emit_spirv_integer;
 pub mod emit_spirv_logical;
 pub mod emit_spirv_memory;
+pub mod emit_spirv_mesh;
 pub mod emit_spirv_select;
 pub mod emit_spirv_shared_memory;
 pub mod emit_spirv_special;

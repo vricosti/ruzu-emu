@@ -2013,6 +2013,47 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
 /// 3. Dispatches to Call32 or Call64 based on process bitness
 /// 4. Exits the SVC profile
 /// 5. Loads SVC arguments back to the physical core
+// Mechanical extraction of upstream svc.cpp Call's dispatch branch: both Rust
+// tracing paths use this same branch, preserving the source's pre-ABI SVC0x80.
+fn dispatch_call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
+    if imm == 0x80 {
+        use crate::hle::kernel::svc::svc_results::*;
+        use crate::hle::kernel::svc::svc_types::MemoryAttribute;
+        use crate::hle::kernel::k_typed_address::KProcessAddress;
+        use crate::hle::result::ResultCode;
+        const SUPPORTED: u32 = MemoryAttribute::GpuAccessible as u32;
+        const PAGE_SIZE: u64 = crate::hle::kernel::k_memory_block::PAGE_SIZE as u64;
+        let address = get_arg64(args, 0);
+        let size = get_arg64(args, 1);
+        let mask = get_arg64(args, 2) as u32;
+        let attr = get_arg64(args, 3) as u32;
+        let result = if address % PAGE_SIZE != 0 {
+            RESULT_INVALID_ADDRESS
+        } else if size == 0 || size % PAGE_SIZE != 0 {
+            RESULT_INVALID_SIZE
+        } else if (attr & !mask) != 0 || ((mask | attr) & !SUPPORTED) != 0 {
+            RESULT_INVALID_COMBINATION
+        } else if address.wrapping_add(size) <= address {
+            RESULT_INVALID_CURRENT_MEMORY
+        } else {
+            let process = system.current_process_arc();
+            let mut process = process.lock().unwrap();
+            let address = KProcessAddress::new(address);
+            if !process.page_table.contains(address, size as usize) {
+                RESULT_INVALID_CURRENT_MEMORY
+            } else {
+                ResultCode::new(process.page_table.set_memory_attribute(address, size as usize, mask, attr))
+            }
+        };
+        log::debug!("Switch 2 svc 0x80 addr={address:#x} size={size:#x} mask={mask:#x} attr={attr:#x} -> {:#x}", result.get_inner_value());
+        args[0] = u64::from(result.get_inner_value());
+    } else if is_64bit {
+        call64(system, imm, args);
+    } else {
+        call32(system, imm, args);
+    }
+}
+
 pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     let mut dispatch_args = *args;
 
@@ -2238,11 +2279,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             dump_svc_full_regs(system, imm, tid, "REGS_IN ");
         }
 
-        if is_64bit {
-            call64(system, imm, &mut dispatch_args);
-        } else {
-            call32(system, imm, &mut dispatch_args);
-        }
+        dispatch_call(system, imm, is_64bit, &mut dispatch_args);
 
         // Log SVC exit
         eprintln!(
@@ -2263,11 +2300,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
             dump_svc_full_regs(system, imm, tid, "REGS_OUT");
         }
     } else {
-        if is_64bit {
-            call64(system, imm, &mut dispatch_args);
-        } else {
-            call32(system, imm, &mut dispatch_args);
-        }
+        dispatch_call(system, imm, is_64bit, &mut dispatch_args);
     }
 
     if let Some(start) = svc_start {
@@ -3483,6 +3516,35 @@ mod tests {
         system.set_runtime_program_id(1);
         system.set_runtime_64bit(false);
         system
+    }
+
+    #[test]
+    fn nx2_gpu_attribute_dispatch_preserves_validation_order_and_64bit_arguments() {
+        use crate::hle::kernel::svc::svc_results::*;
+        let system = test_system();
+        let cases = [
+            (1, 0, 0xFF, 0xFF, RESULT_INVALID_ADDRESS),
+            (0, 0, 0xFF, 0xFF, RESULT_INVALID_SIZE),
+            (0, 1, 0xFF, 0xFF, RESULT_INVALID_SIZE),
+            (0, 0x1000, 0, 0x20, RESULT_INVALID_COMBINATION),
+            (0, 0x1000, 0x28, 0x20, RESULT_INVALID_COMBINATION),
+            // Combination validation takes precedence over wrapping range validation.
+            (u64::MAX - 0xFFF, 0x1000, 0x40, 0, RESULT_INVALID_COMBINATION),
+            (u64::MAX - 0xFFF, 0x1000, 0x20, 0x20, RESULT_INVALID_CURRENT_MEMORY),
+            // Even AArch32 dispatch uses the source's GetArg64 for this special call.
+            (0x1_0000_0000, 0x1000, 0x20, 0x20, RESULT_INVALID_CURRENT_MEMORY),
+            // High halves of mask/attr are truncated before validating the low u32s.
+            (0x1_0000_0000, 0x1000, 0x1_0000_0020, 0x2_0000_0020, RESULT_INVALID_CURRENT_MEMORY),
+        ];
+        for is_64bit in [true, false] {
+            for (address, size, mask, attr, expected) in cases {
+                let mut args = [address, size, mask, attr, 4, 5, 6, 7];
+                let original = args;
+                dispatch_call(&system, 0x80, is_64bit, &mut args);
+                assert_eq!(args[0], u64::from(expected.get_inner_value()), "address={address:#x}, mask={mask:#x}, is64={is_64bit}");
+                assert_eq!(&args[1..], &original[1..]);
+            }
+        }
     }
 
     #[test]

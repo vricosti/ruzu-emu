@@ -87,6 +87,17 @@ impl HeapMapper {
         self.m_size
     }
 
+    /// Mechanical destructor body, also called at upstream's mapper.reset()
+    /// point when a deferred NX2 callback still retains the Rust allocation.
+    /// Draining ownership prevents that callback/Drop from unmapping reused
+    /// SMMU backing after the session's address range has been freed.
+    pub(crate) fn finalize(&self) {
+        let mut internal = self.m_internal.lock().unwrap();
+        for range in internal.mapped_ranges.drain(..) {
+            self.unmap_subrange(range.start, (range.end - range.start) as usize);
+        }
+    }
+
     fn map_subrange(&self, start: u64, size: usize) {
         let sys = self.system.get();
         let Some(host1x) = sys.host1x_core() else {
@@ -120,10 +131,7 @@ impl HeapMapper {
 
 impl Drop for HeapMapper {
     fn drop(&mut self) {
-        let ranges = self.m_internal.lock().unwrap().mapped_ranges.clone();
-        for range in ranges {
-            self.unmap_subrange(range.start, (range.end - range.start) as usize);
-        }
+        self.finalize();
     }
 }
 
@@ -251,6 +259,23 @@ impl HeapMapperInternal {
 mod tests {
     use super::{HeapMapper, HeapMapperInternal};
     use crate::core::SystemRef;
+
+    #[test]
+    fn explicit_retirement_drains_ranges_before_last_capture_is_dropped() {
+        let system = crate::core::System::new_boxed_for_test();
+        let mapper = std::sync::Arc::new(HeapMapper::new(
+            0x1000, 0x8000, 0x4000, 1, SystemRef::from_ref(&system),
+        ));
+        mapper.map(0x1000, 0x2000);
+        mapper.map(0x2000, 0x2000);
+        let pending_release = std::sync::Arc::clone(&mapper);
+        assert_eq!(mapper.m_internal.lock().unwrap().mapped_ranges.len(), 3);
+        mapper.finalize();
+        assert!(pending_release.m_internal.lock().unwrap().mapped_ranges.is_empty());
+        drop(mapper);
+        pending_release.unmap(0x1000, 0x2000);
+        assert!(pending_release.m_internal.lock().unwrap().mapped_ranges.is_empty());
+    }
 
     #[test]
     fn is_in_bounds_uses_upstream_wrapping_address_arithmetic() {

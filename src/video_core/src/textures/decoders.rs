@@ -27,6 +27,15 @@ pub const GOB_SIZE_SHIFT: u32 = GOB_SIZE_X_SHIFT + GOB_SIZE_Y_SHIFT + GOB_SIZE_Z
 const SWIZZLE_X_BITS: u32 = 0b100101111;
 const SWIZZLE_Y_BITS: u32 = 0b011010000;
 
+/// Upstream NativeGobOffset: NX2 swaps address bits5 and6 within each GOB.
+const fn native_gob_offset(offset: u32, native_tiling: bool) -> u32 {
+    if !native_tiling {
+        return offset;
+    }
+    let difference = ((offset >> 5) ^ (offset >> 6)) & 1;
+    offset ^ (difference << 5) ^ (difference << 6)
+}
+
 // ── Helper: pdep (parallel bit deposit) ──────────────────────────────────────
 
 /// Parallel bit deposit — deposits bits of `value` at positions specified by `mask`.
@@ -68,6 +77,7 @@ fn swizzle_impl<const TO_LINEAR: bool, const BYTES_PER_PIXEL: u32>(
     block_height: u32,
     block_depth: u32,
     stride: u32,
+    native_tiling: bool,
 ) {
     let origin_x: u32 = 0;
     let origin_y: u32 = 0;
@@ -94,7 +104,7 @@ fn swizzle_impl<const TO_LINEAR: bool, const BYTES_PER_PIXEL: u32>(
     // The spans supplied by upstream callers may omit untouched GOB padding.
     // Validate through the last byte actually addressed by the loop rather
     // than requiring `slice_size * depth_blocks` bytes. The deposited X/Y
-    // coordinates and block offsets are monotonic over this zero-origin
+    // coordinates (also after swapping bits5/6) and block offsets are monotonic over this zero-origin
     // traversal, so the final texel carries the maximum tiled offset.
     let tiled_size = if width == 0 || height == 0 || depth == 0 {
         0
@@ -114,7 +124,7 @@ fn swizzle_impl<const TO_LINEAR: bool, const BYTES_PER_PIXEL: u32>(
             .wrapping_add(offset_y)
             .wrapping_add(offset_x)
             .wrapping_add(pdep::<SWIZZLE_X_BITS>(x) | pdep::<SWIZZLE_Y_BITS>(y));
-        (swizzled_offset as usize)
+        (native_gob_offset(swizzled_offset, native_tiling) as usize)
             .checked_add(BYTES_PER_PIXEL as usize)
             .expect("tiled swizzle size overflow")
     };
@@ -149,8 +159,10 @@ fn swizzle_impl<const TO_LINEAR: bool, const BYTES_PER_PIXEL: u32>(
                 let offset_x = (x >> GOB_SIZE_X_SHIFT).wrapping_shl(x_shift);
 
                 let base_swizzled_offset = offset_z.wrapping_add(offset_y).wrapping_add(offset_x);
-                let swizzled_offset =
-                    base_swizzled_offset.wrapping_add(swizzled_x | swizzled_y) as usize;
+                let swizzled_offset = native_gob_offset(
+                    base_swizzled_offset.wrapping_add(swizzled_x | swizzled_y),
+                    native_tiling,
+                ) as usize;
                 let unswizzled_offset = slice
                     .wrapping_mul(pitch)
                     .wrapping_mul(height)
@@ -193,6 +205,7 @@ fn swizzle<const TO_LINEAR: bool>(
     block_height: u32,
     block_depth: u32,
     stride_alignment: u32,
+    native_tiling: bool,
 ) {
     macro_rules! bpp_case {
         ($bpp:literal) => {
@@ -205,6 +218,7 @@ fn swizzle<const TO_LINEAR: bool>(
                 block_height,
                 block_depth,
                 stride_alignment,
+                native_tiling,
             )
         };
     }
@@ -236,6 +250,7 @@ pub fn unswizzle_texture(
     block_height: u32,
     block_depth: u32,
     stride_alignment: u32,
+    native_tiling: bool,
 ) {
     let stride =
         (align_up_log2(width as u64, stride_alignment) as u32).wrapping_mul(bytes_per_pixel);
@@ -253,6 +268,7 @@ pub fn unswizzle_texture(
         block_height,
         block_depth,
         stride,
+        native_tiling,
     );
 }
 
@@ -269,6 +285,7 @@ pub fn swizzle_texture(
     block_height: u32,
     block_depth: u32,
     stride_alignment: u32,
+    native_tiling: bool,
 ) {
     let stride =
         (align_up_log2(width as u64, stride_alignment) as u32).wrapping_mul(bytes_per_pixel);
@@ -286,6 +303,7 @@ pub fn swizzle_texture(
         block_height,
         block_depth,
         stride,
+        native_tiling,
     );
 }
 
@@ -305,6 +323,7 @@ fn swizzle_subrect_impl<const TO_LINEAR: bool, const BYTES_PER_PIXEL: u32>(
     block_height: u32,
     block_depth: u32,
     pitch_linear: u32,
+    native_tiling: bool,
 ) {
     let origin_z: u32 = 0;
     let pitch = pitch_linear;
@@ -344,8 +363,10 @@ fn swizzle_subrect_impl<const TO_LINEAR: bool, const BYTES_PER_PIXEL: u32>(
                 let offset_x = (x >> GOB_SIZE_X_SHIFT).wrapping_shl(x_shift);
 
                 let base_swizzled_offset = offset_z.wrapping_add(offset_y).wrapping_add(offset_x);
-                let swizzled_offset =
-                    base_swizzled_offset.wrapping_add(swizzled_x | swizzled_y) as usize;
+                let swizzled_offset = native_gob_offset(
+                    base_swizzled_offset.wrapping_add(swizzled_x | swizzled_y),
+                    native_tiling,
+                ) as usize;
                 let unswizzled_offset = slice
                     .wrapping_mul(pitch)
                     .wrapping_mul(height)
@@ -403,6 +424,7 @@ pub fn swizzle_subrect(
     block_height: u32,
     block_depth: u32,
     pitch_linear: u32,
+    native_tiling: bool,
 ) {
     macro_rules! bpp_case {
         ($bpp:literal) => {
@@ -419,6 +441,7 @@ pub fn swizzle_subrect(
                 block_height,
                 block_depth,
                 pitch_linear,
+                native_tiling,
             )
         };
     }
@@ -452,6 +475,7 @@ pub fn unswizzle_subrect(
     block_height: u32,
     block_depth: u32,
     pitch_linear: u32,
+    native_tiling: bool,
 ) {
     macro_rules! bpp_case {
         ($bpp:literal) => {
@@ -468,6 +492,7 @@ pub fn unswizzle_subrect(
                 block_height,
                 block_depth,
                 pitch_linear,
+                native_tiling,
             )
         };
     }
@@ -542,6 +567,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_gob_matches_fixed_coordinates_and_full_texture_bytes() {
+        for (offset, native) in [
+            (0, 0),
+            (16, 16),
+            (32, 64),
+            (64, 32),
+            (96, 96),
+            (256, 256),
+            (511, 511),
+        ] {
+            assert_eq!(native_gob_offset(offset, false), offset);
+            assert_eq!(native_gob_offset(offset, true), native);
+        }
+        let linear: Vec<u8> = (0..512).map(|i| ((i * 17 + i / 64) % 251) as u8).collect();
+        let mut tiled = vec![0; 512];
+        swizzle_texture(&mut tiled, &linear, 1, 64, 8, 1, 0, 0, 0, true);
+        // Independent native GOB coordinates: X4 -> bit6, Y1 -> bit5.
+        for y in 0..8 {
+            for x in 0..64 {
+                let offset = (x / 32) * 256
+                    + (y / 4) * 128
+                    + ((y % 4) / 2) * 32
+                    + ((x % 32) / 16) * 64
+                    + (y % 2) * 16
+                    + x % 16;
+                assert_eq!(tiled[offset], linear[y * 64 + x]);
+            }
+        }
+        let mut restored = vec![0; 512];
+        unswizzle_texture(&mut restored, &tiled, 1, 64, 8, 1, 0, 0, 0, true);
+        assert_eq!(restored, linear);
+    }
+
+    #[test]
+    fn native_subrect_preserves_origin_and_checks_changed_extent() {
+        let linear: Vec<u8> = (0..40).map(|v| v as u8 + 1).collect();
+        let mut tiled = vec![0; 512];
+        swizzle_subrect(
+            &mut tiled, &linear, 1, 64, 8, 1, 13, 1, 10, 4, 0, 0, 10, true,
+        );
+        for y in 1..5 {
+            for x in 13..23 {
+                let offset = (x / 32) * 256
+                    + (y / 4) * 128
+                    + ((y % 4) / 2) * 32
+                    + ((x % 32) / 16) * 64
+                    + (y % 2) * 16
+                    + x % 16;
+                assert_eq!(tiled[offset], linear[(y - 1) * 10 + x - 13]);
+            }
+        }
+        let mut restored = vec![0; 40];
+        unswizzle_subrect(
+            &mut restored,
+            &tiled,
+            1,
+            64,
+            8,
+            1,
+            13,
+            1,
+            10,
+            4,
+            0,
+            0,
+            10,
+            true,
+        );
+        assert_eq!(restored, linear);
+        // Last texel moves from offset32 to64. Validate the native extent before unsafe copy.
+        assert!(std::panic::catch_unwind(|| {
+            swizzle_texture(&mut [0; 33], &[1; 17], 1, 17, 1, 1, 0, 0, 0, true);
+        })
+        .is_err());
+        let mut exact = [0; 65];
+        swizzle_texture(&mut exact, &[1; 17], 1, 17, 1, 1, 0, 0, 0, true);
+        assert_eq!(exact[64], 1);
+    }
+
+    #[test]
     fn gob_constants() {
         assert_eq!(GOB_SIZE, 512);
         assert_eq!(GOB_SIZE_X, 64);
@@ -601,6 +706,7 @@ mod tests {
                 1,
                 1,
                 1,
+                false,
             );
             unswizzle_texture(
                 &mut output,
@@ -612,6 +718,7 @@ mod tests {
                 1,
                 1,
                 1,
+                false,
             );
 
             assert_eq!(output, input, "bytes_per_pixel={bytes_per_pixel}");
@@ -648,6 +755,7 @@ mod tests {
                 0,
                 0,
                 pitch,
+                false,
             );
             unswizzle_subrect(
                 &mut output,
@@ -663,6 +771,7 @@ mod tests {
                 0,
                 0,
                 pitch,
+                false,
             );
 
             assert_eq!(output, input, "bytes_per_pixel={bytes_per_pixel}");
@@ -699,6 +808,7 @@ mod tests {
                 0,
                 0,
                 pitch,
+                false,
             );
             unswizzle_subrect(
                 &mut output,
@@ -714,6 +824,7 @@ mod tests {
                 0,
                 0,
                 pitch,
+                false,
             );
 
             assert_ne!(output, input, "bytes_per_pixel={bytes_per_pixel}");
@@ -741,6 +852,7 @@ mod tests {
             0,
             0,
             pitch,
+            false,
         );
         unswizzle_subrect(
             &mut output,
@@ -756,6 +868,7 @@ mod tests {
             0,
             0,
             pitch,
+            false,
         );
         assert_eq!(&output[16..18], &input[24..26]);
         assert_eq!(&output[64..66], &input[72..74]);

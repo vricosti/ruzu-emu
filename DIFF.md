@@ -18801,3 +18801,5209 @@ instructions and remain outside this change.
 ### Intentional differences
 
 - `Update` retains Rust's existing checked header reads and negative-count rejection. The obsolete consumed-size output and final alignment calculation are removed, matching upstream's API; `InfoUpdater` owns transport cursor advancement. Internal ordering remains: inactive-context return, header validation, clear connection flags, update info, update destination data. Rust discards the last internal offset instead of assigning it to an unused local as C++ does. Headers and implementations were re-read after the change; the existing negative-count regression was adapted to the new signature.
+
+## 2026-11-06 — src/core/src/file_sys/program_metadata.rs vs src/core/file_sys/program_metadata.{h,cpp}
+
+### Intentional differences
+- NX2 source pinned to eden-nx2 origin/eden-nx2 50fa86bbbc403ad565eb44fcc281f16f77c69e15. Re-read header and Load implementation after porting. Rust uses a bounded mutable byte slice for the same 0x40-byte ACID body replacement; validation and state mutation order match.
+- FAC/FAH base additions use wrapping u32 addition, preserving upstream unsigned arithmetic. Constants remain local to Load.
+- Retained upstream sticky is_switch2 lifetime across subsequent loads; tests explicitly cover this behavior.
+
+### Unintentional differences (to fix)
+- Existing enum accessors map unknown discriminants to defaults, whereas upstream bitfields retain raw values. This requires an API representation change outside this load-format slice.
+- Existing LoadManual clears reserved flag bits; upstream assigns only its two bitfields. Follow-up local parity correction required.
+
+### Missing items
+- Consumers of IsSwitch2 in loader, kernel, CPU and GPU are not yet ported. This entry verifies only the ACID/FAC/FAH parsing slice.
+
+### Binary layout verification
+- Header/AcidHeader/AciHeader retain compile-time sizes 0x80/0x240/0x40. New tests assert ACID magic and FAC offsets 0x200/0x220 and exercise both on-disk signature sizes. No serialized layout change.
+- Tests started; results pending in nx2-tests.log. Full core suite and rebuilt ROM run remain pending.
+`LoadManual` reserved-bit discrepancy corrected immediately: initialization now retains flags & 0xF0 before assigning bits 0..3; rechecked upstream bitfield assignments.
+Validation follow-up: added manual_load_preserves_reserved_flags_and_casts regression (flags 0xff -> 0xf2, priority -1 -> 255, core 0x102 -> 2). Focused compilation is still live; no pass claimed.
+Focused validation: all four nx2_tests passed (0 failed). Full cargo test -p core started; release CLI build also running.
+
+## 2026-11-06 — src/rdynarmic/src/interface/exclusive_monitor.rs vs src/dynarmic/src/dynarmic/interface/exclusive_monitor.h
+
+### Intentional differences
+- Source: eden-nx2 50fa86bbbc403ad565eb44fcc281f16f77c69e15. Capacity constant now matches six processors. Re-read the header and backend/x64/exclusive_monitor.cpp after the change; reservation masking, clearing, lock ordering and value storage are unchanged.
+- Existing Rust Vec storage remains fixed-length after construction versus upstream static_vector; pointers remain stable. This change does not alter that existing representation.
+
+### Unintentional differences (to fix)
+- None introduced by this constant change.
+
+### Missing items
+- Core hardware configuration remains four cores pending coordinated kernel/JIT integration; this change is the prerequisite capacity increase only.
+
+### Binary layout verification
+- No guest binary structure changed. Host field layout unchanged; existing JIT access uses runtime pointers. Regression covers all six reservations, cross-core invalidation and isolated ClearProcessor on cores 4/5.
+- Full cargo test -p rdynarmic running (nx2-rdynarmic-tests.log); no pass claimed yet.
+Full core validation attempt stopped with stack overflow in a time-management test; rerunning with a 16 MiB test-thread stack. Focused NPDM tests remain passing. Full-suite success is not yet established.
+rdynarmic validation: 1151 unit tests passed, 4 ignored, plus four integration tests passed; six-core regression passed. Wrapper reports exit 1 despite successful Cargo summaries; retained complete log for audit.
+Core suite follow-up: 16 MiB stack avoids the initial overflow, but parallel suite reports failure in host_deadline_delivery_pauses_but_explicit_stop_signal_does_not. The exact same test binary passes that test alone (0.09s, exit 0). Sequential execution is now being used to diagnose shared-state/timing interference; full-suite pass not claimed.
+ROM runtime verification after Release rebuild: previous ErrorBadFileAccessControl is gone; loader now rejects kernel metadata (log/ruzu_log.txt, 0.616972s). NPDM loading slice advances real game startup but does not establish CPU/GPU execution.
+
+## 2026-11-06 — src/core/src/hardware_properties.rs vs src/core/hardware_properties.h
+### Intentional differences
+- NX2 50fa86bb: six application cores and mapping 4->4, 5->5 ported; header re-read after change. Rust const function retains existing mask conversion algorithm.
+### Unintentional differences (to fix)
+- None in changed constants.
+### Missing items
+- Runtime verification pending; no claim of full six-core execution.
+### Binary layout verification
+- No serialized structures. Tests now cover 0x3f and isolated core 4/5 affinity conversion.
+
+## 2026-11-06 — src/core/src/hle/kernel/global_scheduler_context.rs vs src/core/hle/kernel/global_scheduler_context.{h,cpp}
+### Intentional differences
+- Six preemption priorities match NX2 PreemptThreads: 59,59,59,63,59,59. Re-read header and implementation after change. Existing module-level constant retains same file ownership rather than C++ function-local placement.
+### Unintentional differences (to fix)
+- None in changed values; complete scheduler parity not claimed.
+### Missing items
+- Six-core scheduler runtime and suite validation pending.
+### Binary layout verification
+- Host array length follows NUM_CPU_CORES; no guest serialized payload.
+
+## 2026-11-06 — src/core/src/hle/kernel/kernel.rs diagnostic arrays (Rust-specific)
+### Intentional differences
+- Existing Rust-only SVC/PC/LR/SP/register diagnostic arrays now initialize from NUM_CPU_CORES rather than four literals; JIT-map loop follows the same count. No C++ equivalent for these instrumentation fields, no guest semantics added.
+### Unintentional differences (to fix)
+- None in mechanical initialization changes.
+### Missing items
+- Compiler and runtime checks pending.
+### Binary layout verification
+- Host instrumentation array capacity changes to six; each atomic remains initialized to zero.
+
+## 2026-11-06 — src/core/src/hle/kernel/k_capabilities.rs vs src/core/hle/kernel/k_capabilities.{h,cpp}
+### Intentional differences
+- Explicit Rust bit extraction remains equivalent to CorePriority fields. Re-read upstream header fields and cpp validation/mapping after correction.
+### Unintentional differences (to fix)
+- Corrected discovered local divergences: max_core now checked against NumVirtualCores (64), not physical CPU count; initial-process and capability physical masks now use ConvertVirtualCoreMaskToPhysical instead of identity mapping.
+### Missing items
+- Full capability subsystem parity is not claimed. Runtime and full suite still pending.
+### Binary layout verification
+- CorePriority packed u32 fields unchanged. New regression covers 0..5 mask, virtual core 63 mapping to physical core 3, and invalid 64. Focused tests pending in nx2-capabilities-tests.log.
+Capability regression validation: all seven k_capabilities tests passed, including virtual IDs 0..5, alias 63->3 and rejection of 64. Hardware mapping tests: two passed. Six-core cargo check completed successfully; full core suite remains unresolved (old hanging runs intentionally stopped).
+
+## 2026-11-06 — src/rdynarmic/src/frontend/a64/translate/pointer_authentication.rs vs src/dynarmic/src/dynarmic/frontend/A64/translate/impl/pointer_authentication.cpp
+### Intentional differences
+- RETA method uses DecodedInst rather than a bool M parameter; both variants intentionally ignore M exactly as NX2 50fa86bb. Re-read cpp and impl.h declaration after implementation: read X30, SetPC, PopRSBHint, return false, in that order.
+- Decoder a64.inc enables the same RETA bit pattern; visitor.rs only dispatches, mod.rs only registers the owner module. Existing Rust translator tree omits the C++ impl directory.
+### Unintentional differences (to fix)
+- None identified for RETA slice. This preserves the upstream identity model, not cryptographic PAC validation.
+### Missing items
+- PACAUT_reg, XPAC_1, PACGA, BRA_BLRA and LDRA remain unported. They are not dependencies of RETA and are not enabled as successful stubs.
+### Binary layout verification
+- RETAA 0xd65f0bff and RETAB 0xd65f0fff tested against RET X30 IR and PopRSBHint terminal. Full rdynarmic test run pending in nx2-reta-tests.log.
+RETA validation: full rdynarmic suite reports 1152 unit tests passed, 4 ignored, and all four integration tests passed. RETAA/RETAB IR equivalence regression passes; git diff --check clean.
+
+## 2026-11-06 — src/rdynarmic/src/frontend/a64/translate/pointer_authentication.rs vs upstream pointer_authentication.cpp (BRA_BLRA)
+### Intentional differences
+- NX2 BRA_BLRA decoded arguments extracted from instruction bits Z24/L21/Rn9..5/Rm4..0; key bit M intentionally unused per upstream. Header declaration and cpp body re-read after implementation. Target read precedes LR write and RSB push; PC and FastDispatchHint follow exactly.
+- Decoder entry added to a64.inc, visitor only dispatches to the upstream-owned module.
+### Unintentional differences (to fix)
+- None identified in this method.
+### Missing items
+- Remaining PACAUT/XPAC/PACGA/LDRA methods not enabled. Full CPU support remains incomplete.
+### Binary layout verification
+- Regression compares IR against plain BR/BLR, including X30 target overlap and zero-register target, both Z/non-Z forms and invalid zero-form encoding. Full rdynarmic suite pending (nx2-bra-tests.log).
+BRA_BLRA validation: all 1153 unit tests passed (4 ignored), including branch target/LR ordering regression. Integration execution still being polled; no ROM result yet.
+
+## 2026-11-06 — pointer_authentication.rs vs upstream pointer_authentication.cpp (PACAUT_reg / XPAC_1)
+### Intentional differences
+- Port preserves NX2 identity authentication model: valid instructions return true without mutation. PACAUT_reg rejects Z && Rn != 31 using UnallocatedEncoding; XPAC_1 ignores D/Rd. This is upstream behavior, not a substitute implementation invented for missing dependencies.
+- Arguments extracted from DecodedInst; methods stay in the counterpart module. Re-read cpp bodies and impl.h signatures after edits.
+### Unintentional differences (to fix)
+- None identified in these methods.
+### Missing items
+- PACGA and LDRA remain absent; complete pointer-authentication file not yet claimed.
+### Binary layout verification
+- Tests enumerate all eight op values, Z forms, Rn 0/30/31 and both XPAC variants; compare emitted IR to NOP and require exception for invalid encodings. Full rdynarmic suite pending in nx2-pac-tests.log.
+PAC/AUT/XPAC validation: 1154 unit tests passed, 4 ignored; all four integration tests passed. Runtime with the prior capabilities+RETA Release now executes guest code and aborts at instruction 0xc8aafe6b, PC 0x8444456c (~2.2s), followed by svcBreak. This executable predates BRA_BLRA and PAC/AUT/XPAC.
+
+## 2026-11-06 — src/rdynarmic/src/frontend/a64/translate/load_store_atomic.rs vs upstream load_store_atomic.cpp (LDAPR_sz)
+### Intentional differences
+- Upstream AtomicAddress helper retained in corresponding module. LDAPR_sz decodes size/Rn/Rt from DecodedInst; byte count, destination width, ORDERED load, zero extension and register write follow source order exactly. Header declaration and cpp helper/method re-read after implementation.
+- Decoder table uses identical upstream LDAPR_sz pattern and visitor only dispatches.
+### Unintentional differences (to fix)
+- None identified in this slice.
+### Missing items
+- AtomicMemOp, CompareAndSwap and CompareAndSwapPair plus their helpers remain unported; no success stubs enabled. These are required by the runtime trace and are next.
+### Binary layout verification
+- Tests compare LDAPR IR to existing ordered LDAR IR for four sizes, Rn/Rt 0/8/31, covering SP, zero register and overlap. Full rdynarmic suite running in nx2-ldapr-tests.log.
+LDAPR validation completed exit 0: 1155 unit tests passed, 4 ignored, all four integration tests passed. IR ordering/width regression passed. git diff --check reports no whitespace errors.
+
+## 2026-11-06 — load_store_atomic.rs vs upstream load_store_atomic.cpp (CompareAndSwap)
+### Intentional differences
+- Same-file helpers ported: AtomicMaskIfZero, AtomicSelect, AtomicTruncate, AtomicLoadZext, AtomicZeroExtendReg, AtomicCommitReg, AtomicFinish, AtomicAccType. Explicit Rust sub carry=true implements upstream subtraction. Re-read helpers, CAS body and impl.h after implementation; validation/order/ownership match.
+### Unintentional differences (to fix)
+- None identified by source comparison; executable success/failure and forced store-contention tests still required before declaring slice fully verified.
+### Missing items
+- AtomicMemOp and CompareAndSwapPair remain absent. CAS runtime regression (memory and registers on match/mismatch/store failure) is the next validation prerequisite.
+### Binary layout verification
+- Exact upstream CompareAndSwap decoder pattern. IR tests cover four widths and four order combinations, exclusive read-before-write, success PC+4 and failure retry PC. Full suite running in nx2-cas-regression.log.
+
+## 2026-11-06 — src/rdynarmic/src/jit.rs (CAS runtime regression)
+### Intentional differences
+- Test-only callbacks optionally reject a configured count of exclusive writes; default remains zero, preserving existing tests. This is fault injection, not guest behavior.
+- Runtime expectations follow upstream CompareAndSwap: old memory returned in Rs after completion, desired stored only on equality, byte/half/word results zero-extended, failed exclusive store retries without converting mismatch to match.
+### Unintentional differences (to fix)
+- None in production code changed by this test slice.
+### Missing items
+- Intermediate-register snapshot at failed store, operand overlap and optimized execution paths still need explicit coverage; no multi-host-core stress proof claimed.
+### Binary layout verification
+- Test preserves untouched bytes outside each store width. Four widths x match/mismatch x zero/one injected failure pass on host JIT (16 cases, 1.14s). Full suite running in nx2-cas-jit-full.log.
+
+### CAS runtime validation follow-up — 2026-11-06
+- Extended jit.rs CAS regression to single-step a forced failed store, compare all 31 registers (including nonzero upper bits of narrow operands), require unchanged memory and PC, then resume and verify the retry result. All 16 cases passed in focused run.
+- Re-read upstream AtomicCommitReg/AtomicFinish: failure selects previous register and same PC; test expectations match this contract.
+- Expanded to both NO_OPTIMIZATIONS and ALL_SAFE_OPTIMIZATIONS (32 cases); full suite running in nx2-cas-optimized.log. Operand aliasing and real multi-core contention remain outside this test's proof.
+
+## 2026-11-06 — load_store_atomic.rs vs upstream load_store_atomic.cpp (AtomicMemOp)
+### Intentional differences
+- AtomicSignExtend and AtomicMemOp retain upstream file ownership, validation op<=8, read/source/operation/store/commit/retry ordering. Rust explicitly supplies zero carry to Add64. Re-read cpp switch and impl.h signature after implementation.
+- Decoder and visitor only register and dispatch identical upstream pattern.
+### Unintentional differences (to fix)
+- None identified in source comparison.
+### Missing items
+- CompareAndSwapPair remains unported. More operand/order/zero-register combinations remain beyond current runtime test coverage.
+### Binary layout verification
+- JIT test exercises 9 operations x 4 widths with negative signed old value and positive source, safe optimizations, injected failed store and unchanged destination at retry. Full suite pending in nx2-lse-tests.log.
+LSE suite completed: 1158 unit tests passed, 4 ignored; four integration tests passed. Optimized all-operation/width retry regression passed.
+
+## 2026-11-06 — src/core/src/hle/kernel/svc/svc_types.rs vs src/core/hle/kernel/svc_types.h
+### Intentional differences
+- Added only Nx2VammSize=33 and conversion for the runtime-observed query. Re-read enum declaration after edit. Existing Rust numeric decoder is extra glue.
+### Unintentional differences (to fix)
+- Existing unknown-ID fallback to CoreMask remains wrong for other unknown IDs; correcting the public conversion API requires a separate caller audit. It caused this query to return 0x3f before ID 33 was recognized.
+### Missing items
+- NX2 IDs 29..32 not included in this slice.
+### Binary layout verification
+- repr(u32) and numeric value 33 preserved; focused regression pending.
+
+## 2026-11-06 — src/core/src/hle/kernel/svc/svc_info.rs vs src/core/hle/kernel/svc/svc_info.cpp
+### Intentional differences
+- Nx2VammSize follows upstream experimental fixed 4 KiB page granule, with its STUBBED warning retained. This is explicitly an upstream approximation, not verified Switch 2 kernel fidelity. No missing backing dependency is replaced with a new success stub.
+- Uses existing same-domain PAGE_SIZE constant (4096). Re-read cpp process-query dispatch, sub-ID validation and Nx2VammSize case after change.
+### Unintentional differences (to fix)
+- Existing process handle lookup accepts any existing object and substitutes current process; not introduced here. Needs typed-handle lookup prerequisite outside this targeted query response.
+### Missing items
+- Other NX2 memory-region and remote-memory queries remain unported.
+### Binary layout verification
+- u64 result now 0x1000 instead of accidentally returning core mask 0x3f. Tests cover numeric ID, valid response, invalid subtype/handle preserving output. Tests running in nx2-vamm-tests.log.
+Focused GetInfo33 regression passed (1 test, 0 failures, 0.01s). Full core suite relaunched sequentially with 16 MiB stack; no full-suite pass claimed.
+
+## 2026-11-06 — application_proxy_service.rs vs application_proxy_service.{h,cpp}
+### Intentional differences
+- Command 10 aliases the existing OpenApplicationProxy handler exactly as NX2. No fabricated interface or automatic-success handler. Header and cpp reread; arguments, process/applet ownership and response behavior unchanged.
+### Unintentional differences (to fix)
+- None introduced by command alias.
+### Missing items
+- NX2 ApplicationProxy getters are not part of this slice.
+### Binary layout verification
+- Same existing CMIF serializer as command 0. Registration identity regression added; focused tests pending nx2-applet-open-tests.log.
+
+## 2026-11-06 — svc_types.rs / svc_info.rs vs svc_types.h / svc_info.cpp (NX2 region queries)
+### Intentional differences
+- Added enum/conversion IDs29/30 and same-file GetInfo cases. Re-read upstream enum and cases after port: upper alias half, base+half address, half size, shared process/subtype validation, experimental warning preserved.
+- Address addition explicitly wraps as upstream u64 arithmetic. This preserves Eden-NX2's experimental VAMM region model, not a claim about real hardware layout.
+### Unintentional differences (to fix)
+- Previously documented generic handle-resolution and unknown-ID fallback differences remain outside this slice.
+### Missing items
+- Remote-memory IDs31/32 and complete Switch2 memory provisioning remain unported. Full core suite contamination remains unresolved.
+### Binary layout verification
+- Exact u32 IDs29/30; u64 results. Nonzero alias region regression expects base 0x800000 and size 0x400000 from alias [0x400000,0xc00000). Invalid subtype/handle tests included. Focused tests pending nx2-memory-query-tests.log.
+Validation: all seven focused nx2_ core regressions passed, including NPDM, region address/size, VAMM granule and appletOE alias. Full core validation still affected by previously reproduced test contamination.
+
+## 2026-11-07 — src/core/src/hle/kernel/k_scheduler.rs vs src/core/hle/kernel/k_scheduler.{h,cpp}
+
+### Intentional differences
+- Native unit-test fixture only: assert RequestDummyThreadWait before releasing
+  the scheduler lock, then restore Runnable and end the dummy wait before unlock.
+  Upstream UpdateHighestPriorityThreadsImpl requests suspension at unlock;
+  RescheduleCurrentHLEThread calls DummyThreadBeginWait. Leaving the fixture
+  waiting without a signaler caused a suite-order-dependent indefinite wait.
+- Header and implementation re-read after edit; production method bodies,
+  ownership, constants and scheduling order remain unchanged by this slice.
+
+### Unintentional differences (to fix)
+- None introduced by this test-lifecycle change. Broader kernel test global-state
+  contamination remains under investigation; this is not a full parity audit.
+
+### Missing items
+- Full core validation remains outstanding; focused lifecycle regression running
+  in nx2-scheduler-wait-lifecycle.log.
+
+### Binary layout verification
+- N/A: test fixture lifecycle only; no serialized data or layout changes.
+
+## 2026-11-07 — src/core/src/hle/kernel/{kernel,k_scheduler}.rs vs src/core/hle/kernel/{kernel,k_scheduler}.{h,cpp}
+
+### Intentional differences
+- Supersedes preceding lifecycle trial: restoring Runnable in the scheduler
+  fixture entered global scheduling and aborted. That trial was reverted.
+- Extend existing cfg(test) ScopedKernelForTest with an explicit absent-kernel
+  scope. Optional boxed ownership, thread-local null pointer, and existing Drop
+  restoration preserve nested scopes without modifying global KERNEL_PTR.
+- The standalone scheduler request-wait test uses this scope. Its original
+  assertion and method-under-test ordering remain intact. Production builds
+  contain none of this test harness code.
+- Re-read upstream headers/implementations: upstream kernel ownership is explicit
+  through Core::System/KernelCore references; Rust native unit-test isolation
+  has no C++ method counterpart. No production method or constant moved.
+
+### Unintentional differences (to fix)
+- No new production divergence. Combined condition-variable/scheduler run now
+  terminates: 12 passed, 1 failed. Remaining condition-variable visibility test
+  returns ResultNoSynchronizationObject (29185), rather than success.
+
+### Missing items
+- Broader core suite validation still pending. Added nested absent/present scope
+  assertions to existing kernel isolation regression.
+
+### Binary layout verification
+- N/A: cfg(test) owner only; no guest payload or production struct change.
+
+Validation follow-up (2026-11-07): nested kernel-scope regression passed. Full
+cargo test -p core -- --test-threads=1 (RUST_MIN_STACK=16777216) passed the
+previously hanging scheduler test but failed elsewhere and terminated with
+STATUS_ACCESS_VIOLATION in a thread wait-cancel test. That test passed in
+isolation. Full crate validation remains failed, not waived.
+
+## 2026-11-07 — src/core/src/hle/service/nx2_stub_interface.rs vs src/core/hle/service/nx2_stub_interface.h
+
+### Intentional differences
+- User explicitly authorized experimental upstream stubs after the blocked audit.
+- Header-only upstream interface maps to its own Rust file. Rust owns the name
+  String instead of InternName's process-lifetime mutex/deque C-string pool;
+  names remain valid for the interface lifetime, with no pointer identity users.
+- No SystemRef is retained by this stateless interface; existing Rust framework
+  obtains reporting/system context from HLERequestContext.
+- Prefix, empty handler tables, owner/command naming, warning and moved-interface
+  success response match upstream. Source re-read after implementation.
+
+### Unintentional differences (to fix)
+- None in this bounded helper port; its automatic-success semantics are
+  experimental upstream behavior, not evidence of actual service emulation.
+
+### Missing items
+- None for this header.
+
+### Binary layout verification
+- Explicit ResponseBuilder serialization: result only plus one interface object;
+  no raw Rust struct serialization. Empty-success regression checks zeroed tail.
+
+## 2026-11-07 — src/core/src/hle/service/am/service/graphics_scale_controller.rs vs src/core/hle/service/am/service/graphics_scale_controller.h
+
+### Intentional differences
+- Header-only upstream mapped to corresponding Rust module; IPC handler serializes
+  ResultSuccess and u32(10), matching upstream CMIF output. No unused SystemRef.
+- User-authorized experimental stub, warnings retained. Header re-read after port.
+
+### Unintentional differences (to fix)
+- None relative to upstream. Known upstream limitation: guest SDK reads 12 bytes
+  of GraphicsScalingParameters whereas this handler provides only one u32.
+  Remaining fields and real scaling state are NOT implemented or inferred.
+
+### Missing items
+- Functional graphics scaling and notification semantics absent in upstream;
+  unknown commands use the upstream nx2-prefix empty-success fallback.
+
+### Binary layout verification
+- Explicit u32 little-endian serialization; regression verifies SFCO, success,
+  value10, and deterministic zeroed command-buffer tail. This does not claim
+  the guest's complete12-byte payload is implemented.
+
+## 2026-11-07 — src/core/src/hle/service/service.rs vs src/core/hle/service/service.{h,cpp}
+
+### Intentional differences
+- Add upstream nx2-prefix selection to ReportUnimplementedFunction fallback.
+  Header/cpp re-read, existing report/error/warning/response ordering retained.
+
+### Unintentional differences (to fix)
+- None introduced in the prefix branch.
+
+### Missing items
+- Broader upstream environment/caller-IsSwitch2 auto-success paths are not part
+  of this slice. Caller selection requires KProcess::IsSwitch2 propagation,
+  which remains a separate prerequisite; ordinary service behavior unchanged.
+
+### Binary layout verification
+- Result-only ResponseBuilder response; covered by nx2 interface regression.
+
+## 2026-11-07 — src/core/src/hle/service/am/service/application_proxy.rs vs src/core/hle/service/am/service/application_proxy.{h,cpp}
+
+### Intentional differences
+- Arc interfaces replace shared_ptr; stateless graphics controller has no unused
+  SystemRef. Existing Rust ResponseBuilder provides the CMIF out-interface.
+- Commands40/50/70/80/90 return named experimental interfaces;60 creates graphics
+  scale controller, matching upstream ownership. Both sources re-read after edit.
+
+### Unintentional differences (to fix)
+- None in the added getters.
+
+### Missing items
+- Underlying generic NX2 interfaces are stubs exactly as upstream, under the
+  user's explicit exception; this does not establish graphics functionality.
+
+### Binary layout verification
+- Existing result plus one moved interface serialization; no new raw payload.
+Validation NX2 stubs: nine focused nx2_ tests passed. Full core suite rerun failed with the same previously observed STATUS_ACCESS_VIOLATION in wait_cancel_pushes_runnable_thread_through_state_change_handler; no full-crate success claimed.
+
+## 2026-11-07 — src/core/src/hle/kernel/svc/svc_thread.rs vs src/core/hle/kernel/svc/svc_thread.cpp and svc.h
+
+### Intentional differences
+- None in this NX2 core-selection slice: IsValidVirtualCoreId now uses NUM_CPU_CORES
+  rather than literal4; FoldExtraCoreId and FoldExtraCoreMask retain upstream
+  file ownership, exact arithmetic, bounds and signed sentinel behavior.
+- CreateThread folds after resolving process-default core and before validating.
+  SetThreadCoreMask validates original affinity against process capabilities,
+  then folds in its non-default branch exactly as upstream; default branch kept.
+- Header declarations and both C++ affected method bodies re-read after edit.
+
+### Unintentional differences (to fix)
+- None found in the changed core-selection logic. No claim of whole-file parity.
+
+### Missing items
+- Full core suite still has previously documented failures; focused SVC suite
+  running in nx2-svc-thread-tests.log. Runtime must verify progress beyond abort.
+
+### Binary layout verification
+- PASS: integer-only transformation; no struct changes. Tests cover cores0..11,
+  boundary12, signed sentinels/extremes, overlapping affinity bits, all bits,
+  zero and high discarded bits, matching upstream six-core folding formula.
+
+## 2026-11-07 — src/core/src/hle/service/am/service/application_functions.rs vs src/core/hle/service/am/service/application_functions.{h,cpp}
+
+### Intentional differences
+- Explicit ResponseBuilder handlers replace CMIF Result-return serialization.
+  Commands320/321 remain separately owned methods matching Unknown320/Unknown321.
+- Experimental upstream stubs authorized by user: warning and empty success only;
+  no inferred arguments, notification state or real functionality claimed.
+- Header/cpp re-read after edit; registrations, names, zero arguments, and return
+  behavior compared. Regression exercises both registered callbacks.
+
+### Unintentional differences (to fix)
+- None in the two added commands.
+
+### Missing items
+- Actual semantics remain unknown upstream. Whole-module completion not claimed.
+
+### Binary layout verification
+- Explicit result-only IPC response; regression checks SFCO and zeroed result/tail.
+
+SVC core-selection validation follow-up:5 focused tests passed,3 existing ignored.
+Full core suite reproduced known wait_cancel access violation. Release compiled;
+ROM now reaches IApplicationFunctions command320, beyond prior CreateThread abort.
+ApplicationFunctions validation:21 focused tests passed. Full core rerun reproduced the pre-existing wait_cancel access violation (nx2-core-application-init-full.log); full validation remains failed.
+
+## 2026-11-07 — src/core/src/hle/kernel/k_process.rs vs src/core/hle/kernel/k_process.{h,cpp}
+
+### Intentional differences
+- bool replaces upstream bitfield in host-only process state, following adjacent
+  Rust flags. New is_switch2 accessor and LoadFromMetadata assignment remain in
+  matching owner. Default false; flag set only after successful initialization
+  when metadata.IsSwitch2 is true, matching upstream monotonic assignment.
+- NX2 max_process_memory includes heap+alias, exactly as the adjacent upstream
+  branch; resource-limit bounding remains in existing memory accounting.
+- Header/cpp re-read after implementation; no changes to initialization ordering.
+
+### Unintentional differences (to fix)
+- None introduced in this slice. Existing fixed physical-memory pool sizes in
+  LoadFromMetadata differ from upstream MemoryManager().GetSize(pool); separate
+  broader memory-model prerequisite remains and is not hidden by this ceiling.
+
+### Missing items
+- NX2 physical pool capacity/model port remains separate; no RAM-size claim.
+
+### Binary layout verification
+- N/A: KProcess is host-owned and never copied as a guest payload. Regression
+  loads alternate-layout NPDM and checks process identity and heap+alias ceiling.
+
+## 2026-11-07 — src/core/src/hle/service/service.rs vs src/core/hle/service/service.{h,cpp}
+
+### Intentional differences
+- OnceLock<bool> mirrors the function-static getenv presence check. Environment
+  name EDEN_NX2_AUTO_STUB retained for upstream parity (even empty enables it).
+- Request thread's Weak process ownership is upgraded instead of reading raw
+  GetOwnerProcess pointer; thread lock released before acquiring process lock.
+- Caller IsSwitch2 branch now follows the prerequisite KProcess identity port.
+  Reporter, unimplemented diagnostic, warning, and result-only response ordering
+  retained. Header/cpp re-read after edit. Existing prefix/config branches kept.
+
+### Unintentional differences (to fix)
+- None in fallback-selection behavior. This intentionally implements the user's
+  authorized experimental upstream auto-success, not unknown service semantics.
+
+### Missing items
+- Actual unknown command implementations remain absent upstream; fallback logs
+  each one. Special vdec diagnostic length and optional IPC tracing not ported.
+
+### Binary layout verification
+- Result-only ResponseBuilder output; regression exercises ordinary service with
+  NX2 caller and checks SFCO plus zeroed success payload/tail.
+Validation caller-based fallback:14 focused NX2 tests passed. Full core suite44763 again failed at known wait_cancel access violation; no full-suite pass claimed.
+
+## 2026-11-07 — src/core/src/hle/kernel/k_process.rs vs src/core/hle/kernel/k_process.{h,cpp}
+
+### Intentional differences
+- Existing Rust kernel accessor supplies the initialized kernel reference rather
+  than a C++ argument; missing kernel is an invariant violation, not a fabricated
+  pool size. Physical-memory limit now uses MemoryManager.GetSize(selected pool).
+- Re-read upstream LoadFromMetadata and header after edit; pool selection and
+  resource-limit construction ordering unchanged. Regression checks the actual
+  fixture pool capacity, which differs from the former hardcoded3.2GiB.
+
+### Unintentional differences (to fix)
+- None in this replacement of the fixed resource limit.
+
+### Missing items
+- Runtime confirmation of the allocation failure hypothesis remains outstanding.
+
+### Binary layout verification
+- N/A: size used as i64 resource limit, matching existing resource-limit API.
+
+## 2026-11-07 — src/core/src/hle/kernel/board/k_system_control.rs vs src/core/hle/kernel/board/nintendo/nx/k_system_control.{h,cpp}
+
+### Intentional differences
+- Existing board path adaptation retained. Nx2GraphicsServerMemorySize is a
+  module-owned usize constant matching upstream header ownership and value8GiB.
+- Mode12GB intended DRAM is12+8GiB, preserving application pool9809MiB and
+  upstream placement of extra memory in non-secure system pool. Header/cpp
+  re-read after edit. Other modes unchanged.
+
+### Unintentional differences (to fix)
+- None in added NX2 DRAM reservation.
+
+### Missing items
+- NX2 graphics-server consumers still unported; this provides their backing.
+
+### Binary layout verification
+- N/A: constants and host allocation sizing only.
+
+## 2026-11-07 — src/core/src/device_memory.rs vs src/core/device_memory.{h,cpp}
+
+### Intentional differences
+- Test expectation for configured12GB mode now20GiB, matching upstream
+  GetIntendedMemorySize. Production constructor already delegates to that
+  function and is unchanged. Header/cpp read again; boundary-byte test retained.
+
+### Unintentional differences (to fix)
+- None in test expectation adjustment.
+
+### Missing items
+- Validation pending in nx2 memory test logs.
+
+### Binary layout verification
+- Test touches first/last backing bytes to validate actual accessible extent.
+Memory validation: two metadata-load tests, two backing/NPDM tests and two kernel derived-layout tests passed. Full core rerun reproduced the known wait_cancel access violation. Runtime with isolated12GB config pending.
+
+## 2026-11-07 — src/core/src/hle/kernel/k_memory_layout.rs and svc/{svc_types,svc_physical_memory}.rs vs core/hle/kernel/k_memory_layout.{h,cpp}, svc.h and svc/svc_physical_memory.cpp (origin/eden-nx2)
+
+### Intentional differences
+- Preserve the existing Rust page-table reservation calculated for 12 GiB, explicitly independent of MainMemorySizeMax. Upstream calculates it from 8 GiB. This keeps the previously audited larger-layout reservation unchanged while restoring the guest SVC contract; supersedes the 2026-09-11 interpretation of MainMemorySizeMax.
+- Existing optional Rust memory-history diagnostics and standalone no-System entry point are outside this validation slice.
+
+### Unintentional differences (to fix)
+- Fixed: removed the unrelated 4 GiB duplicate from svc_types. SetHeapSize imports the 8 GiB exclusive bound from its upstream owner k_memory_layout, preserving alignment-before-bound validation.
+- Pre-existing current-process wrapper zeros output on validation failure; upstream only assigns on success. This will be reconciled separately with the dispatch output-register convention, not assumed equivalent.
+
+### Missing items
+- No missing item in the size-validation slice. The wider physical-memory module is not claimed fully audited.
+
+### Binary layout verification
+- PASS: no payload or layout change; size is u64 and the usize constant is explicitly cast to u64.
+- Source declarations and implementation reread after change. Regression covers zero, 2 MiB alignment, 4 GiB, the observed 0x1FE200000 request, last accepted aligned size, exclusive 8 GiB boundary, 12 GiB and overflow-scale values.
+- Follow-up verification in this same slice: reconciled output assignment too. Both dispatch paths initialize their local output to zero; the handler now leaves caller output untouched on validation/page-table failure and assigns only on success, matching upstream R_TRY. Added sentinel-output regression for misalignment and the exclusive bound. This resolves the pre-existing difference noted above.
+
+## 2026-11-07 — src/core/src/hle/kernel/svc/{svc_info,svc_types}.rs vs core/hle/kernel/svc/svc_info.cpp, svc.h and svc_types.h (origin/eden-nx2)
+
+### Intentional differences
+- The existing Rust enum module remains nested in svc. Experimental upstream remote-memory stubs are explicitly authorized: both queries return zero and warn; neither implements remote-memory backing.
+
+### Unintentional differences (to fix)
+- Fixed: IDs31/32 previously decoded as CoreMask. They now retain Nx2RemoteMemorySize/Nx2RemoteMemoryUsed identity and execute upstream zero-valued responses after the common sub-id/process-handle validation.
+
+### Missing items
+- Graphics-system raw-session and remote-memory implementation remain separate missing prerequisites; no claim that these two stubs provide them.
+
+### Binary layout verification
+- PASS: explicit enum discriminants31/32; u64 output zero. Regression covers successful output and output preservation on invalid sub-id/handle. Header and implementation reread after edits.
+- Validation for the November7 heap/remote-info slices: heap validation/output tests2pass; reservation test1pass; svc_info group7pass/1fail (tick-count query returns InvalidHandle116). Full core reproduces STATUS_ACCESS_VIOLATION at wait_cancel_pushes_runnable_thread_through_state_change_handler. Release heap build succeeds; ROM now successfully allocates0x1FE200000 and opens RomFS, then aborts on missing graphics-session handle. Remote-info changes are tested but not yet rebuilt into release.
+
+## 2026-11-07 — src/video_core/src/nx2.rs vs src/video_core/nx2.h (origin/eden-nx2)
+
+### Intentional differences
+- Header-only source maps to one Rust module. Waiter owner is an opaque usize pointer identity: upstream only compares const void* and never dereferences it. The mutex encloses the vector; atomic count remains separate with identical release/acquire ordering.
+- OnceLock implements the function-local singleton. Atomic region operations retain C++ default sequential consistency; mirror reads remain relaxed. Unsigned address arithmetic explicitly wraps like C++ u64.
+
+### Unintentional differences (to fix)
+- None found in this module after rereading the complete upstream header and comparing all functions, fields, constants and ordering.
+
+### Missing items
+- None within the header. GPU puller/memory-manager integration and the dependent GSV service are separate unported slices; this module alone cannot display a frame.
+
+### Binary layout verification
+- Not a guest payload. Fixed 32-entry atomic u64 table; matching u32 operation/value and u64 address widths. Tests cover duplicate insertion, capacity, region boundaries, removal, unsigned wrapping, write latching, owner replacement and all acquire comparisons including unsigned GE.
+
+## 2026-11-07 — src/core/src/hle/service/nvdrv/devices/nx2_stub_device.rs vs core/hle/service/nvdrv/devices/nx2_stub_device.h (origin/eden-nx2)
+
+### Intentional differences
+- Header-only source stays in one corresponding module. Mutex-protected RegistryState mechanically groups mappings/listeners to express the existing shared lock; TrimMappings takes this locked state without changing ownership or call ordering. Device ranges retain a separate lock.
+- BTreeMap preserves ordered map lookup/iteration. Owner identities use usize instead of non-dereferenced const void*. Box<dyn Fn + Send> supplies the stored callbacks; OnceLock supplies the singleton.
+- Nx2StubDevice does not retain an unused System reference: the existing Rust NvDevice trait has no System-owning base. Name and per-device methods remain in this module. Authorized upstream ioctl stubs echo bounded input, zero trailing/inline output, and log warnings.
+
+### Unintentional differences (to fix)
+- None found in the complete header comparison after implementation. Unsigned range additions/subtractions explicitly wrap. Replay-before-listener-replacement, callback-under-lock ordering and release-before-notify are retained.
+
+### Missing items
+- None in this header. Nvdrv device registration, nvhost-as-gpu listener wiring, and GSV service consumption remain separate unported dependencies; the helpers are not yet on the game's execution path.
+
+### Binary layout verification
+- No guest struct serialization added. Ioctl output bytes are deterministic; CPU/GPU addresses and lengths remain u64. Tests cover mapping splits/replay offsets, bounded device lookup, separate-lock callbacks, release ordering and ioctl echo/zero behavior.
+- Focused validation: nx2 semaphore tests2pass; nx2 GPU registry/ioctl tests3pass. Full core again exits STATUS_ACCESS_VIOLATION at the previously identified wait_cancel thread test; full video_core still running at this checkpoint.
+- Full video_core validation completed successfully: 1606 passed, 1 ignored, zero failures; doc-tests pass. Full core remains failing as recorded above. No rendering/performance claim follows from these prerequisite tests.
+
+## 2026-11-07 — src/video_core/src/host1x/ffmpeg/{ffmpeg.rs,ffmpeg_shim.c} vs video_core/host1x/ffmpeg.{h,cpp}
+
+### Intentional differences
+- Existing opaque C ABI requires mechanical accessors for AVFrame pts/best_effort_timestamp/colorspace/color_range, AVCodec and AVCodecContext. They expose the same native fields/objects upstream obtains through GetFrame/GetCodec/GetCodecContext. No NX2 policy moved into the FFmpeg module.
+- Packet::set_pts exposes GetPacket()->pts without changing DTS. get_codec invokes the same decoder lookup already used at context construction, since the existing Rust Decoder stores codec identity rather than the native AVCodec pointer.
+
+### Unintentional differences (to fix)
+- None introduced in this prerequisite slice; header and relevant implementation reread after edits.
+
+### Missing items
+- NX2 decoder lifecycle, timestamp selection and rendering remain in the pending nx2_video_decoder module, not implemented in these accessors.
+
+### Binary layout verification
+- Opaque native structs stay opaque. Timestamps cross ABI as i64 preserving AV_NOPTS_VALUE and signed bit patterns; metadata as C int. Regression exercises real native decoder drain/flush/re-drain, fresh-frame timestamp sentinels and unchanged DTS.
+
+## 2026-11-07 — src/video_core/src/host1x/nx2_video_decoder.rs and video_core/build.rs vs video_core/host1x/nx2_video_decoder.{h,cpp}
+
+### Intentional differences
+- BTreeMap timestamp multiplicities plus a size counter implement upstream's ordered multiset, including erase-one semantics and the 64-submission bound. ErasePts is a mechanical local adaptation of multiset.erase(iterator). Shared frame ownership remains Arc; Impl stays separately boxed. Drop frees scaler, then context, then hardware in upstream order.
+- Opaque FFmpeg accessors replace native field access; native codec/scaler operations remain here. Pixel formats are resolved by FFmpeg names instead of duplicating version-dependent AVPixelFormat numeric enum values. Numeric constants for padding, colorspace and scaler flags verified against installed FFmpeg headers.
+- Render additionally rejects invalid stride/plane extents and dimensions that cannot fit the native signed-int interface, preventing out-of-bounds writes from a safe Rust slice API. Valid upstream geometry is unchanged; malformed geometry is the explicit safety divergence.
+- Cargo now probes/tracks libswscale, mirroring upstream's direct swscale calls. Installed native package reports9.5.102. No FFmpeg package install required. Other target toolchains not exercised this pass.
+
+### Unintentional differences (to fix)
+- None found in line-by-line header/implementation reread for this module. Constructor MIME order, optional hardware init, padded packet contents, signed timestamp casts, timestamp fallback, pending bound, drain-before-reset and conversion colorspace order are preserved.
+
+### Missing items
+- None in this decoder counterpart. GSV video-session integration and the core/video trait bridge are still absent; this module is not yet exercised by Mario Kart World.
+
+### Binary layout verification
+- PictureFormat explicitly repr(u32), discriminants0/1/2. Nx2Picture is host-only and not raw serialized. FFmpeg pointers stay opaque; timestamp input is bit-preserving u64-to-i64 and return i64-to-u64.
+- Native bridge regression passes. Actual generated56-byte VP8 fixture decodes16x16 red, preserves u64::MAX/AV_NOPTS timestamps, converts NV12/RGBA/BGRA, and decodes again after drain/reset. Additional regressions cover scaling, rejected output extents, MIME order, duplicate timestamps and pending retention after failed packets.
+- Native dependency setup follows the new Cargo probe: Debian/Ubuntu and Steam Deck package lists add libswscale-dev; existing versioned openSUSE FFmpeg8 list adds ffmpeg-8-libswscale-devel (package artifact confirmed in https://ftp.fau.de/packman/suse/openSUSE_Tumbleweed/Essentials/x86_64/). Windows preflight checks libswscale; local vcpkg ffmpeg manifest already includes swscale as a default feature. These setup scripts were not used to install/change host packages.
+- Full video_core validation completed:1610passed,1ignored,0failures; doc-tests pass. Dependency script syntax parsed successfully; git diff --check passes. No game runtime result is claimed for this decoder-only slice.
+
+## 2026-11-07 — src/core/src/hle/service/ipc_helpers.rs vs core/hle/service/ipc_helpers.h (origin/eden-nx2)
+
+### Intentional differences
+- Rust CommandType groups all raw values>=16 into TipcCommandRegion. Reconstruct the original raw type from GetTipcCommand plus the region base for serialization; upstream enum retains the raw value directly.
+
+### Unintentional differences (to fix)
+- Fixed ResponseBuilder's loss of the original TIPC command number. Header-only source reread after change; no other response layout changed.
+
+### Missing items
+- None in this header-field correction; wider IPC implementation not claimed fully audited.
+
+### Binary layout verification
+- Command header's low16 bits now retain exact original command type. Regression covers command0,1,202 and highest16-bit raw type, along with one-word result/data layout and response length.
+
+## 2026-11-07 — src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (raw helpers and INx2NvsrvSession)
+
+### Intentional differences
+- Raw sessions use the existing deferred object-ID/queued ServerManager registration bridge. Child manager construction precedes the existing session helper because that helper requires a manager; reservation still precedes creation and registration precedes response. Registered KSession is marked resource-committed so finalization releases the reservation.
+- Request owner replaces upstream current process/System argument. No guest handle is preallocated. Domain requests still receive a copied client endpoint, never a domain object.
+- Span/initializer-list TipcReplyWords overloads share one Rust slice function. Result remains one u32. Empty nvsrv handlers match explicitly authorized upstream experimental placeholder.
+
+### Unintentional differences (to fix)
+- None in this slice after source reread. The separate pre-existing TIPC header-number loss was fixed first in ipc_helpers.rs.
+
+### Missing items
+- Syncpt/GPU/VI/video/main GSV classes and native image/memory layouts remain unported; SelfController2000 is not connected yet.
+
+### Binary layout verification
+- PASS: response command/length and contiguous result/data words tested. Domain raw-session regression checks copy-object identity, no move/domain conversion, server registration, reservation and release. Both tests pass.
+
+## 2026-11-07 — core/src/host1x_core.rs and video_core/src/host1x/host1x.rs vs video_core/host1x/syncpoint_manager.{h,cpp}
+
+### Intentional differences
+- Two required trait methods bridge GetGuestSyncpointValue and DeregisterGuestAction across the existing core/video crate boundary. Forwarding stays in Host1x; counter/action behavior remains owned by SyncpointManager. Existing opaque action ID conversion is retained.
+- memory.rs test-only FakeHost1xCore explicitly rejects these unsupported fixture operations; no production default stub added.
+
+### Unintentional differences (to fix)
+- None in forwarding; source header/implementation reread after edits.
+
+### Missing items
+- INx2SyncptSession consumer remains pending bridge test completion.
+
+### Binary layout verification
+- No serialized layout changes. Values remain u32, opaque action tokens u64. Regression distinguishes guest from host counters and checks exact callback cancellation.
+
+## 2026-11-07 — src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (INx2SyncptSession)
+
+### Intentional differences
+- Service state uses a mutex for Rust shared handlers. Pending flags are Arc<AtomicBool> so callbacks retain stable field lifetime instead of capturing a C++ map-node reference. SharedState's lock/alive pair is Arc<Mutex<bool>>; callback signalling remains under that same lock, and destruction marks dead before cancel/close.
+- Existing ServiceContext/Event wrappers retain event ownership and translate readable objects on response. SystemRef and Host1xCoreInterface bridge the existing crate boundary; no syncpoint behavior moved out of SyncpointManager.
+- Optional action token represents upstream's null/default ActionHandle when registration completes inline. Cancel skips native deregistration only for that absent token.
+
+### Unintentional differences (to fix)
+- None found after rereading the entire upstream class. Range checks, bitwise-complement counter IDs, zero-extension, event creation, cancel-before-clear-before-register, pending atomic order, signal-on-cancel even without pending request and destructor order match upstream.
+
+### Missing items
+- GPU, VI, video, main GSV session and native object/layout classes remain unported. Existing upstream uses the low32 bits of requested value even for mode1; retained literally rather than claiming full64-bit synchronization.
+
+### Binary layout verification
+- TIPC handshake returns two token words after one result; query returns low/high/zero. HostSyncpoints=192 stays class-owned. Core focused tests pass3 including handshake, invalid counter, cancellation before first request and destructor-alive transition. Real Host1x slot reuse integration is running.
+- Real Host1x integration now passes: request fixture uses a stable boxed System and initializes/shuts down its kernel so copied readable events have their required native owner. Test verifies guest-only progress, query values, cancel-before-reuse, no stale completion, and service destruction deregistration. Earlier fixture without a kernel aborted while creating the event; fixed fixture, not bypassed behavior.
+- Full core again terminates at known wait_cancel thread-test access violation. Full video_core running after successful integration.
+- Full video_core92052 completed:1612passed,1ignored,0failures; doc-tests pass, including real syncpt lifecycle integration in suite order. Full core retains the recorded wait_cancel crash. No new ROM/rendering result this slice.
+
+## 2026-11-07 ? src/video_core/src/gpu_thread.rs vs video_core/gpu_thread.h/cpp (origin/eden-nx2)
+
+### Intentional differences
+- RunCommand stores a Send boxed FnOnce instead of std::function<void()>: the queued callback is moved and invoked once on the worker. Existing Rust queue/fence ownership is retained.
+- Existing macOS per-command autorelease pool also encloses callback execution.
+### Unintentional differences (to fix)
+- Whole-thread NX2 parity remains incomplete: optional GpuSplit execution and pending-channel polling are separate structural dependencies, recorded in NX2_PORT_STATE.md. This slice implements the ordinary single-worker Run path only.
+### Missing items
+- Split backend DeferFunction branch and NX2 pending-channel polling, outside this slice.
+### Binary layout verification
+- N/A: internal host command variant, no guest serialization.
+- Re-read upstream header and implementation after change: Run pushes with block=false and is_async; worker executes callback before completing the queue fence. Focused FIFO/synchronous-wait regression passed.
+
+## 2026-11-07 ? src/video_core/src/gpu.rs and src/core/src/gpu_core.rs vs video_core/gpu.h/cpp and video_core/nx2.h (origin/eden-nx2)
+
+### Intentional differences
+- GPU::RunInOrder forwards through the existing Rust GPU ThreadManager mutex; core uses a required object-safe bridge to avoid the core/video_core crate dependency cycle.
+- Required NX2 semaphore bridge methods forward directly to the functions owned by nx2.rs; constants, atomics and registration/removal behavior remain there.
+- Three existing core FakeGpuCore test fixtures explicitly panic if these unrelated operations are unexpectedly invoked. Production interface has no success stub or default implementation.
+### Unintentional differences (to fix)
+- None in these forwarding methods; underlying unported split backend remains identified above.
+### Missing items
+- GSV GPU session consumers remain unported; this does not connect SelfController command 2000.
+### Binary layout verification
+- N/A: host-only callbacks and u64 address forwarding. Upstream gpu.h/cpp and header-only nx2.h reread and forwarding compared after implementation.
+
+## 2026-11-07 ? src/core/src/hle/kernel/k_page_table_base.rs vs core/hle/kernel/k_page_table_base.h/cpp (origin/eden-nx2)
+
+### Intentional differences
+- Existing Rust tuple result exposes CheckMemoryState's block allocation count; MapPageGroup and UnmapPageGroup now use check_memory_state_range with the default ignored attributes, matching the upstream overload.
+### Unintentional differences (to fix)
+- Fixed: both methods previously checked individual masked blocks without requiring full permission/state/attribute uniformity across the range.
+- Fixed: MapPageGroup previously rejected nonzero attributes in Free blocks; upstream uses an empty attribute mask. UnmapPageGroup retains its all-attributes mask.
+- No further differences identified in these two method bodies other than existing Rust lock/result representation and absent upstream lock-ownership assertions. This is not a whole-file parity assertion.
+### Missing items
+- None in this validation correction; GSV GPU region ownership/lifecycle still awaits implementation.
+### Binary layout verification
+- N/A: no serialized layout changes. Header and both C++ method bodies reread after correction; containment, lock, validation, allocation, mapping/unmapping and block-update ordering compared.
+- Added regression using allocated physical pages: reject mixed permissions before map/unmap; accept uniform Free attributes with empty mask; map and unmap real IoMemory backing, then close page references.
+
+Validation for these slices: full video_core1613 passed/1 ignored before the
+page-table correction; focused physical page-group regression passed afterward.
+Full core after correction still aborts at the pre-existing wait_cancel thread
+test with STATUS_ACCESS_VIOLATION (nx2-core-page-group-full.log).
+
+## 2026-11-07 ? src/core/src/hle/kernel/kernel.rs vs core/hle/kernel/kernel.h/cpp (origin/eden-nx2)
+
+### Intentional differences
+- application_process is a mutex-protected Option<Arc<ProcessLock>>, matching this port's existing process ownership instead of intrusive Open/Close. Setter recognizes identical identity, installs incoming ownership, releases the mutex, then drops the previous owner. Getter returns a safe owning snapshot.
+- Shutdown clears the owner after the existing Rust service-finalization step, before resetting object/process IDs, corresponding to upstream CloseServices then application-process Close.
+### Unintentional differences (to fix)
+- None in the new setter/getter and shutdown release; process destruction remains managed by the existing Rust Arc/process teardown machinery.
+### Missing items
+- WindowSystem's NX2 application-switch caller is not yet ported; this is separately recorded as a dependency, not claimed complete by these accessors.
+### Binary layout verification
+- N/A: host-owned process reference. Header and implementation reread after change. Regression passed: identical assignment does not accumulate references, process registration does not replace application selection, replacing selection releases prior ownership, shutdown releases final ownership.
+
+## 2026-11-07 ? src/core/src/core.rs vs core/core.h/cpp (origin/eden-nx2)
+
+### Intentional differences
+- System::application_process forwards the kernel's owning Arc snapshot rather than a raw KProcess pointer.
+- Load creates the stable Arc/ProcessLock earlier, binds self-reference and selects the application process before SetupForApplicationProcess. Later launch code reuses that same owner; filesystem registration and launch metadata inspect it under the process lock.
+- The Rust legacy unwrapped process slot remains for the existing alternate/test boot path; it is no longer needed by the regular loader after process creation.
+### Unintentional differences (to fix)
+- The separate legacy run_main_loop path and WindowSystem switching are not yet wired to this new kernel selection. Record as prerequisites before using the accessor for every application lifecycle.
+### Missing items
+- WindowSystem UpdateCurrentApplicationLocked and application-change notification path are a larger existing lifecycle gap; pending inspection/port before claiming complete process-selection parity.
+### Binary layout verification
+- N/A: no guest layout change. Reread core.h/cpp ApplicationProcess and Load publication ordering after implementation; standard launch now publishes kernel selection before service creation. Full core validation pending in nx2-core-application-process-full.log.
+
+Validation: full core60903 reproduces the pre-existing wait_cancel
+STATUS_ACCESS_VIOLATION; focused application-owner test12505 passed.
+
+## 2026-11-07 ? src/core/src/core.rs vs core/core.h/cpp (application-change callback)
+### Intentional differences
+- Box<dyn Fn(u64) + Send + Sync> replaces std::function<void(u64)> in the same System owner; registration replaces the callback and notification invokes it only when present.
+### Unintentional differences (to fix)
+- None in these methods. Compared against header and cpp declaration/registration/notification bodies; no extra settings or runtime-state mutation added.
+### Missing items
+- Frontend registration is optional upstream; WindowSystem caller is the next slice.
+### Binary layout verification
+- N/A: host callback only. WindowSystem regression will cover payload, replacement and lock-free notification delivery.
+
+## 2026-11-07 ? src/core/src/hle/service/am/window_system.rs vs core/hle/service/am/window_system.h/cpp (origin/eden-nx2)
+### Intentional differences
+- Existing Rust roots store process IDs instead of pointers; UpdateCurrentApplicationLocked accepts the pending tracked applet to resolve its root before insertion. Existing roots resolve through the map. State and helper ownership stay in WindowSystem.
+- Existing optional event observer remains; null-system processless fixtures do not reach kernel selection. Production process selection requires the kernel.
+### Unintentional differences (to fix)
+- None identified in this slice after rereading header/cpp: application precedes home menu; no candidate/no process/identical process return without notification; selection precedes settings and pending ID; TrackApplet selects before observer registration/insertion; prune selects before finalization; Update notifies even when home-menu locking skips state updates.
+### Missing items
+- No missing methods in application-change selection/notification slice. This is not a claim of full WindowSystem parity.
+### Binary layout verification
+- N/A: host references and optional notification ID. Notification takes the pending ID under lock then invokes frontend outside it; repeated calls do not redeliver.
+
+## 2026-11-07 ? src/core/src/core.rs vs core/core.h/cpp (application memory and legacy launch)
+### Intentional differences
+- memory_shared returns the selected application's shared memory when a kernel application exists; legacy bootstrap/test fallback remains only before application publication. Existing Rust Option<Arc<SharedMemory>> represents upstream's memory reference.
+- Legacy run_main_loop now explicitly selects its wrapped application owner before wiring current-process SVC state. Generic current-process setter does not alter application selection.
+### Unintentional differences (to fix)
+- None in these added selections; no broader legacy-loop parity claim.
+### Missing items
+- GSV GPU session still pending; these complete its application-owner accessor prerequisites.
+### Binary layout verification
+- N/A: host references. Reread core.h/cpp ApplicationMemory and application publication points after edits.
+
+Final validation: WindowSystem focused suite passed7 after final lookup ordering
+correction; full core reproduces known wait_cancel access violation0xc0000005.
+Logs: nx2-window-final-tests.log, nx2-core-window-full.log.
+
+## 2026-11-07 ? src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (INx2GpuSession, origin/eden-nx2)
+
+### Intentional differences
+- Header-only upstream (git tree confirms no nx2_gsv.cpp). Class helpers, 15 TIPC methods, NumIds, VA constants and allocation alignment remain in nx2_gsv.rs; mutable member state is protected by the service's Mutex.
+- Arc::new_cyclic/Weak replaces shared_from_this for command22 so the raw sub-session serves the same object. Ordered callback captures Arc<Event> instead of dangling-capable raw this/event pointers; events still close through ServiceContext at destruction.
+- Existing core/video bridge forwards RunInOrder and video-owned semaphore add/remove. KPageGroup obtains the system resource block-info manager; allocation uses SystemNonSecure/FromBack and does not clear pages. Existing global kernel accessor bridges KPageGroup's kernel ownership.
+- BTreeMap/Vec/Option replace map/vector/pointers. Explicit wrapping arithmetic preserves unsigned inclusive ranges, offsets and handle increment. Reduced repetitive diagnostic logging does not alter reply data or side effects.
+### Unintentional differences (to fix)
+- None identified in the class slice after rereading all declarations/handlers/helper bodies. Registry unmap/release precedes queued completion; deferred page cleanup uses Acquire/Release, unmaps before Close, and retains page refs on unmap failure as upstream.
+### Missing items
+- GSV native objects/image layout, VI/video/graphics sessions and SelfController2000 hookup remain missing. This class is not yet reachable by the title. Registry listeners in nvhost_as_gpu are also a remaining integration dependency.
+### Binary layout verification
+- No raw host structs serialized. TIPC response words use the existing reply builder; event/sub-session use copied object identities. Local constants and u64 low/high word order compared. Tests cover VA range words, memory-handle reply position, slot modulo32 and unsigned inverted-range storage.
+- Regression fixture queues GPU callbacks to distinguish immediate mapping jobs from deferred unmap/destroy events. Separate physical pool test exercises actual AllocateAndOpen/MapPageGroup/UnmapPageGroup and release only after GPU completion. Validation results pending in nx2-gsv-gpu-test.log.
+
+Initial GSV focused suite passed5, including real physical page lifecycle.
+Extended raw-session regression checks same GPU service identity and shared slot
+event through the child handler; final run pending.
+
+Final validation: five focused GSV tests passed (nx2-gsv-gpu-final-test.log).
+Full core repeats pre-existing wait_cancel STATUS_ACCESS_VIOLATION0xc0000005
+(nx2-core-gsv-gpu-full.log); no full-core pass claimed.
+
+## 2026-11-07 ? core/host1x_core.rs and video_core/host1x/{host1x,nx2_video_decoder}.rs (under src/*/src) vs video_core/host1x/nx2_video_decoder.h/cpp
+### Intentional differences
+- Opaque Nx2VideoDecoderHandle and frame Arc<dyn Any + Send + Sync> bridge the core/video_core crate boundary. Actual decoder, frame allocation and format enum remain owned by nx2_video_decoder.rs. Required Host1x factory constructs the real decoder; the memory-test fake explicitly rejects this unrelated operation.
+- Host1x factory is Rust dependency-cycle glue, not an upstream Host1x method. Decoder handle is not Send: it is created and used on the decode worker, matching upstream single-thread usage. Pictures retain shared native frame ownership across service queues.
+- Decode/Drain use a temporary native picture vector, then append converted metadata/Arc owners to the caller's vector. Render explicitly maps all three bridge format variants and downcasts the native frame without pixel copying.
+### Unintentional differences (to fix)
+- None identified in bridge forwarding after rereading upstream decoder header and method bodies. No codec implementation or conversion moved into core.
+### Missing items
+- GSV video-session caller is pending; bridge alone does not start title video playback.
+### Binary layout verification
+- Host-only bridge objects, never raw-serialized. Format discriminants mirror Nv12=0/Rgba8=1/Bgra8=2; forwarding uses exhaustive variant mapping. Focused test uses actual VP8 decode/render and checks timestamp bits, Arc identity, channel order, NV12, append and reset/drain.
+
+## 2026-11-07 ? src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (native objects/image layouts)
+### Intentional differences
+- Nested Memory/Image structs use Nx2NativeMemory/Nx2NativeImage names in the same Rust file; BTreeMap preserves ordered map behavior. Arc<Mutex<Nx2NativeObjects>> callers hold the one upstream mutex around maps and counters. Defaults preserve zero-valued metadata and handles starting at1.
+- Layout functions take &[u32;16] instead of an unchecked pointer. Native decoder format is passed through the explicit core/video bridge; no codec or pixel conversion logic moves here.
+### Unintentional differences (to fix)
+- None identified after rereading the header-only definitions and both layout functions: dimensions unpack as16-bit fields plus1; valid GOB pitch range and block-height limit match; invalid preferences fall back to4bpp/128rows; image alignment has4KiB minimum. NV12 codes1/4, BGRA2/5, remaining codes RGBA, half-height chroma rounded up and each plane padded to128rows.
+### Missing items
+- VI/video/graphics session consumers still pending. These helpers do not yet display title frames.
+### Binary layout verification
+- These are host bookkeeping structs, not raw guest payloads. Metadata field ordering remains traceable; guest preference array stays16 u32. All size/offset/pitch arithmetic usesu64, covering maximum65536x65536 images without truncation. Actual descriptors are serialized by later GSV consumers.
+- Regression checks fixed expected pitches/sizes/alignments, all codec format pairs, HDR/default codes, odd dimensions, maximum dimensions and zero/default preferences.
+
+Validation: bridge focused test passed1; GSV focused suite passed7; full
+video_core passed1614/ignored1 plus doctests. Full core reproduces pre-existing
+wait_cancel access violation0xc0000005. Logs: nx2-decoder-bridge-test.log,
+nx2-image-layout-tests.log, nx2-video-decoder-bridge-full.log,
+nx2-core-image-layout-full.log.
+
+## 2026-11-07 ? src/video_core/src/textures/decoders.rs vs video_core/textures/decoders.h/cpp (native tiling)
+### Intentional differences
+- Rust explicitly passes the upstream default-false native_tiling argument; no overload/dispatcher helper added. NativeGobOffset and all implementation helpers stay in decoders.rs.
+- Existing whole-buffer safety validation now applies the native permutation to the maximum addressed texel before unsafe copies. Deposited X/Y coordinates remain individually monotonic after swapping bits5/6. Existing checked subrectangle slice behavior remains unchanged.
+### Unintentional differences (to fix)
+- None in CPU NativeGobOffset or forwarding after rereading header/cpp: bit permutation applies to final tiled offsets in full/subrect paths, for all BPP variants, in both directions.
+### Missing items
+- GPU compute/shader native tiling remains unported. Texture-cache util.rs native-mode propagation requires threading the upstream memory-manager state through existing callback-based Rust interfaces; recorded as interrupted integration slice in NX2_PORT_STATE.md.
+### Binary layout verification
+- PASS focused11 tests: fixed native byte coordinates/full GOB contents, both conversion directions, nonzero subrectangle origin, native bounds expansion and untouched legacy tests. Guest bytes differ only under native mode. Size calculations and GOB constants unchanged.
+
+## 2026-11-07 ? src/video_core/src/framebuffer_config.rs and src/core/src/gpu_core.rs vs video_core/framebuffer_config.h/cpp
+### Intentional differences
+- Core bridge mirrors new native_tiling bool; both host structs default it tofalse, matching upstream. Existing explicit struct initializers providefalse or copy from source.
+### Unintentional differences (to fix)
+- None in this added field; no claim of guest binary representation because these host structs are not serialized raw.
+### Missing items
+- GSV VI caller that sets true remains unported.
+### Binary layout verification
+- N/A host structs; field placed after blending before layer_stack_mask as upstream.
+
+## 2026-11-07 ? src/video_core/src/gpu.rs vs video_core/gpu.h/cpp (framebuffer bridge)
+### Intentional differences
+- Existing core/video boundary copies native_tiling along with other framebuffer fields. Upstream uses one framebuffer type directly.
+### Unintentional differences (to fix)
+- None in forwarding.
+### Missing items
+- None for this field.
+### Binary layout verification
+- N/A: typed host copy.
+
+## 2026-11-07 ? src/video_core/src/renderer_vulkan/present/layer.rs vs video_core/renderer_vulkan/present/layer.h/cpp
+### Intentional differences
+- Existing Rust buffer/slice bridge remains; native_tiling now forwarded in UpdateRawImage's UnswizzleTexture call.
+### Unintentional differences (to fix)
+- Fixed local confirmed divergence: stride_alignment argument was0, upstream passes1. Now1. Reread header and cpp UpdateRawImage after change; buffer flush remains after host writes.
+### Missing items
+- Texture-cache native decoding/shaders still pending separately; this is the raw framebuffer upload path only.
+### Binary layout verification
+- CPU buffer bytes handled by audited decoder tests; no Vulkan structure layout changes.
+
+## 2026-11-07 ? src/video_core/src/memory_manager.rs vs video_core/memory_manager.h/cpp
+### Intentional differences
+- Native flag owned by actual MemoryManager wrapper, not inner generic GpuMemoryManager; existing parking_lot mutex at engine owner synchronizes access. Both inline methods retain their upstream names/responsibilities.
+### Unintentional differences (to fix)
+- None in EnableNativeTiling/UsesNativeTiling; false initial state retained across constructors. Header and cpp constructors reread.
+### Missing items
+- nvhost address-space enablement and texture-cache propagation remain pending; no native address space is silently enabled by this slice.
+### Binary layout verification
+- N/A host state flag.
+
+## 2026-11-07 ? src/video_core/src/engines/maxwell_dma.rs vs video_core/engines/maxwell_dma.h/cpp
+### Intentional differences
+- Four subrectangle calls obtain native_tiling through existing Arc<Mutex<MemoryManager>> instead of upstream direct reference.
+### Unintentional differences (to fix)
+- None in these call arguments; all four audited against upstream UsesNativeTiling call sites.
+### Missing items
+- None in DMA propagation; native address-space activation remains upstream nvhost ownership work.
+### Binary layout verification
+- Existing block-linear-to-pitch regression now covers false andtrue using native guest bytes. Final validation pending after running executable releases Windows linker lock.
+
+## 2026-11-07 ? src/video_core/src/engines/engine_upload.rs vs engines/engine_upload.cpp (argument adaptation)
+### Intentional differences
+- Existing legacy calls explicitly supply the new default-false texture tiling argument (or default-false framebuffer field in null fixture). No algorithms moved.
+### Unintentional differences (to fix)
+- None in this mechanical signature adaptation; Rust-only backend/fixtures retain their existing behavior.
+### Missing items
+- No extra implementation in this mechanical adaptation.
+### Binary layout verification
+- N/A: explicit default preserves existing bytes.
+
+## 2026-11-07 ? src/video_core/src/engines/sw_blitter/blitter.rs vs engines/sw_blitter/blitter.cpp (argument adaptation)
+### Intentional differences
+- Existing legacy calls explicitly supply the new default-false texture tiling argument (or default-false framebuffer field in null fixture). No algorithms moved.
+### Unintentional differences (to fix)
+- None in this mechanical signature adaptation; Rust-only backend/fixtures retain their existing behavior.
+### Missing items
+- No extra implementation in this mechanical adaptation.
+### Binary layout verification
+- N/A: explicit default preserves existing bytes.
+
+## 2026-11-07 ? src/video_core/src/host1x/vic.rs vs host1x/vic.cpp (argument adaptation)
+### Intentional differences
+- Existing legacy calls explicitly supply the new default-false texture tiling argument (or default-false framebuffer field in null fixture). No algorithms moved.
+### Unintentional differences (to fix)
+- None in this mechanical signature adaptation; Rust-only backend/fixtures retain their existing behavior.
+### Missing items
+- No extra implementation in this mechanical adaptation.
+### Binary layout verification
+- N/A: explicit default preserves existing bytes.
+
+## 2026-11-07 ? src/video_core/src/renderer_opengl/present/layer.rs vs renderer_opengl/present/layer.cpp (argument adaptation)
+### Intentional differences
+- Existing legacy calls explicitly supply the new default-false texture tiling argument (or default-false framebuffer field in null fixture). No algorithms moved.
+### Unintentional differences (to fix)
+- None in this mechanical signature adaptation; Rust-only backend/fixtures retain their existing behavior.
+### Missing items
+- No extra implementation in this mechanical adaptation.
+### Binary layout verification
+- N/A: explicit default preserves existing bytes.
+
+## 2026-11-07 ? src/video_core/src/renderer_opengl/renderer_opengl.rs vs renderer_opengl/renderer_opengl.cpp (argument adaptation)
+### Intentional differences
+- Existing legacy calls explicitly supply the new default-false texture tiling argument (or default-false framebuffer field in null fixture). No algorithms moved.
+### Unintentional differences (to fix)
+- None in this mechanical signature adaptation; Rust-only backend/fixtures retain their existing behavior.
+### Missing items
+- No extra implementation in this mechanical adaptation.
+### Binary layout verification
+- N/A: explicit default preserves existing bytes.
+
+## 2026-11-07 ? src/video_core/src/renderer_vulkan/renderer_vulkan.rs vs renderer_vulkan/renderer_vulkan.cpp (argument adaptation)
+### Intentional differences
+- Existing legacy calls explicitly supply the new default-false texture tiling argument (or default-false framebuffer field in null fixture). No algorithms moved.
+### Unintentional differences (to fix)
+- None in this mechanical signature adaptation; Rust-only backend/fixtures retain their existing behavior.
+### Missing items
+- No extra implementation in this mechanical adaptation.
+### Binary layout verification
+- N/A: explicit default preserves existing bytes.
+
+## 2026-11-07 ? src/video_core/src/renderer_metal/renderer_metal.rs vs Rust-only Metal backend (argument adaptation)
+### Intentional differences
+- Existing legacy calls explicitly supply the new default-false texture tiling argument (or default-false framebuffer field in null fixture). No algorithms moved.
+### Unintentional differences (to fix)
+- None in this mechanical signature adaptation; Rust-only backend/fixtures retain their existing behavior.
+### Missing items
+- No extra implementation in this mechanical adaptation.
+### Binary layout verification
+- N/A: explicit default preserves existing bytes.
+
+## 2026-11-07 ? src/video_core/src/renderer_null/renderer_null.rs vs renderer_null/renderer_null.cpp (Rust fixture) (argument adaptation)
+### Intentional differences
+- Existing legacy calls explicitly supply the new default-false texture tiling argument (or default-false framebuffer field in null fixture). No algorithms moved.
+### Unintentional differences (to fix)
+- None in this mechanical signature adaptation; Rust-only backend/fixtures retain their existing behavior.
+### Missing items
+- No extra implementation in this mechanical adaptation.
+### Binary layout verification
+- N/A: explicit default preserves existing bytes.
+
+## 2026-11-07 ? src/video_core/src/engines/maxwell_dma_test.rs vs Rust regression fixtures (argument adaptation)
+### Intentional differences
+- Existing legacy calls explicitly supply the new default-false texture tiling argument (or default-false framebuffer field in null fixture). No algorithms moved.
+### Unintentional differences (to fix)
+- None in this mechanical signature adaptation; Rust-only backend/fixtures retain their existing behavior.
+### Missing items
+- No extra implementation in this mechanical adaptation.
+### Binary layout verification
+- N/A: explicit default preserves existing bytes.
+
+## 2026-11-07 ? src/video_core/src/texture_cache/texture_cache.rs vs texture_cache/texture_cache.h (Rust fixture) (argument adaptation)
+### Intentional differences
+- Existing legacy calls explicitly supply the new default-false texture tiling argument (or default-false framebuffer field in null fixture). No algorithms moved.
+### Unintentional differences (to fix)
+- None in this mechanical signature adaptation; Rust-only backend/fixtures retain their existing behavior.
+### Missing items
+- No extra implementation in this mechanical adaptation.
+### Binary layout verification
+- N/A: explicit default preserves existing bytes.
+
+## 2026-11-07 ? src/video_core/src/texture_cache/util.rs vs texture_cache/util.cpp (argument adaptation)
+### Intentional differences
+- Existing legacy calls explicitly supply the new default-false texture tiling argument (or default-false framebuffer field in null fixture). No algorithms moved.
+### Unintentional differences (to fix)
+- Native memory-manager propagation in production util calls is pending an interface adaptation, recorded in NX2_PORT_STATE.md; do not claim full NX2 cache parity.
+### Missing items
+- No extra implementation in this mechanical adaptation.
+### Binary layout verification
+- N/A: explicit default preserves existing bytes.
+
+## 2026-11-07 ? src/core/src/hle/service/nvdrv/devices/nvdisp_disp0.rs vs core/hle/service/nvdrv/devices/nvdisp_disp0.h/cpp
+### Intentional differences
+- Ordinary HwcLayer framebuffer construction explicitly supplies native_tiling=false, matching upstream omitted/default member. GSV native images use their separate VI path.
+### Unintentional differences (to fix)
+- None in this field initialization, compared with upstream Composite initializer.
+### Missing items
+- None for this added field.
+### Binary layout verification
+- N/A host framebuffer object.
+
+Final validation for native CPU tiling/framebuffer/DMA slices: focused decoder11
+passed; DMA regression passed both native/legacy modes; full video_core1616passed/
+1ignored plus doctests. Core repeats known wait_cancel access violation. Logs:
+nx2-native-tiling-test.log, nx2-native-dma-final-test.log,
+nx2-video-native-tiling-final-full.log, nx2-core-native-tiling-full.log.
+
+## 2026-11-07 ? src/video_core/src/texture_cache/util.rs vs src/video_core/texture_cache/util.h/.cpp (origin/eden-nx2)
+
+### Intentional differences
+- UnswizzleImage and SwizzleImage receive the channel MemoryManager UsesNativeTiling value as a boolean, alongside the existing borrowed input / read-write callbacks. This preserves the existing Rust memory adapter and avoids acquiring a channel mutex recursively during rasterizer writeback. Helpers and conversion loops remain in their upstream-owned file.
+- Pitch-linear upload continues to copy the caller's already-read guest span rather than issuing upstream's second ReadBlockUnsafe (existing adapter).
+
+### Unintentional differences (to fix)
+- None introduced in this CPU native-tiling slice. Re-read util.h/.cpp and compared dimensions, mip/layer traversal, offsets, stride alignment and read/modify/write ordering after implementation.
+
+### Missing items
+- Accelerated native-tiling image metadata and shaders remain a separate prerequisite recorded in NX2_PORT_STATE.md; this entry does not claim the texture cache is fully ported.
+
+### Binary layout verification
+- PASS: independent 64-byte by 8-row GOB coordinate oracle verifies legacy and NX2 byte placement, both conversion directions, and untouched padding for a 12x8 RGBA texture. All 26 util tests pass.
+
+## 2026-11-07 ? src/video_core/src/texture_cache/texture_cache.rs vs src/video_core/texture_cache/texture_cache.h/.cpp (origin/eden-nx2)
+
+### Intentional differences
+- UploadImageContents and QueueAsyncDecode snapshot UsesNativeTiling before constructing the existing guest-memory adapter; SwizzleImage writeback obtains the flag from the same locked or non-owning manager used by its callbacks. The pre-existing CPU-only fallback has no channel/native state and retains legacy tiling.
+
+### Unintentional differences (to fix)
+- None introduced in CPU flag propagation. Re-read upstream callers after implementation; conversion still occurs before backend upload / async worker submission, and writeback still preserves guest padding.
+
+### Missing items
+- Upstream accelerated upload native_tiling metadata and 3D handling are still pending, as is nvhost native-mode activation. GSV VI remains interrupted for these prerequisites.
+
+### Binary layout verification
+- N/A: no serialized structure changed in this slice; byte conversion verified in util.rs tests.
+
+Validation completed: nx2-util-native-full.log reports 1617 passed, 0 failed, 1 ignored; doc-tests pass. Session83290 terminal. PowerShell redirected-stderr wrapper reports exit1 despite Cargo success summaries; no test failure in log.
+
+## 2026-11-07 ? src/video_core/src/texture_cache/image_info.rs vs src/video_core/texture_cache/image_info.h/.cpp (origin/eden-nx2)
+
+### Intentional differences
+- ImageInfo adds native_tiling immediately after tile_width_spacing, initialized false by all constructors as upstream. Existing Rust enum representation unchanged.
+
+### Unintentional differences (to fix)
+- None identified in this native-tiling slice after upstream re-read and comparison; does not assert subsystem completion.
+
+### Missing items
+- nvhost native-mode activation and GSV VI integration still pending. Upstream OpenGL block-linear and Vulkan BCn flag omissions recorded above must be considered when diagnosing runtime rendering.
+
+### Binary layout verification
+- Not serialized; field ownership/default verified.
+
+## 2026-11-07 ? src/video_core/src/texture_cache/accelerated_swizzle.rs vs src/video_core/texture_cache/accelerated_swizzle.h/.cpp (origin/eden-nx2)
+
+### Intentional differences
+- Both MakeBlockLinearSwizzle parameter functions forward ImageInfo native_tiling as u32. Explicit zeroed trailing 2D padding replaces C++ implicit alignment padding.
+
+### Unintentional differences (to fix)
+- None identified in this native-tiling slice after upstream re-read and comparison; does not assert subsystem completion.
+
+### Missing items
+- nvhost native-mode activation and GSV VI integration still pending. Upstream OpenGL block-linear and Vulkan BCn flag omissions recorded above must be considered when diagnosing runtime rendering.
+
+### Binary layout verification
+- 2D size64 align16, native offset56; 3D size60 align4, native offset56; all existing field offsets retained. Tests check both flag values and zeroed explicit padding.
+
+## 2026-11-07 ? src/video_core/src/texture_cache/texture_cache.rs vs src/video_core/texture_cache/texture_cache.h/.cpp (origin/eden-nx2)
+
+### Intentional differences
+- InsertImage and existing CPU-address-aware equivalent clone input metadata then capture UsesNativeTiling before JoinImages. Native 3D shape logging preserved. Rust retained channel Arc/non-owning pointer avoids recursive cache-callback locking; no-channel test adapter defaults false.
+
+### Unintentional differences (to fix)
+- None identified in this native-tiling slice after upstream re-read and comparison; does not assert subsystem completion.
+
+### Missing items
+- nvhost native-mode activation and GSV VI integration still pending. Upstream OpenGL block-linear and Vulkan BCn flag omissions recorded above must be considered when diagnosing runtime rendering.
+
+### Binary layout verification
+- Metadata only. Regression verifies legacy/native insertion, explicit-address insertion and unchanged input metadata.
+
+## 2026-11-07 ? src/video_core/src/texture_cache/util.rs vs src/video_core/texture_cache/util.h/.cpp (origin/eden-nx2)
+
+### Intentional differences
+- Existing exhaustive ImageInfo test fixtures explicitly initialize new native_tiling=false field; no conversion behavior changed in this slice.
+
+### Unintentional differences (to fix)
+- None identified in this native-tiling slice after upstream re-read and comparison; does not assert subsystem completion.
+
+### Missing items
+- nvhost native-mode activation and GSV VI integration still pending. Upstream OpenGL block-linear and Vulkan BCn flag omissions recorded above must be considered when diagnosing runtime rendering.
+
+### Binary layout verification
+- No payload changes.
+
+## 2026-11-07 ? src/video_core/src/renderer_vulkan/compute_pass.rs vs src/video_core/renderer_vulkan/vk_compute_pass.h/.cpp (origin/eden-nx2)
+
+### Intentional differences
+- AstcPushConstants and Assemble forwarding add native_tiling. Existing filename adaptation predates this slice. Upstream BCn push constant offset56 remains zero (_pad): the source does not forward the new flag to its BCn shader; faithfully retained, not claimed as native BCn support.
+
+### Unintentional differences (to fix)
+- None identified in this native-tiling slice after upstream re-read and comparison; does not assert subsystem completion.
+
+### Missing items
+- nvhost native-mode activation and GSV VI integration still pending. Upstream OpenGL block-linear and Vulkan BCn flag omissions recorded above must be considered when diagnosing runtime rendering.
+
+### Binary layout verification
+- ASTC size32, native offset28; serialized last word checked. BCn existing76-byte payload unchanged.
+
+## 2026-11-07 ? src/video_core/src/renderer_opengl/util_shaders.rs vs src/video_core/renderer_opengl/util_shaders.h/.cpp (origin/eden-nx2)
+
+### Intentional differences
+- ASTCDecode writes uniform7 from params.native_tiling. Upstream BlockLinearUpload2D/3D omit setting the new uniforms8/10; faithfully retained as an upstream limitation.
+
+### Unintentional differences (to fix)
+- None identified in this native-tiling slice after upstream re-read and comparison; does not assert subsystem completion.
+
+### Missing items
+- nvhost native-mode activation and GSV VI integration still pending. Upstream OpenGL block-linear and Vulkan BCn flag omissions recorded above must be considered when diagnosing runtime rendering.
+
+### Binary layout verification
+- ASTC uniform location7 matches shader; no raw structure upload.
+
+## 2026-11-07 ? src/video_core/src/host_shaders/astc_decoder.comp vs src/video_core/host_shaders/astc_decoder.comp (origin/eden-nx2)
+
+### Intentional differences
+- Byte-for-byte copy verified against origin/eden-nx2 after implementation. Adds native-tiling bit5/bit6 permutation and corresponding uniform. No new host-side behavior beyond upstream.
+
+### Unintentional differences (to fix)
+- None identified in this native-tiling slice after upstream re-read and comparison; does not assert subsystem completion.
+
+### Missing items
+- nvhost native-mode activation and GSV VI integration still pending. Upstream OpenGL block-linear and Vulkan BCn flag omissions recorded above must be considered when diagnosing runtime rendering.
+
+### Binary layout verification
+- ASTC native uniform7 / Vulkan offset28; 2D uniform8; 3D uniform10; BCn uniform11 / Vulkan offset56. Vulkan ASTC and BCn compile in cargo build; OpenGL execution not exercised.
+
+## 2026-11-07 ? src/video_core/src/host_shaders/block_linear_unswizzle_2d.comp vs src/video_core/host_shaders/block_linear_unswizzle_2d.comp (origin/eden-nx2)
+
+### Intentional differences
+- Byte-for-byte copy verified against origin/eden-nx2 after implementation. Adds native-tiling bit5/bit6 permutation and corresponding uniform. No new host-side behavior beyond upstream.
+
+### Unintentional differences (to fix)
+- None identified in this native-tiling slice after upstream re-read and comparison; does not assert subsystem completion.
+
+### Missing items
+- nvhost native-mode activation and GSV VI integration still pending. Upstream OpenGL block-linear and Vulkan BCn flag omissions recorded above must be considered when diagnosing runtime rendering.
+
+### Binary layout verification
+- ASTC native uniform7 / Vulkan offset28; 2D uniform8; 3D uniform10; BCn uniform11 / Vulkan offset56. Vulkan ASTC and BCn compile in cargo build; OpenGL execution not exercised.
+
+## 2026-11-07 ? src/video_core/src/host_shaders/block_linear_unswizzle_3d.comp vs src/video_core/host_shaders/block_linear_unswizzle_3d.comp (origin/eden-nx2)
+
+### Intentional differences
+- Byte-for-byte copy verified against origin/eden-nx2 after implementation. Adds native-tiling bit5/bit6 permutation and corresponding uniform. No new host-side behavior beyond upstream.
+
+### Unintentional differences (to fix)
+- None identified in this native-tiling slice after upstream re-read and comparison; does not assert subsystem completion.
+
+### Missing items
+- nvhost native-mode activation and GSV VI integration still pending. Upstream OpenGL block-linear and Vulkan BCn flag omissions recorded above must be considered when diagnosing runtime rendering.
+
+### Binary layout verification
+- ASTC native uniform7 / Vulkan offset28; 2D uniform8; 3D uniform10; BCn uniform11 / Vulkan offset56. Vulkan ASTC and BCn compile in cargo build; OpenGL execution not exercised.
+
+## 2026-11-07 ? src/video_core/src/host_shaders/block_linear_unswizzle_3d_bcn.comp vs src/video_core/host_shaders/block_linear_unswizzle_3d_bcn.comp (origin/eden-nx2)
+
+### Intentional differences
+- Byte-for-byte copy verified against origin/eden-nx2 after implementation. Adds native-tiling bit5/bit6 permutation and corresponding uniform. No new host-side behavior beyond upstream.
+
+### Unintentional differences (to fix)
+- None identified in this native-tiling slice after upstream re-read and comparison; does not assert subsystem completion.
+
+### Missing items
+- nvhost native-mode activation and GSV VI integration still pending. Upstream OpenGL block-linear and Vulkan BCn flag omissions recorded above must be considered when diagnosing runtime rendering.
+
+### Binary layout verification
+- ASTC native uniform7 / Vulkan offset28; 2D uniform8; 3D uniform10; BCn uniform11 / Vulkan offset56. Vulkan ASTC and BCn compile in cargo build; OpenGL execution not exercised.
+
+Validation for 2026-11-07 accelerated native-tiling entries: full
+cargo test -p video_core exits0, 1619passed/1ignored, doctests pass
+(nx2-accelerated-full.log). No runtime presentation or FPS evidence yet.
+
+## 2026-11-07 ? src/video_core/src/macro_memo.rs vs src/video_core/macro_memo.h (origin/eden-nx2)
+
+### Intentional differences
+- Header-only upstream (no .cpp) maps to one Rust file; module declaration added to lib.rs. All methods, state, constants and identity hasher remain in macro_memo.rs.
+- BasicMacroMemo concretizes upstream Map to Rust HashMap<u64,u32,BuildHasherDefault<MacroMemoHash>>; both are hash tables with identity hashing over pre-mixed keys. Bucket iteration order and allocation capacities may differ; compaction rewrites every map offset and invalidates direct slots, so its public effects remain unchanged.
+- Find returns Option<Effects> instead of bool plus output reference. Match (Rust r#match) returns arena ranges so statistics can be updated before creating borrowed effects; slices prevent mutation during replay. Rust bounds checks reject invalid caller-supplied data RAM indices rather than C++ undefined behavior.
+- Nested Effects/Statistics are module types because Rust has no nested struct declarations. Constructor is new plus Default; public APIs retain snake_case names.
+
+### Unintentional differences (to fix)
+- None identified in this prerequisite. Re-read full source after implementation and compared direct-slot-before-hash lookup, guard failures vs misses, overwrite-before-compaction ordering, record fields, pair order, thresholds, generation invalidation and statistics. Wrapping hash arithmetic and counter increments preserved.
+
+### Missing items
+- None from macro_memo.h. Native MacroEngine consumers, Turing interpreter/JIT and channel NX2 initialization are still interrupted prerequisites; the new memo is not yet used by game execution.
+
+### Binary layout verification
+- PASS for internal arena: exact five-u32 header followed by parameters, flattened read pairs, data RAM write pairs and method write pairs. Regression checks precise word sequence and effects ordering. No struct is serialized as raw bytes.
+- Tests cover direct-slot collisions, synthetic hash collisions, changed read guards, in-place overwrite, stale-record compaction at the actual 2^22-word threshold, 75% live occupancy clear, generation invalidation, hash output and identity map hash.
+
+Macro memo final validation: session81524 terminal exit0; full cargo test -p video_core reports1625passed/1ignored + doctests pass (nx2-macro-memo-full.log). No runtime frame/FPS evidence. Next macro_turing interpreter prerequisite remains.
+
+## 2026-11-07 ? src/video_core/src/macro_turing.rs vs src/video_core/macro_turing.h (origin/eden-nx2)
+
+### Intentional differences
+- Header-only source maps to macro_turing.rs, registered in lib.rs. Decode, Execute, helper closures, predicate table, RAM and decoded-cache ownership remain in this file. Nested types become module-level Rust types.
+- active_dram is an optional exclusive RAM borrow passed to Execute instead of a persistent self-referential/external raw pointer. None uses the interpreter's own dram; Some borrows channel RAM for the same call. Native engine integration must forward its selected channel RAM on every call.
+- Emit receives the mutable parameter vector explicitly, preserving the upstream callback's ability to append FIFO words without aliasing a captured mutable borrow. Read/Emit remain generic closures.
+- Decoded instruction copied from the cached entry locally (all fields Copy); cache remains indexed by PC and only changes on raw-word mismatch. No semantic helper extraction or opcode simplification.
+- Explicit wrapping u32/u64 operations preserve upstream bit patterns, including signed multiplication extension and branch offsets. Error strings are static string slices; first-error reporting retained.
+
+### Unintentional differences (to fix)
+- None identified after re-reading the header after implementation and comparing Decode plus every opcode, output selector, loop, termination, tracing and failure branch. There is no corresponding upstream .cpp.
+
+### Missing items
+- None from this interpreter header. Native MacroEngine integration, Turing JIT, engine context/data RAM setters, and ChannelState NX2 initialization remain interrupted prerequisites. The interpreter is not yet reachable by title execution.
+
+### Binary layout verification
+- PASS for instruction decoding: 96-bit uploaded order reversed to low/middle/high decode words, fields crossing u32 boundaries tested, all 16 predicate masks verified. DataRam remains exactly0xc00 u32 words. Rust result/decoded types are not raw serialized ABI payloads.
+- Tests exercise arithmetic/bit operations, signed comparisons, carry lanes, parallel operand reads, FIFO loads before predicates, callback FIFO growth, channel RAM isolation, ordered read/write tracing, zero/nonzero loops, stop branch, back-edge end cancellation, delayed end, immediate selectors, decode invalidation, first-error strings, PC/consumption and million-instruction limit.
+
+Turing interpreter final validation: full cargo test -p video_core exits0,1634passed/1ignored + doctests pass (nx2-macro-turing-full.log). Session86756 terminal; all9new interpreter tests included. Next JIT prerequisite remains; objective not achieved.
+
+## 2026-11-07 ? src/video_core/src/macro_turing_jit.rs vs src/video_core/macro_turing_jit.h (origin/eden-nx2)
+
+### Intentional differences
+- Header-only upstream maps to one Rust module, enabled on x86_64 in lib.rs. Program owns rxbyak CodeAssembler by composition instead of inheriting Xbyak CodeGenerator; executable code remains native x86-64 with auto-growing initial1MiB mapping, per-PC labels and RIP-relative pointer table.
+- State/Thunks/Program are module types rather than nested C++ declarations. Generate, Analyze, Instruction, Body, Lane, Get, Output, Compare, RegOffset, IsFlow, Prepare, Execute and ErrorText retain their corresponding method owners. Local offset macros mechanically represent upstream offsetof addressing.
+- Prepare returns rxbyak Result instead of throwing on allocation/assembly failure. Entry uses Option until ready, replacing the source null function pointer. Drop releases executable memory with its Program owner.
+- State uses repr(C) with explicit zeroed alignment gap before params; all scratch/padding initialized. FIFO points to Rust Vec, accessed only by the Rust thunk; emit receives the FIFO explicitly to preserve append/reallocation behavior without capture aliasing. CallEmit refreshes params and params_size after the callback, including failure.
+- Rust C ABI selects Windows/System V argument registers matching upstream. Jump labels use near encoding consistently, including source auto/short choices; this changes code byte lengths only. The unused source loop_starts_of_end temporary is omitted. Vec<bool> uses byte elements instead of C++ packed proxy bits; ownership/indexing unchanged.
+- Exclusive mutable access owns execution; Send permits moving the compiled context between serialized GPU owners, not concurrent mutation. Runtime tested on Windows x86_64; System V selected code is not runtime-tested here.
+
+### Unintentional differences (to fix)
+- None identified in this port after re-reading the full header post-implementation and comparing allocation/Prepare lifecycle, native prologue/epilogue, callback ABI, every ALU opcode, predication, early operands, loops/dispatch and error labels. No upstream .cpp exists.
+- Upstream characteristics deliberately retained: fail_pc remains zero; uninitialized guest registers read zero without interpreter initialized-mask validation; step budget decremented only in dispatch; JIT does not collect interpreter data-RAM trace vectors. These are not grounds to claim all JIT/interpreter diagnostics identical.
+
+### Missing items
+- None from this JIT header on x86_64. Native MacroEngine/memo integration, shared NativeMacroContext, Maxwell3D/KeplerCompute methods and ChannelState NX2 setup still pending. No game path calls this JIT yet.
+
+### Binary layout verification
+- PASS: State size208; carry96, end_next144, scratch_x148, params160, dram168, user176, emit184, read192, fifo200. Native code uses offset_of! for each memory access. Tests execute real generated code and callback paths.
+- Differential tests compare native effects/FIFO/consumption/errors/data RAM with interpreter for arithmetic, signed comparisons, carry/high product, register hazards, register reads, all predicate masks, loops, branch polarity/end cancellation and DMA FIFO reallocation. Additional tests check generation-only Prepare cache, error texts, zero-register behavior, out-of-code start and dispatch step limit.
+
+Turing JIT final validation: session37998 terminal exit0, full cargo test -p video_core1640passed/1ignored + doctests pass (nx2-macro-jit-full.log). All6native tests included. Next native MacroEngine integration remains. Goal active; no rendered game/FPS evidence.
+
+## 2026-11-07 ? src/video_core/src/nx2_profile.rs vs src/video_core/nx2_profile.h (origin/eden-nx2)
+
+### Intentional differences
+- Header-only source maps to its own Rust module; Zone/Counter names and order, zone_names, ThreadData, Scope, Enabled/Now/Add/Report/DmaReadPages retain ownership. Drop replaces Scope destructor; a non-Send marker prevents exiting on another thread.
+- Thread-local RefCell wraps the same counters; global HashSet of DMA pages uses a Mutex guard instead of a mutable static reference. It remains process-wide and is not cleared by Report.
+- G_ENABLED is initialized once on first use by LazyLock instead of C++ pre-main initialization; presence semantics retained. Report requires the caller to pass the source default "GPU thread" explicitly. Clock still uses common::cpu_features::G_WALL_CLOCK, with no independent replacement timer.
+- Rust formatting/logging replaces fmt/LOG_INFO. Counter overflow and elapsed/exclusive arithmetic wrap as upstream. Test-only per-thread clock/enabled overrides permit deterministic nested timing and report-boundary tests; absent from production.
+
+### Unintentional differences (to fix)
+- None identified after re-reading source and comparing constructor/destructor ordering, child time restoration, first report behavior,10s threshold, percentages/rates, Other calculation and reset ordering.
+
+### Missing items
+- None from header. Profiling call sites in native MacroEngine and other unported NX2 execution paths remain pending; this module alone does not make those paths executable.
+
+### Binary layout verification
+- N/A: no raw serialized struct. Zone33/Counter8 ordering and counts preserved. Four tests pass: nested/sibling exclusive time, disabled no-op,10s report reset/persistent DMA pages, thread isolation and u64 counter wrapping.
+
+## 2026-11-07 ? src/video_core/src/control/channel_state.rs vs src/video_core/control/channel_state.h/.cpp (origin/eden-nx2)
+
+### Intentional differences
+- Existing Rust engine fields/boxed ownership retained. BindNvkDefaultSubchannels adds subchannel2 KeplerMemory between compute1 and Fermi2D3, with NVK_M2MF_SUBCHANNEL owned in the same helper/file.
+
+### Unintentional differences (to fix)
+- Corrected previously confirmed missing M2MF default binding. Re-read .h/.cpp after edit; all five default subchannel bindings follow source order and engine identity.
+
+### Missing items
+- Full ChannelState NX2 init still stopped on NativeMacroContext and Maxwell3D/KeplerCompute native methods; no partial EnableNativeTiling inserted. This entry only verifies default bindings.
+
+### Binary layout verification
+- N/A: no payload changes. Existing init regression now asserts subchannel2 is bound to KeplerMemory in addition to the other four bindings.
+
+Final profiler/M2MF validation:24624 terminal exit0; cargo test -p video_core1644passed/1ignored + doctests pass (nx2-profile-full.log). All test processes terminal. No new runtime frame/FPS.
+
+## 2026-11-07 ? src/video_core/src/macro_turing.rs vs src/video_core/macro_turing.h (origin/eden-nx2), DMA callback RAM access
+
+### Intentional differences
+- Execute's emit adapter now receives the active mutable DataRam alongside the FIFO. This is a scoped reborrow of the actual channel/interpreter RAM, matching upstream callback access through active_dram without a second aliased mutable reference or copied RAM.
+
+### Unintentional differences (to fix)
+- None in this adapter. Re-read Execute's output invocation and active_dram ownership after edit. Callback effects occur before the next instruction; callback DMA writes are not attributed to DWRITE tracing, matching source.
+
+### Missing items
+- Native MacroEngine emit/DMA logic remains to be wired; this fixes its prerequisite interface.
+
+### Binary layout verification
+- PASS: no instruction/RAM layout change. Shared interpreter/JIT regression emits a DMA-like write, reads it through the following DREAD and verifies untouched neighbor RAM plus interpreter tracing.
+
+## 2026-11-07 ? src/video_core/src/macro_turing_jit.rs vs src/video_core/macro_turing_jit.h (origin/eden-nx2), DMA callback RAM access
+
+### Intentional differences
+- CallEmit creates the scoped DataRam reborrow from State.dram and passes it to the Rust closure with FIFO. Native entry/callback ABI remains unchanged; only the internal Rust closure signature gains explicit access previously captured by the C++ caller.
+
+### Unintentional differences (to fix)
+- None identified. Re-read thunk/Execute state pointer contract; FIFO refresh remains after callback, and generated DREAD uses the same State.dram storage.
+
+### Missing items
+- MacroEngine callback integration pending.
+
+### Binary layout verification
+- PASS: State offsets/size and machine callback signature unchanged; real native code observes callback writes without a copy. All16macro interpreter/JIT tests passed.
+
+## 2026-11-07 ? src/video_core/src/engines/engine_upload.rs vs src/video_core/engines/engine_upload.h/.cpp (origin/eden-nx2), native partial transfers
+
+### Intentional differences
+- Existing register snapshot and RasterizerHandle adapters retained. Added upstream-owned native_partial/flushed_offset and SetNativePartialTransfers. ProcessExec resets both offsets; native single-line linear uploads flush only new bytes. Multiword calls write input directly, then advance write/flushed offsets; single-word calls accumulate before last-call flushing.
+- Slice bounds remain checked in Rust. Existing Vec allocation/zero initialization differs from upstream scratch allocation but no unwritten bytes are exposed in the native partial path.
+
+### Unintentional differences (to fix)
+- None identified in partial-transfer slice after re-reading .h/.cpp and comparing count limits, destination offsets, call ordering, zero-count behavior and fallback conditions.
+
+### Missing items
+- Maxwell3D SetNativeTuringMacroMode must enable this state when native channel initialization is ported. No partial channel activation inserted.
+
+### Binary layout verification
+- Register payload unchanged. Two regressions in maxwell_3d_test.rs reuse its bound rasterizer fixture: interleaved word/multiword transfers, short final write, no write when full, reset and multi-line legacy fallback. Both pass.
+
+## 2026-11-07 ? src/video_core/src/engines/maxwell_3d_test.rs vs src/video_core/engines/engine_upload.cpp, regression coverage
+
+### Intentional differences
+- Rust tests reuse the existing Maxwell3D rasterizer spy for upstream Upload::State behavior rather than duplicating the large RasterizerInterface fixture. Production upload logic remains entirely in engine_upload.rs.
+
+### Unintentional differences (to fix)
+- None; expected addresses, byte counts and native-endian payloads derived from source partial-transfer branches.
+
+### Missing items
+- Full native Maxwell3D macro mode integration remains pending.
+
+### Binary layout verification
+- Checks exact emitted byte spans including the two-byte final tail; register layout tests unchanged.
+
+Final callbackRAM/partialupload validation:73985 terminal exit0; full cargo test -p video_core1647passed/1ignored + doctests pass (nx2-macro-ram-partial-full.log). All test processes terminal. No runtime image/FPS evidence.
+
+## 2026-11-07 ? src/video_core/src/engines/maxwell_3d.rs vs src/video_core/engines/maxwell_3d.h/.cpp (origin/eden-nx2), native RAM ownership
+
+### Intentional differences
+- GetMemoryManager returns a reference to the existing Arc<Mutex<MemoryManager>> owner handle rather than a bare mutable C++ reference; callers retain control of lock scope for DMA dirty checks, flushes and reads. No replacement memory manager is created.
+- GetNativeDataRam returns a mutable reference to the actual per-Maxwell3D0xc00-word array. The array remains in Maxwell3D immediately before MacroEngine and is zeroed in the common constructor. No shared-global/interpreter-owned replacement introduced.
+
+### Unintentional differences (to fix)
+- None identified in these prerequisite state/accessors after re-reading header fields/accessors and constructor implementation. Existing macro backend selection still follows disable_macro_jit on x86_64 and interpreted mode elsewhere.
+
+### Missing items
+- NativeMacroContext, native macro/position selectors, mode setter and MacroEngine native execution are still pending; compute-engine borrowing of the channel RAM is not wired yet. These accessors do not enable NX2 channel execution on their own.
+
+### Binary layout verification
+- PASS: DataRam exactly0x3000 bytes (0xc00 u32), initially all zero. Test proves independent persistent RAM including word0x27 and final word0xbff across two channels sharing the same GPU MemoryManager. Arc identity confirms accessor returns original manager. Maxwell3D object itself is not a serialized ABI payload.
+
+## 2026-11-07 ? src/video_core/src/engines/maxwell_3d_test.rs vs src/video_core/engines/maxwell_3d.h/.cpp, native RAM regression
+
+### Intentional differences
+- Rust-native regression instantiates two owner-backed engines; no source C++ test port.
+
+### Unintentional differences (to fix)
+- None in expected initialization, isolation, size and manager identity derived from upstream fields/accessors.
+
+### Missing items
+- Execution and cross-engine shared-context integration remain future validation scopes.
+
+### Binary layout verification
+- PASS:0xc00-word storage verified; exact channel-independent writes retained.
+
+Final Maxwell native RAM validation:97227 terminal exit0; full cargo test -p video_core1648passed/1ignored + doctests pass (nx2-maxwell-native-ram-full.log). All test processes terminal; no frame/FPS evidence.
+
+## 2026-11-07 ? src/core/src/host1x_core.rs; src/video_core/src/host1x/host1x.rs vs video_core/host1x/syncpoint_manager.h
+
+### Intentional differences
+- Cross-crate trait declaration/implementation is necessary because core cannot depend on video_core. No state moved.
+- Verification: Required object-safe bridge forwards IsReadyGuest to its existing syncpoint owner; acquire load and unsigned >= are preserved. Host increments do not advance guest readiness; thresholds 0, 1, 2 and u32::MAX covered.
+
+### Unintentional differences (to fix)
+- None identified in this bridge/prerequisite slice.
+
+### Missing items
+- VI WaitForFrame caller remains pending.
+
+### Binary layout verification
+- PASS: no guest-serialized structure changed. Screenshot bytes retain their allocation and ordering; core atomic is u64.
+
+## 2026-11-07 ? src/core/src/core.rs vs core/core.h and core/core.cpp
+
+### Intentional differences
+- Rust uppercase global naming only.
+- Verification: Re-read declaration/definition: g_nx2_present_count is a zero-initialized atomic u64 with global lifetime. G_NX2_PRESENT_COUNT has the same owner, width, initialization and lifetime.
+
+### Unintentional differences (to fix)
+- None identified in this bridge/prerequisite slice.
+
+### Missing items
+- VI PresentBuffer increments remain pending.
+
+### Binary layout verification
+- PASS: no guest-serialized structure changed. Screenshot bytes retain their allocation and ordering; core atomic is u64.
+
+## 2026-11-07 ? src/video_core/src/renderer_base.rs vs video_core/renderer_base.h and video_core/renderer_base.cpp; core/hle/service/nx2_gsv.h::CaptureFrame
+
+### Intentional differences
+- Safe Vec ownership adapter replaces the source CaptureFrame shared_ptr capture at the crate boundary. Buffer-size and checked dimension validation protect the Rust safe API; valid source callers allocate exactly width*height*4 and are unaffected. Adapter belongs to renderer_base; capture policy remains in the service.
+- Verification: Re-read header and implementation after edit. Existing RequestScreenshot still owns publication order, overlap rejection, layout/layer stack, and asynchronous completion. Mechanical owned adapter keeps the original vector allocation alive inside the callback until completion; no copy or early release.
+
+### Unintentional differences (to fix)
+- None identified in this bridge/prerequisite slice.
+
+### Missing items
+- CaptureFrame service policy and TGA output remain pending.
+
+### Binary layout verification
+- PASS: no guest-serialized structure changed. Screenshot bytes retain their allocation and ordering; core atomic is u64.
+
+## 2026-11-07 ? src/core/src/gpu_core.rs; src/video_core/src/gpu.rs vs video_core/gpu.h and video_core/gpu.cpp; core/hle/service/nx2_gsv.h::CaptureFrame/DumpRanges
+
+### Intentional differences
+- Required cross-crate methods expose source Renderer access without moving renderer state or service policy. Missing renderer/rasterizer is an explicit invariant failure, matching source required owner. Mutex serializes existing renderer access.
+- Verification: Re-read GPU header/cpp: RunOnGpuThread directly returns RequestSyncOperation fence without waiting. Bridge forwards screenshot to RendererBase and direct renderer flush to rasterizer CacheType::ALL. Existing CPU FlushRegion queue is not used by direct renderer flush. Queue regression proves delayed execution, FIFO order and fence advancement.
+
+### Unintentional differences (to fix)
+- None identified in this bridge/prerequisite slice.
+
+### Missing items
+- VI service CaptureFrame/DumpRanges callers remain pending.
+
+### Binary layout verification
+- PASS: no guest-serialized structure changed. Screenshot bytes retain their allocation and ordering; core atomic is u64.
+
+## 2026-11-07 ? src/video_core/src/renderer_null/renderer_null.rs vs video_core/renderer_base.h and video_core/renderer_base.cpp
+
+### Intentional differences
+- Native Rust tests use the null renderer fixture; no null renderer runtime behavior changed.
+- Verification: Regression tests exercise real RendererBase screenshot lifecycle through RendererNull: original allocation pointer, writes before async completion, callback surviving renderer drop, overlapping request rejected without replacing the first pointer, and undersized buffer rejected.
+
+### Unintentional differences (to fix)
+- None identified in this bridge/prerequisite slice.
+
+### Missing items
+- No missing items in this test slice.
+
+### Binary layout verification
+- PASS: no guest-serialized structure changed. Screenshot bytes retain their allocation and ordering; core atomic is u64.
+
+## 2026-11-07 ? src/core/src/memory/memory.rs; src/core/src/hle/service/nx2_gsv.rs; src/core/src/hle/service/nvdrv/devices/nvhost_gpu.rs; src/core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs vs corresponding core owners (test-only bridge fixtures)
+
+### Intentional differences
+- Rust test fixtures have no upstream C++ equivalent; fail-fast methods limit each fixture to its existing scope.
+- Verification: Required GPU bridge methods added to existing test doubles, with explicit panic if an unrelated test invokes screenshot, GPU sync scheduling or renderer flush. Memory fixture also implements required Host1x guest-readiness method. No production fallback or empty-success implementation added.
+
+### Unintentional differences (to fix)
+- None identified in this bridge/prerequisite slice.
+
+### Missing items
+- No missing items in this fixture adaptation.
+
+### Binary layout verification
+- PASS: no guest-serialized structure changed. Screenshot bytes retain their allocation and ordering; core atomic is u64.
+
+Final VI bridge validation (2026-11-07): video43914 exit0, full cargo test -p
+video_core:1652passed/1ignored plus doctests pass (nx2-vi-bridges-full.log).
+Core76663 exit0: cargo test -p core nx2_gsv:7passed (nx2-vi-bridges-core.log).
+Focused guest-readiness1 and owned-screenshot2 tests passed. Full core is NOT
+claimed green: previously recorded unrelated k_thread wait_cancel abort remains.
+Targeted diff whitespace check passes with core.whitespace=cr-at-eol; broad
+check reports pre-existing CRLF lines in video_core/lib.rs, untouched here.
+All test processes terminal. No new game launch, frame, or FPS measurement.
+
+## 2026-11-07 ? core/host1x_core.rs and video_core/host1x/host1x.rs vs core/device_memory_manager.h/.inc
+
+### Intentional differences
+- Required ReadBlock bridge forwards to existing smmu_read_block, preserving flush-before-copy and zero-fill of unmapped segments. Header and implementation re-read. Boolean mapped-range result is the existing Rust API adaptation; VI ignores it as upstream's void caller does.
+- core/memory/memory.rs fake implements the required method as test-only panic outside fixture scope.
+### Unintentional differences (to fix)
+- Separate confirmed prerequisite for later NX2 address-space use: Maxwell device_virtual_bits is 34 in Rust vs 36 upstream. Dense tables grow fourfold; defer to separate memory-footprint audit, not a blind constant change.
+### Missing items
+- No missing items in the ReadBlock bridge; VI caller pending.
+### Binary layout verification
+- PASS: raw copied bytes unchanged; no serialized layout altered.
+
+## 2026-11-07 ? src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (INx2Vi2Session)
+
+### Intentional differences
+- Re-read complete header-only class after implementation (no corresponding cpp). All ten TIPC commands, constructor, destructor, PresentClientBuffer, WaitForFrame, PaceToVblank, Composite, CaptureFrame, DumpRanges, CancelClientBuffer, ReturnOne, SucceedQuietly, GetTimestampRecorderCount, ReturnEvent, GetVsyncEvent remain in the corresponding Rust owner. Source experimental return values/guesses are preserved, not invented replacements.
+- Mutex<Vi2State> is required by Rust service shared-reference dispatch. Arc<Mutex<Vec<Arc<Event>>>> corresponds to shared VsyncState; event wrapper signals the underlying kernel owner. Destructor clears the shared list first, unschedules with Wait (source default), then closes events. Callback owns shared state rather than a session pointer.
+- Option<Instant> represents source zero time_point sentinel. First present schedules from now; late frames discard lost time. Relative thread::sleep implements source sleep_until using the sampled now. PresentStats keeps source 600-present reset, previous last_present, /599 frame denominator, >100000us hitch threshold.
+- Native framebuffer is passed through the existing core/video bridge. Source memory base (not Image::offset), pitch/4 stride, full crop, RGBA8, opaque blend and native_tiling are preserved. Only fences with id<192 are submitted; source calls composite, capture, dump, speed limiter, EndSystemFrame and BeginSystemFrame in that order.
+- Screenshot Vec ownership moves through the checked bridge and returns to its completion callback; this replaces shared_ptr<vector> without copying or shortening lifetime. TGA output writes explicit little-endian dimensions and zeroed 18-byte header; pending atomic stays alive independently of the session. Source interval is presents%120==1.
+- libc strtoull/strtoll retain source prefix parsing, signs, overflow and end-pointer handling for diagnostic ranges and vsync rate. Rust file APIs replace fopen/fwrite/fclose with the same ignored I/O-error behavior. Diagnostics retain nonblocking GPU scheduling and page-bounded flush-before-read order. Environment strings are Rust Unicode strings (Windows current target); non-Unicode environment values are treated as absent.
+- Test fixtures use ScopedKernelForTest thread-local override, avoiding process-global KernelCore initialization in the VI timer test. QueuedGpu records real composition arguments; no new production stubs.
+
+### Unintentional differences (to fix)
+- None identified in this class after source comparison. Existing wider native macro/channel integration and SMMU 34-vs36-bit divergence are separate outstanding slices.
+
+### Missing items
+- INx2GraphicsSystemSession factory (gsv305), INx2VideoSession, and SelfController2000 connection remain unported; this VI class is not yet reachable by the game.
+- Native full-image capture, diagnostic dump files and 4-second GPU wait have not yet been exercised with the game. No rendered image/FPS evidence.
+
+### Binary layout verification
+- PASS: TIPC result/data positions, one copy event object, mask0x7fff + high word0 + four zeros preserved. TGA18-byte header deterministically zeroed then populated with type2, width/heightLE, depth32, descriptor0x08/0x28. Framebuffer bridge carries native flag. Host bookkeeping structs are not serialized.
+- Regression coverage: replies1/3/5/228/229, invalid fence/missing-image present, three event requests with vsync signaling only31/32, retained callback after Drop cannot signal closed events, timer sequence increment on unschedule, source image-memory base/native layout and valid/invalid fence threshold. ReadBlock bridge checks flush callback and unmapped zero-fill across page boundary.
+- Validation: ten focused nx2_gsv tests pass; ReadBlock bridge focused test passes. Full crate validation running separately; no full-core success asserted.
+
+Final VI session validation: video14662 terminal exit0, full cargo test -p
+video_core1653passed/1ignored and doctests pass (nx2-vi-session-video-full.log).
+Core focused10passed; full core aborted0xc0000005 (nx2-vi-session-core-full.log).
+All test processes terminal. VI implementation and source audit complete for
+this class; factory/video/SelfController connection still pending. No ROM run,
+rendered frame or FPS measurement; full gameplay goal remains active.
+
+## 2026-11-07 ? src/core/src/host1x_core.rs and src/video_core/src/host1x/host1x.rs vs video_core/host1x/syncpoint_manager.h/.cpp
+
+### Intentional differences
+- Required IncrementGuest trait bridge delegates to existing source-owned SyncpointManager::increment_guest. Header/cpp re-read; guest counter, notification and action-storage ownership unchanged. Test exercises bridge instead of concrete manager and checks host counter remains unchanged.
+- src/core/src/memory/memory.rs fake method panics outside fixture scope; no runtime fallback.
+### Unintentional differences (to fix)
+- None in bridge.
+### Missing items
+- Video session completion caller in progress.
+### Binary layout verification
+- PASS: no serialized layout change; u32 counter behavior preserved by existing owner.
+
+## 2026-11-07 ? src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (INx2VideoSession and Nx2FirstVideoCommand)
+
+### Intentional differences
+- Re-read complete header-only class/helper after implementation; no cpp exists. All thirteen handlers, first-command logging, constructor/destructor, NvdrvSyncpoints, HandOut, DecodeLoop, WaitForRelease, WriteImage and DumpFrame live in the matching Rust file; constants remain associated with the session (NoSyncpoint, MaxQueuedInputs8, MaxDecodedAhead2, HostSyncpoints192).
+- Arc<VideoShared> owns source mutex/CV and worker-shared queues. Control mutex owns source service context/event/timer/worker/submitted count. Worker captures only these explicit owners and SystemRef, not Arc<Self>, avoiding a self-cycle that prevents the source destructor from joining. No decoder is moved between threads: created lazily on worker via existing Host1x bridge.
+- Syncpoint/base are protected by the worker state mutex instead of source unguarded service-only fields; allocation still occurs once at first HandOut using actual nvdrv service/container manager. Completion pushes output before IncrementGuest under the mutex, then increments frames_out. Destruction sets quit, wakes, joins, clears ready event under its lock, unschedules timer, closes event, frees allocated syncpoint in source order.
+- WriteImage snapshots configured dimensions under the state mutex before taking the native-object lock, eliminating the upstream unguarded concurrent Configure reads. Memory/image ownership, source memory+image.offset, clamped picture size, application-process check, full-layout render, luma then optional chroma writes remain unchanged. Bytes reuse Vec::resize (zeroes only newly grown bytes), matching vector::resize.
+- Rust SharedMemory::access read guard permits internally synchronized WriteBlock; no replacement memory buffer or direct host pointer is introduced.
+- Codec bytes terminate at first NUL just like strnlen, then pass through the existing Rust &str decoder interface. Invalid UTF-8 MIME names use lossy conversion; valid codec MIME names are ASCII. Source unknown MIME behavior remains in the decoder owner. Log vector formatting uses Rust brackets/commas.
+- std::thread::Builder names the worker before execution (source SetCurrentThreadName at DecodeLoop entry). Rust join propagates worker panic rather than silently discarding thread failure. Rust file API preserves diagnostic PGM header, quarter-resolution first-channel sampling, every120-frame cadence and ignored I/O errors.
+- Source unsigned submitted/handed/pts arithmetic uses explicit wrapping; zero-filled output words are explicit. NativeSyncHandle stays four words {~syncpoint,0,value,0}; GetOutputInfo empty result is exactly0x1c286f.
+
+### Unintentional differences (to fix)
+- None identified in this class from source comparison. Wider macro and SMMU tasks remain recorded separately.
+
+### Missing items
+- INx2GraphicsSystemSession factory and SelfController2000 connection remain unported, so the game cannot yet reach the session.
+- Actual compressed-input -> guest-image -> output-counter integration still needs runtime/integration evidence. Existing native decoder tests cover FFmpeg decoding/rendering separately; current core tests cover queue/IPC/timer/idle-worker contracts, not a complete decoded movie.
+
+### Binary layout verification
+- PASS: empty-output result word, sixteen output words, repeated width/height, wrapping pts*1000 low/high words, low-byte EOS, and NativeSyncHandle bit patterns are explicit rather than raw host struct copies. PGM dimensions/sample offset formula preserved.
+- Tests cover ninth input acceptance with room=false at8 (source does not reject), flush retaining free ring/release fences/completed outputs and deferring decoded clearing to worker, unregister erasing all duplicates, empty output/error and wrapping timestamp, single worker start/reconfigure/join, ready event re-signaling only with room and safe retained timer callback after Drop, missing/empty frame fallback sizes without writing bytes.
+- Initial14focused GSV tests passed; final focused run includes added fallback regression. Full crate results recorded below after termination.
+
+Final video-session validation: video92909 terminal exit0: cargo test -p
+video_core1653passed/1ignored + doctests pass (nx2-vdec-session-video-full.log).
+Core93439 terminal0xc0000005 STATUS_ACCESS_VIOLATION, preceding kernel test
+failures (nx2-vdec-session-core-full.log); full core NOT green. Final focused
+cargo test -p core nx2_gsv15passed exit0 (nx2-vdec-session-final-focused.log).
+IncrementGuest bridge readiness/action regressions passed in fullvideo.
+All processes terminal. FactoryGSV/SelfController2000 next; native movie
+integration and playable game>=20FPS remain unverified, goal active.
+
+## 2026-11-07 ? src/core/src/hle/service/nvdrv/nvdrv_interface.rs vs core/hle/service/nvdrv/nvdrv_interface.h/.cpp
+
+### Intentional differences
+- InitializeForProcess lives on existing NvdrvInterface state owner; NvdrvService forwards through its interface mutex. Header/cpp re-read: if initialized return, OpenSession(process), mark initialized, no IPC response or transfer-memory requirement. Source session identity and lifecycle retained.
+### Unintentional differences (to fix)
+- None in this method.
+### Missing items
+- GSV OpenNvsrvSession caller in progress.
+### Binary layout verification
+- PASS: no wire payload change; process identity remains Arc identity in existing Container.
+
+## 2026-11-07 ? src/core/src/hle/service/os/event.rs vs core/hle/kernel/k_event.h/.cpp and core/hle/service/nx2_gsv.h::AttachSyncptMemory
+
+### Intentional differences
+- Mechanical copy_writable_object_id bridge exposes the existing KEvent parent ID from KReadableEvent::parent_id, rather than returning the readable object's ID. Core C++ directly copies KEvent; Rust registers its same Arc and readable end in recipient process registry so existing KEvent signaling resolves the same object. Existing lazy bridge owns creation; no duplicate event is invented.
+- Re-read KEvent header/Signal implementation and AttachSyncptMemory endpoint order: first writable parent, second readable notification. Regression tests distinct object IDs, Arc identity and client-side parent signaling of the same readable event, repeated copy stability.
+### Unintentional differences (to fix)
+- None in this bridge.
+### Missing items
+- GSV AttachSyncptMemory caller in progress.
+### Binary layout verification
+- PASS: guest handle serialization still uses existing object-ID copy path. Parent and readable IDs remain distinct.
+
+## 2026-11-07 ? src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (INx2GraphicsSystemSession)
+
+### Intentional differences
+- Complete header-only factory re-read after implementation (no cpp). Handler ownership, TipcDataOffset, Pair, shared native-object maps, source layout helpers and source per-class constants retained. Factories return raw sessions; nvsrv uses real shared NVDRV module initialized for the request's owner, not the old empty INx2NvsrvSession placeholder.
+- Arc<Mutex<GraphicsSystemState>> lets the timer own source state safely. Drop takes/removes timer without holding state lock, unschedules with Wait, then closes events. Taking timer breaks callback->state->timer cycle. Unlike a Weak<Self> upgrade, timer callback cannot become last session owner and attempt to join itself during Drop.
+- SharedMemory Arc retains RO transfer-memory owner's memory. RW and RO source addresses still use the RO owner, exactly as source. The same state lock serializes attachment with timer execution so event pointers are initialized before polling can signal. Source installs timer before allocating events; Rust retains that order under the lock.
+- Writable parent event is returned first, readable notify second; source behavior on missing transfer memory still returns events and success. Poll updates guest counters before acknowledging every changed armed word, copies summary unconditionally, signals only on changed armed bits; 500us interval, count min504, guest counter limit192 preserved.
+- Rust BTreeMap entry/default preserves C++ operator[] insertion, nonzero memory size is retained on bind, images share memory IDs and decoder offsets. Explicit wrapping handles unsigned ID/size/address arithmetic. CpuUserImageDescriptor uses32zero words, source low-u32 offset/pitch fields, with NV12 second plane only.
+- Non-wire log verbosity differs for some allocation/query handlers (data available in the existing IPC logs and object bookkeeping); guest replies, decisions and method ownership are unchanged. Remaining emitted source diagnostics keep command/service identification.
+
+### Unintentional differences (to fix)
+- None identified in factory guest behavior after line-by-line source review. Native GPU macro/channel integration and 36-bit SMMU support remain outstanding elsewhere.
+
+### Missing items
+- Actual valid-transfer-memory polling with a live title and downstream native GPU execution require runtime validation; no gameplay/FPS claim from unit tests.
+
+### Binary layout verification
+- PASS: raw TIPC data offsets account for optional PID and both handle counts; eight u32 RO header fields are explicit; counter/ack/summary writes use u64; CPU image descriptor is deterministically128bytes. Regression exhausts optional header counts, tests memory binding ownership, decoder pool sizes/offsets, descriptor zero fields, count0->1, and writable/readable endpoint ordering on invalid attachment.
+
+## 2026-11-07 ? src/core/src/hle/service/am/service/self_controller.rs vs core/hle/service/am/service/self_controller.h/.cpp
+
+### Intentional differences
+- Header/cpp re-read after implementation. Command2000 maps GetNx2GraphicsSystemSession in its original owner and returns a raw INx2GraphicsSystemSession through the existing cross-language IPC helper. Rust snake_case and Arc replace C++ names/shared_ptr only.
+### Unintentional differences (to fix)
+- None identified in this handler/table change.
+### Missing items
+- Runtime boot verification in progress; no native rendering claim.
+### Binary layout verification
+- PASS: existing ReturnRawSession emits a copy session handle, preserving source shape rather than a CMIF domain object. Controller test checks2000 is bound; raw-session helper behavior already covered by separate regression.
+
+GSV factory final focused checks:18GSV,1writablecopy,1InitializeForProcess,
+1self_controller passed. Corefull63106 terminated0xc0000409
+STATUS_STACK_BUFFER_OVERRUN after kernel test failures, not a green suite.
+Release77203 still live; source origin/eden-nx2 verified unchanged at
+50fa86bbbc403ad565eb44fcc281f16f77c69e15. Exact NSP exists23607405264bytes.
+
+2026-11-07 fresh release/runtime evidence: release77203 exit0 (3m32s),
+nx2-gsv-release-build.log. NSP launched with isolated12GB/Vulkan/multicore config
+%TEMP%/ruzu-nx2-12gb.ini. PID19652 start2026-11-07T12:08:19.4640997Z reached
+SelfController2000 -> GSV4/101/204 -> GPU497 -> VI305 -> events31/32 -> nvhost-ctrl-gpu
+open. Thus prior SelfController2000zero-handle gate is genuinely passed.
+Logs nx2-gsv-runtime.stderr.log/stdout.log. No captured frames in
+%TEMP%/ruzu-nx2-gsv-captures, no Present229 observed. First near-null reads/writes
+at7.824s after MapMemory(dst0x10B7C62000,src0x210A47D000,size0x80000), repeated
+0x20/0x28/0x29/0x30/0x38/0x40. Stopped exact verified PID19652 (path+start checked).
+Second launch with RUZU_TRACE_UNMAPPED_GUEST=1, PID22964 start
+2026-11-07T12:09:14.1459381Z reproduces same nextgate. At3.451401s first trace:
+tid82 core0 pc0x846F73FC lr0x846C3578 ctx_lr0x846D42A0 vaddr0x20 bits64,
+r0=0x000B81EC r1=0x85604200 r2=0x100 r3=2 r4=0x10857039A8
+r5=0x2105631018 r6=0x210562E870 r7=0 fp=sp=0x1085703AA0.
+Preceded by nvhost-ctrl-gpu fd2/session0 and MapMemory
+(dst0x1101599000,src0x2109A7D000,size0x80000). Logs
+nx2-gsv-trace.stderr.log/stdout.log. Stopped exact verified PID22964.
+All build/test/runtime processes terminal. No game frame or FPS; goal ACTIVE.
+Next investigate this guest near-null loop: use project decompilation skill to
+map runtime PC/LR to correct SDK/main NSO and inspect call. PC may be saved
+context PC rather than exact load instruction; validate before inferring cause.
+Do not invent VI261/GSV unknown replies: source intentionally auto-stubs those.
+Factory/SelfController prerequisites now COMPLETE for source class scope,
+not overall NX2 support. Existing native MacroEngine/channel mode, SMMU36bit,
+pending channel poll etc still outstanding as detailed earlier.
+
+## 2026-11-07 ? src/core/src/hle/service/nvdrv/devices/nvhost_ctrl_gpu.rs vs src/core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.{h,cpp}
+
+### Intentional differences
+- Compared against origin/eden-nx2 50fa86bbbc403ad565eb44fcc281f16f77c69e15; reread header and implementation, including ioctl3 dispatch and complete characteristics/engine helpers after implementation.
+- NX2 slice: same-file ApplyNx2Characteristics, ApplyNx2CharacteristicsTail, GetCharacteristics3 and Nx2GetEngineInfo preserve values, threshold 0xD0, sticky caller detection, copy bounds/order and unknown-ioctl zero-success. Explicit G/0x13 still returns NotImplemented before fallback. Ioctl1 keeps Maxwell characteristics.
+- Source nine s16 writes are expressed as four paired u32 assignments and one low-half update; exact little-endian bytes at 0x70..0x81 are preserved. Engine Item records are serialized as eight LE words, including reserved zeros; no raw Rust padding is exposed.
+- Sticky per-device bool uses AtomicBool because NvDevice dispatch takes shared references. The upstream global flags retain sequentially consistent stores.
+- core cannot import video_core (dependency cycle). Required GpuCoreInterface::set_nx2_ampere bridge in src/core/src/gpu_core.rs is implemented by src/video_core/src/gpu.rs, assigning the existing global in video_core/nx2.rs; no state moved or duplicated. Reread upstream nx2.h global declaration and ctrl-GPU assignment. Device-only unit tests have no GPU; production owns one. Four existing test GPU implementations implement the new required method as a test-only no-op.
+- Existing fill_gpu_characteristics helper mechanically assigns the common Maxwell fields inside their original owning file.
+
+### Unintentional differences (to fix)
+- Pre-existing broader device debt outside this NX2 characteristics slice: ZBC set/query remain stubs rather than upstream locked color/depth tables; event destruction does not mirror FreeEvent. These require a separate state/lifecycle slice, not a claim that this device is fully ported.
+- Existing serializer wrapper validation and TPC method split remain older Rust adaptations; not newly introduced here.
+
+### Missing items
+- Full device parity still requires ZBC entry types/state/reference counting, PMU dispatch and event lifecycle review. Native channel/macro integration and 36-bit SMMU remain separately tracked prerequisites for actual rendering.
+
+### Binary layout verification
+- Compile-time size 160 and class offsets retained. Tests check nine interface versions, extended offset 0xB4, sticky tail, unchanged other tail bytes, engine records, short query, preserved input bytes and fallback gating. Tests/build status recorded in NX2_PORT_STATE.md when terminal.
+
+Ctrl-GPU verification result: focused3/3 pass; fullvideo1653/1ignored+docs pass;
+fullcore terminates STATUS_STACK_BUFFER_OVERRUN (0xc0000409), not green. ROM
+confirms Ampere17E/engine-info/event setup, next unported address-space ioctl
+8010410B; no frame/FPS. See NX2_PORT_STATE.md and nx2-ampere.stderr.log.
+
+## 2026-11-07 ? src/video_core/src/memory_manager.rs vs src/video_core/memory_manager.{h,cpp} (syncpoint shim)
+
+### Intentional differences
+- Reread header declarations/state and cpp constructors/SetNativeSyncpointShim/Read after implementation. Original owner now stores SystemRef and AtomicU64 shim; constant NUM_SHIM_SYNCPOINTS remains associated with MemoryManager (192).
+- Required production constructor takes SystemRef; GPU allocation (gpu.rs) and Host1x local GMMU (host1x/host1x.rs) pass their real SystemRef. Former no-system constructor is test-only. Existing Host1x interface provides actual guest values, without a second counter array.
+- Read<T> intercepts only sizeof(T)==4, nonzero base, address>=base, aligned offsets strictly below192*4. Release setter/acquire reader preserved. Guarded scalar copy implements source cast for the closed u8/u16/u32/u64 MemoryValue set. Normal reads and all writes remain ordinary mapped-memory operations.
+- Required GpuMemoryManagerHandle setter and constant getter bridge core's dependency boundary; VideoGpuMemoryManagerHandle delegates to owner. Three existing fake test handles implement both methods.
+
+### Unintentional differences (to fix)
+- Existing broader memory manager geometry/owner adaptations and unmapped access diagnostics are unchanged; this entry verifies only the syncpoint read interception and required constructor plumbing.
+
+### Missing items
+- nvhost_as_gpu ioctl0xB still pending this prerequisite's focused verification; not answered with an invented address.
+
+### Binary layout verification
+- Counters are u32 at stride4, 192 entries. Test exercises live increments on first/last counter, bound192, unaligned and different-width reads, ordinary writes, disabled shim, remapped base and a shim with no mapped backing. No serialized structure introduced here.
+
+## 2026-11-07 ? src/core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs vs src/core/hle/service/nvdrv/devices/nvhost_as_gpu.{h,cpp} (syncpoint ioctl / zero split)
+
+### Intentional differences
+- Reread h/cpp source after implementation: Nx2GetSyncpointShimInfo, ioctl1 A/0xB gate, VM fields, AllocAsEx validation/geometry/order. Owned by same Rust device file.
+- Mutex<bool> supplies interior mutability for the device's sticky shim bool under existing owner mutex. Checks initialized VM and actual GMMU before writing any output; enables once then returns last VM page, stride4, count from real MemoryManager constant via required trait getter.
+- Custom nonzero-start range with split0 sets split=end, extends end by4GiB using wrapping unsigned addition, and uses absolute big-page limit. Legacy/custom nonzero split remains unchanged. GPU address space is initialized before marking VM initialized.
+- GpuMemoryManagerHandle bridge avoids a core/video dependency cycle; source read behavior was implemented and tested first, no zero-filled substitute.
+
+### Unintentional differences (to fix)
+- Existing larger NX2 registry listener/Nx2Map/Unmap/Release path remains a separate prerequisite slice (session heap/SMMU lifetime ownership); not implemented or approximated here. Device is not declared complete.
+
+### Missing items
+- NX2 listener registration/removal, session and device-range tracking, native maps and releases; existing 36-bit SMMU concern is tracked separately.
+
+### Binary layout verification
+- Shim info repr(C), size16: address u64 at0, stride u32 at8, count u32 at12; no padding. Regression checks exact serialized bytes, no output writes on NotSupported, one setter call for repeated queries, zero-split geometry and an actual big-page allocation at the absolute start.
+
+Shim verification results: focused live Host1x test1pass, nvhost_as_gpu17pass,
+fullvideo1654pass/1ignored+docs. Fullcore native0xc0000005, not green. Release
+build exit0. ROM receives shim0xC0FFFFF000 and continues to GetVaRegions; next
+unported SVC0x80. No frame or FPS; no whole-device completion claim.
+
+## 2026-11-07 ? src/core/src/hle/kernel/svc/svc_types.rs and k_memory_block.rs vs src/core/hle/kernel/{svc_types.h,k_memory_block.h}
+
+### Intentional differences
+- Added source MemoryAttribute::GpuAccessible bit5 and KMemoryAttribute::GPU_ACCESSIBLE bit0x20 in original owners; SET_MASK includes it. Existing Rust enum/bitflags naming preserved. Reread both headers after edits.
+
+### Unintentional differences (to fix)
+- None in this attribute addition.
+
+### Missing items
+- SVC0x80 dispatcher pending prerequisite verification.
+
+### Binary layout verification
+- Same u32 SVC enum and u8 kernel flag widths; QueryMemory USER_MASK already includes bit0x20.
+
+## 2026-11-07 ? src/core/src/hle/kernel/k_page_table_base.rs vs src/core/hle/kernel/k_page_table_base.cpp (GPU attribute)
+
+### Intentional differences
+- Reread SetMemoryAttribute and header-owned attribute definition after edit. State validation requires FLAG_CAN_CHANGE_ATTRIBUTE for either UNCACHED or GPU_ACCESSIBLE. Only UNCACHED changes hardware page properties, matching source; GPU bit updates memory block attributes.
+
+### Unintentional differences (to fix)
+- None introduced in this validation condition.
+
+### Missing items
+- SVC0x80 dispatcher remains next.
+
+### Binary layout verification
+- Test checks bit value, rejection without change-attribute capability, successful set/query/clear and unchanged permissions; no new wire struct.
+
+## 2026-11-07 ? src/core/src/hle/kernel/svc_dispatch.rs vs src/core/hle/kernel/svc.{h,cpp} (SVC0x80)
+
+### Intentional differences
+- Reread Call special branch and svc.h after implementation. Mechanical dispatch_call helper stays in the original owner, shared by Rust's existing traced/untraced paths to avoid duplicating upstream's branch. It handles0x80 before either ABI dispatch as source does; no added title/platform gate.
+- Address/size always use GetArg64, mask/attr truncate to u32, result alone overwrites arg0. Validation order preserved: address alignment, nonzero aligned size, mask/attribute consistency and supported bit, unsigned wrap/Contains, page table mutation. Supported constant lives beside the source-equivalent branch.
+- Rust locks the current process only when its page table is needed; same result and no pre-validation mutation. GPU-only change calls actual page-table setter with prerequisite flag validation, not a successful stub.
+
+### Unintentional differences (to fix)
+- None in this branch. Broader existing dispatcher adaptations outside the slice are unchanged.
+
+### Missing items
+- Native GPU registry mapping remains a separate pending slice.
+
+### Binary layout verification
+- Existing eight u64 SvcArgs unchanged. Regression tests both ABI choices, full-width address, truncated mask high halves, all validation precedence cases, and unchanged args1..7. Page-table test verifies successful set/query/clear against actual block metadata.
+
+## 2026-11-07 ? src/core/src/hle/service/nvdrv/nvdrv.rs vs src/core/hle/service/nvdrv/nvdrv.{h,cpp} (NX2 node fallback)
+
+### Intentional differences
+- Reread Open and header builder/FD fields after change. Existing Rust match constructs known nodes; unknown /dev/nvhost-* nodes now use the already ported Nx2StubDevice, as upstream Open/nx2_stub_builder do. No G_NX2_DRIVER gate is added (source has none).
+- Unknown non-nvhost paths are rejected before consuming a descriptor. This fixes the older local increment-before-validation divergence. Known non-nvhost nodes are nvmap and nvdisp_disp0; all other existing builders use nvhost prefix.
+- Builder lambda stays mechanically represented by the device construction branch in its original owner; source logging/fallback is not generalized to arbitrary devices.
+
+### Unintentional differences (to fix)
+- None in this fallback slice; broader Module ownership/builders remain existing Rust adaptations.
+
+### Missing items
+- Native mapping listener wiring remains pending.
+
+### Binary layout verification
+- No new layout. Regression verifies unknown-name FD preservation, concrete stub type, ioctl3 echo/zero payload and close.
+
+SVC80/Open verification: page-table attribute test, dispatcher test and module
+open regression all pass. Fullcore0xc0000374 (not green). First optimized ROM
+run confirms SVC80 real set/clear success; next TSG open gate is now implemented
+and awaiting final release runtime. No frame/FPS claim.
+
+## 2026-11-07 ? src/core/src/hle/service/nvdrv/devices/nvhost_gpu.rs vs src/core/hle/service/nvdrv/devices/nvhost_gpu.{h,cpp} (NX2 channel dispatch/contexts/fence)
+
+### Intentional differences
+- Reread header-owned enum/ctxObjs and cpp ioctl1/2/3 fallbacks, context indexing/allocation, increment-count helper and submission ordering after edits.
+- Unknown ioctl1/2 branches use original Nx2UnknownIoctl only when G_NX2_DRIVER; ioctl3 additionally zeroes inline output before invoking it. Known handler errors are returned directly, never converted to success.
+- AllocateObjectContext now owns six optional original param records instead of zeroing obj_id. Non-optional channel Arc enforces source's valid-channel prerequisite. Existing channel mutex plus an inner Mutex array supports shared-reference NvDevice methods. Source flag reset, class mappings, zero-class candidate order, invalid/duplicate errors and deferred context state all preserved; no premature hardware binding introduced.
+- CtxClasses and GetObjectContextClassNumberIndex live in original module; helper takes raw u32 to preserve C++ enum casts of unknown integers. obj_id retained even on failure; no invented context handle.
+- BuildIncrementCountCommandList remains same-file helper, emitting WFI, zero payload and count increments. NX2 non-fence-increment submissions append it after main entries before source's optional legacy increment list, preserving flags/max counter order.
+- Existing regression incorrectly expected six words for BuildIncrementWithWfiCommandList; source is two WFI words plus six increment words (eight). Corrected test expectation after source comparison.
+
+### Unintentional differences (to fix)
+- Pre-existing EventInterface lifecycle bridge is incomplete. Additional NX2 channel events and corresponding destruction are a separate pending prerequisite slice; not approximated in this patch.
+- Optional EDEN_NX2_PB_CHECK/TRACEs are not yet mirrored here; source diagnostic difference only.
+
+### Missing items
+- NX2 QueryEvent cache/destruction; source event bridge lifecycle prerequisite.
+- Native channel/macro engine mode integration, address-space registry mapping and36-bit SMMU remain tracked separately. This file/subsystem is not claimed complete.
+
+### Binary layout verification
+- Existing IoctlAllocObjCtx repr(C) retained; its exact copy remains in slot and obj_id survives. Tests cover all fallback output/inline-copy contracts, context errors/selection, and actual ordered command stream for three increments without fence_increment.
+
+Validation of channel slice: five focused tests pass; optimized build succeeds.
+Exact-title runtime now reaches GPFIFO submission, but event7 returns
+BadParameter and GPU reads 0x210aba3000 onward are unmapped; guest aborts0xE401.
+No rendered frames or FPS. Full core suite failed a kernel wait test and hung
+on multiple kernel tests; owned test process stopped after PID/path/start/parent
+verification, suite NOT passed. See nx2-gpu-channel-core-full.log.
+Additional confirmed lifecycle difference: AllocGPFIFOEx H/0x18 missing and Ex2
+initializes eagerly rather than storing program_id pending address-space bind.
+Requires channel state/handle prerequisite and is recorded in NX2_PORT_STATE.md.
+
+## 2026-11-07 â€” src/core/src/hle/service/kernel_helpers.rs vs src/core/hle/service/kernel_helpers.{h,cpp} (explicit kernel owner)
+
+### Intentional differences
+- Re-read constructor/CreateEvent/CloseEvent/header after implementation. new_with_system retains SystemRef and resolves its kernel for process construction and event IDs, matching the source retained system.Kernel reference. Shared new_impl is mechanical constructor delegation in the same owner.
+- Existing name-only constructor is retained for legacy callers; this slice provides the explicit constructor required by NVDRV without migrating unrelated services.
+- Existing Rust handle-to-Event ownership and readable-end bridge are preserved.
+
+### Unintentional differences (to fix)
+- Legacy name-only callers still depend on global kernel availability; not migrated in this prerequisite.
+
+### Missing items
+- Upstream debugger GetEventName registry remains absent (diagnostic only). NVDRV bridge and NX2 channel event cache follow this prerequisite.
+
+### Binary layout verification
+- No serialized structure changes. Regression creates a real kernel-backed event with global kernel explicitly unavailable, verifies registered/readable identity and service-close removal while a copied readable Arc survives.
+
+## 2026-11-07 â€” src/core/src/hle/service/nvdrv/nvdrv.rs vs src/core/hle/service/nvdrv/nvdrv.{h,cpp} (event ownership)
+
+### Intentional differences
+- Re-read EventInterface constructor/CreateEvent/FreeEvent and Module header/constructor. Module owns ServiceContext; interface retains a shared Arc to that same context, avoiding a Module reference cycle. Standalone constructor is retained for isolated device tests.
+- Existing NvDevice readable-end API requires an object-ID to ServiceContext-handle bridge. Creation now uses real KEvent/readable ownership through ServiceContext; FreeEvent closes its owner rather than being a no-op.
+- Nullable source CreateEvent result is Option, including resource exhaustion. No invented successful event on allocation failure.
+
+### Unintentional differences (to fix)
+- No new divergence in this bridge. Broader kernel object registry/reference-count semantics remain represented by the existing ServiceContext/Event implementation.
+
+### Missing items
+- NX2 channel cache remains pending prerequisite validation.
+
+### Binary layout verification
+- Host ownership only; no wire layout changes. Regression verifies shared Module context, nonzero parent, stable readable identity, owner removal and surviving copied readable Arc.
+
+## 2026-11-07 â€” src/core/src/hle/service/nvdrv/devices/nvhost_ctrl.rs vs src/core/hle/service/nvdrv/devices/nvhost_ctrl.{h,cpp} (nullable event allocation)
+
+### Intentional differences
+- Reread CreateNvEvent and header kevent field. Direct Option assignment now preserves nullable CreateEvent result. Registration/status ordering unchanged. Test systems use stable boxed addresses when explicit context accesses kernel SystemRef.
+
+### Unintentional differences (to fix)
+- None in this mechanical API adaptation.
+
+### Missing items
+- No new missing items in this slice; broader device parity not asserted.
+
+### Binary layout verification
+- No wire structure changed.
+
+## 2026-11-07 â€” src/core/src/hle/service/nvdrv/devices/nvhost_ctrl_gpu.rs vs src/core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.{h,cpp} (event lifetime)
+
+### Intentional differences
+- Reread header event/interface fields and destructor. Option represents nullable KEvent pointers, QueryEvent forwards that option. Retained interface releases error notifier then unknown event in Drop, matching source order.
+
+### Unintentional differences (to fix)
+- None in event ownership slice; prior unrelated ZBC/PMU gaps remain tracked.
+
+### Missing items
+- None added in this slice.
+
+### Binary layout verification
+- Host ownership only, no serialized payload changes.
+
+## 2026-11-07 â€” src/core/src/hle/service/nvdrv/devices/nvhost_gpu.rs vs src/core/hle/service/nvdrv/devices/nvhost_gpu.{h,cpp} (base event lifetime)
+
+### Intentional differences
+- Nullable base events use Option. Retained interface frees breakpoint-int, breakpoint-pause and error notifier before syncpoint release, matching source destructor. Stable boxed test systems preserve kernel SystemRef validity.
+
+### Unintentional differences (to fix)
+- NX2 event cache still awaits this prerequisite validation.
+
+### Missing items
+- NX2 QueryEvent/cache destruction next; previous native mapping/channel lifecycle gaps still tracked.
+
+### Binary layout verification
+- No wire layout changes.
+
+## 2026-11-07 â€” src/core/src/hle/service/nvdrv/core/syncpoint_manager.rs vs src/core/hle/service/nvdrv/core/syncpoint_manager.{h,cpp} (regression expectations)
+
+### Intentional differences
+- Re-read source HasSyncpointExpired and header u32 counters. Corrected pre-existing regression assertions to literal unsigned (max-threshold)>=(min-threshold): with min0/max10, thresholds5/10 are pending, threshold11 is expired. After min reaches10 all tested values are expired. Production code unchanged.
+- Related nvhost_ctrl test fixtures now submit maximum5 before expecting a pending wait at5. Previously max0/min0 made any threshold expired by upstream formula, so three tests were testing an unreachable wait branch.
+
+### Unintentional differences (to fix)
+- None in counter math; this change repairs incorrect tests rather than changing the source contract.
+
+### Missing items
+- No new item for this test-only slice.
+
+### Binary layout verification
+- No layout change; unsigned wrap comparisons are exercised explicitly.
+
+## 2026-11-07 â€” src/core/src/hle/service/nvdrv/devices/nvhost_gpu.rs vs src/core/hle/service/nvdrv/devices/nvhost_gpu.{h,cpp} (NX2 events)
+
+### Intentional differences
+- Re-read QueryEvent/destructor and header std::map after implementation. Mutex<BTreeMap<u32, Option<readable Arc>>> preserves ordered map, nullable allocation/retry, and shared-reference NvDevice API.
+- Standard IDs1/2/3 retain their original events. Unknown IDs are created lazily only with G_NX2_DRIVER, cached by ID, named GpuChannelNx2Event{id}, and left unsignalled exactly as source. Allocation failure remains None and retries on next query.
+- Drop frees standard events first, cached events in increasing ID order next, and syncpoint last. This resumes the slice after real EventInterface/ServiceContext prerequisite, rather than adding parentless events.
+
+### Unintentional differences (to fix)
+- None in QueryEvent branch. Native registry mapping and channel initialization prerequisites still pending.
+
+### Missing items
+- No source signal producer exists for these extra events; source labels them stubbed. No fabricated signal was added.
+
+### Binary layout verification
+- No wire layout change; regression checks same-ID identity, different-ID distinction, two cached entries, and initial unsignalled state.
+
+Event prerequisite validation: ServiceContext6/6, Module bridge2/2, NVDRV61/61
+pass. Three waiting tests required a valid SystemRef once corrected pending
+counter fixtures reached their actual Host1x paths. Source behavior unchanged.
+Event slice final validation: NVDRV61/61 pass including cache behavior, explicit
+context6/6. Fullcore0xc0000005, notgreen. Release build succeeds; exact-title run
+confirms event7 Success with readable object759, no prior immediate0xE401 abort
+observed. GPFIFO still reads unmapped nativeGPU addresses; noframes/FPS. Native
+registry listener mapping is next required slice. Runtime process stopped.
+
+## 2026-11-07 â€” src/core/src/hle/service/nvdrv/core/heap_mapper.rs vs src/core/hle/service/nvdrv/core/heap_mapper.{h,cpp} (deferred owner retirement)
+
+### Intentional differences
+- Reread destructor/Unmap/header after implementation. Mechanical finalize helper keeps destructor logic in HeapMapper and drains each owned interval through the same SMMU unmap call. Drop delegates to it.
+- Explicit retirement permits source mapper.reset() side effects at the original CloseSession point while an Arc retained by a deferred NX2 callback still exists. Draining prevents late Drop/release from unmapping newly reused backing; the source raw capture would be invalid after destruction.
+
+### Unintentional differences (to fix)
+- None in interval teardown; no extra map or early counter decrement introduced.
+
+### Missing items
+- Native listeners use this prerequisite next.
+
+### Binary layout verification
+- Host ownership only. Five focused tests pass, including overlapping intervals drained before last captured owner disappears.
+
+## 2026-11-07 â€” src/core/src/hle/service/nvdrv/core/container.rs vs src/core/hle/service/nvdrv/core/container.{h,cpp} (captured mapper identity)
+
+### Intentional differences
+- Re-read mapper creation/CloseSession/GetSession and header. Arc represents a retained callback pointer safely; explicit finalize before resetting session.mapper preserves destructor unmaps before SMMU Free/UnregisterProcess.
+- get_session_mapping mechanically projects source GetSession fields under the existing session mutex. Existing inactive slots are preserved as source does; missing indices yield None instead of out-of-bounds access. Returned mapper is the exact object, not a deferred SessionId lookup.
+
+### Unintentional differences (to fix)
+- None in this capture slice; no change to session ref-count or reuse ordering.
+
+### Missing items
+- Native mapping callbacks next.
+
+### Binary layout verification
+- No serialized layout. Four focused tests pass including same-slot reuse retaining original mapper identity.
+
+## 2026-11-07 â€” src/core/src/hle/service/nvdrv/devices/nvhost_as_gpu.rs vs src/core/hle/service/nvdrv/devices/nvhost_as_gpu.{h,cpp} (native mapping listeners)
+
+### Intentional differences
+- Reread header/constructor/destructor/Ioctl1/OnOpen/Nx2Map/Nx2Unmap/Nx2Release after implementation. Source methods remain associated with NvHostAsGpu in this file. Successful ioctlA9 registers/replays callbacks only with G_NX2_DRIVER, after allocation lock release; Drop removes listener.
+- Nx2State is a mechanical callback-lifetime adapter for device-owned fields, sharing the exact original AS mutex/GMMU. Weak references target this state rather than the device: a last-device-Arc drop inside a registry callback would recursively lock RemoveListener. Device alone owns registration; no strong listener cycle or raw self pointer is introduced. Opaque listener identity is stable state address instead of movable Rust self address.
+- Container clone shares the same underlying session state. Nx2Map preserves session/GMMU checks, exact CPU-range reuse, preallocated heap preference, aligned128KiB allocation, zero failure, tracked SMMU map, registry publication then PITCH/small-page GMMU mapping.
+- Nx2Unmap queues GMMU unmap. Nx2Release erases its range before queueing and captures the exact current heap mapper; nonheap release unmaps then frees aligned128KiB. GMMU Arc/mapper Arc/SystemRef safely represent the original captures without late session-ID lookup.
+
+### Unintentional differences (to fix)
+- Separate known prerequisites remain: native channel/macro execution and 36-bit SMMU capacity. This is not a full graphics parity claim.
+
+### Missing items
+- No missing handler in this mapping slice. Existing channel lazy initialization difference remains recorded.
+
+### Binary layout verification
+- No new wire struct. Regression covers real ioctl registration/replay, same-CPU-range reuse, device range publication, ordered deferred unmaps before SMMU release, allocation failure, and listener removal on device destruction.
+Mapping slice validation: heap5/5, container4/4, AS18/18 pass. Fullcore exits
+0xc0000409 (not green), release build succeeds. Exact ROM now installs native
+GMMU mappings, but SMMU device reads still fail at0x49A4000 onward. No frame/FPS.
+Next prerequisite is registered process-memory backing resolution; native macro
+integration is deferred until these actual command-buffer reads work.
+
+## 2026-11-07 â€” src/video_core/src/host1x/gpu_device_memory_manager.rs vs src/core/device_memory_manager.{h,inc} (SMMU backing diagnostic)
+
+### Intentional differences
+- Re-read upstream Map/GetRawPhysicalAddr/header and Rust map loop after edit. RUZU_TRACE_NX2_SMMU logs only the first page of each mapping: ASID/device/CPU addresses, owning page table, resolved host pointer, physical base/span and compressed index. This is host diagnostic instrumentation only; mapping inputs, results, order and storage are unchanged.
+
+### Unintentional differences (to fix)
+- Runtime device reads remain unmapped after GMMU mapping. Cause not yet identified; diagnostic distinguishes null process translation from rejected physical backing.
+
+### Missing items
+- No new behavior; the backing-resolution investigation remains active.
+
+### Binary layout verification
+- No layout or payload changes.
+
+## 2026-11-07 â€” src/video_core/src/host1x/gpu_device_memory_manager.rs vs src/core/device_memory_manager.{h,inc} and src/video_core/host1x/gpu_device_memory_manager.h (NX2 physical/device capacity)
+
+### Intentional differences
+- Reread current source constants/constructor after change: physical_min_bits32, physical_max_bits35, 4GiB chooses min and every other layout chooses max. Device virtual bits36. Rust now uses those exact capacities rather than an inferred 33/34-bit per-layout approximation.
+- Existing Rust Maxwell specialization owns these template constants and dense tables in this file; no new cross-module dispatcher or duplicated state introduced. Dense table representation remains existing adaptation (272MiB device tables per manager plus physical reverse table), while upstream uses sparse virtual vectors.
+
+### Unintentional differences (to fix)
+- Corrected confirmed runtime rejection: CPU pointer delta0x4849a3000 was valid in actual20GiB backing but beyond old16GiB physical span, yielding compressed=None and unmapped command-buffer reads.
+
+### Missing items
+- Native macro context/integration remains subsequent prerequisite; no frames claimed.
+
+### Binary layout verification
+- Compressed physical page still u32 with +1 sentinel and same reverse-alias representation. Existing boundary regression now uses actual20GiB backing for12GiB mode, reads its last physical page and maps the same page near64GiB device boundary; checks reverse aliases and unmaps. Layout selector tested in isolated child process for every supported mode.
+
+## 2026-11-07 â€” src/core/src/device_memory_manager.rs vs src/core/device_memory_manager.h (physical constant ownership)
+
+### Intentional differences
+- Reread source header after moving PHYSICAL_MIN_BITS32/PHYSICAL_MAX_BITS35 into the upstream-owned core module. Public visibility allows the existing video_core specialization to import them across crates. No duplicate constants remain in video_core; the preceding capacity-entry placement description is superseded by this correction.
+
+### Unintentional differences (to fix)
+- None for these constants. Existing specialization placement limitation remains documented in the module header.
+
+### Missing items
+- No new item in constant ownership slice.
+
+### Binary layout verification
+- No payload changes; the video_core boundary/real-backing regressions exercise the imported limits.
+Capacity final validation: real high-backing regression passes; full video_core
+1654passed/1ignored +doctests passed, final release build succeeded. Fullcore
+0x80000001 (notgreen). Exact title now resolves device49A4000 to compressed
+physical4737444 and reads commands, then reaches legacy macroJIT parameter errors.
+No frames/FPS. Native Turing macro integration remains required.
+
+## 2026-11-07 - src/video_core/src/macro_turing.rs vs src/video_core/macro_turing.h
+
+### Intentional differences
+- Execute has an immutable-slice wrapper and execute_with_code_reader in the same owner. The latter fetches three upload-order words per instruction with no borrow held during callbacks. This preserves upstream live span reads when emitted methods upload new code; an immutable Rust slice cannot legally span those writes. No snapshot of the whole program is made.
+
+### Unintentional differences (to fix)
+- None introduced by the instruction-fetch adapter. Native MacroEngine integration remains a separate interrupted slice in NX2_PORT_STATE.md.
+
+### Missing items
+- No missing interpreter operation in this slice. MacroEngine callers must still be connected to the live reader during native integration.
+
+### Binary layout verification
+- PASS: no guest or serialized structure changed. Upload word order is reversed into Decode exactly as upstream.
+
+Verification: reread header-only upstream Execute, including decode invalidation, bounds checks, callbacks, end delay and loop ordering; no .cpp exists for this interpreter. Added callback replacement of a cached instruction and incomplete/out-of-bounds fetch tests. Test results pending below.
+
+Validation complete: focused macro_turing tests 11 passed (session 58947); full cargo test -p video_core 1656 passed, 1 ignored, doc tests passed, exit 0 (session 69012; nx2-live-code-video-full.log, 109.63s).
+
+## 2026-11-07 - src/video_core/src/native_qmd.rs vs src/video_core/native_qmd.h
+
+### Intentional differences
+- Header-only NativeQmdScheduler port lives in its matching Rust module, exported by lib.rs. State, ReleaseSlots and Signal logic retain their original owner.
+- Rust callback traits and PlainRelease/FlaggedRelease wrappers encode C++ compile-time callback arity and RejectShaderDispatch type checks; signal delegates to signal_with_dispatch for the overload.
+- Process-wide unordered state table uses HashMap behind OnceLock/Mutex. This preserves cross-channel ownership and serial GPU execution; callbacks must not recursively call Signal. Inspected upstream compute read/release/dispatch call path does not recursively signal. Trace uses a Send boxed closure to support GPU thread ownership.
+- Internal State is not byte-serialized; no C++ object ABI is required.
+
+### Unintentional differences (to fix)
+- None identified in the scheduler port after rereading the full upstream header and comparing state transitions, read/validate/dispatch/complete/release/chain ordering.
+
+### Missing items
+- Scheduler complete as a leaf prerequisite. KeplerCompute native methods and channel/native macro wiring are still pending; this does not claim shader execution or gameplay.
+
+### Binary layout verification
+- PASS: Descriptor is [u32; 64], 256 bytes, alignment 4, initialized to zero; guest words and 40-bit release addresses preserve upstream bit placement. State has no guest binary layout contract.
+
+Focused tests cover cross-channel deferred dependency updates, execution-time payload reload, reuse vs forced reload, callback rejection vs failed dispatch completion, third release slot, validate-all-before-release, reduction flags, release failure ordering, chain actions/limits and 4096-state cache boundary. Initial six tests passed; final full suite pending.
+
+Final validation: cargo test -p video_core passed 1663 tests, 1 ignored, doc tests passed; exit 0, session68800, nx2-qmd-video-full.log (110.03s). Seven scheduler tests now cover dependent validation after parent releases and before child execution as well.
+
+## 2026-11-07 - src/video_core/src/macro.rs vs src/video_core/macro.h and macro.cpp (native state/upload slice)
+
+### Intentional differences
+- Native fields, AddCode/ClearCode branches and NativeMacroContext remain in the upstream macro owner. Default implements the C++ aggregate initialization.
+- Native JIT shared_ptr is an optional Arc/Mutex on x86_64; the backend field is omitted on other architectures because the Rust JIT is architecture-specific. Creation remains lazy (None initially).
+- u64 generation uses wrapping_add to reproduce unsigned C++ overflow in debug builds too.
+
+### Unintentional differences (to fix)
+- None identified in constructors or the two upload methods after rereading header and cpp consumers. Native execution integration is still in progress, not enabled on channels.
+
+### Missing items
+- MacroEngine::Execute native branch, native context attachment and Maxwell3D/KeplerCompute consumers remain the active implementation slice. No native execution stub was introduced.
+
+### Binary layout verification
+- PASS: native code remains 0x3000 u32 words (0xc000 bytes), each binding array 0x80 u32 words (0x200 bytes), zero initialized. Host MacroEngine/NativeMacroContext objects are not serialized.
+
+Tests exercise last instruction, ignored upload method, full/out-of-range writes still changing generation, ClearCode preserving words and generation, u64 wrap, legacy/native upload isolation, independently initialized graphics/compute state and lazy JIT. Validation pending below.
+
+Final native macro state validation: fullvideo39967 terminal exit0,1665passed/1ignored+docs,112.40s (nx2-native-macro-state-video-full.log). No sessions or ROM active. Native Execute and engine/channel integration still pending; goal remains active, no frames/FPS.
+
+## 2026-11-07 - src/video_core/src/engines/maxwell_3d.rs vs src/video_core/engines/maxwell_3d.h and .cpp (native RAM borrowing)
+
+### Intentional differences
+- The channel still owns its zeroed DataRam, but stores it in Arc<parking_lot::Mutex<DataRam>>. GetNativeDataRam returns the handle. This is required so a cloned handle can hold the interpreter RAM borrow while emitted methods reborrow Maxwell3D, without overlapping exclusive references. Compute can share the exact channel allocation, matching the upstream pointer, rather than copying RAM.
+- Arc lifetime replaces the upstream raw pointer lifetime; each channel still allocates distinct RAM. Native callback DMA must use the RAM reborrow supplied by the interpreter/JIT, not lock the same RAM again.
+
+### Unintentional differences (to fix)
+- None in RAM initialization, persistence or channel isolation.
+
+### Missing items
+- Native Execute and engine/context activation remain in progress. This prerequisite is implemented before enabling those paths.
+
+### Binary layout verification
+- PASS: underlying DataRam is still [u32;0xc00], 0x3000 zeroed bytes. The host engine object is not serialized.
+
+Reread upstream header ownership/GetNativeDataRam and constructor/destructor in cpp. Regression runs a real Turing interpreter callback that calls the engine while the RAM guard is held, and verifies both the register write and persistent RAM write. Focus10336 passed four tests. Full-suite result follows.
+
+## 2026-11-07 - src/video_core/src/memory_manager.rs vs src/video_core/memory_manager.h and .cpp (Read diagnostic limit)
+
+### Intentional differences
+- Four AtomicU32 slots represent the C++ template-local static reported counter for u8/u16/u32/u64. Rust generic-function statics would otherwise share one counter across widths. SeqCst fetch_add matches the default C++ ordering.
+
+### Unintentional differences (to fix)
+- Fixed the confirmed uncapped unmapped-read log divergence. Separately, existing Write<T> logs an unmapped address whereas upstream ASSERT(false); changing that failure policy requires auditing callers/tests and remains outside this read diagnostic correction.
+
+### Missing items
+- None for Read diagnostic limiting.
+
+### Binary layout verification
+- Not applicable: diagnostic counters only. Read still returns the default value after an unmapped access.
+
+Reread template declaration and implementation; memory lookup and syncpoint shim are unchanged.
+
+Final validation: cargo test -p video_core exit0;1666passed/1ignored+docs,111.03s, session25441 (nx2-native-ram-video-full.log). Focus10336 four tests passed.
+
+## 2026-11-07 - src/video_core/src/macro.rs vs src/video_core/macro.h and macro.cpp (native Execute)
+
+### Intentional differences
+- Native Execute is a same-owner associated raw-pointer entry execute_native, separate from the legacy receiver method. This permits emitted uploads into the engine without keeping a whole-engine exclusive Rust reference live across callbacks. Interpreter/FIFO/memo/write-log state is temporarily moved into locals and restored on all normal returns; code, generation and upload offset remain live in their original owner. Native methods reject nested macro calls as upstream.
+- Per-channel RAM handle is cloned and locked; callback RAM/FIFO arguments are reborrows. Memory manager handle is cloned before cache callbacks, avoiding a long-lived whole-Maxwell reference.
+- Function-local shared diagnostics use OnceLock/Mutex or atomics under serialized GPU execution. Call dumps explicitly encode little-endian words. Log formatting uses Rust formatting (including named memo statistics) with the same values and trigger counts.
+- Failed JIT preparation returns an explicit error: set sticky execution failure and log, rather than a C++ allocation/codegen exception.
+- Macro profiling scope added to the legacy entry too, matching upstream common Execute entry.
+
+### Unintentional differences (to fix)
+- None identified in the implemented native branch after rereading header and entire cpp branch and comparing refresh, diagnostics, method/DMA, JIT/memo, live code, generation guards and failure ordering.
+
+### Missing items
+- Maxwell3D caller routing to execute_native and shared context, KeplerCompute native methods and ChannelState activation remain pending. Native Execute is exercised directly in focused tests; this is not a gameplay claim.
+
+### Binary layout verification
+- PASS: recording uses u32 start/count/parameter words and full 0x3000-word code dumps. DMA reads use MemoryManager::read<u32>, preserving syncpoint shim and scalar read semantics; source upper address mask and wrapping RAM index additions preserved.
+
+Validation: isolated child processes exercise JIT=0/MEMO=0, JIT=0/MEMO=1 and JIT=1. Covers refresh-before-execute, memo replay, sticky failure on nested macro method, actual upload callbacks modifying not-yet-executed code (interpreter observes immediately, JIT keeps prepared program), changed-generation memo suppression. Owner-backed DMA tests verify BUFFER_CACHE flush-before-read using host-written payload, RAM truncation, FIFO growth capped to0x1000, and no DMA memo entries. Focus46565 and9145 passed. Full suite pending.
+
+Final native Execute validation: full cargo test -p video_core exit0;1667passed/1ignored+docs,110.36s, session30739 (nx2-native-execute-video-full.log). Both focused child-process matrices terminal exit0 (46565,9145).
+
+## 2026-11-07 - src/video_core/src/engines/draw_manager.rs vs src/video_core/engines/draw_manager.cpp and maxwell_3d.h (deferred draws)
+
+### Intentional differences
+- Rust passes explicit instance_count/force_draw arguments instead of C++ defaults. u32 batch-count addition uses wrapping_add. DrawManager remains in its corresponding cpp-owned Rust file; source declaration is nested in maxwell_3d.h, no draw_manager.h exists.
+
+### Unintentional differences (to fix)
+- Fixed missing DrawDeferred and the eager-instance divergence in DrawBegin/DrawEnd. Instance END now defers unless forced; a flush submits instance_count+1 and then resets the count. BEGIN First flushes before count/mode/topology changes. Base instance uses the live global base, without the prior per-instance offset. Inline-index END still submits immediately with supplied count.
+
+### Missing items
+- None in these three methods. Shared native context integration remains the interrupted parent slice.
+
+### Binary layout verification
+- Not applicable: no struct/guest layout changes.
+
+Reread header declaration/default arguments and cpp methods after implementation; compared branch/state/update/draw ordering. Tests now derive expectations from source instead of preserving previous eager behavior: forced batch/no double flush, topology ordering, live register capture at flush, unchanged-instance and inline-index paths, unsigned count wrap.
+
+## 2026-11-07 - src/video_core/src/engines/maxwell_3d.rs vs src/video_core/engines/maxwell_3d.cpp and .h (macro draw completion)
+
+### Intentional differences
+- Existing Rust flush_macro adapter follows the same completion ordering as CallMacroMethod. Draw-manager lease uses existing with_draw_manager ownership adapter.
+
+### Unintentional differences (to fix)
+- Fixed omission of DrawDeferred after macro execution. Also reset executing_macro before explicit flush execution and submit deferred draw before parameter cleanup, matching source CallMacroMethod ordering.
+
+### Missing items
+- Shared native macro context getters/setters/upload routing and native Execute dispatch still pending.
+
+### Binary layout verification
+- Not applicable: control flow only.
+
+Regression executes a real no-op macro through both completion paths, verifies one batch then no second submission. Initial focus84509 failed five tests encoding the old divergence; source-derived corrections pass focus53797 (211 tests). Final full suite pending below.
+
+Final deferred-draw validation: full cargo test -p video_core exit0;1668passed/1ignored+docs,111.27s, session7588 (nx2-deferred-draw-video-full.log). Focus53797 211passed.
+
+## 2026-11-07 - src/video_core/src/engines/maxwell_3d.rs vs src/video_core/engines/maxwell_3d.h and .cpp (shared native macro routing)
+
+### Intentional differences
+- Native context uses the same-owner SharedNativeMacroContext alias from macro.rs: Arc<ReentrantMutex<RefCell<NativeMacroContext>>>. The lock serializes GPU users but permits same-thread emitted uploads. Accessor callbacks replace references/spans that cannot outlive a Rust guard.
+- CallMacroMethod retains the reentrant guard throughout Execute, obtains raw field pointers directly from RefCell::as_ptr (not from a discarded RefMut), and holds no RefMut during callbacks. This preserves live upload/code generation behavior with no unprotected cross-thread access and no unsafe Sync implementation.
+- Native Execute uses its previously verified raw entry, legacy uses the existing backend. flush_macro delegates to CallMacroMethod so both paths share routing, deferred draw and parameter/address/segment/dirty cleanup.
+- NativeVertexStreamSize lives with other Regs accessors on Maxwell3D because the Rust register bank is a flat array.
+
+### Unintentional differences (to fix)
+- Fixed missing shared-context setters/getters and upload/bind/execution routing.
+- Fixed GetMaxCurrentVertices native 40-bit size source and small legacy arithmetic divergences: unsigned range subtraction, u32 cap before division, no invented stride minimum. Renamed counterpart to get_max_current_vertices.
+
+### Missing items
+- KeplerCompute native integration and ChannelState singleton/activation remain pending. Split-GPU front methods and other native engine methods are not covered by this slice; no claim of complete Maxwell3D port or gameplay.
+
+### Binary layout verification
+- PASS: binding arrays and code word layout unchanged; NativeVertexStreamSize reads word0x180+2*index high8/low32. Context synchronization wrappers are host-only.
+
+Post-change source header getters/mode/size and cpp upload/bind/call/vertex-count paths reread and compared. Tests execute a macro uploaded/bound by another channel, perform reentrant emitted upload, distinguish shared code from per-channel RAM, exercise explicit flush, detach/fallback and cross-thread handle transfer, under JIT and interpreter. Vertex tests check high-bit masking, shared mode selection, u32 cap, unsigned legacy underflow and constant attributes. Focus88351 passed both backends; focus67319 all213 Maxwell tests passed.
+
+## 2026-11-07 - src/video_core/src/macro.rs vs src/video_core/macro.h and macro.cpp (context sharing adapter)
+
+### Intentional differences
+- SharedNativeMacroContext aliases the Rust equivalent of shared_ptr<NativeMacroContext> with reentrant locking/interior mutability; state and ownership remain in the original macro module. One HLE call site follows the corrected snake_case get_max_current_vertices name.
+
+### Unintentional differences (to fix)
+- None introduced in macro execution by this adapter.
+
+### Missing items
+- Compute/context consumers and channel activation remain pending.
+
+### Binary layout verification
+- Not applicable: host sharing wrapper; guest arrays unchanged.
+
+Final shared-context validation: cargo test -p video_core exit0;1670passed/1ignored+docs,110.87s, session17640 (nx2-shared-context-video-full.log).
+
+## 2026-11-07 - src/video_core/src/engines/kepler_compute.rs vs src/video_core/engines/kepler_compute.h and .cpp (native report semaphore)
+
+### Intentional differences
+- Deferred reduction captures an Arc of the exact MemoryManager owner instead of this; source callback accesses no other engine state. The captured address/payload/reduction are copied at submission, while old memory is read at fence execution. Mutex protects the same owner for read/modify/write.
+- Unsigned additions use wrapping_add. The first32 diagnostic counter uses AtomicU32 for Rust shared-static safety; method/register/constants remain in the source owner.
+- A missing rasterizer for a supported operation is an explicit contract panic instead of dereferencing the upstream null pointer; unsupported operations still return before rasterizer access.
+
+### Unintentional differences (to fix)
+- None identified in this method after rereading header declaration/register bank and full cpp implementation, including operation checks, one-word flags and eight reduction branches.
+
+### Missing items
+- Native compute method dispatch, macro/context mode state, QMD dispatch and channel activation remain pending. This method is verified directly; no native mode is prematurely enabled.
+
+### Binary layout verification
+- PASS: native_registers is a zero-initialized [u32;0x1000]. Address formation preserves the source25-bit high mask and32-bit low value; payload writes remain u32. No raw host object serialization is introduced.
+
+Focused tests use queued fences with owner-backed GPU memory: memory changes between submission/execution are observed, later register changes do not affect captured parameters, all eight reductions and wrap/threshold branches match source. Query tests cover operations0/2, one-word/timestamp flags,57-bit address mask, raw payload and unsupportedoperations1/3 with no side effects. Full-suite result follows.
+
+Final compute-semaphore validation: full cargo test -p video_core exit0;1672passed/1ignored+docs,111.86s, session26051 (nx2-compute-semaphore-video-full.log). Focus41654 all22 Kepler tests passed.
+
+## 2026-11-07 - src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+
+### Intentional differences
+- Instruction/LoweredProgram declarations and Bits; repr(C) instruction16bytes/alignment4. is_valid replaces explicit bool conversion.
+
+### Unintentional differences (to fix)
+- None identified in implemented items after rereading the header; these helpers have no cpp counterpart.
+
+### Missing items
+- LowerToMaxwell implementation remains the interrupted prerequisite; no lowering stub or activation added. Shader environment and compute integration remain pending.
+
+### Binary layout verification
+- PASS for implemented data: instruction16bytes; scalar word order preserved; overrides use 24-byte header followed by exact source/canonicalwords/map entries. Host vectors/state are not raw serialized.
+
+Tests: Exhaustive valid cross-word bit fields, default/error validity, layout. Full shader_recompiler validation pending.
+
+## 2026-11-07 - src/shader_recompiler/src/frontend/ampere/program_address_map.rs vs src/shader_recompiler/frontend/ampere/program_address_map.h
+
+### Intentional differences
+- All three helpers and magic retained in matching owner. wrapping u32 arithmetic before u64 promotion matches source.
+
+### Unintentional differences (to fix)
+- None identified in implemented items after rereading the header; these helpers have no cpp counterpart.
+
+### Missing items
+- None in this header-only helper. Shader environment and compute integration remain pending.
+
+### Binary layout verification
+- PASS for implemented data: instruction16bytes; scalar word order preserved; overrides use 24-byte header followed by exact source/canonicalwords/map entries. Host vectors/state are not raw serialized.
+
+Tests: Control-word gaps, duplicate offsets, emptyappend, u32wrap, malformedcounts/targets/alignment. Full shader_recompiler validation pending.
+
+## 2026-11-07 - src/shader_recompiler/src/frontend/ampere/program_capture.rs vs src/shader_recompiler/frontend/ampere/program_capture.h
+
+### Intentional differences
+- ProgramCaptureState/Observe and limit retained in matching owner. Rust enum replaces nested C++ Result.
+
+### Unintentional differences (to fix)
+- None identified in implemented items after rereading the header; these helpers have no cpp counterpart.
+
+### Missing items
+- None in this header-only helper. Shader environment and compute integration remain pending.
+
+### Binary layout verification
+- PASS for implemented data: instruction16bytes; scalar word order preserved; overrides use 24-byte header followed by exact source/canonicalwords/map entries. Host vectors/state are not raw serialized.
+
+Tests: Call/exit/return ordering, NOINCjump, computedbranchself-termination, signed32vs50bitrelative targets andbounds. Full shader_recompiler validation pending.
+
+## 2026-11-07 - src/shader_recompiler/src/frontend/ampere/program_override.rs vs src/shader_recompiler/frontend/ampere/program_override.h
+
+### Intentional differences
+- All four helpers retained in matching owner. Explicit little-endian bytes replace host memcpy on supported little-endian targets; is_valid replaces bool. FNV uses wrapping u64 multiplication.
+
+### Unintentional differences (to fix)
+- None identified in implemented items after rereading the header; these helpers have no cpp counterpart.
+
+### Missing items
+- None in this header-only helper. Shader environment and compute integration remain pending.
+
+### Binary layout verification
+- PASS for implemented data: instruction16bytes; scalar word order preserved; overrides use 24-byte header followed by exact source/canonicalwords/map entries. Host vectors/state are not raw serialized.
+
+Tests: ExactOV02layout, legacyOV01, sourceidentity/length, badheaders, monotonicboundedmap, repeatedoffsets, failedparseclears, FNV00..0f vector. Full shader_recompiler validation pending.
+
+2026-11-07 Ampere helper validation: nx2-ampere-helpers-full.log ends with 606 passed, 0 failed and doc-tests passed. Prior session78548 is no longer registered; terminal log verified, no rerun. program_capture/program_address_map/program_override and Instruction/LoweredProgram declarations complete; actual LowerToMaxwell still absent. Next port its same-file operand/materialization helpers before the opcode switch; no incomplete lowering entry point will be enabled. Compute integration remains suspended. No game frame/FPS.
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (operand helpers)
+
+### Intentional differences
+- C++ per-instruction captured lambdas are private methods on same-file InstructionLowering, holding the same instruction, predicate, destination, operand error and emitted vector reference. This mechanical Rust borrowing adaptation preserves helper boundaries and output ordering without relocating ownership. HalfSource remains in the same file.
+- Default lambda arguments (floating, uniform_c, predicate masks) are explicit Rust arguments. All numeric casts preserve the upstream unsigned word values. No new validation or fallback was added.
+- Test-only operand_helpers.fixture and scripts/ampere_operand_oracle.py record and regenerate 560 vectors by extracting and compiling the verbatim C++ helpers from the recorded upstream commit. No C++ compiler is required to run cargo tests. The generator writes only into the target repository, never upstream.
+
+### Unintentional differences (to fix)
+- None found within the implemented helpers after rereading and comparing the source uniform_register and base-through-multiply_low lambdas. Header-only source; git ls-tree confirms no matching .cpp.
+
+### Missing items
+- LowerToMaxwell's program scan, uniform rewrite/guard orchestration, opcode switch and relocation/finalization remain unported. No public partial lowering entry point exists. These helpers are not yet wired into shader_environment; compute/channel native activation remains interrupted in NX2_PORT_STATE.md.
+
+### Binary layout verification
+- PASS: fixture comparisons check exact emitted u64 instruction words, returned registers and errors for uniform-register boundaries, all 32 constant-buffer banks (including bank24->17), alignment, immediate bit patterns, absolute/negate order, all eight ALU operand forms, half swizzles/lanes, predicate LUT inversion, XMAD halves/immediate and save/restore masks. Existing Instruction size16/alignment4 and crossing-word extraction regression still passes.
+- Focus13442 exit0: 2 tests passed (including all560 C++ fixture cases). Full cargo test -p shader_recompiler exit0: 607 passed, 0 failed, doc-tests passed (nx2-ampere-operands-full.log). C++ oracle MSVC emits a warning for the constant-disabled uniform-output branch's shift; that branch is not executed by this helper harness. No production shader/ROM execution is claimed.
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (uniform rewrite and relocation state)
+
+### Intentional differences
+- Same-file ProgramLowering owns the original local result/relocations/barrier/call vectors and completion flags. fail/finish consume this private Rust context rather than copying the captured C++ result; clearing, error/source offsets and relocation patch order are unchanged.
+- Same-file UniformRewrite mechanically extracts the pre-switch uniform arithmetic rewrite and guard metadata; begin/end retain the original pre-switch save and post-switch merge/restore sequences. Result errors replace returning fail from inside this block; the future outer loop must forward them to ProgramLowering::fail at the current instruction index.
+- uses_uniform_bank uses any over the exact opcode/flag conditions instead of accumulating |= over every instruction. Reading Instruction fields has no side effects. The unsigned 6 - predicate-slot subtraction explicitly wraps, including PT/!PT, as C++ does.
+
+### Unintentional differences (to fix)
+- None found within this implemented slice after rereading the header's scan, address_of/fail/finish, rewrite, guard setup and epilogue. This upstream implementation is header-only.
+
+### Missing items
+- Outer loop validation/capture offsets/link-register checks/scratch rejection and the entire opcode switch are still missing. No partial LowerToMaxwell entry point is exposed. Native shader environment and compute/channel integration remain suspended until complete lowering is available.
+
+### Binary layout verification
+- PASS: no serialized structures changed. Exact u64 relocation patch tests cover control-word spacing, positive/backward/self displacements, distance/target errors and output clearing while retaining required_texture_buffer/source_size. Uniform error handling precedes restore emissions.
+- Oracle fixture extended to 5018 cases: original560 operand cases, all4096 opcode encodings plus the two conditional uniform flags, uniform register boundaries, predicate combinations/output selectors and exact save/merge/restore words. Generator compiles verbatim upstream blocks, including validation error order. Focus68416 exit0 five tests passed. Full cargo test -p shader_recompiler terminal exit0; see nx2-ampere-control-full.log. No shader execution or game performance claim.
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (float/half and integer multiply opcode arms)
+
+### Intentional differences
+- Mechanically extracted contiguous switch arms into two private methods on the same-file InstructionLowering context: lower_float_and_half and lower_integer_multiply. No opcode logic/constants were moved to another module. The future outer loop must dispatch only the corresponding known opcodes and forward Err to ProgramLowering::fail; private methods reject misuse with unreachable rather than claiming unsupported instructions are implemented.
+- Early switch breaks become local return Ok or matched-arm exits. A by-value local copy of insn matches the unchanged instruction read by each original arm. HFMA2 updates the shared per-instruction predicate and relocation vector exactly before operand materialization. Operand helper errors remain pending for the original outer epilogue.
+
+### Unintentional differences (to fix)
+- None found in the implemented arms after rereading the complete header blocks and comparing word encodings, validation order, constant placement and scratch register usage. Header-only source, no .cpp counterpart.
+
+### Missing items
+- The remaining switch begins at 0x806 VOTE, followed by VOTEU/R2UR/PLOP3 and other ALU/memory/texture/control instructions. The outer program loop is still absent. These private pieces are not a complete lowering API and do not activate native shader_environment/compute/channel execution.
+
+### Binary layout verification
+- PASS: 16 float/half encodings (304,23e,a3e,232,832,a32,230,430,630,231,431,631,831,a31,240,840) and 9 multiply encodings (c24,e24,224,2a5,827,a24,424,624,824) retain exact emitted u64 words. HFMA2.RELU preserves guard relocation to next source instruction, P6 save/restore, binary16 lane clamp sequence and updated predicate. UIMAD.WIDE retains adjacent-pair checks, high/low products, carry ordering and uniform-register mapping; immediate IMAD retains shift and multiply-by48 special forms.
+- scripts/ampere_operand_oracle.py compiles verbatim switch arms with upstream helpers. Fixture now8863 cases (previous5018 +2518 float/half +1327 multiply), comparing emissions/errors and final predicate/relocations; single-bit mutations cover all non-opcode fields, plus RELU predicate/modifier combinations, half NaN/infinity immediate patterns, wide-register boundary pairs and power-of-two multipliers through bit31. These are arm-level comparisons, not claims of whole-program or GPU execution.
+- Float focus fivepassed and full610passed+docs exit0 (nx2-ampere-float-focus/full.log); final multiply focus fivepassed and fullcargo test -p shader_recompiler exit0 610passed+docs (nx2-ampere-multiply-focus/full.log). Compiler harness warns about an unexecuted constant-disabled uniform-output shift, as previously documented; source branches were not rewritten to hide that warning.
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (vote/uniform opcode arms)
+
+### Intentional differences
+- The contiguous VOTE through FSWZADD switch arms are mechanically extracted into private same-file InstructionLowering::lower_vote_and_uniform. Constants/state remain owned by this upstream counterpart; local Ok exits replace switch breaks, and Err must be forwarded to the original program-failure path by the future outer loop.
+- UPLOP3 retains its local slot helper and mutates the per-instruction predicate before emissions. No new helper layer or runtime fallback handles missing opcodes.
+
+### Unintentional differences (to fix)
+- None found in these arms after rereading the header block and comparing validation order, register mapping, masks, words, predication changes and scratch restoration. Header-only source, no matching .cpp.
+
+### Missing items
+- Remaining switch starts at 0xb6c TXD, then further shuffle/texture/ALU/memory/control arms. Outer program loop and shader_environment integration still missing. No production shader conversion or native channel activation is claimed.
+
+### Binary layout verification
+- PASS: exact emitted u64 words and errors for fourteen added encodings806,886,3c2,81c,89c,883,882,c82,ab9,abb,899,b82,f89,822. VOTEU saves/restores the selected predicate while merging into R239; R2UR preserves P6; UPLOP3 remaps uniform slots including PT/negated predicates; UP2UR reverses bit positions under the requested mask. ULDC retains width/pair/bank/alignment validation and direct/indexed paths. USHF preserves its five accepted shapes and shift32; FSWZADD swaps lane codes1/2 exactly.
+- C++ oracle now12540 cases, including3677 new cases: all non-opcode single-bit mutations from fourteen baselines, all256 predicate LUTs with ordinary/uniform third operands, UPLOP3 guards/outputs, all128 UP2UR masks, all32 banks/eight widths for three constant-load encodings, register boundaries, five shift forms through33, and all256 swizzles. These compare individual arm emissions and errors, not execution of a complete shader.
+- Focus fivepassed and full cargo test -p shader_recompiler terminalexit0 610passed+doc-tests (nx2-ampere-vote-focus.log, nx2-ampere-vote-full.log). DIFF verification follows rereading the complete relevant C++ header block.
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (texture/reduction opcode arms)
+
+### Intentional differences
+- Contiguous TXD through SUST arms are mechanically extracted into private same-file InstructionLowering::lower_texture_and_reduction. The required_texture_buffer argument borrows the original result field separately from its instruction-vector borrow, preserving ownership and mutation order.
+- Signed24-bit offsets use a left shift, i32 cast and arithmetic right shift, then preserve the original low20-bit encoding. Err must propagate to ProgramLowering::fail through the future outer loop; private method misuse is unreachable, not an unsupported-opcode substitute.
+
+### Unintentional differences (to fix)
+- None found in this slice after rereading all180 lines of the header block and comparing validation, emitted constants, lane loops, signed offsets, descriptor conflicts and scratch preservation. Header-only implementation; no cpp counterpart.
+
+### Missing items
+- Remaining arms start at0x301 BREV followed by219/c19 shifts and the remainder of the source switch. Outer loop, complete LowerToMaxwell entry, shader_environment native adapter and compute/channel activation remain absent. These tests do not establish a rendered frame or performance.
+
+### Binary layout verification
+- PASS: exact u64 words for b6c,989,589,98e,2bd,2be,3a1,3c4,f8c,38c,3a8,9a8,b97,b9b. TXD/SULD/SUST enforce bank/offset/dimension/register limits before changing required_texture_buffer; conflicts retain prior binding. MATCH preserves P6; REDUX emits32 active-lane selection/reduction sequences; shared stride and signed global offsets preserve upstream encodings and errors.
+- Oracle14606cases (+2066): new14 baselines with every non-opcode bit toggled, signed24-to20 offset boundaries, all8 global reduction operations in register/uniform address forms, descriptor conflicts and32banks, dimension/coordinate boundaries, REDUX sum/max uniform targets, and shared increment strides with ordinary/RZ addresses. Action12 additionally compares required_texture_buffer even on failure; existing action11 fixtures remain unchanged.
+- Focusfivepassed and full cargo test -p shader_recompiler terminalexit0 610passed+doc-tests (nx2-ampere-texture-focus.log, nx2-ampere-texture-full.log). Source reread and line-by-line verification complete for this slice; whole-program execution is still pending.
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (bit/shared-memory opcode arms)
+
+### Intentional differences
+- Contiguous BREV through MOVM switch arms are mechanically extracted into private same-file InstructionLowering::lower_bits_and_shared. Local returns replace switch breaks; pending operand errors still belong to the outer epilogue. No constants or method ownership moved out of the corresponding Rust file.
+
+### Unintentional differences (to fix)
+- None found after rereading and comparing the full113-line header block, including shortcut validation order, uniform mapping, memory-barrier scope mapping, address shift/add order and matrix transpose emissions. Header-only implementation, no matching cpp.
+
+### Missing items
+- Remaining switch starts at23c HMMA (environment-controlled) then83b LDSM and later instructions. Full outer loop and native shader_environment integration still absent. Existing private opcode groups are not a public partial conversion implementation.
+
+### Binary layout verification
+- PASS: exact emitted words for301,219,c19,300,d00,309,d09,918,992,9ab,b1d,388,984,23a. Logical low-word right shift is selected before other SHF forms; MEMBAR accepts only scopes0/2/3/5 with mapping0/1/2/3; BAR requires unconditional predication. LDS/STS retain width/stride/uniform-base constraints and byte-offset encoding; MOVM retains lane addressing and half transposition sequence.
+- Oracle17700cases (+3094), including non-opcode bit mutations of fourteen baselines, register/uniform shift modes and boundaries, all barrier scopes, shared widths/strides/addressRZ/uniform-register boundaries and matrix source/destination limits. Comparisons cover emitted instructions/errors, not host execution of the lowered program.
+- Focusfivepassed and full cargo test -p shader_recompiler terminalexit0 610passed+doc-tests (nx2-ampere-shared-focus.log, nx2-ampere-shared-full.log). No game rendering/FPS claim.
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (HMMA/LDSM)
+
+### Intentional differences
+- Private same-file lower_matrix_multiply and lower_matrix_load mechanically extract the two source switch arms. HMMA's local shuffle/lane_a/lane_b/hfma2 helpers remain local closures, with an explicit mutable context argument instead of overlapping mutable captures.
+- OnceLock<Option<OsString>> retains the function-local static getenv decision on first HMMA, owning the environment value instead of retaining a C runtime pointer. Missing mode is checked before operand validation; exact string stub selects the upstream experimental D=C path, all other present strings (including empty) select the full expansion. No global environment setting or runtime mode activation was changed.
+
+### Unintentional differences (to fix)
+- None found after rereading the complete HMMA/LDSM header arms and comparing helper boundaries, loop ordering, emitted constants, operand checks and address/destination alias handling. Header-only implementation; no cpp counterpart.
+
+### Missing items
+- Remaining switch begins at919/9c3 S2R/S2UR, then uniform comparison/selection and further instructions. Outer program loop, complete LowerToMaxwell API and native environment/compute/channel integration remain missing.
+
+### Binary layout verification
+- PASS: exact word sequences match upstream for full HMMA, explicit stub and missing mode; LDSM preserves count1/2/4, transposed U16 and non-transposed U32 paths, offsets, destination limits and original alias-copy sequence. This establishes emitted-code parity, not matrix execution on the GPU.
+- Main oracle fixture18009cases (+309LDSM). Four tensor fixtures contain165cases each, generated in isolated C++ processes for missing/stub/emulate/empty mode; include all non-opcode bit mutations, register limits/overlap, zero accumulator and predicates. Rust test launches isolated child processes for those four modes plus uppercase STUB (full expansion), then changes the environment in each single-test child and repeats the expected fixture to verify read-once lifecycle. Ordinary parallel tests never modify the tensor environment.
+- Focus36269 exit0 sixpassed; full cargo test -p shader_recompiler exit0 611passed+doc-tests (nx2-ampere-matrix-focus.log, nx2-ampere-matrix-full.log). No game image or FPS verification yet.
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (special/uniform/global-memory arms)
+
+### Intentional differences
+- Contiguous S2R through fragment-discard arms mechanically extracted into same-file InstructionLowering::lower_special_and_global(opcode, code, index). The original native code slice/index are retained for USEL's preceding-instruction pattern; no rewritten instruction substitutes for that source lookup.
+- Local switch breaks map to Ok returns; pending operand errors still propagate through the future outer epilogue. All constants and state stay in this source-owned file.
+
+### Unintentional differences (to fix)
+- None found after rereading and comparing the header block: validation ordering, selected special-register list, predicate save/restore, clamp idiom, load/store alignment/address pair rules, zero materialization and offset encoding are preserved. Header-only implementation, no cpp counterpart.
+
+### Missing items
+- Remaining switch begins at305/b05/d05 float-to-integer conversion; later ALU, texture and control-flow arms and full outer loop are still missing. No native pipeline or channel mode was enabled.
+
+### Binary layout verification
+- PASS: exact emissions/errors for919,9c3,28c,88c,287,887,381,981,386,986,95b. In particular zero stores materialize scratch words before address validation, exactly as source; combined uniform/register pointers retain low-word carry then high-word extension, with differing upstream load/store register bounds. Fragment-discard predication is preserved.
+- Main oracle22213cases (+4204): eleven baselines/non-opcode mutations, all256 special-register IDs, comparison modes/sign/output combinations, USEL preceding-instruction bit mutations/index0/19-bit limit boundaries, memory widths/register alignment/zero-store/address-pair limits. Harness now supplies previous native instruction in parameters4..7; both Rust and C++ consult the original prior words. Existing four165-case tensor fixtures unchanged in scope.
+- Focussixpassed and full cargo test -p shader_recompiler terminalexit0 611passed+doc-tests (nx2-ampere-global-focus.log, nx2-ampere-global-full.log). Source reread and verification completed; whole-program execution and game rendering remain unverified.
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (F2I/TXQ/TLD/DEPBAR)
+
+### Intentional differences
+- Contiguous F2I through DEPBAR arms mechanically extracted into private same-file InstructionLowering::lower_conversion_and_fetch. Result texture-buffer field is borrowed separately from emitted instructions. RG_MASKS/RGBA_MASKS remain local to the TLD arm, mirroring upstream placement.
+- Rust keeps source_a immutable because upstream never changes it. Local Err continues to require forwarding to ProgramLowering::fail; operand materialization errors remain pending for the outer epilogue.
+
+### Unintentional differences (to fix)
+- None found after rereading/comparing the complete102-line header block. F2I validation, unsigned NaN/overflow handling sequence, rounding/saturation encoding, split masks, array scratch copies and descriptor updates match upstream. Header-only source, no matching cpp.
+
+### Missing items
+- Remaining arms start atb69 TMML (LOD query), followed by other textures and ALU/control instructions. Complete outer loop and native environment/compute/channel integration remain missing. No runtime fallback or partial entry point added.
+
+### Binary layout verification
+- PASS: exact u64 emissions/errors for305,b05,d05,b6f,b66,91a. TXQ unconditionally selects bank2 after validation; TLD rejects a conflicting preselected bank. DEPBAR validates the exact accepted words and emits no instruction as upstream.
+- Main oracle23867cases (+1654): six baselines with non-opcode bit mutations, five conversion modes with sign/saturation modifiers and uniform-register boundaries, all texture dimension/channel-mask/split-destination combinations, bank overwrite/conflict and destination boundaries. Existing four165-case tensor fixtures remain exercised independently.
+- Focussixpassed and full cargo test -p shader_recompiler exit0 611passed+doc-tests (nx2-ampere-fetch-focus.log, nx2-ampere-fetch-full.log). Emission parity only; no whole-program shader or game/FPS claim.
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (TMML/TLD4/TEX)
+
+### Intentional differences
+- Three contiguous texture arms mechanically extracted into same-file InstructionLowering::lower_texture_sample. TEX's general_tex/value/copy/pack helpers and four lookup tables remain local to the source-owned arm/helper. Mutable context arguments avoid overlapping mutable closure captures; the final unused next increment is omitted without changing emitted data or ordering.
+- Rust count_ones replaces std::popcount. Duplicate equivalent split-output conditions share one conditional expression; no new destination clamp/validation changes upstream behavior.
+
+### Unintentional differences (to fix)
+- None found after rereading the complete178-line header block and comparing validation/order, fixed-point LOD query, gather coordinate source distinction, specialized array depth compare, general TEX packing and TEXS encoding. Header-only source, no cpp counterpart.
+
+### Missing items
+- Remaining switch begins at816 PRMT, then307 FRND and later attributes/ALU/control-flow. Full program loop and native shader_environment integration remain absent; no partial entry point activated.
+
+### Binary layout verification
+- PASS: exact words/errors/required_texture_buffer for b69,b63,b60. TMML uses source_a+1 when source_b is RZ; gather preserves RZ. Specialized TEX paths impose bank2; general_tex checks prior binding and uses coordinate/meta arrays, source bounds and original component routing. FP16 pack preserves conversion/merge order, skip-RZ semantics and split/contiguous second destinations.
+- Main oracle28010cases (+4143): three baselines with all non-opcode bit mutations; dimension/LOD/depth/offset/half/split/mask combinations; output register boundaries; bank conflicts, specialized bank overwrite and coordinate-span boundaries. Four165-case tensor fixtures continue to pass in isolated processes.
+- Focus26632 terminalexit0 sixpassed; full cargo test -p shader_recompiler exit0 611passed+doc-tests (nx2-ampere-sample-focus.log, nx2-ampere-sample-full.log). Emission parity only; no rendered frame or FPS claim.
+
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (PRMT through MOV)
+
+### Intentional differences
+- Contiguous opcode arms 816/307/321/322/387/983/803/804/c02/202/802/a02 mechanically extracted into private InstructionLowering::lower_permutation_and_moves in the corresponding Rust file. Result errors feed the future outer fail handler; early Ok replaces switch break without skipping the caller epilogue.
+- emit replaces direct vector push in ALD/AST and MOV; the helper only appends the same u64. All constants and behavior remain owned by this file.
+
+### Unintentional differences (to fix)
+- None identified in this slice after rereading the authoritative origin/eden-nx2 header and comparing each arm. No companion cpp exists.
+
+### Missing items
+- Remaining arms from FFMA onward and the complete LowerToMaxwell outer loop are not implemented. Native pipeline integration remains pending; no game frame or FPS claim.
+
+### Binary layout verification
+- PASS: exact emitted u64 words, predicates, errors and metadata compared against verbatim upstream C++ for 3,932 added cases (31,942 main oracle cases total). Includes PRMT sign replication/fast paths, FRND modes, ALD/AST RZ and range/order cases, spill offsets, predicate masks and MOV source forms. No new serialized structs.
+- Focused six tests pass; cargo test -p shader_recompiler passes (611 tests plus doc tests), nx2-ampere-moves-full.log.
+
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (FFMA through FMNMX)
+
+### Intentional differences
+- Contiguous 21 opcode encodings mechanically extracted into private InstructionLowering::lower_float_arithmetic in the corresponding file. Operand evaluation remains a, b, c in order, with the upstream default floating argument made explicit. Constants, scale lookup and validation remain local to the corresponding arms.
+- Result errors are handed to the outer fail handler; operand_error is checked by the caller after emission, as in upstream. No public partial converter was introduced.
+
+### Unintentional differences (to fix)
+- None identified in this slice after rereading and comparing the authoritative origin/eden-nx2 header. FFMA modifier masks, FMUL scale/FTZ/rounding restrictions, FADD second operand selection and FMNMX predicate encoding match literally. Header-only upstream; no companion cpp.
+
+### Missing items
+- Remaining opcode arms starting with MUFU 308/b08 and the full LowerToMaxwell loop still need porting before native shader environment and compute integration.
+
+### Binary layout verification
+- PASS: 4,514 additional C++ oracle cases compare emitted u64 words, errors and metadata, including operand forms/bounds, immediate bit patterns, every FMUL scale/rounding/FTZ combination and FMNMX predicates. Main fixture now 36,456 cases; tensor fixtures unchanged. No new serialized structs.
+- Six focused tests pass; full cargo test -p shader_recompiler passes (611 tests plus doc tests), nx2-ampere-arithmetic-full.log. No runtime frame/FPS verification in this slice.
+
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (MUFU through I2FP)
+
+### Intentional differences
+- Thirteen contiguous opcode encodings live in private InstructionLowering::lower_special_functions_and_conversion, a mechanical extraction in the upstream-owned file. Local to_radians closure takes explicit context; constants and helper boundary remain unchanged. Early Ok replaces break and retains caller epilogue.
+
+### Unintentional differences (to fix)
+- None found after rereading the complete header block and comparing against Rust. MUFU turns-to-radians and half promotion/repack, indexed/default/centroid IPA, SGXT, USHF register selection, CS2R pair order and I2F/I2FP format checks match upstream. No companion cpp exists.
+
+### Missing items
+- Remaining arms begin at SEL/FSEL 207/208; full outer converter and native integration still pending.
+
+### Binary layout verification
+- PASS: 4,647 added verbatim C++ oracle cases, 41,103 total main fixture cases, match exact u64 output/error/metadata. Includes all MUFU operations and half selectors, IPA indexing/modes, uniform funnel selections, destination limits, conversion formats and rounding. No new serialized layout.
+- Six focused tests and full cargo test -p shader_recompiler pass (611 tests plus doc tests), nx2-ampere-mufu-full.log. No game frame or FPS evidence yet.
+
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (SEL through SHF immediate)
+
+### Intentional differences
+- Twenty-nine contiguous opcode encodings mechanically extracted into private InstructionLowering::lower_selection_and_logic in the matching file. Rust b selection uses an expression instead of an initially unused 255 assignment. Early Ok substitutes switch break; caller still executes epilogue. All constants remain local.
+
+### Unintentional differences (to fix)
+- None found after rereading the entire authoritative header block and line-by-line comparison. SEL bitwise operand modes, FSET output/combination validation, HSETP2 fields, FSETP/ISETP operand-before-combine validation order, LOP3 predicate output, IABS sequence, IMNMX immediate limits, and signed/logical SHF shortcut ordering match upstream. Header-only, no cpp counterpart.
+
+### Missing items
+- Remaining arms start at a11 LEA, then IADD3 and control flow. Full LowerToMaxwell loop, program-level oracle and native pipeline integration remain pending.
+
+### Binary layout verification
+- PASS: 10,397 added upstream C++ oracle cases compare exact emitted u64 words/error/metadata, totaling 51,500 main cases. Includes all 256 LUTs with predicate output and PT, comparison/combination matrices, HSETP2 swizzles, uniform bounds, immediate limits, funnel directions/widths/shift boundaries. Tensor fixtures unchanged.
+- Six focused tests and full cargo test -p shader_recompiler pass (611 tests plus doc tests), nx2-ampere-logic-full.log. No runtime frame or FPS claim.
+
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (LEA and IADD3)
+
+### Intentional differences
+- Seven opcode encodings mechanically extracted into private lower_effective_address and lower_integer_add methods on InstructionLowering in the upstream-owned file. rewritten_uniform is passed from the caller; no state ownership change. Local carry save/restore closures accept explicit context, retain scratch R253 and PT, and remain separate from the outer guard helpers.
+- Early Ok replaces switch break; the caller retains operand_error checks and uniform epilogue. Rust expression branches replace mutable C++ selections without changing emission order.
+
+### Unintentional differences (to fix)
+- None identified after rereading all 134 lines of the authoritative header block and comparing each branch. LEA high-word zero immediate fast path, sign/negate rules, constant carry comparison, IADD3 carry validation and uniform UP0/UP1 storage, carry-in save/load/restore ordering, constant extended add, third-source negation and immediate raw bit patterns match upstream. No companion cpp exists.
+
+### Missing items
+- Remaining opcode arms begin with BRX/BRXU 949/958, then CALL/RET/reconvergence/BRA/EXIT. Full conversion loop, program-level differential tests and native shader environment/compute integration are still pending.
+
+### Binary layout verification
+- PASS: 13,028 added verbatim upstream C++ oracle cases compare exact emitted u64 words/errors/metadata, totaling 64,528 main cases. Harness p[2] now supplies rewritten_uniform for IADD3, exercising both paths including invalid uniform carry predicates. Covers LEA high/low/shift/sign forms, all carry-in/out conditions, register/uniform limits and third-source negations. Tensor fixtures unchanged; no new serialized structs.
+- Six focused tests pass; full cargo test -p shader_recompiler passes (611 tests plus doc tests), nx2-ampere-add-full.log. No runtime frame or FPS evidence yet.
+
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h (complete loop and control flow)
+
+### Intentional differences
+- Public lower_to_maxwell now implements the complete upstream function: 181 switch encodings plus eight uniform rewrites. Existing same-file InstructionLowering arm groups are dispatched mechanically; ProgramLowering owns result, relocations, call/link vectors and control flags. Rust Result errors replace lambda fail returns; finish consumes the state. All early finish paths still bypass the per-instruction epilogue.
+- C++ optional link becomes Option; indexed paired vectors use zip; backward return-copy search uses a reversed range and exits upon the same first copy or write. copies_link retains its local helper boundary. Boolean all/any short-circuit only side-effect-free tests.
+- The unreachable extra-branch-condition else arm under case 947 (which also tests opcode == 947) is omitted; all reachable checks and errors remain identical. Native reconvergence no-ops follow upstream literally, without inventing a flow stack.
+
+### Unintentional differences (to fix)
+- None identified after rereading the complete control-flow block, loop preamble and epilogue, and comparing all state transitions against the authoritative origin/eden-nx2 header. No companion cpp exists. Scan-before-size-validation, source offset before @!PT skip, active link selection, scratch checks before uniform rewrite, signed 50-bit targets, linkage checks, pending relocations and main/library termination match upstream.
+
+### Missing items
+- No remaining methods/arms from this upstream header. This is parity with the upstream experimental instruction subset, not support for every Ampere instruction.
+- Native shader_environment adapter, KeplerCompute dispatch and ChannelState activation remain pending. No game frame or >=20 FPS evidence; overall goal remains incomplete.
+
+### Binary layout verification
+- PASS: scripts/ampere_program_oracle.py compiles the full verbatim C++ header and generates 67,809 complete-program cases. Rust matches exact emitted u64 words, source instruction offsets, source_size, required_texture_buffer, error_offset and error strings. Includes 38,874 successful conversions, call/return linkage, copied/overwritten links, multiple callees, computed branches, direct branch predicates, EXIT conditions, uniform guards/outputs/carry paths, scratch-bank global scan and never-executed padding.
+- Existing 64,528 instruction/helper cases and isolated tensor-mode fixtures continue to pass. Added size-boundary test checks 65,536 accepted instructions and 65,537 rejection. No new binary payload structs; native Instruction remains 16 bytes.
+- Full cargo test -p shader_recompiler passes: 613 tests plus doc tests, nx2-ampere-program-full.log. Earlier focused eight tests also pass. Whole-program tensor execution remains covered at arm level by isolated tensor fixtures; the full-program matrix excludes environment-dependent HMMA.
+
+
+## 2026-11-07 ? src/shader_recompiler/src/environment.rs vs src/shader_recompiler/environment.h
+
+### Intentional differences
+- TranslateProgramAddress is a trait method named translate_program_address, with the exact default identity behavior.
+
+### Unintentional differences (to fix)
+- None in this addition; authoritative header reread. Header-only upstream.
+
+### Missing items
+- Native environment overrides are the next integration step.
+
+### Binary layout verification
+- N/A: interface method, no payload changes. Full cargo test -p shader_recompiler passes (614 tests), nx2-program-address-full.log.
+
+## 2026-11-07 ? src/shader_recompiler/src/frontend/control_flow.rs vs src/shader_recompiler/frontend/maxwell/control_flow.cpp
+
+### Intentional differences
+- Existing Rust frontend layout omits the maxwell subdirectory; this change stays in the existing CFG owner. Existing AnalyzeBRX counterpart is named analyze_indirect_branch and supports BRX/JMX using the opcode parameter.
+
+### Unintentional differences (to fix)
+- None in this slice after rereading control_flow.h/cpp. Only AddLabel's target is translated; IndirectBranch.address retains the original value. Sorting/deduplication remain before translation.
+
+### Missing items
+- Native environment address-map overrides and capture adapter remain pending.
+
+### Binary layout verification
+- PASS: regression executes the real IMNMX/SHL/LDC/BRX tracking and CFG path; duplicate native targets are deduplicated, labels use translated addresses, comparison addresses and branch register/offset remain native. Full crate tests pass, 614 tests.
+
+
+## 2026-11-07 ? src/video_core/src/shader_environment.rs vs src/video_core/shader_environment.h/cpp (native address and cache prerequisites)
+
+### Intentional differences
+- Existing Rust Environment trait implementations for GraphicsEnvironment and ComputeEnvironment delegate TranslateProgramAddress to their GenericEnvironment base; FileEnvironment implements its own upstream method. Typed RuntimeError panic payloads follow the existing Rust shader exception transport.
+- The existing Rust-only FileEnvironment-to-GenericEnvironment conversion initializes native_source_size to zero because source bytes are not serialized upstream. The retained map still drives address translation; no source length is invented.
+
+### Unintentional differences (to fix)
+- None in this slice after rereading both upstream files. Native reads reject out-of-cache addresses before setting has_unbound_instructions; Analyze hashes all converted code with the upstream ABI tag; SetCachedSize validates without refetching; cached compute initial_offset is header size only with a native map. Original addresses remain identity for ordinary shaders.
+
+### Missing items
+- InitializeNativeCode capture/lowering/packing/override method and native graphics/compute constructor branches remain unported. native_source_size is initialized but will be populated by that method. Runtime activation is not claimed.
+- Override loop requires missing MemoryManager::IsShuttingDown forwarding to the existing Core::System method; interrupted state recorded in NX2_PORT_STATE.md before proceeding.
+
+### Binary layout verification
+- PASS: serialized cache layout unchanged. Regression round-trips ordinary and native compute code through real serialization/deserialization and verifies header offset and address map. Bounds, typed failures, full-code hash and unchanged cached bytes also tested. Forty shader_environment tests pass.
+
+- Full cargo test -p video_core completed successfully: 1674 passed, 1 ignored, doc tests pass (nx2-native-env-full.log). Full shader_recompiler: 614 passed. These validate the integration slice, not game execution.
+
+
+## 2026-11-07 - src/video_core/src/memory_manager.rs vs src/video_core/memory_manager.h/cpp (IsShuttingDown)
+
+### Intentional differences
+- SystemRef borrows the original Core::System owner; is_shutting_down directly forwards the query. No cached or substituted GPU flag.
+
+### Unintentional differences (to fix)
+- None after rereading header declaration and cpp implementation.
+
+### Missing items
+- None for this prerequisite; resume native shader capture.
+
+### Binary layout verification
+- N/A: accessor only. Focused real-System test verifies false/true/false live state changes (nx2-native-shutdown-focus.log); full video_core run follows the adapter slice.
+
+
+## 2026-11-07 ? src/video_core/src/shader_environment.rs vs src/video_core/shader_environment.h/cpp (InitializeNativeCode)
+
+### Intentional differences
+- initialize_native_code takes the explicit header size (128 for graphics, zero for compute) instead of a C++ default argument. It remains owned by GenericEnvironment in the corresponding file.
+- GPU owner is cloned as an Arc; individual memory operations take short locks, including shutdown polling. No GPU-memory lock spans filesystem I/O or the override wait. Native words and SPH are copied explicitly as little-endian integers instead of raw-memory copies; output bytes remain identical.
+- Function-local OnceLock preserves first-call capture of reject-list and dump-directory environment settings. Override directory and rejected-capture dump environment are queried dynamically, as upstream. Typed RuntimeError panic payloads preserve existing shader exception transport. Filesystem directory errors remain fatal Rust I/O panics; diagnostic file create/write failures are ignored as with upstream default streams.
+
+### Unintentional differences (to fix)
+- None identified in capture/validation/lowering/override/packing after rereading the complete upstream method and header declaration. Capture at mapping boundary, invalid target precedence, optional source extension, shutdown-before-file-read, 30-minute deadline/100ms polling, required texture bank, trailing padding/map, and cache bounds follow the source.
+
+### Missing items
+- Graphics/Compute constructor native-mode branches are not yet connected to this method. Graphics needs read access to the selected shared native macro engine; Compute still lacks the complete native mode/context setup. ChannelState activation and game execution remain pending.
+
+### Binary layout verification
+- PASS: real mapped GPU memory regression verifies 0/128-byte source headers, copied SPH, inserted scheduling word at byte 0x60, native source extent and address mapping. Isolated child processes cover ordinary capture, rejection, non-overwriting dumps, extended overrides, shutdown interruption and invalid override size. Additional cases reject unmapped first instruction, invalid branch targets and incomplete capture at mapping end.
+- Source and mapped diagnostic files are checked for exact extents; override decode validates exact native source bytes through the existing audited decoder. Six isolated modes pass in nx2-native-capture-focus.log; full video_core validation follows.
+
+- Full cargo test -p video_core completed with 1676 passed, 1 ignored, doc tests pass (nx2-native-capture-full.log). This also completes full-crate validation of MemoryManager::is_shutting_down above.
+
+
+## 2026-11-07 ? src/video_core/src/engines/maxwell_3d.rs vs src/video_core/engines/maxwell_3d.h (GetNativeMacroEngine read access)
+
+### Intentional differences
+- get_native_macro_engine_read is the immutable-borrow counterpart of the existing mutable callback accessor. Both select the same shared context engine or channel-local engine; the short guard lifetime preserves ownership and does not cache native_turing.
+
+### Unintentional differences (to fix)
+- None after rereading GetNativeMacroEngine in the authoritative header; upstream inline method has no cpp body.
+
+### Missing items
+- No missing behavior for this accessor adaptation.
+
+### Binary layout verification
+- N/A: borrowed access only. Regression hides an enabled local engine behind a disabled shared engine, enables the shared engine live, then detaches it and observes the local engine again.
+
+## 2026-11-07 ? src/video_core/src/shader_environment.rs vs src/video_core/shader_environment.h/cpp (native GraphicsEnvironment constructor)
+
+### Intentional differences
+- Constructor receives an immutable Maxwell3D borrow; the selected macro-engine accessor provides read-only access under the same owner. Runtime GPU memory remains owner-backed; the existing test-only reader fallback is retained.
+- Source ShaderType::Pixel maps to existing Rust ShaderStageType::Fragment. File diagnostic writes use Rust fs::write with ignored errors, matching the default upstream stream behavior.
+
+### Unintentional differences (to fix)
+- None in this slice after rereading constructor header/cpp. Restored source ordering: SPH read, initial offset and texture bank, native checks/diagnostics/lowering, passthrough/stage, local memory and driver/HLE flags. Small preexisting divergences fixed: invalid-stage and local-size assertions now use the repository's fail-soft ASSERT equivalent; local-memory u32 addition preserves upstream wrapping.
+
+### Missing items
+- Compute native constructor remains dependent on missing Kepler native-mode/context integration. ChannelState automatic activation remains disabled.
+- ShaderCache::MakeShaderInfo must use SourceSizeBytes for native invalidation ranges; this next dependency was identified before game activation.
+
+### Binary layout verification
+- PASS: owner-backed constructor test validates source extent 144 bytes, 80-byte SPH offset, translated EXIT, native address map, local memory, stage ownership and proprietary-driver classification for VertexB/Fragment. Other native stages raise typed RuntimeError. Isolated process verifies both CB1 diagnostic files match mapped bytes. Forty-two shader_environment tests pass (nx2-native-graphics-env-focus.log); full video_core validation follows.
+
+- Full graphics-constructor pass: cargo test -p video_core succeeded (1677 passed, 1 ignored, docs pass), nx2-native-graphics-env-full.log. Shader-cache dependency below was then fixed immediately.
+
+## 2026-11-07 ? src/video_core/src/shader_cache.rs vs src/video_core/shader_cache.h/cpp (native source range)
+
+### Intentional differences
+- SourceSizeBytes is read once into a Rust local; otherwise MakeShaderInfo retains existing ownership and control flow.
+
+### Unintentional differences (to fix)
+- None in this slice after rereading header and cpp. ShaderInfo.size_bytes remains converted cached size while Register receives native source size when nonzero.
+
+### Missing items
+- Native compute and channel activation still pending. Other upstream native rejection-cache additions require their own port; this entry only audits MakeShaderInfo's range selection.
+
+### Binary layout verification
+- PASS: real native graphics constructor produces 120 converted bytes for a 144-byte source. Regression verifies writes at source byte 143 invalidate, byte 144 do not, while ShaderInfo.size_bytes remains 120. Focused isolated test passes, nx2-native-shader-cache-focus.log; full-crate validation follows.
+
+Full validation after native source range correction: cargo test -p video_core passed (1678 passed, 1 ignored; doc tests pass), nx2-native-shader-cache-full.log, session5319 exit0.
+
+## 2026-11-07 - src/video_core/src/shader_cache.rs vs src/video_core/shader_cache.h/cpp (rejection lifecycle prerequisite)
+
+### Intentional differences
+- Mutex<HashMap> owns both the rejected_mutex and rejected_native state. RejectedShaderException models std::exception_ptr for all five existing Shader exception payloads; cloning preserves concrete type and message, resume_unwind rethrows without treating unrelated panics as shader failures. Explicit error argument replaces current_exception().
+### Unintentional differences (to fix)
+- None in the rejection storage/invalidation methods.
+### Missing items
+- RefreshStages/ComputeShader catch sites and native graphics addressing are the interrupted consumer slice, resumed after this prerequisite.
+### Binary layout verification
+- N/A: host-only cache state, no raw serialization.
+- Re-read upstream shader_cache.h/cpp declarations, RethrowIfRejected, IsRejected, RememberRejection, InvalidatePagesInRegion and exception.h. First error retained, relaxed atomic ever-rejected bounds never shrink, invalidation tests exactly the start address in [addr, addr+size), before page invalidation.
+- Focused tests: 29 passed (nx2-shader-rejections-focus.log); checks repeated typed rethrow, first error wins, zero/exclusive/post-start writes, immediate OnCacheInvalidation removal, re-rejection and all five concrete exception types.
+
+## 2026-11-07 - src/video_core/src/shader_cache.rs vs src/video_core/shader_cache.h/cpp (native cache consumers)
+
+### Intentional differences
+- Existing typed panic transport uses catch_unwind/resume_unwind in place of C++ catch/rethrow. Only the five Shader exception payloads are remembered or handled; unrelated Rust panics propagate. The first captured exception retains its concrete type.
+- Native addresses read the corresponding raw Pipeline register words (base +5/+6 = reserved[0]/[1]) via the existing Maxwell accessor; ownership of shader address selection stays in shader_cache.rs as upstream. High word masked to 8 bits.
+- Function-local diagnostic sets/vectors have Mutex/OnceLock guards for Rust concurrency. Header/slot/cbuf words are decoded little-endian for logs instead of memcpy; Rust debug-list punctuation and UTF-8-safe 40-character diagnostic prefix differ only in formatting.
+### Unintentional differences (to fix)
+- None in the new native addressing and rejection paths after rereading header/cpp and comparing ordering.
+### Missing items
+- Native compute engine activation/ComputeEnvironment branch and ChannelState activation remain separate pending slices; no placeholder native mode was introduced.
+### Binary layout verification
+- PASS: Pipeline source layout reread in maxwell_3d.h: enable, offset, reservedA, register_count, binding_group, reserved[4], padding to 0x40. Cache reads full 16-word slot diagnostic and 40-bit address directly; no new guest-memory struct.
+- RefreshStages retains dirty gate, disabled/fragment stage behavior, lookup before rejection, native rejected fast path, construction with native address/start0, first rejection capture, once-per-address diagnostics, native_execution_failed and last_shaders_valid updates, and ordinary exception propagation. GetGraphicsEnvironments uses identical address/start selection before SetCachedSize. ComputeShader consults/records/rethrows rejection after successful lookup miss.
+- Re-read shader_cache.h declarations and complete RefreshStages/ComputeShader/GetGraphicsEnvironments from origin/eden-nx2 after implementation; rejection helpers/invalidation reread separately.
+- Focused suite: 30 passed, nx2-shader-rejections-integration.log. Isolated native test uses real SMMU-backed memory and invalid opcode, masked high address word plus deliberately wrong ordinary base/offset, repeated failure before invalidation, successful retry after write, reconstructed environment, and ordinary exception propagation. Compute test checks repeated typed rejection and successful retry. Initial test used GPU address instead of translated device address for lookup assertions; corrected test to 0x9000, no production change needed.
+
+2026-11-07 Final rejection/address validation: cargo test -p video_core terminal exit0 (session42420), 1681 passed, 1 ignored; doc tests pass. Log nx2-shader-rejections-full.log. No active build or ROM process. Native graphics cache consumer slice verified; next prerequisite remains KeplerCompute native context/mode/dispatch. Actual game frames and >=20 FPS remain unverified.
+
+## 2026-11-07 - src/video_core/src/engines/kepler_compute.rs vs src/video_core/engines/kepler_compute.h/cpp (UpscaleInsteadOfNativeProgram prerequisite)
+### Intentional differences
+- Reuses parsed LaunchParams.const_buffers[0].address and raw Fermi2D Surface fields. Function-local C++ statics use OnceLock and atomic u32 counters; native libc strtoul/strtoull retains signed/prefix/trailing input parsing. The unused diagnostic fake TIC copy is omitted. Existing RasterizerHandle supplies the owner pointer.
+### Unintentional differences (to fix)
+- None in this method after rereading the full h/cpp method and comparing each branch and diagnostic order.
+### Missing items
+- DispatchNativeCompute/DescribeNativeResources are resumed consumers. Global trace budget is in its correct Kepler owner; Vulkan diagnostic consumer belongs to the later Vulkan native slice. Compute mode and channel activation still pending.
+### Binary layout verification
+- PASS: no new serialized layout; zero/default-initialized Fermi Surface retains zero layer/pitch and packs block fields at 0/4/8. Source/destination full addresses, width/height, four format mappings and configuration verified.
+- Isolated regression children normal/override/sample passed. Real SMMU-backed CB handles/TIC entries verify masked indices, bounds, supported/mismatched formats, zero addresses, width and layout checks, height decrease accepted as upstream, all surface/config fields, accelerator false/true propagation, sample flush-copy-flush order, static source address/dynamic format override, and first-call draw trace budget.
+
+## 2026-11-07 - src/video_core/src/engines/kepler_compute.rs vs src/video_core/engines/kepler_compute.h/cpp (DispatchNativeCompute and DescribeNativeResources)
+### Intentional differences
+- Existing DispatchCall adapter snapshots the bound engine state for the rasterizer. Typed panic transport catches only the five Shader exception payloads; other panics rethrow. Static diagnostic dedup uses OnceLock<Mutex<HashSet>> and counters use AtomicU32. No cross-module exception ownership abstraction introduced.
+- Parsed LaunchParams applies C++ bitfield assignment masks explicitly: grid X 31 bits, local positive/CRS 20 bits despite 24-bit source expressions. Description is reset before assignments; code registers update before per-buffer validation, and earlier buffers remain populated if a later buffer is rejected.
+### Unintentional differences (to fix)
+- None in these methods after rereading kepler_compute.h/cpp and checking all fields, masks, early exits, exception filter and fallback ordering.
+### Missing items
+- Caller ProcessNativeMethod/SetNativeMacroMode and ComputeEnvironment native branch still pending; these complete methods are not activated by ChannelState yet. Vulkan native tracing consumer of the Kepler-owned budget also remains in the renderer slice.
+### Binary layout verification
+- PASS: source descriptor indexes checked against the 64-word NativeQmdScheduler::Descriptor and original LaunchParams bitfield widths. Existing parsed Rust representation is not raw-copied. CB addresses retain 40 bits, code address 49 bits, size bits are shifted by 4.
+- Regression checks all eight CBs, full/reset state, bit-width truncation, disabled CB validation, partial failure state, every zero-block dimension, preserved indirect address, typed shader failure -> false, non-shader panic propagation, and real matrix rejection -> fallback result. DescribeNativeResources reads only first two invocations, offsets 0x80..<0x120 and matching handle/index filters.
+
+2026-11-07 Native dispatch/fallback full verification completed: session18655 terminal exit0, cargo test -p video_core 1683 passed, 1 ignored, doc tests pass; nx2-native-dispatch-full.log. All three Kepler methods verified against upstream. No active build/ROM. Next native context/mode and ProcessNativeMethod integration remains required; actual display/playability >=20FPS not established.
+
+## 2026-11-07 - src/video_core/src/native_query_trace.rs vs src/video_core/native_query_trace.h
+### Intentional differences
+- Header-only upstream maps to its own Rust module, registered in lib.rs. NativeQueryDiagnostics owns State/GetState; Mutex<State> combines the C++ mutex and protected fields. OnceLock preserves first-call opt-in and lazy file creation.
+- BufWriter<File> represents ofstream; Option preserves sticky diagnostic I/O failure without throwing. A libc atexit callback flushes the static writer at normal exit because Rust statics do not Drop, matching the upstream static ofstream destructor.
+- Rust keyword type becomes kind; numeric output is explicit lower-case hex for GPU/CPU/type/value/flags and decimal for event/asid. usize wrapping increment preserves size_t behavior.
+### Unintentional differences (to fix)
+- None in the trace function after rereading and comparing the entire header. There is no upstream cpp.
+### Missing items
+- No items missing from this header. Call sites in native compute/query/renderer paths remain their respective owner slices; ProcessNativeMethod implementation resumes after this prerequisite.
+### Binary layout verification
+- N/A: CSV output, verified exact bytes including header, truncation, bases, newlines and u64 maximum.
+- Isolated tests pass for disabled-first-call persistence, enabled-empty-env persistence after removal, limit boundary (999999/1000000), increment of suppressed records, events4/5 bypass cap and flush, normal exit flush, and sticky open failure. No changes to ordinary rendering or global user config.
+
+2026-11-07 native_query_trace prerequisite full validation: session42987 terminal exit0; cargo test -p video_core 1684 passed, 1 ignored, doc tests pass; nx2-native-query-trace-full.log. No active build or ROM. Resume full Kepler native macro/QMD method routing with trace dependency now available. Display/playability >=20FPS still unverified.
+
+## 2026-11-07 - src/video_core/src/macro_turing.rs and macro.rs vs macro_turing.h and macro.cpp/h (persistent active RAM)
+### Intentional differences
+- TuringMacroInterpreter owns an optional Arc<parking_lot::Mutex<DataRam>> for upstream active_dram. None means its own dram, without a self-referential pointer. Explicit per-execution RAM borrows take precedence without overwriting the persistent selection. Maxwell and Kepler assign the handle at their original assignment sites.
+### Unintentional differences (to fix)
+- None in the active RAM ownership/lifetime correction after rereading active_dram definition, Execute accesses, and both macro owner assignment sites.
+### Missing items
+- None for this prerequisite.
+### Binary layout verification
+- N/A host state. Persistent RAM regression passes and native compute retains selection when no replacement is supplied.
+
+## 2026-11-07 - src/video_core/src/engines/kepler_compute.rs vs src/video_core/engines/kepler_compute.h/cpp (native method routing)
+### Intentional differences
+- SharedNativeMacroContext owning handles replace engine pointers and position spans; the existing 128-entry graphics/compute arrays retain upstream ownership. SetNativeMacroMode takes an initial graphics-owner handle plus optional switching context. Reentrant lock/raw accesses permit emitted uploads without retaining RefMut across callbacks; interpreter/FIFO/scheduler leases are restored on unwinding.
+- Local callbacks and diagnostic dumps stay inside ProcessNativeMethod. Explicit little-endian copies replace raw byte spans. Static sets/counters use Mutex/OnceLock/atomics. Constructor QMD trace omits the movable Rust engine object's pointer; other diagnostic arrays use Rust list punctuation. Diagnostic failure dedup uses (program,error) rather than implementation-specific C++ std::hash XOR, avoiding platform-dependent diagnostic hash collisions only.
+- Add/max release callbacks capture the real memory owner Arc, payload/address/flags rather than an engine pointer, retaining exact fence-time read/write and waiter notification order. All callbacks remain in upstream-owned method.
+### Unintentional differences (to fix)
+- Small existing divergences fixed: CallMethod logs/returns on out-of-range registers and ConsumeSinkImpl skips them, matching source rather than panicking.
+### Missing items
+- GpuSplit FrontState/FrontApply/FrontCallMethod are separate pending split-thread integration, not enabled here. Main GPU-thread ProcessNativeMethod, native constructor mask, mode/context/RAM setup, CallMethod and CallMultiMethod paths implemented.
+### Binary layout verification
+- PASS: raw 0x1000 native words, 256-byte inline QMD and 512-byte failure QMD preserved; addresses, flags and source method ownership checked.
+- Re-read header, constructor, SetNativeMacroMode, full ProcessNativeMethod and routing methods against implementation. Regression isolated JIT/memo/interpreter children passes: shared graphics-before-upload/compute-after-upload selection, unchanged/changed context resets, upload/bind and accumulated parameters, repeated memo execution, local RAM, plain registers, invalid/sink guards, QMD action gates, dispatch, add/max deferred releases and waiters, ordinary query release, inline upload/recursive AD restoration, unmapped failure.
+
+## 2026-11-07 - src/video_core/src/shader_environment.rs vs src/video_core/shader_environment.h/cpp (native ComputeEnvironment constructor)
+### Intentional differences
+- Uses the real Kepler IsNativeMode; no placeholder flag. Existing owner handle supplies memory and code base. Wrapping local-memory addition retains C++ u32 arithmetic.
+### Unintentional differences (to fix)
+- None after rereading constructor and class declaration.
+### Missing items
+- ChannelState native activation is the next consumer.
+### Binary layout verification
+- PASS: initial offset/start = 80-byte SPH, source header=0, proprietary mode before InitializeNativeCode. Real native EXIT fixture checks source size16, converted size120 and start0x50.
+
+## 2026-11-07 - src/video_core/src/control/channel_state.rs vs src/video_core/control/channel_state.h/cpp (native activation)
+### Intentional differences
+- OnceLock<SharedNativeMacroContext> is the same anonymous-file singleton as Nx2MacroContext; Arc<ReentrantMutex<RefCell>> replaces shared_ptr. Engines remain individually boxed under existing Payload adaptation.
+### Unintentional differences (to fix)
+- None in activation after rereading h/cpp: construct/bind NVK defaults, enable native tiling, attach shared macros, enable Maxwell native mode, attach compute initial graphics engine/context and channel RAM, then set initialized.
+### Missing items
+- Split GPU thread path remains separate. Actual ROM display/FPS validation still required.
+### Binary layout verification
+- N/A host-only channel ownership. Isolated two-channel regression verifies shared graphics and compute code, separate RAM, cross-channel compute code replay, both native flags and native tiling, and ordinary channel mode after global NX2 flag clears.
+- Focused results: 25 Kepler tests pass including native environment real EXIT; 3 ChannelState tests pass including isolated child; persistent active RAM regression passes.
+
+2026-11-07 Native compute routing/persistent RAM/ComputeEnvironment/ChannelState activation full validation: session52089 terminalexit0, cargo test -p video_core 1687 passed,1ignored,docspass; nx2-native-channel-full.log. Native activation verified by tests, no gameframe/FPS yet. Beginning release rebuild for ROM run.
+
+
+## 2026-11-07 -- src/core/src/hle/service/sm/sm.rs vs src/core/hle/service/sm/sm.cpp (runtime audit)
+
+### Intentional differences
+- No implementation change in this audit. Existing Rust ownership/session adapters retained. Header and implementation re-read at origin/eden-nx2 50fa86bbbc403ad565eb44fcc281f16f77c69e15.
+
+### Unintentional differences (to fix)
+- None identified in the missing-service deferral branch: both implementations defer the request and return ResultNotRegistered until registration.
+
+### Missing items
+- Mario Kart World 1.8.0 requests chat:u; no registration or implementation exists in either this Rust tree or the authoritative upstream reference. Runtime validation stopped at this prerequisite, saved in NX2_PORT_STATE.md. Do not misattribute buffered IPC 1050 log to deadlock: immediate log flush confirms successful response and subsequent missing-service wait. A service specification/reference or explicit scope exception is needed before implementation.
+
+### Binary layout verification
+- Not applicable to this read-only control-flow audit; no payload changes. Native runtime still reports 0 FPS.
+
+
+## 2026-11-07 -- src/core/src/hle/service/chat.rs vs Mario Kart World 1.8.0 SDK (authorized source exception)
+
+### Intentional differences
+- User vas y explicitly authorizes SDK-derived chat:u beyond Eden-NX2. No matching C++ chat file exists at source 50fa86bbbc403ad565eb44fcc281f16f77c69e15. Both interfaces owned by chat.rs, separate from SM and dispatch.
+- Re-read SDK disassembly: InitializeUserService0x6bc330 obtains IUserService0 through vtable0xe193f0+0x30 -> proxy0x6bcda0, returns IUserShimScopedObject allocated at0x6bd0a0. Child vtable0xe195a8+0x30 ->0x1d1ff0 passes command1 to0xf1790; handle attached to g_ChattingEvent. Runtime bases are verified in bases.json, offsets above are module-relative.
+- No active conversation: real initially unsignaled event, shared across child objects of one service session. This offline policy and 32-session service capacity are implementation choices, not established original-server behavior. Unknown commands explicitly fail with IPC ResultNotSupported, never fake successful empty output.
+- Existing ServiceContext and ResponseBuilder manage event and session resources; re-read upstream kernel_helpers.h/cpp and ipc_helpers.h ownership contracts.
+
+### Unintentional differences (to fix)
+- Original chat server is unavailable, so exact behavioral parity cannot be claimed or fully compared.
+
+### Missing items
+- Network conversation, camera, later chat commands and original event signaling policy are not implemented. This entry covers only the observed startup contract.
+
+### Binary layout verification
+- Startup factory: CMIF success with one interface (domain object or moved session), no data payload. Event: CMIF success with one copied readable handle, no data payload. SDK helper sets the wrapper ownership boolean locally at0xf18ac; do not serialize that boolean. Focused tests verify real object identity, repeated event requests and root-independent lifetime.
+
+## 2026-11-07 -- src/core/src/hle/service/services.rs and mod.rs vs src/core/hle/service/services.cpp
+
+### Intentional differences
+- Add chat guest-core service and declare chat module, authorized SDK-derived extension absent from C++ service table. All protocol behavior remains in chat.rs. Existing APM/AM guest-service ownership pattern preserved.
+
+### Unintentional differences (to fix)
+- None in the new registration dispatch.
+
+### Missing items
+- See chat.rs startup-only scope above.
+
+### Binary layout verification
+- Not applicable to module registration.
+
+Validation for chat startup: focused core chat tests passed 2/2 (nx2-chat-focus.log). Full cargo test -p core attempted (nx2-chat-core-full.log), aborted with Windows STATUS_ACCESS_VIOLATION 0xc0000005; no full-suite success claim. SDK response parser0xb9980/0xb9a30 re-read: event helper0xf1790 consumes the first copy-handle index, confirming copy rather than move handle reply.
+
+
+## 2026-11-07 -- src/core/src/hle/service/chat/gsv.rs vs SDK chat::gsv (authorized exception)
+
+### Intentional differences
+- SDK-derived chat prerequisite, no C++ counterpart. Source nx2_gsv.h rechecked: 1201/1202/1203 absent. Existing root nx2_gsv.rs owns dispatch wrappers; chat/gsv.rs owns separate chat session state.
+- Re-read SDK0x6c1c90..0x6c1f70: initialize1201, session1202 must move one client session, finalize1203. Re-read0x6c1a50: raw header0x11 means command1, returns index<=1023 used to size bitmap and query a readable event. Raw0x1b (command11) from0x5d8710 requires moved readable handle. Raw0x77 (command103) at0x6c2040 registers eight-byte name+client slot; raw0x76(command102) at0x6c1000 removes name.
+- Model choices explicitly not verified server semantics: expose full SDK 1024-index capacity, reference-count initialization, reject uninitialized acquisition/invalid slots/duplicate registrations with ResultNotSupported; inactive named streams have no generated frames or notifications. Original server limits and error numbers unavailable.
+- Genuine session/event objects use existing kernel ownership, no guest patches or empty-success substitutions. Unknown commands fail.
+
+### Unintentional differences (to fix)
+- Server semantics beyond client ABI cannot be established from this SDK alone; offline policy is not full original chat equivalence.
+
+### Missing items
+- Camera/network producer, frame queueing and unobserved commands.
+
+### Binary layout verification
+- 1202/11: one moved object, TIPC special header0x20, result at word4. Command1: result at word2, max index at word3. Command103 request has three u32 payload words: LE u64 name + u32 slot, no pointer serialization. Added exact-wire integration regression with real kernel session/event registries.
+
+Chat GSV validation: 5 focused tests passed (nx2-chat-gsv-focus.log, terminal51515). Exact SDK wire test verifies1201 raw0x4c1 success,1202 raw0x4c2 one moved registered client session, command1 raw0x11 result/capacity, command11 raw0x1b one moved registered unsignaled readable event, display103/102 raw0x77/0x76 and session resource release. Full cargo test -p core attempted again after implementation: terminal43974 STATUS_HEAP_CORRUPTION0xc0000374, nx2-chat-gsv-core-full.log. Full suite is NOT green.
+
+
+## 2026-11-07 -- chat.rs, chat/gsv.rs and nx2_gsv.rs vs SDK chat pool ABI (authorized exception)
+
+### Intentional differences
+- Shader/GPU runtime pass interrupted for newly observed chat pool prerequisite. Re-read SDK CreateImagePool0x6c0a10/transport0x6c16f0, CalculateRequiredBufferMemory0x6c0d40, DestroyImagePool0x6c1830, CreateMetadataPool0x6c2500, DestroyMetadataPool0x6c1900, GetMetadata0x6c0ed0 and MakeImagePreference0x6c0e90. Root1291 returns size/alignment u64s;1211 takes16 preference words/count/native memory and returns first image ID;1212 frees pool.
+- Re-read Eden header Nx2CalculateDecoderImageLayout/Nx2NativeObjects: reuse its NV12 memory layout for SDK chat encoding0/format1, stride per image and8192 alignment, all images occupy existing native registry. This shared layout is a model inference, not original chat-server proof. Validate memory backing, handle overflow, and retain whole pool range for destruction. Local supported pool limit256, unsupported encoding rejected.
+- SDK shim vtable0xe195a8+0x38 maps command2 to same copy-event helper0xf1790. Add distinct initially-unsignaled notification2 (purpose not named beyond observed command).
+- Metadata creation raw0x89 means command121, not receive-image; request identity u64/count u64/slot u32. Keep full opaque identity and per-entry absent/received state; raw0xf7(command231) only returns an actual received u64 record. No synthetic metadata, no client-pointer dereference. Shared notification-slot uniqueness with virtual displays. Original server errors/signaling unavailable; validation uses explicit ResultNotSupported policy.
+
+### Unintentional differences (to fix)
+- No original chat server available; offline policies and common image-layout reuse are explicitly limited.
+
+### Missing items
+- ReceiveImage115 and camera producer, virtual camera service root3, further commands and completion notification semantics remain unimplemented; unknown calls fail.
+
+### Binary layout verification
+- Exact captured384x216 preference/count3 produces442368 totalbytes,147456 stride,8192 alignment. Metadata identity retains upper32bits; no raw Rust struct serialization. Regression tests cover insufficient backing rejection, full pool release, metadata lifetime and no false received frame, distinct copy-event identities.
+
+Chat pools validation: focused7/7 passed (nx2-chat-pools-focus.log session5055 exit0). Full cargo test -p core attempted, terminal16148 STATUS_HEAP_CORRUPTION0xc0000374 (nx2-chat-pools-core-full.log), not green. No full chat/video server completion claim.
+
+## 2026-11-07 -- nx2_gsv.rs native image query investigation vs SDK (authorized exception)
+
+### Intentional differences
+- Read-only prerequisite investigation; no emulator implementation changed. Rechecked authoritative tree: nx2_gsv.h exists without paired cpp, query428/map426 absent. SDK static client consumers archived in current runtime directory/native-image-contract.json and five disassemblies, with SDK SHA256.
+
+### Unintentional differences (to fix)
+- Existing unknown-command fallback returns empty success for428; SDK requires actual image descriptor, then aborts on invalid response. Do not treat the fallback as a valid port.
+
+### Missing items
+- Native image query428 and map426. Need verified NV12 descriptor format/planes/layout, flags, and mapped GPU address semantics before implementation.
+
+### Binary layout verification
+- Client ABI established: one input u32; reply38 data words including result, two u64, descriptor128 bytes, flagsu32. Descriptor tags at0/0x20 must equal1, offsetu32 at0x28 and nonzero sizeu32 at0x2c. Full128-byte layout is NOT verified. No tests rerun for read-only analysis. Last focused chat7/7 passed; last fullcore crashed0xc0000374; release built; runtime remains0FPS.
+
+## 2026-11-07 -- src/core/src/hle/service/chat/gsv.rs vs SDK image import and native layout
+
+### Intentional differences
+- Corrected previous erroneous decoder-NV12 reuse: preference kind1 in chat is not decoder format1. Static main0xd322fc loads NVN format0x38 for three384x216 images; resolved ELF64 PLTs confirm nvnNativeImageBuilderSetFormat, nvnNativeImageInitialize and nvnTextureInitializeFromNativeImage. SDK MakeImagePreference0x6c0e90 reread.
+- New corroborating C++ source: https://github.com/Djihads80/Eglantine/blob/ae9d3eb8d224e85b9fc4ec1df35f2825e13aef76/src/core/hle/service/nx2_gsv.h CalculateChatImagePoolSize uses native RGBA layout. Original origin/eden-nx2 unchanged50fa86bb; its header-only Nx2CalculateImageLayout reread and compared against existing Rust helper. Chat ownership remains in chat/gsv.rs under existing SDK exception; no helper moved or copied.
+- Preserved existing explicit chat validations (count1..256 and backed memory), while new fork clamps zero count. Alignment now comes from existing native layout rather than literal8192. Images remain shared native registry objects with decoder=false.
+
+### Unintentional differences (to fix)
+- Prior NV12 allocation (147456-byte stride) fixed to393216-byte native RGBA stride. Earlier audit entries claiming NV12 chat layout are superseded. Original server layout not independently measured.
+
+### Missing items
+- Query428/map426/unmap427, camera producer and earlier unimplemented chat operations remain. New fork marks some descriptor fields guessed; full original descriptor fidelity not proven.
+
+### Binary layout verification
+- Three384x216 native images: pitch1536, paddedheight256, stride393216, total1179648, alignment8192. IPC size/alignment remain little-endian u64 words. Regression rejects previous442368-byte backing and verifies three distinct offsets, decoder=false and full pool release. Validation pending final focused/fullcore runs.
+
+Validation: final focused chat tests7/7 passed, session63999 terminalexit0. Full cargo test -p core attempted, session31881 terminal STATUS_HEAP_CORRUPTION0xc0000374; suite not green. No runtime improvement claimed before remaining native-image prerequisite is implemented and release rebuilt.
+
+## 2026-11-07 -- nx2_gsv.rs and chat/gsv.rs vs native-image SDK/fork extension
+
+### Intentional differences
+- Under authorized SDK-derived prerequisite scope, root426/427/428 now own Map/Unmap/QueryNativeImage in nx2_gsv.rs. Original header-only origin/eden-nx2 lacks them; corroborating C++ is frozen Eglantine ae9d3eb8 nx2_gsv.h QueryNativeImage/UnmapNativeImage/TakeDecoderMapping/DropDecoderMapping. Reread those methods and SDK Query0x461cd0/Map0x461ef0 after implementation.
+- Native RGBA images use existing per-image entries/offsets rather than fork upper_bound/count lookup. Query returns actual backing offset/size/dimensions; map registers actual CPU allocation at identical GPU virtual address through existing native registry. Mapping reference count and mapping ownership follow fork decoder lifetime machinery, also applied to chat RGBA allocations. GPU callbacks occur after object lock release.
+- Mechanical Take/Drop mapping helpers remain in nx2_gsv.rs and are called by chat pool teardown; no relocation of chat ownership. Explicitly reject missing memory/image, decoder or unsupported preference, undersized backing and unrepresentable sizes, instead of fork fallback descriptor for absent handles. Error numbers remain model policy (ResultNotSupported).
+- Descriptor block-height/pitch fields are inherited fork inference, documented in code; full hardware layout and flags not proven. Entire37-word payload initialized to zero before writing known fields. No fake image content or fabricated camera frames.
+
+### Unintentional differences (to fix)
+- Original GSV server semantics unavailable; per-address-space isolation and permission enforcement not established in existing shared GPU registry model. No full server equivalence claim.
+
+### Missing items
+- Decoder native-image GPU descriptors deliberately unsupported by this RGBA slice; prior camera/receive-image prerequisites remain. Full hardware descriptor verification remains unavailable.
+
+### Binary layout verification
+- result + GPU addressu64 + pool offsetu64 +128 descriptor bytes + flagsu32. SDK page rounding, two tag bytes, nonzero size and NVN dimensions/layout kind checked against static consumers. Regression covers exact38-word reply, second pool image offset, real map callback once for two references, partial unmap and pool destruction releasing last map then backing exactly once, unknown image failure. Validation pending.
+
+Validation: native-image exact-wire/lifetime regression passed1/1; chat7/7 passed. Full cargo test -p core attempted and aborted0xc0000374 STATUS_HEAP_CORRUPTION (nx2-native-image-core-full.log, terminal49341). No full-suite success claim.
+
+Runtime validation of native-image slice: release90587 built successfully (3m13). Real ROM PID13296 accepts428/426 for image IDs4..18, stride0x60000 and per-image mapped addresses; crosses previous invalid-descriptor abort. Next failure is missing camera601/602 then603, guest abort0x22 at9.084s. No rendered frame,0FPS. Runtime archived/stopped after identity verification. Camera ABI research only:602 moves a real session (SDK0x2beab0), fork camera command bodies remain unknown stubs and were not implemented here.
+
+## 2026-11-07 -- nx2_gsv.rs camera context vs SDK/fork extension
+
+### Intentional differences
+- INx2CameraSession and root601/602/603 remain in nx2_gsv.rs, matching new frozen Eglantine ae9d3eb8 header ownership. Original upstream header has no implementation. SDK CreateCameraContext0x2be980, helper0x2beab0, DestroyCameraContext0x2bebb0 reread after changes.
+- Factory returns actual registered client session with MOVE descriptor0x20 per SDK, rather than fork ReturnRawSession COPY helper. Context count and u64 mode1 validation are explicit local policy. Underflow/overflow and unsupported mode fail. Child retains shared context storage independently of root lifetime.
+- Camera session unknown operations report ResultNotSupported, including fork empty-success3/21/29 whose semantics are not established. No claim camera capture is implemented.
+
+### Unintentional differences (to fix)
+- Original server lifecycle limits and error numbers are unavailable; context ownership/count is a modeled policy.
+
+### Missing items
+- Camera session command contracts and frame producer. Factory startup is implemented; camera subsystem remains incomplete.
+
+### Binary layout verification
+- 601/603 have no payload;602 receives full64-bit mode (high bits validated) and returns one moved handle at word3, resultword4. Added regression for open-before-create, high mode bits, moved identity, context balance, surviving child, unsupported command and session resource release. Validation pending.
+
+Camera factory validation: focused87609 passed1/1. Full cargo test -p core attempted, terminal37120 STATUS_STACK_BUFFER_OVERRUN0xc0000409; not green. Source factory remains under explicit SDK exception, current runtime verification pending release46829.
+
+### Camera CMIF3 follow-up from runtime33444
+- Factory verified on real ROM; next request header6/SFCI proves CMIF3 named-camera acquisition, contrary to fork TIPC-only handler. Static main vtable0x352b3c0+0x38 ->1c6c6b0 ->CMIF helper1c6d3b0 confirms16-byte name andu64 output on success; helper forwards failure result unchanged. Caller0xcded80..88 tolerates0xdc4 while other errors abort. These ranges reread after implementation.
+- Modeled absent camera producer by returning this recoverable result (inferred unavailable-camera meaning, original symbolic name unknown). No fabricated output camera ID, event, video or success. Constant belongs to INx2CameraSession, CMIF3 registered only in CMIF table; unknown TIPC remains expliciterror. Test replays actual captured request and checks SFCO, result0xdc4, no transferred handles. Runtime verification of this policy pending; physical camera support not claimed.
+
+CMIF3 validation: exact camera context/request test passed (92832). Full cargo test -p core attempted again,23410 terminal STATUS_STACK_BUFFER_OVERRUN0xc0000409; not green. Release59071 pending runtime validation.
+
+Camera runtime validation: release59071 succeeded3m07. ROM33364 accepts601/602 factory and CMIF3 result0xdc4 (unavailable policy), proceeds to CMIF21 with u64 zero, then aborts on unsupported21. No visible frame/0FPS. Archived/stopped verified process. Main1c6de30 confirms21 expects a kernel handle; copy/move and event consumer remain to inspect. No empty-success21 implemented.
+
+## 2026-11-07 -- nx2_gsv.rs INx2CameraSession CMIF21 vs main client ABI
+
+### Intentional differences
+- Matching camera session ownership stays in nx2_gsv.rs. Frozen Eglantine ae9d3eb8 header reread: unknown21 is empty-success/TIPC, contradicted by runtime33364 CMIF6/SFCI command21 and client transport1c6de30. This extends existing authorized SDK/client-derived scope.
+- Client parser1c6d1c0/1c6d270 decodes COPY count bits1..4 and stores COPY-array offset in returned packed byte1, at caller sp+0x23;1c6df0c consumes that offset. Main0xcdc5ac calls vtable+a8=command21 and0xcdc5cc calls PLT2bb28e0. Resolved ELF64 GOT36f7570 to nn::os::AttachReadableHandleToSystemEvent, proving a readable-event handle.
+- Implemented actual ServiceContext-owned event, lazily allocated and stable per fullu64 camera identifier. A copy handle is returned with no moved objects. Event lifetime is owned by camera session; guest retains its copied reference independently. Initially unsignaled/no producer is explicit local offline policy, original event signaling meaning unknown.
+
+### Unintentional differences (to fix)
+- Original camera event notification semantics unknown; no hardware/backend camera producer exists.
+
+### Missing items
+- Other camera operations including29 remain unsupported; no fake frames or empty-success fallback added.
+
+### Binary layout verification
+- Captured CMIF21 request: fullu64 identifier, no descriptor arrays. Response specialheader2=one copied handle, zero moves; SFCO/result layout checked by regression. Repeatedid0 returns stable readableevent, id1<<32 distinct; all initially unsignaled. Validation pending.
+
+Camera event validation: focused67195 passed. Fullcore91234 produced two synchronization test failures then stalled; noninvasive stacks preserved in nx2-camera-event-test-stacks.log. Verified owned testPID28896 terminated after180s; canceled suite not green. Failure cause not assigned to this change.
+
+Camera event runtime: release57769 built, ROM33852 accepts CMIF21 copy event and advances to GPU allocations/audio initialization. No camera abort. Stops waiting for missing aud:u at9.818s,0FPS. Archived/stopped identity-verified process.
+
+## 2026-11-07 -- audio/nx2_audio_user_client.rs vs audio/nx2_audio_user_client.h
+
+### Intentional differences
+- Direct port of original origin/eden-nx2 header-only class; header reread after implementation. Constructor owns SystemRef and CMIF2 table, name nx2:aud:u, unchanged unknown-command fallback inherited. Command2 pops rawu32 argument without filtering, logs it and returns a newly constructed existing IAudioRendererManager with success and one IPC object. Rust Arc replaces shared_ptr. No new renderer behavior or dispatcher abstraction.
+
+### Unintentional differences (to fix)
+- None found in this header-only wrapper slice. Upstream marks command name guessed and logSTUBBED; retained without claiming complete NX2 audio ABI.
+
+### Missing items
+- None from this header. Underlying audio runtime still needs validation on real ROM.
+
+### Binary layout verification
+- u32 input bit pattern retained; CMIF success with one moved interface. Regression covers0/u32MAX inputs, fresh child identities, actual session registration and resource release.
+
+## 2026-11-07 -- audio/audio.rs and audio/mod.rs vs audio/audio.cpp
+
+### Intentional differences
+- Existing Rust module declaration added for matching nx2_audio_user_client.rs. Service registration uses established Rust factory closure, in upstream order audren:u, aud:u, audren:a, with30 sessions. Original LoopProcess reread after implementation; no change to constructor prerequisites.
+
+### Unintentional differences (to fix)
+- None in added registration.
+
+### Missing items
+- No additional items for aud:u registration.
+
+### Binary layout verification
+- Not applicable to module/service registration.
+
+Audio wrapper validation: focused30521 passed1/1 using fresh IPC context per request, retained manager and registered child-object lifetime checks. Parallel fullcore45369 failed a synchronization test and stalled, then deliberately canceled after recording process identity. Full serial rerun85738 also crashed STATUS_ACCESS_VIOLATION0xc0000005 near kernel wait_cancel test; not just parallel execution, suite not green. Release25158 pending.
+
+Audio wrapper runtime: release25158 successful, ROM33048 acquires aud:u cmd2arg0 and opens actual audio renderer (revision0x3f764552). Initialization passes previous service wait. Later audio update reportsbehavior_info5299; not a full audio parity claim. Process then aborts on GPU buffer-cache page-table bounds (index271904,len262144), with concurrent unsupported PACGA ARM exceptions. No rendered frame,0FPS. Runtime logs archived; process terminal.
+
+## 2026-11-07 -- video_core/buffer_cache/buffer_cache.rs vs buffer_cache_base.h
+
+### Intentional differences
+- Preserve existing Rust BufferCache owner and heap-backed fixed array; local correction only. No ownership refactor introduced.
+
+### Unintentional differences (to fix)
+- FIXED: Rust page table covered2^34 bytes while authoritative origin/eden-nx2 BufferCacheBase covers2^36 bytes (matching device_virtual_bits). Actual ROM reached page271904 beyond old262144-entry table. Constant corrected, without clamping addresses or dropping GPU work.
+
+### Missing items
+- No new missing items in table-size correction. Other runtime issues (PACGA/audio behavior revision) remain separate.
+
+### Binary layout verification
+- Host lookup table only, no guest serialized layout. Re-read C++ table declaration and ForEachBufferInRange after implementation, compared Rust iteration unchanged. Regression traverses actual crash page271904 and final64GiB page, skips unallocated entries without panic. Focus33195 pending.
+
+Buffer range validation: focused33195 passed exactcrash/finalpage regression. Full video_core suite86406 still running with CPU-active long DMA continuation test; no full-suite result claimed yet.
+
+## 2026-11-07 - src/rdynarmic/src/frontend/a64/translate/pointer_authentication.rs vs src/dynarmic/src/dynarmic/frontend/A64/translate/impl/pointer_authentication.cpp
+
+### Intentional differences
+- DecodedInst fields replace typed C++ decoder arguments. Existing Rust emitter requires an explicit false carry for Add64 through addr_add. No semantic changes.
+- PACGA and LDRA decoder entries remain at their original Rust instruction-family positions; exact encodings decode in focused regressions. visitor.rs only dispatches to the upstream-owned module.
+### Unintentional differences (to fix)
+- None found in the newly ported PACGA/LDRA methods after re-reading upstream cpp, impl.h declarations and a64.inc at origin/eden-nx2 (50fa86bb).
+### Missing items
+- None in this upstream pointer_authentication.cpp: PACAUT_reg, XPAC_1, PACGA, RETA, BRA_BLRA and LDRA now have counterparts. This is not an audit of the entire decoder or JIT.
+### Binary layout verification
+- PASS: exact PACGA and LDRA encodings; PACGA distinguishes Rm=SP from Rn/Rd=XZR and masks low32 bits. LDRA concatenates S:imm9, sign-extends10 bits and scales by8; load precedes base writeback and destination write, including aliasing. Both key variants use upstream identity authentication policy. No serialized host payload added.
+- Focused pointer-authentication tests passed (5). Full rdynarmic suite in progress.
+
+## 2026-11-07 - src/audio_core/src/renderer/behavior/info_updater.rs vs src/audio_core/renderer/behavior/info_updater.cpp/.h
+
+### Intentional differences
+- Existing checked input read returns InvalidUpdateInfo for truncated input instead of unchecked C++ reinterpret_cast. This safety check is unchanged.
+### Unintentional differences (to fix)
+- Fixed UpdateBehaviorInfo raw revision comparison: compare GetRevisionNum on both sides, as original NX2 does for REV?/REv? tags. Restored upstream mismatch diagnostic. Re-read cpp/h after edit; validation, error clear, flag update and size-check ordering preserved.
+### Missing items
+- None in this changed method; no claim for unrelated updater methods.
+### Binary layout verification
+- PASS: BehaviorInParameter remains16 bytes, no payload layout changes. Regression covers both tags, numeric15, different/unsupported revisions and invalid declared size. Validation pending.
+
+Validation follow-up (PACGA/LDRA and audio revision): full cargo test -p rdynarmic passed1160 unit tests/4ignored plus4 other targets; full cargo test -p audio_core passed222 tests total with1ignored (one test runs in isolated subprocess). Video full passed1688/1ignored. Runtime confirmation pending.
+
+Runtime follow-up: latest optimized build with buffer64GiB, PACGA/LDRA and revision comparison ran past prior failures without UnallocatedEncoding/behavior_info/GPU panic in archived log. Still0FPS; this validates progression only, not playable rendering. Remaining GPU command/HID prerequisites saved in NX2_PORT_STATE.md.
+
+## 2026-11-07 - src/video_core/src/engines/puller.rs vs src/video_core/engines/puller.cpp/.h (NX2 binding and SEM_EXECUTE)
+
+### Intentional differences
+- Rust retains its current single GPU thread execution model. SEM_EXECUTE uses the original non-split path: Query and ReleaseFences execute synchronously. The optional upstream GpuSplit back-thread path is not ported here; introducing it requires wider engine state ownership changes. No dummy queue/drain implementation added.
+- Existing Option engine storage and raw channel pointer architecture retained. Tests changing the global Ampere mode run in an isolated subprocess.
+### Unintentional differences (to fix)
+- Fixed missing C797/C7C0/C7B5 class aliases and native class-zero early return before overwriting bindings. Upper class masking and existing binding dispatch retained exactly.
+- Fixed MemOpA/C/D logging level to trace; upstream does not implement additional work for these registers.
+- Fixed Ampere 0x1A payload-high being treated as legacy blocking acquire, and 0x1B being treated as legacy semaphore release. Ported SEM_EXECUTE address mask/alignment, operation low3 bits, Query fence release, one-shot acquire comparisons, signed wrapping subtraction, first8 warning cap.
+- Separate existing PendingAcquire/CanResumeAcquire/ResumeAcquire and DMA scheduler suspension differences remain outside this slice; these require a structural scheduler port, not a local patch. Broader GPU concurrency parity remains incomplete.
+### Missing items
+- GpuSplit and legacy-trigger pending-acquire scheduling integration, explicitly deferred to their prerequisites. This entry does not claim complete puller parity.
+### Binary layout verification
+- PASS: register file unchanged; SEM_EXECUTE consumes registers17/18/19 with25-bit upper address and4-byte alignment; 1A does not trigger legacy acquire in Ampere mode. New focused tests verify exact Query tuple, class aliases with upper bits, preserved zero binding, and nonblocking acquires. Source cpp/h reread after changes;11 focused tests passed. Fullvideo in progress.
+
+Puller validation follow-up: full cargo test -p video_core passed1690/1ignored (119.17s); release build passed. Runtime evaluation in progress.
+
+Puller runtime follow-up: C7B5 and class0 unsupported-engine errors removed; native shaders and compute execute, but0FPS persists. Unmapped GPU-only memory and scheduler parity remain unresolved. Diagnostic artifacts and exact process state recorded in NX2_PORT_STATE.md.
+
+## 2026-11-07 - src/core/src/hle/service/nx2_gsv.rs vs src/core/hle/service/nx2_gsv.h (allocation diagnostics)
+
+### Intentional differences
+- Rust structured logging format; same12 request words and successful backing address as upstream.
+### Unintentional differences (to fix)
+- Restored omitted SubCreateGpuOnlyRegion diagnostics to distinguish sparse reservation policy from backed memory. Source header re-read after edit; no .cpp counterpart upstream.
+### Missing items
+- Underlying command214 server semantics are still inferred by upstream; SDK calls this CreateSparseRegion. No allocation-policy change made without evidence.
+### Binary layout verification
+- PASS: no payload or wire changes; logs inspect existing words1..12 only.
+
+Allocation diagnostic validation: gpu_sparse_backing_is_freed_only_after_gpu_completion passed; fullcore failed STATUS_ACCESS_VIOLATION0xc0000005. Release succeeded and exact214words captured in realgame.24requests/22backed; failedranges differ from first unmappedreads, so no allocator policy change justified yet.0FPS remains; runtime closed normally and evidence archived.
+
+## 2026-11-07 - src/core/src/hle/service/nx2_gsv.rs vs src/core/hle/service/nx2_gsv.h (mapping lifecycle diagnostics)
+
+### Intentional differences
+- Rust log formatting only.
+### Unintentional differences (to fix)
+- Restored omitted upstream211 mapping info,213 unmap debug and215 sparse destruction info. Re-read header after edits; header-only upstream has no cpp. No allocation/mapping/order changes.
+### Missing items
+- None in these diagnostic statements; broader native GPU behavior remains under investigation.
+### Binary layout verification
+- PASS: read existing request fields, no wire/struct changes.
+
+Mapping lifecycle diagnostic validation: focused gpu_memory_jobs test passed; fullcore failed STATUS_ACCESS_VIOLATION again. Release succeeded. Runtime mapping logs and60HzVsync callbacks captured,0FPS persists beyond106s. No mapping-policy change made without evidence.
+
+
+## 2026-11-07 - src/core/src/hle/service/hid/hid_server.rs vs src/core/hle/service/hid/hid_server.cpp/.h
+
+### Intentional differences
+- SendNx2VibrationValues uses snake_case and ResponseBuilder instead of the C++ CMIF adapter/R_SUCCEED macro. Command 214 retains upstream's guessed name and accepts/drops vibration input exactly as upstream.
+### Unintentional differences (to fix)
+- None in this command slice. Re-read upstream header, registration and implementation after porting; no input decoding, state mutation or output objects in either implementation.
+### Missing items
+- Physical Switch 2 vibration is not implemented by upstream either. This entry does not audit other HID commands.
+### Binary layout verification
+- PASS: command has no decoded parameters or serialized payload; standard result-only CMIF response, no handles or objects.
+
+Validation: focused HID214 regression passed. Full core suite terminated with native 0xc0000409; full validation remains unsuccessful.
+
+
+## 2026-11-07 - nx2_gsv.rs camera command29 vs main client ABI / nx2_gsv.h
+### Intentional differences
+- Original origin/eden-nx2 has no camera server implementation. Frozen Eglantine ae9d3eb8 nx2_gsv.h owns INx2CameraSession but labels29 unknown and returns empty success. Rust retains explicit unavailable-producer policy, returning0xdc4 instead. This is an inferred offline-device result, not a claim of complete camera hardware semantics.
+- Verified main+1c6c860 selects29; shared CMIF serializer1c6e4f0 copies40 bytes then u64, response reads only Result. Caller25a680 loads this vtable method at+d8;25a6d8..e4 masks description bit9 and accepts0xdc4 (also0xfc4). The existing OpenCamera policy returns0xdc4, so command29 now reports the same actual lack of camera producer. Unknown fields remain opaque; no invented validation or state mutation.
+### Unintentional differences (to fix)
+- No invented success response. Full server behavior cannot be verified from client ABI; retained limitations below.
+### Missing items
+- Original command name, hardware configuration validation and camera capture producer remain unavailable. TIPC29 remains unsupported. No camera frames or hardware support claimed.
+### Binary layout verification
+- PASS:40 bytes as10 u32 then full64-bit ID, result-only response, no copy/move objects. ABI and caller reread after change; disassembly archived as camera29-client.asm in audio-event runtime directory.
+
+Validation: camera session regression passed1/1, full core suite failed with native0xc0000409. Runtime validation pending release build.
+
+Runtime validation: camera29 no longer causes guest abort; first actual vi2 presentation at25.284503s, FPS36-57 briefly. Later independent GPU texture-view panic at~35s prevents sustained/visual/gameplay validation. Goal remains active.
+
+
+## 2026-11-07 - src/video_core/src/texture_cache/image_info.rs vs src/video_core/texture_cache/image_info.h/.cpp
+### Intentional differences
+- Port TextureViewHeader in matching image_info owner; clear precisely bits16..20 and29..31 of word2 and16..18 of word4 for native descriptors only. Rust raw-word masks replace C++ BitField::Assign. All other bits preserved.
+- Existing translated and nontranslated entry points share the upstream-owned header helper; no new ownership abstraction. Runtime diagnostics environment names differ; optional diagnostic output is not ported in this slice.
+### Unintentional differences (to fix)
+- None identified in this slice after re-reading upstream header/constructor/CreateImageView sequence and bitfield definitions.
+### Missing items
+- This entry audits native texture-view normalization only; overall texture cache parity is not claimed.
+### Binary layout verification
+- PASS:32-byte TIC retained; only the three upstream legacy layer fields are zeroed in a copy. Regression checks every changed bit, native address/layer selection through both creation paths, and preservation of the original descriptor.
+
+
+## 2026-11-07 - src/video_core/src/texture_cache/texture_cache.rs vs src/video_core/texture_cache/texture_cache.h
+### Intentional differences
+- Both existing Rust view creation paths apply TextureViewHeader before ImageInfo, base address, base lookup and view construction, using channel GPU memory UsesNativeTiling. Keep TryFindBase and level assertions intact. Layer offset multiplication now wraps as upstream u32 before conversion to GPU address width.
+- Existing translated and nontranslated entry points share the upstream-owned header helper; no new ownership abstraction. Runtime diagnostics environment names differ; optional diagnostic output is not ported in this slice.
+### Unintentional differences (to fix)
+- None identified in this slice after re-reading upstream header/constructor/CreateImageView sequence and bitfield definitions.
+### Missing items
+- This entry audits native texture-view normalization only; overall texture cache parity is not claimed.
+### Binary layout verification
+- PASS:32-byte TIC retained; only the three upstream legacy layer fields are zeroed in a copy. Regression checks every changed bit, native address/layer selection through both creation paths, and preservation of the original descriptor.
+
+Validation: full video_core suite1692passed/1ignored including native and legacy view tests. Release build passed. Runtime passed previous TryFindBase failure; black captures and later native shader rejection/Vulkan device-memory exhaustion remain, no rendering completion claim.
+
+
+## 2026-11-07 - src/video_core/src/texture_cache/image_base.rs vs src/video_core/texture_cache/image_base.h/.cpp
+### Intentional differences
+- Added host_level_offset in upstream-owned ImageBase after scale_rating, zero initialized in both normal and null constructors. Added exact upstream flag bits18..20 Unbacked/TrimmedLevels/ZeroFilled.
+- Rust wrapping arithmetic preserves upstream unsigned operations; bitflags replace C++ enum flags.
+### Unintentional differences (to fix)
+- None in this prerequisite slice after re-reading headers and implementations.
+### Missing items
+- Full trimmed ASTC path remains interrupted pending tail uploads, ASTC decoder level mapping, host image/view ranges and download exclusions. Metadata is not activated by image allocation yet. See NX2_PORT_STATE.md.
+### Binary layout verification
+- PASS (logical state): flags retain exact bit values, host_level_offset is u32 and defaults to zero. ImageBase is host-only, not serialized as a guest payload.
+
+
+## 2026-11-07 - src/video_core/src/texture_cache/util.rs vs src/video_core/texture_cache/util.h/.cpp
+### Intentional differences
+- MapSizeBytes follows upstream accelerated+trimmed branch first: FullUploadSwizzles offset, unsigned32 layer_stride subtraction, unsigned32 layers multiplication. Existing accelerated/converted/unswizzled branch ordering retained.
+- Rust wrapping arithmetic preserves upstream unsigned operations; bitflags replace C++ enum flags.
+### Unintentional differences (to fix)
+- None in this prerequisite slice after re-reading headers and implementations.
+### Missing items
+- Full trimmed ASTC path remains interrupted pending tail uploads, ASTC decoder level mapping, host image/view ranges and download exclusions. Metadata is not activated by image allocation yet. See NX2_PORT_STATE.md.
+### Binary layout verification
+- PASS (logical state): flags retain exact bit values, host_level_offset is u32 and defaults to zero. ImageBase is host-only, not serialized as a guest payload.
+
+Validation: trimmed map-size regression passed; full video_core1693passed/1ignored. Allocation/decoder integration not active yet; no new runtime claim.
+
+
+## 2026-11-07 - src/video_core/src/renderer_vulkan/compute_pass.rs vs src/video_core/renderer_vulkan/vk_compute_pass.h/.cpp
+### Intentional differences
+- Ported ASTCDecoderPass::Target and AssembleInto; Assemble builds target with wait=true. Compact stride/size follows skipped guest mips; descriptor range uses compact size; target callback receives guest level minus skip; push constants override layer_stride. Target wait=false leaves submission to caller; wait=true finishes, or flushes under RUZU_NX2_ASTC_FLUSH (upstream EDEN_NX2_ASTC_FLUSH).
+- Borrowed Rust Fn callback replaces std::function. Pure astc_input_layout mechanically extracts upstream local calculation for device-independent regression tests. Optional five-second timing diagnostics are omitted; synchronization behavior is retained.
+### Unintentional differences (to fix)
+- None identified in this prerequisite slice after re-reading header and implementation. Full integration is still stopped below.
+### Missing items
+- Compact layer-tail upload preparation, trimmed host allocation and sampled view ranges, download exclusions remain required before any image can set host_level_offset nonzero. No reduced allocation is activated yet.
+### Binary layout verification
+- PASS: ASTC push-constant layout unchanged; corrected layer_stride value. Target is host-only; no guest serialization. Focus regression checks full guest size versus compact per-layer tails for two skipped levels.
+
+
+## 2026-11-07 - src/video_core/src/renderer_vulkan/texture_cache.rs vs src/video_core/renderer_vulkan/vk_texture_cache.h/.cpp
+### Intentional differences
+- AccelerateImageUpload passes ImageBase::host_level_offset through to ASTC decoder; storage views are created/indexed by host level, with vector sized to guest levels minus skip.
+- Existing Rust backend precreates storage views before decoder recording; C++ supplies a callback creating them on demand. This retains existing Rust resource ownership, while both now select the same host mip levels.
+### Unintentional differences (to fix)
+- None identified in this prerequisite slice after re-reading header and implementation. Full integration is still stopped below.
+### Missing items
+- Compact layer-tail upload preparation, trimmed host allocation and sampled view ranges, download exclusions remain required before any image can set host_level_offset nonzero. No reduced allocation is activated yet.
+### Binary layout verification
+- PASS: ASTC push-constant layout unchanged; corrected layer_stride value. Target is host-only; no guest serialization. Focus regression checks full guest size versus compact per-layer tails for two skipped levels.
+
+Validation for ASTC offset slice: focused regression passed1/1; full video_core1694passed/1ignored after final synchronization change. No runtime claim until full trimmed allocation integration.
+
+
+## 2026-11-07 - src/video_core/src/texture_cache/texture_cache.rs vs texture_cache/texture_cache.h
+### Intentional differences
+- UploadImageContents now ports accelerated trimmed-level branch: read each layer tail with NoTextureCache, erase leading swizzles, subtract the original level offset from retained buffer offsets, preserve guest mip numbers, then accelerate with z_start/z_count zero. Rust uses bounded staging slices and existing GPU-memory lock ownership.
+- IsDownloadable and BindRenderTarget's existing queue helper reject Unbacked/TrimmedLevels exactly as upstream. Other images retain existing download/MSAA policy.
+### Unintentional differences (to fix)
+- None identified in this slice after re-reading all three upstream template bodies. Layer*stride retains unsigned32 multiplication before address widening.
+### Missing items
+- TrimmedHostInfo allocation and HostRange sampled views/huge ASTC format selection still required before activation. No image enables trimming yet. This does not claim Vulkan OOM fixed at runtime.
+### Binary layout verification
+- PASS: regression uses three actual mapped guest layers and two skip values; checks byte-exact compact buffer including layer-tail padding and original mip numbers with rebased offsets. No guest structure layout changes. Download tests cover each blocking flag, their combination, and ordinary-image control case.
+
+Validation: four trimmed-path focused tests passed. Full video_core run pending.
+
+Validation: full video_core suite1696passed/1ignored (nx2-trimmed-transfers-full.log). Runtime still pending final allocation/view integration.
+
+
+## 2026-11-07 - src/video_core/src/renderer_vulkan/texture_cache.rs vs renderer_vulkan/vk_texture_cache.h/.cpp
+### Intentional differences
+- Ported IsHugeAstcArray, HugeAstcHostFormat, HugeAstcViewFormats, WillUseAcceleratedAstcDecode, TrimmedHostInfo and HostRange in their matching owner. Explicit capabilities/settings parameters permit deterministic tests while retaining upstream decisions. Image::new records host_level_offset, flags TrimmedLevels, allocates trimmed host shape with explicit RGBA8 format/view list, and sizes storage views to host mip count.
+- Huge arrays force AcceleratedUpload/Converted/CostlyLoad even with CPU decode/recompression settings. ASTC decoder is initialized for GPU mode OR absent native ASTC support, matching upstream runtime constructor.
+- Sampled views remap guest mip ranges to host mip ranges and choose RGBA8 UNORM/sRGB for huge arrays. Generic create_image_from_info takes upstream MakeImage's optional format/view-list inputs; ordinary and scaled-image calls keep original defaults.
+### Unintentional differences (to fix)
+- None identified in this huge-array slice after re-reading header and source helpers, runtime constructor, Image constructor and image-view creation. Removed an extra ASTC-view-format condition during audit to match upstream's unconditional huge-image view override.
+### Missing items
+- Separate upstream opaque-ASTC BC1 detection and GPU BCn transcoding remain outside this huge-array branch; no claim of complete renderer parity. Native shader opcode gaps already recorded remain.
+### Binary layout verification
+- PASS: guest ImageInfo remains full size; host allocation only is reduced. Original 8192x8192x68/12mips becomes1024x1024x68/9mips with offset3, without changing guest addresses/strides/layers. Sampled view regression covers discarded, crossing and last-mip ranges. Native ASTC and small images do not trim.
+
+Validation: two focused huge-ASTC tests passed; fullvideo/release ongoing after final audit correction.
+
+Huge ASTC validation: fullvideo1698passed/1ignored, releasepassed. Runtime two hugearrays trimtomip3 and previous VulkanOOM not observed through121s. Direct PrintWindow captures confirm map thenpartial3Dscene. FPSafter90smedian7.75, notgoalcomplete; native shaderopcode rejections remain.
+
+
+## 2026-11-07 - src/shader_recompiler/src/frontend/translate/surface_atomic_operations.rs vs src/shader_recompiler/frontend/maxwell/translate/impl/surface_atomic_operations.cpp
+
+### Intentional differences
+- Rust enums/field extraction and free functions preserve upstream helper ownership; panics replace unsupported-mode exceptions in the existing frontend. Source: origin/eden-nx2 50fa86bbbc403ad565eb44fcc281f16f77c69e15. Reread cpp and shared impl.h; instruction declarations generated upstream.
+
+### Unintentional differences (to fix)
+- Fixed SURED operation offset21 ->24, preserving independent size20..22. Also fixed missing MakeCoords Array1D/Array2D arms found in whole-file comparison; layer uses unsigned low16 bits exactly upstream. No remaining difference found in checked operations/helpers.
+
+### Missing items
+- Float/64-bit atomics remain unsupported by upstream too. No new missing item for this slice.
+
+### Binary layout verification
+- PASS: SURED bound51, operation24..26, type33..35, size20..22, clamp49..50, operand0..7, coords8..15, offset36..48, bindless39..46 compared line-by-line. No raw payload.
+- Focused tests passed4/4: signed/unsigned nonzero operation discrimination, array layer extraction, bound/bindless handle, no reduction result write. Full crate validation follows with native lowering.
+
+
+## 2026-11-07 - src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+
+### Intentional differences
+- Original50fa86 has no native593/59f arm. Ported the exact SUATOM/SURED arm from Eglantine900ab5a8251dcdb5eee42dd2837fa936ade15303 in the matching owner; reference https://github.com/Djihads80/Eglantine/blob/900ab5a8251dcdb5eee42dd2837fa936ade15303/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h . Header-only implementation, no cpp. Reread original header and pinned extension after implementation; compared guards, descriptor selection and emitted fields line-by-line.
+- Existing Rust scratch-register rejection now includes data operand32..39 for593/59f; fork has a newer register-pressure mechanism not yet ported. Reject reserved operands instead of corrupting registers.
+
+### Unintentional differences (to fix)
+- None in supported593/59f lowering arms; original source remains authoritative elsewhere.
+
+### Missing items
+- Native923/927 need task/mesh stage-buffer prerequisites; deliberately still rejected. Fork PR173 no-op write is not ported. Latest fork uses pseudo-op0xefc0 and stage-specific IR/backend support, a separate structural slice saved in NX2_PORT_STATE.md.
+
+### Binary layout verification
+- PASS: captured59f0400759f60000c000010e000000fe200 emits Maxwell eb4800c600070400 (U32 bound2D ADD, coordinateR4, dataR0, descriptoroffset12). Instruction remains16bytes.
+- Focused tests passed2/2: all eight2D reductions, permitted3D/returningADD/OR, predicates, descriptor binding/conflict, invalid modes, scratch operands; emitted instructions also translated through Maxwell and checked for actual atomic IR opcode and result-write contract.
+
+Validation follow-up: full cargo test -p shader_recompiler passed618/618 (2.76s), including67809 original C++ program vectors. Two frozen all-zero593/59f probes now expect specific mode rejection instead of unknown-op rejection; fixture bytes and metadata assertions unchanged.
+
+Runtime verification SURED: release passed1m34; MarioKartWorld1.8.0 run21600 (TEMP/ruzu-nx2-sured-20261107-231900) through115s has zero compute shader rejections/59f errors,10 remaining923/927 graphics failures. Actual PrintWindow scene captured road/desert/lamps; render incomplete.26samplesafter90s median8FPS (7.5..8), goalnotachieved. Logs/screenshots archived.
+
+
+## 2026-11-07 - src/shader_recompiler/src/shader_info.rs vs src/shader_recompiler/shader_info.h
+
+### Intentional differences
+- MeshInfo and PrimitiveVertices ported from pinned Eglantine900ab5a8251dcdb5eee42dd2837fa936ade15303 (absent original50fa86). ArrayVec0.7.6 replaces boost static_vector with inline storage and identical capacity136; no unbounded Vec. Header-only; reread all fields and topology ternary after implementation.
+
+### Unintentional differences (to fix)
+- None found in this prerequisite slice.
+
+### Missing items
+- Task/mesh activation and execution backend remain interrupted pending prerequisites in NX2_PORT_STATE.md; these additions do not claim rendered mesh support.
+
+### Binary layout verification
+- No serialized payload; u32 scalar order preserved, container ABI intentionally Rust-only. Defaults zero/empty; bounded capacity and topology0/1/other regression passed.
+
+
+## 2026-11-07 - src/video_core/src/engines/maxwell_3d.rs vs src/video_core/engines/maxwell_3d.h/cpp
+
+### Intentional differences
+- Pinned900ab5a8 MeshControl/MeshShaderA/MeshShaderB/MeshInitShader and IsMeshEnabled ported in existing register owner. Rust uses Maxwell3D flat regs rather than nested Regs; same established mapping. Header and cpp reread; cpp has no special handlers for these registers.
+
+### Unintentional differences (to fix)
+- None found in this prerequisite slice.
+
+### Missing items
+- Task/mesh activation and execution backend remain interrupted pending prerequisites in NX2_PORT_STATE.md; these additions do not claim rendered mesh support.
+
+### Binary layout verification
+- PASS register word indices0x453..456, enable bit0 only; focused test passed1/1 including neighboring data independence.
+
+
+## 2026-11-07 - src/shader_recompiler/src/frontend/translate_program.rs vs src/shader_recompiler/frontend/maxwell/translate_program.cpp/h
+
+### Intentional differences
+- Pinned900ab5a8 AddMeshLines ported in matching owner with Result instead of exception. Existing ProgramHeader accessors preserve packed C++ union offsets. Reread cpp helper and interface header; system fields first, generic index/component order after.
+
+### Unintentional differences (to fix)
+- None found in this prerequisite slice.
+
+### Missing items
+- Task/mesh activation and execution backend remain interrupted pending prerequisites in NX2_PORT_STATE.md; these additions do not claim rendered mesh support.
+
+### Binary layout verification
+- PASS byte33systemB, bytes34..49generic, bytes52..53systemC (VTG-relative). SystemC bit11 reserved and ignored; all other bits rejected before any append. Test covers all136 outputs, sparse order, each systemCbit and append semantics.
+
+
+## 2026-11-07 - src/video_core/src/shader_cache.rs vs src/video_core/shader_cache.cpp/h
+
+### Intentional differences
+- Intentional diagnostic extension: existing once-per-rejection log now includes actual mesh_enabled and four mesh registers. Reread original RefreshStages catch and header. Rejection/failure flags and dedup unchanged.
+
+### Unintentional differences (to fix)
+- None found in this prerequisite slice.
+
+### Missing items
+- Task/mesh activation and execution backend remain interrupted pending prerequisites in NX2_PORT_STATE.md; these additions do not claim rendered mesh support.
+
+### Binary layout verification
+- N/A no payload; register reads only.
+
+Task/mesh prerequisite validation: full shader_recompiler passed621/621. First run620/621 exposed only a test expectation omitting existing NotImplementedException suffix; corrected expectation, implementation unchanged. Full video_core and release diagnostic build pending. Host vulkaninfo confirms no VK_EXT_mesh_shader on RX5700XT; pinned upstream rejects these pipelines without fallback, so native-only integration is insufficient for the actual goal.
+
+Validation complete: shader_recompiler621passed; video_core1699passed/1ignored (134.36s); release built1m57. Runtime mesh register evidence pending. No task/mesh draw support activated.
+
+Runtime diagnostic verification: ten923/927 rejections allshow mesh_enabled=true (46..54s); four actualNVNregisterconfigurations archived mesh-configurations.json in TEMP/ruzu-nx2-mesh-regs-20261107-233214. Confirms task/mesh execution is a real prerequisite, not speculative. Hostextension absence verified via vulkaninfo; pinnedupstream skips these draws and provides nofallback. Renderinggoal remainsincomplete.
+
+
+## 2026-11-07 - src/shader_recompiler/src/ir/program.rs vs src/shader_recompiler/frontend/ir/program.h/cpp
+
+### Intentional differences
+- Added owned MeshInfo at matching program owner, initialized by default alongside existing fields; reread pinned900ab5a8 header and cpp. No change to preexisting shader metadata defaults.
+
+### Unintentional differences (to fix)
+- None found in this slice.
+
+### Missing items
+- Task/mesh execution backend remains missing; activation interrupted in NX2_PORT_STATE.md. These metadata/diagnostic prerequisites do not execute unsupported programs.
+
+### Binary layout verification
+- MeshInfo remains host-only metadata, not raw-serialized; no guest ABI affected.
+
+
+## 2026-11-07 - src/shader_recompiler/src/frontend/translate_program.rs vs src/shader_recompiler/frontend/maxwell/translate_program.cpp/h
+
+### Intentional differences
+- Ported pinned900ab5a8 Task/Mesh initialization block as initialize_mesh_program, a mechanical helper extraction in same owner to verify prerequisites without activating missing execution stages. is_task is original stagecomparison; fields and ordering identical. Result replaces exception. Both source files reread.
+
+### Unintentional differences (to fix)
+- None found in this slice.
+
+### Missing items
+- Task/mesh execution backend remains missing; activation interrupted in NX2_PORT_STATE.md. These metadata/diagnostic prerequisites do not execute unsupported programs.
+
+### Binary layout verification
+- PASS registerfield masks payloadlocal12..20/passed22..30; topology0..3,vertices4..12,primitives13..22,threadcounts0..5/20..25. Minimumonepayloadline/oneinvocation; zerovertices/primitives preserved.
+
+
+## 2026-11-07 - src/video_core/src/shader_cache.rs vs src/video_core/shader_cache.cpp/h
+
+### Intentional differences
+- Diagnostic extension to original RefreshStages rejection handler, enabled only with EDEN_NX2_SHADER_DUMP: snapshots enabled stage1/3 and stage4header plus addresses/meshregs. Needed because rejectedtask aborts stageiteration before reading attachedmesh. Uses read-only fullymapped 128byte blocks, limit1MiB (128bytes forheader-onlystage4); filesexplicitlysnapshots notdecodedprograms. No lowering acceptancechange. Reread originalcatch/interface afteredit.
+
+### Unintentional differences (to fix)
+- None found in this slice.
+
+### Missing items
+- Task/mesh execution backend remains missing; activation interrupted in NX2_PORT_STATE.md. These metadata/diagnostic prerequisites do not execute unsupported programs.
+
+### Binary layout verification
+- PASS bytescopiedwithoutreinterpretation, native128byteheaderincluded. Snapshotread failures stopcapture, filesystemerrors reported; no guestwrites.
+
+
+## 2026-11-07 - src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+
+### Intentional differences
+- UPOPC0x2bf extension from pinned900ab5a8251dcdb5eee42dd2837fa936ade15303; original50fa86 has no arm. Reread header-only original and extension; matched source/destination mapping, inversion63->40, validation masks and emitted POPC. Added opcode to existing uniform-bank scan. Existing Rust mirror rangeUR0..27/URZ63 retained; fork newer high-register pressure mechanism still notported.
+
+### Unintentional differences (to fix)
+- None for supported UPOPC inputs.
+
+### Missing items
+- Higher uniform-register mapping remains separate prerequisite; rejected rather than aliased. Task/mesh execution still inactive pending backend.
+
+### Binary layout verification
+- PASS captured mesh1170instructionprogram+0x1140 words000972bf0000000808000000000fe200 and+0x48c0 words000472bf0000000708000000000fc800 mapUR9<-UR8 andUR4<-UR7. Tests cover inversion,URZsource,reserved destination,unmappedUR,predicate andmalformedoperand rejection.
+- Full shader_recompiler624passed. Frozen original oracle retained; only unsupported-zero-UPOPC diagnostic and UPOPC uniform-scan expectation adapted to intentional extension.
+
+Mesh initialization/snapshot validation: fullshader623passed beforeUPOPC; fullvideo1699passed/1ignored115.69s; release snapshotbuild1m39. Runtime32132 captured10slot1programs,7attachedslot3programs(190/380/1170instructions),andprimitiveheaders; eachprogram complete under existingcapture algorithm. Metadata records actualstageenabledstates. Closednormally; noFPS improvementclaimed.
+
+
+## 2026-11-07 - src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/spirv_emit_context.{h,cpp}
+
+### Intentional differences
+- Source for mesh additions: Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303, DefineMesh workgroup-output block (not present in original Eden-NX2). Re-read both header and implementation after port; compared fields, arithmetic, declaration order, names, storage classes and initializers.
+- Mechanically extracted this block as define_mesh_shared_memory in the same EmitContext owner. It is independent of EXT task payload/output declarations and is suitable for the required compute fallback on the RX5700XT. Normal compilation does not call it until execution prerequisites are ready; no Task/Mesh stage or unsupported native instruction is activated.
+- Rust div_ceil implements Common::DivCeil for the decoded bounded mesh counts; variable definitions use the existing context helper and interface tracking.
+
+### Unintentional differences (to fix)
+- None in the extracted workgroup-output block. This is a prerequisite, not completion of DefineMesh or task/mesh execution.
+
+### Missing items
+- Remaining DefineMesh payload/output declarations, task/mesh stage and IR routing, ISBE read/write emitters, collective prologue/epilogue, and compute/vertex dispatch/transfer integration remain stopped pending their implementations. No placeholder is substituted for them.
+
+### Binary layout verification
+- PASS for generated workgroup declarations: U32 arrays, attributes grouped in 32 elements, per-primitive base following rounded vertex groups, one map byte per U32, distinct scalar U32 primitive count, no initializers, all variables in interface list.
+- Regression cases cover 0/1/31/32/33 elements, point/line/triangle map sizes, 256 vertices with 192 primitives, empty attributes and all 136 lines. Declaration tests inspect actual SPIR-V types/constants/variables, not only host sizes. No external spirv-val execution or GPU execution claimed.
+- Validation: focused tests 2 passed; full cargo test -p shader_recompiler 626 passed (nx2-mesh-shared-full.log). No release build or game run: helper remains inactive.
+
+
+## 2026-11-07 - src/shader_recompiler/src/backend/spirv/emit_spirv_mesh.rs vs shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+
+### Intentional differences
+- Source: pinned Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303; this file has no paired mesh-specific header. Re-read the complete ported functions after implementation and compared helpers, masks, bounds, write order and barrier scopes/semantics.
+- Mesh branch of EmitIsbeWriteAttribute mechanically extracted as emit_mesh_write_attribute in the same owner. The task-payload branch is not represented by a fake write; it remains a prerequisite before native opcode activation.
+- Mesh-output storage presence guards these standalone operations instead of Stage::Mesh. This explicitly permits a future Compute execution model on the non-EXT host; task and ordinary contexts must not define mesh output storage. Guest stage routing must enforce this invariant when integrated. An additional error rejects attribute writes before storage definition.
+- Exceptions become Result errors; upstream helper boundaries Barrier, Clamped and SharedWord remain local. mod.rs only registers the matching file.
+
+### Unintentional differences (to fix)
+- None in ported mesh-only memory operations. They remain disconnected from normal opcode translation until the missing execution prerequisites are implemented.
+
+### Missing items
+- EmitIsbeRead, task payload writes, LocalInvocation, CopyLines, ConvertDepth, conditional output copies, TaskEpilogue/MeshEpilogue, guest Stage/IR routing and Vulkan compute/vertex orchestration. No task/mesh program is newly accepted by this change.
+
+### Binary layout verification
+- PASS: attribute addresses shift logically by two before unsigned clamping; map byte addresses are not shifted, are clamped and values masked to low eight bits stored in U32 slots. Primitive count only accepts immediate byte address 3; value is not prematurely clamped.
+- PASS ordering: every mesh invocation stores zero to primitive count before Workgroup/Workgroup ControlBarrier with AcquireRelease|WorkgroupMemory (0x108), without a conditional block or phi predecessor change. Contexts without mesh storage emit no prologue, as upstream non-mesh stages do.
+- Four focused regressions inspect actual emitted SPIR-V instructions, def-use operands, constants, invalid-address rejection before emission and non-mesh rejection. Initial test helper did not handle rspirv IdScope/IdMemorySemantics operands; fixed the test decoder, with no production workaround.
+- Full cargo test -p shader_recompiler: 630 passed (nx2-mesh-writes-full.log). No external spirv-val or GPU runtime validation claimed, no release rebuild.
+
+
+## 2026-11-08 - src/shader_recompiler/src/shader_info.rs vs shader_recompiler/shader_info.h
+
+### Intentional differences
+- Ported pinned Eglantine900ab5a8 Info.is_task/is_mesh at their upstream position, both false by Default. These guest flags can coexist with a Compute host execution model. No frontend classification is activated yet.
+
+### Unintentional differences (to fix)
+- None in these two fields; header re-read after implementation.
+
+### Missing items
+- TranslateProgram's guest-stage classification and shader-info collection for task/mesh remain prerequisites before normal translation can populate these fields.
+
+### Binary layout verification
+- Not a raw GPU ABI struct; no raw serialization introduced. Default flags checked by payload emission tests. Full shader tests636passed; cargo check -p video_core passed.
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/spirv_emit_context.{h,cpp}
+
+### Intentional differences
+- Source pinned Eglantine900ab5a8 DefineMesh payload block; both header and implementation re-read and compared after implementation.
+- Compute fallback replaces TaskPayloadWorkgroupEXT with a Workgroup U32 array plus an explicit StorageBuffer transport. The RX5700XT lacks EXT mesh shaders. Definitions remain owned by EmitContext; define_mesh_payload_workgroup and define_mesh_payload_buffer do not activate guest translation or dispatch.
+- mesh_payload_words caches the payload size instead of duplicating all MeshInfo; mesh_threads copies program.workgroup_size[0]. Guest classification copied from Info.is_task/is_mesh, independently from host stage. This supersedes using storage presence alone to classify mesh operations.
+- Transport descriptor binding must be reserved by the eventual caller. Buffer is a Block containing one runtime U32 array, stride4, member offset0, descriptor set0. Parent payload word base is supplied by dispatch mapping, never inferred from mesh child index.
+
+### Unintentional differences (to fix)
+- None identified in the ported declarations. The explicit transport is a documented platform adaptation, not an upstream-native implementation.
+
+### Missing items
+- Vulkan descriptor reservation, allocation, parent/child task mapping and write-to-read inter-dispatch barrier are still required before use. No runtime callsite exists yet.
+
+### Binary layout verification
+- PASS generated Workgroup array types for32/64/352/16352words, no initializer or MeshShadingEXT capability. PASS actual transport SPIR-V block/array/pointer types, ArrayStride4, Offset0, descriptor set/binding, interface tracking. No host struct memcpy or padding introduced.
+- Full cargo test -p shader_recompiler636passed; cargo check -p video_core passed. External spirv-val was not available on PATH or located in searched workspace/temp/cargo trees; no external validator or GPU execution claimed.
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv_mesh.rs vs shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+
+### Intentional differences
+- Pinned900ab5a8 PayloadWord, EmitIsbeRead and task branch of EmitIsbeWriteAttribute now ported; LocalInvocation and anonymous If helper retain matching local ownership. Source reread after implementation, including Barrier/Clamped and map/prologue guards.
+- Guest Info flags replace native Stage checks so compute-host execution preserves guest stage semantics. Tasks cannot write maps even if storage exists. Compiler prerequisite assertions reject missing payload/input declarations; no fake values are emitted.
+- Explicit emit_task_payload_export/emit_mesh_payload_import adapt the implicit EXT handoff: cooperative U32 copy into/out of transport buffer with caller-provided parent base. Copy iterates strided workgroup lanes, guards only a partial final group, preserves all payload bits including count at word1. Export barriers before reading shared payload; import barriers after filling it. Host must synchronize the two dispatches and place mesh import in a preheader outside guest phi predecessors.
+- Transfer helpers are in the upstream task/mesh emitter owner. This is a real emitted copy, but NOT a full TaskEpilogue or mesh-launch implementation. No stage dispatch or native923/927 acceptance was enabled.
+
+### Unintentional differences (to fix)
+- None identified in ISBE read/write behavior. Task reads always return workgroup.x; mesh reads load the clamped payload[address>>2] and select workgroup.x only for exact byte address0. Task writes shift logically then clamp, preserving original values.
+
+### Missing items
+- Full collective exit routing, task counts -> child dispatches, mesh output epilogue (indices/attributes/depth), vertex fetch/draw integration, and native Stage/IR routing. Transfer helpers remain intentionally inactive pending those prerequisites, as recorded in NX2_PORT_STATE.md.
+
+### Binary layout verification
+- PASS def-use checks for task index/read and payload stores, mesh reads at0/1/3/4/1407/1408/u32MAX, exact byte-zero selection and351 upper word clamp for352word payload.
+- PASS generated transfer control flow traversal for all lanes of352x32,352x8,64x32,32x1,32x63,352x63. Every payload word copied exactly once, no out-of-range tail lanes, global address=parent base1056+local index, direct U32 load/store, barrier before export/after import. Tests evaluate emitted SPIR-V address expressions and branches, not a separate host size formula.
+- Full shader suite636passed (nx2-mesh-transfer-full.log). Video consumer check passed (nx2-mesh-payload-video-check.log). No release rebuild/runtime/FPS claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/frontend/structured_control_flow.rs vs shader_recompiler/frontend/maxwell/structured_control_flow.{h,cpp}
+
+### Intentional differences
+- Ported pinned Eglantine900ab5a8 GotoPass converge_exits option. A synthetic label and single Return follow the program's block labels; EXIT emits a goto to that label before normal goto elimination and ASL translation. Existing entrypoint defaults false; task/mesh activation remains stopped.
+- Added structure_cfg_detailed_with_exit_convergence as the Rust entrypoint for this option; its future caller supplies guest task/mesh classification instead of requiring incomplete Stage variants today.
+- Synthetic label uses cfg_blocks.len(), preserving existing Rust block-index labels, instead of upstream's label0 followed by shifted block labels. Labels are internal identities, not guest addresses; ordering and goto targets are unchanged.
+- The flat Rust CFG builder can retain predicated EXITs whereas the environment CFG splits their condition first. Preserve block.cond on converged goto for both forms rather than turning a predicated EXIT unconditional.
+
+### Unintentional differences (to fix)
+- Existing larger prerequisite discovered while comparing: FlowCfg::to_cfg_blocks only exports the first function and loses function_call/return_block; GotoPass currently ignores EndClass::Call and treats Return as shader return. Upstream recursively expands called functions and sends RET to caller continuation. This predates this slice; no activation or claim that subroutine graphs are supported. Fix requires preserving function graph across the frontend interface, not a local EXIT rewrite. Interrupted activation and exact prerequisite recorded in NX2_PORT_STATE.md.
+
+### Missing items
+- Guest task/mesh selection of convergence at the frontend callsite remains inactive. Before enabling on shaders with calls/RET, implement upstream recursive function BuildTree and caller return labels using the full FlowCfg; do not merge RET into the common shader EXIT.
+- Backend collective epilogue, task dispatch and mesh output integration still required. No opcode acceptance or runtime path changed.
+
+### Binary layout verification
+- Not a serialized layout change. Re-read upstream header and implementation after editing, including BuildASL, constructor, BuildTree EXIT/Call/Return cases and synthetic exit insertion.
+- Tests execute transformed statement-tree conditions/variables/loops to check guest block traces for all predicate combinations of chained and nested exits and for exit from a loop. They additionally verify exactly one ASL Return at nesting depth0. Ordinary non-converged return behavior remains tested.
+- Initial test compile identified three existing direct GotoPass literals needing exit_label=None; corrected those fixtures. Focus3passed; full cargo test -p shader_recompiler639passed (nx2-mesh-converged-full.log). No external GPU/runtime claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/frontend/control_flow.rs vs shader_recompiler/frontend/maxwell/control_flow.{h,cpp}
+
+### Intentional differences
+- Keep upstream FlowCfg and its functions/blocks/call continuation links alive through BuildASL. Added build_flow_cfg_from_env; existing flat build_cfg_from_env delegates to it for compatibility.
+- all_cfg_blocks is a mechanical Rust instruction-range adapter retaining global FlowBlock indices. It does not inline functions or own call behavior; the structured-control-flow owner reads the original graph. Byte/virtual locations use existing location_to_word_index.
+- Source authority for calls/RET: original Eden-NX2 50fa86bbbc403ad565eb44fcc281f16f77c69e15. Re-read header Block/Function fields and cpp call/return-block assignment after implementation.
+
+### Unintentional differences (to fix)
+- None identified in new graph-preserving adapter. Previous first-function-only issue is removed from the environment translation path.
+
+### Missing items
+- Legacy slice-only build_cfg API remains a flat compatibility interface; it is not the full-function environment frontend and was not made into a second subroutine implementation.
+
+### Binary layout verification
+- No raw struct ABI. Global block identities, instruction ranges and indirect comparison addresses preserved.
+- Tests construct real Maxwell CAL/RET/EXIT instruction environments, verify three functions, execute emitted ASL actions and check nested calls, repeated use of one callee, both paths of conditional RET, and EXIT inside a callee with/without exit convergence. Shader suite643passed.
+
+## 2026-11-08 - src/shader_recompiler/src/frontend/structured_control_flow.rs vs shader_recompiler/frontend/maxwell/structured_control_flow.{h,cpp}
+
+### Intentional differences
+- Ported recursive BuildTree overload from ORIGINAL Eden-NX250fa86, with previously ported pinned900ab5a8 converged-EXIT option. Added structure_flow_cfg_detailed and GotoPass::from_flow_cfg/build_function_tree. Both source header and cpp re-read after implementation.
+- Rust Vec insertion points and fresh numeric labels replace intrusive statement-node iterators; each call expansion has its own local FlowBlock-to-label map. Reset variables remain inserted at root front and immediately after the relevant label, before code. All call/branch/RET ownership remains in this file.
+- TranslateCode actions refer to global FlowBlock ids and can repeat the same source block in separate caller contexts. Existing staged IR materialization is retained.
+
+### Unintentional differences (to fix)
+- None identified in full-graph BuildTree branch/indirect/call/RET/EXIT/Kill cases. This resolves the prerequisite recorded in the preceding EXIT audit for the environment path. RET targets its caller continuation; only EXIT leaves the shader or goes to the shared epilogue.
+
+### Missing items
+- Task/mesh stage routing must still request convergence; ordinary environment translation uses false. Legacy flat-CFG builder remains for slice-only compatibility; task/mesh must use full graph entrypoint.
+
+### Binary layout verification
+- Not applicable to host memory ABI. Trace tests prove repeated/nested callee ordering, conditional RET and whole-shader EXIT. Converged variants produce one outer shader Return. All643shader tests pass (nx2-flow-functions-full.log).
+
+## 2026-11-08 - src/shader_recompiler/src/pipeline_cache.rs vs shader_recompiler/frontend/maxwell/translate_program.{h,cpp} integration
+
+### Intentional differences
+- Existing Rust environment translation adapter now sends the complete FlowCfg to upstream-owned structuring, with all global instruction ranges for later TranslateCode actions. The original TranslateProgram header/cpp BuildASL orchestration re-read after implementation.
+- Mechanically split existing post-structuring orchestration into translate_structured_cfg_to_program; no call semantics moved into the pipeline dispatcher. Normal environment path no longer drops callee functions. Existing explicitly requested RUZU_SHADER_FORCE_LINEAR_SYNTAX diagnostic override retains its previous behavior.
+
+### Unintentional differences (to fix)
+- None identified in the changed integration. Existing location-index/ASL materialization adaptation remains.
+
+### Missing items
+- Task/mesh classification, opcode routing, backend output epilogues and Vulkan dispatch/draw integration remain separate stopped prerequisites. No mesh program was activated by this change.
+
+### Binary layout verification
+- No serialized layout changes. Integration regression translates/optimizes actual CAL twice into one shared callee containing STL: both WriteLocal operations survive and exactly one epilogue/return remains. Fullshader643passed; video_core full suite running session4167 at this audit time (result recorded below when terminal).
+
+Full-function graph validation update: video_core1699passed,1ignored (113.34s); release ruzu-cmd build succeeded (1m29). Runtime verification in progress; no performance claim yet.
+
+Runtime verification for full-function integration: actual3Dscene remainsincomplete,48samples>=90s median8FPS;10existing923/927graphicsrejections,0compute,nonewCFGpanicsorVulkanOOM. Release test in C:\Users\smart\AppData\Local\Temp\ruzu-nx2-flow-functions-20261108-002019; processstatus=exited. No goal completion or performance gain claimed.
+
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/spirv_emit_context.{h,cpp}
+
+### Intentional differences
+- MeshOutputLayout describes the compute fallback's word-addressed output record: four initialized VkDrawIndirectCommand words, then unchanged ISBE attribute/map regions. Public layout permits future Vulkan allocation/draw stride and vertex-reader agreement; it is not a serialized Rust struct.
+- Mechanically extracted DefineMesh's shared-region arithmetic into MeshOutputLayout::new in the same owner; define_mesh_shared_memory still owns declarations. Added upstream mesh_info metadata and fallback output descriptor fields. define_mesh_output_buffer declares set0/reserved binding StorageBuffer.
+- Payload/output storage declarations share a mechanical same-owner define_mesh_storage_buffer helper. Existing payload declaration behavior unchanged. All new paths remain inactive in ordinary shader compilation.
+- Reference pinned Eglantine900ab5a8 DefineMesh and header fields re-read after implementation. Native EXT mesh outputs cannot run on RX5700XT; explicit compute buffers are the documented platform adaptation.
+
+### Unintentional differences (to fix)
+- None identified in region arithmetic/declarations. No claim that complete mesh output behavior is wired into rendering.
+
+### Missing items
+- Actual Vulkan descriptor reservation/allocation, indirect draws and graphics-stage interface remain to be connected. Task/child workgroup mapping and native Stage/IR activation still absent.
+
+### Binary layout verification
+- PASS captured layouts: small32vertices/16triangles,6vertexlines+1primitive line => primitive_base192,attribute_words224,map_base228,map_words52,stride280,vertex_span48. Large256/192,12+13lines =>3072,5568,5572,580,6152,576 respectively. Header occupies exactly4words/16bytes; descriptor buffer uses U32 ArrayStride4 and memberOffset0.
+- Header specification verified against https://docs.vulkan.org/refpages/latest/refpages/source/VkDrawIndirectCommand.html . All four fields explicitly written (no reserved header bytes); firstInstance0 avoids requiring nonzero indirect instance support.
+- Fullshader646passed. Actual GPU compute export/readback validated buffer layout/binding as detailed in emitter entry below.
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv_mesh.rs vs shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+
+### Intentional differences
+- Added emit_mesh_output_export as compute handoff portion of MeshEpilogue: collective Workgroup barrier, unsigned primitive count min(max_primitives), one invocation writes indirect header, all lanes cooperatively copy raw attribute/map regions. This replaces EXT output handoff, not all epilogue semantics.
+- VkDrawIndirectCommand uses vertexCount=clamped primitive count*corners, instanceCount1, firstVertex=global record*max primitive corners, firstInstance0. Later vertex pulling expands each primitive's corners; records use globally assigned mesh slots, independent of child workgroup index within a task. Single header writer avoids SSBO races.
+- emit_mesh_output_attribute_read implements CopyLines address calculation over the transport: vertex_index/vertex_span identifies record; local corner indexes map at4+corner for per-vertex data, or corner/corners identifies the primitive for per-primitive data. Region+(index/32)*lines*32+index%32+line*32 preserved. U32 bits remain unchanged.
+- Raw region padding is transported too; undefined/unwritten guest slots retain upstream undefined values and must not be consumed as active outputs. Only the command header is fully initialized by the exporter. Vertex output bitcasts, point size and depth conversion are deliberately outside these raw-memory helpers.
+- Re-read pinned900ab5a8 MeshEpilogue, CopyLines, ConvertDepth and context header/declarations after implementation. No paired mesh-specific header exists.
+
+### Unintentional differences (to fix)
+- None identified in implemented transport/access operations. Full output-stage parity remains incomplete until missing graphics work is implemented.
+
+### Missing items
+- Generated vertex entrypoint must route lines to correct output variables, apply float bitcasts, point-size policy and z=(z+w)/2 exactly once when required. Per-primitive builtins require equivalent support; captured title headers currently contain positions/generics only, with generic per-primitive lines.
+- Host shader-write -> indirect/vertex-read dependency, descriptors, buffer sizing, task mapping, dispatches and graphics pipeline integration; guest opcode routing and mesh stage activation. No native923/927 program accepted yet.
+
+### Binary layout verification
+- PASS generated SPIR-V control-flow tests: all words copied exactly once, including partial final lane groups; complete header has one writer and count clamp at0/intermediate/u32MAX. Captured small/large cases plus points/lines,33-element boundaries and zero capacities tested.
+- PASS attribute read def-use tests cover primitive0/31/32/191, all triangle corners and mapped vertex0/31/32/255 with raw0xffa12345 preserved, separating per-vertex and per-primitive regions.
+- Full cargo test -p shader_recompiler646passed (nx2-mesh-output-full.log).
+- REAL GPU PASS on AMD Radeon RX5700XT: standalone Vulkan1.2 probe compiled/dispatched exporter and consumer shaders, synchronized compute writes/reads, and verified all280output words, header[48,1,0,0], six indexed vertex attribute reads and six primitive reads. Consumer ran as a compute test kernel using the same read helper, NOT a completed graphics vertex pipeline or game draw. No external spirv-val claim.
+- Probe source/manifest/lock/SPIR-V artifacts: C:/Users/smart/AppData/Local/Temp/ruzu-mesh-output-probe. Log nx2-mesh-output-gpu-probe.log. Initial offline dependency resolution rejected a yanked version; copied the existing workspace lockfile into probe directory, without changing project dependencies, then build/run succeeded. GPU resources destroyed and process exited0.
+
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv_mesh.rs vs shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+
+### Intentional differences
+- Compared ConvertDepth and its MeshEpilogue guard against Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303; reread spirv_emit_context.h interface. emit_mesh_convert_depth remains in the corresponding owner. RX5700XT compute fallback reads raw output transport through the mapped VertexIndex instead of Workgroup storage and writes a non-arrayed vertex Position.z. The generated vertex invocation replaces the upstream mesh vertex-array index.
+- The upstream caller guard is inside this independently callable helper: convert_depth_mode, !support_native_ndc, valid output_position. Both PositionZ and PositionW must exist. First matching line lookup, U32-to-F32 bitcasts, FAdd followed by FMul(0.5), and component 2 store preserve upstream behavior. No clamping or homogeneous division is introduced.
+### Unintentional differences (to fix)
+- None identified within this conversion helper by source comparison.
+### Missing items
+- Full generated vertex entrypoint, generic/per-primitive target mapping, point size ordering, and Vulkan pipeline/dispatch integration remain prerequisites. This helper is not activated in the game path and does not complete MeshEpilogue.
+### Binary layout verification
+- PASS: existing raw transport layout is unchanged. Regression traverses emitted SPIR-V using record 2, corner 7 mapped to vertex 33, reordered W/X/Z lines; verifies only Position.z is written, endpoint/non-unit-W/negative depth results, all guards and missing-Z/W cases. Full cargo test -p shader_recompiler: 647 passed, 0 failed (nx2-mesh-depth-full.log). No GPU or game validation of this new helper claimed.
+
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/spirv_emit_context.cpp and .h
+
+### Intentional differences
+- Reread Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 DefineMesh and MeshLineTarget declarations. define_mesh_vertex_outputs adapts native mesh output arrays to ordinary vertex outputs on the non-mesh-shader host. Target selection and mesh_vertex_targets/mesh_primitive_targets remain owned by this matching context file. Option<u32> replaces the scalar ~0U sentinel.
+- Per-primitive generic values are repeated at each primitive corner; disjoint generic components share ordinary output variables. Reuses DefineOutputs/DefineGenericOutput for non-arrayed declarations and existing scalar/partial-vector transform-feedback components. Ordinary VertexB may declare unused Position/fixed PointSize outputs; this does not write or invent missing guest values.
+- Explicitly declares Vulkan VertexIndex (including firstVertex), without BaseVertex subtraction. Mesh output descriptor binding remains caller-reserved in set 0.
+- Rejects PrimitiveId, overlapping vertex/primitive components, and layer/viewport outputs unavailable on the supplied profile, before shader generation. These require additional interface/capability support; no silent loss or stub implementation. Captured title headers have none of these rejected cases.
+### Unintentional differences (to fix)
+- None identified for the supported non-overlapping interface subset.
+### Missing items
+- General PrimitiveId and overlapping vertex/primitive interfaces need further adaptation before accepting those programs. Full task/mesh pipeline integration remains stopped at the recorded prerequisites.
+### Binary layout verification
+- PASS: raw output transport unchanged; MeshLineTarget is host-side metadata, not serialized. Target declarations used by the successful GPU graphics probe described below. Full shader crate: 649 tests pass.
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv_mesh.rs vs shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+
+### Intentional differences
+- Reread CopyLines, ConvertDepth and MeshEpilogue in pinned Eglantine, plus context header targets. copy_lines consumes context-owned targets and reads exported storage via the existing 32-element ISBE addressing. F32 bitcasts preserve raw float attribute bits; integer builtins retain U32. An ordinary vertex invocation replaces the native output-array index. Primitive values are repeated on all corners rather than PerPrimitiveEXT outputs.
+- emit_mesh_vertex_outputs loads VertexIndex, writes fixed/default point size first for points, copies vertex lines, applies guarded depth conversion, then copies primitive lines, preserving upstream output ordering. The compute exporter and indirect command determine which active primitives invoke this entrypoint.
+### Unintentional differences (to fix)
+- None identified in the supported output copy sequence after comparison.
+### Missing items
+- Task/mesh dispatch, parent-task/child-record mapping and game renderer integration. These helpers still do not activate unsupported guest opcodes.
+### Binary layout verification
+- PASS: emitted-instruction regression checks record 1, vertex 35 and primitive 33, both sides of group boundaries, arbitrary generic U32 bit patterns (including NaN encodings), both regions, points versus triangles, shader point-size override, and depth conversion.
+- GPU PASS: TEMP/ruzu-mesh-vertex-probe uses the production generated vertex shader in an actual offscreen Vulkan graphics pipeline on AMD Radeon RX 5700 XT. Host-seeded raw transport, indirect record 1 with firstVertex=48, mapped vertices 33..35, triangle rasterization and fragment outputs. All 256 RGBA32F pixels equal [0.75,0.5,0.25,1] within 1e-5: vertex generic, primitive generic, converted depth and alpha. This validates graphics consumption; it does not validate a compute-to-graphics combined dispatch or the game pipeline. nx2-mesh-vertex-gpu.log terminal exit 0, rerun after moving target ownership into context.
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv.rs vs shader_recompiler/backend/spirv/emit_spirv.cpp and .h
+
+### Intentional differences
+- Added emit_mesh_vertex_spirv as the platform adaptation entrypoint for mesh output transport. Top-level emission stays here; declarations stay in context and output-copy behavior stays in emit_spirv_mesh.rs. Reuses DefineEntryPoint, float-control, capability and transform-feedback setup, followed by existing finalize.
+- Upstream native mesh execution has no generated vertex stage. This explicit adaptation is required because the RX5700XT lacks VK_EXT_mesh_shader. No guest semantics are inferred from a dummy vertex program: its only responsibility is copying the mesh output already computed elsewhere.
+### Unintentional differences (to fix)
+- None identified in entrypoint construction for supported interfaces.
+### Missing items
+- Vulkan pipeline cache/descriptor/buffer/dispatch integration must call this entrypoint with the reserved transport binding. Native task/mesh translation remains disabled pending that integration and the compute-side entrypoints.
+### Binary layout verification
+- PASS: SPIR-V roundtrip test confirms a Vertex entrypoint and VertexIndex, no BaseVertex; unsupported interfaces return errors. Production output accepted and executed by a real Vulkan graphics pipeline (probe above). Full cargo test -p shader_recompiler: 649 passed, 0 failed, nx2-mesh-vertex-full.log. Re-read upstream emission/header and compared declarations/call ordering. No new game runtime or 20 FPS claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/ir/opcodes.rs vs shader_recompiler/frontend/ir/opcodes.inc, opcodes.h, microinstruction.cpp
+
+### Intentional differences
+- Added IsbeRead(U32)->U32 and three Void(U32,U32) writes. Writes are side effects, read is removable when unused. Uses existing Rust opcode metadata/side-effect delegation from Inst rather than duplicating its table; emitter argument order matches pinned definitions.
+- Source authority: original Eden-NX2 interfaces where present, Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 for new ISBE semantics. Sources/headers reread after changes and compared against the implementation.
+### Unintentional differences (to fix)
+- None identified in this bounded ISBE prerequisite slice.
+### Missing items
+- None in these four opcode contracts.
+### Binary layout verification
+- PASS: pseudo instruction bitfields, U32 IR types and existing stage-buffer layout retained; no new serialized host struct. Full cargo test -p shader_recompiler: 654 passed, 0 failed (nx2-isbe-ir-full.log). cargo check -p video_core passes (nx2-isbe-video-check.log). Focused tests also cover all four decoded operations for task/mesh, registers19/13, offset0xabcdef, rejection cases, RZ+3 constant propagation to the primitive-count address, NVN slot2 lookup and implicit builtin flags. No new GPU/game runtime claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/ir/emitter.rs vs shader_recompiler/frontend/ir/ir_emitter.cpp and .h
+
+### Intentional differences
+- Added the four snake_case IREmitter methods in the corresponding existing Rust owner. Untyped Value follows this emitter API; metadata carries upstream U32 argument/result contracts.
+- Source authority: original Eden-NX2 interfaces where present, Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 for new ISBE semantics. Sources/headers reread after changes and compared against the implementation.
+### Unintentional differences (to fix)
+- None identified in this bounded ISBE prerequisite slice.
+### Missing items
+- None in these four emitter methods.
+### Binary layout verification
+- PASS: pseudo instruction bitfields, U32 IR types and existing stage-buffer layout retained; no new serialized host struct. Full cargo test -p shader_recompiler: 654 passed, 0 failed (nx2-isbe-ir-full.log). cargo check -p video_core passes (nx2-isbe-video-check.log). Focused tests also cover all four decoded operations for task/mesh, registers19/13, offset0xabcdef, rejection cases, RZ+3 constant propagation to the primitive-count address, NVN slot2 lookup and implicit builtin flags. No new GPU/game runtime claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/frontend/maxwell_opcodes.rs vs shader_recompiler/frontend/maxwell/maxwell.inc
+
+### Intentional differences
+- Added ISBE_nx2, upstream display name and exact 1110 1111 1100 0--- encoding. Existing Rust table replaces the macro include; old ISBERD remains distinct.
+- Source authority: original Eden-NX2 interfaces where present, Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 for new ISBE semantics. Sources/headers reread after changes and compared against the implementation.
+### Unintentional differences (to fix)
+- None identified in this bounded ISBE prerequisite slice.
+### Missing items
+- Native Ampere 923/927 lowering intentionally remains rejected until execution prerequisites are implemented.
+### Binary layout verification
+- PASS: pseudo instruction bitfields, U32 IR types and existing stage-buffer layout retained; no new serialized host struct. Full cargo test -p shader_recompiler: 654 passed, 0 failed (nx2-isbe-ir-full.log). cargo check -p video_core passes (nx2-isbe-video-check.log). Focused tests also cover all four decoded operations for task/mesh, registers19/13, offset0xabcdef, rejection cases, RZ+3 constant propagation to the primitive-count address, NVN slot2 lookup and implicit builtin flags. No new GPU/game runtime claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/frontend/translate/mod.rs vs shader_recompiler/frontend/maxwell/translate/translate.cpp and impl/impl.h
+
+### Intentional differences
+- One dispatcher arm delegates ISBE_nx2 to its owning internal_stage_buffer_entry_read module. Matches the upstream INST-generated dispatch; no operation behavior is centralized here.
+- Source authority: original Eden-NX2 interfaces where present, Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 for new ISBE semantics. Sources/headers reread after changes and compared against the implementation.
+### Unintentional differences (to fix)
+- None identified in this bounded ISBE prerequisite slice.
+### Missing items
+- Guest task/mesh classification from runtime environments is not activated.
+### Binary layout verification
+- PASS: pseudo instruction bitfields, U32 IR types and existing stage-buffer layout retained; no new serialized host struct. Full cargo test -p shader_recompiler: 654 passed, 0 failed (nx2-isbe-ir-full.log). cargo check -p video_core passes (nx2-isbe-video-check.log). Focused tests also cover all four decoded operations for task/mesh, registers19/13, offset0xabcdef, rejection cases, RZ+3 constant propagation to the primitive-count address, NVN slot2 lookup and implicit builtin flags. No new GPU/game runtime claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/frontend/translate/internal_stage_buffer_entry_read.rs vs shader_recompiler/frontend/maxwell/translate/impl/internal_stage_buffer_entry_read.cpp and impl.h
+
+### Intentional differences
+- Ported ISBE_nx2 register bits0..7/address bits8..15/offset bits20..43 and write/attribute/size branch ordering literally. Program Info guest flags replace Stage::Task/Mesh because host execution model is Compute; invalid or ambiguous flags reject. Byte attribute writes reject. No invented skew/global transformation: pinned pseudo translator also ignores those already-lowered flags. Rust panic_any carries the existing typed shader exception boundary.
+- Source authority: original Eden-NX2 interfaces where present, Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 for new ISBE semantics. Sources/headers reread after changes and compared against the implementation.
+### Unintentional differences (to fix)
+- None identified in this bounded ISBE prerequisite slice.
+### Missing items
+- Runtime stage classification/native lowering and collectively reached compute entrypoints still require implementation before enabling this path.
+### Binary layout verification
+- PASS: pseudo instruction bitfields, U32 IR types and existing stage-buffer layout retained; no new serialized host struct. Full cargo test -p shader_recompiler: 654 passed, 0 failed (nx2-isbe-ir-full.log). cargo check -p video_core passes (nx2-isbe-video-check.log). Focused tests also cover all four decoded operations for task/mesh, registers19/13, offset0xabcdef, rejection cases, RZ+3 constant propagation to the primitive-count address, NVN slot2 lookup and implicit builtin flags. No new GPU/game runtime claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/ir_opt/collect_shader_info_pass.rs vs shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+
+### Intentional differences
+- Guest task uses NVN base0x110, mesh0x310 regardless of host Compute stage, and both implicitly request workgroup/local invocation inputs. Original Compute behavior remains0x310 with no implicit flags. This implements upstream stage cases through existing guest Info flags.
+- Source authority: original Eden-NX2 interfaces where present, Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 for new ISBE semantics. Sources/headers reread after changes and compared against the implementation.
+### Unintentional differences (to fix)
+- None identified in this bounded ISBE prerequisite slice.
+### Missing items
+- General runtime task/mesh environment and header classification remain pending.
+### Binary layout verification
+- PASS: pseudo instruction bitfields, U32 IR types and existing stage-buffer layout retained; no new serialized host struct. Full cargo test -p shader_recompiler: 654 passed, 0 failed (nx2-isbe-ir-full.log). cargo check -p video_core passes (nx2-isbe-video-check.log). Focused tests also cover all four decoded operations for task/mesh, registers19/13, offset0xabcdef, rejection cases, RZ+3 constant propagation to the primitive-count address, NVN slot2 lookup and implicit builtin flags. No new GPU/game runtime claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/emit_spirv.cpp and emit_spirv_instructions.h; spirv_emit_context.h
+
+### Intentional differences
+- Existing Rust instruction dispatcher now routes four ISBE operations to emit_spirv_mesh.rs. IsbeWriteMapU32 receives the original IR Value, preserving immediate-byte3 validation; other addresses and values resolve to IDs. Returned read ID is registered. Result errors preserve the established typed panic boundary. No memory behavior moved into dispatcher.
+- Source authority: original Eden-NX2 interfaces where present, Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 for new ISBE semantics. Sources/headers reread after changes and compared against the implementation.
+### Unintentional differences (to fix)
+- None identified in this bounded ISBE prerequisite slice.
+### Missing items
+- Collective compute entrypoint, payload/record mapping and host pipeline integration remain missing.
+### Binary layout verification
+- PASS: pseudo instruction bitfields, U32 IR types and existing stage-buffer layout retained; no new serialized host struct. Full cargo test -p shader_recompiler: 654 passed, 0 failed (nx2-isbe-ir-full.log). cargo check -p video_core passes (nx2-isbe-video-check.log). Focused tests also cover all four decoded operations for task/mesh, registers19/13, offset0xabcdef, rejection cases, RZ+3 constant propagation to the primitive-count address, NVN slot2 lookup and implicit builtin flags. No new GPU/game runtime claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv_mesh.rs vs shader_recompiler/backend/spirv/emit_spirv_mesh.cpp and emit_spirv_instructions.h
+
+### Intentional differences
+- Added integration regression only: real IR emitter -> DCE -> usage collection -> SPIR-V dispatch. Confirms used read retained, unused read removed, three writes retained and routed to attribute/map/count storage; map byte masks0x123 to0x23 and count writes5. Existing backend operation implementation unchanged.
+- Source authority: original Eden-NX2 interfaces where present, Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 for new ISBE semantics. Sources/headers reread after changes and compared against the implementation.
+### Unintentional differences (to fix)
+- None identified in this bounded ISBE prerequisite slice.
+### Missing items
+- Full native task/mesh pipeline is still not active.
+### Binary layout verification
+- PASS: pseudo instruction bitfields, U32 IR types and existing stage-buffer layout retained; no new serialized host struct. Full cargo test -p shader_recompiler: 654 passed, 0 failed (nx2-isbe-ir-full.log). cargo check -p video_core passes (nx2-isbe-video-check.log). Focused tests also cover all four decoded operations for task/mesh, registers19/13, offset0xabcdef, rejection cases, RZ+3 constant propagation to the primitive-count address, NVN slot2 lookup and implicit builtin flags. No new GPU/game runtime claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/spirv_emit_context.cpp/.h
+
+### Intentional differences
+- MeshDispatchRecord is an explicit 3-U32 compute transport replacing native Vulkan task association: guest group X, parent payload word base, output record. Mapping SSBO declaration remains owned by context; record serialization uses words() and a 12-byte repr(C) layout.
+- Compute-only adaptation: upstream native task dispatch supplies this association implicitly. Physical host dispatch must be one-dimensional and mapping visible before dispatch. Reviewed pinned Eglantine EmitIsbeRead and context header, original EmitWorkgroupId after changes.
+### Unintentional differences (to fix)
+- None identified in mapping/lookup behavior.
+### Missing items
+- Compute entrypoint must import the mapping in a preheader, then use the parent payload base/output record at import/export. Host scheduler still must populate mappings from real task counts and synchronize buffers; no inferred parent or count clamp implemented.
+### Binary layout verification
+- PASS: size12/alignment4 and exact word order. Regression interprets emitted SPIR-V for host groups31/32/33, guest child indices0/1/0, parent bases352/352/704, output records71/72/73; both ordinary WorkgroupId and ISBE reads agree for task and mesh. Full shader crate655PASS nx2-mesh-dispatch-map-full.log. No game or GPU claim for this mapping slice.
+
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv_mesh.rs vs shader_recompiler/backend/spirv/emit_spirv_mesh.cpp and emit_spirv_instructions.h
+
+### Intentional differences
+- emit_mesh_dispatch_import loads the mapping by physical WorkgroupId.x before guest code. Installs guest (x,0,0), parent payload base and output record IDs. ISBE read uses the same guest workgroup view as normal WorkgroupId IR; task reads all return guest X, mesh address0 returns guest X while other reads retain payload behavior.
+- Compute-only adaptation: upstream native task dispatch supplies this association implicitly. Physical host dispatch must be one-dimensional and mapping visible before dispatch. Reviewed pinned Eglantine EmitIsbeRead and context header, original EmitWorkgroupId after changes.
+### Unintentional differences (to fix)
+- None identified in mapping/lookup behavior.
+### Missing items
+- Compute entrypoint must import the mapping in a preheader, then use the parent payload base/output record at import/export. Host scheduler still must populate mappings from real task counts and synchronize buffers; no inferred parent or count clamp implemented.
+### Binary layout verification
+- PASS: size12/alignment4 and exact word order. Regression interprets emitted SPIR-V for host groups31/32/33, guest child indices0/1/0, parent bases352/352/704, output records71/72/73; both ordinary WorkgroupId and ISBE reads agree for task and mesh. Full shader crate655PASS nx2-mesh-dispatch-map-full.log. No game or GPU claim for this mapping slice.
+
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv_context_get_set.rs vs shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp and emit_spirv_instructions.h
+
+### Intentional differences
+- EmitWorkgroupId returns the imported guest vector when compute dispatch mapping exists, otherwise the original builtin load unchanged. Prevents flattened mesh batches exposing global host indices as per-parent child indices.
+- Compute-only adaptation: upstream native task dispatch supplies this association implicitly. Physical host dispatch must be one-dimensional and mapping visible before dispatch. Reviewed pinned Eglantine EmitIsbeRead and context header, original EmitWorkgroupId after changes.
+### Unintentional differences (to fix)
+- None identified in mapping/lookup behavior.
+### Missing items
+- Compute entrypoint must import the mapping in a preheader, then use the parent payload base/output record at import/export. Host scheduler still must populate mappings from real task counts and synchronize buffers; no inferred parent or count clamp implemented.
+### Binary layout verification
+- PASS: size12/alignment4 and exact word order. Regression interprets emitted SPIR-V for host groups31/32/33, guest child indices0/1/0, parent bases352/352/704, output records71/72/73; both ordinary WorkgroupId and ISBE reads agree for task and mesh. Full shader crate655PASS nx2-mesh-dispatch-map-full.log. No game or GPU claim for this mapping slice.
+
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv.rs vs shader_recompiler/backend/spirv/emit_spirv.cpp and .h
+
+### Intentional differences
+- emit_mesh_compute_spirv is the explicit host-Compute adaptation for already optimized guest task/mesh IR. It reserves unified descriptor bindings after guest resources and returns the dispatch/payload/output assignments with the binary; task programs reserve two, mesh three. Uses existing global resource declarations, DefineMain, entrypoint, float controls, capabilities and deferred-phi patching.
+- DefineMain emits an adapter preheader only when a dispatch mapping is declared. It imports the mapping, then mesh parent payload, then branches to the original guest entry label. Conditional payload tail blocks stay outside guest labels, preserving their identity for phi edges.
+- Rejects unprepared metadata, non-1D workgroups, missing payload capacity, non-unified descriptors, multiple/conditional returns, missing/duplicate or misplaced prologue/epilogue, unreachable termination and demote. Requires one final top-level return and final epilogue instruction. Upstream frontend convergence must have occurred before this API; the emitter does not repair divergent exits or replace guest behavior. Ordinary emission rejects guest task/mesh flags so an unprepared path cannot silently emit a no-op epilogue.
+- No native task/mesh extension or GPU task-launch marker is generated on this host. Payload and output transports implement the output handoff; host scheduling must still implement task launches/counts. Compute does not enable graphics transform-feedback modes.
+### Unintentional differences (to fix)
+- None identified in the bounded compute-entrypoint construction after rereading pinned Eglantine DefineMain/EmitSPIRV and header interfaces. Ordinary entrypoint path remains unchanged except the explicit rejection of unprepared guest task/mesh programs.
+### Missing items
+- Runtime environment classification and native ISBE lowering, converged translation call path, scheduler-produced parent/child mapping, real task counts, allocations/descriptors/barriers and graphics pipeline integration. No game path activation yet.
+### Binary layout verification
+- PASS: production emitted module accepted and executed by RX5700XT. TEMP/ruzu-mesh-compute-entry-probe uses 8 invocations, a 13-word payload import with conditional tail, physical group0 mapped to guest group17/parent payload base7/output record0, leader-only guest stores and a shared merge epilogue. All280 output words match; word0 contains guest group17, word1 contains parent payload value108. Header[48,1,0,0], six indexed vertex and six primitive reads also verified by a second compute kernel. Mapping and payload were host-seeded; this is not a native game shader or task-count scheduler test. Log nx2-mesh-compute-entry-gpu.log terminal0, resources destroyed.
+- Unit regression covers task and mesh entrypoints, descriptor reservations, one return, one task barrier versus three mesh barriers, preheader placement and rejected multiple/nested returns. Full cargo test -p shader_recompiler:656PASS nx2-mesh-compute-entry-full.log. cargo check -p video_core PASS nx2-mesh-compute-entry-video-check.log.
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv_special.rs vs shader_recompiler/backend/spirv/emit_spirv_special.cpp and emit_spirv_instructions.h
+
+### Intentional differences
+- Guest Info task/mesh flags replace native Stage cases while host stage remains Compute. Prologue delegates count initialization/barrier to emit_mesh_prologue; epilogue delegates task payload export using the imported parent word base, or mesh output export using its imported record. Correct ownership retained: special dispatch here, memory implementation in emit_spirv_mesh.rs.
+- Compute adapter requires the mapping preheader and collective emission API. Native upstream delegates to EmitMeshEpilogue with implicit Vulkan task association; this adapter uses explicit transport. No vertex-depth conversion in compute (it remains in the generated vertex consumer).
+### Unintentional differences (to fix)
+- None identified in prologue/epilogue dispatch order after rereading pinned Eglantine source and instruction header. Task initialization remains empty as upstream; mesh count initialization is unchanged.
+### Missing items
+- Game integration and real task-count scheduling remain pending; no support is claimed merely from generated shader success.
+### Binary layout verification
+- PASS: no new layout here. Eight-invocation real GPU probe above verifies collective mesh epilogue, payload import and indirect output; full shader656PASS. Task path validated by entrypoint/bindings/barrier unit test, not newly GPU-executed through this API.
+
+
+## 2026-11-08 - src/shader_recompiler/src/environment.rs vs shader_recompiler/environment.h
+
+### Intentional differences
+- Added optional MeshShaderEnvironment, bundling the upstream task-stage test, MeshRegisters and MeshPrimitiveHeader. None explicitly means ordinary shader; Some requires the compute task/mesh path. Keeps physical graphics binding stage separate from host Compute execution. No production video environment opts in yet.
+- Pinned Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 supplies new mesh semantics; original Eden-NX2 remains authority for ordinary behavior. Relevant interfaces/sources reread and compared after implementation. Guest kind is carried separately from host execution model because RX5700XT uses the compute adaptation.
+### Unintentional differences (to fix)
+- None identified in this bounded environment-to-compute translation slice.
+### Missing items
+- Real video GraphicsEnvironment metadata/capture/replay integration, explicit native923/927 lowering, compilation of the captured native shaders and host task-count scheduling/graphics dispatch remain pending. This API does not activate those unsupported opcodes in the game.
+### Binary layout verification
+- PASS: metadata bundle is host-side, not serialized. Existing register bitfields/header output maps and raw transport ABI unchanged. New end-to-end regression uses physical VertexB/TessellationEval bindings, task/mesh registers, a conditional EXIT and ISBE write; verifies32/8 one-dimensional threads, payload352, NVN0x110/0x310, output lines28/32/36, one collective return/epilogue, and successful compute SPIR-V generation. With convert_depth_mode=true the emitted compute module has no Output variables. Mock rejects any legacy viewport-state read for these guest stages.
+- Full cargo test -p shader_recompiler:657PASS nx2-mesh-env-full.log. cargo check -p video_core passes nx2-mesh-env-video-check.log. No new runtime FPS or real-native-shader claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/pipeline_cache.rs vs shader_recompiler/frontend/maxwell/translate_program.cpp/.h and structured_control_flow.cpp/.h
+
+### Intentional differences
+- Environment translation recognizes explicit task/mesh state before translating instructions, sets exclusive guest Info flags and host Compute stage, forces full-function exit convergence, and calls the already verified initialize_mesh_program owner with the captured registers and both headers. The legacy force-linear debug override cannot bypass mesh convergence. Task/mesh shared size remains the upstream default instead of taking ordinary compute metadata. Existing orchestration remains here; mesh register/output behavior stays in frontend/translate_program.rs.
+- Pinned Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 supplies new mesh semantics; original Eden-NX2 remains authority for ordinary behavior. Relevant interfaces/sources reread and compared after implementation. Guest kind is carried separately from host execution model because RX5700XT uses the compute adaptation.
+### Unintentional differences (to fix)
+- None identified in this bounded environment-to-compute translation slice.
+### Missing items
+- Real video GraphicsEnvironment metadata/capture/replay integration, explicit native923/927 lowering, compilation of the captured native shaders and host task-count scheduling/graphics dispatch remain pending. This API does not activate those unsupported opcodes in the game.
+### Binary layout verification
+- PASS: metadata bundle is host-side, not serialized. Existing register bitfields/header output maps and raw transport ABI unchanged. New end-to-end regression uses physical VertexB/TessellationEval bindings, task/mesh registers, a conditional EXIT and ISBE write; verifies32/8 one-dimensional threads, payload352, NVN0x110/0x310, output lines28/32/36, one collective return/epilogue, and successful compute SPIR-V generation. With convert_depth_mode=true the emitted compute module has no Output variables. Mock rejects any legacy viewport-state read for these guest stages.
+- Full cargo test -p shader_recompiler:657PASS nx2-mesh-env-full.log. cargo check -p video_core passes nx2-mesh-env-video-check.log. No new runtime FPS or real-native-shader claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/frontend/translate_program.rs vs shader_recompiler/frontend/maxwell/translate_program.cpp/.h
+
+### Intentional differences
+- Added collect_mesh_output_stores in the upstream owner, called immediately after shader-info collection and before LayerPass/VendorWorkaroundPass. It declares both stage-buffer line lists as stored attributes for mesh only, matching the pinned TranslateProgram sequence. Reuses the previously verified register decoding/line initialization helper.
+- Pinned Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 supplies new mesh semantics; original Eden-NX2 remains authority for ordinary behavior. Relevant interfaces/sources reread and compared after implementation. Guest kind is carried separately from host execution model because RX5700XT uses the compute adaptation.
+### Unintentional differences (to fix)
+- None identified in this bounded environment-to-compute translation slice.
+### Missing items
+- Real video GraphicsEnvironment metadata/capture/replay integration, explicit native923/927 lowering, compilation of the captured native shaders and host task-count scheduling/graphics dispatch remain pending. This API does not activate those unsupported opcodes in the game.
+### Binary layout verification
+- PASS: metadata bundle is host-side, not serialized. Existing register bitfields/header output maps and raw transport ABI unchanged. New end-to-end regression uses physical VertexB/TessellationEval bindings, task/mesh registers, a conditional EXIT and ISBE write; verifies32/8 one-dimensional threads, payload352, NVN0x110/0x310, output lines28/32/36, one collective return/epilogue, and successful compute SPIR-V generation. With convert_depth_mode=true the emitted compute module has no Output variables. Mock rejects any legacy viewport-state read for these guest stages.
+- Full cargo test -p shader_recompiler:657PASS nx2-mesh-env-full.log. cargo check -p video_core passes nx2-mesh-env-video-check.log. No new runtime FPS or real-native-shader claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/frontend/translate/mod.rs vs shader_recompiler/frontend/maxwell/translate/impl/impl.h
+
+### Intentional differences
+- Environment-backed visitor selects Compute execution semantics for explicitly classified guest task/mesh while retaining the original environment for bound resource reads. Ordinary shader stage selection unchanged; instruction-specific ISBE handling still uses exclusive guest Info flags.
+- Pinned Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 supplies new mesh semantics; original Eden-NX2 remains authority for ordinary behavior. Relevant interfaces/sources reread and compared after implementation. Guest kind is carried separately from host execution model because RX5700XT uses the compute adaptation.
+### Unintentional differences (to fix)
+- None identified in this bounded environment-to-compute translation slice.
+### Missing items
+- Real video GraphicsEnvironment metadata/capture/replay integration, explicit native923/927 lowering, compilation of the captured native shaders and host task-count scheduling/graphics dispatch remain pending. This API does not activate those unsupported opcodes in the game.
+### Binary layout verification
+- PASS: metadata bundle is host-side, not serialized. Existing register bitfields/header output maps and raw transport ABI unchanged. New end-to-end regression uses physical VertexB/TessellationEval bindings, task/mesh registers, a conditional EXIT and ISBE write; verifies32/8 one-dimensional threads, payload352, NVN0x110/0x310, output lines28/32/36, one collective return/epilogue, and successful compute SPIR-V generation. With convert_depth_mode=true the emitted compute module has no Output variables. Mock rejects any legacy viewport-state read for these guest stages.
+- Full cargo test -p shader_recompiler:657PASS nx2-mesh-env-full.log. cargo check -p video_core passes nx2-mesh-env-video-check.log. No new runtime FPS or real-native-shader claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/ir_opt/position_pass.rs vs shader_recompiler/ir_opt/position_pass.cpp and passes.h
+
+### Intentional differences
+- Skips legacy vertex position conversion for explicit task/mesh state even when the physical binding is VertexB. Also restores original upstream short-circuit ordering: a non-VertexB stage returns before querying viewport transform state. This small confirmed divergence was corrected locally.
+- Pinned Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 supplies new mesh semantics; original Eden-NX2 remains authority for ordinary behavior. Relevant interfaces/sources reread and compared after implementation. Guest kind is carried separately from host execution model because RX5700XT uses the compute adaptation.
+### Unintentional differences (to fix)
+- None identified in this bounded environment-to-compute translation slice.
+### Missing items
+- Real video GraphicsEnvironment metadata/capture/replay integration, explicit native923/927 lowering, compilation of the captured native shaders and host task-count scheduling/graphics dispatch remain pending. This API does not activate those unsupported opcodes in the game.
+### Binary layout verification
+- PASS: metadata bundle is host-side, not serialized. Existing register bitfields/header output maps and raw transport ABI unchanged. New end-to-end regression uses physical VertexB/TessellationEval bindings, task/mesh registers, a conditional EXIT and ISBE write; verifies32/8 one-dimensional threads, payload352, NVN0x110/0x310, output lines28/32/36, one collective return/epilogue, and successful compute SPIR-V generation. With convert_depth_mode=true the emitted compute module has no Output variables. Mock rejects any legacy viewport-state read for these guest stages.
+- Full cargo test -p shader_recompiler:657PASS nx2-mesh-env-full.log. cargo check -p video_core passes nx2-mesh-env-video-check.log. No new runtime FPS or real-native-shader claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv.rs vs shader_recompiler/backend/spirv/emit_spirv.cpp/.h and ir_opt/ssa_rewrite_pass.cpp
+
+### Intentional differences
+- The compute prologue validator now permits SSA-generated Undef scalar instructions, Phi and Void before Prologue. End-to-end translation exposed legitimate UndefU1 at the front of the entry block. Other instructions before Prologue still reject; the collective exit/epilogue checks are unchanged.
+- Pinned Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 supplies new mesh semantics; original Eden-NX2 remains authority for ordinary behavior. Relevant interfaces/sources reread and compared after implementation. Guest kind is carried separately from host execution model because RX5700XT uses the compute adaptation.
+### Unintentional differences (to fix)
+- None identified in this bounded environment-to-compute translation slice.
+### Missing items
+- Real video GraphicsEnvironment metadata/capture/replay integration, explicit native923/927 lowering, compilation of the captured native shaders and host task-count scheduling/graphics dispatch remain pending. This API does not activate those unsupported opcodes in the game.
+### Binary layout verification
+- PASS: metadata bundle is host-side, not serialized. Existing register bitfields/header output maps and raw transport ABI unchanged. New end-to-end regression uses physical VertexB/TessellationEval bindings, task/mesh registers, a conditional EXIT and ISBE write; verifies32/8 one-dimensional threads, payload352, NVN0x110/0x310, output lines28/32/36, one collective return/epilogue, and successful compute SPIR-V generation. With convert_depth_mode=true the emitted compute module has no Output variables. Mock rejects any legacy viewport-state read for these guest stages.
+- Full cargo test -p shader_recompiler:657PASS nx2-mesh-env-full.log. cargo check -p video_core passes nx2-mesh-env-video-check.log. No new runtime FPS or real-native-shader claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/spirv_emit_context.cpp/.h
+
+### Intentional differences
+- DefineOutputs returns early for guest task/mesh, matching the upstream native-stage guard. Their Info stores describe stage-buffer output but must not declare graphics Output variables in a compute entrypoint. This became necessary when wiring real output metadata into translation; generated vertex consumer still uses ordinary VertexB output declarations.
+- Pinned Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 supplies new mesh semantics; original Eden-NX2 remains authority for ordinary behavior. Relevant interfaces/sources reread and compared after implementation. Guest kind is carried separately from host execution model because RX5700XT uses the compute adaptation.
+### Unintentional differences (to fix)
+- None identified in this bounded environment-to-compute translation slice.
+### Missing items
+- Real video GraphicsEnvironment metadata/capture/replay integration, explicit native923/927 lowering, compilation of the captured native shaders and host task-count scheduling/graphics dispatch remain pending. This API does not activate those unsupported opcodes in the game.
+### Binary layout verification
+- PASS: metadata bundle is host-side, not serialized. Existing register bitfields/header output maps and raw transport ABI unchanged. New end-to-end regression uses physical VertexB/TessellationEval bindings, task/mesh registers, a conditional EXIT and ISBE write; verifies32/8 one-dimensional threads, payload352, NVN0x110/0x310, output lines28/32/36, one collective return/epilogue, and successful compute SPIR-V generation. With convert_depth_mode=true the emitted compute module has no Output variables. Mock rejects any legacy viewport-state read for these guest stages.
+- Full cargo test -p shader_recompiler:657PASS nx2-mesh-env-full.log. cargo check -p video_core passes nx2-mesh-env-video-check.log. No new runtime FPS or real-native-shader claim.
+
+
+## 2026-11-08 - src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs shader_recompiler/frontend/ampere/lower_to_maxwell.h
+
+### Intentional differences
+- Added explicit lower_task_mesh_to_maxwell entrypoint delegating to the same lowering driver with stage-buffer support enabled. Existing lower_to_maxwell retains the previous rejection, preventing accidental activation before the renderer can execute task/mesh programs. Upstream combines native stage cases in one API; this opt-in separates a usable compiler prerequisite from unfinished runtime dispatch.
+- Ported pinned Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 non-geometry 0x923/0x927 arm literally: mode/reserved-bit validation, read destination rejection, predicate, byte address offset, data register, region, width, skew/output and write bits. No guessed reinterpretation or no-op. Geometry pass-through remains separate and is not enabled by this API.
+- For these two explicitly enabled opcodes, scratch-register validation uses the pinned actual operand list (read Rd/Ra; write Ra/data). Offset bytes and unused fields are not treated as registers, while real write-data scratch registers are rejected. Other opcodes retain their existing scanner behavior.
+### Unintentional differences (to fix)
+- None identified within this new non-geometry ISBE arm and its operand selection. Re-read the pinned header's arm and operand scanner after implementation and compared every field/condition; this upstream implementation is header-only.
+### Missing items
+- Production GraphicsEnvironment metadata/capture/replay/cache identity and explicit task/mesh pipeline integration. Native lowering success alone does not establish successful IR/resource translation or executable game shaders. Geometry-specific ISBERD arm remains unported here.
+### Binary layout verification
+- PASS: native Instruction remains16bytes. Regression enumerates read/write, four regions, output flag, width and skew; verifies predicate3, registers17/19/13, offset0xabcdef, all pseudo bitfields, decoder identity and source offsets. Invalid modes/reserved bits/readRZ and write scratch data reject; unused register-shaped bytes do not falsely reject. Ordinary API still rejects these instructions.
+- Full cargo test -p shader_recompiler:658PASS nx2-native-isbe-full.log, including existing frozen upstream oracle suites.
+- Evidence from real captures: all27 complete entries in TEMP/ruzu-nx2-mesh-pipeline-20261107-234213/mesh-program-analysis.json lower successfully using the explicit API. Includes duplicate raw/snapshot captures, not27 unique programs. Snapshot SPH128bytes skipped and only established complete native code extent passed. Largest1170-native-instruction mesh lowers to1896 Maxwell instructions. Detailed results nx2-native-isbe-captures.log and TEMP/ruzu-native-isbe-lower-probe/results.json; probe source/Cargo.lock/manifest kept there. This is native-to-Maxwell validation only, no resource substitution, no new GPU or game/FPS claim.
+
+
+## 2026-11-08 - src/video_core/src/shader_environment.rs vs video_core/shader_environment.cpp/.h
+
+### Intentional differences
+- Explicit from_maxwell3d_mesh constructor accepts a caller-owned snapshot of task/mesh registers and primitive header. Existing graphics construction stays unchanged until compute dispatch is integrated. Native ISBE lowering is selected only for this explicit environment. Physical VertexB/TessellationEval stage and resource slots 0/2 remain distinct from guest task/mesh execution kind.
+- Pinned Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 supplies mesh extensions; original Eden-NX2 remains authority for ordinary behavior. Re-read the pinned header and implementation and compared construction, native stage validation, resource ownership and serialization after implementation. Native diagnostic bank selection remains Fragment=4, otherwise=0, as upstream.
+- Local cache format uses two high stage-word bits for mesh presence/task kind, followed by three little-endian register words and the primitive header words. Upstream instead uses logical Task/Mesh stages and a with_mesh_state argument. This adaptation preserves physical resource binding separately; ordinary entries retain their existing encoding. Invalid stage combinations and truncated mesh metadata reject.
+- Environment hash includes physical stage, task kind, three registers and primitive header, since these specialize compute/generated vertex code. Ordinary shader hashes are unchanged. This does not replace pending host pipeline key invalidation.
+### Unintentional differences (to fix)
+- None identified in this bounded explicit environment/cache slice. Corrected an existing native cache replay divergence: proprietary-driver detection now accepts a native address map as well as texture bank 2, matching upstream and preserving native bank-1 folding.
+### Missing items
+- Live register/primitive-header snapshot acquisition by the mesh pipeline caller; host pipeline key/cache version integration; task-count scheduling, resources, dispatch barriers and generated vertex draw integration. Existing game graphics path does not opt into the new constructor. Geometry-specific native lowering remains separate.
+### Binary layout verification
+- PASS: appended metadata is exactly 12 register bytes plus ProgramHeader raw words, explicitly little-endian with no host padding. Existing physical stage and resource slots survive serialization/deserialization and conversion to GraphicsEnvironment.
+- Focused regressions cover task, direct mesh and tessellation-slot mesh; hash sensitivity to registers/header/kind; truncated metadata rejection; real owner-backed native ISBE capture/lowering while preserving resource slot. Source size includes the 128-byte shader header plus 32 bytes of native instructions.
+- Full cargo test -p video_core: 1701 passed, 0 failed, 1 ignored; doc tests pass; terminal exit 0, nx2-mesh-video-env-full.log. cargo check -p video_core passed in nx2-mesh-video-env-check.log. No new GPU/game run or FPS claim.
+
+
+## 2026-11-08 - src/video_core/src/shader_environment.rs vs video_core/shader_environment.cpp/.h (live mesh snapshot)
+
+### Intentional differences
+- Added explicit from_maxwell3d_live_mesh construction, sharing the existing environment/lowering implementation. Reads actual Maxwell registers and pass-through primitive header instead of requiring the caller to supply metadata. Constructor remains explicit pending renderer dispatch integration.
+- Snapshot is collected before shared construction/native lowering, so its task/mesh kind is available to select the native lowerer. Upstream assigns logical stage and reads the geometry header inside construction; Rust retains physical graphics stage and separate metadata for compute emulation. No guest state is written.
+- Re-read pinned Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 shader_environment.cpp/.h and Maxwell Pipeline layout after implementation. Task classification, three register owners, conditional geometry-header read, reserved-word offsets and 40-bit GPU address mask match. Original Eden-NX2 remains authority for ordinary stages.
+### Unintentional differences (to fix)
+- None identified in this snapshot slice.
+### Missing items
+- Host shader/pipeline cache integration and invalidation, task scheduling and dispatch, output transport and graphics draw. This constructor alone does not activate game mesh rendering.
+### Binary layout verification
+- PASS: Pipeline is 16 u32 words; reserved starts at word5. Header is read as128 GPU bytes and decoded into all32 little-endian words. Regression covers task (zero primitive header), tessellation-slot mesh and direct vertex-slot mesh, actual register values, and ignored high reserved address bits.
+- Full video_core validation running in nx2-mesh-live-env-full.log; final result recorded below after terminal observation.
+- Final validation: cargo test -p video_core terminal exit0, 1701 passed, 1 ignored; doc tests pass (114.94s), nx2-mesh-live-env-full.log. git diff --check for shader_environment.rs passes. No new ROM/GPU run.
+
+
+## 2026-11-08 - src/video_core/src/dirty_flags.rs vs video_core/dirty_flags.cpp/.h
+
+### Intentional differences
+- None in the new SetupDirtyShaders mesh range; pinned Eglantine900ab5a8 extension fills table1 MeshControl through MeshInitShader (4words) with Shaders. Header and cpp reread after implementation; header inline GetDirtyFlagsForMethod remains unchanged as upstream.
+### Unintentional differences (to fix)
+- Fixed missing mesh-register dirty tracking prerequisite before continuing shader cache integration.
+### Missing items
+- Mesh pipeline execution remains outside this dirty flag slice.
+### Binary layout verification
+- PASS: existing table size/indices unchanged; regression verifies four-word extent, adjacent boundaries and preservation of primary flags. Focused dirty_flags6PASS nx2-mesh-dirty-focused.log; full crate validation follows cache changes.
+
+
+## 2026-11-08 - src/video_core/src/shader_cache.rs vs video_core/shader_cache.cpp/.h
+
+### Intentional differences
+- MeshStateHash serializes a zero-initialized 92-byte array explicitly little-endian instead of hashing raw C++ u32 array memory. Same three register words, first20 primitive-header words (80bytes), conditional ReadBlockUnsafe, 40-bit address mask, CityHash64 and final OR1. Method remains owned by ShaderCache as upstream.
+- Re-read pinned Eglantine900ab5a8251dcdb5eee42dd2837fa936ade15303 cpp/h after implementation. RefreshStages uses native && IsMeshEnabled, skips header-only geometry before address lookup, then XORs specialization into VertexB/Tessellation stage keys after obtaining the code-cache entry, including lookup hits. Original code hash stays unchanged in ShaderInfo.
+### Unintentional differences (to fix)
+- None identified in this key/dirty invalidation slice. Missing mesh dirty flags were recorded as an interrupted prerequisite, fixed and focused-tested before resuming.
+### Missing items
+- Refresh/build environment construction still uses ordinary graphics mode pending compute-dispatch integration. The explicit mesh environment hash must not become a permanently register-specialized ShaderInfo code hash when wiring these sites; preserve separate stable code identity and per-refresh state XOR. Runtime resource binding, task scheduling and generated vertex draw remain pending.
+### Binary layout verification
+- PASS: key input exactly92bytes, first12 register bytes plus80 header bytes; unused header tail excluded as upstream. Regression with cached code checks expected hash, preserved ShaderInfo identity, geometry skip and changed keys after a real engine method write (exercises dirty prerequisite), for both VertexB and Tessellation.
+- Full video_core suite running in nx2-mesh-cache-full.log; terminal result appended below. No GPU/game run.
+- Final validation for shader_cache.rs and dirty_flags.rs: full cargo test -p video_core1703PASS/1ignored, doc testsPASS, terminal0 session40578, nx2-mesh-cache-full.log (115.51s). Initial new regression failed because its isolated engine lacked the renderer-installed dirty tables; fixed test setup, focused rerun PASS in nx2-mesh-cache-focused.log, then full rerun PASS. git diff --check passes for both files.
+
+
+## 2026-11-08 - src/video_core/src/shader_environment.rs vs video_core/shader_environment.cpp/.h (stable code identity)
+
+### Intentional differences
+- None in the restored hash ownership: Analyze/CalculateHash hash code only. Removed the earlier mesh-state hash mix now that ShaderCache owns the pinned per-refresh MeshStateHash specialization. This supersedes the earlier environment-hash adaptation entry; serialized mesh metadata is retained.
+### Unintentional differences (to fix)
+- Fixed impending double/stale specialization when storing explicit mesh environments in the address-indexed ShaderInfo cache. Re-read pinned Eglantine900ab5a8 Analyze/CalculateHash declarations and bodies and ShaderCache MakeShaderInfo after implementation; stable native code hash/version tag preserved.
+### Missing items
+- Vulkan mesh compute dispatch/resource scheduling remains outside this identity correction.
+### Binary layout verification
+- PASS: no cache byte format or raw shader representation change. Live native task and mesh regression verifies Analyze remains identical after mesh-register mutation while refreshed pipeline keys change; metadata cache roundtrip regression retained.
+
+## 2026-11-08 - src/video_core/src/shader_cache.rs vs video_core/shader_cache.cpp/.h (explicit compute consumer)
+
+### Intentional differences
+- Added immutable new_mesh_compute construction policy. RefreshStages and GetGraphicsEnvironments select the existing live mesh constructor only for native mesh VertexB/Tessellation. Ordinary consumers keep new. Upstream selects native task/mesh automatically; this explicit policy isolates native rejection/code caches until the Rust Vulkan consumer can dispatch the compute adaptation on RX5700XT. No change of cache mode after entries exist.
+- Pinned Eglantine900ab5a8251dcdb5eee42dd2837fa936ade15303 cpp/h reread after implementation: both construction sites retain native address/start offset rules, stage ownership, cached size checks and environment ordering. No new dispatcher owns translation logic.
+### Unintentional differences (to fix)
+- None identified in these explicit cache construction paths.
+### Missing items
+- Renderer must instantiate/use the compute-capable cache together with a complete mesh compute pipeline, descriptors, task-child scheduling, barriers and generated vertex draw. Existing renderer remains ordinary and has not been enabled by this test. Real captured game shader resource translation and runtime validation still pending.
+### Binary layout verification
+- PASS: owner-backed GPU fixture uses two real 16-byte native ISBEWR/EXIT programs: task payload write and mesh primitive count write, each with128-byte header. RefreshStages analyzes native code, GetGraphicsEnvironments reconstructs task/mesh from live slots, full environment frontend produces Compute IR, and production emit_mesh_compute_spirv succeeds for both before/after register mutation. Stable code hashes and per-refresh specialized keys checked. This is compiler integration on synthetic guest programs, not execution of game captures.
+- Focused test PASS nx2-mesh-cache-live-focused.log. Initial fixture incorrectly used a mesh-only map write in task; upstream rejection was preserved and fixture corrected to task payload write. Full video_core validation pending in nx2-mesh-cache-live-full.log; terminal result appended below.
+- Final validation: full cargo test -p video_core1704PASS/1ignored, doc testsPASS,114.23s, terminal0 session59196 nx2-mesh-cache-live-full.log. git diff --check passes. No game/GPU execution this slice.
+
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/pipeline_cache.rs vs renderer_vulkan/vk_pipeline_cache.cpp/.h (live compiler diagnostic)
+
+### Intentional differences
+- Opt-in RUZU_NX2_MESH_COMPILE_PROBE directory activates a bounded64-configuration diagnostic before ordinary stage refresh. Uses live task/mesh GraphicsEnvironment, GPU/device HostTranslateInfo/Profile, production environment frontend and compute SPIR-V emitter. Does not dispatch GPU work or replace guest draws. This is investigative instrumentation, absent upstream; owner remains Vulkan pipeline compilation.
+- Native mesh upstream branch requires EXT_mesh_shader; this GPU lacks it. Diagnostic exercises the explicitly implemented compute adaptation instead. cpp/h BuildGraphicsPipeline/CurrentGraphicsPipeline ownership and environment/CFG translation sequence reread after implementation. Uses cached_instruction_start, preserving the128-byte SPH offset.
+- Diagnostic deduplicates bound register configurations, not all memory/resource changes. Saved env files contain reads observed during translation, potentially partial on failure; they are not production pipeline caches. RuntimeInfo is default for compute emission; rasterization consumer specialization remains outside probe.
+### Unintentional differences (to fix)
+- None in normal path with diagnostic unset.
+### Missing items
+- Task scheduling and actual Vulkan compute/generated-vertex draw pipeline remain pending. Probe is evidence gathering only.
+### Binary layout verification
+- PASS: SPIR-V words serialized explicitly LE; existing environment serializer handles recorded resources/mesh snapshot with diagnostic cacheversion1. No guest-memory writes by instrumentation.
+- cargo check -p video_core PASS; full cargo test -p video_core1704PASS/1ignored/docPASS terminal0 in nx2-mesh-live-probe-full.log120.82s. Runtime results to be appended after actual game observation.
+
+- Runtime evidence: release ruzu-cmd launched with isolated copied config and diagnostic enabled. PID26832 startUTC2026-11-08T00:47:15.9314666Z; verified executable/start identity before stopping and observed exit. Artifacts TEMP/ruzu-nx2-live-mesh-compile-20261108-014712:18 status reports,18 SPIR-V modules,18 serialized resource environments, stdout/stderr/main log, perf log, PrintWindow captures and runtime-summary.json. All18 encountered configurations compile successfully with live resources (not18 unique native binaries). Largest emitted module38782words. No driver validation/dispatch of these compute modules yet.
+- Loading temporarily reported0FPS but resumed; final image mainly sky/incomplete rendering.16samples after90s:median8.5FPS,min4.5,max12.5. This is not a playable20FPS result. Ordinary rendering still rejects native ISBE; diagnostic does not replace its pipeline. No claim of frame-rate improvement based on this short diagnostic run.
+- Release builds finished successfully (GUI nx2-mesh-live-probe-release.log; CLI nx2-mesh-live-probe-cmd-release.log). All test/build/runtime processes terminal. Next work can validate and replay these real captured environments offline before actual dispatch/resource integration.
+
+
+## 2026-11-08 - real captured task/mesh SPIR-V driver pipeline validation
+
+### Intentional differences
+- Standalone host validation harness, no production code change. Reflected each captured module's descriptor set/binding/type/count, deduplicated compatible aliased buffer declarations, and created actual Vulkan compute pipelines on AMD Radeon RX5700XT. Device enabled supported Vulkan1.1/1.2 and base features; no guest shader dispatch, resource contents or draw replacement.
+### Unintentional differences (to fix)
+- No driver pipeline-creation failures in the18 captured modules. This is acceptance evidence, not a proof of shader semantics or successful dispatch.
+### Missing items
+- VK_LAYER_KHRONOS_validation is unavailable; zero debug errors does not establish validation-layer success. Real dispatch, resource population, task-to-mesh scheduling, generated vertex draw and20FPS gameplay remain unverified/unimplemented.
+### Binary layout verification
+- Reflection covers SPIR-V pointer/struct/array storage classes and descriptor decorations; all observed bindings are uniform buffers, storage buffers and one combined image sampler. Compatible duplicate bindings correspond to typed aliases; layout entries deduplicated with exact type/count checks.
+- Actual vkCreateComputePipelines succeeded18/18, including38782-word module. Every created pipeline/module/layout/device/instance destroyed. No dispatch executed. Process terminal0 session27619, nx2-real-mesh-driver.log. Harness Cargo.toml/Cargo.lock/src/main.rs/reflect.py/results.json retained in TEMP/ruzu-real-mesh-pipeline-probe; captured inputs/reflection.json in TEMP/ruzu-nx2-live-mesh-compile-20261108-014712/compilation.
+
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs renderer_vulkan/vk_rasterizer.cpp/.h and backend/spirv/emit_spirv_mesh.cpp
+
+### Intentional differences
+- MeshTaskDispatchPlan explicitly expands completed host-visible task payloads into compute mapping records and dispatch ranges, replacing only the implicit task-to-mesh work expansion that native DrawMeshTasksEXT/OpEmitMeshTasksEXT provides on supported GPUs. This CPU planning adaptation is needed on RX5700XT; the actual Vulkan submission/readback/draw owner remains pending.
+- Reads child count from word1 exactly as pinned Eglantine900ab5a8 TaskEpilogue. Each child receives a parent-relative guest index, the parent's unchanged payload word base, and a unique output record. Batches respect the supplied device dispatch limit without resetting guest indices at batch boundaries. Caller uploads each mapping slice so physical groupX restarts at0 per dispatch.
+- Explicit Result errors for invalid input shape, shader word addressing overflow, count overflow, insufficient output allocation and allocation failure. No count clamping/substitution; a failed plan submits nothing. Caller provides the capacity of its actual output allocation.
+- Re-read pinned vk_rasterizer header/Draw mesh branch and TaskEpilogue after implementation. Shader-stage translation and task payload export remain in their existing upstream-owned shader modules; no shader logic moved into the planner.
+### Unintentional differences (to fix)
+- None identified in the bounded task-child mapping expansion.
+### Missing items
+- Planner is not yet invoked by game draws. Task pipeline submission and synchronized readback, actual child dispatch/descriptors, direct-mesh draw path, output/vertex barriers and generated vertex draw integration remain. CPU readback may limit eventual throughput and is not evidence of20FPS.
+### Binary layout verification
+- PASS: reuses existing three-u32 MeshDispatchRecord ABI (guestX,payloadbasewords,outputrecord). Tests cover zero-count parent, two nonzero parents, boundary splitting across parents, preserved payload, output capacity, malformed payload and u32 overflow without large allocation. Full video_core validation pending nx2-mesh-task-plan-full.log.
+- Final checks: full cargo test -p video_core1706PASS/1ignored/docPASS116.72s, session48178terminal0 nx2-mesh-task-plan-full.log; diff check passes.
+- Hardware evidence: production emit_mesh_compute_spirv task shader executed on RX5700XT,3parents/8invocations/13wordpayload. GPU-written word1 counts[0,2,1] and word5 markers match mapped parent indices; host readback after compute-to-host barrier/fence feeds an exact verified snapshot of production MeshTaskDispatchPlan. Records[[0,13,0],[1,13,1],[0,26,2]], batches[0..2,2..3]. No child shader dispatched by this harness. All Vulkan resources destroyed; session37656terminal0 nx2-task-payload-plan-gpu.log. Probe source/Cargo.lock/plan_snapshot.rs/results.json retained TEMP/ruzu-task-payload-plan-probe; snapshot byte-equivalence checked and SHA256 recorded. No new ROM/FPS claim.
+
+
+## 2026-11-08 - task/mesh compute chain and generated vertex graphics hardware validation
+
+### Intentional differences
+- Standalone validation harness composes existing production task/mesh SPIR-V emitters, an exact checked snapshot of MeshTaskDispatchPlan and production emit_mesh_vertex_spirv. No production source changed in this slice. Synthetic task and mesh programs exercise the missing host submission sequence; a small probe fragment shader verifies vertex/primitive varyings and depth.
+- Host waits for task completion/readback, derives child counts, uploads each mapping batch and dispatches mesh. This correctness-first synchronous sequence has no performance claim. Compute-to-host and compute-to-vertex/indirect barriers precede consumers. No host-generated mesh output or indirect header is injected.
+### Unintentional differences (to fix)
+- None observed in exercised task-payload, mapping, mesh export and generated vertex consumption contracts. Upstream TaskEpilogue/MeshEpilogue and rasterizer DrawMeshTasks semantics reread for comparison.
+### Missing items
+- Game renderer integration: actual guest descriptor/resource binding, Vulkan ownership/lifetimes/scheduler wiring, no-task mesh path and full game frame validation. No claim that synthetic shader success proves real game shader execution or20FPS.
+### Binary layout verification
+- PASS actual RX5700XT:3task parents/8lanes/13wordpayload yield GPU counts[0,2,1]. Planner maps child records[[0,13,0],[1,13,1],[0,26,2]], dispatches2then1groups. GPU mesh outputs parent/child identifiers and indirect headers[3,1,0,0],[3,1,48,0],[3,1,96,0]; all verified.
+- Each output record then drives vkCmdDrawIndirect and the production generated vertex consumer. All768 RGBA32F pixels across3offscreen16x16draws match[.25,.5,.25,1],[.75,.5,.25,1],[.25,1,.25,1]. Red depends on childindex, green on parentpayload, blue on converted depth. This proves payloads produced by tasks reach child mesh output and rasterized varyings through the complete host/GPU chain.
+- Both runs terminal0: nx2-task-mesh-chain-gpu.log (compute transport), nx2-task-mesh-chain-graphics-gpu.log (full graphics chain). Every created Vulkan resource destroyed. Harness manifest/lock/src/main.rs/src/plan_snapshot.rs/results.json retained TEMP/ruzu-task-mesh-chain-probe; uses TEMP/ruzu-mesh-compute-entry-probe/target. Planner snapshot byte-equivalence checked and SHA256 recorded. Existing fullvideo1706PASS remains the last production suite; no new production edit requiring rerun.
+
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/compute_pipeline.rs vs renderer_vulkan/vk_compute_pipeline.cpp/.h (mesh host stage)
+
+### Intentional differences
+- Added MeshComputeStage owner for a compute-backed guest task/mesh stage, preserving its physical graphics resource slot0/2. Native upstream task/mesh pipelines use EXT graphics stages; this host compute owner is required on RX5700XT. Shader translation stays in pipeline_cache; guest-resource collection remains a pending graphics binding step, not silently redirected to Kepler registers.
+- Uses existing DescriptorLayoutBuilder and DescriptorPool/DescriptorAllocator, standard descriptor sets, update templates and scheduler semaphore reuse. Guest descriptors retain upstream ordering; append dispatch/payload SSBOs and mesh output SSBO. Rejects mismatched emitter binding metadata or invalid physical stage, and preserves descriptor-array element counts separately from binding counts.
+- Synchronous pipeline creation, optional cache handle and deterministic Drop cleanup on success/partial failure. No push-descriptor/descriptor-buffer optimization for this new path yet. Lazy allocator creation at first descriptor update; caller/cache must keep owner alive through recorded GPU use, matching existing pipeline lifetime obligations.
+- Subgroup size control follows original Eden-NX2 origin/eden-nx2 compute pipeline behavior (GuestWarpSize when extension enabled); original .cpp/.h reread, with pinned Eglantine compute and pool references for the extension integration. Original authority retained over Eglantine's newer warp-op optimization.
+### Unintentional differences (to fix)
+- None identified in bounded creation/layout/template ownership. Actual draw-resource binding and dispatch remain explicit missing integration, not implemented as no-ops.
+### Missing items
+- update_descriptor_set is prepared but not called by game draws. Must collect real graphics resources, allocate transport buffers, enqueue task and child dispatches through Scheduler, retain owners until GPU completion, and feed generated vertex/fragment rendering. MeshComputeStage alone is not a working game mesh path.
+### Binary layout verification
+- PASS: reuses deterministic zeroed DescriptorUpdateEntry union ABI and template stride. Tests distinguish arrays(4UBO+2SSBO elements) from2guest binding declarations and verify appended2/3storage descriptors, bank score and invalid binding/stage rejection.
+- Initial fullvideo1707PASS/1ignored/docPASS; final rerun after subgroup-size correction pending nx2-mesh-runtime-stage-full-final.log.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/descriptor_pool.rs vs renderer_vulkan/vk_descriptor_pool.cpp/.h
+
+### Intentional differences
+- MakeBankInfo visibility becomes pub(crate) so compute-backed mesh stage can reuse the existing descriptor element accounting and append its actual transport descriptors. Helper stays in its upstream-owned file; no behavior, arithmetic or layout changes. Header and cpp reread after change.
+### Unintentional differences (to fix)
+- None identified.
+### Missing items
+- Mesh runtime consumer integration described above.
+### Binary layout verification
+- PASS: DescriptorBankInfo and wrapping guest descriptor accumulation unchanged.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/pipeline_cache.rs vs renderer_vulkan/vk_pipeline_cache.cpp/.h (runtime owner diagnostic)
+
+### Intentional differences
+- Opt-in live compile probe now also creates/destroys MeshComputeStage with the real Vulkan Device and translated ShaderInfo, exercising production descriptor layout/template/pipeline creation. Successful status explicitly says runtime_pipeline=PASS. No compute work submitted by diagnostic. Normal path unchanged.
+### Unintentional differences (to fix)
+- None identified in diagnostic-only addition; existing upstream-owned pipeline construction boundary retained.
+### Missing items
+- Full game dispatch integration, as above.
+### Binary layout verification
+- Existing captured environment/SPIR-V formats unchanged. Runtime evidence will be appended after a new diagnostic launch.
+
+- Final production checks: full cargo test -p video_core1707PASS/1ignored/docPASS119.43s session90564terminal0 nx2-mesh-runtime-stage-full-final.log. Release CLI terminal0 session10528 nx2-mesh-runtime-stage-release-final.log. Earlier runs42714/19711 also terminal; final logs include subgroup change. Diff check passes.
+- Live game verification:18/18 encountered task/mesh configurations now report runtime_pipeline=PASS using MeshComputeStage (actual Device, ShaderInfo-derived descriptors, templates and pipeline). This includes the38782-word shader and texture-bearing mesh. Diagnostic destroys each owner without submitting work; update_descriptor_set remains unexercised by game draws.
+- RuntimePID8024startUTC2026-11-08T01:12:40.6114159Z, exactexe/startverified thenstoppedandexitobserved. Artifacts TEMP/ruzu-nx2-live-mesh-compile-20261108-021237 include18env/SPIRV/status triples, logs, PrintWindow window-runtime-owner.png and runtime-summary.json.24samples>=90s median8.75FPS,min0,max12.49. Image incomplete desert road/sky/lamps; no20FPS/playability claim. No remaining live test/build/game processes.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/graphics_pipeline.rs vs src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp/.h
+
+### Intentional differences
+- Mechanically extracted ConfigureImpl resource preparation into prepare_graphics_resources in the same file/GraphicsPipeline owner. Existing graphics configuration calls it before UpdateRenderTargets/CheckFeedbackLoop/ConfigureDraw, preserving descriptor synchronization, SSBO/texture setup, geometry update/bind, queue acquire, per-stage descriptors and post-copy barrier order.
+- MeshGraphicsResources holds one guest task/mesh Info in physical graphics slot 0 or 2; all other slots are empty. It reuses the same resource phase with DefaultSpec and ordinary descriptor entries for the compute adaptation on devices without native mesh support. Mesh metadata is boxed and retained by MeshComputeStage while the buffer cache borrows uniform-size storage.
+- PreparedMeshDescriptors copies queue entries before a subsequent stage acquires the queue and retains rescaling words/image views for the future submission/feedback-loop caller. Zero entries use an empty Vec without constructing a raw slice.
+- Compared extracted body against TEMP/ruzu-graphics-resources-before.rs: after mechanical field/argument substitution, only the lifetime comment and the render-area correction below differ. Original upstream 50fa86bbbc403ad565eb44fcc281f16f77c69e15 cpp/h re-read; Eglantine 900ab5a8 resource additions are not substituted for original existing behavior.
+
+### Unintentional differences (to fix)
+- Found and fixed locally: render-area words previously forwarded unset surface-clip dimensions. Original ConfigureImpl uses both RT0 dimensions when either clip dimension is zero. render_area_words now preserves that fallback; tests cover both partially unset cases and a valid clip. Words remain consumed only when uses_render_area is set.
+- No additional discrepancy introduced by the mechanical extraction was found in the reviewed resource phase.
+
+### Missing items
+- Real game task/mesh dispatch, payload/mapping/output allocation, readback scheduling, generated-vertex/fragment framebuffer draw, and associated compute/image synchronization remain the interrupted runtime integration slice. This resource bridge is not yet called by game draws; no new performance/playability evidence.
+
+### Binary layout verification
+- Existing DescriptorUpdateEntry union/template layout unchanged; owned copies preserve existing entry order. No new serialized structure. Render-area payload retains four f32 words with deterministic zero padding in the last two words.
+- Focused graphics pipeline tests: 21 passed, nx2-mesh-graphics-resources-focused.log. Full crate validation recorded below after completion.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/compute_pipeline.rs vs src/video_core/renderer_vulkan/vk_compute_pipeline.cpp/.h
+
+### Intentional differences
+- Compute-backed MeshComputeStage owns boxed MeshGraphicsResources and prepare_descriptor_set delegates guest preparation to the graphics owner, then invokes existing update_descriptor_set with mapping/payload/output SSBOs. Guest resource access stays Maxwell graphics slot 0/2 rather than Kepler compute resources. This is the explicit no-native-mesh Vulkan adaptation, not a new upstream ComputePipeline method.
+- Existing ordinary ComputePipeline configuration and Vulkan descriptor template ABI unchanged. Caller must retain the stage through GPU use and while its uniform-size storage remains bound in the buffer cache, just as graphics pipeline cache ownership requires upstream.
+- Re-read original vk_compute_pipeline.cpp/.h Configure and descriptor update/bind ownership alongside original graphics ConfigureImpl.
+
+### Unintentional differences (to fix)
+- None identified in this bridge; GPU submission is not claimed implemented.
+
+### Missing items
+- Rasterizer caller, compute push constants/barriers/submission, task readback and child dispatch, and final graphics consumer remain to integrate. prepare_descriptor_set has not been exercised with live game resources yet.
+
+### Binary layout verification
+- No ABI changes. Guest entries precede the existing two task or three mesh transport descriptors; the bridge reuses update_descriptor_set validation and template updates.
+
+2026-11-08 validation COMPLETE: cargo test -p video_core passed 1709 tests, 1 ignored, doc-tests passed (113.25s); nx2-mesh-graphics-resources-full.log session8445 terminal exit0. Focused21PASS. No game runtime launched; last measured8.75FPS/incomplete unchanged. Graphics-resource bridge still needs rasterizer caller/submission, tracked above.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/pipeline_cache.rs vs src/video_core/renderer_vulkan/vk_pipeline_cache.cpp/.h
+
+### Intentional differences
+- Added cache-owned MeshComputePrograms and current_mesh_compute_programs for the compute adaptation of task/mesh. Uses the existing shared ShaderCache RefreshStages/GetGraphicsEnvironments ownership boundary and the same persistent graphics_key.unique_hashes; RefreshStages can return without rewriting hashes when no shader is dirty.
+- New map retains Rc owners (including boxed uniform metadata) and negative entries like existing graphics/compute caches. It keys by all six specialized shader hashes; fixed raster state does not affect these compute stages, emitted with the same default RuntimeInfo as the verified live compiler probe. ShaderCache owns code invalidation and mesh register/header specialization; diagnostic register hashes are not used here.
+- Translates physical programs 1/3 from full environments, emits production compute SPIR-V, creates MeshComputeStage at resource slots 0/2, retains separate task/mesh MeshInfo, supports absent task, rejects absent/duplicate mesh stages. Driver cache flushing remains the existing owner responsibility. No disk environment format activated for the new map yet.
+- Original 50fa86bbbc403ad565eb44fcc281f16f77c69e15 CurrentGraphicsPipeline/CreateGraphicsPipeline and header cache ownership re-read after implementation.
+
+### Unintentional differences (to fix)
+- None identified in this cache slice. The caller must use the sole channel ShaderCache created with new_mesh_compute, rather than two caches competing to consume shader dirty flags.
+
+### Missing items
+- The rasterizer draw path still does not invoke this map. Transport allocation/readback and generated vertex/fragment graphics pipeline need integration before activation. Live execution/cache reuse not yet verified.
+
+### Binary layout verification
+- Map key is Rust [u64;6] hashing, not a newly serialized raw struct; no padding or disk ABI added. MeshInfo and emitted descriptor bindings are unchanged.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/compute_pipeline.rs vs src/video_core/renderer_vulkan/vk_compute_pipeline.cpp/.h
+
+### Intentional differences
+- MeshComputeStage::record_bind records real compute pipeline, push constants and descriptor set bindings on the existing scheduler, after prepare_descriptor_set. Pipeline/layout lifetime remains the cache owner's responsibility through completion.
+- Task/mesh carries graphics render-area words when shader Info requires them, after rescaling words, matching graphics ConfigureDraw ordering with the host COMPUTE stage flag. Rescaling words are always initialized, as in graphics ConfigureDraw; ordinary Kepler ComputePipeline is unchanged. Ends render pass before compute recording.
+- Original ComputePipeline Configure/header and graphics push-constant ordering re-read after implementation; template updates remain in the prior bridge.
+
+### Unintentional differences (to fix)
+- None identified in the recording bridge. It has not been called by a live game draw yet.
+
+### Missing items
+- Caller integration and actual Vulkan submission evidence remain required.
+
+### Binary layout verification
+- Uses existing pipeline-layout push-constant ranges and offsets; no descriptor or transport ABI changes. Captures values/handles for the asynchronous command worker rather than references to transient descriptor preparation.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/graphics_pipeline.rs vs src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp/.h
+
+### Intentional differences
+- PreparedMeshDescriptors now forwards the existing four-word render-area payload from graphics resource preparation to the compute stage recorder. Ownership and computation remain in GraphicsPipeline's file.
+- Re-read original ConfigureImpl/ConfigureDraw and header declarations: render-area data remains conditional on Info.uses_render_area at push time, preserving the RT0 fallback implemented in the prior slice.
+
+### Unintentional differences (to fix)
+- None identified in this payload forwarding change.
+
+### Missing items
+- Mesh graphics consumer and live dispatch integration remain pending.
+
+### Binary layout verification
+- Existing [f32;4] payload and offsets unchanged. No serialization added.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs src/video_core/renderer_vulkan/vk_rasterizer.cpp/.h
+
+### Intentional differences
+- Added dispatch_mesh_stage in the upstream command-submission owner. Locks both existing resource caches, prepares Maxwell graphics descriptors through MeshComputeStage, records pipeline/set/push constants, then the pre-dispatch dependency and vkCmdDispatch(groups,1,1).
+- Mirrors DispatchCompute's graphics/compute/transfer-to-compute dependency; destination adds MEMORY_WRITE for task/mesh storage output write-after-write dependencies. No implicit queue submission/wait added here; the transport caller owns task completion/readback and output-consumer barriers.
+- Rejects host group-limit overflow and mapping ranges shorter than one 12-byte MeshDispatchRecord per group. Checks use u64 multiplication; no count clamping. Regression covers exact fit, one-byte short, host limit, zero count and u32::MAX multiplication.
+- Original DispatchCompute cpp and rasterizer header re-read after implementation. New dispatch is an explicit substitute for unavailable native mesh support; ordinary Kepler dispatch is unchanged.
+
+### Unintentional differences (to fix)
+- None identified in this submission-recording slice. A full task/mesh draw is still incomplete and not enabled.
+
+### Missing items
+- Draw-path caller, transport buffer allocations/lifetimes, task readback and MeshTaskDispatchPlan batching, mesh-to-vertex/indirect barriers, generated vertex plus real fragment/current-framebuffer graphics pipeline, direct-mesh output draw and live title verification.
+
+### Binary layout verification
+- Uses the existing three-u32 mapping ABI (WORDS*4). Existing VkDescriptorBufferInfo and descriptor update entries unchanged.
+- cargo check -p video_core passed; targeted renderer_vulkan suite: 342 passed, 1 ignored (nx2-mesh-stage-submit-focused.log). Full crate results appended after completion.
+
+2026-11-08 stage submission/cache validation COMPLETE: cargo test -p video_core 1710PASS,1ignored,docPASS; nx2-mesh-stage-submit-full.log session86463 terminalexit0. Targetedrenderer342PASS1ignored. No livegame run or meshsubmission exercised thisslice. Next transport allocation/drawcaller/generatedvertex graphics integration remains necessary; goal20FPSunmet.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/staging_buffer_pool.rs vs src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp/.h
+
+### Intentional differences
+- Exposed existing request_buffer as pub(crate), corresponding to upstream public Request(size,usage,deferred), to permit deferred DeviceLocal transport allocation. Existing allocation/reuse/deferred tick behavior unchanged.
+- Non-stream pooled buffers additionally have INDIRECT_BUFFER usage, required because compute-emulated mesh output embeds VkDrawIndirectCommand headers. Stream buffer flags remain unchanged. This is an explicit compute-mesh adaptation to upstream pool allocation flags.
+- flush_deferred/invalidate_deferred resolve the retained AllocatedBuffer through the same cache/index ownership as FreeDeferred and invoke existing VMA visibility operations. Ruzu's allocator prefers but does not require HOST_COHERENT; invalidate requires caller GPU completion and HOST_READ dependency. No wait is hidden here.
+- Re-read original Request/FreeDeferred/CreateStagingBuffer cpp and header after implementation. No new allocation owner introduced.
+
+### Unintentional differences (to fix)
+- None identified in this prerequisite slice.
+
+### Missing items
+- Runtime transport caller is resumed next; this change alone performs no task/mesh dispatch.
+
+### Binary layout verification
+- StagingBufferRef and allocation layout unchanged. Existing handles, offsets, and deferred indexes reused. cargo check -p video_core passed (nx2-mesh-transport-pool-check.log); full-crate test result will follow the transport integration.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs src/video_core/renderer_vulkan/vk_rasterizer.cpp/.h
+
+### Intentional differences
+- dispatch_mesh_programs now runs the compute replacement for task-to-mesh transport using existing scheduler/resource caches/staging pool. Deferred payload, per-batch mapping, readback and output allocations survive task Finish and descriptor queue rollovers; cleanup stamps the current tick via FreeDeferred on success or returned error. The output alone remains deferred for its graphics consumer.
+- Task mappings preserve guest parent X and payload word base; task exports are copied after COMPUTE->TRANSFER and TRANSFER->HOST barriers, Finish, and mapped-memory invalidation. Existing MeshTaskDispatchPlan reads payload word1 and maps child X/parent base/output record; exact output storage is allocated after the counts are known. Mesh batches preserve global output records and finish with COMPUTE->VERTEX_SHADER|DRAW_INDIRECT visibility.
+- Direct mesh draws have no task parent; direct plan maps guest group X to the same output record and uses an initialized placeholder payload (no parent data exists). Guest shader transport is not populated with synthetic counts or generated output. Allocation/device/address/vertex-span limits reject unrepresentable work without count clamping.
+- RUZU_NX2_MESH_COMPUTE_PROBE selects an explicit diagnostic path: constructs the sole channel ShaderCache using new_mesh_compute, intercepts direct native mesh draws, obtains cache-owned production programs, executes up to 32 unique mesh programs once each, and reads up to eight GPU-written indirect headers. Logs/writes evidence, but does not substitute a graphics draw. Normal path is unchanged without the flag. Zero group draws do not consume a diagnostic entry.
+- Re-read Eglantine 900ab5a8 RasterizerVulkan::Draw/MakeDrawParams and header: group count remains draw_params.num_vertices; instance count is not substituted. Re-read TaskEpilogue: count is payload word1, child groups inherit the parent payload. Original compute submission/caches retain their ownership.
+
+### Unintentional differences (to fix)
+- No mismatch found in the reviewed transport/control sequence; actual game execution is pending below. Host task readback is an explicit compute fallback cost, unlike native EXT mesh dispatch.
+
+### Missing items
+- Generated vertex plus real fragment/current framebuffer graphics consumer, final draw submission and release of its deferred output, direct/indirect mesh production activation, and playable >=20 FPS validation. Diagnostic execution does not claim that any mesh is drawn on screen.
+
+### Binary layout verification
+- Mapping serializes three little-endian u32 words per group. Payload readback decodes little-endian words after GPU completion. Output uses production MeshOutputLayout stride and existing four-u32 indirect headers; range/capacity checks bound u32 word and firstVertex addressing.
+- Focused mesh tests: 13 passed, including direct group identity across batches and storage/word/vertex capacity bounds (nx2-mesh-transport-focused.log). cargo check passed. Full crate/release validation and live evidence follow.
+
+### Live execution evidence - 2026-11-08
+
+2026-11-08 LIVE GPU EVIDENCE transport run1: release/fullbuild session93929terminal0, full1712PASS1ignored/docPASS111.91s, release1m29. Launched TEMP/ruzu-launch-mesh-execution-probe.ps1 PID13128 startUTC2026-11-08T01:43:18.9818078Z, dir TEMP/ruzu-nx2-live-mesh-execution-20261108-024315. Identitychecked executable/start thenstoppedafter~90s, runtimeJSONexited. Archivedruzu_log andwindow-compute-probe.png (viewed:loadingmap,no gameplay). Process remainedresponsive; noDEVICE_LOST/panic observed. Actualproductioncache/resources/scheduler task/mesh executed, NOT justshadercompile.
+10executionreports:3task configs EXECUTEDrecords0;4task configs(groups6) FAILED meshchildcountoverflows;3directmesh configs executedrecords30/1/1 withGPUheaders vertexCount0,instanceCount1,firstVertex stepping192 for30recordcase. Thus transport dispatch/readback completes but realtaskcounts andmeshoutputs NOT validatedcorrect; syntheticproofdoesNOTextendtogame. Need debugrawpayload/resource/nativeISA beforegraphicssuccessclaim. Lastperformancerun8.75FPSincomplete remainsbaseline; no20FPSclaim.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/pipeline_cache.rs vs src/video_core/renderer_vulkan/vk_pipeline_cache.cpp/.h
+
+### Intentional differences
+- Opt-in execution diagnostics save each actual cached stage SPIR-V and serialized environment after translation, keyed by shared shader hash/stage; logs tie handles to hash/workgroup/payload. Original CreateGraphicsPipeline/SerializePipeline and header owners reviewed. Diagnostic version1 does not enable a production disk cache.
+
+### Unintentional differences (to fix)
+- No additional mismatch identified in this slice; real shader input/geometry correctness remains under investigation.
+
+### Missing items
+- Final live run after count initialization, generated vertex/real fragment/framebuffer draw, and playable >=20FPS verification.
+
+### Binary layout verification
+- SPIR-V saved as LE u32; existing environment serializer unchanged. Fullvideo1712PASS1ignored/docPASS114.29s, release1m25, session20941terminal0.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs src/video_core/renderer_vulkan/vk_rasterizer.cpp/.h
+
+### Intentional differences
+- Opt-in task readback saves full raw payload and per-parent counts before planning. No payload replacement. Run2 TEMP/ruzu-nx2-live-mesh-execution-20261108-024945: six taskconfigs childtotal0; one counts[0,0,1,1,0,0], headers[48,1,0,0]/[48,1,48,0]; three directconfigs sampledzerovertices. Actual execution proven, geometry validity NOT proven. PID19576/startUTC2026-11-08T01:49:48.7015842Z identitychecked beforestop; runtimeJSONexited. Earlier overflow was variable, prompting task initialization audit.
+
+### Unintentional differences (to fix)
+- No additional mismatch identified in this slice; real shader input/geometry correctness remains under investigation.
+
+### Missing items
+- Final live run after count initialization, generated vertex/real fragment/framebuffer draw, and playable >=20FPS verification.
+
+### Binary layout verification
+- Raw GPU bytes saved after Finish/HOST_READ/invalidate. Per-parent stride64/352words matches metadata; no ABI change.
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv_mesh.rs vs src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+
+### Intentional differences
+- Intentional compute-fallback correction to pinned Eglantine900ab5a8 undefined behavior: payload word1 is zeroed before guest task instructions and a workgroup AcquireRelease barrier follows. Captured real task SPIR-V has culling/exit paths bypassing the sole count store. Pinned DefineMesh allocates uninitialized task payload and EmitMeshPrologue returns for tasks, while TaskEpilogue always reads word1. No count write now means no emitted children; explicit guest writes still overwrite verbatim, including high-bit values. Only the count is initialized; no clamping or substitute geometry. Upstream stays read-only. Re-read cpp/prologue/epilogue and instruction header; helper stays in mesh owner and introduces no entry-block branch.
+
+### Unintentional differences (to fix)
+- No additional mismatch identified in this slice; real shader input/geometry correctness remains under investigation.
+
+### Missing items
+- Final live run after count initialization, generated vertex/real fragment/framebuffer draw, and playable >=20FPS verification.
+
+### Binary layout verification
+- Same word1/byte4 ABI. Unit regression checks initialization/barrier and explicit0x80000001 preservation. SyntheticGPU TEMP/ruzu-task-empty-count-probe: parent0 skipscountwrite,parents2/1 explicitlywrite; realGPUcounts[0,2,1],samechildmapping,3meshoutputs,all768pixelsPASS. Log nx2-task-empty-count-gpu-final.log session64665terminal0. Initialfixture accidentally changed meshpredicate too; correctedtask-only fixture passes.
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv_special.rs vs src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+
+### Intentional differences
+- EmitPrologue delegates compute task count initialization to emit_task_payload_prologue; existing mesh prologue unchanged. Pinned task/mesh callsite and instruction declaration re-read. Intentional undefined-count correction described above.
+
+### Unintentional differences (to fix)
+- No additional mismatch identified in this slice; real shader input/geometry correctness remains under investigation.
+
+### Missing items
+- Final live run after count initialization, generated vertex/real fragment/framebuffer draw, and playable >=20FPS verification.
+
+### Binary layout verification
+- No ABI change; initialization precedes guest code and collective export.
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv.rs vs src/shader_recompiler/backend/spirv/emit_spirv.cpp/.h
+
+### Intentional differences
+- Compute task adapter rejects payloads shorter than two words because count lives at word1. Existing positive-size mesh validation unchanged. Task barrier regression now expects initialization plus export(two), mesh remains three. Original EmitSPIRV interface/header reviewed; explicit compute adapter extension.
+
+### Unintentional differences (to fix)
+- No additional mismatch identified in this slice; real shader input/geometry correctness remains under investigation.
+
+### Missing items
+- Final live run after count initialization, generated vertex/real fragment/framebuffer draw, and playable >=20FPS verification.
+
+### Binary layout verification
+- No binding/transport ABI change. Initialfullshader658PASS1FAIL dueoldbarrierexpectation; correctedtest, finalshader659PASS/docPASS. Remaining validation follows.
+
+2026-11-08 FINAL VALIDATION AND LIVE EVIDENCE after task-count initialization:
+- shader_recompiler659PASS/docPASS0.78s (nx2-task-count-init-shader-full-final.log); video_core1712PASS1ignored/docPASS113.19s (nx2-task-count-init-video-full.log); releaseCLI1m31, session87387terminal0.
+- Real ROM probe dir TEMP/ruzu-nx2-live-mesh-execution-20261108-025837, PID8780 startUTC2026-11-08T01:58:40.3967203Z. Exactexe/start identitychecked thenstopped; runtimeJSONexited. Logs,17+stage artifacts,payloads,window-count-initialized.png andruntime-summary.json retained. Screenshot viewed:loadingmap,notgameplay.
+- 11 finalexecutionreports (one additional directconfig arrivedafter the10-reportprogressmessage),0FAILED. Seven taskconfigs: six childtotal0; one counts[0,0,1,1,0,0] producing2realmeshrecords stride1120,headers[48,1,0,0]/[48,1,48,0]. Four directconfigs sampledzerovertexheaders. No task-count overflow observed after initialization. This proves real task->hostplan->mesh dispatch completes withrealguestresources andpreservespositivecounts; it does NOT prove finalgeometry/imagescorrect.
+- Newempty-task syntheticGPUpass remains separate evidence: no-count-write parent becomes0,explicit2/1 preserved,3childoutputs/all768pixelsPASS. See TEMP/ruzu-task-empty-count-probe/results.json, finalGPUlog.
+- No liveprocess remains; all build/test handles terminal. DIFF verified/updated. Branch research/eden-nx2-port unchanged. Goalplayable20FPSNOTachieved.
+NEXT: connect MeshComputeOutput to generatedvertex + actualfragment/currentframebuffer graphics pipeline, issueindirectdraws andFreeDeferredoutputafterrecording. dispatch_mesh_programs/dispatch_mesh_stage andcurrent_mesh_compute_programs nowexist andhaveactualgameexecutionevidence, so avoid further isolated transport scaffolding. Needgraphics layout binding foroutputSSBO separatelyfromguestfragmentresources (doNOTpretend output isguestcbuf-backedSSBO). GraphicsPipeline create_descriptor_layout mustappend explicitoutputbinding/bankcount, resourceprep mustappend outputentry beforeconfigure_draw; shadercache key/fixedstate stillownedbypipeline_cache. Reuse existing graphics fixedstate/dynamicstate/query/feedback handling. Probe flag remainsoptin/onceperprogram(max32),normalgamepathnotactivated. ShaderCache::new_mesh_compute mustbe sole channel dirtyflagconsumer when productionmeshconsumerenabled.
+
+## 2026-11-08 - src/shader_recompiler/src/backend/spirv/emit_spirv.rs vs src/shader_recompiler/backend/spirv/emit_spirv.cpp/.h
+
+### Intentional differences
+- Added emit_mesh_vertex_spirv_with_info returning the generated ShaderInfo together with SPIR-V; existing code-only entry point delegates and preserves its API. The returned info is the actual DefineMeshVertexOutputs result, not reconstructed synthetic resource declarations. Required by the graphics pipeline and fragment previous-stage interface.
+- Re-read upstream EmitSPIRV and header: program.info remains the metadata owner alongside emitted code. The generator remains the documented compute-mesh consumer adaptation.
+
+### Unintentional differences (to fix)
+- None identified in this mechanical metadata-return change.
+
+### Missing items
+- Mesh graphics cache/compiler and actual draw caller are resumed next.
+
+### Binary layout verification
+- SPIR-V emission order and output buffer layout unchanged; no serialized format changed. cargo check -p video_core passed; full validation follows this pass.
+
+## 2026-11-08 ? src/video_core/src/renderer_vulkan/graphics_pipeline.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp/.h
+
+### Intentional differences
+- Compute-backed mesh consumer appends one explicit vertex STORAGE_BUFFER binding after all guest descriptors, including its allocation-bank count and template entry. It is not a guest constant-buffer-addressed resource. Original Eden-NX2 has no mesh transport; Eglantine 900ab5a8 uses native mesh shaders instead.
+- This consumer uses ordinary descriptor sets so transport VkDescriptorBufferInfo stays in the same representation as its update template; existing normal graphics descriptor selection is unchanged.
+- SetEngine resets draw-scoped output metadata. Task/mesh image views join fragment views before original UpdateRenderTargets, CheckFeedbackLoop and ConfigureDraw ordering. Ownership remains in the matching graphics pipeline file.
+### Unintentional differences (to fix)
+- None identified within this descriptor/output integration slice by rereading original constructor/ConfigureImpl/ConfigureDraw and matching header plus Eglantine reference.
+### Missing items
+- End-to-end visual validation pending; native task/mesh extension is replaced by previously audited compute transport.
+### Binary layout verification
+- PASS: output descriptor uses Vulkan DescriptorBufferInfo and existing typed template entries; no new guest ABI structure or serialization.
+
+## 2026-11-08 ? src/video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.cpp/.h
+
+### Intentional differences
+- Separate in-memory graphics cache owns generated vertex + actual guest fragment pipelines, keyed by all original shader hashes and refreshed fixed state. Synchronous creation uses the original builder/render-pass machinery. Mesh topology overrides only the cloned key; persistent guest key remains intact for subsequent ordinary draws.
+- Generated vertex ShaderInfo feeds original MakeRuntimeInfo preceding-stage stores for fragment compilation. Output SSBO binding follows guest descriptor declarations (not array elements), with final unified binding checked after fragment SPIR-V emission.
+- RUZU_NX2_MESH_DRAW flag selects this compute-backed adaptation; ordinary pipeline lookup remains unchanged when absent. Native Eglantine mesh stage creation is not available on RX5700XT.
+### Unintentional differences (to fix)
+- None identified in this slice after rereading MakeRuntimeInfo, pipeline creation/cache ownership and header. Full parity of previously unsupported generated interfaces is not claimed.
+### Missing items
+- Persistent disk serialization of generated mesh graphics pipelines; visual runtime validation pending.
+### Binary layout verification
+- PASS: existing key/descriptor types reused. Focused descriptor-array regression added.
+
+## 2026-11-08 ? src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp/.h
+
+### Intentional differences
+- Optional compute-backed direct mesh draw executes actual task/mesh stages, binds generated vertex and guest fragment, configures current framebuffer and original dynamic state/query/feedback flow, then draws each GPU-written 16-byte indirect header. Output allocation is freed deferred only after command recording. Reference Eglantine Draw uses native DrawMeshTasksEXT with MakeDrawParams.num_vertices groups.
+- Topology, restart and vertex-input overrides describe generated output; dirty flags restore guest restart/bias/input on later ordinary draws. Compute output dependency now reaches ALL_GRAPHICS and DRAW_INDIRECT to include fragment consumers of guest writes.
+- Indirect task/mesh guest launches are explicitly rejected, matching Eglantine DrawIndirect's unsupported-layout policy; rejection happens before configuring a consumer that has no output buffer.
+### Unintentional differences (to fix)
+- None identified within command ownership/order slice after rereading original PrepareDraw/MakeDrawParams and pinned Eglantine Draw/DrawIndirect and header. Runtime validation pending.
+### Missing items
+- Guest indirect mesh launch layout remains unsupported as in the extension reference. Playability/performance target remains unfulfilled.
+### Binary layout verification
+- PASS: cmd_draw_indirect drawCount=1 reads each existing 4-u32 header at output offset + record*stride_bytes; no multiDrawIndirect feature assumption.
+
+## 2026-11-08 ? src/shader_recompiler/src/backend/spirv/emit_spirv.rs vs shader_recompiler/backend/spirv/emit_spirv.cpp and emit_spirv_instructions.h
+
+### Intentional differences
+- Generated vertex helper now returns the exact Info produced by DefineMeshVertexOutputs alongside its words. Existing code-only API delegates unchanged. This is host fallback metadata; pinned native mesh emission has no generated vertex consumer.
+### Unintentional differences (to fix)
+- None identified: emission, entry point, capabilities and finalization order unchanged on reread.
+### Missing items
+- No new missing item in metadata exposure slice; earlier unsupported interfaces remain explicit errors.
+### Binary layout verification
+- PASS: no changed shader/output binary layout; regression asserts advertised output components and absence of invented guest storage descriptor. shader_recompiler: 659 tests passed, doc tests passed.
+
+## 2026-11-08 ? src/video_core/src/texture_cache/format_lookup_table.rs vs video_core/texture_cache/format_lookup_table.cpp/.h
+
+### Intentional differences
+- None in this correction. Match guards represent the two adjacent C++ case labels.
+### Unintentional differences (to fix)
+- FIXED: missing S8Z24/UNORM/UINT/UNORM/UNORM/LINEAR case previously fell back to A8B8G8R8Unorm. Pinned original 50fa86bb explicitly maps it to D24_UNORM_S8_UINT, alongside UNORM/UINT/UINT/UINT. Both now map to D24UnormS8Uint. Found repeated format=43 components=(2 4 2 2) in real mesh-graphics run.
+### Missing items
+- None in this mapping correction. No claim that this alone explains incomplete scene geometry.
+### Binary layout verification
+- PASS: no descriptor decoding/layout changes; corrected pixel-format selection only. Added both-encoding regression. Re-read cpp/h after implementation; full video_core tests pending.
+
+### Mesh graphics integration validation follow-up
+- shader_recompiler659PASS/docPASS; video_core1712PASS1ignored/docPASS (142.32s), additional binding-index regression PASS. Initial concurrent targeted link failed with Windows LNK1104 because full suite executable was still running; repeated only after full suite exited, passed. Release CLI passed (1m30).
+- Real ROM run TEMP/ruzu-nx2-live-mesh-graphics-20261108-031831 PID4628 startUTC2026-11-08T02:18:34.7198251Z: at least1025 compute-backed graphics draw records logged, including real two-child task output, drawn=true. No mesh pipeline/transport errors or DEVICE_LOST observed. Window reached incomplete desert/sky by127s, final reported8FPS, not playable20FPS. Exact process identity checked then stopped; logs/perf/screenshots retained. Runtime JSON exited. This run precedes S8Z24 correction.
+
+Validation follow-up for S8Z24: full cargo test -p video_core PASS (1714 tests,1ignored,docPASS,116.19s), releaseCLI PASS (1m27), logs nx2-mesh-depth-video-full.log and nx2-mesh-depth-release.log. No source changes after these checks.
+
+Real ROM after S8Z24 correction: TEMP/ruzu-nx2-live-mesh-graphics-20261108-032507, PID23120 startUTC2026-11-08T02:25:10.5606864Z; identitychecked and stopped, runtimeJSONexited. Final capture shows desert road, lamps and terrain, still missing/black geometry and small pink artifacts; no playability proof. Runtime summary: {"last_sample_s": 174.07, "last_30s_fps_median": 7.0, "last_30s_fps_min": 7.0, "last_30s_fps_max": 7.5, "last_logged_mesh_draw": ["8192", "1", "1", "true"], "mesh_pipeline_errors": 0, "mesh_transport_errors": 0, "device_lost": 0, "bad_depth_tuple": 0, "unmapped_device_reads": 1, "visual": "Desert road, lamps and terrain visible; black/missing geometry and tiny pink artifacts remain; no demonstrated playability"}
+
+## 2026-11-08 ? src/common/src/thread.rs vs common/thread.cpp/.h
+
+### Intentional differences
+- Rust UTF-16 encoding with a terminating zero replaces UTF8ToUTF16W. Dynamic GetProcAddress on loaded KernelBase retains upstream optional-API behavior for MSVC; other target branches unchanged.
+### Unintentional differences (to fix)
+- FIXED: SetCurrentThreadName silently ignored Windows, unlike original50fa86bb MSVC implementation. It now calls the resolved SetThreadDescription on GetCurrentThread.
+### Missing items
+- No missing item in Windows naming slice; no claim of full platform completion.
+### Binary layout verification
+- PASS: Windows system calling convention, HANDLE and UTF16 pointer types match API. Unicode name regression reads actual GetThreadDescription result and frees allocated string with LocalFree. Initial test incorrectly required HRESULT==0; corrected to HRESULT>=0 after actual positive success0x10000000. Full common422PASS/doc1ignored.
+
+## 2026-11-08 ? src/video_core/src/gpu_thread.rs vs video_core/gpu_thread.cpp/.h
+
+### Intentional differences
+- Profile::Report is called at loop top with explicit default label and the same Idle/Push/Tick/Run/FlushInvalidate scopes around existing queue operations. Original StartThread lambda lives in Rust run_thread, same file. Rust RAII handles timing scopes without changing command/fence ordering.
+### Unintentional differences (to fix)
+- FIXED within profiling slice: existing nx2_profile owner had no GPU-thread report call or operation scopes, so its counters were never emitted.
+- Broader pre-existing scheduler difference observed: pinned original has pending-channel resume/poll and optional GpuSplit branches absent from this run_thread. This is structural/lifecycle work outside the diagnostic hookup; needs separate prerequisite audit before implementing those paths. No fake timing zones added for absent operations.
+### Missing items
+- Pending-channel/GpuSplit paths and their profiling are not claimed ported by this slice.
+### Binary layout verification
+- N/A: host-only timing, no guest data layout changes. Existing lifecycle tests and profile nested/exclusive timing tests cover reused mechanisms; full video tests pending.
+
+## 2026-11-08 ? src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.cpp/.h
+
+### Intentional differences
+- Restored original Draw, FlushWork, PipelineLookup, Configure, DynamicState, DrawRecord, Clear and Compute profile scopes in their existing Rust owners. Shared prepare_draw owns Draw scope for both entry points. Mesh fallback additionally charges transport work to Compute and synchronous task readback Finish to Fence, so existing exclusive accounting distinguishes GPU waiting from resource preparation. Native reference has no fallback readback.
+### Unintentional differences (to fix)
+- FIXED: these existing renderer phases previously lacked upstream profile scopes. No drawing semantics/control flow changed.
+### Missing items
+- Fine-grained ConfigureImpl inner zones remain outside this hookup; Configure reports their aggregate. Full renderer profiling completion not claimed.
+### Binary layout verification
+- N/A: diagnostic host timing only. Re-read original cpp/h and reviewed RAII end boundaries after patch; full tests pending.
+
+Profile hook validation: full common422PASS,2integrationPASS,doc1ignored (nx2-profile-thread-common-full-final.log); video_core1714PASS1ignored/docPASS120.99s (nx2-profile-hooks-video-full.log). Session5391terminal0. Windows naming test initially assumed HRESULT==0; actualsuccess0x10000000 required standard nonnegative-success assertion. Both full suites then passed. Release/live profiling still pending while oldbinary longrun confirms interactive menus.
+
+2026-11-08 diagnostic extension to vk_rasterizer.rs TickFrame: with existing EDEN_NX2_GPU_PROFILE only, sample VMA heap budgets/usage/blockBytes/allocationBytes/counts every120frames after original cache housekeeping. This intentional host diagnostic is absent upstream; it does not change budget flags, cache policy or resource lifetime. Re-read original TickFrame cpp/h ordering. Fullvideo tests and release rebuild pending.
+
+Heap-profile validation: video_core1714PASS1ignored/docPASS110.45s; optimized CLI build PASS3m12. Logs nx2-profile-memory-video-full.log / nx2-profile-memory-release.log. New profiling run starts with exact validated sources.
+
+
+## 2026-11-08 - src/video_core/src/engines/maxwell_3d.rs vs src/video_core/engines/maxwell_3d.h/.cpp (50fa86bb)
+
+### Intentional differences
+- CallMacroMethod temporarily owns the parameter vector to avoid Rust aliasing. Its shared callback now reproduces the complete RefreshParameters wrapper (current_macro_dirty guard) before RefreshParametersImpl; both native and legacy execution receive this callback. No method or constant moved.
+
+### Unintentional differences (to fix)
+- Fixed in this slice: callback previously bypassed the header wrapper and unconditionally reread clean DMA segments at High GPU accuracy. This could replace already captured FIFO words and repeatedly flush texture/buffer caches.
+
+### Missing items
+- None for this dirty-guard correction. Broader renderer/mesh correctness, memory exhaustion and performance remain unresolved.
+
+### Binary layout verification
+- PASS: no layout or serialized payload changed; parameter words remain u32.
+- Re-read pinned header RefreshParameters, cpp RefreshParametersImpl and macro.cpp native Execute after implementation; guard, High accuracy check, segment order, safe ReadBlock and post-execution cleanup match.
+- Regression added to maxwell_3d_test.rs actual CallMacroMethod path: clean 42 retained versus backing 73, dirty refreshed to 73, then clean 42 retained again; exercised in isolated interpreter, memo and JIT configurations. Validation pending.
+
+
+## 2026-11-08 - src/video_core/src/texture_cache/texture_cache.rs vs src/video_core/texture_cache/texture_cache.h/.cpp (50fa86bb)
+
+### Intentional differences
+- OnceLock stores the process-static EDEN_NX2_TC_MIN_AGE diagnostic setting; CString/libc strtoull preserve the original numeric conversion. Rust static is shared across generic instantiations; environment is process-wide.
+
+### Unintentional differences (to fix)
+- Fixed missing minimum-age override in RunGarbageCollector configuration. Default remains zero; normal ages 50/25/10 and iteration limits 10/20/40 are unchanged. No memory budget or allocation policy change.
+
+### Missing items
+- None for the optional minimum-age override. OOM diagnosis remains open.
+
+### Binary layout verification
+- PASS: no binary structures changed.
+- Re-read header Configure lambda and explicit-instantiation cpp after change; max(age,min_age) applied in original order, before iteration count in both GC passes. Isolated regression retains image age100 at override150 under critical pressure, then evicts at age200. Validation pending.
+
+Validation for both 2026-11-08 slices above: native macro focused PASS in interpreter/memo/JIT subprocesses; minimum-age isolated regression PASS. Final cargo test -p video_core:1715 passed,1ignored,docPASS113.20s (nx2-macro-dirty-video-full-final.log). Release ruzu-cmd build PASS1m41 (nx2-macro-dirty-release.log).
+
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs src/video_core/renderer_vulkan/vk_rasterizer.h/.cpp (50fa86bb; mesh extension 900ab5a8)
+
+### Intentional differences
+- RUZU_NX2 mesh launch switches are existing port-specific controls for the compute fallback. Cache their first value with function-local OnceLock, matching upstream static diagnostic lifetime and avoiding Windows getenv allocation on every draw. Runtime changes to these launch-only environment variables no longer affect this path. No helper, resource ownership or constants moved.
+
+### Unintentional differences (to fix)
+- No new discrepancy in draw/lookup ordering; only switch evaluation cached. Mesh render defects and OOM remain unresolved.
+
+### Missing items
+- No additional prerequisites for switch caching.
+
+### Binary layout verification
+- PASS: no payload or descriptor layout change.
+- Re-read original and extension Draw/CurrentGraphicsPipeline owners and headers after change; existing port-specific gating remains at the same points. Full crate validation pending.
+
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/pipeline_cache.rs vs src/video_core/renderer_vulkan/vk_pipeline_cache.h/.cpp (50fa86bb; mesh extension 900ab5a8)
+
+### Intentional differences
+- RUZU_NX2 mesh launch switches are existing port-specific controls for the compute fallback. Cache their first value with function-local OnceLock, matching upstream static diagnostic lifetime and avoiding Windows getenv allocation on every draw. Runtime changes to these launch-only environment variables no longer affect this path. No helper, resource ownership or constants moved.
+
+### Unintentional differences (to fix)
+- No new discrepancy in draw/lookup ordering; only switch evaluation cached. Mesh render defects and OOM remain unresolved.
+
+### Missing items
+- No additional prerequisites for switch caching.
+
+### Binary layout verification
+- PASS: no payload or descriptor layout change.
+- Re-read original and extension Draw/CurrentGraphicsPipeline owners and headers after change; existing port-specific gating remains at the same points. Full crate validation pending.
+
+Final switch-cache validation: cargo test -p video_core1715PASS1ignored/docPASS111.12s; releaseCLI PASS1m22; session31811terminal0. Logs nx2-mesh-switch-cache-video-full.log and nx2-mesh-switch-cache-release.log.
+
+
+## 2026-11-08 - src/video_core/src/buffer_cache/memory_tracker_base.rs vs src/video_core/buffer_cache/memory_tracker_base.h (50fa86bb)
+
+### Intentional differences
+- Existing Rust bounds guard remains for addresses outside the real 36-bit device space; upstream array indexing would be undefined there. No separate cpp exists upstream for this template.
+
+### Unintentional differences (to fix)
+- Fixed MAX_CPU_PAGE_BITS34->36 in its upstream owner. Previously valid device addresses >=16GiB were discarded, skipping CPU/GPU dirty tracking. Actual ROM logged0x431262B00. SMMU and BufferCache page table already use36bits. Top tier now16384entries, matching upstream.
+
+### Missing items
+- None for address-width prerequisite; shader-resource investigation resumes after validation.
+
+### Binary layout verification
+- PASS: no guest ABI change. Host top tier expanded to original36-bit geometry; higherpage22bits, pooled manager count32 and WordManager layout unchanged.
+- Reread header constants and IteratePages/IteratePairs after implementation; methods/control remain unchanged. Regression covers actualgame highregion, crossing16GiB andlast64GiBpage, CPUdirty clear/reset andGPUdownload/clear. Existing invalid-address guard test nowuses trulyinvalid>64GiBaddress.
+
+## 2026-11-08 - src/video_core/src/buffer_cache/buffer_cache.rs vs src/video_core/buffer_cache/buffer_cache.h/.cpp (50fa86bb)
+
+### Intentional differences
+- Failed-binding debug message includes descriptor/GPUaddress/size/alignedmapping for live diagnosis; no additional memory read.
+
+### Unintentional differences (to fix)
+- Restored original debuglevel for normal missingSSBO; restored assertion whenalignedmappingexists butunalignedmappingdoesnot, previously silentlyreturnedNULL.
+
+### Missing items
+- Missinggamegeometry rootcause stillunderinvestigation; no assumption that allNULLbindingsareerrors.
+
+### Binary layout verification
+- PASS: bindingaddress/size/layoutunchanged.
+- Reread header StorageBufferBinding and explicit-instantiation cppafterimplementation; size heuristic/alignment/rounding/orderunchanged. Focusedstorage11testsPASSincludingassertionregression.
+
+36-bit tracker/SSBO parity finalvalidation: focused tracker3PASS, storage11PASS; full cargo test -p video_core1717PASS1ignored/docPASS111.49s (nx2-memory-tracker-36-video-full.log); release ruzu-cmd PASS1m26 (nx2-memory-tracker-36-release.log), session14373terminal0.
+
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/staging_buffer_pool.rs vs src/video_core/renderer_vulkan/vk_staging_buffer_pool.h/.cpp (50fa86bb)
+
+### Intentional differences
+- At existing Result-to-Option allocationboundary, log originalVulkanerror/requestsize/usage andheapbudgets before returningNone. Upstreampropagatesexception; Rustpreviouslydiscardederror. Diagnostics onlyuponfailure, no retries, no allocationflag/GC/lifecyclechanges.
+
+### Unintentional differences (to fix)
+- No newbehavioraldifference; actualtextureuploadallocationfailureat92.6s remainsunderinvestigation.
+
+### Missing items
+- Realfailurecode/size/heapstate require nextrun.
+
+### Binary layout verification
+- PASS: bufferusage/size/alignment andStagingBufferRef layoutunchanged. Re-readcppCreateStagingBuffer andheaderafterimplementation. Fullcratevalidationpending.
+
+Stagingfailurediagnostics validation: fullvideo1717PASS1ignored/docPASS132.79s; release1m26PASS, session24351terminal0; logs nx2-staging-failure-video-full.log/nx2-staging-failure-release.log.
+
+## 2026-11-08 - src/video_core/src/buffer_cache/buffer_cache.rs vs src/video_core/buffer_cache/buffer_cache.h/.cpp
+
+### Intentional differences
+- Verified against Eden-NX2 50fa86bbbc403ad565eb44fcc281f16f77c69e15, re-reading UpdateVertexBuffer and the cpp explicit channel-cache instantiation after implementation. Both existing Rust resolution paths retain ownership in buffer_cache.rs; the resolver closure path adapts GPU memory borrowing.
+- Rust assert replaces the upstream runtime_error for enabled native streams exceeding u32. Validation precedes address translation in both paths. Unsigned arithmetic uses wrapping operations.
+
+### Unintentional differences (to fix)
+- None identified in this slice. Fixed both UpdateVertexBuffer paths previously reading the legacy limit in native mode; now use shared-context native_turing and NativeVertexStreamSize, exactly as upstream. Null binding, 64 MiB scan threshold, translation and binding update order preserved.
+
+### Missing items
+- None for native vertex size selection. Whole emulator completion/performance remains unverified.
+
+### Binary layout verification
+- PASS: no structure or serialized payload changes; existing native size accessor decodes the upstream 40-bit register pair. Focused tests cover shared native context, legacy range, zero size, disabled oversized stream, and enabled oversized rejection before translation in both paths.
+
+## 2026-11-08 - src/video_core/src/dirty_flags.rs vs src/video_core/dirty_flags.cpp/.h
+
+### Intentional differences
+- Re-read original Eden-NX2 50fa86bbbc403ad565eb44fcc281f16f77c69e15 header FillBlock overloads and cpp SetupDirtyVertexBuffers after implementation. Rust fill_block_both preserves both table writes and the original array/native-size/legacy-limit ordering.
+
+### Unintentional differences (to fix)
+- None in this slice: restored the missing native vertex size register pair at 0x600 / sizeof(u32) + i * 2, with per-stream and aggregate dirty flags for all 32 streams.
+
+### Missing items
+- None for native vertex size invalidation. Regression writes both words of every pair through Maxwell3D and verifies only the corresponding stream plus aggregate flag are dirtied.
+
+### Binary layout verification
+- PASS: no layouts changed; exact upstream register indices and two-word ranges preserved.
+
+Validation of native vertex size and dirty-table slices: focused native_vertex 4 passed; final cargo test -p video_core 1720 passed, 1 ignored, doc tests passed (113.59s). Release ruzu-cmd build passed (2m06); subsequent edits were confined to cfg(test) fixture setup/import. git diff --check passed for both files.
+
+## 2026-11-08 - src/core/src/hle/kernel/svc/svc_synchronization.rs vs src/core/hle/kernel/svc/svc_synchronization.cpp and svc.h
+
+### Intentional differences
+- Re-read Eden-NX2 50fa86bbbc403ad565eb44fcc281f16f77c69e15 ResetSignal and its svc.h declarations (there is no svc_synchronization.h). The readable-event path retains scoped Arc ownership, but acquires its Rust wrapper mutex before an outer scheduler guard, calls the upstream-owned reset method, and explicitly releases the wrapper before scheduler unlock can switch fibers. Eden embeds objects without this sleeping mutex. This matches the existing KEvent wrapper adaptation and removes a Rust-only suspend-with-mutex window.
+- Process lookup borrow is dropped before calling the readable event; result codes and readable-before-process lookup order remain unchanged.
+
+### Unintentional differences (to fix)
+- Pre-existing process-reset branch resolves only the current process ID, whereas upstream typed handle lookup can resolve any process handle. This needs process-handle ownership work beyond the readable-event deadlock slice; not used by the observed stuck ResetSignal path.
+
+### Missing items
+- General process-handle reset support remains outside this slice. No completion claimed for the synchronization subsystem.
+
+### Binary layout verification
+- PASS: no structures or ABI payload changes. An isolated scheduler-callback regression exercises event operation results and verifies both wrapper mutexes can be acquired at every outer scheduler unlock.
+
+## 2026-11-08 - src/core/src/hle/kernel/svc/svc_event.rs vs src/core/hle/kernel/svc/svc_event.cpp and svc.h
+
+### Intentional differences
+- Re-read original SignalEvent/ClearEvent and svc.h declarations after implementation. Existing KEvent::signal_arc/clear_arc adapt Eden's embedded readable object without retaining an outer KEvent mutex across scheduler rescheduling. Direct readable ClearEvent explicitly releases its mutex before the outer scheduler guard, preserving the event-before-scheduler acquisition order used by existing KEvent wrappers.
+
+### Unintentional differences (to fix)
+- None newly identified in the changed event signal/clear paths. Restored the small missing system-applet SignalEvent best-effort branch: program ID mask 0xFFFFFFFFFFFFFF00 == 0x0100000000001000, known event signaled, unknown handle warned/ignored, success returned as upstream.
+
+### Missing items
+- CreateEvent resource-reservation/lifetime differences predate this slice and are not claimed fixed. Full event lifecycle parity remains outside this change.
+
+### Binary layout verification
+- PASS: no layout or serialized data changes; handle validation, writable-before-readable clear order, reset invalid-state versus clear success preserved. Regression includes normal invalid handles and applet mask boundaries.
+
+Validation limitation for event SVC slice: cargo test -p core failed with shared-state test failures then STATUS_STACK_BUFFER_OVERRUN. Sequential full suite failed with STATUS_ACCESS_VIOLATION in k_thread::tests::wait_cancel_pushes_runnable_thread_through_state_change_handler. Repeated sequential suite with ONLY the two changed SVC files restored to HEAD (all other working-tree files identical) reproduces the same access violation at the same test: nx2-event-svc-core-baseline.log. Current edits restored automatically and confirmed; no full-core PASS claimed. Focused event/synchronization validation and runtime verification continue.
+
+Event SVC final focused validation: all 13 svc_synchronization/svc_event tests passed individually in isolated processes (nx2-event-svc-isolated.log), including scheduler-unlock mutex availability regression. Running the synchronization module as a suite also reproduces stale global-state access violation; isolated tests avoid that harness lifetime issue. Release build passed in 3m20 (nx2-event-svc-release.log), session71242 terminal0. Full-core failure remains documented above; no full-core green claim.
+
+## 2026-11-08 - src/shader_recompiler/src/ir_opt/global_memory_to_storage_buffer_pass.rs vs src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp and passes.h
+
+### Intentional differences
+- Re-read pinned Eden-NX2 50fa86bbbc403ad565eb44fcc281f16f77c69e15 ReplaceLoad, ReplaceAtomic, ReplaceWrite and passes.h declaration after implementation; no individual header exists. Stable Rust InstRef slots replace C++ intrusive instruction pointers.
+- Existing CAS operand preservation remains: Rust carries all comparator/replacement operands while this original upstream helper forwards only Arg(1). This prior CAS extension is unchanged by the identity replacement slice.
+
+### Unintentional differences (to fix)
+- None identified in replacement lifecycle after correction: removed per-replacement whole-program arg/phi/syntax scanning. Load and atomic replacements now call existing Inst::replace_uses_with, leaving Identity(replacement) at the old definition exactly as upstream; they no longer invalidate that definition. Stores still invalidate as upstream. This removes quadratic scans observed in live GPU-thread shader compilation.
+
+### Missing items
+- None for the changed replacement helpers. Broader shader performance and mesh fallback readback stalls remain separate investigations; no subsystem completion claimed.
+
+### Binary layout verification
+- PASS: no binary payload changes. Stable instruction identity and cross-block/phi users remain unchanged until identity cleanup. New regression verifies both load/atomic aliases and cleanup results; existing atomic return test now verifies upstream intermediate Identity before cleanup. SPIR-V emission already maps Identity to its argument ID; DCE recomputes use counts.
+
+Global-memory replacement validation: focused6 PASS; full shader_recompiler660 PASS/docPASS; full video_core1720 PASS1ignored/docPASS (111.63s); release ruzu-cmd PASS1m29. Sequential session39268 terminal0. Diff whitespace check passed. Runtime gain not yet verified.
+
+## 2026-11-08 - src/video_core/src/macro.rs vs src/video_core/macro.cpp and macro.h (native execution JIT state)
+
+### Intentional differences
+- ExecuteNative remains the Rust native branch of upstream MacroEngine::Execute. Its existing temporary execution-state lease permits emitted uploads to reenter the channel owner without overlapping mutable borrows.
+- The interpreter lease is now acquired only after the JIT branch. Upstream keeps native_interpreter in place and its JIT uses only active_dram; Rust no longer copies and zero-initializes the 0xc00-word interpreter RAM for every JIT call. Non-JIT memo/interpreter paths retain their previous lease and restoration, including early returns. active_dram is still updated before execution, and channel RAM is still shared with callbacks.
+- Focused existing dual-process JIT=0/JIT=1 channel/upload regression in engines/maxwell_3d_test.rs additionally verifies fallback RAM contents survive and active_dram retains the correct channel identity.
+
+### Unintentional differences (to fix)
+- None introduced in this slice. Existing Rust wrapper costs (locks, Arc handles, small execution-state leases) remain; this change does not claim full macro subsystem parity or 20 FPS.
+
+### Missing items
+- None required for this correction. Real-game performance after rebuilding remains to be measured.
+
+### Binary layout verification
+- PASS: no guest binary layout, instruction encoding, channel RAM size, or method/constant ownership changed. Re-read original macro.cpp native JIT/memo/interpreter control flow and macro.h state declarations at origin/eden-nx2 after the edit.
+
+Validation for native JIT interpreter lease: focused shared-channel regression passes with JIT=0 and JIT=1; full cargo test -p video_core passes (1720 tests, 1 ignored, doc tests pass); release CLI build passes. Real-game comparison pending.
+
+## 2026-11-08 - src/core/src/hle/kernel/k_server_session.rs vs src/core/hle/kernel/k_server_session.h/.cpp (HLE close reply)
+
+### Intentional differences
+- Existing Rust unlocked Arc/Mutex reply adapter remains to avoid scheduler/session lock inversion; upstream uses a light-lock. The explicit bool replaces the C++ defaulted parameter.
+- SendReplyHLE now accepts the upstream session_closed flag. The HLE closed predicate includes client missing, client endpoint closed, or service-requested closure; both server return and client EndWait receive Kernel::ResultSessionClosed. Normal replies still return success. Request finalization, scheduling, async error delivery, and wrapper-lock release order are unchanged.
+
+### Unintentional differences (to fix)
+- None identified in the changed closure-result path after re-reading original header and implementation. This audit does not assert full kernel parity.
+
+### Missing items
+- None required for this slice. Runtime confirmation remains pending.
+
+### Binary layout verification
+- PASS: no IPC wire or guest object layout changed. Kernel transport result 0xf601 (SessionClosed) remains distinct from IPC service sentinel. The response payload still follows ServiceFrameworkBase, unchanged.
+
+## 2026-11-08 - src/core/src/hle/service/server_manager.rs vs src/core/hle/service/server_manager.h/.cpp (HLE close reply)
+
+### Intentional differences
+- Existing Rust unlocked Arc/Mutex reply adapter remains to avoid scheduler/session lock inversion; upstream uses a light-lock. The explicit bool replaces the C++ defaulted parameter.
+- CompleteSyncRequest now forwards service_result == IPC::ResultSessionClosed into SendReplyHLE before destroying the session, exactly as origin/eden-nx2. Previously the live client was awakened with success first. New isolated integration test exercises both normal and service-close replies, client wait result, request cleanup, and manager destruction.
+
+### Unintentional differences (to fix)
+- None identified in the changed closure-result path after re-reading original header and implementation. This audit does not assert full kernel parity.
+
+### Missing items
+- None required for this slice. Runtime confirmation remains pending.
+
+### Binary layout verification
+- PASS: no IPC wire or guest object layout changed. Kernel transport result 0xf601 (SessionClosed) remains distinct from IPC service sentinel. The response payload still follows ServiceFrameworkBase, unchanged.
+
+Validation for both HLE close-reply entries: focused new subprocess regression PASS; four server-manager close tests and existing kernel client-close reply test PASS in separate processes. Full cargo test -p core attempted, FAILED with STATUS_ACCESS_VIOLATION0xc0000005 and multiple kernel tests failing; no full-core success claimed. Similar baseline harness crashes are documented in the event-SVC validation, but this run was not separately baseline-compared. Release build pending.
+
+HLE close-reply release CLI build PASS (3m06); session32953 terminal0. Full core limitation above remains; runtime verification now launched.
+
+2026-11-08 runtime verification of HLE close-reply slice: same GP50cc passes decoder shutdown without svcBreak (count0), reaches actual driving and steering. Runtime summary TEMP/ruzu-nx2-live-close-reply-benchmark-20261108-061546/runtime-summary.json. 20FPS objective not met; measured start straight median8.5FPS, steering window median7.5FPS.
+
+## 2026-11-08 ? src/shader_recompiler/src/backend/spirv/emit_spirv_mesh.rs vs shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+
+### Intentional differences
+- Added task_mesh_workgroup_bound as a prerequisite for the compute transport on hardware without VK_EXT_mesh_shader. Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303 TaskEpilogue dispatches the exact value stored in payload word 1; native Vulkan needs no allocation-bound analysis. Original Eden-NX2 50fa86bb has no mesh implementation. The helper remains in the backend owner of TaskEpilogue/PayloadWord; MeshInfo remains unchanged.
+- Conservative unsigned intervals follow IsbeWriteAttribute byte-address shift and PayloadWord clamping literally, including unaligned bytes 4..7 and the special two-word payload case. Overflow, unknown instructions, cycles and recursion beyond 64 levels produce unknown ranges; an unknown count rejects the optimization. A BitCount32 result is bounded by 32 for every input, not by a sampled runtime count. No guest instruction/count is changed.
+- Re-read the extension implementation and emit_spirv_instructions.h declarations after implementation; checked write ownership, count-word addressing, payload clamp and epilogue count use against the Rust helper.
+
+### Unintentional differences (to fix)
+- None identified in this analysis prerequisite. It does not replace the existing execution path.
+
+### Missing items
+- GPU dispatch integration using the proven bound remains the interrupted next slice. Existing exact CPU readback stays active; this change alone cannot improve runtime FPS.
+
+### Binary layout verification
+- PASS: no serialized payload, descriptor, dispatch record or MeshInfo layout changed.
+
+## 2026-11-08 ? src/shader_recompiler/src/backend/spirv/spirv_emit_context.rs vs shader_recompiler/backend/spirv/spirv_emit_context.h/.cpp
+
+### Intentional differences
+- Added backend-owned mesh_task_count_guard state; default false. This host compute transport flag has no native EXT counterpart and changes no guest metadata.
+- Technical adaptation for RX5700XT without VK_EXT_mesh_shader; pinned Eglantine 900ab5a8 uses native TaskEpilogue/DrawMeshTasksEXT, while original Eden-NX2 50fa86bb lacks this extension. Re-read relevant upstream header and implementation and compared ownership, exact count, child IDs, payload association and ordering after the edit.
+
+### Unintentional differences (to fix)
+- None identified in this slice; device runtime validation remains pending and tests alone do not establish gameplay parity.
+
+### Missing items
+- Native mesh support and the previously documented indirect guest-mesh draw path remain outside this compute transport change. No new unsupported guest instruction is accepted.
+
+### Binary layout verification
+- PASS: dispatch record stays three u32 words/12 bytes; payload word1 and indirect headers retain their layout. Reserved records preserve their own firstVertex-derived output addresses even across inactive holes.
+
+## 2026-11-08 ? src/shader_recompiler/src/backend/spirv/emit_spirv.rs vs shader_recompiler/backend/spirv/emit_spirv.cpp and emit_spirv_instructions.h
+
+### Intentional differences
+- Added guarded compute entry variant, preserving existing entry API. The workgroup-uniform return is inserted in the host preheader, before payload import, guest phi labels, side effects and barriers. Direct meshes remain unguarded.
+- Technical adaptation for RX5700XT without VK_EXT_mesh_shader; pinned Eglantine 900ab5a8 uses native TaskEpilogue/DrawMeshTasksEXT, while original Eden-NX2 50fa86bb lacks this extension. Re-read relevant upstream header and implementation and compared ownership, exact count, child IDs, payload association and ordering after the edit.
+
+### Unintentional differences (to fix)
+- None identified in this slice; device runtime validation remains pending and tests alone do not establish gameplay parity.
+
+### Missing items
+- Native mesh support and the previously documented indirect guest-mesh draw path remain outside this compute transport change. No new unsupported guest instruction is accepted.
+
+### Binary layout verification
+- PASS: dispatch record stays three u32 words/12 bytes; payload word1 and indirect headers retain their layout. Reserved records preserve their own firstVertex-derived output addresses even across inactive holes.
+
+## 2026-11-08 ? src/shader_recompiler/src/backend/spirv/emit_spirv_mesh.rs vs shader_recompiler/backend/spirv/emit_spirv_mesh.cpp and emit_spirv_instructions.h
+
+### Intentional differences
+- Compute guard compares the mapped guest child ID against the exact parent payload word1. Extra reserved children return without executing guest instructions; native TaskEpilogue creates only these exact children implicitly.
+- Technical adaptation for RX5700XT without VK_EXT_mesh_shader; pinned Eglantine 900ab5a8 uses native TaskEpilogue/DrawMeshTasksEXT, while original Eden-NX2 50fa86bb lacks this extension. Re-read relevant upstream header and implementation and compared ownership, exact count, child IDs, payload association and ordering after the edit.
+
+### Unintentional differences (to fix)
+- None identified in this slice; device runtime validation remains pending and tests alone do not establish gameplay parity.
+
+### Missing items
+- Native mesh support and the previously documented indirect guest-mesh draw path remain outside this compute transport change. No new unsupported guest instruction is accepted.
+
+### Binary layout verification
+- PASS: dispatch record stays three u32 words/12 bytes; payload word1 and indirect headers retain their layout. Reserved records preserve their own firstVertex-derived output addresses even across inactive holes.
+
+## 2026-11-08 ? src/video_core/src/renderer_vulkan/pipeline_cache.rs vs video_core/renderer_vulkan/vk_pipeline_cache.h/.cpp
+
+### Intentional differences
+- Cache owns proven task_workgroup_bound separately from unchanged MeshInfo; task-backed mesh emission enables the guard. Existing stages, descriptors and guest resources keep their owners.
+- Technical adaptation for RX5700XT without VK_EXT_mesh_shader; pinned Eglantine 900ab5a8 uses native TaskEpilogue/DrawMeshTasksEXT, while original Eden-NX2 50fa86bb lacks this extension. Re-read relevant upstream header and implementation and compared ownership, exact count, child IDs, payload association and ordering after the edit.
+
+### Unintentional differences (to fix)
+- None identified in this slice; device runtime validation remains pending and tests alone do not establish gameplay parity.
+
+### Missing items
+- Native mesh support and the previously documented indirect guest-mesh draw path remain outside this compute transport change. No new unsupported guest instruction is accepted.
+
+### Binary layout verification
+- PASS: dispatch record stays three u32 words/12 bytes; payload word1 and indirect headers retain their layout. Reserved records preserve their own firstVertex-derived output addresses even across inactive holes.
+
+## 2026-11-08 ? src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.h/.cpp
+
+### Intentional differences
+- Added bounded parent/child mapping and GPU-only task-to-mesh continuation. Allocation is selected only with a proof, addressable capacity, <=1MiB speculative output, and successful reservation; otherwise exact readback remains. The threshold selects a transport strategy and never clips guest work. Reserved output is zero-filled; inactive records yield zero indirect draws. The final dependency includes both transfer zero writes and compute output writes. Dispatch stage dependencies preserve task payload visibility; deferred allocation lifetimes remain unchanged.
+- Technical adaptation for RX5700XT without VK_EXT_mesh_shader; pinned Eglantine 900ab5a8 uses native TaskEpilogue/DrawMeshTasksEXT, while original Eden-NX2 50fa86bb lacks this extension. Re-read relevant upstream header and implementation and compared ownership, exact count, child IDs, payload association and ordering after the edit.
+
+### Unintentional differences (to fix)
+- None identified in this slice; device runtime validation remains pending and tests alone do not establish gameplay parity.
+
+### Missing items
+- Native mesh support and the previously documented indirect guest-mesh draw path remain outside this compute transport change. No new unsupported guest instruction is accepted.
+
+### Binary layout verification
+- PASS: dispatch record stays three u32 words/12 bytes; payload word1 and indirect headers retain their layout. Reserved records preserve their own firstVertex-derived output addresses even across inactive holes.
+
+## 2026-11-08 ? src/video_core/src/vulkan_common/vulkan_device.rs vs video_core/vulkan_common/vulkan_device.h/.cpp
+
+### Intentional differences
+- Added get_max_draw_indirect_count as a compute-mesh adaptation, beside upstream-owned property getters. The native EXT path needs no such getter; physical limits remain owned by Device. Existing multiDrawIndirect requirement and enablement are unchanged.
+
+### Unintentional differences (to fix)
+- None identified in this batching slice. Runtime throughput remains unproven.
+
+### Missing items
+- Previously documented native/indirect guest mesh support is unchanged.
+
+### Binary layout verification
+- PASS: 16-byte indirect headers remain embedded at the output-record stride; firstVertex and attribute layout are unchanged. Focused regression checks padded byte offsets, empty draws, device-limit splitting and offsets beyond 32 bits.
+
+## 2026-11-08 ? src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.h/.cpp
+
+### Intentional differences
+- Grouped compute-output indirect records using drawCount and actual padded stride, splitting at the physical maxDrawIndirectCount. Upstream ordinary DrawIndirect already forwards count and stride, while native mesh uses DrawMeshTasksEXT. Generated vertex outputs read VertexIndex/firstVertex, not DrawIndex; therefore batching preserves output addressing and zero-count holes. Checked headers, dispatch order, byte offsets, limits and overflow against the upstream declarations/implementations and existing transport after editing.
+
+### Unintentional differences (to fix)
+- None identified in this batching slice. Runtime throughput remains unproven.
+
+### Missing items
+- Previously documented native/indirect guest mesh support is unchanged.
+
+### Binary layout verification
+- PASS: 16-byte indirect headers remain embedded at the output-record stride; firstVertex and attribute layout are unchanged. Focused regression checks padded byte offsets, empty draws, device-limit splitting and offsets beyond 32 bits.
+
+## 2026-11-08 ? src/video_core/src/renderer_vulkan/vk_rasterizer.rs runtime verification of indirect batching
+
+### Intentional differences
+- Previously audited compute mesh adaptation exercised with Mario/Standard Kart/Mushroom Cup/50 cc. Actual acceleration and steering rendered successfully. Straight 20-sample median 11.5 FPS (10.99?12); steering 16-sample median approximately 11 FPS (5?13). This does not meet the 20 FPS goal.
+
+### Unintentional differences (to fix)
+- No new batching-specific rendering defect established on the race scene. Persistent countdown hitches and CPU task-count readback remain observable; no completion claim.
+
+### Missing items
+- Exact GPU count-driven execution is still a candidate; current guarded reservations include unused children. Two captured task shaders still fall back because LaneId bounds are not recognized.
+
+### Binary layout verification
+- PASS for exercised transport: padded records and firstVertex selection produce actual driving output with batching. Focused offset tests and full video suite (1722 passed, one ignored) passed before this runtime. No svcBreak, device loss or GPU allocation failure recorded in this run through measurement.
+
+## 2026-11-08 ? src/shader_recompiler/src/backend/spirv/emit_spirv_mesh.rs vs backend/spirv/emit_spirv_mesh.cpp and emit_spirv_warp.cpp
+
+### Intentional differences
+- Extended the compute-only task-count allocation proof with LaneId range 0..31. Original Eden-NX2 EmitLaneId (50fa86bb) reads subgroup invocation ID and masks with 31 for larger host warps; the Rust emitter and device profile use the same rule. No shader instruction or guest value is changed.
+- Re-read the upstream warp implementation/declaration and extension 900ab5a8 TaskEpilogue/IsbeWriteAttribute after the edit. All potentially aliasing payload writes still participate in the bound; unknown LaneId replacement rejects the proof.
+
+### Unintentional differences (to fix)
+- None identified in this range rule.
+
+### Missing items
+- GPU count-driven dispatch/draw remains unimplemented; this change only admits additional proven programs into the existing guarded reservation path.
+
+### Binary layout verification
+- PASS: no layout or serialization change. Regression exercises unknown destination aliasing with LaneId and BitCount32 writes; replacing the bounded value with unknown returns None. Full shader suite: 663 passed, doc tests passed.
+
+## 2026-11-08 ? src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs video_core/renderer_vulkan/vk_rasterizer.h/.cpp
+
+### Intentional differences
+- Compute-mesh adaptation now uses existing KHR DrawIndirectCount support to consume each parent's exact TaskEpilogue payload word1. Native extension 900ab5a8 emits exactly that many child groups via EmitMeshTasksEXT; the original rasterizer already owns ordinary DrawIndirectCount recording. The new branch avoids drawing unused reserved records and preserves parent order, padded output stride and firstVertex addressing.
+- Enabled only for successfully reserved output with a proven bound no greater than maxDrawIndirectCount and an available extension. The bound is an allocation proof, not an arbitrary clipping limit. All other cases retain batched indirect draws and existing exact readback selection.
+- MeshComputeOutput retains the payload allocation alongside output storage until graphics recording completes, including across descriptor rollover/submission. Both probe and drawing cleanup release it; error/empty paths release all allocations. Existing final COMPUTE/TRANSFER -> DRAW_INDIRECT memory dependency covers task count writes as well as output records. Deferred buffers already have INDIRECT_BUFFER usage.
+- Re-read the upstream header, DrawIndirectCount implementation and TaskEpilogue after the edit; checked offsets, control flow, ownership and retirement against the Rust implementation. No native mesh equivalent of this transport lifetime is needed upstream.
+
+### Unintentional differences (to fix)
+- None identified in this slice; runtime validation of the new branch remains pending.
+
+### Missing items
+- Exact indirect mesh compute dispatch remains unimplemented. Reserved mesh groups still execute a uniform count guard; inactive groups have no guest side effects.
+
+### Binary layout verification
+- PASS: unchanged 12-byte dispatch mappings, payload word1 at byte4, 16-byte draw headers embedded at the existing output stride. Regression checks three parents with nonzero payload offset and output/payload retention until consumer recording; focused test passed.
+
+## 2026-11-08 - emit_spirv_mesh.rs LaneId-bound runtime verification
+
+### Intentional differences
+- Existing compute adaptation exercised with all seven captured task bounds now recognized. Same Mario/Standard Kart/Mushroom Cup/50 cc configuration. Driving median12.49 FPS (20 samples,10.5-13.5); steering median10.49 (15 samples,3.5-15.49). No20FPS claim.
+
+### Unintentional differences (to fix)
+- No new rendering divergence identified in this slice. Countdown hitches remain; a steady sample waited for ASTC texture decompression.
+
+### Missing items
+- GPU DrawIndirectCount source passed full video suite (1723 passed,one ignored,doc tests passed); release/runtime validation pending. Exact indirect compute dispatch remains unimplemented.
+
+### Binary layout verification
+- PASS for exercised output: visible acceleration past start arch, left steering and item pickup; no svcBreak/device loss/device allocation failure. LaneId bound changes no binary layout.
+
+## 2026-11-08 - src/video_core/src/macro.rs vs video_core/macro.h/.cpp
+
+### Intentional differences
+- Native graphics execution now leases BasicMacroMemo only after the JIT branch returns, like the existing interpreter lease. Upstream keeps native_memo in MacroEngine and never accesses it on the JIT path. This removes eager movement/default initialization of 256 two-word slots on every native JIT call.
+- The interpreter fallback retains the same temporary ownership, synchronization, replay, generation checks and restoration after early returns. Shared code and generation remain in their upstream owner throughout emitted methods.
+- Re-read the upstream header and full JIT/memo/interpreter block after implementation; compared initialization, return paths, generation checks and restoration. Extended existing shared-context regression with seeded memo effects and JIT statistics, exercised alongside reentrant code uploads and channel RAM isolation.
+
+### Unintentional differences (to fix)
+- None identified in this local lease correction.
+
+### Missing items
+- Focused and full video validation pending; current live GPU-count executable does not include this change.
+
+### Binary layout verification
+- Not applicable: no guest structure or serialized layout changed. BasicMacroMemo fields and ownership remain unchanged.
+
+Validation update for macro.rs lazy memo lease: focused shared-context regression passed in JIT and interpreter subprocesses; full cargo test -p video_core passed (1723 passed,one ignored,doc tests passed). Runtime performance of this macro change is not yet measured.
+
+## 2026-11-08 - vk_rasterizer.rs GPU DrawIndirectCount runtime verification
+
+### Intentional differences
+- Same Mario/Standard Kart/Mushroom Cup/50 cc; visible driving and steering with count-buffer retention. Driving20samples median12.99FPS (9-15); steering15samples median11.49 (5.5-15). Previous Lane-only median12.49; modest observed gain, no20FPS claim.
+
+### Unintentional differences (to fix)
+- Blue-glowing trackside objects visible in this run; cause not established against prior captures. No isolated new count-path rendering failure proven. Countdown hitches remain; sampled CPU in DCE and VulkanWorker waiting for pipeline compilation.
+
+### Missing items
+- Exact indirect compute dispatch remains pending. Newly tested lazy macro memo lease is not included in this runtime; its release is building separately.
+
+### Binary layout verification
+- PASS for exercised parent/count/output lifetime and draw offsets: acceleration past arch, first turn, left steering and item pickup visible. No svcBreak/device loss/device allocation failure. Full video suite1723passed/oneignored before release1m25.
+
+## 2026-11-08 - shader_recompiler/src/ir/program.rs vs frontend/ir/program.h, value.h and microinstruction.cpp
+
+### Intentional differences
+- Existing indexed-reference adaptation Program::erase_inst now reads one argument at a time rather than allocating a temporary Vec of every InstRef. Upstream Inst::ClearArgs traverses arguments directly and UndoUse decrements each producer before unlinking pseudo associations; the Rust operation now follows that per-operand order.
+- Cross-block mutation remains in Program because Rust InstRef is an indexed reference rather than an upstream pointer. No new ownership boundary is introduced. Stable slots and Block::erase_inst remain unchanged.
+- Re-read upstream Program and Inst declarations, ClearArgs/UndoUse implementations after the edit; compared argument order, duplicate uses, phi uses, pseudo unlink and tombstone behavior.
+
+### Unintentional differences (to fix)
+- None identified in this local traversal correction. Separate existing DCE traversal differs: repeated physical block order instead of one post-order traversal; resolving it requires auditing callers/use-count construction and is outside this allocation correction.
+
+### Missing items
+- Runtime hitch impact not measured. Current live executable only includes the earlier macro memo lease change.
+
+### Binary layout verification
+- Not applicable: host IR only. New regression covers256 repeated cross-block phi uses plus an immediate and a surviving consumer. Existing duplicate argument/pseudo unlink tests pass. Full shader suite664passed/doc tests passed.
+
+## 2026-11-08 - macro.rs lazy memo lease runtime verification
+
+### Intentional differences
+- Same Mario/Standard Kart/Mushroom Cup/50 cc at1x. Acceleration/steering respond. Driving21samples median11FPS (8.5-15.99); steering15samples median10.5 (5.5-14.99). No performance gain established versus prior12.99median; scene/timing variability remains. No20FPS claim.
+
+### Unintentional differences (to fix)
+- No new macro behavior divergence identified. Prior blue-glowing trackside objects absent this run with same GPU-count code; cause remains unresolved.
+
+### Missing items
+- FPS target not met. Diagnostic half-resolution run will use identical binary to distinguish graphics scaling impact. IR argument traversal optimization remains unreleased and is excluded from these timings.
+
+### Binary layout verification
+- Not applicable to memo host ownership; visible driving, left steering and item pickup verified. Focused JIT/interpreter shared-context tests and fullvideo1723passed/oneignored/docs passed before release1m24.
+
+Runtime diagnostic2026-11-08: same macro/GPU-count binary at0.5x resolution (isolated config, no source change) did not establish useful FPSgain: straight median11.995,steering9.0. Returning to1x. Steady GPUengine median43.14percent and hostGPUthread69.17percent ofonecore motivate CPU-zone profiling. Detailed artifacts in TEMP/ruzu-nx2-live-half-resolution-benchmark-20261108-074833. No20FPS completion claim.
+
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/graphics_pipeline.rs vs video_core/renderer_vulkan/vk_graphics_pipeline.cpp/.h
+
+### Intentional differences
+- Restored all ten ConfigureImpl profiling scopes from Eden-NX2 50fa86bbbc403ad565eb44fcc281f16f77c69e15: SyncDescriptors, ReadHandles, FillImageViews, TextureBuffers, UpdateBuffers, DescriptorAcquire, BindStageBuffers, PushDescriptors, RenderTargets, ConfigureDraw. Rust RAII Scope destruction matches C++ block lifetimes, including early returns.
+- Existing Rust filename graphics_pipeline.rs and same-file resource helper remain unchanged; resource scopes also cover the existing compute-backed mesh caller of this helper. ConfigureDraw/RenderTargets remain with their actual graphics operations.
+- Header declarations and cpp scope boundaries re-read after implementation; compared each scope's first/last operation and ordering. No resource operation, constant, state ownership or synchronization was moved.
+
+### Unintentional differences (to fix)
+- None introduced by this profiling-only slice. This is not an audit of the entire pre-existing pipeline port.
+
+### Missing items
+- No missing ConfigureImpl profiling zones. Runtime subzone measurements require rebuilding and a new diagnostic run; current live process uses the earlier binary.
+
+### Binary layout verification
+- PASS (not applicable): only local RAII scopes added; no serialized structures changed.
+
+Validation: full cargo test -p video_core PASS (1723 passed, 1 ignored; doc-tests PASS), 120.06s; scoped git diff --check clean. Existing profiler nested-scope tests exercise RAII accounting; no new test mirrors the ten local scope declarations.
+
+
+## 2026-11-08 - src/video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp/.h
+
+### Intentional differences
+- Ported Maxwell3D::SkipSameValueWrites as the same owner's snake_case method with function-local LazyLock. Absent/empty environment enables it; any EDEN_NX2_SKIP_SAME value beginning with ASCII zero disables it, matching the header's first-character rule.
+- CallMethod now updates shadow RAM before comparing effective state-only values; unchanged values skip dirty propagation, and all non-executable writes return before ProcessMethodCall. Executable methods always mark dirty and execute, matching upstream.
+- ConsumeSinkImpl preserves tracking/replay order and skips unchanged effective state values under the same policy. Its tiny upstream local process lambda is mechanically repeated in Rust's three match arms to avoid conflicting mutable captures of self. Method ownership and ordering are unchanged.
+- Added the existing upstream MethodWrites/SameValueWrites counters before ProcessShadowRam, comparing incoming rather than replayed values, exactly as upstream.
+- Re-read the pinned Eden-NX2 50fa86bbbc403ad565eb44fcc281f16f77c69e15 header and cpp after implementation; compared helper initialization, dirty-mark conditions, shadow writes, side-effect path and sink clearing. ProcessDirtyRegisters itself remains unconditional.
+
+### Unintentional differences (to fix)
+- None in this slice. Broader previously documented front/back split scheduler differences remain outside this local non-split optimization.
+
+### Missing items
+- No missing helper/dependency for this change. Live FPS benefit remains unverified until a new unprofiled release run.
+
+### Binary layout verification
+- PASS: no register layout, flags layout or serialized payload changed. Only local branching and diagnostics added.
+
+Regression validation: focused subprocess test PASS for absent/empty/1/0/0disabled environment values, all four shadow modes, direct and sunk writes, changed values and repeated executable firmware effects. Corrected existing raw dirty-propagation test to call ProcessDirtyRegisters directly; CallMethod test now distinguishes the upstream skip policy. Full video tests pending.
+
+Full validation: cargo test -p video_core PASS, 1724 passed/1 ignored, doc-tests PASS (120.52s); focused subprocess checks PASS; scoped diffcheck clean.
+
+
+## 2026-11-08 - src/shader_recompiler/src/ir_opt/dead_code_elimination_pass.rs vs shader_recompiler/ir_opt/dead_code_elimination_pass.cpp and ir_opt/passes.h
+
+### Intentional differences
+- Restored one traversal of Program::post_order_blocks and reverse logical instruction order, matching Eden-NX2 50fa86bbbc403ad565eb44fcc281f16f77c69e15. Removed the physical-block fixed-point loop and repeated whole-graph recounts. The removal predicate now exactly matches no uses and no side effects, including Void instructions.
+- Retained one initial recompute_use_counts: the existing indexed Rust IR mutates operands directly rather than maintaining intrusive use counts eagerly. This materializes the upstream invariant before the pass; Program::erase_inst updates counts and pseudo links during removal.
+- A per-block stable-slot snapshot releases the Rust block borrow before cross-block use-count mutation. This is a mechanical traversal adaptation, not a new ordering or owner. Stable slots/tombstones preserve instruction-reference identity.
+- Re-read passes.h and complete upstream cpp after implementation, compared traversal list, instruction order, predicate, invalidation-before-erasure and absence of retries. Production translation already builds post_order_blocks from the structured root; it was not changed.
+
+### Unintentional differences (to fix)
+- None in this slice; no assertion of whole compiler parity.
+
+### Missing items
+- No missing prerequisite for the single-pass traversal. Runtime hitch improvement requires a separate release/run; the currently running SkipSame binary does not contain this change.
+
+### Binary layout verification
+- PASS (not applicable): no shader input/output or serialized payload layout changed.
+
+Regression: cross-block dead dependency chain is removed in consumer-first post-order, while allocated blocks absent from the supplied list remain untouched. Existing pseudo/phi/side-effect/stable-reference tests retained. Test-only fixtures in ir_opt/mod.rs, ir_opt/constant_propagation_pass.rs, backend/spirv/emit_spirv_mesh.rs, frontend/translate/mod.rs and frontend/translate/load_store_attribute.rs now explicitly provide their single-block post-order, the same invariant supplied by production translation. No production code in these five files changed for this slice; their upstream-owned translation/emission behavior is unchanged. Two initial fixture failures were traced to missing post-order lists and fixed without weakening assertions.
+
+Full shader validation: cargo test -p shader_recompiler PASS (665 passed, doc-tests PASS); scoped diffcheck clean.
+
+
+## 2026-11-08 - src/video_core/src/macro.rs vs video_core/macro.cpp/.h
+
+### Intentional differences
+- Native Execute recording state is now OnceLock<Option<Mutex<Recording>>> rather than OnceLock<Mutex<Option<Recording>>>. When EDEN_NX2_MME_RECORD is absent, no mutex is constructed or acquired on the hot path, matching upstream's record_path-null branch.
+- Enabled recording still serializes its function-local state in Rust. Skip parsing, file-open timing, nonfatal I/O, first 200000 calls, final flush/code dump and release before macro execution are unchanged.
+- Re-read macro.h Execute declaration and complete cpp recording branch after implementation; compared initialization and every side effect. No method, constant or state moved to another owner. This is a local lifecycle/overhead correction, not a change to macro execution.
+
+### Unintentional differences (to fix)
+- None introduced in this slice.
+
+### Missing items
+- No prerequisite missing. FPS benefit unverified; current live DCE benchmark uses the previous binary.
+
+### Binary layout verification
+- PASS: recording still writes the same little-endian start/count/parameter words and native-code words. No guest structure changed.
+
+Validation: full video_core tests running, including existing native interpreter/JIT regression children with recording disabled. No new test duplicates the Option/Mutex declaration; enabled branch body compared unchanged against the preceding version and upstream.
+
+Validation complete: full video_core 1724PASS/1ignored/docsPASS120.79s, scoped diffcheck clean. Also ran the existing native execution regression directly as its isolated JIT child with recording enabled and skip=1, then parsed the output: exactly seven records/92 bytes, first refreshed parameters [73], then three [42], self-upload arguments and two empty calls; all method IDs zero. This confirms enabled recording byte layout, skip count and refresh-before-record ordering. Artifact TEMP/nx2-optional-record-check.bin.
+
+
+## 2026-11-08 - src/common/src/logging/backend.rs vs common/logging.h/.cpp
+
+### Intentional differences
+- Rust facade global maximum now follows the active environment filter maximum or the minimum native class severity. This mechanical facade adapter rejects globally disabled records before argument evaluation and dynamic logger dispatch; per-target and regex filtering remain in FacadeLogger. Upstream filters before formatting, and compiles Trace out in release; Rust retains opt-in release traces for diagnostics.
+- SetGlobalFilter publishes a permissive ceiling before replacing class levels, then the final ceiling after disabling the initial environment override. LOGGER serializes writers and initialization publication. Native Critical messages bypass the facade ceiling because Rust log has no Critical level.
+- Re-read upstream logging.h Filter/levels/macros and logging.cpp SetGlobalFilter/FmtLogMessageImpl after implementation; compared severity direction, class filtering, live updates and formatting order. Existing asynchronous Rust writer and RUST_LOG override are unchanged adaptations.
+
+### Unintentional differences (to fix)
+- None introduced in this local facade slice; no whole-logger parity claim.
+
+### Missing items
+- No prerequisite missing. Runtime FPS benefit remains unverified.
+
+### Binary layout verification
+- PASS (not applicable): no guest or serialized binary layout changed.
+
+Validation: isolated configuration regression PASS for config, RUST_LOG target/regex, native override and off. Extended assertions verify disabled argument non-evaluation, live Info, selective Trace reactivation, rejection in other classes and native Critical delivery. Full common suite pending.
+
+Full validation: cargo test -p common PASS (422 unit tests, 2 build-script tests, 1 ignored doc-test); scoped diffcheck clean.
+
+
+## 2026-11-08 - src/video_core/src/engines/maxwell_3d.rs vs video_core/engines/maxwell_3d.cpp/.h
+
+### Intentional differences
+- ProcessCBMultiData borrows the input u32 slice as bytes on little-endian hosts, matching upstream direct start_base pointer submission to WriteBlockCached. Removed the temporary allocation and per-word copy from every single/bulk constant-buffer write.
+- Big-endian hosts retain explicit little-endian conversion. This preserves the existing guest byte contract; that cfg branch is not runtime-tested on this Windows host.
+- copy_size is now usize, matching upstream size_t, and truncates to u32 only for the wrapping offset increment after the write. Same memory-manager owner and existing soft assertion policy retained.
+- Re-read header declarations and cpp ProcessCBMultiData/ProcessCBData after implementation; compared validation, address formation, byte count, write and offset ordering. No helper or constant moved.
+
+### Unintentional differences (to fix)
+- None introduced in this slice.
+
+### Missing items
+- No missing prerequisite. Runtime benefit unverified; current live binary contains only the earlier logger-ceiling change.
+
+### Binary layout verification
+- PASS by code comparison: u32 has no padding; bytemuck cast exposes exactly four little-endian bytes per word on supported little-endian host. Regression extended with unaligned destination, high-bit/all-ones/zero patterns, single/bulk/empty writes and untouched neighboring bytes. Full video tests pending.
+
+Validation complete: focused CB regression PASS; full video_core 1724 passed/1 ignored/doc-tests PASS (136.23s). Scoped diffcheck clean.
+
+
+## 2026-11-08 - src/video_core/src/query_cache/query_cache_base.rs vs video_core/query_cache/query_cache.h and query_cache_base.h
+
+### Intentional differences
+- CounterReport now calls Nx2SemaphoreWaiters::OnWrite at both upstream positions: after immediate payload writeback and after deferred final value/timestamp writeback, before free/retirement. Uses the translated device address and low 32 bits of the amended value.
+- Existing Rust CounterReport implementation remains in query_cache_base.rs alongside its class; upstream declares it in query_cache_base.h and defines the template body in query_cache.h. This existing template/owner adaptation is retained rather than relocating the whole query-cache implementation in this prerequisite.
+- Re-read upstream declaration and both full writeback branches after implementation; verified invalidated/unsynchronized early returns skip notification, queued callbacks do not notify early, and timestamp-before-payload ordering remains unchanged.
+
+### Unintentional differences (to fix)
+- Missing notifications corrected here. The broader Puller pending-acquire/DMA/scheduler integration is interrupted and recorded in NX2_PORT_STATE.md; it is not activated by this change.
+
+### Missing items
+- No prerequisite missing for the query notification itself. Pending-acquire consumer integration remains the next interrupted slice.
+
+### Binary layout verification
+- PASS by code comparison: all 4/8/16-byte guest writes and captured pointers are unchanged. Notification only observes device address and low u32 payload.
+- Regression covers immediate and deferred reports with/without timestamps, amended high-bit values, invalidated and unsynchronized suppression, and a later overwrite preserving the latched result. Validation pending.
+
+Query notification validation complete: focused regression PASS; full video_core 1725 passed/1 ignored/doc-tests PASS132.90s. Scoped diffcheck clean.
+
+
+## 2026-11-08 ? src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h ? VI2 source crop
+
+### Intentional differences
+- Fix the inherited Eden-NX2 presentation bug requested by the user: `PresentClientBuffer` now forwards command words 6/7 to its existing `Composite` owner as packed u16 source bounds. Convert inclusive maximum coordinates to the exclusive ends used by `FramebufferConfig::crop_rect`/`NormalizeCrop`. Upstream always selects the complete image allocation; its header was re-read after this implementation (there is no paired .cpp).
+- Evidence: native request 229 has header `000000f5 00000018`, words 6/7 `00000000 059f09ff` on four consecutive presents. This encodes (0,0)..(2559,1439), matching the observed guest viewport 2560x1440 inside a 3840x2160 allocation. The Vulkan layout, frame and swapchain were all 1280x720, blitting supported; Windows DPI was 96/per-monitor aware. Changing window size preserved the erroneous 2/3 image fraction.
+- SDK binary inspection used module-relative offsets only, not guessed runtime bases: exported `nn::vi2::SetLayerNextCrop` at SDK+0x5d6e80; the command-229 serializer at SDK+0x5d95f0 copies the first 8 bytes of its 64-byte presentation descriptor to TLS+0x18 (words 6/7), while fences remain at TLS+0x58 (word 22). Captured request evidence: TEMP/ruzu-nx2-live-resize-diagnostic-20261108-094830/stderr.log. No fixed resolution or title-specific scale factor is introduced.
+- Allocation width, height, pitch, image lookup, fences and pacing remain in their existing owners. Cropping flows through the same presentation machinery as the Switch 1 path. This is an explicit behavioral correction beyond the pinned upstream reference, not a claim of exact upstream parity for the formerly ignored fields.
+
+### Unintentional differences (to fix)
+- None introduced in the scoped crop-forwarding change.
+
+### Missing items
+- No new prerequisite for source-crop forwarding. Other native VI2 fields/operations retain their previously documented implementation status; this does not complete VI2 or the full NX2 port.
+
+### Binary layout verification
+- PASS: two existing u32 command words are split into low/high u16 coordinates without changing the command ABI. Ends are widened to i32 before adding one, so 0xffff becomes 65536 rather than wrapping. GPU framebuffer allocation dimensions and stride remain unchanged. Regression exercises the actual TIPC handler plus captured origin-zero bounds, nonzero origins, a one-pixel rectangle and u16 maximum ends.
+- Validation pending below; all temporary Vulkan and VI2 diagnostic instrumentation has been removed from source.
+
+- Additional protocol verification: SDK `TLayerNativeWindow` vtable+0x98 resolves to module+0x5dd040. The setter packs x/y into the low two u16 lanes and x+width-1/y+height-1 into the upper lanes, sets flag bit 1 at state+0x38, and clears the flag/bounds if width or height is zero. SDK+0x5dd480 copies state+0x30 crop and state+0x38 flags into presentation descriptor offsets 0 and 8; SDK+0x5d95f0 serializes these to request words 6/7 and 8. The fix therefore honors word-8 bit 1; disabled cropping preserves the full allocation, even with stale nonzero bounds. Regression also covers enabled all-zero bounds (one pixel) versus disabled all-zero bounds (full image).
+- First final scoped run: `cargo test -p core vi2_` passed 3 tests. Full `cargo test -p core -- --test-threads=1` hit the pre-existing STATUS_ACCESS_VIOLATION in `k_thread::tests::wait_cancel_pushes_runnable_thread_through_state_change_handler`; it is not a green full-crate result. Crop-flag completion is being rechecked below.
+
+- Final crop-flag regression: `cargo test -p core vi2_` PASS, 3 tests (TEMP/nx2-vi2-crop-flags-focused.log). Final full-core retry again terminated with STATUS_ACCESS_VIOLATION at `k_thread::tests::wait_cancel_pushes_runnable_thread_through_state_change_handler` (TEMP/nx2-vi2-crop-flags-core-full.log); full-crate validation remains blocked by that existing failure. Release build and visual resize validation follow below.
+
+- Release validation: `cargo build --release --bin ruzu-cmd` PASS, 3m25s, exit 0 (TEMP/nx2-vi2-crop-release.log). Instrumentation-free runtime started for visual checks in TEMP/ruzu-nx2-live-vi2-crop-validation-20261108-100210.
+
+- Visual validation PASS: live PrintWindow captures show the complete loading map filling 1280x720, then centered at 960x540 inside a 960x900 client area with symmetric top/bottom bars. The title scene also fills the available 16:9 region in an enlarged/maximized window with symmetric side bars; no top-left 2/3 image remains. Evidence in TEMP/ruzu-nx2-live-vi2-crop-validation-20261108-100210: crop-fixed-1280x720.png, crop-fixed-960x900.png, crop-fixed-title.png. The title capture's original filename crop-fixed-1280x540.png is only the requested test size, not its actual size (the window was maximized before capture). Runtime remains open, all keys released. No FPS-goal claim.
+
+## 2026-11-08 - Remove local investigation instrumentation before checkpoint
+
+### Intentional differences
+- `src/video_core/src/host1x/gpu_device_memory_manager.rs` vs `video_core/host1x/gpu_device_memory_manager.h/.cpp`: removed RUZU_TRACE_NX2_SMMU and its first-page pointer log. Mapping order, pointers, and compressed physical mapping remain unchanged. Re-read upstream traits/explicit instantiations; existing Rust SMMU adaptation remains documented above.
+- `src/video_core/src/renderer_vulkan/vk_rasterizer.rs` vs `video_core/renderer_vulkan/vk_rasterizer.h/.cpp`: removed temporary mesh execution probe, payload capture, and periodic heap budget queries. Re-read TickFrame declaration/body; cache retirement order unchanged. Production compute-backed mesh dispatch, task readback and generated-vertex drawing remain the previously documented host adaptation.
+- `src/video_core/src/renderer_vulkan/pipeline_cache.rs` vs `video_core/renderer_vulkan/vk_pipeline_cache.h/.cpp`: removed temporary live mesh compile probe and SPIR-V/environment captures. Re-read CurrentGraphicsPipeline interface/body; normal refresh/cache/slow-path ordering unchanged. Existing production mesh pipeline extension remains.
+- Upstream native_query_trace/nx2_profile and EDEN_NATIVE_DRAW_DIAGNOSTICS are retained as opt-in ports, disabled by default. Resize investigation markers remain absent.
+- Normalized mixed line endings in common/thread.rs and video_core/lib.rs; repaired base registry note encoding. No semantic changes.
+
+### Unintentional differences (to fix)
+- None introduced by removal. Existing broader parity gaps are recorded in earlier entries and NX2_PORT_STATE.md.
+
+### Missing items
+- PendingAcquire/DMA resume/scheduler integration and GPU split remain pending. No new implementation attempted before requested pause.
+
+### Binary layout verification
+- PASS: no structs, serialized layouts, shader output contracts, or guest payloads changed.
+
+### Validation
+- Full video_core suite running; result appended below before commit. Earlier final VI2 focused suite: 3 passed; full core suite still blocked by documented kernel access violation.
+
+Cleanup validation complete: cargo test -p video_core -- --test-threads=1 with RUST_MIN_STACK=16777216: 1725 passed, 1 ignored, 0 failed; doc tests passed; exit 0 (459.05s). Source/document git diff --cached --check passes; generated Ampere oracle fixtures retain their exact upstream output formatting, including trailing spaces.

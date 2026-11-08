@@ -418,6 +418,16 @@ impl NvdrvInterface {
         NvResult::Success
     }
 
+    /// Port of Eden-NX2 NVDRV::InitializeForProcess: internal session startup,
+    /// without the guest Initialize IPC or transfer-memory parameters.
+    pub fn initialize_for_process(&mut self, process: &Arc<ProcessLock>) {
+        if self.is_initialized {
+            return;
+        }
+        self.session_id = self.nvdrv.get_container().open_session(process);
+        self.is_initialized = true;
+    }
+
     /// Port of NVDRV::QueryEvent
     pub fn query_event(
         &self,
@@ -541,6 +551,11 @@ impl NvdrvService {
 
     pub fn get_module(&self) -> Arc<Module> {
         self.interface.lock().unwrap().get_module()
+    }
+
+    /// Preserve NVDRV ownership through the Rust service/interface split.
+    pub fn initialize_for_process(&self, process: &Arc<ProcessLock>) {
+        self.interface.lock().unwrap().initialize_for_process(process);
     }
 
     // read_buffer / write_buffer removed — use ctx.read_buffer() / ctx.write_buffer()
@@ -1405,6 +1420,28 @@ pub fn dump_nvdrv_ioctl_profile() {
 mod tests {
     use super::{Ioctl, Module, NvResult, NvdrvInterface};
     use crate::core::{System, SystemRef};
+
+    #[test]
+    fn initialize_for_process_is_idempotent_and_releases_one_session() {
+        use crate::hle::kernel::kernel::ScopedKernelForTest;
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use std::sync::Arc;
+        let _scope = ScopedKernelForTest::without_kernel();
+        let system = System::new_boxed_for_test();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let service = super::NvdrvService::new(module.clone(), "nx2:nvsrv");
+        let first = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let other = Arc::new(ProcessLock::from_value(KProcess::new()));
+        service.initialize_for_process(&first);
+        let id = service.interface.lock().unwrap().session_id;
+        service.initialize_for_process(&first);
+        service.initialize_for_process(&other);
+        assert!(service.interface.lock().unwrap().is_initialized());
+        assert_eq!(service.interface.lock().unwrap().session_id, id);
+        assert!(Arc::ptr_eq(&module.get_container().get_session_process(id).unwrap(), &first));
+        drop(service);
+        assert!(module.get_container().get_session_process(id).is_none());
+    }
 
     #[test]
     fn ioctl_output_buffers_are_service_owned_and_zeroed() {

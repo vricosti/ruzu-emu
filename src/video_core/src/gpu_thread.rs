@@ -57,6 +57,11 @@ pub struct FlushAndInvalidateRegionCommand {
 /// Command to make the GPU process pending requests.
 pub struct GpuTickCommand;
 
+/// Upstream RunCommand: executes after the commands queued before it.
+pub struct RunCommand {
+    pub func: Box<dyn FnOnce() + Send>,
+}
+
 /// All possible GPU thread commands.
 /// Matches upstream `CommandData` variant.
 pub enum CommandData {
@@ -66,6 +71,7 @@ pub enum CommandData {
     InvalidateRegion(InvalidateRegionCommand),
     FlushAndInvalidateRegion(FlushAndInvalidateRegionCommand),
     GpuTick(GpuTickCommand),
+    Run(RunCommand),
 }
 
 /// Container for a command with fence tracking.
@@ -306,6 +312,10 @@ impl ThreadManager {
         self.push_command(CommandData::GpuTick(GpuTickCommand), false, is_async);
     }
 
+    pub fn run(&self, func: Box<dyn FnOnce() + Send>, is_async: bool) {
+        self.push_command(CommandData::Run(RunCommand { func }), false, is_async);
+    }
+
     /// Push a command to be executed by the GPU thread.
     /// Matches upstream `ThreadManager::PushCommand(CommandData&&, bool)`.
     fn push_command(&self, command_data: CommandData, mut block: bool, is_async: bool) -> u64 {
@@ -391,8 +401,14 @@ fn run_thread(
     scheduler: &Scheduler,
     rasterizer: RasterizerHandle,
 ) {
+    use crate::nx2_profile::{Scope, Zone};
     while !stop.load(Ordering::Relaxed) {
-        let Some(next) = state.pop_wait(stop) else {
+        crate::nx2_profile::report("GPU thread");
+        let next = {
+            let _scope = Scope::new(Zone::Idle);
+            state.pop_wait(stop)
+        };
+        let Some(next) = next else {
             break; // Stop requested
         };
         if stop.load(Ordering::Relaxed) {
@@ -401,12 +417,19 @@ fn run_thread(
 
         with_command_autorelease_pool(|| match next.data {
             CommandData::SubmitList(submit) => {
+                let _scope = Scope::new(Zone::Push);
                 scheduler.push(gpu, submit.channel, submit.entries);
             }
             CommandData::GpuTick(_) => {
+                let _scope = Scope::new(Zone::Tick);
                 gpu.tick_work();
             }
+            CommandData::Run(run) => {
+                let _scope = Scope::new(Zone::Run);
+                (run.func)();
+            }
             CommandData::FlushRegion(flush) => {
+                let _scope = Scope::new(Zone::FlushInvalidate);
                 // Upstream: rasterizer->FlushRegion(flush.addr, flush.size)
                 unsafe { rasterizer.as_mut() }.flush_region(
                     flush.addr,
@@ -415,6 +438,7 @@ fn run_thread(
                 );
             }
             CommandData::InvalidateRegion(inv) => {
+                let _scope = Scope::new(Zone::FlushInvalidate);
                 // Upstream: rasterizer->OnCacheInvalidation(inv.addr, inv.size)
                 unsafe { rasterizer.as_mut() }.on_cache_invalidation(inv.addr, inv.size);
             }
@@ -452,6 +476,65 @@ fn with_command_autorelease_pool<R>(execute: impl FnOnce() -> R) -> R {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_callbacks_are_fifo_and_sync_submission_waits_for_completion() {
+        let manager = Arc::new(ThreadManager::new(SystemRef::null()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_calls = calls.clone();
+        manager.run(
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                first_calls.lock().unwrap().push(1);
+            }),
+            true,
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        let worker_manager = manager.clone();
+        let worker = std::thread::spawn(move || {
+            let gpu = crate::gpu::Gpu::new(true, false);
+            let scheduler = Scheduler::new();
+            let rasterizer = crate::renderer_null::null_rasterizer::RasterizerNull::new(Arc::new(
+                crate::host1x::syncpoint_manager::SyncpointManager::new(),
+            ));
+            run_thread(
+                &worker_manager.state,
+                &worker_manager.stop,
+                &gpu,
+                &scheduler,
+                RasterizerHandle::from_ref(&rasterizer),
+            );
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let submit_manager = manager.clone();
+        let second_calls = calls.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let submitter = std::thread::spawn(move || {
+            submit_manager.run(
+                Box::new(move || second_calls.lock().unwrap().push(2)),
+                false,
+            );
+            done_tx.send(()).unwrap();
+        });
+        while manager.state.last_fence.load(Ordering::Relaxed) < 2 {
+            std::thread::yield_now();
+        }
+        assert!(done_rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![1, 2]);
+        assert_eq!(manager.state.signaled_fence.load(Ordering::SeqCst), 2);
+        manager.request_stop();
+        submitter.join().unwrap();
+        worker.join().unwrap();
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

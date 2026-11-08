@@ -80,6 +80,8 @@ impl DestRegisters {
 /// corresponding register view explicitly. This avoids a self-referential
 /// engine while preserving Eden's call-boundary register snapshot.
 pub struct State {
+    native_partial: bool,
+    flushed_offset: u32,
     /// Current write offset within `inner_buffer`.
     write_offset: u32,
     /// Total number of bytes to copy for this transfer.
@@ -105,6 +107,8 @@ impl State {
     #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self {
+            native_partial: false,
+            flushed_offset: 0,
             write_offset: 0,
             copy_size: 0,
             inner_buffer: Vec::new(),
@@ -120,6 +124,8 @@ impl State {
         memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
     ) -> Self {
         Self {
+            native_partial: false,
+            flushed_offset: 0,
             write_offset: 0,
             copy_size: 0,
             inner_buffer: Vec::new(),
@@ -146,11 +152,17 @@ impl State {
         self.rasterizer = Some(RasterizerHandle::from_ref(rasterizer));
     }
 
+    /// Port of State::SetNativePartialTransfers.
+    pub fn set_native_partial_transfers(&mut self, enabled: bool) {
+        self.native_partial = enabled;
+    }
+
     /// Begin a new transfer. Called when the engine's exec register is written.
     ///
     /// Corresponds to `State::ProcessExec`.
     pub fn process_exec(&mut self, regs: &Registers, is_linear: bool) {
         self.write_offset = 0;
+        self.flushed_offset = 0;
         self.copy_size = regs.line_length_in.wrapping_mul(regs.line_count);
         self.inner_buffer.resize(self.copy_size as usize, 0);
         self.is_linear = is_linear;
@@ -162,6 +174,22 @@ impl State {
     pub fn process_data_word(&mut self, regs: &Registers, data: u32, is_last_call: bool) {
         self.accumulate_word(data);
         if is_last_call {
+            if self.native_partial && self.is_linear && regs.line_count == 1 {
+                let count = self.write_offset.wrapping_sub(self.flushed_offset);
+                if count != 0 {
+                    let rasterizer = self
+                        .rasterizer
+                        .expect("native inline upload requires the upstream-bound rasterizer");
+                    unsafe { rasterizer.as_mut() }.accelerate_inline_to_memory(
+                        regs.dest.address().wrapping_add(self.flushed_offset as u64),
+                        count as usize,
+                        &self.inner_buffer
+                            [self.flushed_offset as usize..self.write_offset as usize],
+                    );
+                    self.flushed_offset = self.write_offset;
+                }
+                return;
+            }
             Self::process_data_bytes(
                 self.is_linear,
                 self.memory_manager.as_ref(),
@@ -180,6 +208,24 @@ impl State {
         // Safe conversion: reinterpret &[u32] as &[u8] matching C++ reinterpret_cast.
         let byte_view: &[u8] =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        if self.native_partial && self.is_linear && regs.line_count == 1 {
+            let count = byte_view
+                .len()
+                .min(self.copy_size.wrapping_sub(self.write_offset) as usize);
+            if count != 0 {
+                let rasterizer = self
+                    .rasterizer
+                    .expect("native inline upload requires the upstream-bound rasterizer");
+                unsafe { rasterizer.as_mut() }.accelerate_inline_to_memory(
+                    regs.dest.address().wrapping_add(self.write_offset as u64),
+                    count,
+                    &byte_view[..count],
+                );
+                self.write_offset = self.write_offset.wrapping_add(count as u32);
+                self.flushed_offset = self.write_offset;
+            }
+            return;
+        }
         Self::process_data_bytes(
             self.is_linear,
             self.memory_manager.as_ref(),
@@ -302,6 +348,7 @@ impl State {
                 regs.dest.block_height(),
                 regs.dest.block_depth(),
                 regs.line_length_in,
+                false,
             );
 
             // Write the swizzled buffer back to GPU memory with the upstream cached-write path.

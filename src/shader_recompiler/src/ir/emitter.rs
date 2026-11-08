@@ -1805,6 +1805,23 @@ impl<'a> Emitter<'a> {
         self.emit(Inst::new(Opcode::LoadLocal, vec![offset]))
     }
 
+    /// Upstream IREmitter::IsbeRead: address in the input stage buffer, in bytes.
+    pub fn isbe_read(&mut self, address: Value) -> Value {
+        self.emit(Inst::new(Opcode::IsbeRead, vec![address]))
+    }
+
+    pub fn isbe_write_attribute(&mut self, address: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::IsbeWriteAttribute, vec![address, value]));
+    }
+
+    pub fn isbe_write_map_u8(&mut self, address: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::IsbeWriteMapU8, vec![address, value]));
+    }
+
+    pub fn isbe_write_map_u32(&mut self, address: Value, value: Value) {
+        self.emit_void(Inst::new(Opcode::IsbeWriteMapU32, vec![address, value]));
+    }
+
     pub fn write_local(&mut self, offset: Value, value: Value) {
         self.emit_void(Inst::new(Opcode::WriteLocal, vec![offset, value]));
     }

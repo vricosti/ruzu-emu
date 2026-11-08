@@ -48,9 +48,7 @@ pub const fn get_maximum_overhead_size(size: usize) -> usize {
 }
 
 pub const MAIN_MEMORY_SIZE: usize = 4 * (1 << 30); // 4 GiB
-// The exposed layouts reach 12 GiB. Eden's older 8 GiB bound undersizes
-// GetMaximumOverheadSize for the two larger layouts.
-pub const MAIN_MEMORY_SIZE_MAX: usize = 12 * (1 << 30);
+pub const MAIN_MEMORY_SIZE_MAX: usize = 8 * (1 << 30);
 
 pub const RESERVED_EARLY_DRAM_SIZE: usize = 384 * 1024;
 pub const DRAM_PHYSICAL_ADDRESS: usize = 0x80000000;
@@ -80,7 +78,9 @@ pub const KERNEL_PHYSICAL_ADDRESS_SPACE_SIZE: usize =
 pub const KERNEL_PHYSICAL_ADDRESS_CODE_BASE: usize =
     DRAM_PHYSICAL_ADDRESS + RESERVED_EARLY_DRAM_SIZE;
 
-pub const KERNEL_PAGE_TABLE_HEAP_SIZE: usize = get_maximum_overhead_size(MAIN_MEMORY_SIZE_MAX);
+// Retain the existing Rust reservation for 10/12 GiB layouts. This is an
+// intentional allocation difference from upstream, not the SetHeapSize limit.
+pub const KERNEL_PAGE_TABLE_HEAP_SIZE: usize = get_maximum_overhead_size(12 * (1 << 30));
 pub const KERNEL_INITIAL_PAGE_HEAP_SIZE: usize = 128 * 1024;
 
 pub const KERNEL_SLAB_HEAP_DATA_SIZE: usize = 5 * (1 << 20);
@@ -267,7 +267,6 @@ mod tests {
     fn page_table_reservation_covers_every_supported_memory_layout() {
         for gib in [4usize, 6, 8, 10, 12] {
             let memory_size = gib << 30;
-            assert!(memory_size <= MAIN_MEMORY_SIZE_MAX);
             assert!(get_maximum_overhead_size(memory_size) <= KERNEL_PAGE_TABLE_HEAP_SIZE);
         }
         assert_eq!(KERNEL_PAGE_TABLE_HEAP_SIZE, (12 + 6144) * PAGE_SIZE);

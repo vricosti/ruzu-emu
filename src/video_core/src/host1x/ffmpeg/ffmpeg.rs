@@ -22,6 +22,12 @@ mod ffi {
     pub type AVFrame = c_void;
 
     extern "C" {
+        pub fn ruzu_ffmpeg_find_decoder(codec: u64, prefer_mediacodec: c_int) -> *const c_void;
+        pub fn ruzu_ffmpeg_decoder_context(decoder: *mut RuzuFfmpegDecoder) -> *mut c_void;
+        pub fn ruzu_ffmpeg_frame_pts(frame: *const AVFrame) -> i64;
+        pub fn ruzu_ffmpeg_frame_best_effort_timestamp(frame: *const AVFrame) -> i64;
+        pub fn ruzu_ffmpeg_frame_colorspace(frame: *const AVFrame) -> c_int;
+        pub fn ruzu_ffmpeg_frame_color_range(frame: *const AVFrame) -> c_int;
         pub fn ruzu_ffmpeg_decoder_create(
             codec: u64,
             prefer_mediacodec: c_int,
@@ -149,6 +155,11 @@ impl<'a> Packet<'a> {
         self.pts = pts;
         self.dts = dts;
     }
+
+    /// Mechanical accessor for upstream GetPacket()->pts; DTS stays unchanged.
+    pub fn set_pts(&mut self, pts: i64) {
+        self.pts = pts;
+    }
 }
 
 /// Wraps an AVFrame — a container for decoded audio/video data.
@@ -159,6 +170,21 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub fn get_pts(&self) -> i64 {
+        unsafe { ffi::ruzu_ffmpeg_frame_pts(self.raw) }
+    }
+
+    pub fn get_best_effort_timestamp(&self) -> i64 {
+        unsafe { ffi::ruzu_ffmpeg_frame_best_effort_timestamp(self.raw) }
+    }
+
+    pub fn get_colorspace(&self) -> i32 {
+        unsafe { ffi::ruzu_ffmpeg_frame_colorspace(self.raw) }
+    }
+
+    pub fn get_color_range(&self) -> i32 {
+        unsafe { ffi::ruzu_ffmpeg_frame_color_range(self.raw) }
+    }
     pub fn new() -> Self {
         Self {
             raw: unsafe { ffi::ruzu_ffmpeg_frame_create() },
@@ -249,6 +275,9 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    pub(crate) fn get_codec(&self) -> *const libc::c_void {
+        unsafe { ffi::ruzu_ffmpeg_find_decoder(self.codec.raw(), i32::from(self.prefer_mediacodec)) }
+    }
     pub fn new(codec: VideoCodec) -> Self {
         #[cfg(target_os = "android")]
         let prefer_mediacodec = *common::settings::values().nvdec_emulation.get_value()
@@ -375,6 +404,10 @@ pub struct DecoderContext {
 }
 
 impl DecoderContext {
+    /// Opaque native handle, matching upstream GetCodecContext().
+    pub(crate) fn get_codec_context(&mut self) -> *mut libc::c_void {
+        unsafe { ffi::ruzu_ffmpeg_decoder_context(self.raw) }
+    }
     pub fn new(decoder: &Decoder) -> Self {
         let raw = unsafe {
             ffi::ruzu_ffmpeg_decoder_create(
@@ -780,6 +813,36 @@ impl Default for DecodeApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_accessors_preserve_timestamp_sentinels_and_decoder_lifecycle() {
+        extern "C" {
+            fn avcodec_send_packet(context: *mut libc::c_void, packet: *const libc::c_void) -> i32;
+            fn avcodec_flush_buffers(context: *mut libc::c_void);
+        }
+        let frame = Frame::new();
+        assert_eq!(frame.get_pts(), i64::MIN);
+        assert_eq!(frame.get_best_effort_timestamp(), i64::MIN);
+        let mut packet = Packet::new(&[]);
+        packet.set_pts(u64::MAX as i64);
+        assert_eq!(packet.pts, -1);
+        assert_eq!(packet.dts, i64::MIN);
+        let decoder = Decoder::new(VideoCodec::H264);
+        assert!(!decoder.get_codec().is_null());
+        let mut context = DecoderContext::new(&decoder);
+        assert!(context.open_context(&decoder, &[]));
+        let raw = context.get_codec_context();
+        assert!(!raw.is_null());
+        unsafe {
+            assert_eq!(avcodec_send_packet(raw, std::ptr::null()), 0);
+        }
+        assert!(context.receive_frame().is_none());
+        unsafe {
+            avcodec_flush_buffers(raw);
+            assert_eq!(avcodec_send_packet(raw, std::ptr::null()), 0);
+        }
+        assert!(context.receive_frame().is_none());
+    }
 
     #[test]
     fn default_frame_exposes_empty_planes_and_strides() {

@@ -299,6 +299,26 @@ impl StagingBufferPool {
         entry.deferred = false;
     }
 
+    // VMA only prefers HOST_COHERENT. Keep visibility operations with the
+    // allocation owner rather than assuming mapped staging memory is coherent.
+    fn deferred_allocation(&self, buffer: &StagingBufferRef) -> &AllocatedBuffer {
+        let entry = self.get_cache(buffer.usage)[buffer.log2_level as usize]
+            .entries.iter().find(|entry| entry.reference.index == buffer.index)
+            .expect("deferred staging buffer missing from Vulkan staging pool");
+        assert!(entry.deferred);
+        &entry._allocation
+    }
+
+    pub(crate) fn flush_deferred(&self, buffer: &StagingBufferRef) {
+        self.deferred_allocation(buffer).flush();
+    }
+
+    /// Call only after GPU writes are complete and a HOST_READ dependency was
+    /// recorded. Invalidating mapped memory does not itself wait for the GPU.
+    pub(crate) fn invalidate_deferred(&self, buffer: &StagingBufferRef) {
+        self.deferred_allocation(buffer).invalidate();
+    }
+
     /// Per-frame housekeeping (upstream `TickFrame`): rotate the deletion
     /// level. The stream buffer is NOT reset here — its regions retire
     /// individually against the GPU timeline (see `try_stream_allocate`).
@@ -316,7 +336,7 @@ impl StagingBufferPool {
         unsafe { self.scheduler.as_ref() }
     }
 
-    fn request_buffer(
+    pub(crate) fn request_buffer(
         &mut self,
         size: vk::DeviceSize,
         usage: MemoryUsage,
@@ -521,7 +541,10 @@ impl StagingBufferPool {
                     | vk::BufferUsageFlags::UNIFORM_BUFFER
                     | vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::INDEX_BUFFER
-                    | vk::BufferUsageFlags::VERTEX_BUFFER;
+                    | vk::BufferUsageFlags::VERTEX_BUFFER
+                    // Compute mesh output carries VkDrawIndirectCommand headers.
+                    // Non-stream pool allocations can serve both storage and draw.
+                    | vk::BufferUsageFlags::INDIRECT_BUFFER;
                 if self
                     .device_owner
                     .get()
@@ -539,7 +562,24 @@ impl StagingBufferPool {
         // SAFETY: the allocator is boxed by RendererVulkan and outlives the
         // rasterizer and its staging pool, matching upstream's reference member.
         let memory_allocator = unsafe { self.memory_allocator.as_ref() };
-        let allocation = memory_allocator.create_buffer(&buf_info, usage).ok()?;
+        let allocation = match memory_allocator.create_buffer(&buf_info, usage) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                // Upstream propagates the Vulkan exception. Preserve its
+                // details before this Rust Option boundary reports failure.
+                log::error!("Staging buffer allocation failed: size={size:#x} usage={usage:?}: {error:?}");
+                if let Ok(budgets) = self.device_owner.get().get_allocator()
+                    .lock().expect("VMA allocator mutex poisoned").get_heap_budgets() {
+                    for (heap, budget) in budgets.iter().enumerate() {
+                        log::error!("Staging failure heap={heap} usage={} budget={} block_bytes={} allocation_bytes={} blocks={} allocations={}",
+                            budget.usage, budget.budget, budget.statistics.blockBytes,
+                            budget.statistics.allocationBytes, budget.statistics.blockCount,
+                            budget.statistics.allocationCount);
+                    }
+                }
+                return None;
+            }
+        };
         let buffer = allocation.handle();
         let mapped = allocation.mapped_ptr();
         assert!(usage == MemoryUsage::DeviceLocal || !mapped.is_null());

@@ -547,7 +547,7 @@ impl FlowCfg {
             let branch = self.add_label(
                 block,
                 self.blocks[block].stack.clone(),
-                Location::new(target),
+                Location::new(env.translate_program_address(target)),
                 function_id,
             );
             self.blocks[block].indirect_branches.push(IndirectBranch {
@@ -728,6 +728,26 @@ impl FlowCfg {
         self.insert_block_sorted(function_id, new_block);
     }
 
+    /// Instruction-range view retaining global FlowBlock indices. Structuring
+    /// must keep the accompanying FlowCfg to resolve functions/call returns.
+    pub(crate) fn all_cfg_blocks(&self, base_offset: u32) -> Vec<CfgBlock> {
+        self.blocks
+            .iter()
+            .map(|flow| CfgBlock {
+                begin: location_to_word_index(flow.begin, base_offset),
+                end: location_to_word_index(flow.end, base_offset),
+                end_class: flow.end_class,
+                branch_true: flow.branch_true,
+                branch_false: flow.branch_false,
+                cond: flow.cond,
+                stack_depth: flow.stack.entries.len() as u32,
+                branch_reg: flow.branch_reg,
+                branch_offset: flow.branch_offset,
+                indirect_branches: flow.indirect_branches.clone(),
+            })
+            .collect()
+    }
+
     pub fn to_cfg_blocks(&self, base_offset: u32) -> Vec<CfgBlock> {
         let Some(function) = self.functions.first() else {
             return Vec::new();
@@ -776,11 +796,15 @@ pub fn build_cfg_from_env(
     base_offset: u32,
     _code_words: usize,
 ) -> Vec<CfgBlock> {
+    build_flow_cfg_from_env(env, base_offset).to_cfg_blocks(base_offset)
+}
+
+/// Preserve upstream CFG functions and caller continuation links for BuildASL.
+pub(crate) fn build_flow_cfg_from_env(env: &mut dyn Environment, base_offset: u32) -> FlowCfg {
     // Vulkan/OpenGL pass index == 0 (VertexA) to upstream CFG so EXIT
     // branches through the dispatch block before dual-vertex merging.
     let exits_to_dispatcher = env.shader_stage() == crate::stage::Stage::VertexA;
-    let cfg = FlowCfg::new(env, Location::new(base_offset), exits_to_dispatcher);
-    cfg.to_cfg_blocks(base_offset)
+    FlowCfg::new(env, Location::new(base_offset), exits_to_dispatcher)
 }
 
 fn opcode_token(opcode: MaxwellOpcode) -> Token {
@@ -1213,6 +1237,9 @@ mod tests {
         stage: Stage,
         instruction: u64,
         following_instruction: Option<u64>,
+        instructions: std::collections::HashMap<u32, u64>,
+        cbuf: std::collections::HashMap<(u32, u32), u32>,
+        translated_addresses: std::collections::HashMap<u32, u32>,
     }
 
     impl Default for PretEnvironment {
@@ -1223,6 +1250,9 @@ mod tests {
                 stage: Stage::Compute,
                 instruction: 0xe270_0000_0007_000f,
                 following_instruction: None,
+                instructions: Default::default(),
+                cbuf: Default::default(),
+                translated_addresses: Default::default(),
             }
         }
     }
@@ -1233,6 +1263,9 @@ mod tests {
         }
 
         fn read_instruction(&mut self, address: u32) -> u64 {
+            if let Some(&instruction) = self.instructions.get(&address) {
+                return instruction;
+            }
             if address > 8 {
                 self.following_instruction.unwrap_or(self.instruction)
             } else {
@@ -1240,8 +1273,18 @@ mod tests {
             }
         }
 
-        fn read_cbuf_value(&mut self, _cbuf_index: u32, _cbuf_offset: u32) -> u32 {
-            0
+        fn translate_program_address(&self, address: u32) -> u32 {
+            self.translated_addresses
+                .get(&address)
+                .copied()
+                .unwrap_or(address)
+        }
+
+        fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32 {
+            self.cbuf
+                .get(&(cbuf_index, cbuf_offset))
+                .copied()
+                .unwrap_or(0)
         }
 
         fn read_texture_type(&mut self, _raw_handle: u32) -> TextureType {
@@ -1310,6 +1353,239 @@ mod tests {
         fn is_proprietary_driver(&self) -> bool {
             false
         }
+    }
+
+    fn nested_call_environment(inner_exit: bool) -> PretEnvironment {
+        let mut env = PretEnvironment::default();
+        // main calls function A twice; A calls B. Sched words at 0/32/64.
+        env.instructions = [
+            (8, 0xe260_0000_0007_0000 | (24 << 20)),
+            (16, 0xe260_0000_0007_0000 | (16 << 20)),
+            (24, 0xe300_0000_0007_000f),
+            (40, 0xe260_0000_0007_0000 | (24 << 20)),
+            (48, 0xe320_0000_0007_000f),
+            (
+                72,
+                if inner_exit {
+                    0xe300_0000_0007_000f
+                } else {
+                    0xe320_0000_0007_000f
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        env
+    }
+
+    #[test]
+    fn full_function_graph_returns_to_each_nested_call_site() {
+        let mut env = nested_call_environment(false);
+        let cfg = build_flow_cfg_from_env(&mut env, 0);
+        assert_eq!(cfg.functions.len(), 3);
+        assert_eq!(
+            cfg.functions
+                .iter()
+                .map(|f| f.entrypoint.offset())
+                .collect::<Vec<_>>(),
+            [8, 40, 72]
+        );
+        let ranges = cfg.all_cfg_blocks(0);
+        assert_eq!(ranges.len(), cfg.blocks.len());
+        for converge in [false, true] {
+            let structured =
+                super::super::structured_control_flow::structure_flow_cfg_detailed(&cfg, converge);
+            let trace = execute_call_syntax(&structured, &ranges, false);
+            assert_eq!(trace, [8, 40, 72, 48, 16, 40, 72, 48, 24]);
+            assert_eq!(
+                structured
+                    .syntax
+                    .iter()
+                    .filter(|n| matches!(n, crate::ir::SyntaxNode::Return))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn exit_inside_nested_callee_exits_shader_instead_of_returning_to_caller() {
+        let mut env = nested_call_environment(true);
+        let cfg = build_flow_cfg_from_env(&mut env, 0);
+        let ranges = cfg.all_cfg_blocks(0);
+        for converge in [false, true] {
+            let structured =
+                super::super::structured_control_flow::structure_flow_cfg_detailed(&cfg, converge);
+            assert_eq!(
+                execute_call_syntax(&structured, &ranges, false),
+                [8, 40, 72]
+            );
+            if converge {
+                assert_eq!(
+                    structured
+                        .syntax
+                        .iter()
+                        .filter(|n| matches!(n, crate::ir::SyntaxNode::Return))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_ret_keeps_caller_continuations_for_both_predicate_paths() {
+        let mut env = nested_call_environment(false);
+        env.instructions.insert(72, 0xe320_0000_0000_000f); // @P0 RET
+        env.instructions.insert(80, 0xe320_0000_0007_000f); // RET on fallthrough
+        let cfg = build_flow_cfg_from_env(&mut env, 0);
+        let ranges = cfg.all_cfg_blocks(0);
+        for converge in [false, true] {
+            let structured =
+                super::super::structured_control_flow::structure_flow_cfg_detailed(&cfg, converge);
+            for predicate in [false, true] {
+                let trace = execute_call_syntax(&structured, &ranges, predicate);
+                assert_eq!(trace.last(), Some(&24));
+                assert_eq!(trace.iter().filter(|&&pc| pc == 48).count(), 2);
+                assert_eq!(
+                    trace.iter().filter(|&&pc| pc == 80).count(),
+                    if predicate { 0 } else { 2 }
+                );
+                assert_eq!(trace.iter().filter(|&&pc| pc == 16).count(), 1);
+            }
+        }
+    }
+
+    fn execute_call_syntax(
+        structured: &super::super::structured_control_flow::StructuredSyntax,
+        ranges: &[CfgBlock],
+        predicate: bool,
+    ) -> Vec<u32> {
+        use super::super::structured_control_flow::{Expr, StructuredAction};
+        use crate::ir::SyntaxNode;
+        fn eval(
+            expr: &Expr,
+            variables: &std::collections::HashMap<u32, bool>,
+            predicate: bool,
+        ) -> bool {
+            match expr {
+                Expr::Identity(cond) => {
+                    assert_eq!(cond.get_flow_test(), FlowTest::T);
+                    let (pred, negated) = cond.get_pred();
+                    assert!(pred == IrPred::PT || pred == IrPred::P0);
+                    (if pred == IrPred::PT { true } else { predicate }) ^ negated
+                }
+                Expr::Variable(id) => variables[id],
+                Expr::Not(expr) => !eval(expr, variables, predicate),
+                Expr::Or(a, b) => eval(a, variables, predicate) || eval(b, variables, predicate),
+                _ => panic!("unexpected condition"),
+            }
+        }
+        let mut variables = std::collections::HashMap::new();
+        let mut conditions = std::collections::HashMap::new();
+        let mut trace = Vec::new();
+        let mut pc = 0;
+        for _ in 0..500 {
+            match &structured.syntax[pc] {
+                SyntaxNode::Block(block) => {
+                    for action in &structured.actions {
+                        match action {
+                            StructuredAction::TranslateCode {
+                                block: owner,
+                                cfg_block,
+                            } if owner == block => trace.push(ranges[*cfg_block].begin * 8),
+                            StructuredAction::SetVariable {
+                                block: owner,
+                                id,
+                                expr,
+                            } if owner == block => {
+                                let value = eval(expr, &variables, predicate);
+                                variables.insert(*id, value);
+                            }
+                            StructuredAction::Condition {
+                                block: owner,
+                                syntax_index,
+                                expr,
+                            } if owner == block => {
+                                conditions.insert(*syntax_index, eval(expr, &variables, predicate));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                SyntaxNode::If { merge, .. } => {
+                    if !conditions[&pc] {
+                        pc += 1 + structured.syntax[pc + 1..]
+                            .iter()
+                            .position(|n| matches!(n, SyntaxNode::Block(id) if id == merge))
+                            .unwrap();
+                        continue;
+                    }
+                }
+                SyntaxNode::EndIf { .. } => {}
+                SyntaxNode::Return => return trace,
+                node => panic!("unexpected call syntax {node:?}"),
+            }
+            pc += 1;
+        }
+        panic!("call graph did not return");
+    }
+
+    #[test]
+    fn indirect_branch_labels_translate_addresses_but_keep_native_comparison_values() {
+        let start = Location::new(0x50);
+        let brx = start.add_instructions(4);
+        let mut env = PretEnvironment::default();
+        for (index, word) in [
+            0x1C0F_FFFF_FFF7_0C0C,
+            0x3820_0380_0027_0C0C,
+            0x3848_0000_0027_0C0C,
+            0xEF94_0010_0C07_0C0C,
+            0xE250_0FFF_BE87_0C0F,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            env.instructions
+                .insert(start.add_instructions(index as i32).offset(), word);
+        }
+        for (index, target) in [0x20u32, 0x10, 0x20].into_iter().enumerate() {
+            env.cbuf.insert(
+                (1, 192 + index as u32 * 4),
+                target.wrapping_sub(brx.offset()).wrapping_add(1040),
+            );
+        }
+        env.translated_addresses
+            .extend([(0x10, 0x108), (0x20, 0x118)]);
+        env.instructions
+            .extend([(0x108, 0xe30000000007000f), (0x118, 0xe30000000007000f)]);
+        let cfg = FlowCfg::new(&mut env, start, false);
+        let block = cfg
+            .blocks
+            .iter()
+            .find(|b| b.end_class == EndClass::IndirectBranch)
+            .unwrap();
+        assert_eq!(
+            block
+                .indirect_branches
+                .iter()
+                .map(|b| b.address)
+                .collect::<Vec<_>>(),
+            [0x10, 0x20]
+        );
+        assert_eq!(
+            block
+                .indirect_branches
+                .iter()
+                .map(|b| cfg.blocks[b.block].begin.offset())
+                .collect::<Vec<_>>(),
+            [0x108, 0x118]
+        );
+        assert_eq!(block.branch_reg, 12);
+        assert_eq!(
+            block.branch_offset,
+            (brx.offset() as i32).wrapping_sub(1040)
+        );
     }
 
     #[test]

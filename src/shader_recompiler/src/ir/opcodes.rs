@@ -75,6 +75,10 @@ pub enum Opcode {
     SetAttributeIndexed,
     GetPatch,
     SetPatch,
+    IsbeRead,
+    IsbeWriteAttribute,
+    IsbeWriteMapU8,
+    IsbeWriteMapU32,
     SetFragColor,
     SetSampleMask,
     SetFragDepth,
@@ -774,6 +778,9 @@ impl Opcode {
                 | Opcode::SetAttribute
                 | Opcode::SetAttributeIndexed
                 | Opcode::SetPatch
+                | Opcode::IsbeWriteAttribute
+                | Opcode::IsbeWriteMapU8
+                | Opcode::IsbeWriteMapU32
                 | Opcode::SetFragColor
                 | Opcode::SetSampleMask
                 | Opcode::SetFragDepth
@@ -1419,6 +1426,27 @@ impl Opcode {
                 name: "WriteStorage128",
                 return_type: Type::Void,
                 arg_types: &[U32, U32, U32x4],
+            },
+
+            Opcode::IsbeRead => OpcodeMeta {
+                name: "IsbeRead",
+                return_type: U32,
+                arg_types: &[U32],
+            },
+            Opcode::IsbeWriteAttribute => OpcodeMeta {
+                name: "IsbeWriteAttribute",
+                return_type: Type::Void,
+                arg_types: &[U32, U32],
+            },
+            Opcode::IsbeWriteMapU8 => OpcodeMeta {
+                name: "IsbeWriteMapU8",
+                return_type: Type::Void,
+                arg_types: &[U32, U32],
+            },
+            Opcode::IsbeWriteMapU32 => OpcodeMeta {
+                name: "IsbeWriteMapU32",
+                return_type: Type::Void,
+                arg_types: &[U32, U32],
             },
 
             // Local memory

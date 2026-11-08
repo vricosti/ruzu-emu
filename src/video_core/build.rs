@@ -37,11 +37,14 @@ fn main() {
     let avutil = pkg_config::Config::new()
         .probe("libavutil")
         .expect("libavutil is required for video_core FFmpeg decoding");
+    pkg_config::Config::new()
+        .probe("libswscale")
+        .expect("libswscale is required for NX2 video conversion");
     let libva = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("linux" | "freebsd") => pkg_config::Config::new().probe("libva").ok(),
         _ => None,
     };
-    for package in ["libavcodec", "libavutil"] {
+    for package in ["libavcodec", "libavutil", "libswscale"] {
         track_pkg_config_file(package);
     }
     if libva.is_some() {

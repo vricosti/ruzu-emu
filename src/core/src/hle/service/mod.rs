@@ -12,6 +12,8 @@ pub mod ipc_helpers;
 pub mod kernel_helpers;
 pub mod server_manager;
 pub mod service;
+pub mod nx2_stub_interface;
+pub mod nx2_gsv;
 pub mod services;
 
 // Service Manager
@@ -28,6 +30,7 @@ pub mod bpc;
 pub mod btdrv;
 pub mod btm;
 pub mod caps;
+pub mod chat;
 pub mod erpt;
 pub mod es;
 pub mod eupld;

@@ -22,7 +22,7 @@ use crate::memory_manager::MemoryManager;
 use crate::query_cache::query_cache::{RenderConditionState, RenderConditionStateSource};
 use crate::query_cache::types::ComparisonMode;
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
-use crate::r#macro::MacroEngine;
+use crate::r#macro::{MacroEngine, SharedNativeMacroContext};
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use crate::textures::texture::{TicEntry, TscEntry};
 use crate::transform_feedback::{TransformFeedbackLayout, TransformFeedbackState};
@@ -284,6 +284,12 @@ pub(crate) const NUM_VERTEX_ARRAYS: u32 = 32;
 /// Shader pipeline base. 6 stages, 0x10 words each.
 /// Per stage: +0 packed(enable|type), +1 offset, +3 register_count, +4 binding_group.
 pub(crate) const PIPELINE_BASE: u32 = reg_index!(0x2000);
+// Maxwell3D::Regs constants from Eglantine 900ab5a8251dcdb5eee42dd2837fa936ade15303.
+// NVN task/mesh control and configuration remain owned by the 3D register bank.
+pub const MESH_CONTROL: u32 = reg_index!(0x114c);
+pub const MESH_SHADER_A: u32 = reg_index!(0x1150);
+pub const MESH_SHADER_B: u32 = reg_index!(0x1154);
+pub const MESH_INIT_SHADER: u32 = reg_index!(0x1158);
 pub(crate) const PIPELINE_STRIDE: u32 = 0x10;
 pub(crate) const NUM_SHADER_PROGRAMS: usize = 6;
 
@@ -2370,6 +2376,12 @@ pub struct Maxwell3D {
     rasterizer: Option<RasterizerHandle>,
     /// Start offsets of each macro in macro memory.
     macro_positions: [u32; 0x80],
+    native_macro_context: Option<SharedNativeMacroContext>,
+    /// This channel's MME data RAM, also used by its compute engine upstream.
+    // Keep RAM outside the engine allocation: native macro callbacks borrow
+    // Maxwell3D while the interpreter borrows this channel's RAM. Compute shares
+    // this exact allocation, not a copy or process-wide RAM.
+    native_data_ram: Arc<Mutex<crate::macro_turing::DataRam>>,
     /// MME macro engine for uploaded programmable macro execution.
     macro_engine: MacroEngine,
     /// Upstream owner `Upload::State upload_state`.
@@ -2414,6 +2426,64 @@ pub enum HleReplacementAttributeType {
 }
 
 impl Maxwell3D {
+    /// Port of SetNativeMacroContext. Attaching a context does not enable mode.
+    pub fn set_native_macro_context(&mut self, context: Option<SharedNativeMacroContext>) {
+        self.native_macro_context = context;
+    }
+
+    /// Port of SetNativeTuringMacroMode, including the upload-state transition.
+    pub fn set_native_turing_macro_mode(&mut self, enabled: bool) {
+        self.get_native_macro_engine(|engine| engine.native_turing = enabled);
+        self.upload_state.set_native_partial_transfers(enabled);
+    }
+
+    /// Port of GetNativeMacroEngine. The callback is a short borrow adapter for
+    /// the shared context guard; execution uses a raw entry under its own guard.
+    pub(crate) fn get_native_macro_engine<R>(&mut self, access: impl FnOnce(&mut MacroEngine) -> R) -> R {
+        if let Some(context) = &self.native_macro_context {
+            let guard = context.lock();
+            let result = access(&mut guard.borrow_mut().engine);
+            result
+        } else {
+            access(&mut self.macro_engine)
+        }
+    }
+
+    /// Read-only borrow of upstream GetNativeMacroEngine for shader construction.
+    /// Uses the same selected owner as the mutable accessor, without copying mode state.
+    pub(crate) fn get_native_macro_engine_read<R>(&self, access: impl FnOnce(&MacroEngine) -> R) -> R {
+        if let Some(context) = &self.native_macro_context {
+            let guard = context.lock();
+            let result = access(&guard.borrow().engine);
+            result
+        } else {
+            access(&self.macro_engine)
+        }
+    }
+
+    /// Port of GetNativeMacroPositions with the same short-borrow adaptation.
+    pub(crate) fn get_native_macro_positions<R>(&mut self, access: impl FnOnce(&mut [u32; 0x80]) -> R) -> R {
+        if let Some(context) = &self.native_macro_context {
+            let guard = context.lock();
+            let result = access(&mut guard.borrow_mut().positions);
+            result
+        } else {
+            access(&mut self.macro_positions)
+        }
+    }
+
+    /// Port of Maxwell3D::GetMemoryManager. Returns the existing owner handle;
+    /// callers control lock scope when flushing or reading macro DMA data.
+    pub fn get_memory_manager(&self) -> &Arc<Mutex<MemoryManager>> {
+        self.memory_manager.as_ref().expect("Maxwell3D requires its upstream MemoryManager owner")
+    }
+
+    /// Port of Maxwell3D::GetNativeDataRam. This is channel-owned storage,
+    /// independent of shared macro code and binding positions.
+    pub fn get_native_data_ram(&self) -> &Arc<Mutex<crate::macro_turing::DataRam>> {
+        &self.native_data_ram
+    }
+
     /// Port of upstream `Maxwell3D::GetRegisterValue` used by macro engines.
     pub(crate) fn get_register_value(&self, method: u32) -> u32 {
         assert!(
@@ -2563,6 +2633,8 @@ impl Maxwell3D {
             pending_semaphore_writes: Vec::new(),
             rasterizer: None,
             macro_positions: [0u32; 0x80],
+            native_macro_context: None,
+            native_data_ram: Arc::new(Mutex::new([0; 0xc00])),
             macro_engine: MacroEngine::new(is_macro_interpreted),
             upload_state,
             memory_manager,
@@ -3578,6 +3650,11 @@ impl Maxwell3D {
             .is_some_and(|index| self.is_shader_stage_enabled(index))
     }
 
+    /// Port of `Regs::IsMeshEnabled`; other bits do not enable mesh processing.
+    pub fn is_mesh_enabled(&self) -> bool {
+        (self.regs[MESH_CONTROL as usize] & 1) != 0
+    }
+
     /// GPU virtual base address of the shader program region.
     ///
     /// Upstream: `Maxwell3D::Regs::ProgramRegion::Address()` —
@@ -4288,6 +4365,15 @@ impl Maxwell3D {
 
     // ── Shadow RAM processing (matching upstream ProcessShadowRam) ──────
 
+    /// Upstream Maxwell3D::SkipSameValueWrites (maxwell_3d.h).
+    fn skip_same_value_writes() -> bool {
+        static SKIP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("EDEN_NX2_SKIP_SAME")
+                .is_none_or(|value| !value.to_string_lossy().starts_with('0'))
+        });
+        *SKIP
+    }
+
     /// Process shadow RAM for a register write, returning the effective
     /// argument value. Matches upstream `Maxwell3D::ProcessShadowRam`.
     fn process_shadow_ram(&mut self, method: u32, argument: u32) -> u32 {
@@ -4343,11 +4429,11 @@ impl Maxwell3D {
             }
             LOAD_MME_INSTRUCTION_PTR => {
                 let ptr = self.regs[LOAD_MME_INSTRUCTION_PTR as usize];
-                self.macro_engine.clear_code(ptr);
+                self.get_native_macro_engine(|engine| engine.clear_code(ptr));
             }
             LOAD_MME_INSTRUCTION => {
                 let ptr = self.regs[LOAD_MME_INSTRUCTION_PTR as usize];
-                self.macro_engine.add_code(ptr, argument);
+                self.get_native_macro_engine(|engine| engine.add_code(ptr, argument));
             }
             LOAD_MME_START_ADDR => {
                 self.process_macro_bind(argument);
@@ -4436,20 +4522,24 @@ impl Maxwell3D {
             common::assert::assert_fail_soft_impl();
         }
 
-        let copy_size = data.len() as u32 * 4;
+        let copy_size = std::mem::size_of_val(data);
         let address = buffer_address.wrapping_add(offset as u64);
 
         if let Some(memory_manager) = self.memory_manager.as_ref().cloned() {
-            let mut bytes = Vec::with_capacity(copy_size as usize);
-            for value in data {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
+            // Upstream passes start_base directly to WriteBlockCached. On
+            // little-endian hosts these words already have the guest layout.
+            #[cfg(target_endian = "little")]
+            let bytes: &[u8] = bytemuck::cast_slice(data);
+            #[cfg(target_endian = "big")]
+            let storage: Vec<u8> = data.iter().flat_map(|value| value.to_le_bytes()).collect();
+            #[cfg(target_endian = "big")]
+            let bytes = storage.as_slice();
             let mut memory_manager = memory_manager.lock();
-            memory_manager.write_block_cached(address, &bytes);
+            memory_manager.write_block_cached(address, bytes);
         }
 
         // Increment the current buffer position.
-        self.regs[cb_base + 3] = offset.wrapping_add(copy_size);
+        self.regs[cb_base + 3] = offset.wrapping_add(copy_size as u32);
     }
 
     /// Handle CB_BIND trigger for a shader stage. Matches upstream `ProcessCBBind`.
@@ -4508,8 +4598,8 @@ impl Maxwell3D {
     /// Bind a macro start address. Matches upstream `ProcessMacroBind`.
     fn process_macro_bind(&mut self, data: u32) {
         let ptr = self.regs[LOAD_MME_START_ADDR_PTR as usize];
-        self.macro_positions[ptr as usize] = data;
-        self.regs[LOAD_MME_START_ADDR_PTR as usize] = ptr + 1;
+        self.get_native_macro_positions(|positions| positions[ptr as usize] = data);
+        self.regs[LOAD_MME_START_ADDR_PTR as usize] = ptr.wrapping_add(1);
         log::info!(
             "Maxwell3D::process_macro_bind slot={} start=0x{:X}",
             ptr,
@@ -4524,7 +4614,19 @@ impl Maxwell3D {
         self.regs[SHADOW_SCRATCH_BASE as usize] = 1;
     }
 
-    pub(crate) fn max_current_vertices(&self) -> u32 {
+    /// Port of Regs::NativeVertexStreamSize (40-bit size, not an end address).
+    pub fn native_vertex_stream_size(&self, index: usize) -> u64 {
+        let method = 0x600 / std::mem::size_of::<u32>() + index * 2;
+        (u64::from(self.regs[method] & 0xff) << 32) | u64::from(self.regs[method + 1])
+    }
+
+    /// Port of Maxwell3D::GetMaxCurrentVertices.
+    pub(crate) fn get_max_current_vertices(&self) -> u32 {
+        let native_turing = if let Some(context) = &self.native_macro_context {
+            context.lock().borrow().engine.native_turing
+        } else {
+            self.macro_engine.native_turing
+        };
         let mut num_vertices = 0u32;
         for index in 0..32u32 {
             let array = self.vertex_stream_info(index);
@@ -4540,9 +4642,11 @@ impl Maxwell3D {
 
             let limit = self.vertex_stream_limit(index);
             let gpu_addr_begin = array.address;
-            let gpu_addr_end = limit.address.saturating_add(1);
-            let address_size = gpu_addr_end.saturating_sub(gpu_addr_begin) as u32;
-            let vertex_stride = attribute.size.size_bytes().max(array.stride).max(1);
+            let gpu_addr_end = limit.address.wrapping_add(1);
+            let stream_size = if native_turing { self.native_vertex_stream_size(index as usize) }
+                else { gpu_addr_end.wrapping_sub(gpu_addr_begin) };
+            let address_size = stream_size.min(u64::from(u32::MAX)) as u32;
+            let vertex_stride = attribute.size.size_bytes().max(array.stride);
             num_vertices = num_vertices.max(address_size / vertex_stride);
             break;
         }
@@ -4560,7 +4664,7 @@ impl Maxwell3D {
         // of distinct index values, not the largest one.
         let max_size = 1u64 << (byte_size * 8);
         let cap = self
-            .max_current_vertices()
+            .get_max_current_vertices()
             .saturating_mul(4)
             .saturating_mul(byte_size as u32) as usize;
         let lower_cap = (end_address.saturating_sub(start_address) as usize).min(cap);
@@ -4801,19 +4905,39 @@ impl Maxwell3D {
         // vector into this call so Rust can update the exact parameter slice
         // without creating an immutable/mutable alias or a stale clone.
         let mut params = std::mem::take(&mut self.macro_params);
-        let macro_method = self.macro_positions[entry as usize];
+        // Keep the context lock across execution, but no RefMut. Emitted uploads
+        // reenter this lock and borrow only while updating code/bindings. The raw
+        // pointer originates from RefCell's UnsafeCell, not a short-lived RefMut.
+        let context = self.native_macro_context.clone();
+        let guard = context.as_ref().map(|context| context.lock());
+        let (macro_engine, macro_method) = if let Some(guard) = &guard {
+            let context = guard.as_ptr();
+            unsafe { (std::ptr::addr_of_mut!((*context).engine), (*context).positions[entry as usize]) }
+        } else {
+            (std::ptr::addr_of_mut!(self.macro_engine), self.macro_positions[entry as usize])
+        };
         let self_raw = std::ptr::from_mut(self);
         let self_ptr = Maxwell3DPtr(self_raw);
-        self.macro_engine.execute(
-            self_raw,
-            macro_method,
-            &mut params,
-            move |parameters| unsafe { (&mut *self_ptr.0).refresh_parameters_impl(parameters) },
-        );
+        // This callback replaces upstream RefreshParameters, including its
+        // dirty guard; the parameter storage is temporarily owned by params.
+        let refresh_parameters = move |parameters: &mut [u32]| unsafe {
+            let maxwell = &mut *self_ptr.0;
+            if maxwell.current_macro_dirty {
+                maxwell.refresh_parameters_impl(parameters);
+            }
+        };
+        unsafe {
+            if (*macro_engine).native_turing {
+                MacroEngine::execute_native(macro_engine, self_raw, macro_method, &mut params,
+                    refresh_parameters);
+            } else {
+                (&mut *macro_engine).execute(self_raw, macro_method, &mut params,
+                    refresh_parameters);
+            }
+        }
+        drop(guard);
 
-        // Direct BEGIN/END instances are already submitted at END. Unlike
-        // upstream DrawDeferred, completing an unrelated macro must not emit
-        // old geometry using registers changed by that macro.
+        self.with_draw_manager(|draw_manager, this| draw_manager.draw_deferred(this));
 
         params.clear();
         debug_assert!(self.macro_params.is_empty());
@@ -4835,22 +4959,29 @@ impl Maxwell3D {
     fn consume_sink_inner(&mut self) {
         let control = ShadowRamControl::from_raw(self.shadow_state[SHADOW_RAM_CONTROL as usize]);
         let mut sink = std::mem::take(&mut self.interface_state.method_sink);
+        let skip_same = Self::skip_same_value_writes();
         match control {
             ShadowRamControl::Track | ShadowRamControl::TrackWithFilter => {
                 for (method, value) in &sink {
                     self.shadow_state[*method as usize] = *value;
-                    self.process_dirty_registers(*method, *value);
+                    if !skip_same || self.regs[*method as usize] != *value {
+                        self.process_dirty_registers(*method, *value);
+                    }
                 }
             }
             ShadowRamControl::Replay => {
                 for (method, _value) in &sink {
                     let shadow_val = self.shadow_state[*method as usize];
-                    self.process_dirty_registers(*method, shadow_val);
+                    if !skip_same || self.regs[*method as usize] != shadow_val {
+                        self.process_dirty_registers(*method, shadow_val);
+                    }
                 }
             }
             ShadowRamControl::Passthrough => {
                 for (method, value) in &sink {
-                    self.process_dirty_registers(*method, *value);
+                    if !skip_same || self.regs[*method as usize] != *value {
+                        self.process_dirty_registers(*method, *value);
+                    }
                 }
             }
         }
@@ -4865,21 +4996,7 @@ impl Maxwell3D {
             return;
         }
         let method = self.executing_macro;
-        let mut params = std::mem::take(&mut self.macro_params);
-        let entry = ((method - MACRO_METHODS_START) >> 1) % 128;
-        let macro_method = self.macro_positions[entry as usize];
-        let self_raw = std::ptr::from_mut(self);
-        let self_ptr = Maxwell3DPtr(self_raw);
-        self.macro_engine.execute(
-            self_raw,
-            macro_method,
-            &mut params,
-            move |parameters| unsafe { (&mut *self_ptr.0).refresh_parameters_impl(parameters) },
-        );
-        self.executing_macro = 0;
-        params.clear();
-        debug_assert!(self.macro_params.is_empty());
-        self.macro_params = params;
+        self.call_macro_method(method);
     }
 }
 
@@ -4912,7 +5029,22 @@ impl EngineInterface for Maxwell3D {
             method
         );
 
+        if crate::nx2_profile::enabled() {
+            use crate::nx2_profile::{add, Counter};
+            add(Counter::MethodWrites, 1);
+            if self.regs[method as usize] == method_argument {
+                add(Counter::SameValueWrites, 1);
+            }
+        }
         let argument = self.process_shadow_ram(method, method_argument);
+        // State-only writes still update shadow RAM before this check.
+        // Executable methods always retain dirty tracking and side effects.
+        if !self.interface_state.execution_mask[method as usize] {
+            if !Self::skip_same_value_writes() || self.regs[method as usize] != argument {
+                self.process_dirty_registers(method, argument);
+            }
+            return;
+        }
         self.process_dirty_registers(method, argument);
         self.process_method_call(method, argument, method_argument, is_last_call);
     }

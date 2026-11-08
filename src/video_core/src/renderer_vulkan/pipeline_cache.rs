@@ -1011,6 +1011,52 @@ struct GraphicsPipelineBuilder {
     host_info: HostTranslateInfo,
 }
 
+fn mesh_graphics_output_binding(fragment: Option<&ShaderInfo>) -> u32 {
+    fragment.map_or(0, |info| (info.constant_buffer_descriptors.len()
+        + info.storage_buffers_descriptors.len() + info.texture_buffer_descriptors.len()
+        + info.image_buffer_descriptors.len() + info.texture_descriptors.len()
+        + info.image_descriptors.len()) as u32)
+}
+
+/// Compute-backed mesh still uses the real guest fragment program and normal
+/// fixed-state runtime specialization. Only the preceding vertex stage is the
+/// generated reader of the output transport.
+fn compile_mesh_graphics_stages(
+    device: &Device, profile: &Profile, host_info: &HostTranslateInfo,
+    key: &GraphicsPipelineKey, environments: &mut GraphicsEnvironments,
+    mesh: &shader_recompiler::shader_info::MeshInfo,
+) -> Result<[Option<CompiledShader>; NUM_GRAPHICS_STAGES], String> {
+    let fragment = if key.unique_hashes[5] != 0 {
+        if !environments.env_ptrs.contains(&Some(5)) { return Err("Missing mesh fragment environment".into()); }
+        let env = &mut environments.envs[5];
+        if env.generic_environment().cached_code_slice().is_empty()
+            && env.generic_environment_mut().analyze().is_none() {
+            return Err("Mesh fragment analysis failed".into());
+        }
+        let code = env.generic_environment().cached_instruction_slice().to_vec();
+        let start = env.generic_environment().cached_instruction_start();
+        Some(shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(&code, start, env, host_info))
+    } else { None };
+    let output_binding = mesh_graphics_output_binding(fragment.as_ref().map(|program| &program.info));
+    let programs = std::array::from_fn(|_| None);
+    let mut vertex = Program::new(ShaderStage::VertexB);
+    let runtime = make_runtime_info(&programs, key, &vertex, None, device);
+    let (spirv_words, info) = shader_recompiler::backend::spirv::emit_spirv::emit_mesh_vertex_spirv_with_info(
+        mesh, profile, &runtime, output_binding).map_err(|error| error.to_string())?;
+    vertex.info = info;
+    let mut stages = std::array::from_fn(|_| None);
+    stages[0] = Some(CompiledShader { spirv_words, info: vertex.info.clone(), stage: ShaderStage::VertexB });
+    if let Some(fragment) = fragment {
+        let runtime = make_runtime_info(&programs, key, &fragment, Some(&vertex), device);
+        let mut bindings = Bindings::default();
+        let spirv_words = shader_recompiler::backend::spirv::emit_spirv::emit_spirv_with_bindings(
+            &fragment, profile, &runtime, &mut bindings);
+        if bindings.unified != output_binding { return Err("Mesh graphics descriptor binding mismatch".into()); }
+        stages[4] = Some(CompiledShader { spirv_words, info: fragment.info.clone(), stage: fragment.stage });
+    }
+    Ok(stages)
+}
+
 impl GraphicsPipelineBuilder {
     fn new(device: &Device, profile: Profile, host_info: HostTranslateInfo) -> Self {
         Self {
@@ -1053,6 +1099,7 @@ impl GraphicsPipelineBuilder {
             Some(worker),
             runtime,
             pipeline_statistics,
+            false,
         )
     }
 
@@ -1081,6 +1128,7 @@ impl GraphicsPipelineBuilder {
                 None,
                 runtime,
                 pipeline_statistics,
+                false,
             )
         }) {
             Ok(pipeline) => pipeline,
@@ -1104,6 +1152,7 @@ impl GraphicsPipelineBuilder {
         worker: Option<&ThreadWorker>,
         runtime: GraphicsPipelineRuntime,
         pipeline_statistics: Option<Arc<PipelineStatistics>>,
+        has_mesh_output: bool,
     ) -> Option<GraphicsPipeline> {
         let shader_modules = self.create_shader_modules(key, &compiled_stages)?;
         let pipeline = match GraphicsPipeline::new_unbuilt(
@@ -1113,6 +1162,7 @@ impl GraphicsPipelineBuilder {
             key,
             stage_infos_from_compiled(&compiled_stages),
             shader_modules,
+            has_mesh_output,
             false,
             runtime,
         ) {
@@ -1362,7 +1412,7 @@ impl Default for ShaderPools {
 // upstream); older caches carry corrupted attribute state.
 // Version 13: FixedPipelineState::refresh now leaves fields covered by a
 // supported dynamic-state extension at zero (upstream semantics). Older
-// caches carry per-draw dynamic state baked into keys — thousands of
+// caches carry per-draw dynamic state baked into keys â€” thousands of
 // duplicate pipelines per logical key that can never match again.
 // Version 14: Maxwell sched-control decoding is anchored at the shader code
 // start. Version 13 caches may contain environments captured with the old
@@ -1705,6 +1755,17 @@ fn get_pipeline_worker_count(has_broken_parallel_shader_compiling: bool) -> usiz
 
 /// Port of `PipelineCache` class.
 ///
+/// Cache-owned compute portion of a guest mesh graphics pipeline. The task
+/// stage is absent for direct mesh draws. Metadata remains the translated
+/// upstream MeshInfo used by both transport allocation and generated vertices.
+pub(crate) struct MeshComputePrograms {
+    pub task: Option<super::compute_pipeline::MeshComputeStage>,
+    pub task_info: Option<shader_recompiler::shader_info::MeshInfo>,
+    pub task_workgroup_bound: Option<u32>,
+    pub mesh: super::compute_pipeline::MeshComputeStage,
+    pub mesh_info: shader_recompiler::shader_info::MeshInfo,
+}
+
 /// Extends `ShaderCache` to manage Vulkan graphics and compute pipeline
 /// objects, with disk serialization support.
 pub struct PipelineCache {
@@ -1735,6 +1796,10 @@ pub struct PipelineCache {
     graphics_cache:
         HashMap<GraphicsPipelineKey, Option<Rc<GraphicsPipeline>>, BuildUnorderedDenseHasher>,
     graphics_key: GraphicsPipelineKey,
+    // Compute execution is independent of fixed rasterization state. Shader
+    // hashes already include upstream mesh-register/primitive-header identity.
+    mesh_compute_cache: HashMap<[u64; NUM_PROGRAMS], Option<Rc<MeshComputePrograms>>, BuildUnorderedDenseHasher>,
+    mesh_graphics_cache: HashMap<GraphicsPipelineKey, Option<Rc<GraphicsPipeline>>, BuildUnorderedDenseHasher>,
     current_pipeline: Option<Rc<GraphicsPipeline>>,
     dynamic_features: DynamicFeatures,
 
@@ -1883,6 +1948,8 @@ impl PipelineCache {
             ),
             graphics_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
             graphics_key: GraphicsPipelineKey::default(),
+            mesh_compute_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
+            mesh_graphics_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
             current_pipeline: None,
             dynamic_features,
             main_pools: ShaderPools::new(),
@@ -1929,6 +1996,16 @@ impl PipelineCache {
         draw: &mut Maxwell3DDrawView<'_>,
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&GraphicsPipeline> {
+        // Launch-time opt-in for the compute mesh adaptation; avoid querying
+        // the host environment on every ordinary graphics-pipeline lookup.
+        static MESH_DRAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *MESH_DRAW.get_or_init(|| std::env::var_os("RUZU_NX2_MESH_DRAW").is_some())
+            && shared_cache.current_maxwell3d().is_some_and(|maxwell| maxwell.is_mesh_enabled()
+                && maxwell.get_native_macro_engine_read(|engine| engine.native_turing)) {
+            let programs = self.current_mesh_compute_programs(shared_cache)?;
+            self.current_pipeline = self.current_mesh_graphics_pipeline(draw, shared_cache, &programs.mesh_info);
+            return self.current_pipeline.as_deref();
+        }
         if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
             self.current_pipeline = None;
             return None;
@@ -1952,6 +2029,122 @@ impl PipelineCache {
 
         let key = self.graphics_key.clone();
         self.current_graphics_pipeline_slow_path(draw, shared_cache, key)
+    }
+
+    fn current_mesh_graphics_pipeline(
+        &mut self, draw: &mut Maxwell3DDrawView<'_>, shared_cache: &SharedShaderCache,
+        mesh: &shader_recompiler::shader_info::MeshInfo,
+    ) -> Option<Rc<GraphicsPipeline>> {
+        self.graphics_key.fixed_state.refresh(draw, &self.dynamic_features);
+        let mut key = self.graphics_key.clone();
+        let topology = match mesh.topology {
+            0 => PrimitiveTopology::Points,
+            1 => PrimitiveTopology::Lines,
+            _ => PrimitiveTopology::Triangles,
+        };
+        key.fixed_state.set_topology(topology);
+        key.fixed_state.dynamic_state.set_primitive_restart_enable(false);
+        let rasterizer = draw.rasterizer();
+        key.fixed_state.dynamic_state.set_depth_bias_enable(match topology {
+            PrimitiveTopology::Points => rasterizer.polygon_offset_point_enable,
+            PrimitiveTopology::Lines => rasterizer.polygon_offset_line_enable,
+            _ => rasterizer.polygon_offset_fill_enable,
+        });
+        if !self.mesh_graphics_cache.contains_key(&key) {
+            let mut environments = GraphicsEnvironments::default();
+            shared_cache.get_graphics_environments(&mut environments, &key.unique_hashes);
+            let result = catch_shader_exception(|| {
+                let stages = compile_mesh_graphics_stages(self.device_owner.get(), &self.profile, &self.host_info,
+                    &key, &mut environments, mesh)?;
+                self.graphics_pipeline_builder.build_pipeline(self.vulkan_pipeline_cache, self.shader_notify,
+                    &key, stages, None, self.graphics_runtime, None, true)
+                    .ok_or_else(|| "Mesh graphics pipeline creation failed".to_string())
+            }).and_then(|result| result);
+            let pipeline = match result {
+                Ok(pipeline) => Some(Rc::new(pipeline)),
+                Err(error) => { log::error!("Mesh graphics pipeline: {error}"); None }
+            };
+            self.mesh_graphics_cache.insert(key.clone(), pipeline);
+            self.queue_vulkan_pipeline_cache_flush();
+        }
+        self.mesh_graphics_cache.get(&key)?.as_ref().map(Rc::clone)
+    }
+
+    /// Mesh-compute counterpart of CurrentGraphicsPipeline/CreateGraphicsPipeline.
+    /// The caller supplies the shared cache constructed with new_mesh_compute;
+    /// it must be the sole consumer of the channel's shader dirty flags.
+    pub(crate) fn current_mesh_compute_programs(
+        &mut self, shared_cache: &mut SharedShaderCache,
+    ) -> Option<Rc<MeshComputePrograms>> {
+        let maxwell = shared_cache.current_maxwell3d()?;
+        if !maxwell.is_mesh_enabled()
+            || !maxwell.get_native_macro_engine_read(|engine| engine.native_turing) {
+            return None;
+        }
+        // Share the persistent hashes with ordinary graphics lookup: RefreshStages
+        // leaves them untouched when shaders aren't dirty, including on draws
+        // following a task/mesh draw in the same channel.
+        if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
+            return None;
+        }
+        let hashes = self.graphics_key.unique_hashes;
+        if !self.mesh_compute_cache.contains_key(&hashes) {
+            let mut environments = GraphicsEnvironments::default();
+            shared_cache.get_graphics_environments(&mut environments, &hashes);
+            let built = catch_shader_exception(|| -> Result<MeshComputePrograms, String> {
+                let mut task = None;
+                let mut task_info = None;
+                let mut task_workgroup_bound = None;
+                let mut mesh = None;
+                let mut mesh_info = None;
+                for index in [1, 3] {
+                    if hashes[index] == 0 { continue; }
+                    if !environments.env_ptrs.contains(&Some(index)) {
+                        return Err(format!("Missing mesh environment at graphics program {index}"));
+                    }
+                    let env = &mut environments.envs[index];
+                    if env.generic_environment().cached_code_slice().is_empty()
+                        && env.generic_environment_mut().analyze().is_none() {
+                        return Err(format!("Mesh analysis failed at graphics program {index}"));
+                    }
+                    let code = env.generic_environment().cached_instruction_slice().to_vec();
+                    let start = env.generic_environment().cached_instruction_start();
+                    let program = shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
+                        &code, start, env, &self.host_info);
+                    let shader = shader_recompiler::backend::spirv::emit_spirv::emit_mesh_compute_spirv_with_task_guard(
+                        &program, &self.profile, &RuntimeInfo::default(), &mut Bindings::default(), task.is_some())
+                        .map_err(|error| error.to_string())?;
+                    let stage = super::compute_pipeline::MeshComputeStage::new(self.device_owner.get(),
+                        program.info.clone(), &shader, index - 1, self.vulkan_pipeline_cache)
+                        .map_err(|error| format!("Mesh pipeline creation: {error:?}"))?;
+                    if program.info.is_task {
+                        if task.is_some() { return Err("Duplicate task stage".into()); }
+                        task = Some(stage);
+                        task_info = Some(program.mesh.clone());
+                        task_workgroup_bound = shader_recompiler::backend::spirv::emit_spirv_mesh::task_mesh_workgroup_bound(&program);
+                    } else {
+                        if mesh.is_some() { return Err("Duplicate mesh stage".into()); }
+                        mesh = Some(stage);
+                        mesh_info = Some(program.mesh.clone());
+                    }
+                }
+                Ok(MeshComputePrograms {
+                    task, task_info, task_workgroup_bound,
+                    mesh: mesh.ok_or("Mesh graphics pipeline has no mesh stage")?,
+                    mesh_info: mesh_info.ok_or("Mesh graphics pipeline has no mesh metadata")?,
+                })
+            }).and_then(|result| result);
+            let programs = match built {
+                Ok(programs) => Some(Rc::new(programs)),
+                Err(error) => {
+                    log::error!("Mesh compute pipeline: {error}");
+                    None
+                }
+            };
+            self.mesh_compute_cache.insert(hashes, programs);
+            self.queue_vulkan_pipeline_cache_flush();
+        }
+        self.mesh_compute_cache.get(&hashes)?.as_ref().map(Rc::clone)
     }
 
     /// Port of upstream `PipelineCache::CurrentComputePipeline`.
@@ -2496,6 +2689,18 @@ impl Drop for PipelineCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mesh_output_binding_follows_descriptor_declarations_not_array_elements() {
+        use shader_recompiler::shader_info::{ConstantBufferDescriptor, StorageBufferDescriptor};
+        assert_eq!(mesh_graphics_output_binding(None), 0);
+        let mut fragment = ShaderInfo::default();
+        fragment.constant_buffer_descriptors.push(ConstantBufferDescriptor { index: 0, count: 4 });
+        fragment.storage_buffers_descriptors.push(StorageBufferDescriptor {
+            cbuf_index: 0, cbuf_offset: 16, count: 8, is_written: false,
+        });
+        assert_eq!(mesh_graphics_output_binding(Some(&fragment)), 2);
+    }
+
     use crate::engines::const_buffer_info::ConstBufferInfo;
     use crate::engines::maxwell_3d::{
         AntiAliasAlphaControlInfo, BlendColorInfo, BlendInfo, ColorMaskInfo, ComparisonOp,

@@ -3,30 +3,303 @@
 
 //! Vulkan rasterizer port matching zuyu `vk_rasterizer.h/.cpp`.
 //!
-//! Ref: zuyu `vk_rasterizer.h/.cpp` — central orchestrator that coordinates
+//! Ref: zuyu `vk_rasterizer.h/.cpp` â€” central orchestrator that coordinates
 //! shader compilation, pipeline caching, buffer/texture management, command
 //! batching, and GPU state tracking for efficient Vulkan rendering.
 //!
 //! # Components
 //!
-//! - [`Scheduler`] — command chunk batching + submission
-//! - [`StateTracker`] — dirty flags for selective state updates
-//! - [`FixedPipelineState`] — hashable pipeline key
-//! - [`GraphicsPipelineCache`] — compiled VkPipeline caching
-//! - [`RenderPassCache`] — format-keyed VkRenderPass caching
-//! - [`StagingBufferPool`] — CPU↔GPU transfer buffer pooling
-//! - [`DescriptorPool`] — banked descriptor set allocation
-//! - [`UpdateDescriptorQueue`] — ring-buffered descriptor updates
-//! - [`BufferCache`] — vertex/index/uniform buffer management
-//! - [`TextureCache`] — image/view/sampler/framebuffer management
+//! - [`Scheduler`] â€” command chunk batching + submission
+//! - [`StateTracker`] â€” dirty flags for selective state updates
+//! - [`FixedPipelineState`] â€” hashable pipeline key
+//! - [`GraphicsPipelineCache`] â€” compiled VkPipeline caching
+//! - [`RenderPassCache`] â€” format-keyed VkRenderPass caching
+//! - [`StagingBufferPool`] â€” CPUâ†”GPU transfer buffer pooling
+//! - [`DescriptorPool`] â€” banked descriptor set allocation
+//! - [`UpdateDescriptorQueue`] â€” ring-buffered descriptor updates
+//! - [`BufferCache`] â€” vertex/index/uniform buffer management
+//! - [`TextureCache`] â€” image/view/sampler/framebuffer management
 
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
+use crate::nx2_profile::{Scope as ProfileScope, Zone as ProfileZone};
 
 use std::ptr::NonNull;
 use std::sync::{Arc, Once};
 
 use ash::vk;
 use ash::vk::Handle;
+
+fn mesh_dispatch_mapping_fits(group_count: u32, max_groups: u32, mapping_bytes: u64) -> bool {
+    let record_bytes = u64::from(shader_recompiler::backend::spirv::spirv_emit_context::MeshDispatchRecord::WORDS) * 4;
+    group_count <= max_groups && u64::from(group_count) * record_bytes <= mapping_bytes
+}
+
+/// Mechanical batching of the compute transport's indirect records. FirstVertex
+/// still selects the original output record, including holes from culled tasks.
+fn mesh_indirect_draw_batches(count: u32, stride: u64, max_draws: u32)
+    -> impl Iterator<Item = (u64, u32)> {
+    assert_ne!(max_draws, 0, "Vulkan indirect draw limit must be nonzero");
+    (0..count).step_by(max_draws as usize)
+        .map(move |first| (u64::from(first) * stride, (count - first).min(max_draws)))
+}
+
+/// The output allocation stays deferred until its generated vertex/indirect
+/// consumer has been recorded. The caller then returns it with FreeDeferred.
+struct MeshComputeOutput {
+    buffer: super::staging_buffer_pool::StagingBufferRef,
+    descriptor: vk::DescriptorBufferInfo,
+    record_count: u32,
+    stride_bytes: u64,
+    image_views: Vec<crate::texture_cache::texture_cache_base::ImageViewInOut>,
+    task_count: Option<MeshTaskIndirectCount>,
+}
+
+/// Exact TaskEpilogue counts stay GPU-owned through the graphics consumer.
+#[derive(Clone, Copy)]
+struct MeshTaskIndirectCount {
+    buffer: super::staging_buffer_pool::StagingBufferRef,
+    parent_count: u32,
+    payload_words: u32,
+    child_capacity: u32,
+}
+
+impl MeshTaskIndirectCount {
+    fn draw_offsets(&self, output_stride: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+        (0..self.parent_count).map(move |parent| (
+            u64::from(parent) * u64::from(self.child_capacity) * output_stride,
+            self.buffer.offset + (u64::from(parent) * u64::from(self.payload_words) + 1) * 4,
+        ))
+    }
+}
+
+impl MeshComputeOutput {
+    fn retains(&self, buffer: vk::Buffer) -> bool {
+        self.buffer.buffer == buffer || self.task_count.is_some_and(|count| count.buffer.buffer == buffer)
+    }
+}
+
+fn mesh_output_record_capacity(
+    layout: shader_recompiler::backend::spirv::spirv_emit_context::MeshOutputLayout,
+    max_storage_range: u64,
+) -> Result<u32, &'static str> {
+    if layout.stride_words == 0 || layout.vertex_span == 0 {
+        return Err("empty mesh output layout");
+    }
+    Ok((max_storage_range / (u64::from(layout.stride_words) * 4))
+        .min(u64::from(u32::MAX / layout.stride_words))
+        .min(u64::from(u32::MAX / layout.vertex_span)) as u32)
+}
+
+/// Compute adaptation of DrawMeshTasksEXT's task-to-mesh expansion. Upstream
+/// TaskEpilogue emits payload[1] child groups, each inheriting that parent's
+/// payload. The caller must finish task writes and make them host-visible before
+/// supplying this readback. Each range is uploaded as its own mapping-buffer
+/// slice so physical WorkgroupId.x starts at zero for every dispatch.
+#[derive(Debug)]
+pub struct MeshTaskDispatchPlan {
+    pub records: Vec<shader_recompiler::backend::spirv::spirv_emit_context::MeshDispatchRecord>,
+    pub batches: Vec<std::ops::Range<usize>>,
+}
+
+impl MeshTaskDispatchPlan {
+    /// Reserve a proven maximum per parent; a uniform shader guard rejects
+    /// children beyond the actual payload count before any guest side effects.
+    pub fn bounded(parent_count: u32, payload_words: u32, bound: u32,
+        max_groups: u32, capacity: u32) -> Result<Self, &'static str> {
+        use shader_recompiler::backend::spirv::spirv_emit_context::MeshDispatchRecord;
+        let total = parent_count.checked_mul(bound).ok_or("mesh reservation overflow")?;
+        if payload_words < 2 || parent_count.checked_mul(payload_words).is_none()
+            || max_groups == 0 || total > capacity {
+            return Err("mesh reservation exceeds transport capacity");
+        }
+        let mut records = Vec::new();
+        records.try_reserve_exact(total as usize).map_err(|_| "mesh reservation allocation failed")?;
+        for parent in 0..parent_count {
+            for child in 0..bound {
+                records.push(MeshDispatchRecord { guest_workgroup_x: child,
+                    payload_base_words: parent * payload_words, output_record: records.len() as u32 });
+            }
+        }
+        let batches = (0..records.len()).step_by(max_groups as usize)
+            .map(|first| first..(first + max_groups as usize).min(records.len())).collect();
+        Ok(Self { records, batches })
+    }
+
+    /// With no task stage, guest workgroup IDs directly identify mesh groups.
+    /// No parent payload exists; all groups use the same initialized transport.
+    pub fn direct(group_count: u32, max_groups: u32, capacity: u32) -> Result<Self, &'static str> {
+        use shader_recompiler::backend::spirv::spirv_emit_context::MeshDispatchRecord;
+        if max_groups == 0 || group_count > capacity {
+            return Err("direct mesh dispatch exceeds transport capacity");
+        }
+        let mut records = Vec::new();
+        records.try_reserve_exact(group_count as usize).map_err(|_| "mesh mapping allocation failed")?;
+        for group in 0..group_count {
+            records.push(MeshDispatchRecord { guest_workgroup_x: group, payload_base_words: 0, output_record: group });
+        }
+        let mut batches = Vec::new();
+        batches.try_reserve_exact(u64::from(group_count).div_ceil(u64::from(max_groups)) as usize)
+            .map_err(|_| "mesh dispatch allocation failed")?;
+        for start in (0..records.len()).step_by(max_groups as usize) {
+            batches.push(start..(start + max_groups as usize).min(records.len()));
+        }
+        Ok(Self { records, batches })
+    }
+
+    pub fn from_task_payloads(
+        payload: &[u32],
+        payload_words: u32,
+        max_groups_per_dispatch: u32,
+        output_record_capacity: u32,
+    ) -> Result<Self, &'static str> {
+        use shader_recompiler::backend::spirv::spirv_emit_context::MeshDispatchRecord;
+        if payload_words < 2 || max_groups_per_dispatch == 0
+            || payload.len() % payload_words as usize != 0 {
+            return Err("invalid task payload or dispatch dimensions");
+        }
+        // The shader transport uses u32 word addresses. Reject an unaddressable
+        // allocation before producing any records; never clamp a guest count.
+        if payload.len() > u32::MAX as usize {
+            return Err("task payload exceeds shader word addressing");
+        }
+        let mut total = 0u32;
+        for parent in payload.chunks_exact(payload_words as usize) {
+            total = total.checked_add(parent[1]).ok_or("mesh child count overflows")?;
+        }
+        if total > output_record_capacity {
+            return Err("mesh output allocation is too small");
+        }
+        let mut records = Vec::new();
+        records.try_reserve_exact(total as usize).map_err(|_| "mesh mapping allocation failed")?;
+        for (parent_index, parent) in payload.chunks_exact(payload_words as usize).enumerate() {
+            let payload_base_words = (parent_index * payload_words as usize) as u32;
+            for guest_workgroup_x in 0..parent[1] {
+                records.push(MeshDispatchRecord {
+                    guest_workgroup_x,
+                    payload_base_words,
+                    output_record: records.len() as u32,
+                });
+            }
+        }
+        let mut batches = Vec::new();
+        batches.try_reserve_exact((total as u64).div_ceil(max_groups_per_dispatch as u64) as usize)
+            .map_err(|_| "mesh dispatch allocation failed")?;
+        for start in (0..records.len()).step_by(max_groups_per_dispatch as usize) {
+            batches.push(start..(start + max_groups_per_dispatch as usize).min(records.len()));
+        }
+        Ok(Self { records, batches })
+    }
+}
+
+#[cfg(test)]
+mod mesh_task_dispatch_tests {
+    use super::MeshTaskDispatchPlan;
+
+    #[test]
+    fn task_indirect_count_uses_each_parent_word_one_and_retains_payload() {
+        use ash::vk::{self, Handle};
+        use crate::vulkan_common::vulkan_memory_allocator::MemoryUsage;
+        let payload = super::super::staging_buffer_pool::StagingBufferRef {
+            buffer: vk::Buffer::from_raw(11), device_address: 0, offset: 256,
+            mapped: std::ptr::null_mut(), size: 3 * 64 * 4, usage: MemoryUsage::DeviceLocal,
+            log2_level: 10, index: 1,
+        };
+        let count = super::MeshTaskIndirectCount {
+            buffer: payload, parent_count: 3, payload_words: 64, child_capacity: 32,
+        };
+        assert_eq!(count.draw_offsets(1120).collect::<Vec<_>>(),
+            [(0, 260), (35840, 516), (71680, 772)]);
+        // Descriptor rollover may submit the compute work before graphics is
+        // recorded: neither consumer buffer may be returned to the pool yet.
+        let output = super::MeshComputeOutput {
+            buffer: super::super::staging_buffer_pool::StagingBufferRef {
+                buffer: vk::Buffer::from_raw(12), index: 2, ..payload
+            },
+            descriptor: vk::DescriptorBufferInfo::default(), record_count: 96,
+            stride_bytes: 1120, image_views: Vec::new(), task_count: Some(count),
+        };
+        assert!(output.retains(vk::Buffer::from_raw(11)));
+        assert!(output.retains(vk::Buffer::from_raw(12)));
+        assert!(!output.retains(vk::Buffer::from_raw(13)));
+        let direct = super::MeshComputeOutput { task_count: None, ..output };
+        assert!(!direct.retains(vk::Buffer::from_raw(11)));
+        assert!(direct.retains(vk::Buffer::from_raw(12)));
+    }
+
+    #[test]
+    fn indirect_batches_keep_padded_record_offsets_and_device_limits() {
+        let batches: Vec<_> = super::mesh_indirect_draw_batches(5, 1120, 2).collect();
+        assert_eq!(batches, [(0, 2), (2240, 2), (4480, 1)]);
+        assert_eq!(super::mesh_indirect_draw_batches(0, 1120, 2).count(), 0);
+        assert_eq!(super::mesh_indirect_draw_batches(5, 1120, u32::MAX).collect::<Vec<_>>(), [(0, 5)]);
+        assert_eq!(super::mesh_indirect_draw_batches(2, u64::from(u32::MAX), 1)
+            .collect::<Vec<_>>(), [(0, 1), (u64::from(u32::MAX), 1)]);
+    }
+
+    #[test]
+    fn reserved_children_preserve_parent_identity_and_output_holes() {
+        let plan = MeshTaskDispatchPlan::bounded(3, 64, 3, 2, 9).unwrap();
+        let actual_counts = [0, 3, 1];
+        let active: Vec<_> = plan.records.iter().filter(|record|
+            record.guest_workgroup_x < actual_counts[(record.payload_base_words / 64) as usize])
+            .map(|record| record.words()).collect();
+        assert_eq!(active, [[0, 64, 3], [1, 64, 4], [2, 64, 5], [0, 128, 6]]);
+        assert_eq!(plan.batches, [0..2, 2..4, 4..6, 6..8, 8..9]);
+        assert!(MeshTaskDispatchPlan::bounded(3, 64, 3, 2, 8).is_err());
+        assert!(MeshTaskDispatchPlan::bounded(u32::MAX, 64, 3, 2, u32::MAX).is_err());
+        assert!(MeshTaskDispatchPlan::bounded(3, 64, 0, 2, 0).unwrap().records.is_empty());
+    }
+
+    #[test]
+    fn direct_mesh_groups_keep_guest_identity_across_host_batches() {
+        let plan = MeshTaskDispatchPlan::direct(5, 2, 5).unwrap();
+        assert_eq!(plan.batches, [0..2, 2..4, 4..5]);
+        let words: Vec<_> = plan.records.iter().map(|record| record.words()).collect();
+        assert_eq!(words, [[0, 0, 0], [1, 0, 1], [2, 0, 2], [3, 0, 3], [4, 0, 4]]);
+        assert!(MeshTaskDispatchPlan::direct(5, 2, 4).is_err());
+        assert!(MeshTaskDispatchPlan::direct(1, 0, 1).is_err());
+        let empty = MeshTaskDispatchPlan::direct(0, 2, 0).unwrap();
+        assert!(empty.records.is_empty() && empty.batches.is_empty());
+    }
+
+    #[test]
+    fn mesh_output_capacity_obeys_storage_word_and_vertex_address_limits() {
+        use shader_recompiler::backend::spirv::spirv_emit_context::MeshOutputLayout;
+        let mut layout = MeshOutputLayout { stride_words: 280, vertex_span: 48, ..Default::default() };
+        assert_eq!(super::mesh_output_record_capacity(layout, 2240), Ok(2));
+        assert_eq!(super::mesh_output_record_capacity(layout, 2239), Ok(1));
+        assert_eq!(super::mesh_output_record_capacity(layout, u64::MAX), Ok(u32::MAX / 280));
+        layout.vertex_span = 1024;
+        assert_eq!(super::mesh_output_record_capacity(layout, u64::MAX), Ok(u32::MAX / 1024));
+        layout.vertex_span = 0;
+        assert!(super::mesh_output_record_capacity(layout, 2240).is_err());
+    }
+
+    #[test]
+    fn task_counts_preserve_parent_payload_and_child_ids_across_dispatch_limits() {
+        // Word0 is not the count; unreferenced payload words must not affect it.
+        let payload = [99, 0, 77, 88, 66, 3, 55, 44, 33, 2, 22, 11];
+        let plan = MeshTaskDispatchPlan::from_task_payloads(&payload, 4, 2, 5).unwrap();
+        let words: Vec<_> = plan.records.iter().map(|record| record.words()).collect();
+        assert_eq!(words, [[0, 4, 0], [1, 4, 1], [2, 4, 2], [0, 8, 3], [1, 8, 4]]);
+        assert_eq!(plan.batches, [0..2, 2..4, 4..5]);
+        // Dispatch boundaries do not reset child identity or output record.
+        assert_eq!(plan.records[plan.batches[1].start].guest_workgroup_x, 2);
+        assert_eq!(plan.records[plan.batches[2].start].output_record, 4);
+    }
+
+    #[test]
+    fn task_counts_reject_unrepresentable_work_without_truncating() {
+        assert!(MeshTaskDispatchPlan::from_task_payloads(&[0, u32::MAX, 0, 1], 2, 32, u32::MAX).is_err());
+        assert!(MeshTaskDispatchPlan::from_task_payloads(&[0, 3], 2, 32, 2).is_err());
+        assert!(MeshTaskDispatchPlan::from_task_payloads(&[0, 1, 2], 2, 32, 1).is_err());
+        assert!(MeshTaskDispatchPlan::from_task_payloads(&[0, 1], 2, 0, 1).is_err());
+        assert!(MeshTaskDispatchPlan::from_task_payloads(&[], 0, 32, 1).is_err());
+        let empty = MeshTaskDispatchPlan::from_task_payloads(&[55, 0], 2, 32, 0).unwrap();
+        assert!(empty.records.is_empty());
+        assert!(empty.batches.is_empty());
+    }
+}
 use common::alignment::{align_down, align_up};
 use common::types::PAGE_SIZE_U64;
 use log::{debug, info, warn};
@@ -552,7 +825,7 @@ impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
 
 /// Central Vulkan rendering orchestrator.
 ///
-/// Ref: zuyu RasterizerVulkan — coordinates all rendering sub-components:
+/// Ref: zuyu RasterizerVulkan â€” coordinates all rendering sub-components:
 /// shader compilation, pipeline caching, buffer management, dynamic state
 /// tracking, and command batching for efficient GPU rendering.
 pub struct RasterizerVulkan {
@@ -595,7 +868,7 @@ pub struct RasterizerVulkan {
     // and TextureCache point at the descriptor pool and the descriptor queues,
     // TextureCache at the blit helper). A by-value field would move when the
     // constructor returns `Self`, leaving those pointers dangling on the old
-    // stack frame — observed as an UpdateDescriptorQueue whose `acquire()`
+    // stack frame â€” observed as an UpdateDescriptorQueue whose `acquire()`
     // clamped the real instance while `add_buffer` grew a stale cursor until
     // allocation failure.
     #[allow(dead_code)]
@@ -835,7 +1108,7 @@ impl RasterizerVulkan {
     const DISPATCH_THRESHOLD: u32 = 7;
     #[cfg(target_os = "android")]
     const DISPATCH_THRESHOLD: u32 = 3;
-    /// Hard flush threshold — full GPU submit every N draws.
+    /// Hard flush threshold â€” full GPU submit every N draws.
     #[cfg(not(target_os = "android"))]
     const FLUSH_THRESHOLD: u32 = 4096;
     #[cfg(target_os = "android")]
@@ -973,7 +1246,11 @@ impl RasterizerVulkan {
         }));
 
         // Create texture cache
-        let shader_cache = crate::shader_cache::ShaderCache::new(Arc::clone(&device_memory));
+        let shader_cache = if std::env::var_os("RUZU_NX2_MESH_DRAW").is_some() {
+            crate::shader_cache::ShaderCache::new_mesh_compute(Arc::clone(&device_memory))
+        } else {
+            crate::shader_cache::ShaderCache::new(Arc::clone(&device_memory))
+        };
 
         let mut texture_cache = Box::new(
             TextureCache::new(
@@ -1168,10 +1445,358 @@ impl RasterizerVulkan {
         self.invalidate_gpu_cache_callback = Some(callback);
     }
 
-    /// Main draw entry point — process a single draw call.
-    ///
-    /// Ref: zuyu RasterizerVulkan::Draw() — compiles/caches pipeline,
-    /// updates dynamic state via dirty flags, binds resources, records draw.
+    fn allocate_mesh_transport(
+        &mut self, bytes: u64,
+        usage: crate::vulkan_common::vulkan_memory_allocator::MemoryUsage,
+        allocations: &mut Vec<super::staging_buffer_pool::StagingBufferRef>,
+    ) -> Result<super::staging_buffer_pool::StagingBufferRef, String> {
+        if bytes == 0 || bytes > self.device.get().get_max_storage_buffer_range()
+            || bytes > u64::from(u32::MAX) {
+            return Err(format!("Mesh transport size is not addressable: {bytes}"));
+        }
+        let buffer = self.staging_pool.request_buffer(bytes, usage, true)
+            .ok_or_else(|| format!("Mesh transport allocation failed: {bytes} bytes"))?;
+        allocations.push(buffer);
+        Ok(buffer)
+    }
+
+    fn upload_mesh_mapping(
+        &mut self,
+        records: &[shader_recompiler::backend::spirv::spirv_emit_context::MeshDispatchRecord],
+        allocations: &mut Vec<super::staging_buffer_pool::StagingBufferRef>,
+    ) -> Result<vk::DescriptorBufferInfo, String> {
+        let bytes = records.len() as u64 * 12;
+        let buffer = self.allocate_mesh_transport(bytes,
+            crate::vulkan_common::vulkan_memory_allocator::MemoryUsage::Upload, allocations)?;
+        // This deferred allocation is host-visible, exclusively held here,
+        // and not referenced by a GPU command until dispatch_mesh_stage.
+        let mapped = unsafe { std::slice::from_raw_parts_mut(buffer.mapped, bytes as usize) };
+        for (dst, record) in mapped.chunks_exact_mut(12).zip(records) {
+            for (word, value) in dst.chunks_exact_mut(4).zip(record.words()) {
+                word.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        self.staging_pool.flush_deferred(&buffer);
+        Ok(vk::DescriptorBufferInfo { buffer: buffer.buffer, offset: buffer.offset, range: bytes })
+    }
+
+    /// Compute replacement for DrawMeshTasksEXT's task/payload/mesh execution.
+    /// Task completion is read back before allocating the exact child output.
+    /// All transport remains deferred across Finish and any descriptor rollover.
+    fn dispatch_mesh_programs(
+        &mut self,
+        programs: &super::pipeline_cache::MeshComputePrograms,
+        draw: &Maxwell3DDrawView<'_>,
+        read_gpu: &dyn Fn(u64, &mut [u8]),
+        group_count: u32,
+    ) -> Result<Option<MeshComputeOutput>, String> {
+        use crate::vulkan_common::vulkan_memory_allocator::MemoryUsage;
+        use shader_recompiler::backend::spirv::spirv_emit_context::{MeshDispatchRecord, MeshOutputLayout};
+        if group_count == 0 { return Ok(None); }
+        let max_groups = self.max_compute_work_group_count[0];
+        if max_groups == 0 { return Err("Device has no compute workgroups".into()); }
+        let layout = MeshOutputLayout::new(&programs.mesh_info);
+        let capacity = mesh_output_record_capacity(layout, self.device.get().get_max_storage_buffer_range())?;
+        let payload_words = programs.task_info.as_ref().map_or(programs.mesh_info.payload_words, |info| info.payload_words);
+        if payload_words == 0 || payload_words < programs.mesh_info.payload_words
+            || (programs.task.is_some() && payload_words < 2)
+            || programs.task.is_some() != programs.task_info.is_some() {
+            return Err("Incompatible task/mesh payload layouts".into());
+        }
+        let parent_count = if programs.task.is_some() { group_count } else { 1 };
+        let payload_word_count = u64::from(parent_count) * u64::from(payload_words);
+        if payload_word_count > u64::from(u32::MAX) {
+            return Err("Task payload exceeds shader word addressing".into());
+        }
+        let payload_bytes = payload_word_count * 4;
+        let mut allocations = Vec::new();
+        let result = (|| -> Result<Option<MeshComputeOutput>, String> {
+            let payload = self.allocate_mesh_transport(payload_bytes, MemoryUsage::DeviceLocal, &mut allocations)?;
+            let payload_descriptor = vk::DescriptorBufferInfo {
+                buffer: payload.buffer, offset: payload.offset, range: payload_bytes,
+            };
+            self.scheduler.request_outside_render_pass_operation_context();
+            let device = self.device;
+            self.scheduler.record(move |cmdbuf| unsafe {
+                device.get().get_logical().cmd_fill_buffer(cmdbuf, payload.buffer, payload.offset, payload_bytes, 0);
+            });
+            let mut image_views = Vec::new();
+            // Bound speculative memory independently of device addressing.
+            // This is a performance selection only: larger draws retain the
+            // exact readback path, rather than clipping the guest count.
+            const MAX_RESERVED_OUTPUT_BYTES: u64 = 1024 * 1024;
+            let stride_bytes = u64::from(layout.stride_words) * 4;
+            let mapping_limit = max_groups.min((self.device.get().get_max_storage_buffer_range() / 12) as u32);
+            let reserved_plan = programs.task_workgroup_bound.filter(|_| programs.task.is_some())
+                .and_then(|bound| MeshTaskDispatchPlan::bounded(group_count, payload_words, bound,
+                    mapping_limit, capacity.min((MAX_RESERVED_OUTPUT_BYTES / stride_bytes) as u32)).ok());
+            let mut reserved_output = None;
+            let reserved_plan = reserved_plan.filter(|plan| {
+                if plan.records.is_empty() { return true; }
+                reserved_output = self.allocate_mesh_transport(plan.records.len() as u64 * stride_bytes,
+                    MemoryUsage::DeviceLocal, &mut allocations).ok();
+                reserved_output.is_some()
+            });
+            // maxDrawCount is only a host limit here: the proven task bound
+            // guarantees the GPU count is never clipped by it.
+            let task_count = reserved_output.is_some()
+                .then_some(programs.task_workgroup_bound).flatten()
+                .filter(|bound| self.draw_indirect_count.is_some()
+                    && *bound <= self.device.get().get_max_draw_indirect_count())
+                .map(|child_capacity| MeshTaskIndirectCount {
+                    buffer: payload, parent_count: group_count, payload_words, child_capacity,
+                });
+            let plan = if let Some(task) = &programs.task {
+                let mapping_limit = max_groups.min((self.device.get().get_max_storage_buffer_range() / 12) as u32);
+                if mapping_limit == 0 { return Err("Mapping buffer cannot hold a task group".into()); }
+                for first in (0..group_count).step_by(mapping_limit as usize) {
+                    let count = (group_count - first).min(mapping_limit);
+                    let mut records = Vec::new();
+                    records.try_reserve_exact(count as usize).map_err(|_| "Task mapping allocation failed")?;
+                    for parent in first..first + count {
+                        records.push(MeshDispatchRecord { guest_workgroup_x: parent,
+                            payload_base_words: parent * payload_words, output_record: 0 });
+                    }
+                    let mapping = self.upload_mesh_mapping(&records, &mut allocations)?;
+                    let prepared = self.dispatch_mesh_stage(task, draw, read_gpu, mapping,
+                        payload_descriptor, None, count).map_err(|e| format!("Task dispatch: {e:?}"))?;
+                    image_views.extend(prepared.views);
+                }
+                if let Some(plan) = reserved_plan {
+                    plan
+                } else {
+                let readback = self.allocate_mesh_transport(payload_bytes, MemoryUsage::Download, &mut allocations)?;
+                self.scheduler.request_outside_render_pass_operation_context();
+                let device = self.device;
+                self.scheduler.record(move |cmdbuf| unsafe {
+                    let logical = device.get().get_logical();
+                    let task_done = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                    logical.cmd_pipeline_barrier(cmdbuf, vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[task_done], &[], &[]);
+                    logical.cmd_copy_buffer(cmdbuf, payload.buffer, readback.buffer,
+                        &[vk::BufferCopy { src_offset: payload.offset, dst_offset: readback.offset, size: payload_bytes }]);
+                    let host_ready = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+                    logical.cmd_pipeline_barrier(cmdbuf, vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[host_ready], &[], &[]);
+                });
+                {
+                    // Host fallback's task-count readback is a GPU fence wait.
+                    let _scope = ProfileScope::new(ProfileZone::Fence);
+                    self.scheduler.finish();
+                }
+                self.staging_pool.invalidate_deferred(&readback);
+                let bytes = unsafe { std::slice::from_raw_parts(readback.mapped, payload_bytes as usize) };
+                let mut words = Vec::new();
+                words.try_reserve_exact(payload_word_count as usize).map_err(|_| "Task readback allocation failed")?;
+                words.extend(bytes.chunks_exact(4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())));
+                MeshTaskDispatchPlan::from_task_payloads(&words, payload_words, mapping_limit, capacity)?
+                }
+            } else {
+                let mapping_limit = max_groups.min((self.device.get().get_max_storage_buffer_range() / 12) as u32);
+                MeshTaskDispatchPlan::direct(group_count, mapping_limit, capacity)?
+            };
+            if plan.records.is_empty() { return Ok(None); }
+            let stride_bytes = u64::from(layout.stride_words) * 4;
+            let output_bytes = plan.records.len() as u64 * stride_bytes;
+            let output = if let Some(output) = reserved_output {
+                // Inactive child groups return before touching their records.
+                // Zero indirect vertex/instance counts suppress those draws.
+                self.scheduler.request_outside_render_pass_operation_context();
+                let device = self.device;
+                self.scheduler.record(move |cmdbuf| unsafe {
+                    device.get().get_logical().cmd_fill_buffer(cmdbuf, output.buffer,
+                        output.offset, output_bytes, 0);
+                });
+                output
+            } else {
+                self.allocate_mesh_transport(output_bytes, MemoryUsage::DeviceLocal, &mut allocations)?
+            };
+            let descriptor = vk::DescriptorBufferInfo { buffer: output.buffer, offset: output.offset, range: output_bytes };
+            for batch in &plan.batches {
+                let mapping = self.upload_mesh_mapping(&plan.records[batch.clone()], &mut allocations)?;
+                let prepared = self.dispatch_mesh_stage(&programs.mesh, draw, read_gpu, mapping,
+                    payload_descriptor, Some(descriptor), batch.len() as u32)
+                    .map_err(|e| format!("Mesh dispatch: {e:?}"))?;
+                image_views.extend(prepared.views);
+            }
+            // Raw output attributes and embedded indirect headers share this
+            // allocation; make both consumers visible before returning it.
+            let device = self.device;
+            self.scheduler.record(move |cmdbuf| unsafe {
+                let ready = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::INDIRECT_COMMAND_READ);
+                device.get().get_logical().cmd_pipeline_barrier(cmdbuf, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::DRAW_INDIRECT,
+                    vk::DependencyFlags::empty(), &[ready], &[], &[]);
+            });
+            Ok(Some(MeshComputeOutput { buffer: output, descriptor, record_count: plan.records.len() as u32,
+                stride_bytes, image_views, task_count }))
+        })();
+        let retained_output = result.as_ref().ok().and_then(|output| output.as_ref());
+        // On failure, queued commands still retire normally: FreeDeferred
+        // stamps the current scheduler tick instead of immediately recycling.
+        for mut buffer in allocations {
+            if !retained_output.is_some_and(|output| output.retains(buffer.buffer)) {
+                self.staging_pool.free_deferred(&mut buffer);
+            }
+        }
+        result
+    }
+
+    /// Compute adaptation of a task/mesh launch. Resource ownership remains
+    /// Maxwell graphics; command submission and the pre-dispatch barrier stay
+    /// here, like upstream RasterizerVulkan::DispatchCompute. The pipeline
+    /// cache and transport allocator must retain their owners through GPU use.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_mesh_stage(
+        &mut self,
+        stage: &super::compute_pipeline::MeshComputeStage,
+        draw: &Maxwell3DDrawView<'_>,
+        read_gpu: &dyn Fn(u64, &mut [u8]),
+        mapping: vk::DescriptorBufferInfo,
+        payload: vk::DescriptorBufferInfo,
+        output: Option<vk::DescriptorBufferInfo>,
+        group_count: u32,
+    ) -> Result<super::graphics_pipeline::PreparedMeshDescriptors, vk::Result> {
+        if !mesh_dispatch_mapping_fits(group_count, self.max_compute_work_group_count[0], mapping.range) {
+            // The caller batches dispatch records; never silently truncate the
+            // guest's child group count to a host-device limit.
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+        let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex,
+            _buffer_guard, _texture_guard);
+        let (set, prepared) = stage.prepare_descriptor_set(
+            draw, read_gpu, &mut self.scheduler, &mut self.common_buffer_cache,
+            &mut self.texture_cache, &mut self.desc_queue, self.fallback_sampler,
+            draw.is_indexed(), &self.descriptor_pool, mapping, payload, output,
+        )?;
+        stage.record_bind(&mut self.scheduler, set, &prepared);
+        let device = self.device;
+        self.scheduler.record(move |cmdbuf| unsafe {
+            let logical = device.get().get_logical();
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            logical.cmd_pipeline_barrier(cmdbuf,
+                vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(),
+                &[barrier], &[], &[]);
+            logical.cmd_dispatch(cmdbuf, group_count, 1, 1);
+        });
+        Ok(prepared)
+    }
+
+    /// Draw the compute mesh output with generated vertices and the unchanged
+    /// guest fragment program. The caller retains output storage until the last
+    /// indirect command has been recorded, including command-buffer rollover.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_mesh_output(
+        &mut self, draw: &mut Maxwell3DDrawView<'_>, output: &MeshComputeOutput,
+        mesh: &shader_recompiler::shader_info::MeshInfo,
+        dirty_flags: &mut [bool; 256], dirty_flags_are_live: bool,
+        zpass_pixel_count_enabled: bool,
+        read_gpu: &dyn Fn(u64, &mut [u8]), read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> bool {
+        let pipeline = {
+            let _scope = ProfileScope::new(ProfileZone::PipelineLookup);
+            self.pipeline_cache.current_graphics_pipeline(draw, &mut self.shader_cache)
+        };
+        let Some(gp) = pipeline else {
+            return false;
+        };
+        if !dirty_flags_are_live { *dirty_flags = *draw.dirty_flags(); }
+        if let Some(memory) = self.channel_memory_manager_handle {
+            gp.set_engine(draw, dirty_flags, memory, self.push_descriptor.clone(), self.fallback_sampler);
+        } else {
+            gp.set_engine_with_readers(draw, dirty_flags, read_gpu, read_gpu_unsafe,
+                self.push_descriptor.clone(), self.fallback_sampler);
+        }
+        gp.set_mesh_output(output.descriptor, &output.image_views);
+        let old_tick = self.scheduler.current_tick();
+        let configured = {
+            let _scope = ProfileScope::new(ProfileZone::Configure);
+            gp.configure(false)
+        };
+        if !configured { return false; }
+        let dynamic_vertex_input = gp.has_dynamic_vertex_input();
+        if self.scheduler.current_tick() != old_tick && !dirty_flags_are_live {
+            self.state_tracker.apply_command_buffer_invalidation(dirty_flags);
+        }
+        {
+            let _scope = ProfileScope::new(ProfileZone::DynamicState);
+            self.update_dynamic_states(draw, dirty_flags);
+        }
+        // Mesh output topology replaces the guest draw's group-launch topology.
+        // Track the actual host state, and dirty overrides so ordinary draws
+        // restore their own restart/bias/input values afterward.
+        let topology = match mesh.topology {
+            0 => PrimitiveTopology::Points, 1 => PrimitiveTopology::Lines, _ => PrimitiveTopology::Triangles,
+        };
+        self.state_tracker.change_primitive_topology(topology);
+        let rasterizer = draw.rasterizer();
+        let bias = match topology {
+            PrimitiveTopology::Points => rasterizer.polygon_offset_point_enable,
+            PrimitiveTopology::Lines => rasterizer.polygon_offset_line_enable,
+            _ => rasterizer.polygon_offset_fill_enable,
+        };
+        let device = self.device;
+        let eds1 = self.extended_dynamic_state_supported;
+        let eds2 = self.extended_dynamic_state2_supported;
+        let vertex_input = dynamic_vertex_input.then(|| self.vertex_input_dynamic_state.as_ref().unwrap().clone());
+        self.scheduler.record(move |cmdbuf| unsafe {
+            let logical = device.get().get_logical();
+            if eds1 { logical.cmd_set_primitive_topology(cmdbuf, maxwell_to_vk::primitive_topology(topology)); }
+            if eds2 {
+                logical.cmd_set_primitive_restart_enable(cmdbuf, false);
+                logical.cmd_set_depth_bias_enable(cmdbuf, bias);
+            }
+            if let Some(extension) = vertex_input {
+                (extension.cmd_set_vertex_input_ext)(cmdbuf, 0, std::ptr::null(), 0, std::ptr::null());
+            }
+        });
+        for flag in [super::state_tracker::dirty::PRIMITIVE_RESTART_ENABLE,
+            super::state_tracker::dirty::DEPTH_BIAS_ENABLE, super::state_tracker::dirty::VERTEX_INPUT] {
+            dirty_flags[flag as usize] = true;
+            draw.set_dirty_flag(flag);
+        }
+        self.query_cache.notify_segment(true);
+        self.handle_transform_feedback();
+        self.query_cache.counter_enable(&mut self.scheduler, QueryType::ZPassPixelCount64 as u32,
+            zpass_pixel_count_enabled);
+        let buffer = output.buffer.buffer;
+        let offset = output.buffer.offset;
+        let count = output.record_count;
+        let stride = output.stride_bytes;
+        let max_draws = self.device.get().get_max_draw_indirect_count();
+        let task_count = output.task_count;
+        let indirect_count = self.draw_indirect_count.clone();
+        let _record_scope = ProfileScope::new(ProfileZone::DrawRecord);
+        self.scheduler.record(move |cmdbuf| unsafe {
+            if let (Some(count), Some(extension)) = (task_count, indirect_count) {
+                for (relative_offset, count_offset) in count.draw_offsets(stride) {
+                    extension.cmd_draw_indirect_count(cmdbuf, buffer, offset + relative_offset,
+                        count.buffer.buffer, count_offset, count.child_capacity, stride as u32);
+                }
+                return;
+            }
+            // Device creation requires and enables multiDrawIndirect. The
+            // generated vertex shader addresses records via firstVertex and
+            // never reads DrawIndex, so batching preserves every invocation.
+            for (relative_offset, draws) in mesh_indirect_draw_batches(count, stride, max_draws) {
+                device.get().get_logical().cmd_draw_indirect(cmdbuf, buffer,
+                    offset + relative_offset, draws, stride as u32);
+            }
+        });
+        true
+    }
+
+    /// Main draw entry point: compile/cache pipeline, configure resources,
+    /// update dynamic state and record the draw (upstream RasterizerVulkan::Draw).
     fn prepare_draw(
         &mut self,
         draw: &mut Maxwell3DDrawView<'_>,
@@ -1183,17 +1808,71 @@ impl RasterizerVulkan {
         read_gpu: &dyn Fn(u64, &mut [u8]),
         read_gpu_unsafe: &dyn Fn(u64, &mut [u8]) -> bool,
     ) {
+        let _draw_scope = ProfileScope::new(ProfileZone::Draw);
         let _gpu_tick_guard = GpuTickGuard::new(self.gpu_tick_callback.as_ref());
         // 1. Periodic flush
-        self.flush_work();
-        if let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() {
-            memory_manager.lock().flush_caching();
+        {
+            let _scope = ProfileScope::new(ProfileZone::FlushWork);
+            self.flush_work();
+            if let Some(memory_manager) = self.channel_memory_manager.as_ref().cloned() {
+                memory_manager.lock().flush_caching();
+            }
+        }
+
+        // These launch-time switches supplement the upstream mesh branch.
+        // Cache them like upstream's static diagnostic switches: getenv on
+        // Windows otherwise allocates UTF-16 storage for every ordinary draw.
+        static MESH_DRAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *MESH_DRAW.get_or_init(|| std::env::var_os("RUZU_NX2_MESH_DRAW").is_some())
+            && self.shader_cache.current_maxwell3d().is_some_and(|maxwell| maxwell.is_mesh_enabled()
+                && maxwell.get_native_macro_engine_read(|engine| engine.native_turing)) {
+            if indirect_params.is_some() {
+                // Eglantine RasterizerVulkan::DrawIndirect likewise rejects
+                // task/mesh indirect commands: their launch layout differs.
+                static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!("Indirect task/mesh draw skipped");
+                }
+                return;
+            }
+            let programs = {
+                let _scope = ProfileScope::new(ProfileZone::PipelineLookup);
+                self.pipeline_cache.current_mesh_compute_programs(&mut self.shader_cache)
+            };
+            let Some(programs) = programs else { return; };
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _mesh_buffer_guard, _mesh_texture_guard);
+            let groups = make_draw_params(draw, instance_count).num_vertices;
+            let output = {
+                let _scope = ProfileScope::new(ProfileZone::Compute);
+                self.dispatch_mesh_programs(&programs, draw, read_gpu, groups)
+            };
+            match output {
+                Ok(Some(mut output)) => {
+                    let drawn = self.draw_mesh_output(draw, &output, &programs.mesh_info,
+                        dirty_flags, dirty_flags_are_live, zpass_pixel_count_enabled, read_gpu, read_gpu_unsafe);
+                    static DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let number = DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if number < 16 || number.is_power_of_two() {
+                        log::info!("Mesh graphics draw #{number}: groups={groups} records={} drawn={drawn}", output.record_count);
+                    }
+                    self.staging_pool.free_deferred(&mut output.buffer);
+                    if let Some(count) = &mut output.task_count {
+                        self.staging_pool.free_deferred(&mut count.buffer);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => log::error!("Mesh draw transport failed: {error}"),
+            }
+            return;
         }
 
         // 2. Compile or lookup cached pipeline
-        let pipeline_result = self
-            .pipeline_cache
-            .current_graphics_pipeline(draw, &mut self.shader_cache);
+        let pipeline_result = {
+            let _scope = ProfileScope::new(ProfileZone::PipelineLookup);
+            self.pipeline_cache.current_graphics_pipeline(draw, &mut self.shader_cache)
+        };
         let gp = match pipeline_result {
             Some(gp) => gp,
             None => {
@@ -1259,7 +1938,11 @@ impl RasterizerVulkan {
             );
         }
         let command_buffer_tick_before_configure = self.scheduler.current_tick();
-        if !gp.configure(draw.is_indexed()) {
+        let configured = {
+            let _scope = ProfileScope::new(ProfileZone::Configure);
+            gp.configure(draw.is_indexed())
+        };
+        if !configured {
             self.draw_skipped_pipeline = self.draw_skipped_pipeline.wrapping_add(1);
             warn!("RasterizerVulkan: draw skipped because graphics pipeline configuration failed");
             return;
@@ -1310,7 +1993,10 @@ impl RasterizerVulkan {
         // 6. Update dynamic states via dirty flags. Upstream requests the
         // render pass in `GraphicsPipeline::ConfigureDraw` before
         // `RasterizerVulkan::UpdateDynamicStates`.
-        self.update_dynamic_states(draw, dirty_flags);
+        {
+            let _scope = ProfileScope::new(ProfileZone::DynamicState);
+            self.update_dynamic_states(draw, dirty_flags);
+        }
         self.query_cache.notify_segment(true);
         self.handle_transform_feedback();
         self.query_cache.counter_enable(
@@ -1320,6 +2006,7 @@ impl RasterizerVulkan {
         );
 
         // 7. Issue draw call
+        let _record_scope = ProfileScope::new(ProfileZone::DrawRecord);
         if let Some((params, buffer, offset, count)) = indirect_binding {
             if buffer == vk::Buffer::null() {
                 warn!("RasterizerVulkan::draw_indirect skipped: missing indirect buffer");
@@ -1574,7 +2261,7 @@ impl RasterizerVulkan {
         self.fence_backend.wait_fence(fence);
     }
 
-    // ── Dynamic state update methods ──────────────────────────────────────
+    // â”€â”€ Dynamic state update methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[inline(never)]
     fn update_dynamic_states(
@@ -2924,6 +3611,7 @@ impl RasterizerInterface for RasterizerVulkan {
         mut clear_view: crate::engines::draw_manager::Maxwell3DClearView<'_>,
         layer_count: u32,
     ) {
+        let _scope = ProfileScope::new(ProfileZone::Clear);
         // Preserve upstream ordering: submit pending work before flushing the
         // channel GPU-memory cache.
         self.flush_work();
@@ -3215,6 +3903,7 @@ impl RasterizerInterface for RasterizerVulkan {
     }
 
     fn dispatch_compute(&mut self, dispatch: &DispatchCall) {
+        let _scope = ProfileScope::new(ProfileZone::Compute);
         self.flush_work();
         if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
             mm.lock().flush_caching();
@@ -3917,7 +4606,7 @@ impl Drop for RasterizerVulkan {
     }
 }
 
-// ── State mapping helpers (reused from old renderer.rs) ────────────────────
+// â”€â”€ State mapping helpers (reused from old renderer.rs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[cfg(test)]
 pub(crate) fn map_topology(topo: PrimitiveTopology) -> vk::PrimitiveTopology {
@@ -4016,7 +4705,7 @@ fn propagate_consumed_dirty_flags(
     }
 }
 
-// ── Vulkan resource creation helpers ───────────────────────────────────────
+// â”€â”€ Vulkan resource creation helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn find_memory_type(
     instance: &ash::Instance,
@@ -4133,11 +4822,21 @@ fn clear_rescaling(is_rescaling: bool) -> (u32, u32) {
     }
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────
+// â”€â”€ Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_dispatch_requires_one_mapping_record_per_host_group() {
+        assert!(mesh_dispatch_mapping_fits(2, 2, 24));
+        assert!(!mesh_dispatch_mapping_fits(2, 1, 24));
+        assert!(!mesh_dispatch_mapping_fits(2, 2, 23));
+        assert!(mesh_dispatch_mapping_fits(0, 2, 0));
+        assert!(!mesh_dispatch_mapping_fits(u32::MAX, u32::MAX, u32::MAX as u64));
+        assert!(mesh_dispatch_mapping_fits(u32::MAX, u32::MAX, u64::from(u32::MAX) * 12));
+    }
 
     #[test]
     fn clear_rescaling_releases_settings_before_viewport_work() {

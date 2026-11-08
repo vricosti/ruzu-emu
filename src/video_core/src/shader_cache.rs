@@ -5,15 +5,69 @@
 //!
 //! Shader binary caching and invalidation.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
+use shader_recompiler::exception::{
+    InvalidArgument, LogicError, NotImplementedException, RuntimeError, ShaderException,
+};
+
+/// Rust representation of the shader exception held by upstream's `std::exception_ptr`.
+/// Preserve the concrete payload when rethrowing; unrelated panics are never shader rejections.
+#[derive(Clone)]
+enum RejectedShaderException {
+    Base(ShaderException),
+    Logic(LogicError),
+    Runtime(RuntimeError),
+    NotImplemented(NotImplementedException),
+    InvalidArgument(InvalidArgument),
+}
+
+impl RejectedShaderException {
+    fn from_payload(payload: &(dyn std::any::Any + Send)) -> Option<Self> {
+        if let Some(error) = payload.downcast_ref::<ShaderException>() {
+            Some(Self::Base(error.clone()))
+        } else if let Some(error) = payload.downcast_ref::<LogicError>() {
+            Some(Self::Logic(error.clone()))
+        } else if let Some(error) = payload.downcast_ref::<RuntimeError>() {
+            Some(Self::Runtime(error.clone()))
+        } else if let Some(error) = payload.downcast_ref::<NotImplementedException>() {
+            Some(Self::NotImplemented(error.clone()))
+        } else {
+            payload
+                .downcast_ref::<InvalidArgument>()
+                .map(|error| Self::InvalidArgument(error.clone()))
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Base(error) => error.to_string(),
+            Self::Logic(error) => error.to_string(),
+            Self::Runtime(error) => error.to_string(),
+            Self::NotImplemented(error) => error.to_string(),
+            Self::InvalidArgument(error) => error.to_string(),
+        }
+    }
+
+    fn rethrow(self) -> ! {
+        let payload: Box<dyn std::any::Any + Send> = match self {
+            Self::Base(error) => Box::new(error),
+            Self::Logic(error) => Box::new(error),
+            Self::Runtime(error) => Box::new(error),
+            Self::NotImplemented(error) => Box::new(error),
+            Self::InvalidArgument(error) => Box::new(error),
+        };
+        std::panic::resume_unwind(payload)
+    }
+}
 
 use crate::control::channel_state::ChannelState;
 use crate::control::channel_state_cache::{ChannelInfo, ChannelSetupCaches};
 use crate::engines::kepler_compute::KeplerCompute;
-use crate::engines::maxwell_3d::{Maxwell3D, ShaderStageType};
+use crate::engines::maxwell_3d::{Maxwell3D, ShaderStageType, PIPELINE_BASE, PIPELINE_STRIDE};
 use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::shader_environment::{
     ComputeEnvironment, GenericEnvironment, GenericEnvironmentOwner, GraphicsEnvironment,
@@ -65,6 +119,13 @@ pub struct ShaderCache {
     marked_for_removal: Vec<*mut Entry>,
     shader_infos: [Option<*const ShaderInfo>; NUM_PROGRAMS],
     last_shaders_valid: bool,
+    // Immutable cache policy: ordinary and compute-backed mesh consumers must
+    // not share native rejection entries or previously lowered code identities.
+    mesh_compute: bool,
+    rejected_native: Mutex<HashMap<u64, RejectedShaderException>>,
+    // Bounds of every rejected address; deliberately never shrink after invalidation.
+    rejected_lowest: AtomicU64,
+    rejected_highest: AtomicU64,
 }
 
 // Safety: Entry pointers are only used within locked sections.
@@ -123,7 +184,17 @@ impl ShaderCache {
             marked_for_removal: Vec::new(),
             shader_infos: [None; NUM_PROGRAMS],
             last_shaders_valid: false,
+            mesh_compute: false,
+            rejected_native: Mutex::new(HashMap::new()),
+            rejected_lowest: AtomicU64::new(u64::MAX),
+            rejected_highest: AtomicU64::new(0),
         }
+    }
+
+    /// Construct the cache for a consumer that owns compute-backed task/mesh
+    /// dispatch. The ordinary graphics renderer continues to use `new`.
+    pub fn new_mesh_compute(device_memory: Arc<MaxwellDeviceMemoryManager>) -> Self {
+        Self { mesh_compute: true, ..Self::new(device_memory) }
     }
 
     /// Access the shared `MaxwellDeviceMemoryManager`. Same `Arc` as
@@ -162,80 +233,280 @@ impl ShaderCache {
         &self.shader_infos
     }
 
+    /// Port of `ShaderCache::MeshStateHash`: only the first twenty primitive
+    /// header words participate in the upstream pipeline specialization key.
+    fn mesh_state_hash(&self) -> u64 {
+        use crate::engines::maxwell_3d::{MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER};
+        let maxwell = self.current_maxwell3d().expect("mesh hash requires a bound channel");
+        let mut state = [0u8; (3 + 20) * 4];
+        for (index, register) in [MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER].into_iter().enumerate() {
+            state[index * 4..index * 4 + 4]
+                .copy_from_slice(&maxwell.get_register_value(register).to_le_bytes());
+        }
+        if maxwell.shader_config_enabled(ShaderStageType::Geometry) {
+            let slot = PIPELINE_BASE + ShaderStageType::Geometry.as_index().unwrap() * PIPELINE_STRIDE;
+            let address = (u64::from(maxwell.get_register_value(slot + 5) & 0xff) << 32)
+                | u64::from(maxwell.get_register_value(slot + 6));
+            self.current_channel_info().unwrap().gpu_memory.as_ref()
+                .expect("mesh hash requires GPU memory").lock()
+                .read_block_unsafe(address, &mut state[12..]);
+        }
+        common::cityhash::city_hash64(&state) | 1
+    }
+
     /// Port of `ShaderCache::RefreshStages`.
     pub fn refresh_stages(&mut self, unique_hashes: &mut [u64; NUM_PROGRAMS]) -> bool {
-        let Some(channel) = self.current_channel_info() else {
-            self.last_shaders_valid = false;
-            return false;
-        };
-        let maxwell_ptr = channel.maxwell3d as *mut Maxwell3D;
-        if maxwell_ptr.is_null() {
-            self.last_shaders_valid = false;
-            return false;
-        }
-        let maxwell3d = unsafe { &mut *maxwell_ptr };
-        if !maxwell3d.consume_dirty_shaders() {
-            return self.last_shaders_valid;
-        }
-        let Some(gpu_memory) = channel.gpu_memory.as_ref().map(Arc::clone) else {
-            self.last_shaders_valid = false;
-            return false;
-        };
-        if maxwell3d.memory_manager().is_none() {
-            self.last_shaders_valid = false;
-            return false;
-        }
-        let base_addr = maxwell3d.program_region_address();
-        let rasterize_enable = maxwell3d.rasterize_enable();
-        let stage_infos: [crate::engines::maxwell_3d::ShaderStageInfo; NUM_PROGRAMS] =
-            std::array::from_fn(|index| maxwell3d.shader_stage_info(index as u32));
-        let stage_enabled: [bool; NUM_PROGRAMS] =
-            std::array::from_fn(|index| maxwell3d.is_shader_stage_enabled(index as u32));
-        for (index, unique_hash) in unique_hashes.iter_mut().enumerate() {
-            let stage_info = stage_infos[index];
-            let program_type = shader_stage_type_from_index(index);
-            if !stage_enabled[index] {
-                *unique_hash = 0;
-                continue;
-            }
-            if program_type == ShaderStageType::Fragment && !rasterize_enable {
-                *unique_hash = 0;
-                continue;
-            }
-
-            let shader_addr = base_addr + stage_info.offset as u64;
-            let cpu_shader_addr = {
-                let memory = gpu_memory.lock();
-                memory.gpu_to_cpu_address(shader_addr)
-            };
-            let Some(cpu_shader_addr) = cpu_shader_addr else {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(channel) = self.current_channel_info() else {
                 self.last_shaders_valid = false;
                 return false;
             };
-
-            let shader_ptr = if let Some(shader_info) = self.try_get(cpu_shader_addr) {
-                shader_info as *const ShaderInfo
-            } else {
-                if program_type == ShaderStageType::Invalid {
+            let maxwell_ptr = channel.maxwell3d as *mut Maxwell3D;
+            if maxwell_ptr.is_null() {
+                self.last_shaders_valid = false;
+                return false;
+            }
+            let maxwell3d = unsafe { &mut *maxwell_ptr };
+            if !maxwell3d.consume_dirty_shaders() {
+                return self.last_shaders_valid;
+            }
+            let Some(gpu_memory) = channel.gpu_memory.as_ref().map(Arc::clone) else {
+                self.last_shaders_valid = false;
+                return false;
+            };
+            if maxwell3d.memory_manager().is_none() {
+                self.last_shaders_valid = false;
+                return false;
+            }
+            let base_addr = maxwell3d.program_region_address();
+            let native = maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing);
+            let mesh = native && maxwell3d.is_mesh_enabled();
+            let rasterize_enable = maxwell3d.rasterize_enable();
+            let stage_infos: [crate::engines::maxwell_3d::ShaderStageInfo; NUM_PROGRAMS] =
+                std::array::from_fn(|index| maxwell3d.shader_stage_info(index as u32));
+            let stage_enabled: [bool; NUM_PROGRAMS] =
+                std::array::from_fn(|index| maxwell3d.is_shader_stage_enabled(index as u32));
+            for (index, unique_hash) in unique_hashes.iter_mut().enumerate() {
+                let stage_info = stage_infos[index];
+                let program_type = shader_stage_type_from_index(index);
+                if !stage_enabled[index] {
                     *unique_hash = 0;
                     continue;
                 }
-                let mut env = GraphicsEnvironment::from_maxwell3d(
-                    maxwell3d,
-                    program_type,
-                    base_addr,
-                    stage_info.offset,
-                );
-                self.make_shader_info(&mut env, cpu_shader_addr) as *const ShaderInfo
-            };
+                if program_type == ShaderStageType::Fragment && !rasterize_enable {
+                    *unique_hash = 0;
+                    continue;
+                }
+                if mesh && program_type == ShaderStageType::Geometry {
+                    // Header-only primitive output map, consumed by the mesh environment.
+                    *unique_hash = 0;
+                    continue;
+                }
 
-            let shader_info = unsafe { &*shader_ptr };
-            self.shader_infos[index] = Some(shader_ptr);
-            *unique_hash = shader_info.unique_hash;
+                let slot = PIPELINE_BASE + index as u32 * PIPELINE_STRIDE;
+                let shader_addr = if native {
+                    ((maxwell3d.get_register_value(slot + 5) as u64 & 0xff) << 32)
+                        | maxwell3d.get_register_value(slot + 6) as u64
+                } else {
+                    base_addr + stage_info.offset as u64
+                };
+                let cpu_shader_addr = {
+                    let memory = gpu_memory.lock();
+                    memory.gpu_to_cpu_address(shader_addr)
+                };
+                let Some(cpu_shader_addr) = cpu_shader_addr else {
+                    self.last_shaders_valid = false;
+                    return false;
+                };
+
+                let shader_ptr = if let Some(shader_info) = self.try_get(cpu_shader_addr) {
+                    shader_info as *const ShaderInfo
+                } else {
+                    if native && self.is_rejected(cpu_shader_addr) {
+                        maxwell3d.get_native_macro_engine(|engine| {
+                            engine.native_execution_failed = true
+                        });
+                        self.last_shaders_valid = false;
+                        return false;
+                    }
+                    if program_type == ShaderStageType::Invalid {
+                        *unique_hash = 0;
+                        continue;
+                    }
+                    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.rethrow_if_rejected(cpu_shader_addr);
+                        let constructor = if self.mesh_compute && mesh
+                            && matches!(program_type, ShaderStageType::VertexB | ShaderStageType::Tessellation) {
+                            GraphicsEnvironment::from_maxwell3d_live_mesh
+                        } else {
+                            GraphicsEnvironment::from_maxwell3d
+                        };
+                        let mut env = constructor(
+                            maxwell3d,
+                            program_type,
+                            if native { shader_addr } else { base_addr },
+                            if native { 0 } else { stage_info.offset },
+                        );
+                        self.make_shader_info(&mut env, cpu_shader_addr) as *const ShaderInfo
+                    }));
+                    match built {
+                        Ok(info) => info,
+                        Err(payload) => {
+                            if let Some(error) = RejectedShaderException::from_payload(&*payload) {
+                                self.remember_rejection(cpu_shader_addr, error);
+                                static DESCRIBED: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+                                if native
+                                    && DESCRIBED
+                                        .get_or_init(Default::default)
+                                        .lock()
+                                        .insert(shader_addr)
+                                {
+                                    let mut bytes = [0u8; 20];
+                                    gpu_memory.lock().read_block_unsafe(shader_addr, &mut bytes);
+                                    let header: Vec<u32> = bytes
+                                        .chunks_exact(4)
+                                        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                                        .collect();
+                                    let config: Vec<u32> = (0..16)
+                                        .map(|word| maxwell3d.get_register_value(slot + word))
+                                        .collect();
+                                    log::error!("Rejected program {shader_addr:#x} is bound to stage {index}: header {header:08x?}, slot {config:08x?}");
+                                }
+                            }
+                            std::panic::resume_unwind(payload)
+                        }
+                    }
+                };
+
+                let shader_info = unsafe { &*shader_ptr };
+                self.shader_infos[index] = Some(shader_ptr);
+                *unique_hash = shader_info.unique_hash;
+                if mesh && matches!(program_type, ShaderStageType::VertexB | ShaderStageType::Tessellation) {
+                    *unique_hash ^= self.mesh_state_hash();
+                }
+            }
+
+            self.last_shaders_valid = true;
+            true
+        }));
+        match result {
+            Ok(valid) => valid,
+            Err(payload) => {
+                let Some(error) = RejectedShaderException::from_payload(&*payload) else {
+                    std::panic::resume_unwind(payload);
+                };
+                let channel = self
+                    .current_channel_info()
+                    .expect("shader exception requires a bound channel");
+                let maxwell3d = unsafe { &mut *(channel.maxwell3d as *mut Maxwell3D) };
+                if !maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing) {
+                    std::panic::resume_unwind(payload);
+                }
+                let gpu_memory = channel.gpu_memory.as_ref().cloned();
+                maxwell3d.get_native_macro_engine(|engine| engine.native_execution_failed = true);
+                self.last_shaders_valid = false;
+                let message = error.message();
+                static LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+                if LOGGED
+                    .get_or_init(Default::default)
+                    .lock()
+                    .insert(message.clone())
+                {
+                    // Include the actual NVN mesh configuration to distinguish
+                    // missing task/mesh prerequisites from ordinary vertex code.
+                    use crate::engines::maxwell_3d::{
+                        MESH_CONTROL, MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER,
+                    };
+                    log::error!(
+                        "Native graphics shader rejected: {message}; mesh_enabled={} mesh_regs={:08x?}",
+                        maxwell3d.is_mesh_enabled(),
+                        [MESH_CONTROL, MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER]
+                            .map(|reg| maxwell3d.regs[reg as usize]),
+                    );
+                    // Diagnostic extension: an earlier rejected task prevents
+                    // RefreshStages from visiting its mesh/primitive-header slots.
+                    // Preserve mapped snapshots of those slots for offline analysis,
+                    // without accepting or executing the unsupported programs.
+                    if maxwell3d.is_mesh_enabled() {
+                        if let (Some(directory), Some(memory)) =
+                            (std::env::var_os("EDEN_NX2_SHADER_DUMP"), &gpu_memory)
+                        {
+                            let directory = std::path::PathBuf::from(directory);
+                            let memory = memory.lock();
+                            let mut metadata = format!("{message}\nmesh_regs={:08x?}\n",
+                                [MESH_CONTROL, MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER]
+                                    .map(|reg| maxwell3d.regs[reg as usize]));
+                            for stage in [1, 3, 4] {
+                                let slot = PIPELINE_BASE + stage * PIPELINE_STRIDE;
+                                let address = ((u64::from(maxwell3d.get_register_value(slot + 5)) & 0xff) << 32)
+                                    | u64::from(maxwell3d.get_register_value(slot + 6));
+                                let enabled = maxwell3d.is_shader_stage_enabled(stage);
+                                metadata.push_str(&format!("stage={stage} enabled={enabled} address={address:#x}\n"));
+                                if !enabled { continue; }
+                                let path = directory.join(format!("mesh-stage{stage}-{address:016x}.snapshot.bin"));
+                                if path.exists() { continue; }
+                                // A snapshot is explicitly not an instruction count.
+                                // Include the native 128-byte SPH; stage 4 is header-only.
+                                let limit = if stage == 4 { 128 } else { 1024 * 1024 };
+                                let mut bytes = Vec::new();
+                                while bytes.len() < limit {
+                                    let count = (limit - bytes.len()).min(128);
+                                    let next = address + bytes.len() as u64;
+                                    if !memory.is_fully_mapped_range(next, count as u64) { break; }
+                                    let mut block = [0u8; 128];
+                                    memory.read_block_unsafe(next, &mut block[..count]);
+                                    bytes.extend_from_slice(&block[..count]);
+                                }
+                                if let Err(error) = std::fs::create_dir_all(&directory)
+                                    .and_then(|_| std::fs::write(&path, &bytes)) {
+                                    log::warn!("Native mesh snapshot {}: {error}", path.display());
+                                }
+                            }
+                            let key = common::cityhash::city_hash64(metadata.as_bytes());
+                            if let Err(error) = std::fs::write(directory.join(format!("mesh-pipeline-{key:016x}.txt")), metadata) {
+                                log::warn!("Native mesh pipeline metadata: {error}");
+                            }
+                        }
+                    }
+                }
+                static DUMPED_ERRORS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+                let mut dumped = DUMPED_ERRORS.get_or_init(Default::default).lock();
+                if message.contains("constant buffer")
+                    && dumped.len() < 12
+                    && dumped
+                        .iter()
+                        .filter(|previous| **previous == message)
+                        .count()
+                        < 3
+                {
+                    dumped.push(message.clone());
+                    log::info!(
+                        "VS cbuf dump for: {}",
+                        message.chars().take(40).collect::<String>()
+                    );
+                    for slot in 3..8 {
+                        let buffer = &maxwell3d.const_buffer_bindings(0)[slot];
+                        if !buffer.enabled {
+                            continue;
+                        }
+                        let mut bytes = [0u8; 96];
+                        if let Some(memory) = &gpu_memory {
+                            memory.lock().read_block_unsafe(buffer.address, &mut bytes);
+                        }
+                        let words: Vec<u32> = bytes
+                            .chunks_exact(4)
+                            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                            .collect();
+                        log::info!(
+                            "VS cbuf {slot} at {:#x} size {:#x}: {words:08x?}",
+                            buffer.address,
+                            buffer.size
+                        );
+                    }
+                }
+                false
+            }
         }
-
-        self.last_shaders_valid = true;
-        true
     }
 
     /// Port of `ShaderCache::ComputeShader`.
@@ -262,9 +533,48 @@ impl ShaderCache {
             return Some(unsafe { &*shader_ptr });
         }
 
-        let mut env =
-            ComputeEnvironment::from_kepler_compute(kepler_compute, Arc::clone(&gpu_memory));
-        Some(self.make_shader_info(&mut env, cpu_shader_addr))
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.rethrow_if_rejected(cpu_shader_addr);
+            let mut env =
+                ComputeEnvironment::from_kepler_compute(kepler_compute, Arc::clone(&gpu_memory));
+            self.make_shader_info(&mut env, cpu_shader_addr) as *const ShaderInfo
+        }));
+        match built {
+            Ok(info) => Some(unsafe { &*info }),
+            Err(payload) => {
+                if let Some(error) = RejectedShaderException::from_payload(&*payload) {
+                    self.remember_rejection(cpu_shader_addr, error);
+                }
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    /// Port of `ShaderCache::RethrowIfRejected`.
+    fn rethrow_if_rejected(&self, addr: VAddr) {
+        let rejected = self.rejected_native.lock();
+        if let Some(error) = rejected.get(&addr) {
+            error.clone().rethrow();
+        }
+    }
+
+    /// Port of `ShaderCache::IsRejected`.
+    fn is_rejected(&self, addr: VAddr) -> bool {
+        self.rejected_native.lock().contains_key(&addr)
+    }
+
+    /// Port of `ShaderCache::RememberRejection`; the caught exception is explicit in Rust.
+    fn remember_rejection(&self, addr: VAddr, error: RejectedShaderException) {
+        let mut rejected = self.rejected_native.lock();
+        rejected.entry(addr).or_insert(error);
+        self.rejected_lowest.store(
+            self.rejected_lowest.load(Ordering::Relaxed).min(addr),
+            Ordering::Relaxed,
+        );
+        self.rejected_highest.store(
+            self.rejected_highest.load(Ordering::Relaxed).max(addr),
+            Ordering::Relaxed,
+        );
     }
 
     /// Port of `ShaderCache::GetGraphicsEnvironments`.
@@ -282,6 +592,7 @@ impl ShaderCache {
             return;
         }
         let base_addr = maxwell3d.program_region_address();
+        let native = maxwell3d.get_native_macro_engine_read(|engine| engine.native_turing);
         let mut env_index = 0usize;
 
         for (index, unique_hash) in unique_hashes.iter().enumerate() {
@@ -297,12 +608,25 @@ impl ShaderCache {
                 continue;
             }
 
+            let slot = PIPELINE_BASE + index as u32 * PIPELINE_STRIDE;
+            let address = if native {
+                ((maxwell3d.get_register_value(slot + 5) as u64 & 0xff) << 32)
+                    | maxwell3d.get_register_value(slot + 6) as u64
+            } else {
+                base_addr
+            };
             let shader_info = unsafe { &*shader_ptr };
-            let mut env = GraphicsEnvironment::from_maxwell3d(
+            let constructor = if self.mesh_compute && native && maxwell3d.is_mesh_enabled()
+                && matches!(program_type, ShaderStageType::VertexB | ShaderStageType::Tessellation) {
+                GraphicsEnvironment::from_maxwell3d_live_mesh
+            } else {
+                GraphicsEnvironment::from_maxwell3d
+            };
+            let mut env = constructor(
                 maxwell3d,
                 program_type,
-                base_addr,
-                stage_info.offset,
+                address,
+                if native { 0 } else { stage_info.offset },
             );
             env.set_cached_size(shader_info.size_bytes);
             result.envs[index] = env;
@@ -364,6 +688,13 @@ impl ShaderCache {
 
     fn invalidate_pages_in_region(&mut self, addr: VAddr, size: usize) {
         let addr_end = addr + size as u64;
+        if addr_end > self.rejected_lowest.load(Ordering::Relaxed)
+            && addr <= self.rejected_highest.load(Ordering::Relaxed)
+        {
+            self.rejected_native
+                .lock()
+                .retain(|&rejected, _| rejected < addr || rejected >= addr_end);
+        }
         let page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
         for page in (addr >> YUZU_PAGEBITS)..page_end {
             self.invalidate_page_entries(page, addr, addr_end);
@@ -494,7 +825,12 @@ impl ShaderCache {
             info.unique_hash = env.generic_environment().calculate_hash();
             info.size_bytes = env.generic_environment().read_size_bytes();
         }
-        let size_bytes = info.size_bytes;
+        let source_size = env.generic_environment().source_size_bytes();
+        let size_bytes = if source_size != 0 {
+            source_size
+        } else {
+            info.size_bytes
+        };
         self.register(info, cpu_addr, size_bytes);
         self.try_get(cpu_addr)
             .expect("registered shader info must be reachable through lookup cache")
@@ -559,9 +895,141 @@ mod tests {
     use crate::engines::kepler_compute::LaunchParams;
     use crate::engines::maxwell_3d::Maxwell3D;
     use crate::memory_manager::MemoryManager;
+
+    #[test]
+    fn mesh_cache_builds_live_native_environments_through_compute_spirv() {
+        use crate::engines::maxwell_3d::{MESH_CONTROL, MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER};
+        use shader_recompiler::environment::Environment;
+        let gpu_base = 0x1_0000_0000u64;
+        let mut backing = vec![0u8; 0x1000];
+        for (index, words) in [[0xffff7927u32, 0x3ff, 0x8800, 0], [0x794d, 0, 0x03800000, 0]]
+            .into_iter().enumerate() {
+            for (word_index, word) in words.into_iter().enumerate() {
+                let offset = 128 + index * 16 + word_index * 4;
+                backing[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        // Task writes payload word0; only mesh may write the primitive-count map.
+        for (index, words) in [[0xffff7927u32, 0xff, 0xb800, 0], [0x794d, 0, 0x03800000, 0]]
+            .into_iter().enumerate() {
+            for (word_index, word) in words.into_iter().enumerate() {
+                let offset = 0x300 + 128 + index * 16 + word_index * 4;
+                backing[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let (memory, device_memory) = make_owner_backed_memory_manager(gpu_base, 0x2000, &backing);
+        let mut maxwell = Maxwell3D::new();
+        crate::dirty_flags::setup_dirty_flags(&mut maxwell.dirty.tables);
+        maxwell.set_memory_manager(Arc::clone(&memory));
+        maxwell.set_native_turing_macro_mode(true);
+        for (register, value) in [MESH_CONTROL, MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER]
+            .into_iter().zip([1, 0x20204, 0x800000, 0x2c0b020]) {
+            maxwell.regs[register as usize] = value;
+        }
+        for index in [1, 3] {
+            let slot = (PIPELINE_BASE + index * PIPELINE_STRIDE) as usize;
+            maxwell.regs[slot] = 1;
+            maxwell.regs[slot + 5] = 1;
+            maxwell.regs[slot + 6] = if index == 1 { 0x300 } else { 0 };
+        }
+        let mut channel = ChannelState::new(7);
+        channel.memory_manager = Some(memory);
+        channel.maxwell_3d = Some(Box::new(maxwell));
+        let mut cache = ShaderCache::new_mesh_compute(device_memory);
+        cache.create_channel(&channel);
+        cache.bind_to_channel(7);
+        let mut hashes = [0; NUM_PROGRAMS];
+        assert!(cache.refresh_stages(&mut hashes));
+        let code_hashes: [u64; NUM_PROGRAMS] = std::array::from_fn(|index|
+            cache.shader_infos[index].map_or(0, |info| unsafe { &*info }.unique_hash));
+        for iteration in 0..2 {
+            let mut environments = GraphicsEnvironments::default();
+            cache.get_graphics_environments(&mut environments, &hashes);
+            assert_eq!(environments.env_ptrs[..2], [Some(1), Some(3)]);
+            for index in [1, 3] {
+                let env = &mut environments.envs[index];
+                let code_hash = code_hashes[index];
+                assert_eq!(env.mesh_shader().unwrap().is_task, index == 1);
+                assert_eq!(env.generic_environment_mut().analyze().unwrap(), code_hash);
+                assert_eq!(hashes[index], code_hash ^ cache.mesh_state_hash());
+                let code = env.generic_environment().cached_instruction_slice().to_vec();
+                let base = env.generic_environment().cached_instruction_start();
+                let program = shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
+                    &code, base, env, &Default::default());
+                assert_eq!(program.stage, shader_recompiler::ShaderStage::Compute);
+                assert_eq!(program.info.is_task, index == 1);
+                assert_eq!(program.info.is_mesh, index == 3);
+                let profile = shader_recompiler::Profile {
+                    unified_descriptor_binding: true,
+                    supported_spirv: 0x0001_0400,
+                    ..Default::default()
+                };
+                let spirv = shader_recompiler::backend::spirv::emit_spirv::emit_mesh_compute_spirv(
+                    &program, &profile, &Default::default(), &mut Default::default()).unwrap();
+                assert_eq!(spirv.code[0], 0x07230203);
+            }
+            if iteration == 0 {
+                channel.maxwell_3d.as_mut().unwrap().call_method(MESH_SHADER_A, 0x80804, true);
+                assert!(cache.refresh_stages(&mut hashes));
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_refresh_specializes_cached_code_and_skips_header_only_geometry() {
+        use crate::engines::maxwell_3d::{MESH_CONTROL, MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER};
+        let gpu_base = 0x1_0000_0000u64;
+        let cpu_base = 0x2000;
+        let mut backing = vec![0u8; 0x1000];
+        for index in 0..32usize {
+            backing[0x200 + index * 4..0x204 + index * 4]
+                .copy_from_slice(&(0xa500_0000 | index as u32).to_le_bytes());
+        }
+        let (memory, device_memory) = make_owner_backed_memory_manager(gpu_base, cpu_base, &backing);
+        let mut maxwell = Maxwell3D::new();
+        crate::dirty_flags::setup_dirty_flags(&mut maxwell.dirty.tables);
+        maxwell.set_memory_manager(Arc::clone(&memory));
+        maxwell.set_native_turing_macro_mode(true);
+        maxwell.regs[MESH_CONTROL as usize] = 1;
+        for (register, value) in [MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER]
+            .into_iter().zip([0x20204, 0x800000, 0x2c0b020]) {
+            maxwell.regs[register as usize] = value;
+        }
+        for index in [1, 3, 4] {
+            let slot = (PIPELINE_BASE + index * PIPELINE_STRIDE) as usize;
+            maxwell.regs[slot] = 1;
+            maxwell.regs[slot + 5] = 0xffff_ff01;
+            maxwell.regs[slot + 6] = if index == 4 { 0x200 } else { 0 };
+        }
+        let mut channel = ChannelState::new(7);
+        channel.memory_manager = Some(memory);
+        channel.maxwell_3d = Some(Box::new(maxwell));
+        let mut cache = ShaderCache::new(device_memory);
+        cache.create_channel(&channel);
+        cache.bind_to_channel(7);
+        // Existing code identity must be specialized even on a lookup hit.
+        cache.register(Box::new(ShaderInfo { unique_hash: 0x12345678, size_bytes: 16 }), cpu_base, 16);
+        let mut expected = Vec::new();
+        for word in [0x20204u32, 0x800000, 0x2c0b020] { expected.extend_from_slice(&word.to_le_bytes()); }
+        expected.extend_from_slice(&backing[0x200..0x250]);
+        let expected_hash = common::cityhash::city_hash64(&expected) | 1;
+        assert_eq!(cache.mesh_state_hash(), expected_hash);
+        let mut hashes = [0; NUM_PROGRAMS];
+        assert!(cache.refresh_stages(&mut hashes));
+        assert_eq!(hashes[1], 0x12345678 ^ expected_hash);
+        assert_eq!(hashes[3], hashes[1]);
+        assert_eq!(hashes[4], 0);
+        let old = hashes[1];
+        channel.maxwell_3d.as_mut().unwrap().call_method(MESH_SHADER_A, 0x80804, true);
+        assert!(cache.refresh_stages(&mut hashes));
+        assert_ne!(hashes[1], old);
+        assert_eq!(hashes[1], 0x12345678 ^ cache.mesh_state_hash());
+        assert_eq!(hashes[3], hashes[1]);
+        assert_eq!(cache.try_get(cpu_base).unwrap().unique_hash, 0x12345678);
+    }
     use crate::shader_environment::GenericEnvironment;
     use parking_lot::Mutex as ParkingLotMutex;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     fn make_cpu_reader(
         cpu_base: u64,
@@ -614,6 +1082,73 @@ mod tests {
     }
 
     #[test]
+    fn rejected_shaders_preserve_first_error_and_invalidate_only_start_addresses() {
+        let mut cache = ShaderCache::default();
+        assert_eq!(cache.rejected_lowest.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(cache.rejected_highest.load(Ordering::Relaxed), 0);
+        cache.rethrow_if_rejected(0x2000);
+        cache.remember_rejection(
+            0x2000,
+            RejectedShaderException::Runtime(RuntimeError::new("first")),
+        );
+        cache.remember_rejection(
+            0x2000,
+            RejectedShaderException::Logic(LogicError::new("second")),
+        );
+        cache.remember_rejection(
+            0x3000,
+            RejectedShaderException::Runtime(RuntimeError::new("other")),
+        );
+        for _ in 0..2 {
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cache.rethrow_if_rejected(0x2000)
+            }))
+            .unwrap_err();
+            assert_eq!(error.downcast_ref::<RuntimeError>().unwrap().0, "first");
+        }
+        cache.on_cache_invalidation(0x1fff, 1); // end is exclusive
+        cache.invalidate_region(0x2001, 0xfff); // a write after the start does not clear it
+        assert!(cache.is_rejected(0x2000));
+        assert!(cache.is_rejected(0x3000));
+        cache.on_cache_invalidation(0x2000, 0);
+        assert!(cache.is_rejected(0x2000));
+        cache.on_cache_invalidation(0x2000, 1); // removal is immediate, before SyncGuestHost
+        assert!(!cache.is_rejected(0x2000));
+        cache.invalidate_region(0x3000, 1);
+        assert!(!cache.is_rejected(0x3000));
+        assert_eq!(cache.rejected_lowest.load(Ordering::Relaxed), 0x2000);
+        assert_eq!(cache.rejected_highest.load(Ordering::Relaxed), 0x3000);
+        cache.remember_rejection(
+            0x2000,
+            RejectedShaderException::Logic(LogicError::new("retry")),
+        );
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.rethrow_if_rejected(0x2000)
+        }))
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<LogicError>().unwrap().0, "retry");
+    }
+
+    #[test]
+    fn rejected_shader_exception_preserves_concrete_type_and_ignores_unrelated_panics() {
+        let errors: Vec<Box<dyn std::any::Any + Send>> = vec![
+            Box::new(ShaderException::new("base")),
+            Box::new(LogicError::new("logic")),
+            Box::new(RuntimeError::new("runtime")),
+            Box::new(NotImplementedException::new("operation")),
+            Box::new(InvalidArgument::new("argument")),
+        ];
+        for error in errors {
+            let expected_type = (*error).type_id();
+            let rejected = RejectedShaderException::from_payload(&*error).unwrap();
+            let rethrown = std::panic::catch_unwind(|| rejected.rethrow()).unwrap_err();
+            assert_eq!((*rethrown).type_id(), expected_type);
+        }
+        assert!(RejectedShaderException::from_payload(&"assertion failed").is_none());
+        assert!(RejectedShaderException::from_payload(&String::from("unrelated panic")).is_none());
+    }
+
+    #[test]
     fn shader_cache_starts_with_upstream_shared_state_defaults() {
         let cache = ShaderCache::default();
         assert!(cache.current_channel_info().is_none());
@@ -662,6 +1197,137 @@ mod tests {
             .invalidation_cache
             .values()
             .any(|entries| !entries.is_empty()));
+    }
+
+    #[test]
+    fn native_graphics_cache_uses_pipeline_addresses_and_retries_after_source_write() {
+        const CHILD: &str = "RUZU_NATIVE_SHADER_REJECTION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env_remove("EDEN_NX2_REJECT")
+                .env_remove("EDEN_NX2_SHADER_DUMP")
+                .env_remove("EDEN_NATIVE_SHADER_OVERRIDE_DIR")
+                .env_remove("EDEN_NATIVE_DRAW_DIAGNOSTICS")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let gpu_base = 0x1_4000_0000u64;
+        let mut backing = vec![0u8; 0x1000];
+        // An invalid native opcode gives a real lowering rejection, not a seeded cache entry.
+        backing[128..132].copy_from_slice(&0x7ffu32.to_le_bytes());
+        let (memory, device_memory) = make_owner_backed_memory_manager(gpu_base, 0x9000, &backing);
+        let mut maxwell = Maxwell3D::new();
+        maxwell.set_memory_manager(Arc::clone(&memory));
+        maxwell.set_native_turing_macro_mode(true);
+        for (method, value) in [
+            (0x582, 0),
+            (0x583, 0xdead0000),
+            (0x811, 0x800),
+            (0x815, 0xfeed0001),
+            (0x816, 0x40000000),
+        ] {
+            <Maxwell3D as EngineInterface>::call_method(&mut maxwell, method, value, true);
+        }
+        let mut channel = ChannelState::new(42);
+        channel.memory_manager = Some(memory);
+        channel.maxwell_3d = Some(Box::new(maxwell));
+        let mut cache = ShaderCache::new(device_memory);
+        cache.create_channel(&channel);
+        cache.bind_to_channel(42);
+        let mut hashes = [0; NUM_PROGRAMS];
+        assert!(!cache.refresh_stages(&mut hashes));
+        assert!(cache.is_rejected(0x9000));
+        assert!(channel
+            .maxwell_3d
+            .as_ref()
+            .unwrap()
+            .get_native_macro_engine_read(|engine| engine.native_execution_failed));
+        // Repair the source, but leave its remembered rejection intact: this must skip lowering.
+        backing[128..144].fill(0);
+        backing[128..132].copy_from_slice(&0x794du32.to_le_bytes());
+        backing[136..140].copy_from_slice(&0x03800000u32.to_le_bytes());
+        channel.maxwell_3d.as_mut().unwrap().dirty.flags
+            [crate::dirty_flags::flags::SHADERS as usize] = true;
+        assert!(!cache.refresh_stages(&mut hashes));
+        cache.on_cache_invalidation(0x9000, 1);
+        channel.maxwell_3d.as_mut().unwrap().dirty.flags
+            [crate::dirty_flags::flags::SHADERS as usize] = true;
+        assert!(cache.refresh_stages(&mut hashes));
+        assert_ne!(hashes[1], 0);
+        assert_eq!(cache.try_get(0x9000).unwrap().size_bytes, 120);
+        let mut envs = GraphicsEnvironments::default();
+        cache.get_graphics_environments(&mut envs, &hashes);
+        assert_eq!(envs.env_ptrs[0], Some(1));
+        assert_eq!(envs.envs[1].generic_environment().source_size_bytes(), 144);
+        assert_eq!(envs.envs[1].generic_environment().cached_size_bytes(), 120);
+        // Ordinary graphics errors retain their typed propagation instead of failing a native draw.
+        cache.invalidate_region(0x9000, 144);
+        cache.remember_rejection(
+            0x9000,
+            RejectedShaderException::Runtime(RuntimeError::new("ordinary error")),
+        );
+        let maxwell = channel.maxwell_3d.as_mut().unwrap();
+        maxwell.set_native_turing_macro_mode(false);
+        for (method, value) in [(0x582, 1), (0x583, 0x40000000), (0x811, 0)] {
+            <Maxwell3D as EngineInterface>::call_method(maxwell, method, value, true);
+        }
+        maxwell.dirty.flags[crate::dirty_flags::flags::SHADERS as usize] = true;
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.refresh_stages(&mut hashes)
+        }))
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RuntimeError>().unwrap().0,
+            "ordinary error"
+        );
+    }
+
+    #[test]
+    fn native_shader_invalidation_tracks_source_bytes_not_lowered_size() {
+        const CHILD: &str = "RUZU_NATIVE_SHADER_CACHE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env_remove("EDEN_NX2_REJECT")
+                .env_remove("EDEN_NX2_SHADER_DUMP")
+                .env_remove("EDEN_NATIVE_SHADER_OVERRIDE_DIR")
+                .env_remove("EDEN_NATIVE_DRAW_DIAGNOSTICS")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let gpu_base = 0x4000_0000;
+        let mut backing = vec![0u8; 0x1000];
+        for (index, word) in [0x794du32, 0, 0x03800000, 0].into_iter().enumerate() {
+            backing[128 + index * 4..132 + index * 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let (memory, device_memory) = make_owner_backed_memory_manager(gpu_base, 0x9000, &backing);
+        let mut maxwell = Maxwell3D::new();
+        maxwell.set_memory_manager(memory);
+        maxwell.set_native_turing_macro_mode(true);
+        let mut env =
+            GraphicsEnvironment::from_maxwell3d(&maxwell, ShaderStageType::VertexB, gpu_base, 0);
+        let mut cache = ShaderCache::new(device_memory);
+        let info = cache.make_shader_info(&mut env, 0x4000_0000);
+        assert_eq!(info.size_bytes, 120); // converted code, padding and map
+        cache.invalidate_region(0x4000_0000 + 144, 1);
+        assert!(cache.try_get(0x4000_0000).is_some());
+        cache.invalidate_region(0x4000_0000 + 143, 1);
+        assert!(cache.try_get(0x4000_0000).is_none());
     }
 
     #[test]
@@ -889,5 +1555,22 @@ mod tests {
         assert_ne!(shader.unique_hash, 0);
         assert!(shader.size_bytes >= 8);
         assert!(cache.try_get(cpu_base + 0x100).is_some());
+        cache.invalidate_region(cpu_base + 0x100, 1);
+        cache.remember_rejection(
+            cpu_base + 0x100,
+            RejectedShaderException::Logic(LogicError::new("compute rejection")),
+        );
+        for _ in 0..2 {
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cache.compute_shader();
+            }))
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<LogicError>().unwrap().0,
+                "compute rejection"
+            );
+        }
+        cache.on_cache_invalidation(cpu_base + 0x100, 1);
+        assert!(cache.compute_shader().is_some());
     }
 }

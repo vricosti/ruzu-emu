@@ -1057,6 +1057,7 @@ mod tests {
         memory_read_address_sink: Option<Arc<AtomicU64>>,
         memory_read_64_count: Option<Arc<AtomicU64>>,
         halt_reason_ptr: Option<usize>,
+        exclusive_failures: u32,
     }
 
     impl MockCallbacks {
@@ -1081,6 +1082,7 @@ mod tests {
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
+                exclusive_failures: 0,
             }
         }
 
@@ -1099,6 +1101,7 @@ mod tests {
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
+                exclusive_failures: 0,
             }
         }
 
@@ -1117,6 +1120,7 @@ mod tests {
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
+                exclusive_failures: 0,
             }
         }
 
@@ -1148,6 +1152,7 @@ mod tests {
                 memory_read_address_sink: None,
                 memory_read_64_count: None,
                 halt_reason_ptr: None,
+                exclusive_failures: 0,
             }
         }
 
@@ -1274,18 +1279,34 @@ mod tests {
         }
 
         fn exclusive_write_8(&mut self, vaddr: u64, value: u8, _expected: u8) -> bool {
+            if self.exclusive_failures != 0 {
+                self.exclusive_failures -= 1;
+                return false;
+            }
             self.memory_write_8(vaddr, value);
             true
         }
         fn exclusive_write_16(&mut self, vaddr: u64, value: u16, _expected: u16) -> bool {
+            if self.exclusive_failures != 0 {
+                self.exclusive_failures -= 1;
+                return false;
+            }
             self.memory_write_16(vaddr, value);
             true
         }
         fn exclusive_write_32(&mut self, vaddr: u64, value: u32, _expected: u32) -> bool {
+            if self.exclusive_failures != 0 {
+                self.exclusive_failures -= 1;
+                return false;
+            }
             self.memory_write_32(vaddr, value);
             true
         }
         fn exclusive_write_64(&mut self, vaddr: u64, value: u64, _expected: u64) -> bool {
+            if self.exclusive_failures != 0 {
+                self.exclusive_failures -= 1;
+                return false;
+            }
             self.memory_write_64(vaddr, value);
             true
         }
@@ -1996,6 +2017,103 @@ mod tests {
         jit.clear_exclusive_state();
         jit.invalidate_cache_range(0x1000, 4);
         jit.clear_cache();
+    }
+
+    #[test]
+    fn a64_cas_executes_match_mismatch_and_exclusive_retry() {
+        for optimizations in [OptimizationFlag::NO_OPTIMIZATIONS, OptimizationFlag::ALL_SAFE_OPTIMIZATIONS] {
+        for size in 0..4u32 {
+            let bytes = 1usize << size;
+            let mask = u64::MAX >> (64 - bytes * 8);
+            for matches in [false, true] {
+                for failures in [0, 1] {
+                    let instruction = 0x08a07c00 | (size << 30) | (10 << 16) | (19 << 5) | 11;
+                    let mut callbacks = MockCallbacks::new(0x1000, &[instruction, 0xd4000001]);
+                    callbacks.exclusive_failures = failures;
+                    let memory = Arc::clone(&callbacks.memory);
+                    let old = 0x88776655443322f1u64 & mask;
+                    let desired = 0x123456789abcdef0u64;
+                    memory.lock().unwrap()[0x1000..0x1008].copy_from_slice(&0x88776655443322f1u64.to_le_bytes());
+                    let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(1));
+                    let mut config = A64UserConfig::new(Box::new(callbacks));
+                    config.global_monitor = Some(&mut *monitor);
+                    config.enable_cycle_counting = false;
+                    config.code_cache_size = 16 * 1024 * 1024;
+                    config.optimizations = optimizations;
+                    let mut jit = A64Jit::new(config).expect("CAS JIT");
+                    jit.set_pc(0x1000);
+                    jit.set_register(19, 0x2000);
+                    jit.set_register(10, (if matches { old } else { old ^ 1 }) | (!mask & 0xaabbccddeeff0000));
+                    jit.set_register(11, desired);
+                    if failures != 0 {
+                        let registers: Vec<_> = (0..31).map(|r| jit.get_register(r)).collect();
+                        jit.step();
+                        assert_eq!(jit.get_pc(), 0x1000, "failed CAS must retry");
+                        assert_eq!((0..31).map(|r| jit.get_register(r)).collect::<Vec<_>>(), registers,
+                            "failed store must preserve full registers, including upper bits");
+                        assert_eq!(&memory.lock().unwrap()[0x1000..0x1008], &0x88776655443322f1u64.to_le_bytes());
+                        jit.clear_halt(HaltReason::STEP);
+                    }
+                    jit.run();
+                    assert_eq!(jit.get_register(10), old, "size={size} match={matches} failures={failures}");
+                    assert_eq!(jit.get_register(11), desired);
+                    assert_eq!(jit.get_register(19), 0x2000);
+                    let memory = memory.lock().unwrap();
+                    let result = u64::from_le_bytes(memory[0x1000..0x1008].try_into().unwrap());
+                    let expected = if matches { (0x88776655443322f1 & !mask) | (desired & mask) } else { 0x88776655443322f1 };
+                    assert_eq!(result, expected, "size={size} match={matches} failures={failures}");
+                }
+            }
+        }
+        }
+    }
+
+    #[test]
+    fn a64_lse_operations_execute_all_widths_and_retry() {
+        for size in 0..4u32 {
+            let bytes = 1usize << size;
+            let mask = u64::MAX >> (64 - bytes * 8);
+            let old = (1u64 << (bytes * 8 - 1)) | 3;
+            let source = 5u64;
+            for op in 0..9u32 {
+                let instruction = 0x38200000 | (size << 30) | (10 << 16) | (op << 12) | (19 << 5) | 11;
+                let mut callbacks = MockCallbacks::new(0x1000, &[instruction, 0xd4000001]);
+                callbacks.exclusive_failures = 1;
+                let memory = Arc::clone(&callbacks.memory);
+                memory.lock().unwrap()[0x1000..0x1008].copy_from_slice(&old.to_le_bytes());
+                let mut monitor = Box::new(crate::interface::exclusive_monitor::ExclusiveMonitor::new(1));
+                let mut config = A64UserConfig::new(Box::new(callbacks));
+                config.global_monitor = Some(&mut *monitor);
+                config.enable_cycle_counting = false;
+                config.code_cache_size = 16 * 1024 * 1024;
+                config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+                let mut jit = A64Jit::new(config).unwrap();
+                jit.set_pc(0x1000);
+                jit.set_register(19, 0x2000);
+                jit.set_register(10, source);
+                jit.set_register(11, 0xdeadbeef);
+                jit.step();
+                assert_eq!(jit.get_pc(), 0x1000);
+                assert_eq!(jit.get_register(11), 0xdeadbeef);
+                jit.clear_halt(HaltReason::STEP);
+                jit.run();
+                let expected = match op {
+                    0 => old.wrapping_add(source) & mask,
+                    1 => old & !source,
+                    2 => old ^ source,
+                    3 => old | source,
+                    4 => source, // signed old is negative
+                    5 => old,
+                    6 => old,
+                    7 => source,
+                    _ => source,
+                };
+                assert_eq!(jit.get_register(11), old, "size={size} op={op}");
+                assert_eq!(jit.get_register(10), source);
+                let result = u64::from_le_bytes(memory.lock().unwrap()[0x1000..0x1008].try_into().unwrap());
+                assert_eq!(result, expected, "size={size} op={op}");
+            }
+        }
     }
 
     fn test_a64_inner(

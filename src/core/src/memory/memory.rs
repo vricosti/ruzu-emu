@@ -3595,6 +3595,9 @@ mod rasterizer_download_tests {
     struct FakeGpuMemoryManagerHandle;
 
     impl GpuMemoryManagerHandle for FakeGpuMemoryManagerHandle {
+        fn set_native_syncpoint_shim(&self, _address: u64) {}
+        fn num_shim_syncpoints(&self) -> u32 { 192 }
+
         fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
             self
         }
@@ -3633,6 +3636,20 @@ mod rasterizer_download_tests {
     }
 
     impl GpuCoreInterface for FakeGpuCore {
+        fn run_in_order(&self, _func: Box<dyn FnOnce() + Send>) {
+            panic!("GPU callback execution is outside this test fixture");
+        }
+
+        fn set_nx2_ampere(&self, _enabled: bool) {}
+
+        fn nx2_add_semaphore_region(&self, _start: u64) {
+            panic!("NX2 semaphore registration is outside this test fixture");
+        }
+
+        fn nx2_remove_semaphore_region(&self, _start: u64) {
+            panic!("NX2 semaphore removal is outside this test fixture");
+        }
+
         fn as_any(&self) -> &(dyn std::any::Any + Send) {
             self
         }
@@ -3656,6 +3673,24 @@ mod rasterizer_download_tests {
         fn push_gpu_entries(&self, _channel_id: i32, _entries: GpuCommandList) {}
 
         fn request_composite(&self, _layers: Vec<FramebufferConfig>, _fences: Vec<NvFence>) {}
+
+        fn run_on_gpu_thread(&self, _action: Box<dyn FnOnce() + Send>) -> u64 {
+            panic!("GPU sync operation is outside this test fixture");
+        }
+
+        fn renderer_flush_region(&self, _addr: u64, _size: u64) {
+            panic!("renderer flush is outside this test fixture");
+        }
+
+        fn request_screenshot(
+            &self,
+            _pixels: Vec<u8>,
+            _callback: Box<dyn FnOnce(Vec<u8>, bool) + Send>,
+            _layout: crate::frontend::framebuffer_layout::FramebufferLayout,
+            _layer_stack: crate::hle::service::nvnflinger::hwc_layer::LayerStackId,
+        ) {
+            panic!("screenshot is outside this test fixture");
+        }
 
         fn wait_for_composite(&self) {}
 
@@ -3682,6 +3717,26 @@ mod rasterizer_download_tests {
     }
 
     impl Host1xCoreInterface for FakeHost1xCore {
+        fn create_nx2_video_decoder(&self, _mime: &str) -> Box<dyn crate::host1x_core::Nx2VideoDecoderHandle> {
+            panic!("video decoding is outside this memory test fixture");
+        }
+
+        fn increment_guest(&self, _id: u32) {
+            panic!("guest increment is outside this fixture");
+        }
+
+        fn is_ready_guest(&self, _id: u32, _expected_value: u32) -> bool {
+            panic!("memory-test Host1x fixture does not model guest syncpoints")
+        }
+
+        fn get_guest_syncpoint_value(&self, _id: u32) -> u32 {
+            panic!("memory-test Host1x fixture does not model guest syncpoints")
+        }
+
+        fn deregister_guest_action(&self, _id: u32, _handle: u64) {
+            panic!("memory-test Host1x fixture does not model guest actions")
+        }
+
         fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
             self
         }
@@ -3746,6 +3801,10 @@ mod rasterizer_download_tests {
         }
 
         fn smmu_unmap(&self, _d_address: u64, _size: usize) {}
+
+        fn smmu_read_block(&self, _address: u64, _output: &mut [u8]) -> bool {
+            panic!("device reads are outside this fixture");
+        }
 
         fn smmu_lookup(&self, _d_address: u64) -> usize {
             0

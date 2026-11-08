@@ -547,7 +547,7 @@ impl RendererVulkan {
             crate::capture::LINEAR_DEPTH,
             crate::capture::BLOCK_HEIGHT,
             crate::capture::BLOCK_DEPTH,
-            0,
+            0, false,
         );
         out
     }

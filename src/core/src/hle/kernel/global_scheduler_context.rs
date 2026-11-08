@@ -108,9 +108,9 @@ fn trace_sched_state_fast(
 /// Priority at or above which core migration is allowed.
 pub const HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY: i32 = 2;
 
-/// Preemption priorities for each core (indices 0-3).
+/// Preemption priorities for each core (indices 0-5).
 pub const PREEMPTION_PRIORITIES: [u32; hardware_properties::NUM_CPU_CORES as usize] =
-    [59, 59, 59, 63];
+    [59, 59, 59, 63, 59, 59];
 
 /// The global scheduler context.
 ///

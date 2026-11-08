@@ -255,6 +255,11 @@ impl Services {
         guest_service!("apm", move || {
             crate::hle::service::apm::apm::loop_process(system);
         });
+        // SDK-derived NX2 service; separately authorized because Eden-NX2
+        // has no chat:u implementation. Ownership stays in chat.rs.
+        guest_service!("chat", move || {
+            crate::hle::service::chat::loop_process(system);
+        });
         let sm = service_manager.clone();
         guest_service!("bcat", move || {
             Self::loop_process_bcat(&sm, system);

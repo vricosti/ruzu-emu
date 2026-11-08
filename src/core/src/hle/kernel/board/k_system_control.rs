@@ -12,6 +12,9 @@ use crate::hle::kernel::k_trace::K_TRACE_BUFFER_SIZE;
 /// Secure applet memory size (4 MiB).
 pub const SECURE_APPLET_MEMORY_SIZE: usize = 4 * 1024 * 1024;
 
+/// Eden-NX2 graphics-server DRAM, outside the application pool in the 12 GB layout.
+pub const NX2_GRAPHICS_SERVER_MEMORY_SIZE: usize = 8 * 1024 * 1024 * 1024;
+
 // Internal constants matching upstream impl namespace.
 const REQUIRED_NON_SECURE_SYSTEM_MEMORY_SIZE_VI: usize = 0x2280 * 4 * 1024;
 const REQUIRED_NON_SECURE_SYSTEM_MEMORY_SIZE_VI_FATAL: usize = 0x200 * 4 * 1024;
@@ -71,7 +74,7 @@ pub mod init {
             MemorySize::MemorySize6GB => 6 * GIB,
             MemorySize::MemorySize8GB => 8 * GIB,
             MemorySize::MemorySize10GB => 10 * GIB,
-            MemorySize::MemorySize12GB => 12 * GIB,
+            MemorySize::MemorySize12GB => 12 * GIB + NX2_GRAPHICS_SERVER_MEMORY_SIZE,
         }
     }
 

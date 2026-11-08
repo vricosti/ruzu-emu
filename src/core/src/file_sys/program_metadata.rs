@@ -183,6 +183,7 @@ pub struct ProgramMetadata {
     npdm_header: Header,
     aci_header: AciHeader,
     acid_header: AcidHeader,
+    is_switch2: bool,
     acid_file_access: FileAccessControl,
     aci_file_access: FileAccessHeader,
     aci_kernel_capabilities: KernelCapabilityDescriptors,
@@ -203,6 +204,7 @@ impl ProgramMetadata {
             npdm_header: Header::default(),
             aci_header: AciHeader::default(),
             acid_header: AcidHeader::default(),
+            is_switch2: false,
             acid_file_access: FileAccessControl::default(),
             aci_file_access: FileAccessHeader::default(),
             aci_kernel_capabilities: Vec::new(),
@@ -246,13 +248,43 @@ impl ProgramMetadata {
             None => return ResultStatus::ErrorBadACIDHeader,
         }
 
+        // origin/eden-nx2: ProgramMetadata::Load alternate ACID signature area.
+        if self.acid_header.magic != *b"ACID" {
+            const ACID_SIG_SIZE_V1: usize = 0x200;
+            const ACID_SIG_SIZE_V2: usize = 0x300;
+            const ACID_BODY_SIZE: usize = std::mem::size_of::<AcidHeader>() - ACID_SIG_SIZE_V1;
+            // AcidHeader contains only integers and byte arrays; all bit patterns are valid.
+            let body = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (&mut self.acid_header as *mut AcidHeader)
+                        .cast::<u8>()
+                        .add(ACID_SIG_SIZE_V1),
+                    ACID_BODY_SIZE,
+                )
+            };
+            if file.read(
+                body,
+                ACID_BODY_SIZE,
+                self.npdm_header.acid_offset as usize + ACID_SIG_SIZE_V2,
+            ) != ACID_BODY_SIZE
+                || self.acid_header.magic != *b"ACID"
+            {
+                return ResultStatus::ErrorBadACIDHeader;
+            }
+            log::info!("NPDM uses the Switch 2 ACID layout");
+            self.is_switch2 = true;
+        }
+
         match read_object::<AciHeader>(file.as_ref(), self.npdm_header.aci_offset as usize) {
             Some(hdr) => self.aci_header = hdr,
             None => return ResultStatus::ErrorBadACIHeader,
         }
 
         // Load acid_file_access per-component
-        let mut current_offset = self.acid_header.fac_offset as usize;
+        let mut current_offset = self
+            .npdm_header
+            .acid_offset
+            .wrapping_add(self.acid_header.fac_offset) as usize;
         let mut buf1 = [0u8; 1];
         if file.read(&mut buf1, 1, current_offset) != 1 {
             return ResultStatus::ErrorBadFileAccessControl;
@@ -271,7 +303,10 @@ impl ProgramMetadata {
         }
 
         // Load aci_file_access per-component
-        current_offset = self.aci_header.fah_offset as usize;
+        current_offset = self
+            .npdm_header
+            .aci_offset
+            .wrapping_add(self.aci_header.fah_offset) as usize;
         if file.read(&mut buf1, 1, current_offset) != 1 {
             return ResultStatus::ErrorBadFileAccessHeader;
         }
@@ -350,7 +385,7 @@ impl ProgramMetadata {
         system_resource_size: u32,
         capabilities: KernelCapabilityDescriptors,
     ) {
-        let mut flags = 0u8;
+        let mut flags = self.npdm_header.flags & 0xF0;
         if is_64_bit {
             flags |= 0x01;
         }
@@ -363,6 +398,10 @@ impl ProgramMetadata {
         self.aci_header.title_id = title_id;
         self.aci_file_access.permissions = filesystem_permissions;
         self.aci_kernel_capabilities = capabilities;
+    }
+
+    pub fn is_switch2(&self) -> bool {
+        self.is_switch2
     }
 
     pub fn is_64_bit_program(&self) -> bool {
@@ -484,5 +523,83 @@ impl ProgramMetadata {
 impl Default for ProgramMetadata {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod nx2_tests {
+    use super::*;
+    use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+    use std::sync::Arc;
+
+    fn fixture(switch2: bool) -> Vec<u8> {
+        let mut data = vec![0u8; 0x700];
+        data[0x70..0x74].copy_from_slice(&0x80u32.to_le_bytes());
+        data[0x78..0x7c].copy_from_slice(&0x200u32.to_le_bytes());
+        data[0xa0..0xa4].copy_from_slice(&0x40u32.to_le_bytes());
+        data[0xc4..0xcc].copy_from_slice(&0x123456789abcdef0u64.to_le_bytes());
+        let body = if switch2 { 0x500 } else { 0x400 };
+        data[body..body + 4].copy_from_slice(b"ACID");
+        data[body + 0x20..body + 0x24].copy_from_slice(&0x400u32.to_le_bytes());
+        data[0x604..0x60c].copy_from_slice(&0xfedcba9876543210u64.to_le_bytes());
+        data
+    }
+
+    fn load(metadata: &mut ProgramMetadata, data: Vec<u8>) -> ResultStatus {
+        metadata.load(Arc::new(VectorVfsFile::new(data, "main.npdm".into(), None)))
+    }
+
+    #[test]
+    fn manual_load_preserves_reserved_flags_and_casts() {
+        let mut metadata = ProgramMetadata::new();
+        metadata.npdm_header.flags = 0xff;
+        metadata.load_manual(
+            false,
+            ProgramAddressSpaceType::Is36Bit,
+            -1,
+            0x102,
+            0x4000,
+            42,
+            u64::MAX,
+            0,
+            vec![],
+        );
+        assert_eq!(metadata.npdm_header.flags, 0xf2);
+        assert_eq!(metadata.get_main_thread_priority(), 255);
+        assert_eq!(metadata.get_main_thread_core(), 2);
+    }
+
+    #[test]
+    fn layouts_and_relative_permissions() {
+        assert_eq!(std::mem::offset_of!(AcidHeader, magic), 0x200);
+        assert_eq!(std::mem::offset_of!(AcidHeader, fac_offset), 0x220);
+        for switch2 in [false, true] {
+            let mut metadata = ProgramMetadata::new();
+            assert_eq!(load(&mut metadata, fixture(switch2)), ResultStatus::Success);
+            assert_eq!(metadata.is_switch2(), switch2);
+            assert_eq!(metadata.get_filesystem_permissions(), 0x123456789abcdef0);
+            assert_eq!(metadata.acid_file_access.permissions, 0xfedcba9876543210);
+        }
+    }
+
+    #[test]
+    fn invalid_or_truncated_alternate_body_is_rejected() {
+        for length in [0x53f, 0x700] {
+            let mut data = fixture(true);
+            data[0x500] = 0;
+            data.truncate(length);
+            assert_eq!(
+                load(&mut ProgramMetadata::new(), data),
+                ResultStatus::ErrorBadACIDHeader
+            );
+        }
+    }
+
+    #[test]
+    fn switch2_flag_retains_upstream_reload_lifetime() {
+        let mut metadata = ProgramMetadata::new();
+        assert_eq!(load(&mut metadata, fixture(true)), ResultStatus::Success);
+        assert_eq!(load(&mut metadata, fixture(false)), ResultStatus::Success);
+        assert!(metadata.is_switch2());
     }
 }

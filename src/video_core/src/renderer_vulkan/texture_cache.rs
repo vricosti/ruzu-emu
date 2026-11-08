@@ -69,6 +69,82 @@ const ENABLE_MSAA_RESOLVE_CONSUME: bool = true;
 const ENABLE_MSAA_COLOR_DISCARD: bool = true;
 const ENABLE_MSAA_DEPTH_STENCIL_DISCARD: bool = true;
 
+// Port of vk_texture_cache.cpp's huge ASTC host representation helpers.
+fn is_huge_astc_array(optimal_astc_supported: bool, info: &ImageInfo) -> bool {
+    if !crate::surface::is_pixel_format_astc(info.format) || optimal_astc_supported
+        || info.image_type != ImageType::E2D || info.size.depth != 1 {
+        return false;
+    }
+    let bytes: u64 = (0..info.resources.levels).map(|level|
+        u64::from((info.size.width >> level).max(1))
+            * u64::from((info.size.height >> level).max(1)) * 4).sum();
+    bytes * info.resources.layers as u64 > 1u64 << 30
+}
+
+const HUGE_ASTC_VIEW_FORMATS: [vk::Format; 2] = [
+    vk::Format::A8B8G8R8_UNORM_PACK32, vk::Format::A8B8G8R8_SRGB_PACK32,
+];
+
+fn huge_astc_host_format(optimal_astc_supported: bool, info: &ImageInfo) -> Option<vk::Format> {
+    is_huge_astc_array(optimal_astc_supported, info).then(|| {
+        if crate::surface::is_pixel_format_srgb(info.format) {
+            vk::Format::A8B8G8R8_SRGB_PACK32
+        } else {
+            vk::Format::A8B8G8R8_UNORM_PACK32
+        }
+    })
+}
+
+fn will_use_accelerated_astc_decode(
+    optimal_astc_supported: bool, info: &ImageInfo,
+    decode: common::settings_enums::AstcDecodeMode,
+    recompression: common::settings_enums::AstcRecompression,
+) -> bool {
+    if !crate::surface::is_pixel_format_astc(info.format) || optimal_astc_supported { return false; }
+    if is_huge_astc_array(optimal_astc_supported, info) { return true; }
+    decode == common::settings_enums::AstcDecodeMode::Gpu
+        && recompression == common::settings_enums::AstcRecompression::Uncompressed
+        && info.size.depth == 1
+}
+
+fn trimmed_host_info(
+    optimal_astc_supported: bool, info: &ImageInfo, level_offset: &mut u32,
+    decode: common::settings_enums::AstcDecodeMode,
+    recompression: common::settings_enums::AstcRecompression,
+) -> ImageInfo {
+    *level_offset = 0;
+    if !will_use_accelerated_astc_decode(optimal_astc_supported, info, decode, recompression)
+        || info.image_type != ImageType::E2D { return info.clone(); }
+    let decoded_bytes = |skip: u32| -> u64 {
+        (skip..info.resources.levels as u32).map(|level|
+            u64::from((info.size.width >> level).max(1))
+                * u64::from((info.size.height >> level).max(1)) * 4).sum::<u64>()
+            * info.resources.layers as u64
+    };
+    if decoded_bytes(0) <= 1u64 << 30 { return info.clone(); }
+    while *level_offset + 1 < info.resources.levels as u32
+        && decoded_bytes(*level_offset) > 512u64 << 20 { *level_offset += 1; }
+    let mut host = info.clone();
+    host.size.width = (info.size.width >> *level_offset).max(1);
+    host.size.height = (info.size.height >> *level_offset).max(1);
+    host.resources.levels -= *level_offset as i32;
+    log::warn!("{}x{}x{} ASTC image would be {} MiB decoded; keeping mip levels {}+ ({}x{})",
+        info.size.width, info.size.height, info.resources.layers, decoded_bytes(0) >> 20,
+        level_offset, host.size.width, host.size.height);
+    host
+}
+
+fn host_range(image: &ImageBase, mut range: SubresourceRange) -> SubresourceRange {
+    let skip = image.host_level_offset as i32;
+    if skip == 0 { return range; }
+    let host_levels = image.info.resources.levels - skip;
+    let base = (range.base.level - skip).clamp(0, host_levels - 1);
+    let end = (range.base.level + range.extent.levels - skip).clamp(base + 1, host_levels);
+    range.base.level = base;
+    range.extent.levels = end - base;
+    range
+}
+
 fn assert_fail_soft(condition: bool, message: &str) {
     if condition {
         return;
@@ -184,9 +260,16 @@ impl Image {
             *common::settings::values().accelerate_astc.get_value(),
             *common::settings::values().astc_recompression.get_value(),
         );
-        let format = runtime.surface_format(base_mut.info.format, false);
+        let override_format = huge_astc_host_format(runtime.optimal_astc_supported, &base_mut.info);
+        let format = override_format.unwrap_or_else(|| runtime.surface_format(base_mut.info.format, false));
+        let host_info = trimmed_host_info(runtime.optimal_astc_supported, &base_mut.info,
+            &mut base_mut.host_level_offset,
+            *common::settings::values().accelerate_astc.get_value(),
+            *common::settings::values().astc_recompression.get_value());
+        if base_mut.host_level_offset != 0 { base_mut.flags.insert(ImageFlagBits::TRIMMED_LEVELS); }
         let aspect = image_aspect_mask(base_mut.info.format);
-        let image = runtime.create_image_from_info(&base_mut.info)?;
+        let image = runtime.create_image_from_info(&host_info, override_format,
+            override_format.map(|_| HUGE_ASTC_VIEW_FORMATS.as_slice()))?;
         let image_handle = image.handle();
         runtime
             .vulkan_device()
@@ -199,7 +282,7 @@ impl Image {
             scaled_image: None,
             storage_image_views: vec![
                 vk::ImageView::null();
-                base_mut.info.resources.levels.max(1) as usize
+                host_info.resources.levels.max(1) as usize
             ],
             format,
             aspect,
@@ -2347,7 +2430,7 @@ impl TextureCacheRuntime {
                 != 0
         };
         let astc_decoder_pass = if *common::settings::values().accelerate_astc.get_value()
-            == common::settings_enums::AstcDecodeMode::Gpu
+            == common::settings_enums::AstcDecodeMode::Gpu || !optimal_astc_supported
         {
             match AstcDecoderPass::new(
                 vulkan_device,
@@ -2658,12 +2741,15 @@ impl TextureCacheRuntime {
             log::warn!("TextureCacheRuntime::accelerate_image_upload missing ASTCDecoderPass");
             return false;
         };
+        let skip = image.base().host_level_offset;
+        let host_levels = image.base().info.resources.levels - skip as i32;
         let mut storage_views =
-            vec![vk::ImageView::null(); image.base().info.resources.levels.max(1) as usize];
+            vec![vk::ImageView::null(); host_levels.max(1) as usize];
         for swizzle in swizzles {
+            let host_level = swizzle.level - skip as i32;
             let view = match self.storage_image_view_with_format(
                 image,
-                swizzle.level as u32,
+                host_level as u32,
                 vk::Format::A8B8G8R8_UNORM_PACK32,
             ) {
                 Ok(view) => view,
@@ -2677,7 +2763,7 @@ impl TextureCacheRuntime {
                     return false;
                 }
             };
-            let Some(slot) = storage_views.get_mut(swizzle.level as usize) else {
+            let Some(slot) = storage_views.get_mut(host_level as usize) else {
                 self.astc_decoder_pass = Some(pass);
                 return false;
             };
@@ -2689,6 +2775,7 @@ impl TextureCacheRuntime {
             image.aspect_mask(),
             is_initialized,
             &image.base().info,
+            skip,
             image.base().guest_size_bytes as usize,
             map.buffer,
             map.offset,
@@ -3879,7 +3966,7 @@ impl TextureCacheRuntime {
         if is_2d {
             scaled_info.size.height = self.resolution.scale_up_u32(info.size.height);
         }
-        self.create_image_from_info(&scaled_info)
+        self.create_image_from_info(&scaled_info, None, None)
     }
 
     fn blit_scale(
@@ -4052,15 +4139,22 @@ impl TextureCacheRuntime {
         });
     }
 
-    fn create_image_from_info(&mut self, info: &ImageInfo) -> Result<AllocatedImage, vk::Result> {
-        let format_info = self.surface_format_info(info.format, false);
+    fn create_image_from_info(&mut self, info: &ImageInfo, format_override: Option<vk::Format>,
+        view_formats_override: Option<&[vk::Format]>) -> Result<AllocatedImage, vk::Result> {
+        let mut format_info = self.surface_format_info(info.format, false);
+        if let Some(format) = format_override {
+            format_info.format = format;
+            format_info.attachable = false;
+            format_info.storage = true;
+        }
         let mut image_info = make_image_create_info(
             info,
             format_info,
             self.vulkan_device()
                 .is_storage_image_multisample_supported(),
         );
-        let view_formats = self.view_formats[info.format as usize].clone();
+        let view_formats = view_formats_override.map(|formats| formats.to_vec())
+            .unwrap_or_else(|| self.view_formats[info.format as usize].clone());
         let mut format_list = vk::ImageFormatListCreateInfo::default()
             .view_formats(&view_formats);
         let has_storage_compatible_view = view_formats.iter().any(|&view_format| {
@@ -4198,7 +4292,12 @@ impl TextureCacheRuntime {
         // SAFETY: the pointer is the stable boxed base of the slot receiving
         // the returned payload.
         let view_base = unsafe { view_base.as_ref() };
-        let format_info = self.surface_format_info(view_base.format, true);
+        let mut format_info = self.surface_format_info(view_base.format, true);
+        if is_huge_astc_array(self.optimal_astc_supported, &image.base().info) {
+            format_info.format = if crate::surface::is_pixel_format_srgb(view_base.format) {
+                vk::Format::A8B8G8R8_SRGB_PACK32
+            } else { vk::Format::A8B8G8R8_UNORM_PACK32 };
+        }
         let format = format_info.format;
         let aspect_mask = image_view_aspect_mask(info);
         let components = image_view_components(
@@ -4208,7 +4307,7 @@ impl TextureCacheRuntime {
             self.ext_4444_formats_supported,
             self.vulkan_device().supports_depth_stencil_swizzle_one(),
         );
-        let base_range = make_subresource_range(aspect_mask, view_base.range);
+        let base_range = make_subresource_range(aspect_mask, host_range(image.base(), view_base.range));
         let image_format_info = self.surface_format_info(image.base().info.format, false);
         let usage = image_view_usage_flags(
             format_info,
@@ -5729,7 +5828,9 @@ impl TextureCache {
         astc_decode_mode: common::settings_enums::AstcDecodeMode,
         astc_recompression: common::settings_enums::AstcRecompression,
     ) {
-        if crate::surface::is_pixel_format_astc(image.info.format) && !optimal_astc_supported {
+        if is_huge_astc_array(optimal_astc_supported, &image.info) {
+            image.flags.insert(ImageFlagBits::ACCELERATED_UPLOAD | ImageFlagBits::CONVERTED | ImageFlagBits::COSTLY_LOAD);
+        } else if crate::surface::is_pixel_format_astc(image.info.format) && !optimal_astc_supported {
             match astc_decode_mode {
                 common::settings_enums::AstcDecodeMode::Gpu => {
                     if astc_recompression == common::settings_enums::AstcRecompression::Uncompressed
@@ -6519,6 +6620,58 @@ fn make_copy_image_barriers(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn huge_astc_trimming_matches_title_allocation_and_preserves_native_support() {
+        use common::settings_enums::{AstcDecodeMode, AstcRecompression};
+        let info = super::ImageInfo {
+            format: crate::surface::PixelFormat::Astc2d8x8Srgb,
+            image_type: super::ImageType::E2D,
+            size: super::Extent3D { width: 8192, height: 8192, depth: 1 },
+            resources: crate::texture_cache::types::SubresourceExtent { levels: 12, layers: 68 },
+            ..super::ImageInfo::default()
+        };
+        for decode in [AstcDecodeMode::Cpu, AstcDecodeMode::CpuAsynchronous, AstcDecodeMode::Gpu] {
+            let mut skip = 99;
+            let host = super::trimmed_host_info(false, &info, &mut skip, decode, AstcRecompression::Bc3);
+            assert_eq!(skip, 3);
+            assert_eq!((host.size.width, host.size.height, host.resources.levels, host.resources.layers),
+                       (1024, 1024, 9, 68));
+            let mut image = crate::texture_cache::image_base::ImageBase::new(info.clone(), 0, 0);
+            super::TextureCache::apply_backend_image_flags_with_capabilities(
+                &mut image, false, true, decode, AstcRecompression::Bc3);
+            assert!(image.flags.contains(super::ImageFlagBits::ACCELERATED_UPLOAD));
+            assert!(!image.flags.contains(super::ImageFlagBits::ASYNCHRONOUS_DECODE));
+        }
+        assert_eq!(super::huge_astc_host_format(false, &info), Some(ash::vk::Format::A8B8G8R8_SRGB_PACK32));
+        let mut skip = 99;
+        let host = super::trimmed_host_info(true, &info, &mut skip, AstcDecodeMode::Gpu, AstcRecompression::Uncompressed);
+        assert_eq!(skip, 0);
+        assert_eq!(host.size.width, 8192);
+        assert_eq!(super::huge_astc_host_format(true, &info), None);
+        let mut ordinary = info.clone();
+        ordinary.size.width = 1024;
+        ordinary.size.height = 1024;
+        ordinary.resources.layers = 1;
+        super::trimmed_host_info(false, &ordinary, &mut skip, AstcDecodeMode::Gpu, AstcRecompression::Uncompressed);
+        assert_eq!(skip, 0);
+    }
+
+    #[test]
+    fn huge_astc_host_range_clamps_missing_mips_preserving_layers() {
+        use crate::texture_cache::types::{SubresourceBase, SubresourceExtent, SubresourceRange};
+        let mut image = crate::texture_cache::image_base::ImageBase::null(crate::texture_cache::image_base::NullImageParams);
+        image.info.resources.levels = 12;
+        image.host_level_offset = 3;
+        for (base, count, expected_base, expected_count) in [
+            (0, 12, 0, 9), (0, 1, 0, 1), (2, 3, 0, 2), (5, 4, 2, 4), (11, 1, 8, 1),
+        ] {
+            let range = SubresourceRange { base: SubresourceBase { level: base, layer: 7 },
+                extent: SubresourceExtent { levels: count, layers: 4 } };
+            let host = super::host_range(&image, range);
+            assert_eq!((host.base.level, host.extent.levels), (expected_base, expected_count));
+            assert_eq!((host.base.layer, host.extent.layers), (7, 4));
+        }
+    }
     use super::*;
     use crate::texture_cache::image_view_info::SwizzleSource;
     use crate::texture_cache::types::{

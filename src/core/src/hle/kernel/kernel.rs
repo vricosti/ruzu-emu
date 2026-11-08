@@ -178,7 +178,7 @@ pub fn get_kernel_mut() -> Option<&'static mut KernelCore> {
 /// other's process-global kernel pointer.
 #[cfg(test)]
 pub struct ScopedKernelForTest {
-    kernel: Box<KernelCore>,
+    kernel: Option<Box<KernelCore>>,
     previous: *mut KernelCore,
     previous_active: bool,
 }
@@ -191,18 +191,29 @@ impl ScopedKernelForTest {
         let previous = SCOPED_TEST_KERNEL_PTR.with(|current| current.replace(ptr));
         let previous_active = SCOPED_TEST_KERNEL_ACTIVE.with(|active| active.replace(true));
         Self {
-            kernel,
+            kernel: Some(kernel),
+            previous,
+            previous_active,
+        }
+    }
+
+    /// Isolate a standalone unit test from kernels installed by earlier tests.
+    pub fn without_kernel() -> Self {
+        let previous = SCOPED_TEST_KERNEL_PTR.with(|current| current.replace(std::ptr::null_mut()));
+        let previous_active = SCOPED_TEST_KERNEL_ACTIVE.with(|active| active.replace(true));
+        Self {
+            kernel: None,
             previous,
             previous_active,
         }
     }
 
     pub fn memory_manager_mut(&mut self) -> &mut KMemoryManager {
-        self.kernel.memory_manager_mut()
+        self.kernel_mut().memory_manager_mut()
     }
 
     pub fn kernel_mut(&mut self) -> &mut KernelCore {
-        &mut self.kernel
+        self.kernel.as_deref_mut().expect("scope has no kernel")
     }
 }
 
@@ -290,12 +301,7 @@ mod thread_dump_request_tests {
 /// SIGUSR1 dumper to identify which thread/svc is currently executing on each
 /// core.
 pub static SVC_IN_PROGRESS: [std::sync::atomic::AtomicU64;
-    hardware_properties::NUM_CPU_CORES as usize] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
+    hardware_properties::NUM_CPU_CORES as usize] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::NUM_CPU_CORES as usize];
 
 /// Per-core last known guest PC. Updated by `PhysicalCore::handoff_after_svc`
 /// at every SVC return (cheapest hook that already touches the thread context
@@ -303,12 +309,7 @@ pub static SVC_IN_PROGRESS: [std::sync::atomic::AtomicU64;
 /// guest instructions have executed since the last SVC — fine for
 /// post-freeze diagnostics where the spin has no SVCs at all and we want the
 /// PC at which the spin started.
-pub static GUEST_PC: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
+pub static GUEST_PC: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::NUM_CPU_CORES as usize];
 
 /// Per-core last known guest LR (link register). When a guest thread calls
 /// an nnSdk SVC stub like `svc 0x18; bx lr`, LR points back into the caller
@@ -316,23 +317,13 @@ pub static GUEST_PC: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU
 /// Essential for identifying the actual hot spot in a spin loop where the
 /// game only ever calls one kind of SVC (the SVC address drowns out the
 /// real work PC).
-pub static GUEST_LR: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
+pub static GUEST_LR: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::NUM_CPU_CORES as usize];
 
 /// Per-core last known guest SP. Lets the SIGUSR1 dumper walk a few stack
 /// frames above the current SVC/halt — the nnSdk SVC stub caller sits right
 /// above and its caller (the game-level function driving the loop) is
 /// typically within 1-2 frames up.
-pub static GUEST_SP: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
+pub static GUEST_SP: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::NUM_CPU_CORES as usize];
 
 /// Per-core snapshot of guest general-purpose registers. AArch32 uses the
 /// low words; AArch64 uses x0..x28. Updated alongside GUEST_{PC,LR,SP}.
@@ -340,7 +331,7 @@ pub static GUEST_REGS: [[std::sync::atomic::AtomicU64; 29];
     hardware_properties::NUM_CPU_CORES as usize] = {
     const NEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     const ROW: [std::sync::atomic::AtomicU64; 29] = [NEW; 29];
-    [ROW, ROW, ROW, ROW]
+    [ROW; hardware_properties::NUM_CPU_CORES as usize]
 };
 
 /// RUZU_PC_SAMPLE=1 — background guest-PC/LR sampling profiler. Every
@@ -928,7 +919,7 @@ fn dump_thread_state(kernel: &KernelCore, include_profiles: bool) {
             // profiler samples inside JIT code can be attributed to guest
             // locations offline.
             if let Ok(prefix) = std::env::var("RUZU_DUMP_JIT_MAP") {
-                for core in 0..4 {
+                for core in 0..hardware_properties::NUM_CPU_CORES as usize {
                     if let Some(arm) = guard.get_arm_interface_mut(core) {
                         let path = format!("{prefix}.core{core}.map");
                         arm.dump_jit_block_map(&path);
@@ -1930,6 +1921,8 @@ pub struct KernelCore {
     /// Rust stores the stable `Arc<ProcessLock>` owners instead of raw `KProcess*`.
     process_list: Mutex<Vec<Arc<ProcessLock>>>,
     process_list_lock: Mutex<()>,
+    /// Upstream Impl::application_process; Arc owns its Open/Close reference.
+    application_process: Mutex<Option<Arc<ProcessLock>>>,
 
     /// Processes removed from the upstream-visible process list by
     /// `terminate_all_processes` or with outstanding session parents, retained until cooperative CPU fibers
@@ -2069,6 +2062,7 @@ impl KernelCore {
 
             process_list: Mutex::new(Vec::new()),
             process_list_lock: Mutex::new(()),
+            application_process: Mutex::new(None),
             terminating_processes: Mutex::new(Vec::new()),
             registered_objects: Mutex::new(Vec::new()),
             registered_in_use_objects: Mutex::new(Vec::new()),
@@ -2546,6 +2540,7 @@ impl KernelCore {
 
         self.close_services();
         self.finalize_services_after_cpu_shutdown();
+        self.set_application_process(None);
 
         self.next_object_id.store(0, Ordering::Relaxed);
         self.next_kernel_process_id
@@ -2883,6 +2878,27 @@ impl KernelCore {
                 retiring.push(Arc::clone(process));
             }
         }
+    }
+
+    /// Upstream KernelCore::SetApplicationProcess / Impl::SetApplicationProcess.
+    pub fn set_application_process(&self, process: Option<Arc<ProcessLock>>) {
+        let mut current = self.application_process.lock().unwrap();
+        if match (&*current, &process) {
+            (Some(old), Some(new)) => Arc::ptr_eq(old, new),
+            (None, None) => true,
+            _ => false,
+        } {
+            return;
+        }
+        // Acquire the incoming owner before releasing the previous owner.
+        let previous = std::mem::replace(&mut *current, process);
+        drop(current);
+        drop(previous);
+    }
+
+    /// Upstream KernelCore::ApplicationProcess, independent of host-thread TLS.
+    pub fn application_process(&self) -> Option<Arc<ProcessLock>> {
+        self.application_process.lock().unwrap().clone()
     }
 
     /// Return the live kernel process list.
@@ -4307,6 +4323,20 @@ mod tests {
             get_kernel_ref().unwrap() as *const KernelCore as usize,
             first_ptr
         );
+        {
+            let _without_kernel = ScopedKernelForTest::without_kernel();
+            assert!(get_kernel_ref().is_none());
+            assert!(get_kernel_mut().is_none());
+            assert!(scheduler_lock().is_none());
+            let nested = ScopedKernelForTest::new();
+            assert!(get_kernel_ref().is_some());
+            drop(nested);
+            assert!(get_kernel_ref().is_none());
+        }
+        assert_eq!(
+            get_kernel_ref().unwrap() as *const KernelCore as usize,
+            first_ptr
+        );
         drop(first);
     }
 
@@ -4428,6 +4458,29 @@ mod tests {
 
         release_tx.send(()).unwrap();
         holder.join().unwrap();
+    }
+
+    #[test]
+    fn application_process_owner_is_independent_and_replaced_before_release() {
+        let mut kernel = KernelCore::new();
+        let first = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let second = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let first_weak = Arc::downgrade(&first);
+        let second_weak = Arc::downgrade(&second);
+        assert!(kernel.application_process().is_none());
+        kernel.set_application_process(Some(first.clone()));
+        kernel.set_application_process(Some(first.clone()));
+        assert_eq!(Arc::strong_count(&first), 2);
+        kernel.register_process(second.clone());
+        assert!(Arc::ptr_eq(&kernel.application_process().unwrap(), &first));
+        drop(first);
+        assert!(first_weak.upgrade().is_some());
+        kernel.set_application_process(Some(second.clone()));
+        assert!(first_weak.upgrade().is_none());
+        drop(second);
+        kernel.shutdown();
+        assert!(kernel.application_process().is_none());
+        assert!(second_weak.upgrade().is_none());
     }
 
     #[test]

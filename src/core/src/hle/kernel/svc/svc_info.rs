@@ -88,6 +88,11 @@ fn get_info_impl(
         | InfoType::UsedNonSystemMemorySize
         | InfoType::IsApplication
         | InfoType::FreeThreadCount
+        | InfoType::Nx2RegionAddress
+        | InfoType::Nx2RegionSize
+        | InfoType::Nx2RemoteMemorySize
+        | InfoType::Nx2RemoteMemoryUsed
+        | InfoType::Nx2VammSize
         | InfoType::AliasRegionExtraSize => {
             if info_sub_id != 0 {
                 return RESULT_INVALID_ENUM_VALUE;
@@ -126,6 +131,28 @@ fn get_info_impl(
                 }
                 InfoType::AliasRegionSize => {
                     *result = process.page_table.get_alias_region_size() as u64;
+                }
+                InfoType::Nx2RegionAddress | InfoType::Nx2RegionSize => {
+                    // Eden-NX2 exposes the upper alias half as its experimental VAMM region.
+                    let half = process.page_table.get_alias_region_size() as u64 / 2;
+                    *result = if info_id_type == InfoType::Nx2RegionAddress {
+                        process.page_table.get_alias_region_start().get().wrapping_add(half)
+                    } else { half };
+                    log::warn!("(STUBBED) Switch 2 InfoType {}, returning {:#x}", info_id_type as u32, *result);
+                }
+                InfoType::Nx2VammSize => {
+                    // Mirrors eden-nx2's experimental VAMM page-granule response.
+                    *result = PAGE_SIZE;
+                    log::warn!("(STUBBED) Switch 2 InfoType 33, returning {:#x}", *result);
+                }
+                InfoType::Nx2RemoteMemorySize => {
+                    // Upstream has no remote-memory backing yet.
+                    *result = 0;
+                    log::warn!("(STUBBED) Switch 2 InfoType 31 (remote memory size), returning 0");
+                }
+                InfoType::Nx2RemoteMemoryUsed => {
+                    *result = 0;
+                    log::warn!("(STUBBED) Switch 2 InfoType 32 (remote memory used), returning 0");
                 }
                 InfoType::HeapRegionAddress => {
                     *result = process.page_table.get_heap_region_start().get();
@@ -486,6 +513,66 @@ mod tests {
         system.set_runtime_program_id(1);
         system.set_runtime_64bit(false);
         system
+    }
+
+    #[test]
+    fn nx2_region_queries_use_upper_alias_half() {
+        let system = test_system();
+        let process = system.current_process_arc();
+        {
+            let mut process = process.lock().unwrap();
+            let page_table = process.page_table.get_base_mut();
+            page_table.m_alias_region_start = 0x400000;
+            page_table.m_alias_region_end = 0xc00000;
+        }
+        for (id, expected) in [(29, 0x800000), (30, 0x400000)] {
+            let info = InfoType::from_u32(id);
+            assert_eq!(info as u32, id);
+            let mut result = u64::MAX;
+            assert_eq!(get_info(&system, &mut result, info, PseudoHandle::CurrentProcess as Handle, 0), RESULT_SUCCESS);
+            assert_eq!(result, expected);
+            assert_eq!(get_info(&system, &mut result, info, PseudoHandle::CurrentProcess as Handle, 1), RESULT_INVALID_ENUM_VALUE);
+            assert_eq!(result, expected);
+            assert_eq!(get_info(&system, &mut result, info, 0x12345678, 0), RESULT_INVALID_HANDLE);
+        }
+    }
+
+    #[test]
+    fn nx2_vamm_granule_is_not_the_core_mask() {
+        let system = test_system();
+        assert_eq!(InfoType::from_u32(33), InfoType::Nx2VammSize);
+        assert_eq!(InfoType::Nx2VammSize as u32, 33);
+        let mut result = u64::MAX;
+        assert_eq!(get_info(&system, &mut result, InfoType::from_u32(33),
+            PseudoHandle::CurrentProcess as Handle, 0), RESULT_SUCCESS);
+        assert_eq!(result, 0x1000);
+        result = 0xdead;
+        assert_eq!(get_info(&system, &mut result, InfoType::Nx2VammSize,
+            PseudoHandle::CurrentProcess as Handle, 1), RESULT_INVALID_ENUM_VALUE);
+        assert_eq!(result, 0xdead);
+        assert_eq!(get_info(&system, &mut result, InfoType::Nx2VammSize,
+            0x12345678, 0), RESULT_INVALID_HANDLE);
+        assert_eq!(result, 0xdead);
+    }
+
+    #[test]
+    fn nx2_remote_memory_queries_return_zero_after_validation() {
+        let system = test_system();
+        for (id, info) in [(31, InfoType::Nx2RemoteMemorySize), (32, InfoType::Nx2RemoteMemoryUsed)] {
+            assert_eq!(InfoType::from_u32(id), info);
+            assert_eq!(info as u32, id);
+            let mut result = u64::MAX;
+            assert_eq!(get_info(&system, &mut result, info,
+                PseudoHandle::CurrentProcess as Handle, 0), RESULT_SUCCESS);
+            assert_eq!(result, 0);
+            result = 0xdead;
+            assert_eq!(get_info(&system, &mut result, info,
+                PseudoHandle::CurrentProcess as Handle, 1), RESULT_INVALID_ENUM_VALUE);
+            assert_eq!(result, 0xdead);
+            assert_eq!(get_info(&system, &mut result, info,
+                0x12345678, 0), RESULT_INVALID_HANDLE);
+            assert_eq!(result, 0xdead);
+        }
     }
 
     fn test_system_with_thread_and_idle() -> (

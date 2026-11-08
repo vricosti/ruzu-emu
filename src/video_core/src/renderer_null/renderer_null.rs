@@ -165,6 +165,53 @@ mod tests {
         )
     }
 
+    #[test]
+    fn owned_screenshot_keeps_pixels_until_async_completion_and_rejects_overlap() {
+        use ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId;
+        let mut renderer = new_renderer();
+        let layout = FramebufferLayout { width: 2, height: 1, ..Default::default() };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pixels = vec![0u8; 8];
+        let original = pixels.as_ptr();
+        renderer.request_screenshot_owned(
+            pixels,
+            Box::new(move |pixels, inverted| { tx.send((pixels, inverted)).unwrap(); }),
+            layout.clone(), LayerStackId::Default,
+        );
+        assert_eq!(renderer.base_data.settings.screenshot_bits.cast::<u8>(), original.cast_mut());
+        assert!(rx.try_recv().is_err());
+        let (rejected_tx, rejected_rx) = std::sync::mpsc::channel();
+        renderer.request_screenshot_owned(
+            vec![99; 8],
+            Box::new(move |_, _| { rejected_tx.send(()).unwrap(); }),
+            layout, LayerStackId::Default,
+        );
+        assert_eq!(rejected_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected));
+        assert_eq!(renderer.base_data.settings.screenshot_bits.cast::<u8>(), original.cast_mut());
+        // Simulate the renderer writing through the published pointer, then
+        // handing completion to RendererBase's asynchronous callback.
+        unsafe {
+            std::ptr::copy_nonoverlapping([1u8, 2, 3, 4, 5, 6, 7, 8].as_ptr(),
+                renderer.base_data.settings.screenshot_bits.cast::<u8>(), 8);
+        }
+        let complete = renderer.base_data.settings.screenshot_complete_callback.take().unwrap();
+        drop(renderer);
+        complete(true);
+        let (pixels, inverted) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(pixels, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(inverted);
+    }
+
+    #[test]
+    #[should_panic(expected = "screenshot buffer is too small")]
+    fn owned_screenshot_rejects_undersized_buffer_before_publishing_pointer() {
+        new_renderer().request_screenshot_owned(
+            vec![0; 7], Box::new(|_, _| {}),
+            FramebufferLayout { width: 2, height: 1, ..Default::default() },
+            ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId::Default,
+        );
+    }
+
     fn dummy_fb() -> FramebufferConfig {
         FramebufferConfig {
             address: 0,
@@ -182,6 +229,7 @@ mod tests {
                 bottom: 720,
             },
             blending: crate::framebuffer_config::BlendMode::Opaque,
+            native_tiling: false,
             layer_stack_mask: ruzu_core::hle::service::nvnflinger::hwc_layer::DEFAULT_LAYER_STACK_MASK,
         }
     }

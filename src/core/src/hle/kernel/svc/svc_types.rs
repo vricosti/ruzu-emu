@@ -43,6 +43,7 @@ pub enum MemoryAttribute {
     DeviceShared = 1 << 2,
     Uncached = 1 << 3,
     PermissionLocked = 1 << 4,
+    GpuAccessible = 1 << 5,
 }
 
 /// Memory permission flags.
@@ -180,6 +181,12 @@ pub enum InfoType {
     /// normal alias region, used by processes that opt into 39-bit AS
     /// extension. Returns 0 when no extra region is configured.
     AliasRegionExtraSize = 28,
+    /// NX2 page granule queried by VAMM (eden-nx2 experimental contract).
+    Nx2VammSize = 33,
+    Nx2RegionAddress = 29,
+    Nx2RegionSize = 30,
+    Nx2RemoteMemorySize = 31,
+    Nx2RemoteMemoryUsed = 32,
     TransferMemoryHint = 34,
     Unknown37 = 37,
     Unknown38 = 38,
@@ -219,6 +226,11 @@ impl InfoType {
             26 => Self::IsSvcPermitted,
             27 => Self::IoRegionHint,
             28 => Self::AliasRegionExtraSize,
+            29 => Self::Nx2RegionAddress,
+            30 => Self::Nx2RegionSize,
+            31 => Self::Nx2RemoteMemorySize,
+            32 => Self::Nx2RemoteMemoryUsed,
+            33 => Self::Nx2VammSize,
             34 => Self::TransferMemoryHint,
             37 => Self::Unknown37,
             38 => Self::Unknown38,
@@ -524,8 +536,6 @@ pub const PAGE_SIZE: u64 = 4096;
 /// Heap size alignment (2 MiB) — same as svc_common::HEAP_SIZE_ALIGNMENT.
 pub const HEAP_SIZE_ALIGNMENT: u64 = 2 * 1024 * 1024;
 
-/// Main memory size max for SetHeapSize validation.
-pub const MAIN_MEMORY_SIZE_MAX: u64 = 0x1_0000_0000; // 4 GiB
 
 /// Map device address space alignment mask.
 pub const DEVICE_ADDRESS_SPACE_ALIGN_MASK: u64 = (1u64 << 22) - 1;

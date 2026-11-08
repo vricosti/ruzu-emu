@@ -1,21 +1,43 @@
 {
   "_schema": {
-    "_notes": "Switch NSO load-base registry. Each entry maps a game/build to the verified base addresses of its NSOs. Always verify with `find_base.py` before adding — never guess."
+    "_notes": "Switch NSO load-base registry. Each entry maps a game/build to the verified base addresses of its NSOs. Always verify with `find_base.py` before adding \u2014 never guess."
   },
-
   "MK8D 0100152000022000 1.7.1 capture 2026-09-24 1b67e605": {
     "_notes": "Per-run relocation only. Verified 32 runtime bytes at PC 0xDDFC00 match raw module offset 0x92BC00 in RUZU_DUMP_MODULES capture 1b67e605b2034aed82c7c06f33cedfd5. Do not reuse across launches.",
     "main": "0x004B4000"
   },
   "VMRD 0100152000022000 v0": {
-    "_notes": "VMRD — main verified by byte-pattern match at runtime PC 0x71EE40 (pattern '00009fe7...' matches .text NSO offset 0x518E40). subsdk0 verified by runtime bytes at 0x0151FC2C/0x0151FC94 matching subsdk0 .text offsets 0xDC2C/0xDC94.",
-    "main":   "0x00206000",
+    "_notes": "VMRD \u2014 main verified by byte-pattern match at runtime PC 0x71EE40 (pattern '00009fe7...' matches .text NSO offset 0x518E40). subsdk0 verified by runtime bytes at 0x0151FC2C/0x0151FC94 matching subsdk0 .text offsets 0xDC2C/0xDC94.",
+    "main": "0x00206000",
     "_subsdk0": "0x01512000",
     "_subsdk1": "TBD",
     "_subsdk2": "TBD",
     "_subsdk3": "TBD",
     "_subsdk4": "TBD",
-    "_sdk":    "0x01C9C000",
-    "_rtld":   "TBD"
+    "_sdk": "0x01C9C000",
+    "_rtld": "TBD"
+  },
+  "MKW 0400C3F00006E000 1.8.0 abort capture 2026-11-07": {
+    "_notes": "Per-run only. Two 196-byte runtime windows in nx2-runtime-abort-memory.log give one consistent base in 0x850D1000_sdk.bin. Do not reuse across runs.",
+    "sdk": "0x84cce000"
+  },
+  "MKW 0400C3F00006E000 1.8.0 null-loop capture 2026-11-07 PID29876": {
+    "_notes": "Per-run only. 196-byte runtime instruction windows from nx2-null-loop.stderr.log uniquely match loader module dumps in TEMP/ruzu-nx2-null-loop-modules; marker position gives start address. Do not reuse across launches.",
+    "sdk": "0x842d2000",
+    "main": "0x80112000"
+  },
+  "MKW 0400C3F00006E000 1.8.0 null-context capture 2026-11-07 PID12388": {
+    "_notes": "Per-run only; 196-byte runtime windows uniquely matched module dumps from nx2-null-context.stderr.log.",
+    "sdk": "0x84d7b000",
+    "main": "0x80bbb000"
+  },
+  "MKW 0400C3F00006E000 1.8.0 chat-wait capture 2026-11-07 PID31776": {
+    "_notes": "Per-run only. Full 196-byte instruction windows from diagnostic stderr uniquely matched existing raw module dumps.",
+    "sdk": "0x846fb000",
+    "main": "0x8053b000"
+  },
+  "MKW 0400C3F00006E000 diagnostic 2026-11-08 PID11172": {
+    "_notes": "Per-run only. 64 runtime bytes at PC0x8500a544 read through live guest page table uniquely match raw SDK dump offset0x1a4544. Evidence TEMP/ruzu-nx2-live-lazy-break-diagnostic-20261108-060229/verified-sdk-base.json. Backtrace nnEcli module base is wrong for this SDK; use byte-verified base. Filename version1.8.0 not verified active; title reports1.0.0.",
+    "sdk": "0x84e66000"
   }
 }

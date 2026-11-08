@@ -12,6 +12,15 @@ use super::shader_info::{ReplaceConstant, TexturePixelFormat, TextureType};
 use super::stage::Stage;
 use std::collections::HashMap;
 
+/// Guest task/mesh state, kept separate from the host execution stage.
+/// Bundles upstream MeshRegisters/MeshPrimitiveHeader with the task-stage test.
+#[derive(Debug, Clone)]
+pub struct MeshShaderEnvironment {
+    pub is_task: bool,
+    pub registers: [u32; 3],
+    pub primitive_header: ProgramHeader,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CbufWordKey {
     pub index: u32,
@@ -79,6 +88,12 @@ impl TexturePassCaches {
 /// Provides access to shader instructions, constant buffer values,
 /// texture types, and other GPU state needed during translation.
 pub trait Environment {
+    /// None denotes an ordinary shader. Some explicitly selects the compute
+    /// fallback and requires the task/mesh emission and dispatch path.
+    fn mesh_shader(&self) -> Option<&MeshShaderEnvironment> {
+        None
+    }
+
     /// Per-environment caches reset and populated by `TexturePass`.
     fn texture_pass_caches(&mut self) -> &mut TexturePassCaches;
 
@@ -89,6 +104,12 @@ pub trait Environment {
 
     /// Read a 64-bit instruction at the given byte address.
     fn read_instruction(&mut self, address: u32) -> u64;
+
+    /// Translate a native indirect-branch address into the lowered program.
+    /// Upstream Environment::TranslateProgramAddress defaults to identity.
+    fn translate_program_address(&self, address: u32) -> u32 {
+        address
+    }
 
     /// Read a 32-bit value from a constant buffer.
     fn read_cbuf_value(&mut self, cbuf_index: u32, cbuf_offset: u32) -> u32;

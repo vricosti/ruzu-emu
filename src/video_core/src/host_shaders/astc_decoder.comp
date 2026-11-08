@@ -33,6 +33,7 @@ UNIFORM(3) uint block_size;
 UNIFORM(4) uint x_shift;
 UNIFORM(5) uint block_height;
 UNIFORM(6) uint block_height_mask;
+UNIFORM(7) uint native_tiling;
 END_PUSH_CONSTANTS
 
 struct EncodingData {
@@ -1404,7 +1405,12 @@ uint SwizzleOffset(uvec2 pos) {
 void main() {
     uvec3 pos = gl_GlobalInvocationID;
     pos.x <<= BYTES_PER_BLOCK_LOG2;
-    const uint swizzle = SwizzleOffset(pos.xy);
+    uint swizzle = SwizzleOffset(pos.xy);
+    if (native_tiling != 0u) {
+        // Switch 2 GOBs swap offset bits 5 and 6 (see block_linear_unswizzle_2d.comp).
+        const uint difference = ((swizzle >> 5u) ^ (swizzle >> 6u)) & 1u;
+        swizzle ^= (difference << 5u) | (difference << 6u);
+    }
     const uint block_y = pos.y >> GOB_SIZE_Y_SHIFT;
 
     uint offset = 0;

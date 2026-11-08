@@ -24,6 +24,7 @@ use crate::core::SystemRef;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
 use crate::hle::result::ResultCode;
 use crate::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+use crate::hle::service::kernel_helpers::ServiceContext;
 use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFramework};
 
 fn should_trace_ioctl_summary() -> bool {
@@ -35,15 +36,23 @@ fn should_trace_ioctl_summary() -> bool {
 ///
 /// Port of EventInterface from nvdrv.h/nvdrv.cpp.
 /// In the C++ code, this manages KEvent creation/destruction via ServiceContext.
-/// Since we don't have a full kernel event system, this is a lightweight placeholder
-/// that tracks event allocations.
+/// The shared context is owned by Module. The handle map bridges the existing
+/// Rust NvDevice readable-end API to ServiceContext's owning event handles.
 pub struct EventInterface {
     system: SystemRef,
+    service_context: Arc<Mutex<ServiceContext>>,
+    event_handles: Mutex<HashMap<u64, u32>>,
 }
 
 impl EventInterface {
     pub fn new(system: SystemRef) -> Self {
-        Self { system }
+        Self::with_context(system, Arc::new(Mutex::new(ServiceContext::new_with_system(
+            system, "nvdrv".to_owned(),
+        ))))
+    }
+
+    fn with_context(system: SystemRef, service_context: Arc<Mutex<ServiceContext>>) -> Self {
+        Self { system, service_context, event_handles: Mutex::new(HashMap::new()) }
     }
 
     pub fn system(&self) -> SystemRef {
@@ -51,21 +60,25 @@ impl EventInterface {
     }
 
     /// Creates a persistent readable event owned by nvdrv.
-    pub fn create_event(&self, name: &str) -> Arc<Mutex<KReadableEvent>> {
-        let object_id = self.system.get().kernel().unwrap().create_new_object_id() as u64;
-        let readable_event = Arc::new(Mutex::new(KReadableEvent::new()));
-        readable_event.lock().unwrap().initialize(0, object_id);
-        log::debug!(
-            "EventInterface::create_event('{}') -> object_id={}",
-            name,
-            object_id
-        );
-        readable_event
+    pub fn create_event(&self, name: &str) -> Option<Arc<Mutex<KReadableEvent>>> {
+        let mut context = self.service_context.lock().unwrap();
+        let handle = context.create_event(name.to_owned());
+        let readable_event = context.get_event(handle)?
+            .readable_event().expect("NVDRV requires a kernel-backed event");
+        let object_id = readable_event.lock().unwrap().object_id;
+        self.event_handles.lock().unwrap().insert(object_id, handle);
+        Some(readable_event)
     }
 
     /// Frees a previously created event.
     /// In the C++ code: module.service_context.CloseEvent(event)
-    pub fn free_event(&self, _event: Arc<Mutex<KReadableEvent>>) {}
+    pub fn free_event(&self, event: Arc<Mutex<KReadableEvent>>) {
+        let object_id = event.lock().unwrap().object_id;
+        let handle = self.event_handles.lock().unwrap().remove(&object_id);
+        if let Some(handle) = handle {
+            self.service_context.lock().unwrap().close_event(handle);
+        }
+    }
 }
 
 /// The main nvdrv module, managing device file descriptors and dispatching ioctls.
@@ -77,11 +90,15 @@ pub struct Module {
     gpu_files: Mutex<HashMap<DeviceFD, Arc<NvHostGpu>>>,
     disp_files: Mutex<HashMap<DeviceFD, Arc<NvDispDisp0>>>,
     nvmap_files: Mutex<HashMap<DeviceFD, Arc<NvMapDevice>>>,
+    service_context: Arc<Mutex<ServiceContext>>,
     events_interface: Arc<EventInterface>,
 }
 
 impl Module {
     pub fn new(system: crate::core::SystemRef) -> Arc<Self> {
+        let service_context = Arc::new(Mutex::new(ServiceContext::new_with_system(
+            system, "nvdrv".to_owned(),
+        )));
         Arc::new(Self {
             system,
             container: Container::new_with_system(system),
@@ -90,7 +107,8 @@ impl Module {
             gpu_files: Mutex::new(HashMap::new()),
             disp_files: Mutex::new(HashMap::new()),
             nvmap_files: Mutex::new(HashMap::new()),
-            events_interface: Arc::new(EventInterface::new(system)),
+            events_interface: Arc::new(EventInterface::with_context(system, Arc::clone(&service_context))),
+            service_context,
         })
     }
 
@@ -108,6 +126,15 @@ impl Module {
     }
 
     pub fn open(&self, device_name: &str, session_id: SessionId) -> DeviceFD {
+        // Upstream rejects unsupported names before consuming a descriptor;
+        // unrecognized nvhost nodes use its experimental NX2 device implementation.
+        if !device_name.starts_with("/dev/nvhost-")
+            && device_name != "/dev/nvmap"
+            && device_name != "/dev/nvdisp_disp0"
+        {
+            log::error!("Trying to open unknown device {}", device_name);
+            return INVALID_NVDRV_FD;
+        }
         let mut next_fd = self.next_fd.lock().unwrap();
         let fd = *next_fd;
         *next_fd += 1;
@@ -157,6 +184,10 @@ impl Module {
             "/dev/nvhost-nvdec" => Arc::new(NvHostNvDec::new(self.system, &self.container)),
             "/dev/nvhost-nvjpg" => Arc::new(NvHostNvJpg::new()),
             "/dev/nvhost-vic" => Arc::new(NvHostVic::new(self.system, &self.container)),
+            name if name.starts_with("/dev/nvhost-") => {
+                log::warn!("Opening unknown device {} as a Switch 2 stub", name);
+                Arc::new(super::devices::nx2_stub_device::Nx2StubDevice::new(name.to_owned()))
+            }
             _ => {
                 log::error!("Trying to open unknown device {}", device_name);
                 return INVALID_NVDRV_FD;
@@ -581,4 +612,50 @@ pub fn loop_process(system: crate::core::SystemRef) {
         server_manager.register_named_service("nvmemp", Box::new(|| Arc::new(Nvmemp::new())), 64);
     }
     crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
+}
+
+#[cfg(test)]
+mod nx2_open_tests {
+    use super::*;
+
+    #[test]
+    fn event_interface_uses_module_context_and_releases_its_owner() {
+        let _without_global = crate::hle::kernel::kernel::ScopedKernelForTest::without_kernel();
+        let system = crate::core::System::new_boxed_for_test();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let interface = module.get_events_interface();
+        assert!(Arc::ptr_eq(&module.service_context, &interface.service_context));
+        let readable = interface.create_event("NvdrvLifetime").unwrap();
+        let (id, parent) = {
+            let event = readable.lock().unwrap();
+            (event.object_id, event.parent_id)
+        };
+        assert!(parent.is_some_and(|id| id != 0));
+        let handle = interface.event_handles.lock().unwrap()[&id];
+        let owner = module.service_context.lock().unwrap().get_event(handle).unwrap();
+        assert!(Arc::ptr_eq(&readable, &owner.readable_event().unwrap()));
+        interface.free_event(Arc::clone(&readable));
+        assert!(module.service_context.lock().unwrap().get_event(handle).is_none());
+        assert!(!interface.event_handles.lock().unwrap().contains_key(&id));
+        assert_eq!(readable.lock().unwrap().object_id, id);
+    }
+
+    #[test]
+    fn unknown_nvhost_uses_upstream_stub_and_other_unknown_names_do_not_consume_fd() {
+        let system = crate::core::System::new_boxed_for_test();
+        let module = Module::new(SystemRef::from_ref(&system));
+        assert_eq!(module.open("/dev/not-nvhost", SessionId::default()), INVALID_NVDRV_FD);
+        let fd = module.open("/dev/nvhost-tsg-gpu", SessionId::default());
+        assert_eq!(fd, 1);
+        let files = module.open_files.lock().unwrap();
+        let device = files.get(&fd).unwrap();
+        assert!(device.as_any().is::<super::super::devices::nx2_stub_device::Nx2StubDevice>());
+        let mut output = [0xFF; 8];
+        let mut inline = [0xFF; 4];
+        assert_eq!(device.ioctl3(fd, Ioctl { raw: 0 }, &[1, 2, 3], &mut output, &mut inline), NvResult::Success);
+        assert_eq!(output, [1, 2, 3, 0, 0, 0, 0, 0]);
+        assert_eq!(inline, [0; 4]);
+        drop(files);
+        assert_eq!(module.close(fd), NvResult::Success);
+    }
 }

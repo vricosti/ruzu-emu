@@ -15,3 +15,4 @@ pub mod nvhost_nvdec_common;
 pub mod nvhost_nvjpg;
 pub mod nvhost_vic;
 pub mod nvmap;
+pub mod nx2_stub_device;

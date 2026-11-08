@@ -17,6 +17,7 @@ use common::address_space::FlatAllocator64;
 use common::range_mutex::{RangeMutex, ScopedRangeLock};
 use common::settings::MemoryLayout;
 use ruzu_core::device_memory::DeviceMemory;
+use ruzu_core::device_memory_manager::{PHYSICAL_MAX_BITS, PHYSICAL_MIN_BITS};
 use ruzu_core::memory::memory::Memory;
 
 use crate::buffer_cache::word_manager::DeviceTracker;
@@ -24,7 +25,7 @@ use crate::buffer_cache::word_manager::DeviceTracker;
 /// Number of virtual address bits for the Maxwell device address space.
 ///
 /// Port of `MaxwellDeviceTraits::device_virtual_bits`.
-pub const DEVICE_VIRTUAL_BITS: usize = 34;
+pub const DEVICE_VIRTUAL_BITS: usize = 36;
 
 /// Public device-memory-manager capabilities owned by the upstream template.
 pub const HAS_FLUSH_INVALIDATION: bool = true;
@@ -133,15 +134,11 @@ pub struct MaxwellDeviceMemoryManager {
     smmu_translation_cache: TranslationCache,
 }
 
-/// Page size used by the SMMU page table — matches CPU page size so each
+/// Page size used by the SMMU page table â€” matches CPU page size so each
 /// host page maps to one SMMU page.
 pub const SMMU_PAGE_BITS: u32 = 12;
 pub const SMMU_PAGE_SIZE: u64 = 1 << SMMU_PAGE_BITS;
 pub const SMMU_DEVICE_PAGE_COUNT: usize = 1usize << (DEVICE_VIRTUAL_BITS - SMMU_PAGE_BITS as usize);
-const PHYSICAL_MIN_BITS: usize = 32;
-// Eden's 33-bit maximum only covers 8 GiB. The exposed 10/12 GiB modes
-// require 34 bits for the reverse physical-page table.
-const PHYSICAL_MAX_BITS: usize = 34;
 
 /// Base and limit for upstream `DeviceMemoryManagerAllocator`.
 ///
@@ -338,8 +335,7 @@ impl TranslationCache {
 fn smmu_physical_bits() -> usize {
     match *common::settings::values().memory_layout_mode.get_value() {
         MemoryLayout::Memory4Gb => PHYSICAL_MIN_BITS,
-        MemoryLayout::Memory6Gb | MemoryLayout::Memory8Gb => PHYSICAL_MIN_BITS + 1,
-        MemoryLayout::Memory10Gb | MemoryLayout::Memory12Gb => PHYSICAL_MAX_BITS,
+        _ => PHYSICAL_MAX_BITS,
     }
 }
 
@@ -358,9 +354,9 @@ struct SmmuRegisteredProcesses {
     /// `Memory::rasterizer_mark_region_cached` (atomic page-entry stores +
     /// mprotect only) WITHOUT taking the Memory mutex. Upstream
     /// `MarkRegionCaching` is lock-free; taking the mutex here deadlocks:
-    /// the GPU thread holds the shader-cache lock (draw →
-    /// `ShaderCache::register` → here) while a CPU core holds the Memory
-    /// mutex (guest write → `handle_rasterizer_write` →
+    /// the GPU thread holds the shader-cache lock (draw â†’
+    /// `ShaderCache::register` â†’ here) while a CPU core holds the Memory
+    /// mutex (guest write â†’ `handle_rasterizer_write` â†’
     /// `ShaderCache::invalidate_region`).
     processes: Vec<Option<(Arc<ruzu_core::memory::memory::SharedMemory>, usize)>>,
     id_pool: VecDeque<usize>,
@@ -1007,7 +1003,8 @@ impl MaxwellDeviceMemoryManager {
             let current_vaddr = virtual_address.wrapping_add((index as u64) << SMMU_PAGE_BITS);
             let host_ptr = {
                 let memory = memory.access().unwrap();
-                memory.get_pointer_silent(current_vaddr)
+                let pointer = memory.get_pointer_silent(current_vaddr);
+                pointer
             };
             if host_ptr.is_null() {
                 self.smmu_map_device_page(
@@ -1693,7 +1690,7 @@ impl MaxwellDeviceMemoryManager {
     ///
     /// Per-page reference counting: each page's `count.fetch_add(delta)`
     /// runs once, with batched `MarkRegionCaching(begin, bytes, caching)`
-    /// calls when contiguous runs of pages transition from `0`↔non-zero.
+    /// calls when contiguous runs of pages transition from `0`â†”non-zero.
     ///
     /// **Port adaptations vs upstream**:
     /// - `ExtractCPUBacking` is backed by the dense SMMU CPU-backing table
@@ -1703,7 +1700,7 @@ impl MaxwellDeviceMemoryManager {
     ///   registered `Memory` owner fall back to the legacy callback path.
     /// - 8-bit wrapping counter: matches upstream's `CounterType = u8`
     ///   atomic fetch-add semantics. Upstream comment: "Assume delta is
-    ///   either -1 or 1" — same here.
+    ///   either -1 or 1" â€” same here.
     pub fn update_pages_cached_count(&self, addr: DAddr, size: usize, delta: i32) {
         let _counter_guard = ScopedRangeLock::new(&self.cached_pages_guard, addr, size as u64);
         self.update_pages_cached_count_no_lock(addr, size, delta);
@@ -1824,7 +1821,7 @@ impl MaxwellDeviceMemoryManager {
             }
             old_vpage = backing.virtual_page;
 
-            // delta is typically ±1; `wrapping_add` matches upstream's
+            // delta is typically Â±1; `wrapping_add` matches upstream's
             // `count.fetch_add(static_cast<CounterType>(delta))` on `u8`.
             let count = self
                 .cached_pages
@@ -1833,7 +1830,7 @@ impl MaxwellDeviceMemoryManager {
             count.fetch_add(delta as u8, Ordering::Release);
             let new_count = count.load(Ordering::Relaxed);
 
-            // Transition to 0 → schedule uncache.
+            // Transition to 0 â†’ schedule uncache.
             if new_count == 0 {
                 if uncache_bytes == 0 {
                     uncache_begin = backing.virtual_page;
@@ -1850,7 +1847,7 @@ impl MaxwellDeviceMemoryManager {
                 uncache_bytes = 0;
             }
 
-            // First-time cache (0→1 with delta>0) → schedule cache.
+            // First-time cache (0â†’1 with delta>0) â†’ schedule cache.
             if new_count == 1 && delta > 0 {
                 if cache_bytes == 0 {
                     cache_begin = backing.virtual_page;
@@ -1972,10 +1969,10 @@ mod tests {
         }
         for (mode, gib, bits) in [
             (MemoryLayout::Memory4Gb, 4usize, 32),
-            (MemoryLayout::Memory6Gb, 6, 33),
-            (MemoryLayout::Memory8Gb, 8, 33),
-            (MemoryLayout::Memory10Gb, 10, 34),
-            (MemoryLayout::Memory12Gb, 12, 34),
+            (MemoryLayout::Memory6Gb, 6, 35),
+            (MemoryLayout::Memory8Gb, 8, 35),
+            (MemoryLayout::Memory10Gb, 10, 35),
+            (MemoryLayout::Memory12Gb, 20, 35),
         ] {
             {
                 let mut settings = common::settings::values_mut();
@@ -1994,6 +1991,29 @@ mod tests {
             assert_eq!(compressed as usize, (last_page >> 12) + 1);
             assert_eq!(manager.smmu_host_ptr_from_compressed_physical(compressed, 0),
                 Some(base + last_page));
+            if mode == MemoryLayout::Memory12Gb {
+                // Exercise actual backing above 16 GiB, where NX2 graphics
+                // command buffers were silently encoded as unmapped.
+                let device_memory = DeviceMemory::with_size(gib << 30);
+                let pointer = unsafe { device_memory.get_pointer_from_raw(last_page as u64) };
+                unsafe { pointer.write_volatile(0xA7); }
+                manager.smmu_set_physical_base_for_test(device_memory.buffer.backing_base_pointer() as usize);
+                smmu_map_test_backing(&manager, 0x8000, pointer, 0x2100000000, 0x1000);
+                let mut output = [0];
+                assert!(manager.smmu_read_block_unsafe(0x8000, &mut output));
+                assert_eq!(output, [0xA7]);
+                assert_eq!(manager.smmu_reverse_device_pages_for_test(pointer), vec![8]);
+                // The same backing may also be mapped near the end of the
+                // upstream 64 GiB device address space (NX2 aliases).
+                let high_device = (64u64 << 30) - 0x1000;
+                smmu_map_test_backing(&manager, high_device, pointer, 0x2100000000, 0x1000);
+                output.fill(0);
+                assert!(manager.smmu_read_block_unsafe(high_device, &mut output));
+                assert_eq!(output, [0xA7]);
+                assert_eq!(manager.smmu_reverse_device_pages_for_test(pointer), vec![8, high_device >> 12]);
+                manager.smmu_unmap(high_device, 0x1000);
+                manager.smmu_unmap(0x8000, 0x1000);
+            }
         }
     }
 
@@ -2023,9 +2043,9 @@ mod tests {
         install_test_physical_base(&mgr, backing.as_ptr());
         mgr.smmu_map_with_cpu_backing(0x1000, backing.as_ptr(), 0x1000, 0x1000, 3, true);
 
-        // 0→1 within one page → one cache call.
+        // 0â†’1 within one page â†’ one cache call.
         mgr.update_pages_cached_count(0x1000, 0x100, 1);
-        // 1→0 same page → one uncache call.
+        // 1â†’0 same page â†’ one uncache call.
         mgr.update_pages_cached_count(0x1000, 0x100, -1);
 
         let calls = log.lock().unwrap();
@@ -2063,7 +2083,7 @@ mod tests {
         install_test_physical_base(&mgr, backing.as_ptr());
         mgr.smmu_map_with_cpu_backing(0x4000, backing.as_ptr(), 0x4000, 4 * 0x1000, 3, true);
 
-        // 4 pages, 0→1 each → single batched cache call covering all 4.
+        // 4 pages, 0â†’1 each â†’ single batched cache call covering all 4.
         mgr.update_pages_cached_count(0x4000, 4 * 0x1000, 1);
 
         let calls = log.lock().unwrap();
@@ -2118,10 +2138,10 @@ mod tests {
         install_test_physical_base(&mgr, backing.as_ptr());
         mgr.smmu_map_with_cpu_backing(0x2000, backing.as_ptr(), 0x2000, 0x1000, 3, true);
 
-        mgr.update_pages_cached_count(0x2000, 0x1000, 1); // 0→1: cache
-        mgr.update_pages_cached_count(0x2000, 0x1000, 1); // 1→2: no callback
-        mgr.update_pages_cached_count(0x2000, 0x1000, -1); // 2→1: no callback
-        mgr.update_pages_cached_count(0x2000, 0x1000, -1); // 1→0: uncache
+        mgr.update_pages_cached_count(0x2000, 0x1000, 1); // 0â†’1: cache
+        mgr.update_pages_cached_count(0x2000, 0x1000, 1); // 1â†’2: no callback
+        mgr.update_pages_cached_count(0x2000, 0x1000, -1); // 2â†’1: no callback
+        mgr.update_pages_cached_count(0x2000, 0x1000, -1); // 1â†’0: uncache
 
         let calls = log.lock().unwrap();
         assert_eq!(

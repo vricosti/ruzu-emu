@@ -2480,7 +2480,7 @@ impl DrawManager {
         match method {
             CLEAR_SURFACE => self.clear(1, maxwell3d),
             DRAW_BEGIN => self.draw_begin(maxwell3d),
-            DRAW_END => self.draw_end(maxwell3d),
+            DRAW_END => self.draw_end(maxwell3d, 1, false),
             VB_FIRST | VB_COUNT => {}
             m if m == IB_BASE + IB_OFF_FIRST => {}
             m if m == IB_BASE + IB_OFF_COUNT => {
@@ -2692,6 +2692,7 @@ impl DrawManager {
     pub fn draw_begin(&mut self, maxwell3d: &mut dyn Maxwell3DAccess) {
         let (is_first, is_subsequent) = maxwell3d.draw_instance_id();
         if is_first {
+            self.draw_deferred(maxwell3d);
             self.draw_state.instance_count = 0;
             self.draw_state.draw_mode = DrawMode::General;
         } else if is_subsequent {
@@ -2707,28 +2708,25 @@ impl DrawManager {
     /// Corresponds to `DrawManager::DrawEnd`.
     /// Upstream reads `regs.global_base_instance_index`, `regs.global_base_vertex_index`,
     /// `regs.index_buffer`, `regs.vertex_buffer` from Maxwell3D.
-    // Unlike upstream DrawDeferred, complete direct BEGIN/END instances here.
-    // A later shader/vertex-state update or unrelated macro must not redraw
-    // completed geometry with the next draw's registers. Explicit HLE batches
-    // still use DrawArray/DrawIndex with their supplied instance counts.
-    pub(crate) fn draw_end(&mut self, maxwell3d: &mut dyn Maxwell3DAccess) {
+    pub(crate) fn draw_end(&mut self, maxwell3d: &mut dyn Maxwell3DAccess, instance_count: u32, force_draw: bool) {
+        if self.draw_state.draw_mode == DrawMode::Instance && !force_draw {
+            return;
+        }
         match self.draw_state.draw_mode {
             DrawMode::Instance | DrawMode::General => {
-                self.draw_state.base_instance = maxwell3d.global_base_instance_index()
-                    .wrapping_add(self.draw_state.instance_count);
+                self.draw_state.base_instance = maxwell3d.global_base_instance_index();
                 self.draw_state.base_index = maxwell3d.global_base_vertex_index();
                 if self.draw_state.draw_indexed {
                     self.draw_state.index_buffer = maxwell3d.index_buffer();
-                    self.process_draw(true, 1, maxwell3d);
+                    self.process_draw(true, instance_count, maxwell3d);
                 } else {
                     self.draw_state.vertex_buffer = maxwell3d.vertex_buffer();
-                    self.process_draw(false, 1, maxwell3d);
+                    self.process_draw(false, instance_count, maxwell3d);
                 }
                 self.draw_state.draw_indexed = false;
             }
             DrawMode::InlineIndex => {
-                self.draw_state.base_instance = maxwell3d.global_base_instance_index()
-                    .wrapping_add(self.draw_state.instance_count);
+                self.draw_state.base_instance = maxwell3d.global_base_instance_index();
                 self.draw_state.base_index = maxwell3d.global_base_vertex_index();
                 self.draw_state.index_buffer = maxwell3d.index_buffer();
                 self.draw_state.index_buffer.count =
@@ -2736,10 +2734,20 @@ impl DrawManager {
                 self.draw_state.index_buffer.format = IndexFormat::UnsignedInt;
                 // Upstream: maxwell3d->dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
                 maxwell3d.set_dirty_flag(Dirty::INDEX_BUFFER);
-                self.process_draw(true, 1, maxwell3d);
+                self.process_draw(true, instance_count, maxwell3d);
                 self.draw_state.inline_index_draw_indexes.clear();
             }
         }
+    }
+
+    /// Port of DrawManager::DrawDeferred. Flush before resetting the instance
+    /// counter or changing topology in DrawBegin, and after macro execution.
+    pub fn draw_deferred(&mut self, maxwell3d: &mut dyn Maxwell3DAccess) {
+        if self.draw_state.draw_mode != DrawMode::Instance || self.draw_state.instance_count == 0 {
+            return;
+        }
+        self.draw_end(maxwell3d, self.draw_state.instance_count.wrapping_add(1), true);
+        self.draw_state.instance_count = 0;
     }
 
     /// Handle small (packed) index draw.

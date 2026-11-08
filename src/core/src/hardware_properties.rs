@@ -11,7 +11,7 @@ pub const BASE_CLOCK_RATE: u64 = 1_020_000_000;
 pub const CNTFREQ: u64 = 19_200_000;
 
 /// Number of CPU Cores
-pub const NUM_CPU_CORES: u32 = 4;
+pub const NUM_CPU_CORES: u32 = 6;
 
 /// Number of virtual cores (bits in a u64)
 pub const NUM_VIRTUAL_CORES: usize = 64;
@@ -19,7 +19,7 @@ pub const NUM_VIRTUAL_CORES: usize = 64;
 /// Virtual to Physical core map.
 /// Maps virtual core indices to physical core indices.
 pub const VIRTUAL_TO_PHYSICAL_CORE_MAP: [i32; 64] = [
-    0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
 ];
 
@@ -59,5 +59,7 @@ mod tests {
         assert_eq!(convert_virtual_core_mask_to_physical(1), 1);
         // Virtual cores 0-3 -> physical cores 0-3
         assert_eq!(convert_virtual_core_mask_to_physical(0xF), 0xF);
+        assert_eq!(convert_virtual_core_mask_to_physical(0x3F), 0x3F);
+        assert_eq!(convert_virtual_core_mask_to_physical((1 << 4) | (1 << 5)), 0x30);
     }
 }

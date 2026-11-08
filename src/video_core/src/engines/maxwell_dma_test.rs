@@ -630,7 +630,10 @@ fn test_multi_line_pitch_to_blocklinear_tries_buffer_to_image_before_fallback() 
 
 #[test]
 fn test_multi_line_blocklinear_to_pitch_unswizzles_subrect() {
+    for native in [false, true] {
     let mut eng = new_test_engine();
+    assert!(!eng.memory_manager.lock().uses_native_tiling());
+    if native { eng.memory_manager.lock().enable_native_tiling(); }
     let src_addr = 0x1000;
     let dst_addr = 0x8000;
     let width = 16;
@@ -656,7 +659,7 @@ fn test_multi_line_blocklinear_to_pitch_unswizzles_subrect() {
         line_count,
         block_height,
         block_depth,
-        line_length,
+        line_length, native,
     );
 
     eng.write_reg(SRC_ADDR_HIGH, 0);
@@ -694,6 +697,7 @@ fn test_multi_line_blocklinear_to_pitch_unswizzles_subrect() {
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].gpu_va, dst_addr as u64);
     assert_eq!(writes[0].data, linear);
+    }
 }
 
 #[test]
@@ -722,7 +726,7 @@ fn test_multi_line_blocklinear_to_pitch_remap_uses_component_size() {
         line_count,
         0,
         0,
-        pitch,
+        pitch, false,
     );
 
     eng.write_reg(SRC_ADDR_HIGH, 0);
@@ -792,7 +796,7 @@ fn test_multi_line_pitch_to_blocklinear_swizzles_subrect() {
         line_count,
         block_height,
         block_depth,
-        line_length,
+        line_length, false,
     );
 
     eng.write_reg(SRC_ADDR_HIGH, 0);
@@ -860,7 +864,7 @@ fn test_multi_line_blocklinear_to_blocklinear_deswizzles_then_reswizzles() {
         line_count,
         block_height,
         block_depth,
-        line_length,
+        line_length, false,
     );
 
     eng.write_reg(SRC_ADDR_HIGH, 0);

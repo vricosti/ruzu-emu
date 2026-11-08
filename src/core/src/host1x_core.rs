@@ -7,7 +7,6 @@
 use std::any::Any;
 use std::sync::Arc;
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host1xChannelType {
     MsEnc = 0,
@@ -20,9 +19,52 @@ pub enum Host1xChannelType {
     Max = 7,
 }
 
+/// Cross-crate view of video_core/host1x/nx2_video_decoder.h::Nx2Picture.
+/// The opaque frame remains owned by the native FFmpeg implementation.
+pub struct Nx2Picture {
+    pub width: u32,
+    pub height: u32,
+    pub pts: u64,
+    pub frame: Arc<dyn Any + Send + Sync>,
+}
+
+/// Bridge mirror; the upstream-owned enum remains in video_core's decoder file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Nx2PictureFormat {
+    Nv12,
+    Rgba8,
+    Bgra8,
+}
+
+/// Created and used on the decode worker, as upstream's single-thread decoder.
+pub trait Nx2VideoDecoderHandle {
+    fn is_open(&self) -> bool;
+    fn name(&self) -> &str;
+    fn decode(&mut self, data: &[u8], pts: u64, pictures: &mut Vec<Nx2Picture>);
+    fn drain(&mut self, pictures: &mut Vec<Nx2Picture>);
+    fn reset(&mut self);
+    fn render(
+        &mut self,
+        picture: &Nx2Picture,
+        format: Nx2PictureFormat,
+        width: u32,
+        height: u32,
+        pitch: u64,
+        chroma_offset: u64,
+        out: &mut [u8],
+    );
+}
+
 pub trait Host1xCoreInterface: Any + Send + Sync {
+    fn create_nx2_video_decoder(&self, mime: &str) -> Box<dyn Nx2VideoDecoderHandle>;
     fn as_any(&self) -> &(dyn Any + Send + Sync);
     fn get_host_syncpoint_value(&self, id: u32) -> u32;
+    fn get_guest_syncpoint_value(&self, id: u32) -> u32;
+    /// SyncpointManager::IncrementGuest, publishing completed video frames.
+    fn increment_guest(&self, id: u32);
+    /// Direct bridge to SyncpointManager::IsReadyGuest (acquire load, unsigned >=).
+    fn is_ready_guest(&self, id: u32, expected_value: u32) -> bool;
     fn wait_host(&self, id: u32, expected_value: u32);
     fn register_guest_action(
         &self,
@@ -37,6 +79,7 @@ pub trait Host1xCoreInterface: Any + Send + Sync {
         action: Box<dyn FnOnce() + Send>,
     ) -> Option<u64>;
     fn deregister_host_action(&self, id: u32, handle: u64);
+    fn deregister_guest_action(&self, id: u32, handle: u64);
 
     /// Allocate `size` bytes of device-virtual (SMMU) address space and
     /// return the device address. Mirrors upstream
@@ -50,7 +93,10 @@ pub trait Host1xCoreInterface: Any + Send + Sync {
     /// `DeviceMemoryManager<Traits>::registered_processes`. Rust passes the
     /// process `Memory` owner through the opaque Host1x bridge so video_core
     /// can keep the same per-ASID memory association.
-    fn smmu_register_process(&self, memory: Option<Arc<crate::memory::memory::SharedMemory>>) -> u32;
+    fn smmu_register_process(
+        &self,
+        memory: Option<Arc<crate::memory::memory::SharedMemory>>,
+    ) -> u32;
 
     /// Unregister a process ASID previously returned by
     /// `smmu_register_process`, mirroring upstream
@@ -96,6 +142,9 @@ pub trait Host1xCoreInterface: Any + Send + Sync {
     /// Look up the host pointer for a device address via the SMMU page
     /// table. Returns 0 if no mapping exists.
     fn smmu_lookup(&self, d_address: u64) -> usize;
+
+    /// Host1x::MemoryManager().ReadBlock, including its pre-read cache flush.
+    fn smmu_read_block(&self, d_address: u64, output: &mut [u8]) -> bool;
 
     /// Apply `operation` to every device address aliasing `host_ptr`.
     ///

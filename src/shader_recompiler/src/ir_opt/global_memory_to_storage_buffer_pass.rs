@@ -344,36 +344,6 @@ fn collect_storage_buffer(program: &Program, inst_ref: InstRef, info: &mut Stora
     });
 }
 
-fn replace_uses_with(program: &mut Program, old: InstRef, replacement: Value) {
-    let old_value = Value::Inst(old);
-    for block in &mut program.blocks {
-        for inst in block.iter_mut() {
-            for arg in &mut inst.args {
-                if *arg == old_value {
-                    *arg = replacement;
-                }
-            }
-            for (_, value) in &mut inst.phi_args {
-                if *value == old_value {
-                    *value = replacement;
-                }
-            }
-        }
-    }
-    for node in &mut program.syntax_list {
-        match node {
-            crate::ir::program::SyntaxNode::If { cond, .. }
-            | crate::ir::program::SyntaxNode::Repeat { cond, .. }
-            | crate::ir::program::SyntaxNode::Break { cond, .. } => {
-                if *cond == old_value {
-                    *cond = replacement;
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 fn insert_before(
     program: &mut Program,
     before: InstRef,
@@ -446,11 +416,10 @@ fn replace_load(program: &mut Program, inst: InstRef, storage_index: u32, offset
         new_opcode,
         vec![Value::ImmU32(storage_index), offset],
     );
-    replace_uses_with(program, inst, value);
     program
         .block_mut(inst.block)
         .inst_mut(inst.inst)
-        .invalidate();
+        .replace_uses_with(value);
 }
 
 fn replace_write(program: &mut Program, inst: InstRef, storage_index: u32, offset: Value) {
@@ -475,11 +444,10 @@ fn replace_atomic(program: &mut Program, inst: InstRef, storage_index: u32, offs
     let mut args = vec![Value::ImmU32(storage_index), offset];
     args.extend(sources);
     let value = insert_before(program, inst, new_opcode, args);
-    replace_uses_with(program, inst, value);
     program
         .block_mut(inst.block)
         .inst_mut(inst.inst)
-        .invalidate();
+        .replace_uses_with(value);
 }
 
 fn replace(program: &mut Program, storage_inst: StorageInst, storage_index: u32, offset: Value) {
@@ -631,6 +599,41 @@ mod tests {
     use super::*;
     use crate::ir::basic_block::Block;
     use crate::ir::types::ShaderStage;
+
+    #[test]
+    fn load_and_atomic_replacement_preserve_definition_identity_until_cleanup() {
+        for atomic in [false, true] {
+            let mut program = Program::new(ShaderStage::Compute);
+            program.blocks = vec![Block::new(), Block::new()];
+            program.post_order_blocks = vec![1, 0];
+            let opcode = if atomic { Opcode::GlobalAtomicIAdd32 } else { Opcode::LoadGlobal32 };
+            let args = if atomic { vec![Value::ImmU64(4096), Value::ImmU32(7)] }
+                else { vec![Value::ImmU64(4096)] };
+            let old = program.block_mut(0).append_inst(Inst::new(opcode, args));
+            let old_ref = InstRef { block: 0, inst: old };
+            let old_value = Value::Inst(old_ref);
+            let user = program.block_mut(1).append_inst(Inst::new(
+                Opcode::IAdd32, vec![old_value, Value::ImmU32(3)],
+            ));
+            let mut phi = Inst::new(Opcode::Phi, vec![]);
+            phi.phi_args.push((0, old_value));
+            let phi = program.block_mut(1).append_inst(phi);
+            if atomic { replace_atomic(&mut program, old_ref, 2, Value::ImmU32(16)); }
+            else { replace_load(&mut program, old_ref, 2, Value::ImmU32(16)); }
+            let definition = program.block(0).inst(old);
+            assert_eq!(definition.opcode, Opcode::Identity);
+            let replacement = definition.args[0];
+            let Value::Inst(new_ref) = replacement else { panic!("replacement must be an instruction") };
+            assert_eq!(program.block(new_ref.block).inst(new_ref.inst).opcode,
+                if atomic { Opcode::StorageAtomicIAdd32 } else { Opcode::LoadStorage32 });
+            assert_eq!(program.block(1).inst(user).args[0], old_value);
+            assert_eq!(program.block(1).inst(phi).phi_args[0].1, old_value);
+            super::super::identity_removal_pass::identity_removal_pass(&mut program);
+            assert_eq!(program.block(1).inst(user).args[0], replacement);
+            assert_eq!(program.block(1).inst(phi).phi_args[0].1, replacement);
+            assert!(program.block(0).instructions[old as usize].is_none());
+        }
+    }
 
     #[test]
     fn cas_lowering_preserves_both_operands_and_side_effects() {
@@ -937,6 +940,9 @@ mod tests {
             block: 0,
             inst: storage_index,
         });
+        assert_eq!(program.block(0).inst(atomic).opcode, Opcode::Identity);
+        assert_eq!(program.block(0).inst(atomic).args, vec![storage_value]);
+        super::super::identity_removal_pass::identity_removal_pass(&mut program);
         assert!(program.block(0).iter().any(|inst| {
             inst.opcode == Opcode::IAdd32
                 && inst.args.first() == Some(&storage_value)

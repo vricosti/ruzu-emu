@@ -66,8 +66,8 @@ const TARGET_THRESHOLD: u64 = 4 * 1024 * 1024 * 1024;
 #[allow(dead_code)]
 const DISABLE_DOWNLOADS: bool = true;
 
-/// Number of page-table entries: covers 2^34 bytes / CACHING_PAGESIZE.
-const PAGE_TABLE_SIZE: usize = (1u64 << 34) as usize >> CACHING_PAGEBITS;
+/// Number of page-table entries: covers 2^36 bytes / CACHING_PAGESIZE.
+const PAGE_TABLE_SIZE: usize = (1u64 << 36) as usize >> CACHING_PAGEBITS;
 
 /// Stream score threshold above which a buffer region is treated as a stream buffer.
 const STREAM_LEAP_THRESHOLD: i32 = 16;
@@ -2924,17 +2924,29 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if !self.is_geometry_dirty(DirtyFlag::VertexBuffer(index)) {
             return;
         }
-        let Some((array, limit)) = self.maxwell3d().map(|maxwell| {
-            (
-                maxwell.vertex_stream_info(index),
-                maxwell.vertex_stream_limit(index),
-            )
+        let Some((array, gpu_addr_end)) = self.maxwell3d().map(|maxwell| {
+            let array = maxwell.vertex_stream_info(index);
+            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native_size = if native {
+                maxwell.native_vertex_stream_size(index as usize)
+            } else {
+                0
+            };
+            assert!(
+                !native || !array.enabled || native_size <= u64::from(u32::MAX),
+                "Native vertex stream exceeds supported 32-bit buffer size"
+            );
+            let end = if native {
+                array.address.wrapping_add(native_size)
+            } else {
+                maxwell.vertex_stream_limit(index).address.wrapping_add(1)
+            };
+            (array, end)
         }) else {
             return;
         };
 
         let gpu_addr_begin = array.address;
-        let gpu_addr_end = limit.address.wrapping_add(1);
         let device_addr = gpu_to_cpu_address(gpu_addr_begin);
         let address_size = gpu_addr_end.wrapping_sub(gpu_addr_begin) as u32;
         let mut size = address_size;
@@ -2971,17 +2983,29 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if !self.is_geometry_dirty(DirtyFlag::VertexBuffer(index)) {
             return;
         }
-        let Some((array, limit)) = self.maxwell3d().map(|maxwell| {
-            (
-                maxwell.vertex_stream_info(index),
-                maxwell.vertex_stream_limit(index),
-            )
+        let Some((array, gpu_addr_end)) = self.maxwell3d().map(|maxwell| {
+            let array = maxwell.vertex_stream_info(index);
+            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            let native_size = if native {
+                maxwell.native_vertex_stream_size(index as usize)
+            } else {
+                0
+            };
+            assert!(
+                !native || !array.enabled || native_size <= u64::from(u32::MAX),
+                "Native vertex stream exceeds supported 32-bit buffer size"
+            );
+            let end = if native {
+                array.address.wrapping_add(native_size)
+            } else {
+                maxwell.vertex_stream_limit(index).address.wrapping_add(1)
+            };
+            (array, end)
         }) else {
             return;
         };
 
         let gpu_addr_begin = array.address;
-        let gpu_addr_end = limit.address.wrapping_add(1);
         let device_addr = self
             .gpu_memory
             .as_ref()
@@ -4086,20 +4110,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         let aligned_device_addr = gpu_to_cpu_address(aligned_gpu_addr);
         if aligned_device_addr.is_none() || size == 0 {
-            log::warn!(
-                "storage_buffer_binding: Failed to find storage buffer for cbuf index {}",
-                cbuf_index
+            log::debug!(
+                "storage_buffer_binding: Failed to find storage buffer for cbuf index {}: descriptor={:#x} gpu_addr={:#x} size={:#x} aligned_mapped={}",
+                cbuf_index, ssbo_addr, gpu_addr, size, aligned_device_addr.is_some()
             );
             return NULL_BINDING;
         }
         let device_addr = gpu_to_cpu_address(gpu_addr);
-        if device_addr.is_none() {
-            log::warn!(
-                "storage_buffer_binding: Unaligned storage buffer address not found for cbuf index {}",
-                cbuf_index
-            );
-            return NULL_BINDING;
-        }
+        assert!(device_addr.is_some(),
+            "Unaligned storage buffer address not found for cbuf index {}", cbuf_index);
 
         // Upstream: const DAddr cpu_end = Common::AlignUp(*device_addr + size, Core::DEVICE_PAGESIZE);
         let cpu_end = device_addr
@@ -4428,6 +4447,23 @@ mod tests {
         );
         bind_test_channel(&mut cache, 7);
         cache.bind_graphics_uniform_buffer(4, 6, 0x1234, 0x100);
+    }
+
+    #[test]
+    fn native_device_ranges_above_16gib_fit_the_buffer_page_table() {
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker, TestBufferCacheRuntime::default(),
+        );
+        // Actual MKW crash page, then the final page of upstream's 36-bit
+        // device address space. Unallocated pages must be skipped normally.
+        for address in [271904u64 << CACHING_PAGEBITS, (1u64 << 36) - CACHING_PAGESIZE] {
+            BufferCache::<TestParams, DummyTracker>::for_each_buffer_in_range_impl(
+                &cache.page_table[..], &mut cache.slot_buffers,
+                address, CACHING_PAGESIZE,
+                |_, _| panic!("unallocated device page produced a buffer"),
+            );
+        }
     }
 
     #[test]
@@ -5320,6 +5356,89 @@ mod tests {
     }
 
     #[test]
+    fn native_vertex_buffer_size_matches_upstream_in_both_resolution_paths() {
+        use crate::engines::maxwell_3d::{VERTEX_STREAM_BASE, VERTEX_STREAM_LIMIT_BASE};
+        for resolver in [false, true] {
+            for (native, enabled, native_size, expected) in [
+                (true, true, 96u64, 96),
+                (false, true, 96, 256),
+                (true, true, 0, 0),
+                (true, false, 0x1_0000_0060, 0),
+            ] {
+                let tracker = DummyTracker;
+                let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+                    &tracker, TestBufferCacheRuntime::default(),
+                );
+                let mut owner = ChannelState::new(1);
+                let mut engine = Box::new(Maxwell3D::new());
+                engine.set_native_macro_context(Some(std::sync::Arc::new(
+                    parking_lot::ReentrantMutex::new(std::cell::RefCell::new(
+                        crate::r#macro::NativeMacroContext::default(),
+                    )),
+                )));
+                engine.set_native_turing_macro_mode(native);
+                engine.regs[VERTEX_STREAM_BASE as usize] = (u32::from(enabled) << 12) | 32;
+                engine.regs[VERTEX_STREAM_BASE as usize + 2] = 0x10000;
+                engine.regs[VERTEX_STREAM_LIMIT_BASE as usize + 1] = 0x100ff;
+                engine.regs[0x600 / 4] = (native_size >> 32) as u32;
+                engine.regs[0x600 / 4 + 1] = native_size as u32;
+                engine.dirty_flags_mut()[crate::dirty_flags::flags::VERTEX_BUFFER0 as usize] = true;
+                owner.maxwell_3d = Some(engine);
+                cache.create_channel(&owner);
+                cache.bind_to_channel(owner.bind_id);
+                cache.set_gpu_memory(Box::new(IdentityGpuMemory));
+                if resolver {
+                    cache.update_vertex_buffer_with_gpu_resolver(
+                        0, &mut |addr| { assert_eq!(addr, 0x10000); Some(addr) },
+                        &mut |end| { assert_eq!(end, 0x10000 + u64::from(expected)); true },
+                        &mut |_, _| panic!("small vertex stream must not scan mappings"),
+                    );
+                } else {
+                    cache.update_vertex_buffer(0);
+                }
+                let binding = cache.current_channel_state().unwrap().vertex_buffers[0];
+                assert_eq!(binding.size, expected);
+                assert_eq!(binding.device_addr, if expected == 0 { 0 } else { 0x10000 });
+                assert_eq!(cache.vertex_buffer_slot(0).size, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn native_vertex_buffer_oversize_is_rejected_before_translation() {
+        use crate::engines::maxwell_3d::VERTEX_STREAM_BASE;
+        for resolver in [false, true] {
+            let tracker = DummyTracker;
+            let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+                &tracker, TestBufferCacheRuntime::default(),
+            );
+            let mut owner = ChannelState::new(1);
+            let mut engine = Box::new(Maxwell3D::new());
+            engine.set_native_turing_macro_mode(true);
+            engine.regs[VERTEX_STREAM_BASE as usize] = 1 << 12;
+            engine.regs[0x600 / 4] = 1;
+            engine.dirty_flags_mut()[crate::dirty_flags::flags::VERTEX_BUFFER0 as usize] = true;
+            owner.maxwell_3d = Some(engine);
+            cache.create_channel(&owner);
+            cache.bind_to_channel(owner.bind_id);
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if resolver {
+                    cache.update_vertex_buffer_with_gpu_resolver(
+                        0, &mut |_| panic!("translation before validation"),
+                        &mut |_| panic!("range check before validation"),
+                        &mut |_, _| panic!("mapping scan before validation"),
+                    );
+                } else {
+                    cache.update_vertex_buffer(0);
+                }
+            })).expect_err("enabled native sizes above u32 must fail");
+            let message = failure.downcast_ref::<&str>().copied()
+                .or_else(|| failure.downcast_ref::<String>().map(String::as_str));
+            assert_eq!(message, Some("Native vertex stream exceeds supported 32-bit buffer size"));
+        }
+    }
+
+    #[test]
     fn update_vertex_buffer_slot_matches_upstream_mask_and_serial_contract() {
         let tracker = DummyTracker;
         let mut cache = BufferCache::<TestParams, DummyTracker>::new(
@@ -5767,6 +5886,25 @@ mod tests {
                 true
             },
         )
+    }
+
+    #[test]
+    #[should_panic(expected = "Unaligned storage buffer address not found for cbuf index 3")]
+    fn storage_buffer_asserts_inconsistent_unaligned_mapping_like_upstream() {
+        let tracker = DummyTracker;
+        let cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker, TestBufferCacheRuntime::default(),
+        );
+        cache.storage_buffer_binding_with_gpu_reader(
+            0x8000, 3, false,
+            |address| (address == 0x1200).then_some(address),
+            |_| 0x1000,
+            |address, output| {
+                let value: u64 = if address == 0x8000 { 0x1234 } else { 0x80 };
+                output.copy_from_slice(&value.to_le_bytes());
+                true
+            },
+        );
     }
 
     #[test]

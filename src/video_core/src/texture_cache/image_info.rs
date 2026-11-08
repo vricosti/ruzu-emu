@@ -15,6 +15,20 @@ use crate::textures::texture::MsaaMode;
 // Upstream owns PixelFormat in video_core/surface.h.
 pub use super::format_lookup_table::PixelFormat;
 
+/// Port of `image_info.h::TextureViewHeader`.
+/// Native descriptors already address the selected view; legacy layer-base
+/// fields must not introduce an additional array prefix.
+pub fn texture_view_header(
+    mut entry: crate::textures::texture::TicEntry,
+    native: bool,
+) -> crate::textures::texture::TicEntry {
+    if native {
+        entry.raw[1] &= !((0x1fu64 << 16) | (0x7u64 << 29));
+        entry.raw[2] &= !(0x7u64 << 16);
+    }
+    entry
+}
+
 // ── Constants (from image_info.cpp) ────────────────────────────────────
 
 pub const RESCALE_HEIGHT_THRESHOLD: u32 = 288;
@@ -60,6 +74,7 @@ pub struct ImageInfo {
     pub maybe_unaligned_layer_stride: u32,
     pub num_samples: u32,
     pub tile_width_spacing: u32,
+    pub native_tiling: bool,
     pub rescaleable: bool,
     pub downscaleable: bool,
     pub forced_flushed: bool,
@@ -100,6 +115,7 @@ impl Default for ImageInfo {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -327,6 +343,7 @@ impl ImageInfo {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed,
@@ -397,6 +414,7 @@ impl ImageInfo {
             maybe_unaligned_layer_stride: config.array_pitch.wrapping_mul(4),
             num_samples: super::samples_helper::num_samples(msaa_mode) as u32,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed,
@@ -481,6 +499,7 @@ impl ImageInfo {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed,
@@ -543,6 +562,7 @@ impl ImageInfo {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -578,6 +598,19 @@ pub fn byte_size_to_format(bytes_per_pixel: u32) -> PixelFormat {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_texture_view_header_clears_only_legacy_layer_fields() {
+        use crate::textures::texture::TicEntry;
+        let original = TicEntry { raw: [u64::MAX; 4] };
+        assert_eq!(super::texture_view_header(original, false).raw, original.raw);
+        let native = super::texture_view_header(original, true);
+        assert_eq!(native.base_layer(), 0);
+        assert_eq!(native.address(), original.address());
+        assert_eq!(native.raw[0], original.raw[0]);
+        assert_eq!(native.raw[3], original.raw[3]);
+        assert_eq!(native.raw[1] ^ original.raw[1], 0xe01f0000);
+        assert_eq!(native.raw[2] ^ original.raw[2], 0x00070000);
+    }
     use super::*;
     use crate::engines::fermi_2d::{MemoryLayout, Surface};
     use crate::engines::maxwell_3d::{RenderTargetInfo, ZetaInfo};

@@ -307,6 +307,7 @@ impl Layer {
                 block_height_log2,
                 0, // block_depth
                 1, // stride_alignment
+                false,
             );
         }
 

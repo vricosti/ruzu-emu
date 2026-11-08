@@ -47,6 +47,9 @@ bitflags::bitflags! {
         const IS_RESCALABLE        = 1 << 15;
         const ASYNCHRONOUS_DECODE  = 1 << 16;
         const IS_DECODING          = 1 << 17;
+        const UNBACKED             = 1 << 18;
+        const TRIMMED_LEVELS       = 1 << 19;
+        const ZERO_FILLED          = 1 << 20;
     }
 }
 
@@ -79,6 +82,8 @@ pub struct ImageBase {
     pub unswizzled_size_bytes: u32,
     pub converted_size_bytes: u32,
     pub scale_rating: u32,
+    /// Guest mip level stored at host mip zero (ImageBase::host_level_offset).
+    pub host_level_offset: u32,
     pub scale_tick: u64,
     pub has_scaled: bool,
 
@@ -130,6 +135,7 @@ impl ImageBase {
             unswizzled_size_bytes,
             converted_size_bytes,
             scale_rating: 0,
+            host_level_offset: 0,
             scale_tick: 0,
             has_scaled: false,
             channel: 0,
@@ -161,6 +167,7 @@ impl ImageBase {
             unswizzled_size_bytes: 0,
             converted_size_bytes: 0,
             scale_rating: 0,
+            host_level_offset: 0,
             scale_tick: 0,
             has_scaled: false,
             channel: 0,

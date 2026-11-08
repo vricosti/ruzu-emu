@@ -1042,6 +1042,7 @@ mod tests {
 
     #[test]
     fn update_highest_priority_threads_impl_requests_wait_for_non_runnable_dummy_current_thread() {
+        let _kernel_scope = crate::hle::kernel::kernel::ScopedKernelForTest::without_kernel();
         let current_thread = Arc::new(KThreadLock::new(KThread::new()));
         {
             let mut guard = current_thread.lock().unwrap();

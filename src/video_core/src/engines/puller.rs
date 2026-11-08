@@ -520,19 +520,26 @@ impl Puller {
                 log::error!("Special puller engine method NonStallInterrupt not implemented");
             }
             Some(BufferMethods::MemOpA) => {
-                log::error!("Memory Operation A");
+                log::trace!("Memory Operation A");
             }
             Some(BufferMethods::MemOpB) => {
                 self.with_rasterizer_mut(|rasterizer| rasterizer.invalidate_gpu_cache());
             }
             Some(BufferMethods::MemOpC) | Some(BufferMethods::MemOpD) => {
-                log::error!("Memory Operation C,D");
+                log::trace!("Memory Operation C,D");
             }
             Some(BufferMethods::SemaphoreAcquire) => {
-                self.process_semaphore_acquire();
+                // Ampere uses 0x17..0x1A as address/payload words, not an acquire command.
+                if !crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.process_semaphore_acquire();
+                }
             }
             Some(BufferMethods::SemaphoreRelease) => {
-                self.process_semaphore_release();
+                if crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.process_semaphore_execute(method_call.argument);
+                } else {
+                    self.process_semaphore_release();
+                }
             }
             Some(BufferMethods::Yield) => {
                 log::error!("Special puller engine method Yield not implemented");
@@ -719,6 +726,17 @@ impl Puller {
         if (engine & !GF100_BIND_CLASS_MASK) != 0 && (engine & !GF100_BIND_VALID_MASK) == 0 {
             engine &= GF100_BIND_CLASS_MASK;
         }
+        // NX2 binds Ampere classes to the corresponding existing engines.
+        match engine & 0xffff {
+            0xc797 => engine = EngineID::MaxwellB.raw(),
+            0xc7c0 => engine = EngineID::KeplerComputeB.raw(),
+            0xc7b5 => engine = EngineID::MaxwellDmaCopyA.raw(),
+            0 if crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::SeqCst) => {
+                log::debug!("Switch 2 unbinds subchannel {}", method_call.subchannel);
+                return;
+            }
+            _ => {}
+        }
         let eid = EngineID::from_raw(engine);
         self.bound_engines[method_call.subchannel as usize] = eid;
         match eid {
@@ -866,6 +884,40 @@ impl Puller {
                 _ => {
                     log::error!("Invalid semaphore operation {}", op);
                 }
+            }
+        }
+    }
+
+    /// Port of Puller::ProcessSemaphoreExecute, using the upstream unsplit GPU path.
+    /// The current Rust GPU executes rasterizer work synchronously on its GPU thread,
+    /// so there is no separate back-thread queue to defer to or drain here.
+    fn process_semaphore_execute(&mut self, argument: u32) {
+        let address = ((self.regs.reg_array[0x18] as u64 & 0x1ffffff) << 32)
+            | (self.regs.reg_array[0x17] & !3) as u64;
+        let payload = self.regs.reg_array[0x19];
+        let operation = argument & 7;
+        if operation == 1 {
+            self.with_rasterizer_mut(|rasterizer| {
+                rasterizer.query(address, QueryType::Payload as u32,
+                    QueryPropertiesFlags::IS_A_FENCE, payload, 0);
+            });
+            return;
+        }
+        self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
+        let word = self.read_gpu_u32(address);
+        let ready = match operation {
+            0 => word == payload,
+            2 => word >= payload,
+            3 => word.wrapping_sub(payload) as i32 >= 0,
+            4 => word & payload != 0,
+            5 => word & payload == 0,
+            _ => true,
+        };
+        if !ready {
+            static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if REPORTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 8 {
+                log::warn!("SEM_EXECUTE op {} at {:#x}: {:#x} vs {:#x} not met, continuing",
+                    operation, address, word, payload);
             }
         }
     }
@@ -1163,6 +1215,65 @@ mod tests {
         ));
 
         assert_eq!(puller.bound_engines[2].raw(), 0x1234);
+    }
+
+    #[test]
+    fn ampere_classes_bind_existing_engines_and_zero_preserves_native_binding() {
+        const CHILD: &str = "RUZU_PULLER_AMPERE_BIND_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--test-threads=1"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        crate::nx2::G_NX2_AMPERE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut channel = ChannelState::new(1);
+        let mut puller = Puller::new(
+            Arc::new(parking_lot::Mutex::new(crate::memory_manager::MemoryManager::default())),
+            std::ptr::null_mut(), &mut channel);
+        for (class, expected) in [
+            (0xc797, EngineID::MaxwellB),
+            (0xc7c0, EngineID::KeplerComputeB),
+            (0xc7b5, EngineID::MaxwellDmaCopyA),
+        ] {
+            for flags in [0, 0x1f0000, 0x80000000] {
+                puller.process_bind_method(&MethodCall::new(0, flags | class, 4, 1));
+                assert_eq!(puller.bound_engines[4], expected);
+                puller.process_bind_method(&MethodCall::new(0, 0, 4, 1));
+                assert_eq!(puller.bound_engines[4], expected);
+            }
+        }
+        let fake = Box::new(FakeRasterizer::default());
+        let queries = fake.query_calls.clone();
+        puller.bind_rasterizer(fake.as_ref());
+        for (method, argument) in [(0x17, 0x23456783), (0x18, 0xfe000001),
+            (0x19, 0xdeadbeef), (0x1a, 0xffffffff), (0x1b, 0x101)] {
+            puller.call_puller_method(&MethodCall::new(method, argument, 0, 1));
+        }
+        assert_eq!(*queries.lock().unwrap(),
+            vec![(0x123456780, QueryType::Payload as u32, QueryPropertiesFlags::IS_A_FENCE, 0xdeadbeef)]);
+        crate::nx2::G_NX2_AMPERE.store(false, std::sync::atomic::Ordering::SeqCst);
+        puller.process_bind_method(&MethodCall::new(0, 0, 4, 1));
+        assert_eq!(puller.bound_engines[4].raw(), 0);
+    }
+
+    #[test]
+    fn semaphore_execute_acquires_release_fences_once_and_never_emit_a_release() {
+        let mut puller = Puller::default();
+        let fake = Box::new(FakeRasterizer::default());
+        let releases = fake.release_fence_calls.clone();
+        let queries = fake.query_calls.clone();
+        puller.bind_rasterizer(fake.as_ref());
+        // Unmapped reads return zero; include unmet compares and wrapping signed subtraction.
+        for payload in [0, 1, 0x80000000, u32::MAX] {
+            puller.regs.reg_array[0x19] = payload;
+            for operation in [0, 2, 3, 4, 5, 6, 7] {
+                puller.process_semaphore_execute(operation | 0x100);
+            }
+        }
+        assert_eq!(*releases.lock().unwrap(), vec![true; 28]);
+        assert!(queries.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -108,6 +108,29 @@ pub trait RendererBase: Send {
         layer_stack: LayerStackId,
     );
 
+    /// Mechanical ownership adapter for the split-crate screenshot bridge.
+    /// Upstream CaptureFrame keeps its vector alive in the completion callback.
+    fn request_screenshot_owned(
+        &mut self,
+        mut pixels: Vec<u8>,
+        callback: Box<dyn FnOnce(Vec<u8>, bool) + Send>,
+        layout: FramebufferLayout,
+        layer_stack: LayerStackId,
+    ) {
+        let required = u64::from(layout.width)
+            .checked_mul(u64::from(layout.height))
+            .and_then(|size| size.checked_mul(4))
+            .expect("screenshot dimensions overflow");
+        assert!(pixels.len() as u64 >= required, "screenshot buffer is too small");
+        let data = pixels.as_mut_ptr().cast();
+        self.request_screenshot(
+            data,
+            Box::new(move |invert_y| callback(pixels, invert_y)),
+            layout,
+            layer_stack,
+        );
+    }
+
     /// Install a *GPU virtual address* reader on the renderer's shader cache.
     ///
     /// This reader's first argument is a **GPU virtual address**

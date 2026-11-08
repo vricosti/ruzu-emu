@@ -2453,6 +2453,13 @@ impl Device {
         self.device_properties.limits.max_storage_buffer_range as u64
     }
 
+    /// Compute mesh transport adaptation: native DrawMeshTasksEXT does not
+    /// require indirect vertex-draw batching. Keep the physical limit owned by
+    /// Device, alongside the upstream-owned limits used by this transport.
+    pub fn get_max_draw_indirect_count(&self) -> u32 {
+        self.device_properties.limits.max_draw_indirect_count
+    }
+
     /// Returns the maximum size for push constants.
     pub fn get_max_push_constants_size(&self) -> vk::DeviceSize {
         self.device_properties.limits.max_push_constants_size as u64

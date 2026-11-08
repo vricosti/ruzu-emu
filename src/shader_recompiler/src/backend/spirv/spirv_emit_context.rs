@@ -60,6 +60,33 @@ pub(crate) struct GenericElementInfo {
     pub num_components: u32,
 }
 
+/// DefineMesh's output target, with None replacing the upstream scalar sentinel.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MeshLineTarget {
+    pub variable: spirv::Word,
+    pub element: Option<u32>,
+    pub is_float: bool,
+}
+
+/// Explicit compute replacement for Vulkan's implicit task-to-mesh dispatch
+/// association. One record per host workgroup in a one-dimensional dispatch.
+/// Words are tightly packed in the mapping SSBO, independently of host padding.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshDispatchRecord {
+    pub guest_workgroup_x: u32,
+    pub payload_base_words: u32,
+    pub output_record: u32,
+}
+
+impl MeshDispatchRecord {
+    pub const WORDS: u32 = 3;
+
+    pub fn words(self) -> [u32; 3] {
+        [self.guest_workgroup_x, self.payload_base_words, self.output_record]
+    }
+}
+
 /// Port of upstream `TextureDefinition` in `spirv_emit_context.h`.
 #[derive(Clone, Copy)]
 pub(crate) struct TextureDefinition {
@@ -333,6 +360,45 @@ fn storage_image_type(
     )
 }
 
+/// Compute fallback record for one mesh workgroup. The first four U32 words
+/// are VkDrawIndirectCommand (vertexCount, instanceCount, firstVertex,
+/// firstInstance); the remaining regions preserve upstream DefineMesh's ISBE
+/// arrays verbatim. This is a word-offset description, not a memcpy host ABI.
+/// https://docs.vulkan.org/refpages/latest/refpages/source/VkDrawIndirectCommand.html
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MeshOutputLayout {
+    pub attribute_base: u32,
+    pub attribute_words: u32,
+    pub primitive_base: u32,
+    pub map_base: u32,
+    pub map_words: u32,
+    pub stride_words: u32,
+    /// Non-indexed pulled vertices reserved per workgroup, including all corners.
+    pub vertex_span: u32,
+}
+
+impl MeshOutputLayout {
+    pub fn new(mesh: &crate::shader_info::MeshInfo) -> Self {
+        // Mechanical extraction of DefineMesh's workgroup-region arithmetic.
+        let primitive_base = mesh.max_vertices.div_ceil(32) * mesh.vertex_lines.len() as u32 * 32;
+        let attribute_words = (primitive_base
+            + mesh.max_primitives.div_ceil(32) * mesh.primitive_lines.len() as u32 * 32)
+            .max(1);
+        let map_words = 4 + mesh.primitive_vertices() * mesh.max_primitives;
+        let attribute_base = 4;
+        let map_base = attribute_base + attribute_words;
+        Self {
+            attribute_base,
+            attribute_words,
+            primitive_base,
+            map_base,
+            map_words,
+            stride_words: map_base + map_words,
+            vertex_span: mesh.max_primitives * mesh.primitive_vertices(),
+        }
+    }
+}
+
 /// SPIR-V emission context.
 ///
 /// Matches upstream `EmitContext` class that inherits from `Sirit::Module`.
@@ -340,6 +406,9 @@ pub struct SpirvEmitContext {
     pub builder: Builder,
     pub profile: Profile,
     pub stage: ShaderStage,
+    /// Guest classification from upstream Info. The fallback's host stage is Compute.
+    pub(crate) is_task: bool,
+    pub(crate) is_mesh: bool,
 
     // ── Cached SPIR-V type IDs ────────────────────────────────────────
     pub void_type: spirv::Word,
@@ -465,6 +534,35 @@ pub struct SpirvEmitContext {
     pub shared_memory_u32x2: spirv::Word,
     pub shared_memory_u32x4: spirv::Word,
     pub shared_memory_u32_type: spirv::Word,
+    // Upstream EmitContext's mesh output regions. These are independent of
+    // TaskPayloadWorkgroupEXT and can also be used by the compute fallback.
+    pub(crate) mesh_attributes: spirv::Word,
+    pub(crate) mesh_payload: spirv::Word,
+    pub(crate) mesh_payload_u32: spirv::Word,
+    pub(crate) mesh_payload_words: u32,
+    pub(crate) mesh_threads: u32,
+    /// Compute fallback transport for upstream TaskPayloadWorkgroupEXT.
+    pub(crate) mesh_payload_buffer: spirv::Word,
+    pub(crate) mesh_payload_buffer_u32: spirv::Word,
+    pub(crate) mesh_dispatch_buffer: spirv::Word,
+    pub(crate) mesh_dispatch_buffer_u32: spirv::Word,
+    pub(crate) mesh_guest_workgroup_id: spirv::Word,
+    pub(crate) mesh_payload_base: spirv::Word,
+    /// Compute transport may reserve more children than the task emits.
+    pub(crate) mesh_task_count_guard: bool,
+    pub(crate) mesh_output_record: spirv::Word,
+    pub(crate) mesh_info: crate::shader_info::MeshInfo,
+    pub(crate) mesh_vertex_targets: Vec<MeshLineTarget>,
+    pub(crate) mesh_primitive_targets: Vec<MeshLineTarget>,
+    pub(crate) mesh_output_layout: MeshOutputLayout,
+    pub(crate) mesh_output_buffer: spirv::Word,
+    pub(crate) mesh_output_buffer_u32: spirv::Word,
+    pub(crate) mesh_map: spirv::Word,
+    pub(crate) mesh_primitive_count: spirv::Word,
+    pub(crate) mesh_shared_u32: spirv::Word,
+    pub(crate) mesh_attribute_words: u32,
+    pub(crate) mesh_map_bytes: u32,
+    pub(crate) mesh_primitive_base: u32,
     pub shared_store_u8_func: spirv::Word,
     pub shared_store_u16_func: spirv::Word,
     pub increment_cas_shared: spirv::Word,
@@ -692,6 +790,8 @@ impl SpirvEmitContext {
             builder,
             profile: profile.clone(),
             stage: program.stage,
+            is_task: program.info.is_task,
+            is_mesh: program.info.is_mesh,
             runtime_info: runtime_info.clone(),
             workgroup_id: 0,
             local_invocation_id: 0,
@@ -757,6 +857,31 @@ impl SpirvEmitContext {
             shared_memory_u32x2: 0,
             shared_memory_u32x4: 0,
             shared_memory_u32_type: 0,
+            mesh_attributes: 0,
+            mesh_payload: 0,
+            mesh_payload_u32: 0,
+            mesh_payload_words: 0,
+            mesh_threads: program.workgroup_size[0],
+            mesh_payload_buffer: 0,
+            mesh_payload_buffer_u32: 0,
+            mesh_dispatch_buffer: 0,
+            mesh_dispatch_buffer_u32: 0,
+            mesh_guest_workgroup_id: 0,
+            mesh_payload_base: 0,
+            mesh_task_count_guard: false,
+            mesh_output_record: 0,
+            mesh_info: program.mesh.clone(),
+            mesh_vertex_targets: Vec::new(),
+            mesh_primitive_targets: Vec::new(),
+            mesh_output_layout: MeshOutputLayout::default(),
+            mesh_output_buffer: 0,
+            mesh_output_buffer_u32: 0,
+            mesh_map: 0,
+            mesh_primitive_count: 0,
+            mesh_shared_u32: 0,
+            mesh_attribute_words: 0,
+            mesh_map_bytes: 0,
+            mesh_primitive_base: 0,
             shared_store_u8_func: 0,
             shared_store_u16_func: 0,
             increment_cas_shared: 0,
@@ -2696,6 +2821,221 @@ impl SpirvEmitContext {
         }
     }
 
+    /// Payload-array block of upstream `EmitContext::DefineMesh`, with Workgroup
+    /// storage for the compute fallback instead of TaskPayloadWorkgroupEXT.
+    /// The fallback must explicitly export task payloads and import mesh payloads
+    /// across dispatches; this declaration alone does not perform that transfer.
+    pub fn define_mesh_payload_workgroup(&mut self, payload_words: u32) {
+        assert!(
+            payload_words > 0,
+            "mesh metadata must supply a nonempty payload"
+        );
+        self.mesh_payload_words = payload_words;
+        let count = self.constant_u32(payload_words);
+        let payload_type = self.builder.type_array(self.u32_type, count);
+        self.mesh_payload =
+            self.define_variable(payload_type, None, spirv::StorageClass::Workgroup, None);
+        self.builder.name(self.mesh_payload, "task_payload");
+        self.mesh_payload_u32 =
+            self.builder
+                .type_pointer(None, spirv::StorageClass::Workgroup, self.u32_type);
+    }
+
+    /// Explicit transport replacing the automatic TaskPayloadWorkgroupEXT
+    /// handoff on hosts without mesh shaders. Binding is reserved by the caller;
+    /// it must be present in the compute descriptor layout. Payloads are tightly
+    /// packed U32 words, with each task's base supplied to the transfer emitter.
+    pub fn define_mesh_payload_buffer(&mut self, binding: u32) {
+        (self.mesh_payload_buffer, self.mesh_payload_buffer_u32) =
+            self.define_mesh_storage_buffer(binding, "task_payload_transport");
+    }
+
+    /// Reserved mapping descriptor. Must be populated and visible before the
+    /// dispatch; each child maps to its parent's payload, not its own index.
+    pub fn define_mesh_dispatch_buffer(&mut self, binding: u32) {
+        (self.mesh_dispatch_buffer, self.mesh_dispatch_buffer_u32) =
+            self.define_mesh_storage_buffer(binding, "mesh_dispatch_mapping");
+    }
+
+    /// Reserved descriptor shared by the compute exporter and vertex reader.
+    /// Host buffers additionally need INDIRECT_BUFFER usage and a shader-write
+    /// to indirect-read/vertex-shader-read dependency before drawing.
+    pub fn define_mesh_output_buffer(&mut self, mesh: &crate::shader_info::MeshInfo, binding: u32) {
+        self.mesh_info = mesh.clone();
+        self.mesh_output_layout = MeshOutputLayout::new(mesh);
+        (self.mesh_output_buffer, self.mesh_output_buffer_u32) =
+            self.define_mesh_storage_buffer(binding, "mesh_output_transport");
+    }
+
+    /// DefineMesh output declarations adapted to a vertex-pulling entrypoint.
+    /// Per-primitive generics are repeated at every corner of a primitive.
+    /// Unsupported interfaces fail before producing a shader, never drop data.
+    pub fn define_mesh_vertex_outputs(
+        &mut self,
+        mesh: &crate::shader_info::MeshInfo,
+        binding: u32,
+    ) -> Result<crate::shader_info::Info, crate::exception::NotImplementedException> {
+        use crate::exception::NotImplementedException;
+        use crate::ir::value::Attribute;
+        assert_eq!(self.stage, ShaderStage::VertexB);
+        let mut program = ir::Program::new(ShaderStage::VertexB);
+        for &line in &mesh.primitive_lines {
+            if line == 24 {
+                return Err(NotImplementedException::new(
+                    "Mesh PrimitiveId vertex fallback",
+                ));
+            }
+            if (line == 25 || line == 26) && !self.profile.support_viewport_index_layer_non_geometry
+            {
+                return Err(NotImplementedException::new(
+                    "Mesh layer/viewport vertex output",
+                ));
+            }
+            if line == 26 && !self.profile.support_multi_viewport {
+                return Err(NotImplementedException::new("Mesh multiple viewports"));
+            }
+            if (32..160).contains(&line) && mesh.vertex_lines.contains(&line) {
+                return Err(NotImplementedException::new(
+                    "Overlapping mesh vertex/primitive component",
+                ));
+            }
+        }
+        for (&line, primitive) in mesh
+            .vertex_lines
+            .iter()
+            .map(|a| (a, false))
+            .chain(mesh.primitive_lines.iter().map(|a| (a, true)))
+        {
+            // Same target selection as DefineMesh, including ignored builtins.
+            if (32..160).contains(&line)
+                || (!primitive && (27..32).contains(&line))
+                || (primitive && (25..27).contains(&line))
+            {
+                program.info.stores.set(line as usize, true);
+            }
+        }
+        if mesh.primitive_vertices() == 1 {
+            program
+                .info
+                .stores
+                .set(Attribute::POINT_SIZE.0 as usize, true);
+        }
+        self.define_outputs(&program);
+        let target = |attribute: u32, per_primitive: bool| -> MeshLineTarget {
+            let (variable, element, is_float) = match attribute {
+                32..=159 => {
+                    let generic = ((attribute - 32) / 4) as usize;
+                    let element = (attribute - 32) % 4;
+                    let target = self.output_generics[generic][element as usize];
+                    (
+                        target.id,
+                        (target.num_components > 1).then_some(element - target.first_element),
+                        true,
+                    )
+                }
+                28..=31 if !per_primitive => (self.output_position, Some(attribute - 28), true),
+                27 if !per_primitive => (self.output_point_size, None, true),
+                25 if per_primitive => (self.layer, None, false),
+                26 if per_primitive => (self.viewport_index, None, false),
+                _ => return MeshLineTarget::default(),
+            };
+            MeshLineTarget {
+                variable,
+                element,
+                is_float,
+            }
+        };
+        let vertex_targets = mesh
+            .vertex_lines
+            .iter()
+            .map(|&a| target(a, false))
+            .collect();
+        let primitive_targets = mesh
+            .primitive_lines
+            .iter()
+            .map(|&a| target(a, true))
+            .collect();
+        self.mesh_vertex_targets = vertex_targets;
+        self.mesh_primitive_targets = primitive_targets;
+        // Host VertexIndex already includes firstVertex. No BaseVertex subtraction.
+        self.vertex_index =
+            self.define_input(self.u32_type, true, Some(spirv::BuiltIn::VertexIndex));
+        self.define_mesh_output_buffer(mesh, binding);
+        Ok(program.info)
+    }
+
+    // Mechanical common declaration of the two fallback U32 transport blocks.
+    fn define_mesh_storage_buffer(
+        &mut self,
+        binding: u32,
+        name: &str,
+    ) -> (spirv::Word, spirv::Word) {
+        let array_type = self.builder.type_runtime_array(self.u32_type);
+        self.builder.decorate(
+            array_type,
+            spirv::Decoration::ArrayStride,
+            [Operand::LiteralBit32(4)],
+        );
+        let block_type = self.builder.type_struct([array_type]);
+        self.builder
+            .decorate(block_type, spirv::Decoration::Block, []);
+        self.builder.member_decorate(
+            block_type,
+            0,
+            spirv::Decoration::Offset,
+            [Operand::LiteralBit32(0)],
+        );
+        let buffer =
+            self.define_variable(block_type, None, spirv::StorageClass::StorageBuffer, None);
+        self.builder.decorate(
+            buffer,
+            spirv::Decoration::DescriptorSet,
+            [Operand::LiteralBit32(0)],
+        );
+        self.builder.decorate(
+            buffer,
+            spirv::Decoration::Binding,
+            [Operand::LiteralBit32(binding)],
+        );
+        self.builder.name(buffer, name);
+        let pointer =
+            self.builder
+                .type_pointer(None, spirv::StorageClass::StorageBuffer, self.u32_type);
+        (buffer, pointer)
+    }
+
+    /// Workgroup output-region block of upstream `EmitContext::DefineMesh`
+    /// (Eglantine 900ab5a8, spirv_emit_context.cpp).
+    ///
+    /// Mechanically extracted in the same owner so both native mesh and the
+    /// compute fallback can use the identical ISBE layout. This does not define
+    /// the task payload or graphics outputs and is not yet called by normal
+    /// shader compilation: their execution prerequisites must be completed first.
+    pub fn define_mesh_shared_memory(&mut self, mesh: &crate::shader_info::MeshInfo) {
+        self.mesh_info = mesh.clone();
+        let layout = MeshOutputLayout::new(mesh);
+        self.mesh_primitive_base = layout.primitive_base;
+        self.mesh_attribute_words = layout.attribute_words;
+        self.mesh_map_bytes = layout.map_words;
+        self.mesh_shared_u32 =
+            self.builder
+                .type_pointer(None, spirv::StorageClass::Workgroup, self.u32_type);
+        let attribute_words = self.constant_u32(self.mesh_attribute_words);
+        let attribute_type = self.builder.type_array(self.u32_type, attribute_words);
+        self.mesh_attributes =
+            self.define_variable(attribute_type, None, spirv::StorageClass::Workgroup, None);
+        self.builder.name(self.mesh_attributes, "isbe_attributes");
+        // Upstream stores each map byte in one U32, not a packed byte array.
+        let map_bytes = self.constant_u32(self.mesh_map_bytes);
+        let map_type = self.builder.type_array(self.u32_type, map_bytes);
+        self.mesh_map = self.define_variable(map_type, None, spirv::StorageClass::Workgroup, None);
+        self.builder.name(self.mesh_map, "isbe_map");
+        self.mesh_primitive_count =
+            self.define_variable(self.u32_type, None, spirv::StorageClass::Workgroup, None);
+        self.builder
+            .name(self.mesh_primitive_count, "isbe_primitive_count");
+    }
+
     fn define_variable(
         &mut self,
         value_type: spirv::Word,
@@ -3207,6 +3547,11 @@ impl SpirvEmitContext {
     fn define_outputs(&mut self, program: &ir::Program) {
         use crate::ir::value::Attribute;
 
+        // Upstream DefineOutputs delegates task/mesh outputs to DefineMesh.
+        // The compute fallback likewise exports storage, not graphics outputs.
+        if program.info.is_task || program.info.is_mesh {
+            return;
+        }
         let info = &program.info;
         let invocations = Some(program.invocations);
         if self.runtime_info.convert_depth_mode
@@ -5391,6 +5736,28 @@ impl SpirvEmitContext {
             | Opcode::WriteStorage128 => {
                 super::emit_spirv_memory::emit_store(self, inst, block_idx, inst_idx);
             }
+            Opcode::IsbeRead => {
+                let address = self.resolve_value(inst.arg(0));
+                let value = super::emit_spirv_mesh::emit_isbe_read(self, address);
+                self.set_value(block_idx, inst_idx, value);
+            }
+            Opcode::IsbeWriteAttribute | Opcode::IsbeWriteMapU8 | Opcode::IsbeWriteMapU32 => {
+                let value = self.resolve_value(inst.arg(1));
+                let result = if inst.opcode == Opcode::IsbeWriteMapU32 {
+                    // This emitter validates the immediate byte-3 count address.
+                    super::emit_spirv_mesh::emit_isbe_write_map_u32(self, *inst.arg(0), value)
+                } else {
+                    let address = self.resolve_value(inst.arg(0));
+                    if inst.opcode == Opcode::IsbeWriteAttribute {
+                        super::emit_spirv_mesh::emit_isbe_write_attribute(self, address, value)
+                    } else {
+                        super::emit_spirv_mesh::emit_isbe_write_map_u8(self, address, value)
+                    }
+                };
+                if let Err(error) = result {
+                    std::panic::panic_any(error);
+                }
+            }
             Opcode::LoadLocal => {
                 let offset = self.resolve_value(inst.arg(0));
                 let value = super::emit_spirv_context_get_set::emit_load_local(self, offset);
@@ -5950,6 +6317,231 @@ mod tests {
     use crate::ir::types::{ShaderStage, TextureInstInfo, Type};
     use crate::ir::value::{Attribute, InstRef, Patch, Value};
     use crate::runtime_info::TransformFeedbackVarying;
+
+    #[test]
+    fn mesh_shared_memory_preserves_group_boundaries_and_map_units() {
+        // Independent expected sizes, including both sides of a 32-element
+        // boundary. Two vertex lines and three primitive lines per group.
+        for (vertices, primitives, base, words) in [
+            (0, 0, 0, 1),
+            (1, 1, 64, 160),
+            (31, 31, 64, 160),
+            (32, 32, 64, 160),
+            (33, 33, 128, 320),
+            (256, 192, 512, 1088),
+        ] {
+            for (topology, vertices_per_primitive) in [(0, 1), (1, 2), (4, 3)] {
+                let mesh = crate::shader_info::MeshInfo {
+                    max_vertices: vertices,
+                    max_primitives: primitives,
+                    topology,
+                    vertex_lines: [28, 29].into_iter().collect(),
+                    primitive_lines: [24, 25, 26].into_iter().collect(),
+                    ..Default::default()
+                };
+                let program = ir::Program::new(ShaderStage::Compute);
+                let mut ctx =
+                    SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+                ctx.define_mesh_shared_memory(&mesh);
+                assert_eq!(ctx.mesh_primitive_base, base);
+                assert_eq!(ctx.mesh_attribute_words, words);
+                assert_eq!(ctx.mesh_map_bytes, 4 + vertices_per_primitive * primitives);
+                assert_mesh_workgroup_variable(&ctx, ctx.mesh_attributes, Some(words));
+                assert_mesh_workgroup_variable(
+                    &ctx,
+                    ctx.mesh_map,
+                    Some(4 + vertices_per_primitive * primitives),
+                );
+                assert_mesh_workgroup_variable(&ctx, ctx.mesh_primitive_count, None);
+                assert!(!has_capability(&ctx, spirv::Capability::MeshShadingEXT));
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_shared_memory_empty_attributes_and_maximum_line_count() {
+        for (line_count, expected_base, expected_words) in [(0, 0, 1), (136, 34816, 60928)] {
+            let mesh = crate::shader_info::MeshInfo {
+                max_vertices: 256,
+                max_primitives: 192,
+                topology: 4,
+                vertex_lines: (24..24 + line_count).collect(),
+                primitive_lines: (24..24 + line_count).collect(),
+                ..Default::default()
+            };
+            let program = ir::Program::new(ShaderStage::Compute);
+            let mut ctx =
+                SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+            ctx.define_mesh_shared_memory(&mesh);
+            assert_eq!(ctx.mesh_primitive_base, expected_base);
+            assert_eq!(ctx.mesh_attribute_words, expected_words);
+            assert_eq!(ctx.mesh_map_bytes, 580);
+            assert_mesh_workgroup_variable(&ctx, ctx.mesh_attributes, Some(expected_words));
+        }
+    }
+
+    #[test]
+    fn mesh_payload_workgroup_preserves_word_array_without_mesh_extension() {
+        for words in [32, 64, 352, 511 * 32] {
+            let program = ir::Program::new(ShaderStage::Compute);
+            let mut ctx =
+                SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+            ctx.define_mesh_payload_workgroup(words);
+            assert_eq!(ctx.mesh_payload_words, words);
+            assert_mesh_workgroup_variable(&ctx, ctx.mesh_payload, Some(words));
+            assert!(!has_capability(&ctx, spirv::Capability::MeshShadingEXT));
+            let pointer = ctx
+                .builder
+                .module_ref()
+                .types_global_values
+                .iter()
+                .find(|inst| inst.result_id == Some(ctx.mesh_payload_u32))
+                .unwrap();
+            assert_eq!(
+                pointer.operands,
+                [
+                    Operand::StorageClass(spirv::StorageClass::Workgroup),
+                    Operand::IdRef(ctx.u32_type)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_output_records_match_captured_small_and_large_layouts() {
+        for (vertices, primitives, vertex_lines, primitive_lines, expected) in [
+            (32, 16, 6, 1, (192, 224, 228, 52, 280, 48)),
+            (256, 192, 12, 13, (3072, 5568, 5572, 580, 6152, 576)),
+        ] {
+            let mesh = crate::shader_info::MeshInfo {
+                max_vertices: vertices,
+                max_primitives: primitives,
+                topology: 4,
+                vertex_lines: (0..vertex_lines).collect(),
+                primitive_lines: (0..primitive_lines).collect(),
+                ..Default::default()
+            };
+            let layout = MeshOutputLayout::new(&mesh);
+            assert_eq!(layout.attribute_base, 4); // Complete 16-byte indirect command.
+            assert_eq!(
+                (
+                    layout.primitive_base,
+                    layout.attribute_words,
+                    layout.map_base,
+                    layout.map_words,
+                    layout.stride_words,
+                    layout.vertex_span
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_payload_transport_uses_tightly_packed_u32_storage_buffer() {
+        let program = ir::Program::new(ShaderStage::Compute);
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        ctx.define_mesh_payload_buffer(7);
+        let module = ctx.builder.module_ref();
+        let find = |id| {
+            module
+                .types_global_values
+                .iter()
+                .find(|i| i.result_id == Some(id))
+                .unwrap()
+        };
+        let buffer = find(ctx.mesh_payload_buffer);
+        assert_eq!(
+            buffer.operands,
+            [Operand::StorageClass(spirv::StorageClass::StorageBuffer)]
+        );
+        let pointer = find(buffer.result_type.unwrap());
+        let Operand::IdRef(block_id) = pointer.operands[1] else {
+            panic!("block type")
+        };
+        let block = find(block_id);
+        let [Operand::IdRef(array_id)] = block.operands.as_slice() else {
+            panic!("single member")
+        };
+        let array = find(*array_id);
+        assert_eq!(array.class.opcode, spirv::Op::TypeRuntimeArray);
+        assert_eq!(array.operands, [Operand::IdRef(ctx.u32_type)]);
+        for expected in [
+            vec![
+                Operand::IdRef(*array_id),
+                Operand::Decoration(spirv::Decoration::ArrayStride),
+                Operand::LiteralBit32(4),
+            ],
+            vec![
+                Operand::IdRef(block_id),
+                Operand::Decoration(spirv::Decoration::Block),
+            ],
+            vec![
+                Operand::IdRef(block_id),
+                Operand::LiteralBit32(0),
+                Operand::Decoration(spirv::Decoration::Offset),
+                Operand::LiteralBit32(0),
+            ],
+            vec![
+                Operand::IdRef(ctx.mesh_payload_buffer),
+                Operand::Decoration(spirv::Decoration::DescriptorSet),
+                Operand::LiteralBit32(0),
+            ],
+            vec![
+                Operand::IdRef(ctx.mesh_payload_buffer),
+                Operand::Decoration(spirv::Decoration::Binding),
+                Operand::LiteralBit32(7),
+            ],
+        ] {
+            assert!(module.annotations.iter().any(|i| i.operands == expected));
+        }
+        assert!(ctx.interfaces.contains(&ctx.mesh_payload_buffer));
+        assert_eq!(
+            find(ctx.mesh_payload_buffer_u32).operands,
+            [
+                Operand::StorageClass(spirv::StorageClass::StorageBuffer),
+                Operand::IdRef(ctx.u32_type)
+            ]
+        );
+    }
+
+    fn assert_mesh_workgroup_variable(ctx: &SpirvEmitContext, id: u32, words: Option<u32>) {
+        let instructions = &ctx.builder.module_ref().types_global_values;
+        let find = |id| {
+            instructions
+                .iter()
+                .find(|inst| inst.result_id == Some(id))
+                .unwrap()
+        };
+        let variable = find(id);
+        assert_eq!(variable.class.opcode, spirv::Op::Variable);
+        // No initializer: prologue initializes only the primitive count.
+        assert_eq!(
+            variable.operands,
+            [Operand::StorageClass(spirv::StorageClass::Workgroup)]
+        );
+        assert!(ctx.interfaces.contains(&id));
+        let pointer = find(variable.result_type.unwrap());
+        assert_eq!(pointer.class.opcode, spirv::Op::TypePointer);
+        assert_eq!(
+            pointer.operands[0],
+            Operand::StorageClass(spirv::StorageClass::Workgroup)
+        );
+        let Operand::IdRef(value_type) = pointer.operands[1] else {
+            panic!("pointer type")
+        };
+        if let Some(words) = words {
+            let array = find(value_type);
+            assert_eq!(array.class.opcode, spirv::Op::TypeArray);
+            assert_eq!(array.operands[0], Operand::IdRef(ctx.u32_type));
+            let Operand::IdRef(length) = array.operands[1] else {
+                panic!("array length")
+            };
+            assert_eq!(find(length).operands, [Operand::LiteralBit32(words)]);
+        } else {
+            assert_eq!(value_type, ctx.u32_type);
+        }
+    }
 
     fn has_capability(ctx: &SpirvEmitContext, capability: spirv::Capability) -> bool {
         ctx.builder

@@ -14,7 +14,7 @@ pub type Vector = [u64; 2];
 
 const RESERVATION_GRANULE_MASK: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const INVALID_EXCLUSIVE_ADDRESS: u64 = 0xDEAD_DEAD_DEAD_DEAD;
-const MAX_NUM_CPU_CORES: usize = 4;
+const MAX_NUM_CPU_CORES: usize = 6; // eden-nx2: capacity for Switch 2 application cores.
 
 /// Multi-core exclusive monitor.
 ///
@@ -155,6 +155,26 @@ unsafe impl Sync for ExclusiveMonitor {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn six_core_reservations_invalidate_across_all_cores() {
+        let mut monitor = ExclusiveMonitor::new(6);
+        assert_eq!(monitor.get_processor_count(), 6);
+        for core in 0..6 {
+            monitor.read_and_mark::<u64>(core, 0x1000, || core as u64);
+        }
+        assert!(monitor.do_exclusive_operation::<u64>(5, 0x1000, |saved| saved == 5));
+        for core in 0..6 {
+            assert!(!monitor.do_exclusive_operation::<u64>(core, 0x1000, |_| {
+                panic!("all matching reservations must have been cleared")
+            }));
+        }
+        monitor.read_and_mark::<u64>(4, 0x2000, || 42);
+        monitor.read_and_mark::<u64>(5, 0x3000, || 43);
+        monitor.clear_processor(4);
+        assert!(!monitor.do_exclusive_operation::<u64>(4, 0x2000, |_| true));
+        assert!(monitor.do_exclusive_operation::<u64>(5, 0x3000, |saved| saved == 43));
+    }
 
     #[test]
     fn test_basic_exclusive_rw() {

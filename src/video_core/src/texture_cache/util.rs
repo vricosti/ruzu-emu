@@ -865,8 +865,10 @@ pub fn is_valid_entry_with_range_valid(
 /// backend `Image::UploadMemory` path and returns the matching
 /// `BufferImageCopy` list. The caller owns the GPU-memory read; `input` starts
 /// at `gpu_addr` and contains the image's guest-layout bytes.
+/// `native_tiling` snapshots the same MemoryManager::UsesNativeTiling value
+/// as upstream without acquiring a second lock during cache callbacks.
 pub fn unswizzle_image(
-    _gpu_memory: &(),
+    native_tiling: bool,
     _gpu_addr: GPUVAddr,
     info: &ImageInfo,
     input: &[u8],
@@ -966,7 +968,7 @@ pub fn unswizzle_image(
                 num_tiles.depth,
                 block.height,
                 block.depth,
-                stride_alignment,
+                stride_alignment, native_tiling,
             );
             guest_layer_offset += layer_stride as usize;
             host_offset = host_offset.wrapping_add(host_bytes_per_layer);
@@ -1262,6 +1264,7 @@ fn swizzle_pitch_linear_image(
 
 /// Port of `SwizzleBlockLinearImage`.
 fn swizzle_block_linear_image(
+    native_tiling: bool,
     guest_memory_reader: &dyn Fn(u64, &mut [u8]),
     guest_memory_writer: &dyn Fn(u64, &[u8]),
     gpu_addr: GPUVAddr,
@@ -1320,7 +1323,7 @@ fn swizzle_block_linear_image(
             num_tiles.depth,
             block.height,
             block.depth,
-            1,
+            1, native_tiling,
         );
         guest_memory_writer(gpu_addr.wrapping_add(guest_offset), tmp_buffer);
 
@@ -1337,7 +1340,10 @@ fn swizzle_block_linear_image(
 /// Upstream reads and writes through `Tegra::MemoryManager& gpu_memory`.
 /// The paired callbacks preserve the same `UnsafeReadWrite` contract when a
 /// block-linear subresource has padding that must survive the writeback.
+/// The caller supplies UsesNativeTiling from that same memory manager; keeping
+/// the flag alongside the callbacks avoids relocking an already-held channel.
 pub fn swizzle_image(
+    native_tiling: bool,
     guest_memory_reader: &dyn Fn(u64, &mut [u8]),
     guest_memory_writer: &dyn Fn(u64, &[u8]),
     gpu_addr: GPUVAddr,
@@ -1356,6 +1362,7 @@ pub fn swizzle_image(
             swizzle_pitch_linear_image(guest_memory_writer, gpu_addr, info, copy, memory);
         } else {
             swizzle_block_linear_image(
+                native_tiling,
                 guest_memory_reader,
                 guest_memory_writer,
                 gpu_addr,
@@ -1799,6 +1806,13 @@ pub fn deduce_blit_images(
 /// Port of `MapSizeBytes`.
 pub fn map_size_bytes(image: &ImageBase) -> u32 {
     use super::image_base::ImageFlagBits;
+    if image.flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) && image.host_level_offset != 0 {
+        let uploads = full_upload_swizzles(&image.info);
+        let tail = image.info.layer_stride.wrapping_sub(
+            uploads[image.host_level_offset as usize].buffer_offset as u32,
+        );
+        return tail.wrapping_mul(image.info.resources.layers as u32);
+    }
     if image.flags.contains(ImageFlagBits::ACCELERATED_UPLOAD) {
         image.guest_size_bytes
     } else if image.flags.contains(ImageFlagBits::CONVERTED) {
@@ -1810,6 +1824,30 @@ pub fn map_size_bytes(image: &ImageBase) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trimmed_mip_map_size_preserves_upload_priority_and_layer_tails() {
+        use crate::texture_cache::image_base::ImageFlagBits;
+        let mut info = super::ImageInfo::default();
+        info.format = super::PixelFormat::A8B8G8R8Unorm;
+        info.image_type = super::ImageType::E2D;
+        info.size = super::Extent3D { width: 64, height: 64, depth: 1 };
+        info.resources = super::SubresourceExtent { levels: 3, layers: 4 };
+        info.layer_stride = 0x6000;
+        let mut image = super::ImageBase::new(info, 0x10000, 0x20000);
+        assert_eq!(image.host_level_offset, 0);
+        image.flags = ImageFlagBits::ACCELERATED_UPLOAD | ImageFlagBits::CONVERTED;
+        assert_eq!(super::map_size_bytes(&image), image.guest_size_bytes);
+        // 64x64 RGBA8 consumes0x4000 bytes; the32x32 mip consumes0x1000.
+        image.host_level_offset = 1;
+        assert_eq!(super::map_size_bytes(&image), 0x2000 * 4);
+        image.host_level_offset = 2;
+        assert_eq!(super::map_size_bytes(&image), 0x1000 * 4);
+        image.flags.remove(ImageFlagBits::ACCELERATED_UPLOAD);
+        assert_eq!(super::map_size_bytes(&image), image.converted_size_bytes);
+        image.flags.remove(ImageFlagBits::CONVERTED);
+        assert_eq!(super::map_size_bytes(&image), image.unswizzled_size_bytes);
+        assert_eq!(ImageFlagBits::TRIMMED_LEVELS.bits(), 1 << 19);
+    }
     use super::*;
     use crate::texture_cache::image_info::TilingMode;
     use crate::textures::texture::{ComponentType, TextureFormat, TextureType, TicEntry};
@@ -1931,6 +1969,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 1,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -1969,6 +2008,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0x400,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -1998,6 +2038,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2027,6 +2068,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2124,6 +2166,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2158,6 +2201,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2185,6 +2229,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2498,6 +2543,43 @@ mod tests {
     }
 
     #[test]
+    fn native_image_conversion_matches_gob_byte_layout_and_preserves_padding() {
+        let info = ImageInfo {
+            format: PixelFormat::A8B8G8R8Unorm,
+            image_type: ImageType::E2D,
+            resources: SubresourceExtent { levels: 1, layers: 1 },
+            size: Extent3D { width: 12, height: 8, depth: 1 },
+            num_samples: 1,
+            ..ImageInfo::default()
+        };
+        let copies = full_download_copies(&info);
+        let linear: Vec<u8> = (0..384).map(|i| (i * 17 + i / 48) as u8).collect();
+        for native in [false, true] {
+            let mut expected = vec![0xa5; 512];
+            // Independent byte-coordinate formula for a 64-byte by 8-row GOB.
+            for y in 0..8usize {
+                for x in 0..48usize {
+                    let legacy = (x / 32) * 256 + (y / 2) * 64
+                        + ((x % 32) / 16) * 32 + (y % 2) * 16 + x % 16;
+                    let address = if native {
+                        (legacy & !0x60) | ((legacy & 0x20) << 1) | ((legacy & 0x40) >> 1)
+                    } else { legacy };
+                    expected[address] = linear[y * 48 + x];
+                }
+            }
+            let written = Mutex::new(Vec::new());
+            swizzle_image(native, &|_, dst| dst.fill(0xa5),
+                &|addr, bytes| { assert_eq!(addr, 0x1000); *written.lock().unwrap() = bytes.to_vec(); },
+                0x1000, &info, &copies, &linear, &mut ScratchBuffer::new());
+            assert_eq!(*written.lock().unwrap(), expected);
+            let mut output = vec![0; linear.len()];
+            let uploads = unswizzle_image(native, 0x1000, &info, &expected, &mut output);
+            assert_eq!(uploads.len(), 1);
+            assert_eq!(output, linear);
+        }
+    }
+
+    #[test]
     fn swizzle_image_pitch_linear_writes_rows_to_guest() {
         let writes = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
         let writes_for_callback = Arc::clone(&writes);
@@ -2525,6 +2607,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2554,6 +2637,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0),
             &writer,
             0x1000,
@@ -2597,6 +2681,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2624,6 +2709,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0),
             &writer,
             0x1000,
@@ -2670,6 +2756,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2681,6 +2768,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0),
             &writer,
             0x4000,
@@ -2749,6 +2837,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0x4000,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2760,6 +2849,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0xa5),
             &writer,
             0x4000,
@@ -2800,6 +2890,7 @@ mod tests {
                 depth: 0,
             }),
             tile_width_spacing: 2,
+            native_tiling: false,
             ..ImageInfo::default()
         };
         let copies = full_download_copies(&info);
@@ -2811,6 +2902,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0xa5),
             &writer,
             0x4000,
@@ -2832,7 +2924,7 @@ mod tests {
             num_tiles.depth,
             block.height,
             block.depth,
-            1,
+            1, false,
         );
         let mut non_upstream = vec![0xa5; guest_size];
         crate::textures::decoders::swizzle_texture(
@@ -2844,7 +2936,7 @@ mod tests {
             num_tiles.depth,
             block.height,
             block.depth,
-            calculate_level_stride_alignment(&info, 0),
+            calculate_level_stride_alignment(&info, 0), false,
         );
 
         assert_eq!(*written.lock().unwrap(), expected);
@@ -2875,6 +2967,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2887,6 +2980,7 @@ mod tests {
         let mut tmp = ScratchBuffer::new();
 
         swizzle_image(
+            false,
             &|_, output| output.fill(0),
             &writer,
             0x4000,
@@ -2920,6 +3014,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2939,11 +3034,11 @@ mod tests {
             params[0].num_tiles.depth,
             params[0].block.height,
             params[0].block.depth,
-            alignment,
+            alignment, false,
         );
 
         let mut output = vec![0; 64];
-        let copies = unswizzle_image(&(), 0, &info, &input, &mut output);
+        let copies = unswizzle_image(false, 0, &info, &input, &mut output);
 
         assert_eq!(copies.len(), 1);
         assert_eq!(copies[0].buffer_size, 64);
@@ -2982,6 +3077,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -2990,7 +3086,7 @@ mod tests {
         };
         let input = vec![0x5a; calculate_guest_size_in_bytes(&info) as usize];
         let mut output = vec![0; calculate_unswizzled_size_bytes(&info) as usize];
-        let copies = unswizzle_image(&(), 0, &info, &input, &mut output);
+        let copies = unswizzle_image(false, 0, &info, &input, &mut output);
 
         assert_eq!(copies.len(), 4);
         assert_eq!(copies[0].image_extent.width, 8);
@@ -3030,6 +3126,7 @@ mod tests {
             maybe_unaligned_layer_stride: 0,
             num_samples: 1,
             tile_width_spacing: 0,
+            native_tiling: false,
             rescaleable: false,
             downscaleable: false,
             forced_flushed: false,
@@ -3055,7 +3152,7 @@ mod tests {
         input[layer_stride as usize..layer_stride as usize + level_sizes[0] as usize].fill(0x22);
         let mut output = vec![0; calculate_unswizzled_size_bytes(&info) as usize];
 
-        let copies = unswizzle_image(&(), 0, &info, &input, &mut output);
+        let copies = unswizzle_image(false, 0, &info, &input, &mut output);
 
         assert_eq!(copies.len(), 1);
         assert_eq!(copies[0].buffer_size, (host_bytes_per_layer * 2) as usize);

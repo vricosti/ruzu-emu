@@ -27,7 +27,15 @@ pub mod host1x;
 pub mod host_shaders;
 pub mod invalidation_accumulator;
 pub mod r#macro;
+pub mod macro_memo;
+pub mod macro_turing;
+#[cfg(target_arch = "x86_64")]
+pub mod macro_turing_jit;
 pub mod memory_manager;
+pub mod native_qmd;
+pub mod native_query_trace;
+pub mod nx2;
+pub mod nx2_profile;
 pub mod present;
 pub mod pte_kind;
 pub mod query_cache;

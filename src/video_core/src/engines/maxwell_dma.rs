@@ -566,6 +566,7 @@ impl MaxwellDMA {
             block_height,
             block_depth,
             dst_pitch,
+            self.memory_manager.lock().uses_native_tiling(),
         );
 
         Some(vec![PendingWrite {
@@ -668,6 +669,7 @@ impl MaxwellDMA {
             block_height,
             block_depth,
             self.pitch_in(),
+            self.memory_manager.lock().uses_native_tiling(),
         );
 
         Some(vec![PendingWrite {
@@ -759,6 +761,7 @@ impl MaxwellDMA {
             src_params.block_size.height(),
             src_params.block_size.depth(),
             pitch,
+            self.memory_manager.lock().uses_native_tiling(),
         );
         swizzle_subrect(
             &mut dst,
@@ -774,6 +777,7 @@ impl MaxwellDMA {
             dst_params.block_size.height(),
             dst_params.block_size.depth(),
             pitch,
+            self.memory_manager.lock().uses_native_tiling(),
         );
 
         Some(vec![PendingWrite {

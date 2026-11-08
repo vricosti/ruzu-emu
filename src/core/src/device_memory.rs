@@ -122,7 +122,8 @@ mod tests {
             (MemoryLayout::Memory6Gb, 6),
             (MemoryLayout::Memory8Gb, 8),
             (MemoryLayout::Memory10Gb, 10),
-            (MemoryLayout::Memory12Gb, 12),
+            // Eden-NX2 reserves another 8 GiB for graphics-server allocations.
+            (MemoryLayout::Memory12Gb, 20),
             (MemoryLayout::Memory4Gb, 4),
         ] {
             {

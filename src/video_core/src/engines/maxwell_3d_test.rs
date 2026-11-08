@@ -56,6 +56,8 @@ fn new_descriptor_owner_backed_engine(backing: &[u8], device_addr: u64) -> Maxwe
 
 #[derive(Default, Clone)]
 struct RasterizerCalls {
+    flush_write: Option<(usize, u32)>,
+    flushes: Vec<(u64, u64, crate::cache_types::CacheType)>,
     wait_for_idle: u32,
     draw_texture: u32,
     clear_layers: Vec<u32>,
@@ -184,14 +186,22 @@ impl RasterizerInterface for TestRasterizer {
     fn signal_reference(&mut self) {}
     fn release_fences(&mut self, _force: bool) {}
     fn flush_all(&mut self) {}
-    fn flush_region(&mut self, _addr: u64, _size: u64, _which: crate::cache_types::CacheType) {}
+    fn flush_region(&mut self, addr: u64, size: u64, which: crate::cache_types::CacheType) {
+        let mut calls = self.calls.lock().unwrap();
+        if let Some((pointer, value)) = calls.flush_write {
+            calls.flushes.push((addr, size, which));
+            // The native DMA test keeps this backing alive until the rasterizer
+            // is dropped. Simulate a host buffer becoming visible on flush.
+            unsafe { std::ptr::write_unaligned(pointer as *mut u32, value); }
+        }
+    }
     fn must_flush_region(
         &self,
         _addr: u64,
         _size: u64,
         _which: crate::cache_types::CacheType,
     ) -> bool {
-        false
+        self.calls.lock().unwrap().flush_write.is_some()
     }
     fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
         RasterizerDownloadArea {
@@ -1259,6 +1269,21 @@ fn shader_config_enabled_matches_upstream_vertexb_and_enable_bit() {
     assert!(!engine.shader_config_enabled(ShaderStageType::Invalid));
 }
 
+#[test]
+fn mesh_control_matches_upstream_register_offsets_and_enable_bit() {
+    assert_eq!([MESH_CONTROL, MESH_SHADER_A, MESH_SHADER_B, MESH_INIT_SHADER],
+        [0x453, 0x454, 0x455, 0x456]);
+    let mut engine = Maxwell3D::new();
+    assert!(!engine.is_mesh_enabled());
+    for value in [0, 1, 2, 3, 0xffff_fffe, u32::MAX] {
+        engine.regs[MESH_CONTROL as usize] = value;
+        engine.regs[MESH_SHADER_A as usize] = !value;
+        engine.regs[MESH_SHADER_B as usize] = !value;
+        engine.regs[MESH_INIT_SHADER as usize] = !value;
+        assert_eq!(engine.is_mesh_enabled(), value & 1 != 0);
+    }
+}
+
 // ── Color mask tests ────────────────────────────────────────────────
 
 #[test]
@@ -2040,25 +2065,29 @@ fn test_general_draw_has_instance_count_one() {
 }
 
 #[test]
-fn test_instanced_draw_submits_each_end() {
+fn test_instanced_draw_defers_end_until_explicit_flush() {
     let mut engine = Maxwell3D::new();
     let subsequent = 4 | (1 << 26); // Triangles + Subsequent
 
-    // Each Subsequent BEGIN+END completes one instance immediately.
+    // Subsequent END does not submit. The batch includes the initial instance.
     for _ in 0..3 {
         engine.write_reg(DRAW_BEGIN, subsequent);
         engine.write_reg(DRAW_END, 0);
     }
 
-    let draws = engine.take_draw_calls();
-    assert_eq!(draws.len(), 3);
-    assert!(draws.iter().all(|draw| draw.instance_count == 1));
-    assert_eq!(draws.iter().map(|draw| draw.base_instance).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert!(engine.take_draw_calls().is_empty());
     assert_eq!(engine.draw_manager_state().instance_count, 3);
+    engine.with_draw_manager(|manager, this| manager.draw_deferred(this));
+    let draws = engine.take_draw_calls();
+    assert_eq!(draws.len(), 1);
+    assert_eq!((draws[0].instance_count, draws[0].base_instance), (4, 0));
+    assert_eq!(engine.draw_manager_state().instance_count, 0);
+    engine.with_draw_manager(|manager, this| manager.draw_deferred(this));
+    assert!(engine.take_draw_calls().is_empty());
 }
 
 #[test]
-fn test_instanced_draw_does_not_redraw_on_first() {
+fn test_instanced_draw_flushes_before_first_changes_topology() {
     let mut engine = Maxwell3D::new();
     let subsequent = 4 | (1 << 26);
 
@@ -2067,12 +2096,14 @@ fn test_instanced_draw_does_not_redraw_on_first() {
         engine.write_reg(DRAW_BEGIN, subsequent);
         engine.write_reg(DRAW_END, 0);
     }
-    assert_eq!(engine.take_draw_calls().len(), 3);
+    assert!(engine.take_draw_calls().is_empty());
 
-    // BEGIN(First) resets the instance index without redrawing completed work.
-    engine.write_reg(DRAW_BEGIN, 4); // First (bits[27:26]=0)
+    // BEGIN(First) flushes using the previous topology before resetting state.
+    engine.write_reg(DRAW_BEGIN, 5); // First (bits[27:26]=0)
     let draws = engine.take_draw_calls();
-    assert!(draws.is_empty());
+    assert_eq!(draws.len(), 1);
+    assert_eq!(draws[0].instance_count, 4);
+    assert_eq!(draws[0].topology, dm::PrimitiveTopology::Triangles);
 }
 
 #[test]
@@ -2099,7 +2130,7 @@ fn test_instance_count_resets_on_first() {
 }
 
 #[test]
-fn direct_instances_keep_the_shader_active_at_draw_end() {
+fn deferred_instances_capture_registers_at_flush() {
     let mut engine = Maxwell3D::new();
     let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
     let rasterizer = TestRasterizer::new(calls.clone());
@@ -2116,19 +2147,17 @@ fn direct_instances_keep_the_shader_active_at_draw_end() {
     engine.write_reg(DRAW_BEGIN, 4 | (1 << 26));
     engine.write_reg(DRAW_END, 0);
 
-    // The next command sequence may replace the shader before its next BEGIN.
-    // Neither instance of the completed sequence may use that replacement.
+    // Upstream reads live registers when flushing the deferred batch, while
+    // the initial General draw was already submitted at its own END.
     engine.write_reg(vertex + 1, 0x200);
     engine.write_reg(stream + 2, 0x2000);
     engine.write_reg(stream, (1 << 12) | 28);
     engine.write_reg(DRAW_BEGIN, 4);
     let calls = calls.lock().unwrap();
-    assert!(calls.draws.iter().all(|draw| draw.2[1] == 0x100));
-    assert_eq!(calls.draws.iter().map(|draw| draw.0).sum::<u32>(), 2);
-    assert!(calls.draw_registers.iter().all(|registers| {
-        registers.vertex_streams[4].address == 0x1000
-            && registers.vertex_streams[4].stride == 44
-    }));
+    assert_eq!(calls.draws.iter().map(|draw| (draw.0, draw.2[1])).collect::<Vec<_>>(), [(1, 0x100), (2, 0x200)]);
+    assert_eq!(calls.draw_registers.iter().map(|registers| {
+        (registers.vertex_streams[4].address, registers.vertex_streams[4].stride)
+    }).collect::<Vec<_>>(), [(0x1000, 44), (0x2000, 28)]);
 }
 
 #[test]
@@ -2150,10 +2179,9 @@ fn direct_instance_indices_support_first_next_and_unchanged() {
             engine.write_reg(DRAW_END, 0);
         }
         let draws = engine.take_draw_calls();
-        assert_eq!(draws.len(), 4);
-        assert!(draws.iter().all(|draw| draw.instance_count == 1));
-        assert_eq!(draws.iter().map(|draw| draw.base_instance).collect::<Vec<_>>(),
-            vec![42, 43, 43, 42]);
+        assert_eq!(draws.iter().map(|draw| draw.instance_count).collect::<Vec<_>>(),
+            if path == 2 { vec![1, 1, 1, 1] } else { vec![1, 2, 1] });
+        assert!(draws.iter().all(|draw| draw.base_instance == 42));
     }
 }
 
@@ -2780,12 +2808,12 @@ fn test_process_dirty_registers_marks_flags_from_dirty_tables() {
 
     // Upstream ProcessDirtyRegisters marks both table owners even when
     // the value written is identical to the current register value.
-    engine.write_reg(method as u32, 0);
+    engine.process_dirty_registers(method as u32, 0);
     assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
     assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
 
     engine.dirty.flags.fill(false);
-    engine.write_reg(method as u32, 0xCAFE_BABE);
+    engine.process_dirty_registers(method as u32, 0xCAFE_BABE);
     assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
     assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
 }
@@ -2808,8 +2836,8 @@ fn test_call_method_marks_flags_from_dirty_tables() {
     engine.dirty.tables[1][method] = dirty_flags::flags::SHADERS;
 
     engine.call_method(method as u32, 0, true);
-    assert!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize]);
-    assert!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize]);
+    assert_eq!(engine.dirty.flags[dirty_flags::flags::INDEX_BUFFER as usize], !Maxwell3D::skip_same_value_writes());
+    assert_eq!(engine.dirty.flags[dirty_flags::flags::SHADERS as usize], !Maxwell3D::skip_same_value_writes());
 
     engine.dirty.flags.fill(false);
     engine.call_method(method as u32, 0xFEED_FACE, true);
@@ -3129,9 +3157,43 @@ fn draw_manager_instance_arithmetic_wraps_like_upstream_u32() {
 
         draw_manager.draw_state.draw_mode = dm::DrawMode::Instance;
         draw_manager.draw_state.instance_count = u32::MAX;
-        draw_manager.draw_end(this);
-        assert_eq!(draw_manager.draw_state.base_instance, 1);
+        draw_manager.draw_end(this, 1, false);
+        assert_eq!(draw_manager.draw_state.base_instance, u32::MAX, "unforced END leaves deferred state untouched");
+        draw_manager.draw_deferred(this);
+        assert_eq!(draw_manager.draw_state.base_instance, 2);
+        assert_eq!(draw_manager.draw_state.instance_count, 0);
     });
+}
+
+#[test]
+fn macro_completion_flushes_deferred_instances_once() {
+    for explicit_flush in [false, true] {
+        let mut engine = Maxwell3D::new();
+        engine.write_reg(GLOBAL_BASE_INSTANCE_INDEX, 17);
+        engine.write_reg(VB_COUNT, 3);
+        for _ in 0..3 {
+            engine.write_reg(DRAW_BEGIN, 4 | (1 << 26));
+            engine.write_reg(DRAW_END, 0);
+        }
+        assert!(engine.take_draw_calls().is_empty());
+        let exit_nop = 0b1 | (0b001 << 4) | (1 << 7) | (1 << 8);
+        let nop = 0b1 | (0b001 << 4) | (1 << 8);
+        engine.macro_positions[0] = 0x100;
+        engine.macro_engine.add_code(0x100, exit_nop);
+        engine.macro_engine.add_code(0x100, nop);
+        for expected_draws in [1, 0] {
+            engine.macro_params = vec![0];
+            engine.executing_macro = MACRO_REGISTERS_START;
+            if explicit_flush { engine.flush_macro(); }
+            else { engine.call_macro_method(MACRO_REGISTERS_START); }
+            let draws = engine.take_draw_calls();
+            assert_eq!(draws.len(), expected_draws);
+            if let Some(draw) = draws.first() {
+                assert_eq!((draw.instance_count, draw.base_instance), (4, 17));
+            }
+            assert_eq!(engine.draw_manager_state().instance_count, 0);
+        }
+    }
 }
 
 #[test]
@@ -3314,6 +3376,20 @@ fn test_process_cb_multi_data_writes_through_memory_manager() {
     );
     assert_eq!(*writes.lock().unwrap(), 0);
     assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 8);
+
+    // WriteBlockCached accepts a byte address, including unaligned offsets.
+    // Single-word and bulk paths must preserve all bit patterns and neighbors.
+    engine.call_method(CB_CONFIG_BASE + 3, 0x23, true);
+    engine.process_cb_data(0x80ff_017f);
+    engine.process_cb_multi_data(&[0xffff_ffff, 0]);
+    engine.process_cb_multi_data(&[]);
+    memory_manager.lock().flush_caching();
+    assert_eq!(engine.regs[(CB_CONFIG_BASE + 3) as usize], 0x2f);
+    assert_eq!(
+        &backing[0x22..0x30],
+        &[0, 0x7f, 1, 0xff, 0x80, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(*writes.lock().unwrap(), 0);
 }
 
 #[test]
@@ -4214,4 +4290,411 @@ fn test_call_method_report_semaphore() {
     assert_eq!(writes[0].data.len(), 4);
     let payload = u32::from_le_bytes(writes[0].data[..4].try_into().unwrap());
     assert_eq!(payload, 0xCAFE);
+}
+
+#[test]
+fn native_partial_inline_upload_flushes_only_new_bytes_and_resets_on_exec() {
+    let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+    let rasterizer = Box::new(TestRasterizer::new(Arc::clone(&calls)));
+    let mut state = engine_upload::State::new();
+    state.bind_rasterizer(rasterizer.as_ref());
+    state.set_native_partial_transfers(true);
+    let regs = engine_upload::Registers { line_length_in: 14, line_count: 1,
+        dest: engine_upload::DestRegisters {address_low:0x1000,..Default::default()},..Default::default() };
+    state.process_exec(&regs,true);
+    state.process_data_word(&regs,0x11223344,false);
+    assert!(calls.lock().unwrap().inline_to_memory.is_empty());
+    state.process_data_word(&regs,0x55667788,true);
+    state.process_data_multi(&regs,&[0x99aabbcc]);
+    state.process_data_word(&regs,0xddeeff00,true);
+    // Already full: no additional rasterizer calls.
+    state.process_data_multi(&regs,&[u32::MAX]);
+    state.process_data_word(&regs,u32::MAX,true);
+    let writes=calls.lock().unwrap().inline_to_memory.clone();
+    assert_eq!(writes,vec![
+        (0x1000,8,[0x11223344u32.to_ne_bytes(),0x55667788u32.to_ne_bytes()].concat()),
+        (0x1008,4,0x99aabbccu32.to_ne_bytes().to_vec()),
+        (0x100c,2,0xddeeff00u32.to_ne_bytes()[..2].to_vec()),
+    ]);
+    state.process_exec(&regs,true);
+    state.process_data_multi(&regs,&[1,2,3,4,5]);
+    let last=calls.lock().unwrap().inline_to_memory.last().unwrap().clone();
+    assert_eq!((last.0,last.1),(0x1000,14));
+    assert_eq!(last.2,[1u32,2,3,4].iter().flat_map(|w|w.to_ne_bytes()).take(14).collect::<Vec<_>>());
+}
+
+#[test]
+fn native_partial_inline_upload_retains_legacy_multi_line_behavior() {
+    let calls=Arc::new(Mutex::new(RasterizerCalls::default()));
+    let rasterizer=Box::new(TestRasterizer::new(Arc::clone(&calls)));
+    let mut state=engine_upload::State::new();state.bind_rasterizer(rasterizer.as_ref());
+    state.set_native_partial_transfers(true);
+    let regs=engine_upload::Registers {line_length_in:4,line_count:2,
+        dest:engine_upload::DestRegisters {address_low:0x2000,pitch:16,..Default::default()},..Default::default()};
+    state.process_exec(&regs,true);state.process_data_multi(&regs,&[7,8]);
+    assert_eq!(calls.lock().unwrap().inline_to_memory,vec![(0x2000,4,7u32.to_ne_bytes().to_vec()),(0x2010,4,8u32.to_ne_bytes().to_vec())]);
+}
+
+#[test]
+fn native_macro_data_ram_is_zeroed_persistent_and_isolated_between_channels() {
+    let memory = Arc::new(parking_lot::Mutex::new(
+        crate::memory_manager::MemoryManager::new_with_geometry(1, 32, 0x1_0000_0000, 16, 12),
+    ));
+    let first = Maxwell3D::new_with_memory_manager(Arc::clone(&memory));
+    let second = Maxwell3D::new_with_memory_manager(Arc::clone(&memory));
+    assert!(Arc::ptr_eq(first.get_memory_manager(), &memory));
+    assert!(Arc::ptr_eq(second.get_memory_manager(), &memory));
+    assert_eq!(std::mem::size_of_val(&*first.get_native_data_ram().lock()), 0x3000);
+    assert!(first.get_native_data_ram().lock().iter().all(|&word| word == 0));
+    assert!(second.get_native_data_ram().lock().iter().all(|&word| word == 0));
+    assert!(!Arc::ptr_eq(first.get_native_data_ram(), second.get_native_data_ram()));
+    first.get_native_data_ram().lock()[0x27] = 0x12345678;
+    first.get_native_data_ram().lock()[0xbff] = u32::MAX;
+    second.get_native_data_ram().lock()[0x27] = 0xabcdef01;
+    assert_eq!(first.get_native_data_ram().lock()[0x27], 0x12345678);
+    assert_eq!(first.get_native_data_ram().lock()[0xbff], u32::MAX);
+    assert_eq!(second.get_native_data_ram().lock()[0x27], 0xabcdef01);
+    assert_eq!(second.get_native_data_ram().lock()[0xbff], 0);
+}
+
+#[test]
+fn native_macro_ram_borrow_allows_emitted_engine_method_without_aliasing() {
+    let mut engine = Maxwell3D::new();
+    let ram_handle = Arc::clone(engine.get_native_data_ram());
+    let mut ram = ram_handle.lock();
+    // Two ADD-zero instructions; first sets END and emits immediate 0x123.
+    // The second is its termination delay slot. Uploaded order is high first.
+    let mut instruction = 1u128 | (0x123u128 << 30) | (5u128 << 85);
+    for low in [15, 20, 25, 51, 56, 61] { instruction |= 24u128 << low; }
+    let mut delay = 0u128;
+    for low in [15, 20, 25, 51, 56, 61] { delay |= 24u128 << low; }
+    let code = [
+        (instruction >> 64) as u32, (instruction >> 32) as u32, instruction as u32,
+        (delay >> 64) as u32, (delay >> 32) as u32, delay as u32,
+    ];
+    let result = crate::macro_turing::TuringMacroInterpreter::default().execute(
+        &code, 0, &mut vec![], |_| 0,
+        |_, value, _, active_ram| {
+            // The engine can be borrowed safely while its external RAM guard
+            // stays live. DMA updates use the explicit callback reborrow.
+            engine.call_method(LOAD_MME_INSTRUCTION_PTR, value, true);
+            active_ram[0x27] = value;
+            true
+        }, Some(&mut ram),
+    );
+    assert!(result.success, "{result:?}");
+    assert_eq!(ram[0x27], 0x123);
+    assert_eq!(engine.get_register_value(LOAD_MME_INSTRUCTION_PTR), 0x123);
+    drop(ram);
+    assert_eq!(engine.get_native_data_ram().lock()[0x27], 0x123);
+    assert!(Arc::ptr_eq(engine.get_native_data_ram(), &ram_handle));
+}
+
+#[test]
+fn native_macro_execute_refresh_memo_failure_and_live_upload() {
+    const CHILD: &str = "RUZU_NATIVE_EXECUTE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        for (jit, memo) in [("0", "0"), ("0", "1"), ("1", "1")] {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1").env("EDEN_NX2_MME_JIT", jit).env("EDEN_NX2_MME_MEMO", memo)
+                .env_remove("EDEN_NX2_MME_RECORD").env_remove("EDEN_NATIVE_FRAME_CAPTURE")
+                .env_remove("EDEN_NATIVE_DRAW_DIAGNOSTICS")
+                .status().unwrap().success());
+        }
+        return;
+    }
+    fn instruction(method: u32, value: Option<u32>, end: bool) -> [u32; 3] {
+        let mut bits = u128::from(end) | ((method as u128) << 30) | (5u128 << 82);
+        for low in [15, 20, 25, 51, 56, 61] { bits |= 24u128 << low; }
+        if let Some(value) = value { bits |= (value as u128) << 66; bits |= 6u128 << 85; }
+        else { bits |= 3u128 << 85; }
+        [(bits >> 64) as u32, (bits >> 32) as u32, bits as u32]
+    }
+    fn upload(engine: &mut Maxwell3D, code: &[[u32; 3]]) {
+        engine.macro_engine.native_turing = true;
+        engine.macro_engine.clear_code(0);
+        for word in code.iter().flatten() { engine.macro_engine.add_code(0, *word); }
+    }
+    unsafe fn run(engine: &mut Maxwell3D, params: &mut [u32]) {
+        let maxwell = std::ptr::from_mut(engine);
+        MacroEngine::execute_native(std::ptr::addr_of_mut!((*maxwell).macro_engine), maxwell, 0, params, |_| {});
+    }
+    let use_jit = cfg!(target_arch = "x86_64") && std::env::var("EDEN_NX2_MME_JIT").unwrap() != "0";
+    let use_memo = !use_jit && std::env::var("EDEN_NX2_MME_MEMO").unwrap() != "0";
+    // Exercise the actual Maxwell3D callback, not the synthetic refresh
+    // callback below. Upstream RefreshParameters preserves clean FIFO data
+    // even when the segment's backing memory contains a different value.
+    let mut parameter_backing = vec![0u8; 0x1000];
+    parameter_backing[..4].copy_from_slice(&73u32.to_ne_bytes());
+    let mut parameter_engine = new_descriptor_owner_backed_engine(&parameter_backing, 0x4000);
+    upload(&mut parameter_engine, &[
+        instruction(0x123, None, true), instruction(0x124, Some(99), false),
+    ]);
+    assert!(common::settings::is_gpu_level_high(&common::settings::values()));
+    for (dirty, expected) in [(false, 42), (true, 73), (false, 42)] {
+        parameter_engine.macro_params = vec![42];
+        parameter_engine.macro_segments = vec![(0x4000, 1)];
+        parameter_engine.current_macro_dirty = dirty;
+        parameter_engine.call_macro_method(MACRO_REGISTERS_START);
+        assert_eq!(parameter_engine.get_register_value(0x123), expected);
+        assert!(!parameter_engine.macro_engine.native_execution_failed);
+        assert!(!parameter_engine.current_macro_dirty);
+        assert!(parameter_engine.macro_params.is_empty());
+        assert!(parameter_engine.macro_segments.is_empty());
+    }
+    let mut engine = Maxwell3D::new();
+    // Immediate second instruction is the source's termination delay slot.
+    upload(&mut engine, &[instruction(0x123, None, true), instruction(0x124, Some(99), false)]);
+    let maxwell = std::ptr::from_mut(&mut engine);
+    let mut params = [0];
+    unsafe {
+        MacroEngine::execute_native(std::ptr::addr_of_mut!((*maxwell).macro_engine), maxwell, 0, &mut params, |values| values[0] = 42);
+    }
+    assert!(!engine.macro_engine.native_execution_failed);
+    assert_eq!((engine.get_register_value(0x123), engine.get_register_value(0x124)), (42, 99));
+    engine.regs[0x123] = 0;
+    unsafe { run(&mut engine, &mut [42]); }
+    assert_eq!(engine.get_register_value(0x123), 42);
+    assert_eq!(engine.macro_engine.native_memo.get_statistics().hits, u64::from(use_memo));
+    // Modify a not-yet-executed instruction through actual upload methods.
+    // Interpreter observes it immediately; JIT uses its already compiled code.
+    let replacement = instruction(0x123, Some(77), true);
+    upload(&mut engine, &[
+        instruction(LOAD_MME_INSTRUCTION_PTR, None, false),
+        instruction(LOAD_MME_INSTRUCTION, None, false),
+        instruction(LOAD_MME_INSTRUCTION, None, false),
+        instruction(LOAD_MME_INSTRUCTION, None, false),
+        instruction(0x123, None, true), instruction(0x124, Some(98), false),
+    ]);
+    let generation = engine.macro_engine.native_code_generation;
+    let stores = engine.macro_engine.native_memo.get_statistics().stores;
+    unsafe { run(&mut engine, &mut [4, replacement[0], replacement[1], replacement[2], 11]); }
+    assert!(!engine.macro_engine.native_execution_failed);
+    assert_eq!(engine.get_register_value(0x123), if use_jit { 11 } else { 77 });
+    assert_eq!(engine.macro_engine.native_code_generation, generation + 3);
+    assert_eq!(engine.macro_engine.native_memo.get_statistics().stores, stores);
+    assert_eq!(&engine.macro_engine.native_code[12..15], &replacement);
+    // Unsupported emitted macro methods fail and leave the sticky failure flag.
+    upload(&mut engine, &[instruction(0xe00, Some(1), true), instruction(0x124, Some(1), false)]);
+    unsafe { run(&mut engine, &mut []); }
+    assert!(engine.macro_engine.native_execution_failed);
+
+    let mut backing = vec![0u8; 0x6000];
+    backing[4..8].copy_from_slice(&0x87654321u32.to_le_bytes());
+    let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+    calls.lock().unwrap().flush_write = Some((backing.as_mut_ptr() as usize, 0x12345678));
+    let rasterizer = TestRasterizer::new(Arc::clone(&calls));
+    let mut dma = new_descriptor_owner_backed_engine(&backing, 0x4000);
+    dma.get_memory_manager().lock().bind_rasterizer(&rasterizer);
+    upload(&mut dma, &[
+        instruction(0x154, Some(0), false), instruction(0x155, Some(0x4000), false),
+        instruction(0x156, Some(0xbff), false), instruction(0x157, Some(2), false),
+        instruction(0x158, Some(0x1001), false), instruction(0x123, None, true),
+        instruction(0x124, None, false),
+    ]);
+    unsafe { run(&mut dma, &mut []); }
+    assert!(!dma.macro_engine.native_execution_failed);
+    assert_eq!(dma.get_register_value(0x123), 0x12345678, "flush must precede DMA reads");
+    assert_eq!(dma.get_register_value(0x124), 0x87654321);
+    assert_eq!(dma.get_native_data_ram().lock()[0xbff], 0x12345678);
+    assert_eq!(dma.get_native_data_ram().lock()[0], 0, "RAM overflow must not wrap");
+    assert_eq!(dma.macro_engine.native_fifo.len(), 0x1000, "DMA count clamp");
+    assert_eq!(dma.macro_engine.native_memo.size(), 0, "DMA calls must not be memoized");
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.flushes[0], (0x4000, 8, crate::cache_types::CacheType::BUFFER_CACHE));
+    assert!(calls.flushes.iter().all(|(_, _, cache)| *cache == crate::cache_types::CacheType::BUFFER_CACHE));
+}
+
+#[test]
+fn shared_native_context_routes_uploads_bindings_execution_and_channel_ram() {
+    const CHILD: &str = "RUZU_SHARED_NATIVE_CONTEXT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        for jit in ["0", "1"] {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1").env("EDEN_NX2_MME_JIT", jit)
+                .env_remove("EDEN_NX2_MME_RECORD").env_remove("EDEN_NATIVE_FRAME_CAPTURE")
+                .env_remove("EDEN_NATIVE_DRAW_DIAGNOSTICS")
+                .status().unwrap().success());
+        }
+        return;
+    }
+    fn encode(fields: &[(usize, u32)]) -> [u32; 3] {
+        let mut bits = 0u128;
+        for low in [15, 20, 25, 51, 56, 61] { bits |= 24u128 << low; }
+        for &(low, value) in fields {
+            let width = match low { 0 => 1, 30 | 66 => 16, 82 | 89 => 3, 85 | 92 => 4, _ => 5 };
+            let mask = ((1u128 << width) - 1) << low;
+            bits = (bits & !mask) | ((value as u128) << low);
+        }
+        [(bits >> 64) as u32, (bits >> 32) as u32, bits as u32]
+    }
+    let context: SharedNativeMacroContext = Arc::new(parking_lot::ReentrantMutex::new(
+        std::cell::RefCell::new(crate::r#macro::NativeMacroContext::default()),
+    ));
+    let mut first = Maxwell3D::new();
+    let mut second = Maxwell3D::new();
+    first.set_native_macro_context(Some(Arc::clone(&context)));
+    second.set_native_macro_context(Some(Arc::clone(&context)));
+    assert!(!first.get_native_macro_engine(|engine| engine.native_turing));
+    first.set_native_turing_macro_mode(true);
+    second.set_native_turing_macro_mode(true);
+    assert!(!first.macro_engine.native_turing);
+    assert!(!second.macro_engine.native_turing);
+    assert!(second.get_native_macro_engine(|engine| engine.native_turing));
+    let code = [
+        encode(&[(30, LOAD_MME_INSTRUCTION_PTR), (66, 0x30), (82, 5), (85, 6)]),
+        encode(&[(30, LOAD_MME_INSTRUCTION), (82, 5), (85, 3)]),
+        // DWRITE data RAM[0x27] = 0xbeef, then delayed register output.
+        encode(&[(0, 1), (10, 31), (20, 25), (25, 26), (30, 0x27), (66, 0xbeef)]),
+        encode(&[(30, 0x123), (66, 42), (82, 5), (85, 6)]),
+    ];
+    first.call_method(LOAD_MME_INSTRUCTION_PTR, 0x20, true);
+    for word in code.iter().flatten() { first.call_method(LOAD_MME_INSTRUCTION, *word, true); }
+    first.call_method(LOAD_MME_START_ADDR_PTR, 7, true);
+    first.call_method(LOAD_MME_START_ADDR, 0x20, true);
+    assert_eq!(second.get_native_macro_positions(|positions| positions[7]), 0x20);
+    assert_eq!(first.macro_positions[7], 0);
+    assert_eq!(second.macro_positions[7], 0);
+    first.get_native_macro_engine(|engine| {
+        engine.native_interpreter.dram.fill(0xa5a51234);
+        engine.native_memo.synchronize(engine.native_code_generation);
+        engine.native_memo.store(0x777, &[9], &[], &[], &[(0x123, 88)]);
+    });
+    second.call_method(MACRO_REGISTERS_START + 14, 0xfeedface, true);
+    assert_eq!(second.get_register_value(0x123), 42);
+    assert_eq!(second.get_native_data_ram().lock()[0x27], 0xffffbeef);
+    assert_eq!(first.get_native_data_ram().lock()[0x27], 0);
+    assert_eq!(first.get_register_value(0x123), 0);
+    assert!(second.macro_params.is_empty());
+    assert_eq!(second.executing_macro, 0);
+    first.get_native_macro_engine(|engine| {
+        assert!(!engine.native_execution_failed);
+        // JIT execution must neither synchronize nor probe the interpreter memo.
+        if std::env::var("EDEN_NX2_MME_JIT").as_deref() == Ok("1") {
+            let stats = engine.native_memo.get_statistics();
+            assert_eq!((stats.hits, stats.misses, stats.stores), (0, 0, 1));
+        }
+        assert_eq!(engine.native_memo.find(0x777, &[9], &[]).unwrap().writes, [0x123, 88]);
+        // Both execution paths use channel RAM; the interpreter-owned fallback
+        // RAM survives execution and emitted uploads unchanged.
+        assert!(engine.native_interpreter.dram.iter().all(|&word| word == 0xa5a51234));
+        assert!(Arc::ptr_eq(engine.native_interpreter.active_dram.as_ref().unwrap(),
+            second.get_native_data_ram()));
+        assert_eq!(engine.native_code[0x90], 0xfeedface, "emitted upload must reenter shared context");
+    });
+    second.executing_macro = MACRO_REGISTERS_START + 14;
+    second.macro_params = vec![0xdeadbeef];
+    second.flush_macro();
+    assert!(second.macro_params.is_empty());
+    assert_eq!(first.get_native_macro_engine(|engine| engine.native_code[0x90]), 0xdeadbeef);
+    // Shared code survives channel detachment. Detaching restores its local
+    // engine/positions without altering the other channel or shared RAM identity.
+    first.set_native_macro_context(None);
+    first.set_native_turing_macro_mode(true);
+    first.get_native_macro_positions(|positions| positions[7] = 0x77);
+    assert_eq!(first.get_native_macro_positions(|positions| positions[7]), 0x77);
+    assert_eq!(second.get_native_macro_positions(|positions| positions[7]), 0x20);
+    assert!(context.lock().borrow().compute_positions.iter().all(|&word| word == 0));
+    // Shared handle is usable on another serialized GPU owner thread.
+    std::thread::spawn(move || {
+        assert_eq!(context.lock().borrow().engine.native_code[0x90], 0xdeadbeef);
+    }).join().unwrap();
+}
+
+#[test]
+fn native_vertex_stream_size_and_max_vertices_follow_shared_context_mode() {
+    let mut engine = Maxwell3D::new();
+    engine.regs[VERTEX_STREAM_BASE as usize] = (1 << 12) | 32;
+    engine.regs[VERTEX_STREAM_BASE as usize + 2] = 0x1000;
+    engine.regs[VERTEX_STREAM_LIMIT_BASE as usize + 1] = 0x10ff;
+    engine.regs[VERTEX_ATTRIB_BASE as usize] = (1 << 21) | (7 << 27); // 16 bytes
+    assert_eq!(engine.get_max_current_vertices(), 8);
+    let context: SharedNativeMacroContext = Arc::new(parking_lot::ReentrantMutex::new(
+        std::cell::RefCell::new(crate::r#macro::NativeMacroContext::default()),
+    ));
+    engine.set_native_macro_context(Some(context));
+    engine.set_native_turing_macro_mode(true);
+    engine.regs[0x600 / 4] = 0;
+    engine.regs[0x600 / 4 + 1] = 96;
+    assert!(!engine.macro_engine.native_turing);
+    assert_eq!(engine.get_max_current_vertices(), 3);
+    engine.regs[0x600 / 4] = 0xffff_ffff;
+    assert_eq!(engine.native_vertex_stream_size(0), 0xff_00000060);
+    assert_eq!(engine.get_max_current_vertices(), u32::MAX / 32);
+    engine.regs[0x600 / 4 + 31 * 2] = 0x101;
+    engine.regs[0x600 / 4 + 31 * 2 + 1] = 0x12345678;
+    assert_eq!(engine.native_vertex_stream_size(31), 0x1_12345678);
+    engine.set_native_macro_context(None);
+    assert_eq!(engine.get_max_current_vertices(), 8);
+    engine.regs[VERTEX_STREAM_LIMIT_BASE as usize + 1] = 0;
+    assert_eq!(engine.get_max_current_vertices(), u32::MAX / 32, "unsigned range then u32 cap");
+    engine.regs[VERTEX_ATTRIB_BASE as usize] |= 1 << 6;
+    assert_eq!(engine.get_max_current_vertices(), 1);
+}
+
+
+#[test]
+fn same_value_state_writes_preserve_shadow_and_executable_effects() {
+    const CHILD: &str = "RUZU_SKIP_SAME_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        for value in [None, Some(""), Some("1"), Some("0"), Some("0disabled")] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", std::thread::current().name().unwrap()]).env(CHILD, "1");
+            command.env_remove("EDEN_NX2_SKIP_SAME");
+            if let Some(value) = value { command.env("EDEN_NX2_SKIP_SAME", value); }
+            assert!(command.status().unwrap().success());
+        }
+        return;
+    }
+    let skip = std::env::var("EDEN_NX2_SKIP_SAME").map_or(true, |v| !v.starts_with('0'));
+    assert_eq!(Maxwell3D::skip_same_value_writes(), skip);
+    let method = 0x200usize;
+    let flag = dirty_flags::flags::SHADERS as usize;
+    for control in 0..4 {
+        for sunk in [false, true] {
+            let mut engine = Maxwell3D::new();
+            assert!(!engine.interface_state.execution_mask[method]);
+            engine.dirty.tables[0][method] = flag as u8;
+            engine.shadow_state[SHADOW_RAM_CONTROL as usize] = control;
+            engine.regs[method] = 0x55;
+            // Replay must compare the effective shadow value, not incoming 0x99.
+            engine.shadow_state[method] = if control == 3 { 0x55 } else { 0x11 };
+            engine.dirty.flags.fill(false);
+            let argument = if control == 3 { 0x99 } else { 0x55 };
+            if sunk {
+                engine.interface_state.method_sink.push((method as u32, argument));
+                engine.consume_sink();
+                assert!(engine.interface_state.method_sink.is_empty());
+            } else {
+                engine.call_method(method as u32, argument, true);
+            }
+            assert_eq!(engine.regs[method], 0x55);
+            assert_eq!(engine.dirty.flags[flag], !skip, "control={control}, sunk={sunk}");
+            assert_eq!(engine.shadow_state[method], if control == 2 { 0x11 } else { 0x55 });
+            // A changed effective value must still invalidate the dependent state.
+            engine.dirty.flags.fill(false);
+            engine.shadow_state[method] = 0x77;
+            if sunk {
+                engine.interface_state.method_sink.push((method as u32, 0x77));
+                engine.consume_sink();
+            } else {
+                engine.call_method(method as u32, 0x77, true);
+            }
+            assert_eq!(engine.regs[method], 0x77);
+            assert!(engine.dirty.flags[flag]);
+        }
+    }
+    // Firmware method has a visible side effect even on repeated zero writes.
+    let mut engine = Maxwell3D::new();
+    assert!(engine.interface_state.execution_mask[FALCON4 as usize]);
+    engine.dirty.tables[0][FALCON4 as usize] = flag as u8;
+    for _ in 0..2 {
+        engine.regs[SHADOW_SCRATCH_BASE as usize] = 0;
+        engine.dirty.flags.fill(false);
+        engine.call_method(FALCON4, 0, true);
+        assert_eq!(engine.regs[SHADOW_SCRATCH_BASE as usize], 1);
+        assert!(engine.dirty.flags[flag]);
+    }
 }

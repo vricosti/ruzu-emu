@@ -50,6 +50,7 @@ pub struct FramebufferConfig {
     pub transform_flags: BufferTransformFlags,
     pub crop_rect: Rectangle<i32>,
     pub blending: BlendMode,
+    pub native_tiling: bool,
     // Mirrors Tegra::FramebufferConfig across the core/video_core crate boundary.
     pub layer_stack_mask: u32,
 }
@@ -66,6 +67,7 @@ impl Default for FramebufferConfig {
             transform_flags: BufferTransformFlags::default(),
             crop_rect: Rectangle::default(),
             blending: BlendMode::default(),
+            native_tiling: false,
             layer_stack_mask: crate::hle::service::nvnflinger::hwc_layer::DEFAULT_LAYER_STACK_MASK,
         }
     }
@@ -83,6 +85,10 @@ pub struct RasterizerDownloadArea {
 /// Opaque GPU memory-manager state handle.
 pub trait GpuMemoryManagerHandle: Any + Send + Sync {
     fn as_any(&self) -> &(dyn Any + Send + Sync);
+
+    fn set_native_syncpoint_shim(&self, address: u64);
+    /// Bridge the constant owned by video_core::MemoryManager.
+    fn num_shim_syncpoints(&self) -> u32;
 
     /// Mirrors upstream `Tegra::MemoryManager::Map(...)`.
     fn map(&self, gpu_addr: u64, device_addr: u64, size: u64, kind: u32, is_big_pages: bool);
@@ -112,6 +118,23 @@ pub trait GpuChannelHandle: Send + Sync {
 
 /// Opaque GPU implementation owned by [`crate::core::System`].
 pub trait GpuCoreInterface: Any + Send {
+    /// Mirrors upstream GPU::RunInOrder; callback ownership moves to the GPU queue.
+    fn run_in_order(&self, func: Box<dyn FnOnce() + Send>);
+
+    /// GPU::RunOnGpuThread: enqueue between command lists, returning its sync fence.
+    fn run_on_gpu_thread(&self, action: Box<dyn FnOnce() + Send>) -> u64;
+
+    /// GPU::Renderer().ReadRasterizer()->FlushRegion, for callbacks already
+    /// executing on the GPU thread; does not enqueue or wait for another task.
+    fn renderer_flush_region(&self, addr: u64, size: u64);
+
+    /// Bridges the free functions in video_core/nx2.h without moving their state.
+    /// Bridge the upstream global assignment; state remains in video_core/nx2.rs.
+    fn set_nx2_ampere(&self, enabled: bool);
+
+    fn nx2_add_semaphore_region(&self, start: u64);
+    fn nx2_remove_semaphore_region(&self, start: u64);
+
     fn as_any(&self) -> &(dyn Any + Send);
 
     /// Mirrors the upstream `GPU::AllocateChannel()`.
@@ -135,6 +158,16 @@ pub trait GpuCoreInterface: Any + Send {
 
     /// Mirrors the upstream `GPU::RequestComposite(layers, fences)`.
     fn request_composite(&self, layers: Vec<FramebufferConfig>, fences: Vec<NvFence>);
+
+    /// Bridges GPU::Renderer().RequestScreenshot across the crate boundary.
+    /// The renderer owns the pixels until completion and returns them to the caller.
+    fn request_screenshot(
+        &self,
+        pixels: Vec<u8>,
+        callback: Box<dyn FnOnce(Vec<u8>, bool) + Send>,
+        layout: crate::frontend::framebuffer_layout::FramebufferLayout,
+        layer_stack: crate::hle::service::nvnflinger::hwc_layer::LayerStackId,
+    );
 
     /// Mirrors the upstream `GPU::WaitForComposite()`.
     fn wait_for_composite(&self);

@@ -19,6 +19,22 @@ use crate::engines::nv01_timer::Nv01Timer;
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerInterface;
 
+/// Port of the anonymous Nx2MacroContext helper: one process-wide TSG macro context.
+fn nx2_macro_context() -> crate::r#macro::SharedNativeMacroContext {
+    static CONTEXT: std::sync::OnceLock<crate::r#macro::SharedNativeMacroContext> =
+        std::sync::OnceLock::new();
+    CONTEXT
+        .get_or_init(|| {
+            let mut context = crate::r#macro::NativeMacroContext::default();
+            context.engine.native_turing = true;
+            context.compute_engine.native_turing = true;
+            Arc::new(parking_lot::ReentrantMutex::new(std::cell::RefCell::new(
+                context,
+            )))
+        })
+        .clone()
+}
+
 // ---------------------------------------------------------------------------
 // ChannelState
 // ---------------------------------------------------------------------------
@@ -135,6 +151,21 @@ impl ChannelState {
 
         self.bind_nvk_default_subchannels();
 
+        if crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::SeqCst) {
+            self.memory_manager
+                .as_ref()
+                .unwrap()
+                .lock()
+                .enable_native_tiling();
+            let macros = nx2_macro_context();
+            let maxwell = self.maxwell_3d.as_mut().unwrap();
+            maxwell.set_native_macro_context(Some(macros.clone()));
+            maxwell.set_native_turing_macro_mode(true);
+            let compute = self.kepler_compute.as_mut().unwrap();
+            compute.set_native_macro_mode(Some(macros.clone()), Some(macros));
+            compute.set_native_data_ram(Some(maxwell.get_native_data_ram().clone()));
+        }
+
         self.initialized = true;
         log::debug!(
             "ChannelState::init bind_id={} program_id={:016x}",
@@ -150,6 +181,7 @@ impl ChannelState {
     fn bind_nvk_default_subchannels(&mut self) {
         const NVK_3D_SUBCHANNEL: u32 = 0;
         const NVK_COMPUTE_SUBCHANNEL: u32 = 1;
+        const NVK_M2MF_SUBCHANNEL: u32 = 2;
         const NVK_2D_SUBCHANNEL: u32 = 3;
         const NVK_COPY_SUBCHANNEL: u32 = 4;
 
@@ -157,6 +189,7 @@ impl ChannelState {
             dma_pusher,
             maxwell_3d,
             kepler_compute,
+            kepler_memory,
             fermi_2d,
             maxwell_dma,
             ..
@@ -180,7 +213,16 @@ impl ChannelState {
             NVK_COMPUTE_SUBCHANNEL,
             EngineTypes::KeplerCompute,
         );
-        // Subchannel 2 is M2MF; Eden does not expose a 0x9039 engine yet.
+        // NVN uses M2MF without binding a class; KeplerMemory has the same
+        // LINE_LENGTH_IN/OFFSET_OUT/LAUNCH_DMA/LOAD_INLINE_DATA layout.
+        dma_pusher.bind_subchannel(
+            kepler_memory
+                .as_mut()
+                .expect("KeplerMemory must exist before NVK binding")
+                .as_mut(),
+            NVK_M2MF_SUBCHANNEL,
+            EngineTypes::KeplerMemory,
+        );
         dma_pusher.bind_subchannel(
             fermi_2d
                 .as_mut()
@@ -236,6 +278,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_channels_share_macro_code_but_keep_separate_data_ram() {
+        const CHILD: &str = "RUZU_NATIVE_CHANNEL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("EDEN_NX2_MME_JIT", "0")
+                .env_remove("EDEN_NATIVE_DRAW_DIAGNOSTICS")
+                .env_remove("EDEN_NX2_MME_DUMP")
+                .env_remove("EDEN_NX2_SEM_WATCH")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let gpu = crate::gpu::Gpu::new(false, false);
+        crate::nx2::G_NX2_AMPERE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut channels: Vec<_> = (1..=2)
+            .map(|id| {
+                let mut channel = Box::new(ChannelState::new(id));
+                channel.memory_manager =
+                    Some(Arc::new(Mutex::new(MemoryManager::new(id as usize))));
+                channel.init(&gpu, 0x1234);
+                assert!(channel.initialized);
+                assert!(channel
+                    .memory_manager
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .uses_native_tiling());
+                assert!(channel.kepler_compute.as_ref().unwrap().is_native_mode());
+                channel
+            })
+            .collect();
+        channels[0]
+            .maxwell_3d
+            .as_mut()
+            .unwrap()
+            .get_native_macro_engine(|engine| engine.native_code[0] = 0xabcdef);
+        assert_eq!(
+            channels[1]
+                .maxwell_3d
+                .as_ref()
+                .unwrap()
+                .get_native_macro_engine_read(|engine| engine.native_code[0]),
+            0xabcdef
+        );
+        let first_ram = channels[0]
+            .maxwell_3d
+            .as_ref()
+            .unwrap()
+            .get_native_data_ram()
+            .clone();
+        let second_ram = channels[1]
+            .maxwell_3d
+            .as_ref()
+            .unwrap()
+            .get_native_data_ram()
+            .clone();
+        assert!(!Arc::ptr_eq(&first_ram, &second_ram));
+        first_ram.lock()[0x27] = 11;
+        second_ram.lock()[0x27] = 22;
+        let encode = |fields: &[(usize, usize, u32)]| {
+            let mut bits = 0u128;
+            for low in [15, 20, 25, 51, 56, 61] {
+                bits |= 24u128 << low;
+            }
+            for &(low, count, value) in fields {
+                let mask = ((1u128 << count) - 1) << low;
+                bits = (bits & !mask) | (((value as u128) << low) & mask);
+            }
+            [(bits >> 64) as u32, (bits >> 32) as u32, bits as u32]
+        };
+        let code = [
+            encode(&[
+                (0, 1, 1),
+                (10, 5, 31),
+                (20, 5, 25),
+                (30, 16, 0x27),
+                (25, 5, 26),
+                (66, 16, 77),
+            ]),
+            encode(&[]),
+        ]
+        .concat();
+        let compute = channels[0].kepler_compute.as_mut().unwrap();
+        compute.call_method(0x45, 0, true);
+        compute.call_multi_method(0x46, &code, code.len() as u32, code.len() as u32);
+        compute.call_method(0x47, 0, true);
+        compute.call_method(0x48, 0, true);
+        compute.call_method(0xe00, 0, true);
+        assert_eq!(first_ram.lock()[0x27], 77);
+        assert_eq!(second_ram.lock()[0x27], 22);
+        let compute = channels[1].kepler_compute.as_mut().unwrap();
+        compute.call_method(0x47, 0, true);
+        compute.call_method(0xe00, 0, true);
+        assert_eq!(second_ram.lock()[0x27], 77);
+        crate::nx2::G_NX2_AMPERE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut ordinary = ChannelState::new(3);
+        ordinary.memory_manager = Some(Arc::new(Mutex::new(MemoryManager::new(3))));
+        ordinary.init(&gpu, 0x5678);
+        assert!(!ordinary.kepler_compute.as_ref().unwrap().is_native_mode());
+        assert!(!ordinary
+            .memory_manager
+            .as_ref()
+            .unwrap()
+            .lock()
+            .uses_native_tiling());
+    }
+
+    #[test]
     fn test_new_channel_state() {
         let cs = ChannelState::new(42);
         assert_eq!(cs.bind_id, 42);
@@ -262,7 +419,10 @@ mod tests {
             dma.subchannel_binding_for_test(1),
             (true, EngineTypes::KeplerCompute)
         );
-        assert_eq!(dma.subchannel_binding_for_test(2).0, false);
+        assert_eq!(
+            dma.subchannel_binding_for_test(2),
+            (true, EngineTypes::KeplerMemory)
+        );
         assert_eq!(
             dma.subchannel_binding_for_test(3),
             (true, EngineTypes::Fermi2D)

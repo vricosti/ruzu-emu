@@ -518,6 +518,7 @@ impl QueryCacheBase {
                     device_memory.write_u32(cpu_addr, payload);
                 }
             }
+            crate::nx2::Nx2SemaphoreWaiters::get().on_write(cpu_addr, payload);
             streamer.free(new_query_id);
             return;
         }
@@ -601,6 +602,7 @@ impl QueryCacheBase {
                     device_memory.write_u32(cpu_addr, final_value as u32);
                 }
             }
+            crate::nx2::Nx2SemaphoreWaiters::get().on_write(cpu_addr, final_value as u32);
             if !is_synced {
                 owner.impl_.pending_unregister.push(query_location);
             }
@@ -1834,6 +1836,64 @@ mod tests {
         assert!(memory.writes32.is_empty());
         assert_eq!(streamer.free_calls, 1);
         assert!(cache.impl_.pending_unregister.is_empty());
+    }
+
+    #[test]
+    fn counter_report_latches_semaphore_waiters_after_guest_writeback() {
+        use crate::nx2::Nx2SemaphoreWaiters;
+        use common::settings_enums::GpuAccuracy;
+
+        struct WaiterOwner(Box<u8>);
+        impl WaiterOwner {
+            fn id(&self) -> usize { self.0.as_ref() as *const u8 as usize }
+        }
+        impl Drop for WaiterOwner {
+            fn drop(&mut self) { Nx2SemaphoreWaiters::get().remove(self.id()); }
+        }
+
+        for (accuracy, invalidated, unsynchronized) in [
+            (GpuAccuracy::Low, false, false),
+            (GpuAccuracy::High, false, false),
+            (GpuAccuracy::High, true, false),
+            (GpuAccuracy::High, false, true),
+        ] {
+            let _accuracy = crate::test_support::GpuAccuracyGuard::set(accuracy);
+            for timestamp in [false, true] {
+                let owner = WaiterOwner(Box::new(0));
+                let device = owner.id() as u64;
+                let waiters = Nx2SemaphoreWaiters::get();
+                let mut cache = Box::new(QueryCacheBase::new());
+                let mut streamer = CountingStreamer::new(QueryType::Payload as usize, QueryBase::new());
+                streamer.base.amend_value = 0x1_0000_0005;
+                let expected = if accuracy == GpuAccuracy::Low { 0x80 } else { 0x85 };
+                waiters.add(owner.id(), device, expected, Nx2SemaphoreWaiters::ACQUIRE_EQUAL);
+                let mut memory = CountingDeviceMemory::default();
+                let mut translation = CountingGpuMemory::default();
+                translation.translations.insert(0x8000, device);
+                cache.impl_.register_streamer(QueryType::Payload as usize, &mut streamer);
+                cache.bind_device_memory(&mut memory);
+                cache.bind_gpu_memory(&mut translation);
+                let mut operations = Vec::<Box<dyn FnOnce() + Send>>::new();
+                let flags = if timestamp { QueryPropertiesFlags::HAS_TIMEOUT } else { QueryPropertiesFlags::empty() };
+                cache.counter_report_with_callbacks(0x8000, QueryType::Payload, flags, 0x80, 0,
+                    |_| panic!("not a fence"), |op| operations.push(op));
+                if accuracy == GpuAccuracy::High {
+                    assert!(!waiters.latched(owner.id()), "queued reports must not wake early");
+                    if invalidated { streamer.query.flags.insert(QueryFlagBits::IS_INVALIDATED); }
+                    if unsynchronized { streamer.query.flags.remove(QueryFlagBits::IS_FINAL_VALUE_SYNCED); }
+                }
+                for operation in operations { operation(); }
+                assert_eq!(waiters.latched(owner.id()), !invalidated && !unsynchronized);
+                if invalidated || unsynchronized {
+                    assert!(memory.writes32.is_empty() && memory.writes64.is_empty());
+                } else {
+                    assert!(memory.writes32.iter().any(|&(addr, value)| addr == device && value == expected)
+                        || memory.writes64.iter().any(|&(addr, value)| addr == device && value as u32 == expected));
+                    waiters.on_write(device, 0);
+                    assert!(waiters.latched(owner.id()), "later releases must not erase satisfaction");
+                }
+            }
+        }
     }
 
     #[test]

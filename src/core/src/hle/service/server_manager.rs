@@ -1533,6 +1533,7 @@ impl ServerManager {
         let reply_result =
             crate::hle::kernel::k_server_session::KServerSession::send_reply_hle_unlocked(
                 &event.server_session,
+                service_result == crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED,
             );
         record_ipc_phase("server_10_send_reply_hle", &mut phase_last);
 
@@ -2330,6 +2331,52 @@ mod tests {
 
         assert!(manager.sessions.is_empty());
         assert!(manager.multi_wait.holders.is_empty());
+    }
+
+    #[test]
+    fn hle_session_close_result_reaches_waiting_client_before_destruction() {
+        struct ReplyHandler(bool);
+        impl crate::hle::service::hle_ipc::SessionRequestHandler for ReplyHandler {
+            fn handle_sync_request(&self, _: &mut HLERequestContext) -> ResultCode {
+                if self.0 { crate::hle::service::ipc_helpers::RESULT_SESSION_CLOSED }
+                else { RESULT_SUCCESS }
+            }
+        }
+        // Keep kernel-global test state isolated from other service tests.
+        const CHILD: &str = "RUZU_TEST_HLE_SESSION_CLOSE_REPLY";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        for close in [false, true] {
+            let manager = Arc::new(Mutex::new(ServerManager::new(SystemRef::null())));
+            let server = Arc::new(Mutex::new(KServerSession::new()));
+            server.lock().unwrap().initialize(0x1000);
+            let request_manager = Arc::new(Mutex::new(SessionRequestManager::new()));
+            request_manager.lock().unwrap().set_session_handler(Arc::new(ReplyHandler(close)));
+            assert_eq!(manager.lock().unwrap().register_session(
+                Arc::clone(&server), Arc::clone(&request_manager)), RESULT_SUCCESS);
+            let client = Arc::new(crate::hle::kernel::k_thread::KThreadLock::new(
+                crate::hle::kernel::k_thread::KThread::new()));
+            client.lock().unwrap().begin_wait();
+            let mut request = crate::hle::kernel::k_session_request::KSessionRequest::new();
+            request.thread = Some(Arc::downgrade(&client));
+            request.thread_id = Some(1);
+            let request = Arc::new(Mutex::new(request));
+            server.lock().unwrap().request_list.push_back(Arc::clone(&request));
+            assert!(ServerManager::process_session_event_shared(&manager, SharedSessionEvent {
+                session_id: 1, server_session: Arc::clone(&server), manager: request_manager,
+                service_manager: None, server_name: "test".to_string(),
+            }));
+            assert_eq!(client.lock().unwrap().get_wait_result(), if close {
+                KERNEL_RESULT_SESSION_CLOSED.get_inner_value()
+            } else { RESULT_SUCCESS.get_inner_value() });
+            assert_eq!(manager.lock().unwrap().sessions.is_empty(), close);
+            assert!(server.lock().unwrap().current_request.is_none());
+            assert!(request.lock().unwrap().get_thread().is_none());
+        }
     }
 
     #[test]

@@ -2263,7 +2263,7 @@ impl KPageTableBase {
 
         // Compute state test mask based on which attributes are being changed.
         let mut state_test_mask = KMemoryState::NONE;
-        if mask_attr.contains(KMemoryAttribute::UNCACHED) {
+        if mask_attr.intersects(KMemoryAttribute::UNCACHED | KMemoryAttribute::GPU_ACCESSIBLE) {
             state_test_mask = KMemoryState::from_bits_truncate(
                 state_test_mask.bits() | KMemoryState::FLAG_CAN_CHANGE_ATTRIBUTE.bits(),
             );
@@ -7732,16 +7732,17 @@ impl KPageTableBase {
         let general_lock = self.m_general_lock.clone();
         let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
 
-        // Check that the region is currently Free with no permissions.
-        let (result, blocks_needed) = self.check_memory_state_contiguous(
+        // Check Free state and uniform permissions/attributes, with upstream masks.
+        let (result, _, _, _, blocks_needed) = self.check_memory_state_range(
             addr,
             size,
             KMemoryState::all(),
             KMemoryState::FREE,
             KMemoryPermission::NONE,
             KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF),
             KMemoryAttribute::NONE,
+            KMemoryAttribute::NONE,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if result != 0 {
             return result;
@@ -7800,15 +7801,16 @@ impl KPageTableBase {
         let _lock_guard = KScopedLightLock::new(general_lock.as_ref());
 
         // Check that the region is currently in the expected state.
-        let (result, blocks_needed) = self.check_memory_state_contiguous(
+        let (result, _, _, _, blocks_needed) = self.check_memory_state_range(
             address,
             size,
             KMemoryState::all(),
             state,
             KMemoryPermission::NONE,
             KMemoryPermission::NONE,
-            KMemoryAttribute::from_bits_truncate(0xFF),
+            KMemoryAttribute::all(),
             KMemoryAttribute::NONE,
+            Self::DEFAULT_MEMORY_IGNORE_ATTR,
         );
         if result != 0 {
             return result;
@@ -7989,6 +7991,46 @@ mod tests {
             KPageTableBase::convert_to_memory_permission(KMemoryPermission::USER_READ_WRITE),
             false,
         );
+    }
+
+    #[test]
+    fn page_group_mapping_matches_upstream_attribute_and_uniform_permission_checks() {
+        let mut kernel = kernel_with_application_pool_for_test(16);
+        let backing = PageTableMemoryForTest::new(0x400000);
+        let mut group = super::super::k_page_group::KPageGroup::new();
+        assert_eq!(kernel.memory_manager_mut().allocate_and_open(
+            &mut group, 2,
+            KMemoryManager::encode_option(Pool::Application, Direction::FromFront)), 0);
+        let mut table = KPageTableBase::new();
+        let addr = 0x1000_0000;
+        table.m_address_space_start = addr;
+        table.m_address_space_end = addr + 4 * PAGE_SIZE;
+        table.m_alias_code_region_start = addr;
+        table.m_alias_code_region_end = table.m_address_space_end;
+        attach_page_table_memory_for_test(&mut table, backing.memory.clone());
+        table.m_memory_block_manager.initialize(addr, table.m_address_space_end, None).unwrap();
+        table.m_memory_block_manager.update(addr + PAGE_SIZE, 1,
+            KMemoryState::FREE, KMemoryPermission::USER_READ, KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE, KMemoryBlockDisableMergeAttribute::NONE);
+        let invalid = svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value();
+        // Full permission equality is required even though perm_mask is None.
+        assert_eq!(table.map_page_group(addr, &group, KMemoryState::IO_MEMORY,
+            KMemoryPermission::USER_READ_WRITE), invalid);
+        // Upstream MapPageGroup ignores the attribute mask for free pages.
+        table.m_memory_block_manager.update(addr, 2,
+            KMemoryState::FREE, KMemoryPermission::NONE, KMemoryAttribute::UNCACHED,
+            KMemoryBlockDisableMergeAttribute::NONE, KMemoryBlockDisableMergeAttribute::NONE);
+        assert_eq!(table.map_page_group(addr, &group, KMemoryState::IO_MEMORY,
+            KMemoryPermission::USER_READ_WRITE), 0);
+        table.m_memory_block_manager.update(addr + PAGE_SIZE, 1,
+            KMemoryState::IO_MEMORY, KMemoryPermission::USER_READ, KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE, KMemoryBlockDisableMergeAttribute::NONE);
+        assert_eq!(table.unmap_page_group(addr, &group, KMemoryState::IO_MEMORY), invalid);
+        table.m_memory_block_manager.update(addr, 2,
+            KMemoryState::IO_MEMORY, KMemoryPermission::USER_READ_WRITE, KMemoryAttribute::NONE,
+            KMemoryBlockDisableMergeAttribute::NONE, KMemoryBlockDisableMergeAttribute::NONE);
+        assert_eq!(table.unmap_page_group(addr, &group, KMemoryState::IO_MEMORY), 0);
+        group.close();
     }
 
     #[test]
@@ -8202,6 +8244,37 @@ mod tests {
         assert_eq!(info.m_attribute, KMemoryAttribute::NONE);
         assert_eq!(info.m_ipc_lock_count, 0);
         assert_eq!(info.m_device_use_count, 0);
+    }
+
+    #[test]
+    fn gpu_accessible_attribute_requires_capability_and_is_queryable_and_clearable() {
+        let _kernel = kernel_with_application_pool_for_test(4);
+        let mut table = KPageTableBase::new();
+        attach_page_table_managers_for_test(&mut table);
+        table.m_address_space_start = 0x1000_0000;
+        table.m_address_space_end = 0x1000_4000;
+        table.m_memory_block_manager.initialize(table.m_address_space_start, table.m_address_space_end, None).unwrap();
+        let address = table.m_address_space_start;
+        let bit = u32::from(KMemoryAttribute::GPU_ACCESSIBLE.bits());
+        assert_eq!(bit, crate::hle::kernel::svc::svc_types::MemoryAttribute::GpuAccessible as u32);
+        for capable in [false, true] {
+            let state = if capable { KMemoryState::NORMAL } else {
+                KMemoryState::from_bits_retain(KMemoryState::NORMAL.bits() & !KMemoryState::FLAG_CAN_CHANGE_ATTRIBUTE.bits())
+            };
+            table.m_memory_block_manager.update(address, 1, state, KMemoryPermission::USER_READ_WRITE,
+                KMemoryAttribute::NONE, KMemoryBlockDisableMergeAttribute::NONE, KMemoryBlockDisableMergeAttribute::NONE);
+            let result = table.set_memory_attribute(address, PAGE_SIZE, bit, bit);
+            if !capable {
+                assert_eq!(result, svc_results::RESULT_INVALID_CURRENT_MEMORY.get_inner_value());
+                continue;
+            }
+            assert_eq!(result, 0);
+            let info = table.query_info(address).unwrap();
+            assert_eq!(info.m_attribute, KMemoryAttribute::GPU_ACCESSIBLE);
+            assert_eq!(info.m_permission, KMemoryPermission::USER_READ_WRITE);
+            assert_eq!(table.set_memory_attribute(address, PAGE_SIZE, bit, 0), 0);
+            assert_eq!(table.query_info(address).unwrap().m_attribute, KMemoryAttribute::NONE);
+        }
     }
 
     #[test]

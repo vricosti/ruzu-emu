@@ -235,7 +235,8 @@ impl Host1x {
             devices: Mutex::new(HashMap::new()),
             memory_manager: Arc::clone(&memory_manager),
             gmmu_manager: Arc::new(parking_lot::Mutex::new(
-                MemoryManager::new_with_geometry_and_device_memory(
+                MemoryManager::new_with_system_and_device_memory(
+                    system,
                     0,
                     memory_manager,
                     32,
@@ -381,6 +382,28 @@ impl Default for Host1x {
 }
 
 impl Host1xCoreInterface for Host1x {
+    fn create_nx2_video_decoder(&self, mime: &str) -> Box<dyn ruzu_core::host1x_core::Nx2VideoDecoderHandle> {
+        Box::new(super::nx2_video_decoder::Nx2VideoDecoder::new(mime))
+    }
+
+    fn increment_guest(&self, id: u32) {
+        self.syncpoint_manager.increment_guest(id);
+    }
+
+    fn is_ready_guest(&self, id: u32, expected_value: u32) -> bool {
+        self.syncpoint_manager.is_ready_guest(id, expected_value)
+    }
+
+    fn get_guest_syncpoint_value(&self, id: u32) -> u32 {
+        self.syncpoint_manager.get_guest_syncpoint_value(id)
+    }
+
+    fn deregister_guest_action(&self, id: u32, handle: u64) {
+        self.syncpoint_manager.deregister_guest_action(
+            id,
+            &crate::host1x::syncpoint_manager::ActionHandle::from_raw(handle),
+        );
+    }
     fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
         self
     }
@@ -467,6 +490,10 @@ impl Host1xCoreInterface for Host1x {
 
     fn smmu_unmap(&self, d_address: u64, size: usize) {
         self.memory_manager.smmu_unmap(d_address, size);
+    }
+
+    fn smmu_read_block(&self, d_address: u64, output: &mut [u8]) -> bool {
+        self.memory_manager.smmu_read_block(d_address, output)
     }
 
     fn smmu_lookup(&self, d_address: u64) -> usize {
@@ -589,8 +616,42 @@ mod tests {
     }
 
     #[test]
+    fn device_read_bridge_flushes_and_zero_fills_unmapped_bytes() {
+        let host1x = Host1x::new();
+        let bridge: &dyn Host1xCoreInterface = &host1x;
+        let flushed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = flushed.clone();
+        bridge.bind_device_memory_flusher(Box::new(move |address, size| {
+            observed.lock().unwrap().push((address, size));
+        }));
+        let mut bytes = [0xff; 8];
+        assert!(!bridge.smmu_read_block(0x1ffc, &mut bytes));
+        assert_eq!(bytes, [0; 8]);
+        assert_eq!(*flushed.lock().unwrap(), [(0x1ffc, 8)]);
+    }
+
+    #[test]
+    fn guest_readiness_bridge_observes_only_guest_progress_and_unsigned_thresholds() {
+        let host1x = Host1x::new();
+        let bridge: &dyn Host1xCoreInterface = &host1x;
+        assert!(bridge.is_ready_guest(1, 0));
+        assert!(!bridge.is_ready_guest(1, 1));
+        assert!(!bridge.is_ready_guest(1, u32::MAX));
+        host1x.syncpoint_manager().increment_host(1);
+        assert!(!bridge.is_ready_guest(1, 1));
+        bridge.increment_guest(1);
+        assert_eq!(bridge.get_host_syncpoint_value(1), 1);
+        assert!(bridge.is_ready_guest(1, 1));
+        assert!(bridge.is_ready_guest(1, 0));
+        assert!(!bridge.is_ready_guest(1, 2));
+        assert!(!bridge.is_ready_guest(1, u32::MAX));
+        assert!(!bridge.is_ready_guest(2, 1));
+    }
+
+    #[test]
     fn guest_action_bridge_fires_from_guest_counter_only() {
         let host1x = Host1x::new();
+        let bridge: &dyn Host1xCoreInterface = &host1x;
         let fired = Arc::new(AtomicUsize::new(0));
         let fired_clone = Arc::clone(&fired);
 
@@ -606,7 +667,75 @@ mod tests {
         assert!(handle.is_some());
         host1x.syncpoint_manager().increment_host(1);
         assert_eq!(fired.load(Ordering::SeqCst), 0);
-        host1x.syncpoint_manager().increment_guest(1);
+        bridge.increment_guest(1);
+        assert_eq!(bridge.get_host_syncpoint_value(1), 1);
         assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn guest_action_bridge_reads_guest_value_and_cancels_exact_action() {
+        let host1x = Host1x::new();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let callback = Arc::clone(&fired);
+        let handle = Host1xCoreInterface::register_guest_action(&host1x, 3, 1,
+            Box::new(move || { callback.fetch_add(1, Ordering::SeqCst); })).unwrap();
+        Host1xCoreInterface::deregister_guest_action(&host1x, 3, handle);
+        host1x.syncpoint_manager().increment_host(3);
+        assert_eq!(Host1xCoreInterface::get_guest_syncpoint_value(&host1x, 3), 0);
+        host1x.syncpoint_manager().increment_guest(3);
+        assert_eq!(Host1xCoreInterface::get_guest_syncpoint_value(&host1x, 3), 1);
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nx2_syncpt_slot_reuse_cancels_clears_and_signals_on_guest_progress() {
+        use ruzu_core::core::{System, SystemRef};
+        use ruzu_core::hle::kernel::k_process::{KProcess, ProcessLock};
+        use ruzu_core::hle::kernel::k_thread::{KThread, KThreadLock};
+        use ruzu_core::hle::service::hle_ipc::{HLERequestContext, SessionRequestHandler};
+        use ruzu_core::hle::service::nx2_gsv::INx2SyncptSession;
+        let mut system = System::new_boxed_for_test();
+        system.set_host1x_core(Box::new(Host1x::new()));
+        system.kernel_mut().unwrap().initialize();
+        let service = INx2SyncptSession::new(SystemRef::from_ref(&system));
+        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        thread.lock().unwrap().parent = Some(Arc::downgrade(&process));
+        let request = |command: u32, words: &[u32]| {
+            let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
+            let mut data = vec![16 + command, words.len() as u32];
+            data.extend_from_slice(words);
+            ctx.populate_from_incoming_command_buffer(&data);
+            assert_eq!(service.handle_sync_request(&mut ctx), ruzu_core::hle::result::RESULT_SUCCESS);
+            ctx
+        };
+        request(22, &[7]);
+        let event = {
+            let owner = process.lock().unwrap();
+            assert_eq!(owner.readable_event_objects.len(), 1);
+            owner.readable_event_objects.values().next().unwrap().clone()
+        };
+        let host = system.host1x_core().unwrap().as_any().downcast_ref::<Host1x>().unwrap();
+        request(202, &[7]); // cancellation without a pending wait signals too
+        assert!(event.lock().unwrap().is_signaled());
+        request(201, &[7, !3, 1, 0, 0]);
+        assert!(!event.lock().unwrap().is_signaled());
+        host.syncpoint_manager().increment_host(3);
+        assert!(!event.lock().unwrap().is_signaled());
+        host.syncpoint_manager().increment_guest(3);
+        assert!(event.lock().unwrap().is_signaled());
+        assert_eq!(&request(103, &[!3]).command_buffer()[2..6], &[0, 1, 0, 0]);
+        request(201, &[7, !3, 2, 0, 0]);
+        request(202, &[7]);
+        request(201, &[7, !3, 3, 0, 0]);
+        host.syncpoint_manager().increment_guest(3); // canceled target2 must not signal
+        assert!(!event.lock().unwrap().is_signaled());
+        host.syncpoint_manager().increment_guest(3);
+        assert!(event.lock().unwrap().is_signaled());
+        request(201, &[7, !3, 4, 0, 0]);
+        drop(service); // unregister pending callback before closing event
+        host.syncpoint_manager().increment_guest(3);
+        assert!(!event.lock().unwrap().is_signaled());
+        system.kernel_mut().unwrap().shutdown();
     }
 }

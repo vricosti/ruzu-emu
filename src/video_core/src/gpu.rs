@@ -569,6 +569,11 @@ impl Gpu {
         fence
     }
 
+    /// Matches GPU::RunOnGpuThread -> Impl::RequestSyncOperation.
+    pub fn run_on_gpu_thread(&self, action: Box<dyn FnOnce() + Send>) -> u64 {
+        self.request_sync_operation(action)
+    }
+
     pub fn current_sync_request_fence(&self) -> u64 {
         self.current_sync_fence.load(Ordering::Relaxed)
     }
@@ -742,6 +747,11 @@ impl Gpu {
             .lock()
             .unwrap()
             .flush_region(addr, size, self.is_async);
+    }
+
+    /// Matches GPU::RunInOrder -> GPU::Impl::RunInOrder.
+    pub fn run_in_order(&self, func: Box<dyn FnOnce() + Send>) {
+        self.gpu_thread.lock().unwrap().run(func, self.is_async);
     }
 
     /// Invalidate a region.
@@ -943,6 +953,14 @@ impl GpuChannelHandle for VideoGpuChannelHandle {
 }
 
 impl GpuMemoryManagerHandle for VideoGpuMemoryManagerHandle {
+    fn set_native_syncpoint_shim(&self, address: u64) {
+        self.memory_manager.lock().set_native_syncpoint_shim(address);
+    }
+
+    fn num_shim_syncpoints(&self) -> u32 {
+        crate::memory_manager::MemoryManager::NUM_SHIM_SYNCPOINTS
+    }
+
     fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
         self
     }
@@ -1016,6 +1034,34 @@ fn replay_deferred_rasterizer_ops(
 }
 
 impl GpuCoreInterface for Gpu {
+    fn run_in_order(&self, func: Box<dyn FnOnce() + Send>) {
+        Gpu::run_in_order(self, func);
+    }
+
+    fn run_on_gpu_thread(&self, action: Box<dyn FnOnce() + Send>) -> u64 {
+        Gpu::run_on_gpu_thread(self, action)
+    }
+
+    fn renderer_flush_region(&self, addr: u64, size: u64) {
+        let rasterizer = self.rasterizer_handle()
+            .expect("renderer flush requires the GPU rasterizer");
+        // The core caller is a RunOnGpuThread callback, matching the source's
+        // direct renderer access rather than the CPU-side queued FlushRegion.
+        unsafe { rasterizer.as_mut() }.flush_region(addr, size, crate::cache_types::CacheType::ALL);
+    }
+
+    fn set_nx2_ampere(&self, enabled: bool) {
+        crate::nx2::G_NX2_AMPERE.store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn nx2_add_semaphore_region(&self, start: u64) {
+        crate::nx2::nx2_add_semaphore_region(start);
+    }
+
+    fn nx2_remove_semaphore_region(&self, start: u64) {
+        crate::nx2::nx2_remove_semaphore_region(start);
+    }
+
     fn as_any(&self) -> &(dyn std::any::Any + Send) {
         self
     }
@@ -1049,7 +1095,8 @@ impl GpuCoreInterface for Gpu {
         let device_memory = self
             .host1x_device_memory_manager()
             .expect("GPU memory-manager allocation requires a Host1x device-memory owner");
-        let mm = crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+        let mm = crate::memory_manager::MemoryManager::new_with_system_and_device_memory(
+            self.system_ref(),
             id,
             device_memory,
             address_space_bits,
@@ -1105,6 +1152,7 @@ impl GpuCoreInterface for Gpu {
                 pixel_format: layer.pixel_format,
                 transform_flags: layer.transform_flags,
                 crop_rect: layer.crop_rect,
+                native_tiling: layer.native_tiling,
                 layer_stack_mask: layer.layer_stack_mask,
                 blending: match layer.blending {
                     CoreBlendMode::Opaque => crate::framebuffer_config::BlendMode::Opaque,
@@ -1116,6 +1164,18 @@ impl GpuCoreInterface for Gpu {
             })
             .collect();
         self.request_composite_with_fences(layers, fences);
+    }
+
+    fn request_screenshot(
+        &self,
+        pixels: Vec<u8>,
+        callback: Box<dyn FnOnce(Vec<u8>, bool) + Send>,
+        layout: ruzu_core::frontend::framebuffer_layout::FramebufferLayout,
+        layer_stack: ruzu_core::hle::service::nvnflinger::hwc_layer::LayerStackId,
+    ) {
+        self.renderer.lock().unwrap().as_mut()
+            .expect("screenshot requires the GPU renderer")
+            .request_screenshot_owned(pixels, callback, layout, layer_stack);
     }
 
     fn wait_for_composite(&self) {
@@ -1168,6 +1228,24 @@ mod tests {
         RasterizerDownloadArea, RasterizerHandle, RasterizerInterface,
     };
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+    #[test]
+    fn run_on_gpu_thread_returns_fences_without_executing_or_waiting() {
+        let gpu = Gpu::new(false, false);
+        let bridge: &dyn GpuCoreInterface = &gpu;
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let first_order = order.clone();
+        let first = bridge.run_on_gpu_thread(Box::new(move || first_order.lock().unwrap().push(1)));
+        let second_order = order.clone();
+        let second = bridge.run_on_gpu_thread(Box::new(move || second_order.lock().unwrap().push(2)));
+        assert_eq!(second, first + 1);
+        assert!(order.lock().unwrap().is_empty());
+        assert!(gpu.current_sync_request_fence() < first);
+        gpu.tick_work();
+        assert_eq!(*order.lock().unwrap(), [1, 2]);
+        assert_eq!(gpu.current_sync_request_fence(), second);
+        gpu.wait_for_sync_operation(second);
+    }
 
     struct RecordingGraphicsContext {
         events: Arc<StdMutex<Vec<&'static str>>>,

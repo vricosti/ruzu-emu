@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Port of zuyu/src/shader_recompiler/frontend/maxwell/translate/impl/surface_atomic_operations.cpp
+//! Port of Eden's frontend/maxwell/translate/impl/surface_atomic_operations.cpp.
 
 use super::{field, TranslatorVisitor};
 use crate::ir::types::TextureInstInfo;
@@ -126,6 +126,13 @@ fn get_type(surface_type: SurfaceType) -> TextureType {
 fn make_coords(v: &mut TranslatorVisitor, reg: u32, surface_type: SurfaceType) -> Value {
     match surface_type {
         SurfaceType::E1D | SurfaceType::Buffer1D => v.x(reg),
+        SurfaceType::Array1D => {
+            let x = v.x(reg);
+            let layer = v.x(reg + 1);
+            let layer =
+                v.ir.bit_field_u_extract(layer, Value::ImmU32(0), Value::ImmU32(16));
+            v.ir.composite_construct_u32x2(x, layer)
+        }
         SurfaceType::E2D => {
             let x = v.x(reg);
             let y = v.x(reg + 1);
@@ -137,7 +144,14 @@ fn make_coords(v: &mut TranslatorVisitor, reg: u32, surface_type: SurfaceType) -
             let z = v.x(reg + 2);
             v.ir.composite_construct_u32x3(x, y, z)
         }
-        value => panic!("Invalid type {:?}", value),
+        SurfaceType::Array2D => {
+            let x = v.x(reg);
+            let y = v.x(reg + 1);
+            let layer = v.x(reg + 2);
+            let layer =
+                v.ir.bit_field_u_extract(layer, Value::ImmU32(0), Value::ImmU32(16));
+            v.ir.composite_construct_u32x3(x, y, layer)
+        }
     }
 }
 
@@ -255,7 +269,7 @@ pub fn suatom(tv: &mut TranslatorVisitor, insn: u64) {
 /// SURED — Surface Reduction.
 pub fn sured(tv: &mut TranslatorVisitor, insn: u64) {
     let is_bound = field(insn, 51, 1) != 0;
-    let op = AtomicOp::from_bits(field(insn, 21, 3) as u64);
+    let op = AtomicOp::from_bits(field(insn, 24, 3) as u64);
     let surface_type = SurfaceType::from_bits(field(insn, 33, 3) as u64);
     let size = Size::from_bits(field(insn, 20, 3) as u64);
     let clamp = Clamp::from_bits(field(insn, 49, 2) as u64);
@@ -325,7 +339,7 @@ mod tests {
         let insn = 4u64
             | (8u64 << 8)
             | (Size::U32 as u64) << 20
-            | (AtomicOp::Add as u64) << 21
+            | (AtomicOp::Add as u64) << 24
             | (SurfaceType::E2D as u64) << 33
             | (39u64 << 39);
 
@@ -339,5 +353,69 @@ mod tests {
         assert!(tv.ir.program.blocks[0]
             .iter()
             .all(|inst| inst.opcode != Opcode::SetRegister));
+    }
+
+    #[test]
+    fn sured_operation_field_is_independent_of_size() {
+        for (op, size, expected) in [
+            (AtomicOp::Or, Size::U32, Opcode::BoundImageAtomicOr32),
+            (AtomicOp::Min, Size::S32, Opcode::BoundImageAtomicSMin32),
+            (AtomicOp::Xor, Size::U32, Opcode::BoundImageAtomicXor32),
+        ] {
+            let mut program = fresh_program();
+            let mut tv = TranslatorVisitor::new(&mut program, 0);
+            // Original surface_atomic_operations.cpp: op 24..26, size 20..22.
+            let insn = 4
+                | (8 << 8)
+                | ((size as u64) << 20)
+                | ((op as u64) << 24)
+                | (3 << 33)
+                | (12 << 36)
+                | (1 << 51);
+            sured(&mut tv, insn);
+            let atomic = tv.ir.program.blocks[0]
+                .iter()
+                .find(|inst| inst.opcode == expected)
+                .expect("SURED must decode operation separately from size");
+            assert_eq!(atomic.args[0], Value::ImmU32(48));
+            assert!(tv.ir.program.blocks[0]
+                .iter()
+                .all(|inst| inst.opcode != Opcode::SetRegister));
+        }
+    }
+
+    #[test]
+    fn surface_array_coordinates_extract_unsigned_low_16_bit_layer() {
+        for (kind, dimension, components) in [
+            (
+                SurfaceType::Array1D,
+                TextureType::ColorArray1D,
+                Opcode::CompositeConstructU32x2,
+            ),
+            (
+                SurfaceType::Array2D,
+                TextureType::ColorArray2D,
+                Opcode::CompositeConstructU32x3,
+            ),
+        ] {
+            let mut program = fresh_program();
+            let mut tv = TranslatorVisitor::new(&mut program, 0);
+            sured(&mut tv, 4 | (8 << 8) | ((kind as u64) << 33) | (1 << 51));
+            let block = &tv.ir.program.blocks[0];
+            let extract = block
+                .iter()
+                .find(|inst| inst.opcode == Opcode::BitFieldUExtract)
+                .expect("array layer is unsigned 16-bit");
+            assert_eq!(&extract.args[1..], &[Value::ImmU32(0), Value::ImmU32(16)]);
+            assert!(block.iter().any(|inst| inst.opcode == components));
+            let atomic = block
+                .iter()
+                .find(|inst| inst.opcode == Opcode::BoundImageAtomicIAdd32)
+                .unwrap();
+            assert_eq!(
+                TextureInstInfo::from_u32(atomic.flags).texture_type,
+                dimension as u8
+            );
+        }
     }
 }

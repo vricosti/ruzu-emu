@@ -166,6 +166,14 @@ RuzuFfmpegDecoder* ruzu_ffmpeg_decoder_create(uint64_t codec, int prefer_mediaco
     return wrapper;
 }
 
+const AVCodec* ruzu_ffmpeg_find_decoder(uint64_t codec, int prefer_mediacodec) {
+    return ruzu_find_decoder(codec, prefer_mediacodec);
+}
+
+AVCodecContext* ruzu_ffmpeg_decoder_context(RuzuFfmpegDecoder* decoder) {
+    return decoder != NULL ? decoder->context : NULL;
+}
+
 const char* ruzu_ffmpeg_decoder_name(const RuzuFfmpegDecoder* decoder) {
     if (decoder == NULL || decoder->decoder == NULL) {
         return "";
@@ -457,6 +465,22 @@ int ruzu_ffmpeg_frame_width(const AVFrame* frame) {
 
 int ruzu_ffmpeg_frame_height(const AVFrame* frame) {
     return frame != NULL ? frame->height : 0;
+}
+
+int64_t ruzu_ffmpeg_frame_pts(const AVFrame* frame) {
+    return frame != NULL ? frame->pts : AV_NOPTS_VALUE;
+}
+
+int64_t ruzu_ffmpeg_frame_best_effort_timestamp(const AVFrame* frame) {
+    return frame != NULL ? frame->best_effort_timestamp : AV_NOPTS_VALUE;
+}
+
+int ruzu_ffmpeg_frame_colorspace(const AVFrame* frame) {
+    return frame != NULL ? frame->colorspace : AVCOL_SPC_UNSPECIFIED;
+}
+
+int ruzu_ffmpeg_frame_color_range(const AVFrame* frame) {
+    return frame != NULL ? frame->color_range : AVCOL_RANGE_UNSPECIFIED;
 }
 
 int ruzu_ffmpeg_frame_format(const AVFrame* frame) {

@@ -260,6 +260,7 @@ mod tests {
     fn dead_ipa_does_not_leave_stale_attribute_usage() {
         let mut program = Program::new(ShaderStage::Fragment);
         let block = program.add_block();
+        program.post_order_blocks.push(block);
         let mut sph = ProgramHeader::default();
         sph.raw[6] = 0b10_10_10_10;
         {

@@ -176,7 +176,7 @@ impl KCapabilities {
 
         // Initial processes may run on all cores.
         self.core_mask = hardware_properties::VIRTUAL_CORE_MASK;
-        self.phys_core_mask = hardware_properties::VIRTUAL_CORE_MASK; // simplified
+        self.phys_core_mask = hardware_properties::convert_virtual_core_mask_to_physical(self.core_mask);
 
         // Initial processes may use any user priority (not kernel priorities 0-3).
         self.priority_mask = !0xFu64;
@@ -341,7 +341,7 @@ impl KCapabilities {
         if min_prio > max_prio {
             return svc_results::RESULT_INVALID_COMBINATION.get_inner_value();
         }
-        if max_core >= hardware_properties::NUM_CPU_CORES {
+        if max_core >= hardware_properties::NUM_VIRTUAL_CORES as u32 {
             return svc_results::RESULT_INVALID_CORE_ID.get_inner_value();
         }
         debug_assert!(max_prio < 64);
@@ -352,8 +352,7 @@ impl KCapabilities {
         }
         // Physical core mask = convert virtual to physical.
         // Upstream: Core::Hardware::ConvertVirtualCoreMaskToPhysical
-        // For simplicity, physical = virtual (identity mapping).
-        self.phys_core_mask = self.core_mask;
+        self.phys_core_mask = hardware_properties::convert_virtual_core_mask_to_physical(self.core_mask);
 
         // Set priority mask.
         for prio in min_prio..=max_prio {
@@ -651,6 +650,23 @@ mod tests {
     #[test]
     fn test_get_capability_type() {
         assert_eq!(get_capability_type(0xFFFF_FFFF), CapabilityType::Padding);
+    }
+
+    #[test]
+    fn virtual_core_affinity_uses_hardware_mapping() {
+        for (minimum, maximum, virtual_mask, physical_mask) in [
+            (0u32, 5u32, 0x3fu64, 0x3fu64),
+            (63, 63, 1u64 << 63, 1u64 << 3),
+        ] {
+            let mut caps = KCapabilities::new();
+            let cap = 7 | (59 << 4) | (28 << 10) | (minimum << 16) | (maximum << 24);
+            assert_eq!(caps.set_core_priority_capability(cap), 0);
+            assert_eq!(caps.core_mask, virtual_mask);
+            assert_eq!(caps.phys_core_mask, physical_mask);
+        }
+        let mut caps = KCapabilities::new();
+        assert_eq!(caps.set_core_priority_capability(7 | (59 << 4) | (28 << 10) | (64 << 24)),
+            svc_results::RESULT_INVALID_CORE_ID.get_inner_value());
     }
 
     #[test]

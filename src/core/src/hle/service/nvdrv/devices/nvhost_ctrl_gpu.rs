@@ -5,6 +5,7 @@
 //! Port of zuyu/src/core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.cpp
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::core::SystemRef;
 use crate::hle::kernel::k_readable_event::KReadableEvent;
@@ -13,6 +14,38 @@ use crate::hle::service::nvdrv::devices::nvdevice::NvDevice;
 use crate::hle::service::nvdrv::devices::nvmap::{read_struct, write_struct};
 use crate::hle::service::nvdrv::nvdata::{DeviceFD, Ioctl, NvResult};
 use crate::hle::service::nvdrv::nvdrv::EventInterface;
+
+// Eden-NX2 nvhost_ctrl_gpu.cpp anonymous namespace.
+const NX2_CHARACTERISTICS_SIZE: u64 = 0xD0;
+
+fn apply_nx2_characteristics(gc: &mut IoctlGpuCharacteristics) {
+    gc.arch = 0x170;
+    gc.r#impl = 0xE;
+    gc.num_tpc_per_gpc = 6;
+    gc.sm_arch_sm_version = 0x808;
+    gc.sm_arch_spa_version = 0x808;
+    gc.threed_class = 0xC797;
+    gc.compute_class = 0xC7C0;
+    gc.gpfifo_class = 0xC56F;
+    gc.dma_copy_class = 0xC7B5;
+    gc.chipname = 0x6631306167;
+    gc.flags |= 0x100 | (1 << 22) | (1 << 26) | (1 << 34);
+    // Nine little-endian s16 interface versions overlay offsets 0x70..=0x80.
+    gc.max_fbps_count = 0x00400040;
+    gc.fbp_en_mask = 0x00400040;
+    gc.max_ltc_per_fbp = 0x00400040;
+    gc.max_lts_per_ltc = 0x00400040;
+    gc.max_tex_per_tpc = (gc.max_tex_per_tpc & 0xffff0000) | 0x40;
+}
+
+fn apply_nx2_characteristics_tail(block: &mut [u8]) {
+    const MAX_SUBCONTEXTS_OFFSET: usize = 0xB4;
+    const MAX_SUBCONTEXTS: u32 = 64;
+    if block.len() >= MAX_SUBCONTEXTS_OFFSET + 4 {
+        block[MAX_SUBCONTEXTS_OFFSET..MAX_SUBCONTEXTS_OFFSET + 4]
+            .copy_from_slice(&MAX_SUBCONTEXTS.to_le_bytes());
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -158,16 +191,21 @@ const _: () = assert!(std::mem::size_of::<IoctlGetGpuTime>() == 0x10);
 /// nvhost_ctrl_gpu device.
 pub struct NvHostCtrlGpu {
     system: SystemRef,
-    error_notifier_event: Arc<Mutex<KReadableEvent>>,
-    unknown_event: Arc<Mutex<KReadableEvent>>,
+    events_interface: Arc<EventInterface>,
+    // NvDevice dispatch uses shared references; upstream's sticky bool is atomic here.
+    nx2_caller: AtomicBool,
+    error_notifier_event: Option<Arc<Mutex<KReadableEvent>>>,
+    unknown_event: Option<Arc<Mutex<KReadableEvent>>>,
 }
 
 impl NvHostCtrlGpu {
     pub fn new(system: SystemRef, events_interface: Arc<EventInterface>) -> Self {
         Self {
             system,
+            nx2_caller: AtomicBool::new(false),
             error_notifier_event: events_interface.create_event("CtrlGpuErrorNotifier"),
             unknown_event: events_interface.create_event("CtrlGpuUnknownEvent"),
+            events_interface,
         }
     }
 
@@ -209,7 +247,7 @@ impl NvHostCtrlGpu {
         gc.gr_compbit_store_base_hw = 0x0;
     }
 
-    pub fn get_characteristics(&self, params: &mut IoctlCharacteristics) -> NvResult {
+    pub fn get_characteristics1(&self, params: &mut IoctlCharacteristics) -> NvResult {
         log::debug!("nvhost_ctrl_gpu::GetCharacteristics called");
         Self::fill_gpu_characteristics(&mut params.gc);
         params.gpu_characteristics_buf_size = 0xA0;
@@ -226,6 +264,48 @@ impl NvHostCtrlGpu {
                 params.gc.inline_to_memory_class,
                 params.gc.dma_copy_class
             );
+        }
+        NvResult::Success
+    }
+
+    fn get_characteristics3(&self, params: &mut IoctlCharacteristics, inline: &mut [u8]) -> NvResult {
+        let nx2 = params.gpu_characteristics_buf_size >= NX2_CHARACTERISTICS_SIZE;
+        Self::fill_gpu_characteristics(&mut params.gc);
+        params.gpu_characteristics_buf_size = 0xA0;
+        params.gpu_characteristics_buf_addr = 0xdeadbeef;
+        if nx2 {
+            self.nx2_caller.store(true, Ordering::Relaxed);
+            super::nx2_stub_device::G_NX2_DRIVER.store(true, Ordering::SeqCst);
+            // Production systems own a GPU; isolated device tests can omit it.
+            if let Some(gpu) = self.system.get().gpu_core() {
+                gpu.set_nx2_ampere(true);
+            }
+            apply_nx2_characteristics(&mut params.gc);
+            params.gpu_characteristics_buf_size = NX2_CHARACTERISTICS_SIZE;
+            log::warn!("Switch 2 caller, reporting Ampere chip 0x17E");
+        }
+        if inline.len() >= std::mem::size_of::<IoctlGpuCharacteristics>() {
+            write_struct(inline, &params.gc);
+        }
+        NvResult::Success
+    }
+
+    fn nx2_get_engine_info(&self, input: &[u8], output: &mut [u8], inline: &mut [u8]) -> NvResult {
+        // Two source Item records: engine_id, instance, signed runlist_id, reserved.
+        const ITEMS: [u32; 8] = [0, 0, 0, 0, 2, 0, 1, 0];
+        const NEEDED: u32 = 32;
+        let buf_size = input.get(..4).map(|v| u32::from_le_bytes(v.try_into().unwrap())).unwrap_or(0);
+        log::warn!("(STUBBED) Switch 2 GetEngineInfo buf_size={buf_size:#x} inline_out={:#x}", inline.len());
+        if buf_size >= NEEDED && inline.len() >= NEEDED as usize {
+            for (dst, value) in inline[..NEEDED as usize].chunks_exact_mut(4).zip(ITEMS) {
+                dst.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        output.fill(0);
+        let copied = input.len().min(output.len());
+        output[..copied].copy_from_slice(&input[..copied]);
+        if output.len() >= 4 {
+            output[..4].copy_from_slice(&NEEDED.to_le_bytes());
         }
         NvResult::Success
     }
@@ -296,6 +376,17 @@ impl NvHostCtrlGpu {
     }
 }
 
+impl Drop for NvHostCtrlGpu {
+    fn drop(&mut self) {
+        if let Some(event) = self.error_notifier_event.take() {
+            self.events_interface.free_event(event);
+        }
+        if let Some(event) = self.unknown_event.take() {
+            self.events_interface.free_event(event);
+        }
+    }
+}
+
 impl NvDevice for NvHostCtrlGpu {
     fn ioctl1(&self, _fd: DeviceFD, command: Ioctl, input: &[u8], output: &mut [u8]) -> NvResult {
         match command.group() {
@@ -326,7 +417,7 @@ impl NvDevice for NvHostCtrlGpu {
                 }
                 0x5 => {
                     let mut params: IoctlCharacteristics = read_struct(input);
-                    let r = self.get_characteristics(&mut params);
+                    let r = self.get_characteristics1(&mut params);
                     write_struct(output, &params);
                     r
                 }
@@ -386,37 +477,42 @@ impl NvDevice for NvHostCtrlGpu {
         output: &mut [u8],
         inline_output: &mut [u8],
     ) -> NvResult {
-        match command.group() {
-            b'G' => match command.cmd() {
+        if command.group() == b'G' {
+            match command.cmd() {
                 0x5 => {
                     let mut params: IoctlCharacteristics = read_struct(input);
-                    let r = self.get_characteristics(&mut params);
+                    let result = self.get_characteristics3(&mut params, inline_output);
                     write_struct(output, &params);
-                    // Write inline output (gpu characteristics)
-                    if inline_output.len() >= std::mem::size_of::<IoctlGpuCharacteristics>() {
-                        write_struct(inline_output, &params.gc);
+                    if self.nx2_caller.load(Ordering::Relaxed) {
+                        apply_nx2_characteristics_tail(inline_output);
                     }
-                    r
+                    return result;
                 }
                 0x6 => {
                     let mut params: IoctlGpuGetTpcMasksArgs = read_struct(input);
-                    let r = self.get_tpc_masks(&mut params);
+                    let result = self.get_tpc_masks(&mut params);
                     write_struct(output, &params);
                     if inline_output.len() >= 4 {
                         write_struct(inline_output, &params.tcp_mask);
                     }
-                    r
+                    return result;
                 }
-                _ => {
-                    log::error!("Unimplemented ioctl={:08X}", command.raw);
-                    NvResult::NotImplemented
-                }
-            },
-            _ => {
-                log::error!("Unimplemented ioctl={:08X}", command.raw);
-                NvResult::NotImplemented
+                0x13 => return NvResult::NotImplemented,
+                _ => {}
             }
         }
+        if self.nx2_caller.load(Ordering::Relaxed) {
+            if command.group() == b'G' && command.cmd() == 0x1F {
+                return self.nx2_get_engine_info(input, output, inline_output);
+            }
+            log::warn!("(STUBBED) Switch 2 ioctl={:08X} group={:X} command={:X}",
+                command.raw, command.group(), command.cmd());
+            output.fill(0);
+            inline_output.fill(0);
+            return NvResult::Success;
+        }
+        log::error!("Unimplemented ioctl={:08X}", command.raw);
+        NvResult::NotImplemented
     }
 
     fn on_open(&self, _session_id: SessionId, _fd: DeviceFD) {}
@@ -424,8 +520,8 @@ impl NvDevice for NvHostCtrlGpu {
 
     fn query_event(&self, event_id: u32) -> Option<Arc<Mutex<KReadableEvent>>> {
         match event_id {
-            1 => Some(Arc::clone(&self.error_notifier_event)),
-            2 => Some(Arc::clone(&self.unknown_event)),
+            1 => self.error_notifier_event.clone(),
+            2 => self.unknown_event.clone(),
             _ => {
                 log::error!("Unknown Ctrl GPU Event {}", event_id);
                 None
@@ -440,8 +536,67 @@ mod tests {
     use crate::core::System;
 
     #[test]
+    fn nx2_characteristics_layout_and_sticky_detection() {
+        let system = System::new_boxed_for_test();
+        let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
+        let device = NvHostCtrlGpu::new(SystemRef::from_ref(&system), events);
+        let mut input = [0u8; 176];
+        input[..8].copy_from_slice(&0xD0u64.to_le_bytes());
+        let mut output = [0u8; 176];
+        let mut inline = [0xAAu8; 0xD0];
+        let command = Ioctl { raw: (u32::from(b'G') << 8) | 5 };
+        assert_eq!(device.ioctl3(0, command, &input, &mut output, &mut inline), NvResult::Success);
+        let params: IoctlCharacteristics = read_struct(&output);
+        assert_eq!(params.gpu_characteristics_buf_size, 0xD0);
+        assert_eq!(params.gc.arch + params.gc.r#impl, 0x17E);
+        assert_eq!(params.gc.sm_arch_sm_version, 0x808);
+        assert_eq!(params.gc.flags, 0x55 | 0x100 | (1 << 22) | (1 << 26) | (1 << 34));
+        for offset in (0x70..=0x80).step_by(2) {
+            assert_eq!(&inline[offset..offset + 2], &0x40u16.to_le_bytes());
+        }
+        assert_eq!(&inline[0xB4..0xB8], &64u32.to_le_bytes());
+        assert!(inline[0xA0..0xB4].iter().all(|&b| b == 0xAA));
+        // A later legacy query returns Maxwell, but the caller latch still patches the tail.
+        input[..8].copy_from_slice(&0xA0u64.to_le_bytes());
+        inline.fill(0xAA);
+        device.ioctl3(0, command, &input, &mut output, &mut inline);
+        assert_eq!(read_struct::<IoctlCharacteristics>(&output).gc.arch, 0x120);
+        assert_eq!(&inline[0xB4..0xB8], &64u32.to_le_bytes());
+        assert!(device.nx2_caller.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn nx2_engine_info_sizes_and_ioctl_fallback() {
+        let system = System::new_boxed_for_test();
+        let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));
+        let device = NvHostCtrlGpu::new(SystemRef::from_ref(&system), events);
+        let command = Ioctl { raw: (u32::from(b'G') << 8) | 0x1F };
+        let mut output = [0xAA; 20];
+        let mut inline = [0xAA; 36];
+        assert_eq!(device.ioctl3(0, command, &[], &mut output, &mut inline), NvResult::NotImplemented);
+        device.nx2_caller.store(true, Ordering::Relaxed);
+        device.ioctl3(0, command, &[], &mut output, &mut inline);
+        assert_eq!(&output[..4], &32u32.to_le_bytes());
+        assert_eq!(&output[4..], &[0; 16]);
+        assert_eq!(inline, [0xAA; 36]);
+        let input = [32, 0, 0, 0, 9, 8, 7, 6];
+        device.ioctl3(0, command, &input, &mut output, &mut inline);
+        assert_eq!(&output[4..8], &input[4..8]);
+        assert_eq!(&inline[..16], &[0; 16]);
+        assert_eq!(&inline[16..20], &2u32.to_le_bytes());
+        assert_eq!(&inline[24..28], &1u32.to_le_bytes());
+        assert_eq!(&inline[32..], &[0xAA; 4]);
+        let unknown = Ioctl { raw: 0xFFFF };
+        assert_eq!(device.ioctl3(0, unknown, &[], &mut output, &mut inline), NvResult::Success);
+        assert_eq!(output, [0; 20]);
+        assert_eq!(inline, [0; 36]);
+        let unsupported = Ioctl { raw: (u32::from(b'G') << 8) | 0x13 };
+        assert_eq!(device.ioctl3(0, unsupported, &[], &mut output, &mut inline), NvResult::NotImplemented);
+    }
+
+    #[test]
     fn get_gpu_time_uses_core_timing() {
-        let system = System::new();
+        let system = System::new_boxed_for_test();
         system.core_timing().add_ticks(1234);
 
         let events = Arc::new(EventInterface::new(SystemRef::from_ref(&system)));

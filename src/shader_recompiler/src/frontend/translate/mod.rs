@@ -154,7 +154,11 @@ impl<'a> TranslatorVisitor<'a> {
     /// Construct the runtime visitor with the same environment ownership as
     /// upstream `TranslatorVisitor(Environment&, IR::Block&)`.
     pub fn new_with_env(program: &'a mut Program, block: u32, env: &'a dyn Environment) -> Self {
-        let stage = env.shader_stage();
+        let stage = if env.mesh_shader().is_some() {
+            ShaderStage::Compute
+        } else {
+            env.shader_stage()
+        };
         Self {
             ir: Emitter::new(program, block),
             stage,
@@ -821,6 +825,7 @@ impl<'a> TranslatorVisitor<'a> {
 
             // internal_stage_buffer_entry_read.cpp
             MaxwellOpcode::ISBERD => self.translate_isberd(insn),
+            MaxwellOpcode::ISBE_nx2 => self.translate_isbe_nx2(insn),
 
             // pixel_load.cpp
             MaxwellOpcode::PIXLD => self.translate_pixld(insn),
@@ -1188,6 +1193,7 @@ mod tests {
     fn regression_i2i_cc_feeds_csetp_through_ssa() {
         let mut program = Program::new(ShaderStage::VertexB);
         program.blocks.push(Block::new());
+        program.post_order_blocks.push(0);
         {
             let mut tv = TranslatorVisitor::new(&mut program, 0);
             tv.translate_instruction(0x5CE0_8000_0027_0AFF);

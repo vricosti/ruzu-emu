@@ -39,8 +39,12 @@ use hid_core::hid_core::HIDCore;
 use crate::hle::kernel::k_process::ProcessLock;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+
+/// Frames presented by the Switch 2 vi2 guest; upstream core.h/core.cpp owns
+/// this process-wide counter used by present and input replay.
+pub static G_NX2_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Clock-update portion of Impl::RefreshTime, mechanically separated so the
 /// ordering and persisted contexts can be tested without a running frontend.
@@ -320,6 +324,7 @@ impl SystemRef {
 
 /// Type used for the frontend to designate a callback for System to exit the application.
 pub type ExitCallback = Box<dyn Fn() + Send + Sync>;
+pub type ApplicationChangedCallback = Box<dyn Fn(u64) + Send + Sync>;
 
 /// Minimal bridge from `core` to a concrete `audio_core::renderer::Renderer`
 /// session owned by AudioCore.
@@ -1252,6 +1257,7 @@ pub struct System {
     execute_program_callback: Option<ExecuteProgramCallback>,
     /// Callback to exit the application.
     exit_callback: Option<Arc<ExitCallback>>,
+    application_changed_callback: Option<ApplicationChangedCallback>,
     /// Factory callback for creating video/audio subsystems.
     /// Called by setup_for_application_process() to create Host1x, GPU, AudioCore.
     /// Upstream creates these directly in SetupForApplicationProcess (core.cpp:277-283)
@@ -1374,6 +1380,7 @@ impl System {
             general_channel: Mutex::new(GeneralChannelState::default()),
             execute_program_callback: None,
             exit_callback: None,
+            application_changed_callback: None,
             subsystem_factory: None,
             app_loader: None,
             virtual_filesystem: None,
@@ -1748,20 +1755,26 @@ impl System {
 
         if let Some(kernel) = self.kernel_mut() {
             process.process_id = kernel.create_new_user_process_id();
-            // Upstream: kernel.MakeApplicationProcess(process->GetHandle())
-            // Registers this process as THE application process.
         }
 
         // Store the loader and process before setup_for_application_process,
         // since services may query System state.
         self.app_loader = Some(loader);
         self.load_parameters = load_parameters;
-        self.current_process = Some(process);
+        // Bind the stable process owner before services start, matching
+        // upstream SetApplicationProcess before SetupForApplicationProcess.
+        let process_arc = Arc::new(ProcessLock::from_value(process));
+        process_arc.lock().unwrap().bind_self_reference(&process_arc);
+        self.kernel.as_ref().unwrap().set_application_process(Some(process_arc.clone()));
+        self.current_process_arc = Some(process_arc);
 
         if let Some((program_id, is_64bit)) = self
-            .current_process
+            .current_process_arc
             .as_ref()
-            .map(|process| (process.get_program_id(), process.is_64bit()))
+            .map(|process| {
+                let process = process.lock().unwrap();
+                (process.get_program_id(), process.is_64bit())
+            })
         {
             self.set_runtime_program_id(program_id);
             common::settings::set_current_program_id(program_id);
@@ -1811,7 +1824,8 @@ impl System {
         // ReadProgramId(program_id) and falls through with program_id=0 on
         // ErrorNoControl (NRO without NACP/Aset), so that's the expected
         // behaviour here too — do not "fix" it with a homebrew default.
-        if let Some(ref process) = self.current_process {
+        if let Some(ref process) = self.current_process_arc {
+            let process = process.lock().unwrap();
             let romfs_factory = self
                 .app_loader
                 .as_ref()
@@ -1851,21 +1865,15 @@ impl System {
 
         // Upstream: applet_manager.CreateAndInsertByFrontendAppletParameters(process, params)
         // followed by applet->process->Run() at the end of SetWindowSystem.
-        if let Some(process) = self.current_process.take() {
+        if let Some(process_arc) = self.current_process_arc.clone() {
             let lp = self
                 .load_parameters
                 .as_ref()
                 .expect("loader must provide process launch parameters");
-            let is_64bit = process.is_64bit();
+            let is_64bit = process_arc.lock().unwrap().is_64bit();
             let priority = lp.main_thread_priority;
             let stack_size = lp.main_thread_stack_size as usize;
 
-            // Wrap in Arc<Mutex<>> — run() needs self_reference for thread creation.
-            let process_arc = Arc::new(ProcessLock::from_value(process));
-            process_arc
-                .lock()
-                .unwrap()
-                .bind_self_reference(&process_arc);
             if let Some(ref kernel) = self.kernel {
                 kernel.register_process(process_arc.clone());
             }
@@ -2410,6 +2418,9 @@ impl System {
     /// Upstream: `System::ApplicationMemory()` → `ApplicationProcess()->GetMemory()`.
     /// Falls back to the legacy `self.memory` if no application process is set.
     pub fn memory_shared(&self) -> Option<Arc<crate::memory::memory::SharedMemory>> {
+        if let Some(process) = self.application_process() {
+            return process.lock().unwrap().get_memory();
+        }
         // Try per-process Memory first (the correct upstream path)
         if let Some(ref process) = self.current_process {
             if let Some(mem) = process.get_memory() {
@@ -2763,6 +2774,18 @@ impl System {
         }
     }
 
+    /// Upstream System::RegisterApplicationChangedCallback.
+    pub fn register_application_changed_callback(&mut self, callback: ApplicationChangedCallback) {
+        self.application_changed_callback = Some(callback);
+    }
+
+    /// Upstream System::NotifyApplicationChanged (optional frontend callback).
+    pub fn notify_application_changed(&self, program_id: u64) {
+        if let Some(callback) = &self.application_changed_callback {
+            callback(program_id);
+        }
+    }
+
     /// Registers a callback from the frontend for System to exit the application.
     pub fn register_exit_callback(&mut self, callback: ExitCallback) {
         self.exit_callback = Some(Arc::new(callback));
@@ -2900,6 +2923,11 @@ impl System {
     pub fn current_process_arc(&self) -> Arc<ProcessLock> {
         self.current_process_arc_opt()
             .expect("current_process_arc not set; call set_current_process_arc() first")
+    }
+
+    /// Upstream System::ApplicationProcess; the kernel owns this selection.
+    pub fn application_process(&self) -> Option<Arc<ProcessLock>> {
+        self.kernel.as_ref().and_then(KernelCore::application_process)
     }
 
     pub fn current_process_arc_opt(&self) -> Option<Arc<ProcessLock>> {
@@ -3111,6 +3139,7 @@ impl System {
 
         // Wire the runtime SVC state on System so that SVC handlers
         // can access process, scheduler, memory, etc. via &System.
+        self.kernel.as_ref().unwrap().set_application_process(Some(process.clone()));
         self.set_current_process_arc(process.clone());
         self.set_scheduler_arc(scheduler.clone());
         self.set_shared_process_memory(shared_memory.clone());

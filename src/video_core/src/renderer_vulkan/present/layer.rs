@@ -374,7 +374,8 @@ impl Layer {
                 1,
                 BLOCK_HEIGHT_LOG2,
                 0,
-                0,
+                1, // Upstream default stride alignment is log2(2 pixels).
+                framebuffer.native_tiling,
             );
             buffer.flush();
         }

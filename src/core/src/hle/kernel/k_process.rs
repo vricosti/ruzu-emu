@@ -509,6 +509,7 @@ pub struct KProcess {
     pub is_signaled: bool,
     pub is_initialized: bool,
     pub is_application: bool,
+    pub is_switch2: bool,
     pub is_default_application_system_resource: bool,
     pub is_hbl: bool,
     pub name: [u8; 13],
@@ -651,6 +652,7 @@ impl KProcess {
             is_signaled: false,
             is_initialized: false,
             is_application: false,
+            is_switch2: false,
             is_default_application_system_resource: false,
             is_hbl: false,
             name: [0u8; 13],
@@ -936,6 +938,10 @@ impl KProcess {
 
     pub fn is_application(&self) -> bool {
         self.is_application
+    }
+
+    pub fn is_switch2(&self) -> bool {
+        self.is_switch2
     }
 
     pub fn is_default_application_system_resource(&self) -> bool {
@@ -2078,15 +2084,12 @@ impl KProcess {
             PoolPartition::SystemNonSecure => k_memory_manager::Pool::SystemNonSecure,
         };
 
-        // Upstream: const auto physical_memory_size = m_kernel.MemoryManager().GetSize(pool);
-        // We don't have a kernel reference yet, so use a default physical memory size
-        // (4 GiB for Application pool, matching typical Switch memory layout).
-        // Upstream: m_kernel.MemoryManager().GetSize(pool). Requires kernel reference.
-        let physical_memory_size: i64 = match pool {
-            k_memory_manager::Pool::Application => 0xCD500000, // ~3.2 GiB (Switch Application pool)
-            k_memory_manager::Pool::Applet => 0x1FB00000,      // ~507 MiB
-            _ => 0x2C600000,                                   // ~710 MiB (System)
-        };
+        // Upstream uses the initialized kernel pool, including the configured
+        // memory layout, rather than a fixed Switch 1 application budget.
+        let physical_memory_size = super::kernel::get_kernel_ref()
+            .expect("LoadFromMetadata requires an initialized kernel")
+            .memory_manager()
+            .get_size(pool) as i64;
 
         let res_limit = Arc::new(super::k_resource_limit::create_resource_limit_for_process(
             physical_memory_size,
@@ -2159,6 +2162,14 @@ impl KProcess {
         // Assign remaining properties (upstream lines 1227-1228).
         self.is_hbl = is_hbl;
         self.ideal_core_id = metadata.get_main_thread_core() as i32;
+
+        // Eden-NX2: retain the platform identity and count the alias region in
+        // the process memory ceiling (still bounded by the resource limit).
+        if metadata.is_switch2() {
+            self.is_switch2 = true;
+            self.max_process_memory =
+                self.page_table.get_heap_region_size() + self.page_table.get_alias_region_size();
+        }
 
         // Upstream: this->InitializeInterfaces() creates ArmDynarmic32/64 per core.
         // Currently done in System::load / main.rs.
@@ -3785,6 +3796,7 @@ mod tests {
         assert_eq!(process.get_main_stack_size(), 0);
         assert!(!process.is_64bit());
         assert!(process.is_application());
+        assert!(!process.is_switch2());
         let default_resource = process
             .default_system_resource
             .as_ref()
@@ -3807,6 +3819,33 @@ mod tests {
                 .unwrap(),
             &default_resource.block_info_manager_arc(),
         ));
+    }
+
+    #[test]
+    fn nx2_metadata_sets_process_identity_and_alias_memory_ceiling() {
+        use crate::file_sys::vfs::vfs_vector::VectorVfsFile;
+        let _kernel = kernel_with_application_pool_for_test(0x8000);
+        // Minimal NPDM with the alternate ACID body at ACID + 0x300.
+        let mut data = vec![0u8; 0x700];
+        data[0x70..0x74].copy_from_slice(&0x80u32.to_le_bytes());
+        data[0x78..0x7c].copy_from_slice(&0x200u32.to_le_bytes());
+        data[0xa0..0xa4].copy_from_slice(&0x40u32.to_le_bytes());
+        data[0x500..0x504].copy_from_slice(b"ACID");
+        data[0x520..0x524].copy_from_slice(&0x400u32.to_le_bytes());
+        let mut metadata = ProgramMetadata::new();
+        assert_eq!(metadata.load(Arc::new(VectorVfsFile::new(data, "main.npdm".into(), None))),
+            crate::file_sys::partition_filesystem::ResultStatus::Success);
+        metadata.load_manual(true, ProgramAddressSpaceType::Is39Bit, 44, 0,
+            0x40000, 42, 0, 0, vec![]);
+        let mut process = KProcess::new();
+        assert!(!process.is_switch2());
+        assert_eq!(process.load_from_metadata(&metadata, 0x120000, 0, 0, false),
+            RESULT_SUCCESS.get_inner_value());
+        assert!(process.is_switch2());
+        assert_eq!(process.resource_limit.as_ref().unwrap()
+            .get_limit_value(LimitableResource::PhysicalMemoryMax), (0x8000 * PAGE_SIZE) as i64);
+        assert_eq!(process.max_process_memory, process.page_table.get_heap_region_size()
+            + process.page_table.get_alias_region_size());
     }
 
     #[test]

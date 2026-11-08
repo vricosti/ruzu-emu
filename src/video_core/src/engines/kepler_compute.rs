@@ -7,7 +7,8 @@
 //! a Queue Meta Data (QMD) descriptor is read from GPU memory, parsed, and
 //! forwarded immediately to the bound rasterizer, matching upstream.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
@@ -16,6 +17,9 @@ use super::engine_upload;
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use crate::textures::texture::{TicEntry, TscEntry};
+
+/// Port of kepler_compute.cpp's diagnostic draw budget after an upscale fallback.
+pub static G_NX2_TRACE_DRAWS_AFTER_UPSCALE: AtomicU32 = AtomicU32::new(0);
 
 // ── Register offset constants (method addresses) ────────────────────────────
 
@@ -256,6 +260,24 @@ pub struct State {
 // ── Engine struct ───────────────────────────────────────────────────────────
 
 pub struct KeplerCompute {
+    /// Native method register bank from KeplerCompute's upstream owner.
+    native_registers: [u32; 0x1000],
+    native_qmd: crate::native_qmd::NativeQmdScheduler,
+    native_data_ram: Option<Arc<Mutex<crate::macro_turing::DataRam>>>,
+    native_mode: bool,
+    native_context: Option<crate::r#macro::SharedNativeMacroContext>,
+    // Owning handle for upstream native_macro/native_macro_positions, with selected engine.
+    native_macro_context: Option<crate::r#macro::SharedNativeMacroContext>,
+    native_macro_compute: bool,
+    native_compute_uploaded: bool,
+    native_plain_methods: Box<[bool; 0xe00]>,
+    native_parameters: Vec<u32>,
+    native_memo_parameters: Vec<u32>,
+    native_executing_macro: Option<u32>,
+    native_executing_macro_logged: Option<u32>,
+    native_bind_pointer: u32,
+    native_mme_dumped: bool,
+    front_macros: bool,
     regs: Box<[u32; KEPLER_COMPUTE_REG_COUNT]>,
     interface_state: EngineInterfaceState,
     memory_manager: Arc<Mutex<MemoryManager>>,
@@ -278,6 +300,56 @@ impl KeplerCompute {
     /// `System&` dependency remains outside this bounded slice.
     pub fn new(memory_manager: Arc<Mutex<MemoryManager>>) -> Self {
         Self {
+            native_registers: [0; 0x1000],
+            native_qmd: {
+                let mut scheduler = crate::native_qmd::NativeQmdScheduler::default();
+                if std::env::var_os("EDEN_NX2_QMD_TRACE").is_some() {
+                    let memory = Arc::clone(&memory_manager);
+                    scheduler.trace = Some(Box::new(move |event, address, value| {
+                        log::info!(
+                            "QMD trace {event} {address:#x} {value} (as {})",
+                            memory.lock().get_id()
+                        );
+                    }));
+                }
+                scheduler
+            },
+            native_data_ram: None,
+            native_mode: false,
+            native_context: None,
+            native_macro_context: None,
+            native_macro_compute: false,
+            native_compute_uploaded: false,
+            native_plain_methods: {
+                let mut methods = Box::new([true; 0xe00]);
+                for method in [
+                    0x45,
+                    0x46,
+                    0x47,
+                    0x48,
+                    0xae,
+                    0xaf,
+                    0xb0,
+                    0x107,
+                    0x6c3,
+                    EXEC_UPLOAD as usize,
+                    DATA_UPLOAD as usize,
+                ] {
+                    methods[method] = false;
+                }
+                if std::env::var_os("EDEN_NATIVE_DRAW_DIAGNOSTICS").is_some() {
+                    methods[0x5a] = false;
+                    methods[0xc6..=0x108].fill(false);
+                }
+                methods
+            },
+            native_parameters: Vec::new(),
+            native_memo_parameters: Vec::new(),
+            native_executing_macro: None,
+            native_executing_macro_logged: None,
+            native_bind_pointer: 0,
+            native_mme_dumped: false,
+            front_macros: false,
             regs: Box::new([0u32; KEPLER_COMPUTE_REG_COUNT]),
             interface_state: {
                 let mut state = EngineInterfaceState::new();
@@ -300,13 +372,953 @@ impl KeplerCompute {
         }
     }
 
+    /// Port of SetNativeDataRam; the RAM remains owned by the channel.
+    pub fn set_native_data_ram(&mut self, ram: Option<Arc<Mutex<crate::macro_turing::DataRam>>>) {
+        self.native_data_ram = ram;
+    }
+
+    /// Port of SetNativeMacroMode. The shared handle owns the initial graphics engine and
+    /// positions; context controls the later compute-upload switch. Handles replace raw spans.
+    pub fn set_native_macro_mode(
+        &mut self,
+        shared_macro: Option<crate::r#macro::SharedNativeMacroContext>,
+        context: Option<crate::r#macro::SharedNativeMacroContext>,
+    ) {
+        let same = match (&self.native_context, &context) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.native_compute_uploaded = false;
+        }
+        self.native_context = context;
+        self.native_mode = shared_macro.is_some();
+        self.upload_state
+            .set_native_partial_transfers(self.native_mode);
+        self.native_macro_context = shared_macro;
+        self.native_macro_compute = false;
+        self.interface_state.execution_mask.fill(self.native_mode);
+        if !self.native_mode {
+            for method in [EXEC_UPLOAD, DATA_UPLOAD, LAUNCH] {
+                self.interface_state.execution_mask[method as usize] = true;
+            }
+        }
+    }
+
+    pub fn is_native_mode(&self) -> bool {
+        self.native_mode
+    }
+
+    pub fn front_runs_macros(&self) -> bool {
+        self.native_mode
+    }
+
+    /// Port of ProcessNativeMethod. The retained reentrant context lock allows emitted
+    /// register writes to upload code without borrowing the selected macro engine across callbacks.
+    fn process_native_method(&mut self, method: u32, argument: u32, is_last_call: bool) -> bool {
+        use crate::native_query_trace::trace_native_query;
+        if self.native_context.is_some() && !self.front_macros {
+            if method == 0x45 || method == 0x47 {
+                self.native_compute_uploaded = true;
+            }
+            self.native_macro_context = self.native_context.clone();
+            self.native_macro_compute = self.native_compute_uploaded;
+        }
+        if method as usize >= self.native_registers.len() {
+            log::error!("Native compute method out of range: {method:#x}");
+            return true;
+        }
+        let owner = self
+            .native_macro_context
+            .clone()
+            .expect("native compute requires macro owner");
+        let guard = owner.lock();
+        let context = guard.as_ptr();
+        let this = self as *mut Self;
+        // All accesses are serialized by the retained context lock. No RefMut spans callbacks.
+        let selected = || unsafe {
+            if (*this).native_macro_compute {
+                std::ptr::addr_of_mut!((*context).compute_engine)
+            } else {
+                std::ptr::addr_of_mut!((*context).engine)
+            }
+        };
+        let positions = || unsafe {
+            if (*this).native_macro_compute {
+                std::ptr::addr_of_mut!((*context).compute_positions)
+            } else {
+                std::ptr::addr_of_mut!((*context).positions)
+            }
+        };
+        // Mechanical byte-copy adaptation for the source's owner-local ofstream dumps.
+        let dump_words = |path: String, words: &[u32]| {
+            let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            let _ = std::fs::write(path, bytes);
+        };
+        if method >= 0xe00 {
+            if self.native_executing_macro.is_none() {
+                if method & 1 != 0 {
+                    log::error!("Native compute macro starts on argument method");
+                    return true;
+                }
+                self.native_executing_macro = Some(method);
+            }
+            self.native_parameters.push(argument);
+            if !is_last_call {
+                return true;
+            }
+            let entry = ((self.native_executing_macro.unwrap() - 0xe00) / 2) as usize % 0x80;
+            self.native_executing_macro_logged = self.native_executing_macro.take();
+            static WATCH: OnceLock<u32> = OnceLock::new();
+            let watch = *WATCH.get_or_init(|| {
+                std::env::var("EDEN_NX2_SEM_WATCH")
+                    .ok()
+                    .and_then(|v| std::ffi::CString::new(v).ok())
+                    .map_or(0, |v| unsafe {
+                        libc::strtoull(v.as_ptr(), std::ptr::null_mut(), 16) as u32
+                    })
+            });
+            let watched = watch != 0
+                && self
+                    .native_parameters
+                    .iter()
+                    .any(|parameter| parameter & !0xf == watch);
+            let start = unsafe { (*positions())[entry] };
+            if watched {
+                log::info!(
+                    "Semaphore watch: compute macro start={start:#x} parameters={:08x?}",
+                    self.native_parameters
+                );
+            }
+            static MME_DUMP: OnceLock<bool> = OnceLock::new();
+            let mme_dump =
+                *MME_DUMP.get_or_init(|| std::env::var_os("EDEN_NX2_MME_DUMP").is_some());
+            if mme_dump {
+                if !self.native_mme_dumped && start == 0xda {
+                    self.native_mme_dumped = true;
+                    dump_words(format!("native-compute-mme-{this:p}.bin"), unsafe {
+                        &(*selected()).native_code
+                    });
+                }
+                log::info!(
+                    "MME call engine {this:p} method {:#x} start={start:#x} parameters={:08x?}",
+                    self.native_executing_macro_logged.unwrap(),
+                    self.native_parameters
+                );
+            }
+            let engine = selected();
+            // Lease interpreter and FIFO so Rust callbacks can observe live uploads safely.
+            if let Some(ram) = &self.native_data_ram {
+                unsafe {
+                    (*engine).native_interpreter.active_dram = Some(ram.clone());
+                }
+            }
+            let mut interpreter = unsafe { std::mem::take(&mut (*engine).native_interpreter) };
+            let mut parameters = std::mem::take(&mut self.native_parameters);
+            let ram_owner = interpreter.active_dram.clone();
+            let mut shared_ram = ram_owner.as_ref().map(|ram| ram.lock());
+            let mut local_ram = std::mem::replace(&mut interpreter.dram, [0; 0xc00]);
+            let ram = shared_ram.as_deref_mut().unwrap_or(&mut local_ram);
+            let dram0_before = ram[0x27];
+            let mut emit = |address: u32,
+                            value: u32,
+                            _fifo: &mut Vec<u32>,
+                            _ram: &mut crate::macro_turing::DataRam| {
+                static WRITES: AtomicU32 = AtomicU32::new(0);
+                static LOG_EMITS: OnceLock<bool> = OnceLock::new();
+                let log_emits = *LOG_EMITS
+                    .get_or_init(|| std::env::var_os("EDEN_NX2_SEM_WATCH_EMITS").is_some());
+                if watched && log_emits {
+                    log::info!("Semaphore watch: compute macro emit {address:#x} = {value:#x}");
+                }
+                if WRITES.fetch_add(1, Ordering::Relaxed) < 4096 {
+                    log::debug!("Native compute MME emit method={address:#x}, value={value:#x}");
+                }
+                if address >= 0xe00 {
+                    return false;
+                }
+                let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::Method);
+                unsafe {
+                    (*this).call_method(address, value, true);
+                }
+                true
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    static USE_JIT: OnceLock<bool> = OnceLock::new();
+                    if *USE_JIT.get_or_init(|| {
+                        std::env::var_os("EDEN_NX2_MME_JIT")
+                            .is_none_or(|v| !v.to_string_lossy().starts_with('0'))
+                    }) && !watched
+                    {
+                        let jit = (*engine)
+                            .native_jit
+                            .get_or_insert_with(|| {
+                                Arc::new(std::sync::Mutex::new(Default::default()))
+                            })
+                            .clone();
+                        let mut jit = jit
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        jit.prepare(&(*engine).native_code, (*engine).native_code_generation)
+                            .expect("native compute macro JIT preparation failed");
+                        let result = jit.execute(
+                            start,
+                            &mut parameters,
+                            ram,
+                            |address| {
+                                (*this)
+                                    .native_registers
+                                    .get(address as usize)
+                                    .copied()
+                                    .unwrap_or(0)
+                            },
+                            &mut emit,
+                        );
+                        if !result.success {
+                            (*selected()).native_execution_failed = true;
+                            log::error!("Native MME (JIT) failed: compute start={start:#x}, consumed={}/{}, error={}", result.consumed, parameters.len(), result.error);
+                        }
+                        return;
+                    }
+                }
+                static USE_MEMO: OnceLock<bool> = OnceLock::new();
+                let use_memo = *USE_MEMO.get_or_init(|| {
+                    std::env::var_os("EDEN_NX2_MME_MEMO")
+                        .is_none_or(|v| !v.to_string_lossy().starts_with('0'))
+                });
+                if use_memo && !watched {
+                    (*engine)
+                        .native_memo
+                        .synchronize((*engine).native_code_generation);
+                    if let Some(effects) = (*engine).native_memo.find(start, &parameters, ram) {
+                        for pair in effects.data_ram_writes.chunks_exact(2) {
+                            ram[pair[0] as usize] = pair[1];
+                        }
+                        for pair in effects.writes.chunks_exact(2) {
+                            emit(pair[0], pair[1], &mut parameters, ram);
+                        }
+                        return;
+                    }
+                    (*engine).native_writes.clear();
+                }
+                (*this).native_memo_parameters.clone_from(&parameters);
+                let generation = (*engine).native_code_generation;
+                let result = interpreter.execute_with_code_reader(
+                    0x3000,
+                    |base| {
+                        let code = std::ptr::addr_of!((*engine).native_code).cast::<u32>();
+                        [*code.add(base), *code.add(base + 1), *code.add(base + 2)]
+                    },
+                    start,
+                    &mut parameters,
+                    |address| {
+                        (*this)
+                            .native_registers
+                            .get(address as usize)
+                            .copied()
+                            .unwrap_or(0)
+                    },
+                    |address, value, fifo, ram| {
+                        if use_memo {
+                            (*selected()).native_writes.push((address, value));
+                        }
+                        emit(address, value, fifo, ram)
+                    },
+                    Some(ram),
+                );
+                let current = selected();
+                let state = if current == engine {
+                    &interpreter
+                } else {
+                    &(*current).native_interpreter
+                };
+                if use_memo
+                    && !watched
+                    && result.success
+                    && !state.read_registers
+                    && !state.reread_data_ram
+                    && generation == (*current).native_code_generation
+                {
+                    (*engine).native_memo.store(
+                        start,
+                        &(*this).native_memo_parameters,
+                        &state.data_ram_reads,
+                        &state.data_ram_writes,
+                        &(*current).native_writes,
+                    );
+                }
+                static MME_DUMP_AFTER: OnceLock<bool> = OnceLock::new();
+                if *MME_DUMP_AFTER.get_or_init(|| std::env::var_os("EDEN_NX2_MME_DUMP").is_some())
+                    && ram[0x27] != dram0_before
+                {
+                    log::info!("MME data RAM[0x27] {dram0_before:#x} -> {:#x} by engine {this:p} macro start={:#x}", ram[0x27], (*positions())[entry]);
+                }
+                if !result.success {
+                    (*current).native_execution_failed = true;
+                    static DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+                    if *DIAGNOSTICS
+                        .get_or_init(|| std::env::var_os("EDEN_NATIVE_DRAW_DIAGNOSTICS").is_some())
+                    {
+                        dump_words("native-compute-mme.bin".into(), &(*current).native_code);
+                    }
+                    log::error!("Native MME failed: compute start={:#x}, pc={:#x}, consumed={}/{}, error={}, parameters={parameters:08x?}", (*positions())[entry], result.pc, result.consumed, parameters.len(), result.error);
+                }
+            }));
+            interpreter.dram = local_ram;
+            unsafe {
+                (*engine).native_interpreter = interpreter;
+            }
+            parameters.clear();
+            self.native_parameters = parameters;
+            if let Err(payload) = result {
+                std::panic::resume_unwind(payload);
+            }
+            return true;
+        }
+        self.native_registers[method as usize] = argument;
+        if method == 0x6c3 {
+            self.process_native_report_semaphore(argument);
+            return true;
+        }
+        let asid = self.memory_manager.lock().get_id() as u64;
+        if method == 0x5a || (0xc6..=0x108).contains(&method) {
+            trace_native_query(12, asid, method as u64, 0, 0, argument as u64, 0);
+        }
+        if method == 0x107 {
+            let address = (((self.native_registers[0xc6] as u64) << 32)
+                | self.native_registers[0xc7] as u64)
+                .wrapping_shl(8);
+            let program = ((self.native_registers[0xc8 + 49] as u64 & 0x1ffff) << 32)
+                | self.native_registers[0xc8 + 48] as u64;
+            let control = self.native_registers[0xa7];
+            log::debug!("Native inline QMD: address={address:#x}, program={program:#x}, control={control:#x}, grid={}/{}/{}",self.native_registers[0xc8+12],self.native_registers[0xc8+13]&0xffff,self.native_registers[0xc8+14]&0xffff);
+            static DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+            if *DIAGNOSTICS
+                .get_or_init(|| std::env::var_os("EDEN_NATIVE_DRAW_DIAGNOSTICS").is_some())
+            {
+                dump_words(
+                    "native-inline-qmd.bin".into(),
+                    &self.native_registers[0xc8..0x108],
+                );
+                dump_words(
+                    "native-inline-compute-registers.bin".into(),
+                    &self.native_registers,
+                );
+                if self
+                    .memory_manager
+                    .lock()
+                    .is_fully_mapped_range(program, 0x10000)
+                {
+                    let mut code = vec![0u8; 0x10000];
+                    self.memory_manager
+                        .lock()
+                        .read_block_unsafe(program, &mut code);
+                    let _ = std::fs::write("native-inline-compute-shader.bin", code);
+                }
+            }
+            if !self
+                .memory_manager
+                .lock()
+                .is_fully_mapped_range(address, 256)
+            {
+                unsafe {
+                    (*selected()).native_execution_failed = true;
+                }
+                log::error!("Unmapped native inline QMD destination");
+                return true;
+            }
+            let bytes: Vec<u8> = self.native_registers[0xc8..0x108]
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect();
+            unsafe {
+                self.rasterizer
+                    .expect("native inline QMD requires rasterizer")
+                    .as_mut()
+            }
+            .accelerate_inline_to_memory(address, 256, &bytes);
+            if control & (1 << 24) != 0 || self.native_registers[0xcc] & (1 << 12) == 0 {
+                let previous = self.native_registers[0xad];
+                self.native_registers[0xad] = (address >> 8) as u32;
+                self.process_native_method(0xb0, 3, true);
+                self.native_registers[0xad] = previous;
+            }
+            return true;
+        }
+        if self.front_macros && (0x45..=0x48).contains(&method) {
+            return true;
+        }
+        match method {
+            0x45 => {
+                unsafe {
+                    (*selected()).clear_code(argument);
+                }
+                true
+            }
+            0x46 => {
+                unsafe {
+                    (*selected()).add_code(0, argument);
+                }
+                true
+            }
+            0x47 => {
+                self.native_bind_pointer = argument;
+                true
+            }
+            0x48 => {
+                if self.native_bind_pointer < 0x80 {
+                    unsafe {
+                        (*positions())[self.native_bind_pointer as usize] = argument;
+                    }
+                    self.native_bind_pointer += 1;
+                } else {
+                    log::error!("Native compute macro bind out of bounds");
+                }
+                true
+            }
+            0xae | 0xaf | 0xb0 => {
+                let address = (self.native_registers[0xad] as u64) << 8;
+                let cpu = self
+                    .memory_manager
+                    .lock()
+                    .gpu_to_cpu_address(address)
+                    .unwrap_or(0);
+                trace_native_query(9, asid, address, cpu, method, argument as u64, 0);
+                if method == 0xae
+                    || (method == 0xaf && argument & 2 == 0)
+                    || (method == 0xb0 && matches!(argument & 15, 0 | 1))
+                {
+                    return true;
+                }
+                static DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+                let diagnostics = *DIAGNOSTICS
+                    .get_or_init(|| std::env::var_os("EDEN_NATIVE_DRAW_DIAGNOSTICS").is_some());
+                if argument & 15 == 12 && diagnostics {
+                    static CAPTURED: AtomicU32 = AtomicU32::new(0);
+                    if CAPTURED.fetch_add(1, Ordering::Relaxed) == 0
+                        && self
+                            .memory_manager
+                            .lock()
+                            .is_fully_mapped_range(address, 256)
+                    {
+                        let mut bytes = [0u8; 256];
+                        self.memory_manager
+                            .lock()
+                            .read_block_unsafe(address, &mut bytes);
+                        let words: Vec<u32> = bytes
+                            .chunks_exact(4)
+                            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                            .collect();
+                        let _ = std::fs::write("native-increment-qmd.bin", bytes);
+                        log::warn!("Native increment dependency descriptor: address={address:#x}, words={words:08x?}");
+                    }
+                }
+                let memory = Arc::clone(&self.memory_manager);
+                let rasterizer = self.rasterizer.expect("native QMD requires rasterizer");
+                let mut scheduler = std::mem::take(&mut self.native_qmd);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    scheduler.signal_with_dispatch(address,argument,
+                    |address,descriptor| {
+                        if !memory.lock().is_fully_mapped_range(address,256) { return false; }
+                        let mut bytes=[0u8;256]; memory.lock().read_block_unsafe(address,&mut bytes);
+                        for (word,bytes) in descriptor.iter_mut().zip(bytes.chunks_exact(4)) { *word=u32::from_le_bytes(bytes.try_into().unwrap()); }
+                        static LOGGED:AtomicU32=AtomicU32::new(0);
+                        if descriptor[53]&(1<<23)!=0 && LOGGED.load(Ordering::Relaxed)<8 {
+                            LOGGED.fetch_add(1,Ordering::Relaxed);
+                            log::info!("Native QMD {address:#x} releases: {:08x?} | {:08x?} | {:08x?}",&descriptor[24..28],&descriptor[28..32],&descriptor[52..56]);
+                        }
+                        for slot in 0..2 {
+                            let flags=descriptor[25+slot*4]; if flags&(1<<23)==0 {continue;}
+                            let destination=((flags as u64&0xff)<<32)|descriptor[24+slot*4] as u64;
+                            let cpu=memory.lock().gpu_to_cpu_address(destination).unwrap_or(0);
+                            trace_native_query(7+slot as u32,asid,destination,cpu,descriptor[4],descriptor[26+slot*4] as u64,flags);
+                        }
+                        true
+                    }, crate::native_qmd::FlaggedRelease(|address:u64,payload:u32,flags:u32| {
+                        if !memory.lock().is_fully_mapped_range(address,4) {return false;}
+                        let rasterizer=unsafe{rasterizer.as_mut()};
+                        if flags&(1<<26)!=0 || flags&(1<<19)!=0 {
+                            let memory=Arc::clone(&memory);
+                            rasterizer.signal_fence(Box::new(move || {
+                                let mut mm=memory.lock();
+                                let old=mm.read::<u32>(address);
+                                let value=if flags&(1<<26)!=0 {old.wrapping_add(payload)} else {old.max(payload)};
+                                mm.write::<u32>(address,value);
+                                let cpu=mm.gpu_to_cpu_address(address); drop(mm);
+                                if let Some(cpu)=cpu {crate::nx2::Nx2SemaphoreWaiters::get().on_write(cpu,value);}
+                                if flags&(1<<26)!=0 {
+                                    static WATCH:OnceLock<u64>=OnceLock::new();
+                                    let watch=*WATCH.get_or_init(||std::env::var("EDEN_NX2_SEM_WATCH").ok().and_then(|v|std::ffi::CString::new(v).ok()).map_or(0,|v|unsafe{libc::strtoull(v.as_ptr(),std::ptr::null_mut(),16) as u64}));
+                                    if watch!=0 && address&!0xf==watch {log::info!("Semaphore watch: QMD release add {address:#x} -> {value:#x}");}
+                                    trace_native_query(1,asid,address,cpu.unwrap_or(0),0,value as u64,1<<26);
+                                }
+                            }));
+                        } else {
+                            static WATCH:OnceLock<u64>=OnceLock::new();
+                            let watch=*WATCH.get_or_init(||std::env::var("EDEN_NX2_SEM_WATCH").ok().and_then(|v|std::ffi::CString::new(v).ok()).map_or(0,|v|unsafe{libc::strtoull(v.as_ptr(),std::ptr::null_mut(),16) as u64}));
+                            if watch!=0 && address&!0xf==watch&!0xf {log::info!("Semaphore watch: QMD release {address:#x} = {payload:#x} flags {flags:#x}");}
+                            rasterizer.query(address,crate::query_cache::types::QueryType::Payload as u32,crate::query_cache::types::QueryPropertiesFlags::IS_A_FENCE,payload,0);
+                        }
+                        true
+                    }), |qmd:&crate::native_qmd::Descriptor|unsafe{(*this).dispatch_native_compute(qmd)})
+                }));
+                self.native_qmd = scheduler;
+                let error = match result {
+                    Ok(error) => error,
+                    Err(payload) => std::panic::resume_unwind(payload),
+                };
+                if error.is_empty() {
+                    log::debug!("Native QMD control action={argument:#x}, QMD={address:#x}");
+                    return true;
+                }
+                unsafe {
+                    (*selected()).native_execution_failed = true;
+                }
+                let mut qmd = [0u32; 128];
+                let mapped = self
+                    .memory_manager
+                    .lock()
+                    .is_fully_mapped_range(address, 512);
+                if mapped {
+                    let mut bytes = [0u8; 512];
+                    self.memory_manager
+                        .lock()
+                        .read_block_unsafe(address, &mut bytes);
+                    for (w, b) in qmd.iter_mut().zip(bytes.chunks_exact(4)) {
+                        *w = u32::from_le_bytes(b.try_into().unwrap());
+                    }
+                }
+                let program = ((qmd[49] as u64) << 32) | qmd[48] as u64;
+                static FAILURES: OnceLock<Mutex<std::collections::HashMap<(u64, String), u32>>> =
+                    OnceLock::new();
+                let mut failures = FAILURES.get_or_init(Default::default).lock();
+                let count = failures.entry((program, error.into())).or_default();
+                let previous = *count;
+                *count = count.wrapping_add(1);
+                drop(failures);
+                if previous >= 2 {
+                    return true;
+                }
+                log::error!("Native QMD failed: {error}");
+                if diagnostics && mapped {
+                    dump_words("native-qmd.bin".into(), &qmd);
+                    dump_words("native-dispatch-mme.bin".into(), unsafe {
+                        &(*selected()).native_code
+                    });
+                    dump_words(
+                        "native-dispatch-registers.bin".into(),
+                        &self.native_registers,
+                    );
+                }
+                log::error!("Native compute dispatch unsupported: method={method:#x}, value={argument:#x}, QMD={address:#x}, words={qmd:08x?}");
+                true
+            }
+            _ => {
+                if (method as usize) < KEPLER_COMPUTE_REG_COUNT {
+                    self.regs[method as usize] = argument;
+                }
+                method != EXEC_UPLOAD && method != DATA_UPLOAD
+            }
+        }
+    }
+
+    /// Port of KeplerCompute::DispatchNativeCompute.
+    fn dispatch_native_compute(&mut self, qmd: &crate::native_qmd::Descriptor) -> bool {
+        use shader_recompiler::exception::{
+            InvalidArgument, LogicError, NotImplementedException, RuntimeError, ShaderException,
+        };
+        // Assign into the original LaunchParams bitfields, including their narrower widths.
+        self.launch_description = LaunchParams::default();
+        self.launch_description.grid_dim_x = qmd[12] & 0x7fffffff;
+        self.launch_description.grid_dim_y = qmd[13] & 0xffff;
+        self.launch_description.grid_dim_z = qmd[14] & 0xffff;
+        self.launch_description.shared_alloc = qmd[17] & 0x3ffff;
+        self.launch_description.block_dim_x = qmd[18] >> 16;
+        self.launch_description.block_dim_y = qmd[19] & 0xffff;
+        self.launch_description.block_dim_z = qmd[19] >> 16;
+        self.launch_description.const_buffer_enable_mask = qmd[20] & 0xff;
+        self.launch_description.local_pos_alloc = qmd[23] & 0xfffff;
+        self.launch_description.local_crs_alloc = qmd[50] & 0xfffff;
+        self.regs[CODE_LOC_BASE as usize + 1] = qmd[48];
+        self.regs[CODE_LOC_BASE as usize] = qmd[49] & 0x1ffff;
+        for slot in 0..NUM_CONST_BUFFERS {
+            let high = qmd[33 + slot * 2];
+            if high & 0x1ff00 != 0 {
+                log::error!("Native compute constant address exceeds supported GPU width");
+                return false;
+            }
+            self.launch_description.const_buffers[slot] = ConstBufferConfig {
+                address: ((high as u64 & 0xff) << 32) | qmd[32 + slot * 2] as u64,
+                size: ((high >> 19) & 0x1fff) << 4,
+            };
+        }
+        if self.launch_description.block_dim_x == 0
+            || self.launch_description.block_dim_y == 0
+            || self.launch_description.block_dim_z == 0
+        {
+            return false;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Existing Rust rasterizer adapter snapshots the bound engine's launch state.
+            let dispatch = DispatchCall {
+                launch_description: self.launch_description.clone(),
+                launch_desc_loc: self.launch_desc_address(),
+                indirect_compute_address: self.indirect_compute,
+                code_address: self.code_address(),
+                tsc_address: self.tsc_address(),
+                tsc_limit: self.tsc_limit(),
+                tic_address: self.tic_address(),
+                tic_limit: self.tic_limit(),
+                tex_cb_index: self.tex_cb_index(),
+            };
+            let rasterizer = self
+                .rasterizer
+                .map(|handle| unsafe { handle.as_mut() })
+                .expect("native compute requires a rasterizer");
+            rasterizer.dispatch_compute(&dispatch);
+        }));
+        if let Err(payload) = result {
+            // Catch only Shader::Exception descendants, never general Rust failures.
+            let message = if let Some(error) = payload.downcast_ref::<ShaderException>() {
+                error.to_string()
+            } else if let Some(error) = payload.downcast_ref::<LogicError>() {
+                error.to_string()
+            } else if let Some(error) = payload.downcast_ref::<RuntimeError>() {
+                error.to_string()
+            } else if let Some(error) = payload.downcast_ref::<NotImplementedException>() {
+                error.to_string()
+            } else if let Some(error) = payload.downcast_ref::<InvalidArgument>() {
+                error.to_string()
+            } else {
+                std::panic::resume_unwind(payload)
+            };
+            static LOGGED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+            if LOGGED
+                .get_or_init(Default::default)
+                .lock()
+                .insert(message.clone())
+            {
+                log::error!("Native compute shader rejected: {message}");
+            }
+            if message.contains("matrix multiply") {
+                self.describe_native_resources(qmd);
+                return self.upscale_instead_of_native_program();
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Port of KeplerCompute::DescribeNativeResources.
+    fn describe_native_resources(&self, qmd: &crate::native_qmd::Descriptor) {
+        static DESCRIBED: AtomicU32 = AtomicU32::new(0);
+        if DESCRIBED.fetch_add(1, Ordering::Relaxed) >= 2 {
+            return;
+        }
+        let cbuf = &self.launch_description.const_buffers[0];
+        log::info!("Native resources: cbuf0 {:#x} size {:#x}, grid {}x{}x{}, block {}x{}x{}, tic pool {:#x}",
+            cbuf.address, cbuf.size, qmd[12], qmd[13] & 0xffff, qmd[14] & 0xffff,
+            self.launch_description.block_dim_x, self.launch_description.block_dim_y,
+            self.launch_description.block_dim_z, self.tic_address());
+        for offset in (0x80..0x120).step_by(4) {
+            let handle = self
+                .memory_manager
+                .lock()
+                .read::<u32>(cbuf.address + offset);
+            let tic_index = handle & 0xfffff;
+            if handle == 0 || tic_index > self.tic_limit() {
+                continue;
+            }
+            let tic = self.get_tic_entry(tic_index);
+            log::info!("  handle @{offset:#x} = {handle:#x}: tic {tic_index} address {:#x} {}x{} format {:#x} types {}/{}/{}/{}",
+                tic.address(), tic.width(), tic.height(), tic.format(), tic.r_type(), tic.g_type(), tic.b_type(), tic.a_type());
+        }
+    }
+
+    /// Port of KeplerCompute::UpscaleInsteadOfNativeProgram.
+    fn upscale_instead_of_native_program(&mut self) -> bool {
+        use super::fermi_2d::{Config, Filter, MemoryLayout, Operation, Surface};
+        use crate::cache_types::CacheType;
+        use crate::gpu::RenderTargetFormat as RTFormat;
+        use crate::textures::texture::TextureFormat;
+
+        let cbuf_address = self.launch_description.const_buffers[0].address;
+        let image = |offset: u64| {
+            let index = self
+                .memory_manager
+                .lock()
+                .read::<u32>(cbuf_address + offset)
+                & 0xfffff;
+            if index > self.tic_limit() {
+                None
+            } else {
+                Some(self.get_tic_entry(index))
+            }
+        };
+        let (Some(input), Some(output)) = (image(0x90), image(0xa0)) else {
+            return false;
+        };
+        if input.format() != output.format()
+            || input.address() == 0
+            || output.address() == 0
+            || output.width() <= input.width()
+            || !input.is_block_linear()
+            || !output.is_block_linear()
+        {
+            return false;
+        }
+        let format = match TextureFormat::from_raw(input.format()) {
+            Some(TextureFormat::A2B10G10R10) => RTFormat::A2B10G10R10Unorm,
+            Some(TextureFormat::A8B8G8R8) => RTFormat::A8B8G8R8Unorm,
+            Some(TextureFormat::B10G11R11) => RTFormat::B10G11R11Float,
+            Some(TextureFormat::R16G16B16A16) => RTFormat::R16G16B16A16Float,
+            _ => return false,
+        };
+        let surface = |tic: &TicEntry| Surface {
+            format: format as u32,
+            linear: MemoryLayout::BlockLinear as u32,
+            block_dimensions: tic.block_width()
+                | (tic.block_height() << 4)
+                | (tic.block_depth() << 8),
+            depth: 1,
+            width: tic.width(),
+            height: tic.height(),
+            addr_upper: (tic.address() >> 32) as u32,
+            addr_lower: tic.address() as u32,
+            ..Surface::default()
+        };
+        let config = Config {
+            operation: Operation::SrcCopy,
+            filter: Filter::Bilinear,
+            must_accelerate: true,
+            dst_x0: 0,
+            dst_y0: 0,
+            dst_x1: output.width() as i32,
+            dst_y1: output.height() as i32,
+            src_x0: 0,
+            src_y0: 0,
+            src_x1: input.width() as i32,
+            src_y1: input.height() as i32,
+        };
+        // These lambdas are function-local in upstream; preserve libc prefix/sign parsing.
+        static SAMPLE_AT: OnceLock<u32> = OnceLock::new();
+        let sample_at = *SAMPLE_AT.get_or_init(|| {
+            std::env::var_os("EDEN_NX2_SAMPLE_AT")
+                .map(|value| {
+                    let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
+                    unsafe { libc::strtoul(value.as_ptr(), std::ptr::null_mut(), 10) as u32 }
+                })
+                .unwrap_or(20)
+        });
+        let rasterizer = self
+            .rasterizer
+            .map(|handle| unsafe { handle.as_mut() })
+            .expect("native upscale requires a rasterizer");
+        static SAMPLED: AtomicU32 = AtomicU32::new(0);
+        if SAMPLED.fetch_add(1, Ordering::Relaxed) == sample_at {
+            let mut sample = |tic: &TicEntry| {
+                let size = tic.width() as u64 * tic.height() as u64 * 4;
+                let device = self.memory_manager.lock().gpu_to_cpu_address(tic.address());
+                if let Some(device) = device {
+                    rasterizer.flush_region(device, size, CacheType::ALL);
+                }
+                let (mut nonzero, mut samples, mut sum) = (0u32, 0u32, 0u64);
+                for offset in (0..size).step_by(4096 + 4) {
+                    let word = self
+                        .memory_manager
+                        .lock()
+                        .read::<u32>(tic.address() + offset);
+                    samples += 1;
+                    nonzero += u32::from(word != 0);
+                    sum +=
+                        ((word & 0x3ff) + ((word >> 10) & 0x3ff) + ((word >> 20) & 0x3ff)) as u64;
+                }
+                log::info!("Upscale fallback image {:#x}: {nonzero}/{samples} sampled words non-zero, mean channel {}", tic.address(), if samples != 0 {sum / (samples as u64 * 3)} else {0});
+            };
+            sample(&input);
+            sample(&output);
+            for address in [
+                0x8116a03000u64,
+                0x8117ae5000,
+                0x8114b62000,
+                0x8115a63000,
+                0x8117904000,
+                0x8114a02000,
+            ] {
+                let size = 2560u64 * 1440 * 4;
+                let device = self.memory_manager.lock().gpu_to_cpu_address(address);
+                if let Some(device) = device {
+                    rasterizer.flush_region(device, size, CacheType::ALL);
+                }
+                let (mut nonzero, mut samples, mut distinct, mut last) = (0u32, 0u32, 0u32, 0u32);
+                for offset in (0..size).step_by(4096 + 4) {
+                    let word = self.memory_manager.lock().read::<u32>(address + offset);
+                    samples += 1;
+                    nonzero += u32::from(word != 0);
+                    distinct += u32::from(word != last);
+                    last = word;
+                }
+                log::info!("Upscale fallback target {address:#x}: {nonzero}/{samples} non-zero, {distinct} changes");
+            }
+        }
+        let mut source = surface(&input);
+        static OVERRIDE_SOURCE: OnceLock<u64> = OnceLock::new();
+        let override_source = *OVERRIDE_SOURCE.get_or_init(|| {
+            std::env::var_os("EDEN_NX2_UPSCALE_SOURCE")
+                .map(|value| {
+                    let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
+                    unsafe { libc::strtoull(value.as_ptr(), std::ptr::null_mut(), 16) as u64 }
+                })
+                .unwrap_or(0)
+        });
+        if override_source != 0 {
+            source.addr_upper = (override_source >> 32) as u32;
+            source.addr_lower = override_source as u32;
+            if let Some(value) = std::env::var_os("EDEN_NX2_UPSCALE_SOURCE_FORMAT") {
+                let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
+                source.format =
+                    unsafe { libc::strtoul(value.as_ptr(), std::ptr::null_mut(), 16) as u32 };
+            }
+        }
+        let done = rasterizer.accelerate_surface_copy(&source, &surface(&output), &config);
+        static CHECKED: AtomicU32 = AtomicU32::new(0);
+        if CHECKED.fetch_add(1, Ordering::Relaxed) == sample_at {
+            let size = output.width() as u64 * output.height() as u64 * 4;
+            let device = self
+                .memory_manager
+                .lock()
+                .gpu_to_cpu_address(output.address());
+            if let Some(device) = device {
+                rasterizer.flush_region(device, size, CacheType::ALL);
+            }
+            let (mut nonzero, mut samples, mut changes, mut last) = (0u32, 0u32, 0u32, 0u32);
+            for offset in (0..size).step_by(4096 + 4) {
+                let word = self
+                    .memory_manager
+                    .lock()
+                    .read::<u32>(output.address() + offset);
+                samples += 1;
+                nonzero += u32::from(word != 0);
+                changes += u32::from(word != last);
+                last = word;
+            }
+            log::info!("Upscale fallback output after blit: {nonzero}/{samples} non-zero, {changes} changes");
+        }
+        static TRACE_AT: OnceLock<u32> = OnceLock::new();
+        let trace_at = *TRACE_AT.get_or_init(|| {
+            std::env::var_os("EDEN_NX2_TRACE_AFTER_UPSCALE")
+                .map(|value| {
+                    let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
+                    unsafe { libc::strtoul(value.as_ptr(), std::ptr::null_mut(), 10) as u32 }
+                })
+                .unwrap_or(30)
+        });
+        static COUNT: AtomicU32 = AtomicU32::new(0);
+        if COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1) == trace_at {
+            G_NX2_TRACE_DRAWS_AFTER_UPSCALE.store(40, Ordering::SeqCst);
+        }
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+            log::info!("Upscale fallback {:#x} {}x{} block {}/{}/{} -> {:#x} {}x{} block {}/{}/{} levels {}: {}",
+                input.address(), input.width(), input.height(), input.block_width(), input.block_height(), input.block_depth(),
+                output.address(), output.width(), output.height(), output.block_width(), output.block_height(), output.block_depth(),
+                output.max_mip_level(), if done {"blitted"} else {"not accelerated"});
+        }
+        done
+    }
+
+    /// Port of ProcessNativeReportSemaphore: SET_REPORT_SEMAPHORE_A-D.
+    fn process_native_report_semaphore(&mut self, argument: u32) {
+        use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let address = (u64::from(self.native_registers[0x6c0] & 0x1ffffff) << 32)
+            | u64::from(self.native_registers[0x6c1]);
+        let payload = self.native_registers[0x6c2];
+        let operation = argument & 3;
+        let one_word = (argument >> 28) & 1 != 0;
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 32 {
+            log::info!("Native compute report semaphore {address:#x} = {payload:#x}, control {argument:#x}");
+        }
+        if operation != 0 && operation != 2 {
+            log::warn!("Native compute report semaphore operation {operation} not supported");
+            return;
+        }
+        let rasterizer = self
+            .rasterizer
+            .map(|handle| unsafe { handle.as_mut() })
+            .expect("native compute semaphore requires a rasterizer");
+        if (argument >> 3) & 1 != 0 {
+            let reduction = (argument >> 9) & 7;
+            // Keep the exact memory owner alive until the fence. The source
+            // captures this solely to reach memory_manager; no engine state is
+            // read by the callback, and the value must be read at fence time.
+            let memory = Arc::clone(&self.memory_manager);
+            rasterizer.signal_fence(Box::new(move || {
+                let mut memory = memory.lock();
+                let old_value = memory.read::<u32>(address);
+                let value = match reduction {
+                    0 => old_value.wrapping_add(payload),
+                    1 => old_value.min(payload),
+                    2 => old_value.max(payload),
+                    3 => {
+                        if old_value >= payload {
+                            0
+                        } else {
+                            old_value.wrapping_add(1)
+                        }
+                    }
+                    4 => {
+                        if old_value == 0 || old_value > payload {
+                            payload
+                        } else {
+                            old_value - 1
+                        }
+                    }
+                    5 => old_value & payload,
+                    6 => old_value | payload,
+                    _ => old_value ^ payload,
+                };
+                memory.write::<u32>(address, value);
+            }));
+            return;
+        }
+        rasterizer.query(
+            address,
+            QueryType::Payload as u32,
+            if one_word {
+                QueryPropertiesFlags::IS_A_FENCE
+            } else {
+                QueryPropertiesFlags::HAS_TIMEOUT
+            },
+            payload,
+            0,
+        );
+    }
+
     /// Corresponds to upstream `KeplerCompute::CallMethod`.
     pub fn call_method(&mut self, method: u32, argument: u32, _is_last_call: bool) {
         let idx = method as usize;
-        assert!(
-            idx < KEPLER_COMPUTE_REG_COUNT,
-            "Invalid KeplerCompute register, increase the size of the register array"
-        );
+        if self.native_mode {
+            if idx < self.native_plain_methods.len() && self.native_plain_methods[idx] {
+                self.native_registers[idx] = argument;
+                if idx < KEPLER_COMPUTE_REG_COUNT {
+                    self.regs[idx] = argument;
+                }
+                return;
+            }
+            if self.process_native_method(method, argument, _is_last_call) {
+                return;
+            }
+        }
+        if idx >= KEPLER_COMPUTE_REG_COUNT {
+            log::error!("Compute register out of range: {method:#x}");
+            return;
+        }
         self.regs[idx] = argument;
 
         match method {
@@ -364,6 +1376,12 @@ impl KeplerCompute {
             (amount as usize) <= args.len(),
             "KeplerCompute multi-method amount exceeds the argument span"
         );
+        if self.native_mode {
+            for (i, &arg) in args.iter().take(amount as usize).enumerate() {
+                self.call_method(method, arg, methods_pending.wrapping_sub(i as u32) <= 1);
+            }
+            return;
+        }
         if method == DATA_UPLOAD {
             self.upload_address = self.interface_state.current_dma_segment;
             self.upload_dirty = self.interface_state.current_dirty;
@@ -554,8 +1572,9 @@ impl EngineInterface for KeplerCompute {
         let sink = std::mem::take(&mut self.interface_state.method_sink);
         for (method, value) in sink {
             let idx = method as usize;
-            assert!(idx < KEPLER_COMPUTE_REG_COUNT);
-            self.regs[idx] = value;
+            if idx < KEPLER_COMPUTE_REG_COUNT {
+                self.regs[idx] = value;
+            }
         }
     }
 
@@ -608,6 +1627,260 @@ mod tests {
     }
 
     #[test]
+    fn native_method_routing_runs_shared_macros_qmd_and_fenced_releases() {
+        const CHILD: &str = "RUZU_NATIVE_COMPUTE_ROUTING_CHILD";
+        let Ok(mode) = std::env::var(CHILD) else {
+            for mode in ["jit", "memo", "interpreter"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        std::thread::current().name().unwrap(),
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, mode)
+                    .env("EDEN_NX2_MME_JIT", if mode == "jit" { "1" } else { "0" })
+                    .env("EDEN_NX2_MME_MEMO", if mode == "memo" { "1" } else { "0" })
+                    .env_remove("EDEN_NX2_SEM_WATCH")
+                    .env_remove("EDEN_NX2_MME_DUMP")
+                    .env_remove("EDEN_NATIVE_DRAW_DIAGNOSTICS")
+                    .env_remove("EDEN_NX2_REJECT")
+                    .env_remove("EDEN_NX2_SHADER_DUMP")
+                    .env_remove("EDEN_NATIVE_SHADER_OVERRIDE_DIR")
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "child {mode}");
+            }
+            return;
+        };
+        let context = Arc::new(parking_lot::ReentrantMutex::new(std::cell::RefCell::new(
+            crate::r#macro::NativeMacroContext::default(),
+        )));
+        let encode = |fields: &[(usize, usize, u32)]| {
+            let mut bits = 0u128;
+            for low in [15, 20, 25, 51, 56, 61] {
+                bits |= 24u128 << low;
+            }
+            for &(low, count, value) in fields {
+                let mask = ((1u128 << count) - 1) << low;
+                bits = (bits & !mask) | (((value as u128) << low) & mask);
+            }
+            [(bits >> 64) as u32, (bits >> 32) as u32, bits as u32]
+        };
+        let code = |value| {
+            [
+                encode(&[
+                    (0, 1, 1),
+                    (30, 16, 0x200),
+                    (66, 16, value),
+                    (82, 3, 5),
+                    (85, 4, 6),
+                ]),
+                encode(&[]),
+            ]
+            .concat()
+        };
+        {
+            let guard = context.lock();
+            let mut context = guard.borrow_mut();
+            context.engine.native_turing = true;
+            context.compute_engine.native_turing = true;
+            context.engine.clear_code(0);
+            for word in code(0x55) {
+                context.engine.add_code(0, word);
+            }
+        }
+        let mut backing = vec![0u8; 0x1000];
+        let mut qmd = [0u32; 64];
+        qmd[12] = 1;
+        qmd[13] = 1;
+        qmd[14] = 1;
+        qmd[18] = (2 << 16) | 0x30;
+        qmd[19] = (1 << 16) | 1;
+        for (slot, address, payload, flags) in [
+            (24, 0x7800, 7, 1 << 26),
+            (28, 0x7804, 4, 1 << 19),
+            (52, 0x7808, 99, 0),
+        ] {
+            qmd[slot] = address;
+            qmd[slot + 1] = (1 << 23) | (1 << 30) | flags;
+            qmd[slot + 2] = payload;
+        }
+        for base in [0x100, 0x200] {
+            for (index, word) in qmd.iter().enumerate() {
+                backing[base + index * 4..base + index * 4 + 4]
+                    .copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let mut engine = new_owner_backed_engine(&backing, 0x7000);
+        let rasterizer = TestRasterizer::new(0, 0);
+        rasterizer.defer_fences.set(true);
+        engine.bind_rasterizer(&rasterizer);
+        engine.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
+        assert!(engine.is_native_mode());
+        assert!(engine.interface_state.execution_mask.iter().all(|&bit| bit));
+        let ram = Arc::new(Mutex::new([0u32; 0xc00]));
+        ram.lock()[0x27] = 0xabcdef;
+        engine.set_native_data_ram(Some(ram.clone()));
+        engine.call_method(0xe01, 0, true);
+        assert!(engine.native_executing_macro.is_none());
+        engine.call_method(0xe00, 0, true);
+        assert_eq!(engine.native_registers[0x200], 0x55);
+        assert!(!engine.native_compute_uploaded);
+        engine.call_method(0x47, 0, true);
+        engine.call_method(0x48, 0, true);
+        engine.call_method(0x45, 0, true);
+        let words = code(0x99);
+        engine.call_multi_method(0x46, &words, words.len() as u32, words.len() as u32);
+        assert!(engine.native_compute_uploaded);
+        engine.call_method(0xe00, 7, false);
+        assert_eq!(engine.native_registers[0x200], 0x55);
+        engine.call_multi_method(0xe01, &[8], 1, 1);
+        assert_eq!(engine.native_registers[0x200], 0x99);
+        engine.call_method(0x200, 0, true);
+        engine.call_method(0xe00, 7, false);
+        engine.call_method(0xe01, 8, true);
+        assert_eq!(engine.native_registers[0x200], 0x99);
+        assert!(engine.native_parameters.is_empty());
+        assert_eq!(ram.lock()[0x27], 0xabcdef);
+        {
+            let guard = context.lock();
+            let context = guard.borrow();
+            assert_eq!(context.engine.native_code[..6], code(0x55));
+            assert_eq!(context.compute_engine.native_code[..6], code(0x99));
+            assert!(!context.compute_engine.native_execution_failed);
+            if mode == "memo" {
+                assert!(context.compute_engine.native_memo.size() > 0);
+            }
+            if mode == "interpreter" {
+                assert_eq!(context.compute_engine.native_memo.size(), 0);
+            }
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(context.compute_engine.native_jit.is_some(), mode == "jit");
+        }
+        engine.set_native_data_ram(None);
+        engine.call_method(0xe00, 7, false);
+        engine.call_method(0xe01, 8, true);
+        assert!(Arc::ptr_eq(
+            context
+                .lock()
+                .borrow()
+                .compute_engine
+                .native_interpreter
+                .active_dram
+                .as_ref()
+                .unwrap(),
+            &ram
+        ));
+        engine.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
+        assert!(engine.native_compute_uploaded);
+        engine.call_method(0x48, 3, true);
+        assert!(engine.native_macro_compute);
+        engine.call_method(0xd00, 0x1234, true);
+        assert_eq!(engine.native_registers[0xd00], 0x1234);
+        engine.call_method(0x1000, 1, true); // logged unsupported register, not a host panic
+        engine.push_method_sink(0xd00, 42);
+        engine.consume_sink_impl();
+        // Native QMD ignores upload-only/action0/action1, then dispatches and releases at fences.
+        engine.call_method(0xad, 0x71, true);
+        for (method, value) in [(0xae, 3), (0xaf, 0), (0xb0, 0), (0xb0, 1)] {
+            engine.call_method(method, value, true);
+        }
+        assert_eq!(rasterizer.dispatches.get(), 0);
+        engine.memory_manager.lock().write::<u32>(0x7800, 1);
+        engine.memory_manager.lock().write::<u32>(0x7804, 2);
+        engine.call_method(0xb0, 3, true);
+        assert_eq!(rasterizer.dispatches.get(), 1);
+        assert_eq!(rasterizer.pending_fences.borrow().len(), 2);
+        assert_eq!(rasterizer.queries.borrow().last().unwrap().0, 0x7808);
+        assert_eq!(rasterizer.queries.borrow().last().unwrap().3, 99);
+        engine.memory_manager.lock().write::<u32>(0x7800, 10);
+        engine.memory_manager.lock().write::<u32>(0x7804, 9);
+        let waiters = crate::nx2::Nx2SemaphoreWaiters::get();
+        waiters.add(
+            0xc001,
+            0x7800,
+            17,
+            crate::nx2::Nx2SemaphoreWaiters::ACQUIRE_EQUAL,
+        );
+        waiters.add(
+            0xc002,
+            0x7804,
+            9,
+            crate::nx2::Nx2SemaphoreWaiters::ACQUIRE_EQUAL,
+        );
+        loop {
+            let fence = rasterizer.pending_fences.borrow_mut().pop_front();
+            let Some(fence) = fence else {
+                break;
+            };
+            fence();
+        }
+        assert_eq!(engine.memory_manager.lock().read::<u32>(0x7800), 17);
+        assert_eq!(engine.memory_manager.lock().read::<u32>(0x7804), 9);
+        assert!(waiters.latched(0xc001));
+        assert!(waiters.latched(0xc002));
+        waiters.remove(0xc001);
+        waiters.remove(0xc002);
+        // Inline upload keeps the original AD across its optional recursive dispatch.
+        engine.native_registers[0xc8..0x108].copy_from_slice(&qmd);
+        engine.call_method(0xc6, 0, true);
+        engine.call_method(0xc7, 0x72, true);
+        engine.call_method(0xa7, 1 << 24, true);
+        engine.call_method(0x107, qmd[63], true);
+        assert_eq!(rasterizer.dispatches.get(), 2);
+        assert_eq!(engine.native_registers[0xad], 0x71);
+        let uploads = rasterizer.inline_uploads.borrow();
+        let upload = uploads.last().unwrap();
+        assert_eq!((upload.0, upload.1), (0x7200, 256));
+        assert_eq!(
+            upload.2,
+            qmd.iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        drop(uploads);
+        engine.call_method(0xad, 0xdead, true);
+        engine.call_method(0xb0, 3, true);
+        assert!(
+            context
+                .lock()
+                .borrow()
+                .compute_engine
+                .native_execution_failed
+        );
+        // The native compute environment now lowers real code at offset zero and starts at SPH size.
+        for (index, word) in [0x794du32, 0, 0x03800000, 0].into_iter().enumerate() {
+            backing[0x400 + index * 4..0x404 + index * 4].copy_from_slice(&word.to_le_bytes());
+        }
+        engine.call_method(CODE_LOC_BASE, 0, true);
+        engine.call_method(CODE_LOC_BASE + 1, 0x7400, true);
+        let env = crate::shader_environment::ComputeEnvironment::from_kepler_compute(
+            &engine,
+            engine.memory_manager.clone(),
+        );
+        assert_eq!(env.generic_environment().source_size_bytes(), 16);
+        assert_eq!(env.generic_environment().start_address(), 0x50);
+        assert_eq!(env.generic_environment().cached_size_bytes(), 120);
+        let other = Arc::new(parking_lot::ReentrantMutex::new(std::cell::RefCell::new(
+            crate::r#macro::NativeMacroContext::default(),
+        )));
+        engine.set_native_macro_mode(Some(other.clone()), Some(other));
+        assert!(!engine.native_compute_uploaded);
+        engine.set_native_macro_mode(None, None);
+        assert!(!engine.is_native_mode());
+        assert_eq!(
+            engine
+                .interface_state
+                .execution_mask
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| v.then_some(i))
+                .collect::<Vec<_>>(),
+            [EXEC_UPLOAD as usize, DATA_UPLOAD as usize, LAUNCH as usize]
+        );
+    }
+
+    #[test]
     fn upload_dirty_snapshot_survives_until_indirect_launch() {
         for multi in [false, true] {
             for was_dirty in [false, true] {
@@ -624,15 +1897,25 @@ mod tests {
                     engine.call_method(EXEC_UPLOAD, 1, true);
                     engine.set_current_dma_segment(0x11000);
                     engine.set_current_dirty(was_dirty);
-                    if multi { engine.call_multi_method(DATA_UPLOAD, &[42], 1, 1); }
-                    else { engine.call_method(DATA_UPLOAD, 42, true); }
+                    if multi {
+                        engine.call_multi_method(DATA_UPLOAD, &[42], 1, 1);
+                    } else {
+                        engine.call_method(DATA_UPLOAD, 42, true);
+                    }
                     assert_eq!(engine.upload_dirty, was_dirty);
                     assert!(!engine.current_dirty());
                     engine.call_method(EXEC_UPLOAD, 1, true);
                     assert_eq!(engine.uploads.last().unwrap().was_dirty, was_dirty);
                     engine.call_method(LAUNCH, 1, true);
-                    assert_eq!(rasterizer.last_dispatch.borrow().as_ref().unwrap().indirect_compute_address,
-                        (was_dirty || source_dirty).then_some(0x11000));
+                    assert_eq!(
+                        rasterizer
+                            .last_dispatch
+                            .borrow()
+                            .as_ref()
+                            .unwrap()
+                            .indirect_compute_address,
+                        (was_dirty || source_dirty).then_some(0x11000)
+                    );
                     assert!(engine.uploads.is_empty());
                     assert_eq!(engine.get_indirect_compute_address(), None);
                 }
@@ -669,24 +1952,410 @@ mod tests {
         KeplerCompute::new(memory_manager)
     }
 
+    #[test]
+    fn native_dispatch_decodes_qmd_bitfields_rejects_invalid_buffers_and_preserves_failures() {
+        let mut engine = new_test_engine();
+        let rasterizer = TestRasterizer::new(0, 0);
+        engine.bind_rasterizer(&rasterizer);
+        engine.launch_description.program_start = 0x1234;
+        engine.launch_description.linked_tsc = true;
+        engine.launch_description.local_neg_alloc = 99;
+        engine.indirect_compute = Some(0x123456);
+        let mut qmd = [0u32; 64];
+        qmd[12] = 0xfedcba98;
+        qmd[13] = 0xdead1234;
+        qmd[14] = 0xbeef5678;
+        qmd[17] = u32::MAX;
+        qmd[18] = 0x0020abcd;
+        qmd[19] = 0x00030004;
+        qmd[20] = 0xffff00a5;
+        qmd[23] = 0xabfedcba;
+        qmd[50] = 0xcdabcdef;
+        qmd[48] = 0x87654321;
+        qmd[49] = 0xfffe1234;
+        for slot in 0..8 {
+            qmd[32 + slot * 2] = 0x80000000 + slot as u32;
+            qmd[33 + slot * 2] = 0xfff80080 + slot as u32;
+        }
+        assert!(engine.dispatch_native_compute(&qmd));
+        let dispatch = rasterizer.last_dispatch.borrow().as_ref().unwrap().clone();
+        let launch = &dispatch.launch_description;
+        assert_eq!(
+            (launch.grid_dim_x, launch.grid_dim_y, launch.grid_dim_z),
+            (0x7edcba98, 0x1234, 0x5678)
+        );
+        assert_eq!(
+            (launch.block_dim_x, launch.block_dim_y, launch.block_dim_z),
+            (32, 4, 3)
+        );
+        assert_eq!(
+            (
+                launch.shared_alloc,
+                launch.const_buffer_enable_mask,
+                launch.local_pos_alloc,
+                launch.local_crs_alloc
+            ),
+            (0x3ffff, 0xa5, 0xedcba, 0xbcdef)
+        );
+        assert_eq!(dispatch.code_address, 0x1234_87654321);
+        assert_eq!(dispatch.indirect_compute_address, Some(0x123456));
+        assert_eq!(
+            (
+                launch.program_start,
+                launch.linked_tsc,
+                launch.local_neg_alloc
+            ),
+            (0, false, 0)
+        );
+        for slot in 0..8 {
+            assert_eq!(
+                launch.const_buffers[slot],
+                ConstBufferConfig {
+                    address: ((0x80 + slot as u64) << 32) | (0x80000000 + slot as u64),
+                    size: 0x1fff0
+                }
+            );
+        }
+        qmd[37] |= 0x100; // reject slot 2, even with its enable bit cleared
+        qmd[20] = 0;
+        assert!(!engine.dispatch_native_compute(&qmd));
+        assert_eq!(
+            engine.launch_description.const_buffers[1],
+            launch.const_buffers[1]
+        );
+        assert_eq!(
+            engine.launch_description.const_buffers[2],
+            ConstBufferConfig::default()
+        );
+        assert_eq!(rasterizer.dispatches.get(), 1);
+        qmd[37] &= !0x100;
+        for (word, mask) in [(18, 0xffff), (19, 0xffff0000), (19, 0xffff)] {
+            let old = qmd[word];
+            qmd[word] &= mask;
+            assert!(!engine.dispatch_native_compute(&qmd));
+            qmd[word] = old;
+        }
+        assert_eq!(rasterizer.dispatches.get(), 1);
+        qmd[12] = 0;
+        qmd[13] = 0;
+        qmd[14] = 0;
+        assert!(engine.dispatch_native_compute(&qmd)); // upstream rejects zero block dimensions, not grid dimensions
+        rasterizer.dispatch_failure.set(1);
+        assert!(!engine.dispatch_native_compute(&qmd));
+        assert!(rasterizer.copies.borrow().is_empty());
+        rasterizer.dispatch_failure.set(3);
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.dispatch_native_compute(&qmd)
+        }))
+        .unwrap_err();
+        assert_eq!(
+            *error.downcast_ref::<&str>().unwrap(),
+            "unrelated rasterizer panic"
+        );
+    }
+
+    #[test]
+    fn native_upscale_preserves_formats_validation_overrides_and_sampling_order() {
+        const CHILD: &str = "RUZU_NATIVE_UPSCALE_CHILD";
+        let Ok(mode) = std::env::var(CHILD) else {
+            for mode in ["normal", "override", "sample"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        std::thread::current().name().unwrap(),
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, mode)
+                    .env(
+                        "EDEN_NX2_SAMPLE_AT",
+                        if mode == "sample" { "0" } else { "4294967295" },
+                    )
+                    .env("EDEN_NX2_TRACE_AFTER_UPSCALE", "1")
+                    .env_remove("EDEN_NX2_UPSCALE_SOURCE")
+                    .env_remove("EDEN_NX2_UPSCALE_SOURCE_FORMAT");
+                if mode == "override" {
+                    command
+                        .env("EDEN_NX2_UPSCALE_SOURCE", "  +0x123456789tail")
+                        .env("EDEN_NX2_UPSCALE_SOURCE_FORMAT", "ca suffix");
+                }
+                assert!(command.status().unwrap().success(), "child {mode}");
+            }
+            return;
+        };
+        let mut backing = vec![0u8; 0x1000];
+        backing[0x90..0x94].copy_from_slice(&0xfff00000u32.to_le_bytes());
+        backing[0xa0..0xa4].copy_from_slice(&0xfff00001u32.to_le_bytes());
+        // Raw TIC descriptors: block-linear, Texture2D, distinct block dimensions.
+        let descriptors = [
+            [
+                8u32,
+                0x7800,
+                3 << 21,
+                1 | (2 << 3) | (3 << 6),
+                3 | (1 << 23),
+                1,
+                0,
+                0,
+            ],
+            [
+                8u32,
+                0x7900,
+                3 << 21,
+                2 | (3 << 3) | (1 << 6),
+                7 | (1 << 23),
+                0,
+                0,
+                0,
+            ],
+        ];
+        for (index, words) in descriptors.iter().enumerate() {
+            for (word, value) in words.iter().enumerate() {
+                let offset = 0x200 + index * 32 + word * 4;
+                backing[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let mut engine = new_owner_backed_engine(&backing, 0x7000);
+        engine.launch_description.const_buffers[0].address = 0x7000;
+        engine.regs[TIC_BASE as usize + 1] = 0x7200;
+        engine.regs[TIC_BASE as usize + 2] = 1;
+        let rasterizer = TestRasterizer::new(0, 0);
+        engine.bind_rasterizer(&rasterizer);
+        assert!(!engine.upscale_instead_of_native_program()); // accelerator failure is forwarded
+        assert_eq!(G_NX2_TRACE_DRAWS_AFTER_UPSCALE.load(Ordering::SeqCst), 40);
+        let (src, dst, config) = rasterizer.copies.borrow()[0];
+        assert_eq!(
+            src.address(),
+            if mode == "override" {
+                0x123456789
+            } else {
+                0x7800
+            }
+        );
+        assert_eq!(src.format, if mode == "override" { 0xca } else { 0xd5 });
+        assert_eq!(dst.address(), 0x7900);
+        assert_eq!(
+            (src.block_width(), src.block_height(), src.block_depth()),
+            (1, 2, 3)
+        );
+        assert_eq!(
+            (dst.block_width(), dst.block_height(), dst.block_depth()),
+            (2, 3, 1)
+        );
+        assert_eq!((src.depth, src.pitch, src.layer), (1, 0, 0));
+        assert_eq!(
+            (config.src_x1, config.src_y1, config.dst_x1, config.dst_y1),
+            (4, 2, 8, 1)
+        );
+        assert_eq!(config.operation, super::super::fermi_2d::Operation::SrcCopy);
+        assert_eq!(config.filter, super::super::fermi_2d::Filter::Bilinear);
+        assert!(config.must_accelerate);
+        if mode == "sample" {
+            assert_eq!(
+                &*rasterizer.copy_events.borrow(),
+                &["flush", "flush", "copy", "flush"]
+            );
+            assert_eq!(
+                &*rasterizer.flushes.borrow(),
+                &[
+                    (0x7800, 32, crate::cache_types::CacheType::ALL),
+                    (0x7900, 32, crate::cache_types::CacheType::ALL),
+                    (0x7900, 32, crate::cache_types::CacheType::ALL)
+                ]
+            );
+        } else {
+            assert!(rasterizer.flushes.borrow().is_empty());
+        }
+        rasterizer.copy_result.set(true);
+        if mode == "override" {
+            unsafe {
+                std::env::set_var("EDEN_NX2_UPSCALE_SOURCE", "999");
+                std::env::set_var("EDEN_NX2_UPSCALE_SOURCE_FORMAT", "d1");
+            }
+        }
+        for (texture, target) in [(9u32, 0xd1), (8, 0xd5), (0x21, 0xe0), (3, 0xca)] {
+            for offset in [0x200, 0x220] {
+                backing[offset..offset + 4].copy_from_slice(&texture.to_le_bytes());
+            }
+            assert!(engine.upscale_instead_of_native_program());
+            let copies = rasterizer.copies.borrow();
+            let (src, dst, _) = copies.last().unwrap();
+            assert_eq!(dst.format, target);
+            assert_eq!(src.format, if mode == "override" { 0xd1 } else { target });
+            assert_eq!(
+                src.address(),
+                if mode == "override" {
+                    0x123456789
+                } else {
+                    0x7800
+                }
+            );
+        }
+        let count = rasterizer.copies.borrow().len();
+        // Each unsupported condition returns before calling the accelerator.
+        for (offset, value) in [
+            (0x200, 1u32),
+            (0x220, 8),
+            (0x204, 0),
+            (0x224, 0),
+            (0x230, 3 | (1 << 23)),
+            (0x208, 2 << 21),
+            (0x228, 2 << 21),
+            (0xa0, 2),
+        ] {
+            let saved: [u8; 4] = backing[offset..offset + 4].try_into().unwrap();
+            if offset == 0x200 {
+                backing[0x220..0x224].copy_from_slice(&1u32.to_le_bytes());
+            }
+            backing[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                !engine.upscale_instead_of_native_program(),
+                "offset {offset:x}"
+            );
+            backing[offset..offset + 4].copy_from_slice(&saved);
+            backing[0x220..0x224].copy_from_slice(&3u32.to_le_bytes());
+        }
+        assert_eq!(rasterizer.copies.borrow().len(), count);
+        let mut qmd = [0u32; 64];
+        qmd[18] = 1 << 16;
+        qmd[19] = 1 | (1 << 16);
+        qmd[32] = 0x7000;
+        rasterizer.dispatch_failure.set(2);
+        assert!(engine.dispatch_native_compute(&qmd));
+        assert_eq!(rasterizer.copies.borrow().len(), count + 1);
+        rasterizer.copy_result.set(false);
+        assert!(!engine.dispatch_native_compute(&qmd));
+    }
+
+    #[test]
+    fn native_report_semaphore_reductions_read_at_fence_and_capture_parameters() {
+        let backing = vec![0u8; 0x1000];
+        let mut engine = new_owner_backed_engine(&backing, 0x7000);
+        let rasterizer = TestRasterizer::new(0, 0);
+        rasterizer.defer_fences.set(true);
+        engine.bind_rasterizer(&rasterizer);
+        let cases = [
+            (0, u32::MAX, 2, 1),
+            (1, u32::MAX, 2, 2),
+            (1, 1, 2, 1),
+            (2, 1, 2, 2),
+            (2, u32::MAX, 2, u32::MAX),
+            (3, 3, 4, 4),
+            (3, 4, 4, 0),
+            (3, 5, 4, 0),
+            (4, 0, 4, 4),
+            (4, 5, 4, 4),
+            (4, 4, 4, 3),
+            (4, 1, 4, 0),
+            (5, 0x33, 0x55, 0x11),
+            (6, 0x33, 0x55, 0x77),
+            (7, 0x33, 0x55, 0x66),
+        ];
+        for (reduction, value_at_fence, payload, expected) in cases {
+            engine
+                .memory_manager
+                .lock()
+                .write::<u32>(0x7000, 0xdeadbeef);
+            engine.native_registers[0x6c0] = 0;
+            engine.native_registers[0x6c1] = 0x7000;
+            engine.native_registers[0x6c2] = payload;
+            engine.process_native_report_semaphore(2 | (1 << 3) | (reduction << 9) | (1 << 28));
+            assert_eq!(engine.memory_manager.lock().read::<u32>(0x7000), 0xdeadbeef);
+            assert_eq!(rasterizer.pending_fences.borrow().len(), 1);
+            // Later register writes do not alter the enqueued address/payload;
+            // GPU memory changes, however, are observed when the fence runs.
+            engine.native_registers[0x6c1] = 0x7004;
+            engine.native_registers[0x6c2] = 999;
+            engine
+                .memory_manager
+                .lock()
+                .write::<u32>(0x7000, value_at_fence);
+            let callback = rasterizer.pending_fences.borrow_mut().pop_front().unwrap();
+            callback();
+            assert_eq!(
+                engine.memory_manager.lock().read::<u32>(0x7000),
+                expected,
+                "reduction {reduction}"
+            );
+            assert_eq!(engine.memory_manager.lock().read::<u32>(0x7004), 0);
+        }
+        assert!(rasterizer.queries.borrow().is_empty());
+    }
+
+    #[test]
+    fn native_report_semaphore_query_flags_address_and_unsupported_operations() {
+        let mut engine = new_test_engine();
+        assert!(engine.native_registers.iter().all(|&word| word == 0));
+        // Unsupported operations must return before touching the rasterizer.
+        for operation in [1, 3] {
+            engine.process_native_report_semaphore(operation | 8);
+        }
+        let rasterizer = TestRasterizer::new(0, 0);
+        rasterizer.defer_fences.set(true);
+        engine.bind_rasterizer(&rasterizer);
+        engine.native_registers[0x6c0] = u32::MAX;
+        engine.native_registers[0x6c1] = 0x12345678;
+        engine.native_registers[0x6c2] = 0xfedcba98;
+        for operation in [0, 2] {
+            for one_word in [false, true] {
+                engine.process_native_report_semaphore(operation | (u32::from(one_word) << 28));
+                assert_eq!(
+                    rasterizer.queries.borrow().last().copied(),
+                    Some((
+                        0x1ffffff_12345678,
+                        crate::query_cache::types::QueryType::Payload as u32,
+                        if one_word {
+                            QueryPropertiesFlags::IS_A_FENCE
+                        } else {
+                            QueryPropertiesFlags::HAS_TIMEOUT
+                        },
+                        0xfedcba98,
+                        0,
+                    ))
+                );
+            }
+        }
+        for operation in [1, 3] {
+            engine.process_native_report_semaphore(operation | 8);
+        }
+        assert_eq!(rasterizer.queries.borrow().len(), 4);
+        assert!(rasterizer.pending_fences.borrow().is_empty());
+    }
+
     struct TestRasterizer {
+        defer_fences: Cell<bool>,
+        pending_fences: RefCell<std::collections::VecDeque<Box<dyn FnOnce() + Send>>>,
+        queries: RefCell<Vec<(u64, u32, QueryPropertiesFlags, u32, u32)>>,
         accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,
         dirty_addr: u64,
         dirty_size: u64,
         dispatches: Cell<u32>,
+        dispatch_failure: Cell<u8>,
         last_dispatch: RefCell<Option<DispatchCall>>,
         inline_uploads: RefCell<Vec<(u64, usize, Vec<u8>)>>,
+        copies: RefCell<Vec<(Fermi2DSurface, Fermi2DSurface, Fermi2DConfig)>>,
+        copy_result: Cell<bool>,
+        flushes: RefCell<Vec<(u64, u64, crate::cache_types::CacheType)>>,
+        copy_events: RefCell<Vec<&'static str>>,
     }
 
     impl TestRasterizer {
         fn new(dirty_addr: u64, dirty_size: u64) -> Self {
             Self {
+                defer_fences: Cell::new(false),
+                pending_fences: RefCell::new(Default::default()),
+                queries: RefCell::new(Vec::new()),
                 accelerate_dma: Default::default(),
                 dirty_addr,
                 dirty_size,
                 dispatches: Cell::new(0),
+                dispatch_failure: Cell::new(0),
                 last_dispatch: RefCell::new(None),
                 inline_uploads: RefCell::new(Vec::new()),
+                copies: RefCell::new(Vec::new()),
+                copy_result: Cell::new(false),
+                flushes: RefCell::new(Vec::new()),
+                copy_events: RefCell::new(Vec::new()),
             }
         }
     }
@@ -711,18 +2380,31 @@ mod tests {
         fn dispatch_compute(&mut self, dispatch: &DispatchCall) {
             self.dispatches.set(self.dispatches.get() + 1);
             self.last_dispatch.replace(Some(dispatch.clone()));
+            match self.dispatch_failure.get() {
+                1 => std::panic::panic_any(shader_recompiler::exception::RuntimeError::new(
+                    "native failure",
+                )),
+                2 => std::panic::panic_any(
+                    shader_recompiler::exception::NotImplementedException::new("matrix multiply"),
+                ),
+                3 => panic!("unrelated rasterizer panic"),
+                _ => {}
+            }
         }
 
         fn reset_counter(&mut self, _query_type: u32) {}
 
         fn query(
             &mut self,
-            _gpu_addr: u64,
-            _query_type: u32,
-            _flags: QueryPropertiesFlags,
-            _payload: u32,
-            _subreport: u32,
+            gpu_addr: u64,
+            query_type: u32,
+            flags: QueryPropertiesFlags,
+            payload: u32,
+            subreport: u32,
         ) {
+            self.queries
+                .borrow_mut()
+                .push((gpu_addr, query_type, flags, payload, subreport));
         }
 
         fn bind_graphics_uniform_buffer(
@@ -737,7 +2419,11 @@ mod tests {
         fn disable_graphics_uniform_buffer(&mut self, _stage: usize, _index: u32) {}
 
         fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
-            func();
+            if self.defer_fences.get() {
+                self.pending_fences.borrow_mut().push_back(func);
+            } else {
+                func();
+            }
         }
 
         fn sync_operation(&mut self, func: Box<dyn FnOnce() + Send>) {
@@ -752,7 +2438,21 @@ mod tests {
 
         fn flush_all(&mut self) {}
 
-        fn flush_region(&mut self, _addr: u64, _size: u64, _which: crate::cache_types::CacheType) {}
+        fn flush_region(&mut self, addr: u64, size: u64, which: crate::cache_types::CacheType) {
+            self.flushes.borrow_mut().push((addr, size, which));
+            self.copy_events.borrow_mut().push("flush");
+        }
+
+        fn accelerate_surface_copy(
+            &mut self,
+            src: &Fermi2DSurface,
+            dst: &Fermi2DSurface,
+            config: &Fermi2DConfig,
+        ) -> bool {
+            self.copies.borrow_mut().push((*src, *dst, *config));
+            self.copy_events.borrow_mut().push("copy");
+            self.copy_result.get()
+        }
 
         fn must_flush_region(
             &self,
@@ -808,15 +2508,6 @@ mod tests {
         fn flush_commands(&mut self) {}
 
         fn tick_frame(&mut self) {}
-
-        fn accelerate_surface_copy(
-            &mut self,
-            _src: &Fermi2DSurface,
-            _dst: &Fermi2DSurface,
-            _copy_config: &Fermi2DConfig,
-        ) -> bool {
-            false
-        }
 
         fn accelerate_inline_to_memory(&mut self, address: u64, copy_size: usize, memory: &[u8]) {
             self.inline_uploads

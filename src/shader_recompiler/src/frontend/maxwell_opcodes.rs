@@ -182,6 +182,7 @@ pub enum MaxwellOpcode {
     // ── Interpolation ─────────────────────────────────────────────────
     IPA,
     ISBERD,
+    ISBE_nx2,
     // ── Integer Shift-Add ─────────────────────────────────────────────
     ISCADD_reg,
     ISCADD_cbuf,
@@ -415,6 +416,7 @@ pub fn name_of(opcode: MaxwellOpcode) -> &'static str {
         MaxwellOpcode::IMUL_cbuf => "IMUL (cbuf)",
         MaxwellOpcode::IMUL_reg => "IMUL (reg)",
         MaxwellOpcode::ISBERD => "ISBERD",
+        MaxwellOpcode::ISBE_nx2 => "ISBE (nx2)",
         MaxwellOpcode::ISCADD_cbuf => "ISCADD (cbuf)",
         MaxwellOpcode::ISCADD_reg => "ISCADD (reg)",
         MaxwellOpcode::LDC => "LDC",
@@ -771,6 +773,7 @@ const ENCODINGS_TEXT: &[(MaxwellOpcode, &str)] = &[
     (MaxwellOpcode::IMUL_cbuf, "0100 1100 0011 1---"),
     (MaxwellOpcode::IMUL_reg, "0101 1100 0011 1---"),
     (MaxwellOpcode::ISBERD, "1110 1111 1101 0---"),
+    (MaxwellOpcode::ISBE_nx2, "1110 1111 1100 0---"),
     (MaxwellOpcode::ISCADD_cbuf, "0100 1100 0001 1---"),
     (MaxwellOpcode::ISCADD_reg, "0101 1100 0001 1---"),
     (MaxwellOpcode::LDC, "1110 1111 1001 0---"),
@@ -1168,6 +1171,7 @@ impl MaxwellOpcode {
                     AL2P => "AL2P",
                     IPA => "IPA",
                     ISBERD => "ISBERD",
+                    ISBE_nx2 => "ISBE_nx2",
                     STP => "STP",
                     ATOM => "ATOM",
                     ATOMS => "ATOMS",

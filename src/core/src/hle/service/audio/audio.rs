@@ -573,6 +573,15 @@ pub fn loop_process(system: crate::core::SystemRef) {
             30,
         );
 
+        // Eden-NX2 audio.cpp: Switch 2 entry point, after audren:u.
+        server_manager.register_named_service(
+            "aud:u",
+            Box::new(move || -> SessionRequestHandlerPtr {
+                std::sync::Arc::new(super::nx2_audio_user_client::INx2AudioUserClient::new(system))
+            }),
+            30,
+        );
+
         server_manager.register_named_service(
             "audren:a",
             Box::new(|| -> SessionRequestHandlerPtr {

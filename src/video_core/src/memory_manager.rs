@@ -18,7 +18,7 @@ use crate::invalidation_accumulator::InvalidationAccumulator;
 use crate::pte_kind::PteKind;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// Non-owning memory-manager pointer matching upstream's stored
@@ -1921,6 +1921,11 @@ fn pte_kind_from_u32(raw: u32) -> PteKind {
 /// nvdrv, etc.
 pub struct MemoryManager {
     inner: GpuMemoryManager,
+    native_syncpoint_shim: AtomicU64,
+    /// Upstream Core::System&; runtime constructors keep the original owner.
+    system: ruzu_core::core::SystemRef,
+    /// Upstream MemoryManager::native_tiling; enabled per address space.
+    native_tiling: bool,
     /// Upstream stores `MaxwellDeviceMemoryManager& memory` directly.
     /// Rust keeps the Host1x owner as an `Arc` while the broader owner graph is
     /// still shared through handles.
@@ -1928,6 +1933,7 @@ pub struct MemoryManager {
 }
 
 impl MemoryManager {
+    pub const NUM_SHIM_SYNCPOINTS: u32 = 192;
     /// Upstream `MemoryManager::HAS_FLUSH_INVALIDATION`.
     pub const HAS_FLUSH_INVALIDATION: bool = true;
 
@@ -1957,7 +1963,23 @@ impl MemoryManager {
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_geometry_and_device_memory(
+        id: usize,
+        device_memory: Arc<MaxwellDeviceMemoryManager>,
+        address_space_bits: u64,
+        split_address: u64,
+        big_page_bits: u64,
+        page_bits: u64,
+    ) -> Self {
+        Self::new_with_system_and_device_memory(
+            ruzu_core::core::SystemRef::null(), id, device_memory,
+            address_space_bits, split_address, big_page_bits, page_bits,
+        )
+    }
+
+    pub fn new_with_system_and_device_memory(
+        system: ruzu_core::core::SystemRef,
         id: usize,
         device_memory: Arc<MaxwellDeviceMemoryManager>,
         address_space_bits: u64,
@@ -1979,9 +2001,23 @@ impl MemoryManager {
         inner.unique_identifier = id;
         Self {
             inner,
+            native_syncpoint_shim: AtomicU64::new(0),
+            system,
+            native_tiling: false,
             device_memory,
         }
     }
+
+    /// Upstream MemoryManager::SetNativeSyncpointShim.
+    pub fn set_native_syncpoint_shim(&self, address: u64) {
+        self.native_syncpoint_shim.store(address, Ordering::Release);
+    }
+
+    /// Upstream inline MemoryManager::EnableNativeTiling.
+    pub fn enable_native_tiling(&mut self) { self.native_tiling = true; }
+
+    /// Upstream inline MemoryManager::UsesNativeTiling.
+    pub fn uses_native_tiling(&self) -> bool { self.native_tiling }
 
     /// Upstream: `MemoryManager::GetID()`.
     pub fn get_id(&self) -> usize {
@@ -1994,6 +2030,11 @@ impl MemoryManager {
 
     pub fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
         self.inner.gpu_to_cpu_address(gpu_addr)
+    }
+
+    /// Upstream MemoryManager::IsShuttingDown reads the owning Core::System.
+    pub fn is_shutting_down(&self) -> bool {
+        self.system.get().is_shutting_down()
     }
 
     pub fn gpu_to_cpu_address_range(&self, gpu_addr: u64, size: u64) -> Option<u64> {
@@ -2012,13 +2053,33 @@ impl MemoryManager {
     /// `u8`, `u16`, `u32` and `u64` scalar types.
     #[inline]
     pub(crate) fn read<T: MemoryValue>(&self, gpu_addr: u64) -> T {
+        if std::mem::size_of::<T>() == std::mem::size_of::<u32>() {
+            let shim = self.native_syncpoint_shim.load(Ordering::Acquire);
+            if shim != 0 && gpu_addr >= shim
+                && gpu_addr - shim < u64::from(Self::NUM_SHIM_SYNCPOINTS) * 4
+                && (gpu_addr - shim) % 4 == 0
+            {
+                let value = self.system.get().host1x_core()
+                    .expect("native syncpoint shim requires Host1x")
+                    .get_guest_syncpoint_value(((gpu_addr - shim) / 4) as u32);
+                // MemoryValue admits only u8/u16/u32/u64; the size guard selects u32.
+                return unsafe { std::ptr::read_unaligned((&value as *const u32).cast::<T>()) };
+            }
+        }
         let page_pointer = self.get_pointer(gpu_addr);
         if !page_pointer.is_null() {
             // Match Eden's memcpy fast path, including unaligned addresses.
             return unsafe { std::ptr::read_unaligned(page_pointer.cast::<T>()) };
         }
 
-        log::error!("MemoryManager::Read from unmapped GPU address {gpu_addr:#x}");
+        // C++ has one static counter per explicitly instantiated Read<T>.
+        // Rust generic-function statics are shared, so keep a slot per width.
+        static REPORTED: [std::sync::atomic::AtomicU32; 4] =
+            [const { std::sync::atomic::AtomicU32::new(0) }; 4];
+        let width = std::mem::size_of::<T>();
+        if REPORTED[width.trailing_zeros() as usize].fetch_add(1, Ordering::SeqCst) < 16 {
+            log::error!("Read{} of unmapped GPU address {gpu_addr:#x}", width * 8);
+        }
         T::default()
     }
 
@@ -2343,6 +2404,61 @@ mod tests {
     use super::*;
     use crate::rasterizer_interface::RasterizerDownloadArea;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn shutdown_state_tracks_the_original_system_owner() {
+        use ruzu_core::core::{System, SystemRef};
+        let system = System::new_boxed_for_test();
+        let mm = MemoryManager::new_with_system_and_device_memory(
+            SystemRef::from_ref(&system), 13, Arc::new(MaxwellDeviceMemoryManager::default()),
+            32, 0x1_0000_0000, 16, 12,
+        );
+        assert!(!mm.is_shutting_down());
+        system.set_shutting_down(true);
+        assert!(mm.is_shutting_down());
+        system.set_shutting_down(false);
+        assert!(!mm.is_shutting_down());
+    }
+
+    #[test]
+    fn native_syncpoint_shim_reads_live_host1x_only_for_aligned_u32() {
+        use ruzu_core::core::{System, SystemRef};
+        use crate::host1x::host1x::Host1x;
+        let mut system = System::new_boxed_for_test();
+        system.set_host1x_core(Box::new(Host1x::new()));
+        let host = system.host1x_core().unwrap().as_any().downcast_ref::<Host1x>().unwrap();
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0x5Au8; 0x1000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(0x9000_0000, backing.as_mut_ptr(), 0x4000_0000, 0x1000, 1, true);
+        let mut mm = MemoryManager::new_with_system_and_device_memory(
+            SystemRef::from_ref(&system), 13, device_memory, 32, 0x1_0000_0000, 16, 12,
+        );
+        mm.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+        assert_eq!(mm.read::<u32>(0x20000), 0x5A5A5A5A);
+        mm.set_native_syncpoint_shim(0x20000);
+        assert_eq!(mm.read::<u32>(0x20000), 0);
+        host.syncpoint_manager().increment_guest(0);
+        host.syncpoint_manager().increment_guest(191);
+        assert_eq!(mm.read::<u32>(0x20000), 1);
+        assert_eq!(mm.read::<u32>(0x20000 + 191 * 4), 1);
+        host.syncpoint_manager().increment_guest(191);
+        assert_eq!(mm.read::<u32>(0x20000 + 191 * 4), 2);
+        assert_eq!(mm.read::<u32>(0x20000 + 192 * 4), 0x5A5A5A5A);
+        assert_eq!(mm.read::<u32>(0x20001), 0x5A5A5A5A);
+        assert_eq!(mm.read::<u8>(0x20000), 0x5A);
+        assert_eq!(mm.read::<u16>(0x20000), 0x5A5A);
+        assert_eq!(mm.read::<u64>(0x20000), 0x5A5A5A5A5A5A5A5A);
+        mm.write::<u32>(0x20000, 99);
+        assert_eq!(mm.read::<u32>(0x20000), 1);
+        assert_eq!(&backing[..4], &99u32.to_ne_bytes());
+        mm.set_native_syncpoint_shim(0);
+        assert_eq!(mm.read::<u32>(0x20000), 99);
+        mm.set_native_syncpoint_shim(0x30000);
+        // No normal page mapping is needed for the read-only counter shim.
+        assert_eq!(mm.read::<u32>(0x30000), 1);
+        assert_eq!(mm.read::<u32>(0x2FFFC), 0);
+    }
 
     struct TestRasterizer {
         accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,

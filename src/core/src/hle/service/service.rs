@@ -197,7 +197,19 @@ pub trait ServiceFramework: SessionRequestHandler {
         log::error!("Unknown / unimplemented {}", buf);
         common::assert::assert_fail_soft_impl();
 
-        if *common::settings::values().use_auto_stub.get_value() {
+        // Experimental Eden-NX2 fallback, explicitly authorized for this port.
+        // Like getenv upstream, presence (including an empty value) enables it.
+        static ENV_AUTO_STUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let env_auto_stub = *ENV_AUTO_STUB.get_or_init(|| std::env::var_os("EDEN_NX2_AUTO_STUB").is_some());
+        let caller = ctx.get_thread().and_then(|thread| {
+            thread.lock().unwrap().parent.as_ref().and_then(std::sync::Weak::upgrade)
+        });
+        let caller_is_switch2 = caller.is_some_and(|process| process.lock().unwrap().is_switch2());
+        if *common::settings::values().use_auto_stub.get_value()
+            || env_auto_stub
+            || self.get_service_name().starts_with(super::nx2_stub_interface::NX2_STUB_PREFIX)
+            || caller_is_switch2
+        {
             log::warn!("Using auto stub fallback!");
             let mut rb = ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
             rb.push_result(RESULT_SUCCESS);
@@ -343,6 +355,24 @@ mod tests {
     #[test]
     fn test_server_session_count_max() {
         assert_eq!(SERVER_SESSION_COUNT_MAX, 0x40);
+    }
+
+    #[test]
+    fn nx2_caller_gets_empty_success_on_an_ordinary_service() {
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+        let _scope = crate::hle::kernel::kernel::ScopedKernelForTest::without_kernel();
+        let mut process = KProcess::new();
+        process.is_switch2 = true;
+        let process = Arc::new(ProcessLock::from_value(process));
+        let mut thread = KThread::new();
+        thread.parent = Some(Arc::downgrade(&process));
+        let thread = Arc::new(KThreadLock::new(thread));
+        let mut ctx = HLERequestContext::new_with_thread(thread, 0);
+        ctx.command_buffer_mut().fill(u32::MAX);
+        TestService::new().report_unimplemented_function(&mut ctx, None);
+        assert_eq!(ctx.command_buffer()[4], 0x4f434653);
+        assert!(ctx.command_buffer()[6..].iter().all(|word| *word == 0));
     }
 
     #[test]

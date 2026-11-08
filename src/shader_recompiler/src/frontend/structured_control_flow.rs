@@ -5,7 +5,7 @@
 //!
 //! Ref: zuyu `frontend/maxwell/structured_control_flow.cpp`
 
-use super::control_flow::{CfgBlock, Condition, EndClass};
+use super::control_flow::{CfgBlock, Condition, EndClass, FlowCfg};
 use crate::ir::program::SyntaxNode;
 use crate::ir::value::Value;
 
@@ -142,6 +142,16 @@ pub fn structure_cfg(cfg_blocks: &[CfgBlock]) -> Vec<SyntaxNode> {
 /// Convert a CFG into structured ASL plus the IR actions that upstream
 /// `TranslatePass::Visit` emits into each header/merge block.
 pub(crate) fn structure_cfg_detailed(cfg_blocks: &[CfgBlock]) -> StructuredSyntax {
+    structure_cfg_detailed_with_exit_convergence(cfg_blocks, false)
+}
+
+/// Upstream BuildASL/GotoPass `converge_exits` option (Eglantine 900ab5a8).
+/// The task/mesh frontend must request this before SSA and epilogue emission;
+/// changing only the backend Return instruction would leave divergent barriers.
+pub(crate) fn structure_cfg_detailed_with_exit_convergence(
+    cfg_blocks: &[CfgBlock],
+    converge_exits: bool,
+) -> StructuredSyntax {
     if cfg_blocks.is_empty() {
         return StructuredSyntax {
             syntax: Vec::new(),
@@ -150,7 +160,7 @@ pub(crate) fn structure_cfg_detailed(cfg_blocks: &[CfgBlock]) -> StructuredSynta
         };
     }
 
-    let mut pass = GotoPass::new(cfg_blocks);
+    let mut pass = GotoPass::new(cfg_blocks, converge_exits);
     pass.run();
 
     let mut translator = TranslatePass::new();
@@ -161,6 +171,17 @@ pub(crate) fn structure_cfg_detailed(cfg_blocks: &[CfgBlock]) -> StructuredSynta
 struct GotoPass {
     root: Vec<Statement>,
     goto_count: usize,
+    exit_label: Option<u32>,
+}
+
+/// Upstream BuildASL over the full function graph. TranslateCode actions refer
+/// to global FlowBlock indices (the matching view is FlowCfg::all_cfg_blocks).
+pub(crate) fn structure_flow_cfg_detailed(cfg: &FlowCfg, converge_exits: bool) -> StructuredSyntax {
+    let mut pass = GotoPass::from_flow_cfg(cfg, converge_exits);
+    pass.run();
+    let mut translator = TranslatePass::new();
+    translator.visit(pass.root_children(), None, None);
+    translator.finish()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,10 +191,145 @@ struct StatementPath {
 }
 
 impl GotoPass {
-    fn new(cfg_blocks: &[CfgBlock]) -> Self {
+    fn from_flow_cfg(cfg: &FlowCfg, converge_exits: bool) -> Self {
         let mut pass = Self {
             root: Vec::new(),
             goto_count: 0,
+            exit_label: converge_exits.then_some(0),
+        };
+        let mut next_label = 0;
+        if converge_exits {
+            pass.root.push(Statement::Label { id: 0 });
+            pass.root.push(Statement::Return);
+            next_label = 1;
+        }
+        if !cfg.functions.is_empty() {
+            pass.build_function_tree(cfg, 0, &mut next_label, 0, None);
+        }
+        pass
+    }
+
+    /// Upstream recursive BuildTree overload. Labels are local to each call
+    /// expansion, even when multiple callers share the same FlowFunction.
+    fn build_function_tree(
+        &mut self,
+        cfg: &FlowCfg,
+        function: usize,
+        next_label: &mut u32,
+        insert_point: usize,
+        return_label: Option<u32>,
+    ) {
+        let mut local_labels = std::collections::HashMap::new();
+        for (offset, &block) in cfg.functions[function].blocks.iter().enumerate() {
+            let id = *next_label;
+            *next_label += 1;
+            self.root
+                .insert(insert_point + offset, Statement::Label { id });
+            local_labels.insert(block, id);
+        }
+        for &block_index in &cfg.functions[function].blocks {
+            let block = &cfg.blocks[block_index];
+            let label = local_labels[&block_index];
+            let mut ip = self.find_label_position(label).unwrap() + 1;
+            self.root.insert(
+                0,
+                Statement::SetVariable {
+                    id: label,
+                    op: Expr::false_value(),
+                },
+            );
+            ip += 1;
+            self.root.insert(
+                ip,
+                Statement::SetVariable {
+                    id: label,
+                    op: Expr::false_value(),
+                },
+            );
+            ip += 1;
+            self.root.insert(ip, Statement::Code { block: block_index });
+            ip += 1;
+            match block.end_class {
+                EndClass::Branch => {
+                    if block.cond.is_always() {
+                        self.insert_goto(
+                            ip,
+                            Expr::true_value(),
+                            local_labels[&block.branch_true.unwrap()],
+                        );
+                    } else if block.cond == Condition::from_bool(false) {
+                        self.insert_goto(
+                            ip,
+                            Expr::true_value(),
+                            local_labels[&block.branch_false.unwrap()],
+                        );
+                    } else {
+                        self.insert_goto(
+                            ip,
+                            Expr::Identity(block.cond),
+                            local_labels[&block.branch_true.unwrap()],
+                        );
+                        self.insert_goto(
+                            ip + 1,
+                            Expr::true_value(),
+                            local_labels[&block.branch_false.unwrap()],
+                        );
+                    }
+                }
+                EndClass::IndirectBranch => {
+                    self.root.insert(
+                        ip,
+                        Statement::SetIndirectBranchVariable {
+                            branch_reg: block.branch_reg,
+                            branch_offset: block.branch_offset,
+                        },
+                    );
+                    ip += 1;
+                    for indirect in &block.indirect_branches {
+                        self.insert_goto(
+                            ip,
+                            Expr::IndirectBranchCond(indirect.address),
+                            local_labels[&indirect.block],
+                        );
+                        ip += 1;
+                    }
+                    self.root.insert(ip, Statement::Unreachable);
+                }
+                EndClass::Call => {
+                    let continuation =
+                        local_labels[&block.return_block.expect("call continuation")];
+                    self.build_function_tree(
+                        cfg,
+                        block.function_call,
+                        next_label,
+                        ip,
+                        Some(continuation),
+                    );
+                }
+                EndClass::Return => self.insert_goto(
+                    ip,
+                    Expr::Identity(block.cond),
+                    return_label.expect("RET requires a caller"),
+                ),
+                EndClass::Exit => {
+                    if let Some(label) = self.exit_label {
+                        self.insert_goto(ip, Expr::true_value(), label);
+                    } else {
+                        self.root.insert(ip, Statement::Return);
+                    }
+                }
+                EndClass::Kill => self.root.insert(ip, Statement::Kill),
+            }
+        }
+    }
+
+    fn new(cfg_blocks: &[CfgBlock], converge_exits: bool) -> Self {
+        let mut pass = Self {
+            root: Vec::new(),
+            goto_count: 0,
+            // Rust CFG labels are block indices; reserve the first unused id
+            // for upstream's synthetic exit label instead of renumbering them.
+            exit_label: converge_exits.then_some(cfg_blocks.len() as u32),
         };
         pass.build_tree(cfg_blocks);
         pass
@@ -196,6 +352,10 @@ impl GotoPass {
     fn build_tree(&mut self, cfg_blocks: &[CfgBlock]) {
         for block in 0..cfg_blocks.len() {
             self.root.push(Statement::Label { id: block as u32 });
+        }
+        if let Some(id) = self.exit_label {
+            self.root.push(Statement::Label { id });
+            self.root.push(Statement::Return);
         }
 
         for (block_index, block) in cfg_blocks.iter().enumerate() {
@@ -247,6 +407,12 @@ impl GotoPass {
                     self.root.insert(ip, Statement::Unreachable);
                 }
                 EndClass::Call => {}
+                EndClass::Exit if self.exit_label.is_some() => {
+                    // CFGs built from the environment have already split
+                    // predicated EXITs. Retain the predicate for the flat CFG
+                    // builder too, matching its existing conditional semantics.
+                    self.insert_goto(ip, Expr::Identity(block.cond), self.exit_label.unwrap());
+                }
                 EndClass::Exit if !block.cond.is_always() => {
                     self.root.insert(
                         ip,
@@ -1085,6 +1251,175 @@ mod tests {
     }
 
     #[test]
+    fn converged_conditional_exits_skip_later_code_and_share_outer_return() {
+        use crate::ir::condition::IrPred;
+        let cfg = [
+            block(EndClass::Exit, Condition::from_pred(IrPred::P0, false)),
+            block(EndClass::Exit, Condition::from_pred(IrPred::P1, false)),
+            block(EndClass::Exit, Condition::always()),
+        ];
+        for (predicates, expected) in [
+            ([false, false], vec![0, 1, 2]),
+            ([false, true], vec![0, 1]),
+            ([true, false], vec![0]),
+            ([true, true], vec![0]),
+        ] {
+            assert_converged_trace(&cfg, predicates, &expected);
+        }
+        // Ordinary programs retain their existing multiple-return behavior.
+        assert_eq!(
+            structure_cfg(&cfg)
+                .iter()
+                .filter(|n| matches!(n, SyntaxNode::Return))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn converged_nested_branches_reach_return_outside_all_selections() {
+        use crate::ir::condition::IrPred;
+        let mut outer = block(EndClass::Branch, Condition::from_pred(IrPred::P0, false));
+        outer.branch_true = Some(1);
+        outer.branch_false = Some(4);
+        let mut inner = block(EndClass::Branch, Condition::from_pred(IrPred::P1, false));
+        inner.branch_true = Some(2);
+        inner.branch_false = Some(3);
+        let cfg = [
+            outer,
+            inner,
+            block(EndClass::Exit, Condition::always()),
+            block(EndClass::Exit, Condition::always()),
+            block(EndClass::Exit, Condition::always()),
+        ];
+        assert_converged_trace(&cfg, [false, false], &[0, 4]);
+        assert_converged_trace(&cfg, [false, true], &[0, 4]);
+        assert_converged_trace(&cfg, [true, false], &[0, 1, 3]);
+        assert_converged_trace(&cfg, [true, true], &[0, 1, 2]);
+    }
+
+    #[test]
+    fn converged_exit_inside_loop_reaches_return_outside_loop() {
+        use crate::ir::condition::IrPred;
+        let mut branch = block(EndClass::Branch, Condition::from_pred(IrPred::P0, false));
+        branch.branch_true = Some(1);
+        branch.branch_false = Some(3);
+        let early_exit = block(EndClass::Exit, Condition::from_pred(IrPred::P1, false));
+        let mut back_edge = block(EndClass::Branch, Condition::always());
+        back_edge.branch_true = Some(0);
+        let cfg = [
+            branch,
+            early_exit,
+            back_edge,
+            block(EndClass::Exit, Condition::always()),
+        ];
+        assert_converged_trace(&cfg, [false, false], &[0, 3]);
+        assert_converged_trace(&cfg, [true, true], &[0, 1]);
+    }
+
+    fn assert_converged_trace(cfg: &[CfgBlock], predicates: [bool; 2], expected: &[usize]) {
+        let structured = structure_cfg_detailed_with_exit_convergence(cfg, true);
+        let mut depth = 0;
+        let mut returns = 0;
+        for node in &structured.syntax {
+            match node {
+                SyntaxNode::If { .. } | SyntaxNode::Loop { .. } => depth += 1,
+                SyntaxNode::EndIf { .. } | SyntaxNode::Repeat { .. } => depth -= 1,
+                SyntaxNode::Return => {
+                    assert_eq!(depth, 0, "{:#?}", structured.syntax);
+                    returns += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(returns, 1);
+        let mut pass = GotoPass::new(cfg, true);
+        pass.run();
+        let mut trace = Vec::new();
+        let mut variables = std::collections::HashMap::new();
+        assert_eq!(
+            visit_test_tree(&pass.root, predicates, &mut variables, &mut trace, &mut 0),
+            2
+        );
+        assert_eq!(trace, expected);
+    }
+
+    fn test_expr(
+        expr: &Expr,
+        predicates: [bool; 2],
+        variables: &std::collections::HashMap<u32, bool>,
+    ) -> bool {
+        match expr {
+            Expr::Identity(condition) => {
+                assert_eq!(condition.get_flow_test(), crate::ir::flow_test::FlowTest::T);
+                let (predicate, negate) = condition.get_pred();
+                let value = if predicate == crate::ir::condition::IrPred::PT {
+                    true
+                } else {
+                    predicates[predicate.index()]
+                };
+                value ^ negate
+            }
+            Expr::Not(expr) => !test_expr(expr, predicates, variables),
+            Expr::Or(a, b) => {
+                test_expr(a, predicates, variables) || test_expr(b, predicates, variables)
+            }
+            Expr::Variable(id) => *variables.get(id).expect("goto variable initialized"),
+            Expr::IndirectBranchCond(_) => panic!("not an indirect test"),
+        }
+    }
+
+    // Execute the transformed statement tree to check which guest blocks still
+    // execute after predicated exits. 0=fallthrough, 1=break, 2=return.
+    fn visit_test_tree(
+        tree: &[Statement],
+        predicates: [bool; 2],
+        variables: &mut std::collections::HashMap<u32, bool>,
+        trace: &mut Vec<usize>,
+        steps: &mut usize,
+    ) -> u8 {
+        for statement in tree {
+            *steps += 1;
+            assert!(*steps < 500, "unexpected nontermination");
+            match statement {
+                Statement::Code { block } => trace.push(*block),
+                Statement::Label { .. } => {}
+                Statement::SetVariable { id, op } => {
+                    let value = test_expr(op, predicates, variables);
+                    variables.insert(*id, value);
+                }
+                Statement::If { cond, children } => {
+                    if test_expr(cond, predicates, variables) {
+                        let control =
+                            visit_test_tree(children, predicates, variables, trace, steps);
+                        if control != 0 {
+                            return control;
+                        }
+                    }
+                }
+                Statement::Loop { cond, children } => loop {
+                    match visit_test_tree(children, predicates, variables, trace, steps) {
+                        2 => return 2,
+                        1 => break,
+                        _ => {}
+                    }
+                    if !test_expr(cond, predicates, variables) {
+                        break;
+                    }
+                },
+                Statement::Break { cond } => {
+                    if test_expr(cond, predicates, variables) {
+                        return 1;
+                    }
+                }
+                Statement::Return => return 2,
+                _ => panic!("unexpected structured statement {statement:?}"),
+            }
+        }
+        0
+    }
+
+    #[test]
     fn conditional_forward_branch_bodies_use_inverted_condition() {
         let mut branch = block(
             EndClass::Branch,
@@ -1179,6 +1514,7 @@ mod tests {
                 Statement::Code { block: 2 },
             ],
             goto_count: 1,
+            exit_label: None,
         };
 
         pass.run();
@@ -1216,6 +1552,7 @@ mod tests {
                 Statement::Code { block: 1 },
             ],
             goto_count: 1,
+            exit_label: None,
         };
 
         pass.run();
@@ -1253,6 +1590,7 @@ mod tests {
                 Statement::Code { block: 2 },
             ],
             goto_count: 1,
+            exit_label: None,
         };
 
         pass.run();

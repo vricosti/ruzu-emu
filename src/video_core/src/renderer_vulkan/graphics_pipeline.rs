@@ -120,6 +120,8 @@ struct GraphicsPipelineEngine {
     gpu_memory: GraphicsGpuMemory,
     push_descriptor: Option<ash::khr::push_descriptor::Device>,
     fallback_sampler: vk::Sampler,
+    mesh_output: Option<vk::DescriptorBufferInfo>,
+    mesh_views: Vec<ImageViewInOut>,
 }
 
 /// Owned state captured by the asynchronous constructor job. Eden's worker
@@ -183,6 +185,78 @@ impl GraphicsGpuMemory {
             Self::Memory(memory) => unsafe { memory.as_ref().read_block_unsafe(addr, output) },
             Self::LegacyReaders { read_unsafe, .. } => unsafe { (&**read_unsafe)(addr, output) },
         }
+    }
+}
+
+struct GraphicsDescriptorState<'a> {
+    stage_infos: &'a [ShaderInfo; NUM_VK_GRAPHICS_STAGES],
+    enabled_uniform_buffer_masks: &'a [u32; NUM_STAGES as usize],
+    uniform_buffer_sizes: &'a UniformBufferSizes,
+    num_image_elements: usize,
+    num_textures: u32,
+    num_descriptor_entries: u32,
+    uses_descriptor_buffer: bool,
+}
+
+/// Address-stable graphics resource metadata for one guest task/mesh stage.
+/// Kept boxed while the buffer cache retains pointers to the uniform metadata.
+/// Its graphics-slot ownership is independent of the host COMPUTE bind point.
+pub(crate) struct MeshGraphicsResources {
+    stage_infos: [ShaderInfo; NUM_VK_GRAPHICS_STAGES],
+    enabled_uniform_buffer_masks: [u32; NUM_STAGES as usize],
+    uniform_buffer_sizes: UniformBufferSizes,
+    num_image_elements: usize,
+    num_textures: u32,
+    num_descriptor_entries: u32,
+}
+
+pub(crate) struct PreparedMeshDescriptors {
+    pub entries: Vec<DescriptorUpdateEntry>,
+    pub rescaling_data: [u32; NUM_TEXTURE_AND_IMAGE_SCALING_WORDS as usize],
+    pub render_area_data: [f32; 4],
+    pub views: GraphicsImageViews,
+}
+
+impl MeshGraphicsResources {
+    pub fn new(info: &ShaderInfo, resource_stage: usize) -> Box<Self> {
+        assert!(info.is_task ^ info.is_mesh);
+        assert!(matches!(resource_stage, 0 | 2));
+        assert!(!info.is_task || resource_stage == 0);
+        let mut stage_infos = std::array::from_fn(|_| ShaderInfo::default());
+        stage_infos[resource_stage] = info.clone();
+        let (enabled_uniform_buffer_masks, uniform_buffer_sizes) = buffer_cache_metadata(&stage_infos);
+        let (num_image_elements, num_textures, _) = graphics_resource_metadata(&stage_infos);
+        Box::new(Self { stage_infos, enabled_uniform_buffer_masks, uniform_buffer_sizes,
+            num_image_elements, num_textures, num_descriptor_entries: num_descriptor_entries(info) })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        &self, draw: &Maxwell3DDrawView<'_>, read_gpu: &dyn Fn(u64, &mut [u8]),
+        scheduler: &mut Scheduler, buffer_cache: &mut VulkanCommonBufferCache,
+        texture_cache: &mut TextureCache, queue: &mut UpdateDescriptorQueue,
+        fallback_sampler: vk::Sampler, is_indexed: bool,
+    ) -> PreparedMeshDescriptors {
+        let state = GraphicsDescriptorState {
+            stage_infos: &self.stage_infos,
+            enabled_uniform_buffer_masks: &self.enabled_uniform_buffer_masks,
+            uniform_buffer_sizes: &self.uniform_buffer_sizes,
+            num_image_elements: self.num_image_elements, num_textures: self.num_textures,
+            num_descriptor_entries: self.num_descriptor_entries, uses_descriptor_buffer: false,
+        };
+        let (prepared, views) = GraphicsPipeline::prepare_graphics_resources::<DefaultSpec>(
+            state, draw, read_gpu, scheduler, buffer_cache, texture_cache, queue,
+            fallback_sampler, is_indexed);
+        // Copy before another stage acquires the shared descriptor queue.
+        let entries = if self.num_descriptor_entries == 0 {
+            Vec::new()
+        } else {
+            // The resource phase acquired the queue and populated exactly the
+            // descriptor count from this stage's shader metadata.
+            unsafe { std::slice::from_raw_parts(queue.update_data(), self.num_descriptor_entries as usize) }.to_vec()
+        };
+        PreparedMeshDescriptors { entries, rescaling_data: prepared.rescaling_data,
+            render_area_data: prepared.render_area_data, views }
     }
 }
 
@@ -461,6 +535,7 @@ pub struct GraphicsPipeline {
     uses_descriptor_buffer: bool,
     /// Total payload entries reserved by upstream `GraphicsPipeline`.
     pub num_descriptor_entries: u32,
+    has_mesh_output: bool,
     descriptor_allocator: Option<DescriptorAllocator>,
     scheduler: NonNull<Scheduler>,
     buffer_cache: NonNull<VulkanCommonBufferCache>,
@@ -526,16 +601,23 @@ impl GraphicsPipeline {
         descriptor_buffer_ring: &DescriptorBufferRing,
         descriptor_pool: &DescriptorPool,
         scheduler: &Scheduler,
+        has_mesh_output: bool,
     ) -> Option<GraphicsDescriptorLayout> {
         let mut builder = DescriptorLayoutBuilder::new(device);
         for (stage_index, info) in stage_infos.iter().enumerate() {
             let stage_flags = graphics_stage_flags(stage_index);
             builder.add(info, stage_flags);
         }
+        if has_mesh_output {
+            // Generated vertices read host compute output, not a guest SSBO
+            // described by a constant-buffer address. Append its own binding.
+            builder.add_descriptors(vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::VERTEX, &[super::pipeline_helper::DescriptorInfo { count: 1 }]);
+        }
 
-        let uses_push_descriptor = builder.can_use_push_descriptor();
+        let uses_push_descriptor = !has_mesh_output && builder.can_use_push_descriptor();
         let mut uses_descriptor_buffer =
-            builder.can_use_descriptor_buffer() && descriptor_buffer_ring.is_valid();
+            !has_mesh_output && builder.can_use_descriptor_buffer() && descriptor_buffer_ring.is_valid();
         let mut descriptor_set_layout = builder
             .create_descriptor_set_layout(uses_push_descriptor, uses_descriptor_buffer)
             .ok()?;
@@ -602,12 +684,20 @@ impl GraphicsPipeline {
             }
         };
         let descriptor_allocator = if !uses_push_descriptor && !uses_descriptor_buffer {
-            match descriptor_pool.allocator_for_infos(
+            let allocator = if has_mesh_output {
+                let mut bank = super::descriptor_pool::make_bank_info(stage_infos);
+                bank.storage_buffers += 1;
+                bank.score += 1;
+                descriptor_pool.allocator(device, scheduler, descriptor_set_layout, &bank)
+            } else {
+                descriptor_pool.allocator_for_infos(
                 device,
                 scheduler,
                 descriptor_set_layout,
                 stage_infos,
-            ) {
+                )
+            };
+            match allocator {
                 Ok(allocator) => Some(allocator),
                 Err(error) => {
                     log::warn!("Failed to create graphics descriptor allocator: {error:?}");
@@ -649,6 +739,7 @@ impl GraphicsPipeline {
         key: &GraphicsPipelineKey,
         stage_infos: [ShaderInfo; NUM_VK_GRAPHICS_STAGES],
         shader_modules: [vk::ShaderModule; NUM_VK_GRAPHICS_STAGES],
+        has_mesh_output: bool,
         is_built: bool,
         runtime: GraphicsPipelineRuntime,
     ) -> Option<Self> {
@@ -661,13 +752,15 @@ impl GraphicsPipeline {
                 runtime.descriptor_buffer_ring.as_ref(),
                 runtime.descriptor_pool(),
                 runtime.scheduler.as_ref(),
+                has_mesh_output,
             )?
         };
         let (enabled_uniform_buffer_masks, uniform_buffer_sizes) =
             buffer_cache_metadata(&stage_infos);
         let uses_render_area = stage_infos.iter().any(|info| info.uses_render_area);
         let uses_rescaling_uniform = stage_infos.iter().any(|info| info.uses_rescaling_uniform);
-        let num_descriptor_entries = stage_infos.iter().map(num_descriptor_entries).sum();
+        let num_descriptor_entries = stage_infos.iter().map(num_descriptor_entries).sum::<u32>()
+            + u32::from(has_mesh_output);
         let (num_image_elements, num_textures, fragment_has_color0_output) =
             graphics_resource_metadata(&stage_infos);
         let configure_func = configure_func(&shader_modules, &stage_infos);
@@ -684,6 +777,7 @@ impl GraphicsPipeline {
             descriptor_buffer_layout: descriptor_layout.descriptor_buffer_layout,
             uses_descriptor_buffer: descriptor_layout.uses_descriptor_buffer,
             num_descriptor_entries,
+            has_mesh_output,
             descriptor_allocator: descriptor_layout.descriptor_allocator,
             scheduler: runtime.scheduler,
             buffer_cache: runtime.buffer_cache,
@@ -788,6 +882,8 @@ impl GraphicsPipeline {
             gpu_memory: GraphicsGpuMemory::Memory(gpu_memory),
             push_descriptor,
             fallback_sampler,
+            mesh_output: None,
+            mesh_views: Vec::new(),
         });
     }
 
@@ -821,6 +917,8 @@ impl GraphicsPipeline {
             gpu_memory: GraphicsGpuMemory::LegacyReaders { read, read_unsafe },
             push_descriptor,
             fallback_sampler,
+            mesh_output: None,
+            mesh_views: Vec::new(),
         });
     }
 
@@ -832,6 +930,16 @@ impl GraphicsPipeline {
             .take()
             .expect("GraphicsPipeline::SetEngine must precede Configure");
         (self.configure_func)(self, engine, is_indexed)
+    }
+
+    /// Draw-scoped transport binding for a generated mesh vertex shader.
+    pub(crate) fn set_mesh_output(&self, output: vk::DescriptorBufferInfo, views: &[ImageViewInOut]) {
+        assert!(self.has_mesh_output);
+        assert!(output.buffer != vk::Buffer::null() && output.range != 0);
+        let mut engine = self.engine.borrow_mut();
+        let engine = engine.as_mut().expect("SetEngine must precede mesh output binding");
+        engine.mesh_output = Some(output);
+        engine.mesh_views.extend_from_slice(views);
     }
 
     /// Port of `GraphicsPipeline::ConfigureImpl`.
@@ -867,22 +975,87 @@ impl GraphicsPipeline {
                 &mut *self.descriptor_buffer_ring.as_ptr(),
             )
         };
+        let state = GraphicsDescriptorState {
+            stage_infos: &self.stage_infos,
+            enabled_uniform_buffer_masks: &self.enabled_uniform_buffer_masks,
+            uniform_buffer_sizes: &self.uniform_buffer_sizes,
+            num_image_elements: self.num_image_elements,
+            num_textures: self.num_textures,
+            num_descriptor_entries: self.num_descriptor_entries,
+            uses_descriptor_buffer: self.uses_descriptor_buffer,
+        };
+        let (prepared, mut views) = Self::prepare_graphics_resources::<S>(
+            state, draw, &read_gpu, scheduler, buffer_cache, texture_cache,
+            guest_descriptor_queue, engine.fallback_sampler, is_indexed,
+        );
+        if self.has_mesh_output {
+            let output = engine.mesh_output.expect("mesh graphics configuration requires compute output");
+            guest_descriptor_queue.add_buffer(output.buffer, output.offset, output.range);
+            views.extend(engine.mesh_views);
+        }
+
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::RenderTargets);
+            if !texture_cache.update_render_targets(
+                &draw.render_targets(),
+                dirty_flags,
+                &read_gpu_unsafe,
+                false,
+                None,
+            ) {
+                return false;
+            }
+            texture_cache.check_feedback_loop(&views);
+        }
+        if self.is_built() && *self.pipeline.lock().unwrap() == vk::Pipeline::null() {
+            return false;
+        }
+        let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::ConfigureDraw);
+        self.configure_draw(
+            scheduler,
+            texture_cache,
+            guest_descriptor_queue,
+            descriptor_buffer_ring,
+            prepared,
+            engine.push_descriptor,
+        )
+    }
+
+    /// Mechanical extraction of ConfigureImpl's resource phase; retained in
+    /// its upstream owner so graphics and compute-backed mesh use identical
+    /// graphics slots, descriptor ordering, texture handling and upload barriers.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_graphics_resources<S: ConfigureSpec>(
+        state: GraphicsDescriptorState<'_>,
+        draw: &Maxwell3DDrawView<'_>,
+        read_gpu: &dyn Fn(u64, &mut [u8]),
+        scheduler: &mut Scheduler,
+        buffer_cache: &mut VulkanCommonBufferCache,
+        texture_cache: &mut TextureCache,
+        guest_descriptor_queue: &mut UpdateDescriptorQueue,
+        fallback_sampler: vk::Sampler,
+        is_indexed: bool,
+    ) -> (PreparedGraphicsDescriptors, GraphicsImageViews) {
         let mut views = GraphicsImageViews::new();
         let mut samplers = GraphicsSamplers::new();
-        views.reserve(self.num_image_elements);
-        samplers.reserve(self.num_textures as usize);
+        views.reserve(state.num_image_elements);
+        samplers.reserve(state.num_textures as usize);
 
         let descriptor_sync_regs = draw.descriptor_sync_regs();
-        texture_cache
-            .base
-            .synchronize_graphics_descriptors(descriptor_sync_regs);
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::SyncDescriptors);
+            texture_cache
+                .base
+                .synchronize_graphics_descriptors(descriptor_sync_regs);
+        }
 
-        // SAFETY: PipelineCache retains this Rc-owned pipeline, so its
-        // per-pipeline size array remains address-stable through every draw.
+        // SAFETY: The caller retains either the Rc-owned GraphicsPipeline or
+        // boxed MeshGraphicsResources. Both keep these arrays address-stable
+        // while the buffer cache uses them, until the next state replacement.
         unsafe {
             buffer_cache.set_uniform_buffers_state(
-                &self.enabled_uniform_buffer_masks,
-                &self.uniform_buffer_sizes,
+                state.enabled_uniform_buffer_masks,
+                state.uniform_buffer_sizes,
             );
         }
 
@@ -925,7 +1098,7 @@ impl GraphicsPipeline {
 
         {
             let mut config_stage = |stage: usize| {
-                let info = &self.stage_infos[stage];
+                let info = &state.stage_infos[stage];
                 buffer_cache.unbind_graphics_storage_buffers(stage);
                 if S::HAS_STORAGE_BUFFERS {
                     for (ssbo_index, desc) in info.storage_buffers_descriptors.iter().enumerate() {
@@ -1023,6 +1196,7 @@ impl GraphicsPipeline {
                     }
                 }
             };
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::ReadHandles);
             if S::ENABLED_STAGES[0] {
                 config_stage(0);
             }
@@ -1039,14 +1213,17 @@ impl GraphicsPipeline {
                 config_stage(4);
             }
         }
-        assert_eq!(views.len(), self.num_image_elements);
-        assert_eq!(samplers.len(), self.num_textures as usize);
-        texture_cache.fill_image_views(&mut views, false, S::HAS_IMAGES);
+        assert_eq!(views.len(), state.num_image_elements);
+        assert_eq!(samplers.len(), state.num_textures as usize);
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::FillImageViews);
+            texture_cache.fill_image_views(&mut views, false, S::HAS_IMAGES);
+        }
 
         let mut view_cursor = 0usize;
         {
             let mut bind_stage_info = |stage: usize| {
-                let info = &self.stage_infos[stage];
+                let info = &state.stage_infos[stage];
                 buffer_cache.unbind_graphics_texture_buffers(stage);
                 let mut binding_index = 0usize;
                 if S::HAS_TEXTURE_BUFFERS {
@@ -1090,6 +1267,7 @@ impl GraphicsPipeline {
                     view_cursor += num_descriptors(&info.image_descriptors) as usize;
                 }
             };
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::TextureBuffers);
             if S::ENABLED_STAGES[0] {
                 bind_stage_info(0);
             }
@@ -1110,33 +1288,45 @@ impl GraphicsPipeline {
         if draw.transform_feedback_enabled() {
             scheduler.request_outside_render_pass_operation_context();
         }
-        buffer_cache.update_graphics_buffers(is_indexed);
-        buffer_cache.bind_host_geometry_buffers(is_indexed);
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::UpdateBuffers);
+            buffer_cache.update_graphics_buffers(is_indexed);
+            buffer_cache.bind_host_geometry_buffers(is_indexed);
+        }
 
-        let expected_descriptor_count = self.num_descriptor_entries as usize;
-        guest_descriptor_queue.acquire(
-            scheduler,
-            expected_descriptor_count,
-            self.uses_descriptor_buffer,
-        );
+        let expected_descriptor_count = state.num_descriptor_entries as usize;
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::DescriptorAcquire);
+            guest_descriptor_queue.acquire(
+                scheduler,
+                expected_descriptor_count,
+                state.uses_descriptor_buffer,
+            );
+        }
         let mut rescaling = RescalingPushConstant::new();
         let mut sampler_cursor = 0usize;
         view_cursor = 0;
         {
             let mut prepare_stage = |stage: usize| {
-                let info = &self.stage_infos[stage];
-                buffer_cache.bind_host_stage_buffers(stage);
-                push_image_descriptors(
-                    texture_cache,
-                    guest_descriptor_queue,
-                    info,
-                    &mut rescaling,
-                    &samplers,
-                    &mut sampler_cursor,
-                    &views,
-                    &mut view_cursor,
-                    engine.fallback_sampler,
-                );
+                let info = &state.stage_infos[stage];
+                {
+                    let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::BindStageBuffers);
+                    buffer_cache.bind_host_stage_buffers(stage);
+                }
+                {
+                    let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::PushDescriptors);
+                    push_image_descriptors(
+                        texture_cache,
+                        guest_descriptor_queue,
+                        info,
+                        &mut rescaling,
+                        &samplers,
+                        &mut sampler_cursor,
+                        &views,
+                        &mut view_cursor,
+                        fallback_sampler,
+                    );
+                }
             };
             if S::ENABLED_STAGES[0] {
                 prepare_stage(0);
@@ -1158,38 +1348,12 @@ impl GraphicsPipeline {
             buffer_cache.runtime.post_copy_barrier();
             buffer_cache.any_buffer_uploaded = false;
         }
-        let surface_clip = draw.surface_clip();
         let prepared = PreparedGraphicsDescriptors {
             rescaling_data: *rescaling.data(),
-            render_area_data: [
-                surface_clip.width as f32,
-                surface_clip.height as f32,
-                0.0,
-                0.0,
-            ],
+            render_area_data: render_area_words(&draw.render_targets()),
         };
 
-        if !texture_cache.update_render_targets(
-            &draw.render_targets(),
-            dirty_flags,
-            &read_gpu_unsafe,
-            false,
-            None,
-        ) {
-            return false;
-        }
-        texture_cache.check_feedback_loop(&views);
-        if self.is_built() && *self.pipeline.lock().unwrap() == vk::Pipeline::null() {
-            return false;
-        }
-        self.configure_draw(
-            scheduler,
-            texture_cache,
-            guest_descriptor_queue,
-            descriptor_buffer_ring,
-            prepared,
-            engine.push_descriptor,
-        )
+        (prepared, views)
     }
 
     fn bind_graphics_texture_buffer_view(
@@ -1837,6 +2001,18 @@ impl GraphicsPipeline {
     }
 }
 
+/// ConfigureImpl's RenderAreaPushConstant words. Upstream falls back to RT0
+/// when either surface-clip dimension is unset (not independently per axis).
+fn render_area_words(targets: &crate::engines::draw_manager::Maxwell3DRenderTargets) -> [f32; 4] {
+    let clip = targets.surface_clip;
+    let (width, height) = if clip.width != 0 && clip.height != 0 {
+        (clip.width, clip.height)
+    } else {
+        (targets.render_targets[0].width, targets.render_targets[0].height)
+    };
+    [width as f32, height as f32, 0.0, 0.0]
+}
+
 fn buffer_cache_metadata(
     stage_infos: &[ShaderInfo; 5],
 ) -> ([u32; NUM_STAGES as usize], UniformBufferSizes) {
@@ -2196,6 +2372,51 @@ mod tests {
     use std::mem::ManuallyDrop;
 
     #[test]
+    fn mesh_resources_retain_physical_graphics_slots_and_uniform_sizes() {
+        use shader_recompiler::shader_info::ConstantBufferDescriptor;
+        for (is_task, stage) in [(true, 0), (false, 0), (false, 2)] {
+            let mut info = ShaderInfo::default();
+            info.is_task = is_task;
+            info.is_mesh = !is_task;
+            info.constant_buffer_mask = (1 << 1) | (1 << 7);
+            info.constant_buffer_used_sizes[1] = 48;
+            info.constant_buffer_used_sizes[7] = 260;
+            info.constant_buffer_descriptors.push(ConstantBufferDescriptor { index: 1, count: 1 });
+            info.constant_buffer_descriptors.push(ConstantBufferDescriptor { index: 7, count: 1 });
+            let owner = MeshGraphicsResources::new(&info, stage);
+            assert_eq!(owner.num_descriptor_entries, 2);
+            for slot in 0..NUM_STAGES as usize {
+                assert_eq!(owner.enabled_uniform_buffer_masks[slot], if slot == stage { 130 } else { 0 });
+                assert_eq!(owner.uniform_buffer_sizes[slot][1], if slot == stage { 48 } else { 0 });
+                assert_eq!(owner.uniform_buffer_sizes[slot][7], if slot == stage { 260 } else { 0 });
+            }
+            // Moving the stage's boxed owner must preserve the address borrowed
+            // by BufferCacheChannelInfo, including when a cache reallocates.
+            let sizes = &owner.uniform_buffer_sizes as *const UniformBufferSizes;
+            let mut cache = Vec::with_capacity(1);
+            cache.push(owner);
+            cache.push(MeshGraphicsResources::new(&info, stage));
+            assert_eq!(sizes, &cache[0].uniform_buffer_sizes as *const UniformBufferSizes);
+        }
+    }
+
+    #[test]
+    fn render_area_uses_rt0_if_either_clip_dimension_is_unset() {
+        let mut targets = crate::engines::draw_manager::Maxwell3DRenderTargets::default();
+        targets.render_targets[0].width = 1920;
+        targets.render_targets[0].height = 1080;
+        for (width, height) in [(0, 0), (1280, 0), (0, 720), (1280, 720)] {
+            targets.surface_clip.width = width;
+            targets.surface_clip.height = height;
+            assert_eq!(render_area_words(&targets), if width != 0 && height != 0 {
+                [1280.0, 720.0, 0.0, 0.0]
+            } else {
+                [1920.0, 1080.0, 0.0, 0.0]
+            });
+        }
+    }
+
+    #[test]
     fn graphics_gpu_memory_uses_upstream_non_owning_pointer() {
         let memory = std::sync::Arc::new(parking_lot::Mutex::new(
             crate::memory_manager::MemoryManager::new(0),
@@ -2317,6 +2538,7 @@ mod tests {
             descriptor_buffer_layout: DescriptorBufferLayout::default(),
             uses_descriptor_buffer: false,
             num_descriptor_entries: 0,
+            has_mesh_output: false,
             descriptor_allocator: None,
             scheduler: NonNull::dangling(),
             buffer_cache: NonNull::dangling(),

@@ -647,7 +647,7 @@ impl RendererBase for RendererOpenGL {
                 capture::LINEAR_DEPTH,
                 capture::BLOCK_HEIGHT,
                 capture::BLOCK_DEPTH,
-                0,
+                0, false,
             );
         }
 

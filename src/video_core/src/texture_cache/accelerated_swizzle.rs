@@ -33,6 +33,9 @@ pub struct BlockLinearSwizzle2DParams {
     pub x_shift: u32,
     pub block_height: u32,
     pub block_height_mask: u32,
+    pub native_tiling: u32,
+    /// Explicit zeroed representation of upstream trailing alignment padding.
+    pub _pad_end: u32,
 }
 
 /// Parameters for a 3D block-linear swizzle compute dispatch.
@@ -51,6 +54,7 @@ pub struct BlockLinearSwizzle3DParams {
     pub block_height_mask: u32,
     pub block_depth: u32,
     pub block_depth_mask: u32,
+    pub native_tiling: u32,
 }
 
 // ── Public functions ───────────────────────────────────────────────────
@@ -80,6 +84,8 @@ pub fn make_block_linear_swizzle_2d_params(
         x_shift: GOB_SIZE_SHIFT + block.height + block.depth,
         block_height: block.height,
         block_height_mask: (1u32 << block.height) - 1,
+        native_tiling: u32::from(info.native_tiling),
+        _pad_end: 0,
     }
 }
 
@@ -113,6 +119,7 @@ pub fn make_block_linear_swizzle_3d_params(
         block_height_mask: (1u32 << block.height) - 1,
         block_depth: block.depth,
         block_depth_mask: (1u32 << block.depth) - 1,
+        native_tiling: u32::from(info.native_tiling),
     }
 }
 
@@ -140,9 +147,30 @@ mod tests {
     }
 
     #[test]
+    fn native_tiling_metadata_reaches_both_dispatch_parameters() {
+        let mut info = ImageInfo::default();
+        info.format = PixelFormat::A8B8G8R8Unorm;
+        let swizzle = SwizzleParameters {
+            num_tiles: Extent3D { width: 16, height: 8, depth: 1 },
+            block: Extent3D { width: 0, height: 0, depth: 0 },
+            buffer_offset: 0, level: 0,
+        };
+        for native in [false, true] {
+            info.native_tiling = native;
+            let two = make_block_linear_swizzle_2d_params(&swizzle, &info);
+            let three = make_block_linear_swizzle_3d_params(&swizzle, &info);
+            assert_eq!(two.native_tiling, u32::from(native));
+            assert_eq!(three.native_tiling, u32::from(native));
+            assert_eq!((two._pad0, two._pad1, two._pad_end), (0, 0, 0));
+        }
+    }
+
+    #[test]
     fn block_linear_parameter_layouts_match_upstream() {
         assert_eq!(size_of::<BlockLinearSwizzle2DParams>(), 64);
         assert_eq!(align_of::<BlockLinearSwizzle2DParams>(), 16);
+        assert_eq!(offset_of!(BlockLinearSwizzle2DParams, native_tiling), 56);
+        assert_eq!(offset_of!(BlockLinearSwizzle3DParams, native_tiling), 56);
         assert_eq!(offset_of!(BlockLinearSwizzle2DParams, origin), 0);
         assert_eq!(offset_of!(BlockLinearSwizzle2DParams, destination), 16);
         assert_eq!(
@@ -158,7 +186,7 @@ mod tests {
             52
         );
 
-        assert_eq!(size_of::<BlockLinearSwizzle3DParams>(), 56);
+        assert_eq!(size_of::<BlockLinearSwizzle3DParams>(), 60);
         assert_eq!(align_of::<BlockLinearSwizzle3DParams>(), 4);
         assert_eq!(offset_of!(BlockLinearSwizzle3DParams, origin), 0);
         assert_eq!(offset_of!(BlockLinearSwizzle3DParams, destination), 12);

@@ -498,7 +498,7 @@ mod macro_hle {
             let base_instance = parameters[4];
 
             let required_vertices = (vertex_first as usize).wrapping_add(vertex_count as usize);
-            if !topology.is_hle_safe() && (self.max_current_vertices() as usize) < required_vertices
+            if !topology.is_hle_safe() && (self.get_max_current_vertices() as usize) < required_vertices
             {
                 crate::r#macro::assert_fail_soft(false, || {
                     "HLE_DrawArraysIndirect: faulty unsafe-topology draw".to_owned()
@@ -2836,9 +2836,289 @@ pub struct MacroEngine {
     macro_cache: HashMap<u32, CacheInfo, BuildUnorderedDenseHasher>,
     uploaded_macro_code: HashMap<u32, Vec<u32>, BuildUnorderedDenseHasher>,
     is_interpreted: bool,
+    pub(crate) native_turing: bool,
+    pub(crate) native_execution_failed: bool,
+    pub(crate) native_write_offset: u32,
+    pub(crate) native_code: [u32; 0x3000],
+    pub(crate) native_interpreter: crate::macro_turing::TuringMacroInterpreter,
+    pub(crate) native_fifo: Vec<u32>,
+    pub(crate) native_code_generation: u64,
+    pub(crate) native_memo: crate::macro_memo::BasicMacroMemo,
+    // Upstream shared_ptr; created lazily by the native execution path. Mutex
+    // permits exclusive JIT preparation/execution when shared in Rust.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) native_jit:
+        Option<std::sync::Arc<std::sync::Mutex<crate::macro_turing_jit::TuringMacroJit>>>,
+    pub(crate) native_writes: crate::macro_memo::MacroMemoPairs,
+    pub(crate) native_calls: u64,
+}
+
+/// Port of `NativeMacroContext` in macro.h. Channels share code and binding
+/// positions; their data RAM remains owned by the individual Maxwell3D channel.
+pub struct NativeMacroContext {
+    pub engine: MacroEngine,
+    pub positions: [u32; 0x80],
+    pub compute_engine: MacroEngine,
+    pub compute_positions: [u32; 0x80],
+}
+
+/// Shared upstream macro context, serialized across GPU users while allowing
+/// same-thread emitted uploads. Never retain a RefMut across Execute callbacks;
+/// use RefCell::as_ptr under the retained reentrant lock for that entry.
+pub type SharedNativeMacroContext = std::sync::Arc<
+    parking_lot::ReentrantMutex<std::cell::RefCell<NativeMacroContext>>,
+>;
+
+impl Default for NativeMacroContext {
+    fn default() -> Self {
+        Self {
+            engine: MacroEngine::new(true),
+            positions: [0; 0x80],
+            compute_engine: MacroEngine::new(true),
+            compute_positions: [0; 0x80],
+        }
+    }
 }
 
 impl MacroEngine {
+    /// Native branch of upstream Execute. Kept as a raw-pointer entry because
+    /// emitted methods may upload into this very engine. No exclusive borrow
+    /// of the whole MacroEngine survives a callback. Execution-only fields are
+    /// temporarily moved to locals and restored before returning; uploaded code
+    /// stays in its owner and is fetched live by the interpreter.
+    ///
+    /// # Safety
+    /// Both pointers must remain valid and exclusively GPU-thread-owned for the
+    /// call. No recursive macro execution is allowed (emits >= 0xe00 are rejected).
+    /// Callbacks may access upload fields, but not the temporarily borrowed
+    /// execution state. The RAM handle is cloned before any callback borrow.
+    pub(crate) unsafe fn execute_native<R>(
+        engine: *mut Self,
+        maxwell: *mut Maxwell3D,
+        method: u32,
+        parameters: &mut [u32],
+        mut refresh_parameters: R,
+    ) where R: FnMut(&mut [u32]) {
+        use crate::engines::engine_interface::EngineInterface;
+        use crate::macro_turing::DataRam;
+        use crate::nx2_profile::{self, Counter, Scope, Zone};
+        use std::sync::{Mutex, OnceLock};
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+        let _profile = Scope::new(Zone::Macro);
+        refresh_parameters(parameters);
+        let context = engine as usize;
+        static CAPTURE: OnceLock<bool> = OnceLock::new();
+        static CAPTURED: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
+        if *CAPTURE.get_or_init(|| std::env::var_os("EDEN_NATIVE_FRAME_CAPTURE").is_some())
+            && CAPTURED.get_or_init(Default::default).lock().unwrap().insert(context)
+        {
+            if let Ok(mut file) = std::fs::File::create(format!("native-graphics-mme-{context}.bin")) {
+                for word in &(*engine).native_code { let _ = file.write_all(&word.to_le_bytes()); }
+            }
+        }
+        static LOG_CALLS: OnceLock<bool> = OnceLock::new();
+        if *LOG_CALLS.get_or_init(|| std::env::var_os("EDEN_NX2_MME_LOG").is_some()) {
+            log::debug!("Native MME context={context:#x}");
+            log::debug!("Native MME start={method:#x}, parameters={}, data={parameters:08x?}", parameters.len());
+        }
+        // Static recording state corresponds to the function-local ofstream,
+        // counters and getenv values in macro.cpp; failed I/O remains nonfatal.
+        struct Recording { path: std::ffi::OsString, file: Option<std::fs::File>, recorded: u32, skip: u64 }
+        static RECORD: OnceLock<Option<Mutex<Recording>>> = OnceLock::new();
+        let record = RECORD.get_or_init(|| std::env::var_os("EDEN_NX2_MME_RECORD").map(|path| {
+            let skip = std::env::var("EDEN_NX2_MME_RECORD_SKIP").ok()
+                .and_then(|text| std::ffi::CString::new(text).ok())
+                .map_or(0, |text| unsafe { libc::strtoull(text.as_ptr(), std::ptr::null_mut(), 10) });
+            Mutex::new(Recording { file: std::fs::File::create(&path).ok(), path, recorded: 0, skip })
+        }));
+        if let Some(record) = record {
+            let mut record = record.lock().unwrap();
+            if record.skip > 0 { record.skip -= 1; }
+            else if record.recorded < 200000 {
+                if let Some(file) = record.file.as_mut() {
+                    let _ = file.write_all(&method.to_le_bytes());
+                    let _ = file.write_all(&(parameters.len() as u32).to_le_bytes());
+                    for word in parameters.iter() { let _ = file.write_all(&word.to_le_bytes()); }
+                }
+                record.recorded += 1;
+                if record.recorded == 200000 {
+                    if let Some(file) = record.file.as_mut() { let _ = file.flush(); }
+                    let mut path = record.path.clone(); path.push(".code");
+                    if let Ok(mut file) = std::fs::File::create(path) {
+                        for word in &(*engine).native_code { let _ = file.write_all(&word.to_le_bytes()); }
+                    }
+                    log::info!("Recorded 200000 macro calls to {}", record.path.to_string_lossy());
+                }
+            }
+        }
+        let ram_handle = std::sync::Arc::clone((&*maxwell).get_native_data_ram());
+        (*engine).native_interpreter.active_dram = Some(ram_handle.clone());
+        let mut ram = ram_handle.lock();
+        // Upstream's JIT only uses active_dram, not the interpreter's own RAM.
+        // Lease the interpreter only on the fallback path: taking it eagerly
+        // copies and zeroes its 12 KiB RAM on every native JIT macro call.
+        let mut interpreter = None;
+        let mut fifo = std::mem::take(&mut (*engine).native_fifo);
+        // Like the interpreter, the 2 KiB memo slots are unused by the JIT.
+        let mut memo = None;
+        let mut writes = std::mem::take(&mut (*engine).native_writes);
+        let read_memory = std::cell::Cell::new(false);
+        let mut emit = |address: u32, value: u32, fifo: &mut Vec<u32>, ram: &mut DataRam| -> bool {
+            if address >= 0xe00 { return false; }
+            if address == 0x556 {
+                static MODES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+                static ENABLE_WRITES: AtomicU64 = AtomicU64::new(0);
+                MODES[(value & 3) as usize].fetch_add(1, Ordering::Relaxed);
+                if ENABLE_WRITES.fetch_add(1, Ordering::Relaxed).wrapping_add(1) % 20000 == 0 {
+                    log::info!("Native MME render enable modes: use {} always {} never {} other {}",
+                        MODES[0].load(Ordering::Relaxed), MODES[1].load(Ordering::Relaxed),
+                        MODES[2].load(Ordering::Relaxed), MODES[3].load(Ordering::Relaxed));
+                }
+            }
+            {
+                let _method_profile = Scope::new(Zone::Method);
+                unsafe { (&mut *maxwell).call_method(address, value, true); }
+            }
+            const MEM_ADDRESS_A: u32 = 0x154;
+            const MEM_ADDRESS_B: u32 = 0x155;
+            const DATA_RAM_ADDRESS: u32 = 0x156;
+            const DMA_READ: u32 = 0x157;
+            const DMA_READ_FIFOED: u32 = 0x158;
+            if address == DMA_READ || address == DMA_READ_FIFOED {
+                read_memory.set(true);
+                let (source, ram_address, memory_handle) = {
+                    let maxwell = unsafe { &*maxwell };
+                    ((u64::from(maxwell.get_register_value(MEM_ADDRESS_A) & 0x1ffffff) << 32)
+                        | u64::from(maxwell.get_register_value(MEM_ADDRESS_B)),
+                     maxwell.get_register_value(DATA_RAM_ADDRESS),
+                     std::sync::Arc::clone(maxwell.get_memory_manager()))
+                };
+                let mut memory = memory_handle.lock();
+                let read_bytes = u64::from(value.min(0x1000)) * 4;
+                if nx2_profile::enabled() {
+                    nx2_profile::add(Counter::DmaReadBytes, read_bytes);
+                    let mut page = source & !0xfff;
+                    while page < source + read_bytes {
+                        if let Some(device) = memory.gpu_to_cpu_address(page) {
+                            nx2_profile::dma_read_pages().insert(device >> 12);
+                        }
+                        page += 0x1000;
+                    }
+                }
+                let cache = crate::cache_types::CacheType::BUFFER_CACHE;
+                if memory.is_memory_dirty_with_cache_type(source, read_bytes, cache) {
+                    memory.flush_region_with_cache_type(source, read_bytes, cache);
+                    static FLUSHES: AtomicU64 = AtomicU64::new(0);
+                    let flushes = FLUSHES.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                    if flushes % 2000 == 1 { log::info!("Native MME DMA read flushed GPU-written memory ({flushes} times)"); }
+                }
+                static DMA_LOGS: AtomicU32 = AtomicU32::new(0);
+                if DMA_LOGS.load(Ordering::Relaxed) < 400 {
+                    DMA_LOGS.fetch_add(1, Ordering::Relaxed);
+                    let mut words = [0u32; 8];
+                    for i in 0..value.min(8) { words[i as usize] = memory.read::<u32>(source + u64::from(i) * 4); }
+                    log::info!("Native MME DMA read{} start={method:#x} source={source:#x} count={value} words={words:08x?}",
+                        if address == DMA_READ_FIFOED { " fifoed" } else { "" });
+                }
+                for i in 0..value.min(0x1000) {
+                    let word = memory.read::<u32>(source + u64::from(i) * 4);
+                    if address == DMA_READ_FIFOED { fifo.push(word); }
+                    else if (ram_address.wrapping_add(i) as usize) < ram.len() {
+                        static DUMP: OnceLock<bool> = OnceLock::new();
+                        let at = ram_address.wrapping_add(i) as usize;
+                        if *DUMP.get_or_init(|| std::env::var_os("EDEN_NX2_MME_DUMP").is_some())
+                            && at == 0x27 && ram[0x27] != word
+                        { log::info!("MME data RAM[0x27] {:#x} -> {word:#x} by 3D engine {:p} (DMA from {source:#x})", ram[0x27], maxwell); }
+                        ram[at] = word;
+                    }
+                }
+            }
+            true
+        };
+        let read = |address: u32| -> u32 {
+            if (address as usize) < crate::engines::maxwell_3d::NUM_REGS {
+                unsafe { (&*maxwell).get_register_value(address) }
+            } else { 0 }
+        };
+        // A closure keeps all early returns inside the execution-state lease.
+        // Code/offset/generation remain in the original engine throughout.
+        (|| {
+            #[cfg(target_arch = "x86_64")]
+            {
+                static USE_JIT: OnceLock<bool> = OnceLock::new();
+                if *USE_JIT.get_or_init(|| std::env::var_os("EDEN_NX2_MME_JIT").is_none_or(|v| !v.to_string_lossy().starts_with('0'))) {
+                    let jit = (*engine).native_jit.get_or_insert_with(|| std::sync::Arc::new(Mutex::new(Default::default()))).clone();
+                    let mut jit = jit.lock().unwrap();
+                    if let Err(error) = jit.prepare(&(*engine).native_code, (*engine).native_code_generation) {
+                        (*engine).native_execution_failed = true;
+                        log::error!("Native MME JIT compilation failed: start={method:#x}, error={error:?}");
+                        return;
+                    }
+                    fifo.clear(); fifo.extend_from_slice(parameters);
+                    let result = jit.execute(method, &mut fifo, &mut ram, read, &mut emit);
+                    if !result.success {
+                        (*engine).native_execution_failed = true;
+                        log::error!("Native MME (JIT) failed: start={method:#x}, consumed={}/{}, error={}", result.consumed, parameters.len(), result.error);
+                    }
+                    return;
+                }
+            }
+            let interpreter = interpreter.insert(std::mem::take(&mut (*engine).native_interpreter));
+            let memo = memo.insert(std::mem::take(&mut (*engine).native_memo));
+            static USE_MEMO: OnceLock<bool> = OnceLock::new();
+            let use_memo = *USE_MEMO.get_or_init(|| std::env::var_os("EDEN_NX2_MME_MEMO").is_none_or(|v| !v.to_string_lossy().starts_with('0')));
+            if use_memo {
+                static STATS: OnceLock<bool> = OnceLock::new();
+                if *STATS.get_or_init(|| std::env::var_os("EDEN_NX2_MME_MEMO_STATS").is_some()) {
+                    (*engine).native_calls = (*engine).native_calls.wrapping_add(1);
+                    if (*engine).native_calls & 0xffffff == 0 {
+                        log::info!("Macro memo: {:?}; {} entries, {} KiB", memo.get_statistics(), memo.size(), memo.arena_words() * 4 / 1024);
+                    }
+                }
+                memo.synchronize((*engine).native_code_generation);
+                if let Some(effects) = memo.find(method, parameters, &ram[..]) {
+                    for pair in effects.data_ram_writes.chunks_exact(2) { ram[pair[0] as usize] = pair[1]; }
+                    for pair in effects.writes.chunks_exact(2) { emit(pair[0], pair[1], &mut fifo, &mut ram); }
+                    return;
+                }
+                writes.clear();
+            }
+            fifo.clear(); fifo.extend_from_slice(parameters);
+            let generation = (*engine).native_code_generation;
+            let result = interpreter.execute_with_code_reader(
+                0x3000,
+                |base| { let code = std::ptr::addr_of!((*engine).native_code).cast::<u32>(); [*code.add(base), *code.add(base + 1), *code.add(base + 2)] },
+                method, &mut fifo, read,
+                |address, value, fifo, ram| {
+                    if use_memo { writes.push((address, value)); }
+                    emit(address, value, fifo, ram)
+                }, Some(&mut ram),
+            );
+            if use_memo && result.success && !read_memory.get() && !interpreter.read_registers
+                && !interpreter.reread_data_ram && generation == (*engine).native_code_generation
+            { memo.store(method, parameters, &interpreter.data_ram_reads, &interpreter.data_ram_writes, &writes); }
+            if !result.success {
+                (*engine).native_execution_failed = true;
+                static DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+                if *DIAGNOSTICS.get_or_init(|| std::env::var_os("EDEN_NATIVE_DRAW_DIAGNOSTICS").is_some()) {
+                    if let Ok(mut file) = std::fs::File::create(format!("native-mme-{method}.bin")) {
+                        for word in &(*engine).native_code { let _ = file.write_all(&word.to_le_bytes()); }
+                    }
+                }
+                log::error!("Native MME failed: start={method:#x}, pc={:#x}, consumed={}/{}, error={}", result.pc, result.consumed, parameters.len(), result.error);
+            }
+        })();
+        if let Some(interpreter) = interpreter {
+            (*engine).native_interpreter = interpreter;
+        }
+        (*engine).native_fifo = fifo;
+        if let Some(memo) = memo {
+            (*engine).native_memo = memo;
+        }
+        (*engine).native_writes = writes;
+    }
+
     /// Create a new macro engine.
     ///
     /// Port of `MacroEngine::MacroEngine(bool is_interpreted)`.
@@ -2847,6 +3127,18 @@ impl MacroEngine {
             macro_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
             uploaded_macro_code: HashMap::with_hasher(BuildUnorderedDenseHasher),
             is_interpreted,
+            native_turing: false,
+            native_execution_failed: false,
+            native_write_offset: 0,
+            native_code: [0; 0x3000],
+            native_interpreter: Default::default(),
+            native_fifo: Vec::new(),
+            native_code_generation: 0,
+            native_memo: Default::default(),
+            #[cfg(target_arch = "x86_64")]
+            native_jit: None,
+            native_writes: Vec::new(),
+            native_calls: 0,
         }
     }
 
@@ -2865,6 +3157,14 @@ impl MacroEngine {
     ///
     /// Port of `MacroEngine::AddCode`.
     pub fn add_code(&mut self, method: u32, data: u32) {
+        if self.native_turing {
+            if (self.native_write_offset as usize) < self.native_code.len() {
+                self.native_code[self.native_write_offset as usize] = data;
+                self.native_write_offset += 1;
+            }
+            self.native_code_generation = self.native_code_generation.wrapping_add(1);
+            return;
+        }
         self.uploaded_macro_code
             .entry(method)
             .or_default()
@@ -2875,6 +3175,14 @@ impl MacroEngine {
     ///
     /// Port of `MacroEngine::ClearCode`.
     pub fn clear_code(&mut self, method: u32) {
+        if self.native_turing {
+            self.native_write_offset = if method < 0x1000 {
+                method * 3
+            } else {
+                self.native_code.len() as u32
+            };
+            return;
+        }
         self.macro_cache.remove(&method);
         self.uploaded_macro_code.remove(&method);
     }
@@ -2892,6 +3200,7 @@ impl MacroEngine {
     ) where
         R: FnMut(&mut [u32]),
     {
+        let _profile = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::Macro);
         let is_interpreted = self.is_interpreted;
         self.execute_with_compiler(
             maxwell3d,
@@ -3050,6 +3359,74 @@ mod tests {
         let ma = MethodAddress::new(0x3F_FFF);
         assert_eq!(ma.address(), 0xFFF);
         assert_eq!(ma.increment(), 0x3F);
+    }
+
+    #[test]
+    fn native_macro_upload_bounds_generation_and_clear_match_upstream() {
+        let mut engine = MacroEngine::new(true);
+        engine.add_code(0x100, 0x1234);
+        engine.native_turing = true;
+        engine.clear_code(0xfff);
+        assert_eq!(engine.native_write_offset, 0x2ffd);
+        for (method, data) in [(0, 11), (0x1234, 22), (u32::MAX, 33)] {
+            engine.add_code(method, data);
+        }
+        assert_eq!(&engine.native_code[0x2ffd..], &[11, 22, 33]);
+        assert_eq!(engine.native_write_offset, 0x3000);
+        engine.add_code(0, 44);
+        assert_eq!(&engine.native_code[0x2ffd..], &[11, 22, 33]);
+        assert_eq!((engine.native_write_offset, engine.native_code_generation), (0x3000, 4));
+        for method in [0x1000, u32::MAX] {
+            engine.clear_code(method);
+            assert_eq!(engine.native_write_offset, 0x3000);
+            assert_eq!(engine.native_code_generation, 4);
+        }
+        engine.clear_code(0xfff);
+        assert_eq!(&engine.native_code[0x2ffd..], &[11, 22, 33]);
+        engine.add_code(0, 55);
+        assert_eq!(&engine.native_code[0x2ffd..], &[55, 22, 33]);
+        engine.native_code_generation = u64::MAX;
+        engine.add_code(0, 66);
+        assert_eq!(engine.native_code_generation, 0);
+        assert_eq!(engine.uploaded_macro_code[&0x100], [0x1234]);
+        engine.native_turing = false;
+        engine.clear_code(0x100);
+        assert!(!engine.uploaded_macro_code.contains_key(&0x100));
+        assert_eq!(engine.native_code[0x2ffd], 55);
+    }
+
+    #[test]
+    fn native_macro_context_initializes_distinct_graphics_and_compute_state() {
+        let mut context = NativeMacroContext::default();
+        for engine in [&context.engine, &context.compute_engine] {
+            assert!(engine.is_interpreted);
+            assert!(!engine.native_turing);
+            assert!(!engine.native_execution_failed);
+            assert_eq!(engine.native_write_offset, 0);
+            assert!(engine.native_code.iter().all(|&word| word == 0));
+            assert!(engine.native_interpreter.dram.iter().all(|&word| word == 0));
+            assert!(engine.native_fifo.is_empty());
+            assert_eq!(engine.native_code_generation, 0);
+            assert_eq!(engine.native_memo.size(), 0);
+            #[cfg(target_arch = "x86_64")]
+            assert!(engine.native_jit.is_none());
+            assert!(engine.native_writes.is_empty());
+            assert_eq!(engine.native_calls, 0);
+        }
+        assert_eq!(context.positions, [0; 0x80]);
+        assert_eq!(context.compute_positions, [0; 0x80]);
+        context.engine.native_turing = true;
+        context.compute_engine.native_turing = true;
+        context.engine.add_code(0, 0xaaaa);
+        context.compute_engine.add_code(0, 0xbbbb);
+        context.positions[0] = 7;
+        context.compute_positions[0] = 9;
+        assert_eq!(context.engine.native_code[0], 0xaaaa);
+        assert_eq!(context.compute_engine.native_code[0], 0xbbbb);
+        assert_eq!(context.positions[0], 7);
+        assert_eq!(context.compute_positions[0], 9);
+        assert_eq!(std::mem::size_of_val(&context.engine.native_code), 0xc000);
+        assert_eq!(std::mem::size_of_val(&context.positions), 0x200);
     }
 
     #[test]

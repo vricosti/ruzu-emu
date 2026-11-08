@@ -794,6 +794,7 @@ struct DynarmicCallbacks64 {
     /// Whether wall clock is used (if true, ticking is disabled).
     /// Matches upstream `m_parent.m_uses_wall_clock`.
     uses_wall_clock: bool,
+    hardware_profile: crate::hardware_properties::HardwareProfile,
     /// Core timing reference for tick management.
     /// Matches upstream `m_parent.m_system.CoreTiming()`.
     core_timing: Arc<crate::core_timing::CoreTiming>,
@@ -850,6 +851,7 @@ impl DynarmicCallbacks64 {
             core_memory,
             svc,
             uses_wall_clock,
+            hardware_profile: crate::hardware_properties::SWITCH1_PROFILE,
             core_timing,
             last_exception_address,
             breakpoint_context,
@@ -2201,13 +2203,13 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
     }
 
     /// Matches upstream `DynarmicCallbacks64::AddTicks`:
-    /// Divides ticks by NUM_CPU_CORES (4), passes to CoreTiming::AddTicks.
+    /// Divides ticks by the active session core count, passes to CoreTiming::AddTicks.
     fn add_ticks(&mut self, ticks: u64) {
         if self.uses_wall_clock {
             return;
         }
         let amortized_ticks =
-            std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
+            std::cmp::max(ticks / self.hardware_profile.num_cpu_cores() as u64, 1);
         self.core_timing.add_ticks(amortized_ticks);
     }
 
@@ -2277,7 +2279,7 @@ impl ArmDynarmic64 {
     /// `shared_memory` corresponds to upstream's `process->GetMemory()` —
     /// the JIT callbacks use it for all guest memory access.
     pub fn new(
-        _system: &dyn std::any::Any,
+        hardware_profile: crate::hardware_properties::HardwareProfile,
         uses_wall_clock: bool,
         process: &KProcess,
         exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
@@ -2348,7 +2350,7 @@ impl ArmDynarmic64 {
         })
         .filter(|backing_base| {
             let intended_memory_size =
-                crate::hle::kernel::board::k_system_control::init::get_intended_memory_size();
+                kernel_process.device_memory_backing_size;
             (*backing_base as u64) + (intended_memory_size as u64) < (1u64 << 39)
         })
         .map(|_| PageTable::SIGN_BIT as u8);
@@ -2365,7 +2367,7 @@ impl ArmDynarmic64 {
         let base = ArmInterfaceBase::new(uses_wall_clock);
         let halted_watchpoint = Arc::new(Mutex::new(None));
         let last_code_addr = Arc::new(AtomicU64::new(u64::MAX));
-        let callbacks = DynarmicCallbacks64::new(
+        let mut callbacks = DynarmicCallbacks64::new(
             shared_memory,
             core_memory,
             svc.clone(),
@@ -2380,6 +2382,9 @@ impl ArmDynarmic64 {
             Some(tpidr_el0_ptr),
             Arc::clone(&last_code_addr),
         );
+        // Explicit session data replaces the unused Any system adapter.
+        callbacks.hardware_profile = hardware_profile;
+
 
         log::warn!(
             "ArmDynarmic64: page_table_pointer={:?} fastmem_pointer={:?} for core {}",
@@ -2918,6 +2923,33 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn set_test_vector_lane(state: &mut A64JitState, index: usize, value: u64) {
         state.vec[index] = value;
+    }
+
+    #[test]
+    fn hardware_profile_ticks_preserve_divisor_minimum_and_wall_clock_bypass() {
+        use crate::hardware_properties::{SWITCH1_PROFILE, NX2_PROFILE};
+        let interface = ArmInterfaceBase::new(false);
+        let timing = Arc::new(CoreTiming::new());
+        let mut callbacks = DynarmicCallbacks64::new(
+            Arc::new(RwLock::new(ProcessMemoryData::new())), None,
+            Arc::new(AtomicU32::new(0)), false, timing.clone(),
+            Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(Default::default())),
+            0, false, interface.shared_watchpoint_array(), Arc::new(Mutex::new(None)),
+            None, Arc::new(AtomicU64::new(u64::MAX)),
+        );
+        for (profile, decrement) in [(SWITCH1_PROFILE, 6), (NX2_PROFILE, 4)] {
+            callbacks.hardware_profile = profile;
+            timing.reset_ticks();
+            let before = timing.get_downcount();
+            callbacks.add_ticks(24);
+            assert_eq!(before - timing.get_downcount(), decrement);
+            callbacks.add_ticks(0);
+            assert_eq!(before - timing.get_downcount(), decrement + 1);
+            callbacks.uses_wall_clock = true;
+            callbacks.add_ticks(24);
+            assert_eq!(before - timing.get_downcount(), decrement + 1);
+            callbacks.uses_wall_clock = false;
+        }
     }
 
     #[test]

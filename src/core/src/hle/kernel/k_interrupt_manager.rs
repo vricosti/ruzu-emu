@@ -5,7 +5,6 @@
 //! KInterruptManager: namespace-level functions for handling inter-processor
 //! interrupts and scheduling interrupts. Upstream is a namespace, not a class.
 
-use crate::hardware_properties;
 
 use super::kernel::KernelCore;
 
@@ -117,7 +116,7 @@ pub fn handle_interrupt(kernel: &KernelCore, core_id: i32) {
 /// Upstream: `KInterruptManager::SendInterProcessorInterrupt(KernelCore&, u64)`
 /// (k_interrupt_manager.cpp:36-42).
 pub fn send_inter_processor_interrupt(kernel: &KernelCore, core_mask: u64) {
-    for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
+    for core_id in 0..kernel.hardware_profile().num_cpu_cores() as usize {
         if core_mask & (1u64 << core_id) != 0 {
             if let Some(physical_core) = kernel.physical_core(core_id) {
                 physical_core.interrupt();

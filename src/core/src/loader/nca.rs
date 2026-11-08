@@ -89,6 +89,49 @@ impl FileTypeIdentifier for AppLoaderNca {
 }
 
 impl AppLoaderNca {
+    fn prepare_directory_loader(&mut self, system: &mut System) -> Result<(), ResultStatus> {
+        if self.directory_loader.is_some() { return Ok(()); }
+        let nca_status = self.nca.get_status();
+        if nca_status != FsResultStatus::Success {
+            return Err(map_fs_status(nca_status));
+        }
+
+        if self.nca.get_type() != NCAContentType::Program {
+            return Err(ResultStatus::ErrorNCANotProgram);
+        }
+
+        let mut exefs = self.nca.get_exefs();
+        if exefs.is_none() {
+            log::info!("No ExeFS found in NCA, looking for ExeFS from update");
+
+            // Upstream: const auto& installed = system.GetContentProvider();
+            //           const auto update_nca = installed.GetEntry(
+            //               FileSys::GetUpdateTitleID(nca->GetTitleId()), Program);
+            if let Some(ref cp) = system.content_provider {
+                let cp_guard = cp.lock().unwrap();
+                let update_title_id = get_update_title_id(self.nca.get_title_id());
+                let update_nca = cp_guard.get_entry(update_title_id, ContentRecordType::Program);
+                if let Some(update) = update_nca {
+                    exefs = update.get_exefs();
+                }
+            }
+
+            if exefs.is_none() {
+                return Err(ResultStatus::ErrorNoExeFS);
+            }
+        }
+
+        let exefs = exefs.unwrap();
+
+        // Upstream: directory_loader = make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true);
+        // The second arg `true` means override_update=true, is_hbl=false.
+        let dir_loader =
+            AppLoaderDeconstructedRomDirectory::new_from_directory(exefs, true, false);
+
+        self.directory_loader = Some(dir_loader);
+        Ok(())
+    }
+
     /// Create a new NCA loader.
     ///
     /// Maps to upstream `AppLoader_NCA::AppLoader_NCA`.
@@ -121,6 +164,12 @@ impl AppLoaderNca {
 }
 
 impl AppLoader for AppLoaderNca {
+    fn read_hardware_profile(&mut self, system: &mut System)
+        -> Result<crate::hardware_properties::HardwareProfile, ResultStatus> {
+        self.prepare_directory_loader(system)?;
+        self.directory_loader.as_mut().unwrap().read_hardware_profile(system)
+    }
+
     fn get_file_type(&self) -> FileType {
         Self::identify_type(&self.file)
     }
@@ -131,43 +180,8 @@ impl AppLoader for AppLoaderNca {
             return (ResultStatus::ErrorAlreadyLoaded, None);
         }
 
-        let nca_status = self.nca.get_status();
-        if nca_status != FsResultStatus::Success {
-            return (map_fs_status(nca_status), None);
-        }
-
-        if self.nca.get_type() != NCAContentType::Program {
-            return (ResultStatus::ErrorNCANotProgram, None);
-        }
-
-        let mut exefs = self.nca.get_exefs();
-        if exefs.is_none() {
-            log::info!("No ExeFS found in NCA, looking for ExeFS from update");
-
-            // Upstream: const auto& installed = system.GetContentProvider();
-            //           const auto update_nca = installed.GetEntry(
-            //               FileSys::GetUpdateTitleID(nca->GetTitleId()), Program);
-            if let Some(ref cp) = system.content_provider {
-                let cp_guard = cp.lock().unwrap();
-                let update_title_id = get_update_title_id(self.nca.get_title_id());
-                let update_nca = cp_guard.get_entry(update_title_id, ContentRecordType::Program);
-                if let Some(update) = update_nca {
-                    exefs = update.get_exefs();
-                }
-            }
-
-            if exefs.is_none() {
-                return (ResultStatus::ErrorNoExeFS, None);
-            }
-        }
-
-        let exefs = exefs.unwrap();
-
-        // Upstream: directory_loader = make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true);
-        // The second arg `true` means override_update=true, is_hbl=false.
-        let mut dir_loader =
-            AppLoaderDeconstructedRomDirectory::new_from_directory(exefs, true, false);
-
+        if let Err(error) = self.prepare_directory_loader(system) { return (error, None); }
+        let mut dir_loader = self.directory_loader.take().expect("prepared NCA loader");
         let load_result = dir_loader.load(process, system);
         if load_result.0 != ResultStatus::Success {
             self.directory_loader = Some(dir_loader);

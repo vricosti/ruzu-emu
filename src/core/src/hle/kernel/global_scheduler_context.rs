@@ -109,8 +109,16 @@ fn trace_sched_state_fast(
 pub const HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY: i32 = 2;
 
 /// Preemption priorities for each core (indices 0-5).
-pub const PREEMPTION_PRIORITIES: [u32; hardware_properties::NUM_CPU_CORES as usize] =
-    [59, 59, 59, 63, 59, 59];
+pub const PREEMPTION_PRIORITIES: [u32; 4] = [59, 59, 59, 63];
+/// Existing experimental NX2 values; firmware priorities remain unverified.
+const NX2_PREEMPTION_PRIORITIES: [u32; 6] = [59, 59, 59, 63, 59, 59];
+
+fn preemption_priorities(profile: hardware_properties::HardwareProfile) -> &'static [u32] {
+    match profile {
+        hardware_properties::HardwareProfile::Switch1 => &PREEMPTION_PRIORITIES,
+        hardware_properties::HardwareProfile::Nx2 => &NX2_PREEMPTION_PRIORITIES,
+    }
+}
 
 /// The global scheduler context.
 ///
@@ -118,6 +126,7 @@ pub const PREEMPTION_PRIORITIES: [u32; hardware_properties::NUM_CPU_CORES as usi
 /// Owns the KSchedulerPriorityQueue, the scheduler lock, the thread list,
 /// and dummy thread wakeup tracking.
 pub struct GlobalSchedulerContext {
+    pub hardware_profile: hardware_properties::HardwareProfile,
     pub m_scheduler_update_needed: std::sync::atomic::AtomicBool,
     pub m_priority_queue: KPriorityQueue,
     pub m_scheduler_lock: KAbstractSchedulerLock,
@@ -134,8 +143,11 @@ pub struct GlobalSchedulerContext {
 }
 
 impl GlobalSchedulerContext {
-    pub fn new() -> Self {
+    pub fn new() -> Self { Self::with_hardware_profile(hardware_properties::SWITCH1_PROFILE) }
+
+    pub fn with_hardware_profile(hardware_profile: hardware_properties::HardwareProfile) -> Self {
         Self {
+            hardware_profile,
             m_scheduler_update_needed: std::sync::atomic::AtomicBool::new(false),
             m_priority_queue: KPriorityQueue::new(),
             m_scheduler_lock: KAbstractSchedulerLock::new(),
@@ -460,8 +472,8 @@ impl GlobalSchedulerContext {
     // -- PreemptThreads --
 
     pub fn preempt_threads(&mut self, current_thread_id: Option<u64>) {
-        for core_id in 0..hardware_properties::NUM_CPU_CORES {
-            let priority = PREEMPTION_PRIORITIES[core_id as usize] as i32;
+        for core_id in 0..self.hardware_profile.num_cpu_cores() {
+            let priority = preemption_priorities(self.hardware_profile)[core_id as usize] as i32;
             super::k_scheduler::KScheduler::rotate_scheduled_queue(
                 self,
                 core_id as i32,
@@ -535,6 +547,12 @@ mod tests {
 
     use super::{GlobalSchedulerContext, PREEMPTION_PRIORITIES};
     use crate::hle::kernel::k_thread::{KThread, KThreadLock, ThreadState};
+
+    #[test]
+    fn hardware_profiles_select_upstream_preemption_priorities() {
+        assert_eq!(super::preemption_priorities(crate::hardware_properties::SWITCH1_PROFILE), &[59,59,59,63]);
+        assert_eq!(super::preemption_priorities(crate::hardware_properties::NX2_PROFILE), &[59,59,59,63,59,59]);
+    }
 
     #[test]
     fn get_thread_by_thread_id_does_not_need_thread_mutex() {

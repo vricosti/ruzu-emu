@@ -1785,6 +1785,8 @@ mod tests {
             // allocation rather than moving an initialized System afterward.
             let mut system = System::new_boxed_for_test();
             system.initialize();
+            let mode = *common::settings::values().memory_layout_mode.get_value();
+            system.initialize_device_memory(mode);
             system
                 .kernel_mut()
                 .expect("test system must own a kernel")

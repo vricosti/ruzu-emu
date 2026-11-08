@@ -669,7 +669,14 @@ impl crate::texture_cache::descriptor_table::GpuMemoryReader for MaxwellDeviceMe
 
 impl Default for MaxwellDeviceMemoryManager {
     fn default() -> Self {
-        let physical_page_count = smmu_physical_page_count_from_settings();
+        Self::with_physical_page_count(smmu_physical_page_count_from_settings())
+    }
+}
+
+impl MaxwellDeviceMemoryManager {
+    // Mechanical constructor split: session and standalone construction share
+    // the upstream allocator/table initialization order.
+    fn with_physical_page_count(physical_page_count: usize) -> Self {
         Self {
             cached_pages: (0..SMMU_DEVICE_PAGE_COUNT)
                 .map(|_| AtomicU8::new(0))
@@ -701,13 +708,21 @@ impl DeviceTracker for MaxwellDeviceMemoryManager {
 }
 
 impl MaxwellDeviceMemoryManager {
-    /// Construct the manager from the process-wide device memory backing.
+    /// Construct the manager from the session device memory backing.
     ///
     /// Port of upstream `DeviceMemoryManager<Traits>::DeviceMemoryManager(const
     /// DeviceMemory&)`, which captures `physical_base` from
     /// `device_memory.buffer.BackingBasePointer()` during Host1x construction.
     pub fn new_with_device_memory(device_memory: &DeviceMemory) -> Self {
-        let manager = Self::default();
+        // Session extension of the upstream 4 GB / extended table selection:
+        // the supplied backing is authoritative, since automatic NX2 memory
+        // selection deliberately does not modify the global user setting.
+        let bits = if device_memory.buffer.backing_size() <= (1usize << PHYSICAL_MIN_BITS) {
+            PHYSICAL_MIN_BITS
+        } else {
+            PHYSICAL_MAX_BITS
+        };
+        let manager = Self::with_physical_page_count(1usize << (bits - SMMU_PAGE_BITS as usize));
         manager.smmu_physical_base.store(
             device_memory.buffer.backing_base_pointer() as usize,
             Ordering::Relaxed,
@@ -1934,6 +1949,25 @@ mod tests {
         size: usize,
     ) {
         mgr.smmu_map_with_cpu_backing(d_address, host_ptr, virtual_address, size, 5, true);
+    }
+
+    #[test]
+    fn session_backing_sizes_gpu_tables_without_changing_global_layout() {
+        let configured = *common::settings::values().memory_layout_mode.get_value();
+        for (gib, bits) in [(4usize, PHYSICAL_MIN_BITS), (20, PHYSICAL_MAX_BITS), (4, PHYSICAL_MIN_BITS)] {
+            let device_memory = DeviceMemory::with_size(gib << 30);
+            let manager = MaxwellDeviceMemoryManager::new_with_device_memory(&device_memory);
+            assert_eq!(manager.smmu_physical_page_count, 1usize << (bits - 12));
+            let last_page = (gib << 30) - SMMU_PAGE_SIZE as usize;
+            let pointer = unsafe { device_memory.get_pointer_from_raw(last_page as u64) };
+            unsafe { pointer.write_volatile(0xA7); }
+            smmu_map_test_backing(&manager, 0x8000, pointer, 0x2100000000, 0x1000);
+            let mut output = [0];
+            assert!(manager.smmu_read_block_unsafe(0x8000, &mut output));
+            assert_eq!(output, [0xA7]);
+            assert_eq!(manager.smmu_reverse_device_pages_for_test(pointer), vec![8]);
+            assert_eq!(*common::settings::values().memory_layout_mode.get_value(), configured);
+        }
     }
 
     #[test]

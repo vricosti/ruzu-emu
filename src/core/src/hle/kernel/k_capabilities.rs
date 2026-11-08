@@ -93,6 +93,7 @@ fn get_capability_flag(cap_type: CapabilityType) -> u32 {
 /// Process capabilities.
 /// Matches upstream `KCapabilities` class (k_capabilities.h).
 pub struct KCapabilities {
+    pub(crate) hardware_profile: hardware_properties::HardwareProfile,
     pub svc_access_flags: [bool; SVC_ACCESS_FLAG_COUNT],
     pub irq_access_flags: [bool; INTERRUPT_ID_COUNT],
     pub core_mask: u64,
@@ -107,6 +108,7 @@ pub struct KCapabilities {
 impl KCapabilities {
     pub fn new() -> Self {
         Self {
+            hardware_profile: hardware_properties::SWITCH1_PROFILE,
             svc_access_flags: [false; SVC_ACCESS_FLAG_COUNT],
             irq_access_flags: [false; INTERRUPT_ID_COUNT],
             core_mask: 0,
@@ -176,7 +178,7 @@ impl KCapabilities {
 
         // Initial processes may run on all cores.
         self.core_mask = hardware_properties::VIRTUAL_CORE_MASK;
-        self.phys_core_mask = hardware_properties::convert_virtual_core_mask_to_physical(self.core_mask);
+        self.phys_core_mask = self.hardware_profile.convert_virtual_core_mask_to_physical(self.core_mask);
 
         // Initial processes may use any user priority (not kernel priorities 0-3).
         self.priority_mask = !0xFu64;
@@ -352,7 +354,7 @@ impl KCapabilities {
         }
         // Physical core mask = convert virtual to physical.
         // Upstream: Core::Hardware::ConvertVirtualCoreMaskToPhysical
-        self.phys_core_mask = hardware_properties::convert_virtual_core_mask_to_physical(self.core_mask);
+        self.phys_core_mask = self.hardware_profile.convert_virtual_core_mask_to_physical(self.core_mask);
 
         // Set priority mask.
         for prio in min_prio..=max_prio {
@@ -638,6 +640,7 @@ impl Default for KCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hardware_properties::HardwareProfile;
 
     #[test]
     fn test_capability_type_values() {
@@ -654,11 +657,14 @@ mod tests {
 
     #[test]
     fn virtual_core_affinity_uses_hardware_mapping() {
-        for (minimum, maximum, virtual_mask, physical_mask) in [
-            (0u32, 5u32, 0x3fu64, 0x3fu64),
-            (63, 63, 1u64 << 63, 1u64 << 3),
+        for (profile, minimum, maximum, virtual_mask, physical_mask) in [
+            (HardwareProfile::Switch1, 0u32, 5u32, 0x3fu64, 0x0fu64),
+            (HardwareProfile::Nx2, 0, 5, 0x3f, 0x3f),
+            (HardwareProfile::Switch1, 63, 63, 1u64 << 63, 1u64 << 3),
+            (HardwareProfile::Nx2, 63, 63, 1u64 << 63, 1u64 << 3),
         ] {
             let mut caps = KCapabilities::new();
+            caps.hardware_profile = profile;
             let cap = 7 | (59 << 4) | (28 << 10) | (minimum << 16) | (maximum << 24);
             assert_eq!(caps.set_core_priority_capability(cap), 0);
             assert_eq!(caps.core_mask, virtual_mask);

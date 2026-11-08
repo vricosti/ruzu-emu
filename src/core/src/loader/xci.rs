@@ -114,6 +114,16 @@ impl AppLoaderXci {
 }
 
 impl AppLoader for AppLoaderXci {
+    fn read_hardware_profile(&mut self, system: &mut System)
+        -> Result<crate::hardware_properties::HardwareProfile, ResultStatus> {
+        if self.xci.get_status() != FsResultStatus::Success { return Err(map_fs_status(self.xci.get_status())); }
+        if self.xci.get_program_nca_status() != FsResultStatus::Success { return Err(map_fs_status(self.xci.get_program_nca_status())); }
+        if !self.xci.has_program_nca() && !KeyManager::key_file_exists(false) {
+            return Err(ResultStatus::ErrorMissingProductionKeyFile);
+        }
+        self.nca_loader.read_hardware_profile(system)
+    }
+
     fn get_file_type(&self) -> FileType {
         Self::identify_type(&self.file)
     }

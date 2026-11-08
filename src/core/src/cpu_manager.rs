@@ -44,10 +44,11 @@ impl Default for CoreData {
 /// In Rust, CpuManager is owned by System, so we use a raw pointer set
 /// after construction via `set_system()`. This mirrors the C++ pattern.
 pub struct CpuManager {
+    hardware_profile: hardware_properties::HardwareProfile,
     /// Barrier for GPU readiness synchronization.
     gpu_barrier: Option<Arc<Barrier>>,
     /// Per-core thread data.
-    core_data: [CoreData; hardware_properties::NUM_CPU_CORES as usize],
+    core_data: [CoreData; hardware_properties::MAX_NUM_CPU_CORES],
     /// Whether we're using async GPU emulation.
     is_async_gpu: bool,
     /// Whether we're in multicore mode.
@@ -273,9 +274,9 @@ fn trace_core_dispatch(
     };
     const PHASE_COUNT: usize = 6;
     static CORE_DISPATCH_TRACE_COUNTS: [std::sync::atomic::AtomicU64;
-        hardware_properties::NUM_CPU_CORES as usize * PHASE_COUNT] =
+        hardware_properties::MAX_NUM_CPU_CORES * PHASE_COUNT] =
         [const { std::sync::atomic::AtomicU64::new(0) };
-            hardware_properties::NUM_CPU_CORES as usize * PHASE_COUNT];
+            hardware_properties::MAX_NUM_CPU_CORES * PHASE_COUNT];
     let counter_index = core_index * PHASE_COUNT + phase_id as usize;
     let n = CORE_DISPATCH_TRACE_COUNTS[counter_index].fetch_add(1, Ordering::Relaxed);
     if n >= 512 && !n.is_multiple_of(1_000) {
@@ -358,6 +359,7 @@ impl CpuManager {
     /// Upstream: `CpuManager::CpuManager(System& system_) : system{system_} {}`
     pub fn new() -> Self {
         Self {
+            hardware_profile: hardware_properties::SWITCH1_PROFILE,
             gpu_barrier: None,
             core_data: Default::default(),
             is_async_gpu: false,
@@ -367,6 +369,12 @@ impl CpuManager {
             num_cores: 0,
             stop_requested: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Selects the session profile before creating CPU workers.
+    pub fn set_hardware_profile(&mut self, profile: hardware_properties::HardwareProfile) {
+        assert_eq!(self.num_cores, 0, "CPU workers already initialized");
+        self.hardware_profile = profile;
     }
 
     /// Sets if emulation is multicore or single core. Must be set before Initialize.
@@ -397,7 +405,7 @@ impl CpuManager {
     /// threads (guaranteed by System::shutdown joining them first).
     pub unsafe fn initialize(&mut self, kernel_ptr: *const KernelCore) {
         self.num_cores = if self.is_multicore {
-            hardware_properties::NUM_CPU_CORES as usize
+            self.hardware_profile.num_cpu_cores() as usize
         } else {
             1
         };
@@ -467,6 +475,10 @@ impl CpuManager {
                 let _ = thread.join();
             }
         }
+        self.num_cores = 0;
+        self.gpu_barrier = None;
+        self.current_core.store(0, Ordering::Relaxed);
+        self.idle_count.store(0, Ordering::Relaxed);
         log::info!("CpuManager: shutdown complete");
     }
 
@@ -780,7 +792,7 @@ impl CpuManager {
             _,
             bool,
             [Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
-                hardware_properties::NUM_CPU_CORES as usize],
+                hardware_properties::MAX_NUM_CPU_CORES],
         ) = {
             let parent_weak = {
                 let thread = thread_arc.lock().unwrap();
@@ -796,9 +808,9 @@ impl CpuManager {
             let mut process = parent_arc.lock().unwrap();
             let is_64bit = process.is_64bit();
             let mut jits: [Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
-                hardware_properties::NUM_CPU_CORES as usize] =
-                [const { None }; hardware_properties::NUM_CPU_CORES as usize];
-            for i in 0..hardware_properties::NUM_CPU_CORES as usize {
+                hardware_properties::MAX_NUM_CPU_CORES] =
+                [const { None }; hardware_properties::MAX_NUM_CPU_CORES];
+            for i in 0..process.hardware_profile().num_cpu_cores() as usize {
                 if let Some(jit) = process.get_arm_interface_mut(i) {
                     jits[i] = Some(
                         jit as *mut _ as *mut Box<dyn crate::arm::arm_interface::ArmInterface>,
@@ -862,7 +874,7 @@ impl CpuManager {
         process_owner: &Arc<crate::hle::kernel::k_process::ProcessLock>,
         is_64bit: bool,
         cached_jits: &[Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
-             hardware_properties::NUM_CPU_CORES as usize],
+             hardware_properties::MAX_NUM_CPU_CORES],
     ) {
         use crate::arm::arm_interface::KThread as OpaqueKThread;
 
@@ -1884,9 +1896,9 @@ impl CpuManager {
                     let mut process = parent_arc.lock().unwrap();
                     let is_64bit = process.is_64bit();
                     let mut jits: [Option<*mut Box<dyn crate::arm::arm_interface::ArmInterface>>;
-                        hardware_properties::NUM_CPU_CORES as usize] =
-                        [const { None }; hardware_properties::NUM_CPU_CORES as usize];
-                    for i in 0..hardware_properties::NUM_CPU_CORES as usize {
+                        hardware_properties::MAX_NUM_CPU_CORES] =
+                        [const { None }; hardware_properties::MAX_NUM_CPU_CORES];
+                    for i in 0..process.hardware_profile().num_cpu_cores() as usize {
                         if let Some(jit) = process.get_arm_interface_mut(i) {
                             jits[i] = Some(
                                 jit as *mut _
@@ -1968,7 +1980,7 @@ impl CpuManager {
         }
 
         let next_core = (self.current_core.load(Ordering::Relaxed) + 1)
-            % hardware_properties::NUM_CPU_CORES as usize;
+            % self.hardware_profile.num_cpu_cores() as usize;
         self.current_core.store(next_core, Ordering::Relaxed);
 
         core_timing.reset_ticks();
@@ -1995,7 +2007,7 @@ impl CpuManager {
         }
 
         let next_core = (current_core.load(Ordering::Relaxed) + 1)
-            % hardware_properties::NUM_CPU_CORES as usize;
+            % kernel.hardware_profile().num_cpu_cores() as usize;
         current_core.store(next_core, Ordering::Relaxed);
         core_timing.reset_ticks();
 

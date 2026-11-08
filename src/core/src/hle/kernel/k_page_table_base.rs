@@ -48,7 +48,7 @@ fn invalidate_instruction_cache_for_table(table: &KPageTableBase, addr: usize, s
     };
 
     let mut process = process.lock().unwrap();
-    for core_id in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
+    for core_id in 0..kernel.hardware_profile().num_cpu_cores() as usize {
         if let Some(interface) = process.get_arm_interface_mut(core_id) {
             interface.invalidate_cache_range(addr as u64, size);
         }

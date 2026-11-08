@@ -42,6 +42,7 @@ use crate::hle::result::ResultCode;
 // Core threads get IDs 0..NUM_CPU_CORES-1. Other host threads get IDs >= NUM_CPU_CORES.
 // UINT8_MAX (255) means "not yet registered".
 std::thread_local! {
+    static HOST_THREAD_SESSION: RefCell<Weak<()>> = const { RefCell::new(Weak::new()) };
     static HOST_THREAD_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
     static IS_PHANTOM_MODE_FOR_SINGLECORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -284,6 +285,69 @@ mod thread_dump_request_tests {
     use std::sync::atomic::AtomicU64;
 
     #[test]
+    fn hardware_profiles_reinitialize_kernel_cores_in_both_directions() {
+        use super::KernelCore;
+        use crate::hardware_properties;
+        use std::sync::atomic::Ordering;
+        for profile in [hardware_properties::SWITCH1_PROFILE, hardware_properties::NX2_PROFILE,
+            hardware_properties::SWITCH1_PROFILE] {
+            let mut kernel = Box::new(KernelCore::with_hardware_profile(profile));
+            kernel.initialize();
+            let count = profile.num_cpu_cores() as usize;
+            assert_eq!(kernel.cores.len(), count);
+            assert_eq!(kernel.schedulers.len(), count);
+            assert_eq!(kernel.main_threads.len(), count);
+            assert_eq!(kernel.idle_threads.len(), count);
+            assert_eq!(kernel.slab_resource_counts.num_k_debug, count);
+            for (core, thread) in kernel.main_threads.iter().enumerate() {
+                assert_eq!(thread.lock().unwrap().get_affinity_mask().get_affinity_mask(), 1 << core);
+            }
+            kernel.register_host_thread();
+            assert!(kernel.get_current_host_thread_id() >= count as u32);
+            assert!(!kernel.is_current_thread_guest_core());
+            assert_eq!(kernel.current_physical_core_index(), count - 1);
+            assert!(kernel.next_host_thread_id.load(Ordering::Relaxed) >= count as u32);
+            kernel.shutdown();
+        }
+    }
+
+    #[test]
+    fn hardware_profile_persistent_host_worker_discards_old_session_tls() {
+        use crate::hardware_properties::{SWITCH1_PROFILE, NX2_PROFILE};
+        let (send, receive) = std::sync::mpsc::channel::<usize>();
+        let (report, reports) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while let Ok(kernel_addr) = receive.recv() {
+                // The sender owns the kernel and keeps it alive until the
+                // report is received; the process-global pointer cannot be
+                // used here because parallel tests replace it.
+                let kernel = unsafe { &*(kernel_addr as *const super::KernelCore) };
+                assert_eq!(kernel.get_current_host_thread_id(), u32::MAX);
+                assert!(!kernel.is_phantom_mode_for_single_core());
+                kernel.register_host_thread();
+                let mut affinity = super::get_or_create_host_dummy_thread(kernel)
+                    .lock().unwrap().physical_affinity_mask;
+                affinity.set_all();
+                let id = kernel.get_current_host_thread_id();
+                kernel.set_is_phantom_mode_for_single_core(true);
+                report.send((id, affinity.get_affinity_mask())).unwrap();
+            }
+        });
+        for profile in [SWITCH1_PROFILE, NX2_PROFILE, SWITCH1_PROFILE] {
+            let mut kernel = Box::new(super::KernelCore::with_hardware_profile(profile));
+            kernel.set_multicore(false);
+            kernel.initialize();
+            send.send(&*kernel as *const super::KernelCore as usize).unwrap();
+            let (id, mask) = reports.recv().unwrap();
+            assert!(id >= profile.num_cpu_cores() && id != u32::MAX);
+            assert_eq!(mask, (1u64 << profile.num_cpu_cores()) - 1);
+            kernel.shutdown();
+        }
+        drop(send);
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn dump_marker_is_opt_in_monotonic_and_consumed_once() {
         let handled = AtomicU64::new(0);
         for invalid in ["", "0", "-1", "invalid", "18446744073709551616"] {
@@ -301,7 +365,7 @@ mod thread_dump_request_tests {
 /// SIGUSR1 dumper to identify which thread/svc is currently executing on each
 /// core.
 pub static SVC_IN_PROGRESS: [std::sync::atomic::AtomicU64;
-    hardware_properties::NUM_CPU_CORES as usize] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::NUM_CPU_CORES as usize];
+    hardware_properties::MAX_NUM_CPU_CORES] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::MAX_NUM_CPU_CORES];
 
 /// Per-core last known guest PC. Updated by `PhysicalCore::handoff_after_svc`
 /// at every SVC return (cheapest hook that already touches the thread context
@@ -309,7 +373,7 @@ pub static SVC_IN_PROGRESS: [std::sync::atomic::AtomicU64;
 /// guest instructions have executed since the last SVC — fine for
 /// post-freeze diagnostics where the spin has no SVCs at all and we want the
 /// PC at which the spin started.
-pub static GUEST_PC: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::NUM_CPU_CORES as usize];
+pub static GUEST_PC: [std::sync::atomic::AtomicU64; hardware_properties::MAX_NUM_CPU_CORES] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::MAX_NUM_CPU_CORES];
 
 /// Per-core last known guest LR (link register). When a guest thread calls
 /// an nnSdk SVC stub like `svc 0x18; bx lr`, LR points back into the caller
@@ -317,21 +381,21 @@ pub static GUEST_PC: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU
 /// Essential for identifying the actual hot spot in a spin loop where the
 /// game only ever calls one kind of SVC (the SVC address drowns out the
 /// real work PC).
-pub static GUEST_LR: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::NUM_CPU_CORES as usize];
+pub static GUEST_LR: [std::sync::atomic::AtomicU64; hardware_properties::MAX_NUM_CPU_CORES] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::MAX_NUM_CPU_CORES];
 
 /// Per-core last known guest SP. Lets the SIGUSR1 dumper walk a few stack
 /// frames above the current SVC/halt — the nnSdk SVC stub caller sits right
 /// above and its caller (the game-level function driving the loop) is
 /// typically within 1-2 frames up.
-pub static GUEST_SP: [std::sync::atomic::AtomicU64; hardware_properties::NUM_CPU_CORES as usize] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::NUM_CPU_CORES as usize];
+pub static GUEST_SP: [std::sync::atomic::AtomicU64; hardware_properties::MAX_NUM_CPU_CORES] = [const { std::sync::atomic::AtomicU64::new(0) }; hardware_properties::MAX_NUM_CPU_CORES];
 
 /// Per-core snapshot of guest general-purpose registers. AArch32 uses the
 /// low words; AArch64 uses x0..x28. Updated alongside GUEST_{PC,LR,SP}.
 pub static GUEST_REGS: [[std::sync::atomic::AtomicU64; 29];
-    hardware_properties::NUM_CPU_CORES as usize] = {
+    hardware_properties::MAX_NUM_CPU_CORES] = {
     const NEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     const ROW: [std::sync::atomic::AtomicU64; 29] = [NEW; 29];
-    [ROW; hardware_properties::NUM_CPU_CORES as usize]
+    [ROW; hardware_properties::MAX_NUM_CPU_CORES]
 };
 
 /// RUZU_PC_SAMPLE=1 — background guest-PC/LR sampling profiler. Every
@@ -620,7 +684,7 @@ fn dump_thread_state(kernel: &KernelCore, include_profiles: bool) {
     let mut pcs_to_dump: Vec<u64> = Vec::new();
     let mut stacks_to_dump: Vec<(usize, u64)> = Vec::new();
     let mut svc21_messages_to_dump: Vec<(usize, u32, u32, u32, u32)> = Vec::new();
-    for core_id in 0..hardware_properties::NUM_CPU_CORES as usize {
+    for core_id in 0..kernel.hardware_profile().num_cpu_cores() as usize {
         if let Some(core) = kernel.physical_core(core_id) {
             let interrupted = core.is_interrupted();
             let packed = SVC_IN_PROGRESS[core_id].load(Ordering::Acquire);
@@ -846,7 +910,7 @@ fn dump_thread_state(kernel: &KernelCore, include_profiles: bool) {
         "[DUMP] scheduler pq_fronts=(scheduled,suggested) {:?}",
         pq_fronts
     );
-    for core_id in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
+    for core_id in 0..kernel.hardware_profile().num_cpu_cores() as usize {
         let Some(scheduler) = kernel.scheduler(core_id) else {
             eprintln!("[DUMP] scheduler core={} missing", core_id);
             continue;
@@ -919,7 +983,7 @@ fn dump_thread_state(kernel: &KernelCore, include_profiles: bool) {
             // profiler samples inside JIT code can be attributed to guest
             // locations offline.
             if let Ok(prefix) = std::env::var("RUZU_DUMP_JIT_MAP") {
-                for core in 0..hardware_properties::NUM_CPU_CORES as usize {
+                for core in 0..kernel.hardware_profile().num_cpu_cores() as usize {
                     if let Some(arm) = guard.get_arm_interface_mut(core) {
                         let path = format!("{prefix}.core{core}.map");
                         arm.dump_jit_block_map(&path);
@@ -1566,7 +1630,7 @@ fn real_update_highest_priority_threads() -> u64 {
     };
 
     // Collect scheduler arcs before locking GSC (lock order: GSC before schedulers).
-    let sched_arcs: Vec<_> = (0..hardware_properties::NUM_CPU_CORES as usize)
+    let sched_arcs: Vec<_> = (0..kernel.hardware_profile().num_cpu_cores() as usize)
         .filter_map(|i| kernel.scheduler(i).cloned())
         .collect();
 
@@ -1675,6 +1739,7 @@ std::thread_local! {
 
 #[inline(never)]
 fn get_or_create_host_dummy_thread(kernel: &KernelCore) -> Arc<KThreadLock> {
+    kernel.ensure_host_thread_session();
     HOST_DUMMY_THREAD.with(|cell| {
         if let Some(thread) = cell.borrow().as_ref() {
             let belongs_to_kernel = match (
@@ -1692,7 +1757,7 @@ fn get_or_create_host_dummy_thread(kernel: &KernelCore) -> Arc<KThreadLock> {
             }
         }
 
-        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::with_hardware_profile(kernel.hardware_profile())));
         {
             let thread_id = kernel.create_new_thread_id();
             let object_id = kernel.create_new_object_id() as u64;
@@ -1872,6 +1937,9 @@ const RESERVED_DYNAMIC_PAGE_COUNT: usize = 64;
 ///
 /// Maps to upstream KernelCore and its inner Impl struct.
 pub struct KernelCore {
+    hardware_profile: hardware_properties::HardwareProfile,
+    host_thread_session: Arc<()>,
+    memory_layout_mode: common::settings::MemoryLayout,
     // -- Initialization state --
     is_multicore: bool,
     is_shutting_down: AtomicBool,
@@ -2035,7 +2103,43 @@ const PROCESS_ID_MIN: u64 = 81;
 impl KernelCore {
     /// Construct a new kernel instance.
     pub fn new() -> Self {
+        Self::with_hardware_profile(hardware_properties::SWITCH1_PROFILE)
+    }
+
+    pub fn hardware_profile(&self) -> hardware_properties::HardwareProfile { self.hardware_profile }
+
+    pub fn memory_layout_mode(&self) -> common::settings::MemoryLayout { self.memory_layout_mode }
+
+    // Unlike Eden's fixed kernel lifetime, frontends can replace this session.
+    // Weak ownership prevents allocator address reuse from reviving stale TLS.
+    #[inline(never)]
+    fn ensure_host_thread_session(&self) {
+        let changed = HOST_THREAD_SESSION.with(|session| {
+            if session.borrow().as_ptr() == Arc::as_ptr(&self.host_thread_session) {
+                return false;
+            }
+            *session.borrow_mut() = Arc::downgrade(&self.host_thread_session);
+            true
+        });
+        if changed {
+            HOST_THREAD_ID.with(|id| id.set(u32::MAX));
+            IS_PHANTOM_MODE_FOR_SINGLECORE.with(|mode| mode.set(false));
+            if CURRENT_THREAD_IS_CACHED_HOST.with(|cached| cached.replace(false)) {
+                CURRENT_THREAD.with(|thread| *thread.borrow_mut() = None);
+                CURRENT_THREAD_ID.with(|id| id.set(0));
+                CURRENT_THREAD_PTR.with(|ptr| ptr.set(std::ptr::null_mut()));
+            }
+            HOST_DUMMY_THREAD.with(|thread| *thread.borrow_mut() = None);
+        }
+    }
+
+
+    pub fn with_hardware_profile(hardware_profile: hardware_properties::HardwareProfile) -> Self {
         Self {
+            hardware_profile,
+            host_thread_session: Arc::new(()),
+            memory_layout_mode: super::board::k_system_control::memory_layout_for_hardware_profile(
+                hardware_profile, *common::settings::values().memory_layout_mode.get_value()),
             is_multicore: true,
             is_shutting_down: AtomicBool::new(false),
             exception_exited: false,
@@ -2058,7 +2162,7 @@ impl KernelCore {
             idle_threads: Vec::new(),
             application_thread: None,
 
-            slab_resource_counts: KSlabResourceCounts::create_default(),
+            slab_resource_counts: KSlabResourceCounts::for_hardware_profile(hardware_profile),
 
             process_list: Mutex::new(Vec::new()),
             process_list_lock: Mutex::new(()),
@@ -2077,7 +2181,7 @@ impl KernelCore {
             app_system_resource: None,
             system_system_resource: None,
             memory_layout: None,
-            next_host_thread_id: AtomicU32::new(hardware_properties::NUM_CPU_CORES),
+            next_host_thread_id: AtomicU32::new(hardware_profile.num_cpu_cores()),
             single_core_thread_id: AtomicU32::new(0),
             core_timing: None,
             system_ref: crate::core::SystemRef::null(),
@@ -2102,7 +2206,7 @@ impl KernelCore {
         self.hardware_timer = Some(Arc::new(KHardwareTimer::new()));
 
         self.global_object_list_container = Some(KAutoObjectWithListContainer::new());
-        self.global_scheduler_context = Some(Arc::new(Mutex::new(GlobalSchedulerContext::new())));
+        self.global_scheduler_context = Some(Arc::new(Mutex::new(GlobalSchedulerContext::with_hardware_profile(self.hardware_profile))));
 
         // Cache the GSC's `m_scheduler_lock` raw pointer so any site can
         // acquire `KScopedSchedulerLock` via `kernel::scheduler_lock()`.
@@ -2118,7 +2222,7 @@ impl KernelCore {
 
         // Initialize slab resource counts.
         super::init::init_slab_setup::initialize_slab_resource_counts(
-            &mut self.slab_resource_counts,
+            self.hardware_profile, &mut self.slab_resource_counts,
         );
 
         // Initialize shutdown threads (before physical cores, matching upstream order).
@@ -2176,7 +2280,7 @@ impl KernelCore {
                     let deadline =
                         std::time::Instant::now() + std::time::Duration::from_millis(100);
                     while std::time::Instant::now() < deadline
-                        && (0..hardware_properties::NUM_CPU_CORES as usize).any(|core_id| {
+                        && (0..kernel.hardware_profile().num_cpu_cores() as usize).any(|core_id| {
                             kernel
                                 .physical_core(core_id)
                                 .is_some_and(|core| core.is_interrupted())
@@ -2216,7 +2320,7 @@ impl KernelCore {
 
         // Make and initialize the service process before registration.
         // Upstream uses a default CreateProcessParameter and is_real=false.
-        let process = Arc::new(ProcessLock::from_value(super::k_process::KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(super::k_process::KProcess::with_hardware_profile(self.hardware_profile)));
         {
             let mut process_guard = process.lock().unwrap();
             let rc = process_guard.initialize(
@@ -2247,7 +2351,7 @@ impl KernelCore {
         assert!(thread_reservation.succeeded());
 
         // Create the service thread.
-        let thread = Arc::new(KThreadLock::new(super::k_thread::KThread::new()));
+        let thread = Arc::new(KThreadLock::new(super::k_thread::KThread::with_hardware_profile(self.hardware_profile)));
         let thread_id = self.create_new_thread_id();
         let object_id = self.create_new_object_id() as u64;
         if std::env::var_os("RUZU_TRACE_THREAD_ID").is_some() {
@@ -2300,7 +2404,7 @@ impl KernelCore {
         // Upstream: SetSchedulerUpdateNeeded + KScopedSchedulerLock release triggers reschedule.
         // Request reschedule on ALL cores (upstream does this via SetSchedulerUpdateNeeded
         // which marks a global flag checked by all cores).
-        for core_id in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
+        for core_id in 0..self.hardware_profile.num_cpu_cores() as usize {
             if let Some(scheduler) = self.scheduler(core_id) {
                 scheduler.lock().unwrap().request_schedule();
             }
@@ -2343,7 +2447,7 @@ impl KernelCore {
             KScopedResourceReservation::new(resource_limit, LimitableResource::ThreadCountMax, 1);
         assert!(thread_reservation.succeeded());
 
-        let thread = Arc::new(KThreadLock::new(KThread::new()));
+        let thread = Arc::new(KThreadLock::new(KThread::with_hardware_profile(self.hardware_profile)));
         {
             let thread_id = self.create_new_thread_id();
             let object_id = self.create_new_object_id() as u64;
@@ -2417,7 +2521,7 @@ impl KernelCore {
         name: &str,
         func: Box<dyn FnOnce() + Send>,
     ) -> std::thread::JoinHandle<()> {
-        let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+        let process = Arc::new(ProcessLock::from_value(KProcess::with_hardware_profile(self.hardware_profile)));
         {
             let mut process_guard = process.lock().unwrap();
             let rc = process_guard.initialize(
@@ -2436,7 +2540,7 @@ impl KernelCore {
             // reach the global scheduler. Preserve that dependency explicitly
             // in Rust so host dummy threads can use KSynchronizationObject::Wait
             // instead of MultiWait's polling fallback.
-            let dummy_core = (hardware_properties::NUM_CPU_CORES - 1) as usize;
+            let dummy_core = (self.hardware_profile.num_cpu_cores() - 1) as usize;
             if let Some(scheduler) = self.scheduler(dummy_core) {
                 process_guard.attach_scheduler(scheduler);
             }
@@ -2585,6 +2689,9 @@ impl KernelCore {
         // dummy whose global scheduler has just been destroyed.
         set_current_emu_thread(None);
         HOST_DUMMY_THREAD.with(|thread| *thread.borrow_mut() = None);
+        self.host_thread_session = Arc::new(());
+        HOST_THREAD_ID.with(|id| id.set(u32::MAX));
+        IS_PHANTOM_MODE_FOR_SINGLECORE.with(|mode| mode.set(false));
         KERNEL_PTR.store(std::ptr::null_mut(), Ordering::Release);
         SCHEDULER_LOCK_PTR.store(std::ptr::null_mut(), Ordering::Release);
         PENDING_ACTIVE_CORE_UPDATES.lock().unwrap().clear();
@@ -3202,7 +3309,7 @@ impl KernelCore {
     /// Returns None if called from a non-core thread.
     pub fn current_scheduler(&self) -> Option<&Arc<Mutex<KScheduler>>> {
         let core_id = self.get_current_host_thread_id();
-        if core_id >= hardware_properties::NUM_CPU_CORES {
+        if core_id >= self.hardware_profile.num_cpu_cores() {
             return None;
         }
         self.schedulers.get(core_id as usize)
@@ -3216,15 +3323,15 @@ impl KernelCore {
     /// TODO: remove this once host service waits no longer need the
     /// guest-core/host-thread split workaround in `ServerManager`.
     pub fn is_current_thread_guest_core(&self) -> bool {
-        self.get_current_host_thread_id() < hardware_properties::NUM_CPU_CORES
+        self.get_current_host_thread_id() < self.hardware_profile.num_cpu_cores()
     }
 
     /// Get the physical core index for the calling host thread.
     /// Upstream: `KernelCore::CurrentPhysicalCoreIndex()` (kernel.cpp:940-946).
     pub fn current_physical_core_index(&self) -> usize {
         let core_id = self.get_current_host_thread_id();
-        if core_id >= hardware_properties::NUM_CPU_CORES {
-            return (hardware_properties::NUM_CPU_CORES - 1) as usize;
+        if core_id >= self.hardware_profile.num_cpu_cores() {
+            return (self.hardware_profile.num_cpu_cores() - 1) as usize;
         }
         core_id as usize
     }
@@ -3246,7 +3353,8 @@ impl KernelCore {
     /// Upstream: `KernelCore::RegisterCoreThread(core_id)` (kernel.cpp:1032).
     /// Must be called from the host thread that will run this core.
     pub fn register_core_thread(&self, core_id: usize) {
-        assert!(core_id < hardware_properties::NUM_CPU_CORES as usize);
+        self.ensure_host_thread_session();
+        assert!(core_id < self.hardware_profile.num_cpu_cores() as usize);
         let this_id = set_host_thread_id(core_id);
         if !self.is_multicore {
             self.single_core_thread_id.store(this_id, Ordering::Relaxed);
@@ -3256,6 +3364,7 @@ impl KernelCore {
     /// Register a host thread (non-core) by allocating the next host thread ID.
     /// Upstream: `KernelCore::RegisterHostThread(existing_thread)` (kernel.cpp:1036).
     pub fn register_host_thread_with_existing(&self, existing_thread: Option<&Arc<KThreadLock>>) {
+        self.ensure_host_thread_session();
         HOST_THREAD_ID.with(|id| {
             if id.get() == u32::MAX {
                 let new_id = self.next_host_thread_id.fetch_add(1, Ordering::Relaxed);
@@ -3282,6 +3391,7 @@ impl KernelCore {
     /// In single-core mode, if the calling thread is the single core thread,
     /// returns the current core index from CpuManager instead of the raw ID.
     pub fn get_current_host_thread_id(&self) -> u32 {
+        self.ensure_host_thread_session();
         let this_id = get_host_thread_id();
         if !self.is_multicore && this_id == self.single_core_thread_id.load(Ordering::Relaxed) {
             // Upstream: `system.GetCpuManager().CurrentCore()`.
@@ -3370,11 +3480,13 @@ impl KernelCore {
 
     /// Workaround for single-core mode phantom mode.
     pub fn is_phantom_mode_for_single_core(&self) -> bool {
+        self.ensure_host_thread_session();
         is_phantom_mode_for_single_core()
     }
 
     /// Set the phantom mode for single core.
     pub fn set_is_phantom_mode_for_single_core(&self, value: bool) {
+        self.ensure_host_thread_session();
         assert!(!self.is_multicore);
         set_is_phantom_mode_for_single_core(value);
     }
@@ -3626,7 +3738,7 @@ impl KernelCore {
             code_start, code_size, K_MEMORY_REGION_TYPE_KERNEL_CODE.get_value(), 0, 0));
         board::setup_device_physical_memory_regions(&mut layout);
 
-        let mut misc_needed = hardware_properties::NUM_CPU_CORES as u64 * 3 * (page + page);
+        let mut misc_needed = self.hardware_profile.num_cpu_cores() as u64 * 3 * (page + page);
         for region in layout.get_physical_memory_region_tree().iter() {
             if region.has_type_attribute(K_MEMORY_REGION_ATTR_SHOULD_KERNEL_MAP) {
                 assert_ne!(region.get_end_address(), 0);
@@ -3682,7 +3794,7 @@ impl KernelCore {
             layout.get_physical_memory_region_tree_mut().find_modifiable(address).unwrap()
                 .set_pair_address(map_virt + address - map_phys);
         }
-        board::setup_dram_physical_memory_regions(&mut layout);
+        board::setup_dram_physical_memory_regions(&mut layout, self.memory_layout_mode);
         assert!(layout.get_physical_memory_region_tree_mut().insert(
             code_phys, code_size, K_MEMORY_REGION_TYPE_DRAM_KERNEL_CODE.get_value(), 0, 0));
         assert!(layout.get_physical_memory_region_tree_mut().insert(
@@ -3736,7 +3848,7 @@ impl KernelCore {
                 region.set_type(K_MEMORY_REGION_TYPE_DRAM_POOL_PARTITION.get_value());
             }
         }
-        board::setup_pool_partition_memory_regions(&mut layout);
+        board::setup_pool_partition_memory_regions(&mut layout, self.memory_layout_mode);
         layout.initialize_linear_memory_region_trees(aligned_phys, linear_start);
         self.memory_layout = Some(Arc::new(Mutex::new(layout)));
     }
@@ -3921,8 +4033,8 @@ impl KernelCore {
 
         let kernel_ptr = self as *const KernelCore as usize;
 
-        for core_id in 0..hardware_properties::NUM_CPU_CORES {
-            let thread = Arc::new(KThreadLock::new(KThread::new()));
+        for core_id in 0..self.hardware_profile.num_cpu_cores() {
+            let thread = Arc::new(KThreadLock::new(KThread::with_hardware_profile(self.hardware_profile)));
             {
                 let thread_id = self.create_new_thread_id();
                 let object_id = self.create_new_object_id() as u64;
@@ -3967,7 +4079,7 @@ impl KernelCore {
         // kernel shutdown which happens before KernelCore is dropped.
         let kernel_ptr = self as *const KernelCore as usize;
 
-        for i in 0..hardware_properties::NUM_CPU_CORES as usize {
+        for i in 0..self.hardware_profile.num_cpu_cores() as usize {
             let core_id = i as i32;
 
             // Create scheduler and physical core.
@@ -3988,7 +4100,7 @@ impl KernelCore {
             //
             // Upstream passes system.GetCpuManager().GetGuestActivateFunc() as the
             // fiber entry point. GuestActivate calls scheduler->Activate().
-            let main_thread = Arc::new(KThreadLock::new(KThread::new()));
+            let main_thread = Arc::new(KThreadLock::new(KThread::with_hardware_profile(self.hardware_profile)));
             {
                 let thread_id = self.create_new_thread_id();
                 let object_id = self.create_new_object_id() as u64;
@@ -4024,7 +4136,7 @@ impl KernelCore {
             // Upstream passes system.GetCpuManager().GetIdleThreadStartFunc() as the
             // fiber entry point. IdleThreadFunction dispatches to MultiCoreRunIdleThread
             // or SingleCoreRunIdleThread.
-            let idle_thread = Arc::new(KThreadLock::new(KThread::new()));
+            let idle_thread = Arc::new(KThreadLock::new(KThread::with_hardware_profile(self.hardware_profile)));
             {
                 let thread_id = self.create_new_thread_id();
                 let object_id = self.create_new_object_id() as u64;
@@ -4094,7 +4206,7 @@ mod tests {
             let backing = DeviceMemory::new();
             let mut kernel = KernelCore::new();
             super::super::init::init_slab_setup::initialize_slab_resource_counts(
-                &mut kernel.slab_resource_counts);
+                kernel.hardware_profile, &mut kernel.slab_resource_counts);
             kernel.derive_initial_memory_layout();
             let (total, reserved, pt_address, pt_size) = {
                 let layout = kernel.memory_layout.as_ref().unwrap().lock().unwrap();
@@ -4127,7 +4239,7 @@ mod tests {
         }
         let mut kernel = KernelCore::new();
         super::super::init::init_slab_setup::initialize_slab_resource_counts(
-            &mut kernel.slab_resource_counts);
+            kernel.hardware_profile, &mut kernel.slab_resource_counts);
         for mode in [common::settings::MemoryLayout::Memory4Gb,
             common::settings::MemoryLayout::Memory6Gb,
             common::settings::MemoryLayout::Memory8Gb,
@@ -4138,6 +4250,7 @@ mod tests {
                 settings.memory_layout_mode.set_global(true);
                 settings.memory_layout_mode.set_value(mode);
             }
+            kernel.memory_layout_mode = mode;
             kernel.derive_initial_memory_layout();
             let layout = kernel.memory_layout.as_ref().unwrap().lock().unwrap();
             let mut application = 0;
@@ -4156,8 +4269,8 @@ mod tests {
                     applet += region.get_size();
                 }
             }
-            assert_eq!(application, super::super::board::k_system_control::init::get_application_pool_size());
-            assert_eq!(applet, super::super::board::k_system_control::init::get_applet_pool_size());
+            assert_eq!(application, super::super::board::k_system_control::init::get_application_pool_size(mode));
+            assert_eq!(applet, super::super::board::k_system_control::init::get_applet_pool_size(mode));
             let mut manager = super::super::k_memory_manager::KMemoryManager::new();
             manager.initialize_from_layout(&layout);
             for (pool, expected) in [
@@ -4177,7 +4290,7 @@ mod tests {
                 assert_eq!(manager.get_free_size(pool), expected);
             }
             assert_eq!(layout.get_main_memory_physical_extents().get_size(),
-                super::super::board::k_system_control::init::get_intended_memory_size());
+                super::super::board::k_system_control::init::get_intended_memory_size(mode));
         }
     }
 

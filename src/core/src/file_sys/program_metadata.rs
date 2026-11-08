@@ -231,6 +231,8 @@ impl ProgramMetadata {
     }
 
     pub fn load(&mut self, file: VirtualFile) -> ResultStatus {
+        self.is_switch2 = false; // Reload must not retain the previous ACID layout.
+
         let total_size = file.get_size();
         let header_size = std::mem::size_of::<Header>();
 
@@ -596,10 +598,10 @@ mod nx2_tests {
     }
 
     #[test]
-    fn switch2_flag_retains_upstream_reload_lifetime() {
+    fn hardware_profile_follows_reloaded_acid_layout() {
         let mut metadata = ProgramMetadata::new();
         assert_eq!(load(&mut metadata, fixture(true)), ResultStatus::Success);
         assert_eq!(load(&mut metadata, fixture(false)), ResultStatus::Success);
-        assert!(metadata.is_switch2());
+        assert!(!metadata.is_switch2());
     }
 }

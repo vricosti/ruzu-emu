@@ -25,12 +25,12 @@
 
 use std::collections::HashMap;
 
-use crate::hardware_properties::NUM_CPU_CORES;
+use crate::hardware_properties::MAX_NUM_CPU_CORES;
 
 /// Number of priority levels (0..=63).
 pub const NUM_PRIORITY: usize = 64;
 /// Number of CPU cores.
-pub const NUM_CORES: usize = NUM_CPU_CORES as usize;
+pub const NUM_CORES: usize = MAX_NUM_CPU_CORES as usize;
 
 /// Lowest thread priority.
 pub const LOWEST_PRIORITY: i32 = 63;

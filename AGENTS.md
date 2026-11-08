@@ -452,3 +452,8 @@ env XDG_CACHE_HOME=/tmp/ruzu-cache \
 ```
 
 </testing_commands>
+
+
+### Runtime hardware profile extension (2026-11-08)
+
+Switch 1/NX2 session selection is owned by System/KernelCore and propagated to process/thread/JIT owners; never use a global profile. NUM_CPU_CORES retains Eden's Switch 1 value (4); MAX_NUM_CPU_CORES (6) is host storage capacity only. Active behavior reads the session profile. Preemption priorities remain in global_scheduler_context.rs; affinity-mask derivation remains in k_affinity_mask.rs. Loader metadata preflight is a documented multi-console lifecycle extension: it uses the effective patched ExeFS before kernel construction, then preserves kernel-before-process initialization. NX2 priorities [59,59,59,63,59,59], virtual map and four watchpoints preserve current experimental assumptions, not verified hardware claims.

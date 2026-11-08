@@ -426,6 +426,8 @@ mod tests {
     fn test_system() -> System {
         let mut system = System::new_for_test();
         system.initialize();
+        let mode = *common::settings::values().memory_layout_mode.get_value();
+        system.initialize_device_memory(mode);
         {
             let kernel = system
                 .kernel_mut()

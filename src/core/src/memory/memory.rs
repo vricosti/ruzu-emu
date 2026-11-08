@@ -41,7 +41,7 @@ static RASTERIZER_MARK_CACHED_COUNTS: [AtomicU64; 9] = [
 ];
 
 fn new_rasterizer_read_areas(
-) -> [Mutex<RasterizerDownloadArea>; hardware_properties::NUM_CPU_CORES as usize] {
+) -> [Mutex<RasterizerDownloadArea>; hardware_properties::MAX_NUM_CPU_CORES] {
     std::array::from_fn(|_| Mutex::new(RasterizerDownloadArea::default()))
 }
 
@@ -140,13 +140,13 @@ pub struct Memory {
     current_page_table: *mut PageTable,
     /// Upstream owner: `rasterizer_read_areas[Core::Hardware::NUM_CPU_CORES]`.
     rasterizer_read_areas:
-        [Mutex<RasterizerDownloadArea>; hardware_properties::NUM_CPU_CORES as usize],
+        [Mutex<RasterizerDownloadArea>; hardware_properties::MAX_NUM_CPU_CORES],
     /// Upstream owner: `rasterizer_write_areas[Core::Hardware::NUM_CPU_CORES]`.
-    rasterizer_write_areas: [Mutex<GpuDirtyState>; hardware_properties::NUM_CPU_CORES as usize],
+    rasterizer_write_areas: [Mutex<GpuDirtyState>; hardware_properties::MAX_NUM_CPU_CORES],
     /// Upstream owner: `std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers`.
     gpu_dirty_managers: Vec<Arc<GpuDirtyMemoryManager>>,
     /// Port of upstream `scratch_buffers[Core::Hardware::NUM_CPU_CORES]`.
-    smmu_scratch_buffers: [Mutex<ScratchBuffer<u32>>; hardware_properties::NUM_CPU_CORES as usize],
+    smmu_scratch_buffers: [Mutex<ScratchBuffer<u32>>; hardware_properties::MAX_NUM_CPU_CORES],
     /// Serializes non-core host threads sharing the last per-core GPU cache
     /// slot. Upstream owner: `std::mutex sys_core_guard`.
     sys_core_guard: Arc<Mutex<()>>,
@@ -1266,7 +1266,7 @@ impl Memory {
             return;
         };
         let core = self.current_host_thread_cache_index();
-        let sys_core = hardware_properties::NUM_CPU_CORES as usize - 1;
+        let sys_core = self.system.get().hardware_profile().num_cpu_cores() as usize - 1;
         let _sys_core_guard = (core == sys_core).then(|| self.sys_core_guard.lock().unwrap());
 
         let mut write = |device_addr: u64| {
@@ -1303,7 +1303,7 @@ impl Memory {
         self.system
             .get()
             .current_host_thread_id()
-            .min(hardware_properties::NUM_CPU_CORES as usize - 1)
+            .min(self.system.get().hardware_profile().num_cpu_cores() as usize - 1)
     }
 
     fn handle_rasterizer_download(&self, vaddr: u64, size: usize) {
@@ -1513,7 +1513,7 @@ impl Memory {
             remaining -= block_size;
         }
 
-        let sys_core = hardware_properties::NUM_CPU_CORES as usize - 1;
+        let sys_core = self.system.get().hardware_profile().num_cpu_cores() as usize - 1;
         RasterizerWriteBatch {
             system: self.system,
             dirty_manager: self.gpu_dirty_managers.get(core).cloned(),

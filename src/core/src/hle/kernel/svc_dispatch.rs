@@ -13,7 +13,6 @@
 //! - The main `call` entry point
 
 use crate::core::System;
-use crate::hardware_properties;
 use crate::hle::kernel::svc::svc_activity;
 use crate::hle::kernel::svc::svc_address_arbiter;
 use crate::hle::kernel::svc::svc_cache;
@@ -2168,7 +2167,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
                 );
             }
         }
-        if core_id < hardware_properties::NUM_CPU_CORES as usize {
+        if core_id < system.hardware_profile().num_cpu_cores() as usize {
             super::kernel::mark_svc_enter(core_id, tid, imm);
             core_id
         } else {
@@ -2178,7 +2177,7 @@ pub fn call(system: &System, imm: u32, is_64bit: bool, args: &mut SvcArgs) {
     struct SvcExitGuard(usize);
     impl Drop for SvcExitGuard {
         fn drop(&mut self) {
-            if self.0 < hardware_properties::NUM_CPU_CORES as usize {
+            if self.0 != usize::MAX {
                 super::kernel::mark_svc_exit(self.0);
             }
         }

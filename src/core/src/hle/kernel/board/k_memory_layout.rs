@@ -220,10 +220,10 @@ pub fn setup_device_physical_memory_regions(layout: &mut KMemoryLayout) {
 
 /// Set up DRAM physical memory regions.
 /// Port of upstream `Init::SetupDramPhysicalMemoryRegions`.
-pub fn setup_dram_physical_memory_regions(layout: &mut KMemoryLayout) {
-    let intended_memory_size = super::k_system_control::init::get_intended_memory_size();
+pub fn setup_dram_physical_memory_regions(layout: &mut KMemoryLayout, mode: common::settings::MemoryLayout) {
+    let intended_memory_size = super::k_system_control::init::get_intended_memory_size(mode);
     let physical_memory_base_address =
-        super::k_system_control::init::get_kernel_physical_base_address(DRAM_PHYSICAL_ADDRESS);
+        super::k_system_control::init::get_kernel_physical_base_address(DRAM_PHYSICAL_ADDRESS, mode);
 
     let phys_tree = layout.get_physical_memory_region_tree_mut();
 
@@ -270,7 +270,7 @@ pub fn setup_dram_physical_memory_regions(layout: &mut KMemoryLayout) {
 /// This is the most complex initialization function, splitting DRAM into
 /// application pool, applet pool, unsafe system pool, pool management,
 /// and secure system pool regions.
-pub fn setup_pool_partition_memory_regions(layout: &mut KMemoryLayout) {
+pub fn setup_pool_partition_memory_regions(layout: &mut KMemoryLayout, mode: common::settings::MemoryLayout) {
     // Start by identifying the extents of the DRAM memory region.
     let dram_extents = layout.get_main_memory_physical_extents();
     assert!(dram_extents.get_end_address() != 0);
@@ -303,8 +303,8 @@ pub fn setup_pool_partition_memory_regions(layout: &mut KMemoryLayout) {
     };
 
     // Get Application and Applet pool sizes.
-    let application_pool_size = super::k_system_control::init::get_application_pool_size();
-    let applet_pool_size = super::k_system_control::init::get_applet_pool_size();
+    let application_pool_size = super::k_system_control::init::get_application_pool_size(mode);
+    let applet_pool_size = super::k_system_control::init::get_applet_pool_size(mode);
     let unsafe_system_pool_min_size =
         super::k_system_control::init::get_minimum_non_secure_system_pool_size();
 

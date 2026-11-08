@@ -486,6 +486,14 @@ pub trait AppLoader: Send + Sync {
     /// Load the application and return the created Process instance.
     fn load(&mut self, process: &mut KProcess, system: &mut System) -> LoadResult;
 
+    /// Session-profile extension: prepare the effective metadata without creating
+    /// a process. Container loaders delegate to the same child used by Load.
+    /// Standalone NRO/NSO/KIP formats have no NPDM and retain Switch 1 semantics.
+    fn read_hardware_profile(&mut self, _system: &mut System)
+        -> Result<crate::hardware_properties::HardwareProfile, ResultStatus> {
+        Ok(crate::hardware_properties::SWITCH1_PROFILE)
+    }
+
     /// Try to verify the integrity of the file.
     fn verify_integrity(&self, _progress_callback: &dyn Fn(usize, usize) -> bool) -> ResultStatus {
         ResultStatus::ErrorIntegrityVerificationNotImplemented

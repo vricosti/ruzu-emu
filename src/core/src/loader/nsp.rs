@@ -153,6 +153,19 @@ impl AppLoaderNsp {
 }
 
 impl AppLoader for AppLoaderNsp {
+    fn read_hardware_profile(&mut self, system: &mut System)
+        -> Result<crate::hardware_properties::HardwareProfile, ResultStatus> {
+        let title_id = self.nsp.get_program_title_id();
+        if !self.nsp.is_extracted_type() && title_id == 0 { return Err(ResultStatus::ErrorNSPMissingProgramNCA); }
+        if self.nsp.get_status() != FsResultStatus::Success { return Err(map_fs_status(self.nsp.get_status())); }
+        if self.nsp.get_program_status() != FsResultStatus::Success { return Err(map_fs_status(self.nsp.get_program_status())); }
+        if !self.nsp.is_extracted_type() && self.nsp.get_nca(title_id, ContentRecordType::Program, TitleType::Application).is_none() {
+            if !KeyManager::key_file_exists(false) { return Err(ResultStatus::ErrorMissingProductionKeyFile); }
+            return Err(ResultStatus::ErrorNSPMissingProgramNCA);
+        }
+        self.secondary_loader.as_mut().ok_or(ResultStatus::ErrorNSPMissingProgramNCA)?.read_hardware_profile(system)
+    }
+
     fn get_file_type(&self) -> FileType {
         Self::identify_type(&self.file)
     }

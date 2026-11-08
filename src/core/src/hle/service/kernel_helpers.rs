@@ -72,7 +72,7 @@ impl ServiceContext {
             Some(process) => (Some(process), false),
             None => match kernel {
                 Some(kernel) => {
-                    let process = Arc::new(ProcessLock::from_value(KProcess::new()));
+                    let process = Arc::new(ProcessLock::from_value(KProcess::with_hardware_profile(kernel.hardware_profile())));
                     {
                         let mut process_guard = process.lock().unwrap();
                         process_guard.process_id = kernel.create_new_kernel_process_id();
@@ -251,6 +251,18 @@ impl Drop for ServiceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardware_profile_service_process_inherits_explicit_kernel() {
+        let _without_global_kernel = crate::hle::kernel::kernel::ScopedKernelForTest::without_kernel();
+        for profile in [crate::hardware_properties::SWITCH1_PROFILE, crate::hardware_properties::NX2_PROFILE] {
+            let system = Box::new(crate::core::System::new_for_test_with_hardware_profile(profile));
+            let context = ServiceContext::new_with_system(crate::core::SystemRef::from_ref(&system), "profile".into());
+            assert!(context.process_created);
+            assert_eq!(context.process.as_ref().unwrap().lock().unwrap().hardware_profile(), profile);
+        }
+    }
+
 
     #[test]
     fn explicit_system_keeps_kernel_event_owner_without_current_guest_thread() {

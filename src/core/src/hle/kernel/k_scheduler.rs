@@ -696,7 +696,7 @@ mod tests {
         gsc.m_priority_queue
             .push_back(2, 20, 0, 0b0001, false, None);
 
-        let scheduler_arcs: Vec<_> = (0..crate::hardware_properties::NUM_CPU_CORES)
+        let scheduler_arcs: Vec<_> = (0..gsc.hardware_profile.num_cpu_cores())
             .map(|core_id| Mutex::new(KScheduler::new(core_id as i32)))
             .collect();
         let mut schedulers: Vec<_> = scheduler_arcs.iter().map(|s| s.lock().unwrap()).collect();
@@ -723,7 +723,7 @@ mod tests {
     #[should_panic(expected = "assertion failed: gsc.is_locked()")]
     fn update_highest_priority_threads_impl_requires_scheduler_lock() {
         let mut gsc = GlobalSchedulerContext::new();
-        let scheduler_arcs: Vec<_> = (0..crate::hardware_properties::NUM_CPU_CORES)
+        let scheduler_arcs: Vec<_> = (0..gsc.hardware_profile.num_cpu_cores())
             .map(|core_id| Mutex::new(KScheduler::new(core_id as i32)))
             .collect();
         let mut schedulers: Vec<_> = scheduler_arcs.iter().map(|s| s.lock().unwrap()).collect();
@@ -1021,7 +1021,7 @@ mod tests {
         gsc.m_priority_queue
             .push_back(4, 20, 0, 0b0101, false, None);
 
-        let scheduler_arcs: Vec<_> = (0..crate::hardware_properties::NUM_CPU_CORES)
+        let scheduler_arcs: Vec<_> = (0..gsc.hardware_profile.num_cpu_cores())
             .map(|core_id| Mutex::new(KScheduler::new(core_id as i32)))
             .collect();
         let mut schedulers: Vec<_> = scheduler_arcs.iter().map(|s| s.lock().unwrap()).collect();
@@ -1053,7 +1053,7 @@ mod tests {
         crate::hle::kernel::kernel::set_current_emu_thread(Some(&current_thread));
 
         let mut gsc = GlobalSchedulerContext::new();
-        let scheduler_arcs: Vec<_> = (0..crate::hardware_properties::NUM_CPU_CORES)
+        let scheduler_arcs: Vec<_> = (0..gsc.hardware_profile.num_cpu_cores())
             .map(|core_id| Mutex::new(KScheduler::new(core_id as i32)))
             .collect();
         let mut schedulers: Vec<_> = scheduler_arcs.iter().map(|s| s.lock().unwrap()).collect();
@@ -1856,7 +1856,7 @@ impl KScheduler {
     /// Send IPI to cores that need rescheduling.
     /// Matches upstream `KScheduler::RescheduleCores(kernel, core_mask)`.
     fn reschedule_cores_impl(&self, core_mask: u64) {
-        for i in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
+        for i in 0..self.physical_cores.len() {
             if core_mask & (1u64 << i) != 0 {
                 if let Some(core) = self.physical_cores.get(i) {
                     core.interrupt();
@@ -1874,7 +1874,7 @@ impl KScheduler {
         log::trace!("KScheduler::reschedule_cores mask=0x{:x}", core_mask);
 
         if let Some(kernel) = super::kernel::get_kernel_ref() {
-            for i in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
+            for i in 0..kernel.hardware_profile().num_cpu_cores() as usize {
                 if core_mask & (1u64 << i) != 0 {
                     if let Some(core) = kernel.physical_core(i) {
                         core.interrupt();
@@ -2098,8 +2098,6 @@ impl KScheduler {
         schedulers: &mut [std::sync::MutexGuard<'_, KScheduler>],
         gsc: &mut super::global_scheduler_context::GlobalSchedulerContext,
     ) -> (u64, Vec<(u64, i32)>) {
-        use crate::hardware_properties::NUM_CPU_CORES;
-
         assert!(gsc.is_locked());
 
         // Clear scheduler update needed.
@@ -2108,12 +2106,12 @@ impl KScheduler {
 
         let mut cores_needing_scheduling = 0u64;
         let mut idle_cores = 0u64;
-        let mut top_threads: [Option<u64>; crate::hardware_properties::NUM_CPU_CORES as usize] =
-            [None; crate::hardware_properties::NUM_CPU_CORES as usize];
+        let mut top_threads: [Option<u64>; crate::hardware_properties::MAX_NUM_CPU_CORES] =
+            [None; crate::hardware_properties::MAX_NUM_CPU_CORES];
         let migrations: Vec<(u64, i32)> = Vec::new();
 
         // Select top thread per core from PQ.
-        for core_id in 0..NUM_CPU_CORES as usize {
+        for core_id in 0..gsc.hardware_profile.num_cpu_cores() as usize {
             let raw_top_thread_id = gsc.get_scheduled_front(core_id as i32);
             let top_thread_id = scheduled_front_with_pinned_thread(gsc, core_id as i32);
 
@@ -2144,7 +2142,7 @@ impl KScheduler {
             if let Some(mut suggested_id) = gsc.m_priority_queue.get_suggested_front(core_id as i32)
             {
                 let mut migration_candidates =
-                    [0i32; crate::hardware_properties::NUM_CPU_CORES as usize];
+                    [0i32; crate::hardware_properties::MAX_NUM_CPU_CORES];
                 let mut num_candidates = 0usize;
 
                 loop {

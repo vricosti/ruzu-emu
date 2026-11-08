@@ -1109,6 +1109,8 @@ pub trait OpusDecoderInterface: Send {
 /// In C++, this uses a Pimpl pattern (System::Impl). In Rust, we flatten
 /// everything into this struct directly.
 pub struct System {
+    hardware_profile: hardware_properties::HardwareProfile,
+    hardware_profile_override: Option<hardware_properties::HardwareProfile>,
     // ── Core subsystems ──
     /// The core timing system (event scheduling).
     pub core_timing: Arc<CoreTiming>,
@@ -1280,7 +1282,7 @@ pub struct System {
 
     // ── Per-core profiling data ──
     /// Dynarmic tick counters per CPU core (for profiling).
-    _dynarmic_ticks: [u64; hardware_properties::NUM_CPU_CORES as usize],
+    _dynarmic_ticks: [u64; hardware_properties::MAX_NUM_CPU_CORES],
 
     // ── Runtime SVC state ──
     // These fields are set during the bootstrap phase (after load, before JIT
@@ -1368,6 +1370,8 @@ impl System {
             exit_locked: Arc::new(AtomicBool::new(false)),
             exit_requested: AtomicBool::new(false),
             nvdec_active: AtomicBool::new(false),
+            hardware_profile: hardware_properties::SWITCH1_PROFILE,
+            hardware_profile_override: None,
             is_multicore: false,
             is_async_gpu: false,
             extended_memory_layout: false,
@@ -1386,7 +1390,7 @@ impl System {
             virtual_filesystem: None,
             current_process: None,
             load_parameters: None,
-            _dynarmic_ticks: [0u64; hardware_properties::NUM_CPU_CORES as usize],
+            _dynarmic_ticks: [0u64; hardware_properties::MAX_NUM_CPU_CORES],
             current_process_arc: None,
             scheduler_arc: None,
             shared_process_memory: None,
@@ -1427,20 +1431,6 @@ impl System {
     /// creation happen later in load() via initialize_kernel() and
     /// setup_for_application_process(), matching upstream's phased approach.
     pub fn initialize(&mut self) {
-        // Allocate device memory
-        self.device_memory = Some(Box::new(DeviceMemory::new()));
-
-        // Create the Memory bridge (maps virtual→physical→host via PageTable).
-        // Upstream: m_memory = make_unique<Core::Memory::Memory>(system)
-        let dm_ptr = self.device_memory.as_ref().unwrap().as_ref() as *const DeviceMemory;
-        let buffer_ptr = unsafe { &(*dm_ptr).buffer as *const common::host_memory::HostMemory };
-        let mut memory = unsafe { Memory::new(SystemRef::from_ref(self), dm_ptr, buffer_ptr) };
-        self.gpu_dirty_memory_managers = (0..hardware_properties::NUM_CPU_CORES as usize)
-            .map(|_| Arc::new(GpuDirtyMemoryManager::new()))
-            .collect();
-        memory.set_gpu_dirty_managers(self.gpu_dirty_memory_managers.clone());
-        self.memory = Some(Arc::new(crate::memory::memory::SharedMemory::new(memory)));
-
         // Read configuration from settings.
         // In C++: is_multicore = Settings::values.use_multi_core.GetValue()
         // RUZU_SINGLE_CORE=1 — env-var override to force single-core mode.
@@ -1458,16 +1448,6 @@ impl System {
             .get_value();
 
         self.core_timing.set_multicore(self.is_multicore);
-        // Upstream order: core_timing.Initialize() runs BEFORE kernel.Initialize().
-        // The worker thread spawned here calls register_host_thread() which
-        // allocates tid=1 as a Dummy — matching zuyu's startup ordering.
-        // (Earlier we tried moving this after kernel.initialize() to avoid the
-        //  race, but that placed dummies at tid 13-14 instead of zuyu's 1-2.
-        let system_ref_for_ct = SystemRef::from_ref(self);
-        self.core_timing.initialize(move || {
-            system_ref_for_ct.get().register_host_thread();
-        });
-
         // Ensure VFS exists. Upstream does this in Initialize().
         if self.virtual_filesystem.is_none() {
             self.virtual_filesystem = Some(RealVfsFilesystem::new());
@@ -1484,12 +1464,8 @@ impl System {
         self.cpu_manager.set_multicore(self.is_multicore);
         self.cpu_manager.set_async_gpu(self.is_async_gpu);
 
-        // Create kernel but do NOT initialize it yet.
-        // Upstream creates kernel in Impl::Impl() (constructor), and only calls
-        // kernel.Initialize() later in InitializeKernel() (called from Load()).
-        let mut kernel = KernelCore::new();
-        kernel.set_multicore(self.is_multicore);
-        self.kernel = Some(kernel);
+        // Session kernel and CoreTiming worker are constructed after metadata
+        // preflight in load_with_parameters, before InitializeKernel.
 
         log::info!(
             "System: initialized (multicore={}, async_gpu={})",
@@ -1498,23 +1474,48 @@ impl System {
         );
     }
 
+    /// Mechanical allocation prefix of Initialize, now selected per session.
+    pub(crate) fn initialize_device_memory(&mut self, mode: common::settings::MemoryLayout) {
+        // Allocate only after metadata selected the console profile and layout.
+        self.shared_process_memory = None;
+        self.memory = None;
+        self.device_memory = Some(Box::new(DeviceMemory::with_size(
+            crate::hle::kernel::board::k_system_control::init::get_intended_memory_size(mode))));
+        log::info!("Session memory layout: {:?}", mode);
+
+        // Create the Memory bridge (maps virtual→physical→host via PageTable).
+        // Upstream: m_memory = make_unique<Core::Memory::Memory>(system)
+        let dm_ptr = self.device_memory.as_ref().unwrap().as_ref() as *const DeviceMemory;
+        let buffer_ptr = unsafe { &(*dm_ptr).buffer as *const common::host_memory::HostMemory };
+        let mut memory = unsafe { Memory::new(SystemRef::from_ref(self), dm_ptr, buffer_ptr) };
+        self.gpu_dirty_memory_managers = (0..hardware_properties::MAX_NUM_CPU_CORES)
+            .map(|_| Arc::new(GpuDirtyMemoryManager::new()))
+            .collect();
+        memory.set_gpu_dirty_managers(self.gpu_dirty_memory_managers.clone());
+        self.memory = Some(Arc::new(crate::memory::memory::SharedMemory::new(memory)));
+
+    }
+
     /// Initialize the kernel and CPU manager.
     ///
     /// Corresponds to C++ InitializeKernel(system) (core.cpp:264-272).
     /// Called at the start of load(), before ROM loading.
     fn initialize_kernel(&mut self) {
+        let mode = self.kernel.as_ref().expect("session kernel").memory_layout_mode();
+        self.initialize_device_memory(mode);
+
         // Upstream: KernelCore holds System& from construction.
         // Set it here since Rust can't pass &self during construction.
         let system_ref = SystemRef::from_ref(self);
         let device_memory = self
             .device_memory
             .as_deref()
-            .expect("device memory must be created in initialize()");
+            .expect("device memory must be created for the selected session");
 
         let kernel = self
             .kernel
             .as_mut()
-            .expect("kernel must be created in initialize()");
+            .expect("kernel must be created after metadata preflight");
 
         // Upstream: ReinitializeIfNecessary() checks if multicore/memory layout
         // changed and re-runs Initialize() if so. We just call initialize() directly.
@@ -1681,9 +1682,6 @@ impl System {
         filepath: &str,
         mut params: FrontendAppletParameters,
     ) -> SystemResultStatus {
-        // Phase 1: Initialize kernel (upstream: InitializeKernel(system))
-        self.initialize_kernel();
-
         let vfs = self
             .virtual_filesystem
             .as_ref()
@@ -1718,6 +1716,37 @@ impl System {
             }
         };
 
+        let detected_profile = match loader.read_hardware_profile(&mut loader_system) {
+            Ok(profile) => profile,
+            Err(error) => {
+                log::error!("Hardware metadata preflight failed: {:?}", error);
+                self.status = SystemResultStatus::ErrorLoader;
+                return self.status;
+            }
+        };
+        // A failed previous Load can already own CPU workers and a live kernel.
+        // Join and finalize that session before replacing its kernel storage.
+        if self.kernel.is_some() {
+            self.shutdown_main_process();
+            self.kernel = None;
+        }
+        self.set_shutting_down(false);
+        self.hardware_profile = self.hardware_profile_override.unwrap_or(detected_profile);
+        log::info!("Hardware profile: {:?} ({} CPU cores)", self.hardware_profile,
+            self.hardware_profile.num_cpu_cores());
+        // Choose the profile before creating the kernel or its host identities.
+        let mut kernel = KernelCore::with_hardware_profile(self.hardware_profile);
+        kernel.set_multicore(self.is_multicore);
+        self.kernel = Some(kernel);
+        // Keep CoreTiming initialization before kernel initialization, as upstream.
+        let system_ref_for_ct = SystemRef::from_ref(self);
+        self.core_timing.initialize(move || {
+            system_ref_for_ct.get().register_host_thread();
+        });
+
+        self.cpu_manager.set_hardware_profile(self.hardware_profile);
+        self.initialize_kernel();
+
         // Create a KProcess and call the loader.
         let mut process = crate::loader::loader::KProcess::new();
 
@@ -1737,6 +1766,9 @@ impl System {
                 crate::loader::loader::get_result_status_string(result_status),
                 filepath,
             );
+            // Upstream Load closes the failed process before ShutdownMainProcess.
+            drop(process);
+            self.shutdown_main_process();
             self.status = SystemResultStatus::ErrorLoader;
             return SystemResultStatus::ErrorLoader;
         }
@@ -1812,6 +1844,7 @@ impl System {
         // Phase 3: Set up GPU, audio, services (upstream: SetupForApplicationProcess)
         if let Err(error) = self.setup_for_application_process() {
             log::error!("Failed to initialize video core: {error}");
+            self.shutdown_main_process();
             self.set_status(SystemResultStatus::ErrorVideoCore, Some(&error));
             return SystemResultStatus::ErrorVideoCore;
         }
@@ -2155,6 +2188,9 @@ impl System {
         self.audio_core = None;
         self.current_process_arc = None;
         self.current_process = None;
+        // Session-owned timer workers must release their old kernel/TLS identity
+        // before that kernel is destroyed or a different profile is selected.
+        self.core_timing.reset();
         if let Some(ref mut kernel) = self.kernel {
             kernel.shutdown();
         }
@@ -2311,6 +2347,8 @@ impl System {
     /// Called by the frontend after System::load() since video_core does not
     /// depend on core. Upstream: created in SetupForApplicationProcess() (core.cpp:278).
     pub fn set_gpu_core(&mut self, gpu: Box<dyn crate::gpu_core::GpuCoreInterface>) {
+        gpu.set_nx2_ampere(false); // Reset the previous session before any GPU ioctl.
+
         self.gpu_core = Some(gpu);
     }
 
@@ -2473,12 +2511,12 @@ impl System {
     pub fn device_memory(&self) -> &DeviceMemory {
         self.device_memory
             .as_ref()
-            .expect("DeviceMemory not initialized; call System::initialize() first")
+            .expect("DeviceMemory not initialized; load a session first")
     }
 
     /// Raw pointers to DeviceMemory and its HostMemory buffer, for creating
     /// per-process Memory instances.  Both pointers remain valid for the
-    /// lifetime of System (they live in `self.device_memory`).
+    /// active session. Release consumers before shutdown/reloading a session.
     pub fn device_memory_ptrs(
         &self,
     ) -> (*const DeviceMemory, *const common::host_memory::HostMemory) {
@@ -2492,7 +2530,7 @@ impl System {
     pub fn device_memory_mut(&mut self) -> &mut DeviceMemory {
         self.device_memory
             .as_mut()
-            .expect("DeviceMemory not initialized; call System::initialize() first")
+            .expect("DeviceMemory not initialized; load a session first")
     }
 
     /// Gets a reference to the performance stats, if available.
@@ -2815,6 +2853,16 @@ impl System {
     }
 
     /// Get a reference to the kernel core.
+    pub fn hardware_profile(&self) -> hardware_properties::HardwareProfile {
+        self.hardware_profile
+    }
+
+    /// Explicit override for formats without console metadata. Set before load.
+    pub fn set_hardware_profile_override(&mut self, profile: Option<hardware_properties::HardwareProfile>) {
+        assert!(self.current_process_arc.is_none(), "cannot change hardware during a session");
+        self.hardware_profile_override = profile;
+    }
+
     pub fn kernel(&self) -> Option<&KernelCore> {
         self.kernel.as_ref()
     }
@@ -3013,7 +3061,12 @@ impl System {
     /// manager) for SVC handlers to function. Callers must still set
     /// `current_process_arc`, `scheduler_arc`, etc.
     pub fn new_for_test() -> Self {
+        Self::new_for_test_with_hardware_profile(hardware_properties::SWITCH1_PROFILE)
+    }
+
+    pub fn new_for_test_with_hardware_profile(profile: hardware_properties::HardwareProfile) -> Self {
         let mut system = Self::new();
+        system.hardware_profile = profile;
         system.initialize_for_test();
         system
     }
@@ -3033,7 +3086,7 @@ impl System {
     fn initialize_for_test(&mut self) {
         // Kernel (provides object/thread ID allocation). Don't call
         // initialize() — that creates timers, physical cores, etc.
-        let mut kernel = KernelCore::new();
+        let mut kernel = KernelCore::with_hardware_profile(self.hardware_profile);
         kernel.set_system_ref(SystemRef::from_ref(self));
         // Pre-advance ID counters past values that test setups manually assign
         // to pre-existing threads (typically object_id 1..2, thread_id 1..2).
@@ -3369,13 +3422,54 @@ mod exit_state_tests {
             }
             let mut system = Box::new(System::new());
             system.initialize();
+            system.kernel = Some(KernelCore::with_hardware_profile(system.hardware_profile));
             system.initialize_kernel();
-            let expected = crate::hle::kernel::board::k_system_control::init::get_intended_memory_size();
+            let expected = crate::hle::kernel::board::k_system_control::init::get_intended_memory_size(mode);
             assert_eq!(system.device_memory.as_ref().unwrap().buffer.backing_size(), expected);
             let layout = system.kernel.as_ref().unwrap().get_memory_layout().unwrap();
             assert_eq!(layout.lock().unwrap().get_total_and_kernel_memory_sizes().0, expected);
             system.shutdown_main_process();
         }
+    }
+
+    #[test]
+    fn hardware_profile_failed_load_retry_shuts_down_previous_kernel() {
+        const CHILD: &str = "RUZU_TEST_PROFILE_LOAD_RETRY";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "core::exit_state_tests::hardware_profile_failed_load_retry_shuts_down_previous_kernel"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        {
+            let mut settings = common::settings::values_mut();
+            settings.memory_layout_mode.set_global(true);
+            settings.memory_layout_mode.set_value(common::settings::MemoryLayout::Memory4Gb);
+        }
+        let path = std::env::temp_dir().join(format!("ruzu-profile-retry-{}.nro", std::process::id()));
+        fs::write(&path, [0u8; 4]).unwrap();
+        let mut system = Box::new(System::new());
+        system.initialize();
+        for profile in [hardware_properties::SWITCH1_PROFILE, hardware_properties::NX2_PROFILE,
+            hardware_properties::SWITCH1_PROFILE] {
+            system.set_hardware_profile_override(Some(profile));
+            assert_eq!(system.load(path.to_str().unwrap()), SystemResultStatus::ErrorLoader);
+            let kernel = system.kernel.as_ref().expect("load failed after kernel initialization");
+            assert_eq!(kernel.hardware_profile(), profile);
+            let expected_mode = if profile == hardware_properties::NX2_PROFILE {
+                common::settings::MemoryLayout::Memory12Gb
+            } else { common::settings::MemoryLayout::Memory4Gb };
+            assert_eq!(kernel.memory_layout_mode(), expected_mode);
+            assert_eq!(system.device_memory().buffer.backing_size(),
+                crate::hle::kernel::board::k_system_control::init::get_intended_memory_size(expected_mode));
+            assert_eq!(*common::settings::values().memory_layout_mode.get_value(),
+                common::settings::MemoryLayout::Memory4Gb);
+            assert!(kernel.global_scheduler_context().is_none(), "failed load must finalize the kernel immediately");
+            assert!(!system.core_timing.has_started());
+        }
+        system.shutdown_main_process();
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

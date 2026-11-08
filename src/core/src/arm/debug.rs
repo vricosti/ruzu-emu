@@ -5,7 +5,6 @@
 //! Debug utilities (thread naming, backtrace, module enumeration).
 
 use crate::arm::arm_interface::ThreadContext;
-use crate::hardware_properties;
 use crate::hle::kernel::k_memory_block::{KMemoryPermission, KMemoryState};
 use crate::hle::kernel::k_process::KProcess;
 use crate::hle::kernel::k_thread::KThread;
@@ -274,7 +273,7 @@ pub fn invalidate_instruction_cache_range(
     address: u64,
     size: u64,
 ) {
-    for core_index in 0..hardware_properties::NUM_CPU_CORES as usize {
+    for core_index in 0..process.hardware_profile().num_cpu_cores() as usize {
         if let Some(interface) = process.get_arm_interface_mut(core_index) {
             interface.invalidate_cache_range(address, size as usize);
         }

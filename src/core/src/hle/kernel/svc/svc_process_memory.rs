@@ -454,7 +454,7 @@ fn invalidate_process_instruction_cache(
     address: u64,
     size: u64,
 ) {
-    for core in 0..crate::hardware_properties::NUM_CPU_CORES as usize {
+    for core in 0..process.hardware_profile().num_cpu_cores() as usize {
         if let Some(cpu) = process.get_arm_interface_mut(core) {
             cpu.invalidate_cache_range(address, size as usize);
         }

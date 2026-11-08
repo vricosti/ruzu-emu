@@ -16,13 +16,14 @@ use crate::hle::kernel::svc::svc_types::*;
 use crate::hle::kernel::svc_common::{Handle, PseudoHandle, INVALID_HANDLE};
 use crate::hle::result::{ResultCode, RESULT_SUCCESS};
 
-fn is_valid_virtual_core_id(core_id: i32) -> bool {
-    (0..crate::hardware_properties::NUM_CPU_CORES as i32).contains(&core_id)
+fn is_valid_virtual_core_id(profile: crate::hardware_properties::HardwareProfile, core_id: i32) -> bool {
+    (0..profile.num_cpu_cores() as i32).contains(&core_id)
 }
 
 // Eden-NX2 folds additional hardware core IDs onto the emulated cores.
-fn fold_extra_core_id(core_id: i32) -> i32 {
-    let num_cores = crate::hardware_properties::NUM_CPU_CORES as i32;
+fn fold_extra_core_id(profile: crate::hardware_properties::HardwareProfile, core_id: i32) -> i32 {
+    if profile == crate::hardware_properties::SWITCH1_PROFILE { return core_id; }
+    let num_cores = profile.num_cpu_cores() as i32;
     if core_id >= num_cores && core_id < 2 * num_cores {
         core_id - num_cores
     } else {
@@ -30,9 +31,10 @@ fn fold_extra_core_id(core_id: i32) -> i32 {
     }
 }
 
-fn fold_extra_core_mask(mask: u64) -> u64 {
-    let low = (1u64 << crate::hardware_properties::NUM_CPU_CORES) - 1;
-    (mask & low) | ((mask >> crate::hardware_properties::NUM_CPU_CORES) & low)
+fn fold_extra_core_mask(profile: crate::hardware_properties::HardwareProfile, mask: u64) -> u64 {
+    if profile == crate::hardware_properties::SWITCH1_PROFILE { return mask; }
+    let low = (1u64 << profile.num_cpu_cores()) - 1;
+    (mask & low) | ((mask >> profile.num_cpu_cores()) & low)
 }
 
 fn sleep_timeout_tick_from_ns(current_tick: i64, ns: i64) -> i64 {
@@ -189,10 +191,10 @@ pub fn create_thread(
         if core_id == IDEAL_CORE_USE_PROCESS_VALUE {
             core_id = process.get_ideal_core_id();
         }
-        core_id = fold_extra_core_id(core_id);
+        core_id = fold_extra_core_id(system.hardware_profile(), core_id);
         let process_core_mask = process.get_core_mask();
 
-        if !is_valid_virtual_core_id(core_id) {
+        if !is_valid_virtual_core_id(system.hardware_profile(), core_id) {
             trace_create_thread(
                 2,
                 caller_tid,
@@ -703,9 +705,9 @@ pub fn set_thread_core_mask(
             return RESULT_INVALID_COMBINATION;
         }
         // Validate the original mask against process capabilities before folding.
-        affinity_mask = fold_extra_core_mask(affinity_mask);
-        core_id = fold_extra_core_id(core_id);
-        if is_valid_virtual_core_id(core_id) {
+        affinity_mask = fold_extra_core_mask(system.hardware_profile(), affinity_mask);
+        core_id = fold_extra_core_id(system.hardware_profile(), core_id);
+        if is_valid_virtual_core_id(system.hardware_profile(), core_id) {
             if ((1u64 << core_id) & affinity_mask) == 0 {
                 return RESULT_INVALID_COMBINATION;
             }
@@ -767,27 +769,27 @@ mod tests {
     #[test]
     fn nx2_core_id_folding_preserves_sentinels_and_bounds() {
         for core in 0..6 {
-            assert!(super::is_valid_virtual_core_id(core));
-            assert_eq!(super::fold_extra_core_id(core), core);
-            assert_eq!(super::fold_extra_core_id(core + 6), core);
+            assert!(super::is_valid_virtual_core_id(crate::hardware_properties::NX2_PROFILE, core));
+            assert_eq!(super::fold_extra_core_id(crate::hardware_properties::NX2_PROFILE, core), core);
+            assert_eq!(super::fold_extra_core_id(crate::hardware_properties::NX2_PROFILE, core + 6), core);
         }
         for core in [i32::MIN, -3, -2, -1, 12, i32::MAX] {
-            assert_eq!(super::fold_extra_core_id(core), core);
-            assert!(!super::is_valid_virtual_core_id(core));
+            assert_eq!(super::fold_extra_core_id(crate::hardware_properties::NX2_PROFILE, core), core);
+            assert!(!super::is_valid_virtual_core_id(crate::hardware_properties::NX2_PROFILE, core));
         }
     }
 
     #[test]
     fn nx2_core_mask_folding_unions_low_and_extra_cores() {
         for core in 0..6 {
-            assert_eq!(super::fold_extra_core_mask(1 << core), 1 << core);
-            assert_eq!(super::fold_extra_core_mask(1 << (core + 6)), 1 << core);
-            assert_eq!(super::fold_extra_core_mask((1 << core) | (1 << (core + 6))), 1 << core);
+            assert_eq!(super::fold_extra_core_mask(crate::hardware_properties::NX2_PROFILE, 1 << core), 1 << core);
+            assert_eq!(super::fold_extra_core_mask(crate::hardware_properties::NX2_PROFILE, 1 << (core + 6)), 1 << core);
+            assert_eq!(super::fold_extra_core_mask(crate::hardware_properties::NX2_PROFILE, (1 << core) | (1 << (core + 6))), 1 << core);
         }
-        assert_eq!(super::fold_extra_core_mask(0), 0);
-        assert_eq!(super::fold_extra_core_mask(u64::MAX), 0x3f);
-        assert_eq!(super::fold_extra_core_mask(1 << 12), 0);
-        assert_eq!(super::fold_extra_core_mask((1 << 5) | (1 << 6)), 0x21);
+        assert_eq!(super::fold_extra_core_mask(crate::hardware_properties::NX2_PROFILE, 0), 0);
+        assert_eq!(super::fold_extra_core_mask(crate::hardware_properties::NX2_PROFILE, u64::MAX), 0x3f);
+        assert_eq!(super::fold_extra_core_mask(crate::hardware_properties::NX2_PROFILE, 1 << 12), 0);
+        assert_eq!(super::fold_extra_core_mask(crate::hardware_properties::NX2_PROFILE, (1 << 5) | (1 << 6)), 0x21);
     }
 
     use super::*;
@@ -802,10 +804,20 @@ mod tests {
     use crate::hle::kernel::k_worker_task_manager::KWorkerTaskManager;
     use std::sync::Mutex;
 
-    fn test_system() -> System {
-        let mut system = System::new_for_test();
+    fn test_system() -> System { test_system_with_profile(crate::hardware_properties::SWITCH1_PROFILE) }
+
+    fn test_system_with_profile(profile: crate::hardware_properties::HardwareProfile) -> System {
+        // These tests exercise scheduler-lock paths through the process-global
+        // KERNEL_PTR/SCHEDULER_LOCK_PTR fallbacks, which parallel tests that
+        // run KernelCore::initialize()/shutdown() mutate concurrently. Pin this
+        // test thread to the "no global kernel" override for its whole
+        // lifetime (one thread per test, so the forgotten guard never leaks
+        // across tests).
+        std::mem::forget(crate::hle::kernel::kernel::ScopedKernelForTest::without_kernel());
+        let mut system = System::new_for_test_with_hardware_profile(profile);
 
         let mut process = KProcess::new();
+        process.capabilities.hardware_profile = profile;
         process.capabilities.core_mask = 0xF;
         process.capabilities.priority_mask = u64::MAX;
         process.flags = 0;
@@ -844,6 +856,43 @@ mod tests {
         system.set_runtime_program_id(1);
         system.set_runtime_64bit(false);
         system
+    }
+
+    #[test]
+    fn hardware_profiles_preserve_svc_validation_order() {
+        use crate::hardware_properties::{SWITCH1_PROFILE, NX2_PROFILE};
+        for profile in [SWITCH1_PROFILE, NX2_PROFILE, SWITCH1_PROFILE] {
+            let system = test_system_with_profile(profile);
+            let mut handle = 0;
+            assert_eq!(create_thread(&system, &mut handle, 0x201000, 0, 0x260000, 44, 4), RESULT_INVALID_CORE_ID);
+            assert_eq!(set_thread_core_mask(&system, INVALID_HANDLE, 4, 1),
+                if profile == SWITCH1_PROFILE { RESULT_INVALID_CORE_ID } else { RESULT_INVALID_COMBINATION });
+            assert_eq!(set_thread_core_mask(&system, INVALID_HANDLE, 0, 0x10), RESULT_INVALID_CORE_ID);
+            assert_eq!(set_thread_core_mask(&system, INVALID_HANDLE, 4, 0), RESULT_INVALID_COMBINATION);
+            assert_eq!(set_thread_core_mask(&system, INVALID_HANDLE, 0, 1), RESULT_INVALID_HANDLE);
+        }
+        for core in 4..12 {
+            assert_eq!(fold_extra_core_id(SWITCH1_PROFILE, core), core);
+        }
+        assert_eq!(fold_extra_core_mask(SWITCH1_PROFILE, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn hardware_profile_nx2_creates_threads_on_cores_four_and_five() {
+        let system = test_system_with_profile(crate::hardware_properties::NX2_PROFILE);
+        system.current_process_arc().lock().unwrap().capabilities.core_mask = 0x3f;
+        for core in [4, 5] {
+            let mut handle = INVALID_HANDLE;
+            assert_eq!(create_thread(&system, &mut handle, 0x201000, 0, 0x260000, 44, core), RESULT_SUCCESS);
+            let thread = resolve_thread_handle(&system, handle).unwrap();
+            {
+                let thread = thread.lock().unwrap();
+                assert_eq!(thread.physical_ideal_core_id, core);
+                assert_eq!(thread.physical_affinity_mask.get_affinity_mask(), 1u64 << core);
+            }
+            assert_eq!(set_thread_core_mask(&system, handle, core, 0x30), RESULT_SUCCESS);
+            assert_eq!(thread.lock().unwrap().physical_affinity_mask.get_affinity_mask(), 0x30);
+        }
     }
 
     #[test]

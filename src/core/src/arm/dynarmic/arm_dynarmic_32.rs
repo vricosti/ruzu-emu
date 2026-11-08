@@ -2339,7 +2339,7 @@ impl A32UserCallbacks for DynarmicCallbacks32 {
     }
 
     /// Matches upstream `DynarmicCallbacks32::AddTicks`:
-    /// Divides ticks by NUM_CPU_CORES (4), passes to CoreTiming::AddTicks.
+    /// Divides ticks by the active session core count, passes to CoreTiming::AddTicks.
     fn add_ticks(&mut self, ticks: u64) {
         // Upstream: ASSERT_MSG(!m_parent.m_uses_wall_clock, ...)
         if self.parent().base.uses_wall_clock {
@@ -2348,7 +2348,7 @@ impl A32UserCallbacks for DynarmicCallbacks32 {
         // Divide by number of CPU cores, minimum 1 tick.
         // Matches upstream: amortized_ticks = max(ticks / NUM_CPU_CORES, 1)
         let amortized_ticks =
-            std::cmp::max(ticks / crate::hardware_properties::NUM_CPU_CORES as u64, 1);
+            std::cmp::max(ticks / self.parent().hardware_profile.num_cpu_cores() as u64, 1);
         self.parent().core_timing.add_ticks(amortized_ticks);
     }
 
@@ -2375,6 +2375,7 @@ impl A32UserCallbacks for DynarmicCallbacks32 {
 ///
 /// Corresponds to upstream `Core::ArmDynarmic32`.
 pub struct ArmDynarmic32 {
+    hardware_profile: crate::hardware_properties::HardwareProfile,
     pub base: ArmInterfaceBase,
 
     // Upstream holds `System& m_system` for accessing CoreTiming, DebuggerEnabled,
@@ -2432,7 +2433,7 @@ impl ArmDynarmic32 {
     ///
     /// Corresponds to upstream `ArmDynarmic32::ArmDynarmic32`.
     pub fn new(
-        _system: &dyn std::any::Any,
+        hardware_profile: crate::hardware_properties::HardwareProfile,
         uses_wall_clock: bool,
         process: &KProcess,
         exclusive_monitor: *mut crate::arm::dynarmic::dynarmic_exclusive_monitor::DynarmicExclusiveMonitor,
@@ -2502,7 +2503,7 @@ impl ArmDynarmic32 {
         })
         .filter(|backing_base| {
             let intended_memory_size =
-                crate::hle::kernel::board::k_system_control::init::get_intended_memory_size();
+                kernel_process.device_memory_backing_size;
             (*backing_base as u64) + (intended_memory_size as u64) < (1u64 << 39)
         })
         .map(|_| PageTable::SIGN_BIT as u8);
@@ -2692,6 +2693,7 @@ impl ArmDynarmic32 {
         maybe_spawn_vaddr_poller(fastmem_pointer, core_index);
 
         let result = Self {
+            hardware_profile,
             base,
             core_index,
             svc_swi,
@@ -3132,6 +3134,41 @@ mod tests {
     use crate::hle::kernel::k_process::ProcessMemoryData;
     use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
     use std::sync::RwLock;
+
+    #[test]
+    fn hardware_profile_a32_ticks_preserve_divisor_and_wall_clock_bypass() {
+        use crate::hardware_properties::{SWITCH1_PROFILE, NX2_PROFILE};
+        let parent_ptr = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+        let timing = Arc::new(crate::core_timing::CoreTiming::new());
+        let mut parent = Box::new(ArmDynarmic32 {
+            hardware_profile: SWITCH1_PROFILE, base: ArmInterfaceBase::new(false),
+            core_index: 0, svc_swi: Arc::new(AtomicU32::new(0)), core_timing: timing.clone(),
+            parent_ptr: parent_ptr.clone(), halted_watchpoint: Arc::new(Mutex::new(None)),
+            breakpoint_context: Arc::new(Mutex::new(ThreadContext::default())), jit: None,
+            cp15: Arc::new(DynarmicCP15::new(parent_ptr.clone())),
+            last_exception_address: Arc::new(AtomicU64::new(0)), trace_fastmem_ptr: std::ptr::null(),
+            last_code_addr: Arc::new(AtomicU64::new(u64::MAX)),
+        });
+        parent.set_parent_ptr();
+        let mut callbacks = DynarmicCallbacks32::new(
+            Arc::new(RwLock::new(ProcessMemoryData::new())), None, std::ptr::null(),
+            parent_ptr, false, parent.base.shared_watchpoint_array(),
+            parent.halted_watchpoint.clone(), parent.last_code_addr.clone(),
+        );
+        for (profile, decrement) in [(SWITCH1_PROFILE, 6), (NX2_PROFILE, 4)] {
+            parent.hardware_profile = profile;
+            timing.reset_ticks();
+            let before = timing.get_downcount();
+            callbacks.add_ticks(24);
+            assert_eq!(before - timing.get_downcount(), decrement);
+            callbacks.add_ticks(0);
+            assert_eq!(before - timing.get_downcount(), decrement + 1);
+            parent.base.uses_wall_clock = true;
+            callbacks.add_ticks(24);
+            assert_eq!(before - timing.get_downcount(), decrement + 1);
+            parent.base.uses_wall_clock = false;
+        }
+    }
 
     #[test]
     fn callbacks_implement_the_architecture_owned_a32_interface() {

@@ -526,7 +526,7 @@ pub fn calculate_converted_size_bytes(info: &ImageInfo) -> u32 {
             .wrapping_mul(surface::bytes_per_block(info.format));
     }
 
-    let recompression = *common::settings::values().astc_recompression.get_value();
+    let recompression = common::settings::values().effective_astc_recompression();
     if surface::is_pixel_format_astc(info.format)
         && recompression != common::settings_enums::AstcRecompression::Uncompressed
     {
@@ -1018,7 +1018,7 @@ pub fn convert_image(
 
         let astc = surface::is_pixel_format_astc(info.format);
 
-        let recompression = *common::settings::values().astc_recompression.get_value();
+        let recompression = common::settings::values().effective_astc_recompression();
 
         if astc && recompression == common::settings_enums::AstcRecompression::Uncompressed {
             let input_slice = &input[input_offset..];
@@ -2082,12 +2082,13 @@ mod tests {
     #[test]
     fn astc_recompression_setting_preserves_solid_color_and_output_size() {
         use common::settings_enums::AstcRecompression;
-        struct Restore(AstcRecompression, bool);
+        struct Restore(AstcRecompression, bool, bool);
         impl Drop for Restore {
             fn drop(&mut self) {
                 let mut values = common::settings::values_mut();
                 values.astc_recompression.setting.set_value(self.0);
                 values.astc_recompression.set_global(self.1);
+                values.use_session_astc_recompression = self.2;
             }
         }
         let _restore = {
@@ -2095,6 +2096,7 @@ mod tests {
             Restore(
                 *values.astc_recompression.get_value_global(),
                 values.astc_recompression.using_global(),
+                values.use_session_astc_recompression,
             )
         };
         // ASTC LDR void-extent block, opaque red in 16-bit channels.
@@ -2113,15 +2115,18 @@ mod tests {
             },
             ..ImageInfo::default()
         };
-        for (mode, size, compressed_format) in [
-            (AstcRecompression::Uncompressed, 64, None),
-            (AstcRecompression::Bc1, 8, Some(PixelFormat::Bc1RgbaUnorm)),
-            (AstcRecompression::Bc3, 16, Some(PixelFormat::Bc3Unorm)),
+        for (mode, session, size, compressed_format) in [
+            (AstcRecompression::Uncompressed, false, 64, None),
+            (AstcRecompression::Bc1, false, 8, Some(PixelFormat::Bc1RgbaUnorm)),
+            (AstcRecompression::Bc3, false, 16, Some(PixelFormat::Bc3Unorm)),
+            (AstcRecompression::Uncompressed, true, 16, Some(PixelFormat::Bc3Unorm)),
+            (AstcRecompression::Uncompressed, false, 64, None),
         ] {
             {
                 let mut values = common::settings::values_mut();
                 values.astc_recompression.set_global(true);
                 values.astc_recompression.set_value(mode);
+                values.use_session_astc_recompression = session;
             }
             assert_eq!(calculate_converted_size_bytes(&info), size);
             let mut copies = full_download_copies(&info);

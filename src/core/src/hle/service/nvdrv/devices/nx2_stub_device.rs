@@ -72,6 +72,17 @@ impl Nx2GpuMemoryRegistry {
         self.map_at(address, address, size);
     }
 
+    /// End the emulation session after its CPU/service workers have stopped.
+    /// The upstream singleton retains mappings until explicit guest unmaps;
+    /// forced shutdown need not issue those. None of its addresses or callbacks
+    /// may be replayed into a later System. Do not invoke guest unmap/release
+    /// callbacks here: the GPU and its address spaces are being destroyed.
+    pub(crate) fn reset_session(&self) {
+        let mut state = self.state.lock().unwrap();
+        *state = RegistryState::default();
+        self.device_ranges.lock().unwrap().clear();
+    }
+
     pub fn map_at(&self, gpu_address: u64, cpu_address: u64, size: u64) {
         let mut state = self.state.lock().unwrap();
         Self::trim_mappings(&mut state, gpu_address, size);
@@ -246,6 +257,31 @@ impl NvDevice for Nx2StubDevice {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn session_reset_discards_callbacks_mappings_and_device_addresses() {
+        let registry = Nx2GpuMemoryRegistry::default();
+        let old_calls = Arc::new(Mutex::new(0));
+        let calls = Arc::clone(&old_calls);
+        registry.add_listener(1, Box::new(move |_, _, _| *calls.lock().unwrap() += 1),
+            Box::new(|_, _| panic!("reset must not invoke old GPU callbacks")),
+            Some(Box::new(|_, _| panic!("reset must not release through a destroyed GPU"))));
+        registry.map_at(0x1000, 0x9000, 0x1000);
+        registry.record_device_range(0x9000, 0x1000, 0x8000);
+        registry.reset_session();
+        registry.reset_session(); // Failed loads and repeated shutdown are harmless.
+        assert_eq!(registry.device_address_of(0x9000), None);
+        let replay = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&replay);
+        registry.add_listener(2, Box::new(move |g, c, s| seen.lock().unwrap().push((g, c, s))),
+            Box::new(|_, _| {}), None);
+        assert!(replay.lock().unwrap().is_empty());
+        registry.map_at(0x1000, 0xa000, 0x1000);
+        registry.unmap(0x1000, 0x1000);
+        registry.release_backing(0xa000, 0x1000);
+        assert_eq!(*old_calls.lock().unwrap(), 1);
+        assert_eq!(*replay.lock().unwrap(), vec![(0x1000, 0xa000, 0x1000)]);
+    }
 
     #[test]
     fn mappings_split_and_replay_with_adjusted_cpu_offsets() {

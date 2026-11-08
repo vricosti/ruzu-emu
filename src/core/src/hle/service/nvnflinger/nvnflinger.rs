@@ -71,5 +71,10 @@ pub fn loop_process(system: crate::core::SystemRef) {
         Box::new(move || -> Arc<dyn SessionRequestHandler> { binder_driver.clone() }),
         64,
     );
+    // Upstream's native service stack destroys these owners on return. Guest
+    // fibers can be abandoned at shutdown, so move the local owner into the
+    // kernel's post-CPU cleanup (not another Arc clone on the fiber stack).
+    system.get().kernel().expect("Nvnflinger requires a kernel")
+        .retain_service_lifetime_owner(nvnflinger);
     ServerManager::run_server_shared(server_manager);
 }

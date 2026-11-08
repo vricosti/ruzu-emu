@@ -1732,6 +1732,11 @@ impl System {
         }
         self.set_shutting_down(false);
         self.hardware_profile = self.hardware_profile_override.unwrap_or(detected_profile);
+        {
+            let mut settings = common::settings::values_mut();
+            settings.use_session_astc_recompression = self.hardware_profile == hardware_properties::NX2_PROFILE;
+            log::info!("Session ASTC recompression: {:?}", settings.effective_astc_recompression());
+        }
         log::info!("Hardware profile: {:?} ({} CPU cores)", self.hardware_profile,
             self.hardware_profile.num_cpu_cores());
         // Choose the profile before creating the kernel or its host identities.
@@ -2169,6 +2174,7 @@ impl System {
         self.app_loader = None;
         // Upstream: gpu_core.reset();
         self.gpu_core = None;
+        common::settings::values_mut().use_session_astc_recompression = false;
         // Upstream: host1x_core.reset();
         self.host1x_core = None;
 
@@ -2182,6 +2188,13 @@ impl System {
         if let Some(ref kernel) = self.kernel {
             kernel.finalize_terminated_processes_after_cpu_shutdown();
         }
+        // NX2's process-global registry must not replay old guest addresses or
+        // callbacks when another title starts. All producers have stopped and
+        // service/process owners have been released at this point.
+        crate::hle::service::nvdrv::devices::nx2_stub_device::Nx2GpuMemoryRegistry::get()
+            .reset_session();
+        crate::hle::service::nvdrv::devices::nx2_stub_device::G_NX2_DRIVER
+            .store(false, Ordering::SeqCst);
         // Rust retains service sessions in the terminated-process table until
         // the post-CPU finalization above. Keep AudioCore's render manager
         // alive so late AudioRenderer::finalize waits can still be signaled.
@@ -3466,6 +3479,7 @@ mod exit_state_tests {
             assert_eq!(*common::settings::values().memory_layout_mode.get_value(),
                 common::settings::MemoryLayout::Memory4Gb);
             assert!(kernel.global_scheduler_context().is_none(), "failed load must finalize the kernel immediately");
+            assert!(!common::settings::values().use_session_astc_recompression);
             assert!(!system.core_timing.has_started());
         }
         system.shutdown_main_process();

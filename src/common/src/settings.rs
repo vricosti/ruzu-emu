@@ -222,6 +222,9 @@ pub struct Values {
     pub frame_pacing_mode: SwitchableSetting<FramePacingMode>,
     pub max_anisotropy: SwitchableSetting<AnisotropyMode>,
     pub astc_recompression: SwitchableSetting<AstcRecompression>,
+    /// Runtime-only NX2 texture policy; excluded from setting linkage/serialization.
+    /// System sets it before GPU creation and clears it after GPU teardown.
+    pub use_session_astc_recompression: bool,
     pub vram_usage_mode: SwitchableSetting<VramUsageMode>,
     pub sync_memory_operations: SwitchableSetting<bool>,
     pub renderer_force_max_clock: SwitchableSetting<bool>,
@@ -395,6 +398,15 @@ pub struct Values {
 }
 
 impl Values {
+    /// Session extension of the upstream ASTC setting. All render consumers
+    /// must use the same effective mode for format, byte size and conversion.
+    pub fn effective_astc_recompression(&self) -> AstcRecompression {
+        match *self.astc_recompression.get_value() {
+            AstcRecompression::Uncompressed if self.use_session_astc_recompression => AstcRecompression::Bc3,
+            configured => configured,
+        }
+    }
+
     /// Visit settings owned by one upstream category.
     ///
     /// This is the Rust counterpart of `Settings::values.linkage.by_category`.
@@ -1133,6 +1145,7 @@ impl Default for Values {
                 "max_anisotropy",
                 RendererAdvanced,
             ),
+            use_session_astc_recompression: false,
             astc_recompression: SwitchableSetting::ranged(
                 AstcRecompression::Uncompressed,
                 AstcRecompression::Uncompressed,
@@ -2026,6 +2039,23 @@ pub type Settings = Values;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_astc_policy_preserves_configured_values_and_switch1_behavior() {
+        let mut settings = Values::default();
+        for mode in [AstcRecompression::Uncompressed, AstcRecompression::Bc1, AstcRecompression::Bc3] {
+            settings.astc_recompression.set_value(mode);
+            for enabled in [false, true, false] {
+                settings.use_session_astc_recompression = enabled;
+                let expected = if enabled && mode == AstcRecompression::Uncompressed {
+                    AstcRecompression::Bc3
+                } else { mode };
+                assert_eq!(settings.effective_astc_recompression(), expected);
+                assert_eq!(*settings.astc_recompression.get_value(), mode);
+                assert_eq!(*settings.astc_recompression.get_value_global(), mode);
+            }
+        }
+    }
 
     #[test]
     fn configured_time_zone_names_follow_upstream_table() {

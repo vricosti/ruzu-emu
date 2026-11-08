@@ -94,6 +94,14 @@ impl NativeQmdScheduler {
         STATES.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
+    /// All channels share dependencies within one GPU session, but guest QMD
+    /// addresses and deferred counters cannot survive GPU destruction. Called
+    /// only after its worker has stopped, never on an individual channel drop.
+    pub(crate) fn reset_session() {
+        Self::states().lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+    }
+
     pub fn signal<R: ReleaseCallback>(
         &mut self,
         address: Address,
@@ -291,6 +299,34 @@ mod tests {
         qmd[base] = address as u32;
         qmd[base + 1] = (address >> 32) as u32 | (1 << 23) | (1 << 30);
         qmd[base + 2] = payload;
+    }
+
+    #[test]
+    fn gpu_shutdown_discards_previous_session_capacity_and_dependencies() {
+        let _guard = reset();
+        let gpu = crate::gpu::Gpu::new(false, false);
+        let mut scheduler = NativeQmdScheduler::default();
+        for address in 1..=4096 {
+            assert_eq!(scheduler.signal(address, 7, |_, _| panic!("early decrement must not read"),
+                PlainRelease(|_, _| true)), "");
+        }
+        assert_eq!(scheduler.signal(4097, 7, |_, _| panic!(), PlainRelease(|_, _| true)),
+            "QMD cache limit");
+        drop(gpu);
+
+        // Reuse an old address with zero dependencies: a stale deferred -1
+        // would underflow. A new address must also be accepted at full capacity.
+        let next_gpu = crate::gpu::Gpu::new(false, false);
+        let mut next_channel = NativeQmdScheduler::default();
+        for address in [1, 4097] {
+            let mut released = false;
+            let mut qmd = descriptor(0);
+            set_release(&mut qmd, 24, 0x8000, 42);
+            assert_eq!(next_channel.signal(address, 3, |_, out| { *out = qmd; true },
+                PlainRelease(|a, p| { assert_eq!((a, p), (0x8000, 42)); released = true; true })), "");
+            assert!(released);
+        }
+        drop(next_gpu);
     }
 
     #[test]

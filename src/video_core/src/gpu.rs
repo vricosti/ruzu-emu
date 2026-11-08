@@ -197,6 +197,10 @@ impl Drop for Gpu {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .shutdown();
+        // The NX2 oracle's QMD table is static to share dependency counters
+        // across channels. Its guest addresses are still session-owned: keeping
+        // them here exhausts the cache (and reuses old counters) after Restart.
+        crate::native_qmd::NativeQmdScheduler::reset_session();
     }
 }
 

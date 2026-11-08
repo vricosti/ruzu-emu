@@ -258,14 +258,14 @@ impl Image {
             runtime.optimal_astc_supported,
             runtime.optimal_bcn_supported,
             *common::settings::values().accelerate_astc.get_value(),
-            *common::settings::values().astc_recompression.get_value(),
+            common::settings::values().effective_astc_recompression(),
         );
         let override_format = huge_astc_host_format(runtime.optimal_astc_supported, &base_mut.info);
         let format = override_format.unwrap_or_else(|| runtime.surface_format(base_mut.info.format, false));
         let host_info = trimmed_host_info(runtime.optimal_astc_supported, &base_mut.info,
             &mut base_mut.host_level_offset,
             *common::settings::values().accelerate_astc.get_value(),
-            *common::settings::values().astc_recompression.get_value());
+            common::settings::values().effective_astc_recompression());
         if base_mut.host_level_offset != 0 { base_mut.flags.insert(ImageFlagBits::TRIMMED_LEVELS); }
         let aspect = image_aspect_mask(base_mut.info.format);
         let image = runtime.create_image_from_info(&host_info, override_format,
@@ -5817,7 +5817,7 @@ impl TextureCache {
             self.base.runtime().optimal_astc_supported,
             self.base.runtime().optimal_bcn_supported,
             *common::settings::values().accelerate_astc.get_value(),
-            *common::settings::values().astc_recompression.get_value(),
+            common::settings::values().effective_astc_recompression(),
         );
     }
 

@@ -611,12 +611,75 @@ pub fn loop_process(system: crate::core::SystemRef) {
         }
         server_manager.register_named_service("nvmemp", Box::new(|| Arc::new(Nvmemp::new())), 64);
     }
+    // Eden's LoopProcess keeps this shared_ptr on a native stack until the
+    // server exits. A stopped cooperative guest fiber can abandon that stack
+    // without running Rust destructors. Transfer (do not clone) the local
+    // owner to the existing post-CPU service cleanup, so Module's devices and
+    // their NX2 memory listeners are destroyed before System goes away.
+    system
+        .get()
+        .kernel()
+        .expect("NVDRV service requires a kernel")
+        .retain_service_lifetime_owner(module);
     crate::hle::service::server_manager::ServerManager::run_server_shared(server_manager);
 }
 
 #[cfg(test)]
 mod nx2_open_tests {
     use super::*;
+
+    #[test]
+    fn shutdown_releases_nvdrv_module_and_open_address_space() {
+        use crate::hle::service::server_manager::ServerManager;
+
+        let _without_global = crate::hle::kernel::kernel::ScopedKernelForTest::without_kernel();
+        let mut system = crate::core::System::new_boxed_for_test();
+        let kernel = system.kernel().unwrap();
+        let module = Module::new(SystemRef::from_ref(&system));
+        let weak_module = Arc::downgrade(&module);
+        let fd = module.open("/dev/nvhost-as-gpu", SessionId::default());
+        let weak_device = Arc::downgrade(module.open_files.lock().unwrap().get(&fd).unwrap());
+        let manager = ServerManager::new_shared(SystemRef::from_ref(&system));
+        let service_module = Arc::clone(&module);
+        manager.lock().unwrap().register_named_service(
+            "nvdrv:s",
+            Box::new(move || Arc::new(super::super::nvdrv_interface::NvdrvService::new(
+                Arc::clone(&service_module), "nvdrv:s",
+            ))),
+            64,
+        );
+        // The display services also retain Module. Reproduce that real graph,
+        // not only the NVDRV factory: their abandoned locals used to keep the
+        // old address-space listeners alive after the NVDRV local was fixed.
+        let flinger = Arc::new(crate::hle::service::nvnflinger::nvnflinger::Nvnflinger::new(
+            SystemRef::from_ref(&system),
+        ));
+        let weak_flinger = Arc::downgrade(&flinger);
+        let binder = Arc::clone(flinger.get_binder_driver());
+        manager.lock().unwrap().register_named_service("dispdrv",
+            Box::new(move || binder.clone()), 64);
+        let vi = crate::hle::service::vi::container::Container::new(SystemRef::from_ref(&system));
+        let weak_vi = Arc::downgrade(&vi);
+        let vi_for_stop = Arc::downgrade(&vi);
+        let stop = system.register_stop_callback(move || {
+            if let Some(vi) = vi_for_stop.upgrade() { vi.on_terminate(); }
+        });
+        kernel.track_server_manager_for_test(Arc::clone(&manager));
+        kernel.retain_service_lifetime_owner(module);
+        kernel.retain_service_lifetime_owner(flinger);
+        kernel.retain_service_lifetime_owner((vi, stop));
+        assert!(weak_module.upgrade().is_some());
+        assert!(weak_device.upgrade().is_some());
+
+        // Keep the manager Arc alive, as on an abandoned fiber stack. Its
+        // factories and the transferred LoopProcess owner must both release.
+        system.shutdown_main_process();
+        assert!(weak_vi.upgrade().is_none());
+        assert!(weak_flinger.upgrade().is_none());
+        assert!(weak_module.upgrade().is_none());
+        assert!(weak_device.upgrade().is_none());
+        drop(manager);
+    }
 
     #[test]
     fn event_interface_uses_module_context_and_releases_its_owner() {

@@ -1513,6 +1513,9 @@ pub struct INx2VideoSession {
     control: Mutex<VideoControl>,
     shared: Arc<VideoShared>,
     ready: Arc<VideoReadyState>,
+    // Retain the allocator of our syncpoint through deferred service teardown.
+    // Rust can destroy this session after System's ServiceManager is gone.
+    syncpoints: std::sync::OnceLock<Arc<super::nvdrv::core::syncpoint_manager::SyncpointManager>>,
 }
 impl INx2VideoSession {
     const NO_SYNCPOINT: u32 = u32::MAX;
@@ -1575,6 +1578,7 @@ impl INx2VideoSession {
                 event: Mutex::new(None),
                 room: AtomicBool::new(true),
             }),
+            syncpoints: std::sync::OnceLock::new(),
         }
     }
     fn log(&self, ctx: &HLERequestContext, what: &str) {
@@ -1601,20 +1605,22 @@ impl INx2VideoSession {
         }
     }
     fn nvdrv_syncpoints(&self) -> Arc<super::nvdrv::core::syncpoint_manager::SyncpointManager> {
-        let manager = self
-            .system
-            .get()
-            .service_manager()
-            .expect("video requires ServiceManager");
-        let service =
-            super::sm::sm::ServiceManager::get_service_blocking(&manager, self.system, "nvdrv");
-        service
-            .as_any()
-            .downcast_ref::<super::nvdrv::nvdrv_interface::NvdrvService>()
-            .expect("nvdrv must own NVDRV")
-            .get_module()
-            .get_container()
-            .get_syncpoint_manager_handle()
+        Arc::clone(self.syncpoints.get_or_init(|| {
+            let manager = self
+                .system
+                .get()
+                .service_manager()
+                .expect("video requires ServiceManager");
+            let service =
+                super::sm::sm::ServiceManager::get_service_blocking(&manager, self.system, "nvdrv");
+            service
+                .as_any()
+                .downcast_ref::<super::nvdrv::nvdrv_interface::NvdrvService>()
+                .expect("nvdrv must own NVDRV")
+                .get_module()
+                .get_container()
+                .get_syncpoint_manager_handle()
+        }))
     }
     fn create_decoder_service(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
@@ -3880,6 +3886,33 @@ mod tests {
         drop(service);
         assert!(shared.state.lock().unwrap().quit);
         assert_eq!(Arc::strong_count(&shared), 1);
+    }
+    #[test]
+    fn video_drop_releases_syncpoint_after_service_manager_shutdown() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let mut system = crate::core::System::new_boxed_for_test();
+        let module = super::super::nvdrv::nvdrv::Module::new(SystemRef::from_ref(&system));
+        let allocator = module.get_container().get_syncpoint_manager_handle();
+        system.service_manager().unwrap().lock().unwrap().register_service(
+            "nvdrv".into(), 64,
+            Box::new(move || Arc::new(super::super::nvdrv::nvdrv_interface::NvdrvService::new(
+                Arc::clone(&module), "nvdrv",
+            ))),
+        );
+        let service = INx2VideoSession::new(
+            SystemRef::from_ref(&system),
+            Arc::new(Mutex::new(Nx2NativeObjects::default())),
+            "nx2:vdec-test",
+        );
+        let syncpoints = service.nvdrv_syncpoints();
+        assert!(Arc::ptr_eq(&syncpoints, &allocator));
+        let id = syncpoints.allocate_syncpoint(false);
+        service.shared.state.lock().unwrap().syncpoint = id;
+        system.shutdown_main_process();
+        assert!(system.service_manager().is_none());
+        assert!(allocator.is_syncpoint_allocated(id));
+        drop(service);
+        assert!(!allocator.is_syncpoint_allocated(id));
     }
     #[test]
     fn video_ready_timer_observes_room_and_is_disarmed_before_event_close() {

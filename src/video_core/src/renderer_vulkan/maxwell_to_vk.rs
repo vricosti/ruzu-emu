@@ -613,7 +613,7 @@ pub fn surface_format(
     let mut info = surface_format_table(pixel_format);
 
     if !device.is_optimal_astc_supported() && crate::surface::is_pixel_format_astc(pixel_format) {
-        match *common::settings::values().astc_recompression.get_value() {
+        match common::settings::values().effective_astc_recompression() {
             common::settings_enums::AstcRecompression::Uncompressed => {
                 if is_srgb {
                     info.format = vk::Format::A8B8G8R8_SRGB_PACK32;

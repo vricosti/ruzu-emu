@@ -84,6 +84,7 @@ pub(crate) mod test_support {
             let mut values = settings::values_mut();
             let previous = values.current_gpu_accuracy;
             values.current_gpu_accuracy = value;
+            settings::republish_gpu_levels(&values);
             Self {
                 previous,
                 _lock: lock,
@@ -93,7 +94,9 @@ pub(crate) mod test_support {
 
     impl Drop for GpuAccuracyGuard {
         fn drop(&mut self) {
-            settings::values_mut().current_gpu_accuracy = self.previous;
+            let mut values = settings::values_mut();
+            values.current_gpu_accuracy = self.previous;
+            settings::republish_gpu_levels(&values);
         }
     }
 }

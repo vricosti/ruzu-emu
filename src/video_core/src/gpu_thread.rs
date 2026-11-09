@@ -289,7 +289,7 @@ impl ThreadManager {
     ///
     /// Upstream flushes at High accuracy, then directly invalidates the rasterizer cache.
     pub fn flush_and_invalidate_region(&self, addr: DAddr, size: u64, is_async: bool) {
-        if settings::is_gpu_level_high(&settings::values()) {
+        if settings::is_gpu_level_high_published() {
             if !is_async {
                 self.push_command(
                     CommandData::FlushRegion(FlushRegionCommand { addr, size }),

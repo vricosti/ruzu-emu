@@ -113,6 +113,12 @@ pub const ZONE_NAMES: [&str; Zone::Count as usize] = [
     "bind storage",
 ];
 
+/// Cumulative shader frontend translation time across all threads, in
+/// nanoseconds. Rust diagnostic: decomposes the disk pipeline cache load.
+pub static TRANSLATE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cumulative Vulkan pipeline creation time across all threads, in nanoseconds.
+pub static VKCREATE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // Rust's process-wide initialization occurs on first use rather than pre-main.
 // Presence (including an empty value or "0") enables profiling, as upstream.
 static G_ENABLED: LazyLock<bool> =

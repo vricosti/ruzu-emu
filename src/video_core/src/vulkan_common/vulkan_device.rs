@@ -638,6 +638,26 @@ impl Device {
         let is_integrated = device_properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
         let (memory_properties, memory_budget_properties) =
             physical_memory_properties(&instance, physical, has_memory_budget);
+        {
+            // Publish the dedicated VRAM size for the session ASTC policy
+            // before any texture-cache consumer reads the effective mode.
+            let device_local_bytes: u64 = memory_properties.memory_heaps
+                [..memory_properties.memory_heap_count as usize]
+                .iter()
+                .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .map(|heap| heap.size)
+                .max()
+                .unwrap_or(0);
+            let mut values = common::settings::values_mut();
+            values.session_device_vram_bytes = if is_integrated { 0 } else { device_local_bytes };
+            if values.use_session_astc_recompression {
+                log::info!(
+                    "Session ASTC recompression with {} MiB device-local VRAM: {:?}",
+                    device_local_bytes / (1024 * 1024),
+                    values.effective_astc_recompression()
+                );
+            }
+        }
 
         // Build queue create infos
         let queue_priority = [1.0f32];

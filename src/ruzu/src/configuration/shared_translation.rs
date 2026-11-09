@@ -97,6 +97,7 @@ pub const ASTC_RECOMPRESSION: &[(AstcRecompression, &str)] = &[
     ),
     (AstcRecompression::Bc1, "BC1 (Low quality)"),
     (AstcRecompression::Bc3, "BC3 (Medium quality)"),
+    (AstcRecompression::Bc7, "BC7 (High quality)"),
 ];
 
 pub const VRAM_USAGE_MODE: &[(VramUsageMode, &str)] = &[

@@ -3,7 +3,7 @@ use std::{
     hint::black_box,
     time::{Duration, Instant},
 };
-use video_core::textures::bcn::compress_bc3;
+use video_core::textures::bcn::{compress_bc3, compress_bc7};
 
 fn main() {
     for side in [16u32, 64, 256, 1024] {
@@ -30,6 +30,19 @@ fn main() {
             }
             println!(
                 "side={side} trial={trial} us={:.3} digest={digest:016x}",
+                start.elapsed().as_secs_f64() * 1e6 / f64::from(count)
+            );
+        }
+        for trial in 0..3 {
+            let start = Instant::now();
+            let mut count = 0u32;
+            while start.elapsed() < Duration::from_millis(300) {
+                compress_bc7(black_box(&input), side, side, 1, black_box(&mut output));
+                black_box(&output);
+                count += 1;
+            }
+            println!(
+                "side={side} BC7 trial={trial} us={:.3}",
                 start.elapsed().as_secs_f64() * 1e6 / f64::from(count)
             );
         }

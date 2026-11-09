@@ -226,6 +226,8 @@ const GL_COMPRESSED_RGBA_S3TC_DXT1_EXT: u32 = 0x83F1;
 const GL_COMPRESSED_RGBA_S3TC_DXT5_EXT: u32 = 0x83F3;
 const GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT: u32 = 0x8C4D;
 const GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT: u32 = 0x8C4F;
+const GL_COMPRESSED_RGBA_BPTC_UNORM: u32 = 0x8E8C;
+const GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM: u32 = 0x8E8D;
 
 /// Port of upstream `IsAstcRecompressionEnabled()`.
 fn is_astc_recompression_enabled() -> bool {
@@ -248,6 +250,13 @@ fn select_astc_format(_format: PixelFormat, is_srgb: bool) -> u32 {
                 GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT
             } else {
                 GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
+            }
+        }
+        common::settings_enums::AstcRecompression::Bc7 => {
+            if is_srgb {
+                GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM
+            } else {
+                GL_COMPRESSED_RGBA_BPTC_UNORM
             }
         }
         common::settings_enums::AstcRecompression::Uncompressed => {

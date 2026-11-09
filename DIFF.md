@@ -25476,3 +25476,151 @@ Integrated runtime validation: full cargo test -p video_core -- --test-threads=1
 
 ### Binary layout verification
 - n/a (profiling-only).
+
+## 2026-11-09 - BC7 ASTC recompression target (ruzu extension, feat/nx2-astc-bc7)
+
+### Intentional differences
+- AstcRecompression gains a Bc7 variant beyond Eden's Uncompressed/Bc1/Bc3,
+  appended so ini values 0..=2 keep their upstream meaning. The NX2 session
+  policy still rewrites only a configured Uncompressed to Bc3; an explicit
+  Bc1/Bc3/Bc7 is preserved. Plumbing covers the setting bounds, Vulkan
+  (BC7_UNORM/SRGB_BLOCK), OpenGL (BPTC), compressed-size estimation
+  (16 bytes/block like BC3), the texture-cache conversion path and the
+  frontend label.
+- textures/bcn_shim.cpp implements an analytical real-time BC7 mode 6
+  encoder in the spirit of Basis Universal's transcoder-internal real-time
+  encoders: principal-axis projection (seeded by the farthest-from-mean
+  pixel so the seed can never be orthogonal to the block's dominant
+  direction), one closed-form least-squares endpoint refinement, scalar
+  index re-projection against the quantized endpoints, anchor-index swap.
+  No mode or partition search. RUZU_BC7_FAST=0 selects the vendored
+  searching encoder instead (externals/bc7enc, Rich Geldreich, MIT/public
+  domain, same vendoring pattern as stb_dxt) for offline-grade quality.
+- Measured on the BC3 microbenchmark grid (1024^2 random RGBA): BC3 4.3 ms,
+  analytical BC7 4.1 ms, bc7enc search profile 77 ms. First-race driving on
+  Mario Kart World: analytical BC7 13.94 FPS mean with 1 sample under 5 FPS
+  and 0.88 s worst frame, versus BC3 14.05 FPS with 8 samples under 5 FPS
+  and 1.26 s worst frame; BC1 was rejected by the user on quality.
+- Validation: bcn tests include a mode 6 reference decoder round-trip
+  (gradient mean abs error < 6, constant block within 2) and a determinism
+  check; surface size tests cover Bc7.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Mode 6 only: smooth-gradient blocks may band slightly versus multi-mode
+  encoders; revisit with mode 5 selection if observed in play.
+
+### Binary layout verification
+- BC7 blocks validated against a specification-derived mode 6 decoder in
+  unit tests; GPU rendering visually verified in-race.
+
+## 2026-11-09 - pipeline boot decomposition counters (Rust diagnostic)
+
+### Intentional differences
+- nx2_profile gains two always-on cumulative counters (TRANSLATE_NS,
+  VKCREATE_NS; one relaxed atomic add per pipeline build) around frontend
+  translation and vkCreate*Pipelines, reported in the existing Total
+  Pipeline Count line. Measured: 24.7k pipelines, 262 s wall boot,
+  translate 934 s and vkCreate 2302 s cumulative worker time - the AMD
+  Windows driver recompiles every pipeline each boot (serialized
+  VkPipelineCache data is 2.9 MB for 24.7k pipelines).
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None; measurement only.
+
+### Binary layout verification
+- n/a.
+
+## 2026-11-09 - thread_worker helping wait and VRAM-aware session ASTC policy
+
+### Intentional differences
+- common/thread_worker.rs gains wait_for_requests_helping() on the stateless
+  pool: the caller drains queued tasks itself instead of parking, then falls
+  back to wait_for_requests for tasks already running on workers. Upstream
+  WaitForRequests parks the caller; stack sampling showed the GPU command
+  thread parked there ~13% of its time during texture conversion. Each task
+  still runs exactly once. The helper notifies wait_condition after each
+  task it completes: workers only notify when they observe an empty queue,
+  so a helper finishing the final outstanding task must wake concurrent
+  waiters itself (regression test; the initial version deadlocked the bcn
+  test suite exactly this way). textures/bcn.rs and textures/astc.rs call
+  the helping variant from their conversion entry points.
+- The NX2 session ASTC policy becomes VRAM-aware: the Vulkan device
+  publishes its largest device-local heap size (discrete GPUs only) into
+  runtime-only settings at creation, and a configured Uncompressed mode is
+  kept when the session device has at least 11 GiB of dedicated VRAM
+  (covering 12 GB boards) instead of being rewritten to Bc3. Explicit
+  Bc1/Bc3/Bc7 choices are never rewritten. System clears the published size
+  with the session flag at teardown. Uncompressed on large-VRAM cards keeps
+  full quality and halves conversion cost (ASTC decode only, no block
+  recompression) at 4x the VRAM footprint.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- The Uncompressed VRAM threshold is a heuristic, not a measured working-set
+  bound for any particular title.
+
+### Binary layout verification
+- n/a (host scheduling and host policy only).
+
+## 2026-11-09 - texture_cache/converted_cache.rs disk cache for converted ASTC textures (ruzu extension)
+
+### Intentional differences
+- New file with no Eden counterpart (documented per-folder exception). ASTC
+  decode plus BCn recompression runs inline in the upload path and was
+  measured as the dominant first-encounter stall source; nothing upstream
+  persists the converted payloads, so every session repays the conversion.
+  convert_image now looks up each ASTC copy in an append-only per-title
+  disk store (converted_textures.{idx,bin} beside the title's shader cache)
+  keyed by CityHash64 of the exact ASTC source bytes plus dimensions, layer
+  count and the target recompression mode; hits copy the stored payload and
+  skip decode and recompression entirely, misses convert as before and
+  enqueue the payload to a dedicated writer thread. Incomplete index records
+  (data shorter than recorded) are ignored at load; a version header
+  invalidates wholesale; a 16 GiB cap stops persistence with one warning;
+  RUZU_TEXTURE_CONVERSION_CACHE=0 disables the cache; a title change within
+  one process bypasses the store rather than mixing titles. Uncompressed
+  conversions are not cached (4x payloads; decode-only cost).
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- No eviction beyond the size cap; no cross-title sharing.
+
+### Binary layout verification
+- Cache files are host-private and versioned; the uploaded payload bytes on
+  a hit are the exact bytes a miss would produce (same converter output,
+  verified by the round-trip unit test and runtime hit-path validation).
+
+## 2026-11-09 - BC7F encoder evaluation (ctt-bc7f crate; evaluated and removed)
+
+### Intentional differences
+- Basis Universal's portable analytical BC7F encoder was wired in behind the
+  ctt-bc7f 0.6.1 crate, benchmarked and quality-compared against the in-tree
+  analytical mode 6 encoder, then removed: at the speed-equivalent profile
+  (trivial mode 6) the in-tree encoder produced 12% lower total squared
+  error on a mixed block set (gradients, hard edges, noise, alpha ramps;
+  2,089,999 versus 2,366,820 through the reference mode 6 decoder), and the
+  microbenchmark showed no speed win (in-tree ~5.3 ms versus BC7F fastest
+  ~5.0 ms per 1024x1024, both measured with a background emulator session
+  inflating absolute values). BC7F's higher-quality multi-subset profile
+  costs about 3x and was not adopted; revisit only if mode 6 banding is
+  observed in play, where the converted-texture disk cache would absorb the
+  one-time cost. No dependency or code path remains.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- n/a (evaluation only; the in-tree encoder's mode 6 round-trip test stands).

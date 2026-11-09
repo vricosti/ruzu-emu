@@ -225,6 +225,10 @@ pub struct Values {
     /// Runtime-only NX2 texture policy; excluded from setting linkage/serialization.
     /// System sets it before GPU creation and clears it after GPU teardown.
     pub use_session_astc_recompression: bool,
+    /// Runtime-only dedicated VRAM of the session's render device in bytes;
+    /// 0 while unknown. The renderer publishes it at device creation so the
+    /// session ASTC policy can keep Uncompressed on large-VRAM cards.
+    pub session_device_vram_bytes: u64,
     pub vram_usage_mode: SwitchableSetting<VramUsageMode>,
     pub sync_memory_operations: SwitchableSetting<bool>,
     pub renderer_force_max_clock: SwitchableSetting<bool>,
@@ -400,9 +404,23 @@ pub struct Values {
 impl Values {
     /// Session extension of the upstream ASTC setting. All render consumers
     /// must use the same effective mode for format, byte size and conversion.
+    ///
+    /// The NX2 session policy exists to avoid VRAM exhaustion from 4x-sized
+    /// uncompressed ASTC replacements. Cards with enough dedicated VRAM keep
+    /// the configured Uncompressed mode: perfect quality, and texture
+    /// conversion drops to ASTC decode only (no block recompression).
     pub fn effective_astc_recompression(&self) -> AstcRecompression {
+        // 11 GiB catches 12 GB boards whose device-local heap reports
+        // slightly under the nominal size.
+        const UNCOMPRESSED_SESSION_VRAM_BYTES: u64 = 11 * 1024 * 1024 * 1024;
         match *self.astc_recompression.get_value() {
-            AstcRecompression::Uncompressed if self.use_session_astc_recompression => AstcRecompression::Bc3,
+            AstcRecompression::Uncompressed if self.use_session_astc_recompression => {
+                if self.session_device_vram_bytes >= UNCOMPRESSED_SESSION_VRAM_BYTES {
+                    AstcRecompression::Uncompressed
+                } else {
+                    AstcRecompression::Bc3
+                }
+            }
             configured => configured,
         }
     }
@@ -1146,10 +1164,11 @@ impl Default for Values {
                 RendererAdvanced,
             ),
             use_session_astc_recompression: false,
+            session_device_vram_bytes: 0,
             astc_recompression: SwitchableSetting::ranged(
                 AstcRecompression::Uncompressed,
                 AstcRecompression::Uncompressed,
-                AstcRecompression::Bc3,
+                AstcRecompression::Bc7,
                 "astc_recompression",
                 RendererAdvanced,
             ),
@@ -1620,9 +1639,45 @@ impl Default for Values {
 
 // ── Free functions matching C++ Settings:: namespace ────────────────────────
 
+/// Lock-free published copies of the per-command-list refreshed GPU levels.
+/// Upstream reads `Settings::values` as a plain global on hot paths (per DMA
+/// read, per memory operation); these atomics give Rust hot paths the same
+/// cost while `UpdateGPUAccuracy` remains the single refresh point.
+static GPU_LEVEL_HIGH_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static DMA_SAFE_READS_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Recompute the published GPU-level atomics from the given values. Called by
+/// `update_gpu_accuracy`; tests that write `current_gpu_accuracy` directly
+/// republish through this to keep the lock-free readers coherent.
+pub fn republish_gpu_levels(values: &Values) {
+    let high = values.current_gpu_accuracy == GpuAccuracy::High;
+    let safe_reads = if is_dma_level_default(values) {
+        high
+    } else {
+        is_dma_level_safe(values)
+    };
+    GPU_LEVEL_HIGH_PUBLISHED.store(high, std::sync::atomic::Ordering::Relaxed);
+    DMA_SAFE_READS_PUBLISHED.store(safe_reads, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Update `current_gpu_accuracy` from the switchable setting.
 pub fn update_gpu_accuracy(values: &mut Values) {
     values.current_gpu_accuracy = *values.gpu_accuracy.get_value();
+    republish_gpu_levels(values);
+}
+
+/// Lock-free `IsGPULevelHigh` for hot paths, refreshed by `update_gpu_accuracy`.
+pub fn is_gpu_level_high_published() -> bool {
+    GPU_LEVEL_HIGH_PUBLISHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lock-free "DMA reads must be safe" (upstream's IsDMALevelDefault ?
+/// IsGPULevelHigh : IsDMALevelSafe combination), refreshed by
+/// `update_gpu_accuracy`.
+pub fn dma_reads_are_safe_published() -> bool {
+    DMA_SAFE_READS_PUBLISHED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Returns true if GPU accuracy is High.
@@ -2271,6 +2326,36 @@ mod tests {
     }
 
     #[test]
+    fn session_astc_policy_keeps_uncompressed_on_large_vram() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut values = Values::default();
+        values
+            .astc_recompression
+            .set_value(AstcRecompression::Uncompressed);
+        values.use_session_astc_recompression = true;
+        values.session_device_vram_bytes = 8 * GIB;
+        assert_eq!(values.effective_astc_recompression(), AstcRecompression::Bc3);
+        values.session_device_vram_bytes = 12 * GIB;
+        assert_eq!(
+            values.effective_astc_recompression(),
+            AstcRecompression::Uncompressed
+        );
+        // Explicit recompression modes are never rewritten.
+        values.astc_recompression.set_value(AstcRecompression::Bc7);
+        values.session_device_vram_bytes = 0;
+        assert_eq!(values.effective_astc_recompression(), AstcRecompression::Bc7);
+        // Outside an NX2 session the configured value passes through.
+        values
+            .astc_recompression
+            .set_value(AstcRecompression::Uncompressed);
+        values.use_session_astc_recompression = false;
+        assert_eq!(
+            values.effective_astc_recompression(),
+            AstcRecompression::Uncompressed
+        );
+    }
+
+    #[test]
     fn gpu_level_high_only_matches_high() {
         let mut values = Values::default();
         values.current_gpu_accuracy = GpuAccuracy::High;
@@ -2380,12 +2465,25 @@ mod tests {
         update_gpu_accuracy(&mut values);
 
         assert_eq!(values.current_gpu_accuracy, GpuAccuracy::Low);
+        assert!(!is_gpu_level_high_published());
+        // DMA Default follows the GPU level for the published safe-reads bit.
+        assert!(!dma_reads_are_safe_published());
 
         values.gpu_accuracy.set_value(GpuAccuracy::High);
         update_gpu_accuracy(&mut values);
 
         assert_eq!(values.current_gpu_accuracy, GpuAccuracy::High);
         assert!(is_gpu_level_high(&values));
+        assert!(is_gpu_level_high_published());
+        assert!(dma_reads_are_safe_published());
+
+        values.dma_accuracy.set_value(DmaAccuracy::Unsafe);
+        update_gpu_accuracy(&mut values);
+        assert!(!dma_reads_are_safe_published());
+
+        values.dma_accuracy.set_value(DmaAccuracy::Safe);
+        update_gpu_accuracy(&mut values);
+        assert!(dma_reads_are_safe_published());
     }
 
     #[test]

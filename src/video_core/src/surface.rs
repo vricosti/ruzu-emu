@@ -1040,7 +1040,8 @@ pub fn transcoded_astc_size(base_size: u64, format: PixelFormat) -> u64 {
 
     match common::settings::values().effective_astc_recompression() {
         common::settings_enums::AstcRecompression::Bc1 => uncompressed_size / 8,
-        common::settings_enums::AstcRecompression::Bc3 => uncompressed_size / 4,
+        common::settings_enums::AstcRecompression::Bc3
+        | common::settings_enums::AstcRecompression::Bc7 => uncompressed_size / 4,
         common::settings_enums::AstcRecompression::Uncompressed => uncompressed_size,
     }
 }
@@ -1259,6 +1260,7 @@ mod tests {
             (AstcRecompression::Uncompressed, 64),
             (AstcRecompression::Bc1, 8),
             (AstcRecompression::Bc3, 16),
+            (AstcRecompression::Bc7, 16),
         ] {
             common::settings::values_mut()
                 .astc_recompression

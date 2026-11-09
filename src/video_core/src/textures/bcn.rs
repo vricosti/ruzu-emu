@@ -23,6 +23,7 @@ type BcnCompressor = fn(block_output: &mut [u8], block_input: &[u8], any_alpha: 
 extern "C" {
     fn ruzu_stb_compress_bc1_block(dest: *mut u8, src: *const u8, alpha: i32);
     fn ruzu_stb_compress_bc3_block(dest: *mut u8, src: *const u8);
+    fn ruzu_bc7enc_compress_block(dest: *mut u8, src: *const u8);
 }
 
 // ── Internal ─────────────────────────────────────────────────────────────────
@@ -32,14 +33,16 @@ extern "C" {
 /// Port of the `CompressBCN<BytesPerBlock, ThresholdAlpha>` template from `bcn.cpp`.
 ///
 /// Iterates over 4x4 blocks, gathers RGBA texels, and calls the compressor `f`.
-fn compress_bcn<const BYTES_PER_BLOCK: u32, const THRESHOLD_ALPHA: bool>(
+fn compress_bcn<const BYTES_PER_BLOCK: u32, const THRESHOLD_ALPHA: bool, F>(
     data: &[u8],
     width: u32,
     height: u32,
     depth: u32,
     output: &mut [u8],
-    f: BcnCompressor,
-) {
+    f: F,
+) where
+    F: Fn(&mut [u8], &[u8], bool) + Send + Copy + 'static,
+{
     const ALPHA_THRESHOLD: u8 = 128;
     const BYTES_PER_PX: u32 = 4;
 
@@ -138,7 +141,7 @@ fn compress_bcn<const BYTES_PER_BLOCK: u32, const THRESHOLD_ALPHA: bool>(
                 }
             });
         }
-        workers.wait_for_requests();
+        workers.wait_for_requests_helping();
     }
 }
 
@@ -148,7 +151,7 @@ fn compress_bcn<const BYTES_PER_BLOCK: u32, const THRESHOLD_ALPHA: bool>(
 ///
 /// Port of `Tegra::Texture::BCN::CompressBC1`.
 pub fn compress_bc1(data: &[u8], width: u32, height: u32, depth: u32, output: &mut [u8]) {
-    compress_bcn::<8, true>(
+    compress_bcn::<8, true, _>(
         data,
         width,
         height,
@@ -164,11 +167,29 @@ pub fn compress_bc1(data: &[u8], width: u32, height: u32, depth: u32, output: &m
     );
 }
 
+/// Compress RGBA8 data into BC7 format.
+///
+/// ruzu extension beyond Eden's BCN set: same 16-byte blocks and dispatch as
+/// `compress_bc3`, encoded with the vendored bc7enc encoder for much higher
+/// quality at a higher one-time CPU cost.
+pub fn compress_bc7(data: &[u8], width: u32, height: u32, depth: u32, output: &mut [u8]) {
+    compress_bcn::<16, false, _>(
+        data,
+        width,
+        height,
+        depth,
+        output,
+        |block_output, block_input, _any_alpha| unsafe {
+            ruzu_bc7enc_compress_block(block_output.as_mut_ptr(), block_input.as_ptr());
+        },
+    );
+}
+
 /// Compress RGBA8 data into BC3 format.
 ///
 /// Port of `Tegra::Texture::BCN::CompressBC3`.
 pub fn compress_bc3(data: &[u8], width: u32, height: u32, depth: u32, output: &mut [u8]) {
-    compress_bcn::<16, false>(
+    compress_bcn::<16, false, _>(
         data,
         width,
         height,
@@ -294,6 +315,91 @@ mod tests {
         }
 
         assert_eq!(threaded, independently_compressed);
+    }
+
+    #[test]
+    fn bc7_produces_nonzero_blocks_of_sixteen_bytes() {
+        let mut rgba = vec![0u8; 8 * 8 * 4];
+        for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+            pixel.copy_from_slice(&[index as u8, 255 - index as u8, 64, 255]);
+        }
+        let mut output = [0u8; 4 * 16];
+        compress_bc7(&rgba, 8, 8, 1, &mut output);
+        for block in output.chunks_exact(16) {
+            assert_ne!(block, [0u8; 16]);
+        }
+        // Deterministic for identical input and parameters.
+        let mut second = [0u8; 4 * 16];
+        compress_bc7(&rgba, 8, 8, 1, &mut second);
+        assert_eq!(output, second);
+    }
+
+    /// Reference BC7 mode 6 decoder for validating the analytical encoder.
+    fn decode_bc7_mode6(block: &[u8; 16]) -> [[u8; 4]; 16] {
+        const WEIGHTS4: [u32; 16] =
+            [0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64];
+        let lo = u64::from_le_bytes(block[0..8].try_into().unwrap());
+        let hi = u64::from_le_bytes(block[8..16].try_into().unwrap());
+        let get = |start: u32, count: u32| -> u32 {
+            let mut v = 0u32;
+            for i in 0..count {
+                let bit = start + i;
+                let b = if bit < 64 { (lo >> bit) & 1 } else { (hi >> (bit - 64)) & 1 };
+                v |= (b as u32) << i;
+            }
+            v
+        };
+        assert_eq!(get(0, 7), 1 << 6, "mode 6 tag");
+        let mut e = [[0u32; 2]; 4];
+        for c in 0..4 {
+            e[c][0] = get(7 + c as u32 * 14, 7);
+            e[c][1] = get(14 + c as u32 * 14, 7);
+        }
+        let p0 = get(63, 1);
+        let p1 = get(64, 1);
+        let mut out = [[0u8; 4]; 16];
+        for i in 0..16 {
+            let idx = if i == 0 { get(65, 3) } else { get(68 + (i as u32 - 1) * 4, 4) };
+            let w = WEIGHTS4[idx as usize];
+            for c in 0..4 {
+                let a = (e[c][0] << 1) | p0;
+                let b = (e[c][1] << 1) | p1;
+                out[i][c] = (((64 - w) * a + w * b + 32) >> 6) as u8;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn bc7_analytical_mode6_decodes_close_to_source() {
+        // Gradient block: the analytical encoder must reproduce it closely.
+        let mut rgba = [0u8; 64];
+        for i in 0..16 {
+            let v = (i * 16) as u8;
+            rgba[i * 4..i * 4 + 4].copy_from_slice(&[v, 255 - v, 128, 255]);
+        }
+        let mut block = [0u8; 16];
+        unsafe { ruzu_bc7enc_compress_block(block.as_mut_ptr(), rgba.as_ptr()) };
+        let decoded = decode_bc7_mode6(&block);
+        let mut total_err = 0u32;
+        for i in 0..16 {
+            for c in 0..4 {
+                total_err += (decoded[i][c] as i32 - rgba[i * 4 + c] as i32).unsigned_abs();
+            }
+        }
+        let mean_err = total_err as f32 / 64.0;
+        assert!(mean_err < 6.0, "mean abs error {mean_err} too high");
+
+        // Constant block must decode essentially exactly.
+        let flat = [[17u8, 200, 40, 255]; 16];
+        let flat_bytes: Vec<u8> = flat.iter().flatten().copied().collect();
+        unsafe { ruzu_bc7enc_compress_block(block.as_mut_ptr(), flat_bytes.as_ptr()) };
+        let decoded = decode_bc7_mode6(&block);
+        for texel in decoded {
+            for c in 0..4 {
+                assert!((texel[c] as i32 - flat[0][c] as i32).abs() <= 2);
+            }
+        }
     }
 
     #[test]

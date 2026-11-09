@@ -522,9 +522,14 @@ impl ComputePipeline {
                     .stage(stage_ci)
                     .layout(pipeline_layout);
 
-                if let Ok(pipelines) =
-                    unsafe { device.create_compute_pipelines(pipeline_cache, &[ci], None) }
-                {
+                let vkcreate_start = std::time::Instant::now();
+                let creation_result =
+                    unsafe { device.create_compute_pipelines(pipeline_cache, &[ci], None) };
+                crate::nx2_profile::VKCREATE_NS.fetch_add(
+                    vkcreate_start.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Ok(pipelines) = creation_result {
                     let created = pipelines[0];
                     *pipeline.lock().unwrap() = created;
                     if is_active() {

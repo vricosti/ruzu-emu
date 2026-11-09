@@ -2174,7 +2174,11 @@ impl System {
         self.app_loader = None;
         // Upstream: gpu_core.reset();
         self.gpu_core = None;
-        common::settings::values_mut().use_session_astc_recompression = false;
+        {
+            let mut values = common::settings::values_mut();
+            values.use_session_astc_recompression = false;
+            values.session_device_vram_bytes = 0;
+        }
         // Upstream: host1x_core.reset();
         self.host1x_core = None;
 

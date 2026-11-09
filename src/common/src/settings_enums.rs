@@ -277,6 +277,11 @@ settings_enum! {
         Uncompressed,
         Bc1,
         Bc3,
+        // ruzu extension beyond Eden's enum: BC7 keeps BC3's 16-byte blocks
+        // and VRAM footprint with far higher quality, at a higher one-time
+        // CPU encoding cost (bc7enc). Appended so ini values 0..=2 keep
+        // their upstream meaning.
+        Bc7,
     }
 }
 

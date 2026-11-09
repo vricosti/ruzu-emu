@@ -636,6 +636,13 @@ pub fn surface_format(
                     vk::Format::BC3_UNORM_BLOCK
                 };
             }
+            common::settings_enums::AstcRecompression::Bc7 => {
+                info.format = if is_srgb {
+                    vk::Format::BC7_SRGB_BLOCK
+                } else {
+                    vk::Format::BC7_UNORM_BLOCK
+                };
+            }
         }
     }
 

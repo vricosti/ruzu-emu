@@ -2143,7 +2143,7 @@ impl RasterizerInterface for MetalRasterizer {
                 return true;
             }
         }
-        if !common::settings::is_gpu_level_high(&common::settings::values()) {
+        if !common::settings::is_gpu_level_high_published() {
             return false;
         }
         if which.contains(CacheType::TEXTURE_CACHE) {
@@ -2288,7 +2288,7 @@ impl RasterizerInterface for MetalRasterizer {
     }
 
     fn flush_and_invalidate_region(&mut self, addr: u64, size: u64, which: CacheType) {
-        if common::settings::is_gpu_level_high(&common::settings::values()) {
+        if common::settings::is_gpu_level_high_published() {
             self.flush_region(addr, size, which);
         }
         self.invalidate_region(addr, size, which);

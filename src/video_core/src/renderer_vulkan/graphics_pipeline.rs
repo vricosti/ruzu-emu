@@ -1882,13 +1882,19 @@ impl GraphicsPipeline {
             .render_pass(render_pass)
             .subpass(0);
 
-        match unsafe {
+        let vkcreate_start = std::time::Instant::now();
+        let creation_result = unsafe {
             build
                 .device_owner
                 .get()
                 .get_logical()
                 .create_graphics_pipelines(build.pipeline_cache, &[pipeline_info], None)
-        } {
+        };
+        crate::nx2_profile::VKCREATE_NS.fetch_add(
+            vkcreate_start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        match creation_result {
             Ok(pipelines) => {
                 let created = pipelines[0];
                 *pipeline_state.lock().unwrap() = created;

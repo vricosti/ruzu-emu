@@ -1061,6 +1061,43 @@ pub fn convert_image(
                 .wrapping_mul(surface::bytes_per_block(
                     surface::PixelFormat::A8B8G8R8Unorm,
                 ));
+
+            // The ASTC source size for this copy: one 16-byte block per tile.
+            let source_blocks = copy
+                .image_extent
+                .width
+                .div_ceil(tile_size.width)
+                .wrapping_mul(copy.image_extent.height.div_ceil(tile_size.height))
+                .wrapping_mul(depth_layers) as usize;
+            let source_len = source_blocks * 16;
+            let aligned_plane_dim = align_up(copy.image_extent.width, 4)
+                .wrapping_mul(align_up(copy.image_extent.height, 4));
+            let converted_size = (aligned_plane_dim
+                .wrapping_mul(copy.image_extent.depth)
+                .wrapping_mul(copy.image_subresource.num_layers as u32)
+                / bpp_div) as usize;
+
+            let cache_key = input
+                .get(input_offset..input_offset + source_len)
+                .map(|source| {
+                    super::converted_cache::key_for(
+                        source,
+                        copy.image_extent.width,
+                        copy.image_extent.height,
+                        depth_layers,
+                        recompression,
+                    )
+                });
+            if let Some(key) = cache_key {
+                if super::converted_cache::get(&key, &mut output[output_offset as usize..])
+                    == Some(converted_size)
+                {
+                    copy.buffer_size = converted_size;
+                    output_offset = output_offset.wrapping_add(converted_size as u32);
+                    continue;
+                }
+            }
+
             decode_scratch.resize_destructive(level_size as usize);
 
             crate::textures::astc::decompress(
@@ -1073,30 +1110,43 @@ pub fn convert_image(
                 &mut decode_scratch,
             );
 
-            if recompression == common::settings_enums::AstcRecompression::Bc1 {
-                crate::textures::bcn::compress_bc1(
-                    &decode_scratch,
-                    copy.image_extent.width,
-                    copy.image_extent.height,
-                    depth_layers,
-                    &mut output[output_offset as usize..],
-                );
-            } else {
-                crate::textures::bcn::compress_bc3(
-                    &decode_scratch,
-                    copy.image_extent.width,
-                    copy.image_extent.height,
-                    depth_layers,
-                    &mut output[output_offset as usize..],
-                );
+            match recompression {
+                common::settings_enums::AstcRecompression::Bc1 => {
+                    crate::textures::bcn::compress_bc1(
+                        &decode_scratch,
+                        copy.image_extent.width,
+                        copy.image_extent.height,
+                        depth_layers,
+                        &mut output[output_offset as usize..],
+                    );
+                }
+                common::settings_enums::AstcRecompression::Bc7 => {
+                    crate::textures::bcn::compress_bc7(
+                        &decode_scratch,
+                        copy.image_extent.width,
+                        copy.image_extent.height,
+                        depth_layers,
+                        &mut output[output_offset as usize..],
+                    );
+                }
+                _ => {
+                    crate::textures::bcn::compress_bc3(
+                        &decode_scratch,
+                        copy.image_extent.width,
+                        copy.image_extent.height,
+                        depth_layers,
+                        &mut output[output_offset as usize..],
+                    );
+                }
             }
 
-            let aligned_plane_dim = align_up(copy.image_extent.width, 4)
-                .wrapping_mul(align_up(copy.image_extent.height, 4));
-            copy.buffer_size = (aligned_plane_dim
-                .wrapping_mul(copy.image_extent.depth)
-                .wrapping_mul(copy.image_subresource.num_layers as u32)
-                / bpp_div) as usize;
+            copy.buffer_size = converted_size;
+            if let Some(key) = cache_key {
+                super::converted_cache::put(
+                    key,
+                    &output[output_offset as usize..output_offset as usize + converted_size],
+                );
+            }
             output_offset = output_offset.wrapping_add(copy.buffer_size as u32);
         } else {
             crate::texture_cache::decode_bc::decompress_bcn(

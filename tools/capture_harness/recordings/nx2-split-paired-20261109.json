@@ -304,5 +304,156 @@
     },
     "coherent_picture": "first-race BC3 14.05 with stalls (conversion burst) / first-race BC1 17.41 nearly stall-free / warm-texture BC3 19.42 stall-free: texture conversion dominates first-encounter driving cost",
     "user_decision": "BC1 rejected on quality (severe blocking); user requested BC7 as the recompression target on a dedicated branch"
+  },
+  "bc7_analytical_slice": {
+    "branch": "feat/nx2-astc-bc7",
+    "microbench_1024_ms": {
+      "bc3": 4.3,
+      "bc7_analytical": 4.1,
+      "bc7enc_search": 77.0
+    },
+    "first_race_driving": {
+      "bc7_analytical": {
+        "mean_fps": 13.942160679584232,
+        "p10_fps": 8.989564204361951,
+        "below_5fps": 1,
+        "zero_fps": 0,
+        "worst_frame_s": 0.8801846
+      },
+      "bc3_reference": {
+        "mean_fps": 14.050120234422854,
+        "below_5fps": 8,
+        "worst_frame_s": 1.2589502
+      }
+    },
+    "visual": "in-race screenshot clean (no BC1-style blocking); user full-resolution judgment pending",
+    "config": "per-title astc_recompression=3 left active for user evaluation; revert = set 2",
+    "encoder_bug_fixed": "power-iteration seed could be orthogonal to the block's dominant direction (test gradient collapsed to mean); now seeded by farthest-from-mean pixel with regression test",
+    "warm_window_attempt": {
+      "mean_fps": 13.575450513068665,
+      "below_5fps": 11,
+      "worst_frame_s": 0.6266573,
+      "validity": "inconclusive: race phase differed from the warm BC3 19.42 window (ongoing first race around the kart versus a freshly restarted race); the hold-A harness scene noise (+/-3 FPS) is reached. Robust BC7 evidence remains the matched first-race pair and the microbenchmark."
+    }
+  },
+  "boot_decomposition": {
+    "binary": "5da8a88c (adds cumulative translate/vkcreate counters to the Total Pipeline Count log)",
+    "measurement": "24701 pipelines, 262 s wall boot, ~15 workers (~3900 cumulative worker-seconds)",
+    "translate_cumulative_s": 934.3,
+    "vkcreate_cumulative_s": 2302.2,
+    "reading": "vkCreate*Pipelines dominates (59% of worker time, ~93 ms/pipeline) despite the driver pipeline cache being loaded; vulkan_pipelines.bin is only 2.9 MB for 24.7k pipelines - the AMD Windows driver returns almost no reusable cache data, so every boot pays full driver compilation (known AMD+yuzu-family behavior). Frontend translation is 24%; SPIR-V persistence alone would thus cut at most ~a quarter of the boot.",
+    "options": [
+      "User-side: check AMD Adrenalin shader cache setting / driver updates",
+      "use_disk_shader_cache=false: near-instant boot, compile-on-demand during play with async shaders (heavy first-play pop-in)",
+      "Reduce pipeline count growth (dedupe keys) - design slice",
+      "SPIR-V persistence: addresses only the 24% translation share"
+    ]
+  },
+  "native_stack_profile": {
+    "method": "100 brief CDB attach/detach snapshots of all threads at the race grid (release PDB symbols); GPU thread identified per sample by its run-loop frames; raw dump archived as nx2-gpu-thread-stack-samples-20261109.txt",
+    "gpu_thread_samples": 99,
+    "leaf_highlights": {
+      "futex_condvar_parking_waits": "~30% (includes waiting on BCN compression workers via StatefulThreadWorker::wait_for_requests ~13%, and parking_lot contention)",
+      "alloc": "5-6%",
+      "settings_values_rwlock": "appears as leaf; common::settings::values() takes a std RwLock per read while upstream reads a plain global"
+    },
+    "inclusive_highlights": {
+      "prepare_draw": 28,
+      "draw": 26,
+      "configure_impl": 18,
+      "lock_slow_contention": 15,
+      "wait_for_requests_on_bcn_workers": 12,
+      "compress_bcn": 9,
+      "dispatch_calls": 9
+    },
+    "hot_settings_readers_confirmed": [
+      "vk_rasterizer::must_flush_region / flush_and_invalidate_region (per DMA memory operation)",
+      "texture_cache upload path (gpu_unswizzle_enabled, resolution_info clones)",
+      "query cache / fence manager per report"
+    ],
+    "next_slices_designed": [
+      "1. Session-snapshot hot settings (accuracy, unswizzle, resolution_info, fence behavior) into their GPU owners or lock-free published copies, respecting Eden's runtime-modifiable accuracy via the existing update propagation",
+      "2. Let the conversion-calling thread execute queued BCN rows instead of pure wait_for_requests (work participation), or route conversions through the async decode queue",
+      "3. Find and remove hot-path allocations (alloc 5-6% leaf) in draw preparation"
+    ]
+  },
+  "helping_wait_and_vram_policy_slice": {
+    "binary": "fb5b8676",
+    "changes": [
+      "thread_worker wait_for_requests_helping: the conversion-calling thread drains queued BCN/ASTC tasks instead of parking (DIFF.md 2026-11-09); a missed-wakeup deadlock in the first version (helper finishing the final task never notified parked waiters) was caught by the hung bcn suite, root-caused via CDB stacks, fixed and regression-tested",
+      "VRAM-aware session ASTC policy: configured Uncompressed is kept on discrete GPUs with >= 11 GiB device-local VRAM; runtime log confirms '7920 MiB device-local VRAM: Bc3' on this 8 GB card"
+    ],
+    "first_race_bc3_driving": {
+      "helping_build": {
+        "mean_fps": 13.32,
+        "below_5fps": 5,
+        "zero_fps": 0,
+        "worst_frame_s": 1.179
+      },
+      "pre_helping_reference": {
+        "mean_fps": 14.05,
+        "below_5fps": 8,
+        "zero_fps": 0,
+        "worst_frame_s": 1.259
+      },
+      "reading": "stall counts and worst frame improve modestly (8->5 samples under 5 FPS, 1.26->1.18 s); mean within route noise. Consistent with converting ~13% wait into ~1/(workers+1) extra throughput during conversion bursts."
+    },
+    "tests": "video_core 1792 passed / 0 failed / 1 ignored; common 440; settings VRAM-policy and helping regression tests added"
+  },
+  "converted_texture_disk_cache": {
+    "binary": "431e647f",
+    "design": "append-only per-title store beside the shader cache (converted_textures.idx/bin), keyed by CityHash64 of the exact ASTC source bytes + dims + layers + target mode; dedicated writer thread; 4 GiB cap; version header; RUZU_TEXTURE_CONVERSION_CACHE=0 kill switch; title mismatch bypasses (DIFF.md 2026-11-09)",
+    "population_session_first_race_bc7": {
+      "mean_fps": 18.3,
+      "below_5fps": 1,
+      "worst_frame_s": 0.17,
+      "note": "already improved because in-race re-uploads of VRAM-evicted textures hit the cache instead of reconverting"
+    },
+    "cross_session_first_race_bc7": {
+      "mean_fps": 17.67,
+      "p10_fps": 14.98,
+      "below_10fps": 1,
+      "below_5fps": 0,
+      "worst_frame_s": 0.212,
+      "stalls": 0
+    },
+    "store_size": "37644 entries / 3469 MiB after one race (cap 4 GiB reached quickly: MKW texture volume)",
+    "baselines_first_race": {
+      "bc3_no_cache": {
+        "mean": 14.05,
+        "below5": 8,
+        "worst_s": 1.26
+      },
+      "bc7_no_cache": {
+        "mean": 13.94,
+        "below5": 1,
+        "worst_s": 0.88
+      }
+    },
+    "conclusion": "First-encounter texture-conversion stalls eliminated (+26% first-race mean, worst frame 1.26 -> 0.21 s) with BC7 quality; visual check clean",
+    "follow_up": "size cap hit within one race - consider raising the cap or compressing the store; cache covers BCn targets only"
+  },
+  "hot_allocation_analysis": {
+    "method": "caller attribution of alloc/RawVec frames in the archived 100-sample CDB stack dump",
+    "finding": "187/209 alloc stacks are ThreadWorker task boxing (Box<dyn FnOnce> per queued BCN/ASTC row - upstream heap-allocates std::function identically); the rest are memory_manager range-set operations (~1-2%, upstream boost::icl also allocates)",
+    "conclusion": "No port divergence to fix; the dominant alloc source ran during conversion bursts, which the converted-texture disk cache now removes on hits. Slice closed by analysis.",
+    "remaining_design_slices": [
+      "Split rehabilitation: requires reducing per-draw back-side cost (fill image views descriptor visiting), an upstream-divergent caching design",
+      "GPU command thread saturation: same lever; next instrument would be per-descriptor visit counts"
+    ]
+  },
+  "final_state_profile": {
+    "binary": "fa931f96 (final: in-tree BC7 analytical, 16 GiB disk cache, lock-free settings, helping wait, VRAM policy)",
+    "scene": "grid, early-race phase (instant 17 FPS), EDEN_NX2_GPU_PROFILE",
+    "gpu_thread_ms_per_second": {
+      "macro": "190-195 (was 197-210)",
+      "method": "173-177",
+      "dma_dispatch": "170-181",
+      "fill_image_views": "95-97 (was 143-303 at comparable in-race phase before the disk cache)",
+      "bind_stage_buffers": "7 (was 39-58)",
+      "fence_host_wait": 0,
+      "idle": "5-7 (thread remains the structural ceiling)"
+    },
+    "remaining_ceiling": "GPU command thread saturation: next levers are the documented design slices (per-draw descriptor-visit caching, split transport redesign)"
   }
 }

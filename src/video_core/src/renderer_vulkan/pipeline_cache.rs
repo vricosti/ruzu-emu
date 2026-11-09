@@ -770,10 +770,15 @@ pub(crate) fn translate_graphics_stages_from_environments_with_features(
             return None;
         }
         let cfg_offset = env.generic_environment().cached_instruction_start();
+        let translate_start = std::time::Instant::now();
         let mut program =
             shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
                 &code, cfg_offset, env, host_info,
             );
+        crate::nx2_profile::TRANSLATE_NS.fetch_add(
+            translate_start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if uses_vertex_a && program_index == 1 {
             let mut vertex_a = programs[0].take()?;
             program = merge_dual_vertex_programs(&mut vertex_a, &mut program, env);
@@ -922,10 +927,15 @@ pub(super) fn compile_graphics_stages_from_file_environments(
             return None;
         }
         let cfg_offset = env.cached_instruction_start();
+        let translate_start = std::time::Instant::now();
         let mut program =
             shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
                 &code, cfg_offset, env, host_info,
             );
+        crate::nx2_profile::TRANSLATE_NS.fetch_add(
+            translate_start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if uses_vertex_a && program_index == 1 {
             let vertex_a_index = environments
                 .iter()
@@ -1564,11 +1574,16 @@ fn compile_compute_program(
     unique_hash: u64,
 ) -> shader_recompiler::CompiledShader {
     let runtime_info = RuntimeInfo::default();
+    let translate_start = std::time::Instant::now();
     let mut program = shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
         code,
         base_offset,
         env,
         host_info,
+    );
+    crate::nx2_profile::TRANSLATE_NS.fetch_add(
+        translate_start.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
     );
     let needs_shared_memory_clamp = matches!(
         driver_id,
@@ -2541,10 +2556,14 @@ impl PipelineCache {
             }
         }
         log::info!(
-            "Total Pipeline Count: {} (built={}, skipped={})",
+            "Total Pipeline Count: {} (built={}, skipped={}, translate={:.1}s, vkcreate={:.1}s cumulative worker time)",
             queued_total,
             built,
-            skipped_count
+            skipped_count,
+            crate::nx2_profile::TRANSLATE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1e9,
+            crate::nx2_profile::VKCREATE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1e9,
         );
 
         if self.use_vulkan_pipeline_cache {

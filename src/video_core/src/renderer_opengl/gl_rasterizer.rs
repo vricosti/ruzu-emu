@@ -3166,7 +3166,7 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn flush_and_invalidate_region(&mut self, addr: u64, size: u64, which: CacheType) {
-        if settings::is_gpu_level_high(&settings::values()) {
+        if settings::is_gpu_level_high_published() {
             self.flush_region(addr, size, which);
         }
         self.invalidate_region(addr, size, which);
@@ -3240,7 +3240,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         };
         let mut memory_manager = memory_manager.lock();
         memory_manager.flush_caching();
-        if settings::is_gpu_level_high(&settings::values()) {
+        if settings::is_gpu_level_high_published() {
             return false;
         }
         memory_manager.is_memory_dirty_with_cache_type(

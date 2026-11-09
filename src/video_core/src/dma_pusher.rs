@@ -549,15 +549,9 @@ impl DmaPusher {
     }
 
     fn should_use_unsafe_read(&self) -> bool {
-        let use_safe = {
-            let values = settings::values();
-            if settings::is_dma_level_default(&values) {
-                settings::is_gpu_level_high(&values)
-            } else {
-                settings::is_dma_level_safe(&values)
-            }
-        };
-        !use_safe
+        // Lock-free published combination, refreshed per command list by
+        // UpdateGPUAccuracy exactly like upstream's plain global reads.
+        !settings::dma_reads_are_safe_published()
     }
 
     pub fn has_pending_acquire(&self) -> bool {
@@ -1299,6 +1293,7 @@ mod tests {
         {
             let mut values = settings::values_mut();
             values.current_gpu_accuracy = GpuAccuracy::Low;
+            settings::republish_gpu_levels(&values);
         }
         assert!(dma.should_use_unsafe_read());
     }

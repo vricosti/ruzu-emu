@@ -3450,7 +3450,7 @@ impl Maxwell3D {
     }
 
     pub(crate) fn refresh_parameters_impl(&mut self, parameters: &mut [u32]) {
-        if !common::settings::is_gpu_level_high(&common::settings::values()) {
+        if !common::settings::is_gpu_level_high_published() {
             return;
         }
         let mut current_index = 0usize;

@@ -13,6 +13,7 @@ fn main() {
         .expect("the ruzu source directory must be inside the workspace");
     let stb_dir = workspace_dir.join("externals/stb");
     let bc_decoder_dir = workspace_dir.join("externals/bc_decoder");
+    let bc7enc_dir = workspace_dir.join("externals/bc7enc");
 
     println!(
         "cargo:rerun-if-changed={}",
@@ -29,6 +30,14 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         bc_decoder_dir.join("bc_decoder.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bc7enc_dir.join("bc7enc.cpp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bc7enc_dir.join("bc7enc.h").display()
     );
 
     let avcodec = pkg_config::Config::new()
@@ -76,9 +85,11 @@ fn main() {
     bcn_build.std("c++17");
     bcn_build.file("src/textures/bcn_shim.cpp");
     bcn_build.file(stb_dir.join("stb_dxt.cpp"));
+    bcn_build.file(bc7enc_dir.join("bc7enc.cpp"));
     bcn_build.file(bc_decoder_dir.join("bc_decoder.cpp"));
     bcn_build.include(&stb_dir);
     bcn_build.include(&bc_decoder_dir);
+    bcn_build.include(&bc7enc_dir);
     bcn_build.warnings(false);
     bcn_build.compile("ruzu_video_core_bcn_shim");
 

@@ -2871,10 +2871,16 @@ pub type SharedNativeMacroContext = std::sync::Arc<
 
 impl Default for NativeMacroContext {
     fn default() -> Self {
+        // Upstream picks the x64 macro JIT unless `disable_macro_jit` is set;
+        // this hardcoded `true` kept every macro on the interpreter, and macro
+        // execution is the GPU command thread's largest single cost (181 ms/s
+        // over 543k invocations/s in Mario Kart World). `compile_backend`
+        // already selects `MacroJITx64Impl` for the false case.
+        let interpreted = *common::settings::values().disable_macro_jit.get_value();
         Self {
-            engine: MacroEngine::new(true),
+            engine: MacroEngine::new(interpreted),
             positions: [0; 0x80],
-            compute_engine: MacroEngine::new(true),
+            compute_engine: MacroEngine::new(interpreted),
             compute_positions: [0; 0x80],
         }
     }
@@ -3398,8 +3404,11 @@ mod tests {
     #[test]
     fn native_macro_context_initializes_distinct_graphics_and_compute_state() {
         let mut context = NativeMacroContext::default();
+        // The backend follows `disable_macro_jit` as upstream does, so the x64
+        // JIT is used by default; it must not be pinned to the interpreter.
+        let expect_interpreted = *common::settings::values().disable_macro_jit.get_value();
         for engine in [&context.engine, &context.compute_engine] {
-            assert!(engine.is_interpreted);
+            assert_eq!(engine.is_interpreted, expect_interpreted);
             assert!(!engine.native_turing);
             assert!(!engine.native_execution_failed);
             assert_eq!(engine.native_write_offset, 0);

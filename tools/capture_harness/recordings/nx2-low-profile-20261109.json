@@ -1,0 +1,41 @@
+{
+  "date": "2026-11-09",
+  "scene": "Mario Bros Circuit start grid, kart idle, race running; profiled with EDEN_NX2_GPU_PROFILE, per-title Low accuracy + async shaders, split inactive (new default), binary ae94c24e",
+  "stable_windows_ms_per_second": {
+    "macro_jit": 210,
+    "method_dispatch": 197,
+    "dma_dispatch": 167,
+    "draw_preparation_total_approx": 250,
+    "flush_work": 60,
+    "fill_image_views": "41-63",
+    "read_handles": 38,
+    "bind_stage_buffers": 39,
+    "update_buffers": 31,
+    "configure": 26,
+    "idle": 9,
+    "fence_host_wait": 0
+  },
+  "calls_per_second": {
+    "method": 3040000,
+    "macro": 660000,
+    "dma_dispatch": 96400,
+    "draws": 38200,
+    "semaphore_acquires": 1335,
+    "acquire_waits": 99
+  },
+  "key_findings": [
+    "GPU command thread is saturated (~99% busy, idle 9 ms/s): it is THE bottleneck at Low accuracy",
+    "Fence host waits are 0 ms/s at Low accuracy (were 235 ms/s at High): that cost is already harvested by the Low setting",
+    "Command processing (macro+method+dma dispatch) = ~574 ms/s = 57% of the thread",
+    "Draw preparation = ~250 ms/s for ~1900 draws/frame at ~20 FPS",
+    "61% of 3D register writes are same-value (1.92M of 3.16M per second)",
+    "The GPU split should parallelize 574 vs 370 ms/s but measured -8 to -17%: root-cause candidates are the 1335 semaphore acquires/s each draining the backend, and the condvar wake protocol"
+  ],
+  "evidence": "C:/Users/smart/AppData/Local/Temp/ruzu-profile-20261109-profile-low/profile-windows.txt (40 windows)",
+  "next_optimization_targets_ranked": [
+    "1. Fix split-mode overhead (drain-per-acquire serialization, wake protocol) to parallelize the saturated thread: largest theoretical win (+50%+)",
+    "2. Reduce per-call dispatch cost of method (65 ns) and macro paths against upstream",
+    "3. Batch draw preparation lookups (read handles / fill image views / bind) across the ~1900 draws per frame",
+    "4. Startup: 20k pipeline rebuild takes ~240 s per boot; consider persisting translated SPIR-V"
+  ]
+}

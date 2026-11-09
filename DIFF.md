@@ -24007,3 +24007,1472 @@ Query notification validation complete: focused regression PASS; full video_core
 - Full video_core suite running; result appended below before commit. Earlier final VI2 focused suite: 3 passed; full core suite still blocked by documented kernel access violation.
 
 Cleanup validation complete: cargo test -p video_core -- --test-threads=1 with RUST_MIN_STACK=16777216: 1725 passed, 1 ignored, 0 failed; doc tests passed; exit 0 (459.05s). Source/document git diff --cached --check passes; generated Ampere oracle fixtures retain their exact upstream output formatting, including trailing spaces.
+
+
+## 2026-11-08 - src/core/src/core.rs vs core/core.h/.cpp (automatic NX2 memory)
+
+### Intentional differences
+- DeviceMemory and Memory bridge allocation moves mechanically from Initialize to InitializeKernel after profile/board-layout selection. Old bridges cleared before replacing backing; live workers already joined by the reviewed teardown. Failed-load sequential regression asserts 4 -> modeled 12 -> 4 memory selection while global setting stays 4.
+- Multi-console session selection is the authorized extension; original owner source/header re-read.
+
+### Unintentional differences (to fix)
+- No new known mismatch in this slice. Existing NX2 HLE Memory12Gb provision uses 20 GiB backing (12 + 8 graphics-server provision) and a 9809 MiB application pool. This is NOT a bit-accurate retail 12 GB/OS carveout implementation; replacing the graphics-server memory model is a separate structural prerequisite and is explicitly deferred.
+
+### Missing items
+- No new stub or title-specific rule. Exact retail NX2 pool model remains unverified.
+
+### Binary layout verification
+- No serialized structs changed. Guest memory extents/pools select the existing 12 GB mode for NX2; Switch1 settings retain their existing behavior. Host snapshots are not guest ABI.
+
+## 2026-11-08 - src/core/src/device_memory.rs vs core/device_memory.h/.cpp (automatic NX2 memory)
+
+### Intentional differences
+- Standalone constructor forwards the configured layout explicitly to the existing owner helper. Runtime System allocates with the selected session backing size using existing with_size. Reserve/physical address arithmetic unchanged.
+- Multi-console session selection is the authorized extension; original owner source/header re-read.
+
+### Unintentional differences (to fix)
+- No new known mismatch in this slice. Existing NX2 HLE Memory12Gb provision uses 20 GiB backing (12 + 8 graphics-server provision) and a 9809 MiB application pool. This is NOT a bit-accurate retail 12 GB/OS carveout implementation; replacing the graphics-server memory model is a separate structural prerequisite and is explicitly deferred.
+
+### Missing items
+- No new stub or title-specific rule. Exact retail NX2 pool model remains unverified.
+
+### Binary layout verification
+- No serialized structs changed. Guest memory extents/pools select the existing 12 GB mode for NX2; Switch1 settings retain their existing behavior. Host snapshots are not guest ABI.
+
+## 2026-11-08 - src/core/src/hle/kernel/kernel.rs vs core/hle/kernel/kernel.h/.cpp (automatic NX2 memory)
+
+### Intentional differences
+- Snapshot memory_layout_mode in KernelCore at construction, selected by board-owned profile policy. DeriveInitialMemoryLayout passes this same value to DRAM and pool construction. Existing multi-mode region test explicitly updates its fixture mode between derivations.
+- Multi-console session selection is the authorized extension; original owner source/header re-read.
+
+### Unintentional differences (to fix)
+- No new known mismatch in this slice. Existing NX2 HLE Memory12Gb provision uses 20 GiB backing (12 + 8 graphics-server provision) and a 9809 MiB application pool. This is NOT a bit-accurate retail 12 GB/OS carveout implementation; replacing the graphics-server memory model is a separate structural prerequisite and is explicitly deferred.
+
+### Missing items
+- No new stub or title-specific rule. Exact retail NX2 pool model remains unverified.
+
+### Binary layout verification
+- No serialized structs changed. Guest memory extents/pools select the existing 12 GB mode for NX2; Switch1 settings retain their existing behavior. Host snapshots are not guest ABI.
+
+## 2026-11-08 - src/core/src/hle/kernel/board/k_system_control.rs vs core/hle/kernel/board/nintendo/nx/k_system_control.h/.cpp (automatic NX2 memory)
+
+### Intentional differences
+- Board-owned memory_layout_for_hardware_profile selects Memory12Gb for every NX2 title and preserves Switch1 configured modes. Size/arrangement/pool helpers take an explicit session layout instead of reading global settings. Existing constants, pool arithmetic and fallback behavior preserved; no global mutation.
+- Multi-console session selection is the authorized extension; original owner source/header re-read.
+
+### Unintentional differences (to fix)
+- No new known mismatch in this slice. Existing NX2 HLE Memory12Gb provision uses 20 GiB backing (12 + 8 graphics-server provision) and a 9809 MiB application pool. This is NOT a bit-accurate retail 12 GB/OS carveout implementation; replacing the graphics-server memory model is a separate structural prerequisite and is explicitly deferred.
+
+### Missing items
+- No new stub or title-specific rule. Exact retail NX2 pool model remains unverified.
+
+### Binary layout verification
+- No serialized structs changed. Guest memory extents/pools select the existing 12 GB mode for NX2; Switch1 settings retain their existing behavior. Host snapshots are not guest ABI.
+
+## 2026-11-08 - src/core/src/hle/kernel/board/k_memory_layout.rs vs core/hle/kernel/board/nintendo/nx/k_memory_layout.h/.cpp (automatic NX2 memory)
+
+### Intentional differences
+- SetupDramPhysicalMemoryRegions and SetupPoolPartitionMemoryRegions receive the kernel snapshot and forward it to system-control helpers. Region ownership, insertion order, alignment, bounds and midpoint partitioning unchanged.
+- Multi-console session selection is the authorized extension; original owner source/header re-read.
+
+### Unintentional differences (to fix)
+- No new known mismatch in this slice. Existing NX2 HLE Memory12Gb provision uses 20 GiB backing (12 + 8 graphics-server provision) and a 9809 MiB application pool. This is NOT a bit-accurate retail 12 GB/OS carveout implementation; replacing the graphics-server memory model is a separate structural prerequisite and is explicitly deferred.
+
+### Missing items
+- No new stub or title-specific rule. Exact retail NX2 pool model remains unverified.
+
+### Binary layout verification
+- No serialized structs changed. Guest memory extents/pools select the existing 12 GB mode for NX2; Switch1 settings retain their existing behavior. Host snapshots are not guest ABI.
+
+## 2026-11-08 - src/core/src/hle/kernel/initial_process.rs vs core/hle/kernel/initial_process.h (automatic NX2 memory)
+
+### Intentional differences
+- Header-only physical-base helper receives the explicit layout and forwards it. Initial binary maximum and address calculation unchanged. No current call sites.
+- Multi-console session selection is the authorized extension; original owner source/header re-read.
+
+### Unintentional differences (to fix)
+- No new known mismatch in this slice. Existing NX2 HLE Memory12Gb provision uses 20 GiB backing (12 + 8 graphics-server provision) and a 9809 MiB application pool. This is NOT a bit-accurate retail 12 GB/OS carveout implementation; replacing the graphics-server memory model is a separate structural prerequisite and is explicitly deferred.
+
+### Missing items
+- No new stub or title-specific rule. Exact retail NX2 pool model remains unverified.
+
+### Binary layout verification
+- No serialized structs changed. Guest memory extents/pools select the existing 12 GB mode for NX2; Switch1 settings retain their existing behavior. Host snapshots are not guest ABI.
+
+## 2026-11-08 - src/core/src/hle/kernel/k_process.rs vs core/hle/kernel/k_process.h/.cpp (automatic NX2 memory)
+
+### Intentional differences
+- Capture actual DeviceMemory backing size alongside existing JIT construction snapshots in CreateMemory. Avoid asking mutable global settings for a size that can differ from the selected console session.
+- Multi-console session selection is the authorized extension; original owner source/header re-read.
+
+### Unintentional differences (to fix)
+- No new known mismatch in this slice. Existing NX2 HLE Memory12Gb provision uses 20 GiB backing (12 + 8 graphics-server provision) and a 9809 MiB application pool. This is NOT a bit-accurate retail 12 GB/OS carveout implementation; replacing the graphics-server memory model is a separate structural prerequisite and is explicitly deferred.
+
+### Missing items
+- No new stub or title-specific rule. Exact retail NX2 pool model remains unverified.
+
+### Binary layout verification
+- No serialized structs changed. Guest memory extents/pools select the existing 12 GB mode for NX2; Switch1 settings retain their existing behavior. Host snapshots are not guest ABI.
+
+## 2026-11-08 - src/core/src/arm/dynarmic/arm_dynarmic_32.rs vs core/arm/dynarmic/arm_dynarmic_32.h/.cpp (automatic NX2 memory)
+
+### Intentional differences
+- Page-table sign-extension bounds use the owning process actual backing size snapshot. Upstream computes DeviceMemory base plus intended memory size; runtime snapshot preserves that correspondence after automatic selection.
+- Multi-console session selection is the authorized extension; original owner source/header re-read.
+
+### Unintentional differences (to fix)
+- No new known mismatch in this slice. Existing NX2 HLE Memory12Gb provision uses 20 GiB backing (12 + 8 graphics-server provision) and a 9809 MiB application pool. This is NOT a bit-accurate retail 12 GB/OS carveout implementation; replacing the graphics-server memory model is a separate structural prerequisite and is explicitly deferred.
+
+### Missing items
+- No new stub or title-specific rule. Exact retail NX2 pool model remains unverified.
+
+### Binary layout verification
+- No serialized structs changed. Guest memory extents/pools select the existing 12 GB mode for NX2; Switch1 settings retain their existing behavior. Host snapshots are not guest ABI.
+
+## 2026-11-08 - src/core/src/arm/dynarmic/arm_dynarmic_64.rs vs core/arm/dynarmic/arm_dynarmic_64.h/.cpp (automatic NX2 memory)
+
+### Intentional differences
+- Same actual-backing bound correction as ARM32; JIT ownership and threshold remain unchanged.
+- Multi-console session selection is the authorized extension; original owner source/header re-read.
+
+### Unintentional differences (to fix)
+- No new known mismatch in this slice. Existing NX2 HLE Memory12Gb provision uses 20 GiB backing (12 + 8 graphics-server provision) and a 9809 MiB application pool. This is NOT a bit-accurate retail 12 GB/OS carveout implementation; replacing the graphics-server memory model is a separate structural prerequisite and is explicitly deferred.
+
+### Missing items
+- No new stub or title-specific rule. Exact retail NX2 pool model remains unverified.
+
+### Binary layout verification
+- No serialized structs changed. Guest memory extents/pools select the existing 12 GB mode for NX2; Switch1 settings retain their existing behavior. Host snapshots are not guest ABI.
+
+Automatic memory validation: 18 hardware-profile tests passed; memory layout lifecycle, derived pool region pairs and DeviceMemory sizing tests passed. Full core suite repeats the baseline k_thread wait_cancel access violation; failure-set comparison printed separately. GUI/CLI release build and default-4GB automatic NX2 manual boot pending.
+
+
+## 2026-11-08 - src/core/src/hle/kernel/k_thread.rs vs core/hle/kernel/k_thread.h/.cpp (memory fixture adaptation)
+
+### Intentional differences
+- Test fixtures that directly attach process memory now explicitly initialize device memory using the configured mode. Runtime allocation remains deferred until metadata/profile selection. Only cfg(test) setup changed; owner production logic untouched.
+### Unintentional differences (to fix)
+- Removed obsolete fixture assumption that System::initialize allocates runtime DRAM.
+### Missing items
+- No production items added or removed.
+### Binary layout verification
+- Not applicable: test setup only.
+
+## 2026-11-08 - src/core/src/hle/kernel/k_condition_variable.rs vs core/hle/kernel/k_condition_variable.h/.cpp (memory fixture adaptation)
+
+### Intentional differences
+- Test fixtures that directly attach process memory now explicitly initialize device memory using the configured mode. Runtime allocation remains deferred until metadata/profile selection. Only cfg(test) setup changed; owner production logic untouched.
+### Unintentional differences (to fix)
+- Removed obsolete fixture assumption that System::initialize allocates runtime DRAM.
+### Missing items
+- No production items added or removed.
+### Binary layout verification
+- Not applicable: test setup only.
+
+## 2026-11-08 - src/core/src/hle/kernel/svc/svc_synchronization.rs vs core/hle/kernel/svc/svc_synchronization.h/.cpp (memory fixture adaptation)
+
+### Intentional differences
+- Test fixtures that directly attach process memory now explicitly initialize device memory using the configured mode. Runtime allocation remains deferred until metadata/profile selection. Only cfg(test) setup changed; owner production logic untouched.
+### Unintentional differences (to fix)
+- Removed obsolete fixture assumption that System::initialize allocates runtime DRAM.
+### Missing items
+- No production items added or removed.
+### Binary layout verification
+- Not applicable: test setup only.
+
+## 2026-11-08 - src/core/src/hle/service/jit/jit.rs vs core/hle/service/jit/jit.h/.cpp (memory fixture adaptation)
+
+### Intentional differences
+- Test fixtures that directly attach process memory now explicitly initialize device memory using the configured mode. Runtime allocation remains deferred until metadata/profile selection. Only cfg(test) setup changed; owner production logic untouched.
+### Unintentional differences (to fix)
+- Removed obsolete fixture assumption that System::initialize allocates runtime DRAM.
+### Missing items
+- No production items added or removed.
+### Binary layout verification
+- Not applicable: test setup only.
+
+Memory fixture follow-up: two newly failing KThread tests were caused by their old Initialize allocation assumption; both pass in isolation after explicit fixture preparation. JIT service group passes (5). SVC synchronization group crashes in aggregate at reset_signal_resets_readable_event; that test passes individually. This aggregate failure is recorded as unresolved, not asserted to be baseline-proven. Existing full-suite baseline crash prevents global green validation.
+
+## 2026-11-08 - src/video_core/src/host1x/gpu_device_memory_manager.rs vs video_core/host1x/gpu_device_memory_manager.h/.cpp and core/device_memory_manager.h/.inc
+
+### Intentional differences
+- Existing concrete Rust specialization remains in its Host1x owner (C++ template instantiated by gpu_device_memory_manager.cpp). Mechanical constructor helper preserves existing table/allocator initialization. Actual session DeviceMemory backing selects the same 32-bit or 35-bit reverse table; upstream reads global layout. This explicit session extension is necessary for automatic NX2 memory without mutating user settings. Standalone Default retains upstream settings selection.
+- Re-read header, explicit instantiation cpp and template constructor after implementation; base capture, table capacity formula and mapping semantics preserved. No frontend interface change: Host1x already supplies DeviceMemory.
+### Unintentional differences (to fix)
+- None introduced in this constructor slice.
+### Missing items
+- None for this slice; does not claim full generic DeviceMemoryManager parity.
+### Binary layout verification
+- PASS: no guest ABI changes; host reverse-table capacity uses unchanged page bits and physical constants.
+- Regression exercises 4/20/4 GiB session backings without global setting changes, maps/reads last physical page, checks reverse mapping.
+
+Automatic-memory runtime validation (2026-11-08): release GUI+CLI build passed. Mario Kart World reached the title screen with configured Memory4Gb unchanged, automatic Nx2/6 cores + Memory12Gb session, and GPU reverse table using session backing. Evidence TEMP/ruzu-profile-4gb-nx2-20261108-122410/automatic-nx2-title.png and ruzu_log.txt. Stopped verified CLI PID 25592 before next Switch1 launch. Removed only the temporary memory override from APPDATA custom/0400C3F00006E000.ini (use_global=true); other per-title settings preserved. Switch1 smoke in progress.
+
+Automatic memory validation completed for both titles: Mario Kart 8 Deluxe also reached title with Switch1/4 cores and Memory4Gb (TEMP/ruzu-profile-4gb-switch1-20261108-122636/automatic-switch1-title.png, ruzu_log.txt). These are independent CLI processes; they verify automatic memory selection and rendering, not a same-GUI-process success cycle or gameplay performance. Failed-load session transitions are covered separately by the 18 passing hardware_profile tests. Both smoke runtimes stopped. Full core suite retains the recorded baseline access violation and 31 baseline failures; no full core pass claimed. Final release GUI+CLI build passed in 2m15s, diff --check passed.
+
+Final GPU validation: full video_core unit-test executable (built by cargo test -p video_core) completed successfully: 1726 passed, 0 failed, 1 ignored, 460.42s; TEMP/nx2-auto-gpu-full.log. Focused GPU manager tests: 52 passed. Automatic memory extension and prerequisite are complete within documented core-suite and retail-layout limitations. No temporary instrumentation introduced, no commit or push performed.
+
+## 2026-11-08 - src/common/src/settings.rs vs common/settings.h/.cpp
+### Intentional differences
+- Console-wide NX2 ASTC policy extension: Uncompressed resolves to BC3 during an active NX2 session; configured BC1/BC3 and Switch1 behavior remain unchanged. No title ID check.
+- Settings owns the nonserialized runtime policy and effective accessor; System sets policy before GPU construction and clears it after GPU destruction, including failed-load teardown. Existing single-active-session global renderer settings model retained; no global hardware profile or configuration mutation introduced.
+- Renderer/texture consumers use the effective accessor consistently for format, staging size, conversion and upload flags. Existing native ASTC capability gates and algorithm ownership remain unchanged. Upstream headers/source re-read after edit; this is an intentional policy extension, not a claimed upstream feature.
+### Unintentional differences (to fix)
+- None identified in this changed slice.
+### Missing items
+- General Vulkan allocation failure recovery remains outside this policy slice; BC3 reduces texture pressure but cannot guarantee unlimited VRAM or full-game stability.
+### Binary layout verification
+- PASS: no guest ABI changes. New settings field is host-only and omitted from category linkage, so configuration persistence retains user values.
+
+## 2026-11-08 - src/core/src/core.rs vs core/core.h/.cpp
+### Intentional differences
+- Console-wide NX2 ASTC policy extension: Uncompressed resolves to BC3 during an active NX2 session; configured BC1/BC3 and Switch1 behavior remain unchanged. No title ID check.
+- Settings owns the nonserialized runtime policy and effective accessor; System sets policy before GPU construction and clears it after GPU destruction, including failed-load teardown. Existing single-active-session global renderer settings model retained; no global hardware profile or configuration mutation introduced.
+- Renderer/texture consumers use the effective accessor consistently for format, staging size, conversion and upload flags. Existing native ASTC capability gates and algorithm ownership remain unchanged. Upstream headers/source re-read after edit; this is an intentional policy extension, not a claimed upstream feature.
+### Unintentional differences (to fix)
+- None identified in this changed slice.
+### Missing items
+- General Vulkan allocation failure recovery remains outside this policy slice; BC3 reduces texture pressure but cannot guarantee unlimited VRAM or full-game stability.
+### Binary layout verification
+- PASS: no guest ABI changes. New settings field is host-only and omitted from category linkage, so configuration persistence retains user values.
+
+## 2026-11-08 - src/video_core/src/surface.rs vs video_core/surface.h/.cpp
+### Intentional differences
+- Console-wide NX2 ASTC policy extension: Uncompressed resolves to BC3 during an active NX2 session; configured BC1/BC3 and Switch1 behavior remain unchanged. No title ID check.
+- Settings owns the nonserialized runtime policy and effective accessor; System sets policy before GPU construction and clears it after GPU destruction, including failed-load teardown. Existing single-active-session global renderer settings model retained; no global hardware profile or configuration mutation introduced.
+- Renderer/texture consumers use the effective accessor consistently for format, staging size, conversion and upload flags. Existing native ASTC capability gates and algorithm ownership remain unchanged. Upstream headers/source re-read after edit; this is an intentional policy extension, not a claimed upstream feature.
+### Unintentional differences (to fix)
+- None identified in this changed slice.
+### Missing items
+- General Vulkan allocation failure recovery remains outside this policy slice; BC3 reduces texture pressure but cannot guarantee unlimited VRAM or full-game stability.
+### Binary layout verification
+- PASS: no guest ABI changes. New settings field is host-only and omitted from category linkage, so configuration persistence retains user values.
+
+## 2026-11-08 - src/video_core/src/texture_cache/util.rs vs video_core/texture_cache/util.h/.cpp
+### Intentional differences
+- Console-wide NX2 ASTC policy extension: Uncompressed resolves to BC3 during an active NX2 session; configured BC1/BC3 and Switch1 behavior remain unchanged. No title ID check.
+- Settings owns the nonserialized runtime policy and effective accessor; System sets policy before GPU construction and clears it after GPU destruction, including failed-load teardown. Existing single-active-session global renderer settings model retained; no global hardware profile or configuration mutation introduced.
+- Renderer/texture consumers use the effective accessor consistently for format, staging size, conversion and upload flags. Existing native ASTC capability gates and algorithm ownership remain unchanged. Upstream headers/source re-read after edit; this is an intentional policy extension, not a claimed upstream feature.
+### Unintentional differences (to fix)
+- None identified in this changed slice.
+### Missing items
+- General Vulkan allocation failure recovery remains outside this policy slice; BC3 reduces texture pressure but cannot guarantee unlimited VRAM or full-game stability.
+### Binary layout verification
+- PASS: no guest ABI changes. New settings field is host-only and omitted from category linkage, so configuration persistence retains user values.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/maxwell_to_vk.rs vs video_core/renderer_vulkan/maxwell_to_vk.h/.cpp
+### Intentional differences
+- Console-wide NX2 ASTC policy extension: Uncompressed resolves to BC3 during an active NX2 session; configured BC1/BC3 and Switch1 behavior remain unchanged. No title ID check.
+- Settings owns the nonserialized runtime policy and effective accessor; System sets policy before GPU construction and clears it after GPU destruction, including failed-load teardown. Existing single-active-session global renderer settings model retained; no global hardware profile or configuration mutation introduced.
+- Renderer/texture consumers use the effective accessor consistently for format, staging size, conversion and upload flags. Existing native ASTC capability gates and algorithm ownership remain unchanged. Upstream headers/source re-read after edit; this is an intentional policy extension, not a claimed upstream feature.
+### Unintentional differences (to fix)
+- None identified in this changed slice.
+### Missing items
+- General Vulkan allocation failure recovery remains outside this policy slice; BC3 reduces texture pressure but cannot guarantee unlimited VRAM or full-game stability.
+### Binary layout verification
+- PASS: no guest ABI changes. New settings field is host-only and omitted from category linkage, so configuration persistence retains user values.
+
+## 2026-11-08 - src/video_core/src/renderer_vulkan/texture_cache.rs vs video_core/renderer_vulkan/vk_texture_cache.h/.cpp
+### Intentional differences
+- Console-wide NX2 ASTC policy extension: Uncompressed resolves to BC3 during an active NX2 session; configured BC1/BC3 and Switch1 behavior remain unchanged. No title ID check.
+- Settings owns the nonserialized runtime policy and effective accessor; System sets policy before GPU construction and clears it after GPU destruction, including failed-load teardown. Existing single-active-session global renderer settings model retained; no global hardware profile or configuration mutation introduced.
+- Renderer/texture consumers use the effective accessor consistently for format, staging size, conversion and upload flags. Existing native ASTC capability gates and algorithm ownership remain unchanged. Upstream headers/source re-read after edit; this is an intentional policy extension, not a claimed upstream feature.
+### Unintentional differences (to fix)
+- None identified in this changed slice.
+### Missing items
+- General Vulkan allocation failure recovery remains outside this policy slice; BC3 reduces texture pressure but cannot guarantee unlimited VRAM or full-game stability.
+### Binary layout verification
+- PASS: no guest ABI changes. New settings field is host-only and omitted from category linkage, so configuration persistence retains user values.
+
+## 2026-11-08 - src/video_core/src/renderer_opengl/gl_texture_cache.rs vs video_core/renderer_opengl/gl_texture_cache.h/.cpp
+### Intentional differences
+- Console-wide NX2 ASTC policy extension: Uncompressed resolves to BC3 during an active NX2 session; configured BC1/BC3 and Switch1 behavior remain unchanged. No title ID check.
+- Settings owns the nonserialized runtime policy and effective accessor; System sets policy before GPU construction and clears it after GPU destruction, including failed-load teardown. Existing single-active-session global renderer settings model retained; no global hardware profile or configuration mutation introduced.
+- Renderer/texture consumers use the effective accessor consistently for format, staging size, conversion and upload flags. Existing native ASTC capability gates and algorithm ownership remain unchanged. Upstream headers/source re-read after edit; this is an intentional policy extension, not a claimed upstream feature.
+### Unintentional differences (to fix)
+- None identified in this changed slice.
+### Missing items
+- General Vulkan allocation failure recovery remains outside this policy slice; BC3 reduces texture pressure but cannot guarantee unlimited VRAM or full-game stability.
+### Binary layout verification
+- PASS: no guest ABI changes. New settings field is host-only and omitted from category linkage, so configuration persistence retains user values.
+
+ASTC runtime validation: GUI Mario Kart World reached title using automatic Session ASTC Bc3 + Nx2 profile, with global astc_recompression=0 and custom use_global=true. Evidence TEMP/ruzu-session-astc-nx2-20261108-125225/automatic-bc3.png and ruzu_log.txt. No new image allocation OOM in this smoke. Next GUI Switch1 session reports Uncompressed + Memory4Gb. Runtime checks use separate GUI processes; same-process failure cleanup is covered by regression tests. Release GUI+CLI build passed in 4m33s. Local vulkaninfo confirms installed Radeon RX 5700 XT driver exposes textureCompressionASTC_LDR=false and textureCompressionBC=true.
+
+GUI Switch1 validation complete: Mario Kart 8 Deluxe 1.7.1 reached title with Session ASTC Uncompressed and Memory4Gb (TEMP/ruzu-session-astc-switch1-20261108-125405/switch1-uncompressed.png). Both GUI runtimes stopped after identity checks. No title-specific ASTC override remains. No new temporary instrumentation added.
+
+Console-wide ASTC policy final validation: test result: ok. 1726 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 465.40s Full common suite passed (423 unit, 2 integration, 1 ignored doc). Core retains 31 baseline failures and baseline wait_cancel access violation; no new failure before abort. Release GUI/CLI built, both GUI title smokes passed with expected per-session modes, diff --check clean. Implementation complete within stated lossiness/VRAM recovery limitations. Changes not committed/pushed.
+
+
+## 2026-11-08 - src/video_core/src/textures/bcn.rs vs video_core/textures/bcn.h/.cpp
+
+### Intentional differences
+- Candidate performance change: gather non-thresholded BC3 texels by contiguous row copies instead of individual RGBA texels. Same valid texels and zero padding, same block order, compressor, worker ownership, and per-plane waits. Applies to every BC3 conversion, with no title-ID condition.
+- Added an independent scalar Eden gather reference test for all width/height combinations 1..9 with two planes and output guards.
+- Added src/video_core/examples/bcn_bench.rs as a host-only repeatable microbenchmark; no upstream production counterpart or runtime instrumentation.
+
+### Unintentional differences (to fix)
+- None identified in the changed gather logic after re-reading both upstream files. Candidate retained only after validation and measurement.
+
+### Missing items
+- No new missing API items. Validation/benchmark results pending.
+
+### Binary layout verification
+- No shared struct changes. BC3 still emits 16-byte blocks via the same stb_dxt compressor; byte equality is checked by the new reference test.
+
+
+## 2026-11-08 - src/core/src/hle/service/nvdrv/nvdrv.rs vs core/hle/service/nvdrv/nvdrv.h/.cpp (eden-nx2 origin/eden-nx2)
+
+### Intentional differences
+- LoopProcess transfers its local Arc<Module> to KernelCore::retain_service_lifetime_owner before RunServer. Eden unwinds the native stack; cooperative Rust guest fibers can abandon it. Reuses the existing AM/Glue shutdown ownership adapter, retaining the module until post-CPU service cleanup instead of leaking its devices and NX2 callbacks across Restart. No title or hardware-specific branch.
+- Regression covers complete System shutdown while a ServerManager Arc remains alive: service factories and transferred owner release Module and an open nvhost-as-gpu device.
+
+### Unintentional differences (to fix)
+- None in the changed slice after re-reading upstream header, LoopProcess, Module destructor, and nvhost_as_gpu destructor/RemoveListener. Other ownership differences are not claimed audited.
+
+### Missing items
+- Runtime Restart validation pending.
+
+### Binary layout verification
+- PASS: no shared struct, ioctl, constant or serialized payload change.
+
+Validation: 65 NVDRV tests passed, including the new lifecycle test. Full core suite running; known baseline failures tracked separately. BC3 candidate saved outside source for isolated crash-fix runtime build.
+
+Restart fix validation update: release GUI build passed (3m55s). Full core test run reproduces the same 31 failures as TEMP/nx2-astc-core-full.log and the same k_thread wait_cancel STATUS_ACCESS_VIOLATION; no new failure before abort. Runtime Restart verification remains pending.
+
+
+## 2026-11-08 - src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (eden-nx2 origin/eden-nx2)
+
+### Intentional differences
+- INx2VideoSession::NvdrvSyncpoints lazily retains the exact Arc<SyncpointManager> used to allocate the decoder syncpoint. Upstream resolves through ServiceManager again during destruction; Rust post-CPU service cleanup may run after System has cleared ServiceManager. Cached ownership permits the same FreeSyncpoint on the original allocator without looking up a destroyed service or silently skipping cleanup. Lazy allocation point, decoder join, timer cancellation, event close and syncpoint free ordering preserved. No Module/System strong cycle is introduced.
+- Added regression resolving the real registered NVDRV allocator, allocating a syncpoint, shutting down System, then dropping the video session: syncpoint must be released without a ServiceManager.
+
+### Unintentional differences (to fix)
+- None identified in the changed slice after re-reading upstream class, NvdrvSyncpoints, HandOut and destructor.
+
+### Missing items
+- Runtime closing/restart verification pending.
+
+### Binary layout verification
+- PASS: no guest/shared structures changed; added host-only OnceLock<Arc<SyncpointManager>>.
+
+Validation: focused video_drop_releases_syncpoint_after_service_manager_shutdown test passed.
+
+NX2 video shutdown validation: all 21 nx2_gsv tests pass (including late syncpoint release). Full core suite reproduces the 31 known baseline failures and the same wait_cancel STATUS_ACCESS_VIOLATION; no new failure before abort. GUI rebuild in progress. Separate robustness limitation observed: an uncaught boot-thread panic prevents terminal frontend event delivery, leaving Closing software visible. Fixing that generically requires an explicit partial-teardown failure state; this change fixes the actual destructor panic rather than reporting incomplete teardown as completed.
+
+Video shutdown fix: release GUI rebuild passed (3m58s); diff --check clean. Normal GUI relaunch performed for manual runtime closing/restart validation; no claim of completed runtime validation yet.
+
+
+## 2026-11-08 ? src/core/src/hle/service/nvnflinger/nvnflinger.rs vs eden-nx2 origin/eden-nx2:src/core/hle/service/nvnflinger/nvnflinger.{h,cpp}
+
+### Intentional differences
+- Move the local Nvnflinger owner into existing KernelCore deferred service ownership before entering the cooperative loop. Upstream native stack unwinding releases binder/compositor owners; abandoned Rust fibers do not. Service registration and method ownership unchanged.
+- Upstream headers/implementations reread and relevant owner/lifecycle paths compared after implementation.
+
+### Unintentional differences (to fix)
+- None newly introduced in this slice. Generic abandoned-fiber leaks elsewhere remain outside this bounded display-owner correction.
+
+### Missing items
+- Real-title restart validation pending release rebuild; do not infer runtime success from tests.
+
+### Binary layout verification
+- N/A: host ownership/registry state only; guest IPC layouts unchanged.
+
+
+## 2026-11-08 ? src/core/src/hle/service/vi/vi.rs vs eden-nx2 origin/eden-nx2:src/core/hle/service/vi/vi.{h,cpp}
+
+### Intentional differences
+- Move the Container and stop-callback token into existing post-CPU cleanup. This releases its SharedBufferManager/SurfaceFlinger NVDRV references at session end, while OnTerminate still runs at stop request. No guest protocol change.
+- Upstream headers/implementations reread and relevant owner/lifecycle paths compared after implementation.
+
+### Unintentional differences (to fix)
+- None newly introduced in this slice. Generic abandoned-fiber leaks elsewhere remain outside this bounded display-owner correction.
+
+### Missing items
+- Real-title restart validation pending release rebuild; do not infer runtime success from tests.
+
+### Binary layout verification
+- N/A: host ownership/registry state only; guest IPC layouts unchanged.
+
+
+## 2026-11-08 ? src/core/src/hle/service/nvdrv/nvdrv.rs vs eden-nx2 origin/eden-nx2:src/core/hle/service/nvdrv/nvdrv.{h,cpp}
+
+### Intentional differences
+- Extend the shutdown regression to include real Nvnflinger and VI Container owners, not only the NVDRV factory. Assert all display owners, Module and its open address-space device expire. The previous local Module transfer alone could not release these other references.
+- Upstream headers/implementations reread and relevant owner/lifecycle paths compared after implementation.
+
+### Unintentional differences (to fix)
+- None newly introduced in this slice. Generic abandoned-fiber leaks elsewhere remain outside this bounded display-owner correction.
+
+### Missing items
+- Real-title restart validation pending release rebuild; do not infer runtime success from tests.
+
+### Binary layout verification
+- N/A: host ownership/registry state only; guest IPC layouts unchanged.
+
+
+## 2026-11-08 ? src/core/src/hle/service/nvdrv/devices/nx2_stub_device.rs vs eden-nx2 origin/eden-nx2:src/core/hle/service/nvdrv/devices/nx2_stub_device.h
+
+### Intentional differences
+- Explicit reset_session is an intentional lifecycle correction beyond the NX2 oracle: its static registry otherwise retains guest mappings/device ranges until guest unmaps, which forced shutdown need not send. Clear mappings, callbacks and device ranges under existing locks without invoking dead GPU callbacks; all ordinary map/unmap/replay behavior remains unchanged. Header-only upstream, no cpp counterpart.
+- Upstream headers/implementations reread and relevant owner/lifecycle paths compared after implementation.
+
+### Unintentional differences (to fix)
+- None newly introduced in this slice. Generic abandoned-fiber leaks elsewhere remain outside this bounded display-owner correction.
+
+### Missing items
+- Real-title restart validation pending release rebuild; do not infer runtime success from tests.
+
+### Binary layout verification
+- N/A: host ownership/registry state only; guest IPC layouts unchanged.
+
+
+## 2026-11-08 ? src/core/src/core.rs vs eden-nx2 origin/eden-nx2:src/core/core.{h,cpp}
+
+### Intentional differences
+- After CPU/service and terminated-process finalization, reset the NX2 singleton and driver-identification flag before another title can start. This intentional session-lifecycle correction prevents old mappings/listeners and NX2 ioctl mode surviving into a new System or a Switch1 title. Existing shutdown ordering otherwise unchanged.
+- Upstream headers/implementations reread and relevant owner/lifecycle paths compared after implementation.
+
+### Unintentional differences (to fix)
+- None newly introduced in this slice. Generic abandoned-fiber leaks elsewhere remain outside this bounded display-owner correction.
+
+### Missing items
+- Real-title restart validation pending release rebuild; do not infer runtime success from tests.
+
+### Binary layout verification
+- N/A: host ownership/registry state only; guest IPC layouts unchanged.
+
+Validation: 66 NVDRV tests, 21 NX2 service tests and 15 VI tests pass. Full core repeats the exact 31 baseline FAILED names and aborts at the known wait_cancel_pushes_runnable_thread_through_state_change_handler access violation. Separate Nvnflinger group: 34 pass, 4 failures in unchanged buffer_queue_producer tests (dequeue count contract and three absent test event handles); no full-suite green claim. Logs: TEMP/ruzu-display-{nvdrv,nx2,vi,flinger}-tests.log and TEMP/ruzu-display-core-full.log.
+
+Runtime validation update: release GUI build passed (3m56s). PID 7768 reached title, completed normal GUI Restart (shutdown t=362.508), opened the second NVHOST address space t=537.936 and reached title again; capture TEMP/ruzu-display-fixed-input-20261108-154556/restart-verified.png. No second-chance AV or Rust panic. However after terminating attached CDB (-pd) to detach, rendering stopped. Subsequent snapshots show live CoreTiming and guest waits; do not claim the resulting instance is usable or attribute the stall without further evidence. Original crash is no longer reproduced through second title. Repeating entire cycle without debugger in PID 25920, TEMP/ruzu-session-astc-nx2-20261108-160013. No guest controls sent.
+
+
+## 2026-11-08 ? src/video_core/src/native_qmd.rs vs eden-nx2 origin/eden-nx2:src/video_core/native_qmd.h
+
+### Intentional differences
+- Add reset_session for the table shared by GPU channels. It discards guest descriptors and deferred dependency counters only at GPU session teardown. The 4096-entry safety bound and all within-session Signal control flow remain identical. This intentionally corrects an upstream static-state lifecycle omission, rather than increasing the bound or evicting live dependencies. Regression fills the old table, drops a real Gpu, then checks a reused address has no stale decrement and a new address can execute/release. Header-only upstream; no cpp counterpart.
+- Upstream reread and changed paths compared after implementation.
+
+### Unintentional differences (to fix)
+- None introduced in this slice.
+
+### Missing items
+- Full video tests and release/runtime restart validation in progress.
+
+### Binary layout verification
+- PASS: Descriptor remains 64 u32 words, 256 bytes, alignment 4; host lifetime only changed.
+
+
+## 2026-11-08 ? src/video_core/src/gpu.rs vs eden-nx2 origin/eden-nx2:src/video_core/gpu.{h,cpp}
+
+### Intentional differences
+- After stopping/joining the GPU worker in Drop, reset NativeQmdScheduler session state. Ownership stays in the GPU lifecycle, not individual channels, because dependencies are deliberately shared across channels. Existing reverse-order C++ member-destruction adaptation remains. This explicit reset is an intentional correction beyond the upstream default destructor.
+- Upstream reread and changed paths compared after implementation.
+
+### Unintentional differences (to fix)
+- None introduced in this slice.
+
+### Missing items
+- Full video tests and release/runtime restart validation in progress.
+
+### Binary layout verification
+- PASS: Descriptor remains 64 u32 words, 256 bytes, alignment 4; host lifetime only changed.
+
+Evidence: both restart runs reached their second title, then QMD cache limit errors preceded the durable stall (t=664.990 in PID 7768; around t=600 in PID 25920). The debugger-removal hypothesis was not supported by the normal-run reproduction. The actual second failure is stale global QMD capacity/dependencies. Eight QMD tests pass including real GPU teardown regression.
+
+QMD shutdown validation: cargo test -p video_core -- --test-threads=1 passes: 1727 passed, 0 failed, 1 ignored (447.74s), doc tests pass. Eight focused QMD tests pass. Release GUI rebuild in progress (TEMP/ruzu-qmd-release-overlap.log; original orchestration will perform an up-to-date build after waiting on the release lock). Runtime restart of this final binary remains pending.
+
+Final runtime validation (supersedes the pending notes above): release GUI built successfully. Normal PID 22980 (no debugger) reached Mario Kart World 1.8.0 title, completed GUI Restart in the same process (System shutdown at t=311.840), opened the second NVHOST address space at t=495.193 and returned to title. Subsequent 119.70s / 237 status samples end with active rendering; 14 zero-FPS samples occur during the interval, so this is a bounded no-durable-stall check, not a smooth-performance claim. No QMD cache limit errors or Rust panic in archived final-verified-log.txt/stderr. final-stable.png confirms a later animated title scene. Evidence: TEMP/ruzu-session-astc-nx2-20261108-162437/final-restart-stability.json and TEMP/ruzu-qmd-final-input-20261108-162437/final-stable.png. One GUI instance remains running, no debugger, no guest buttons sent. Native AV on restart and cross-session QMD capacity exhaustion are corrected and covered by regressions. Visual artifacts and long shader startup remain outside this crash fix; BC3 optimization remains shelved. Generic abandoned-fiber ownership leaks outside the corrected display graph are not claimed solved. Tests: video 1727 pass / 1 ignored; targeted core NVDRV 66, NX2 21, VI 15 pass. Full core retains exact 31 baseline failures and known wait_cancel AV; separate Nvnflinger group 34 pass / 4 failures in unchanged producer tests. DIFF audits complete; diff --check clean. No commit/push in this slice.
+
+## 2026-11-08 - src/video_core/src/dma_pusher.rs vs src/video_core/dma_pusher.cpp/.h
+
+### Intentional differences
+- Added opt-in diagnostic Scope guards for DMA fetch, sync wait, command dispatch, FlushCommands and OnCommandListEnd. These extend the existing EDEN_NX2_GPU_PROFILE facility; they do not change command state, memory flags, ownership or flush/fence ordering.
+- Fetch scope ends before ProcessCommands while its borrowed guest-memory view remains alive. Dispatch scope includes nested engine work, with existing profiler exclusive-time subtraction.
+
+### Unintentional differences (to fix)
+- No execution differences introduced by this diagnostic change. Re-read Eden DispatchCalls/Step/ProcessCommands and header state, then compared each inserted guard with surrounding Rust statements.
+
+### Missing items
+- Current origin/eden-nx2 additionally has resumable puller acquires and split GPU dispatch, absent from this older Eden-based DMA implementation. These are broader lifecycle work, not prerequisites for timing the existing synchronous path; no parity claim is made for them.
+
+### Binary layout verification
+- PASS: no DMA or guest-visible structure changed.
+
+## 2026-11-08 - src/video_core/src/nx2_profile.rs vs origin/eden-nx2:src/video_core/nx2_profile.h
+
+### Intentional differences
+- Appended five Rust diagnostic zones after all upstream zone entries; existing discriminants and labels remain unchanged. Host-only profiling arrays grow with Zone::Count. No upstream .cpp exists for this header-only facility.
+- Test reset expectation now derives its length from Zone::Count. Added deterministic nested DMA/macro accounting regression.
+
+### Unintentional differences (to fix)
+- None introduced in scope accounting, ten-second reporting, per-thread counters or disabled-mode behavior. Re-read upstream Scope and report logic; added zones use the existing mechanism unchanged.
+
+### Missing items
+- None for this diagnostic extension. Runtime cost attribution still requires rebuilding and remeasuring; no performance improvement claimed.
+
+### Binary layout verification
+- PASS: profiling storage is host-local, never serialized as a guest ABI; existing zone indices preserved.
+## 2026-11-08 — src/video_core/src/renderer_vulkan/scheduler.rs vs src/video_core/renderer_vulkan/vk_scheduler.cpp/.h
+
+### Intentional differences
+- Before the existing fatal worker abort, also print the failed submission/command-buffer rotation and VkResult synchronously to stderr. The queued logger lost this evidence in the 18:27 crash (RVA 0x37ab0b resolves to the submission-error abort). This is diagnostic only; scheduling, error handling and successful execution remain unchanged. Upstream throws from the worker on Vulkan failure; Rust retains its existing process abort.
+
+### Unintentional differences (to fix)
+- No new execution-path difference introduced. The underlying Vulkan submission failure is still unidentified; the previous process did not preserve its VkResult.
+
+### Missing items
+- No implementation added beyond error output. Crash reproduction and full test validation pending.
+
+### Binary layout verification
+- Not applicable: no types, layouts or command payloads changed.
+Validation: full cargo test -p video_core passed (see ruzu-vulkan-abort-tests.log in TEMP; diagnostic-only change); cargo build --release --bin ruzu succeeded. Runtime reproduction still pending.
+
+## 2026-11-08 — src/video_core/src/renderer_vulkan/scheduler.rs vs src/video_core/renderer_vulkan/vk_scheduler.cpp/.h (worker notifications)
+
+### Intentional differences
+- Port upstream worker_waiting into the existing SchedulerWorkerState queue-mutex owner. SchedulerWorker::push implements the DispatchWork queue/wake subset; pop_front updates the predicate used by the existing worker wait loop. The worker checks queued work before sleeping, so submissions while it executes need no notification.
+- Retain notify_one for Rust's dedicated single-consumer job condition variable. Eden shares event_cv with other scheduler waiters and uses notify_all; Rust retains its separate drained_cv and existing in_flight contract.
+
+### Unintentional differences (to fix)
+- None introduced in this slice. Existing broader scheduler ownership differences are outside this queue-wake change. Runtime FPS effect not yet measured.
+
+### Missing items
+- Focused wait/wake and queued-work regressions added; focused and full video tests pending.
+
+### Binary layout verification
+- Internal host-only bool added; no guest layout, serialized payload or command-storage layout changes.
+
+Verification: re-read upstream .h worker_waiting ownership and .cpp DispatchWork/WorkerThread after editing. Queue insertion and wake-predicate read share the mutex; the wait predicate marks waiting before Condvar atomically unlocks it, and consuming work clears waiting. Stop-path clearing retained explicitly in Rust.
+Worker-notification validation: 3 focused tests passed; full video_core suite 1730 passed, 0 failed, 1 ignored (472.72 seconds). Candidate not yet built for game measurement.
+
+## 2026-11-08 — src/video_core/src/nx2_profile.rs vs src/video_core/nx2_profile.h (fence timing)
+
+### Intentional differences
+- Append ReleaseFences and FenceHostWait diagnostic zones after the existing extension, preserving upstream zone indices. The nested accounting test ensures setup, host wait and residual dispatch are exclusive.
+### Unintentional differences (to fix)
+- None introduced; profiling overhead must be excluded from final FPS comparisons.
+### Missing items
+- Runtime timing and validation pending.
+### Binary layout verification
+- Host profiler array size only; no guest ABI.
+
+## 2026-11-08 — src/video_core/src/fence_manager.rs vs src/video_core/fence_manager.h (host wait timing)
+
+### Intentional differences
+- Optional profiler scope around the existing async forced drain mutex/predicate wait, after SignalFence. Measures wall time including mutex reacquisition, not GPU execution time alone. Non-async and force=false control flow unchanged.
+### Unintentional differences (to fix)
+- None introduced. Callback ownership, notification and predicate loop unchanged.
+### Missing items
+- Runtime timing and validation pending.
+### Binary layout verification
+- No payload or ownership layout change.
+
+## 2026-11-08 — src/video_core/src/renderer_vulkan/vk_rasterizer.rs vs src/video_core/renderer_vulkan/vk_rasterizer.cpp/.h (fence release timing)
+
+### Intentional differences
+- Optional ReleaseFences scope encloses existing WaitPendingFences call. Nested profiler scopes are excluded, allowing comparison of drain setup and host wait costs.
+### Unintentional differences (to fix)
+- None introduced; all callbacks and execution ordering preserved.
+### Missing items
+- Runtime timing and validation pending.
+### Binary layout verification
+- No layout change.
+
+Verification: re-read the header-only upstream profiler/fence manager and rasterizer .cpp/.h after edits. No synchronization operation or force policy changed.
+Fence-timing validation: 6 focused tests passed; full video_core suite 1731 passed, 0 failed, 1 ignored (471.62 seconds). Release GUI build succeeded. Runtime profiling underway.
+
+## 2026-11-08 — src/video_core/src/engines/puller.rs vs src/video_core/engines/puller.cpp/.h (ReadSemaphoreWord prerequisite)
+
+### Intentional differences
+- ReadSemaphoreWord is a Puller-private method using its existing manager/rasterizer fields instead of an anonymous-namespace function accepting DmaPusher. Same file owner and translation -> BufferCache-only conditional four-byte flush -> scalar Read<u32> ordering.
+- Drop the Rust memory-manager mutex guard before the rasterizer flush; the callback can reenter that manager. Regression writes the new semaphore during flush and requires try_lock to succeed.
+- Apply the coherent read to valid NX2 trigger acquire checks. Switch1 and Ampere SEM_EXECUTE keep their existing paths. Channel suspension is a separate interrupted slice with prerequisites in recordings/nx2-acquire-port-state.json.
+
+### Unintentional differences (to fix)
+- Existing NX2 trigger acquisition still uses the legacy one-check/drain flow instead of PendingAcquire/ResumeAcquire. DMA resume offsets, pending scheduler channels and idle polling are not implemented in this prerequisite slice; do not claim acquisition parity or remove blocking waits yet.
+
+### Missing items
+- Resume the recorded channel-suspension slice after prerequisite validation. Focused and full video tests pending.
+
+### Binary layout verification
+- No guest register or payload layout changes. Test rasterizer adds host-only fields.
+
+Verification: re-read upstream puller.cpp ReadSemaphoreWord and puller.h acquire interface after implementation; dirty-only BufferCache mask, device-address translation, scalar read width and flush-before-read ordering match. Tests cover dirty, clean and unmapped addresses.
+## 2026-11-08 — src/video_core/src/engines/puller.rs vs video_core/engines/puller.cpp and puller.h (NX2 release size)
+
+### Intentional differences
+- Upstream origin/eden-nx2 ProcessSemaphoreTriggerMethod WriteLong branch was re-read against its header and compared line by line. Rust calls the rasterizer directly because its GPU runs the unsplit path; the upstream OnBack helper executes immediately in that mode.
+- The optional upstream debug message for mirrored writes is omitted; query order, addresses, payload and properties are preserved.
+
+### Unintentional differences (to fix)
+- This slice fixes NX2 RELEASE_SIZE bit 24 selecting IsAFence (four-byte payload) instead of HasTimeout, and emits the second query when Nx2SemaphoreMirror returns a nonzero address. Switch 1 keeps HasTimeout and no mirror.
+- Resumable acquisitions remain an interrupted separate slice tracked in tools/capture_harness/recordings/nx2-acquire-port-state.json; they are not claimed complete here.
+
+### Missing items
+- No missing item in the WriteLong release branch. Whole-puller parity is not claimed.
+
+### Binary layout verification
+- No register or serialized structure changed. Regression verifies flags, full 64-bit addresses, original-then-mirror query order, both RELEASE_SIZE values and both hardware profiles.
+- Focused tests queued; full-suite validation of this release change pending. The already-running coherent-read suite predates this edit.
+
+Validation update (2026-11-08): coherent-read prerequisite full cargo test -p video_core -- --test-threads=1 passed: 1732 passed, 0 failed, 1 ignored (445.95 s). NX2 release-size/mirror edit then passed all 13 focused puller tests. Full suite for the release edit is running separately; it is not covered by the preceding 1732-test result.
+
+
+## 2026-11-08 ? src/video_core/src/engines/puller.rs vs video_core/engines/puller.cpp and puller.h (resumable NX2 acquisitions)
+
+### Intentional differences
+- Compared PendingAcquire, Matches, CanResumeAcquire, ResumeAcquire and trigger acquisition ordering against origin/eden-nx2 source/header after implementation. Rust retains the prerequisite memory manager/rasterizer handles in Puller instead of borrowing DmaPusher for each method.
+- Only the existing unsplit GPU path is implemented: upstream DrainBack is a no-op there. No split-thread dependency is substituted with a stub.
+- Rust stores the registration identity and removes it on Drop as well as resume; production Puller is embedded in the stable boxed DmaPusher. This prevents an abandoned session from retaining a waiter. Upstream has no explicit destructor cleanup.
+- The two-second diagnostic is shorter (address, operation, target, current); optional rescued-release/debug memory-word logging is omitted. Timeout never releases an acquisition.
+- read_gpu_u32 now uses MemoryManager::read::<u32>, matching upstream scalar reads in Switch1 acquisition and SEM_EXECUTE as well as NX2 coherent reads; the preceding unsafe block-copy helper was a local divergence.
+
+### Unintentional differences (to fix)
+- None found in the implemented unsplit acquisition state machine: unsigned GEQ, mask nonzero, initial coherent check, waiter registration before ReleaseFences(true), latched-or-current test, clear/remove on successful resume.
+
+### Missing items
+- Optional split-GPU execution and detailed debug logging remain outside this slice. Whole-file completion is not claimed.
+
+### Binary layout verification
+- PASS: register offsets/layout unchanged; PendingAcquire is host-owned state and is never serialized. Scalar guest reads preserve the upstream 32-bit width.
+- Focused NX2 predicate, CPU-write, release-then-overwrite, diagnostic-timeout and Drop-cleanup tests passed before the final scalar-helper alignment; final focused/full verification is running.
+
+## 2026-11-08 ? src/video_core/src/dma_pusher.rs vs video_core/dma_pusher.cpp and dma_pusher.h (acquire resume offsets)
+
+### Intentional differences
+- Re-read and compared DispatchCalls, Step, ProcessCommands and their header declarations. Rust uses an explicit word_offset argument instead of a C++ default argument. GpuGuestMemory reuses the existing Rust backup-buffer guard and restores it before returning from suspension.
+- Added a mechanical is_powered_on accessor for Scheduler rather than exposing the upstream public System field. A null SystemRef remains supported by existing standalone tests.
+- Existing optional Rust profiling zones are preserved.
+
+### Unintentional differences (to fix)
+- None found in the default unsplit resume path: DispatchCalls preserves subindex, Step resumes before fetching, consumed words accumulate, memory-backed entries are re-read on resume, and pending acquisitions stop before pop/subindex advance.
+
+### Missing items
+- Upstream opt-in EDEN_NX2_PARK_SPLIT_METHODS guessing, submit-hash debug records and split-GPU dispatch are not implemented here. They are not dependencies of the upstream default unsplit acquisition path. Existing continuation parsing is retained.
+
+### Binary layout verification
+- PASS: CommandHeader and CommandListHeader layouts unchanged; current DMA segment includes the resumed word offset using host size_t-width arithmetic.
+- Regression records exact engine calls/addresses across prefetch and memory-backed resume, changes the unread suffix during suspension, verifies NI puller word boundaries, Switch1 continuation and powered-off scheduling. Focused test passed.
+
+## 2026-11-08 ? src/video_core/src/control/scheduler.rs vs video_core/control/scheduler.cpp and scheduler.h (pending channels)
+
+### Intentional differences
+- Re-read and compared Push, BindChannel, HasPendingChannels and ResumePending including the powered-off guard. Rust owns pending Arc<Mutex<ChannelState>> entries behind a Mutex, with the same single GPU dispatch consumer and pointer-identity duplicate check as upstream shared_ptr entries.
+- ChannelState guards are released before GPU::bind_channel, which locks that state itself in Rust. Map/scheduling guard is released for command dispatch, matching upstream ownership boundaries.
+
+### Unintentional differences (to fix)
+- None found in the unsplit pending-channel loop: retry while progress, bind before dispatch, erase completed entries, stop immediately when powered off.
+
+### Missing items
+- Split-GPU BindChannel deferral is outside this unsplit slice.
+
+### Binary layout verification
+- N/A: host-only channel ownership and scheduling; no guest serialization.
+- Cross-channel release and powered-off pending-acquire regressions pass in the focused DMA/GPU-thread tests.
+
+## 2026-11-08 ? src/video_core/src/gpu_thread.rs vs video_core/gpu_thread.cpp and gpu_thread.h (idle acquire polling)
+
+### Intentional differences
+- Re-read source/header and compared the pending-channel branch in StartThread with the existing Rust run_thread owner. Rust uses Option from TryPop and an AtomicBool stop flag instead of output parameter/jthread stop_token.
+- Existing per-command platform autorelease scope and command fence signaling remain in their original order.
+
+### Unintentional differences (to fix)
+- None found in unsplit polling: ResumePending before TryPop, yield for less than 500 microseconds since last command, sleep 1 millisecond otherwise, continue checking stop, keep blocking PopWait when no channels are pending.
+
+### Missing items
+- Optional split-GPU worker remains outside this slice. No performance improvement is asserted from tests.
+
+### Binary layout verification
+- N/A: no guest-visible structures changed.
+- Regression passes for cross-channel release, CPU release with an empty queue, and stopping the worker while an acquisition remains unmet. Final full video_core suite is running.
+
+
+Validation update (2026-11-08, coordinated NX2 acquisitions): final cargo test -p video_core -- --test-threads=1 passed with 1736 passed, 0 failed, 1 ignored (479.59 s), after 16 focused NX2 tests and 14 final puller tests. Release build passed in 2m14s. Singleton runtime PID13424 reached the recorded circuit; performance gain and long-run stability remain unproven.
+
+
+## 2026-11-08 ? src/video_core/src/engines/kepler_compute.rs vs video_core/engines/kepler_compute.cpp and kepler_compute.h (method sink capacity)
+
+### Intentional differences
+- Re-read upstream ConsumeSinkImpl declaration and implementation before/after this local change. Rust iterates by shared borrow over the sink while mutating the disjoint register field, then calls Vec::clear, matching upstream iteration and vector::clear.
+
+### Unintentional differences (to fix)
+- Fixed the prior mem::take plus consuming iteration, which discarded the vector allocation after every flush. Register bounds, write order and last-write-wins behavior are unchanged.
+
+### Missing items
+- No missing item in this method. No whole-engine completion or measured FPS improvement is claimed.
+
+### Binary layout verification
+- PASS: no guest structure/register layout changes. Regression checks first/last valid registers, invalid indices, duplicate write ordering and retained pointer/capacity across repeated flushes.
+- Validation deferred until the active paired benchmark is complete to avoid CPU load during performance samples. The running candidate binary F9D64D16 predates this source edit and remains unchanged.
+
+
+Validation update (Kepler method sink, 2026-11-08): focused consume_sink_preserves_allocation_order_and_register_bounds_like_upstream passed (1 test, 0 failed). Full video_core suite still pending until paired runtime samples finish. Measured binaries remain unchanged.
+
+Validation follow-up: KeplerCompute ConsumeSinkImpl allocation retention regression and full `cargo test -p video_core -- --test-threads=1` passed (1737 passed, 0 failed, 1 ignored, 466.21 s; doc tests passed). RUST_MIN_STACK=16777216. This source change is not present in the F9D64D16 binary used for the accuracy comparison; no FPS benefit claimed.
+
+## 2026-11-08 ? fence-work predicates: query_cache/query_cache.rs and texture_cache/texture_cache.rs vs upstream query_cache.h and texture_cache.h
+
+### Intentional differences
+- Rust uses methods on QueryCacheBase and generic TextureCacheBase<P>; implementations live in the counterpart of the upstream template implementation header. Tests reuse streamer and typed-buffer fixtures in the corresponding base modules.
+- Source reviewed against eden-nx2 origin/eden-nx2, including query_cache_base.h and texture_cache_base.h declarations, before and after the changes.
+
+### Unintentional differences (to fix)
+- None in these two new predicates: query iteration short-circuits with unsynced queries OR pending host sync; texture work is pending downloads OR pending async buffers.
+
+### Missing items
+- This prerequisite alone does not activate empty-fence avoidance. Backend query adapters, selective cache commit/pop masks and FenceManager SkipEmptyFence integration remain; interrupted slice recorded in tools/capture_harness/recordings/nx2-empty-fence-port-state.json.
+
+### Binary layout verification
+- Not applicable: no serialized structures changed. Predicates only inspect existing state.
+
+### Validation
+- Regression tests added for empty state, later streamer host sync without downloads, unsynced queries, async buffers without image downloads, and cleared work. Focused test build in progress; no performance benefit claimed.
+
+Validation follow-up: both new fence-work predicate regressions passed (one query test, one texture test). Full video_core suite started; not yet confirmed complete.
+
+## 2026-11-08 ? renderer query/texture fence-work adapters vs Eden Vulkan/OpenGL template aliases
+
+### Intentional differences
+- renderer_vulkan/query_cache.rs::has_pending_fence_work explicitly includes SamplesStreamer and TfbCounterStreamer alongside QueryCacheBase. Upstream vk_query_cache.h aliases QueryCacheBase<QueryCacheParams>, whose runtime enumeration includes these streamers; Rust already owns these separately and uses matching adapters for WFI and flush operations.
+- renderer_vulkan/texture_cache.rs and renderer_opengl/gl_texture_cache.rs forward has_async_flush_work to their common base. Upstream exposes the method through its TextureCache template aliases.
+- Reviewed vk_query_cache.h/.cpp and Vulkan/OpenGL texture headers/sources plus common predicate definitions. No serialized data or synchronization order changed by these read-only adapters.
+
+### Unintentional differences (to fix)
+- None in adapter conditions: each Vulkan streamer blocks skipping for unsynced queries OR pending host sync.
+
+### Missing items
+- Selective fence cache commits/pops and SkipEmptyFence remain unimplemented; OpenGL legacy query cache must conservatively disable SkipEmptyFence, matching upstream compile-time capability check.
+- Upstream ReleaseThreadFunc also batches up to 64 completed fences, then pops texture/buffer caches by committed mask before per-fence queries and callbacks. This coordinated optimization remains to port; cannot substitute dropping waits.
+
+### Binary layout verification
+- Not applicable: methods only; existing state unchanged.
+
+### Validation
+- Common predicate tests passed. Full common-prerequisite suite remains running against its previously built executable. Backend adapter compilation/validation still pending.
+
+Backend adapter validation: cargo check -p video_core passed (8.57 s, existing warnings). Full tests for the preceding common-predicate snapshot remain running; not claimed to cover these later adapters.
+
+## 2026-11-08 ? selective cache flush retirement: fence_manager.rs and backend adapters vs video_core/fence_manager.h
+
+### Intentional differences
+- CacheFlushes and TEXTURE_FLUSHES/BUFFER_FLUSHES remain owned by fence_manager.rs, matching upstream placement. PendingFence bundles its committed mask with its fence rather than maintaining parallel queues.
+- Existing Rust rasterizer callbacks implement cache operations in renderer_vulkan/vk_rasterizer.rs and renderer_opengl/gl_rasterizer.rs; each cache lock is now acquired alone, only actual work is committed, and retirement uses the saved mask. Query work is still committed/popped once per real fence. Callback signatures in renderer_opengl/gl_fence_manager.rs mechanically forward the mask and flush results.
+- Async retirement captures the committed mask in the per-fence callback, while synchronous retirement reads PendingFence.committed_flushes. Both match PopAsyncFlushes(mask) before deferred operations.
+
+### Unintentional differences (to fix)
+- None identified in the selective commit/pop slice after rereading upstream SignalFence, CommitCacheFlushes, PopAsyncFlushes, TryReleasePendingFences and both GL fence header/source.
+- Corrected prior ordering: pending fences are released before cache commits, as current eden-nx2 does; updated ordering regression accordingly.
+- Removed OpenGL's extra num_queued_commands flush predicate from these fence calls: upstream's real/stub decision uses committed cache downloads or query flushes, not arbitrary queued draw commands.
+
+### Missing items
+- SkipEmptyFence and batched ReleaseThreadFunc remain the next coordinated implementation slices; selective retirement currently keeps one real fence per call. No FPS gain claimed.
+
+### Binary layout verification
+- Not applicable: CacheFlushes and PendingFence are host-only structures, never copied to guest memory.
+
+### Validation
+- cargo check -p video_core passed. Existing fence tests updated for mask callback contract; added mixed-mask synchronous/asynchronous regression for texture-only, empty, buffer-only and combined queues, with callback ordering and async-buffer retirement without downloads.
+- Focused tests initially could not link because the previous full-suite executable was still live (Windows LNK1104); waiting for that suite before retrying. No test failure inferred from the linker conflict.
+
+Common-prerequisite full-suite result: 1739 passed, 0 failed, 1 ignored, 451.74 s; doc tests passed. This snapshot excludes the later adapters and selective retirement changes, which are being validated separately.
+
+Selective retirement validation: 15 focused fence-manager tests passed (including mixed-mask ordering for both synchronous/asynchronous paths); cargo check passed. Full video_core suite for this new snapshot started; result pending.
+
+## 2026-11-08 ? empty-fence gate in fence_manager.rs vs video_core/fence_manager.h
+
+### Intentional differences
+- Backend HasPendingFenceWork capability is supplied as a callback: Vulkan forwards its complete predicate, OpenGL always reports work (matching upstream requires-expression fallback for its legacy query cache). Forwarding lives in vk_rasterizer.rs and gl_fence_manager.rs.
+- The existing Rust manager's shared-state mutex guards uncommitted operations; it is released before the immediate callback, matching upstream SkipEmptyFence's callback-outside-lock requirement.
+
+### Unintentional differences (to fix)
+- None found after rereading SignalFence and SkipEmptyFence: gate after cache commits and before query commits, counter limit64, reset upon real fence, immediate callback then cache invalidation on skip. High/default remains delayed and never skips.
+
+### Missing items
+- Batched async retirement remains; no benchmark on this new implementation yet.
+
+### Binary layout verification
+- Not applicable: host-only skipped_fences counter and callback arguments.
+
+### Validation
+- cargo check passed. Added regression coverage for limit/reset, no-work skip side effects, pending queries, cache masks, queued operations and High deferred callbacks. Existing fence tests explicitly retain real-fence intent through a veto predicate. Full selective-mask suite remains live on its earlier executable; new test execution awaits its exit.
+
+## 2026-11-08 ? renderer_metal/metal_rasterizer.rs generic fence API compatibility
+
+### Intentional differences
+- No renderer_metal counterpart exists in eden-nx2 origin/eden-nx2 (git tree lookup confirmed). This is the existing native Rust backend.
+- Adapted all five common FenceManager call sites to the committed-mask callback signature. Metal retires its query callbacks and reports zero common cache commits, retaining its scheduler-work submission condition and prequeued query completion operations. Empty-fence skips are disabled for this backend.
+
+### Unintentional differences (to fix)
+- No intended Metal behavior change beyond the common manager's upstream-aligned release-before-commit ordering.
+
+### Missing items
+- Native macOS compilation and runtime validation are unavailable in this Windows session; Windows cargo checks do not cover cfg-gated Metal code.
+
+### Binary layout verification
+- Not applicable: closure signatures only, no guest structures changed.
+
+### Validation
+- Parsed the complete Metal rasterizer with rustfmt --edition2021 --emit stdout without modifying it. Pending-query callbacks were confirmed FnMut in metal_query_cache.rs; captured mutably for the new mask-ignoring adapter.
+
+Selective-mask full suite: 1739 passed, 1 failed, 1 ignored (454.79 s). Failure: OpenGL release_fences_pops_async_flushes_for_stubbed_fence injects an already-committed async buffer without a corresponding fence, then signals a no-work fence. Contract audit pending; do not claim full validation or Switch1 regression safety.
+
+## 2026-11-08 ? Vulkan per-fence query masks in renderer_vulkan/query_cache.rs vs query_cache/query_cache.h and vk_query_cache.cpp
+
+### Intentional differences
+- Rust's existing Vulkan adapter owns samples/TFB streamers outside the shared QueryCacheBase. A mutex-protected FIFO of their QueryType bits now supplements the base FIFO, one entry per real fence including zero masks. The mask uses upstream query IDs and stays in the query-cache owner.
+- Backend streamers are pushed only when they have work and popped only for the corresponding saved bits. Waiting examines the oldest mask, so future work cannot make an earlier empty fence consume its data. Removed now-unused per-streamer wait helpers, whose queue-front checks lacked per-fence association.
+- Header declarations and common CommitAsyncFlushes/ShouldWaitAsyncFlushes/PopAsyncFlushes plus Vulkan streamer push/pop implementations were reread after changes.
+
+### Unintentional differences (to fix)
+- Fixed the confirmed prior mismatch: an empty earlier fence could pop backend streamer work from a later fence because the adapter popped both streamers unconditionally.
+
+### Missing items
+- Runtime Vulkan readback validation remains; headless regression checks FIFO alignment and waiting decisions without constructing GPU query resources. Async fence batching remains separate work.
+
+### Binary layout verification
+- Host-only FIFO; no guest binary structure changed.
+
+### Validation
+- Added empty/samples/empty/TFB/combined/empty FIFO regression. Focused fence test group running.
+
+## 2026-11-08 ? renderer_opengl/gl_rasterizer_test.rs empty fence retirement contract
+
+### Intentional differences
+- Rust-only test, no C++ test counterpart. Changed the orphan-download fixture to assert that a new no-work fence leaves an unrelated precommitted download untouched. Current upstream CommitCacheFlushes records no buffer bit without new work, and PopAsyncFlushes(0) cannot pop that buffer queue.
+
+### Unintentional differences (to fix)
+- Corrected outdated test expectation; did not reintroduce unconditional popping to make the test green. Positive associated-mask retirement is covered by mixed_cache_masks_preserve_per_fence_pop_and_callback_order for synchronous and asynchronous managers.
+
+### Missing items
+- Full suite rerun after focused validation; Switch1 gameplay validation still pending.
+
+### Binary layout verification
+- Not applicable: test only.
+
+Combined selective/empty-fence and Vulkan query-mask validation: 47 focused fence-related tests passed, 0 failed (17.28 s), including the corrected OpenGL regression. Full suite running in session27579; release build81772. Neither full result nor runtime gain claimed yet.
+
+Full combined validation: cargo test -p video_core -- --test-threads=1 passed (1743 passed, 0 failed, 1 ignored, 485.10 s; doc tests passed). Release GUI build passed in 2m21s, binary SHA256 443080ECC8A7562A06E59AA2182DC7C4ED9473F7FF042D2A01697EF72877DA57. macOS runtime/type-check and Switch1 gameplay validation remain outstanding.
+
+
+## 2026-11-08 ? src/video_core/src/control/channel_state.rs and control/scheduler.rs vs video_core/control/channel_state.{h,cpp} and scheduler.{h,cpp}
+
+### Intentional differences
+- DMA remains channel-owned but its existing stable Box is wrapped in Arc<parking_lot::Mutex<_>>. Scheduler retains the channel Arc while cloning/locking DMA, preserving the lifetime of borrowed channel/engine pointers. This Rust synchronization adaptation permits upstream's dispatch outside the channel lock; it does not start another GPU worker.
+- Scheduler::push and resume_pending clone the DMA handle under a short channel lock, then release that lock before DMA execution/acquire checks. Bind-before-dispatch, pending deduplication, powered-off early return, repeated progress passes and final pending removal retain upstream order.
+- Constructor order, stable boxed self-reference installation, NVK subchannel setup and BindRasterizer owner order are unchanged. Initialization-only BindRasterizer acquires DMA under the channel lock; runtime dispatch must never retain that channel lock while waiting for DMA.
+- dma_pusher.rs and gpu_thread.rs test fixtures now access DMA through its own lock; concurrent polling clones the handle before waiting for DMA to avoid reverse lock order.
+
+### Unintentional differences (to fix)
+- Full GPU split is still absent. ChannelState payload grouping, frontend puller mutable engine lookups, front macro copies and backend lifetime/aliasing contracts need verification before enabling parallel engine execution. This slice removes the scheduler/channel lock cycle prerequisite only; it does not prove concurrent engine access safe.
+
+### Missing items
+- gpu_split.rs ring/worker and integration remain recorded in tools/capture_harness/recordings/nx2-gpu-split-port-state.json.
+
+### Binary layout verification
+- N/A: host-only synchronization wrapper; no guest struct or serialized format changes.
+
+### Validation
+- Added scheduler_dispatch_releases_channel_lock_before_engine_work: executes a real prefetched engine method through Scheduler::push and checks channel access during dispatch plus argument/order preservation. Focused and full suite results pending.
+- Re-read upstream channel_state.h/cpp and scheduler.h/cpp at 50fa86bbbc403ad565eb44fcc281f16f77c69e15 after edits; compared construction/binding and dispatch/resume control flow. No FPS improvement claimed.
+
+Validation update: all 18 DMA-filtered tests passed (114.73s), including the new scheduler lock regression and NX2 acquire-resume regression. Full video_core suite started; result pending.
+
+Full validation update: cargo test -p video_core -- --test-threads=1 completed with exit 0:1744 passed,0 failed,1 ignored in496.32s; doctests passed. RUST_MIN_STACK=16777216. This validates the DMA/channel lock separation snapshot, not split execution or FPS improvement.
+
+
+## 2026-11-08 ? src/video_core/src/engines/puller.rs, dma_pusher.rs, engines/engine_interface.rs vs video_core/engines/puller.{h,cpp}, dma_pusher.{h,cpp}, engines/engine_interface.h
+
+### Intentional differences
+- Puller captures six non-owning EngineHandles at construction, after ChannelState creates all boxed engines and before dispatch. ProcessBindMethod copies the matching handle instead of creating mutable references to ChannelState and its engine. Upstream takes a stable payload engine address without borrowing/mutating its state; the cached Rust handles preserve that operation without frontend aliasing of a future backend engine borrow.
+- Channel ownership/lifetime and existing boxed engine allocation remain unchanged. Replacing channel engines requires rebuilding DMA/Puller; no runtime engine replacement is supported by this handle snapshot.
+- DmaPusher::bind_subchannel_handle mechanically stores engine handle/type in the same arrays as upstream BindSubchannel; existing initialization callers retain bind_subchannel with a reference, which delegates to the same storage operation.
+- Test-only EngineHandle::ptr_eq and DmaPusher::subchannel_handle_for_test allow identity checks without dereferencing the engine. They add no release behavior.
+- Standalone test pullers with absent payload engines keep None handles, preserving their existing no-bind behavior.
+
+### Unintentional differences (to fix)
+- Other direct engine operations and frontend/back ownership integration remain to audit before split activation. No split is enabled by this change.
+
+### Missing items
+- GPU ring, backend worker, deferred cache operations and front macro state are tracked in nx2-gpu-split-port-state.json.
+
+### Binary layout verification
+- N/A: added host-only cached trait-object handles; guest ABI and command words are unchanged.
+
+### Validation
+- Re-read upstream ProcessBindMethod and BindSubchannel plus EngineTypes header after implementation: six class mappings, valid flag stripping, three Ampere aliases, NX2 zero early return, raw unknown class storage/logging and array update order preserved.
+- New test initializes real engines, checks handle identity for all six classes at all eight subchannels and all three aliases, with the channel pointer set null after construction to catch runtime channel access. Existing unknown/zero/flag tests retained. Focused results pending.
+
+Validation update:15 Puller tests passed in8.85s. Test-only handle comparison uses engine data-address identity (addr_eq), since Rust trait vtables can be duplicated across codegen units; first test attempt compared vtables as well and failed. All engine-class/subchannel/alias identity checks now pass. Full video_core suite started; result pending.
+
+Full engine-handle validation: cargo test -p video_core -- --test-threads=1 exited0;1745 passed,0 failed,1 ignored in498.04s; doctests passed. GPU split remains inactive and no runtime performance gain is asserted.
+
+
+## 2026-11-08 ? src/video_core/src/gpu_split.rs vs video_core/gpu_split.h and gpu_split.cpp
+
+### Intentional differences
+- Implemented transport slice: Reserve/ReserveSlow/WaitForSpace/Commit/Publish/Drain retain upstream owner, constants (1<<20 words, mask, publication256->8 after drain), wrap marker, producer/consumer memory ordering and spin/yield thresholds. Pause uses spin_loop on x86 and yield on other architectures, matching upstream; u32 spin counters wrap.
+- Rust GpuSplitShared holds the shared ring/atomics in Arc, while GpuSplit keeps frontend positions. Per-word UnsafeCell permits disjoint producer writes/consumer reads; publication/consumption handoff is the synchronization contract. This does not authorize multiple producers/consumers.
+- Rust Wake adapts atomic wait/notify with a generation atomic plus parking_lot mutex/condvar. Notification increments generation before taking the wait mutex; wait checks generation with that mutex held, preventing lost wakeup between check and sleep. No new dependency or platform API required.
+- CacheLine wrappers pad each shared counter to64 bytes; host-only allocation layout differs from the C++ member layout without changing command data.
+- reserve asserts an internal packet size in1..=RingWords to reject impossible caller requests rather than spin forever. This adds no guest input validation: packet constructors are not integrated yet.
+- Constructor allocates transport storage for independent tests. No emulator call site constructs it; upstream MaybeStart eligibility/allocation integration is still pending. lib.rs only declares the matching module.
+
+### Unintentional differences (to fix)
+- No activated runtime split exists yet; this is a transport implementation slice, not a completed GpuSplit port. Do not enable it until execution/lifetime integration is complete.
+
+### Missing items
+- Method/MultiMethod/MacroWrite/SwitchEngine/Defer packet construction, Execute, BackLoop, MaybeStart/Stop, owner diagnostics and front/back integration remain tracked in nx2-gpu-split-port-state.json. No placeholder execution methods were introduced.
+
+### Binary layout verification
+- PASS for implemented transport words: u64 storage, Wrap kind0, power-of-two mask and contiguous reservation; UnsafeCell<u64> retains u64 layout/alignment. No guest ABI changes.
+- Engine trait-object packet representation is not implemented/validated yet; requires complete handle payload rather than one C++ pointer word.
+
+### Validation
+- Re-read gpu_split.h reserve/commit fields and gpu_split.cpp reserve slow, wait, publish, drain after implementation and compared control flow/order. Initial three transport tests passed. Added deterministic unpublished-work drain and full-ring backpressure checks; final five-test run pending.
+- 10,000 variable-sized packets test FIFO contents across repeated wraps and the publication/sleep handshake; it is not a formal concurrency model check and does not test engine command execution.
+
+Transport validation update:all5 focused tests passed in0.11s;full video_core suite started, result pending. No runtime split enabled.
+
+
+## 2026-11-08 ? src/video_core/src/gpu_split.rs packet construction vs video_core/gpu_split.{h,cpp}
+
+### Intentional differences
+- SelectEngine/SwitchEngine/Method/MacroWrite/MultiMethod retain upstream owner and order. Engine packets contain the full typed EngineHandle (fat trait pointer), taking1+ceil(sizeof(handle)/8) words instead of the C++2-word packet. Alignment is compile-time checked; typed writes preserve pointer provenance/vtable rather than converting the object pointer to integers. This host-only protocol is internal to the Rust producer/consumer.
+- EngineHandle::ptr_eq now also serves runtime SelectEngine and compares engine data addresses, matching upstream pointer identity while ignoring duplicate Rust vtable addresses across codegen units.
+- MultiMethod takes a bounds-checked source slice; packet payload copies remain exactly the caller's amount. MAX_MULTI_WORDS8192, method mask0xffff, flags, header fields, optional segment, tail-zero-before-copy and methods_pending unsigned subtraction match upstream.
+
+### Unintentional differences (to fix)
+- Command execution and activation remain absent. Encoding alone cannot improve runtime FPS and must not be enabled in isolation.
+
+### Missing items
+- Defer/DeferFunction/CallThunk, Execute, BackLoop, activation/shutdown and caller integration remain tracked in nx2-gpu-split-port-state.json.
+
+### Binary layout verification
+- Method/MacroWrite/MultiMethod words preserve upstream bit positions. Engine payload intentionally differs due to Rust trait objects; no guest ABI change. New tests compare literal expected packet headers, complete handle identity and copied payload words.
+
+### Validation
+- Re-read upstream header Method/MacroWrite and source SwitchEngine/MultiMethod and compared encoding/order. cargo check -p video_core --tests passed. Packet tests added but not executed while the preceding transport full-suite binary remains active on Windows.
+
+Transport-only full-suite result:1750 passed,0 failed,1 ignored in497.98s;exit0 and doctests passed. This run predates the packet construction changes;their focused validation starts separately.
+
+Packet construction validation:all8 gpu_split tests passed in0.18s. Full suite for the packet snapshot started;result pending.
+
+
+## 2026-11-08 ? src/video_core/src/gpu_split.rs execution slice vs video_core/gpu_split.{h,cpp}
+
+### Intentional differences
+- GpuSplitBack owns backend fields and Execute in the same upstream counterpart file, avoiding a shared mutable borrow of frontend positions. This is Rust ownership separation of the same upstream class, not a separate subsystem.
+- Execute handles Wrap, Engine, Method, Multi and Call with upstream masks/order. Direct macro methods consume sink and call with is_last=true; non-executable methods only append sink; executable methods consume sink before applying optional segment. Multi always consumes sink then applies its segment and forwards payload/pending count. Unknown kinds advance1 as upstream.
+- Engine packet size follows the previously audited full Rust EngineHandle representation. Call packet stores/loads a typed function pointer and typed Copy callback, preserving provenance. Function pointer size and callback alignment are checked against u64 storage.
+- Defer requires Fn+Copy+Send+'static to encode upstream's trivially-copyable cross-thread callback contract. No owned callback destruction is promised by this API; DeferFunction is not implemented yet.
+
+### Unintentional differences (to fix)
+- Runtime worker/activation and ownership cleanup remain incomplete; no game path executes this transport.
+
+### Missing items
+- Owned DeferFunction callbacks require a reviewed cancellation/destruction path on stop before adding them. BackLoop/MaybeStart/Stop, owner diagnostics, deferred cache calls and front macros remain pending.
+
+### Binary layout verification
+- Call kind4 and payload word count bits8..31 match upstream; pointer/function/capture payloads are host-only typed values. Generic callback padding is not interpreted as numeric command words.
+
+### Validation
+- Re-read upstream header Defer/CallThunk and source Execute after edits and compared branch ordering, payload sizes and masks. cargo check -p video_core --tests passed.
+- Added ordered trace regression spanning deferred sink writes, executable method, direct macro, Multi with segment, two selected engines, a captured Copy callback and zero-sized callback; execution test awaits prior full-suite completion before relink.
+
+Packet snapshot full validation:1753 passed,0 failed,1 ignored in495.84s;exit0 and doctests passed. Execute/Defer changes were added after that test binary was built and are validated separately.
+
+Execute/Defer validation update:all9 gpu_split tests passed in0.19s, including ordered engine/sink/macro/multi/callback trace. Full suite for this snapshot started;result pending.
+
+
+## 2026-11-08 ? src/video_core/src/gpu_split.rs owned callbacks vs video_core/gpu_split.cpp DeferFunction/Stop
+
+### Intentional differences
+- DeferFunction transfers Box<dyn FnOnce()+Send> to a thin boxed pointer, matching upstream heap-owned std::function and invoke-then-delete ownership. Call packets use a Rust-only OwnedCall bit4 and1-word typed heap pointer payload; method flags retain their meaning and Call payload count remains in bits8..31.
+- Call execution clears the owned pointer slot before invocation. This prevents cancellation from seeing a freed pointer when consumed publication lags execution or the callback panics. A shared owned-pending counter tracks resources, not execution order.
+- discard_pending scans the committed prefix from consumed through write_position (including unpublished work), respects wrap/packet lengths, and drops remaining owned captures without invoking GPU commands. Drop invokes this while no runtime worker exists; future worker lifecycle must join before cleanup.
+- Upstream Stop requests/join but does not reclaim heap callbacks abandoned in its raw ring. Rust intentionally reclaims those captures while preserving abandonment of their executable work. No engine command is replayed during cleanup.
+
+### Unintentional differences (to fix)
+- Runtime BackLoop/Stop integration remains required before enabling concurrency; cleanup must never race the backend. Current module has no runtime activation/caller.
+
+### Missing items
+- Worker lifecycle, eligibility, owner diagnostics and frontend/cache/macro integration remain tracked in nx2-gpu-split-port-state.json.
+
+### Binary layout verification
+- Host-only OwnedCall flag uses an otherwise unused Call header bit. Pointer size <=u64 is compile-time checked. Owned pointer is read/written as its actual Rust type; no guest ABI change.
+
+### Validation
+- Re-read upstream DeferFunction and Stop after implementation. cargo check -p video_core --tests passed.
+- Added tests for normal/panicking callback followed by cancellation before consumed publication, repeated cleanup, Drop, unpublished wrap and mixed packet kinds. Test execution awaits the previous full-suite process; no validation or runtime FPS claim yet.
+
+Execute/Copy Defer full validation:1754 passed,0 failed,1 ignored in496.14s;exit0 and doctests passed. Owned callback changes are validated separately after this snapshot.
+
+Owned callback validation:all11 gpu_split tests passed in0.22s;normal execution, panic, delayed consumed publication, idempotent cleanup and unpublished wrap cancellation all passed. Full suite for this snapshot started;result pending.
+
+
+## 2026-11-08 ? src/video_core/src/gpu_split.rs worker lifecycle vs video_core/gpu_split.{h,cpp}
+
+### Intentional differences
+- BackLoop retains upstream acquire/publication order,8192-spin idle phase, waiting-generation handshake, stop recheck, full-current-batch execution and4096-word consumed updates. The backend state stays separate from mutable frontend positions in the same Rust counterpart file.
+- start_back is the mechanical thread-creation portion of MaybeStart. It applies GPUBack name, Critical priority and performance-core selection, then invokes the owning session's registration action before BackLoop. The callback seam permits headless tests; actual session registration/eligibility are not integrated yet.
+- Atomic stop replaces jthread stop_token; stop requests, wakes and joins before cancellation. Drop performs the same join/cleanup and does not re-panic on a JoinHandle error. Explicit stop returns the thread result for its caller.
+- Rust thread panic normally terminates only that thread, unlike C++ unhandled exceptions. The worker records failure with Release before resuming unwind; frontend reserve/space/drain checks acquire that flag and panic rather than spin forever. Runtime session/UI fault routing remains integration work.
+- A new transport instance is required for each start/session; stale positions or stopped instances are rejected. This avoids reusing engine handles and positions across reloads. No global static split is activated.
+
+### Unintentional differences (to fix)
+- MaybeStart eligibility, actual runtime ownership/registration and frontend/cache/macro integration remain absent. Current tests do not prove gameplay or concurrent renderer ownership correctness.
+
+### Missing items
+- Runtime MaybeStart/Active/FrontMacros, owner diagnostics, frontend access bridge, deferred cache operations and front macro state.
+
+### Binary layout verification
+- N/A: host thread/atomic lifecycle fields only; packet encoding unchanged.
+
+### Validation
+- Re-read upstream BackLoop/header fields and Stop after implementation, comparing stop points, memory ordering, spin/publication thresholds and execution order. cargo check -p video_core --tests passed.
+- Added real-worker FIFO/fresh-session/sleep-stop tests, panic-to-drain/cleanup test, full-ring producer failure test and stop-current-batch/cancel-later-work test. Execution awaits the preceding suite's terminal result to avoid relinking its Windows test executable.
+
+Owned callback full validation:1756 passed,0 failed,1 ignored in489.58s;exit0 and doctests passed. Worker lifecycle changes are tested separately after this snapshot.
+
+Worker lifecycle validation:all15 gpu_split tests passed in0.33s, including FIFO across3 fresh sessions, sleeping stop, current-batch stop/cancellation, worker panic to frontend drain and full-ring producer failure. Full suite for the worker snapshot started;result pending.
+
+
+## 2026-11-08 - src/video_core/src/engines/kepler_compute.rs vs src/video_core/engines/kepler_compute.cpp and .h (frontend state and uploads)
+
+### Intentional differences
+- FrontState is owned by an engine-held Arc<Mutex<FrontState>>. A retained frontend handle can access the copied registers without borrowing the concurrently mutated backend engine. Raw upstream context/macro pointers become owning shared handles plus an engine selector.
+- Front takes a raw stable engine pointer and drains before forming any Rust reference, including when reacquiring an existing frontend handle. Runtime dispatch must cache the handle rather than reacquire it for each command. This extra drain on reacquisition protects Rust exclusive-reference invariants. No runtime caller is installed yet.
+- FrontApply takes the context lock only during code/binding access and releases it before returning. Future enqueue/Drain operations must run outside this lock, including JIT callbacks; retaining it around a complete frontend macro can deadlock a full ring against backend compute context access.
+- FrontMacroEngine/FrontMacroPositions use an explicitly locked context parameter; FrontMacroOwner mechanically selects the owning handle. File/method responsibilities remain in kepler_compute.rs.
+
+### Unintentional differences (to fix)
+- No known differences in register-store order, compute-upload selection, bind bounds, or backend upload suppression within this slice.
+
+### Missing items
+- FrontCallMethod, FrontCallMultiMethod and FrontRunMacro remain unimplemented. JIT preparation/execution must not retain the context lock across emitted writes or ring-space waits. Runtime frontend handle acquisition/dispatch and Maxwell frontend prerequisites are still pending; split mode remains inactive.
+
+### Binary layout verification
+- PASS: 0x1000 u32 copied registers and 0x80 u32 macro positions match upstream element counts; these host-owned states are not guest ABI payloads.
+- Re-read upstream revision 50fa86bbbc403ad565eb44fcc281f16f77c69e15 .cpp/.h after implementation; compared transfer, code-write and binding order. Tests cover moved FIFO allocation, independent registers, compute/fallback engine selection, boundary bindings, backend suppression and cross-thread lock availability.
+
+## 2026-11-08 - src/video_core/src/gpu_split.rs vs src/video_core/gpu_split.cpp and .h (frontend access visibility)
+
+### Intentional differences
+- Constructor and Drain become crate-visible for owner-local engine Front initialization and tests, matching their usable upstream interface. No transport behavior changes.
+
+### Unintentional differences (to fix)
+- None introduced by visibility changes.
+
+### Missing items
+- Runtime activation/integration remains pending as recorded in the split port state.
+
+### Binary layout verification
+- N/A: visibility only.
+
+
+## 2026-11-08 - src/video_core/src/engines/kepler_compute.rs vs src/video_core/engines/kepler_compute.cpp and .h (frontend macro execution)
+
+### Intentional differences
+- FrontCallMethod/MultiMethod/RunMacro receive the retained FrontState and stable EngineHandle explicitly. They never borrow the backend KeplerCompute allocation while queuing commands. The unused C++ System parameter is omitted.
+- FrontState retains the channel RAM handle established at channel initialization. Native macro context and channel RAM are set by ChannelState::init before runtime dispatch.
+- JIT preparation and macro selection lock the shared context briefly; the lock is released before executing emitted writes, including ring-space waits. FrontApply releases its own lock before MacroWrite. No RefMut or whole MacroEngine borrow crosses execution callbacks.
+- Rust moves the parameter Vec and fallback interpreter RAM into temporary execution storage, restoring ownership (and clearing parameters) after execution and on Rust unwinding. Shared RAM is locked for execution, then released before restoring/reporting through the context. The original selected macro receives error state even if emitted uploads change the selector.
+- The optional macro profiling scope includes context/position selection as well as preparation and execution; guest behavior is unchanged.
+- Multi pending subtraction explicitly wraps like upstream unsigned u32. Source slices are bounds-checked before queuing.
+
+### Unintentional differences (to fix)
+- No known differences in method routing, odd macro-start rejection, parameter accumulation, completion timing, register reads, write rejection or direct macro writes within this slice.
+
+### Missing items
+- Runtime handle dispatch/activation and Maxwell frontend remain pending; this path is exercised only by tests. Full-ring macro/backend contention still requires integrated stress validation before activation.
+
+### Binary layout verification
+- PASS: register/parameter words are u32; local/shared RAM remains 0xc00 u32. No new guest ABI structs.
+- Re-read upstream 50fa86bbbc403ad565eb44fcc281f16f77c69e15 kepler_compute .cpp/.h after implementation and compared each Front* branch. Tests exercise real worker dispatch, parameter completion, local/shared RAM, frontend-only register reads including out-of-range zero, code-generation count without duplicate backend uploads, rejected recursive emits and selected-engine failure reporting.
+
+## 2026-11-08 - src/video_core/src/gpu_split.rs vs src/video_core/gpu_split.cpp and .h (frontend command access)
+
+### Intentional differences
+- Method, MultiMethod, MacroWrite, start_back and stop become crate-visible for engine frontend dispatch and worker-backed regression tests. No transport behavior changes. start_back remains the previously documented Rust thread-creation seam rather than runtime eligibility.
+
+### Unintentional differences (to fix)
+- None introduced by visibility changes.
+
+### Missing items
+- Activation/eligibility, kernel registration, frontend bridge and runtime integration remain pending.
+
+### Binary layout verification
+- N/A: visibility changes only. Re-read matching .cpp/.h packet and stop implementations.
+
+- Frontend execution follow-up: fallback RAM is an Option and is only leased when active shared RAM is absent, avoiding a redundant 0xc00-word initialization on the shared-RAM path. The error regression also changes macro selection mid-execution before rejecting an emit. Updated gpu_split module documentation to reflect implemented worker execution, without claiming runtime activation.
+
+
+## 2026-11-08 - src/video_core/src/engines/maxwell_3d.rs vs src/video_core/engines/maxwell_3d.cpp and .h (frontend state/write and backend upload ownership)
+
+### Intentional differences
+- FrontState uses an engine-owned Arc<Mutex<FrontState>> with separately allocated register arrays and a copy of the immutable execution mask. FrontWrite takes this retained state and EngineHandle rather than borrowing a backend Maxwell3D concurrently.
+- Front drains before forming any engine reference, including on handle reacquisition; runtime must cache the handle. ConsumeSink still precedes copying registers/shadow and moving parameters.
+- When native_macro_context is absent, Front moves the local MacroEngine and copies its binding positions into a new shared NativeMacroContext. Both existing backend accessors and the frontend select that same context afterward. This preserves one live macro state without concurrent references into an embedded backend field; the dormant local fallback is unused after takeover. Existing shared contexts retain identity. No runtime activation yet.
+- Shadow control stores raw u32 enum bits in FrontState so unknown modes remain intact for comparison/diagnostics; unknown values retain upstream passthrough behavior. Control-write counters, bind pointers and CB offsets wrap as upstream unsigned arithmetic.
+- Short macro-context guards end before Method/MacroWrite enqueue or ring-space waits. FrontVerifyEnabled/FrontSkipSame/FrontHandledOutsideDrawManager stay module-local, matching upstream anonymous-namespace ownership.
+
+### Unintentional differences (to fix)
+- None identified within Front/FrontWrite, backend upload suppression, or backend control-write recording. Original method arguments (not replayed effective values) are queued as upstream does.
+
+### Missing items
+- FrontCallMethod/MultiMethod, FrontRunMacro, FrontDmaRead, FrontVerify, FinishFrontMacro and runtime integration remain pending. FrontState fields for these methods are present; no placeholder methods were installed.
+
+### Binary layout verification
+- PASS: copied register banks retain NUM_REGS=0xe00 u32; binding positions retain0x80 u32; control-write history retains16 entries of three u32 words. Host-only ownership wrappers are not guest ABI payloads.
+- Re-read upstream50fa86bbbc403ad565eb44fcc281f16f77c69e15 .cpp/.h after implementation. Compared shadow-before-skip ordering, executable side effects, upload/binding semantics, deferred-draw classification, original-argument forwarding and suppression paths.
+- Regression tests in maxwell_3d_test.rs cover local-state takeover and sink consumption, shared-state identity, mixed direct/queued writes across shadow modes, same-value shadow updates, single code generation (no repeated backend upload), binding bounds/wrap, CB offset wrap, draw pending and cross-thread context availability.
+
+
+## 2026-11-09 - src/video_core/src/macro_turing_jit.rs vs src/video_core/macro_turing_jit.h (Rust callback panic boundary prerequisite)
+
+### Intentional differences
+- Upstream is header-only; there is no matching .cpp. Rust extern-C read/emit thunks now catch callback panics internally, store the original payload outside State, return through the generated function normally, then resume unwinding on the Rust stack. Outer catch_unwind alone cannot prevent an abort through an extern-C callback.
+- State.pad is named callback_failed and initialized to zero. A panicking read sets it; generated opcode22 checks it immediately and exits through the existing fail_emit epilogue before any later lane, output or guest effect. A panicking emit returns false through the existing failure branch. Execute resumes the original panic instead of exposing that internal error result.
+- Successful read/emit semantics and ordinary false-emission errors are unchanged; FIFO pointer/size refresh still follows callbacks. Catching panics and the read flag check add host work on all native-JIT users, including any Switch1 user of that JIT; performance impact remains unmeasured.
+
+### Unintentional differences (to fix)
+- None identified in callback ordering or normal return behavior.
+
+### Missing items
+- Integrated split-worker failure propagation to the frontend/UI remains pending.
+
+### Binary layout verification
+- PASS by offset assertions: callback_failed occupies the existing byte147; scratch_x remains148, params160, FIFO200, total State208. No guest ABI data changes.
+- Re-read upstream50fa86bbbc403ad565eb44fcc281f16f77c69e15 State/Execute/Thunks/opcode22 after implementation. Added regression for both read and emit panics, preserving payload and prior effects, rejecting later DWRITE, FIFO reallocation, and subsequent JIT reuse.
+
+## 2026-11-09 - src/video_core/src/engines/maxwell_3d.rs vs src/video_core/engines/maxwell_3d.cpp and .h (frontend execution, DMA and completion)
+
+### Intentional differences
+- FrontCallMethod/MultiMethod/RunMacro use the retained FrontState plus stable EngineHandle. FrontState retains the channel RAM/memory-manager handles and a typed non-owning back pointer captured during drained takeover; no backend engine reference spans an enqueue or drain.
+- FrontRunMacro releases the context guard after JIT preparation, before emitted writes or DMA waits. The FIFO is leased separately during Execute, and callback FIFO/RAM arguments supply FrontDmaRead without overlapping whole-state references or recursive RAM locking. FIFO ownership is restored on Rust unwinding.
+- FinishFrontMacro is queued as a Copy/Send typed pointer-wrapper callback. It consumes the sink then draws deferred instances in backend queue order. No unused System parameter is passed.
+- FrontVerify uses atomic diagnostic counters rather than unsynchronized static integers. It drains before inspecting backend registers and the pending sink, then reproduces upstream reconciliation and log limits. Its expected register bank uses Box storage.
+- Wrapping arithmetic explicitly preserves unsigned binding/CB offsets, counters, source addresses and DMA RAM offset addition. The optional profiling scope also covers host context acquisition during macro preparation.
+
+### Unintentional differences (to fix)
+- None identified in the ported method branches. Bulk CB, inline-upload and packed-index paths remain distinct; macro completion still follows amount==methods_pending. DMA count clamps0x1000, BufferCache flush precedes reads, and FIFO/ bounded RAM writes use the source order.
+
+### Missing items
+- Runtime frontend handle dispatch, activation/eligibility, kernel/cache/lifecycle bridges, integrated ring saturation and session teardown validation remain pending. No gameplay activation or FPS claim.
+- JIT callback boundary prerequisite implemented separately; focused/full validation pending at audit time.
+
+### Binary layout verification
+- PASS: u32 register/FIFO/RAM words and original array sizes retained. FrontState owns host handles, not guest ABI payloads.
+- Re-read upstream .cpp/.h FrontCallMethod/MultiMethod/RunMacro/DmaRead/Verify/FinishFrontMacro after implementation. Regression tests exercise real worker DMA/cache visibility/FIFO growth, partial and zero-parameter completion, single deferred draw completion, bulk register parity and verification of pending sink entries without executing them.
+
+## 2026-11-09 - src/video_core/src/gpu_split.rs vs src/video_core/gpu_split.h (Defer visibility)
+
+### Intentional differences
+- Defer becomes crate-visible for Maxwell FinishFrontMacro scheduling; typed callback packet behavior is unchanged. Re-read upstream header-owned Defer template.
+
+### Unintentional differences (to fix)
+- None introduced.
+
+### Missing items
+- Runtime integration remains pending.
+
+### Binary layout verification
+- N/A: visibility only; existing host packet layout unchanged.
+
+- Validation follow-up: JIT8/8, Maxwell frontend8/8 and Kepler frontend6/6 focused tests passed. Added real worker-registration failure followed by frontend JIT emission: panic is recoverable and FIFO ownership survives. DMA flush coverage assertions allow mapped-page segmentation while requiring contiguous exact coverage and BufferCache selection. Combined full suite running; no runtime activation or FPS result.
+
+
+## 2026-11-09 - src/video_core/src/gpu_split.rs vs src/video_core/gpu_split.cpp and .h (session-scoped frontend access and eligibility)
+
+### Intentional differences
+- GpuSplitFrontend is an owner-local mechanical adapter around the existing transport. Rc confines it to the frontend thread; each method borrows the RefCell transport only for its enqueue/publish/drain operation. No mutable producer borrow spans engine macros, scheduler dispatch or external cache callbacks. Transport packet semantics remain unchanged.
+- Get/Active access is represented by a scoped thread-local optional frontend handle, not a process-static producer. CurrentGuard removes it on return or unwind; unrelated threads and the backend cannot enqueue through that accessor. This prevents stale session producer state.
+- into_transport requires all frontend handles/scopes to be released, then moves the Send transport to the joining owner. This supports upstream ThreadManager ordering: join front first, then stop/join back while renderer/channel owners survive. Runtime ThreadManager wiring is still pending.
+- MaybeStart returns a new eligible frontend handle rather than mutating a singleton. Eligibility is extracted mechanically for exhaustive tests; default mode2, explicit mode1/2, NX2/Vulkan, High/Safe DMA exclusion and x86 JIT-dependent front macros follow upstream. Actual kernel registration is retained in the worker callback at its existing source point. The caller must install the scope; no runtime caller is installed yet.
+
+### Unintentional differences (to fix)
+- No differences identified in eligibility predicates, environment first-character handling, command transport or kernel registration ordering within this slice.
+
+### Missing items
+- CheckOwner diagnostics and EDEN_NX2_SPLIT_CHECK handling remain pending; not silently implemented as a no-op.
+- Runtime ThreadManager, DMA, Puller, Scheduler and cache/lifecycle integration remain pending. MaybeStart is not invoked by gameplay yet.
+
+### Binary layout verification
+- PASS: ring packet layouts untouched; Rc/RefCell ownership is host-only.
+- Re-read upstream50fa86bbbc403ad565eb44fcc281f16f77c69e15 .cpp/.h Get/Active/FrontMacros/MaybeStart/Stop and ThreadManager shutdown order after implementation. Tests cover the mode/settings matrix, nested current-handle access, backend TLS isolation, fresh sessions, transferring transport after front join and scope cleanup on panic.
+
+## 2026-11-09 - src/video_core/src/engines/kepler_compute.rs vs src/video_core/engines/kepler_compute.cpp and .h (frontend access adapter)
+
+### Intentional differences
+- Front* methods now receive &GpuSplitFrontend instead of &mut GpuSplit. Each transport operation owns its short mutable borrow, so no exclusive producer borrow crosses JIT callbacks. Existing regression fixtures use the same adapter.
+
+### Unintentional differences (to fix)
+- None introduced; method/state/write ordering unchanged.
+
+### Missing items
+- Runtime DMA dispatch/handle lifetime integration and performance validation remain pending.
+
+### Binary layout verification
+- N/A: host parameter type only. Re-read corresponding upstream declarations and call routing.
+
+## 2026-11-09 - src/video_core/src/engines/maxwell_3d.rs vs src/video_core/engines/maxwell_3d.cpp and .h (frontend access adapter)
+
+### Intentional differences
+- Front* methods use &GpuSplitFrontend, avoiding a live &mut producer across JIT, DMA/cache and verification callbacks. maxwell_3d_test.rs fixtures use the same adapter; frontend state and worker packet semantics are unchanged.
+
+### Unintentional differences (to fix)
+- None introduced.
+
+### Missing items
+- Runtime DMA dispatch/handle lifetime integration, cache owner checks and gameplay validation remain pending.
+
+### Binary layout verification
+- N/A: host parameter type only. Re-read upstream declarations and call routing after the adapter change.
+
+
+## 2026-11-09 ? src/video_core/src/engines/puller.rs vs src/video_core/engines/puller.cpp and .h
+
+### Intentional differences
+- OnBack takes the existing optional typed RasterizerHandle plus a Copy + Send callback; the packet captures argument values and never a borrow of the frontend Puller. Its lifetime still follows the renderer/channel owner graph. No-rasterizer test fallback is preserved.
+- DrainBack uses scoped thread-local frontend access; absence is the upstream inactive no-op. All five source drain points and all eight OnBack call sites retain source ordering, including direct cache/fence accesses only after draining.
+- Re-read both upstream files at origin/eden-nx2 50fa86bbbc403ad565eb44fcc281f16f77c69e15 after the implementation. Switch1 trigger do/while(false) remains a single check, not a retry loop. SEM_EXECUTE acquires still check once.
+
+### Unintentional differences (to fix)
+- No new differences in this routing slice. Full runtime activation is intentionally withheld pending DMA and ThreadManager ownership/routing prerequisites.
+
+### Missing items
+- End-to-end gameplay measurements and Switch1 runtime regression gate remain pending; no FPS gain is claimed.
+
+### Binary layout verification
+- PASS: no guest layout, register index, packet payload, or semaphore width changes. New regression checks capture-time values, FIFO execution on the backend, and a frontend acquire after draining prior work.
+
+## 2026-11-09 ? src/video_core/src/control/scheduler.rs vs src/video_core/control/scheduler.cpp and .h
+
+### Intentional differences
+- DeferredBind is a typed Copy + Send non-owning capture of upstream this/gpu_ptr/bind_id. Backend execution reacquires the same channel-map scheduling guard before GPU::BindChannel; enqueue occurs outside that guard. Owners must remain stable until backend join, as in upstream.
+- Re-read both upstream files at origin/eden-nx2 50fa86bbbc403ad565eb44fcc281f16f77c69e15 and compared BindChannel ordering. Existing Arc/Mutex channel/DMA ownership adaptations are unchanged.
+
+### Unintentional differences (to fix)
+- None in BindChannel routing. ThreadManager join-front/stop-back wiring is still a prerequisite to activating the session frontend in gameplay.
+
+### Missing items
+- Runtime integration, FPS measurements, and Switch1 gate remain pending.
+
+### Binary layout verification
+- PASS: only host-side callback capture added; no guest ABI changes. Regression enqueues while the scheduling guard is held, then releases it before backend execution.
+
+Validation for 2026-11-09 scheduler/puller routing: puller 17 passed, scheduler 3 passed; full video_core suite running (ruzu-split-routing-full.log). Prior scoped-frontend snapshot: 1778 passed, 0 failed, 1 ignored, doc-tests passed. No gameplay activation or measured FPS gain.
+
+
+## 2026-11-09 ? src/video_core/src/engines/{maxwell_3d,kepler_compute}.rs vs src/video_core/engines/{maxwell_3d,kepler_compute}.{h,cpp}
+
+### Intentional differences
+- Expose FrontState (fields remain private), Front, FrontCallMethod and FrontCallMultiMethod crate-wide for DMA integration. Upstream DMA calls public frontend methods whose private Front accessor retrieves embedded state; Rust DMA retains the separate Arc allocation to avoid creating engine references while the backend mutates it. Existing method bodies/owners are unchanged. Re-read both headers and corresponding cpp Front/FrontCall declarations and definitions at 50fa86bbbc403ad565eb44fcc281f16f77c69e15.
+
+### Unintentional differences (to fix)
+- None introduced by visibility changes.
+
+### Missing items
+- DMA caller wiring and combined validation follow this prerequisite.
+
+### Binary layout verification
+- PASS: visibility-only changes, no state or guest ABI changes.
+
+
+## 2026-11-09 ? src/video_core/src/dma_pusher.rs vs src/video_core/dma_pusher.cpp and .h
+
+### Intentional differences
+- Split single/multi dispatch forwards copied payloads with WantsSegment selection, or calls native Maxwell/Kepler FrontCall methods. Rust caches Arc handles to engine-owned frontend state per binding; flags are read once after Drain because borrowing the backend engine concurrently would violate Rust aliasing. Runtime native-mode setters are used only during ChannelState initialization. Changing a binding invalidates the cached handle; repeating the same binding preserves it. Mode 1 does not use cached front macros.
+- Deferred dirty-cache checks capture an owning memory-manager Arc in an owned callback (upstream captures a raw pointer); this introduces allocation/refcount work on these continued-payload fetches, but retains ownership through execution/cancellation. Method packets remain allocation-free.
+- List completion uses a typed Copy/Send GPU pointer capture with the existing owner lifetime contract. FlushCommands precedes OnCommandListEnd and Publish follows enqueue, as upstream. SignalFence drains first.
+- Private method names now match upstream CallMethod/CallMultiMethod in snake_case. Removed stale callback-only integration comment.
+- Re-read upstream .h/.cpp at origin/eden-nx2 50fa86bbbc403ad565eb44fcc281f16f77c69e15 after implementation and compared split branches, WantsSegment, BindSubchannel, ReportUnboundSubchannel, and completion/fence ordering.
+
+### Unintentional differences (to fix)
+- Fixed discovered small divergence: unbound single/multi commands previously panicked; now ReportUnboundSubchannel logs the first eight and drops the method, matching upstream.
+- Existing optional parked-method and pushbuffer-hash diagnostic paths are not added by this slice; they require a separate parser-state audit. Default continuation and current acquire/resume behavior are preserved.
+
+### Missing items
+- ThreadManager lifecycle and command routing, owner diagnostics, end-to-end activation and FPS A/B remain pending. No FPS improvement claimed.
+
+### Binary layout verification
+- PASS: no guest command/header/register layouts changed. FrontEngine and DeferredListEnd are host-only state; packets use existing typed transport. Tests cover 2.4 million multi-method values (ring wrap and input overwrite), native graphics/compute binding transitions without duplicate uploads, unbound dropping, and segment selection. Focused and full validation pending.
+
+DMA validation fixture notes: native code pointer uses instruction units (3 words), corrected new test input accordingly. Existing dirty-sampling matrix retains all 162 combinations but now reuses its unchanged unmapped address space and resets every relevant DMA field/dirty flag each iteration; this removes redundant initialization, not coverage.
+
+DMA focused validation: 21 passed, 0 failed (includes 6 cdma tests matched by the filter), 18.48 s. Full video_core suite started: ruzu-split-dma-full.log. Prior Scheduler/Puller snapshot: 1781 passed, 0 failed, 1 ignored, doctests passed (504.27 s). No emulator launch or FPS measurement in this slice.
+
+
+## 2026-11-09 ? src/common/src/bounded_threadsafe_queue.rs vs src/common/bounded_threadsafe_queue.h
+
+### Intentional differences
+- Added stop-aware EmplaceWait returning an unqueued owned value, needed for Rust worker unwind while the queue is full; upstream noexcept consumers do not recover from exceptions. Existing enqueue API and normal queue operations remain unchanged.
+- External notify_all locks each wait mutex separately to reproduce reliable stop-token wakeup with Rust Condvar.
+
+### Unintentional differences (to fix)
+- Fixed PopWaitWithStop consuming queued data despite a requested stop; upstream always checks the stop token before moving data. Fixed lost-wakeup window in external stop notification.
+
+### Missing items
+- None for the cancellation prerequisite. Header-only upstream re-read and Pop/Emplace/notification ordering compared at 50fa86bbbc403ad565eb44fcc281f16f77c69e15.
+
+### Binary layout verification
+- PASS: no queue fields or guest layouts changed. Focused queue tests: 6 passed. Full common: 425 unit tests and 2 integration tests passed; 1 doc-test ignored.
+
+
+## 2026-11-09 ? src/video_core/src/gpu_thread.rs vs src/video_core/gpu_thread.cpp and .h
+
+### Intentional differences
+- Per-session frontend scope replaces the upstream singleton; RunThread retries MaybeStart between commands until eligible. Its returned Send transport passes through JoinHandle to ThreadManager, preserving join-front then stop/join-back ordering before renderer/scheduler destruction. Typed Copy pointer captures replace raw C++ lambda captures; payloads remain owned until executed or cancelled.
+- Rust StopOnUnwind wakes queue/fence waiters before dropping the split transport; a backend panic callback performs the same wake. Stop-aware bounded enqueue prevents a full producer queue from retaining write_lock forever after consumer failure. These paths adapt C++ noexcept termination to Rust thread unwinding; normal dispatch order is unchanged.
+- SignalCommand retains its upstream file and ordering: signaled fence after actual backend command, then lock/notify for blocking callers. Stop notifications acquire write_lock only after waking the bounded queue to avoid a producer-lock cycle.
+- Re-read .h/.cpp at 50fa86bbbc403ad565eb44fcc281f16f77c69e15 and compared dispatch cases, deferred completion, Publish, MaybeStart placement, and NotifyShutdown.
+
+### Unintentional differences (to fix)
+- None identified in normal split command ordering. Frontend unwind joins its transport during cleanup rather than returning it; owners remain alive until this join completes.
+
+### Missing items
+- Combined tests and gameplay FPS/regression validation pending. Runtime source is now connected, but no new release/gameplay run has occurred.
+
+### Binary layout verification
+- PASS: host-only thread return type and callback captures; no guest ABI changes. Added tests for FIFO/backend thread identity across fresh sessions, backend failure releasing a blocking submitter, frontend failure cleanup, front-before-back shutdown and a full producer queue cancellation.
+
+## 2026-11-09 ? src/video_core/src/gpu_split.rs vs src/video_core/gpu_split.cpp and .h
+
+### Intentional differences
+- MaybeStart accepts a shared session failure notifier, cloned only after eligibility succeeds. Worker unwind marks failure/stops/wakes transport before invoking the notifier to release frontend and host waits; original panic is resumed afterward.
+- CheckOwner uses a Weak session state and its OS thread ID instead of process-global busy/ID variables, avoiding stale session state. Its Windows report keeps the upstream 12-report limit, 40-frame capture, module-relative offsets and environment-presence enablement. No stack capture or owner mutex lock when disabled. Rust stderr writes ignore output errors instead of panicking.
+- Re-read upstream header and cpp MaybeStart/Stop/BackLoop/CheckOwner after changes at 50fa86bbbc403ad565eb44fcc281f16f77c69e15.
+
+### Unintentional differences (to fix)
+- None identified in this lifecycle/diagnostic slice.
+
+### Missing items
+- Full session validation and real renderer execution remain pending.
+
+### Binary layout verification
+- PASS: new OS thread ID is host-only; packet formats and guest structs unchanged.
+
+## 2026-11-09 ? src/video_core/src/renderer_vulkan/scheduler.rs vs src/video_core/renderer_vulkan/vk_scheduler.cpp and .h
+
+### Intentional differences
+- RecordWithUploadBuffer, Flush, Finish and DispatchWork invoke the inline CheckOwner wrapper, which contains the disabled fast-path check. Upstream has the same guard at the call sites. Re-read both source files and compared all four locations.
+
+### Unintentional differences (to fix)
+- None in the diagnostic call sites.
+
+### Missing items
+- Vulkan gameplay validation pending; diagnostic output alone cannot prove race freedom.
+
+### Binary layout verification
+- PASS: no descriptor, command, or guest layout changes.
+
+ThreadManager focused validation: 10 passed, 0 failed, 1.54 s; cross-channel/CPU-release/acquire-stop regression now runs both unsplit and split. Final MaybeStart ordering preserves the upstream early mode/NX2 rejection before settings lock and JIT getenv, avoiding new per-command Switch1 work. Transport and full final-source validation follow.
+
+Final-source transport validation: 18 passed, 0 failed (0.38 s). Full video_core suite running in ruzu-split-thread-full.log; source activation is integrated, but release/gameplay validation is still pending.
+
+Integrated runtime validation: full cargo test -p video_core -- --test-threads=1 passed: 1789 passed, 0 failed, 1 ignored, doc-tests passed (376.89 s), ruzu-split-thread-full.log. Release compilation and gameplay validation remain pending.
+
+## 2026-11-09 - src/video_core/src/gpu_split.rs default mode vs src/video_core/gpu_split.cpp MaybeStart
+
+### Intentional differences
+- Upstream defaults EDEN_NX2_SPLIT to mode '2' when the variable is absent
+  (gpu_split.cpp:86-89 at 50fa86bbbc40). The Rust port now defaults to '0'
+  (inactive). Justification: paired same-binary, same-scene, same-settings
+  benchmarks on the only validated host (Mario Kart World 1.8.0 start grid,
+  Vulkan, GPU accuracy Low, NX2) measured the split as a regression:
+  mode 0 mean 21.24 FPS (median 21.96) versus mode 2 mean 19.53 and 17.63 FPS
+  across two independent windows. Evidence:
+  tools/capture_harness/recordings/nx2-split-paired-20261109.json.
+- The environment variable keeps upstream semantics otherwise: '1' and '2'
+  select the same modes with the same eligibility (NX2, Vulkan, Low accuracy,
+  unsafe DMA reads, x86_64 JIT for mode 2 front macros). Only the absent-value
+  default changed. Revisit after the Rust transport/wake overhead is profiled
+  and reduced; this is a measured host-side decision, not a parity claim.
+
+### Unintentional differences (to fix)
+- None in this slice.
+
+### Missing items
+- Mode-2 regression root cause (ring wake protocol, extra thread contention on
+  the measured 8-thread-busy host, or frontend lock boundaries) is not yet
+  isolated.
+
+### Binary layout verification
+- n/a (host scheduling decision; no guest-visible state).
+
+## 2026-11-09 - engines/engine_interface.rs, dma_pusher.rs, gpu_split.rs hot-path member access vs video_core/engines/engine_interface.h
+
+### Intentional differences
+- Upstream EngineInterface declares execution_mask, method_sink, current_dirty
+  and current_dma_segment as public base-class data members; DmaPusher and
+  GpuSplit::Execute read and write them directly, and ConsumeSink is an inline
+  non-virtual empty-check wrapper. The Rust port exposed each as a separate
+  trait method, costing up to five dynamic dispatches per guest method call
+  (3.0M calls/s measured on Mario Kart World). EngineInterface now exposes the
+  existing shared EngineInterfaceState through interface_state()/
+  interface_state_mut(), and the two hot paths (DmaPusher::CallMethod/
+  CallMultiMethod outside split mode; GpuSplitBack::execute) use one state
+  access plus direct field reads, calling consume_sink_impl only when the sink
+  is non-empty - the mechanical equivalent of upstream's direct member access
+  and inline ConsumeSink. Deferral semantics, ConsumeSink-before-segment
+  ordering and dispatch order are unchanged.
+- The per-method trait accessors (execution_mask, push_method_sink,
+  has_pending_methods, set_current_dma_segment, current_dirty,
+  set_current_dirty) became default methods over interface_state, and the six
+  production engines dropped their duplicated implementations. Test engines
+  (RecordingEngine, TraceEngine, encoding TestEngine) now hold a real
+  EngineInterfaceState; behavioral overrides (panic on sink push, tracing)
+  are preserved.
+
+### Unintentional differences (to fix)
+- None known in this slice.
+
+### Missing items
+- None; this is a dispatch-shape alignment, not a new feature.
+
+### Binary layout verification
+- n/a (host dispatch; no guest-visible state or serialized layout changed).
+
+## 2026-11-09 - textures/bcn.rs gather candidate evaluation vs video_core/textures/bcn.cpp
+
+### Intentional differences
+- Evaluated the saved row-copy gather candidate for CompressBCN's
+  non-thresholded path against the saved baseline microbenchmark: output is
+  bit-exact (identical digests) but the gain is 1-3% because stb_dxt block
+  compression dominates. The candidate was rejected in favor of upstream's
+  per-texel gather; only its scalar parity regression test
+  (bc3_matches_eden_texel_gather_for_full_and_partial_blocks) was kept.
+  No production code differs from upstream in this slice.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- PASS: BC3/BC1 output verified bit-exact against the independent scalar
+  reference for all 1..=9 edge remainders and two planes.
+
+## 2026-11-09 - nx2_profile.rs and buffer_cache.rs diagnostic sub-zones (Rust extension)
+
+### Intentional differences
+- Six new Rust-only diagnostic zones (buf update index/vertex/uniform/storage,
+  bind uniform/storage) decompose the existing UpdateBuffers and
+  BindStageBuffers zones. Scopes are inert without EDEN_NX2_GPU_PROFILE, like
+  the existing DMA diagnostic zones. No execution-order or state change.
+- Measured decomposition at the race grid (26.9k draws/s): buf update
+  index 3.6 / vertex 7.1 / uniform 7.7 / storage 7.2 ms/s; bind uniform
+  24.8 / storage 9.2 ms/s - all faithful and small. The dominant per-draw
+  cost is fill image views (143-303 ms/s with opponent streaming), whose
+  DescriptorTable/VisitImageView structure was audited as faithful; its cost
+  is descriptor visiting plus first-encounter texture conversion.
+
+### Unintentional differences (to fix)
+- None.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- n/a (profiling-only).

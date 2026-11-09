@@ -46,6 +46,21 @@ pub enum Zone {
     Method,
     SplitDrain,
     SplitWait,
+    // Rust diagnostic extension: distinguish residual SubmitList time without
+    // changing upstream zone indices or command execution semantics.
+    DmaFetch,
+    DmaWait,
+    DmaDispatch,
+    DmaFlush,
+    DmaListEnd,
+    ReleaseFences,
+    FenceHostWait,
+    BufUpdateIndex,
+    BufUpdateVertex,
+    BufUpdateUniform,
+    BufUpdateStorage,
+    BindUniform,
+    BindStorage,
     Count,
 }
 
@@ -83,6 +98,19 @@ pub const ZONE_NAMES: [&str; Zone::Count as usize] = [
     "method",
     "split drain",
     "split wait",
+    "dma fetch",
+    "dma wait",
+    "dma dispatch",
+    "dma flush",
+    "dma list end",
+    "release fences",
+    "fence host wait",
+    "buf update index",
+    "buf update vertex",
+    "buf update uniform",
+    "buf update storage",
+    "bind uniform",
+    "bind storage",
 ];
 
 // Rust's process-wide initialization occurs on first use rather than pre-main.
@@ -307,7 +335,7 @@ mod tests {
         report("test");
         assert_eq!(data().window_start, 10_000_000_100);
         assert_eq!(data().counters, [0; 8]);
-        assert_eq!(data().count, [0; 33]);
+        assert_eq!(data().count, [0; Zone::Count as usize]);
         assert!(dma_read_pages().remove(&u64::MAX));
     }
     #[test]
@@ -326,6 +354,54 @@ mod tests {
         report("test");
         assert_eq!(data(), original);
     }
+    #[test]
+    fn dma_breakdown_excludes_nested_macro_time_from_submission() {
+        let _fixture = Fixture::new(true, 100);
+        let push = Scope::new(Zone::Push);
+        time(110);
+        let fetch = Scope::new(Zone::DmaFetch);
+        time(130);
+        drop(fetch);
+        let dispatch = Scope::new(Zone::DmaDispatch);
+        time(140);
+        let macro_scope = Scope::new(Zone::Macro);
+        time(180);
+        drop(macro_scope);
+        time(190);
+        drop(dispatch);
+        let flush = Scope::new(Zone::DmaFlush);
+        time(200);
+        drop(flush);
+        drop(push);
+        let d = data();
+        assert_eq!(d.exclusive_ns[Zone::Push as usize], 10);
+        assert_eq!(d.exclusive_ns[Zone::DmaFetch as usize], 20);
+        assert_eq!(d.exclusive_ns[Zone::DmaDispatch as usize], 20);
+        assert_eq!(d.exclusive_ns[Zone::Macro as usize], 40);
+        assert_eq!(d.exclusive_ns[Zone::DmaFlush as usize], 10);
+        assert_eq!(d.child_ns, 100);
+    }
+    #[test]
+    fn fence_wait_is_not_charged_to_release_setup_or_dma_dispatch() {
+        let _fixture = Fixture::new(true, 100);
+        let dispatch = Scope::new(Zone::DmaDispatch);
+        time(110);
+        let release = Scope::new(Zone::ReleaseFences);
+        time(130);
+        let wait = Scope::new(Zone::FenceHostWait);
+        time(180);
+        drop(wait);
+        time(190);
+        drop(release);
+        time(200);
+        drop(dispatch);
+        let d = data();
+        assert_eq!(d.exclusive_ns[Zone::DmaDispatch as usize], 20);
+        assert_eq!(d.exclusive_ns[Zone::ReleaseFences as usize], 30);
+        assert_eq!(d.exclusive_ns[Zone::FenceHostWait as usize], 50);
+        assert_eq!(d.child_ns, 100);
+    }
+
     #[test]
     fn thread_totals_are_isolated_and_counters_wrap() {
         let _fixture = Fixture::new(true, 1);

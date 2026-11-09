@@ -3710,6 +3710,11 @@ impl TextureCache {
         self.base.has_uncommitted_flushes()
     }
 
+    /// Upstream exposes this through its TextureCache template alias.
+    pub fn has_async_flush_work(&self) -> bool {
+        self.base.has_async_flush_work()
+    }
+
     pub fn pop_async_flushes(&mut self) {
         let Some(download_ids) = self.base.committed_downloads.pop_front() else {
             return;

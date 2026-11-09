@@ -815,12 +815,7 @@ impl SamplesStreamer {
             .push_back(std::mem::take(&mut self.pending_flush_queries));
     }
 
-    fn should_wait_async_flushes(&self) -> bool {
-        self.pending_flush_sets
-            .lock()
-            .front()
-            .is_some_and(|reports| !reports.is_empty())
-    }
+
 
     /// Port of `SamplesStreamer::PopUnsyncedQueries`: sync each bank range
     /// once, then sum the results of every query in the set.
@@ -1738,12 +1733,7 @@ impl TfbCounterStreamer {
             .push_back(std::mem::take(&mut self.pending_flush_queries));
     }
 
-    fn should_wait_async_flushes(&self) -> bool {
-        self.pending_flush_sets
-            .lock()
-            .front()
-            .is_some_and(|reports| !reports.is_empty())
-    }
+
 
     fn pop_unsynced_queries(&mut self) {
         let _ = self.pending_flush_sets.lock().pop_front();
@@ -2647,6 +2637,9 @@ pub struct QueryCache {
     // Keep its address stable when the surrounding rasterizer is moved.
     pub base: Box<QueryCacheBase>,
     pub runtime: Box<QueryCacheRuntime>,
+    /// Per-fence bits for the streamers owned outside QueryCacheBase in Rust.
+    /// Includes empty entries, matching QueryCacheBaseImpl::flushes_pending.
+    pending_backend_flushes: parking_lot::Mutex<VecDeque<u64>>,
     /// Channel-bound GPU device memory manager. Used to translate the
     /// query's GPU virtual address to the underlying CPU/guest address
     /// when writing the query result back. Mirrors the wiring in
@@ -2727,6 +2720,7 @@ impl QueryCache {
         let mut cache = QueryCache {
             base: Box::new(QueryCacheBase::new()),
             runtime,
+            pending_backend_flushes: parking_lot::Mutex::new(VecDeque::new()),
             channel_memory_manager: None,
             gpu_memory_adapter: None,
             device_memory_adapter: Some(device_memory_adapter),
@@ -2764,6 +2758,7 @@ impl QueryCache {
         Self {
             base: Box::new(QueryCacheBase::new()),
             runtime: Box::new(QueryCacheRuntime::new()),
+            pending_backend_flushes: parking_lot::Mutex::new(VecDeque::new()),
             channel_memory_manager: None,
             gpu_memory_adapter: None,
             device_memory_adapter: None,
@@ -2977,16 +2972,21 @@ impl QueryCache {
     ) {
         self.notify_wfi(scheduler, &mut sync_operation);
         self.base.commit_async_flushes_with_callback(sync_operation);
+        let mut mask = 0;
         if let Some(samples_streamer) = self.runtime.samples_streamer.as_mut() {
             if samples_streamer.has_unsynced_queries() {
+                mask |= 1u64 << QueryType::ZPassPixelCount64 as u32;
                 samples_streamer.push_unsynced_queries(scheduler);
             }
         }
         if let Some(tfb_streamer) = self.runtime.tfb_streamer.as_mut() {
             if tfb_streamer.has_unsynced_queries() {
+                mask |= 1u64 << QueryType::StreamingByteCount as u32;
                 tfb_streamer.push_unsynced_queries(scheduler);
             }
         }
+        // Publish one entry even when neither backend streamer committed work.
+        self.pending_backend_flushes.lock().push_back(mask);
     }
     pub fn has_uncommitted_flushes(&self) -> bool {
         self.base.has_uncommitted_flushes()
@@ -3001,26 +3001,35 @@ impl QueryCache {
                 .as_ref()
                 .is_some_and(TfbCounterStreamer::has_unsynced_queries)
     }
+    /// Upstream exposes QueryCacheBase::HasPendingFenceWork through its
+    /// QueryCache alias. Include the backend-owned streamers, just as the
+    /// existing flush and WFI adapters do for Rust's split streamer ownership.
+    pub fn has_pending_fence_work(&self) -> bool {
+        self.base.has_pending_fence_work()
+            || self.runtime.samples_streamer.as_ref().is_some_and(|streamer| {
+                streamer.has_unsynced_queries() || streamer.has_pending_sync()
+            })
+            || self.runtime.tfb_streamer.as_ref().is_some_and(|streamer| {
+                streamer.has_unsynced_queries() || streamer.has_pending_sync()
+            })
+    }
+
     pub fn should_wait_async_flushes(&self) -> bool {
         self.base.should_wait_async_flushes()
-            || self
-                .runtime
-                .samples_streamer
-                .as_ref()
-                .is_some_and(SamplesStreamer::should_wait_async_flushes)
-            || self
-                .runtime
-                .tfb_streamer
-                .as_ref()
-                .is_some_and(TfbCounterStreamer::should_wait_async_flushes)
+            || self.pending_backend_flushes.lock().front().is_some_and(|&mask| mask != 0)
     }
     pub fn pop_async_flushes(&mut self) {
+        let mask = self.pending_backend_flushes.lock().pop_front().unwrap_or(0);
         self.base.pop_async_flushes();
-        if let Some(samples_streamer) = self.runtime.samples_streamer.as_mut() {
-            samples_streamer.pop_unsynced_queries();
+        if mask & (1u64 << QueryType::ZPassPixelCount64 as u32) != 0 {
+            if let Some(samples_streamer) = self.runtime.samples_streamer.as_mut() {
+                samples_streamer.pop_unsynced_queries();
+            }
         }
-        if let Some(tfb_streamer) = self.runtime.tfb_streamer.as_mut() {
-            tfb_streamer.pop_unsynced_queries();
+        if mask & (1u64 << QueryType::StreamingByteCount as u32) != 0 {
+            if let Some(tfb_streamer) = self.runtime.tfb_streamer.as_mut() {
+                tfb_streamer.pop_unsynced_queries();
+            }
         }
     }
 
@@ -3547,6 +3556,26 @@ mod tests {
 
         cache.erase_channel(channel.bind_id);
         assert!(!cache.has_bound_memory_manager_for_test());
+    }
+
+    #[test]
+    fn backend_fence_masks_preserve_empty_entries_before_later_work() {
+        let mut cache = QueryCache::new_for_test();
+        let samples = 1u64 << QueryType::ZPassPixelCount64 as u32;
+        let tfb = 1u64 << QueryType::StreamingByteCount as u32;
+        let masks = [0, samples, 0, tfb, samples | tfb, 0];
+        // No Vulkan resources are needed to validate the parallel per-fence
+        // queue contract; actual streamer readback remains runtime validation.
+        cache.pending_backend_flushes.lock().extend(masks);
+        cache.base.impl_.flushes_pending.extend([0; 6]);
+        for (index, mask) in masks.into_iter().enumerate() {
+            assert_eq!(cache.should_wait_async_flushes(), mask != 0);
+            cache.pop_async_flushes();
+            assert_eq!(cache.pending_backend_flushes.lock().len(), masks.len() - index - 1);
+            assert_eq!(cache.base.impl_.flushes_pending.len(), masks.len() - index - 1);
+            assert_eq!(cache.pending_backend_flushes.lock().front().copied(), masks.get(index + 1).copied());
+        }
+        assert!(!cache.should_wait_async_flushes());
     }
 
     #[test]

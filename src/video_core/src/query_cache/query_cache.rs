@@ -18,6 +18,18 @@ use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::RasterizerInterface;
 
+impl QueryCacheBase {
+    /// Port of `QueryCacheBase<Traits>::HasPendingFenceWork` in query_cache.h.
+    pub fn has_pending_fence_work(&self) -> bool {
+        let mut result = false;
+        self.impl_.for_each_streamer(|streamer| {
+            result |= streamer.has_unsynced_queries() || streamer.has_pending_sync();
+            result
+        });
+        result
+    }
+}
+
 /// Guest sync payload written back by runtime-owned sync operations.
 ///
 /// Maps to C++ `SyncValuesStruct`.

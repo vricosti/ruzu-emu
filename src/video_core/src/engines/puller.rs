@@ -8,11 +8,29 @@
 //! methods (semaphores, fences, sync points) or to bound engine subchannels.
 
 use crate::control::channel_state::ChannelState;
-use crate::engines::engine_interface::EngineInterface;
+use crate::engines::engine_interface::{EngineHandle, EngineInterface};
 use crate::engines::engine_interface::EngineTypes;
 use crate::query_cache::types::{QueryPropertiesFlags, QueryType};
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
 use std::sync::Arc;
+
+// Port of puller.cpp's anonymous OnBack/DrainBack helpers. Only capture
+// immutable command arguments and the non-owning rasterizer handle, never the
+// frontend-owned Puller. The renderer must outlive the joined backend worker.
+fn on_back<F>(handle: Option<RasterizerHandle>, func: F)
+where F: Fn(&mut dyn RasterizerInterface) + Copy + Send + 'static {
+    let Some(handle) = handle else { return; };
+    let call = move || unsafe { handle.with_mut(func) };
+    if let Some(split) = crate::gpu_split::current() {
+        split.defer(call);
+    } else {
+        call();
+    }
+}
+
+fn drain_back() {
+    if let Some(split) = crate::gpu_split::current() { split.drain(); }
+}
 
 const GF100_BIND_CLASS_MASK: u32 = 0xFFFF;
 const GF100_BIND_VALID_MASK: u32 = 0x1F0000 | GF100_BIND_CLASS_MASK;
@@ -333,10 +351,28 @@ impl PullerRegs {
 /// Number of subchannels.
 const NUM_SUBCHANNELS: usize = 8;
 
-/// The GPU command puller.
-///
-/// Corresponds to the C++ `Puller` class. Dispatches method calls to either
-/// built-in puller methods or bound engine subchannels.
+/// Corresponds to Puller::PendingAcquire in puller.h.
+#[derive(Clone, Copy)]
+struct PendingAcquire {
+    address: u64,
+    value: u32,
+    operation: u32,
+    since: std::time::Instant,
+    reported: bool,
+}
+
+impl PendingAcquire {
+    fn matches(&self, current: u32) -> bool {
+        match self.operation {
+            0x1 => current == self.value,
+            0x4 => current >= self.value,
+            0x8 => current & self.value != 0,
+            _ => true,
+        }
+    }
+}
+
+/// The GPU command puller, corresponding to the C++ Puller class.
 pub struct Puller {
     pub regs: PullerRegs,
     /// Mapping of subchannels to bound engine IDs.
@@ -345,6 +381,20 @@ pub struct Puller {
     dma_pusher: *mut crate::dma_pusher::DmaPusher,
     rasterizer: Option<RasterizerHandle>,
     channel_state: *mut ChannelState,
+    // Upstream takes stable payload engine addresses during SetObject. Cache
+    // those non-owning handles before dispatch so binding never borrows an
+    // engine that a split backend may currently be mutating.
+    engine_handles: [Option<EngineHandle>; 6],
+    pending_acquire: Option<PendingAcquire>,
+    // Keep the registered identity for Drop even if a standalone Rust puller
+    // moves. Production pullers live inside the channel's boxed DmaPusher.
+    waiter_owner: usize,
+}
+
+impl Drop for Puller {
+    fn drop(&mut self) {
+        crate::nx2::Nx2SemaphoreWaiters::get().remove(self.waiter_owner);
+    }
 }
 
 impl Puller {
@@ -353,6 +403,17 @@ impl Puller {
         dma_pusher: *mut crate::dma_pusher::DmaPusher,
         channel_state: *mut ChannelState,
     ) -> Self {
+        // Production constructs Puller after all six boxed engines and before
+        // any channel commands can run. Channel lifetime covers these handles;
+        // replacing payload engines requires constructing a new DMA/Puller.
+        let engine_handles = unsafe { channel_state.as_ref() }.map(|channel| [
+            channel.nv01_timer.as_ref().map(|engine| EngineHandle::from_ref(engine.as_ref())),
+            channel.kepler_compute.as_ref().map(|engine| EngineHandle::from_ref(engine.as_ref())),
+            channel.maxwell_3d.as_ref().map(|engine| EngineHandle::from_ref(engine.as_ref())),
+            channel.fermi_2d.as_ref().map(|engine| EngineHandle::from_ref(engine.as_ref())),
+            channel.maxwell_dma.as_ref().map(|engine| EngineHandle::from_ref(engine.as_ref())),
+            channel.kepler_memory.as_ref().map(|engine| EngineHandle::from_ref(engine.as_ref())),
+        ]).unwrap_or([None; 6]);
         Self {
             regs: PullerRegs::default(),
             bound_engines: [EngineID::default(); NUM_SUBCHANNELS],
@@ -360,7 +421,39 @@ impl Puller {
             dma_pusher,
             rasterizer: None,
             channel_state,
+            engine_handles,
+            pending_acquire: None,
+            waiter_owner: 0,
         }
+    }
+
+    pub fn has_pending_acquire(&self) -> bool {
+        self.pending_acquire.is_some()
+    }
+
+    pub fn can_resume_acquire(&mut self) -> bool {
+        let Some(acquire) = self.pending_acquire else { return true; };
+        drain_back();
+        let current = self.read_semaphore_word(acquire.address);
+        if crate::nx2::Nx2SemaphoreWaiters::get().latched(self.waiter_owner)
+            || acquire.matches(current)
+        {
+            return true;
+        }
+        if !acquire.reported && acquire.since.elapsed() > std::time::Duration::from_secs(2) {
+            self.pending_acquire.as_mut().unwrap().reported = true;
+            log::warn!("Semaphore {:#x} waits for 2 s: operation {}, expected {:#x}, current {:#x}",
+                acquire.address, acquire.operation, acquire.value, current);
+        }
+        false
+    }
+
+    pub fn resume_acquire(&mut self) -> bool {
+        if !self.can_resume_acquire() { return false; }
+        self.pending_acquire = None;
+        crate::nx2::Nx2SemaphoreWaiters::get().remove(self.waiter_owner);
+        self.waiter_owner = 0;
+        true
     }
 
     /// Bind a rasterizer interface to this puller.
@@ -413,11 +506,23 @@ impl Puller {
     }
 
     fn read_gpu_u32(&self, gpu_va: u64) -> u32 {
-        let mut bytes = [0u8; 4];
-        self.memory_manager
-            .lock()
-            .read_block_unsafe(gpu_va, &mut bytes);
-        u32::from_le_bytes(bytes)
+        self.memory_manager.lock().read::<u32>(gpu_va)
+    }
+
+    /// Port of puller.cpp's ReadSemaphoreWord, owned here with the acquire path.
+    fn read_semaphore_word(&mut self, gpu_va: u64) -> u32 {
+        // Release the memory-manager guard before entering the rasterizer:
+        // downloading the buffer may access the same manager again.
+        let device = self.memory_manager.lock().gpu_to_cpu_address(gpu_va);
+        if let Some(device) = device {
+            self.with_rasterizer_mut(|rasterizer| {
+                let which = crate::cache_types::CacheType::BUFFER_CACHE;
+                if rasterizer.must_flush_region(device, 4, which) {
+                    rasterizer.flush_region(device, 4, which);
+                }
+            });
+        }
+        self.memory_manager.lock().read::<u32>(gpu_va)
     }
 
     fn write_gpu_u32(&self, gpu_va: u64, value: u32) {
@@ -505,13 +610,13 @@ impl Puller {
                 // No-op for these methods
             }
             Some(BufferMethods::RefCnt) => {
-                self.with_rasterizer_mut(|rasterizer| rasterizer.signal_reference());
+                on_back(self.rasterizer, move |rasterizer| rasterizer.signal_reference());
             }
             Some(BufferMethods::SyncpointOperation) => {
                 self.process_fence_action_method();
             }
             Some(BufferMethods::WaitForIdle) => {
-                self.with_rasterizer_mut(|rasterizer| rasterizer.wait_for_idle());
+                on_back(self.rasterizer, move |rasterizer| rasterizer.wait_for_idle());
             }
             Some(BufferMethods::SemaphoreOperation) => {
                 self.process_semaphore_trigger_method();
@@ -523,7 +628,7 @@ impl Puller {
                 log::trace!("Memory Operation A");
             }
             Some(BufferMethods::MemOpB) => {
-                self.with_rasterizer_mut(|rasterizer| rasterizer.invalidate_gpu_cache());
+                on_back(self.rasterizer, move |rasterizer| rasterizer.invalidate_gpu_cache());
             }
             Some(BufferMethods::MemOpC) | Some(BufferMethods::MemOpD) => {
                 log::trace!("Memory Operation C,D");
@@ -746,66 +851,20 @@ impl Puller {
             | EngineID::KeplerInlineToMemoryB
             | EngineID::MaxwellDmaCopyA
             | EngineID::Nv01Timer => {
-                let channel_state = unsafe { &mut *self.channel_state };
-                let dma_pusher = unsafe { self.dma_pusher.as_mut() };
-                if let Some(dma_pusher) = dma_pusher {
-                    match eid {
-                        EngineID::FermiTwodA => {
-                            if let Some(engine) = channel_state.fermi_2d.as_mut() {
-                                dma_pusher.bind_subchannel(
-                                    engine.as_mut(),
-                                    method_call.subchannel,
-                                    EngineTypes::Fermi2D,
-                                );
-                            }
-                        }
-                        EngineID::MaxwellB => {
-                            if let Some(engine) = channel_state.maxwell_3d.as_mut() {
-                                dma_pusher.bind_subchannel(
-                                    engine.as_mut(),
-                                    method_call.subchannel,
-                                    EngineTypes::Maxwell3D,
-                                );
-                            }
-                        }
-                        EngineID::KeplerComputeB => {
-                            if let Some(engine) = channel_state.kepler_compute.as_mut() {
-                                dma_pusher.bind_subchannel(
-                                    engine.as_mut(),
-                                    method_call.subchannel,
-                                    EngineTypes::KeplerCompute,
-                                );
-                            }
-                        }
-                        EngineID::KeplerInlineToMemoryB => {
-                            if let Some(engine) = channel_state.kepler_memory.as_mut() {
-                                dma_pusher.bind_subchannel(
-                                    engine.as_mut(),
-                                    method_call.subchannel,
-                                    EngineTypes::KeplerMemory,
-                                );
-                            }
-                        }
-                        EngineID::MaxwellDmaCopyA => {
-                            if let Some(engine) = channel_state.maxwell_dma.as_mut() {
-                                dma_pusher.bind_subchannel(
-                                    engine.as_mut(),
-                                    method_call.subchannel,
-                                    EngineTypes::MaxwellDMA,
-                                );
-                            }
-                        }
-                        EngineID::Nv01Timer => {
-                            if let Some(engine) = channel_state.nv01_timer.as_mut() {
-                                dma_pusher.bind_subchannel(
-                                    engine.as_mut(),
-                                    method_call.subchannel,
-                                    EngineTypes::Nv01Timer,
-                                );
-                            }
-                        }
-                        _ => unreachable!("known engine ids are handled by the outer match"),
-                    }
+                let engine_type = match eid {
+                    EngineID::FermiTwodA => EngineTypes::Fermi2D,
+                    EngineID::MaxwellB => EngineTypes::Maxwell3D,
+                    EngineID::KeplerComputeB => EngineTypes::KeplerCompute,
+                    EngineID::KeplerInlineToMemoryB => EngineTypes::KeplerMemory,
+                    EngineID::MaxwellDmaCopyA => EngineTypes::MaxwellDMA,
+                    EngineID::Nv01Timer => EngineTypes::Nv01Timer,
+                    _ => unreachable!("known engine ids are handled by the outer match"),
+                };
+                if let (Some(engine), Some(dma)) = (
+                    self.engine_handles[engine_type as usize],
+                    unsafe { self.dma_pusher.as_mut() },
+                ) {
+                    dma.bind_subchannel_handle(engine, method_call.subchannel, engine_type);
                 }
             }
             _ => {
@@ -829,11 +888,11 @@ impl Puller {
         let action = self.regs.fence_action();
         match action.op() {
             FenceOperation::Acquire => {
-                self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
+                on_back(self.rasterizer, |rasterizer| rasterizer.release_fences(true));
             }
             FenceOperation::Increment => {
                 let syncpoint_id = action.syncpoint_id();
-                self.with_rasterizer_mut(|rasterizer| rasterizer.signal_sync_point(syncpoint_id));
+                on_back(self.rasterizer, move |rasterizer| rasterizer.signal_sync_point(syncpoint_id));
             }
         }
     }
@@ -847,16 +906,66 @@ impl Puller {
         if op == GpuSemaphoreOperation::WriteLong as u32 {
             let sequence_address = self.regs.semaphore_address();
             let payload = self.regs.semaphore_sequence();
-            self.with_rasterizer_mut(|rasterizer| {
+            let nx2 = crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::SeqCst);
+            // RELEASE_SIZE selects a four-byte payload on NX2. A timestamp
+            // release here would overwrite adjacent semaphore words.
+            let properties = if nx2 && self.regs.semaphore_trigger() & (1 << 24) != 0 {
+                QueryPropertiesFlags::IS_A_FENCE
+            } else {
+                QueryPropertiesFlags::HAS_TIMEOUT
+            };
+            let mirror = if nx2 {
+                crate::nx2::nx2_semaphore_mirror(sequence_address)
+            } else {
+                0
+            };
+            on_back(self.rasterizer, move |rasterizer| {
                 rasterizer.query(
                     sequence_address,
                     QueryType::Payload as u32,
-                    QueryPropertiesFlags::HAS_TIMEOUT,
+                    properties,
                     payload,
                     0,
-                )
+                );
+                if mirror != 0 {
+                    rasterizer.query(mirror, QueryType::Payload as u32, properties, payload, 0);
+                }
             });
+        } else if crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::SeqCst) {
+            if !matches!(op, 0x1 | 0x4 | 0x8) {
+                log::error!("Invalid semaphore operation {}", op);
+                return;
+            }
+            let acquire = PendingAcquire {
+                address: self.regs.semaphore_address(),
+                value: self.regs.semaphore_sequence(),
+                operation: op,
+                since: std::time::Instant::now(),
+                reported: false,
+            };
+            crate::nx2_profile::add(crate::nx2_profile::Counter::AcquireChecks, 1);
+            drain_back();
+            if acquire.matches(self.read_semaphore_word(acquire.address)) { return; }
+            let waiters = crate::nx2::Nx2SemaphoreWaiters::get();
+            let device = self.memory_manager.lock().gpu_to_cpu_address(acquire.address);
+            if let Some(device) = device {
+                self.waiter_owner = self as *const Self as usize;
+                waiters.add(self.waiter_owner, device, acquire.value, acquire.operation);
+            }
+            // Register before draining: a matching release must remain latched
+            // even if another fence overwrites the same word in this drain.
+            self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
+            if !waiters.latched(self.waiter_owner)
+                && !acquire.matches(self.read_semaphore_word(acquire.address))
+            {
+                self.pending_acquire = Some(acquire);
+                crate::nx2_profile::add(crate::nx2_profile::Counter::AcquireWaits, 1);
+            } else {
+                waiters.remove(self.waiter_owner);
+                self.waiter_owner = 0;
+            }
         } else {
+            drain_back();
             let word = self.read_gpu_u32(self.regs.semaphore_address());
             let acquire_value = self.regs.semaphore_sequence();
             self.regs.set_acquire_source(1);
@@ -888,21 +997,21 @@ impl Puller {
         }
     }
 
-    /// Port of Puller::ProcessSemaphoreExecute, using the upstream unsplit GPU path.
-    /// The current Rust GPU executes rasterizer work synchronously on its GPU thread,
-    /// so there is no separate back-thread queue to defer to or drain here.
+    /// Port of Puller::ProcessSemaphoreExecute. Releases are ordered on the
+    /// backend; acquires drain it before checking memory and remain nonblocking.
     fn process_semaphore_execute(&mut self, argument: u32) {
         let address = ((self.regs.reg_array[0x18] as u64 & 0x1ffffff) << 32)
             | (self.regs.reg_array[0x17] & !3) as u64;
         let payload = self.regs.reg_array[0x19];
         let operation = argument & 7;
         if operation == 1 {
-            self.with_rasterizer_mut(|rasterizer| {
+            on_back(self.rasterizer, move |rasterizer| {
                 rasterizer.query(address, QueryType::Payload as u32,
                     QueryPropertiesFlags::IS_A_FENCE, payload, 0);
             });
             return;
         }
+        drain_back();
         self.with_rasterizer_mut(|rasterizer| rasterizer.release_fences(true));
         let word = self.read_gpu_u32(address);
         let ready = match operation {
@@ -926,6 +1035,7 @@ impl Puller {
     ///
     /// Corresponds to `Puller::ProcessSemaphoreAcquire`.
     fn process_semaphore_acquire(&mut self) {
+        drain_back();
         let addr = self.regs.semaphore_address();
         let value = self.regs.semaphore_acquire();
         let mut word = self.read_gpu_u32(addr);
@@ -957,7 +1067,7 @@ impl Puller {
             self.write_gpu_u32(sequence_address, payload);
             return;
         }
-        self.with_rasterizer_mut(|rasterizer| {
+        on_back(self.rasterizer, move |rasterizer| {
             rasterizer.query(
                 sequence_address,
                 QueryType::Payload as u32,
@@ -996,12 +1106,18 @@ mod tests {
 
     #[derive(Default)]
     struct FakeRasterizer {
+        events: StdArc<StdMutex<Vec<(&'static str, std::thread::ThreadId)>>>,
         accelerate_dma: crate::rasterizer_interface::TestAccelerateDMA,
         syncpoints: StdArc<StdMutex<Vec<u32>>>,
         wait_for_idle_calls: StdArc<StdMutex<u32>>,
         reference_calls: StdArc<StdMutex<u32>>,
         release_fence_calls: StdArc<StdMutex<Vec<bool>>>,
         query_calls: StdArc<StdMutex<Vec<(u64, u32, QueryPropertiesFlags, u32)>>>,
+        flush_needed: bool,
+        flush_checks: StdArc<StdMutex<Vec<(u64, u64, crate::cache_types::CacheType)>>>,
+        flush_calls: StdArc<StdMutex<Vec<(u64, u64, crate::cache_types::CacheType)>>>,
+        flush_write: Option<(Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>, u64, u32)>,
+        release_writes: Option<(Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>, u64, Vec<u32>)>,
     }
 
     impl RasterizerInterface for FakeRasterizer {
@@ -1038,6 +1154,7 @@ mod tests {
             payload: u32,
             _subreport: u32,
         ) {
+            self.events.lock().unwrap().push(("query", std::thread::current().id()));
             self.query_calls
                 .lock()
                 .unwrap()
@@ -1055,23 +1172,42 @@ mod tests {
         fn signal_fence(&mut self, _func: Box<dyn FnOnce() + Send>) {}
         fn sync_operation(&mut self, _func: Box<dyn FnOnce() + Send>) {}
         fn signal_sync_point(&mut self, value: u32) {
+            self.events.lock().unwrap().push(("syncpoint", std::thread::current().id()));
             self.syncpoints.lock().unwrap().push(value);
         }
         fn signal_reference(&mut self) {
+            self.events.lock().unwrap().push(("reference", std::thread::current().id()));
             *self.reference_calls.lock().unwrap() += 1;
         }
         fn release_fences(&mut self, force: bool) {
+            self.events.lock().unwrap().push(("release", std::thread::current().id()));
             self.release_fence_calls.lock().unwrap().push(force);
+            if let Some((memory, address, values)) = &self.release_writes {
+                for &value in values {
+                    let mut memory = memory.lock();
+                    memory.write::<u32>(*address, value);
+                    let device = memory.gpu_to_cpu_address(*address).unwrap();
+                    drop(memory);
+                    crate::nx2::Nx2SemaphoreWaiters::get().on_write(device, value);
+                }
+            }
         }
         fn flush_all(&mut self) {}
-        fn flush_region(&mut self, _addr: u64, _size: u64, _which: crate::cache_types::CacheType) {}
+        fn flush_region(&mut self, addr: u64, size: u64, which: crate::cache_types::CacheType) {
+            self.flush_calls.lock().unwrap().push((addr, size, which));
+            if let Some((memory, address, value)) = &self.flush_write {
+                memory.try_lock().expect("puller must release memory lock before flush")
+                    .write::<u32>(*address, *value);
+            }
+        }
         fn must_flush_region(
             &self,
-            _addr: u64,
-            _size: u64,
-            _which: crate::cache_types::CacheType,
+            addr: u64,
+            size: u64,
+            which: crate::cache_types::CacheType,
         ) -> bool {
-            false
+            self.flush_checks.lock().unwrap().push((addr, size, which));
+            self.flush_needed
         }
         fn get_flush_area(&self, addr: u64, _size: u64) -> RasterizerDownloadArea {
             RasterizerDownloadArea {
@@ -1091,7 +1227,9 @@ mod tests {
         fn on_cpu_write(&mut self, _addr: u64, _size: u64) -> bool {
             false
         }
-        fn invalidate_gpu_cache(&mut self) {}
+        fn invalidate_gpu_cache(&mut self) {
+            self.events.lock().unwrap().push(("invalidate", std::thread::current().id()));
+        }
         fn unmap_memory(&mut self, _addr: u64, _size: u64) {}
         fn modify_gpu_memory(&mut self, _as_id: usize, _addr: u64, _size: u64) {}
         fn flush_and_invalidate_region(
@@ -1102,6 +1240,7 @@ mod tests {
         ) {
         }
         fn wait_for_idle(&mut self) {
+            self.events.lock().unwrap().push(("wait", std::thread::current().id()));
             *self.wait_for_idle_calls.lock().unwrap() += 1;
         }
         fn fragment_barrier(&mut self) {}
@@ -1115,6 +1254,87 @@ mod tests {
             _memory: &[u8],
         ) {
         }
+    }
+
+    #[test]
+    fn split_acquire_paths_drain_pending_backend_work_before_returning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut puller = Puller::default();
+        let fake = Box::new(FakeRasterizer::default());
+        puller.bind_rasterizer(fake.as_ref());
+        let split = crate::gpu_split::GpuSplitFrontend::new(false);
+        let scope = split.install();
+        split.start_back(|| {});
+        for path in 0..4 {
+            let completed = Arc::new(AtomicBool::new(false));
+            let signal = completed.clone();
+            split.defer_function(Box::new(move || { signal.store(true, Ordering::Release); }));
+            match path {
+                0 => {
+                    puller.regs.reg_array[0x07] = GpuSemaphoreOperation::AcquireEqual as u32;
+                    puller.process_semaphore_trigger_method();
+                }
+                1 => puller.process_semaphore_acquire(),
+                2 => {
+                    puller.pending_acquire = Some(PendingAcquire {
+                        address: 0, value: 0, operation: GpuSemaphoreOperation::AcquireEqual as u32,
+                        since: std::time::Instant::now(), reported: false,
+                    });
+                    assert!(puller.resume_acquire());
+                }
+                3 => puller.process_semaphore_execute(0),
+                _ => unreachable!(),
+            }
+            assert!(completed.load(Ordering::Acquire), "acquire path {path} did not drain");
+        }
+        split.stop().unwrap();
+        drop(scope);
+    }
+
+    #[test]
+    fn split_puller_preserves_fifo_and_captures_register_values_before_execution() {
+        let mut puller = Puller::default();
+        let fake = Box::new(FakeRasterizer::default());
+        puller.bind_rasterizer(fake.as_ref());
+        let split = crate::gpu_split::GpuSplitFrontend::new(false);
+        let scope = split.install();
+        let (ready, wait) = std::sync::mpsc::channel();
+        split.start_back(move || { wait.recv_timeout(std::time::Duration::from_secs(10)).unwrap(); });
+        puller.regs.reg_array[0x1D] = 1 | (7 << 8);
+        puller.process_fence_action_method();
+        puller.regs.reg_array[0x1D] = 0;
+        puller.process_fence_action_method();
+        for method in [BufferMethods::RefCnt, BufferMethods::WaitForIdle, BufferMethods::MemOpB] {
+            puller.call_puller_method(&MethodCall::new(method as u32, 0, 0, 1));
+        }
+        puller.regs.reg_array[0x05] = 0x1000;
+        puller.regs.reg_array[0x1B] = 11;
+        puller.process_semaphore_release();
+        puller.regs.reg_array[0x05] = 0x2000;
+        puller.regs.reg_array[0x06] = 22;
+        puller.regs.reg_array[0x07] = 2;
+        puller.process_semaphore_trigger_method();
+        puller.regs.reg_array[0x17] = 0x3003;
+        puller.regs.reg_array[0x19] = 33;
+        puller.process_semaphore_execute(1);
+        puller.regs.reg_array.fill(0);
+        assert!(fake.events.lock().unwrap().is_empty());
+        ready.send(()).unwrap();
+        // An acquire must drain the preceding releases before using the
+        // rasterizer directly on the frontend. Unmapped zero equals payload.
+        puller.process_semaphore_execute(0);
+        split.stop().unwrap();
+        drop(scope);
+        assert_eq!(*fake.syncpoints.lock().unwrap(), vec![7]);
+        let events = fake.events.lock().unwrap();
+        assert_eq!(events.iter().map(|e| e.0).collect::<Vec<_>>(),
+            ["syncpoint", "release", "reference", "wait", "invalidate", "query", "query", "query", "release"]);
+        let front = std::thread::current().id();
+        assert!(events[..8].iter().all(|e| e.1 == events[0].1 && e.1 != front));
+        assert_eq!(events[8].1, front);
+        let queries = fake.query_calls.lock().unwrap();
+        assert_eq!(queries.iter().map(|q| (q.0, q.3)).collect::<Vec<_>>(),
+            [(0x1000, 11), (0x2000, 22), (0x3000, 33)]);
     }
 
     #[test]
@@ -1202,6 +1422,40 @@ mod tests {
     }
 
     #[test]
+    fn bind_uses_initialized_engine_handles_without_accessing_channel_or_engine_state() {
+        let gpu = crate::gpu::Gpu::new(false, false);
+        let mut channel = Box::new(ChannelState::new(1));
+        let memory = Arc::new(parking_lot::Mutex::new(crate::memory_manager::MemoryManager::default()));
+        channel.memory_manager = Some(memory.clone());
+        channel.init(&gpu, 1);
+        let dma_handle = channel.dma_pusher.as_ref().unwrap().clone();
+        let mut dma = dma_handle.lock();
+        let mut puller = Puller::new(memory, dma.as_mut(), channel.as_mut());
+        let cases = [
+            (EngineID::Nv01Timer.raw(), EngineTypes::Nv01Timer, EngineHandle::from_ref(channel.nv01_timer.as_ref().unwrap().as_ref())),
+            (EngineID::KeplerComputeB.raw(), EngineTypes::KeplerCompute, EngineHandle::from_ref(channel.kepler_compute.as_ref().unwrap().as_ref())),
+            (EngineID::MaxwellB.raw(), EngineTypes::Maxwell3D, EngineHandle::from_ref(channel.maxwell_3d.as_ref().unwrap().as_ref())),
+            (EngineID::FermiTwodA.raw(), EngineTypes::Fermi2D, EngineHandle::from_ref(channel.fermi_2d.as_ref().unwrap().as_ref())),
+            (EngineID::MaxwellDmaCopyA.raw(), EngineTypes::MaxwellDMA, EngineHandle::from_ref(channel.maxwell_dma.as_ref().unwrap().as_ref())),
+            (EngineID::KeplerInlineToMemoryB.raw(), EngineTypes::KeplerMemory, EngineHandle::from_ref(channel.kepler_memory.as_ref().unwrap().as_ref())),
+        ];
+        // A valid bind must need only copied handles, not the channel pointer.
+        // The real channel and boxed engines still own every handle throughout.
+        puller.channel_state = std::ptr::null_mut();
+        for (class, kind, handle) in cases {
+            for subchannel in 0..NUM_SUBCHANNELS {
+                puller.process_bind_method(&MethodCall::new(0, class, subchannel as u32, 1));
+                assert_eq!(dma.subchannel_binding_for_test(subchannel), (true, kind));
+                assert!(dma.subchannel_handle_for_test(subchannel).unwrap().ptr_eq(handle));
+            }
+        }
+        for (alias, index) in [(0xc797, 2), (0xc7c0, 1), (0xc7b5, 4)] {
+            puller.process_bind_method(&MethodCall::new(0, alias, 7, 1));
+            assert!(dma.subchannel_handle_for_test(7).unwrap().ptr_eq(cases[index].2));
+        }
+    }
+
+    #[test]
     fn unknown_bind_engine_stores_raw_value_then_logs_like_upstream_without_debug_asserts() {
         let mut puller = Puller::default();
 
@@ -1256,6 +1510,152 @@ mod tests {
         crate::nx2::G_NX2_AMPERE.store(false, std::sync::atomic::Ordering::SeqCst);
         puller.process_bind_method(&MethodCall::new(0, 0, 4, 1));
         assert_eq!(puller.bound_engines[4].raw(), 0);
+    }
+
+    #[test]
+    fn nx2_acquire_predicates_latching_timeout_and_drop_preserve_wait_contract() {
+        const CHILD: &str = "RUZU_PULLER_ACQUIRE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--test-threads=1"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        use crate::nx2::Nx2SemaphoreWaiters;
+        crate::nx2::G_NX2_AMPERE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut backing = vec![0u8; 0x1000];
+        let device = Arc::new(MaxwellDeviceMemoryManager::default());
+        device.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device.smmu_map_with_cpu_backing(0x9000_0000, backing.as_mut_ptr(), 0x5000_0000, backing.len(), 3, true);
+        let mut memory = MemoryManager::new_with_geometry_and_device_memory(13, device, 32, 0x1_0000_0000, 16, 12);
+        memory.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+        let memory = Arc::new(parking_lot::Mutex::new(memory));
+        let mut fake = Box::new(FakeRasterizer::default());
+        for (op, target, unmet, met) in [(1, 7, 8, 7), (4, 0x80000000, 0x7fffffff, u32::MAX), (8, 0x80, 1, 0x81)] {
+            let mut puller = Box::new(Puller::new(memory.clone(), std::ptr::null_mut(), std::ptr::null_mut()));
+            puller.bind_rasterizer(fake.as_ref());
+            puller.regs.reg_array[5] = 0x20040;
+            puller.regs.reg_array[6] = target;
+            puller.regs.reg_array[7] = op;
+            memory.lock().write::<u32>(0x20040, unmet);
+            puller.process_semaphore_trigger_method();
+            assert!(puller.has_pending_acquire());
+            assert!(!puller.resume_acquire());
+            puller.pending_acquire.as_mut().unwrap().since -= std::time::Duration::from_secs(3);
+            assert!(!puller.resume_acquire(), "diagnostic timeout must never release a channel");
+            assert!(puller.pending_acquire.unwrap().reported);
+            // CPU writes have no registry callback: polling must still resume.
+            memory.lock().write::<u32>(0x20040, met);
+            assert!(puller.resume_acquire());
+            assert!(!puller.has_pending_acquire());
+            // A release followed by an overwrite is latched during fence drain.
+            fake.release_writes = Some((memory.clone(), 0x20040, vec![met, unmet]));
+            memory.lock().write::<u32>(0x20040, unmet);
+            puller.process_semaphore_trigger_method();
+            assert!(!puller.has_pending_acquire());
+            fake.release_writes = None;
+            puller.process_semaphore_trigger_method();
+            let owner = puller.waiter_owner;
+            Nx2SemaphoreWaiters::get().on_write(0x9000_0040, met);
+            Nx2SemaphoreWaiters::get().on_write(0x9000_0040, unmet);
+            assert!(puller.can_resume_acquire());
+            assert!(puller.resume_acquire());
+            assert!(!Nx2SemaphoreWaiters::get().latched(owner));
+            puller.process_semaphore_trigger_method();
+            Nx2SemaphoreWaiters::get().on_write(0x9000_0040, met);
+            assert!(Nx2SemaphoreWaiters::get().latched(owner));
+            drop(puller);
+            assert!(!Nx2SemaphoreWaiters::get().latched(owner), "session teardown must remove waiters");
+        }
+    }
+
+    #[test]
+    fn semaphore_trigger_release_size_and_mirror_match_nx2_without_changing_switch1() {
+        // Isolate the session globals from other parallel tests.
+        const CHILD: &str = "RUZU_PULLER_RELEASE_SIZE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--test-threads=1"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let region = 0x1_2340_0000;
+        crate::nx2::nx2_add_semaphore_region(region);
+        let mut puller = Puller::default();
+        let fake = Box::new(FakeRasterizer::default());
+        puller.bind_rasterizer(fake.as_ref());
+        for nx2 in [false, true] {
+            crate::nx2::G_NX2_AMPERE.store(nx2, std::sync::atomic::Ordering::SeqCst);
+            for short in [false, true] {
+                for address in [region + 0x40, region + 0x1040] {
+                    fake.query_calls.lock().unwrap().clear();
+                    puller.regs.reg_array[0x4] = (address >> 32) as u32;
+                    puller.regs.reg_array[0x5] = address as u32;
+                    puller.regs.reg_array[0x6] = 0xdeadbeef;
+                    puller.regs.reg_array[0x7] = 2 | if short { 1 << 24 } else { 0 };
+                    puller.process_semaphore_trigger_method();
+                    let flags = if nx2 && short {
+                        QueryPropertiesFlags::IS_A_FENCE
+                    } else {
+                        QueryPropertiesFlags::HAS_TIMEOUT
+                    };
+                    let mut expected = vec![(address, QueryType::Payload as u32, flags, 0xdeadbeef)];
+                    if nx2 && address == region + 0x1040 {
+                        expected.push((region + 0x40, QueryType::Payload as u32, flags, 0xdeadbeef));
+                    }
+                    assert_eq!(*fake.query_calls.lock().unwrap(), expected);
+                }
+            }
+        }
+        crate::nx2::nx2_remove_semaphore_region(region);
+        crate::nx2::G_NX2_AMPERE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn semaphore_read_flushes_only_dirty_buffer_bytes_before_reading() {
+        use crate::cache_types::CacheType;
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+
+        let mut backing = vec![0u8; 0x1000];
+        let device = Arc::new(MaxwellDeviceMemoryManager::default());
+        device.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+        device.smmu_map_with_cpu_backing(
+            0x9000_0000, backing.as_mut_ptr(), 0x5000_0000, backing.len(), 3, true,
+        );
+        let mut memory = MemoryManager::new_with_geometry_and_device_memory(
+            13, device, 32, 0x1_0000_0000, 16, 12,
+        );
+        memory.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+        memory.write::<u32>(0x20040, 3);
+        let memory = Arc::new(parking_lot::Mutex::new(memory));
+        let mut puller = Puller::new(Arc::clone(&memory), std::ptr::null_mut(), std::ptr::null_mut());
+        let mut rasterizer = Box::new(FakeRasterizer {
+            flush_needed: true,
+            flush_write: Some((Arc::clone(&memory), 0x20040, 7)),
+            ..Default::default()
+        });
+        puller.bind_rasterizer(rasterizer.as_ref());
+        assert_eq!(puller.read_semaphore_word(0x20040), 7);
+        let expected = (0x9000_0040, 4, CacheType::BUFFER_CACHE);
+        assert_eq!(*rasterizer.flush_checks.lock().unwrap(), vec![expected]);
+        assert_eq!(*rasterizer.flush_calls.lock().unwrap(), vec![expected]);
+
+        // A clean buffer is read directly, with no download or other cache flush.
+        rasterizer.flush_needed = false;
+        memory.lock().write::<u32>(0x20040, 11);
+        assert_eq!(puller.read_semaphore_word(0x20040), 11);
+        assert_eq!(rasterizer.flush_checks.lock().unwrap().len(), 2);
+        assert_eq!(rasterizer.flush_calls.lock().unwrap().len(), 1);
+
+        // Unmapped addresses must not ask the rasterizer to flush device address zero.
+        assert_eq!(puller.read_semaphore_word(0x30000), 0);
+        assert_eq!(rasterizer.flush_checks.lock().unwrap().len(), 2);
+        assert_eq!(rasterizer.flush_calls.lock().unwrap().len(), 1);
     }
 
     #[test]

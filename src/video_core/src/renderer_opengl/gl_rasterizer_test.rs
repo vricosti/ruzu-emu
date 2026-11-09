@@ -377,7 +377,7 @@ fn signal_reference_accumulates_buffer_ranges_without_queuing_a_fence() {
 }
 
 #[test]
-fn release_fences_pops_async_flushes_for_stubbed_fence() {
+fn empty_fence_does_not_pop_an_unassociated_async_download() {
     let syncpoints = Arc::new(SyncpointManager::new());
     let mut rast = RasterizerOpenGL::new_for_test(syncpoints);
 
@@ -387,7 +387,10 @@ fn release_fences_pops_async_flushes_for_stubbed_fence() {
     rast.signal_fence(Box::new(|| {}));
     rast.release_fences(true);
 
-    assert!(!rast.buffer_cache.should_wait_async_flushes());
+    // Upstream PopAsyncFlushes uses the mask saved when this fence was made.
+    // The injected download has no corresponding fence; a new empty fence
+    // must not steal it from another submission's queue.
+    assert!(rast.buffer_cache.should_wait_async_flushes());
 }
 
 #[test]

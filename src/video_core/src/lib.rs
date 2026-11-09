@@ -21,6 +21,7 @@ pub mod framebuffer_config;
 pub mod fsr;
 pub mod gpu;
 pub mod gpu_logging;
+pub(crate) mod gpu_split;
 pub mod gpu_thread;
 pub mod guest_memory;
 pub mod host1x;

@@ -185,6 +185,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bc3_matches_eden_texel_gather_for_full_and_partial_blocks() {
+        // Independent scalar reference from Eden's CompressBCN<16, false>.
+        // Exercise every edge remainder, multiple planes, and output guards.
+        for width in 1..=9u32 {
+            for height in 1..=9u32 {
+                let depth = 2;
+                let data: Vec<u8> = (0..width * height * depth * 4)
+                    .map(|i| (i.wrapping_mul(37) ^ (i >> 3)) as u8)
+                    .collect();
+                let blocks_x = width.div_ceil(4);
+                let blocks_y = height.div_ceil(4);
+                let size = (blocks_x * blocks_y * depth * 16) as usize;
+                let mut expected = vec![0u8; size];
+                for z in 0..depth {
+                    for y in (0..height).step_by(4) {
+                        for x in (0..width).step_by(4) {
+                            let mut block = [0u8; 64];
+                            for j in 0..4 {
+                                for i in 0..4 {
+                                    if x + i < width && y + j < height {
+                                        let src = ((z * height * width + (y + j) * width + x + i)
+                                            * 4)
+                                            as usize;
+                                        let dst = ((j * 4 + i) * 4) as usize;
+                                        block[dst..dst + 4].copy_from_slice(&data[src..src + 4]);
+                                    }
+                                }
+                            }
+                            let offset = ((z * blocks_y * blocks_x + (y / 4) * blocks_x + x / 4)
+                                * 16) as usize;
+                            unsafe {
+                                ruzu_stb_compress_bc3_block(
+                                    expected[offset..].as_mut_ptr(),
+                                    block.as_ptr(),
+                                );
+                            }
+                        }
+                    }
+                }
+                let mut actual = vec![0xa5u8; size + 32];
+                compress_bc3(&data, width, height, depth, &mut actual[16..16 + size]);
+                assert_eq!(&actual[16..16 + size], &expected, "{width}x{height}");
+                assert_eq!(&actual[..16], &[0xa5; 16]);
+                assert_eq!(&actual[16 + size..], &[0xa5; 16]);
+            }
+        }
+    }
+
+    #[test]
     fn bc1_uses_stb_dxt_output() {
         let mut rgba = vec![0u8; 4 * 4 * 4];
         for pixel in rgba.chunks_exact_mut(4) {

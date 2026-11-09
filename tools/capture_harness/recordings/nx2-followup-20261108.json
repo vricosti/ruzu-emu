@@ -1,0 +1,39 @@
+{
+  "runtime_directory": "C:/Users/smart/AppData/Local/Temp/ruzu-session-astc-nx2-20261108-171449",
+  "repeat_measurement": {
+    "file": "race-repeat-summary.json",
+    "fps_mean": 13.884868998215486,
+    "fps_min": 3.993540049615741,
+    "fps_max": 16.9894652422337,
+    "image_transcode_percent_one_core": 69.541202728369,
+    "valid_stationary_comparison": false,
+    "reason": "Post-measurement screenshot repeat-scene-check.png shows Mario at a different position. Inputs were not recorded in this window. Do not use this run to confirm or refute the previous fastmem gain."
+  },
+  "gpu_observation": {
+    "file": "gpu-observation.csv",
+    "duration_samples": 15,
+    "dedicated_bytes": 6217326592,
+    "shared_bytes": 970731520,
+    "engine_3d_mean_percent": 48.5020802392329,
+    "engine_3d_max_percent": 50.1900923458621,
+    "limitation": "Process-filtered Windows engine counters; not hardware timestamps or a controlled scene comparison. Shared allocation does not prove active paging."
+  },
+  "stack_observations": {
+    "method": "Three noninvasive suspended CDB snapshots outside FPS sampling; process resumed and status verified afterwards",
+    "files": ["consistent-stack-1.txt", "consistent-stack-2.txt", "consistent-stack-3.txt"],
+    "gpu_locations": [
+      "MME native call -> Maxwell3D constant-buffer writes -> GPU memory translation",
+      "Texture-cache garbage collection -> image deletion -> channel image-view invalidation",
+      "GPU command queue waiting for work"
+    ],
+    "limitation": "Pointers to investigate, not a statistical time attribution. Earlier nonsuspending samples had unreliable stack walks."
+  },
+  "next_measurement": {
+    "facility": "Existing video_core/nx2_profile.rs",
+    "enable_environment": "EDEN_NX2_GPU_PROFILE=1",
+    "requires_restart": true,
+    "purpose": "Separate macro, texture upload, tick, pipeline lookup, descriptor, buffer, fence and idle durations without adding new instrumentation",
+    "gates": ["Confirm fastmem enabled on all six cores", "Replay recorded route", "Verify scene before and after interval", "Record inputs or ensure no concurrent manual controls", "Keep profiling runs separate from uninstrumented FPS comparisons"]
+  },
+  "source_changes": false
+}

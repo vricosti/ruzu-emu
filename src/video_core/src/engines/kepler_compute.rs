@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
-use super::engine_interface::{EngineInterface, EngineInterfaceState};
+use super::engine_interface::{EngineHandle, EngineInterface, EngineInterfaceState};
 use super::engine_upload;
 use crate::memory_manager::MemoryManager;
 use crate::rasterizer_interface::{RasterizerHandle, RasterizerInterface};
@@ -259,6 +259,21 @@ pub struct State {
 
 // ── Engine struct ───────────────────────────────────────────────────────────
 
+/// KeplerCompute::FrontState. The Arc-owned allocation lets the frontend access
+/// only its copied state while the backend exclusively borrows KeplerCompute.
+pub(crate) struct FrontState {
+    registers: [u32; 0x1000],
+    executing_macro: Option<u32>,
+    parameters: Vec<u32>,
+    compute_uploaded: bool,
+    bind_pointer: u32,
+    // Owning equivalents of upstream's native_context and macro pointers.
+    native_context: Option<crate::r#macro::SharedNativeMacroContext>,
+    macro_owner: crate::r#macro::SharedNativeMacroContext,
+    macro_compute: bool,
+    native_data_ram: Option<Arc<Mutex<crate::macro_turing::DataRam>>>,
+}
+
 pub struct KeplerCompute {
     /// Native method register bank from KeplerCompute's upstream owner.
     native_registers: [u32; 0x1000],
@@ -278,6 +293,7 @@ pub struct KeplerCompute {
     native_bind_pointer: u32,
     native_mme_dumped: bool,
     front_macros: bool,
+    front: Option<Arc<Mutex<FrontState>>>,
     regs: Box<[u32; KEPLER_COMPUTE_REG_COUNT]>,
     interface_state: EngineInterfaceState,
     memory_manager: Arc<Mutex<MemoryManager>>,
@@ -350,6 +366,7 @@ impl KeplerCompute {
             native_bind_pointer: 0,
             native_mme_dumped: false,
             front_macros: false,
+            front: None,
             regs: Box::new([0u32; KEPLER_COMPUTE_REG_COUNT]),
             interface_state: {
                 let mut state = EngineInterfaceState::new();
@@ -412,6 +429,238 @@ impl KeplerCompute {
 
     pub fn front_runs_macros(&self) -> bool {
         self.native_mode
+    }
+
+    /// Port of Front. Drain occurs before creating any Rust engine reference.
+    ///
+    /// # Safety
+    /// `engine` must be a live, stable engine owned by this split's channel.
+    /// The caller must be its sole command producer, with no engine references
+    /// alive across this call. Cache the returned frontend allocation: subsequent
+    /// dispatch must borrow that allocation, never the concurrently running back.
+    pub(crate) unsafe fn front(
+        engine: *mut Self,
+        split: &crate::gpu_split::GpuSplitFrontend,
+    ) -> Arc<Mutex<FrontState>> {
+        // Upstream checks front before draining. We always drain on acquiring a
+        // handle so even that field is never read through a concurrent &mut Self.
+        split.drain();
+        let engine = unsafe { &mut *engine };
+        if engine.front.is_none() {
+            let state = FrontState {
+                registers: engine.native_registers,
+                executing_macro: engine.native_executing_macro,
+                parameters: std::mem::take(&mut engine.native_parameters),
+                compute_uploaded: engine.native_compute_uploaded,
+                bind_pointer: engine.native_bind_pointer,
+                native_context: engine.native_context.clone(),
+                macro_owner: engine.native_macro_context.clone()
+                    .expect("native compute requires macro owner"),
+                macro_compute: engine.native_macro_compute,
+                native_data_ram: engine.native_data_ram.clone(),
+            };
+            engine.native_executing_macro = None;
+            engine.front = Some(Arc::new(Mutex::new(state)));
+            engine.front_macros = true;
+        }
+        engine.front.as_ref().unwrap().clone()
+    }
+
+    // Mechanical ownership selector for C++'s raw context/macro pointers.
+    fn front_macro_owner(fs: &FrontState) -> &crate::r#macro::SharedNativeMacroContext {
+        fs.native_context.as_ref().unwrap_or(&fs.macro_owner)
+    }
+
+    fn front_macro_engine<'a>(
+        fs: &FrontState,
+        context: &'a mut crate::r#macro::NativeMacroContext,
+    ) -> &'a mut crate::r#macro::MacroEngine {
+        let compute = if fs.native_context.is_some() {
+            fs.compute_uploaded
+        } else {
+            fs.macro_compute
+        };
+        if compute { &mut context.compute_engine } else { &mut context.engine }
+    }
+
+    fn front_macro_positions<'a>(
+        fs: &FrontState,
+        context: &'a mut crate::r#macro::NativeMacroContext,
+    ) -> &'a mut [u32; 0x80] {
+        let compute = if fs.native_context.is_some() {
+            fs.compute_uploaded
+        } else {
+            fs.macro_compute
+        };
+        if compute { &mut context.compute_positions } else { &mut context.positions }
+    }
+
+    /// Port of FrontApply. No macro-context lock survives this call: enqueue,
+    /// ring-space waits and Drain must happen only after it has returned.
+    fn front_apply(fs: &mut FrontState, method: u32, argument: u32) {
+        if method == 0x45 || method == 0x47 {
+            fs.compute_uploaded = true;
+        }
+        fs.registers[method as usize] = argument;
+        match method {
+            0x45 | 0x46 => {
+                let owner = Self::front_macro_owner(fs).clone();
+                let guard = owner.lock();
+                let mut context = guard.borrow_mut();
+                let engine = Self::front_macro_engine(fs, &mut context);
+                if method == 0x45 { engine.clear_code(argument); }
+                else { engine.add_code(0, argument); }
+            }
+            0x47 => fs.bind_pointer = argument,
+            0x48 => {
+                let owner = Self::front_macro_owner(fs).clone();
+                let guard = owner.lock();
+                let mut context = guard.borrow_mut();
+                let positions = Self::front_macro_positions(fs, &mut context);
+                if (fs.bind_pointer as usize) < positions.len() {
+                    positions[fs.bind_pointer as usize] = argument;
+                    fs.bind_pointer += 1;
+                } else {
+                    log::error!("Native compute macro bind out of bounds");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// FrontCallMethod operates only on the retained frontend state, never on
+    /// the engine allocation that the backend is concurrently mutating.
+    pub(crate) fn front_call_method(
+        fs: &mut FrontState, engine: EngineHandle,
+        split: &crate::gpu_split::GpuSplitFrontend,
+        method: u32, argument: u32, is_last_call: bool, segment: Option<u64>,
+    ) {
+        if method as usize >= fs.registers.len() {
+            split.method(engine, method, argument, is_last_call, segment);
+            return;
+        }
+        if method >= 0xe00 {
+            if fs.executing_macro.is_none() {
+                if method & 1 != 0 {
+                    log::error!("Native compute macro starts on argument method");
+                    return;
+                }
+                fs.executing_macro = Some(method);
+            }
+            fs.parameters.push(argument);
+            if is_last_call {
+                Self::front_run_macro(fs, engine, split);
+            }
+            return;
+        }
+        Self::front_apply(fs, method, argument);
+        split.method(engine, method, argument, is_last_call, segment);
+    }
+
+    pub(crate) fn front_call_multi_method(
+        fs: &mut FrontState, engine: EngineHandle,
+        split: &crate::gpu_split::GpuSplitFrontend,
+        method: u32, words: &[u32], amount: u32, methods_pending: u32,
+        segment: Option<u64>,
+    ) {
+        let words = &words[..amount as usize];
+        if method >= 0xe00 && (method as usize) < fs.registers.len() {
+            for (i, &argument) in words.iter().enumerate() {
+                Self::front_call_method(fs, engine, split, method, argument,
+                    methods_pending.wrapping_sub(i as u32) <= 1, segment);
+            }
+            return;
+        }
+        if (method as usize) < fs.registers.len() {
+            for &argument in words {
+                Self::front_apply(fs, method, argument);
+            }
+        }
+        split.multi_method(engine, method, words, amount, methods_pending, segment);
+    }
+
+    fn front_run_macro(
+        fs: &mut FrontState, engine: EngineHandle,
+        split: &crate::gpu_split::GpuSplitFrontend,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let owner = Self::front_macro_owner(fs).clone();
+            // Keep the original macro identity for restoring RAM and reporting
+            // failures even if an emitted upload changes the frontend selector.
+            let compute = if fs.native_context.is_some() {
+                fs.compute_uploaded
+            } else { fs.macro_compute };
+            let _profile = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::Macro);
+            let (start, jit, ram_owner, mut local_ram) = {
+                let guard = owner.lock();
+                let mut context = guard.borrow_mut();
+                let positions = Self::front_macro_positions(fs, &mut context);
+                let start = positions[((fs.executing_macro.unwrap() - 0xe00) / 2) as usize
+                    % positions.len()];
+                fs.executing_macro = None;
+                let macro_engine = Self::front_macro_engine(fs, &mut context);
+                if let Some(ram) = &fs.native_data_ram {
+                    macro_engine.native_interpreter.active_dram = Some(ram.clone());
+                }
+                let jit = macro_engine.native_jit.get_or_insert_with(|| {
+                    Arc::new(std::sync::Mutex::new(Default::default()))
+                }).clone();
+                jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .prepare(&macro_engine.native_code, macro_engine.native_code_generation)
+                    .expect("native compute frontend macro JIT preparation failed");
+                let ram_owner = macro_engine.native_interpreter.active_dram.clone();
+                let local_ram = ram_owner.is_none().then(|| {
+                    std::mem::replace(&mut macro_engine.native_interpreter.dram, [0; 0xc00])
+                });
+                (start, jit, ram_owner, local_ram)
+            }; // Release the context before Execute can enqueue or wait for the back.
+            let mut parameters = std::mem::take(&mut fs.parameters);
+            let mut shared_ram = ram_owner.as_ref().map(|ram| ram.lock());
+            let ram = match shared_ram.as_deref_mut() {
+                Some(ram) => ram,
+                None => local_ram.as_mut().unwrap(),
+            };
+            let front = fs as *mut FrontState;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut jit = jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                jit.execute(start, &mut parameters, ram,
+                    // Read/emit callbacks run sequentially. Parameters and RAM
+                    // are leased separately, and no whole-state borrow spans a callback.
+                    |address| unsafe {
+                        (*front).registers.get(address as usize).copied().unwrap_or(0)
+                    },
+                    |address, value, _, _| {
+                        if address >= 0xe00 { return false; }
+                        unsafe { Self::front_apply(&mut *front, address, value); }
+                        split.macro_write(engine, address, value);
+                        true
+                    },
+                )
+            }));
+            drop(shared_ram);
+            {
+                let guard = owner.lock();
+                let mut context = guard.borrow_mut();
+                let macro_engine = if compute { &mut context.compute_engine }
+                    else { &mut context.engine };
+                if let Some(ram) = local_ram { macro_engine.native_interpreter.dram = ram; }
+                if let Ok(result) = &result {
+                    if !result.success {
+                        macro_engine.native_execution_failed = true;
+                        log::error!("Native MME (JIT, split front) failed: compute start={start:#x}, consumed={}, error={}", result.consumed, result.error);
+                    }
+                }
+            }
+            parameters.clear();
+            fs.parameters = parameters;
+            if let Err(payload) = result { std::panic::resume_unwind(payload); }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            fs.executing_macro = None;
+            fs.parameters.clear();
+        }
     }
 
     /// Port of ProcessNativeMethod. The retained reentrant context lock allows emitted
@@ -1569,38 +1818,23 @@ impl EngineInterface for KeplerCompute {
     }
 
     fn consume_sink_impl(&mut self) {
-        let sink = std::mem::take(&mut self.interface_state.method_sink);
-        for (method, value) in sink {
+        for &(method, value) in &self.interface_state.method_sink {
             let idx = method as usize;
             if idx < KEPLER_COMPUTE_REG_COUNT {
                 self.regs[idx] = value;
             }
         }
+        self.interface_state.method_sink.clear();
     }
 
-    fn has_pending_methods(&self) -> bool {
-        !self.interface_state.method_sink.is_empty()
+    fn interface_state(&self) -> &super::engine_interface::EngineInterfaceState {
+        &self.interface_state
     }
 
-    fn execution_mask(&self) -> &[bool] {
-        &self.interface_state.execution_mask
+    fn interface_state_mut(&mut self) -> &mut super::engine_interface::EngineInterfaceState {
+        &mut self.interface_state
     }
 
-    fn push_method_sink(&mut self, method: u32, value: u32) {
-        self.interface_state.method_sink.push((method, value));
-    }
-
-    fn set_current_dma_segment(&mut self, segment: u64) {
-        self.interface_state.current_dma_segment = segment;
-    }
-
-    fn current_dirty(&self) -> bool {
-        self.interface_state.current_dirty
-    }
-
-    fn set_current_dirty(&mut self, dirty: bool) {
-        self.interface_state.current_dirty = dirty;
-    }
 }
 
 #[cfg(test)]
@@ -1624,6 +1858,301 @@ mod tests {
 
     fn new_test_engine() -> KeplerCompute {
         KeplerCompute::new(Arc::new(Mutex::new(MemoryManager::new(0))))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn front_instruction(fields: &[(usize, usize, u32)]) -> [u32; 3] {
+        let mut bits = 0u128;
+        for low in [15, 20, 25, 51, 56, 61] { bits |= 24u128 << low; }
+        for &(low, count, value) in fields {
+            let mask = ((1u128 << count) - 1) << low;
+            bits = (bits & !mask) | (((value as u128) << low) & mask);
+        }
+        [(bits >> 64) as u32, (bits >> 32) as u32, bits as u32]
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn front_macro_executes_with_shared_or_local_ram_and_ordered_backend_writes() {
+        for shared in [false, true] {
+            let context = Arc::new(parking_lot::ReentrantMutex::new(RefCell::new(
+                crate::r#macro::NativeMacroContext::default(),
+            )));
+            {
+                let guard = context.lock();
+                let mut state = guard.borrow_mut();
+                state.engine.native_turing = true;
+                state.compute_engine.native_turing = true;
+                state.compute_engine.native_interpreter.dram[0x28] = 0xabcdef;
+            }
+            let ram = Arc::new(Mutex::new([0; 0xc00]));
+            ram.lock()[0x28] = 0xabcdef;
+            let mut engine = Box::new(new_test_engine());
+            engine.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
+            if shared { engine.set_native_data_ram(Some(ram.clone())); }
+            let handle = EngineHandle::from_ref(&*engine);
+            let split = crate::gpu_split::GpuSplitFrontend::new(true);
+            let front = unsafe { KeplerCompute::front(&mut *engine, &split) };
+            // The engine allocation stays alive and unborrowed until stop joins.
+            split.start_back(|| {});
+            {
+                let mut fs = front.lock();
+                KeplerCompute::front_call_method(&mut fs, handle, &split, 0x45, 0, true, None);
+                let code = [
+                    front_instruction(&[(10, 5, 31), (20, 5, 25), (30, 16, 0x27),
+                        (25, 5, 26), (66, 16, 42)]),
+                    front_instruction(&[(0, 1, 1), (10, 5, 30), (20, 5, 25),
+                        (30, 16, 0x27), (66, 16, 0x200), (82, 3, 6), (85, 4, 1)]),
+                    front_instruction(&[]),
+                ].concat();
+                KeplerCompute::front_call_multi_method(&mut fs, handle, &split,
+                    0x46, &code, code.len() as u32, code.len() as u32, None);
+                KeplerCompute::front_call_multi_method(&mut fs, handle, &split,
+                    0x200, &[13, 17], 2, 2, Some(0x1234));
+                KeplerCompute::front_call_method(&mut fs, handle, &split, 0xe01, 99, true, None);
+                assert!(fs.parameters.is_empty());
+                assert_eq!(fs.executing_macro, None);
+                KeplerCompute::front_call_method(&mut fs, handle, &split, 0xe00, 7, false, None);
+                assert_eq!(fs.registers[0x200], 17);
+                assert_eq!(fs.parameters, [7]);
+                KeplerCompute::front_call_multi_method(&mut fs, handle, &split,
+                    0xe01, &[8, 9], 2, 2, None);
+                assert!(fs.parameters.is_empty());
+                assert_eq!(fs.executing_macro, None);
+                assert_eq!(fs.registers[0x200], 42);
+            }
+            split.drain();
+            split.stop().unwrap();
+            assert_eq!(engine.native_registers[0x200], 42);
+            assert!(engine.native_parameters.is_empty());
+            let guard = context.lock();
+            let state = guard.borrow();
+            assert_eq!(state.compute_engine.native_code_generation, 9);
+            assert!(!state.compute_engine.native_execution_failed);
+            if shared {
+                assert_eq!(&ram.lock()[0x27..=0x28], &[42, 0xabcdef]);
+            } else {
+                assert_eq!(&state.compute_engine.native_interpreter.dram[0x27..=0x28],
+                    &[42, 0xabcdef]);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn front_macro_reads_front_registers_before_backend_execution() {
+        let context = Arc::new(parking_lot::ReentrantMutex::new(RefCell::new(
+            crate::r#macro::NativeMacroContext::default(),
+        )));
+        {
+            let guard = context.lock();
+            let mut state = guard.borrow_mut();
+            state.engine.native_turing = true;
+            let code = [
+                front_instruction(&[(10, 5, 22), (20, 5, 25), (30, 16, 0x201),
+                    (66, 16, 0x202), (82, 3, 6), (85, 4, 1)]),
+                front_instruction(&[(0, 1, 1), (10, 5, 22), (20, 5, 25),
+                    (30, 16, 0x1234), (66, 16, 0x203), (82, 3, 6), (85, 4, 1)]),
+                front_instruction(&[]),
+            ].concat();
+            for word in code { state.engine.add_code(0, word); }
+        }
+        let mut engine = Box::new(new_test_engine());
+        engine.set_native_macro_mode(Some(context.clone()), Some(context));
+        engine.native_registers[0x201] = 9;
+        engine.native_registers[0x203] = 99;
+        let handle = EngineHandle::from_ref(&*engine);
+        let split = crate::gpu_split::GpuSplitFrontend::new(true);
+        let front = unsafe { KeplerCompute::front(&mut *engine, &split) };
+        // Start from a fresh ring but hold registration before command execution.
+        // On assertion failure, dropping go also releases the waiting worker.
+        let (go, wait) = std::sync::mpsc::channel();
+        split.start_back(move || { let _ = wait.recv(); });
+        {
+            let mut fs = front.lock();
+            KeplerCompute::front_call_method(&mut fs, handle, &split, 0x201, 81, true, None);
+            KeplerCompute::front_call_method(&mut fs, handle, &split, 0xe00, 0, true, None);
+            assert_eq!(fs.registers[0x202], 81);
+            assert_eq!(fs.registers[0x203], 0);
+        }
+        assert_eq!(engine.native_registers[0x201], 9);
+        assert_eq!(engine.native_registers[0x202], 0);
+        assert_eq!(engine.native_registers[0x203], 99);
+        go.send(()).unwrap();
+        split.drain();
+        split.stop().unwrap();
+        assert_eq!(engine.native_registers[0x201], 81);
+        assert_eq!(engine.native_registers[0x202], 81);
+        assert_eq!(engine.native_registers[0x203], 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn front_macro_rejects_recursive_emits_and_reports_failure_on_selected_engine() {
+        let context = Arc::new(parking_lot::ReentrantMutex::new(RefCell::new(
+            crate::r#macro::NativeMacroContext::default(),
+        )));
+        {
+            let guard = context.lock();
+            let mut state = guard.borrow_mut();
+            state.engine.native_turing = true;
+            state.compute_engine.native_turing = true;
+            let code = [
+                // Switch the frontend selector during execution. Failure must
+                // still be reported on the macro that began this execution.
+                front_instruction(&[(30, 16, 0x45), (66, 16, 0),
+                    (82, 3, 5), (85, 4, 6)]),
+                front_instruction(&[(0, 1, 1), (30, 16, 0xe00), (66, 16, 1),
+                    (82, 3, 5), (85, 4, 6)]),
+                front_instruction(&[]),
+            ].concat();
+            for word in code { state.engine.add_code(0, word); }
+            state.engine.native_interpreter.dram[5] = 123;
+        }
+        let mut engine = Box::new(new_test_engine());
+        engine.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
+        let handle = EngineHandle::from_ref(&*engine);
+        let split = crate::gpu_split::GpuSplitFrontend::new(true);
+        let front = unsafe { KeplerCompute::front(&mut *engine, &split) };
+        let mut fs = front.lock();
+        KeplerCompute::front_call_method(&mut fs, handle, &split, 0xe00, 0, true, None);
+        assert!(fs.parameters.is_empty());
+        assert_eq!(fs.executing_macro, None);
+        assert_eq!(fs.registers[0xe00], 0);
+        assert!(fs.compute_uploaded);
+        let guard = context.lock();
+        let state = guard.borrow();
+        assert!(state.engine.native_execution_failed);
+        assert!(!state.compute_engine.native_execution_failed);
+        assert_eq!(state.engine.native_interpreter.dram[5], 123);
+    }
+
+    #[test]
+    fn front_takeover_moves_fifo_and_keeps_independent_registers() {
+        let context = Arc::new(parking_lot::ReentrantMutex::new(RefCell::new(
+            crate::r#macro::NativeMacroContext::default(),
+        )));
+        let mut engine = Box::new(new_test_engine());
+        engine.set_native_macro_mode(Some(context.clone()), Some(context));
+        engine.native_registers[0x200] = 7;
+        engine.native_parameters = vec![11, 19];
+        let allocation = engine.native_parameters.as_ptr();
+        engine.native_executing_macro = Some(0xe00);
+        engine.native_bind_pointer = 5;
+        let split = crate::gpu_split::GpuSplitFrontend::new(true);
+        // No backend commands exist, and no reference spans Front's drain.
+        let front = unsafe { KeplerCompute::front(&mut *engine, &split) };
+        assert!(engine.front_macros);
+        assert!(engine.native_parameters.is_empty());
+        assert_eq!(engine.native_executing_macro, None);
+        {
+            let mut fs = front.lock();
+            assert_eq!(fs.parameters.as_ptr(), allocation);
+            assert_eq!(fs.parameters, [11, 19]);
+            assert_eq!(fs.executing_macro, Some(0xe00));
+            assert_eq!(fs.bind_pointer, 5);
+            assert_eq!(fs.registers[0x200], 7);
+            KeplerCompute::front_apply(&mut fs, 0x200, 23);
+            assert_eq!(fs.registers[0x200], 23);
+            assert_eq!(engine.native_registers[0x200], 7);
+        }
+        let again = unsafe { KeplerCompute::front(&mut *engine, &split) };
+        assert!(Arc::ptr_eq(&front, &again));
+        assert_eq!(again.lock().registers[0x200], 23);
+    }
+
+    #[test]
+    fn front_uploads_select_compute_and_backend_does_not_repeat_uploads() {
+        let context = Arc::new(parking_lot::ReentrantMutex::new(RefCell::new(
+            crate::r#macro::NativeMacroContext::default(),
+        )));
+        {
+            let guard = context.lock();
+            let mut state = guard.borrow_mut();
+            state.engine.native_turing = true;
+            state.compute_engine.native_turing = true;
+        }
+        let mut engine = Box::new(new_test_engine());
+        engine.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
+        let split = crate::gpu_split::GpuSplitFrontend::new(true);
+        let front = unsafe { KeplerCompute::front(&mut *engine, &split) };
+        let mut fs = front.lock();
+        // Before compute's first pointer upload, code is shared with graphics.
+        KeplerCompute::front_apply(&mut fs, 0x46, 0xa);
+        for (method, value) in [(0x45, 2), (0x46, 0xb), (0x47, 127), (0x48, 9), (0x48, 99)] {
+            KeplerCompute::front_apply(&mut fs, method, value);
+            engine.call_method(method, value, true);
+            assert_eq!(engine.native_registers[method as usize], value);
+        }
+        assert!(fs.compute_uploaded);
+        assert_eq!(fs.bind_pointer, 128); // Failed binding does not advance.
+        assert_eq!(fs.registers[0x48], 99); // Register write precedes validation.
+        let guard = context.lock();
+        let state = guard.borrow();
+        assert_eq!(state.engine.native_code[0], 0xa);
+        assert_eq!(state.engine.native_write_offset, 1);
+        assert_eq!(state.compute_engine.native_code[6], 0xb);
+        assert_eq!(state.compute_engine.native_write_offset, 7);
+        assert_eq!(state.compute_positions[127], 9);
+        assert_eq!(state.positions[127], 0);
+    }
+
+    #[test]
+    fn front_without_native_context_keeps_original_engine_and_releases_lock() {
+        let owner = Arc::new(parking_lot::ReentrantMutex::new(RefCell::new(
+            crate::r#macro::NativeMacroContext::default(),
+        )));
+        {
+            let guard = owner.lock();
+            let mut state = guard.borrow_mut();
+            state.engine.native_turing = true;
+            state.compute_engine.native_turing = true;
+        }
+        let mut engine = Box::new(new_test_engine());
+        engine.set_native_macro_mode(Some(owner.clone()), None);
+        let split = crate::gpu_split::GpuSplitFrontend::new(true);
+        let front = unsafe { KeplerCompute::front(&mut *engine, &split) };
+        let mut fs = front.lock();
+        for (method, value) in [(0x45, 3), (0x46, 0x123), (0x47, 7), (0x48, 15)] {
+            KeplerCompute::front_apply(&mut fs, method, value);
+        }
+        // Still holding the frontend state must not block a worker's context
+        // access. Reentrant try_lock on this thread would miss that regression.
+        let unlocked = std::thread::spawn(move || {
+            let guard = owner.try_lock().expect("FrontApply retained the macro lock");
+            let state = guard.borrow();
+            assert_eq!(state.engine.native_code[9], 0x123);
+            assert_eq!(state.positions[7], 15);
+            assert_eq!(state.compute_engine.native_code[9], 0);
+            assert_eq!(state.compute_positions[7], 0);
+        });
+        unlocked.join().unwrap();
+        assert!(fs.compute_uploaded);
+    }
+
+    #[test]
+    fn consume_sink_preserves_allocation_order_and_register_bounds_like_upstream() {
+        let mut engine = new_test_engine();
+        engine.interface_state.method_sink.reserve(32);
+        let capacity = engine.interface_state.method_sink.capacity();
+        let pointer = engine.interface_state.method_sink.as_ptr();
+        for value in [7, 19] {
+            for (method, argument) in [
+                (0x20, 1),
+                (KEPLER_COMPUTE_REG_COUNT as u32 - 1, value),
+                (KEPLER_COMPUTE_REG_COUNT as u32, 0xbad),
+                (u32::MAX, 0xbad),
+                (0x20, value),
+            ] {
+                engine.push_method_sink(method, argument);
+            }
+            engine.consume_sink();
+            assert_eq!(engine.regs[0x20], value);
+            assert_eq!(engine.regs[KEPLER_COMPUTE_REG_COUNT - 1], value);
+            assert!(engine.interface_state.method_sink.is_empty());
+            assert_eq!(engine.interface_state.method_sink.capacity(), capacity);
+            assert_eq!(engine.interface_state.method_sink.as_ptr(), pointer);
+        }
     }
 
     #[test]

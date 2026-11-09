@@ -1,0 +1,362 @@
+{
+  "status": "candidate_window_invalid_input_detected",
+  "config": "C:\\Users\\smart\\AppData\\Roaming\\ruzu\\config\\qt-config.ini",
+  "backup": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-fast-paired-config-backup.ini",
+  "original_sha256": "297deeced3259ea86e76f7a57da5b142df278f1c7a606a81d67c527d594845ff",
+  "temporary_sha256": "ad07777d7c37de913f66f28c0b243201d475f685f9e64ee8e13ba3296594d642",
+  "candidate_runtime": {
+    "profiling_enabled": false,
+    "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-input-candidate-20261108-220537",
+    "purpose": "Unprofiled paired benchmark: candidate",
+    "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-220537",
+    "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+    "rust_log": "info",
+    "binary_sha256": "443080ECC8A7562A06E59AA2182DC7C4ED9473F7FF042D2A01697EF72877DA57",
+    "pid": 26152,
+    "status": "running",
+    "game": "D:\\Games\\Emulators\\Switch\\common\\roms\\Mario kart world 1.8.0[0400C3F00006E000].nsp",
+    "start_utc": "2026-11-08T21:05:38.8264370Z"
+  },
+  "candidate_mean_fps": 13.551263833405436,
+  "candidate_median_fps": 14.987502712938856,
+  "candidate_samples": 129,
+  "candidate_buttons_pressed": true,
+  "visual_note": "Strong colored halos in candidate Fast; compare reference before interpreting correctness.",
+  "input_observations": [
+    {
+      "seconds": 0.0,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 0.51,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 1.01,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 1.52,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 2.03,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 2.53,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 3.04,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 3.55,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 4.05,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 4.56,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 5.06,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 5.57,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 6.08,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 6.58,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 7.09,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 7.6,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 8.1,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 8.6,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 9.11,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 9.62,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 10.12,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 10.63,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 11.14,
+      "buttons": [
+        0,
+        11
+      ]
+    },
+    {
+      "seconds": 11.65,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 12.16,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 12.66,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 23.81,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 27.37,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 27.87,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 28.37,
+      "buttons": [
+        0,
+        2
+      ]
+    },
+    {
+      "seconds": 28.88,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 29.39,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 29.89,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 30.4,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 30.91,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 31.42,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 31.93,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 32.43,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 32.94,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 33.45,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 33.96,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 34.46,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 34.98,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 35.48,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 35.99,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 36.49,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 37.0,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 37.51,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 38.02,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 38.52,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 39.03,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 39.54,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 40.05,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 40.56,
+      "buttons": [
+        0
+      ]
+    },
+    {
+      "seconds": 41.07,
+      "buttons": [
+        0
+      ]
+    }
+  ],
+  "interpretation": "Reject as stationary paired benchmark: buttons pressed during FPS sampling. Observed FPS does not establish code improvement.",
+  "configuration_restored_on_disk": true,
+  "runtime_note": "Current live session still uses Low; original High config restored for subsequent launches. Candidate window is a moving gameplay observation, not comparable to stationary High baseline."
+}

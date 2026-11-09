@@ -1,0 +1,121 @@
+{
+  "status": "Implementation tests passed; candidate High runtime comparison underway; batch retirement and Switch1 runtime validation remain",
+  "source": "eden-nx2 origin/eden-nx2:src/video_core/fence_manager.h",
+  "reason": "Upstream SkipEmptyFence can avoid no-work fences only with non-delayed fence behavior and no cache commits or pending query/operation work; current Rust always commits all caches and creates a fence.",
+  "prerequisites": [
+    "TextureCache HasAsyncFlushWork checks both uncommitted downloads and async buffers",
+    "QueryCacheBase HasPendingFenceWork in query_cache/query_cache.h and query_cache_base.h",
+    "Per-fence committed cache mask and selective commit/pop order",
+    "One real fence after 64 skips; reset counter when real fence created",
+    "Preserve queued operations and query cleanup; no skipping in delayed High default"
+  ],
+  "integration": [
+    "src/video_core/src/fence_manager.rs",
+    "src/video_core/src/renderer_vulkan/vk_rasterizer.rs",
+    "OpenGL caller audit",
+    "texture and query cache owners"
+  ],
+  "validation": [
+    "pending query operations prevent skip",
+    "texture async buffers prevent skip",
+    "callback exactly once and cache invalidation order",
+    "64 skip limit",
+    "selective commits and pops aligned across mixed fences",
+    "shutdown drains pending operations"
+  ],
+  "performance_evidence": "No local measurement of this optimization; current Low accuracy experiment uses unchanged F9 binary.",
+  "implemented_prerequisites": [
+    "QueryCacheBase::has_pending_fence_work in query_cache/query_cache.rs",
+    "TextureCacheBase::has_async_flush_work in texture_cache/texture_cache.rs"
+  ],
+  "validation_logs": [
+    "%TEMP%/ruzu-empty-fence-prereq-query.log",
+    "%TEMP%/ruzu-empty-fence-prereq-texture.log",
+    "%TEMP%/ruzu-empty-fence-prereq-full.log"
+  ],
+  "next": "Confirm full suite; audit Vulkan samples/TFB streamer adapter and texture wrapper, then integrate selective committed masks and no-work fence gate. Do not bypass backend query work.",
+  "full_test_session": 18168,
+  "backend_adapters": {
+    "status": "cargo check -p video_core passed; full tests on preceding common-predicate snapshot still running",
+    "files": [
+      "src/video_core/src/renderer_vulkan/query_cache.rs",
+      "src/video_core/src/renderer_vulkan/texture_cache.rs",
+      "src/video_core/src/renderer_opengl/gl_texture_cache.rs"
+    ],
+    "query_condition": "base work OR samples unsynced/pending sync OR TFB unsynced/pending sync",
+    "opengl_query_policy": "No empty-fence skip capability: legacy cache lacks upstream HasPendingFenceWork",
+    "check_log": "%TEMP%/ruzu-empty-fence-adapters-check.log"
+  },
+  "batching_prerequisite": "Upstream batches up to64 completed fences, counts committed texture/buffer masks, pops caches under one lock per cache, then queries and callbacks per fence. Current release worker retires one fence and locks both caches per callback.",
+  "common_prerequisite_full_result": {
+    "passed": 1739,
+    "failed": 0,
+    "ignored": 1,
+    "seconds": 451.74,
+    "doc_tests": "passed",
+    "scope": "common predicates before backend adapter and selective-mask edits"
+  },
+  "remaining_implementation": [
+    "SkipEmptyFence with query/operation gate and 64-skip limit",
+    "Batch released fences and cache locks preserving per-fence query/callback order"
+  ],
+  "selective_mask_validation": {
+    "focused": "15 fence tests passed, no failures",
+    "check": "cargo check -p video_core passed",
+    "full": {
+      "passed": 1739,
+      "failed": 1,
+      "ignored": 1,
+      "seconds": 454.79,
+      "failure": "renderer_opengl::gl_rasterizer::tests::release_fences_pops_async_flushes_for_stubbed_fence",
+      "assessment": "Test injects precommitted async buffer without matching fence, then creates no-work fence. Audit upstream contract and update code/test as warranted; not yet resolved."
+    },
+    "full_log": "%TEMP%/ruzu-selective-fence-full.log",
+    "full_session": 29635
+  },
+  "empty_fence_gate": {
+    "status": "Implemented; 47 focused fence-related tests passed",
+    "conditions": [
+      "non-delayed fence behavior",
+      "zero committed cache mask",
+      "no pending queries or host sync",
+      "no uncommitted operations",
+      "fewer than64 skipped fences"
+    ],
+    "backend_capability": "Vulkan uses full backend-aware pending predicate; OpenGL always vetoes skip",
+    "tests": [
+      "64 skips followed by mandatory real fence and reset",
+      "query work veto",
+      "texture/buffer mask veto",
+      "queued operation retained and executed once",
+      "High retains fence and deferred callback"
+    ]
+  },
+  "metal_compatibility": "Updated five generic manager call sites: query-only retirement ignores download mask, reports scheduler work with zero cache mask, and vetoes empty-fence skips. Rust syntax parsed; macOS type-check/runtime unavailable on Windows.",
+  "interrupted_slice": {
+    "slice": "runtime validation of selective/empty fence optimization",
+    "prerequisite": "Vulkan backend samples/TFB per-fence query flush masks",
+    "evidence": "commit_async_flushes pushes each backend streamer only when it has queries; pop_async_flushes currently pops both unconditionally. Upstream QueryCacheBase saves per-fence streamer mask and pops only its bits.",
+    "next": "Implement FIFO masks in backend query adapter preserving shared streamer ordering before runtime optimization trials",
+    "switch1_impact": "Shared query path affects both profiles; regression must cover empty fence followed by later streamer work",
+    "prerequisite_status": "Implemented backend FIFO masks, including empty slots; focused regression passed; full suite running"
+  },
+  "validation_current": {
+    "focused_passed": 47,
+    "focused_failed": 0,
+    "focused_log": "%TEMP%/ruzu-empty-fence-query-focused.log",
+    "full_session": 27579,
+    "full_log": "%TEMP%/ruzu-empty-fence-query-full.log",
+    "release_build_session": 81772,
+    "release_log": "%TEMP%/ruzu-empty-fence-release.log",
+    "full_result": {
+      "passed": 1743,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 485.1,
+      "doc_tests": "passed"
+    },
+    "release_result": "passed, 2m21s"
+  },
+  "opengl_failure_resolution": "Outdated orphan-download fixture corrected against upstream selective-mask contract; targeted test now passes. Full suite rerun pending."
+}

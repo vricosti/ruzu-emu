@@ -5329,6 +5329,11 @@ impl TextureCache {
         self.base.has_uncommitted_flushes()
     }
 
+    /// Upstream exposes this through its TextureCache template alias.
+    pub fn has_async_flush_work(&self) -> bool {
+        self.base.has_async_flush_work()
+    }
+
     pub fn commit_async_flushes(&mut self) {
         let mut download_ids = std::mem::take(&mut self.base.uncommitted_downloads);
         if download_ids.is_empty() {

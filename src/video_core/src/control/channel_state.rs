@@ -62,7 +62,10 @@ pub struct ChannelState {
 
     pub memory_manager: Option<Arc<Mutex<MemoryManager>>>,
 
-    pub dma_pusher: Option<Box<crate::dma_pusher::DmaPusher>>,
+    // Separate synchronization preserves upstream's independently accessed DMA
+    // payload. Scheduler retains the channel Arc while using this handle, so
+    // the DMA's borrowed engine/channel pointers cannot outlive their owners.
+    pub dma_pusher: Option<Arc<Mutex<Box<crate::dma_pusher::DmaPusher>>>>,
 
     pub initialized: bool,
 }
@@ -138,15 +141,16 @@ impl ChannelState {
         self.nv01_timer = Some(Box::new(Nv01Timer::new(Arc::clone(
             self.memory_manager.as_ref().unwrap(),
         ))));
-        self.dma_pusher = Some(Box::new(crate::dma_pusher::DmaPusher::new(
+        self.dma_pusher = Some(Arc::new(Mutex::new(Box::new(crate::dma_pusher::DmaPusher::new(
             _gpu as *const crate::gpu::Gpu,
             _gpu.system_ref(),
             Arc::clone(self.memory_manager.as_ref().unwrap()),
             self as *mut ChannelState,
-        )));
+        )))));
         self.dma_pusher
             .as_mut()
             .expect("DmaPusher must exist immediately after construction")
+            .lock()
             .install_self_reference();
 
         self.bind_nvk_default_subchannels();
@@ -194,9 +198,10 @@ impl ChannelState {
             maxwell_dma,
             ..
         } = self;
-        let dma_pusher = dma_pusher
+        let mut dma_pusher = dma_pusher
             .as_mut()
-            .expect("DmaPusher must exist before binding NVK subchannels");
+            .expect("DmaPusher must exist before binding NVK subchannels")
+            .lock();
         dma_pusher.bind_subchannel(
             maxwell_3d
                 .as_mut()
@@ -250,7 +255,7 @@ impl ChannelState {
     pub fn bind_rasterizer(&mut self, rasterizer: &dyn RasterizerInterface) {
         log::debug!("ChannelState::bind_rasterizer bind_id={}", self.bind_id);
         if let Some(ref mut dma) = self.dma_pusher {
-            dma.bind_rasterizer(rasterizer);
+            dma.lock().bind_rasterizer(rasterizer);
         }
         if let Some(ref mut mm) = self.memory_manager {
             mm.lock().bind_rasterizer(rasterizer);
@@ -410,7 +415,7 @@ mod tests {
 
         cs.init(&gpu, 0x1234);
 
-        let dma = cs.dma_pusher.as_ref().unwrap();
+        let dma = cs.dma_pusher.as_ref().unwrap().lock();
         assert_eq!(
             dma.subchannel_binding_for_test(0),
             (true, EngineTypes::Maxwell3D)

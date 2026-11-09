@@ -1,0 +1,708 @@
+{
+  "status": "Integrated full suite and release build passed; new release running baseline split=0/Fast, shader cache loading; split=2 comparison and Switch1 gate pending",
+  "upstream_revision": "50fa86bbbc403ad565eb44fcc281f16f77c69e15",
+  "objective": "General NX2 Vulkan GPU front/back split, including upstream front macro execution; measure gains rather than assume them",
+  "prerequisite": {
+    "problem": "Scheduler::push and resume_pending hold ChannelState mutex while dispatch_calls/can_resume_acquire execute. Upstream split defers Gpu::bind_channel to backend; Rust bind_channel takes that same mutex. Front Drain can then wait on backend blocked by front-owned mutex.",
+    "evidence": [
+      "src/video_core/src/control/scheduler.rs:push",
+      "src/video_core/src/control/scheduler.rs:resume_pending",
+      "src/video_core/src/gpu.rs:bind_channel",
+      "upstream control/scheduler.cpp:BindChannel",
+      "upstream engines/puller.cpp:CanResumeAcquire/DrainBack"
+    ],
+    "required_resolution": "Keep frontend-owned DMA dispatch independent of backend channel-binding lock; preserve stable engine/DMA/channel addresses and avoid concurrent mutable aliases. Audit Payload ownership and borrowed cache references before selecting Rust representation. Do not simply mark raw handles Send/Sync or remove locks.",
+    "implementation": "Channel-owned stable boxed DMA now behind independent Arc<Mutex>; Scheduler clones handle with channel lifetime retained and releases channel guard before dispatch/acquire checks. Backend engine aliasing/front lookups still need audit."
+  },
+  "integration_order": [
+    {
+      "owner": "control/channel_state.rs, control/scheduler.rs, gpu.rs",
+      "work": "Resolve channel ownership and lifetime prerequisite; derive regression tests for deferred binding and drain without lock cycle."
+    },
+    {
+      "owner": "gpu_split.rs (missing)",
+      "work": "Port ordered SPSC ring, variable entries, wrap, publication, drain, wake protocol and worker lifecycle; preserve upstream constants and memory ordering."
+    },
+    {
+      "owner": "gpu_thread.rs",
+      "work": "Backend tick/run/flush/invalidate and command completion; frontend list parsing; join front before stopping back while borrowed owners remain alive."
+    },
+    {
+      "owner": "control/scheduler.rs, dma_pusher.rs, engines/puller.rs",
+      "work": "Deferred channel binding, copied multi-method payloads and DMA segments, drain before dependent semaphore reads, ordered backend cache operations."
+    },
+    {
+      "owner": "engines/maxwell_3d.rs, engines/kepler_compute.rs",
+      "work": "Upstream mode2 front state and native macro dispatch. Mode1 can isolate ring/backend correctness but is not final scope."
+    }
+  ],
+  "validation": [
+    "Ring wrap and odd payload padding; copied multi-method data survives caller reuse",
+    "Mixed method/direct macro/deferred callback ordering",
+    "No command completion before backend execution",
+    "Deferred bind followed by frontend drain completes without lock cycle",
+    "Cross-channel semaphore acquire/release and shutdown while waiting",
+    "Switch1 and High never activate split; NX2 Fast/default DMA eligibility",
+    "Repeated NX2 sessions without stale engine handles",
+    "Full video_core suite plus same-scene unprofiled comparison and visual checks"
+  ],
+  "performance_evidence": "nx2-fast-live-cpu-20261108.json",
+  "gain_claim": "none; busiest individual thread is command processor, but waiting/supply distribution still needed",
+  "validation_live": {
+    "focused_session": 74747,
+    "focused_log": "%TEMP%/ruzu-dma-ownership-focused2.log",
+    "new_regression": "scheduler_dispatch_releases_channel_lock_before_engine_work",
+    "note": "Initial regression failed only incorrect expected DMA argument offset 0; actual upstream-compatible offset4 corrected. Final focused suite pending.",
+    "focused_result": {
+      "passed": 18,
+      "failed": 0,
+      "seconds": 114.73
+    },
+    "full_log": "%TEMP%/ruzu-dma-ownership-full.log",
+    "full_session": 14674,
+    "full_result": {
+      "passed": 1744,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 496.32,
+      "exit_code": 0,
+      "doctests": "passed"
+    }
+  },
+  "frontend_engine_handle_prerequisite": {
+    "status": "Implemented in Puller construction and ProcessBindMethod; pointer-only DmaPusher bind helper; tests pending",
+    "upstream": "Puller::ProcessBindObject passes engine address to DmaPusher::BindSubchannel without accessing engine state",
+    "rust": "Puller process_bind_object dereferences whole ChannelState as &mut, then Box engine as_mut; DmaPusher::bind_subchannel requires &mut dyn EngineInterface merely to store EngineHandle",
+    "risk": "Concurrent backend mutation is incompatible with frontend shared/mutable engine references even if frontend only wants an address. Mutex separation alone is insufficient.",
+    "next_change": "Provide stable non-owning engine handles at initialization and bind subchannels without borrowing engine state; preserve exact engine-class normalization and initial NVK bindings. Keep lifetime under retained ChannelState ownership. Audit remaining frontend dereferences separately.",
+    "tests_required": [
+      "All six engine classes and NX2 aliases bind correct handles",
+      "Unknown and zero class behavior unchanged",
+      "Switch1/NX2 initial subchannel bindings unchanged",
+      "Rebind does not call any engine methods or mutate engine state"
+    ]
+  },
+  "engine_handle_validation": {
+    "focused_session": 34217,
+    "focused_log": "%TEMP%/ruzu-engine-handles-focused2.log",
+    "full_result": {
+      "passed": 1745,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 498.04,
+      "exit_code": 0,
+      "doctests": "passed"
+    },
+    "focused_result": {
+      "passed": 15,
+      "failed": 0,
+      "seconds": 8.85
+    },
+    "full_log": "%TEMP%/ruzu-engine-handles-full.log"
+  },
+  "transport_audit": {
+    "upstream_files": [
+      "gpu_split.h",
+      "gpu_split.cpp"
+    ],
+    "ring_words": 1048576,
+    "ring_bytes": 8388608,
+    "max_multi_words": 8192,
+    "publish_every": 256,
+    "after_drain_publish_every": 8,
+    "consumed_publish_interval_words": 4096,
+    "ordering": "Reserve writes unpublished ring storage; Publish stores seq_cst; backend acquires published, executes ordered entries, releases consumed. Front may reuse only consumed storage.",
+    "wake_contract": "back_waiting seq_cst, sample wake, recheck published seq_cst, then wait on unchanged wake; stop also increments wake. A Rust condvar adaptation must check generation under its wait mutex to avoid missed notifications.",
+    "rust_handle_adaptation": "EngineHandle is a trait-object pointer, unlike upstream single-word EngineInterface*. Ring Engine payload must store/copy complete handle with size/alignment checked; never truncate to data pointer or reconstruct vtable by engine kind. Host-only packet size may differ and must be audited.",
+    "multi_method_contract": "Copy input words into ring before returning; at most8192 input words per packet; subtract piece from methods_pending; optional DMA segment retained; odd tail word zeroed before copy.",
+    "shutdown_contract": "Frontend must stop before backend while engine/cache owners still live; account for deferred owned callback destruction if queued entries are abandoned. Do not execute arbitrary deferred GPU work after owner teardown.",
+    "required_tests": [
+      "Wrap marker at end and no entry straddling ring boundary",
+      "Producer cannot overwrite unconsumed data",
+      "Short and >8192-word multi-method payload retains contents after source buffer mutation",
+      "Engine handle identity including dynamic dispatch survives packet transport",
+      "Method mask/sink/direct-macro semantics and optional segment match Execute",
+      "Publish versus sleep race and stop versus sleep race cannot miss wake",
+      "Command completion is ordered after preceding backend work"
+    ]
+  },
+  "transport_implementation": {
+    "file": "src/video_core/src/gpu_split.rs",
+    "methods": [
+      "reserve",
+      "reserve_slow",
+      "wait_for_space",
+      "commit",
+      "publish",
+      "drain"
+    ],
+    "wake": "Generation atomic plus condvar wait mutex",
+    "focused_session": 40614,
+    "focused_log": "%TEMP%/ruzu-gpu-split-transport-focused2.log",
+    "runtime_active": false,
+    "remaining": [
+      "packet constructors and complete EngineHandle payload",
+      "Execute and BackLoop",
+      "MaybeStart eligibility and Stop lifecycle",
+      "deferred cache access and front macro integration"
+    ],
+    "focused_result": {
+      "passed": 5,
+      "failed": 0,
+      "seconds": 0.11
+    },
+    "full_session": 72394,
+    "full_log": "%TEMP%/ruzu-gpu-split-transport-full.log",
+    "full_result": {
+      "passed": 1750,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 497.98,
+      "exit_code": 0,
+      "scope": "transport-only snapshot before packet constructors"
+    }
+  },
+  "packet_construction": {
+    "methods": [
+      "select_engine",
+      "switch_engine",
+      "method",
+      "macro_write",
+      "multi_method"
+    ],
+    "engine_payload": "Typed EngineHandle write/read, ceil(size_of(handle)/8) words, alignment <=u64 checked",
+    "tests_added": [
+      "engine handle identity, deduplicated selection, method flags, optional segment, direct macro encoding",
+      "8192-word chunk split, source independence, remaining count, odd padding with/without segment",
+      "zero amount engine selection and unsigned pending count wrap"
+    ],
+    "validation": {
+      "focused_passed": 8,
+      "focused_failed": 0,
+      "seconds": 0.18,
+      "focused_log": "%TEMP%/ruzu-gpu-split-packets-focused.log",
+      "full_log": "%TEMP%/ruzu-gpu-split-packets-full.log",
+      "full_result": {
+        "passed": 1753,
+        "failed": 0,
+        "ignored": 1,
+        "seconds": 495.84,
+        "exit_code": 0,
+        "scope": "packet constructors before Execute/Defer"
+      }
+    },
+    "remaining": [
+      "defer/call ownership and destruction",
+      "Execute",
+      "BackLoop and lifecycle",
+      "frontend/cache/front-macro integration"
+    ]
+  },
+  "execution_slice": {
+    "implemented": [
+      "GpuSplitBack::execute for all five packet kinds",
+      "GpuSplit::defer for Copy+Send+static callbacks",
+      "typed CallThunk invocation preserving function/capture provenance"
+    ],
+    "validation": {
+      "focused_passed": 9,
+      "focused_failed": 0,
+      "seconds": 0.19,
+      "focused_log": "%TEMP%/ruzu-gpu-split-execute-focused.log",
+      "full_log": "%TEMP%/ruzu-gpu-split-execute-full.log",
+      "full_result": {
+        "passed": 1754,
+        "failed": 0,
+        "ignored": 1,
+        "seconds": 496.14,
+        "exit_code": 0,
+        "scope": "Execute/Copy Defer snapshot, before owned callbacks"
+      }
+    },
+    "prerequisite_for_owned_callbacks": "Define ownership and discard path for queued heap callbacks during Stop before implementing DeferFunction; never execute GPU callbacks after engine/cache teardown.",
+    "full_live_previous_snapshot": 13895,
+    "remaining": [
+      "DeferFunction owned callback destruction",
+      "BackLoop",
+      "MaybeStart/Stop",
+      "runtime caller integration including front macros"
+    ]
+  },
+  "owned_callback_cleanup_design": {
+    "status": "Implemented:owned Call marker, typed heap slot cleared before invocation, pending counter and discard scan;tests awaiting execution",
+    "problem": "BackLoop publishes consumed only periodically. If an owned callback executes or panics before consumed advances, cancellation scanning from consumed could see an already-freed callback pointer.",
+    "required_invariant": "Take/clear owned callback pointer in its ring slot before invoking it, then destroy captures exactly once. Cancellation must only drop remaining owned captures, never execute callbacks.",
+    "shutdown_order": "Stop/join backend before scanning committed but unconsumed and unpublished packets; retain engine/cache owners until both workers and pending captures are retired.",
+    "tests": [
+      "Executed owned capture dropped exactly once",
+      "Unexecuted owned capture dropped without executing its callback",
+      "Executed owned callback with delayed consumed publication is not freed twice",
+      "Callback panic still leaves cancellation safe",
+      "Wrap and mixed Copy/owned callbacks preserve cleanup ownership"
+    ]
+  },
+  "owned_callback_validation": {
+    "check": "cargo check -p video_core --tests passed",
+    "focused": {
+      "passed": 11,
+      "failed": 0,
+      "seconds": 0.22,
+      "log": "%TEMP%/ruzu-gpu-split-owned-focused.log"
+    },
+    "tests": [
+      "Normal/panicking execution followed by cancellation with consumed still0",
+      "Idempotent cancellation and Drop",
+      "Unpublished owned callback across wrap mixed with engine/multi/Copy packets"
+    ],
+    "full_log": "%TEMP%/ruzu-gpu-split-owned-full.log",
+    "full_result": {
+      "passed": 1756,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 489.58,
+      "exit_code": 0,
+      "scope": "owned callback snapshot before worker lifecycle"
+    }
+  },
+  "worker_integration_constraints": {
+    "session_lifetime": "Construct fresh split transport per GPU session, or reset every position/engine handle before restart; no stale engine pointers across Switch1/NX2 or NX2 reload. Upstream static instance Stop only sets active=false; MaybeStart allocates a new ring without visibly resetting positions. User session reload requirement takes precedence over copying that hazard.",
+    "stop_order": "Join frontend first, request backend stop and wake, join backend, then discard owned callbacks while captured owners remain valid.",
+    "failure_progress": "Backend panic/failure must not leave frontend WaitForSpace/Drain spinning forever; establish failure propagation before enabling runtime worker.",
+    "frontend_access": "Avoid holding &mut GpuSplit across scheduler/macro code that reenters enqueue through a thread-local bridge. Front/back engine fields must not be borrowed as one mutable object concurrently."
+  },
+  "worker_slice": {
+    "implemented": [
+      "back_loop with8192-spin wait and4096-word consumption publication",
+      "start_back registration seam and thread metadata",
+      "stop/join before callback cleanup",
+      "backend panic flag checked by reserve/space waits/drain",
+      "fresh per-session start invariant"
+    ],
+    "validation": {
+      "focused_passed": 15,
+      "focused_failed": 0,
+      "seconds": 0.33,
+      "focused_log": "%TEMP%/ruzu-gpu-split-worker-focused.log",
+      "full_log": "%TEMP%/ruzu-gpu-split-worker-full.log",
+      "full_result": "passed",
+      "full_passed": 1760,
+      "full_failed": 0,
+      "full_ignored": 1,
+      "full_seconds": 494.17,
+      "doctests": "passed",
+      "snapshot": "Worker lifecycle before Kepler frontend-state changes"
+    },
+    "tests": [
+      "3 fresh sessions with2000 FIFO callbacks each and sleeping stop",
+      "worker panic reaches frontend drain and cancels remaining captures",
+      "backend failure releases full-ring producer",
+      "stop finishes current batch and cancels later published work"
+    ],
+    "remaining": [
+      "MaybeStart profile/settings eligibility and per-session frontend access",
+      "actual kernel registration callback at runtime owner",
+      "CheckOwner diagnostics",
+      "DMA/puller/cache integration",
+      "front macro copies and dispatch",
+      "UI/session fault propagation and gameplay validation"
+    ]
+  },
+  "front_macro_takeover_audit": {
+    "source": "Maxwell3D::Front and KeplerCompute::Front in upstream50fa86bbbc403ad565eb44fcc281f16f77c69e15",
+    "maxwell_order": [
+      "Drain backend",
+      "ConsumeSink",
+      "Copy registers and shadow state/control",
+      "Capture skip-same settings",
+      "Move executing macro and parameters",
+      "Clear backend macro parameters/executing macro",
+      "Set front_macros true"
+    ],
+    "kepler_order": [
+      "Drain backend",
+      "Copy native registers",
+      "Move executing macro and parameters",
+      "Copy upload/bind/macro metadata",
+      "Clear backend executing macro/parameters",
+      "Set front_macros true"
+    ],
+    "rust_constraint": "After takeover, frontend methods must borrow only separately owned FrontState and macro context, never hold &mut whole backend engine while publishing work. Preserve engine-file ownership of Front* methods and state.",
+    "missing": [
+      "Runtime frontend handle/lifetime/dispatch integration and combined validation"
+    ]
+  },
+  "front_macro_lock_prerequisite": {
+    "status": "Kepler and Maxwell frontend context guards end before Execute/enqueue/Drain. Focused worker-backed DMA and worker-failure regressions passed; runtime saturation and session lifecycle integration still pending.",
+    "owner": "src/video_core/src/engines/kepler_compute.rs::process_native_method",
+    "finding": "The Rust adaptation retains SharedNativeMacroContext reentrant lock across all native method processing, including backend register uploads that front_macros suppresses and QMD/rasterizer operations.",
+    "risk": "A frontend macro can retain this lock while enqueueing. A full ring or Drain may wait for the backend, while the backend blocks on the same lock. This is a prospective split integration deadlock, not an established cause of current 15 FPS.",
+    "additional_accesses": [
+      "Unmapped inline QMD sets selected native_execution_failed",
+      "QMD signal error sets selected native_execution_failed"
+    ],
+    "required_next": [
+      "Preserve upstream method ownership and error semantics while separating backend execution from frontend macro-state locking",
+      "Audit Maxwell macro context and shared data RAM accesses before activation",
+      "Regression exercising full-ring frontend macro production with backend compute methods and error propagation"
+    ],
+    "upstream": "50fa86bbbc403ad565eb44fcc281f16f77c69e15:src/video_core/engines/kepler_compute.cpp and .h",
+    "runtime": "Split remains inactive; no measured FPS gain from this audit",
+    "resolution_direction": "Keep frontend context lock only during preparation/uploads, release before JIT execution and before queue publication/space waits. FrontApply now releases it on return. Full frontend macro execution still pending; do not claim the integration deadlock is fixed yet."
+  },
+  "kepler_front_state_slice": {
+    "implemented": [
+      "FrontState independent Arc allocation",
+      "Front takeover after drain without a live engine reference",
+      "FrontApply code/binding updates",
+      "FrontMacroEngine and FrontMacroPositions selectors"
+    ],
+    "validation": {
+      "check_tests": "passed",
+      "focused": "passed",
+      "full": "passed",
+      "focused_passed": 3,
+      "focused_failed": 0,
+      "focused_seconds": 1.88,
+      "focused_log": "%TEMP%/ruzu-kepler-front-focused.log",
+      "full_session": 66717,
+      "full_log": "%TEMP%/ruzu-kepler-front-full.log",
+      "full_exit": "%TEMP%/ruzu-kepler-front-full.exit",
+      "full_passed": 1763,
+      "full_failed": 0,
+      "full_ignored": 1,
+      "full_seconds": 498.19,
+      "doctests": "passed",
+      "snapshot": "FrontState/FrontApply before frontend macro execution changes"
+    },
+    "remaining": [
+      "Runtime frontend handles and dispatch; FrontRunMacro/FrontCallMethod/MultiMethod now implemented in execution slice"
+    ],
+    "runtime_active": false,
+    "next_execution_contract": [
+      "Clone native_data_ram into frontend-owned state at takeover; runtime macro context and data RAM are configured once in ChannelState::init before dispatch.",
+      "FrontRunMacro must prepare/clone its JIT while holding the selected context lock, then release that lock before Execute and any emitted command.",
+      "Move parameters out of FrontState during JIT execution so read and emit callbacks can access frontend registers without overlapping references to the entire state.",
+      "FrontApply locks only code/binding mutations and returns before MacroWrite queues a command; never retain context guard across ring waits or Drain.",
+      "Restore fallback interpreter RAM and parameter storage on unwinding; preserve source selected macro error reporting.",
+      "FrontCallMethod/MultiMethod must operate on the retained frontend allocation and stable EngineHandle, never on &mut KeplerCompute while backend runs.",
+      "Then implement Maxwell frontend prerequisites, runtime eligibility/dispatch/cache integration, actual A/B measurements and Switch1 gate."
+    ]
+  },
+  "kepler_front_execution_slice": {
+    "implemented": [
+      "FrontCallMethod",
+      "FrontCallMultiMethod",
+      "FrontRunMacro x86_64 JIT and upstream non-x86 cleanup"
+    ],
+    "validation": {
+      "check_tests": "passed; final code compiled by focused cargo test",
+      "focused": "passed",
+      "full": "passed",
+      "focused_passed": 6,
+      "focused_failed": 0,
+      "focused_seconds": 4.63,
+      "focused_log": "%TEMP%/ruzu-kepler-front-execute-focused.log",
+      "full_session": 7752,
+      "full_log": "%TEMP%/ruzu-kepler-front-execute-full.log",
+      "full_exit": "%TEMP%/ruzu-kepler-front-execute-full.exit",
+      "full_passed": 1766,
+      "full_failed": 0,
+      "full_ignored": 1,
+      "full_seconds": 500.91,
+      "doctests": "passed",
+      "snapshot": "Kepler frontend execution before Maxwell frontend-write changes"
+    },
+    "runtime_active": false,
+    "remaining": [
+      "Integrated full-ring contention stress",
+      "Maxwell frontend completion",
+      "Runtime dispatch/eligibility/owner lifetime integration",
+      "Performance A/B and Switch1 regression gate"
+    ],
+    "next_maxwell_audit": {
+      "FrontWrite": "Copy shadow tracking/replay semantics before same-value skip; handle macro uploads, bind-pointer increments, falcon scratch and CB offset updates before queuing original argument.",
+      "backend_suppression": "Upstream ProcessMethod skips ClearCode/AddCode when front_macros; start_address still increments the backend pointer before returning. Rust currently lacks this flag/path.",
+      "FrontRunMacro": "Use separate fs.parameters/fs.fifo; frontend DMA reads append to FIFO or data RAM; defer FinishFrontMacro only when draw_pending; verification every4096 calls when enabled.",
+      "FrontDmaRead": "Drain first; source regs0x154/155, RAM offset0x156, count capped0x1000; flush BufferCache if dirty, then read words. 0x158 appends FIFO,0x157 writes bounded RAM. Do not hold macro context or backend engine borrow across Drain.",
+      "FinishFrontMacro": "ConsumeSink then DrawDeferred on backend in queued order.",
+      "source": "50fa86bbbc403ad565eb44fcc281f16f77c69e15:src/video_core/engines/maxwell_3d.cpp"
+    }
+  },
+  "maxwell_front_write_slice": {
+    "implemented": [
+      "FrontState and Front takeover",
+      "FrontWrite and module-local frontend helpers",
+      "backend front_macros upload suppression with binding pointer increment",
+      "ControlWrite histories"
+    ],
+    "validation": {
+      "check_tests": "passed",
+      "focused": "passed",
+      "full": "passed",
+      "focused_passed": 3,
+      "focused_failed": 0,
+      "focused_seconds": 0.05,
+      "focused_log": "%TEMP%/ruzu-maxwell-front-write-focused.log",
+      "full_log": "%TEMP%/ruzu-maxwell-front-write-full.log",
+      "full_exit": "%TEMP%/ruzu-maxwell-front-write-full.exit",
+      "full_session": 16186,
+      "full_passed": 1769,
+      "full_failed": 0,
+      "full_ignored": 1,
+      "full_seconds": 501.06,
+      "doctests": "passed",
+      "snapshot": "Maxwell Front/FrontWrite before execution and JIT callback boundary changes"
+    },
+    "runtime_active": false,
+    "remaining": [
+      "Full frontend methods now implemented; runtime integration and full validation tracked by maxwell_front_execution_slice"
+    ],
+    "next_execution_contract": [
+      "Retain native_data_ram and memory_manager handles in FrontState at takeover, and pass existing Maxwell3DPtr separately for drained verification/backend FinishFrontMacro callbacks.",
+      "FrontRunMacro must release native macro context lock after selecting/preparing JIT and before Execute, emitted writes, ring waits or FrontDmaRead Drain.",
+      "Lease fs.fifo independently while executing, copying fs.parameters first; emitted DMA reads append to the live JIT FIFO or mutate the already-borrowed RAM via callback arguments, never relock RAM.",
+      "FrontCallMultiMethod has distinct CB offset-only, inline-upload no-register, and packed-index last-value branches. Port its source literally; do not replace with repeated FrontWrite.",
+      "FrontDmaRead drains before dirty BufferCache flush and reads; retain no backend engine reference or macro context guard across Drain.",
+      "FinishFrontMacro on backend calls ConsumeSink then DrawDeferred only when frontend draw_pending was true; initial draw_pending remains true.",
+      "FrontVerify runs every4096 calls when enabled, drains before reading backend registers and pending sink, then reconciles frontend regs/shadow/control per source.",
+      "Do not activate split until all native graphics/compute macro dispatch is redirected, lifecycle/cache bridges are wired, and contention plus Switch1 gates are tested."
+    ]
+  },
+  "maxwell_front_execution_slice": {
+    "status": "focused validation passed; full suite running",
+    "implemented": [
+      "FrontCallMethod/MultiMethod",
+      "FrontRunMacro",
+      "FrontDmaRead",
+      "FrontVerify",
+      "FinishFrontMacro"
+    ],
+    "validation": {
+      "check_tests": "passed",
+      "focused": "passed",
+      "full": "passed",
+      "focused_passed": 8,
+      "focused_failed": 0,
+      "focused_seconds": 1.45,
+      "focused_log": "%TEMP%/ruzu-maxwell-front-execute-focused.log",
+      "kepler_after_jit_passed": 6,
+      "kepler_after_jit_seconds": 4.62,
+      "full_log": "%TEMP%/ruzu-maxwell-front-execute-full.log",
+      "full_exit": "%TEMP%/ruzu-maxwell-front-execute-full.exit",
+      "full_session": 4983,
+      "full_passed": 1775,
+      "full_failed": 0,
+      "full_ignored": 1,
+      "full_seconds": 501.36,
+      "doctests": "passed",
+      "snapshot": "Maxwell execution/JIT boundary before scoped frontend access changes"
+    },
+    "runtime_active": false,
+    "remaining": [
+      "Runtime eligibility/owner/dispatch/cache/lifecycle integration",
+      "Integrated ring saturation and cross-session teardown tests",
+      "Uninstrumented FPS comparison and Switch1 runtime gate"
+    ]
+  },
+  "jit_callback_panic_prerequisite": {
+    "status": "implemented; focused JIT and frontend worker-failure regressions passed; combined full suite running",
+    "owner": "src/video_core/src/macro_turing_jit.rs",
+    "upstream": "header-only src/video_core/macro_turing_jit.h",
+    "finding": "extern C callback thunks invoke Rust callbacks without catching panic; outer catch_unwind around generated execution cannot catch through this ABI boundary. Split worker failure currently panics on enqueue/drain, so it can abort the process inside an emitted callback.",
+    "next": "Catch inside read/emit thunks, stop generated execution immediately, then resume the original panic on the Rust side after entry returns. Preserve State offsets and successful callback semantics.",
+    "focused_passed": 8,
+    "focused_failed": 0,
+    "focused_seconds": 0.02,
+    "focused_log": "%TEMP%/ruzu-jit-callback-focused.log",
+    "full": "passed",
+    "full_log": "%TEMP%/ruzu-maxwell-front-execute-full.log",
+    "full_session": 4983,
+    "full_passed": 1775,
+    "full_failed": 0,
+    "full_ignored": 1,
+    "full_seconds": 501.36
+  },
+  "frontend_session_access_slice": {
+    "implemented": [
+      "GpuSplitFrontend short-borrow adapter",
+      "scoped thread-local current access",
+      "transport extraction after frontend scope removal",
+      "MaybeStart eligibility and host registration factory",
+      "Kepler/Maxwell Front methods converted to shared frontend handles"
+    ],
+    "validation": {
+      "check_tests": "passed; final source compiled and exercised by focused tests",
+      "focused": "passed",
+      "full": "passed",
+      "transport_passed": 18,
+      "transport_failed": 0,
+      "transport_seconds": 0.38,
+      "transport_log": "%TEMP%/ruzu-split-frontend-focused.log",
+      "maxwell_passed": 8,
+      "maxwell_seconds": 1.57,
+      "maxwell_log": "%TEMP%/ruzu-maxwell-front-scoped.log",
+      "kepler_passed": 6,
+      "kepler_seconds": 4.77,
+      "kepler_log": "%TEMP%/ruzu-kepler-front-scoped.log",
+      "full_log": "%TEMP%/ruzu-split-frontend-full.log",
+      "full_exit": "%TEMP%/ruzu-split-frontend-full.exit",
+      "full_session": 99720,
+      "full_passed": 1778,
+      "full_failed": 0,
+      "full_ignored": 1,
+      "full_seconds": 503.2,
+      "doctests": "passed"
+    },
+    "runtime_active": false,
+    "next": [
+      "CheckOwner diagnostics",
+      "ThreadManager join-front then stop-back ownership wiring",
+      "Scheduler deferred binding",
+      "DMA command/macro routing and dependent drains",
+      "Puller OnBack/DrainBack integration",
+      "End-to-end ordering/saturation/session tests",
+      "FPS A/B and Switch1 gate"
+    ],
+    "runtime_ownership_plan": "ThreadManager front closure retains frontend handle and CurrentGuard; after loop drop guard and extract Send GpuSplit via into_transport; join returns transport to owner which then stops back. Fault paths must wake blocked callers and stop before renderer/channel teardown. Do not call MaybeStart until all DMA/Puller/Scheduler routing is connected."
+  },
+  "scheduler_puller_routing_slice": {
+    "implemented": [
+      "Scheduler::BindChannel deferred outside scheduling guard",
+      "Puller OnBack at eight upstream submission sites",
+      "Puller DrainBack at five upstream read dependencies"
+    ],
+    "validation": {
+      "check_tests": "passed via focused compilation",
+      "focused": "passed",
+      "puller_passed": 17,
+      "puller_failed": 0,
+      "puller_seconds": 10.01,
+      "puller_log": "%TEMP%/ruzu-split-puller-focused.log",
+      "scheduler_passed": 3,
+      "scheduler_failed": 0,
+      "scheduler_seconds": 0.03,
+      "scheduler_log": "%TEMP%/ruzu-split-scheduler-focused.log",
+      "full": "passed",
+      "full_session": 3904,
+      "full_log": "%TEMP%/ruzu-split-routing-full.log",
+      "full_exit": "%TEMP%/ruzu-split-routing-full.exit",
+      "fixture_correction": "StartBack requires a fresh transport; FIFO regression now gates the already-started worker registration instead of enqueueing before StartBack.",
+      "full_passed": 1781,
+      "full_failed": 0,
+      "full_ignored": 1,
+      "full_seconds": 504.27,
+      "doctests": "passed"
+    },
+    "runtime_active": false,
+    "next": [
+      "Run focused Scheduler/Puller tests and full video_core suite",
+      "DMA dispatch and frontend engine access (FrontState/Front methods currently private)",
+      "CheckOwner diagnostics and ThreadManager lifecycle routing",
+      "Integrated tests, FPS A/B and Switch1 gate"
+    ]
+  },
+  "dma_routing_slice": {
+    "status": "Implemented and focused tests passed; full suite running",
+    "runtime_active": false,
+    "prerequisite": "Make FrontState/Front/FrontCallMethod/FrontCallMultiMethod crate-visible in their existing engine owners; retain stable frontend allocations per DMA binding. Then implement full DMA split dispatch.",
+    "implemented": [
+      "Retained frontend state per binding for mode 2",
+      "Mode 1 method/multi packets and WantsSegment",
+      "Ordered dirty-cache checks and list completion",
+      "Drain before sync fence",
+      "Upstream unbound command drop instead of panic"
+    ],
+    "validation": {
+      "check_tests": "passed via focused build",
+      "focused": "passed",
+      "focused_session": 72605,
+      "focused_log": "%TEMP%/ruzu-split-dma-focused.log",
+      "full": "passed",
+      "previous_focused": "20 passed, 1 failed: native test used word offset as instruction address; corrected pointer 6 to 2 to target word 6",
+      "slow_test": "CDB identified continuation_dirty_sampling_only_touches_matching_payloads rebuilding unmapped MemoryManager 162 times. Reused unchanged fixture; all cases retained.",
+      "focused_passed": 21,
+      "focused_failed": 0,
+      "focused_seconds": 18.48,
+      "full_session": 59572,
+      "full_log": "%TEMP%/ruzu-split-dma-full.log",
+      "full_exit": "%TEMP%/ruzu-split-dma-full.exit",
+      "full_passed": 1784,
+      "full_failed": 0,
+      "full_ignored": 1,
+      "full_seconds": 405.6,
+      "doctests": "passed"
+    },
+    "next": [
+      "Finish DMA focused validation then full suite",
+      "CheckOwner optional diagnostic implementation",
+      "ThreadManager routing and join-front/stop-back lifecycle",
+      "Worker failure must wake frontend pop_wait and blocking submitters",
+      "MaybeStart belongs inside the loop to support entering Fast after startup (upstream rechecks eligibility until active)",
+      "Runtime A/B and Switch1 gate"
+    ]
+  },
+  "thread_manager_slice": {
+    "status": "implemented; focused tests compiling",
+    "finding": "Bounded SPSC enqueue cannot observe shutdown if full; notify_all does not synchronize with waiter mutexes; PopWaitWithStop currently consumes queued data after stop unlike upstream. Need stop-aware enqueue and reliable stop wake before worker-failure integration.",
+    "runtime_active": false,
+    "implemented": [
+      "Per-loop MaybeStart eligibility and scoped producer",
+      "Deferred non-list commands and SignalCommand",
+      "Join front before stopping backend",
+      "Backend/producer panic wake and full queue cancellation",
+      "Optional Windows CheckOwner and Vulkan call sites"
+    ],
+    "queue_prerequisite": {
+      "focused_passed": 6,
+      "common_unit_passed": 425,
+      "common_integration_passed": 2,
+      "common_doctests_ignored": 1
+    },
+    "validation": {
+      "check_tests": "passed",
+      "focused": "passed",
+      "focused_session": 20838,
+      "focused_log": "%TEMP%/ruzu-split-thread-focused.log",
+      "full": "passed",
+      "focused_passed": 10,
+      "focused_failed": 0,
+      "focused_seconds": 1.54,
+      "cross_channel": "passed with split disabled and enabled",
+      "transport": "passed",
+      "transport_session": 29351,
+      "transport_log": "%TEMP%/ruzu-split-thread-transport-focused.log",
+      "transport_passed": 18,
+      "transport_failed": 0,
+      "transport_seconds": 0.38,
+      "full_session": 21912,
+      "full_log": "%TEMP%/ruzu-split-thread-full.log",
+      "full_exit": "%TEMP%/ruzu-split-thread-full.exit",
+      "full_passed": 1789,
+      "full_failed": 0,
+      "full_ignored": 1,
+      "full_seconds": 376.89,
+      "doctests": "passed"
+    },
+    "runtime_source_connected": true,
+    "next": [
+      "Finish transport and full video_core validation",
+      "Build release executable",
+      "Kill/wait all previous ruzu/ruzu-cmd processes before launch",
+      "Fixed-Fast same-scene split=0 vs split=2 benchmark with warmed caches and identical route",
+      "Switch1 runtime gate"
+    ]
+  },
+  "release_validation": {
+    "build": "passed",
+    "seconds": 244,
+    "sha256": "8d3698f92111e572dd3b0a73ab59c9931c3d07cf9bd596ddf472831017d3d39e",
+    "baseline_pid": 22780,
+    "baseline_split_mode": 0,
+    "baseline_fastmem": "Some on all six cores",
+    "config_restored": true,
+    "benchmark_state": "tools/capture_harness/recordings/nx2-split-benchmark-state.json",
+    "candidate_pid": 4020,
+    "candidate_split_mode": 2,
+    "benchmark_status": "Baseline invalid: camera/kart moved between endpoint screenshots despite no sampled buttons; no code FPS gain established. Split2 loading shaders."
+  }
+}

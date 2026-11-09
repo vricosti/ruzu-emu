@@ -80,6 +80,11 @@ impl RenderTargetDirtyFlagAccess for [bool; 256] {
 }
 
 impl<P: TextureCacheParams> TextureCacheBase<P> {
+    /// Port of `TextureCache<P>::HasAsyncFlushWork` in texture_cache.h.
+    pub fn has_async_flush_work(&self) -> bool {
+        !self.uncommitted_downloads.is_empty() || !self.uncommitted_async_buffers.is_empty()
+    }
+
     /// Port of upstream `TextureCache<P>::RefreshContents`.
     pub fn refresh_contents(&mut self, image_id: ImageId) {
         if !self.slot_images[image_id]

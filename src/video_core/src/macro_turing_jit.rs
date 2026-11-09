@@ -27,7 +27,8 @@ pub struct State {
     pub end_next: u8,
     pub stopped: u8,
     pub cancel_end: u8,
-    pub pad: u8,
+    /// Rust-only failure flag in upstream's padding byte; ABI offsets stay fixed.
+    pub callback_failed: u8,
     pub scratch_x: Word,
     pub scratch_y: Word,
     pub _pointer_alignment: Word,
@@ -113,6 +114,7 @@ impl TuringMacroJit {
         let mut thunks = Thunks {
             read: &mut read,
             emit: &mut emit,
+            panic: None,
         };
         // All fields (including upstream unspecified scratch/padding) deterministic.
         let mut state = State {
@@ -132,7 +134,7 @@ impl TuringMacroJit {
             end_next: 0,
             stopped: 0,
             cancel_end: 0,
-            pad: 0,
+            callback_failed: 0,
             scratch_x: 0,
             scratch_y: 0,
             _pointer_alignment: 0,
@@ -149,6 +151,11 @@ impl TuringMacroJit {
             .expect("Prepare must precede Execute")
             .entry;
         let error = unsafe { entry.expect("Program must be finalized")(&mut state) };
+        // Never unwind through generated machine code or an extern-C callback.
+        // The thunk returns through the normal JIT exit before restoring panic.
+        if let Some(payload) = thunks.panic.take() {
+            std::panic::resume_unwind(payload);
+        }
         ExecutionResult {
             success: error == 0,
             pc: state.fail_pc,
@@ -160,6 +167,7 @@ impl TuringMacroJit {
 struct Thunks<'a, R, E> {
     read: &'a mut R,
     emit: &'a mut E,
+    panic: Option<Box<dyn std::any::Any + Send>>,
 }
 impl<R: FnMut(Word) -> Word, E: FnMut(Word, Word, &mut Vec<Word>, &mut DataRam) -> bool>
     Thunks<'_, R, E>
@@ -168,16 +176,31 @@ impl<R: FnMut(Word) -> Word, E: FnMut(Word, Word, &mut Vec<Word>, &mut DataRam) 
         let state = unsafe { &mut *state };
         let thunks = unsafe { &mut *state.user.cast::<Self>() };
         let fifo = unsafe { &mut *state.fifo };
-        let ok = (thunks.emit)(method, value, fifo, unsafe {
-            &mut *state.dram.cast::<DataRam>()
-        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (thunks.emit)(method, value, fifo, unsafe { &mut *state.dram.cast::<DataRam>() })
+        }));
         state.params = fifo.as_ptr();
         state.params_size = fifo.len() as u32;
-        ok
+        match result {
+            Ok(ok) => ok,
+            Err(payload) => {
+                thunks.panic = Some(payload);
+                state.callback_failed = 1;
+                false
+            }
+        }
     }
     unsafe extern "C" fn call_read(state: *mut State, address: Word) -> Word {
-        let thunks = unsafe { &mut *(*state).user.cast::<Self>() };
-        (thunks.read)(address)
+        let state = unsafe { &mut *state };
+        let thunks = unsafe { &mut *state.user.cast::<Self>() };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (thunks.read)(address))) {
+            Ok(value) => value,
+            Err(payload) => {
+                thunks.panic = Some(payload);
+                state.callback_failed = 1;
+                0
+            }
+        }
     }
 }
 #[cfg(target_os = "windows")]
@@ -689,6 +712,10 @@ impl Program {
                 self.asm.mov(ARG1D, EAX)?;
                 self.asm.mov(ARG0, RBX)?;
                 self.asm.call_reg(q!(read))?;
+                // Read has no boolean return channel. Exit before committing a
+                // destination, running the other lane, or emitting any writes.
+                self.asm.cmp(b!(callback_failed), 0)?;
+                self.asm.jnz(&self.fail_emit, JmpType::Near)?;
             }
             23 => {
                 if imm < 2 {
@@ -753,6 +780,51 @@ impl Program {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callback_panics_resume_after_leaving_jit_without_later_guest_effects() {
+        let code = [
+            instruction(&[(10, 5, 22), (20, 5, 25), (30, 16, 0x123)]),
+            instruction(&[(30, 16, 0x100), (66, 16, 9), (82, 3, 5), (85, 4, 6)]),
+            instruction(&[(0, 1, 1), (10, 5, 31), (20, 5, 25), (30, 16, 5),
+                (25, 5, 26), (66, 16, 77)]),
+            instruction(&[]),
+        ].concat();
+        let mut jit = TuringMacroJit::default();
+        jit.prepare(&code, 0).unwrap();
+        for fail_read in [true, false] {
+            let reads = std::cell::Cell::new(0);
+            let emits = std::cell::Cell::new(0);
+            let mut fifo = vec![42];
+            let mut ram = [0u32; 0xc00];
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                jit.execute(0, &mut fifo, &mut ram,
+                    |_| {
+                        reads.set(reads.get() + 1);
+                        if fail_read { std::panic::panic_any(0x1234u64); }
+                        0
+                    },
+                    |_, _, fifo, ram| {
+                        emits.set(emits.get() + 1);
+                        fifo.resize(10000, 7); // Reallocation before failure remains valid.
+                        ram[0] = 9;
+                        std::panic::panic_any(0x5678u64);
+                    },
+                )
+            }));
+            let payload = result.err().expect("original callback panic was swallowed");
+            assert_eq!(payload.downcast_ref::<u64>(), Some(&if fail_read { 0x1234 } else { 0x5678 }));
+            assert_eq!(reads.get(), 1);
+            assert_eq!(emits.get(), u32::from(!fail_read));
+            assert_eq!(ram[5], 0, "JIT executed DWRITE after callback failed");
+            assert_eq!(ram[0], if fail_read { 0 } else { 9 });
+            assert_eq!(fifo.len(), if fail_read { 1 } else { 10000 });
+            let result = jit.execute(0, &mut fifo, &mut ram, |_| 0, |_, _, _, _| true);
+            assert!(result.success, "failure leaked into subsequent execution");
+            assert_eq!(ram[5], 77);
+        }
+    }
+
     fn instruction(fields: &[(usize, usize, u32)]) -> [u32; 3] {
         let mut bits = 0u128;
         for low in [15, 20, 25, 51, 56, 61] {
@@ -1067,6 +1139,7 @@ mod tests {
     fn prepare_uses_generation_and_native_state_layout_matches_upstream() {
         assert_eq!(offset_of!(State, carry), 96);
         assert_eq!(offset_of!(State, end_next), 144);
+        assert_eq!(offset_of!(State, callback_failed), 147);
         assert_eq!(offset_of!(State, scratch_x), 148);
         assert_eq!(offset_of!(State, params), 160);
         assert_eq!(offset_of!(State, dram), 168);

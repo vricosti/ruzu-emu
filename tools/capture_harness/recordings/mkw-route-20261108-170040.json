@@ -1,0 +1,147 @@
+{
+  "version": 1,
+  "kind": "ruzu-gui-buttons",
+  "complete": true,
+  "program_id": 288445811711729664,
+  "interval_ms": 20,
+  "events": [
+    {
+      "at_us": 0,
+      "buttons": []
+    },
+    {
+      "at_us": 128874501,
+      "buttons": [
+        "L",
+        "R",
+        "SL",
+        "SR"
+      ]
+    },
+    {
+      "at_us": 129056022,
+      "buttons": []
+    },
+    {
+      "at_us": 133492206,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 133588813,
+      "buttons": []
+    },
+    {
+      "at_us": 137582063,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 137705916,
+      "buttons": []
+    },
+    {
+      "at_us": 140053266,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 140222559,
+      "buttons": []
+    },
+    {
+      "at_us": 142754195,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 142892394,
+      "buttons": []
+    },
+    {
+      "at_us": 149515228,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 149642331,
+      "buttons": []
+    },
+    {
+      "at_us": 150998066,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 151177430,
+      "buttons": []
+    },
+    {
+      "at_us": 152402131,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 152538267,
+      "buttons": []
+    },
+    {
+      "at_us": 165720003,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 165900412,
+      "buttons": []
+    },
+    {
+      "at_us": 173638827,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 173818844,
+      "buttons": []
+    },
+    {
+      "at_us": 180290820,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 180493853,
+      "buttons": []
+    },
+    {
+      "at_us": 181301766,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 181502154,
+      "buttons": []
+    },
+    {
+      "at_us": 189889593,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 190079746,
+      "buttons": []
+    }
+  ],
+  "duration_us": 222601825
+}

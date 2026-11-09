@@ -2202,41 +2202,62 @@ impl RasterizerVulkan {
         cache_wait || self.query_cache.should_wait_async_flushes()
     }
 
-    fn should_flush_async(&self) -> bool {
-        let cache_flush = {
-            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
-            self.texture_cache.has_uncommitted_flushes()
-                || self.common_buffer_cache.has_uncommitted_flushes()
-        };
-        cache_flush || self.query_cache.has_uncommitted_flushes()
+    /// Callback adaptation of upstream FenceManager::CommitCacheFlushes.
+    /// Hold each cache lock alone and commit only queues containing work.
+    fn commit_cache_flushes(&mut self) -> crate::fence_manager::CacheFlushes {
+        let mut flushes = crate::fence_manager::CacheFlushes::default();
+        unsafe {
+            let cache: *mut TextureCache = &mut *self.texture_cache;
+            let mutex: *const _ = &(*cache).base.mutex;
+            let _guard = (*mutex).lock();
+            flushes.should_flush = (*cache).has_uncommitted_flushes();
+            if (*cache).has_async_flush_work() {
+                (*cache).commit_async_flushes();
+
+                flushes.committed |= crate::fence_manager::TEXTURE_FLUSHES;
+            }
+        }
+        unsafe {
+            let cache: *mut VulkanCommonBufferCache = &mut *self.common_buffer_cache;
+            let mutex: *const _ = &(*cache).mutex;
+            let _guard = (*mutex).lock();
+
+            if (*cache).has_uncommitted_flushes() {
+                (*cache).commit_async_flushes();
+                flushes.should_flush = true;
+                flushes.committed |= crate::fence_manager::BUFFER_FLUSHES;
+            }
+        }
+        flushes
     }
 
-    fn pop_async_flushes(&mut self) {
-        {
-            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
-            self.texture_cache.pop_async_flushes();
-            self.common_buffer_cache.pop_async_flushes();
+    fn pop_async_flushes(&mut self, committed: u8) {
+        if committed & crate::fence_manager::TEXTURE_FLUSHES != 0 {
+            unsafe {
+                let cache: *mut TextureCache = &mut *self.texture_cache;
+                let mutex: *const _ = &(*cache).base.mutex;
+                let _guard = (*mutex).lock();
+                (*cache).pop_async_flushes();
+            }
+        }
+        if committed & crate::fence_manager::BUFFER_FLUSHES != 0 {
+            unsafe {
+                let cache: *mut VulkanCommonBufferCache = &mut *self.common_buffer_cache;
+                let mutex: *const _ = &(*cache).mutex;
+                let _guard = (*mutex).lock();
+                (*cache).pop_async_flushes();
+            }
         }
         self.query_cache.pop_async_flushes();
     }
 
-    fn commit_async_flushes(&mut self) {
-        {
-            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_guard, _texture_guard);
-            self.texture_cache.commit_async_flushes();
-            self.common_buffer_cache.commit_async_flushes();
-        }
+    fn commit_async_flushes(&mut self) -> bool {
+        let should_flush = self.query_cache.has_uncommitted_flushes();
         let this = self as *mut Self;
-        self.query_cache
-            .commit_async_flushes(&mut self.scheduler, move |operation| unsafe {
-                (*this).sync_operation(operation);
-            });
+        self.query_cache.commit_async_flushes(&mut self.scheduler, move |operation| unsafe {
+            (*this).sync_operation(operation);
+        });
+        should_flush
     }
 
     /// Callback adaptation of upstream `FenceManager::SignalOrdering`, which
@@ -4071,11 +4092,12 @@ impl RasterizerInterface for RasterizerVulkan {
             move |fence| unsafe { (*this).queue_fence(fence) },
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).should_flush_async() },
+            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
+            move || unsafe { (*this).query_cache.has_pending_fence_work() },
         );
     }
 
@@ -4098,11 +4120,12 @@ impl RasterizerInterface for RasterizerVulkan {
             move |fence| unsafe { (*this).queue_fence(fence) },
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).should_flush_async() },
+            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
+            move || unsafe { (*this).query_cache.has_pending_fence_work() },
         );
     }
 
@@ -4114,15 +4137,17 @@ impl RasterizerInterface for RasterizerVulkan {
             move |fence| unsafe { (*this).queue_fence(fence) },
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).should_flush_async() },
+            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
+            move || unsafe { (*this).query_cache.has_pending_fence_work() },
         );
     }
 
     fn release_fences(&mut self, force: bool) {
+        let _scope = ProfileScope::new(ProfileZone::ReleaseFences);
         let this = self as *mut Self;
         let this_for_pop = this as usize;
         self.fence_manager.wait_pending_fences(
@@ -4132,11 +4157,12 @@ impl RasterizerInterface for RasterizerVulkan {
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
             move |fence| unsafe { (*this).wait_fence(fence) },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).should_flush_async() },
+            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
+            move || unsafe { (*this).query_cache.has_pending_fence_work() },
         );
     }
 
@@ -4394,7 +4420,7 @@ impl RasterizerInterface for RasterizerVulkan {
         self.fence_manager.signal_ordering(
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
+            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
             move || unsafe { (*this).accumulate_flushes() },
         );
     }

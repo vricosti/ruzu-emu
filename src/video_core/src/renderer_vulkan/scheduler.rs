@@ -369,6 +369,8 @@ struct SchedulerWorkerState {
     chunks: VecDeque<CommandChunk>,
     chunk_reserve: Vec<CommandChunk>,
     in_flight: usize,
+    // Upstream Scheduler::worker_waiting, guarded by the queue mutex.
+    worker_waiting: bool,
 }
 
 /// Stable synchronization subset of `Scheduler` used by Vulkan fences.
@@ -400,7 +402,9 @@ impl SchedulerWorkerState {
     }
 
     fn pop_front(&mut self) -> Option<CommandChunk> {
-        let chunk = self.chunks.pop_front()?;
+        let chunk = self.chunks.pop_front();
+        self.worker_waiting = chunk.is_none();
+        let chunk = chunk?;
         self.in_flight += 1;
         Some(chunk)
     }
@@ -425,6 +429,7 @@ impl SchedulerWorker {
                 chunks: VecDeque::new(),
                 chunk_reserve: Vec::new(),
                 in_flight: 0,
+                worker_waiting: false,
             }),
             job_cv: Condvar::new(),
             drained_cv: Condvar::new(),
@@ -433,8 +438,16 @@ impl SchedulerWorker {
     }
 
     fn push(&self, chunk: CommandChunk) {
-        self.state.lock().unwrap().chunks.push_back(chunk);
-        self.job_cv.notify_one();
+        let wake = {
+            let mut state = self.state.lock().unwrap();
+            state.chunks.push_back(chunk);
+            state.worker_waiting
+        };
+        // Upstream DispatchWork avoids a wake while the worker is executing.
+        // It checks the queue before sleeping, under this same mutex.
+        if wake {
+            self.job_cv.notify_one();
+        }
     }
 
     fn acquire_chunk(&self) -> CommandChunk {
@@ -463,6 +476,7 @@ impl SchedulerWorker {
                         break Some(chunk);
                     }
                     if self.stop.load(Ordering::Acquire) {
+                        state.worker_waiting = false;
                         break None;
                     }
                     state = self.job_cv.wait(state).unwrap();
@@ -475,6 +489,9 @@ impl SchedulerWorker {
             let submit = chunk.execute_all(context.current_cmdbuf, context.upload_cmdbuf);
             if let Some(submit) = submit {
                 if let Err(error) = context.submit_execution(&submit) {
+                    // The asynchronous logger may not drain before abort().
+                    // Preserve the Vulkan result in redirected stderr as well.
+                    eprintln!("Vulkan worker failed to submit tick {}: {error:?}", submit.tick);
                     log::error!(
                         "Vulkan worker failed to submit tick {}: {error:?}",
                         submit.tick
@@ -485,6 +502,10 @@ impl SchedulerWorker {
                     std::process::abort();
                 }
                 if let Err(error) = context.allocate_worker_command_buffer() {
+                    eprintln!(
+                        "Vulkan worker failed to rotate command buffers after tick {}: {error:?}",
+                        submit.tick
+                    );
                     log::error!(
                         "Vulkan worker failed to rotate command buffers after tick {}: {error:?}",
                         submit.tick
@@ -766,6 +787,7 @@ impl Scheduler {
         &mut self,
         cmd: impl FnOnce(vk::CommandBuffer, vk::CommandBuffer) + Send + 'static,
     ) {
+        crate::gpu_split::check_owner("Scheduler::Record");
         let command = match self.current_chunk.record(cmd) {
             Ok(()) => return,
             Err(command) => command,
@@ -1195,6 +1217,7 @@ impl Scheduler {
 
     /// Port of upstream `Scheduler::DispatchWork`.
     pub fn dispatch_work(&mut self) {
+        crate::gpu_split::check_owner("Scheduler::DispatchWork");
         if self.current_chunk.is_empty() {
             return;
         }
@@ -1230,6 +1253,7 @@ impl Scheduler {
         signal_semaphore: vk::Semaphore,
         wait_semaphore: vk::Semaphore,
     ) -> u64 {
+        crate::gpu_split::check_owner("Scheduler::Flush");
         let tick = self.submit_execution(signal_semaphore, wait_semaphore);
         self.allocate_new_context();
         debug!("Scheduler: flushed at tick {}", tick);
@@ -1276,6 +1300,7 @@ impl Scheduler {
         signal_semaphore: vk::Semaphore,
         wait_semaphore: vk::Semaphore,
     ) {
+        crate::gpu_split::check_owner("Scheduler::Finish");
         let presubmit_tick = self.current_tick();
         self.submit_execution(signal_semaphore, wait_semaphore);
         self.wait(presubmit_tick);
@@ -1441,11 +1466,51 @@ mod tests {
             chunks: VecDeque::new(),
             chunk_reserve: Vec::new(),
             in_flight: 1,
+            worker_waiting: false,
         };
         assert!(!state.is_drained());
 
         state.in_flight = 0;
         assert!(state.is_drained());
+    }
+
+    #[test]
+    fn scheduler_worker_receives_work_after_entering_wait() {
+        let worker = Arc::new(SchedulerWorker::new());
+        let consumer = Arc::clone(&worker);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut state = consumer.state.lock().unwrap();
+            assert!(state.pop_front().is_none());
+            assert!(state.worker_waiting);
+            ready_tx.send(()).unwrap();
+            let (mut state, timeout) = consumer.job_cv.wait_timeout_while(
+                state,
+                Duration::from_secs(5),
+                |state| state.chunks.is_empty(),
+            ).unwrap();
+            assert!(!timeout.timed_out(), "queued work must wake the waiting worker");
+            assert!(state.pop_front().is_some());
+            assert!(!state.worker_waiting);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.push(CommandChunk::new());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn scheduler_worker_checks_queued_work_before_waiting() {
+        let worker = SchedulerWorker::new();
+        worker.push(CommandChunk::new());
+        worker.push(CommandChunk::new());
+        let mut state = worker.state.lock().unwrap();
+        assert!(!state.worker_waiting);
+        assert!(state.pop_front().is_some());
+        assert!(!state.worker_waiting);
+        assert!(state.pop_front().is_some());
+        assert!(!state.worker_waiting);
+        assert!(state.pop_front().is_none());
+        assert!(state.worker_waiting);
     }
 
     #[test]
@@ -1544,6 +1609,7 @@ mod tests {
             chunks: VecDeque::from([first, second]),
             chunk_reserve: Vec::new(),
             in_flight: 0,
+            worker_waiting: false,
         };
 
         let first = state.pop_front().unwrap();

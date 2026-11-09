@@ -1,0 +1,170 @@
+{
+  "status": "Fresh High comparison candidate13.758 vs reference13.968 (-1.50%); no gain. Large drop versus older runs occurs in both binaries; causality unproven.",
+  "runtime": {
+    "profiling_enabled": false,
+    "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-input-candidate-20261108-213744",
+    "purpose": "Unprofiled paired benchmark: candidate",
+    "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-213744",
+    "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+    "rust_log": "info",
+    "binary_sha256": "443080ECC8A7562A06E59AA2182DC7C4ED9473F7FF042D2A01697EF72877DA57",
+    "pid": 20552,
+    "status": "stopped_after_benchmark",
+    "start_utc": "2026-11-08T20:37:47.4016238Z"
+  },
+  "candidate_sha256": "443080ECC8A7562A06E59AA2182DC7C4ED9473F7FF042D2A01697EF72877DA57",
+  "reference_sha256": "F9D64D1667E625879CAE44021D019D9F947ED2E59F552394190A5893B1A31EC8",
+  "reference_executable": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-194932\\candidate-binary\\ruzu.exe",
+  "config_sha256": "297deeced3259ea86e76f7a57da5b142df278f1c7a606a81d67c527d594845ff",
+  "hardware": {
+    "gpu": "AMD Radeon RX5700XT",
+    "driver": "32.0.21045.16010",
+    "cpu": "Intel Core i7-10700K",
+    "cores": 8,
+    "logical_processors": 16
+  },
+  "scope": [
+    "Kepler sink storage retention",
+    "selective cache commit/retirement masks",
+    "empty-fence skip (inactive at High default)",
+    "Vulkan backend per-fence query mask correction"
+  ],
+  "excluded": "Batched retirement not implemented",
+  "gpu_diagnostic": "%TEMP%/ruzu-gpu-diagnostic.ps1; separate from FPS window due ~919ms CIM query time",
+  "full_test_session": 27579,
+  "release_build": "passed in 2m21s",
+  "switch1_gate": "No recorded route available; user preference pending, Tetris99 launch check proposed",
+  "full_test_result": {
+    "passed": 1743,
+    "failed": 0,
+    "ignored": 1,
+    "seconds": 485.1
+  },
+  "candidate_high": {
+    "mean_fps": 13.75847158401788,
+    "median_fps": 14.962124266283695,
+    "samples": 129,
+    "buttons_pressed": false,
+    "input_complete": true,
+    "events": [
+      {
+        "at_us": 0,
+        "buttons": []
+      }
+    ],
+    "source": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-213744\\fence-candidate-high-fps.json",
+    "scene": "Start/end inspected: same grid position, 5 coins, lap1/3, 24th; no buttons",
+    "ten_second_groups": [
+      {
+        "offset_s": 0,
+        "mean": 14.33559802966665,
+        "min": 10.98219505524832,
+        "max": 15.997488697119618,
+        "samples": 20
+      },
+      {
+        "offset_s": 10,
+        "mean": 15.083734652648408,
+        "min": 13.974944439418024,
+        "max": 15.987527022631877,
+        "samples": 20
+      },
+      {
+        "offset_s": 20,
+        "mean": 12.932772698090808,
+        "min": 10.972365757602905,
+        "max": 14.991061128399535,
+        "samples": 20
+      },
+      {
+        "offset_s": 30,
+        "mean": 11.28566480430718,
+        "min": 5.990234963180376,
+        "max": 15.97902231913712,
+        "samples": 20
+      },
+      {
+        "offset_s": 40,
+        "mean": 13.97768090424261,
+        "min": 10.978258668832439,
+        "max": 15.97703018038284,
+        "samples": 19
+      },
+      {
+        "offset_s": 50,
+        "mean": 14.584210535808868,
+        "min": 10.986723068714983,
+        "max": 15.998451349950276,
+        "samples": 20
+      },
+      {
+        "offset_s": 60,
+        "mean": 14.482728274725856,
+        "min": 11.98163219235982,
+        "max": 15.987540912025672,
+        "samples": 10
+      }
+    ]
+  },
+  "candidate_high_gpu_diagnostic": {
+    "source": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-candidate-20261108-213744\\fence-candidate-high-gpu.jsonl",
+    "samples": 23,
+    "elapsed_seconds": 28.483437,
+    "process_cpu_core_equivalents": 3.941435333102533,
+    "working_set_gib": 20.693138122558594,
+    "engine_utilization": {
+      "pid_20552_luid_0x00000000_0x0000E112_phys_0_eng_0_engtype_3D": {
+        "mean": 36.91304347826087,
+        "max": 47
+      }
+    },
+    "mean_query_ms": 308.30434782608694,
+    "limitation": "Windows engine utilization counters in separate30s window; not same FPS interval; low utilization does not exclude short GPU waits or driver synchronization.",
+    "scene": "End inspected: same grid position,5coins,lap1/3,24th; opponents moving"
+  },
+  "config_unchanged": true,
+  "reference_runtime": {
+    "profiling_enabled": false,
+    "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-input-reference-20261108-215032",
+    "purpose": "Unprofiled paired benchmark: reference",
+    "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-reference-20261108-215032",
+    "exe": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-194932\\candidate-binary\\ruzu.exe",
+    "rust_log": "info",
+    "binary_sha256": "F9D64D1667E625879CAE44021D019D9F947ED2E59F552394190A5893B1A31EC8",
+    "pid": 21604,
+    "status": "running",
+    "start_utc": "2026-11-08T20:50:32.7771541Z"
+  },
+  "reference_high": {
+    "mean_fps": 13.967909529491788,
+    "median_fps": 13.994131873297196,
+    "samples": 129,
+    "buttons_pressed": false,
+    "input_complete": true,
+    "events": [
+      {
+        "at_us": 0,
+        "buttons": []
+      }
+    ],
+    "source": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-reference-20261108-215032\\fence-reference-high-fps.json",
+    "scene": "Start/end inspected: same grid position,5coins,lap1/3,24th; no buttons"
+  },
+  "paired_high_delta_percent": -1.499422265240924,
+  "next": "Measure Low/Fast, where empty-fence skipping is enabled; preserve configuration. Batch retirement and Switch1 runtime gate still pending.",
+  "reference_high_gpu_diagnostic": {
+    "source": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-reference-20261108-215032\\fence-reference-high-gpu.jsonl",
+    "samples": 19,
+    "elapsed_seconds": 23.360538,
+    "process_cpu_core_equivalents": 2.965069768513037,
+    "working_set_gib": 18.295764923095703,
+    "engine_utilization": {
+      "pid_21604_luid_0x00000000_0x0000E112_phys_0_eng_0_engtype_3D": {
+        "mean": 44.526315789473685,
+        "max": 62
+      }
+    },
+    "mean_query_ms": 612.3157894736842,
+    "limitation": "Separate30s diagnostic window, not same FPS interval; no causal inference from one pair."
+  }
+}

@@ -1,0 +1,308 @@
+{
+  "conclusion": "GPU split mode 2 is a measured regression versus mode 0 on this host at the stationary start-grid scene; default flipped to '0' in gpu_split.rs with EDEN_NX2_SPLIT opt-in preserved",
+  "binary_sha256": "8d3698f92111e572dd3b0a73ab59c9931c3d07cf9bd596ddf472831017d3d39e",
+  "settings": "Vulkan, gpu_accuracy Low (temporary global override, original restored byte-identical afterwards), dma_accuracy Default, fastmem on all six cores, RUST_LOG=info, no profiling",
+  "scene": "Mario Kart World 1.8.0 Mario Bros Circuit start grid, position 24, 5 coins, lap 1/3, kart idle, sampling window after the race-start burst; start/end screenshots validated identical framing",
+  "method": "130 samples of GUI game_fps at 500 ms over 65 s via gui_control status; route replayed from title with mkw-route-title-ready.json in a fresh process per mode",
+  "mode_verification": "split=0 session log contains zero 'GPU thread split' markers; split=2 sessions log the activation line",
+  "windows": [
+    {
+      "label": "split0-grid",
+      "split_mode": 0,
+      "mean_fps": 21.238907067644995,
+      "median_fps": 21.96413315239107,
+      "min_fps": 17.976335351300087,
+      "max_fps": 22.986087828880322,
+      "samples": 130,
+      "run_directory": "C:/Users/smart/AppData/Local/Temp/ruzu-bench-reference-20261109-064500",
+      "input_directory": "C:/Users/smart/AppData/Local/Temp/ruzu-bench-input-reference-20261109-064500"
+    },
+    {
+      "label": "split2-grid (previous night, window includes race-start burst)",
+      "split_mode": 2,
+      "mean_fps": 19.528459894764012,
+      "median_fps": 19.976820485798143,
+      "min_fps": 13.976121799344916,
+      "max_fps": 20.991338886139275,
+      "samples": 130,
+      "run_directory": "C:/Users/smart/AppData/Local/Temp/ruzu-bench-candidate-20261109-012459"
+    },
+    {
+      "label": "split2-grid-repeat (same post-burst timing as split0 window)",
+      "split_mode": 2,
+      "mean_fps": 17.633782198910016,
+      "median_fps": 17.976585625542107,
+      "min_fps": 9.98872195406273,
+      "max_fps": 22.98843512966819,
+      "samples": 130,
+      "run_directory": "C:/Users/smart/AppData/Local/Temp/ruzu-bench-candidate2-20261109-071500",
+      "input_directory": "C:/Users/smart/AppData/Local/Temp/ruzu-bench-input-candidate2-20261109-071500"
+    }
+  ],
+  "rejected_windows": [
+    {
+      "label": "split0 sample on drifted scene after 4h idle (kart left the grid)",
+      "mean_fps": 21.499315628098024,
+      "reason": "different scene; reject per protocol",
+      "run_directory": "C:/Users/smart/AppData/Local/Temp/ruzu-bench-reference-20261109-013457"
+    }
+  ],
+  "delta": {
+    "split2_first_vs_split0_percent": -8.05,
+    "split2_repeat_vs_split0_percent": -16.97
+  },
+  "limitations": [
+    "One split=0 window versus two split=2 windows; stationary grid with nondeterministic opponents",
+    "GUI 500 ms FPS averages, not frame latencies",
+    "Single host (AMD RX 5700 XT, Windows 11); regression root cause in the Rust transport not yet isolated"
+  ],
+  "pipeline_cache_observation": "Warm disk pipeline cache load rebuilds every pipeline each boot: 20187-20802 pipelines take 235-243 s on the worker pool before the title screen",
+  "follow_up_changes": [
+    "gpu_split.rs default EDEN_NX2_SPLIT absent => mode '0' (DIFF.md entry 2026-11-09)",
+    "Per-title MKW config: gpu_accuracy=Low and use_asynchronous_shaders=true (backup TEMP/ruzu-mkw-custom-before-perf-20261109.ini); global qt-config.ini restored byte-identical (sha256 297DEE...)"
+  ],
+  "new_binary_validation": {
+    "binary_sha256_prefix": "ae94c24e3c1eb924",
+    "split_marker_absent_without_env": true,
+    "per_title_low_accuracy_effective": "startup log gpu_accuracy: Low while global stays High",
+    "grid_window_invalid": "newbin-grid window started on the loading screen (black start screenshot); not comparable"
+  },
+  "driving_comparison": {
+    "method": "hold-A 120 s from the validated grid, 500 ms game_fps samples; nondeterministic path (wall bounces), warm 21k-pipeline cache; host RAM nearly exhausted (0.4 GB free of 32) during both runs",
+    "async_on": {
+      "mean_fps": 14.050120234422854,
+      "median_fps": 13.984434312844598,
+      "p10_fps": 8.991752934682605,
+      "below_10fps": 34,
+      "below_5fps": 8,
+      "zero_fps": 0,
+      "worst_frame_seconds": 1.2589502,
+      "dir": "C:/Users/smart/AppData/Local/Temp/ruzu-drive-20261109-async-on"
+    },
+    "async_off": {
+      "mean_fps": 13.341839532333914,
+      "median_fps": 13.976647071156297,
+      "p10_fps": 8.390779387615753,
+      "below_10fps": 52,
+      "below_5fps": 7,
+      "zero_fps": 1,
+      "worst_frame_seconds": 0.4982462,
+      "dir": "C:/Users/smart/AppData/Local/Temp/ruzu-drive-20261109-async-off"
+    },
+    "reading": "slight advantage for async ON (mean, p10, below-10fps count, no full freeze); difference within route noise. The async benefit targets first-encounter pipelines; this circuit was already cached, so the user's reported freezes on fresh content remain the expected beneficiary.",
+    "decision": "keep per-title use_asynchronous_shaders=true and gpu_accuracy=Low for MKW"
+  },
+  "switch1_gate": {
+    "title": "Mario Kart 8 Deluxe [0100152000022000] v0",
+    "binary_sha256_prefix": "ae94c24e3c1eb924",
+    "result": "boots to rendered title attract demo; Hardware profile Switch1 (4 CPU cores); gpu_accuracy High from untouched global config; no GPU split marker; no panic",
+    "evidence": "C:/Users/smart/AppData/Local/Temp/ruzu-smoke-input-20261109-switch1-smoke/mk8d-smoke.png",
+    "scope": "smoke only: boot, profile selection, rendering; not a performance comparison"
+  },
+  "same_build_high_vs_low": {
+    "binary_sha256_prefix": "ae94c24e3c1eb924",
+    "variable": "per-title gpu_accuracy only (async shaders ON in both; split inactive in both)",
+    "scene": "same validated start grid, post-burst window, start/end screenshots checked",
+    "high": {
+      "mean_fps": 13.750630359008145,
+      "median_fps": 14.968878166063469,
+      "min_fps": 7.985738078591295,
+      "max_fps": 15.997211843688502,
+      "dir": "C:/Users/smart/AppData/Local/Temp/ruzu-bench-high-20261109-high-ref"
+    },
+    "low": {
+      "mean_fps": 21.238907067644995,
+      "median_fps": 21.96413315239107,
+      "note": "split0-grid window, same binary lineage 8d3698f9; grid state identical",
+      "low_rerun_same_binary": "driving run binary ae94c24e boots Low per-title; grid window of that run was invalidated by loading-screen start"
+    },
+    "delta_mean_percent": 54.46,
+    "delta_median_percent": 46.73,
+    "config_after": "per-title restored to gpu_accuracy=0 (Low), default=false, use_global=false; GUI shutdown rewrite of the default flag corrected twice"
+  },
+  "split_root_cause": {
+    "date": "2026-11-09",
+    "split2_profiled_front_per_second": {
+      "split_drain_ms": 506.0,
+      "drains_per_s": 2180,
+      "mean_drain_us": 232,
+      "macro_ms": 202.9,
+      "dma_dispatch_ms": 169.7,
+      "dma_fetch_ms": 69.4,
+      "idle_ms": 27.7,
+      "register_writes": 5952866
+    },
+    "split2_profiled_back_per_second": {
+      "method_ms": 243.4,
+      "method_calls": 2450421,
+      "ns_per_method_call": 99,
+      "draw_prep_total_ms_approx": 460,
+      "unzoned_other_ms": 139.4,
+      "split_wait_ms": 40.5,
+      "register_writes": 2174582,
+      "note": "back is ~96% busy; non-split method dispatch costs 65 ns/call"
+    },
+    "split1_grid_window": {
+      "mean_fps": 17.55530313516063,
+      "median_fps": 17.976517741979034,
+      "min_fps": 5.995475371994718,
+      "samples": 130,
+      "dir": "C:/Users/smart/AppData/Local/Temp/ruzu-bench-split1-20261109-split1",
+      "activation_marker": "engine methods run on a second thread (no front macros)"
+    },
+    "conclusion": [
+      "Both split modes regress equally (mode1 17.56, mode2 17.63/19.53 vs mode0 21.24): the front-macro state duplication of mode 2 is NOT the main cost",
+      "Front loses ~50% of its time in Drain (2180/s at ~232 us) waiting on a saturated back",
+      "Back per-method execution costs ~99 ns vs 65 ns unsplit, plus ~139 ms/s unzoned ring-loop overhead",
+      "Mode 2 doubles register writes by design (front state 5.95M/s + back 2.17M/s vs 3.16M/s unsplit)",
+      "Rehabilitating the split requires cutting back-side execute() overhead and reducing drain frequency/latency; default '0' stands"
+    ],
+    "split2_profile_archive": "C:/Users/smart/AppData/Local/Temp/ruzu-profile-20261109-profile-split2/profile-windows.txt"
+  },
+  "dispatch_shape_slice": {
+    "date": "2026-11-09",
+    "change": "EngineInterface now exposes EngineInterfaceState via interface_state()/interface_state_mut(); DmaPusher::CallMethod/CallMultiMethod (unsplit) and GpuSplitBack::execute use one state access plus direct field reads instead of up to five dynamic dispatches per guest method call, matching upstream's public-member access and inline ConsumeSink (DIFF.md 2026-11-09)",
+    "binary_sha256_prefix": "9c1923bbaae7d11b",
+    "tests": "full video_core suite 1828 passed, 0 failed, 1 ignored (84 s); focused gpu_split 18, dma_pusher 22, engines 409",
+    "grid_windows": [
+      {
+        "label": "dispatch-grid (lap-1 pack crossing line mid-window)",
+        "mean_fps": 16.529408549680145,
+        "median_fps": 16.975983351854264,
+        "first_half_mean": 18.46,
+        "second_half_mean": 14.6,
+        "valid_for_comparison": false,
+        "reason": "race phase mismatch: the reference 21.24 window sampled a spread field; this one caught the pack re-crossing the start line"
+      },
+      {
+        "label": "dispatch-grid2 (spread field, same phase as reference)",
+        "mean_fps": 22.01471073370374,
+        "median_fps": 21.975808075574445,
+        "min_fps": 17.976443294038827,
+        "valid_for_comparison": true
+      }
+    ],
+    "comparison": "22.01/21.98 vs reference 21.24/21.96: +3.6% mean, median flat - small or within-noise gain, no regression; visuals verified (pink flashes are legitimate finish-line crossing effects)",
+    "methodology_note": "Grid windows must match race phase: FPS varies by several FPS depending on where the 23 opponents are on the course. Future A/Bs should fix the sampling start at a defined offset from race start and use 2+ windows."
+  },
+  "fresh_content_attribution": {
+    "date": "2026-11-09",
+    "question": "user-reported freezes while driving and tree pop-in; does it also slow the game?",
+    "fresh_vs_warm_same_course": {
+      "course": "Desert Hills, Time Trial solo, hold-A 150 s, async shaders ON",
+      "fresh": {
+        "mean_fps": 26.22,
+        "p10": 11.09,
+        "below_5fps": 18,
+        "zero_fps": 8,
+        "worst_frame_s": 1.79
+      },
+      "warm_second_pass": {
+        "mean_fps": 26.84,
+        "p10": 18.08,
+        "below_5fps": 4,
+        "zero_fps": 2,
+        "worst_frame_s": 0.33
+      },
+      "reading": "~75-80% of stalls are first-encounter work; a residual remains"
+    },
+    "profiled_fresh_course": {
+      "course": "Dino Dino Jungle, Time Trial solo, EDEN_NX2_GPU_PROFILE, 150 s",
+      "fill_image_views_ms_per_s": "280-546 during the drive (vs 41-63 at the warm grid)",
+      "texture_upload_zone": "never reported; ASTC decode + BC3 compress run inside the texture-cache upload path reached from FillGraphicsImageViews",
+      "stall_alignment": "highest fill-image-views windows coincide with the sampled stall clusters",
+      "macro_method": "stayed at normal levels; pipeline compilation is handled by async workers (no stall contribution visible)"
+    },
+    "pipeline_growth_per_fresh_course": "Desert Hills added ~743 pipelines (22093 -> 22836 at next boot)",
+    "parity_check": "astc.rs decoder and bcn.rs BC3/BC1 compressors are both thread-worker parallelized exactly as upstream astc.cpp/bcn.cpp; the cost is inherent, not a port defect",
+    "tree_pop_in": "expected async-shader behavior (draw skipped until pipeline built), not a slowdown; the slowdown is the texture conversion burst",
+    "black_foliage_hypothesis": "BC3 recompression lossiness (session NX2 policy for 8 GB VRAM); unverified - would need an Uncompressed run with OOM risk",
+    "remaining_candidates": [
+      "BC3 row-copy gather candidate (saved at TEMP/ruzu-bcn-candidate-before-restart-fix.rs): modest inner-loop gain, microbenchmark exists",
+      "Persist converted textures or recompress to BC1 (quality/VRAM tradeoffs, design decisions)",
+      "GPU-accelerated ASTC decode (accelerate_astc) conflicts with the BC3 VRAM policy"
+    ]
+  },
+  "split2_retest_after_dispatch_slice": {
+    "binary_sha256_prefix": "9c1923bbaae7d11b",
+    "scene_phase": "spread field (same as split0 22.01 window), split activation verified in log",
+    "split2_mean_fps": 18.400962522011877,
+    "split2_median_fps": 18.481107953732064,
+    "split0_same_binary_mean_fps": 22.01471073370374,
+    "reading": "gap narrowed from 17.63 to 18.40 after the dispatch slice but split=2 stays ~-16%; front drains waiting on a back saturated by draw preparation dominate. Default '0' confirmed. Rehabilitating the split requires cutting back-side draw-prep cost (fill image views / read handles / bind / update buffers ~460-500 ms/s on the back), which is also the main unsplit cost after command processing."
+  },
+  "async_shader_same_build_ab": {
+    "binary": "9c1923bb (dispatch build)",
+    "scene": "warm grid, spread-field phase, same protocol",
+    "async_on": {
+      "mean_fps": 22.01471073370374,
+      "median_fps": 21.975808075574445
+    },
+    "async_off": {
+      "mean_fps": 22.41580884546781,
+      "median_fps": 21.97621605294123
+    },
+    "conclusion": "identical medians; the setting is free at steady state and only converts first-encounter pipeline stalls into pop-in"
+  },
+  "draw_prep_subzone_decomposition": {
+    "binary": "fc9e36ea (adds 6 diagnostic buffer sub-zones)",
+    "at_grid_26.9k_draws_per_s_ms_per_s": {
+      "buf_update_index": 3.6,
+      "buf_update_vertex": 7.1,
+      "buf_update_uniform": 7.7,
+      "buf_update_storage": 7.2,
+      "bind_uniform": 24.8,
+      "bind_storage": 9.2,
+      "read_handles": 29.4,
+      "configure": 18.9,
+      "fill_image_views": "143-303 (streaming-dependent)"
+    },
+    "audit": "buffer paths and DescriptorTable/VisitImageView verified structurally faithful (flat generation-checked table, stack SmallVec containers, no per-draw heap allocation or lock found)",
+    "conclusion": "the only remaining per-draw hotspot is fill image views; its cost is inherent descriptor visiting plus first-encounter texture conversion, pointing the next slices at texture conversion policy and a native sampling profiler session"
+  },
+  "bc1_recompression_experiment": {
+    "date": "2026-11-09",
+    "change": "per-title MKW astc_recompression=Bc1 (session log confirms 'Session ASTC recompression: Bc1'); NX2 policy preserves an explicitly configured Bc1",
+    "binary": "fc9e36ea",
+    "driving_mario_bros_circuit_24_racers_hold_A_120s": {
+      "bc1": {
+        "mean_fps": 17.40734556321571,
+        "median_fps": 17.968190863439183,
+        "p10_fps": 11.989448180184736,
+        "below_10fps": 12,
+        "below_5fps": 1,
+        "zero_fps": 0,
+        "worst_frame_s": 0.2015473
+      },
+      "bc3_reference_same_course_yesterday_binary_ae94c24e": {
+        "mean_fps": 14.050120234422854,
+        "p10_fps": 8.991752934682605,
+        "below_10fps": 34,
+        "below_5fps": 8,
+        "zero_fps": 0,
+        "worst_frame_s": 1.2589502
+      },
+      "delta": "+24% mean while driving; stalls nearly eliminated (worst frame 1.26 -> 0.20 s). Confounds: different binary (includes dispatch slice ~+3%), different race instance; the stall-magnitude drop exceeds both."
+    },
+    "visual": "race renders correctly with BC1; the dark/black distant foliage artifact is IDENTICAL to BC3, so that artifact is not BC3-specific",
+    "mechanism": "BC1 halves both the CPU block-compression cost and the upload size versus BC3 (8 vs 16 bytes/block)",
+    "decision": "kept per-title for MKW (backup TEMP/ruzu-mkw-custom-before-bc1-20261109.ini); user visual judgment requested in real play",
+    "config_final_per_title": "gpu_accuracy=Low, use_asynchronous_shaders=true, astc_recompression=Bc1, all use_global=false",
+    "outcome": "REJECTED by user on quality (full-resolution screenshot shows severe block artifacts on road/cliffs). Per-title restored to explicit Bc3 (astc_recompression=2). The +24%/stall-elimination measurement stands as evidence that texture conversion cost is the driving-stall bottleneck."
+  },
+  "bc3_same_build_driving": {
+    "binary": "fc9e36ea",
+    "polluted_first_window": "rejected: included course loading (max 59.9 FPS menu frames, 5.4 s worst frame)",
+    "clean_second_race_window": {
+      "mean_fps": 19.416426830475753,
+      "median_fps": 19.975075586191174,
+      "p10_fps": 13.987839501055557,
+      "below_5fps": 0,
+      "zero_fps": 0,
+      "worst_frame_s": 0.39708075,
+      "note": "textures already converted by the first race of the session"
+    },
+    "coherent_picture": "first-race BC3 14.05 with stalls (conversion burst) / first-race BC1 17.41 nearly stall-free / warm-texture BC3 19.42 stall-free: texture conversion dominates first-encounter driving cost",
+    "user_decision": "BC1 rejected on quality (severe blocking); user requested BC7 as the recompression target on a dedicated branch"
+  }
+}

@@ -5,6 +5,344 @@ use super::*;
 use crate::rasterizer_interface::{RasterizerDownloadArea, RasterizerInterface};
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_arch = "x86_64")]
+fn front_test_instruction(method: Option<u32>, value: Option<u32>, end: bool) -> [u32; 3] {
+    let mut bits = u128::from(end);
+    for low in [15, 20, 25, 51, 56, 61] { bits |= 24u128 << low; }
+    if let Some(method) = method {
+        bits |= (method as u128) << 30;
+        bits |= 5u128 << 82;
+        if let Some(value) = value { bits |= (value as u128) << 66; bits |= 6u128 << 85; }
+        else { bits |= 3u128 << 85; }
+    }
+    [(bits >> 64) as u32, (bits >> 32) as u32, bits as u32]
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn front_macro_dma_drains_flushes_buffer_cache_and_extends_live_fifo() {
+    let mut backing = vec![0u8; 0x6000];
+    backing[4..8].copy_from_slice(&0x87654321u32.to_le_bytes());
+    let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
+    calls.lock().unwrap().flush_write = Some((backing.as_mut_ptr() as usize, 0x12345678));
+    let rasterizer = TestRasterizer::new(calls.clone());
+    let mut engine = Box::new(new_descriptor_owner_backed_engine(&backing, 0x4000));
+    engine.get_memory_manager().lock().bind_rasterizer(&rasterizer);
+    engine.set_native_turing_macro_mode(true);
+    let handle = EngineHandle::from_ref(&*engine);
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    split.start_back(|| {});
+    {
+        let mut fs = front.lock();
+        let code = [
+            front_test_instruction(Some(0x154), Some(0), false),
+            front_test_instruction(Some(0x155), Some(0x4000), false),
+            front_test_instruction(Some(0x156), Some(0xbff), false),
+            front_test_instruction(Some(0x157), Some(2), false),
+            front_test_instruction(Some(0x158), Some(0x1001), false),
+            front_test_instruction(Some(0x123), None, true),
+            front_test_instruction(Some(0x124), None, false),
+        ].concat();
+        Maxwell3D::front_call_method(&mut fs, handle, &split, LOAD_MME_INSTRUCTION_PTR, 0, true);
+        Maxwell3D::front_call_multi_method(&mut fs, handle, &split,
+            LOAD_MME_INSTRUCTION, &code, code.len() as u32, code.len() as u32);
+        // Upstream executes a zero-parameter multi when amount == pending == 0.
+        Maxwell3D::front_call_multi_method(&mut fs, handle, &split,
+            MACRO_REGISTERS_START, &[], 0, 0);
+        assert_eq!(fs.regs[0x123], 0x12345678);
+        assert_eq!(fs.regs[0x124], 0x87654321);
+        assert_eq!(fs.fifo.len(), 0x1000);
+        assert!(fs.parameters.is_empty());
+        assert_eq!(fs.executing_macro, 0);
+        assert!(!fs.draw_pending);
+        let guard = fs.macro_owner.lock();
+        let context = guard.borrow();
+        assert!(!context.engine.native_execution_failed);
+        assert_eq!(context.engine.native_code_generation, code.len() as u64);
+    }
+    split.drain();
+    split.stop().unwrap();
+    assert_eq!(engine.regs[0x123], 0x12345678);
+    assert_eq!(engine.regs[0x124], 0x87654321);
+    assert_eq!(engine.native_data_ram.lock()[0xbff], 0x12345678);
+    assert_eq!(engine.native_data_ram.lock()[0], 0);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.flushes[0], (0x4000, 8, crate::cache_types::CacheType::BUFFER_CACHE));
+    // MemoryManager may split the second flush at mapped-page boundaries.
+    let mut cursor = 0x4000;
+    for &(address, size, cache) in &calls.flushes[1..] {
+        assert_eq!(address, cursor);
+        assert!(size > 0);
+        assert_eq!(cache, crate::cache_types::CacheType::BUFFER_CACHE);
+        cursor += size;
+    }
+    assert_eq!(cursor, 0x8000);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn front_macro_worker_failure_propagates_through_jit_without_aborting() {
+    let mut engine = Box::new(Maxwell3D::default());
+    engine.set_native_turing_macro_mode(true);
+    for word in [front_test_instruction(Some(0x123), Some(1), true),
+        front_test_instruction(None, None, false)].concat()
+    { engine.macro_engine.add_code(0, word); }
+    let handle = EngineHandle::from_ref(&*engine);
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    split.start_back(|| std::panic::panic_any(0xdeadu32));
+    let failure = split.stop().err().expect("worker should report registration failure");
+    assert_eq!(failure.downcast_ref::<u32>(), Some(&0xdead));
+    let mut fs = front.lock();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Maxwell3D::front_call_method(&mut fs, handle, &split, MACRO_REGISTERS_START, 7, true);
+    }));
+    assert!(result.is_err(), "failed worker must reach the frontend error boundary");
+    assert_eq!(fs.executing_macro, 0);
+    assert_eq!(fs.fifo, [7], "FIFO ownership restored after callback panic");
+    assert_eq!(engine.regs[0x123], 0, "failed worker executed no guest writes");
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn front_macro_completion_flushes_pending_instances_once_in_order() {
+    let mut engine = Box::new(Maxwell3D::default());
+    engine.set_native_turing_macro_mode(true);
+    engine.write_reg(GLOBAL_BASE_INSTANCE_INDEX, 17);
+    engine.write_reg(VB_COUNT, 3);
+    for _ in 0..3 {
+        engine.write_reg(DRAW_BEGIN, 4 | (1 << 26));
+        engine.write_reg(DRAW_END, 0);
+    }
+    assert!(engine.take_draw_calls().is_empty());
+    for word in [front_test_instruction(Some(0x123), None, true),
+        front_test_instruction(None, None, false)].concat()
+    { engine.macro_engine.add_code(0, word); }
+    let handle = EngineHandle::from_ref(&*engine);
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    split.start_back(|| {});
+    {
+        let mut fs = front.lock();
+        Maxwell3D::front_call_method(&mut fs, handle, &split, MACRO_REGISTERS_START, 7, false);
+        assert_eq!(fs.parameters, [7]);
+        assert_eq!(fs.regs[0x123], 0);
+        Maxwell3D::front_call_multi_method(&mut fs, handle, &split,
+            MACRO_REGISTERS_START + 1, &[8, 9], 2, 2);
+        assert_eq!(fs.regs[0x123], 7);
+        assert!(fs.parameters.is_empty());
+        assert!(!fs.draw_pending);
+        Maxwell3D::front_call_method(&mut fs, handle, &split, MACRO_REGISTERS_START, 11, true);
+        assert_eq!(fs.regs[0x123], 11);
+        assert!(!fs.draw_pending);
+    }
+    split.drain();
+    split.stop().unwrap();
+    let draws = engine.take_draw_calls();
+    assert_eq!(draws.len(), 1);
+    assert_eq!((draws[0].instance_count, draws[0].base_instance), (4, 17));
+    assert_eq!(engine.draw_manager_state().instance_count, 0);
+    assert_eq!(engine.regs[0x123], 11);
+}
+
+#[test]
+fn front_multi_methods_match_shadow_transitions_cb_and_packed_index_state() {
+    let backing = vec![0u8; 0x1000];
+    let mut engine = Box::new(new_descriptor_owner_backed_engine(&backing, 0x4000));
+    engine.set_native_turing_macro_mode(true);
+    for (method, value) in [(CB_CONFIG_BASE, 0x100), (CB_CONFIG_BASE + 2, 0x4000)] {
+        engine.call_method(method, value, true);
+    }
+    let handle = EngineHandle::from_ref(&*engine);
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    split.start_back(|| {});
+    {
+        let mut fs = front.lock();
+        for (method, words) in [
+            (0x123, vec![3, 7]),
+            (SHADOW_RAM_CONTROL, vec![2, 3, 0]),
+            (CB_DATA_BASE, vec![11, 13, 17]),
+            (DRAW_INLINE_INDEX, vec![0x12345678, 0xabcdef01]),
+            (INLINE_INDEX_2X16_EVEN, vec![0x00120034]),
+            (INLINE_INDEX_4X8_INDEX0, vec![0x01020304]),
+            (LOAD_MME_INSTRUCTION_PTR, vec![0, 2]),
+            (LOAD_MME_INSTRUCTION, vec![21, 22, 23]),
+            (LOAD_MME_START_ADDR_PTR, vec![127]),
+            (LOAD_MME_START_ADDR, vec![2, 3]),
+        ] {
+            let amount = words.len() as u32;
+            Maxwell3D::front_call_multi_method(&mut fs, handle, &split, method,
+                &words, amount, amount);
+        }
+        assert_eq!(fs.regs[CB_CONFIG_BASE as usize + 3], 12);
+        assert!(fs.draw_pending);
+    }
+    split.drain();
+    split.stop().unwrap();
+    engine.consume_sink();
+    let fs = front.lock();
+    assert_eq!(fs.regs.as_ref(), engine.regs.as_ref());
+    assert_eq!(fs.shadow.as_ref(), engine.shadow_state.as_ref());
+    assert_eq!(fs.control, engine.shadow_state[SHADOW_RAM_CONTROL as usize]);
+    assert_eq!(&backing[..12], &[11, 0, 0, 0, 13, 0, 0, 0, 17, 0, 0, 0]);
+    let guard = fs.macro_owner.lock();
+    let context = guard.borrow();
+    assert_eq!(&context.engine.native_code[6..9], &[21, 22, 23]);
+    assert_eq!(context.engine.native_code_generation, 3);
+    assert_eq!(context.positions[127], 2);
+    assert_eq!(fs.regs[LOAD_MME_START_ADDR_PTR as usize], 129);
+}
+
+#[test]
+fn front_verify_includes_pending_sink_without_executing_it() {
+    let mut engine = Box::new(Maxwell3D::default());
+    engine.set_native_turing_macro_mode(true);
+    engine.regs[0x123] = 1;
+    engine.shadow_state[0x123] = 17;
+    engine.shadow_state[SHADOW_RAM_CONTROL as usize] = ShadowRamControl::Replay as u32;
+    let handle = EngineHandle::from_ref(&*engine);
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    split.start_back(|| {});
+    {
+        let mut fs = front.lock();
+        fs.skip_same = false;
+        Maxwell3D::front_write(&mut fs, handle, &split, 0x123, 99, true, false);
+        fs.regs[0x123] = u32::MAX;
+        fs.shadow[0x123] = u32::MAX;
+        fs.control = 0xf0;
+        Maxwell3D::front_verify(&mut fs, &split);
+        assert_eq!(fs.regs[0x123], 17);
+        assert_eq!(fs.shadow[0x123], 17);
+        assert_eq!(fs.control, ShadowRamControl::Replay as u32);
+    }
+    split.stop().unwrap();
+    assert_eq!(engine.regs[0x123], 1);
+    assert_eq!(engine.interface_state.method_sink, [(0x123, 99)]);
+}
+
+#[test]
+fn front_takeover_consumes_sink_and_preserves_local_macro_state() {
+    let mut engine = Box::new(Maxwell3D::default());
+    engine.set_native_turing_macro_mode(true);
+    engine.macro_engine.add_code(0, 0x12345678);
+    engine.macro_positions[7] = 29;
+    engine.interface_state.method_sink.push((0x123, 19));
+    engine.executing_macro = MACRO_REGISTERS_START + 14;
+    engine.macro_params = vec![3, 5];
+    let allocation = engine.macro_params.as_ptr();
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    assert!(engine.front_macros);
+    assert!(engine.interface_state.method_sink.is_empty());
+    assert!(engine.macro_params.is_empty());
+    assert_eq!(engine.executing_macro, 0);
+    {
+        let fs = front.lock();
+        assert_eq!(fs.regs[0x123], 19);
+        assert_eq!(fs.shadow[0x123], 19);
+        assert_eq!(fs.parameters, [3, 5]);
+        assert_eq!(fs.parameters.as_ptr(), allocation);
+        assert_eq!(fs.executing_macro, MACRO_REGISTERS_START + 14);
+        assert!(fs.draw_pending);
+        assert!(Arc::ptr_eq(&fs.macro_owner, engine.native_macro_context.as_ref().unwrap()));
+        let guard = fs.macro_owner.lock();
+        let state = guard.borrow();
+        assert_eq!(state.engine.native_code[0], 0x12345678);
+        assert_eq!(state.engine.native_code_generation, 1);
+        assert_eq!(state.positions[7], 29);
+    }
+    engine.get_native_macro_engine(|macro_engine| {
+        assert_eq!(macro_engine.native_code[0], 0x12345678);
+    });
+    let again = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    assert!(Arc::ptr_eq(&front, &again));
+}
+
+#[test]
+fn front_writes_match_backend_shadow_replay_and_do_not_repeat_uploads() {
+    let context = Arc::new(parking_lot::ReentrantMutex::new(std::cell::RefCell::new(
+        crate::r#macro::NativeMacroContext::default(),
+    )));
+    let mut engine = Box::new(Maxwell3D::default());
+    engine.set_native_macro_context(Some(context.clone()));
+    engine.set_native_turing_macro_mode(true);
+    let handle = EngineHandle::from_ref(&*engine);
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    split.start_back(|| {});
+    {
+        let mut fs = front.lock();
+        fs.skip_same = true;
+        for (index, (method, value)) in [
+            (0x123, 7),
+            (SHADOW_RAM_CONTROL, 2), (0x123, 9),
+            (SHADOW_RAM_CONTROL, 3), (0x123, 99),
+            (SHADOW_RAM_CONTROL, 2), (0x123, 13),
+            (SHADOW_RAM_CONTROL, 0), (0x123, 13),
+            (SHADOW_RAM_CONTROL, 3), (0x123, 37),
+            (SHADOW_RAM_CONTROL, 0),
+            (LOAD_MME_INSTRUCTION_PTR, 2), (LOAD_MME_INSTRUCTION, 0xabc),
+            (LOAD_MME_START_ADDR_PTR, 127), (LOAD_MME_START_ADDR, 7),
+            (LOAD_MME_START_ADDR_PTR, u32::MAX), (LOAD_MME_START_ADDR, 42),
+        ].into_iter().enumerate() {
+            Maxwell3D::front_write(&mut fs, handle, &split, method, value, true, index % 2 == 0);
+        }
+    }
+    split.drain();
+    split.stop().unwrap();
+    engine.consume_sink();
+    let fs = front.lock();
+    assert_eq!(fs.regs.as_ref(), engine.regs.as_ref());
+    assert_eq!(fs.shadow.as_ref(), engine.shadow_state.as_ref());
+    assert_eq!(fs.regs[0x123], 13);
+    assert_eq!(fs.shadow[0x123], 13);
+    assert_eq!(fs.regs[LOAD_MME_START_ADDR_PTR as usize], 0);
+    assert_eq!(engine.back_control_count, 6);
+    let guard = context.lock();
+    let state = guard.borrow();
+    assert_eq!(state.engine.native_code[6], 0xabc);
+    assert_eq!(state.engine.native_code_generation, 1);
+    assert_eq!(state.engine.native_write_offset, 7);
+    assert_eq!(state.positions[127], 7);
+    assert_eq!(state.positions[0], 0);
+}
+
+#[test]
+fn front_write_tracks_draw_side_effects_and_wraps_cb_offset() {
+    let mut engine = Box::new(Maxwell3D::default());
+    engine.set_native_turing_macro_mode(true);
+    let handle = EngineHandle::from_ref(&*engine);
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    let mut fs = front.lock();
+    fs.draw_pending = false;
+    for (method, value) in [
+        (0x123, 9), (LOAD_MME_INSTRUCTION_PTR, 0),
+        (LOAD_MME_INSTRUCTION, 5), (FALCON4, 0),
+        (CB_CONFIG_BASE + 3, u32::MAX - 1), (CB_DATA_BASE, 0),
+    ] {
+        Maxwell3D::front_write(&mut fs, handle, &split, method, value, true, false);
+        assert!(!fs.draw_pending, "method {method:#x}");
+    }
+    assert_eq!(fs.regs[SHADOW_SCRATCH_BASE as usize], 1);
+    assert_eq!(fs.regs[CB_CONFIG_BASE as usize + 3], 2);
+    Maxwell3D::front_write(&mut fs, handle, &split, DRAW_BEGIN, 0, true, true);
+    assert!(fs.draw_pending);
+    // Unknown control bits pass through unchanged, as the upstream enum cast does.
+    Maxwell3D::front_write(&mut fs, handle, &split, SHADOW_RAM_CONTROL, 0xf0, true, false);
+    Maxwell3D::front_write(&mut fs, handle, &split, 0x123, 11, true, false);
+    assert_eq!(fs.control, 0xf0);
+    assert_eq!(fs.regs[0x123], 11);
+    assert_eq!(fs.shadow[0x123], 9);
+    let owner = fs.macro_owner.clone();
+    std::thread::spawn(move || {
+        assert!(owner.try_lock().is_some(), "frontend retained the macro context lock");
+    }).join().unwrap();
+}
+
 #[test]
 fn register_count_matches_eden_maxwell_3d() {
     let engine = Maxwell3D::default();

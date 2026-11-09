@@ -798,8 +798,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::BindHostStageBuffers`
     pub fn bind_host_stage_buffers(&mut self, stage: usize) {
-        self.bind_host_graphics_uniform_buffers(stage);
-        self.bind_host_graphics_storage_buffers(stage);
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::BindUniform);
+            self.bind_host_graphics_uniform_buffers(stage);
+        }
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::BindStorage);
+            self.bind_host_graphics_storage_buffers(stage);
+        }
         self.bind_host_graphics_texture_buffers(stage);
     }
 
@@ -2665,13 +2671,27 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.graphics_segments.clear();
         self.buffer_operations(|cache| {
             if is_indexed {
+                let _scope =
+                    crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::BufUpdateIndex);
                 cache.update_index_buffer();
             }
-            cache.update_vertex_buffers();
+            {
+                let _scope =
+                    crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::BufUpdateVertex);
+                cache.update_vertex_buffers();
+            }
             cache.update_transform_feedback_buffers();
             for stage in 0..NUM_STAGES as usize {
-                cache.update_uniform_buffers(stage);
-                cache.update_storage_buffers(stage);
+                {
+                    let _scope =
+                        crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::BufUpdateUniform);
+                    cache.update_uniform_buffers(stage);
+                }
+                {
+                    let _scope =
+                        crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::BufUpdateStorage);
+                    cache.update_storage_buffers(stage);
+                }
                 cache.update_texture_buffers(stage);
             }
             // Upstream: if (current_draw_indirect) { UpdateDrawIndirect(); }

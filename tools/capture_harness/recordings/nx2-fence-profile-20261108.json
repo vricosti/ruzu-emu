@@ -1,0 +1,742 @@
+{
+  "runtime": {
+    "start_utc": "2026-11-08T18:16:10.3639436Z",
+    "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-191607",
+    "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+    "status": "running",
+    "pid": 17640,
+    "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-fence-profile-input-20261108-191607",
+    "purpose": "Fence release/setup versus host wait profiling"
+  },
+  "windows": 5,
+  "wall_ms_per_second": {
+    "fence host wait": 224.54,
+    "macro": 147.20000000000002,
+    "method": 138.92000000000002,
+    "dma dispatch": 114.6,
+    "fill image views": 106.04,
+    "flush work": 36.4,
+    "bind stage buffers": 29.8,
+    "read handles": 27.14,
+    "compute": 26.12,
+    "update buffers": 23.4,
+    "dma fetch": 22.98,
+    "configure": 17.84,
+    "dynamic state": 15.16,
+    "draw": 13.18,
+    "pipeline lookup": 10.82,
+    "push": 9.8,
+    "render targets": 9.5,
+    "push descriptors": 8.44,
+    "idle": 5.14,
+    "configure draw": 4.0,
+    "clear": 2.14,
+    "draw record": 1.64,
+    "texture buffers": 1.28,
+    "release fences": 1.26,
+    "sync descriptors": 1.26,
+    "descriptor acquire": 1.22,
+    "other": 0.04,
+    "dma flush": 0.02,
+    "tick": 0.0,
+    "dma list end": 0.0
+  },
+  "calls_per_second": {
+    "method": 2126934.2,
+    "render targets": 26046.6,
+    "update buffers": 27711.0,
+    "macro": 467237.2,
+    "pipeline lookup": 26936.2,
+    "draw record": 26046.6,
+    "dma flush": 74.0,
+    "tick": 10.4,
+    "flush work": 26046.6,
+    "idle": 84.4,
+    "clear": 355.8,
+    "push descriptors": 60414.8,
+    "draw": 26046.6,
+    "fence host wait": 579.8,
+    "release fences": 653.4,
+    "fill image views": 27711.0,
+    "sync descriptors": 27711.0,
+    "dma dispatch": 67068.8,
+    "configure draw": 26046.6,
+    "configure": 26046.6,
+    "other": 0.0,
+    "dma fetch": 67036.8,
+    "compute": 2078.2,
+    "read handles": 27711.0,
+    "dynamic state": 26046.6,
+    "push": 74.0,
+    "bind stage buffers": 60414.8,
+    "texture buffers": 27711.0,
+    "descriptor acquire": 27711.0,
+    "dma list end": 74.0
+  },
+  "mean_duration_us_per_call": {
+    "method": 0.06531466746832132,
+    "render targets": 0.36473090537728536,
+    "update buffers": 0.8444300097434232,
+    "macro": 0.31504340835875233,
+    "pipeline lookup": 0.4016899191422695,
+    "draw record": 0.062964072086184,
+    "dma flush": 0.2702702702702703,
+    "tick": 0.0,
+    "flush work": 1.39749525849823,
+    "idle": 60.90047393364929,
+    "clear": 6.014614952220349,
+    "push descriptors": 0.13970086799923198,
+    "draw": 0.5060161403023812,
+    "fence host wait": 387.2714729216972,
+    "release fences": 1.928374655647383,
+    "fill image views": 3.8266392407347265,
+    "sync descriptors": 0.04546930821695356,
+    "dma dispatch": 1.7086931628417386,
+    "configure draw": 0.15357090752727803,
+    "configure": 0.6849262475716601,
+    "dma fetch": 0.342796792209652,
+    "compute": 12.568568953902417,
+    "read handles": 0.9793944642921584,
+    "dynamic state": 0.5820337395283838,
+    "push": 132.43243243243242,
+    "bind stage buffers": 0.4932566192389944,
+    "texture buffers": 0.04619104326801631,
+    "descriptor acquire": 0.04402583811482805,
+    "dma list end": 0.0
+  },
+  "instrumented_mean_fps": 10.562121172629256,
+  "buttons_changed": false,
+  "limitations": [
+    "Exclusive wall timing includes waits and profiling overhead, not pure CPU time",
+    "Intervals matched to process-start-relative log timestamps with one-second margins",
+    "Host fence wait includes mutex acquisition and callback scheduling, not hardware-only GPU execution",
+    "Stationary kart with moving opponents; not a deterministic frame sequence"
+  ],
+  "raw_samples": [
+    {
+      "time": 571.121596,
+      "zones": {
+        "other": {
+          "ms": 0.0,
+          "calls": 0.0
+        },
+        "idle": {
+          "ms": 3.8,
+          "calls": 74.0
+        },
+        "push": {
+          "ms": 10.1,
+          "calls": 65.0
+        },
+        "tick": {
+          "ms": 0.0,
+          "calls": 9.0
+        },
+        "macro": {
+          "ms": 157.8,
+          "calls": 505414.0
+        },
+        "draw": {
+          "ms": 13.3,
+          "calls": 26591.0
+        },
+        "clear": {
+          "ms": 1.9,
+          "calls": 312.0
+        },
+        "compute": {
+          "ms": 25.8,
+          "calls": 1885.0
+        },
+        "flush work": {
+          "ms": 38.4,
+          "calls": 26591.0
+        },
+        "pipeline lookup": {
+          "ms": 11.2,
+          "calls": 27372.0
+        },
+        "configure": {
+          "ms": 18.2,
+          "calls": 26591.0
+        },
+        "sync descriptors": {
+          "ms": 1.3,
+          "calls": 28052.0
+        },
+        "read handles": {
+          "ms": 26.7,
+          "calls": 28052.0
+        },
+        "fill image views": {
+          "ms": 99.6,
+          "calls": 28052.0
+        },
+        "texture buffers": {
+          "ms": 1.3,
+          "calls": 28052.0
+        },
+        "update buffers": {
+          "ms": 24.4,
+          "calls": 28052.0
+        },
+        "descriptor acquire": {
+          "ms": 1.2,
+          "calls": 28052.0
+        },
+        "bind stage buffers": {
+          "ms": 30.7,
+          "calls": 60488.0
+        },
+        "push descriptors": {
+          "ms": 8.5,
+          "calls": 60488.0
+        },
+        "render targets": {
+          "ms": 9.0,
+          "calls": 26591.0
+        },
+        "configure draw": {
+          "ms": 3.9,
+          "calls": 26591.0
+        },
+        "dynamic state": {
+          "ms": 16.0,
+          "calls": 26591.0
+        },
+        "draw record": {
+          "ms": 1.7,
+          "calls": 26591.0
+        },
+        "method": {
+          "ms": 143.9,
+          "calls": 2266437.0
+        },
+        "dma fetch": {
+          "ms": 23.6,
+          "calls": 70444.0
+        },
+        "dma dispatch": {
+          "ms": 114.6,
+          "calls": 70472.0
+        },
+        "dma flush": {
+          "ms": 0.0,
+          "calls": 65.0
+        },
+        "dma list end": {
+          "ms": 0.0,
+          "calls": 65.0
+        },
+        "release fences": {
+          "ms": 1.1,
+          "calls": 572.0
+        },
+        "fence host wait": {
+          "ms": 211.8,
+          "calls": 507.0
+        }
+      }
+    },
+    {
+      "time": 581.167407,
+      "zones": {
+        "other": {
+          "ms": 0.0,
+          "calls": 0.0
+        },
+        "idle": {
+          "ms": 3.1,
+          "calls": 74.0
+        },
+        "push": {
+          "ms": 9.4,
+          "calls": 65.0
+        },
+        "tick": {
+          "ms": 0.0,
+          "calls": 9.0
+        },
+        "macro": {
+          "ms": 144.0,
+          "calls": 460291.0
+        },
+        "draw": {
+          "ms": 12.8,
+          "calls": 24605.0
+        },
+        "clear": {
+          "ms": 1.9,
+          "calls": 311.0
+        },
+        "compute": {
+          "ms": 26.3,
+          "calls": 1866.0
+        },
+        "flush work": {
+          "ms": 35.4,
+          "calls": 24605.0
+        },
+        "pipeline lookup": {
+          "ms": 10.5,
+          "calls": 25383.0
+        },
+        "configure": {
+          "ms": 16.9,
+          "calls": 24605.0
+        },
+        "sync descriptors": {
+          "ms": 1.2,
+          "calls": 26061.0
+        },
+        "read handles": {
+          "ms": 25.5,
+          "calls": 26061.0
+        },
+        "fill image views": {
+          "ms": 147.4,
+          "calls": 26061.0
+        },
+        "texture buffers": {
+          "ms": 1.2,
+          "calls": 26061.0
+        },
+        "update buffers": {
+          "ms": 22.5,
+          "calls": 26061.0
+        },
+        "descriptor acquire": {
+          "ms": 1.2,
+          "calls": 26061.0
+        },
+        "bind stage buffers": {
+          "ms": 28.5,
+          "calls": 56490.0
+        },
+        "push descriptors": {
+          "ms": 8.0,
+          "calls": 56490.0
+        },
+        "render targets": {
+          "ms": 8.6,
+          "calls": 24605.0
+        },
+        "configure draw": {
+          "ms": 3.7,
+          "calls": 24605.0
+        },
+        "dynamic state": {
+          "ms": 14.7,
+          "calls": 24605.0
+        },
+        "draw record": {
+          "ms": 1.5,
+          "calls": 24605.0
+        },
+        "method": {
+          "ms": 134.4,
+          "calls": 2070643.0
+        },
+        "dma fetch": {
+          "ms": 22.0,
+          "calls": 64360.0
+        },
+        "dma dispatch": {
+          "ms": 117.5,
+          "calls": 64388.0
+        },
+        "dma flush": {
+          "ms": 0.0,
+          "calls": 65.0
+        },
+        "dma list end": {
+          "ms": 0.0,
+          "calls": 65.0
+        },
+        "release fences": {
+          "ms": 1.1,
+          "calls": 569.0
+        },
+        "fence host wait": {
+          "ms": 200.5,
+          "calls": 505.0
+        }
+      }
+    },
+    {
+      "time": 591.328787,
+      "zones": {
+        "other": {
+          "ms": 0.0,
+          "calls": 0.0
+        },
+        "idle": {
+          "ms": 3.6,
+          "calls": 81.0
+        },
+        "push": {
+          "ms": 8.9,
+          "calls": 71.0
+        },
+        "tick": {
+          "ms": 0.0,
+          "calls": 10.0
+        },
+        "macro": {
+          "ms": 130.0,
+          "calls": 407656.0
+        },
+        "draw": {
+          "ms": 12.6,
+          "calls": 23378.0
+        },
+        "clear": {
+          "ms": 2.1,
+          "calls": 341.0
+        },
+        "compute": {
+          "ms": 27.7,
+          "calls": 1976.0
+        },
+        "flush work": {
+          "ms": 32.7,
+          "calls": 23378.0
+        },
+        "pipeline lookup": {
+          "ms": 9.9,
+          "calls": 24231.0
+        },
+        "configure": {
+          "ms": 16.2,
+          "calls": 23378.0
+        },
+        "sync descriptors": {
+          "ms": 1.1,
+          "calls": 24974.0
+        },
+        "read handles": {
+          "ms": 24.9,
+          "calls": 24974.0
+        },
+        "fill image views": {
+          "ms": 173.3,
+          "calls": 24974.0
+        },
+        "texture buffers": {
+          "ms": 1.2,
+          "calls": 24974.0
+        },
+        "update buffers": {
+          "ms": 21.2,
+          "calls": 24974.0
+        },
+        "descriptor acquire": {
+          "ms": 1.1,
+          "calls": 24974.0
+        },
+        "bind stage buffers": {
+          "ms": 27.1,
+          "calls": 54735.0
+        },
+        "push descriptors": {
+          "ms": 7.7,
+          "calls": 54735.0
+        },
+        "render targets": {
+          "ms": 9.0,
+          "calls": 23378.0
+        },
+        "configure draw": {
+          "ms": 3.7,
+          "calls": 23378.0
+        },
+        "dynamic state": {
+          "ms": 13.6,
+          "calls": 23378.0
+        },
+        "draw record": {
+          "ms": 1.5,
+          "calls": 23378.0
+        },
+        "method": {
+          "ms": 126.4,
+          "calls": 1872725.0
+        },
+        "dma fetch": {
+          "ms": 21.5,
+          "calls": 59536.0
+        },
+        "dma dispatch": {
+          "ms": 110.5,
+          "calls": 59566.0
+        },
+        "dma flush": {
+          "ms": 0.0,
+          "calls": 71.0
+        },
+        "dma list end": {
+          "ms": 0.0,
+          "calls": 71.0
+        },
+        "release fences": {
+          "ms": 1.2,
+          "calls": 632.0
+        },
+        "fence host wait": {
+          "ms": 211.1,
+          "calls": 562.0
+        }
+      }
+    },
+    {
+      "time": 601.348423,
+      "zones": {
+        "other": {
+          "ms": 0.1,
+          "calls": 0.0
+        },
+        "idle": {
+          "ms": 6.5,
+          "calls": 93.0
+        },
+        "push": {
+          "ms": 10.0,
+          "calls": 82.0
+        },
+        "tick": {
+          "ms": 0.0,
+          "calls": 12.0
+        },
+        "macro": {
+          "ms": 147.3,
+          "calls": 466066.0
+        },
+        "draw": {
+          "ms": 13.3,
+          "calls": 26935.0
+        },
+        "clear": {
+          "ms": 2.3,
+          "calls": 394.0
+        },
+        "compute": {
+          "ms": 25.9,
+          "calls": 2261.0
+        },
+        "flush work": {
+          "ms": 36.6,
+          "calls": 26935.0
+        },
+        "pipeline lookup": {
+          "ms": 10.9,
+          "calls": 27919.0
+        },
+        "configure": {
+          "ms": 18.4,
+          "calls": 26935.0
+        },
+        "sync descriptors": {
+          "ms": 1.3,
+          "calls": 28776.0
+        },
+        "read handles": {
+          "ms": 28.4,
+          "calls": 28776.0
+        },
+        "fill image views": {
+          "ms": 81.3,
+          "calls": 28776.0
+        },
+        "texture buffers": {
+          "ms": 1.3,
+          "calls": 28776.0
+        },
+        "update buffers": {
+          "ms": 23.7,
+          "calls": 28776.0
+        },
+        "descriptor acquire": {
+          "ms": 1.3,
+          "calls": 28776.0
+        },
+        "bind stage buffers": {
+          "ms": 30.5,
+          "calls": 63074.0
+        },
+        "push descriptors": {
+          "ms": 8.7,
+          "calls": 63074.0
+        },
+        "render targets": {
+          "ms": 10.1,
+          "calls": 26935.0
+        },
+        "configure draw": {
+          "ms": 4.2,
+          "calls": 26935.0
+        },
+        "dynamic state": {
+          "ms": 15.3,
+          "calls": 26935.0
+        },
+        "draw record": {
+          "ms": 1.7,
+          "calls": 26935.0
+        },
+        "method": {
+          "ms": 140.9,
+          "calls": 2142246.0
+        },
+        "dma fetch": {
+          "ms": 23.4,
+          "calls": 68252.0
+        },
+        "dma dispatch": {
+          "ms": 112.4,
+          "calls": 68288.0
+        },
+        "dma flush": {
+          "ms": 0.0,
+          "calls": 82.0
+        },
+        "dma list end": {
+          "ms": 0.0,
+          "calls": 82.0
+        },
+        "release fences": {
+          "ms": 1.4,
+          "calls": 723.0
+        },
+        "fence host wait": {
+          "ms": 242.9,
+          "calls": 642.0
+        }
+      }
+    },
+    {
+      "time": 611.36768,
+      "zones": {
+        "other": {
+          "ms": 0.1,
+          "calls": 0.0
+        },
+        "idle": {
+          "ms": 8.7,
+          "calls": 100.0
+        },
+        "push": {
+          "ms": 10.6,
+          "calls": 87.0
+        },
+        "tick": {
+          "ms": 0.0,
+          "calls": 12.0
+        },
+        "macro": {
+          "ms": 156.9,
+          "calls": 496759.0
+        },
+        "draw": {
+          "ms": 13.9,
+          "calls": 28724.0
+        },
+        "clear": {
+          "ms": 2.5,
+          "calls": 421.0
+        },
+        "compute": {
+          "ms": 24.9,
+          "calls": 2403.0
+        },
+        "flush work": {
+          "ms": 38.9,
+          "calls": 28724.0
+        },
+        "pipeline lookup": {
+          "ms": 11.6,
+          "calls": 29776.0
+        },
+        "configure": {
+          "ms": 19.5,
+          "calls": 28724.0
+        },
+        "sync descriptors": {
+          "ms": 1.4,
+          "calls": 30692.0
+        },
+        "read handles": {
+          "ms": 30.2,
+          "calls": 30692.0
+        },
+        "fill image views": {
+          "ms": 28.6,
+          "calls": 30692.0
+        },
+        "texture buffers": {
+          "ms": 1.4,
+          "calls": 30692.0
+        },
+        "update buffers": {
+          "ms": 25.2,
+          "calls": 30692.0
+        },
+        "descriptor acquire": {
+          "ms": 1.3,
+          "calls": 30692.0
+        },
+        "bind stage buffers": {
+          "ms": 32.2,
+          "calls": 67287.0
+        },
+        "push descriptors": {
+          "ms": 9.3,
+          "calls": 67287.0
+        },
+        "render targets": {
+          "ms": 10.8,
+          "calls": 28724.0
+        },
+        "configure draw": {
+          "ms": 4.5,
+          "calls": 28724.0
+        },
+        "dynamic state": {
+          "ms": 16.2,
+          "calls": 28724.0
+        },
+        "draw record": {
+          "ms": 1.8,
+          "calls": 28724.0
+        },
+        "method": {
+          "ms": 149.0,
+          "calls": 2282620.0
+        },
+        "dma fetch": {
+          "ms": 24.4,
+          "calls": 72592.0
+        },
+        "dma dispatch": {
+          "ms": 118.0,
+          "calls": 72630.0
+        },
+        "dma flush": {
+          "ms": 0.1,
+          "calls": 87.0
+        },
+        "dma list end": {
+          "ms": 0.0,
+          "calls": 87.0
+        },
+        "release fences": {
+          "ms": 1.5,
+          "calls": 771.0
+        },
+        "fence host wait": {
+          "ms": 256.4,
+          "calls": 683.0
+        }
+      }
+    }
+  ]
+}

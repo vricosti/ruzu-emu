@@ -1,0 +1,93 @@
+{
+  "runtime_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-175426",
+  "fastmem": "enabled on all six cores",
+  "scene": "Same stationary starting line verified before and after; no button transitions in 65-second recording",
+  "profile_windows": 5,
+  "alignment": "Report intervals within FPS UTC interval relative to process start, with one-second margin at each end",
+  "wall_ms_per_second": {
+    "dma dispatch": 370.8,
+    "macro": 146.28,
+    "method": 140.82,
+    "fill image views": 63.14,
+    "flush work": 37.44,
+    "bind stage buffers": 30.88,
+    "read handles": 28.72,
+    "compute": 26.16,
+    "update buffers": 24.26,
+    "dma fetch": 23.34,
+    "configure": 18.46,
+    "dynamic state": 16.48,
+    "draw": 14.04,
+    "pipeline lookup": 11.72,
+    "push": 10.54,
+    "render targets": 10.06,
+    "push descriptors": 8.86,
+    "idle": 5.56,
+    "configure draw": 4.26,
+    "clear": 2.34,
+    "draw record": 1.6,
+    "texture buffers": 1.3599999999999999,
+    "descriptor acquire": 1.3,
+    "sync descriptors": 1.28,
+    "dma flush": 0.08,
+    "other": 0.08,
+    "tick": 0.0,
+    "dma list end": 0.0
+  },
+  "calls_per_second": {
+    "macro": 458603.4,
+    "method": 2106581.4,
+    "draw": 26441.2,
+    "fill image views": 28257.2
+  },
+  "instrumented_fps_mean": 11.506879690202732,
+  "limitations": [
+    "Profiling overhead changes FPS; this is not an uninstrumented A/B result",
+    "Exclusive wall time includes waits and measurement overhead",
+    "DMA dispatch includes nested puller fence waits and unscoped engine work; it is not pure command decoding CPU time",
+    "Buttons recorded, but analog axes are not covered; visual endpoints match"
+  ],
+  "next_priorities": [
+    "Measure puller release_fences/wait_pending_fences separately from command decoding; compare ordering with upstream before changes",
+    "Separate profiling clock overhead from macro/method work using uninstrumented validation",
+    "Investigate draw preparation and shader invalidation, distinguishing streaming from stationary costs",
+    "Retain fastmem allocation failure as a separate reliability/performance issue",
+    "Validate each candidate with uninstrumented stationary and controlled movement baselines with matching settings"
+  ],
+  "stack_snapshot_evidence": {
+    "method": "15 noninvasive suspended CDB snapshots, outside timed FPS measurement",
+    "limitations": [
+      "Small opportunistic sample, not statistical percentages",
+      "Profiler enabled; clock overhead visible",
+      "DMA wait zone covers only its explicit wait branch; nested fence waits are charged to dispatch"
+    ],
+    "counts": {
+      "puller fence wait": 3,
+      "draw preparation": 5,
+      "profiling clock": 3,
+      "command memory fetch": 2,
+      "compute method": 1,
+      "native macro": 1
+    }
+  },
+  "correlated_fence_snapshots": [
+    {
+      "snapshot": 1,
+      "gpu_waits_fence": true,
+      "fence_worker_waits_vulkan": true,
+      "vulkan_worker_waits_work": true
+    },
+    {
+      "snapshot": 12,
+      "gpu_waits_fence": true,
+      "fence_worker_waits_vulkan": true,
+      "vulkan_worker_waits_work": true
+    },
+    {
+      "snapshot": 14,
+      "gpu_waits_fence": true,
+      "fence_worker_waits_vulkan": true,
+      "vulkan_worker_waits_work": true
+    }
+  ]
+}

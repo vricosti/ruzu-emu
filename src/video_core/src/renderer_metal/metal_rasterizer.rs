@@ -1997,7 +1997,7 @@ impl RasterizerInterface for MetalRasterizer {
     fn signal_fence(&mut self, func: Box<dyn FnOnce() + Send>) {
         self.notify_query_wfi();
         self.fence_manager.sync_operation(self.query_cache.commit_async_flushes());
-        let (should_wait_queries, pop_queries) = self.query_cache.async_flush_callbacks();
+        let (should_wait_queries, mut pop_queries) = self.query_cache.async_flush_callbacks();
         let this = self as *mut Self;
         self.fence_manager.signal_fence(
             func,
@@ -2005,11 +2005,18 @@ impl RasterizerInterface for MetalRasterizer {
             |_fence| {},
             should_wait_queries,
             |fence| fence.is_signaled(),
-            pop_queries,
-            move || unsafe { (*this).scheduler.has_active_work() },
-            || {},
+            move |_| pop_queries(),
+            move || crate::fence_manager::CacheFlushes {
+                should_flush: unsafe { (*this).scheduler.has_active_work() },
+                // Metal queues query completion operations above, not the
+                // common texture/buffer async download queues.
+                committed: 0,
+            },
+            || false,
             move || unsafe { (*this).flush_commands_for_fence() },
             move || unsafe { (*this).invalidate_gpu_cache_callback() },
+            // Preserve Metal's existing fence path; no empty-fence capability.
+            || true,
         );
     }
 
@@ -2020,7 +2027,7 @@ impl RasterizerInterface for MetalRasterizer {
     fn signal_sync_point(&mut self, value: u32) {
         self.notify_query_wfi();
         self.fence_manager.sync_operation(self.query_cache.commit_async_flushes());
-        let (should_wait_queries, pop_queries) = self.query_cache.async_flush_callbacks();
+        let (should_wait_queries, mut pop_queries) = self.query_cache.async_flush_callbacks();
         let this = self as *mut Self;
         let syncpoints = Arc::clone(&self.syncpoints);
         self.fence_manager.signal_sync_point(
@@ -2034,34 +2041,48 @@ impl RasterizerInterface for MetalRasterizer {
             |_fence| {},
             should_wait_queries,
             |fence| fence.is_signaled(),
-            pop_queries,
-            move || unsafe { (*this).scheduler.has_active_work() },
-            || {},
+            move |_| pop_queries(),
+            move || crate::fence_manager::CacheFlushes {
+                should_flush: unsafe { (*this).scheduler.has_active_work() },
+                // Metal queues query completion operations above, not the
+                // common texture/buffer async download queues.
+                committed: 0,
+            },
+            || false,
             move || unsafe { (*this).flush_commands_for_fence() },
             move || unsafe { (*this).invalidate_gpu_cache_callback() },
+            // Preserve Metal's existing fence path; no empty-fence capability.
+            || true,
         );
     }
 
     fn signal_reference(&mut self) {
         self.notify_query_wfi();
         self.fence_manager.sync_operation(self.query_cache.commit_async_flushes());
-        let (should_wait_queries, pop_queries) = self.query_cache.async_flush_callbacks();
+        let (should_wait_queries, mut pop_queries) = self.query_cache.async_flush_callbacks();
         let this = self as *mut Self;
         self.fence_manager.signal_reference(
             move |is_stubbed| unsafe { (*this).create_fence(is_stubbed) },
             |_fence| {},
             should_wait_queries,
             |fence| fence.is_signaled(),
-            pop_queries,
-            move || unsafe { (*this).scheduler.has_active_work() },
-            || {},
+            move |_| pop_queries(),
+            move || crate::fence_manager::CacheFlushes {
+                should_flush: unsafe { (*this).scheduler.has_active_work() },
+                // Metal queues query completion operations above, not the
+                // common texture/buffer async download queues.
+                committed: 0,
+            },
+            || false,
             move || unsafe { (*this).flush_commands_for_fence() },
             move || unsafe { (*this).invalidate_gpu_cache_callback() },
+            // Preserve Metal's existing fence path; no empty-fence capability.
+            || true,
         );
     }
 
     fn release_fences(&mut self, force: bool) {
-        let (should_wait_queries, pop_queries) = self.query_cache.async_flush_callbacks();
+        let (should_wait_queries, mut pop_queries) = self.query_cache.async_flush_callbacks();
         let this = self as *mut Self;
         self.fence_manager.wait_pending_fences(
             force,
@@ -2070,11 +2091,18 @@ impl RasterizerInterface for MetalRasterizer {
             should_wait_queries,
             |fence| fence.is_signaled(),
             |fence| fence.wait_for_fence(),
-            pop_queries,
-            move || unsafe { (*this).scheduler.has_active_work() },
-            || {},
+            move |_| pop_queries(),
+            move || crate::fence_manager::CacheFlushes {
+                should_flush: unsafe { (*this).scheduler.has_active_work() },
+                // Metal queues query completion operations above, not the
+                // common texture/buffer async download queues.
+                committed: 0,
+            },
+            || false,
             move || unsafe { (*this).flush_commands_for_fence() },
             move || unsafe { (*this).invalidate_gpu_cache_callback() },
+            // Preserve Metal's existing fence path; no empty-fence capability.
+            || true,
         );
     }
 
@@ -2270,12 +2298,12 @@ impl RasterizerInterface for MetalRasterizer {
         self.notify_query_wfi();
         self.scheduler
             .request_outside_render_pass_operation_context();
-        let (should_wait_queries, pop_queries) = self.query_cache.async_flush_callbacks();
+        let (should_wait_queries, mut pop_queries) = self.query_cache.async_flush_callbacks();
         let this = self as *mut Self;
         self.fence_manager.signal_ordering(
             should_wait_queries,
             |fence| fence.is_signaled(),
-            pop_queries,
+            move |_| pop_queries(),
             move || unsafe { (*this).common_buffer_cache.flush_cached_writes() },
         );
     }

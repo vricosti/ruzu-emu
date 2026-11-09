@@ -14,7 +14,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::const_buffer_info::ConstBufferInfo;
-use super::engine_interface::{EngineInterface, EngineInterfaceState};
+use super::engine_interface::{EngineHandle, EngineInterface, EngineInterfaceState};
 use super::engine_upload;
 use crate::dirty_flags;
 use crate::engines::draw_manager as dm;
@@ -2338,6 +2338,60 @@ impl DirtyState {
 
 // ── Engine struct ───────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Default)]
+struct ControlWrite {
+    argument: u32,
+    before: u32,
+    path: u32,
+}
+
+/// Maxwell3D::FrontState, separately allocated from the worker-owned engine.
+pub(crate) struct FrontState {
+    control_writes: [ControlWrite; 16],
+    control_count: u32,
+    regs: Box<[u32; NUM_REGS]>,
+    shadow: Box<[u32; NUM_REGS]>,
+    // Keep the raw enum bits, including unknown modes, for verification.
+    control: u32,
+    executing_macro: u32,
+    parameters: Vec<u32>,
+    fifo: Vec<u32>,
+    calls: u64,
+    draw_pending: bool,
+    skip_same: bool,
+    execution_mask: Vec<bool>,
+    macro_owner: SharedNativeMacroContext,
+    back: Maxwell3DPtr,
+    memory_manager: Option<Arc<Mutex<MemoryManager>>>,
+    native_data_ram: Arc<Mutex<crate::macro_turing::DataRam>>,
+}
+
+fn front_verify_enabled() -> bool {
+    static VERIFY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("EDEN_NX2_SPLIT_VERIFY").is_some()
+    });
+    *VERIFY
+}
+
+fn front_skip_same() -> bool {
+    static SKIP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("EDEN_NX2_SPLIT_SKIP")
+            .is_none_or(|value| !value.to_string_lossy().starts_with('0'))
+    });
+    *SKIP
+}
+
+fn front_handled_outside_draw_manager(method: u32) -> bool {
+    (CB_DATA_BASE..CB_DATA_END).contains(&method) || matches!(method,
+        WAIT_FOR_IDLE | SHADOW_RAM_CONTROL | LOAD_MME_INSTRUCTION_PTR |
+        LOAD_MME_INSTRUCTION | LOAD_MME_START_ADDR | FALCON4 |
+        CB_BIND_TRIGGER_0 | CB_BIND_TRIGGER_1 | CB_BIND_TRIGGER_2 |
+        CB_BIND_TRIGGER_3 | CB_BIND_TRIGGER_4 | REPORT_SEMAPHORE_QUERY |
+        RENDER_ENABLE_MODE | CLEAR_REPORT_VALUE | SYNC_INFO | LAUNCH_DMA |
+        INLINE_DATA | FRAGMENT_BARRIER | INVALIDATE_TEXTURE_DATA_CACHE |
+        TILED_CACHE_BARRIER)
+}
+
 pub struct Maxwell3D {
     pub(crate) regs: Box<[u32; NUM_REGS]>,
     /// Shadow copy of registers for shadow RAM tracking.
@@ -2398,6 +2452,10 @@ pub struct Maxwell3D {
     macro_segments: Vec<(u64, u32)>,
     /// Whether the current macro has dirty memory.
     current_macro_dirty: bool,
+    front: Option<Arc<Mutex<FrontState>>>,
+    front_macros: bool,
+    back_control_writes: [ControlWrite; 16],
+    back_control_count: u32,
     /// Rust adaptation for the upstream `Core::System& system` dependency used
     /// here only to read guest memory through the active GPU owner.
     guest_memory_reader: Option<Arc<dyn Fn(u64, &mut [u8]) + Send + Sync>>,
@@ -2426,6 +2484,377 @@ pub enum HleReplacementAttributeType {
 }
 
 impl Maxwell3D {
+    /// Port of Front. The caller must retain the returned allocation and use
+    /// it directly for dispatch, without borrowing the concurrent back engine.
+    ///
+    /// # Safety
+    /// The pointer must identify a stable, live channel engine owned by this
+    /// split. No references to the engine may survive across the drain, and
+    /// the caller must be the only command producer.
+    pub(crate) unsafe fn front(engine: *mut Self, split: &crate::gpu_split::GpuSplitFrontend)
+        -> Arc<Mutex<FrontState>>
+    {
+        split.drain();
+        let engine = unsafe { &mut *engine };
+        if engine.front.is_none() {
+            engine.consume_sink();
+            // C++ can share pointers to an embedded macro engine. Rust must
+            // detach that mutable state before borrowing the backend engine
+            // concurrently. Both accessors then select this same owning context.
+            if engine.native_macro_context.is_none() {
+                let context = crate::r#macro::NativeMacroContext {
+                    engine: std::mem::replace(&mut engine.macro_engine, MacroEngine::new(true)),
+                    positions: engine.macro_positions,
+                    compute_engine: MacroEngine::new(true),
+                    compute_positions: [0; 0x80],
+                };
+                engine.native_macro_context = Some(Arc::new(parking_lot::ReentrantMutex::new(
+                    std::cell::RefCell::new(context),
+                )));
+            }
+            let fs = FrontState {
+                control_writes: [ControlWrite::default(); 16],
+                control_count: 0,
+                regs: engine.regs.clone(),
+                shadow: engine.shadow_state.clone(),
+                control: engine.shadow_state[SHADOW_RAM_CONTROL as usize],
+                executing_macro: engine.executing_macro,
+                parameters: std::mem::take(&mut engine.macro_params),
+                fifo: Vec::new(),
+                calls: 0,
+                draw_pending: true,
+                skip_same: Self::skip_same_value_writes() && front_skip_same(),
+                execution_mask: engine.interface_state.execution_mask.clone(),
+                macro_owner: engine.native_macro_context.as_ref().unwrap().clone(),
+                back: Maxwell3DPtr(engine),
+                memory_manager: engine.memory_manager.clone(),
+                native_data_ram: engine.native_data_ram.clone(),
+            };
+            engine.executing_macro = 0;
+            engine.front = Some(Arc::new(Mutex::new(fs)));
+            engine.front_macros = true;
+        }
+        engine.front.as_ref().unwrap().clone()
+    }
+
+    fn front_write(fs: &mut FrontState, engine: EngineHandle,
+        split: &crate::gpu_split::GpuSplitFrontend, method: u32, argument: u32,
+        is_last_call: bool, from_macro: bool)
+    {
+        let index = method as usize;
+        let mut value = argument;
+        let mut shadow_kept = true;
+        match ShadowRamControl::from_raw(fs.control) {
+            ShadowRamControl::Track | ShadowRamControl::TrackWithFilter => {
+                shadow_kept = fs.shadow[index] == argument;
+                fs.shadow[index] = argument;
+            }
+            ShadowRamControl::Replay => value = fs.shadow[index],
+            ShadowRamControl::Passthrough => {}
+        }
+        if crate::nx2_profile::enabled() {
+            crate::nx2_profile::add(crate::nx2_profile::Counter::MethodWrites, 1);
+        }
+        if method == SHADOW_RAM_CONTROL && front_verify_enabled() {
+            fs.control_writes[fs.control_count as usize % 16] = ControlWrite {
+                argument, before: fs.control, path: if from_macro { 2 } else { 1 },
+            };
+            fs.control_count = fs.control_count.wrapping_add(1);
+        }
+        if !fs.execution_mask[index] {
+            if fs.regs[index] == value && shadow_kept && fs.skip_same {
+                if crate::nx2_profile::enabled() {
+                    crate::nx2_profile::add(crate::nx2_profile::Counter::SameValueWrites, 1);
+                }
+                return;
+            }
+            fs.regs[index] = value;
+        } else {
+            fs.regs[index] = value;
+            match method {
+                SHADOW_RAM_CONTROL => {
+                    fs.control = argument;
+                    fs.shadow[index] = argument;
+                }
+                LOAD_MME_INSTRUCTION_PTR | LOAD_MME_INSTRUCTION => {
+                    let guard = fs.macro_owner.lock();
+                    let mut context = guard.borrow_mut();
+                    let pointer = fs.regs[LOAD_MME_INSTRUCTION_PTR as usize];
+                    if method == LOAD_MME_INSTRUCTION_PTR { context.engine.clear_code(pointer); }
+                    else { context.engine.add_code(pointer, value); }
+                }
+                LOAD_MME_START_ADDR => {
+                    let guard = fs.macro_owner.lock();
+                    let mut context = guard.borrow_mut();
+                    let pointer = &mut fs.regs[LOAD_MME_START_ADDR_PTR as usize];
+                    if (*pointer as usize) < context.positions.len() {
+                        context.positions[*pointer as usize] = value;
+                    }
+                    *pointer = pointer.wrapping_add(1);
+                }
+                FALCON4 => fs.regs[SHADOW_SCRATCH_BASE as usize] = 1,
+                m if (CB_DATA_BASE..CB_DATA_END).contains(&m) => {
+                    let offset = CB_CONFIG_BASE as usize + 3;
+                    fs.regs[offset] = fs.regs[offset].wrapping_add(4);
+                }
+                _ if !front_handled_outside_draw_manager(method) => fs.draw_pending = true,
+                _ => {}
+            }
+        }
+        // Context guards from uploads/bindings have been released before enqueue.
+        if from_macro { split.macro_write(engine, method, argument); }
+        else { split.method(engine, method, argument, is_last_call, None); }
+    }
+
+    pub(crate) fn front_call_method(fs: &mut FrontState, engine: EngineHandle,
+        split: &crate::gpu_split::GpuSplitFrontend, method: u32, argument: u32,
+        is_last_call: bool)
+    {
+        if method >= MACRO_REGISTERS_START {
+            if fs.executing_macro == 0 { fs.executing_macro = method; }
+            fs.parameters.push(argument);
+            if is_last_call { Self::front_run_macro(fs, engine, split); }
+            return;
+        }
+        Self::front_write(fs, engine, split, method, argument, is_last_call, false);
+    }
+
+    pub(crate) fn front_call_multi_method(fs: &mut FrontState, engine: EngineHandle,
+        split: &crate::gpu_split::GpuSplitFrontend, method: u32, words: &[u32],
+        amount: u32, methods_pending: u32)
+    {
+        let words = &words[..amount as usize];
+        if method >= MACRO_REGISTERS_START {
+            if fs.executing_macro == 0 { fs.executing_macro = method; }
+            fs.parameters.extend_from_slice(words);
+            if amount == methods_pending { Self::front_run_macro(fs, engine, split); }
+            return;
+        }
+        let index = method as usize;
+        let tracked = |control| matches!(control, 0 | 1);
+        if (CB_DATA_BASE..CB_DATA_END).contains(&method) {
+            let offset = CB_CONFIG_BASE as usize + 3;
+            fs.regs[offset] = fs.regs[offset].wrapping_add(amount.wrapping_mul(4));
+        } else if method == INLINE_DATA {
+            // Upstream's upload-only path does not update the register bank.
+        } else if matches!(method, DRAW_INLINE_INDEX | INLINE_INDEX_2X16_EVEN |
+            INLINE_INDEX_4X8_INDEX0) && fs.control != ShadowRamControl::Replay as u32
+        {
+            if let Some(&last) = words.last() {
+                if tracked(fs.control) { fs.shadow[index] = last; }
+                fs.regs[index] = last;
+            }
+            fs.draw_pending = true;
+        } else {
+            for &argument in words {
+                let mut value = argument;
+                if method == SHADOW_RAM_CONTROL && front_verify_enabled() {
+                    fs.control_writes[fs.control_count as usize % 16] = ControlWrite {
+                        argument, before: fs.control, path: 3,
+                    };
+                    fs.control_count = fs.control_count.wrapping_add(1);
+                }
+                if tracked(fs.control) { fs.shadow[index] = argument; }
+                else if fs.control == ShadowRamControl::Replay as u32 { value = fs.shadow[index]; }
+                fs.regs[index] = value;
+                if !fs.execution_mask[index] { continue; }
+                match method {
+                    SHADOW_RAM_CONTROL => {
+                        fs.control = argument;
+                        fs.shadow[index] = argument;
+                    }
+                    LOAD_MME_INSTRUCTION_PTR | LOAD_MME_INSTRUCTION => {
+                        let guard = fs.macro_owner.lock();
+                        let mut context = guard.borrow_mut();
+                        if method == LOAD_MME_INSTRUCTION_PTR { context.engine.clear_code(value); }
+                        else { context.engine.add_code(fs.regs[LOAD_MME_INSTRUCTION_PTR as usize], value); }
+                    }
+                    LOAD_MME_START_ADDR => {
+                        let guard = fs.macro_owner.lock();
+                        let mut context = guard.borrow_mut();
+                        let pointer = &mut fs.regs[LOAD_MME_START_ADDR_PTR as usize];
+                        if (*pointer as usize) < context.positions.len() {
+                            context.positions[*pointer as usize] = value;
+                        }
+                        *pointer = pointer.wrapping_add(1);
+                    }
+                    FALCON4 => fs.regs[SHADOW_SCRATCH_BASE as usize] = 1,
+                    _ if !front_handled_outside_draw_manager(method) => fs.draw_pending = true,
+                    _ => {}
+                }
+            }
+        }
+        split.multi_method(engine, method, words, amount, methods_pending, None);
+    }
+
+    fn front_run_macro(fs: &mut FrontState, engine: EngineHandle,
+        split: &crate::gpu_split::GpuSplitFrontend)
+    {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let method = fs.executing_macro;
+            fs.executing_macro = 0;
+            let owner = fs.macro_owner.clone();
+            let ram_owner = fs.native_data_ram.clone();
+            {
+                let _profile = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::Macro);
+                let (start, jit) = {
+                    let guard = owner.lock();
+                    let mut context = guard.borrow_mut();
+                    let start = context.positions[((method - MACRO_REGISTERS_START) >> 1) as usize
+                        % context.positions.len()];
+                    let macro_engine = &mut context.engine;
+                    macro_engine.native_interpreter.active_dram = Some(ram_owner.clone());
+                    let jit = macro_engine.native_jit.get_or_insert_with(|| {
+                        Arc::new(std::sync::Mutex::new(Default::default()))
+                    }).clone();
+                    jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .prepare(&macro_engine.native_code, macro_engine.native_code_generation)
+                        .expect("native graphics frontend macro JIT preparation failed");
+                    (start, jit)
+                }; // No context/engine borrow may span enqueue or DMA Drain.
+                fs.fifo.clone_from(&fs.parameters);
+                let mut fifo = std::mem::take(&mut fs.fifo);
+                let mut ram = ram_owner.lock();
+                let front = fs as *mut FrontState;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut jit = jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    jit.execute(start, &mut fifo, &mut ram,
+                        |address| unsafe {
+                            (*front).regs.get(address as usize).copied().unwrap_or(0)
+                        },
+                        |address, value, fifo, ram| {
+                            if address >= MACRO_REGISTERS_START { return false; }
+                            unsafe { Self::front_write(&mut *front, engine, split, address, value, true, true); }
+                            if address == 0x157 || address == 0x158 {
+                                unsafe { Self::front_dma_read(&*front, split, address, value, fifo, ram); }
+                            }
+                            true
+                        },
+                    )
+                }));
+                drop(ram);
+                fs.fifo = fifo;
+                match result {
+                    Ok(result) if !result.success => {
+                        owner.lock().borrow_mut().engine.native_execution_failed = true;
+                        log::error!("Native MME (JIT, split front) failed: start={start:#x}, consumed={}/{}, error={}", result.consumed, fs.parameters.len(), result.error);
+                    }
+                    Err(payload) => std::panic::resume_unwind(payload),
+                    _ => {}
+                }
+            }
+            fs.parameters.clear();
+            if fs.draw_pending {
+                fs.draw_pending = false;
+                let back = fs.back;
+                split.defer(move || {
+                    // Capture the Send pointer wrapper as a whole. Execution is
+                    // serialized on the backend after preceding method packets.
+                    let back = back;
+                    unsafe { (&mut *back.0).finish_front_macro(); }
+                });
+            }
+            if front_verify_enabled() {
+                fs.calls = fs.calls.wrapping_add(1);
+                if fs.calls & 4095 == 0 { Self::front_verify(fs, split); }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            fs.executing_macro = 0;
+            fs.parameters.clear();
+        }
+    }
+
+    /// FIFO and RAM are leased to Execute; use its callback arguments instead
+    /// of borrowing the stored FIFO or relocking the same channel RAM.
+    fn front_dma_read(fs: &FrontState, split: &crate::gpu_split::GpuSplitFrontend,
+        method: u32, count: u32, fifo: &mut Vec<u32>, ram: &mut crate::macro_turing::DataRam)
+    {
+        split.drain();
+        let source = ((fs.regs[0x154] as u64 & 0x1ffffff) << 32) | fs.regs[0x155] as u64;
+        let ram_offset = fs.regs[0x156];
+        let words = count.min(0x1000);
+        let read_bytes = words as u64 * 4;
+        if crate::nx2_profile::enabled() {
+            crate::nx2_profile::add(crate::nx2_profile::Counter::DmaReadBytes, read_bytes);
+        }
+        let mut memory = fs.memory_manager.as_ref()
+            .expect("Maxwell3D requires its upstream MemoryManager owner").lock();
+        if memory.is_memory_dirty_with_cache_type(source, read_bytes, crate::cache_types::CacheType::BUFFER_CACHE) {
+            memory.flush_region_with_cache_type(source, read_bytes, crate::cache_types::CacheType::BUFFER_CACHE);
+        }
+        for i in 0..words {
+            let word = memory.read::<u32>(source.wrapping_add(i as u64 * 4));
+            if method == 0x158 { fifo.push(word); }
+            else {
+                let index = ram_offset.wrapping_add(i) as usize;
+                if index < ram.len() { ram[index] = word; }
+            }
+        }
+    }
+
+    fn front_verify(fs: &mut FrontState, split: &crate::gpu_split::GpuSplitFrontend) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CHECKS: AtomicU64 = AtomicU64::new(0);
+        static DIFFERENCES: AtomicU64 = AtomicU64::new(0);
+        static CONTROL_DIFFERENCES: AtomicU64 = AtomicU64::new(0);
+        split.drain();
+        // No back engine reference exists until its queue has fully drained.
+        let back = unsafe { &*fs.back.0 };
+        let checks = CHECKS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let control = back.shadow_state[SHADOW_RAM_CONTROL as usize];
+        let mut expected = back.regs.clone();
+        for &(method, value) in &back.interface_state.method_sink {
+            expected[method as usize] = if control == ShadowRamControl::Replay as u32 {
+                back.shadow_state[method as usize]
+            } else { value };
+        }
+        let control_index = SHADOW_RAM_CONTROL as usize;
+        if (fs.control != control || fs.shadow[control_index] != back.shadow_state[control_index]
+            || fs.regs[control_index] != expected[control_index])
+            && CONTROL_DIFFERENCES.load(Ordering::Relaxed) < 4
+        {
+            log::warn!("Split shadow RAM control writes, front ({} total) / back ({} total):", fs.control_count, back.back_control_count);
+            for i in 0..16u32 {
+                let f = fs.control_writes[fs.control_count.wrapping_add(i) as usize % 16];
+                let b = back.back_control_writes[back.back_control_count.wrapping_add(i) as usize % 16];
+                log::warn!("  front {:#x} (mode {}, path {}) | back {:#x} (mode {}, last {})", f.argument, f.before, f.path, b.argument, b.before, b.path);
+            }
+        }
+        for i in 0..NUM_REGS {
+            if fs.regs[i] != expected[i] {
+                if DIFFERENCES.fetch_add(1, Ordering::Relaxed) < 64 {
+                    log::warn!("Split front register {i:#x}: front {:#x}, back {:#x}", fs.regs[i], expected[i]);
+                }
+                fs.regs[i] = expected[i];
+            }
+        }
+        if fs.control != control {
+            if CONTROL_DIFFERENCES.fetch_add(1, Ordering::Relaxed) < 16 {
+                log::warn!("Split front shadow RAM control {} vs back {}", fs.control, control);
+            }
+            fs.control = control;
+        }
+        for i in 0..NUM_REGS {
+            if fs.shadow[i] != back.shadow_state[i] {
+                if CONTROL_DIFFERENCES.fetch_add(1, Ordering::Relaxed) < 16 {
+                    log::warn!("Split front shadow register {i:#x}: front {:#x}, back {:#x}", fs.shadow[i], back.shadow_state[i]);
+                }
+                fs.shadow[i] = back.shadow_state[i];
+            }
+        }
+        if checks & 63 == 1 {
+            log::info!("Split front register checks: {checks} done, {} differences", DIFFERENCES.load(Ordering::Relaxed));
+        }
+    }
+
+    fn finish_front_macro(&mut self) {
+        self.consume_sink();
+        self.with_draw_manager(|draw_manager, this| draw_manager.draw_deferred(this));
+    }
+
     /// Port of SetNativeMacroContext. Attaching a context does not enable mode.
     pub fn set_native_macro_context(&mut self, context: Option<SharedNativeMacroContext>) {
         self.native_macro_context = context;
@@ -2643,6 +3072,10 @@ impl Maxwell3D {
             macro_addresses: Vec::new(),
             macro_segments: Vec::new(),
             current_macro_dirty: false,
+            front: None,
+            front_macros: false,
+            back_control_writes: [ControlWrite::default(); 16],
+            back_control_count: 0,
             guest_memory_reader: None,
             guest_memory_writer: None,
             gpu_ticks_getter: None,
@@ -4428,14 +4861,21 @@ impl Maxwell3D {
                 self.shadow_state[SHADOW_RAM_CONTROL as usize] = nonshadow_argument;
             }
             LOAD_MME_INSTRUCTION_PTR => {
+                if self.front_macros { return; }
                 let ptr = self.regs[LOAD_MME_INSTRUCTION_PTR as usize];
                 self.get_native_macro_engine(|engine| engine.clear_code(ptr));
             }
             LOAD_MME_INSTRUCTION => {
+                if self.front_macros { return; }
                 let ptr = self.regs[LOAD_MME_INSTRUCTION_PTR as usize];
                 self.get_native_macro_engine(|engine| engine.add_code(ptr, argument));
             }
             LOAD_MME_START_ADDR => {
+                if self.front_macros {
+                    let pointer = &mut self.regs[LOAD_MME_START_ADDR_PTR as usize];
+                    *pointer = pointer.wrapping_add(1);
+                    return;
+                }
                 self.process_macro_bind(argument);
             }
             FALCON4 => {
@@ -5036,6 +5476,14 @@ impl EngineInterface for Maxwell3D {
                 add(Counter::SameValueWrites, 1);
             }
         }
+        if method == SHADOW_RAM_CONTROL && self.front_macros {
+            self.back_control_writes[self.back_control_count as usize % 16] = ControlWrite {
+                argument: method_argument,
+                before: self.shadow_state[SHADOW_RAM_CONTROL as usize],
+                path: u32::from(is_last_call),
+            };
+            self.back_control_count = self.back_control_count.wrapping_add(1);
+        }
         let argument = self.process_shadow_ram(method, method_argument);
         // State-only writes still update shadow RAM before this check.
         // Executable methods always retain dirty tracking and side effects.
@@ -5098,29 +5546,14 @@ impl EngineInterface for Maxwell3D {
         self.consume_sink_inner();
     }
 
-    fn has_pending_methods(&self) -> bool {
-        !self.interface_state.method_sink.is_empty()
+    fn interface_state(&self) -> &super::engine_interface::EngineInterfaceState {
+        &self.interface_state
     }
 
-    fn execution_mask(&self) -> &[bool] {
-        &self.interface_state.execution_mask
+    fn interface_state_mut(&mut self) -> &mut super::engine_interface::EngineInterfaceState {
+        &mut self.interface_state
     }
 
-    fn push_method_sink(&mut self, method: u32, value: u32) {
-        self.interface_state.method_sink.push((method, value));
-    }
-
-    fn set_current_dma_segment(&mut self, segment: u64) {
-        self.interface_state.current_dma_segment = segment;
-    }
-
-    fn current_dirty(&self) -> bool {
-        self.interface_state.current_dirty
-    }
-
-    fn set_current_dirty(&mut self, dirty: bool) {
-        self.interface_state.current_dirty = dirty;
-    }
 }
 
 #[cfg(test)]

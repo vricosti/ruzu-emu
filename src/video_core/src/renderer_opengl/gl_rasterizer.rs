@@ -2411,44 +2411,60 @@ impl RasterizerOpenGL {
         }
     }
 
-    fn should_flush_async(&mut self) -> bool {
-        let buffer_cache: *mut OpenGLBufferCache = &mut *self.buffer_cache;
-        let texture_cache: *mut OpenGLTextureCache = &mut *self.texture_cache;
-        let buffer_mutex: *const _ = unsafe { &(*buffer_cache).mutex };
-        let texture_mutex: *const _ = unsafe { &(*texture_cache).base.mutex };
-        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_lock, _texture_lock);
+    /// Callback adaptation of upstream FenceManager::CommitCacheFlushes.
+    /// Hold each cache lock alone and commit only queues containing work.
+    fn commit_cache_flushes(&mut self) -> crate::fence_manager::CacheFlushes {
+        let mut flushes = crate::fence_manager::CacheFlushes::default();
         unsafe {
-            (*texture_cache).has_uncommitted_flushes()
-                || (*buffer_cache).has_uncommitted_flushes()
-                || self.query_cache.has_uncommitted_flushes()
+            let cache: *mut OpenGLTextureCache = &mut *self.texture_cache;
+            let mutex: *const _ = &(*cache).base.mutex;
+            let _guard = (*mutex).lock();
+            flushes.should_flush = (*cache).has_uncommitted_flushes();
+            if (*cache).has_async_flush_work() {
+                (*cache).commit_async_flushes();
+
+                flushes.committed |= crate::fence_manager::TEXTURE_FLUSHES;
+            }
         }
+        unsafe {
+            let cache: *mut OpenGLBufferCache = &mut *self.buffer_cache;
+            let mutex: *const _ = &(*cache).mutex;
+            let _guard = (*mutex).lock();
+
+            if (*cache).has_uncommitted_flushes() {
+                (*cache).commit_async_flushes();
+                flushes.should_flush = true;
+                flushes.committed |= crate::fence_manager::BUFFER_FLUSHES;
+            }
+        }
+        flushes
     }
 
-    fn pop_async_flushes(&mut self) {
-        let buffer_cache: *mut OpenGLBufferCache = &mut *self.buffer_cache;
-        let texture_cache: *mut OpenGLTextureCache = &mut *self.texture_cache;
-        let buffer_mutex: *const _ = unsafe { &(*buffer_cache).mutex };
-        let texture_mutex: *const _ = unsafe { &(*texture_cache).base.mutex };
-        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_lock, _texture_lock);
-        unsafe {
-            (*texture_cache).pop_async_flushes();
-            (*buffer_cache).pop_async_flushes();
+    fn pop_async_flushes(&mut self, committed: u8) {
+        if committed & crate::fence_manager::TEXTURE_FLUSHES != 0 {
+            unsafe {
+                let cache: *mut OpenGLTextureCache = &mut *self.texture_cache;
+                let mutex: *const _ = &(*cache).base.mutex;
+                let _guard = (*mutex).lock();
+                (*cache).pop_async_flushes();
+            }
         }
-        let any_command_queued = self.any_command_queued();
-        self.query_cache.pop_async_flushes(any_command_queued);
+        if committed & crate::fence_manager::BUFFER_FLUSHES != 0 {
+            unsafe {
+                let cache: *mut OpenGLBufferCache = &mut *self.buffer_cache;
+                let mutex: *const _ = &(*cache).mutex;
+                let _guard = (*mutex).lock();
+                (*cache).pop_async_flushes();
+            }
+        }
+        let queued = self.any_command_queued();
+        self.query_cache.pop_async_flushes(queued);
     }
 
-    fn commit_async_flushes(&mut self) {
-        let buffer_cache: *mut OpenGLBufferCache = &mut *self.buffer_cache;
-        let texture_cache: *mut OpenGLTextureCache = &mut *self.texture_cache;
-        let buffer_mutex: *const _ = unsafe { &(*buffer_cache).mutex };
-        let texture_mutex: *const _ = unsafe { &(*texture_cache).base.mutex };
-        lock_two_reentrant_mutexes!(buffer_mutex, texture_mutex, _buffer_lock, _texture_lock);
-        unsafe {
-            (*texture_cache).commit_async_flushes();
-            (*buffer_cache).commit_async_flushes();
-        }
+    fn commit_async_flushes(&mut self) -> bool {
+        let should_flush = self.query_cache.has_uncommitted_flushes();
         self.query_cache.commit_async_flushes();
+        should_flush
     }
 }
 
@@ -2876,8 +2892,8 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.fence_manager.signal_fence(
             func,
             move || unsafe { (*this).should_wait_async_flushes() },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
+            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
@@ -2900,8 +2916,8 @@ impl RasterizerInterface for RasterizerOpenGL {
             },
             move |value| syncpoints.increment_host(value),
             move || unsafe { (*this).should_wait_async_flushes() },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
+            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },
@@ -2913,7 +2929,7 @@ impl RasterizerInterface for RasterizerOpenGL {
         let this_for_pop = this as usize;
         self.fence_manager.signal_ordering(
             move || unsafe { (*this).should_wait_async_flushes() },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
+            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
             move || unsafe {
                 let buffer_cache: *mut OpenGLBufferCache = &mut *(*this).buffer_cache;
                 let _buffer_guard = (*buffer_cache).mutex.lock();
@@ -2928,8 +2944,8 @@ impl RasterizerInterface for RasterizerOpenGL {
         self.fence_manager.wait_pending_fences(
             force,
             move || unsafe { (*this).should_wait_async_flushes() },
-            move || unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes() },
-            move || unsafe { (*this).num_queued_commands != 0 || (*this).should_flush_async() },
+            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
             move || unsafe { (*this).invalidate_gpu_cache() },

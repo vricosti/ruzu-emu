@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "kind": "ruzu-gui-buttons",
+  "complete": true,
+  "program_id": 288445811711729664,
+  "interval_ms": 20,
+  "events": [
+    {
+      "at_us": 0,
+      "buttons": []
+    },
+    {
+      "at_us": 2000000,
+      "buttons": [
+        "L",
+        "R",
+        "SL",
+        "SR"
+      ]
+    },
+    {
+      "at_us": 2181521,
+      "buttons": []
+    },
+    {
+      "at_us": 6617705,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 6714312,
+      "buttons": []
+    },
+    {
+      "at_us": 10707562,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 10831415,
+      "buttons": []
+    },
+    {
+      "at_us": 13178765,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 13348058,
+      "buttons": []
+    },
+    {
+      "at_us": 15879694,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 16017893,
+      "buttons": []
+    },
+    {
+      "at_us": 22640727,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 22767830,
+      "buttons": []
+    },
+    {
+      "at_us": 24123565,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 24302929,
+      "buttons": []
+    },
+    {
+      "at_us": 25527630,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 25663766,
+      "buttons": []
+    },
+    {
+      "at_us": 38845502,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 39025911,
+      "buttons": []
+    },
+    {
+      "at_us": 46764326,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 46944343,
+      "buttons": []
+    },
+    {
+      "at_us": 53416319,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 53619352,
+      "buttons": []
+    },
+    {
+      "at_us": 54427265,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 54627653,
+      "buttons": []
+    },
+    {
+      "at_us": 63015092,
+      "buttons": [
+        "A"
+      ]
+    },
+    {
+      "at_us": 63205245,
+      "buttons": []
+    }
+  ],
+  "duration_us": 95727324,
+  "source_recording": "mkw-route-20261108-170040.json",
+  "removed_initial_idle_us": 126874501
+}

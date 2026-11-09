@@ -1662,6 +1662,28 @@ mod tests {
     }
 
     #[test]
+    fn async_flush_work_includes_buffers_without_image_downloads() {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cache = TextureCacheBase::<TypedSlotTestParams>::new_for_backend(
+            std::sync::Arc::new(MaxwellDeviceMemoryManager::default()),
+        );
+        assert!(!cache.has_async_flush_work());
+        cache.uncommitted_async_buffers.push(DropProbe(drops));
+        assert!(!cache.has_uncommitted_flushes());
+        assert!(cache.has_async_flush_work());
+        cache.uncommitted_async_buffers.clear();
+        assert!(!cache.has_async_flush_work());
+        cache.uncommitted_downloads.push(super::PendingDownload {
+            is_swizzle: false,
+            async_buffer_id: 0,
+            object_id: ImageId::default(),
+        });
+        assert!(cache.has_async_flush_work());
+        cache.uncommitted_downloads.clear();
+        assert!(!cache.has_async_flush_work());
+    }
+
+    #[test]
     fn common_backend_staging_buffer_exposes_the_requested_mapped_span() {
         let mut cache = TextureCacheBase::<CommonTextureCacheParams>::new(std::sync::Arc::new(
             MaxwellDeviceMemoryManager::default(),

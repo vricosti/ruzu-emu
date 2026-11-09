@@ -1,0 +1,149 @@
+{
+  "slice": "NX2 resumable semaphore acquisitions",
+  "status": "Coordinated acquire correctness tests/runtime validated; one comparable unprofiled pair suggests6.38% slowdown; second reference sample excluded for kart movement. No performance gain claimed.",
+  "prerequisite": {
+    "file": "src/video_core/src/engines/puller.rs",
+    "method": "read_semaphore_word",
+    "behavior": "Mapped dirty BufferCache word flushed before scalar read, with memory guard released before rasterizer access; used for valid NX2 trigger acquire checks",
+    "focused_tests_exec_session": 20871,
+    "validation": "Focused tests and complete video_core suite passed for coherent-read prerequisite before release-size edit",
+    "focused_tests": {
+      "passed": 12,
+      "failed": 0
+    },
+    "full_tests": {
+      "exec_session": 97292,
+      "log": "%TEMP%/ruzu-semaphore-read-full.log",
+      "status": "passed",
+      "passed": 1732,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 445.95
+    }
+  },
+  "resume_after_prerequisite": [
+    "Finish full video_core suite and release build",
+    "Launch singleton NX2 instance and verify title then recorded route",
+    "Measure acquire checks/waits, pending sleep and fence costs",
+    "Compare unprofiled paired samples with documented scene limitations"
+  ],
+  "not_claimed": [
+    "No verified unprofiled FPS gain yet",
+    "Prior crashes not causally resolved by this observation",
+    "Split GPU thread and optional debug parked-method guessing not implemented"
+  ],
+  "release_prerequisite": {
+    "file": "src/video_core/src/engines/puller.rs",
+    "status": "passed",
+    "behavior": "NX2 RELEASE_SIZE bit 24 uses IsAFence instead of HasTimeout; optional mirror query follows original query. Switch1 unchanged.",
+    "upstream": "origin/eden-nx2:src/video_core/engines/puller.cpp ProcessSemaphoreTriggerMethod and puller.h",
+    "validation_session": 53549,
+    "focused_log": "%TEMP%/ruzu-semaphore-release-focused.log",
+    "full_log": "%TEMP%/ruzu-semaphore-release-full.log",
+    "first_attempt": "Windows LNK1104: existing video_core test executable still running; no code compilation error. Retry waits for its process exit.",
+    "focused_passed": 13,
+    "focused_failed": 0,
+    "release_build_session": 58562,
+    "release_build_log": "%TEMP%/ruzu-semaphore-release-build.log",
+    "full_tests": {
+      "passed": 1733,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 446.3
+    },
+    "release_build": "passed (2m16s); not launched; superseded by coordinated implementation"
+  },
+  "dma_resume_audit": {
+    "word_offset": "ProcessCommands must return consumed words, use (word_offset+index)*4 and preserve offset/subindex between DispatchCalls",
+    "nonincrementing": "NX2 puller methods must dispatch one word at a time; acquisition can suspend after any word",
+    "reread": "Memory-backed GP entry is fetched again after acquire; consume only unprocessed suffix",
+    "optional_parked_methods": "Upstream parked-method guessing is opt-in EDEN_NX2_PARK_SPLIT_METHODS, not required for default resume behavior",
+    "scheduler_lock": "Release ChannelState mutex before GPU.bind_channel, which itself locks ChannelState",
+    "owner_lifetime": "Puller embedded in boxed DmaPusher; waiter identity must be retained and removed at destruction to avoid stale session owner",
+    "polling": "ResumePending before TryPop while pending; yield for first 500 us since command then sleep 1 ms; powered-off guard required",
+    "scope": "Current unsplit GPU path; no GPU split thread implementation claimed",
+    "performance_caveat": "Measured aggregate fence waits include SEM_EXECUTE and other paths. Restoring trigger acquisitions does not prove elimination of that cost.",
+    "qmd_release_hooks": "Verified against origin/eden-nx2 kepler_compute.cpp lines 362-391: Rust combines add (bit26, priority) and max (bit19) branches mechanically; both signal a fence, scalar-read/write then translate and OnWrite. Plain release delegates to query callback. No missing latch hook in these paths."
+  },
+  "resume_validation": {
+    "focused_tests": {
+      "passed": 16,
+      "failed": 0,
+      "log": "%TEMP%/ruzu-acquire-focused.log",
+      "limitation": "before final scalar-helper alignment"
+    },
+    "final_puller_tests": {
+      "passed": 14,
+      "failed": 0,
+      "log": "%TEMP%/ruzu-acquire-puller-final.log"
+    },
+    "full_tests": {
+      "session": 26034,
+      "status": "passed",
+      "log": "%TEMP%/ruzu-acquire-full.log",
+      "passed": 1736,
+      "failed": 0,
+      "ignored": 1,
+      "seconds": 479.59
+    },
+    "release_build": {
+      "session": 13567,
+      "status": "passed",
+      "log": "%TEMP%/ruzu-acquire-release.log",
+      "duration": "2m14s"
+    }
+  },
+  "runtime": {
+    "profiling_enabled": false,
+    "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-input-reference-20261108-201627",
+    "purpose": "Unprofiled paired benchmark: reference",
+    "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-reference-20261108-201627",
+    "exe": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-185536\\candidate-binary\\ruzu.exe",
+    "rust_log": "info",
+    "binary_sha256": "1D1B59B7B0F9A3D63A22758A0786786F3EC0C043CD30E93CAE03B1B0214FBF2E",
+    "pid": 33944,
+    "status": "stopped_after_benchmark",
+    "start_utc": "2026-11-08T19:16:27.5627400Z"
+  },
+  "profile_run": {
+    "start_utc": "2026-11-08T18:49:35.4592888Z",
+    "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-194932",
+    "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+    "status": "Stopped after validated profile sample; singleton launch helper waited for exit before next run",
+    "pid": 13424,
+    "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-acquire-input-20261108-194932",
+    "purpose": "Coordinated NX2 acquire resume runtime validation and instrumented fence comparison",
+    "binary_sha256": "F9D64D1667E625879CAE44021D019D9F947ED2E59F552394190A5893B1A31EC8",
+    "fastmem_cores_verified": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "screenshots": [
+      "acquire-startup.png",
+      "acquire-title-check.png",
+      "acquire-route-end.png"
+    ],
+    "menu_observation": "Transitional menu windows observed 401-556 acquire checks/s and 31-44 waits/s. Not a stationary performance measurement.",
+    "profile_report": "tools/capture_harness/recordings/nx2-acquire-profile-20261108.json"
+  },
+  "next_actions": [
+    "Poll full test session25436; do not restart while alive",
+    "Record final full-suite result in DIFF and plan",
+    "User optionally asked to provide solo route; continue independent audit if no answer",
+    "Repeat first-window A/B or isolate pending-acquisition cost before any FPS claim",
+    "Audit upstream split GPU prerequisites/fence pipeline with existing measurements"
+  ],
+  "unprofiled_report": "tools/capture_harness/recordings/nx2-acquire-unprofiled-20261108.json",
+  "pending_validation": {
+    "file": "src/video_core/src/engines/kepler_compute.rs",
+    "change": "Retain method sink allocation like upstream",
+    "focused": "passed",
+    "full_suite_session": 25436,
+    "full_suite_log": "%TEMP%/ruzu-compute-sink-full.log",
+    "status": "running"
+  }
+}

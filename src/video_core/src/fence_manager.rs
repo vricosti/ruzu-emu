@@ -15,6 +15,16 @@ use common::thread::{set_current_thread_name, set_current_thread_priority, Threa
 
 use crate::delayed_destruction_ring::DelayedDestructionRing;
 
+pub const TEXTURE_FLUSHES: u8 = 1;
+pub const BUFFER_FLUSHES: u8 = 2;
+
+/// Upstream FenceManager::CacheFlushes: submitted cache queues for one fence.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheFlushes {
+    pub should_flush: bool,
+    pub committed: u8,
+}
+
 type Operation = Box<dyn FnOnce() + Send + 'static>;
 
 /// Base trait for fence objects.
@@ -28,6 +38,7 @@ pub trait FenceBase {
 
 struct PendingFence<F: FenceBase + Send + 'static> {
     fence: F,
+    committed_flushes: u8,
     pre_operations: VecDeque<Operation>,
     operations: VecDeque<Operation>,
 }
@@ -53,6 +64,7 @@ pub struct FenceManager<F: FenceBase + Send + 'static> {
     shared: Arc<FenceManagerShared<F>>,
     has_async_check: bool,
     fence_thread: Option<JoinHandle<()>>,
+    skipped_fences: u32,
 }
 
 impl<F: FenceBase + Send + 'static> FenceManager<F> {
@@ -81,6 +93,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             shared,
             has_async_check,
             fence_thread,
+            skipped_fences: 0,
         }
     }
 
@@ -100,7 +113,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
     ) where
         FSW: FnMut() -> bool,
         FS: FnMut(&F) -> bool,
-        FPF: FnMut() + Send + 'static,
+        FPF: FnMut(u8) + Send + 'static,
         FAF: FnMut(),
     {
         if !self.has_async_check {
@@ -119,27 +132,29 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
     }
 
     /// Port of `FenceManager::SignalReference()`.
-    pub fn signal_reference<FC, FQ, FSW, FIS, FPF, FSHF, FCAF, FFL, FINV>(
+    pub fn signal_reference<FC, FQ, FSW, FIS, FPF, FSHF, FCAF, FFL, FINV, FPW>(
         &mut self,
         create_fence: FC,
         queue_fence: FQ,
         should_wait_async_flushes: FSW,
         is_fence_signaled: FIS,
         pop_async_flushes: FPF,
-        should_flush: FSHF,
+        commit_cache_flushes: FSHF,
         commit_async_flushes: FCAF,
         flush_commands: FFL,
         invalidate_gpu_cache: FINV,
+        has_pending_fence_work: FPW,
     ) where
         FC: FnMut(bool) -> F,
         FQ: FnMut(&mut F),
         FSW: FnMut() -> bool,
         FIS: FnMut(&F) -> bool,
-        FPF: FnMut() + Send + 'static,
-        FSHF: FnMut() -> bool,
-        FCAF: FnMut(),
+        FPF: FnMut(u8) + Send + 'static,
+        FSHF: FnMut() -> CacheFlushes,
+        FCAF: FnMut() -> bool,
         FFL: FnMut(),
         FINV: FnMut(),
+        FPW: FnMut() -> bool,
     {
         self.signal_fence(
             Box::new(|| {}),
@@ -148,11 +163,25 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             should_wait_async_flushes,
             is_fence_signaled,
             pop_async_flushes,
-            should_flush,
+            commit_cache_flushes,
             commit_async_flushes,
             flush_commands,
             invalidate_gpu_cache,
+            has_pending_fence_work,
         )
+    }
+
+    /// Port of upstream `SkipEmptyFence`. Backends without the query capability
+    /// supply a predicate that always reports pending work.
+    fn skip_empty_fence(&mut self, has_pending_fence_work: &mut impl FnMut() -> bool) -> bool {
+        if self.skipped_fences >= 64 || has_pending_fence_work() {
+            return false;
+        }
+        if !self.shared.state.lock().unwrap().uncommitted_operations.is_empty() {
+            return false;
+        }
+        self.skipped_fences += 1;
+        true
     }
 
     /// Port of `FenceManager::SyncOperation()`.
@@ -162,7 +191,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
     }
 
     /// Port of `FenceManager::SignalFence()`.
-    pub fn signal_fence<FC, FQ, FSW, FIS, FPF, FSHF, FCAF, FFL, FINV>(
+    pub fn signal_fence<FC, FQ, FSW, FIS, FPF, FSHF, FCAF, FFL, FINV, FPW>(
         &mut self,
         func: Operation,
         mut create_fence: FC,
@@ -170,20 +199,22 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         mut should_wait_async_flushes: FSW,
         mut is_fence_signaled: FIS,
         mut pop_async_flushes: FPF,
-        mut should_flush: FSHF,
+        mut commit_cache_flushes: FSHF,
         mut commit_async_flushes: FCAF,
         mut flush_commands: FFL,
         mut invalidate_gpu_cache: FINV,
+        mut has_pending_fence_work: FPW,
     ) where
         FC: FnMut(bool) -> F,
         FQ: FnMut(&mut F),
         FSW: FnMut() -> bool,
         FIS: FnMut(&F) -> bool,
-        FPF: FnMut() + Send + 'static,
-        FSHF: FnMut() -> bool,
-        FCAF: FnMut(),
+        FPF: FnMut(u8) + Send + 'static,
+        FSHF: FnMut() -> CacheFlushes,
+        FCAF: FnMut() -> bool,
         FFL: FnMut(),
         FINV: FnMut(),
+        FPW: FnMut() -> bool,
     {
         let delay_fence = {
             let values = settings::values();
@@ -194,8 +225,6 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
                     || settings::is_gpu_fence_behavior_accurate(&values)
             }
         };
-
-        let should_flush_now = should_flush();
 
         if !self.has_async_check {
             self.try_release_pending_fences(false, |pending_fence, force_wait| {
@@ -210,13 +239,24 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             });
         }
 
-        commit_async_flushes();
+        let cache_flushes = commit_cache_flushes();
+        let committed_flushes = cache_flushes.committed;
+        if !delay_fence && committed_flushes == 0 && self.skip_empty_fence(&mut has_pending_fence_work) {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::FenceSkipped);
+            func();
+            invalidate_gpu_cache();
+            return;
+        }
+        self.skipped_fences = 0;
+        // Query flushes are committed once per real fence, after the caches.
+        let query_flush = commit_async_flushes();
+        let should_flush_now = cache_flushes.should_flush || query_flush;
 
         let mut new_fence = create_fence(!should_flush_now);
         let mut maybe_func = Some(func);
         let mut pre_operations = VecDeque::new();
         if self.has_async_check {
-            pre_operations.push_back(Box::new(move || pop_async_flushes()) as Operation);
+            pre_operations.push_back(Box::new(move || pop_async_flushes(committed_flushes)) as Operation);
         }
 
         if self.has_async_check {
@@ -237,6 +277,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             }
             state.fences.push_back(PendingFence {
                 fence: new_fence,
+                committed_flushes,
                 pre_operations,
                 operations,
             });
@@ -268,6 +309,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
                 .fences
                 .push_back(PendingFence {
                     fence: new_fence,
+                    committed_flushes,
                     pre_operations,
                     operations,
                 });
@@ -282,7 +324,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
     }
 
     /// Port of `FenceManager::SignalSyncPoint()`.
-    pub fn signal_sync_point<FG, FH, FC, FQ, FSW, FIS, FPF, FSHF, FCAF, FFL, FINV>(
+    pub fn signal_sync_point<FG, FH, FC, FQ, FSW, FIS, FPF, FSHF, FCAF, FFL, FINV, FPW>(
         &mut self,
         value: u32,
         mut increment_guest: FG,
@@ -292,10 +334,11 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         should_wait_async_flushes: FSW,
         is_fence_signaled: FIS,
         pop_async_flushes: FPF,
-        should_flush: FSHF,
+        commit_cache_flushes: FSHF,
         commit_async_flushes: FCAF,
         flush_commands: FFL,
         invalidate_gpu_cache: FINV,
+        has_pending_fence_work: FPW,
     ) where
         FG: FnMut(u32),
         FH: FnMut(u32) + Send + 'static,
@@ -303,11 +346,12 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         FQ: FnMut(&mut F),
         FSW: FnMut() -> bool,
         FIS: FnMut(&F) -> bool,
-        FPF: FnMut() + Send + 'static,
-        FSHF: FnMut() -> bool,
-        FCAF: FnMut(),
+        FPF: FnMut(u8) + Send + 'static,
+        FSHF: FnMut() -> CacheFlushes,
+        FCAF: FnMut() -> bool,
         FFL: FnMut(),
         FINV: FnMut(),
+        FPW: FnMut() -> bool,
     {
         increment_guest(value);
         self.signal_fence(
@@ -317,15 +361,16 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             should_wait_async_flushes,
             is_fence_signaled,
             pop_async_flushes,
-            should_flush,
+            commit_cache_flushes,
             commit_async_flushes,
             flush_commands,
             invalidate_gpu_cache,
+            has_pending_fence_work,
         );
     }
 
     /// Port of `FenceManager::WaitPendingFences()`.
-    pub fn wait_pending_fences<FC, FQ, FS, FW, FSW, FPF, FSHF, FCAF, FFL, FINV>(
+    pub fn wait_pending_fences<FC, FQ, FS, FW, FSW, FPF, FSHF, FCAF, FFL, FINV, FPW>(
         &mut self,
         force: bool,
         create_fence: FC,
@@ -334,21 +379,23 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         mut is_fence_signaled: FS,
         mut wait_fence: FW,
         mut pop_async_flushes: FPF,
-        should_flush: FSHF,
+        commit_cache_flushes: FSHF,
         commit_async_flushes: FCAF,
         flush_commands: FFL,
         invalidate_gpu_cache: FINV,
+        has_pending_fence_work: FPW,
     ) where
         FC: FnMut(bool) -> F,
         FQ: FnMut(&mut F),
         FS: FnMut(&F) -> bool,
         FW: FnMut(&F),
         FSW: FnMut() -> bool,
-        FPF: FnMut() + Send + 'static,
-        FSHF: FnMut() -> bool,
-        FCAF: FnMut(),
+        FPF: FnMut(u8) + Send + 'static,
+        FSHF: FnMut() -> CacheFlushes,
+        FCAF: FnMut() -> bool,
         FFL: FnMut(),
         FINV: FnMut(),
+        FPW: FnMut() -> bool,
     {
         if !self.has_async_check {
             // Eden instantiates `TryReleasePendingFences<true>()` for every
@@ -384,12 +431,16 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             should_wait_async_flushes,
             is_fence_signaled,
             pop_async_flushes,
-            should_flush,
+            commit_cache_flushes,
             commit_async_flushes,
             flush_commands,
             invalidate_gpu_cache,
+            has_pending_fence_work,
         );
 
+        // Diagnostic scope excludes SignalFence setup above, but includes the
+        // host mutex acquisition and predicate wait for the drain callback.
+        let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::FenceHostWait);
         let (lock, cv) = &*wait_pair;
         let mut finished = lock.lock().unwrap();
         while !*finished {
@@ -474,7 +525,7 @@ where
     FSW: FnMut() -> bool,
     FIS: FnMut(&F) -> bool,
     FW: FnMut(&F),
-    FPF: FnMut(),
+    FPF: FnMut(u8),
 {
     if should_wait_async_flushes() && !is_fence_signaled(&pending_fence.fence) {
         if force_wait {
@@ -485,7 +536,7 @@ where
             return false;
         }
     }
-    pop_async_flushes();
+    pop_async_flushes(pending_fence.committed_flushes);
     true
 }
 
@@ -563,6 +614,7 @@ mod tests {
             let mut state = manager.shared.state.lock().unwrap();
             state.fences.push_back(PendingFence {
                 fence: TestFence { stubbed: false },
+                committed_flushes: TEXTURE_FLUSHES | BUFFER_FLUSHES,
                 pre_operations: VecDeque::new(),
                 operations: VecDeque::from([Box::new({
                     let released = Arc::clone(&released);
@@ -578,7 +630,7 @@ mod tests {
             |_| true,
             {
                 let popped = Arc::clone(&popped);
-                move || popped.store(true, Ordering::Relaxed)
+                move |_| popped.store(true, Ordering::Relaxed)
             },
             {
                 let accumulated = Arc::clone(&accumulated);
@@ -607,6 +659,7 @@ mod tests {
             let mut state = manager.shared.state.lock().unwrap();
             state.fences.push_back(PendingFence {
                 fence: TestFence { stubbed: false },
+                committed_flushes: TEXTURE_FLUSHES | BUFFER_FLUSHES,
                 pre_operations: VecDeque::new(),
                 operations: VecDeque::from([Box::new({
                     let previous_fence_released = Arc::clone(&previous_fence_released);
@@ -626,15 +679,15 @@ mod tests {
             |_| {},
             || false,
             |_| true,
-            || {},
+            |_| {},
             {
                 let previous_fence_released = Arc::clone(&previous_fence_released);
                 move || {
                     assert!(
-                        !previous_fence_released.load(Ordering::Relaxed),
-                        "upstream computes ShouldFlush before releasing pending fences"
+                        previous_fence_released.load(Ordering::Relaxed),
+                        "upstream commits caches after releasing pending fences"
                     );
-                    true
+                    CacheFlushes { should_flush: true, committed: TEXTURE_FLUSHES }
                 }
             },
             {
@@ -643,6 +696,7 @@ mod tests {
                 move || {
                     assert!(previous_fence_released.load(Ordering::Relaxed));
                     committed.store(true, Ordering::Relaxed);
+                    false
                 }
             },
             {
@@ -653,6 +707,7 @@ mod tests {
                 let invalidated = Arc::clone(&invalidated);
                 move || invalidated.store(true, Ordering::Relaxed)
             },
+            || true,
         );
 
         assert!(committed.load(Ordering::Relaxed));
@@ -682,11 +737,12 @@ mod tests {
             },
             || false,
             |_| true,
-            || {},
+            |_| {},
+            CacheFlushes::default,
             || false,
             || {},
             || {},
-            || {},
+            || true,
         );
     }
 
@@ -701,12 +757,13 @@ mod tests {
             .fences
             .push_back(PendingFence {
                 fence: TestFence { stubbed: false },
+                committed_flushes: TEXTURE_FLUSHES | BUFFER_FLUSHES,
                 pre_operations: VecDeque::new(),
                 operations: VecDeque::from([Box::new(|| panic!("operation failed")) as Operation]),
             });
 
         let result = catch_unwind(AssertUnwindSafe(|| {
-            manager.signal_ordering(|| false, |_| true, || {}, || {});
+            manager.signal_ordering(|| false, |_| true, |_| {}, || {});
         }));
 
         assert!(result.is_err());
@@ -739,11 +796,12 @@ mod tests {
             |_| {},
             || false,
             |_| true,
-            || {},
+            |_| {},
+            CacheFlushes::default,
             || false,
             || {},
             || {},
-            || {},
+            || true,
         );
 
         assert_eq!(guest.load(Ordering::Relaxed), 7);
@@ -759,6 +817,7 @@ mod tests {
             let mut state = manager.shared.state.lock().unwrap();
             state.fences.push_back(PendingFence {
                 fence: TestFence { stubbed: true },
+                committed_flushes: TEXTURE_FLUSHES | BUFFER_FLUSHES,
                 pre_operations: VecDeque::new(),
                 operations: VecDeque::new(),
             });
@@ -775,12 +834,13 @@ mod tests {
             |_| {},
             {
                 let popped = Arc::clone(&popped);
-                move || popped.store(true, Ordering::Relaxed)
+                move |_| popped.store(true, Ordering::Relaxed)
             },
+            CacheFlushes::default,
             || false,
             || {},
             || {},
-            || {},
+            || true,
         );
 
         assert!(popped.load(Ordering::Relaxed));
@@ -801,6 +861,7 @@ mod tests {
             .fences
             .push_back(PendingFence {
                 fence: TestFence { stubbed: false },
+                committed_flushes: TEXTURE_FLUSHES | BUFFER_FLUSHES,
                 pre_operations: VecDeque::new(),
                 operations: VecDeque::new(),
             });
@@ -819,12 +880,13 @@ mod tests {
             },
             {
                 let popped = Arc::clone(&popped);
-                move || popped.store(true, Ordering::Relaxed)
+                move |_| popped.store(true, Ordering::Relaxed)
             },
+            CacheFlushes::default,
             || false,
             || {},
             || {},
-            || {},
+            || true,
         );
 
         assert!(waited.load(Ordering::Relaxed));
@@ -853,16 +915,144 @@ mod tests {
             |_| true,
             {
                 let popped = Arc::clone(&popped);
-                move || popped.store(true, Ordering::Relaxed)
+                move |_| popped.store(true, Ordering::Relaxed)
             },
+            CacheFlushes::default,
             || false,
             || {},
             || {},
-            || {},
+            || true,
         );
 
         wait_until(&popped);
         wait_until(&callback_hit);
+    }
+
+    #[test]
+    fn mixed_cache_masks_preserve_per_fence_pop_and_callback_order() {
+        let _accuracy = crate::test_support::GpuAccuracyGuard::set(GpuAccuracy::High);
+        for asynchronous in [false, true] {
+            let mut manager = FenceManager::<TestFence>::new(asynchronous);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let finished = Arc::new(AtomicBool::new(false));
+            let masks = [TEXTURE_FLUSHES, 0, BUFFER_FLUSHES, TEXTURE_FLUSHES | BUFFER_FLUSHES];
+            for (index, mask) in masks.into_iter().enumerate() {
+                let callback_events = Arc::clone(&events);
+                let pop_events = Arc::clone(&events);
+                let finished = Arc::clone(&finished);
+                manager.signal_fence(
+                    Box::new(move || {
+                        callback_events.lock().unwrap().push((1, index as u8));
+                        if index == 3 {
+                            finished.store(true, Ordering::Relaxed);
+                        }
+                    }),
+                    |stubbed| TestFence { stubbed },
+                    |_| {},
+                    || false,
+                    |_| true,
+                    move |committed| pop_events.lock().unwrap().push((0, committed)),
+                    // Async texture buffers can retire without a download wait.
+                    move || CacheFlushes { should_flush: false, committed: mask },
+                    || false,
+                    || panic!("empty downloads must not force a submission"),
+                    || {},
+                    || true,
+        );
+            }
+            if asynchronous {
+                wait_until(&finished);
+            } else {
+                let events = Arc::clone(&events);
+                manager.signal_ordering(
+                    || false,
+                    |_| true,
+                    move |mask| events.lock().unwrap().push((0, mask)),
+                    || {},
+                );
+            }
+            let expected: Vec<_> = masks.into_iter().enumerate()
+                .flat_map(|(index, mask)| [(0, mask), (1, index as u8)])
+                .collect();
+            assert_eq!(*events.lock().unwrap(), expected);
+        }
+    }
+
+    fn queue_empty_fence_candidate(
+        manager: &mut FenceManager<TestFence>,
+        events: &Arc<Mutex<Vec<&'static str>>>,
+        committed: u8,
+        queries_pending: bool,
+    ) {
+        let callback = Arc::clone(events);
+        let create = Arc::clone(events);
+        let queries = Arc::clone(events);
+        let invalidate = Arc::clone(events);
+        manager.signal_fence(
+            Box::new(move || callback.lock().unwrap().push("callback")),
+            move |stubbed| {
+                create.lock().unwrap().push("create");
+                TestFence { stubbed }
+            },
+            |_| {},
+            || false,
+            |_| true,
+            |_| {},
+            move || CacheFlushes { should_flush: false, committed },
+            move || { queries.lock().unwrap().push("query_commit"); false },
+            || panic!("no downloads to submit"),
+            move || invalidate.lock().unwrap().push("invalidate"),
+            move || queries_pending,
+        );
+    }
+
+    #[test]
+    fn empty_fence_skip_limit_and_pending_work_match_upstream() {
+        let _accuracy = crate::test_support::GpuAccuracyGuard::set(GpuAccuracy::Low);
+        let mut manager = FenceManager::<TestFence>::new(false);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        for index in 1..=64 {
+            queue_empty_fence_candidate(&mut manager, &events, 0, false);
+            assert_eq!(manager.skipped_fences, index);
+            assert_eq!(manager.queued_fence_count(), 0);
+        }
+        // No query commit, fence allocation or queue publication on skipped calls.
+        assert_eq!(*events.lock().unwrap(), ["callback", "invalidate"].repeat(64));
+        queue_empty_fence_candidate(&mut manager, &events, 0, false);
+        assert_eq!(manager.skipped_fences, 0);
+        assert_eq!(manager.queued_fence_count(), 1);
+        assert_eq!(&events.lock().unwrap()[128..], &["query_commit", "create", "callback", "invalidate"]);
+        queue_empty_fence_candidate(&mut manager, &events, 0, false);
+        assert_eq!(manager.skipped_fences, 1);
+        assert_eq!(manager.queued_fence_count(), 0);
+
+        for (mask, pending) in [(0, true), (TEXTURE_FLUSHES, false), (BUFFER_FLUSHES, false)] {
+            queue_empty_fence_candidate(&mut manager, &events, mask, pending);
+            assert_eq!(manager.skipped_fences, 0);
+            assert_eq!(manager.queued_fence_count(), 1);
+        }
+        let operation_events = Arc::clone(&events);
+        manager.sync_operation(Box::new(move || operation_events.lock().unwrap().push("operation")));
+        queue_empty_fence_candidate(&mut manager, &events, 0, false);
+        assert_eq!(manager.queued_fence_count(), 1);
+        assert_eq!(manager.skipped_fences, 0);
+        // The queued operation is carried by that real fence and retires once.
+        queue_empty_fence_candidate(&mut manager, &events, 0, false);
+        assert_eq!(events.lock().unwrap().iter().filter(|&&e| e == "operation").count(), 1);
+        assert_eq!(manager.skipped_fences, 1);
+    }
+
+    #[test]
+    fn high_accuracy_keeps_empty_fence_and_delays_callback() {
+        let _accuracy = crate::test_support::GpuAccuracyGuard::set(GpuAccuracy::High);
+        let mut manager = FenceManager::<TestFence>::new(false);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        queue_empty_fence_candidate(&mut manager, &events, 0, false);
+        assert_eq!(manager.skipped_fences, 0);
+        assert_eq!(manager.queued_fence_count(), 1);
+        assert_eq!(*events.lock().unwrap(), ["query_commit", "create", "invalidate"]);
+        manager.signal_ordering(|| false, |_| true, |_| {}, || {});
+        assert_eq!(*events.lock().unwrap(), ["query_commit", "create", "invalidate", "callback"]);
     }
 
     #[test]
@@ -893,11 +1083,12 @@ mod tests {
             || false,
             |_| true,
             |_| {},
-            || {},
+            |_| {},
+            CacheFlushes::default,
             || false,
             || {},
             || {},
-            || {},
+            || true,
         );
 
         assert_eq!(created.load(Ordering::Relaxed), 1);

@@ -1669,6 +1669,27 @@ mod tests {
     }
 
     #[test]
+    fn pending_fence_work_includes_host_sync_without_downloads() {
+        let mut cache = QueryCacheBase::new();
+        assert!(!cache.has_pending_fence_work());
+        let mut first = CountingStreamer::new(0, QueryBase::new());
+        let mut later = CountingStreamer::new(2, QueryBase::new());
+        cache.impl_.register_streamer(0, &mut first);
+        cache.impl_.register_streamer(2, &mut later);
+        assert!(!cache.has_pending_fence_work());
+        later.pending_sync = true;
+        assert!(!cache.has_uncommitted_flushes());
+        assert!(cache.has_pending_fence_work());
+        later.pending_sync = false;
+        first.unsynced_queries = true;
+        assert!(cache.has_pending_fence_work());
+        first.unsynced_queries = false;
+        assert!(!cache.has_pending_fence_work());
+        assert_eq!(first.push_calls + later.push_calls, 0);
+        assert_eq!(first.sync_calls + later.sync_calls, 0);
+    }
+
+    #[test]
     fn segment_writeback_and_unregister_paths_use_bound_owners() {
         use crate::memory_manager::MemoryManager;
         use parking_lot::Mutex as ParkingMutex;

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::engines::engine_interface::EngineTypes;
 use crate::engines::engine_interface::{EngineHandle, EngineInterface};
 use crate::engines::puller::{MethodCall, Puller};
+use crate::engines::{kepler_compute, maxwell_3d};
 use crate::guest_memory::{GpuGuestMemory, GpuMemoryManagerHandle, GuestMemoryFlags};
 use common::scratch_buffer::ScratchBuffer;
 use common::settings;
@@ -225,21 +226,40 @@ struct DmaSyncState {
     cv: Condvar,
 }
 
-/// The DmaPusher implements DMA submission to FIFOs.
-///
-/// The pushbuffers are assembled into a "command stream" of 32-bit words.
-/// In the full GPU integration, this holds references to GPU, MemoryManager,
-/// and Puller. For now, engine dispatch is performed via callback closures
-/// passed through the dispatch chain.
+// Rust lifetime adaptation for upstream engine->Front(): cache the separate
+// frontend allocation, not a reference into the concurrently mutated engine.
+enum FrontEngine {
+    Backend,
+    Maxwell(Arc<Mutex<maxwell_3d::FrontState>>),
+    Kepler(Arc<Mutex<kepler_compute::FrontState>>),
+}
+
+#[derive(Clone, Copy)]
+struct DeferredListEnd(*const crate::gpu::Gpu);
+// The GPU owner outlives the joined backend, as for DmaPusher::gpu.
+unsafe impl Send for DeferredListEnd {}
+impl DeferredListEnd {
+    unsafe fn run(self) {
+        let gpu = unsafe { &*self.0 };
+        gpu.flush_commands();
+        gpu.on_command_list_end();
+    }
+}
+
+/// Implements DMA submission to FIFOs, assembling pushbuffers into a stream
+/// of 32-bit commands. Owns the puller and channel engine bindings, matching
+/// upstream DmaPusher; split sessions retain each engine's frontend allocation.
 pub struct DmaPusher {
     dma_pushbuffer: VecDeque<CommandList>,
     dma_pushbuffer_subindex: usize,
+    command_resume_offset: usize,
     dma_state: DmaState,
     dma_increment_once: bool,
     ib_enable: bool,
     command_headers: ScratchBuffer<CommandHeader>,
     subchannels: [Option<EngineHandle>; MAX_SUBCHANNELS],
     subchannel_type: [EngineTypes; MAX_SUBCHANNELS],
+    front_engines: [Option<FrontEngine>; MAX_SUBCHANNELS],
     gpu: *const crate::gpu::Gpu,
     system: SystemRef,
     memory_manager: Arc<Mutex<crate::memory_manager::MemoryManager>>,
@@ -266,12 +286,14 @@ impl DmaPusher {
         Self {
             dma_pushbuffer: VecDeque::new(),
             dma_pushbuffer_subindex: 0,
+            command_resume_offset: 0,
             dma_state: DmaState::default(),
             dma_increment_once: false,
             ib_enable: true,
             command_headers: ScratchBuffer::new(),
             subchannels: [None; MAX_SUBCHANNELS],
             subchannel_type: [EngineTypes::Maxwell3D; MAX_SUBCHANNELS],
+            front_engines: std::array::from_fn(|_| None),
             gpu,
             system,
             memory_manager,
@@ -311,7 +333,22 @@ impl DmaPusher {
         subchannel_id: u32,
         engine_type: EngineTypes,
     ) {
-        self.subchannels[subchannel_id as usize] = Some(EngineHandle::from_ref(engine));
+        self.bind_subchannel_handle(EngineHandle::from_ref(engine), subchannel_id, engine_type);
+    }
+
+    /// Pointer-only form of upstream BindSubchannel. No engine state is read
+    /// or borrowed: the channel owns the initialized engine for dispatch's lifetime.
+    pub(crate) fn bind_subchannel_handle(
+        &mut self,
+        engine: EngineHandle,
+        subchannel_id: u32,
+        engine_type: EngineTypes,
+    ) {
+        let index = subchannel_id as usize;
+        if self.subchannels[index].is_none_or(|bound| !bound.ptr_eq(engine))
+            || self.subchannel_type[index] != engine_type
+        { self.front_engines[index] = None; }
+        self.subchannels[subchannel_id as usize] = Some(engine);
         self.subchannel_type[subchannel_id as usize] = engine_type;
     }
 
@@ -323,6 +360,11 @@ impl DmaPusher {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn subchannel_handle_for_test(&self, subchannel: usize) -> Option<EngineHandle> {
+        self.subchannels[subchannel]
+    }
+
     /// Push a command list into the DMA pushbuffer queue.
     pub fn push(&mut self, entries: CommandList) {
         self.dma_pushbuffer.push_back(entries);
@@ -330,7 +372,6 @@ impl DmaPusher {
 
     /// Dispatch all pending command lists. Matches upstream `DmaPusher::DispatchCalls`.
     pub fn dispatch_calls(&mut self) {
-        self.dma_pushbuffer_subindex = 0;
         self.dma_state.is_last_call = true;
 
         while self.system.is_null() || self.system.get().is_powered_on() {
@@ -339,9 +380,22 @@ impl DmaPusher {
             }
         }
 
+        if let Some(split) = crate::gpu_split::current() {
+            let end = DeferredListEnd(self.gpu);
+            split.defer(move || unsafe { end.run() });
+            split.publish();
+            return;
+        }
         let gpu = unsafe { &*self.gpu };
-        gpu.flush_commands();
-        gpu.on_command_list_end();
+        // Optional Rust diagnostic zones; upstream flush/end ordering is unchanged.
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::DmaFlush);
+            gpu.flush_commands();
+        }
+        {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::DmaListEnd);
+            gpu.on_command_list_end();
+        }
     }
 
     fn update_current_dirty_for_fetch(&mut self, command_gpu_addr: GPUVAddr, word_count: u32) {
@@ -362,6 +416,14 @@ impl DmaPusher {
         }
         let words = self.dma_state.method_count.min(word_count);
 
+        if let Some(split) = crate::gpu_split::current() {
+            let memory = Arc::clone(&self.memory_manager);
+            split.defer_function(Box::new(move || {
+                let dirty = memory.lock().is_memory_dirty(command_gpu_addr, words as u64 * 4);
+                unsafe { engine.as_mut() }.set_current_dirty(dirty);
+            }));
+            return;
+        }
         let dirty = self.memory_manager.lock().is_memory_dirty(
             command_gpu_addr,
             words as u64 * std::mem::size_of::<u32>() as u64,
@@ -370,12 +432,11 @@ impl DmaPusher {
     }
 
     /// Process the next step of command submission. Matches upstream `DmaPusher::Step`.
-    ///
-    /// Without MemoryManager integration, only prefetched command lists can be
-    /// processed. GPU-memory-resident command lists are deferred until the memory
-    /// manager is wired in.
     fn step(&mut self) -> bool {
         if !self.ib_enable || self.dma_pushbuffer.is_empty() {
+            return false;
+        }
+        if !self.puller.resume_acquire() {
             return false;
         }
 
@@ -401,7 +462,10 @@ impl DmaPusher {
                     command_list.prefetch_command_list.len(),
                 )
             };
-            self.process_commands(&commands);
+            self.command_resume_offset += self.process_commands(
+                &commands[self.command_resume_offset..], self.command_resume_offset);
+            if self.has_pending_acquire() { return false; }
+            self.command_resume_offset = 0;
             self.dma_pushbuffer.pop_front();
         } else {
             let command_list_total = command_list.command_lists.len();
@@ -410,6 +474,7 @@ impl DmaPusher {
 
             let must_wait_for_sync = self.signal_sync && !*self.sync_state.synced.lock();
             if must_wait_for_sync {
+                let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::DmaWait);
                 let mut synced = self.sync_state.synced.lock();
                 while !*synced {
                     self.sync_state.cv.wait(&mut synced);
@@ -419,6 +484,7 @@ impl DmaPusher {
             }
 
             if command_list_header.size() > 0 {
+                let fetch_scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::DmaFetch);
                 self.update_current_dirty_for_fetch(
                     command_list_header.addr(),
                     command_list_header.size(),
@@ -439,9 +505,15 @@ impl DmaPusher {
                     &mut command_headers,
                 );
                 let commands = unsafe { headers.as_slice() };
-                self.process_commands(commands);
+                drop(fetch_scope);
+                // Re-read a resumed entry: the CPU may have written its suffix
+                // before releasing the semaphore that suspended this channel.
+                self.command_resume_offset += self.process_commands(
+                    &commands[self.command_resume_offset..], self.command_resume_offset);
                 drop(headers);
                 self.command_headers = command_headers;
+                if self.has_pending_acquire() { return false; }
+                self.command_resume_offset = 0;
             }
 
             self.dma_pushbuffer_subindex += 1;
@@ -459,6 +531,7 @@ impl DmaPusher {
             }
 
             if self.signal_sync {
+                if let Some(split) = crate::gpu_split::current() { split.drain(); }
                 let sync_state = Arc::clone(&self.sync_state);
                 let rasterizer = self.rasterizer.expect("DMA rasterizer must be bound");
                 unsafe {
@@ -487,25 +560,44 @@ impl DmaPusher {
         !use_safe
     }
 
-    fn process_commands(&mut self, commands: &[CommandHeader]) {
+    pub fn has_pending_acquire(&self) -> bool {
+        self.puller.has_pending_acquire()
+    }
+
+    pub fn can_resume_acquire(&mut self) -> bool {
+        self.puller.can_resume_acquire()
+    }
+
+    pub fn is_powered_on(&self) -> bool {
+        self.system.is_null() || self.system.get().is_powered_on()
+    }
+
+    fn process_commands(&mut self, commands: &[CommandHeader], word_offset: usize) -> usize {
+        let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::DmaDispatch);
         let mut index = 0;
         while index < commands.len() {
             let command_header = commands[index];
 
             if self.dma_state.method_count > 0 {
-                self.dma_state.dma_word_offset = (index as u32).wrapping_mul(4) as u64;
+                self.dma_state.dma_word_offset = (word_offset + index).wrapping_mul(4) as u64;
                 if self.dma_state.non_incrementing {
-                    let max_write =
+                    let mut max_write =
                         std::cmp::min(index + self.dma_state.method_count as usize, commands.len())
                             - index;
-                    self.dispatch_multi_method(&commands[index..index + max_write]);
+                    if crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::SeqCst)
+                        && self.dma_state.method < NON_PULLER_METHODS
+                    {
+                        max_write = 1;
+                    }
+                    self.call_multi_method(&commands[index..index + max_write]);
                     self.dma_state.method_count -= max_write as u32;
                     self.dma_state.is_last_call = true;
                     index += max_write;
+                    if self.has_pending_acquire() { return index; }
                     continue;
                 } else {
                     self.dma_state.is_last_call = self.dma_state.method_count <= 1;
-                    self.dispatch_method(command_header.argument());
+                    self.call_method(command_header.argument());
                 }
 
                 if !self.dma_state.non_incrementing {
@@ -534,7 +626,7 @@ impl DmaPusher {
                         self.dma_state.subchannel = command_header.subchannel();
                         self.dma_state.dma_word_offset =
                             (self.dma_state.dma_get as i64).wrapping_neg() as u64;
-                        self.dispatch_method(command_header.arg_count());
+                        self.call_method(command_header.arg_count());
                         self.dma_state.non_incrementing = true;
                         self.dma_increment_once = false;
                     }
@@ -547,7 +639,9 @@ impl DmaPusher {
                 }
             }
             index += 1;
+            if self.has_pending_acquire() { return index; }
         }
+        commands.len()
     }
 
     fn set_state(&mut self, command_header: &CommandHeader) {
@@ -556,9 +650,57 @@ impl DmaPusher {
         self.dma_state.method_count = command_header.method_count();
     }
 
+    fn wants_segment(&self) -> bool {
+        let engine = self.subchannel_type[self.dma_state.subchannel as usize];
+        engine == EngineTypes::KeplerCompute
+            || (engine == EngineTypes::Maxwell3D && self.dma_state.method >= MACRO_REGISTERS_START)
+    }
+
+    fn report_unbound_subchannel(&self) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static REPORTED: AtomicU32 = AtomicU32::new(0);
+        if REPORTED.fetch_add(1, Ordering::Relaxed) < 8 {
+            log::warn!("Dropping method {:#x} on unbound subchannel {}",
+                self.dma_state.method, self.dma_state.subchannel);
+        }
+    }
+
+    // Mechanical equivalent of upstream's typed engine selection and Front().
+    // Native-mode flags are initialized with the channel, before dispatch. Read
+    // them once per binding, after draining; subsequent calls use only FrontState.
+    fn prepare_front_engine(&mut self, engine: EngineHandle,
+        split: &crate::gpu_split::GpuSplitFrontend)
+    {
+        let index = self.dma_state.subchannel as usize;
+        if !split.front_macros() || self.front_engines[index].is_some() { return; }
+        let kind = self.subchannel_type[index];
+        self.front_engines[index] = Some(match kind {
+            EngineTypes::Maxwell3D => {
+                split.drain();
+                // Binding pairs the concrete channel engine with this type.
+                let ptr = unsafe { engine.as_mut() } as *mut dyn EngineInterface
+                    as *mut maxwell_3d::Maxwell3D;
+                let native = unsafe { &*ptr }.get_native_macro_engine_read(|m| m.native_turing);
+                if native {
+                    FrontEngine::Maxwell(unsafe { maxwell_3d::Maxwell3D::front(ptr, split) })
+                } else { FrontEngine::Backend }
+            }
+            EngineTypes::KeplerCompute => {
+                split.drain();
+                let ptr = unsafe { engine.as_mut() } as *mut dyn EngineInterface
+                    as *mut kepler_compute::KeplerCompute;
+                let native = unsafe { &*ptr }.front_runs_macros();
+                if native {
+                    FrontEngine::Kepler(unsafe { kepler_compute::KeplerCompute::front(ptr, split) })
+                } else { FrontEngine::Backend }
+            }
+            _ => FrontEngine::Backend,
+        });
+    }
+
     /// Dispatch a single method call to an engine. Matches upstream
     /// `DmaPusher::CallMethod`.
-    fn dispatch_method(&mut self, argument: u32) {
+    fn call_method(&mut self, argument: u32) {
         if self.dma_state.method < NON_PULLER_METHODS {
             self.puller.call_method(&MethodCall::new(
                 self.dma_state.method,
@@ -569,30 +711,53 @@ impl DmaPusher {
             return;
         }
 
-        let subchannel =
-            self.subchannels[self.dma_state.subchannel as usize].unwrap_or_else(|| {
-                panic!(
-                    "DMA method requires a bound subchannel: state={:?} argument={argument:#010x}",
-                    self.dma_state
-                )
-            });
-        let subchannel = unsafe { subchannel.as_mut() };
-        if !subchannel.execution_mask()[self.dma_state.method as usize] {
-            subchannel.push_method_sink(self.dma_state.method, argument);
+        let Some(subchannel) = self.subchannels[self.dma_state.subchannel as usize] else {
+            self.report_unbound_subchannel();
+            return;
+        };
+        if let Some(split) = crate::gpu_split::current() {
+            self.prepare_front_engine(subchannel, &split);
+            let state = &self.dma_state;
+            let segment = state.dma_get.wrapping_add(state.dma_word_offset);
+            match if split.front_macros() { self.front_engines[state.subchannel as usize].as_ref() } else { None } {
+                Some(FrontEngine::Maxwell(front)) => {
+                    maxwell_3d::Maxwell3D::front_call_method(&mut front.lock(), subchannel,
+                        &split, state.method, argument, state.is_last_call);
+                }
+                Some(FrontEngine::Kepler(front)) => {
+                    kepler_compute::KeplerCompute::front_call_method(&mut front.lock(), subchannel,
+                        &split, state.method, argument, state.is_last_call, Some(segment));
+                }
+                _ => split.method(subchannel, state.method, argument, state.is_last_call,
+                    self.wants_segment().then_some(segment)),
+            }
             return;
         }
-        subchannel.consume_sink();
-        subchannel.set_current_dma_segment(
-            self.dma_state
-                .dma_get
-                .wrapping_add(self.dma_state.dma_word_offset),
-        );
+        let subchannel = unsafe { subchannel.as_mut() };
+        // Upstream reads the public EngineInterface members directly; one
+        // interface_state access stands in for that, keeping sink deferral,
+        // ConsumeSink-before-segment ordering and dispatch unchanged.
+        let sink_pending = {
+            let state = subchannel.interface_state_mut();
+            if !state.execution_mask[self.dma_state.method as usize] {
+                state.method_sink.push((self.dma_state.method, argument));
+                return;
+            }
+            !state.method_sink.is_empty()
+        };
+        if sink_pending {
+            subchannel.consume_sink_impl();
+        }
+        subchannel.interface_state_mut().current_dma_segment = self
+            .dma_state
+            .dma_get
+            .wrapping_add(self.dma_state.dma_word_offset);
         subchannel.call_method(self.dma_state.method, argument, self.dma_state.is_last_call);
     }
 
     /// Dispatch a multi-method call to an engine. Matches upstream
     /// `DmaPusher::CallMultiMethod`.
-    fn dispatch_multi_method(&mut self, commands: &[CommandHeader]) {
+    fn call_multi_method(&mut self, commands: &[CommandHeader]) {
         let args: &[u32] = bytemuck::cast_slice(commands);
         if self.dma_state.method < NON_PULLER_METHODS {
             self.puller.call_multi_method(
@@ -604,15 +769,36 @@ impl DmaPusher {
             );
             return;
         }
-        let subchannel = self.subchannels[self.dma_state.subchannel as usize]
-            .expect("DMA multi-method requires a bound subchannel");
+        let Some(subchannel) = self.subchannels[self.dma_state.subchannel as usize] else {
+            self.report_unbound_subchannel();
+            return;
+        };
+        if let Some(split) = crate::gpu_split::current() {
+            self.prepare_front_engine(subchannel, &split);
+            let state = &self.dma_state;
+            let segment = state.dma_get.wrapping_add(state.dma_word_offset);
+            match if split.front_macros() { self.front_engines[state.subchannel as usize].as_ref() } else { None } {
+                Some(FrontEngine::Maxwell(front)) => {
+                    maxwell_3d::Maxwell3D::front_call_multi_method(&mut front.lock(), subchannel,
+                        &split, state.method, args, args.len() as u32, state.method_count);
+                }
+                Some(FrontEngine::Kepler(front)) => {
+                    kepler_compute::KeplerCompute::front_call_multi_method(&mut front.lock(), subchannel,
+                        &split, state.method, args, args.len() as u32, state.method_count, Some(segment));
+                }
+                _ => split.multi_method(subchannel, state.method, args, args.len() as u32,
+                    state.method_count, self.wants_segment().then_some(segment)),
+            }
+            return;
+        }
         let subchannel = unsafe { subchannel.as_mut() };
-        subchannel.consume_sink();
-        subchannel.set_current_dma_segment(
-            self.dma_state
-                .dma_get
-                .wrapping_add(self.dma_state.dma_word_offset),
-        );
+        if !subchannel.interface_state().method_sink.is_empty() {
+            subchannel.consume_sink_impl();
+        }
+        subchannel.interface_state_mut().current_dma_segment = self
+            .dma_state
+            .dma_get
+            .wrapping_add(self.dma_state.dma_word_offset);
         subchannel.call_multi_method(
             self.dma_state.method,
             args,
@@ -631,18 +817,266 @@ mod tests {
     use common::settings;
     use common::settings_enums::GpuAccuracy;
 
+    struct RecordingEngine {
+        channel_access: Option<std::sync::Weak<Mutex<ChannelState>>>,
+        state: crate::engines::engine_interface::EngineInterfaceState,
+        calls: Vec<(u32, u32, u64)>,
+    }
+    impl Default for RecordingEngine {
+        fn default() -> Self {
+            let mut state = crate::engines::engine_interface::EngineInterfaceState::new();
+            // Recorded methods execute immediately, as the old all-true test mask did.
+            state.execution_mask.iter_mut().for_each(|flag| *flag = true);
+            Self { channel_access: None, state, calls: Vec::new() }
+        }
+    }
+    impl EngineInterface for RecordingEngine {
+        fn call_method(&mut self, method: u32, argument: u32, _last: bool) {
+            if let Some(channel) = &self.channel_access {
+                let channel = channel.upgrade().expect("channel must outlive dispatch");
+                assert!(channel.try_lock().is_some(), "DMA must not retain the channel lock while executing commands");
+            }
+            self.calls.push((method, argument, self.state.current_dma_segment));
+        }
+        fn call_multi_method(&mut self, method: u32, args: &[u32], amount: u32, _pending: u32) {
+            for &argument in &args[..amount as usize] { self.call_method(method, argument, true); }
+        }
+        fn consume_sink_impl(&mut self) {}
+        fn push_method_sink(&mut self, _: u32, _: u32) { panic!("recorded methods execute immediately"); }
+        fn interface_state(&self) -> &crate::engines::engine_interface::EngineInterfaceState { &self.state }
+        fn interface_state_mut(&mut self) -> &mut crate::engines::engine_interface::EngineInterfaceState { &mut self.state }
+    }
+
+    #[test]
+    fn split_dma_copies_multi_payloads_and_preserves_compute_segments_across_ring_wrap() {
+        let gpu = Box::new(crate::gpu::Gpu::new(false, false));
+        let memory = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+        let mut engine = Box::new(RecordingEngine::default());
+        let mut dma = DmaPusher::new(&*gpu, SystemRef::null(), memory, std::ptr::null_mut());
+        dma.bind_subchannel(&mut *engine, 0, EngineTypes::KeplerCompute);
+        let split = crate::gpu_split::GpuSplitFrontend::new(false);
+        let scope = split.install();
+        split.start_back(|| {});
+        dma.dma_state.method = 0x80;
+        dma.dma_state.method_count = 20000;
+        dma.dma_state.is_last_call = true;
+        let mut words = vec![CommandHeader { raw: 0 }; 20000];
+        for batch in 0..120u32 {
+            dma.dma_state.dma_get = 0x10000 + batch as u64 * 0x100;
+            dma.dma_state.dma_word_offset = 12;
+            for (i, word) in words.iter_mut().enumerate() { word.raw = batch * 20000 + i as u32; }
+            dma.call_multi_method(&words);
+            // Producer's reusable pushbuffer can be overwritten immediately.
+            words.fill(CommandHeader { raw: u32::MAX });
+        }
+        dma.dispatch_calls(); // Also publishes the ordered flush/list-end packet.
+        split.drain();
+        split.stop().unwrap();
+        drop(scope);
+        assert_eq!(engine.calls.len(), 2400000);
+        for (i, &(method, argument, segment)) in engine.calls.iter().enumerate() {
+            assert_eq!((method, argument, segment),
+                (0x80, i as u32, 0x1000c + (i / 20000) as u64 * 0x100));
+        }
+    }
+
+    #[test]
+    fn dma_front_macro_uploads_switch_concrete_engines_without_repeating_on_backend() {
+        let gpu = Box::new(crate::gpu::Gpu::new(false, false));
+        let memory = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+        let context = Arc::new(parking_lot::ReentrantMutex::new(std::cell::RefCell::new(
+            crate::r#macro::NativeMacroContext::default())));
+        context.lock().borrow_mut().compute_engine.native_turing = true;
+        let mut graphics = Box::new(maxwell_3d::Maxwell3D::default());
+        graphics.set_native_macro_context(Some(context.clone()));
+        graphics.set_native_turing_macro_mode(true);
+        let mut compute = Box::new(kepler_compute::KeplerCompute::new(memory.clone()));
+        compute.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
+        let graphics_handle = EngineHandle::from_ref(&*graphics);
+        let compute_handle = EngineHandle::from_ref(&*compute);
+        let mut dma = DmaPusher::new(&*gpu, SystemRef::null(), memory, std::ptr::null_mut());
+        let split = crate::gpu_split::GpuSplitFrontend::new(true);
+        let scope = split.install();
+        split.start_back(|| {});
+        for (handle, kind) in [(graphics_handle, EngineTypes::Maxwell3D),
+                                (compute_handle, EngineTypes::KeplerCompute)] {
+            dma.bind_subchannel_handle(handle, 0, kind);
+            assert!(dma.front_engines[0].is_none());
+            dma.dma_state.method = 0x45;
+            dma.dma_state.is_last_call = true;
+            dma.call_method(2); // Native instruction address: 3 words per instruction.
+            assert!(matches!((kind, &dma.front_engines[0]),
+                (EngineTypes::Maxwell3D, Some(FrontEngine::Maxwell(_))) |
+                (EngineTypes::KeplerCompute, Some(FrontEngine::Kepler(_)))));
+            dma.dma_state.method = 0x46;
+            dma.dma_state.method_count = 3;
+            dma.call_multi_method(&[CommandHeader { raw: 21 },
+                CommandHeader { raw: 22 }, CommandHeader { raw: 23 }]);
+            dma.bind_subchannel_handle(handle, 0, kind);
+            assert!(dma.front_engines[0].is_some(), "same binding retains frontend allocation");
+        }
+        split.drain();
+        split.stop().unwrap();
+        drop(scope);
+        let guard = context.lock();
+        let context = guard.borrow();
+        for macro_engine in [&context.engine, &context.compute_engine] {
+            assert_eq!(&macro_engine.native_code[6..9], &[21, 22, 23]);
+            assert_eq!(macro_engine.native_write_offset, 9);
+            assert_eq!(macro_engine.native_code_generation, 3, "backend must not repeat uploads");
+        }
+    }
+
+    #[test]
+    fn unbound_dma_methods_are_dropped_and_segment_selection_matches_upstream() {
+        let gpu = crate::gpu::Gpu::new(false, false);
+        let memory = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+        let mut dma = DmaPusher::new(&gpu, SystemRef::null(), memory, std::ptr::null_mut());
+        dma.dma_state.method = 0x80;
+        dma.call_method(42);
+        dma.call_multi_method(&[CommandHeader { raw: 43 }]);
+        for kind in [EngineTypes::Fermi2D, EngineTypes::Maxwell3D, EngineTypes::KeplerCompute] {
+            dma.subchannel_type[0] = kind;
+            for method in [0x40, 0xdff, 0xe00, 0xfff] {
+                dma.dma_state.method = method;
+                assert_eq!(dma.wants_segment(), kind == EngineTypes::KeplerCompute
+                    || (kind == EngineTypes::Maxwell3D && method >= 0xe00));
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_dispatch_releases_channel_lock_before_engine_work() {
+        let gpu = crate::gpu::Gpu::new(false, false);
+        let channel = gpu.create_channel(3);
+        let memory = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+        let mut engine = RecordingEngine {
+            channel_access: Some(Arc::downgrade(&channel)),
+            ..Default::default()
+        };
+        let rasterizer = RasterizerNull::new(Arc::new(SyncpointManager::new()));
+        let mut dma = Box::new(DmaPusher::new(&gpu, SystemRef::null(), memory, std::ptr::null_mut()));
+        dma.bind_subchannel(&mut engine, 0, EngineTypes::Fermi2D);
+        dma.bind_rasterizer(&rasterizer);
+        channel.lock().dma_pusher = Some(Arc::new(Mutex::new(dma)));
+        let scheduler = crate::control::scheduler::Scheduler::new();
+        scheduler.declare_channel(channel.clone());
+        scheduler.push(&gpu, 3, CommandList::from_prefetch([
+            CommandHeader { raw: (1 << 29) | (1 << 16) | 0x80 },
+            CommandHeader { raw: 42 },
+        ]));
+        assert_eq!(engine.calls, [(0x80, 42, 4)]); // argument follows the 4-byte header
+        // Retire borrowed engine/rasterizer handles before their local owners.
+        channel.lock().dma_pusher = None;
+    }
+
+    #[test]
+    fn nx2_acquire_resumes_prefetch_and_memory_entries_without_replay_or_skip() {
+        const CHILD: &str = "RUZU_DMA_ACQUIRE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--test-threads=1"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager;
+        use crate::memory_manager::MemoryManager;
+        for nx2 in [false, true] {
+            crate::nx2::G_NX2_AMPERE.store(nx2, std::sync::atomic::Ordering::SeqCst);
+            for prefetch in [false, true] {
+                let gpu = crate::gpu::Gpu::new(false, false);
+                let mut backing = vec![0u8; 0x1000];
+                let device = Arc::new(MaxwellDeviceMemoryManager::default());
+                device.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+                device.smmu_map_with_cpu_backing(0x9000_0000, backing.as_mut_ptr(), 0x5000_0000, backing.len(), 3, true);
+                let mut memory = MemoryManager::new_with_geometry_and_device_memory(13, device, 32, 0x1_0000_0000, 16, 12);
+                memory.map(0x20000, 0x9000_0000, 0x1000, 0, false);
+                let memory = Arc::new(Mutex::new(memory));
+                let mut dma = Box::new(DmaPusher::new(&gpu, SystemRef::null(), memory.clone(), std::ptr::null_mut()));
+                let mut engine = RecordingEngine::default();
+                dma.bind_subchannel(&mut engine, 0, EngineTypes::Fermi2D);
+                let rasterizer = RasterizerNull::new(Arc::new(SyncpointManager::new()));
+                dma.bind_rasterizer(&rasterizer);
+                dma.puller.regs.reg_array[5] = 0x20800;
+                dma.puller.regs.reg_array[6] = 7;
+                // Two non-incrementing acquire words: stop after the first,
+                // keeping the second as data, not a fresh command header.
+                let words: Vec<CommandHeader> = [
+                    (1 << 29) | (1 << 16) | 0x80, 11,
+                    (3 << 29) | (2 << 16) | 7, 1, 1,
+                    (1 << 29) | (1 << 16) | 0x81, 22,
+                ].into_iter().map(|raw| CommandHeader { raw }).collect();
+                if prefetch {
+                    dma.push(CommandList::from_prefetch(words));
+                } else {
+                    memory.lock().write_block_unsafe(0x20000, bytemuck::cast_slice(&words));
+                    dma.push(CommandList {
+                        command_lists: vec![CommandListHeader { raw: 0 },
+                            CommandListHeader { raw: 0x20000 | ((words.len() as u64) << 42) }].into(),
+                        prefetch_command_list: SmallVec::new(),
+                    });
+                }
+                dma.dispatch_calls();
+                let base = if prefetch { 0 } else { 0x20000 };
+                let mut suffix = 22;
+                if nx2 {
+                    assert!(dma.has_pending_acquire());
+                    assert_eq!(dma.command_resume_offset, 4);
+                    assert_eq!(dma.dma_state.method_count, 1);
+                    assert_eq!(engine.calls, vec![(0x80, 11, base + 4)]);
+                    if !prefetch {
+                        assert_eq!(dma.dma_pushbuffer_subindex, 1);
+                        suffix = 33;
+                        memory.lock().write::<u32>(0x20018, suffix);
+                    }
+                    dma.dispatch_calls(); // Still unmet: no progress or replay.
+                    assert_eq!(engine.calls.len(), 1);
+                    memory.lock().write::<u32>(0x20800, 7);
+                    dma.dispatch_calls();
+                }
+                assert!(!dma.has_pending_acquire());
+                assert!(dma.dma_pushbuffer.is_empty());
+                assert_eq!(dma.command_resume_offset, 0);
+                assert_eq!(engine.calls, vec![(0x80, 11, base + 4), (0x81, suffix, base + 24)]);
+                if nx2 && prefetch {
+                    // Shutdown after suspension must not count an already met
+                    // acquire as progress when DispatchCalls cannot execute.
+                    memory.lock().write::<u32>(0x20800, 0);
+                    dma.push(CommandList::from_prefetch([CommandHeader {
+                        raw: (4 << 29) | (1 << 16) | 7,
+                    }]));
+                    dma.dispatch_calls();
+                    assert!(dma.has_pending_acquire());
+                    memory.lock().write::<u32>(0x20800, 7);
+                    let system = ruzu_core::core::System::new();
+                    dma.system = SystemRef::from_ref(&system);
+                    let channel = gpu.create_channel(3);
+                    channel.lock().dma_pusher = Some(Arc::new(Mutex::new(dma)));
+                    let scheduler = crate::control::scheduler::Scheduler::new();
+                    scheduler.declare_channel(channel.clone());
+                    scheduler.push(&gpu, 3, CommandList::default());
+                    assert!(scheduler.has_pending_channels());
+                    assert!(channel.lock().dma_pusher.as_ref().unwrap().lock().has_pending_acquire());
+                }
+            }
+        }
+    }
 
     #[test]
     fn continuation_dirty_sampling_only_touches_matching_payloads() {
+        // Each case overwrites all relevant DMA fields and the dirty flag;
+        // reuse the unchanged unmapped address space instead of rebuilding it
+        // for every matrix element.
+        let memory = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+        let mut channel = Box::new(ChannelState::new(7));
+        let mut engine = crate::engines::kepler_compute::KeplerCompute::new(Arc::clone(&memory));
+        let mut dma = DmaPusher::new(std::ptr::null(), SystemRef::null(), memory, &mut *channel);
         for engine_type in [EngineTypes::KeplerCompute, EngineTypes::Maxwell3D, EngineTypes::Fermi2D] {
             for method in [COMPUTE_INLINE, MACRO_REGISTERS_START - 1, MACRO_REGISTERS_START] {
                 for non_incrementing in [false, true] {
                     for remaining in [0, 1, 20] {
                         for words in [0, 1, 40] {
-                            let memory = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
-                            let mut channel = Box::new(ChannelState::new(7));
-                            let mut engine = crate::engines::kepler_compute::KeplerCompute::new(Arc::clone(&memory));
-                            let mut dma = DmaPusher::new(std::ptr::null(), SystemRef::null(), memory, &mut *channel);
                             dma.bind_subchannel(&mut engine, 0, engine_type);
                             dma.dma_state.method = method;
                             dma.dma_state.method_count = remaining;
@@ -675,11 +1109,11 @@ mod tests {
                 std::ptr::null(), SystemRef::null(), memory, &mut *channel,
             );
             dma.bind_subchannel(&mut engine, 3, EngineTypes::Fermi2D);
-            dma.process_commands(&words[..split]);
+            dma.process_commands(&words[..split], 0);
             if split > 0 {
                 assert_eq!(dma.dma_state.method_count, (words.len() - split) as u32);
             }
-            dma.process_commands(&words[split..]);
+            dma.process_commands(&words[split..], 0);
             assert_eq!(dma.dma_state.method_count, 0);
             assert_eq!(dma.dma_state.method, 0x8d);
             assert_eq!(dma.dma_state.subchannel, 3);
@@ -842,7 +1276,7 @@ mod tests {
             BufferMethods::Nop,
             0,
             SubmissionMode::Inline,
-        )]);
+        )], 0);
 
         assert_eq!(dma.dma_state.dma_word_offset, 0x8000_0000_0000_0000);
     }
@@ -891,6 +1325,6 @@ mod tests {
         dma.dispatch_calls();
 
         assert_eq!(dma.dma_pushbuffer.len(), 1);
-        assert_eq!(dma.dma_pushbuffer_subindex, 0);
+        assert_eq!(dma.dma_pushbuffer_subindex, 7);
     }
 }

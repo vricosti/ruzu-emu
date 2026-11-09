@@ -1,0 +1,149 @@
+{
+  "protocol": "Identical recorded route; verify empty starting grid; wait30s then two65s windows; RUST_LOG=info, profiling absent, six fastmem cores",
+  "candidate": {
+    "runtime": {
+      "start_utc": "2026-11-08T19:02:03.3291110Z",
+      "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-200203",
+      "exe": "D:\\Projects\\Dev\\Perso\\Emulators\\ruzu\\target\\release\\ruzu.exe",
+      "status": "running",
+      "pid": 19908,
+      "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-acquire-normal-input-20261108-200159",
+      "purpose": "Unprofiled coordinated-acquire candidate; paired benchmark pending",
+      "binary_sha256": "F9D64D1667E625879CAE44021D019D9F947ED2E59F552394190A5893B1A31EC8"
+    },
+    "windows": [
+      {
+        "file": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-200203\\normal-fps-1.json",
+        "mean_fps": 15.696298880634329,
+        "median_fps": 15.979495231957413,
+        "samples": 129,
+        "utc_start": 1794165074.8943396,
+        "utc_end": 1794165139.7088938,
+        "buttons_pressed": false,
+        "input_complete": true,
+        "input_events": [
+          {
+            "at_us": 0,
+            "buttons": []
+          }
+        ],
+        "scene_verified": "Same starting-grid position, 5 coins, lap1/3, 24th; opponents moving",
+        "start_screenshot": "normal-candidate-start-1.png",
+        "end_screenshot": "normal-candidate-end-1.png"
+      },
+      {
+        "file": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-200203\\normal-fps-2.json",
+        "mean_fps": 14.059512620671272,
+        "median_fps": 13.98417225549124,
+        "samples": 129,
+        "utc_start": 1794165166.8145278,
+        "utc_end": 1794165231.6445014,
+        "buttons_pressed": false,
+        "input_complete": true,
+        "input_events": [
+          {
+            "at_us": 0,
+            "buttons": []
+          }
+        ],
+        "scene_verified": "Same starting-grid position, 5 coins, lap1/3, 24th; opponents moving",
+        "start_screenshot": "normal-candidate-end-1.png",
+        "end_screenshot": "normal-candidate-end-2.png"
+      }
+    ],
+    "profiling_lines": 0,
+    "fastmem_cores": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5"
+    ],
+    "long_acquire_warnings": 0
+  },
+  "reference": {
+    "status": "Measured; second window excluded after visual scene check",
+    "exe": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-185536\\candidate-binary\\ruzu.exe",
+    "sha256": "1D1B59B7B0F9A3D63A22758A0786786F3EC0C043CD30E93CAE03B1B0214FBF2E",
+    "runtime": {
+      "profiling_enabled": false,
+      "input_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-input-reference-20261108-201627",
+      "purpose": "Unprofiled paired benchmark: reference",
+      "directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-reference-20261108-201627",
+      "exe": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-185536\\candidate-binary\\ruzu.exe",
+      "rust_log": "info",
+      "binary_sha256": "1D1B59B7B0F9A3D63A22758A0786786F3EC0C043CD30E93CAE03B1B0214FBF2E",
+      "pid": 33944,
+      "status": "running",
+      "start_utc": "2026-11-08T19:16:27.5627400Z"
+    },
+    "loader_check": "42 packaged DLL names checked; only System32 vulkan-1.dll differed. Copied target/release/vulkan-1.dll beside saved executable, relaunched singleton and verified it is loaded from that directory.",
+    "startup_test": "Separate Kepler sink regression compiled and passed during loading; completed at least before any benchmark sample. No change to reference/candidate binaries.",
+    "windows": [
+      {
+        "file": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-reference-20261108-201627\\normal-fps-1.json",
+        "mean_fps": 16.76547865534666,
+        "median_fps": 16.9802999444606,
+        "samples": 129,
+        "utc_start": 1794165956.4107792,
+        "utc_end": 1794166021.2093456,
+        "buttons_pressed": false,
+        "input_complete": true,
+        "input_events": [
+          {
+            "at_us": 0,
+            "buttons": []
+          }
+        ],
+        "scene_valid": true,
+        "scene_reason": "Same starting position, 5coins, lap1/3, 24th",
+        "start_screenshot": "normal-reference-start-1.png",
+        "end_screenshot": "normal-reference-end-1.png"
+      },
+      {
+        "file": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-bench-reference-20261108-201627\\normal-fps-2.json",
+        "mean_fps": 15.191813231381968,
+        "median_fps": 14.994689758415669,
+        "samples": 129,
+        "utc_start": 1794166044.093024,
+        "utc_end": 1794166108.853843,
+        "buttons_pressed": false,
+        "input_complete": true,
+        "input_events": [
+          {
+            "at_us": 0,
+            "buttons": []
+          }
+        ],
+        "scene_valid": false,
+        "scene_reason": "Rejected: kart moved far forward around first corner by end screenshot, despite all recorded buttons released; cause unproven",
+        "start_screenshot": "normal-reference-end-1.png",
+        "end_screenshot": "normal-reference-end-2.png"
+      }
+    ],
+    "profiling_lines": 0,
+    "fastmem_cores": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5"
+    ]
+  },
+  "limitations": [
+    "Only one candidate launch so far",
+    "Stationary position does not fix opponents or all simulation work",
+    "FPS polling values are not independent frame-time samples",
+    "Candidate window means differ about10%; no gain claim permitted without matched followup",
+    "Button recording does not cover analog inputs",
+    "Reference second window discarded; do not average all four windows"
+  ],
+  "queued_edit_excluded": "kepler_compute sink capacity source edit not in these binaries",
+  "comparison": {
+    "valid_pair_count": 1,
+    "candidate_minus_reference_percent": -6.377269606742542,
+    "interpretation": "Single comparable pair suggests regression, not a gain; do not infer causality or confidence from correlated FPS polls. Second reference window rejected for scene movement. Need repeated/solo route."
+  }
+}

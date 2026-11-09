@@ -1,0 +1,47 @@
+{
+  "pid": 28708,
+  "binary_sha256": "d70eb12dd333e0aac29f089bbfa51ec606d4950eb85de3a8c229da9fb654a2a2",
+  "profile_enabled": false,
+  "method": "three consecutive 65-second windows in same stationary session; not independent launches",
+  "windows": [
+    {
+      "index": 1,
+      "samples": 129,
+      "mean_fps": 14.623703774969895,
+      "median_fps": 14.983306372885508,
+      "min_fps": 8.992302398679744,
+      "max_fps": 16.996253310112234,
+      "screenshot_start": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-baseline-input-20261108-180930\\baseline-1-start.png",
+      "screenshot_end": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-baseline-input-20261108-180930\\baseline-1-end.png"
+    },
+    {
+      "index": 2,
+      "samples": 129,
+      "mean_fps": 14.000468059031888,
+      "median_fps": 13.993131380831858,
+      "min_fps": 5.998541378561107,
+      "max_fps": 16.99851293944571,
+      "screenshot_start": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-baseline-input-20261108-180930\\baseline-2-start.png",
+      "screenshot_end": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-baseline-input-20261108-180930\\baseline-2-end.png"
+    }
+  ],
+  "complete": false,
+  "completed_windows": 2,
+  "crash": {
+    "first_error": "nonzero uniform-buffer GPU address unmapped",
+    "file": "src/video_core/src/buffer_cache/buffer_cache.rs:639",
+    "stage": 0,
+    "index": 11,
+    "gpu_address": "0x22098e7700",
+    "size": "0x300",
+    "secondary_error": "panic crossing non-unwinding macro JIT callback",
+    "uptime_seconds_approx": 585
+  },
+  "limitations": [
+    "Third measurement window interrupted by process abort",
+    "CPU sampler lost buffered data on process exit; do not report CPU totals",
+    "Button polling does not cover analog axes",
+    "Consecutive windows share one session and moving competitors; not independent repetitions"
+  ],
+  "artifacts_directory": "C:\\Users\\smart\\AppData\\Local\\Temp\\ruzu-session-astc-nx2-20261108-180933"
+}

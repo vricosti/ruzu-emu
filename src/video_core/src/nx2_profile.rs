@@ -344,7 +344,7 @@ mod tests {
         time(10_000_000_100);
         report("test");
         assert_eq!(data().window_start, 10_000_000_100);
-        assert_eq!(data().counters, [0; 8]);
+        assert_eq!(data().counters, [0; 10]);
         assert_eq!(data().count, [0; Zone::Count as usize]);
         assert!(dma_read_pages().remove(&u64::MAX));
     }

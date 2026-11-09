@@ -225,6 +225,11 @@ pub struct Values {
     /// Runtime-only NX2 texture policy; excluded from setting linkage/serialization.
     /// System sets it before GPU creation and clears it after GPU teardown.
     pub use_session_astc_recompression: bool,
+    /// Runtime-only NX2 session marker; System sets it with the ASTC session
+    /// policy before GPU creation and clears it after GPU teardown. NX2
+    /// sessions disable asynchronous shaders: the skipped draws make large
+    /// scenery (trees, props) visibly pop in, which was judged unacceptable.
+    pub use_nx2_session_policies: bool,
     /// Runtime-only dedicated VRAM of the session's render device in bytes;
     /// 0 while unknown. The renderer publishes it at device creation so the
     /// session ASTC policy can keep Uncompressed on large-VRAM cards.
@@ -423,6 +428,22 @@ impl Values {
             }
             configured => configured,
         }
+    }
+
+    /// Effective asynchronous-shaders switch. NX2 sessions default it to off
+    /// so no draw is skipped while a pipeline compiles (no scenery pop-in),
+    /// but an explicit per-title choice (use_global unset) always wins, and
+    /// RUZU_NX2_ASYNC_SHADERS=1 restores the configured value for testing.
+    pub fn effective_use_asynchronous_shaders(&self) -> bool {
+        let configured = *self.use_asynchronous_shaders.get_value();
+        if self.use_nx2_session_policies
+            && self.use_asynchronous_shaders.using_global()
+            && !std::env::var_os("RUZU_NX2_ASYNC_SHADERS")
+                .is_some_and(|value| value.to_string_lossy().starts_with('1'))
+        {
+            return false;
+        }
+        configured
     }
 
     /// Visit settings owned by one upstream category.
@@ -1164,6 +1185,7 @@ impl Default for Values {
                 RendererAdvanced,
             ),
             use_session_astc_recompression: false,
+            use_nx2_session_policies: false,
             session_device_vram_bytes: 0,
             astc_recompression: SwitchableSetting::ranged(
                 AstcRecompression::Uncompressed,
@@ -2323,6 +2345,23 @@ mod tests {
             *values.vertex_input_dynamic_state.get_value(),
             !cfg!(target_os = "android")
         );
+    }
+
+    #[test]
+    fn nx2_session_disables_asynchronous_shaders_unless_per_title() {
+        let mut values = Values::default();
+        values.use_asynchronous_shaders.set_value(true);
+        assert!(values.effective_use_asynchronous_shaders());
+        // Global-inherited value is overridden in NX2 sessions.
+        values.use_nx2_session_policies = true;
+        assert!(!values.effective_use_asynchronous_shaders());
+        // An explicit per-title choice wins over the session policy.
+        values.use_asynchronous_shaders.set_global(false);
+        values.use_asynchronous_shaders.set_value(true);
+        assert!(values.effective_use_asynchronous_shaders());
+        values.use_asynchronous_shaders.set_global(true);
+        values.use_nx2_session_policies = false;
+        assert!(values.effective_use_asynchronous_shaders());
     }
 
     #[test]

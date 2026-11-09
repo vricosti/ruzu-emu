@@ -1822,6 +1822,10 @@ pub struct PipelineCache {
 
     pipeline_cache_filename: PathBuf,
     vulkan_pipeline_cache_filename: PathBuf,
+    /// Keys already present in the on-disk pipeline file, kept to avoid
+    /// duplicate appends when boot precompilation is skipped.
+    disk_graphics_keys: std::collections::HashSet<GraphicsPipelineKey>,
+    disk_compute_keys: std::collections::HashSet<ComputePipelineCacheKey>,
     vulkan_pipeline_cache: vk::PipelineCache,
 
     // Upstream's node-based cache keeps returned `ComputePipeline*` stable and
@@ -1875,9 +1879,8 @@ impl PipelineCache {
         let device = vulkan_device.get_logical().clone();
         let profile = make_shader_profile(vulkan_device);
         let host_info = make_host_translate_info(vulkan_device);
-        let use_asynchronous_shaders = *common::settings::values()
-            .use_asynchronous_shaders
-            .get_value();
+        let use_asynchronous_shaders = common::settings::values()
+            .effective_use_asynchronous_shaders();
         let use_vulkan_pipeline_cache = *common::settings::values()
             .use_vulkan_driver_pipeline_cache
             .get_value();
@@ -1970,6 +1973,8 @@ impl PipelineCache {
             main_pools: ShaderPools::new(),
             pipeline_cache_filename: PathBuf::new(),
             vulkan_pipeline_cache_filename: PathBuf::new(),
+            disk_graphics_keys: std::collections::HashSet::new(),
+            disk_compute_keys: std::collections::HashSet::new(),
             vulkan_pipeline_cache: vk::PipelineCache::null(),
             compute_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
             workers: ThreadWorker::new_stateless(
@@ -2187,7 +2192,9 @@ impl PipelineCache {
             let pipeline = self.create_compute_pipeline_from_environment(&key, &mut env);
             self.queue_vulkan_pipeline_cache_flush();
             let pipeline = pipeline?;
-            if !self.pipeline_cache_filename.as_os_str().is_empty() {
+            if !self.pipeline_cache_filename.as_os_str().is_empty()
+                && self.disk_compute_keys.insert(key)
+            {
                 let key_bytes = compute_key_to_cache_bytes(&key);
                 let filename = self.pipeline_cache_filename.clone();
                 let generic_env = env.generic_environment().clone();
@@ -2329,7 +2336,9 @@ impl PipelineCache {
                 return None;
             }
         };
-        if !self.pipeline_cache_filename.as_os_str().is_empty() {
+        if !self.pipeline_cache_filename.as_os_str().is_empty()
+            && self.disk_graphics_keys.insert(key.clone())
+        {
             let key_bytes = key.to_cache_bytes();
             let filename = self.pipeline_cache_filename.clone();
             let envs: Vec<_> = environments.span().into_iter().cloned().collect();
@@ -2433,6 +2442,32 @@ impl PipelineCache {
             Box::new(load_compute),
             Box::new(load_graphics),
         );
+
+        // Remember which keys the file already holds so runtime creations do
+        // not append duplicates, whether or not they get precompiled now.
+        for (key, _) in loaded_compute.borrow().iter() {
+            self.disk_compute_keys.insert(*key);
+        }
+        for (key, _) in loaded_graphics.borrow().iter() {
+            self.disk_graphics_keys.insert(key.clone());
+        }
+
+        // RUZU_SKIP_BOOT_PRECOMPILE=1 keeps the cache paths, the loaded
+        // Vulkan driver cache and the known-key sets, but skips the blocking
+        // rebuild (measured ~4 minutes for 25k pipelines, 59% of worker time
+        // in AMD driver vkCreate): pipelines build on demand through the
+        // asynchronous shader path instead.
+        if std::env::var_os("RUZU_SKIP_BOOT_PRECOMPILE")
+            .is_some_and(|value| value.to_string_lossy().starts_with('1'))
+        {
+            let skipped_total =
+                loaded_compute.borrow().len() + loaded_graphics.borrow().len();
+            log::info!(
+                "Skipping boot precompilation of {skipped_total} pipelines (RUZU_SKIP_BOOT_PRECOMPILE)"
+            );
+            callback(crate::rasterizer_interface::LoadCallbackStage::Complete, 0, 0);
+            return;
+        }
 
         let build_results = Arc::new(Mutex::new(Vec::<DiskPipelineBuildResult>::new()));
         let job_skipped = Arc::new(AtomicUsize::new(0));

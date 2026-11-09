@@ -167,9 +167,8 @@ impl Device {
 
         let blacklist_async_shaders =
             (is_intel && !cfg!(target_family = "unix")) || strict_context_required;
-        let requested_async_shaders = *common::settings::values()
-            .use_asynchronous_shaders
-            .get_value();
+        let requested_async_shaders = common::settings::values()
+            .effective_use_asynchronous_shaders();
         let use_asynchronous_shaders = requested_async_shaders && !blacklist_async_shaders;
         let use_driver_cache = is_nvidia;
         let supports_conditional_barriers = !is_intel;

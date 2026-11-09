@@ -25624,3 +25624,30 @@ Integrated runtime validation: full cargo test -p video_core -- --test-threads=1
 
 ### Binary layout verification
 - n/a (evaluation only; the in-tree encoder's mode 6 round-trip test stands).
+
+## 2026-11-09 - NX2 session policy: asynchronous shaders disabled
+
+### Intentional differences
+- NX2 sessions default the effective use_asynchronous_shaders to false
+  through a runtime-only session flag set and cleared by System alongside
+  the ASTC session policy (effective_use_asynchronous_shaders; both
+  async-shader snapshot sites - the Vulkan pipeline cache and the OpenGL
+  device - read it). An explicit per-title choice (use_global unset) always
+  wins over the session policy. Rationale: with asynchronous shaders, draws whose pipeline is still
+  compiling are skipped and large scenery visibly pops in, which the user
+  judged unacceptable on Mario Kart World. With the converted-texture disk
+  cache and boot precompilation, the synchronous compile hitches this
+  reintroduces are limited to genuinely new pipelines.
+  RUZU_NX2_ASYNC_SHADERS=1 restores the configured value for testing, and
+  Switch1 titles keep upstream behavior. Consequently
+  RUZU_SKIP_BOOT_PRECOMPILE should not be combined with NX2 sessions unless
+  pop-in is acceptable.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- n/a (host policy).

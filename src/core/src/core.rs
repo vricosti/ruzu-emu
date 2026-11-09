@@ -1735,6 +1735,7 @@ impl System {
         {
             let mut settings = common::settings::values_mut();
             settings.use_session_astc_recompression = self.hardware_profile == hardware_properties::NX2_PROFILE;
+            settings.use_nx2_session_policies = self.hardware_profile == hardware_properties::NX2_PROFILE;
             log::info!("Session ASTC recompression: {:?}", settings.effective_astc_recompression());
         }
         log::info!("Hardware profile: {:?} ({} CPU cores)", self.hardware_profile,
@@ -2177,6 +2178,7 @@ impl System {
         {
             let mut values = common::settings::values_mut();
             values.use_session_astc_recompression = false;
+            values.use_nx2_session_policies = false;
             values.session_device_vram_bytes = 0;
         }
         // Upstream: host1x_core.reset();

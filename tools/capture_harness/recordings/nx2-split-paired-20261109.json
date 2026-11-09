@@ -455,5 +455,16 @@
       "idle": "5-7 (thread remains the structural ceiling)"
     },
     "remaining_ceiling": "GPU command thread saturation: next levers are the documented design slices (per-draw descriptor-visit caching, split transport redesign)"
+  },
+  "nx2_async_policy_and_boot_options": {
+    "binary": "eca06080",
+    "nx2_async_policy": "NX2 sessions default use_asynchronous_shaders to OFF (user: scenery pop-in unacceptable); explicit per-title choice wins; RUZU_NX2_ASYNC_SHADERS=1 escape; Switch1 unchanged. Tests green.",
+    "boot_skip_option": "RUZU_SKIP_BOOT_PRECOMPILE=1 keeps cache paths/driver cache/known keys (duplicate-append dedup via disk key sets) and skips the rebuild; not recommended with async OFF (compiles would stall gameplay)",
+    "adrenalin_reset_experiment": {
+      "boot1_after_reset_vkcreate_s": 2421.9,
+      "boot2_vkcreate_s": 2350.1,
+      "verdict": "no effect: the RX 5700 XT Windows driver does not reuse pipeline compilations across boots regardless of its own cache state; the ~4.5 min boot is driver-bound on this hardware. Remaining levers: pipeline LRU pruning, interleaved loading (design slices)."
+    },
+    "switch1_final_gate": "MK8D on eca06080: Switch1 profile 4 cores, ASTC Uncompressed (session policies inactive), global High intact, menu rendering clean"
   }
 }

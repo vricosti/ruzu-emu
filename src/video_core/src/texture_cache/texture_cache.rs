@@ -494,6 +494,13 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 table.read(self.device_memory.as_ref(), index)
             }
         };
+        if crate::nx2_profile::enabled() {
+            use crate::nx2_profile::{add, Counter};
+            add(Counter::DescriptorVisits, 1);
+            if is_new {
+                add(Counter::DescriptorChanges, 1);
+            }
+        }
         let map_index = index
             | if compute {
                 common::slot_vector::SlotId::TAGGED_VALUE

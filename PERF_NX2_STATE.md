@@ -44,9 +44,12 @@ boots); translation is 24%.
 
 ## Next slices (design work, in value order)
 
-1. Split rehabilitation: cut back-side per-draw cost first (descriptor-visit
-   memoization needs TIC/TSC region write tracking so unchanged tables skip
-   guest re-reads), then re-A/B the split (its drains wait on that cost).
+1. Split rehabilitation: cut back-side per-draw cost first. Descriptor-visit
+   memoization is sized: 238k visits/s at the grid, only 0.64% changed, so
+   nearly the whole fill-image-views descriptor cost is recoverable; it
+   needs TIC/TSC region write tracking (SMMU-page based - CPU invalidations
+   arrive in CPU space while tables live in GPU VA) so unchanged tables skip
+   guest re-reads. Then re-A/B the split (its drains wait on that cost).
 2. Draw-preparation reduction benefits the unsplit path identically.
 3. Boot: pipeline LRU pruning (needs per-key last-used metadata sidecar) or
    interleaved loading (requires batched cache insertion under the

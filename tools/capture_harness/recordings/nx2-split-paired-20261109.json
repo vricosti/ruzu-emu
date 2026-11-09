@@ -466,5 +466,17 @@
       "verdict": "no effect: the RX 5700 XT Windows driver does not reuse pipeline compilations across boots regardless of its own cache state; the ~4.5 min boot is driver-bound on this hardware. Remaining levers: pipeline LRU pruning, interleaved loading (design slices)."
     },
     "switch1_final_gate": "MK8D on eca06080: Switch1 profile 4 cores, ASTC Uncompressed (session policies inactive), global High intact, menu rendering clean"
+  },
+  "descriptor_visit_sizing": {
+    "binary": "1f51a568 (adds DescriptorVisits/DescriptorChanges profile counters)",
+    "at_grid": {
+      "visits_per_s": 238000,
+      "changed_per_s": 1545,
+      "change_rate_percent": 0.64,
+      "visits_per_draw": 6.5,
+      "fill_image_views_ms_s": 36.6,
+      "draws_per_s": 36300
+    },
+    "conclusion": "99.4% of per-visit guest descriptor re-reads are redundant on a stable scene: memoization (slice 3) would recover nearly the whole fill-image-views descriptor cost and shrink the split back accordingly. The correctness requirement stands: every guest write path to the TIC/TSC table ranges (CPU, DMA engine, compute, inline) must invalidate the memo - candidate mechanism is SMMU-page write tracking, since CPU invalidations arrive in CPU address space while the tables live in GPU VA."
   }
 }

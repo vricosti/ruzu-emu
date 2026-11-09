@@ -144,7 +144,7 @@ pub fn now() -> u64 {
 pub struct ThreadData {
     pub exclusive_ns: [u64; Zone::Count as usize],
     pub count: [u64; Zone::Count as usize],
-    pub counters: [u64; 8],
+    pub counters: [u64; 10],
     pub child_ns: u64,
     pub window_start: u64,
 }
@@ -153,7 +153,7 @@ impl Default for ThreadData {
         Self {
             exclusive_ns: [0; Zone::Count as usize],
             count: [0; Zone::Count as usize],
-            counters: [0; 8],
+            counters: [0; 10],
             child_ns: 0,
             window_start: 0,
         }
@@ -218,6 +218,8 @@ pub enum Counter {
     SameValueWrites,
     AcquireChecks,
     AcquireWaits,
+    DescriptorVisits,
+    DescriptorChanges,
 }
 
 /// Process-wide page set, retained across reports. The guard replaces upstream's
@@ -265,6 +267,8 @@ pub fn report(thread_name: &str) {
             data.counters[4] as f64*1e9/window as f64,data.counters[5] as f64*1e9/window as f64).unwrap();
         write!(line," | acquires {:.0} ({:.0} waited)",
             data.counters[6] as f64*1e9/window as f64,data.counters[7] as f64*1e9/window as f64).unwrap();
+        write!(line," | descriptor visits {:.0} ({:.0} changed)",
+            data.counters[8] as f64*1e9/window as f64,data.counters[9] as f64*1e9/window as f64).unwrap();
         log::info!("{} per second:{}",thread_name,line);
         *data=ThreadData::default();data.window_start=now;
     });

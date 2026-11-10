@@ -29,6 +29,35 @@ use std::sync::{Arc, Once};
 use ash::vk;
 use ash::vk::Handle;
 
+/// Whether mesh draws go through the compute mesh adaptation this session.
+/// Decided once per rasterizer by `configure_mesh_draw`; read on every draw
+/// and pipeline lookup, hence the atomic rather than a settings lock.
+static MESH_DRAW_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ruzu extension (no upstream counterpart): choose the mesh draw path for
+/// the session being started.
+///
+/// On by default for NX2 sessions. Without it, a title's mesh shaders are
+/// lowered through the ordinary graphics path, which has no arm for their
+/// stage-buffer opcodes (0x923/0x927): the shader is rejected, its pipeline
+/// cannot be built and the draw is skipped. Mario Kart World loses about 650
+/// such draws a second, and scenery flickers in and out with a still camera;
+/// with the adaptation on there are none and it is stable, at the same frame
+/// rate. `RUZU_NX2_MESH_DRAW=0` turns it off, any other value forces it on.
+fn configure_mesh_draw() -> bool {
+    let enabled = match std::env::var_os("RUZU_NX2_MESH_DRAW") {
+        Some(value) => !value.to_string_lossy().starts_with('0'),
+        None => common::settings::values().use_nx2_session_policies,
+    };
+    MESH_DRAW_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    enabled
+}
+
+pub(crate) fn mesh_draw_enabled() -> bool {
+    MESH_DRAW_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn mesh_dispatch_mapping_fits(group_count: u32, max_groups: u32, mapping_bytes: u64) -> bool {
     let record_bytes = u64::from(shader_recompiler::backend::spirv::spirv_emit_context::MeshDispatchRecord::WORDS) * 4;
     group_count <= max_groups && u64::from(group_count) * record_bytes <= mapping_bytes
@@ -1246,7 +1275,7 @@ impl RasterizerVulkan {
         }));
 
         // Create texture cache
-        let shader_cache = if std::env::var_os("RUZU_NX2_MESH_DRAW").is_some() {
+        let shader_cache = if configure_mesh_draw() {
             crate::shader_cache::ShaderCache::new_mesh_compute(Arc::clone(&device_memory))
         } else {
             crate::shader_cache::ShaderCache::new(Arc::clone(&device_memory))
@@ -1822,8 +1851,7 @@ impl RasterizerVulkan {
         // These launch-time switches supplement the upstream mesh branch.
         // Cache them like upstream's static diagnostic switches: getenv on
         // Windows otherwise allocates UTF-16 storage for every ordinary draw.
-        static MESH_DRAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *MESH_DRAW.get_or_init(|| std::env::var_os("RUZU_NX2_MESH_DRAW").is_some())
+        if mesh_draw_enabled()
             && self.shader_cache.current_maxwell3d().is_some_and(|maxwell| maxwell.is_mesh_enabled()
                 && maxwell.get_native_macro_engine_read(|engine| engine.native_turing)) {
             if indirect_params.is_some() {

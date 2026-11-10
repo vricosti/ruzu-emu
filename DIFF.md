@@ -25651,3 +25651,184 @@ Integrated runtime validation: full cargo test -p video_core -- --test-threads=1
 
 ### Binary layout verification
 - n/a (host policy).
+
+## 2026-11-10 - converted-texture disk cache: hit path describes the level like a fresh conversion (texture_cache/util.rs)
+
+### Intentional differences
+- The converted-texture disk cache (converted_cache.rs) is a ruzu extension;
+  upstream ConvertImage always decodes. No new divergence in this slice.
+
+### Unintentional differences (to fix)
+- Fixed: on a cache hit convert_image skipped the trailing
+  copy.buffer_row_length / copy.buffer_image_height = mip_size assignment
+  that upstream ConvertImage performs for every level, leaving both aligned
+  to the ASTC block. Levels whose extent is not a block multiple were
+  uploaded sheared (Mario's face in Mario Kart World). The hit now falls
+  through the same tail as a fresh conversion. Regression test:
+  cached_astc_level_is_described_like_a_fresh_conversion (12x12 ASTC 8x8).
+
+### Missing items
+- None. RUZU_TEXTURE_CONVERSION_CACHE_VERIFY re-decodes hits and compares
+  bytes; RUZU_DUMP_ASTC_DIR dumps decoded base levels (diagnostics, off by
+  default).
+
+### Binary layout verification
+- Cache entry bytes unchanged; INDEX_VERSION = 2.
+
+## 2026-11-10 - Nx2Map ordered behind a pending Nx2Unmap (nvdrv/devices/nvhost_as_gpu.rs)
+
+### Intentional differences
+- Upstream Nx2Unmap defers the GMMU unmap through RunInOrder while Nx2Map
+  maps immediately. When the title destroys a GPU-only region and recreates
+  one at the same GPU address, the stale deferred unmap erases the new
+  mapping; texture uploads then resolve to an unbacked address and read
+  zeros (transient black scenery). Nx2State gains pending_unmaps; a map that
+  overlaps a pending unmap is queued through run_in_order as well so both
+  apply in submission order. Non-overlapping maps keep upstream's immediate
+  path. Measured on Mario Kart World: unbacked image resolutions 8 -> 0.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- n/a (host-side ordering; ioctl payloads unchanged).
+
+## 2026-11-10 - vi2 present fence timeout raised from 4 s to 120 s (hle/service/nx2_gsv.rs)
+
+### Intentional differences
+- Upstream gives up waiting on the present fence after 4 s. On this host a
+  synchronous pipeline build on a cold shader cache or a texture
+  reconversion stalls the GPU thread for ~10 s; after the timeout the title
+  diverges (semaphores never released, then garbage command lists and
+  GPU-thread panics: ERROR_OUT_OF_DEVICE_MEMORY on an 879-layer image,
+  macro bind index 4096). The default is now 120000 ms;
+  RUZU_VI2_FENCE_TIMEOUT_MS overrides it (4000 restores upstream).
+- The acquire-abandon guard added to Puller in de5f7a41 is withdrawn:
+  puller.rs matches upstream again. The guard only converted the resulting
+  hang into garbage execution.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- None.
+
+### Binary layout verification
+- n/a.
+
+## 2026-11-10 - mesh draw path enabled by default under the NX2 session policy (renderer_vulkan/vk_rasterizer.rs, pipeline_cache.rs)
+
+### Intentional differences
+- Upstream has no mesh-draw path; it is a ruzu extension. It is now on by
+  default when use_nx2_session_policies is set (RUZU_NX2_MESH_DRAW=0
+  disables it). Without it the title's mesh shaders are rejected on the
+  classic path (unsupported native opcode 923/927), about 650 draws per
+  second are skipped and vegetation flickers. With it: 0 skipped draws,
+  0 rejections, frame rate unchanged.
+
+### Unintentional differences (to fix)
+- update_depth_bias ignores VK_EXT_depth_bias_control where upstream uses
+  it when available (not exposed by the AMD driver used for validation).
+- Two shaders are still rejected in races (native indexed constant load
+  mode, op b82, lower_to_maxwell.rs); their Triangles draws are skipped.
+
+### Missing items
+- Desert bushes on Mario Bros. Circuit render near-black with a correct
+  alpha cut-out, in BC3 and BC7, with and without the mesh path. Working
+  hypothesis (not yet tied to the bush draw): their textures live in
+  GPU-only regions that nx2:gpu 214 cannot back from the 8 GiB pool, and
+  FindImageView returns the null view for an unmapped descriptor exactly
+  as upstream does. See the 2026-11-10 GPU-only region entry below.
+
+### Binary layout verification
+- n/a.
+
+## 2026-11-10 - GPU-only regions the pool cannot back (hle/service/nx2_gsv.rs, hle/kernel/board/k_system_control.rs)
+
+### Intentional differences
+- RUZU_NX2_GRAPHICS_POOL_GIB (8..=24) overrides Nx2GraphicsServerMemorySize
+  for the session through nx2_graphics_server_memory_size(); the default
+  stays upstream's 8 GiB. Diagnostic RUZU_GPU_XLATE_MISS=1 (memory_manager.rs)
+  counts GPU-VA translations that find no mapping and logs backtraces.
+
+### Unintentional differences (to fix)
+- None known; the limitation below is shared with upstream.
+
+### Missing items
+- Mario Kart World asks for about 21.5 GiB of GPU-only regions. With 8 GiB
+  nine stay unmapped (2 x 5.7 GiB, 7 x 170-341 MiB) and everything the
+  title blits into and samples from them is a null view. Each 5.7 GiB
+  region holds one 8192x8192 68-layer 12-level array (layer stride
+  89.5 MiB). Measured on a 32 GiB RAM / 8 GiB VRAM host:
+  - pool 16 GiB: 93 regions backed, 1 unbacked, then the GPU thread dies
+    at t=38 s creating the BC6H_UFLOAT 8192x8192x68 array
+    (ERROR_OUT_OF_DEVICE_MEMORY, 6.08 GiB wanted with 3.8 GiB in use);
+  - pool 22 GiB: the 34 GiB guest section cannot be committed, the session
+    never renders;
+  - device address without guest memory for the unbacked regions (tried,
+    removed): about 510 MiB of page writes dropped in 31 s, then the same
+    out-of-device-memory failure.
+  What is missing is a host representation for huge non-ASTC arrays that
+  fits in VRAM (the trimmed-level path only covers accelerated ASTC
+  uploads) and backing for the regions that does not commit them whole.
+
+### Binary layout verification
+- n/a.
+
+## 2026-11-10 - MemoryAllocator::CreateImage over-budget retry and unbacked sparse fallback (vulkan_common/vulkan_memory_allocator.rs)
+
+### Intentional differences
+- AllocatedImage keeps the ash device for an image created without memory:
+  upstream releases it with vmaDestroyImage(allocator, handle, null), vk-mem
+  exposes no null allocation, so Drop calls vkDestroyImage directly.
+- Upstream's `dedicated` parameter is not ported (no caller passes it).
+
+### Unintentional differences (to fix)
+- Fixed: create_image returned the first ERROR_OUT_OF_DEVICE_MEMORY and
+  Image construction then panicked the GPU thread. It now follows upstream:
+  images above 2^28 texels are never backed, an over-budget allocation is
+  retried without WITHIN_BUDGET, and what still does not fit becomes a
+  sparse-residency image with nothing bound (AllocatedImage::is_unbacked).
+  Image::new sets ImageFlagBits::UNBACKED from it and RefreshContents skips
+  the upload of such an image, as upstream does.
+- Upstream's informational logs for unbacked images (2D blit destination,
+  DMA copy, render target, view creation) are not ported yet.
+
+### Missing items
+- Measured with RUZU_NX2_GRAPHICS_POOL_GIB=16 on Mario Kart World: the
+  session that died at t=38 s now reaches the race (142 regions backed, one
+  5.7 GiB region unbacked, four unbacked sparse images: three BC6H
+  8192x8192x68 arrays and one R8 16384x16384). The black tumbleweeds on
+  Mario Bros. Circuit are still black in that session, so backing the
+  170-341 MiB regions is not what they lack. Host at 0.3 GiB free RAM
+  during that run: 16 GiB is not a usable default on a 32 GiB machine.
+
+### Binary layout verification
+- n/a.
+
+## 2026-11-10 - diagnostic draw filters for null and unbacked image views (renderer_vulkan/graphics_pipeline.rs, texture_cache/texture_cache.rs)
+
+### Intentional differences
+- ruzu-only diagnostics, inactive unless RUZU_DEBUG_SKIP_VIEW_DRAWS is set
+  (null, unbacked, bc6h, r8, r16): GraphicsPipeline::configure_impl returns
+  false for a draw that samples a null image view, a view of an UNBACKED
+  image, or a null view whose unmapped descriptor has the selected format.
+  VisitImageView records the matching descriptor-table indices in
+  DEBUG_NULL_VIEW_INDICES. With RUZU_GPU_XLATE_MISS set, FindImageView logs
+  each distinct descriptor rejected by IsValidEntry.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Sparse residency for the BC6H 8192x8192 virtual-texture array that every
+  static-world draw of Mario Kart World samples: both upstream and ruzu
+  create it with nothing bound, so the tiles the title fills are lost.
+  The black tumbleweeds on Mario Bros. Circuit are attributed to it by
+  elimination, not by a per-draw capture.
+
+### Binary layout verification
+- n/a.

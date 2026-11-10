@@ -618,6 +618,28 @@ pub fn emit_mesh_convert_depth(ctx: &mut SpirvEmitContext, vertex_index: Word) {
     ctx.builder.store(pointer, depth, None, []).unwrap();
 }
 
+/// Store zero to every word of a Workgroup array, each invocation taking the
+/// lane-striped slice the transport copies. The index is clamped instead of
+/// guarded so no block is introduced: the entry label must stay a predecessor
+/// of later phi instructions. Clamped lanes all write zero to the last word.
+fn clear_workgroup_words(ctx: &mut SpirvEmitContext, array: Word, pointer_type: Word, words: u32) {
+    // Only the compute replacement has a local invocation input to stripe by.
+    if words == 0 || ctx.mesh_threads == 0 || ctx.local_invocation_id == 0 {
+        return;
+    }
+    let invocation = local_invocation(ctx);
+    let last = ctx.constant_u32(words - 1);
+    for first in (0..words).step_by(ctx.mesh_threads as usize) {
+        let first_id = ctx.constant_u32(first);
+        let index = ctx.builder.i_add(ctx.u32_type, None, invocation, first_id).unwrap();
+        let index = ctx.builder
+            .ext_inst(ctx.u32_type, None, ctx.glsl_ext, 38, [Operand::IdRef(index), Operand::IdRef(last)])
+            .unwrap();
+        let pointer = ctx.builder.access_chain(pointer_type, None, array, [index]).unwrap();
+        ctx.builder.store(pointer, ctx.const_zero_u32, None, []).unwrap();
+    }
+}
+
 fn shared_word(ctx: &mut SpirvEmitContext, array: Word, index: Word) -> Word {
     ctx.builder
         .access_chain(ctx.mesh_shared_u32, None, array, [index])
@@ -757,6 +779,16 @@ pub fn emit_mesh_prologue(ctx: &mut SpirvEmitContext) {
     ctx.builder
         .store(ctx.mesh_primitive_count, ctx.const_zero_u32, None, [])
         .unwrap();
+    if workgroup_zero_fill() {
+        // Same undefined Workgroup storage as the task payload: an output
+        // line or map byte this group does not write would be exported with
+        // another group's geometry.
+        let pointer_type = ctx.mesh_shared_u32;
+        let (attributes, attribute_words) = (ctx.mesh_attributes, ctx.mesh_attribute_words);
+        let (map, map_words) = (ctx.mesh_map, ctx.mesh_map_bytes);
+        clear_workgroup_words(ctx, attributes, pointer_type, attribute_words);
+        clear_workgroup_words(ctx, map, pointer_type, map_words);
+    }
     barrier(ctx);
 }
 
@@ -770,7 +802,26 @@ pub fn emit_task_payload_prologue(ctx: &mut SpirvEmitContext) {
     let one = ctx.constant_u32(1);
     let count = ctx.builder.access_chain(ctx.mesh_payload_u32, None, ctx.mesh_payload, [one]).unwrap();
     ctx.builder.store(count, ctx.const_zero_u32, None, []).unwrap();
+    if workgroup_zero_fill() {
+        // The payload is Workgroup storage, which Vulkan leaves undefined at
+        // launch: a word the guest task does not write is exported as whatever
+        // the previous workgroup using that memory left there, and the mesh
+        // children then read another draw's payload.
+        let payload = ctx.mesh_payload;
+        let pointer_type = ctx.mesh_payload_u32;
+        clear_workgroup_words(ctx, payload, pointer_type, ctx.mesh_payload_words);
+    }
     barrier(ctx);
+}
+
+/// `RUZU_NX2_WORKGROUP_ZERO=0` restores the pinned upstream behaviour of
+/// initializing only the task emission count and the mesh primitive count.
+fn workgroup_zero_fill() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("RUZU_NX2_WORKGROUP_ZERO")
+            .is_none_or(|value| !value.to_string_lossy().starts_with('0'))
+    })
 }
 
 #[cfg(test)]
@@ -1863,17 +1914,62 @@ mod tests {
 
     #[test]
     fn mesh_prologue_initializes_count_before_collective_barrier_without_branch() {
-        let mut ctx = context(true);
+        // The clear is lane-striped, so this context declares the compute
+        // replacement's 32-thread workgroup and its local invocation input.
+        let mut program = ir::Program::new(ShaderStage::Compute);
+        program.info.is_mesh = true;
+        program.info.uses_workgroup_id = true;
+        program.info.uses_local_invocation_id = true;
+        program.workgroup_size = [32, 1, 1];
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        ctx.define_global_variables(&program, &mut crate::backend::bindings::Bindings::default());
+        ctx.define_mesh_shared_memory(&MeshInfo {
+            max_vertices: 32,
+            max_primitives: 16,
+            topology: 4,
+            vertex_lines: [28, 29, 30, 31].into_iter().collect(),
+            ..Default::default()
+        });
+        ctx.builder
+            .begin_function(ctx.void_type, None, spirv::FunctionControl::NONE, ctx.void_fn_type)
+            .unwrap();
+        ctx.builder.begin_block(None).unwrap();
         emit_mesh_prologue(&mut ctx);
         let ops = instructions(&ctx);
-        assert_eq!(ops.len(), 2);
         assert_eq!(ops[0].class.opcode, spirv::Op::Store);
         assert_eq!(ops[0].operands[0], Operand::IdRef(ctx.mesh_primitive_count));
         assert_eq!(constant(&ctx, &ops[0].operands[1]), 0);
-        assert_eq!(ops[1].class.opcode, spirv::Op::ControlBarrier);
-        assert_eq!(constant(&ctx, &ops[1].operands[0]), 2); // Workgroup execution
-        assert_eq!(constant(&ctx, &ops[1].operands[1]), 2); // Workgroup memory
-        assert_eq!(constant(&ctx, &ops[1].operands[2]), 0x108); // AcquireRelease | WorkgroupMemory
+        let barrier = ops.last().unwrap();
+        assert_eq!(barrier.class.opcode, spirv::Op::ControlBarrier);
+        assert_eq!(constant(&ctx, &barrier.operands[0]), 2); // Workgroup execution
+        assert_eq!(constant(&ctx, &barrier.operands[1]), 2); // Workgroup memory
+        assert_eq!(constant(&ctx, &barrier.operands[2]), 0x108); // AcquireRelease | WorkgroupMemory
+        // The whole output storage is cleared before the barrier: Workgroup
+        // memory is undefined at launch and unwritten lines must not carry
+        // another group's geometry. No block may be introduced doing so.
+        assert_workgroup_clear(&ctx, &ops[1..ops.len() - 1],
+            &[(ctx.mesh_attributes, ctx.mesh_attribute_words), (ctx.mesh_map, ctx.mesh_map_bytes)]);
+    }
+
+    /// Checks a branch-free run of lane-striped zero stores covering `arrays`.
+    fn assert_workgroup_clear(ctx: &SpirvEmitContext, ops: &[rspirv::dr::Instruction], arrays: &[(Word, u32)]) {
+        for op in ops {
+            assert!(!matches!(op.class.opcode, spirv::Op::Label | spirv::Op::Branch
+                | spirv::Op::BranchConditional | spirv::Op::SelectionMerge), "{:?}", op.class.opcode);
+            if op.class.opcode == spirv::Op::Store {
+                assert_eq!(constant(ctx, &op.operands[1]), 0);
+            }
+        }
+        for &(array, words) in arrays {
+            let chains = ops.iter().filter(|op| op.class.opcode == spirv::Op::AccessChain
+                && op.operands[0] == Operand::IdRef(array)).count() as u32;
+            assert_eq!(chains, words.div_ceil(ctx.mesh_threads), "one store per lane stripe");
+        }
+        let stores = ops.iter().filter(|op| op.class.opcode == spirv::Op::Store).count() as u32;
+        assert_eq!(stores, arrays.iter().map(|&(_, words)| words.div_ceil(ctx.mesh_threads)).sum::<u32>());
+        // Out-of-range lanes are clamped to the last word rather than guarded.
+        assert!(ops.iter().any(|op| op.class.opcode == spirv::Op::ExtInst
+            && op.operands[1] == Operand::LiteralExtInstInteger(38)));
     }
 
     #[test]
@@ -1881,15 +1977,19 @@ mod tests {
         let mut ctx = payload_context(true);
         emit_task_payload_prologue(&mut ctx);
         let ops = instructions(&ctx);
-        assert_eq!(ops.len(), 3);
         assert_eq!(ops[0].class.opcode, spirv::Op::AccessChain);
         assert_eq!(ops[0].operands[0], Operand::IdRef(ctx.mesh_payload));
         assert_eq!(constant(&ctx, &ops[0].operands[1]), 1);
         assert_eq!(ops[1].class.opcode, spirv::Op::Store);
         assert_eq!(ops[1].operands[0], Operand::IdRef(ops[0].result_id.unwrap()));
         assert_eq!(constant(&ctx, &ops[1].operands[1]), 0);
-        assert_eq!(ops[2].class.opcode, spirv::Op::ControlBarrier);
-        assert_eq!(constant(&ctx, &ops[2].operands[2]), 0x108);
+        let barrier = ops.last().unwrap();
+        assert_eq!(barrier.class.opcode, spirv::Op::ControlBarrier);
+        assert_eq!(constant(&ctx, &barrier.operands[2]), 0x108);
+        // Every payload word is cleared, not only the count: a word the guest
+        // task leaves unwritten would otherwise export stale Workgroup bytes
+        // to the mesh children.
+        assert_workgroup_clear(&ctx, &ops[2..ops.len() - 1], &[(ctx.mesh_payload, ctx.mesh_payload_words)]);
         let address = ctx.constant_u32(4);
         let value = ctx.constant_u32(0x8000_0001);
         emit_isbe_write_attribute(&mut ctx, address, value).unwrap();

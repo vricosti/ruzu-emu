@@ -603,6 +603,41 @@ all of it samples the same array.
 What a real fix needs is sparse residency for that array: memory for the
 tiles the title fills (Fermi2D blits into 85 MiB layer slots were observed),
 not an image with nothing bound. Upstream has the same gap.
+
+## Vegetation still flickering after the mesh-path default (2026-11-10, fixed)
+
+The user still saw vegetation appear and disappear. Reproduced stationary in
+a race: cacti and bushes popping in and out, sometimes drawn at another
+position, with 0 skipped draws. Ruled out, each with its own run: unbacked
+GPU-only regions (pool 16 GiB), GPU accuracy High, upload reordering, the
+speculative vs exact task-count path, `OpUndef` values, full subgroups.
+
+What pinned it: in the exact path the task payload is read back, so it can be
+dumped. Stationary, the guest-side inputs of each vegetation draw (constant
+buffers, storage-buffer pointers) were identical frame to frame and the
+emitted child counts were constant (74 mesh draws, 111 children per frame),
+yet the payload words differed on every frame and several draws carried the
+same words. The payload lives in Workgroup storage, undefined at launch; only
+the emission count was initialized, so every word the guest task leaves
+unwritten exported stale bytes from another workgroup, and the mesh children
+read them. Clearing the whole payload (and the mesh output storage) at launch
+makes 34 of 34 active draws byte-stable across frames, at the same frame
+rate. `RUZU_NX2_WORKGROUP_ZERO=0` restores the old behaviour.
+
+It is not the whole defect. The user still sees bushes flicker with the
+clear on and off. Captures agree that it is not sufficient: one stray bush in
+24 frames in a run with it and one in 24 without, although two other runs
+(36+24 and 2x49 settled frames, speculative and exact path) showed no pop at
+all, only every bush changing slightly together about every sixth capture,
+identically in both paths (wind animation or the reported flicker: not
+determined). RenderDoc 1.47 captures work (RUZU_RENDERDOC_TRIGGER with
+ENABLE_VULKAN_RENDERDOC_CAPTURE=1; four 4 GB captures taken) but replaying
+one exits about 25 s in, right after the initial-state sync, with no error
+in its log, so no per-draw comparison was obtained.
+
+Method note: several A/B runs in this investigation silently used a stale
+test binary because the copy over a still-locked executable failed. Any
+comparison has to confirm the binary timestamp first.
 Two shaders are still rejected in races (`native indexed constant load
 mode`, op b82).
 

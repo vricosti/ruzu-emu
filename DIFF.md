@@ -25832,3 +25832,40 @@ Integrated runtime validation: full cargo test -p video_core -- --test-threads=1
 
 ### Binary layout verification
 - n/a.
+
+## 2026-11-10 - task payload and mesh output Workgroup storage cleared at launch (shader_recompiler backend/spirv/emit_spirv_mesh.rs)
+
+### Intentional differences
+- The compute replacement of task/mesh shaders keeps the task payload and
+  the mesh output lines/map in Workgroup storage, which Vulkan leaves
+  undefined at launch. Pinned upstream initializes nothing there, and the
+  earlier transport correction only zeroed the task emission count
+  (payload word 1). A payload word the guest task does not write was
+  therefore exported with whatever the previous workgroup using that memory
+  had left, and the mesh children consumed another draw's values:
+  vegetation in Mario Kart World appeared, vanished or was drawn at another
+  instance's place from one frame to the next.
+  emit_task_payload_prologue now clears every payload word and
+  emit_mesh_prologue every attribute and map word, each invocation taking
+  the lane-striped slice the transport copies. Indices are clamped rather
+  than guarded so no block is introduced and the entry label stays a
+  predecessor of later phi instructions. RUZU_NX2_WORKGROUP_ZERO=0 restores
+  the previous behaviour.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- Measured on Mario Kart World, stationary in a race on Mario Bros.
+  Circuit: before, the task payload of every vegetation draw differed on
+  each of 8 consecutive frames (34 active draws, 0 stable) although the
+  guest-side inputs and the emitted child counts were identical; after,
+  34 of 34 are identical across frames. Frame rate unchanged. This does not
+  remove the flicker the user reports: a stray bush still appears about once
+  in 24 frames with the clear on or off, so another cause remains open.
+- The black tumbleweeds are unrelated to this and remain open (see the
+  GPU-only region and sparse-residency entries above).
+
+### Binary layout verification
+- Payload and output record layouts are unchanged; only their initial
+  contents are defined.

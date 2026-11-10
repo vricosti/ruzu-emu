@@ -402,6 +402,68 @@ mod tests {
         }
     }
 
+    /// Worst per-channel error of one encoded block against its source.
+    fn bc7_block_max_error(rgba: &[u8; 64]) -> i32 {
+        let mut block = [0u8; 16];
+        unsafe { ruzu_bc7enc_compress_block(block.as_mut_ptr(), rgba.as_ptr()) };
+        let decoded = decode_bc7_mode6(&block);
+        let mut worst = 0i32;
+        for i in 0..16 {
+            for c in 0..4 {
+                worst = worst.max((decoded[i][c] as i32 - rgba[i * 4 + c] as i32).abs());
+            }
+        }
+        worst
+    }
+
+    fn block_from(texels: [[u8; 4]; 16]) -> [u8; 64] {
+        let mut rgba = [0u8; 64];
+        for (i, texel) in texels.iter().enumerate() {
+            rgba[i * 4..i * 4 + 4].copy_from_slice(texel);
+        }
+        rgba
+    }
+
+    /// Blocks whose texels form two clusters that are not collinear in RGBA
+    /// cannot be represented by a single mode 6 line. These are the blocks
+    /// that show as discolored patches in game (skin next to a dark feature
+    /// outline, for instance). The encoder must keep their worst-channel
+    /// error low enough not to be visible.
+    #[test]
+    fn bc7_keeps_two_cluster_blocks_close_to_source() {
+        // Skin tone with a dark nostril-like feature over part of the block.
+        let skin = [252u8, 194, 149, 255];
+        let feature = [92u8, 36, 28, 255];
+        let mut texels = [skin; 16];
+        for i in [5usize, 6, 9, 10] {
+            texels[i] = feature;
+        }
+        let skin_feature = bc7_block_max_error(&block_from(texels));
+
+        // Two saturated hues: the mean axis points nowhere useful.
+        let mut texels = [[220u8, 30, 30, 255]; 16];
+        for texel in texels.iter_mut().take(8) {
+            *texel = [30, 200, 40, 255];
+        }
+        let opposed_hues = bc7_block_max_error(&block_from(texels));
+
+        // Opaque subject against a fully transparent background.
+        let mut texels = [[200u8, 180, 160, 255]; 16];
+        for texel in texels.iter_mut().skip(8) {
+            *texel = [0, 0, 0, 0];
+        }
+        let alpha_edge = bc7_block_max_error(&block_from(texels));
+
+        // Two clusters sit exactly on the two mode 6 endpoints, so these must
+        // reconstruct almost exactly; a regression here means the endpoint fit
+        // or the index assignment stopped tracking the clusters.
+        assert!(
+            skin_feature <= 4 && opposed_hues <= 4 && alpha_edge <= 4,
+            "worst-channel error too high: skin/feature {skin_feature}, \
+             opposed hues {opposed_hues}, alpha edge {alpha_edge}"
+        );
+    }
+
     #[test]
     fn bc1_alpha_threshold_matches_eden_boundary() {
         let mut rgba = vec![0u8; 4 * 4 * 4];

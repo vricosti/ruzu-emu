@@ -979,6 +979,50 @@ pub fn unswizzle_image(
     copies
 }
 
+/// Diagnostic: with RUZU_DUMP_ASTC_DIR set, writes each decoded ASTC base
+/// level (as a top-down 32-bit BMP) while `<dir>/on` exists, so the textures
+/// uploaded for one screen can be inspected before any recompression.
+fn dump_decoded_astc_level(
+    format: surface::PixelFormat,
+    level: i32,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("RUZU_DUMP_ASTC_DIR").map(Into::into))
+    else {
+        return;
+    };
+    if level != 0 || width < 128 || height < 128 || !dir.join("on").exists() {
+        return;
+    }
+    let pixels = (width as usize) * (height as usize) * 4;
+    if rgba.len() < pixels {
+        return;
+    }
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut file = Vec::with_capacity(54 + pixels);
+    file.extend_from_slice(b"BM");
+    file.extend_from_slice(&((54 + pixels) as u32).to_le_bytes());
+    file.extend_from_slice(&0u32.to_le_bytes());
+    file.extend_from_slice(&54u32.to_le_bytes());
+    file.extend_from_slice(&40u32.to_le_bytes());
+    file.extend_from_slice(&(width as i32).to_le_bytes());
+    file.extend_from_slice(&(-(height as i32)).to_le_bytes());
+    file.extend_from_slice(&1u16.to_le_bytes());
+    file.extend_from_slice(&32u16.to_le_bytes());
+    file.extend_from_slice(&[0u8; 24]);
+    for pixel in rgba[..pixels].chunks_exact(4) {
+        file.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    }
+    let _ = std::fs::write(
+        dir.join(format!("{sequence:05}_{width}x{height}_{format:?}.bmp")),
+        file,
+    );
+}
+
 /// Port of `ConvertImage`.
 ///
 /// Decompresses ASTC or BCn compressed images into the host output format.
@@ -1088,60 +1132,98 @@ pub fn convert_image(
                         recompression,
                     )
                 });
-            if let Some(key) = cache_key {
-                if super::converted_cache::get(&key, &mut output[output_offset as usize..])
+            // Diagnostic: RUZU_TEXTURE_CONVERSION_CACHE_VERIFY=1 reconverts every
+            // cache hit and reports payloads that differ from a fresh conversion.
+            //
+            // A hit must fall through, never `continue`: the row length and
+            // image height assigned after this branch chain apply to cached
+            // levels as well. Skipping them left both aligned to the ASTC
+            // block instead of the mip size, so any level whose width is not a
+            // block multiple was uploaded with one BC block column too many
+            // per row and came out sheared (Mario's face, foliage mips).
+            let cache_hit = cache_key.is_some_and(|key| {
+                super::converted_cache::get(&key, &mut output[output_offset as usize..])
                     == Some(converted_size)
-                {
-                    copy.buffer_size = converted_size;
-                    output_offset = output_offset.wrapping_add(converted_size as u32);
-                    continue;
-                }
-            }
+            });
+            let cached_for_verify = (cache_hit && super::converted_cache::verify_enabled())
+                .then(|| {
+                    output[output_offset as usize..output_offset as usize + converted_size].to_vec()
+                });
+            let convert = !cache_hit || cached_for_verify.is_some();
 
-            decode_scratch.resize_destructive(level_size as usize);
+            if convert {
+                decode_scratch.resize_destructive(level_size as usize);
 
-            crate::textures::astc::decompress(
-                &input[input_offset..],
-                copy.image_extent.width,
-                copy.image_extent.height,
-                depth_layers,
-                tile_size.width,
-                tile_size.height,
-                &mut decode_scratch,
-            );
+                crate::textures::astc::decompress(
+                    &input[input_offset..],
+                    copy.image_extent.width,
+                    copy.image_extent.height,
+                    depth_layers,
+                    tile_size.width,
+                    tile_size.height,
+                    &mut decode_scratch,
+                );
 
-            match recompression {
-                common::settings_enums::AstcRecompression::Bc1 => {
-                    crate::textures::bcn::compress_bc1(
-                        &decode_scratch,
-                        copy.image_extent.width,
-                        copy.image_extent.height,
-                        depth_layers,
-                        &mut output[output_offset as usize..],
-                    );
-                }
-                common::settings_enums::AstcRecompression::Bc7 => {
-                    crate::textures::bcn::compress_bc7(
-                        &decode_scratch,
-                        copy.image_extent.width,
-                        copy.image_extent.height,
-                        depth_layers,
-                        &mut output[output_offset as usize..],
-                    );
-                }
-                _ => {
-                    crate::textures::bcn::compress_bc3(
-                        &decode_scratch,
-                        copy.image_extent.width,
-                        copy.image_extent.height,
-                        depth_layers,
-                        &mut output[output_offset as usize..],
-                    );
+                dump_decoded_astc_level(
+                    info.format,
+                    copy.image_subresource.base_level,
+                    copy.image_extent.width,
+                    copy.image_extent.height,
+                    &decode_scratch,
+                );
+
+                match recompression {
+                    common::settings_enums::AstcRecompression::Bc1 => {
+                        crate::textures::bcn::compress_bc1(
+                            &decode_scratch,
+                            copy.image_extent.width,
+                            copy.image_extent.height,
+                            depth_layers,
+                            &mut output[output_offset as usize..],
+                        );
+                    }
+                    common::settings_enums::AstcRecompression::Bc7 => {
+                        crate::textures::bcn::compress_bc7(
+                            &decode_scratch,
+                            copy.image_extent.width,
+                            copy.image_extent.height,
+                            depth_layers,
+                            &mut output[output_offset as usize..],
+                        );
+                    }
+                    _ => {
+                        crate::textures::bcn::compress_bc3(
+                            &decode_scratch,
+                            copy.image_extent.width,
+                            copy.image_extent.height,
+                            depth_layers,
+                            &mut output[output_offset as usize..],
+                        );
+                    }
                 }
             }
 
             copy.buffer_size = converted_size;
-            if let Some(key) = cache_key {
+            if let Some(cached) = cached_for_verify {
+                let fresh = &output[output_offset as usize..output_offset as usize + converted_size];
+                if cached != fresh {
+                    let differing = cached
+                        .chunks(16)
+                        .zip(fresh.chunks(16))
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    let first = cached.iter().zip(fresh.iter()).position(|(a, b)| a != b);
+                    log::error!(
+                        "Converted cache MISMATCH: {:?} {}x{} layers {} level {} blocks differing {}/{} first byte {:?} key {:?}",
+                        info.format, copy.image_extent.width, copy.image_extent.height,
+                        depth_layers, copy.image_subresource.base_level,
+                        differing, converted_size / 16, first,
+                        cache_key.map(|key| (key.source_hash, key.source_len)),
+                    );
+                } else {
+                    super::converted_cache::note_verified();
+                }
+            } else if let (false, Some(key)) = (cache_hit, cache_key) {
                 super::converted_cache::put(
                     key,
                     &output[output_offset as usize..output_offset as usize + converted_size],
@@ -2196,6 +2278,94 @@ mod tests {
                 assert_eq!(pixel, [255, 0, 0, 255], "mode={mode:?}");
             }
         }
+    }
+
+    /// A level served from the converted-texture cache must leave its copy
+    /// described exactly like a freshly converted one. The hit path used to
+    /// skip the trailing row-length and image-height assignment, leaving both
+    /// aligned to the ASTC block (16 here) instead of the mip size (12): the
+    /// upload then counted four BC blocks per row for three and sheared the
+    /// level - Mario's face and foliage mips in Mario Kart World.
+    #[test]
+    fn cached_astc_level_is_described_like_a_fresh_conversion() {
+        use crate::texture_cache::converted_cache::TEST_STORE;
+        use common::settings_enums::AstcRecompression;
+        struct Restore(AstcRecompression, bool, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_STORE.with(|store| *store.borrow_mut() = None);
+                let mut values = common::settings::values_mut();
+                values.astc_recompression.setting.set_value(self.0);
+                values.astc_recompression.set_global(self.1);
+                values.use_session_astc_recompression = self.2;
+            }
+        }
+        let _restore = {
+            let values = common::settings::values();
+            Restore(
+                *values.astc_recompression.get_value_global(),
+                values.astc_recompression.using_global(),
+                values.use_session_astc_recompression,
+            )
+        };
+        {
+            let mut values = common::settings::values_mut();
+            values.astc_recompression.set_global(true);
+            values.astc_recompression.set_value(AstcRecompression::Bc3);
+            values.use_session_astc_recompression = false;
+        }
+        TEST_STORE.with(|store| *store.borrow_mut() = Some(Default::default()));
+
+        // 12x12 texels in 8x8 ASTC blocks: two blocks per row, aligned width 16.
+        let block = [0xfc, 0x0d, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0xff, 0xff];
+        let source: Vec<u8> = std::iter::repeat(block).take(4).flatten().collect();
+        let info = ImageInfo {
+            format: PixelFormat::Astc2d8x8Unorm,
+            image_type: ImageType::E2D,
+            size: Extent3D {
+                width: 12,
+                height: 12,
+                depth: 1,
+            },
+            resources: SubresourceExtent {
+                levels: 1,
+                layers: 1,
+            },
+            ..ImageInfo::default()
+        };
+        let convert = || {
+            let mut copies = full_download_copies(&info);
+            // What the unswizzle step hands over: extents aligned to the block.
+            copies[0].buffer_row_length = 16;
+            copies[0].buffer_image_height = 16;
+            let mut output = vec![0xa5; calculate_converted_size_bytes(&info) as usize];
+            convert_image(&source, &info, &mut output, &mut copies);
+            (
+                copies[0].buffer_row_length,
+                copies[0].buffer_image_height,
+                copies[0].buffer_size,
+                copies[0].buffer_offset,
+                output,
+            )
+        };
+
+        let fresh = convert();
+        assert_eq!(
+            TEST_STORE.with(|store| store.borrow().as_ref().unwrap().len()),
+            1,
+            "the first conversion must populate the cache"
+        );
+        let cached = convert();
+        assert_eq!(
+            TEST_STORE.with(|store| store.borrow().as_ref().unwrap().len()),
+            1,
+            "the second conversion must be a hit, not a second entry"
+        );
+
+        assert_eq!((fresh.0, fresh.1), (12, 12));
+        assert_eq!((cached.0, cached.1), (12, 12), "hit path left block-aligned extents");
+        assert_eq!((cached.2, cached.3), (fresh.2, fresh.3));
+        assert_eq!(cached.4, fresh.4);
     }
 
     #[test]

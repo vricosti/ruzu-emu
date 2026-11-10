@@ -27,7 +27,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 
 const INDEX_MAGIC: &[u8; 4] = b"RZTC";
-const INDEX_VERSION: u32 = 1;
+/// Covers the index format, the key layout, and the output of every
+/// ASTC->BCn encoder. Bump it whenever any of those change: cached payloads
+/// written by an older encoder must never be served (a mismatch recreates
+/// both files wholesale).
+const INDEX_VERSION: u32 = 2;
 const HEADER_LEN: u64 = 8;
 /// Stop appending beyond this much converted data per title. Mario Kart
 /// World filled 3.5 GiB in a single race, so the bound covers a full game's
@@ -200,6 +204,21 @@ fn store() -> Option<&'static Store> {
     Some(store)
 }
 
+/// Diagnostic switch: reconvert every hit and compare (see convert_image).
+pub fn verify_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TEXTURE_CONVERSION_CACHE_VERIFY").is_some())
+}
+
+/// Counts hits whose cached payload matched a fresh conversion.
+pub fn note_verified() {
+    static VERIFIED: AtomicU64 = AtomicU64::new(0);
+    let count = VERIFIED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        log::info!("Converted cache verify: {count} hits matched a fresh conversion");
+    }
+}
+
 /// Builds the key for one conversion input.
 pub fn key_for(
     source: &[u8],
@@ -218,8 +237,27 @@ pub fn key_for(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// In-memory stand-in for the disk store, so the hit path of
+    /// `convert_image` can be exercised without touching user data.
+    pub(crate) static TEST_STORE: std::cell::RefCell<Option<HashMap<Key, Vec<u8>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Copies the cached converted payload into `output`, returning its length.
 pub fn get(key: &Key, output: &mut [u8]) -> Option<usize> {
+    #[cfg(test)]
+    if let Some(found) = TEST_STORE.with(|store| {
+        store.borrow().as_ref().map(|entries| {
+            let payload = entries.get(key)?;
+            output.get_mut(..payload.len())?.copy_from_slice(payload);
+            Some(payload.len())
+        })
+    }) {
+        return found;
+    }
+
     let store = store()?;
     let (offset, len) = *store.index.lock().unwrap().get(key)?;
     let len = len as usize;
@@ -234,6 +272,17 @@ pub fn get(key: &Key, output: &mut [u8]) -> Option<usize> {
 
 /// Stores a freshly converted payload.
 pub fn put(key: Key, payload: &[u8]) {
+    #[cfg(test)]
+    if TEST_STORE.with(|store| {
+        store
+            .borrow_mut()
+            .as_mut()
+            .map(|entries| entries.insert(key, payload.to_vec()))
+            .is_some()
+    }) {
+        return;
+    }
+
     let Some(store) = store() else { return };
     let projected = store.data_len.load(Ordering::Relaxed) + payload.len() as u64;
     if projected > MAX_DATA_BYTES {

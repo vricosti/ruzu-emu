@@ -15,7 +15,38 @@ use crate::hle::kernel::k_trace::K_TRACE_BUFFER_SIZE;
 pub const SECURE_APPLET_MEMORY_SIZE: usize = 4 * 1024 * 1024;
 
 /// Eden-NX2 graphics-server DRAM, outside the application pool in the 12 GB layout.
+///
+/// This feeds the SystemNonSecure pool, which backs the GPU-only (sparse)
+/// regions `nx2:gpu` command 214 creates. Mario Kart World backs 87 regions
+/// totalling 9.5 GiB and then asks for a further 5.7 GiB, so this value leaves
+/// the pool exhausted: the backing allocation fails and the unbacked range
+/// reads back as zeros (black textures, scenery popping).
+///
+/// Raising it to 16 GiB was measured on a 32 GiB host: allocation failures fell
+/// from 9 to 1 and unmapped GPU-VA reads from 20 to 0, but the guest then
+/// touched enough of the extra pool to drive the host to 0.3 GiB free and the
+/// title froze. More eager backing is therefore not the fix on hosts this size.
+///
+/// The real fix is to stop backing these regions eagerly: they are sparse
+/// regions, so only the pages the guest actually maps need committing. That is
+/// a structural change to `nx2_gsv`'s region handling, not a constant.
 pub const NX2_GRAPHICS_SERVER_MEMORY_SIZE: usize = 8 * 1024 * 1024 * 1024;
+
+/// The graphics-server provision for this session.
+///
+/// `RUZU_NX2_GRAPHICS_POOL_GIB` (8..=24) overrides the upstream value on hosts
+/// with the memory for it: every GiB is committed up front with the guest DRAM
+/// section, and what the title then renders into it also has to fit in VRAM.
+pub fn nx2_graphics_server_memory_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("RUZU_NX2_GRAPHICS_POOL_GIB")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|gib| (8..=24).contains(gib))
+            .map_or(NX2_GRAPHICS_SERVER_MEMORY_SIZE, |gib| gib * GIB)
+    })
+}
 
 // Internal constants matching upstream impl namespace.
 const REQUIRED_NON_SECURE_SYSTEM_MEMORY_SIZE_VI: usize = 0x2280 * 4 * 1024;
@@ -84,7 +115,7 @@ pub mod init {
             MemorySize::MemorySize6GB => 6 * GIB,
             MemorySize::MemorySize8GB => 8 * GIB,
             MemorySize::MemorySize10GB => 10 * GIB,
-            MemorySize::MemorySize12GB => 12 * GIB + NX2_GRAPHICS_SERVER_MEMORY_SIZE,
+            MemorySize::MemorySize12GB => 12 * GIB + nx2_graphics_server_memory_size(),
         }
     }
 

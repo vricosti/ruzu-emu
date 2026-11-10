@@ -351,12 +351,6 @@ impl PullerRegs {
 /// Number of subchannels.
 const NUM_SUBCHANNELS: usize = 8;
 
-/// How long a semaphore acquire may block its channel before the wait is
-/// abandoned. Long enough that a slow but legitimate wait (a pipeline still
-/// compiling, a loaded host) is never cut short, short enough that a wait that
-/// can never be satisfied does not end the session.
-const ACQUIRE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// Corresponds to Puller::PendingAcquire in puller.h.
 #[derive(Clone, Copy)]
 struct PendingAcquire {
@@ -450,30 +444,6 @@ impl Puller {
             self.pending_acquire.as_mut().unwrap().reported = true;
             log::warn!("Semaphore {:#x} waits for 2 s: operation {}, expected {:#x}, current {:#x}",
                 acquire.address, acquire.operation, acquire.value, current);
-        }
-        // An acquire that can never be satisfied hangs the whole machine, not
-        // just this channel: the scheduler keeps the channel pending, the GPU
-        // thread spins in PendingSleep, and every guest core parks waiting on
-        // it. That is reachable from an ordinary emulation gap - a shader the
-        // recompiler rejects makes `vk_rasterizer` skip the draw, so the
-        // semaphore the draw would have incremented stays one short, which is
-        // exactly what a hung session showed (expected 0x4, current 0x3).
-        //
-        // Hardware does not wait forever either: the puller has an acquire
-        // timeout register. Give up after a deadline so an unsupported shader
-        // costs visual corruption rather than the session.
-        if acquire.since.elapsed() > ACQUIRE_DEADLINE {
-            log::error!(
-                "Semaphore {:#x} never reached its value after {:?}: operation {}, \
-                 expected {:#x}, current {:#x}; abandoning the wait to keep the \
-                 channel running (expect visual corruption)",
-                acquire.address,
-                ACQUIRE_DEADLINE,
-                acquire.operation,
-                acquire.value,
-                current
-            );
-            return true;
         }
         false
     }
@@ -1319,43 +1289,6 @@ mod tests {
         }
         split.stop().unwrap();
         drop(scope);
-    }
-
-    /// A semaphore whose value never arrives must not pin its channel forever:
-    /// the scheduler keeps such a channel pending, the GPU thread spins, and
-    /// every guest core parks behind it. Reproduces the hung-session shape
-    /// observed in Mario Kart World (operation 4, expected 0x4, current 0x3).
-    #[test]
-    fn unsatisfiable_semaphore_acquire_is_abandoned_after_the_deadline() {
-        let mut puller = Puller::default();
-        let unreachable = PendingAcquire {
-            address: 0,
-            value: 4,
-            operation: GpuSemaphoreOperation::AcquireGequal as u32,
-            since: std::time::Instant::now(),
-            reported: false,
-        };
-
-        // Fresh: the value is not there, so the channel keeps waiting.
-        puller.pending_acquire = Some(unreachable);
-        assert!(!puller.can_resume_acquire(), "a fresh wait must not be cut short");
-        assert!(puller.has_pending_acquire());
-
-        // Still within the deadline: still waiting.
-        puller.pending_acquire = Some(PendingAcquire {
-            since: std::time::Instant::now() - (ACQUIRE_DEADLINE / 2),
-            ..unreachable
-        });
-        assert!(!puller.can_resume_acquire(), "deadline must not fire early");
-
-        // Past the deadline: abandoned, and the channel is released.
-        puller.pending_acquire = Some(PendingAcquire {
-            since: std::time::Instant::now() - (ACQUIRE_DEADLINE + std::time::Duration::from_secs(1)),
-            ..unreachable
-        });
-        assert!(puller.can_resume_acquire(), "an unsatisfiable wait must be abandoned");
-        assert!(puller.resume_acquire());
-        assert!(!puller.has_pending_acquire(), "the channel must stop being pending");
     }
 
     #[test]

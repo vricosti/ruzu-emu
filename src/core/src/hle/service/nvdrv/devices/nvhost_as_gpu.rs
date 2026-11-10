@@ -204,6 +204,8 @@ struct Nx2State {
     gmmu: Arc<Mutex<Option<Arc<dyn GpuMemoryManagerHandle>>>>,
     session: Mutex<SessionId>,
     device_ranges: Mutex<BTreeMap<(u64, u64), Nx2DeviceRange>>,
+    /// GPU ranges whose unmap is queued on the GPU thread and has not run yet.
+    pending_unmaps: Arc<Mutex<Vec<(u64, u64)>>>,
 }
 
 pub struct NvHostAsGpu {
@@ -242,6 +244,7 @@ impl NvHostAsGpu {
             gmmu: Arc::clone(&gmmu),
             session: Mutex::new(SessionId::default()),
             device_ranges: Mutex::new(BTreeMap::new()),
+            pending_unmaps: Arc::new(Mutex::new(Vec::new())),
         });
         Self {
             system,
@@ -289,15 +292,46 @@ impl NvHostAsGpu {
         ranges.insert((cpu_address, size), range);
         super::nx2_stub_device::Nx2GpuMemoryRegistry::get()
             .record_device_range(cpu_address, size, range.address);
-        gmmu.map(gpu_address, range.address, size, 0, false); // PTEKind::PITCH
+        // Unmaps are queued on the GPU thread (it may still be running command
+        // lists that use the range) while maps apply at once. A title that
+        // destroys a region and recreates one at the same GPU address - Mario
+        // Kart World does, constantly, for its streamed texture regions - can
+        // therefore have the stale unmap run *after* the new map and erase it:
+        // images in the new region then find no backing and upload as zeros
+        // (black scenery that later corrects itself). Order the new map behind
+        // any unmap still pending on an overlapping range.
+        let overlaps_pending_unmap = state.pending_unmaps.lock().unwrap().iter().any(
+            |&(pending_address, pending_size)| {
+                gpu_address < pending_address.wrapping_add(pending_size)
+                    && pending_address < gpu_address.wrapping_add(size)
+            },
+        );
+        if overlaps_pending_unmap {
+            let device_address = range.address;
+            state.system.get().gpu_core().expect("NX2 mapping requires GPU")
+                .run_in_order(Box::new(move || {
+                    gmmu.map(gpu_address, device_address, size, 0, false); // PTEKind::PITCH
+                }));
+        } else {
+            gmmu.map(gpu_address, range.address, size, 0, false); // PTEKind::PITCH
+        }
         log::debug!("Switch 2 GPU mapping {gpu_address:#x}+{size:#x} -> CPU {cpu_address:#x}");
     }
 
     fn nx2_unmap(state: &Nx2State, gpu_address: u64, size: u64) {
         let _guard = state.mutex.lock().unwrap();
         let Some(gmmu) = state.gmmu.lock().unwrap().clone() else { return };
+        let pending_unmaps = Arc::clone(&state.pending_unmaps);
+        pending_unmaps.lock().unwrap().push((gpu_address, size));
+        // The GPU thread may still be running command lists that use the range.
         state.system.get().gpu_core().expect("NX2 unmapping requires GPU")
-            .run_in_order(Box::new(move || gmmu.unmap(gpu_address, size)));
+            .run_in_order(Box::new(move || {
+                gmmu.unmap(gpu_address, size);
+                let mut pending = pending_unmaps.lock().unwrap();
+                if let Some(position) = pending.iter().position(|&entry| entry == (gpu_address, size)) {
+                    pending.swap_remove(position);
+                }
+            }));
         log::debug!("Switch 2 GPU unmapping {gpu_address:#x}+{size:#x}");
     }
 

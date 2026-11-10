@@ -720,6 +720,16 @@ impl INx2GpuSession {
         this.signal_after_gpu(w[3]);
         ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
     }
+    /// Whether `nx2:gpu` command 214 leaves its GPU-only regions unbacked.
+    ///
+    /// Eager backing commits the whole region out of the SystemNonSecure pool;
+    /// Mario Kart World asks for about 15 GiB that way against a 9.5 GiB pool.
+    /// This is opt-in while the title-side consequences are being measured.
+    fn lazy_sparse_regions_enabled() -> bool {
+        std::env::var_os("RUZU_NX2_LAZY_SPARSE")
+            .is_some_and(|value| value.to_string_lossy().starts_with('1'))
+    }
+
     fn sub_create_gpu_only_region(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         let w = ctx.command_buffer();
@@ -733,9 +743,35 @@ impl INx2GpuSession {
         let size = last.wrapping_add(1).wrapping_sub(start);
         if last > start && size % PAGE_SIZE as u64 == 0 {
             this.free_released_regions();
-            if let Some(address) = this.back_gpu_only_region(start, size) {
+            if Self::lazy_sparse_regions_enabled() {
+                // A sparse region is address space, not memory: backing the
+                // whole range up front commits guest pages the title may never
+                // map, which is what exhausts the SystemNonSecure pool. Leave
+                // it unbacked and let reads of never-mapped pages return zeros,
+                // which is what sparse semantics call for anyway.
+                log::info!(
+                    "nx2:gpu 214 GPU-only region [{start:#x}, {last:#x}] left unbacked \
+                     ({size:#x} bytes, lazy sparse regions)"
+                );
+            } else if let Some(address) = this.back_gpu_only_region(start, size) {
                 Nx2GpuMemoryRegistry::get().map_at(start, address, size);
                 log::info!("nx2:gpu 214 GPU-only region [{start:#x}, {last:#x}] backed at {address:#x}");
+            } else {
+                // Nothing is mapped here, so every read of this range returns
+                // zeros: black textures and popping scenery. Reporting the
+                // failure instead was measured and is worse - Mario Kart World
+                // aborts within 120 ms of receiving the error (guest backtrace
+                // right after two of these lines), so the success answer is
+                // load-bearing. Giving the range a device address with no
+                // guest memory was also tried (2026-11-10) and is worse too:
+                // the title writes into these regions (about 510 MiB of page
+                // writes in the first 31 s were dropped) and the GPU thread
+                // then died creating an image there (ERROR_OUT_OF_DEVICE_MEMORY
+                // on an 8 GiB card). Leave it, and name the consequence here.
+                log::error!(
+                    "nx2:gpu 214 GPU-only region [{start:#x}, {last:#x}] is UNBACKED \
+                     ({size:#x} bytes); reads of it will return zeros"
+                );
             }
         } else {
             log::warn!("nx2:gpu 214 unexpected region [{start:#x}, {last:#x}]");
@@ -819,6 +855,14 @@ impl INx2GpuSession {
             .expect("system resource initialized")
             .block_info_manager_arc();
         let mut pg = Box::new(KPageGroup::with_block_info_manager(Some(manager)));
+        // These regions belong in SystemNonSecure and must stay there. Falling
+        // back to Applet and Application when it is exhausted was tried and
+        // breaks the title: borrowing 1.5 GiB from those pools at t=285.7 was
+        // followed at t=319.7 by a guest `svcBreak` / Userspace PANIC with
+        // debug_buffer_err_code=E401. Application is the title's own heap, so
+        // satisfying GPU-only regions out of it starves the allocation the
+        // title makes next. An unbacked region renders black; a drained
+        // application pool aborts the game, which is worse.
         if kernel.memory_manager_mut().allocate_and_open(
             &mut pg,
             (size / PAGE_SIZE as u64) as usize,
@@ -1083,7 +1127,26 @@ impl INx2Vi2Session {
         }
         let syncpoints = self.system.get().host1x_core().expect("VI requires Host1x");
         let start = std::time::Instant::now();
-        let deadline = start + std::time::Duration::from_millis(4000);
+        // Upstream gives up on the frame's fence after 4 s. That is shorter
+        // than stalls this emulator really has - a burst of synchronous
+        // pipeline builds on a cold shader cache holds the GPU thread ~10 s -
+        // and giving up is not harmless: the present returns, the title moves
+        // on to the next frame while the GPU thread is still consuming the
+        // previous one, and the two diverge. Measured on Mario Kart World,
+        // three runs out of three: semaphore acquires that are never
+        // released, then command streams with nonsense state (a render target
+        // with 879 layers, a macro slot of 4096) and a dead GPU thread. With
+        // the wait left to finish, the same stalls pass without incident.
+        // Keep a bound so a truly lost fence still surfaces, but well beyond
+        // any stall observed. RUZU_VI2_FENCE_TIMEOUT_MS overrides it.
+        static FENCE_TIMEOUT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let timeout_ms = *FENCE_TIMEOUT_MS.get_or_init(|| {
+            std::env::var("RUZU_VI2_FENCE_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(120_000)
+        });
+        let deadline = start + std::time::Duration::from_millis(timeout_ms);
         if !syncpoints.is_ready_guest(fence_id, fence_value) {
             let wake = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
             let signal = wake.clone();

@@ -271,6 +271,9 @@ impl Image {
         let image = runtime.create_image_from_info(&host_info, override_format,
             override_format.map(|_| HUGE_ASTC_VIEW_FORMATS.as_slice()))?;
         let image_handle = image.handle();
+        if image.is_unbacked() {
+            base_mut.flags.insert(ImageFlagBits::UNBACKED);
+        }
         runtime
             .vulkan_device()
             .set_image_name(image_handle, &image_name(base_mut));

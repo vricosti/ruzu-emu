@@ -380,6 +380,13 @@ impl ImageInfo {
         } else {
             info.image_type = ImageType::E2D;
             info.resources.layers = (config.depth & 0xFFFF) as i32;
+            if info.resources.layers > 64 {
+                log::error!(
+                    "RenderTarget with {} layers: {}x{} format {:?} tile_mode {:#x} array_pitch {:#x} depth {:#x}",
+                    info.resources.layers, config.width, config.height, format,
+                    config.tile_mode, config.array_pitch, config.depth
+                );
+            }
             info.rescaleable =
                 info.block().depth == 0 && info.size.height > RESCALE_HEIGHT_THRESHOLD;
             info.downscaleable = info.size.height > DOWNSCALE_HEIGHT_THRESHOLD;

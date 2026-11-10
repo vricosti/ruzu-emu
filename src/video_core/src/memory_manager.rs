@@ -95,6 +95,71 @@ enum EntryType {
 
 static UNIQUE_IDENTIFIER_GENERATOR: AtomicUsize = AtomicUsize::new(0);
 
+/// Volume of guest traffic that sparse (`Reserved`) or unmapped (`Free`) GMMU
+/// pages silently swallow: writes are dropped and reads come back as zeros,
+/// which is what renders as black textures. The per-address warnings below are
+/// capped at ten lines each, so these uncapped totals are what actually sizes
+/// an on-demand commit of those pages.
+static SPARSE_WRITE_DROPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+static SPARSE_READ_ZEROED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Reports the first occurrence and then each crossing of a 1 MiB boundary, so
+/// the log shows both onset and growth without one line per page.
+fn note_sparse_traffic(counter: &AtomicU64, bytes: usize, what: &str) {
+    const REPORT_STEP: u64 = 1 << 20;
+    let before = counter.fetch_add(bytes as u64, Ordering::Relaxed);
+    let after = before + bytes as u64;
+    if before == 0 {
+        log::warn!("gpu_mm: {what} started ({bytes} bytes)");
+    } else if before / REPORT_STEP != after / REPORT_STEP {
+        log::warn!("gpu_mm: {what} reached {} MiB", after >> 20);
+    }
+}
+
+/// Diagnostic (`RUZU_GPU_XLATE_MISS=1`): counts GPU-VA translations that find
+/// no mapping, per 64 MiB bucket, and reports each bucket at 1, 10, 100, ...
+/// misses. Buffer bindings resolve through this path without ever reaching the
+/// read counters above, so this is what shows a draw input living in an
+/// unbacked region.
+fn note_translation_miss(gpu_addr: u64) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("RUZU_GPU_XLATE_MISS").is_some()) {
+        return;
+    }
+    static MISSES: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, u64>>> =
+        OnceLock::new();
+    let mut misses = MISSES.get_or_init(Default::default).lock().unwrap();
+    let count = misses.entry(gpu_addr >> 26).or_insert(0);
+    *count += 1;
+    let n = *count;
+    let mut power = 1u64;
+    while power < n {
+        power *= 10;
+    }
+    if n == 1000 || (n == 1 && misses.len() % 16 == 1) {
+        log::warn!(
+            "gpu_mm: translation miss at {gpu_addr:#x} from\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+    if power == n {
+        log::warn!(
+            "gpu_mm: translation miss #{n} in bucket {:#x} (address {gpu_addr:#x})",
+            (gpu_addr >> 26) << 26
+        );
+    }
+}
+
+/// Total bytes dropped by writes to sparse or unmapped GMMU pages.
+pub fn sparse_write_dropped_bytes() -> u64 {
+    SPARSE_WRITE_DROPPED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Total bytes zero-filled by reads of sparse or unmapped GMMU pages.
+pub fn sparse_read_zeroed_bytes() -> u64 {
+    SPARSE_READ_ZEROED_BYTES.load(Ordering::Relaxed)
+}
+
 fn gpu_va_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_GPU_VA_TRACE").is_some())
@@ -946,6 +1011,11 @@ impl GpuMemoryManager {
                 _ => {
                     // Reserved or Free — fill with zeros.
                     if remaining > 0 {
+                        note_sparse_traffic(
+                            &SPARSE_READ_ZEROED_BYTES,
+                            copy_amount,
+                            "reads of sparse/unmapped pages",
+                        );
                         static UNMAPPED_COUNT: AtomicUsize = AtomicUsize::new(0);
                         let c = UNMAPPED_COUNT.fetch_add(1, Ordering::Relaxed);
                         if c < 10 {
@@ -1004,7 +1074,13 @@ impl GpuMemoryManager {
                     src_offset += copy_amount;
                 }
                 EntryType::Reserved => {
-                    // Reserved (sparse) — skip.
+                    // Reserved (sparse) — the write is dropped, so a later read
+                    // of this page returns zeros instead of what was stored.
+                    note_sparse_traffic(
+                        &SPARSE_WRITE_DROPPED_BYTES,
+                        copy_amount,
+                        "writes dropped on sparse pages",
+                    );
                     src_offset += copy_amount;
                 }
                 EntryType::Free => {
@@ -2029,7 +2105,11 @@ impl MemoryManager {
     }
 
     pub fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
-        self.inner.gpu_to_cpu_address(gpu_addr)
+        let result = self.inner.gpu_to_cpu_address(gpu_addr);
+        if result.is_none() && gpu_addr != 0 {
+            note_translation_miss(gpu_addr);
+        }
+        result
     }
 
     /// Upstream MemoryManager::IsShuttingDown reads the owning Core::System.

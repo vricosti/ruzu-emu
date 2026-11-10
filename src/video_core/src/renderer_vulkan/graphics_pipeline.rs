@@ -988,6 +988,50 @@ impl GraphicsPipeline {
             state, draw, &read_gpu, scheduler, buffer_cache, texture_cache,
             guest_descriptor_queue, engine.fallback_sampler, is_indexed,
         );
+        // Diagnostic (RUZU_DEBUG_SKIP_VIEW_DRAWS=null|unbacked): drop every
+        // draw that samples a null image view, or a view of an image created
+        // without memory. Whatever disappears from the frame is what those
+        // inputs feed.
+        {
+            static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+            let mode = *MODE.get_or_init(|| {
+                match std::env::var("RUZU_DEBUG_SKIP_VIEW_DRAWS").as_deref() {
+                    Ok("null") => 1,
+                    Ok("unbacked") => 2,
+                    Ok("bc6h" | "r8" | "r16") => 3,
+                    _ => 0,
+                }
+            });
+            if mode != 0 {
+                use crate::texture_cache::image_base::ImageFlagBits;
+                let indices = (mode == 3).then(|| {
+                    crate::texture_cache::texture_cache::DEBUG_NULL_VIEW_INDICES.lock().unwrap()
+                });
+                let hit = views.iter().any(|view| {
+                    if let Some(indices) = &indices {
+                        return view.id == NULL_IMAGE_VIEW_ID && indices.contains(&view.index);
+                    }
+                    if view.id == NULL_IMAGE_VIEW_ID {
+                        return mode == 1;
+                    }
+                    let image_id = texture_cache.base.slot_image_views[view.id].image_id;
+                    mode == 2
+                        && image_id.is_valid()
+                        && texture_cache.base.slot_images[image_id]
+                            .flags
+                            .contains(ImageFlagBits::UNBACKED)
+                });
+                if hit {
+                    static SKIPPED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        log::warn!("debug view filter (mode {mode}) skipped {n} draws");
+                    }
+                    return false;
+                }
+            }
+        }
         if self.has_mesh_output {
             let output = engine.mesh_output.expect("mesh graphics configuration requires compute output");
             guest_descriptor_queue.add_buffer(output.buffer, output.offset, output.range);

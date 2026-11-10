@@ -79,6 +79,25 @@ impl RenderTargetDirtyFlagAccess for [bool; 256] {
     }
 }
 
+/// Diagnostic (RUZU_DEBUG_SKIP_VIEW_DRAWS=bc6h|r8|r16): descriptor-table
+/// indices whose descriptor currently resolves to the null view because its
+/// range is unmapped and whose format matches the selected class.
+pub(crate) static DEBUG_NULL_VIEW_INDICES: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn debug_null_view_filter() -> Option<fn(crate::surface::PixelFormat) -> bool> {
+    use crate::surface::PixelFormat;
+    static MODE: std::sync::OnceLock<Option<fn(PixelFormat) -> bool>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("RUZU_DEBUG_SKIP_VIEW_DRAWS").as_deref() {
+        Ok("bc6h") => Some(|format| format == PixelFormat::Bc6hUfloat),
+        Ok("r8") => Some(|format| format == PixelFormat::R8Unorm),
+        Ok("r16") => {
+            Some(|format| matches!(format, PixelFormat::R16Unorm | PixelFormat::R16G16Unorm))
+        }
+        _ => None,
+    })
+}
+
 impl<P: TextureCacheParams> TextureCacheBase<P> {
     /// Port of `TextureCache<P>::HasAsyncFlushWork` in texture_cache.h.
     pub fn has_async_flush_work(&self) -> bool {
@@ -98,6 +117,15 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             .flags
             .remove(ImageFlagBits::CPU_MODIFIED);
         self.track_image(image_id);
+
+        if self.slot_images[image_id]
+            .flags
+            .contains(ImageFlagBits::UNBACKED)
+        {
+            // Nothing to upload into (and staging it could take tens of GB).
+            P::transition_image_layout(self, image_id);
+            return;
+        }
 
         if self.slot_images[image_id].info.num_samples > 1 && !P::can_upload_msaa(self) {
             log::warn!("MSAA image uploads are not implemented");
@@ -509,6 +537,17 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             };
         let image_view_id = if is_new {
             let image_view_id = self.find_image_view(&descriptor);
+            if let Some(filter) = debug_null_view_filter() {
+                let matches = image_view_id == NULL_IMAGE_VIEW_ID
+                    && descriptor.address() != 0
+                    && filter(super::image_info::ImageInfo::from_tic_entry(&descriptor).format);
+                let mut indices = DEBUG_NULL_VIEW_INDICES.lock().unwrap();
+                if matches {
+                    indices.insert(map_index);
+                } else {
+                    indices.remove(&map_index);
+                }
+            }
             if image_view_id != NULL_IMAGE_VIEW_ID {
                 P::prepare_image_view(self, image_view_id, false, false);
             }
@@ -744,6 +783,22 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                 .or_else(|| gpu_memory.gpu_to_cpu_address_range(gpu_addr, size))
         }) {
             return cpu_addr;
+        }
+        // An image whose guest range has no backing is given a fake address
+        // and uploads as zeros (black). Counting these says how much of the
+        // title's texture set lives in GPU-only regions that were never backed.
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            static BYTES: AtomicU64 = AtomicU64::new(0);
+            let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            let bytes = BYTES.fetch_add(size, Ordering::Relaxed) + size;
+            if count <= 24 || count.is_power_of_two() {
+                log::warn!(
+                    "Unbacked image #{count}: gpu {gpu_addr:#x} size {size:#x} (total {} MiB)",
+                    bytes >> 20
+                );
+            }
         }
         let fake_addr = !(1u64 << 40) + self.virtual_invalid_space;
         self.virtual_invalid_space += common::alignment::align_up(size, 32);
@@ -1459,6 +1514,24 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         if !super::util::is_valid_entry_with_range_valid(descriptor, |gpu_addr, size| {
             gpu_to_cpu(gpu_addr, size).is_some()
         }) {
+            // Diagnostic (RUZU_GPU_XLATE_MISS=1): name each distinct descriptor
+            // that resolves to the null view because its range is unmapped.
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ENABLED.get_or_init(|| std::env::var_os("RUZU_GPU_XLATE_MISS").is_some())
+                && descriptor.address() != 0
+            {
+                static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+                    std::sync::OnceLock::new();
+                if SEEN.get_or_init(Default::default).lock().unwrap().insert(descriptor.address()) {
+                    let info = super::image_info::ImageInfo::from_tic_entry(descriptor);
+                    log::warn!(
+                        "null view for unmapped descriptor at {:#x}: {:?} {:?} {}x{}x{} levels {} layers {}",
+                        descriptor.address(), info.format, info.image_type, info.size.width,
+                        info.size.height, info.size.depth, info.resources.levels,
+                        info.resources.layers
+                    );
+                }
+            }
             return NULL_IMAGE_VIEW_ID;
         }
         if let Some(&id) = self.current_channel_state_mut().image_views.get(descriptor) {
@@ -2638,6 +2711,18 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     broken_views,
                     native_bgr,
                 ) {
+                    if solution.resources.layers > new_info.resources.layers.max(overlap.info.resources.layers) + 16 {
+                        log::error!(
+                            "JoinImages layer explosion: {} -> {} layers; new {:?} {}x{} layers {} stride {:#x} gpu {:#x} cpu {:#x}; overlap {:?} {}x{} layers {} levels {} stride {:#x}/{:#x} gpu {:#x} cpu {:#x} guest {:#x} flags {:?}",
+                            new_info.resources.layers, solution.resources.layers,
+                            new_info.format, new_info.size.width, new_info.size.height,
+                            new_info.resources.layers, new_info.layer_stride, gpu_addr, cpu_addr,
+                            overlap.info.format, overlap.info.size.width, overlap.info.size.height,
+                            overlap.info.resources.layers, overlap.info.resources.levels,
+                            overlap.info.layer_stride, overlap.info.maybe_unaligned_layer_stride,
+                            overlap.gpu_addr, overlap.cpu_addr, overlap.guest_size_bytes, overlap.flags,
+                        );
+                    }
                     gpu_addr = solution.gpu_addr;
                     cpu_addr = solution.cpu_addr;
                     new_info.resources = solution.resources;

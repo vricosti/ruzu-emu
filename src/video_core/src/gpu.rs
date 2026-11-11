@@ -583,9 +583,19 @@ impl Gpu {
     }
 
     /// Wait for a sync operation to complete.
+    ///
+    /// Upstream `GPU::Impl::WaitForSyncOperation` waits on the fence alone.
+    /// Here guest cores still execute between `notify_shutdown`, which joins
+    /// the GPU thread, and `CpuManager::shutdown`, which joins them; a guest
+    /// read of rasterizer-cached memory in that window queued a request that
+    /// nothing would ever run and the core never returned (frontend frozen on
+    /// "Closing software..."). `notify_shutdown` sets `shutting_down` and
+    /// notifies under this same mutex, so the wait also ends on it.
     pub fn wait_for_sync_operation(&self, fence: u64) {
         let mut guard = self.sync_requests.lock().unwrap();
-        while self.current_sync_fence.load(Ordering::Relaxed) < fence {
+        while self.current_sync_fence.load(Ordering::Relaxed) < fence
+            && !self.shutting_down.load(Ordering::Relaxed)
+        {
             guard = self.sync_request_cv.wait(guard).unwrap();
         }
     }
@@ -1388,6 +1398,23 @@ mod tests {
         fn bind_channel(&mut self, channel: &mut crate::control::channel_state::ChannelState) {
             self.bound_channels.lock().unwrap().push(channel.bind_id);
         }
+    }
+
+    #[test]
+    fn wait_for_sync_operation_returns_once_shutdown_is_notified() {
+        let gpu = Arc::new(Gpu::new(false, false));
+        let fence = gpu.request_sync_operation(Box::new(|| {}));
+        let waiter = {
+            let gpu = Arc::clone(&gpu);
+            std::thread::spawn(move || gpu.wait_for_sync_operation(fence))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!waiter.is_finished());
+        gpu.notify_shutdown();
+        waiter.join().unwrap();
+        // A request made after shutdown must not block either.
+        let late = gpu.request_sync_operation(Box::new(|| {}));
+        gpu.wait_for_sync_operation(late);
     }
 
     #[test]

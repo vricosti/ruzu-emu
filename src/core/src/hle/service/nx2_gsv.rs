@@ -393,11 +393,14 @@ impl INx2SyncptSession {
     fn cancel(&self, request: &mut SlotRequest) -> bool {
         if request.pending.swap(false, Ordering::SeqCst) {
             if let Some(handle) = request.handle {
-                self.system
-                    .get()
-                    .host1x_core()
-                    .expect("syncpt requires Host1x")
-                    .deregister_guest_action(request.syncpoint, handle);
+                // `System::shutdown_main_process` resets Host1x before the
+                // service sessions are released, so the session destructor
+                // reaches this with a pending request and no Host1x. The
+                // registered action died with the syncpoint manager; expecting
+                // Host1x here panicked the frontend thread mid-shutdown.
+                if let Some(host1x) = self.system.get().host1x_core() {
+                    host1x.deregister_guest_action(request.syncpoint, handle);
+                }
             }
             return true;
         }

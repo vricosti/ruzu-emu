@@ -3051,7 +3051,7 @@ impl KernelCore {
             process_guard.thread_objects.values().cloned().collect()
         };
 
-        for thread in threads {
+        for thread in &threads {
             let mut thread_guard = thread.lock().unwrap();
             if should_suspend {
                 thread_guard.request_suspend(SuspendType::System);
@@ -3060,8 +3060,25 @@ impl KernelCore {
             }
         }
 
-        if should_suspend {
-            self.interrupt_all_cores();
+        if !should_suspend {
+            return;
+        }
+        self.interrupt_all_cores();
+
+        // Upstream: "Wait for process execution to stop." TryWait takes the
+        // scheduler lock and reports whether any core's scheduler still has a
+        // thread of the process as its current thread. Without this wait the
+        // caller (System::pause, System::shutdown_main_process) went on while
+        // cores were still executing guest code.
+        let try_wait = || {
+            let _scheduler_guard = scheduler_lock()
+                .map(super::k_scheduler_lock::KScopedSchedulerLock::new);
+            !is_any_thread_current(&self.schedulers, &threads)
+        };
+        while !try_wait() {
+            // Upstream spins with an empty body; yield so the cores being
+            // waited on are not starved of host time.
+            std::thread::yield_now();
         }
     }
 
@@ -5161,5 +5178,45 @@ mod tests {
 impl Default for KernelCore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Body of upstream `KernelCore::SuspendEmulation`'s `TryWait` scan: whether
+/// any core's scheduler still has one of `threads` as its current thread.
+/// The caller holds the scheduler lock.
+fn is_any_thread_current(
+    schedulers: &[Arc<Mutex<KScheduler>>],
+    threads: &[Arc<KThreadLock>],
+) -> bool {
+    schedulers.iter().any(|scheduler| {
+        let current = scheduler.lock().unwrap().get_scheduler_current_thread();
+        // A thread has not finished running yet.
+        current.is_some_and(|current| threads.iter().any(|thread| Arc::ptr_eq(thread, &current)))
+    })
+}
+
+#[cfg(test)]
+mod suspend_emulation_tests {
+    use super::*;
+
+    #[test]
+    fn suspend_wait_sees_a_process_thread_until_its_core_switches_away() {
+        let process_thread = Arc::new(KThreadLock::new(KThread::new()));
+        let idle_thread = Arc::new(KThreadLock::new(KThread::new()));
+        let schedulers: Vec<_> = (0..2)
+            .map(|core| Arc::new(Mutex::new(KScheduler::new(core))))
+            .collect();
+        let threads = vec![Arc::clone(&process_thread)];
+
+        // No current thread on any core.
+        assert!(!is_any_thread_current(&schedulers, &threads));
+
+        schedulers[0].lock().unwrap().current_thread = Some(Arc::downgrade(&idle_thread));
+        schedulers[1].lock().unwrap().current_thread = Some(Arc::downgrade(&process_thread));
+        assert!(is_any_thread_current(&schedulers, &threads));
+
+        // The core rescheduled to a thread outside the process.
+        schedulers[1].lock().unwrap().current_thread = Some(Arc::downgrade(&idle_thread));
+        assert!(!is_any_thread_current(&schedulers, &threads));
     }
 }

@@ -604,7 +604,7 @@ What a real fix needs is sparse residency for that array: memory for the
 tiles the title fills (Fermi2D blits into 85 MiB layer slots were observed),
 not an image with nothing bound. Upstream has the same gap.
 
-## Vegetation still flickering after the mesh-path default (2026-11-10, fixed)
+## Vegetation still flickering after the mesh-path default (2026-11-10, superseded below)
 
 The user still saw vegetation appear and disappear. Reproduced stationary in
 a race: cacti and bushes popping in and out, sometimes drawn at another
@@ -640,6 +640,101 @@ test binary because the copy over a still-locked executable failed. Any
 comparison has to confirm the binary timestamp first.
 Two shaders are still rejected in races (`native indexed constant load
 mode`, op b82).
+
+## Scenery flicker: frame-time pacing and GPU-driven instanced draws (2026-11-11)
+
+Reproduced on Linux (RADV, RX 5700 XT, ~16 FPS) in the intro cinematic, which
+plays the same way on every boot as long as the title has no save data.
+
+The premise of the section above is wrong for this defect: it is not in the
+compute replacement of task/mesh shaders.
+
+- With every task/mesh draw skipped (a temporary switch, since removed) the
+  rocks and cacti are still drawn and still flicker.
+- The task and the mesh stage are deterministic: dispatching each twice in
+  the same frame into separate zeroed outputs gave 0 differences over 24,576
+  mesh and 53,248 task draws.
+- Forcing the exact task path with a GPU wait before the draw, synchronous
+  GPU emulation, GPU accuracy High, CPU accuracy Accurate, backing the six
+  341 MiB GPU-only regions (pool 16 GiB) and immediate download of every
+  compute-written buffer each leave it flickering.
+
+Two things flicker. First, ordinary direct draws: a per-draw log (temporary,
+since removed) shows the title drawing a given rock every frame in its three shadow passes (same colour
+target, three other zeta addresses) but only on some frames in the main view
+(2560x1440, zeta 0x8135700000): the guest CPU leaves the draw out, with
+unchanged per-object data on the frames that have it.
+
+Cause A, fixed. The title measures its frame time with CNTPCT. At 55-60 ms
+per frame its frame counter advances by 2 on about one frame in six and
+main-view objects drop out at random. Dividing the counter by 2, 4 or 8
+(`sync_core_speed` with a raised speed limit) makes the counter advance by 1
+on every frame and removes those drop-outs, so `CoreTiming` now paces CNTPCT
+by the measured present interval for NX2 sessions (`ClockPacing`, DIFF.md
+2026-11-11). Measured on the cinematic, 600 frames each:
+
+| run | objects flipping 4+ times | frames with visible blink |
+|---|---|---|
+| High, pacing off | 15 | 67.6% |
+| High, pacing on | 3 | 39-44% |
+| Low, pacing off | 12 | 80.0% |
+| Low, pacing on | 5 | 66.4% |
+
+"Visible blink" counts a frame when more than 150 pixels (of 480x270) change
+and change back within three frames; fast camera motion also trips it, so it
+does not reach zero on a clean run.
+
+Cause B, fixed. The large rock formations that appeared and vanished together
+from frame to frame, drawn black, are instanced draws the title builds on the
+GPU. Compute jobs cull the instances and compact them into an instance buffer;
+a list-builder job writes one draw record per mesh into a buffer that the
+graphics channel then executes as command data. Three defects (DIFF.md
+2026-11-11, second entry) made those draws read the wrong instances:
+
+- The list builder's prefix sum over a 32-lane warp uses SHFL.IDX with an
+  index of -1 for "no previous lane". Unmasked, the chain never terminated and
+  every record of a group received the group total as base instance.
+- The pass that finds a storage buffer's base pointer picked the scaled index
+  instead of the pointer for the list builder's global instance counter, so
+  the counter was bound to address zero and every group started at slot 0.
+- The draw macro sets the base instance, issues the instances and restores
+  the base; the batch of deferred instances was drawn after the restore.
+
+With the first two fixed, the instance buffer holds the same 72 instances on
+every frame and the records are disjoint; with the third the draws read them.
+Measured on the cinematic (pixels of a 640x360 frame that blink three times or
+more in eight seconds): 8,000 to 26,000 before, 170 to 350 after at GPU
+accuracy High, about 1,300 at Low where what remains is texture shimmer on a
+moving wall. Per-object tracking shows no object flipping in or out.
+
+The title also runs a GPU occlusion test for the objects its CPU draws (two
+alternating 0x1500-byte result buffers, read back in full every frame) and
+drops objects whose footprint in the depth pyramid shows something else. With
+the formations drawn in the wrong places that test hid visible rocks on
+arbitrary frames; it settles once the formations are right.
+
+Dead ends, for whoever looks at this area again: the reads of the result
+buffers by the guest are regular and never torn; result latency is constant;
+the semaphore mirror, the QMD release bit 19 and the guest-valued syncpoints
+listed in DIFF.md are real defects but none of them moved this symptom; the
+render target size does not change from frame to frame. Guest reads of
+rasterizer-cached pages go through the slow path, so a watchpoint on the
+fastmem view never sees them.
+
+Other things established on the way:
+
+- The title drives dynamic resolution from GPU timestamp reports: with
+  `fast_gpu_time=0` the main target drops from 2560x1440 to 1664x932.
+- The draw count has a strict 6-frame cycle (one cube-map face per frame);
+  that is the title's own scheduling, not a defect.
+- `ruzu-cmd` does not load the per-title `custom/<id>.ini`; only the GTK
+  frontend does. Runs meant to compare a per-title setting must set it in the
+  global file.
+- The graphics pool cannot usefully exceed 16 GiB: physical memory is capped
+  at 32 GiB, 18 and 20 leave more regions unbacked and 22 and 24 do not boot.
+  The title reserves 22.8 GiB of GPU-only regions in total.
+- During the cup intro fly-over the frame is tinted green for a few seconds;
+  not investigated.
 
 ## Where the remaining time goes
 

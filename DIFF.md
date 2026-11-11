@@ -25869,3 +25869,189 @@ Integrated runtime validation: full cargo test -p video_core -- --test-threads=1
 ### Binary layout verification
 - Payload and output record layouts are unchanged; only their initial
   contents are defined.
+
+## 2026-11-11 - NX2 session CNTPCT pacing by the present rate (core/src/core_timing.rs, hle/service/nx2_gsv.rs)
+
+### Intentional differences
+- Upstream returns the wall-clock CNTPCT, optionally scaled by the CPU clock
+  setting and, with `sync_core_speed`, divided by the configured speed limit.
+  Ruzu adds `ClockPacing` in front of that scaling for NX2 sessions:
+  `CoreTiming::notify_frame_presented`, called from the `nx2:vi2` present
+  next to the perf-stats frame boundary, smooths the interval between
+  presents (3:1) and, once it exceeds 36 ms, advances the guest counter so
+  that one presented frame appears to last 25 ms. It releases below 33 ms,
+  ignores intervals above 500 ms (loads and pauses), never goes below 1/16 of
+  real time and never runs ahead of the raw counter. The mapping is rebased
+  at each rate change, so the paced counter is continuous and monotonic.
+  Kernel timers and sleeps stay on the host clock, as with `sync_core_speed`.
+- Reason: Mario Kart World measures frame time with CNTPCT. At the 55-60 ms
+  per frame this port reaches, its frame counter skips and it leaves
+  main-view objects out on arbitrary frames while still drawing them in its
+  shadow passes. A static division of the counter (Eden's `sync_core_speed`)
+  removes that but ties the factor to the speed-limit setting; pacing by the
+  measured present rate needs no setting and is the identity at real time.
+- Inert for Switch 1 sessions, in single-core mode and with
+  `RUZU_NX2_CLOCK_PACING=0`. `RUZU_NX2_CLOCK_PACING_MS=<8..=33>` sets the
+  apparent frame duration; `RUZU_NX2_CLOCK_PACING_LOG=1` logs the real and
+  apparent duration of every presented frame.
+
+### Unintentional differences (to fix)
+- None known.
+
+### Missing items
+- The upstream Switch 2 branch is not present in the local Eden checkout
+  (`origin/eden-nx2` does not exist on this remote), so the pacing was not
+  compared against any newer upstream handling of the same title behaviour.
+- Pacing removes the frame-time-driven drop-outs only. The instanced scenery
+  that appeared and vanished from frame to frame had a different cause, see
+  the next entry.
+
+### Binary layout verification
+- Not applicable: no guest-visible structure changes.
+
+## 2026-11-11 - GPU-driven instanced draws of NX2 titles (shader_recompiler, video_core/src/engines)
+
+Mario Kart World builds its instanced scenery draws on the GPU: compute jobs
+cull the instances, a "list builder" job writes one draw record per mesh
+(count, instance count, first index, base vertex, base instance) into a buffer,
+and the graphics channel executes that buffer as command data. Three defects
+made those draws read the wrong instances, which showed as rock formations
+drawn black and appearing or vanishing from one frame to the next.
+
+### Restored upstream behaviour
+- shader_recompiler/src/ir_opt/global_memory_to_storage_buffer_pass.rs:
+  `track` walked the address expression with its own queue, leftmost argument
+  first. Upstream `Track` uses `BreadthFirstSearch`, which visits the
+  rightmost argument first; the port now calls its existing
+  `ir::breadth_first_search`. For an address of the form
+  `index * stride + pointer` whose index is also read from a constant buffer,
+  the old order resolved the storage buffer to the index, bound it to address
+  zero and silently dropped the list builder's global instance counter.
+  Test: `track_resolves_scaled_index_plus_pointer_to_the_pointer`.
+
+### Intentional differences
+- shader_recompiler/src/backend/spirv/emit_spirv_warp.rs, `emit_shuffle_index`:
+  upstream uses the index register unmasked and compares it, signed, with the
+  clamp. The source lane of SHFL.IDX is a five-bit field. Guest code passes
+  -1 for "no previous lane" together with a clamp of 30 and relies on lane 31
+  being rejected; unmasked, -1 passes the signed comparison and
+  `OpGroupNonUniformShuffle` receives an out-of-range invocation index, which
+  is undefined. The index is now masked with 31 before the segmentation
+  logic. Without it the list builder's prefix sum gave every record of a
+  group the group total as base instance.
+  Test: `shuffle_index_masks_the_source_lane_to_five_bits`.
+- video_core/src/engines/maxwell_3d.rs, `flush_deferred_instances_before`
+  (called from `call_method` and for constant-buffer data in
+  `call_multi_method`), with `DrawManager::has_deferred_instances`: upstream
+  accumulates `InstanceId::Subsequent` draws and draws the batch at the next
+  first draw or when the macro ends, with the state current at that moment.
+  The hardware draws each instance as its draw is issued. The title's draw
+  macro sets the base instance (register and shader constants), issues the
+  instances and restores the base afterwards, so the batch was drawn with the
+  restored base. Any write that is not part of the instancing sequence
+  (draw begin and end, vertex and index counts, the small and inline index
+  methods) now flushes the batch first.
+  Tests: `deferred_instances_are_drawn_before_the_base_instance_is_restored`;
+  `deferred_instances_keep_the_registers_of_their_draws` replaces the test
+  that asserted the upstream flush-time state.
+
+### Unintentional differences (to fix)
+- The instanced formations were black before these fixes because they were
+  drawn with other objects' instance data. Whether any shading defect remains
+  on them was not examined separately.
+
+### Missing items
+- The five-bit source lane is inferred from the title's own use of the
+  instruction (clamp 30 with an index of -1) and from the result, not from
+  vendor documentation. SHFL.UP, SHFL.DOWN and SHFL.BFLY are unchanged.
+- Found during the investigation and left as they are, because changing them
+  did not affect the symptom: `kepler_compute.rs` treats bit 19 of a QMD
+  release word as a "maximum" reduction, while NVIDIA's `clc6c0qmd.h`
+  (QMDV03_00) defines it as `RELEASE0_MEMBAR_TYPE`; `nx2_semaphore_mirror`
+  copies releases of the second semaphore page onto the first and overwrites
+  the compute completion word that channel acquires wait on; `nx2:syncpt`
+  reports guest (submitted) syncpoint values.
+
+### Binary layout verification
+- Not applicable: no guest-visible structure changes.
+
+## 2026-11-11 - GPU sync operation wait ends at shutdown (video_core/src/gpu.rs)
+
+### Intentional difference
+- `Gpu::wait_for_sync_operation` also returns once `shutting_down` is set.
+  Upstream `GPU::Impl::WaitForSyncOperation` waits on the fence alone.
+- Reason: `System::shutdown_main_process` joins the GPU thread in
+  `Gpu::notify_shutdown` before `CpuManager::shutdown` joins the CPU cores, and
+  in this port a core can still be executing guest code in between. A guest
+  read of rasterizer-cached memory (`Gpu::on_cpu_read`) then queued a flush
+  that no thread would ever run, the core never returned and the frontend
+  stayed on "Closing software...". Captured with Mario Kart World, which reads
+  GPU-written buffers every frame: one stop out of six hung, with CPUCore_3 in
+  `wait_for_sync_operation` and the main thread in `CpuManager::shutdown`.
+- `notify_shutdown` already set the flag and notified `sync_request_cv` under
+  the `sync_requests` mutex, so the wait cannot miss the wake-up. The guest
+  read returns the memory as it is; the process is being terminated.
+- Not addressed: why guest code still runs after `KernelCore::shutdown_cores`.
+
+### Tests
+- `gpu::tests::wait_for_sync_operation_returns_once_shutdown_is_notified`.
+
+## 2026-11-11 - NX2 video decoder NV12 output (video_core/src/host1x/nx2_video_decoder.rs)
+
+### Intentional difference
+- `Nx2VideoDecoder::render` copies the two planes itself (`copy_nv12_planes`)
+  when the decoded frame is already NV12 at the requested size, instead of
+  passing it through `sws_scale`.
+- Reason, measured with libswscale 7.5 (FFmpeg 6.1) on a hardware-decoded VP9
+  stream: for an NV12 to NV12 conversion of equal size `sws_scale` returned
+  the full height and wrote the luma plane, but left the destination chroma
+  plane untouched (source chroma valid, destination all zero). The guest
+  samples luma as R8 and chroma as R8G8, so zero chroma turned the whole
+  picture green: Mario Kart World's course fly-over before a race, a VP9
+  2560x1440 video of 23.7 s.
+- Other source formats and scaled conversions still go through `sws_scale`.
+
+### Tests
+- `nv12_plane_copy_fills_luma_and_interleaved_chroma_at_the_destination_pitch`.
+
+## 2026-11-11 - Emulation suspend waits for guest execution to stop (core/src/hle/kernel/kernel.rs)
+
+### Restored upstream behaviour
+- `KernelCore::suspend_emulation(true)` now ends with upstream's "Wait for
+  process execution to stop" loop: under the scheduler lock, it reports
+  whether any core's scheduler still has a thread of the process as its
+  current thread, and repeats until none has. The port requested the
+  suspension and returned at once, so `System::pause` and
+  `System::shutdown_main_process` continued while cores still ran guest code.
+  That is how a core could issue a GPU read after the GPU thread was joined
+  (entry "GPU sync operation wait ends at shutdown" above, which stays as a
+  second guard).
+
+### Intentional difference
+- The loop yields the host thread between attempts; upstream spins with an
+  empty body.
+- Like the rest of `suspend_emulation`, only the frontend application process
+  is considered; upstream walks the whole process list.
+
+## 2026-11-11 - BreadthFirstSearch visited set (shader_recompiler/src/ir/breadth_first_search.rs)
+
+### Intentional difference
+- `visited` is a `HashSet`; upstream uses a `small_vector` searched linearly.
+  Membership answers and visiting order are identical.
+- Reason: a search that fails visits every reachable instruction, and Mario
+  Kart World's compute shaders (28,102 instructions) run one search per global
+  memory access since `track` uses this helper (entry "GPU-driven instanced
+  draws" above). Three stack samples out of three taken during a slow stop
+  showed the GPU thread in the linear lookup; the frontend waited for that
+  shader to finish before it could close.
+
+## 2026-11-11 - nx2:syncpt request cancel after Host1x teardown (core/src/hle/service/nx2_gsv.rs)
+
+### Lifecycle note
+- `INx2SyncptSession::cancel` skips the deregistration when Host1x no longer
+  exists. `System::shutdown_main_process` resets Host1x before the retained
+  service sessions are released, so the session destructor could reach
+  `cancel` with a pending request; `expect("syncpt requires Host1x")` then
+  panicked the frontend thread during shutdown and the unwind blocked on a
+  scheduler mutex (one stop out of ten in the stop series). The registered
+  action is owned by the syncpoint manager and is gone with it.

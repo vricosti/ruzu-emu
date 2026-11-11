@@ -1,4 +1,39 @@
-# Handoff — Mario Kart World vegetation flicker (NX2), 2026-11-10
+# Handoff — Mario Kart World vegetation flicker (NX2)
+
+**2026-11-11 update: resolved. Read this block first; it supersedes the
+"Flicker: what is established" section below.**
+
+- The flicker was not in the task/mesh compute replacement; both compute
+  stages are deterministic when dispatched twice.
+- Cause A (fixed): the title drops main-view objects when its CNTPCT-measured
+  frame time overruns. `ClockPacing` in `core/src/core_timing.rs` paces the
+  counter for NX2 sessions. `RUZU_NX2_CLOCK_PACING=0` restores the old
+  behaviour.
+- Cause B (fixed): the rock formations that appeared and vanished together,
+  drawn black, are GPU-driven instanced draws that read the wrong instances.
+  Three fixes: the five-bit source lane of SHFL.IDX
+  (`shader_recompiler/src/backend/spirv/emit_spirv_warp.rs`), upstream's
+  rightmost-first search for a storage buffer's base pointer
+  (`shader_recompiler/src/ir_opt/global_memory_to_storage_buffer_pass.rs`),
+  and flushing deferred instance draws before unrelated state writes
+  (`video_core/src/engines/maxwell_3d.rs`). Details in DIFF.md (2026-11-11,
+  second entry) and PERF_NX2_STATE.md, "Scenery flicker".
+- Reproduce without driving: the intro cinematic (about 75-105 s after
+  launch) is identical on every boot provided the title's save directory is
+  deleted first. `ruzu-cmd` ignores the per-title ini.
+- The validation runs deleted the title's Vulkan pipeline cache
+  (`~/.cache/ruzu/shader/0400c3f00006e000/vulkan*`) first. Whether a stale
+  cache would otherwise keep the old shader translation was not checked.
+- The green course fly-over before a race was a VP9 video whose chroma plane
+  was never written (NV12 to NV12 through libswscale); fixed in
+  `nx2_video_decoder.rs`, see DIFF.md.
+- Stopping the game could freeze or take about 10 s; fixed (suspend wait,
+  GPU sync wait, syncpt cancel, breadth-first search), see DIFF.md.
+- `RUZU_NX2_MESH_EXACT`, `RUZU_NX2_MESH_FINISH` and
+  `RUZU_NX2_MESH_OUTPUT_TRACE` remain in the tree but do not bear on this
+  defect.
+
+---
 
 Branch `research/eden-nx2-port`. Read this first, then the "Vegetation still
 flickering" section of `PERF_NX2_STATE.md` and the 2026-11-10 entries at the

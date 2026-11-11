@@ -914,11 +914,18 @@ impl Puller {
             } else {
                 QueryPropertiesFlags::HAS_TIMEOUT
             };
-            let mirror = if nx2 {
-                crate::nx2::nx2_semaphore_mirror(sequence_address)
-            } else {
-                0
-            };
+            // eden-nx2 also writes a release that lands in the second page
+            // of a queue's two-page region to the same offset of the first
+            // page (`Nx2SemaphoreMirror`), on the assumption that the console
+            // copies one page into the other. Measured on Mario Kart World,
+            // the two pages hold different counters: the queue releases
+            // 0x1788, 0x17c8, ... at +0x1000 and 0x17f, 0x183, ... at +0x1010
+            // and +0x1020, while the GPU acquires on the first page wait for
+            // 0x117, 0x11a, ... at +0x0 and for the compute job counts 1, 2
+            // at +0x10 and +0x20, which other releases write there. The copy
+            // overwrote those words with far larger values, so every acquire
+            // was met at once. Without it each acquire finds its word one
+            // step short and is met by the release it waits for.
             on_back(self.rasterizer, move |rasterizer| {
                 rasterizer.query(
                     sequence_address,
@@ -927,9 +934,6 @@ impl Puller {
                     payload,
                     0,
                 );
-                if mirror != 0 {
-                    rasterizer.query(mirror, QueryType::Payload as u32, properties, payload, 0);
-                }
             });
         } else if crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::SeqCst) {
             if !matches!(op, 0x1 | 0x4 | 0x8) {
@@ -1603,10 +1607,9 @@ mod tests {
                     } else {
                         QueryPropertiesFlags::HAS_TIMEOUT
                     };
-                    let mut expected = vec![(address, QueryType::Payload as u32, flags, 0xdeadbeef)];
-                    if nx2 && address == region + 0x1040 {
-                        expected.push((region + 0x40, QueryType::Payload as u32, flags, 0xdeadbeef));
-                    }
+                    // A release into the second page of a registered region
+                    // is written there only, never copied to the first page.
+                    let expected = vec![(address, QueryType::Payload as u32, flags, 0xdeadbeef)];
                     assert_eq!(*fake.query_calls.lock().unwrap(), expected);
                 }
             }

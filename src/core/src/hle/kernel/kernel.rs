@@ -1961,6 +1961,13 @@ pub struct KernelCore {
     /// Per-core KScheduler instances.
     /// Upstream: `std::array<std::unique_ptr<Kernel::KScheduler>, NUM_CPU_CORES> schedulers`.
     schedulers: Vec<Arc<Mutex<KScheduler>>>,
+    /// Whether each core's host thread is currently inside the guest fibers
+    /// (between `CpuManager::RunThread`'s yield to the scheduler's thread and
+    /// the return to the host fiber). Upstream keeps the core threads alive
+    /// until `CpuManager::Shutdown`; here they return once the guest has
+    /// exited, leaving their scheduler's current thread as it was, so
+    /// `suspend_emulation` must not wait on those cores.
+    core_in_guest: [std::sync::atomic::AtomicBool; hardware_properties::MAX_NUM_CPU_CORES],
     /// Per-core PhysicalCore instances.
     /// Upstream: `std::array<std::unique_ptr<Kernel::PhysicalCore>, NUM_CPU_CORES> cores`.
     cores: Vec<Arc<PhysicalCore>>,
@@ -2155,6 +2162,8 @@ impl KernelCore {
             object_name_global_data: None,
 
             schedulers: Vec::new(),
+            core_in_guest: [const { std::sync::atomic::AtomicBool::new(false) };
+                hardware_properties::MAX_NUM_CPU_CORES],
             cores: Vec::new(),
 
             shutdown_threads: Vec::new(),
@@ -3036,6 +3045,14 @@ impl KernelCore {
         self.terminating_processes.lock().unwrap().extend(processes);
     }
 
+    /// Records whether `core`'s host thread is inside the guest fibers. Set by
+    /// `CpuManager::run_thread_on_core` around its yield to the guest.
+    pub fn set_core_in_guest(&self, core: usize, in_guest: bool) {
+        if let Some(flag) = self.core_in_guest.get(core) {
+            flag.store(in_guest, Ordering::SeqCst);
+        }
+    }
+
     /// Suspend or resume emulation threads for the current application process.
     ///
     /// Upstream: `KernelCore::SuspendEmulation(bool)`.
@@ -3073,7 +3090,7 @@ impl KernelCore {
         let try_wait = || {
             let _scheduler_guard = scheduler_lock()
                 .map(super::k_scheduler_lock::KScopedSchedulerLock::new);
-            !is_any_thread_current(&self.schedulers, &threads)
+            !is_any_thread_current(&self.schedulers, &self.core_in_guest, &threads)
         };
         while !try_wait() {
             // Upstream spins with an empty body; yield so the cores being
@@ -5186,9 +5203,15 @@ impl Default for KernelCore {
 /// The caller holds the scheduler lock.
 fn is_any_thread_current(
     schedulers: &[Arc<Mutex<KScheduler>>],
+    core_in_guest: &[std::sync::atomic::AtomicBool],
     threads: &[Arc<KThreadLock>],
 ) -> bool {
-    schedulers.iter().any(|scheduler| {
+    schedulers.iter().zip(core_in_guest).any(|(scheduler, in_guest)| {
+        // A core whose host thread left the guest fibers runs nothing, whatever
+        // its scheduler still names as current.
+        if !in_guest.load(Ordering::SeqCst) {
+            return false;
+        }
         let current = scheduler.lock().unwrap().get_scheduler_current_thread();
         // A thread has not finished running yet.
         current.is_some_and(|current| threads.iter().any(|thread| Arc::ptr_eq(thread, &current)))
@@ -5201,22 +5224,41 @@ mod suspend_emulation_tests {
 
     #[test]
     fn suspend_wait_sees_a_process_thread_until_its_core_switches_away() {
+        use std::sync::atomic::AtomicBool;
         let process_thread = Arc::new(KThreadLock::new(KThread::new()));
         let idle_thread = Arc::new(KThreadLock::new(KThread::new()));
         let schedulers: Vec<_> = (0..2)
             .map(|core| Arc::new(Mutex::new(KScheduler::new(core))))
             .collect();
+        let in_guest = [AtomicBool::new(true), AtomicBool::new(true)];
         let threads = vec![Arc::clone(&process_thread)];
 
         // No current thread on any core.
-        assert!(!is_any_thread_current(&schedulers, &threads));
+        assert!(!is_any_thread_current(&schedulers, &in_guest, &threads));
 
         schedulers[0].lock().unwrap().current_thread = Some(Arc::downgrade(&idle_thread));
         schedulers[1].lock().unwrap().current_thread = Some(Arc::downgrade(&process_thread));
-        assert!(is_any_thread_current(&schedulers, &threads));
+        assert!(is_any_thread_current(&schedulers, &in_guest, &threads));
 
         // The core rescheduled to a thread outside the process.
         schedulers[1].lock().unwrap().current_thread = Some(Arc::downgrade(&idle_thread));
-        assert!(!is_any_thread_current(&schedulers, &threads));
+        assert!(!is_any_thread_current(&schedulers, &in_guest, &threads));
+    }
+
+    #[test]
+    fn suspend_wait_ignores_a_core_whose_host_thread_left_the_guest() {
+        use std::sync::atomic::AtomicBool;
+        let process_thread = Arc::new(KThreadLock::new(KThread::new()));
+        let schedulers = vec![Arc::new(Mutex::new(KScheduler::new(0)))];
+        schedulers[0].lock().unwrap().current_thread = Some(Arc::downgrade(&process_thread));
+        let threads = vec![Arc::clone(&process_thread)];
+
+        // The guest exited on its own: the host thread returned from the guest
+        // fibers and the scheduler still names the process thread.
+        let in_guest = [AtomicBool::new(false)];
+        assert!(!is_any_thread_current(&schedulers, &in_guest, &threads));
+
+        in_guest[0].store(true, Ordering::SeqCst);
+        assert!(is_any_thread_current(&schedulers, &in_guest, &threads));
     }
 }

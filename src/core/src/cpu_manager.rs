@@ -2141,7 +2141,9 @@ impl CpuManager {
                         core,
                         std::thread::current().name().unwrap_or("?"),
                     );
+                    kernel.set_core_in_guest(core, true);
                     Fiber::yield_to(Arc::downgrade(&host_ctx), &thread_host_ctx);
+                    kernel.set_core_in_guest(core, false);
                     log::info!(
                         "RunThread core {} host={}: returned from main thread fiber",
                         core,

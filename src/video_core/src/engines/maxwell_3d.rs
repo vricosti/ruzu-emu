@@ -2850,6 +2850,40 @@ impl Maxwell3D {
         }
     }
 
+    /// Divergence from upstream, which draws accumulated `Subsequent` instance
+    /// draws only at the next `First` draw or when the macro ends, with the
+    /// state current at that moment. The hardware draws every instance as its
+    /// draw is issued. A macro that restores the base instance (register and
+    /// shader constants) after its last instance, as Mario Kart World's
+    /// GPU-driven instanced draws do, would otherwise have the whole batch
+    /// drawn with the restored state. Any write that is not part of the
+    /// instancing sequence itself therefore flushes the batch first.
+    fn flush_deferred_instances_before(&mut self, method: u32) {
+        if !self
+            .draw_manager
+            .as_ref()
+            .is_some_and(|draw_manager| draw_manager.has_deferred_instances())
+        {
+            return;
+        }
+        let instancing_method = method == DRAW_BEGIN
+            || method == DRAW_END
+            || method == VB_FIRST
+            || method == VB_COUNT
+            || method == IB_BASE + IB_OFF_FIRST
+            || method == IB_BASE + IB_OFF_COUNT
+            || method == INDEX_BUFFER32_SUBSEQUENT
+            || method == INDEX_BUFFER16_SUBSEQUENT
+            || method == INDEX_BUFFER8_SUBSEQUENT
+            || method == VERTEX_ARRAY_INSTANCE_SUBSEQUENT
+            || method == DRAW_INLINE_INDEX
+            || (INLINE_INDEX_2X16_EVEN..=INLINE_INDEX_2X16_EVEN + 1).contains(&method)
+            || (INLINE_INDEX_4X8_INDEX0..=INLINE_INDEX_4X8_INDEX0 + 1).contains(&method);
+        if !instancing_method {
+            self.with_draw_manager(|draw_manager, this| draw_manager.draw_deferred(this));
+        }
+    }
+
     fn finish_front_macro(&mut self) {
         self.consume_sink();
         self.with_draw_manager(|draw_manager, this| draw_manager.draw_deferred(this));
@@ -5468,6 +5502,7 @@ impl EngineInterface for Maxwell3D {
             "Invalid Maxwell3D register 0x{:X}, increase Regs::NUM_REGS",
             method
         );
+        self.flush_deferred_instances_before(method);
 
         if crate::nx2_profile::enabled() {
             use crate::nx2_profile::{add, Counter};
@@ -5520,6 +5555,7 @@ impl EngineInterface for Maxwell3D {
 
         match method {
             m if m >= CB_DATA_BASE && m < CB_DATA_END => {
+                self.flush_deferred_instances_before(method);
                 self.process_cb_multi_data(&base_start[..amount]);
             }
             INLINE_DATA => {

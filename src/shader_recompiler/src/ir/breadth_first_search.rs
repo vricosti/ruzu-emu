@@ -7,7 +7,7 @@
 //! Used by optimization passes to find specific instruction patterns
 //! by traversing arguments.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use super::instruction::Inst;
 use super::opcodes::Opcode;
@@ -42,7 +42,13 @@ where
         return None;
     }
 
-    let mut visited = Vec::with_capacity(2);
+    // Upstream keeps `visited` in a small_vector and searches it linearly.
+    // A search that fails walks every reachable instruction, and Mario Kart
+    // World's 28,000-instruction compute shaders run one such search per
+    // global memory access: the linear lookup held the GPU thread for
+    // seconds per shader. A hash set gives the same membership answers, so
+    // the visiting order is unchanged.
+    let mut visited = HashSet::with_capacity(2);
     let mut queue = VecDeque::from([inst_recursive(program, value)?]);
 
     while let Some(inst_ref) = queue.pop_front() {
@@ -60,8 +66,7 @@ where
             let Some(arg_ref) = inst_recursive(program, arg) else {
                 continue;
             };
-            if !visited.contains(&arg_ref) {
-                visited.push(arg_ref);
+            if visited.insert(arg_ref) {
                 queue.push_back(arg_ref);
             }
         }

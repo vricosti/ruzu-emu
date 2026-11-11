@@ -1278,6 +1278,8 @@ impl INx2Vi2Session {
             .expect("VI requires perf stats");
         stats.end_system_frame();
         stats.begin_system_frame();
+        // NX2 session extension: pace the guest counter by the present rate.
+        self.system.get().core_timing().notify_frame_presented();
     }
 
     fn capture_frame(&self, presents: u64) {

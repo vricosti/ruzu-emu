@@ -349,6 +349,16 @@ pub fn emit_shuffle_index(
     let thread_id = emit_lane_id(ctx);
     let min_thread_id = compute_min_thread_id(ctx, thread_id, segmentation_mask);
     let max_thread_id = compute_max_thread_id(ctx, min_thread_id, clamp, not_seg_mask);
+    // Divergence from upstream, which uses the index register unmasked. The
+    // source lane of SHFL.IDX is a five-bit field: an index of -1, which
+    // guest code produces for "no such lane", selects lane 31 and is then
+    // rejected by a clamp below 31. Unmasked, the signed comparison accepts
+    // -1 and `OpGroupNonUniformShuffle` is given an out-of-range invocation.
+    let lane_mask = ctx.constant_u32(31);
+    let index = ctx
+        .builder
+        .bitwise_and(ctx.u32_type, None, index, lane_mask)
+        .unwrap();
     let lhs = ctx
         .builder
         .bitwise_and(ctx.u32_type, None, index, not_seg_mask)
@@ -557,4 +567,92 @@ pub fn emit_quad_swap(ctx: &mut SpirvEmitContext, value: Word, direction: Word) 
     ctx.builder
         .group_non_uniform_shuffle_xor(ctx.u32_type, None, scope, value, xor_mask)
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::backend::spirv::spirv_emit_context::SpirvEmitContext;
+    use crate::ir::basic_block::Block;
+    use crate::ir::instruction::Inst;
+    use crate::ir::types::ShaderStage;
+    use crate::ir::value::{InstRef, Value};
+    use crate::ir::{Opcode, Program, SyntaxNode};
+    use crate::profile::Profile;
+    use crate::runtime_info::RuntimeInfo;
+    use rspirv::dr::Operand;
+    use rspirv::spirv;
+    use std::collections::HashMap;
+
+    /// SHFL.IDX takes its source lane from five bits of the index register:
+    /// -1 means lane 31, which a clamp of 30 then rejects. The shuffle must
+    /// never be handed the unmasked index.
+    #[test]
+    fn shuffle_index_masks_the_source_lane_to_five_bits() {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        let block = program.block_mut(0);
+        let lane = block.append_inst(Inst::new(Opcode::LaneId, vec![]));
+        let lane = Value::Inst(InstRef { block: 0, inst: lane });
+        let index = block.append_inst(Inst::new(Opcode::ISub32, vec![lane, Value::ImmU32(1)]));
+        let index = Value::Inst(InstRef { block: 0, inst: index });
+        block.append_inst(Inst::new(
+            Opcode::ShuffleIndex,
+            vec![lane, index, Value::ImmU32(30), Value::ImmU32(0)],
+        ));
+        program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+        crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+
+        let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
+        ctx.emit_program(&program);
+        let module = ctx.builder.module_ref();
+        let thirty_one = module
+            .types_global_values
+            .iter()
+            .find(|inst| {
+                inst.class.opcode == spirv::Op::Constant
+                    && inst.operands.first() == Some(&Operand::LiteralBit32(31))
+            })
+            .and_then(|inst| inst.result_id)
+            .expect("the lane mask constant must exist");
+        let instructions: Vec<_> = module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .collect();
+        let by_result: HashMap<_, _> = instructions
+            .iter()
+            .filter_map(|inst| inst.result_id.map(|id| (id, *inst)))
+            .collect();
+        let shuffle = instructions
+            .iter()
+            .find(|inst| inst.class.opcode == spirv::Op::GroupNonUniformShuffle)
+            .expect("SHFL.IDX must emit a subgroup shuffle");
+        let Operand::IdRef(source) = shuffle.operands[2] else {
+            panic!("the shuffle source must be an id");
+        };
+        // Walk the source lane back through the segmentation logic to the mask.
+        let mut pending = vec![source];
+        let mut masked = false;
+        while let Some(id) = pending.pop() {
+            let Some(inst) = by_result.get(&id) else { continue };
+            if !matches!(inst.class.opcode, spirv::Op::BitwiseAnd | spirv::Op::BitwiseOr) {
+                continue;
+            }
+            let ids: Vec<_> = inst
+                .operands
+                .iter()
+                .filter_map(|operand| match operand {
+                    Operand::IdRef(id) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            if inst.class.opcode == spirv::Op::BitwiseAnd && ids.contains(&thirty_one) {
+                masked = true;
+                break;
+            }
+            pending.extend(ids);
+        }
+        assert!(masked, "the shuffle source lane is not masked to five bits");
+    }
 }

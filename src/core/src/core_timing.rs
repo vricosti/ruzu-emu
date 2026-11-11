@@ -53,6 +53,138 @@ fn get_next_tick_count(use_custom_ticks: bool, configured_ticks: u32, next_ticks
     }
 }
 
+/// Guest CNTPCT ticks per millisecond (19.2 MHz counter).
+const CNTPCT_TICKS_PER_MS: u64 = wall_clock::CNTFRQ / 1000;
+
+/// NX2 session extension, not present upstream: adaptive pacing of the guest
+/// counter while the session presents far below real time.
+///
+/// Mario Kart World measures its own frame time with CNTPCT. Once a frame
+/// appears to overrun its budget several times over, the title's late-frame
+/// handling drops individual objects from the main view on arbitrary frames
+/// (their shadow-pass draws stay), which shows as scenery flickering. A
+/// console never reaches that regime; an emulated session presenting at
+/// 15-20 FPS is permanently in it. Eden's `sync_core_speed` divides CNTPCT by
+/// the configured speed limit for the same class of problem, but that factor
+/// is static. This paces the counter by the measured present interval instead:
+/// below `ENGAGE_MS` per frame the counter advances so that one presented
+/// frame appears to last `target_ms`; at or above real time it is untouched.
+///
+/// The mapping is piecewise linear and rebased at every rate change, so the
+/// paced counter stays continuous and monotonic and never runs ahead of the
+/// raw one. Kernel timers and sleeps keep running on the host clock, exactly
+/// as with `sync_core_speed`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ClockPacing {
+    anchor_raw: u64,
+    anchor_paced: u64,
+    /// Paced ticks per raw tick, in 1/65536 units; `RATE_ONE` is real time.
+    rate: u32,
+    last_present_raw: Option<u64>,
+    /// Smoothed raw ticks between two presents; 0 until the first interval.
+    smoothed_frame_ticks: u64,
+    engaged: bool,
+}
+
+impl ClockPacing {
+    const RATE_ONE: u32 = 1 << 16;
+    /// Slowest pacing: one sixteenth of real time.
+    const RATE_MIN: u32 = Self::RATE_ONE / 16;
+    /// Pacing starts above this smoothed present interval (below ~28 FPS)...
+    const ENGAGE_MS: u64 = 36;
+    /// ...and stops once the session is back under it (30 FPS and faster).
+    const RELEASE_MS: u64 = 33;
+    /// Present intervals longer than this are pauses or loads, not frames.
+    const IGNORE_MS: u64 = 500;
+    /// Apparent duration of one presented frame while pacing.
+    pub(crate) const DEFAULT_TARGET_MS: u64 = 25;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            anchor_raw: 0,
+            anchor_paced: 0,
+            rate: Self::RATE_ONE,
+            last_present_raw: None,
+            smoothed_frame_ticks: 0,
+            engaged: false,
+        }
+    }
+
+    /// Paced counter value for a raw counter value.
+    pub(crate) fn paced(&self, raw: u64) -> u64 {
+        let elapsed = raw.saturating_sub(self.anchor_raw);
+        self.anchor_paced
+            .wrapping_add(((elapsed as u128 * self.rate as u128) >> 16) as u64)
+    }
+
+    fn set_rate(&mut self, raw: u64, rate: u32) {
+        if rate == self.rate {
+            return;
+        }
+        self.anchor_paced = self.paced(raw);
+        self.anchor_raw = raw.max(self.anchor_raw);
+        self.rate = rate;
+    }
+
+    /// Account one presented frame at raw counter value `raw`.
+    pub(crate) fn frame_presented(&mut self, raw: u64, target_ms: u64) {
+        let Some(last) = self.last_present_raw.replace(raw) else {
+            return;
+        };
+        let interval = raw.saturating_sub(last);
+        if interval == 0 || interval > Self::IGNORE_MS * CNTPCT_TICKS_PER_MS {
+            return;
+        }
+        self.smoothed_frame_ticks = if self.smoothed_frame_ticks == 0 {
+            interval
+        } else {
+            (self.smoothed_frame_ticks * 3 + interval) / 4
+        };
+        let smoothed = self.smoothed_frame_ticks;
+        if smoothed > Self::ENGAGE_MS * CNTPCT_TICKS_PER_MS {
+            self.engaged = true;
+        } else if smoothed < Self::RELEASE_MS * CNTPCT_TICKS_PER_MS {
+            self.engaged = false;
+        }
+        let rate = if self.engaged {
+            let target = target_ms * CNTPCT_TICKS_PER_MS;
+            ((target as u128 * Self::RATE_ONE as u128) / smoothed as u128)
+                .clamp(Self::RATE_MIN as u128, Self::RATE_ONE as u128) as u32
+        } else {
+            Self::RATE_ONE
+        };
+        self.set_rate(raw, rate);
+    }
+
+    /// Return to real time, keeping the counter continuous.
+    pub(crate) fn release(&mut self, raw: u64) {
+        self.set_rate(raw, Self::RATE_ONE);
+        self.last_present_raw = None;
+        self.smoothed_frame_ticks = 0;
+        self.engaged = false;
+    }
+}
+
+/// `RUZU_NX2_CLOCK_PACING=0` disables the NX2 counter pacing;
+/// `RUZU_NX2_CLOCK_PACING_MS=<8..=33>` overrides the apparent frame duration.
+fn nx2_clock_pacing_target_ms() -> Option<u64> {
+    static TARGET: OnceLock<Option<u64>> = OnceLock::new();
+    *TARGET.get_or_init(|| {
+        if std::env::var_os("RUZU_NX2_CLOCK_PACING")
+            .is_some_and(|value| value.to_string_lossy().starts_with('0'))
+        {
+            return None;
+        }
+        Some(
+            std::env::var("RUZU_NX2_CLOCK_PACING_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|ms| (8..=33).contains(ms))
+                .unwrap_or(ClockPacing::DEFAULT_TARGET_MS),
+        )
+    })
+}
+
 /// A callback that may be scheduled for a particular core timing event.
 /// Returns an optional reschedule time in nanoseconds.
 pub type TimedCallback = Box<dyn Fn(i64, Duration) -> Option<Duration> + Send + Sync>;
@@ -172,6 +304,9 @@ pub struct CoreTiming {
     on_thread_init: Mutex<Option<Box<dyn Fn() + Send>>>,
 
     is_multicore: AtomicBool,
+
+    /// NX2 session counter pacing (see `ClockPacing`); real time otherwise.
+    clock_pacing: Mutex<ClockPacing>,
 }
 
 impl CoreTiming {
@@ -198,6 +333,38 @@ impl CoreTiming {
             has_started: AtomicBool::new(false),
             on_thread_init: Mutex::new(None),
             is_multicore: AtomicBool::new(false),
+            clock_pacing: Mutex::new(ClockPacing::new()),
+        }
+    }
+
+    /// One frame was presented by an NX2 session. Updates the counter pacing
+    /// from the interval since the previous present; inert for other sessions,
+    /// in single-core mode and with `RUZU_NX2_CLOCK_PACING=0`.
+    pub fn notify_frame_presented(&self) {
+        if !self.is_multicore.load(Ordering::SeqCst) {
+            return;
+        }
+        let raw = self.clock.get_cntpct() as u64;
+        let target = nx2_clock_pacing_target_ms()
+            .filter(|_| common::settings::values().use_nx2_session_policies);
+        let mut pacing = self.clock_pacing.lock();
+        // Diagnostic (RUZU_NX2_CLOCK_PACING_LOG=1): real and apparent duration
+        // of every presented frame, in microseconds.
+        static LOG: OnceLock<bool> = OnceLock::new();
+        if *LOG.get_or_init(|| std::env::var_os("RUZU_NX2_CLOCK_PACING_LOG").is_some()) {
+            if let Some(last) = pacing.last_present_raw {
+                let to_us = |ticks: u64| ticks * 1000 / CNTPCT_TICKS_PER_MS;
+                log::warn!(
+                    "clock pacing: frame real {} us apparent {} us rate {}/65536",
+                    to_us(raw.saturating_sub(last)),
+                    to_us(pacing.paced(raw).saturating_sub(pacing.paced(last))),
+                    pacing.rate
+                );
+            }
+        }
+        match target {
+            Some(target_ms) => pacing.frame_presented(raw, target_ms),
+            None => pacing.release(raw),
         }
     }
 
@@ -469,7 +636,8 @@ impl CoreTiming {
     /// Returns the current CNTPCT tick value.
     pub fn get_clock_ticks(&self) -> u64 {
         let raw_ticks = if self.is_multicore.load(Ordering::SeqCst) {
-            self.clock.get_cntpct() as u64
+            // Identity unless an NX2 session is presenting below real time.
+            self.clock_pacing.lock().paced(self.clock.get_cntpct() as u64)
         } else {
             wall_clock::cpu_tick_to_cntpct(self.state.lock().cpu_ticks)
         };
@@ -667,6 +835,83 @@ mod tests {
         assert_eq!(scale_clock_ticks(1020, 1734, false, 100), 1734);
         assert_eq!(scale_clock_ticks(1020, 1020, true, 50), 2040);
         assert_eq!(scale_clock_ticks(1020, 1020, true, 200), 510);
+    }
+
+    #[test]
+    fn clock_pacing_is_identity_at_real_time_and_until_the_second_present() {
+        let mut pacing = ClockPacing::new();
+        assert_eq!(pacing.paced(123_456), 123_456);
+        let frame = 16 * CNTPCT_TICKS_PER_MS;
+        for index in 0..20u64 {
+            pacing.frame_presented(index * frame, ClockPacing::DEFAULT_TARGET_MS);
+            assert_eq!(pacing.paced(index * frame + 7), index * frame + 7);
+        }
+        // 30 FPS is inside the hysteresis band and never engages either.
+        let mut pacing = ClockPacing::new();
+        let frame = 33 * CNTPCT_TICKS_PER_MS;
+        for index in 0..20u64 {
+            pacing.frame_presented(index * frame, ClockPacing::DEFAULT_TARGET_MS);
+        }
+        assert_eq!(pacing.paced(20 * frame), 20 * frame);
+    }
+
+    #[test]
+    fn clock_pacing_makes_a_slow_frame_appear_to_last_the_target() {
+        let mut pacing = ClockPacing::new();
+        let frame = 60 * CNTPCT_TICKS_PER_MS;
+        let mut previous = 0;
+        for index in 0..40u64 {
+            let raw = index * frame;
+            let before = pacing.paced(raw);
+            pacing.frame_presented(raw, 25);
+            // Rebasing never moves the counter, and it never runs backwards.
+            assert_eq!(pacing.paced(raw), before);
+            assert!(before >= previous);
+            previous = before;
+        }
+        let apparent = pacing.paced(40 * frame) - pacing.paced(39 * frame);
+        let target = 25 * CNTPCT_TICKS_PER_MS;
+        assert!(apparent.abs_diff(target) <= target / 100, "apparent {apparent} target {target}");
+        // Never ahead of the raw counter.
+        assert!(pacing.paced(40 * frame) <= 40 * frame);
+    }
+
+    #[test]
+    fn clock_pacing_clamps_releases_and_ignores_pauses() {
+        // A 2 s present interval is a load or a pause, not a frame.
+        let mut pacing = ClockPacing::new();
+        pacing.frame_presented(0, 25);
+        pacing.frame_presented(2000 * CNTPCT_TICKS_PER_MS, 25);
+        assert_eq!(pacing, {
+            let mut expected = ClockPacing::new();
+            expected.last_present_raw = Some(2000 * CNTPCT_TICKS_PER_MS);
+            expected
+        });
+
+        // 400 ms frames would need 1/16 of real time; the rate is clamped there.
+        let mut pacing = ClockPacing::new();
+        let frame = 480 * CNTPCT_TICKS_PER_MS;
+        for index in 0..30u64 {
+            pacing.frame_presented(index * frame, 25);
+        }
+        assert_eq!(pacing.rate, ClockPacing::RATE_MIN);
+
+        // Back at full speed the pacing releases and the counter keeps its
+        // offset: it continues at real time from where it was.
+        let start = 30 * frame;
+        let fast = 16 * CNTPCT_TICKS_PER_MS;
+        for index in 0..40u64 {
+            pacing.frame_presented(start + index * fast, 25);
+        }
+        assert_eq!(pacing.rate, ClockPacing::RATE_ONE);
+        let now = start + 40 * fast;
+        assert_eq!(pacing.paced(now + 1000) - pacing.paced(now), 1000);
+        assert!(pacing.paced(now) < now);
+
+        let mut released = pacing;
+        released.release(now);
+        assert_eq!(released.paced(now), pacing.paced(now));
+        assert_eq!(released.last_present_raw, None);
     }
 
     #[test]

@@ -2740,6 +2740,12 @@ impl DrawManager {
         }
     }
 
+    /// True while instance draws issued with `InstanceId::Subsequent` are
+    /// accumulated and not yet drawn.
+    pub fn has_deferred_instances(&self) -> bool {
+        self.draw_state.draw_mode == DrawMode::Instance && self.draw_state.instance_count != 0
+    }
+
     /// Port of DrawManager::DrawDeferred. Flush before resetting the instance
     /// counter or changing topology in DrawBegin, and after macro execution.
     pub fn draw_deferred(&mut self, maxwell3d: &mut dyn Maxwell3DAccess) {

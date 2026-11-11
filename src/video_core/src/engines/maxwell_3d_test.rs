@@ -2468,7 +2468,7 @@ fn test_instance_count_resets_on_first() {
 }
 
 #[test]
-fn deferred_instances_capture_registers_at_flush() {
+fn deferred_instances_keep_the_registers_of_their_draws() {
     let mut engine = Maxwell3D::new();
     let calls = Arc::new(Mutex::new(RasterizerCalls::default()));
     let rasterizer = TestRasterizer::new(calls.clone());
@@ -2485,17 +2485,19 @@ fn deferred_instances_capture_registers_at_flush() {
     engine.write_reg(DRAW_BEGIN, 4 | (1 << 26));
     engine.write_reg(DRAW_END, 0);
 
-    // Upstream reads live registers when flushing the deferred batch, while
-    // the initial General draw was already submitted at its own END.
+    // Divergence from upstream, which reads live registers when it flushes
+    // the deferred batch at the next first draw. The hardware has drawn the
+    // instances already, so the first unrelated state write flushes the batch
+    // with the registers its draws were issued under.
     engine.write_reg(vertex + 1, 0x200);
     engine.write_reg(stream + 2, 0x2000);
     engine.write_reg(stream, (1 << 12) | 28);
     engine.write_reg(DRAW_BEGIN, 4);
     let calls = calls.lock().unwrap();
-    assert_eq!(calls.draws.iter().map(|draw| (draw.0, draw.2[1])).collect::<Vec<_>>(), [(1, 0x100), (2, 0x200)]);
+    assert_eq!(calls.draws.iter().map(|draw| (draw.0, draw.2[1])).collect::<Vec<_>>(), [(1, 0x100), (2, 0x100)]);
     assert_eq!(calls.draw_registers.iter().map(|registers| {
         (registers.vertex_streams[4].address, registers.vertex_streams[4].stride)
-    }).collect::<Vec<_>>(), [(0x1000, 44), (0x2000, 28)]);
+    }).collect::<Vec<_>>(), [(0x1000, 44), (0x1000, 44)]);
 }
 
 #[test]
@@ -5035,4 +5037,34 @@ fn same_value_state_writes_preserve_shadow_and_executable_effects() {
         assert_eq!(engine.regs[SHADOW_SCRATCH_BASE as usize], 1);
         assert!(engine.dirty.flags[flag]);
     }
+}
+
+/// Hardware draws each `Subsequent` instance as its draw is issued. A base
+/// instance restored after the last instance must not reach the batch that
+/// the draw manager accumulated.
+#[test]
+fn deferred_instances_are_drawn_before_the_base_instance_is_restored() {
+    const SUBSEQUENT: u32 = 1 << 26;
+    let mut engine = Maxwell3D::new();
+    engine.write_reg(GLOBAL_BASE_INSTANCE_INDEX, 18);
+    engine.write_reg(DRAW_BEGIN, PrimitiveTopology::Triangles as u32);
+    engine.write_reg(DRAW_END, 0);
+    for _ in 0..7 {
+        engine.write_reg(DRAW_BEGIN, PrimitiveTopology::Triangles as u32 | SUBSEQUENT);
+        engine.write_reg(DRAW_END, 0);
+    }
+    // Only the first instance has been drawn so far.
+    assert_eq!(engine.take_draw_calls().len(), 1);
+
+    engine.write_reg(GLOBAL_BASE_INSTANCE_INDEX, 0);
+    let draws = engine.take_draw_calls();
+    assert_eq!(draws.len(), 1, "the state write must flush the batch");
+    assert_eq!(draws[0].base_instance, 18);
+
+    // Nothing is left for the next first draw to flush.
+    engine.write_reg(DRAW_BEGIN, PrimitiveTopology::Triangles as u32);
+    engine.write_reg(DRAW_END, 0);
+    let draws = engine.take_draw_calls();
+    assert_eq!(draws.len(), 1);
+    assert_eq!(draws[0].base_instance, 0);
 }

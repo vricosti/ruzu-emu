@@ -14,7 +14,7 @@ use crate::ir::opcodes::Opcode;
 use crate::ir::program::{Program, ShaderInfo};
 use crate::ir::value::{InstRef, Value};
 use crate::shader_info::StorageBufferDescriptor;
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::BTreeSet;
 
 /// Address in constant buffers to the storage buffer descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -278,44 +278,34 @@ fn meets_bias(storage_buffer: StorageBufferAddr, bias: Bias) -> bool {
         && storage_buffer.offset < bias.offset_end
 }
 
+/// Port of upstream `Track`: breadth-first search for the constant-buffer read
+/// that supplies the storage buffer pointer. Upstream's `BreadthFirstSearch`
+/// visits the rightmost argument first; an address of the form
+/// `index * stride + pointer` whose index is itself read from a constant
+/// buffer resolves to the pointer only in that order.
 fn track(program: &Program, value: Value, bias: Option<Bias>) -> Option<StorageBufferAddr> {
-    let mut queue = VecDeque::from([value]);
-    let mut visited = HashSet::new();
-    while let Some(value) = queue.pop_front() {
-        let Value::Inst(inst_ref) = value else {
-            continue;
+    crate::ir::breadth_first_search::breadth_first_search(value, program, |inst: &Inst| {
+        if !matches!(inst.opcode, Opcode::GetCbufU32 | Opcode::GetCbufU32x2) {
+            return None;
+        }
+        let index = inst.args.first()?;
+        let offset = inst.args.get(1)?;
+        if !index.is_immediate() || !offset.is_immediate() {
+            return None;
+        }
+        let storage_buffer = StorageBufferAddr {
+            index: index.imm_u32(),
+            offset: offset.imm_u32(),
         };
-        if !visited.insert(inst_ref) {
-            continue;
+        let alignment = bias.map_or(8, |bias| bias.alignment);
+        if storage_buffer.offset % alignment != 0 {
+            return None;
         }
-        let inst = program.block(inst_ref.block).inst(inst_ref.inst);
-        if matches!(inst.opcode, Opcode::GetCbufU32 | Opcode::GetCbufU32x2) {
-            let Some(index) = inst.args.first() else {
-                continue;
-            };
-            let Some(offset) = inst.args.get(1) else {
-                continue;
-            };
-            if !index.is_immediate() || !offset.is_immediate() {
-                continue;
-            }
-            let storage_buffer = StorageBufferAddr {
-                index: index.imm_u32(),
-                offset: offset.imm_u32(),
-            };
-            let alignment = bias.map_or(8, |bias| bias.alignment);
-            if storage_buffer.offset % alignment != 0 {
-                continue;
-            }
-            if bias.is_some_and(|bias| !meets_bias(storage_buffer, bias)) {
-                continue;
-            }
-            return Some(storage_buffer);
+        if bias.is_some_and(|bias| !meets_bias(storage_buffer, bias)) {
+            return None;
         }
-        queue.extend(inst.args.iter().copied());
-        queue.extend(inst.phi_args.iter().map(|(_, value)| *value));
-    }
-    None
+        Some(storage_buffer)
+    })
 }
 
 fn collect_storage_buffer(program: &Program, inst_ref: InstRef, info: &mut StorageInfo) {
@@ -633,6 +623,33 @@ mod tests {
             assert_eq!(program.block(1).inst(phi).phi_args[0].1, replacement);
             assert!(program.block(0).instructions[old as usize].is_none());
         }
+    }
+
+    /// `index * stride + pointer`, both read from constant buffers at the same
+    /// depth: upstream's rightmost-first search resolves to the pointer.
+    #[test]
+    fn track_resolves_scaled_index_plus_pointer_to_the_pointer() {
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        fn append(program: &mut Program, opcode: Opcode, args: Vec<Value>) -> Value {
+            let inst = program.block_mut(0).append_inst(Inst::new(opcode, args));
+            Value::Inst(InstRef { block: 0, inst })
+        }
+        let index = append(&mut program, Opcode::GetCbufU32, vec![Value::ImmU32(1), Value::ImmU32(8)]);
+        let scaled = append(&mut program, Opcode::ShiftLeftLogical32, vec![index, Value::ImmU32(3)]);
+        let pointer_pair = append(&mut program, Opcode::GetCbufU32x2, vec![Value::ImmU32(0), Value::ImmU32(80)]);
+        let pointer = append(&mut program, Opcode::CompositeExtractU32x2, vec![pointer_pair, Value::ImmU32(0)]);
+        let address = append(&mut program, Opcode::IAdd32, vec![scaled, pointer]);
+        assert_eq!(
+            track(&program, address, None),
+            Some(StorageBufferAddr { index: 0, offset: 80 })
+        );
+        // The same operands in the other order still follow upstream's order.
+        let swapped = append(&mut program, Opcode::IAdd32, vec![pointer, scaled]);
+        assert_eq!(
+            track(&program, swapped, None),
+            Some(StorageBufferAddr { index: 1, offset: 8 })
+        );
     }
 
     #[test]

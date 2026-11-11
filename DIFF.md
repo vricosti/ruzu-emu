@@ -25892,8 +25892,7 @@ Integrated runtime validation: full cargo test -p video_core -- --test-threads=1
   measured present rate needs no setting and is the identity at real time.
 - Inert for Switch 1 sessions, in single-core mode and with
   `RUZU_NX2_CLOCK_PACING=0`. `RUZU_NX2_CLOCK_PACING_MS=<8..=33>` sets the
-  apparent frame duration; `RUZU_NX2_CLOCK_PACING_LOG=1` logs the real and
-  apparent duration of every presented frame.
+  apparent frame duration.
 
 ### Unintentional differences (to fix)
 - None known.
@@ -26032,6 +26031,18 @@ drawn black and appearing or vanishing from one frame to the next.
   empty body.
 - Like the rest of `suspend_emulation`, only the frontend application process
   is considered; upstream walks the whole process list.
+- A core is only waited on while its host thread is inside the guest fibers
+  (`KernelCore::set_core_in_guest`, set around the yield in
+  `CpuManager::run_thread_on_core`). Upstream core threads live until
+  `CpuManager::Shutdown`; here they return as soon as the guest has exited,
+  and their scheduler keeps naming the last process thread as current. The
+  GTK frontend first asks the guest to exit and only then pauses, so without
+  this the wait never ended and the window stayed on "Closing software..."
+  (regression of the first version of this wait, caught the same day).
+
+### Tests
+- `suspend_wait_sees_a_process_thread_until_its_core_switches_away`,
+  `suspend_wait_ignores_a_core_whose_host_thread_left_the_guest`.
 
 ## 2026-11-11 - BreadthFirstSearch visited set (shader_recompiler/src/ir/breadth_first_search.rs)
 

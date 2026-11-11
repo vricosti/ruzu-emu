@@ -29,9 +29,9 @@
   `nx2_video_decoder.rs`, see DIFF.md.
 - Stopping the game could freeze or take about 10 s; fixed (suspend wait,
   GPU sync wait, syncpt cancel, breadth-first search), see DIFF.md.
-- `RUZU_NX2_MESH_EXACT`, `RUZU_NX2_MESH_FINISH` and
-  `RUZU_NX2_MESH_OUTPUT_TRACE` remain in the tree but do not bear on this
-  defect.
+- The investigation switches `RUZU_NX2_MESH_EXACT`, `RUZU_NX2_MESH_FINISH`,
+  `RUZU_NX2_MESH_OUTPUT_TRACE` and `RUZU_RENDERDOC_TRIGGER` were removed from
+  the tree on 2026-11-11; the mentions below are history.
 
 ---
 
@@ -88,6 +88,8 @@ GPU accuracy High, `OpUndef` values, `REQUIRE_FULL_SUBGROUPS`, AMD subgroup
 size (driver reports max 64; pipelines request 32 via subgroup size control).
 
 ## Diagnostics in the tree (all inert unless set)
+
+The first four entries no longer exist (removed 2026-11-11).
 
 - `RUZU_NX2_MESH_EXACT=1` — always read task counts back (no speculative path).
 - `RUZU_NX2_MESH_FINISH=1` — `scheduler.finish()` after the mesh dispatches.

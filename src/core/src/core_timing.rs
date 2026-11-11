@@ -348,20 +348,6 @@ impl CoreTiming {
         let target = nx2_clock_pacing_target_ms()
             .filter(|_| common::settings::values().use_nx2_session_policies);
         let mut pacing = self.clock_pacing.lock();
-        // Diagnostic (RUZU_NX2_CLOCK_PACING_LOG=1): real and apparent duration
-        // of every presented frame, in microseconds.
-        static LOG: OnceLock<bool> = OnceLock::new();
-        if *LOG.get_or_init(|| std::env::var_os("RUZU_NX2_CLOCK_PACING_LOG").is_some()) {
-            if let Some(last) = pacing.last_present_raw {
-                let to_us = |ticks: u64| ticks * 1000 / CNTPCT_TICKS_PER_MS;
-                log::warn!(
-                    "clock pacing: frame real {} us apparent {} us rate {}/65536",
-                    to_us(raw.saturating_sub(last)),
-                    to_us(pacing.paced(raw).saturating_sub(pacing.paced(last))),
-                    pacing.rate
-                );
-            }
-        }
         match target {
             Some(target_ms) => pacing.frame_presented(raw, target_ms),
             None => pacing.release(raw),

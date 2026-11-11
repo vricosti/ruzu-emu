@@ -25964,7 +25964,8 @@ drawn black and appearing or vanishing from one frame to the next.
   instruction (clamp 30 with an index of -1) and from the result, not from
   vendor documentation. SHFL.UP, SHFL.DOWN and SHFL.BFLY are unchanged.
 - Found during the investigation and left as they are, because changing them
-  did not affect the symptom: `kepler_compute.rs` treats bit 19 of a QMD
+  did not affect the symptom (the first one was corrected afterwards, see
+  "QMD release MEMBAR_TYPE" below): `kepler_compute.rs` treats bit 19 of a QMD
   release word as a "maximum" reduction, while NVIDIA's `clc6c0qmd.h`
   (QMDV03_00) defines it as `RELEASE0_MEMBAR_TYPE`; `nx2_semaphore_mirror`
   copies releases of the second semaphore page onto the first and overwrites
@@ -26066,3 +26067,35 @@ drawn black and appearing or vanishing from one frame to the next.
   panicked the frontend thread during shutdown and the unwind blocked on a
   scheduler mutex (one stop out of ten in the stop series). The registered
   action is owned by the syncpoint manager and is gone with it.
+
+## 2026-11-11 - QMD release MEMBAR_TYPE (video_core/src/engines/kepler_compute.rs)
+
+### Corrected against the vendor header
+- Word 1 of a QMD release, per NVIDIA `clc6c0qmd.h` (NVC6C0_QMDV03_00_RELEASEn):
+  bits 0-7 ADDRESS_UPPER, 19 MEMBAR_TYPE (FE_NONE / FE_SYSMEMBAR), 20-22
+  REDUCTION_OP (ADD, MIN, MAX, INC, DEC, AND, OR, XOR), 23 ENABLE, 24-25
+  REDUCTION_FORMAT, 26 REDUCTION_ENABLE, 27-28 NON_BLOCKING_INTR_TYPE,
+  29 PAYLOAD64B, 30-31 STRUCTURE_SIZE.
+- The native QMD release callback treated bit 19 without bit 26 as
+  `value = max(old, payload)`, written at the fence. Bit 19 is a memory
+  barrier request and does not change the value: such a release is now the
+  same plain payload write as a release with no flags (fenced payload query).
+  Only REDUCTION_ENABLE selects a read-modify-write, and the scheduler still
+  accepts RED_ADD alone.
+
+### Consequence
+- A release carrying FE_SYSMEMBAR can now lower the word it writes. With the
+  old reading, a payload smaller than the current content was dropped.
+- Measured on Mario Kart World's intro cinematic: same frame pacing, no
+  semaphore or fence timeout, picture unchanged. The blink metric varied more
+  between two runs of the same build than between builds, so no effect on
+  the scenery can be claimed either way.
+
+### Missing items
+- Reductions other than RED_ADD (a real RED_MAX is REDUCTION_ENABLE with
+  REDUCTION_OP = 2) are still rejected as "unsupported QMD release format".
+- The memory barrier itself is not modelled.
+
+### Tests
+- `native_method_routing_runs_shared_macros_qmd_and_fenced_releases`: the
+  bit 19 release is expected as a plain payload write.

@@ -1089,21 +1089,25 @@ impl KeplerCompute {
                     }, crate::native_qmd::FlaggedRelease(|address:u64,payload:u32,flags:u32| {
                         if !memory.lock().is_fully_mapped_range(address,4) {return false;}
                         let rasterizer=unsafe{rasterizer.as_mut()};
-                        if flags&(1<<26)!=0 || flags&(1<<19)!=0 {
+                        // NVC6C0_QMDV03_00_RELEASEn word 1 (clc6c0qmd.h): bit 19 is
+                        // MEMBAR_TYPE (FE_SYSMEMBAR), a memory barrier ahead of the
+                        // release write; it does not change the value written. Only
+                        // REDUCTION_ENABLE (bit 26) selects a reduction, and the
+                        // scheduler accepts RED_ADD alone. Bit 19 used to be read
+                        // here as a max reduction.
+                        if flags&(1<<26)!=0 {
                             let memory=Arc::clone(&memory);
                             rasterizer.signal_fence(Box::new(move || {
                                 let mut mm=memory.lock();
                                 let old=mm.read::<u32>(address);
-                                let value=if flags&(1<<26)!=0 {old.wrapping_add(payload)} else {old.max(payload)};
+                                let value=old.wrapping_add(payload);
                                 mm.write::<u32>(address,value);
                                 let cpu=mm.gpu_to_cpu_address(address); drop(mm);
                                 if let Some(cpu)=cpu {crate::nx2::Nx2SemaphoreWaiters::get().on_write(cpu,value);}
-                                if flags&(1<<26)!=0 {
-                                    static WATCH:OnceLock<u64>=OnceLock::new();
-                                    let watch=*WATCH.get_or_init(||std::env::var("EDEN_NX2_SEM_WATCH").ok().and_then(|v|std::ffi::CString::new(v).ok()).map_or(0,|v|unsafe{libc::strtoull(v.as_ptr(),std::ptr::null_mut(),16) as u64}));
-                                    if watch!=0 && address&!0xf==watch {log::info!("Semaphore watch: QMD release add {address:#x} -> {value:#x}");}
-                                    trace_native_query(1,asid,address,cpu.unwrap_or(0),0,value as u64,1<<26);
-                                }
+                                static WATCH:OnceLock<u64>=OnceLock::new();
+                                let watch=*WATCH.get_or_init(||std::env::var("EDEN_NX2_SEM_WATCH").ok().and_then(|v|std::ffi::CString::new(v).ok()).map_or(0,|v|unsafe{libc::strtoull(v.as_ptr(),std::ptr::null_mut(),16) as u64}));
+                                if watch!=0 && address&!0xf==watch {log::info!("Semaphore watch: QMD release add {address:#x} -> {value:#x}");}
+                                trace_native_query(1,asid,address,cpu.unwrap_or(0),0,value as u64,1<<26);
                             }));
                         } else {
                             static WATCH:OnceLock<u64>=OnceLock::new();
@@ -2319,22 +2323,21 @@ mod tests {
         engine.memory_manager.lock().write::<u32>(0x7804, 2);
         engine.call_method(0xb0, 3, true);
         assert_eq!(rasterizer.dispatches.get(), 1);
-        assert_eq!(rasterizer.pending_fences.borrow().len(), 2);
-        assert_eq!(rasterizer.queries.borrow().last().unwrap().0, 0x7808);
-        assert_eq!(rasterizer.queries.borrow().last().unwrap().3, 99);
+        // Only the REDUCTION_ENABLE release is deferred as a read-modify-write.
+        // The MEMBAR_TYPE (bit 19) release is a plain payload write, like the
+        // release with no flags.
+        assert_eq!(rasterizer.pending_fences.borrow().len(), 1);
+        {
+            let queries = rasterizer.queries.borrow();
+            let plain: Vec<_> = queries.iter().rev().take(2).map(|query| (query.0, query.3)).collect();
+            assert_eq!(plain, [(0x7808, 99), (0x7804, 4)]);
+        }
         engine.memory_manager.lock().write::<u32>(0x7800, 10);
-        engine.memory_manager.lock().write::<u32>(0x7804, 9);
         let waiters = crate::nx2::Nx2SemaphoreWaiters::get();
         waiters.add(
             0xc001,
             0x7800,
             17,
-            crate::nx2::Nx2SemaphoreWaiters::ACQUIRE_EQUAL,
-        );
-        waiters.add(
-            0xc002,
-            0x7804,
-            9,
             crate::nx2::Nx2SemaphoreWaiters::ACQUIRE_EQUAL,
         );
         loop {
@@ -2345,9 +2348,7 @@ mod tests {
             fence();
         }
         assert_eq!(engine.memory_manager.lock().read::<u32>(0x7800), 17);
-        assert_eq!(engine.memory_manager.lock().read::<u32>(0x7804), 9);
         assert!(waiters.latched(0xc001));
-        assert!(waiters.latched(0xc002));
         waiters.remove(0xc001);
         waiters.remove(0xc002);
         // Inline upload keeps the original AD across its optional recursive dispatch.

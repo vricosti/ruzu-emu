@@ -11,7 +11,10 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
 use objc2_metal::{
+    MTLBuffer, MTLCommandEncoder, MTLDevice, MTLResourceOptions,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCullMode, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLScissorRect, MTLSize, MTLViewport, MTLWinding,
 };
@@ -101,6 +104,8 @@ pub enum MetalRasterizerError {
     Tessellation(#[from] MetalTessellationPipelineError),
     #[error(transparent)]
     Assembly(#[from] MetalPrimitiveAssemblyError),
+    #[error("Metal could not allocate {0} bytes of compute shared-memory storage")]
+    ComputeSharedMemoryAllocation(usize),
     #[error("native geometry indirect input requires GPU draw-argument expansion")]
     GeometryIndirectInput,
     #[error("native tessellation indirect input requires GPU draw-argument expansion")]
@@ -289,6 +294,15 @@ fn bind_stage(
                 encoder.setFragmentBytes_length_atIndex(pointer, bytes.len(), *index as usize);
             }
         }
+        if let Some((index, limits)) = stage.storage_limits.as_ref().filter(|(_, limits)| !limits.is_empty()) {
+            let pointer = NonNull::new(limits.as_ptr() as *mut c_void).unwrap();
+            let length = std::mem::size_of_val(limits.as_slice());
+            if vertex {
+                encoder.setVertexBytes_length_atIndex(pointer, length, *index as usize);
+            } else {
+                encoder.setFragmentBytes_length_atIndex(pointer, length, *index as usize);
+            }
+        }
     }
 }
 
@@ -429,6 +443,11 @@ pub struct MetalRasterizer {
     query_cache_runtime: QueryCacheRuntime,
     conditional_arguments_pass: ConditionalRenderingArgumentsPass,
     conditional_direct_arguments: ConditionalDirectArguments,
+    /// Scratch storage for compute shared memory above Metal's threadgroup
+    /// limit. Grow-only; compute passes on the queue execute in order and
+    /// shared memory has no contents across dispatches, so one buffer serves
+    /// every dispatch.
+    compute_shared_memory: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     state_tracker: MetalStateTracker,
     fence_manager: MetalFenceManager,
     blit_image: Box<MetalBlitHelper>,
@@ -498,6 +517,7 @@ impl MetalRasterizer {
             query_cache,
             query_cache_runtime,
             conditional_arguments_pass,
+            compute_shared_memory: None,
             conditional_direct_arguments: ConditionalDirectArguments::default(),
             state_tracker,
             fence_manager,
@@ -1712,6 +1732,78 @@ impl MetalRasterizer {
         };
         let pipeline_state = pipeline.retained_state();
 
+        // Shared memory above the threadgroup limit lives in a device buffer
+        // with one slice per threadgroup (see `MslBindingLayout`).
+        let shared_memory = {
+            let layout = pipeline.shader().bindings();
+            match (layout.shared_memory_buffer_index, layout.shared_memory_grid_buffer_index) {
+                (Some(storage_index), Some(grid_index)) => {
+                    let grid = match dispatch.indirect_compute_address {
+                        // The slice count must be known when encoding. The
+                        // indirect arguments are read from guest memory; a
+                        // grid written by an earlier GPU pass and not yet
+                        // downloaded would be stale here.
+                        Some(address) => {
+                            let mut words = [0u8; 12];
+                            memory_manager.lock().read_block_unsafe(address, &mut words);
+                            [0, 4, 8].map(|at| u32::from_le_bytes(words[at..at + 4].try_into().unwrap()))
+                        }
+                        None => {
+                            let grid = &dispatch.launch_description;
+                            [grid.grid_dim_x, grid.grid_dim_y, grid.grid_dim_z]
+                        }
+                    };
+                    let threadgroups = grid.iter().fold(1usize, |total, value| {
+                        total.saturating_mul((*value).max(1) as usize)
+                    });
+                    let length = threadgroups
+                        .saturating_mul(layout.shared_memory_words as usize)
+                        .saturating_mul(4);
+                    let reusable = self
+                        .compute_shared_memory
+                        .as_ref()
+                        .is_some_and(|buffer| buffer.length() >= length);
+                    if !reusable {
+                        self.compute_shared_memory = Some(
+                            self.device
+                                .device()
+                                .newBufferWithLength_options(length, MTLResourceOptions::StorageModePrivate)
+                                .ok_or(MetalRasterizerError::ComputeSharedMemoryAllocation(length))?,
+                        );
+                    }
+                    let storage = self.compute_shared_memory.clone().expect("allocated above");
+                    Some((storage_index as usize, storage, grid_index as usize, [grid[0], grid[1], grid[2], 0]))
+                }
+                _ => None,
+            }
+        };
+        // Names the guest shader in Metal's per-encoder fault report.
+        let signpost = self.scheduler.fault_signposts().then(|| {
+            objc2_foundation::NSString::from_str(&format!(
+                "shader={:016x} workgroup={:?} smem={} indirect={}",
+                pipeline.key().unique_hash,
+                workgroup,
+                pipeline.key().shared_memory_size,
+                dispatch.indirect_compute_address.is_some(),
+            ))
+        });
+        let bind_shared_memory = |encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>| {
+            if let Some(signpost) = &signpost {
+                encoder.insertDebugSignpost(signpost);
+            }
+            if let Some((storage_index, storage, grid_index, grid)) = &shared_memory {
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(storage), 0, *storage_index);
+                    // Metal copies the bytes during the call.
+                    encoder.setBytes_length_atIndex(
+                        NonNull::new(grid.as_ptr() as *mut c_void).expect("grid pointer is non-null"),
+                        std::mem::size_of_val(grid),
+                        *grid_index,
+                    );
+                }
+            }
+        };
+
         if let Some(indirect_address) = dispatch.indirect_compute_address {
             let (buffer_id, offset) = self.common_buffer_cache.obtain_buffer(
                 indirect_address,
@@ -1732,6 +1824,7 @@ impl MetalRasterizer {
             self.scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::Guest, |encoder| unsafe {
                 encoder.setComputePipelineState(&pipeline_state);
                 bind_compute_resources(encoder, &prepared);
+                bind_shared_memory(encoder);
                 encoder.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
                     indirect_buffer.handle(),
                     offset as usize,
@@ -1753,6 +1846,7 @@ impl MetalRasterizer {
         self.scheduler.with_compute_encoder_for(super::metal_gpu_profiler::ComputeWork::Guest, |encoder| {
             encoder.setComputePipelineState(&pipeline_state);
             bind_compute_resources(encoder, &prepared);
+            bind_shared_memory(encoder);
             encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 threadgroups_per_grid,
                 threads_per_threadgroup,

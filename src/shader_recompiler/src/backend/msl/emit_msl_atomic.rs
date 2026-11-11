@@ -140,13 +140,14 @@ pub fn emit_shared_atomic(
 ) -> Result<(), MslError> {
     let offset = context.value_expression(inst.arg(0), inst_ref, 0)?;
     let value = context.value_expression(inst.arg(1), inst_ref, 1)?;
+    let space = context.shared_memory_address_space();
     let pointer = format!(
-        "reinterpret_cast<threadgroup atomic_uint*>(&smem[(({}) >> 2u)])",
+        "reinterpret_cast<{space} atomic_uint*>(&smem[(({}) >> 2u)])",
         offset
     );
     let operation = operation(inst.opcode);
     require_atomic_helpers(context, operation);
-    let expression = unsigned_atomic_expression(operation, &pointer, "threadgroup", &value);
+    let expression = unsigned_atomic_expression(operation, &pointer, space, &value);
     context.define(inst_ref, Type::U32, expression, false)
 }
 
@@ -545,6 +546,7 @@ fn global_atomic_parameters(resources: &[MslGlobalMemoryResource], value_type: &
     for index in 0..resources.len() {
         parameters.push(format!("constant uint4* global_cbuf{index}"));
         parameters.push(format!("device uint* global_ssbo{index}"));
+        parameters.push(format!("uint global_limit{index}"));
     }
     parameters.join(", ")
 }
@@ -566,7 +568,7 @@ fn define_global_route(
         "        const ulong ssbo_address = as_type<ulong>(uint2({low}, {high})) & 0x{alignment_mask:016X}ul;\n"
     ));
     source.push_str(&format!(
-        "        const ulong ssbo_end = ssbo_address + ulong({size});\n"
+        "        const ulong ssbo_end = ssbo_address + min(ulong({size}), ulong(global_limit{resource_index} - min(global_limit{resource_index}, 2u)) * 4ul);\n"
     ));
     source.push_str("        if (address >= ssbo_address && address < ssbo_end) {\n");
     source.push_str(&format!(

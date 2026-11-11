@@ -1736,7 +1736,13 @@ impl System {
             let mut settings = common::settings::values_mut();
             settings.use_session_astc_recompression = self.hardware_profile == hardware_properties::NX2_PROFILE;
             settings.use_nx2_session_policies = self.hardware_profile == hardware_properties::NX2_PROFILE;
-            log::info!("Session ASTC recompression: {:?}", settings.effective_astc_recompression());
+            // Only a fallback: a renderer whose device samples ASTC natively
+            // never converts, whatever this mode says. The renderer logs which
+            // of the two applies once the device is known.
+            log::info!(
+                "Session ASTC fallback mode (used only without native ASTC): {:?}",
+                settings.effective_astc_recompression()
+            );
         }
         log::info!("Hardware profile: {:?} ({} CPU cores)", self.hardware_profile,
             self.hardware_profile.num_cpu_cores());

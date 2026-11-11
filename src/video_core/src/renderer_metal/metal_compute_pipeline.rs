@@ -102,6 +102,8 @@ pub struct MetalPreparedCompute {
     pub samplers: Vec<MetalComputeSamplerBinding>,
     pub samplers_in_argument_buffer: bool,
     pub push_constants: Option<(u32, [u8; 32])>,
+    /// Last addressable word of each storage-buffer descriptor's bound range.
+    pub storage_limits: Option<(u32, Vec<u32>)>,
     pub image_views: Vec<ImageViewInOut>,
 }
 
@@ -322,12 +324,14 @@ pub fn configure_compute_resources(
         });
         binding += 1;
     }
+    let mut storage_limits = Vec::new();
     for (index, _) in info.storage_buffers_descriptors.iter().enumerate() {
         let value = compute_buffers
             .storage_buffers
             .get(index)
             .cloned()
             .unwrap_or_else(|| null_binding(&null_buffer));
+        storage_limits.push(super::metal_buffer_cache::storage_limit(&value));
         declarations.push(DescriptorDeclaration {
             binding,
             expected_kind: MetalResourceKind::StorageBuffer,
@@ -499,6 +503,9 @@ pub fn configure_compute_resources(
     if let Some(index) = pipeline.shader().bindings().push_constant_buffer_index {
         prepared.push_constants = Some((index, make_push_constants(info, &rescaling)));
     }
+    if let Some(index) = pipeline.shader().bindings().storage_limits_buffer_index {
+        prepared.storage_limits = Some((index, storage_limits));
+    }
     prepared.image_views = handles.views;
     Ok(prepared)
 }
@@ -525,6 +532,11 @@ pub fn bind_compute_resources(
             let pointer = NonNull::new(bytes.as_ptr() as *mut c_void)
                 .expect("compute push-constant pointer is non-null");
             encoder.setBytes_length_atIndex(pointer, bytes.len(), *index as usize);
+        }
+        if let Some((index, limits)) = prepared.storage_limits.as_ref().filter(|(_, limits)| !limits.is_empty()) {
+            let pointer = NonNull::new(limits.as_ptr() as *mut c_void)
+                .expect("storage-limit pointer is non-null");
+            encoder.setBytes_length_atIndex(pointer, std::mem::size_of_val(limits.as_slice()), *index as usize);
         }
     }
 }

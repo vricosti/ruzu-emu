@@ -11,7 +11,10 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSCopying;
+use objc2_foundation::{NSArray, NSString};
 use objc2_metal::{
+    MTLCommandBufferDescriptor, MTLCommandBufferEncoderInfo, MTLCommandBufferEncoderInfoErrorKey,
+    MTLCommandBufferErrorOption, MTLCommandEncoderErrorState,
     MTLBlitCommandEncoder, MTLBlitPassDescriptor, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePassDescriptor,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLSamplerState,
@@ -61,6 +64,10 @@ pub struct MetalScheduler {
     active_stage_samples: Option<StageSamples>,
     non_render_serial: u64,
     command_journal: Option<Arc<CommandJournal>>,
+    last_draw_signpost: Option<[u64; 6]>,
+    /// `RUZU_METAL_FAULT_SIGNPOSTS=1`: tag draws and compute work so a failed
+    /// command buffer names the guest shaders of the faulted encoder.
+    fault_signposts: bool,
     active_workload: Option<CommandWorkload>,
     pass_dump: Option<super::metal_pass_dump::MetalPassDump>,
 }
@@ -183,6 +190,8 @@ impl MetalScheduler {
             active_stage_samples: None,
             non_render_serial: 0,
             command_journal: CommandJournal::from_environment(),
+            last_draw_signpost: None,
+            fault_signposts: std::env::var_os("RUZU_METAL_FAULT_SIGNPOSTS").is_some(),
             active_workload: None,
             pass_dump: super::metal_pass_dump::MetalPassDump::from_environment(),
         }
@@ -196,7 +205,11 @@ impl MetalScheduler {
                 "allocation_begin next_tick={} pending={} known_gpu_tick={}",
                 self.next_tick, self.in_flight.len(), self.known_gpu_tick));
         }
-        let command_buffer = self.queue.commandBuffer();
+        // Ask Metal to record per-encoder execution status so a failed buffer
+        // names the pass that faulted instead of only reporting device loss.
+        let descriptor = MTLCommandBufferDescriptor::new();
+        descriptor.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
+        let command_buffer = self.queue.commandBufferWithDescriptor(&descriptor);
         if let Some(journal) = &self.command_journal {
             journal.record(format_args!("allocation_returned object=0x{:x}",
                 command_buffer.as_deref().map_or(0, |buffer| buffer as *const _ as usize)));
@@ -276,6 +289,7 @@ impl MetalScheduler {
                 command_buffer.blitCommandEncoder()
             }
             .ok_or(MetalSchedulerError::NoBlitEncoder)?;
+            encoder.setLabel(Some(&NSString::from_str("blit")));
             self.active_encoder = Some(ActiveEncoder::Blit(encoder));
         }
         let Some(ActiveEncoder::Blit(encoder)) = self.active_encoder.as_ref() else {
@@ -300,6 +314,7 @@ impl MetalScheduler {
         if self.active_upload.is_none() {
             let command_buffer = self.begin()?;
             let encoder = command_buffer.blitCommandEncoder().ok_or(MetalSchedulerError::NoBlitEncoder)?;
+            encoder.setLabel(Some(&NSString::from_str("upload prefix")));
             self.active_upload = Some((command_buffer, encoder));
         }
         Ok(record(&self.active_upload.as_ref().unwrap().1))
@@ -337,7 +352,16 @@ impl MetalScheduler {
                 command_buffer.computeCommandEncoder()
             }
             .ok_or(MetalSchedulerError::NoComputeEncoder)?;
+            encoder.setLabel(Some(&NSString::from_str("compute")));
             self.active_encoder = Some(ActiveEncoder::Compute(encoder));
+        }
+        if let Some(ActiveEncoder::Compute(encoder)) = self.active_encoder.as_ref().filter(|_| self.fault_signposts) {
+            // One signpost per unit of work: a faulted compute encoder then
+            // lists exactly which passes it contained.
+            let caller = std::panic::Location::caller();
+            encoder.insertDebugSignpost(&NSString::from_str(&format!(
+                "{work:?} {}:{}", caller.file().rsplit('/').next().unwrap_or(""), caller.line()
+            )));
         }
         if let Some(samples) = self.active_stage_samples.as_mut() {
             samples.observe_compute(work, ended_render);
@@ -398,6 +422,8 @@ impl MetalScheduler {
                 profiled_descriptor.as_deref().unwrap_or(descriptor),
             )
             .ok_or(MetalSchedulerError::NoRenderEncoder)?;
+        encoder.setLabel(Some(&NSString::from_str("render")));
+        self.last_draw_signpost = None;
         self.active_encoder = Some(ActiveEncoder::Render(encoder));
         if let Some(dump) = self.pass_dump.as_mut() { dump.begin(descriptor); }
         Ok(())
@@ -413,9 +439,21 @@ impl MetalScheduler {
         Ok(record(encoder))
     }
 
+    pub(crate) fn fault_signposts(&self) -> bool {
+        self.fault_signposts
+    }
+
     pub(crate) fn profile_graphics_draw(
         &mut self, shaders: [u64; 6], depth: super::metal_pipeline_cache::MetalDepthStencilKey,
     ) {
+        if let Some(ActiveEncoder::Render(encoder)) = self.active_encoder.as_ref() {
+            // Name the guest shaders of each draw in Metal's fault report.
+            if self.fault_signposts && self.last_draw_signpost != Some(shaders) {
+                self.last_draw_signpost = Some(shaders);
+                encoder.insertDebugSignpost(&NSString::from_str(&format!(
+                    "vs={:016x} fs={:016x} gs={:016x}", shaders[1], shaders[5], shaders[4])));
+            }
+        }
         if matches!(self.active_encoder.as_ref(), Some(ActiveEncoder::Render(_))) {
             if let Some(dump) = self.pass_dump.as_mut() { dump.draw(shaders); }
             if let Some(workload) = self.active_workload.as_mut() {
@@ -742,6 +780,39 @@ impl MetalScheduler {
         }
     }
 
+    /// Logs every encoder Metal did not complete, with its label and the
+    /// signposts recorded into it.
+    fn log_encoder_status(error: &objc2_foundation::NSError) {
+        let user_info = error.userInfo();
+        let Some(infos) = user_info.objectForKey(unsafe { MTLCommandBufferEncoderInfoErrorKey }) else {
+            return;
+        };
+        // SAFETY: Metal documents this key's value as an array of
+        // `id<MTLCommandBufferEncoderInfo>`.
+        let infos: &NSArray<ProtocolObject<dyn MTLCommandBufferEncoderInfo>> =
+            unsafe { &*(Retained::as_ptr(&infos) as *const _) };
+        for (index, info) in infos.iter().enumerate() {
+            let state = info.errorState();
+            if state == MTLCommandEncoderErrorState::Completed {
+                continue;
+            }
+            let state = match state {
+                MTLCommandEncoderErrorState::Faulted => "FAULTED",
+                MTLCommandEncoderErrorState::Affected => "affected",
+                MTLCommandEncoderErrorState::Pending => "pending",
+                _ => "unknown",
+            };
+            // The binding declares this non-null, but Metal returns nil for
+            // an encoder that recorded no signposts.
+            let signposts: Option<Retained<NSArray<NSString>>> =
+                unsafe { objc2::msg_send![&*info, debugSignposts] };
+            let signposts: Vec<String> = signposts
+                .map(|signposts| signposts.iter().map(|signpost| signpost.to_string()).collect())
+                .unwrap_or_default();
+            log::error!("Metal encoder {index} '{}' {state}: {}", info.label(), signposts.join(" | "));
+        }
+    }
+
     fn check_completed(
         command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<(), MetalSchedulerError> {
@@ -749,9 +820,23 @@ impl MetalScheduler {
         if status == MTLCommandBufferStatus::Completed {
             return Ok(());
         }
-        let reason = command_buffer.error()
-            .map(|error| error.to_string())
+        let error = command_buffer.error();
+        if let Some(error) = &error {
+            Self::log_encoder_status(error);
+        }
+        let reason = error
+            .map(|error| format!("{error} (code {})", error.code()))
             .unwrap_or_else(|| "no driver error description".to_owned());
+        if status == MTLCommandBufferStatus::Error && reason.contains(INNOCENT_VICTIM_MARKER) {
+            // The GPU was reset because of a different command buffer (this
+            // process's or another's) and the driver discarded this one. The
+            // device and queue stay usable, so this is lost work for one
+            // submission, not device loss: retire the buffer like a completed
+            // one so the queue head advances. The buffer that caused the reset,
+            // if it is ours, reports its own error code and still aborts below.
+            log::error!("Metal command buffer discarded by a GPU reset it did not cause: {reason}");
+            return Ok(());
+        }
         if status == MTLCommandBufferStatus::Error {
             // A committed buffer the driver failed (a GPU hang, typically) is
             // Metal's device loss. Eden's `vk::Check` throws out of the Vulkan
@@ -781,6 +866,11 @@ impl Drop for MetalScheduler {
         }
     }
 }
+
+/// Metal reports a buffer discarded by someone else's GPU reset as
+/// `MTLCommandBufferErrorInternal`; only the IOGPU status in the description
+/// distinguishes it from a buffer that faulted itself.
+const INNOCENT_VICTIM_MARKER: &str = "kIOGPUCommandBufferCallbackErrorInnocentVictim";
 
 fn is_terminal_status(status: MTLCommandBufferStatus) -> bool {
     status == MTLCommandBufferStatus::Completed || status == MTLCommandBufferStatus::Error

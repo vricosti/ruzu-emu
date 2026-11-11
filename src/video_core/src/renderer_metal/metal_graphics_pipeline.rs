@@ -107,6 +107,8 @@ pub struct MetalPreparedStage {
     pub samplers: Vec<MetalStageSamplerBinding>,
     pub samplers_in_argument_buffer: bool,
     pub push_constants: Option<(u32, [u8; 32])>,
+    /// Last addressable word of each storage-buffer descriptor's bound range.
+    pub storage_limits: Option<(u32, Vec<u32>)>,
 }
 
 #[derive(Default)]
@@ -631,6 +633,7 @@ fn prepare_stage(
         uniform_cursor += 1;
         binding += 1;
     }
+    let mut storage_limits = Vec::new();
     for (storage_cursor, _) in info.storage_buffers_descriptors.iter().enumerate() {
         let value = graphics_buffers.storage_buffers[stage]
             .get(storage_cursor)
@@ -641,6 +644,7 @@ fn prepare_stage(
                 size: 4,
                 is_written: false,
             });
+        storage_limits.push(super::metal_buffer_cache::storage_limit(&value));
         declarations.push(DescriptorDeclaration {
             binding,
             expected_kind: MetalResourceKind::StorageBuffer,
@@ -824,6 +828,9 @@ fn prepare_stage(
     }
     if let Some(index) = layout.push_constant_buffer_index {
         prepared.push_constants = Some((index, make_push_constants(info, rescaling)));
+    }
+    if let Some(index) = layout.storage_limits_buffer_index {
+        prepared.storage_limits = Some((index, storage_limits));
     }
     Ok(prepared)
 }

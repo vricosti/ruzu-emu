@@ -1,5 +1,44 @@
 # Upstream parity notes
 
+## 2026-11-12 - native Metal renderer: compute storage bindings, shared memory, storage bounds, fault reporting
+
+### Intentional differences (Eden has no native MSL backend)
+- `renderer_metal/metal_buffer_cache.rs::bind_storage_buffer` honours the active binding target.
+  The common cache binds compute storage buffers through this entry point
+  (`NEEDS_BIND_STORAGE_INDEX == false`, as for Eden's Vulkan runtime); they were pushed to graphics
+  stage 0, so every compute shader ran on the 64 KiB null buffer.
+- `backend/msl`: guest compute shared memory larger than `MTLDevice.maxThreadgroupMemoryLength`
+  (32768 bytes on Apple GPUs; Mario Kart World declares 49152) cannot be a `threadgroup uint smem[]`
+  array, Metal rejects the pipeline. It is emitted as a slice of a device buffer:
+  `smem = smem_storage + linear(threadgroup_position_in_grid, smem_grid) * words`. The renderer
+  (`metal_rasterizer.rs::dispatch_compute`) binds a grow-only private scratch buffer of
+  `threadgroups * words * 4` bytes and the grid by `setBytes`. Atomics and `spvWriteSharedBits` use
+  the `device` address space and barriers add `mem_device`. For an indirect dispatch the grid is
+  read from guest memory at encode time, so a grid written by a not-yet-downloaded GPU pass is
+  stale. At or below the limit the upstream threadgroup layout is unchanged.
+- `backend/msl`: every storage-buffer access is clamped to the bound range,
+  `ssboN[min(index, storage_limits[d])]`, and the global-memory helpers shrink their guest-size
+  range to it. Eden relies on Vulkan `robustBufferAccess`; Metal has none, and an out-of-range
+  access page-faults or hangs the GPU and discards unrelated command buffers. `storage_limits` is
+  one `uint` per storage descriptor (last addressable word), bound by `setBytes` next to the push
+  constants in the compute, vertex/fragment and geometry paths.
+- `backend/msl/emit_msl_image_atomic.rs` accepts an absent (void) descriptor index like the SPIR-V
+  backend, instead of only literal zero.
+- `metal_scheduler.rs`: command buffers request `MTLCommandBufferErrorOptionEncoderExecutionStatus`;
+  on failure every non-completed encoder is logged with its label. `RUZU_METAL_FAULT_SIGNPOSTS=1`
+  also tags draws and compute dispatches with guest shader hashes. A buffer whose error is
+  `kIOGPUCommandBufferCallbackErrorInnocentVictim` (reported as `MTLCommandBufferErrorInternal`) is
+  retired as lost work instead of aborting; any other failed buffer still aborts as device loss.
+- ASTC logs: the session recompression mode is logged as a fallback, and each renderer logs whether
+  ASTC is native (the mode is inert whenever the device samples ASTC).
+
+### Unresolved
+- The NX2 task/mesh draw path exists only in the Vulkan renderer. Under Metal, Mario Kart World's
+  mesh programs are rejected ("Native graphics shader rejected ... mesh_enabled=true") and the 3D
+  scene renders black.
+- Textures with no guest view are bound as nil (Metal shader validation reports "Null texture
+  access"); Vulkan binds typed null image views. Not observed to fault.
+
 ## 2026-10-18 - native dependency tracking and GTK build guards
 
 ### Intentional differences

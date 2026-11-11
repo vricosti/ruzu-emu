@@ -3080,28 +3080,73 @@ mod tests {
             emit_msl_with_bindings(&program, &profile, &RuntimeInfo::default(), &mut bindings)
                 .unwrap();
         let source = &artifact.source.source;
-        assert!(source.contains("kernel void main0(device uint* ssbo0 [[buffer(0)]])"));
-        assert!(source.contains("extract_bits(ssbo0[0u], 8u, 8u)"));
-        assert!(source.contains("as_type<uint>(extract_bits(as_type<int>(ssbo0[0u]), 16u, 16u))"));
-        assert!(source.contains("uint v_0_2 = ssbo0[1u];"));
-        assert!(source.contains("uint2 v_0_3 = uint2(ssbo0[2u], ssbo0[3u]);"));
-        assert!(source.contains("uint4 v_0_4 = uint4(ssbo0[4u], ssbo0[5u], ssbo0[6u], ssbo0[7u]);"));
-        assert!(source.contains("spvWriteStorageBits(&ssbo0[0u], 0x000000ABu, 24u, 8u);"));
-        assert!(source.contains("spvWriteStorageBits(&ssbo0[1u], 0x0000CDEFu, 16u, 16u);"));
-        assert!(source.contains("ssbo0[1u] = 0x00000007u;"));
-        assert!(source.contains("ssbo0[2u] = v_0_3.x;"));
-        assert!(source.contains("ssbo0[7u] = v_0_4.w;"));
+        assert!(source.contains("kernel void main0(constant uint* storage_limits [[buffer(0)]], device uint* ssbo0 [[buffer(1)]])"));
+        assert!(source.contains("extract_bits(ssbo0[min(0u, storage_limits[0u])], 8u, 8u)"));
+        assert!(source.contains("as_type<uint>(extract_bits(as_type<int>(ssbo0[min(0u, storage_limits[0u])]), 16u, 16u))"));
+        assert!(source.contains("uint v_0_2 = ssbo0[min(1u, storage_limits[0u])];"));
+        assert!(source.contains("uint2 v_0_3 = uint2(ssbo0[min(2u, storage_limits[0u])], ssbo0[min(3u, storage_limits[0u])]);"));
+        assert!(source.contains("uint4 v_0_4 = uint4(ssbo0[min(4u, storage_limits[0u])], ssbo0[min(5u, storage_limits[0u])], ssbo0[min(6u, storage_limits[0u])], ssbo0[min(7u, storage_limits[0u])]);"));
+        assert!(source.contains("spvWriteStorageBits(&ssbo0[min(0u, storage_limits[0u])], 0x000000ABu, 24u, 8u);"));
+        assert!(source.contains("spvWriteStorageBits(&ssbo0[min(1u, storage_limits[0u])], 0x0000CDEFu, 16u, 16u);"));
+        assert!(source.contains("ssbo0[min(1u, storage_limits[0u])] = 0x00000007u;"));
+        assert!(source.contains("ssbo0[min(2u, storage_limits[0u])] = v_0_3.x;"));
+        assert!(source.contains("ssbo0[min(7u, storage_limits[0u])] = v_0_4.w;"));
         assert!(source.contains("atomic_compare_exchange_weak_explicit"));
         assert_eq!(bindings.unified, 7);
-        assert_eq!(artifact.bindings.buffer_count, 1);
+        assert_eq!(artifact.bindings.buffer_count, 2);
         assert_eq!(artifact.bindings.resources.len(), 1);
         assert_eq!(artifact.bindings.resources[0].binding, 5);
         assert_eq!(
             artifact.bindings.resources[0].kind,
             MslResourceKind::StorageBuffer
         );
-        assert_eq!(artifact.bindings.resources[0].buffer_index, 0);
+        // Slot 0 carries the per-descriptor bounds every access is clamped to.
+        assert_eq!(artifact.bindings.storage_limits_buffer_index, Some(0));
+        assert_eq!(artifact.bindings.resources[0].buffer_index, 1);
         assert_eq!(artifact.bindings.resources[0].count, None);
+    }
+
+    /// Guest shared memory above `maxThreadgroupMemoryLength` cannot be a
+    /// `threadgroup` array (Metal rejects the pipeline). It must move to a
+    /// device buffer sliced per threadgroup, with device-space atomics and
+    /// barriers that publish device stores.
+    #[test]
+    fn shared_memory_above_the_threadgroup_limit_uses_a_device_buffer_slice() {
+        let mut program = empty_program(Stage::Compute);
+        program.shared_memory_size = 49152;
+        program.info.uses_int8 = true;
+        let block = &mut program.blocks[0];
+        block.append_new_inst(Opcode::LoadSharedU32, vec![Value::ImmU32(4)]);
+        block.append_new_inst(
+            Opcode::WriteSharedU8,
+            vec![Value::ImmU32(3), Value::ImmU32(0xAB)],
+        );
+        block.append_new_inst(Opcode::Barrier, vec![]);
+
+        let options = MslOptions { max_threadgroup_memory_length: 32768, ..MslOptions::default() };
+        let artifact = emit_msl_with_options(
+            &program, &Profile::default(), &RuntimeInfo::default(), &options).unwrap();
+        let source = &artifact.source.source;
+        assert!(!source.contains("threadgroup uint smem"));
+        assert!(source.contains("device uint* smem_storage [[buffer(0)]]"));
+        assert!(source.contains("constant uint3& smem_grid [[buffer(1)]]"));
+        assert!(source.contains("uint3 workgroup_id [[threadgroup_position_in_grid]]"));
+        assert!(source.contains(
+            "device uint* smem = smem_storage + (workgroup_id.x + smem_grid.x * (workgroup_id.y + smem_grid.y * workgroup_id.z)) * 12288u;"
+        ));
+        assert!(source.contains("inline void spvWriteSharedBits(device uint* pointer"));
+        assert!(source.contains("threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);"));
+        assert_eq!(artifact.bindings.shared_memory_buffer_index, Some(0));
+        assert_eq!(artifact.bindings.shared_memory_grid_buffer_index, Some(1));
+        assert_eq!(artifact.bindings.shared_memory_words, 12288);
+        assert_eq!(artifact.bindings.buffer_count, 2);
+
+        // At or below the limit the upstream threadgroup layout is unchanged.
+        program.shared_memory_size = 32768;
+        let artifact = emit_msl_with_options(
+            &program, &Profile::default(), &RuntimeInfo::default(), &options).unwrap();
+        assert!(artifact.source.source.contains("threadgroup uint smem[8192];"));
+        assert_eq!(artifact.bindings.shared_memory_buffer_index, None);
     }
 
     #[test]
@@ -3188,7 +3233,7 @@ mod tests {
         let artifact = emit_msl(&program, &profile, &RuntimeInfo::default()).unwrap();
         let source = &artifact.source.source;
         assert!(source.contains(
-            "inline uint spvLoadGlobal32(ulong address, constant uint4* global_cbuf0, device uint* global_ssbo0)"
+            "inline uint spvLoadGlobal32(ulong address, constant uint4* global_cbuf0, device uint* global_ssbo0, uint global_limit0)"
         ));
         assert!(source.contains("inline uint spvLoadGlobalU8(ulong address"));
         assert!(source.contains("inline uint spvLoadGlobalS16(ulong address"));
@@ -3207,9 +3252,9 @@ mod tests {
         ));
         assert!(source.contains("ulong(global_cbuf0[17u].z)"));
         assert!(source.contains("const uint element = uint(address - ssbo_address) >> 4u;"));
-        assert!(source.contains("spvLoadGlobal32(0x0000000000001000ul, c0, ssbo0)"));
+        assert!(source.contains("spvLoadGlobal32(0x0000000000001000ul, c0, ssbo0, storage_limits[0u])"));
         assert!(source.contains("spvWriteGlobal128(0x0000000000001030ul"));
-        assert_eq!(artifact.bindings.buffer_count, 2);
+        assert_eq!(artifact.bindings.buffer_count, 3);
         assert_eq!(artifact.bindings.resources.len(), 2);
     }
 
@@ -3300,7 +3345,7 @@ mod tests {
         let source = artifact.source.source;
         assert!(source.contains("_compare = 0x00000011u;"), "{source}");
         assert!(source.contains("_replacement = 0x0000001Du;"));
-        assert!(source.contains("atomic_compare_exchange_weak_explicit(reinterpret_cast<device atomic_uint*>(&ssbo0[4u])"));
+        assert!(source.contains("atomic_compare_exchange_weak_explicit(reinterpret_cast<device atomic_uint*>(&ssbo0[min(4u, storage_limits[0u])])"));
         assert!(source.contains("&& cas_0_0_old == cas_0_0_compare"));
     }
 
@@ -3414,7 +3459,7 @@ mod tests {
         assert!(source.contains("spvAtomicInc(reinterpret_cast<threadgroup atomic_uint*>"));
         assert!(source.contains("spvAtomicDec(reinterpret_cast<threadgroup atomic_uint*>"));
         assert!(source.contains(
-            "atomic_exchange_explicit(reinterpret_cast<device atomic_uint*>(&ssbo0[2u])"
+            "atomic_exchange_explicit(reinterpret_cast<device atomic_uint*>(&ssbo0[min(2u, storage_limits[0u])])"
         ));
         assert!(source.contains("reinterpret_cast<device atomic_int*>"));
         assert!(source.contains("uint desired = expected >= limit ? 0u : expected + 1u;"));
@@ -3522,8 +3567,8 @@ mod tests {
         assert!(source.contains("ulong spv_shared_wide_0_1_original"));
         assert!(source.contains("as_type<ulong>(min(as_type<long>"));
         assert!(source.contains("as_type<uint2>(min(as_type<int2>"));
-        assert!(source.contains("ssbo0[4u] = spv_storage_wide_"));
-        assert!(source.contains("ssbo0[6u] = spv_storage_wide_"));
+        assert!(source.contains("ssbo0[min(4u, storage_limits[0u])] = spv_storage_wide_"));
+        assert!(source.contains("ssbo0[min(6u, storage_limits[0u])] = spv_storage_wide_"));
         assert!(!source.contains("atomic_ulong"));
     }
 
@@ -3787,7 +3832,7 @@ mod tests {
         assert!(artifact
             .source
             .source
-            .contains("spvLoadGlobal32(0x0000000000001000ul, c0, ssbo2)"));
+            .contains("spvLoadGlobal32(0x0000000000001000ul, c0, ssbo2, storage_limits[1u])"));
     }
 
     #[test]
@@ -3899,11 +3944,11 @@ mod tests {
         assert!(artifact
             .source
             .source
-            .contains("uint v_0_1 = ssbo0[((v_0_0) >> 2u)];"));
+            .contains("uint v_0_1 = ssbo0[min(((v_0_0) >> 2u), storage_limits[0u])];"));
         assert!(artifact
             .source
             .source
-            .contains("ssbo0[((v_0_0) >> 2u)] = 0x00000007u;"));
+            .contains("ssbo0[min(((v_0_0) >> 2u), storage_limits[0u])] = 0x00000007u;"));
     }
 
     #[test]

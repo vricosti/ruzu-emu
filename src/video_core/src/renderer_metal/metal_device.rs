@@ -315,6 +315,11 @@ impl MetalDevice {
     pub fn new() -> Result<Self, MetalDeviceError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(MetalDeviceError::NoDevice)?;
         let profile = MetalDeviceProfile::query(&device);
+        // Metal has no recompression path: the ASTC setting never applies here.
+        log::info!(
+            "ASTC textures: {} (Metal; recompression setting ignored)",
+            if profile.supports_astc_texture_compression { "native" } else { "unsupported by this GPU family" }
+        );
         let command_queue = device
             .newCommandQueue()
             .ok_or(MetalDeviceError::NoCommandQueue)?;

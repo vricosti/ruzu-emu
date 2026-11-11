@@ -80,6 +80,10 @@ pub struct MslOptions {
     /// Geometry output assembly implements the guest provoking-vertex mode;
     /// Metal's triangle-list rasterizer takes flat data from the first index.
     pub geometry_provoking_vertex_last: bool,
+    /// Metal's per-pipeline `threadgroup` storage limit in bytes
+    /// (`MTLDevice.maxThreadgroupMemoryLength`). Guest shared memory above it
+    /// cannot be a `threadgroup` array and is backed by a device buffer.
+    pub max_threadgroup_memory_length: u32,
 }
 
 impl Default for MslOptions {
@@ -93,6 +97,7 @@ impl Default for MslOptions {
             enable_point_size_builtin: true,
             disable_rasterization: false,
             geometry_provoking_vertex_last: false,
+            max_threadgroup_memory_length: u32::MAX,
         }
     }
 }
@@ -134,6 +139,21 @@ pub struct MslBindingLayout {
     /// When present, sampler_index addresses an argument-buffer member ID,
     /// not the direct sampler table. Textures and data buffers stay direct.
     pub sampler_argument_buffer_index: Option<u32>,
+    /// Buffer slot of one `uint` per storage-buffer descriptor: the last
+    /// addressable word of the bound range. Metal has no robust buffer access,
+    /// so every storage access is clamped to it; an unclamped guest offset
+    /// past the bound `MTLBuffer` faults or hangs the GPU.
+    pub storage_limits_buffer_index: Option<u32>,
+    /// Present when guest shared memory exceeds the device's `threadgroup`
+    /// limit. The renderer binds a scratch buffer of
+    /// `threadgroups * shared_memory_words * 4` bytes here; each threadgroup
+    /// addresses its own slice, so the storage keeps workgroup scope.
+    pub shared_memory_buffer_index: Option<u32>,
+    /// Buffer slot of the `uint3` threadgroup grid used to linearize
+    /// `threadgroup_position_in_grid` into the slice index.
+    pub shared_memory_grid_buffer_index: Option<u32>,
+    /// Words in one threadgroup's slice of the shared-memory buffer.
+    pub shared_memory_words: u32,
 }
 
 /// Backend output before native Metal library compilation.

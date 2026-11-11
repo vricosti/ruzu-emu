@@ -766,6 +766,8 @@ pub(crate) fn direct_msl_options(
         enable_point_size_builtin: options.enable_point_size_builtin,
         disable_rasterization: options.disable_rasterization,
         geometry_provoking_vertex_last: options.geometry_provoking_vertex_last,
+        max_threadgroup_memory_length: u32::try_from(device.maxThreadgroupMemoryLength())
+            .unwrap_or(u32::MAX),
     }
 }
 

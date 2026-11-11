@@ -70,6 +70,14 @@ pub struct MetalBufferBinding {
     pub is_written: bool,
 }
 
+/// Index of the last `uint` a shader may address through a storage-buffer
+/// binding: the bound size, never past the end of the `MTLBuffer`.
+pub(super) fn storage_limit(binding: &MetalBufferBinding) -> u32 {
+    let available = binding.buffer.length().saturating_sub(binding.offset);
+    let bytes = (binding.size as usize).min(available);
+    u32::try_from(bytes / 4).unwrap_or(u32::MAX).saturating_sub(1)
+}
+
 #[derive(Clone)]
 pub struct MetalVertexBinding {
     pub buffer: Arc<MetalBuffer>,
@@ -911,8 +919,16 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
         size: u32,
         is_written: bool,
     ) {
-        self.graphics.storage_buffers[stage]
-            .push(Self::bind_buffer(buffer, offset, size, is_written));
+        // The common cache binds compute storage buffers through this entry
+        // point too (`NEEDS_BIND_STORAGE_INDEX` is false, as for Eden's Vulkan
+        // runtime, which shares one descriptor queue), so the active target
+        // decides the destination. Sending them to graphics stage 0 left every
+        // compute shader on the null buffer.
+        let binding = Self::bind_buffer(buffer, offset, size, is_written);
+        match self.binding_target {
+            BindingTarget::Graphics => self.graphics.storage_buffers[stage].push(binding),
+            BindingTarget::Compute => self.compute.storage_buffers.push(binding),
+        }
     }
 
     fn bind_texture_buffer(

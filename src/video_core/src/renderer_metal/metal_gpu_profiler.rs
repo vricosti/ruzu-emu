@@ -76,7 +76,7 @@ impl RenderEndSites {
 }
 
 /// Bounded operation counters, not Metal pipeline labels or emulation state.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum ComputeWork {
     Other,
     Guest,

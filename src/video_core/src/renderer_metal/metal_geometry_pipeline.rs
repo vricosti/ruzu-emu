@@ -251,6 +251,13 @@ pub fn bind_vertex_resources(
                 *index as usize,
             );
         }
+        if let Some((index, limits)) = stage.storage_limits.as_ref().filter(|(_, limits)| !limits.is_empty()) {
+            encoder.setBytes_length_atIndex(
+                NonNull::new(limits.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(limits.as_slice()),
+                *index as usize,
+            );
+        }
     }
 }
 
@@ -276,6 +283,13 @@ pub fn bind_geometry_resources(
             encoder.setMeshBytes_length_atIndex(
                 NonNull::new(bytes.as_ptr() as *mut c_void).unwrap(),
                 bytes.len(),
+                *index as usize,
+            );
+        }
+        if let Some((index, limits)) = stage.storage_limits.as_ref().filter(|(_, limits)| !limits.is_empty()) {
+            encoder.setMeshBytes_length_atIndex(
+                NonNull::new(limits.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(limits.as_slice()),
                 *index as usize,
             );
         }

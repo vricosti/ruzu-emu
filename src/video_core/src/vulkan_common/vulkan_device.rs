@@ -650,13 +650,6 @@ impl Device {
                 .unwrap_or(0);
             let mut values = common::settings::values_mut();
             values.session_device_vram_bytes = if is_integrated { 0 } else { device_local_bytes };
-            if values.use_session_astc_recompression {
-                log::info!(
-                    "Session ASTC recompression with {} MiB device-local VRAM: {:?}",
-                    device_local_bytes / (1024 * 1024),
-                    values.effective_astc_recompression()
-                );
-            }
         }
 
         // Build queue create infos
@@ -1687,6 +1680,19 @@ impl Device {
             physical,
             device_features.texture_compression_astc_ldr != 0,
         );
+        // Report what textures actually get: every conversion path is gated
+        // on missing native support, so the configured mode is inert otherwise.
+        if is_optimal_astc_supported {
+            log::info!("ASTC textures: native (device samples ASTC; recompression setting ignored)");
+        } else {
+            let values = common::settings::values();
+            log::info!(
+                "ASTC textures: converted to {:?} (no native ASTC; {} MiB dedicated VRAM, session policy {})",
+                values.effective_astc_recompression(),
+                values.session_device_vram_bytes / (1024 * 1024),
+                if values.use_session_astc_recompression { "on" } else { "off" }
+            );
+        }
         let supports_d24_depth = format_properties
             .get(&vk::Format::D24_UNORM_S8_UINT)
             .is_some_and(|properties| {

@@ -3725,6 +3725,10 @@ mod rasterizer_download_tests {
             panic!("guest increment is outside this fixture");
         }
 
+        fn increment_host(&self, _id: u32) {
+            panic!("host increment is outside this fixture");
+        }
+
         fn is_ready_guest(&self, _id: u32, _expected_value: u32) -> bool {
             panic!("memory-test Host1x fixture does not model guest syncpoints")
         }

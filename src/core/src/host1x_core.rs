@@ -63,6 +63,9 @@ pub trait Host1xCoreInterface: Any + Send + Sync {
     fn get_guest_syncpoint_value(&self, id: u32) -> u32;
     /// SyncpointManager::IncrementGuest, publishing completed video frames.
     fn increment_guest(&self, id: u32);
+    /// SyncpointManager::IncrementHost, for work that is complete when it is
+    /// published (upstream pairs it with IncrementGuest in such producers).
+    fn increment_host(&self, id: u32);
     /// Direct bridge to SyncpointManager::IsReadyGuest (acquire load, unsigned >=).
     fn is_ready_guest(&self, id: u32, expected_value: u32) -> bool;
     fn wait_host(&self, id: u32, expected_value: u32);

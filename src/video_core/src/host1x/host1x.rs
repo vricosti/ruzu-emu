@@ -390,6 +390,10 @@ impl Host1xCoreInterface for Host1x {
         self.syncpoint_manager.increment_guest(id);
     }
 
+    fn increment_host(&self, id: u32) {
+        self.syncpoint_manager.increment_host(id);
+    }
+
     fn is_ready_guest(&self, id: u32, expected_value: u32) -> bool {
         self.syncpoint_manager.is_ready_guest(id, expected_value)
     }
@@ -688,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn nx2_syncpt_slot_reuse_cancels_clears_and_signals_on_guest_progress() {
+    fn nx2_syncpt_slot_reuse_cancels_clears_and_signals_on_host_progress() {
         use ruzu_core::core::{System, SystemRef};
         use ruzu_core::hle::kernel::k_process::{KProcess, ProcessLock};
         use ruzu_core::hle::kernel::k_thread::{KThread, KThreadLock};
@@ -720,21 +724,23 @@ mod tests {
         assert!(event.lock().unwrap().is_signaled());
         request(201, &[7, !3, 1, 0, 0]);
         assert!(!event.lock().unwrap().is_signaled());
-        host.syncpoint_manager().increment_host(3);
-        assert!(!event.lock().unwrap().is_signaled());
+        // Submitted (guest) progress alone neither signals nor is reported.
         host.syncpoint_manager().increment_guest(3);
+        assert!(!event.lock().unwrap().is_signaled());
+        assert_eq!(&request(103, &[!3]).command_buffer()[2..6], &[0, 0, 0, 0]);
+        host.syncpoint_manager().increment_host(3);
         assert!(event.lock().unwrap().is_signaled());
         assert_eq!(&request(103, &[!3]).command_buffer()[2..6], &[0, 1, 0, 0]);
         request(201, &[7, !3, 2, 0, 0]);
         request(202, &[7]);
         request(201, &[7, !3, 3, 0, 0]);
-        host.syncpoint_manager().increment_guest(3); // canceled target2 must not signal
+        host.syncpoint_manager().increment_host(3); // canceled target2 must not signal
         assert!(!event.lock().unwrap().is_signaled());
-        host.syncpoint_manager().increment_guest(3);
+        host.syncpoint_manager().increment_host(3);
         assert!(event.lock().unwrap().is_signaled());
         request(201, &[7, !3, 4, 0, 0]);
         drop(service); // unregister pending callback before closing event
-        host.syncpoint_manager().increment_guest(3);
+        host.syncpoint_manager().increment_host(3);
         assert!(!event.lock().unwrap().is_signaled());
         system.kernel_mut().unwrap().shutdown();
     }

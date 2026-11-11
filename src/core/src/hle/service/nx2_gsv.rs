@@ -274,7 +274,7 @@ impl INx2SyncptSession {
                 .get()
                 .host1x_core()
                 .expect("syncpt requires Host1x")
-                .get_guest_syncpoint_value(syncpoint) as u64
+                .get_host_syncpoint_value(syncpoint) as u64
         } else {
             0
         };
@@ -354,7 +354,7 @@ impl INx2SyncptSession {
             .get()
             .host1x_core()
             .expect("syncpt requires Host1x")
-            .register_guest_action(
+            .register_host_action(
                 syncpoint,
                 value as u32,
                 Box::new(move || {
@@ -399,7 +399,7 @@ impl INx2SyncptSession {
                 // registered action died with the syncpoint manager; expecting
                 // Host1x here panicked the frontend thread mid-shutdown.
                 if let Some(host1x) = self.system.get().host1x_core() {
-                    host1x.deregister_guest_action(request.syncpoint, handle);
+                    host1x.deregister_host_action(request.syncpoint, handle);
                 }
             }
             return true;
@@ -1975,11 +1975,12 @@ impl INx2VideoSession {
                     pts: frame.pts,
                     end: frame.end,
                 });
-                system
-                    .get()
-                    .host1x_core()
-                    .expect("video requires Host1x")
-                    .increment_guest(state.syncpoint);
+                // The frame is complete here: advance both counters, as
+                // upstream's synchronous producers do, so that waits on the
+                // completed (host) value see it.
+                let host1x = system.get().host1x_core().expect("video requires Host1x");
+                host1x.increment_guest(state.syncpoint);
+                host1x.increment_host(state.syncpoint);
                 state.frames_out = state.frames_out.wrapping_add(1);
                 if state.frames_out == 1 || state.frames_out % 600 == 0 || frame.end {
                     log::info!(
@@ -2565,7 +2566,11 @@ impl INx2GraphicsSystemSession {
             .unwrap();
         let mut changed = false;
         for id in 0..state.syncpt_count.min(Self::HOST_SYNCPOINTS) {
-            let value = manager.get_guest_syncpoint_value(id) as u64;
+            // The page stands for the hardware counters, which advance when
+            // the GPU reaches the increment: the host value, as
+            // nvhost_ctrl reports it on Switch 1 (eden-nx2 mirrors the guest
+            // value, which advances as soon as the command is processed).
+            let value = manager.get_host_syncpoint_value(id) as u64;
             let address = state
                 .syncpt_ro
                 .wrapping_add(Self::SYNCPT_VALUES_OFFSET + id as u64 * 8);

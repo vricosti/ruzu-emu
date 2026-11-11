@@ -25964,8 +25964,8 @@ drawn black and appearing or vanishing from one frame to the next.
   instruction (clamp 30 with an index of -1) and from the result, not from
   vendor documentation. SHFL.UP, SHFL.DOWN and SHFL.BFLY are unchanged.
 - Found during the investigation and left as they are, because changing them
-  did not affect the symptom (the first one was corrected afterwards, see
-  "QMD release MEMBAR_TYPE" below): `kepler_compute.rs` treats bit 19 of a QMD
+  did not affect the symptom (all three were corrected afterwards, see the
+  three entries that follow this one): `kepler_compute.rs` treats bit 19 of a QMD
   release word as a "maximum" reduction, while NVIDIA's `clc6c0qmd.h`
   (QMDV03_00) defines it as `RELEASE0_MEMBAR_TYPE`; `nx2_semaphore_mirror`
   copies releases of the second semaphore page onto the first and overwrites
@@ -26099,3 +26099,54 @@ drawn black and appearing or vanishing from one frame to the next.
 ### Tests
 - `native_method_routing_runs_shared_macros_qmd_and_fenced_releases`: the
   bit 19 release is expected as a plain payload write.
+
+## 2026-11-11 - NX2 semaphore releases are no longer mirrored (video_core/src/engines/puller.rs)
+
+### Intentional difference from eden-nx2
+- eden-nx2 `Puller::ProcessSemaphoreTriggerMethod` also writes a release that
+  lands in the second page of a queue's two-page region to the same offset of
+  the first page (`Nx2SemaphoreMirror`). Its `nx2.h` states the reason as an
+  assumption: "Something on the console copies one into the other; until that
+  is known, the puller mirrors releases that land in a second page."
+- This port no longer performs that copy. `nx2_semaphore_mirror` and the
+  region table stay in `nx2.rs` as the port of the header, now unused.
+- Measured on Mario Kart World (70 s from boot, one region, 2 x 0x1000):
+  the queue releases 0x1788, 0x17c8, ... at +0x1000 and 0x17f, 0x183, ... at
+  +0x1010 and +0x1020. The GPU acquires on the first page (all GEQUAL) wait
+  for 0x117, 0x11a, ... at +0x0 and for 0, 1, 2 at +0x10 and +0x20, the latter
+  being the compute job counts that QMD releases write there. The two pages
+  therefore hold different counters. With the copy, every acquire read a far
+  larger foreign value (0x2cf4 for a wanted 0x10e) and was met at once; without
+  it each acquire reads its own word one step short (0x116 for 0x117) and is
+  met by the release it waits for. No acquire waited 2 s in either mode.
+- Risk: a title in which nothing writes the first page would now block on its
+  acquire ("Semaphore ... waits for 2 s"). Only this title was tested.
+
+### Tests
+- `puller` release-size test: a second-page release produces one query.
+
+## 2026-11-11 - NX2 syncpoint service reports completed values (core/src/hle/service/nx2_gsv.rs)
+
+### Intentional difference from eden-nx2
+- `nx2:syncpt` 103 (query), 201 (slot event) and 202 (cancel), and the shared
+  read-only value page refreshed by `update_syncpt_values`, use the host
+  syncpoint value and host actions. eden-nx2 uses the guest value, which
+  advances when the GPU thread processes the increment command; the host
+  value advances when the corresponding fence is reached. Upstream's Switch 1
+  `nvhost_ctrl` event wait registers a host action (verified in
+  `nvhost_ctrl.cpp`), so the NX2 service now follows the same rule.
+- The NX2 video decoder publishes a finished frame with IncrementGuest and
+  IncrementHost, as upstream's synchronous producers do (`cdma_pusher.cpp`,
+  `sync_manager.cpp`); with the guest increment alone the frame event would
+  never fire. `Host1xCoreInterface::increment_host` was added for it.
+- Not changed: the VI2 present fence wait and the values it logs still use
+  the guest side, like upstream's composite path.
+- Measured on Mario Kart World: boot, intro cinematic, menus, the VP9 course
+  fly-over (1423 frames) and the start of a race run with no fence or
+  semaphore timeout; frame pacing is unchanged within run-to-run variation.
+  No visible benefit was measured. Risk: the title now waits for the host GPU,
+  so a fence that is never signalled would stall it.
+
+### Tests
+- `nx2_syncpt_slot_reuse_cancels_clears_and_signals_on_host_progress`
+  (renamed): guest progress alone neither signals nor is reported.

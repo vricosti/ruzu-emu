@@ -305,6 +305,39 @@ impl Nx2VideoDecoder {
         };
         unsafe {
             let target = av_get_pix_fmt(name.as_ptr().cast());
+            // A hardware-decoded picture arrives as NV12 already. Measured with
+            // libswscale 7.5 (FFmpeg 6.1): its same-format plane copy returns
+            // the full height but leaves the interleaved chroma plane of the
+            // destination untouched, so the guest sampled zero chroma and the
+            // whole video was green (Mario Kart World course fly-over, VP9
+            // 2560x1440). Copy the two planes directly in that case.
+            if format == Nx2PictureFormat::Nv12
+                && frame.get_pixel_format() == target
+                && frame.get_width() == width as c_int
+                && frame.get_height() == height as c_int
+            {
+                let source = frame.get_planes();
+                let source_strides = frame.get_strides();
+                if source[0].is_null()
+                    || source[1].is_null()
+                    || source_strides[0] < row_bytes as c_int
+                    || source_strides[1] < row_bytes as c_int
+                {
+                    return;
+                }
+                copy_nv12_planes(
+                    source[0],
+                    source_strides[0] as usize,
+                    source[1],
+                    source_strides[1] as usize,
+                    width,
+                    height,
+                    pitch,
+                    chroma_offset,
+                    out,
+                );
+                return;
+            }
             self.inner.scaler = sws_getCachedContext(
                 self.inner.scaler,
                 frame.get_width(),
@@ -378,6 +411,39 @@ impl Nx2VideoDecoder {
                 strides.as_ptr(),
             );
         }
+    }
+}
+
+/// Copies an NV12 picture into a destination that uses one pitch for both
+/// planes and places the interleaved chroma plane at `chroma_offset`.
+///
+/// # Safety
+/// `luma` must be readable for `height` rows of `luma_stride` bytes and
+/// `chroma` for `(height + 1) / 2` rows of `chroma_stride` bytes, each row
+/// holding at least `width` rounded up to even bytes. The caller has checked
+/// that `out` holds both destination planes.
+unsafe fn copy_nv12_planes(
+    luma: *const u8,
+    luma_stride: usize,
+    chroma: *const u8,
+    chroma_stride: usize,
+    width: u32,
+    height: u32,
+    pitch: u64,
+    chroma_offset: u64,
+    out: &mut [u8],
+) {
+    let pitch = pitch as usize;
+    let luma_bytes = width as usize;
+    let chroma_bytes = (width as usize + 1) & !1;
+    for row in 0..height as usize {
+        let source = std::slice::from_raw_parts(luma.add(row * luma_stride), luma_bytes);
+        out[row * pitch..][..luma_bytes].copy_from_slice(source);
+    }
+    let chroma_start = chroma_offset as usize;
+    for row in 0..(height as usize + 1) / 2 {
+        let source = std::slice::from_raw_parts(chroma.add(row * chroma_stride), chroma_bytes);
+        out[chroma_start + row * pitch..][..chroma_bytes].copy_from_slice(source);
     }
 }
 
@@ -484,6 +550,39 @@ mod tests {
                 pending_pts_size: 0,
                 packet: Vec::new(),
             }),
+        }
+    }
+
+    #[test]
+    fn nv12_plane_copy_fills_luma_and_interleaved_chroma_at_the_destination_pitch() {
+        // 5x3 picture: source strides wider than the row, odd width and height.
+        let (width, height) = (5u32, 3u32);
+        let (luma_stride, chroma_stride) = (8usize, 10usize);
+        let luma: Vec<u8> = (0..luma_stride * 3).map(|i| 0x10 + i as u8).collect();
+        let chroma: Vec<u8> = (0..chroma_stride * 2).map(|i| 0x80 + i as u8).collect();
+        let (pitch, chroma_offset) = (16u64, 64u64);
+        let mut out = vec![0u8; 64 + 32];
+        unsafe {
+            copy_nv12_planes(
+                luma.as_ptr(),
+                luma_stride,
+                chroma.as_ptr(),
+                chroma_stride,
+                width,
+                height,
+                pitch,
+                chroma_offset,
+                &mut out,
+            );
+        }
+        for row in 0..3 {
+            assert_eq!(&out[row * 16..][..5], &luma[row * luma_stride..][..5]);
+            assert_eq!(&out[row * 16 + 5..row * 16 + 16], &[0u8; 11]);
+        }
+        // (height + 1) / 2 chroma rows of width rounded up to even bytes.
+        for row in 0..2 {
+            assert_eq!(&out[64 + row * 16..][..6], &chroma[row * chroma_stride..][..6]);
+            assert_eq!(&out[64 + row * 16 + 6..64 + row * 16 + 16], &[0u8; 10]);
         }
     }
 

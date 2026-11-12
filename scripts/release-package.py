@@ -9,7 +9,12 @@ import sys
 import time
 
 
-VERSION = re.compile(r"(?:v)?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
+# A release is X.Y.Z; a release candidate is X.Y.Z-rcN with N >= 1. The tag is
+# the version prefixed with "v" (v0.1.2, v0.1.1-rc9). Nothing else is accepted:
+# common/build.rs only shows a tag in the window title when it equals "v" plus
+# the Cargo version, so the two must be written from the same string.
+VERSION = re.compile(
+    r"(?:v)?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc([1-9][0-9]*))?\Z")
 INDEX_LOCK_ATTEMPTS = 10
 
 
@@ -57,13 +62,55 @@ def clean(repo):
         raise RuntimeError("Initialize submodules at their recorded commits before releasing.")
 
 
-def suggested_version(tags):
-    versions = [tuple(map(int, match.groups())) for tag in tags
-                if tag.startswith("v") and (match := VERSION.fullmatch(tag))]
+def parse_version(text):
+    """Returns (major, minor, patch, rc) with rc None for a final release, or None."""
+    match = VERSION.fullmatch(text)
+    if not match:
+        return None
+    major, minor, patch, candidate = match.groups()
+    return int(major), int(minor), int(patch), int(candidate) if candidate else None
+
+
+def format_version(version):
+    major, minor, patch, candidate = version
+    base = f"{major}.{minor}.{patch}"
+    return base if candidate is None else f"{base}-rc{candidate}"
+
+
+def version_order(version):
+    # A release candidate precedes the final release of the same X.Y.Z.
+    major, minor, patch, candidate = version
+    return major, minor, patch, candidate is None, candidate or 0
+
+
+def suggested_versions(tags):
+    """Returns the default proposal and the alternative, from the latest version tag.
+
+    After a release candidate (v0.1.1-rc8): the next candidate (0.1.1-rc9), or
+    the final release (0.1.1). After a final release (v0.1.1): the next patch
+    release (0.1.2), or its first candidate (0.1.2-rc1).
+    """
+    versions = [version for tag in tags
+                if tag.startswith("v") and (version := parse_version(tag))]
     if not versions:
-        return "0.0.1"
-    major, minor, patch = max(versions)
-    return f"{major}.{minor}.{patch + 1}"
+        return "0.0.1", "0.0.1-rc1"
+    major, minor, patch, candidate = max(versions, key=version_order)
+    if candidate is not None:
+        return (format_version((major, minor, patch, candidate + 1)),
+                format_version((major, minor, patch, None)))
+    return (format_version((major, minor, patch + 1, None)),
+            format_version((major, minor, patch + 1, 1)))
+
+
+def suggested_version(tags):
+    return suggested_versions(tags)[0]
+
+
+def annotated_tag_commit(repo, tag):
+    """Commit behind `tag`, which must be an annotated tag."""
+    if git(repo, "cat-file", "-t", f"refs/tags/{tag}") != "tag":
+        raise RuntimeError(f"Tag {tag} is not an annotated tag")
+    return git(repo, "rev-parse", f"refs/tags/{tag}^{{commit}}")
 
 
 def update_manifest(text, version):
@@ -104,12 +151,14 @@ def release(repo, platform, skip_deps=False):
     git(repo, "remote", "get-url", "--push", "origin")
     run(repo, "git", "fetch", "origin", "--tags")
     tags = git(repo, "tag", "--list").splitlines()
-    suggestion = suggested_version(tags)
-    answer = input(f"Release version [{suggestion}] (Ctrl+C to cancel): ").strip() or suggestion
-    match = VERSION.fullmatch(answer)
-    if not match:
-        raise RuntimeError("Use a numeric version such as 0.0.5 or v0.0.5")
-    version = ".".join(match.groups())
+    suggestion, alternative = suggested_versions(tags)
+    answer = input(f"Release version: [1] {suggestion} (default), [2] {alternative}, "
+                   "or type another one (Ctrl+C to cancel): ").strip()
+    answer = {"": suggestion, "1": suggestion, "2": alternative}.get(answer, answer)
+    parsed = parse_version(answer)
+    if parsed is None:
+        raise RuntimeError("Use a version such as 0.1.2 or 0.1.2-rc1 (a leading v is accepted)")
+    version = format_version(parsed)
     tag = "v" + version
     if tag in tags:
         raise RuntimeError(f"Tag {tag} already exists; it will not be replaced")
@@ -143,10 +192,12 @@ def release(repo, platform, skip_deps=False):
     build(repo, platform, package=False, skip_deps=skip_deps)
     unchanged()
     run(repo, "git", "tag", "-a", tag, commit, "-m", tag)
+    if annotated_tag_commit(repo, tag) != commit:
+        raise RuntimeError(f"Tag {tag} does not point at the release commit")
     # Rebuild after tagging so embedded SCM metadata and artifact names agree.
     build(repo, platform, package=True, skip_deps=True)
     unchanged()
-    if git(repo, "rev-parse", f"refs/tags/{tag}^{{commit}}") != commit:
+    if annotated_tag_commit(repo, tag) != commit:
         raise RuntimeError("Release tag changed during packaging")
     run(repo, "git", "push", "--atomic", "origin",
         f"{commit}:refs/heads/{branch}", f"refs/tags/{tag}:refs/tags/{tag}")

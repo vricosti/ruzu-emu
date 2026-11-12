@@ -31,8 +31,8 @@ try {
 }
 finally { Pop-Location }
 $cargoVersion = ($packageId -split '#')[-1] -replace '^.*@', ''
-if ($cargoVersion -notmatch '^\d+\.\d+\.\d+$') {
-    throw "Release packaging requires a numeric major.minor.patch Cargo version: $cargoVersion"
+if ($cargoVersion -notmatch '^\d+\.\d+\.\d+(-rc[1-9]\d*)?$') {
+    throw "Release packaging requires a major.minor.patch Cargo version, optionally with -rcN: $cargoVersion"
 }
 if ($Version -and $Version -ne $cargoVersion) {
     throw "Requested version $Version does not match Cargo version $cargoVersion. Update Cargo.toml instead."

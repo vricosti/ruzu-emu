@@ -85,12 +85,12 @@ pub fn page(runtime_lock: bool) -> Page {
         "Recompress ASTC to BC3 on the GPU (experimental, Vulkan only)",
         *values.gpu_astc_recompression.get_value(),
     );
-    gpu_astc_recompression.set_tooltip_text(Some(
+    gpu_astc_recompression.set_tooltip_text(Some(&crate::i18n::tr(
         "Decodes ASTC textures and encodes them to BC3 with compute shaders instead of on the CPU. \
          Applies when ASTC decoding is set to GPU and ASTC recompression is BC3 (the mode used for \
          Switch 2 titles on cards with less than 11 GB of VRAM). Shortens loading and stutter; \
          texture quality can be slightly lower than the CPU encoder.",
-    ));
+    )));
     hacks.append(&gpu_astc_recompression);
     column.append(&hacks_group);
 

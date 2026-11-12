@@ -95,15 +95,12 @@ fn huge_astc_host_format(optimal_astc_supported: bool, info: &ImageInfo) -> Opti
     })
 }
 
-/// Ruzu extension, experimental: `RUZU_GPU_BC3_TRANSCODE=1` keeps the ASTC to
-/// BC3 conversion on the GPU (compute decode, compute encode, block copy)
-/// instead of decoding and encoding on the CPU.
+/// Ruzu extension, experimental: the `gpu_astc_recompression` setting keeps
+/// the ASTC to BC3 conversion on the GPU (compute decode, compute encode,
+/// block copy) instead of decoding and encoding on the CPU. Read once per
+/// session, when the runtime creates its compute passes.
 fn gpu_bc3_transcode_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("RUZU_GPU_BC3_TRANSCODE")
-            .is_some_and(|value| value.to_string_lossy().starts_with('1'))
-    })
+    *common::settings::values().gpu_astc_recompression.get_value()
 }
 
 /// Scratch images of one texture shape for the GPU BC3 transcode: the decoded
@@ -2461,7 +2458,7 @@ pub struct TextureCacheRuntime {
     /// Boxed: commands recorded by a pass keep a pointer to its descriptor
     /// allocator, and the pass is taken out of this slot while it records.
     astc_decoder_pass: Option<Box<AstcDecoderPass>>,
-    /// Ruzu extension: present only with `RUZU_GPU_BC3_TRANSCODE=1`.
+    /// Ruzu extension: present only when `gpu_astc_recompression` is set.
     bc3_encoder_pass: Option<Box<Bc3EncoderPass>>,
     /// Scratch images of the GPU BC3 transcode, least recently used first.
     bc3_scratch: Vec<Bc3Scratch>,

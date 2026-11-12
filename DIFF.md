@@ -26154,8 +26154,12 @@ drawn black and appearing or vanishing from one frame to the next.
 ## 2026-11-12 - Experimental GPU ASTC to BC3 transcode (video_core: host_shaders/bc3_encoder.comp, renderer_vulkan/compute_pass.rs, renderer_vulkan/texture_cache.rs)
 
 ### Ruzu extension (no upstream counterpart), off by default
-- `RUZU_GPU_BC3_TRANSCODE=1` keeps the conversion of ASTC textures to BC3 on
-  the GPU. Upstream decodes ASTC on the GPU only when the result stays
+- The `gpu_astc_recompression` setting (Renderer hacks category, per-game
+  capable, default off; GTK: Graphics, Extras, "Recompress ASTC to BC3 on the
+  GPU") keeps the conversion of ASTC textures to BC3 on the GPU. It is read
+  when a session creates its renderer. The first version of this entry used
+  the environment variable `RUZU_GPU_BC3_TRANSCODE`, which no longer exists.
+- Upstream decodes ASTC on the GPU only when the result stays
   uncompressed; with a BC recompression it decodes and encodes on the CPU.
 - Path, for plain 2D ASTC images (mips and layers included) whose decoded
   size is at most 256 MiB, when `accelerate_astc` is Gpu and the effective
@@ -26186,7 +26190,7 @@ drawn black and appearing or vanishing from one frame to the next.
   Frames over 100 ms in the next 600: 2 against 10 and 13.
 
 ### Missing items
-- No setting or UI; BC1 and BC7 targets; 3D and huge-array images; image
+- BC1 and BC7 targets; 3D and huge-array images; image
   quality metrics against the CPU encoder; other GPUs and drivers; VRAM use
   of the scratch pool under pressure.
 

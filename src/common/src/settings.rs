@@ -256,6 +256,10 @@ pub struct Values {
     pub gpu_unswizzle_stream_size: SwitchableSetting<GpuUnswizzle>,
     pub gpu_unswizzle_chunk_size: SwitchableSetting<GpuUnswizzleChunk>,
     pub gpu_unswizzle_enabled: SwitchableSetting<bool>,
+    /// Ruzu extension: convert ASTC textures to BC3 on the GPU (compute
+    /// decode and encode) instead of on the CPU, when the effective
+    /// recompression is BC3 and `accelerate_astc` is Gpu.
+    pub gpu_astc_recompression: SwitchableSetting<bool>,
 
     // ── Renderer Extensions ─────────────────────────────────────────────
     pub dyna_state: SwitchableSetting<ExtendedDynamicState>,
@@ -571,6 +575,7 @@ impl Values {
                 gpu_unswizzle_stream_size,
                 gpu_unswizzle_chunk_size,
                 gpu_unswizzle_enabled,
+                gpu_astc_recompression,
             ),
             Category::RendererExtensions => {
                 visit!(dyna_state, sample_shading, vertex_input_dynamic_state,)
@@ -1296,6 +1301,11 @@ impl Default for Values {
             gpu_unswizzle_enabled: SwitchableSetting::new(
                 false,
                 "gpu_unswizzle_enabled",
+                RendererHacks,
+            ),
+            gpu_astc_recompression: SwitchableSetting::new(
+                false,
+                "gpu_astc_recompression",
                 RendererHacks,
             ),
 
@@ -2033,6 +2043,7 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.gpu_unswizzle_stream_size.set_global(true);
     values.gpu_unswizzle_chunk_size.set_global(true);
     values.gpu_unswizzle_enabled.set_global(true);
+    values.gpu_astc_recompression.set_global(true);
     values.dyna_state.set_global(true);
     values.sample_shading.set_global(true);
     values.vertex_input_dynamic_state.set_global(true);
@@ -2174,7 +2185,7 @@ mod tests {
         }
         // Inventory of the Setting/SwitchableSetting fields in Values; plain
         // controller arrays and frontend UI settings have separate serializers.
-        assert_eq!(labels.len(), 192);
+        assert_eq!(labels.len(), 193);
 
         // Eden registers a restore callback for every SwitchableSetting.
         // Exercise all registered settings so a newly added field cannot
@@ -2324,6 +2335,7 @@ mod tests {
             GpuUnswizzleChunk::Medium
         );
         assert!(!*values.gpu_unswizzle_enabled.get_value());
+        assert!(!*values.gpu_astc_recompression.get_value());
 
         assert_eq!(*values.gpu_log_level.get_value(), GpuLogLevel::Off);
         assert!(*values.gpu_log_vulkan_calls.get_value());

@@ -1590,6 +1590,7 @@ mod tests {
             "gpu_unswizzle_stream_size",
             "gpu_unswizzle_chunk_size",
             "gpu_unswizzle_enabled",
+            "gpu_astc_recompression",
             // Extras / Vulkan Extensions
             "dyna_state",
             "sample_shading_fraction",
@@ -1776,6 +1777,7 @@ mod tests {
                 .gpu_unswizzle_chunk_size
                 .set_value(GpuUnswizzleChunk::High);
             values.gpu_unswizzle_enabled.set_value(true);
+            values.gpu_astc_recompression.set_value(true);
 
             values.dyna_state.set_value(ExtendedDynamicState::EDS3);
             values.sample_shading.set_value(42);
@@ -1876,6 +1878,7 @@ mod tests {
                 GpuUnswizzleChunk::High
             );
             assert!(*values.gpu_unswizzle_enabled.get_value());
+            assert!(*values.gpu_astc_recompression.get_value());
             assert_eq!(*values.dyna_state.get_value(), ExtendedDynamicState::EDS3);
             assert_eq!(*values.sample_shading.get_value(), 42);
             assert!(!*values.vertex_input_dynamic_state.get_value());

@@ -81,6 +81,17 @@ pub fn page(runtime_lock: bool) -> Page {
     hacks.append(&chunk_row);
     let gpu_unswizzle = w::check_row("GPU Unswizzle", *values.gpu_unswizzle_enabled.get_value());
     hacks.append(&gpu_unswizzle);
+    let gpu_astc_recompression = w::check_row(
+        "Recompress ASTC to BC3 on the GPU (experimental, Vulkan only)",
+        *values.gpu_astc_recompression.get_value(),
+    );
+    gpu_astc_recompression.set_tooltip_text(Some(
+        "Decodes ASTC textures and encodes them to BC3 with compute shaders instead of on the CPU. \
+         Applies when ASTC decoding is set to GPU and ASTC recompression is BC3 (the mode used for \
+         Switch 2 titles on cards with less than 11 GB of VRAM). Shortens loading and stutter; \
+         texture quality can be slightly lower than the CPU encoder.",
+    ));
+    hacks.append(&gpu_astc_recompression);
     column.append(&hacks_group);
 
     let (extensions_group, extensions) = w::group("Vulkan Extensions");
@@ -154,6 +165,12 @@ pub fn page(runtime_lock: bool) -> Page {
         configuring_global,
     );
     gpu_unswizzle.set_sensitive(gpu_unswizzle_enabled_policy.sensitive);
+    let gpu_astc_recompression_policy = w::SettingEditPolicy::new(
+        &values.gpu_astc_recompression,
+        runtime_lock,
+        configuring_global,
+    );
+    gpu_astc_recompression.set_sensitive(gpu_astc_recompression_policy.sensitive);
     let dyna_state_policy =
         w::SettingEditPolicy::new(&values.dyna_state, runtime_lock, configuring_global);
     dynamic_row.set_sensitive(dyna_state_policy.sensitive);
@@ -182,6 +199,7 @@ pub fn page(runtime_lock: bool) -> Page {
         let gpu_unswizzle_chunk_size_value =
             tr::value_at(tr::GPU_UNSWIZZLE_CHUNK, chunk_size.selected());
         let gpu_unswizzle_enabled_value = gpu_unswizzle.is_active();
+        let gpu_astc_recompression_value = gpu_astc_recompression.is_active();
         let dyna_state_value = tr::value_at(tr::EXTENDED_DYNAMIC_STATE, dynamic_state.selected());
         let sample_shading_value = sample_shading.value() as u32;
         let vertex_input_dynamic_state_value = vertex_input.is_active();
@@ -213,6 +231,10 @@ pub fn page(runtime_lock: bool) -> Page {
         gpu_unswizzle_enabled_policy.apply(
             &mut values.gpu_unswizzle_enabled,
             gpu_unswizzle_enabled_value,
+        );
+        gpu_astc_recompression_policy.apply(
+            &mut values.gpu_astc_recompression,
+            gpu_astc_recompression_value,
         );
         dyna_state_policy.apply(&mut values.dyna_state, dyna_state_value);
         sample_shading_policy.apply(&mut values.sample_shading, sample_shading_value);

@@ -164,6 +164,7 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
         ("CONVERT_MSAA_TO_NON_MSAA_COMP_SPV", "convert_msaa_to_non_msaa.comp"),
         ("CONVERT_NON_MSAA_TO_MSAA_COMP_SPV", "convert_non_msaa_to_msaa.comp"),
         ("ASTC_DECODER_COMP_SPV", "astc_decoder.comp"),
+        ("BC3_ENCODER_COMP_SPV", "bc3_encoder.comp"),
         ("BLOCK_LINEAR_UNSWIZZLE_3D_BCN_COMP_SPV", "block_linear_unswizzle_3d_bcn.comp"),
         ("VULKAN_QUAD_INDEXED_COMP_SPV", "vulkan_quad_indexed.comp"),
         ("VULKAN_UINT8_COMP_SPV", "vulkan_uint8.comp"),

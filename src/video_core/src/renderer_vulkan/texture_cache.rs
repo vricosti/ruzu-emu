@@ -47,7 +47,7 @@ use super::blit_image::{
     subresource_range_from_view, BlitFramebufferInfo, BlitImageHelper, BlitImageView,
     Extent3D as BlitExtent3D, Offset2D as BlitOffset2D, Region2D as BlitRegion2D,
 };
-use super::compute_pass::{AstcDecoderPass, BlockLinearUnswizzle3DPass};
+use super::compute_pass::{AstcDecoderPass, Bc3EncoderPass, BlockLinearUnswizzle3DPass};
 use super::descriptor_pool::DescriptorPool;
 use super::maxwell_to_vk;
 use super::render_pass_cache::{supports_depth_stencil_resolve, RenderPassCache, RenderPassKey};
@@ -93,6 +93,94 @@ fn huge_astc_host_format(optimal_astc_supported: bool, info: &ImageInfo) -> Opti
             vk::Format::A8B8G8R8_UNORM_PACK32
         }
     })
+}
+
+/// Ruzu extension, experimental: `RUZU_GPU_BC3_TRANSCODE=1` keeps the ASTC to
+/// BC3 conversion on the GPU (compute decode, compute encode, block copy)
+/// instead of decoding and encoding on the CPU.
+fn gpu_bc3_transcode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("RUZU_GPU_BC3_TRANSCODE")
+            .is_some_and(|value| value.to_string_lossy().starts_with('1'))
+    })
+}
+
+/// Scratch images of one texture shape for the GPU BC3 transcode: the decoded
+/// RGBA8 mip chain and the RGBA32UI image that receives one texel per block.
+struct Bc3Scratch {
+    device: ash::Device,
+    /// Width, height, mip levels and layers of the textures it serves.
+    shape: (u32, u32, u32, u32),
+    /// Size of the decoded image, the budget unit of the pool.
+    bytes: u64,
+    views: Vec<vk::ImageView>,
+    block_view: vk::ImageView,
+    decoded: AllocatedImage,
+    blocks: AllocatedImage,
+}
+
+impl Drop for Bc3Scratch {
+    fn drop(&mut self) {
+        unsafe {
+            for view in self.views.drain(..) {
+                self.device.destroy_image_view(view, None);
+            }
+            if self.block_view != vk::ImageView::null() {
+                self.device.destroy_image_view(self.block_view, None);
+            }
+        }
+    }
+}
+
+/// Set once the runtime owns both compute passes the transcode needs.
+static GPU_BC3_TRANSCODE_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Largest decoded scratch image the GPU transcode path will allocate.
+const GPU_BC3_TRANSCODE_MAX_DECODED_BYTES: u64 = 256 << 20;
+
+/// Whether an ASTC image recompressed to BC3 is converted on the GPU. Only
+/// plain 2D images (with mips and layers) are taken; the rest stay on the CPU.
+fn will_use_gpu_bc3_transcode(
+    optimal_astc_supported: bool, info: &ImageInfo,
+    decode: common::settings_enums::AstcDecodeMode,
+    recompression: common::settings_enums::AstcRecompression,
+) -> bool {
+    gpu_bc3_transcode_takes(
+        GPU_BC3_TRANSCODE_READY.load(std::sync::atomic::Ordering::Relaxed),
+        optimal_astc_supported, info, decode, recompression,
+    )
+}
+
+/// `will_use_gpu_bc3_transcode` with the availability of the passes given.
+fn gpu_bc3_transcode_takes(
+    ready: bool,
+    optimal_astc_supported: bool, info: &ImageInfo,
+    decode: common::settings_enums::AstcDecodeMode,
+    recompression: common::settings_enums::AstcRecompression,
+) -> bool {
+    if !ready
+        || optimal_astc_supported
+        || !crate::surface::is_pixel_format_astc(info.format)
+        || is_huge_astc_array(optimal_astc_supported, info)
+        || decode != common::settings_enums::AstcDecodeMode::Gpu
+        || recompression != common::settings_enums::AstcRecompression::Bc3
+        || info.image_type != ImageType::E2D
+        || info.size.depth != 1
+        || info.num_samples > 1
+    {
+        return false;
+    }
+    let decoded_bytes: u64 = (0..info.resources.levels.max(1) as u32)
+        .map(|level| {
+            u64::from((info.size.width >> level).max(1))
+                * u64::from((info.size.height >> level).max(1))
+                * 4
+        })
+        .sum::<u64>()
+        * info.resources.layers.max(1) as u64;
+    decoded_bytes <= GPU_BC3_TRANSCODE_MAX_DECODED_BYTES
 }
 
 fn will_use_accelerated_astc_decode(
@@ -2370,7 +2458,13 @@ pub struct TextureCacheRuntime {
     staging_buffer_pool: NonNull<StagingBufferPool>,
     blit_image_helper: NonNull<BlitImageHelper>,
     render_pass_cache: NonNull<RenderPassCache>,
-    astc_decoder_pass: Option<AstcDecoderPass>,
+    /// Boxed: commands recorded by a pass keep a pointer to its descriptor
+    /// allocator, and the pass is taken out of this slot while it records.
+    astc_decoder_pass: Option<Box<AstcDecoderPass>>,
+    /// Ruzu extension: present only with `RUZU_GPU_BC3_TRANSCODE=1`.
+    bc3_encoder_pass: Option<Box<Bc3EncoderPass>>,
+    /// Scratch images of the GPU BC3 transcode, least recently used first.
+    bc3_scratch: Vec<Bc3Scratch>,
     bl3d_unswizzle_pass: Option<BlockLinearUnswizzle3DPass>,
     /// Cached `vkGetPhysicalDeviceFormatProperties` results (upstream caches
     /// these in `Device`); queried on hot per-draw paths via `surface_format`.
@@ -2443,7 +2537,7 @@ impl TextureCacheRuntime {
                 compute_pass_descriptor_queue,
                 memory_allocator,
             ) {
-                Ok(pass) => Some(pass),
+                Ok(pass) => Some(Box::new(pass)),
                 Err(err) => {
                     log::warn!(
                         "TextureCacheRuntime: failed to create ASTCDecoderPass: {:?}",
@@ -2455,6 +2549,29 @@ impl TextureCacheRuntime {
         } else {
             None
         };
+        let bc3_encoder_pass = if gpu_bc3_transcode_enabled() && astc_decoder_pass.is_some() {
+            match Bc3EncoderPass::new(
+                vulkan_device,
+                scheduler,
+                descriptor_pool,
+                compute_pass_descriptor_queue,
+            ) {
+                Ok(pass) => {
+                    log::info!("TextureCacheRuntime: GPU ASTC to BC3 transcode enabled");
+                    Some(Box::new(pass))
+                }
+                Err(err) => {
+                    log::warn!("TextureCacheRuntime: failed to create Bc3EncoderPass: {:?}", err);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        GPU_BC3_TRANSCODE_READY.store(
+            bc3_encoder_pass.is_some(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let bl3d_unswizzle_pass = if *common::settings::values().gpu_unswizzle_enabled.get_value() {
             match BlockLinearUnswizzle3DPass::new(
                 vulkan_device,
@@ -2487,6 +2604,8 @@ impl TextureCacheRuntime {
             blit_image_helper: NonNull::from(blit_image_helper),
             render_pass_cache: NonNull::from(render_pass_cache),
             astc_decoder_pass,
+            bc3_encoder_pass,
+            bc3_scratch: Vec::new(),
             bl3d_unswizzle_pass,
             format_properties: std::cell::RefCell::new(std::collections::HashMap::new()),
             shader_stencil_export_supported,
@@ -2740,6 +2859,9 @@ impl TextureCacheRuntime {
             self.bl3d_unswizzle_pass = Some(pass);
             return result;
         }
+        if matches!(image.format, vk::Format::BC3_UNORM_BLOCK | vk::Format::BC3_SRGB_BLOCK) {
+            return self.transcode_astc_to_bc3(image, map, swizzles);
+        }
         let Some(mut pass) = self.astc_decoder_pass.take() else {
             log::warn!("TextureCacheRuntime::accelerate_image_upload missing ASTCDecoderPass");
             return false;
@@ -2788,6 +2910,193 @@ impl TextureCacheRuntime {
         image.layout = vk::ImageLayout::GENERAL;
         self.astc_decoder_pass = Some(pass);
         result
+    }
+
+    /// Ruzu extension: ASTC to BC3 without leaving the GPU. The guest blocks
+    /// in `map` are decoded into a scratch RGBA8 image by the ASTC compute
+    /// decoder, each level is encoded by `Bc3EncoderPass` into a scratch
+    /// RGBA32UI image holding one texel per block, and that image is copied
+    /// into the BC3 host image.
+    ///
+    /// Nothing waits for the GPU: the scratch images outlive the commands
+    /// (they are pooled and only destroyed after a `finish`), and a later
+    /// upload that reuses them is recorded after this one.
+    fn transcode_astc_to_bc3(
+        &mut self,
+        image: &mut Image,
+        map: StagingBufferRef,
+        swizzles: &[crate::texture_cache::types::SwizzleParameters],
+    ) -> bool {
+        let (Some(mut decoder), Some(mut encoder)) =
+            (self.astc_decoder_pass.take(), self.bc3_encoder_pass.take())
+        else {
+            log::warn!("TextureCacheRuntime::transcode_astc_to_bc3 missing a compute pass");
+            return false;
+        };
+        let info = image.base().info.clone();
+        let guest_size_bytes = image.base().guest_size_bytes as usize;
+        let layers = info.resources.layers.max(1) as u32;
+        let ok = match self.acquire_bc3_scratch(&info) {
+            Some(index) => {
+                let scratch = &self.bc3_scratch[index];
+                let (decoded, blocks, block_view) =
+                    (scratch.decoded.handle(), scratch.blocks.handle(), scratch.block_view);
+                let views = scratch.views.clone();
+                let level_view = |level: i32| views[level as usize];
+                let target = super::compute_pass::AstcDecoderTarget {
+                    image: decoded,
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    initialized: false,
+                    level_view: &level_view,
+                    wait: false,
+                };
+                let decoded_ok = decoder.assemble_into(
+                    &info, 0, guest_size_bytes, &target, map.buffer, map.offset, swizzles,
+                );
+                let is_initialized = image.exchange_initialization();
+                encoder.begin(image.handle(), is_initialized);
+                for swizzle in swizzles {
+                    let level = swizzle.level as u32;
+                    encoder.encode_level(
+                        views[level as usize],
+                        [(info.size.width >> level).max(1), (info.size.height >> level).max(1)],
+                        blocks,
+                        block_view,
+                        image.handle(),
+                        level,
+                        layers,
+                    );
+                }
+                encoder.end(image.handle());
+                image.layout = vk::ImageLayout::GENERAL;
+                decoded_ok
+            }
+            None => false,
+        };
+        self.astc_decoder_pass = Some(decoder);
+        self.bc3_encoder_pass = Some(encoder);
+        ok
+    }
+
+    /// Returns the pooled scratch images for `info`, creating them (and
+    /// evicting older ones past the budget) when no entry of that exact shape
+    /// exists. The returned entry is moved to the back of the pool.
+    fn acquire_bc3_scratch(&mut self, info: &ImageInfo) -> Option<usize> {
+        const MAX_ENTRIES: usize = 8;
+        const MAX_BYTES: u64 = 512 << 20;
+        let levels = info.resources.levels.max(1) as u32;
+        let layers = info.resources.layers.max(1) as u32;
+        let shape = (info.size.width, info.size.height, levels, layers);
+        if let Some(position) = self.bc3_scratch.iter().position(|entry| entry.shape == shape) {
+            let entry = self.bc3_scratch.remove(position);
+            self.bc3_scratch.push(entry);
+            return Some(self.bc3_scratch.len() - 1);
+        }
+        let bytes = (0..levels)
+            .map(|level| {
+                u64::from((info.size.width >> level).max(1))
+                    * u64::from((info.size.height >> level).max(1))
+                    * 4
+            })
+            .sum::<u64>()
+            * u64::from(layers);
+        let pooled = |pool: &[Bc3Scratch]| pool.iter().map(|entry| entry.bytes).sum::<u64>();
+        if !self.bc3_scratch.is_empty()
+            && (self.bc3_scratch.len() >= MAX_ENTRIES || pooled(&self.bc3_scratch) + bytes > MAX_BYTES)
+        {
+            // Recorded commands may still use the entries about to go.
+            self.scheduler().finish();
+            while !self.bc3_scratch.is_empty()
+                && (self.bc3_scratch.len() >= MAX_ENTRIES
+                    || pooled(&self.bc3_scratch) + bytes > MAX_BYTES)
+            {
+                self.bc3_scratch.remove(0);
+            }
+        }
+        let scratch_info = |format, extent: vk::Extent3D, mip_levels, usage| {
+            vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(extent)
+                .mip_levels(mip_levels)
+                .array_layers(layers)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+        };
+        let decoded_info = scratch_info(
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Extent3D { width: info.size.width, height: info.size.height, depth: 1 },
+            levels,
+            vk::ImageUsageFlags::STORAGE,
+        );
+        let block_info = scratch_info(
+            vk::Format::R32G32B32A32_UINT,
+            vk::Extent3D {
+                width: info.size.width.div_ceil(4),
+                height: info.size.height.div_ceil(4),
+                depth: 1,
+            },
+            1,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+        );
+        let created = self
+            .memory_allocator()
+            .create_image(&decoded_info)
+            .and_then(|decoded| Ok((decoded, self.memory_allocator().create_image(&block_info)?)));
+        let (decoded, blocks) = match created {
+            Ok(images) => images,
+            Err(err) => {
+                log::error!("GPU BC3 transcode scratch allocation failed: {:?}", err.result);
+                return None;
+            }
+        };
+        let mut entry = Bc3Scratch {
+            device: self.device.clone(),
+            shape,
+            bytes,
+            views: Vec::with_capacity(levels as usize),
+            block_view: vk::ImageView::null(),
+            decoded,
+            blocks,
+        };
+        let make_view = |device: &ash::Device, handle, format, level| {
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(handle)
+                .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
+                .format(format)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: level,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: vk::REMAINING_ARRAY_LAYERS,
+                });
+            unsafe { device.create_image_view(&view_info, None) }
+        };
+        for level in 0..levels {
+            let view = make_view(
+                &self.device, entry.decoded.handle(), vk::Format::R8G8B8A8_UNORM, level,
+            );
+            match view {
+                Ok(view) => entry.views.push(view),
+                Err(err) => {
+                    log::error!("GPU BC3 transcode scratch view failed: {:?}", err);
+                    return None;
+                }
+            }
+        }
+        match make_view(&self.device, entry.blocks.handle(), vk::Format::R32G32B32A32_UINT, 0) {
+            Ok(view) => entry.block_view = view,
+            Err(err) => {
+                log::error!("GPU BC3 transcode scratch view failed: {:?}", err);
+                return None;
+            }
+        }
+        self.bc3_scratch.push(entry);
+        Some(self.bc3_scratch.len() - 1)
     }
 
     fn get_temporary_buffer(&mut self, needed_size: usize) -> Option<vk::Buffer> {
@@ -5841,8 +6150,14 @@ impl TextureCache {
         } else if crate::surface::is_pixel_format_astc(image.info.format) && !optimal_astc_supported {
             match astc_decode_mode {
                 common::settings_enums::AstcDecodeMode::Gpu => {
-                    if astc_recompression == common::settings_enums::AstcRecompression::Uncompressed
-                        && image.info.size.depth == 1
+                    if (astc_recompression == common::settings_enums::AstcRecompression::Uncompressed
+                        && image.info.size.depth == 1)
+                        || will_use_gpu_bc3_transcode(
+                            optimal_astc_supported,
+                            &image.info,
+                            astc_decode_mode,
+                            astc_recompression,
+                        )
                     {
                         image.flags.insert(ImageFlagBits::ACCELERATED_UPLOAD);
                     }
@@ -7049,6 +7364,49 @@ mod tests {
                 | vk::ImageUsageFlags::STORAGE
                 | vk::ImageUsageFlags::COLOR_ATTACHMENT
         ));
+    }
+
+    #[test]
+    fn gpu_bc3_transcode_takes_only_plain_2d_astc_within_the_scratch_budget() {
+        use common::settings_enums::{AstcDecodeMode, AstcRecompression};
+        let mut info = ImageInfo {
+            format: PixelFormat::Astc2d8x8Unorm,
+            image_type: ImageType::E2D,
+            size: Extent3D { width: 1024, height: 1024, depth: 1 },
+            ..ImageInfo::default()
+        };
+        info.resources.levels = 11;
+        info.resources.layers = 6;
+        // Without both compute passes nothing is taken.
+        assert!(!gpu_bc3_transcode_takes(
+            false, false, &info, AstcDecodeMode::Gpu, AstcRecompression::Bc3,
+        ));
+        let takes = |info: &ImageInfo, native, decode, recompression| {
+            gpu_bc3_transcode_takes(true, native, info, decode, recompression)
+        };
+        assert!(takes(&info, false, AstcDecodeMode::Gpu, AstcRecompression::Bc3));
+        assert!(!takes(&info, true, AstcDecodeMode::Gpu, AstcRecompression::Bc3));
+        assert!(!takes(&info, false, AstcDecodeMode::Cpu, AstcRecompression::Bc3));
+        assert!(!takes(&info, false, AstcDecodeMode::Gpu, AstcRecompression::Bc1));
+        assert!(!takes(&info, false, AstcDecodeMode::Gpu, AstcRecompression::Bc7));
+        assert!(!takes(&info, false, AstcDecodeMode::Gpu, AstcRecompression::Uncompressed));
+
+        let mut volume = info.clone();
+        volume.image_type = ImageType::E3D;
+        volume.size.depth = 4;
+        assert!(!takes(&volume, false, AstcDecodeMode::Gpu, AstcRecompression::Bc3));
+        let mut other_format = info.clone();
+        other_format.format = PixelFormat::A8B8G8R8Unorm;
+        assert!(!takes(&other_format, false, AstcDecodeMode::Gpu, AstcRecompression::Bc3));
+
+        // 8192x8192 RGBA8 is exactly the 256 MiB budget for one level.
+        let mut large = info.clone();
+        large.size = Extent3D { width: 8192, height: 8192, depth: 1 };
+        large.resources.levels = 1;
+        large.resources.layers = 1;
+        assert!(takes(&large, false, AstcDecodeMode::Gpu, AstcRecompression::Bc3));
+        large.resources.layers = 2;
+        assert!(!takes(&large, false, AstcDecodeMode::Gpu, AstcRecompression::Bc3));
     }
 
     #[test]

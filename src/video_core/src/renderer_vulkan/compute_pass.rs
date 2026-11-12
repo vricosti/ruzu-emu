@@ -15,7 +15,7 @@ use super::staging_buffer_pool::StagingBufferPool;
 use super::update_descriptor::{ComputePassDescriptorQueue, DescriptorUpdateEntry};
 use crate::engines::maxwell_3d::IndexFormat;
 use crate::host_shaders::spirv_shaders::{
-    ASTC_DECODER_COMP_SPV, BLOCK_LINEAR_UNSWIZZLE_3D_BCN_COMP_SPV,
+    ASTC_DECODER_COMP_SPV, BC3_ENCODER_COMP_SPV, BLOCK_LINEAR_UNSWIZZLE_3D_BCN_COMP_SPV,
     QUERIES_PREFIX_SCAN_SUM_COMP_SPV, QUERIES_PREFIX_SCAN_SUM_NOSUBGROUPS_COMP_SPV,
     RESOLVE_CONDITIONAL_RENDER_COMP_SPV, VULKAN_QUAD_INDEXED_COMP_SPV, VULKAN_UINT8_COMP_SPV,
 };
@@ -1327,6 +1327,315 @@ impl AstcDecoderPass {
             }
         }
         true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bc3EncoderPass
+// ---------------------------------------------------------------------------
+
+/// Bank info for the BC3 encoder pass (2 storage images).
+const BC3_ENCODER_BANK_INFO: DescriptorBankInfo = DescriptorBankInfo {
+    uniform_buffers: 0,
+    storage_buffers: 0,
+    texture_buffers: 0,
+    image_buffers: 0,
+    textures: 0,
+    images: 2,
+    score: 2,
+};
+
+/// Ruzu extension (no upstream counterpart): encodes an RGBA8 mip level to
+/// BC3 with `bc3_encoder.comp` and copies the result into a BC3 image, so an
+/// ASTC texture decoded by `AstcDecoderPass` never leaves the GPU.
+///
+/// The shader writes one RGBA32UI texel per 4x4 block into a scratch image;
+/// Vulkan allows `vkCmdCopyImage` between that format and a BC3 image because
+/// a texel and a block are both 128 bits.
+pub struct Bc3EncoderPass {
+    base: ComputePass,
+    scheduler: NonNull<Scheduler>,
+    compute_pass_descriptor_queue: NonNull<ComputePassDescriptorQueue>,
+}
+
+impl Bc3EncoderPass {
+    pub fn new(
+        device: &Device,
+        scheduler: &mut Scheduler,
+        descriptor_pool: &mut DescriptorPool,
+        compute_pass_descriptor_queue: &mut ComputePassDescriptorQueue,
+    ) -> Result<Self, vk::Result> {
+        let entry_size = std::mem::size_of::<
+            crate::renderer_vulkan::update_descriptor::DescriptorUpdateEntry,
+        >();
+        let bindings: [vk::DescriptorSetLayoutBinding; 2] = [0u32, 1].map(|binding| {
+            vk::DescriptorSetLayoutBinding {
+                binding,
+                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                p_immutable_samplers: std::ptr::null(),
+                ..Default::default()
+            }
+        });
+        let templates: [vk::DescriptorUpdateTemplateEntry; 2] = [0u32, 1].map(|binding| {
+            vk::DescriptorUpdateTemplateEntry {
+                dst_binding: binding,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                offset: binding as usize * entry_size,
+                stride: entry_size,
+            }
+        });
+        let push_constants = [vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            offset: 0,
+            size: std::mem::size_of::<[i32; 4]>() as u32,
+        }];
+        let base = ComputePass::new(
+            device,
+            scheduler,
+            descriptor_pool,
+            &bindings,
+            &templates,
+            &BC3_ENCODER_BANK_INFO,
+            &push_constants,
+            BC3_ENCODER_COMP_SPV,
+            None,
+        )?;
+        Ok(Self {
+            base,
+            scheduler: NonNull::from(scheduler),
+            compute_pass_descriptor_queue: NonNull::from(compute_pass_descriptor_queue),
+        })
+    }
+
+    /// Puts `destination` in GENERAL layout, ready to receive block copies.
+    pub fn begin(&mut self, destination: vk::Image, is_initialized: bool) {
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        let device = self.base.device.get().get_logical().clone();
+        scheduler.request_outside_render_pass_operation_context();
+        scheduler.record(move |cmdbuf| unsafe {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(if is_initialized {
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_WRITE
+                } else {
+                    vk::AccessFlags::empty()
+                })
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(if is_initialized {
+                    vk::ImageLayout::GENERAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                })
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(destination)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: vk::REMAINING_MIP_LEVELS,
+                    base_array_layer: 0,
+                    layer_count: vk::REMAINING_ARRAY_LAYERS,
+                });
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                if is_initialized {
+                    vk::PipelineStageFlags::ALL_GRAPHICS
+                        | vk::PipelineStageFlags::COMPUTE_SHADER
+                        | vk::PipelineStageFlags::TRANSFER
+                } else {
+                    vk::PipelineStageFlags::TOP_OF_PIPE
+                },
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        });
+    }
+
+    /// Encodes the `source_size` texels behind `source_view` and copies the
+    /// blocks into mip `destination_level` of `destination`, for all `layers`.
+    /// `block_image` is the RGBA32UI scratch image behind `block_view`; it is
+    /// reused for every level, so its previous contents are discarded.
+    pub fn encode_level(
+        &mut self,
+        source_view: vk::ImageView,
+        source_size: [u32; 2],
+        block_image: vk::Image,
+        block_view: vk::ImageView,
+        destination: vk::Image,
+        destination_level: u32,
+        layers: u32,
+    ) {
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        let device = self.base.device.get().get_logical().clone();
+        let pipeline = self.base.pipeline;
+        let layout = self.base.layout;
+        let block_count = [source_size[0].div_ceil(4), source_size[1].div_ceil(4)];
+        let descriptor_data = unsafe {
+            let queue = self.compute_pass_descriptor_queue.as_mut();
+            queue.acquire(scheduler, 2, false);
+            queue.add_image(source_view);
+            queue.add_image(block_view);
+            DescriptorData(queue.update_data())
+        };
+        let uniforms: [i32; 4] = [
+            block_count[0] as i32,
+            block_count[1] as i32,
+            source_size[0] as i32,
+            source_size[1] as i32,
+        ];
+        let descriptor_allocator = self
+            .base
+            .descriptor_allocator
+            .as_ref()
+            .expect("Bc3EncoderPass requires descriptor bindings")
+            .reference();
+        let descriptor_template = self.base.descriptor_template;
+        scheduler.record(move |cmdbuf| unsafe {
+            let block_range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: vk::REMAINING_ARRAY_LAYERS,
+            };
+            // The scratch image is rewritten for every level.
+            let to_write = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(block_image)
+                .subresource_range(block_range);
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_write],
+            );
+            let descriptor_set = descriptor_allocator
+                .commit()
+                .expect("BC3 encoder descriptor allocation failed");
+            device.update_descriptor_set_with_template(
+                descriptor_set,
+                descriptor_template,
+                descriptor_data.as_raw_data(),
+            );
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmdbuf,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            device.cmd_push_constants(
+                cmdbuf,
+                layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&uniforms),
+            );
+            device.cmd_dispatch(
+                cmdbuf,
+                block_count[0].div_ceil(8),
+                block_count[1].div_ceil(8),
+                layers,
+            );
+            let to_read = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(block_image)
+                .subresource_range(block_range);
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_read],
+            );
+            // Between an uncompressed source and a compressed destination the
+            // extent is given in source texels: one per destination block.
+            let copy = vk::ImageCopy {
+                src_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: layers,
+                },
+                src_offset: vk::Offset3D::default(),
+                dst_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: destination_level,
+                    base_array_layer: 0,
+                    layer_count: layers,
+                },
+                dst_offset: vk::Offset3D::default(),
+                extent: vk::Extent3D {
+                    width: block_count[0],
+                    height: block_count[1],
+                    depth: 1,
+                },
+            };
+            device.cmd_copy_image(
+                cmdbuf,
+                block_image,
+                vk::ImageLayout::GENERAL,
+                destination,
+                vk::ImageLayout::GENERAL,
+                &[copy],
+            );
+        });
+    }
+
+    /// Makes the copied blocks visible to later sampling of `destination`.
+    pub fn end(&mut self, destination: vk::Image) {
+        let scheduler = unsafe { self.scheduler.as_mut() };
+        let device = self.base.device.get().get_logical().clone();
+        scheduler.record(move |cmdbuf| unsafe {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(destination)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: vk::REMAINING_MIP_LEVELS,
+                    base_array_layer: 0,
+                    layer_count: vk::REMAINING_ARRAY_LAYERS,
+                });
+            device.cmd_pipeline_barrier(
+                cmdbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        });
     }
 }
 

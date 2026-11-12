@@ -26150,3 +26150,49 @@ drawn black and appearing or vanishing from one frame to the next.
 ### Tests
 - `nx2_syncpt_slot_reuse_cancels_clears_and_signals_on_host_progress`
   (renamed): guest progress alone neither signals nor is reported.
+
+## 2026-11-12 - Experimental GPU ASTC to BC3 transcode (video_core: host_shaders/bc3_encoder.comp, renderer_vulkan/compute_pass.rs, renderer_vulkan/texture_cache.rs)
+
+### Ruzu extension (no upstream counterpart), off by default
+- The `gpu_astc_recompression` setting (Renderer hacks category, per-game
+  capable, default off; GTK: Graphics, Extras, "Recompress ASTC to BC3 on the
+  GPU") keeps the conversion of ASTC textures to BC3 on the GPU. It is read
+  when a session creates its renderer. The first version of this entry used
+  the environment variable `RUZU_GPU_BC3_TRANSCODE`, which no longer exists.
+- Upstream decodes ASTC on the GPU only when the result stays
+  uncompressed; with a BC recompression it decodes and encodes on the CPU.
+- Path, for plain 2D ASTC images (mips and layers included) whose decoded
+  size is at most 256 MiB, when `accelerate_astc` is Gpu and the effective
+  recompression is Bc3: `AstcDecoderPass` decodes the guest blocks into a
+  scratch RGBA8 image; `Bc3EncoderPass` (`bc3_encoder.comp`) encodes each
+  level into a scratch RGBA32UI image, one texel per 4x4 block; `vkCmdCopyImage`
+  copies those texels into the BC3 host image (a texel and a block are both
+  128 bits). 3D images, huge arrays and other recompression targets keep
+  their existing path.
+- The encoder is a real-time one: bounding-box colour endpoints with inset and
+  diagonal selection, nearest of the four palette entries, min/max alpha in
+  the eight-value mode. The CPU encoder (stb) refines its endpoints; quality
+  is expected to be slightly lower and was only checked by eye.
+- Scratch images are pooled by texture shape (8 entries, 512 MiB of decoded
+  size) and the path does not wait for the GPU after an upload.
+- `TextureCacheRuntime` now boxes `AstcDecoderPass` (and the new pass):
+  recorded commands hold a pointer to the pass's descriptor allocator, and the
+  pass is moved out of its slot while it records. Upstream's path hides this
+  by waiting for the GPU before the pass is moved back; without that wait the
+  worker thread used a dangling pointer (panic in `ResourcePool`).
+- The converted-texture disk cache is not fed by this path.
+
+### Measured (Mario Kart World, RX 5700 XT, cold caches, conversion cache off)
+- Time to the 600th present: 41.9 to 42.5 s (three runs) against 48.3 and
+  48.6 s on the CPU path (two runs); 1200th present 71.9 to 73.6 s against
+  78.5 and 78.7 s.
+- Worst frame of the first 600: 1.27 to 1.41 s against 2.92 and 3.47 s.
+  Frames over 100 ms in the next 600: 2 against 10 and 13.
+
+### Missing items
+- BC1 and BC7 targets; 3D and huge-array images; image
+  quality metrics against the CPU encoder; other GPUs and drivers; VRAM use
+  of the scratch pool under pressure.
+
+### Tests
+- `gpu_bc3_transcode_takes_only_plain_2d_astc_within_the_scratch_budget`.

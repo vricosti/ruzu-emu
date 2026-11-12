@@ -378,7 +378,7 @@ pub(crate) struct RuntimeInfoDeviceFeatures {
     pub(crate) molten_vk: bool,
 }
 
-fn make_runtime_info_with_features(
+pub(crate) fn make_runtime_info_with_features(
     programs: &[Option<Program>; NUM_PROGRAMS],
     key: &GraphicsPipelineKey,
     program: &Program,

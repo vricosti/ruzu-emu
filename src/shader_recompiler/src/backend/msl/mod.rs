@@ -24,6 +24,7 @@ mod emit_msl_image_atomic;
 mod emit_msl_integer;
 mod emit_msl_logical;
 mod emit_msl_memory;
+mod emit_msl_mesh;
 mod emit_msl_select;
 mod emit_msl_shared_memory;
 mod emit_msl_special;
@@ -84,6 +85,11 @@ pub struct MslOptions {
     /// (`MTLDevice.maxThreadgroupMemoryLength`). Guest shared memory above it
     /// cannot be a `threadgroup` array and is backed by a device buffer.
     pub max_threadgroup_memory_length: u32,
+    /// Task-backed mesh kernels reject child groups beyond the task's count.
+    pub mesh_task_count_guard: bool,
+    /// The vertex entry point is the generated reader of the mesh output
+    /// transport and takes the `mesh_output` buffer.
+    pub mesh_vertex: bool,
 }
 
 impl Default for MslOptions {
@@ -98,6 +104,8 @@ impl Default for MslOptions {
             disable_rasterization: false,
             geometry_provoking_vertex_last: false,
             max_threadgroup_memory_length: u32::MAX,
+            mesh_task_count_guard: false,
+            mesh_vertex: false,
         }
     }
 }
@@ -144,6 +152,19 @@ pub struct MslBindingLayout {
     /// so every storage access is clamped to it; an unclamped guest offset
     /// past the bound `MTLBuffer` faults or hangs the GPU.
     pub storage_limits_buffer_index: Option<u32>,
+    /// Task/mesh compute transport (see `emit_msl_mesh.rs`): the per-group
+    /// dispatch mapping, the task payload transport and, for mesh programs,
+    /// the output records read by the generated vertex function.
+    pub mesh_dispatch_buffer_index: Option<u32>,
+    pub mesh_payload_buffer_index: Option<u32>,
+    pub mesh_output_buffer_index: Option<u32>,
+    /// Present when a task/mesh kernel's workgroup storage exceeds the
+    /// device's `threadgroup` limit. The renderer binds a scratch buffer of
+    /// `threadgroups * mesh_workgroup_words * 4` bytes here; each physical
+    /// group addresses its own slice.
+    pub mesh_workgroup_buffer_index: Option<u32>,
+    /// Words in one group's slice of the workgroup-storage buffer.
+    pub mesh_workgroup_words: u32,
     /// Present when guest shared memory exceeds the device's `threadgroup`
     /// limit. The renderer binds a scratch buffer of
     /// `threadgroups * shared_memory_words * 4` bytes here; each threadgroup

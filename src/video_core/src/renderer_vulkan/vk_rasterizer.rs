@@ -45,7 +45,7 @@ static MESH_DRAW_ENABLED: std::sync::atomic::AtomicBool =
 /// such draws a second, and scenery flickers in and out with a still camera;
 /// with the adaptation on there are none and it is stable, at the same frame
 /// rate. `RUZU_NX2_MESH_DRAW=0` turns it off, any other value forces it on.
-fn configure_mesh_draw() -> bool {
+pub(crate) fn configure_mesh_draw() -> bool {
     let enabled = match std::env::var_os("RUZU_NX2_MESH_DRAW") {
         Some(value) => !value.to_string_lossy().starts_with('0'),
         None => common::settings::values().use_nx2_session_policies,
@@ -107,7 +107,7 @@ impl MeshComputeOutput {
     }
 }
 
-fn mesh_output_record_capacity(
+pub(crate) fn mesh_output_record_capacity(
     layout: shader_recompiler::backend::spirv::spirv_emit_context::MeshOutputLayout,
     max_storage_range: u64,
 ) -> Result<u32, &'static str> {

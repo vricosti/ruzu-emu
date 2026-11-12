@@ -54,8 +54,8 @@ use crate::renderer_vulkan::fixed_pipeline_state::DynamicFeatures;
 use crate::renderer_vulkan::fixed_pipeline_state::FixedPipelineState;
 use crate::renderer_vulkan::graphics_pipeline::GraphicsPipelineKey;
 use crate::renderer_vulkan::pipeline_cache::{
-    translate_graphics_stages_from_environments_with_features, RuntimeInfoDeviceFeatures,
-    NUM_GRAPHICS_STAGES,
+    make_runtime_info_with_features, translate_graphics_stages_from_environments_with_features,
+    RuntimeInfoDeviceFeatures, NUM_GRAPHICS_STAGES,
 };
 use crate::shader_cache::{GraphicsEnvironments, ShaderCache as SharedShaderCache};
 use crate::shader_environment::{
@@ -68,10 +68,14 @@ use super::metal_framebuffer::MetalFramebuffer;
 use super::metal_geometry_pipeline::{
     MetalGeometryPipeline, MetalGeometryPipelineError, MetalGeometryShaderStages,
 };
+use super::metal_mesh_pipeline::{
+    MetalMeshComputePrograms, MetalMeshComputeStage, MetalMeshShaderStages,
+};
 use super::metal_tessellation_pipeline::{MetalTessellationPipeline, MetalTessellationPipelineError,
     MetalTessellationShaderStages};
 use super::metal_shader::{
-    compile_cached_direct_msl_shader_with_bindings, direct_msl_options, DirectMslCompileError,
+    compile_cached_direct_msl_shader_with_bindings, compile_cached_native_msl_artifact,
+    direct_msl_options, DirectMslCompileError,
     MetalShaderBindingLayout, MetalShaderCompileOptions, MetalShaderError, MetalShaderModule,
 };
 #[cfg(feature = "metal-spirv-validation")]
@@ -145,7 +149,11 @@ pub fn make_shader_profile(device: &MetalDeviceProfile) -> Profile {
         },
         support_viewport_index_layer_non_geometry: false,
         support_viewport_mask: false,
-        support_typeless_image_loads: false,
+        // MSL `access::read` textures carry no format qualifier, so a guest
+        // image load without a declared format reads natively (Vulkan's
+        // `shaderStorageImageReadWithoutFormat`). Leaving this off makes every
+        // such load return zero, as upstream does for hosts lacking it.
+        support_typeless_image_loads: true,
         support_demote_to_helper_invocation: true,
         // Apple8 exposes only 64-bit min/max, and the full operation set is
         // limited to Apple9+. Keep the coarse shader profile disabled until
@@ -200,7 +208,12 @@ pub fn make_host_translate_info(device: &MetalDeviceProfile) -> HostTranslateInf
         support_snorm_render_buffer: true,
         support_viewport_index_layer: false,
         support_geometry_shader_passthrough: false,
-        support_conditional_barrier: false,
+        // Eden disables this only for Intel's Vulkan drivers. Metal accepts
+        // `threadgroup_barrier` in conditional control flow, and guest
+        // programs depend on it: without it ConditionalBarrierPass strips
+        // every barrier that follows a conditional return, and the phases of
+        // (for one) the single-pass mip downsampler race through shared memory.
+        support_conditional_barrier: true,
     };
     host_info.apply_descriptor_limit_policy();
     host_info
@@ -435,6 +448,24 @@ impl MetalDepthStencilKey {
         }))
     }
 
+    /// Restrict the state to the attachments the render pass actually has.
+    /// Vulkan defines the depth and stencil tests as passing, and their
+    /// writes as absent, when the subpass lacks the attachment. Metal applies
+    /// the state regardless: a stencil comparison against a missing
+    /// attachment rejects every fragment.
+    pub fn for_attachments(mut self, depth_format: MTLPixelFormat, stencil_format: MTLPixelFormat) -> Self {
+        if depth_format == MTLPixelFormat::Invalid {
+            self.depth_compare = MTLCompareFunction::Always;
+            self.depth_write_enabled = false;
+        }
+        if stencil_format == MTLPixelFormat::Invalid {
+            self.stencil_enabled = false;
+            self.front = MetalStencilFaceState::default();
+            self.back = MetalStencilFaceState::default();
+        }
+        self
+    }
+
     fn from_fixed_state(fixed: &FixedPipelineState, live: &DepthStencilInfo) -> Self {
         let dynamic = &fixed.dynamic_state;
         let depth_test_enabled = dynamic.depth_test_enable();
@@ -566,6 +597,8 @@ enum MetalVertexShader {
     Native(Arc<MetalShaderModule>),
     Geometry(Arc<MetalGeometryShaderStages>),
     Tessellation(Arc<MetalTessellationShaderStages>),
+    /// Compute-backed guest task/mesh programs and their generated reader.
+    Mesh(Arc<MetalMeshShaderStages>),
 }
 
 impl MetalGraphicsShaderStages {
@@ -580,6 +613,7 @@ impl MetalGraphicsShaderStages {
     pub fn vertex(&self) -> Option<&MetalShaderModule> {
         match &self.vertex {
             MetalVertexShader::Native(module) => Some(module),
+            MetalVertexShader::Mesh(stages) => Some(&stages.vertex),
             MetalVertexShader::Geometry(_) | MetalVertexShader::Tessellation(_) => None,
         }
     }
@@ -587,6 +621,7 @@ impl MetalGraphicsShaderStages {
     pub fn vertex_bindings(&self) -> &MetalShaderBindingLayout {
         match &self.vertex {
             MetalVertexShader::Native(module) => module.bindings(),
+            MetalVertexShader::Mesh(stages) => stages.vertex.bindings(),
             MetalVertexShader::Geometry(stages) => &stages.vertex.bindings,
             MetalVertexShader::Tessellation(stages) => &stages.vertex.bindings,
         }
@@ -595,7 +630,14 @@ impl MetalGraphicsShaderStages {
     pub fn geometry(&self) -> Option<&MetalGeometryShaderStages> {
         match &self.vertex {
             MetalVertexShader::Geometry(stages) => Some(stages),
-            MetalVertexShader::Native(_) | MetalVertexShader::Tessellation(_) => None,
+            _ => None,
+        }
+    }
+
+    pub fn mesh(&self) -> Option<&MetalMeshShaderStages> {
+        match &self.vertex {
+            MetalVertexShader::Mesh(stages) => Some(stages),
+            _ => None,
         }
     }
 
@@ -758,6 +800,10 @@ pub struct MetalPipelineCache {
         HashMap<MetalDepthStencilKey, Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
     compute_pipelines: HashMap<MetalComputePipelineKey, MetalComputePipeline>,
     graphics_shader_modules: HashMap<GraphicsPipelineKey, MetalGraphicsShaderStages>,
+    // Keyed like the Vulkan cache: the task/mesh program hashes already carry
+    // the mesh-register identity; the graphics half adds the fixed state.
+    mesh_compute_cache: HashMap<[u64; 6], Option<Arc<MetalMeshComputePrograms>>>,
+    mesh_graphics_cache: HashMap<GraphicsPipelineKey, Option<MetalGraphicsShaderStages>>,
     graphics_key: GraphicsPipelineKey,
     dynamic_features: DynamicFeatures,
     pipeline_cache_filename: PathBuf,
@@ -786,6 +832,8 @@ impl MetalPipelineCache {
             depth_stencil_states: HashMap::new(),
             compute_pipelines: HashMap::new(),
             graphics_shader_modules: HashMap::new(),
+            mesh_compute_cache: HashMap::new(),
+            mesh_graphics_cache: HashMap::new(),
             graphics_key: GraphicsPipelineKey::default(),
             // Metal state not represented by a dynamic encoder command stays
             // in the fixed key. Start with every Vulkan-only dynamic feature
@@ -1150,6 +1198,243 @@ impl MetalPipelineCache {
         Ok(self.graphics_shader_modules.get(&key).cloned())
     }
 
+    /// Mesh-compute counterpart of `current_graphics_shaders`; the Metal form
+    /// of the Vulkan `PipelineCache::current_mesh_compute_programs`. The
+    /// shared cache must have been constructed with `new_mesh_compute`.
+    pub(crate) fn current_mesh_compute_programs(
+        &mut self,
+        shared_cache: &mut SharedShaderCache,
+    ) -> Option<Arc<MetalMeshComputePrograms>> {
+        let maxwell = shared_cache.current_maxwell3d()?;
+        if !maxwell.is_mesh_enabled()
+            || !maxwell.get_native_macro_engine_read(|engine| engine.native_turing)
+        {
+            return None;
+        }
+        if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
+            return None;
+        }
+        let hashes = self.graphics_key.unique_hashes;
+        if !self.mesh_compute_cache.contains_key(&hashes) {
+            let _notification = self.shader_notify.map(|notify| notify.build_scope());
+            let mut environments = GraphicsEnvironments::default();
+            shared_cache.get_graphics_environments(&mut environments, &hashes);
+            let built = catch_shader_exception(|| {
+                Self::build_mesh_compute_programs(&self.device, &self.profile, &self.host_info,
+                    &hashes, &mut environments)
+            })
+            .and_then(|result| result);
+            let programs = match built {
+                Ok(programs) => Some(Arc::new(programs)),
+                Err(error) => {
+                    log::error!("Metal mesh compute pipeline {:016x?}: {error}", hashes);
+                    None
+                }
+            };
+            self.mesh_compute_cache.insert(hashes, programs);
+        }
+        self.mesh_compute_cache.get(&hashes)?.clone()
+    }
+
+    fn build_mesh_compute_programs(
+        device: &MetalDevice,
+        profile: &Profile,
+        host_info: &HostTranslateInfo,
+        hashes: &[u64; 6],
+        environments: &mut GraphicsEnvironments,
+    ) -> Result<MetalMeshComputePrograms, String> {
+        use shader_recompiler::backend::msl::emit_msl::emit_msl_mesh_compute;
+        let mut task = None;
+        let mut task_info = None;
+        let mut task_workgroup_bound = None;
+        let mut mesh = None;
+        let mut mesh_info = None;
+        for index in [1, 3] {
+            if hashes[index] == 0 {
+                continue;
+            }
+            if !environments.env_ptrs.contains(&Some(index)) {
+                return Err(format!("Missing mesh environment at graphics program {index}"));
+            }
+            let env = &mut environments.envs[index];
+            if env.generic_environment().cached_code_slice().is_empty()
+                && env.generic_environment_mut().analyze().is_none()
+            {
+                return Err(format!("Mesh analysis failed at graphics program {index}"));
+            }
+            let code = env.generic_environment().cached_instruction_slice().to_vec();
+            let start = env.generic_environment().cached_instruction_start();
+            let program = shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
+                &code, start, env, host_info);
+            let options = MetalShaderCompileOptions::for_compute_device(
+                device.profile(), program.workgroup_size);
+            let artifact = emit_msl_mesh_compute(&program, profile, &RuntimeInfo::default(),
+                &direct_msl_options(device.device(), &options), &mut Bindings::default(),
+                task.is_some())
+                .map_err(|error| format!("program {index}: {error}"))?;
+            let shader = Arc::new(compile_cached_native_msl_artifact(device, artifact)
+                .map_err(|error| format!("program {index}: {error}"))?);
+            let state = Self::create_compute_pipeline_state(device, &shader)
+                .map_err(|error| format!("program {index}: {error}"))?;
+            let threads = program.workgroup_size[0];
+            if threads as usize > device.profile().max_threads_per_threadgroup.0
+                || threads as usize > state.maxTotalThreadsPerThreadgroup()
+            {
+                return Err(format!("program {index}: workgroup of {threads} threads exceeds the device"));
+            }
+            let stage = MetalMeshComputeStage {
+                resource_stage: index - 1,
+                info: program.info.clone(),
+                shader,
+                state,
+                threads,
+            };
+            if program.info.is_task {
+                if task.is_some() {
+                    return Err("Duplicate task stage".into());
+                }
+                task = Some(stage);
+                task_info = Some(program.mesh.clone());
+                task_workgroup_bound =
+                    shader_recompiler::backend::spirv::emit_spirv_mesh::task_mesh_workgroup_bound(&program);
+            } else {
+                if mesh.is_some() {
+                    return Err("Duplicate mesh stage".into());
+                }
+                mesh = Some(stage);
+                mesh_info = Some(program.mesh.clone());
+            }
+        }
+        Ok(MetalMeshComputePrograms {
+            task,
+            task_info,
+            task_workgroup_bound,
+            mesh: mesh.ok_or("Mesh graphics pipeline has no mesh stage")?,
+            mesh_info: mesh_info.ok_or("Mesh graphics pipeline has no mesh metadata")?,
+        })
+    }
+
+    /// Graphics half of a compute-backed mesh draw; the Metal form of the
+    /// Vulkan `current_mesh_graphics_pipeline` up through module creation.
+    pub(crate) fn current_mesh_graphics_shaders(
+        &mut self,
+        draw: &mut Maxwell3DDrawView<'_>,
+        shared_cache: &SharedShaderCache,
+        programs: &Arc<MetalMeshComputePrograms>,
+    ) -> Option<MetalGraphicsShaderStages> {
+        let features = self.dynamic_features;
+        self.graphics_key.fixed_state.refresh(draw, &features);
+        let mut key = self.graphics_key.clone();
+        let mesh = &programs.mesh_info;
+        // Mesh output topology replaces the guest draw's group-launch topology.
+        let topology = match mesh.topology {
+            0 => PrimitiveTopology::Points,
+            1 => PrimitiveTopology::Lines,
+            _ => PrimitiveTopology::Triangles,
+        };
+        key.fixed_state.set_topology(topology);
+        key.fixed_state.dynamic_state.set_primitive_restart_enable(false);
+        let rasterizer = draw.rasterizer();
+        key.fixed_state.dynamic_state.set_depth_bias_enable(match topology {
+            PrimitiveTopology::Points => rasterizer.polygon_offset_point_enable,
+            PrimitiveTopology::Lines => rasterizer.polygon_offset_line_enable,
+            _ => rasterizer.polygon_offset_fill_enable,
+        });
+        if !self.mesh_graphics_cache.contains_key(&key) {
+            let _notification = self.shader_notify.map(|notify| notify.build_scope());
+            let mut environments = GraphicsEnvironments::default();
+            shared_cache.get_graphics_environments(&mut environments, &key.unique_hashes);
+            let built = catch_shader_exception(|| {
+                Self::build_mesh_graphics_stages(&self.device, &self.profile, &self.host_info,
+                    &key, &mut environments, programs)
+            })
+            .and_then(|result| result);
+            let stages = match built {
+                Ok(stages) => Some(stages),
+                Err(error) => {
+                    log::error!("Metal mesh graphics pipeline 0x{:016X}: {error}", key.hash_value());
+                    None
+                }
+            };
+            self.mesh_graphics_cache.insert(key.clone(), stages);
+        }
+        self.mesh_graphics_cache.get(&key)?.clone()
+    }
+
+    /// The MSL form of the Vulkan `compile_mesh_graphics_stages`: only the
+    /// preceding vertex stage is generated; the guest fragment program keeps
+    /// its normal fixed-state runtime specialization.
+    fn build_mesh_graphics_stages(
+        device: &MetalDevice,
+        profile: &Profile,
+        host_info: &HostTranslateInfo,
+        key: &GraphicsPipelineKey,
+        environments: &mut GraphicsEnvironments,
+        programs: &Arc<MetalMeshComputePrograms>,
+    ) -> Result<MetalGraphicsShaderStages, String> {
+        use shader_recompiler::backend::msl::emit_msl::emit_msl_mesh_vertex;
+        use shader_recompiler::ir::Program;
+        let features = RuntimeInfoDeviceFeatures { transform_feedback: true, molten_vk: true };
+        let fragment_program = if key.unique_hashes[5] != 0 {
+            if !environments.env_ptrs.contains(&Some(5)) {
+                return Err("Missing mesh fragment environment".into());
+            }
+            let env = &mut environments.envs[5];
+            if env.generic_environment().cached_code_slice().is_empty()
+                && env.generic_environment_mut().analyze().is_none()
+            {
+                return Err("Mesh fragment analysis failed".into());
+            }
+            let code = env.generic_environment().cached_instruction_slice().to_vec();
+            let start = env.generic_environment().cached_instruction_start();
+            Some(shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
+                &code, start, env, host_info))
+        } else {
+            None
+        };
+        let mut options = MetalShaderCompileOptions::for_device(device.profile());
+        options.enable_point_size_builtin = key.fixed_state.topology() == PrimitiveTopology::Points;
+        options.disable_rasterization = !metal_rasterization_enabled(&key.fixed_state, None);
+        let none: [Option<Program>; 6] = std::array::from_fn(|_| None);
+        let mut vertex_program = Program::new(Stage::VertexB);
+        let runtime = make_runtime_info_with_features(&none, key, &vertex_program, None, features);
+        let (artifact, info) = emit_msl_mesh_vertex(&programs.mesh_info, profile, &runtime,
+            &direct_msl_options(device.device(), &options), &mut Bindings::default())
+            .map_err(|error| format!("generated vertex: {error}"))?;
+        vertex_program.info = info;
+        let vertex = Arc::new(compile_cached_native_msl_artifact(device, artifact)
+            .map_err(|error| format!("generated vertex: {error}"))?);
+        let mut stage_infos: [ShaderInfo; NUM_GRAPHICS_STAGES] = Default::default();
+        for kernel in programs.task.iter().chain(std::iter::once(&programs.mesh)) {
+            stage_infos[kernel.resource_stage] = kernel.info.clone();
+        }
+        let fragment = match fragment_program {
+            Some(program) => {
+                let runtime = make_runtime_info_with_features(&none, key, &program,
+                    Some(&vertex_program), features);
+                // Each stage of a mesh pipeline owns an independent binding sequence.
+                let module = compile_cached_direct_msl_shader_with_bindings(device, &program,
+                    profile, &runtime, &options, &mut Bindings::default())
+                    .map_err(|error| format!("fragment: {error}"))?;
+                stage_infos[4] = program.info;
+                Some(Arc::new(module))
+            }
+            None => None,
+        };
+        let (enabled_uniform_buffer_masks, uniform_buffer_sizes) = buffer_cache_metadata(&stage_infos);
+        Ok(MetalGraphicsShaderStages {
+            key: key.clone(),
+            vertex: MetalVertexShader::Mesh(Arc::new(MetalMeshShaderStages {
+                vertex,
+                programs: Arc::clone(programs),
+            })),
+            fragment,
+            stage_infos: Arc::new(stage_infos),
+            enabled_uniform_buffer_masks,
+            uniform_buffer_sizes: Arc::new(uniform_buffer_sizes),
+        })
+    }
+
     pub fn get_or_create_tessellation_pipeline(
         &mut self,
         key: MetalRenderPipelineKey,
@@ -1273,6 +1558,10 @@ impl MetalPipelineCache {
         &self,
         stages: &MetalGraphicsShaderStages,
     ) -> Result<MetalVertexInputState, MetalPipelineError> {
+        if stages.mesh().is_some() {
+            // The generated vertex function pulls from the output transport.
+            return Ok(MetalVertexInputState::default());
+        }
         MetalVertexInputState::from_fixed_state(
             &stages.key.fixed_state,
             &stages.stage_infos[0],
@@ -1300,8 +1589,10 @@ impl MetalPipelineCache {
         key.sample_count = framebuffer.samples();
         key.topology = if stages.tessellation().is_some() { MTLPrimitiveTopologyClass::Triangle }
             else { metal_topology_class(fixed.topology()) };
-        key.alpha_to_coverage = fixed.alpha_to_coverage_enabled();
-        key.alpha_to_one = fixed.alpha_to_one_enabled();
+        // Both read fragment output 0's alpha; skipped for an integer target.
+        let alpha_coverage_applies = !metal_integer_color_format(color_formats[0]);
+        key.alpha_to_coverage = fixed.alpha_to_coverage_enabled() && alpha_coverage_applies;
+        key.alpha_to_one = fixed.alpha_to_one_enabled() && alpha_coverage_applies;
         key.rasterization_enabled =
             metal_rasterization_enabled(fixed, if stages.tessellation().is_some() {
                 Some(OutputTopology::TriangleStrip)
@@ -1821,10 +2112,45 @@ fn make_vertex_descriptor(state: &MetalVertexInputState) -> Retained<MTLVertexDe
     descriptor
 }
 
+/// Integer color formats: Metal's pipeline validation aborts the process when
+/// blending, alpha-to-coverage or alpha-to-one is requested for one. Vulkan
+/// defines all three as not applied to integer attachments.
+fn metal_integer_color_format(format: MTLPixelFormat) -> bool {
+    matches!(
+        format,
+        MTLPixelFormat::R8Uint | MTLPixelFormat::R8Sint
+            | MTLPixelFormat::R16Uint | MTLPixelFormat::R16Sint
+            | MTLPixelFormat::RG8Uint | MTLPixelFormat::RG8Sint
+            | MTLPixelFormat::R32Uint | MTLPixelFormat::R32Sint
+            | MTLPixelFormat::RG16Uint | MTLPixelFormat::RG16Sint
+            | MTLPixelFormat::RGBA8Uint | MTLPixelFormat::RGBA8Sint
+            | MTLPixelFormat::RGB10A2Uint
+            | MTLPixelFormat::RG32Uint | MTLPixelFormat::RG32Sint
+            | MTLPixelFormat::RGBA16Uint | MTLPixelFormat::RGBA16Sint
+            | MTLPixelFormat::RGBA32Uint | MTLPixelFormat::RGBA32Sint
+    )
+}
+
 fn metal_color_attachment(
     attachment: crate::renderer_vulkan::fixed_pipeline_state::BlendingAttachment,
     format: MTLPixelFormat,
 ) -> MetalColorAttachmentState {
+    if metal_integer_color_format(format) {
+        // Blending is not applied to integer attachments; keep the write mask.
+        if attachment.is_enabled() {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                log::info!("Metal: guest blending on integer attachment {format:?} is not applied");
+            }
+        }
+        let [red, green, blue, alpha] = attachment.mask();
+        let mut write_mask = MTLColorWriteMask::None;
+        write_mask.set(MTLColorWriteMask::Red, red);
+        write_mask.set(MTLColorWriteMask::Green, green);
+        write_mask.set(MTLColorWriteMask::Blue, blue);
+        write_mask.set(MTLColorWriteMask::Alpha, alpha);
+        return MetalColorAttachmentState { format, write_mask, ..MetalColorAttachmentState::disabled() };
+    }
     let [red, green, blue, alpha] = attachment.mask();
     let mut write_mask = MTLColorWriteMask::None;
     write_mask.set(MTLColorWriteMask::Red, red);
@@ -2293,6 +2619,22 @@ mod tests {
     }
 
     #[test]
+    fn integer_color_attachments_never_request_blending() {
+        use crate::renderer_vulkan::fixed_pipeline_state::BlendingAttachment;
+        let mut attachment = BlendingAttachment::default();
+        attachment.set_enabled(true);
+        attachment.set_mask(true, false, true, false);
+        for format in [MTLPixelFormat::RGBA8Uint, MTLPixelFormat::R32Sint, MTLPixelFormat::RGB10A2Uint] {
+            let state = metal_color_attachment(attachment, format);
+            assert_eq!(state.format, format);
+            assert!(!state.blending_enabled);
+            assert_eq!(state.write_mask, MTLColorWriteMask::Red | MTLColorWriteMask::Blue);
+        }
+        assert!(metal_color_attachment(attachment, MTLPixelFormat::RGBA8Unorm).blending_enabled);
+        assert!(metal_color_attachment(attachment, MTLPixelFormat::RGBA16Float).blending_enabled);
+    }
+
+    #[test]
     fn color_attachment_preserves_maxwell_blend_and_write_mask() {
         let mut attachment =
             crate::renderer_vulkan::fixed_pipeline_state::BlendingAttachment::default();
@@ -2405,6 +2747,28 @@ mod tests {
         }
         key.depth_write_enabled = true;
         assert!(key.may_write_depth_stencil());
+    }
+
+    #[test]
+    fn missing_attachments_disable_their_tests_like_vulkan() {
+        let enabled = MetalDepthStencilKey {
+            depth_compare: MTLCompareFunction::Less,
+            depth_write_enabled: true,
+            stencil_enabled: true,
+            front: MetalStencilFaceState { compare: MTLCompareFunction::Equal, ..Default::default() },
+            back: MetalStencilFaceState { compare: MTLCompareFunction::Equal, ..Default::default() },
+        };
+        let depth = MTLPixelFormat::Depth32Float;
+        let combined = MTLPixelFormat::Depth32Float_Stencil8;
+        assert_eq!(enabled.for_attachments(combined, combined), enabled);
+        let color_only = enabled.for_attachments(MTLPixelFormat::Invalid, MTLPixelFormat::Invalid);
+        assert_eq!(color_only.depth_compare, MTLCompareFunction::Always);
+        assert!(!color_only.depth_write_enabled && !color_only.stencil_enabled);
+        assert!(!color_only.may_write_depth_stencil());
+        let depth_only = enabled.for_attachments(depth, MTLPixelFormat::Invalid);
+        assert_eq!(depth_only.depth_compare, MTLCompareFunction::Less);
+        assert!(depth_only.depth_write_enabled && !depth_only.stencil_enabled);
+        assert_eq!(depth_only.front, MetalStencilFaceState::default());
     }
 
     #[test]

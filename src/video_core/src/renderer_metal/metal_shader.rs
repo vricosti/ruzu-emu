@@ -676,6 +676,14 @@ pub fn compile_native_msl_artifact(
     compile_native_msl_artifact_cached(device, artifact, None)
 }
 
+/// As `compile_native_msl_artifact`, sharing the device's compiled-function cache.
+pub(super) fn compile_cached_native_msl_artifact(
+    device: &super::metal_device::MetalDevice,
+    artifact: MetalShaderArtifact,
+) -> Result<MetalShaderModule, MetalShaderError> {
+    compile_native_msl_artifact_cached(device.device(), artifact, Some(device.shader_cache()))
+}
+
 fn compile_native_msl_artifact_cached(
     device: &ProtocolObject<dyn MTLDevice>,
     artifact: MetalShaderArtifact,
@@ -768,6 +776,8 @@ pub(crate) fn direct_msl_options(
         geometry_provoking_vertex_last: options.geometry_provoking_vertex_last,
         max_threadgroup_memory_length: u32::try_from(device.maxThreadgroupMemoryLength())
             .unwrap_or(u32::MAX),
+        mesh_task_count_guard: false,
+        mesh_vertex: false,
     }
 }
 
@@ -923,6 +933,46 @@ pub fn validate_direct_msl_against_active_module_with_bindings(
     Ok(direct)
 }
 
+/// Guest-visible part of a binding layout. Direct MSL adds renderer-owned
+/// buffers (storage limits, oversized shared memory, task/mesh transport)
+/// that SPIRV-Cross output has no counterpart for, and which shift the slots
+/// of the buffers declared after them.
+#[cfg(any(test, feature = "metal-spirv-validation"))]
+pub(crate) fn guest_binding_layout(layout: &MetalShaderBindingLayout) -> MetalShaderBindingLayout {
+    let internal: Vec<u32> = [
+        layout.storage_limits_buffer_index,
+        layout.mesh_dispatch_buffer_index,
+        layout.mesh_payload_buffer_index,
+        layout.mesh_output_buffer_index,
+        layout.mesh_workgroup_buffer_index,
+        layout.shared_memory_buffer_index,
+        layout.shared_memory_grid_buffer_index,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let remap = |index: u32| index - internal.iter().filter(|slot| **slot < index).count() as u32;
+    let mut guest = layout.clone();
+    for resource in &mut guest.resources {
+        if matches!(resource.kind, MetalResourceKind::UniformBuffer | MetalResourceKind::StorageBuffer) {
+            resource.buffer_index = remap(resource.buffer_index);
+        }
+    }
+    guest.push_constant_buffer_index = guest.push_constant_buffer_index.map(remap);
+    guest.sampler_argument_buffer_index = guest.sampler_argument_buffer_index.map(remap);
+    guest.buffer_count -= internal.len() as u32;
+    guest.storage_limits_buffer_index = None;
+    guest.mesh_dispatch_buffer_index = None;
+    guest.mesh_payload_buffer_index = None;
+    guest.mesh_output_buffer_index = None;
+    guest.mesh_workgroup_buffer_index = None;
+    guest.mesh_workgroup_words = 0;
+    guest.shared_memory_buffer_index = None;
+    guest.shared_memory_grid_buffer_index = None;
+    guest.shared_memory_words = 0;
+    guest
+}
+
 /// Compare an already-compiled direct-MSL module with the validation-only
 /// SPIRV-Cross module produced from the same backend-neutral IR.
 #[cfg(any(test, feature = "metal-spirv-validation"))]
@@ -936,7 +986,7 @@ pub fn validate_direct_msl_module_against_compatibility(
             active: compatibility.source().stage,
         });
     }
-    if direct.bindings() != compatibility.bindings() {
+    if guest_binding_layout(direct.bindings()) != guest_binding_layout(compatibility.bindings()) {
         return Err(DirectMslValidationError::BindingLayoutMismatch);
     }
     if direct.execution() != compatibility.execution() {
@@ -1160,7 +1210,9 @@ kernel void probe(device const uint4* input [[buffer(0)]], device uint4* output 
         let options = MslOptions { language_version: MslVersion::V3_0, ..Default::default() };
         let artifact = emit_msl_geometry_function(&program, &Profile::default(),
             &RuntimeInfo::default(), &options, &mut Bindings::default()).unwrap();
-        assert_eq!(artifact.bindings.buffer_count, 1);
+        // The guest counter and its bounds word.
+        assert_eq!(artifact.bindings.buffer_count, 2);
+        assert_eq!(artifact.bindings.storage_limits_buffer_index, Some(1));
         // This transport is test-owned. It snapshots the same mesh interface
         // into thread storage and exports scalar results, with no host struct ABI.
         let source = format!("{}\n{}", artifact.source.source, r#"
@@ -1174,10 +1226,10 @@ struct Capture {
     void set_primitive(uint i, MslGeometryPrimitiveOut p) thread { primitives[i] = p; }
     void set_primitive_count(uint n) thread { count = n; }
 };
-kernel void capture(device uint* counter [[buffer(0)]], device uint* result [[buffer(1)]]) {
+kernel void capture(device uint* counter [[buffer(0)]], constant uint* limits [[buffer(1)]], device uint* result [[buffer(2)]]) {
     MslGeometryPayload input = {};
     Capture output = {};
-    ruzu_geometry(counter, input, uint3(0), output);
+    ruzu_geometry(counter, limits, input, uint3(0), output);
     result[0] = output.count;
     for (uint i = 0; i < output.count; ++i) result[1 + i] = output.primitives[i].layer;
     for (uint i = 0; i < output.count * 2; ++i) result[5 + i] = output.indices[i];
@@ -1194,7 +1246,10 @@ kernel void capture(device uint* counter [[buffer(0)]], device uint* result [[bu
         scheduler.with_compute_encoder(|encoder| unsafe {
             encoder.setComputePipelineState(&pipeline);
             encoder.setBuffer_offset_atIndex(Some(counter.handle()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(result.handle()), 0, 1);
+            // Last addressable word of the one-word counter.
+            let limits = [0u32];
+            encoder.setBytes_length_atIndex(std::ptr::NonNull::from(&limits).cast(), 4, 1);
+            encoder.setBuffer_offset_atIndex(Some(result.handle()), 0, 2);
             let one = MTLSize { width: 1, height: 1, depth: 1 };
             encoder.dispatchThreads_threadsPerThreadgroup(one, one);
         }).unwrap();
@@ -1938,6 +1993,8 @@ fragment float4 shade_patch(MslVertexOut input [[stage_in]]) { return input.out_
                     MetalStageBufferBinding { index: 0, buffer: count_buffer, offset: 0 },
                     MetalStageBufferBinding { index: 1, buffer: geometry_counter.clone(), offset: 0 },
                 ],
+                // Slot after the guest buffers: last word of the counter.
+                storage_limits: Some((2, vec![(geometry_counter.length() / 4 - 1) as u32])),
                 ..Default::default()
             };
             let mut vertex_sizes = [0u64; 31];
@@ -3607,7 +3664,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 panic!("direct {name} MSL must compile with the active ABI: {error}")
             });
 
-            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
             assert_eq!(direct.execution(), active.execution());
         }
     }
@@ -3635,7 +3692,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         )
         .expect("direct render-area MSL must compile with the active push-constant ABI");
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         assert_eq!(direct.bindings().push_constant_buffer_index, Some(0));
         assert!(direct
             .source()
@@ -3672,7 +3729,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 panic!("direct {stage:?} rescaling must match the active ABI: {error}")
             });
 
-            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
             assert_eq!(direct.bindings().push_constant_buffer_index, Some(0));
             assert_eq!(
                 direct
@@ -3838,6 +3895,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("compatibility vertex built-ins must lower directly");
@@ -3928,7 +3986,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         )
         .expect("direct fragment depth/mask MSL must compile with the active ABI");
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         let source = &direct.source().source;
         assert!(!source.contains("[[depth(any)]]"));
         assert!(source.contains("[[sample_mask]]"));
@@ -3986,7 +4044,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         )
         .expect("direct vertex special-output MSL must compile with the active ABI");
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         let source = &direct.source().source;
         assert!(source.contains("[[point_size]]"));
         assert!(source.contains("[[clip_distance]]"));
@@ -4134,7 +4192,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         )
         .expect("direct alpha-test dual-source MSL must compile with the active ABI");
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         let source = &direct.source().source;
         assert!(source.contains("[[color(0), index(0)]]"));
         assert!(source.contains("[[color(0), index(1)]]"));
@@ -4189,7 +4247,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         )
         .expect("direct derivative MSL must compile with the active ABI");
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         let source = &direct.source().source;
         assert_eq!(source.matches("dfdx(").count(), 2);
         assert_eq!(source.matches("dfdy(").count(), 2);
@@ -4219,7 +4277,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         )
         .expect("direct warp MSL must compile with the active ABI");
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         let source = &direct.source().source;
         assert!(source.contains("thread_index_in_simdgroup"));
         assert!(source.contains("simd_ballot("));
@@ -4244,6 +4302,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("minimal compute IR must lower directly to MSL");
@@ -4377,6 +4436,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("shared-memory compute IR must lower directly to MSL 2.3");
@@ -4407,6 +4467,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("memory-barrier IR must lower directly to MSL");
@@ -4467,7 +4528,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         )
         .expect("direct 32-bit memory atomic MSL must compile with the active ABI");
         assert_eq!(shader.source().stage, Stage::Compute);
-        assert_eq!(shader.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(shader.bindings()), guest_binding_layout(active.bindings()));
         assert!(shader.source().source.contains("spvAtomicInc"));
         assert!(shader.source().source.contains("atomic_fetch_min_explicit"));
     }
@@ -4654,6 +4715,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("supported vertex IR must lower directly to MSL");
@@ -4787,6 +4849,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("scalar IR must lower directly to MSL");
@@ -4922,6 +4985,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("native half/int64 IR must lower directly to MSL when supported");
@@ -4993,6 +5057,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("bitwise conversion IR must lower directly to MSL");
@@ -5094,6 +5159,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("global-memory IR must lower directly to MSL");
@@ -5205,6 +5271,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("global atomic IR must lower directly to MSL");
@@ -5285,7 +5352,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         .unwrap();
 
         assert_eq!(direct.source().stage, Stage::VertexB);
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
     }
 
     #[test]
@@ -5316,7 +5383,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         )
         .expect("direct sampled-texture MSL must compile with the same ABI");
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         assert_eq!(direct.bindings().texture_count, 2);
         assert_eq!(direct.bindings().sampler_count, 2);
         assert!(direct
@@ -5436,7 +5503,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 panic!("direct depth={is_depth} sample operands must compile: {error}")
             });
 
-            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
             assert!(direct.source().source.contains("bias("));
             assert!(direct.source().source.contains("min_lod_clamp("));
             assert!(direct.source().source.contains("int2(-1, 2)"));
@@ -5462,6 +5529,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                     enable_point_size_builtin: true,
                     disable_rasterization: false,
                     geometry_provoking_vertex_last: false,
+                    ..Default::default()
                 },
             )
             .unwrap_or_else(|error| {
@@ -5551,7 +5619,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 &active,
             )
             .expect("direct fetch variant must compile with the active ABI");
-            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         }
     }
 
@@ -5629,7 +5697,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 &active,
             )
             .expect("direct gather MSL must compile with the active ABI");
-            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
             assert!(direct.source().source.contains(".gather"));
         }
     }
@@ -5653,6 +5721,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("PTP gather must lower directly to MSL");
@@ -5668,8 +5737,29 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
             return;
         };
         let runtime_profile = make_shader_profile(device.profile());
+        // Metal reads storage textures without a format qualifier.
+        assert!(runtime_profile.support_typeless_image_loads);
         let runtime_info = RuntimeInfo::default();
         let typeless_read = storage_image_program(TextureType::Color2D, 1, false, true, false);
+        let native = validate_direct_msl_against_active_module(
+            device.device(),
+            &typeless_read,
+            &runtime_profile,
+            &runtime_info,
+            &compile_native_shader(
+                device.device(),
+                device.profile(),
+                &emit_spirv(&typeless_read, &runtime_profile, &runtime_info),
+                &MetalShaderCompileOptions::for_device(device.profile()),
+            )
+            .expect("active typeless load must compile"),
+        )
+        .expect("direct typeless load must compile");
+        assert!(native.source().source.contains(".read("));
+        assert!(!native.source().source.contains("= uint4(0u);"));
+
+        // Upstream's explicit zero result for hosts without the capability.
+        let runtime_profile = Profile { support_typeless_image_loads: false, ..runtime_profile };
         let active = compile_native_shader(
             device.device(),
             device.profile(),
@@ -5685,14 +5775,12 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
             &active,
         )
         .expect("direct unsupported typeless load must compile to zero");
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         assert!(direct.source().source.contains("= uint4(0u);"));
         assert!(!direct.source().source.contains(".read("));
 
         let mut profile = runtime_profile;
         // Exercise the float load conversion as well as the integer path.
-        // Runtime Metal profiles keep typeless loads disabled and therefore
-        // follow upstream's explicit zero-result path.
         profile.support_typeless_image_loads = true;
         let mut programs = Vec::new();
         for texture_type in [
@@ -5737,7 +5825,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                     active.source().source,
                 )
             });
-            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
             assert_eq!(
                 direct.bindings().resources[0].kind,
                 MetalResourceKind::StorageImage
@@ -5762,6 +5850,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("direct storage-image descriptor array must lower");
@@ -5818,7 +5907,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 )
             });
 
-            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
             assert_eq!(direct.bindings().resources.len(), 1);
             assert_eq!(direct.bindings().resources[0].kind, expected_kind);
         }
@@ -5841,6 +5930,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("direct image-buffer descriptor array must lower");
@@ -5882,7 +5972,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
             )
         });
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         assert!(direct.source().source.contains("atomic_fetch_add"));
         assert!(direct.source().source.contains("atomic_exchange"));
     }
@@ -5920,7 +6010,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
             )
         });
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         assert_eq!(
             direct.bindings().resources[0].kind,
             MetalResourceKind::StorageImage
@@ -6108,6 +6198,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .expect("multisample fetch must lower at the MSL 2.3 baseline");
@@ -6173,7 +6264,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         )
         .unwrap();
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         assert_eq!(direct.bindings().resources.len(), 1);
         assert_eq!(
             direct.bindings().resources[0].kind,
@@ -6262,7 +6353,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         )
         .expect("direct indirect CBUF MSL must compile with the active ABI");
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         assert_eq!(
             direct.bindings().resources.len(),
             shader_recompiler::shader_info::Info::MAX_INDIRECT_CBUFS
@@ -6313,7 +6404,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
             )
             .unwrap();
 
-            assert_eq!(direct.bindings(), active.bindings());
+            assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
             assert_eq!(
                 direct.bindings().resources[0].binding,
                 expected_binding as u32
@@ -6437,7 +6528,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         )
         .unwrap();
 
-        assert_eq!(direct.bindings(), active.bindings());
+        assert_eq!(guest_binding_layout(direct.bindings()), guest_binding_layout(active.bindings()));
         assert_eq!(direct.bindings().resources.len(), 2);
         assert_eq!(
             direct.bindings().resources[1].kind,
@@ -6446,7 +6537,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         assert!(direct
             .source()
             .source
-            .contains("device uint* ssbo0 [[buffer(1)]]"));
+            .contains("device uint* ssbo0 [[buffer(1)]], constant uint* storage_limits [[buffer(2)]]"));
 
         let mut subword_program = empty_program(Stage::Compute);
         subword_program
@@ -6477,6 +6568,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 enable_point_size_builtin: true,
                 disable_rasterization: false,
                 geometry_provoking_vertex_last: false,
+                ..Default::default()
             },
         )
         .unwrap();

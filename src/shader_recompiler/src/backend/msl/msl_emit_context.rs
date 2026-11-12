@@ -62,6 +62,7 @@ pub struct MslEmitContext {
     uses_storage_subword_cas: bool,
     uses_shared_subword_cas: bool,
     shared_memory_in_device_buffer: bool,
+    mesh: Option<super::emit_msl_mesh::MslMeshState>,
     uses_atomic_inc_dec_cas: bool,
     fp_cas_helpers: [bool; 7],
     uses_texture_cast: bool,
@@ -296,6 +297,55 @@ impl MslEmitContext {
                 MslParameterAttribute::Buffer(grid_index),
             ));
         }
+        // Guest task/mesh programs run as compute kernels over an explicit
+        // transport; see `emit_msl_mesh.rs`.
+        let mesh = (stage == Stage::Compute && (program.info.is_task ^ program.info.is_mesh)).then(|| {
+            super::emit_msl_mesh::MslMeshState {
+                is_task: program.info.is_task,
+                payload_words: program.mesh.payload_words,
+                threads: program.workgroup_size[0],
+                info: program.mesh.clone(),
+                layout: crate::backend::spirv::spirv_emit_context::MeshOutputLayout::new(&program.mesh),
+                task_count_guard: options.mesh_task_count_guard,
+                zero_fill: super::emit_msl_mesh::workgroup_zero_fill(),
+                device_storage: false,
+            }
+        }).map(|mut mesh| {
+            mesh.device_storage =
+                mesh.threadgroup_bytes() > u64::from(options.max_threadgroup_memory_length);
+            mesh
+        });
+        if options.mesh_vertex && stage == Stage::VertexB {
+            let index = bindings.buffer_count;
+            bindings.buffer_count += 1;
+            bindings.mesh_output_buffer_index = Some(index);
+            parameters.push(MslParameter::new(
+                "const device uint*",
+                "mesh_output",
+                MslParameterAttribute::Buffer(index),
+            ));
+        }
+        if let Some(mesh) = &mesh {
+            let mut reserve = |name: &str| {
+                let index = bindings.buffer_count;
+                bindings.buffer_count += 1;
+                parameters.push(MslParameter::new(
+                    "device uint*",
+                    name,
+                    MslParameterAttribute::Buffer(index),
+                ));
+                Some(index)
+            };
+            if mesh.device_storage {
+                bindings.mesh_workgroup_buffer_index = reserve("mesh_workgroup_storage");
+                bindings.mesh_workgroup_words = mesh.workgroup_words();
+            }
+            bindings.mesh_dispatch_buffer_index = reserve("mesh_dispatch");
+            bindings.mesh_payload_buffer_index = reserve("mesh_payload_transport");
+            if !mesh.is_task {
+                bindings.mesh_output_buffer_index = reserve("mesh_output");
+            }
+        }
         let texture_rescaling_index = binding_counters.texture_scaling_index;
         let image_rescaling_index = binding_counters.image_scaling_index;
         let binding_counter = if profile.unified_descriptor_binding {
@@ -345,16 +395,6 @@ impl MslEmitContext {
         let mut storage_index = 0u32;
         let mut storage_descriptor_names = Vec::new();
         let mut storage_buffer_descriptors = HashMap::new();
-        if !program.info.storage_buffers_descriptors.is_empty() {
-            let buffer_index = bindings.buffer_count;
-            bindings.buffer_count += 1;
-            bindings.storage_limits_buffer_index = Some(buffer_index);
-            parameters.push(MslParameter::new(
-                "constant uint*",
-                "storage_limits",
-                MslParameterAttribute::Buffer(buffer_index),
-            ));
-        }
         for (descriptor_index, descriptor) in program.info.storage_buffers_descriptors.iter().enumerate() {
             let descriptor_binding = *binding_counter;
             *binding_counter += descriptor.count;
@@ -381,6 +421,18 @@ impl MslEmitContext {
                 storage_buffer_descriptors.insert(storage_index + alias, descriptor_index as u32);
             }
             storage_index += descriptor.count;
+        }
+        // Allocated after the guest buffers so their slots stay those of the
+        // descriptor order (and of the SPIRV-Cross validation layout).
+        if !program.info.storage_buffers_descriptors.is_empty() {
+            let buffer_index = bindings.buffer_count;
+            bindings.buffer_count += 1;
+            bindings.storage_limits_buffer_index = Some(buffer_index);
+            parameters.push(MslParameter::new(
+                "constant uint*",
+                "storage_limits",
+                MslParameterAttribute::Buffer(buffer_index),
+            ));
         }
         let global_memory_resources = if program.info.uses_global_memory {
             program
@@ -519,14 +571,14 @@ impl MslEmitContext {
                 "thread_index_in_simdgroup",
             ));
         }
-        if program.info.uses_workgroup_id || shared_memory_in_device_buffer {
+        if program.info.uses_workgroup_id || shared_memory_in_device_buffer || mesh.is_some() {
             parameters.push(MslParameter::builtin(
                 "uint3",
                 "workgroup_id",
                 "threadgroup_position_in_grid",
             ));
         }
-        if program.info.uses_local_invocation_id {
+        if program.info.uses_local_invocation_id || mesh.is_some() {
             parameters.push(MslParameter::builtin(
                 "uint3",
                 "local_invocation_id",
@@ -934,6 +986,9 @@ impl MslEmitContext {
                     let num_words = program.shared_memory_size.div_ceil(4);
                     source.push_str(&format!("    threadgroup uint smem[{num_words}];\n"));
                 }
+                if let Some(mesh) = &mesh {
+                    source.push_str(&super::emit_msl_mesh::kernel_preheader(mesh));
+                }
                 false
             }
             _ => unreachable!("stage was validated above"),
@@ -982,6 +1037,7 @@ impl MslEmitContext {
             uses_storage_subword_cas: false,
             uses_shared_subword_cas: false,
             shared_memory_in_device_buffer,
+            mesh,
             uses_atomic_inc_dec_cas: false,
             fp_cas_helpers: [false; 7],
             uses_texture_cast: false,
@@ -2040,6 +2096,15 @@ impl MslEmitContext {
         } else {
             "threadgroup"
         }
+    }
+
+    pub(super) fn mesh_state(&self) -> Option<&super::emit_msl_mesh::MslMeshState> {
+        self.mesh.as_ref()
+    }
+
+    /// Append already indented, newline-terminated statements.
+    pub(super) fn emit_raw(&mut self, statements: &str) {
+        self.source.push_str(statements);
     }
 
     pub fn emit_statement(&mut self, statement: &str) {

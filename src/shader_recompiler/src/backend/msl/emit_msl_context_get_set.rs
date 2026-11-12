@@ -108,7 +108,10 @@ pub fn emit_get_cbuf(
 
 /// Emit Eden's `EmitWorkgroupId` through Metal's native compute built-in.
 pub fn emit_workgroup_id(context: &mut MslEmitContext, inst_ref: InstRef) -> Result<(), MslError> {
-    context.define(inst_ref, ir::Type::U32x3, "workgroup_id".to_owned(), false)
+    // A task/mesh kernel's physical group is one-dimensional; the guest view
+    // comes from the dispatch mapping.
+    let name = if context.mesh_state().is_some() { "guest_workgroup_id" } else { "workgroup_id" };
+    context.define(inst_ref, ir::Type::U32x3, name.to_owned(), false)
 }
 
 /// Emit Eden's `EmitLocalInvocationId` through Metal's native compute built-in.

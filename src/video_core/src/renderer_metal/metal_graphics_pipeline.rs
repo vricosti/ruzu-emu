@@ -427,20 +427,35 @@ pub fn configure_graphics_resources(
     // shared binding sequence across every graphics stage.
     let mut descriptor_binding = 0u32;
 
-    let vertex = prepare_stage(
-        device,
-        0,
-        stages.stage_infos(),
-        stages.vertex_bindings(),
-        texture_cache,
-        &graphics_buffers,
-        &null_buffer,
-        &views,
-        &sampler_ids,
-        &mut cursors,
-        &mut rescaling,
-        &mut descriptor_binding,
-    )?;
+    // A compute-backed mesh pipeline keeps its task/mesh resources in the
+    // Maxwell graphics slots 0 and 2. Each of its stages is compiled alone, so
+    // the binding sequence and rescaling words restart per stage; the view and
+    // sampler cursors still walk the shared per-stage arrays above.
+    let mesh = stages.mesh();
+    let vertex = if let Some(mesh) = mesh {
+        if let Some(kernel) = mesh.programs.kernel(0) {
+            prepare_stage(device, 0, stages.stage_infos(), kernel.shader.bindings(), texture_cache,
+                &graphics_buffers, &null_buffer, &views, &sampler_ids, &mut cursors,
+                &mut rescaling, &mut descriptor_binding)?
+        } else {
+            MetalPreparedStage::default()
+        }
+    } else {
+        prepare_stage(
+            device,
+            0,
+            stages.stage_infos(),
+            stages.vertex_bindings(),
+            texture_cache,
+            &graphics_buffers,
+            &null_buffer,
+            &views,
+            &sampler_ids,
+            &mut cursors,
+            &mut rescaling,
+            &mut descriptor_binding,
+        )?
+    };
     let mut tessellation = [MetalPreparedStage::default(), MetalPreparedStage::default()];
     for (index, prepared) in tessellation.iter_mut().enumerate() {
         let stage = index + 1;
@@ -449,6 +464,12 @@ pub fn configure_graphics_resources(
                 else { &tessellation.evaluation.bindings };
             *prepared = prepare_stage(device, stage, stages.stage_infos(), bindings, texture_cache,
                 &graphics_buffers, &null_buffer, &views, &sampler_ids, &mut cursors,
+                &mut rescaling, &mut descriptor_binding)?;
+        } else if let Some(kernel) = mesh.and_then(|mesh| mesh.programs.kernel(stage)) {
+            rescaling = RescalingPushConstant::new();
+            descriptor_binding = 0;
+            *prepared = prepare_stage(device, stage, stages.stage_infos(), kernel.shader.bindings(),
+                texture_cache, &graphics_buffers, &null_buffer, &views, &sampler_ids, &mut cursors,
                 &mut rescaling, &mut descriptor_binding)?;
         } else {
             advance_empty_native_stage(stage, &stages.stage_infos()[stage], &mut cursors,
@@ -481,6 +502,10 @@ pub fn configure_graphics_resources(
         );
         MetalPreparedStage::default()
     };
+    if mesh.is_some() {
+        rescaling = RescalingPushConstant::new();
+        descriptor_binding = 0;
+    }
     let fragment = if let Some(module) = stages.fragment() {
         prepare_stage(
             device,

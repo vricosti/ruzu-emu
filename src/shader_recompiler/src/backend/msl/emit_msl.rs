@@ -125,8 +125,12 @@ fn first_unsupported_program_feature(
         crate::stage::Stage::VertexB | crate::stage::Stage::Geometry | crate::stage::Stage::TessellationControl | crate::stage::Stage::TessellationEval
     ) && varying_mask_has_only_vertex_outputs(program.stage, &info.stores.mask);
     let supported_fragment_colors = program.stage == crate::stage::Stage::Fragment;
-    if (!supported_stage_loads && info.loads.mask.iter().any(|word| *word != 0))
-        || (!supported_vertex_stores && info.stores.mask.iter().any(|word| *word != 0))
+    // Task/mesh outputs are stage-buffer writes owned by `emit_msl_mesh.rs`;
+    // like SPIR-V's DefineOutputs, their varying masks declare no interface.
+    let mesh_compute = program.stage == crate::stage::Stage::Compute
+        && (info.is_task ^ info.is_mesh);
+    if (!mesh_compute && !supported_stage_loads && info.loads.mask.iter().any(|word| *word != 0))
+        || (!mesh_compute && !supported_vertex_stores && info.stores.mask.iter().any(|word| *word != 0))
         || info.passthrough.mask.iter().any(|word| *word != 0)
         || info.loads_indexed_attributes
         || info.stores_indexed_attributes
@@ -670,6 +674,12 @@ fn emit_inst(
         | Opcode::GetCbufU32
         | Opcode::GetCbufF32
         | Opcode::GetCbufU32x2 => emit_msl_context_get_set::emit_get_cbuf(context, inst_ref, inst),
+        Opcode::IsbeRead => super::emit_msl_mesh::emit_isbe_read(context, inst_ref, inst),
+        Opcode::IsbeWriteAttribute => {
+            super::emit_msl_mesh::emit_isbe_write_attribute(context, inst_ref, inst)
+        }
+        Opcode::IsbeWriteMapU8 => super::emit_msl_mesh::emit_isbe_write_map_u8(context, inst_ref, inst),
+        Opcode::IsbeWriteMapU32 => super::emit_msl_mesh::emit_isbe_write_map_u32(context, inst_ref, inst),
         Opcode::WorkgroupId => emit_msl_context_get_set::emit_workgroup_id(context, inst_ref),
         Opcode::LocalInvocationId => {
             emit_msl_context_get_set::emit_local_invocation_id(context, inst_ref)
@@ -1090,6 +1100,108 @@ pub fn emit_msl_with_options_and_bindings(
         bindings,
         super::msl_function::MslFunctionKind::StageEntryPoint,
     )
+}
+
+/// Emit an already optimized, exit-converged guest task/mesh program as a
+/// compute kernel; the MSL counterpart of `emit_mesh_compute_spirv`. Host
+/// dispatches are one-dimensional and must provide one `MeshDispatchRecord`
+/// per workgroup. The transport buffer slots are returned in the binding layout.
+pub fn emit_msl_mesh_compute(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+    task_count_guard: bool,
+) -> Result<MslShaderArtifact, MslError> {
+    let invalid = MslError::UnsupportedProgramFeature(
+        "nonconverged or unprepared task/mesh compute program",
+    );
+    if program.stage != crate::stage::Stage::Compute
+        || !(program.info.is_task ^ program.info.is_mesh)
+        || program.workgroup_size[0] == 0
+        || program.workgroup_size[1..] != [1, 1]
+        || program.mesh.payload_words == 0
+        || (program.info.is_task && program.mesh.payload_words < 2)
+    {
+        return Err(invalid);
+    }
+    // Every invocation must reach the collective barriers: exactly one
+    // top-level return, terminating the program.
+    let mut depth = 0i32;
+    let mut returns = 0;
+    for node in &program.syntax_list {
+        match node {
+            SyntaxNode::If { .. } | SyntaxNode::Loop { .. } => depth += 1,
+            SyntaxNode::EndIf { .. } | SyntaxNode::Repeat { .. } => depth -= 1,
+            SyntaxNode::Return => {
+                if depth != 0 {
+                    return Err(invalid);
+                }
+                returns += 1;
+            }
+            SyntaxNode::Unreachable => return Err(invalid),
+            _ => {}
+        }
+        if depth < 0 {
+            return Err(invalid);
+        }
+    }
+    if depth != 0 || returns != 1 || !matches!(program.syntax_list.last(), Some(SyntaxNode::Return)) {
+        return Err(invalid);
+    }
+    let options = MslOptions {
+        mesh_task_count_guard: task_count_guard && program.info.is_mesh,
+        ..options.clone()
+    };
+    emit_msl_with_options_and_bindings(program, profile, runtime_info, &options, bindings)
+}
+
+/// Generate the graphics consumer of the compute mesh output transport; the
+/// MSL counterpart of `emit_mesh_vertex_spirv_with_info`. The returned `Info`
+/// is the generated vertex interface, used as the fragment's previous stage.
+pub fn emit_msl_mesh_vertex(
+    mesh: &crate::shader_info::MeshInfo,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    options: &MslOptions,
+    bindings: &mut Bindings,
+) -> Result<(MslShaderArtifact, crate::shader_info::Info), MslError> {
+    use crate::ir::value::Attribute;
+    let mut program = ir::Program::new(crate::stage::Stage::VertexB);
+    program.blocks.push(crate::ir::basic_block::Block::new());
+    for (&line, primitive) in mesh
+        .vertex_lines
+        .iter()
+        .map(|line| (line, false))
+        .chain(mesh.primitive_lines.iter().map(|line| (line, true)))
+    {
+        if primitive && (32..160).contains(&line) && mesh.vertex_lines.contains(&line) {
+            return Err(MslError::UnsupportedProgramFeature(
+                "overlapping mesh vertex/primitive component",
+            ));
+        }
+        // Same target selection as DefineMesh, including ignored builtins.
+        if (32..160).contains(&line) || (!primitive && (27..32).contains(&line)) {
+            program.info.stores.set(line as usize, true);
+        }
+    }
+    if mesh.primitive_vertices() == 1 {
+        program.info.stores.set(Attribute::POINT_SIZE.0 as usize, true);
+    }
+    program.info.loads.set(Attribute::VERTEX_ID.0 as usize, true);
+    let options = MslOptions { mesh_vertex: true, ..options.clone() };
+    let mut context = MslEmitContext::new(&program, profile, runtime_info, &options, bindings)?;
+    let body = super::emit_msl_mesh::vertex_body(
+        mesh,
+        runtime_info.fixed_state_point_size,
+        runtime_info.convert_depth_mode && !profile.support_native_ndc,
+    )?;
+    // Metal's vertex_id already includes the draw's first vertex.
+    let vertex = if profile.support_vertex_instance_id { "vertex_id" } else { "vertex_index" };
+    context.emit_raw(&body.replace("vertex_id", vertex));
+    context.emit_return();
+    Ok((context.finish(), program.info))
 }
 
 /// Emit the unchanged vertex IR as a function for native stage composition.
@@ -3080,7 +3192,7 @@ mod tests {
             emit_msl_with_bindings(&program, &profile, &RuntimeInfo::default(), &mut bindings)
                 .unwrap();
         let source = &artifact.source.source;
-        assert!(source.contains("kernel void main0(constant uint* storage_limits [[buffer(0)]], device uint* ssbo0 [[buffer(1)]])"));
+        assert!(source.contains("kernel void main0(device uint* ssbo0 [[buffer(0)]], constant uint* storage_limits [[buffer(1)]])"));
         assert!(source.contains("extract_bits(ssbo0[min(0u, storage_limits[0u])], 8u, 8u)"));
         assert!(source.contains("as_type<uint>(extract_bits(as_type<int>(ssbo0[min(0u, storage_limits[0u])]), 16u, 16u))"));
         assert!(source.contains("uint v_0_2 = ssbo0[min(1u, storage_limits[0u])];"));
@@ -3100,9 +3212,10 @@ mod tests {
             artifact.bindings.resources[0].kind,
             MslResourceKind::StorageBuffer
         );
-        // Slot 0 carries the per-descriptor bounds every access is clamped to.
-        assert_eq!(artifact.bindings.storage_limits_buffer_index, Some(0));
-        assert_eq!(artifact.bindings.resources[0].buffer_index, 1);
+        // The per-descriptor bounds every access is clamped to follow the
+        // guest buffers, whose slots keep the descriptor order.
+        assert_eq!(artifact.bindings.storage_limits_buffer_index, Some(1));
+        assert_eq!(artifact.bindings.resources[0].buffer_index, 0);
         assert_eq!(artifact.bindings.resources[0].count, None);
     }
 

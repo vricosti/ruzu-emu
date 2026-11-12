@@ -1,5 +1,71 @@
 # Upstream parity notes
 
+## 2026-11-12 - native Metal renderer: NX2 task/mesh draws, compute uniform buffers, attachment-less depth/stencil, typeless loads, conditional barriers
+
+### Intentional differences (Eden has no native MSL backend)
+- `backend/msl/emit_msl_mesh.rs` (new) is the MSL counterpart of `backend/spirv/emit_spirv_mesh.rs`:
+  guest task and mesh programs run as compute kernels over the same transport (`MeshDispatchRecord`,
+  `MeshOutputLayout`, shared with the SPIR-V backend), and `emit_msl_mesh_vertex` generates the
+  vertex function that pulls the output records. Entry points: `emit_msl::emit_msl_mesh_compute`,
+  `emit_msl::emit_msl_mesh_vertex`. The transport buffers are reported in `MslBindingLayout`
+  (`mesh_dispatch_buffer_index`, `mesh_payload_buffer_index`, `mesh_output_buffer_index`).
+  Workgroup storage (payload, attributes, map, primitive count) is `threadgroup` up to
+  `maxThreadgroupMemoryLength` (32 KiB on Apple GPUs). Above it the kernel addresses one slice per
+  physical group of a device buffer, `mesh_workgroup_storage + workgroup_id.x * words`
+  (`mesh_workgroup_buffer_index`, `mesh_workgroup_words`), with `mem_device` barriers; the
+  renderer binds the grow-only scratch buffer it already uses for oversized compute shared memory.
+  Mario Kart World's largest mesh program needs about 25 KiB, so that title stays on `threadgroup`.
+- `renderer_metal/metal_mesh_pipeline.rs` (new) holds the Metal forms of the Vulkan
+  `MeshComputeStage`/`MeshComputePrograms`. `metal_pipeline_cache.rs` gains
+  `current_mesh_compute_programs` and `current_mesh_graphics_shaders` (the Metal forms of the Vulkan
+  `current_mesh_compute_programs`/`current_mesh_graphics_pipeline`). Each stage of a mesh pipeline
+  is compiled with its own binding sequence, so `configure_graphics_resources` restarts the binding
+  and rescaling counters per stage for it; task/mesh resources stay Maxwell graphics stages 0 and 2.
+- `metal_rasterizer.rs::dispatch_mesh_programs`/`dispatch_mesh_stage` are the Metal forms of the
+  Vulkan functions of the same names, reusing `MeshTaskDispatchPlan`. Differences: transport
+  buffers are host-visible staging allocations, so the payload and the reserved output headers are
+  cleared on the CPU instead of `vkCmdFillBuffer`, and the exact-count fallback reads the payload
+  without a copy after `finish_all`. Metal has no multi-draw or indirect-count command: the output
+  is drawn with one `drawPrimitives(indirectBuffer:)` per record, through the existing indirect
+  path (so conditional rendering applies unchanged). Indirect task/mesh draws are skipped, as in
+  the Vulkan path. The session switch is the Vulkan one (`RUZU_NX2_MESH_DRAW`).
+- `metal_buffer_cache.rs::bind_uniform_buffer` honours the active binding target, like
+  `bind_storage_buffer` below. The common cache binds compute uniform buffers through this entry
+  point (`NEEDS_BIND_UNIFORM_INDEX == false`); only the streamed (unaligned-offset) path reached the
+  compute bindings, so a compute shader whose constant buffer sat at a 16-byte-aligned offset read
+  the null buffer. In Mario Kart World this silently disabled, among others, the kernel that
+  resets the per-draw meshlet records.
+- `metal_pipeline_cache.rs::MetalDepthStencilKey::for_attachments` disables the depth test when the
+  render pass has no depth attachment and the stencil test when it has no stencil attachment.
+  Vulkan defines both tests as passing without the attachment; Metal applies the state regardless,
+  and a stencil comparison then rejects every fragment (the pass that composes the scene before
+  the final upscale was black).
+- `metal_pipeline_cache.rs::make_shader_profile` sets `support_typeless_image_loads`. MSL
+  `access::read` textures carry no format qualifier, so a guest image load without a declared format
+  reads natively; with it off every such load took upstream's zero-result path. Mario Kart World's
+  single-pass mip downsampler (compute `322f6f58e8bfa377`) averaged zeros.
+- `metal_pipeline_cache.rs::make_host_translate_info` sets `support_conditional_barrier`. Eden
+  clears it only for Intel's Vulkan drivers; with it off, `ConditionalBarrierPass` removes every
+  barrier inside conditional control flow or after a conditional return (17 in Mario Kart World),
+  and the phases of that downsampler raced through shared memory. Together these two left the
+  environment cube's mip levels zero or uninitialised; the probe prefilter then produced NaN and
+  the lit scene was overexposed with invalid tiles.
+- `metal_pipeline_cache.rs::metal_color_attachment`/`make_render_pipeline_key` do not request
+  blending, alpha-to-coverage or alpha-to-one for an integer color attachment. Vulkan defines all
+  three as not applied to integer formats; Metal's pipeline validation aborts the process
+  (`Blending is enabled for render target 0; however, the pixelformat ... is not blendable`).
+  Mario Kart World blends on an `R8Uint` target a few minutes in.
+- `metal_shader.rs::guest_binding_layout`: the validation-only comparison against SPIRV-Cross
+  ignores the renderer-owned buffers of direct MSL (storage limits, oversized shared memory, mesh
+  transport), which SPIRV-Cross output has no counterpart for.
+
+### Unresolved
+- Every mesh draw ends the current render pass, because its kernels need a compute encoder: one
+  render pass per mesh draw (about 70 per frame in Mario Kart World), with the corresponding
+  load/store cost.
+- `renderer_metal::metal_query_cache::tests::common_gpu_write_notifications_advance_native_generation_within_one_tick`
+  fails (content generation does not advance on `MarkAsWritten`); unrelated to the changes above.
+
 ## 2026-11-12 - native Metal renderer: compute storage bindings, shared memory, storage bounds, fault reporting
 
 ### Intentional differences (Eden has no native MSL backend)
@@ -21,7 +87,8 @@
   range to it. Eden relies on Vulkan `robustBufferAccess`; Metal has none, and an out-of-range
   access page-faults or hangs the GPU and discards unrelated command buffers. `storage_limits` is
   one `uint` per storage descriptor (last addressable word), bound by `setBytes` next to the push
-  constants in the compute, vertex/fragment and geometry paths.
+  constants in the compute, vertex/fragment and geometry paths. Its buffer slot follows the guest
+  uniform and storage buffers, so their slots keep the descriptor order.
 - `backend/msl/emit_msl_image_atomic.rs` accepts an absent (void) descriptor index like the SPIR-V
   backend, instead of only literal zero.
 - `metal_scheduler.rs`: command buffers request `MTLCommandBufferErrorOptionEncoderExecutionStatus`;
@@ -33,9 +100,6 @@
   ASTC is native (the mode is inert whenever the device samples ASTC).
 
 ### Unresolved
-- The NX2 task/mesh draw path exists only in the Vulkan renderer. Under Metal, Mario Kart World's
-  mesh programs are rejected ("Native graphics shader rejected ... mesh_enabled=true") and the 3D
-  scene renders black.
 - Textures with no guest view are bound as nil (Metal shader validation reports "Null texture
   access"); Vulkan binds typed null image views. Not observed to fault.
 

@@ -88,6 +88,12 @@ impl TexturePassCaches {
 /// Provides access to shader instructions, constant buffer values,
 /// texture types, and other GPU state needed during translation.
 pub trait Environment {
+    /// Fritchii Environment::HasNativeInstructions. Only native lowering may
+    /// emit the reserved MOV form that addresses shadow register banks.
+    fn has_native_instructions(&self) -> bool {
+        false
+    }
+
     /// None denotes an ordinary shader. Some explicitly selects the compute
     /// fallback and requires the task/mesh emission and dispatch path.
     fn mesh_shader(&self) -> Option<&MeshShaderEnvironment> {

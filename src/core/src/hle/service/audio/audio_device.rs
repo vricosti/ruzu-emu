@@ -32,6 +32,13 @@ use crate::hle::service::service::{build_handler_map, FunctionInfo, ServiceFrame
 /// | 12  | QueryAudioDeviceOutputEvent     |
 /// | 13  | GetActiveAudioOutputDeviceName  |
 /// | 14  | ListAudioOutputDeviceName       |
+/// | 15  | AcquireAudioInputDeviceNotification  | (17.0.0+)
+/// | 16  | ReleaseAudioInputDeviceNotification  | (17.0.0+)
+/// | 17  | AcquireAudioOutputDeviceNotification | (17.0.0+)
+/// | 18  | ReleaseAudioOutputDeviceNotification | (17.0.0+)
+/// | 19  | SetAudioDeviceOutputVolumeAutoTuneEnabled | (18.0.0+)
+/// | 20  | IsAudioDeviceOutputVolumeAutoTuneEnabled  | (18.0.0+)
+/// | 21  | IsActiveOutputDeviceEstimatedLowLatency   | (21.0.0+)
 pub struct IAudioDevice {
     system: SystemRef,
     applet_resource_user_id: u64,
@@ -41,6 +48,7 @@ pub struct IAudioDevice {
     handlers_tipc: BTreeMap<u32, FunctionInfo>,
     service_context: Mutex<ServiceContext>,
     event_handle: u32,
+    notification_event_handle: u32,
 }
 
 impl IAudioDevice {
@@ -123,10 +131,46 @@ impl IAudioDevice {
                 Some(Self::list_audio_output_device_name_handler),
                 "ListAudioOutputDeviceName",
             ),
+            (9, Some(Self::stub_reply_zeroed_handler), "Unknown9"),
+            (
+                15,
+                Some(Self::acquire_audio_device_notification_handler),
+                "AcquireAudioInputDeviceNotification",
+            ),
+            (
+                16,
+                Some(Self::release_audio_device_notification_handler),
+                "ReleaseAudioInputDeviceNotification",
+            ),
+            (
+                17,
+                Some(Self::acquire_audio_device_notification_handler),
+                "AcquireAudioOutputDeviceNotification",
+            ),
+            (
+                18,
+                Some(Self::release_audio_device_notification_handler),
+                "ReleaseAudioOutputDeviceNotification",
+            ),
+            (
+                19,
+                Some(Self::set_audio_device_output_volume_auto_tune_enabled_handler),
+                "SetAudioDeviceOutputVolumeAutoTuneEnabled",
+            ),
+            (
+                20,
+                Some(Self::is_audio_device_output_volume_auto_tune_enabled_handler),
+                "IsAudioDeviceOutputVolumeAutoTuneEnabled",
+            ),
+            (21, Some(Self::stub_reply_zeroed_handler), "IsActiveOutputDeviceEstimatedLowLatency"),
         ]);
         let mut service_context = ServiceContext::new("IAudioDevice".to_string());
         let event_handle =
             service_context.create_event(format!("IAudioDeviceEvent-{}", device_num));
+        // The device-set never changes in HLE; upstream leaves this event
+        // unsignaled and hands it out via AcquireAudioDeviceNotification.
+        let notification_event_handle = service_context
+            .create_event(format!("IAudioDeviceNotification-{}", device_num));
         let event = service_context
             .get_event(event_handle)
             .expect("IAudioDevice event handle must resolve");
@@ -141,6 +185,7 @@ impl IAudioDevice {
             handlers_tipc: BTreeMap::new(),
             service_context: Mutex::new(service_context),
             event_handle,
+            notification_event_handle,
         }
     }
 
@@ -483,6 +528,99 @@ impl IAudioDevice {
         response.push_result(RESULT_SUCCESS);
         response.push_u32(names.len() as u32);
     }
+
+    fn notification_event(&self) -> std::sync::Arc<Event> {
+        self.service_context
+            .lock()
+            .unwrap()
+            .get_event(self.notification_event_handle)
+            .expect("IAudioDevice notification event must stay alive for service lifetime")
+    }
+
+    fn copy_notification_event_object_id(
+        this: &dyn ServiceFramework,
+        ctx: &HLERequestContext,
+    ) -> Option<u64> {
+        let svc = Self::as_self(this);
+        svc.notification_event().copy_object_id(ctx)
+    }
+
+    /// Port of upstream `IAudioDevice::AcquireAudioDeviceNotification`.
+    /// The HLE device set never changes, so the notification event is simply
+    /// signaled once and handed out for commands 15 (input) and 17 (output).
+    /// The auto stub previously replied without a handle, breaking Switch 2
+    /// titles that wait on the event afterwards.
+    fn acquire_audio_device_notification_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let mut request = CmifRequest::new(ctx);
+        let unknown = request.u64();
+        log::debug!(
+            "IAudioDevice::AcquireAudioDeviceNotification unknown={:#x}",
+            unknown
+        );
+        if let Some(object_id) = Self::copy_notification_event_object_id(this, ctx) {
+            let mut response = CmifResponse::new(ctx, 2, 1, 0);
+            response.push_result(RESULT_SUCCESS);
+            response.push_copy_object_id(object_id);
+        } else {
+            log::error!(
+                "IAudioDevice::AcquireAudioDeviceNotification failed to resolve notification event"
+            );
+            let mut response = CmifResponse::new(ctx, 2, 0, 0);
+            response.push_result(RESULT_SUCCESS);
+        }
+    }
+
+    /// Port of upstream `IAudioDevice::ReleaseAudioDeviceNotification`
+    /// (commands 16 (input) and 18 (output)).
+    fn release_audio_device_notification_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let mut request = CmifRequest::new(ctx);
+        let unknown = request.u64();
+        log::debug!(
+            "IAudioDevice::ReleaseAudioDeviceNotification unknown={:#x}",
+            unknown
+        );
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+    }
+
+    /// Port of upstream `IAudioDevice::SetAudioDeviceOutputVolumeAutoTuneEnabled`.
+    fn set_audio_device_output_volume_auto_tune_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("IAudioDevice::SetAudioDeviceOutputVolumeAutoTuneEnabled (STUBBED) called");
+        let _ = this;
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+    }
+
+    /// Port of upstream `IAudioDevice::IsAudioDeviceOutputVolumeAutoTuneEnabled`.
+    fn is_audio_device_output_volume_auto_tune_enabled_handler(
+        this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        log::warn!("IAudioDevice::IsAudioDeviceOutputVolumeAutoTuneEnabled (STUBBED) called");
+        let _ = this;
+        let mut response = CmifResponse::new(ctx, 3, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+        response.push_bool(false);
+    }
+
+    /// Port of upstream `IAudioDevice::StubReplyZeroed` (Unknown9 and
+    /// IsActiveOutputDeviceEstimatedLowLatency): an empty success reply.
+    fn stub_reply_zeroed_handler(
+        _this: &dyn ServiceFramework,
+        ctx: &mut HLERequestContext,
+    ) {
+        let mut response = CmifResponse::new(ctx, 2, 0, 0);
+        response.push_result(RESULT_SUCCESS);
+    }
 }
 
 #[cfg(test)]
@@ -544,9 +682,34 @@ mod tests {
     #[test]
     fn service_registers_upstream_command_ids() {
         let service = IAudioDevice::new(SystemRef::null(), 0, 0x5245_5631, 0);
-        for cmd in [0_u32, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14] {
+        for cmd in [
+            0_u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+        ] {
             assert!(service.handlers.contains_key(&cmd));
         }
+    }
+
+    #[test]
+    fn acquire_audio_device_notification_has_a_dedicated_unsignaled_event() {
+        // Switch 2 titles (OOT, KAR) acquire the
+        // output-device notification event and wait on it; the auto stub used
+        // to reply without a handle and the title aborted with Kernel/120.
+        let service = IAudioDevice::new(SystemRef::null(), 0, 0x5245_5631, 2);
+        let notification = service.notification_event();
+        let main_event = service
+            .service_context
+            .lock()
+            .unwrap()
+            .get_event(service.event_handle)
+            .expect("IAudioDevice constructor must create event");
+        assert!(
+            !std::sync::Arc::ptr_eq(&notification, &main_event),
+            "notification event must be distinct from the query event"
+        );
+        // Upstream leaves the notification event unsignaled: the device set
+        // never changes.
+        assert!(!notification.is_signaled());
+        assert!(main_event.is_signaled());
     }
 }
 

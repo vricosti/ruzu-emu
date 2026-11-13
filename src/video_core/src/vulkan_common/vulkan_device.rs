@@ -2653,6 +2653,13 @@ impl Device {
         self.subgroup_properties.supported_stages
     }
 
+    /// Fritchii `Device::GetMaxSubgroupSize` (vulkan_device.h).
+    pub fn get_max_subgroup_size(&self) -> u32 {
+        self.subgroup_properties.subgroup_size.max(
+            self.subgroup_size_control_properties.max_subgroup_size,
+        )
+    }
+
     /// Port of upstream `Device::IsSampledImageArrayNonUniformIndexingSupported`.
     pub fn is_sampled_image_array_non_uniform_indexing_supported(&self) -> bool {
         self.sampled_image_array_non_uniform_indexing_supported

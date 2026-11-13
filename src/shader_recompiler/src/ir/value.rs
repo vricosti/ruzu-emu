@@ -17,36 +17,8 @@ pub struct InstRef {
     pub inst: u32,
 }
 
-/// Maxwell GPU register (R0-R254, RZ=255).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Reg(pub u8);
-
-impl Reg {
-    /// Zero register — reads as 0, writes are discarded.
-    pub const RZ: Reg = Reg(255);
-    /// Number of user-accessible registers.
-    pub const NUM_USER_REGS: usize = 255;
-    /// Total register count including RZ.
-    pub const NUM_REGS: usize = 256;
-
-    pub fn index(self) -> usize {
-        self.0 as usize
-    }
-
-    pub fn is_zero(self) -> bool {
-        self.0 == 255
-    }
-}
-
-impl fmt::Display for Reg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_zero() {
-            write!(f, "RZ")
-        } else {
-            write!(f, "R{}", self.0)
-        }
-    }
-}
+// Register identity is owned by ir/reg.rs, as upstream reg.h.
+pub use super::reg::Reg;
 
 /// Maxwell predicate register (P0-P6, PT=7 always true).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -28,6 +28,7 @@ use ruzu_core::file_sys::control_metadata::NACP;
 use ruzu_core::file_sys::fs_filesystem::OpenMode;
 use ruzu_core::file_sys::kernel_executable::KIP;
 use ruzu_core::file_sys::nca_metadata::TitleType;
+use ruzu_core::file_sys::nup_container::NupContainer;
 use ruzu_core::file_sys::partition_filesystem::ResultStatus as FsResultStatus;
 use ruzu_core::file_sys::patch_manager::{Patch, PatchManager};
 use ruzu_core::file_sys::program_metadata::ProgramMetadata;
@@ -139,7 +140,7 @@ const NEW_DIRECTORY_DEEP_SCAN: bool = true;
 
 /// Switch executable extensions listed in the game view. Mirrors
 /// `GameList::supported_file_extensions`.
-const SUPPORTED_EXTENSIONS: &[&str] = &["nsp", "xci", "nca", "nro", "nso", "kip"];
+const SUPPORTED_EXTENSIONS: &[&str] = &["nsp", "xci", "nup", "nca", "nro", "nso", "kip"];
 
 /// Process-wide frontend provider. The mutex adapter keeps the provider stable
 /// for the non-owning union slot while allowing the game-list worker to refill
@@ -2899,6 +2900,18 @@ fn read_program_architecture(
         FileType::DeconstructedRomDirectory => file
             .get_containing_directory()
             .and_then(|exefs| architecture_from_exefs(exefs, patch_manager)),
+        FileType::NUP => {
+            // The booted program is the base package's ExeFS with the newest
+            // update's ExeFS layered over it; a standalone update boots on its
+            // own (SPEC section 4.1.2), matching the NUP loader's selection.
+            let nup = NupContainer::new(Some(file.clone()));
+            let index = nup.find_best_update_package()
+                .filter(|index| nup.get_exefs_dir(*index).is_some())
+                .or_else(|| nup.find_base_package());
+            index
+                .and_then(|index| nup.get_exefs_dir(index))
+                .and_then(|exefs| architecture_from_exefs(exefs, patch_manager))
+        }
         FileType::NCA | FileType::NSP | FileType::XCI | FileType::NAX => content_provider
             .get_entry_raw(
                 patch_manager.get_title_id(),
@@ -3469,7 +3482,7 @@ mod tests {
     fn supported_extensions_cover_every_switch_container() {
         // Mirrors `GameList::supported_file_extensions`; dropping one silently
         // hides a whole class of dumps.
-        for ext in ["nsp", "xci", "nca", "nro", "nso", "kip"] {
+        for ext in ["nsp", "xci", "nup", "nca", "nro", "nso", "kip"] {
             assert!(SUPPORTED_EXTENSIONS.contains(&ext), "{ext} missing");
         }
     }

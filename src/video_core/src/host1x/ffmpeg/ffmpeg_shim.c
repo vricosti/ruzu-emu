@@ -99,6 +99,8 @@ static enum AVCodecID ruzu_codec_id(uint64_t codec) {
         return AV_CODEC_ID_VP8;
     case 0x9:
         return AV_CODEC_ID_VP9;
+    case 0xA:
+        return AV_CODEC_ID_AV1;
     default:
         return AV_CODEC_ID_NONE;
     }

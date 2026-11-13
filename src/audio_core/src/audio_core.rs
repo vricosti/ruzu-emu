@@ -416,6 +416,13 @@ impl ruzu_core::core::AudioOutSessionImpl for AudioOutSession {
 }
 
 impl ruzu_core::core::AudioCoreInterface for AudioCore {
+    fn acquire_sysmix_stream(&self, name: &str) -> Option<Box<dyn ruzu_core::core::SysmixSinkStream>> {
+        let sink = self.get_output_sink();
+        let stream = sink.lock().acquire_sink_stream(self.system.clone(), 2, name,
+            crate::sink::sink_stream::StreamType::Sysmix);
+        Some(Box::new(crate::sink::sink_stream::SysmixStreamBridge { sink, stream }))
+    }
+
     fn set_audio_output_sink_volume(&self, volume: f32) {
         let mut sink = self.output_sink.lock();
         sink.set_system_volume(volume);

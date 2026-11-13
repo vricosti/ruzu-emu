@@ -25,6 +25,7 @@ pub struct ProxySocket {
     blocking: bool,
     received_packets: Mutex<VecDeque<ProxyPacket>>,
     protocol: Protocol,
+    socket_type: Type,
     // TODO: room_network: &RoomNetwork,
 }
 
@@ -40,13 +41,15 @@ impl ProxySocket {
             blocking: true,
             received_packets: Mutex::new(VecDeque::new()),
             protocol: Protocol::Unspecified,
+            socket_type: Type::Unspecified,
         }
     }
 }
 
 impl SocketBase for ProxySocket {
-    fn initialize(&mut self, _domain: Domain, _type_: Type, socket_protocol: Protocol) -> Errno {
+    fn initialize(&mut self, _domain: Domain, socket_type: Type, socket_protocol: Protocol) -> Errno {
         self.protocol = socket_protocol;
+        self.socket_type = socket_type;
         Errno::Success
     }
 
@@ -234,6 +237,19 @@ impl SocketBase for ProxySocket {
         packets.push_back(decompressed);
     }
 
+    /// Fritchii ProxySocket::EmulatedPoll. Callers hold the socket owner mutex;
+    /// the packet queue retains its own synchronization as in upstream.
+    fn emulated_poll(&self, events: crate::internal_network::network::PollEvents)
+        -> Option<crate::internal_network::network::PollEvents> {
+        use crate::internal_network::network::PollEvents;
+        let packets = self.received_packets.lock().unwrap();
+        let mut revents = events & PollEvents::OUT;
+        if self.closed || !packets.is_empty() || self.socket_type == Type::STREAM {
+            revents |= events & (PollEvents::IN | PollEvents::RD_NORM);
+        }
+        Some(revents)
+    }
+
     fn get_fd(&self) -> NativeSocket {
         INVALID_SOCKET // ProxySocket doesn't use a real fd
     }
@@ -288,5 +304,34 @@ impl ProxySocket {
             }
             (read_bytes as i32, Errno::Success)
         }
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use crate::internal_network::network::PollEvents;
+
+    #[test]
+    fn emulated_readiness_tracks_packets_streams_close_and_requested_mask() {
+        let mut socket = ProxySocket::new();
+        socket.initialize(Domain::INET, Type::DGRAM, Protocol::UDP);
+        let requested = PollEvents::IN | PollEvents::RD_NORM | PollEvents::OUT | PollEvents::PRI;
+        assert_eq!(socket.emulated_poll(requested), Some(PollEvents::OUT));
+        socket.received_packets.lock().unwrap().push_back(ProxyPacket {
+            local_endpoint: SockAddrIn::default(), remote_endpoint: SockAddrIn::default(),
+            protocol: Protocol::UDP, broadcast: false, data: vec![1],
+        });
+        let ready = PollEvents::IN | PollEvents::RD_NORM | PollEvents::OUT;
+        assert_eq!(socket.emulated_poll(requested), Some(ready));
+        assert_eq!(socket.emulated_poll(PollEvents::PRI), Some(PollEvents::empty()));
+        socket.received_packets.lock().unwrap().clear();
+        socket.initialize(Domain::INET, Type::STREAM, Protocol::Unspecified);
+        assert_eq!(socket.emulated_poll(requested), Some(ready));
+        socket.initialize(Domain::INET, Type::DGRAM, Protocol::UDP);
+        socket.close();
+        assert_eq!(socket.emulated_poll(requested), Some(ready));
+        let native = crate::internal_network::sockets::Socket::new();
+        assert_eq!(native.emulated_poll(requested), None);
     }
 }

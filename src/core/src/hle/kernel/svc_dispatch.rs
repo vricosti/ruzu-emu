@@ -884,7 +884,7 @@ fn call32(system: &System, imm: u32, args: &mut SvcArgs) {
                 system,
                 get_arg32(args, 0) as u64,
                 get_arg32(args, 1),
-                get_arg32(args, 2) as i32,
+                get_arg32(args, 2) as i32 as i64,
                 gather64(args, 3, 4) as i64,
             );
             set_arg32(args, 0, result.get_inner_value());
@@ -1689,7 +1689,7 @@ fn call64(system: &System, imm: u32, args: &mut SvcArgs) {
                 system,
                 get_arg64(args, 0),
                 get_arg64(args, 1) as u32,
-                get_arg64(args, 2) as i32,
+                get_arg64(args, 2) as i64,
                 get_arg64(args, 3) as i64,
             );
             set_arg64(args, 0, result.get_inner_value() as u64);

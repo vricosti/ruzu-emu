@@ -245,8 +245,16 @@ pub trait GenericEnvironmentOwner {
 
 impl GenericEnvironment {
     /// Upstream GenericEnvironment::InitializeNativeCode (128-byte graphics header, zero for compute).
+    #[cfg(test)]
     fn initialize_native_code(&mut self, source_header_size: u32) {
-        use shader_recompiler::frontend::ampere::lower_to_maxwell::{Instruction, lower_to_maxwell};
+        self.initialize_native_code_with_cbuf(source_header_size, |_, _| None);
+    }
+
+    /// NX2 extension: concrete owners resolve bindings; native preflight reads are
+    /// cached with the same cbuf keys as subsequent Maxwell flow analysis.
+    fn initialize_native_code_with_cbuf(&mut self, source_header_size: u32,
+        mut cbuf_address: impl FnMut(u32, u32) -> Option<u64>) {
+        use shader_recompiler::frontend::ampere::lower_to_maxwell::{Instruction, lower_to_maxwell_with_cbuf, LoweringOptions};
         use shader_recompiler::frontend::ampere::program_capture::{ProgramCaptureState, Result as CaptureResult};
         use shader_recompiler::frontend::ampere::program_override::{native_program_key, program_override_source_size, decode_program_override};
         use shader_recompiler::frontend::ampere::program_address_map::append_native_address_map;
@@ -282,10 +290,32 @@ impl GenericEnvironment {
             }
             if status == CaptureResult::Complete { break; }
         }
-        let mut lowered = if self.mesh_shader.is_some() {
-            shader_recompiler::frontend::ampere::lower_to_maxwell::lower_task_mesh_to_maxwell(&native)
+        let is_mesh = self.mesh_shader.is_some();
+        static DUMP_DIRECTORY: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+        let dump_directory = DUMP_DIRECTORY.get_or_init(|| std::env::var_os("EDEN_NX2_SHADER_DUMP"));
+        let mut cbuf_reads = Vec::new();
+        let mut read_cbuf = |bank, offset| {
+            let key = make_cbuf_key(bank, offset);
+            let (value, status) = if let Some(value) = self.cbuf_values.get(&key) {
+                (Some(*value), "cached")
+            } else if let Some(address) = cbuf_address(bank, offset) {
+                if gpu_memory.lock().is_fully_mapped_range(address, 4) {
+                    let value = self.read_u32(address);
+                    self.cbuf_values.insert(key, value);
+                    (Some(value), "mapped")
+                } else {
+                    (None, "unmapped")
+                }
+            } else {
+                (None, "unbound-or-out-of-range")
+            };
+            if dump_directory.is_some() { cbuf_reads.push((bank, offset, value, status)); }
+            value
+        };
+        let mut lowered = if is_mesh {
+            shader_recompiler::frontend::ampere::lower_to_maxwell::lower_task_mesh_to_maxwell_with_cbuf(&native, &mut read_cbuf)
         } else {
-            lower_to_maxwell(&native)
+            lower_to_maxwell_with_cbuf(&native, LoweringOptions { tensor: true }, &mut read_cbuf)
         };
         static REJECT_LIST: OnceLock<String> = OnceLock::new();
         let reject_list = REJECT_LIST.get_or_init(|| std::env::var_os("EDEN_NX2_REJECT")
@@ -293,14 +323,24 @@ impl GenericEnvironment {
         if !reject_list.is_empty() && reject_list.contains(&format!(",{:x},", self.program_base)) {
             std::panic::panic_any(RuntimeError::new(format!("Native shader at {:#x} rejected by EDEN_NX2_REJECT", self.program_base)));
         }
-        static DUMP_DIRECTORY: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
-        if let Some(directory) = DUMP_DIRECTORY.get_or_init(|| std::env::var_os("EDEN_NX2_SHADER_DUMP")) {
+        if let Some(directory) = dump_directory {
             let folder = std::path::PathBuf::from(directory);
             let path = folder.join(format!("{:016x}-{}-{:x}.bin", native_program_key(&native), if source_header_size == 0 { "cs" } else { "gfx" }, self.program_base));
             if !path.exists() {
                 fs::create_dir_all(&folder).unwrap();
-                if let Ok(mut file) = std::fs::File::create(path) {
+                if let Ok(mut file) = std::fs::File::create(&path) {
                     for insn in &native { for word in insn.words { let _ = file.write_all(&word.to_le_bytes()); } }
+                }
+            }
+            // Keep the actual branch-table inputs next to the native capture.
+            // Missing reads must remain distinguishable from a real zero entry.
+            if let Ok(mut file) = std::fs::File::create(path.with_extension("cbuf.txt")) {
+                let _ = writeln!(file, "# bank offset value status; mesh={is_mesh}");
+                for (bank, offset, value, status) in cbuf_reads {
+                    match value {
+                        Some(value) => { let _ = writeln!(file, "{bank} {offset:#x} {value:#x} {status}"); }
+                        None => { let _ = writeln!(file, "{bank} {offset:#x} unavailable {status}"); }
+                    }
                 }
             }
         }
@@ -603,6 +643,10 @@ impl GenericEnvironment {
 
     pub fn source_size_bytes(&self) -> usize {
         self.native_source_size
+    }
+
+    pub fn has_native_instructions(&self) -> bool {
+        self.native_source_size != 0 || has_native_address_map(&self.code)
     }
 
     pub fn translate_program_address(&self, address: u32) -> u32 {
@@ -936,8 +980,15 @@ impl GraphicsEnvironment {
             if env.base.mesh_shader.is_none() && !matches!(program, ShaderStageType::VertexB | ShaderStageType::Fragment) {
                 std::panic::panic_any(RuntimeError::new(format!("Unsupported native graphics shader stage {}", program as u32)));
             }
+            let native_stage = match program {
+                ShaderStageType::VertexA | ShaderStageType::VertexB => 0,
+                ShaderStageType::TessInit => 1,
+                ShaderStageType::Tessellation => 2,
+                ShaderStageType::Geometry => 3,
+                ShaderStageType::Fragment => 4,
+                ShaderStageType::Invalid => panic!("Invalid native graphics shader stage"),
+            };
             if std::env::var_os("EDEN_NATIVE_DRAW_DIAGNOSTICS").is_some() {
-                let native_stage = if program == ShaderStageType::Fragment { 4 } else { 0 };
                 let table = &maxwell3d.const_buffer_bindings(native_stage)[1];
                 if table.enabled && table.size != 0 && table.size as usize <= crate::engines::maxwell_3d::MAX_CONST_BUFFER_SIZE {
                     let mut bytes = vec![0; table.size as usize];
@@ -945,7 +996,11 @@ impl GraphicsEnvironment {
                     let _ = fs::write(format!("native-graphics-cbuf-{}-1.bin", program as u32), bytes);
                 }
             }
-            env.base.initialize_native_code(128);
+            env.base.initialize_native_code_with_cbuf(128, |bank, offset| {
+                let binding = maxwell3d.const_buffer_bindings(native_stage).get(bank as usize)?;
+                if !binding.enabled || offset.checked_add(4)? > binding.size { return None; }
+                binding.address.checked_add(u64::from(offset))
+            });
         }
         env.base.gp_passthrough_mask = maxwell3d.post_vtg_shader_attrib_skip_mask();
         match program {
@@ -1230,6 +1285,9 @@ impl Default for GraphicsEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for GraphicsEnvironment {
+    fn has_native_instructions(&self) -> bool {
+        self.base.has_native_instructions()
+    }
     fn mesh_shader(&self) -> Option<&MeshShaderEnvironment> {
         self.base.mesh_shader.as_ref()
     }
@@ -1399,7 +1457,12 @@ impl ComputeEnvironment {
         if kepler_compute.is_native_mode() {
             env.base.initial_offset = std::mem::size_of::<ProgramHeader>() as u32;
             env.base.is_proprietary_driver = true;
-            env.base.initialize_native_code(0);
+            env.base.initialize_native_code_with_cbuf(0, |bank, offset| {
+                let binding = qmd.const_buffers.get(bank as usize)?;
+                if qmd.const_buffer_enable_mask & (1 << bank) == 0
+                    || offset.checked_add(4)? > binding.size { return None; }
+                binding.address.checked_add(u64::from(offset))
+            });
             env.base.start_address = std::mem::size_of::<ProgramHeader>() as u32;
         }
         env
@@ -1580,6 +1643,9 @@ impl Default for ComputeEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for ComputeEnvironment {
+    fn has_native_instructions(&self) -> bool {
+        self.base.has_native_instructions()
+    }
     fn translate_program_address(&self, address: u32) -> u32 {
         self.base.translate_program_address(address)
     }
@@ -1925,6 +1991,10 @@ impl FileEnvironment {
         self.code[((address - self.read_lowest) / 8) as usize]
     }
 
+    pub fn has_native_instructions(&self) -> bool {
+        has_native_address_map(&self.code)
+    }
+
     pub fn translate_program_address(&self, address: u32) -> u32 {
         if let Some(translated) = native_program_address(&self.code, address) {
             return translated;
@@ -2047,6 +2117,9 @@ impl Default for FileEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for FileEnvironment {
+    fn has_native_instructions(&self) -> bool {
+        FileEnvironment::has_native_instructions(self)
+    }
     fn mesh_shader(&self) -> Option<&MeshShaderEnvironment> { self.mesh_shader.as_ref() }
 
     fn translate_program_address(&self, address: u32) -> u32 {
@@ -2947,6 +3020,38 @@ mod tests {
             assert_eq!(fs::read(path).unwrap(), b"keep-existing");
         }
         if mode == "plain" {
+            let table_program = [
+                [0x00377802, 48, 0xf00, 0], [0x00017202, 2, 0xf00, 0],
+                [0x7944, 112, 0x03c00000, 0], [0x0c0c7817, 1, 0x03800000, 0],
+                [0x0c0e7819, 2, 0x6ff, 0], [0x0e0c7b82, 0x00400800, 0x800, 0],
+                [0xff0d7819, 31, 0x1140c, 0], [0x0c007949, 128, 0x03800000, 0],
+                [0x794d, 0, 0x03800000, 0], [0x794d, 0, 0x03800000, 0],
+                [0x00017202, 2, 0xf00, 0], [0x37007950, 0xffffff40, 0x03c3ffff, 0],
+                [0x7947, 0xfffffff0, 0x0383ffff, 0],
+            ].map(|words| Instruction { words });
+            write_source(&mut backing, 0, &table_program);
+            backing[0x800..0x804].copy_from_slice(&128u32.wrapping_sub(256).to_le_bytes());
+            backing[0x804..0x808].copy_from_slice(&144u32.wrapping_sub(256).to_le_bytes());
+            let mut table_env = GenericEnvironment::new()
+                .with_gpu_memory(Arc::clone(&gpu_memory)).with_program(0x10000, 0);
+            let mut reads = Vec::new();
+            table_env.initialize_native_code_with_cbuf(0, |bank, offset| {
+                reads.push((bank, offset));
+                assert_eq!(bank, 1);
+                Some(0x10800 + u64::from(offset - 32))
+            });
+            assert_eq!(reads, [(1, 32), (1, 36)]);
+            assert_eq!(table_env.native_source_size, 208);
+            assert_eq!(table_env.cbuf_values[&make_cbuf_key(1, 32)], 128u32.wrapping_sub(256));
+            assert_eq!(table_env.cbuf_values[&make_cbuf_key(1, 36)], 144u32.wrapping_sub(256));
+            // No mapped constant means no proven table, even if the program is mapped.
+            let mut missing = GenericEnvironment::new()
+                .with_gpu_memory(Arc::clone(&gpu_memory)).with_program(0x10000, 0);
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                missing.initialize_native_code_with_cbuf(0, |_, _| Some(0x20000));
+            })).unwrap_err();
+            assert!(error.downcast_ref::<RuntimeError>().unwrap().0.contains("native call linkage mode"));
+            assert!(missing.cbuf_values.is_empty());
             let mov = Instruction {
                 words: [0x00017802, 123, 0xf00, 0],
             };
@@ -2960,7 +3065,8 @@ mod tests {
                 &mut backing,
                 0,
                 &[Instruction {
-                    words: [0x7947, 1, 0x03800000, 0],
+                    // Low two bits are BRA mode flags; bit 2 is misalignment.
+                    words: [0x7947, 4, 0x03800000, 0],
                 }],
             );
             let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3006,6 +3112,8 @@ mod tests {
         use shader_recompiler::frontend::ampere::program_address_map::append_native_address_map;
         let mut env = GenericEnvironment::new();
         assert_eq!(env.source_size_bytes(), 0);
+        assert!(!env.has_native_instructions());
+        assert!(!FileEnvironment::new().has_native_instructions());
         assert_eq!(env.translate_program_address(13), 13);
         assert_eq!(FileEnvironment::new().translate_program_address(13), 13);
         env.code = vec![0; 20];
@@ -3015,6 +3123,7 @@ mod tests {
         env.cached_lowest = 0;
         env.cached_highest = (env.code.len() as u32 - 1) * 8;
         assert_eq!(env.source_size_bytes(), 176);
+        assert!(env.has_native_instructions());
         assert_eq!(env.translate_program_address(32), 0x68);
         assert_eq!(env.read_instruction(0x50), 0xe30000000007000f);
         assert!(!env.has_unbound_instructions);
@@ -3036,6 +3145,7 @@ mod tests {
         assert!(!env.has_unbound_instructions);
         let mut cached = FileEnvironment::new();
         cached.code = env.code.clone();
+        assert!(cached.has_native_instructions());
         assert_eq!(cached.translate_program_address(16), 0x58);
         for bad in [1, 48, u32::MAX] {
             let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

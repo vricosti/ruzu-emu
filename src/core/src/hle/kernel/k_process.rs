@@ -1331,7 +1331,7 @@ impl KProcess {
         current_thread: &Arc<super::k_thread::KThreadLock>,
         address: u64,
         arb_type: super::k_address_arbiter::ArbitrationType,
-        value: i32,
+        value: i64,
         timeout: i64,
     ) -> u32 {
         // The wait path must not hold `process.lock()` across the fiber-wait

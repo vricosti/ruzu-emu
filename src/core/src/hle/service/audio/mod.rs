@@ -17,3 +17,6 @@ pub mod hardware_opus_decoder;
 pub mod hardware_opus_decoder_manager;
 
 pub mod nx2_audio_user_client;
+
+pub mod nx2_sysmix;
+pub mod nx2_audio_device_manager;

@@ -255,7 +255,7 @@ fn materialize_structured_actions(
                     *block,
                     Inst::new(
                         Opcode::GetRegister,
-                        vec![Value::Reg(super::ir::value::Reg(*branch_reg as u8))],
+                        vec![Value::Reg(super::ir::value::Reg(u64::from(*branch_reg)))],
                     ),
                 );
                 let address = append_inst(
@@ -1547,6 +1547,7 @@ mod tests {
     const UNCONDITIONAL_EXIT: u64 = 0xE300_0000_0007_000F;
 
     struct DummyEnvironment {
+        native: bool,
         texture_pass_caches: crate::environment::TexturePassCaches,
         sph: ProgramHeader,
         instructions: Vec<u64>,
@@ -1559,6 +1560,7 @@ mod tests {
             sph.raw[3] = (OutputTopology::TriangleStrip as u32) << 24;
             Self {
                 texture_pass_caches: Default::default(),
+                native: false,
                 sph,
                 instructions: Vec::new(),
                 mesh: None,
@@ -1567,6 +1569,7 @@ mod tests {
     }
 
     impl Environment for DummyEnvironment {
+        fn has_native_instructions(&self) -> bool { self.native }
         fn mesh_shader(&self) -> Option<&crate::environment::MeshShaderEnvironment> {
             self.mesh.as_ref()
         }
@@ -1659,6 +1662,111 @@ mod tests {
 
         fn is_proprietary_driver(&self) -> bool {
             false
+        }
+    }
+
+    #[test]
+    fn predicated_gather_offsets_remain_constant_after_control_flow_optimization() {
+        use crate::ir::{opcodes::Opcode, value::Value};
+        use crate::frontend::ampere::lower_to_maxwell::{Instruction, lower_to_maxwell};
+        let native = [
+            Instruction { words: [0x00109802, 0x00010000, 0xf00, 0] },
+            Instruction { words: [0x00119802, 0x01010100, 0xf00, 0] },
+            Instruction { words: [0x06189b63, 0x30007c10, 0x001e2f0e, 0] },
+            Instruction { words: [0x794d, 0, 0x03800000, 0] },
+        ];
+        let lowered = lower_to_maxwell(&native);
+        assert!(lowered.is_valid(), "{}", lowered.error);
+        let mut code = lowered.instructions;
+        // Keep the sampled value observable through a shared-memory store.
+        code.insert(lowered.source_instruction_offsets[3] as usize, 0xef5c00000007ff18);
+        let mut scheduled = Vec::new();
+        for instruction in code {
+            if scheduled.len() % 4 == 0 { scheduled.push(0); }
+            scheduled.push(instruction);
+        }
+        let mut env = DummyEnvironment::compute();
+        env.native = true;
+        env.instructions = scheduled.clone();
+        let program = translate_program_from_env(&scheduled, 0, &mut env);
+        let resolve = |mut value: Value| {
+            while let Value::Inst(reference) = value {
+                let inst = program.blocks[reference.block as usize].instructions[reference.inst as usize].as_ref().unwrap();
+                if inst.opcode != Opcode::Identity { break; }
+                value = inst.args[0];
+            }
+            value
+        };
+        let gathers: Vec<_> = program.blocks.iter().flat_map(|b| b.iter())
+            .filter(|i| matches!(i.opcode, Opcode::BoundImageGather | Opcode::ImageGather | Opcode::BindlessImageGather)).collect();
+        assert_eq!(gathers.len(), 1);
+        for offset in &gathers[0].args[2..4] {
+            let Value::Inst(reference) = resolve(*offset) else { panic!("missing offset vector"); };
+            let vector = program.blocks[reference.block as usize].instructions[reference.inst as usize].as_ref().unwrap();
+            assert_eq!(vector.opcode, Opcode::CompositeConstructU32x4);
+            assert!(vector.args.iter().all(|&v| resolve(v).is_immediate()), "nonconstant offsets: {:?}", vector.args);
+        }
+    }
+
+    #[test]
+    fn native_register_copies_preserve_shadow_banks_through_ssa() {
+        use crate::frontend::{translate::{TranslatorVisitor, move_register}, maxwell_opcodes::MaxwellOpcode};
+        use crate::ir::{basic_block::Block, value::{Reg, Value}};
+        let mut env = DummyEnvironment::compute();
+        env.native = true;
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        let reads;
+        {
+            let mut visitor = TranslatorVisitor::new_with_env(&mut program, 0, &env);
+            visitor.set_x(4, Value::ImmU32(11));
+            visitor.set_x(260, Value::ImmU32(22));
+            let copy = |dst_bank: u64, src_bank: u64| {
+                0x5c98000000070000 | (10u64 << 44) | 4 | (dst_bank << 8)
+                    | (src_bank << 10) | (4u64 << 20)
+            };
+            move_register::mov(&mut visitor, copy(2, 0), MaxwellOpcode::MOV_reg);
+            move_register::mov(&mut visitor, copy(0, 1), MaxwellOpcode::MOV_reg);
+            let borrowed = visitor.x(4);
+            visitor.set_x(4, Value::ImmU32(99));
+            move_register::mov(&mut visitor, copy(1, 0), MaxwellOpcode::MOV_reg);
+            move_register::mov(&mut visitor, copy(0, 2), MaxwellOpcode::MOV_reg);
+            visitor.set_x(511, Value::ImmU32(51));
+            visitor.set_x(767, Value::ImmU32(76));
+            visitor.set_x(255, Value::ImmU32(255));
+            assert_eq!(visitor.x(255), Value::ImmU32(0));
+            reads = [borrowed, visitor.x(4), visitor.x(260), visitor.x(516), visitor.x(511), visitor.x(767)];
+        }
+        crate::ir_opt::ssa_rewrite_pass::ssa_rewrite_pass(&mut program);
+        for (read, expected) in reads.into_iter().zip([22, 11, 99, 11, 51, 76]) {
+            let mut resolved = read;
+            while let Value::Inst(index) = resolved {
+                let instruction = program.block(index.block).inst(index.inst);
+                assert_eq!(instruction.opcode, crate::ir::Opcode::Identity);
+                resolved = instruction.args[0];
+            }
+            assert_eq!(resolved, Value::ImmU32(expected));
+        }
+        assert_eq!(Reg::RZ.0, 255);
+        assert_eq!(Reg::NUM_REGS, 768);
+    }
+
+    #[test]
+    fn native_register_copy_marker_is_gated_and_rejects_invalid_banks() {
+        use crate::frontend::{translate::{TranslatorVisitor, move_register}, maxwell_opcodes::MaxwellOpcode};
+        use crate::ir::basic_block::Block;
+        let marker = 0x5c98000000070000 | (10u64 << 44) | 4 | (1u64 << 10) | (4u64 << 20);
+        let mut env = DummyEnvironment::compute();
+        let mut program = Program::new(ShaderStage::Compute);
+        program.blocks.push(Block::new());
+        move_register::mov(&mut TranslatorVisitor::new_with_env(&mut program, 0, &env), marker, MaxwellOpcode::MOV_reg);
+        assert_eq!(program.block(0).iter().count(), 0);
+        env.native = true;
+        for invalid in [marker | (3u64 << 8), (marker & !(3u64 << 10)) | (3u64 << 10)] {
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                move_register::mov(&mut TranslatorVisitor::new_with_env(&mut program, 0, &env), invalid, MaxwellOpcode::MOV_reg);
+            })).unwrap_err();
+            assert!(error.is::<crate::exception::NotImplementedException>());
         }
     }
 

@@ -24,6 +24,15 @@ use crate::hle::service::ipc_helpers;
 /// Default number of maximum connections to a server session.
 pub const SERVER_SESSION_COUNT_MAX: u32 = 0x40;
 
+// Fritchii service.cpp: placeholder replies must not expose request words as data.
+const STUB_ZEROED_WORDS: u32 = 32;
+
+fn push_stub_zeroes(rb: &mut ipc_helpers::ResponseBuilder<'_>) {
+    for _ in 0..STUB_ZEROED_WORDS {
+        rb.push_u32(0);
+    }
+}
+
 const _: () = assert!(SERVER_SESSION_COUNT_MAX == 0x40);
 
 static IPC_INVALID_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +115,39 @@ pub trait ServiceFramework: SessionRequestHandler {
 
     /// Returns a reference to the TIPC handler map.
     fn handlers_tipc(&self) -> &BTreeMap<u32, FunctionInfo>;
+
+    /// Fritchii ServiceFrameworkBase::StubAllowed; these remain placeholders.
+    fn stub_allowed(&self, ctx: &mut HLERequestContext) -> bool {
+        static ENV_AUTO_STUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let env_auto_stub = *ENV_AUTO_STUB.get_or_init(|| std::env::var_os("EDEN_NX2_AUTO_STUB").is_some());
+        let caller = ctx.get_thread().and_then(|thread| {
+            thread.lock().unwrap().parent.as_ref().and_then(std::sync::Weak::upgrade)
+        });
+        let caller_is_switch2 = caller.is_some_and(|process| process.lock().unwrap().is_switch2());
+        if *common::settings::values().use_auto_stub.get_value()
+            || env_auto_stub
+            || self.get_service_name().starts_with(super::nx2_stub_interface::NX2_STUB_PREFIX)
+            || caller_is_switch2
+        {
+            static LOGGED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<(String, u32)>>> = std::sync::OnceLock::new();
+            if LOGGED.get_or_init(Default::default).lock().unwrap()
+                .insert((self.get_service_name().to_owned(), ctx.get_command())) {
+                log::warn!("(STUBBED) {}::{} (placeholder reply)", self.get_service_name(), ctx.get_command());
+            }
+            return true;
+        }
+        let handlers = if ctx.is_tipc() { self.handlers_tipc() } else { self.handlers() };
+        self.report_unimplemented_function(ctx, handlers.get(&ctx.get_command()));
+        false
+    }
+
+    /// Fritchii ServiceFrameworkBase::StubReplyZeroed.
+    fn stub_reply_zeroed(&self, ctx: &mut HLERequestContext) {
+        if !self.stub_allowed(ctx) { return; }
+        let mut rb = ipc_helpers::ResponseBuilder::new(ctx, 2 + STUB_ZEROED_WORDS, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        push_stub_zeroes(&mut rb);
+    }
 
     /// Deprecated compatibility hook kept for older services.
     fn service_manager(

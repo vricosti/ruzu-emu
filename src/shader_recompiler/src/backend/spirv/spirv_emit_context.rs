@@ -475,6 +475,7 @@ pub struct SpirvEmitContext {
     pub sample_id: spirv::Word,
     pub is_helper_invocation: spirv::Word,
     pub subgroup_local_invocation_id: spirv::Word,
+    pub software_matrix_functions: [spirv::Word; 2],
     pub subgroup_mask_eq: spirv::Word,
     pub subgroup_mask_lt: spirv::Word,
     pub subgroup_mask_le: spirv::Word,
@@ -800,6 +801,7 @@ impl SpirvEmitContext {
             sample_id: 0,
             is_helper_invocation: 0,
             subgroup_local_invocation_id: 0,
+            software_matrix_functions: [0; 2],
             subgroup_mask_eq: 0,
             subgroup_mask_lt: 0,
             subgroup_mask_le: 0,
@@ -4207,6 +4209,13 @@ impl SpirvEmitContext {
     ) {
         use ir::Opcode;
         match inst.opcode {
+            Opcode::TensorMulAdd => {
+                let a = self.resolve_value(inst.arg(0));
+                let b = self.resolve_value(inst.arg(1));
+                let c = self.resolve_value(inst.arg(2));
+                let id = super::emit_spirv_tensor::emit_tensor_mul_add(self, inst, a, b, c);
+                self.set_value(block_idx, inst_idx, id);
+            }
             // ── FP16 arithmetic ───────────────────────────────────────
             Opcode::FPAdd16 => {
                 let a = self.resolve_value(inst.arg(0));

@@ -608,6 +608,11 @@ pub fn collect_shader_info_pass(program: &mut Program) {
                 Opcode::DemoteToHelperInvocation => {
                     program.info.uses_demote_to_helper_invocation = true;
                 }
+                Opcode::TensorMulAdd => {
+                    program.info.uses_subgroup_shuffles = true;
+                    program.info.uses_fp32_denorms_preserve = true;
+                    program.info.uses_subgroup_invocation_id = true;
+                }
                 Opcode::LaneId => {
                     program.info.uses_subgroup_invocation_id = true;
                 }

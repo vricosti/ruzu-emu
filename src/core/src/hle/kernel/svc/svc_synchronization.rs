@@ -504,6 +504,39 @@ mod tests {
             .set_current_page_table(impl_pt.as_mut() as *mut _, true);
     }
 
+    #[test]
+    fn address_arbiter_wait64_preserves_abi_and_validation() {
+        // Reuse this module's mapped-memory/current-thread SVC integration fixture.
+        let system = test_system();
+        let address = write_wait_handles(&system, &[0xFFFF_FFFE, 0x8000_0001]);
+        let invoke = |is_64bit: bool, address: u64, kind: u64, value: u64| {
+            let mut args = [address, kind, value, 0, 0, 0, 0, 0];
+            crate::hle::kernel::svc_dispatch::call(
+                &system,
+                crate::hle::kernel::svc_dispatch::SvcId::WaitForAddress as u32,
+                is_64bit,
+                &mut args,
+            );
+            ResultCode::new(args[0] as u32)
+        };
+        // The upper word and sign bit must survive the AArch64 SVC boundary.
+        assert_eq!(invoke(true, address, 3, 0x8000_0001_FFFF_FFFE), RESULT_TIMED_OUT);
+        assert_eq!(invoke(true, address, 3, 0x0000_0001_FFFF_FFFE), RESULT_INVALID_STATE);
+        assert_eq!(invoke(true, address, 3, 0xFFFF_FFFE), RESULT_INVALID_STATE);
+        // Existing 32-bit modes still truncate and sign-extend their operand.
+        assert_eq!(invoke(true, address, 2, 0x1234_5678_FFFF_FFFE), RESULT_TIMED_OUT);
+        assert_eq!(invoke(false, address, 2, 0xFFFF_FFFE), RESULT_TIMED_OUT);
+        // The AArch32 wrapper sign-extends its s32 argument even for mode 3.
+        let negative_address = write_wait_handles(&system, &[0xFFFF_FFFE, 0xFFFF_FFFF]);
+        assert_eq!(invoke(false, negative_address, 3, 0xFFFF_FFFE), RESULT_TIMED_OUT);
+        // Validate alignment before enum, and the entire 64-bit memory range.
+        assert_eq!(invoke(true, address + 4, 3, 0), RESULT_INVALID_ADDRESS);
+        assert_eq!(invoke(true, address + 1, 99, 0), RESULT_INVALID_ADDRESS);
+        assert_eq!(invoke(true, address, 99, 0), RESULT_INVALID_ENUM_VALUE);
+        assert_eq!(invoke(true, 0, 3, 0), RESULT_INVALID_CURRENT_MEMORY);
+        assert_eq!(invoke(true, address + 4, 2, u64::MAX), RESULT_TIMED_OUT);
+    }
+
     fn write_wait_handles(system: &System, handles: &[Handle]) -> u64 {
         let process_arc = system.current_process_arc();
         let mut process = process_arc.lock().unwrap();

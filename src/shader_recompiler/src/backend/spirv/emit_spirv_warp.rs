@@ -139,17 +139,41 @@ fn get_max_thread_id(
     compute_max_thread_id(ctx, min_thread_id, clamp, not_seg_mask)
 }
 
+fn needs_shuffle_fallback(ctx: &SpirvEmitContext) -> bool {
+    ctx.profile.has_broken_spirv_subgroup_shuffle
+        || (ctx.profile.has_broken_spirv_fragment_subgroup_shuffle
+            && ctx.stage == crate::ir::types::ShaderStage::Fragment)
+}
+
+/// Fritchii `ShuffleAbsolute`: use constant-index broadcasts on broken drivers.
+/// The fragment-only flag is a host workaround extension: the AMD compiler
+/// crashes on the captured dynamic shuffle while compute/tensor shuffles work.
+fn shuffle_absolute(ctx: &mut SpirvEmitContext, value: Word, src_thread_id: Word) -> Word {
+    let scope = subgroup_scope(ctx);
+    if !needs_shuffle_fallback(ctx) {
+        return ctx.builder
+            .group_non_uniform_shuffle(ctx.u32_type, None, scope, value, src_thread_id)
+            .unwrap();
+    }
+    let mut result = ctx.const_zero_u32;
+    for lane in 0..ctx.profile.max_subgroup_size {
+        let lane = ctx.constant_u32(lane);
+        let read = ctx.builder
+            .group_non_uniform_broadcast(ctx.u32_type, None, scope, value, lane)
+            .unwrap();
+        let matches = ctx.builder.i_equal(ctx.bool_type, None, src_thread_id, lane).unwrap();
+        result = ctx.builder.select(ctx.u32_type, None, matches, read, result).unwrap();
+    }
+    result
+}
+
 fn select_value(
     ctx: &mut SpirvEmitContext,
     in_range: Word,
     value: Word,
     src_thread_id: Word,
 ) -> Word {
-    let scope = subgroup_scope(ctx);
-    let shuffled = ctx
-        .builder
-        .group_non_uniform_shuffle(ctx.u32_type, None, scope, value, src_thread_id)
-        .unwrap();
+    let shuffled = shuffle_absolute(ctx, value, src_thread_id);
     ctx.builder
         .select(ctx.u32_type, None, in_range, shuffled, value)
         .unwrap()
@@ -582,6 +606,64 @@ mod tests {
     use rspirv::dr::Operand;
     use rspirv::spirv;
     use std::collections::HashMap;
+
+    #[test]
+    fn broken_fragment_shuffle_broadcasts_every_host_lane_without_changing_compute() {
+        for size in [32, 64, 128] {
+            for stage in [ShaderStage::Fragment, ShaderStage::Compute] {
+                let mut program = Program::new(stage);
+                program.blocks.push(Block::new());
+                program.block_mut(0).append_inst(Inst::new(Opcode::ShuffleIndex, vec![
+                    Value::ImmU32(0x1234abcd), Value::ImmU32(31),
+                    Value::ImmU32(31), Value::ImmU32(0),
+                ]));
+                program.syntax_list = vec![SyntaxNode::Block(0), SyntaxNode::Return];
+                crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+                let profile = Profile {
+                    supported_spirv: 0x00010600,
+                    support_vote: true,
+                    supported_subgroup_stages: u32::MAX,
+                    has_broken_spirv_fragment_subgroup_shuffle: true,
+                    max_subgroup_size: size,
+                    warp_size_potentially_larger_than_guest: size > 32,
+                    ..Profile::default()
+                };
+                let words = crate::backend::emit_spirv(&program, &profile, &RuntimeInfo::default());
+                let module = rspirv::dr::load_words(&words).unwrap();
+                let instructions: Vec<_> = module.functions.iter().flat_map(|f| &f.blocks)
+                    .flat_map(|b| &b.instructions).collect();
+                let broadcasts: Vec<_> = instructions.iter().filter(|i| i.class.opcode == spirv::Op::GroupNonUniformBroadcast).collect();
+                let shuffles = instructions.iter().filter(|i| i.class.opcode == spirv::Op::GroupNonUniformShuffle).count();
+                if stage == ShaderStage::Compute {
+                    assert!(broadcasts.is_empty());
+                    assert_eq!(shuffles, 1, "fragment workaround must not change compute/tensor lowering");
+                    continue;
+                }
+                assert_eq!(shuffles, 0);
+                assert_eq!(broadcasts.len(), size as usize);
+                for (lane, broadcast) in broadcasts.into_iter().enumerate() {
+                    let index = broadcast.operands[2].unwrap_id_ref();
+                    let constant = module.types_global_values.iter().find(|i| i.result_id == Some(index)).unwrap();
+                    assert_eq!(constant.class.opcode, spirv::Op::Constant);
+                    assert_eq!(constant.operands[0], Operand::LiteralBit32(lane as u32));
+                    let matches = instructions.iter().find(|i| i.class.opcode == spirv::Op::IEqual
+                        && i.operands[1] == Operand::IdRef(index)).unwrap();
+                    assert!(instructions.iter().any(|i| i.class.opcode == spirv::Op::Select
+                        && i.operands[0] == Operand::IdRef(matches.result_id.unwrap())
+                        && i.operands[1] == Operand::IdRef(broadcast.result_id.unwrap())));
+                }
+                if let Some(validator) = std::env::var_os("RUZU_SPIRV_VAL") {
+                    let path = std::env::temp_dir().join(format!("ruzu-shuffle-fallback-{}-{size}.spv", std::process::id()));
+                    let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+                    std::fs::write(&path, bytes).unwrap();
+                    let output = std::process::Command::new(validator).args(["--target-env", "vulkan1.3"])
+                        .arg(&path).output().unwrap();
+                    let _ = std::fs::remove_file(path);
+                    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                }
+            }
+        }
+    }
 
     /// SHFL.IDX takes its source lane from five bits of the index register:
     /// -1 means lane 31, which a clamp of 30 then rejects. The shuffle must

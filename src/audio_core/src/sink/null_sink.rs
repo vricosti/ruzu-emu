@@ -30,6 +30,18 @@ impl SinkStream for NullSinkStreamImpl {
         &self.base
     }
 
+    fn is_ready(&self) -> bool { true }
+
+    fn start(&self, _resume: bool) { self.base.lock().signal_start(); }
+
+    fn stop(&self) { self.base.lock().signal_stop(); }
+
+    fn try_append_output_block(&self, buffer: SinkBuffer, samples: &[i16]) -> bool {
+        buffer.frames == crate::common::common::TARGET_SAMPLE_COUNT as u64
+            && buffer.frames_played == 0 && !buffer.consumed
+            && samples.len() == crate::common::common::TARGET_SAMPLE_COUNT as usize * 2
+    }
+
     fn append_buffer(&self, _buffer: SinkBuffer, _samples: &[i16]) {}
 
     fn release_buffer(&self, _num_samples: u64) -> Vec<i16> {

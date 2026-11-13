@@ -663,6 +663,7 @@ pub(crate) fn emit_into_context(
     assert!(!program.info.is_task && !program.info.is_mesh,
         "task/mesh programs require the compute fallback entrypoint");
     ctx.define_global_variables(program, bindings);
+    super::emit_spirv_tensor::define_software_matrix_functions(ctx, program);
     let main = define_main(ctx, program);
     define_entry_point(program, ctx, main);
     let profile = ctx.profile.clone();

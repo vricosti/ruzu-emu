@@ -67,6 +67,10 @@ pub trait SocketBase: Send + Sync {
     fn is_opened(&self) -> bool;
     fn handle_proxy_packet(&mut self, packet: &ProxyPacket);
 
+    /// Fritchii SocketBase::EmulatedPoll; None delegates readiness to host poll.
+    fn emulated_poll(&self, events: crate::internal_network::network::PollEvents)
+        -> Option<crate::internal_network::network::PollEvents>;
+
     fn get_fd(&self) -> NativeSocket;
 }
 
@@ -315,6 +319,8 @@ fn translate_poll_events(mut events: NetworkPollEvents) -> i16 {
     if !events.is_empty() {
         log::warn!("Unhandled poll events={:#x}", events.bits());
     }
+    // Fritchii: Winsock reports out-of-band input as POLLRDBAND and rejects POLLPRI.
+    if result & ws::POLLPRI != 0 { result = (result & !ws::POLLPRI) | ws::POLLRDBAND; }
     // WSAPoll rejects other input flags, unlike POSIX poll.
     result & (ws::POLLRDBAND | ws::POLLRDNORM | ws::POLLWRNORM)
 }
@@ -482,6 +488,30 @@ mod tests {
 }
 
 impl Socket {
+    /// Fritchii Socket::Transfer. Rust's exclusive &mut Socket (held through
+    /// the descriptor's mutex) precludes overlapping calls and SetNonBlock;
+    /// the C++ epoch/refcount protocol therefore reduces to one scoped mode change.
+    fn transfer(&mut self, flags: i32, operation: impl FnOnce(&mut Self, i32) -> (i32, Errno)) -> (i32, Errno) {
+        #[cfg(windows)]
+        {
+            let temporary = flags & crate::internal_network::network::FLAG_MSG_DONTWAIT != 0 && !self.is_non_blocking;
+            if temporary {
+                let mut mode = 1u32;
+                if unsafe { ws::ioctlsocket(self.fd, ws::FIONBIO, &mut mode) } == ws::SOCKET_ERROR { return (-1, get_last_error()); }
+            }
+            let result = operation(self, 0);
+            if temporary {
+                let mut mode = 0u32;
+                if unsafe { ws::ioctlsocket(self.fd, ws::FIONBIO, &mut mode) } == ws::SOCKET_ERROR { log::error!("Failed to restore socket blocking mode: {:?}", get_last_error()); }
+            }
+            result
+        }
+        #[cfg(unix)]
+        { operation(self, if flags & crate::internal_network::network::FLAG_MSG_DONTWAIT != 0 { libc::MSG_DONTWAIT } else { 0 }) }
+        #[cfg(not(any(unix, windows)))]
+        { let _ = flags; operation(self, 0) }
+    }
+
     #[cfg(windows)]
     fn set_sock_opt<T>(&self, option: i32, value: &T) -> Errno {
         let result = unsafe { ws::setsockopt(self.fd, ws::SOL_SOCKET, option,
@@ -885,35 +915,19 @@ impl SocketBase for Socket {
     }
 
     fn recv(&mut self, flags: i32, message: &mut [u8]) -> (i32, Errno) {
-        #[cfg(unix)]
-        {
-            assert_eq!(flags, 0);
-            let result = unsafe {
-                libc::recv(
-                    self.fd,
-                    message.as_mut_ptr() as *mut libc::c_void,
-                    message.len(),
-                    flags,
-                )
-            };
-            if result >= 0 {
-                (result as i32, Errno::Success)
-            } else {
-                (-1, get_last_error())
-            }
-        }
-        #[cfg(windows)]
-        {
-            assert_eq!(flags, 0);
-            assert!(message.len() < i32::MAX as usize);
-            let result = unsafe { ws::recv(self.fd, message.as_mut_ptr().cast(), message.len() as i32, 0) };
-            if result == ws::SOCKET_ERROR { (-1, get_last_error()) } else { (result, Errno::Success) }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (flags, message);
-            (-1, Errno::Other)
-        }
+        use crate::internal_network::network::FLAG_MSG_DONTWAIT;
+        assert_eq!(flags & !FLAG_MSG_DONTWAIT, 0);
+        assert!(message.len() < i32::MAX as usize);
+        self.transfer(flags, |socket, host_flags| {
+            #[cfg(unix)]
+            let result = unsafe { libc::recv(socket.fd, message.as_mut_ptr().cast(), message.len(), host_flags) };
+            #[cfg(windows)]
+            let result = unsafe { ws::recv(socket.fd, message.as_mut_ptr().cast(), message.len() as i32, host_flags) };
+            #[cfg(any(unix, windows))]
+            { if result < 0 { (-1, get_last_error()) } else { (result as i32, Errno::Success) } }
+            #[cfg(not(any(unix, windows)))]
+            { let _ = (socket, host_flags); (-1, Errno::Other) }
+        })
     }
 
     fn recv_from(
@@ -1238,6 +1252,11 @@ impl SocketBase for Socket {
         log::warn!("ProxyPacket received, but not in Proxy mode!");
     }
 
+    fn emulated_poll(&self, _events: crate::internal_network::network::PollEvents)
+        -> Option<crate::internal_network::network::PollEvents> {
+        None
+    }
+
     fn get_fd(&self) -> NativeSocket {
         self.fd
     }
@@ -1305,7 +1324,14 @@ pub fn poll(pollfds: &mut [PollFD], timeout: i32) -> (i32, Errno) {
         }
 
         for (i, fd) in fds.iter().take(num).enumerate() {
-            pollfds[i].revents = translate_poll_revents(fd.revents).bits();
+            let mut revents = translate_poll_revents(fd.revents);
+            // POLLIN aliases both read bits on Windows; retain their precise meanings.
+            if fd.revents & ws::POLLRDNORM != 0 { revents |= NetworkPollEvents::RD_NORM; }
+            if fd.revents & ws::POLLRDBAND != 0 {
+                revents |= NetworkPollEvents::RD_BAND;
+                if pollfds[i].events & NetworkPollEvents::PRI.bits() != 0 { revents |= NetworkPollEvents::PRI; }
+            }
+            pollfds[i].revents = revents.bits();
         }
         if result > 0 {
             (result, Errno::Success)
@@ -1330,6 +1356,22 @@ mod windows_tests {
 
     fn loopback(portno: u16) -> SockAddrIn {
         SockAddrIn { family: Some(Domain::INET), ip: [127, 0, 0, 1], portno }
+    }
+
+    #[test]
+    fn windows_poll_preserves_normal_readiness_for_select() {
+        let _network = NetworkInstance::new();
+        assert_eq!(translate_poll_events(NetworkPollEvents::PRI), ws::POLLRDBAND);
+        let mut receiver = Socket::new();
+        assert_eq!(receiver.initialize(Domain::INET, Type::DGRAM, Protocol::UDP), Errno::Success);
+        assert_eq!(receiver.bind(loopback(0)), Errno::Success);
+        let address = receiver.get_sock_name().0;
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(&[42], std::net::SocketAddrV4::new(address.ip.into(), address.portno)).unwrap();
+        let mut fds = [PollFD { fd: receiver.get_fd(), events: NetworkPollEvents::RD_NORM.bits(), revents: 0 }];
+        assert!(poll(&mut fds, 1000).0 > 0);
+        assert_ne!(fds[0].revents & NetworkPollEvents::RD_NORM.bits(), 0);
+        assert_eq!(fds[0].revents & NetworkPollEvents::PRI.bits(), 0);
     }
 
     #[test]

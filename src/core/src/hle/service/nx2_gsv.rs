@@ -949,6 +949,7 @@ struct PresentStats {
 struct Vi2State {
     context: ServiceContext,
     events: Vec<u32>,
+    native_events: [Option<u32>; 8],
     vsync_timer: Option<Arc<parking_lot::Mutex<crate::core_timing::EventType>>>,
     presents: u64,
     wait_timeouts: u32,
@@ -981,23 +982,34 @@ impl INx2Vi2Session {
                     "GetTimestampRecorderCount (guessed)",
                 ),
                 (11, Some(Self::return_event), "Unknown11"),
-                (31, Some(Self::get_vsync_event), "GetVsyncEvent (guessed)"),
+                (31, Some(Self::acquire_native_event), "AcquireNativeEvent"),
                 (
                     32,
-                    Some(Self::get_vsync_event),
-                    "GetDisplayVsyncEvent (guessed)",
+                    Some(Self::duplicate_native_event),
+                    "DuplicateNativeEvent",
                 ),
-                (
-                    104,
-                    Some(Self::succeed_quietly),
-                    "Unknown104 (display default)",
-                ),
-                (
-                    105,
-                    Some(Self::succeed_quietly),
-                    "Unknown105 (display default)",
-                ),
+                (103, Some(Self::query_display_refresh_rate), "QueryDisplayRefreshRate"),
+                (104, Some(Self::query_display_hdr_status), "QueryDisplayHdrStatus"),
+                (105, Some(Self::query_display_hdr_paper_white), "QueryDisplayHdrPaperWhite"),
+                (106, Some(Self::get_buffer_max_resolution), "GetBufferMaxResolution"),
+                (212, Some(Self::get_layer_buffer_bits), "GetLayerBufferBits"),
                 (228, Some(Self::cancel_client_buffer), "CancelClientBuffer"),
+                (261, Some(Self::bind_vsync), "BindDisplayVsyncEvent"),
+                (262, Some(Self::unbind_native_event), "UnbindDisplayVsyncEvent"),
+                (263, Some(Self::bind_change), "BindDisplayRefreshRateEvent"),
+                (264, Some(Self::unbind_native_event), "UnbindDisplayRefreshRateEvent"),
+                (265, Some(Self::bind_change), "BindDisplayHdrStatusEvent"),
+                (266, Some(Self::unbind_native_event), "UnbindDisplayHdrStatusEvent"),
+                (267, Some(Self::bind_change), "BindDisplayHdrPaperWhiteEvent"),
+                (268, Some(Self::unbind_native_event), "UnbindDisplayHdrPaperWhiteEvent"),
+                (269, Some(Self::bind_change), "BindDisplayBufferMaxResolutionEvent"),
+                (270, Some(Self::unbind_native_event), "UnbindDisplayBufferMaxResolutionEvent"),
+                (271, Some(Self::bind_change), "BindDisplayModeCapabilityEvent"),
+                (272, Some(Self::unbind_native_event), "UnbindDisplayModeCapabilityEvent"),
+                (107, Some(|this, ctx| this.stub_reply_zeroed(ctx)), "Unknown107"),
+                (301, Some(|this, ctx| this.stub_reply_zeroed(ctx)), "Unknown301"),
+                (351, Some(|this, ctx| this.stub_reply_zeroed(ctx)), "Unknown351"),
+                (354, Some(|this, ctx| this.stub_reply_zeroed(ctx)), "Unknown354"),
                 (
                     229,
                     Some(Self::present_client_buffer),
@@ -1007,6 +1019,7 @@ impl INx2Vi2Session {
             state: Mutex::new(Vi2State {
                 context: ServiceContext::new("nx2:vi2".into()),
                 events: Vec::new(),
+                native_events: [None; 8],
                 vsync_timer: None,
                 presents: 0,
                 wait_timeouts: 0,
@@ -1413,9 +1426,6 @@ impl INx2Vi2Session {
         log::warn!("(STUBBED) nx2:vi2 TIPC 5, returning 7");
         tipc_reply_words(ctx, &[7]);
     }
-    fn succeed_quietly(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        ResponseBuilder::new(ctx, 2, 0, 0).push_result(RESULT_SUCCESS);
-    }
     fn return_event(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
         log::warn!(
@@ -1434,21 +1444,122 @@ impl INx2Vi2Session {
         rb.push_result(RESULT_SUCCESS);
         rb.push_copy_object_id(object);
     }
-    fn get_vsync_event(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn query_display_refresh_rate(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        tipc_reply_words(ctx, &[60, 0]);
+    }
+    fn query_display_hdr_status(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        tipc_reply_words(ctx, &[1, 0, 400]);
+    }
+    fn query_display_hdr_paper_white(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        tipc_reply_words(ctx, &[203]);
+    }
+    fn get_layer_buffer_bits(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        const AVAILABLE_SLOTS: u64 = 0x7fff;
+        tipc_reply_words(ctx, &[AVAILABLE_SLOTS as u32, (AVAILABLE_SLOTS >> 32) as u32]);
+    }
+    fn get_buffer_max_resolution(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        const DEFAULT_DISPLAY: u64 = 0x00746c7561666564;
+        let packet = ctx.command_buffer();
+        let name = u64::from(packet[2]) | (u64::from(packet[3]) << 32);
+        let mut result = crate::hle::kernel::svc::svc_results::RESULT_INVALID_COMBINATION;
+        let mut mode = 0;
+        if packet[0] == 0x7a && packet[1] == 2 {
+            result = ResultCode::from_module_description(crate::hle::result::ErrorModule::VI, 7);
+            if name == DEFAULT_DISPLAY {
+                static FORCED: std::sync::LazyLock<Option<std::ffi::CString>> = std::sync::LazyLock::new(|| {
+                    std::env::var("EDEN_VI2_MAX_RESOLUTION_MODE").ok().map(|value| std::ffi::CString::new(value).unwrap())
+                });
+                mode = if let Some(value) = FORCED.as_ref() {
+                    unsafe { libc::strtoull(value.as_ptr(), std::ptr::null_mut(), 0) }
+                } else if common::settings::is_docked_mode(&common::settings::values()) { 4 } else { 2 };
+                result = RESULT_SUCCESS;
+            }
+        }
+        let mut rb = ResponseBuilder::new(ctx, 4, 0, 0);
+        rb.push_u32(result.get_inner_value());
+        rb.push_u64(mode);
+    }
+    fn acquire_native_event(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
-        log::info!(
-            "nx2:vi2 {} vsync event, [2]={:#x}",
-            ctx.get_command(),
-            ctx.command_buffer()[2]
-        );
-        let mut state = this.state.lock().unwrap();
-        let name = format!("nx2:vi2:Vsync{}", state.events.len());
-        let handle = state.context.create_event(name);
-        state.events.push(handle);
-        let event = state.context.get_event(handle).unwrap();
-        this.vsync.lock().unwrap().push(event.clone());
+        let index = ctx.command_buffer()[2] as usize;
+        if index >= 8 {
+            ResponseBuilder::new(ctx, 2, 0, 0).push_result(crate::hle::result::RESULT_UNKNOWN);
+            return;
+        }
+        this.reply_native_event(ctx, index);
+    }
+    fn duplicate_native_event(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let words = ctx.command_buffer();
+        let mut data = 2;
+        if words[1] >> 31 != 0 {
+            let descriptor = words[2];
+            data = 3 + ((descriptor >> 1) & 0xf) as usize + ((descriptor >> 5) & 0xf) as usize
+                + if descriptor & 1 != 0 { 2 } else { 0 };
+        }
+        let index = words[data] as usize;
+        if index >= 8 {
+            ResponseBuilder::new(ctx, 2, 0, 0).push_result(crate::hle::result::RESULT_UNKNOWN);
+            return;
+        }
+        this.reply_native_event(ctx, index);
+    }
+    fn bind_vsync(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let index = ctx.command_buffer()[4] as usize;
+        let state = this.state.lock().unwrap();
+        if index < state.native_events.len() && state.native_events[index].is_some() {
+            this.set_vsync_slot(&state, index, true);
+        }
+        tipc_reply_words(ctx, &[]);
+    }
+    fn bind_change(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let index = ctx.command_buffer()[4] as usize;
+        let state = this.state.lock().unwrap();
+        if let Some(Some(handle)) = state.native_events.get(index) {
+            this.set_vsync_slot(&state, index, false);
+            state.context.get_event(*handle).unwrap().signal();
+        }
+        tipc_reply_words(ctx, &[]);
+    }
+    fn unbind_native_event(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        let this = unsafe { &*(this as *const dyn ServiceFramework as *const Self) };
+        let index = ctx.command_buffer()[4] as usize;
+        let state = this.state.lock().unwrap();
+        if index < state.native_events.len() && state.native_events[index].is_some() {
+            this.set_vsync_slot(&state, index, false);
+        }
+        tipc_reply_words(ctx, &[]);
+    }
+    fn reply_native_event(&self, ctx: &mut HLERequestContext, index: usize) {
+        let mut state = self.state.lock().unwrap();
+        if state.native_events[index].is_none() {
+            let handle = state.context.create_event(format!("nx2:vi2:Native{index}"));
+            state.native_events[index] = Some(handle);
+            state.events.push(handle);
+            self.set_vsync_slot(&state, index, true);
+            self.start_vsync_timer(&mut state);
+        }
+        let event = state.context.get_event(state.native_events[index].unwrap()).unwrap();
+        let object = event.copy_object_id(ctx).expect("VI event requires owner");
+        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_copy_object_id(object);
+    }
+    fn set_vsync_slot(&self, state: &Vi2State, index: usize, on: bool) {
+        let event = state.context.get_event(state.native_events[index].unwrap()).unwrap();
+        let mut list = self.vsync.lock().unwrap();
+        let position = list.iter().position(|item| Arc::ptr_eq(item, &event));
+        match (on, position) {
+            (true, None) => list.push(event),
+            (false, Some(position)) => { list.remove(position); }
+            _ => {}
+        }
+    }
+    fn start_vsync_timer(&self, state: &mut Vi2State) {
         if state.vsync_timer.is_none() {
-            let vsync = this.vsync.clone();
+            let vsync = self.vsync.clone();
             let timer = crate::core_timing::create_event(
                 "nx2:vi2 vsync".into(),
                 Box::new(move |_, _| {
@@ -1469,17 +1580,14 @@ impl INx2Vi2Session {
                         .unwrap_or(60);
                     std::time::Duration::from_nanos((1_000_000_000 / hz) as u64)
                 });
-            this.system
+            self.system
                 .get()
                 .core_timing()
                 .schedule_looping_event(*INTERVAL, *INTERVAL, &timer, false);
             state.vsync_timer = Some(timer);
         }
-        let object = event.copy_object_id(ctx).expect("VI event requires owner");
-        let mut rb = ResponseBuilder::new(ctx, 2, 1, 0);
-        rb.push_result(RESULT_SUCCESS);
-        rb.push_copy_object_id(object);
     }
+
 }
 impl Drop for INx2Vi2Session {
     fn drop(&mut self) {
@@ -1610,11 +1718,15 @@ impl INx2VideoSession {
                 (109, Some(Self::submit_input), "SubmitInputBuffer"),
                 (115, Some(Self::succeed), "Finalize"),
                 (200, Some(Self::succeed), "Initialize"),
+                (201, Some(Self::succeed), "InitializeWithFlag"),
+                (202, Some(Self::succeed), "InitializeWithFlagAndValue"),
                 (207, Some(Self::flush), "Stop"),
+                (210, Some(Self::succeed), "Unknown210"),
                 (212, Some(Self::unregister_buffer), "UnregisterBuffer"),
                 (213, Some(Self::get_output_info), "GetOutputInfo"),
                 (311, Some(Self::register_buffer), "RegisterBuffer"),
                 (314, Some(Self::release_buffer), "ReleaseBuffer"),
+                (400, Some(Self::submit_input), "SubmitInputBufferWithInfo"),
             ]),
             control: Mutex::new(VideoControl {
                 context: ServiceContext::new(name.into()),
@@ -2117,6 +2229,13 @@ impl INx2VideoSession {
                 &bytes[offset..offset + (layout.pitch * ((height as u64 + 1) / 2)) as usize],
             );
         }
+        drop(memory);
+        // Fritchii WriteImage: discard the GPU's cached copy after both planes
+        // have been published, using the device address rather than the CPU VA.
+        if let Some(device) = Nx2GpuMemoryRegistry::get().device_address_of(address) {
+            system.get().gpu_core().expect("video requires GPU")
+                .invalidate_region(device, layout.size);
+        }
         (width, height)
     }
     fn dump_frame(
@@ -2331,6 +2450,7 @@ impl INx2GraphicsSystemSession {
                     "OpenVideoDecoderSession2 (guessed)",
                 ),
                 (911, Some(Self::create_decoder_image), "CreateDecoderImage"),
+                (912, Some(Self::destroy_native_image), "DestroyDecoderImage"),
                 (
                     961,
                     Some(Self::get_cpu_image_descriptor),
@@ -3732,6 +3852,31 @@ mod tests {
         assert_eq!(zero_count.command_buffer()[3], layout.size as u32);
     }
     #[test]
+    fn gsv_destroy_decoder_image_retires_only_the_requested_pool_member() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let service = INx2GraphicsSystemSession::new(SystemRef::null());
+        let memory = gsv_request(&service, 111, &[3, 0x80000, 0]).command_buffer()[3];
+        let mut words = [0; 18];
+        words[1] = 1;
+        words[2] = (128 << 16) | 16;
+        words[16] = 3;
+        words[17] = memory;
+        let first = gsv_request(&service, 911, &words).command_buffer()[3];
+        for id in [first + 1, first + 1, u32::MAX] {
+            let reply = gsv_request(&service, 912, &[id]);
+            assert_eq!(reply.command_buffer()[2], RESULT_SUCCESS.get_inner_value());
+        }
+        let objects = service.objects.lock().unwrap();
+        assert!(!objects.images.contains_key(&(first + 1)));
+        assert!(objects.images.contains_key(&first));
+        assert!(objects.images.contains_key(&(first + 2)));
+        assert!(objects.memories.contains_key(&memory));
+        drop(objects);
+        assert!(gsv_request(&service, 961, &[first + 1]).command_buffer()[3..35]
+            .iter()
+            .all(|&word| word == 0));
+    }
+    #[test]
     fn gsv_missing_transfer_memory_still_returns_writable_then_readable_events() {
         let _without = ScopedKernelForTest::without_kernel();
         let service = INx2GraphicsSystemSession::new(SystemRef::null());
@@ -3766,6 +3911,62 @@ mod tests {
         ctx.populate_from_incoming_command_buffer(&request);
         assert_eq!(service.handle_sync_request(&mut ctx), RESULT_SUCCESS);
         ctx
+    }
+
+    #[test]
+    fn vi2_placeholder_replies_advertise_and_clear_all_data_words() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let service = INx2Vi2Session::new(SystemRef::null(), Arc::new(Mutex::new(Nx2NativeObjects::default())));
+        for command in [107, 301, 351, 354] {
+            let mut ctx = HLERequestContext::new();
+            ctx.populate_from_incoming_command_buffer(&[16 + command, 2, u32::MAX, u32::MAX]);
+            assert_eq!(service.handle_sync_request(&mut ctx), RESULT_SUCCESS);
+            assert_eq!(ctx.command_buffer()[1] & 0x3ff, 33);
+            assert!(ctx.command_buffer()[2..35].iter().all(|word| *word == 0));
+        }
+    }
+
+    #[test]
+    fn vi2_display_queries_return_complete_upstream_payloads() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let service = INx2Vi2Session::new(SystemRef::null(), Arc::new(Mutex::new(Nx2NativeObjects::default())));
+        for (command, expected) in [(103, vec![60, 0]), (104, vec![1, 0, 400]),
+            (105, vec![203]), (212, vec![0x7fff, 0])] {
+            let mut ctx = HLERequestContext::new();
+            ctx.populate_from_incoming_command_buffer(&[16 + command, 2, u32::MAX, u32::MAX]);
+            service.handle_sync_request(&mut ctx);
+            assert_eq!(ctx.command_buffer()[1] & 0x3ff, 1 + expected.len() as u32);
+            assert_eq!(&ctx.command_buffer()[3..3 + expected.len()], expected.as_slice());
+        }
+        for (size, name, result) in [
+            (1, [0, 0], crate::hle::kernel::svc::svc_results::RESULT_INVALID_COMBINATION),
+            (2, [0, 0], ResultCode::from_module_description(crate::hle::result::ErrorModule::VI, 7)),
+            (2, [0x61666564, 0x00746c75], RESULT_SUCCESS),
+        ] {
+            let mut ctx = HLERequestContext::new();
+            ctx.populate_from_incoming_command_buffer(&[0x7a, size, name[0], name[1]]);
+            service.handle_sync_request(&mut ctx);
+            assert_eq!(ctx.command_buffer()[2], result.get_inner_value());
+            if result != RESULT_SUCCESS {
+                assert_eq!(&ctx.command_buffer()[3..5], &[0, 0]);
+            } else if std::env::var_os("EDEN_VI2_MAX_RESOLUTION_MODE").is_none() {
+                let mode = if common::settings::is_docked_mode(&common::settings::values()) { 4 } else { 2 };
+                assert_eq!(&ctx.command_buffer()[3..5], &[mode, 0]);
+            }
+        }
+    }
+
+    #[test]
+    fn video_initialization_aliases_keep_upstream_placeholder_response() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let service = INx2VideoSession::new(SystemRef::null(), Arc::new(Mutex::new(Nx2NativeObjects::default())), "nx2:vdec-test");
+        for command in [200, 201, 202, 210] {
+            let ctx = video_request(&service, command, &[u32::MAX]);
+            assert_eq!(ctx.command_buffer()[1] & 0x3ff, 1);
+            assert_eq!(ctx.command_buffer()[2], 0);
+        }
+        let aliases = service.handlers_tipc();
+        assert_eq!(aliases[&109].handler_callback.unwrap() as usize, aliases[&400].handler_callback.unwrap() as usize);
     }
     #[test]
     fn video_empty_frame_reports_configured_size_clamped_to_image() {
@@ -4189,10 +4390,58 @@ mod tests {
             )
         };
         assert!(events.iter().all(|event| !event.is_signaled()));
+        // Acquire and duplicate slot zero must share one event and one timer.
+        assert_eq!(events.len(), 2);
+        assert_eq!(service.vsync.lock().unwrap().len(), 1);
         let callback = timer.lock().callback.clone();
         assert_eq!(callback(0, std::time::Duration::ZERO), None);
         assert!(!events[0].is_signaled());
-        assert!(events[1].is_signaled() && events[2].is_signaled());
+        assert!(events[1].is_signaled());
+        for command in [263, 265, 267, 269, 271] {
+            events[1].clear();
+            let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
+            ctx.populate_from_incoming_command_buffer(&[16 + command, 3, 0, 0, 0]);
+            assert_eq!(service.handle_sync_request(&mut ctx), RESULT_SUCCESS);
+            assert!(events[1].is_signaled());
+            events[1].clear();
+            callback(0, std::time::Duration::ZERO);
+            assert!(!events[1].is_signaled(), "change event must not fire at each vblank");
+        }
+        for command in [262, 264, 266, 268, 270, 272] {
+            let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
+            for _ in 0..2 {
+                ctx.populate_from_incoming_command_buffer(&[16 + 261, 3, 0, 0, 0]);
+                service.handle_sync_request(&mut ctx);
+            }
+            assert_eq!(service.vsync.lock().unwrap().len(), 1);
+            callback(0, std::time::Duration::ZERO);
+            assert!(events[1].is_signaled());
+            events[1].clear();
+            ctx.populate_from_incoming_command_buffer(&[16 + command, 3, 0, 0, 0]);
+            service.handle_sync_request(&mut ctx);
+            callback(0, std::time::Duration::ZERO);
+            assert!(!events[1].is_signaled());
+        }
+        for command in [31, 32] {
+            let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
+            ctx.populate_from_incoming_command_buffer(&[16 + command, 1, 8]);
+            service.handle_sync_request(&mut ctx);
+            assert!(ctx.outgoing_copy_objects.is_empty());
+            assert_eq!(ctx.command_buffer()[2], crate::hle::result::RESULT_UNKNOWN.get_inner_value());
+        }
+        for descriptor in [2u32, 2 | 1, 2 | (1 << 5) | 1] {
+            let mut ctx = HLERequestContext::new_with_thread(thread.clone(), 0);
+            ctx.populate_from_incoming_command_buffer(&[16 + 32, 1, 0]);
+            let data = 3 + ((descriptor >> 1) & 0xf) as usize
+                + ((descriptor >> 5) & 0xf) as usize + if descriptor & 1 != 0 { 2 } else { 0 };
+            ctx.command_buffer_mut()[1] |= 1 << 31;
+            ctx.command_buffer_mut()[2] = descriptor;
+            ctx.command_buffer_mut()[3..data].fill(u32::MAX);
+            ctx.command_buffer_mut()[data] = 0;
+            INx2Vi2Session::duplicate_native_event(&service, &mut ctx);
+            assert_eq!(ctx.outgoing_copy_objects.len(), 1);
+            assert_eq!(service.state.lock().unwrap().events.len(), 2);
+        }
         for event in &events {
             event.clear();
         }

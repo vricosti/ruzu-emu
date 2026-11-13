@@ -103,6 +103,7 @@ pub enum FileType {
     XCI,
     NAX,
     KIP,
+    NUP,
     DeconstructedRomDirectory,
 }
 
@@ -117,12 +118,16 @@ pub fn identify_file(file: &VirtualFile) -> FileType {
     use super::nro::AppLoaderNro;
     use super::nso::AppLoaderNso;
     use super::nsp::AppLoaderNsp;
+    use super::nup::AppLoaderNup;
     use super::xci::AppLoaderXci;
 
     if let Some(ft) = identify_file_loader::<AppLoaderNsp>(file) {
         return ft;
     }
     if let Some(ft) = identify_file_loader::<AppLoaderXci>(file) {
+        return ft;
+    }
+    if let Some(ft) = identify_file_loader::<AppLoaderNup>(file) {
         return ft;
     }
     if let Some(ft) = identify_file_loader::<AppLoaderNro>(file) {
@@ -151,7 +156,7 @@ pub fn identify_file(file: &VirtualFile) -> FileType {
 ///
 /// Maps to upstream `Loader::IsContainerType`.
 pub fn is_container_type(file_type: FileType) -> bool {
-    matches!(file_type, FileType::NSP | FileType::XCI)
+    matches!(file_type, FileType::NSP | FileType::XCI | FileType::NUP)
 }
 
 /// Open an NSP directly, or the secure-partition NSP carried by an XCI.
@@ -216,6 +221,29 @@ pub fn is_bootable_game_container(
     if file_type == FileType::Unknown {
         file_type = identify_file(&file);
     }
+    if file_type == FileType::NUP {
+        use crate::file_sys::nup_container::NupContainer;
+
+        let nup = NupContainer::new(Some(file));
+        if nup.get_status() != ResultStatus::Success {
+            return false;
+        }
+        // A base package boots normally; a standalone update (no base) carries
+        // a complete patched tree and boots on its own (SPEC section 4.1.2).
+        let base = nup.find_base_package();
+        if let Some(base) = base {
+            if nup.get_exefs_dir(base).is_some() {
+                return true;
+            }
+        }
+        let update = nup.find_best_update_package();
+        if let Some(update) = update {
+            if nup.get_exefs_dir(update).is_some() {
+                return true;
+            }
+        }
+        return false;
+    }
     if !is_container_type(file_type) {
         return false;
     }
@@ -261,6 +289,7 @@ pub fn guess_from_filename(name: &str) -> FileType {
         "nca" => FileType::NCA,
         "xci" => FileType::XCI,
         "nsp" => FileType::NSP,
+        "nup" => FileType::NUP,
         "kip" => FileType::KIP,
         _ => FileType::Unknown,
     }
@@ -277,6 +306,7 @@ pub fn get_file_type_string(file_type: FileType) -> &'static str {
         FileType::XCI => "XCI",
         FileType::NAX => "NAX",
         FileType::NSP => "NSP",
+        FileType::NUP => "NUP",
         FileType::KIP => "KIP",
         FileType::DeconstructedRomDirectory => "Directory",
         FileType::Error | FileType::Unknown => "unknown",
@@ -357,6 +387,8 @@ pub enum ResultStatus {
     ErrorINITooManyKIPs,
     ErrorIntegrityVerificationNotImplemented,
     ErrorIntegrityVerificationFailed,
+    ErrorNUPBadFormat,
+    ErrorNUPNoBasePackage,
 }
 
 /// Result status messages, indexed by discriminant value.
@@ -431,6 +463,8 @@ const RESULT_MESSAGES: &[&str] = &[
     "The INI file contains more than the maximum allowable number of KIP files.",
     "Integrity verification could not be performed for this file.",
     "Integrity verification failed.",
+    "The NUP container is malformed or its TOC hash does not match.",
+    "The NUP container does not contain a loadable base package.",
 ];
 
 /// Get a human-readable string for a ResultStatus.
@@ -623,6 +657,7 @@ fn get_file_loader(
             )))
         }
         FileType::KIP => Some(Box::new(super::kip::AppLoaderKip::new(file))),
+        FileType::NUP => Some(Box::new(super::nup::AppLoaderNup::new(file))),
         FileType::DeconstructedRomDirectory => Some(Box::new(
             super::deconstructed_rom_directory::AppLoaderDeconstructedRomDirectory::new_from_file(
                 file,
@@ -737,8 +772,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn container_types_are_limited_to_nsp_and_xci() {
-        for file_type in [FileType::NSP, FileType::XCI] {
+    fn container_types_include_nsp_xci_and_nup() {
+        for file_type in [FileType::NSP, FileType::XCI, FileType::NUP] {
             assert!(is_container_type(file_type));
         }
         for file_type in [
@@ -759,7 +794,7 @@ mod tests {
     fn result_messages_stay_aligned_with_result_status() {
         assert_eq!(
             RESULT_MESSAGES.len(),
-            ResultStatus::ErrorIntegrityVerificationFailed as usize + 1
+            ResultStatus::ErrorNUPNoBasePackage as usize + 1
         );
         assert_eq!(
             get_result_status_string(ResultStatus::ErrorIntegrityVerificationFailed),
@@ -768,6 +803,14 @@ mod tests {
         assert_eq!(
             get_result_status_string(ResultStatus::ErrorIntegrityVerificationNotImplemented),
             "Integrity verification could not be performed for this file."
+        );
+        assert_eq!(
+            get_result_status_string(ResultStatus::ErrorNUPBadFormat),
+            "The NUP container is malformed or its TOC hash does not match."
+        );
+        assert_eq!(
+            get_result_status_string(ResultStatus::ErrorNUPNoBasePackage),
+            "The NUP container does not contain a loadable base package."
         );
     }
 

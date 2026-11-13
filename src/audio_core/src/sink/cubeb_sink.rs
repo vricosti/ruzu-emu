@@ -68,6 +68,10 @@ impl SinkStream for CubebSinkStream {
         &self.base
     }
 
+    fn is_ready(&self) -> bool {
+        self.lifecycle.lock().stream.is_some() && !self.base.lock().failed
+    }
+
     fn finalize(&self) {
         let mut lifecycle = self.lifecycle.lock();
         if lifecycle.state == SinkStreamLifecycleState::Finalized {
@@ -79,6 +83,7 @@ impl SinkStream for CubebSinkStream {
             if self.base.lock().signal_stop() {
                 if let Some(stream) = lifecycle.stream.as_ref() {
                     if let Err(error) = stream.stop() {
+                        self.base.lock().failed = true;
                         log::error!("Error stopping cubeb stream: {:?}", error);
                     }
                 }
@@ -97,17 +102,20 @@ impl SinkStream for CubebSinkStream {
         if lifecycle.state != SinkStreamLifecycleState::Stopped || lifecycle.stream.is_none() {
             return;
         }
-        if !self.base.lock().signal_start() {
+        if { let base = self.base.lock(); base.failed || !base.is_paused() } {
             return;
         }
 
         lifecycle.state = SinkStreamLifecycleState::Starting;
         if let Some(stream) = lifecycle.stream.as_ref() {
             if let Err(error) = stream.start() {
-                // Eden also leaves `paused` false when cubeb_stream_start fails.
+                self.base.lock().failed = true;
+                lifecycle.state = SinkStreamLifecycleState::Stopped;
                 log::error!("Error starting cubeb stream: {:?}", error);
+                return;
             }
         }
+        self.base.lock().signal_start();
         lifecycle.state = SinkStreamLifecycleState::Running;
     }
 
@@ -121,7 +129,8 @@ impl SinkStream for CubebSinkStream {
         if self.base.lock().signal_stop() {
             if let Some(stream) = lifecycle.stream.as_ref() {
                 if let Err(error) = stream.stop() {
-                    log::error!("Error stopping cubeb stream: {:?}", error);
+                    self.base.lock().failed = true;
+                        log::error!("Error stopping cubeb stream: {:?}", error);
                 }
             }
         }

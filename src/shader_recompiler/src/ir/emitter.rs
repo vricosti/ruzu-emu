@@ -1691,6 +1691,36 @@ impl<'a> Emitter<'a> {
 
     // ── Composite (vector) ────────────────────────────────────────────
 
+    /// Fritchii IREmitter::TensorMulAdd: validate before publishing the instruction.
+    pub fn tensor_mul_add(
+        &mut self,
+        a: Value,
+        b: Value,
+        c: Value,
+        depth: u32,
+    ) -> Result<Value, crate::exception::InvalidArgument> {
+        use super::types::Type;
+        let value_type = |mut value: Value| loop {
+            match value {
+                Value::Inst(reference) => {
+                    let inst = self.program.block(reference.block).inst(reference.inst);
+                    if inst.opcode == Opcode::Identity {
+                        value = inst.args[0];
+                    } else {
+                        break inst.return_type();
+                    }
+                }
+                immediate => break immediate.ir_type(),
+            }
+        };
+        if value_type(a) != Type::U32x4 || value_type(b) != Type::U32x2
+            || value_type(c) != Type::U32x2 || !matches!(depth, 8 | 16)
+        {
+            return Err(crate::exception::InvalidArgument::new("Invalid software matrix operands"));
+        }
+        Ok(self.emit(Inst::with_flags(Opcode::TensorMulAdd, vec![a, b, c], depth)))
+    }
+
     pub fn composite_construct_u32x2(&mut self, a: Value, b: Value) -> Value {
         self.emit(Inst::new(Opcode::CompositeConstructU32x2, vec![a, b]))
     }
@@ -3069,6 +3099,30 @@ impl<'a> Emitter<'a> {
 mod tests {
     use super::*;
     use crate::ir::types::ShaderStage;
+
+    #[test]
+    fn tensor_mul_add_validates_shapes_and_depth_before_emission() {
+        let mut program = Program::new(ShaderStage::Compute);
+        let block = program.add_block();
+        let mut emitter = Emitter::new(&mut program, block);
+        let zero = Value::ImmU32(0);
+        let a = emitter.composite_construct_u32x4(zero, zero, zero, zero);
+        let a = emitter.identity(a);
+        let b = emitter.composite_construct_u32x2(zero, zero);
+        for depth in [8, 16] {
+            let Value::Inst(result) = emitter.tensor_mul_add(a, b, b, depth).unwrap() else { panic!() };
+            let inst = emitter.program.block(block).inst(result.inst);
+            assert_eq!(inst.opcode, Opcode::TensorMulAdd);
+            assert_eq!(inst.args, vec![a, b, b]);
+            assert_eq!(inst.flags, depth);
+            assert_eq!(inst.return_type(), super::super::types::Type::U32x2);
+        }
+        let count = emitter.program.block(block).iter().count();
+        for (a, b, c, depth) in [(b,b,b,8), (a,a,b,8), (a,b,a,8), (a,b,b,0), (a,b,b,32)] {
+            assert!(emitter.tensor_mul_add(a,b,c,depth).is_err());
+        }
+        assert_eq!(emitter.program.block(block).iter().count(), count);
+    }
 
     #[test]
     fn get_sparse_from_op_associates_pseudo_with_parent() {

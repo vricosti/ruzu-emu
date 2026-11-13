@@ -16,6 +16,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum MaxwellOpcode {
+    TENSOR_MUL_ADD,
     CCTLT,
     // ── Attribute / Output ────────────────────────────────────────────
     AL2P,
@@ -363,6 +364,7 @@ pub enum MaxwellOpcode {
 pub fn name_of(opcode: MaxwellOpcode) -> &'static str {
     match opcode {
         MaxwellOpcode::CCTLT => "CCTLT",
+        MaxwellOpcode::TENSOR_MUL_ADD => "TENSOR_MUL_ADD",
         MaxwellOpcode::AL2P => "AL2P",
         MaxwellOpcode::ALD => "ALD",
         MaxwellOpcode::AST => "AST",
@@ -720,6 +722,7 @@ struct InstEncoding {
 /// audits can diff this table against the source of truth.
 const ENCODINGS_TEXT: &[(MaxwellOpcode, &str)] = &[
     (MaxwellOpcode::CCTLT, "1110 1011 1111 0--0"),
+    (MaxwellOpcode::TENSOR_MUL_ADD, "0101 1101 0011 0---"),
     (MaxwellOpcode::AL2P, "1110 1111 1010 0---"),
     (MaxwellOpcode::ALD, "1110 1111 1101 1---"),
     (MaxwellOpcode::AST, "1110 1111 1111 0---"),
@@ -1184,6 +1187,7 @@ impl MaxwellOpcode {
                     DEPBAR => "DEPBAR",
                     MEMBAR => "MEMBAR",
                     SHFL => "SHFL",
+                    TENSOR_MUL_ADD => "TENSOR_MUL_ADD",
                     VOTE => "VOTE",
                     PSET => "PSET",
                     PSETP => "PSETP",

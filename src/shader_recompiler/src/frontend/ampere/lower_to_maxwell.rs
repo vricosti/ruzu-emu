@@ -3,22 +3,9 @@
 // Encoding reference: Mesa NAK sm70_encode.rs (MIT), Copyright 2022 Collabora, Ltd.
 //! Native instruction lowering from `frontend/ampere/lower_to_maxwell.h`.
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Instruction {
-    pub words: [u32; 4],
-}
-
-impl Instruction {
-    pub fn bits(&self, offset: u32, count: u32) -> u32 {
-        let index = (offset / 32) as usize;
-        let mut bits = u64::from(self.words[index]);
-        if index + 1 < self.words.len() {
-            bits |= u64::from(self.words[index + 1]) << 32;
-        }
-        ((bits >> (offset % 32)) & ((1u64 << count) - 1)) as u32
-    }
-}
+pub use super::instruction::Instruction;
+use super::register_pressure::prepare_register_pressure;
+use std::cell::Cell;
 
 #[derive(Debug, Clone)]
 pub struct LoweredProgram {
@@ -26,6 +13,7 @@ pub struct LoweredProgram {
     pub source_instruction_offsets: Vec<u32>,
     pub source_size: u32,
     pub required_texture_buffer: u32,
+    pub high_uniform_registers: u32,
     pub error_offset: u32,
     pub error: &'static str,
 }
@@ -37,6 +25,7 @@ impl Default for LoweredProgram {
             source_instruction_offsets: Vec::new(),
             source_size: 0,
             required_texture_buffer: u32::MAX,
+            high_uniform_registers: 0,
             error_offset: 0,
             error: "",
         }
@@ -50,31 +39,67 @@ impl LoweredProgram {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<Instruction>() == 16);
-
 /// Scheduling/control words are added by the environment adapter, as upstream.
 pub fn lower_to_maxwell(code: &[Instruction]) -> LoweredProgram {
-    lower_with_stage_buffer(code, false)
+    lower_to_maxwell_with_options(code, LoweringOptions::default())
+}
+
+/// Ported subset of upstream LoweringOptions. Stage-buffer selection remains
+/// on the existing task/mesh entrypoint; unsupported stages are not enabled.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoweringOptions {
+    pub tensor: bool,
+}
+
+pub fn lower_to_maxwell_with_options(code: &[Instruction], options: LoweringOptions) -> LoweredProgram {
+    lower_to_maxwell_with_cbuf(code, options, &mut |_, _| None)
+}
+
+/// NX2 extension: resolve native branch tables using the environment owner's
+/// cached constant-buffer reads before proving non-adjacent CALL linkage.
+pub fn lower_to_maxwell_with_cbuf(code: &[Instruction], options: LoweringOptions,
+    read_cbuf: &mut dyn FnMut(u32, u32) -> Option<u32>) -> LoweredProgram {
+    lower_with_stage_buffer(code, false, options, read_cbuf)
 }
 
 /// Explicit task/mesh path. Callers must supply mesh environment metadata and
 /// use collective compute emission; ordinary graphics/compute remains gated.
 pub fn lower_task_mesh_to_maxwell(code: &[Instruction]) -> LoweredProgram {
-    lower_with_stage_buffer(code, true)
+    lower_task_mesh_to_maxwell_with_cbuf(code, &mut |_, _| None)
 }
 
-fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredProgram {
+pub fn lower_task_mesh_to_maxwell_with_cbuf(code: &[Instruction],
+    read_cbuf: &mut dyn FnMut(u32, u32) -> Option<u32>) -> LoweredProgram {
+    lower_with_stage_buffer(code, true, LoweringOptions::default(), read_cbuf)
+}
+
+fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool, options: LoweringOptions,
+    read_cbuf: &mut dyn FnMut(u32, u32) -> Option<u32>) -> LoweredProgram {
+    let mut high_uniforms = 0;
+    loop {
+        let uniforms = UniformRegisters { high_uniforms, ..Default::default() };
+        let mut result = lower_to_maxwell_with(code, stage_buffer, options, &uniforms, read_cbuf);
+        result.high_uniform_registers = uniforms.requested.get();
+        if result.is_valid() || result.high_uniform_registers <= high_uniforms { return result; }
+        high_uniforms = result.high_uniform_registers;
+    }
+}
+
+fn lower_to_maxwell_with(code: &[Instruction], stage_buffer: bool, options: LoweringOptions,
+    uniforms: &UniformRegisters, read_cbuf: &mut dyn FnMut(u32, u32) -> Option<u32>) -> LoweredProgram {
     let mut program = ProgramLowering::default();
     let uses_uniform_bank = ProgramLowering::uses_uniform_bank(code);
     if code.is_empty() || code.len() > 65536 {
         return program.fail(0, "invalid native program size");
     }
+    let control = BoundedControl::analyze_with_cbuf(code, false, uses_uniform_bank, uniforms.base(), read_cbuf);
     for index in 0..code.len() as u32 {
         let mut insn = code[index as usize];
         program
             .result
             .source_instruction_offsets
             .push(program.result.instructions.len() as u32);
+        if control.dead_instructions[index as usize] { continue; }
         let mut opcode = insn.bits(0, 12);
         if insn.bits(12, 4) == 15 {
             continue;
@@ -88,8 +113,13 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
                     active_link = Some(link);
                 }
             }
-            if active_link == Some(insn.bits(16, 8)) {
-                return program.fail(index, "native callee overwrites link register");
+            let no_destination = matches!(opcode, 0x950 | 0x947 | 0x918)
+                || matches!(opcode & 0x1ff, 0x00c | 0x00b);
+            let written = BoundedControl::write_count(&insn).unwrap_or(1);
+            if let Some(link) = active_link {
+                if !no_destination && insn.bits(16, 8) <= link && link < insn.bits(16, 8) + written {
+                    return program.fail(index, "native callee overwrites link register");
+                }
             }
         }
         // Pinned operand scanner: ISBERD has Rd/Ra; ISBEWR has Ra/data.
@@ -99,25 +129,38 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
             (true, 0x927) => &[24, 32],
             _ => &[16, 24, 32, 64],
         };
+        let mut requires_shadow = false;
         for &bit in register_offsets {
+            if opcode == 0x81c { break; }
             if bit == 32
                 && insn.bits(9, 3) != 1
-                && !matches!(opcode, 0xb60 | 0xb66 | 0x593 | 0x59f)
+                && !matches!(opcode, 0xb60 | 0xb66 | 0x986 | 0x987 | 0xf66 | 0x988 | 0x593 | 0x59f)
                 && !(stage_buffer && opcode == 0x927)
-            {
-                continue;
-            }
+            { continue; }
             let reg = insn.bits(bit, 8);
-            if reg >= if uses_uniform_bank { 216 } else { 246 } && reg < 255 {
-                return program.fail(index, "native program uses lowering scratch registers");
+            if reg >= if uses_uniform_bank { uniforms.base() } else { 246 } && reg < 255 {
+                requires_shadow = true;
             }
         }
-        let rewrite = match UniformRewrite::new(&mut insn, &mut opcode) {
+        let pressure = if requires_shadow {
+            if !uses_uniform_bank || uniforms.base() & 3 != 0 {
+                return program.fail(index, "native program uses lowering scratch registers");
+            }
+            let pressure = prepare_register_pressure(&insn, uniforms.base());
+            if !pressure.valid { return program.fail(index, "native register shadowing mode"); }
+            insn = pressure.instruction;
+            program.result.instructions.extend_from_slice(&pressure.prefix);
+            Some(pressure)
+        } else { None };
+        let instruction_start = program.result.instructions.len() as u32;
+        let relocation_start = program.relocations.len();
+        let rewrite = match UniformRewrite::new(&mut insn, &mut opcode, uniforms) {
             Ok(rewrite) => rewrite,
             Err(error) => return program.fail(index, error),
         };
         let native_predicate = rewrite.native_predicate;
         let mut lowering = InstructionLowering {
+            uniforms,
             insn,
             predicate: rewrite.predicate,
             dest: u64::from(insn.bits(16, 8)),
@@ -133,8 +176,8 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
                 native_predicate,
                 &mut program.relocations,
             ),
-            0xc24 | 0xe24 | 0x224 | 0x2a5 | 0x827 | 0xa24 | 0x424 | 0x624 | 0x824 => {
-                lowering.lower_integer_multiply(opcode, native_predicate)
+            0xc24 | 0xe24 | 0x224 | 0x2a5 | 0x225 | 0x227 | 0x625 | 0x825 | 0xa27 | 0x827 | 0xa24 | 0x424 | 0x624 | 0x824 => {
+                lowering.lower_integer_multiply(opcode, native_predicate, rewrite.rewritten_uniform)
             }
             0x806 | 0x886 | 0x3c2 | 0x81c | 0x89c | 0x883 | 0x882 | 0xc82 | 0xab9 | 0xabb
             | 0x899 | 0xb82 | 0xf89 | 0x822 => {
@@ -147,36 +190,36 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
                     native_predicate,
                     &mut program.result.required_texture_buffer,
                 ),
-            0x301 | 0x219 | 0xc19 | 0x300 | 0xd00 | 0x309 | 0xd09 | 0x918 | 0x992 | 0x9ab
+            0x301 | 0x219 | 0xa19 | 0xc19 | 0x300 | 0xd00 | 0x309 | 0xd09 | 0x918 | 0x992 | 0x9ab
             | 0xb1d | 0x388 | 0x984 | 0x23a => {
                 lowering.lower_bits_and_shared(opcode, native_predicate)
             }
-            0x23c => lowering.lower_matrix_multiply(),
+            0x23c => lowering.lower_matrix_multiply(uses_uniform_bank, options.tensor),
             0x83b => lowering.lower_matrix_load(),
             0x919 | 0x9c3 | 0x28c | 0x88c | 0x287 | 0x887 | 0x381 | 0x981 | 0x386 | 0x986
-            | 0x95b => lowering.lower_special_and_global(opcode, code, index),
-            0x305 | 0xb05 | 0xd05 | 0xb6f | 0xb66 | 0x91a => lowering
+            | 0x95b => lowering.lower_special_and_global(opcode, code, index, &program.relocations),
+            0x305 | 0xb05 | 0xd05 | 0xb6f | 0x370 | 0xb66 | 0x91a => lowering
                 .lower_conversion_and_fetch(opcode, &mut program.result.required_texture_buffer),
-            0xb69 | 0xb63 | 0xb60 => {
-                lowering.lower_texture_sample(opcode, &mut program.result.required_texture_buffer)
+            0xb69 | 0xb63 | 0xf63 | 0xb60 | 0xf60 | 0x361 => {
+                lowering.lower_texture_sample(opcode, &mut program.result.required_texture_buffer, code, index, uses_uniform_bank)
             }
-            0x816 | 0x307 | 0x321 | 0x322 | 0x387 | 0x983 | 0x803 | 0x804 | 0xc02 | 0x202
+            0x816 | 0x307 | 0xb07 | 0x321 | 0x322 | 0x387 | 0x983 | 0x803 | 0x804 | 0xc02 | 0x202
             | 0x802 | 0xa02 => lowering.lower_permutation_and_moves(opcode),
             0x223 | 0x423 | 0x623 | 0x823 | 0xa23 | 0xc23 | 0xe23 | 0x220 | 0x820 | 0xa20
             | 0xc20 | 0x221 | 0x421 | 0x621 | 0x821 | 0xa21 | 0xe21 | 0x209 | 0x809 | 0xa09
             | 0xc09 => lowering.lower_float_arithmetic(opcode),
-            0x308 | 0xb08 | 0x526 | 0x326 | 0x81a | 0x299 | 0x419 | 0x805 | 0x306 | 0xd06
+            0x308 | 0x908 | 0xb08 | 0xd08 | 0x526 | 0x326 | 0x81a | 0x299 | 0x499 | 0x419 | 0x805 | 0x306 | 0xd06
             | 0x245 | 0xa45 | 0xc45 => {
                 lowering.lower_special_functions_and_conversion(opcode, native_predicate)
             }
-            0x207 | 0x807 | 0xa07 | 0x208 | 0x808 | 0xa08 | 0x20a | 0x80a | 0xa0a | 0x434
-            | 0x20b | 0x80b | 0xa0b | 0x20c | 0x80c | 0xa0c | 0xc0c | 0x212 | 0x812 | 0xa12
+            0x207 | 0x807 | 0xa07 | 0xc07 | 0x208 | 0x808 | 0xa08 | 0x20a | 0x80a | 0xa0a | 0xc0a | 0x234 | 0x434
+            | 0x20b | 0x80b | 0xa0b | 0xc0b | 0x20c | 0x80c | 0xa0c | 0xc0c | 0x212 | 0x812 | 0xa12
             | 0xc12 | 0x213 | 0xa13 | 0xc13 | 0x217 | 0x817 | 0xa17 | 0xc17 | 0x819 => {
                 lowering.lower_selection_and_logic(opcode)
             }
-            0xa11 | 0x211 | 0x811 => lowering.lower_effective_address(opcode),
+            0xa11 | 0x211 | 0x811 | 0xc11 => lowering.lower_effective_address(opcode, rewrite.rewritten_uniform),
             0x210 | 0x810 | 0xa10 | 0xc10 => {
-                lowering.lower_integer_add(opcode, rewrite.rewritten_uniform)
+                lowering.lower_integer_add(opcode, rewrite.rewritten_uniform, rewrite.guarded_uniform)
             }
             0x949 | 0x958 => {
                 if insn.bits(12, 4) != 7
@@ -191,17 +234,20 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
                 }
                 let raw = u64::from(insn.words[1]) | (u64::from(insn.words[2] & 0x3ffff) << 32);
                 let relative = ((raw << 14) as i64) >> 14;
-                if i64::from(index) * 16 + 16 + relative != 0 {
+                // NX2 extension to Fritchii's zero-base subset: preserve the native
+                // table base. FlowCfg adds it before translating native labels.
+                let native_base = i64::from(index) * 16 + 16 + relative;
+                if native_base < 0 || native_base > i64::from(u32::MAX) || native_base % 16 != 0 {
                     return program.fail(index, "native computed branch relative base");
                 }
-                let offset = -i64::from(ProgramLowering::address_of(
+                let offset = native_base - i64::from(ProgramLowering::address_of(
                     lowering.instructions.len() as u32
                 )) - 8;
-                if offset < -0x800000 {
+                if !(-0x800000..=0x7fffff).contains(&offset) {
                     return program.fail(index, "native computed branch range");
                 }
                 let source = if opcode == 0x958 {
-                    InstructionLowering::uniform_register(insn.bits(24, 8))
+                    uniforms.register(insn.bits(24, 8))
                 } else {
                     insn.bits(24, 8)
                 };
@@ -218,35 +264,29 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
                 Ok(())
             }
             0x944 => {
-                if native_predicate != 7
-                    && insn.words[1] == 16
-                    && insn.words[2] == 0x03c00000
-                    && (index as usize + 2) < code.len()
-                    && code[index as usize + 1].bits(0, 12) == 0x947
-                {
+                if BoundedControl::is_loop_transfer(code, index as usize) {
                     program.relocations.push(Relocation {
+                        call: false,
+                        output_target: None,
                         output_index: lowering.instructions.len() as u32,
                         target: i64::from(index + 2),
                     });
                     lowering.emit(0xe24000000000000f | lowering.predicate);
                 } else {
-                    if program.main_exited
-                        || index == 0
-                        || insn.words[0] != 0x7944
-                        || insn.words[2] & !0x3ffff != 0x03c00000
-                        || code[index as usize - 1].words[0] & !0x00ff0000 != 0x00007802
-                        || code[index as usize - 1].bits(16, 8) >= 250
-                        || code[index as usize - 1].words[1] != (index + 1) * 16
-                        || code[index as usize - 1].words[2] != 0xf00
-                    {
-                        return program.fail(index, "native call linkage mode");
-                    }
+                    let adjacent = index != 0
+                        && code[index as usize - 1].words[0] & !0x00ff0000 == 0x00007802
+                        && code[index as usize - 1].bits(16, 8) < 250
+                        && code[index as usize - 1].words[1] == (index + 1) * 16
+                        && code[index as usize - 1].words[2] == 0xf00;
+                    if index == 0 || insn.words[0] != 0x7944
+                        || insn.words[2] & !0x3ffff != 0x03c00000 || (!adjacent && !control.bounded)
+                    { return program.fail(index, "native call linkage mode"); }
                     let raw = u64::from(insn.words[1]) | (u64::from(insn.words[2] & 0x3ffff) << 32);
                     let target = i64::from(index) * 16 + 16 + (((raw << 14) as i64) >> 14);
                     if target < 0 || target % 16 != 0 {
                         return program.fail(index, "native call destination alignment");
                     }
-                    let link = code[index as usize - 1].bits(16, 8);
+                    let link = if adjacent { code[index as usize - 1].bits(16, 8) } else { control.links[index as usize] };
                     for (&call_target, &call_link) in
                         program.call_targets.iter().zip(&program.call_links)
                     {
@@ -257,6 +297,8 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
                     program.call_targets.push((target / 16) as u32);
                     program.call_links.push(link);
                     program.relocations.push(Relocation {
+                        call: true,
+                        output_target: None,
                         output_index: lowering.instructions.len() as u32,
                         target: target / 16,
                     });
@@ -315,10 +357,18 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
             // Upstream reconvergence operations intentionally emit nothing.
             0x945 | 0x941 | 0x942 | 0x948 => Ok(()),
             0x947 => {
+                let mode = insn.bits(32, 2);
+                if (mode <= 1 && insn.bits(91, 1) != 0)
+                    || (mode == 1 && (insn.bits(82, 5) != 0 || insn.bits(92, 13) != 0)) {
+                    return program.fail(index, "native branch convergence mode");
+                }
+                if mode != 2 {
                 let mut branch_predicate = lowering.predicate;
                 if insn.bits(87, 4) != 7 {
                     if insn.bits(12, 4) != 7 {
                         program.relocations.push(Relocation {
+                            call: false,
+                            output_target: None,
                             output_index: lowering.instructions.len() as u32,
                             target: i64::from(index + 1),
                         });
@@ -326,12 +376,14 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
                     }
                     branch_predicate = u64::from(insn.bits(87, 4)) << 16;
                 }
-                let raw = u64::from(insn.words[1]) | (u64::from(insn.words[2] & 0x3ffff) << 32);
+                let raw = u64::from(insn.words[1] & !3) | (u64::from(insn.words[2] & 0x3ffff) << 32);
                 let target = i64::from(index) * 16 + 16 + (((raw << 14) as i64) >> 14);
                 if target < 0 || target % 16 != 0 {
                     return program.fail(index, "native branch destination alignment");
                 }
                 program.relocations.push(Relocation {
+                    call: false,
+                    output_target: None,
                     output_index: lowering.instructions.len() as u32,
                     target: target / 16,
                 });
@@ -341,6 +393,7 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
                     && branch_predicate == 7u64 << 16
                 {
                     return program.finish(index);
+                }
                 }
                 Ok(())
             }
@@ -384,6 +437,8 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
                 if insn.bits(87, 4) != 7 {
                     if native_predicate != 7 {
                         program.relocations.push(Relocation {
+                            call: false,
+                            output_target: None,
                             output_index: lowering.instructions.len() as u32,
                             target: i64::from(index + 1),
                         });
@@ -404,6 +459,9 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
                             if !pending_branch && !program.computed_branch {
                                 return program.finish(index);
                             }
+                        } else if !program.main_exited && program.relocations.iter()
+                            .any(|r| !r.call && r.target > i64::from(index)) {
+                            // This EXIT terminates only one path of the main program.
                         } else if program.main_exited {
                             let complete = program
                                 .relocations
@@ -418,7 +476,10 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
                                 return program
                                     .fail(index, "native call target overlaps main program");
                             }
-                            program.main_exited = true;
+                            let pending_branch = program.relocations.iter().any(|r|
+                                r.target > i64::from(index)
+                                    && !program.call_targets.contains(&(r.target as u32)));
+                            if !pending_branch { program.main_exited = true; }
                         }
                     }
                 }
@@ -432,6 +493,16 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
         if let Err(error) = rewrite.end(&mut lowering) {
             return program.fail(index, error);
         }
+        if let Some(pressure) = pressure {
+            if !pressure.suffix.is_empty() {
+                for pending in &mut program.relocations[relocation_start..] {
+                    if !pending.call && pending.output_index >= instruction_start
+                        && pending.target == i64::from(index + 1)
+                    { pending.output_target = Some(program.result.instructions.len() as u32); }
+                }
+                program.result.instructions.extend_from_slice(&pressure.suffix);
+            }
+        }
     }
     let reason = if program.main_exited {
         "native program lacks captured library return"
@@ -443,8 +514,346 @@ fn lower_with_stage_buffer(code: &[Instruction], stage_buffer: bool) -> LoweredP
 
 #[allow(dead_code)]
 struct Relocation {
+    call: bool,
+    output_target: Option<u32>,
     output_index: u32,
     target: i64,
+}
+
+// State and lambdas from Fritchii's bounded-control preflight. Kept in the
+// lowering owner; integrating the result must also preserve CALL/RET/EXIT ordering.
+#[derive(Debug)]
+struct BoundedControl {
+    bounded: bool,
+    links: Vec<u32>,
+    direct_targets: Vec<u32>,
+    checked_returns: Vec<bool>,
+    dead_instructions: Vec<bool>,
+}
+
+impl BoundedControl {
+    // NX2 extension to the TLD4 arm's constant-offset proof. Only a locally
+    // dominating definition is needed; unrelated branches elsewhere are allowed.
+    fn gather_constant_offsets(code: &[Instruction], index: usize, source: u32) -> Option<[u32; 2]> {
+        let predicate = code[index].bits(12, 4);
+        let mut values = [None; 2];
+        let mut starts = [index; 2];
+        let mut guard_intact = true;
+        for pc in (0..index).rev() {
+            let insn = code[pc];
+            let pred = insn.bits(12, 4);
+            if pred == 15 { continue; }
+            let opcode = insn.bits(0, 12);
+            let dest = insn.bits(16, 8);
+            let immediate = (opcode == 0x802 && insn.bits(24, 8) == 0 && insn.words[2] == 0xf00)
+                || (opcode == 0x424 && insn.bits(24, 8) == 255 && insn.words[2] == 0x078e00ff);
+            if opcode == 0xb63 {
+                let count = insn.bits(72, 4).count_ones();
+                let high = insn.bits(64, 8);
+                // Conservatively cover full-precision writes even for packed F16.
+                for component in 0..2 {
+                    if values[component].is_some() { continue; }
+                    let reg = source + component as u32;
+                    if (dest != 255 && dest <= reg && reg < dest + if high == 255 { count } else { count.min(2) })
+                        || (high != 255 && count > 2 && high <= reg && reg < high + count - 2) { return None; }
+                }
+                guard_intact &= insn.bits(81, 3) == 7;
+                continue;
+            }
+            let count = match opcode {
+                0x224 | 0x624 | 0x827 | 0xa27 | 0x211 | 0xa11 | 0x831 | 0x832 => 1,
+                0x805 => 2,
+                0x945 | 0x947 | 0x941 | 0x942 | 0x948 | 0x94d | 0x91a => 0,
+                _ => Self::write_count(&insn)?,
+            };
+            for component in 0..2 {
+                if values[component].is_some() { continue; }
+                let reg = source + component as u32;
+                if dest <= reg && reg < dest + count {
+                    if dest != reg || !immediate || !(pred == 7 || (pred == predicate && guard_intact)) { return None; }
+                    values[component] = Some(insn.words[1]);
+                    starts[component] = pc;
+                }
+            }
+            if values.iter().all(Option::is_some) { break; }
+            // Restrict predicated definitions to a provably predicate-preserving
+            // interval. Unconditional constants do not depend on this flag.
+            guard_intact &= immediate
+                || matches!(opcode, 0x202 | 0x802 | 0x918 | 0x805 | 0x819 | 0x91a
+                    | 0x945 | 0x947 | 0x941 | 0x942 | 0x948 | 0x94d
+                    | 0x220 | 0xa20 | 0x221 | 0x421 | 0x621 | 0x223 | 0x423
+                    | 0x623 | 0x823 | 0xa23 | 0x245 | 0x306 | 0x831 | 0x832)
+                || (matches!(opcode, 0x212 | 0x812 | 0xa12 | 0xc12)
+                    && insn.bits(81, 3) != (predicate & 7))
+                || (matches!(opcode, 0x210 | 0x810 | 0xa10 | 0xc10)
+                    && insn.bits(81, 6) == 0x3f)
+                || (opcode == 0x81c
+                    && insn.bits(81, 3) != (predicate & 7)
+                    && insn.bits(84, 3) != (predicate & 7))
+                || (matches!(opcode, 0x224 | 0x424 | 0x624 | 0x824)
+                    && insn.words[2] & !0x2ff == 0x078e0000);
+        }
+        let values = [values[0]?, values[1]?];
+        for value in values {
+            for shift in (0..32).step_by(8) {
+                let byte = (value >> shift) & 255;
+                if byte > 31 && byte < 224 { return None; }
+            }
+        }
+        for (pc, insn) in code.iter().enumerate() {
+            let opcode = insn.bits(0, 12);
+            if matches!(opcode, 0x945 | 0x947) {
+                let raw = u64::from(insn.words[1] & if opcode == 0x947 { !3 } else { u32::MAX })
+                    | (u64::from(insn.words[2] & 0x3ffff) << 32);
+                let target = pc as i64 * 16 + 16 + (((raw << 14) as i64) >> 14);
+                if target < 0 || target % 16 != 0 || target as usize / 16 >= code.len() { return None; }
+                // BSSY targets account conservatively for subsequent BSYNC/BREAK.
+                for start in starts {
+                    if start < target as usize / 16 && target as usize / 16 <= index
+                        && (pc < start || pc >= index) { return None; }
+                }
+            } else if (0x140..=0x15f).contains(&(opcode & 0x1ff))
+                && !matches!(opcode, 0x941 | 0x942 | 0x948 | 0x348 | 0x94d | 0x95b) {
+                return None;
+            }
+        }
+        Some(values)
+    }
+
+    // Native counterpart of Maxwell TrackLDC/TrackSHL/TrackIMNMX. This is used
+    // for a linkage proof, so require reaching definitions (not merely matching
+    // opcodes), unconditional writes, unsigned MIN and an exact four-byte stride.
+    fn branch_table(code: &[Instruction], index: usize) -> Option<(usize, u32, u32, u32, u32)> {
+        fn definition(code: &[Instruction], end: usize, reg: u32) -> Option<usize> {
+            if reg == 255 { return None; }
+            for pc in (0..end).rev() {
+                let insn = &code[pc];
+                let dest = insn.bits(16, 8);
+                if dest == reg { return Some(pc); }
+                let count = BoundedControl::write_count(insn)?;
+                if dest <= reg && reg < dest + count { return None; }
+            }
+            None
+        }
+        let branch = code[index];
+        if branch.bits(0, 12) != 0x949 || branch.bits(12, 4) != 7
+            || branch.words[2] & !0x3ffff != 0x03800000 { return None; }
+        let ldc_pc = definition(code, index, branch.bits(24, 8))?;
+        let ldc = code[ldc_pc];
+        if ldc.bits(0, 12) != 0xb82 || ldc.bits(12, 4) != 7
+            || ldc.words[2] != 0x800 || ldc.words[1] & 0xf800003f != 0 { return None; }
+        let bank = match ldc.bits(54, 5) { 24 => 17, value => value };
+        let offset = ldc.bits(38, 16);
+        if bank >= 18 || offset >= 0x8000 || offset % 4 != 0 { return None; }
+        let shift_pc = definition(code, ldc_pc, ldc.bits(24, 8))?;
+        let shift = code[shift_pc];
+        if shift.bits(0, 12) != 0x819 || shift.bits(12, 4) != 7
+            || shift.words[1] != 2 || shift.words[2] != 0x6ff { return None; }
+        let clamp_pc = definition(code, shift_pc, shift.bits(24, 8))?;
+        let clamp = code[clamp_pc];
+        if clamp.bits(0, 12) != 0x817 || clamp.bits(12, 4) != 7
+            || clamp.words[2] != 0x03800000 || clamp.words[1] >= 0x4000 { return None; }
+        let count = clamp.words[1] + 1;
+        if offset + count * 4 > 0x10000 { return None; }
+        let raw = u64::from(branch.words[1]) | (u64::from(branch.words[2] & 0x3ffff) << 32);
+        let base = index as i64 * 16 + 16 + (((raw << 14) as i64) >> 14);
+        if !(0..=i64::from(u32::MAX)).contains(&base) || base % 16 != 0 { return None; }
+        Some((clamp_pc, bank, offset, count, base as u32))
+    }
+
+    // Same NOINC loop-transfer idiom as the upstream CALL emitter. It has no
+    // return-link contract, so preflight must classify it as a branch too.
+    fn is_loop_transfer(code: &[Instruction], index: usize) -> bool {
+        let insn = code[index];
+        insn.bits(0, 12) == 0x944 && insn.bits(12, 4) != 7
+            && insn.words[1] == 16 && insn.words[2] == 0x03c00000
+            && index + 2 < code.len() && code[index + 1].bits(0, 12) == 0x947
+    }
+
+    fn write_count(instruction: &Instruction) -> Option<u32> {
+        match instruction.bits(0, 12) {
+            0x202 | 0x802 | 0x424 | 0x724 | 0x824 | 0xe24 | 0x227
+            | 0x810 | 0x819 | 0x845 | 0x906 | 0x820 | 0x812 | 0x589
+            | 0x212 | 0x207 | 0x807 | 0x208 | 0x808 | 0x220 | 0xa20 | 0x221 | 0x421 | 0x621
+            | 0x223 | 0x423 | 0x623 | 0x823 | 0xa23 | 0x243 | 0x245 | 0x306
+            | 0x919 | 0xc12 | 0x300 | 0x210 | 0x308 => Some(u32::from(instruction.bits(16, 8) != 255)),
+            0x225 | 0x625 | 0x825 => Some(2),
+            0x305 => Some(if instruction.bits(75, 2) == 3 { 2 } else { 1 }),
+            0x83b => (instruction.bits(72, 2) != 3).then(|| 1 << instruction.bits(72, 2)),
+            0x381 | 0x981 | 0x984 | 0xb82 => match instruction.bits(73, 3) {
+                0..=4 => Some(1), 5 => Some(2), 6 => Some(4), _ => None,
+            },
+            0x20c | 0x80c | 0x81c | 0x387 | 0x388 | 0xb1d | 0x348 | 0x918 | 0x886 | 0x95b => Some(0),
+            _ => None,
+        }
+    }
+
+    // Called only after the outer size check, like upstream.
+    #[cfg(test)]
+    fn analyze(code: &[Instruction], geometry_stage: bool, uses_uniform_bank: bool, high_uniform_base: u32) -> Self {
+        Self::analyze_with_cbuf(code, geometry_stage, uses_uniform_bank, high_uniform_base, &mut |_, _| None)
+    }
+
+    fn analyze_with_cbuf(code: &[Instruction], geometry_stage: bool, uses_uniform_bank: bool, high_uniform_base: u32,
+        read_cbuf: &mut dyn FnMut(u32, u32) -> Option<u32>) -> Self {
+        let mut result = Self { bounded: !geometry_stage, links: vec![u32::MAX; code.len()],
+            direct_targets: vec![u32::MAX; code.len()], checked_returns: vec![false; code.len()],
+            dead_instructions: vec![false; code.len()] };
+        let mut entries = vec![false; code.len()];
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        let mut table_spans = Vec::new();
+        entries[0] = true;
+        let ordinary_operands = |instruction: &Instruction| {
+            for bit in [16, 24, 32, 64] {
+                if bit == 32 && instruction.bits(9, 3) != 1 { continue; }
+                let reg = instruction.bits(bit, 8);
+                if reg >= if uses_uniform_bank { high_uniform_base } else { 246 } && reg != 255 { return false; }
+            }
+            true
+        };
+        for (index, instruction) in code.iter().enumerate() {
+            let opcode = instruction.bits(0, 12);
+            if matches!(opcode, 0x944 | 0x945 | 0x947) {
+                if opcode == 0x944 && index == 0 { result.bounded = false; }
+                let mode = instruction.words[2] & !0x3ffff;
+                // NX2 extension: BRA's secondary predicate occupies bits 87..90.
+                // The emitter already handles both predicates. They change edge
+                // execution, not its destination: retain the edge conservatively.
+                let valid_mode = if opcode == 0x947 {
+                    matches!(mode & !0x07800000, 0 | 0x08000000)
+                } else {
+                    mode == if opcode == 0x944 { 0x03c00000 } else { 0x03800000 }
+                };
+                if !valid_mode { result.bounded = false; }
+                let raw = u64::from(instruction.words[1] & if opcode == 0x947 { !3 } else { u32::MAX })
+                    | (u64::from(instruction.words[2] & 0x3ffff) << 32);
+                let relative = ((raw << 14) as i64) >> 14;
+                let target = index as i64 * 16 + 16 + relative;
+                if target < 0 || target % 16 != 0 || target as u64 / 16 >= code.len() as u64 {
+                    result.bounded = false;
+                } else {
+                    result.direct_targets[index] = (target / 16) as u32;
+                    entries[target as usize / 16] = true;
+                    edges.push((index, target as usize / 16));
+                }
+                if opcode == 0x944 && index + 1 < code.len() {
+                    entries[index + 1] = true; edges.push((index, index + 1));
+                }
+            } else if opcode == 0x949 {
+                if let Some((start, bank, offset, count, base)) = Self::branch_table(code, index) {
+                    table_spans.push((start, index));
+                    for slot in 0..count {
+                        let Some(value) = read_cbuf(bank, offset + slot * 4) else {
+                            result.bounded = false; break;
+                        };
+                        let target = base.wrapping_add(value);
+                        if target % 16 != 0 || target as usize / 16 >= code.len() {
+                            result.bounded = false; break;
+                        }
+                        entries[target as usize / 16] = true;
+                        edges.push((index, target as usize / 16));
+                    }
+                } else { result.bounded = false; }
+            } else if (0x140..=0x15f).contains(&(opcode & 0x1ff))
+                && !matches!(opcode, 0x941 | 0x942 | 0x948 | 0x348 | 0x94d | 0x950 | 0x95b) {
+                result.bounded = false;
+            }
+        }
+        // A jump into the definition chain could bypass its clamp/load. Include
+        // all resolved indirect edges before deciding whether the proof holds.
+        for (start, end) in table_spans {
+            if entries[start + 1..=end].iter().any(|&entry| entry) { result.bounded = false; }
+        }
+        for index in 1..code.len() {
+            if !result.bounded { break; }
+            if code[index].bits(0, 12) != 0x944 || Self::is_loop_transfer(code, index) { continue; }
+            if code[index].words[0] != 0x7944 { result.bounded = false; break; }
+            let mut overwritten = [false; 256];
+            let mut setup = index;
+            for prior in (0..index).rev() {
+                let instruction = &code[prior];
+                let destination = instruction.bits(16, 8);
+                if (instruction.words[0] & !0x00ff0000) == 0x00007802
+                    && instruction.words[1] == (index as u32 + 1) * 16 && instruction.words[2] == 0xf00
+                    && instruction.words[3] & 0xc00001ff == 0 && ordinary_operands(instruction)
+                    && destination < 246 && !overwritten[destination as usize] {
+                    result.links[index] = destination; setup = prior; break;
+                }
+                let Some(count) = Self::write_count(instruction) else { break; };
+                if !ordinary_operands(instruction) || destination + count > 255 { break; }
+                for component in 0..count { overwritten[(destination + component) as usize] = true; }
+            }
+            if result.links[index] == u32::MAX { result.bounded = false; break; }
+            for entry in setup + 1..=index { if entries[entry] { result.bounded = false; } }
+        }
+        for index in 0..code.len() {
+            if !result.bounded { break; }
+            if code[index].bits(0, 12) != 0x944 || Self::is_loop_transfer(code, index) { continue; }
+            let link = result.links[index];
+            let target = result.direct_targets[index] as usize;
+            if target == 0 { result.bounded = false; break; }
+            let previous = code[target - 1];
+            if previous.bits(12, 4) != 7 || previous.bits(87, 4) != 7
+                || !matches!(previous.bits(0, 12), 0x947 | 0x94d | 0x950) {
+                result.bounded = false; break;
+            }
+            for &(source, destination) in &edges {
+                if destination == target && code[source].bits(0, 12) != 0x944 { result.bounded = false; }
+            }
+            let mut aliases = [false; 256]; aliases[link as usize] = true;
+            let mut returned = false;
+            for pc in target..code.len() {
+                let instruction = &code[pc];
+                if pc != target && entries[pc] { break; }
+                if instruction.bits(0, 12) == 0x950 {
+                    let raw = u64::from(instruction.words[1]) | (u64::from(instruction.words[2] & 0x3ffff) << 32);
+                    let relative = ((raw << 14) as i64) >> 14;
+                    returned = instruction.words[0] & 0x00ffffff == 0x00007950
+                        && instruction.words[2] & !0x3ffff == 0x03c00000
+                        && instruction.words[3] & 0xc00001ff == 0 && pc as i64 * 16 + 16 + relative == 0
+                        && aliases[instruction.bits(24, 8) as usize];
+                    if returned { result.checked_returns[pc] = true; }
+                    break;
+                }
+                let Some(count) = Self::write_count(instruction) else { break; };
+                let destination = instruction.bits(16, 8);
+                if !ordinary_operands(instruction) || destination + count > 255
+                    || (count != 0 && destination <= link && link < destination + count) { break; }
+                let mut copy = false;
+                if instruction.bits(12, 4) == 7 {
+                    if instruction.words[0] & 0xff00ffff == 0x00007202
+                        && instruction.words[1] < 256 && instruction.words[2] == 0xf00 {
+                        copy = aliases[instruction.words[1] as usize];
+                    }
+                    if instruction.words[0] & 0xff00ffff == 0xff007224
+                        && instruction.words[1] == 0xff && instruction.words[2] & !0xff == 0x078e0000 {
+                        copy = aliases[instruction.bits(64, 8) as usize];
+                    }
+                }
+                for component in 0..count { aliases[(destination + component) as usize] = component == 0 && copy; }
+            }
+            if !returned { result.bounded = false; }
+        }
+        for index in 0..code.len() {
+            if !result.bounded { break; }
+            if code[index].bits(0, 12) == 0x950 && !result.checked_returns[index] { result.bounded = false; }
+        }
+        for index in 0..code.len() {
+            if !result.bounded { break; }
+            let instruction = &code[index];
+            let target = result.direct_targets[index];
+            if instruction.bits(0, 12) != 0x947 || instruction.bits(12, 4) != 7
+                || instruction.bits(32, 2) == 2 || instruction.bits(16, 8) != 0 || instruction.bits(87, 4) != 7
+                || target <= index as u32 || target == u32::MAX || instruction.words[3] & 0xc00001ff != 0
+                || if instruction.bits(91, 1) != 0 { instruction.bits(24, 8) >= 64 } else { instruction.bits(24, 8) != 0 }
+            { continue; }
+            if !(index + 1..target as usize).any(|pc| code[pc].bits(0, 12) == 0x944) { continue; }
+            let entered = edges.iter().any(|&(source, destination)| index < destination && destination < target as usize
+                && !(index < source && source < target as usize));
+            if !entered { for pc in index + 1..target as usize { result.dead_instructions[pc] = true; } }
+        }
+        result
+    }
 }
 
 // State captured by the upstream fail/finish lambdas and opcode loop.
@@ -482,7 +891,8 @@ impl ProgramLowering {
                 return self.fail(index, "native branch or call leaves captured program");
             }
             // Branch/call validation rejects negative targets before recording them.
-            let target = self.result.source_instruction_offsets[relocation.target as usize];
+            let target = relocation.output_target.unwrap_or_else(||
+                self.result.source_instruction_offsets[relocation.target as usize]);
             let relative = i64::from(Self::address_of(target))
                 - i64::from(Self::address_of(relocation.output_index))
                 - 8;
@@ -501,8 +911,10 @@ impl ProgramLowering {
             let op = instruction.bits(0, 12);
             matches!(
                 op,
-                0x3c4
+                0xf63 | 0xf60
+                    | 0x3c4
                     | 0x2bd
+                    | 0xc0b
                     | 0xc0c
                     | 0x986
                     | 0x9a8
@@ -550,8 +962,14 @@ impl ProgramLowering {
                     | 0x883
                     | 0x2a5
                     | 0xd06
+                    | 0xd08
+                    | 0x8a5
+                    | 0x4a4
+                    | 0xc11
                     | 0x299
+                    | 0x499
                     | 0xc09
+                    | 0xc07 | 0xc0a
             ) || (op == 0x984 && instruction.bits(91, 1) != 0)
                 || (op == 0x81c && instruction.bits(67, 1) != 0)
         })
@@ -572,29 +990,36 @@ struct UniformRewrite {
 
 #[allow(dead_code)]
 impl UniformRewrite {
-    fn new(insn: &mut Instruction, opcode: &mut u32) -> Result<Self, &'static str> {
+    fn new(insn: &mut Instruction, opcode: &mut u32, uniforms: &UniformRegisters) -> Result<Self, &'static str> {
         let mut rewritten_uniform = false;
         let mut uniform_guard = false;
         let mut uniform_output = 7;
         if matches!(
             *opcode,
-            0x2a4 | 0x8a4 | 0x891 | 0x890 | 0x290 | 0x292 | 0x892 | 0x291
+            0x2a4 | 0x4a4 | 0x8a4 | 0x8a5 | 0x891 | 0x890 | 0x290 | 0x292 | 0x892 | 0x291
         ) {
             if insn.bits(12, 4) != 7 && *opcode != 0x292 && *opcode != 0x892 {
-                return Err("native uniform arithmetic predication");
+                let guarded_add = matches!(*opcode, 0x290 | 0x890) && insn.bits(74, 1) == 0
+                    && insn.bits(81, 6) == 0x3f && insn.bits(77, 4) == 15 && insn.bits(87, 4) == 15;
+                let guarded_lea = matches!(*opcode, 0x291 | 0x891) && insn.bits(74, 1) == 0
+                    && insn.bits(80, 1) == 0 && insn.bits(81, 3) == 7;
+                let guarded_multiply = *opcode == 0x2a4 && (insn.words[2] & !0x080002ff) == 0x078e0000;
+                if !guarded_add && !guarded_lea && !guarded_multiply {
+                    return Err("native uniform arithmetic predication");
+                }
             }
             uniform_guard = insn.bits(12, 4) != 7;
             rewritten_uniform = true;
-            let dst = InstructionLowering::uniform_register(insn.bits(16, 8));
-            let a = InstructionLowering::uniform_register(insn.bits(24, 8));
-            let c = InstructionLowering::uniform_register(insn.bits(64, 8));
+            let dst = uniforms.register(insn.bits(16, 8));
+            let a = uniforms.register(insn.bits(24, 8));
+            let c = uniforms.register(insn.bits(64, 8));
             if dst == u32::MAX || a == u32::MAX || c == u32::MAX {
                 return Err("native uniform arithmetic register");
             }
             insn.words[0] = (insn.words[0] & 0xffff) | (dst << 16) | (a << 24);
             insn.words[2] = (insn.words[2] & !0x080000ff) | c;
             if matches!(*opcode, 0x2a4 | 0x290 | 0x292 | 0x291) {
-                let b = InstructionLowering::uniform_register(insn.bits(32, 8));
+                let b = uniforms.register(insn.bits(32, 8));
                 if b == u32::MAX {
                     return Err("native uniform arithmetic second register");
                 }
@@ -609,7 +1034,9 @@ impl UniformRewrite {
             }
             *opcode = match *opcode {
                 0x2a4 => 0x224,
+                0x4a4 => 0x424,
                 0x8a4 => 0x824,
+                0x8a5 => 0x825,
                 0x891 => 0x811,
                 0x890 => 0x810,
                 0x292 => 0x212,
@@ -618,7 +1045,7 @@ impl UniformRewrite {
                 _ => 0x210,
             };
         }
-        let uniform_predication = matches!(*opcode, 0xabb | 0xab9 | 0xc82 | 0x882);
+        let uniform_predication = matches!(*opcode, 0xabb | 0xab9 | 0xc82 | 0x882 | 0x899 | 0x299 | 0x499);
         let native_predicate = insn.bits(12, 4);
         let guarded_uniform = (uniform_predication || uniform_guard) && native_predicate != 7;
         let guard_slot = 6u32.wrapping_sub(native_predicate & 7);
@@ -671,10 +1098,35 @@ impl UniformRewrite {
     }
 }
 
+// Captures of the upstream uniform_register lambda, shared by rewriting and emission.
+#[derive(Default)]
+struct UniformRegisters {
+    high_uniforms: u32,
+    requested: Cell<u32>,
+}
+
+impl UniformRegisters {
+    fn base(&self) -> u32 { 216 - self.high_uniforms }
+
+    fn register(&self, reg: u32) -> u32 {
+        if reg < 22 { return 216 + reg; }
+        if reg < 28 { return 218 + reg; }
+        if reg == 63 { return 255; }
+        if reg < 63 && reg - 28 < self.high_uniforms {
+            return self.base() + reg - 28;
+        }
+        if reg < 63 {
+            self.requested.set(self.requested.get().max((reg - 26) & !1));
+        }
+        u32::MAX
+    }
+}
+
 // Mechanical context for LowerToMaxwell's per-instruction captured lambdas.
 // Their state and emitted words stay in this upstream-owned file.
 #[allow(dead_code)]
 struct InstructionLowering<'a> {
+    uniforms: &'a UniformRegisters,
     insn: Instruction,
     predicate: u64,
     dest: u64,
@@ -693,98 +1145,89 @@ struct HalfSource {
 
 #[allow(dead_code)]
 impl InstructionLowering<'_> {
-    fn lower_effective_address(&mut self, opcode: u32) -> Result<(), &'static str> {
+    fn lower_effective_address(&mut self, opcode: u32, rewritten_uniform: bool) -> Result<(), &'static str> {
         let insn = self.insn;
-        match opcode {
-            0xa11 => {
-                if insn.bits(72, 1) != 0
-                    || insn.bits(74, 1) != 0
-                    || insn.bits(80, 1) != 0
-                    || insn.bits(81, 3) == 7
-                    || insn.bits(62, 2) != 0
-                {
-                    return Err("native constant LEA carry mode");
-                }
-                let b = self.operand(1, false);
-                self.emit(
-                    self.base(0x5c18000000000000)
-                        | (u64::from(insn.bits(24, 8)) << 8)
-                        | (u64::from(b) << 20)
-                        | (u64::from(insn.bits(75, 5)) << 39),
-                );
-                self.emit(
-                    0x5b60000000000000
-                        | self.predicate
-                        | 7
-                        | (u64::from(insn.bits(81, 3)) << 3)
-                        | (self.dest << 8)
-                        | (u64::from(b) << 20)
-                        | (7u64 << 39)
-                        | (1u64 << 49),
-                );
+        if insn.bits(80, 1) != 0 {
+            let extended = insn.bits(74, 1) != 0;
+            let high = insn.bits(64, 8);
+            if insn.bits(72, 1) != 0 || insn.bits(81, 3) != 7
+                || (high != 255 && insn.bits(73, 1) != 0)
+                || (matches!(opcode, 0x211 | 0xa11) && insn.bits(62, 1) != 0)
+                || (opcode == 0xc11 && insn.words[1] & !0x8000003f != 0) {
+                return Err("native high effective address mode");
             }
-            0x211 | 0x811 => {
-                if insn.bits(80, 1) != 0 {
-                    if insn.bits(72, 1) != 0
-                        || insn.bits(74, 1) != 0
-                        || insn.bits(81, 3) != 7
-                        || insn.bits(64, 8) != 255
-                        || (opcode == 0x211 && insn.bits(62, 2) != 0)
-                    {
-                        return Err("native high effective address mode");
-                    }
-                    let mut b = insn.bits(32, 8);
-                    if opcode == 0x811 {
-                        b = if insn.words[1] != 0 { 251 } else { 255 };
-                        if b == 251 {
-                            self.mov_imm(251, insn.words[1]);
-                        }
-                    }
-                    let shift = (u64::from(32 - insn.bits(75, 5)) << 20)
-                        | (u64::from(insn.bits(73, 1)) << 48);
-                    if b == 255 {
-                        self.emit(
-                            self.base(0x3828000000000000)
-                                | (u64::from(insn.bits(24, 8)) << 8)
-                                | shift,
-                        );
-                    } else {
-                        self.emit(
-                            0x3828000000000000
-                                | self.predicate
-                                | 250
-                                | (u64::from(insn.bits(24, 8)) << 8)
-                                | shift,
-                        );
-                        self.emit(
-                            self.base(0x5c10000000000000) | (250u64 << 8) | (u64::from(b) << 20),
-                        );
-                    }
-                    return Ok(());
-                }
-                if insn.bits(72, 1) != 0
-                    || insn.bits(74, 1) != 0
-                    || insn.bits(80, 1) != 0
-                    || insn.bits(81, 3) != 7
-                    || (opcode == 0x211 && insn.bits(62, 1) != 0)
-                {
-                    return Err("native LEA carry/high mode");
-                }
-                let mut b = insn.bits(32, 8);
-                if opcode == 0x811 {
-                    self.mov_imm(251, insn.words[1]);
-                    b = 251;
-                }
-                self.emit(
-                    self.base(0x5c18000000000000)
-                        | (u64::from(insn.bits(24, 8)) << 8)
-                        | (u64::from(b) << 20)
-                        | (u64::from(insn.bits(75, 5)) << 39)
-                        | (u64::from(if opcode == 0x211 { insn.bits(63, 1) } else { 0 }) << 48),
-                );
+            let mut b = if opcode == 0xc11 { self.uniforms.register(insn.bits(32, 8)) } else { insn.bits(32, 8) };
+            if opcode == 0xa11 { b = self.operand(1, false); }
+            if b == u32::MAX { return Err("native uniform LEA register"); }
+            if opcode == 0x811 {
+                b = if insn.words[1] != 0 { 251 } else { 255 };
+                if b == 251 { self.mov_imm(251, insn.words[1]); }
             }
-            _ => unreachable!("opcode outside upstream LEA arms"),
+            let shift = (u64::from(32 - insn.bits(75, 5)) << 20) | (u64::from(insn.bits(73, 1)) << 48);
+            let high_word = |this: &mut Self, target: u64| {
+                if high == 255 {
+                    this.emit(target | 0x3828000000000000 | (u64::from(insn.bits(24, 8)) << 8) | shift);
+                } else {
+                    this.emit(target | 0x36f8000000000000 | (u64::from(insn.bits(24, 8)) << 8)
+                        | (u64::from(high) << 39) | (u64::from(insn.bits(75, 5)) << 20));
+                }
+            };
+            if b == 255 && !extended {
+                high_word(self, self.base(0));
+            } else {
+                high_word(self, self.predicate | 250);
+                if extended {
+                    self.mov_imm(252, 1);
+                    self.emit(0x5ca0000000000000 | self.predicate | 252 | (252u64 << 8) | (255u64 << 20)
+                        | (u64::from(insn.bits(87, 3)) << 39) | (u64::from(insn.bits(90, 1)) << 42));
+                    self.emit(0x5c10000000000000 | self.predicate | 250 | (250u64 << 8) | (252u64 << 20));
+                }
+                // LEA.HI uses the same Rb negation bit as LEA; immediate
+                // bit 63 is part of the immediate value, not a modifier.
+                self.emit(self.base(0x5c10000000000000) | (250u64 << 8) | (u64::from(b) << 20)
+                    | (u64::from(opcode != 0x811 && insn.bits(63, 1) != 0) << 48));
+            }
+            return Ok(());
         }
+        let carry_out = insn.bits(81, 3);
+        if insn.bits(72, 1) != 0 || insn.bits(74, 1) != 0 || insn.bits(80, 1) != 0
+            || (carry_out != 7 && ((opcode != 0x811 && insn.bits(63, 1) != 0)
+                || (rewritten_uniform && (opcode != 0x211 || carry_out > 1))))
+            || (matches!(opcode, 0x211 | 0xa11) && insn.bits(62, 1) != 0)
+            || (opcode == 0xc11 && insn.words[1] & !0x8000003f != 0) {
+            return Err("native LEA carry/high mode");
+        }
+        let mut b = if opcode == 0xc11 { self.uniforms.register(insn.bits(32, 8)) } else { insn.bits(32, 8) };
+        if opcode == 0xa11 { b = self.operand(1, false); }
+        if b == u32::MAX { return Err("native uniform LEA register"); }
+        if opcode == 0x811 { self.mov_imm(251, insn.words[1]); b = 251; }
+        if opcode == 0xa11 && carry_out != 7 {
+            self.emit(self.base(0x5c18000000000000) | (u64::from(insn.bits(24, 8)) << 8)
+                | (u64::from(b) << 20) | (u64::from(insn.bits(75, 5)) << 39));
+            self.emit(0x5b60000000000000 | self.predicate | 7 | (u64::from(carry_out) << 3)
+                | (self.dest << 8) | (u64::from(b) << 20) | (7u64 << 39) | (1u64 << 49));
+            return Ok(());
+        }
+        if carry_out != 7 {
+            let target = if rewritten_uniform { 6 - carry_out } else { carry_out };
+            let mask = u64::from(1u32 << target);
+            self.emit(0x5c18000000000000 | self.predicate | 250 | (u64::from(insn.bits(24, 8)) << 8)
+                | (u64::from(b) << 20) | (u64::from(insn.bits(75, 5)) << 39));
+            if rewritten_uniform {
+                self.emit(0x38e8000000070000 | 253 | (255u64 << 8) | (mask << 20));
+            }
+            self.emit(0x5b60000000000000 | self.predicate | 7 | (u64::from(target) << 3)
+                | (250u64 << 8) | (u64::from(b) << 20) | (7u64 << 39) | (1u64 << 49));
+            if rewritten_uniform {
+                self.emit(0x38e8000000070000 | 239 | (239u64 << 8) | (mask << 20));
+                self.emit(0x38f0000000070000 | (253u64 << 8) | (mask << 20));
+            }
+            self.emit(self.base(0x5c98000000000000) | (15u64 << 39) | (250u64 << 20));
+            return Ok(());
+        }
+        self.emit(self.base(0x5c18000000000000) | (u64::from(insn.bits(24, 8)) << 8)
+            | (u64::from(b) << 20) | (u64::from(insn.bits(75, 5)) << 39)
+            | (u64::from(if opcode != 0x811 { insn.bits(63, 1) } else { 0 }) << 48));
         Ok(())
     }
 
@@ -792,9 +1235,64 @@ impl InstructionLowering<'_> {
         &mut self,
         opcode: u32,
         rewritten_uniform: bool,
+        guarded_uniform: bool,
     ) -> Result<(), &'static str> {
         let insn = self.insn;
         assert!(matches!(opcode, 0x210 | 0x810 | 0xa10 | 0xc10));
+        if rewritten_uniform && opcode == 0x210 && insn.bits(74, 1) != 0 && insn.bits(81, 6) == 0x3f {
+            if guarded_uniform || (insn.words[2] & !0x0781e0ff) != 0x007e0400
+                || insn.words[1] & !0xff != 0 {
+                return Err("native uniform extended add mode");
+            }
+            self.emit(0x5c10000000000000 | self.predicate | 250 | (u64::from(insn.bits(24, 8)) << 8)
+                | (u64::from(insn.bits(32, 8)) << 20));
+            self.emit(0x5c10000000000000 | self.predicate | 250 | (250u64 << 8) | (u64::from(insn.bits(64, 8)) << 20));
+            let mut mask = 0;
+            for bit in [77, 87] {
+                let source = insn.bits(bit, 3);
+                if source != 7 { mask |= 1 << (6 - source); }
+            }
+            self.save_predicate(mask);
+            self.emit(0x38f0000000070000 | (239u64 << 8) | (u64::from(mask) << 20));
+            self.mov_imm(252, 1);
+            for bit in [77, 87] {
+                let source = insn.bits(bit, 3);
+                self.emit(0x5ca0000000000000 | self.predicate | 251 | (252u64 << 8) | (255u64 << 20)
+                    | (u64::from(if source == 7 { 7 } else { 6 - source }) << 39)
+                    | (u64::from(insn.bits(bit + 3, 1)) << 42));
+                self.emit(0x5c10000000000000 | self.predicate | 250 | (250u64 << 8) | (251u64 << 20));
+            }
+            self.restore_predicate(mask);
+            self.emit(self.base(0x5c98000000000000) | (15u64 << 39) | (250u64 << 20));
+            return Ok(());
+        }
+        if rewritten_uniform && opcode == 0x210 && insn.bits(81, 6) != 0x3f {
+            let first = insn.bits(81, 3);
+            let second = insn.bits(84, 3);
+            if guarded_uniform || (insn.words[2] & !0x007e00ff) != 0x0781e000
+                || insn.words[1] & !0xff != 0 || (first != 7 && first == second) {
+                return Err("native uniform add carry mode");
+            }
+            self.emit(0x5c10000000000000 | self.predicate | 250 | (u64::from(insn.bits(24, 8)) << 8)
+                | (u64::from(insn.bits(32, 8)) << 20) | (1u64 << 47));
+            self.emit(0x5c10000000000000 | self.predicate | 251 | (255u64 << 8) | (255u64 << 20) | (1u64 << 43));
+            self.emit(0x5c10000000000000 | self.predicate | 250 | (250u64 << 8) | (u64::from(insn.bits(64, 8)) << 20) | (1u64 << 47));
+            self.emit(0x5c10000000000000 | self.predicate | 251 | (251u64 << 8) | (255u64 << 20) | (1u64 << 43));
+            let mask = (if first == 7 { 0 } else { 1 << (6 - first) })
+                | (if second == 7 { 0 } else { 1 << (6 - second) });
+            self.save_predicate(mask);
+            self.emit(self.base(0x5c98000000000000) | (15u64 << 39) | (250u64 << 20));
+            for output in 0..2 {
+                let target = if output != 0 { second } else { first };
+                if target == 7 { continue; }
+                self.mov_imm(252, output + 1);
+                self.emit(0x5b60000000000000 | self.predicate | 7 | (u64::from(6 - target) << 3)
+                    | (251u64 << 8) | (252u64 << 20) | (7u64 << 39) | (6u64 << 49));
+            }
+            self.emit(0x38e8000000070000 | 239 | (239u64 << 8) | (u64::from(mask) << 20));
+            self.restore_predicate(mask);
+            return Ok(());
+        }
         if matches!(opcode, 0x210 | 0x810)
             && insn.bits(64, 8) == 255
             && insn.bits(73, 1) == 0
@@ -803,6 +1301,7 @@ impl InstructionLowering<'_> {
             && insn.bits(77, 4) == 15
             && insn.bits(72, 1) == 0
             && (insn.bits(81, 3) != 7 || insn.bits(74, 1) != 0)
+            && (opcode == 0x810 || insn.bits(63, 1) == 0)
         {
             let carry_in = insn.bits(74, 1) != 0;
             let carry_out = insn.bits(81, 3);
@@ -1005,9 +1504,10 @@ impl InstructionLowering<'_> {
     fn lower_selection_and_logic(&mut self, opcode: u32) -> Result<(), &'static str> {
         let insn = self.insn;
         match opcode {
-            0x207 | 0x807 | 0xa07 | 0x208 | 0x808 | 0xa08 => {
-                let a = self.operand(0, false);
-                let b = self.operand(1, false);
+            0x207 | 0x807 | 0xa07 | 0xc07 | 0x208 | 0x808 | 0xa08 => {
+                let floating = opcode & 0x1ff == 8;
+                let a = self.operand(0, floating);
+                let b = self.operand(1, floating);
                 self.emit(
                     self.base(0x5ca0000000000000)
                         | (u64::from(a) << 8)
@@ -1016,11 +1516,11 @@ impl InstructionLowering<'_> {
                         | (u64::from(insn.bits(90, 1)) << 42),
                 );
             }
-            0x20a | 0x80a | 0xa0a => {
+            0x20a | 0x80a | 0xa0a | 0xc0a => {
                 if insn.bits(64, 8) != 0
                     || insn.bits(74, 2) == 3
                     || insn.bits(81, 6) != 0
-                    || insn.bits(91, 1) != 0
+                    || (opcode != 0xc0a && insn.bits(91, 1) != 0)
                 {
                     return Err("native floating comparison output mode");
                 }
@@ -1037,8 +1537,17 @@ impl InstructionLowering<'_> {
                         | (u64::from(insn.bits(80, 1)) << 55),
                 );
             }
-            0x434 => {
-                self.mov_imm(250, insn.words[1]);
+            0x234 | 0x434 => {
+                let source = if opcode == 0x234 {
+                    if insn.words[1] & 0x0fffff00 != 0 || insn.bits(64, 5) != 0 {
+                        return Err("native half comparison mode");
+                    }
+                    (u64::from(insn.bits(32, 8)) << 20) | (u64::from(insn.bits(60, 2)) << 28)
+                        | (u64::from(insn.bits(62, 1)) << 30) | (u64::from(insn.bits(63, 1)) << 31)
+                } else {
+                    self.mov_imm(250, insn.words[1]);
+                    250u64 << 20
+                };
                 self.emit(
                     0x5d20000000000000
                         | self.predicate
@@ -1046,7 +1555,7 @@ impl InstructionLowering<'_> {
                         | (u64::from(insn.bits(81, 3)) << 3)
                         | (u64::from(insn.bits(80, 1)) << 6)
                         | (u64::from(insn.bits(24, 8)) << 8)
-                        | (250u64 << 20)
+                        | source
                         | (u64::from(insn.bits(76, 4)) << 35)
                         | (u64::from(insn.bits(87, 3)) << 39)
                         | (u64::from(insn.bits(90, 1)) << 42)
@@ -1057,10 +1566,50 @@ impl InstructionLowering<'_> {
                         | (u64::from(insn.bits(71, 1)) << 49),
                 );
             }
-            0x20b | 0x80b | 0xa0b | 0x20c | 0x80c | 0xa0c | 0xc0c => {
+            0x20b | 0x80b | 0xa0b | 0xc0b | 0x20c | 0x80c | 0xa0c | 0xc0c => {
                 let floating = opcode & 0x1ff == 0xb;
                 if !floating && insn.bits(72, 1) != 0 {
-                    return Err("native extended integer comparison");
+                    // Fritchii ISETP.EX: combine the high-word comparison with
+                    // the predicate produced by the low-word comparison.
+                    let compare = insn.bits(76, 3);
+                    let destination = insn.bits(81, 3);
+                    let destination_b = insn.bits(84, 3);
+                    let low = insn.bits(68, 4);
+                    let accumulate = insn.bits(87, 4);
+                    let combine = insn.bits(74, 2);
+                    if compare == 0 || compare == 7 || combine == 3 {
+                        return Err("native extended integer comparison mode");
+                    }
+                    let a = self.operand(0, false);
+                    let b = self.operand(1, false);
+                    let mut temporary = 0;
+                    while temporary == destination || temporary == destination_b
+                        || temporary == (low & 7) || temporary == (accumulate & 7)
+                        || temporary == insn.bits(12, 3)
+                    {
+                        temporary += 1;
+                    }
+                    let mask = 1u64 << temporary;
+                    self.emit(0x38e8000000070000 | 253 | (255u64 << 8) | (mask << 20));
+                    let isetp = |op: u32, input: u32, combine: u32| {
+                        0x5b60000000000000 | self.predicate | 7 | (u64::from(temporary) << 3)
+                            | (u64::from(a) << 8) | (u64::from(b) << 20)
+                            | (u64::from(input & 7) << 39) | (u64::from(input >> 3) << 42)
+                            | (u64::from(combine) << 45) | (u64::from(insn.bits(73, 1)) << 48)
+                            | (u64::from(op) << 49)
+                    };
+                    let first = isetp(if compare == 5 { 5 } else { 2 }, low, u32::from(compare == 5));
+                    let second = isetp(if compare <= 3 { 1 } else { 4 }, temporary, 1);
+                    self.emit(first);
+                    if compare != 2 && compare != 5 {
+                        self.emit(second);
+                    }
+                    self.emit(0x5090000000000000 | self.predicate | u64::from(destination_b)
+                        | (u64::from(destination) << 3) | (u64::from(temporary) << 12)
+                        | (7u64 << 29) | (u64::from(accumulate & 7) << 39)
+                        | (u64::from(accumulate >> 3) << 42) | (u64::from(combine) << 45));
+                    self.emit(0x38f0000000070000 | (253u64 << 8) | (mask << 20));
+                    return Ok(());
                 }
                 let a = self.operand(0, floating);
                 let b = self.operand(1, floating);
@@ -1105,7 +1654,7 @@ impl InstructionLowering<'_> {
                     self.mov_imm(251, insn.words[1]);
                     251
                 } else if opcode == 0xc12 {
-                    let b = Self::uniform_register(insn.bits(32, 8));
+                    let b = self.uniforms.register(insn.bits(32, 8));
                     if b == u32::MAX {
                         return Err("native uniform logic source");
                     }
@@ -1151,16 +1700,21 @@ impl InstructionLowering<'_> {
             0x217 | 0x817 | 0xa17 | 0xc17 => {
                 if insn.words[2] & !(0x04000200 | if opcode == 0xc17 { 0x08000000 } else { 0 })
                     != 0x03800000
-                    || (opcode != 0xa17
-                        && insn.words[1] > if opcode == 0x817 { 0x7ffff } else { 255 })
+                    || (opcode != 0xa17 && opcode != 0x817 && insn.words[1] > 255)
                     || (opcode == 0xa17 && (!self.valid_cbuf() || insn.bits(62, 2) != 0))
                 {
                     return Err("native integer min/max mode");
                 }
+                // Maxwell's immediate carries 19 value bits and a separate sign bit.
+                let short_immediate = opcode == 0x817
+                    && (insn.words[1] <= 0x7ffff || insn.words[1] >= 0xfff80000);
+                if opcode == 0x817 && !short_immediate { self.mov_imm(251, insn.words[1]); }
                 let source = if opcode == 0xc17 {
-                    Self::uniform_register(insn.words[1])
+                    self.uniforms.register(insn.words[1])
                 } else if opcode == 0xa17 {
                     self.operand(1, false)
+                } else if opcode == 0x817 {
+                    if short_immediate { insn.words[1] & 0x7ffff } else { 251 }
                 } else {
                     insn.words[1]
                 };
@@ -1168,18 +1722,31 @@ impl InstructionLowering<'_> {
                     return Err("native uniform min/max operand");
                 }
                 self.emit(
-                    self.base(if opcode == 0x817 {
+                    self.base(if short_immediate {
                         0x3820000000000000
                     } else {
                         0x5c20000000000000
                     }) | (u64::from(insn.bits(24, 8)) << 8)
                         | (u64::from(source) << 20)
+                        | (u64::from(if short_immediate { insn.words[1] >> 31 } else { 0 }) << 56)
                         | (u64::from(insn.bits(87, 4)) << 39)
                         | (u64::from(insn.bits(73, 1)) << 48),
                 );
             }
             0x819 => {
                 let is_signed = insn.bits(73, 2) == 2;
+                if insn.bits(80, 1) == 0 && insn.bits(76, 1) != 0
+                    && insn.bits(73, 2) == 1 && insn.bits(75, 1) == 0
+                    && insn.words[1] <= 32
+                {
+                    // Fritchii: U64 right funnel shifts through 32 need no
+                    // clamp bit (it overlaps Maxwell's immediate field).
+                    self.emit(self.base(0x38f8000000000000)
+                        | (u64::from(insn.bits(24, 8)) << 8)
+                        | (u64::from(insn.words[1]) << 20)
+                        | (u64::from(insn.bits(64, 8)) << 39));
+                    return Ok(());
+                }
                 if insn.bits(80, 1) == 0
                     && insn.bits(76, 1) == 0
                     && insn.bits(64, 8) == 255
@@ -1208,7 +1775,8 @@ impl InstructionLowering<'_> {
                     );
                     return Ok(());
                 }
-                if (insn.bits(73, 2) != 3 && !is_signed)
+                let u64_left = insn.bits(73, 2) == 1 && insn.bits(76, 1) == 0;
+                if (insn.bits(73, 2) != 3 && !is_signed && !u64_left)
                     || insn.bits(75, 1) != 0
                     || insn.bits(80, 1) == 0
                     || insn.words[1] > 32
@@ -1248,13 +1816,18 @@ impl InstructionLowering<'_> {
     fn lower_special_functions_and_conversion(
         &mut self,
         opcode: u32,
-        native_predicate: u32,
+        _native_predicate: u32,
     ) -> Result<(), &'static str> {
         let insn = self.insn;
         match opcode {
-            0x308 | 0xb08 => {
+            0x308 | 0x908 | 0xb08 | 0xd08 => {
                 let operation = insn.bits(74, 6);
-                if operation > 8 || operation == 6 || operation == 7 || insn.bits(80, 12) != 0 {
+                if opcode == 0x908 && (insn.bits(24, 8) != 0 || (insn.words[2] & !0xfc00) != 0) {
+                    return Err("native immediate MUFU mode");
+                }
+                // TANH (operation 9) still requires its IR/backend prerequisite.
+                if operation > 8 || operation == 6 || operation == 7
+                    || insn.bits(80, 12) != if opcode == 0xd08 { 0x800 } else { 0 } {
                     return Err("native MUFU mode");
                 }
                 // SM70+ COS/SIN take turns; Maxwell takes radians, so retain upstream's 2pi scale.
@@ -1298,7 +1871,10 @@ impl InstructionLowering<'_> {
                         self.base(0x5ca8000000000000) | (1u64 << 8) | (2u64 << 10) | (250u64 << 20),
                     );
                 } else {
-                    let mut src = self.operand(1, true);
+                    let mut src = if opcode == 0xd08 {
+                        self.uniforms.register(insn.bits(32, 8))
+                    } else { self.operand(1, true) };
+                    if src == u32::MAX { return Err("native MUFU uniform source"); }
                     if turns {
                         src = to_radians(self, src);
                     }
@@ -1310,7 +1886,7 @@ impl InstructionLowering<'_> {
                 }
             }
             0x526 => {
-                let index_register = Self::uniform_register(insn.bits(24, 8));
+                let index_register = self.uniforms.register(insn.bits(24, 8));
                 if index_register == u32::MAX
                     || insn.bits(32, 8) != 255
                     || (insn.bits(76, 4) != 0 && insn.bits(76, 4) != 4)
@@ -1363,20 +1939,21 @@ impl InstructionLowering<'_> {
                 );
             }
             0x81a => {
-                if insn.words[2] != 0 || insn.words[1] > 32 || self.dest >= 255 {
+                if insn.words[2] & !0x200 != 0 || insn.words[1] > 32 || self.dest >= 255 {
                     return Err("native sign extend mode");
                 }
                 self.emit(
                     self.base(0x3800000000000000)
                         | (u64::from(insn.bits(24, 8)) << 8)
-                        | (u64::from(insn.words[1] << 8) << 20),
+                        | (u64::from(insn.words[1] << 8) << 20)
+                        | (u64::from(insn.bits(73, 1)) << 48),
                 );
             }
             0x299 => {
-                let dst = Self::uniform_register(insn.bits(16, 8));
-                let low = Self::uniform_register(insn.bits(24, 8));
-                let shift = Self::uniform_register(insn.bits(32, 8));
-                let high = Self::uniform_register(insn.bits(64, 8));
+                let dst = self.uniforms.register(insn.bits(16, 8));
+                let low = self.uniforms.register(insn.bits(24, 8));
+                let shift = self.uniforms.register(insn.bits(32, 8));
+                let high = self.uniforms.register(insn.bits(64, 8));
                 let right = insn.bits(76, 1) != 0;
                 let high_result = insn.bits(80, 1) != 0;
                 if dst == u32::MAX
@@ -1384,7 +1961,6 @@ impl InstructionLowering<'_> {
                     || low == u32::MAX
                     || shift == u32::MAX
                     || high == u32::MAX
-                    || native_predicate != 7
                     || insn.bits(73, 2) != 3
                     || insn.words[2] & !0x000118ff != 0x08000600
                 {
@@ -1409,8 +1985,21 @@ impl InstructionLowering<'_> {
                         | (u64::from(insn.bits(75, 1)) << 39),
                 );
             }
+            0x499 => {
+                let target = self.uniforms.register(self.dest as u32);
+                let shift = self.uniforms.register(insn.bits(64, 8));
+                if insn.bits(24, 8) != 63 || insn.words[2] & !0x8ff != 0x08010600
+                    || insn.words[3] & 0xc00001ff != 0
+                    || target == u32::MAX || target == 255 || shift == u32::MAX {
+                    return Err("native uniform immediate high-word shift mode");
+                }
+                self.mov_imm(250, insn.words[1]);
+                self.emit(0x5c48000000000000 | self.predicate | u64::from(target) | (250u64 << 8)
+                    | (u64::from(shift) << 20) | (u64::from(insn.bits(75, 1)) << 39));
+            }
             0x419 => {
-                if insn.bits(24, 8) != 255 || insn.words[2] & !0xff != 0x00010e00 {
+                if insn.bits(24, 8) != 255 || insn.words[2] & !0x8ff != 0x00010600
+                    || (insn.bits(75, 1) == 0 && insn.words[3] & 0xc00001ff != 0) {
                     return Err("native funnel shift immediate mode");
                 }
                 self.mov_imm(250, insn.words[1]);
@@ -1418,7 +2007,7 @@ impl InstructionLowering<'_> {
                     self.base(0x5c48000000000000)
                         | (250u64 << 8)
                         | (u64::from(insn.bits(64, 8)) << 20)
-                        | (1u64 << 39),
+                        | (u64::from(insn.bits(75, 1)) << 39),
                 );
             }
             0x805 => {
@@ -1430,28 +2019,47 @@ impl InstructionLowering<'_> {
             }
             0x306 | 0xd06 => {
                 let source = if opcode == 0xd06 {
-                    Self::uniform_register(insn.bits(32, 8))
+                    self.uniforms.register(insn.bits(32, 8))
                 } else {
                     insn.bits(32, 8)
                 };
-                if opcode == 0x306 && insn.words[2] == 0x00101000 && insn.words[1] & 0xcfffff00 == 0
+                if opcode == 0x306 && matches!(insn.words[2], 0x00200c00 | 0x00209400) {
+                    let half = insn.words[2] == 0x00200c00;
+                    if insn.bits(24, 8) != 0 || insn.words[1] & !0xff != 0
+                        || insn.words[3] & 0xc00001ff != 0 {
+                        return Err("native scalar integer-to-float conversion mode");
+                    }
+                    self.emit(self.base(0x5cb8000000000000)
+                        | ((if half { 1u64 } else { 2 }) << 8) | (2u64 << 10)
+                        | (1u64 << 13) | (u64::from(source) << 20)
+                        | ((if half { 0u64 } else { 2 }) << 39));
+                    return Ok(());
+                }
+                if ((opcode == 0x306 && insn.words[2] & !0x400 == 0x00101000)
+                    || (opcode == 0xd06 && insn.words[2] == 0x08101000
+                        && insn.bits(61, 1) == 0 && insn.bits(24, 8) == 0
+                        && insn.words[3] & 0xc00001ff == 0))
+                    && insn.words[1] & 0xcfffff00 == 0 && source != u32::MAX
                 {
                     self.emit(
                         self.base(0x5cb8000000000000)
                             | (2u64 << 8)
                             | (1u64 << 10)
+                            | (u64::from(insn.bits(74, 1)) << 13)
                             | (u64::from(source) << 20)
                             | (u64::from(insn.bits(60, 2) * 2) << 41),
                     );
                     return Ok(());
                 }
-                if insn.words[2] != if opcode == 0xd06 { 0x08001000 } else { 0x1000 }
-                    || insn.words[1] & 0xffffff00 != 0
+                if insn.words[2] & !0x400 != if opcode == 0xd06 { 0x08001000 } else { 0x1000 }
+                    || insn.words[1] & if opcode == 0xd06 { 0xffffff00 } else { 0xcfffff00 } != 0
                     || source == u32::MAX
                 {
                     return Err("native byte-to-float conversion mode");
                 }
-                self.emit(self.base(0x5cb8000000000000) | (2u64 << 8) | (u64::from(source) << 20));
+                self.emit(self.base(0x5cb8000000000000) | (2u64 << 8)
+                    | (u64::from(insn.bits(74, 1)) << 13) | (u64::from(source) << 20)
+                    | (u64::from(insn.bits(60, 2)) << 41));
             }
             0x245 | 0xa45 | 0xc45 => {
                 if insn.words[2] & !(0x400 | 0xc000 | if opcode == 0xc45 { 0x08000000 } else { 0 })
@@ -1651,7 +2259,18 @@ impl InstructionLowering<'_> {
                     );
                 }
             }
-            0x307 => {
+            0x307 | 0xb07 => {
+                if opcode == 0x307 && matches!(insn.words[2], 0x00100800 | 0x0010c800) {
+                    if insn.bits(24, 8) != 0 || insn.words[1] & !0x100000ff != 0
+                        || insn.words[3] & 0xc00001ff != 0 {
+                        return Err("native half round mode");
+                    }
+                    self.emit(self.base(0x5ca8000000000000) | (1u64 << 8) | (1u64 << 10)
+                        | (u64::from(insn.bits(32, 8)) << 20)
+                        | (u64::from(8 + insn.bits(78, 2)) << 39)
+                        | (u64::from(insn.bits(60, 1)) << 41));
+                    return Ok(());
+                }
                 if insn.bits(75, 2) != 2
                     || insn.bits(84, 2) != 2
                     || insn.bits(81, 3) != 0
@@ -1659,11 +2278,14 @@ impl InstructionLowering<'_> {
                 {
                     return Err("native floating round format");
                 }
+                if opcode == 0xb07 && !self.valid_cbuf() {
+                    return Err("native constant buffer address");
+                }
                 self.emit(
-                    self.base(0x5ca8000000000000)
+                    self.base(if opcode == 0xb07 { 0x4ca8000000000000 } else { 0x5ca8000000000000 })
                         | (2u64 << 8)
                         | (2u64 << 10)
-                        | (u64::from(insn.bits(32, 8)) << 20)
+                        | (if opcode == 0xb07 { self.cbuf() } else { u64::from(insn.bits(32, 8)) << 20 })
                         | (u64::from(8 + insn.bits(78, 2)) << 39)
                         | (u64::from(insn.bits(80, 1)) << 44)
                         | (u64::from(insn.bits(63, 1)) << 45)
@@ -1779,13 +2401,14 @@ impl InstructionLowering<'_> {
                             | (u64::from(insn.words[1]) << 20),
                     );
                 } else if opcode == 0xc02 {
-                    if insn.words[1] >= 16 || insn.words[2] != 0x08000f00 {
+                    let source = if insn.words[1] < 64 { self.uniforms.register(insn.words[1]) } else { u32::MAX };
+                    if source == u32::MAX || insn.words[2] != 0x08000f00 {
                         return Err("native uniform move source");
                     }
                     self.emit(
                         self.base(0x5c98000000000000)
                             | (15u64 << 39)
-                            | (u64::from(insn.words[1] + 216) << 20),
+                            | (u64::from(source) << 20),
                     );
                 } else if opcode == 0x202 {
                     if insn.bits(40, 24) != 0 {
@@ -1812,6 +2435,9 @@ impl InstructionLowering<'_> {
         &mut self,
         opcode: u32,
         required_texture_buffer: &mut u32,
+        code: &[Instruction],
+        index: u32,
+        uses_uniform_bank: bool,
     ) -> Result<(), &'static str> {
         let insn = self.insn;
         match opcode {
@@ -1886,76 +2512,188 @@ impl InstructionLowering<'_> {
                     }
                 }
             }
-            0xb63 => {
+            0xb63 | 0xf63 => {
+                let bindless = opcode == 0xf63;
+                let handle = if bindless { self.uniforms.register(insn.bits(40, 6)) } else { 255 };
                 let mask = insn.bits(72, 4);
                 let second_dest = insn.bits(64, 8);
                 let source_a = insn.bits(24, 8);
                 let source_b = insn.bits(32, 8);
                 let binding = insn.bits(54, 5);
-                if insn.bits(61, 3) != 1
-                    || insn.bits(76, 4) != 0
-                    || insn.bits(81, 3) != 7
-                    || insn.bits(59, 1) != 0
-                    || insn.bits(40, 14) > 0x1fff
-                    || binding >= 18
-                    || insn.bits(89, 1) != 0
-                    || mask == 0
-                    || (*required_texture_buffer != u32::MAX && *required_texture_buffer != binding)
-                {
-                    return Err("native texture gather mode");
+                let offsets = insn.bits(76, 1) != 0;
+                let per_tap = insn.bits(76, 2) == 2;
+                let half = insn.bits(79, 1) != 0;
+                let depth_compare = insn.bits(78, 1) != 0;
+                let register_limit = if uses_uniform_bank { self.uniforms.base() } else { 246 };
+                let array = insn.bits(61, 3) == 5;
+                let dest = self.dest as u32;
+                if bindless && array {
+                    let count = mask.count_ones();
+                    let first_count = if second_dest == 255 { count } else { count.min(2) };
+                    let second_count = count - first_count;
+                    if insn.bits(60, 1) == 0 || (insn.words[2] & !0x05800fff) != 0x081e0000
+                        || source_a + 2 > register_limit || source_b >= register_limit
+                        || (dest != 255 && dest + first_count > register_limit)
+                        || (second_dest != 255 && second_dest + second_count > register_limit)
+                        || (dest != 255 && second_dest != 255 && second_count != 0
+                            && second_dest < dest + first_count && dest < second_dest + second_count)
+                        || insn.words[3] & 0xc00001ff != 0
+                    { return Err("native uniform array texture gather mode"); }
                 }
-                *required_texture_buffer = binding;
-                self.emit(
-                    0x5c98000000000000
-                        | self.predicate
-                        | 250
-                        | (15u64 << 39)
-                        | (u64::from(source_a) << 20),
-                );
-                self.emit(
-                    0x5c98000000000000
-                        | self.predicate
-                        | 251
-                        | (15u64 << 39)
-                        | (u64::from(source_b) << 20),
-                );
-                self.emit(
-                    0xc800000000000000
-                        | self.predicate
-                        | 250
-                        | (250u64 << 8)
-                        | (255u64 << 20)
-                        | (2u64 << 28)
-                        | (u64::from(mask) << 31)
-                        | (u64::from(insn.bits(40, 14)) << 36)
-                        | (u64::from(insn.bits(90, 1)) << 49)
-                        | (7u64 << 51)
-                        | (u64::from(insn.bits(87, 2)) << 56),
-                );
+                if depth_compare {
+                    // 2D depth gather: XY in Ra/Ra+1, comparison value in Rb.
+                    // Maxwell places the comparison value in the metadata group.
+                    let count = mask.count_ones();
+                    let first = if half { 1 } else if second_dest == 255 { count } else { count.min(2) };
+                    let second = if half { 1 } else { count - first };
+                    if bindless || array || offsets || per_tap || insn.bits(60, 1) == 0
+                        || (source_a != 255 && source_a + 1 >= register_limit)
+                        || (source_b != 255 && source_b >= register_limit)
+                        || (dest != 255 && dest + first > register_limit)
+                        || (second_dest != 255 && second_dest + second > register_limit)
+                        || (dest != 255 && second_dest != 255 && second != 0
+                            && second_dest < dest + first && dest < second_dest + second)
+                    { return Err("native depth gather operands"); }
+                }
+                if (insn.bits(61, 3) != 1 && !array) || (insn.bits(77, 1) != 0 && !per_tap)
+                    || insn.bits(81, 3) != 7 || insn.bits(59, 1) != 0
+                    || (array && !bindless && (insn.bits(60, 1) == 0
+                        || (insn.words[2] & !0x058000ff) != 0x001e0f00
+                        || source_a + 2 > register_limit || source_b >= register_limit
+                        || dest + 2 > register_limit || second_dest + 2 > register_limit
+                        || (second_dest < dest + 2 && dest < second_dest + 2)
+                        || insn.words[3] & 0xc00001ff != 0))
+                    || (half && (bindless || offsets || insn.bits(60, 1) == 0
+                        || insn.bits(80, 1) != 0 || insn.bits(91, 1) != 0
+                        || (source_b != 255 && source_b >= register_limit)
+                        || mask != 15 || dest >= register_limit || second_dest >= register_limit))
+                    || (offsets && (bindless || source_b == 255 || (source_a != 255 && source_a >= 245)))
+                    || (per_tap && (bindless || insn.bits(78, 1) != 0 || insn.bits(80, 1) != 0 || insn.bits(91, 1) != 0))
+                    || insn.bits(89, 1) != 0 || mask == 0
+                    || if bindless { handle >= 246 || insn.bits(46, 13) != 0 || insn.bits(91, 1) == 0 }
+                        else { insn.bits(40, 14) > 0x1fff || binding >= 18
+                            || (*required_texture_buffer != u32::MAX && *required_texture_buffer != binding) }
+                { return Err("native texture gather mode"); }
+                if per_tap {
+                    if insn.bits(60, 1) == 0 || mask != 15 || source_a + 1 >= register_limit
+                        || source_b + 1 >= register_limit || (dest != 255 && dest + 1 >= register_limit)
+                        || (second_dest != 255 && second_dest + 1 >= register_limit)
+                    { return Err("native per-tap gather operands"); }
+                    // Reserved scratch constants must dominate the predicated
+                    // gather. Otherwise SSA merges them with undefined values
+                    // and SPIR-V cannot represent the per-tap offsets.
+                    let gather_predicate = self.predicate;
+                    self.predicate = 7 << 16;
+                    if let Some(offsets) = BoundedControl::gather_constant_offsets(code, index as usize, source_b) {
+                        for (i, packed) in offsets.into_iter().enumerate() { self.mov_imm(248 + i as u32, packed); }
+                    } else {
+                    // Only straight-line programs make the backward constant-definition proof sound.
+                    let mut terminal = false;
+                    for instruction in code {
+                        if instruction.bits(12, 4) == 15 { continue; }
+                        let op = instruction.bits(0, 12);
+                        if op == 0x94d && instruction.bits(12, 4) == 7 { terminal = true; break; }
+                        // Upstream's incidental uniform-bank update for 0x83b is unobservable:
+                        // this proof always rejects that opcode before any subsequent emission.
+                        if !matches!(op, 0x326 | 0x802 | 0x307 | 0x421 | 0xa20 | 0xb63 | 0x221
+                            | 0x823 | 0x423 | 0x223 | 0x308 | 0x220 | 0x820)
+                        { return Err("native per-tap gather control-flow proof"); }
+                    }
+                    if !terminal { return Err("native per-tap gather terminal proof"); }
+                    let mut packed_offsets: [Option<u32>; 2] = [None; 2];
+                    let mut cursor = index as usize;
+                    while cursor > 0 && packed_offsets.iter().any(Option::is_none) {
+                        cursor -= 1;
+                        let definition = code[cursor];
+                        if definition.bits(12, 4) == 15 { continue; }
+                        let op = definition.bits(0, 12);
+                        let target = definition.bits(16, 8);
+                        if op == 0xb63 {
+                            let count = definition.bits(72, 4).count_ones();
+                            let high = definition.bits(64, 8);
+                            for i in 0..2 {
+                                if packed_offsets[i].is_some() { continue; }
+                                let reg = source_b + i as u32;
+                                if (target != 255 && reg >= target
+                                    && reg < target + if high == 255 { count } else { count.min(2) })
+                                    || (high != 255 && count > 2 && reg >= high && reg < high + count - 2)
+                                { return Err("native per-tap gather offset clobber"); }
+                            }
+                            continue;
+                        }
+                        if !matches!(op, 0x802 | 0x307 | 0x421 | 0xa20) {
+                            return Err("native per-tap gather offset proof");
+                        }
+                        for i in 0..2 {
+                            if packed_offsets[i].is_some() || target != source_b + i as u32 { continue; }
+                            if op != 0x802 || definition.bits(12, 4) != 7 || definition.bits(24, 8) != 0
+                                || definition.words[2] != 0x00000f00
+                            { return Err("native per-tap gather nonconstant offsets"); }
+                            packed_offsets[i] = Some(definition.words[1]);
+                        }
+                    }
+                    for packed in packed_offsets {
+                        let packed = packed.ok_or("native per-tap gather missing offsets")?;
+                        for shift in (0..32).step_by(8) {
+                            let value = (packed >> shift) & 255;
+                            if value > 31 && value < 224 { return Err("native per-tap gather offset range"); }
+                        }
+                    }
+                    for (i, packed) in packed_offsets.into_iter().enumerate() {
+                        self.mov_imm(248 + i as u32, packed.unwrap());
+                    }
+                    }
+                    self.predicate = gather_predicate;
+                }
+                if !bindless { *required_texture_buffer = binding; }
+                let y = if !offsets && !per_tap && !depth_compare { source_b } else if source_a == 255 { 255 } else { source_a + 1 };
+                self.emit(0x5c98000000000000 | self.predicate | 250 | (15u64 << 39) | (u64::from(source_a) << 20));
+                self.emit(0x5c98000000000000 | self.predicate | 251 | (15u64 << 39)
+                    | (u64::from(if array { source_a + 1 } else { y }) << 20));
+                if array { self.emit(0x5c98000000000000 | self.predicate | 252 | (15u64 << 39) | (u64::from(source_b) << 20)); }
+                if offsets || depth_compare { self.emit(0x5c98000000000000 | self.predicate | 246 | (15u64 << 39) | (u64::from(source_b) << 20)); }
+                if bindless {
+                    self.emit(0x5c98000000000000 | self.predicate | 246 | (15u64 << 39) | (u64::from(handle) << 20));
+                    self.emit(0xdec0000000000000 | self.predicate | 250 | (250u64 << 8) | (246u64 << 20)
+                        | ((if array { 3u64 } else { 2 }) << 28) | (u64::from(mask) << 31)
+                        | (u64::from(insn.bits(87, 2)) << 38) | (u64::from(insn.bits(90, 1)) << 49) | (7u64 << 51));
+                } else {
+                    self.emit(0xc800000000000000 | self.predicate | 250 | (250u64 << 8)
+                        | ((if per_tap { 248u64 } else if offsets || depth_compare { 246 } else { 255 }) << 20)
+                        | ((if array { 3u64 } else { 2 }) << 28) | (u64::from(mask) << 31)
+                        | (u64::from(insn.bits(40, 14)) << 36) | (u64::from(insn.bits(90, 1)) << 49)
+                        | (u64::from(depth_compare) << 50)
+                        | (7u64 << 51) | ((if per_tap { 2u64 } else if offsets { 1 } else { 0 }) << 54)
+                        | (u64::from(insn.bits(87, 2)) << 56));
+                }
+                if half {
+                    for i in 0u32..2 {
+                        self.emit(0x5ca8000000000000 | self.predicate | 246 | (1u64 << 8) | (2u64 << 10)
+                            | (u64::from(250 + i * 2) << 20));
+                        self.emit(0x5ca8000000000000 | self.predicate | 247 | (1u64 << 8) | (2u64 << 10)
+                            | (u64::from(251 + i * 2) << 20));
+                        self.emit(0x5c18000000000000 | self.predicate | u64::from(if i == 0 { dest } else { second_dest })
+                            | (247u64 << 8) | (246u64 << 20) | (16u64 << 39));
+                    }
+                    return Ok(());
+                }
                 let components = mask.count_ones();
                 let split = second_dest != 255;
                 for i in 0..components {
-                    let target = if !split || i < 2 {
-                        if self.dest == 255 {
-                            255
-                        } else {
-                            self.dest as u32 + i
-                        }
-                    } else {
-                        second_dest + (i - 2)
-                    };
-                    if target != 255 {
-                        self.emit(
-                            0x5c98000000000000
-                                | self.predicate
-                                | u64::from(target)
-                                | (15u64 << 39)
-                                | (u64::from(250 + i) << 20),
-                        );
-                    }
+                    let target = if !split || i < 2 { if dest == 255 { 255 } else { dest + i } }
+                        else { second_dest + i - 2 };
+                    if target != 255 { self.emit(0x5c98000000000000 | self.predicate | u64::from(target)
+                        | (15u64 << 39) | (u64::from(250 + i) << 20)); }
                 }
             }
-            0xb60 => {
+            0xb60 | 0xf60 | 0x361 => {
+                // Fritchii TEX: uniform or register handles become Maxwell TEX.B metadata.
+                let bindless = opcode != 0xb60;
+                let handle = if opcode == 0xf60 { self.uniforms.register(insn.bits(40, 6)) } else { 255 };
+                if bindless && ((opcode == 0xf60 && (handle >= 246 || insn.bits(46, 13) != 0))
+                    || (opcode == 0x361 && (insn.bits(40, 19) != 0 || insn.bits(87, 3) > 3))) {
+                    return Err("native bindless texture mode");
+                }
                 let mask = insn.bits(72, 4);
                 let second_dest = insn.bits(64, 8);
                 const RG_MASKS: [u32; 8] = [1, 2, 4, 8, 3, 9, 10, 12];
@@ -1967,13 +2705,14 @@ impl InstructionLowering<'_> {
                 let lod = insn.bits(87, 3);
                 let source_a = insn.bits(24, 8);
                 let source_b = insn.bits(32, 8);
-                if dimension == 5 && depth_compare && lod == 0 && !split && mask == 1 {
+                if !bindless && dimension == 5 && depth_compare && lod == 0 && !split && mask == 1
+                    && (*required_texture_buffer == u32::MAX || *required_texture_buffer == insn.bits(54, 5)) {
                     if insn.bits(60, 1) == 0
                         || insn.bits(76, 2) != 0
                         || insn.bits(81, 3) != 7
                         || insn.bits(59, 1) != 0
                         || insn.bits(40, 14) > 0x1fff
-                        || insn.bits(54, 5) != 2
+                        || insn.bits(54, 5) >= 18
                         || source_a & 1 != 0
                         || source_b & 1 != 0
                         || source_a >= 248
@@ -1982,7 +2721,7 @@ impl InstructionLowering<'_> {
                     {
                         return Err("native array depth comparison sample mode");
                     }
-                    *required_texture_buffer = 2;
+                    *required_texture_buffer = insn.bits(54, 5);
                     for i in 0..3u32 {
                         let source = if i < 2 { source_a + i } else { source_b };
                         self.emit(
@@ -2015,9 +2754,8 @@ impl InstructionLowering<'_> {
                     if dimension == 6
                         || insn.bits(77, 1) != 0
                         || insn.bits(81, 3) != 7
-                        || insn.bits(59, 1) != 0
-                        || insn.bits(40, 14) > 0x1fff
-                        || insn.bits(54, 5) >= 18
+                        || insn.bits(59, 1) != u32::from(opcode == 0x361)
+                        || (!bindless && (insn.bits(40, 14) > 0x1fff || insn.bits(54, 5) >= 18))
                         || (lod > 3 && lod != 6 && lod != 7)
                         || (depth_compare && mask != 1)
                         || mask == 0
@@ -2026,11 +2764,14 @@ impl InstructionLowering<'_> {
                     }
                     let coordinates = COORDINATE_COUNT[dimension as usize];
                     let has_lod = matches!(lod, 2 | 3 | 6 | 7);
-                    let count = coordinates
+                    let handle_slot = u32::from(opcode == 0x361);
+                    let count = coordinates + handle_slot
                         + u32::from(has_lod)
                         + u32::from(offsets)
                         + u32::from(depth_compare);
-                    let in_a = if count <= 4 { (count + 1) / 2 } else { 4 };
+                    let in_a = if opcode == 0x361 && insn.bits(60, 1) == 0 { coordinates }
+                        else if count <= 4 { (count + 1) / 2 }
+                        else if opcode == 0x361 { coordinates } else { 4 };
                     let value = |i: u32| -> u32 {
                         if i < in_a {
                             if source_a == 255 {
@@ -2049,11 +2790,13 @@ impl InstructionLowering<'_> {
                     {
                         return false;
                     }
+                    let texture_handle = if opcode == 0x361 { value(coordinates) } else { handle };
+                    if bindless && texture_handle >= 246 { return false; }
                     let binding = insn.bits(54, 5);
-                    if *required_texture_buffer != u32::MAX && *required_texture_buffer != binding {
-                        return false;
-                    }
-                    *required_texture_buffer = binding;
+                    let second_buffer = !bindless && *required_texture_buffer != u32::MAX
+                        && *required_texture_buffer != binding;
+                    if !bindless && !second_buffer { *required_texture_buffer = binding; }
+                    let tex_b = bindless || second_buffer;
                     let copy = |this: &mut Self, target: u32, source: u32| {
                         this.emit(
                             0x5c98000000000000
@@ -2067,7 +2810,15 @@ impl InstructionLowering<'_> {
                         copy(this, 250 + i, value(i));
                     }
                     let mut meta = 246;
-                    let mut next = coordinates;
+                    let mut next = coordinates + handle_slot;
+                    if bindless {
+                        copy(this, meta, texture_handle);
+                        meta += 1;
+                    } else if second_buffer {
+                        this.emit(0x4c98000000070000 | u64::from(meta) | (15u64 << 39)
+                            | (u64::from(insn.bits(40, 14)) << 20) | (u64::from(binding) << 34));
+                        meta += 1;
+                    }
                     if has_lod {
                         copy(this, meta, value(next));
                         meta += 1;
@@ -2082,7 +2833,13 @@ impl InstructionLowering<'_> {
                         copy(this, meta, value(next));
                         meta += 1;
                     }
-                    this.emit(
+                    if tex_b {
+                        this.emit(0xde80000000000000 | this.predicate | 250 | (250u64 << 8)
+                            | (246u64 << 20) | (u64::from(MAXWELL_TYPE[dimension as usize]) << 28)
+                            | (u64::from(mask) << 31) | (u64::from(offsets) << 36)
+                            | (u64::from(lod) << 37) | (u64::from(insn.bits(90, 1)) << 49)
+                            | (u64::from(depth_compare) << 50) | (7u64 << 51));
+                    } else { this.emit(
                         0xc000000000000000
                             | this.predicate
                             | 250
@@ -2096,7 +2853,7 @@ impl InstructionLowering<'_> {
                             | (7u64 << 51)
                             | (u64::from(offsets) << 54)
                             | (u64::from(lod) << 55),
-                    );
+                    ); }
                     let components = mask.count_ones();
                     if insn.bits(79, 1) != 0 {
                         let pack = |this: &mut Self, target: u32, low: u32, high: u32| {
@@ -2123,8 +2880,10 @@ impl InstructionLowering<'_> {
                                 0x5c18000000000000
                                     | this.predicate
                                     | u64::from(target)
-                                    | (246u64 << 8)
-                                    | (247u64 << 20)
+                                    // ISCADD shifts A: retain c0 in the low half,
+                                    // and shift c1 into the high half (Fritchii TEX.F16).
+                                    | (247u64 << 8)
+                                    | (246u64 << 20)
                                     | (16u64 << 39),
                             );
                         };
@@ -2176,7 +2935,7 @@ impl InstructionLowering<'_> {
                         }
                     }
                 }
-                if insn.bits(60, 1) == 0
+                if bindless || insn.bits(60, 1) == 0
                     || (dimension != 1 && dimension != 5)
                     || swizzle == u32::MAX
                     || insn.bits(76, 2) != 0
@@ -2196,6 +2955,7 @@ impl InstructionLowering<'_> {
                             || source_a & 1 != 0
                             || source_a >= 249))
                     || (dimension == 5 && (source_a & 1 != 0 || source_a >= 249))
+                    || (*required_texture_buffer != u32::MAX && *required_texture_buffer != 2)
                 {
                     if !general_tex(self, required_texture_buffer) {
                         return Err("native texture mode or descriptor binding");
@@ -2250,137 +3010,163 @@ impl InstructionLowering<'_> {
         match opcode {
             0x305 | 0xb05 | 0xd05 => {
                 let mode = insn.words[2] & !(if opcode == 0xd05 { 0x08000000 } else { 0 });
-                let half = opcode == 0x305 && mode == 0x0010f000;
-                let small = mode == 0x00212800;
-                let floor = (mode & !0x10100) == 0x00207000;
-                let nearest = (mode & !0x10100) == 0x00203000;
-                if (!half && !small && !floor && !nearest && (mode & !0x100) != 0x0021f000)
-                    || (opcode != 0xb05 && (insn.words[1] & 0xffffff00) != 0)
-                    || (opcode == 0xd05 && Self::uniform_register(insn.bits(32, 8)) == u32::MAX)
+                let signed_half = opcode == 0x305 && matches!(mode, 0x00103100 | 0x00107100);
+                let half = signed_half || (opcode == 0x305 && (mode & !0x100) == 0x0010f000);
+                let small = (mode & !0xc000) == 0x00212800;
+                let short_trunc = opcode == 0x305 && (mode & !0x100) == 0x0021e800;
+                let absolute = opcode == 0x305 && !half && insn.bits(62, 1) != 0;
+                let negate = opcode == 0x305 && !half && insn.bits(63, 1) != 0;
+                let byte = (mode & !0x10100) == 0x0020e000;
+                let word = (mode & !0x1c100) == 0x00203000;
+                let extended_word = word && (insn.bits(78, 2) == 2
+                    || (insn.bits(78, 2) == 3 && insn.bits(80, 1) == 0));
+                if (!half && !small && !short_trunc && !byte && !word)
+                    || (signed_half && (insn.bits(24, 8) != 0 || insn.words[3] & 0xc00001ff != 0))
+                    || ((byte || small || short_trunc || extended_word)
+                        && (insn.bits(24, 8) != 0 || insn.words[3] & 0xc00001ff != 0
+                            || (opcode == 0xb05 && (insn.bits(63, 1) != 0
+                                || (!small && insn.bits(62, 1) != 0)
+                                || (small && insn.bits(59, 3) != 0)))
+                            || insn.bits(91, 1) != u32::from(opcode == 0xd05)))
+                    || (opcode != 0xb05 && (insn.words[1] & !(if half { 0x100000ff }
+                        else { 0xff | if absolute { 0x40000000 } else { 0 }
+                            | if negate { 0x80000000 } else { 0 } })) != 0)
+                    || (opcode == 0xd05 && self.uniforms.register(insn.bits(32, 8)) == u32::MAX)
                 {
                     return Err("native float-to-integer conversion mode");
                 }
                 let is_signed = insn.bits(72, 1) != 0;
                 let mut source = if opcode == 0xb05 {
-                    self.materialize(2, 0, 252, false, false)
-                } else if opcode == 0xd05 {
-                    Self::uniform_register(insn.bits(32, 8))
-                } else {
-                    insn.bits(32, 8)
-                };
+                    self.materialize(2, 0, 252, small && insn.bits(62, 1) != 0, false)
+                } else if opcode == 0xd05 { self.uniforms.register(insn.bits(32, 8)) }
+                else { insn.bits(32, 8) };
                 if half {
-                    self.extract_half(
-                        HalfSource {
-                            reg: source,
-                            swizzle: 2,
-                            absolute: false,
-                            negate: false,
-                        },
-                        0,
-                        252,
-                    );
+                    self.extract_half(HalfSource { reg: source,
+                        swizzle: if insn.bits(60, 1) != 0 { 3 } else { 2 },
+                        absolute: false, negate: false }, 0, 252);
                     source = 252;
                 }
-                if !is_signed {
-                    self.emit(
-                        0x5800000000000000
-                            | self.predicate
-                            | 250
-                            | (u64::from(source) << 8)
-                            | (u64::from(source) << 20)
-                            | (7u64 << 39)
-                            | (7u64 << 48),
-                    );
-                    self.emit(
-                        0x5c40000000000000
-                            | self.predicate
-                            | 250
-                            | (u64::from(source) << 8)
-                            | (250u64 << 20)
-                            | (7u64 << 48),
-                    );
-                    if !small {
+                if absolute || negate {
+                    source = self.materialize(0, source, 249, absolute, negate);
+                }
+                if signed_half {
+                    self.mov_imm(253, 0x47800000);
+                    self.emit(0x5800000000000000 | self.predicate | 250 | (252u64 << 8)
+                        | (253u64 << 20) | (7u64 << 39) | (1u64 << 48) | (1u64 << 54));
+                    self.emit(0x5800000000000000 | self.predicate | 251 | (252u64 << 8)
+                        | (253u64 << 20) | (7u64 << 39) | (4u64 << 48));
+                    self.mov_imm(253, 0xc7800000);
+                    self.emit(0x5800000000000000 | self.predicate | 253 | (252u64 << 8)
+                        | (253u64 << 20) | (7u64 << 39) | (1u64 << 48));
+                    self.emit(0x5c40000000000000 | self.predicate | 252 | (252u64 << 8)
+                        | (250u64 << 20) | (7u64 << 48));
+                    self.emit(self.base(0x5cb0000000000000) | (2u64 << 8) | (2u64 << 10)
+                        | (1u64 << 12) | (252u64 << 20) | (u64::from(insn.bits(78, 2)) << 39));
+                    self.mov_imm(250, 0x7fffffff);
+                    self.emit(0x5c40000000000000 | self.predicate | 251 | (251u64 << 8)
+                        | (250u64 << 20) | (7u64 << 48));
+                    self.mov_imm(250, 0x80000000);
+                    self.emit(0x5c40000000000000 | self.predicate | 253 | (253u64 << 8)
+                        | (250u64 << 20) | (7u64 << 48));
+                    self.emit(self.base(0x5c40000000000000) | (self.dest << 8) | (251u64 << 20)
+                        | (1u64 << 41) | (7u64 << 48));
+                    self.emit(self.base(0x5c40000000000000) | (self.dest << 8) | (253u64 << 20)
+                        | (1u64 << 41) | (7u64 << 48));
+                    return Ok(());
+                }
+                if byte {
+                    self.emit(0x5800000000000000 | self.predicate | 250 | (u64::from(source) << 8)
+                        | (u64::from(source) << 20) | (7u64 << 39) | (7u64 << 48));
+                    self.emit(0x5c40000000000000 | self.predicate | 250 | (u64::from(source) << 8)
+                        | (250u64 << 20) | (7u64 << 48));
+                    self.mov_imm(252, if is_signed { 0xc3000000 } else { 0 });
+                    self.emit(0x5c60000000000000 | self.predicate | 250 | (250u64 << 8)
+                        | (252u64 << 20) | (15u64 << 39));
+                    self.mov_imm(252, if is_signed { 0x42fe0000 } else { 0x437f0000 });
+                    self.emit(0x5c60000000000000 | self.predicate | 250 | (250u64 << 8)
+                        | (252u64 << 20) | (7u64 << 39));
+                    source = 250;
+                } else if !is_signed {
+                    // Clear NaNs without consuming a guest predicate, and retain
+                    // the overflow mask when clamping conversion below 2^32.
+                    self.emit(0x5800000000000000 | self.predicate | 250 | (u64::from(source) << 8)
+                        | (u64::from(source) << 20) | (7u64 << 39) | (7u64 << 48));
+                    self.emit(0x5c40000000000000 | self.predicate | 250 | (u64::from(source) << 8)
+                        | (250u64 << 20) | (7u64 << 48));
+                    if !small && !short_trunc {
                         self.mov_imm(252, 0x4f800000);
-                        self.emit(
-                            0x5800000000000000
-                                | self.predicate
-                                | 251
-                                | (250u64 << 8)
-                                | (252u64 << 20)
-                                | (7u64 << 39)
-                                | (6u64 << 48),
-                        );
+                        self.emit(0x5800000000000000 | self.predicate | 251 | (250u64 << 8)
+                            | (252u64 << 20) | (7u64 << 39) | (6u64 << 48));
                         self.mov_imm(252, 0x4f7fffff);
-                        self.emit(
-                            0x5c60000000000000
-                                | self.predicate
-                                | 250
-                                | (250u64 << 8)
-                                | (252u64 << 20)
-                                | (7u64 << 39),
-                        );
+                        self.emit(0x5c60000000000000 | self.predicate | 250 | (250u64 << 8)
+                            | (252u64 << 20) | (7u64 << 39));
                     }
                     source = 250;
                 }
-                self.emit(
-                    self.base(0x5cb0000000000000)
-                        | ((if small { 1u64 } else { 2 }) << 8)
-                        | (2u64 << 10)
-                        | (u64::from(is_signed) << 12)
-                        | (u64::from(source) << 20)
-                        | ((if small || nearest {
-                            0u64
-                        } else if floor {
-                            1
-                        } else {
-                            3
-                        }) << 39)
-                        | (u64::from(insn.bits(80, 1)) << 44),
-                );
-                if !is_signed && !small {
-                    self.emit(
-                        self.base(0x5c40000000000000)
-                            | (self.dest << 8)
-                            | (251u64 << 20)
-                            | (1u64 << 41)
-                            | (7u64 << 48),
-                    );
+                self.emit(self.base(0x5cb0000000000000) | ((if small || short_trunc { 1u64 } else { 2 }) << 8)
+                    | (2u64 << 10) | (u64::from(is_signed) << 12) | (u64::from(source) << 20)
+                    | (u64::from(insn.bits(78, 2)) << 39) | (u64::from(insn.bits(80, 1)) << 44));
+                if !is_signed && !small && !short_trunc && !byte {
+                    self.emit(self.base(0x5c40000000000000) | (self.dest << 8) | (251u64 << 20)
+                        | (1u64 << 41) | (7u64 << 48));
                 }
             }
-            0xb6f => {
-                if insn.bits(59, 5) != 0
-                    || insn.bits(64, 8) != 255
-                    || insn.bits(72, 4) == 0
-                    || insn.bits(72, 4) > 3
-                    || insn.bits(76, 14) != 0
-                    || insn.bits(91, 1) != 0
-                    || insn.bits(54, 5) != 2
+            0xb6f | 0x370 => {
+                let bindless = opcode == 0x370;
+                let binding = insn.bits(54, 5);
+                let mask = insn.bits(72, 4);
+                let components = mask.count_ones();
+                let second_dest = insn.bits(64, 8);
+                let direct = second_dest == 255;
+                if insn.bits(59, 5) != u32::from(bindless) || mask == 0
+                    || (direct && components > 2) || insn.bits(76, 14) != 0
+                    || insn.bits(91, 1) != 0 || (!bindless && binding >= 18)
+                    || (bindless && (insn.bits(32, 27) != 0 || insn.bits(24, 8) >= 245))
+                    || (!direct && (second_dest >= 245 || self.dest >= 245))
                     || insn.bits(40, 14) > 0x1fff
-                    || (insn.bits(72, 4) == 3 && self.dest & 1 != 0)
-                    || self.dest >= 254
-                {
+                    || (direct && components == 2 && self.dest & 1 != 0) || self.dest >= 254 {
                     return Err("native texture dimension query mode");
                 }
-                *required_texture_buffer = 2;
-                self.emit(
-                    0xdf48000000000000
-                        | self.predicate
-                        | self.dest
-                        | (u64::from(insn.bits(24, 8)) << 8)
-                        | (1u64 << 22)
-                        | (u64::from(insn.bits(72, 4)) << 31)
-                        | (u64::from(insn.bits(40, 14)) << 36)
-                        | (u64::from(insn.bits(90, 1)) << 49),
-                );
+                if !bindless {
+                    if *required_texture_buffer != u32::MAX && *required_texture_buffer != binding {
+                        return Err("native texture descriptor buffer conflict");
+                    }
+                    *required_texture_buffer = binding;
+                }
+                self.emit((if bindless { 0xdf50000000000000 } else { 0xdf48000000000000 })
+                    | self.predicate | (if direct { self.dest } else { 250 })
+                    | (u64::from(insn.bits(24, 8)) << 8) | (1u64 << 22)
+                    | (u64::from(mask) << 31)
+                    | (u64::from(if bindless { 0 } else { insn.bits(40, 14) }) << 36)
+                    | (u64::from(insn.bits(90, 1)) << 49));
+                if !direct {
+                    for i in 0..components {
+                        let target = if i < 2 {
+                            if self.dest == 255 { 255 } else { self.dest as u32 + i }
+                        } else { second_dest + i - 2 };
+                        if target != 255 {
+                            self.emit(0x5c98000000000000 | self.predicate | u64::from(target)
+                                | (15u64 << 39) | (u64::from(250 + i) << 20));
+                        }
+                    }
+                }
             }
             0xb66 => {
-                let mask = insn.bits(72, 4);
+                let mut mask = insn.bits(72, 4);
+                let level = insn.bits(87, 3) == 3;
+                let offsets = insn.bits(76, 1) != 0;
+                let half = insn.bits(79, 1) != 0;
                 let dimension = insn.bits(61, 3);
                 let array = dimension == 5;
                 let volume = dimension == 2;
                 let source_a = insn.bits(24, 8);
                 let mut source_b = insn.bits(32, 8);
-                let second_dest = insn.bits(64, 8);
+                let mut second_dest = insn.bits(64, 8);
+                // TLDS has no single-pair R+B/G+B swizzle: discard the added alpha in R246.
+                if second_dest == 255 && matches!(mask, 5 | 6) {
+                    mask |= 8;
+                    second_dest = 246;
+                }
                 let split = second_dest != 255;
                 const RG_MASKS: [u32; 8] = [1, 2, 4, 8, 3, 9, 10, 12];
                 const RGBA_MASKS: [u32; 5] = [7, 11, 13, 14, 15];
@@ -2401,15 +3187,21 @@ impl InstructionLowering<'_> {
                 if insn.bits(60, 1) == 0
                     || (dimension != 0 && dimension != 1 && !array && !volume)
                     || swizzle == u32::MAX
-                    || insn.bits(76, 5) != 0
+                    || insn.bits(76, 5) & !0x9 != 0
+                    || (half && array && level)
+                    || (offsets && (dimension != 1 || source_a & 1 != 0 || source_a >= 254
+                        || source_b == 255 || (level && (source_b & 1 != 0 || source_b >= 254))))
                     || insn.bits(81, 3) != 7
-                    || insn.bits(87, 3) != 1
+                    || (insn.bits(87, 3) != 1 && !level)
+                    || (level && volume)
+                    || (level && dimension == 1 && (source_a & 1 != 0 || source_a >= 254))
+                    || (level && array && (source_b & 1 != 0 || source_b >= 254))
                     || insn.bits(59, 1) != 0
                     || insn.bits(40, 14) > 0x1fff
                     || insn.bits(54, 5) >= 18
                     || self.dest == 255
-                    || (mask & (mask - 1) != 0 && (self.dest & 1 != 0 || self.dest >= 254))
-                    || (split && mask == 15 && (second_dest & 1 != 0 || second_dest >= 254))
+                    || (!half && mask & (mask - 1) != 0 && (self.dest & 1 != 0 || self.dest >= 254))
+                    || (!half && split && mask == 15 && (second_dest & 1 != 0 || second_dest >= 254))
                     || (array && (source_a & 1 != 0 || source_a >= 249))
                     || (volume && (source_a & 1 != 0 || source_a >= 254))
                 {
@@ -2417,46 +3209,57 @@ impl InstructionLowering<'_> {
                 }
                 let binding = insn.bits(54, 5);
                 if *required_texture_buffer != u32::MAX && *required_texture_buffer != binding {
-                    return Err("native texture descriptor buffer conflict");
+                    if level || offsets || half { return Err("native texture descriptor buffer conflict"); }
+                    // A second descriptor buffer: TLD.B (LZ) with the coordinates in R250.. (array
+                    // index or Z after Ra) and the handle, loaded from that buffer, in R253.
+                    let copy = |this: &mut Self, target: u32, source: u32| {
+                        this.emit(0x5c98000000000000 | this.predicate | u64::from(target) | (15u64 << 39) | (u64::from(source) << 20));
+                    };
+                    copy(self, 250, source_a);
+                    if array || volume { copy(self, 251, source_a + 1); }
+                    if dimension != 0 { copy(self, if array || volume { 252 } else { 251 }, source_b); }
+                    self.emit(0x4c98000000070000 | 253 | (15u64 << 39) | (u64::from(insn.bits(40, 14)) << 20) |
+                         (u64::from(binding) << 34));
+                    self.emit(0xdd00000000000000 | self.predicate | 250 | (250u64 << 8) | (253u64 << 20) |
+                         (u64::from(if array { 3u32 } else if volume { 4 } else if dimension == 0 { 0 } else { 2 }) << 28) | (u64::from(mask) << 31) |
+                         (u64::from(insn.bits(90, 1)) << 49) | (7u64 << 51));
+                    let components = mask.count_ones();
+                    for i in 0..components {
+                        copy(self, if i < 2 || !split { self.dest as u32 + i } else { second_dest + i - 2 }, 250 + i);
+                    }
+                    return Ok(());
                 }
                 *required_texture_buffer = binding;
+                if array && level {
+                    // TLDS has no array form with a level: TLD takes (layer, x, y) from Ra and the level
+                    // from Rb (layer, x in Ra, Ra+1; y, level in Rb, Rb+1 here). Results come out packed,
+                    // then go where the Ampere destinations (Rd, Rd+1, then the second pair) take them.
+                    for i in 0u32..2 {
+                        self.emit(0x5c98000000000000 | self.predicate | u64::from(250 + i) | (15u64 << 39) | (u64::from(source_a + i) << 20));
+                        self.emit(0x5c98000000000000 | self.predicate | u64::from(252 + i) | (15u64 << 39) | (u64::from(source_b + i) << 20));
+                    }
+                    self.emit(0xdc00000000000000 | self.predicate | 246 | (250u64 << 8) | (253u64 << 20) |
+                         (3u64 << 28) | (u64::from(mask) << 31) | (u64::from(insn.bits(40, 14)) << 36) |
+                         (u64::from(insn.bits(90, 1)) << 49) | (7u64 << 51) | (1u64 << 55));
+                    let components = mask.count_ones();
+                    for i in 0..components {
+                        let target = if !split || i < 2 { self.dest as u32 + i } else { second_dest + i - 2 };
+                        if target != 255 && (split || i < 2) {
+                            self.emit(0x5c98000000000000 | self.predicate | u64::from(target) | (15u64 << 39) | (u64::from(246 + i) << 20));
+                        }
+                    }
+                    return Ok(());
+                }
                 if array {
-                    self.emit(
-                        0x5c98000000000000
-                            | self.predicate
-                            | 250
-                            | (15u64 << 39)
-                            | (u64::from(source_a + 1) << 20),
-                    );
-                    self.emit(
-                        0x5c98000000000000
-                            | self.predicate
-                            | 251
-                            | (15u64 << 39)
-                            | (u64::from(source_b) << 20),
-                    );
+                    self.emit(0x5c98000000000000 | self.predicate | 250 | (15u64 << 39) | (u64::from(source_a + 1) << 20));
+                    self.emit(0x5c98000000000000 | self.predicate | 251 | (15u64 << 39) | (u64::from(source_b) << 20));
                     source_b = 250;
                 }
-                self.emit(
-                    0xda00000000000000
-                        | self.predicate
-                        | self.dest
-                        | (u64::from(source_a) << 8)
-                        | (u64::from(source_b) << 20)
-                        | (u64::from(insn.bits(64, 8)) << 28)
-                        | (u64::from(insn.bits(40, 14)) << 36)
-                        | (u64::from(insn.bits(90, 1)) << 49)
-                        | (u64::from(swizzle) << 50)
-                        | ((if array {
-                            8u64
-                        } else if volume {
-                            7
-                        } else if dimension == 0 {
-                            0
-                        } else {
-                            2
-                        }) << 53),
-                );
+                self.emit((0xda00000000000000 & !(u64::from(half) << 59)) | self.predicate | self.dest | (u64::from(source_a) << 8) |
+                     (u64::from(source_b) << 20) | (u64::from(second_dest) << 28) |
+                     (u64::from(insn.bits(40, 14)) << 36) | (u64::from(insn.bits(90, 1)) << 49) |
+                     (u64::from(swizzle) << 50) |
+                     (u64::from(if offsets { if level { 12u32 } else { 4 } } else if array { 8 } else if volume { 7 } else if dimension == 0 { if level { 1 } else { 0 } } else if level { 5 } else { 2 }) << 53));
             }
             0x91a => {
                 if insn.words[0] != 0x791a
@@ -2478,11 +3281,26 @@ impl InstructionLowering<'_> {
         opcode: u32,
         code: &[Instruction],
         index: u32,
+        relocations: &[Relocation],
     ) -> Result<(), &'static str> {
         let insn = self.insn;
         match opcode {
             0x919 | 0x9c3 => {
                 let special = insn.bits(72, 8);
+                if special == 132 && insn.words[1] == 0 && insn.words[2] == special << 8 {
+                    // Fritchii SR_VARIABLE_RATE: without variable-rate shading,
+                    // fragment width and height are 1 in bytes 1 and 2.
+                    let target = if opcode == 0x9c3 {
+                        self.uniforms.register(self.dest as u32)
+                    } else {
+                        self.dest as u32
+                    };
+                    if target == u32::MAX {
+                        return Err("native uniform special destination");
+                    }
+                    self.mov_imm(target, 0x00010100);
+                    return Ok(());
+                }
                 if insn.words[1] != 0
                     || insn.words[2] != special << 8
                     || !matches!(
@@ -2493,7 +3311,7 @@ impl InstructionLowering<'_> {
                     return Err("native special register");
                 }
                 let target = if opcode == 0x9c3 {
-                    Self::uniform_register(self.dest as u32)
+                    self.uniforms.register(self.dest as u32)
                 } else {
                     self.dest as u32
                 };
@@ -2509,67 +3327,92 @@ impl InstructionLowering<'_> {
             }
             0x28c | 0x88c => {
                 let output = insn.bits(81, 3);
-                let a = Self::uniform_register(insn.bits(24, 8));
+                let a = self.uniforms.register(insn.bits(24, 8));
                 let b = if opcode == 0x88c {
                     252
                 } else {
-                    Self::uniform_register(insn.bits(32, 8))
+                    self.uniforms.register(insn.bits(32, 8))
                 };
+                let combine = insn.bits(87, 3);
+                let combine_op = insn.bits(74, 2);
                 if output > 6
                     || insn.bits(84, 3) != 7
-                    || insn.bits(87, 4) != 7
-                    || insn.bits(72, 4) & !2 != 0
-                    || insn.bits(12, 4) != 7
+                    || insn.bits(72, 1) != 0 || combine_op == 3
                     || a == u32::MAX
                     || b == u32::MAX
                 {
                     return Err("native uniform comparison mode");
                 }
                 let temporary = 6 - output;
-                let mask = 1u32 << temporary;
+                let combine_slot = if combine == 7 { 7 } else { 6 - combine };
+                let combine_mask = if combine == 7 { 0 } else { 1u32 << combine_slot };
+                let native_predicate = insn.bits(12, 4);
+                let guard_slot = 6u32.wrapping_sub(native_predicate & 7);
+                let guarded = native_predicate != 7;
+                let temporary_mask = 1u32 << temporary;
+                // !PT is skipped by the program loop; keep isolated helper calls defined too.
+                let guard_mask = 1u32.checked_shl(guard_slot).unwrap_or(0);
+                let load_mask = combine_mask | if guarded { temporary_mask | guard_mask } else { 0 };
+                let mask = temporary_mask | load_mask;
                 if opcode == 0x88c {
-                    self.mov_imm(252, insn.words[1]);
+                    self.emit(0x0100000000000000 | (7u64 << 16) | 252 | (15u64 << 12)
+                        | (u64::from(insn.words[1]) << 20));
                 }
                 self.emit(0x38e8000000070000 | 253 | (255u64 << 8) | (u64::from(mask) << 20));
+                if load_mask != 0 {
+                    self.emit(0x38f0000000070000 | (239u64 << 8) | (u64::from(load_mask) << 20));
+                }
                 self.emit(
-                    0x5b60000000070000
+                    0x5b60000000000000
+                        | (u64::from(if guarded { (native_predicate & 8) | guard_slot } else { 7 }) << 16)
                         | 7
                         | (u64::from(temporary) << 3)
                         | (u64::from(a) << 8)
                         | (u64::from(b) << 20)
-                        | (7u64 << 39)
+                        | (u64::from(combine_slot) << 39)
+                        | (u64::from(insn.bits(90, 1)) << 42)
+                        | (u64::from(combine_op) << 45)
                         | (u64::from(insn.bits(73, 1)) << 48)
                         | (u64::from(insn.bits(76, 3)) << 49),
                 );
-                self.emit(0x38e8000000070000 | 239 | (239u64 << 8) | (u64::from(mask) << 20));
+                self.emit(0x38e8000000070000 | 239 | (239u64 << 8) | (u64::from(temporary_mask) << 20));
                 self.emit(0x38f0000000070000 | (253u64 << 8) | (u64::from(mask) << 20));
             }
             0x287 | 0x887 => {
                 let condition = insn.bits(87, 3);
-                let target = Self::uniform_register(self.dest as u32);
-                let a = Self::uniform_register(insn.bits(24, 8));
+                let target = self.uniforms.register(self.dest as u32);
+                let a = self.uniforms.register(insn.bits(24, 8));
                 let b = if opcode == 0x887 {
                     252
                 } else {
-                    Self::uniform_register(insn.bits(32, 8))
+                    self.uniforms.register(insn.bits(32, 8))
                 };
                 if condition > 6
                     || target == u32::MAX
                     || a == u32::MAX
                     || b == u32::MAX
-                    || insn.bits(12, 4) != 7
                     || (insn.words[2] & !0x07800000) != 0x08000000
                 {
                     return Err("native uniform select mode");
                 }
-                if opcode == 0x887
-                    && index > 0
+                let native_predicate = insn.bits(12, 4);
+                let guard_slot = 6u32.wrapping_sub(native_predicate & 7);
+                let mut compare = index;
+                for back in 1..=8.min(index) {
+                    let earlier = code[(index - back) as usize].bits(0, 12);
+                    let datapath = earlier & 0x1ff;
+                    if earlier == 0x88c { compare = index - back; break; }
+                    if (0x080..=0x0bf).contains(&datapath) || (0x1c2..=0x1c4).contains(&datapath)
+                        || (0x940..=0x95f).contains(&earlier) { break; }
+                }
+                let target_between = relocations.iter().any(|r| r.target > i64::from(compare) && r.target <= i64::from(index));
+                if opcode == 0x887 && native_predicate == 7 && compare < index && !target_between
                     && condition == 0
                     && insn.words[1] <= 0x7ffff
-                    && code[index as usize - 1].bits(0, 12) == 0x88c
-                    && code[index as usize - 1].bits(24, 8) == insn.bits(24, 8)
-                    && code[index as usize - 1].words[1] == insn.words[1]
-                    && code[index as usize - 1].words[2] == 0x0bf01070
+                    && code[compare as usize].bits(12, 4) == 7
+                    && code[compare as usize].bits(24, 8) == insn.bits(24, 8)
+                    && code[compare as usize].words[1] == insn.words[1]
+                    && code[compare as usize].words[2] == 0x0bf01070
                     && insn.words[2] == 0x08000000
                 {
                     self.emit(
@@ -2582,14 +3425,16 @@ impl InstructionLowering<'_> {
                     return Ok(());
                 }
                 if opcode == 0x887 {
-                    self.mov_imm(252, insn.words[1]);
+                    self.emit(0x0100000000000000 | (7u64 << 16) | 252 | (15u64 << 12)
+                        | (u64::from(insn.words[1]) << 20));
                 }
                 let temporary = 6 - condition;
-                let mask = 1u32 << temporary;
+                let mask = (1u32 << temporary) | if native_predicate != 7 && guard_slot < 7 { 1 << guard_slot } else { 0 };
                 self.emit(0x38e8000000070000 | 253 | (255u64 << 8) | (u64::from(mask) << 20));
                 self.emit(0x38f0000000070000 | (239u64 << 8) | (u64::from(mask) << 20));
                 self.emit(
-                    0x5ca0000000070000
+                    0x5ca0000000000000
+                        | (u64::from((native_predicate & 8) | if native_predicate != 7 { guard_slot } else { 7 }) << 16)
                         | u64::from(target)
                         | (u64::from(a) << 8)
                         | (u64::from(b) << 20)
@@ -2617,7 +3462,7 @@ impl InstructionLowering<'_> {
                     let uniform_address = if insn.bits(38, 2) != 0 {
                         u32::MAX
                     } else {
-                        Self::uniform_register(insn.bits(32, 6))
+                        self.uniforms.register(insn.bits(32, 6))
                     };
                     if (insn.words[2] & !(0x04000000 | 0x3f | 0xe00 | 0x2000)) != 0x081e8100
                         || uniform_address == u32::MAX
@@ -2682,7 +3527,7 @@ impl InstructionLowering<'_> {
                 let mut address = insn.bits(24, 8);
                 let extended = insn.bits(72, 1) != 0;
                 if opcode == 0x986 {
-                    let uniform_address = Self::uniform_register(insn.bits(64, 6));
+                    let uniform_address = self.uniforms.register(insn.bits(64, 6));
                     if (insn.words[2] & !(0x04000000 | 0x3f | 0xe00)) != 0x0810a100
                         || uniform_address == u32::MAX
                         || uniform_address & 1 != 0
@@ -2742,153 +3587,83 @@ impl InstructionLowering<'_> {
         Ok(())
     }
 
-    fn lower_matrix_multiply(&mut self) -> Result<(), &'static str> {
-        // Upstream function-local static getenv: snapshot on the first HMMA.
-        static MODE: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
-        let Some(mode) = MODE.get_or_init(|| std::env::var_os("EDEN_NX2_TENSOR")) else {
-            return Err("native matrix multiply (set EDEN_NX2_TENSOR to emulate)");
-        };
+    fn lower_matrix_multiply(&mut self, uses_uniform_bank: bool, compact_matrix: bool) -> Result<(), &'static str> {
+        // Fritchii HMMA software warp expansion (compact_matrix=false).
         let insn = self.insn;
         let a = insn.bits(24, 8);
         let b = insn.bits(32, 8);
         let c = insn.bits(64, 8);
-        if (insn.words[1] & !0xff) != 0
-            || (insn.words[2] & !0xff) != 0x800
-            || self.dest + 2 > 246
-            || a + 4 > 246
-            || b + 2 > 246
-            || (c != 255 && c + 2 > 246)
-        {
-            return Err("native matrix multiply mode");
+        let mode = insn.words[2] & !0xff;
+        let depth = if mode == 0 { 8 } else { 16 };
+        let a_count = depth / 4;
+        let b_count = depth / 8;
+        let limit = if uses_uniform_bank { self.uniforms.base() } else { 246 };
+        if insn.bits(12, 4) != 7 || (mode != 0 && mode != 0x800)
+            || insn.words[1] & !0xff != 0 || insn.words[3] & 0xc00001ff != 0
+            || self.dest % 2 != 0 || self.dest + 2 > u64::from(limit)
+            || a % a_count != 0 || a + a_count > limit
+            || b % b_count != 0 || b + b_count > limit
+            || (c != 255 && (c % 2 != 0 || c + 2 > limit)) {
+            return Err("native half matrix multiply mode");
         }
-        if mode == "stub" {
-            // Explicit upstream experimental mode, never selected by default.
-            for row in 0..2u32 {
-                if c == 255 {
-                    self.mov_imm(self.dest as u32 + row, 0);
-                } else if u64::from(c) != self.dest {
-                    self.emit(
-                        0x5c98000000000000
-                            | self.predicate
-                            | (self.dest + u64::from(row))
-                            | (15u64 << 39)
-                            | (u64::from(c + row) << 20),
-                    );
-                }
-            }
+        if compact_matrix {
+            self.emit(0x5d30000000000000 | self.predicate | self.dest | (u64::from(a) << 8)
+                | (u64::from(b) << 20) | (u64::from(c) << 39) | (1u64 << 48)
+                | (u64::from(depth == 8) << 49));
             return Ok(());
         }
-        // The explicit context argument preserves the local C++ helper boundaries
-        // without simultaneous mutable captures of the emitted instruction vector.
-        let shuffle = |this: &mut Self, target: u32, source_reg: u32| {
-            this.emit(
-                0xef10000000000000
-                    | this.predicate
-                    | u64::from(target)
-                    | (u64::from(source_reg) << 8)
-                    | (246u64 << 20)
-                    | (1u64 << 29)
-                    | (31u64 << 34)
-                    | (7u64 << 48),
-            );
+        // Four accumulators and five temporaries are confined to R246..R254.
+        let shuffle = |this: &mut Self, target: u32, source: u32, lane: u32| {
+            this.emit(0xef10000000000000 | this.predicate | u64::from(target)
+                | (u64::from(source) << 8) | (u64::from(lane) << 20)
+                | (1u64 << 29) | (0x1fu64 << 34) | (7u64 << 48));
         };
-        let lane_a = |this: &mut Self, i: u32| {
-            this.emit(0xf0c8000000000000 | this.predicate | 246);
-            this.emit(0x0400000000000000 | this.predicate | 246 | (246u64 << 8) | (0x1cu64 << 20));
-            if i != 0 {
-                this.emit(
-                    0x1c00000000000000
-                        | this.predicate
-                        | 246
-                        | (246u64 << 8)
-                        | (u64::from(i) << 20),
-                );
-            }
+        let round_half = |this: &mut Self, reg: u32| {
+            this.emit(0x5ca8000000000000 | this.predicate | u64::from(reg)
+                | (1u64 << 8) | (2u64 << 10) | (u64::from(reg) << 20));
         };
-        let lane_b = |this: &mut Self, add: u32| {
-            this.emit(0xf0c8000000000000 | this.predicate | 246);
-            this.emit(0x0400000000000000 | this.predicate | 246 | (246u64 << 8) | (3u64 << 20));
-            this.emit(0x3848000000000000 | this.predicate | 246 | (246u64 << 8) | (3u64 << 20));
-            if add != 0 {
-                this.emit(
-                    0x1c00000000000000
-                        | this.predicate
-                        | 246
-                        | (246u64 << 8)
-                        | (u64::from(add) << 20),
-                );
-            }
-        };
-        let hfma2 = |this: &mut Self, accumulator: u32, swizzle_a: u32, pair: u32| {
-            this.emit(
-                0x5d00000000000000
-                    | this.predicate
-                    | u64::from(accumulator)
-                    | (251u64 << 8)
-                    | (u64::from(pair) << 20)
-                    | (u64::from(accumulator) << 39)
-                    | (u64::from(swizzle_a) << 47),
-            );
-        };
-        for row in 0..2u32 {
-            if c == 255 {
-                self.mov_imm(252 + row, 0);
-            } else {
-                self.emit(
-                    0x5c98000000000000
-                        | self.predicate
-                        | u64::from(252 + row)
-                        | (15u64 << 39)
-                        | (u64::from(c + row) << 20),
-                );
+        for row in 0..2 {
+            for col in 0..2 {
+                self.extract_half(HalfSource { reg: if c == 255 { 255 } else { c + row },
+                    swizzle: 0, absolute: false, negate: false }, col, 246 + row * 2 + col);
             }
         }
-        for i in 0..4u32 {
-            for k_block in 0..2u32 {
-                lane_b(self, i);
-                shuffle(self, 247, b + k_block);
-                lane_b(self, 4 + i);
-                shuffle(self, 248, b + k_block);
-                self.emit(
-                    0x0400000000000000 | self.predicate | 249 | (247u64 << 8) | (0xffffu64 << 20),
-                );
-                self.emit(
-                    0x5c18000000000000
-                        | self.predicate
-                        | 249
-                        | (248u64 << 8)
-                        | (249u64 << 20)
-                        | (16u64 << 39),
-                );
-                self.emit(
-                    0x3828000000000000 | self.predicate | 250 | (247u64 << 8) | (16u64 << 20),
-                );
-                self.emit(
-                    0x0400000000000000
-                        | self.predicate
-                        | 248
-                        | (248u64 << 8)
-                        | (0xffff0000u64 << 20),
-                );
-                self.emit(
-                    0x5c10000000000000 | self.predicate | 250 | (250u64 << 8) | (248u64 << 20),
-                );
-                for row in 0..2u32 {
-                    lane_a(self, i);
-                    shuffle(self, 251, a + k_block * 2 + row);
-                    hfma2(self, 252 + row, 2, 249);
-                    hfma2(self, 252 + row, 3, 250);
+        for pair in 0..depth / 2 {
+            self.emit(0xf0c8000000000000 | self.predicate | 250);
+            self.emit(0x0400000000000000 | self.predicate | 251 | (250u64 << 8) | (3u64 << 20));
+            self.emit(0x3848000000000000 | self.predicate | 251 | (251u64 << 8) | (3u64 << 20));
+            self.emit(0x0400000000000000 | self.predicate | 250 | (250u64 << 8) | (0x1cu64 << 20));
+            self.mov_imm(254, pair & 3);
+            for reg in [250u64, 251] {
+                self.emit(0x5c10000000000000 | self.predicate | reg | (reg << 8) | (254u64 << 20));
+            }
+            for row in 0..2 {
+                for half in 0..2 {
+                    shuffle(self, 252, a + if pair >= 4 { 2 } else { 0 } + row, 250);
+                    self.extract_half(HalfSource { reg: 252, swizzle: 0, absolute: false, negate: false }, half, 252);
+                    for col in 0..2 {
+                        self.mov_imm(254, col * 4);
+                        self.emit(0x5c10000000000000 | self.predicate | 254 | (251u64 << 8) | (254u64 << 20));
+                        shuffle(self, 253, b + pair / 4, 254);
+                        self.extract_half(HalfSource { reg: 253, swizzle: 0, absolute: false, negate: false }, half, 253);
+                        let acc = u64::from(246 + row * 2 + col);
+                        self.emit(0x5980000000000000 | self.predicate | acc | (252u64 << 8)
+                            | (253u64 << 20) | (acc << 39));
+                    }
+                }
+            }
+            if pair & 3 == 3 {
+                for reg in 246..250 {
+                    round_half(self, reg);
+                    if pair + 1 < depth / 2 {
+                        self.extract_half(HalfSource { reg, swizzle: 2, absolute: false, negate: false }, 0, reg);
+                    }
                 }
             }
         }
-        for row in 0..2u32 {
-            self.emit(
-                0x5c98000000000000
-                    | self.predicate
-                    | (self.dest + u64::from(row))
-                    | (15u64 << 39)
-                    | (u64::from(252 + row) << 20),
-            );
+        for row in 0..2u64 {
+            self.emit(0x5c18000000000000 | self.predicate | (self.dest + row)
+                | ((247 + row * 2) << 8) | ((246 + row * 2) << 20) | (16u64 << 39));
         }
         Ok(())
     }
@@ -3025,26 +3800,47 @@ impl InstructionLowering<'_> {
                         | (1u64 << 40),
                 );
             }
-            0x219 | 0xc19 => {
+            0x219 | 0xa19 | 0xc19 => {
                 let low = insn.bits(24, 8);
                 let high = insn.bits(64, 8);
+                let constant = opcode == 0xa19;
                 let shift = if opcode == 0xc19 {
-                    Self::uniform_register(insn.bits(32, 8))
+                    self.uniforms.register(insn.bits(32, 8))
+                } else if constant {
+                    251
                 } else {
                     insn.bits(32, 8)
                 };
+                let shift_operand = if constant { self.valid_cbuf() && insn.bits(62, 2) == 0 }
+                    else { insn.words[1] <= 255 };
                 let right = insn.bits(76, 1) != 0;
                 let high_result = insn.bits(80, 1) != 0;
+                if opcode == 0x219 && shift_operand && insn.words[2] & !0xff == 0x00001200 {
+                    self.right_shift_u64_low(self.dest as u32, low, high, shift);
+                    return Ok(());
+                }
+                if opcode == 0x219 && low == 255 && shift_operand
+                    && insn.words[2] & !0x8ff == 0x00011400 && insn.words[3] & 0xc00001ff == 0 {
+                    let wrap = insn.bits(75, 1) != 0;
+                    if !wrap {
+                        self.emit(0x3820000000000000 | self.predicate | 250 | (u64::from(shift) << 8)
+                            | (31u64 << 20) | (7u64 << 39));
+                    }
+                    self.emit(self.base(0x5c28000000000000) | (u64::from(high) << 8)
+                        | (u64::from(if wrap { shift } else { 250 }) << 20) | (1u64 << 39) | (1u64 << 48));
+                    return Ok(());
+                }
                 if right
                     && !high_result
                     && high == 255
                     && insn.bits(73, 2) == 3
                     && shift != u32::MAX
-                    && insn.words[1] <= 255
+                    && shift_operand
                     && (insn.words[2]
                         & !(0x000118ff | if opcode == 0xc19 { 0x08000000 } else { 0 }))
                         == 0x00000600
                 {
+                    if constant { self.materialize(2, 0, 251, false, false); }
                     self.emit(
                         self.base(0x5c28000000000000)
                             | (u64::from(low) << 8)
@@ -3052,7 +3848,7 @@ impl InstructionLowering<'_> {
                     );
                     return Ok(());
                 }
-                if insn.words[1] > 255
+                if !shift_operand
                     || insn.bits(73, 2) != 3
                     || shift == u32::MAX
                     || (insn.words[2]
@@ -3061,11 +3857,12 @@ impl InstructionLowering<'_> {
                     || if right {
                         !high_result || low != 255
                     } else {
-                        high_result || high != 255
+                        if high_result { low != 255 } else { high != 255 }
                     }
                 {
                     return Err("native register shift mode");
                 }
+                if constant { self.materialize(2, 0, 251, false, false); }
                 self.emit(
                     self.base(if right {
                         0x5cf8000000000000
@@ -3073,7 +3870,7 @@ impl InstructionLowering<'_> {
                         0x5bf8000000000000
                     }) | (u64::from(if right { high } else { 255 }) << 8)
                         | (u64::from(shift) << 20)
-                        | (u64::from(if right { 255 } else { low }) << 39)
+                        | (u64::from(if right { 255 } else if high_result { high } else { low }) << 39)
                         | (u64::from(insn.bits(75, 1)) << 50),
                 );
             }
@@ -3152,7 +3949,7 @@ impl InstructionLowering<'_> {
                 let stride = insn.bits(78, 2);
                 let uniform_base = opcode == 0x984 && insn.bits(91, 1) != 0;
                 let base_register = if uniform_base {
-                    Self::uniform_register(insn.bits(32, 8))
+                    self.uniforms.register(insn.bits(32, 8))
                 } else {
                     255
                 };
@@ -3276,33 +4073,48 @@ impl InstructionLowering<'_> {
                 let offset = insn.bits(40, 14);
                 let coordinates = insn.bits(24, 8);
                 let derivatives = insn.bits(32, 8);
-                if (insn.words[2] & !0xff) != 0x001e0f00
+                let dimension = insn.bits(61, 3);
+                let high = insn.bits(64, 8);
+                let mask = insn.bits(72, 4);
+                let channels = mask.count_ones();
+                if (insn.words[2] & !(0xfff | (1 << 26))) != 0x001e0000 || mask == 0
                     || insn.bits(59, 2) != 0
-                    || insn.bits(61, 3) != 5
+                    || (dimension != 1 && dimension != 5)
                     || binding >= 18
                     || offset > 0x1fff
-                    || self.dest & 1 != 0
+                    || (channels > 1 && self.dest & 1 != 0)
                     || self.dest >= 248
-                    || u64::from(insn.bits(64, 8)) != self.dest + 2
+                    || (channels <= 2 && high != 255)
+                    || (high != 255 && ((channels > 3 && high & 1 != 0) || high >= 248))
                     || coordinates >= 248
                     || derivatives >= 247
                 {
-                    return Err("native array gradient texture mode");
+                    return Err("native gradient texture mode");
                 }
                 if *required_texture_buffer != u32::MAX && *required_texture_buffer != binding {
                     return Err("native texture descriptor buffer conflict");
                 }
                 *required_texture_buffer = binding;
+                let consecutive = channels <= 2 || u64::from(high) == self.dest + 2;
+                let target = if consecutive { self.dest } else { 248 };
                 self.emit(
-                    self.base(0xde00000000000000)
+                    0xde00000000000000 | self.predicate | target
                         | (u64::from(coordinates) << 8)
                         | (u64::from(derivatives) << 20)
-                        | (3u64 << 28)
-                        | (15u64 << 31)
+                        | ((if dimension == 5 { 3u64 } else { 2 }) << 28)
+                        | (u64::from(mask) << 31)
                         | (u64::from(offset) << 36)
                         | (u64::from(insn.bits(90, 1)) << 49)
                         | (7u64 << 51),
                 );
+                if !consecutive {
+                    for i in 0..channels {
+                        if i >= 2 && high == 255 { break; }
+                        let to = if i < 2 { self.dest as u32 + i } else { high + i - 2 };
+                        self.emit(0x5c98000000000000 | self.predicate | u64::from(to)
+                            | (15u64 << 39) | (u64::from(248 + i) << 20));
+                    }
+                }
             }
             0x989 => {
                 if (insn.words[1] & 0xf01fffff) != 0 || (insn.words[2] & !0x000e00ff) != 0 {
@@ -3334,44 +4146,37 @@ impl InstructionLowering<'_> {
                 );
             }
             0x98e => {
-                if (insn.words[2] & !0x0380003f) == 0x0c10e100 && insn.bits(24, 8) == 255 {
-                    let address = Self::uniform_register(insn.bits(64, 6));
-                    let offset = ((insn.bits(40, 24) << 8) as i32) >> 8;
-                    if address == u32::MAX
-                        || address & 1 != 0
-                        || !(-0x80000..=0x7ffff).contains(&offset)
-                    {
-                        return Err("native global reduction uniform address");
-                    }
-                    self.emit(
-                        0xebf8000000000000
-                            | self.predicate
-                            | u64::from(insn.bits(32, 8))
-                            | (u64::from(address) << 8)
-                            | (u64::from(insn.bits(87, 3)) << 23)
-                            | (u64::from((offset as u32) & 0xfffff) << 28)
-                            | (1u64 << 48),
-                    );
-                } else {
-                    if (insn.words[2] & !0x03800000) != 0x0010e100
-                        || insn.bits(40, 24) != 0
-                        || insn.bits(24, 8) & 1 != 0
-                    {
-                        return Err("native global reduction mode");
-                    }
-                    self.emit(
-                        0xebf8000000000000
-                            | self.predicate
-                            | u64::from(insn.bits(32, 8))
-                            | (u64::from(insn.bits(24, 8)) << 8)
-                            | (u64::from(insn.bits(87, 3)) << 23)
-                            | (1u64 << 48),
-                    );
+                // Fritchii RED.E: U32/S32 operations and F32 ADD, with either
+                // a register pair or a uniform address and signed byte offset.
+                let kind = insn.bits(73, 3);
+                let operation = insn.bits(87, 3);
+                let uniform_address = insn.bits(24, 8) == 255;
+                let variable = 0x03800e00 | if uniform_address { 0x3f } else { 0 };
+                let mode = if uniform_address { 0x0c10e100 } else { 0x0010e100 };
+                let offset = ((insn.bits(40, 24) << 8) as i32) >> 8;
+                if insn.words[2] & !variable != mode
+                    || !matches!(kind, 0 | 1 | 3) || (kind == 3 && operation != 0) {
+                    return Err("native global reduction mode");
                 }
+                let address = if uniform_address {
+                    self.uniforms.register(insn.bits(64, 6))
+                } else {
+                    insn.bits(24, 8)
+                };
+                if address == u32::MAX || address & 1 != 0
+                    || !(-0x80000..=0x7ffff).contains(&offset) {
+                    return Err("native global reduction address");
+                }
+                self.emit(0xebf8000000000000 | self.predicate | u64::from(insn.bits(32, 8))
+                    | (u64::from(address) << 8) | (u64::from(kind) << 20)
+                    | (u64::from(operation) << 23) | (u64::from(offset as u32 & 0xfffff) << 28)
+                    | (1u64 << 48));
             }
             0x2bd => {
-                if self.dest >= 16
-                    || insn.words[1] >= 16
+                let target = self.uniforms.register(self.dest as u32);
+                let source = self.uniforms.register(insn.bits(32, 8));
+                if self.dest == 63 || target == u32::MAX || source == u32::MAX
+                    || insn.words[1] & !0xff != 0
                     || (insn.words[2] & !0x400) != 0x080e0000
                     || native_predicate != 7
                 {
@@ -3380,15 +4185,15 @@ impl InstructionLowering<'_> {
                 self.emit(
                     0x5c30000000000000
                         | self.predicate
-                        | (self.dest + 216)
-                        | (u64::from(insn.words[1] + 216) << 20)
+                        | u64::from(target)
+                        | (u64::from(source) << 20)
                         | (u64::from(insn.bits(74, 1)) << 41),
                 );
             }
             // Pinned Eglantine 900ab5a8: UPOPC reads/writes the uniform mirrors.
             0x2bf => {
-                let target = Self::uniform_register(self.dest as u32);
-                let source = Self::uniform_register(insn.bits(32, 8));
+                let target = self.uniforms.register(self.dest as u32);
+                let source = self.uniforms.register(insn.bits(32, 8));
                 if self.dest == 63 || target == u32::MAX || source == u32::MAX
                     || insn.words[1] & !0x800000ff != 0
                     || insn.words[2] != 0x08000000 || native_predicate != 7
@@ -3399,8 +4204,10 @@ impl InstructionLowering<'_> {
                     | (u64::from(source) << 20) | (u64::from(insn.bits(63, 1)) << 40));
             }
             0x2be => {
-                if self.dest >= 16
-                    || insn.words[1] >= 16
+                let target = self.uniforms.register(self.dest as u32);
+                let source = self.uniforms.register(insn.bits(32, 8));
+                if self.dest == 63 || target == u32::MAX || source == u32::MAX
+                    || insn.words[1] & !0xff != 0
                     || insn.words[2] != 0x08000000
                     || native_predicate != 7
                 {
@@ -3409,8 +4216,8 @@ impl InstructionLowering<'_> {
                 self.emit(
                     0x3828000000000000
                         | self.predicate
-                        | (self.dest + 216)
-                        | (u64::from(insn.words[1] + 216) << 8)
+                        | u64::from(target)
+                        | (u64::from(source) << 8)
                         | (1u64 << 39)
                         | (1u64 << 40),
                 );
@@ -3467,18 +4274,23 @@ impl InstructionLowering<'_> {
             }
             0x3c4 => {
                 let source = insn.bits(24, 8);
-                let target = Self::uniform_register(self.dest as u32);
-                let maximum = insn.words[2] == 0x14000;
+                let target = self.uniforms.register(self.dest as u32);
+                let mode = insn.words[2] & !0x200;
+                let maximum = mode == 0x14000;
+                let minimum = mode == 0x10000;
+                let signed_order = insn.bits(73, 1) != 0;
+                let logical = if insn.words[2] == 0x4000 { 1u64 } else if insn.words[2] == 0x8000 { 2 } else { 0 };
                 if target == u32::MAX
                     || target == 255
                     || insn.words[1] != 0
-                    || (insn.words[2] != 0xc000 && !maximum)
+                    || (insn.words[2] != 0xc000 && !maximum && !minimum && logical == 0)
+                    || (signed_order && !maximum && !minimum)
                     || native_predicate != 7
                 {
                     return Err("native warp sum mode");
                 }
                 self.emit(0x50d8000000070000 | 250 | (7u64 << 39) | (7u64 << 45) | (1u64 << 48));
-                self.mov_imm(target, 0);
+                self.mov_imm(target, if minimum { u32::MAX } else { 0 });
                 for lane in 0..32u32 {
                     self.emit(
                         0xef10000000070000
@@ -3490,15 +4302,22 @@ impl InstructionLowering<'_> {
                             | (31u64 << 34)
                             | (7u64 << 48),
                     );
+                    if signed_order {
+                        self.emit(0x0400000000070000 | 251 | (251u64 << 8) | (0x80000000u64 << 20) | (2u64 << 53));
+                    }
                     self.emit(0x3828000000070000 | 252 | (250u64 << 8) | (u64::from(lane) << 20));
                     self.emit(0x0400000000070000 | 252 | (252u64 << 8) | (1u64 << 20));
                     self.emit(
                         0x5c10000000070000 | 252 | (255u64 << 8) | (252u64 << 20) | (1u64 << 48),
                     );
                     self.emit(
-                        0x5c40000000070000 | 251 | (251u64 << 8) | (252u64 << 20) | (7u64 << 48),
+                        0x5c40000000070000 | 251 | (251u64 << 8) | (252u64 << 20) | (7u64 << 48)
+                            | (u64::from(minimum) << 40) | (u64::from(minimum) << 41),
                     );
-                    if maximum {
+                    if minimum {
+                        self.emit(0x5c20000000070000 | u64::from(target) | (u64::from(target) << 8)
+                            | (251u64 << 20) | (7u64 << 39));
+                    } else if maximum {
                         self.emit(
                             0x5c20000000070000
                                 | u64::from(target)
@@ -3506,6 +4325,9 @@ impl InstructionLowering<'_> {
                                 | (251u64 << 20)
                                 | (15u64 << 39),
                         );
+                    } else if logical != 0 {
+                        self.emit(0x5c40000000070000 | u64::from(target) | (u64::from(target) << 8)
+                            | (251u64 << 20) | (logical << 41) | (7u64 << 48));
                     } else {
                         self.emit(
                             0x5c10000000070000
@@ -3514,6 +4336,10 @@ impl InstructionLowering<'_> {
                                 | (251u64 << 20),
                         );
                     }
+                }
+                if signed_order {
+                    self.emit(0x0400000000070000 | u64::from(target) | (u64::from(target) << 8)
+                        | (0x80000000u64 << 20) | (2u64 << 53));
                 }
             }
             0xf8c => {
@@ -3577,7 +4403,7 @@ impl InstructionLowering<'_> {
                 );
             }
             0x9a8 => {
-                let address = Self::uniform_register(insn.bits(64, 6));
+                let address = self.uniforms.register(insn.bits(64, 6));
                 let offset = ((insn.bits(40, 24) << 8) as i32) >> 8;
                 if insn.bits(24, 8) != 255
                     || !(-0x80000..=0x7ffff).contains(&offset)
@@ -3740,8 +4566,10 @@ impl InstructionLowering<'_> {
             0x886 => {
                 let output = insn.bits(81, 3);
                 let target = insn.bits(16, 8);
-                if (target >= 16 && target != 63)
+                let mapped_target = self.uniforms.register(target);
+                if mapped_target == u32::MAX || insn.bits(24, 8) != 0
                     || insn.words[1] != 0
+                    || insn.words[2] & !0x078e0300 != 0
                     || insn.bits(72, 2) > 2
                     || native_predicate != 7
                 {
@@ -3754,7 +4582,7 @@ impl InstructionLowering<'_> {
                 }
                 self.emit(
                     0x50d8000000070000
-                        | u64::from(Self::uniform_register(target))
+                        | u64::from(mapped_target)
                         | (u64::from(insn.bits(87, 4)) << 39)
                         | (u64::from(temporary) << 45)
                         | (u64::from(insn.bits(72, 2)) << 48),
@@ -3765,7 +4593,7 @@ impl InstructionLowering<'_> {
                 }
             }
             0x3c2 => {
-                let target = Self::uniform_register(self.dest as u32);
+                let target = self.uniforms.register(self.dest as u32);
                 if target == u32::MAX
                     || target == 255
                     || insn.words[1] != 0
@@ -3887,7 +4715,7 @@ impl InstructionLowering<'_> {
                 self.emit(0x38f0000000070000 | (254u64 << 8) | (0x7fu64 << 20));
             }
             0x883 => {
-                let target = Self::uniform_register(insn.bits(16, 8));
+                let target = self.uniforms.register(insn.bits(16, 8));
                 let mask = insn.words[1];
                 if target == u32::MAX
                     || insn.bits(24, 8) != 63
@@ -3921,35 +4749,37 @@ impl InstructionLowering<'_> {
                 }
             }
             0x882 => {
-                if self.dest >= 16 || insn.words[2] != 0 {
+                let target = self.uniforms.register(self.dest as u32);
+                if target == u32::MAX || insn.words[2] != 0 {
                     return Err("native uniform immediate move mode");
                 }
-                self.mov_imm(self.dest as u32 + 216, insn.words[1]);
+                if target != 255 { self.mov_imm(target, insn.words[1]); }
             }
             0xc82 => {
                 let source = if insn.words[1] < 64 {
-                    Self::uniform_register(insn.words[1])
+                    self.uniforms.register(insn.words[1])
                 } else {
                     u32::MAX
                 };
-                if self.dest >= 16 || source == u32::MAX || insn.words[2] != 0x08000000 {
+                let target = self.uniforms.register(self.dest as u32);
+                if target == u32::MAX || source == u32::MAX || insn.words[2] != 0x08000000 {
                     return Err("native uniform move mode");
                 }
-                self.emit(
+                if target != 255 { self.emit(
                     0x5c98000000000000
                         | self.predicate
-                        | (self.dest + 216)
+                        | u64::from(target)
                         | (u64::from(source) << 20)
                         | (15u64 << 39),
-                );
+                ); }
             }
             0xab9 | 0xabb => {
                 let uniform_dest = insn.bits(16, 8);
                 let index_reg = insn.bits(24, 8);
                 let width = insn.bits(73, 3);
-                let target = Self::uniform_register(uniform_dest);
+                let target = self.uniforms.register(uniform_dest);
                 let index_target = if opcode == 0xabb {
-                    Self::uniform_register(index_reg)
+                    self.uniforms.register(index_reg)
                 } else {
                     255
                 };
@@ -3958,7 +4788,7 @@ impl InstructionLowering<'_> {
                     || (width != 4 && width != 5)
                     || (width == 5
                         && (uniform_dest & 1 != 0
-                            || Self::uniform_register(uniform_dest + 1) != target + 1))
+                            || self.uniforms.register(uniform_dest + 1) != target + 1))
                     || self.bank() >= 18
                     || insn.bits(38, 16) % 4 != 0
                     || insn.bits(62, 2) != 0
@@ -3991,61 +4821,48 @@ impl InstructionLowering<'_> {
                 let dst = insn.bits(16, 8);
                 let low = insn.bits(24, 8);
                 let high = insn.bits(64, 8);
-                if insn.words[2] == (0x08011400 | high)
-                    && low == 63
-                    && high < 16
-                    && dst < 16
-                    && native_predicate == 7
-                    && insn.words[1] <= 32
-                {
-                    self.emit(
-                        0x3828000000000000
-                            | self.predicate
-                            | u64::from(dst + 216)
-                            | (u64::from(high + 216) << 8)
-                            | (u64::from(insn.words[1]) << 20)
-                            | (1u64 << 48),
-                    );
+                let dst_reg = self.uniforms.register(dst);
+                let low_reg = self.uniforms.register(low);
+                let high_reg = self.uniforms.register(high);
+                let dst_ok = dst != 63 && dst_reg != u32::MAX;
+                let low_ok = low != 63 && low_reg != u32::MAX;
+                let high_ok = high != 63 && high_reg != u32::MAX;
+                if dst_ok && low_reg != u32::MAX && high_reg != u32::MAX
+                    && insn.words[2] == (0x08001200 | high) {
+                    self.mov_imm(252, insn.words[1]);
+                    self.right_shift_u64_low(dst_reg, low_reg, high_reg, 252);
                     return Ok(());
                 }
-                let right_low = insn.words[2] == 0x0800163f && low < 16;
-                let right_high = insn.words[2] == (0x08011600 | high) && low == 63 && high < 16;
-                if (right_low || right_high)
-                    && dst < 16
-                    && native_predicate == 7
-                    && insn.words[1] <= 32
-                {
-                    self.emit(
-                        0x3828000000000000
-                            | self.predicate
-                            | u64::from(dst + 216)
-                            | (u64::from((if right_high { high } else { low }) + 216) << 8)
-                            | (u64::from(insn.words[1]) << 20),
-                    );
+                if insn.words[2] == (0x08011400 | high) && low == 63 && high_ok
+                    && dst_ok && insn.words[1] <= 32 {
+                    self.emit(0x3828000000000000 | self.predicate | u64::from(dst_reg)
+                        | (u64::from(high_reg) << 8) | (u64::from(insn.words[1]) << 20) | (1u64 << 48));
                     return Ok(());
                 }
-                let high_result = insn.words[2] == (0x08010600 | high) && low == 63 && high < 16;
-                let low_result = insn.words[2] == 0x0800063f && low < 16;
-                if dst >= 16
-                    || native_predicate != 7
-                    || insn.words[1] > 32
-                    || (!high_result && !low_result)
-                {
+                let right_low = insn.words[2] == 0x0800163f && low_ok;
+                let right_high = insn.words[2] == (0x08011600 | high) && low == 63 && high_ok;
+                if (right_low || right_high) && dst_ok && insn.words[1] <= 32 {
+                    self.emit(0x3828000000000000 | self.predicate | u64::from(dst_reg)
+                        | (u64::from(if right_high { high_reg } else { low_reg }) << 8)
+                        | (u64::from(insn.words[1]) << 20));
+                    return Ok(());
+                }
+                let high_result = insn.words[2] == (0x08010600 | high) && low == 63 && high_ok;
+                let low_result = insn.words[2] == 0x0800063f && low_ok;
+                if !dst_ok || insn.words[1] > 32 || (!high_result && !low_result) {
                     return Err("native uniform shift mode");
                 }
-                self.emit(
-                    0x3848000000000000
-                        | self.predicate
-                        | u64::from(dst + 216)
-                        | (u64::from((if high_result { high } else { low }) + 216) << 8)
-                        | (u64::from(insn.words[1]) << 20),
-                );
+                self.emit(0x3848000000000000 | self.predicate | u64::from(dst_reg)
+                    | (u64::from(if high_result { high_reg } else { low_reg }) << 8)
+                    | (u64::from(insn.words[1]) << 20));
             }
             0xb82 => {
                 let width = insn.bits(73, 3);
-                if (width != 4 && width != 5)
-                    || insn.bits(78, 2) != 0
-                    || insn.bits(91, 1) != 0
+                let mode = insn.bits(78, 2);
+                if width > 5
+                    || !matches!(mode, 0 | 2)
+                    || insn.words[2] & !0xce00 != 0
+                    || insn.words[1] & 0xf800003f != 0
                     || self.bank() >= 18
                     || (width == 5 && (self.dest & 1 != 0 || self.dest >= 254))
                 {
@@ -4056,6 +4873,7 @@ impl InstructionLowering<'_> {
                         | (u64::from(insn.bits(24, 8)) << 8)
                         | (u64::from(insn.bits(38, 16)) << 20)
                         | (u64::from(self.bank()) << 36)
+                        | (u64::from(mode) << 44)
                         | (u64::from(width) << 48),
                 );
             }
@@ -4100,6 +4918,7 @@ impl InstructionLowering<'_> {
         &mut self,
         opcode: u32,
         native_predicate: u32,
+        rewritten_uniform: bool,
     ) -> Result<(), &'static str> {
         let insn = self.insn;
         match opcode {
@@ -4147,6 +4966,20 @@ impl InstructionLowering<'_> {
                             | (15u64 << 39)
                             | (u64::from(insn.bits(64, 8)) << 20),
                     );
+                } else if insn.bits(24, 8) == 255 && insn.words[1] == 255
+                    && insn.words[2] & !0x07800aff == 0x000e0400
+                    && (!rewritten_uniform || insn.bits(87, 3) == 7) {
+                    let mut c = insn.bits(64, 8);
+                    self.mov_imm(250, 1);
+                    self.emit(0x5ca0000000000000 | self.predicate | 250 | (250u64 << 8)
+                        | (255u64 << 20) | (u64::from(insn.bits(87, 3)) << 39)
+                        | (u64::from(insn.bits(90, 1)) << 42));
+                    if insn.bits(75, 1) != 0 {
+                        self.emit(0x0400000000000000 | self.predicate | 251 | (u64::from(c) << 8)
+                            | (0xffffffffu64 << 20) | (2u64 << 53));
+                        c = 251;
+                    }
+                    self.emit(self.base(0x5c10000000000000) | (u64::from(c) << 8) | (250u64 << 20));
                 } else {
                     if (insn.words[2] & !0x2ff) != 0x078e0000 || (insn.words[1] & !0xff) != 0 {
                         return Err("native integer register multiply mode");
@@ -4155,17 +4988,17 @@ impl InstructionLowering<'_> {
                 }
             }
             0x2a5 => {
-                let a = Self::uniform_register(insn.bits(24, 8));
-                let b = Self::uniform_register(insn.bits(32, 8));
+                let a = self.uniforms.register(insn.bits(24, 8));
+                let b = self.uniforms.register(insn.bits(32, 8));
                 let c = insn.bits(64, 8);
-                let c_low = Self::uniform_register(c);
+                let c_low = self.uniforms.register(c);
                 let c_high = if c == 63 {
                     255
                 } else {
-                    Self::uniform_register(c + 1)
+                    self.uniforms.register(c + 1)
                 };
-                let d_low = Self::uniform_register(insn.bits(16, 8));
-                let d_high = Self::uniform_register(insn.bits(16, 8) + 1);
+                let d_low = self.uniforms.register(insn.bits(16, 8));
+                let d_high = self.uniforms.register(insn.bits(16, 8) + 1);
                 if native_predicate != 7
                     || (insn.words[1] & !0xff) != 0
                     || (insn.words[2] & !0xff) != 0x0f8e0000
@@ -4204,20 +5037,78 @@ impl InstructionLowering<'_> {
                 );
                 self.emit(0x5c10000000070000 | u64::from(d_low) | (250u64 << 8) | (255u64 << 20));
             }
-            0x827 => {
-                if insn.words[2] != 0x078e00ff {
+            0x225 | 0x227 | 0x625 | 0x825 | 0x827 | 0xa27 => {
+                // Fritchii: IMAD.HI / IMAD.WIDE, including signed product and carry output.
+                let wide = matches!(opcode, 0x225 | 0x625 | 0x825);
+                let immediate = matches!(opcode, 0x825 | 0x827);
+                let signed_product = insn.bits(73, 1) != 0;
+                let c = if opcode == 0x625 { 255 } else { insn.bits(64, 8) };
+                let carry_output = insn.bits(81, 3);
+                if (insn.words[2] & !0x000e02ff) != 0x07800000
+                    || (matches!(opcode, 0x225 | 0x227) && (insn.words[1] & !0xff) != 0)
+                    || (matches!(opcode, 0xa27 | 0x625) && (!self.valid_cbuf() || insn.bits(62, 2) != 0))
+                    || (opcode == 0x625 && insn.bits(38, 16) > 0xfff8)
+                    || (c != 255 && c & 1 != 0)
+                    || (wide && (self.dest == 255 || self.dest & 1 != 0))
+                    || (signed_product && carry_output != 7) {
                     return Err("native high multiply mode");
                 }
                 let a = insn.bits(24, 8);
-                let b = insn.words[1];
-                self.xmad(250, a, b, 255, false, false, 0, true);
-                self.xmad(251, a, b, 250, true, false, 2, true);
-                self.xmad(250, a, b, 251, false, true, 1, true);
-                self.xmad(252, a, b, 251, true, true, 2, true);
-                self.emit(
-                    0x3828000000000000 | self.predicate | 250 | (250u64 << 8) | (16u64 << 20),
-                );
-                self.emit(self.base(0x5c10000000000000) | (250u64 << 8) | (252u64 << 20));
+                let b = if immediate { insn.words[1] } else if opcode == 0xa27 { 254 }
+                    else { insn.bits(if opcode == 0x625 { 64 } else { 32 }, 8) };
+                if opcode == 0xa27 {
+                    self.emit(0x4c98000000000000 | self.predicate | 254 | (15u64 << 39) | self.cbuf());
+                }
+                if signed_product {
+                    let b_register = if immediate { 254 } else { b };
+                    if immediate { self.mov_imm(254, b); }
+                    self.emit(0x3828000000000000 | self.predicate | 253 | (u64::from(a) << 8) | (31u64 << 20) | (1u64 << 48));
+                    self.emit(0x5c40000000000000 | self.predicate | 253 | (253u64 << 8) | (u64::from(b_register) << 20) | (7u64 << 48));
+                    self.emit(0x3828000000000000 | self.predicate | 252 | (u64::from(b_register) << 8) | (31u64 << 20) | (1u64 << 48));
+                    self.emit(0x5c40000000000000 | self.predicate | 252 | (252u64 << 8) | (u64::from(a) << 20) | (7u64 << 48));
+                    self.emit(0x5c10000000000000 | self.predicate | 253 | (253u64 << 8) | (252u64 << 20));
+                }
+                self.xmad(250, a, b, 255, false, false, 0, immediate);
+                self.xmad(251, a, b, 250, true, false, 2, immediate);
+                self.xmad(250, a, b, 251, false, true, 1, immediate);
+                self.xmad(252, a, b, 251, true, true, 2, immediate);
+                self.emit(0x3828000000000000 | self.predicate | 250 | (250u64 << 8) | (16u64 << 20));
+                if signed_product {
+                    self.emit(0x5c10000000000000 | self.predicate | 250 | (250u64 << 8) | (253u64 << 20) | (1u64 << 48));
+                }
+                if !wide && c == 255 && carry_output == 7 {
+                    self.emit(self.base(0x5c10000000000000) | (250u64 << 8) | (252u64 << 20));
+                    return Ok(());
+                }
+                self.emit(0x5c10000000000000 | self.predicate | 253 | (250u64 << 8) | (252u64 << 20));
+                self.xmad(250, a, b, 255, false, false, 0, immediate);
+                self.xmad(251, a, b, 255, true, false, 0, immediate);
+                self.xmad(251, a, b, 251, false, true, 0, immediate);
+                self.emit(0x5c18000000000000 | self.predicate | 250 | (251u64 << 8) | (250u64 << 20) | (16u64 << 39));
+                let mut c_low = c;
+                let mut c_high = if c == 255 { 255 } else { c + 1 };
+                if opcode == 0x625 {
+                    self.emit(0x4c98000000000000 | self.predicate | 252 | (15u64 << 39) | self.cbuf());
+                    self.emit(0x4c98000000000000 | self.predicate | 254 | (15u64 << 39) | (self.cbuf() + (1u64 << 20)));
+                    c_low = 252;
+                    c_high = 254;
+                }
+                let high = if wide { self.dest + 1 } else { self.dest };
+                self.emit(0x5c10000000000000 | self.predicate | 250 | (250u64 << 8) | (u64::from(c_low) << 20) | (1u64 << 47));
+                if carry_output == 7 {
+                    self.emit(0x5c10000000000000 | self.predicate | high | (253u64 << 8) | (u64::from(c_high) << 20) | (1u64 << 43));
+                    if wide { self.emit(self.base(0x5c10000000000000) | (250u64 << 8) | (255u64 << 20)); }
+                    return Ok(());
+                }
+                self.emit(0x5c10000000000000 | self.predicate | 251 | (255u64 << 8) | (255u64 << 20) | (1u64 << 43));
+                self.emit(0x5c10000000000000 | self.predicate | 253 | (253u64 << 8) | (u64::from(c_high) << 20) | (1u64 << 47));
+                self.emit(0x5c10000000000000 | self.predicate | 254 | (255u64 << 8) | (255u64 << 20) | (1u64 << 43));
+                self.emit(0x5c10000000000000 | self.predicate | 253 | (253u64 << 8) | (251u64 << 20) | (1u64 << 47));
+                self.emit(0x5c10000000000000 | self.predicate | 254 | (254u64 << 8) | (255u64 << 20) | (1u64 << 43));
+                self.emit(0x5c98000000000000 | self.predicate | high | (253u64 << 20) | (15u64 << 39));
+                if wide { self.emit(self.base(0x5c98000000000000) | (250u64 << 20) | (15u64 << 39)); }
+                self.emit(0x5b60000000000000 | self.predicate | 7 | (u64::from(carry_output) << 3) | (254u64 << 8)
+                    | (255u64 << 20) | (7u64 << 39) | (5u64 << 49));
             }
             0xa24 => {
                 if (insn.words[2] & !0x2ff) != 0x078e0000
@@ -4495,6 +5386,8 @@ impl InstructionLowering<'_> {
                 }
                 if relu && native_predicate != 7 {
                     relocations.push(Relocation {
+                        call: false,
+                        output_target: None,
                         output_index: self.instructions.len() as u32,
                         target: i64::from(index + 1),
                     });
@@ -4681,18 +5574,6 @@ impl InstructionLowering<'_> {
         Ok(())
     }
 
-    fn uniform_register(reg: u32) -> u32 {
-        if reg < 22 {
-            216 + reg
-        } else if reg < 28 {
-            218 + reg
-        } else if reg == 63 {
-            255
-        } else {
-            u32::MAX
-        }
-    }
-
     fn base(&self, opcode_bits: u64) -> u64 {
         opcode_bits | self.predicate | self.dest
     }
@@ -4810,7 +5691,7 @@ impl InstructionLowering<'_> {
         negate: bool,
     ) -> u32 {
         if kind == 3 {
-            let mapped = Self::uniform_register(reg);
+            let mapped = self.uniforms.register(reg);
             if mapped == u32::MAX {
                 self.operand_error = "native uniform source register";
                 return 255;
@@ -4959,6 +5840,21 @@ impl InstructionLowering<'_> {
         }
     }
 
+    // Fritchii right_shift_u64_low lambda, kept beside the operand helpers.
+    fn right_shift_u64_low(&mut self, target: u32, low: u32, high: u32, shift: u32) {
+        self.mov_imm(250, 32);
+        self.emit(0x5c10000000000000 | self.predicate | 251 | (250u64 << 8)
+            | (u64::from(shift) << 20) | (1u64 << 48));
+        self.emit(0x5c28000000000000 | self.predicate | 250 | (u64::from(low) << 8) | (u64::from(shift) << 20));
+        self.emit(0x5c48000000000000 | self.predicate | 251 | (u64::from(high) << 8) | (251u64 << 20));
+        self.emit(0x5c40000000000000 | self.predicate | 250 | (250u64 << 8)
+            | (251u64 << 20) | (1u64 << 41) | (7u64 << 48));
+        self.emit(0x1c00000000000000 | self.predicate | 251 | (u64::from(shift) << 8) | (0xffffffe0u64 << 20));
+        self.emit(0x5c28000000000000 | self.predicate | 251 | (u64::from(high) << 8) | (251u64 << 20));
+        self.emit(0x5c40000000000000 | self.predicate | u64::from(target) | (250u64 << 8)
+            | (251u64 << 20) | (1u64 << 41) | (7u64 << 48));
+    }
+
     fn extract_half(&mut self, source: HalfSource, lane: u32, target: u32) {
         let high = source.swizzle == 3 || (source.swizzle == 0 && lane == 1);
         self.emit(
@@ -5017,6 +5913,167 @@ impl InstructionLowering<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_gather_preserves_xy_comparison_and_split_destinations() {
+        use crate::frontend::translate::TranslatorVisitor;
+        use crate::ir::{basic_block::Block, opcodes::Opcode, program::Program, types::{ShaderStage, TextureInstInfo}, value::Value};
+        use crate::ir_opt::{constant_propagation_pass::constant_propagation_pass, ssa_rewrite_pass::ssa_rewrite_pass};
+        fn resolve(program: &Program, mut value: Value) -> Value {
+            while let Value::Inst(reference) = value {
+                let inst = program.blocks[reference.block as usize].instructions[reference.inst as usize].as_ref().unwrap();
+                if inst.opcode != Opcode::Identity { break; }
+                value = inst.args[0];
+            }
+            value
+        }
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        // Destinations alias the input coordinate pair and comparison value.
+        let sample = Instruction { words: [0x18187b63, 0x30800e1c, 0x001e4f1c, 0x000f4200] };
+        let lowered = lower_to_maxwell(&[sample, exit]);
+        assert!(lowered.is_valid(), "{}", lowered.error);
+        assert_eq!(lowered.required_texture_buffer, 2);
+        let mut program = Program::new(ShaderStage::Fragment);
+        program.blocks.push(Block::new());
+        {
+            let mut tv = TranslatorVisitor::new(&mut program, 0);
+            tv.set_f(24, Value::ImmF32(0.25));
+            tv.set_f(25, Value::ImmF32(0.75));
+            tv.set_f(28, Value::ImmF32(0.5));
+            for &instruction in &lowered.instructions[..lowered.source_instruction_offsets[1] as usize] {
+                tv.translate_instruction(instruction);
+            }
+        }
+        let writes: Vec<_> = program.blocks[0].iter().filter(|i| i.opcode == Opcode::SetRegister)
+            .filter_map(|i| if let Value::Reg(reg) = i.args[0] { Some(reg.0) } else { None }).collect();
+        assert!(writes.ends_with(&[24, 25, 28, 29]));
+        ssa_rewrite_pass(&mut program);
+        constant_propagation_pass(&mut program);
+        let gather = program.blocks[0].iter().find(|i| i.opcode == Opcode::BoundImageGatherDref).unwrap();
+        assert!(TextureInstInfo::from_u32(gather.flags).is_depth);
+        assert_eq!(resolve(&program, gather.args[0]), Value::ImmU32(0x38));
+        assert_eq!(resolve(&program, gather.args[4]), Value::ImmF32(0.5));
+        let Value::Inst(coords) = resolve(&program, gather.args[1]) else { panic!("missing XY"); };
+        let coords = program.blocks[coords.block as usize].instructions[coords.inst as usize].as_ref().unwrap();
+        assert_eq!(resolve(&program, coords.args[0]), Value::ImmF32(0.25));
+        assert_eq!(resolve(&program, coords.args[1]), Value::ImmF32(0.75));
+        let mut packed = sample;
+        packed.words[2] = (packed.words[2] & !255) | 25 | (1 << 15);
+        let packed = lower_to_maxwell(&[packed, exit]);
+        assert!(packed.is_valid(), "{}", packed.error);
+        let destinations: Vec<_> = packed.instructions.iter()
+            .filter(|&&word| word & 0xffff000000000000 == 0x5c18000000000000)
+            .map(|word| word & 255).collect();
+        assert_eq!(destinations, [24, 25]); // FP16 outputs occupy one register each.
+        for (word, mask) in [(2, 1 << 12), (2, 1 << 13), (1, 1 << 28)] {
+            let mut unsupported = sample;
+            unsupported.words[word] ^= mask;
+            assert!(!lower_to_maxwell(&[unsupported, exit]).is_valid());
+        }
+    }
+
+    #[test]
+    fn lea_high_subtraction_preserves_wrapping_arithmetic() {
+        use crate::frontend::translate::TranslatorVisitor;
+        use crate::ir::{basic_block::Block, program::Program, types::ShaderStage, value::Value};
+        use crate::ir_opt::{constant_propagation_pass::constant_propagation_pass, ssa_rewrite_pass::ssa_rewrite_pass};
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        for signed in [false, true] {
+            for negate in [false, true] {
+                for shift in [0u32, 1, 16, 30, 31] {
+                    let native = Instruction { words: [0x04037211, 5 | (u32::from(negate) << 31),
+                        0x078f00ff | (shift << 11) | (u32::from(signed) << 9), 0] };
+                    let lowered = lower_to_maxwell(&[native, exit]);
+                    assert!(lowered.is_valid(), "{}", lowered.error);
+                    for a in [0u32, 1, 0x7fffffff, 0x80000000, u32::MAX] {
+                        for b in [0u32, 1, 0x80000000, u32::MAX] {
+                            let mut program = Program::new(ShaderStage::Compute);
+                            program.blocks.push(Block::new());
+                            let output;
+                            {
+                                let mut tv = TranslatorVisitor::new(&mut program, 0);
+                                tv.set_x(4, Value::ImmU32(a));
+                                tv.set_x(5, Value::ImmU32(b));
+                                for &instruction in &lowered.instructions[..lowered.source_instruction_offsets[1] as usize] {
+                                    tv.translate_instruction(instruction);
+                                }
+                                output = tv.x(3);
+                            }
+                            ssa_rewrite_pass(&mut program);
+                            constant_propagation_pass(&mut program);
+                            let mut value = output;
+                            while let Value::Inst(reference) = value {
+                                let inst = program.blocks[reference.block as usize].instructions[reference.inst as usize].as_ref().unwrap();
+                                assert_eq!(inst.opcode, crate::ir::opcodes::Opcode::Identity);
+                                value = inst.args[0];
+                            }
+                            let high = if signed { ((a as i32 as i64) >> (32 - shift)) as u32 }
+                                else { ((a as u64) >> (32 - shift)) as u32 };
+                            let expected = if negate { high.wrapping_sub(b) } else { high.wrapping_add(b) };
+                            assert_eq!(value, Value::ImmU32(expected), "a={a:x} b={b:x} shift={shift} signed={signed} negate={negate}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gather_offsets_require_unchanged_execution_predicate() {
+        let constant = |reg: u32, value: u32| Instruction {
+            words: [0x9802 | (reg << 16), value, 0xf00, 0],
+        };
+        let gather = Instruction { words: [0x9b63, 0, 0, 0] };
+        // !P1 constants remain valid when PLOP3 or LOP3 writes another predicate.
+        for opcode in [0x81c, 0x212] {
+            for target in 0..7 {
+                let middle = Instruction {
+                    words: [opcode | 0x7000 | (24 << 16), 0, (target << 17) | (7 << 20), 0],
+                };
+                let code = [constant(16, 0xffff0001), constant(17, 0x01000100), middle, gather];
+                assert_eq!(BoundedControl::gather_constant_offsets(&code, 3, 16),
+                    if target == 1 { None } else { Some([0xffff0001, 0x01000100]) });
+            }
+        }
+        let mut code = [constant(16, 0), constant(17, 1), gather];
+        code[0].words[0] ^= 1 << 12; // !P0 definition cannot establish a !P1 value.
+        assert_eq!(BoundedControl::gather_constant_offsets(&code, 2, 16), None);
+    }
+
+    #[test]
+    fn gather_offsets_require_dominating_in_range_unclobbered_constants() {
+        let constant = |reg: u32, value: u32| Instruction {
+            words: [0x7802 | (reg << 16), value, 0xf00, 0],
+        };
+        let nop = Instruction { words: [0x7918, 0, 0, 0] };
+        let gather = Instruction { words: [0x7b63, 0, 0, 0] };
+        let branch = |from: usize, to: usize| {
+            let offset = ((to as i64 - from as i64 - 1) * 16) as u64;
+            Instruction { words: [0x7947, offset as u32, ((offset >> 32) as u32) & 0x3ffff, 0] }
+        };
+        let base = [nop, constant(16, 0x1fe00001), constant(17, 0xff000100), nop, gather];
+        assert_eq!(BoundedControl::gather_constant_offsets(&base, 4, 16), Some([0x1fe00001, 0xff000100]));
+        for (from, to) in [(0, 2), (0, 3), (1, 3)] {
+            let mut code = base;
+            code[from] = branch(from, to);
+            assert_eq!(BoundedControl::gather_constant_offsets(&code, 4, 16), None);
+        }
+        let mut internal = base;
+        internal[3] = branch(3, 4);
+        assert!(BoundedControl::gather_constant_offsets(&internal, 4, 16).is_some());
+        for byte in [32, 127, 128, 223] {
+            let mut code = base;
+            code[1].words[1] = byte;
+            assert_eq!(BoundedControl::gather_constant_offsets(&code, 4, 16), None);
+        }
+        let mut overwritten = base;
+        // Two-register write starting at R15 aliases the first offset register.
+        overwritten[3] = Instruction { words: [0x000f7805, 0, 0, 0] };
+        assert_eq!(BoundedControl::gather_constant_offsets(&overwritten, 4, 16), None);
+        let mut loop_entry = base.to_vec();
+        loop_entry.push(branch(5, 3));
+        assert_eq!(BoundedControl::gather_constant_offsets(&loop_entry, 4, 16), None);
+    }
 
     #[test]
     fn task_mesh_isbe_native_modes_preserve_pseudo_fields_and_reject_invalid_access() {
@@ -5104,9 +6161,105 @@ mod tests {
     }
 
     #[test]
+    fn native_tex_f16_packs_first_component_in_low_half() {
+        // TEX RGB.F16: RG in R0, B + zero in R1. The general TEX path
+        // must match Fritchii's pack helper and Maxwell TEXS.F16 ordering.
+        let sample = Instruction { words: [0x01007b60, 0x30002800, 0x049e8701, 0x000f4200] };
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        let result = lower_to_maxwell(&[sample, exit]);
+        assert!(result.is_valid(), "{}", result.error);
+        let packs: Vec<_> = result.instructions.iter().copied()
+            .filter(|word| word & 0xffff000000000000 == 0x5c18000000000000)
+            .collect();
+        assert_eq!(packs.len(), 2);
+        // Distinct half bit patterns make swapped RG and discarded B observable.
+        for (word, low, high) in [(packs[0], 0x3400u32, 0x3800u32), (packs[1], 0x3a00, 0)] {
+            let mut regs = [0u32; 256];
+            regs[246] = low;
+            regs[247] = high;
+            let a = regs[((word >> 8) & 255) as usize];
+            let b = regs[((word >> 20) & 255) as usize];
+            let packed = (a << ((word >> 39) & 31)) + b;
+            assert_eq!(packed & 0xffff, low);
+            assert_eq!(packed >> 16, high);
+        }
+    }
+
+    #[test]
+    fn native_variable_rate_preserves_predication_and_uniform_destination() {
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        for opcode in [0x919, 0x9c3] {
+            for dest in [0u32, 3, 5, 21, 22, 27] {
+                for predicate in 0u32..15 {
+                    let insn = Instruction { words: [opcode | predicate << 12 | dest << 16,
+                        0, 0x8400, 0x000e2200] };
+                    let result = lower_to_maxwell(&[insn, exit]);
+                    assert!(result.is_valid(), "{}", result.error);
+                    let target = if opcode == 0x919 { dest }
+                        else if dest < 22 { 216 + dest } else { 218 + dest };
+                    // Upstream mov_imm: predicated MOV32I of packed width=1, height=1.
+                    assert_eq!(result.instructions[0], 0x010000101000f000
+                        | u64::from(predicate) << 16 | u64::from(target));
+                }
+            }
+        }
+        for words in [[0x00037919, 1, 0x8400, 0], [0x00057919, 0, 0x8401, 0]] {
+            assert_eq!(lower_to_maxwell(&[Instruction { words }, exit]).error,
+                "native special register");
+        }
+        assert_eq!(lower_to_maxwell(&[Instruction { words: [0x004079c3, 0, 0x8400, 0] }, exit]).error,
+            "native uniform special destination");
+    }
+
+    #[test]
+    fn native_uniform_mufu_and_txq_descriptor_zero_match_captured_encodings() {
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        let mufu = Instruction { words: [0x00098d08, 5, 0x08001000, 0x000e2400] };
+        assert!(ProgramLowering::uses_uniform_bank(&[mufu]));
+        let result = lower_to_maxwell(&[mufu, exit]);
+        assert!(result.is_valid(), "{}", result.error);
+        assert_eq!(result.instructions[0], 0x5080000000080009 | (221u64 << 8) | (4u64 << 20));
+        let mut invalid = mufu;
+        invalid.words[1] = 64;
+        assert_eq!(lower_to_maxwell(&[invalid, exit]).error, "native MUFU uniform source");
+
+        let query = Instruction { words: [0x02027b6f, 0x1600, 0x3ff, 0x000f4200] };
+        let result = lower_to_maxwell(&[query, exit]);
+        assert!(result.is_valid(), "{}", result.error);
+        assert_eq!(result.required_texture_buffer, 0);
+        assert_eq!(result.instructions[0], 0xdf48000000070002 | (2u64 << 8)
+            | (1u64 << 22) | (3u64 << 31) | (22u64 << 36));
+        let mut conflict = query;
+        conflict.words[1] |= 1 << 22;
+        assert_eq!(lower_to_maxwell(&[query, conflict, exit]).error, "native texture descriptor buffer conflict");
+    }
+
+    #[test]
+    fn native_fsetp_uniform_source_preserves_predicates_and_float_modes() {
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        // Captured FSETP with a uniform source; the uniform bank must be reserved.
+        let insn = Instruction { words: [0x22009c0b, 5, 0x0bf1b000, 0x000fc800] };
+        assert!(ProgramLowering::uses_uniform_bank(&[insn]));
+        let lowered = lower_to_maxwell(&[insn, exit]);
+        assert!(lowered.is_valid(), "{}", lowered.error);
+        // Fritchii FSETP emission: UR5 maps to R221, R34 is the other operand.
+        let expected = 0x5bb0000000000000u64
+            | (u64::from(insn.bits(12, 4)) << 16)
+            | u64::from(insn.bits(84, 3))
+            | (u64::from(insn.bits(81, 3)) << 3)
+            | (34 << 8) | (221 << 20)
+            | (u64::from(insn.bits(87, 3)) << 39)
+            | (u64::from(insn.bits(90, 1)) << 42)
+            | (u64::from(insn.bits(74, 2)) << 45)
+            | (u64::from(insn.bits(80, 1)) << 47)
+            | (u64::from(insn.bits(76, 4)) << 48);
+        assert_eq!(lowered.instructions[0], expected);
+    }
+
+    #[test]
     fn native_uniform_population_count_captured_operands_and_inversion() {
         let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
-        for (dest, source, target, mirror) in [(9, 8, 225, 224), (4, 7, 220, 223), (22, 63, 240, 255)] {
+        for (dest, source, target, mirror) in [(9, 8, 225, 224), (4, 7, 220, 223), (22, 63, 240, 255), (28, 8, 214, 224), (9, 28, 225, 214)] {
             for inverted in [false, true] {
                 let insn = Instruction { words: [0x72bf | (dest << 16), source | ((inverted as u32) << 31), 0x08000000, 0x000fe200] };
                 assert!(ProgramLowering::uses_uniform_bank(&[insn]));
@@ -5117,8 +6270,8 @@ mod tests {
         }
         for words in [
             [0x003f72bf, 8, 0x08000000, 0], // Uniform zero register is not a destination.
-            [0x001c72bf, 8, 0x08000000, 0], // No mirror for UR28.
-            [0x000972bf, 28, 0x08000000, 0],
+            [0x004072bf, 8, 0x08000000, 0], // Outside uniform register file.
+            [0x000972bf, 64, 0x08000000, 0],
             [0x000962bf, 8, 0x08000000, 0], // Predicated uniform form unsupported upstream.
             [0x000972bf, 0x100, 0x08000000, 0],
         ] {
@@ -5235,8 +6388,265 @@ mod tests {
 
     #[test]
     fn complete_programs_match_verbatim_upstream_cpp() {
+        check_program_fixture(include_str!("programs.fixture"), 67809);
+    }
+
+    #[test]
+    fn gameplay_shift_round_and_constant_load_modes_match_upstream_cpp() {
+        check_program_fixture(include_str!("gameplay_memory_programs.fixture"), 236);
+    }
+
+    #[test]
+    fn gameplay_conversion_and_extended_compare_modes_match_upstream_cpp() {
+        check_program_fixture(include_str!("gameplay_conversion_programs.fixture"), 450);
+    }
+
+    #[test]
+    fn high_register_programs_and_restoration_branches_match_upstream_cpp() {
+        check_program_fixture(include_str!("register_pressure_programs.fixture"), 806);
+    }
+
+    #[test]
+    fn float_integer_modes_and_modifiers_match_upstream_cpp() {
+        check_program_fixture(include_str!("float_integer_programs.fixture"), 9365);
+    }
+
+    #[test]
+    fn half_comparison_register_modes_match_upstream_cpp() {
+        check_program_fixture(include_str!("half_compare_programs.fixture"), 3073);
+    }
+
+    #[test]
+    fn texel_fetch_modes_and_descriptor_conflicts_match_upstream_cpp() {
+        check_program_fixture(include_str!("texel_fetch_programs.fixture"), 4097);
+    }
+
+    #[test]
+    fn gather_modes_and_constant_offset_proofs_match_upstream_cpp() {
+        check_program_fixture(include_str!("gather_programs.fixture"), 1457);
+    }
+
+    #[test]
+    fn selection_modifiers_and_uniform_operands_match_upstream_cpp() {
+        check_program_fixture(include_str!("selection_programs.fixture"), 5034);
+    }
+
+    #[test]
+    fn uniform_comparison_predicate_masks_match_upstream_cpp() {
+        check_program_fixture(include_str!("uniform_compare_programs.fixture"), 3625);
+    }
+
+    #[test]
+    fn uniform_moves_and_leading_bits_match_upstream_cpp() {
+        check_program_fixture(include_str!("uniform_move_flo_programs.fixture"), 14871);
+    }
+
+    #[test]
+    fn native_branch_tables_prove_calls_only_with_bounded_reaching_definitions() {
+        let code = [
+            Instruction { words: [0x00377802, 48, 0xf00, 0] },
+            Instruction { words: [0x00017202, 2, 0xf00, 0] },
+            Instruction { words: [0x7944, 112, 0x03c00000, 0] },
+            Instruction { words: [0x0c0c7817, 1, 0x03800000, 0] },
+            Instruction { words: [0x0c0e7819, 2, 0x6ff, 0] },
+            Instruction { words: [0x0e0c7b82, 0x00400800, 0x800, 0] },
+            Instruction { words: [0xff0d7819, 31, 0x1140c, 0] },
+            Instruction { words: [0x0c007949, 128, 0x03800000, 0] },
+            Instruction { words: [0x794d, 0, 0x03800000, 0] },
+            Instruction { words: [0x794d, 0, 0x03800000, 0] },
+            Instruction { words: [0x00017202, 2, 0xf00, 0] },
+            Instruction { words: [0x37007950, 0xffffff40, 0x03c3ffff, 0] },
+            Instruction { words: [0x7947, 0xfffffff0, 0x0383ffff, 0] },
+        ];
+        let table = |bank, offset| match (bank, offset) {
+            (1, 32) => Some(128u32.wrapping_sub(256)),
+            (1, 36) => Some(144u32.wrapping_sub(256)),
+            _ => None,
+        };
+        assert_eq!(BoundedControl::branch_table(&code, 7), Some((3, 1, 32, 2, 256)));
+        assert!(!BoundedControl::analyze(&code, false, false, 216).bounded);
+        let control = BoundedControl::analyze_with_cbuf(&code, false, false, 216, &mut table.clone());
+        assert!(control.bounded);
+        assert_eq!(control.links[2], 55);
+        assert!(control.checked_returns[11]);
+        let lowered = lower_to_maxwell_with_cbuf(&code, LoweringOptions::default(), &mut table.clone());
+        assert!(lowered.is_valid(), "{} at {}", lowered.error, lowered.error_offset);
+        // Bad targets: unaligned, outside capture, inside the definition chain,
+        // or entering a callee without CALL. Signed backward offsets above work.
+        for target in [129u32, 208, 64, 160] {
+            let control = BoundedControl::analyze_with_cbuf(&code, false, false, 216,
+                &mut |_, _| Some(target.wrapping_sub(256)));
+            assert!(!control.bounded, "target {target}");
+        }
+        for (pc, word, value) in [
+            (3, 1, u32::MAX), (3, 2, 0x03800200), (3, 2, 0x07800000),
+            (4, 1, 1), (5, 0, 0x0e0c0b82), (5, 2, 0xa00),
+            (6, 0, 0xff0c7819),
+        ] {
+            let mut changed = code;
+            changed[pc].words[word] = value;
+            assert!(BoundedControl::branch_table(&changed, 7).is_none(), "mutation {pc}/{word}");
+            assert!(!BoundedControl::analyze_with_cbuf(&changed, false, false, 216, &mut table.clone()).bounded);
+        }
+    }
+
+    #[test]
+    fn secondary_branch_predicates_preserve_call_entry_proofs() {
+        for primary in 0..16 {
+            for secondary in 0..16 {
+                let mut code = [
+                    Instruction { words: [0x947 | (primary << 12), 0, secondary << 23, 0] },
+                    Instruction { words: [0x00377802, 64, 0xf00, 0] },
+                    Instruction { words: [0x00017202, 2, 0xf00, 0] },
+                    Instruction { words: [0x7944, 16, 0x03c00000, 0] },
+                    Instruction { words: [0x794d, 0, 0x03800000, 0] },
+                    Instruction { words: [0x00017202, 2, 0xf00, 0] },
+                    Instruction { words: [0x37007950, 0xffffff90, 0x03c3ffff, 0] },
+                ];
+                let control = BoundedControl::analyze(&code, false, false, 216);
+                assert!(control.bounded, "predicates {primary}/{secondary}");
+                assert_eq!(control.direct_targets[0], 1);
+                assert_eq!(control.links[3], 55);
+                assert!(control.checked_returns[6]);
+                let lowered = lower_to_maxwell(&code);
+                assert!(lowered.is_valid(), "{}", lowered.error);
+                // Even a conditional entry between link setup and CALL invalidates
+                // the proof. Never discard the edge to accept a wider predicate set.
+                code[0].words[1] = 16;
+                assert!(!BoundedControl::analyze(&code, false, false, 216).bounded);
+                code[0].words[1] = 0;
+                for reserved in [1 << 18, 1 << 22, 1 << 28, 1 << 31] {
+                    code[0].words[2] = (secondary << 23) | reserved;
+                    assert!(!BoundedControl::analyze(&code, false, false, 216).bounded);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_loop_transfer_does_not_require_a_return_link() {
+        let code = [
+            Instruction { words: [0x00377802, 32, 0xf00, 0] },
+            Instruction { words: [0x7944, 48, 0x03c00000, 0] },
+            Instruction { words: [0x0944, 16, 0x03c00000, 0] },
+            Instruction { words: [0x7947, 0xffffffe0, 0x0383ffff, 0] },
+            Instruction { words: [0x794d, 0, 0x03800000, 0] },
+            Instruction { words: [0x00017202, 2, 0xf00, 0] },
+            Instruction { words: [0x37007950, 0xffffff90, 0x03c3ffff, 0] },
+        ];
+        let control = BoundedControl::analyze(&code, false, false, 216);
+        assert!(control.bounded);
+        assert_eq!(control.links[1], 55);
+        assert_eq!(control.links[2], u32::MAX);
+        assert!(control.checked_returns[6]);
+        assert!(lower_to_maxwell(&code).is_valid());
+    }
+
+    #[test]
+    fn relative_computed_branch_base_checks_alignment_and_encoded_range() {
+        for (base, expected) in [(0i64, ""), (0x1f00, ""), (0x7500, ""),
+            (0x800050, ""), (0x800060, "native computed branch range"),
+            (-16, "native computed branch relative base"), (1, "native computed branch relative base")] {
+            let relative = (base - 16) as u64;
+            let code = [Instruction { words: [0x0c007949, relative as u32,
+                0x03800000 | ((relative >> 32) as u32 & 0x3ffff), 0] },
+                Instruction { words: [0x7947, 0xfffffff0, 0x0383ffff, 0] }];
+            assert_eq!(lower_to_maxwell(&code).error, expected, "base {base:#x}");
+        }
+    }
+
+    #[test]
+    fn imad_carry_modes_match_upstream_cpp() {
+        check_program_fixture(include_str!("imad_carry_programs.fixture"), 1396);
+    }
+
+    #[test]
+    fn redux_modes_match_upstream_cpp() {
+        check_program_fixture(include_str!("redux_programs.fixture"), 512);
+    }
+
+    #[test]
+    fn uniform_select_predicates_and_clamp_proofs_match_upstream_cpp() {
+        check_program_fixture(include_str!("uniform_select_programs.fixture"), 2504);
+    }
+
+    #[test]
+    fn uniform_high_word_shift_matches_upstream_cpp() {
+        check_program_fixture(include_str!("uniform_high_shift_programs.fixture"), 4751);
+    }
+
+    #[test]
+    fn gradient_texture_masks_and_split_destinations_match_upstream_cpp() {
+        check_program_fixture(include_str!("gradient_programs.fixture"), 1792);
+    }
+
+    #[test]
+    fn register_shift_modes_match_upstream_cpp() {
+        check_program_fixture(include_str!("register_shift_programs.fixture"), 3807);
+    }
+
+    #[test]
+    fn minmax_immediate_boundaries_match_upstream_cpp() {
+        check_program_fixture(include_str!("minmax_programs.fixture"), 4096);
+    }
+
+    #[test]
+    fn bit_modes_and_uniform_register_boundaries_match_upstream_cpp() {
+        check_program_fixture(include_str!("bit_modes_programs.fixture"), 2552);
+    }
+
+    #[test]
+    fn texture_sample_handles_and_descriptor_buffers_match_upstream_cpp() {
+        check_program_fixture(include_str!("texture_sample_programs.fixture"), 9501);
+    }
+
+    #[test]
+    fn bounded_control_preflight_matches_verbatim_cpp() {
         let mut count = 0;
-        for (line_number, line) in include_str!("programs.fixture").lines().enumerate() {
+        for (line_number, line) in include_str!("bounded_control.fixture").lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') { continue; }
+            let fields: Vec<_> = line.split('|').collect();
+            let input: Vec<u32> = fields[0].split_whitespace().map(|s| s.parse().unwrap()).collect();
+            let code: Vec<_> = input[4..].chunks_exact(4).map(|w| Instruction { words: w.try_into().unwrap() }).collect();
+            assert_eq!(code.len(), input[3] as usize);
+            let actual = BoundedControl::analyze(&code, input[0] != 0, input[1] != 0, input[2]);
+            assert_eq!(actual.bounded, fields[1] == "1", "bounded line {}", line_number + 1);
+            for (kind, values, expected) in [
+                ("links", actual.links, fields[2]), ("targets", actual.direct_targets, fields[3]),
+                ("returns", actual.checked_returns.into_iter().map(u32::from).collect(), fields[4]),
+                ("dead", actual.dead_instructions.into_iter().map(u32::from).collect(), fields[5]),
+            ] {
+                let expected: Vec<u32> = expected.split_whitespace().map(|s| s.parse().unwrap()).collect();
+                assert_eq!(values, expected, "{} line {}", kind, line_number + 1);
+            }
+            count += 1;
+        }
+        assert_eq!(count, 3528);
+    }
+
+    #[test]
+    fn bounded_call_branch_and_exit_programs_match_upstream_cpp() {
+        check_program_fixture(include_str!("bounded_programs.fixture"), 3528);
+    }
+
+    #[test]
+    fn captured_runtime_shader_programs_match_upstream_cpp() {
+        check_program_fixture(include_str!("runtime_shader_programs.fixture"), 5);
+    }
+
+    #[test]
+    fn uniform_shift_boundaries_guards_and_imad_addends_match_upstream_cpp() {
+        check_program_fixture(include_str!("uniform_shader_programs.fixture"), 386);
+    }
+
+    #[test]
+    fn address_and_uniform_carry_programs_match_upstream_cpp() {
+        check_program_fixture(include_str!("address_carry_programs.fixture"), 388);
+    }
+
+    fn check_program_fixture(fixture: &str, expected_count: usize) {
+        let mut count = 0;
+        for (line_number, line) in fixture.lines().enumerate() {
             if line.starts_with('#') || line.is_empty() {
                 continue;
             }
@@ -5309,7 +6719,7 @@ mod tests {
             );
             count += 1;
         }
-        assert_eq!(count, 67809);
+        assert_eq!(count, expected_count);
     }
 
     #[test]
@@ -5336,16 +6746,21 @@ mod tests {
 
     #[test]
     fn operand_helpers_match_verbatim_upstream_cpp() {
-        check_fixture(include_str!("operand_helpers.fixture"), 64528);
+        check_fixture(include_str!("operand_helpers.fixture"), 64524);
     }
 
     #[test]
-    fn tensor_modes_match_upstream_and_are_captured_once() {
+    fn wide_multiply_signed_unsigned_addends_and_carries_match_upstream_cpp() {
+        check_fixture(include_str!("wide_multiply.fixture"), 432);
+    }
+
+    #[test]
+    fn matrix_software_matches_upstream_without_environment_gate() {
         const CHILD: &str = "RUZU_TEST_AMPERE_TENSOR_MODE";
         let Ok(mode) = std::env::var(CHILD) else {
             for mode in ["missing", "stub", "emulate", "empty", "other"] {
                 let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-                command.args(["--exact", "frontend::ampere::lower_to_maxwell::tests::tensor_modes_match_upstream_and_are_captured_once", "--test-threads=1"]);
+                command.args(["--exact", "frontend::ampere::lower_to_maxwell::tests::matrix_software_matches_upstream_without_environment_gate", "--test-threads=1"]);
                 command.env(CHILD, mode).env_remove("EDEN_NX2_TENSOR");
                 match mode {
                     "missing" => {}
@@ -5369,15 +6784,10 @@ mod tests {
             }
             return;
         };
-        let fixture = match mode.as_str() {
-            "missing" => include_str!("tensor_missing.fixture"),
-            "stub" => include_str!("tensor_stub.fixture"),
-            "empty" => include_str!("tensor_empty.fixture"),
-            _ => include_str!("tensor_emulate.fixture"),
-        };
+        let fixture = include_str!("tensor_emulate.fixture");
         check_fixture(fixture, 165);
-        // This child runs only this test. Changing the environment after the
-        // first HMMA must not change its function-local static mode.
+        // Legacy environment values, including stub, must not replace real
+        // matrix arithmetic with a placeholder.
         std::env::set_var(
             "EDEN_NX2_TENSOR",
             if mode == "stub" { "emulate" } else { "stub" },
@@ -5401,7 +6811,9 @@ mod tests {
             let insn = Instruction {
                 words: input[9..13].try_into().unwrap(),
             };
+            let uniforms = &UniformRegisters::default();
             let mut lowering = InstructionLowering {
+                uniforms,
                 predicate: u64::from(insn.bits(12, 4)) << 16,
                 dest: u64::from(insn.bits(16, 8)),
                 insn,
@@ -5409,7 +6821,7 @@ mod tests {
                 instructions: &mut emitted,
             };
             let value = match input[0] {
-                0 => InstructionLowering::uniform_register(p[0]),
+                0 => uniforms.register(p[0]),
                 1 => {
                     let valid = u32::from(lowering.valid_cbuf());
                     lowering.emit(lowering.cbuf());
@@ -5450,7 +6862,7 @@ mod tests {
                 }
                 9 => {
                     let mut opcode = lowering.insn.bits(0, 12);
-                    match UniformRewrite::new(&mut lowering.insn, &mut opcode) {
+                    match UniformRewrite::new(&mut lowering.insn, &mut opcode, uniforms) {
                         Err(error) => {
                             lowering.operand_error = error;
                             0
@@ -5482,9 +6894,9 @@ mod tests {
                     let native_predicate = lowering.insn.bits(12, 4);
                     let result = if matches!(
                         opcode,
-                        0xc24 | 0xe24 | 0x224 | 0x2a5 | 0x827 | 0xa24 | 0x424 | 0x624 | 0x824
+                        0xc24 | 0xe24 | 0x224 | 0x2a5 | 0x225 | 0x227 | 0x625 | 0x825 | 0xa27 | 0x827 | 0xa24 | 0x424 | 0x624 | 0x824
                     ) {
-                        lowering.lower_integer_multiply(opcode, native_predicate)
+                        lowering.lower_integer_multiply(opcode, native_predicate, p[2] != 0)
                     } else if matches!(
                         opcode,
                         0x806
@@ -5529,6 +6941,7 @@ mod tests {
                         opcode,
                         0x301
                             | 0x219
+                            | 0xa19
                             | 0xc19
                             | 0x300
                             | 0xd00
@@ -5543,14 +6956,15 @@ mod tests {
                             | 0x23a
                     ) {
                         lowering.lower_bits_and_shared(opcode, native_predicate)
-                    } else if matches!(opcode, 0x305 | 0xb05 | 0xd05 | 0xb6f | 0xb66 | 0x91a) {
+                    } else if matches!(opcode, 0x305 | 0xb05 | 0xd05 | 0xb6f | 0x370 | 0xb66 | 0x91a) {
                         lowering.lower_conversion_and_fetch(opcode, &mut required_texture_buffer)
-                    } else if matches!(opcode, 0xb69 | 0xb63 | 0xb60) {
-                        lowering.lower_texture_sample(opcode, &mut required_texture_buffer)
+                    } else if matches!(opcode, 0xb69 | 0xb63 | 0xf63 | 0xb60 | 0xf60 | 0x361) {
+                        lowering.lower_texture_sample(opcode, &mut required_texture_buffer, &[], p[0], false)
                     } else if matches!(
                         opcode,
                         0x816
                             | 0x307
+                            | 0xb07
                             | 0x321
                             | 0x322
                             | 0x387
@@ -5564,11 +6978,11 @@ mod tests {
                     ) {
                         lowering.lower_permutation_and_moves(opcode)
                     } else if opcode == 0x23c {
-                        lowering.lower_matrix_multiply()
-                    } else if matches!(opcode, 0xa11 | 0x211 | 0x811) {
-                        lowering.lower_effective_address(opcode)
+                        lowering.lower_matrix_multiply(false, false)
+                    } else if matches!(opcode, 0xa11 | 0x211 | 0x811 | 0xc11) {
+                        lowering.lower_effective_address(opcode, p[2] != 0)
                     } else if matches!(opcode, 0x210 | 0x810 | 0xa10 | 0xc10) {
-                        lowering.lower_integer_add(opcode, p[2] != 0)
+                        lowering.lower_integer_add(opcode, p[2] != 0, false)
                     } else if matches!(
                         opcode,
                         0x207
@@ -5584,6 +6998,7 @@ mod tests {
                             | 0x20b
                             | 0x80b
                             | 0xa0b
+                            | 0xc0b
                             | 0x20c
                             | 0x80c
                             | 0xa0c
@@ -5605,11 +7020,14 @@ mod tests {
                     } else if matches!(
                         opcode,
                         0x308
+                            | 0x908
+                            | 0xd08
                             | 0xb08
                             | 0x526
                             | 0x326
                             | 0x81a
                             | 0x299
+                            | 0x499
                             | 0x419
                             | 0x805
                             | 0x306
@@ -5664,7 +7082,7 @@ mod tests {
                         if p[0] > 0 {
                             code[p[0] as usize - 1].words.copy_from_slice(&p[4..8]);
                         }
-                        lowering.lower_special_and_global(opcode, &code, p[0])
+                        lowering.lower_special_and_global(opcode, &code, p[0], &[])
                     } else {
                         lowering.lower_float_and_half(
                             opcode,
@@ -5735,14 +7153,20 @@ mod tests {
         program.result.source_instruction_offsets = vec![0, 2, 3];
         program.relocations = vec![
             Relocation {
+                call: false,
+                output_target: None,
                 output_index: 0,
                 target: 1,
             },
             Relocation {
+                call: false,
+                output_target: None,
                 output_index: 2,
                 target: 0,
             },
             Relocation {
+                call: false,
+                output_target: None,
                 output_index: 3,
                 target: 2,
             },
@@ -5774,6 +7198,8 @@ mod tests {
             program.result.source_instruction_offsets = vec![source_offset];
             program.result.required_texture_buffer = 17;
             program.relocations.push(Relocation {
+                call: false,
+                output_target: None,
                 output_index: 0,
                 target,
             });
@@ -5798,11 +7224,13 @@ mod tests {
             words: [0x00000292, 0, 0, 0],
         };
         let mut opcode = 0x292;
-        let rewrite = UniformRewrite::new(&mut insn, &mut opcode).unwrap();
+        let uniforms = &UniformRegisters::default();
+        let rewrite = UniformRewrite::new(&mut insn, &mut opcode, uniforms).unwrap();
         assert!(rewrite.guarded_uniform);
         assert_ne!(rewrite.output_mask, 0);
         let mut words = Vec::new();
         let mut lowering = InstructionLowering {
+            uniforms,
             insn,
             predicate: rewrite.predicate,
             dest: 216,

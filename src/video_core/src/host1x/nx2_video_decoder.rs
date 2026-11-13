@@ -82,6 +82,8 @@ fn codec_from_mime(mime: &str) -> Option<VideoCodec> {
         Some(VideoCodec::VP9)
     } else if mime.contains("vp8") {
         Some(VideoCodec::VP8)
+    } else if mime.contains("av01") || mime.contains("av1") {
+        Some(VideoCodec::AV1)
     } else if mime.contains("avc") || mime.contains("264") {
         Some(VideoCodec::H264)
     } else {
@@ -338,6 +340,40 @@ impl Nx2VideoDecoder {
                 );
                 return;
             }
+            if format == Nx2PictureFormat::Nv12
+                && frame.get_pixel_format() == av_get_pix_fmt(c"yuv420p".as_ptr())
+                && frame.get_color_range() != AVCOL_RANGE_JPEG
+                && frame.get_width() == width as c_int
+                && frame.get_height() == height as c_int
+            {
+                let source = frame.get_planes();
+                let strides = frame.get_strides();
+                let chroma_width = row_bytes as usize / 2;
+                if source[..3].iter().any(|p| p.is_null())
+                    || strides[0] < width as c_int
+                    || strides[1] < chroma_width as c_int
+                    || strides[2] < chroma_width as c_int
+                {
+                    return;
+                }
+                for y in 0..height as usize {
+                    std::ptr::copy_nonoverlapping(
+                        source[0].add(y * strides[0] as usize),
+                        out.as_mut_ptr().add(y * pitch as usize),
+                        width as usize,
+                    );
+                }
+                for y in 0..(height as usize + 1) / 2 {
+                    let u = source[1].add(y * strides[1] as usize);
+                    let v = source[2].add(y * strides[2] as usize);
+                    let dst = &mut out[chroma_offset as usize + y * pitch as usize..];
+                    for x in 0..chroma_width {
+                        dst[x * 2] = *u.add(x);
+                        dst[x * 2 + 1] = *v.add(x);
+                    }
+                }
+                return;
+            }
             self.inner.scaler = sws_getCachedContext(
                 self.inner.scaler,
                 frame.get_width(),
@@ -364,7 +400,7 @@ impl Nx2VideoDecoder {
                 );
                 return;
             }
-            if format != Nx2PictureFormat::Nv12 {
+            {
                 let mut space = SWS_CS_ITU601;
                 if frame.get_colorspace() == AVCOL_SPC_BT709
                     || (frame.get_colorspace() == AVCOL_SPC_UNSPECIFIED
@@ -378,12 +414,16 @@ impl Nx2VideoDecoder {
                     space = SWS_CS_BT2020;
                 }
                 let coefficients = sws_getCoefficients(space);
+                let full_range_source = frame.get_color_range() == AVCOL_RANGE_JPEG
+                    || [c"yuvj420p", c"yuvj422p", c"yuvj444p", c"yuvj440p", c"yuvj411p"]
+                        .iter()
+                        .any(|name| frame.get_pixel_format() == av_get_pix_fmt(name.as_ptr()));
                 sws_setColorspaceDetails(
                     self.inner.scaler,
                     coefficients,
-                    i32::from(frame.get_color_range() == AVCOL_RANGE_JPEG),
+                    i32::from(full_range_source),
                     coefficients,
-                    1,
+                    i32::from(format != Nx2PictureFormat::Nv12),
                     0,
                     1 << 16,
                     1 << 16,
@@ -535,12 +575,16 @@ mod tests {
     ];
 
     fn software_decoder() -> Nx2VideoDecoder {
-        let decoder = Decoder::new(VideoCodec::VP8);
+        software_decoder_for(VideoCodec::VP8, "video/vp8")
+    }
+
+    fn software_decoder_for(codec: VideoCodec, mime: &str) -> Nx2VideoDecoder {
+        let decoder = Decoder::new(codec);
         let mut context = DecoderContext::new(&decoder);
         assert!(context.open_context(&decoder, &[]));
         Nx2VideoDecoder {
             inner: Box::new(Impl {
-                name: "video/vp8".into(),
+                name: mime.into(),
                 decoder: Some(decoder),
                 context: Some(context),
                 hardware: None,
@@ -551,6 +595,76 @@ mod tests {
                 packet: Vec::new(),
             }),
         }
+    }
+
+    #[test]
+    fn av1_decoder_is_available_and_opens() {
+        let decoder = Decoder::new(VideoCodec::AV1);
+        assert!(!decoder.get_codec().is_null(), "FFmpeg must provide AV1 decoding");
+        let mut context = DecoderContext::new(&decoder);
+        assert!(context.open_context(&decoder, &[]));
+    }
+
+    #[test]
+    fn av1_software_decodes_and_renders_a_frame() {
+        // Original fixture: Pillow AVIF quality=100, speed=10, solid red 16x16;
+        // elementary AV1 stream extracted from the generated mdat box.
+        const RED_AV1: &[u8] = &[
+            0x12, 0x00, 0x0a, 0x09, 0x18, 0x0c, 0xff, 0xd8, 0x20, 0x21, 0xa0, 0xd0,
+            0x80, 0x32, 0x13, 0x10, 0x00, 0x00, 0x39, 0x50, 0xbb, 0x24, 0x85, 0x8b,
+            0x56, 0xea, 0xd5, 0xa8, 0x8a, 0xed, 0x8c, 0x83, 0x54, 0x8e,
+        ];
+        let mut decoder = software_decoder_for(VideoCodec::AV1, "video/av1");
+        let mut pictures = Vec::new();
+        decoder.decode(RED_AV1, 123, &mut pictures);
+        decoder.drain(&mut pictures);
+        assert_eq!(pictures.len(), 1);
+        assert_eq!((pictures[0].width, pictures[0].height, pictures[0].pts), (16, 16, 123));
+        let mut pixels = [0; 16 * 16 * 4];
+        decoder.render(&pictures[0], Nx2PictureFormat::Rgba8, 16, 16, 64, 0, &mut pixels);
+        assert!(pixels.chunks_exact(4).all(|p| p[0] >= 245 && p[1] <= 10 && p[2] <= 10 && p[3] == 255));
+        // Full-range AV1 must become limited-range NV12, including when scaled.
+        for size in [16usize, 8] {
+            let chroma = size * size;
+            let mut nv12 = vec![0; chroma * 3 / 2];
+            decoder.render(&pictures[0], Nx2PictureFormat::Nv12,
+                size as u32, size as u32, size as u64, chroma as u64, &mut nv12);
+            assert!(nv12[..chroma].iter().all(|&y| (75..=85).contains(&y)), "luma {:?}", &nv12[..size]);
+            assert!(nv12[chroma..].chunks_exact(2).all(|uv|
+                (85..=100).contains(&uv[0]) && (230..=245).contains(&uv[1])),
+                "chroma {:?}", &nv12[chroma..chroma+size]);
+        }
+    }
+
+    #[test]
+    fn planar_yuv420_copy_preserves_samples_and_destination_padding() {
+        let mut decoder = software_decoder();
+        let mut pictures = Vec::new();
+        decoder.decode(RED_VP8, 0, &mut pictures);
+        let picture = &pictures[0];
+        assert_eq!(picture.frame.get_pixel_format(), unsafe { av_get_pix_fmt(c"yuv420p".as_ptr()) });
+        assert_ne!(picture.frame.get_color_range(), AVCOL_RANGE_JPEG);
+        let (pitch, chroma_offset) = (32usize, 544usize);
+        let mut out = vec![0x5a; chroma_offset + pitch * 8];
+        decoder.render(picture, Nx2PictureFormat::Nv12, 16, 16,
+            pitch as u64, chroma_offset as u64, &mut out);
+        let planes = picture.frame.get_planes();
+        let strides = picture.frame.get_strides();
+        unsafe {
+            for y in 0..16 {
+                assert_eq!(&out[y*pitch..y*pitch+16],
+                    std::slice::from_raw_parts(planes[0].add(y*strides[0] as usize),16));
+                assert!(out[y*pitch+16..(y+1)*pitch].iter().all(|&v| v==0x5a));
+            }
+            for y in 0..8 {
+                for x in 0..8 {
+                    assert_eq!(out[chroma_offset+y*pitch+x*2], *planes[1].add(y*strides[1] as usize+x));
+                    assert_eq!(out[chroma_offset+y*pitch+x*2+1], *planes[2].add(y*strides[2] as usize+x));
+                }
+                assert!(out[chroma_offset+y*pitch+16..chroma_offset+(y+1)*pitch].iter().all(|&v| v==0x5a));
+            }
+        }
+        assert!(out[512..chroma_offset].iter().all(|&v| v==0x5a));
     }
 
     #[test]
@@ -720,6 +834,10 @@ mod tests {
     fn mime_order_closed_decoder_and_multiset_duplicate_contracts() {
         assert_eq!(codec_from_mime("vp8-vp9-avc"), Some(VideoCodec::VP9));
         assert_eq!(codec_from_mime("video/vp8"), Some(VideoCodec::VP8));
+        assert_eq!(codec_from_mime("video/av1"), Some(VideoCodec::AV1));
+        assert_eq!(codec_from_mime("video/av01"), Some(VideoCodec::AV1));
+        assert_eq!(codec_from_mime("vp8-av1-avc"), Some(VideoCodec::VP8));
+        assert_eq!(codec_from_mime("av01-avc"), Some(VideoCodec::AV1));
         assert_eq!(codec_from_mime("video/avc"), Some(VideoCodec::H264));
         assert_eq!(codec_from_mime("video/h264"), Some(VideoCodec::H264));
         assert_eq!(codec_from_mime("video/VP9"), None);

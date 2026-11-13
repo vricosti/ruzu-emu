@@ -1758,6 +1758,30 @@ impl Memory {
         }
     }
 
+    /// Atomic read matching Fritchii `Memory::Read32Acquire`.
+    /// `None` represents the upstream false result (unmapped or unaligned).
+    pub fn read_32_acquire(&self, vaddr: u64) -> Option<u32> {
+        if self.current_page_table.is_null() || vaddr & 3 != 0 {
+            return None;
+        }
+        let ptr = self.get_pointer_impl(vaddr);
+        if ptr.is_null() {
+            return None;
+        }
+        if self.page_type_at(vaddr) == Some(PageType::RasterizerCachedMemory) {
+            self.handle_rasterizer_download(vaddr, 4);
+        }
+        let atomic = unsafe { &*(ptr as *const std::sync::atomic::AtomicU32) };
+        let actual = match atomic.compare_exchange(
+            0, 0,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(value) | Err(value) => value,
+        };
+        Some(u32::from_le(actual))
+    }
+
     /// Read a u64 (LE). Matches upstream `Memory::Read64`.
     pub fn read_64(&self, vaddr: u64) -> u64 {
         if (vaddr & 7) == 0 {
@@ -3166,6 +3190,26 @@ mod process_fastmem_tests {
                 &device_memory.buffer,
             )
         }
+    }
+
+    #[test]
+    fn acquire_read_validates_mapping_and_preserves_observed_bits() {
+        let device_memory = DeviceMemory::with_size(0x20_000);
+        let mut memory = memory_for_device(&device_memory);
+        assert_eq!(memory.read_32_acquire(0x4000), None);
+        let mut page_table = PageTable::new();
+        page_table.resize(32, PAGE_BITS);
+        memory.set_current_page_table(&mut page_table, false);
+        memory.map_pages(
+            &mut page_table, 4, 1, dram_memory_map::BASE + 0x2000, PageType::Memory,
+        );
+        for value in [0, 1, 0x8000_0000, u32::MAX] {
+            memory.write_32_no_rasterizer(0x4000, value);
+            assert_eq!(memory.read_32_acquire(0x4000), Some(value));
+            assert_eq!(memory.read_32(0x4000), value);
+        }
+        assert_eq!(memory.read_32_acquire(0x4001), None);
+        assert_eq!(memory.read_32_acquire(0x5000), None);
     }
 
     #[test]

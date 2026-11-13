@@ -96,6 +96,7 @@ pub mod video_multiply_add;
 pub mod video_set_predicate;
 pub mod vote;
 pub mod warp_shuffle;
+pub mod tensor_mul_add;
 
 use crate::environment::Environment;
 use crate::frontend::maxwell_opcodes::{MaxwellOpcode, SrcType};
@@ -169,7 +170,7 @@ impl<'a> TranslatorVisitor<'a> {
 
     /// Get a register value as U32.
     pub fn x(&mut self, reg_idx: u32) -> Value {
-        let reg = Reg(reg_idx as u8);
+        let reg = Reg(u64::from(reg_idx));
         if reg.is_zero() {
             Value::ImmU32(0)
         } else {
@@ -200,7 +201,7 @@ impl<'a> TranslatorVisitor<'a> {
 
     /// Set a register to a U32 value.
     pub fn set_x(&mut self, reg_idx: u32, value: Value) {
-        let reg = Reg(reg_idx as u8);
+        let reg = Reg(u64::from(reg_idx));
         if !reg.is_zero() {
             self.ir.set_reg(reg, value);
         }
@@ -834,6 +835,7 @@ impl<'a> TranslatorVisitor<'a> {
             MaxwellOpcode::VOTE => self.translate_vote(insn),
             MaxwellOpcode::VOTE_vtg => self.translate_vote_vtg(insn),
             MaxwellOpcode::SHFL => self::warp_shuffle::shfl(self, insn),
+            MaxwellOpcode::TENSOR_MUL_ADD => self::tensor_mul_add::tensor_mul_add(self, insn),
 
             // predicate_set_predicate.cpp
             MaxwellOpcode::PSETP => {

@@ -1533,15 +1533,23 @@ mod tests {
 
     #[test]
     fn indirect_branch_labels_translate_addresses_but_keep_native_comparison_values() {
+        use crate::frontend::ampere::lower_to_maxwell::{lower_to_maxwell, Instruction as NativeInstruction};
+        for native_base in [0u32, 0x1f00, 0x7500] {
         let start = Location::new(0x50);
-        let brx = start.add_instructions(4);
+        let mut native = vec![NativeInstruction { words: [0x7918, 0, 0, 0] }; 4];
+        let relative = i64::from(native_base) - 5 * 16;
+        native.push(NativeInstruction { words: [0x0c007949, relative as u32,
+            0x03800000 | (((relative as u64) >> 32) as u32 & 0x3ffff), 0] });
+        native.push(NativeInstruction { words: [0x7947, 0xfffffff0, 0x0383ffff, 0] });
+        let lowered = lower_to_maxwell(&native);
+        assert!(lowered.is_valid(), "{}", lowered.error);
         let mut env = PretEnvironment::default();
         for (index, word) in [
             0x1C0F_FFFF_FFF7_0C0C,
             0x3820_0380_0027_0C0C,
             0x3848_0000_0027_0C0C,
             0xEF94_0010_0C07_0C0C,
-            0xE250_0FFF_BE87_0C0F,
+            lowered.instructions[4],
         ]
         .into_iter()
         .enumerate()
@@ -1552,7 +1560,7 @@ mod tests {
         for (index, target) in [0x20u32, 0x10, 0x20].into_iter().enumerate() {
             env.cbuf.insert(
                 (1, 192 + index as u32 * 4),
-                target.wrapping_sub(brx.offset()).wrapping_add(1040),
+                target.wrapping_sub(native_base),
             );
         }
         env.translated_addresses
@@ -1584,8 +1592,9 @@ mod tests {
         assert_eq!(block.branch_reg, 12);
         assert_eq!(
             block.branch_offset,
-            (brx.offset() as i32).wrapping_sub(1040)
+            native_base as i32
         );
+        }
     }
 
     #[test]

@@ -739,14 +739,16 @@ impl IManagerForApplication {
             ),
             (
                 3,
-                Some(Self::load_id_token_cache_handler),
-                "LoadIdTokenCache",
+                Some(Self::load_id_token_cache_deprecated_handler),
+                "LoadIdTokenCacheDeprecated",
             ),
+            (4, Some(Self::load_id_token_cache_handler), "LoadIdTokenCache"),
             (
                 130,
                 Some(Self::get_nintendo_account_user_resource_cache_for_application_handler),
                 "GetNintendoAccountUserResourceCacheForApplication",
             ),
+            (136, Some(Self::get_nintendo_account_user_resource_cache_for_application_handler), "GetNintendoAccountUserResourceCache"),
             (150, None, "CreateAuthorizationRequest"),
             (
                 160,
@@ -764,9 +766,8 @@ impl IManagerForApplication {
     }
 
     fn check_availability_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
-        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        let mut rb = ResponseBuilder::new(ctx, 2, 0, 0);
         rb.push_result(RESULT_SUCCESS);
-        rb.push_bool(false);
     }
 
     fn get_account_id_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
@@ -789,10 +790,21 @@ impl IManagerForApplication {
         push_interface_response(ctx, svc.ensure_token_id.clone());
     }
 
-    fn load_id_token_cache_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+    fn load_id_token_cache_deprecated_handler(this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
         let svc =
             unsafe { &*(this as *const dyn ServiceFramework as *const IManagerForApplication) };
         svc.ensure_token_id.load_id_token_cache(ctx);
+    }
+
+    /// Fritchii IManagerForApplication::LoadIdTokenCache (command 4).
+    /// Upstream's offline placeholder is a zeroed 0x100-byte token, not authentication.
+    fn load_id_token_cache_handler(_this: &dyn ServiceFramework, ctx: &mut HLERequestContext) {
+        log::warn!("(STUBBED) IManagerForApplication::LoadIdTokenCache called");
+        let token_data = [0u8; 0x100];
+        ctx.write_buffer(&token_data, 0);
+        let mut rb = ResponseBuilder::new(ctx, 3, 0, 0);
+        rb.push_result(RESULT_SUCCESS);
+        rb.push_u32(token_data.len() as u32);
     }
 
     fn get_nintendo_account_user_resource_cache_for_application_handler(
@@ -2735,6 +2747,23 @@ mod tests {
         let mut interface = make_interface(crate::core::SystemRef::from_ref(&system));
         assert_eq!(interface.initialize_application_info(), RESULT_SUCCESS);
         assert_eq!(interface.initialize_application_info(), RESULT_SUCCESS);
+    }
+
+    #[test]
+    fn application_token_commands_preserve_deprecated_and_current_response_shapes() {
+        let service = IManagerForApplication::new(crate::core::SystemRef::null(), Arc::new(Mutex::new(ProfileManager::new())));
+        for (command, size) in [(3, 0), (4, 0x100)] {
+            let mut ctx = HLERequestContext::new();
+            service.handlers[&command].handler_callback.unwrap()(&service, &mut ctx);
+            let mut expected = HLERequestContext::new();
+            let mut rb = ResponseBuilder::new(&mut expected, 3, 0, 0);
+            rb.push_result(RESULT_SUCCESS); rb.push_u32(size); drop(rb);
+            assert_eq!(ctx.command_buffer(), expected.command_buffer());
+        }
+        assert!(service.handlers[&136].handler_callback.is_some());
+        let mut ctx = HLERequestContext::new();
+        service.handlers[&0].handler_callback.unwrap()(&service, &mut ctx);
+        assert_eq!(ctx.write_size - ctx.data_payload_offset, 2);
     }
 
     #[test]

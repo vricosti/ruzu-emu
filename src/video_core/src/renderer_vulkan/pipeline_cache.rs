@@ -187,6 +187,9 @@ pub(super) fn make_shader_profile(device: &Device) -> Profile {
         has_broken_fp16_float_controls: driver_id == vk::DriverId::NVIDIA_PROPRIETARY,
         ignore_nan_fp_comparisons: false,
         has_broken_spirv_subgroup_mask_vector_extract_dynamic: false,
+        has_broken_spirv_subgroup_shuffle: driver_id == vk::DriverId::QUALCOMM_PROPRIETARY,
+        has_broken_spirv_fragment_subgroup_shuffle: driver_id == vk::DriverId::AMD_PROPRIETARY,
+        max_subgroup_size: device.get_max_subgroup_size(),
         has_broken_robust: device.is_nvidia()
             && device.get_nvidia_arch() <= NvidiaArchitecture::Pascal,
         min_ssbo_alignment: device.get_storage_buffer_alignment(),
@@ -1436,7 +1439,19 @@ impl Default for ShaderPools {
 // Version 17: vertex strides are omitted from fixed pipeline state whenever
 // extended dynamic state owns them, matching upstream. Version 16 entries
 // can contain per-draw strides and therefore produce duplicate pipelines.
-const CACHE_VERSION: u32 = 18;
+// Version 19: native shader environments use the compact software matrix
+// collective. Previous captures contain the expanded Maxwell instruction
+// stream and cannot be converted back to the original native instructions.
+// Version 20: TEX.F16 lowering preserves low/high component order. Cached
+// expanded instructions from the previous lowering retain reversed halves.
+// Version 21: native control-flow validation and high-register lowering changed.
+// Serialized expanded programs must be rebuilt from their native instructions.
+// Version 22: native texture/arithmetic lowering and cbuf-backed branch proofs.
+// Rebuild expanded programs and record their branch-table constant dependencies.
+// Version 23: uniform compare/select, FP16 per-tap gather and LEA.HI negation.
+// Previously expanded native programs retain the old lowering behavior.
+// Version 24: corrected NOINC capture boundaries, depth gather and constant PTP offsets.
+const CACHE_VERSION: u32 = 24;
 // Upstream: flush the Vulkan pipeline cache to disk at most once per
 // max(30 s, 1 s per MiB of cache) once 128 new pipelines were built.
 const VULKAN_CACHE_FLUSH_PIPELINES: usize = 128;
@@ -3551,8 +3566,13 @@ mod tests {
     }
 
     #[test]
-    fn cache_version_matches_upstream_wire_format() {
-        assert_eq!(CACHE_VERSION, 18);
+    fn cache_rejects_pre_compact_matrix_entries() {
+        // Version 18 persisted expanded Maxwell instructions. Reusing them
+        // would bypass the new software matrix collective on a cached load.
+        let mut blob = Vec::from(VULKAN_CACHE_MAGIC_NUMBER);
+        blob.extend_from_slice(&18u32.to_le_bytes());
+        assert_eq!(parse_vulkan_pipeline_cache_blob(&blob, CACHE_VERSION),
+            Err(VulkanPipelineCacheHeaderError::VersionMismatch));
     }
 
     #[test]

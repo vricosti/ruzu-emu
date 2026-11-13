@@ -13,4 +13,5 @@ pub mod nca;
 pub mod nro;
 pub mod nso;
 pub mod nsp;
+pub mod nup;
 pub mod xci;

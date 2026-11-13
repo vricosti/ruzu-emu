@@ -958,7 +958,21 @@ pub struct AudioOutOpenResponse {
 /// Upstream `Core::System` owns `AudioCore::AudioCore` directly. Rust cannot do
 /// that without a crate cycle, so `System` stores a trait object that preserves
 /// the same owner boundary for exercised service calls.
+/// Object-safe bridge to SinkStream; avoids the core/audio_core crate cycle.
+/// Queueing and native lifecycle remain owned by audio_core::sink.
+pub trait SysmixSinkStream: Send + Sync {
+    fn is_ready(&self) -> bool;
+    fn is_paused(&self) -> bool;
+    fn start(&self);
+    fn stop(&self);
+    fn mark_faulted(&self);
+    fn try_append_output_block(&self, tag: u64, samples: &[i16]) -> bool;
+    fn get_queue_size(&self) -> u32;
+}
+
 pub trait AudioCoreInterface: Send {
+    fn acquire_sysmix_stream(&self, _name: &str) -> Option<Box<dyn SysmixSinkStream>> { None }
+
     /// Mirror `AudioCore::Renderer::Manager::GetWorkBufferSize`.
     fn get_audio_renderer_work_buffer_size(&self, params: &[u8; 0x34]) -> Option<u64>;
 

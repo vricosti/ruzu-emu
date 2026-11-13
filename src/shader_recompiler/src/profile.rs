@@ -97,6 +97,13 @@ pub struct Profile {
     pub ignore_nan_fp_comparisons: bool,
     /// Some drivers have broken support for OpVectorExtractDynamic on subgroup mask inputs.
     pub has_broken_spirv_subgroup_mask_vector_extract_dynamic: bool,
+    /// Driver cannot correctly execute SPIR-V subgroup shuffles.
+    pub has_broken_spirv_subgroup_shuffle: bool,
+    /// AMD proprietary fragment compiler can crash on dynamic subgroup shuffles.
+    /// Kept separate from the all-stage limitation used by tensor lowering.
+    pub has_broken_spirv_fragment_subgroup_shuffle: bool,
+    /// Fritchii Profile::max_subgroup_size, populated from host device properties.
+    pub max_subgroup_size: u32,
 
     pub gl_max_compute_smem_size: u32,
 
@@ -186,6 +193,9 @@ impl Default for Profile {
             has_gl_bool_ref_bug: false,
             ignore_nan_fp_comparisons: false,
             has_broken_spirv_subgroup_mask_vector_extract_dynamic: false,
+            has_broken_spirv_subgroup_shuffle: false,
+            has_broken_spirv_fragment_subgroup_shuffle: false,
+            max_subgroup_size: 0,
             gl_max_compute_smem_size: 0,
             has_broken_robust: false,
             min_ssbo_alignment: 0,

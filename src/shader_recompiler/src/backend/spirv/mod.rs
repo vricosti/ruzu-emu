@@ -25,6 +25,7 @@ pub mod emit_spirv_mesh;
 pub mod emit_spirv_select;
 pub mod emit_spirv_shared_memory;
 pub mod emit_spirv_special;
+pub mod emit_spirv_tensor;
 pub mod emit_spirv_undefined;
 pub mod emit_spirv_warp;
 pub mod spirv_emit_context;

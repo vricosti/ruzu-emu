@@ -72,7 +72,7 @@ else {
 
 $VcpkgPackages = @(
     "gtk:$VcpkgTriplet"
-    "ffmpeg[avcodec]:$VcpkgTriplet"
+    "ffmpeg[avcodec,dav1d]:$VcpkgTriplet"
     "opus:$VcpkgTriplet"
     "openssl:$VcpkgTriplet"
     "vulkan:$VcpkgTriplet"
@@ -503,6 +503,7 @@ function Get-MissingVcpkgPackages {
         "gtk:$VcpkgTriplet"
         "ffmpeg:$VcpkgTriplet"
         "ffmpeg[avcodec]:$VcpkgTriplet"
+        "ffmpeg[dav1d]:$VcpkgTriplet"
         "opus:$VcpkgTriplet"
         "openssl:$VcpkgTriplet"
         "vulkan:$VcpkgTriplet"

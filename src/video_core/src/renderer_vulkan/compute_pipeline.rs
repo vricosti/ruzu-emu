@@ -489,8 +489,14 @@ impl ComputePipeline {
             let build_condvar = build_condvar.clone();
             let build_mutex = build_mutex.clone();
             let is_built = is_built.clone();
+            // Fritchii only constrains shaders that observe warp-level state.
+            let uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id
+                || info.uses_subgroup_shuffles || info.uses_subgroup_mask
+                || info.uses_quad_shuffles || info.uses_fswzadd;
             let supports_subgroup_size_control =
-                vulkan_device.is_ext_subgroup_size_control_supported();
+                vulkan_device.is_ext_subgroup_size_control_supported()
+                    && uses_warp_ops
+                    && vulkan_device.is_guest_warp_size_supported(vk::ShaderStageFlags::COMPUTE);
             let capture_statistics = vulkan_device.is_khr_pipeline_executable_properties_enabled()
                 && *common::settings::values().renderer_debug.get_value();
             move || {

@@ -627,6 +627,8 @@ pub enum Opcode {
     VoteAll,
     VoteAny,
     VoteEqual,
+    /// Fritchii software matrix collective; flags carry K=8 or K=16.
+    TensorMulAdd,
     LaneId,
     SubgroupBallot,
     SubgroupEqMask,
@@ -3453,6 +3455,11 @@ impl Opcode {
                 name: "SubgroupBallot",
                 return_type: U32,
                 arg_types: &[U1],
+            },
+            Opcode::TensorMulAdd => OpcodeMeta {
+                name: "TensorMulAdd",
+                return_type: U32x2,
+                arg_types: &[U32x4, U32x2, U32x2],
             },
             Opcode::LaneId => OpcodeMeta {
                 name: "LaneId",

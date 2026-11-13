@@ -20,6 +20,7 @@ impl VideoCodec {
     pub const VP8: Self = Self(0x5);
     pub const H265: Self = Self(0x7);
     pub const VP9: Self = Self(0x9);
+    pub const AV1: Self = Self(0xA);
 
     pub const fn from_raw(value: u64) -> Self {
         Self(value)
@@ -50,6 +51,7 @@ impl std::fmt::Debug for VideoCodec {
             Self::VP8 => formatter.write_str("VP8"),
             Self::H265 => formatter.write_str("H265"),
             Self::VP9 => formatter.write_str("VP9"),
+            Self::AV1 => formatter.write_str("AV1"),
             _ => write!(formatter, "Unknown({:#x})", self.raw()),
         }
     }

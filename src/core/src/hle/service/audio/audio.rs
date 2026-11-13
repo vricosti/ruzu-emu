@@ -447,6 +447,7 @@ impl ServiceFramework for IAudioSystemManagerForDebugger {
 /// ```
 pub fn loop_process(system: crate::core::SystemRef) {
     let server_manager = ServerManager::new_shared(system);
+    let sysmix_streams = super::nx2_audio_device_manager::Nx2SysmixStreams::new(system);
 
     {
         let mut server_manager = server_manager.lock().unwrap();
@@ -581,6 +582,14 @@ pub fn loop_process(system: crate::core::SystemRef) {
             }),
             30,
         );
+
+        let device_streams = sysmix_streams.clone();
+        server_manager.register_named_service("auddmg:u", Box::new(move || -> SessionRequestHandlerPtr {
+            std::sync::Arc::new(super::nx2_audio_device_manager::INx2AudioDeviceManagerService::new(system, device_streams.clone()))
+        }), 30);
+        server_manager.register_named_service("audsmx:u", Box::new(move || -> SessionRequestHandlerPtr {
+            std::sync::Arc::new(super::nx2_audio_device_manager::INx2AudioSoundMixerService::new(system, sysmix_streams.clone()))
+        }), 30);
 
         server_manager.register_named_service(
             "audren:a",

@@ -14,6 +14,7 @@ pub enum StreamType {
     Render,
     Out,
     In,
+    Sysmix,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -53,6 +54,23 @@ pub trait SinkStream: Send + Sync {
     fn finalize(&self) {}
     fn start(&self, _resume: bool) {}
     fn stop(&self) {}
+
+    fn is_ready(&self) -> bool { false }
+
+    fn mark_faulted(&self) { self.base().lock().failed = true; }
+
+    fn try_append_output_block(&self, buffer: SinkBuffer, samples: &[i16]) -> bool {
+        if !self.is_ready() { return false; }
+        let mut base = self.base().lock();
+        if base.stream_type != StreamType::Sysmix || base.failed
+            || buffer.frames != TARGET_SAMPLE_COUNT as u64 || buffer.frames_played != 0
+            || buffer.consumed || base.system_channels != 2
+            || !matches!(base.device_channels, 2 | 6)
+            || samples.len() != TARGET_SAMPLE_COUNT as usize * 2 || base.get_queue_size() >= 3
+        { return false; }
+        base.append_buffer(buffer, samples);
+        true
+    }
 
     fn is_paused(&self) -> bool {
         self.base().lock().is_paused()
@@ -216,6 +234,7 @@ pub struct SinkStreamBase {
     pub system_channels: u32,
     pub device_channels: u32,
     pub name: String,
+    pub(crate) failed: bool,
     queue: VecDeque<SinkBuffer>,
     playing_buffer: SinkBuffer,
     samples: VecDeque<i16>,
@@ -244,6 +263,7 @@ impl SinkStreamBase {
             system_channels,
             device_channels,
             name,
+            failed: false,
             queue: VecDeque::new(),
             playing_buffer: SinkBuffer {
                 consumed: true,
@@ -519,7 +539,7 @@ impl SinkStreamBase {
             let sys = self.system.get();
             (sys.is_paused(), sys.is_shutting_down())
         };
-        if paused || shutting_down {
+        if paused || shutting_down || (self.stream_type == StreamType::Sysmix && self.failed) {
             return;
         }
 
@@ -577,7 +597,7 @@ impl SinkStreamBase {
             let sys = self.system.get();
             (sys.is_paused(), sys.is_shutting_down())
         };
-        if paused || shutting_down {
+        if paused || shutting_down || (self.stream_type == StreamType::Sysmix && self.failed) {
             if shutting_down {
                 self.release.queued_buffers.store(0, Ordering::Release);
                 self.release.cv.notify_one();
@@ -596,8 +616,12 @@ impl SinkStreamBase {
                 let Some(buffer) = self.queue.pop_front() else {
                     for frame in frames_written..num_frames {
                         let base = frame * frame_size;
-                        output_buffer[base..base + frame_size]
-                            .copy_from_slice(&self.last_frame[..frame_size]);
+                        if self.stream_type == StreamType::Sysmix {
+                            output_buffer[base..base + frame_size].fill(0);
+                        } else {
+                            output_buffer[base..base + frame_size]
+                                .copy_from_slice(&self.last_frame[..frame_size]);
+                        }
                     }
                     frames_written = num_frames;
                     continue;
@@ -685,6 +709,34 @@ mod tests {
     use super::*;
     fn make_system() -> SharedSystem {
         crate::make_test_system()
+    }
+
+    #[test]
+    fn sysmix_admission_is_bounded_and_underruns_are_silent() {
+        struct Ready(SharedSinkStreamBase);
+        impl SinkStream for Ready {
+            fn base(&self) -> &SharedSinkStreamBase { &self.0 }
+            fn is_ready(&self) -> bool { !self.0.lock().failed }
+        }
+        let stream = Ready(Arc::new(Mutex::new(SinkStreamBase::new(
+            make_system(), StreamType::Sysmix, 2, 2, "sysmix-test".into(),
+        ))));
+        let block = SinkBuffer { frames: TARGET_SAMPLE_COUNT as u64, ..SinkBuffer::default() };
+        assert!(!stream.try_append_output_block(block.clone(), &[0; 479]));
+        assert_eq!(stream.get_queue_size(), 0);
+        for _ in 0..3 { assert!(stream.try_append_output_block(block.clone(), &[123; 480])); }
+        assert!(!stream.try_append_output_block(block.clone(), &[123; 480]));
+        assert_eq!(stream.get_queue_size(), 3);
+        let mut output = [1; 4 * 480];
+        stream.process_audio_out_and_render(&mut output, 4 * 240);
+        assert_eq!(stream.get_queue_size(), 0);
+        assert_eq!(&output[3*480..], &[0;480]);
+        assert!(stream.try_append_output_block(block.clone(), &[123;480]));
+        stream.mark_faulted();
+        assert!(!stream.try_append_output_block(block, &[123;480]));
+        output.fill(1);
+        stream.process_audio_out_and_render(&mut output, 4 * 240);
+        assert!(output.iter().all(|v| *v == 0));
     }
 
     #[test]
@@ -864,4 +916,26 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert!(stream.is_paused());
     }
+}
+
+/// Sink-owned bridge for core services; Drop mirrors Sink::CloseStream.
+pub(crate) struct SysmixStreamBridge {
+    pub sink: crate::sink::sink::SinkHandle,
+    pub stream: SinkStreamHandle,
+}
+impl ruzu_core::core::SysmixSinkStream for SysmixStreamBridge {
+    fn is_ready(&self) -> bool { self.stream.is_ready() }
+    fn is_paused(&self) -> bool { self.stream.is_paused() }
+    fn start(&self) { self.stream.start(false); }
+    fn stop(&self) { self.stream.stop(); }
+    fn mark_faulted(&self) { self.stream.mark_faulted(); }
+    fn get_queue_size(&self) -> u32 { self.stream.get_queue_size() }
+    fn try_append_output_block(&self, tag: u64, samples: &[i16]) -> bool {
+        self.stream.try_append_output_block(SinkBuffer {
+            frames: TARGET_SAMPLE_COUNT as u64, frames_played: 0, tag, consumed: false,
+        }, samples)
+    }
+}
+impl Drop for SysmixStreamBridge {
+    fn drop(&mut self) { self.sink.lock().close_stream(&self.stream); }
 }

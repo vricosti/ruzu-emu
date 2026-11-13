@@ -215,6 +215,8 @@ pub struct ServerManager {
     /// Deferred sessions awaiting retry.
     /// Upstream: `std::list<Session*> m_deferred_sessions`.
     deferred_sessions: Vec<u64>,
+    deferral_epoch: u64,
+    deferral_cancel_handler: Option<Arc<dyn Fn(&HLERequestContext) + Send + Sync>>,
 
     /// Wakeup holder in the multi-wait.
     /// Upstream: `std::optional<MultiWaitHolder> m_wakeup_holder`.
@@ -354,6 +356,8 @@ impl ServerManager {
             multi_wait: MultiWait::new(),
             deferred_list: Mutex::new(MultiWait::new()),
             deferred_sessions: Vec::new(),
+            deferral_epoch: 0,
+            deferral_cancel_handler: None,
             wakeup_holder: Some(wakeup_holder),
             deferral_holder: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
@@ -843,6 +847,12 @@ impl ServerManager {
 
     /// Manages deferral events.
     /// Port of upstream `ServerManager::ManageDeferral(KEvent**)`.
+    /// Fritchii ServerManager::SetDeferralCancelHandler. Configure before workers start.
+    pub fn set_deferral_cancel_handler(&mut self, handler: Arc<dyn Fn(&HLERequestContext) + Send + Sync>) {
+        assert!(self.host_threads.lock().unwrap().is_empty());
+        self.deferral_cancel_handler = Some(handler);
+    }
+
     pub fn manage_deferral(&mut self) -> (ResultCode, Option<Arc<Mutex<KEvent>>>) {
         let Some(kernel) = (!self.system.is_null())
             .then(|| self.system.get().kernel())
@@ -1202,6 +1212,11 @@ impl ServerManager {
         self.sessions[session_index].holder.unlink_from_multi_wait();
 
         let session = self.sessions.remove(session_index);
+        // Existing endpoint-close queue reaches this owner even for deferred
+        // sessions; it supplies Fritchii SetClientClosedEvent/RetireDeferredRequest.
+        if let (Some(context), Some(cancel)) = (&session.context, &self.deferral_cancel_handler) {
+            cancel(context);
+        }
         let session_id = session.id;
 
         // Deleting upstream's Session wrapper closes its native
@@ -1374,8 +1389,9 @@ impl ServerManager {
             KEvent::clear_arc(&event, &process);
         }
 
-        let (pending, wakeup_after_relink) = {
+        let pending = {
             let mut owner = manager_owner.lock().unwrap();
+            owner.deferral_epoch = owner.deferral_epoch.wrapping_add(1);
             let deferred = std::mem::take(&mut owner.deferred_sessions);
             log::debug!(
                 "ServerManager({}): retrying {} deferred sessions",
@@ -1383,27 +1399,13 @@ impl ServerManager {
                 deferred.len()
             );
 
-            let deferral_holder_ptr = owner
-                .deferral_holder
-                .as_deref_mut()
-                .map(|holder| holder as *mut MultiWaitHolder);
-            let mut wakeup_after_relink = None;
-            if let Some(deferral_holder_ptr) = deferral_holder_ptr {
-                {
-                    let mut deferred_list = owner.deferred_list.lock().unwrap();
-                    unsafe {
-                        (*deferral_holder_ptr)
-                            .link_to_multi_wait(&mut *deferred_list as *mut MultiWait);
-                    }
-                }
-                wakeup_after_relink = Some(owner.wakeup_event_arc());
-            }
-
             let mut pending = Vec::with_capacity(deferred.len());
             for session_id in deferred {
                 let Some(session_index) = owner.session_index_by_id(session_id) else {
                     continue;
                 };
+                let client_closed = owner.sessions[session_index].server_session.lock().unwrap().client_closed;
+                if client_closed { owner.destroy_session(session_index); continue; }
                 let Some(context) = owner.sessions[session_index].context.take() else {
                     log::warn!(
                         "ServerManager({}): deferred session {} missing HLE request context",
@@ -1424,18 +1426,35 @@ impl ServerManager {
                     context,
                 ));
             }
-            (pending, wakeup_after_relink)
+            pending
         };
-
-        // `Event::signal` can wake kernel waiters and reschedule. Perform it
-        // only after the global manager guard has been destroyed.
-        if let Some(wakeup) = wakeup_after_relink {
-            wakeup.signal();
-        }
 
         for (event, context) in pending {
             Self::complete_sync_request_shared(manager_owner, event, context);
         }
+        // Relink only after the batch finishes. Events signaled during retries
+        // remain latched, and another worker cannot retry this batch concurrently.
+        let wakeup_after_relink = {
+            let mut owner = manager_owner.lock().unwrap();
+            let deferral_holder_ptr = owner
+                .deferral_holder
+                .as_deref_mut()
+                .map(|holder| holder as *mut MultiWaitHolder);
+            let mut wakeup_after_relink = None;
+            if let Some(deferral_holder_ptr) = deferral_holder_ptr {
+                {
+                    let mut deferred_list = owner.deferred_list.lock().unwrap();
+                    unsafe {
+                        (*deferral_holder_ptr)
+                            .link_to_multi_wait(&mut *deferred_list as *mut MultiWait);
+                    }
+                }
+                wakeup_after_relink = Some(owner.wakeup_event_arc());
+            }
+
+            wakeup_after_relink
+        };
+        if let Some(wakeup) = wakeup_after_relink { wakeup.signal(); }
         true
     }
 
@@ -1473,62 +1492,76 @@ impl ServerManager {
         if let Some(sm) = event.service_manager {
             context.set_service_manager(sm);
         }
-        context.set_is_deferred_value(false);
-        record_ipc_phase("server_07_prepare_context", &mut phase_last);
+        let service_result = loop {
+            let deferral_epoch = manager_owner.lock().unwrap().deferral_epoch;
+            context.set_is_deferred_value(false);
+            record_ipc_phase("server_07_prepare_context", &mut phase_last);
 
-        if std::env::var_os("RUZU_TRACE_HOST_THREAD_IPC").is_some() {
-            let (svc, dom) = {
-                let g = event.manager.lock().unwrap();
-                let svc = g
-                    .session_handler()
-                    .map(|h| h.service_name().to_string())
-                    .unwrap_or_else(|| "<none>".to_string());
-                (svc, g.is_domain())
-            };
-            eprintln!(
-                "[HOST_THREAD_IPC] dispatch manager={} service={} cmd={} dom={}",
-                event.server_name,
-                svc,
-                context.get_command(),
-                dom
-            );
-        }
-
-        let service_profile =
-            crate::hle::kernel::svc::svc_ipc::ipc_service_profile_enabled().then(Instant::now);
-        let service_profile_key = service_profile.as_ref().map(|_| {
-            let manager = event.manager.lock().unwrap();
-            let service_name = manager
-                .session_handler()
-                .map(|handler| handler.service_name().to_string())
-                .unwrap_or_else(|| "<none>".to_string());
-            (service_name, context.get_command())
-        });
-        let service_result = hle_ipc::complete_sync_request(&event.manager, &mut context);
-        if let (Some(start), Some((service_name, command))) = (service_profile, service_profile_key)
-        {
-            crate::hle::kernel::svc::svc_ipc::record_ipc_service_profile(
-                &service_name,
-                command,
-                start.elapsed(),
-            );
-        }
-        record_ipc_phase("server_08_hle_complete_sync_request", &mut phase_last);
-
-        if context.get_is_deferred() {
-            log::debug!(
-                "ServerManager({}): session {} deferred",
-                event.server_name,
-                event.session_id
-            );
-            let mut owner = manager_owner.lock().unwrap();
-            if let Some(session_index) = owner.session_index_by_id(event.session_id) {
-                owner.sessions[session_index].context = Some(context);
-                owner.deferred_sessions.push(event.session_id);
+            if std::env::var_os("RUZU_TRACE_HOST_THREAD_IPC").is_some() {
+                let (svc, dom) = {
+                    let g = event.manager.lock().unwrap();
+                    let svc = g
+                        .session_handler()
+                        .map(|h| h.service_name().to_string())
+                        .unwrap_or_else(|| "<none>".to_string());
+                    (svc, g.is_domain())
+                };
+                eprintln!(
+                    "[HOST_THREAD_IPC] dispatch manager={} service={} cmd={} dom={}",
+                    event.server_name,
+                    svc,
+                    context.get_command(),
+                    dom
+                );
             }
-            record_ipc_phase("server_09_deferred", &mut phase_last);
-            return true;
-        }
+
+            let service_profile =
+                crate::hle::kernel::svc::svc_ipc::ipc_service_profile_enabled().then(Instant::now);
+            let service_profile_key = service_profile.as_ref().map(|_| {
+                let manager = event.manager.lock().unwrap();
+                let service_name = manager
+                    .session_handler()
+                    .map(|handler| handler.service_name().to_string())
+                    .unwrap_or_else(|| "<none>".to_string());
+                (service_name, context.get_command())
+            });
+            let service_result = hle_ipc::complete_sync_request(&event.manager, &mut context);
+            if let (Some(start), Some((service_name, command))) = (service_profile, service_profile_key)
+            {
+                crate::hle::kernel::svc::svc_ipc::record_ipc_service_profile(
+                    &service_name,
+                    command,
+                    start.elapsed(),
+                );
+            }
+            record_ipc_phase("server_08_hle_complete_sync_request", &mut phase_last);
+
+            if context.get_is_deferred() {
+                log::debug!(
+                    "ServerManager({}): session {} deferred",
+                    event.server_name,
+                    event.session_id
+                );
+                let mut owner = manager_owner.lock().unwrap();
+                let client_closed = event.server_session.lock().unwrap().client_closed;
+                if client_closed {
+                    if let Some(cancel) = &owner.deferral_cancel_handler { cancel(&context); }
+                    if let Some(index) = owner.session_index_by_id(event.session_id) { owner.destroy_session(index); }
+                    return true;
+                }
+                if owner.deferral_epoch != deferral_epoch { drop(owner); continue; }
+                if let Some(session_index) = owner.session_index_by_id(event.session_id) {
+                    owner.sessions[session_index].context = Some(context);
+                    owner.deferred_sessions.push(event.session_id);
+                } else if let Some(cancel) = &owner.deferral_cancel_handler {
+                    cancel(&context);
+                }
+                record_ipc_phase("server_09_deferred", &mut phase_last);
+                return true;
+            }
+
+            break service_result;
+        };
 
         let reply_result =
             crate::hle::kernel::k_server_session::KServerSession::send_reply_hle_unlocked(
@@ -1908,6 +1941,7 @@ mod tests {
         manager_was_unlocked: AtomicBool,
         request_addresses: Mutex<Vec<u64>>,
         defer_first: bool,
+        handle_deferral_during_first: AtomicBool,
     }
 
     impl crate::hle::service::hle_ipc::SessionRequestHandler for RecordingDispatchHandler {
@@ -1936,6 +1970,9 @@ mod tests {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             if self.defer_first && call == 0 {
                 context.set_is_deferred();
+                if self.handle_deferral_during_first.load(Ordering::Relaxed) {
+                    ServerManager::process_deferral_event_shared(&self.owner.upgrade().unwrap());
+                }
             }
             RESULT_SUCCESS
         }
@@ -1960,6 +1997,7 @@ mod tests {
             manager_was_unlocked: AtomicBool::new(true),
             request_addresses: Mutex::new(Vec::new()),
             defer_first,
+            handle_deferral_during_first: AtomicBool::new(false),
         });
         let request_manager = Arc::new(Mutex::new(SessionRequestManager::new()));
         request_manager
@@ -2066,6 +2104,36 @@ mod tests {
             !HleIpcHostFiberContext::is_active(),
             "the host-fiber deferral context must end after reply and relink finalization"
         );
+    }
+
+    #[test]
+    fn deferral_epoch_retries_a_wakeup_handled_before_enqueue() {
+        let (owner, server, _, handler) = setup_recording_dispatch(true);
+        handler.handle_deferral_during_first.store(true, Ordering::Relaxed);
+        let client = enqueue_waiting_request(&server, 1, 0x2000);
+        unlink_first_session_holder(&owner);
+        assert!(ServerManager::process_session_event_shared(&owner, first_shared_session_event(&owner)));
+        assert_eq!(handler.calls.load(Ordering::Relaxed), 2);
+        assert!(owner.lock().unwrap().deferred_sessions.is_empty());
+        assert!(server.lock().unwrap().current_request.is_none());
+        assert_eq!(client.lock().unwrap().get_wait_result(), RESULT_SUCCESS.get_inner_value());
+    }
+
+    #[test]
+    fn deferral_cancel_retires_closed_clients_without_retry() {
+        let (owner, server, _, handler) = setup_recording_dispatch(true);
+        let cancellations = Arc::new(Mutex::new(Vec::new()));
+        let observed = cancellations.clone();
+        owner.lock().unwrap().set_deferral_cancel_handler(Arc::new(move |ctx| observed.lock().unwrap().push(ctx.request_key())));
+        let _client = enqueue_waiting_request(&server, 1, 0x2000);
+        unlink_first_session_holder(&owner);
+        ServerManager::process_session_event_shared(&owner, first_shared_session_event(&owner));
+        let key = owner.lock().unwrap().sessions[0].context.as_ref().unwrap().request_key();
+        server.lock().unwrap().client_closed = true;
+        ServerManager::process_deferral_event_shared(&owner);
+        assert_eq!(handler.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(*cancellations.lock().unwrap(), vec![key]);
+        assert!(owner.lock().unwrap().sessions.is_empty());
     }
 
     #[test]

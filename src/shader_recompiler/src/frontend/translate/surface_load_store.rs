@@ -184,7 +184,7 @@ fn check_alignment(reg: u32, alignment: u32) {
 fn make_color(ir: &mut crate::ir::emitter::Emitter<'_>, reg: u32, num_regs: u32) -> Value {
     let mut colors = [Value::ImmU32(0); 4];
     for i in 0..num_regs {
-        colors[i as usize] = ir.get_reg(crate::ir::value::Reg((reg + i) as u8));
+        colors[i as usize] = ir.get_reg(crate::ir::value::Reg(u64::from(reg)) + i as i32);
     }
     ir.composite_construct_u32x4(colors[0], colors[1], colors[2], colors[3])
 }
@@ -353,6 +353,17 @@ mod tests {
         let info = TextureInstInfo::from_u32(read.flags);
         assert_eq!(info.texture_type, TextureType::Color2D as u8);
         assert_eq!(info.image_format, ImageFormat::R32Uint as u8);
+    }
+
+    #[test]
+    fn surface_zero_register_components_remain_zero_registers() {
+        let mut program = fresh_program();
+        let mut tv = TranslatorVisitor::new(&mut program, 0);
+        make_color(&mut tv.ir, 255, 4);
+        let reads: Vec<_> = program.blocks[0].iter()
+            .filter(|inst| inst.opcode == Opcode::GetRegister)
+            .map(|inst| inst.args[0]).collect();
+        assert_eq!(reads, vec![Value::Reg(crate::ir::value::Reg::RZ); 4]);
     }
 
     #[test]

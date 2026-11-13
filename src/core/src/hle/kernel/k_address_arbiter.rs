@@ -55,6 +55,7 @@ pub enum ArbitrationType {
     WaitIfLessThan = 0,
     DecrementAndWaitIfLessThan = 1,
     WaitIfEqual = 2,
+    WaitIfEqual64 = 3,
 }
 
 // ---------------------------------------------------------------------------
@@ -301,18 +302,21 @@ impl KAddressArbiter {
         current_thread: &Arc<KThreadLock>,
         addr: u64,
         arb_type: ArbitrationType,
-        value: i32,
+        value: i64,
         timeout: i64,
     ) -> ResultCode {
         match arb_type {
             ArbitrationType::WaitIfLessThan => {
-                self.wait_if_less_than(process, current_thread, addr, value, false, timeout)
+                self.wait_if_less_than(process, current_thread, addr, value as i32, false, timeout)
             }
             ArbitrationType::DecrementAndWaitIfLessThan => {
-                self.wait_if_less_than(process, current_thread, addr, value, true, timeout)
+                self.wait_if_less_than(process, current_thread, addr, value as i32, true, timeout)
             }
             ArbitrationType::WaitIfEqual => {
-                self.wait_if_equal(process, current_thread, addr, value, timeout)
+                self.wait_if_equal(process, current_thread, addr, value as i32 as i64, timeout, false)
+            }
+            ArbitrationType::WaitIfEqual64 => {
+                self.wait_if_equal(process, current_thread, addr, value, timeout, true)
             }
         }
     }
@@ -531,8 +535,9 @@ impl KAddressArbiter {
         process: &Arc<ProcessLock>,
         current_thread: &Arc<KThreadLock>,
         addr: u64,
-        value: i32,
+        value: i64,
         timeout: i64,
+        is_64_bit: bool,
     ) -> ResultCode {
         let current_thread_id = current_thread.lock().unwrap().get_thread_id();
         let priority = current_thread.lock().unwrap().get_priority();
@@ -559,7 +564,20 @@ impl KAddressArbiter {
             }
 
             let process_guard = process.lock().unwrap();
-            let Some(user_value) = read_from_user(&process_guard, addr) else {
+            let user_value = if is_64_bit {
+                if let Some(memory) = process_guard.get_memory().as_ref() {
+                    let memory = memory.access().unwrap();
+                    memory.is_valid_virtual_address_range(addr, 8)
+                        .then(|| memory.read_64(addr) as i64)
+                } else {
+                    // Same fallback backing as the existing 32-bit arbiter reads.
+                    let memory = process_guard.process_memory.read().unwrap();
+                    memory.is_valid_range(addr, 8).then(|| memory.read_64(addr) as i64)
+                }
+            } else {
+                read_from_user(&process_guard, addr).map(i64::from)
+            };
+            let Some(user_value) = user_value else {
                 sleep_guard.cancel_sleep();
                 return Err(RESULT_INVALID_CURRENT_MEMORY);
             };

@@ -145,6 +145,10 @@ impl SinkStream for SDLSinkStream {
         &self.base
     }
 
+    fn is_ready(&self) -> bool {
+        !self.lifecycle.lock().stream.is_null() && !self.base.lock().failed
+    }
+
     fn finalize(&self) {
         let mut lifecycle = self.lifecycle.lock();
         if lifecycle.state == SinkStreamLifecycleState::Finalized {
@@ -155,7 +159,10 @@ impl SinkStream for SDLSinkStream {
             lifecycle.state = SinkStreamLifecycleState::Stopping;
             if self.base.lock().signal_stop() && !lifecycle.stream.is_null() {
                 unsafe {
-                    let _ = sdl::SDL_PauseAudioStreamDevice(lifecycle.stream);
+                    if !sdl::SDL_PauseAudioStreamDevice(lifecycle.stream) {
+                        self.base.lock().failed = true;
+                        log::error!("Error stopping SDL audio stream");
+                    }
                 }
             }
             lifecycle.state = SinkStreamLifecycleState::Stopped;
@@ -176,14 +183,20 @@ impl SinkStream for SDLSinkStream {
         let mut lifecycle = self.lifecycle.lock();
         if lifecycle.state != SinkStreamLifecycleState::Stopped
             || lifecycle.stream.is_null()
-            || !self.base.lock().signal_start()
+            || { let base = self.base.lock(); base.failed || !base.is_paused() }
         {
             return;
         }
         lifecycle.state = SinkStreamLifecycleState::Starting;
         unsafe {
-            let _ = sdl::SDL_ResumeAudioStreamDevice(lifecycle.stream);
+            if !sdl::SDL_ResumeAudioStreamDevice(lifecycle.stream) {
+                self.base.lock().failed = true;
+                lifecycle.state = SinkStreamLifecycleState::Stopped;
+                log::error!("Error starting SDL audio stream");
+                return;
+            }
         }
+        self.base.lock().signal_start();
         lifecycle.state = SinkStreamLifecycleState::Running;
     }
 
@@ -195,7 +208,10 @@ impl SinkStream for SDLSinkStream {
         lifecycle.state = SinkStreamLifecycleState::Stopping;
         if self.base.lock().signal_stop() {
             unsafe {
-                let _ = sdl::SDL_PauseAudioStreamDevice(lifecycle.stream);
+                if !sdl::SDL_PauseAudioStreamDevice(lifecycle.stream) {
+                        self.base.lock().failed = true;
+                        log::error!("Error stopping SDL audio stream");
+                    }
             }
         }
         lifecycle.state = SinkStreamLifecycleState::Stopped;

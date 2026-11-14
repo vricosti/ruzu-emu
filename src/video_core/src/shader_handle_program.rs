@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Draw-time descriptor evaluation; upstream video_core/shader_handle_program.h.
 
-use shader_recompiler::shader_info::{evaluate_handle_program, Info};
+use shader_recompiler::shader_info::{evaluate_handle_program, Info, TextureDescriptor};
 use std::cell::RefCell;
 
 /// The address of storage buffer `binding` of a shader as its descriptor in a
@@ -80,10 +80,85 @@ pub fn evaluate_texture_handle(
     ).unwrap_or(0)
 }
 
+/// Whether texture descriptor `desc`'s handle word (element `index`) is where
+/// a storage buffer of the same program keeps its address. The translation
+/// falls back to such a word when the shader loads the handle per invocation,
+/// which no draw-time evaluation can give. Its low bits then name an unrelated
+/// texture, a different one whenever the game moves the buffer or reuses the
+/// texture header they happen to name. Bind no texture for it instead.
+///
+/// Lichii: `video_core/shader_handle_program.h:171-197` `HandleIsStoragePointer`
+/// (794602bfbd). Lichii's later `handle_is_pointer_word` translation flag
+/// (282a585aa8) has no ruzu counterpart; only the storage-descriptor test is
+/// ported.
+pub fn handle_is_storage_pointer(info: &Info, desc: &TextureDescriptor, index: u32) -> bool {
+    if desc.handle_program != u32::MAX || desc.has_secondary {
+        return false;
+    }
+    let offset = desc.cbuf_offset.wrapping_add(index << desc.size_shift);
+    info.storage_buffers_descriptors.iter().any(|storage| {
+        storage.cbuf_index == desc.cbuf_index
+            && offset >= storage.cbuf_offset
+            && offset - storage.cbuf_offset < std::mem::size_of::<u64>() as u32
+    })
+}
+
+/// A texture handle no table holds: the texture cache binds its null view and
+/// sampler. Lichii: `video_core/shader_handle_program.h:199-200`.
+pub const NULL_TEXTURE_HANDLE: (u32, u32) = (u32::MAX, u32::MAX);
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use shader_recompiler::shader_info::{HandleOp as H, StorageBufferDescriptor};
+
+    #[test]
+    fn handle_word_holding_a_storage_buffer_address_is_no_texture() {
+        // Lichii 794602bfbd tests (shader_handle_program): the handle word is
+        // inside the 8-byte address word of a storage buffer of the program.
+        let mut info = Info::default();
+        info.storage_buffers_descriptors.push(StorageBufferDescriptor {
+            cbuf_index: 0,
+            cbuf_offset: 0x520,
+            count: 1,
+            ..Default::default()
+        });
+        let mut desc = TextureDescriptor {
+            handle_program: u32::MAX,
+            texture_type: shader_recompiler::shader_info::TextureType::Color2D,
+            is_depth: false,
+            is_multisample: false,
+            is_integer: false,
+            has_secondary: false,
+            cbuf_index: 0,
+            cbuf_offset: 0x520,
+            shift_left: 0,
+            secondary_cbuf_index: 0,
+            secondary_cbuf_offset: 0,
+            secondary_shift_left: 0,
+            count: 1,
+            size_shift: 0,
+        };
+        assert!(handle_is_storage_pointer(&info, &desc, 0));
+        desc.cbuf_offset = 0x524; // the address's high word
+        assert!(handle_is_storage_pointer(&info, &desc, 0));
+        desc.cbuf_offset = 0x528; // past the address
+        assert!(!handle_is_storage_pointer(&info, &desc, 0));
+        desc.cbuf_offset = 0x51c;
+        desc.size_shift = 2;
+        assert!(!handle_is_storage_pointer(&info, &desc, 0));
+        assert!(handle_is_storage_pointer(&info, &desc, 1)); // the second element
+        desc.cbuf_offset = 0x520;
+        desc.size_shift = 0;
+        desc.cbuf_index = 1; // another constant buffer
+        assert!(!handle_is_storage_pointer(&info, &desc, 0));
+        desc.cbuf_index = 0;
+        desc.has_secondary = true; // a separate sampler word: a real handle
+        assert!(!handle_is_storage_pointer(&info, &desc, 0));
+        desc.has_secondary = false;
+        desc.handle_program = 0; // computed at draw time
+        assert!(!handle_is_storage_pointer(&info, &desc, 0));
+    }
 
     #[test]
     fn storage_handle_uses_current_binding_and_full_pointer() {

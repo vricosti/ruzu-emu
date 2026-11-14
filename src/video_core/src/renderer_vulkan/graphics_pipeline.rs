@@ -1224,19 +1224,27 @@ impl GraphicsPipeline {
                 }
                 for desc in &info.texture_descriptors {
                     for element in 0..desc.count {
-                        let (tic_id, tsc_id) = read_stage_handle(
-                            stage,
-                            desc.handle_program,
-                            desc.cbuf_index,
-                            desc.cbuf_offset,
-                            desc.size_shift,
-                            element,
-                            desc.has_secondary,
-                            desc.shift_left,
-                            desc.secondary_cbuf_index,
-                            desc.secondary_cbuf_offset,
-                            desc.secondary_shift_left,
-                        );
+                        // Lichii vk_graphics_pipeline.cpp:940-942: a handle word
+                        // holding a storage buffer address binds no texture.
+                        let (tic_id, tsc_id) = if crate::shader_handle_program::
+                            handle_is_storage_pointer(info, desc, element)
+                        {
+                            crate::shader_handle_program::NULL_TEXTURE_HANDLE
+                        } else {
+                            read_stage_handle(
+                                stage,
+                                desc.handle_program,
+                                desc.cbuf_index,
+                                desc.cbuf_offset,
+                                desc.size_shift,
+                                element,
+                                desc.has_secondary,
+                                desc.shift_left,
+                                desc.secondary_cbuf_index,
+                                desc.secondary_cbuf_offset,
+                                desc.secondary_shift_left,
+                            )
+                        };
                         add_view(tic_id, false);
                         samplers.push(texture_cache.get_sampler_id(tsc_id, false));
                     }

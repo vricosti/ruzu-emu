@@ -1,5 +1,30 @@
 # Upstream parity notes
 
+## 2026-11-14 — video_core/{shader_handle_program,renderer_vulkan/graphics_pipeline,renderer_vulkan/compute_pipeline}.rs vs Lichii video_core/{shader_handle_program.h,renderer_vulkan/vk_graphics_pipeline.cpp,renderer_vulkan/vk_compute_pipeline.cpp}
+
+### Ported (Lichii extension, absent from Eden)
+- `HandleIsStoragePointer` and `NULL_TEXTURE_HANDLE` (shader_handle_program.h:170-200, from
+  Lichii 794602bfbd "bind no texture for a handle word that is a storage buffer address") as
+  `handle_is_storage_pointer` / `NULL_TEXTURE_HANDLE`, applied where Lichii applies them: the
+  graphics texture descriptors (vk_graphics_pipeline.cpp:940-942) and the compute ones
+  (vk_compute_pipeline.cpp:532-534). A texture whose cbuf handle word lies in the 8-byte address
+  word of a storage buffer of the same program gets the null view and sampler.
+- Ocarina of Time's Kokiri Forest: in ruzu that word read as handle 0xe4000, which
+  `texture_header_index` turns into texture header 0x7200 (a header byte offset). The game's
+  descriptor allocator gives that header to a different texture every ~256 frames (traced: R16G16
+  float, then D32 depth, then others), so many main-pass materials sampled an unrelated texture
+  for ~23 s at a time at 11 FPS: depth read as colour (tree bark and cliffs red), R16G16 as colour
+  (yellow), or values that saturated the exposure (white frame). Measured on bench.sh runs of the
+  Kokiri scenario (33 captures each, t=70..230 s, Link idle): base binary 4, 11 and 5 defective
+  captures (plus 8 in a traced run); with this port 0 and 0 (the t=70 loading-screen sun glare
+  the saturation score also flags in base runs excepted). 11.47 and 11.92 FPS against 11.25.
+
+### Intentional differences
+- Lichii's later `handle_is_pointer_word` translation flag (282a585aa8, shader_info.h:245) and
+  the delta-draw handle-word ranges that skip such words (vk_graphics_pipeline.cpp:482) have no
+  ruzu counterpart (ruzu has no `handle_is_pointer_word` or delta draws); only the
+  storage-descriptor test is ported.
+
 ## 2026-11-14 — video_core/memory_manager.rs vs Lichii video_core/memory_manager.{h,cpp}
 
 ### Ported (Lichii extension, absent from Eden)

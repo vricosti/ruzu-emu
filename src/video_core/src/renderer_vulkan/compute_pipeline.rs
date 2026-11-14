@@ -1102,9 +1102,15 @@ fn collect_texture_handles(
     }
     for desc in &info.texture_descriptors {
         for index in 0..desc.count {
+            // Lichii vk_compute_pipeline.cpp:532-534: a handle word holding a
+            // storage buffer address binds no texture.
             let (view, sampler) =
-                read_texture_handle(info, &dispatch.launch_description, desc, index,
-                                    storage_alignment, &mut read_u32);
+                if crate::shader_handle_program::handle_is_storage_pointer(info, desc, index) {
+                    crate::shader_handle_program::NULL_TEXTURE_HANDLE
+                } else {
+                    read_texture_handle(info, &dispatch.launch_description, desc, index,
+                                        storage_alignment, &mut read_u32)
+                };
             result.views.push(ImageViewInOut {
                 index: view,
                 ..Default::default()

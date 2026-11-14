@@ -41,6 +41,78 @@
   messages as before. Screenshots at 40 s and 70 s showed a correct title screen.
 - Not verified: other scenes (gameplay, cutscenes after the intro), the sRGB-decoding copy path
   at runtime, and other titles (the replacement is gated on this title's program id).
+## 2026-11-14 — core/file_sys/patch_manager.rs built-in patches vs Lichii core/file_sys/patch_manager.cpp
+
+### Intentional differences
+- Lichii extension, absent from Eden, ported at the user's explicit request
+  although it is title-specific: every built-in targets The Legend of Zelda:
+  Ocarina of Time (Switch 2), title `0400486024DEC000`, module `main`, build id
+  `E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348`. No other title-specific
+  behaviour is added. Source: Lichii `src/core/file_sys/patch_manager.cpp`
+  (`BuiltinPatchRecord`, `BuiltinPatch`, `BUILTIN_PATCHES`, the loop at the end
+  of `PatchNSO`, the check in `HasNSOPatch`, the listing in `GetPatches`), from
+  commits 99ac3d5955 (Max Resolution), 55532f2d81 (Dynamic FPS), 760183a2ad
+  (100 ms delta cap), cc3bfb9317 (FPS Unlock) and 12062785e3 (Texture Pool x2).
+  Tests port Lichii `src/tests/core/builtin_patches.cpp`.
+- Ported in Lichii's order, all default-on and listed in Add-Ons as mods whose
+  name is the disabled-add-on key (the existing per-title `disabled_addons`):
+  `Max Resolution (built-in)` (main+0x805BD0), `Texture Pool x2 (built-in)`
+  (main+0xC2A36C plus code cave main+0x3C462C0), `FPS Unlock (built-in)`
+  (main+0x6E6CC4 plus code cave main+0x3C46200, BSS state main+0x4E9FE00) and
+  `Dynamic FPS by Dark (built-in)` (same hook, cave and state). FPS Unlock
+  replaces Dynamic FPS: once it applies, Dynamic FPS is skipped with
+  "included in an applied built-in patch", and the Add-Ons list shows Dynamic
+  FPS as "IPS, replaced by FPS Unlock (built-in) when it applies". Original
+  bytes, executable-padding, BSS and user-mod-precedence guards and the log
+  messages are Lichii's.
+- Not ported: Lichii's three `DLSS ... render scale (built-in)` entries
+  (87d84d513c, ProfessorTee's Lichii #903 and QuincyForbes/Lichii f7d0938b5b)
+  and the `Settings::SetAppliedOcarinaRenderScale` bookkeeping. They apply only
+  in an `EGLANTINE_STREAMLINE` (NVIDIA Streamline) build with `nvidia_dlss` and
+  `nvidia_dlss_quality`; in Lichii's other builds they are neither applied nor
+  listed, which is ruzu's behaviour. Porting them needs the NVIDIA DLSS
+  settings, Streamline integration and the Ocarina upscale-pass replacement in
+  the Vulkan renderer (`vk_ocarina_camera_motion.cpp`, `ocarina_upscale.h`).
+- `patch_nso` now keeps the input image to compare against (Lichii takes it by
+  `const&` and copies it) and, like Lichii/Eden, returns the unpatched input
+  when the patched image is shorter than a header (it returned the short
+  patched image).
+
+### Attribution and licence status of the patch bytes
+- Max Resolution: Lichii 99ac3d5955 calls it "the community Max Resolution
+  exefs patch"; no author and no licence are given anywhere in Lichii. Licence:
+  unknown.
+- Texture Pool x2: "RsMan-Dev's patch as described in #247" (Lichii
+  12062785e3, by William RICHER, co-authored by Devin Alsup). No licence or
+  permission is stated. Licence: unknown.
+- Dynamic FPS by Dark: routine by Dark, "an Eglantine developer". Lichii
+  `docs/nx2/ocarina-dynamic-fps.md` says the bytes come from Frizti's
+  `oot-gather-fix` commit 765659af4ccb7201d1145c57f3b45ce84653cea0, "that
+  commit explicitly states that Dark gave permission to bundle it"; CTGL's
+  Lichii #299 changed the delta cap. Licence: permission to bundle mentioned
+  (second-hand, as reported by Lichii), no licence named.
+- FPS Unlock: Dark's routine head (as above) with a tail by atk3001 (Lichii
+  cc3bfb9317, contributed to Lichii, whose tree is GPL-3.0-or-later). Licence
+  of the head: as Dynamic FPS; of the tail: Lichii's project licence by
+  contribution, no separate statement.
+- The attributions are repeated in comments next to the bytes in
+  `patch_manager.rs`.
+
+## 2026-11-14 — common/settings.rs `frame_rate_limit` and nx2_gsv.rs vsync rate vs Lichii common/settings.h and core/hle/service/nx2_gsv.h
+
+### Intentional differences
+- Lichii extension (cc3bfb9317): `frame_rate_limit` (key
+  `nx2_frame_rate_limit`, Renderer, 30..=240, default 60, saved, not
+  runtime-modifiable) sets the nx2:vi2 vsync event rate through
+  `nx2_vsync_rate_hz` (`EDEN_NX2_VSYNC_HZ` still overrides it). It is what lets
+  the FPS Unlock built-in run Ocarina above 60 fps. The GTK Graphics page shows
+  it as a " Hz" slider after the FSR sharpness, in Lichii's setting order.
+- Lichii's `PaceToVblank` stops applying the 60 Hz present interval when the
+  rate is not 60 Hz (`timer_paced`). ruzu's `pace_to_vblank` has no swap
+  interval or FPS-limit pacing (it only paces to 60 Hz scaled by the speed
+  limit), so `timer_paced` just skips that pacing. At the default 60 Hz
+  nothing changes. As in Lichii, a non-60 `EDEN_NX2_VSYNC_HZ` now also skips
+  it (before, the variable changed only the vsync timer).
 
 ## 2026-11-14 — video_core/buffer_cache/{buffer_cache,buffer_cache_base}.rs vs Lichii video_core/buffer_cache/{buffer_cache,buffer_cache_base}.h
 

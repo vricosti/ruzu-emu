@@ -1906,7 +1906,9 @@ fn get_pipeline_worker_count(has_broken_parallel_shader_compiling: bool) -> usiz
 pub(crate) struct MeshComputePrograms {
     pub task: Option<super::compute_pipeline::MeshComputeStage>,
     pub task_info: Option<shader_recompiler::shader_info::MeshInfo>,
-    pub task_workgroup_bound: Option<u32>,
+    /// With a task program: the distribution pass that resolves the mesh
+    /// workgroup count on the GPU (Lichii mesh emulation, see vk_rasterizer).
+    pub distribution: Option<super::compute_pipeline::MeshEmulationDistribution>,
     pub mesh: super::compute_pipeline::MeshComputeStage,
     pub mesh_info: shader_recompiler::shader_info::MeshInfo,
 }
@@ -2288,7 +2290,7 @@ impl PipelineCache {
             let built = catch_shader_exception(|| -> Result<MeshComputePrograms, String> {
                 let mut task = None;
                 let mut task_info = None;
-                let mut task_workgroup_bound = None;
+                let mut distribution = None;
                 let mut mesh = None;
                 let mut mesh_info = None;
                 for index in [1, 3] {
@@ -2305,9 +2307,17 @@ impl PipelineCache {
                     let start = env.generic_environment().cached_instruction_start();
                     let program = shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
                         &code, start, env, &self.host_info);
-                    let shader = shader_recompiler::backend::spirv::emit_spirv::emit_mesh_compute_spirv_with_task_guard(
-                        &program, &self.profile, &RuntimeInfo::default(), &mut Bindings::default(), task.is_some())
-                        .map_err(|error| error.to_string())?;
+                    // A mesh after a task is dispatched by the distribution
+                    // pass and finds its task itself (Lichii mesh emulation).
+                    let task_payload_stride = task_info.as_ref()
+                        .map(|info: &shader_recompiler::shader_info::MeshInfo| info.payload_words);
+                    let shader = match task_payload_stride {
+                        Some(stride) if !program.info.is_task =>
+                            shader_recompiler::backend::spirv::emit_spirv::emit_mesh_compute_spirv_with_task_distribution(
+                                &program, &self.profile, &RuntimeInfo::default(), &mut Bindings::default(), stride),
+                        _ => shader_recompiler::backend::spirv::emit_spirv::emit_mesh_compute_spirv(
+                            &program, &self.profile, &RuntimeInfo::default(), &mut Bindings::default()),
+                    }.map_err(|error| error.to_string())?;
                     let stage = super::compute_pipeline::MeshComputeStage::new(self.device_owner.get(),
                         program.info.clone(), &shader, index - 1, self.vulkan_pipeline_cache)
                         .map_err(|error| format!("Mesh pipeline creation: {error:?}"))?;
@@ -2315,16 +2325,23 @@ impl PipelineCache {
                         if task.is_some() { return Err("Duplicate task stage".into()); }
                         task = Some(stage);
                         task_info = Some(program.mesh.clone());
-                        task_workgroup_bound = shader_recompiler::backend::spirv::emit_spirv_mesh::task_mesh_workgroup_bound(&program);
+                        let code = shader_recompiler::backend::spirv::emit_spirv_mesh::emit_mesh_emulation_distribution(&self.profile);
+                        distribution = Some(super::compute_pipeline::MeshEmulationDistribution::new(
+                            self.device_owner.get(), &code, self.vulkan_pipeline_cache)
+                            .map_err(|error| format!("Mesh distribution pipeline creation: {error:?}"))?);
                     } else {
                         if mesh.is_some() { return Err("Duplicate mesh stage".into()); }
                         mesh = Some(stage);
                         mesh_info = Some(program.mesh.clone());
                     }
                 }
+                let mesh = mesh.ok_or("Mesh graphics pipeline has no mesh stage")?;
+                if mesh.has_task_args() != task.is_some() {
+                    return Err("Task program must precede its mesh program".into());
+                }
                 Ok(MeshComputePrograms {
-                    task, task_info, task_workgroup_bound,
-                    mesh: mesh.ok_or("Mesh graphics pipeline has no mesh stage")?,
+                    task, task_info, distribution,
+                    mesh,
                     mesh_info: mesh_info.ok_or("Mesh graphics pipeline has no mesh metadata")?,
                 })
             }).and_then(|result| result);

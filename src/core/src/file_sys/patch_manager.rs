@@ -49,6 +49,204 @@ const EXEFS_FILE_NAMES: &[&str] = &[
 ];
 
 // ============================================================================
+// Built-in patches
+// ============================================================================
+//
+// Lichii extension (not in Eden), ported at the user's explicit request from
+// Lichii `src/core/file_sys/patch_manager.cpp` (commits 99ac3d5955, 55532f2d81,
+// 760183a2ad, cc3bfb9317, 12062785e3). Title-specific: every entry targets
+// The Legend of Zelda: Ocarina of Time (Switch 2), title 0400486024DEC000,
+// module `main`, build id E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348. Authors
+// and licence status of each byte sequence are recorded below and in DIFF.md
+// (2026-11-14). Lichii's three "DLSS ... render scale (built-in)" entries are
+// not ported: they only apply in an NVIDIA Streamline build with the
+// `nvidia_dlss_quality` setting, which ruzu does not have; Lichii's other
+// builds neither apply nor list them.
+
+/// One write of a built-in patch, at an offset into the module image (after
+/// the NSO header). Corresponds to Lichii `BuiltinPatchRecord`.
+struct BuiltinPatchRecord {
+    module_offset: usize,
+    bytes: &'static [u8],
+    /// Bytes required at `module_offset` in the unpatched module; empty means
+    /// no check.
+    original: &'static [u8],
+    /// The record writes into the zero-filled padding between the end of
+    /// `.text` and its page-rounded end (a code cave).
+    executable_padding: bool,
+}
+
+/// Corresponds to Lichii `BuiltinPatch`.
+struct BuiltinPatch {
+    name: &'static str,
+    title_id: u64,
+    module: &'static str,
+    build_id: &'static str,
+    records: &'static [BuiltinPatchRecord],
+    /// BSS storage the patch's routine uses; it must lie in BSS and be zero.
+    state_offset: usize,
+    state_size: usize,
+    /// Another built-in this one contains; it is skipped once this one is
+    /// applied. Empty when none.
+    replaces: &'static str,
+}
+
+const MAX_RESOLUTION_NAME: &str = "Max Resolution (built-in)";
+
+// Lichii 99ac3d5955 describes it as "the community Max Resolution exefs
+// patch"; its author and licence are not named in Lichii. `tbz w8, #0, ...`
+// becomes `b` to the game's own "dynamic resolution disabled" path.
+const MAX_RESOLUTION_ORIGINAL: [u8; 4] = [0xE8, 0x41, 0x00, 0x36];
+const MAX_RESOLUTION_BRANCH: [u8; 4] = [0x0F, 0x02, 0x00, 0x14];
+const MAX_RESOLUTION_RECORDS: [BuiltinPatchRecord; 1] = [BuiltinPatchRecord {
+    module_offset: 0x805BD0,
+    bytes: &MAX_RESOLUTION_BRANCH,
+    original: &MAX_RESOLUTION_ORIGINAL,
+    executable_padding: false,
+}];
+
+// RsMan-Dev's texture pool patch: stp x8, x9, [sp, #0x10] stores the graphics allocator's
+// initial pool size (x8); the call doubles it first (lsl x8, x8, #1 ; stp ; ret).
+// (Lichii 12062785e3: "RsMan-Dev's patch as described in #247"; no licence stated.)
+const TEXTURE_POOL_ORIGINAL: [u8; 4] = [0xE8, 0x27, 0x01, 0xA9];
+const TEXTURE_POOL_CALL: [u8; 4] = [0xD5, 0x6F, 0xC0, 0x94];
+const TEXTURE_POOL_ROUTINE: [u8; 12] = [
+    0x08, 0xF9, 0x7F, 0xD3, 0xE8, 0x27, 0x01, 0xA9, 0xC0, 0x03, 0x5F, 0xD6,
+];
+const TEXTURE_POOL_RECORDS: [BuiltinPatchRecord; 2] = [
+    BuiltinPatchRecord {
+        module_offset: 0xC2A36C,
+        bytes: &TEXTURE_POOL_CALL,
+        original: &TEXTURE_POOL_ORIGINAL,
+        executable_padding: false,
+    },
+    BuiltinPatchRecord {
+        module_offset: 0x3C462C0,
+        bytes: &TEXTURE_POOL_ROUTINE,
+        original: &[],
+        executable_padding: true,
+    },
+];
+
+// Dynamic FPS routine written by Dark (an Eglantine developer). Lichii
+// docs/nx2/ocarina-dynamic-fps.md: taken from Frizti's `oot-gather-fix` commit
+// 765659af4ccb7201d1145c57f3b45ce84653cea0, which "explicitly states that Dark
+// gave permission to bundle it"; no licence is named. CTGL's Lichii #299
+// changed the delta cap; the FPS Unlock tail is atk3001's (Lichii cc3bfb9317).
+const DYNAMIC_FPS_ORIGINAL: [u8; 4] = [0x28, 0x18, 0x20, 0x1E];
+const DYNAMIC_FPS_CALL: [u8; 4] = [0x4F, 0x7D, 0xD5, 0x94];
+// Dark's routine up to the step computation; the two built-ins differ only in the tail.
+// (Lichii's `DYNAMIC_FPS_ROUTINE_HEAD` macro; it takes the tail bytes here.)
+// The original routine caps the measured delta at CNTFRQ / 20 (50 ms); the head uses /10
+// (100 ms) so Ocarina keeps real speed down to 10 fps.
+macro_rules! dynamic_fps_routine_head {
+    ($($tail:expr),* $(,)?) => {
+        [
+            0x28, 0x18, 0x20, 0x1E, 0xCA, 0x92, 0x00, 0xB0, 0x4A, 0x01, 0x38, 0x91, 0x2B, 0xE0,
+            0x3B, 0xD5, 0x4C, 0x01, 0x40, 0xF9, 0x4B, 0x01, 0x00, 0xF9, 0xCC, 0x02, 0x00, 0xB4,
+            0x6B, 0x01, 0x0C, 0xCB, 0x0D, 0xE0, 0x3B, 0xD5, 0x4E, 0x01, 0x80, 0xD2, 0xAE, 0x09,
+            0xCE, 0x9A, 0x7F, 0x01, 0x0E, 0xEB, 0xCB, 0x81, 0x8B, 0x9A, 0x4C, 0x05, 0x40, 0xF9,
+            0x4C, 0x00, 0x00, 0xB5, 0xEC, 0x03, 0x0B, 0xAA, 0x6E, 0x01, 0x0C, 0xCB, 0x8C, 0x0D,
+            0x8E, 0x8B, 0x4C, 0x05, 0x00, 0xF9, 0x82, 0x01, 0x23, 0x9E, 0xA3, 0x01, 0x23, 0x9E,
+            0x42, 0x18, 0x23, 0x1E, 0x42, 0x08,
+            $($tail),*
+        ]
+    };
+}
+const DYNAMIC_FPS_ROUTINE: [u8; 120] = dynamic_fps_routine_head![
+    // Dark's tail: the smoothed step if it is above original * 1.03, else the original step.
+    0x21, 0x1E, 0xC3, 0x00, 0x00, 0x1C, 0x03, 0x09, 0x23, 0x1E, 0x40, 0x20, 0x23, 0x1E, 0x4D,
+    0x00, 0x00, 0x54, 0x48, 0x40, 0x20, 0x1E, 0xC0, 0x03, 0x5F, 0xD6, 0x0A, 0xD7, 0x83, 0x3F,
+];
+const FPS_UNLOCK_ROUTINE: [u8; 128] = dynamic_fps_routine_head![
+    // Unlock tail: the smoothed real-time step in 1/60-s units is clamped into [0.02, 6.0] and
+    // always returned, so logic follows real time above 60 fps too (0.5 units/frame at 120 fps)
+    // and down to 10 fps (6.0 matches the 100 ms delta cap). At 60 fps it equals Dark's tail.
+    // 0x5C: ldr s3, +0x78 (0.02f) ; fmaxnm s2, s2, s3 ; 0x64: ldr s3, +0x7c (6.0f) ;
+    // fminnm s2, s2, s3 ; fmov s8, s2 ; ret ; nop ; 0.02f ; 6.0f
+    0x21, 0x1E, 0xE3, 0x00, 0x00, 0x1C, 0x42, 0x68, 0x23, 0x1E, 0xC3, 0x00, 0x00, 0x1C, 0x42,
+    0x78, 0x23, 0x1E, 0x48, 0x40, 0x20, 0x1E, 0xC0, 0x03, 0x5F, 0xD6, 0x1F, 0x20, 0x03, 0xD5,
+    0x0A, 0xD7, 0xA3, 0x3C, 0x00, 0x00, 0xC0, 0x40,
+];
+const DYNAMIC_FPS_RECORDS: [BuiltinPatchRecord; 2] = [
+    BuiltinPatchRecord {
+        module_offset: 0x6E6CC4,
+        bytes: &DYNAMIC_FPS_CALL,
+        original: &DYNAMIC_FPS_ORIGINAL,
+        executable_padding: false,
+    },
+    BuiltinPatchRecord {
+        module_offset: 0x3C46200,
+        bytes: &DYNAMIC_FPS_ROUTINE,
+        original: &[],
+        executable_padding: true,
+    },
+];
+const FPS_UNLOCK_RECORDS: [BuiltinPatchRecord; 2] = [
+    BuiltinPatchRecord {
+        module_offset: 0x6E6CC4,
+        bytes: &DYNAMIC_FPS_CALL,
+        original: &DYNAMIC_FPS_ORIGINAL,
+        executable_padding: false,
+    },
+    BuiltinPatchRecord {
+        module_offset: 0x3C46200,
+        bytes: &FPS_UNLOCK_ROUTINE,
+        original: &[],
+        executable_padding: true,
+    },
+];
+
+const BUILTIN_PATCHES: [BuiltinPatch; 4] = [
+    // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
+    // instead of following the GPU-time controller down to its 480p floor.
+    BuiltinPatch {
+        name: MAX_RESOLUTION_NAME,
+        title_id: 0x0400486024DEC000,
+        module: "main",
+        build_id: "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        records: &MAX_RESOLUTION_RECORDS,
+        state_offset: 0,
+        state_size: 0,
+        replaces: "",
+    },
+    // With Max Resolution the guard house outgrows the initial pool and dereferences a null
+    // allocation.
+    BuiltinPatch {
+        name: "Texture Pool x2 (built-in)",
+        title_id: 0x0400486024DEC000,
+        module: "main",
+        build_id: "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        records: &TEXTURE_POOL_RECORDS,
+        state_offset: 0,
+        state_size: 0,
+        replaces: "",
+    },
+    // Dark's routine with a tail that also lowers the step above 60 fps, so the game keeps real
+    // speed at any frame rate limit (Settings frame_rate_limit).
+    BuiltinPatch {
+        name: "FPS Unlock (built-in)",
+        title_id: 0x0400486024DEC000,
+        module: "main",
+        build_id: "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        records: &FPS_UNLOCK_RECORDS,
+        state_offset: 0x4E9FE00,
+        state_size: 16,
+        replaces: "Dynamic FPS by Dark (built-in)",
+    },
+    BuiltinPatch {
+        name: "Dynamic FPS by Dark (built-in)",
+        title_id: 0x0400486024DEC000,
+        module: "main",
+        build_id: "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        records: &DYNAMIC_FPS_RECORDS,
+        state_offset: 0x4E9FE00,
+        state_size: 16,
+        replaces: "",
+    },
+];
+
+// ============================================================================
 // Title version formatting
 // ============================================================================
 
@@ -640,7 +838,7 @@ impl<'a> PatchManager<'a> {
         patch_dirs.sort_by(|l, r| l.get_name().cmp(&r.get_name()));
         let patches = self.collect_patches(&patch_dirs, &build_id);
 
-        let mut out = nso;
+        let mut out = nso.clone();
         for patch_file in &patches {
             if patch_file.get_extension() == "ips" {
                 if let Some(containing) = patch_file.get_containing_directory() {
@@ -680,8 +878,142 @@ impl<'a> PatchManager<'a> {
             }
         }
 
+        // Lichii extension: built-in patches (see BUILTIN_PATCHES).
+        let disabled = self.get_disabled_addons();
+        let mut replaced: Vec<&str> = Vec::new();
+        for patch in &BUILTIN_PATCHES {
+            if patch.title_id != self.title_id || patch.module != name {
+                continue;
+            }
+            if disabled.iter().any(|entry| entry == patch.name) {
+                log::info!("    - Skipping \"{}\": disabled in Add-Ons", patch.name);
+                continue;
+            }
+            if replaced.contains(&patch.name) {
+                log::info!(
+                    "    - Skipping \"{}\": included in an applied built-in patch",
+                    patch.name
+                );
+                continue;
+            }
+            if patch.build_id != build_id {
+                log::info!(
+                    "    - Skipping \"{}\": build id {} is not {}",
+                    patch.name,
+                    build_id,
+                    patch.build_id
+                );
+                continue;
+            }
+            let fits = |data: &[u8], offset: usize, size: usize| {
+                data.len() >= header_size
+                    && offset <= data.len() - header_size
+                    && size <= data.len() - header_size - offset
+            };
+            if patch.state_size != 0 {
+                let data = &header.segments[2];
+                let bss_start = u64::from(data.location) + u64::from(data.size);
+                let bss_end = bss_start + u64::from(data.alignment_or_bss_size);
+                let state_offset = patch.state_offset as u64;
+                if state_offset < bss_start
+                    || state_offset > bss_end
+                    || patch.state_size as u64 > bss_end - state_offset
+                    || !fits(&nso, patch.state_offset, patch.state_size)
+                    || !fits(&out, patch.state_offset, patch.state_size)
+                {
+                    log::warn!("    - Skipping \"{}\": timer state is outside BSS", patch.name);
+                    continue;
+                }
+                let offset = header_size + patch.state_offset;
+                let range = offset..offset + patch.state_size;
+                if !nso[range.clone()].iter().all(|&byte| byte == 0)
+                    || nso[range.clone()] != out[range]
+                {
+                    log::warn!(
+                        "    - Skipping \"{}\": timer state is not zero-filled",
+                        patch.name
+                    );
+                    continue;
+                }
+            }
+            let mut apply = true;
+            for record in patch.records {
+                if !fits(&nso, record.module_offset, record.bytes.len())
+                    || !fits(&out, record.module_offset, record.bytes.len())
+                    || !fits(&nso, record.module_offset, record.original.len())
+                {
+                    log::warn!(
+                        "    - Skipping \"{}\": {}+{:#x} is past the module's end",
+                        patch.name,
+                        name,
+                        record.module_offset
+                    );
+                    apply = false;
+                    break;
+                }
+                let offset = header_size + record.module_offset;
+                if record.executable_padding {
+                    let text = &header.segments[0];
+                    let text_end = u64::from(text.location) + u64::from(text.size);
+                    let executable_end = (text_end + 0xFFF) & !0xFFFu64;
+                    let record_end = (record.module_offset + record.bytes.len()) as u64;
+                    if (record.module_offset as u64) < text_end
+                        || record_end > executable_end
+                        || record_end > u64::from(header.segments[1].location)
+                        || !nso[offset..offset + record.bytes.len()]
+                            .iter()
+                            .all(|&byte| byte == 0)
+                    {
+                        log::warn!(
+                            "    - Skipping \"{}\": code cave is not executable padding",
+                            patch.name
+                        );
+                        apply = false;
+                        break;
+                    }
+                }
+                if nso[offset..offset + record.original.len()] != *record.original {
+                    log::warn!(
+                        "    - Skipping \"{}\": unexpected original bytes at {}+{:#x}",
+                        patch.name,
+                        name,
+                        record.module_offset
+                    );
+                    apply = false;
+                    break;
+                }
+                let range = offset..offset + record.bytes.len();
+                if nso[range.clone()] != out[range] {
+                    log::info!(
+                        "    - Skipping \"{}\": a user mod already patched {}+{:#x}",
+                        patch.name,
+                        name,
+                        record.module_offset
+                    );
+                    apply = false;
+                    break;
+                }
+            }
+            if !apply {
+                continue;
+            }
+            for record in patch.records {
+                let offset = header_size + record.module_offset;
+                out[offset..offset + record.bytes.len()].copy_from_slice(record.bytes);
+            }
+            log::info!(
+                "    - Applying built-in patch \"{}\" ({} records) to {}",
+                patch.name,
+                patch.records.len(),
+                name
+            );
+            if !patch.replaces.is_empty() {
+                replaced.push(patch.replaces);
+            }
+        }
+
         if out.len() < std::mem::size_of::<NsoHeader>() {
-            return out;
+            return nso;
         }
 
         // Restore the original header (upstream does this to keep the original build ID etc.)
@@ -707,6 +1039,14 @@ impl<'a> PatchManager<'a> {
             build_id_str,
             name
         );
+
+        // Lichii extension: a built-in patch for this module makes PatchNSO run.
+        if BUILTIN_PATCHES
+            .iter()
+            .any(|patch| patch.title_id == self.title_id && patch.module == name)
+        {
+            return true;
+        }
 
         let load_dir = match self.get_modification_load_root(false)
         {
@@ -1042,6 +1382,39 @@ impl<'a> PatchManager<'a> {
                     numeric_version: 0,
                 });
             }
+        }
+
+        // Lichii extension: built-in patches are listed as mods and toggled
+        // through the disabled add-ons like one.
+        let is_disabled = |name: &str| disabled.iter().any(|entry| entry == name);
+        for patch in &BUILTIN_PATCHES {
+            if patch.title_id != self.title_id {
+                continue;
+            }
+            // Name an enabled built-in that contains this one, so unchecking only this one is not
+            // mistaken for turning the change off. Whether it applies is only known in PatchNSO (a
+            // user mod can make it skip), hence "when it applies".
+            let replacing = BUILTIN_PATCHES.iter().find(|other| {
+                other.title_id == self.title_id
+                    && other.replaces == patch.name
+                    && !is_disabled(other.name)
+            });
+            out.push(Patch {
+                enabled: !is_disabled(patch.name),
+                name: patch.name.to_string(),
+                version: match replacing {
+                    Some(replacing) => {
+                        format!("IPS, replaced by {} when it applies", replacing.name)
+                    }
+                    None => "IPS".to_string(),
+                },
+                patch_type: PatchType::Mod,
+                program_id: self.title_id,
+                title_id: self.title_id,
+                source: PatchSource::Unknown,
+                location: String::new(),
+                numeric_version: 0,
+            });
         }
 
         // DLC
@@ -1799,5 +2172,449 @@ mod tests {
             *provider.control_requests.lock().unwrap(),
             vec![get_update_title_id(application_id)]
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // Built-in patches (Lichii src/tests/core/builtin_patches.cpp)
+    // ------------------------------------------------------------------------
+
+    const OCARINA_TITLE_ID: u64 = 0x0400486024DEC000;
+    const OTHER_TITLE_ID: u64 = 0x0100000000010000;
+    const MAX_RESOLUTION: &str = "Max Resolution (built-in)";
+    const DYNAMIC_FPS: &str = "Dynamic FPS by Dark (built-in)";
+    const FPS_UNLOCK: &str = "FPS Unlock (built-in)";
+    const TEXTURE_POOL: &str = "Texture Pool x2 (built-in)";
+    const OCARINA_BUILD_ID_HEX: &str = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348";
+    const OCARINA_BUILD_ID: [u8; 20] = [
+        0xE0, 0xF3, 0xCC, 0xFA, 0xF5, 0x00, 0x65, 0xAE, 0x4E, 0xA0, 0x1E, 0xB5, 0xAE, 0xB1, 0x3B,
+        0x1A, 0x45, 0xDA, 0x33, 0x48,
+    ];
+    const NSO_HEADER_SIZE: usize = std::mem::size_of::<crate::loader::nso::NsoHeader>();
+    const PATCH_OFFSET: usize = NSO_HEADER_SIZE + 0x805BD0;
+    const TBZ_INSTRUCTION: u32 = 0x360041E8;
+    const BRANCH_INSTRUCTION: u32 = 0x1400020F;
+    const NOP_INSTRUCTION: u32 = 0xD503201F;
+    const DYNAMIC_CALL_OFFSET: usize = NSO_HEADER_SIZE + 0x6E6CC4;
+    const DYNAMIC_ROUTINE_OFFSET: usize = NSO_HEADER_SIZE + 0x3C46200;
+    const DYNAMIC_STATE_OFFSET: usize = NSO_HEADER_SIZE + 0x4E9FE00;
+    const DYNAMIC_ROUTINE_SIZE: usize = 120;
+    const UNLOCK_ROUTINE_SIZE: usize = 128;
+    const DYNAMIC_CALL_INSTRUCTION: u32 = 0x94D57D4F;
+    const DYNAMIC_ORIGINAL_INSTRUCTION: u32 = 0x1E201828;
+
+    /// Settings are process-global: each built-in test runs alone in a child
+    /// process. Returns true in the parent once the child has passed.
+    fn ran_in_child_process(variable: &str) -> bool {
+        if std::env::var_os(variable).is_some() {
+            common::settings::values_mut().dump_nso.set_value(false);
+            return false;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", std::thread::current().name().unwrap()])
+            .env(variable, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        true
+    }
+
+    /// Lichii `WriteIps`.
+    fn write_ips(word: u32, offset: usize) -> Vec<u8> {
+        let ips32 = offset > 0xFFFFFF;
+        let mut ips = if ips32 { b"IPS32".to_vec() } else { b"PATCH".to_vec() };
+        if ips32 {
+            ips.push((offset >> 24) as u8);
+        }
+        ips.extend([(offset >> 16) as u8, (offset >> 8) as u8, offset as u8, 0, 4]);
+        ips.extend(word.to_le_bytes());
+        if ips32 {
+            ips.push(b'E');
+        }
+        ips.extend(b"EOF");
+        ips
+    }
+
+    /// Lichii `PatchManagerTestContext`: a load root with an Ocarina title
+    /// directory, optionally holding a user IPS mod.
+    fn builtin_test_controller(user_mod: Option<(u32, usize)>) -> FileSystemController {
+        let directory = |name: &str, files: Vec<VirtualFile>, dirs: Vec<VirtualDir>| -> VirtualDir {
+            Arc::new(VectorVfsDirectory::new(files, dirs, name.into(), None))
+        };
+        let mut mods = Vec::new();
+        if let Some((word, offset)) = user_mod {
+            let ips: VirtualFile = Arc::new(VectorVfsFile::new(
+                write_ips(word, offset),
+                format!("{OCARINA_BUILD_ID_HEX}.ips"),
+                None,
+            ));
+            mods.push(directory("UserMod", vec![], vec![directory("exefs", vec![ips], vec![])]));
+        }
+        let load = directory(
+            "load",
+            vec![],
+            vec![
+                directory(&format!("{OCARINA_TITLE_ID:016X}"), vec![], mods),
+                directory(&format!("{OTHER_TITLE_ID:016X}"), vec![], vec![]),
+            ],
+        );
+        let mut controller = FileSystemController::new();
+        controller.set_bis_factory(super::super::bis_factory::BisFactory::new(
+            directory("nand", vec![], vec![]),
+            load,
+            directory("dump", vec![], vec![]),
+        ));
+        controller
+    }
+
+    fn builtin_test_provider() -> RecordingContentProvider {
+        RecordingContentProvider { control_requests: Mutex::new(Vec::new()) }
+    }
+
+    fn set_disabled(names: &[&str]) {
+        common::settings::values_mut()
+            .disabled_addons
+            .insert(OCARINA_TITLE_ID, names.iter().map(|name| name.to_string()).collect());
+    }
+
+    fn update_header(nso: &mut [u8], update: impl FnOnce(&mut crate::loader::nso::NsoHeader)) {
+        let mut header = crate::loader::nso::NsoHeader::default();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                nso.as_ptr(),
+                &mut header as *mut _ as *mut u8,
+                NSO_HEADER_SIZE,
+            );
+        }
+        update(&mut header);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&header as *const _ as *const u8, NSO_HEADER_SIZE)
+        };
+        nso[..NSO_HEADER_SIZE].copy_from_slice(bytes);
+    }
+
+    /// Lichii `MakeMain`.
+    fn make_main(build_id: &[u8; 20], word: u32) -> Vec<u8> {
+        let mut nso = vec![0; PATCH_OFFSET + 0x100];
+        update_header(&mut nso, |header| {
+            header.magic = common::common_funcs::make_magic(b'N', b'S', b'O', b'0');
+            header.build_id[..20].copy_from_slice(build_id);
+        });
+        nso[PATCH_OFFSET..PATCH_OFFSET + 4].copy_from_slice(&word.to_le_bytes());
+        nso
+    }
+
+    /// Lichii `MakeDynamicMain`: the real segment layout of Ocarina's main.
+    fn make_dynamic_main() -> Vec<u8> {
+        let mut nso = make_main(&OCARINA_BUILD_ID, TBZ_INSTRUCTION);
+        nso.resize(DYNAMIC_STATE_OFFSET + 16, 0);
+        update_header(&mut nso, |header| {
+            header.segments[0].size = 63201744;
+            header.segments[1].location = 63205376;
+            header.segments[1].size = 12603520;
+            header.segments[2].location = 75812864;
+            header.segments[2].size = 5217152;
+            header.segments[2].alignment_or_bss_size = 1414272;
+        });
+        nso[DYNAMIC_CALL_OFFSET..DYNAMIC_CALL_OFFSET + 4]
+            .copy_from_slice(&DYNAMIC_ORIGINAL_INSTRUCTION.to_le_bytes());
+        nso
+    }
+
+    fn word_at(nso: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(nso[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+    }
+
+    fn listed(manager: &PatchManager, name: &str) -> Patch {
+        let patch = manager
+            .get_patches(None)
+            .into_iter()
+            .find(|patch| patch.name == name)
+            .unwrap_or_else(|| panic!("{name} is not listed"));
+        assert_eq!(patch.patch_type, PatchType::Mod);
+        patch
+    }
+
+    #[test]
+    fn builtin_max_resolution_is_gated_on_build_id_and_original_word() {
+        if ran_in_child_process("RUZU_TEST_BUILTIN_MAX_RESOLUTION_GATES") {
+            return;
+        }
+        let controller = builtin_test_controller(None);
+        let provider = builtin_test_provider();
+        let patch_main = |build_id: &[u8; 20], word, name: &str, title_id| {
+            let manager = PatchManager::new(title_id, &controller, &provider);
+            word_at(&manager.patch_nso(make_main(build_id, word), name), PATCH_OFFSET)
+        };
+
+        // Matching build id and original word applies.
+        assert_eq!(
+            patch_main(&OCARINA_BUILD_ID, TBZ_INSTRUCTION, "main", OCARINA_TITLE_ID),
+            BRANCH_INSTRUCTION
+        );
+        // Wrong original word skips.
+        assert_eq!(
+            patch_main(&OCARINA_BUILD_ID, NOP_INSTRUCTION, "main", OCARINA_TITLE_ID),
+            NOP_INSTRUCTION
+        );
+        // Other build id skips.
+        let mut other = OCARINA_BUILD_ID;
+        other[0] ^= 1;
+        assert_eq!(
+            patch_main(&other, TBZ_INSTRUCTION, "main", OCARINA_TITLE_ID),
+            TBZ_INSTRUCTION
+        );
+        // Other module skips.
+        assert_eq!(
+            patch_main(&OCARINA_BUILD_ID, TBZ_INSTRUCTION, "sdk", OCARINA_TITLE_ID),
+            TBZ_INSTRUCTION
+        );
+        // Other title skips.
+        assert_eq!(
+            patch_main(&OCARINA_BUILD_ID, TBZ_INSTRUCTION, "main", OTHER_TITLE_ID),
+            TBZ_INSTRUCTION
+        );
+        // Disabled in Add-Ons skips.
+        set_disabled(&[MAX_RESOLUTION]);
+        assert_eq!(
+            patch_main(&OCARINA_BUILD_ID, TBZ_INSTRUCTION, "main", OCARINA_TITLE_ID),
+            TBZ_INSTRUCTION
+        );
+    }
+
+    #[test]
+    fn builtin_max_resolution_defers_to_a_user_mod_at_the_same_offset() {
+        if ran_in_child_process("RUZU_TEST_BUILTIN_MAX_RESOLUTION_USER_MOD") {
+            return;
+        }
+        let provider = builtin_test_provider();
+        let patch_main = |mod_word| {
+            let controller = builtin_test_controller(Some((mod_word, PATCH_OFFSET)));
+            let manager = PatchManager::new(OCARINA_TITLE_ID, &controller, &provider);
+            word_at(
+                &manager.patch_nso(make_main(&OCARINA_BUILD_ID, TBZ_INSTRUCTION), "main"),
+                PATCH_OFFSET,
+            )
+        };
+        // A different word from the mod is kept.
+        assert_eq!(patch_main(NOP_INSTRUCTION), NOP_INSTRUCTION);
+        // The same word from the mod is applied once.
+        assert_eq!(patch_main(BRANCH_INSTRUCTION), BRANCH_INSTRUCTION);
+        // Disabling the built-in patch keeps the mod.
+        set_disabled(&[MAX_RESOLUTION]);
+        assert_eq!(patch_main(BRANCH_INSTRUCTION), BRANCH_INSTRUCTION);
+    }
+
+    #[test]
+    fn builtin_max_resolution_is_listed_and_loaded_for_ocarina_main() {
+        if ran_in_child_process("RUZU_TEST_BUILTIN_MAX_RESOLUTION_LISTED") {
+            return;
+        }
+        let controller = builtin_test_controller(None);
+        let provider = builtin_test_provider();
+        let manager = PatchManager::new(OCARINA_TITLE_ID, &controller, &provider);
+        let mut build_id = [0u8; 0x20];
+        build_id[..20].copy_from_slice(&OCARINA_BUILD_ID);
+
+        assert!(manager.has_nso_patch(&build_id, "main"));
+        assert!(!manager.has_nso_patch(&build_id, "sdk"));
+        assert!(!PatchManager::new(OTHER_TITLE_ID, &controller, &provider)
+            .has_nso_patch(&build_id, "main"));
+
+        assert!(listed(&manager, MAX_RESOLUTION).enabled);
+        set_disabled(&[MAX_RESOLUTION]);
+        assert!(!listed(&manager, MAX_RESOLUTION).enabled);
+    }
+
+    #[test]
+    fn builtin_fps_unlock_defaults_on_and_replaces_dynamic_fps() {
+        if ran_in_child_process("RUZU_TEST_BUILTIN_FPS_UNLOCK") {
+            return;
+        }
+        let controller = builtin_test_controller(None);
+        let provider = builtin_test_provider();
+        let manager = PatchManager::new(OCARINA_TITLE_ID, &controller, &provider);
+        let routine = |nso: &[u8], size| {
+            hex(&nso[DYNAMIC_ROUTINE_OFFSET..DYNAMIC_ROUTINE_OFFSET + size])
+        };
+        const ROUTINE_HEAD: &str = concat!(
+            "2818201ECA9200B04A0138912BE03BD54C0140F94B0100F9CC0200B46B010CCB0DE03BD5",
+            "4E0180D2AE09CE9A7F010EEBCB818B9A4C0540F94C0000B5EC030BAA6E010CCB8C0D8E8B",
+            "4C0500F98201239EA301239E4218231E4208211E"
+        );
+        let nso = make_dynamic_main();
+
+        // Default: FPS Unlock applies, Dynamic FPS is listed as replaced by it when it applies.
+        assert!(listed(&manager, FPS_UNLOCK).enabled);
+        assert!(listed(&manager, DYNAMIC_FPS).enabled);
+        assert_eq!(
+            listed(&manager, DYNAMIC_FPS).version,
+            format!("IPS, replaced by {FPS_UNLOCK} when it applies")
+        );
+        assert_eq!(listed(&manager, FPS_UNLOCK).version, "IPS");
+        let patched = manager.patch_nso(nso.clone(), "main");
+        assert_eq!(word_at(&patched, DYNAMIC_CALL_OFFSET), DYNAMIC_CALL_INSTRUCTION);
+        assert_eq!(
+            routine(&patched, UNLOCK_ROUTINE_SIZE),
+            format!(
+                "{ROUTINE_HEAD}E300001C4268231EC300001C4278231E4840201EC0035FD61F2003D50AD7A33C0000C040"
+            )
+        );
+        assert_eq!(word_at(&patched, PATCH_OFFSET), BRANCH_INSTRUCTION);
+        let unlocked = routine(&patched, UNLOCK_ROUTINE_SIZE);
+
+        // Unchecking only Dynamic FPS keeps FPS Unlock.
+        set_disabled(&[DYNAMIC_FPS]);
+        assert!(!listed(&manager, DYNAMIC_FPS).enabled);
+        assert_eq!(
+            routine(&manager.patch_nso(nso.clone(), "main"), UNLOCK_ROUTINE_SIZE),
+            unlocked
+        );
+
+        // Without FPS Unlock, Dark's routine applies unchanged.
+        set_disabled(&[FPS_UNLOCK]);
+        assert!(!listed(&manager, FPS_UNLOCK).enabled);
+        assert_eq!(listed(&manager, DYNAMIC_FPS).version, "IPS");
+        let patched = manager.patch_nso(nso.clone(), "main");
+        assert_eq!(word_at(&patched, DYNAMIC_CALL_OFFSET), DYNAMIC_CALL_INSTRUCTION);
+        assert_eq!(
+            routine(&patched, DYNAMIC_ROUTINE_SIZE),
+            format!("{ROUTINE_HEAD}C300001C0309231E4020231E4D0000544840201EC0035FD60AD7833F")
+        );
+        assert_eq!(word_at(&patched, DYNAMIC_ROUTINE_OFFSET + DYNAMIC_ROUTINE_SIZE), 0);
+
+        // Both unchecked: hook and code cave stay untouched.
+        set_disabled(&[FPS_UNLOCK, DYNAMIC_FPS]);
+        let patched = manager.patch_nso(nso.clone(), "main");
+        assert_eq!(word_at(&patched, DYNAMIC_CALL_OFFSET), DYNAMIC_ORIGINAL_INSTRUCTION);
+        assert_eq!(word_at(&patched, DYNAMIC_ROUTINE_OFFSET), 0);
+
+        set_disabled(&[MAX_RESOLUTION]);
+        let patched = manager.patch_nso(nso, "main");
+        assert_eq!(word_at(&patched, DYNAMIC_CALL_OFFSET), DYNAMIC_CALL_INSTRUCTION);
+        assert_eq!(word_at(&patched, PATCH_OFFSET), TBZ_INSTRUCTION);
+
+        let unrelated = PatchManager::new(OTHER_TITLE_ID, &controller, &provider).get_patches(None);
+        assert!(unrelated.iter().all(|patch| patch.name != DYNAMIC_FPS && patch.name != FPS_UNLOCK));
+    }
+
+    #[test]
+    fn builtin_dynamic_fps_rejects_mismatched_or_truncated_modules_transactionally() {
+        if ran_in_child_process("RUZU_TEST_BUILTIN_DYNAMIC_FPS_REJECTS") {
+            return;
+        }
+        let controller = builtin_test_controller(None);
+        let provider = builtin_test_provider();
+        set_disabled(&[MAX_RESOLUTION]);
+        let build_id_offset = std::mem::offset_of!(crate::loader::nso::NsoHeader, build_id);
+        let cases: Vec<(&str, Box<dyn Fn(&mut Vec<u8>, &mut &str, &mut u64)>)> = vec![
+            ("wrong build", Box::new(move |nso, _, _| nso[build_id_offset] ^= 1)),
+            ("wrong module", Box::new(|_, module, _| *module = "sdk")),
+            ("wrong title", Box::new(|_, _, title| *title = OTHER_TITLE_ID)),
+            ("incomplete header", Box::new(|nso, _, _| nso.truncate(NSO_HEADER_SIZE - 1))),
+            ("incomplete call", Box::new(|nso, _, _| nso.truncate(DYNAMIC_CALL_OFFSET + 3))),
+            (
+                "incomplete routine",
+                Box::new(|nso, _, _| {
+                    nso.truncate(DYNAMIC_ROUTINE_OFFSET + DYNAMIC_ROUTINE_SIZE - 1)
+                }),
+            ),
+            ("incomplete timer state", Box::new(|nso, _, _| nso.truncate(DYNAMIC_STATE_OFFSET + 15))),
+            (
+                "timer state outside BSS",
+                Box::new(|nso, _, _| {
+                    update_header(nso, |header| header.segments[2].alignment_or_bss_size = 15)
+                }),
+            ),
+            ("wrong original hook", Box::new(|nso, _, _| nso[DYNAMIC_CALL_OFFSET] ^= 1)),
+            (
+                "nonzero code cave",
+                Box::new(|nso, _, _| nso[DYNAMIC_ROUTINE_OFFSET + DYNAMIC_ROUTINE_SIZE - 1] = 1),
+            ),
+            ("nonzero timer state", Box::new(|nso, _, _| nso[DYNAMIC_STATE_OFFSET + 15] = 1)),
+            (
+                "code cave outside executable padding",
+                Box::new(|nso, _, _| update_header(nso, |header| header.segments[0].size = 0x3C46000)),
+            ),
+            (
+                "code cave overlaps read-only segment",
+                Box::new(|nso, _, _| {
+                    update_header(nso, |header| header.segments[1].location = 0x3C46200)
+                }),
+            ),
+        ];
+        for (section, mutate) in cases {
+            let mut nso = make_dynamic_main();
+            let mut module = "main";
+            let mut title = OCARINA_TITLE_ID;
+            mutate(&mut nso, &mut module, &mut title);
+            let manager = PatchManager::new(title, &controller, &provider);
+            assert!(manager.patch_nso(nso.clone(), module) == nso, "{section}");
+        }
+    }
+
+    #[test]
+    fn builtin_dynamic_fps_leaves_both_records_alone_when_a_user_mod_changes_either() {
+        if ran_in_child_process("RUZU_TEST_BUILTIN_DYNAMIC_FPS_USER_MOD") {
+            return;
+        }
+        let provider = builtin_test_provider();
+        set_disabled(&[MAX_RESOLUTION]);
+        for (section, offset, mod_word) in [
+            ("user call", DYNAMIC_CALL_OFFSET, 0x11223344),
+            ("identical call", DYNAMIC_CALL_OFFSET, DYNAMIC_CALL_INSTRUCTION),
+            ("user routine", DYNAMIC_ROUTINE_OFFSET, 0x11223344),
+            (
+                "last routine word",
+                DYNAMIC_ROUTINE_OFFSET + DYNAMIC_ROUTINE_SIZE - 4,
+                0x11223344,
+            ),
+            ("user timer state", DYNAMIC_STATE_OFFSET, 0x11223344),
+        ] {
+            let controller = builtin_test_controller(Some((mod_word, offset)));
+            let manager = PatchManager::new(OCARINA_TITLE_ID, &controller, &provider);
+            let nso = make_dynamic_main();
+            let mut expected = nso.clone();
+            expected[offset..offset + 4].copy_from_slice(&u32::to_le_bytes(mod_word));
+            assert!(manager.patch_nso(nso, "main") == expected, "{section}");
+        }
+    }
+
+    #[test]
+    fn builtin_texture_pool_doubles_the_allocators_initial_pool_size() {
+        if ran_in_child_process("RUZU_TEST_BUILTIN_TEXTURE_POOL") {
+            return;
+        }
+        const CALL_OFFSET: usize = NSO_HEADER_SIZE + 0xC2A36C;
+        const ROUTINE_OFFSET: usize = NSO_HEADER_SIZE + 0x3C462C0;
+        const STP_INSTRUCTION: u32 = 0xA90127E8;
+        const CALL_INSTRUCTION: u32 = 0x94C06FD5;
+        let controller = builtin_test_controller(None);
+        let provider = builtin_test_provider();
+        let manager = PatchManager::new(OCARINA_TITLE_ID, &controller, &provider);
+        let mut nso = make_dynamic_main();
+        nso[CALL_OFFSET..CALL_OFFSET + 4].copy_from_slice(&STP_INSTRUCTION.to_le_bytes());
+
+        let patched = manager.patch_nso(nso.clone(), "main");
+        assert_eq!(word_at(&patched, CALL_OFFSET), CALL_INSTRUCTION);
+        assert_eq!(hex(&patched[ROUTINE_OFFSET..ROUTINE_OFFSET + 12]), "08F97FD3E82701A9C0035FD6");
+        assert_eq!(word_at(&patched, ROUTINE_OFFSET + 12), 0);
+        // The Texture Pool cave sits right after the FPS Unlock routine.
+        assert_eq!(DYNAMIC_ROUTINE_OFFSET + UNLOCK_ROUTINE_SIZE, ROUTINE_OFFSET - 0x40);
+        assert!(listed(&manager, TEXTURE_POOL).enabled);
+
+        set_disabled(&[TEXTURE_POOL]);
+        let patched = manager.patch_nso(nso.clone(), "main");
+        assert_eq!(word_at(&patched, CALL_OFFSET), STP_INSTRUCTION);
+        assert_eq!(word_at(&patched, ROUTINE_OFFSET), 0);
+
+        common::settings::values_mut().disabled_addons.remove(&OCARINA_TITLE_ID);
+        nso[CALL_OFFSET..CALL_OFFSET + 4].copy_from_slice(&NOP_INSTRUCTION.to_le_bytes());
+        let patched = manager.patch_nso(nso, "main");
+        assert_eq!(word_at(&patched, CALL_OFFSET), NOP_INSTRUCTION);
+        assert_eq!(word_at(&patched, ROUTINE_OFFSET), 0);
     }
 }

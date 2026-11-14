@@ -37,6 +37,7 @@ pub mod native_qmd;
 pub mod native_query_trace;
 pub mod nx2;
 pub mod nx2_profile;
+pub mod oot_network;
 pub mod present;
 pub mod pte_kind;
 pub mod query_cache;

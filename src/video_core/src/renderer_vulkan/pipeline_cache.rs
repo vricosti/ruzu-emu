@@ -1703,6 +1703,289 @@ fn get_pipeline_worker_count(has_broken_parallel_shader_compiling: bool) -> usiz
     }
 }
 
+// ---------------------------------------------------------------------------
+// Precompiled pipelines (issue #24; Fritchii `be76402ab5`, `790bca8969`)
+// ---------------------------------------------------------------------------
+
+/// `<title>/vulkan_used.bin` magic: "EUP1", matching Fritchii's `UsedPipelinesMagic`.
+const USED_PIPELINES_MAGIC: u32 = 0x3150_5545;
+/// A pipeline unused for this many sessions is dropped from `vulkan_used.bin`.
+const USED_PIPELINES_MAX_AGE: u8 = 8;
+/// A session too short to say what the game uses (a boot to the menu) keeps the old list.
+const MINIMUM_USED_PIPELINES: usize = 64;
+/// How often a session's first-use records are written while the game runs.
+const USED_PIPELINES_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Port of Fritchii `LoadUsedPipelines`: key hash -> sessions since the last use.
+fn load_used_pipelines(path: &std::path::Path) -> HashMap<u64, u8> {
+    use std::io::Read;
+
+    let mut used = HashMap::new();
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return used;
+    };
+    let mut magic = [0u8; 4];
+    let mut count = [0u8; 4];
+    if file.read_exact(&mut magic).is_err()
+        || u32::from_le_bytes(magic) != USED_PIPELINES_MAGIC
+        || file.read_exact(&mut count).is_err()
+    {
+        return used;
+    }
+    for _ in 0..u32::from_le_bytes(count) {
+        let mut entry = [0u8; 9];
+        if file.read_exact(&mut entry).is_err() {
+            break;
+        }
+        let hash = u64::from_le_bytes(entry[..8].try_into().expect("8 bytes"));
+        used.insert(hash, entry[8]);
+    }
+    used
+}
+
+/// Port of Fritchii `PreloadAllPipelines`: `RUZU_PRELOAD_ALL_PIPELINES=1` builds
+/// every cached pipeline at boot, as before. (Upstream
+/// `EDEN_NX2_PRELOAD_ALL_PIPELINES`.)
+fn preload_all_pipelines() -> bool {
+    common::env_flag!("RUZU_PRELOAD_ALL_PIPELINES")
+}
+
+/// The boot-gating decision of Fritchii `LoadDiskResources`'s `load_graphics`.
+///
+/// Build at boot only what a recent session used; the rest is built when a draw
+/// first needs it and is not stored in the disk cache again.
+fn should_build_graphics_at_boot(
+    key_hash: u64,
+    used_pipelines: &HashMap<u64, u8>,
+    preload_all: bool,
+) -> bool {
+    preload_all || used_pipelines.is_empty() || used_pipelines.contains_key(&key_hash)
+}
+
+/// Serialize `vulkan_used.bin` from this session's uses and the loaded ages
+/// (Fritchii `SaveUsedPipelines`).
+fn write_used_pipelines(
+    path: &std::path::Path,
+    used_this_session: &std::collections::HashSet<u64>,
+    used_pipelines: &HashMap<u64, u8>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut next = HashMap::with_capacity(used_pipelines.len() + used_this_session.len());
+    for hash in used_this_session {
+        next.insert(*hash, 0u8);
+    }
+    for (hash, age) in used_pipelines {
+        if age + 1 < USED_PIPELINES_MAX_AGE {
+            next.entry(*hash).or_insert(age + 1);
+        }
+    }
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&USED_PIPELINES_MAGIC.to_le_bytes())?;
+    file.write_all(&(next.len() as u32).to_le_bytes())?;
+    for (hash, age) in next {
+        file.write_all(&hash.to_le_bytes())?;
+        file.write_all(&[age])?;
+    }
+    Ok(())
+}
+
+/// Bytes before the first pipeline record: the 8-byte magic and the u32 cache
+/// version (`serialize_pipeline` / `load_pipelines` header).
+fn cache_file_header_len() -> usize {
+    crate::shader_environment::MAGIC_NUMBER.len() + std::mem::size_of::<u32>()
+}
+
+/// Read one captured graphics record: its environments and its key.
+///
+/// The parse mirrors `load_pipelines`'s body and additionally requires the record
+/// to end exactly where boot measured it, so a record corrupted by a partial
+/// append is rejected instead of desynchronizing the caller's cursor.
+fn read_graphics_record(
+    file: &mut std::fs::File,
+    offset: u64,
+    length: u64,
+) -> std::io::Result<(GraphicsPipelineKey, Vec<FileEnvironment>)> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf4 = [0u8; 4];
+    file.read_exact(&mut buf4)?;
+    let num_envs = u32::from_le_bytes(buf4) as usize;
+    if num_envs == 0 || num_envs > NUM_PROGRAMS {
+        return Err(crate::shader_environment::invalid_cache_data(format!(
+            "pipeline environment count {num_envs} is outside 1..={NUM_PROGRAMS}"
+        )));
+    }
+    let mut environments = Vec::new();
+    environments
+        .try_reserve_exact(num_envs)
+        .map_err(|_| crate::shader_environment::invalid_cache_data("record is too large"))?;
+    for _ in 0..num_envs {
+        let mut environment = FileEnvironment::new();
+        environment.deserialize(file)?;
+        environments.push(environment);
+    }
+    let key = GraphicsPipelineKey::read_from_file(file)?;
+    let consumed = file.stream_position()? - offset;
+    if consumed != length {
+        return Err(crate::shader_environment::invalid_cache_data(format!(
+            "record is {consumed} bytes, boot measured {length}"
+        )));
+    }
+    Ok((key, environments))
+}
+
+/// Fritchii `PreparePrecompiled`'s stamp file: the step runs once per cache file,
+/// driver and emulator build.
+fn precompiled_stamp_path(base_dir: &std::path::Path) -> PathBuf {
+    base_dir.join(format!("precompiled_prepared.ruzu-v{CACHE_VERSION}.txt"))
+}
+
+/// Contents of the preparation stamp: file size, modification time, driver
+/// version, build revision and device model.
+fn precompiled_stamp(
+    filename: &std::path::Path,
+    driver_version: u32,
+    model_name: &str,
+) -> std::io::Result<String> {
+    let metadata = std::fs::metadata(filename)?;
+    let modified = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(format!(
+        "{} {} {driver_version:#x} {} {model_name}\n",
+        metadata.len(),
+        modified,
+        common::scm_rev::SCM_REV,
+    ))
+}
+
+fn read_precompiled_stamp(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+/// Fritchii `PreparePrecompiled`, adapted: rebuild and drop every cached graphics
+/// pipeline this boot did not build, so the driver's own cache holds their
+/// compiled code before a draw needs them.
+///
+/// Draws never use these pipelines: they build their own from the guest's
+/// shaders and find the driver's compiled code. Progress is reported as
+/// `WarmProgress` kind 3.
+fn prepare_precompiled_graphics(
+    filename: &std::path::Path,
+    base_dir: &std::path::Path,
+    records: &[(u64, u64)],
+    mut builder: GraphicsPipelineBuilder,
+    pipeline_cache: vk::PipelineCache,
+    shader_notify: crate::shader_notify::ShaderNotifyHandle,
+    graphics_runtime: GraphicsPipelineRuntime,
+    stop_loading: &std::sync::atomic::AtomicBool,
+    cancel: &std::sync::atomic::AtomicBool,
+    force: bool,
+) {
+    let stamp_path = precompiled_stamp_path(base_dir);
+    let stamp = match precompiled_stamp(
+        filename,
+        builder.device_owner.get().get_driver_version(),
+        &builder.device_owner.get().get_model_name(),
+    ) {
+        Ok(stamp) => stamp,
+        Err(error) => {
+            log::debug!("Precompiled pipelines skipped: {}", error);
+            return;
+        }
+    };
+    if !force && read_precompiled_stamp(&stamp_path).as_deref() == Some(stamp.as_str()) {
+        return;
+    }
+
+    let total = records.len();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let built = std::sync::atomic::AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicUsize::new(0);
+    let begin = std::time::Instant::now();
+    log::info!("Precompiled pipelines: preparing {total} cached pipelines in the background");
+
+    // The records boot captured, read one at a time. The file is append-only while
+    // the game runs, so a captured range is stable; a record that no longer parses
+    // (or whose hash moved) is skipped without touching the cache file.
+    match std::fs::OpenOptions::new().read(true).open(filename) {
+        Ok(mut file) => {
+            for &(offset, length) in records {
+                if stop_loading.load(Ordering::Acquire) || cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                let (key, mut environments) = match read_graphics_record(&mut file, offset, length)
+                {
+                    Ok(record) => record,
+                    Err(error) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        log::debug!(
+                            "Precompiled pipelines: record at {offset}+{length} unreadable: {error}"
+                        );
+                        done.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let pipeline = builder.build_from_file_environments(
+                    pipeline_cache,
+                    shader_notify,
+                    &mut environments,
+                    &key,
+                    graphics_runtime,
+                    None,
+                );
+                if pipeline.is_some() {
+                    built.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                }
+                // The driver's cache keeps the compiled code; the pipeline itself
+                // is not retained (Fritchii builds and drops).
+                drop(pipeline);
+                let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if finished % 32 == 0 || finished == total {
+                    shader_notify.set_warm_progress(3, finished, total);
+                }
+                if finished % 500 == 0 || finished == total {
+                    log::info!(
+                        "Precompiled pipelines: {finished} of {total} done, {} built, {} failed, {:.0} s",
+                        built.load(Ordering::Relaxed),
+                        failed.load(Ordering::Relaxed),
+                        begin.elapsed().as_secs_f64()
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            log::debug!("Precompiled pipelines skipped: cannot open the cache: {error}");
+            return;
+        }
+    }
+
+    let finished = done.load(Ordering::Relaxed);
+    if finished < total && (stop_loading.load(Ordering::Acquire) || cancel.load(Ordering::Acquire)) {
+        log::info!(
+            "Precompiled pipelines: stopped after {finished} of {total}; the rest is prepared next time"
+        );
+        return;
+    }
+    // An interrupted preparation is not stamped as done: it continues next boot.
+    if failed.load(Ordering::Relaxed) * 2 > total {
+        log::warn!(
+            "Precompiled pipelines: {} of {total} failed; not stamping the preparation",
+            failed.load(Ordering::Relaxed)
+        );
+        return;
+    }
+    if let Err(error) = std::fs::write(&stamp_path, stamp) {
+        log::warn!("Precompiled pipelines: cannot write the stamp: {error}");
+    }
+}
+
 /// Port of `PipelineCache` class.
 ///
 /// Extends `ShaderCache` to manage Vulkan graphics and compute pipeline
@@ -1741,6 +2024,26 @@ pub struct PipelineCache {
     main_pools: ShaderPools,
 
     pipeline_cache_filename: PathBuf,
+
+    /// Key hashes of the graphics pipelines in the disk cache. Only those a
+    /// recent session used are built at boot; the rest are built when first
+    /// needed, and not stored again. Each built pipeline holds driver memory
+    /// (Fritchii `be76402ab5`).
+    disk_pipelines: std::collections::HashSet<u64>,
+    /// Key hash -> sessions since it was last used (`vulkan_used.bin`).
+    used_pipelines: HashMap<u64, u8>,
+    /// Key hashes of the graphics pipelines this session used.
+    used_this_session: std::collections::HashSet<u64>,
+    used_pipelines_filename: PathBuf,
+    /// When `vulkan_used.bin` was last written; `None` until a session takes it over.
+    used_pipelines_saved: Option<std::time::Instant>,
+    /// Idle-priority worker that prepares cached pipelines the boot did not
+    /// build (Fritchii `precompile_thread`). Created when a preparation starts.
+    precompile_worker: Option<ThreadWorker>,
+    /// Set when a preparation is running so the preparation loop can be asked
+    /// to end with the renderer.
+    precompile_cancel: Arc<std::sync::atomic::AtomicBool>,
+
     vulkan_pipeline_cache_filename: PathBuf,
     vulkan_pipeline_cache: vk::PipelineCache,
 
@@ -1887,6 +2190,13 @@ impl PipelineCache {
             dynamic_features,
             main_pools: ShaderPools::new(),
             pipeline_cache_filename: PathBuf::new(),
+            disk_pipelines: std::collections::HashSet::new(),
+            used_pipelines: HashMap::new(),
+            used_this_session: std::collections::HashSet::new(),
+            used_pipelines_filename: PathBuf::new(),
+            used_pipelines_saved: None,
+            precompile_worker: None,
+            precompile_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             vulkan_pipeline_cache_filename: PathBuf::new(),
             vulkan_pipeline_cache: vk::PipelineCache::null(),
             compute_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
@@ -2062,6 +2372,16 @@ impl PipelineCache {
         }
 
         let pipeline = Rc::clone(self.graphics_cache.get(&key)?.as_ref()?);
+        // Fritchii `CurrentGraphicsPipelineSlowPath`: record what the session
+        // draws, and write it out at most every two minutes.
+        if self.used_this_session.insert(graphics_key_cache_hash(&key)) {
+            let due = self.used_pipelines_saved.is_none_or(|saved| {
+                saved.elapsed() >= USED_PIPELINES_SAVE_INTERVAL
+            });
+            if due {
+                self.save_used_pipelines();
+            }
+        }
         if let Some(current_pipeline) = self.current_pipeline.as_ref() {
             current_pipeline.add_transition(&pipeline);
         }
@@ -2122,6 +2442,12 @@ impl PipelineCache {
             }
         };
         if !self.pipeline_cache_filename.as_os_str().is_empty() {
+            // Fritchii `be76402ab5`: a key the disk cache already holds is only
+            // not built at boot; nothing new to store.
+            if self.disk_pipelines.contains(&graphics_key_cache_hash(key)) {
+                self.queue_vulkan_pipeline_cache_flush();
+                return Some(pipeline);
+            }
             let key_bytes = key.to_cache_bytes();
             let filename = self.pipeline_cache_filename.clone();
             let envs: Vec<_> = environments.span().into_iter().cloned().collect();
@@ -2152,14 +2478,24 @@ impl PipelineCache {
 
         let base_dir = pipeline_cache_filename
             .parent()
-            .expect("pipeline cache path should have a parent directory");
-        if let Err(err) = std::fs::create_dir_all(base_dir) {
+            .expect("pipeline cache path should have a parent directory")
+            .to_path_buf();
+        if let Err(err) = std::fs::create_dir_all(&base_dir) {
             log::error!("Failed to create pipeline cache directories: {}", err);
             return;
         }
 
         self.pipeline_cache_filename = pipeline_cache_filename;
         self.vulkan_pipeline_cache_filename = vulkan_pipeline_cache_filename;
+        // Fritchii `be76402ab5`: remember which pipelines recent sessions used so
+        // boot builds only those (each built pipeline holds driver memory).
+        self.used_pipelines_filename = base_dir.join("vulkan_used.bin");
+        self.used_pipelines = load_used_pipelines(&self.used_pipelines_filename);
+        self.used_pipelines_saved = Some(std::time::Instant::now());
+        self.used_this_session.clear();
+        self.disk_pipelines.clear();
+        let preload_all = preload_all_pipelines();
+        let mut skipped_pipelines = 0usize;
         log::info!(
             "Loading Vulkan disk pipeline cache title_id={:016X} file={}",
             title_id,
@@ -2183,6 +2519,7 @@ impl PipelineCache {
         }
 
         use std::cell::{Cell, RefCell};
+        use std::io::Seek as _;
 
         let mut built = 0usize;
         let skipped = Cell::new(0usize);
@@ -2192,10 +2529,20 @@ impl PipelineCache {
             .is_khr_pipeline_executable_properties_enabled()
             .then(|| Arc::new(PipelineStatistics::new(self.device_owner.get())));
         let dynamic_features = self.dynamic_features;
+        let used_pipelines = self.used_pipelines.clone();
+        let disk_pipelines = RefCell::new(std::collections::HashSet::new());
+        // (offset, length) of every graphics record boot skipped by the used
+        // gating. The preparation reads these exact records afterwards; it must
+        // not stream the file, which the GPU thread keeps appending to.
+        let skipped_records = RefCell::new(Vec::<(u64, u64)>::new());
+        // Start of the record being parsed: both callbacks advance it past their
+        // record, and `load_pipelines` delivers records strictly in file order.
+        let record_start = Cell::new(cache_file_header_len() as u64);
         let loaded_compute: RefCell<Vec<(ComputePipelineCacheKey, FileEnvironment)>> =
             RefCell::new(Vec::new());
         let load_compute = |file: &mut std::fs::File, env: FileEnvironment| {
             let key = ComputePipelineCacheKey::read_from_file(file)?;
+            record_start.set(file.stream_position()?);
             if env.has_ambiguous_depth_stencil_formats() {
                 skipped.set(skipped.get() + 1);
                 return Ok(());
@@ -2206,13 +2553,24 @@ impl PipelineCache {
         let loaded_graphics: RefCell<Vec<(GraphicsPipelineKey, Vec<FileEnvironment>)>> =
             RefCell::new(Vec::new());
         let load_graphics = |file: &mut std::fs::File, envs: Vec<FileEnvironment>| {
+            // Read the key even for skipped entries: the next record starts after it.
             let key = GraphicsPipelineKey::read_from_file(file)?;
+            let record_end = file.stream_position()?;
+            let record = (record_start.get(), record_end - record_start.get());
+            record_start.set(record_end);
             if envs.iter().any(FileEnvironment::has_ambiguous_depth_stencil_formats) {
                 skipped.set(skipped.get() + 1);
                 return Ok(());
             }
             if !graphics_key_dynamic_features_match(&key, &dynamic_features) {
                 skipped.set(skipped.get() + 1);
+                return Ok(());
+            }
+            let hash = graphics_key_cache_hash(&key);
+            disk_pipelines.borrow_mut().insert(hash);
+            if !should_build_graphics_at_boot(hash, &used_pipelines, preload_all) {
+                skipped_pipelines += 1;
+                skipped_records.borrow_mut().push(record);
                 return Ok(());
             }
             loaded_graphics.borrow_mut().push((key, envs));
@@ -2353,12 +2711,178 @@ impl PipelineCache {
             built,
             skipped_count
         );
+        if skipped_pipelines != 0 {
+            log::info!(
+                "{skipped_pipelines} cached graphics pipelines no recent session used are built when first needed"
+            );
+        }
+
+        // Take the disk-cache key set here, before the GPU thread starts adding to it.
+        self.disk_pipelines = disk_pipelines.into_inner();
 
         if self.use_vulkan_pipeline_cache {
             self.serialize_vulkan_pipeline_cache(&self.vulkan_pipeline_cache_filename);
         }
         if let Some(statistics) = pipeline_statistics {
             statistics.report();
+        }
+
+        // Fritchii `StartPrecompiled`: prepare what boot did not build in the
+        // background while the game runs (see `start_precompiled`).
+        self.start_precompiled(&base_dir, skipped_records.into_inner(), stop_loading);
+    }
+
+    /// Fritchii `StartPrecompiled`: background preparation of the cached
+    /// pipelines boot did not build.
+    ///
+    /// Boot builds only what recent sessions used; the skipped pipelines would
+    /// otherwise be translated and compiled inside the first draw that needs
+    /// them. This prepares them on an idle-priority thread while the game runs so
+    /// the driver's own cache holds their compiled code first (Fritchii
+    /// `StartPrecompiled` + `PreparePrecompiled`, adapted to ruzu's `vulkan.bin`
+    /// instead of an `NX2PREP1` file).
+    fn start_precompiled(
+        &mut self,
+        base_dir: &std::path::Path,
+        records: Vec<(u64, u64)>,
+        stop_loading: DiskResourceLoadStop,
+    ) {
+        self.precompile_worker = None;
+        self.precompile_cancel
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.shader_notify.set_precompile_available(false);
+        self.shader_notify.set_warm_progress(0, 0, 0);
+
+        if common::env_flag!("RUZU_DISABLE_PRECOMPILE") {
+            return;
+        }
+        // The prepared pipelines are kept by the driver's own cache. Without one
+        // they would have to live in the emulator's pipeline cache file, which is
+        // loaded whole at boot: preparation would not save the stutter.
+        if !self.use_vulkan_pipeline_cache {
+            log::info!(
+                "Precompiled pipelines skipped: the driver keeps no pipeline cache of its own"
+            );
+            return;
+        }
+
+        if records.is_empty() {
+            return;
+        }
+
+        let stamp_path = precompiled_stamp_path(base_dir);
+        let current_stamp = precompiled_stamp(
+            &self.pipeline_cache_filename,
+            self.device_owner.get().get_driver_version(),
+            &self.device_owner.get().get_model_name(),
+        );
+        if let Ok(stamp) = current_stamp {
+            if read_precompiled_stamp(&stamp_path).as_deref() == Some(stamp.as_str()) {
+                log::info!("Precompiled pipelines already prepared for this driver");
+                return;
+            }
+        }
+
+        let worker = ThreadWorker::new_stateless_with_placement(
+            1,
+            "VkPrecompile".to_owned(),
+            common::thread::ThreadPlacement::Background,
+        );
+        let filename = self.pipeline_cache_filename.clone();
+        let base_dir = base_dir.to_path_buf();
+        let records = Arc::new(records);
+        let builder = self.graphics_pipeline_builder.clone_for_disk_worker();
+        let pipeline_cache = self.vulkan_pipeline_cache;
+        let shader_notify = self.shader_notify;
+        let graphics_runtime = self.graphics_runtime;
+        let cancel = Arc::clone(&self.precompile_cancel);
+        let stop_loading = Arc::clone(&stop_loading);
+
+        self.shader_notify.set_precompile_available(true);
+        worker.queue_stateless_work(move || {
+            let mut force = false;
+            loop {
+                shader_notify.precompile_started();
+                prepare_precompiled_graphics(
+                    &filename,
+                    &base_dir,
+                    &records,
+                    builder.clone_for_disk_worker(),
+                    pipeline_cache,
+                    shader_notify,
+                    graphics_runtime,
+                    &stop_loading,
+                    &cancel,
+                    force,
+                );
+                shader_notify.set_warm_progress(0, 0, 0);
+                shader_notify.precompile_ended();
+
+                // Prepare Shaders Now prepares the file once more, whatever the
+                // stamp says (Fritchii `StartPrecompiled`'s request loop).
+                while !stop_loading.load(Ordering::Acquire)
+                    && !cancel.load(Ordering::Acquire)
+                    && !shader_notify.precompile_requested()
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                if stop_loading.load(Ordering::Acquire) || cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                log::info!("Precompiled pipelines: prepared again (Prepare Shaders Now)");
+                force = true;
+            }
+            if shader_notify.precompile_requested() {
+                // A request that came with the stop: it was counted as a warm-up.
+                shader_notify.precompile_started();
+                shader_notify.precompile_ended();
+            }
+            shader_notify.set_precompile_available(false);
+        });
+        self.precompile_worker = Some(worker);
+    }
+
+    /// Ask the preparation thread to prepare the title's cached pipelines again.
+    /// Returns false when this title has nothing to prepare.
+    pub fn request_precompile(&self) -> bool {
+        self.shader_notify.request_precompile()
+    }
+
+    /// Port of Fritchii `PipelineCache::SaveUsedPipelines`.
+    ///
+    /// A session too short to say what the game uses (a boot to the menu) keeps
+    /// the old list; the caller's `vulkan_used` ages are carried forward and
+    /// dropped after [`USED_PIPELINES_MAX_AGE`] sessions.
+    fn save_used_pipelines(&mut self) {
+        self.used_pipelines_saved = Some(std::time::Instant::now());
+        log::debug!(
+            "Used pipelines: {} this session ({} needed to save)",
+            self.used_this_session.len(),
+            MINIMUM_USED_PIPELINES
+        );
+        if self.used_pipelines_filename.as_os_str().is_empty()
+            || self.used_this_session.len() < MINIMUM_USED_PIPELINES
+        {
+            return;
+        }
+        // Upstream writes the hashes of the pipelines still in `graphics_cache`.
+        let cached: std::collections::HashSet<u64> = self
+            .graphics_cache
+            .keys()
+            .map(graphics_key_cache_hash)
+            .collect();
+        let used: std::collections::HashSet<u64> = self
+            .used_this_session
+            .iter()
+            .copied()
+            .filter(|hash| cached.contains(hash))
+            .collect();
+        if let Err(error) = write_used_pipelines(
+            &self.used_pipelines_filename,
+            &used,
+            &self.used_pipelines,
+        ) {
+            log::warn!("Failed to save the used pipeline list: {error}");
         }
     }
 
@@ -2473,6 +2997,12 @@ impl PipelineCache {
 
 impl Drop for PipelineCache {
     fn drop(&mut self) {
+        // Fritchii `~PipelineCache` saves the session's uses first.
+        self.save_used_pipelines();
+        // A preparation still running must end before the renderer's owners go away.
+        self.precompile_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.precompile_worker = None;
         // Upstream waits for serialization work through ThreadWorker teardown.
         // Do it explicitly before the final driver-cache serialization so a
         // late `SerializePipeline` job cannot race `vulkan_pipelines.bin`.
@@ -3188,6 +3718,202 @@ mod tests {
         let mut no_tf_preserve = features;
         no_tf_preserve.has_provoking_vertex_tf_preserve = false;
         assert!(!graphics_key_dynamic_features_match(&key, &no_tf_preserve));
+    }
+
+    #[test]
+    fn used_pipelines_round_trip_matches_fritchii_layout() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruzu-used-pipelines-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vulkan_used.bin");
+
+        // "EUP1", u32 count, then {u64 hash, u8 age} little-endian.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x3150_5545u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&0x99AA_BBCC_DDEE_FF00u64.to_le_bytes());
+        bytes.push(7);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let loaded = load_used_pipelines(&path);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[&0x1122_3344_5566_7788], 0);
+        assert_eq!(loaded[&0x99AA_BBCC_DDEE_FF00], 7);
+
+        // A wrong magic yields an empty list, never an error.
+        std::fs::write(&path, [0u8; 8]).unwrap();
+        assert!(load_used_pipelines(&path).is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn used_pipelines_age_and_drop_after_max_age() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruzu-used-aging-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vulkan_used.bin");
+
+        let mut loaded = HashMap::new();
+        loaded.insert(1u64, 0u8); // used last session
+        loaded.insert(2u64, 1u8); // used two sessions ago
+        loaded.insert(3u64, 6u8); // one session left before the age limit
+        loaded.insert(4u64, 7u8); // `age + 1 == MAX` drops it
+        let mut session = std::collections::HashSet::new();
+        session.insert(9u64); // used now
+
+        write_used_pipelines(&path, &session, &loaded).unwrap();
+        let next = load_used_pipelines(&path);
+        assert_eq!(next[&9], 0);
+        assert_eq!(next[&1], 1);
+        assert_eq!(next[&2], 2);
+        assert_eq!(next[&3], 7);
+        assert!(!next.contains_key(&4));
+        assert_eq!(next.len(), 4);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn boot_gating_builds_recently_used_pipelines_only() {
+        let mut used = HashMap::new();
+        used.insert(0xAAu64, 0u8);
+
+        // No list yet: build everything, as before.
+        assert!(should_build_graphics_at_boot(0xAA, &HashMap::new(), false));
+        assert!(should_build_graphics_at_boot(0xBB, &HashMap::new(), false));
+
+        // A list: only what it names is built at boot.
+        assert!(should_build_graphics_at_boot(0xAA, &used, false));
+        assert!(!should_build_graphics_at_boot(0xBB, &used, false));
+
+        // RUZU_PRELOAD_ALL_PIPELINES keeps building all of them.
+        assert!(should_build_graphics_at_boot(0xBB, &used, true));
+    }
+
+    #[test]
+    fn captured_graphics_records_read_back_bounded() {
+        use crate::shader_environment::MAGIC_NUMBER;
+        use std::io::{Seek as _, Write};
+        use shader_recompiler::program_header::ProgramHeader;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ruzu-precompile-record-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vulkan.bin");
+
+        // One graphics record in `serialize_pipeline`'s layout: u32 environment
+        // count, the environment, then the key. The environment has no facts and
+        // an empty program body, which is what a zero-fact translation writes.
+        let mut key = GraphicsPipelineKey::default();
+        key.unique_hashes[0] = 0x1234_5678_9ABC_DEF0;
+        let mut record = Vec::new();
+        record.extend_from_slice(&1u32.to_le_bytes());
+        for _ in 0..5 {
+            record.extend_from_slice(&0u64.to_le_bytes()); // code size and fact counts
+        }
+        record.extend_from_slice(&0u32.to_le_bytes()); // local memory size
+        record.extend_from_slice(&0u32.to_le_bytes()); // texture bound
+        record.extend_from_slice(&0u32.to_le_bytes()); // start address
+        record.extend_from_slice(&0u32.to_le_bytes()); // cached lowest
+        record.extend_from_slice(&0u32.to_le_bytes()); // cached highest
+        record.extend_from_slice(&1u32.to_le_bytes()); // viewport transform state
+        record.extend_from_slice(&(ShaderStage::Fragment as u32).to_le_bytes());
+        record.extend_from_slice(&[0u8; std::mem::size_of::<ProgramHeader>()]);
+        record.extend_from_slice(&key.to_cache_bytes());
+
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&MAGIC_NUMBER);
+        file_bytes.extend_from_slice(&CACHE_VERSION.to_le_bytes());
+        assert_eq!(file_bytes.len(), cache_file_header_len());
+        let offset = file_bytes.len() as u64;
+        file_bytes.extend_from_slice(&record);
+        std::fs::write(&path, &file_bytes).unwrap();
+        let length = record.len() as u64;
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let (read_key, environments) = read_graphics_record(&mut file, offset, length).unwrap();
+        assert_eq!(read_key.unique_hashes[0], 0x1234_5678_9ABC_DEF0);
+        assert_eq!(read_key.hash_value(), key.hash_value());
+        assert_eq!(environments.len(), 1);
+        assert_eq!(environments[0].shader_stage(), ShaderStage::Fragment);
+
+        // A range that does not end where the record does is rejected.
+        assert!(read_graphics_record(&mut file, offset, length - 4).is_err());
+        assert!(read_graphics_record(&mut file, offset, length + 4).is_err());
+        // A range inside the payload cannot parse as a record.
+        assert!(read_graphics_record(&mut file, offset + 4, length - 4).is_err());
+
+        // A torn append stays out of the captured range: the same range still reads.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&1u32.to_le_bytes())
+            .unwrap();
+        assert!(read_graphics_record(&mut file, offset, length).is_ok());
+        assert!(file.seek(std::io::SeekFrom::Start(0)).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn precompiled_stamp_tracks_file_driver_and_build() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruzu-precompile-stamp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("vulkan.bin");
+        std::fs::write(&cache, [1u8; 16]).unwrap();
+        let stamp_path = precompiled_stamp_path(&dir);
+        assert_eq!(
+            stamp_path.file_name().unwrap().to_str().unwrap(),
+            format!("precompiled_prepared.ruzu-v{CACHE_VERSION}.txt")
+        );
+
+        let stamp = precompiled_stamp(&cache, 0x1234, "Test Device").unwrap();
+        // Fritchii layout: size, modification time, driver, build revision, model.
+        assert!(stamp.contains(" 0x1234 "));
+        assert!(stamp.ends_with(" Test Device\n"));
+        assert!(stamp.contains(common::scm_rev::SCM_REV));
+        assert!(stamp.starts_with("16 "));
+
+        // Missing cache file: no stamp, so no preparation.
+        assert!(precompiled_stamp(&dir.join("missing.bin"), 0x1234, "Test Device").is_err());
+
+        std::fs::write(&stamp_path, &stamp).unwrap();
+        assert_eq!(read_precompiled_stamp(&stamp_path).as_deref(), Some(stamp.as_str()));
+
+        // A new file size changes the stamp, so the step runs again.
+        std::fs::write(&cache, [1u8; 17]).unwrap();
+        let changed = precompiled_stamp(&cache, 0x1234, "Test Device").unwrap();
+        assert_ne!(changed, stamp);
+        assert_ne!(read_precompiled_stamp(&stamp_path).as_deref(), Some(changed.as_str()));
+
+        // Another driver or device also invalidates it.
+        assert_ne!(
+            precompiled_stamp(&cache, 0x9999, "Test Device").unwrap(),
+            changed
+        );
+        assert_ne!(
+            precompiled_stamp(&cache, 0x1234, "Other Device").unwrap(),
+            changed
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

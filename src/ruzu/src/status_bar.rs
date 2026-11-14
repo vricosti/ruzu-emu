@@ -547,6 +547,17 @@ impl StatusBar {
         results: Option<PerfStatsResults>,
         shaders_building: Option<i32>,
     ) {
+        self.update_performance_with_warm(results, shaders_building, None);
+    }
+
+    /// Update the permanent performance labels, including the shader warm-up
+    /// and precompiled-pipeline preparation progress (`ShaderNotify::WarmProgress`).
+    pub fn update_performance_with_warm(
+        &self,
+        results: Option<PerfStatsResults>,
+        shaders_building: Option<i32>,
+        warm_progress: Option<video_core::shader_notify::WarmProgress>,
+    ) {
         let Some(results) = results else {
             for label in [
                 &self.shader_building,
@@ -562,6 +573,10 @@ impl StatusBar {
         if let Some(count) = shaders_building.filter(|count| *count > 0) {
             self.shader_building
                 .set_label(&format_shaders_building(count));
+            self.shader_building.set_visible(true);
+        } else if let Some(progress) = warm_progress.filter(|progress| progress.kind == 3) {
+            self.shader_building
+                .set_label(&format_preparing_shaders(progress.done, progress.total));
             self.shader_building.set_visible(true);
         } else {
             self.shader_building.set_visible(false);
@@ -673,6 +688,15 @@ fn format_shaders_building(count: i32) -> String {
         "{} {count} {}",
         crate::i18n::tr("Building:"),
         crate::i18n::tr(suffix)
+    )
+}
+
+/// Format the precompiled-pipeline preparation the way upstream's warm
+/// progress reads: `Preparing: 1234/6500`.
+fn format_preparing_shaders(done: usize, total: usize) -> String {
+    format!(
+        "{} {done}/{total}",
+        crate::i18n::tr("Preparing:"),
     )
 }
 
@@ -811,6 +835,12 @@ fn install_css() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparing_shaders_matches_upstream_warm_progress_text() {
+        assert_eq!(format_preparing_shaders(0, 0), "Preparing: 0/0");
+        assert_eq!(format_preparing_shaders(1234, 6500), "Preparing: 1234/6500");
+    }
 
     #[test]
     #[ignore = "requires GTK display and an isolated process for font settings"]

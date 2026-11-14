@@ -1453,7 +1453,9 @@ impl KeplerCompute {
             }
             if message.contains("matrix multiply") {
                 self.describe_native_resources(qmd);
-                return self.upscale_instead_of_native_program();
+                log::error!(
+                    "Native tensor dispatch is unsupported; no validated replacement was available"
+                );
             }
             return false;
         }
@@ -1573,198 +1575,6 @@ impl KeplerCompute {
         {
             self.native_upscale_input = Some(input);
         }
-    }
-
-    /// Port of KeplerCompute::UpscaleInsteadOfNativeProgram.
-    fn upscale_instead_of_native_program(&mut self) -> bool {
-        use super::fermi_2d::{Config, Filter, MemoryLayout, Operation, Surface};
-        use crate::cache_types::CacheType;
-        use crate::gpu::RenderTargetFormat as RTFormat;
-        use crate::textures::texture::TextureFormat;
-
-        let cbuf_address = self.launch_description.const_buffers[0].address;
-        let image = |offset: u64| {
-            let index = self
-                .memory_manager
-                .lock()
-                .read::<u32>(cbuf_address + offset)
-                & 0xfffff;
-            if index > self.tic_limit() {
-                None
-            } else {
-                Some(self.get_tic_entry(index))
-            }
-        };
-        let (Some(input), Some(output)) = (image(0x90), image(0xa0)) else {
-            return false;
-        };
-        if input.format() != output.format()
-            || input.address() == 0
-            || output.address() == 0
-            || output.width() <= input.width()
-            || !input.is_block_linear()
-            || !output.is_block_linear()
-        {
-            return false;
-        }
-        let format = match TextureFormat::from_raw(input.format()) {
-            Some(TextureFormat::A2B10G10R10) => RTFormat::A2B10G10R10Unorm,
-            Some(TextureFormat::A8B8G8R8) => RTFormat::A8B8G8R8Unorm,
-            Some(TextureFormat::B10G11R11) => RTFormat::B10G11R11Float,
-            Some(TextureFormat::R16G16B16A16) => RTFormat::R16G16B16A16Float,
-            _ => return false,
-        };
-        let surface = |tic: &TicEntry| Surface {
-            format: format as u32,
-            linear: MemoryLayout::BlockLinear as u32,
-            block_dimensions: tic.block_width()
-                | (tic.block_height() << 4)
-                | (tic.block_depth() << 8),
-            depth: 1,
-            width: tic.width(),
-            height: tic.height(),
-            addr_upper: (tic.address() >> 32) as u32,
-            addr_lower: tic.address() as u32,
-            ..Surface::default()
-        };
-        let config = Config {
-            operation: Operation::SrcCopy,
-            filter: Filter::Bilinear,
-            must_accelerate: true,
-            dst_x0: 0,
-            dst_y0: 0,
-            dst_x1: output.width() as i32,
-            dst_y1: output.height() as i32,
-            src_x0: 0,
-            src_y0: 0,
-            src_x1: input.width() as i32,
-            src_y1: input.height() as i32,
-        };
-        // These lambdas are function-local in upstream; preserve libc prefix/sign parsing.
-        static SAMPLE_AT: OnceLock<u32> = OnceLock::new();
-        let sample_at = *SAMPLE_AT.get_or_init(|| {
-            std::env::var_os("EDEN_NX2_SAMPLE_AT")
-                .map(|value| {
-                    let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
-                    unsafe { libc::strtoul(value.as_ptr(), std::ptr::null_mut(), 10) as u32 }
-                })
-                .unwrap_or(20)
-        });
-        let rasterizer = self
-            .rasterizer
-            .map(|handle| unsafe { handle.as_mut() })
-            .expect("native upscale requires a rasterizer");
-        static SAMPLED: AtomicU32 = AtomicU32::new(0);
-        if SAMPLED.fetch_add(1, Ordering::Relaxed) == sample_at {
-            let mut sample = |tic: &TicEntry| {
-                let size = tic.width() as u64 * tic.height() as u64 * 4;
-                let device = self.memory_manager.lock().gpu_to_cpu_address(tic.address());
-                if let Some(device) = device {
-                    rasterizer.flush_region(device, size, CacheType::ALL);
-                }
-                let (mut nonzero, mut samples, mut sum) = (0u32, 0u32, 0u64);
-                for offset in (0..size).step_by(4096 + 4) {
-                    let word = self
-                        .memory_manager
-                        .lock()
-                        .read::<u32>(tic.address() + offset);
-                    samples += 1;
-                    nonzero += u32::from(word != 0);
-                    sum +=
-                        ((word & 0x3ff) + ((word >> 10) & 0x3ff) + ((word >> 20) & 0x3ff)) as u64;
-                }
-                log::info!("Upscale fallback image {:#x}: {nonzero}/{samples} sampled words non-zero, mean channel {}", tic.address(), if samples != 0 {sum / (samples as u64 * 3)} else {0});
-            };
-            sample(&input);
-            sample(&output);
-            for address in [
-                0x8116a03000u64,
-                0x8117ae5000,
-                0x8114b62000,
-                0x8115a63000,
-                0x8117904000,
-                0x8114a02000,
-            ] {
-                let size = 2560u64 * 1440 * 4;
-                let device = self.memory_manager.lock().gpu_to_cpu_address(address);
-                if let Some(device) = device {
-                    rasterizer.flush_region(device, size, CacheType::ALL);
-                }
-                let (mut nonzero, mut samples, mut distinct, mut last) = (0u32, 0u32, 0u32, 0u32);
-                for offset in (0..size).step_by(4096 + 4) {
-                    let word = self.memory_manager.lock().read::<u32>(address + offset);
-                    samples += 1;
-                    nonzero += u32::from(word != 0);
-                    distinct += u32::from(word != last);
-                    last = word;
-                }
-                log::info!("Upscale fallback target {address:#x}: {nonzero}/{samples} non-zero, {distinct} changes");
-            }
-        }
-        let mut source = surface(&input);
-        static OVERRIDE_SOURCE: OnceLock<u64> = OnceLock::new();
-        let override_source = *OVERRIDE_SOURCE.get_or_init(|| {
-            std::env::var_os("EDEN_NX2_UPSCALE_SOURCE")
-                .map(|value| {
-                    let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
-                    unsafe { libc::strtoull(value.as_ptr(), std::ptr::null_mut(), 16) as u64 }
-                })
-                .unwrap_or(0)
-        });
-        if override_source != 0 {
-            source.addr_upper = (override_source >> 32) as u32;
-            source.addr_lower = override_source as u32;
-            if let Some(value) = std::env::var_os("EDEN_NX2_UPSCALE_SOURCE_FORMAT") {
-                let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
-                source.format =
-                    unsafe { libc::strtoul(value.as_ptr(), std::ptr::null_mut(), 16) as u32 };
-            }
-        }
-        let done = rasterizer.accelerate_surface_copy(&source, &surface(&output), &config);
-        static CHECKED: AtomicU32 = AtomicU32::new(0);
-        if CHECKED.fetch_add(1, Ordering::Relaxed) == sample_at {
-            let size = output.width() as u64 * output.height() as u64 * 4;
-            let device = self
-                .memory_manager
-                .lock()
-                .gpu_to_cpu_address(output.address());
-            if let Some(device) = device {
-                rasterizer.flush_region(device, size, CacheType::ALL);
-            }
-            let (mut nonzero, mut samples, mut changes, mut last) = (0u32, 0u32, 0u32, 0u32);
-            for offset in (0..size).step_by(4096 + 4) {
-                let word = self
-                    .memory_manager
-                    .lock()
-                    .read::<u32>(output.address() + offset);
-                samples += 1;
-                nonzero += u32::from(word != 0);
-                changes += u32::from(word != last);
-                last = word;
-            }
-            log::info!("Upscale fallback output after blit: {nonzero}/{samples} non-zero, {changes} changes");
-        }
-        static TRACE_AT: OnceLock<u32> = OnceLock::new();
-        let trace_at = *TRACE_AT.get_or_init(|| {
-            std::env::var_os("EDEN_NX2_TRACE_AFTER_UPSCALE")
-                .map(|value| {
-                    let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
-                    unsafe { libc::strtoul(value.as_ptr(), std::ptr::null_mut(), 10) as u32 }
-                })
-                .unwrap_or(30)
-        });
-        static COUNT: AtomicU32 = AtomicU32::new(0);
-        if COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1) == trace_at {
-            G_NX2_TRACE_DRAWS_AFTER_UPSCALE.store(40, Ordering::SeqCst);
-        }
-        static LOGGED: AtomicU32 = AtomicU32::new(0);
-        if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
-            log::info!("Upscale fallback {:#x} {}x{} block {}/{}/{} -> {:#x} {}x{} block {}/{}/{} levels {}: {}",
-                input.address(), input.width(), input.height(), input.block_width(), input.block_height(), input.block_depth(),
-                output.address(), output.width(), output.height(), output.block_width(), output.block_height(), output.block_depth(),
-                output.max_mip_level(), if done {"blitted"} else {"not accelerated"});
-        }
-        done
     }
 
     /// Port of ProcessNativeReportSemaphore: SET_REPORT_SEMAPHORE_A-D.
@@ -2869,176 +2679,22 @@ mod tests {
     }
 
     #[test]
-    fn native_upscale_preserves_formats_validation_overrides_and_sampling_order() {
-        const CHILD: &str = "RUZU_NATIVE_UPSCALE_CHILD";
-        let Ok(mode) = std::env::var(CHILD) else {
-            for mode in ["normal", "override", "sample"] {
-                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-                command
-                    .args([
-                        "--exact",
-                        std::thread::current().name().unwrap(),
-                        "--test-threads=1",
-                    ])
-                    .env(CHILD, mode)
-                    .env(
-                        "EDEN_NX2_SAMPLE_AT",
-                        if mode == "sample" { "0" } else { "4294967295" },
-                    )
-                    .env("EDEN_NX2_TRACE_AFTER_UPSCALE", "1")
-                    .env_remove("EDEN_NX2_UPSCALE_SOURCE")
-                    .env_remove("EDEN_NX2_UPSCALE_SOURCE_FORMAT");
-                if mode == "override" {
-                    command
-                        .env("EDEN_NX2_UPSCALE_SOURCE", "  +0x123456789tail")
-                        .env("EDEN_NX2_UPSCALE_SOURCE_FORMAT", "ca suffix");
-                }
-                assert!(command.status().unwrap().success(), "child {mode}");
-            }
-            return;
-        };
-        let mut backing = vec![0u8; 0x1000];
-        backing[0x90..0x94].copy_from_slice(&0xfff00000u32.to_le_bytes());
-        backing[0xa0..0xa4].copy_from_slice(&0xfff00001u32.to_le_bytes());
-        // Raw TIC descriptors: block-linear, Texture2D, distinct block dimensions.
-        let descriptors = [
-            [
-                8u32,
-                0x7800,
-                3 << 21,
-                1 | (2 << 3) | (3 << 6),
-                3 | (1 << 23),
-                1,
-                0,
-                0,
-            ],
-            [
-                8u32,
-                0x7900,
-                3 << 21,
-                2 | (3 << 3) | (1 << 6),
-                7 | (1 << 23),
-                0,
-                0,
-                0,
-            ],
-        ];
-        for (index, words) in descriptors.iter().enumerate() {
-            for (word, value) in words.iter().enumerate() {
-                let offset = 0x200 + index * 32 + word * 4;
-                backing[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-            }
-        }
+    fn native_matrix_multiply_rejection_is_reported_without_a_stand_in() {
+        // Lichii f6a8f51324 removed the plain-upscale stand-in for rejected tensor programs:
+        // the rejection is described and the dispatch reports failure, with no copy.
+        let backing = vec![0u8; 0x1000];
         let mut engine = new_owner_backed_engine(&backing, 0x7000);
-        engine.launch_description.const_buffers[0].address = 0x7000;
-        engine.regs[TIC_BASE as usize + 1] = 0x7200;
-        engine.regs[TIC_BASE as usize + 2] = 1;
         let rasterizer = TestRasterizer::new(0, 0);
-        engine.bind_rasterizer(&rasterizer);
-        assert!(!engine.upscale_instead_of_native_program()); // accelerator failure is forwarded
-        assert_eq!(G_NX2_TRACE_DRAWS_AFTER_UPSCALE.load(Ordering::SeqCst), 40);
-        let (src, dst, config) = rasterizer.copies.borrow()[0];
-        assert_eq!(
-            src.address(),
-            if mode == "override" {
-                0x123456789
-            } else {
-                0x7800
-            }
-        );
-        assert_eq!(src.format, if mode == "override" { 0xca } else { 0xd5 });
-        assert_eq!(dst.address(), 0x7900);
-        assert_eq!(
-            (src.block_width(), src.block_height(), src.block_depth()),
-            (1, 2, 3)
-        );
-        assert_eq!(
-            (dst.block_width(), dst.block_height(), dst.block_depth()),
-            (2, 3, 1)
-        );
-        assert_eq!((src.depth, src.pitch, src.layer), (1, 0, 0));
-        assert_eq!(
-            (config.src_x1, config.src_y1, config.dst_x1, config.dst_y1),
-            (4, 2, 8, 1)
-        );
-        assert_eq!(config.operation, super::super::fermi_2d::Operation::SrcCopy);
-        assert_eq!(config.filter, super::super::fermi_2d::Filter::Bilinear);
-        assert!(config.must_accelerate);
-        if mode == "sample" {
-            assert_eq!(
-                &*rasterizer.copy_events.borrow(),
-                &["flush", "flush", "copy", "flush"]
-            );
-            assert_eq!(
-                &*rasterizer.flushes.borrow(),
-                &[
-                    (0x7800, 32, crate::cache_types::CacheType::ALL),
-                    (0x7900, 32, crate::cache_types::CacheType::ALL),
-                    (0x7900, 32, crate::cache_types::CacheType::ALL)
-                ]
-            );
-        } else {
-            assert!(rasterizer.flushes.borrow().is_empty());
-        }
         rasterizer.copy_result.set(true);
-        if mode == "override" {
-            unsafe {
-                std::env::set_var("EDEN_NX2_UPSCALE_SOURCE", "999");
-                std::env::set_var("EDEN_NX2_UPSCALE_SOURCE_FORMAT", "d1");
-            }
-        }
-        for (texture, target) in [(9u32, 0xd1), (8, 0xd5), (0x21, 0xe0), (3, 0xca)] {
-            for offset in [0x200, 0x220] {
-                backing[offset..offset + 4].copy_from_slice(&texture.to_le_bytes());
-            }
-            assert!(engine.upscale_instead_of_native_program());
-            let copies = rasterizer.copies.borrow();
-            let (src, dst, _) = copies.last().unwrap();
-            assert_eq!(dst.format, target);
-            assert_eq!(src.format, if mode == "override" { 0xd1 } else { target });
-            assert_eq!(
-                src.address(),
-                if mode == "override" {
-                    0x123456789
-                } else {
-                    0x7800
-                }
-            );
-        }
-        let count = rasterizer.copies.borrow().len();
-        // Each unsupported condition returns before calling the accelerator.
-        for (offset, value) in [
-            (0x200, 1u32),
-            (0x220, 8),
-            (0x204, 0),
-            (0x224, 0),
-            (0x230, 3 | (1 << 23)),
-            (0x208, 2 << 21),
-            (0x228, 2 << 21),
-            (0xa0, 2),
-        ] {
-            let saved: [u8; 4] = backing[offset..offset + 4].try_into().unwrap();
-            if offset == 0x200 {
-                backing[0x220..0x224].copy_from_slice(&1u32.to_le_bytes());
-            }
-            backing[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-            assert!(
-                !engine.upscale_instead_of_native_program(),
-                "offset {offset:x}"
-            );
-            backing[offset..offset + 4].copy_from_slice(&saved);
-            backing[0x220..0x224].copy_from_slice(&3u32.to_le_bytes());
-        }
-        assert_eq!(rasterizer.copies.borrow().len(), count);
+        engine.bind_rasterizer(&rasterizer);
         let mut qmd = [0u32; 64];
         qmd[18] = 1 << 16;
         qmd[19] = 1 | (1 << 16);
         qmd[32] = 0x7000;
         rasterizer.dispatch_failure.set(2);
-        assert!(engine.dispatch_native_compute(&qmd));
-        assert_eq!(rasterizer.copies.borrow().len(), count + 1);
-        rasterizer.copy_result.set(false);
         assert!(!engine.dispatch_native_compute(&qmd));
+        assert_eq!(rasterizer.dispatches.get(), 1);
+        assert!(rasterizer.copies.borrow().is_empty());
     }
 
     #[test]

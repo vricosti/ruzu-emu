@@ -1,5 +1,47 @@
 # Upstream parity notes
 
+## 2026-11-14 — video_core/engines/{kepler_compute,native_upscale,fermi_2d}.rs, oot_network.rs and renderer_vulkan/blit_image.rs vs Lichii video_core/engines/{kepler_compute.cpp,native_upscale.h,fermi_2d.h}, oot_network.h and renderer_vulkan/blit_image.cpp
+
+### Ported
+- Ocarina of Time's movie network replacement, from Lichii aae0b063f7 (#721, port of
+  Eglantine 92f119195f): `dispatch_native_compute` skips the network's passes and replaces
+  the pass that stores the upscaled image with a bilinear Fermi2D copy of the retained input
+  (`SrcCopySrgbToLinear` when the program carries the sRGB decode immediates 0x434/0x292d292d
+  and 0x832/0x40cc40cc, otherwise `SrcCopy`). Same conditions, order, 32-dispatch window,
+  failure fallback (`native_upscale_disabled`) and helpers (`native_image_handles`,
+  `remember_native_upscale_input`, `find_native_upscale_output`, `find_native_upscale_slots`).
+- Game-specific by design, authorised by the user: active only when the current program id is
+  `oot_network::PROGRAM_ID` (0x0400486024DEC000) and cbuf0 is enabled for the dispatch.
+- `Fermi2D::Operation::SrcCopySrgbToLinear` (7) and its fragment shader
+  `blit_color_srgb_to_linear.frag` from Lichii 82e34d410f; the Vulkan blit helper selects it by
+  operation. OpenGL ignores the operation, as upstream.
+- Removed the legacy `upscale_instead_of_native_program` stand-in (fixed cbuf0 +0x90/+0xa0 pair,
+  reached only after a "matrix multiply" shader rejection), as Lichii f6a8f51324 did: the
+  rejection is now described and logged, and the dispatch reports failure. Its EDEN_NX2_SAMPLE_AT,
+  EDEN_NX2_UPSCALE_SOURCE(_FORMAT) and EDEN_NX2_TRACE_AFTER_UPSCALE diagnostics went with it.
+
+### Intentional differences
+- Lichii also requires `!dlss_chain.active`; ruzu has no Fire Emblem DLSS chain, so the term is
+  always true here.
+- `oot_network.rs` holds only `PROGRAM_ID`. The rest of Lichii's `oot_network.h` (the gameplay
+  anti-aliasing bypass: program keys, tonemap hashes, `BypassState`, `BypassEnabled` and the
+  `oot_anti_aliasing` setting) is a separate feature that ruzu does not have.
+- `find_native_upscale_slots` names `TicEntry` instead of a C++ template parameter; it has no
+  caller, upstream included.
+
+### Measurements
+- Setup: RX 5700 XT / RADV, Ocarina of Time with no controller (title screen over the movie),
+  window 30-90 s, release builds, bench.sh in headless gamescope, two runs each.
+- Per frame, 12 of 14 native dispatches belong to the movie network: one pass reads only
+  cbuf0+0x58 (1920x1080 A8B8G8R8) and stores nothing, ten passes have no image handles, and
+  the last stores cbuf0+0xc8 (2560x1440). The copy is the plain one (the program does not carry
+  the sRGB immediates), and it succeeded on every frame of the run that logged it.
+- Before: 43.60 and 43.57 FPS, host GPU busy 99.0 % in both runs.
+- After: 59.87 and 59.92 FPS, host GPU busy 14.0 % and 15.2 %. Same set of error and warning
+  messages as before. Screenshots at 40 s and 70 s showed a correct title screen.
+- Not verified: other scenes (gameplay, cutscenes after the intro), the sRGB-decoding copy path
+  at runtime, and other titles (the replacement is gated on this title's program id).
+
 ## 2026-11-14 — video_core/buffer_cache/{buffer_cache,buffer_cache_base}.rs vs Lichii video_core/buffer_cache/{buffer_cache,buffer_cache_base}.h
 
 ### Intentional differences

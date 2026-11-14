@@ -1557,6 +1557,7 @@ mod tests {
             "scaling_filter",
             "anti_aliasing",
             "fsr_sharpening_slider",
+            "nx2_frame_rate_limit",
             "bg_red",
             "bg_green",
             "bg_blue",
@@ -1728,6 +1729,7 @@ mod tests {
             values.vsync_mode.set_value(VSyncMode::Mailbox);
             values.scaling_filter.set_value(ScalingFilter::SgsrEdge);
             values.fsr_sharpening_slider.set_value(77);
+            values.frame_rate_limit.set_value(120);
             values.aspect_ratio.set_value(AspectRatio::R21_9);
             values.anti_aliasing.set_value(AntiAliasing::Smaa);
             values.use_asynchronous_gpu_emulation.set_value(false);
@@ -1811,6 +1813,7 @@ mod tests {
             assert_eq!(*values.vsync_mode.get_value(), VSyncMode::Mailbox);
             assert_eq!(*values.scaling_filter.get_value(), ScalingFilter::SgsrEdge);
             assert_eq!(*values.fsr_sharpening_slider.get_value(), 77);
+            assert_eq!(*values.frame_rate_limit.get_value(), 120);
             assert_eq!(*values.aspect_ratio.get_value(), AspectRatio::R21_9);
             assert_eq!(*values.anti_aliasing.get_value(), AntiAliasing::Smaa);
             assert!(!*values.use_asynchronous_gpu_emulation.get_value());

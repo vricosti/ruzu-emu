@@ -209,6 +209,10 @@ pub struct Values {
     pub scaling_filter: SwitchableSetting<ScalingFilter>,
     pub anti_aliasing: SwitchableSetting<AntiAliasing>,
     pub fsr_sharpening_slider: SwitchableSetting<i32>,
+    /// Lichii extension (cc3bfb9317): Switch 2 VSync event rate. Games start
+    /// frames on it, so above 60 only games with a real-time step (e.g. the
+    /// Ocarina "FPS Unlock" built-in) keep their speed.
+    pub frame_rate_limit: SwitchableSetting<u16>,
 
     pub bg_red: SwitchableSetting<u8>,
     pub bg_green: SwitchableSetting<u8>,
@@ -551,6 +555,7 @@ impl Values {
                 scaling_filter,
                 anti_aliasing,
                 fsr_sharpening_slider,
+                frame_rate_limit,
                 bg_red,
                 bg_green,
                 bg_blue,
@@ -1116,6 +1121,16 @@ impl Default for Values {
                 Specialization::SCALAR | Specialization::PERCENTAGE,
                 true,
                 true,
+            ),
+            frame_rate_limit: SwitchableSetting::ranged_with_options(
+                60,
+                30,
+                240,
+                "nx2_frame_rate_limit",
+                Renderer,
+                Specialization::SCALAR,
+                true,
+                false,
             ),
 
             bg_red: SwitchableSetting::with_options(
@@ -2025,6 +2040,7 @@ pub fn restore_global_state(values: &mut Values, is_powered_on: bool) {
     values.scaling_filter.set_global(true);
     values.anti_aliasing.set_global(true);
     values.fsr_sharpening_slider.set_global(true);
+    values.frame_rate_limit.set_global(true);
     values.bg_red.set_global(true);
     values.bg_green.set_global(true);
     values.bg_blue.set_global(true);
@@ -2231,7 +2247,7 @@ mod tests {
         }
         // Inventory of the Setting/SwitchableSetting fields in Values; plain
         // controller arrays and frontend UI settings have separate serializers.
-        assert_eq!(labels.len(), 193);
+        assert_eq!(labels.len(), 194);
 
         // Eden registers a restore callback for every SwitchableSetting.
         // Exercise all registered settings so a newly added field cannot
@@ -2291,6 +2307,14 @@ mod tests {
             *values.fsr_sharpening_slider.get_value(),
             if cfg!(target_os = "android") { 0 } else { 25 }
         );
+        assert_eq!(*values.frame_rate_limit.get_value(), 60);
+        assert_eq!(values.frame_rate_limit.setting.label, "nx2_frame_rate_limit");
+        assert!(!values.frame_rate_limit.setting.runtime_modifiable);
+        let mut frame_rate_limit = values.frame_rate_limit.clone();
+        frame_rate_limit.set_value(10);
+        assert_eq!(*frame_rate_limit.get_value(), 30);
+        frame_rate_limit.set_value(1000);
+        assert_eq!(*frame_rate_limit.get_value(), 240);
         assert_eq!(*values.aspect_ratio.get_value(), AspectRatio::R16_9);
         assert_eq!(*values.anti_aliasing.get_value(), AntiAliasing::None);
         assert_eq!(

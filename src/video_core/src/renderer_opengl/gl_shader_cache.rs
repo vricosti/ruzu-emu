@@ -229,6 +229,8 @@ fn opengl_host_translate_info(device: &Device) -> HostTranslateInfo {
         support_viewport_index_layer: device.has_vertex_viewport_layer(),
         support_geometry_shader_passthrough: device.has_geometry_shader_passthrough(),
         support_conditional_barrier: device.supports_conditional_barriers(),
+        // OpenGL pipelines bind at most 64 textures (Lichii host_translate_info.h:48-51).
+        support_handle_table_arrays: false,
     };
     host_info.apply_descriptor_limit_policy();
     host_info

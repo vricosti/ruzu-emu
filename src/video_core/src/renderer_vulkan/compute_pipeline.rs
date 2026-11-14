@@ -654,7 +654,8 @@ impl ComputePipeline {
                 tsc_addr: dispatch.tsc_address,
                 tsc_limit: dispatch.tsc_limit,
             });
-        let mut handles = collect_texture_handles(&self.info, dispatch, |address| {
+        let storage_alignment = buffer_cache.runtime.get_storage_buffer_alignment() as u64;
+        let mut handles = collect_texture_handles(&self.info, dispatch, storage_alignment, |address| {
             let mut value = [0u8; 4];
             let _ = read_gpu(address, &mut value);
             u32::from_le_bytes(value)
@@ -1026,6 +1027,7 @@ fn read_texture_handle(
     qmd: &LaunchParams,
     desc: &impl ComputeTextureHandleDescriptor,
     index: u32,
+    storage_alignment: u64,
     read_u32: &mut impl FnMut(u64) -> u32,
 ) -> (u32, u32) {
     if desc.handle_program() != u32::MAX {
@@ -1035,7 +1037,7 @@ fn read_texture_handle(
                 if index as usize >= qmd.const_buffers.len()
                     || (qmd.const_buffer_enable_mask >> index) & 1 == 0 { return 0; }
                 qmd.const_buffers[index as usize].address
-            }, read_u32);
+            }, read_u32, storage_alignment, index);
         return texture_pair(handle, qmd.linked_tsc);
     }
     assert_ne!((qmd.const_buffer_enable_mask >> desc.cbuf_index()) & 1, 0);
@@ -1062,6 +1064,7 @@ fn read_texture_handle(
 fn collect_texture_handles(
     info: &ShaderInfo,
     dispatch: &DispatchCall,
+    storage_alignment: u64,
     mut read_u32: impl FnMut(u64) -> u32,
 ) -> ComputeTextureHandles {
     let mut result = ComputeTextureHandles::default();
@@ -1073,6 +1076,7 @@ fn collect_texture_handles(
                     &dispatch.launch_description,
                     desc,
                     index,
+                    storage_alignment,
                     &mut read_u32,
                 )
                 .0,
@@ -1088,6 +1092,7 @@ fn collect_texture_handles(
                     &dispatch.launch_description,
                     desc,
                     index,
+                    storage_alignment,
                     &mut read_u32,
                 )
                 .0,
@@ -1098,7 +1103,8 @@ fn collect_texture_handles(
     for desc in &info.texture_descriptors {
         for index in 0..desc.count {
             let (view, sampler) =
-                read_texture_handle(info, &dispatch.launch_description, desc, index, &mut read_u32);
+                read_texture_handle(info, &dispatch.launch_description, desc, index,
+                                    storage_alignment, &mut read_u32);
             result.views.push(ImageViewInOut {
                 index: view,
                 ..Default::default()
@@ -1114,6 +1120,7 @@ fn collect_texture_handles(
                     &dispatch.launch_description,
                     desc,
                     index,
+                    storage_alignment,
                     &mut read_u32,
                 )
                 .0,
@@ -1228,7 +1235,7 @@ mod tests {
         qmd.const_buffer_enable_mask = 1 << 3;
         qmd.const_buffers[3].address = 0x1000;
         for handle in [17, 29] {
-            assert_eq!(super::read_texture_handle(&info, &qmd, &desc, 0, &mut |address| {
+            assert_eq!(super::read_texture_handle(&info, &qmd, &desc, 0, 1, &mut |address| {
                 assert_eq!(address, 0x100c); handle
             }), super::texture_pair(handle, qmd.linked_tsc));
         }

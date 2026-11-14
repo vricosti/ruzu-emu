@@ -232,6 +232,9 @@ fn make_host_translate_info(device: &Device) -> HostTranslateInfo {
         support_viewport_index_layer: device.is_ext_shader_viewport_index_layer_supported(),
         support_geometry_shader_passthrough: device.is_nv_geometry_shader_passthrough_supported(),
         support_conditional_barrier: device.supports_conditional_barriers(),
+        // The arrays are indexed per invocation, which needs nonuniform
+        // indexing to be defined (Lichii vk_pipeline_cache.cpp:705-706).
+        support_handle_table_arrays: device.is_sampled_image_array_non_uniform_indexing_supported(),
     };
     host_info.apply_descriptor_limit_policy();
     host_info

@@ -24,7 +24,7 @@ fn computed_image_handle_reads_current_binding_before_direct_cbuf_validation() {
     qmd.const_buffer_enable_mask = 1 << 3;
     qmd.const_buffers[3].address = 0x1000;
     for handle in [17, 29] {
-        let result = ComputePipeline::collect_texture_bindings(&info, &qmd, |address| {
+        let result = ComputePipeline::collect_texture_bindings(&info, &qmd, 1, |address| {
             assert_eq!(address, 0x100c);
             handle
         }, |_| panic!("image has no sampler"));
@@ -430,6 +430,7 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
     let handles = ComputePipeline::collect_texture_bindings(
         &info,
         &qmd,
+        1,
         |addr| {
             events.borrow_mut().push(("read", addr));
             match addr {

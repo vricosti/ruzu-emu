@@ -1,5 +1,37 @@
 # Upstream parity notes
 
+## 2026-11-14 — shader_recompiler/{ir_opt/texture_pass,shader_info,host_translate_info}.rs and video_core/{shader_handle_program,renderer_vulkan/{graphics,compute}_pipeline,renderer_opengl/gl_{graphics,compute}_pipeline}.rs vs Lichii shader_recompiler/{ir_opt/texture_pass.cpp,shader_info.h,host_translate_info.h} and video_core/{shader_handle_program.h,renderer_vulkan/vk_{graphics,compute}_pipeline.cpp,renderer_vulkan/vk_pipeline_cache.cpp}
+
+### Ported (Lichii extensions, absent from Eden)
+- Handle-table descriptor arrays. A bindless handle read from a storage table at an index
+  each invocation loads for itself (Ocarina of Time's clustered light loop:
+  `table[light_list[i] * 0x60]`) has no draw-wide value; the handle program build failed with
+  `Phi` and the whole pipeline was rejected (`[DRAW_SKIP] pipeline compilation failed`).
+  Ported Lichii's `g_handle_index_allowed`/`g_handle_index`/`g_handle_load_depth`/
+  `g_handle_scaled` (texture_pass.cpp:643-660, 757-779, 875-886) as `HandleBuildState`
+  fields, `load_word`'s `address`/`index_word` lambdas as `build_handle_address`/
+  `build_handle_index_word`, `HandleOp::Index` (shader_info.h:438, 491-494), the MakeInst
+  retry and `HANDLE_TABLE_SIZE` = 64 element array (texture_pass.cpp:1061-1063, 1298-1390),
+  `Dominance` (texture_pass.cpp:1068-1134), `DescriptorSizeShift`'s zero shift for handle
+  programs (texture_pass.cpp:366-370) and `HostTranslateInfo::support_handle_table_arrays`
+  (host_translate_info.h:51; set from sampled-image nonuniform indexing as
+  vk_pipeline_cache.cpp:705-706, false for OpenGL and Metal).
+- `evaluate_texture_handle` takes the element (`HandleOp::Index`) and the storage alignment, and
+  `storage_buffer_base` ports Lichii `StorageBufferBase` (shader_handle_program.h:24-41): the
+  storage base honours `indirect_offset` and is aligned down to the host storage alignment,
+  as the translation's `storage_offset` assumes. ruzu read from the unaligned base and ignored
+  `indirect_offset`.
+
+### Intentional differences
+- No legacy breadth-first fallback (`pointer_word`, `handle_is_pointer_word`,
+  `binds_unmapped_pointer_word`, `HandleIsStoragePointer`) when even the index build fails: the
+  pass still throws, as before.
+- Not ported: `TrimTrailingTees`, `EvaluateTextureHandles` (one evaluation per element instead,
+  same values), `HandleTableNotes`, `IsUncomparable` (pipeline_helper.h:399), Lichii's distinct-array
+  `DynamicSampledTextureArrayCount` (ruzu keeps Eden's per-instruction count) and
+  `LimitSampledTextureArrays`/`is_descriptor_array`.
+- `Dominance` takes each instruction's block from its `InstRef` instead of a map.
+
 ## 2026-11-14 — video_core/{textures/texture,shader_environment,texture_cache/texture_cache}.rs vs Lichii video_core/{textures/texture.h,shader_environment.cpp,texture_cache/texture_cache.h}
 
 ### Ported (Lichii extensions, absent from Eden)

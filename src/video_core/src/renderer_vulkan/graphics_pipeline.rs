@@ -1109,6 +1109,7 @@ impl GraphicsPipeline {
         }
 
         let via_header_index = descriptor_sync_regs.sampler_binding_via_header;
+        let storage_alignment = buffer_cache.runtime.get_storage_buffer_alignment() as u64;
         let read_u32 = |addr: u64| -> u32 {
             let mut bytes = [0u8; 4];
             read_gpu(addr, &mut bytes);
@@ -1133,7 +1134,7 @@ impl GraphicsPipeline {
                         if index as usize >= shader_recompiler::shader_info::Info::MAX_CBUFS { return 0; }
                         let cbuf = draw.const_buffer_binding(stage, index as usize);
                         if cbuf.enabled { cbuf.address } else { 0 }
-                    }, read_u32);
+                    }, read_u32, storage_alignment, element);
                 return texture_pair(handle, via_header_index);
             }
             let index_offset = element.wrapping_shl(size_shift);

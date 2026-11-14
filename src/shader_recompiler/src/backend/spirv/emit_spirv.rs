@@ -702,12 +702,59 @@ pub fn emit_spirv_with_bindings(
 }
 
 /// Host descriptor assignments accompanying a compute task/mesh shader.
+#[derive(Clone, Debug)]
 pub struct MeshComputeSpirv {
     pub code: Vec<u32>,
     pub dispatch_binding: u32,
     pub payload_binding: u32,
     pub output_binding: Option<u32>,
+    /// Mesh after a task program, dispatched by the distribution pass: its
+    /// argument buffer (Lichii `RuntimeInfo::mesh_task_args_binding`). The
+    /// dispatch binding then holds the per-task offsets.
+    pub args_binding: Option<u32>,
 }
+
+/// Mesh emulation with a task program: push constants of the distribution
+/// pass. Port of Lichii `MeshEmulationDistributionConstants` (emit_spirv.h:65-73).
+/// ruzu's transport records replace Lichii's blocks: `block_words` is the
+/// record stride and `vertices_per_group` the record's vertex span.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeshEmulationDistributionConstants {
+    /// task workgroups of the draw
+    pub tasks: u32,
+    /// words per task in the payload buffer (count at word 1)
+    pub payload_words: u32,
+    /// words of the output arena
+    pub capacity_words: u32,
+    /// output words per mesh workgroup
+    pub block_words: u32,
+    /// draw vertices per mesh workgroup
+    pub vertices_per_group: u32,
+    /// the device's maxComputeWorkGroupCount[0]
+    pub max_groups: u32,
+}
+
+impl MeshEmulationDistributionConstants {
+    pub const WORDS: u32 = 6;
+
+    /// Push-constant words, in member order (offset = member * 4).
+    pub fn words(&self) -> [u32; 6] {
+        [self.tasks, self.payload_words, self.capacity_words, self.block_words,
+            self.vertices_per_group, self.max_groups]
+    }
+}
+
+/// Words of the distribution's argument buffer: vkCmdDispatchIndirect at 0, the
+/// mesh workgroups the tasks asked for at 3, vkCmdDrawIndirect at
+/// MESH_EMULATION_DRAW_ARGS_OFFSET, then the draw's first output record in the
+/// arena and its task count. Port of Lichii emit_spirv.h:74-81 (Lichii stores
+/// the first output word at MESH_EMULATION_ARGS_BASE; ruzu its record index).
+pub const MESH_EMULATION_ARGS_REQUESTED: u32 = 3;
+pub const MESH_EMULATION_DRAW_ARGS_OFFSET: u32 = 16;
+pub const MESH_EMULATION_ARGS_BASE: u32 = 8;
+pub const MESH_EMULATION_ARGS_TASKS: u32 = 9;
+pub const MESH_EMULATION_ARGS_WORDS: u32 = 10;
 
 /// Emit an already optimized, exit-converged guest task/mesh as host Compute.
 /// Bindings are reserved after ordinary guest resources. Host dispatches are
@@ -729,6 +776,36 @@ pub fn emit_mesh_compute_spirv_with_task_guard(
     runtime_info: &RuntimeInfo,
     bindings: &mut Bindings,
     task_count_guard: bool,
+) -> Result<MeshComputeSpirv, crate::exception::NotImplementedException> {
+    emit_mesh_compute_spirv_impl(program, profile, runtime_info, bindings, task_count_guard, None)
+}
+
+/// Mesh after a task program in Lichii's mesh emulation (vk_graphics_pipeline.cpp:1542-1602):
+/// the distribution pass resolves the mesh workgroup count on the GPU and the
+/// mesh workgroups are dispatched indirectly, finding their task and payload
+/// themselves. `task_payload_stride` is the task's payload transport stride.
+pub fn emit_mesh_compute_spirv_with_task_distribution(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut Bindings,
+    task_payload_stride: u32,
+) -> Result<MeshComputeSpirv, crate::exception::NotImplementedException> {
+    if !program.info.is_mesh || task_payload_stride < 2 {
+        return Err(crate::exception::NotImplementedException::new(
+            "Task distribution requires a mesh program after a task payload"));
+    }
+    emit_mesh_compute_spirv_impl(program, profile, runtime_info, bindings, false,
+        Some(task_payload_stride))
+}
+
+fn emit_mesh_compute_spirv_impl(
+    program: &ir::Program,
+    profile: &Profile,
+    runtime_info: &RuntimeInfo,
+    bindings: &mut Bindings,
+    task_count_guard: bool,
+    task_payload_stride: Option<u32>,
 ) -> Result<MeshComputeSpirv, crate::exception::NotImplementedException> {
     use crate::exception::NotImplementedException;
     let invalid =
@@ -826,8 +903,12 @@ pub fn emit_mesh_compute_spirv_with_task_guard(
     let dispatch_binding = bindings.unified;
     let payload_binding = dispatch_binding + 1;
     let output_binding = program.info.is_mesh.then_some(dispatch_binding + 2);
-    bindings.unified += if program.info.is_mesh { 3 } else { 2 };
+    let args_binding = task_payload_stride.map(|_| dispatch_binding + 3);
+    bindings.unified += if program.info.is_mesh { 3 } else { 2 } + u32::from(args_binding.is_some());
     ctx.define_mesh_dispatch_buffer(dispatch_binding);
+    if let (Some(binding), Some(stride)) = (args_binding, task_payload_stride) {
+        ctx.define_mesh_task_args_buffer(binding, stride);
+    }
     ctx.define_mesh_payload_buffer(payload_binding);
     ctx.define_mesh_payload_workgroup(program.mesh.payload_words);
     if let Some(binding) = output_binding {
@@ -844,6 +925,7 @@ pub fn emit_mesh_compute_spirv_with_task_guard(
         dispatch_binding,
         payload_binding,
         output_binding,
+        args_binding,
     })
 }
 
@@ -897,6 +979,52 @@ mod tests {
     use rspirv::dr::Operand;
 
     const MAIN: spirv::Word = 0x100;
+
+    #[test]
+    fn task_distributed_mesh_reserves_args_binding_and_searches_offsets() {
+        let build = |task: bool| {
+            let mut program = ir::Program::new(ShaderStage::Compute);
+            program.info.is_task = task;
+            program.info.is_mesh = !task;
+            program.workgroup_size = [8, 1, 1];
+            program.mesh.payload_words = 13;
+            program.mesh.max_vertices = 32;
+            program.mesh.max_primitives = 16;
+            program.blocks.push(Block::new());
+            program.blocks[0].append_inst(ir::Inst::new(ir::Opcode::Prologue, vec![]));
+            program.blocks[0].append_inst(ir::Inst::new(ir::Opcode::Epilogue, vec![]));
+            program.syntax_list = vec![ir::SyntaxNode::Block(0), ir::SyntaxNode::Return];
+            crate::ir_opt::collect_shader_info_pass::collect_shader_info_pass(&mut program);
+            program
+        };
+        let profile = Profile {
+            unified_descriptor_binding: true,
+            supported_spirv: 0x0001_0400,
+            ..Default::default()
+        };
+        let mut bindings = Bindings { unified: 6, ..Default::default() };
+        let result = emit_mesh_compute_spirv_with_task_distribution(
+            &build(false), &profile, &RuntimeInfo::default(), &mut bindings, 64).unwrap();
+        assert_eq!((result.dispatch_binding, result.payload_binding), (6, 7));
+        assert_eq!((result.output_binding, result.args_binding), (Some(8), Some(9)));
+        assert_eq!(bindings.unified, 10);
+        let count = |code: Vec<u32>, opcode: spirv::Op| {
+            let module = rspirv::dr::load_words(code).unwrap();
+            module.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instructions)
+                .filter(|i| i.class.opcode == opcode).count()
+        };
+        let plain = emit_mesh_compute_spirv(&build(false), &profile, &RuntimeInfo::default(),
+            &mut Bindings { unified: 6, ..Default::default() }).unwrap();
+        // The 32-step search selects among the offsets; no per-workgroup record is read.
+        assert_eq!(count(result.code.clone(), spirv::Op::Select) - count(plain.code, spirv::Op::Select),
+            super::super::emit_spirv_mesh::MESH_EMULATION_TASK_SEARCH_STEPS as usize);
+        // No guard return: every dispatched workgroup is an emitted child.
+        assert_eq!(count(result.code, spirv::Op::Return), 1);
+        assert!(emit_mesh_compute_spirv_with_task_distribution(
+            &build(true), &profile, &RuntimeInfo::default(), &mut Bindings::default(), 64).is_err());
+        assert!(emit_mesh_compute_spirv_with_task_distribution(
+            &build(false), &profile, &RuntimeInfo::default(), &mut Bindings::default(), 1).is_err());
+    }
 
     #[test]
     fn mesh_compute_entry_reserves_bindings_and_requires_collective_exit() {

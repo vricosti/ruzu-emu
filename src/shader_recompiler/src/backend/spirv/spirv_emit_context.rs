@@ -550,6 +550,14 @@ pub struct SpirvEmitContext {
     pub(crate) mesh_payload_buffer_u32: spirv::Word,
     pub(crate) mesh_dispatch_buffer: spirv::Word,
     pub(crate) mesh_dispatch_buffer_u32: spirv::Word,
+    /// Lichii `EmitContext::mesh_task_args_buffer`: with a task program the
+    /// mesh dispatch buffer holds the distribution's per-task offsets, and
+    /// this one its arguments (MESH_EMULATION_ARGS_*).
+    pub(crate) mesh_task_args_buffer: spirv::Word,
+    pub(crate) mesh_task_args_buffer_u32: spirv::Word,
+    /// Lichii `RuntimeInfo::mesh_task_payload_stride`: words per task in the
+    /// payload transport.
+    pub(crate) mesh_task_payload_stride: u32,
     pub(crate) mesh_guest_workgroup_id: spirv::Word,
     pub(crate) mesh_payload_base: spirv::Word,
     /// Compute transport may reserve more children than the task emits.
@@ -874,6 +882,9 @@ impl SpirvEmitContext {
             mesh_dispatch_buffer: 0,
             mesh_dispatch_buffer_u32: 0,
             mesh_guest_workgroup_id: 0,
+            mesh_task_args_buffer: 0,
+            mesh_task_args_buffer_u32: 0,
+            mesh_task_payload_stride: 0,
             mesh_payload_base: 0,
             mesh_task_count_guard: false,
             mesh_output_record: 0,
@@ -2902,6 +2913,16 @@ impl SpirvEmitContext {
     pub fn define_mesh_dispatch_buffer(&mut self, binding: u32) {
         (self.mesh_dispatch_buffer, self.mesh_dispatch_buffer_u32) =
             self.define_mesh_storage_buffer(binding, "mesh_dispatch_mapping");
+    }
+
+    /// Mesh emulation with a task program (Lichii `EmitContext::DefineMeshEmulationOutput`,
+    /// spirv_emit_context.cpp:2055-2059):
+    /// the distribution pass's argument buffer. The dispatch binding then holds
+    /// the first mesh workgroup of each task instead of per-workgroup records.
+    pub fn define_mesh_task_args_buffer(&mut self, binding: u32, payload_stride: u32) {
+        (self.mesh_task_args_buffer, self.mesh_task_args_buffer_u32) =
+            self.define_mesh_storage_buffer(binding, "mesh_task_args");
+        self.mesh_task_payload_stride = payload_stride;
     }
 
     /// Reserved descriptor shared by the compute exporter and vertex reader.

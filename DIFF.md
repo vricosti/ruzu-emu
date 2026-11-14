@@ -1,5 +1,57 @@
 # Upstream parity notes
 
+## 2026-11-14 — video_core/renderer_vulkan/{vk_rasterizer,compute_pipeline,pipeline_cache}.rs and shader_recompiler/backend/spirv/{emit_spirv,emit_spirv_mesh,spirv_emit_context}.rs vs Lichii video_core/renderer_vulkan/{vk_rasterizer.cpp,vk_rasterizer.h,vk_graphics_pipeline.cpp,vk_graphics_pipeline.h,vk_pipeline_cache.cpp} and shader_recompiler/backend/spirv/{emit_spirv.h,emit_spirv_mesh.cpp,spirv_emit_context.cpp}
+
+### Ported (Lichii extensions, absent from Eden)
+- Task/mesh emulation without a host readback. A task draw used to copy the task payloads to a
+  download buffer, `Scheduler::finish()` and build the mesh dispatch on the CPU, unless the task
+  program had a proven `task_mesh_workgroup_bound`; in Ocarina of Time's Kokiri Forest every task
+  draw (100 %, ~27 per frame) lacked that bound, so each one waited for the GPU. Lichii's
+  mechanism now replaces both the readback and the bounded reservation:
+  - per-submission output arena `MeshArena`, `acquire_mesh_arena`, `release_mesh_emulation_buffers`,
+    `mesh_arenas`/`mesh_arena_current`/`mesh_arena_size` (64 MiB, grown from the counter of a
+    finished submission, at most min(1 GiB, maxStorageBufferRange)) and `mesh_draw_buffers`
+    (vk_rasterizer.h:417-436, vk_rasterizer.cpp:365-437, 955-957, 1101-1164);
+  - the one-invocation distribution pass `emit_mesh_emulation_distribution` with
+    `MeshEmulationDistributionConstants` and `MESH_EMULATION_ARGS_*` /
+    `MESH_EMULATION_DRAW_ARGS_OFFSET` (emit_spirv.h:65-88, emit_spirv_mesh.cpp:602-730), owned by
+    `MeshEmulationDistribution` (vk_graphics_pipeline.h:519-527, vk_graphics_pipeline.cpp:565-604,
+    1550-1595 and 1766-1768) and recorded between the task dispatch and an indirect mesh dispatch
+    with the same barriers (vk_graphics_pipeline.cpp:1542-1602);
+  - the mesh workgroup's task lookup by binary search of the per-task offsets, and its arena base
+    read from the arguments (emit_spirv_mesh.cpp:166-176, 362-392;
+    spirv_emit_context.cpp:2055-2059: `define_mesh_task_args_buffer`,
+    `emit_mesh_compute_spirv_with_task_distribution`);
+  - one `vkCmdDrawIndirect` from the arguments for the whole draw (vk_rasterizer.cpp:1652-1662);
+  - zero vertex indices past a group's primitive count (emit_spirv_mesh.cpp:207-231).
+
+### Intentional differences
+- ruzu keeps its own transport (MeshDispatchRecord mapping, padded records with an embedded
+  VkDrawIndirectCommand, vertex pulling by `VertexIndex / vertex_span`) instead of Lichii's blocks
+  and `EmitMeshEmulationVertex`. Consequently the distribution pass rounds the draw's base up to a
+  whole record, stores a record index at `MESH_EMULATION_ARGS_BASE` (Lichii: a word) and writes
+  `firstVertex = base * vertex_span` (Lichii: 0, its vertex shader reads the base); the task
+  lookup fills the same `guest_workgroup_x`/`payload_base`/`output_record` the host mapping
+  supplies otherwise; the offsets go in the existing dispatch binding and the arguments in a
+  fourth transport binding.
+- Degenerate primitives past the count (Lichii ComputeMeshEpilogue, emit_spirv_mesh.cpp:207-231):
+  `emit_mesh_output_export` now writes 0 for every map word past `4 + count * corners`, since the
+  single task draw covers each record's whole vertex span. Without it the draw rasterized the
+  indices the guest left in unused map slots (the previous per-record draws never reached
+  them). ruzu also emulates point and line meshes, which Lichii skips; for them an unused slot
+  is a point or zero-length line at vertex 0 when drawn by a task draw.
+- The task lookup unrolls 32 steps instead of Lichii's 17, which stop being correct past 2^17
+  task workgroups (Lichii has no host guard).
+- The task dispatch keeps ruzu's per-parent mapping and batching by the device dispatch limit;
+  Lichii clamps the draw's task groups to maxComputeWorkGroupCount[0] instead. As in Lichii, the
+  mesh workgroups past the arena's room or the dispatch limit are dropped for that submission.
+- Not ported: the diagnostic probes (`EDEN_NX2_MESH_EMULATION_PROBE`, `mesh_probe`,
+  `mesh_task_probe`, survey and statistics logs), `EDEN_NX2_NO_MESH*`, and Lichii's pipeline-side
+  eligibility (triangles only, no per-primitive outputs), which ruzu's compute transport does not need.
+- Removed with the readback path: `MeshTaskIndirectCount` and the Vulkan use of
+  `task_mesh_workgroup_bound`, `MeshTaskDispatchPlan::bounded`/`from_task_payloads` (still used
+  by the Metal backend).
+
 ## 2026-11-14 — video_core/{shader_handle_program,renderer_vulkan/graphics_pipeline,renderer_vulkan/compute_pipeline}.rs vs Lichii video_core/{shader_handle_program.h,renderer_vulkan/vk_graphics_pipeline.cpp,renderer_vulkan/vk_compute_pipeline.cpp}
 
 ### Ported (Lichii extension, absent from Eden)

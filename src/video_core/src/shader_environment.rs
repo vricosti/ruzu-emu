@@ -20,7 +20,9 @@ use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::maxwell_3d::{EngineHint, Maxwell3D, SamplerBinding, ShaderStageType};
 use crate::memory_manager::MemoryManager;
 use crate::texture_cache::format_lookup_table::pixel_format_from_texture_info_raw;
-use crate::textures::texture::{texture_pair, TextureType as TegraTextureType, TicEntry};
+use crate::textures::texture::{
+    texture_header_index, texture_pair, TextureType as TegraTextureType, TicEntry,
+};
 use common::fs::fs_util::path_to_utf8_string;
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
 use parking_lot::Mutex as ParkingLotMutex;
@@ -103,6 +105,26 @@ fn make_indirect_cbuf_key(index: u32, offset: u32, indirect: u32) -> u64 {
 
 pub fn make_cbuf_key(index: u32, offset: u32) -> u64 {
     ((index as u64) << 32) | (offset as u64)
+}
+
+/// The descriptor `GenericEnvironment::read_texture_info` compiles for when a
+/// handle indexes past the pool: what the texture cache's null view is, a
+/// plain normalized 2D A8B8G8R8 UNORM texture, every other bit zero.
+///
+/// Lichii extension: the fallback entry built inline in
+/// `GenericEnvironment::ReadTextureInfo` (shader_environment.cpp:479-487).
+fn null_view_tic_entry() -> TicEntry {
+    const FORMAT_A8B8G8R8: u64 = 0x08;
+    const COMPONENT_UNORM: u64 = 2;
+    const TEXTURE_2D: u64 = 1;
+    let word0 = FORMAT_A8B8G8R8
+        | (COMPONENT_UNORM << 7)
+        | (COMPONENT_UNORM << 10)
+        | (COMPONENT_UNORM << 13)
+        | (COMPONENT_UNORM << 16);
+    // texture_type: word 4 bits [26:23]; normalized_coords: word 5 bit 31.
+    let word4_5 = (TEXTURE_2D << 23) | (1u64 << 63);
+    TicEntry { raw: [word0, 0, word4_5, 0] }
 }
 
 fn stage_to_prefix(stage: ShaderStage) -> &'static str {
@@ -798,15 +820,25 @@ impl GenericEnvironment {
         via_header_index: bool,
         raw: u32,
     ) -> TicEntry {
-        let (tic_index, _) = texture_pair(raw, via_header_index);
+        let (handle_index, _) = texture_pair(raw, via_header_index);
+        // Lichii extension (shader_environment.cpp:465-489): a Switch 2 handle
+        // may hold the header's byte offset instead of its index
+        // (TextureHeaderIndex), and an index still past the pool compiles for
+        // the null view the texture cache binds for it at draw time
+        // (VisitImageView) instead of reading bytes that are no descriptor.
+        let native_tiling = self
+            .gpu_memory
+            .as_ref()
+            .is_some_and(|gpu_memory| gpu_memory.lock().uses_native_tiling());
+        let tic_index = texture_header_index(handle_index, tic_limit, native_tiling);
         if tic_index > tic_limit {
-            // Upstream uses ASSERT here. ASSERT is fail-soft unless the user
-            // explicitly enables debug asserts, so a Rust `assert!` would
-            // incorrectly kill the GPU thread in normal release builds.
-            log::error!(
-                "shader_environment.cpp: assert handle.first <= tic_limit (tic_index={tic_index:#x}, tic_limit={tic_limit:#x})"
-            );
-            common::assert::assert_fail_soft_impl();
+            static WARNINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                log::warn!(
+                    "Texture handle {raw:#x} indexes past the descriptor pool (index {tic_index} > limit {tic_limit}); using a null 2D texture"
+                );
+            }
+            return null_view_tic_entry();
         }
         let mut raw_bytes = [0u8; 32];
         if let Some(gpu_memory) = self.gpu_memory.as_ref() {
@@ -3751,7 +3783,9 @@ mod tests {
     }
 
     #[test]
-    fn read_texture_info_limit_assert_is_fail_soft_like_upstream() {
+    fn read_texture_info_past_the_pool_compiles_for_the_null_view() {
+        // Lichii shader_environment.cpp:471-489: the bytes past the pool are
+        // no descriptor; compile for the null 2D RGBA8 view bound at draw time.
         let reads = Arc::new(Mutex::new(Vec::new()));
         let reads_clone = Arc::clone(&reads);
         let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
@@ -3762,8 +3796,36 @@ mod tests {
 
         let entry = env.read_texture_info(0x1000, 0x10ff, false, u32::MAX);
 
-        assert!(entry == TicEntry::default());
-        assert_eq!(reads.lock().unwrap().as_slice(), &[(0x0200_0fe0, 32)]);
+        assert!(entry == null_view_tic_entry());
+        assert!(reads.lock().unwrap().is_empty());
+        assert_eq!(entry.format(), crate::textures::texture::TextureFormat::A8B8G8R8 as u32);
+        for component in [entry.r_type(), entry.g_type(), entry.b_type(), entry.a_type()] {
+            assert_eq!(component, crate::textures::texture::ComponentType::Unorm as u32);
+        }
+        assert_eq!(entry.texture_type(), TegraTextureType::Texture2D as u32);
+        assert_eq!(entry.normalized_coords(), 1);
+        assert_eq!(entry.address_low(), 0);
+        assert_eq!(
+            crate::texture_cache::format_lookup_table::pixel_format_from_texture_info_raw(
+                entry.format(), entry.r_type(), entry.g_type(), entry.b_type(), entry.a_type(),
+                entry.srgb_conversion() != 0),
+            crate::surface::PixelFormat::A8B8G8R8Unorm
+        );
+    }
+
+    #[test]
+    fn read_texture_info_inside_the_pool_reads_the_descriptor() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let reads_clone = Arc::clone(&reads);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            reads_clone.lock().unwrap().push((gpu_addr, dst.len()));
+            dst.fill(0);
+        });
+        let env = GenericEnvironment::new().with_gpu_read(reader);
+
+        let _ = env.read_texture_info(0x1000, 0x10ff, false, 0x10ff);
+
+        assert_eq!(reads.lock().unwrap().as_slice(), &[(0x1000 + 0x10ff * 32, 32)]);
     }
 
     /// Build a 64 KiB GPU-memory mock with a Maxwell self-branch sentinel

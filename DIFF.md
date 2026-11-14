@@ -1,5 +1,22 @@
 # Upstream parity notes
 
+## 2026-11-14 — video_core/{textures/texture,shader_environment,texture_cache/texture_cache}.rs vs Lichii video_core/{textures/texture.h,shader_environment.cpp,texture_cache/texture_cache.h}
+
+### Ported (Lichii extensions, absent from Eden)
+- `texture_header_index` (texture.h:167-176): on Switch 2 (native tiling) a handle past the pool
+  that is a multiple of 32 whose quotient lands inside it is a header byte offset. Applied in
+  `GenericEnvironment::read_texture_info` (shader_environment.cpp:465-470) and
+  `TextureCacheBase::visit_image_view` (texture_cache.h:1193). Ocarina of Time's Kokiri Forest
+  handle 0xf4000 with pool limit 0x812b now names header 0x7a00 instead of reading past the pool.
+- `read_texture_info` compiles for the null 2D A8B8G8R8 UNORM view when the index is still past
+  the pool (shader_environment.cpp:471-489, `null_view_tic_entry`), instead of the fail-soft
+  assert followed by a read of bytes that are no descriptor.
+
+### Intentional differences
+- Lichii's `SampledTextureMemo` use of `TextureHeaderIndex` (texture_cache.h:807) has no ruzu
+  counterpart (no memo). The diagnostic-only call in `ComputeEnvironment::ReadTexturePixelFormat`
+  (shader_environment.cpp:1122) is not ported.
+
 ## 2026-11-14 — video_core/engines/{kepler_compute,native_upscale,fermi_2d}.rs, oot_network.rs and renderer_vulkan/blit_image.rs vs Lichii video_core/engines/{kepler_compute.cpp,native_upscale.h,fermi_2d.h}, oot_network.h and renderer_vulkan/blit_image.cpp
 
 ### Ported

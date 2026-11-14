@@ -489,8 +489,18 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     }
 
     /// Port of upstream `TextureCache<P>::VisitImageView`.
-    pub(crate) fn visit_image_view(&mut self, index: u32, compute: bool) -> ImageViewId {
+    pub(crate) fn visit_image_view(&mut self, mut index: u32, compute: bool) -> ImageViewId {
         let channel_gpu_memory_handle = self.channel_gpu_memory_handle;
+        // Lichii extension (texture_cache.h:1193): a Switch 2 handle may hold
+        // the header's byte offset in the pool instead of its index.
+        let native_tiling = if let Some(gpu_memory) = channel_gpu_memory_handle {
+            // SAFETY: same channel-owned memory manager as the reads below.
+            unsafe { gpu_memory.as_ref().uses_native_tiling() }
+        } else {
+            self.channel_gpu_memory
+                .as_ref()
+                .is_some_and(|gpu_memory| gpu_memory.lock().uses_native_tiling())
+        };
         let (descriptor, is_new) = {
             let channel_state = self
                 .channel_caches
@@ -501,6 +511,11 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             } else {
                 &mut channel_state.graphics_image_table
             };
+            index = crate::textures::texture::texture_header_index(
+                index,
+                table.current_limit,
+                native_tiling,
+            );
             if index > table.current_limit {
                 log::debug!("Invalid image view index={}", index);
                 return NULL_IMAGE_VIEW_ID;

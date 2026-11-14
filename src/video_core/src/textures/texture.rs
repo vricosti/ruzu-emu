@@ -392,6 +392,21 @@ pub fn texture_pair(raw: u32, via_header_index: bool) -> (u32, u32) {
     }
 }
 
+/// Some Switch 2 bindless handles hold the texture header's byte offset in the
+/// pool, `index * 32`, where the handle normally has the index. Read it as an
+/// offset only on Switch 2 (native tiling), when the plain index falls past the
+/// pool and the offset lands inside it, so handles that already resolve are
+/// left alone.
+///
+/// Lichii extension (not in Eden): `video_core/textures/texture.h:171`
+/// `Tegra::Texture::TextureHeaderIndex`.
+pub const fn texture_header_index(index: u32, limit: u32, switch2: bool) -> u32 {
+    if switch2 && index > limit && index % 32 == 0 && index / 32 <= limit {
+        return index / 32;
+    }
+    index
+}
+
 // ── TIC Entry ────────────────────────────────────────────────────────────────
 
 /// Texture Image Control entry — 32 bytes (0x20).
@@ -1077,6 +1092,36 @@ mod tests {
         let mut hasher = BuildIdentityHasher.build_hasher();
         value.hash(&mut hasher);
         hasher.finish()
+    }
+
+    // Lichii tests/video_core/native_texture_header_index.cpp.
+    #[test]
+    fn texture_header_index_keeps_switch1_handles() {
+        assert_eq!(texture_header_index(64, 63, false), 64);
+        assert_eq!(texture_header_index(2016, 63, false), 2016);
+        assert_eq!(texture_header_index(32, 0, false), 32);
+    }
+
+    #[test]
+    fn texture_header_index_reads_switch2_byte_offsets_past_the_pool() {
+        assert_eq!(texture_header_index(64, 63, true), 2);
+        assert_eq!(texture_header_index(2016, 63, true), 63);
+        assert_eq!(texture_header_index(2048, 63, true), 2048);
+        assert_eq!(texture_header_index(65, 63, true), 65);
+        assert_eq!(texture_header_index(32, 0, true), 32);
+        // Ocarina of Time's Kokiri Forest: handle 0xf4000 in a 0x812b pool.
+        assert_eq!(texture_header_index(0xf4000, 0x812b, true), 0x7a00);
+    }
+
+    #[test]
+    fn texture_header_index_leaves_indices_inside_the_pool() {
+        for native_tiling in [false, true] {
+            assert_eq!(texture_header_index(0, 0, native_tiling), 0);
+            assert_eq!(texture_header_index(32, 63, native_tiling), 32);
+            assert_eq!(texture_header_index(64, 64, native_tiling), 64);
+            assert_eq!(texture_header_index(u32::MAX, u32::MAX, native_tiling), u32::MAX);
+            assert_eq!(texture_header_index(u32::MAX, 63, native_tiling), u32::MAX);
+        }
     }
 
     #[test]

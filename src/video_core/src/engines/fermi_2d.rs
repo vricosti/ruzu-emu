@@ -107,6 +107,10 @@ impl Operation {
     pub const Rop: Self = Self(4);
     pub const SrcCopyPremult: Self = Self(5);
     pub const BlendPremult: Self = Self(6);
+    /// Not a hardware operation: a copy that decodes sRGB-encoded values to linear, for the
+    /// nx2 upscale fallback standing in for a program that decodes its output. Port of Lichii
+    /// `Fermi2D::Operation::SrcCopySrgbToLinear` (82e34d410f); the OpenGL backend ignores it.
+    pub const SrcCopySrgbToLinear: Self = Self(7);
 
     pub const fn from_raw(raw: u32) -> Self {
         Self(raw)

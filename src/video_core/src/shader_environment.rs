@@ -2734,7 +2734,7 @@ pub fn load_pipelines<'a, FStop>(
     }
 }
 
-fn invalid_cache_data(message: impl Into<String>) -> std::io::Error {
+pub(crate) fn invalid_cache_data(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
 }
 

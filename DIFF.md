@@ -1699,6 +1699,74 @@ GPU-thread command processing overhead (no behavior change; measured on the NX2 
 ### Unresolved
 - Textures with no guest view are bound as nil (Metal shader validation reports "Null texture
   access"); Vulkan binds typed null image views. Not observed to fault.
+## 2026-11-15 - precompiled pipelines: used-list boot gating and background preparation (issue #24)
+
+Upstream reference: `/Users/mojics/orca/Fritchii` (Eden-lineage fork cited in
+https://github.com/vricosti/ruzu-emu/issues/24), commits `be76402ab5`
+(`vulkan_used.bin` boot gating) and `790bca8969` / `4a4fa51576`
+(`StartPrecompiled`/`PreparePrecompiled`, `shader_notify` warm/precompile state).
+
+### Intentional differences
+- **No NVN2 recipe, assembler or game-file extractor** (`nx2_recipe.*`,
+  `nx2_shader_extract.*`, `tools/nx2-precompile`). Those scan BNSH/BAHS/NDSR
+  **Switch 2** shader archives; ruzu emulates Switch 1, where games build Maxwell
+  shaders at runtime in guest memory. The ported runtime reads ruzu's own
+  `vulkan.bin` instead, which is the Switch 1 equivalent of a shared recipe:
+  self-contained `GenericEnvironment`s plus keys, already versioned by
+  `CACHE_VERSION`.
+- **Preparation input is the disk cache**, not an `NX2PREP1` file. Boot captures
+  the byte range of every graphics record the used-list gating skipped, and the
+  preparation re-reads exactly those ranges. Fritchii can stream its immutable
+  precompiled file; ruzu must not, because the GPU thread keeps appending to
+  `vulkan.bin` (see the fixed divergence below).
+- **Environment names** `RUZU_PRELOAD_ALL_PIPELINES` / `RUZU_DISABLE_PRECOMPILE`
+  and `RUZU_WARM_WHILE_PLAYING` replace `EDEN_NX2_PRELOAD_ALL_PIPELINES`,
+  `EDEN_NX2_PRECOMPILE` and `EDEN_NX2_WARM_WHILE_PLAYING`. There is no numeric
+  Mode(): preparation is on by default because it only rebuilds pipelines the
+  user's own cache already holds, and the override env var turns it off.
+- **No interrupt checkpoint** (`precompiled_progress.*`, restart skipping).
+  Ruzu's preparation is bounded by one title's disk cache; a stopped run is not
+  stamped and simply starts over next boot, instead of Fritchii's per-record
+  progress file with skip-ahead heuristics.
+- **Stamp content** uses `common::scm_rev::SCM_REV` and the Cargo package version
+  instead of `Common::g_scm_rev`; file size, mtime, driver version and device
+  model match.
+- `save_used_pipelines` logs a debug line with the session count. Upstream has
+  no logging here; the line records the minimum-used gate for field diagnosis.
+- `PipelineCache::drop` sets the preparation cancel flag and joins the
+  preparation thread **before** the final driver-cache serialization. Fritchii's
+  `std::jthread` member is destroyed after the destructor body, so its thread can
+  still be building while the cache is written. Joining first keeps the
+  serialization free of concurrent builders.
+- `ShaderNotify` keeps ruzu's `Mutex<ReportState>` for the completion timeout.
+  The new warm/precompile atomics follow upstream exactly, including
+  `RequestPrecompile` only moving Idle to Asked.
+
+### Unintentional differences (fixed during this port)
+- `PipelineCache::load_disk_resources` skipped an entry **without consuming its
+  key**, leaving `load_pipelines`' cursor inside the record. The next parse read
+  garbage (`pipeline environment count 150886525`) and the invalid-cache path
+  deleted `vulkan.bin`. Both callbacks now read the key before any early return,
+  matching upstream's "consume the key" contract. Regression coverage lives in
+  `captured_graphics_records_read_back_bounded`.
+
+### Missing items
+- "Prepare Shaders Now" has no GUI menu action yet: `PipelineCache::request_precompile`
+  and the `ShaderNotify` request loop are ported and unit-tested, and the status
+  bar shows the preparation, but no menu item invokes them.
+- `ruzu-cmd` does not display warm progress; it logs it only.
+
+### Binary layout verification
+- PASS: `vulkan_used.bin` = `u32 "EUP1" (0x31505545)`, `u32 count`, then
+  `{ u64 key hash, u8 sessions-since-use }`, little-endian, exactly
+  Fritchii's `SaveUsedPipelines` layout. Round-trip and aging (drop at
+  `age + 1 >= 8`) are covered by `used_pipelines_round_trip_matches_fritchii_layout`
+  and `used_pipelines_age_and_drop_after_max_age`.
+- PASS: `vulkan.bin` record ranges are the existing `serialize_pipeline` layout
+  (`u32 env count`, environments, key). No record format changed; the preparation
+  only reads captured ranges and rejects a range whose end moved.
+- PASS: `precompiled_prepared.ruzu-v<CACHE_VERSION>.txt` holds
+  `size mtime driver_version build_rev model` terminated by `\n`.
 
 ## 2026-10-18 - native dependency tracking and GTK build guards
 

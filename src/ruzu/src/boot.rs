@@ -249,6 +249,7 @@ pub struct EmulationSession {
     join: Option<JoinHandle<()>>,
     perf_results: Arc<RwLock<PerfStatsResults>>,
     shaders_building: Arc<AtomicI32>,
+    warm_progress: Arc<std::sync::Mutex<video_core::shader_notify::WarmProgress>>,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     program_id: Arc<AtomicU64>,
@@ -279,6 +280,19 @@ impl EmulationSession {
         self.running
             .load(Ordering::Acquire)
             .then(|| self.shaders_building.load(Ordering::Acquire))
+    }
+
+    /// Return the latest `ShaderNotify::GetWarmProgress()` sample.
+    ///
+    /// Upstream's status bar shows the shader warm-up and precompiled-pipeline
+    /// preparation from this value as well as `ShadersBuilding()`.
+    pub fn warm_progress(&self) -> Option<video_core::shader_notify::WarmProgress> {
+        self.running.load(Ordering::Acquire).then(|| {
+            *self
+                .warm_progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        })
     }
 
     pub fn program_id(&self) -> Option<u64> {
@@ -439,6 +453,7 @@ pub fn boot_game(
     let (command_tx, command_rx) = std::sync::mpsc::channel::<EmulationCommand>();
     let perf_results = Arc::new(RwLock::new(PerfStatsResults::default()));
     let shaders_building = Arc::new(AtomicI32::new(0));
+    let warm_progress = Arc::new(std::sync::Mutex::new(Default::default()));
     let running = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
     let program_id = Arc::new(AtomicU64::new(0));
@@ -446,6 +461,7 @@ pub fn boot_game(
     let (exit_locked_tx, exit_locked_rx) = std::sync::mpsc::sync_channel(1);
     let boot_perf_results = Arc::clone(&perf_results);
     let boot_shaders_building = Arc::clone(&shaders_building);
+    let boot_warm_progress = Arc::clone(&warm_progress);
     let boot_running = Arc::clone(&running);
     let boot_program_id = Arc::clone(&program_id);
     let boot_frontend_stop_requested = Arc::clone(&frontend_stop_requested);
@@ -469,6 +485,7 @@ pub fn boot_game(
                 command_rx,
                 boot_perf_results,
                 boot_shaders_building,
+                boot_warm_progress,
                 boot_running,
                 boot_program_id,
                 exit_locked_tx,
@@ -486,6 +503,7 @@ pub fn boot_game(
         join: Some(join),
         perf_results,
         shaders_building,
+        warm_progress,
         running,
         paused,
         program_id,
@@ -516,6 +534,7 @@ fn run_boot(
     command_rx: Receiver<EmulationCommand>,
     perf_results: Arc<RwLock<PerfStatsResults>>,
     shaders_building: Arc<AtomicI32>,
+    warm_progress: Arc<std::sync::Mutex<video_core::shader_notify::WarmProgress>>,
     running: Arc<AtomicBool>,
     program_id: Arc<AtomicU64>,
     exit_locked_tx: SyncSender<Arc<AtomicBool>>,
@@ -1099,18 +1118,29 @@ fn run_boot(
                 *perf_results
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = sample;
-                let building = system
+                let (building, warm) = system
                     .gpu_core()
                     .and_then(|gpu| gpu.as_any().downcast_ref::<video_core::gpu::Gpu>())
-                    .map(|gpu| gpu.shader_notify().shaders_building())
-                    .unwrap_or(0);
+                    .map(|gpu| {
+                        (
+                            gpu.shader_notify().shaders_building(),
+                            gpu.shader_notify().warm_progress(),
+                        )
+                    })
+                    .unwrap_or((0, Default::default()));
                 shaders_building.store(building, Ordering::Release);
+                *warm_progress
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = warm;
                 running.store(true, Ordering::Release);
             }
         }
     };
     running.store(false, Ordering::Release);
     shaders_building.store(0, Ordering::Release);
+    *warm_progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Default::default();
 
     if stopped_by_frontend {
         // Upstream `RequestGameExit`: let the application process its normal
@@ -1410,6 +1440,7 @@ mod tests {
             join: None,
             perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
             shaders_building: Arc::new(AtomicI32::new(0)),
+            warm_progress: Arc::new(std::sync::Mutex::new(Default::default())),
             running: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             program_id: Arc::new(AtomicU64::new(0)),
@@ -1432,6 +1463,7 @@ mod tests {
             join: None,
             perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
             shaders_building: Arc::new(AtomicI32::new(0)),
+            warm_progress: Arc::new(std::sync::Mutex::new(Default::default())),
             running: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             program_id: Arc::new(AtomicU64::new(0)),
@@ -1453,6 +1485,7 @@ mod tests {
             join: None,
             perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
             shaders_building: Arc::new(AtomicI32::new(0)),
+            warm_progress: Arc::new(std::sync::Mutex::new(Default::default())),
             running: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             program_id: Arc::new(AtomicU64::new(0)),
@@ -1475,6 +1508,7 @@ mod tests {
             command_tx: Some(command_tx), join: None,
             perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
             shaders_building: Arc::new(AtomicI32::new(0)),
+            warm_progress: Arc::new(std::sync::Mutex::new(Default::default())),
             running: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             program_id: Arc::new(AtomicU64::new(0)),
@@ -1508,6 +1542,7 @@ mod tests {
             join: None,
             perf_results: Arc::new(RwLock::new(PerfStatsResults::default())),
             shaders_building: Arc::new(AtomicI32::new(0)),
+            warm_progress: Arc::new(std::sync::Mutex::new(Default::default())),
             running: Arc::new(AtomicBool::new(true)),
             paused: Arc::new(AtomicBool::new(false)),
             program_id: Arc::new(AtomicU64::new(0)),

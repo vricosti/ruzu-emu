@@ -1,5 +1,34 @@
 # Upstream parity notes
 
+## 2026-11-14 — video_core/memory_manager.rs vs Lichii video_core/memory_manager.{h,cpp}
+
+### Ported (Lichii extension, absent from Eden)
+- Device-contiguous runs kept at map time. Eden's `MaxContinuousRange` walks the page tables on
+  each call; storage buffer binds (`storage_buffer_binding`) ask it for up to 8 MiB each, which
+  was 10.9 % of the GPU thread in Ocarina of Time's Kokiri Forest. Ported Lichii's
+  `ContinuousRun`/`continuous_runs` (memory_manager.h:301-307), `UpdateContinuousRuns`
+  (memory_manager.cpp:745-800; called after the kind map update at the end of `PageTableOp`
+  and `BigPageTableOp`, cpp:167, 231, followed by `map_serial` (cpp:168, 232)),
+  `MappingSnapshot` runs and `CurrentSnapshot` (h:214-222, cpp:802-831: per-thread view of an
+  immutable snapshot rebuilt under `runs_guard` when `map_serial` changes) and
+  `MaxContinuousRange`'s binary search (cpp:719-743). Eden's walk is kept as
+  `max_continuous_range_uncached` (cpp:833-871); unit tests check both give the same answer
+  across map/sparse/unmap/remap sequences (big and small pages, holes, adjacent separate maps,
+  unaligned operations, the end of the address space).
+
+### Intentional differences
+- `max_continuous_range` does not return 0 when `size > address_space_size - gpu_addr`
+  (Lichii cpp:723): ruzu's walk answers such ranges when their run ends inside the address
+  space, and the answer stays equal to the walk's.
+- The snapshot views are keyed by a never-reused per-instance token, not `unique_identifier`:
+  ruzu's `MemoryManager` constructors overwrite that id with a caller-chosen one two managers
+  may share. `current_snapshot` lends the snapshot to a closure instead of returning a
+  reference into thread-local storage.
+- Not ported: the kind-map copy in `MappingSnapshot` and `GetMemoryLayoutSize`'s lookup in it
+  (cpp:873-902), the `Nx2Perf::Verify` cross-check (`EDEN_NX2_PERF_VERIFY`, cpp:732-741),
+  `MapSerial`/`HostPointerSerial` (h:176-184), and `PageTableOp`/`BigPageTableOp`'s
+  out-of-address-space guard and merged `ModifyGPUMemory` notifications (cpp:123-162).
+
 ## 2026-11-14 — shader_recompiler/{ir_opt/texture_pass,shader_info,host_translate_info}.rs and video_core/{shader_handle_program,renderer_vulkan/{graphics,compute}_pipeline,renderer_opengl/gl_{graphics,compute}_pipeline}.rs vs Lichii shader_recompiler/{ir_opt/texture_pass.cpp,shader_info.h,host_translate_info.h} and video_core/{shader_handle_program.h,renderer_vulkan/vk_{graphics,compute}_pipeline.cpp,renderer_vulkan/vk_pipeline_cache.cpp}
 
 ### Ported (Lichii extensions, absent from Eden)

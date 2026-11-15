@@ -2807,12 +2807,12 @@ impl MetadataReader {
         }
 
         let mut control = NACP::new();
-        let (developer, version) =
-            if loader.read_control_data(&mut control) == ResultStatus::Success {
-                (control.get_developer_name(), control.get_version_string())
-            } else {
-                (String::new(), "1.0.0".to_string())
-            };
+        let has_control_data = loader.read_control_data(&mut control) == ResultStatus::Success;
+        let (developer, version) = if has_control_data {
+            (control.get_developer_name(), control.get_version_string())
+        } else {
+            (String::new(), "1.0.0".to_string())
+        };
 
         let mut update_raw = None;
         loader.read_update_raw(&mut update_raw);
@@ -2838,6 +2838,11 @@ impl MetadataReader {
         let add_ons = get_game_list_cached_string(program_id, "pv.txt", || {
             format_patch_name_versions(&patches, file_type, rom_fs_updatable)
         });
+        let add_ons = append_packed_update_version(
+            add_ons,
+            file_type,
+            has_control_data.then_some(version.as_str()),
+        );
 
         Some(GameMetadata {
             title,
@@ -2968,6 +2973,28 @@ fn format_patch_name_versions(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Lichii `MakeGameListEntry` (qt_common/game_list/worker.cpp:274-287): a NUP is already the
+/// updated game, so the patch manager lists no update for it; its control data's version is
+/// shown as the update instead, after the cached add-ons. Lichii does the same for its NX tree
+/// snapshots (`FileType::NX`), a container ruzu does not have.
+fn append_packed_update_version(
+    mut add_ons: String,
+    file_type: FileType,
+    control_version: Option<&str>,
+) -> String {
+    if file_type != FileType::NUP {
+        return add_ons;
+    }
+    let Some(version) = control_version.filter(|version| !version.is_empty()) else {
+        return add_ons;
+    };
+    if !add_ons.is_empty() {
+        add_ons.push('\n');
+    }
+    add_ons.push_str(&format!("Update ({version})"));
+    add_ons
 }
 
 /// Eden `GetGameListCachedObject(QString)` specialization.
@@ -3805,6 +3832,34 @@ mod tests {
         assert_eq!(
             format_patch_name_versions(&patches, FileType::NRO, false),
             "[D] Example Mod"
+        );
+    }
+
+    #[test]
+    fn nup_add_ons_end_with_the_control_data_version_as_the_update() {
+        // Lichii MakeGameListEntry: a NUP is already the updated game.
+        let built_ins = "Max Resolution (built-in) (IPS)".to_owned();
+        assert_eq!(
+            append_packed_update_version(built_ins.clone(), FileType::NUP, Some("2.0.0")),
+            "Max Resolution (built-in) (IPS)\nUpdate (2.0.0)"
+        );
+        assert_eq!(
+            append_packed_update_version(String::new(), FileType::NUP, Some("2.0.0")),
+            "Update (2.0.0)"
+        );
+        // No control data, or an empty version string: nothing is added.
+        assert_eq!(
+            append_packed_update_version(built_ins.clone(), FileType::NUP, None),
+            built_ins
+        );
+        assert_eq!(
+            append_packed_update_version(built_ins.clone(), FileType::NUP, Some("")),
+            built_ins
+        );
+        // Other containers get their update from the patch manager.
+        assert_eq!(
+            append_packed_update_version(built_ins.clone(), FileType::NSP, Some("2.0.0")),
+            built_ins
         );
     }
 

@@ -1,5 +1,40 @@
 # Upstream parity notes
 
+## 2026-11-15 — video_core/renderer_vulkan/{scheduler,query_cache}.rs vs Lichii video_core/renderer_vulkan/{vk_scheduler.cpp,vk_query_cache.cpp}
+
+### Ported (Lichii divergence from Eden)
+- `Scheduler::EndPendingOperations` closes (pauses) the `ZPassPixelCount64` counter at each
+  submission instead of resetting it (Lichii 5b89a3daf4, vk_scheduler.cpp:979-984; Eden resets it
+  since b1f3b568fb). A guest that resets the counter, draws and reports expects the report to
+  cover every draw since its own reset; a submission landing in that window dropped the samples
+  counted so far and the report read too low. On the NX2 title used for measurement the game then
+  culled a large distant mesh for one frame (22 draws missing from the frame), shown as one-frame
+  white bloom flashes in the forest scene: 50 to 85 per ~5,000 frames before, 0 after (two runs
+  each, single-frame saturation spikes measured on every presented frame).
+- `SamplesStreamer::CloseCounter` bounds the running query: past four banks
+  (`MaxRunningQuerySlots`, 1,024 slots) it drops the count as a reset would and logs the 1st,
+  2nd, 4th, 8th... drop (vk_query_cache.cpp:218-240; Lichii 5b89a3daf4, a08bf8f02d, 88783d558d),
+  because a title that counts without resetting or reporting grows the query by a slot at every
+  submission and render pass. Implemented as `SamplesQueryState::close_counter` (with
+  `MAX_RUNNING_QUERY_SLOTS` and the `bank_bound_resets` counter), used by the streamer's
+  `close_counter` and by `Scheduler::end_pending_operations`.
+
+### Intentional differences
+- The bound counts the slots of the cumulative query (`history`), which is what Lichii's
+  `current_query->size_slots` counts. Lichii's bound calls the streamer's full `ResetCounter()`;
+  the scheduler only reaches `SamplesQueryState`, so the drop abandons those slots as ruzu's
+  submission-time reset did before this change, without the streamer's amend/accumulation reset
+  and checkpoint update.
+- No unit test drives `close_counter` itself (it needs a Vulkan scheduler and query banks); the
+  bound and the log cadence are pinned by `running_samples_query_bound_matches_lichii`.
+
+### Not ported (tested on the same scene, no effect on the flash; candidates for later)
+- Lichii fixed_pipeline_state.cpp:260-277 (rebuild blend attachments for every key without
+  dynamic blend state), vk_texture_cache.cpp:4783-4786 (`VariantKey::drop_compare`),
+  vk_rasterizer.cpp `ClearVolumeSlices` (the scene issues no layered or 3D clear), and the Vulkan
+  half of Lichii 18cfe85563 (dispatch barrier with DRAW_INDIRECT, compute-to-graphics barrier at
+  render pass begin, wait-for-idle as a memory barrier instead of Eden's event wait).
+
 ## 2026-11-15 — async read-back of GPU-written buffer memory: video_core/{gpu,rasterizer_interface,rasterizer_download_area,memory_manager,buffer_cache/{buffer_cache,buffer_cache_base},query_cache/query_cache_base,renderer_vulkan/{vk_rasterizer,buffer_cache,query_cache,renderer_vulkan},renderer_base}.rs and core/{gpu_core,gpu_dirty_memory_manager,memory/memory}.rs vs Lichii video_core/{gpu.cpp,rasterizer_interface.h,rasterizer_download_area.h,memory_manager.cpp,buffer_cache/buffer_cache{.h,_base.h},query_cache/query_cache.h,renderer_vulkan/vk_{rasterizer,buffer_cache,query_cache}.cpp} and core/{gpu_dirty_memory_manager.h,memory.cpp}
 
 Divergence from Eden accepted by the user on 2026-11-14 for `on_cpu_read`: asynchronous

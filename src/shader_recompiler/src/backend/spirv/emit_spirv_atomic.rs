@@ -334,7 +334,7 @@ fn storage_pointer(ctx: &mut SpirvEmitContext, binding: ir::Value, offset: ir::V
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum StorageAtomicOp {
     IAdd,
     SMin,
@@ -362,14 +362,21 @@ pub(crate) fn global_atomic_u32_operation(opcode: Opcode) -> Option<StorageAtomi
     })
 }
 
+/// A 32-bit global atomic through its routing function (Lichii `GlobalAtomic`,
+/// emit_spirv_atomic.cpp:431-441).
 pub(crate) fn emit_global_atomic_u32(ctx: &mut SpirvEmitContext, inst: &ir::Inst) -> Word {
+    if !ctx.profile.support_int64 {
+        std::panic::panic_any(crate::exception::NotImplementedException::new(
+            "Global atomic addressing requires 64-bit integers",
+        ));
+    }
     let function = ctx
         .global_atomic_functions
         .get(&inst.opcode)
         .copied()
         .unwrap_or_else(|| {
             std::panic::panic_any(crate::exception::NotImplementedException::new(
-                "Global atomic requires 64-bit address support",
+                "Global atomic with no routable storage buffer",
             ))
         });
     let address = ctx.resolve_value(inst.arg(0));

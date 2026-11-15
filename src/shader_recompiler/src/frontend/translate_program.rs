@@ -381,7 +381,9 @@ fn optimize_program(
         ir_opt::constant_propagation_pass::constant_propagation_pass(program);
     }
     ir_opt::global_memory_to_storage_buffer_pass::global_memory_to_storage_buffer_pass(
-        program, host_info,
+        env.as_deref_mut(),
+        program,
+        host_info,
     );
     if let Some(env) = env.as_deref_mut() {
         ir_opt::texture_pass::texture_pass(env, program, host_info);

@@ -421,6 +421,10 @@ pub struct Info {
     pub uses_atomic_s32_max: bool,
     pub uses_int64_bit_atomics: bool,
     pub uses_global_memory: bool,
+    /// Native programs: a global access was left global among several candidate buffers; the
+    /// backend routes it to the buffer whose base is the closest one at or below the address.
+    /// Lichii extension (`shader_info.h:379`).
+    pub native_global_bounds: bool,
     pub uses_atomic_image_u32: bool,
     pub uses_shadow_lod: bool,
     pub uses_rescaling_uniform: bool,
@@ -464,7 +468,8 @@ pub struct Info {
 impl Info {
     pub const MAX_INDIRECT_CBUFS: usize = 14;
     pub const MAX_CBUFS: usize = 18;
-    pub const MAX_SSBOS: usize = 32;
+    /// Lichii shader_info.h:294 (Eden: 32): native programs bind every candidate pointer.
+    pub const MAX_SSBOS: usize = 64;
 
     /// Whether a storage descriptor names a used entry of the driver table.
     /// The mask indexes guest table slots, not the compacted descriptor vector.

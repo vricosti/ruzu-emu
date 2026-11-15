@@ -47,8 +47,11 @@ pub const NUM_GRAPHICS_UNIFORM_BUFFERS: u32 = 18;
 /// Number of uniform buffers for compute.
 pub const NUM_COMPUTE_UNIFORM_BUFFERS: u32 = 8;
 
-/// Number of storage buffer slots.
-pub const NUM_STORAGE_BUFFERS: u32 = 16;
+/// Number of storage buffer slots: one per shader storage descriptor (Lichii
+/// buffer_cache_base.h:74-75, `NUM_STORAGE_BUFFERS = Shader::Info::MAX_SSBOS`; Eden binds 16).
+/// The enabled/written storage masks are `u64`, so the count must fit in one.
+pub const NUM_STORAGE_BUFFERS: u32 = shader_recompiler::shader_info::Info::MAX_SSBOS as u32;
+const _: () = assert!(NUM_STORAGE_BUFFERS <= 64, "storage binding masks must fit u64");
 
 /// Number of texture buffer slots.
 pub const NUM_TEXTURE_BUFFERS: u32 = 32;
@@ -228,7 +231,7 @@ pub struct BufferCacheChannelInfo {
     pub compute_uniform_buffers: [Binding; NUM_COMPUTE_UNIFORM_BUFFERS as usize],
     pub compute_storage_buffers: [Binding; NUM_STORAGE_BUFFERS as usize],
     pub compute_storage_write_marks: [u32; NUM_STORAGE_BUFFERS as usize],
-    pub native_compute_storage_buffers: u32,
+    pub native_compute_storage_buffers: u64,
     pub compute_texture_buffers: [TextureBufferBinding; NUM_TEXTURE_BUFFERS as usize],
 
     // -- Enabled masks --
@@ -240,10 +243,10 @@ pub struct BufferCacheChannelInfo {
     pub compute_uniform_buffer_sizes: Option<NonNull<ComputeUniformBufferSizes>>,
 
     // -- Storage buffer masks --
-    pub enabled_storage_buffers: [u32; NUM_STAGES as usize],
-    pub written_storage_buffers: [u32; NUM_STAGES as usize],
-    pub enabled_compute_storage_buffers: u32,
-    pub written_compute_storage_buffers: u32,
+    pub enabled_storage_buffers: [u64; NUM_STAGES as usize],
+    pub written_storage_buffers: [u64; NUM_STAGES as usize],
+    pub enabled_compute_storage_buffers: u64,
+    pub written_compute_storage_buffers: u64,
     pub total_graphics_storage_buffers: u32,
     pub total_compute_storage_buffers: u32,
 

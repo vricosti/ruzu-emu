@@ -1002,9 +1002,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     return false;
                 }
             }
-            cs.enabled_storage_buffers[stage] |= 1u32 << ssbo_index;
+            cs.enabled_storage_buffers[stage] |= 1u64 << ssbo_index;
             cs.written_storage_buffers[stage] |=
-                (if is_written { 1u32 } else { 0u32 }) << ssbo_index;
+                (if is_written { 1u64 } else { 0u64 }) << ssbo_index;
             if limit_dynamic_storage_buffers && !already_enabled {
                 cs.total_graphics_storage_buffers =
                     cs.total_graphics_storage_buffers.wrapping_add(1);
@@ -1078,9 +1078,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     return false;
                 }
             }
-            cs.enabled_storage_buffers[stage] |= 1u32 << ssbo_index;
+            cs.enabled_storage_buffers[stage] |= 1u64 << ssbo_index;
             cs.written_storage_buffers[stage] |=
-                (if is_written { 1u32 } else { 0u32 }) << ssbo_index;
+                (if is_written { 1u64 } else { 0u64 }) << ssbo_index;
             if limit_dynamic_storage_buffers && !already_enabled {
                 cs.total_graphics_storage_buffers =
                     cs.total_graphics_storage_buffers.wrapping_add(1);
@@ -1173,8 +1173,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 return;
             }
         }
-        cs.enabled_compute_storage_buffers |= 1u32 << ssbo_index;
-        cs.written_compute_storage_buffers |= (if is_written { 1u32 } else { 0u32 }) << ssbo_index;
+        cs.enabled_compute_storage_buffers |= 1u64 << ssbo_index;
+        cs.written_compute_storage_buffers |= (if is_written { 1u64 } else { 0u64 }) << ssbo_index;
         if limit_dynamic_storage_buffers && !already_enabled {
             cs.total_compute_storage_buffers = cs.total_compute_storage_buffers.wrapping_add(1);
         }
@@ -1216,8 +1216,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.compute_storage_buffers[ssbo_index] = binding;
             cs.compute_storage_write_marks[ssbo_index] = mark;
-            cs.native_compute_storage_buffers = (cs.native_compute_storage_buffers & !(1 << ssbo_index))
-                | (u32::from(native) << ssbo_index);
+            cs.native_compute_storage_buffers = (cs.native_compute_storage_buffers & !(1u64 << ssbo_index))
+                | (u64::from(native) << ssbo_index);
         }
     }
 
@@ -1909,10 +1909,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     // -----------------------------------------------------------------------
 
     /// Call `func` for each set bit in `enabled_mask`.
-    fn for_each_enabled_bit<F>(mut enabled_mask: u32, mut func: F)
+    fn for_each_enabled_bit<F>(enabled_mask: impl Into<u64>, mut func: F)
     where
         F: FnMut(u32),
     {
+        let mut enabled_mask: u64 = enabled_mask.into();
         let mut index: u32 = 0;
         while enabled_mask != 0 {
             let disabled_bits = enabled_mask.trailing_zeros();
@@ -2758,7 +2759,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
             let is_written = ((written_mask >> idx) & 1) != 0;
-            let write_limit = if native_mask & (1 << idx) != 0 { u64::from(write_marks[idx as usize]) } else { u64::MAX };
+            let write_limit = if native_mask & (1u64 << idx) != 0 { u64::from(write_marks[idx as usize]) } else { u64::MAX };
             if self.bind_multi_range_storage(&binding, is_written, true, write_limit) {
                 return;
             }
@@ -4992,7 +4993,7 @@ mod tests {
     #[test]
     fn test_for_each_enabled_bit() {
         let mut bits = Vec::new();
-        BufferCache::<TestParams, DummyTracker>::for_each_enabled_bit(0b1010_0101, |idx| {
+        BufferCache::<TestParams, DummyTracker>::for_each_enabled_bit(0b1010_0101u32, |idx| {
             bits.push(idx);
         });
         assert_eq!(bits, vec![0, 2, 5, 7]);
@@ -5120,6 +5121,21 @@ mod tests {
             u64::MAX - 0x7ff,
             0x1000,
         ));
+    }
+
+    /// Lichii binds one storage slot per shader descriptor (`MAX_SSBOS`); with Eden's 16 slots
+    /// and u32 masks, slots 16+ were dropped and every later descriptor shifted.
+    #[test]
+    fn storage_slots_cover_every_shader_descriptor() {
+        assert_eq!(
+            NUM_STORAGE_BUFFERS as usize,
+            shader_recompiler::shader_info::Info::MAX_SSBOS
+        );
+        let mut bits = Vec::new();
+        BufferCache::<TestParams, DummyTracker>::for_each_enabled_bit(1u64 << 63 | 1 << 17, |idx| {
+            bits.push(idx);
+        });
+        assert_eq!(bits, vec![17, 63]);
     }
 
     #[test]
@@ -5374,7 +5390,7 @@ mod tests {
             let cs = cache.channel_caches.current_channel_state_mut().unwrap();
             cs.enabled_compute_storage_buffers = 1;
             cs.written_compute_storage_buffers = 1;
-            cs.native_compute_storage_buffers = u32::from(native);
+            cs.native_compute_storage_buffers = u64::from(native);
             cs.compute_storage_write_marks[0] = mark;
             cs.compute_storage_buffers[0] = Binding { buffer_id: id, device_addr: address, size: 0x4000, ..NULL_BINDING };
             cache.bind_host_compute_storage_buffers();

@@ -1535,7 +1535,9 @@ impl Default for ShaderPools {
 // Version 23: uniform compare/select, FP16 per-tap gather and LEA.HI negation.
 // Previously expanded native programs retain the old lowering behavior.
 // Version 24: corrected NOINC capture boundaries, depth gather and constant PTP offsets.
-const CACHE_VERSION: u32 = 25;
+/// 26: the storage buffer pass reads pointer classifications that records made by the earlier
+/// pass lack (they failed to load with "Uncached storage pointer classification").
+const CACHE_VERSION: u32 = 26;
 // Upstream: flush the Vulkan pipeline cache to disk at most once per
 // max(30 s, 1 s per MiB of cache) once 128 new pipelines were built.
 const VULKAN_CACHE_FLUSH_PIPELINES: usize = 128;

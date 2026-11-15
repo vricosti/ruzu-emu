@@ -2780,11 +2780,19 @@ impl Maxwell3D {
         if crate::nx2_profile::enabled() {
             crate::nx2_profile::add(crate::nx2_profile::Counter::DmaReadBytes, read_bytes);
         }
-        let mut memory = fs.memory_manager.as_ref()
-            .expect("Maxwell3D requires its upstream MemoryManager owner").lock();
+        let memory_handle = fs.memory_manager.as_ref()
+            .expect("Maxwell3D requires its upstream MemoryManager owner");
+        let mut memory = memory_handle.lock();
         if memory.is_memory_dirty_with_cache_type(source, read_bytes, crate::cache_types::CacheType::BUFFER_CACHE) {
             memory.flush_region_with_cache_type(source, read_bytes, crate::cache_types::CacheType::BUFFER_CACHE);
         }
+        drop(memory);
+        // Lichii Maxwell3D::FrontDmaRead (maxwell_3d.cpp:2265-2270, from Lichii 7ae3e74014):
+        // after the buffer cache, write out the reports the query cache holds until their fence
+        // or host result, else the read returns stale occlusion counts. Lichii runs it on the
+        // split's back; here the front does it after the drain, as for the buffer cache flush.
+        crate::query_dma::flush_pending(memory_handle, source, read_bytes);
+        let memory = memory_handle.lock();
         for i in 0..words {
             let word = memory.read::<u32>(source.wrapping_add(i as u64 * 4));
             if method == 0x158 { fifo.push(word); }

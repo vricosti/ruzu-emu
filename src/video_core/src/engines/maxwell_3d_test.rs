@@ -68,16 +68,24 @@ fn front_macro_dma_drains_flushes_buffer_cache_and_extends_live_fifo() {
     assert_eq!(engine.native_data_ram.lock()[0xbff], 0x12345678);
     assert_eq!(engine.native_data_ram.lock()[0], 0);
     let calls = calls.lock().unwrap();
-    assert_eq!(calls.flushes[0], (0x4000, 8, crate::cache_types::CacheType::BUFFER_CACHE));
-    // MemoryManager may split the second flush at mapped-page boundaries.
-    let mut cursor = 0x4000;
-    for &(address, size, cache) in &calls.flushes[1..] {
-        assert_eq!(address, cursor);
-        assert!(size > 0);
-        assert_eq!(cache, crate::cache_types::CacheType::BUFFER_CACHE);
-        cursor += size;
+    use crate::cache_types::CacheType;
+    // Lichii Maxwell3D::FrontDmaRead: the buffer cache, then the query cache's reports.
+    assert_eq!(calls.flushes[0], (0x4000, 8, CacheType::BUFFER_CACHE));
+    assert_eq!(calls.flushes[1], (0x4000, 8, CacheType::QUERY_CACHE));
+    let buffer: Vec<_> = calls.flushes.iter().filter(|f| f.2 == CacheType::BUFFER_CACHE).collect();
+    let query: Vec<_> = calls.flushes.iter().filter(|f| f.2 == CacheType::QUERY_CACHE).collect();
+    assert_eq!(buffer.len() + query.len(), calls.flushes.len());
+    // MemoryManager may split the second buffer flush at mapped-page boundaries; the query
+    // write-out walks the read by device page.
+    for flushes in [&buffer, &query] {
+        let mut cursor = 0x4000;
+        for &&(address, size, _) in &flushes[1..] {
+            assert_eq!(address, cursor);
+            assert!(size > 0);
+            cursor += size;
+        }
+        assert_eq!(cursor, 0x8000);
     }
-    assert_eq!(cursor, 0x8000);
 }
 
 #[test]
@@ -4843,8 +4851,13 @@ fn native_macro_execute_refresh_memo_failure_and_live_upload() {
     assert_eq!(dma.macro_engine.native_fifo.len(), 0x1000, "DMA count clamp");
     assert_eq!(dma.macro_engine.native_memo.size(), 0, "DMA calls must not be memoized");
     let calls = calls.lock().unwrap();
-    assert_eq!(calls.flushes[0], (0x4000, 8, crate::cache_types::CacheType::BUFFER_CACHE));
-    assert!(calls.flushes.iter().all(|(_, _, cache)| *cache == crate::cache_types::CacheType::BUFFER_CACHE));
+    use crate::cache_types::CacheType;
+    // Lichii MacroEngine::Execute: the query cache writes out its reports, then the buffer cache.
+    assert_eq!(calls.flushes[0], (0x4000, 8, CacheType::QUERY_CACHE));
+    assert_eq!(calls.flushes[1], (0x4000, 8, CacheType::BUFFER_CACHE));
+    assert!(calls.flushes.iter().all(|(_, _, cache)| {
+        *cache == CacheType::BUFFER_CACHE || *cache == CacheType::QUERY_CACHE
+    }));
 }
 
 #[test]

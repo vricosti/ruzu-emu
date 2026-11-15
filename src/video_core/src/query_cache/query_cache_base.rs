@@ -250,16 +250,20 @@ impl QueryCacheBase {
 
     /// Flush all cached queries overlapping `[addr, addr+size)`.
     ///
-    /// Maps to C++ `QueryCacheBase::FlushRegion`:
-    /// ```cpp
-    /// bool result = false;
-    /// IterateCache<false>(addr, size, [&](QueryLocation loc) {
-    ///     result |= SemiFlushQueryDirty(loc);
-    ///     return result; // early-exit on first dirty
-    /// });
-    /// if (result) RequestGuestHostSync();
-    /// ```
+    /// Maps to C++ `QueryCacheBase::FlushRegion`, which Lichii splits into `SemiFlushRegion`
+    /// and `RequestGuestHostSync`.
     pub fn flush_region(&mut self, addr: VAddr, size: usize) {
+        if self.semi_flush_region(addr, size) {
+            self.request_guest_host_sync();
+        }
+    }
+
+    /// Writes out the finalized reports in the region. True when some still wait for host
+    /// results.
+    ///
+    /// Lichii `QueryCacheBase::SemiFlushRegion` (query_cache_base.h:80-91; split out of
+    /// `FlushRegion` by Lichii 7ae3e74014).
+    pub fn semi_flush_region(&mut self, addr: VAddr, size: usize) -> bool {
         let mut result = false;
         let impl_ = &mut self.impl_;
         Self::iterate_cache::<false, _>(
@@ -267,14 +271,15 @@ impl QueryCacheBase {
             &mut self.cached_queries,
             addr,
             size,
+            // Lichii 821ccd570a: visits every query in the range, so each final value not
+            // written yet is written here. Eden's callback returned `result`, but its
+            // IterateCache tested `std::invoke_result` (never `bool`) and never stopped early.
             |location| {
                 result |= Self::semi_flush_query_dirty_impl(impl_, location);
-                result
+                false
             },
         );
-        if result {
-            self.request_guest_host_sync();
-        }
+        result
     }
 
     /// Scoped-owner variant of FlushRegion. Returns the RequestGuestHostSync
@@ -297,7 +302,8 @@ impl QueryCacheBase {
                 if let Some(query) = impl_.obtain_query(location) {
                     result |= Self::semi_flush_query_value(query, Some(&mut *device_memory));
                 }
-                result
+                // Every query in the range, as `semi_flush_region`.
+                false
             },
         );
         result
@@ -1642,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_region_stops_at_first_dirty_query_like_upstream() {
+    fn flush_region_writes_every_final_value_past_a_pending_query_like_lichii() {
         let mut cache = QueryCacheBase::new();
         let mut dirty_streamer = CountingStreamer::new(
             QueryType::Payload as usize,
@@ -1670,13 +1676,15 @@ mod tests {
         );
         cache.flush_region(0x1000, 0x1004);
 
+        // Lichii 821ccd570a: the walk goes on past the pending query and writes the final value
+        // after it (Eden's walk never stopped early either).
         assert_eq!(rasterizer.release_fences_calls, vec![true]);
-        assert!(device_memory.writes32.is_empty());
+        assert_eq!(device_memory.writes32, [(0x2000, 0x2222)]);
         assert!(device_memory.writes64.is_empty());
     }
 
     #[test]
-    fn scoped_flush_region_preserves_early_exit_without_a_bound_rasterizer() {
+    fn scoped_flush_region_writes_every_final_value_without_a_bound_rasterizer() {
         let mut cache = QueryCacheBase::new();
         let mut pending = CountingStreamer::new(QueryType::Payload as usize,
             QueryBase::with_params(0x1000, QueryFlagBits::IS_HOST_MANAGED, 0));
@@ -1691,9 +1699,9 @@ mod tests {
         let mut memory = CountingDeviceMemory::default();
         assert!(cache.flush_region_with_memory(0x1000, 0x1004, &mut memory));
         assert!(memory.writes32.is_empty());
-        assert!(memory.writes64.is_empty());
-        assert!(!cache.flush_region_with_memory(0x2000, 4, &mut memory));
         assert_eq!(memory.writes64, [(0x2000, 0x1122334455667788)]);
+        assert!(!cache.flush_region_with_memory(0x2000, 4, &mut memory));
+        assert_eq!(memory.writes64, [(0x2000, 0x1122334455667788); 2]);
         assert!(!ready.query.flags.contains(QueryFlagBits::IS_GUEST_SYNCED));
     }
 

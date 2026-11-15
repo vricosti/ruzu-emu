@@ -203,6 +203,14 @@ pub trait RasterizerInterface {
     /// Release all pending fences.
     fn release_fences(&mut self, force: bool);
 
+    /// Writes the region's query reports to guest memory, waiting for pending host results.
+    ///
+    /// Lichii `RasterizerInterface::FlushQueryResults` (rasterizer_interface.h; from Lichii
+    /// 7ae3e74014); absent from Eden.
+    fn flush_query_results(&mut self, addr: u64, size: u64) {
+        self.flush_region(addr, size, CacheType::QUERY_CACHE);
+    }
+
     // ── Cache management ────────────────────────────────────────────────
 
     /// Flush all caches to Switch memory.

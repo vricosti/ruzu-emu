@@ -41,6 +41,7 @@ pub mod oot_network;
 pub mod present;
 pub mod pte_kind;
 pub mod query_cache;
+pub mod query_dma;
 pub mod query_cache_top;
 pub mod rasterizer_download_area;
 pub mod rasterizer_interface;

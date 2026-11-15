@@ -626,7 +626,7 @@ impl SamplesStreamer {
             self.last_accumulation_checkpoint.max(self.num_slots_used);
     }
 
-    /// Port of `SamplesStreamer::CloseCounter` (Lichii: pause, bounded to one bank).
+    /// Port of `SamplesStreamer::CloseCounter` (Lichii: pause, bounded to four banks).
     fn close_counter(&mut self, scheduler: &mut Scheduler) {
         self.state.lock().close_counter(scheduler);
     }
@@ -2682,6 +2682,11 @@ pub struct QueryCache {
     /// Per-fence bits for the streamers owned outside QueryCacheBase in Rust.
     /// Includes empty entries, matching QueryCacheBaseImpl::flushes_pending.
     pending_backend_flushes: parking_lot::Mutex<VecDeque<u64>>,
+    /// Host-resolved reports (samples, transform feedback, primitives) whose write-back has not
+    /// run yet. Upstream `CounterReport` indexes these in `QueryCacheBase` as host-managed
+    /// queries, so `SemiFlushQueryDirty` reports them pending until their operation writes them;
+    /// the port keeps these reports outside `QueryCacheBase`, and this index answers for them.
+    pending_host_reports: Arc<PendingHostReports>,
     /// Channel-bound GPU device memory manager. Used to translate the
     /// query's GPU virtual address to the underlying CPU/guest address
     /// when writing the query result back. Mirrors the wiring in
@@ -2693,6 +2698,53 @@ pub struct QueryCache {
     /// Mirrors `gl_query_cache::QueryCache::gpu_ticks_getter`.
     gpu_ticks_getter: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     gpu_tick_adapter: Option<Box<QueryGpuTickAdapter>>,
+}
+
+/// Device ranges of the host-resolved reports not written back yet, with a count per range
+/// (the same address can be reported again before the earlier write-back runs).
+#[derive(Default)]
+struct PendingHostReports {
+    ranges: parking_lot::Mutex<std::collections::BTreeMap<u64, (u64, u32)>>,
+}
+
+impl PendingHostReports {
+    /// Registers a report and returns the guard its write-back operation drops when it is done.
+    fn register(self: &Arc<Self>, addr: u64, size: u64) -> PendingHostReport {
+        let mut ranges = self.ranges.lock();
+        let entry = ranges.entry(addr).or_insert((size, 0));
+        entry.0 = entry.0.max(size);
+        entry.1 += 1;
+        PendingHostReport { owner: Arc::clone(self), addr }
+    }
+
+    /// Whether a report not written back yet reaches into `[addr, addr + size)`.
+    fn overlaps(&self, addr: u64, size: u64) -> bool {
+        const MAX_REPORT_SIZE: u64 = 16;
+        let end = addr.saturating_add(size);
+        self.ranges
+            .lock()
+            .range(addr.saturating_sub(MAX_REPORT_SIZE - 1)..end)
+            .any(|(&start, &(length, _))| start.saturating_add(length) > addr)
+    }
+}
+
+/// Upstream's `pending_unregister` of a host-managed query: removes the report from
+/// `PendingHostReports` once its write-back has run (or was dropped without running).
+struct PendingHostReport {
+    owner: Arc<PendingHostReports>,
+    addr: u64,
+}
+
+impl Drop for PendingHostReport {
+    fn drop(&mut self) {
+        let mut ranges = self.owner.ranges.lock();
+        if let Some(entry) = ranges.get_mut(&self.addr) {
+            entry.1 -= 1;
+            if entry.1 == 0 {
+                ranges.remove(&self.addr);
+            }
+        }
+    }
 }
 
 struct QueryGpuTickAdapter(Arc<dyn Fn() -> u64 + Send + Sync>);
@@ -2763,6 +2815,7 @@ impl QueryCache {
             base: Box::new(QueryCacheBase::new()),
             runtime,
             pending_backend_flushes: parking_lot::Mutex::new(VecDeque::new()),
+            pending_host_reports: Arc::new(PendingHostReports::default()),
             channel_memory_manager: None,
             gpu_memory_adapter: None,
             device_memory_adapter: Some(device_memory_adapter),
@@ -2801,6 +2854,7 @@ impl QueryCache {
             base: Box::new(QueryCacheBase::new()),
             runtime: Box::new(QueryCacheRuntime::new()),
             pending_backend_flushes: parking_lot::Mutex::new(VecDeque::new()),
+            pending_host_reports: Arc::new(PendingHostReports::default()),
             channel_memory_manager: None,
             gpu_memory_adapter: None,
             device_memory_adapter: None,
@@ -2976,8 +3030,18 @@ impl QueryCache {
     pub fn invalidate_region(&mut self, addr: u64, size: usize) {
         self.base.invalidate_region(addr, size);
     }
+    /// Upstream `QueryCacheBase::FlushRegion`, over the reports `QueryCacheBase` holds only: it
+    /// runs under the memory manager's lock (`MemoryManager::read_block`), which the host
+    /// reports' write-back (`write_query_result`) takes, so it cannot wait for those.
     pub fn flush_region(&mut self, addr: u64, size: usize) {
         self.base.flush_region(addr, size);
+    }
+    /// Lichii `QueryCacheBase::SemiFlushRegion`: true when reports in the region still wait for
+    /// host results, which includes the host-resolved reports this backend keeps outside
+    /// `QueryCacheBase` (upstream: host-managed queries not yet guest-synced).
+    pub fn semi_flush_region(&mut self, addr: u64, size: usize) -> bool {
+        let base_pending = self.base.semi_flush_region(addr, size);
+        base_pending || self.pending_host_reports.overlaps(addr, size as u64)
     }
     pub fn notify_wfi(
         &mut self,
@@ -3171,12 +3235,17 @@ impl QueryCache {
         } else {
             None
         };
+        let report_size = if flags.contains(QueryPropertiesFlags::HAS_TIMEOUT) { 16 } else { 4 };
+        let pending = host_report
+            .is_some()
+            .then(|| self.pending_host_reports.register(device_addr, report_size));
         self.enqueue_query_writeback(
             gpu_addr,
             flags,
             effective_payload,
             host_report,
             host_report_is_synchronized,
+            pending,
             signal_fence,
             sync_operation,
         );
@@ -3189,6 +3258,7 @@ impl QueryCache {
         payload: u32,
         host_report: Option<HostQueryReport>,
         host_report_is_synchronized: bool,
+        pending: Option<PendingHostReport>,
         signal_fence: impl FnOnce(Box<dyn FnOnce() + Send>),
         sync_operation: impl FnOnce(Box<dyn FnOnce() + Send>),
     ) {
@@ -3199,6 +3269,8 @@ impl QueryCache {
         let is_fence = flags.contains(QueryPropertiesFlags::IS_A_FENCE);
         let gpu_ticks_getter = self.gpu_ticks_getter.as_ref().cloned();
         let operation = Box::new(move || {
+            // Unregistered when the operation ends, on every exit (upstream pending_unregister).
+            let _pending = pending;
             if host_report.is_some() && !host_report_is_synchronized {
                 log::error!(
                     "Query report value not synchronized. Consider increasing GPU accuracy."
@@ -3521,6 +3593,23 @@ mod tests {
     }
 
     #[test]
+    fn pending_host_reports_answer_region_flushes_until_written_back() {
+        let reports = Arc::new(PendingHostReports::default());
+        let first = reports.register(0x1000, 16);
+        assert!(reports.overlaps(0x1000, 4));
+        assert!(reports.overlaps(0x100c, 4));
+        assert!(reports.overlaps(0xff0, 0x11));
+        assert!(!reports.overlaps(0xff0, 0x10));
+        assert!(!reports.overlaps(0x1010, 4));
+        // The same address reported again before the first write-back ran.
+        let second = reports.register(0x1000, 4);
+        drop(first);
+        assert!(reports.overlaps(0x1008, 4));
+        drop(second);
+        assert!(!reports.overlaps(0x1000, 16));
+    }
+
+    #[test]
     fn running_samples_query_bound_matches_lichii() {
         assert_eq!(MAX_RUNNING_QUERY_SLOTS, 1024);
         let logged: Vec<u64> = (1..=16).filter(|&n| is_logged_bank_bound_reset(n)).collect();
@@ -3644,6 +3733,7 @@ mod tests {
             0xAABB_CCDD,
             None,
             true,
+            None,
             |_func| panic!("fence path should not be used"),
             |func| func(),
         );
@@ -3671,6 +3761,7 @@ mod tests {
             0x1234_5678,
             None,
             true,
+            None,
             move |func| {
                 *deferred_clone.lock() = Some(func);
             },
@@ -3700,6 +3791,7 @@ mod tests {
             0,
             Some(HostQueryReport::Test(0xDEAD_BEEF)),
             false,
+            None,
             |func| func(),
             |_func| panic!("sync path should not be used"),
         );

@@ -3032,8 +3032,13 @@ impl MacroEngine {
                      maxwell.get_register_value(DATA_RAM_ADDRESS),
                      std::sync::Arc::clone(maxwell.get_memory_manager()))
                 };
-                let mut memory = memory_handle.lock();
                 let read_bytes = u64::from(value.min(0x1000)) * 4;
+                // Lichii MacroEngine::Execute (macro.cpp, from Lichii 7ae3e74014): the query
+                // cache holds report and semaphore writes until a fence or the host result;
+                // write them out, or occlusion predicates read stale values. This path runs where
+                // the caches are owned (the split's front reads in Maxwell3D::front_dma_read).
+                crate::query_dma::flush_pending(&memory_handle, source, read_bytes);
+                let mut memory = memory_handle.lock();
                 if nx2_profile::enabled() {
                     nx2_profile::add(Counter::DmaReadBytes, read_bytes);
                     let mut page = source & !0xfff;

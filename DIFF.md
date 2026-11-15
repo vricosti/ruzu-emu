@@ -1,5 +1,56 @@
 # Upstream parity notes
 
+## 2026-11-15 — video_core/{query_dma,macro,engines/maxwell_3d,rasterizer_interface,query_cache/query_cache_base,renderer_vulkan/{query_cache,vk_rasterizer}}.rs vs Lichii video_core/{query_dma.h,macro.cpp,engines/maxwell_3d.cpp,rasterizer_interface.h,query_cache/query_cache_base.h,renderer_vulkan/vk_rasterizer.cpp}
+
+### Ported (Lichii extensions, absent from Eden)
+- Macro DMA reads write out the query cache's pending reports first and wait for the ones still
+  waiting for host results (Lichii 7ae3e74014): `query_dma::flush_pending` (query_dma.h:63-76),
+  `RasterizerInterface::flush_query_results` (default `flush_region(QUERY_CACHE)`), its Vulkan
+  override (vk_rasterizer.cpp:3093-3112: a sync operation queued behind a signalled fence, then
+  a wait for it), called before the buffer cache flush in `MacroEngine::execute`'s
+  `MME_DMA_READ`/`MME_DMA_READ_FIFOED` and after it in `Maxwell3D::front_dma_read`.
+- `QueryCacheBase::semi_flush_region` split out of `flush_region` (query_cache_base.h:80-91), and
+  it visits every query in the range (Lichii 821ccd570a). Eden's `FlushRegion` callback returned
+  `result`, but Eden's `IterateCache` tested `std::invoke_result` (never `bool`) and never
+  stopped early, so Eden wrote every final value of the range; ruzu had ported the intended early
+  exit and stopped at the first report still pending. `flush_region_with_memory` visits every
+  query too.
+
+### Intentional differences
+- Ruzu's Vulkan query cache keeps the host-resolved reports (`ZPassPixelCount64` samples,
+  transform feedback, primitives) outside `QueryCacheBase`: `QueryCache::query` writes them back
+  through its own operation (`enqueue_query_writeback`). Upstream `CounterReport` indexes every
+  report in `QueryCacheBase`, so `SemiFlushQueryDirty` answers "pending" for a host-managed query
+  not yet guest-synced, and `FlushRegion` (`ReadBlock`, `flush_region(QUERY_CACHE)`, the macro
+  DMA write-out above) waits for it. Without that, nothing a region flush asked about saw these
+  reports. `PendingHostReports` (renderer_vulkan/query_cache.rs) restores the answer: each host
+  report is registered with its device range (16 bytes with a timestamp, else 4) when it is
+  taken, and its write-back operation unregisters it when it ends, on every exit (upstream
+  `pending_unregister`); `QueryCache::semi_flush_region`, and so `flush_query_results`, include
+  it. `QueryCache::flush_region` does not wait for these reports as upstream `FlushRegion` would:
+  it runs under the memory manager's `ParkingLotMutex` (`MemoryManager::read_block`), which their
+  write-back (`write_query_result`) takes, and making it wait hung the load of the measured scene
+  (1 run of 3); `query_dma::flush_pending` releases that lock before it waits. On the
+  NX2 title used for measurement, the game's macros read ~950 occlusion reports per frame by DMA
+  and write the render-enable mode from them; a report read before its write-back landed culled
+  objects for one frame (the character's G-buffer draws among them), seen as a saturated white
+  halo on the character and on sunlit surfaces. Per-frame detector, two runs each: 22 and 54
+  defective frames before (~6,400 frames per run), 0 and 0 after; with a full fence wait before
+  every macro DMA read instead (experiment only) also 0, at 17.9 fps instead of ~23. The defect
+  was 0 at bbb188d7 with the occlusion counter fix; the later draw preparation, macro and async
+  read-back commits removed synchronous waits that used to let these write-backs land first.
+- Lichii's `FlushQueryResults` also calls `scheduler.FlushDeferred()` (work its GPU split's back
+  deferred); ruzu's scheduler defers no submission.
+- Lichii flushes in `MacroEngine::Execute` only where the caches are owned
+  (`!GpuSplit::Active() || OnBackThread()`); ruzu's native macro path always runs on the GPU
+  thread, and the split front reads through `Maxwell3D::front_dma_read`, which flushes after its
+  drain on the front thread (as it already did for the buffer cache) instead of `split.Run` on
+  the back. The memory manager lock is released before `flush_query_results` waits, since report
+  write-backs (`write_query_result`) take it.
+- Not ported: `QueryDma::HasPendingQueries`, `HoldsReports`, `Trace`/`TraceEnabled`
+  (EDEN_NX2_QUERY_DMA_TRACE), `GpuSplit::WaitForWrites` and Lichii's `page_filter` early-out in
+  `SemiFlushRegion`.
+
 ## 2026-11-15 — core/hle/service/service.rs `report_unimplemented_function` vs Lichii core/hle/service/service.cpp `ServiceFrameworkBase::ReportUnimplementedFunction`
 
 ### Ported (Lichii divergence from Eden)

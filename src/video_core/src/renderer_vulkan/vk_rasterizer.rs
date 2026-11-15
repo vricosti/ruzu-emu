@@ -4315,6 +4315,28 @@ impl RasterizerInterface for RasterizerVulkan {
         );
     }
 
+    /// Lichii `RasterizerVulkan::FlushQueryResults` (vk_rasterizer.cpp:3093-3112; from Lichii
+    /// 7ae3e74014). Below High GPU accuracy a fence runs its own callback at once, so this waits
+    /// for an operation queued behind the pending report writes instead.
+    fn flush_query_results(&mut self, addr: u64, size: u64) {
+        if addr == 0 || size == 0 || !self.query_cache.semi_flush_region(addr, size as usize) {
+            return;
+        }
+        let written = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let written_by_operation = Arc::clone(&written);
+        self.sync_operation(Box::new(move || {
+            let (lock, cv) = &*written_by_operation;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }));
+        self.signal_fence(Box::new(|| {}));
+        let (lock, cv) = &*written;
+        let mut done = lock.lock().unwrap();
+        while !*done {
+            done = cv.wait(done).unwrap();
+        }
+    }
+
     fn flush_all(&mut self) {}
 
     fn flush_region(&mut self, addr: u64, size: u64, which: CacheType) {

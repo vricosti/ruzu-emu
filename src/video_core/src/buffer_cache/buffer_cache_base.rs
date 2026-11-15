@@ -1544,6 +1544,13 @@ pub trait GpuMemoryAccess {
         0
     }
 
+    /// Lichii `Tegra::MemoryManager::MapSerial()`: a value that changes whenever the page table
+    /// does. `None` (the default) means the address space cannot say, and storage buffer bindings
+    /// are then computed again for every use.
+    fn map_serial(&self) -> Option<u64> {
+        None
+    }
+
     /// Upstream: `Tegra::MemoryManager::GetSubmappedRange(gpu_addr, size)`:
     /// `(gpu_addr, size)` runs that are contiguous in host memory. The default
     /// reports nothing, which disables multi-range resolution.

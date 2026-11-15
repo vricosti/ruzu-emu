@@ -80,6 +80,52 @@ const DEVICE_PAGESIZE: u64 = 4096;
 // BufferCache<P>
 // ---------------------------------------------------------------------------
 
+/// Key of Lichii's thread-local storage binding cache (`CachedBinding`, buffer_cache.h:4276-4284).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct StorageBindingKey {
+    owner: u64,
+    gpu_addr: u64,
+    next_qword: u64,
+    serial: u64,
+    alignment: u32,
+    flags: u32,
+}
+
+/// Lichii: 512 sets of 4 ways, most recent first.
+const STORAGE_BINDING_CACHE_SETS: usize = 512;
+const STORAGE_BINDING_CACHE_WAYS: usize = 4;
+type StorageBindingSet = [Option<(StorageBindingKey, Binding)>; STORAGE_BINDING_CACHE_WAYS];
+
+thread_local! {
+    static STORAGE_BINDING_CACHE: std::cell::RefCell<Vec<StorageBindingSet>> =
+        std::cell::RefCell::new(vec![[None; STORAGE_BINDING_CACHE_WAYS]; STORAGE_BINDING_CACHE_SETS]);
+}
+
+fn storage_binding_cache_set(key: &StorageBindingKey) -> usize {
+    ((key.gpu_addr ^ key.next_qword ^ u64::from(key.flags)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55)
+        as usize
+}
+
+fn storage_binding_cache_lookup(key: &StorageBindingKey) -> Option<Binding> {
+    STORAGE_BINDING_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let set = &mut cache[storage_binding_cache_set(key)];
+        let way = set.iter().position(|entry| entry.is_some_and(|(cached, _)| cached == *key))?;
+        let hit = set[way].expect("found above").1;
+        set[..=way].rotate_right(1);
+        Some(hit)
+    })
+}
+
+fn storage_binding_cache_store(key: StorageBindingKey, binding: Binding) {
+    STORAGE_BINDING_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let set = &mut cache[storage_binding_cache_set(&key)];
+        set.rotate_right(1);
+        set[0] = Some((key, binding));
+    });
+}
+
 /// The main buffer cache.
 ///
 /// Corresponds to the C++ `BufferCache<P>` template. The generic parameter
@@ -4268,8 +4314,39 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             gm.read_u32(gpu_addr)
         };
 
+        // Lichii's binding cache (buffer_cache.h:4266-4302, 4409-4410): a draw binds the same
+        // pointers as the last one, and a binding only changes with the pointer, the word after
+        // it, the page table or the binding kind. Native tables bind hundreds of MiB, and
+        // computing their size walks the page table.
+        let cache_key = gm.map_serial().and_then(|serial| {
+            let gpu_addr = read_u64(ssbo_addr)?;
+            if gpu_addr == 0 {
+                return None;
+            }
+            let reads_size_word = !(table_pointer && !is_written)
+                && (!native_pointer || (compute && !is_written));
+            let next_qword = if reads_size_word {
+                read_u64(ssbo_addr.wrapping_add(8)).unwrap_or(0)
+            } else {
+                0
+            };
+            Some(StorageBindingKey {
+                owner: gm.get_id() as u64 + 1,
+                gpu_addr,
+                next_qword,
+                serial,
+                alignment: self.runtime.get_storage_buffer_alignment(),
+                flags: u32::from(is_written)
+                    | (u32::from(native_pointer) << 1)
+                    | (u32::from(table_pointer) << 2)
+                    | (u32::from(compute) << 3),
+            })
+        });
+        if let Some(hit) = cache_key.and_then(|key| storage_binding_cache_lookup(&key)) {
+            return hit;
+        }
         // Upstream: const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
-        self.storage_buffer_binding_with_gpu_reader(
+        let binding = self.storage_buffer_binding_with_gpu_reader(
             ssbo_addr,
             cbuf_index,
             is_written,
@@ -4296,7 +4373,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 }
                 _ => false,
             },
-        )
+        );
+        if let Some(key) = cache_key {
+            storage_binding_cache_store(key, binding);
+        }
+        binding
     }
 
     fn storage_buffer_binding_with_gpu_reader(
@@ -5042,6 +5123,49 @@ mod tests {
         assert_eq!(bits, vec![0, 2, 5, 7]);
     }
 
+    /// Lichii's storage binding cache: a hit needs the same pointer, size word, page table
+    /// serial, alignment and kind; the set keeps the four most recent bindings.
+    #[test]
+    fn storage_binding_cache_hits_only_identical_keys() {
+        let key = StorageBindingKey {
+            owner: 1, gpu_addr: 0x1_0000, next_qword: 0, serial: 7, alignment: 4, flags: 2,
+        };
+        let binding = Binding { device_addr: 0x8000, gpu_addr: 0x1_0000, size: 0x100, ..NULL_BINDING };
+        storage_binding_cache_store(key, binding);
+        assert_eq!(storage_binding_cache_lookup(&key).map(|b| (b.device_addr, b.size)),
+            Some((0x8000, 0x100)));
+        assert!(storage_binding_cache_lookup(&StorageBindingKey { serial: 8, ..key }).is_none());
+        assert!(storage_binding_cache_lookup(&StorageBindingKey { flags: 3, ..key }).is_none());
+        // Four newer entries in the same set push it out.
+        let set = storage_binding_cache_set(&key);
+        let mut stored = 0;
+        let mut serial = 100;
+        while stored < STORAGE_BINDING_CACHE_WAYS {
+            let other = StorageBindingKey { serial, ..key };
+            serial += 1;
+            if storage_binding_cache_set(&other) == set {
+                storage_binding_cache_store(other, binding);
+                stored += 1;
+            }
+        }
+        assert!(storage_binding_cache_lookup(&key).is_none());
+    }
+
+    /// Lichii binds one storage slot per shader descriptor (`MAX_SSBOS`); with Eden's 16 slots
+    /// and u32 masks, slots 16+ were dropped and every later descriptor shifted.
+    #[test]
+    fn storage_slots_cover_every_shader_descriptor() {
+        assert_eq!(
+            NUM_STORAGE_BUFFERS as usize,
+            shader_recompiler::shader_info::Info::MAX_SSBOS
+        );
+        let mut bits = Vec::new();
+        BufferCache::<TestParams, DummyTracker>::for_each_enabled_bit(1u64 << 63 | 1 << 17, |idx| {
+            bits.push(idx);
+        });
+        assert_eq!(bits, vec![17, 63]);
+    }
+
     #[test]
     fn immediate_buffer_uses_contiguous_guest_memory_across_page_boundary() {
         let memory = ImmediateDeviceMemory {
@@ -5164,21 +5288,6 @@ mod tests {
             u64::MAX - 0x7ff,
             0x1000,
         ));
-    }
-
-    /// Lichii binds one storage slot per shader descriptor (`MAX_SSBOS`); with Eden's 16 slots
-    /// and u32 masks, slots 16+ were dropped and every later descriptor shifted.
-    #[test]
-    fn storage_slots_cover_every_shader_descriptor() {
-        assert_eq!(
-            NUM_STORAGE_BUFFERS as usize,
-            shader_recompiler::shader_info::Info::MAX_SSBOS
-        );
-        let mut bits = Vec::new();
-        BufferCache::<TestParams, DummyTracker>::for_each_enabled_bit(1u64 << 63 | 1 << 17, |idx| {
-            bits.push(idx);
-        });
-        assert_eq!(bits, vec![17, 63]);
     }
 
     #[test]

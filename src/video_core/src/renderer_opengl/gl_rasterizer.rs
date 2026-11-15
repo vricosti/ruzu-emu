@@ -292,6 +292,9 @@ impl crate::buffer_cache::buffer_cache_base::GpuMemoryAccess for GpuMemoryAccess
     fn get_id(&self) -> usize {
         self.mm.lock().get_id()
     }
+    fn map_serial(&self) -> Option<u64> {
+        Some(self.mm.lock().map_serial())
+    }
 
     fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
         self.mm.lock().get_submapped_range(gpu_addr, size)

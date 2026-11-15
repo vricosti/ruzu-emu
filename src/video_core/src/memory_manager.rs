@@ -405,6 +405,12 @@ impl GpuMemoryManager {
         self.unique_identifier
     }
 
+    /// Lichii `MemoryManager::MapSerial` (memory_manager.h:176-178): changes with every page
+    /// table update.
+    pub fn map_serial(&self) -> u64 {
+        self.map_serial.load(Ordering::Acquire)
+    }
+
     fn with_rasterizer_mut<R>(
         &mut self,
         f: impl FnOnce(&mut dyn RasterizerInterface) -> R,
@@ -2337,6 +2343,11 @@ impl MemoryManager {
     /// Upstream: `MemoryManager::GetID()`.
     pub fn get_id(&self) -> usize {
         self.inner.get_id()
+    }
+
+    /// Lichii `MemoryManager::MapSerial`.
+    pub fn map_serial(&self) -> u64 {
+        self.inner.map_serial()
     }
 
     pub fn device_memory(&self) -> &Arc<MaxwellDeviceMemoryManager> {

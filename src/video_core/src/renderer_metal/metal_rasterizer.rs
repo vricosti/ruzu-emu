@@ -412,6 +412,9 @@ impl GpuMemoryAccess for GpuMemoryAccessAdapter {
     fn get_id(&self) -> usize {
         self.memory_manager.lock().get_id()
     }
+    fn map_serial(&self) -> Option<u64> {
+        Some(self.memory_manager.lock().map_serial())
+    }
 
     fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
         self.memory_manager.lock().get_submapped_range(gpu_addr, size)

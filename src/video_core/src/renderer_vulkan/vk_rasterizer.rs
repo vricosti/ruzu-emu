@@ -823,6 +823,10 @@ impl GpuMemoryAccess for GpuMemoryAccessAdapter {
         unsafe { self.mm.as_ref().get_id() }
     }
 
+    fn map_serial(&self) -> Option<u64> {
+        Some(unsafe { self.mm.as_ref().map_serial() })
+    }
+
     fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
         unsafe { self.mm.as_ref().get_submapped_range(gpu_addr, size) }
     }

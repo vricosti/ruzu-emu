@@ -107,6 +107,38 @@ pub fn make_cbuf_key(index: u32, offset: u32) -> u64 {
     ((index as u64) << 32) | (offset as u64)
 }
 
+/// Lichii `NullStoragePointerSlots` (shader_environment.cpp:59-76): constant buffer slots that
+/// held a null pointer when the program was translated and were therefore not bound as storage
+/// buffers. A later non-null value makes the translation stale.
+fn null_storage_pointer_slots(
+    cbuf_values: &HashMap<u64, u32>,
+    storage_pointer_types: &HashMap<u64, bool>,
+) -> Vec<(u32, u32)> {
+    let mut slots = Vec::new();
+    for (&key, &mapped) in storage_pointer_types {
+        if mapped || (key >> 63) != 0 {
+            continue;
+        }
+        let low = cbuf_values.get(&key);
+        let high = cbuf_values.get(&key.wrapping_add(4));
+        if low == Some(&0) && high == Some(&0) {
+            slots.push(((key >> 32) as u32, key as u32));
+        }
+    }
+    slots
+}
+
+/// Lichii `MappedStoragePointerKeys` (shader_environment.cpp:79-88): the slots bound as storage
+/// buffer pointers, sorted.
+fn mapped_storage_pointer_keys(storage_pointer_types: &HashMap<u64, bool>) -> Vec<u64> {
+    let mut keys: Vec<u64> = storage_pointer_types
+        .iter()
+        .filter_map(|(&key, &mapped)| mapped.then_some(key))
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
 /// The descriptor `GenericEnvironment::read_texture_info` compiles for when a
 /// handle indexes past the pool: what the texture cache's null view is, a
 /// plain normalized 2D A8B8G8R8 UNORM texture, every other bit zero.
@@ -276,6 +308,24 @@ pub trait GenericEnvironmentOwner {
 }
 
 impl GenericEnvironment {
+    /// Lichii `GenericEnvironment::NullStoragePointerSlots`.
+    pub fn null_storage_pointer_slots(&self) -> Vec<(u32, u32)> {
+        null_storage_pointer_slots(&self.cbuf_values, &self.storage_pointer_types)
+    }
+
+    /// Lichii `GenericEnvironment::MappedStoragePointerKeys`.
+    pub fn mapped_storage_pointer_keys(&self) -> Vec<u64> {
+        mapped_storage_pointer_keys(&self.storage_pointer_types)
+    }
+
+    /// Lichii `GenericEnvironment::KeepStoragePointers`: answers the classification of these keys
+    /// as storage buffer pointers, whatever the slots hold now; called before translation.
+    pub fn keep_storage_pointers(&mut self, keys: &[u64]) {
+        for &key in keys {
+            self.storage_pointer_types.insert(key, true);
+        }
+    }
+
     /// GenericEnvironment::IsCbufStorageBufferPointer, with the derived
     /// environment retained for virtual constant-buffer reads.
     fn is_cbuf_storage_buffer_pointer<E: GenericEnvironmentOwner + shader_recompiler::environment::Environment>(
@@ -1904,6 +1954,16 @@ pub struct FileEnvironment {
 }
 
 impl FileEnvironment {
+    /// Lichii `FileEnvironment::NullStoragePointerSlots`.
+    pub fn null_storage_pointer_slots(&self) -> Vec<(u32, u32)> {
+        null_storage_pointer_slots(&self.cbuf_values, &self.storage_pointer_types)
+    }
+
+    /// Lichii `FileEnvironment::MappedStoragePointerKeys`.
+    pub fn mapped_storage_pointer_keys(&self) -> Vec<u64> {
+        mapped_storage_pointer_keys(&self.storage_pointer_types)
+    }
+
     /// Older entries persisted combined storage formats without the TIC
     /// swizzle. They cannot determine whether sampling returned depth or stencil.
     /// Loaders must consume the key, skip prebuilding this entry and let live
@@ -4721,5 +4781,29 @@ mod tests {
             shader_recompiler::environment::Environment::read_texture_pixel_format(&mut env, 9),
             TexturePixelFormat::A8B8G8R8Unorm
         );
+    }
+
+    /// Lichii NullStoragePointerSlots / MappedStoragePointerKeys / KeepStoragePointers: a slot
+    /// classified as a non-pointer while it held zero is reported for the stale-translation
+    /// check; kept keys are answered as pointers on the next translation.
+    #[test]
+    fn null_pointer_slots_and_kept_pointers() {
+        let mut values = HashMap::new();
+        let mut types = HashMap::new();
+        values.insert(make_cbuf_key(4, 0x90), 0);
+        values.insert(make_cbuf_key(4, 0x94), 0);
+        types.insert(make_cbuf_key(4, 0x90), false);
+        values.insert(make_cbuf_key(4, 0xa0), 7); // a scalar, not a null pointer
+        values.insert(make_cbuf_key(4, 0xa4), 0);
+        types.insert(make_cbuf_key(4, 0xa0), false);
+        types.insert(make_cbuf_key(4, 0x130), true);
+        types.insert(make_indirect_cbuf_key(4, 0x90, 8), false);
+        assert_eq!(null_storage_pointer_slots(&values, &types), vec![(4, 0x90)]);
+        assert_eq!(mapped_storage_pointer_keys(&types), vec![make_cbuf_key(4, 0x130)]);
+        let mut env = GenericEnvironment::default();
+        env.storage_pointer_types = types;
+        env.keep_storage_pointers(&[make_cbuf_key(4, 0x90)]);
+        assert_eq!(env.mapped_storage_pointer_keys(),
+            vec![make_cbuf_key(4, 0x90), make_cbuf_key(4, 0x130)]);
     }
 }

@@ -34,6 +34,37 @@
   also needs `MemoryManager::HostPointerSerial` and `DescriptorTable::changes`.
 - ruzu's per-channel `image_view_ids` remains one hash map keyed by index | compute tag; Eden
   keeps `graphics_image_view_ids`/`compute_image_view_ids` vectors indexed by the TIC index.
+## 2026-11-15 — video_core/{nx2_profile,macro,engines/kepler_compute,engines/maxwell_3d}.rs and core/hle/kernel/{svc/svc_synchronization,k_handle_table}.rs vs Lichii video_core/{nx2_profile.h,macro.cpp,engines/kepler_compute.cpp,engines/maxwell_3d.cpp} and Eden core/hle/kernel/{svc/svc_synchronization.cpp,k_handle_table.h}
+
+GPU-thread command processing overhead (no behavior change; measured on the NX2 title used for measurement).
+
+### Brought closer to upstream
+- `nx2_profile::Scope::new`/`drop` and `enabled()` are now inlined with only the enabled path
+  out of line, like Lichii's header-inline `Scope` (nx2_profile.h:184-214). The out-of-line
+  disabled constructor cost a call plus a store-forwarding stall per macro-emitted method.
+- `KeplerCompute::process_native_method`: Lichii re-points the raw `native_macro` pointer at the
+  context on every method (kepler_compute.cpp:133-137). The Rust owning handle is now replaced
+  only when it names another context (`Arc::ptr_eq`), and the retained context lock is taken
+  through a borrowed pointer instead of a per-method `Arc` clone/drop.
+- Same function: `memory_manager.GetID()` is read only in the traced branches, as upstream
+  (kepler_compute.cpp:281-283, 334), instead of locking the memory manager on every method write.
+- Compute macros on the JIT path no longer lease (move out, zero, move back) the 12 KiB
+  `TuringMacroInterpreter` nor swap its `dram`: like `MacroEngine::execute_native`, the
+  interpreter is leased only for the interpreter path or when there is no `active_dram`
+  (Lichii uses the engine's interpreter in place, kepler_compute.cpp:195-212).
+- `active_dram` (Kepler and `MacroEngine::execute_native`) is reassigned only when it names other
+  storage; the native data RAM lock, the macro JIT and the Maxwell3D native macro context are
+  reached through borrowed pointers instead of `Arc` clones per macro call (upstream: raw
+  pointers / `shared_ptr` members used in place, macro.cpp:1371-1372, maxwell_3d.h:3183).
+- `Maxwell3D::process_cb_multi_data` borrows its memory manager instead of cloning the `Arc`.
+- Rust-only diagnostic switches `RUZU_TRACE_WAITSYNC`, `RUZU_TRACE_WAITSYNC_TID`
+  (svc_synchronization.rs) and `RUZU_HANDLE_MISS_TRACE` (k_handle_table.rs) are read once
+  (`OnceLock`), no longer by a `getenv` per `WaitSynchronization` / handle lookup miss.
+
+### Intentional differences (unchanged)
+- Kepler/Maxwell still keep owning `Arc` handles where upstream keeps raw pointers; the borrowed
+  pointers rely on these owners being replaced only by channel setup
+  (`set_native_macro_mode`, `set_native_macro_context`), never while a method or macro runs.
 
 ## 2026-11-14 — video_core/{buffer_cache/{buffer_cache,buffer_cache_base},memory_manager,renderer_{vulkan/vk_rasterizer,opengl/gl_rasterizer,metal/metal_rasterizer}}.rs vs Lichii video_core/{buffer_cache/buffer_cache.h,memory_manager.h}
 

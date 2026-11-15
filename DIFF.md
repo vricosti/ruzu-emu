@@ -1,5 +1,160 @@
 # Upstream parity notes
 
+## 2026-11-14 — video_core/{buffer_cache/{buffer_cache,buffer_cache_base},memory_manager,renderer_{vulkan/vk_rasterizer,opengl/gl_rasterizer,metal/metal_rasterizer}}.rs vs Lichii video_core/{buffer_cache/buffer_cache.h,memory_manager.h}
+
+### Ported (Lichii extensions, absent from Eden)
+- The thread-local storage binding cache of `StorageBufferBinding` (buffer_cache.h:4266-4302,
+  4409-4410): 512 sets of 4 ways keyed by the address space (`GetID() + 1`), the pointer, the word
+  after it (when the binding reads it), `MapSerial`, the storage alignment and the binding kind
+  (written, native, table, compute); a hit returns the binding without computing its size again.
+  Native pointer tables bind pools of ~150 MiB whose size (`GetMemoryLayoutSize`,
+  `MaxContinuousRange`) was computed again for every storage buffer of every draw.
+- `MemoryManager::map_serial` (memory_manager.h:176-178) and `GpuMemoryAccess::map_serial`;
+  Vulkan, OpenGL and Metal adapters report it. The default (`None`) disables the cache.
+
+### Intentional differences
+- Lichii skips the cache under `Nx2Perf::Verify()`; ruzu has no verify mode for it.
+
+## 2026-11-15 — video_core/buffer_cache/usage_tracker.rs vs Lichii video_core/buffer_cache/usage_tracker.h
+
+### Ported (Lichii extensions, absent from Eden)
+- `Track` skips the last four ranges tracked since the reset, `FillPages` grows a run of pages
+  known to be all ones instead of writing them again, `Reset` clears only the words set since
+  the last reset and does nothing when nothing was tracked, and `Pages()` is exposed
+  (usage_tracker.h:29-170). Native pointer tables bind ~150 MiB per storage buffer; every draw
+  wrote one word per 4 KiB of each binding and every frame cleared the whole bitmap.
+- `TrackPage`/`IsPageUsed` mark exactly the 64-byte granules a range touches and nothing for an
+  empty range (usage_tracker.h:145-170). Eden computed the mask from the size alone, which set
+  the whole page for an empty range and could miss the second granule of a straddling range;
+  the two ruzu tests that pinned Eden's masks now pin Lichii's.
+
+### Intentional differences
+- Lichii's `Nx2Perf::Verify()`/`BackX::g_verify` cross-checks are not ported (no verify mode).
+
+## 2026-11-14 — shader_recompiler/{ir_opt/global_memory_to_storage_buffer_pass,ir/breadth_first_search,backend/spirv/spirv_emit_context,backend/spirv/emit_spirv_atomic,shader_info,frontend/translate_program}.rs vs Lichii shader_recompiler/{ir_opt/global_memory_to_storage_buffer_pass.cpp,frontend/ir/breadth_first_search.h,backend/spirv/spirv_emit_context.cpp,backend/spirv/emit_spirv_atomic.cpp,shader_info.h}
+
+### Ported (Lichii extensions, absent from Eden)
+- Native pointer tracking of the storage buffer pass. Ocarina of Time's Kokiri Forest runs four
+  native compute kernels whose append atomics (`GlobalAtomicIAdd32`/`UMax32`) take their pointer
+  from a constant buffer array at a run-time index (`c4[index * 8 + 0xe0]`) or from a pointer
+  loaded through a constant buffer pointer; ruzu's Eden-only pass left them global and the
+  pipelines were rejected (`Global atomic address has no registered storage ranges`). Ported:
+  `StorageBufferAddr::indirect` (pass.cpp:32-39), the extended `StorageInfo` (pass.cpp:65-106),
+  `IsRuntimeRoutable` (170-185), `TrackLowAddress`'s high word (357-405), `Track` as a
+  `BreadthFirstSearchPruned` that stops at loaded pointers (410-454), `TrackAddend` (457-480),
+  `TrackingConditions` (509-764), `ForEachSummedWord` (767-808), `SumWords`/
+  `CollectIteratorWords` (811-928), `ReadsCbufWord`/`CollectAtomicPointers` (931-1025),
+  `TrackPointerAddend` (1030-1058), `DynamicPointerSlots`/`CollectPointerSlots` (1063-1130),
+  `NativePointerCandidates` (1135-1328), `CollectStorageBuffers` (1332-1489), the pass's
+  competing-loaded and pointer-table retries, binding limit and `native_global_bounds` (2081-2189),
+  `StorageBufferLimit` (2191-2200), `StorageOffset`'s `UConvert` fallback (1957-1976) and the
+  `native_global_bounds` merge of `JoinStorageInfo` (2204).
+- `BreadthFirstSearch` with a resolver and `BreadthFirstSearchPruned`
+  (frontend/ir/breadth_first_search.h:22-101) as `breadth_first_search_resolved`/
+  `breadth_first_search_pruned`.
+- `Info::native_global_bounds` (shader_info.h:379).
+- SPIR-V global memory routing (spirv_emit_context.cpp:968-1165): `base_address` reads a pointer
+  table entry through its holder's binding; native programs route an address to the bound buffer
+  whose base is the closest one at or below it; 8/16-byte accesses read and write word by word
+  when the device storage alignment is below the vector size, and through the 32-bit functions
+  without descriptor aliasing. Global atomics are defined when any descriptor is routable
+  (`native_global_bounds` or NVN), and their emission reports Lichii's messages
+  (emit_spirv_atomic.cpp:431-441).
+
+### Intentional differences
+- IR identity is `InstRef` instead of `Inst*`; blocks are indices. `Value::resolve` plus an
+  `Inst` match stands for `IsImmediate()`/`InstRecursive()` (a register value counts as an
+  immediate, as upstream's non-opaque type check does).
+- `CollectIteratorWords`' Tarjan search is iterative (same edges, same order, same components)
+  so that its depth is not bounded by the host stack.
+- The global atomic functions stay keyed by opcode in `global_atomic_functions` and use
+  `emit_spirv_atomic::atomic_u32` for the operation.
+- `StorageBufferLimit` applies only `max_descriptor_set_storage_buffers`: ruzu's
+  `HostTranslateInfo` has no `max_per_stage_descriptor_storage_buffers`.
+
+### Accepted divergence from Eden (user decision, 2026-11-14)
+- The Lichii pointer tracking also applies to Switch 1 (non-native) programs: the paired pointer
+  (`TrackPointerAddend`), the legacy nearest-word search, `TrackAddend`, then the biased and
+  unbiased `Track` (now a pruned search that stops at loaded pointers), instead of Eden's two
+  `Track` calls. Not restricted to NX2.
+
+### Not ported (still missing)
+- Routed global `Inc32`/`Dec32`/`AddF32` atomics (CAS loops) and the routed
+  `GlobalAtomicCompareExchange32` function (spirv_emit_context.cpp:1166-1253,
+  emit_spirv_atomic.cpp:488-499): these opcodes still throw in ruzu's SPIR-V backend.
+- The compute pipeline rebuild when a constant buffer pointer that was null at translation
+  becomes mapped (`NullStoragePointerSlots`, `StaleNullPointerSlot`, `mapped_pointers`;
+  shader_environment.cpp:59-76, vk_pipeline_cache.cpp:987-1062). A candidate slot that is null when
+  the pipeline is first built stays unbound for that pipeline.
+- `JoinStorageInfo`'s binding limit and `requires_coherent_global_memory` merge (no ruzu
+  counterpart field; the VertexA/B merge has no host limits at hand).
+
+## 2026-11-14 — shader_recompiler/shader_info.rs and video_core/buffer_cache/{buffer_cache_base,buffer_cache}.rs vs Lichii shader_recompiler/shader_info.h and video_core/buffer_cache/buffer_cache_base.h
+
+### Ported (Lichii extensions, absent from Eden)
+- `Info::MAX_SSBOS` = 64 (shader_info.h:294; Eden 32) and `NUM_STORAGE_BUFFERS` =
+  `MAX_SSBOS` with u64 enabled/written/native storage masks (buffer_cache_base.h:74-75,
+  145-168; Eden 16 slots, u32 masks). The native pointer candidates bind every mapped slot of a
+  pointer array (Kokiri Forest's kernels bind 32): with 16 slots, `bind_compute_storage_buffer`
+  dropped slots 16+ ("index N exceeds maximum storage buffer count"), the descriptor stream
+  no longer matched the pipeline layout and the GPU faulted (GPUVM read fault, device lost).
+  `for_each_enabled_bit` takes any mask that widens to u64.
+
+## 2026-11-14 — video_core/buffer_cache/{multi_range_refresh,buffer_cache}.rs vs Lichii video_core/buffer_cache/{multi_range_refresh.h,buffer_cache.h}
+
+### Ported (Lichii extensions, absent from Eden)
+- `multi_range_refresh.rs` ports `InvalidateMultiRangeSegments`, `MultiRangeSegmentsLive` and
+  `RefreshMultiRangeSegments` (multi_range_refresh.h). `bind_multi_range_storage` refuses
+  segments whose buffer is gone and always invalidates the gathered copy before binding
+  (`BindFreshMultiRangeStorage`; ruzu invalidated only when a segment was synchronized).
+  `delete_buffer` forgets deleted buffers in both segment pools (buffer_cache.h:4199-4201), and
+  the graphics and compute updates refresh their pool at the end (buffer_cache.h:3027, 3038).
+  The resolver variant of the graphics update now clears the graphics pool first, as
+  `DoUpdateGraphicsBuffers` does (buffer_cache.h:3012).
+
+### Intentional differences
+- `refresh_multi_range_segments` takes the cache as an explicit context for its two callbacks
+  (upstream's lambdas both capture `this`). The pool is moved out of the cache while it is
+  refreshed: a buffer joined during the refresh is caught by the liveness check of the next pass
+  rather than by `InvalidateMultiRangeSegments`.
+
+## 2026-11-14 — video_core/{shader_environment,renderer_vulkan/pipeline_cache}.rs vs Lichii video_core/{shader_environment.cpp,renderer_vulkan/vk_pipeline_cache.{cpp,h}} (Lichii 6645721f2c)
+
+### Ported (Lichii extensions, absent from Eden)
+- Rebuild of native compute translations whose pointer slots were null at translation.
+  `null_storage_pointer_slots`, `mapped_storage_pointer_keys` (shader_environment.cpp:59-88) for
+  `GenericEnvironment` and `FileEnvironment`, `GenericEnvironment::keep_storage_pointers`
+  (shader_environment.cpp:295-299), `ComputePipelineCacheEntry` with `null_pointer_slots`,
+  `mapped_pointers` and `rebuilds` (vk_pipeline_cache.h:110-123), `MAX_COMPUTE_REBUILDS` = 4 and
+  `stale_null_pointer_slot` (vk_pipeline_cache.cpp:949, 987-1012), the rebuild in
+  `current_compute_pipeline` that keeps every pointer the old translation bound and keeps the old
+  pipeline when the rebuild fails (vk_pipeline_cache.cpp:1032-1053), and the entry's slots for
+  pipelines loaded from the disk cache (vk_pipeline_cache.cpp:3158-3161). Kokiri Forest's append
+  kernels are first translated while `c4[0x90]`, `c4[0x130]` and other list pointers are null.
+
+### Intentional differences
+- Replaced pipelines are kept in `retired_compute_pipelines` until the cache is destroyed
+  (at most four per key) instead of being freed once the scheduler tick passes.
+- The rebuild log names the shader hash instead of the program address.
+
+### Not ported (still missing)
+- Serializing every rebuilt translation and `OrderComputeTranslations` (choosing, at load, the
+  cached translation that binds every pointer the first one binds; vk_pipeline_cache.cpp:951-984):
+  ruzu still serializes a compute key once per session, so the next session loads the first
+  translation and rebuilds it again when a null slot is filled.
+- Graphics `EvictedPointerSlots` (evicted_pointer_slots.h): ruzu does not evict graphics pipelines.
+
+## 2026-11-14 — video_core/renderer_vulkan/pipeline_cache.rs: `CACHE_VERSION` 25 → 26
+
+### Intentional differences
+- Ruzu's own Vulkan pipeline cache version (Eden and Lichii number theirs independently; Lichii
+  is at 54 in pipeline_cache_files.h:30 and did not bump it for its native pointer tracking,
+  commit 6645721f2c). Bumped on the user's decision of 2026-11-14: records written by the
+  previous storage buffer pass lack the pointer classifications the new pass reads, and every
+  run failed to load ~480 of them ("Uncached storage pointer classification"). An older file is
+  deleted at load ("Deleting old pipeline cache") and rebuilt by the next session. The OpenGL
+  (15) and Metal (2) caches are not bumped.
+
 ## 2026-11-14 — video_core/renderer_vulkan/{vk_rasterizer,compute_pipeline,pipeline_cache}.rs and shader_recompiler/backend/spirv/{emit_spirv,emit_spirv_mesh,spirv_emit_context}.rs vs Lichii video_core/renderer_vulkan/{vk_rasterizer.cpp,vk_rasterizer.h,vk_graphics_pipeline.cpp,vk_graphics_pipeline.h,vk_pipeline_cache.cpp} and shader_recompiler/backend/spirv/{emit_spirv.h,emit_spirv_mesh.cpp,spirv_emit_context.cpp}
 
 ### Ported (Lichii extensions, absent from Eden)
@@ -105,7 +260,6 @@
   (cpp:873-902), the `Nx2Perf::Verify` cross-check (`EDEN_NX2_PERF_VERIFY`, cpp:732-741),
   `MapSerial`/`HostPointerSerial` (h:176-184), and `PageTableOp`/`BigPageTableOp`'s
   out-of-address-space guard and merged `ModifyGPUMemory` notifications (cpp:123-162).
-
 ## 2026-11-14 — shader_recompiler/{ir_opt/texture_pass,shader_info,host_translate_info}.rs and video_core/{shader_handle_program,renderer_vulkan/{graphics,compute}_pipeline,renderer_opengl/gl_{graphics,compute}_pipeline}.rs vs Lichii shader_recompiler/{ir_opt/texture_pass.cpp,shader_info.h,host_translate_info.h} and video_core/{shader_handle_program.h,renderer_vulkan/vk_{graphics,compute}_pipeline.cpp,renderer_vulkan/vk_pipeline_cache.cpp}
 
 ### Ported (Lichii extensions, absent from Eden)
@@ -130,8 +284,9 @@
 
 ### Intentional differences
 - No legacy breadth-first fallback (`pointer_word`, `handle_is_pointer_word`,
-  `binds_unmapped_pointer_word`, `HandleIsStoragePointer`) when even the index build fails: the
-  pass still throws, as before.
+  `binds_unmapped_pointer_word`) when even the index build fails: the pass still throws, as
+  before. (`HandleIsStoragePointer` was ported later, by 8c6626b1: see the entry for
+  video_core/{shader_handle_program,renderer_vulkan/graphics_pipeline,renderer_vulkan/compute_pipeline}.rs.)
 - Not ported: `TrimTrailingTees`, `EvaluateTextureHandles` (one evaluation per element instead,
   same values), `HandleTableNotes`, `IsUncomparable` (pipeline_helper.h:399), Lichii's distinct-array
   `DynamicSampledTextureArrayCount` (ruzu keeps Eden's per-instruction count) and

@@ -791,20 +791,14 @@ impl GpuMemoryAccess for GpuMemoryAccessAdapter {
         unsafe { self.mm.as_ref().gpu_to_cpu_address(gpu_addr) }
     }
 
+    // Upstream `gpu_memory->Read<u64>` / `Read<u32>` (buffer_cache.h
+    // StorageBufferBinding): a plain page read, without `ReadBlock`'s flush.
     fn read_u64(&self, gpu_addr: u64) -> Option<u64> {
-        let mut buf = [0u8; 8];
-        unsafe {
-            self.mm.as_ref().read_block(gpu_addr, &mut buf);
-        }
-        Some(u64::from_le_bytes(buf))
+        Some(unsafe { self.mm.as_ref().read::<u64>(gpu_addr) })
     }
 
     fn read_u32(&self, gpu_addr: u64) -> Option<u32> {
-        let mut buf = [0u8; 4];
-        unsafe {
-            self.mm.as_ref().read_block(gpu_addr, &mut buf);
-        }
-        Some(u32::from_le_bytes(buf))
+        Some(unsafe { self.mm.as_ref().read::<u32>(gpu_addr) })
     }
 
     fn is_within_gpu_address_range(&self, gpu_addr: u64) -> bool {

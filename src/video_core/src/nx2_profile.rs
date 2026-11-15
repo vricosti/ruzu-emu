@@ -146,6 +146,7 @@ pub static VKCREATE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static G_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("EDEN_NX2_GPU_PROFILE").is_some());
 
+#[inline(always)]
 pub fn enabled() -> bool {
     #[cfg(test)]
     if let Some(value) = TEST_ENABLED.with(|v| v.get()) {
@@ -192,17 +193,31 @@ pub struct Scope {
     _thread: PhantomData<Rc<()>>,
 }
 impl Scope {
+    // Upstream's Scope is header-inline, so a disabled scope costs one flag test
+    // at each call site. Keep that: only the enabled path is out of line.
+    #[inline(always)]
     pub fn new(zone: Zone) -> Self {
+        if !enabled() {
+            return Self {
+                zone,
+                enabled: false,
+                start: 0,
+                parent_child_ns: 0,
+                _thread: PhantomData,
+            };
+        }
+        Self::enter(zone)
+    }
+
+    #[inline(never)]
+    fn enter(zone: Zone) -> Self {
         let mut scope = Self {
             zone,
-            enabled: enabled(),
+            enabled: true,
             start: 0,
             parent_child_ns: 0,
             _thread: PhantomData,
         };
-        if !scope.enabled {
-            return scope;
-        }
         T_DATA.with(|cell| {
             let mut data = cell.borrow_mut();
             scope.parent_child_ns = data.child_ns;
@@ -213,10 +228,16 @@ impl Scope {
     }
 }
 impl Drop for Scope {
+    #[inline(always)]
     fn drop(&mut self) {
-        if !self.enabled {
-            return;
+        if self.enabled {
+            self.exit();
         }
+    }
+}
+impl Scope {
+    #[inline(never)]
+    fn exit(&mut self) {
         let elapsed = now().wrapping_sub(self.start);
         T_DATA.with(|cell| {
             let mut data = cell.borrow_mut();

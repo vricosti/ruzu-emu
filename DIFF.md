@@ -1,5 +1,40 @@
 # Upstream parity notes
 
+## 2026-11-15 — draw preparation cost: video_core/renderer_vulkan/{graphics_pipeline,vk_rasterizer,pipeline_cache}.rs and video_core/memory_manager.rs vs Eden/Lichii vk_graphics_pipeline.cpp, vk_rasterizer.cpp, memory_manager.{h,cpp}
+
+### Realigned on Eden
+- `GraphicsPipeline::ConfigureImpl` texture handle reads (`read_handle`, and the handle-program
+  reads of `EvaluateTextureHandle`) now use `MemoryManager::read::<u32>` (Eden
+  vk_graphics_pipeline.cpp:389-396 `gpu_memory->Read<u32>`, Lichii :877-884 and
+  shader_handle_program.h:60-65) instead of `read_block`, which flushed the rasterizer caches
+  for every handle word. The compute-backed mesh path (`MeshGraphicsResources::prepare`) keeps
+  its caller's block reader.
+- The buffer cache's `GpuMemoryAccess::read_u64/read_u32` adapter (`GpuMemoryAccessAdapter` in
+  vk_rasterizer.rs) uses `read::<u64>/read::<u32>` (Eden buffer_cache.h:2004/2013
+  `gpu_memory->Read<u64>`) instead of `read_block`.
+- `MemoryManager::FlushCaching` appends the device ranges into a reusable `page_stash2` member
+  through `get_submapped_device_ranges_into` (Eden `GetSubmappedRangeImpl<false>(addr, size,
+  page_stash2)`, memory_manager.h:221, memory_manager.cpp:711-719) instead of allocating two
+  vectors per call.
+
+### Intentional differences
+- From Lichii, not Eden: `update_dynamic_states` receives whether the draw's already looked-up
+  pipeline has dynamic vertex input (Lichii `UpdateDynamicStates(const GraphicsPipeline*)`,
+  vk_rasterizer.cpp:4238, 4323-4329). Eden calls `PipelineCache::CurrentGraphicsPipeline()` a
+  second time per draw (vk_rasterizer.cpp:1141). `draw_texture` passes `None` and keeps the
+  lookup, like Lichii's `nullptr`.
+- ruzu-only pipeline-use sidecar (`note_pipeline_use`, not in Eden or Lichii): a draw whose
+  lookup keeps the current pipeline no longer re-hashes the key; the recency order of the
+  recorded keys is unchanged, the use clock only advances on pipeline changes.
+
+### Not ported
+- Lichii's sampled-texture memo (`SampledTextureMemo`, `ResolveMemoizedTextures`,
+  `MemoizeTextures`, texture_cache.h:738-850, vk_graphics_pipeline.cpp:759-1010), which is why
+  Lichii calls `FillImageViews` on about a third of its draws. It is a Lichii-only mechanism that
+  also needs `MemoryManager::HostPointerSerial` and `DescriptorTable::changes`.
+- ruzu's per-channel `image_view_ids` remains one hash map keyed by index | compute tag; Eden
+  keeps `graphics_image_view_ids`/`compute_image_view_ids` vectors indexed by the TIC index.
+
 ## 2026-11-14 — video_core/{buffer_cache/{buffer_cache,buffer_cache_base},memory_manager,renderer_{vulkan/vk_rasterizer,opengl/gl_rasterizer,metal/metal_rasterizer}}.rs vs Lichii video_core/{buffer_cache/buffer_cache.h,memory_manager.h}
 
 ### Ported (Lichii extensions, absent from Eden)

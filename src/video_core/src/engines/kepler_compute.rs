@@ -991,8 +991,10 @@ impl KeplerCompute {
             self.process_native_report_semaphore(argument);
             return true;
         }
-        let asid = self.memory_manager.lock().get_id() as u64;
+        // As upstream, memory_manager.GetID() is read only where it is traced,
+        // not under the memory-manager lock on every native method write.
         if method == 0x5a || (0xc6..=0x108).contains(&method) {
+            let asid = self.memory_manager.lock().get_id() as u64;
             trace_native_query(12, asid, method as u64, 0, 0, argument as u64, 0);
         }
         if method == 0x107 {
@@ -1088,6 +1090,7 @@ impl KeplerCompute {
                 true
             }
             0xae | 0xaf | 0xb0 => {
+                let asid = self.memory_manager.lock().get_id() as u64;
                 let address = (self.native_registers[0xad] as u64) << 8;
                 let cpu = self
                     .memory_manager

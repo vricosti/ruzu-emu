@@ -215,6 +215,9 @@ pub struct SwitchableSetting<T: Clone> {
     pub setting: Setting<T>,
     use_global: bool,
     custom: T,
+    // Runtime-only default selected by System; never serialized as a global value.
+    // Unlike the single-console upstream, Ruzu has per-session hardware defaults.
+    session_default: Option<T>,
 }
 
 impl<T: Clone> SwitchableSetting<T> {
@@ -225,6 +228,7 @@ impl<T: Clone> SwitchableSetting<T> {
             setting: Setting::new(default_val, label, category),
             use_global: true,
             custom,
+            session_default: None,
         }
     }
 
@@ -249,16 +253,23 @@ impl<T: Clone> SwitchableSetting<T> {
             ),
             use_global: true,
             custom,
+            session_default: None,
         }
     }
 
     /// Returns the effective value (global or custom depending on state).
     pub fn get_value(&self) -> &T {
         if self.use_global {
-            self.setting.get_value()
+            self.session_default.as_ref().unwrap_or_else(|| self.setting.get_value())
         } else {
             &self.custom
         }
+    }
+
+    /// Apply a temporary inherited default without changing the persisted values.
+    /// Explicit custom values remain authoritative.
+    pub fn set_session_default(&mut self, value: Option<T>) {
+        self.session_default = value;
     }
 
     /// Returns the global value regardless of the use_global flag.
@@ -271,6 +282,7 @@ impl<T: Clone> SwitchableSetting<T> {
     where
         T: PartialOrd,
     {
+        self.session_default = None;
         if self.use_global {
             self.setting.set_value(val);
         } else {
@@ -291,6 +303,7 @@ impl<T: Clone> SwitchableSetting<T> {
 
     /// Sets the value without clamping.
     pub fn set_value_unclamped(&mut self, val: T) {
+        self.session_default = None;
         if self.use_global {
             self.setting.set_value_unclamped(val);
         } else {
@@ -333,6 +346,7 @@ impl<T: Clone + PartialOrd> SwitchableSetting<T> {
             setting: Setting::ranged(default_val, min_val, max_val, label, category),
             use_global: true,
             custom,
+            session_default: None,
         }
     }
 
@@ -361,6 +375,7 @@ impl<T: Clone + PartialOrd> SwitchableSetting<T> {
             ),
             use_global: true,
             custom,
+            session_default: None,
         }
     }
 }

@@ -51,6 +51,7 @@ pub mod renderer_opengl;
 pub mod renderer_vulkan;
 pub mod shader_cache;
 pub mod shader_environment;
+pub mod shader_handle_program;
 pub mod shader_notify;
 // shader_recompiler is a separate crate (matches upstream top-level directory)
 pub mod smaa_area_tex;

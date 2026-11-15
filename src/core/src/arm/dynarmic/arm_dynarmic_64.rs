@@ -41,6 +41,11 @@ const CODE_PAGE_SIZE: u64 = 4096;
 const CODE_PAGE_MASK: u64 = CODE_PAGE_SIZE - 1;
 const CODE_PAGE_WORDS: usize = (CODE_PAGE_SIZE as usize) / std::mem::size_of::<u32>();
 
+// Mechanical extraction of Lichii GetCNTPCT's polling-loop predicate.
+fn counter_reads_form_spin_loop(ticks: u64, previous: u64, frequency: u64) -> bool {
+    ticks.wrapping_sub(previous) < frequency / 600_000
+}
+
 /// Host-backend-specific access to the active A64 JIT state.
 ///
 /// Dynarmic deliberately gives its Arm64 and x64 backends different state
@@ -795,6 +800,8 @@ struct DynarmicCallbacks64 {
     /// Matches upstream `m_parent.m_uses_wall_clock`.
     uses_wall_clock: bool,
     hardware_profile: crate::hardware_properties::HardwareProfile,
+    /// Previous CNTPCT read, for upstream's short polling-loop pause.
+    last_cntpct: AtomicU64,
     /// Core timing reference for tick management.
     /// Matches upstream `m_parent.m_system.CoreTiming()`.
     core_timing: Arc<crate::core_timing::CoreTiming>,
@@ -852,6 +859,7 @@ impl DynarmicCallbacks64 {
             svc,
             uses_wall_clock,
             hardware_profile: crate::hardware_properties::SWITCH1_PROFILE,
+            last_cntpct: AtomicU64::new(0),
             core_timing,
             last_exception_address,
             breakpoint_context,
@@ -2199,7 +2207,23 @@ x0=0x{:016X} x1=0x{:016X} x2=0x{:016X} x3=0x{:016X} x19=0x{:016X} x20=0x{:016X} 
 
     /// Matches upstream `DynarmicCallbacks64::GetCNTPCT`.
     fn get_cntpct(&self) -> u64 {
-        self.core_timing.get_clock_ticks()
+        let ticks = self.core_timing.get_clock_ticks();
+        static PAUSE_SPINS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("RUZU_NX2_CNTPCT_PAUSE").map_or(true, |value| !value.starts_with('0'))
+        });
+        let previous = self.last_cntpct.load(Ordering::Relaxed);
+        if *PAUSE_SPINS && counter_reads_form_spin_loop(ticks, previous, self.hardware_profile.counter_frequency()) {
+            #[cfg(target_arch = "x86_64")]
+            {
+                std::hint::spin_loop();
+                std::hint::spin_loop();
+            }
+            #[cfg(target_arch = "aarch64")]
+            // Use the exact upstream hint; Rust's spin_loop may choose ISB.
+            unsafe { std::arch::asm!("yield", options(nomem, nostack, preserves_flags)) };
+        }
+        self.last_cntpct.store(ticks, Ordering::Relaxed);
+        ticks
     }
 
     /// Matches upstream `DynarmicCallbacks64::AddTicks`:
@@ -2541,7 +2565,7 @@ impl ArmDynarmic64 {
             page_table_log2_stride: PAGE_TABLE_LOG2_STRIDE,
             page_table_marked_bit: Some(0),
             page_table_sign_extension,
-            cntfrq_el0: common::wall_clock::CNTFRQ as u32,
+            cntfrq_el0: hardware_profile.counter_frequency() as u32,
             ctr_el0: 0x8444_c004,
             dczid_el0: 4,
             fastmem_address_space_bits: fastmem_address_space_bits
@@ -2884,6 +2908,18 @@ mod tests {
     use rdynarmic::interface::optimization_flags::OptimizationFlag;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
+
+    #[test]
+    fn counter_poll_pause_uses_session_frequency_and_unsigned_delta() {
+        for frequency in [common::wall_clock::CNTFRQ, common::wall_clock::SWITCH2_CNTFRQ] {
+            let threshold = frequency / 600_000;
+            assert!(super::counter_reads_form_spin_loop(100, 100, frequency));
+            assert!(super::counter_reads_form_spin_loop(100 + threshold - 1, 100, frequency));
+            assert!(!super::counter_reads_form_spin_loop(100 + threshold, 100, frequency));
+            assert!(!super::counter_reads_form_spin_loop(99, 100, frequency));
+            assert!(super::counter_reads_form_spin_loop(1, u64::MAX, frequency));
+        }
+    }
 
     #[cfg(target_arch = "aarch64")]
     fn set_test_pstate(state: &mut A64JitState, value: u32) {

@@ -86,7 +86,8 @@ use super::metal_shader::{
 const SPIRV_1_5: u32 = 0x0001_0500;
 const METAL_MIN_SSBO_ALIGNMENT: u64 = 4;
 const METAL_MAX_USER_CLIP_DISTANCES: u32 = 8;
-const CACHE_VERSION: u32 = 1;
+// GraphicsPipelineKey now includes an explicitly encoded resource-pool tail.
+const CACHE_VERSION: u32 = 2;
 
 fn buffer_cache_metadata(
     stage_infos: &[ShaderInfo; NUM_GRAPHICS_STAGES],
@@ -2432,8 +2433,7 @@ mod tests {
         );
         collect_shader_info_pass(&mut program);
         program.info.storage_buffers_descriptors.push(StorageBufferDescriptor {
-            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true,
-        });
+            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true, ..Default::default() });
         let options = MetalShaderCompileOptions {
             disable_rasterization: !enabled,
             ..MetalShaderCompileOptions::for_device(device.profile())

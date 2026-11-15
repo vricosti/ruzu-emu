@@ -402,6 +402,7 @@ dependencies = [
  "log",
  "lz4_flex",
  "parking_lot",
+ "portable-atomic",
  "thiserror 2.0.18",
  "toml 0.8.23",
  "winapi",

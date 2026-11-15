@@ -28,12 +28,16 @@ use shader_recompiler::exception::LogicError;
 use shader_recompiler::exception::RuntimeError;
 use shader_recompiler::frontend::ampere::program_address_map::{has_native_address_map, native_program_address};
 use shader_recompiler::program_header::ProgramHeader;
-use shader_recompiler::environment::MeshShaderEnvironment;
+use shader_recompiler::environment::{MeshShaderEnvironment, TexturePoolState};
 
 // Cache-local tags preserve the physical graphics stage used for resource
 // bindings while carrying the separate guest task/mesh execution kind.
 const CACHE_MESH_STATE: u32 = 1 << 31;
 const CACHE_TASK_STATE: u32 = 1 << 30;
+// Optional extension, emitted only after querying GPU-selected resource tables.
+const CACHE_TEXTURE_POOL_STATE: u32 = 1 << 29;
+// Optional extension: preserve old entries and record native pointer classifications.
+const CACHE_STORAGE_POINTER_TYPES: u32 = 1 << 28;
 
 /// GPU virtual address type.
 pub type GPUVAddr = u64;
@@ -93,6 +97,10 @@ pub use shader_recompiler::stage::Stage as ShaderStage;
 pub use shader_recompiler::shader_info::{ReplaceConstant, TexturePixelFormat, TextureType};
 
 /// Make a constant buffer key from index and offset.
+fn make_indirect_cbuf_key(index: u32, offset: u32, indirect: u32) -> u64 {
+    (1 << 63) | (u64::from(indirect & 0x3fffff) << 40) | make_cbuf_key(index, offset)
+}
+
 pub fn make_cbuf_key(index: u32, offset: u32) -> u64 {
     ((index as u64) << 32) | (offset as u64)
 }
@@ -189,6 +197,8 @@ fn dump_impl(
 /// not construct the full channel/MemoryManager owner graph.
 #[derive(Clone)]
 pub struct GenericEnvironment {
+    storage_pointer_types: HashMap<u64, bool>,
+    texture_pool_state: Option<TexturePoolState>,
     mesh_shader: Option<MeshShaderEnvironment>,
     native_source_size: usize,
     texture_pass_caches: shader_recompiler::environment::TexturePassCaches,
@@ -244,6 +254,55 @@ pub trait GenericEnvironmentOwner {
 }
 
 impl GenericEnvironment {
+    /// GenericEnvironment::IsCbufStorageBufferPointer, with the derived
+    /// environment retained for virtual constant-buffer reads.
+    fn is_cbuf_storage_buffer_pointer<E: GenericEnvironmentOwner + shader_recompiler::environment::Environment>(
+        env: &mut E, index: u32, offset: u32,
+    ) -> bool {
+        let key = make_cbuf_key(index, offset);
+        if let Some(&mapped) = env.generic_environment().storage_pointer_types.get(&key) {
+            return mapped;
+        }
+        let address = u64::from(env.read_cbuf_value(index, offset))
+            | (u64::from(env.read_cbuf_value(index, offset.wrapping_add(4))) << 32);
+        let memory = env.generic_environment().gpu_memory.as_ref().unwrap_or_else(||
+            std::panic::panic_any(LogicError::new("Uncached storage pointer classification")));
+        let mapped = {
+            let memory = memory.lock();
+            address != 0 && memory.is_within_gpu_address_range(address)
+                && memory.is_fully_mapped_range(address, 1)
+        };
+        env.generic_environment_mut().storage_pointer_types.insert(key, mapped);
+        mapped
+    }
+
+    fn is_cbuf_indirect_storage_buffer_pointer<E: GenericEnvironmentOwner + shader_recompiler::environment::Environment>(
+        env: &mut E, index: u32, offset: u32, indirect: u32,
+    ) -> bool {
+        let key = make_indirect_cbuf_key(index, offset, indirect);
+        if let Some(&mapped) = env.generic_environment().storage_pointer_types.get(&key) {
+            return mapped;
+        }
+        // A cache-backed environment must never infer a missing table classification.
+        if env.generic_environment().gpu_memory.is_none() {
+            std::panic::panic_any(LogicError::new("Uncached storage pointer table classification"));
+        }
+        let mut mapped = false;
+        if Self::is_cbuf_storage_buffer_pointer(env, index, offset) {
+            let holder = u64::from(env.read_cbuf_value(index, offset))
+                | (u64::from(env.read_cbuf_value(index, offset.wrapping_add(4))) << 32);
+            let memory = env.generic_environment().gpu_memory.as_ref().unwrap().lock();
+            let entry = holder.wrapping_add(u64::from(indirect));
+            if memory.is_fully_mapped_range(entry, 8) {
+                let address = memory.read::<u64>(entry);
+                mapped = address != 0 && memory.is_within_gpu_address_range(address)
+                    && memory.is_fully_mapped_range(address, 1);
+            }
+        }
+        env.generic_environment_mut().storage_pointer_types.insert(key, mapped);
+        mapped
+    }
+
     /// Upstream GenericEnvironment::InitializeNativeCode (128-byte graphics header, zero for compute).
     #[cfg(test)]
     fn initialize_native_code(&mut self, source_header_size: u32) {
@@ -417,6 +476,8 @@ impl GenericEnvironment {
     pub fn new() -> Self {
         Self {
             native_source_size: 0,
+            storage_pointer_types: HashMap::new(),
+            texture_pool_state: None,
             mesh_shader: None,
             texture_pass_caches: Default::default(),
             program_base: 0,
@@ -1285,6 +1346,30 @@ impl Default for GraphicsEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for GraphicsEnvironment {
+    fn is_cbuf_storage_buffer_pointer(&mut self, index: u32, offset: u32) -> bool {
+        GenericEnvironment::is_cbuf_storage_buffer_pointer(self, index, offset)
+    }
+    fn is_cbuf_indirect_storage_buffer_pointer(&mut self, index: u32, offset: u32, indirect: u32) -> bool {
+        GenericEnvironment::is_cbuf_indirect_storage_buffer_pointer(self, index, offset, indirect)
+    }
+    fn texture_pool_state(&mut self) -> Option<TexturePoolState> {
+        if self.file_backed {
+            return self.base.texture_pool_state;
+        }
+        #[cfg(test)]
+        if self.maxwell3d.is_null() {
+            return self.base.texture_pool_state;
+        }
+        let engine = self.maxwell3d();
+        let state = TexturePoolState {
+            texture_limit: engine.tex_header_pool_limit(),
+            sampler_limit: engine.tex_sampler_pool_limit(),
+            linked_sampler: engine.sampler_binding() == SamplerBinding::ViaHeaderBinding,
+        };
+        self.base.texture_pool_state = state.descriptor_counts().map(|_| state);
+        self.base.texture_pool_state
+    }
+
     fn has_native_instructions(&self) -> bool {
         self.base.has_native_instructions()
     }
@@ -1643,6 +1728,30 @@ impl Default for ComputeEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for ComputeEnvironment {
+    fn is_cbuf_storage_buffer_pointer(&mut self, index: u32, offset: u32) -> bool {
+        GenericEnvironment::is_cbuf_storage_buffer_pointer(self, index, offset)
+    }
+    fn is_cbuf_indirect_storage_buffer_pointer(&mut self, index: u32, offset: u32, indirect: u32) -> bool {
+        GenericEnvironment::is_cbuf_indirect_storage_buffer_pointer(self, index, offset, indirect)
+    }
+    fn texture_pool_state(&mut self) -> Option<TexturePoolState> {
+        if self.file_backed {
+            return self.base.texture_pool_state;
+        }
+        #[cfg(test)]
+        if self.kepler_compute.is_null() {
+            return self.base.texture_pool_state;
+        }
+        let engine = self.kepler_compute();
+        let state = TexturePoolState {
+            texture_limit: engine.tic_limit(),
+            sampler_limit: engine.tsc_limit(),
+            linked_sampler: engine.launch_description().linked_tsc,
+        };
+        self.base.texture_pool_state = state.descriptor_counts().map(|_| state);
+        self.base.texture_pool_state
+    }
+
     fn has_native_instructions(&self) -> bool {
         self.base.has_native_instructions()
     }
@@ -1738,6 +1847,8 @@ impl GenericEnvironmentOwner for ComputeEnvironment {
 
 /// File-based shader environment for loading from pipeline cache.
 pub struct FileEnvironment {
+    storage_pointer_types: HashMap<u64, bool>,
+    texture_pool_state: Option<TexturePoolState>,
     mesh_shader: Option<MeshShaderEnvironment>,
     texture_pass_caches: shader_recompiler::environment::TexturePassCaches,
     code: Vec<u64>,
@@ -1774,6 +1885,8 @@ impl FileEnvironment {
     pub fn new() -> Self {
         Self {
             mesh_shader: None,
+            storage_pointer_types: HashMap::new(),
+            texture_pool_state: None,
             texture_pass_caches: Default::default(),
             code: Vec::new(),
             texture_types: HashMap::new(),
@@ -1828,8 +1941,10 @@ impl FileEnvironment {
         let stage_raw = read_u32(file)?;
         let has_mesh_state = stage_raw & CACHE_MESH_STATE != 0;
         let is_task = stage_raw & CACHE_TASK_STATE != 0;
+        let has_texture_pool_state = stage_raw & CACHE_TEXTURE_POOL_STATE != 0;
+        let has_storage_pointer_types = stage_raw & CACHE_STORAGE_POINTER_TYPES != 0;
         self.stage = deserialize_enum_u32(
-            stage_raw & !(CACHE_MESH_STATE | CACHE_TASK_STATE),
+            stage_raw & !(CACHE_MESH_STATE | CACHE_TASK_STATE | CACHE_TEXTURE_POOL_STATE | CACHE_STORAGE_POINTER_TYPES),
             ShaderStage::VertexA as u32,
             "ShaderStage",
         )?;
@@ -1846,6 +1961,8 @@ impl FileEnvironment {
             ));
         }
         self.mesh_shader = None;
+        self.texture_pool_state = None;
+        self.storage_pointer_types.clear();
 
         let trailing_size = if self.stage == ShaderStage::Compute {
             4 * std::mem::size_of::<u32>() as u64
@@ -1856,7 +1973,9 @@ impl FileEnvironment {
                 } else {
                     0
                 }
-        } + if has_mesh_state { 12 + std::mem::size_of::<ProgramHeader>() as u64 } else { 0 };
+        } + if has_mesh_state { 12 + std::mem::size_of::<ProgramHeader>() as u64 } else { 0 }
+            + if has_texture_pool_state { 12 } else { 0 }
+            + if has_storage_pointer_types { 8 } else { 0 };
         let payload_size = code_size
             .checked_add(num_texture_types.checked_mul(8).ok_or_else(|| {
                 invalid_cache_data("texture-type count overflows the cache entry")
@@ -1980,6 +2099,31 @@ impl FileEnvironment {
                 primitive_header,
             });
         }
+        if has_texture_pool_state {
+            let texture_limit = read_u32(file)?;
+            let sampler_limit = read_u32(file)?;
+            let linked = read_u32(file)?;
+            let state = TexturePoolState { texture_limit, sampler_limit, linked_sampler: linked != 0 };
+            if linked > 1 || state.descriptor_counts().is_none() {
+                return Err(invalid_cache_data("invalid texture pool state"));
+            }
+            self.texture_pool_state = Some(state);
+        }
+        if has_storage_pointer_types {
+            let count = read_u64(file)?;
+            let remaining = file.metadata()?.len().saturating_sub(file.stream_position()?);
+            if count > (1 << 16) || count > remaining / 9 {
+                return Err(invalid_cache_data("invalid storage pointer classification count"));
+            }
+            for _ in 0..count {
+                let key = read_u64(file)?;
+                let mut value = [0u8];
+                file.read_exact(&mut value)?;
+                if value[0] > 1 || self.storage_pointer_types.insert(key, value[0] != 0).is_some() {
+                    return Err(invalid_cache_data("invalid storage pointer classification"));
+                }
+            }
+        }
         self.is_proprietary_driver = self.texture_bound == 2 || has_native_address_map(&self.code);
         Ok(())
     }
@@ -2058,6 +2202,8 @@ impl FileEnvironment {
         let has_hle_engine_state = !self.cbuf_replacements.is_empty();
         GenericEnvironment {
             native_source_size: 0,
+            storage_pointer_types: self.storage_pointer_types,
+            texture_pool_state: self.texture_pool_state,
             mesh_shader: self.mesh_shader,
             texture_pass_caches: self.texture_pass_caches,
             program_base: 0,
@@ -2117,6 +2263,18 @@ impl Default for FileEnvironment {
 }
 
 impl shader_recompiler::environment::Environment for FileEnvironment {
+    fn is_cbuf_storage_buffer_pointer(&mut self, index: u32, offset: u32) -> bool {
+        self.storage_pointer_types.get(&make_cbuf_key(index, offset)).copied()
+            .unwrap_or_else(|| std::panic::panic_any(LogicError::new("Uncached storage pointer classification")))
+    }
+    fn is_cbuf_indirect_storage_buffer_pointer(&mut self, index: u32, offset: u32, indirect: u32) -> bool {
+        self.storage_pointer_types.get(&make_indirect_cbuf_key(index, offset, indirect)).copied()
+            .unwrap_or_else(|| std::panic::panic_any(LogicError::new("Uncached storage pointer table classification")))
+    }
+    fn texture_pool_state(&mut self) -> Option<TexturePoolState> {
+        self.texture_pool_state
+    }
+
     fn has_native_instructions(&self) -> bool {
         FileEnvironment::has_native_instructions(self)
     }
@@ -2276,6 +2434,13 @@ fn serialize_generic_environment(
 ) -> std::io::Result<()> {
     use std::io::Write;
 
+    if env.texture_pool_state.is_some_and(|state| state.descriptor_counts().is_none()) {
+        return Err(invalid_cache_data("invalid texture pool state"));
+    }
+    if env.storage_pointer_types.len() > (1 << 16) {
+        return Err(invalid_cache_data("too many storage pointer classifications"));
+    }
+
     let code_size = env.cached_size_bytes() as u64;
     let num_texture_types = env.texture_types.len() as u64;
     let num_texture_pixel_formats = env.texture_pixel_formats.len() as u64;
@@ -2294,7 +2459,9 @@ fn serialize_generic_environment(
     file.write_all(&env.cached_highest.to_le_bytes())?;
     file.write_all(&env.viewport_transform_state.to_le_bytes())?;
     let stage_raw = env.stage as u32 | env.mesh_shader.as_ref().map_or(0, |mesh|
-        CACHE_MESH_STATE | if mesh.is_task { CACHE_TASK_STATE } else { 0 });
+        CACHE_MESH_STATE | if mesh.is_task { CACHE_TASK_STATE } else { 0 })
+        | if env.texture_pool_state.is_some() { CACHE_TEXTURE_POOL_STATE } else { 0 }
+        | if env.storage_pointer_types.is_empty() { 0 } else { CACHE_STORAGE_POINTER_TYPES };
     file.write_all(&stage_raw.to_le_bytes())?;
 
     // Write code as bytes
@@ -2341,6 +2508,18 @@ fn serialize_generic_environment(
     if let Some(mesh) = &env.mesh_shader {
         for word in mesh.registers { file.write_all(&word.to_le_bytes())?; }
         for word in mesh.primitive_header.raw { file.write_all(&word.to_le_bytes())?; }
+    }
+    if let Some(state) = env.texture_pool_state {
+        for word in [state.texture_limit, state.sampler_limit, u32::from(state.linked_sampler)] {
+            file.write_all(&word.to_le_bytes())?;
+        }
+    }
+    if !env.storage_pointer_types.is_empty() {
+        file.write_all(&(env.storage_pointer_types.len() as u64).to_le_bytes())?;
+        for (&key, &mapped) in &env.storage_pointer_types {
+            file.write_all(&key.to_le_bytes())?;
+            file.write_all(&[u8::from(mapped)])?;
+        }
     }
     Ok(())
 }
@@ -2613,6 +2792,189 @@ fn deserialize_enum_u32<T>(raw: u32, max: u32, type_name: &str) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_pointer_queries_validate_live_direct_and_indirect_addresses() {
+        use shader_recompiler::environment::Environment;
+        let gpu_base = 0x3000_0000u64;
+        let mut backing = vec![0u8; 0x2000];
+        backing[0x80..0x88].copy_from_slice(&(gpu_base + 0x800).to_le_bytes());
+        backing[0x88..0x90].copy_from_slice(&17u64.to_le_bytes());
+        backing[0x810..0x818].copy_from_slice(&(gpu_base + 0x1000).to_le_bytes());
+        let memory = make_owner_backed_memory_manager(gpu_base, 0xB000, &backing);
+        let mut kepler = KeplerCompute::new(Arc::clone(&memory));
+        kepler.launch_description.const_buffer_enable_mask = 1;
+        kepler.launch_description.const_buffers[0] = ConstBufferConfig { address: gpu_base, size: 0x400 };
+        let mut env = ComputeEnvironment::from_kepler_compute(&kepler, memory);
+        assert!(env.is_cbuf_storage_buffer_pointer(0, 0x80));
+        assert!(!env.is_cbuf_storage_buffer_pointer(0, 0x88));
+        assert!(!env.is_cbuf_storage_buffer_pointer(0, 0x90));
+        assert!(env.is_cbuf_indirect_storage_buffer_pointer(0, 0x80, 0x10));
+        assert!(!env.is_cbuf_indirect_storage_buffer_pointer(0, 0x80, 0x18));
+        assert!(!env.is_cbuf_indirect_storage_buffer_pointer(0, 0x80, 0x4000));
+        assert!(!env.is_cbuf_indirect_storage_buffer_pointer(0, 0x88, 0));
+        assert_eq!(env.base.storage_pointer_types.len(), 7);
+    }
+
+    #[test]
+    fn storage_pointer_cache_roundtrip_preserves_classification_and_entry_boundary() {
+        use shader_recompiler::environment::Environment;
+        use std::io::{Seek, SeekFrom};
+        let mut env = GenericEnvironment::new().with_stage(ShaderStage::Compute);
+        env.code = vec![0; 20];
+        env.cached_lowest = 0;
+        env.cached_highest = 152;
+        env.storage_pointer_types.insert(make_cbuf_key(2, 32), true);
+        env.storage_pointer_types.insert(make_cbuf_key(2, 40), false);
+        env.storage_pointer_types.insert(make_indirect_cbuf_key(2, 32, 16), true);
+        let path = make_test_cache_path("storage-pointer-state");
+        let mut file = std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(&path).unwrap();
+        serialize_generic_environment(&env, &mut file).unwrap();
+        let end = file.stream_position().unwrap();
+        let mut old = env.clone();
+        old.storage_pointer_types.clear();
+        serialize_generic_environment(&old, &mut file).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut cached = FileEnvironment::new();
+        cached.deserialize(&mut file).unwrap();
+        assert_eq!(file.stream_position().unwrap(), end);
+        assert!(cached.is_cbuf_storage_buffer_pointer(2, 32));
+        assert!(!cached.is_cbuf_storage_buffer_pointer(2, 40));
+        assert!(cached.is_cbuf_indirect_storage_buffer_pointer(2, 32, 16));
+        let mut adapter = ComputeEnvironment::from_file_environment(cached);
+        assert!(adapter.is_cbuf_storage_buffer_pointer(2, 32));
+        assert!(!adapter.is_cbuf_storage_buffer_pointer(2, 40));
+        assert!(adapter.is_cbuf_indirect_storage_buffer_pointer(2, 32, 16));
+        let mut cached = FileEnvironment::new();
+        cached.storage_pointer_types.insert(1, true);
+        cached.deserialize(&mut file).unwrap();
+        assert!(cached.storage_pointer_types.is_empty());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            cached.is_cbuf_storage_buffer_pointer(2, 32))).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn storage_pointer_cache_rejects_invalid_boolean_and_truncated_records() {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut env = GenericEnvironment::new().with_stage(ShaderStage::Compute);
+        env.code = vec![0; 20];
+        env.cached_lowest = 0;
+        env.cached_highest = 152;
+        env.storage_pointer_types.insert(make_cbuf_key(1, 16), true);
+        let path = make_test_cache_path("storage-pointer-invalid");
+        let mut file = std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(&path).unwrap();
+        serialize_generic_environment(&env, &mut file).unwrap();
+        let end = file.stream_position().unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(&[2]).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(FileEnvironment::new().deserialize(&mut file).is_err());
+        file.set_len(end - 1).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(FileEnvironment::new().deserialize(&mut file).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn texture_pool_queries_capture_live_graphics_and_compute_state() {
+        use shader_recompiler::environment::Environment;
+        use crate::engines::maxwell_3d::{TEX_HEADER_POOL_BASE, TEX_SAMPLER_POOL_BASE};
+        let mut graphics = Maxwell3D::new();
+        let mut env = GraphicsEnvironment::from_maxwell3d(&graphics, ShaderStageType::Fragment, 0, 0);
+        assert_eq!(env.base.texture_pool_state, None);
+        graphics.call_method(TEX_HEADER_POOL_BASE + 2, 31, true);
+        graphics.call_method(TEX_SAMPLER_POOL_BASE + 2, 7, true);
+        graphics.call_method(0x1234 / 4, 1, true);
+        let expected = TexturePoolState { texture_limit: 31, sampler_limit: 7, linked_sampler: true };
+        assert_eq!(env.texture_pool_state(), Some(expected));
+        assert_eq!(env.base.texture_pool_state, Some(expected));
+        let memory = Arc::new(ParkingLotMutex::new(MemoryManager::new(0)));
+        let mut compute = KeplerCompute::new(Arc::clone(&memory));
+        let mut env = ComputeEnvironment::from_kepler_compute(&compute, memory);
+        assert_eq!(env.base.texture_pool_state, None);
+        compute.call_method(0x55f, 15, true);
+        compute.call_method(0x559, 3, true);
+        compute.launch_description.linked_tsc = false;
+        let expected = TexturePoolState { texture_limit: 15, sampler_limit: 3, linked_sampler: false };
+        assert_eq!(env.texture_pool_state(), Some(expected));
+        assert_eq!(env.base.texture_pool_state, Some(expected));
+        compute.call_method(0x55f, u32::MAX, true);
+        assert_eq!(env.texture_pool_state(), None);
+        assert_eq!(env.base.texture_pool_state, None);
+    }
+
+    #[test]
+    fn texture_pool_cache_extension_roundtrips_without_consuming_next_entry() {
+        use shader_recompiler::environment::Environment;
+        use std::io::{Seek, SeekFrom};
+        for stage in [ShaderStage::Compute, ShaderStage::VertexB, ShaderStage::Geometry] {
+            for state in [None, Some(TexturePoolState {
+                texture_limit: 17, sampler_limit: 3, linked_sampler: false,
+            }), Some(TexturePoolState {
+                texture_limit: 31, sampler_limit: 7, linked_sampler: true,
+            })] {
+                let mut env = GenericEnvironment::new().with_stage(stage);
+                env.code = vec![0; 20];
+                env.cached_lowest = 0;
+                env.cached_highest = 152;
+                env.texture_pool_state = state;
+                let path = make_test_cache_path("texture-pool-state");
+                let mut file = std::fs::OpenOptions::new().create_new(true).read(true).write(true)
+                    .open(&path).unwrap();
+                serialize_generic_environment(&env, &mut file).unwrap();
+                let end = file.stream_position().unwrap();
+                let mut old = env.clone();
+                old.texture_pool_state = None;
+                serialize_generic_environment(&old, &mut file).unwrap();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                let mut cached = FileEnvironment::new();
+                cached.deserialize(&mut file).unwrap();
+                assert_eq!(file.stream_position().unwrap(), end);
+                assert_eq!(cached.texture_pool_state(), state);
+                let mut graphics = GraphicsEnvironment::from_file_environment(cached);
+                assert_eq!(graphics.texture_pool_state(), state);
+                // Reusing a FileEnvironment must clear an earlier extension.
+                let mut next = FileEnvironment::new();
+                next.texture_pool_state = state;
+                next.deserialize(&mut file).unwrap();
+                assert_eq!(next.texture_pool_state(), None);
+                let mut cached = FileEnvironment::new();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                cached.deserialize(&mut file).unwrap();
+                let mut compute = ComputeEnvironment::from_file_environment(cached);
+                assert_eq!(compute.texture_pool_state(), state);
+                drop(file);
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn texture_pool_cache_extension_rejects_truncation_and_invalid_boolean() {
+        use std::io::{Seek, SeekFrom};
+        let mut env = GenericEnvironment::new().with_stage(ShaderStage::Compute);
+        env.code = vec![0; 1];
+        env.cached_lowest = 0;
+        env.cached_highest = 0;
+        env.texture_pool_state = Some(TexturePoolState {
+            texture_limit: 7, sampler_limit: 3, linked_sampler: false,
+        });
+        let path = make_test_cache_path("texture-pool-invalid");
+        let mut file = std::fs::OpenOptions::new().create_new(true).read(true).write(true)
+            .open(&path).unwrap();
+        serialize_generic_environment(&env, &mut file).unwrap();
+        let len = file.stream_position().unwrap();
+        file.seek(SeekFrom::End(-4)).unwrap();
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(FileEnvironment::new().deserialize(&mut file).is_err());
+        file.set_len(len - 1).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(FileEnvironment::new().deserialize(&mut file).is_err());
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn mesh_environment_cache_preserves_physical_binding_state() {
         use shader_recompiler::environment::Environment;

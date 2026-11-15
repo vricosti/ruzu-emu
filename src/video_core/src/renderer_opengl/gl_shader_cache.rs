@@ -1473,8 +1473,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 3,
-                is_written: false,
-            },
+                is_written: false, ..Default::default() },
         );
 
         assert!(!make_compute_runtime_info(&info, 2).glasm_use_storage_buffers);

@@ -1124,6 +1124,9 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     fn get_storage_buffer_alignment(&self) -> u32 {
         self.vulkan_device().get_storage_buffer_alignment() as u32
     }
+    fn get_max_storage_buffer_range(&self) -> u64 {
+        self.vulkan_device().get_max_storage_buffer_range()
+    }
 
     fn should_limit_dynamic_storage_buffers(&self) -> bool {
         self.limit_dynamic_storage_buffers

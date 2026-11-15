@@ -1,6 +1,7 @@
 # Generated from 50fa86bbbc403ad565eb44fcc281f16f77c69e15:src/shader_recompiler/frontend/ampere/lower_to_maxwell.h; 0xc0b FSETP and uniform-bank scan from Fritchii f66ea633db (C++ oracle); TXQ/MUFU source forms from Fritchii f66ea633db (TANH gated pending IR prerequisite); IMAD.WIDE/HI Fritchii f66ea633db; UIMAD.WIDE + default HMMA software expansion Fritchii f66ea633db; uniform IMAD-addend/USHF Fritchii f66ea633db; LEA and uniform IADD3 carry/guards Fritchii f66ea633db; TEX.F16 pack order from Fritchii f66ea633db (C++ oracle); ISETP.EX/I2F selectors/RED types from Fritchii f66ea633db (C++ oracle); SHF.U64/FRND/LDC from Fritchii f66ea633db (C++ oracle); SR_VARIABLE_RATE from Fritchii f66ea633db (verbatim C++ oracle); full F2I block Fritchii f66ea633db (C++ oracle); TLDb66 full Fritchii f66ea633db (C++ oracle); TLD4 full Fritchii f66ea633db (C++ oracle)
 # scripts/ampere_operand_oracle.py; verbatim C++ blocks; tensor=None
 # TEX block updated from Fritchii f66ea633
+# Non-SCR TEX source-register fields corrected independently from Mesa 61a2e907 nak_nir_lower_tex.c; these fields are not verbatim C++ expectations.
 # Updated bit-mode blocks: Fritchii f66ea633
 # Updated minmax blocks: Fritchii f66ea633
 # Updated register-shift blocks: Fritchii f66ea633
@@ -6160,7 +6161,8 @@
 11 12 0 0 0 0 0 0 0 51606065 4 524293 0|0|native half fused multiply-add absolute source|
 11 12 0 0 0 0 0 0 0 51606065 4 1048581 0|1||5d00028040470313 70000 0 
 11 12 0 0 0 0 0 0 0 51606065 4 2097157 0|0|native half fused multiply-add mode|
-11 12 0 0 0 0 0 0 0 51606065 4 4194309 0|1||4480000000704fb 5d0002800fb70313 70000 0 
+# Mixed-sign FP16 cases: manually transcribed emissions from Fritchii c9ebb5c3af672a0472ca0811392f04fab10203ab (half exchange + low sign XOR).
+11 12 0 0 0 0 0 0 0 51606065 4 4194309 0|1||36f80200010704fb 44000080007fbfb 5d0002800fb70313 70000 0
 11 12 0 0 0 0 0 0 0 51606065 4 8388613 0|0|native half fused multiply-add mode|
 11 12 0 0 0 0 0 0 0 51606065 4 16777221 0|0|native half fused multiply-add mode|
 11 12 0 0 0 0 0 0 0 51606065 4 33554437 0|0|native half fused multiply-add mode|
@@ -6277,7 +6279,7 @@
 11 12 0 0 0 0 0 0 0 51606577 4 524293 0|0|native half fused multiply-add absolute source|
 11 12 0 0 0 0 0 0 0 51606577 4 1048581 0|1||10000000047f0fc 5d007e0080570313 70000 0 
 11 12 0 0 0 0 0 0 0 51606577 4 2097157 0|0|native half fused multiply-add mode|
-11 12 0 0 0 0 0 0 0 51606577 4 4194309 0|1||10000000047f0fc 4480000000705fb 5d007e000fb70313 70000 0 
+11 12 0 0 0 0 0 0 0 51606577 4 4194309 0|1||10000000047f0fc 36f80280010705fb 44000080007fbfb 5d007e000fb70313 70000 0
 11 12 0 0 0 0 0 0 0 51606577 4 8388613 0|0|native half fused multiply-add mode|
 11 12 0 0 0 0 0 0 0 51606577 4 16777221 0|0|native half fused multiply-add mode|
 11 12 0 0 0 0 0 0 0 51606577 4 33554437 0|0|native half fused multiply-add mode|
@@ -6394,7 +6396,7 @@
 11 12 0 0 0 0 0 0 0 51607089 4 524293 0|0|native half fused multiply-add absolute source|
 11 12 0 0 0 0 0 0 0 51607089 4 1048581 0|1||4c980780000700fc 5d007e0080570313 70000 0 
 11 12 0 0 0 0 0 0 0 51607089 4 2097157 0|0|native half fused multiply-add mode|
-11 12 0 0 0 0 0 0 0 51607089 4 4194309 0|1||4c980780000700fc 4480000000705fb 5d007e000fb70313 70000 0 
+11 12 0 0 0 0 0 0 0 51607089 4 4194309 0|1||4c980780000700fc 36f80280010705fb 44000080007fbfb 5d007e000fb70313 70000 0
 11 12 0 0 0 0 0 0 0 51607089 4 8388613 0|0|native half fused multiply-add mode|
 11 12 0 0 0 0 0 0 0 51607089 4 16777221 0|0|native half fused multiply-add mode|
 11 12 0 0 0 0 0 0 0 51607089 4 33554437 0|0|native half fused multiply-add mode|
@@ -24160,7 +24162,7 @@
 12 12 4294967295 0 0 0 0 0 0 68451168 847250182 918527 0|1||5c980780004700fa 5c980780006700fb c0380031aff7fafa 5c9807800fa70014 5c9807800fb70015 70000 0 a 
 12 12 4294967295 0 0 0 0 0 0 68451168 880804614 918527 0|0|native texture mode or descriptor binding|ffffffff 
 12 12 4294967295 0 0 0 0 0 0 68451168 947913478 918527 0|0|native texture mode or descriptor binding|ffffffff 
-12 12 4294967295 0 0 0 0 0 0 68451168 545260294 918527 0|1||5c980780004700fa 5c980780006700fb c0380031aff7fafa 5c9807800fa70014 5c9807800fb70015 70000 0 2 
+12 12 4294967295 0 0 0 0 0 0 68451168 545260294 918527 0|1||5c980780004700fa 5c980780005700fb c0380031aff7fafa 5c9807800fa70014 5c9807800fb70015 70000 0 2
 12 12 4294967295 0 0 0 0 0 0 68451168 276824838 918527 0|1||5c980780004700fa c03800318ff7fafa 5c9807800fa70014 5c9807800fb70015 70000 0 2 
 12 12 4294967295 0 0 0 0 0 0 68451168 1887437574 918527 0|1||5c980780004700fa 5c980780005700fb 5c980780006700fc c0380031eff7fafa 5c9807800fa70014 5c9807800fb70015 70000 0 2 
 12 12 4294967295 0 0 0 0 0 0 68451168 2961179398 918527 0|1||d8f0003ff0670414 70000 0 2 

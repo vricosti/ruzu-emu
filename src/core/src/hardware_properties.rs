@@ -29,6 +29,13 @@ pub const SWITCH1_PROFILE: HardwareProfile = HardwareProfile::Switch1;
 pub const NX2_PROFILE: HardwareProfile = HardwareProfile::Nx2;
 
 impl HardwareProfile {
+    pub const fn counter_frequency(self) -> u64 {
+        match self {
+            Self::Switch1 => common::wall_clock::CNTFRQ,
+            Self::Nx2 => common::wall_clock::SWITCH2_CNTFRQ,
+        }
+    }
+
     pub const fn num_cpu_cores(self) -> u32 {
         match self { Self::Switch1 => NUM_CPU_CORES, Self::Nx2 => 6 }
     }

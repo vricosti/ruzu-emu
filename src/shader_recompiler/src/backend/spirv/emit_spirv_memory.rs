@@ -530,8 +530,7 @@ mod tests {
             cbuf_index: 0,
             cbuf_offset: 0,
             count: 1,
-            is_written: true,
-        }];
+            is_written: true, ..Default::default() }];
         let mut ctx = SpirvEmitContext::new(&program, &profile, &RuntimeInfo::default());
         ctx.define_global_variables(&program, &mut Bindings::default());
         ctx.builder

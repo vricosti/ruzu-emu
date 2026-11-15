@@ -3,9 +3,12 @@
 //! Derniere synchro: 2026-03-05
 
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// CNTPCT_EL0 Frequency = 19.2 MHz
 pub const CNTFRQ: u64 = 19_200_000;
+/// Experimental NX2 counter frequency, matching Lichii's WallClock.
+pub const SWITCH2_CNTFRQ: u64 = 31_250_000;
 /// GM20B GPU Tick Frequency = 614.4 MHz
 pub const GPU_TICK_FREQ: u64 = 614_400_000;
 /// T210/4 A57 CPU Tick Frequency = 1020.0 MHz
@@ -24,6 +27,14 @@ const US_PER_SEC: u64 = 1_000_000;
 
 /// Trait for wall clock implementations, matching the C++ WallClock abstract class.
 pub trait WallClock: Send + Sync {
+    /// Select before guest execution; never change a running session's timebase.
+    fn set_guest_cntfrq(&self, frequency: u64);
+    fn get_guest_cntfrq(&self) -> u64;
+
+    fn cpu_tick_to_guest_cntpct(&self, cpu_tick: u64) -> u64 {
+        ((cpu_tick as u128) * self.get_guest_cntfrq() as u128 / CPU_TICK_FREQ as u128) as u64
+    }
+
     /// Returns the time in nanoseconds since the construction of this clock.
     fn get_time_ns(&self) -> Duration;
 
@@ -92,12 +103,14 @@ pub fn cpu_tick_to_gpu_tick(cpu_tick: u64) -> u64 {
 /// This is the fallback when no native high-precision clock is available.
 pub struct StandardWallClock {
     _start: Instant,
+    guest_cntfrq: AtomicU64,
 }
 
 impl StandardWallClock {
     pub fn new() -> Self {
         Self {
             _start: Instant::now(),
+            guest_cntfrq: AtomicU64::new(CNTFRQ),
         }
     }
 }
@@ -109,6 +122,14 @@ impl Default for StandardWallClock {
 }
 
 impl WallClock for StandardWallClock {
+    fn set_guest_cntfrq(&self, frequency: u64) {
+        self.guest_cntfrq.store(frequency, Ordering::Relaxed);
+    }
+
+    fn get_guest_cntfrq(&self) -> u64 {
+        self.guest_cntfrq.load(Ordering::Relaxed)
+    }
+
     fn get_time_ns(&self) -> Duration {
         Duration::from_nanos(self.get_uptime().max(0) as u64)
     }
@@ -128,7 +149,7 @@ impl WallClock for StandardWallClock {
         // the fraction at compile time (19.2M/1e9 -> 12/625), avoiding u64
         // overflow on large uptime values. Use u128 intermediate to match.
         let uptime = self.get_uptime() as u64;
-        ((uptime as u128 * CNTFRQ as u128) / NS_PER_SEC as u128) as i64
+        ((uptime as u128 * self.get_guest_cntfrq() as u128) / NS_PER_SEC as u128) as i64
     }
 
     fn get_gpu_tick(&self) -> i64 {
@@ -206,6 +227,29 @@ pub fn create_standard_wall_clock() -> Box<dyn WallClock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_counter_frequency_is_instance_local_and_round_trips_cpu_ticks() {
+        let unchanged = create_standard_wall_clock();
+        let clocks = [create_standard_wall_clock(), create_optimal_clock()];
+        for clock in clocks {
+            for frequency in [CNTFRQ, SWITCH2_CNTFRQ, CNTFRQ] {
+                clock.set_guest_cntfrq(frequency);
+                assert_eq!(clock.get_guest_cntfrq(), frequency);
+                assert_eq!(unchanged.get_guest_cntfrq(), CNTFRQ);
+                assert_eq!(clock.cpu_tick_to_guest_cntpct(CPU_TICK_FREQ), frequency);
+                assert_eq!(clock.cpu_tick_to_guest_cntpct(CPU_TICK_FREQ * 7), frequency * 7);
+                // Sample around the query, avoiding assumptions about the host epoch.
+                let before = clock.get_time_ns().as_nanos();
+                let ticks = clock.get_cntpct() as u128;
+                let after = clock.get_time_ns().as_nanos();
+                let low = before * frequency as u128 / NS_PER_SEC as u128;
+                let high = after * frequency as u128 / NS_PER_SEC as u128;
+                assert!(ticks + 2 >= low && ticks <= high + 2,
+                    "counter {ticks} outside [{low}, {high}] at {frequency} Hz");
+            }
+        }
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]

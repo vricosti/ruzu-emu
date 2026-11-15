@@ -4887,6 +4887,32 @@ impl Maxwell3D {
         nonshadow_argument: u32,
         is_last_call: bool,
     ) {
+        // Temporary investigation probe, removed before delivery.
+        static TRACE_TRIGGER: std::sync::LazyLock<Option<std::path::PathBuf>> =
+            std::sync::LazyLock::new(|| std::env::var_os("RUZU_CLEAR_TRACE_TRIGGER").map(Into::into));
+        static TRACE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if method == CLEAR_SURFACE
+            && TRACE_TRIGGER.as_ref().is_some_and(|path| path.is_file())
+            && TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4096
+        {
+            log::info!("Clear shadow probe: raw={nonshadow_argument:#x} effective={argument:#x} shadow={} control={:#x} rasterize={} override={} mode={} execute={} rt0={:#x} zeta={:#x} clip={:?} scissor={:?}",
+                self.shadow_state[SHADOW_RAM_CONTROL as usize], self.regs[CLEAR_CONTROL as usize],
+                self.regs[RASTERIZE_ENABLE as usize], self.regs[RENDER_ENABLE_OVERRIDE as usize],
+                self.regs[RENDER_ENABLE_MODE as usize], self.execute_on,
+                self.rt_address(0), self.zeta_info().address, self.surface_clip_info(),
+                self.scissor_info(0));
+            let trace_index = TRACE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            if trace_index <= 256 {
+                use std::io::Write;
+                if let Some(path) = TRACE_TRIGGER.as_ref() {
+                    if let Ok(mut file) = std::fs::File::create(path.with_extension(format!("registers-{trace_index:03}"))) {
+                        for register in self.regs.iter() {
+                            let _ = file.write_all(&register.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
         match method {
             WAIT_FOR_IDLE => {
                 let _ = self.with_rasterizer_mut(|rasterizer| rasterizer.wait_for_idle());

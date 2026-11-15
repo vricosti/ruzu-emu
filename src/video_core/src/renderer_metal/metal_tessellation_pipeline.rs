@@ -1040,8 +1040,7 @@ fragment float4 shade(Out input [[stage_in]]) { return input.color; }
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         let control_runtime = RuntimeInfo {
             previous_stage_stores: vertex.info.stores.clone(),
             ..Default::default()
@@ -1093,8 +1092,7 @@ fragment float4 shade(Out input [[stage_in]]) { return input.color; }
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         let layout = TessellationControlLayout::new(&control, &control_runtime).unwrap();
         let evaluation_runtime = RuntimeInfo {
             previous_stage_stores: control.info.stores.clone(),
@@ -1154,8 +1152,7 @@ fragment float4 shade(Out input [[stage_in]]) { return input.color; }
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         let stages = MetalTessellationShaderStages {
             vertex: emit_msl_vertex_function(
                 &vertex,
@@ -1982,8 +1979,7 @@ fragment float4 shade(bool front [[front_facing]]) {
                     cbuf_index: 0,
                     cbuf_offset: 0,
                     count: 1,
-                    is_written: true,
-                });
+                    is_written: true, ..Default::default() });
             let artifact = emit_msl_tessellation_control_function(
                 &program,
                 &Profile {

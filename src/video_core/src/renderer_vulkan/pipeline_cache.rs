@@ -51,6 +51,7 @@ use shader_recompiler::runtime_info::{
     AttributeType, CompareFunction, InputTopology, TessPrimitive, TessSpacing,
 };
 use shader_recompiler::shader_info::Info as ShaderInfo;
+use shader_recompiler::environment::TexturePoolState;
 use shader_recompiler::{CompiledShader, Profile, RuntimeInfo, ShaderStage};
 
 use super::buffer_cache::VulkanCommonBufferCache;
@@ -127,6 +128,8 @@ pub(super) fn make_shader_profile(device: &Device) -> Profile {
         support_float_controls: device.is_khr_shader_float_controls_supported(),
         support_separate_denorm_behavior: float_control.denorm_behavior_independence
             == vk::ShaderFloatControlsIndependence::ALL,
+        support_fp32_only_denorm_independence: float_control.denorm_behavior_independence
+            == vk::ShaderFloatControlsIndependence::TYPE_32_ONLY,
         support_separate_rounding_mode: float_control.rounding_mode_independence
             == vk::ShaderFloatControlsIndependence::ALL,
         support_fp16_denorm_preserve: float_control.shader_denorm_preserve_float16 != 0,
@@ -610,7 +613,7 @@ pub(crate) struct TranslatedGraphicsShader {
 
 pub(crate) const NUM_GRAPHICS_STAGES: usize = 5;
 
-pub(crate) const GEOMETRY_CAPTURE_VERSION: u32 = 1;
+pub(crate) const GEOMETRY_CAPTURE_VERSION: u32 = 2;
 
 fn pre_raster_capture_directory(
     key: &GraphicsPipelineKey,
@@ -1265,11 +1268,40 @@ impl GraphicsPipelineBuilder {
 
 /// Port of `ComputePipelineCacheKey`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
 pub struct ComputePipelineCacheKey {
     pub unique_hash: u64,
     pub shared_memory_size: u32,
     pub workgroup_size: [u32; 3],
+    pub texture_pool_state: Option<TexturePoolState>,
+}
+
+// Versioned key extension for shader-side descriptor selection. Serialize
+// fields explicitly: Option and bool have no portable raw-byte representation.
+pub(super) fn texture_pool_key_bytes(state: Option<TexturePoolState>) -> [u8; 16] {
+    let words = state.map_or([0; 4], |s| [1, s.texture_limit, s.sampler_limit, u32::from(s.linked_sampler)]);
+    let mut bytes = [0; 16];
+    for (dst, word) in bytes.chunks_exact_mut(4).zip(words) {
+        dst.copy_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
+
+pub(super) fn read_texture_pool_key(file: &mut std::fs::File) -> std::io::Result<Option<TexturePoolState>> {
+    use std::io::Read;
+    let mut bytes = [0; 16];
+    file.read_exact(&mut bytes)?;
+    let mut words = [0u32; 4];
+    for (word, src) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+        *word = u32::from_le_bytes(src.try_into().unwrap());
+    }
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid texture pool key");
+    if words[0] == 0 {
+        return if words[1..] == [0, 0, 0] { Ok(None) } else { Err(invalid()) };
+    }
+    if words[0] != 1 || words[3] > 1 { return Err(invalid()); }
+    let state = TexturePoolState { texture_limit: words[1], sampler_limit: words[2], linked_sampler: words[3] != 0 };
+    state.descriptor_counts().ok_or_else(invalid)?;
+    Ok(Some(state))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1310,15 +1342,9 @@ impl DiskResourceLoadState {
 impl ComputePipelineCacheKey {
     /// Port of `ComputePipelineCacheKey::Hash`.
     ///
-    /// Computes the upstream-style CityHash64 over the raw key bytes.
+    /// CityHash64 over the explicitly serialized key, including dependencies.
     pub fn hash_value(&self) -> u64 {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (self as *const Self).cast::<u8>(),
-                std::mem::size_of::<Self>(),
-            )
-        };
-        city_hash64(bytes)
+        city_hash64(&compute_key_to_cache_bytes(self))
     }
 
     pub fn read_from_file(file: &mut std::fs::File) -> std::io::Result<Self> {
@@ -1338,6 +1364,7 @@ impl ComputePipelineCacheKey {
             unique_hash,
             shared_memory_size,
             workgroup_size,
+            texture_pool_state: read_texture_pool_key(file)?,
         })
     }
 }
@@ -1346,12 +1373,11 @@ impl GraphicsPipelineKey {
     /// Port of `GraphicsPipelineCacheKey::Hash` from
     /// `vk_pipeline_cache.cpp`.
     ///
-    /// Upstream CityHash64 hashes the six shader hashes followed by exactly
-    /// `FixedPipelineState::Size()` bytes. The fixed stack buffer avoids the
-    /// two heap allocations previously hidden in `to_cache_bytes()`.
+    /// The upstream prefix is followed by the explicit resource-pool key tail.
+    /// Keep hashing allocation-free, including on the transition fast path.
     pub fn hash_value(&self) -> u64 {
         const HASH_BYTES: usize =
-            std::mem::size_of::<[u64; NUM_PROGRAMS]>() + FixedPipelineState::FULL_SIZE;
+            std::mem::size_of::<[u64; NUM_PROGRAMS]>() + FixedPipelineState::FULL_SIZE + 16;
         let mut bytes = [0u8; HASH_BYTES];
         let mut offset = 0usize;
         for unique_hash in self.unique_hashes {
@@ -1361,7 +1387,9 @@ impl GraphicsPipelineKey {
         }
         let (state_bytes, state_size) = self.fixed_state.prefix_bytes();
         bytes[offset..offset + state_size].copy_from_slice(&state_bytes[..state_size]);
-        city_hash64(&bytes[..offset + state_size])
+        offset += state_size;
+        bytes[offset..offset + 16].copy_from_slice(&texture_pool_key_bytes(self.texture_pool_state));
+        city_hash64(&bytes[..offset + 16])
     }
 }
 
@@ -1451,7 +1479,7 @@ impl Default for ShaderPools {
 // Version 23: uniform compare/select, FP16 per-tap gather and LEA.HI negation.
 // Previously expanded native programs retain the old lowering behavior.
 // Version 24: corrected NOINC capture boundaries, depth gather and constant PTP offsets.
-const CACHE_VERSION: u32 = 24;
+const CACHE_VERSION: u32 = 25;
 // Upstream: flush the Vulkan pipeline cache to disk at most once per
 // max(30 s, 1 s per MiB of cache) once 128 new pipelines were built.
 const VULKAN_CACHE_FLUSH_PIPELINES: usize = 128;
@@ -1638,13 +1666,14 @@ fn graphics_key_cache_hash(key: &GraphicsPipelineKey) -> u64 {
     key.hash_value()
 }
 
-fn compute_key_to_cache_bytes(key: &ComputePipelineCacheKey) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(std::mem::size_of::<ComputePipelineCacheKey>());
-    bytes.extend_from_slice(&key.unique_hash.to_le_bytes());
-    bytes.extend_from_slice(&key.shared_memory_size.to_le_bytes());
-    for value in key.workgroup_size {
-        bytes.extend_from_slice(&value.to_le_bytes());
+fn compute_key_to_cache_bytes(key: &ComputePipelineCacheKey) -> [u8; 40] {
+    let mut bytes = [0; 40];
+    bytes[..8].copy_from_slice(&key.unique_hash.to_le_bytes());
+    bytes[8..12].copy_from_slice(&key.shared_memory_size.to_le_bytes());
+    for (dst, value) in bytes[12..24].chunks_exact_mut(4).zip(key.workgroup_size) {
+        dst.copy_from_slice(&value.to_le_bytes());
     }
+    bytes[24..].copy_from_slice(&texture_pool_key_bytes(key.texture_pool_state));
     bytes
 }
 
@@ -1911,7 +1940,7 @@ pub struct PipelineCache {
     graphics_key: GraphicsPipelineKey,
     // Compute execution is independent of fixed rasterization state. Shader
     // hashes already include upstream mesh-register/primitive-header identity.
-    mesh_compute_cache: HashMap<[u64; NUM_PROGRAMS], Option<Rc<MeshComputePrograms>>, BuildUnorderedDenseHasher>,
+    mesh_compute_cache: HashMap<([u64; NUM_PROGRAMS], TexturePoolState), Option<Rc<MeshComputePrograms>>, BuildUnorderedDenseHasher>,
     mesh_graphics_cache: HashMap<GraphicsPipelineKey, Option<Rc<GraphicsPipeline>>, BuildUnorderedDenseHasher>,
     current_pipeline: Option<Rc<GraphicsPipeline>>,
     dynamic_features: DynamicFeatures,
@@ -2120,6 +2149,14 @@ impl PipelineCache {
         draw: &mut Maxwell3DDrawView<'_>,
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&GraphicsPipeline> {
+        // Refresh before mesh lookup, Next(), and the slow-path lookup alike.
+        self.graphics_key.texture_pool_state = shared_cache.current_maxwell3d()
+            .filter(|engine| engine.get_native_macro_engine_read(|macros| macros.native_turing))
+            .map(|engine| TexturePoolState {
+                texture_limit: engine.tex_header_pool_limit(),
+                sampler_limit: engine.tex_sampler_pool_limit(),
+                linked_sampler: engine.sampler_binding() == crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding,
+            });
         // Launch-time opt-in for the compute mesh adaptation; avoid querying
         // the host environment on every ordinary graphics-pipeline lookup.
         if super::vk_rasterizer::mesh_draw_enabled()
@@ -2232,11 +2269,17 @@ impl PipelineCache {
         // Share the persistent hashes with ordinary graphics lookup: RefreshStages
         // leaves them untouched when shaders aren't dirty, including on draws
         // following a task/mesh draw in the same channel.
+        let pool_state = TexturePoolState {
+            texture_limit: maxwell.tex_header_pool_limit(),
+            sampler_limit: maxwell.tex_sampler_pool_limit(),
+            linked_sampler: maxwell.sampler_binding() == crate::engines::maxwell_3d::SamplerBinding::ViaHeaderBinding,
+        };
         if !shared_cache.refresh_stages(&mut self.graphics_key.unique_hashes) {
             return None;
         }
         let hashes = self.graphics_key.unique_hashes;
-        if !self.mesh_compute_cache.contains_key(&hashes) {
+        let key = (hashes, pool_state);
+        if !self.mesh_compute_cache.contains_key(&key) {
             let mut environments = GraphicsEnvironments::default();
             shared_cache.get_graphics_environments(&mut environments, &hashes);
             let built = catch_shader_exception(|| -> Result<MeshComputePrograms, String> {
@@ -2289,10 +2332,10 @@ impl PipelineCache {
                     None
                 }
             };
-            self.mesh_compute_cache.insert(hashes, programs);
+            self.mesh_compute_cache.insert(key, programs);
             self.queue_vulkan_pipeline_cache_flush();
         }
-        self.mesh_compute_cache.get(&hashes)?.as_ref().map(Rc::clone)
+        self.mesh_compute_cache.get(&key)?.as_ref().map(Rc::clone)
     }
 
     /// Port of upstream `PipelineCache::CurrentComputePipeline`.
@@ -2307,6 +2350,11 @@ impl PipelineCache {
         let kepler_compute = shared_cache.current_kepler_compute()?;
         let qmd = kepler_compute.launch_description();
         let key = ComputePipelineCacheKey {
+            texture_pool_state: kepler_compute.is_native_mode().then(|| TexturePoolState {
+                texture_limit: kepler_compute.tic_limit(),
+                sampler_limit: kepler_compute.tsc_limit(),
+                linked_sampler: qmd.linked_tsc,
+            }),
             unique_hash: shader_hash,
             shared_memory_size: qmd.shared_alloc,
             workgroup_size: [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z],
@@ -2978,8 +3026,7 @@ mod tests {
         let mut fragment = ShaderInfo::default();
         fragment.constant_buffer_descriptors.push(ConstantBufferDescriptor { index: 0, count: 4 });
         fragment.storage_buffers_descriptors.push(StorageBufferDescriptor {
-            cbuf_index: 0, cbuf_offset: 16, count: 8, is_written: false,
-        });
+            cbuf_index: 0, cbuf_offset: 16, count: 8, is_written: false, ..Default::default() });
         assert_eq!(mesh_graphics_output_binding(Some(&fragment)), 2);
     }
 
@@ -3194,6 +3241,7 @@ mod tests {
         let mut fixed_state = FixedPipelineState::default();
         fixed_state.color_formats[0] = crate::gpu::RenderTargetFormat::R32Uint as u8;
         let key = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 1, 0, 0, 0, 1],
             fixed_state,
         };
@@ -3230,6 +3278,7 @@ mod tests {
         let mut fixed_state = FixedPipelineState::default();
         fixed_state.point_size = 2.5f32.to_bits();
         let key = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 1, 0, 0, 1, 0],
             fixed_state,
         };
@@ -3264,6 +3313,7 @@ mod tests {
         fixed_state.set_tessellation_spacing(1);
         fixed_state.set_tessellation_clockwise(true);
         let key = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 1, 0, 1, 0, 1],
             fixed_state,
         };
@@ -3748,6 +3798,7 @@ mod tests {
     #[test]
     fn compute_pipeline_cache_key_hash_changes_with_shared_memory_size() {
         let key_a = ComputePipelineCacheKey {
+            texture_pool_state: None,
             unique_hash: 0x1234,
             shared_memory_size: 0x20,
             workgroup_size: [1, 2, 3],
@@ -3763,6 +3814,7 @@ mod tests {
     #[test]
     fn compute_pipeline_cache_key_hash_changes_with_workgroup_size() {
         let key_a = ComputePipelineCacheKey {
+            texture_pool_state: None,
             unique_hash: 0x1234,
             shared_memory_size: 0x20,
             workgroup_size: [1, 2, 3],
@@ -3776,9 +3828,76 @@ mod tests {
     }
 
     #[test]
-    fn compute_pipeline_cache_key_layout_matches_upstream_shape() {
-        assert_eq!(std::mem::size_of::<ComputePipelineCacheKey>(), 24);
-        assert_eq!(std::mem::align_of::<ComputePipelineCacheKey>(), 8);
+    fn compute_pipeline_cache_key_serialization_has_explicit_dependency_tail() {
+        let key = ComputePipelineCacheKey {
+            unique_hash: 17, shared_memory_size: 32, workgroup_size: [1, 2, 3],
+            texture_pool_state: None,
+        };
+        let bytes = compute_key_to_cache_bytes(&key);
+        assert_eq!(bytes.len(), 40);
+        assert_eq!(&bytes[..8], &17u64.to_le_bytes());
+        assert_eq!(&bytes[24..], &[0; 16]);
+        assert_eq!(key.hash_value(), city_hash64(&bytes));
+    }
+
+    #[test]
+    fn pipeline_keys_roundtrip_pool_dependencies_and_separate_variants() {
+        use std::io::{Seek, SeekFrom, Write};
+        let path = std::env::temp_dir().join(format!("ruzu-pool-keys-{}-{}.bin",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut file = std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(&path).unwrap();
+        let states = [None,
+            Some(TexturePoolState { texture_limit: 7, sampler_limit: 3, linked_sampler: false }),
+            Some(TexturePoolState { texture_limit: 15, sampler_limit: 3, linked_sampler: false }),
+            Some(TexturePoolState { texture_limit: 7, sampler_limit: 7, linked_sampler: false }),
+            Some(TexturePoolState { texture_limit: 7, sampler_limit: 3, linked_sampler: true }),
+        ];
+        let mut graphics_keys = std::collections::HashSet::new();
+        let mut compute_keys = std::collections::HashSet::new();
+        for state in states {
+            let compute = ComputePipelineCacheKey {
+                unique_hash: 29, shared_memory_size: 64, workgroup_size: [1, 2, 3],
+                texture_pool_state: state,
+            };
+            let graphics = GraphicsPipelineKey { texture_pool_state: state, ..Default::default() };
+            graphics_keys.insert(graphics.clone());
+            compute_keys.insert(compute);
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&compute_key_to_cache_bytes(&compute)).unwrap();
+            file.write_all(&graphics.to_cache_bytes()).unwrap();
+            let end = file.stream_position().unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            assert_eq!(ComputePipelineCacheKey::read_from_file(&mut file).unwrap(), compute);
+            assert_eq!(GraphicsPipelineKey::read_from_file(&mut file).unwrap(), graphics);
+            assert_eq!(file.stream_position().unwrap(), end);
+            assert_eq!(graphics.hash_value(), city_hash64(&graphics.to_cache_bytes()));
+            assert_eq!(compute.hash_value(), city_hash64(&compute_key_to_cache_bytes(&compute)));
+        }
+        assert_eq!(graphics_keys.len(), states.len());
+        assert_eq!(compute_keys.len(), states.len());
+        // Reject noncanonical absent values, invalid tags/booleans, and
+        // inclusive limits whose descriptor counts would overflow.
+        for words in [
+            [0u32, 1, 0, 0],
+            [2, 0, 0, 0],
+            [1, 7, 3, 2],
+            [1, u32::MAX, 3, 0],
+            [1, 7, u32::MAX, 0],
+        ] {
+            file.seek(SeekFrom::Start(0)).unwrap();
+            for word in words {
+                file.write_all(&word.to_le_bytes()).unwrap();
+            }
+            file.seek(SeekFrom::Start(0)).unwrap();
+            assert_eq!(read_texture_pool_key(&mut file).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        }
+        for size in 0..16 {
+            file.set_len(size).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            assert_eq!(read_texture_pool_key(&mut file).unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        }
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -3786,6 +3905,7 @@ mod tests {
         use std::hash::BuildHasher;
 
         let key = ComputePipelineCacheKey {
+            texture_pool_state: None,
             unique_hash: 0x1234_5678_9abc_def0,
             shared_memory_size: 0x4000,
             workgroup_size: [8, 4, 2],
@@ -3802,6 +3922,7 @@ mod tests {
     #[test]
     fn compute_cache_can_retain_upstream_negative_entry() {
         let key = ComputePipelineCacheKey {
+            texture_pool_state: None,
             unique_hash: 0x1234,
             shared_memory_size: 0x20,
             workgroup_size: [1, 2, 3],

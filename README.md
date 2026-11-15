@@ -27,8 +27,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 ## About
 
-Ruzu brings Nintendo Switch emulation to desktop computers, with a graphical
-game library, controller-friendly navigation and configurable graphics and input.
+Ruzu is an experimental, open-source Nintendo Switch and Switch 2 emulator written in rust.
 
 The project builds on the work of Yuzu and Eden, with development focused on
 compatibility, rendering correctness, performance and usability. It is developed

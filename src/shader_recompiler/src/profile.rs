@@ -23,6 +23,8 @@ pub struct Profile {
     pub support_vertex_instance_id: bool,
     pub support_float_controls: bool,
     pub support_separate_denorm_behavior: bool,
+    /// Vulkan 32_BIT_ONLY: FP16 control is independent of FP32, but coupled to FP64.
+    pub support_fp32_only_denorm_independence: bool,
     pub support_separate_rounding_mode: bool,
     pub support_fp16_denorm_preserve: bool,
     pub support_fp32_denorm_preserve: bool,
@@ -138,6 +140,7 @@ impl Default for Profile {
             support_vertex_instance_id: false,
             support_float_controls: false,
             support_separate_denorm_behavior: false,
+            support_fp32_only_denorm_independence: false,
             support_separate_rounding_mode: false,
             support_fp16_denorm_preserve: false,
             support_fp32_denorm_preserve: false,

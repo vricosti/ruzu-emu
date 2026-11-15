@@ -37,6 +37,7 @@ use crate::surface::PixelFormat;
 
 use super::buffer_cache_base::*;
 use super::memory_tracker_base::MemoryTrackerBase;
+use super::read_trap_tracker::ReadTrapTracker;
 use super::virtual_range_cache::{VirtualRangeCache, VirtualSegments};
 use super::word_manager::DeviceTracker;
 
@@ -139,6 +140,7 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
 
     // -- GPU-modified range tracking --
     uncommitted_gpu_modified_ranges: RangeSet,
+    read_trapped_ranges: ReadTrapTracker,
     gpu_modified_ranges: RangeSet,
     committed_gpu_modified_ranges: VecDeque<RangeSet>,
 
@@ -238,6 +240,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             upload_copies: SmallVec::new(),
             memory_tracker: MemoryTrackerBase::new(device_tracker),
             uncommitted_gpu_modified_ranges: RangeSet::new(),
+            read_trapped_ranges: ReadTrapTracker::default(),
             gpu_modified_ranges: RangeSet::new(),
             committed_gpu_modified_ranges: VecDeque::new(),
             lru_cache: LeastRecentlyUsedCache::new(),
@@ -286,11 +289,16 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `gpu_memory` is set per-channel via channel setup caches.
     pub fn set_gpu_memory(&mut self, gpu_memory: Box<dyn GpuMemoryAccess>) {
+        // The CPU's GetFlushArea reads the adapter under this same mutex.
+        // ChannelSetupCaches updates upstream's pointer under the cache lock;
+        // our separately installed trait object must follow that contract too.
+        let _guard = self.mutex.lock();
         self.gpu_memory = Some(gpu_memory);
     }
 
     /// Clear the per-channel GPU-memory owner when the bound channel is released.
     pub fn clear_gpu_memory(&mut self) {
+        let _guard = self.mutex.lock();
         self.gpu_memory = None;
     }
 
@@ -298,6 +306,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `device_memory` is bound at construction.
     pub fn set_device_memory(&mut self, device_memory: Box<dyn DeviceMemoryAccess>) {
+        let _guard = self.mutex.lock();
         self.device_memory = Some(device_memory);
     }
 
@@ -557,7 +566,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if self
             .memory_tracker
             .is_region_preflushable(device_addr, size)
+            && !self.has_gpu_writes_not_downloaded_at_fence(
+                device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned)
         {
+            self.forget_read_traps(device_addr_start_aligned,
+                device_addr_end_aligned - device_addr_start_aligned);
             return Some(RasterizerDownloadArea {
                 start_address: device_addr_start_aligned,
                 end_address: device_addr_end_aligned,
@@ -569,16 +582,79 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             device_addr_start_aligned,
             device_addr_end_aligned.wrapping_sub(device_addr_start_aligned) as usize,
         );
-        self.memory_tracker.mark_region_as_preflushable(
-            device_addr_start_aligned,
-            device_addr_end_aligned.wrapping_sub(device_addr_start_aligned),
-        );
+        if self.async_buffer_downloads() {
+            self.memory_tracker.mark_region_as_preflushable(
+                device_addr_start_aligned,
+                device_addr_end_aligned.wrapping_sub(device_addr_start_aligned),
+            );
+        }
+        self.forget_read_traps(device_addr_start_aligned,
+            device_addr_end_aligned - device_addr_start_aligned);
 
         Some(RasterizerDownloadArea {
             start_address: device_addr_start_aligned,
             end_address: device_addr_end_aligned,
             preemtive,
         })
+    }
+
+    /// Lichii AsyncBufferDownloads. Keep the existing fence policy for memory
+    /// adapters without read traps and NCE, whose fault path cannot service them.
+    fn async_buffer_downloads(&self) -> bool {
+        !self.gpu_memory.as_ref().is_some_and(|memory| memory.uses_native_tiling())
+            || !self.device_memory.as_ref().is_some_and(|memory| memory.supports_read_traps())
+            || *common::settings::values().cpu_backend.get_value()
+                == common::settings_enums::CpuBackend::Nce
+    }
+
+    pub fn flushes_on_cpu_read(&self) -> bool { !self.async_buffer_downloads() }
+
+    pub fn forget_read_traps(&mut self, address: u64, size: u64) {
+        let begin = address & !(DEVICE_PAGESIZE - 1);
+        let end = (address + size).div_ceil(DEVICE_PAGESIZE) * DEVICE_PAGESIZE;
+        self.read_trapped_ranges.subtract(begin, end - begin);
+    }
+
+    fn arm_read_traps(&mut self, address: u64, size: u64) {
+        let begin = address & !(DEVICE_PAGESIZE - 1);
+        let end = (address + size).div_ceil(DEVICE_PAGESIZE) * DEVICE_PAGESIZE;
+        let memory = self.device_memory.as_ref().expect("read-trap policy needs memory owner");
+        self.read_trapped_ranges.arm_with(begin, end - begin, |part, length| {
+            memory.arm_read_traps(part, length as usize);
+        });
+    }
+
+    fn has_gpu_writes_not_downloaded_at_fence(&mut self, address: u64, size: u64) -> bool {
+        if self.async_buffer_downloads() { return false; }
+        let mut downloads = Vec::new();
+        self.memory_tracker.for_each_download_range(address, size, false,
+            &mut |start, length| downloads.push((start, length)));
+        for (start, length) in downloads {
+            let mut covered = 0;
+            self.memory_tracker.for_each_preflushable_range(start, length, &mut |lower, size| {
+                covered += (lower + size).min(start + length).saturating_sub(lower.max(start));
+            });
+            if covered < length { return true; }
+        }
+        false
+    }
+
+    fn queue_fence_download(&mut self, address: u64, size: u64) {
+        if self.async_buffer_downloads() {
+            self.uncommitted_gpu_modified_ranges.add(address, size as usize);
+            return;
+        }
+        let end = address + size;
+        let mut queued = 0;
+        self.memory_tracker.for_each_preflushable_range(address, size, &mut |begin, length| {
+            let lower = begin.max(address);
+            let upper = (begin + length).min(end);
+            if lower < upper {
+                self.uncommitted_gpu_modified_ranges.add(lower, (upper - lower) as usize);
+                queued += upper - lower;
+            }
+        });
+        if queued < size { self.arm_read_traps(address, size); }
     }
 
     /// Inline a small memory write directly into the buffer.
@@ -904,6 +980,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         cbuf_index: u32,
         cbuf_offset: u32,
         is_written: bool,
+        indirect_offset: u32,
     ) -> bool {
         if stage >= NUM_STAGES as usize || ssbo_index >= NUM_STORAGE_BUFFERS as usize {
             return false;
@@ -940,8 +1017,18 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         //               StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
         let binding = if let Some(maxwell) = self.maxwell3d() {
             let cbuf = maxwell.const_buffer_bindings(stage)[cbuf_index as usize];
-            let ssbo_addr = cbuf.address.wrapping_add(cbuf_offset as u64);
-            self.storage_buffer_binding(ssbo_addr, cbuf_index, is_written)
+            let mut ssbo_addr = cbuf.address.wrapping_add(cbuf_offset as u64);
+            if indirect_offset != u32::MAX {
+                let holder = self.gpu_memory.as_ref().and_then(|gm| gm.read_u64(ssbo_addr)).unwrap_or(0);
+                if holder == 0 {
+                    self.channel_caches.current_channel_state_mut().unwrap().storage_buffers[stage][ssbo_index] = NULL_BINDING;
+                    return false;
+                }
+                ssbo_addr = holder.wrapping_add(u64::from(indirect_offset));
+            }
+            let native = maxwell.get_native_macro_engine_read(|engine| engine.native_turing);
+            self.storage_buffer_binding(ssbo_addr, cbuf_index, is_written,
+                native || indirect_offset != u32::MAX, indirect_offset != u32::MAX, false)
         } else {
             NULL_BINDING
         };
@@ -965,8 +1052,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         cbuf_index: u32,
         cbuf_offset: u32,
         is_written: bool,
+        indirect_offset: u32,
         mut gpu_to_cpu_address: impl FnMut(u64) -> Option<u64>,
         mut get_memory_layout_size: impl FnMut(u64) -> u64,
+        mut max_continuous_range: impl FnMut(u64, u64) -> u64,
         mut read_block: impl FnMut(u64, &mut [u8]) -> bool,
     ) -> bool {
         if stage >= NUM_STAGES as usize || ssbo_index >= NUM_STORAGE_BUFFERS as usize {
@@ -1000,13 +1089,26 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         let binding = if let Some(maxwell) = self.maxwell3d() {
             let cbuf = maxwell.const_buffer_bindings(stage)[cbuf_index as usize];
-            let ssbo_addr = cbuf.address.wrapping_add(cbuf_offset as u64);
+            let mut ssbo_addr = cbuf.address.wrapping_add(cbuf_offset as u64);
+            if indirect_offset != u32::MAX {
+                let mut bytes = [0; 8];
+                let holder = if read_block(ssbo_addr, &mut bytes) { u64::from_le_bytes(bytes) } else { 0 };
+                if holder == 0 {
+                    self.channel_caches.current_channel_state_mut().unwrap().storage_buffers[stage][ssbo_index] = NULL_BINDING;
+                    return false;
+                }
+                ssbo_addr = holder.wrapping_add(u64::from(indirect_offset));
+            }
             self.storage_buffer_binding_with_gpu_reader(
                 ssbo_addr,
                 cbuf_index,
                 is_written,
+                maxwell.get_native_macro_engine_read(|engine| engine.native_turing) || indirect_offset != u32::MAX,
+                indirect_offset != u32::MAX,
+                false,
                 &mut gpu_to_cpu_address,
                 &mut get_memory_layout_size,
+                &mut max_continuous_range,
                 &mut read_block,
             )
         } else {
@@ -1045,6 +1147,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         cbuf_index: u32,
         cbuf_offset: u32,
         is_written: bool,
+        indirect_offset: u32,
+        write_extent: &shader_recompiler::storage_write_extent::StorageWriteExtent,
     ) {
         let limit_dynamic_storage_buffers = self.runtime.should_limit_dynamic_storage_buffers();
         let max_dynamic_storage_buffers = self.runtime.max_dynamic_storage_buffers();
@@ -1089,9 +1193,31 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 .address
                 .wrapping_add(cbuf_offset as u64)
         };
-        let binding = self.storage_buffer_binding(ssbo_addr, cbuf_index, is_written);
+        let engine = self.kepler_compute().expect("bound compute owner");
+        let native = engine.is_native_mode();
+        let qmd = engine.launch_description();
+        let block = [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z];
+        let grid = engine.get_indirect_compute_address().is_none()
+            .then_some([qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z]);
+        let table = indirect_offset != u32::MAX;
+        let holder = if table { self.gpu_memory.as_ref().and_then(|gm| gm.read_u64(ssbo_addr)).unwrap_or(0) } else { 0 };
+        let ssbo_addr = if table { holder.wrapping_add(u64::from(indirect_offset)) } else { ssbo_addr };
+        let binding = if table && holder == 0 { NULL_BINDING } else {
+            self.storage_buffer_binding(ssbo_addr, cbuf_index, is_written, native, table, true)
+        };
+        let mut mark = binding.size;
+        if native && is_written && binding.size != 0 {
+            if let Some(extent) = shader_recompiler::storage_write_extent::resolve_storage_write_extent(write_extent, block, grid) {
+                let pointer = self.gpu_memory.as_ref().and_then(|gm| gm.read_u64(ssbo_addr)).unwrap_or(0);
+                let pad = pointer.saturating_sub(binding.gpu_addr);
+                mark = u64::from(binding.size).min(pad + extent) as u32;
+            }
+        }
         if let Some(cs) = self.channel_caches.current_channel_state_mut() {
             cs.compute_storage_buffers[ssbo_index] = binding;
+            cs.compute_storage_write_marks[ssbo_index] = mark;
+            cs.native_compute_storage_buffers = (cs.native_compute_storage_buffers & !(1 << ssbo_index))
+                | (u32::from(native) << ssbo_index);
         }
     }
 
@@ -1324,7 +1450,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         let mut downloads: SmallVec<[(BufferCopy, BufferId); 16]> = SmallVec::new();
         let mut total_size_bytes = 0u64;
-        let mut _largest_copy = 0u64;
+        let mut largest_copy = 0u64;
         {
             let committed_ranges = &self.committed_gpu_modified_ranges;
             let page_table = &self.page_table[..];
@@ -1369,7 +1495,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                                             const ALIGN: u64 = 64;
                                             const MASK: u64 = !(ALIGN - 1);
                                             total_size_bytes += (new_size + ALIGN - 1) & MASK;
-                                            _largest_copy = _largest_copy.max(new_size);
+                                            largest_copy = largest_copy.max(new_size);
                                         },
                                     );
                                 },
@@ -1384,6 +1510,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         if downloads.is_empty() {
             self.async_buffers.push_back(None);
             return;
+        }
+
+        // Opt-in counterpart of upstream's download byte/copy profiling.
+        static TRACE_DOWNLOADS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("RUZU_TRACE_BUFFER_DOWNLOADS").is_some()
+        });
+        if *TRACE_DOWNLOADS {
+            log::info!("Buffer download batch: bytes={} copies={} largest={}",
+                total_size_bytes, downloads.len(), largest_copy);
         }
 
         // Upstream: allocate staging, copy GPU→staging, track for async pop.
@@ -1565,7 +1700,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             },
         );
         for &(addr, sz) in &tmp_intervals {
-            self.uncommitted_gpu_modified_ranges.add(addr, sz as usize);
+            self.queue_fence_download(addr, sz);
         }
         // Subtraction in this order is important for overlapping copies.
         self.gpu_modified_ranges
@@ -2137,6 +2272,30 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                     .memory_tracker
                     .is_region_gpu_modified(device_addr, size as u64));
 
+        // Temporary bounded read-only diagnostic; remove before delivery.
+        static TRACE: std::sync::LazyLock<Option<(std::path::PathBuf, usize, u32)>> =
+            std::sync::LazyLock::new(|| {
+                let path = std::env::var_os("RUZU_UNIFORM_TRACE_TRIGGER")?;
+                let slot = std::env::var("RUZU_UNIFORM_TRACE_SLOT").ok()?;
+                let (stage, index) = slot.split_once(':')?;
+                Some((path.into(), stage.parse().ok()?, index.parse().ok()?))
+            });
+        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if let Some((path, trace_stage, trace_index)) = TRACE.as_ref() {
+            if stage == *trace_stage && index == *trace_index && path.is_file() {
+                let ordinal = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if ordinal < 256 {
+                    if let Some(dm) = self.device_memory.as_ref() {
+                        let mut bytes = vec![0; size as usize];
+                        dm.read_block_unsafe(device_addr, &mut bytes);
+                        let _ = std::fs::write(path.with_extension(format!("uniform-{ordinal:03}")), bytes);
+                        log::info!("Uniform source probe: ordinal={ordinal} stage={stage} index={index} binding={binding_index} address={device_addr:#x} size={size:#x} fast={use_fast_buffer} gpu_modified={} offset={offset:#x}",
+                            self.memory_tracker.is_region_gpu_modified(device_addr, size as u64));
+                    }
+                }
+            }
+        }
+
         if use_fast_buffer {
             // Upstream fast path: either BindMappedUniformBuffer or PushFastUniformBuffer.
             let mut fast_buffer_bound = false;
@@ -2352,6 +2511,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         binding: &Binding,
         is_written: bool,
         compute: bool,
+        mut write_mark_limit: u64,
     ) -> bool {
         if !self.runtime.supports_multi_range_storage() {
             return false;
@@ -2381,8 +2541,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             }
             let offset = self.slot_buffers[segment.buffer_id].offset(segment.device_addr);
             self.slot_buffers[segment.buffer_id].mark_usage(offset as u64, segment.size as u64);
-            if is_written {
-                self.mark_written_buffer(segment.buffer_id, segment.device_addr, segment.size, false);
+            if is_written && write_mark_limit != 0 {
+                let mark = u64::from(segment.size).min(write_mark_limit) as u32;
+                self.mark_written_buffer(segment.buffer_id, segment.device_addr, mark, false);
+                if write_mark_limit != u64::MAX { write_mark_limit -= u64::from(mark); }
             }
             self.runtime.push_multi_range_source(
                 &self.slot_buffers[segment.buffer_id],
@@ -2407,7 +2569,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
             let is_written = ((written_mask >> idx) & 1) != 0;
-            if self.bind_multi_range_storage(&binding, is_written, false) {
+            if self.bind_multi_range_storage(&binding, is_written, false, u64::MAX) {
                 return;
             }
             self.touch_buffer(binding.buffer_id);
@@ -2589,12 +2751,15 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let mask = cs.enabled_compute_storage_buffers;
         let written_mask = cs.written_compute_storage_buffers;
         let bindings = cs.compute_storage_buffers;
+        let write_marks = cs.compute_storage_write_marks;
+        let native_mask = cs.native_compute_storage_buffers;
 
         let mut binding_index = 0u32;
         Self::for_each_enabled_bit(mask, |idx| {
             let binding = bindings[idx as usize];
             let is_written = ((written_mask >> idx) & 1) != 0;
-            if self.bind_multi_range_storage(&binding, is_written, true) {
+            let write_limit = if native_mask & (1 << idx) != 0 { u64::from(write_marks[idx as usize]) } else { u64::MAX };
+            if self.bind_multi_range_storage(&binding, is_written, true, write_limit) {
                 return;
             }
             self.touch_buffer(binding.buffer_id);
@@ -2603,8 +2768,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             let offset = self.slot_buffers[binding.buffer_id].offset(binding.device_addr);
             self.slot_buffers[binding.buffer_id].mark_usage(offset as u64, binding.size as u64);
 
-            if is_written {
-                self.mark_written_buffer(binding.buffer_id, binding.device_addr, binding.size, true);
+            let mark = if is_written { u64::from(binding.size).min(write_limit) as u32 } else { 0 };
+            if mark != 0 {
+                self.mark_written_buffer(binding.buffer_id, binding.device_addr, mark, true);
             }
 
             let buffer = &mut self.slot_buffers[binding.buffer_id];
@@ -3390,8 +3556,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.memory_tracker
             .mark_region_as_gpu_modified(device_addr, size as u64);
         self.gpu_modified_ranges.add(device_addr, size as usize);
-        self.uncommitted_gpu_modified_ranges
-            .add(device_addr, size as usize);
+        self.queue_fence_download(device_addr, size as u64);
     }
 
     /// Find or create a buffer covering `[device_addr, device_addr+size)`.
@@ -3931,6 +4096,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     ///
     /// Upstream: `BufferCache<P>::DeleteBuffer`
     fn delete_buffer(&mut self, buffer_id: BufferId, do_not_mark: bool) {
+        self.read_trapped_ranges.subtract(self.slot_buffers[buffer_id].cpu_addr(),
+            self.slot_buffers[buffer_id].size_bytes() as u64);
         // Upstream: `if constexpr (requires { runtime.OnBufferDeleted(buffer); })`.
         self.runtime.on_buffer_deleted(&self.slot_buffers[buffer_id]);
         let Some(cs) = self.channel_caches.current_channel_state_mut() else {
@@ -4026,7 +4193,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Build a storage buffer binding from a GPU virtual SSBO address.
     ///
     /// Upstream: `BufferCache<P>::StorageBufferBinding`
-    fn storage_buffer_binding(&self, ssbo_addr: u64, cbuf_index: u32, is_written: bool) -> Binding {
+    fn storage_buffer_binding(&self, ssbo_addr: u64, cbuf_index: u32, is_written: bool,
+        native_pointer: bool, table_pointer: bool, compute: bool) -> Binding {
         let Some(ref gm) = self.gpu_memory else {
             log::warn!(
                 "storage_buffer_binding: gpu_memory not available for cbuf_index {}",
@@ -4061,8 +4229,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             ssbo_addr,
             cbuf_index,
             is_written,
+            native_pointer,
+            table_pointer,
+            compute,
             |gpu_addr| gm.gpu_to_cpu_address(gpu_addr),
             |gpu_addr| gm.get_memory_layout_size(gpu_addr),
+            |gpu_addr, size| gm.max_continuous_range(gpu_addr, size),
             |gpu_addr, out| match out.len() {
                 4 => {
                     let Some(value) = read_u32(gpu_addr) else {
@@ -4088,8 +4260,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         ssbo_addr: u64,
         cbuf_index: u32,
         is_written: bool,
+        native_pointer: bool,
+        table_pointer: bool,
+        compute: bool,
         mut gpu_to_cpu_address: impl FnMut(u64) -> Option<u64>,
         mut get_memory_layout_size: impl FnMut(u64) -> u64,
+        mut max_continuous_range: impl FnMut(u64, u64) -> u64,
         mut read_block: impl FnMut(u64, &mut [u8]) -> bool,
     ) -> Binding {
         let mut gpu_addr_bytes = [0u8; 8];
@@ -4101,13 +4277,12 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             return NULL_BINDING;
         }
 
-        // Upstream accepts the next qword as a packed size only when its high
-        // half is zero and the size fits in the mapped memory layout. This is
-        // independent of the constant-buffer index.
-        let size = {
-            let memory_layout_size = get_memory_layout_size(gpu_addr) as u32;
+        // Lichii StorageBufferBinding: native pointers carry no NVN size field.
+        let mut size = {
+            let memory_layout_size = get_memory_layout_size(gpu_addr).min(u64::from(u32::MAX)) as u32;
             let mut next_qword_bytes = [0u8; 8];
-            let next_qword = if read_block(ssbo_addr.wrapping_add(8), &mut next_qword_bytes) {
+            let reads_size_word = !(table_pointer && !is_written) && (!native_pointer || (compute && !is_written));
+            let next_qword = if reads_size_word && read_block(ssbo_addr.wrapping_add(8), &mut next_qword_bytes) {
                 u64::from_le_bytes(next_qword_bytes)
             } else {
                 0
@@ -4116,12 +4291,27 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             let next_qword_is_size = (next_qword >> 32) as u32 == 0
                 && packed_size != 0
                 && packed_size <= memory_layout_size;
-            if next_qword_is_size {
+            let reach = self.runtime.get_max_storage_buffer_range().min(1 << 30);
+            let limit = (reach - reach.min(64 * 1024)) as u32;
+            if table_pointer && !is_written {
+                memory_layout_size.min(limit)
+            } else if native_pointer {
+                let bare = memory_layout_size.min(8 * 1024 * 1024);
+                if compute && !is_written && next_qword_is_size && packed_size > bare {
+                    packed_size.min(limit)
+                } else {
+                    bare
+                }
+            } else if next_qword_is_size {
                 packed_size
             } else {
                 memory_layout_size.min(8 * 1024 * 1024)
             }
         };
+
+        if (native_pointer || table_pointer) && size != 0 {
+            size = max_continuous_range(gpu_addr, u64::from(size)) as u32;
+        }
 
         // Upstream: alignment only applies to the offset of the buffer.
         let alignment = self.runtime.get_storage_buffer_alignment();
@@ -4366,6 +4556,106 @@ mod tests {
     }
 
     struct IdentityGpuMemory;
+
+    struct NativeGpuMemory;
+    impl GpuMemoryAccess for NativeGpuMemory {
+        fn uses_native_tiling(&self) -> bool { true }
+        fn gpu_to_cpu_address(&self, address: u64) -> Option<u64> { Some(address) }
+        fn read_u64(&self, _: u64) -> Option<u64> { None }
+        fn read_u32(&self, _: u64) -> Option<u32> { None }
+        fn is_within_gpu_address_range(&self, _: u64) -> bool { true }
+        fn max_continuous_range(&self, _: u64, size: u64) -> u64 { size }
+        fn get_memory_layout_size(&self, _: u64) -> u64 { 0x20000 }
+    }
+
+    struct TrappedMemory {
+        memory: SharedDeviceMemory,
+        traps: Arc<std::sync::Mutex<Vec<(u64, usize)>>>,
+    }
+
+    #[test]
+    fn gpu_memory_adapter_replacement_and_clear_hold_cache_lock() {
+        struct LockCheckedMemory(Arc<ReentrantMutex<()>>);
+        impl Drop for LockCheckedMemory {
+            fn drop(&mut self) {
+                let mutex = Arc::clone(&self.0);
+                // Reentrant acquisition on this thread would hide a missing lock.
+                assert!(std::thread::spawn(move || mutex.try_lock().is_none())
+                    .join().unwrap(), "adapter destruction must exclude CPU flush readers");
+            }
+        }
+        impl GpuMemoryAccess for LockCheckedMemory {
+            fn gpu_to_cpu_address(&self, _: u64) -> Option<u64> { None }
+            fn read_u64(&self, _: u64) -> Option<u64> { None }
+            fn read_u32(&self, _: u64) -> Option<u32> { None }
+            fn is_within_gpu_address_range(&self, _: u64) -> bool { false }
+            fn max_continuous_range(&self, _: u64, _: u64) -> u64 { 0 }
+            fn get_memory_layout_size(&self, _: u64) -> u64 { 0 }
+        }
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker, TestBufferCacheRuntime::default());
+        cache.set_gpu_memory(Box::new(LockCheckedMemory(Arc::clone(&cache.mutex))));
+        cache.set_gpu_memory(Box::new(LockCheckedMemory(Arc::clone(&cache.mutex))));
+        cache.clear_gpu_memory();
+        assert!(cache.gpu_memory.is_none());
+    }
+    impl DeviceMemoryAccess for TrappedMemory {
+        fn supports_read_traps(&self) -> bool { true }
+        fn arm_read_traps(&self, address: u64, size: usize) {
+            self.traps.lock().unwrap().push((address, size));
+        }
+        fn get_pointer(&self, address: u64) -> Option<*const u8> { self.memory.get_pointer(address) }
+        fn read_block_unsafe(&self, address: u64, dst: &mut [u8]) { self.memory.read_block_unsafe(address, dst); }
+        fn write_block_unsafe(&self, address: u64, src: &[u8]) { self.memory.write_block_unsafe(address, src); }
+    }
+
+    #[test]
+    fn native_gpu_writes_download_on_read_and_rearm_after_consumption() {
+        const CHILD: &str = "RUZU_TEST_DEMAND_DOWNLOAD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "buffer_cache::buffer_cache::tests::native_gpu_writes_download_on_read_and_rearm_after_consumption"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker, TestBufferCacheRuntime::default());
+        let bytes = Arc::new(parking_lot::Mutex::new(vec![0; 0x20000]));
+        let traps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        cache.set_gpu_memory(Box::new(NativeGpuMemory));
+        cache.set_device_memory(Box::new(TrappedMemory {
+            memory: SharedDeviceMemory { bytes: bytes.clone() }, traps: traps.clone(),
+        }));
+        let address = 0x10000;
+        let id = cache.create_buffer(address, 0x3000, false);
+        cache.memory_tracker.unmark_region_as_cpu_modified(address, 0x3000);
+        let payload = [0x12, 0x34, 0x56, 0x78];
+        let offset = cache.slot_buffers[id].offset(address);
+        cache.slot_buffers[id].immediate_upload(offset as u64, &payload);
+        cache.mark_written_buffer(id, address, 4, true);
+        assert!(cache.uncommitted_gpu_modified_ranges.empty());
+        assert_eq!(*traps.lock().unwrap(), [(address, 0x1000)]);
+        cache.mark_written_buffer(id, address, 4, true);
+        assert_eq!(traps.lock().unwrap().len(), 1);
+        assert!(!cache.get_flush_area(address, 4).unwrap().preemtive);
+        cache.download_memory(address, 4);
+        assert_eq!(&bytes.lock()[address as usize..address as usize + 4], &payload);
+        cache.mark_written_buffer(id, address, 4, true);
+        assert_eq!(traps.lock().unwrap().len(), 2);
+        // Only the preflushable middle page is queued, not the complete write.
+        cache.memory_tracker.mark_region_as_preflushable(address + 0x1000, 0x1000);
+        cache.mark_written_buffer(id, address, 0x3000, true);
+        let mut queued = Vec::new();
+        cache.uncommitted_gpu_modified_ranges.for_each(|start, end| queued.push((start, end)));
+        assert_eq!(queued, [(address + 0x1000, address + 0x2000)]);
+        assert!(!cache.get_flush_area(address + 0x800, 0x1800).unwrap().preemtive);
+        cache.uncommitted_gpu_modified_ranges.clear();
+        cache.set_gpu_memory(Box::new(IdentityGpuMemory));
+        cache.mark_written_buffer(id, address, 4, true);
+        assert!(!cache.uncommitted_gpu_modified_ranges.empty(), "legacy channels keep fence downloads");
+    }
 
     impl GpuMemoryAccess for IdentityGpuMemory {
         fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
@@ -5071,6 +5361,27 @@ mod tests {
         cache.bind_host_compute_storage_buffers();
         assert_eq!(cache.slot_buffers[id].write_tick(), 23);
         assert!(cache.is_region_gpu_modified(address, 4));
+    }
+
+    #[test]
+    fn compute_storage_write_extent_limits_dirty_range_not_binding_size() {
+        for (native, mark) in [(true, 0), (true, 0x1000), (false, 0x1000)] {
+            let tracker = DummyTracker;
+            let mut cache = BufferCache::<TestParams, DummyTracker>::new(&tracker, TestBufferCacheRuntime::default());
+            bind_test_channel(&mut cache, 18);
+            let address = 0x10000;
+            let id = cache.create_buffer(address, 0x4000, false);
+            let cs = cache.channel_caches.current_channel_state_mut().unwrap();
+            cs.enabled_compute_storage_buffers = 1;
+            cs.written_compute_storage_buffers = 1;
+            cs.native_compute_storage_buffers = u32::from(native);
+            cs.compute_storage_write_marks[0] = mark;
+            cs.compute_storage_buffers[0] = Binding { buffer_id: id, device_addr: address, size: 0x4000, ..NULL_BINDING };
+            cache.bind_host_compute_storage_buffers();
+            assert_eq!(cache.is_region_gpu_modified(address, 1), !native || mark != 0);
+            assert_eq!(cache.is_region_gpu_modified(address + 0x2000, 1), !native);
+            assert_eq!(cache.current_channel_state().unwrap().compute_storage_buffers[0].size, 0x4000);
+        }
     }
 
     #[test]
@@ -5811,8 +6122,8 @@ mod tests {
             cs.total_compute_storage_buffers = 1;
         }
 
-        assert!(!cache.bind_graphics_storage_buffer(0, 0, 0, 0, false));
-        cache.bind_compute_storage_buffer(0, 0, 0, false);
+        assert!(!cache.bind_graphics_storage_buffer(0, 0, 0, 0, false, u32::MAX));
+        cache.bind_compute_storage_buffer(0, 0, 0, false, u32::MAX, &Default::default());
 
         let cs = cache.current_channel_state().unwrap();
         assert_eq!(cs.enabled_storage_buffers[0], 0);
@@ -5892,8 +6203,10 @@ mod tests {
             ssbo_addr,
             cbuf_index,
             true,
+            false, false, false,
             Some,
             |_| 0x1000,
+            |_, size| size,
             |address, output| {
                 let value = if address == ssbo_addr {
                     gpu_addr
@@ -5909,6 +6222,43 @@ mod tests {
     }
 
     #[test]
+    fn storage_binding_distinguishes_native_pointers_from_legacy_descriptors() {
+        let tracker = DummyTracker;
+        let cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker, TestBufferCacheRuntime::default());
+        let bind = |native, table, compute, written, next: u64, layout: u64, continuous: u64| {
+            let mut size_reads = 0;
+            let binding = cache.storage_buffer_binding_with_gpu_reader(
+                0x8000, 0, written, native, table, compute,
+                Some, |_| layout, |_, size| size.min(continuous),
+                |address, out| {
+                    let value = if address == 0x8000 { 0x20000u64 } else {
+                        assert_eq!(address, 0x8008);
+                        size_reads += 1;
+                        next
+                    };
+                    out.copy_from_slice(&value.to_le_bytes());
+                    true
+                });
+            (binding.size, size_reads)
+        };
+        let mib = 1024 * 1024;
+        // Legacy written sizes still use the descriptor; large mappings do not wrap u32.
+        assert_eq!(bind(false, false, false, true, 128, 16 * mib, u64::MAX), (128, 1));
+        assert_eq!(bind(false, false, false, true, 128, 1 << 32, u64::MAX), (128, 1));
+        // Native stores and graphics reads must not inspect the adjacent scalar as a size.
+        assert_eq!(bind(true, false, true, true, 128, 16 * mib, u64::MAX), (8 * mib as u32, 0));
+        assert_eq!(bind(true, false, false, false, 128, 16 * mib, u64::MAX), (8 * mib as u32, 0));
+        assert_eq!(bind(true, false, true, false, 128, 16 * mib, u64::MAX), (8 * mib as u32, 1));
+        assert_eq!(bind(true, false, true, false, 12 * mib, 16 * mib, u64::MAX), (12 * mib as u32, 1));
+        // Native bindings stop at mapping discontinuities before alignment/dirty tracking.
+        assert_eq!(bind(true, false, true, true, 128, 16 * mib, 4096), (4096, 0));
+        // Read-only object tables can exceed 8 MiB but reserve host alignment headroom.
+        assert_eq!(bind(true, true, true, false, 128, 16 * mib, u64::MAX), (16 * mib as u32, 0));
+        assert_eq!(bind(true, true, true, false, 128, 2 << 30, u64::MAX), ((1 << 30) - 65536, 0));
+    }
+
+    #[test]
     #[should_panic(expected = "Unaligned storage buffer address not found for cbuf index 3")]
     fn storage_buffer_asserts_inconsistent_unaligned_mapping_like_upstream() {
         let tracker = DummyTracker;
@@ -5916,9 +6266,10 @@ mod tests {
             &tracker, TestBufferCacheRuntime::default(),
         );
         cache.storage_buffer_binding_with_gpu_reader(
-            0x8000, 3, false,
+            0x8000, 3, false, false, false, false,
             |address| (address == 0x1200).then_some(address),
             |_| 0x1000,
+            |_, size| size,
             |address, output| {
                 let value: u64 = if address == 0x8000 { 0x1234 } else { 0x80 };
                 output.copy_from_slice(&value.to_le_bytes());

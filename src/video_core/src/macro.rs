@@ -2970,8 +2970,31 @@ impl MacroEngine {
         let mut memo = None;
         let mut writes = std::mem::take(&mut (*engine).native_writes);
         let read_memory = std::cell::Cell::new(false);
+        // Temporary bounded investigation probe; remove before delivery.
+        static CLEAR_TRIGGER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+        static CLEAR_CALLS: AtomicU32 = AtomicU32::new(0);
+        let trace_clear = CLEAR_TRIGGER.get_or_init(||
+            std::env::var_os("RUZU_CLEAR_TRACE_TRIGGER").map(Into::into))
+            .as_ref().is_some_and(|path| path.is_file())
+            && CLEAR_CALLS.load(Ordering::Relaxed) < 128;
+        let trace_parameters = trace_clear.then(|| parameters.to_vec());
+        if trace_clear {
+            static DUMPED: OnceLock<()> = OnceLock::new();
+            DUMPED.get_or_init(|| {
+                if let Some(path) = CLEAR_TRIGGER.get().and_then(Option::as_ref) {
+                    if let Ok(mut file) = std::fs::File::create(path.with_extension("mme-code")) {
+                        for word in &(*engine).native_code {
+                            let _ = file.write_all(&word.to_le_bytes());
+                        }
+                    }
+                }
+            });
+        }
         let mut emit = |address: u32, value: u32, fifo: &mut Vec<u32>, ram: &mut DataRam| -> bool {
             if address >= 0xe00 { return false; }
+            if address == 0x674 && trace_clear && CLEAR_CALLS.fetch_add(1, Ordering::Relaxed) < 128 {
+                log::info!("Clear macro probe: start={method:#x} value={value:#x} parameters={trace_parameters:08x?}");
+            }
             if address == 0x556 {
                 static MODES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
                 static ENABLE_WRITES: AtomicU64 = AtomicU64::new(0);

@@ -61,6 +61,17 @@ pub enum Zone {
     BufUpdateStorage,
     BindUniform,
     BindStorage,
+    SplitCallback,
+    FenceCacheCommit,
+    FenceQueryCommit,
+    FenceInvalidate,
+    Composite,
+    CompositeCapture,
+    CompositeAcquire,
+    CompositeDraw,
+    CompositeSubmit,
+    CompositePresent,
+    CompositeEnd,
     Count,
 }
 
@@ -111,6 +122,17 @@ pub const ZONE_NAMES: [&str; Zone::Count as usize] = [
     "buf update storage",
     "bind uniform",
     "bind storage",
+    "split callback",
+    "fence cache commit",
+    "fence query commit",
+    "fence invalidate",
+    "composite",
+    "composite capture",
+    "composite acquire",
+    "composite draw",
+    "composite submit",
+    "composite present",
+    "composite end",
 ];
 
 /// Cumulative shader frontend translation time across all threads, in
@@ -427,5 +449,22 @@ mod tests {
         .unwrap();
         assert_eq!(data().counters[4], 1);
         assert_eq!(ZONE_NAMES[Zone::SplitWait as usize], "split wait");
+    }
+
+    #[test]
+    fn split_callback_excludes_nested_fence_wait() {
+        let _fixture = Fixture::new(true, 100);
+        let callback = Scope::new(Zone::SplitCallback);
+        time(110);
+        let wait = Scope::new(Zone::FenceHostWait);
+        time(180);
+        drop(wait);
+        time(200);
+        drop(callback);
+        let d = data();
+        assert_eq!(d.exclusive_ns[Zone::SplitCallback as usize], 30);
+        assert_eq!(d.exclusive_ns[Zone::FenceHostWait as usize], 70);
+        assert_eq!(d.child_ns, 100);
+        assert_eq!(ZONE_NAMES[Zone::SplitCallback as usize], "split callback");
     }
 }

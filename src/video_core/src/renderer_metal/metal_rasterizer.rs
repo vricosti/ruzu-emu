@@ -375,6 +375,9 @@ struct GpuMemoryAccessAdapter {
 }
 
 impl GpuMemoryAccess for GpuMemoryAccessAdapter {
+    fn uses_native_tiling(&self) -> bool {
+        self.memory_manager.lock().uses_native_tiling()
+    }
     fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
         self.memory_manager.lock().gpu_to_cpu_address(gpu_addr)
     }
@@ -427,6 +430,11 @@ impl crate::query_cache::query_cache::GpuAddressTranslator for GpuMemoryAccessAd
 }
 
 impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
+    fn supports_read_traps(&self) -> bool { true }
+
+    fn arm_read_traps(&self, device_addr: u64, size: usize) {
+        self.device_memory.arm_read_traps(device_addr, size);
+    }
     fn get_pointer(&self, device_addr: u64) -> Option<*const u8> {
         let pointer = self.device_memory.get_pointer(device_addr);
         (!pointer.is_null()).then_some(pointer)
@@ -2587,11 +2595,29 @@ impl RasterizerInterface for MetalRasterizer {
     }
 
     fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
+        let texture_area = {
         let mutex: *const _ = &self.texture_cache.base.mutex;
         let _guard = unsafe { (*mutex).lock() };
         let cache = &*self.texture_cache as *const MetalTextureCache as *mut MetalTextureCache;
-        if let Some(area) = unsafe { (*cache).base.get_flush_area(addr, size as usize) } {
-            return area;
+        unsafe { (*cache).base.get_flush_area(addr, size as usize) }
+        };
+        unsafe {
+            let mutex: *const _ = &self.common_buffer_cache.mutex;
+            let _guard = (*mutex).lock();
+            let cache = std::ptr::from_ref(&*self.common_buffer_cache).cast_mut();
+            if let Some(area) = texture_area {
+                (*cache).forget_read_traps(area.start_address, area.end_address - area.start_address);
+                return area;
+            }
+            if (*cache).flushes_on_cpu_read() {
+                if let Some(area) = (*cache).get_flush_area(addr, size) {
+                    return RasterizerDownloadArea {
+                        start_address: area.start_address,
+                        end_address: area.end_address,
+                        preemtive: area.preemtive,
+                    };
+                }
+            }
         }
         const PAGE: u64 = 4096;
         RasterizerDownloadArea {

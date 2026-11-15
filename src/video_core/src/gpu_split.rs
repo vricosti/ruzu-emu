@@ -420,6 +420,10 @@ impl GpuSplitBack {
                 data + (amount as usize).div_ceil(2)
             }
             4 => {
+                // Diagnostic only: callbacks include synchronization not charged
+                // to engine Method scopes. Keep their nested zones exclusive.
+                let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::SplitCallback);
+                let trace_start = crate::nx2_profile::enabled().then(std::time::Instant::now);
                 let payload = ((head >> 8) & 0xffffff) as usize;
                 let thunk = unsafe { entry.add(1).cast::<CallThunk>().read() };
                 if head & OWNED_CALL == 0 {
@@ -429,6 +433,14 @@ impl GpuSplitBack {
                     // The owned thunk clears its slot before calling user code.
                     // A panic cannot leave a stale pointer for cancellation.
                     unsafe { thunk(entry.add(2)); }
+                }
+                if let Some(start) = trace_start {
+                    let elapsed = start.elapsed();
+                    if elapsed >= std::time::Duration::from_millis(5) {
+                        // Resolve this code address against the running binary's
+                        // mappings; never log callback payloads or guest data.
+                        log::info!("GPU split slow callback {:p}: {} us", thunk as *const (), elapsed.as_micros());
+                    }
                 }
                 2 + payload
             }

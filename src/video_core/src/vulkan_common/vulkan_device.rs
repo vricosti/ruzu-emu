@@ -153,6 +153,84 @@ unsafe fn link_next<Root: vk::TaggedStructure, Ext: vk::TaggedStructure>(
     (*root_base).p_next = next_base;
 }
 
+/// Keep Ruzu's core-1.2 features without duplicating their extension structs.
+/// Upstream queries individual extension structs only. Ruzu additionally needs
+/// core shaderOutputLayer; VUID-VkDeviceCreateInfo-pNext-02830 forbids submitting
+/// both representations. The individually filtered driver policy wins.
+///
+/// # Safety
+/// Every node must be live, writable, correctly tagged and exclusively accessible
+/// through this acyclic chain, as for `link_next`. No node is moved or freed.
+unsafe fn coalesce_vulkan12_features(root: &mut vk::PhysicalDeviceFeatures2) {
+    let mut aggregate = root.p_next.cast::<vk::BaseOutStructure>();
+    while !aggregate.is_null()
+        && (*aggregate).s_type != vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+    {
+        aggregate = (*aggregate).p_next;
+    }
+    if aggregate.is_null() {
+        return;
+    }
+    let aggregate = aggregate.cast::<vk::PhysicalDeviceVulkan12Features>();
+    let mut previous = (root as *mut vk::PhysicalDeviceFeatures2).cast::<vk::BaseOutStructure>();
+    let mut node = (*previous).p_next;
+    while !node.is_null() {
+        let mut promoted = false;
+        macro_rules! merge {
+            ($ty:ident, $($field:ident),+ $(,)?) => {
+                if (*node).s_type == <vk::$ty as vk::TaggedStructure>::STRUCTURE_TYPE {
+                    let source = node.cast::<vk::$ty>();
+                    $((*aggregate).$field = (*source).$field;)+
+                    promoted = true;
+                }
+            };
+        }
+        merge!(PhysicalDevice8BitStorageFeatures, storage_buffer8_bit_access,
+            uniform_and_storage_buffer8_bit_access, storage_push_constant8);
+        merge!(PhysicalDeviceShaderAtomicInt64Features, shader_buffer_int64_atomics,
+            shader_shared_int64_atomics);
+        merge!(PhysicalDeviceShaderFloat16Int8Features, shader_float16, shader_int8);
+        merge!(PhysicalDeviceDescriptorIndexingFeatures,
+            shader_input_attachment_array_dynamic_indexing,
+            shader_uniform_texel_buffer_array_dynamic_indexing,
+            shader_storage_texel_buffer_array_dynamic_indexing,
+            shader_uniform_buffer_array_non_uniform_indexing,
+            shader_sampled_image_array_non_uniform_indexing,
+            shader_storage_buffer_array_non_uniform_indexing,
+            shader_storage_image_array_non_uniform_indexing,
+            shader_input_attachment_array_non_uniform_indexing,
+            shader_uniform_texel_buffer_array_non_uniform_indexing,
+            shader_storage_texel_buffer_array_non_uniform_indexing,
+            descriptor_binding_uniform_buffer_update_after_bind,
+            descriptor_binding_sampled_image_update_after_bind,
+            descriptor_binding_storage_image_update_after_bind,
+            descriptor_binding_storage_buffer_update_after_bind,
+            descriptor_binding_uniform_texel_buffer_update_after_bind,
+            descriptor_binding_storage_texel_buffer_update_after_bind,
+            descriptor_binding_update_unused_while_pending,
+            descriptor_binding_partially_bound,
+            descriptor_binding_variable_descriptor_count, runtime_descriptor_array);
+        merge!(PhysicalDeviceScalarBlockLayoutFeatures, scalar_block_layout);
+        merge!(PhysicalDeviceImagelessFramebufferFeatures, imageless_framebuffer);
+        merge!(PhysicalDeviceUniformBufferStandardLayoutFeatures, uniform_buffer_standard_layout);
+        merge!(PhysicalDeviceShaderSubgroupExtendedTypesFeatures, shader_subgroup_extended_types);
+        merge!(PhysicalDeviceSeparateDepthStencilLayoutsFeatures, separate_depth_stencil_layouts);
+        merge!(PhysicalDeviceHostQueryResetFeatures, host_query_reset);
+        merge!(PhysicalDeviceTimelineSemaphoreFeatures, timeline_semaphore);
+        merge!(PhysicalDeviceBufferDeviceAddressFeatures, buffer_device_address,
+            buffer_device_address_capture_replay, buffer_device_address_multi_device);
+        merge!(PhysicalDeviceVulkanMemoryModelFeatures, vulkan_memory_model,
+            vulkan_memory_model_device_scope, vulkan_memory_model_availability_visibility_chains);
+        let next = (*node).p_next;
+        if promoted {
+            (*previous).p_next = next;
+        } else {
+            previous = node;
+        }
+        node = next;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FormatType — port of `Vulkan::FormatType`
 // ---------------------------------------------------------------------------
@@ -1729,9 +1807,9 @@ impl Device {
             .map(|name| name.as_ptr())
             .collect();
 
-        // Match upstream: reuse the exact feature chain returned by
-        // vkGetPhysicalDeviceFeatures2. Rebuilding it loses core/promoted features and
-        // copying an individual node also copies its linked pNext chain.
+        // Retain queried/filtered features, but submit only one representation
+        // of core-1.2 features. The stack-owned nodes remain live through creation.
+        unsafe { coalesce_vulkan12_features(&mut features2) };
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&enabled_extension_ptrs);
@@ -1769,11 +1847,9 @@ impl Device {
         let mut allocator_info =
             vk_mem::AllocatorCreateInfo::new(&instance, &logical.device, physical);
         allocator_info.flags = allocator_flags;
-        allocator_info.preferred_large_heap_block_size = if is_integrated {
-            64 * 1024 * 1024
-        } else {
-            256 * 1024 * 1024
-        };
+        // Lichii Device: smaller blocks limit retained holes as cached images
+        // and buffers are freed. Apply the same policy to discrete GPUs too.
+        allocator_info.preferred_large_heap_block_size = 16 * 1024 * 1024;
         allocator_info.vulkan_api_version = vma_api_version(device_properties.api_version);
         // SAFETY: instance, device and physical device outlive the allocator
         // (it is dropped with this `Device`, see `Drop`).
@@ -4628,6 +4704,86 @@ mod tests {
 
         assert_eq!(limits.max_vertex_input_attributes, 16);
         assert_eq!(limits.max_vertex_input_bindings, 16);
+    }
+
+    #[test]
+    fn vulkan12_coalescing_preserves_filtered_policy_and_unrelated_nodes() {
+        let mut root = vk::PhysicalDeviceFeatures2::default();
+        let mut core = vk::PhysicalDeviceVulkan12Features::default()
+            .shader_float16(true).shader_output_layer(true).runtime_descriptor_array(true);
+        let mut float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_int8(true);
+        let mut indexing = vk::PhysicalDeviceDescriptorIndexingFeatures::default()
+            .descriptor_binding_partially_bound(true);
+        let mut storage16 = vk::PhysicalDevice16BitStorageFeatures::default()
+            .storage_buffer16_bit_access(true);
+        // Link interleaved nodes and keep an unrelated Vulkan1.1 feature.
+        unsafe {
+            link_next(&mut root, &mut float16);
+            link_next(&mut root, &mut core);
+            link_next(&mut root, &mut storage16);
+            link_next(&mut root, &mut indexing);
+            coalesce_vulkan12_features(&mut root);
+        }
+        assert_eq!(core.shader_float16, vk::FALSE);
+        assert_eq!(core.shader_int8, vk::TRUE);
+        assert_eq!(core.runtime_descriptor_array, vk::FALSE);
+        assert_eq!(core.descriptor_binding_partially_bound, vk::TRUE);
+        assert_eq!(core.shader_output_layer, vk::TRUE);
+        assert_eq!(root.p_next, (&mut storage16 as *mut vk::PhysicalDevice16BitStorageFeatures).cast());
+        assert_eq!(storage16.p_next, (&mut core as *mut vk::PhysicalDeviceVulkan12Features).cast());
+        assert!(core.p_next.is_null());
+        unsafe { coalesce_vulkan12_features(&mut root) };
+        assert_eq!(core.shader_float16, vk::FALSE);
+        assert!(core.p_next.is_null());
+    }
+
+    #[test]
+    fn vulkan12_coalescing_leaves_extension_only_devices_unchanged() {
+        let mut root = vk::PhysicalDeviceFeatures2::default();
+        let mut float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
+        let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+        unsafe {
+            link_next(&mut root, &mut timeline);
+            link_next(&mut root, &mut float16);
+            coalesce_vulkan12_features(&mut root);
+        }
+        assert_eq!(root.p_next, (&mut float16 as *mut vk::PhysicalDeviceShaderFloat16Int8Features).cast());
+        assert_eq!(float16.p_next, (&mut timeline as *mut vk::PhysicalDeviceTimelineSemaphoreFeatures).cast());
+        assert_eq!(float16.shader_float16, vk::TRUE);
+        assert_eq!(timeline.timeline_semaphore, vk::TRUE);
+    }
+
+    #[test]
+    fn vulkan12_coalescing_covers_every_forbidden_constituent() {
+        macro_rules! check {
+            ($ty:ident, $field:ident) => {{
+                let mut root = vk::PhysicalDeviceFeatures2::default();
+                let mut core = vk::PhysicalDeviceVulkan12Features::default();
+                let mut extension = vk::$ty::default();
+                extension.$field = vk::TRUE;
+                unsafe {
+                    link_next(&mut root, &mut core);
+                    link_next(&mut root, &mut extension);
+                    coalesce_vulkan12_features(&mut root);
+                }
+                assert_eq!(core.$field, vk::TRUE, stringify!($ty));
+                assert_eq!(root.p_next, (&mut core as *mut vk::PhysicalDeviceVulkan12Features).cast());
+                assert!(core.p_next.is_null());
+            }};
+        }
+        check!(PhysicalDevice8BitStorageFeatures, storage_push_constant8);
+        check!(PhysicalDeviceShaderAtomicInt64Features, shader_shared_int64_atomics);
+        check!(PhysicalDeviceShaderFloat16Int8Features, shader_int8);
+        check!(PhysicalDeviceDescriptorIndexingFeatures, runtime_descriptor_array);
+        check!(PhysicalDeviceScalarBlockLayoutFeatures, scalar_block_layout);
+        check!(PhysicalDeviceImagelessFramebufferFeatures, imageless_framebuffer);
+        check!(PhysicalDeviceUniformBufferStandardLayoutFeatures, uniform_buffer_standard_layout);
+        check!(PhysicalDeviceShaderSubgroupExtendedTypesFeatures, shader_subgroup_extended_types);
+        check!(PhysicalDeviceSeparateDepthStencilLayoutsFeatures, separate_depth_stencil_layouts);
+        check!(PhysicalDeviceHostQueryResetFeatures, host_query_reset);
+        check!(PhysicalDeviceTimelineSemaphoreFeatures, timeline_semaphore);
+        check!(PhysicalDeviceBufferDeviceAddressFeatures, buffer_device_address_multi_device);
+        check!(PhysicalDeviceVulkanMemoryModelFeatures, vulkan_memory_model_device_scope);
     }
 
     #[test]

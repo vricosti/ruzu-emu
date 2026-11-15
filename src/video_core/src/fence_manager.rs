@@ -216,6 +216,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         FINV: FnMut(),
         FPW: FnMut() -> bool,
     {
+        let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::Fence);
         let delay_fence = {
             let values = settings::values();
             if settings::is_gpu_fence_behavior_default(&values) {
@@ -239,17 +240,24 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
             });
         }
 
-        let cache_flushes = commit_cache_flushes();
+        let cache_flushes = {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::FenceCacheCommit);
+            commit_cache_flushes()
+        };
         let committed_flushes = cache_flushes.committed;
         if !delay_fence && committed_flushes == 0 && self.skip_empty_fence(&mut has_pending_fence_work) {
             let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::FenceSkipped);
             func();
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::FenceInvalidate);
             invalidate_gpu_cache();
             return;
         }
         self.skipped_fences = 0;
         // Query flushes are committed once per real fence, after the caches.
-        let query_flush = commit_async_flushes();
+        let query_flush = {
+            let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::FenceQueryCommit);
+            commit_async_flushes()
+        };
         let should_flush_now = cache_flushes.should_flush || query_flush;
 
         let mut new_fence = create_fence(!should_flush_now);
@@ -320,6 +328,7 @@ impl<F: FenceBase + Send + 'static> FenceManager<F> {
         if self.has_async_check {
             self.shared.cv.notify_all();
         }
+        let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::FenceInvalidate);
         invalidate_gpu_cache();
     }
 

@@ -650,6 +650,9 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
     fn get_storage_buffer_alignment(&self) -> u32 {
         16
     }
+    fn get_max_storage_buffer_range(&self) -> u64 {
+        self.device.profile().max_buffer_length as u64
+    }
 
     fn finish(&mut self) {
         self.scheduler()

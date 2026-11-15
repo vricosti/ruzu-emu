@@ -178,6 +178,7 @@ mod tests {
 
     fn image_buffer(count: u32) -> ImageBufferDescriptor {
         ImageBufferDescriptor {
+            handle_program: u32::MAX,
             format: ImageFormat::Typeless,
             is_written: false,
             is_read: true,
@@ -191,6 +192,7 @@ mod tests {
 
     fn image(count: u32) -> ImageDescriptor {
         ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::Typeless,
             is_written: false,
@@ -205,6 +207,7 @@ mod tests {
 
     fn texture_buffer(count: u32) -> TextureBufferDescriptor {
         TextureBufferDescriptor {
+            handle_program: u32::MAX,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -219,6 +222,7 @@ mod tests {
 
     fn texture(count: u32) -> TextureDescriptor {
         TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -271,8 +275,7 @@ mod tests {
             cbuf_index: 0,
             cbuf_offset: 0,
             count: 1,
-            is_written: false,
-        }];
+            is_written: false, ..Default::default() }];
         let mut bindings = Bindings::default();
         let profile = Profile::default();
         let mut runtime_info = RuntimeInfo::default();

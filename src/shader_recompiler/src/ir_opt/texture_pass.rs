@@ -32,6 +32,290 @@ struct TextureInst {
     cbuf: ConstBufferAddr,
 }
 
+// Native indirect-handle prerequisite. These helpers preserve the conditional
+// diamond recognition owned by upstream texture_pass.cpp, not a global CFG pass.
+fn conditional_header(program: &Program, body: u32) -> Option<u32> {
+    let body_block = program.blocks.get(body as usize)?;
+    if body_block.imm_predecessors.len() != 1 || body_block.imm_successors.len() != 1 {
+        return None;
+    }
+    let header = body_block.imm_predecessors[0];
+    let header_block = program.blocks.get(header as usize)?;
+    let targets = &header_block.imm_successors;
+    if targets.len() != 2 || targets[0] != body || targets[1] != body_block.imm_successors[0]
+        || program.blocks.get(targets[1] as usize)?.imm_predecessors.len() != 2
+        || header_block.indexed_rev_iter().next()?.1.opcode != Opcode::ConditionRef
+    {
+        return None;
+    }
+    Some(header)
+}
+
+fn condition(program: &Program, mut value: Value) -> (Value, bool) {
+    let mut negated = false;
+    while let Some(inst) = get_inst_recursive(program, value) {
+        if inst.opcode == Opcode::LogicalNot {
+            negated = !negated;
+        } else if inst.opcode != Opcode::ConditionRef {
+            break;
+        }
+        value = inst.args[0];
+    }
+    (value.resolve(program), negated)
+}
+
+fn resolve_conditional_phi(program: &Program, mut value: Value, block: u32) -> Value {
+    if !get_inst_recursive(program, value).is_some_and(|inst| inst.opcode == Opcode::Phi) {
+        return value;
+    }
+    let Some(mut block) = conditional_header(program, block) else { return value };
+    let header_condition = program.blocks[block as usize].indexed_rev_iter().next().unwrap().1.args[0];
+    let (condition_value, negated) = condition(program, header_condition);
+    let mut visited = Vec::new();
+    while let Some(phi) = get_inst_recursive(program, value) {
+        if phi.opcode != Opcode::Phi || visited.contains(&block) { break; }
+        visited.push(block);
+        let predecessors = &program.blocks[block as usize].imm_predecessors;
+        if predecessors.len() == 1 {
+            block = predecessors[0];
+            continue;
+        }
+        if predecessors.len() != 2 || phi.phi_args.len() != 2 { break; }
+        let mut body = predecessors[0];
+        let mut header = conditional_header(program, body);
+        if header != Some(predecessors[1]) {
+            body = predecessors[1];
+            header = conditional_header(program, body);
+            if header != Some(predecessors[0]) { break; }
+        }
+        let header = header.unwrap();
+        let other = program.blocks[header as usize].indexed_rev_iter().next().unwrap().1.args[0];
+        let (other_condition, other_negated) = condition(program, other);
+        if condition_value == other_condition
+            && (phi.phi_args[0].0 == header || phi.phi_args[0].0 == body)
+        {
+            let incoming = if negated == other_negated { body } else { header };
+            value = phi.phi_args[usize::from(phi.phi_args[0].0 != incoming)].1;
+        }
+        block = header;
+    }
+    value
+}
+
+// Upstream's thread-local BuildHandleProgram state is scoped to one build here;
+// no state survives translation or is shared between concurrent compilations.
+#[derive(Default)]
+struct HandleBuildState {
+    slots: std::collections::HashMap<InstRef, u32>,
+    slot_count: u32,
+    failure: Option<Opcode>,
+}
+
+fn is_undefined(op: Opcode) -> bool {
+    matches!(op, Opcode::UndefU1 | Opcode::UndefU8 | Opcode::UndefU16
+        | Opcode::UndefU32 | Opcode::UndefU64)
+}
+
+impl HandleBuildState {
+    fn build_handle_program(&mut self, program: &Program, value: Value, code: &mut Vec<u32>,
+                            budget: &mut i32, block: u32) -> bool {
+        use crate::shader_info::HandleOp;
+        let value = value.resolve(program);
+        if value.is_immediate() {
+            return self.build_handle_node(program, value, code, budget, block);
+        }
+        let Some(reference) = get_inst_ref_recursive(program, value) else { return false };
+        if let Some(&slot) = self.slots.get(&reference) {
+            if slot == u32::MAX {
+                self.failure = Some(Opcode::Phi);
+                return false;
+            }
+            code.extend([HandleOp::Load as u32, slot]);
+            return true;
+        }
+        self.slots.insert(reference, u32::MAX);
+        let start = code.len();
+        let first_slot = self.slot_count;
+        let result = self.build_handle_node(program, value, code, budget, block);
+        self.slots.remove(&reference);
+        if !result {
+            code.truncate(start);
+            self.slots.retain(|_, slot| *slot == u32::MAX || *slot < first_slot);
+            self.slot_count = first_slot;
+        }
+        if result && get_inst(program, reference).unwrap().use_count > 1 && self.slots.len() < 256 {
+            let slot = self.slot_count;
+            self.slot_count += 1;
+            self.slots.insert(reference, slot);
+            code.extend([HandleOp::Tee as u32, slot]);
+        }
+        result
+    }
+
+    fn build_handle_node(&mut self, program: &Program, value: Value, code: &mut Vec<u32>,
+                         budget: &mut i32, block: u32) -> bool {
+        use crate::shader_info::HandleOp as H;
+        let value = value.resolve(program);
+        *budget -= 1;
+        if *budget < 0 { return false; }
+        if value.is_immediate() {
+            code.extend([H::Immediate as u32, value.imm_u32()]);
+            return true;
+        }
+        let Some(inst) = get_inst_recursive(program, value) else { return false };
+        let build = |state: &mut Self, arg: usize, code: &mut Vec<u32>, budget: &mut i32| {
+            state.build_handle_program(program, *inst.arg(arg), code, budget, block)
+        };
+        let mapped = match inst.opcode {
+            Opcode::IAdd32 => Some((H::Add, 2)), Opcode::ISub32 => Some((H::Sub, 2)),
+            Opcode::IMul32 => Some((H::Mul, 2)), Opcode::BitwiseAnd32 => Some((H::And, 2)),
+            Opcode::BitwiseOr32 => Some((H::Or, 2)), Opcode::BitwiseXor32 => Some((H::Xor, 2)),
+            Opcode::ShiftLeftLogical32 => Some((H::Shl, 2)),
+            Opcode::ShiftRightLogical32 => Some((H::Shr, 2)),
+            Opcode::ShiftRightArithmetic32 => Some((H::Sar, 2)),
+            Opcode::INeg32 => Some((H::Neg, 1)), Opcode::BitwiseNot32 => Some((H::Not, 1)),
+            Opcode::UMin32 => Some((H::UMin, 2)), Opcode::UMax32 => Some((H::UMax, 2)),
+            Opcode::SMin32 => Some((H::SMin, 2)), Opcode::SMax32 => Some((H::SMax, 2)),
+            Opcode::SLessThan => Some((H::SLt, 2)), Opcode::SLessThanEqual => Some((H::SLe, 2)),
+            Opcode::SGreaterThan => Some((H::SGt, 2)), Opcode::SGreaterThanEqual => Some((H::SGe, 2)),
+            Opcode::ULessThan => Some((H::ULt, 2)), Opcode::ULessThanEqual => Some((H::ULe, 2)),
+            Opcode::UGreaterThan => Some((H::UGt, 2)), Opcode::UGreaterThanEqual => Some((H::UGe, 2)),
+            Opcode::IEqual => Some((H::Eq, 2)), Opcode::INotEqual => Some((H::Ne, 2)),
+            Opcode::LogicalAnd => Some((H::LAnd, 2)), Opcode::LogicalOr => Some((H::LOr, 2)),
+            Opcode::LogicalXor => Some((H::LXor, 2)), Opcode::LogicalNot => Some((H::LNot, 1)),
+            Opcode::SelectU1 | Opcode::SelectU32 => Some((H::Select, 3)),
+            _ => None,
+        };
+        if let Some((op, count)) = mapped {
+            for arg in 0..count { if !build(self, arg, code, budget) { return false; } }
+            code.push(op as u32);
+            return true;
+        }
+        match inst.opcode {
+            Opcode::Identity | Opcode::ConditionRef | Opcode::ShuffleIndex
+            | Opcode::VoteAny | Opcode::VoteAll | Opcode::BitCastU32F32
+            | Opcode::BitCastF32U32 => build(self, 0, code, budget),
+            Opcode::GetCbufU32 | Opcode::LoadStorage32 =>
+                self.build_handle_load_word(program, inst, 0, code, budget, block),
+            // Native storage loads can return four words as well as two.
+            // Both extraction forms select a word at the same byte offset.
+            Opcode::CompositeExtractU32x2 | Opcode::CompositeExtractU32x4 => {
+                let element = inst.arg(1).resolve(program);
+                if !element.is_immediate() { return false; }
+                let Some(source) = get_inst_recursive(program, *inst.arg(0)) else { return false };
+                self.build_handle_load_word(program, source, element.imm_u32().wrapping_mul(4),
+                                            code, budget, block)
+            }
+            Opcode::Phi => {
+                let resolved = resolve_conditional_phi(program, value, block);
+                if resolved.is_immediate() || get_inst_ref_recursive(program, resolved)
+                    != get_inst_ref_recursive(program, value)
+                {
+                    return self.build_handle_program(program, resolved, code, budget, block);
+                }
+                let mut chosen = None;
+                for arg in 0..inst.num_args() {
+                    let incoming = *inst.arg(arg);
+                    let source = get_inst_recursive(program, incoming);
+                    if source.is_some_and(|i| is_undefined(i.opcode)) { continue; }
+                    if chosen.is_none() || source.is_some_and(|i| i.opcode == Opcode::ShuffleIndex) {
+                        chosen = Some(arg);
+                    }
+                }
+                if chosen.is_some_and(|arg| build(self, arg, code, budget)) { return true; }
+                for arg in 0..inst.num_args() {
+                    if Some(arg) == chosen || get_inst_recursive(program, *inst.arg(arg))
+                        .is_some_and(|i| is_undefined(i.opcode)) { continue; }
+                    if build(self, arg, code, budget) { return true; }
+                }
+                false
+            }
+            Opcode::GetZeroFromOp | Opcode::GetSignFromOp => {
+                if !build(self, 0, code, budget) { return false; }
+                code.extend([H::Immediate as u32, 0,
+                    if inst.opcode == Opcode::GetZeroFromOp { H::Eq } else { H::SLt } as u32]);
+                true
+            }
+            Opcode::GetCarryFromOp => {
+                let Some(add) = get_inst_recursive(program, *inst.arg(0)) else {
+                    self.failure = Some(inst.opcode); return false;
+                };
+                if add.opcode != Opcode::IAdd32 {
+                    self.failure = Some(inst.opcode); return false;
+                }
+                if !build(self, 0, code, budget) || !self.build_handle_program(
+                    program, *add.arg(0), code, budget, block) { return false; }
+                code.push(H::ULt as u32);
+                true
+            }
+            Opcode::UndefU1 | Opcode::UndefU32 => {
+                code.extend([H::Immediate as u32, 0]); true
+            }
+            Opcode::BitFieldUExtract => {
+                if !build(self, 0, code, budget) || !build(self, 1, code, budget) { return false; }
+                code.extend([H::Shr as u32, H::Immediate as u32, 1]);
+                if !build(self, 2, code, budget) { return false; }
+                code.extend([H::Shl as u32, H::Immediate as u32, 1, H::Sub as u32, H::And as u32]);
+                true
+            }
+            Opcode::BitFieldSExtract => {
+                if !build(self, 0, code, budget) { return false; }
+                code.extend([H::Immediate as u32, 32]);
+                if !build(self, 1, code, budget) { return false; }
+                code.push(H::Sub as u32);
+                if !build(self, 2, code, budget) { return false; }
+                code.extend([H::Sub as u32, H::Shl as u32, H::Immediate as u32, 32]);
+                if !build(self, 2, code, budget) { return false; }
+                code.extend([H::Sub as u32, H::Sar as u32]); true
+            }
+            Opcode::BitFieldInsert => {
+                let mask = |state: &mut Self, code: &mut Vec<u32>, budget: &mut i32| {
+                    code.extend([H::Immediate as u32, 1]);
+                    if !build(state, 3, code, budget) { return false; }
+                    code.extend([H::Shl as u32, H::Immediate as u32, 1, H::Sub as u32]);
+                    if !build(state, 2, code, budget) { return false; }
+                    code.push(H::Shl as u32); true
+                };
+                if !build(self, 0, code, budget) || !mask(self, code, budget) { return false; }
+                code.extend([H::Not as u32, H::And as u32]);
+                if !build(self, 1, code, budget) || !build(self, 2, code, budget) { return false; }
+                code.push(H::Shl as u32);
+                if !mask(self, code, budget) { return false; }
+                code.extend([H::And as u32, H::Or as u32]); true
+            }
+            Opcode::UClamp32 | Opcode::SClamp32 => {
+                if !build(self, 0, code, budget) || !build(self, 1, code, budget) { return false; }
+                code.push(if inst.opcode == Opcode::SClamp32 { H::SMax } else { H::UMax } as u32);
+                if !build(self, 2, code, budget) { return false; }
+                code.push(if inst.opcode == Opcode::SClamp32 { H::SMin } else { H::UMin } as u32);
+                true
+            }
+            _ => { self.failure = Some(inst.opcode); false }
+        }
+    }
+
+    // Mechanical extraction of BuildHandleNode's load_word lambda: same owner.
+    fn build_handle_load_word(&mut self, program: &Program, source: &Inst, extra: u32,
+                              code: &mut Vec<u32>, budget: &mut i32, block: u32) -> bool {
+        use crate::shader_info::HandleOp as H;
+        let is_cbuf = matches!(source.opcode, Opcode::GetCbufU32 | Opcode::GetCbufU32x2);
+        if !is_cbuf && !matches!(source.opcode, Opcode::LoadStorage32
+            | Opcode::LoadStorage64 | Opcode::LoadStorage128) { return false; }
+        let index = source.arg(0).resolve(program);
+        if !index.is_immediate() { return false; }
+        let index = index.imm_u32();
+        let offset = source.arg(1).resolve(program);
+        if is_cbuf && offset.is_immediate() {
+            code.extend([H::Cbuf as u32, index, offset.imm_u32().wrapping_add(extra)]);
+            return true;
+        }
+        if !self.build_handle_program(program, offset, code, budget, block) { return false; }
+        if extra != 0 { code.extend([H::Immediate as u32, extra, H::Add as u32]); }
+        code.extend([if is_cbuf { H::CbufDynamic } else { H::Storage } as u32, index]);
+        true
+    }
+}
+
 /// Resolve bindless/bound texture operations to indexed operations.
 pub fn texture_pass(
     env: &mut dyn Environment,
@@ -72,6 +356,9 @@ fn texture_pass_impl(
 
     let post_order_blocks = program.post_order_blocks.clone();
     for block_index in post_order_blocks {
+        if let Some(env) = env.as_deref_mut() {
+            env.texture_pass_caches().track_cache.clear();
+        }
         let block = &program.blocks[block_index as usize];
         for (inst_index, inst) in block.instructions.iter().enumerate() {
             let Some(inst) = inst.as_ref() else {
@@ -90,11 +377,43 @@ fn texture_pass_impl(
                         .unwrap_or(0);
                     ConstBufferAddr::bound(texture_bound_buffer, cbuf_offset)
                 }
-                value => track_cached(value, program, &mut env, &host_info).unwrap_or_else(|| {
-                    std::panic::panic_any(crate::exception::NotImplementedException::new(
-                        "Failed to track bindless texture constant buffer",
-                    ))
-                }),
+                value => {
+                    if let Some(addr) = track_cached(value, program, &mut env, &host_info, block_index) {
+                        addr
+                    } else {
+                        let mut code = Vec::new();
+                        let mut state = HandleBuildState::default();
+                        let mut budget = 4096;
+                        if !state.build_handle_program(program, value, &mut code, &mut budget, block_index) {
+                            // Temporary, opt-in investigation capture. Remove before delivery.
+                            if let Some(directory) = std::env::var_os("RUZU_HANDLE_FAILURE_DUMP_DIR") {
+                                use std::sync::atomic::{AtomicUsize, Ordering};
+                                static CAPTURES: AtomicUsize = AtomicUsize::new(0);
+                                let index = CAPTURES.fetch_add(1, Ordering::Relaxed);
+                                if index < 16 {
+                                    let path = std::path::PathBuf::from(directory)
+                                        .join(format!("handle-failure-{index:02}.txt"));
+                                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                                        .write(true).create_new(true).open(path) {
+                                        use std::io::Write;
+                                        let _ = writeln!(file, "root={value:?} block={block_index} budget={budget} failure={:?}\n{program:#?}", state.failure);
+                                    }
+                                }
+                            }
+                            // Do not restore the legacy search through memory addresses:
+                            // that would bind the address as if it were the loaded handle.
+                            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                                format!("Failed to compute bindless texture handle: {:?}", state.failure),
+                            ));
+                        }
+                        let index = program.info.handle_programs.iter().position(|p| *p == code)
+                            .unwrap_or_else(|| {
+                                program.info.handle_programs.push(code);
+                                program.info.handle_programs.len() - 1
+                            });
+                        ConstBufferAddr { handle_program: index as u32, ..ConstBufferAddr::bound(0, 0) }
+                    }
+                },
             };
             to_replace.push(TextureInst {
                 block: block_index,
@@ -124,6 +443,7 @@ fn texture_pass_impl(
     let mut last_integer_format: Option<(u32, u32, bool)> = None;
     let mut is_texture_pixel_format_integer =
         |env: &mut Option<&mut dyn Environment>, cbuf: &ConstBufferAddr| {
+            if cbuf.handle_program != u32::MAX { return false; }
             if let Some((index, offset, is_integer)) = last_integer_format {
                 if index == cbuf.index && offset == cbuf.offset {
                     return is_integer;
@@ -137,6 +457,17 @@ fn texture_pass_impl(
             is_integer
         };
 
+    let mut handle_program_types = std::collections::HashMap::new();
+    for texture_inst in &to_replace {
+        let inst = get_inst(program, InstRef { block: texture_inst.block, inst: texture_inst.inst }).unwrap();
+        let op = indexed_instruction(inst.opcode).unwrap_or(inst.opcode);
+        if texture_inst.cbuf.handle_program != u32::MAX && op != Opcode::ImageQueryDimensions
+            && !is_storage_image_instruction(op)
+        {
+            handle_program_types.entry(texture_inst.cbuf.handle_program)
+                .or_insert(TextureInstInfo::from_u32(inst.flags).texture_type);
+        }
+    }
     for texture_inst in to_replace {
         let inst_snapshot = program.blocks[texture_inst.block as usize].instructions
             [texture_inst.inst as usize]
@@ -151,7 +482,9 @@ fn texture_pass_impl(
         let mut is_multisample = false;
         match indexed_opcode {
             Opcode::ImageQueryDimensions => {
-                if let Some(env) = env.as_deref_mut() {
+                if let Some(&texture_type) = handle_program_types.get(&cbuf.handle_program) {
+                    flags.texture_type = texture_type;
+                } else if let Some(env) = env.as_deref_mut() {
                     flags.texture_type = read_texture_type_cached(env, &cbuf) as u8;
                 }
             }
@@ -209,6 +542,7 @@ fn texture_pass_impl(
                 add_image_buffer_descriptor(
                     &mut program.info.image_buffer_descriptors,
                     ImageBufferDescriptor {
+                        handle_program: cbuf.handle_program,
                         format: image_format_from_flags(flags),
                         is_written: indexed_opcode != Opcode::ImageRead,
                         is_read: indexed_opcode != Opcode::ImageWrite,
@@ -223,6 +557,7 @@ fn texture_pass_impl(
                 add_image_descriptor(
                     &mut program.info.image_descriptors,
                     ImageDescriptor {
+                        handle_program: cbuf.handle_program,
                         texture_type: texture_type_from_flags(flags),
                         format: image_format_from_flags(flags),
                         is_written: indexed_opcode != Opcode::ImageRead,
@@ -239,6 +574,7 @@ fn texture_pass_impl(
             add_texture_buffer_descriptor(
                 &mut program.info.texture_buffer_descriptors,
                 TextureBufferDescriptor {
+                    handle_program: cbuf.handle_program,
                     has_secondary: cbuf.has_secondary,
                     cbuf_index: cbuf.index,
                     cbuf_offset: cbuf.offset,
@@ -254,6 +590,7 @@ fn texture_pass_impl(
             count = count.min(sampled_dynamic_cap);
             let is_integer = is_texture_pixel_format_integer(&mut env, &cbuf);
             let descriptor = TextureDescriptor {
+                handle_program: cbuf.handle_program,
                 texture_type: texture_type_from_flags(flags),
                 is_depth: flags.is_depth,
                 is_multisample,
@@ -441,9 +778,10 @@ fn track_cached(
     program: &Program,
     env: &mut Option<&mut dyn Environment>,
     host_info: &HostTranslateInfo,
+    block: u32,
 ) -> Option<ConstBufferAddr> {
     let Some(key) = get_inst_ref_recursive(program, value) else {
-        return track(value, program, env, host_info);
+        return track(value, program, env, host_info, block);
     };
     if let Some(found) = env
         .as_deref_mut()
@@ -451,7 +789,7 @@ fn track_cached(
     {
         return Some(found);
     }
-    let found = track(value, program, env, host_info);
+    let found = track(value, program, env, host_info, block);
     if let (Some(env), Some(found)) = (env.as_deref_mut(), found) {
         env.texture_pass_caches().track_cache.insert(key, found);
     }
@@ -463,10 +801,30 @@ fn track(
     program: &Program,
     env: &mut Option<&mut dyn Environment>,
     host_info: &HostTranslateInfo,
+    block: u32,
 ) -> Option<ConstBufferAddr> {
-    crate::ir::breadth_first_search::breadth_first_search(value, program, |inst| {
-        try_get_const_buffer(inst, program, env, host_info)
-    })
+    let value = resolve_conditional_phi(program, value, block).resolve(program);
+    let root = get_inst_ref_recursive(program, value)?;
+    let mut queue = std::collections::VecDeque::from([root]);
+    let mut visited = std::collections::HashSet::from([root]);
+    while let Some(reference) = queue.pop_front() {
+        let inst = get_inst(program, reference)?;
+        if let Some(addr) = try_get_const_buffer(inst, program, env, host_info, block) { return Some(addr); }
+        if matches!(inst.opcode,
+            Opcode::LoadGlobalU8 | Opcode::LoadGlobalS8 | Opcode::LoadGlobalU16 | Opcode::LoadGlobalS16
+            | Opcode::LoadGlobal32 | Opcode::LoadGlobal64 | Opcode::LoadGlobal128
+            | Opcode::LoadStorageU8 | Opcode::LoadStorageS8 | Opcode::LoadStorageU16 | Opcode::LoadStorageS16
+            | Opcode::LoadStorage32 | Opcode::LoadStorage64 | Opcode::LoadStorage128 | Opcode::LoadLocal
+            | Opcode::LoadSharedU8 | Opcode::LoadSharedS8 | Opcode::LoadSharedU16 | Opcode::LoadSharedS16
+            | Opcode::LoadSharedU32 | Opcode::LoadSharedU64 | Opcode::LoadSharedU128) { continue; }
+        for arg in (0..inst.num_args()).rev() {
+            let value = resolve_conditional_phi(program, *inst.arg(arg), block).resolve(program);
+            if let Some(reference) = get_inst_ref_recursive(program, value) {
+                if visited.insert(reference) { queue.push_back(reference); }
+            }
+        }
+    }
+    None
 }
 
 fn try_get_const_buffer(
@@ -474,11 +832,12 @@ fn try_get_const_buffer(
     program: &Program,
     env: &mut Option<&mut dyn Environment>,
     host_info: &HostTranslateInfo,
+    block: u32,
 ) -> Option<ConstBufferAddr> {
     match inst.opcode {
         Opcode::BitwiseOr32 => {
-            let mut lhs = track_cached(*inst.args.first()?, program, env, host_info)?;
-            let mut rhs = track_cached(*inst.args.get(1)?, program, env, host_info)?;
+            let mut lhs = track_cached(*inst.args.first()?, program, env, host_info, block)?;
+            let mut rhs = track_cached(*inst.args.get(1)?, program, env, host_info, block)?;
             if lhs.has_secondary || rhs.has_secondary || lhs.count > 1 || rhs.count > 1 {
                 return None;
             }
@@ -486,6 +845,7 @@ fn try_get_const_buffer(
                 std::mem::swap(&mut lhs, &mut rhs);
             }
             Some(ConstBufferAddr {
+                handle_program: u32::MAX,
                 index: lhs.index,
                 offset: lhs.offset,
                 shift_left: lhs.shift_left,
@@ -502,7 +862,7 @@ fn try_get_const_buffer(
             if !shift.is_immediate() {
                 return None;
             }
-            let mut lhs = track_cached(*inst.args.first()?, program, env, host_info)?;
+            let mut lhs = track_cached(*inst.args.first()?, program, env, host_info, block)?;
             lhs.shift_left = shift.imm_u32();
             Some(lhs)
         }
@@ -525,7 +885,7 @@ fn try_get_const_buffer(
                 return None;
             }
             let mask = op2.imm_u32();
-            let mut lhs = track_cached(op1, program, env, host_info)?;
+            let mut lhs = track_cached(op1, program, env, host_info, block)?;
             lhs.shift_left = mask.trailing_zeros();
             Some(lhs)
         }
@@ -774,6 +1134,7 @@ fn get_texture_handle_cached(env: &mut dyn Environment, cbuf: &ConstBufferAddr) 
 }
 
 fn read_texture_type_cached(env: &mut dyn Environment, cbuf: &ConstBufferAddr) -> TextureType {
+    if cbuf.handle_program != u32::MAX { return TextureType::Color2D; }
     let handle = get_texture_handle_cached(env, cbuf);
     env.read_texture_type(handle)
 }
@@ -782,6 +1143,7 @@ fn read_texture_pixel_format_cached(
     env: &mut dyn Environment,
     cbuf: &ConstBufferAddr,
 ) -> TexturePixelFormat {
+    if cbuf.handle_program != u32::MAX { return TexturePixelFormat::A8B8G8R8Unorm; }
     let handle = get_texture_handle_cached(env, cbuf);
     env.read_texture_pixel_format(handle)
 }
@@ -790,6 +1152,7 @@ fn is_texture_pixel_format_integer_cached(
     env: &mut dyn Environment,
     cbuf: &ConstBufferAddr,
 ) -> bool {
+    if cbuf.handle_program != u32::MAX { return false; }
     let handle = get_texture_handle_cached(env, cbuf);
     env.is_texture_pixel_format_integer(handle)
 }
@@ -1078,6 +1441,7 @@ fn add_texture_descriptor(
             && existing.secondary_shift_left == descriptor.secondary_shift_left
             && existing.count == descriptor.count
             && existing.size_shift == descriptor.size_shift
+            && existing.handle_program == descriptor.handle_program
     }) {
         descriptors[index].is_multisample |= descriptor.is_multisample;
         descriptors[index].is_integer |= descriptor.is_integer;
@@ -1112,6 +1476,7 @@ fn add_image_descriptor(
             && existing.cbuf_offset == descriptor.cbuf_offset
             && existing.count == descriptor.count
             && existing.size_shift == descriptor.size_shift
+            && existing.handle_program == descriptor.handle_program
     }) {
         let existing = &mut descriptors[index];
         existing.is_written |= descriptor.is_written;
@@ -1133,6 +1498,7 @@ fn add_image_buffer_descriptor(
             && existing.cbuf_offset == descriptor.cbuf_offset
             && existing.count == descriptor.count
             && existing.size_shift == descriptor.size_shift
+            && existing.handle_program == descriptor.handle_program
     }) {
         let existing = &mut descriptors[index];
         existing.is_written |= descriptor.is_written;
@@ -1147,18 +1513,73 @@ fn add_image_buffer_descriptor(
 /// Join texture descriptors from `source` into `base`.
 ///
 /// Upstream: `JoinTextureInfo` in `texture_pass.cpp`.
-pub fn join_texture_info(_base: &mut ShaderInfo, _source: &mut ShaderInfo) {
-    for desc in _source.texture_buffer_descriptors.drain(..) {
-        add_texture_buffer_descriptor(&mut _base.texture_buffer_descriptors, desc);
+pub fn join_texture_info(base: &mut ShaderInfo, source: &mut ShaderInfo) -> [Vec<u32>; 4] {
+    use crate::shader_info::HandleOp as H;
+    // Storage descriptors must already be joined. Programs carry source-local
+    // binding indices, unlike cbuf indices which are hardware identifiers.
+    let mut programs = Vec::with_capacity(source.handle_programs.len());
+    for mut code in source.handle_programs.drain(..) {
+        let mut pc = 0;
+        while pc < code.len() {
+            let op = code[pc];
+            pc += 1;
+            if op == H::Storage as u32 {
+                let desc = &source.storage_buffers_descriptors[code[pc] as usize];
+                code[pc] = base.storage_buffers_descriptors.iter().position(|d|
+                    d.cbuf_index == desc.cbuf_index && d.cbuf_offset == desc.cbuf_offset
+                        && d.count == desc.count
+                ).expect("storage descriptors must be joined before handle programs") as u32;
+            }
+            pc += if op == H::Cbuf as u32 { 2 }
+                else if [H::Immediate, H::CbufDynamic, H::Storage, H::Tee, H::Load]
+                    .iter().any(|h| *h as u32 == op) { 1 } else { 0 };
+        }
+        let index = base.handle_programs.iter().position(|p| *p == code)
+            .unwrap_or_else(|| {
+                base.handle_programs.push(code);
+                base.handle_programs.len() - 1
+            });
+        programs.push(index as u32);
     }
-    for desc in _source.image_buffer_descriptors.drain(..) {
-        add_image_buffer_descriptor(&mut _base.image_buffer_descriptors, desc);
+    let remap = |program: &mut u32| {
+        if *program != u32::MAX { *program = programs[*program as usize]; }
+    };
+    let mut mapping: [Vec<u32>; 4] = Default::default();
+    for mut desc in source.texture_buffer_descriptors.drain(..) {
+        remap(&mut desc.handle_program);
+        mapping[0].push(add_texture_buffer_descriptor(&mut base.texture_buffer_descriptors, desc));
     }
-    for desc in _source.texture_descriptors.drain(..) {
-        add_texture_descriptor(&mut _base.texture_descriptors, desc);
+    for mut desc in source.image_buffer_descriptors.drain(..) {
+        remap(&mut desc.handle_program);
+        mapping[1].push(add_image_buffer_descriptor(&mut base.image_buffer_descriptors, desc));
     }
-    for desc in _source.image_descriptors.drain(..) {
-        add_image_descriptor(&mut _base.image_descriptors, desc);
+    for mut desc in source.texture_descriptors.drain(..) {
+        remap(&mut desc.handle_program);
+        mapping[2].push(add_texture_descriptor(&mut base.texture_descriptors, desc));
+    }
+    for mut desc in source.image_descriptors.drain(..) {
+        remap(&mut desc.handle_program);
+        mapping[3].push(add_image_descriptor(&mut base.image_descriptors, desc));
+    }
+    mapping
+}
+
+/// Apply JoinTextureInfo's source-to-destination mapping to the cloned blocks.
+/// The upstream merge omits this when independently numbered stages are joined.
+pub fn remap_texture_bindings(blocks: &mut [crate::ir::basic_block::Block], mapping: &[Vec<u32>; 4]) {
+    for block in blocks {
+        for inst in block.iter_mut() {
+            if indexed_instruction(inst.opcode) != Some(inst.opcode) { continue; }
+            let mut flags = TextureInstInfo::from_u32(inst.flags);
+            let buffer = flags.texture_type == TextureType::Buffer as u8;
+            let image = is_storage_image_instruction(inst.opcode);
+            let group = match (buffer, image) {
+                (true, false) => 0, (true, true) => 1,
+                (false, false) => 2, (false, true) => 3,
+            };
+            flags.descriptor_index = mapping[group][flags.descriptor_index as usize] as u16;
+            inst.flags = flags.to_u32();
+        }
     }
 }
 
@@ -1423,8 +1844,8 @@ mod tests {
     fn texture_pass_preserves_upstream_untracked_bindless_exception() {
         let mut program = fragment_program();
         let unknown_handle = program.blocks[0].append_inst(Inst::new(
-            Opcode::IAdd32,
-            vec![Value::ImmU32(1), Value::ImmU32(2)],
+            Opcode::LaneId,
+            vec![],
         ));
         program.blocks[0].append_inst(Inst::with_flags(
             Opcode::BindlessImageSampleExplicitLod,
@@ -1453,7 +1874,7 @@ mod tests {
             .expect("failure must remain a shader NotImplementedException");
         assert_eq!(
             exception.to_string(),
-            "Failed to track bindless texture constant buffer is not implemented"
+            "Failed to compute bindless texture handle: Some(LaneId) is not implemented"
         );
     }
 
@@ -1549,6 +1970,228 @@ mod tests {
         let inst = program.blocks[0].instructions[4].as_ref().unwrap();
         assert_eq!(inst.args[0], Value::Void);
         assert_eq!(TextureInstInfo::from_u32(inst.flags).descriptor_index, 0);
+    }
+
+    #[test]
+    fn texture_tracking_must_not_treat_storage_address_as_handle() {
+        let mut program = fragment_program();
+        let block = &mut program.blocks[0];
+        let address = block.append_inst(Inst::new(
+            Opcode::GetCbufU32,
+            vec![Value::ImmU32(0), Value::ImmU32(0x100)],
+        ));
+        // GlobalMemoryToStorageBufferPass retains the base address in the
+        // offset subtraction. The loaded value is not that base address.
+        let offset = block.append_inst(Inst::new(
+            Opcode::ISub32,
+            vec![
+                Value::ImmU32(0x20000020),
+                Value::Inst(InstRef { block: 0, inst: address }),
+            ],
+        ));
+        let handle = block.append_inst(Inst::new(
+            Opcode::LoadStorage32,
+            vec![Value::ImmU32(0), Value::Inst(InstRef { block: 0, inst: offset })],
+        ));
+        let found = track(
+            Value::Inst(InstRef { block: 0, inst: handle }),
+            &program,
+            &mut None,
+            &HostTranslateInfo::default(),
+            0,
+        );
+        assert!(found.is_none(), "a memory load must not resolve to its address cbuf: {found:?}");
+    }
+
+    #[test]
+    fn conditional_handle_phi_selects_the_matching_branch() {
+        for negate in [false, true] {
+            let mut program = fragment_program();
+            program.blocks = (0..5).map(|_| Block::new()).collect();
+            program.blocks[0].imm_successors = vec![1, 2];
+            program.blocks[1].imm_predecessors = vec![0];
+            program.blocks[1].imm_successors = vec![2];
+            program.blocks[2].imm_predecessors = vec![0, 1];
+            program.blocks[2].imm_successors = vec![3, 4];
+            program.blocks[3].imm_predecessors = vec![2];
+            program.blocks[3].imm_successors = vec![4];
+            program.blocks[4].imm_predecessors = vec![2, 3];
+            let condition_inst = program.blocks[0].append_new_inst(
+                Opcode::GetCbufU32, vec![Value::ImmU32(0), Value::ImmU32(16)]);
+            let cond = Value::Inst(InstRef { block: 0, inst: condition_inst });
+            program.blocks[0].append_new_inst(Opcode::ConditionRef, vec![cond]);
+            let mut phi = Inst::phi();
+            phi.phi_args = vec![(0, Value::ImmU32(11)), (1, Value::ImmU32(22))];
+            let phi_index = program.blocks[2].append_inst(phi);
+            let phi_value = Value::Inst(InstRef { block: 2, inst: phi_index });
+            let cond = if negate {
+                let inst = program.blocks[2].append_new_inst(Opcode::LogicalNot, vec![cond]);
+                Value::Inst(InstRef { block: 2, inst })
+            } else { cond };
+            program.blocks[2].append_new_inst(Opcode::ConditionRef, vec![cond]);
+            assert_eq!(conditional_header(&program, 3), Some(2));
+            assert_eq!(resolve_conditional_phi(&program, phi_value, 3),
+                       Value::ImmU32(if negate { 11 } else { 22 }));
+            // Outside that conditional body the merge remains unresolved.
+            assert_eq!(resolve_conditional_phi(&program, phi_value, 4), phi_value);
+            // A different condition cannot select a predecessor of this Phi.
+            program.blocks[2].back_mut().args[0] = Value::ImmU32(123);
+            assert_eq!(resolve_conditional_phi(&program, phi_value, 3), phi_value);
+        }
+    }
+
+    #[test]
+    fn handle_builder_extracts_every_word_of_storage_vector() {
+        use crate::shader_info::evaluate_handle_program;
+        for (load_op, extract_op, words) in [
+            (Opcode::LoadStorage64, Opcode::CompositeExtractU32x2, 2),
+            (Opcode::LoadStorage128, Opcode::CompositeExtractU32x4, 4),
+        ] {
+            for element in 0..words {
+                let mut program = fragment_program();
+                let load = program.blocks[0].append_new_inst(load_op,
+                    vec![Value::ImmU32(2), Value::ImmU32(32)]);
+                let word = program.blocks[0].append_new_inst(extract_op,
+                    vec![Value::Inst(InstRef { block: 0, inst: load }), Value::ImmU32(element)]);
+                let mut code = Vec::new();
+                assert!(HandleBuildState::default().build_handle_program(&program,
+                    Value::Inst(InstRef { block: 0, inst: word }), &mut code, &mut 4096, 0));
+                assert_eq!(evaluate_handle_program(&code, |_, _| panic!("storage only"),
+                    |binding, offset| {
+                        assert_eq!((binding, offset), (2, 32 + element * 4)); 123
+                    }), Some(123));
+            }
+        }
+    }
+
+    #[test]
+    fn handle_builder_reads_storage_at_computed_byte_offset() {
+        use crate::shader_info::evaluate_handle_program;
+        let mut program = fragment_program();
+        let reference = |inst| Value::Inst(InstRef { block: 0, inst });
+        let block = &mut program.blocks[0];
+        let cbuf = block.append_new_inst(Opcode::GetCbufU32,
+            vec![Value::ImmU32(0), Value::ImmU32(16)]);
+        let offset = block.append_new_inst(Opcode::ISub32,
+            vec![Value::ImmU32(0x1020), reference(cbuf)]);
+        let load = block.append_new_inst(Opcode::LoadStorage64,
+            vec![Value::ImmU32(2), reference(offset)]);
+        let word = block.append_new_inst(Opcode::CompositeExtractU32x2,
+            vec![reference(load), Value::ImmU32(1)]);
+        let mut code = Vec::new();
+        assert!(HandleBuildState::default().build_handle_program(
+            &program, reference(word), &mut code, &mut 4096, 0));
+        for data in [9, 15] {
+            assert_eq!(evaluate_handle_program(&code,
+                |index, offset| { assert_eq!((index, offset), (0, 16)); 0x1000 },
+                |index, offset| { assert_eq!((index, offset), (2, 36)); data }), Some(data));
+        }
+    }
+
+    #[test]
+    fn texture_pass_keeps_distinct_storage_handles_and_query_types() {
+        use crate::shader_info::{evaluate_handle_program, TextureType};
+        let mut program = fragment_program();
+        for (offset, texture_type) in [(4, TextureType::Color3D), (8, TextureType::ColorCube)] {
+            let load = program.blocks[0].append_new_inst(Opcode::LoadStorage32,
+                vec![Value::ImmU32(0), Value::ImmU32(offset)]);
+            let handle = Value::Inst(InstRef { block: 0, inst: load });
+            let flags = TextureInstInfo { texture_type: texture_type as u8, ..Default::default() }.to_u32();
+            program.blocks[0].append_inst(Inst::with_flags(Opcode::ImageSampleImplicitLod,
+                vec![handle, Value::Void], flags));
+            program.blocks[0].append_inst(Inst::with_flags(Opcode::ImageQueryDimensions,
+                vec![handle, Value::ImmU32(0)], 0));
+        }
+        texture_pass_bound_textures(&mut program, 0);
+        assert_eq!(program.info.handle_programs.len(), 2);
+        assert_eq!(program.info.texture_descriptors.len(), 2);
+        for (index, ty) in [TextureType::Color3D, TextureType::ColorCube].into_iter().enumerate() {
+            let desc = &program.info.texture_descriptors[index];
+            assert_eq!(desc.handle_program, index as u32);
+            assert_eq!(desc.texture_type, ty);
+            let code = &program.info.handle_programs[index];
+            for contents in [100, 200] {
+                assert_eq!(evaluate_handle_program(code, |_, _| panic!("not a cbuf handle"),
+                    |binding, offset| { assert_eq!(binding, 0); contents + offset }),
+                    Some(contents + (index as u32 + 1) * 4));
+            }
+        }
+    }
+
+    #[test]
+    fn handle_builder_rolls_back_slots_from_failed_phi_input() {
+        use crate::shader_info::evaluate_handle_program;
+        let mut program = fragment_program();
+        let reference = |inst| Value::Inst(InstRef { block: 0, inst });
+        let block = &mut program.blocks[0];
+        let shared = block.append_new_inst(Opcode::GetCbufU32,
+            vec![Value::ImmU32(1), Value::ImmU32(8)]);
+        block.instructions[shared as usize].as_mut().unwrap().use_count = 2;
+        let unsupported = block.append_new_inst(Opcode::LaneId, vec![]);
+        let bad = block.append_new_inst(Opcode::IAdd32, vec![reference(shared), reference(unsupported)]);
+        let good = block.append_new_inst(Opcode::IAdd32, vec![reference(shared), Value::ImmU32(1)]);
+        let mut phi = Inst::phi();
+        phi.phi_args = vec![(0, reference(bad)), (0, reference(good))];
+        let value = reference(block.append_inst(phi));
+        let mut code = Vec::new();
+        let mut state = HandleBuildState::default();
+        assert!(state.build_handle_program(&program, value, &mut code, &mut 4096, 0));
+        assert_eq!(evaluate_handle_program(&code, |_, _| 6, |_, _| unreachable!()), Some(7));
+        assert_eq!(state.slot_count, 1);
+        assert_eq!(state.failure, Some(Opcode::LaneId));
+    }
+
+    #[test]
+    fn handle_builder_rejects_cycles_and_exhausted_budget() {
+        let mut program = fragment_program();
+        let value = Value::Inst(InstRef { block: 0, inst: 0 });
+        let mut phi = Inst::phi();
+        phi.phi_args = vec![(0, value)];
+        program.blocks[0].append_inst(phi);
+        let mut state = HandleBuildState::default();
+        let mut code = Vec::new();
+        assert!(!state.build_handle_program(&program, value, &mut code, &mut 4096, 0));
+        assert_eq!(state.failure, Some(Opcode::Phi));
+        assert!(code.is_empty());
+        assert!(state.slots.is_empty());
+        assert!(!state.build_handle_program(&program, Value::ImmU32(3), &mut code, &mut 0, 0));
+        assert!(code.is_empty());
+    }
+
+    #[test]
+    fn handle_builder_flags_bitfields_and_clamps() {
+        use crate::shader_info::evaluate_handle_program;
+        for (op, args, expected) in [
+            (Opcode::BitFieldUExtract, vec![0x1234, 4, 8], 0x23),
+            (Opcode::BitFieldSExtract, vec![0x800, 8, 4], 0xfffffff8),
+            (Opcode::BitFieldInsert, vec![0x1234, 0xab, 4, 8], 0x1ab4),
+            (Opcode::UClamp32, vec![12, 2, 8], 8),
+            (Opcode::SClamp32, vec![u32::MAX, 0, 8], 0),
+            (Opcode::SelectU32, vec![0, 11, 22], 22),
+            (Opcode::GetZeroFromOp, vec![0], 1),
+            (Opcode::GetSignFromOp, vec![u32::MAX], 1),
+        ] {
+            let mut program = fragment_program();
+            let inst = program.blocks[0].append_new_inst(op, args.into_iter().map(Value::ImmU32).collect());
+            let mut code = Vec::new();
+            assert!(HandleBuildState::default().build_handle_program(&program,
+                Value::Inst(InstRef { block: 0, inst }), &mut code, &mut 4096, 0));
+            assert_eq!(evaluate_handle_program(&code, |_, _| 0, |_, _| 0), Some(expected), "{op:?}");
+        }
+        let mut program = fragment_program();
+        let add = program.blocks[0].append_new_inst(Opcode::IAdd32,
+            vec![Value::ImmU32(u32::MAX), Value::ImmU32(2)]);
+        let carry = program.blocks[0].append_new_inst(Opcode::GetCarryFromOp,
+            vec![Value::Inst(InstRef { block: 0, inst: add })]);
+        let mut code = Vec::new();
+        assert!(HandleBuildState::default().build_handle_program(&program,
+            Value::Inst(InstRef { block: 0, inst: carry }), &mut code, &mut 4096, 0));
+        assert_eq!(evaluate_handle_program(&code, |_, _| 0, |_, _| 0), Some(1));
+        let alias = program.blocks[0].append_new_inst(Opcode::Identity, vec![Value::ImmU1(true)]);
+        code.clear();
+        assert!(HandleBuildState::default().build_handle_program(&program,
+            Value::Inst(InstRef { block: 0, inst: alias }), &mut code, &mut 4096, 0));
+        assert_eq!(evaluate_handle_program(&code, |_, _| 0, |_, _| 0), Some(1));
     }
 
     #[test]
@@ -1712,6 +2355,7 @@ mod tests {
     fn dynamic_sampled_texture_cap_reserves_static_resources() {
         let mut info = ShaderInfo::default();
         info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -2012,10 +2656,80 @@ mod tests {
     }
 
     #[test]
+    fn computed_program_merge_relocates_storage_and_image_instructions() {
+        use crate::shader_info::{HandleOp as H, StorageBufferDescriptor};
+        use crate::ir_opt::global_memory_to_storage_buffer_pass::{join_storage_info, remap_storage_bindings};
+        let mut base = ShaderInfo::default();
+        let mut source = ShaderInfo::default();
+        let a = StorageBufferDescriptor { cbuf_index: 2, cbuf_offset: 16, count: 1, is_written: false, ..Default::default() };
+        let b = StorageBufferDescriptor { cbuf_offset: 32, ..a.clone() };
+        base.storage_buffers_descriptors.push(a.clone());
+        source.storage_buffers_descriptors.extend([b, a]);
+        let program = vec![H::Immediate as u32, H::Storage as u32, H::Storage as u32, 0];
+        base.handle_programs.push(program.clone());
+        source.handle_programs.push(program);
+        let desc = ImageDescriptor {
+            handle_program: 0, texture_type: TextureType::Color2D, format: ImageFormat::R32Uint,
+            is_written: true, is_read: false, is_integer: false,
+            cbuf_index: 0, cbuf_offset: 0, count: 1, size_shift: DESCRIPTOR_SIZE_SHIFT,
+        };
+        base.image_descriptors.push(desc.clone());
+        source.image_descriptors.push(desc);
+        let storage = join_storage_info(&mut base, &mut source);
+        assert_eq!(storage, [1, 0]);
+        let images = join_texture_info(&mut base, &mut source);
+        assert_eq!(images[3], [1]);
+        // An immediate whose value equals the Storage opcode must not be patched.
+        assert_eq!(base.handle_programs[1], [H::Immediate as u32, H::Storage as u32, H::Storage as u32, 1]);
+        let mut blocks = [Block::new()];
+        blocks[0].append_inst(Inst::with_flags(Opcode::ImageWrite, vec![], TextureInstInfo {
+            descriptor_index: 0, texture_type: TextureType::Color2D as u8, ..Default::default()
+        }.to_u32()));
+        blocks[0].append_inst(Inst::new(Opcode::WriteStorage32,
+            vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU32(7)]));
+        blocks[0].append_inst(Inst::new(Opcode::StorageAtomicIAdd32,
+            vec![Value::ImmU32(1), Value::ImmU32(0), Value::ImmU32(7)]));
+        remap_texture_bindings(&mut blocks, &images);
+        remap_storage_bindings(&mut blocks, &storage);
+        assert_eq!(TextureInstInfo::from_u32(blocks[0].inst(0).flags).descriptor_index, 1);
+        assert_eq!(blocks[0].inst(1).args[0], Value::ImmU32(1));
+        assert_eq!(blocks[0].inst(2).args[0], Value::ImmU32(0));
+    }
+
+    #[test]
+    fn join_texture_info_preserves_distinct_computed_programs() {
+        use crate::shader_info::HandleOp as H;
+        let mut base = ShaderInfo::default();
+        let mut source = ShaderInfo::default();
+        let descriptor = ImageDescriptor {
+            handle_program: 0,
+            texture_type: TextureType::Color2D,
+            format: ImageFormat::R32Uint,
+            is_written: false, is_read: true, is_integer: false,
+            cbuf_index: 0, cbuf_offset: 0, count: 1,
+            size_shift: DESCRIPTOR_SIZE_SHIFT,
+        };
+        base.handle_programs.push(vec![H::Immediate as u32, 17]);
+        source.handle_programs.push(vec![H::Immediate as u32, 29]);
+        base.image_descriptors.push(descriptor.clone());
+        source.image_descriptors.push(descriptor);
+        join_texture_info(&mut base, &mut source);
+        assert_eq!(base.image_descriptors.len(), 2,
+            "source-local program zero must not alias destination program zero");
+        for (descriptor, expected) in base.image_descriptors.iter().zip([17, 29]) {
+            assert_eq!(crate::shader_info::evaluate_handle_program(
+                &base.handle_programs[descriptor.handle_program as usize],
+                |_, _| panic!("constant program"), |_, _| panic!("constant program"),
+            ), Some(expected));
+        }
+    }
+
+    #[test]
     fn join_texture_info_dedupes_and_merges_image_flags() {
         let mut base = ShaderInfo::default();
         let mut source = ShaderInfo::default();
         base.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32Uint,
             is_written: false,
@@ -2027,6 +2741,7 @@ mod tests {
             size_shift: DESCRIPTOR_SIZE_SHIFT,
         });
         source.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32Uint,
             is_written: true,
@@ -2080,6 +2795,7 @@ mod tests {
         let mut base = ShaderInfo::default();
         let mut source = ShaderInfo::default();
         base.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -2095,6 +2811,7 @@ mod tests {
             size_shift: DESCRIPTOR_SIZE_SHIFT,
         });
         source.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: true,

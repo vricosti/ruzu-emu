@@ -259,12 +259,15 @@ pub fn configure_graphics_resources(
                 descriptor.cbuf_index,
                 descriptor.cbuf_offset,
                 descriptor.is_written,
+                descriptor.indirect_offset,
             );
         }
 
         for descriptor in &info.texture_buffer_descriptors {
             for element in 0..descriptor.count {
                 let (tic, _) = read_texture_handle(
+                    info,
+                    descriptor.handle_program,
                     draw,
                     stage,
                     descriptor.cbuf_index,
@@ -289,6 +292,8 @@ pub fn configure_graphics_resources(
         for descriptor in &info.image_buffer_descriptors {
             for element in 0..descriptor.count {
                 let (tic, _) = read_texture_handle(
+                    info,
+                    descriptor.handle_program,
                     draw,
                     stage,
                     descriptor.cbuf_index,
@@ -313,6 +318,8 @@ pub fn configure_graphics_resources(
         for descriptor in &info.texture_descriptors {
             for element in 0..descriptor.count {
                 let (tic, tsc) = read_texture_handle(
+                    info,
+                    descriptor.handle_program,
                     draw,
                     stage,
                     descriptor.cbuf_index,
@@ -338,6 +345,8 @@ pub fn configure_graphics_resources(
         for descriptor in &info.image_descriptors {
             for element in 0..descriptor.count {
                 let (tic, _) = read_texture_handle(
+                    info,
+                    descriptor.handle_program,
                     draw,
                     stage,
                     descriptor.cbuf_index,
@@ -539,6 +548,8 @@ pub fn configure_graphics_resources(
 
 #[allow(clippy::too_many_arguments)]
 fn read_texture_handle(
+    info: &ShaderInfo,
+    handle_program: u32,
     draw: &Maxwell3DDrawView<'_>,
     stage: usize,
     cbuf_index: u32,
@@ -553,6 +564,25 @@ fn read_texture_handle(
     via_header: bool,
     read_gpu: &mut impl FnMut(u64, &mut [u8]),
 ) -> Result<(u32, u32), MetalGraphicsPipelineError> {
+    // Metal has no Eden counterpart; share the native Vulkan evaluator while
+    // retaining graphics binding ownership in this pipeline.
+    if handle_program != u32::MAX {
+        let raw = crate::shader_handle_program::evaluate_texture_handle(
+            info,
+            handle_program,
+            |index| {
+                if index as usize >= ShaderInfo::MAX_CBUFS { return 0; }
+                let cbuf = draw.const_buffer_binding(stage, index as usize);
+                if cbuf.enabled { cbuf.address } else { 0 }
+            },
+            |address| {
+                let mut bytes = [0; 4];
+                read_gpu(address, &mut bytes);
+                u32::from_le_bytes(bytes)
+            },
+        );
+        return Ok(texture_pair(raw, via_header));
+    }
     let index_offset = element.wrapping_shl(size_shift);
     let primary = draw.const_buffer_binding(stage, cbuf_index as usize);
     if !primary.enabled {
@@ -1127,8 +1157,7 @@ mod tests {
                 cbuf_index: 1,
                 cbuf_offset: 0,
                 count: 3,
-                is_written: false,
-            });
+                is_written: false, ..Default::default() });
 
         assert_eq!(descriptor_binding_count(&info), 2);
     }

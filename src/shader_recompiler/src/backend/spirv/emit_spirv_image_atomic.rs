@@ -298,6 +298,7 @@ mod tests {
         let mut program = Program::new(ShaderStage::Fragment);
         program.blocks.push(Block::new());
         program.info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32Uint,
             is_written: true,

@@ -44,6 +44,7 @@ pub mod profile;
 pub mod program_header;
 pub mod runtime_info;
 pub mod shader_info;
+pub mod storage_write_extent;
 pub mod stage;
 pub mod varying_state;
 

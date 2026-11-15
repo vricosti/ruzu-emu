@@ -1746,10 +1746,13 @@ impl System {
         }
         self.set_shutting_down(false);
         self.hardware_profile = self.hardware_profile_override.unwrap_or(detected_profile);
+        self.core_timing.set_guest_cntfrq(self.hardware_profile.counter_frequency());
+        log::info!("Guest counter frequency: {} Hz", self.core_timing.get_guest_cntfrq());
         {
             let mut settings = common::settings::values_mut();
             settings.use_session_astc_recompression = self.hardware_profile == hardware_properties::NX2_PROFILE;
             settings.use_nx2_session_policies = self.hardware_profile == hardware_properties::NX2_PROFILE;
+            settings.set_session_graphics_defaults(self.hardware_profile == hardware_properties::NX2_PROFILE);
             // Only a fallback: a renderer whose device samples ASTC natively
             // never converts, whatever this mode says. The renderer logs which
             // of the two applies once the device is known.
@@ -2199,6 +2202,7 @@ impl System {
             let mut values = common::settings::values_mut();
             values.use_session_astc_recompression = false;
             values.use_nx2_session_policies = false;
+            values.set_session_graphics_defaults(false);
             values.session_device_vram_bytes = 0;
         }
         // Upstream: host1x_core.reset();
@@ -3106,6 +3110,7 @@ impl System {
     pub fn new_for_test_with_hardware_profile(profile: hardware_properties::HardwareProfile) -> Self {
         let mut system = Self::new();
         system.hardware_profile = profile;
+        system.core_timing.set_guest_cntfrq(profile.counter_frequency());
         system.initialize_for_test();
         system
     }

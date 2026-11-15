@@ -402,7 +402,7 @@ impl ComputePipeline {
         for desc in &info.texture_buffer_descriptors {
             for index in 0..desc.count {
                 let (tic_index, _) =
-                    Self::read_handle(qmd, desc, index, via_header_index, &mut read_u32);
+                    Self::read_handle(info, qmd, desc, index, via_header_index, &mut read_u32);
                 result.push_view(ImageViewInOut {
                     index: tic_index,
                     ..Default::default()
@@ -412,6 +412,7 @@ impl ComputePipeline {
         for desc in &info.image_buffer_descriptors {
             Self::add_image_handles(
                 &mut result,
+                info,
                 qmd,
                 desc,
                 false,
@@ -423,7 +424,7 @@ impl ComputePipeline {
         for desc in &info.texture_descriptors {
             for index in 0..desc.count {
                 let (tic_index, tsc_index) =
-                    Self::read_handle(qmd, desc, index, via_header_index, &mut read_u32);
+                    Self::read_handle(info, qmd, desc, index, via_header_index, &mut read_u32);
                 result.push_view(ImageViewInOut {
                     index: tic_index,
                     ..Default::default()
@@ -435,6 +436,7 @@ impl ComputePipeline {
         for desc in &info.image_descriptors {
             Self::add_image_handles(
                 &mut result,
+                info,
                 qmd,
                 desc,
                 desc.is_written,
@@ -574,6 +576,8 @@ impl ComputePipeline {
                 desc.cbuf_index,
                 desc.cbuf_offset,
                 desc.is_written,
+                desc.indirect_offset,
+                &desc.write_extent,
             );
         }
     }
@@ -773,12 +777,24 @@ impl ComputePipeline {
     }
 
     fn read_handle(
+        info: &Info,
         qmd: &LaunchParams,
         desc: &impl ComputeHandleDescriptor,
         index: u32,
         via_header_index: bool,
         read_u32: &mut impl FnMut(u64) -> u32,
     ) -> (u32, u32) {
+        if desc.handle_program() != u32::MAX {
+            let raw = crate::shader_handle_program::evaluate_texture_handle(
+                info,
+                desc.handle_program(),
+                |index| qmd.const_buffers.get(index as usize)
+                    .filter(|_| ((qmd.const_buffer_enable_mask >> index) & 1) != 0)
+                    .map_or(0, |cbuf| cbuf.address),
+                read_u32,
+            );
+            return texture_pair(raw, via_header_index);
+        }
         assert_compute_cbuf_enabled(qmd, desc.cbuf_index());
         let index_offset = index << desc.size_shift();
         let offset = desc.cbuf_offset().wrapping_add(index_offset);
@@ -801,6 +817,7 @@ impl ComputePipeline {
 
     fn add_image_handles(
         bindings: &mut ComputeTextureBindings,
+        info: &Info,
         qmd: &LaunchParams,
         desc: &impl ComputeHandleDescriptor,
         blacklist: bool,
@@ -809,7 +826,7 @@ impl ComputePipeline {
     ) {
         for index in 0..desc.count() {
             bindings.push_view(ImageViewInOut {
-                index: Self::read_handle(qmd, desc, index, via_header_index, read_u32).0,
+                index: Self::read_handle(info, qmd, desc, index, via_header_index, read_u32).0,
                 blacklist,
                 ..Default::default()
             });
@@ -868,6 +885,7 @@ fn assert_compute_cbuf_enabled(qmd: &LaunchParams, cbuf_index: u32) {
 }
 
 trait ComputeHandleDescriptor {
+    fn handle_program(&self) -> u32;
     fn has_secondary(&self) -> bool {
         false
     }
@@ -890,6 +908,7 @@ trait ComputeHandleDescriptor {
 }
 
 impl ComputeHandleDescriptor for TextureBufferDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn has_secondary(&self) -> bool {
         self.has_secondary
     }
@@ -928,6 +947,7 @@ impl ComputeHandleDescriptor for TextureBufferDescriptor {
 }
 
 impl ComputeHandleDescriptor for TextureDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn has_secondary(&self) -> bool {
         self.has_secondary
     }
@@ -966,6 +986,7 @@ impl ComputeHandleDescriptor for TextureDescriptor {
 }
 
 impl ComputeHandleDescriptor for ImageBufferDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn cbuf_index(&self) -> u32 {
         self.cbuf_index
     }
@@ -984,6 +1005,7 @@ impl ComputeHandleDescriptor for ImageBufferDescriptor {
 }
 
 impl ComputeHandleDescriptor for ImageDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn cbuf_index(&self) -> u32 {
         self.cbuf_index
     }

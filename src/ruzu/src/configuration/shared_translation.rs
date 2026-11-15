@@ -215,6 +215,7 @@ pub const SCALING_FILTER: &[(ScalingFilter, &str)] = &[
         ScalingFilter::SgsrEdge,
         "Snapdragon Game Super Resolution EdgeDir",
     ),
+    (ScalingFilter::Fsr3, "FSR 1 Soft"),
 ];
 
 pub const ANTI_ALIASING: &[(AntiAliasing, &str)] = &[
@@ -319,6 +320,7 @@ pub const STATUS_SCALING_FILTER: &[(ScalingFilter, &str)] = &[
     (ScalingFilter::Mmpx, "MMPX"),
     (ScalingFilter::Sgsr, "SGSR"),
     (ScalingFilter::SgsrEdge, "SGSR EdgeDir"),
+    (ScalingFilter::Fsr3, "FSR 1 Soft"),
 ];
 
 pub const STATUS_CONSOLE_MODE: &[(ConsoleMode, &str)] = &[
@@ -388,6 +390,7 @@ mod tests {
                 "Spline-1",
                 "Snapdragon Game Super Resolution",
                 "Snapdragon Game Super Resolution EdgeDir",
+                "FSR 1 Soft",
             ]
         );
     }
@@ -425,7 +428,7 @@ mod tests {
                 "OpenGL SPIRV",
             ]
         );
-        assert_eq!(STATUS_SCALING_FILTER.len(), 15);
+        assert_eq!(STATUS_SCALING_FILTER.len(), 16);
         assert_eq!(
             STATUS_SCALING_FILTER[8],
             (ScalingFilter::ZeroTangent, "Zero-Tangent")

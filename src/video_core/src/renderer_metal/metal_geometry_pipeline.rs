@@ -789,8 +789,7 @@ mod tests {
             vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU32(1)]);
         collect_shader_info_pass(&mut program);
         program.info.storage_buffers_descriptors.push(StorageBufferDescriptor {
-            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true,
-        });
+            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true, ..Default::default() });
         let artifact = emit_msl_vertex_function(&program, &Profile { support_vertex_instance_id: true, ..Default::default() },
             &RuntimeInfo::default(), &MslOptions::default(), &mut Bindings::default()).unwrap();
         let runtime = RuntimeInfo { previous_stage_stores: program.info.stores, ..Default::default() };
@@ -912,8 +911,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         let runtime = RuntimeInfo {
             previous_stage_stores: program.info.stores.clone(),
             ..Default::default()

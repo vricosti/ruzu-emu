@@ -10,6 +10,30 @@ use shader_recompiler::shader_info::{
 };
 
 #[test]
+fn computed_image_handle_reads_current_binding_before_direct_cbuf_validation() {
+    use shader_recompiler::shader_info::HandleOp as H;
+    let mut info = Info::default();
+    info.handle_programs.push(vec![H::Cbuf as u32, 3, 12]);
+    info.image_buffer_descriptors.push(ImageBufferDescriptor {
+        handle_program: 0,
+        format: ImageFormat::Typeless,
+        is_written: false, is_read: true, is_integer: false,
+        cbuf_index: 0, cbuf_offset: 0, count: 1, size_shift: 3,
+    });
+    let mut qmd = LaunchParams::default();
+    qmd.const_buffer_enable_mask = 1 << 3;
+    qmd.const_buffers[3].address = 0x1000;
+    for handle in [17, 29] {
+        let result = ComputePipeline::collect_texture_bindings(&info, &qmd, |address| {
+            assert_eq!(address, 0x100c);
+            handle
+        }, |_| panic!("image has no sampler"));
+        assert_eq!(result.views.len(), 1);
+        assert_eq!(result.views[0].index, handle);
+    }
+}
+
+#[test]
 fn pipeline_programs_and_fence_use_upstream_raii_owners() {
     let pipeline = ComputePipeline::new_for_test(Info::default(), false, 0);
     assert_eq!(pipeline.source_program.handle, 0);
@@ -147,6 +171,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
     info.constant_buffer_used_sizes[8] = 0x90;
     info.texture_buffer_descriptors
         .push(TextureBufferDescriptor {
+            handle_program: u32::MAX,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -159,6 +184,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
         });
     info.texture_buffer_descriptors
         .push(TextureBufferDescriptor {
+            handle_program: u32::MAX,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -170,6 +196,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
             size_shift: 2,
         });
     info.image_buffer_descriptors.push(ImageBufferDescriptor {
+        handle_program: u32::MAX,
         format: ImageFormat::R32Uint,
         is_written: false,
         is_read: true,
@@ -180,6 +207,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
         size_shift: 2,
     });
     info.texture_descriptors.push(TextureDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         is_depth: false,
         is_multisample: false,
@@ -195,6 +223,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
         size_shift: 2,
     });
     info.image_descriptors.push(ImageDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         format: ImageFormat::R32Uint,
         is_written: false,
@@ -210,8 +239,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
             cbuf_index: 0,
             cbuf_offset: 0x20,
             count: 2,
-            is_written: true,
-        });
+            is_written: true, ..Default::default() });
     info.uses_local_memory = true;
 
     let glsl_state = ComputePipeline::info_state(&info, false, 0);
@@ -238,6 +266,7 @@ fn compute_pipeline_info_state_matches_upstream_constructor_metadata() {
 fn descriptor_capacity_assertions_are_fail_soft_like_eden() {
     let mut info = Info::default();
     info.texture_descriptors.push(TextureDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         is_depth: false,
         is_multisample: false,
@@ -253,6 +282,7 @@ fn descriptor_capacity_assertions_are_fail_soft_like_eden() {
         size_shift: 2,
     });
     info.image_descriptors.push(ImageDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         format: ImageFormat::R32Uint,
         is_written: false,
@@ -280,15 +310,13 @@ fn configure_buffer_state_follows_upstream_compute_order() {
             cbuf_index: 0,
             cbuf_offset: 0x100,
             count: 1,
-            is_written: false,
-        });
+            is_written: false, ..Default::default() });
     info.storage_buffers_descriptors
         .push(StorageBufferDescriptor {
             cbuf_index: 2,
             cbuf_offset: 0x200,
             count: 1,
-            is_written: true,
-        });
+            is_written: true, ..Default::default() });
 
     let pipeline = ComputePipeline::new_for_test(info, false, 0);
     let tracker = MaxwellDeviceMemoryManager::default();
@@ -336,6 +364,7 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
     let mut info = Info::default();
     info.texture_buffer_descriptors
         .push(TextureBufferDescriptor {
+            handle_program: u32::MAX,
             has_secondary: false,
             cbuf_index: 0,
             cbuf_offset: 0,
@@ -347,6 +376,7 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
             size_shift: 2,
         });
     info.image_buffer_descriptors.push(ImageBufferDescriptor {
+        handle_program: u32::MAX,
         format: ImageFormat::R32Uint,
         is_written: false,
         is_read: true,
@@ -357,6 +387,7 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
         size_shift: 2,
     });
     info.texture_descriptors.push(TextureDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         is_depth: false,
         is_multisample: false,
@@ -372,6 +403,7 @@ fn collect_texture_handles_follows_upstream_compute_order_and_pairs() {
         size_shift: 2,
     });
     info.image_descriptors.push(ImageDescriptor {
+        handle_program: u32::MAX,
         texture_type: TextureType::Color2D,
         format: ImageFormat::R32Uint,
         is_written: true,

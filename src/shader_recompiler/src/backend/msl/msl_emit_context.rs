@@ -440,10 +440,7 @@ impl MslEmitContext {
                 .storage_buffers_descriptors
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| {
-                    *index < u16::BITS as usize
-                        && program.info.nvn_buffer_used & (1u16 << index) != 0
-                })
+                .filter(|(_, descriptor)| program.info.uses_nvn_storage_descriptor(descriptor))
                 .map(|(index, descriptor)| {
                     Ok(MslGlobalMemoryResource {
                         cbuf_name: constant_buffers

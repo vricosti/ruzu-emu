@@ -10,8 +10,9 @@ use common::heap_tracker::HeapTracker;
 use common::host_memory::HostMemory;
 use common::page_table::{PageEntryData, PageTable, PageType};
 use common::scratch_buffer::ScratchBuffer;
+use std::collections::BTreeSet;
 use std::sync::{
-    atomic::{AtomicU16, AtomicU64, Ordering},
+    atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -141,6 +142,11 @@ pub struct Memory {
     /// Upstream owner: `rasterizer_read_areas[Core::Hardware::NUM_CPU_CORES]`.
     rasterizer_read_areas:
         [Mutex<RasterizerDownloadArea>; hardware_properties::MAX_NUM_CPU_CORES],
+    /// Lichii memory.cpp: generation invalidates previously clean read areas.
+    read_area_generations: [AtomicU64; hardware_properties::MAX_NUM_CPU_CORES],
+    read_trap_generation: AtomicU64,
+    armed_read_traps: Mutex<BTreeSet<u64>>,
+    armed_read_trap_count: AtomicUsize,
     /// Upstream owner: `rasterizer_write_areas[Core::Hardware::NUM_CPU_CORES]`.
     rasterizer_write_areas: [Mutex<GpuDirtyState>; hardware_properties::MAX_NUM_CPU_CORES],
     /// Upstream owner: `std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers`.
@@ -467,6 +473,10 @@ impl Memory {
             heap_tracker: None,
             current_page_table: std::ptr::null_mut(),
             rasterizer_read_areas: new_rasterizer_read_areas(),
+            read_area_generations: std::array::from_fn(|_| AtomicU64::new(0)),
+            read_trap_generation: AtomicU64::new(0),
+            armed_read_traps: Mutex::new(BTreeSet::new()),
+            armed_read_trap_count: AtomicUsize::new(0),
             rasterizer_write_areas: std::array::from_fn(|_| Mutex::new(GpuDirtyState::default())),
             gpu_dirty_managers: Vec::new(),
             smmu_scratch_buffers: std::array::from_fn(|_| Mutex::new(ScratchBuffer::new())),
@@ -521,6 +531,20 @@ impl Memory {
     /// Set the current page table and wire up the fastmem arena.
     /// Matches upstream `Memory::Impl::SetCurrentPageTable`.
     pub fn set_current_page_table(&mut self, page_table: *mut PageTable, is_application: bool) {
+        // Trap ownership is tied to this address space, not reusable virtual
+        // addresses in a different table. Release old read traps before forgetting
+        // them; writes to cached pages remain protected.
+        if self.current_page_table != page_table {
+            let pages: Vec<_> = self.armed_read_traps.get_mut().unwrap().iter().copied().collect();
+            for page in pages {
+                if self.page_type_at(page << PAGE_BITS) == Some(PageType::RasterizerCachedMemory) {
+                    self.protect_buffer((page << PAGE_BITS) as usize, PAGE_SIZE as usize, MemoryPermission::READ);
+                }
+            }
+            self.armed_read_traps.get_mut().unwrap().clear();
+            self.armed_read_trap_count.store(0, Ordering::Relaxed);
+            self.read_trap_generation.fetch_add(1, Ordering::Release);
+        }
         self.current_page_table = page_table;
         if !page_table.is_null() && !self.buffer.is_null() {
             let pt = unsafe { &mut *page_table };
@@ -912,6 +936,14 @@ impl Memory {
         debug_assert!((size & PAGE_MASK) == 0);
         debug_assert!((base & PAGE_MASK) == 0);
 
+        if std::ptr::eq(page_table, self.current_page_table) {
+            // Forget traps without restoring permissions on pages being unmapped.
+            let mut traps = self.armed_read_traps.lock().unwrap();
+            traps.retain(|page| *page < base / PAGE_SIZE || *page >= (base + size) / PAGE_SIZE);
+            self.armed_read_trap_count.store(traps.len(), Ordering::Relaxed);
+            self.read_trap_generation.fetch_add(1, Ordering::Release);
+        }
+
         self.map_pages(
             page_table,
             base / PAGE_SIZE,
@@ -1194,7 +1226,13 @@ impl Memory {
                 perm |= MemoryPermission::WRITE;
             }
             self.protect_buffer(vaddr as usize, size as usize, perm);
+            if cached && !perm.is_empty() {
+                self.protect_armed_pages(vaddr, size);
+            }
         }
+
+        // Retain armed ownership while temporarily uncached, like Lichii.
+        // Recaching restores protection even if BufferCache deduplicates arms.
 
         // Upstream computes `num_pages` as
         //   ((vaddr + size - 1) >> PAGEBITS) - (vaddr >> PAGEBITS) + 1
@@ -1295,6 +1333,76 @@ impl Memory {
         }
     }
 
+    /// Port of Lichii Memory::Impl::ReadTrapsEnabled. The fence-download policy
+    /// must retain its fallback when fastmem protection is unavailable.
+    fn read_traps_enabled(&self) -> bool {
+        if self.current_page_table.is_null() {
+            return false;
+        }
+        let settings = common::settings::values();
+        !unsafe { &*self.current_page_table }.fastmem_arena.is_null()
+            && !*settings.use_reactive_flushing.get_value()
+            && *settings.cpu_backend.get_value() != common::settings_enums::CpuBackend::Nce
+    }
+
+    /// Lichii RasterizerArmReadTraps: newly GPU-written cached pages lose CPU
+    /// read permission until the slow path downloads their contents.
+    pub fn rasterizer_arm_read_traps(&self, vaddr: u64, size: u64) {
+        self.read_trap_generation.fetch_add(1, Ordering::Release);
+        if vaddr == 0 || size == 0 || !self.address_space_contains(vaddr, size as usize)
+            || !self.read_traps_enabled()
+        {
+            return;
+        }
+        let page_end = ((vaddr + size - 1) >> PAGE_BITS) + 1;
+        let mut traps = self.armed_read_traps.lock().unwrap();
+        let mut run_begin = 0;
+        let mut run_pages = 0;
+        let protect_run = |begin: u64, pages: &mut u64| {
+            if *pages != 0 {
+                self.read_trap_generation.fetch_add(1, Ordering::Release);
+                self.protect_buffer((begin << PAGE_BITS) as usize,
+                    (*pages << PAGE_BITS) as usize, MemoryPermission::empty());
+                *pages = 0;
+            }
+        };
+        for page in (vaddr >> PAGE_BITS)..page_end {
+            let cached = self.page_type_at(page << PAGE_BITS) == Some(PageType::RasterizerCachedMemory);
+            self.armed_read_trap_count.fetch_add(1, Ordering::Relaxed);
+            if !cached || !traps.insert(page) {
+                self.armed_read_trap_count.fetch_sub(1, Ordering::Relaxed);
+                protect_run(run_begin, &mut run_pages);
+                continue;
+            }
+            if run_pages == 0 { run_begin = page; }
+            run_pages += 1;
+        }
+        protect_run(run_begin, &mut run_pages);
+    }
+
+    fn protect_armed_pages(&self, vaddr: u64, size: u64) {
+        if size == 0 || self.armed_read_trap_count.load(Ordering::Relaxed) == 0 { return; }
+        let traps = self.armed_read_traps.lock().unwrap();
+        let end = ((vaddr + size - 1) >> PAGE_BITS) + 1;
+        for page in traps.range((vaddr >> PAGE_BITS)..end) {
+            self.protect_buffer((*page << PAGE_BITS) as usize, PAGE_SIZE as usize, MemoryPermission::empty());
+        }
+    }
+
+    fn disarm_read_traps(&self, vaddr: u64, size: usize) {
+        if size == 0 || self.armed_read_trap_count.load(Ordering::Relaxed) == 0 { return; }
+        let mut traps = self.armed_read_traps.lock().unwrap();
+        let begin = vaddr >> PAGE_BITS;
+        let end = ((vaddr + size as u64 - 1) >> PAGE_BITS) + 1;
+        while let Some(page) = traps.range(begin..end).next().copied() {
+            if self.page_type_at(page << PAGE_BITS) == Some(PageType::RasterizerCachedMemory) {
+                self.protect_buffer((page << PAGE_BITS) as usize, PAGE_SIZE as usize, MemoryPermission::READ);
+            }
+            traps.remove(&page);
+            self.armed_read_trap_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     fn current_host_thread_cache_index(&self) -> usize {
         if self.system.is_null() {
             return 0;
@@ -1307,11 +1415,11 @@ impl Memory {
     }
 
     fn handle_rasterizer_download(&self, vaddr: u64, size: usize) {
-        self.handle_rasterizer_download_on_pointer(self.get_pointer_impl(vaddr), size);
+        self.handle_rasterizer_download_on_pointer(self.get_pointer_impl(vaddr), size, Some(vaddr));
     }
 
     /// Upstream HandleRasterizerDownload after virtual-to-host translation.
-    fn handle_rasterizer_download_on_pointer(&self, host_ptr: *mut u8, size: usize) {
+    fn handle_rasterizer_download_on_pointer(&self, host_ptr: *mut u8, size: usize, vaddr: Option<u64>) {
         if self.system.is_null() {
             return;
         }
@@ -1320,11 +1428,35 @@ impl Memory {
             return;
         };
 
-        let core = self.current_host_thread_cache_index();
+        // Lichii DownloadFromRasterizer: service threads have no per-core read
+        // area. In particular, they must not reuse the last guest CPU's area
+        // or hold its scratch mutex while waiting for the GPU.
+        let core = self.system.get().current_host_thread_id();
+        if core >= self.system.get().hardware_profile().num_cpu_cores() as usize {
+            if let Some(host1x) = self.system.get().host1x_core() {
+                let mut scratch = ScratchBuffer::new();
+                host1x.smmu_apply_op_on_host_pointer(
+                    host_ptr as usize,
+                    &mut scratch,
+                    &mut |device_addr| {
+                        if let Some(vaddr) = vaddr {
+                            self.disarm_read_traps(vaddr, size);
+                        }
+                        let _ = gpu.on_cpu_read(device_addr, size as u64);
+                    },
+                );
+            }
+            return;
+        }
         let mut download = |device_addr: u64| {
             let end_address = device_addr.wrapping_add(size as u64);
             {
-                let current_area = self.rasterizer_read_areas[core].lock().unwrap();
+                let mut current_area = self.rasterizer_read_areas[core].lock().unwrap();
+                let generation = self.read_trap_generation.load(Ordering::Acquire);
+                if self.read_area_generations[core].load(Ordering::Relaxed) != generation {
+                    *current_area = RasterizerDownloadArea::default();
+                    self.read_area_generations[core].store(generation, Ordering::Relaxed);
+                }
                 if current_area.start_address <= device_addr
                     && end_address <= current_area.end_address
                 {
@@ -1332,6 +1464,9 @@ impl Memory {
                 }
             }
 
+            if let Some(vaddr) = vaddr {
+                self.disarm_read_traps(vaddr, size);
+            }
             let new_area = gpu.on_cpu_read(device_addr, size as u64);
             *self.rasterizer_read_areas[core].lock().unwrap() = new_area;
         };
@@ -2212,7 +2347,11 @@ impl Memory {
                 if self.page_type_in_table(page_table, vaddr)
                     == Some(PageType::RasterizerCachedMemory)
                 {
-                    self.handle_rasterizer_download_on_pointer(ptr, copy_amount);
+                    // Explicit-table kernel copies may address a different
+                    // process. Never consume this process's same-VA trap then.
+                    let trap_vaddr = std::ptr::eq(page_table, self.current_page_table)
+                        .then_some(vaddr);
+                    self.handle_rasterizer_download_on_pointer(ptr, copy_amount, trap_vaddr);
                 }
                 unsafe {
                     std::ptr::copy_nonoverlapping(ptr, dest[offset..].as_mut_ptr(), copy_amount);
@@ -3623,11 +3762,12 @@ mod zero_phys_block_tests {
 
 #[cfg(test)]
 mod rasterizer_download_tests {
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     use common::page_table::{PageTable, PageType};
 
-    use super::{dram_memory_map, DeviceMemory, Memory, PAGE_BITS, PAGE_SIZE};
+    use super::{dram_memory_map, DeviceMemory, Memory, MemoryPermission, PAGE_BITS, PAGE_SIZE};
     use crate::core::{System, SystemRef};
     use crate::gpu_core::{
         FramebufferConfig, GpuChannelHandle, GpuCommandList, GpuCoreInterface,
@@ -3928,6 +4068,7 @@ mod rasterizer_download_tests {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let applied_host_ptrs = Arc::new(Mutex::new(Vec::new()));
         let mut system = System::new_boxed_for_test();
+        system.kernel().unwrap().register_core_thread(0);
         system.set_gpu_core(Box::new(FakeGpuCore {
             reads: reads.clone(),
             writes: writes.clone(),
@@ -3979,6 +4120,7 @@ mod rasterizer_download_tests {
         let reads = Arc::new(Mutex::new(Vec::new()));
         let applied_host_ptrs = Arc::new(Mutex::new(Vec::new()));
         let mut system = System::new_for_test();
+        system.kernel().unwrap().register_core_thread(0);
         system.set_gpu_core(Box::new(FakeGpuCore {
             reads: reads.clone(),
             writes: Arc::new(Mutex::new(Vec::new())),
@@ -3997,6 +4139,135 @@ mod rasterizer_download_tests {
 
         let reads = reads.lock().unwrap();
         assert_eq!(&*reads, &[(device_addr + 0x20, 4)]);
+    }
+
+    #[test]
+    fn rasterizer_download_host_reads_do_not_reuse_or_modify_guest_core_area() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut system = System::new_boxed_for_test();
+        assert!(system.current_host_thread_id() >= system.hardware_profile().num_cpu_cores() as usize);
+        system.set_gpu_core(Box::new(FakeGpuCore {
+            reads: reads.clone(),
+            writes: Arc::new(Mutex::new(Vec::new())),
+            download_size: 0x100,
+        }));
+        let (_device_memory, _page_table, memory, vaddr, device_addr) =
+            make_rasterizer_cached_memory(&system);
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            applied_host_ptrs: Arc::new(Mutex::new(Vec::new())),
+            aliases: vec![device_addr + 0x20],
+        }));
+        let last_core = system.hardware_profile().num_cpu_cores() as usize - 1;
+        *memory.rasterizer_read_areas[last_core].lock().unwrap() = RasterizerDownloadArea {
+            start_address: device_addr,
+            end_address: device_addr + 0x100,
+            ..Default::default()
+        };
+        memory.read_area_generations[last_core].store(
+            memory.read_trap_generation.load(Ordering::Acquire), Ordering::Relaxed);
+        // A host read cannot borrow a core's clean-area claim. Nor can a host
+        // remember its own previous read: the GPU may have written again.
+        memory.handle_rasterizer_download(vaddr + 0x20, 4);
+        memory.handle_rasterizer_download(vaddr + 0x20, 4);
+        assert_eq!(&*reads.lock().unwrap(), &[(device_addr + 0x20, 4); 2]);
+        let area = memory.rasterizer_read_areas[last_core].lock().unwrap();
+        assert_eq!(area.start_address, device_addr);
+        assert_eq!(area.end_address, device_addr + 0x100);
+        drop(area);
+        system.kernel().unwrap().register_core_thread(last_core);
+        memory.handle_rasterizer_download(vaddr + 0x20, 4);
+        assert_eq!(reads.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rasterizer_download_generation_invalidates_clean_area_without_fastmem() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut system = System::new_boxed_for_test();
+        system.kernel().unwrap().register_core_thread(0);
+        system.set_gpu_core(Box::new(FakeGpuCore {
+            reads: reads.clone(), writes: Arc::new(Mutex::new(Vec::new())), download_size: 0x100,
+        }));
+        let (_device_memory, mut page_table, memory, vaddr, device_addr) =
+            make_rasterizer_cached_memory(&system);
+        page_table.fastmem_arena = std::ptr::null_mut();
+        system.set_host1x_core(Box::new(FakeHost1xCore {
+            applied_host_ptrs: Arc::new(Mutex::new(Vec::new())), aliases: vec![device_addr],
+        }));
+        memory.handle_rasterizer_download(vaddr, 4);
+        memory.handle_rasterizer_download(vaddr, 4);
+        assert_eq!(reads.lock().unwrap().len(), 1);
+        memory.rasterizer_arm_read_traps(vaddr, PAGE_SIZE);
+        assert_eq!(memory.armed_read_trap_count.load(Ordering::Relaxed), 0);
+        memory.handle_rasterizer_download(vaddr, 4);
+        assert_eq!(reads.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn read_traps_arm_consume_rearm_and_forget_unmapped_pages() {
+        const CHILD: &str = "RUZU_TEST_READ_TRAP_LIFECYCLE";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "memory::memory::rasterizer_download_tests::read_traps_arm_consume_rearm_and_forget_unmapped_pages"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        {
+            let mut settings = common::settings::values_mut();
+            settings.use_reactive_flushing.set_value(false);
+            settings.cpu_backend.set_value(common::settings_enums::CpuBackend::Dynarmic);
+        }
+        let system = System::new_boxed_for_test();
+        let (device, mut table, mut memory, vaddr, _) = make_rasterizer_cached_memory(&system);
+        table.fastmem_arena = device.buffer.virtual_base_pointer();
+        assert!(!table.fastmem_arena.is_null());
+        device.buffer.map(vaddr as usize, 0x2000, PAGE_SIZE as usize,
+            MemoryPermission::READ | MemoryPermission::WRITE, false);
+        memory.rasterizer_arm_read_traps(vaddr, PAGE_SIZE);
+        memory.rasterizer_arm_read_traps(vaddr, PAGE_SIZE);
+        assert_eq!(memory.armed_read_trap_count.load(Ordering::Relaxed), 1);
+        assert!(memory.armed_read_traps.lock().unwrap().contains(&(vaddr >> PAGE_BITS)));
+        #[cfg(target_os = "linux")]
+        let permissions = || {
+            let address = table.fastmem_arena as usize + vaddr as usize;
+            let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+            maps.lines().find_map(|line| {
+                let mut parts = line.split_whitespace();
+                let (start, end) = parts.next()?.split_once('-')?;
+                let start = usize::from_str_radix(start, 16).ok()?;
+                let end = usize::from_str_radix(end, 16).ok()?;
+                (start <= address && address < end).then(|| parts.next().unwrap().to_owned())
+            }).expect("fastmem mapping must exist")
+        };
+        #[cfg(target_os = "linux")]
+        assert!(permissions().starts_with("---"));
+        memory.rasterizer_mark_region_cached(vaddr, PAGE_SIZE, true);
+        #[cfg(target_os = "linux")]
+        assert!(permissions().starts_with("---"), "recaching lost the read trap");
+        memory.disarm_read_traps(vaddr, 4);
+        assert_eq!(memory.armed_read_trap_count.load(Ordering::Relaxed), 0);
+        #[cfg(target_os = "linux")]
+        assert!(permissions().starts_with("r--"), "writes must remain trapped");
+        // The backing value is visible through the read-only fastmem alias.
+        unsafe {
+            device.buffer.backing_base_pointer().add(0x2000).write(0x5a);
+            assert_eq!(table.fastmem_arena.add(vaddr as usize).read(), 0x5a);
+        }
+        memory.rasterizer_arm_read_traps(vaddr, PAGE_SIZE);
+        memory.rasterizer_mark_region_cached(vaddr, PAGE_SIZE, false);
+        assert_eq!(memory.armed_read_trap_count.load(Ordering::Relaxed), 1);
+        #[cfg(target_os = "linux")]
+        assert!(permissions().starts_with("rw-"));
+        memory.rasterizer_mark_region_cached(vaddr, PAGE_SIZE, true);
+        #[cfg(target_os = "linux")]
+        assert!(permissions().starts_with("---"), "recaching must restore retained traps");
+        memory.rasterizer_arm_read_traps(vaddr, PAGE_SIZE);
+        memory.unmap_region(&mut table, vaddr, PAGE_SIZE, false);
+        assert!(memory.armed_read_traps.lock().unwrap().is_empty());
+        assert_eq!(memory.armed_read_trap_count.load(Ordering::Relaxed), 0);
+        memory.set_current_page_table(std::ptr::null_mut(), false);
+        memory.rasterizer_arm_read_traps(vaddr, PAGE_SIZE);
+        assert_eq!(memory.armed_read_trap_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]

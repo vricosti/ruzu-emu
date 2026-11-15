@@ -411,6 +411,17 @@ pub struct Values {
 }
 
 impl Values {
+    /// Session defaults requested for NX2. System owns the hardware decision;
+    /// settings only retain temporary values, leaving global/per-title INI data intact.
+    pub fn set_session_graphics_defaults(&mut self, nx2: bool) {
+        self.gpu_accuracy.set_session_default(nx2.then_some(GpuAccuracy::Low));
+        self.use_docked_mode.set_session_default(nx2.then_some(ConsoleMode::Handheld));
+        self.anti_aliasing.set_session_default(nx2.then_some(AntiAliasing::Fxaa));
+        self.scaling_filter.set_session_default(nx2.then_some(ScalingFilter::Fsr3));
+        self.fsr_sharpening_slider.set_session_default(nx2.then_some(25));
+        update_gpu_accuracy(self);
+    }
+
     /// Session extension of the upstream ASTC setting. All render consumers
     /// must use the same effective mode for format, byte size and conversion.
     ///
@@ -2127,6 +2138,41 @@ pub type Settings = Values;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_graphics_defaults_are_transient_and_custom_settings_win() {
+        use crate::settings_setting::BasicSetting;
+        let mut settings = Values::default();
+        settings.gpu_accuracy.set_value(GpuAccuracy::High);
+        settings.use_docked_mode.set_value(ConsoleMode::Docked);
+        settings.scaling_filter.set_value(ScalingFilter::NearestNeighbor);
+        let persisted = settings.scaling_filter.to_string_global();
+        settings.set_session_graphics_defaults(true);
+        assert_eq!(*settings.gpu_accuracy.get_value(), GpuAccuracy::Low);
+        assert_eq!(settings.current_gpu_accuracy, GpuAccuracy::Low);
+        assert_eq!(*settings.use_docked_mode.get_value(), ConsoleMode::Handheld);
+        assert_eq!(*settings.scaling_filter.get_value(), ScalingFilter::Fsr3);
+        assert_eq!(*settings.anti_aliasing.get_value(), AntiAliasing::Fxaa);
+        assert_eq!(*settings.fsr_sharpening_slider.get_value(), 25);
+        assert!(settings.scaling_filter.using_global());
+        assert_eq!(settings.scaling_filter.to_string_global(), persisted);
+        settings.set_session_graphics_defaults(false);
+        assert_eq!(*settings.scaling_filter.get_value(), ScalingFilter::NearestNeighbor);
+        assert_eq!(*settings.use_docked_mode.get_value(), ConsoleMode::Docked);
+        assert_eq!(settings.current_gpu_accuracy, GpuAccuracy::High);
+
+        settings.scaling_filter.set_global(false);
+        settings.scaling_filter.set_value(ScalingFilter::Bilinear);
+        settings.set_session_graphics_defaults(true);
+        assert_eq!(*settings.scaling_filter.get_value(), ScalingFilter::Bilinear);
+        // A live explicit user choice also overrides the session default.
+        settings.gpu_accuracy.set_value(GpuAccuracy::High);
+        update_gpu_accuracy(&mut settings);
+        assert_eq!(settings.current_gpu_accuracy, GpuAccuracy::High);
+        settings.set_session_graphics_defaults(false);
+        assert_eq!(*settings.scaling_filter.get_value(), ScalingFilter::Bilinear);
+        assert_eq!(settings.scaling_filter.to_string_global(), persisted);
+    }
 
     #[test]
     fn session_astc_policy_preserves_configured_values_and_switch1_behavior() {

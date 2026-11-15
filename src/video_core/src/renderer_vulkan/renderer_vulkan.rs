@@ -474,14 +474,25 @@ impl RendererVulkan {
     /// 8. Notify GPU of frame end
     /// 9. Tick rasterizer frame
     pub fn composite_impl(&mut self, framebuffers: &[FramebufferConfig]) {
+        use crate::nx2_profile::{Scope, Zone};
+        let _scope = Scope::new(Zone::Composite);
         let _frame_displayed = FrameDisplayedNotifyGuard::new(&self.frame_displayed_notify);
-        self.render_applet_capture_layer(framebuffers);
+        {
+            let _scope = Scope::new(Zone::CompositeCapture);
+            self.render_applet_capture_layer(framebuffers);
+        }
         if !should_present_window(&self.window_shown) {
             return;
         }
-        self.render_screenshot(framebuffers);
+        {
+            let _scope = Scope::new(Zone::CompositeCapture);
+            self.render_screenshot(framebuffers);
+        }
 
-        let frame_index = self.present_manager.get_render_frame_index();
+        let frame_index = {
+            let _scope = Scope::new(Zone::CompositeAcquire);
+            self.present_manager.get_render_frame_index()
+        };
         self.scheduler
             .request_outside_render_pass_operation_context();
 
@@ -494,6 +505,7 @@ impl RendererVulkan {
         // both values in atomics updated at swapchain (re)creation.
         let swapchain_image_count = self.present_manager.swapchain_image_count();
         let swapchain_image_view_format = self.present_manager.swapchain_image_view_format();
+        let draw_scope = Scope::new(Zone::CompositeDraw);
         self.blit_swapchain.draw_to_present_frame(
             self.device.as_ref(),
             &mut self.rasterizer,
@@ -507,11 +519,18 @@ impl RendererVulkan {
             swapchain_image_count,
             swapchain_image_view_format,
         );
+        drop(draw_scope);
 
         let render_ready = self.present_manager.frame(frame_index).render_ready;
-        self.scheduler.flush_with_signal(render_ready);
-        self.present_manager
-            .present(frame_index, &mut self.scheduler);
+        {
+            let _scope = Scope::new(Zone::CompositeSubmit);
+            self.scheduler.flush_with_signal(render_ready);
+        }
+        {
+            let _scope = Scope::new(Zone::CompositePresent);
+            self.present_manager.present(frame_index, &mut self.scheduler);
+        }
+        let _end_scope = Scope::new(Zone::CompositeEnd);
         (self.frame_end_notify)();
         self.rasterizer.tick_frame();
     }

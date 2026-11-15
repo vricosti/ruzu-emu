@@ -14,6 +14,7 @@ pub mod server_manager;
 pub mod service;
 pub mod nx2_stub_interface;
 pub mod nx2_gsv;
+pub mod nx2_video_input_queue;
 pub mod services;
 
 // Service Manager

@@ -26,6 +26,7 @@ use crate::vulkan_common::vulkan_memory_allocator::{
 
 use super::anti_alias_pass::AntiAliasPass;
 use super::fsr::Fsr;
+use super::fsr3::Fsr3;
 use super::fxaa::Fxaa;
 use super::present_push_constants::{
     make_orthographic_matrix, PresentPushConstants, ScreenRectVertex,
@@ -86,6 +87,7 @@ enum SuperResolutionFilter {
     None,
     Sgsr(Sgsr),
     Fsr(Fsr),
+    Fsr3(Fsr3),
 }
 
 /// Rust counterpart of upstream's `std::variant<std::monostate, FXAA, SMAA>`.
@@ -180,6 +182,7 @@ impl Layer {
             ScalingFilter::Fsr => {
                 SuperResolutionFilter::Fsr(Fsr::new(device, allocator, image_count, output_size))
             }
+            ScalingFilter::Fsr3 => SuperResolutionFilter::Fsr3(Fsr3::new(device, allocator, image_count, output_size)),
             ScalingFilter::Sgsr => SuperResolutionFilter::Sgsr(Sgsr::new(
                 device,
                 allocator,
@@ -317,6 +320,7 @@ impl Layer {
                 render_extent,
                 crop,
             )),
+            SuperResolutionFilter::Fsr3(fsr) => Some(fsr.draw(device, scheduler, image_index, source_image, source_image_view, render_extent, crop)),
             SuperResolutionFilter::Sgsr(_) if is_applet => None,
             SuperResolutionFilter::Sgsr(sgsr) => Some(sgsr.draw(
                 device,

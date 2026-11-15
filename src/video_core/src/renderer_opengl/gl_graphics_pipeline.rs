@@ -831,8 +831,10 @@ impl GraphicsPipeline {
                     desc.cbuf_index,
                     desc.cbuf_offset,
                     desc.is_written,
+                desc.indirect_offset,
                     |gpu_addr| gpu_memory.gpu_to_cpu_address(gpu_addr),
                     |gpu_addr| gpu_memory.get_memory_layout_size(gpu_addr),
+                    |gpu_addr, size| gpu_memory.max_continuous_range(gpu_addr, size),
                     |gpu_addr, output| gpu_memory.read_block(gpu_addr, output),
                 );
             }
@@ -849,11 +851,24 @@ impl GraphicsPipeline {
             let address = cbuf.address.wrapping_add(u64::from(offset));
             gpu_memory.read::<u32>(address)
         };
+        // Native computed descriptors share the Vulkan evaluator; keep binding
+        // ownership here, alongside Eden's direct-cbuf Configure path.
+        let read_computed = |program| {
+            crate::shader_handle_program::evaluate_texture_handle(
+                info,
+                program,
+                |index| cbufs.get(index as usize).filter(|cbuf| cbuf.enabled)
+                    .map_or(0, |cbuf| cbuf.address),
+                |address| gpu_memory.read::<u32>(address),
+            )
+        };
         macro_rules! read_handle {
             ($desc:expr, $index:expr) => {{
                 let index_offset = ($index as u32) << $desc.size_shift;
                 let offset = $desc.cbuf_offset.wrapping_add(index_offset);
-                if $desc.has_secondary {
+                if $desc.handle_program != u32::MAX {
+                    texture_pair(read_computed($desc.handle_program), via_header_index)
+                } else if $desc.has_secondary {
                     let second_offset = $desc.secondary_cbuf_offset.wrapping_add(index_offset);
                     let lhs = read_word($desc.cbuf_index, offset) << $desc.shift_left;
                     let rhs = read_word($desc.secondary_cbuf_index, second_offset)
@@ -869,8 +884,12 @@ impl GraphicsPipeline {
                 for index in 0..$desc.count {
                     let index_offset = index << $desc.size_shift;
                     let offset = $desc.cbuf_offset.wrapping_add(index_offset);
-                    let (image_index, _) =
-                        texture_pair(read_word($desc.cbuf_index, offset), via_header_index);
+                    let raw = if $desc.handle_program != u32::MAX {
+                        read_computed($desc.handle_program)
+                    } else {
+                        read_word($desc.cbuf_index, offset)
+                    };
+                    let (image_index, _) = texture_pair(raw, via_header_index);
                     views[*views_index] = ImageViewInOut {
                         index: image_index,
                         blacklist: $blacklist,
@@ -1571,8 +1590,7 @@ mod tests {
                 cbuf_index: index,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            })
+                is_written: true, ..Default::default() })
             .collect();
         let infos = [Some(info), None, None, None, None];
 
@@ -1609,8 +1627,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: u32::MAX,
-                is_written: false,
-            });
+                is_written: false, ..Default::default() });
         let mut second = ShaderInfo::default();
         second
             .storage_buffers_descriptors
@@ -1618,8 +1635,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 2,
-                is_written: false,
-            });
+                is_written: false, ..Default::default() });
         let infos = [Some(first), Some(second), None, None, None];
 
         let mut pipeline = GraphicsPipeline::new_for_test(GraphicsPipelineKey::default(), None);
@@ -1673,8 +1689,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: false,
-            });
+                is_written: false, ..Default::default() });
         let complex: [Option<ShaderInfo>; NUM_STAGES] =
             [Some(vertex_with_storage), None, None, None, None];
         let spec = ConfigureSpec::select(&complex, 1 << 0);

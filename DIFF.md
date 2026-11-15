@@ -1,5 +1,244 @@
 # Upstream parity notes
 
+## 2026-11-14 — video_core/buffer_cache/{buffer_cache,buffer_cache_base}.rs vs Lichii video_core/buffer_cache/{buffer_cache,buffer_cache_base}.h
+
+### Intentional differences
+- Native-tiling channels now queue only exact preflushable ranges at fences and
+  arm the remaining CPU pages for on-demand reads. MarkWrittenBuffer and DMA-copy
+  queueing use QueueFenceDownload; GetFlushArea and buffer deletion consume the
+  deduplication marks so subsequent GPU writes rearm the core. Legacy channels
+  retain their existing fence downloads.
+- The policy reads channel MemoryManager::UsesNativeTiling, not Lichii's global
+  console flag. NCE and adapters without the capability retain fence downloads.
+  Rust trait methods bridge the existing owning device-memory manager; reduced
+  test memory defaults to no capability, rather than silently claiming protection.
+- HasGpuWritesNotDownloadedAtFence first collects download ranges before walking
+  preflushable ranges, avoiding simultaneous mutable borrows of MemoryTracker.
+  Range coverage and callback order remain the reference's.
+- This ports the synchronous reactive-read path. Lichii's optional speculative
+  asynchronous CPU-read downloads, page-filter fast paths and coalesced CPU-read
+  batches are not enabled: reads still synchronously download their required
+  range. This avoids relying on unported in-flight read-download bookkeeping.
+- Synthetic regression verifies write -> trap -> CPU-read download -> rearm,
+  deduplicated protections, byte-exact downloaded data, partial preflush coverage
+  and retention of the legacy fence policy. Runtime performance remains unverified.
+
+## 2026-11-14 — renderer_vulkan/vk_rasterizer.rs, renderer_opengl/gl_rasterizer.rs and renderer_metal/metal_rasterizer.rs vs Lichii renderer_vulkan/vk_rasterizer.{h,cpp} and renderer_opengl/gl_rasterizer.{h,cpp}
+
+### Intentional differences
+- All three adapters expose channel native tiling and forward read traps to their
+  owning Maxwell device-memory manager. OpenGL retains its existing read/write
+  callbacks and additionally retains that manager for protection callbacks.
+- GetFlushArea releases the texture lock before consuming buffer read-trap marks;
+  Vulkan and Metal query the buffer cache when on-demand downloads are active.
+  OpenGL preserves its existing unconditional buffer-cache fallback. Metal has
+  no upstream C++ counterpart and adopts the same ownership/ordering contract.
+- Lichii's lock-free image/GPU-written page filters are not present here: reads
+  conservatively query the caches under their existing locks. No read is skipped
+  based on an unported filter. Metal runtime validation requires a macOS host.
+
+## 2026-11-14 — video_core/host1x/gpu_device_memory_manager.rs vs Lichii core/device_memory_manager.{h,inc} and video_core/host1x/gpu_device_memory_manager.{h,cpp}
+
+### Intentional differences
+- ArmReadTraps lives in the existing active Maxwell instantiation, alongside
+  ExtractCPUBacking and registered process ownership. Rust's core/video crate
+  boundary still prevents putting this active template instantiation in core;
+  this change does not introduce a second manager implementation.
+- Contiguous CPU pages with the same Memory owner are coalesced, interrupted by
+  holes, discontinuities or owner changes, and dispatched to the core's
+  RasterizerArmReadTraps. An Arc retains each Memory owner across the callback;
+  a shared access guard replaces the upstream borrowed pointer. Registry and
+  mapping-table locks are not held through the callback.
+- The isolated Linux regression checks actual mapping permissions across two
+  process owners, contiguous/discontiguous pages, mapping holes and absent or
+  unregistered owners. No fence-download policy is changed in this prerequisite.
+
+## 2026-11-13 — video_core/buffer_cache/memory_tracker_base.rs vs Lichii video_core/buffer_cache/memory_tracker_base.h
+
+### Intentional differences
+- Added Lichii's ForEachPreflushableRange to the matching MemoryTracker owner;
+  the local Eden header does not contain this extension. It enumerates only
+  existing managers and preserves Preflushable bits, using the existing
+  WordManager page-granular callback contract. Callers must intersect emitted
+  pages with their exact byte range, as upstream QueueFenceDownload does.
+- This is a prerequisite for exact fence-download selection, not a runtime
+  policy change. Tests cover absent managers, higher-page boundaries, repeated
+  enumeration, explicit unmarking and independent GPU-modified bits.
+
+## 2026-11-13 — core/memory/memory.rs read traps vs Lichii core/memory.{h,cpp}
+
+### Intentional differences
+- Ported RasterizerArmReadTraps, ReadTrapsEnabled, ProtectArmedPages and
+  DisarmReadTraps in the Memory owner, with ordered page set and batched
+  no-access protection. Release/acquire generations invalidate clean read areas
+  even when fastmem is unavailable. No trap-set lock survives a GPU read wait.
+- Existing Rust per-core mutexes are retained and generation observation occurs
+  inside the read-area lock for each translated alias. Explicit-table kernel
+  copies consume traps only when reading the selected table, never a different
+  process's same virtual address.
+- Trap lifetime is explicitly ended on unmap and table replacement;
+  the reference does not explicitly erase these cases in Memory. This avoids
+  stale page ownership restoring read-only permissions to an unrelated mapping.
+  Table replacement restores old cached read permissions before forgetting traps.
+  Temporary uncache retains armed ownership like upstream; recaching restores
+  protection even when BufferCache deduplicates an arm. Disarming an uncached
+  page does not reduce its permissions.
+- The upstream diagnostic environment disable switch is not ported. Scalar
+  unarmed-read elision is not enabled: the existing synchronization remains until
+  the device-memory callbacks and fence policy are wired and validated. The
+  interrupted integration is recorded in the project-local investigation state.
+
+## 2026-11-13 — core/memory/memory.rs vs Eden core/memory.{h,cpp} and Lichii core/memory.{h,cpp}
+
+### Intentional differences
+- The read-download path now follows Lichii DownloadFromRasterizer for non-core
+  threads: a local scratch buffer and an unconditional OnCPURead per device
+  alias, without borrowing a guest core's last clean read area. Eden indexes
+  directly by host-thread ID; the previous Rust clamp incorrectly shared the
+  last guest core's cached read area with service threads. Write-side batching
+  and its sys_core_guard are unchanged.
+- The core/host threshold uses the owning session's active CPU count, not
+  storage capacity or a global console profile. Per-core area locks remain the
+  existing Rust synchronization adaptation; none is held through OnCPURead.
+- This slice isolates host read ownership only. It does not enable Lichii's
+  read-trap/fence-download policy; that interrupted slice and its outstanding
+  memory protection/generation prerequisites are recorded in the investigation
+  state file. GPU downloads remain enabled.
+
+## 2026-11-13 — video_core/buffer_cache/read_trap_tracker.rs vs Lichii video_core/buffer_cache/read_trap_tracker.h
+
+### Intentional differences
+- This header-only prerequisite is from the user-requested Lichii reference;
+  the local Eden tree has no corresponding ReadTrapTracker. Ownership remains
+  in buffer_cache, with the same range state, ordered gap notifications,
+  insertion after notification, and subtraction when traps are consumed.
+- Rust names the callback overload `arm_with` and the no-callback overload
+  `arm`; its existing RangeSet accepts usize lengths on the supported 64-bit
+  hosts. Valid device-address ranges have the same clipped intersection behavior.
+- This is a prerequisite only: fence downloads are unchanged until the core
+  memory-protection, read-area generation and device-memory callbacks are ported
+  and validated. No runtime performance improvement is claimed by this module.
+
+## 2026-11-13 — backend/spirv/emit_spirv_atomic.rs and spirv_emit_context.rs vs backend/spirv/emit_spirv_atomic.cpp, emit_spirv_instructions.h and spirv_emit_context.{h,cpp}
+
+### Intentional differences
+- Global 32-bit add, signed/unsigned min/max, bitwise and/or/xor and exchange
+  now reuse the existing NVN range lookup to resolve a storage pointer before
+  emitting the same atomic instruction as StorageAtomicU32. Eden rejects these
+  global operations. Device scope, relaxed semantics, and return of the old
+  value are preserved. Operation emission stays in the atomic owner; helper
+  functions and their IDs stay in the emit context. Helpers are generated only
+  for used opcodes. Other global atomic families retain explicit rejection.
+- This is a mapped-NVN-range implementation, not arbitrary guest-address
+  translation: an unmapped address returns zero without a write, consistent
+  with the existing global load/store fallback. Dynamic pointer tables outside
+  the registered NVN ranges remain a prerequisite for the current investigation;
+  shader compilation success must not be treated as correct execution there.
+- If no NVN range is registered at all, global atomic emission now rejects
+  the program before creating helpers. This preserves explicit unsupported
+  behavior instead of pretending to implement an atomic with a zero-only
+  function. Eden rejects all global atomics; the extension only admits the
+  mapped-range case. A synthetic no-range regression checks the typed shader
+  exception and absence of registered atomic helpers.
+- Regression exercises all nine operations, checks the helper call's 64-bit
+  address, conditional access, old-value return and synchronization operands.
+  All nine complete modules passed spirv-val with scalar block layout enabled.
+  Full shader_recompiler suite: 749 tests passed.
+
+## 2026-11-13 — shader_info.rs, frontend/translate_program.rs and backend global-memory helpers vs shader_info.h, frontend/maxwell/translate_program.cpp and backend/{spirv,glsl} emit contexts
+
+### Intentional differences
+- NVN use-mask bits designate guest table slots, not indices in the compacted
+  storage descriptor vector. SPIR-V, GLSL, and MSL now select resources by
+  cbuf zero, aligned offset relative to nvn_buffer_base, and the matching mask
+  bit. Binding/limit indices still use the actual descriptor vector positions.
+  The shared Info query owns only this metadata predicate; each backend retains
+  its existing global-memory code generation and range-check ownership.
+- AddNVNStorageBuffers matches both constant-buffer index and byte offset
+  when reusing a descriptor. Equal offsets in different constant buffers are
+  different resources. Task-to-compute adaptation preserves its vertex-layout
+  NVN base, matching CollectShaderInfo rather than the host compute stage.
+- Re-read upstream descriptor definitions, AddNVNStorageBuffers, and both
+  DefineGlobalMemoryFunctions implementations after changing the Rust code.
+  Upstream uses descriptor-vector index for the mask and offset-only lookup;
+  those behaviors are deliberately corrected rather than replicated. MSL has
+  no original Eden counterpart and retains its separate resource-limit mapping.
+- Synthetic tests cover sparse mask slots, foreign cbuf descriptors, invalid
+  offsets, SPIR-V range counts, GLSL helper generation, MSL binding after an
+  array descriptor, and task/mesh table bases. Shader library tests: 747 pass.
+  This does not implement dynamically indexed pointer tables or global atomics,
+  and does not establish the cause of the observed lighting defect.
+
+## 2026-11-13 — renderer_vulkan/pipeline_cache.rs and graphics_pipeline.rs vs renderer_vulkan/vk_pipeline_cache.{h,cpp} and vk_graphics_pipeline.h
+
+### Intentional differences
+- Native resource-table compilation needs TIC/TSC limits and linked-sampler
+  mode in the graphics and compute keys. Graphics refreshes this dependency
+  before both Next transitions and map lookup; compute captures it before
+  lookup. The existing optional mesh-compute adaptation also keys its programs
+  by this state, including calls made independently of graphics lookup.
+  Ordinary Maxwell keys carry None. This is an extension prerequisite, not
+  evidence that the resource tables or the lighting fix are complete.
+- Eden hashes raw trivially-copyable keys. Rust hashes explicit little-endian
+  bytes instead: the existing prefix followed by four u32 words (presence,
+  image limit, sampler limit, linked boolean). None has an all-zero tail.
+  Readers reject noncanonical tags, booleans, overflowing descriptor counts,
+  and truncation. No Option representation or padding bytes are serialized.
+- Vulkan cache version becomes 25 and geometry-capture version becomes 2.
+  renderer_metal/metal_pipeline_cache.rs advances its cache version to 2
+  because it shares the graphics-key format; no Metal resource-table support
+  is implied. Old formats must be rejected rather than consumed at wrong offsets.
+- Re-read upstream key declarations, Hash/equality, CurrentGraphicsPipeline,
+  CurrentComputePipeline, and Next after changes. Their existing ownership and
+  lookup order remain; pool dependencies have no upstream counterpart.
+  Tests check distinct dependencies, hash/serialization agreement, consecutive
+  key round trips and transition misses. GPU resource-table integration remains
+  interrupted and tracked in the project-local investigation state.
+
+## 2026-11-13 — shader_recompiler/environment.rs and video_core/shader_environment.rs vs shader_recompiler/environment.h and video_core/shader_environment.{h,cpp}
+
+### Intentional differences
+- TexturePoolState is a compilation dependency for the interrupted GPU-selected
+  resource-table slice. The graphics/compute environment queries the respective
+  engine's inclusive TIC/TSC limits and linked-sampler mode, preserving the
+  same owners used by upstream ReadTextureType. Only an explicit query records
+  it; legacy shaders do not gain a dependency or change serialized bytes.
+  Old/file environments without that query return None, never guessed limits.
+  Linked sampler counts derive from the image limit; independent counts derive
+  from the sampler limit. Unrepresentable counts are rejected, not wrapped.
+- Queried state is stored in an optional cache tail tagged with stage bit 29,
+  following the existing task/mesh extension. The tail has exactly three
+  little-endian u32 words (texture limit, sampler limit, boolean 0/1), not raw
+  Rust struct bytes. Deserialize accounts for all 12 bytes before allocation,
+  rejects truncation/invalid booleans/count overflow and clears old optional
+  state when reading a legacy entry. Both file-backed environment adapters
+  preserve it. Existing task/mesh tags and unextended byte order remain intact.
+  Re-read upstream environment interface, engine reads and Serialize/Deserialize
+  after implementation. This supplies metadata only; pipeline-key dependency
+  handling and shader/runtime table integration remain the active stopped slice
+  in the project-local investigation state, not an enabled partial renderer.
+
+## 2026-11-13 — src/video_core/src/renderer_vulkan/pipeline_helper.rs vs video_core/renderer_vulkan/pipeline_helper.h
+
+### Intentional differences
+- DescriptorSizeForType and WriteDescriptorBuffer additionally accept separate
+  SAMPLER and SAMPLED_IMAGE descriptors, required before implementing shader-side
+  independent image/sampler table selection. Eden only handles combined sampled
+  images. The sizes use the matching device properties; the payload union uses
+  pSampler pointing to the sampler handle and pSampledImage pointing to the image
+  info, as specified by VkDescriptorDataEXT. Existing combined-image, buffer and
+  storage-image cases retain their mapping and ordering.
+- The type switch is mechanically extracted into a private, borrowed
+  descriptor_data helper in the same owner for testing. DescriptorSizeForType
+  accepts the properties/robustness flag directly instead of extracting them
+  from Device; its one caller supplies the same values. No payload layout,
+  lifetime owner or binding numbering changed. Synthetic tests check separate
+  sizes, live payload pointers and descriptor-array update-template offsets.
+  The upstream header was re-read after implementation. This is only a
+  prerequisite: current shader producers still declare combined descriptors;
+  dynamic texture metadata, shader indexing and runtime table binding are the
+  interrupted slice recorded in the project-local investigation state.
+
 ## 2026-11-12 - native Metal renderer: NX2 task/mesh draws, compute uniform buffers, attachment-less depth/stencil, typeless loads, conditional barriers
 
 ### Intentional differences (Eden has no native MSL backend)
@@ -18905,7 +19144,7 @@ instructions and remain outside this change.
 
 - `Update` retains Rust's existing checked header reads and negative-count rejection. The obsolete consumed-size output and final alignment calculation are removed, matching upstream's API; `InfoUpdater` owns transport cursor advancement. Internal ordering remains: inactive-context return, header validation, clear connection flags, update info, update destination data. Rust discards the last internal offset instead of assigning it to an unused local as C++ does. Headers and implementations were re-read after the change; the existing negative-count regression was adapted to the new signature.
 
-## 2026-11-06 � src/core/src/file_sys/program_metadata.rs vs src/core/file_sys/program_metadata.{h,cpp}
+## 2026-11-06 — src/core/src/file_sys/program_metadata.rs vs src/core/file_sys/program_metadata.{h,cpp}
 
 ### Intentional differences
 - NX2 source pinned to eden-nx2 origin/eden-nx2 50fa86bbbc403ad565eb44fcc281f16f77c69e15. Re-read header and Load implementation after porting. Rust uses a bounded mutable byte slice for the same 0x40-byte ACID body replacement; validation and state mutation order match.
@@ -18926,7 +19165,7 @@ instructions and remain outside this change.
 Validation follow-up: added manual_load_preserves_reserved_flags_and_casts regression (flags 0xff -> 0xf2, priority -1 -> 255, core 0x102 -> 2). Focused compilation is still live; no pass claimed.
 Focused validation: all four nx2_tests passed (0 failed). Full cargo test -p core started; release CLI build also running.
 
-## 2026-11-06 � src/rdynarmic/src/interface/exclusive_monitor.rs vs src/dynarmic/src/dynarmic/interface/exclusive_monitor.h
+## 2026-11-06 — src/rdynarmic/src/interface/exclusive_monitor.rs vs src/dynarmic/src/dynarmic/interface/exclusive_monitor.h
 
 ### Intentional differences
 - Source: eden-nx2 50fa86bbbc403ad565eb44fcc281f16f77c69e15. Capacity constant now matches six processors. Re-read the header and backend/x64/exclusive_monitor.cpp after the change; reservation masking, clearing, lock ordering and value storage are unchanged.
@@ -18946,7 +19185,7 @@ rdynarmic validation: 1151 unit tests passed, 4 ignored, plus four integration t
 Core suite follow-up: 16 MiB stack avoids the initial overflow, but parallel suite reports failure in host_deadline_delivery_pauses_but_explicit_stop_signal_does_not. The exact same test binary passes that test alone (0.09s, exit 0). Sequential execution is now being used to diagnose shared-state/timing interference; full-suite pass not claimed.
 ROM runtime verification after Release rebuild: previous ErrorBadFileAccessControl is gone; loader now rejects kernel metadata (log/ruzu_log.txt, 0.616972s). NPDM loading slice advances real game startup but does not establish CPU/GPU execution.
 
-## 2026-11-06 � src/core/src/hardware_properties.rs vs src/core/hardware_properties.h
+## 2026-11-06 — src/core/src/hardware_properties.rs vs src/core/hardware_properties.h
 ### Intentional differences
 - NX2 50fa86bb: six application cores and mapping 4->4, 5->5 ported; header re-read after change. Rust const function retains existing mask conversion algorithm.
 ### Unintentional differences (to fix)
@@ -18956,7 +19195,7 @@ ROM runtime verification after Release rebuild: previous ErrorBadFileAccessContr
 ### Binary layout verification
 - No serialized structures. Tests now cover 0x3f and isolated core 4/5 affinity conversion.
 
-## 2026-11-06 � src/core/src/hle/kernel/global_scheduler_context.rs vs src/core/hle/kernel/global_scheduler_context.{h,cpp}
+## 2026-11-06 — src/core/src/hle/kernel/global_scheduler_context.rs vs src/core/hle/kernel/global_scheduler_context.{h,cpp}
 ### Intentional differences
 - Six preemption priorities match NX2 PreemptThreads: 59,59,59,63,59,59. Re-read header and implementation after change. Existing module-level constant retains same file ownership rather than C++ function-local placement.
 ### Unintentional differences (to fix)
@@ -18966,7 +19205,7 @@ ROM runtime verification after Release rebuild: previous ErrorBadFileAccessContr
 ### Binary layout verification
 - Host array length follows NUM_CPU_CORES; no guest serialized payload.
 
-## 2026-11-06 � src/core/src/hle/kernel/kernel.rs diagnostic arrays (Rust-specific)
+## 2026-11-06 — src/core/src/hle/kernel/kernel.rs diagnostic arrays (Rust-specific)
 ### Intentional differences
 - Existing Rust-only SVC/PC/LR/SP/register diagnostic arrays now initialize from NUM_CPU_CORES rather than four literals; JIT-map loop follows the same count. No C++ equivalent for these instrumentation fields, no guest semantics added.
 ### Unintentional differences (to fix)
@@ -18976,7 +19215,7 @@ ROM runtime verification after Release rebuild: previous ErrorBadFileAccessContr
 ### Binary layout verification
 - Host instrumentation array capacity changes to six; each atomic remains initialized to zero.
 
-## 2026-11-06 � src/core/src/hle/kernel/k_capabilities.rs vs src/core/hle/kernel/k_capabilities.{h,cpp}
+## 2026-11-06 — src/core/src/hle/kernel/k_capabilities.rs vs src/core/hle/kernel/k_capabilities.{h,cpp}
 ### Intentional differences
 - Explicit Rust bit extraction remains equivalent to CorePriority fields. Re-read upstream header fields and cpp validation/mapping after correction.
 ### Unintentional differences (to fix)
@@ -18987,7 +19226,7 @@ ROM runtime verification after Release rebuild: previous ErrorBadFileAccessContr
 - CorePriority packed u32 fields unchanged. New regression covers 0..5 mask, virtual core 63 mapping to physical core 3, and invalid 64. Focused tests pending in nx2-capabilities-tests.log.
 Capability regression validation: all seven k_capabilities tests passed, including virtual IDs 0..5, alias 63->3 and rejection of 64. Hardware mapping tests: two passed. Six-core cargo check completed successfully; full core suite remains unresolved (old hanging runs intentionally stopped).
 
-## 2026-11-06 � src/rdynarmic/src/frontend/a64/translate/pointer_authentication.rs vs src/dynarmic/src/dynarmic/frontend/A64/translate/impl/pointer_authentication.cpp
+## 2026-11-06 — src/rdynarmic/src/frontend/a64/translate/pointer_authentication.rs vs src/dynarmic/src/dynarmic/frontend/A64/translate/impl/pointer_authentication.cpp
 ### Intentional differences
 - RETA method uses DecodedInst rather than a bool M parameter; both variants intentionally ignore M exactly as NX2 50fa86bb. Re-read cpp and impl.h declaration after implementation: read X30, SetPC, PopRSBHint, return false, in that order.
 - Decoder a64.inc enables the same RETA bit pattern; visitor.rs only dispatches, mod.rs only registers the owner module. Existing Rust translator tree omits the C++ impl directory.
@@ -18999,7 +19238,7 @@ Capability regression validation: all seven k_capabilities tests passed, includi
 - RETAA 0xd65f0bff and RETAB 0xd65f0fff tested against RET X30 IR and PopRSBHint terminal. Full rdynarmic test run pending in nx2-reta-tests.log.
 RETA validation: full rdynarmic suite reports 1152 unit tests passed, 4 ignored, and all four integration tests passed. RETAA/RETAB IR equivalence regression passes; git diff --check clean.
 
-## 2026-11-06 � src/rdynarmic/src/frontend/a64/translate/pointer_authentication.rs vs upstream pointer_authentication.cpp (BRA_BLRA)
+## 2026-11-06 — src/rdynarmic/src/frontend/a64/translate/pointer_authentication.rs vs upstream pointer_authentication.cpp (BRA_BLRA)
 ### Intentional differences
 - NX2 BRA_BLRA decoded arguments extracted from instruction bits Z24/L21/Rn9..5/Rm4..0; key bit M intentionally unused per upstream. Header declaration and cpp body re-read after implementation. Target read precedes LR write and RSB push; PC and FastDispatchHint follow exactly.
 - Decoder entry added to a64.inc, visitor only dispatches to the upstream-owned module.
@@ -19011,7 +19250,7 @@ RETA validation: full rdynarmic suite reports 1152 unit tests passed, 4 ignored,
 - Regression compares IR against plain BR/BLR, including X30 target overlap and zero-register target, both Z/non-Z forms and invalid zero-form encoding. Full rdynarmic suite pending (nx2-bra-tests.log).
 BRA_BLRA validation: all 1153 unit tests passed (4 ignored), including branch target/LR ordering regression. Integration execution still being polled; no ROM result yet.
 
-## 2026-11-06 � pointer_authentication.rs vs upstream pointer_authentication.cpp (PACAUT_reg / XPAC_1)
+## 2026-11-06 — pointer_authentication.rs vs upstream pointer_authentication.cpp (PACAUT_reg / XPAC_1)
 ### Intentional differences
 - Port preserves NX2 identity authentication model: valid instructions return true without mutation. PACAUT_reg rejects Z && Rn != 31 using UnallocatedEncoding; XPAC_1 ignores D/Rd. This is upstream behavior, not a substitute implementation invented for missing dependencies.
 - Arguments extracted from DecodedInst; methods stay in the counterpart module. Re-read cpp bodies and impl.h signatures after edits.
@@ -19023,7 +19262,7 @@ BRA_BLRA validation: all 1153 unit tests passed (4 ignored), including branch ta
 - Tests enumerate all eight op values, Z forms, Rn 0/30/31 and both XPAC variants; compare emitted IR to NOP and require exception for invalid encodings. Full rdynarmic suite pending in nx2-pac-tests.log.
 PAC/AUT/XPAC validation: 1154 unit tests passed, 4 ignored; all four integration tests passed. Runtime with the prior capabilities+RETA Release now executes guest code and aborts at instruction 0xc8aafe6b, PC 0x8444456c (~2.2s), followed by svcBreak. This executable predates BRA_BLRA and PAC/AUT/XPAC.
 
-## 2026-11-06 � src/rdynarmic/src/frontend/a64/translate/load_store_atomic.rs vs upstream load_store_atomic.cpp (LDAPR_sz)
+## 2026-11-06 — src/rdynarmic/src/frontend/a64/translate/load_store_atomic.rs vs upstream load_store_atomic.cpp (LDAPR_sz)
 ### Intentional differences
 - Upstream AtomicAddress helper retained in corresponding module. LDAPR_sz decodes size/Rn/Rt from DecodedInst; byte count, destination width, ORDERED load, zero extension and register write follow source order exactly. Header declaration and cpp helper/method re-read after implementation.
 - Decoder table uses identical upstream LDAPR_sz pattern and visitor only dispatches.
@@ -19035,7 +19274,7 @@ PAC/AUT/XPAC validation: 1154 unit tests passed, 4 ignored; all four integration
 - Tests compare LDAPR IR to existing ordered LDAR IR for four sizes, Rn/Rt 0/8/31, covering SP, zero register and overlap. Full rdynarmic suite running in nx2-ldapr-tests.log.
 LDAPR validation completed exit 0: 1155 unit tests passed, 4 ignored, all four integration tests passed. IR ordering/width regression passed. git diff --check reports no whitespace errors.
 
-## 2026-11-06 � load_store_atomic.rs vs upstream load_store_atomic.cpp (CompareAndSwap)
+## 2026-11-06 — load_store_atomic.rs vs upstream load_store_atomic.cpp (CompareAndSwap)
 ### Intentional differences
 - Same-file helpers ported: AtomicMaskIfZero, AtomicSelect, AtomicTruncate, AtomicLoadZext, AtomicZeroExtendReg, AtomicCommitReg, AtomicFinish, AtomicAccType. Explicit Rust sub carry=true implements upstream subtraction. Re-read helpers, CAS body and impl.h after implementation; validation/order/ownership match.
 ### Unintentional differences (to fix)
@@ -19045,7 +19284,7 @@ LDAPR validation completed exit 0: 1155 unit tests passed, 4 ignored, all four i
 ### Binary layout verification
 - Exact upstream CompareAndSwap decoder pattern. IR tests cover four widths and four order combinations, exclusive read-before-write, success PC+4 and failure retry PC. Full suite running in nx2-cas-regression.log.
 
-## 2026-11-06 � src/rdynarmic/src/jit.rs (CAS runtime regression)
+## 2026-11-06 — src/rdynarmic/src/jit.rs (CAS runtime regression)
 ### Intentional differences
 - Test-only callbacks optionally reject a configured count of exclusive writes; default remains zero, preserving existing tests. This is fault injection, not guest behavior.
 - Runtime expectations follow upstream CompareAndSwap: old memory returned in Rs after completion, desired stored only on equality, byte/half/word results zero-extended, failed exclusive store retries without converting mismatch to match.
@@ -19056,12 +19295,12 @@ LDAPR validation completed exit 0: 1155 unit tests passed, 4 ignored, all four i
 ### Binary layout verification
 - Test preserves untouched bytes outside each store width. Four widths x match/mismatch x zero/one injected failure pass on host JIT (16 cases, 1.14s). Full suite running in nx2-cas-jit-full.log.
 
-### CAS runtime validation follow-up � 2026-11-06
+### CAS runtime validation follow-up — 2026-11-06
 - Extended jit.rs CAS regression to single-step a forced failed store, compare all 31 registers (including nonzero upper bits of narrow operands), require unchanged memory and PC, then resume and verify the retry result. All 16 cases passed in focused run.
 - Re-read upstream AtomicCommitReg/AtomicFinish: failure selects previous register and same PC; test expectations match this contract.
 - Expanded to both NO_OPTIMIZATIONS and ALL_SAFE_OPTIMIZATIONS (32 cases); full suite running in nx2-cas-optimized.log. Operand aliasing and real multi-core contention remain outside this test's proof.
 
-## 2026-11-06 � load_store_atomic.rs vs upstream load_store_atomic.cpp (AtomicMemOp)
+## 2026-11-06 — load_store_atomic.rs vs upstream load_store_atomic.cpp (AtomicMemOp)
 ### Intentional differences
 - AtomicSignExtend and AtomicMemOp retain upstream file ownership, validation op<=8, read/source/operation/store/commit/retry ordering. Rust explicitly supplies zero carry to Add64. Re-read cpp switch and impl.h signature after implementation.
 - Decoder and visitor only register and dispatch identical upstream pattern.
@@ -19073,7 +19312,7 @@ LDAPR validation completed exit 0: 1155 unit tests passed, 4 ignored, all four i
 - JIT test exercises 9 operations x 4 widths with negative signed old value and positive source, safe optimizations, injected failed store and unchanged destination at retry. Full suite pending in nx2-lse-tests.log.
 LSE suite completed: 1158 unit tests passed, 4 ignored; four integration tests passed. Optimized all-operation/width retry regression passed.
 
-## 2026-11-06 � src/core/src/hle/kernel/svc/svc_types.rs vs src/core/hle/kernel/svc_types.h
+## 2026-11-06 — src/core/src/hle/kernel/svc/svc_types.rs vs src/core/hle/kernel/svc_types.h
 ### Intentional differences
 - Added only Nx2VammSize=33 and conversion for the runtime-observed query. Re-read enum declaration after edit. Existing Rust numeric decoder is extra glue.
 ### Unintentional differences (to fix)
@@ -19083,7 +19322,7 @@ LSE suite completed: 1158 unit tests passed, 4 ignored; four integration tests p
 ### Binary layout verification
 - repr(u32) and numeric value 33 preserved; focused regression pending.
 
-## 2026-11-06 � src/core/src/hle/kernel/svc/svc_info.rs vs src/core/hle/kernel/svc/svc_info.cpp
+## 2026-11-06 — src/core/src/hle/kernel/svc/svc_info.rs vs src/core/hle/kernel/svc/svc_info.cpp
 ### Intentional differences
 - Nx2VammSize follows upstream experimental fixed 4 KiB page granule, with its STUBBED warning retained. This is explicitly an upstream approximation, not verified Switch 2 kernel fidelity. No missing backing dependency is replaced with a new success stub.
 - Uses existing same-domain PAGE_SIZE constant (4096). Re-read cpp process-query dispatch, sub-ID validation and Nx2VammSize case after change.
@@ -19095,7 +19334,7 @@ LSE suite completed: 1158 unit tests passed, 4 ignored; four integration tests p
 - u64 result now 0x1000 instead of accidentally returning core mask 0x3f. Tests cover numeric ID, valid response, invalid subtype/handle preserving output. Tests running in nx2-vamm-tests.log.
 Focused GetInfo33 regression passed (1 test, 0 failures, 0.01s). Full core suite relaunched sequentially with 16 MiB stack; no full-suite pass claimed.
 
-## 2026-11-06 � application_proxy_service.rs vs application_proxy_service.{h,cpp}
+## 2026-11-06 — application_proxy_service.rs vs application_proxy_service.{h,cpp}
 ### Intentional differences
 - Command 10 aliases the existing OpenApplicationProxy handler exactly as NX2. No fabricated interface or automatic-success handler. Header and cpp reread; arguments, process/applet ownership and response behavior unchanged.
 ### Unintentional differences (to fix)
@@ -19105,7 +19344,7 @@ Focused GetInfo33 regression passed (1 test, 0 failures, 0.01s). Full core suite
 ### Binary layout verification
 - Same existing CMIF serializer as command 0. Registration identity regression added; focused tests pending nx2-applet-open-tests.log.
 
-## 2026-11-06 � svc_types.rs / svc_info.rs vs svc_types.h / svc_info.cpp (NX2 region queries)
+## 2026-11-06 — svc_types.rs / svc_info.rs vs svc_types.h / svc_info.cpp (NX2 region queries)
 ### Intentional differences
 - Added enum/conversion IDs29/30 and same-file GetInfo cases. Re-read upstream enum and cases after port: upper alias half, base+half address, half size, shared process/subtype validation, experimental warning preserved.
 - Address addition explicitly wraps as upstream u64 arithmetic. This preserves Eden-NX2's experimental VAMM region model, not a claim about real hardware layout.
@@ -19117,7 +19356,7 @@ Focused GetInfo33 regression passed (1 test, 0 failures, 0.01s). Full core suite
 - Exact u32 IDs29/30; u64 results. Nonzero alias region regression expects base 0x800000 and size 0x400000 from alias [0x400000,0xc00000). Invalid subtype/handle tests included. Focused tests pending nx2-memory-query-tests.log.
 Validation: all seven focused nx2_ core regressions passed, including NPDM, region address/size, VAMM granule and appletOE alias. Full core validation still affected by previously reproduced test contamination.
 
-## 2026-11-07 � src/core/src/hle/kernel/k_scheduler.rs vs src/core/hle/kernel/k_scheduler.{h,cpp}
+## 2026-11-07 — src/core/src/hle/kernel/k_scheduler.rs vs src/core/hle/kernel/k_scheduler.{h,cpp}
 
 ### Intentional differences
 - Native unit-test fixture only: assert RequestDummyThreadWait before releasing
@@ -19139,7 +19378,7 @@ Validation: all seven focused nx2_ core regressions passed, including NPDM, regi
 ### Binary layout verification
 - N/A: test fixture lifecycle only; no serialized data or layout changes.
 
-## 2026-11-07 � src/core/src/hle/kernel/{kernel,k_scheduler}.rs vs src/core/hle/kernel/{kernel,k_scheduler}.{h,cpp}
+## 2026-11-07 — src/core/src/hle/kernel/{kernel,k_scheduler}.rs vs src/core/hle/kernel/{kernel,k_scheduler}.{h,cpp}
 
 ### Intentional differences
 - Supersedes preceding lifecycle trial: restoring Runnable in the scheduler
@@ -19172,7 +19411,7 @@ previously hanging scheduler test but failed elsewhere and terminated with
 STATUS_ACCESS_VIOLATION in a thread wait-cancel test. That test passed in
 isolation. Full crate validation remains failed, not waived.
 
-## 2026-11-07 � src/core/src/hle/service/nx2_stub_interface.rs vs src/core/hle/service/nx2_stub_interface.h
+## 2026-11-07 — src/core/src/hle/service/nx2_stub_interface.rs vs src/core/hle/service/nx2_stub_interface.h
 
 ### Intentional differences
 - User explicitly authorized experimental upstream stubs after the blocked audit.
@@ -19195,7 +19434,7 @@ isolation. Full crate validation remains failed, not waived.
 - Explicit ResponseBuilder serialization: result only plus one interface object;
   no raw Rust struct serialization. Empty-success regression checks zeroed tail.
 
-## 2026-11-07 � src/core/src/hle/service/am/service/graphics_scale_controller.rs vs src/core/hle/service/am/service/graphics_scale_controller.h
+## 2026-11-07 — src/core/src/hle/service/am/service/graphics_scale_controller.rs vs src/core/hle/service/am/service/graphics_scale_controller.h
 
 ### Intentional differences
 - Header-only upstream mapped to corresponding Rust module; IPC handler serializes
@@ -19216,7 +19455,7 @@ isolation. Full crate validation remains failed, not waived.
   value10, and deterministic zeroed command-buffer tail. This does not claim
   the guest's complete12-byte payload is implemented.
 
-## 2026-11-07 � src/core/src/hle/service/service.rs vs src/core/hle/service/service.{h,cpp}
+## 2026-11-07 — src/core/src/hle/service/service.rs vs src/core/hle/service/service.{h,cpp}
 
 ### Intentional differences
 - Add upstream nx2-prefix selection to ReportUnimplementedFunction fallback.
@@ -19233,7 +19472,7 @@ isolation. Full crate validation remains failed, not waived.
 ### Binary layout verification
 - Result-only ResponseBuilder response; covered by nx2 interface regression.
 
-## 2026-11-07 � src/core/src/hle/service/am/service/application_proxy.rs vs src/core/hle/service/am/service/application_proxy.{h,cpp}
+## 2026-11-07 — src/core/src/hle/service/am/service/application_proxy.rs vs src/core/hle/service/am/service/application_proxy.{h,cpp}
 
 ### Intentional differences
 - Arc interfaces replace shared_ptr; stateless graphics controller has no unused
@@ -19252,7 +19491,7 @@ isolation. Full crate validation remains failed, not waived.
 - Existing result plus one moved interface serialization; no new raw payload.
 Validation NX2 stubs: nine focused nx2_ tests passed. Full core suite rerun failed with the same previously observed STATUS_ACCESS_VIOLATION in wait_cancel_pushes_runnable_thread_through_state_change_handler; no full-crate success claimed.
 
-## 2026-11-07 � src/core/src/hle/kernel/svc/svc_thread.rs vs src/core/hle/kernel/svc/svc_thread.cpp and svc.h
+## 2026-11-07 — src/core/src/hle/kernel/svc/svc_thread.rs vs src/core/hle/kernel/svc/svc_thread.cpp and svc.h
 
 ### Intentional differences
 - None in this NX2 core-selection slice: IsValidVirtualCoreId now uses NUM_CPU_CORES
@@ -19275,7 +19514,7 @@ Validation NX2 stubs: nine focused nx2_ tests passed. Full core suite rerun fail
   boundary12, signed sentinels/extremes, overlapping affinity bits, all bits,
   zero and high discarded bits, matching upstream six-core folding formula.
 
-## 2026-11-07 � src/core/src/hle/service/am/service/application_functions.rs vs src/core/hle/service/am/service/application_functions.{h,cpp}
+## 2026-11-07 — src/core/src/hle/service/am/service/application_functions.rs vs src/core/hle/service/am/service/application_functions.{h,cpp}
 
 ### Intentional differences
 - Explicit ResponseBuilder handlers replace CMIF Result-return serialization.
@@ -19299,7 +19538,7 @@ Full core suite reproduced known wait_cancel access violation. Release compiled;
 ROM now reaches IApplicationFunctions command320, beyond prior CreateThread abort.
 ApplicationFunctions validation:21 focused tests passed. Full core rerun reproduced the pre-existing wait_cancel access violation (nx2-core-application-init-full.log); full validation remains failed.
 
-## 2026-11-07 � src/core/src/hle/kernel/k_process.rs vs src/core/hle/kernel/k_process.{h,cpp}
+## 2026-11-07 — src/core/src/hle/kernel/k_process.rs vs src/core/hle/kernel/k_process.{h,cpp}
 
 ### Intentional differences
 - bool replaces upstream bitfield in host-only process state, following adjacent
@@ -19322,7 +19561,7 @@ ApplicationFunctions validation:21 focused tests passed. Full core rerun reprodu
 - N/A: KProcess is host-owned and never copied as a guest payload. Regression
   loads alternate-layout NPDM and checks process identity and heap+alias ceiling.
 
-## 2026-11-07 � src/core/src/hle/service/service.rs vs src/core/hle/service/service.{h,cpp}
+## 2026-11-07 — src/core/src/hle/service/service.rs vs src/core/hle/service/service.{h,cpp}
 
 ### Intentional differences
 - OnceLock<bool> mirrors the function-static getenv presence check. Environment
@@ -19346,7 +19585,7 @@ ApplicationFunctions validation:21 focused tests passed. Full core rerun reprodu
   NX2 caller and checks SFCO plus zeroed success payload/tail.
 Validation caller-based fallback:14 focused NX2 tests passed. Full core suite44763 again failed at known wait_cancel access violation; no full-suite pass claimed.
 
-## 2026-11-07 � src/core/src/hle/kernel/k_process.rs vs src/core/hle/kernel/k_process.{h,cpp}
+## 2026-11-07 — src/core/src/hle/kernel/k_process.rs vs src/core/hle/kernel/k_process.{h,cpp}
 
 ### Intentional differences
 - Existing Rust kernel accessor supplies the initialized kernel reference rather
@@ -19365,7 +19604,7 @@ Validation caller-based fallback:14 focused NX2 tests passed. Full core suite447
 ### Binary layout verification
 - N/A: size used as i64 resource limit, matching existing resource-limit API.
 
-## 2026-11-07 � src/core/src/hle/kernel/board/k_system_control.rs vs src/core/hle/kernel/board/nintendo/nx/k_system_control.{h,cpp}
+## 2026-11-07 — src/core/src/hle/kernel/board/k_system_control.rs vs src/core/hle/kernel/board/nintendo/nx/k_system_control.{h,cpp}
 
 ### Intentional differences
 - Existing board path adaptation retained. Nx2GraphicsServerMemorySize is a
@@ -19383,7 +19622,7 @@ Validation caller-based fallback:14 focused NX2 tests passed. Full core suite447
 ### Binary layout verification
 - N/A: constants and host allocation sizing only.
 
-## 2026-11-07 � src/core/src/device_memory.rs vs src/core/device_memory.{h,cpp}
+## 2026-11-07 — src/core/src/device_memory.rs vs src/core/device_memory.{h,cpp}
 
 ### Intentional differences
 - Test expectation for configured12GB mode now20GiB, matching upstream
@@ -19400,7 +19639,7 @@ Validation caller-based fallback:14 focused NX2 tests passed. Full core suite447
 - Test touches first/last backing bytes to validate actual accessible extent.
 Memory validation: two metadata-load tests, two backing/NPDM tests and two kernel derived-layout tests passed. Full core rerun reproduced the known wait_cancel access violation. Runtime with isolated12GB config pending.
 
-## 2026-11-07 � src/core/src/hle/kernel/k_memory_layout.rs and svc/{svc_types,svc_physical_memory}.rs vs core/hle/kernel/k_memory_layout.{h,cpp}, svc.h and svc/svc_physical_memory.cpp (origin/eden-nx2)
+## 2026-11-07 — src/core/src/hle/kernel/k_memory_layout.rs and svc/{svc_types,svc_physical_memory}.rs vs core/hle/kernel/k_memory_layout.{h,cpp}, svc.h and svc/svc_physical_memory.cpp (origin/eden-nx2)
 
 ### Intentional differences
 - Preserve the existing Rust page-table reservation calculated for 12 GiB, explicitly independent of MainMemorySizeMax. Upstream calculates it from 8 GiB. This keeps the previously audited larger-layout reservation unchanged while restoring the guest SVC contract; supersedes the 2026-09-11 interpretation of MainMemorySizeMax.
@@ -19418,7 +19657,7 @@ Memory validation: two metadata-load tests, two backing/NPDM tests and two kerne
 - Source declarations and implementation reread after change. Regression covers zero, 2 MiB alignment, 4 GiB, the observed 0x1FE200000 request, last accepted aligned size, exclusive 8 GiB boundary, 12 GiB and overflow-scale values.
 - Follow-up verification in this same slice: reconciled output assignment too. Both dispatch paths initialize their local output to zero; the handler now leaves caller output untouched on validation/page-table failure and assigns only on success, matching upstream R_TRY. Added sentinel-output regression for misalignment and the exclusive bound. This resolves the pre-existing difference noted above.
 
-## 2026-11-07 � src/core/src/hle/kernel/svc/{svc_info,svc_types}.rs vs core/hle/kernel/svc/svc_info.cpp, svc.h and svc_types.h (origin/eden-nx2)
+## 2026-11-07 — src/core/src/hle/kernel/svc/{svc_info,svc_types}.rs vs core/hle/kernel/svc/svc_info.cpp, svc.h and svc_types.h (origin/eden-nx2)
 
 ### Intentional differences
 - The existing Rust enum module remains nested in svc. Experimental upstream remote-memory stubs are explicitly authorized: both queries return zero and warn; neither implements remote-memory backing.
@@ -19433,7 +19672,7 @@ Memory validation: two metadata-load tests, two backing/NPDM tests and two kerne
 - PASS: explicit enum discriminants31/32; u64 output zero. Regression covers successful output and output preservation on invalid sub-id/handle. Header and implementation reread after edits.
 - Validation for the November7 heap/remote-info slices: heap validation/output tests2pass; reservation test1pass; svc_info group7pass/1fail (tick-count query returns InvalidHandle116). Full core reproduces STATUS_ACCESS_VIOLATION at wait_cancel_pushes_runnable_thread_through_state_change_handler. Release heap build succeeds; ROM now successfully allocates0x1FE200000 and opens RomFS, then aborts on missing graphics-session handle. Remote-info changes are tested but not yet rebuilt into release.
 
-## 2026-11-07 � src/video_core/src/nx2.rs vs src/video_core/nx2.h (origin/eden-nx2)
+## 2026-11-07 — src/video_core/src/nx2.rs vs src/video_core/nx2.h (origin/eden-nx2)
 
 ### Intentional differences
 - Header-only source maps to one Rust module. Waiter owner is an opaque usize pointer identity: upstream only compares const void* and never dereferences it. The mutex encloses the vector; atomic count remains separate with identical release/acquire ordering.
@@ -19448,7 +19687,7 @@ Memory validation: two metadata-load tests, two backing/NPDM tests and two kerne
 ### Binary layout verification
 - Not a guest payload. Fixed 32-entry atomic u64 table; matching u32 operation/value and u64 address widths. Tests cover duplicate insertion, capacity, region boundaries, removal, unsigned wrapping, write latching, owner replacement and all acquire comparisons including unsigned GE.
 
-## 2026-11-07 � src/core/src/hle/service/nvdrv/devices/nx2_stub_device.rs vs core/hle/service/nvdrv/devices/nx2_stub_device.h (origin/eden-nx2)
+## 2026-11-07 — src/core/src/hle/service/nvdrv/devices/nx2_stub_device.rs vs core/hle/service/nvdrv/devices/nx2_stub_device.h (origin/eden-nx2)
 
 ### Intentional differences
 - Header-only source stays in one corresponding module. Mutex-protected RegistryState mechanically groups mappings/listeners to express the existing shared lock; TrimMappings takes this locked state without changing ownership or call ordering. Device ranges retain a separate lock.
@@ -19466,7 +19705,7 @@ Memory validation: two metadata-load tests, two backing/NPDM tests and two kerne
 - Focused validation: nx2 semaphore tests2pass; nx2 GPU registry/ioctl tests3pass. Full core again exits STATUS_ACCESS_VIOLATION at the previously identified wait_cancel thread test; full video_core still running at this checkpoint.
 - Full video_core validation completed successfully: 1606 passed, 1 ignored, zero failures; doc-tests pass. Full core remains failing as recorded above. No rendering/performance claim follows from these prerequisite tests.
 
-## 2026-11-07 � src/video_core/src/host1x/ffmpeg/{ffmpeg.rs,ffmpeg_shim.c} vs video_core/host1x/ffmpeg.{h,cpp}
+## 2026-11-07 — src/video_core/src/host1x/ffmpeg/{ffmpeg.rs,ffmpeg_shim.c} vs video_core/host1x/ffmpeg.{h,cpp}
 
 ### Intentional differences
 - Existing opaque C ABI requires mechanical accessors for AVFrame pts/best_effort_timestamp/colorspace/color_range, AVCodec and AVCodecContext. They expose the same native fields/objects upstream obtains through GetFrame/GetCodec/GetCodecContext. No NX2 policy moved into the FFmpeg module.
@@ -19481,7 +19720,7 @@ Memory validation: two metadata-load tests, two backing/NPDM tests and two kerne
 ### Binary layout verification
 - Opaque native structs stay opaque. Timestamps cross ABI as i64 preserving AV_NOPTS_VALUE and signed bit patterns; metadata as C int. Regression exercises real native decoder drain/flush/re-drain, fresh-frame timestamp sentinels and unchanged DTS.
 
-## 2026-11-07 � src/video_core/src/host1x/nx2_video_decoder.rs and video_core/build.rs vs video_core/host1x/nx2_video_decoder.{h,cpp}
+## 2026-11-07 — src/video_core/src/host1x/nx2_video_decoder.rs and video_core/build.rs vs video_core/host1x/nx2_video_decoder.{h,cpp}
 
 ### Intentional differences
 - BTreeMap timestamp multiplicities plus a size counter implement upstream's ordered multiset, including erase-one semantics and the 64-submission bound. ErasePts is a mechanical local adaptation of multiset.erase(iterator). Shared frame ownership remains Arc; Impl stays separately boxed. Drop frees scaler, then context, then hardware in upstream order.
@@ -19501,7 +19740,7 @@ Memory validation: two metadata-load tests, two backing/NPDM tests and two kerne
 - Native dependency setup follows the new Cargo probe: Debian/Ubuntu and Steam Deck package lists add libswscale-dev; existing versioned openSUSE FFmpeg8 list adds ffmpeg-8-libswscale-devel (package artifact confirmed in https://ftp.fau.de/packman/suse/openSUSE_Tumbleweed/Essentials/x86_64/). Windows preflight checks libswscale; local vcpkg ffmpeg manifest already includes swscale as a default feature. These setup scripts were not used to install/change host packages.
 - Full video_core validation completed:1610passed,1ignored,0failures; doc-tests pass. Dependency script syntax parsed successfully; git diff --check passes. No game runtime result is claimed for this decoder-only slice.
 
-## 2026-11-07 � src/core/src/hle/service/ipc_helpers.rs vs core/hle/service/ipc_helpers.h (origin/eden-nx2)
+## 2026-11-07 — src/core/src/hle/service/ipc_helpers.rs vs core/hle/service/ipc_helpers.h (origin/eden-nx2)
 
 ### Intentional differences
 - Rust CommandType groups all raw values>=16 into TipcCommandRegion. Reconstruct the original raw type from GetTipcCommand plus the region base for serialization; upstream enum retains the raw value directly.
@@ -19515,7 +19754,7 @@ Memory validation: two metadata-load tests, two backing/NPDM tests and two kerne
 ### Binary layout verification
 - Command header's low16 bits now retain exact original command type. Regression covers command0,1,202 and highest16-bit raw type, along with one-word result/data layout and response length.
 
-## 2026-11-07 � src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (raw helpers and INx2NvsrvSession)
+## 2026-11-07 — src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (raw helpers and INx2NvsrvSession)
 
 ### Intentional differences
 - Raw sessions use the existing deferred object-ID/queued ServerManager registration bridge. Child manager construction precedes the existing session helper because that helper requires a manager; reservation still precedes creation and registration precedes response. Registered KSession is marked resource-committed so finalization releases the reservation.
@@ -19531,7 +19770,7 @@ Memory validation: two metadata-load tests, two backing/NPDM tests and two kerne
 ### Binary layout verification
 - PASS: response command/length and contiguous result/data words tested. Domain raw-session regression checks copy-object identity, no move/domain conversion, server registration, reservation and release. Both tests pass.
 
-## 2026-11-07 � core/src/host1x_core.rs and video_core/src/host1x/host1x.rs vs video_core/host1x/syncpoint_manager.{h,cpp}
+## 2026-11-07 — core/src/host1x_core.rs and video_core/src/host1x/host1x.rs vs video_core/host1x/syncpoint_manager.{h,cpp}
 
 ### Intentional differences
 - Two required trait methods bridge GetGuestSyncpointValue and DeregisterGuestAction across the existing core/video crate boundary. Forwarding stays in Host1x; counter/action behavior remains owned by SyncpointManager. Existing opaque action ID conversion is retained.
@@ -19546,7 +19785,7 @@ Memory validation: two metadata-load tests, two backing/NPDM tests and two kerne
 ### Binary layout verification
 - No serialized layout changes. Values remain u32, opaque action tokens u64. Regression distinguishes guest from host counters and checks exact callback cancellation.
 
-## 2026-11-07 � src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (INx2SyncptSession)
+## 2026-11-07 — src/core/src/hle/service/nx2_gsv.rs vs core/hle/service/nx2_gsv.h (INx2SyncptSession)
 
 ### Intentional differences
 - Service state uses a mutex for Rust shared handlers. Pending flags are Arc<AtomicBool> so callbacks retain stable field lifetime instead of capturing a C++ map-node reference. SharedState's lock/alive pair is Arc<Mutex<bool>>; callback signalling remains under that same lock, and destruction marks dead before cancel/close.
@@ -26299,3 +26538,751 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Tests
 - `gpu_bc3_transcode_takes_only_plain_2d_astc_within_the_scratch_budget`.
+
+## 2026-11-13 — src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs shader_recompiler/frontend/ampere/lower_to_maxwell.h
+
+### Intentional differences
+- The predicate-only MATCH.ALL expansion now accepts the 32-bit source mode in
+  addition to the existing 64-bit mode. Bit 73 selects the width, independently
+  verified against Mesa NAK's SM70 OpMatch encoder. The narrow mode emits one
+  shuffle/comparison instead of two; the existing active-lane ballot, predicate
+  preservation and final ALL vote remain unchanged. ANY, returned masks and
+  predicated execution remain explicitly rejected.
+- Frozen C++ oracle fixtures retain their original rejection of this extension.
+  Those newly accepted cases instead check the single source shuffle/comparison
+  and destination vote. A separate synthetic test translates both widths into
+  Maxwell IR, including an odd-numbered 32-bit source and rejected modes.
+- Re-read Eden's Maxwell vote.cpp, warp_shuffle.cpp, integer_set_predicate.cpp
+  and impl.h to verify the emitted operations. The native Ampere header is not
+  available in this local Eden checkout, so native header parity is not claimed;
+  its pinned oracle remains the comparison baseline for unchanged modes.
+
+### Validation
+- All 50 native-lowering tests pass. Full shader_recompiler suite: 723 passed,
+  one separate texture-tracking diagnostic fails. Runtime lighting validation
+  is still pending; accepting this shader is not proof of a lighting fix.
+
+## 2026-11-13 — src/shader_recompiler/src/ir_opt/texture_pass.rs vs shader_recompiler/ir_opt/texture_pass.cpp
+
+### Investigation, not a production correction
+- A synthetic diagnostic exposes Track's traversal from a loaded descriptor
+  through its storage address to an unrelated constant-buffer value. Re-reading
+  Eden's Track/TryGetConstBuffer confirms the same unrestricted breadth-first
+  traversal. No production behavior has been changed. The test remains failing
+  while support for indirect descriptor tracking is unresolved; the interrupted
+  investigation is recorded in bugs/nx2-render-investigation-20261113/STATE.md.
+- The captured fragment draw under investigation uses direct descriptors, so
+  this separate limitation is not established as its lighting defect.
+
+## 2026-11-13 — src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs shader_recompiler/frontend/ampere/lower_to_maxwell.h (shared atomic displacement)
+
+### Source verification
+- Located the header-only native implementation in Eglantine commit
+  ae9d3eb8d224e85b9fc4ec1df35f2825e13aef76. Re-read its complete 0xf8c and
+  0x3a1 switch arms after the changes: validation, scratch allocation,
+  predication, displacement encoding and emission order now match those arms.
+  This supersedes the earlier note that only frozen native fixtures were
+  available. No local Eden source was changed.
+- ATOMS.POPC.INC.32 now forwards aligned byte displacements from bits 40..63
+  to Maxwell's 22-bit word offset. Zero-offset behavior is unchanged, as are
+  the stride shift and per-active-lane increment. CuAssembler's pinned SM86
+  records independently confirm the immediate offset encoding.
+- MATCH.ALL can write P6 by temporarily using and preserving P5 instead;
+  other destinations retain P6 as scratch. Both source widths are tested.
+
+### Intentional differences
+- Original frozen oracle fixtures are not rewritten. Newly accepted cases
+  explicitly check the new instruction contract, while unchanged cases retain
+  their exact original word/error/metadata comparisons.
+- Synthetic tests cover relative and absolute bases, all four strides, aligned
+  displacement boundaries, unaligned rejection and translation to shared atomic
+  IR. This validates translation, not the final rendered lighting result.
+
+### Validation
+- Full crate: 724 passed, the separate texture-tracking diagnostic remains red.
+- All 261 collected compute dumps pass native lowering. Release rebuild passed;
+  runtime no longer reports either native shader rejection. Save reload and
+  thumbnail remain functional, but the equipment lighting defect persists.
+
+## 2026-11-13 — src/shader_recompiler/src/backend/glsl/var_alloc.rs vs shader_recompiler/backend/glsl/var_alloc.{h,cpp}
+
+### Intentional differences
+- Rust's `Value::is_immediate` excludes `Void`, whereas upstream's query includes
+  every non-opaque type after resolving identities. `VarAlloc::consume` explicitly
+  includes `Void` locally and forwards it to `make_imm`, which returns the empty
+  string required by upstream for absent optional operands. This avoids changing
+  the shared IR predicate's behavior for unrelated consumers.
+- Regression tests exercise both direct and identity-wrapped absent operands.
+  The synthetic `emit_glsl_image.rs` regression covers ordinary fetch with no
+  sample operand and multisample fetch with no LOD operand, checking the emitted
+  overloads against `EmitImageFetch` in `emit_glsl_image.cpp`. No image-emission
+  production logic or shader data layout changes are needed.
+
+### Validation
+- Both focused regressions pass. This fixes a GLSL generation panic encountered
+  before the cross-backend rendering comparison; it does not establish a fix for
+  the separate lighting defect.
+- Full crate: 726 passed, with only the previously introduced texture-tracking
+  diagnostic failing. Release rebuild succeeded.
+
+## 2026-11-13 — src/shader_recompiler/src/backend/glsl/emit_glsl_warp.rs and emit_glsl.rs vs shader_recompiler/backend/glsl/emit_glsl_warp.cpp and emit_glsl_instructions.h
+
+### Ownership and behavior verification
+- The five subgroup-mask emitters now live in the upstream-owned warp module;
+  the dispatcher forwards the instruction without consuming a nonexistent
+  argument. Each returns a scalar U32, not U32x4. `BallotIndex` and `GetMask`
+  preserve upstream selection of the guest's 32-bit word on wider host warps.
+- `LaneId` uses the same owner and upstream `THREAD_ID & 31u` expression, fixing
+  the neighboring omission of the guest-warp mask.
+- Synthetic tests exercise all five masks with both host-warp profile settings
+  through the real dispatcher, and check the lane-ID expression. This is a
+  limited verification of these emitters, not a completed audit of all warp
+  operations; existing vote/shuffle paths are outside this slice.
+
+## 2026-11-13 — src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs frontend/ampere/lower_to_maxwell.h (Fritchii c9ebb5c3af672a0472ca0811392f04fab10203ab)
+
+### Ownership and behavior verification
+- The mixed-sign FP16 FMA source mode now emits the upstream half exchange
+  followed by XOR of the new low-half sign bit, in the existing lowering
+  owner. Previously only the original high-half sign was inverted.
+- Re-read the header's operand validation and both emitted instructions after
+  implementation; temporary register, predicate, operation order and subsequent
+  FMA source match. This native header has no separate implementation file and
+  is absent from the local Eden master checkout; the pinned public fork supplies
+  this comparison, not a claim about unavailable Eden NX2 history.
+- A synthetic instruction regression checks both emitted operations and the
+  FMA's use of the transformed operand. This is a lowering regression, not a
+  hardware execution comparison. No captured native shader used this mode, so
+  this correction is not evidence of resolving the active lighting defect.
+
+## 2026-11-13 — src/shader_recompiler/src/frontend/ampere/lower_to_maxwell.rs vs frontend/ampere/lower_to_maxwell.h (native TEX operand partition)
+
+### Intentional differences
+- Non-scalar TEX uses source A for coordinates and source B for metadata for
+  constant-buffer and uniform handles too, not only register handles. The
+  pinned Fritchii c9ebb5c3af672a0472ca0811392f04fab10203ab header restricts this
+  layout to opcode 0x361 and therefore reads the wrong LOD/offset registers for
+  non-scalar constant-buffer TEX. Ownership and lowering order are unchanged.
+- Independent reference: Mesa 61a2e907f1d6e4a8432d91d0fde5d439a875fbbe,
+  nouveau/compiler/nak_nir_lower_tex.c lower_tex/try_scalarize_tex and
+  nak/sm70_encode.rs OpTex::encode (scalar bit60). Re-read these and the C++
+  header after editing. A synthetic 3D LOD+offset case checks both layouts.
+
+### Validation still pending
+- Focused regression passes. Full crate run: 730 passed, one failed: the known
+  independent indirect-handle tracking diagnostic remains red. Corrected 217
+  frozen fixture cases using the independent source layout above; only MOV
+  source-register fields changed, with provenance noted in each fixture.
+  No cases were skipped. Release compilation succeeded.
+- Captured native instructions exercise the non-scalar mode. Runtime validation
+  with the rebuilt binary loads the manual save and its thumbnail correctly,
+  but the equipment lighting remains dark. This correction is not sufficient
+  to resolve that defect.
+
+## 2026-11-13 — src/shader_recompiler/src/shader_info.rs vs shader_recompiler/shader_info.h (Fritchii c9ebb5c3af672a0472ca0811392f04fab10203ab)
+
+### Intentional differences
+- `EvaluateHandleProgram` remains owned by shader_info, using Rust closures and
+  an iterator over raw u32 opcodes instead of a C++ templated callback and PC.
+  No unchecked integer-to-enum conversion is used. Re-read the complete header
+  evaluator after implementation: opcode order, 64-word stack, 256 zeroed slots,
+  operand/pop order, wrapping arithmetic, signed comparisons, oversized shifts,
+  ignored overflowing pushes, missing operands and final-stack validation match.
+- The local Eden header lacks this native-handle extension; comparison uses the
+  pinned public fork above (header-only, no separate implementation file).
+
+### Interrupted integration
+- This evaluator is a prerequisite, not yet connected to translation or draw
+  binding. Descriptor program indexes, BuildHandleProgram, cache implications
+  and draw-time consumers must be ported before resuming the indirect-handle
+  runtime test. The interrupted work is recorded in the investigation state.
+- Synthetic tests exercise current storage contents, dynamic cbuf access,
+  every arithmetic/logical operation, selection, shared slots and bounds.
+  No change to the rendered scene is claimed from this isolated prerequisite.
+- Full shader-recompiler suite: 733 passed, one existing indirect-handle
+  tracking diagnostic failed. All three evaluator regressions pass. No runtime
+  validation is claimed before the remaining integration is implemented.
+
+## 2026-11-13 — src/shader_recompiler/src/ir/value.rs vs shader_recompiler/frontend/ir/value.h
+
+### Intentional differences
+- Value::resolve takes the owning Program because Rust values contain arena
+  indexes rather than C++ instruction pointers. It follows Identity operands
+  and returns the terminal value, preserving an immediate's bit pattern.
+  Re-read Value::Resolve/IsImmediate/InstRecursive after implementation; the
+  source is header-inline, with no out-of-line implementation of these methods.
+- The existing context-free is_immediate API is unchanged. The new handle
+  compiler explicitly resolves operands before inspecting immediate values.
+  A regression covers chained identities ending in an immediate or instruction.
+
+## 2026-11-13 — src/shader_recompiler/src/ir_opt/texture_pass.rs vs shader_recompiler/ir_opt/texture_pass.cpp (Fritchii c9ebb5c3af672a0472ca0811392f04fab10203ab)
+
+### Intentional differences
+- ConditionalHeader, Condition, ResolveConditionalPhi, BuildHandleProgram and
+  BuildHandleNode remain in the matching pass owner. Rust uses block/InstRef
+  indexes; Phi inputs use phi_args and block tails follow logical instruction
+  order. Temporary slot/failure state is owned by one HandleBuildState instead
+  of thread-local globals. Callers must create fresh state per root build.
+- The load_word lambda is mechanically expressed as a private method in that
+  same state. Rollback removes emitted code and slots created by failed paths;
+  shared operands, cycle detection, budget consumption, arithmetic lowering,
+  selection and conditional Phi handling were compared against the retrieved
+  C++ excerpts. The public repository began returning HTTP 404 during the final
+  reread; this comparison uses excerpts retrieved earlier in the same turn,
+  not a claim that the repository remains accessible.
+- Synthetic tests cover branch polarity, unresolved merge contexts, storage
+  byte offsets, failed-Phi slot rollback, cycles, budgets, flags, bitfields,
+  clamps and identity-wrapped immediates.
+
+### Interrupted integration
+- The compiler is tested but not yet called by production TexturePass. Runtime
+  descriptor indexes, shader-info storage and backend evaluation are still
+  required; the known invalid tracking diagnostic remains red. No render fix
+  or complete parity claim is made for this prerequisite slice.
+
+## 2026-11-13 — indirect descriptor metadata and Vulkan consumers vs Fritchii c9ebb5c3af672a0472ca0811392f04fab10203ab
+
+### Ownership and intentional differences
+- The exact pinned source was recovered from uphiago/Fritchii after the original
+  repository became inaccessible; relevant source snapshots are retained in the
+  ignored investigation directory. shader_info.rs and environment.rs now carry
+  handle_program indexes in the corresponding descriptor types and ConstBufferAddr,
+  with u32::MAX denoting the existing direct path. Info owns handle_programs.
+  Existing constructors and synthetic fixtures explicitly initialize the sentinel;
+  those mechanical changes do not enable the indirect path.
+- New video_core/shader_handle_program.rs corresponds to the upstream header-only
+  EvaluateTextureHandle. It reads current cbuf/storage words, checks absent bindings
+  and zero addresses in the same order, and returns zero on evaluator failure.
+  The Rust memory adapter uses two little-endian u32 reads for the u64 storage
+  pointer. Sequential reader callbacks share RefCell adapters, not additional
+  locks or a persistent cache. Test verifies full 64-bit addresses and fresh data.
+- Vulkan graphics_pipeline.rs ConfigureImpl and compute_pipeline.rs read_handle
+  use that helper before direct-cbuf assertions, in the same owners and order as
+  vk_graphics_pipeline.cpp and vk_compute_pipeline.cpp. The existing Rust draw/
+  dispatch snapshots supply cbuf bindings instead of pointers to engine state.
+  Re-read the pinned helper, descriptors, Configure snippets and pipeline header
+  state after editing. A compute regression verifies a valid program may read a
+  different enabled cbuf while the direct descriptor's cbuf remains disabled.
+
+### Validation and interrupted integration
+- cargo check -p video_core passes. The helper and compute-handle regressions pass.
+  Shader suite remains 739 passing and the existing indirect tracking diagnostic
+  failing: TexturePass still emits only direct descriptors. Backend/compiler
+  integration, descriptor deduplication/merge and cache audit remain required.
+- Other renderer constructor changes only set u32::MAX in existing test data;
+  they do not claim OpenGL or Metal runtime support for the new programs.
+  Full video_core suite: 1806 passed, one ignored, one failed in the AV1 software
+  frame chroma check. This failure has not been baseline-compared and is not
+  claimed to be pre-existing. Runtime validation of indirect descriptors remains
+  pending the production compiler integration.
+
+## 2026-11-13 — src/shader_recompiler/src/ir_opt/texture_pass.rs vs ir_opt/texture_pass.cpp (indirect handle integration, pinned c9ebb5c3)
+
+### Intentional differences
+- The pass now stops direct-cbuf tracking at memory loads, resolves conditional
+  Phi inputs in the texture instruction's block, and clears tracking cache per
+  block. Untracked handles compile into deduplicated Info.handle_programs.
+  Descriptors retain program indexes; their deduplication includes those indexes.
+  Dimension queries use the sampled type of the same program when available.
+- The upstream default float/type metadata for computed handles is retained;
+  integer/format specialization remains limited by upstream's assumptions.
+  Unlike the pinned fork, a program that cannot be evaluated does not retry the
+  known-invalid search through a memory load's address. It throws the existing
+  shader NotImplementedException instead of silently binding an address as a
+  texture handle. This is a deliberate correction to that fallback, not parity.
+- Re-read Track/MakeInst, format helpers, descriptor Add overloads and pass type
+  inference after editing. Synthetic coverage proves a storage address is not
+  selected as the handle, distinct programs do not collapse, query types agree,
+  and current storage words determine the result. The old exception regression
+  now uses LaneId (per-lane, not evaluable per draw) rather than constant addition,
+  which is correctly supported by the new evaluator.
+
+### Integration still in progress
+- Do not run this as a completed cross-backend fix yet: OpenGL/Metal readers and
+  dual-vertex descriptor/program merging require completion. The pinned upstream
+  JoinTextureInfo also does not remap program indexes, so copying it verbatim is
+  not sufficient evidence of correctness. No lighting improvement is claimed.
+
+## 2026-11-13 — renderer_opengl/gl_{graphics,compute}_pipeline.rs vs renderer_opengl/gl_{graphics,compute}_pipeline.{h,cpp}
+
+### Intentional differences
+- Graphics Configure and compute descriptor collection now evaluate computed
+  handles before inspecting direct-cbuf fields. Binding ownership stays in each
+  pipeline, with the shared evaluator from the pinned native reference's
+  video_core/shader_handle_program.h. Local Eden only supports the direct-cbuf
+  branch; that branch, secondary sampler composition and texture-pair decoding
+  remain unchanged. This is an explicit native-descriptor extension, not a claim
+  that local Eden contains equivalent OpenGL code.
+- Computed handles read currently bound enabled cbufs; invalid or disabled
+  bindings provide address zero, matching the shared evaluator contract. They
+  do not validate the unused direct descriptor's cbuf index.
+- Re-read both C++ headers and Configure handle readers after implementation.
+  The synthetic compute test exercises collection with an unused disabled cbuf
+  and a different enabled program cbuf, then changes the memory word between
+  collections. All 13 OpenGL compute pipeline tests pass.
+
+### Integration still in progress
+- Metal readers and dual-vertex program/storage-index remapping remain pending.
+  No release/runtime validation or lighting correction is claimed for this slice.
+
+## 2026-11-13 — renderer_metal/metal_{graphics,compute}_pipeline.rs vs renderer_vulkan/vk_{graphics,compute}_pipeline.{h,cpp}
+
+### Intentional differences
+- Metal has no local Eden counterpart. Its graphics and compute resource owners
+  now use the pinned native reference's EvaluateTextureHandle contract before
+  direct descriptor validation, just like Vulkan. The existing Metal block-read
+  callback supplies little-endian words; disabled/out-of-range cbuf bindings
+  supply address zero. Direct binding/error handling remains unchanged.
+- Re-read the pinned Vulkan Configure readers and header ownership declarations
+  after editing. Added a macOS-target compute regression for changing current
+  cbuf data with an unused disabled direct cbuf. Both Metal files parse through
+  rustfmt, but this Linux host has not type-checked or executed the macOS code;
+  this is not claimed as Metal runtime validation.
+
+### Unintentional differences (to fix)
+- A new synthetic JoinTextureInfo regression proves source program zero aliases
+  destination program zero when their contents differ (one descriptor retained
+  instead of two). The pinned native upstream also omits this remapping.
+  Integration is stopped before runtime testing pending descriptor/program and
+  storage-index remapping in the respective merge owners. This is an observed
+  integration defect, not evidence that it causes the lighting symptom.
+
+## 2026-11-13 — shader_recompiler texture/storage joins and frontend/translate_program.rs vs corresponding C++ merge owners
+
+### Intentional differences
+- JoinStorageInfo returns the source-to-destination binding map while preserving
+  upstream descriptor matching and is_written union. JoinTextureInfo relocates
+  Storage operands in handle programs to the joined storage descriptors, dedups
+  programs by relocated contents, and relocates descriptor program indices.
+  It returns a map for each of the four texture/image descriptor categories.
+- MergeDualVertexPrograms joins storage before textures because computed handle
+  programs depend on storage bindings. It applies both maps only to the cloned
+  second vertex program; first-stage indices and hardware cbuf IDs are retained.
+  Remapping logic remains in each descriptor-owning optimization module, not in
+  the frontend coordinator. The C++ merge was reread after implementation; it
+  does not repair independently assigned indices, so this is a correctness
+  extension rather than literal parity with that omission.
+- Synthetic regressions prove distinct source/destination program-zero values
+  remain distinct, storage binding permutation is honored, opcode-like immediate
+  data is not rewritten, and image-write/storage-write/atomic IR indices follow
+  their merged descriptors. Full shader_recompiler suite: 743 passed.
+
+## 2026-11-13 — ir_opt/texture_pass.rs vs pinned texture_pass.cpp (vector handle extraction)
+
+### Intentional differences
+- BuildHandleNode now accepts CompositeExtractU32x4 in addition to x2. Both
+  select a 32-bit word at base byte offset plus four times the element index;
+  the existing load-word helper already accepts LoadStorage128. The pinned
+  C++ switch was reread and only includes x2, despite accepting 128-bit storage
+  sources in load_word. This is an explicit extension, triggered by observed
+  shader translation failures, not a game-specific workaround.
+- Synthetic coverage checks every component of both 64-bit and 128-bit storage
+  loads against the evaluator's read address. Full shader suite: 744 passed.
+  The previous runtime reached gameplay but still had dark equipment lighting;
+  this additional case has not yet been validated in the running renderer.
+
+### Runtime follow-up
+- The x4 extraction path now passes the previous runtime failure, but later
+  handle evaluation fails with Phi and the equipment-lighting symptom remains.
+  An opt-in, create-new, maximum-16-file IR failure capture was added locally to
+  TexturePass for investigation. It does not change fallback/evaluation and is
+  temporary instrumentation to remove before delivery, not an upstream port.
+
+## 2026-11-13 — src/video_core/src/renderer_vulkan/scheduler.rs vs video_core/renderer_vulkan/vk_scheduler.{h,cpp}
+
+### Intentional differences
+- Render-pass continuation follows Lichii nx2 commit ac166ebc64 instead of the
+  older local Eden predicate: an active pass with the same framebuffer and
+  render area continues even when its handle is the compatible deferred-clear
+  variant. Ending a pass still requires starting a new one even if its retained
+  framebuffer and area match. Deferred-clear realization ordering is unchanged.
+- The comparison is mechanically extracted into SchedulerState for a synthetic
+  regression test; state and render-pass lifecycle remain owned by Scheduler.
+  This reduces unnecessary pass restarts; it is not yet established as a fix
+  for the pending lighting issue or validated in a live session.
+
+## 2026-11-13 — Vulkan present/fsr3.rs and filter selection vs Lichii nx2 present/fsr3.{h,cpp}, present/layer.{h,cpp}, common/settings_enums.h
+
+### Intentional differences
+- FSR 1 Soft follows Lichii nx2 1e5ae836a3, not the older local Eden tree.
+  Fsr3 retains serialized value 15. Its Vulkan owner is present/fsr3.rs:
+  two EASU/RCAS raster passes, FP16/FP32 shader selection, image formats,
+  descriptor order, cropped viewport constants and slider / 100 * 0.8 match.
+  The unused history image is still allocated and initially cleared; the
+  unused has_prev_frame boolean is omitted. This is spatial FSR, not temporal
+  reconstruction, despite upstream header prose.
+- Rust captures owned handles in scheduler closures and explicitly destroys
+  views/framebuffers before RAII images. A mechanical helper exposes the RCAS
+  parameter for a synthetic test. Push constants remain 16 zero-initialized
+  u32 values (64 bytes); no host struct padding is serialized.
+- Vulkan layer/blit selection and GUI labels expose the new mode. OpenGL
+  follows Lichii's existing Fsr3-to-FSR path, which does not apply Vulkan's
+  0.8 RCAS multiplier. Metal presentation has no equivalent filter pipeline;
+  this tranche does not implement Metal post-processing.
+
+## 2026-11-13 — common/settings_common.rs, common/settings.rs and core/core.rs vs common/settings_setting.h, common/settings.{h,cpp} and core/core.{h,cpp}
+
+### Intentional differences
+- System selects temporary NX2 graphics defaults after hardware preflight and
+  clears them after GPU shutdown. Unlike single-console Eden, inherited settings
+  use Fast, Handheld, FXAA, FSR 1 Soft and sharpening 25 for this session.
+  SwitchableSetting stores an optional session default, without changing the
+  persisted global value or use_global flag. Explicit per-title settings win;
+  explicit runtime writes remove the temporary default. Global serialization
+  still reads GetValueGlobal, and inherited per-title values are not serialized.
+- Existing Rust placement of SwitchableSetting in settings_common.rs is retained.
+  The new state is a documented multi-console lifecycle extension, not an Eden
+  behavior claim. Tests cover selection, restoration, global serialization and
+  explicit per-title/runtime choices. No new persisted setting or binary ABI.
+- The reference FX chain is empty. No FX/Reshade implementation or functional
+  effect toggle is claimed by these defaults.
+
+## 2026-11-13 — core/hle/service/nx2_video_input_queue.rs and nx2_gsv.rs vs Lichii nx2 core/hle/service/nx2_video_input_queue.h and nx2_gsv.h
+
+### Intentional differences
+- The header-only input queue has its own corresponding Rust module: VecDeque
+  replaces deque and Option replaces optional. Packet ownership, watermark 8,
+  refusal threshold 24, retained refused packet, retry comparison (PTS and
+  bytes), EOS exception and clear ordering follow the reference literally.
+  Pop asserts nonempty rather than invoking C++ undefined behavior.
+- SubmitInput returns module HwOpus / description 3603 without incrementing
+  the submission counter on busy. Accepted EOS disables readiness until flush
+  or a new stream; decode does not re-enable readiness while EOS is queued.
+  Existing worker/mutex ownership is retained. This is the admission-control
+  slice, not a claim that the entire newer video session has been ported.
+
+### Unintentional differences (to fix)
+- The wider newer reference also has presentation-clock and late-output
+  handling, end-of-stream fence completion and descriptor-count-based payload
+  decoding. These require a separate verified service slice; the existing
+  fixed payload offset still assumes one A descriptor.
+
+## 2026-11-13 — ruzu/src/boot.rs vs frontend loading notifications
+
+### Intentional differences
+- GTK receives ConfigurationApplied again after System::Load selects the
+  hardware-specific temporary defaults. The initial pre-load notification is
+  retained. This corrects stale status-bar labels without rewriting settings;
+  Qt frontend code is not ported.
+
+## 2026-11-13 — common/src/wall_clock.rs vs Lichii common/cpu_features.{h,cpp}
+
+### Intentional differences
+- The existing WallClock trait and StandardWallClock remain in their historical
+  Rust file rather than moving all CPU detection/platform clocks together.
+  Guest frequency and CPU-tick conversion belong to that clock, as upstream.
+  Each System owns its clock; there is no global guest-frequency selection.
+  NX2 uses the reference's experimental 31.25 MHz; Switch 1 keeps 19.2 MHz.
+
+## 2026-11-13 — common/src/x64/native_clock.rs vs Lichii common/cpu_features.{h,cpp} (x64)
+
+### Intentional differences
+- Retains the existing platform file. Frequency changes update the atomic
+  fixed-point CNTPCT factor before execution, matching SetGuestCNTFRQ; the
+  nanosecond and GPU factors are untouched. No extra division on tick reads.
+
+## 2026-11-13 — common/src/arm64/native_clock.rs vs Lichii common/cpu_features.{h,cpp} (ARM64)
+
+### Intentional differences
+- Retains the existing platform file. The 128-bit factor uses portable-atomic
+  instead of an ordinary C++ integer to support safe interior mutation of a
+  Send+Sync clock. Selection still occurs before guest execution, not during
+  concurrent guest reads. Host frequency is retained for rebuilding the factor.
+  The upstream max(host frequency, 1) initialization guard is also preserved.
+- Native ARM64 execution has not been tested on this Linux x64 host; this
+  clock change does not implement the existing NCE CNTFRQ patcher limitation.
+
+## 2026-11-13 — core/src/hardware_properties.rs and core/src/core.rs vs Lichii core/core.{h,cpp}
+
+### Intentional differences
+- System selects its own CoreTiming frequency from HardwareProfile after old
+  workers are stopped and metadata preflight selects the new session, before
+  kernel/thread creation. Test System creation uses the same selection.
+  This replaces the reference's process-global switch2_program selection and
+  intentionally does not port its environment frequency override.
+
+## 2026-11-13 — core/src/core_timing.rs vs Lichii core/core_timing.{h,cpp}
+
+### Intentional differences
+- CoreTiming forwards frequency configuration/query to its owned clock; both
+  multicore and single-core counters now use that frequency before existing
+  CPU clock/speed scaling. Event deadlines remain in nanoseconds.
+- The pre-existing adaptive-pacing extension is retained for this isolated
+  frequency experiment; its thresholds now use the selected tick units.
+  The independent pacing-disabled run still measured roughly 20 FPS before
+  this change. No performance improvement is claimed from that experiment.
+
+## 2026-11-13 — core/src/arm/dynarmic/arm_dynarmic_64.rs vs Lichii core/arm/dynarmic/arm_dynarmic_64.{h,cpp}
+
+### Intentional differences
+- CNTFRQ_EL0 comes from the immutable session hardware profile, not a global
+  WallClock. It selects the same frequency configured on CoreTiming at boot.
+- GetCNTPCT now preserves the reference's short-poll pause (two x64 PAUSEs or
+  one ARM64 YIELD for unsigned deltas below frequency/600000). The returned
+  tick value is unchanged. Rust's shared callback receiver requires an atomic
+  previous-read field; it is per JIT, not a global counter. The diagnostic
+  opt-out is named RUZU_NX2_CNTPCT_PAUSE rather than EDEN_NX2_CNTPCT_PAUSE.
+
+## 2026-11-13 — core/src/hle/service/psc/time/common.rs vs Lichii core/hle/service/psc/time/common.{h,cpp}
+
+### Intentional differences
+- ConvertToTimeSpan receives the session frequency explicitly rather than
+  reading global state. Signed saturation, quotient/remainder ordering and
+  nanosecond units are unchanged. Tests cover both frequencies and saturation.
+
+## 2026-11-13 — core/src/hle/service/psc/time/service_manager.rs vs Lichii core/hle/service/psc/time/clocks/standard_steady_clock_core.{h,cpp}
+
+### Intentional differences
+- Existing Rust steady-clock consumers receive a nanosecond callback from
+  TimeServiceManager instead of calling System directly. That callback now
+  converts with the same System's frequency, preserving the current ownership
+  adaptation without introducing global frequency state.
+
+## 2026-11-13 — core/src/hle/service/glue/time/standard_steady_clock_resource.rs vs Lichii core/hle/service/glue/time/standard_steady_clock_resource.{h,cpp}
+
+### Intentional differences
+- RTC offset and timeout conversion explicitly receive System's frequency;
+  the null-System unit-test path keeps the Switch 1 default. The existing
+  arithmetic test helper now accepts the frequency too. The 101 ms rejection
+  boundary and signed RTC subtraction are preserved for both session profiles.
+
+## 2026-11-13 — video_core/src/buffer_cache/buffer_cache.rs vs Lichii video_core/buffer_cache/buffer_cache.h (download diagnostics)
+
+### Intentional differences
+- RUZU_TRACE_BUFFER_DOWNLOADS reports batch bytes, copy count and largest copy
+  at the same point as upstream's DownloadBytes/DownloadCopies counters.
+  This opt-in diagnostic does not port the full Nx2Profile subsystem and does
+  not alter copy ranges, synchronization or memory ownership.
+
+## 2026-11-13 — shader_recompiler/environment.rs and video_core/shader_environment.rs vs Eden/Lichii environment.h and shader_environment.{h,cpp} (native pointer prerequisites)
+
+### Intentional differences
+- Eden has no native pointer-classification interface. The NX2 extension follows
+  Lichii's direct and indirect constant-buffer pointer checks: nonzero address,
+  GPU address range, mapped byte; indirect entries first require eight mapped
+  bytes. First observations are cached per environment, including negative ones.
+- GenericEnvironment keeps ownership; associated functions receive the derived
+  Rust environment to preserve virtual constant-buffer reads without aliasing
+  its mutable base. Cache-backed graphics/compute adapters carry the same map.
+- The serialized map uses an optional stage-bit extension rather than inserting
+  a mandatory count into the older Eden cache header. Existing records remain
+  readable; missing classifications fail explicitly rather than guessing from
+  absent live GPU state. This format is not Lichii-cache compatible. Records use
+  explicit little-endian u64 keys and one-byte booleans, with count/bounds checks.
+- Lichii's optional guessed offline environment is not used: uncached pointer
+  queries raise LogicError, matching its non-guess path.
+
+### Missing items
+- Native candidate traversal and indirect storage bindings remain the interrupted
+  dependent slice, recorded in the rendering investigation state. This change
+  supplies its environment/cache prerequisite only; it does not yet restore the
+  missing compute pipelines or establish the cause of local-lighting failure.
+
+## 2026-11-13 — src/shader_recompiler/src/storage_write_extent.rs vs Lichii shader_recompiler/storage_write_extent.h
+
+### Intentional differences
+- Eden's baseline has no native write-extent metadata. The Lichii extension is
+  kept in its own matching module, with the same fields, guard threshold,
+  component-wise merge and unknown-bound fallback. Optional grid dimensions
+  distinguish direct dispatches from GPU-selected indirect dispatch counts.
+- C++ constexpr helpers become ordinary Rust functions: evaluation is needed at
+  runtime for dispatch dimensions. Metadata is not serialized by raw struct copy;
+  no C++ padding/layout dependency is introduced.
+
+### Missing items
+- This is the prerequisite for descriptor metadata and native store analysis,
+  not yet a change to buffer dirty tracking. Its dependent pass and binding work
+  remain recorded in the investigation state; no measured bandwidth gain claimed.
+
+## 2026-11-13 — video_core/buffer_cache/buffer_cache.rs and buffer_cache_base.rs vs Lichii buffer_cache/buffer_cache.{h,base.h} (binding ranges)
+
+### Intentional differences
+- Adopted Lichii's range semantics for legacy descriptors too: mapped length is
+  capped to u32::MAX before conversion, rather than truncated. Native graphics
+  and written compute pointers do not treat the following scalar as a size.
+  Read-only native compute can use a larger valid size, capped by host limits;
+  native/table ranges stop at MaxContinuousRange before alignment.
+- The callback-based graphics path supplies the already-held memory owner's
+  continuity query, avoiding a recursive Rust memory-manager lock. Mode comes
+  from the bound Maxwell/Kepler owner, never from a global console profile.
+- Reference diagnostic counters are omitted; range selection is unchanged by
+  their absence. Metal uses its device's maxBufferLength for the range ceiling.
+
+### Missing items
+- Indirect descriptor producers are not connected yet; the range logic supports
+  that context and is tested, but current callers supply direct-pointer context.
+- Lichii's thread-local binding memoization requires owner/map-serial invalidation
+  plumbing before porting; the current path recomputes identical range rules.
+  The interrupted cache prerequisite is recorded in the investigation state.
+
+## 2026-11-13 — renderer_vulkan/buffer_cache.rs, renderer_opengl/{gl_device,gl_buffer_cache,gl_graphics_pipeline}.rs, renderer_metal/metal_buffer_cache.rs vs Lichii renderer_{vulkan,opengl} buffer-cache/device owners
+
+### Intentional differences
+- Runtime storage-range limits remain in backend owners. Vulkan forwards the
+  physical-device limit; OpenGL captures GL_MAX_SHADER_STORAGE_BLOCK_SIZE using
+  a 64-bit query and the same 128MiB lower bound as Lichii. Metal has no upstream
+  equivalent and forwards its native device profile's maxBufferLength.
+- OpenGL passes the continuity callback through its existing guarded-reader
+  path; test runtimes use a deterministic 1GiB limit. No global capability cache.
+
+## 2026-11-13 — shader_info.rs, ir_opt/global_memory_to_storage_buffer_pass.rs and backend descriptor initializers vs Lichii shader_info.h/global_memory_to_storage_buffer_pass.cpp
+
+### Intentional differences
+- Storage descriptors now carry indirect_offset (u32::MAX means direct) and
+  StorageWriteExtent. Existing producers and synthetic fixtures initialize the
+  additional fields explicitly through Default, preserving direct/unknown behavior.
+  No raw serialized struct layout is used. Backend descriptor initializer edits
+  are mechanical; no shader operations or binding numbers changed.
+- JoinStorageInfo includes indirect offset in identity and merges written extents
+  component-wise, preserving unknown when either written source is unknown.
+
+### Missing items
+- Native candidate collection/store-extent analysis still must produce these
+  descriptors. Host-limit enforcement and stale-null-pointer rebuilds remain
+  prerequisites before enabling that producer; current callers create direct,
+  unbounded descriptors.
+
+## 2026-11-13 — buffer_cache/{buffer_cache,buffer_cache_base}.rs and renderer_{vulkan,opengl,metal} pipeline consumers vs Lichii buffer_cache and pipeline owners
+
+### Intentional differences
+- Graphics and compute bindings resolve indirect table offsets and reject null
+  holders. Compute tracks native write marks separately from full readable binding
+  sizes, with pointer-alignment padding. Unknown bounds retain whole-range writes.
+  Legacy bindings keep whole-range tracking. Multi-range writes consume the mark
+  budget in segment order, preserving full ranges for synchronization/reads.
+- Ruzu has no kept-grid dispatch optimization; an indirect compute address makes
+  the resolver's grid unknown. Any future kept-grid path must do the same.
+  The reference diagnostic Full override is not exposed; runtime uses Auto rules.
+- Metal consumes the same generic descriptor metadata although it has no C++
+  counterpart. GL preserves its existing held-memory-reader adapter.
+
+### Missing items
+- Lichii's separate multi_range_refresh lifecycle helpers are not part of this
+  slice; their live-ID validation and unconditional gathered-buffer refresh need
+  a separately verified port before claiming full multi-range parity.
+
+## 2026-11-13 — src/shader_recompiler/src/ir_opt/global_memory_to_storage_buffer_pass.rs vs Lichii shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp and ir_opt/passes.h
+
+### Intentional differences
+- Ported CbufWord, StoreSize, IdBound and StoreExtentAnalysis into the matching
+  pass owner. Bounds are computed before rewriting global addresses; an
+  untracked store disables all narrowed write extents. This extends Eden's
+  direct-pointer pass with Lichii's analysis, without a console-name condition.
+- Rust instruction references key the memo/active sets; Phi inputs live in
+  phi_args instead of C++ Inst::Arg. Helper evaluation order, signed immediate
+  interpretation, guards and unknown propagation retain reference semantics.
+- StoreSize includes 64-bit compare-exchange as eight bytes; the reference's
+  default four-byte result would undercount this operation. StaticMax rejects
+  an overflowing sum for malformed workgroup dimensions rather than wrapping.
+- Existing direct-pointer collection remains separate from this completed
+  analysis prerequisite. The native pointer-candidate collection slice remains
+  interrupted as recorded in the investigation state; this is not a claim of
+  complete global-memory pass parity.
+
+## 2026-11-13 — src/video_core/src/{gpu_split,nx2_profile}.rs vs Lichii video_core/{gpu_split.cpp,gpu_split.h,nx2_profile.h}
+
+### Intentional differences
+- Added an opt-in SplitCallback profiling zone around Kind::Call execution to
+  distinguish its exclusive elapsed time from Other. Existing zone indices are
+  unchanged, nested scopes are subtracted, and callback ordering, invocation,
+  ownership and synchronization are unchanged. Reference Execute/Scope reread;
+  this is diagnostic instrumentation, not a rendering or performance fix.
+- With profiling enabled, callbacks taking at least five milliseconds also log
+  their host thunk address and elapsed time for symbolization. No guest data or
+  callback payload is logged; this diagnostic is inactive in normal execution.
+
+## 2026-11-13 — src/video_core/src/{fence_manager,nx2_profile}.rs vs Lichii video_core/{fence_manager.h,nx2_profile.h}
+
+### Intentional differences
+- Restored the reference Fence scope around SignalFence and added diagnostic
+  subzones for cache commit, query commit and GPU-cache invalidation. These
+  scopes preserve both early-return and queued-fence control flow and do not
+  alter locking, flushing, notification or callback order. New indices are
+  appended to the Rust diagnostic zones; all scopes are profiling-only.
+
+## 2026-11-13 — src/video_core/src/renderer_vulkan/renderer_vulkan.rs vs Lichii video_core/renderer_vulkan/renderer_vulkan.{cpp,h}
+
+### Intentional differences
+- Opt-in Composite subzones distinguish capture, frame-slot acquisition, blit,
+  submission, Present and frame-end notification. This expands the reference
+  Present scope/frame trace without changing Composite call order or early
+  return behavior. The outer scope includes the frame-displayed drop guard.
+
+## 2026-11-13 — src/shader_recompiler/src/backend/spirv/emit_spirv_tensor.rs vs Lichii shader_recompiler/backend/spirv/{emit_spirv_tensor.cpp,emit_spirv_instructions.h,spirv_emit_context.h}
+
+### Intentional differences
+- The software HMMA group emitter uses an optional tuple of builder IDs to emit
+  its shared body once in Rust, instead of the C++ emit_group lambda with a pick
+  lambda. K=8 emits four pairs without a runtime loop; K=16 executes that same
+  group twice through a DontUnroll loop. Lane selection, FMA order, NoContraction,
+  four explicit half-roundings per group and final packing follow the reference.
+- This slice only changes the existing software collective. Cooperative-matrix
+  paths and their device qualification/self-tests are not implemented here and
+  must not be enabled without those prerequisites. This does not claim parity
+  with the reference's hardware matrix acceleration.
+
+## 2026-11-13 — src/shader_recompiler/src/{shader_info.rs,ir_opt/conditional_barrier_pass.rs} and src/video_core/src/renderer_vulkan/compute_pipeline.rs vs Lichii shader_recompiler/{shader_info.h,ir_opt/conditional_barrier_pass.cpp,ir_opt/passes.h} and video_core/renderer_vulkan/vk_compute_pipeline.{cpp,h}
+
+### Intentional differences
+- ShaderInfo remains Rust-owned metadata, not a raw serialized C++ payload.
+  The removed_conditional_barrier marker is rebuilt with the optimized program
+  when loading cached shader environments; no binary cache field is added.
+  The producer preserves the marker across subsequent collection passes, and
+  the Vulkan consumer includes it in the existing guest-warp-size predicate.
+  Rust tests explicitly exercise conditional removal, an earlier conditional
+  return, repeated processing, metadata collection and an unconditional barrier.
+
+## 2026-11-13 — src/video_core/src/vulkan_common/vulkan_device.rs vs Eden/Lichii video_core/vulkan_common/vulkan_device.{cpp,h}
+
+### Intentional differences
+- The allocator's preferred large-heap block size follows Lichii's Device
+  constructor (16 MiB on both integrated and discrete GPUs), rather than
+  Eden's 64/256 MiB split. This allocation policy is independent of the guest
+  console profile and leaves allocator ownership, flags and destruction order
+  unchanged. It is not a Metal allocator change or a demonstrated FPS gain.
+  This slice changes only the default block size, not Lichii's separate-pool
+  machinery for sparse pages and small device buffers.
+
+## 2026-11-13 — src/video_core/src/vulkan_common/vulkan_device.rs vs Eden/Lichii video_core/vulkan_common/vulkan_device.{cpp,h} (device feature chain)
+
+### Intentional differences
+- Rust retains its existing core Vulkan 1.2 feature query for core-only layer
+  output support. Eden/Lichii use individual extension feature structures.
+  Before device creation, the Rust-owned coalescing helper copies the filtered
+  individual fields into their core aggregate and removes the constituent
+  nodes, as required by VUID-VkDeviceCreateInfo-pNext-02830. Explicitly disabled
+  features override the aggregate's earlier queried values; core-only fields
+  and unrelated nodes are preserved. Extension-only devices are unchanged.
+  All 13 prohibited constituent types are covered, without raw payload copies,
+  allocation or changes to ownership. Stack-owned nodes stay alive through
+  vkCreateDevice. This fixes an invalid API call; no performance gain is claimed.
+
+## 2026-11-14 — src/video_core/src/{buffer_cache/buffer_cache.rs,renderer_vulkan/vk_rasterizer.rs} vs Eden/Lichii video_core/{buffer_cache/buffer_cache_base.h,renderer_vulkan/vk_rasterizer.{h,cpp}}
+
+### Intentional differences
+- Rust installs a boxed GPU-memory adapter separately from ChannelSetupCaches.
+  Replacement, clearing and device-adapter installation now take the cache's
+  recursive mutex, matching the upstream locked channel-reference updates.
+  CPU GetFlushArea already takes this mutex; replacing the box without it could
+  destroy an adapter while a CPU queried the demand-download policy.
+- The Vulkan adapter retains an Arc to its channel memory owner while retaining
+  the non-locking handle for address reads. Channel release may remove the other
+  owners before adapter replacement obtains the cache lock. Retention closes
+  that lifetime gap without recursively locking MemoryManager from callbacks.
+  Tests check exclusion of other-thread readers during replacement/clearing and
+  manager lifetime after the original channel owner is released.
+
+## 2026-11-14 — src/shader_recompiler/src/backend/spirv/{emit_spirv_tensor,emit_spirv,spirv_emit_context}.rs vs Lichii shader_recompiler/backend/spirv/{emit_spirv_tensor.cpp,emit_spirv.cpp,spirv_emit_context.h}
+
+### Intentional differences
+- The software matrix helper may use an explicitly `FPRoundingMode RTE`-decorated F32-to-F16 conversion followed by widening instead of Lichii's integer-significand rounding sequence. Both round after each K=8 group; K=16 retains its two-iteration loop, FMA order and `NoContraction` decorations. Bare conversions are not equivalent on the tested driver and are deliberately not used.
+- Eligibility requires an already-native FP16 shader, 16-bit storage capability for the decoration, supported independent denorm preservation and signed-zero/nonfinite controls, and no requested FP16 flushing or known broken FP16 controls. All other profiles retain the existing explicit arithmetic. Nonfinite source bit patterns are selected unchanged rather than trusting a narrowing conversion to preserve NaN payloads.
+- EmitContext records the helper's need for FP16 denorm preservation; SetupDenormControl adds that requirement without mutating guest metadata, duplicating execution modes, or setting a global rounding mode. The state belongs to one emitted module, not a console-wide setting. Upstream has no such optimization state; the helper and float-control owners remain unchanged.
+- Synthetic emitted-module tests cover required capabilities, fallback gates, per-instruction RTE, a single denorm mode and FMA-before-rounding ordering. An independent diagnostic GPU probe checked 458752 rounding inputs against a host IEEE half codec; full-scene performance remains to be validated.
+
+## 2026-11-14 — src/shader_recompiler/src/profile.rs and src/video_core/src/renderer_vulkan/pipeline_cache.rs vs Lichii shader_recompiler/profile.h and video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}
+
+### Intentional differences
+- Profile retains Vulkan's `32_BIT_ONLY` denorm-independence capability separately from upstream's `ALL` boolean. Only the optimized matrix helper consumes the additional property, and only in shaders without FP64: FP16 and FP64 remain coupled on these devices. Existing non-matrix denorm-control selection is unchanged. Other backend profiles default to false.
+- The profile is compilation metadata, not a raw serialized ABI payload. Tests exercise partial independence with and without FP64, full independence, and absent capabilities. The independent diagnostic shader also ran with the Vulkan validation layer without reported errors on the partial-independence device.
+

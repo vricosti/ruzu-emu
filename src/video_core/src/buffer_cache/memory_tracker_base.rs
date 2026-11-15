@@ -293,6 +293,28 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         });
     }
 
+    /// Lichii ForEachPreflushableRange: enumerate marked pages without clearing
+    /// them or allocating managers for untouched address ranges.
+    pub fn for_each_preflushable_range<F>(
+        &mut self,
+        query_cpu_range: VAddr,
+        query_size: u64,
+        func: &mut F,
+    ) where
+        F: FnMut(VAddr, u64),
+    {
+        self.iterate_pages::<false, _>(query_cpu_range, query_size, |mgr, offset, size| {
+            mgr.for_each_modified_range(
+                Type::Preflushable,
+                false,
+                mgr.get_cpu_addr().wrapping_add(offset),
+                size,
+                func,
+            );
+            IterateResult::Void
+        });
+    }
+
     /// Call `func` for each GPU-modified range, optionally clearing the bits.
     pub fn for_each_download_range<F>(
         &mut self,
@@ -510,6 +532,35 @@ mod tests {
     struct DummyTracker;
     impl DeviceTracker for DummyTracker {
         fn update_pages_cached_batch(&self, _ranges: &[(VAddr, usize)], _delta: i32) {}
+    }
+
+    #[test]
+    fn preflushable_iteration_preserves_marks_and_skips_absent_managers() {
+        let tracker = DummyTracker;
+        let mut memory = MemoryTrackerBase::new(&tracker);
+        let pools = memory.manager_pool.len();
+        let free = memory.free_managers.len();
+        memory.for_each_preflushable_range(0, HIGHER_PAGE_SIZE * 3, &mut |_, _| {
+            panic!("untouched memory has no preflushable pages")
+        });
+        assert_eq!(memory.manager_pool.len(), pools);
+        assert_eq!(memory.free_managers.len(), free);
+        let boundary = HIGHER_PAGE_SIZE;
+        memory.mark_region_as_preflushable(boundary - 0x1000, 0x2000);
+        memory.unmark_region_as_cpu_modified(boundary + 0x3000, 0x1000);
+        memory.mark_region_as_gpu_modified(boundary + 0x3000, 0x1000);
+        for _ in 0..2 {
+            let mut ranges = Vec::new();
+            memory.for_each_preflushable_range(boundary - 0x2000, 0x6000,
+                &mut |addr, size| ranges.push((addr, size)));
+            assert_eq!(ranges, [(boundary - 0x1000, 0x1000), (boundary, 0x1000)]);
+        }
+        memory.unmark_region_as_preflushable(boundary, 0x1000);
+        let mut ranges = Vec::new();
+        memory.for_each_preflushable_range(boundary - 0x1000, 0x2000,
+            &mut |addr, size| ranges.push((addr, size)));
+        assert_eq!(ranges, [(boundary - 0x1000, 0x1000)]);
+        assert!(memory.is_region_gpu_modified(boundary + 0x3000, 0x1000));
     }
 
     #[test]

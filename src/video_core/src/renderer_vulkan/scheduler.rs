@@ -223,6 +223,16 @@ struct SchedulerState {
     descriptor_buffer_bound: bool,
 }
 
+impl SchedulerState {
+    /// Predicate from Lichii's RequestRenderpass: clear/load variants are
+    /// compatible, but a previously ended pass must never be continued.
+    fn can_continue_renderpass(&self, framebuffer: vk::Framebuffer, area: vk::Extent2D) -> bool {
+        self.renderpass != vk::RenderPass::null()
+            && self.framebuffer == framebuffer
+            && self.render_area == area
+    }
+}
+
 #[derive(Clone)]
 struct DeferredClear {
     framebuffer: Option<RenderTargetFramebuffer>,
@@ -814,11 +824,7 @@ impl Scheduler {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: framebuffer.render_area(),
         };
-        if self.state.renderpass == framebuffer.render_pass()
-            && self.state.framebuffer == framebuffer.handle()
-            && self.state.render_area.width == render_area.extent.width
-            && self.state.render_area.height == render_area.extent.height
-        {
+        if self.state.can_continue_renderpass(framebuffer.handle(), render_area.extent) {
             return;
         }
         // Ends any active pass and realizes a deferred clear.
@@ -1444,6 +1450,28 @@ mod tests {
         assert!(!state.rescaling_defined);
         assert!(!state.needs_state_enable_refresh);
         assert!(!state.descriptor_buffer_bound);
+    }
+
+    #[test]
+    fn renderpass_continuation_requires_active_matching_framebuffer_and_area() {
+        let area = vk::Extent2D { width: 1280, height: 720 };
+        let framebuffer = vk::Framebuffer::from_raw(42);
+        let mut state = SchedulerState {
+            renderpass: vk::RenderPass::from_raw(7),
+            framebuffer,
+            render_area: area,
+            ..Default::default()
+        };
+        assert!(state.can_continue_renderpass(framebuffer, area));
+        // A clear variant may differ from the base pass requested by the draw.
+        state.renderpass = vk::RenderPass::from_raw(8);
+        assert!(state.can_continue_renderpass(framebuffer, area));
+        assert!(!state.can_continue_renderpass(vk::Framebuffer::from_raw(43), area));
+        assert!(!state.can_continue_renderpass(framebuffer, vk::Extent2D { width: 640, ..area }));
+        assert!(!state.can_continue_renderpass(framebuffer, vk::Extent2D { height: 360, ..area }));
+        // EndRenderPass retains the framebuffer and area, but clears this handle.
+        state.renderpass = vk::RenderPass::null();
+        assert!(!state.can_continue_renderpass(framebuffer, area));
     }
 
     #[test]

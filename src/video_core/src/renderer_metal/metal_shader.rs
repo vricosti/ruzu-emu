@@ -1205,8 +1205,7 @@ kernel void probe(device const uint4* input [[buffer(0)]], device uint4* output 
             vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU32(1)]);
         collect_shader_info_pass(&mut program);
         program.info.storage_buffers_descriptors.push(StorageBufferDescriptor {
-            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true,
-        });
+            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true, ..Default::default() });
         let options = MslOptions { language_version: MslVersion::V3_0, ..Default::default() };
         let artifact = emit_msl_geometry_function(&program, &Profile::default(),
             &RuntimeInfo::default(), &options, &mut Bindings::default()).unwrap();
@@ -1421,8 +1420,7 @@ kernel void probe_control(device MslControlInput* inputs [[buffer(0)]],
             vec![Value::ImmU32(0), Value::ImmU32(0), Value::ImmU32(1)]);
         collect_shader_info_pass(&mut program);
         program.info.storage_buffers_descriptors.push(shader_recompiler::shader_info::StorageBufferDescriptor {
-            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true,
-        });
+            cbuf_index: 0, cbuf_offset: 0, count: 1, is_written: true, ..Default::default() });
         let mut runtime = RuntimeInfo::default();
         runtime.previous_stage_stores.set(Attribute::generic(9, 0).0 as usize, true);
         // Producer has an additional unused field before the consumed one.
@@ -1828,8 +1826,7 @@ fragment float4 shade_patch(MslVertexOut input [[stage_in]]) { return input.out_
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
             let mut runtime = geometry_runtime.clone();
             if points { runtime.fixed_state_point_size = Some(4.0); }
             let geometry_options = direct_msl_options(device.device(), &MetalShaderCompileOptions {
@@ -2190,6 +2187,7 @@ fragment float4 shade_patch(MslVertexOut input [[stage_in]]) { return input.out_
             .constant_buffer_descriptors
             .push(ConstantBufferDescriptor { index: 0, count: 2 });
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -2619,6 +2617,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         let mut program = Program::new(Stage::Fragment);
         program.blocks.push(Block::new());
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             is_depth: false,
             is_multisample: false,
@@ -2664,6 +2663,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         let mut program = Program::new(Stage::Fragment);
         program.blocks.push(Block::new());
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             is_depth: true,
             is_multisample: false,
@@ -2708,6 +2708,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         let mut program = Program::new(Stage::Fragment);
         program.blocks.push(Block::new());
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth,
             is_multisample: false,
@@ -2839,6 +2840,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
             TextureType::Color1D | TextureType::ColorArray1D
         );
         program.info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             format,
             is_written,
@@ -2908,6 +2910,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
             .info
             .texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,
@@ -2957,6 +2960,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
             .info
             .image_buffer_descriptors
             .push(ImageBufferDescriptor {
+                handle_program: u32::MAX,
                 format: ImageFormat::R32Uint,
                 is_written,
                 is_read,
@@ -3044,6 +3048,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         program.blocks.push(Block::new());
         program.info.uses_atomic_image_u32 = true;
         program.info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32Uint,
             is_written: true,
@@ -3126,6 +3131,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         let mut program = Program::new(Stage::Fragment);
         program.blocks.push(Block::new());
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             is_depth,
             is_multisample,
@@ -3189,6 +3195,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         let mut program = Program::new(Stage::Fragment);
         program.blocks.push(Block::new());
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             is_depth: false,
             is_multisample,
@@ -3232,6 +3239,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         let mut program = Program::new(Stage::Fragment);
         program.blocks.push(Block::new());
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             is_depth: false,
             is_multisample: false,
@@ -3274,6 +3282,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         let mut program = Program::new(Stage::Fragment);
         program.blocks.push(Block::new());
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             is_depth: false,
             is_multisample: false,
@@ -3389,6 +3398,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
         let mut program = Program::new(Stage::Fragment);
         program.blocks.push(Block::new());
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             is_depth,
             is_multisample: false,
@@ -4496,8 +4506,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         program.blocks[0].append_new_inst(
             Opcode::SharedAtomicInc32,
@@ -4544,8 +4553,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         program.blocks[0].append_new_inst(
             Opcode::StorageAtomicAddF32,
@@ -4630,8 +4638,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         let pair = program.blocks[0].append_new_inst(
             Opcode::CompositeConstructU32x2,
@@ -5097,8 +5104,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 cbuf_index: 0,
                 cbuf_offset: 0x110,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         let block = &mut program.blocks[0];
         block.append_new_inst(Opcode::LoadGlobalU8, vec![Value::ImmU64(0x1001)]);
         block.append_new_inst(Opcode::LoadGlobalS8, vec![Value::ImmU64(0x1002)]);
@@ -5190,8 +5196,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 cbuf_index: 0,
                 cbuf_offset: 0x110,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         program.blocks[0].append_new_inst(
             Opcode::GlobalAtomicIAdd32,
             vec![Value::ImmU64(0x1000), Value::ImmU32(1)],
@@ -6472,8 +6477,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 2,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         program.info.uses_int8 = true;
         program.info.uses_int16 = true;
         program.info.used_storage_buffer_types = shader_recompiler::ir::Type::U8 as u32
@@ -6547,8 +6551,7 @@ vertex float4 aspect_test_vertex(uint id [[vertex_id]]) {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         subword_program.info.uses_int16 = true;
         subword_program.info.used_storage_buffer_types = shader_recompiler::ir::Type::U16 as u32;
         subword_program.blocks[0].append_new_inst(

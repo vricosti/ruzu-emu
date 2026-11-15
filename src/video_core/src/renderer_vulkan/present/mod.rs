@@ -10,6 +10,7 @@
 pub mod anti_alias_pass;
 pub mod filters;
 pub mod fsr;
+pub mod fsr3;
 pub mod fxaa;
 pub mod layer;
 pub mod present_push_constants;

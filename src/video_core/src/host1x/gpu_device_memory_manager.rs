@@ -1398,6 +1398,48 @@ impl MaxwellDeviceMemoryManager {
             })
     }
 
+    /// Lichii DeviceMemoryManager::ArmReadTraps. The active Maxwell template
+    /// instantiation lives here in Rust (the existing core/video crate boundary).
+    /// Retain each process while invoking its Memory callback, but never hold
+    /// the process-registry or CPU-backing mutex through that callback.
+    pub fn arm_read_traps(&self, address: DAddr, size: usize) {
+        let mut run_memory: Option<Arc<ruzu_core::memory::memory::SharedMemory>> = None;
+        let mut run_begin = 0u64;
+        let mut run_pages = 0u64;
+        let release_run = |memory: &Option<Arc<ruzu_core::memory::memory::SharedMemory>>,
+                           begin: u64, pages: &mut u64| {
+            if *pages != 0 {
+                if let Some(memory) = memory {
+                    memory.access().unwrap().rasterizer_arm_read_traps(
+                        begin << PAGE_BITS, *pages << PAGE_BITS,
+                    );
+                }
+            }
+            *pages = 0;
+        };
+        let page_end = (address + size as u64).div_ceil(PAGE_SIZE);
+        for page in (address >> PAGE_BITS)..page_end {
+            let backing = self.smmu_extract_cpu_backing(page);
+            if backing.virtual_page == 0 {
+                release_run(&run_memory, run_begin, &mut run_pages);
+                continue;
+            }
+            let memory = self.smmu_registered_memory(backing.asid);
+            let same_memory = match (&run_memory, &memory) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same_memory || backing.virtual_page != run_begin + run_pages {
+                release_run(&run_memory, run_begin, &mut run_pages);
+                run_memory = memory;
+                run_begin = backing.virtual_page;
+            }
+            run_pages += 1;
+        }
+        release_run(&run_memory, run_begin, &mut run_pages);
+    }
+
     pub fn smmu_cpu_backing_for_address(&self, d_address: DAddr) -> Option<CpuBacking> {
         let device_page = d_address >> SMMU_PAGE_BITS;
         let page_offset = d_address & (SMMU_PAGE_SIZE - 1);
@@ -1949,6 +1991,77 @@ mod tests {
         size: usize,
     ) {
         mgr.smmu_map_with_cpu_backing(d_address, host_ptr, virtual_address, size, 5, true);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn read_traps_translate_processes_discontinuities_and_mapping_holes() {
+        const CHILD: &str = "RUZU_TEST_DEVICE_READ_TRAPS";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host1x::gpu_device_memory_manager::tests::read_traps_translate_processes_discontinuities_and_mapping_holes"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use common::host_memory::MemoryPermission;
+        use ruzu_core::memory::memory::SharedMemory;
+        {
+            let mut settings = common::settings::values_mut();
+            settings.use_reactive_flushing.set_value(false);
+            settings.cpu_backend.set_value(common::settings_enums::CpuBackend::Dynarmic);
+        }
+        let device = DeviceMemory::with_size(0x10000);
+        device.buffer.map(0x4000, 0x4000, 0x8000,
+            MemoryPermission::READ | MemoryPermission::WRITE, false);
+        let make_memory = |pages: &[u64]| {
+            let mut table = Box::new(PageTable::new());
+            table.resize(16, PAGE_BITS as usize);
+            for &page in pages {
+                table.entries.get_and_fault(page as usize).store(
+                    true, PageType::RasterizerCachedMemory, 1,
+                    device.buffer.backing_base_pointer() as usize,
+                );
+            }
+            let mut memory = unsafe { Memory::new(SystemRef::null(), &device, &device.buffer) };
+            memory.set_current_page_table(&mut *table, true);
+            table.fastmem_arena = device.buffer.virtual_base_pointer();
+            (table, Arc::new(SharedMemory::new(memory)))
+        };
+        let (_table_a, memory_a) = make_memory(&[4, 5, 7]);
+        let (_table_b, memory_b) = make_memory(&[9, 11]);
+        let manager = MaxwellDeviceMemoryManager::new_with_device_memory(&device);
+        let a = manager.smmu_register_process(Some(memory_a));
+        let b = manager.smmu_register_process(Some(memory_b));
+        let missing = manager.smmu_register_process(None);
+        {
+            let mut backing = manager.smmu_cpu_backing.lock().unwrap();
+            for (page, asid, cpu_page) in [
+                (8, a, 4), (9, a, 5), (10, b, 9),
+                // Page 11 is a hole. Page 12 resumes the same process at a
+                // discontiguous virtual address. Page 13 has no registered Memory.
+                (12, b, 11), (13, missing, 6), (14, a, 7),
+            ] {
+                backing.insert(page, CpuBacking { asid, virtual_address: cpu_page << PAGE_BITS });
+            }
+        }
+        manager.arm_read_traps(0x8000, 0x7000);
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        for page in 4..12usize {
+            let address = device.buffer.virtual_base_pointer() as usize + (page << PAGE_BITS);
+            let permissions = maps.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (start, end) = fields.next()?.split_once('-')?;
+                let start = usize::from_str_radix(start, 16).ok()?;
+                let end = usize::from_str_radix(end, 16).ok()?;
+                (start <= address && address < end).then(|| fields.next().unwrap())
+            }).unwrap();
+            let expected = if [4, 5, 7, 9, 11].contains(&page) { "---" } else { "rw-" };
+            assert!(permissions.starts_with(expected), "page {page}: {permissions}");
+        }
+        manager.smmu_unregister_process(b);
+        // Missing/unregistered owners are not dereferenced.
+        manager.arm_read_traps(0xa000, 0x4000);
     }
 
     #[test]

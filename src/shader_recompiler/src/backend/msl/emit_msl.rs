@@ -1484,6 +1484,7 @@ mod tests {
     fn sampled_texture_program(count: u32, explicit_lod: bool) -> ir::Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -1531,6 +1532,7 @@ mod tests {
     fn sampled_texture_operands_program(stage: Stage, is_depth: bool) -> ir::Program {
         let mut program = empty_program(stage);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth,
             is_multisample: false,
@@ -1634,6 +1636,7 @@ mod tests {
             TextureType::Color1D | TextureType::ColorArray1D
         );
         program.info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             format,
             is_written,
@@ -1691,6 +1694,7 @@ mod tests {
             .info
             .texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,
@@ -1733,6 +1737,7 @@ mod tests {
             .info
             .image_buffer_descriptors
             .push(ImageBufferDescriptor {
+                handle_program: u32::MAX,
                 format: ImageFormat::R32Uint,
                 is_written,
                 is_read,
@@ -1808,6 +1813,7 @@ mod tests {
         let mut program = empty_program(Stage::Compute);
         program.info.uses_atomic_image_u32 = true;
         program.info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32Uint,
             is_written: true,
@@ -1837,6 +1843,7 @@ mod tests {
     fn array_2d_fetch_program(is_multisample: bool, with_offset: bool) -> ir::Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::ColorArray2D,
             is_depth: false,
             is_multisample,
@@ -1910,6 +1917,7 @@ mod tests {
     fn query_lod_program(texture_type: TextureType) -> ir::Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             is_depth: false,
             is_multisample: false,
@@ -1955,6 +1963,7 @@ mod tests {
     ) -> ir::Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type,
             is_depth: false,
             is_multisample: false,
@@ -2070,6 +2079,7 @@ mod tests {
     fn gather_program() -> ir::Program {
         let mut program = empty_program(Stage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -2771,8 +2781,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: false,
-            },
+                is_written: false, ..Default::default() },
         );
 
         let profile = Profile {
@@ -2998,6 +3007,7 @@ mod tests {
         let mut program = empty_program(Stage::Fragment);
         program.info.uses_rescaling_uniform = true;
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -3013,6 +3023,7 @@ mod tests {
             size_shift: 0,
         });
         program.info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32Uint,
             is_written: false,
@@ -3114,8 +3125,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 2,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         program.info.uses_int8 = true;
         program.info.uses_int16 = true;
@@ -3269,6 +3279,7 @@ mod tests {
         program.info.stores_global_memory = true;
         program.info.uses_int64 = true;
         program.info.nvn_buffer_used = 1;
+        program.info.nvn_buffer_base = 0x110;
         program
             .info
             .constant_buffer_descriptors
@@ -3280,8 +3291,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0x110,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         let block = &mut program.blocks[0];
         block.append_new_inst(Opcode::LoadGlobalU8, vec![Value::ImmU64(0x1001)]);
         block.append_new_inst(Opcode::LoadGlobalS8, vec![Value::ImmU64(0x1002)]);
@@ -3441,8 +3451,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         program.blocks[0].append_new_inst(
             Opcode::StorageAtomicCompareExchange32,
@@ -3475,8 +3484,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         let block = &mut program.blocks[0];
         for opcode in [
@@ -3605,8 +3613,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         let pair = program.blocks[0].append_new_inst(
             Opcode::CompositeConstructU32x2,
@@ -3692,6 +3699,7 @@ mod tests {
         program.info.stores_global_memory = true;
         program.info.uses_int64 = true;
         program.info.nvn_buffer_used = 1;
+        program.info.nvn_buffer_base = 0x110;
         program
             .info
             .constant_buffer_descriptors
@@ -3703,8 +3711,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0x110,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
 
         for opcode in [
             Opcode::GlobalAtomicIAdd32,
@@ -3907,7 +3914,8 @@ mod tests {
         let mut program = empty_program(Stage::Compute);
         program.info.uses_global_memory = true;
         program.info.uses_int64 = true;
-        program.info.nvn_buffer_used = 1 << 1;
+        program.info.nvn_buffer_used = 1 << 5;
+        program.info.nvn_buffer_base = 0x310;
         program
             .info
             .constant_buffer_descriptors
@@ -3919,17 +3927,15 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0x100,
                 count: 2,
-                is_written: false,
-            });
+                is_written: false, ..Default::default() });
         program
             .info
             .storage_buffers_descriptors
             .push(StorageBufferDescriptor {
                 cbuf_index: 0,
-                cbuf_offset: 0x110,
+                cbuf_offset: 0x360,
                 count: 1,
-                is_written: false,
-            });
+                is_written: false, ..Default::default() });
         program.blocks[0].append_new_inst(Opcode::LoadGlobal32, vec![Value::ImmU64(0x1000)]);
 
         let artifact = emit_msl(
@@ -4025,8 +4031,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            },
+                is_written: true, ..Default::default() },
         );
         program.info.used_storage_buffer_types = crate::ir::Type::U32 as u32;
         let offset = program.blocks[0]

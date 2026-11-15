@@ -259,6 +259,9 @@ struct GpuMemoryAccessAdapter {
 }
 
 impl crate::buffer_cache::buffer_cache_base::GpuMemoryAccess for GpuMemoryAccessAdapter {
+    fn uses_native_tiling(&self) -> bool {
+        self.mm.lock().uses_native_tiling()
+    }
     fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
         self.mm.lock().gpu_to_cpu_address(gpu_addr)
     }
@@ -299,11 +302,17 @@ impl crate::buffer_cache::buffer_cache_base::GpuMemoryAccess for GpuMemoryAccess
 /// Adapter that implements `DeviceMemoryAccess` for the buffer cache by
 /// reading/writing through the CPU memory reader/writer callbacks.
 struct DeviceMemoryAccessAdapter {
+    device_memory: Arc<MaxwellDeviceMemoryManager>,
     device_reader: crate::renderer_base::DeviceMemoryReader,
     guest_writer: Option<crate::renderer_base::GuestMemoryWriter>,
 }
 
 impl crate::buffer_cache::buffer_cache_base::DeviceMemoryAccess for DeviceMemoryAccessAdapter {
+    fn supports_read_traps(&self) -> bool { true }
+
+    fn arm_read_traps(&self, device_addr: u64, size: usize) {
+        self.device_memory.arm_read_traps(device_addr, size);
+    }
     fn get_pointer(&self, _device_addr: u64) -> Option<*const u8> {
         None
     }
@@ -2283,6 +2292,7 @@ impl RasterizerOpenGL {
         self.device_memory_reader = Some(Arc::clone(&reader));
         self.buffer_cache
             .set_device_memory(Box::new(DeviceMemoryAccessAdapter {
+                device_memory: Arc::clone(&self.device_memory),
                 device_reader: reader,
                 guest_writer: self.guest_memory_writer.clone(),
             }));
@@ -2357,6 +2367,7 @@ impl RasterizerOpenGL {
         if let Some(device_reader) = self.device_memory_reader.as_ref().cloned() {
             self.buffer_cache
                 .set_device_memory(Box::new(DeviceMemoryAccessAdapter {
+                    device_memory: Arc::clone(&self.device_memory),
                     device_reader,
                     guest_writer: self.guest_memory_writer.clone(),
                 }));
@@ -3003,21 +3014,23 @@ impl RasterizerInterface for RasterizerOpenGL {
     }
 
     fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
-        unsafe {
+        let texture_area = unsafe {
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let _texture_guard = (*texture_mutex).lock();
             let texture_cache: *mut OpenGLTextureCache =
                 &*self.texture_cache as *const OpenGLTextureCache as *mut OpenGLTextureCache;
-            if let Some(area) = (*texture_cache).get_flush_area(addr, size) {
-                return area;
-            }
-        }
+            (*texture_cache).get_flush_area(addr, size)
+        };
 
         unsafe {
             let buffer_mutex: *const _ = &self.buffer_cache.mutex;
             let _buffer_guard = (*buffer_mutex).lock();
             let buffer_cache: *mut OpenGLBufferCache =
                 &*self.buffer_cache as *const OpenGLBufferCache as *mut OpenGLBufferCache;
+            if let Some(area) = texture_area {
+                (*buffer_cache).forget_read_traps(area.start_address, area.end_address - area.start_address);
+                return area;
+            }
             if let Some(area) = (*buffer_cache).get_flush_area(addr, size) {
                 return RasterizerDownloadArea {
                     start_address: area.start_address,
@@ -3333,6 +3346,7 @@ impl RasterizerInterface for RasterizerOpenGL {
             if let Some(ref device_reader) = self.device_memory_reader {
                 self.buffer_cache
                     .set_device_memory(Box::new(DeviceMemoryAccessAdapter {
+                        device_memory: Arc::clone(&self.device_memory),
                         device_reader: Arc::clone(device_reader),
                         guest_writer: self.guest_memory_writer.clone(),
                     }));

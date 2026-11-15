@@ -809,6 +809,11 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
             unsafe { device.as_ref() }.shader_storage_buffer_alignment() as u32
         })
     }
+    fn get_max_storage_buffer_range(&self) -> u64 {
+        self.device.map_or(1 << 27, |device| {
+            unsafe { device.as_ref() }.get_max_shader_storage_block_size()
+        })
+    }
 
     fn uniform_buffer_alignment(&self) -> u32 {
         self.device.map_or(1, |device| {

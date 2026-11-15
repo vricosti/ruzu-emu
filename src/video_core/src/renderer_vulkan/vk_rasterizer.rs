@@ -785,9 +785,15 @@ impl From<vk::Result> for RendererError {
 
 struct GpuMemoryAccessAdapter {
     mm: MemoryManagerHandle,
+    // The rasterizer may release its channel before replacing this adapter.
+    // Retain the owner until the cache lock permits the old adapter to be dropped.
+    _owner: Arc<parking_lot::Mutex<crate::memory_manager::MemoryManager>>,
 }
 
 impl GpuMemoryAccess for GpuMemoryAccessAdapter {
+    fn uses_native_tiling(&self) -> bool {
+        unsafe { self.mm.as_ref().uses_native_tiling() }
+    }
     fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
         // SAFETY: the rasterizer retains the channel's owning Arc while this
         // adapter is installed, and BufferCache access is externally
@@ -838,6 +844,11 @@ struct DeviceMemoryAccessAdapter {
 }
 
 impl DeviceMemoryAccess for DeviceMemoryAccessAdapter {
+    fn supports_read_traps(&self) -> bool { true }
+
+    fn arm_read_traps(&self, device_addr: u64, size: usize) {
+        self.device_memory.arm_read_traps(device_addr, size);
+    }
     fn get_pointer(&self, device_addr: u64) -> Option<*const u8> {
         let pointer = self.device_memory.get_pointer(device_addr);
         (!pointer.is_null()).then_some(pointer)
@@ -4243,13 +4254,29 @@ impl RasterizerInterface for RasterizerVulkan {
     }
 
     fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
-        unsafe {
+        let texture_area = unsafe {
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
             let _texture_guard = (*texture_mutex).lock();
             let texture_cache: *mut TextureCache =
                 &*self.texture_cache as *const TextureCache as *mut TextureCache;
-            if let Some(area) = (*texture_cache).base.get_flush_area(addr, size as usize) {
+            (*texture_cache).base.get_flush_area(addr, size as usize)
+        };
+        unsafe {
+            let mutex: *const _ = &self.common_buffer_cache.mutex;
+            let _guard = (*mutex).lock();
+            let cache = std::ptr::from_ref(&*self.common_buffer_cache).cast_mut();
+            if let Some(area) = texture_area {
+                (*cache).forget_read_traps(area.start_address, area.end_address - area.start_address);
                 return area;
+            }
+            if (*cache).flushes_on_cpu_read() {
+                if let Some(area) = (*cache).get_flush_area(addr, size) {
+                    return RasterizerDownloadArea {
+                        start_address: area.start_address,
+                        end_address: area.end_address,
+                        preemtive: area.preemtive,
+                    };
+                }
             }
         }
         RasterizerDownloadArea {
@@ -4537,7 +4564,10 @@ impl RasterizerInterface for RasterizerVulkan {
         });
         if let Some(mm) = self.channel_memory_manager_handle {
             self.common_buffer_cache
-                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm }));
+                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter {
+                    mm,
+                    _owner: Arc::clone(self.channel_memory_manager.as_ref().unwrap()),
+                }));
         }
     }
 
@@ -4564,7 +4594,10 @@ impl RasterizerInterface for RasterizerVulkan {
         });
         if let Some(mm) = self.channel_memory_manager_handle {
             self.common_buffer_cache
-                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter { mm }));
+                .set_gpu_memory(Box::new(GpuMemoryAccessAdapter {
+                    mm,
+                    _owner: Arc::clone(self.channel_memory_manager.as_ref().unwrap()),
+                }));
         } else {
             self.common_buffer_cache.clear_gpu_memory();
         }
@@ -4949,6 +4982,7 @@ mod tests {
         let guard = memory.lock();
         let adapter = GpuMemoryAccessAdapter {
             mm: MemoryManagerHandle::from_ref(&guard),
+            _owner: Arc::clone(&memory),
         };
 
         // Deliberately keep the non-reentrant owner mutex held. Eden's buffer
@@ -4956,6 +4990,16 @@ mod tests {
         // adapter must not acquire that mutex again for each address lookup.
         assert_eq!(adapter.gpu_to_cpu_address(0x1000), None);
         assert_eq!(adapter.read_u32(0x1000), Some(0));
+        let weak = Arc::downgrade(&memory);
+        drop(guard);
+        drop(memory);
+        // Releasing the channel owner must not invalidate a CPU flush query
+        // already using the old adapter while the replacement waits on the cache.
+        assert!(weak.upgrade().is_some());
+        assert!(!adapter.uses_native_tiling());
+        assert_eq!(adapter.gpu_to_cpu_address(0x1000), None);
+        drop(adapter);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

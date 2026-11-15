@@ -227,6 +227,8 @@ pub struct BufferCacheChannelInfo {
     // -- Compute bindings --
     pub compute_uniform_buffers: [Binding; NUM_COMPUTE_UNIFORM_BUFFERS as usize],
     pub compute_storage_buffers: [Binding; NUM_STORAGE_BUFFERS as usize],
+    pub compute_storage_write_marks: [u32; NUM_STORAGE_BUFFERS as usize],
+    pub native_compute_storage_buffers: u32,
     pub compute_texture_buffers: [TextureBufferBinding; NUM_TEXTURE_BUFFERS as usize],
 
     // -- Enabled masks --
@@ -302,6 +304,8 @@ impl BufferCacheChannelInfo {
 
             compute_uniform_buffers: [Binding::default(); NUM_COMPUTE_UNIFORM_BUFFERS as usize],
             compute_storage_buffers: [Binding::default(); NUM_STORAGE_BUFFERS as usize],
+            compute_storage_write_marks: [0; NUM_STORAGE_BUFFERS as usize],
+            native_compute_storage_buffers: 0,
             compute_texture_buffers: [TextureBufferBinding::default();
                 NUM_TEXTURE_BUFFERS as usize],
 
@@ -723,6 +727,8 @@ pub trait BufferCacheRuntime {
     ///
     /// Upstream: `Runtime::GetStorageBufferAlignment()`
     fn get_storage_buffer_alignment(&self) -> u32;
+    /// Lichii Runtime::GetMaxStorageBufferRange.
+    fn get_max_storage_buffer_range(&self) -> u64;
 
     /// Wait for all pending GPU operations to complete.
     ///
@@ -1239,6 +1245,9 @@ impl BufferCacheRuntime for TestBufferCacheRuntime {
     fn get_storage_buffer_alignment(&self) -> u32 {
         0x100
     }
+    fn get_max_storage_buffer_range(&self) -> u64 {
+        1 << 30
+    }
 
     fn should_limit_dynamic_storage_buffers(&self) -> bool {
         self.limit_dynamic_storage_buffers
@@ -1494,6 +1503,8 @@ impl BufferCacheRuntime for TestBufferCacheRuntime {
 /// - `MaxContinuousRange(gpu_addr, size)` — find max mapped range
 /// - `GetMemoryLayoutSize(gpu_addr)` — get mapped size from an address
 pub trait GpuMemoryAccess {
+    /// Per-channel MemoryManager::UsesNativeTiling; not a global console flag.
+    fn uses_native_tiling(&self) -> bool { false }
     /// Translate a GPU virtual address to a device (CPU) address.
     ///
     /// Upstream: `gpu_memory->GpuToCpuAddress(gpu_addr)`
@@ -1547,6 +1558,13 @@ pub trait GpuMemoryAccess {
 /// Upstream: these operations are performed via `device_memory`
 /// (a `Tegra::MaxwellDeviceMemoryManager&`).
 pub trait DeviceMemoryAccess {
+    /// Whether this memory owner can route CPU read traps. Reduced test memory
+    /// implementations keep fence downloads unless they explicitly support it.
+    fn supports_read_traps(&self) -> bool { false }
+
+    fn arm_read_traps(&self, _device_addr: u64, _size: usize) {
+        assert!(!self.supports_read_traps(), "read-trap capability requires an implementation");
+    }
     /// Get a pointer to guest memory at `device_addr`.
     ///
     /// Upstream: `device_memory.GetPointer<u8>(device_addr)`

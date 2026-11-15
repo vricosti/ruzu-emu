@@ -266,7 +266,9 @@ fn setup_denorm_control(
             );
         }
     }
-    if !profile.support_separate_denorm_behavior || profile.has_broken_fp16_float_controls {
+    if (!profile.support_separate_denorm_behavior && !ctx.software_matrix_native_rounding)
+        || profile.has_broken_fp16_float_controls
+    {
         return;
     }
     if !(info.uses_fp16_denorms_flush && info.uses_fp16_denorms_preserve) {
@@ -278,7 +280,9 @@ fn setup_denorm_control(
                 spirv::ExecutionMode::DenormFlushToZero,
                 16,
             );
-        } else if info.uses_fp16_denorms_preserve && profile.support_fp16_denorm_preserve {
+        } else if (info.uses_fp16_denorms_preserve || ctx.software_matrix_native_rounding)
+            && profile.support_fp16_denorm_preserve
+        {
             add_float_execution_mode(
                 ctx,
                 main,

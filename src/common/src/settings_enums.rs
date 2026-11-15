@@ -596,6 +596,7 @@ settings_enum! {
         Mmpx,
         Sgsr,
         SgsrEdge,
+        Fsr3,
     }
 }
 
@@ -792,11 +793,12 @@ mod tests {
             ScalingFilter::Mmpx,
             ScalingFilter::Sgsr,
             ScalingFilter::SgsrEdge,
+            ScalingFilter::Fsr3,
         ];
         for (index, filter) in expected.into_iter().enumerate() {
             assert_eq!(filter as u32, index as u32);
             assert_eq!(ScalingFilter::from_u32(index as u32), Some(filter));
         }
-        assert_eq!(ScalingFilter::SgsrEdge as u32, expected.len() as u32 - 1);
+        assert_eq!(ScalingFilter::Fsr3 as u32, expected.len() as u32 - 1);
     }
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Port of Fritchii backend/spirv/emit_spirv_tensor.cpp (software warp collective).
+//! Port of Lichii backend/spirv/emit_spirv_tensor.cpp (software warp collective).
 use super::spirv_emit_context::SpirvEmitContext;
 use crate::ir::{Inst, Opcode, Program};
 use rspirv::spirv::{self, Word};
@@ -12,11 +12,30 @@ pub fn define_software_matrix_functions(ctx: &mut SpirvEmitContext, program: &Pr
                 continue;
             }
             if !matches!(inst.flags, 8 | 16) {
-                std::panic::panic_any(crate::exception::LogicError::new("Invalid software HMMA depth"));
+                std::panic::panic_any(crate::exception::LogicError::new(
+                    "Invalid software HMMA depth",
+                ));
             }
             needed[usize::from(inst.flags == 16)] = true;
         }
     }
+    // Lichii rounds significands explicitly to prevent a driver from removing
+    // pack/unpack round trips. An explicitly RTE-decorated narrowing conversion
+    // preserves that rounding with native FP16, provided denorms are preserved.
+    // Do not alter shaders requesting FP16 flush, or introduce a Float16 type
+    // when the translation pipeline did not already retain native FP16.
+    ctx.software_matrix_native_rounding = needed.iter().any(|needed| *needed)
+        && program.info.uses_fp16
+        && !program.info.uses_fp16_denorms_flush
+        && ctx.profile.supported_spirv >= 0x00010300
+        && ctx.profile.support_storage_buffer_16bit
+        && ctx.profile.support_float_controls
+        && (ctx.profile.support_separate_denorm_behavior
+            || (ctx.profile.support_fp32_only_denorm_independence && !program.info.uses_fp64))
+        && ctx.profile.support_fp16_denorm_preserve
+        && ctx.profile.support_fp16_signed_zero_nan_preserve
+        && ctx.profile.support_fp32_signed_zero_nan_preserve
+        && !ctx.profile.has_broken_fp16_float_controls;
     for (variant, needed) in needed.into_iter().enumerate() {
         if !needed {
             continue;
@@ -30,6 +49,8 @@ pub fn define_software_matrix_functions(ctx: &mut SpirvEmitContext, program: &Pr
         }
         let u = ctx.u32_type;
         let f = ctx.f32_type;
+        let half = ctx.f16_type;
+        let native_rounding = ctx.software_matrix_native_rounding;
         let boolean = ctx.bool_type;
         let u2 = ctx.u32_vec2_type;
         let u4 = ctx.u32_vec4_type;
@@ -39,6 +60,10 @@ pub fn define_software_matrix_functions(ctx: &mut SpirvEmitContext, program: &Pr
         let b = &mut ctx.builder;
         b.capability(spirv::Capability::GroupNonUniform);
         b.capability(spirv::Capability::GroupNonUniformShuffle);
+        if native_rounding {
+            // Required by SPIR-V for the FPRoundingMode decoration.
+            b.capability(spirv::Capability::StorageBuffer16BitAccess);
+        }
         // Mechanical equivalents of the upstream local lambdas.
         macro_rules! imm {
             ($v:expr) => {
@@ -103,64 +128,87 @@ pub fn define_software_matrix_functions(ctx: &mut SpirvEmitContext, program: &Pr
         let row_base = op!(bitwise_and, u, lane, imm!(28));
         let col_bits = op!(bitwise_and, u, lane, imm!(3));
         let col_base = op!(shift_left_logical, u, col_bits, imm!(3));
-        let header = b.id();
-        let body = b.id();
-        let next = b.id();
-        let end = b.id();
-        b.branch(header).unwrap();
-        b.begin_block(Some(header)).unwrap();
-        let pair = load!(u, counter);
-        let more = op!(
-            u_less_than,
-            boolean,
-            pair,
-            imm!(if variant == 1 { 8 } else { 4 })
-        );
-        b.loop_merge(end, next, spirv::LoopControl::DONT_UNROLL, [])
-            .unwrap();
-        b.branch_conditional(more, body, end, []).unwrap();
-        b.begin_block(Some(body)).unwrap();
-        let upper = op!(u_greater_than_equal, boolean, pair, imm!(4));
-        let component = op!(bitwise_and, u, pair, imm!(3));
-        let a_offset = op!(i_add, u, row_base, component);
-        let a_lane = op!(i_add, u, warp_base, a_offset);
-        let b_offset = op!(i_add, u, col_base, component);
-        let b_lane = op!(i_add, u, warp_base, b_offset);
-        let bv = op!(select, u, upper, inputs[5], inputs[4]);
-        let mut bs = [0; 2];
-        for col in 0..2 {
-            let target = op!(i_add, u, b_lane, imm!(col as u32 * 4));
-            let shuffled = op!(group_non_uniform_shuffle, u, imm!(3), bv, target);
-            bs[col] = gl!(f2, UnpackHalf2x16, shuffled);
-        }
-        let round_now = op!(i_equal, boolean, component, imm!(3));
-        for row in 0..2 {
-            let av = op!(select, u, upper, inputs[row + 2], inputs[row]);
-            let shuffled = op!(group_non_uniform_shuffle, u, imm!(3), av, a_lane);
-            let halves = gl!(f2, UnpackHalf2x16, shuffled);
+        let a_base = op!(i_add, u, warp_base, row_base);
+        let b_base = op!(i_add, u, warp_base, col_base);
+        // Lichii's emit_group: unroll the four pairs within K=8, while retaining
+        // a two-group loop for K=16 to limit register pressure. The optional
+        // tuple only holds builder IDs; no guest/runtime ownership changes.
+        let group_loop = if variant == 1 {
+            let header = b.id();
+            let body = b.id();
+            let next = b.id();
+            let end = b.id();
+            b.branch(header).unwrap();
+            b.begin_block(Some(header)).unwrap();
+            let group = load!(u, counter);
+            let more = op!(u_less_than, boolean, group, imm!(2));
+            b.loop_merge(end, next, spirv::LoopControl::DONT_UNROLL, [])
+                .unwrap();
+            b.branch_conditional(more, body, end, []).unwrap();
+            b.begin_block(Some(body)).unwrap();
+            let upper = op!(i_equal, boolean, group, imm!(1));
+            Some((header, next, end, group, upper))
+        } else {
+            None
+        };
+        for component in 0..4 {
+            let a_lane = op!(i_add, u, a_base, imm!(component));
+            let bv = if let Some((_, _, _, _, upper)) = group_loop {
+                op!(select, u, upper, inputs[5], inputs[4])
+            } else {
+                inputs[4]
+            };
+            let mut bs = [0; 2];
             for col in 0..2 {
-                let mut value = load!(f, accumulators[row * 2 + col]);
-                for half in 0..2 {
-                    let a = extract!(f, halves, half);
-                    let rhs = extract!(f, bs[col], half);
-                    value = gl!(f, Fma, a, rhs, value);
-                    b.decorate(value, spirv::Decoration::NoContraction, []);
+                let target = op!(i_add, u, b_base, imm!(component + col as u32 * 4));
+                let shuffled = op!(group_non_uniform_shuffle, u, imm!(3), bv, target);
+                bs[col] = gl!(f2, UnpackHalf2x16, shuffled);
+            }
+            for row in 0..2 {
+                let av = if let Some((_, _, _, _, upper)) = group_loop {
+                    op!(select, u, upper, inputs[row + 2], inputs[row])
+                } else {
+                    inputs[row]
+                };
+                let shuffled = op!(group_non_uniform_shuffle, u, imm!(3), av, a_lane);
+                let halves = gl!(f2, UnpackHalf2x16, shuffled);
+                for col in 0..2 {
+                    let mut value = load!(f, accumulators[row * 2 + col]);
+                    for half in 0..2 {
+                        let a = extract!(f, halves, half);
+                        let rhs = extract!(f, bs[col], half);
+                        value = gl!(f, Fma, a, rhs, value);
+                        b.decorate(value, spirv::Decoration::NoContraction, []);
+                    }
+                    b.store(accumulators[row * 2 + col], value, None, [])
+                        .unwrap();
                 }
-                b.store(accumulators[row * 2 + col], value, None, [])
-                    .unwrap();
             }
         }
-        let round_block = b.id();
-        let round_merge = b.id();
-        b.selection_merge(round_merge, spirv::SelectionControl::DONT_FLATTEN)
-            .unwrap();
-        b.branch_conditional(round_now, round_block, round_merge, [])
-            .unwrap();
-        b.begin_block(Some(round_block)).unwrap();
+        // Preserve the half-precision rounding after every K=8 group, including
+        // the midpoint of K=16; never round each multiply or defer to the end.
         for accumulator in accumulators {
             let value = load!(f, accumulator);
             let bits = op!(bitcast, u, value);
             let magnitude = op!(bitwise_and, u, bits, imm!(0x7fffffff));
+            if native_rounding {
+                let narrow = op!(f_convert, half, value);
+                b.decorate(
+                    narrow,
+                    spirv::Decoration::FPRoundingMode,
+                    [rspirv::dr::Operand::FPRoundingMode(
+                        spirv::FPRoundingMode::RTE,
+                    )],
+                );
+                let wide = op!(f_convert, f, narrow);
+                let finite_bits = op!(bitcast, u, wide);
+                let non_finite = op!(u_greater_than_equal, boolean, magnitude, imm!(0x7f800000));
+                // Preserve the upstream helper's original NaN payload/sign.
+                let result = op!(select, u, non_finite, bits, finite_bits);
+                let rounded_value = op!(bitcast, f, result);
+                b.store(accumulator, rounded_value, None, []).unwrap();
+                continue;
+            }
             let shifted = op!(shift_right_logical, u, magnitude, imm!(13));
             let tie = op!(bitwise_and, u, shifted, imm!(1));
             let biased = op!(i_add, u, magnitude, imm!(0xfff));
@@ -184,14 +232,14 @@ pub fn define_software_matrix_functions(ctx: &mut SpirvEmitContext, program: &Pr
             let rounded_value = op!(bitcast, f, signed);
             b.store(accumulator, rounded_value, None, []).unwrap();
         }
-        b.branch(round_merge).unwrap();
-        b.begin_block(Some(round_merge)).unwrap();
-        b.branch(next).unwrap();
-        b.begin_block(Some(next)).unwrap();
-        let increment = op!(i_add, u, pair, imm!(1));
-        b.store(counter, increment, None, []).unwrap();
-        b.branch(header).unwrap();
-        b.begin_block(Some(end)).unwrap();
+        if let Some((header, next, end, group, _)) = group_loop {
+            b.branch(next).unwrap();
+            b.begin_block(Some(next)).unwrap();
+            let increment = op!(i_add, u, group, imm!(1));
+            b.store(counter, increment, None, []).unwrap();
+            b.branch(header).unwrap();
+            b.begin_block(Some(end)).unwrap();
+        }
         let mut packed = [0; 2];
         for row in 0..2 {
             let x = load!(f, accumulators[row * 2]);
@@ -213,7 +261,9 @@ pub fn emit_tensor_mul_add(
     c: Word,
 ) -> Word {
     if !matches!(inst.flags, 8 | 16) {
-        std::panic::panic_any(crate::exception::NotImplementedException::new("Unsupported matrix multiply depth"));
+        std::panic::panic_any(crate::exception::NotImplementedException::new(
+            "Unsupported matrix multiply depth",
+        ));
     }
     ctx.builder
         .function_call(
@@ -247,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn software_matrix_helpers_share_bounded_loops_and_preserve_rounding() {
+    fn software_matrix_helpers_unroll_groups_and_preserve_rounding() {
         let p = program();
         assert!(
             p.info.uses_subgroup_shuffles
@@ -264,7 +314,7 @@ mod tests {
         assert_ne!(ctx.software_matrix_functions[0], 0);
         assert_ne!(ctx.software_matrix_functions[1], 0);
         let module = ctx.builder.module_ref();
-        for id in ctx.software_matrix_functions {
+        for (variant, id) in ctx.software_matrix_functions.into_iter().enumerate() {
             let helper = module
                 .functions
                 .iter()
@@ -279,28 +329,72 @@ mod tests {
                     .iter()
                     .filter(|i| i.class.opcode == spirv::Op::LoopMerge)
                     .count(),
-                1
+                variant
             );
             assert_eq!(
                 instructions
                     .iter()
                     .filter(|i| i.class.opcode == spirv::Op::GroupNonUniformShuffle)
                     .count(),
-                4
+                16
             );
-            assert!(instructions
+            assert_eq!(
+                instructions
+                    .iter()
+                    .any(|i| i.class.opcode == spirv::Op::LoopMerge
+                        && i.operands.contains(&rspirv::dr::Operand::LoopControl(
+                            spirv::LoopControl::DONT_UNROLL
+                        ))),
+                variant == 1
+            );
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|i| i.class.opcode == spirv::Op::SelectionMerge)
+                    .count(),
+                0
+            );
+            // Four pairs, two rows, two columns, two halves: 32 FMAs, followed
+            // by one rounding of each of the four accumulators per K=8 group.
+            for (operation, expected) in [(spirv::GLOp::Fma, 32), (spirv::GLOp::RoundEven, 4)] {
+                assert_eq!(
+                    instructions
+                        .iter()
+                        .filter(|i| {
+                            i.class.opcode == spirv::Op::ExtInst
+                                && i.operands
+                                    .contains(&rspirv::dr::Operand::LiteralExtInstInteger(
+                                        operation as u32,
+                                    ))
+                        })
+                        .count(),
+                    expected
+                );
+            }
+            let arithmetic: Vec<_> = instructions
                 .iter()
-                .any(|i| i.class.opcode == spirv::Op::LoopMerge
-                    && i.operands.contains(&rspirv::dr::Operand::LoopControl(
-                        spirv::LoopControl::DONT_UNROLL
-                    ))));
-            assert!(instructions
-                .iter()
-                .any(|i| i.class.opcode == spirv::Op::ExtInst
-                    && i.operands
-                        .contains(&rspirv::dr::Operand::LiteralExtInstInteger(
-                            spirv::GLOp::RoundEven as u32
-                        ))));
+                .filter_map(|inst| {
+                    if inst.class.opcode != spirv::Op::ExtInst {
+                        return None;
+                    }
+                    match inst.operands.get(1) {
+                        Some(rspirv::dr::Operand::LiteralExtInstInteger(op))
+                            if *op == spirv::GLOp::Fma as u32
+                                || *op == spirv::GLOp::RoundEven as u32 =>
+                        {
+                            Some(*op)
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            let group_arithmetic: Vec<_> = std::iter::repeat_n(spirv::GLOp::Fma as u32, 32)
+                .chain(std::iter::repeat_n(spirv::GLOp::RoundEven as u32, 4))
+                .collect();
+            assert_eq!(
+                arithmetic, group_arithmetic,
+                "each group must round all accumulators before the next group's FMAs"
+            );
         }
         assert_eq!(
             module
@@ -320,6 +414,128 @@ mod tests {
                 .flat_map(u32::to_le_bytes)
                 .collect();
             std::fs::write(path, bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn software_matrix_native_rounding_requires_exact_float_controls() {
+        use rspirv::dr::Operand;
+        let native = Profile {
+            supported_spirv: 0x00010300,
+            supported_subgroup_stages: 1 << ShaderStage::Compute as u32,
+            support_storage_buffer_16bit: true,
+            support_float_controls: true,
+            support_separate_denorm_behavior: true,
+            support_fp16_denorm_preserve: true,
+            support_fp16_signed_zero_nan_preserve: true,
+            support_fp32_signed_zero_nan_preserve: true,
+            ..Profile::default()
+        };
+        for case in 0..15 {
+            let mut p = program();
+            p.info.uses_fp16 = true;
+            let mut profile = native.clone();
+            match case {
+                0 => {}
+                1 => p.info.uses_fp16 = false,
+                2 => p.info.uses_fp16_denorms_flush = true,
+                3 => profile.supported_spirv = 0x00010200,
+                4 => profile.support_storage_buffer_16bit = false,
+                5 => profile.support_float_controls = false,
+                6 => profile.support_separate_denorm_behavior = false,
+                7 => profile.support_fp16_denorm_preserve = false,
+                8 => profile.support_fp16_signed_zero_nan_preserve = false,
+                9 => profile.support_fp32_signed_zero_nan_preserve = false,
+                10 => profile.has_broken_fp16_float_controls = true,
+                11 => p.info.uses_fp16_denorms_preserve = true,
+                12 | 13 => {
+                    profile.support_separate_denorm_behavior = false;
+                    profile.support_fp32_only_denorm_independence = true;
+                    p.info.uses_fp64 = case == 13;
+                }
+                14 => p.info.uses_fp64 = true,
+                _ => unreachable!(),
+            }
+            let expected_native = matches!(case, 0 | 11 | 12 | 14);
+            let mut ctx = SpirvEmitContext::new(&p, &profile, &RuntimeInfo::default());
+            ctx.emit_program(&p);
+            assert_eq!(
+                ctx.software_matrix_native_rounding, expected_native,
+                "case {case}"
+            );
+            let module = ctx.builder.module_ref();
+            let rounding_decorations: Vec<_> = module
+                .annotations
+                .iter()
+                .filter(|i| {
+                    i.operands
+                        .contains(&Operand::Decoration(spirv::Decoration::FPRoundingMode))
+                })
+                .collect();
+            assert_eq!(
+                rounding_decorations.len(),
+                if expected_native { 8 } else { 0 }
+            );
+            assert!(rounding_decorations
+                .iter()
+                .all(|i| i.operands.last()
+                    == Some(&Operand::FPRoundingMode(spirv::FPRoundingMode::RTE))));
+            assert!(!module.execution_modes.iter().any(|i| i.operands.contains(
+                &Operand::ExecutionMode(spirv::ExecutionMode::RoundingModeRTE)
+            )));
+            if expected_native {
+                assert_eq!(
+                    module
+                        .execution_modes
+                        .iter()
+                        .filter(|i| i.operands.contains(&Operand::ExecutionMode(
+                            spirv::ExecutionMode::DenormPreserve
+                        )) && i.operands.last() == Some(&Operand::LiteralBit32(16)))
+                        .count(),
+                    1
+                );
+            }
+            for id in ctx.software_matrix_functions {
+                let helper = module
+                    .functions
+                    .iter()
+                    .find(|f| f.def.as_ref().unwrap().result_id == Some(id))
+                    .unwrap();
+                let instructions: Vec<_> =
+                    helper.blocks.iter().flat_map(|b| &b.instructions).collect();
+                assert_eq!(
+                    instructions
+                        .iter()
+                        .filter(|i| i.class.opcode == spirv::Op::FConvert)
+                        .count(),
+                    if expected_native { 8 } else { 0 }
+                );
+                let last_fma = instructions
+                    .iter()
+                    .rposition(|i| {
+                        i.class.opcode == spirv::Op::ExtInst
+                            && i.operands
+                                .contains(&Operand::LiteralExtInstInteger(spirv::GLOp::Fma as u32))
+                    })
+                    .unwrap();
+                if expected_native {
+                    let first_round = instructions
+                        .iter()
+                        .position(|i| i.class.opcode == spirv::Op::FConvert)
+                        .unwrap();
+                    assert!(last_fma < first_round);
+                }
+            }
+            if case == 0 {
+                if let Some(path) = std::env::var_os("RUZU_TEST_NATIVE_MATRIX_SPIRV") {
+                    let bytes: Vec<_> = ctx
+                        .finalize()
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect();
+                    std::fs::write(path, bytes).unwrap();
+                }
+            }
         }
     }
 

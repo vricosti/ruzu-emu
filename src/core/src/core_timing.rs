@@ -76,6 +76,7 @@ const CNTPCT_TICKS_PER_MS: u64 = wall_clock::CNTFRQ / 1000;
 /// as with `sync_core_speed`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ClockPacing {
+    ticks_per_ms: u64,
     anchor_raw: u64,
     anchor_paced: u64,
     /// Paced ticks per raw tick, in 1/65536 units; `RATE_ONE` is real time.
@@ -101,6 +102,7 @@ impl ClockPacing {
 
     pub(crate) const fn new() -> Self {
         Self {
+            ticks_per_ms: CNTPCT_TICKS_PER_MS,
             anchor_raw: 0,
             anchor_paced: 0,
             rate: Self::RATE_ONE,
@@ -132,7 +134,7 @@ impl ClockPacing {
             return;
         };
         let interval = raw.saturating_sub(last);
-        if interval == 0 || interval > Self::IGNORE_MS * CNTPCT_TICKS_PER_MS {
+        if interval == 0 || interval > Self::IGNORE_MS * self.ticks_per_ms {
             return;
         }
         self.smoothed_frame_ticks = if self.smoothed_frame_ticks == 0 {
@@ -141,13 +143,13 @@ impl ClockPacing {
             (self.smoothed_frame_ticks * 3 + interval) / 4
         };
         let smoothed = self.smoothed_frame_ticks;
-        if smoothed > Self::ENGAGE_MS * CNTPCT_TICKS_PER_MS {
+        if smoothed > Self::ENGAGE_MS * self.ticks_per_ms {
             self.engaged = true;
-        } else if smoothed < Self::RELEASE_MS * CNTPCT_TICKS_PER_MS {
+        } else if smoothed < Self::RELEASE_MS * self.ticks_per_ms {
             self.engaged = false;
         }
         let rate = if self.engaged {
-            let target = target_ms * CNTPCT_TICKS_PER_MS;
+            let target = target_ms * self.ticks_per_ms;
             ((target as u128 * Self::RATE_ONE as u128) / smoothed as u128)
                 .clamp(Self::RATE_MIN as u128, Self::RATE_ONE as u128) as u32
         } else {
@@ -310,6 +312,19 @@ pub struct CoreTiming {
 }
 
 impl CoreTiming {
+    /// System selects the session's timebase before starting guest workers.
+    /// Unlike upstream's global WallClock, this clock belongs to this System.
+    pub fn set_guest_cntfrq(&self, frequency: u64) {
+        self.clock.set_guest_cntfrq(frequency);
+        let mut pacing = self.clock_pacing.lock();
+        *pacing = ClockPacing::new();
+        pacing.ticks_per_ms = frequency / 1000;
+    }
+
+    pub fn get_guest_cntfrq(&self) -> u64 {
+        self.clock.get_guest_cntfrq()
+    }
+
     pub fn new() -> Self {
         Self {
             clock: wall_clock::create_optimal_clock(),
@@ -625,7 +640,7 @@ impl CoreTiming {
             // Identity unless an NX2 session is presenting below real time.
             self.clock_pacing.lock().paced(self.clock.get_cntpct() as u64)
         } else {
-            wall_clock::cpu_tick_to_cntpct(self.state.lock().cpu_ticks)
+            self.clock.cpu_tick_to_guest_cntpct(self.state.lock().cpu_ticks)
         };
         let (target_mhz, sync_core_speed) = {
             let values = common::settings::values();
@@ -839,6 +854,25 @@ mod tests {
             pacing.frame_presented(index * frame, ClockPacing::DEFAULT_TARGET_MS);
         }
         assert_eq!(pacing.paced(20 * frame), 20 * frame);
+    }
+
+    #[test]
+    fn session_counter_frequency_updates_pacing_units_without_changing_other_sessions() {
+        let timing = CoreTiming::new();
+        let other = CoreTiming::new();
+        for profile in [crate::hardware_properties::NX2_PROFILE, crate::hardware_properties::SWITCH1_PROFILE] {
+            let frequency = profile.counter_frequency();
+            timing.set_guest_cntfrq(frequency);
+            assert_eq!(timing.get_guest_cntfrq(), frequency);
+            assert_eq!(other.get_guest_cntfrq(), wall_clock::CNTFRQ);
+            assert_eq!(timing.clock.cpu_tick_to_guest_cntpct(wall_clock::CPU_TICK_FREQ), frequency);
+            let mut pacing = timing.clock_pacing.lock();
+            let frame = frequency / 20;
+            for index in 0..10 {
+                pacing.frame_presented(index * frame, 25);
+            }
+            assert_eq!(pacing.rate, ClockPacing::RATE_ONE / 2);
+        }
     }
 
     #[test]

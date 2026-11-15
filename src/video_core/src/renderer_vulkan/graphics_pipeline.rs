@@ -476,6 +476,8 @@ pub struct GraphicsPipelineKey {
     pub unique_hashes: [u64; NUM_PROGRAMS],
     /// Fixed (non-dynamic) pipeline state.
     pub fixed_state: FixedPipelineState,
+    /// Descriptor-pool bounds are shader compilation inputs for dynamic access.
+    pub texture_pool_state: Option<shader_recompiler::environment::TexturePoolState>,
 }
 
 impl Default for GraphicsPipelineKey {
@@ -483,6 +485,7 @@ impl Default for GraphicsPipelineKey {
         Self {
             unique_hashes: [0; NUM_PROGRAMS],
             fixed_state: FixedPipelineState::default(),
+            texture_pool_state: None,
         }
     }
 }
@@ -490,7 +493,7 @@ impl Default for GraphicsPipelineKey {
 impl GraphicsPipelineKey {
     /// Port of upstream `GraphicsPipelineCacheKey::Size`.
     pub fn serialized_size(&self) -> usize {
-        std::mem::size_of::<[u64; NUM_PROGRAMS]>() + self.fixed_state.serialized_size()
+        std::mem::size_of::<[u64; NUM_PROGRAMS]>() + self.fixed_state.serialized_size() + 16
     }
 
     pub fn to_cache_bytes(&self) -> Vec<u8> {
@@ -499,6 +502,7 @@ impl GraphicsPipelineKey {
             bytes.extend_from_slice(&hash.to_le_bytes());
         }
         self.fixed_state.write_prefix_bytes(&mut bytes);
+        bytes.extend_from_slice(&super::pipeline_cache::texture_pool_key_bytes(self.texture_pool_state));
         debug_assert_eq!(bytes.len(), self.serialized_size());
         bytes
     }
@@ -516,6 +520,7 @@ impl GraphicsPipelineKey {
         Ok(Self {
             unique_hashes,
             fixed_state,
+            texture_pool_state: super::pipeline_cache::read_texture_pool_key(file)?,
         })
     }
 }
@@ -1110,6 +1115,7 @@ impl GraphicsPipeline {
             u32::from_le_bytes(bytes)
         };
         let read_stage_handle = |stage: usize,
+                                 handle_program: u32,
                                  cbuf_index: u32,
                                  cbuf_offset: u32,
                                  size_shift: u32,
@@ -1120,6 +1126,16 @@ impl GraphicsPipeline {
                                  secondary_cbuf_offset: u32,
                                  secondary_shift_left: u32|
          -> (u32, u32) {
+            if handle_program != u32::MAX {
+                let handle = crate::shader_handle_program::evaluate_texture_handle(
+                    &state.stage_infos[stage], handle_program,
+                    |index| {
+                        if index as usize >= shader_recompiler::shader_info::Info::MAX_CBUFS { return 0; }
+                        let cbuf = draw.const_buffer_binding(stage, index as usize);
+                        if cbuf.enabled { cbuf.address } else { 0 }
+                    }, read_u32);
+                return texture_pair(handle, via_header_index);
+            }
             let index_offset = element.wrapping_shl(size_shift);
             let cbuf = draw.const_buffer_binding(stage, cbuf_index as usize);
             assert!(cbuf.enabled);
@@ -1153,6 +1169,7 @@ impl GraphicsPipeline {
                             desc.cbuf_index,
                             desc.cbuf_offset,
                             desc.is_written,
+                desc.indirect_offset,
                         );
                     }
                 }
@@ -1169,6 +1186,7 @@ impl GraphicsPipeline {
                         for element in 0..desc.count {
                             let (tic_id, _) = read_stage_handle(
                                 stage,
+                                desc.handle_program,
                                 desc.cbuf_index,
                                 desc.cbuf_offset,
                                 desc.size_shift,
@@ -1188,6 +1206,7 @@ impl GraphicsPipeline {
                         for element in 0..desc.count {
                             let (tic_id, _) = read_stage_handle(
                                 stage,
+                                desc.handle_program,
                                 desc.cbuf_index,
                                 desc.cbuf_offset,
                                 desc.size_shift,
@@ -1206,6 +1225,7 @@ impl GraphicsPipeline {
                     for element in 0..desc.count {
                         let (tic_id, tsc_id) = read_stage_handle(
                             stage,
+                            desc.handle_program,
                             desc.cbuf_index,
                             desc.cbuf_offset,
                             desc.size_shift,
@@ -1225,6 +1245,7 @@ impl GraphicsPipeline {
                         for element in 0..desc.count {
                             let (tic_id, _) = read_stage_handle(
                                 stage,
+                                desc.handle_program,
                                 desc.cbuf_index,
                                 desc.cbuf_offset,
                                 desc.size_shift,
@@ -2521,8 +2542,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: false,
-            });
+                is_written: false, ..Default::default() });
         assert_eq!(
             configure_func(&modules, &infos) as usize,
             configure_spec::<SimpleStorageSpec> as ConfigureFunc as usize
@@ -2530,6 +2550,7 @@ mod tests {
 
         infos[0].storage_buffers_descriptors.clear();
         infos[0].image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::Typeless,
             is_written: false,
@@ -2549,6 +2570,7 @@ mod tests {
         infos[0]
             .texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,
@@ -2632,6 +2654,7 @@ mod tests {
         let mut fragment = ShaderInfo::default();
         fragment.stores_frag_color[0] = true;
         fragment.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -2671,6 +2694,7 @@ mod tests {
     #[test]
     fn gpu_log_payloads_match_upstream_graphics_pipeline_strings() {
         let key = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 123, 0, 0, 0, 456],
             fixed_state: FixedPipelineState::default(),
         };
@@ -2687,10 +2711,12 @@ mod tests {
     #[test]
     fn test_pipeline_key_equality() {
         let key_a = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 123, 0, 0, 0, 456],
             fixed_state: FixedPipelineState::default(),
         };
         let key_b = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 123, 0, 0, 0, 456],
             fixed_state: FixedPipelineState::default(),
         };
@@ -2700,10 +2726,12 @@ mod tests {
     #[test]
     fn test_transition_graph_returns_self_and_added_transition() {
         let key_a = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 123, 0, 0, 0, 456],
             fixed_state: FixedPipelineState::default(),
         };
         let key_b = GraphicsPipelineKey {
+            texture_pool_state: None,
             unique_hashes: [0, 789, 0, 0, 0, 321],
             fixed_state: FixedPipelineState::default(),
         };
@@ -2721,6 +2749,20 @@ mod tests {
             &transition
         ));
         assert!(pipeline.is_built());
+
+        // A bound change must not return the existing pipeline through Next,
+        // even when shader hashes and all fixed graphics state are identical.
+        for state in [
+            shader_recompiler::environment::TexturePoolState { texture_limit: 7, sampler_limit: 3, linked_sampler: false },
+            shader_recompiler::environment::TexturePoolState { texture_limit: 15, sampler_limit: 3, linked_sampler: false },
+            shader_recompiler::environment::TexturePoolState { texture_limit: 7, sampler_limit: 7, linked_sampler: false },
+            shader_recompiler::environment::TexturePoolState { texture_limit: 7, sampler_limit: 3, linked_sampler: true },
+        ] {
+            let mut changed = key_a.clone();
+            changed.texture_pool_state = Some(state);
+            assert!(GraphicsPipeline::next(&pipeline, &changed).is_none());
+            assert_ne!(changed.hash_value(), key_a.hash_value());
+        }
 
         // Both fixtures intentionally carry a dangling test-only DeviceReference.
         // They may exercise pure cache methods, but must never enter the real

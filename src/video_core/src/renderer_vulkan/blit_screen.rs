@@ -378,6 +378,7 @@ impl BlitScreen {
             ScalingFilter::Area => filters::make_area(device, self.swapchain_view_format),
             ScalingFilter::Mmpx => filters::make_mmpx(device, self.swapchain_view_format),
             ScalingFilter::Fsr
+            | ScalingFilter::Fsr3
             | ScalingFilter::Sgsr
             | ScalingFilter::SgsrEdge
             | ScalingFilter::Bilinear => filters::make_bilinear(device, self.swapchain_view_format),

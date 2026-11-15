@@ -489,8 +489,10 @@ impl ComputePipeline {
             let build_condvar = build_condvar.clone();
             let build_mutex = build_mutex.clone();
             let is_built = is_built.clone();
-            // Fritchii only constrains shaders that observe warp-level state.
-            let uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id
+            // Lichii also constrains shaders whose removed conditional barrier
+            // relied on guest warp-sized lockstep execution.
+            let uses_warp_ops = info.removed_conditional_barrier
+                || info.uses_subgroup_vote || info.uses_subgroup_invocation_id
                 || info.uses_subgroup_shuffles || info.uses_subgroup_mask
                 || info.uses_quad_shuffles || info.uses_fswzadd;
             let supports_subgroup_size_control =
@@ -638,6 +640,8 @@ impl ComputePipeline {
                 desc.cbuf_index,
                 desc.cbuf_offset,
                 desc.is_written,
+                desc.indirect_offset,
+                &desc.write_extent,
             );
         }
 
@@ -915,6 +919,7 @@ struct ComputeTextureHandles {
 }
 
 trait ComputeTextureHandleDescriptor {
+    fn handle_program(&self) -> u32;
     fn has_secondary(&self) -> bool;
     fn cbuf_index(&self) -> u32;
     fn cbuf_offset(&self) -> u32;
@@ -928,6 +933,7 @@ trait ComputeTextureHandleDescriptor {
 macro_rules! impl_compute_texture_handle_descriptor {
     ($ty:ty) => {
         impl ComputeTextureHandleDescriptor for $ty {
+            fn handle_program(&self) -> u32 { self.handle_program }
             fn has_secondary(&self) -> bool {
                 self.has_secondary
             }
@@ -960,6 +966,7 @@ impl_compute_texture_handle_descriptor!(TextureBufferDescriptor);
 impl_compute_texture_handle_descriptor!(TextureDescriptor);
 
 impl ComputeTextureHandleDescriptor for ImageBufferDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn has_secondary(&self) -> bool {
         false
     }
@@ -987,6 +994,7 @@ impl ComputeTextureHandleDescriptor for ImageBufferDescriptor {
 }
 
 impl ComputeTextureHandleDescriptor for ImageDescriptor {
+    fn handle_program(&self) -> u32 { self.handle_program }
     fn has_secondary(&self) -> bool {
         false
     }
@@ -1014,11 +1022,22 @@ impl ComputeTextureHandleDescriptor for ImageDescriptor {
 }
 
 fn read_texture_handle(
+    info: &ShaderInfo,
     qmd: &LaunchParams,
     desc: &impl ComputeTextureHandleDescriptor,
     index: u32,
     read_u32: &mut impl FnMut(u64) -> u32,
 ) -> (u32, u32) {
+    if desc.handle_program() != u32::MAX {
+        let handle = crate::shader_handle_program::evaluate_texture_handle(
+            info, desc.handle_program(),
+            |index| {
+                if index as usize >= qmd.const_buffers.len()
+                    || (qmd.const_buffer_enable_mask >> index) & 1 == 0 { return 0; }
+                qmd.const_buffers[index as usize].address
+            }, read_u32);
+        return texture_pair(handle, qmd.linked_tsc);
+    }
     assert_ne!((qmd.const_buffer_enable_mask >> desc.cbuf_index()) & 1, 0);
     let index_offset = index << desc.size_shift();
     let address = qmd.const_buffers[desc.cbuf_index() as usize]
@@ -1050,6 +1069,7 @@ fn collect_texture_handles(
         for index in 0..desc.count {
             result.views.push(ImageViewInOut {
                 index: read_texture_handle(
+                    info,
                     &dispatch.launch_description,
                     desc,
                     index,
@@ -1064,6 +1084,7 @@ fn collect_texture_handles(
         for index in 0..desc.count {
             result.views.push(ImageViewInOut {
                 index: read_texture_handle(
+                    info,
                     &dispatch.launch_description,
                     desc,
                     index,
@@ -1077,7 +1098,7 @@ fn collect_texture_handles(
     for desc in &info.texture_descriptors {
         for index in 0..desc.count {
             let (view, sampler) =
-                read_texture_handle(&dispatch.launch_description, desc, index, &mut read_u32);
+                read_texture_handle(info, &dispatch.launch_description, desc, index, &mut read_u32);
             result.views.push(ImageViewInOut {
                 index: view,
                 ..Default::default()
@@ -1089,6 +1110,7 @@ fn collect_texture_handles(
         for index in 0..desc.count {
             result.views.push(ImageViewInOut {
                 index: read_texture_handle(
+                    info,
                     &dispatch.launch_description,
                     desc,
                     index,
@@ -1192,6 +1214,26 @@ fn compute_descriptor_set_layout_bindings(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn computed_handle_is_evaluated_before_direct_cbuf_validation() {
+        use shader_recompiler::shader_info::HandleOp as H;
+        let mut info = super::ShaderInfo::default();
+        info.handle_programs.push(vec![H::Cbuf as u32, 3, 12]);
+        let desc = super::ImageBufferDescriptor {
+            handle_program: 0,
+            format: super::ImageFormat::Typeless,
+            is_written: false, is_read: true, is_integer: false,
+            cbuf_index: 0, cbuf_offset: 0, count: 1, size_shift: 3,
+        };
+        let mut qmd = super::LaunchParams::default();
+        qmd.const_buffer_enable_mask = 1 << 3;
+        qmd.const_buffers[3].address = 0x1000;
+        for handle in [17, 29] {
+            assert_eq!(super::read_texture_handle(&info, &qmd, &desc, 0, &mut |address| {
+                assert_eq!(address, 0x100c); handle
+            }), super::texture_pair(handle, qmd.linked_tsc));
+        }
+    }
+    #[test]
     fn mesh_transport_layout_follows_guest_bindings_and_counts_array_elements() {
         use shader_recompiler::backend::spirv::emit_spirv::MeshComputeSpirv;
         for mesh in [false, true] {
@@ -1200,8 +1242,7 @@ mod tests {
             info.is_mesh = mesh;
             info.constant_buffer_descriptors.push(ConstantBufferDescriptor { index: 0, count: 4 });
             info.storage_buffers_descriptors.push(StorageBufferDescriptor {
-                cbuf_index: 1, cbuf_offset: 16, count: 2, is_written: false,
-            });
+                cbuf_index: 1, cbuf_offset: 16, count: 2, is_written: false, ..Default::default() });
             let shader = MeshComputeSpirv { code: Vec::new(), dispatch_binding: 2,
                 payload_binding: 3, output_binding: mesh.then_some(4) };
             let mut builder = DescriptorLayoutBuilder::new_for_test();
@@ -1242,10 +1283,10 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            });
+                is_written: true, ..Default::default() });
         info.texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,
@@ -1257,6 +1298,7 @@ mod tests {
                 size_shift: 0,
             });
         info.image_buffer_descriptors.push(ImageBufferDescriptor {
+            handle_program: u32::MAX,
             format: ImageFormat::R32Uint,
             is_written: true,
             is_read: true,
@@ -1267,6 +1309,7 @@ mod tests {
             size_shift: 0,
         });
         info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -1282,6 +1325,7 @@ mod tests {
             size_shift: 0,
         });
         info.image_descriptors.push(ImageDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             format: ImageFormat::R32Uint,
             is_written: true,

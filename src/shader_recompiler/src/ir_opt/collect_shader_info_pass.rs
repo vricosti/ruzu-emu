@@ -898,6 +898,7 @@ pub fn collect_shader_info_pass(program: &mut Program) {
         program.info.texture_descriptors = tex_set
             .into_iter()
             .map(|index| TexDescriptor {
+                handle_program: u32::MAX,
                 cbuf_index: index,
                 texture_type: crate::shader_info::TextureType::Color2D,
                 is_depth: false,

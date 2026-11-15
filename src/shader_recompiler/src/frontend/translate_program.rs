@@ -481,11 +481,16 @@ pub fn merge_dual_vertex_programs(
     }
     result.local_memory_size = vertex_a.local_memory_size.max(vertex_b.local_memory_size);
 
-    ir_opt::texture_pass::join_texture_info(&mut result.info, &mut vertex_b.info);
-    ir_opt::global_memory_to_storage_buffer_pass::join_storage_info(
+    // Computed texture handles refer to storage bindings, so join those first.
+    // Both merge helpers retain A's indices and return B's index relocation.
+    let storage_mapping = ir_opt::global_memory_to_storage_buffer_pass::join_storage_info(
         &mut result.info,
         &mut vertex_b.info,
     );
+    let texture_mapping = ir_opt::texture_pass::join_texture_info(&mut result.info, &mut vertex_b.info);
+    let source_blocks = &mut result.blocks[vertex_b_block_offset as usize..];
+    ir_opt::global_memory_to_storage_buffer_pass::remap_storage_bindings(source_blocks, &storage_mapping);
+    ir_opt::texture_pass::remap_texture_bindings(source_blocks, &texture_mapping);
     ir_opt::dead_code_elimination_pass::dead_code_elimination_pass(&mut result);
     if *common::settings::values().renderer_debug.get_value() {
         ir_opt::verification_pass::verification_pass(&result);
@@ -621,13 +626,15 @@ pub fn add_nvn_storage_buffers(program: &mut Program) {
     const DRIVER_CBUF: u32 = 0;
     const DESCRIPTOR_SIZE: u32 = 0x10;
     const NUM_BUFFERS: u32 = 16;
-    let base = match program.stage {
+    // Task programs use the vertex driver-table layout even when lowered to
+    // host compute. Match CollectShaderInfo's stage-local NVN base selection.
+    let base = if program.info.is_task { 0x110 } else { match program.stage {
         ShaderStage::VertexA | ShaderStage::VertexB => 0x110,
         ShaderStage::TessellationControl => 0x210,
         ShaderStage::TessellationEval | ShaderStage::Compute => 0x310,
         ShaderStage::Geometry => 0x410,
         ShaderStage::Fragment => 0x510,
-    };
+    }};
 
     let descriptors = &mut program.info.storage_buffers_descriptors;
     for index in 0..NUM_BUFFERS {
@@ -637,7 +644,7 @@ pub fn add_nvn_storage_buffers(program: &mut Program) {
         let offset = base + index * DESCRIPTOR_SIZE;
         if let Some(descriptor) = descriptors
             .iter_mut()
-            .find(|descriptor| descriptor.cbuf_offset == offset)
+            .find(|descriptor| descriptor.cbuf_index == DRIVER_CBUF && descriptor.cbuf_offset == offset)
         {
             descriptor.is_written |= program.info.stores_global_memory;
             continue;
@@ -646,8 +653,7 @@ pub fn add_nvn_storage_buffers(program: &mut Program) {
             cbuf_index: DRIVER_CBUF,
             cbuf_offset: offset,
             count: 1,
-            is_written: program.info.stores_global_memory,
-        });
+            is_written: program.info.stores_global_memory, ..Default::default() });
     }
 }
 
@@ -1286,23 +1292,43 @@ mod tests {
         program.info.nvn_buffer_used = (1 << 2) | (1 << 5);
         program.info.storage_buffers_descriptors.push(
             crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 3, cbuf_offset: 0x560, count: 1, is_written: false, ..Default::default() },
+        );
+        program.info.storage_buffers_descriptors.push(
+            crate::shader_info::StorageBufferDescriptor {
                 cbuf_index: 0,
                 cbuf_offset: 0x530,
                 count: 1,
-                is_written: false,
-            },
+                is_written: false, ..Default::default() },
         );
 
         add_nvn_storage_buffers(&mut program);
 
-        assert_eq!(program.info.storage_buffers_descriptors.len(), 2);
-        assert!(program.info.storage_buffers_descriptors[0].is_written);
-        assert_eq!(program.info.storage_buffers_descriptors[1].cbuf_index, 0);
+        assert_eq!(program.info.storage_buffers_descriptors.len(), 3);
+        assert!(!program.info.storage_buffers_descriptors[0].is_written);
+        assert!(program.info.storage_buffers_descriptors[1].is_written);
+        assert_eq!(program.info.storage_buffers_descriptors[2].cbuf_index, 0);
         assert_eq!(
-            program.info.storage_buffers_descriptors[1].cbuf_offset,
+            program.info.storage_buffers_descriptors[2].cbuf_offset,
             0x560
         );
-        assert_eq!(program.info.storage_buffers_descriptors[1].count, 1);
-        assert!(program.info.storage_buffers_descriptors[1].is_written);
+        assert_eq!(program.info.storage_buffers_descriptors[2].count, 1);
+        assert!(program.info.storage_buffers_descriptors[2].is_written);
+    }
+
+    #[test]
+    fn add_nvn_storage_buffers_preserves_task_table_when_lowered_to_compute() {
+        for (task, base) in [(true, 0x110), (false, 0x310)] {
+            let mut program = Program::new(ShaderStage::Compute);
+            program.info.is_task = task;
+            program.info.is_mesh = !task;
+            program.info.uses_global_memory = true;
+            program.info.nvn_buffer_base = base;
+            program.info.nvn_buffer_used = 1 << 5;
+            add_nvn_storage_buffers(&mut program);
+            let descriptor = &program.info.storage_buffers_descriptors[0];
+            assert_eq!(descriptor.cbuf_offset, base + 5 * 0x10);
+            assert!(program.info.uses_nvn_storage_descriptor(descriptor));
+        }
     }
 }

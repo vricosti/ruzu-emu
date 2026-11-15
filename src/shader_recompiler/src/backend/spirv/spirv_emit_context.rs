@@ -476,6 +476,9 @@ pub struct SpirvEmitContext {
     pub is_helper_invocation: spirv::Word,
     pub subgroup_local_invocation_id: spirv::Word,
     pub software_matrix_functions: [spirv::Word; 2],
+    /// Backend-local optimization of the software helper's exact half rounding.
+    /// Consumed by SetupDenormControl; never changes guest shader metadata.
+    pub software_matrix_native_rounding: bool,
     pub subgroup_mask_eq: spirv::Word,
     pub subgroup_mask_lt: spirv::Word,
     pub subgroup_mask_le: spirv::Word,
@@ -609,6 +612,7 @@ pub struct SpirvEmitContext {
     pub(crate) write_global_func_u32: spirv::Word,
     pub(crate) write_global_func_u32x2: spirv::Word,
     pub(crate) write_global_func_u32x4: spirv::Word,
+    pub(crate) global_atomic_functions: HashMap<ir::Opcode, spirv::Word>,
     pub(crate) indexed_load_func: spirv::Word,
     pub(crate) indexed_store_func: spirv::Word,
     /// Texture combined image sampler variables, indexed by descriptor index.
@@ -802,6 +806,7 @@ impl SpirvEmitContext {
             is_helper_invocation: 0,
             subgroup_local_invocation_id: 0,
             software_matrix_functions: [0; 2],
+            software_matrix_native_rounding: false,
             subgroup_mask_eq: 0,
             subgroup_mask_lt: 0,
             subgroup_mask_le: 0,
@@ -965,6 +970,7 @@ impl SpirvEmitContext {
             write_global_func_u32: 0,
             write_global_func_u32x2: 0,
             write_global_func_u32x4: 0,
+            global_atomic_functions: HashMap::new(),
             indexed_load_func: 0,
             indexed_store_func: 0,
             textures: Vec::new(),
@@ -2103,14 +2109,16 @@ impl SpirvEmitContext {
         value_type: spirv::Word,
         element_size: u32,
         write: bool,
+        atomic: Option<super::emit_spirv_atomic::StorageAtomicOp>,
     ) -> spirv::Word {
-        let function_type = if write {
+        let has_data = write || atomic.is_some();
+        let result_type = if write { self.void_type } else { value_type };
+        let function_type = if has_data {
             self.builder
-                .type_function(self.void_type, vec![self.u64_type, value_type])
+                .type_function(result_type, vec![self.u64_type, value_type])
         } else {
             self.builder.type_function(value_type, vec![self.u64_type])
         };
-        let result_type = if write { self.void_type } else { value_type };
         let function = self
             .builder
             .begin_function(
@@ -2121,14 +2129,14 @@ impl SpirvEmitContext {
             )
             .unwrap();
         let address = self.builder.function_parameter(self.u64_type).unwrap();
-        let data = write.then(|| self.builder.function_parameter(value_type).unwrap());
+        let data = has_data.then(|| self.builder.function_parameter(value_type).unwrap());
         self.builder.begin_block(None).unwrap();
 
         let element_pointer = self.storage_types.get(kind).element;
         assert_ne!(element_pointer, 0, "missing global SSBO type {kind:?}");
         let shift = element_size.trailing_zeros();
         for (index, descriptor) in info.storage_buffers_descriptors.iter().enumerate() {
-            if index >= u16::BITS as usize || info.nvn_buffer_used & (1u16 << index) == 0 {
+            if !info.uses_nvn_storage_descriptor(descriptor) {
                 continue;
             }
             let cbuf = self
@@ -2233,7 +2241,10 @@ impl SpirvEmitContext {
                     vec![self.const_zero_u32, ssbo_index],
                 )
                 .unwrap();
-            if let Some(data) = data {
+            if let Some(operation) = atomic {
+                let value = super::emit_spirv_atomic::atomic_u32(self, pointer, data.unwrap(), operation);
+                self.builder.ret_value(value).unwrap();
+            } else if let Some(data) = data {
                 self.builder.store(pointer, data, None, []).unwrap();
                 self.builder.ret().unwrap();
             } else {
@@ -2256,9 +2267,22 @@ impl SpirvEmitContext {
     }
 
     /// Port of upstream `EmitContext::DefineGlobalMemoryFunctions`.
-    fn define_global_memory_functions(&mut self, info: &crate::shader_info::Info) {
+    fn define_global_memory_functions(&mut self, program: &ir::Program) {
+        let info = &program.info;
         if !info.uses_global_memory || !self.profile.support_int64 {
             return;
+        }
+        // Do not turn unresolved atomics into zero-returning functions with
+        // no memory effects. Validate before defining any storage helper.
+        let has_atomic = program.blocks.iter().any(|block| block.iter().any(|inst| {
+            super::emit_spirv_atomic::global_atomic_u32_operation(inst.opcode).is_some()
+        }));
+        if has_atomic && !info.storage_buffers_descriptors.iter().any(|descriptor| {
+            info.uses_nvn_storage_descriptor(descriptor)
+        }) {
+            std::panic::panic_any(crate::exception::NotImplementedException::new(
+                "Global atomic address has no registered storage ranges",
+            ));
         }
         self.load_global_func_u32 = self.define_global_memory_function(
             info,
@@ -2266,6 +2290,7 @@ impl SpirvEmitContext {
             self.u32_type,
             4,
             false,
+            None,
         );
         self.write_global_func_u32 = self.define_global_memory_function(
             info,
@@ -2273,6 +2298,7 @@ impl SpirvEmitContext {
             self.u32_type,
             4,
             true,
+            None,
         );
         self.load_global_func_u32x2 = self.define_global_memory_function(
             info,
@@ -2280,6 +2306,7 @@ impl SpirvEmitContext {
             self.u32_vec2_type,
             8,
             false,
+            None,
         );
         self.write_global_func_u32x2 = self.define_global_memory_function(
             info,
@@ -2287,6 +2314,7 @@ impl SpirvEmitContext {
             self.u32_vec2_type,
             8,
             true,
+            None,
         );
         self.load_global_func_u32x4 = self.define_global_memory_function(
             info,
@@ -2294,6 +2322,7 @@ impl SpirvEmitContext {
             self.u32_vec4_type,
             16,
             false,
+            None,
         );
         self.write_global_func_u32x4 = self.define_global_memory_function(
             info,
@@ -2301,7 +2330,23 @@ impl SpirvEmitContext {
             self.u32_vec4_type,
             16,
             true,
+            None,
         );
+        // Emit only helpers actually referenced by IR, before the entry point.
+        // Operation emission remains in emit_spirv_atomic.rs.
+        for block in &program.blocks {
+            for inst in block.iter() {
+                let Some(operation) = super::emit_spirv_atomic::global_atomic_u32_operation(inst.opcode) else {
+                    continue;
+                };
+                if !self.global_atomic_functions.contains_key(&inst.opcode) {
+                    let function = self.define_global_memory_function(
+                        info, StorageDefinitionKind::U32, self.u32_type, 4, false, Some(operation),
+                    );
+                    self.global_atomic_functions.insert(inst.opcode, function);
+                }
+            }
+        }
     }
 
     /// Port of upstream `EmitContext::DefineTextureBuffers`.
@@ -3990,7 +4035,7 @@ impl SpirvEmitContext {
 
         self.define_attribute_mem_access(info);
         self.define_write_storage_cas_loop_function(info);
-        self.define_global_memory_functions(info);
+        self.define_global_memory_functions(program);
         self.define_rescaling_input(info);
         self.define_render_area(info);
     }
@@ -5849,6 +5894,19 @@ impl SpirvEmitContext {
                 super::emit_spirv_atomic::emit_storage_atomic(self, inst, block_idx, inst_idx);
             }
 
+            Opcode::GlobalAtomicIAdd32
+            | Opcode::GlobalAtomicSMin32
+            | Opcode::GlobalAtomicUMin32
+            | Opcode::GlobalAtomicSMax32
+            | Opcode::GlobalAtomicUMax32
+            | Opcode::GlobalAtomicAnd32
+            | Opcode::GlobalAtomicOr32
+            | Opcode::GlobalAtomicXor32
+            | Opcode::GlobalAtomicExchange32 => {
+                let id = super::emit_spirv_atomic::emit_global_atomic_u32(self, inst);
+                self.set_value(block_idx, inst_idx, id);
+            }
+
             // ── Warp / subgroup ──────────────────────────────────────
             Opcode::VoteAll | Opcode::VoteAny | Opcode::VoteEqual => {
                 let pred = self.resolve_value(inst.arg(0));
@@ -6170,18 +6228,9 @@ impl SpirvEmitContext {
             | Opcode::CompositeExtractF64x3
             | Opcode::CompositeExtractF64x4
             | Opcode::SelectU8
-            | Opcode::GlobalAtomicIAdd32
-            | Opcode::GlobalAtomicSMin32
-            | Opcode::GlobalAtomicUMin32
-            | Opcode::GlobalAtomicSMax32
-            | Opcode::GlobalAtomicUMax32
             | Opcode::GlobalAtomicInc32
             | Opcode::GlobalAtomicDec32
-            | Opcode::GlobalAtomicAnd32
-            | Opcode::GlobalAtomicOr32
-            | Opcode::GlobalAtomicXor32
             | Opcode::GlobalAtomicCompareExchange32
-            | Opcode::GlobalAtomicExchange32
             | Opcode::GlobalAtomicIAdd64
             | Opcode::GlobalAtomicSMin64
             | Opcode::GlobalAtomicUMin64
@@ -6972,8 +7021,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 2,
-                is_written: true,
-            }];
+                is_written: true, ..Default::default() }];
         let profile = Profile {
             unified_descriptor_binding: true,
             support_descriptor_aliasing: true,
@@ -7015,8 +7063,7 @@ mod tests {
                 cbuf_index: 0,
                 cbuf_offset: 0,
                 count: 1,
-                is_written: true,
-            }];
+                is_written: true, ..Default::default() }];
         let mut ctx = SpirvEmitContext::new(&program, &Profile::default(), &RuntimeInfo::default());
         let mut bindings = Bindings::default();
 
@@ -7042,7 +7089,8 @@ mod tests {
         let mut program = ir::Program::new(ShaderStage::Compute);
         program.info.uses_int64 = true;
         program.info.uses_global_memory = true;
-        program.info.nvn_buffer_used = 1;
+        program.info.nvn_buffer_used = (1 << 2) | (1 << 5);
+        program.info.nvn_buffer_base = 0x310;
         program.info.used_constant_buffer_types = Type::U32 as u32 | Type::U32x2 as u32;
         program.info.used_storage_buffer_types =
             Type::U32 as u32 | Type::U32x2 as u32 | Type::U32x4 as u32;
@@ -7052,11 +7100,14 @@ mod tests {
             .push(ConstantBufferDescriptor { index: 0, count: 1 });
         program.info.storage_buffers_descriptors =
             vec![crate::shader_info::StorageBufferDescriptor {
-                cbuf_index: 0,
-                cbuf_offset: 16,
+                cbuf_index: 1,
+                cbuf_offset: 0x330,
                 count: 1,
-                is_written: true,
-            }];
+                is_written: true, ..Default::default() }];
+        for offset in [0x330, 0x360] {
+            program.info.storage_buffers_descriptors.push(crate::shader_info::StorageBufferDescriptor {
+                cbuf_index: 0, cbuf_offset: offset, count: 1, is_written: true, ..Default::default() });
+        }
         let profile = Profile {
             unified_descriptor_binding: true,
             support_descriptor_aliasing: true,
@@ -7081,7 +7132,9 @@ mod tests {
             .flat_map(|function| function.blocks.iter())
             .flat_map(|block| block.instructions.iter());
         let opcodes: Vec<_> = instructions.map(|inst| inst.class.opcode).collect();
-        assert!(opcodes.contains(&spirv::Op::UGreaterThanEqual));
+        // Six helpers each search both used guest slots, despite their vector
+        // indices being 1 and 2 and an unrelated descriptor occupying index 0.
+        assert_eq!(opcodes.iter().filter(|&&op| op == spirv::Op::UGreaterThanEqual).count(), 12);
         assert!(opcodes.contains(&spirv::Op::ULessThan));
         assert!(opcodes.contains(&spirv::Op::LogicalAnd));
         assert!(opcodes.contains(&spirv::Op::ISub));
@@ -7569,6 +7622,7 @@ mod tests {
     fn sampled_array_texture_preserves_upstream_image_type_flags() {
         let mut program = ir::Program::new(ShaderStage::Fragment);
         program.info.texture_descriptors.push(TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::ColorArray2D,
             is_depth: true,
             is_multisample: true,
@@ -7645,6 +7699,7 @@ mod tests {
             .info
             .texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,
@@ -7661,6 +7716,7 @@ mod tests {
         assert_eq!(binding_of(&vertex_ctx, vertex_ctx.texture_buffers[0].id), 1);
 
         let texture = TextureDescriptor {
+            handle_program: u32::MAX,
             texture_type: TextureType::Color2D,
             is_depth: false,
             is_multisample: false,
@@ -7692,6 +7748,7 @@ mod tests {
             .info
             .texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,
@@ -7715,6 +7772,7 @@ mod tests {
             .info
             .image_buffer_descriptors
             .push(ImageBufferDescriptor {
+                handle_program: u32::MAX,
                 format: ImageFormat::R32Uint,
                 is_written: true,
                 is_read: true,
@@ -7901,6 +7959,7 @@ mod tests {
             .info
             .texture_buffer_descriptors
             .push(TextureBufferDescriptor {
+                handle_program: u32::MAX,
                 has_secondary: false,
                 cbuf_index: 0,
                 cbuf_offset: 0,

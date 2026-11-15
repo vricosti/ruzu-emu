@@ -2769,7 +2769,10 @@ impl InstructionLowering<'_> {
                         + u32::from(has_lod)
                         + u32::from(offsets)
                         + u32::from(depth_compare);
-                    let in_a = if opcode == 0x361 && insn.bits(60, 1) == 0 { coordinates }
+                    // Non-scalar TEX keeps coordinates in source A and metadata
+                    // (handle, LOD, offsets, comparison) in source B. Only SCR
+                    // redistributes the combined operands between both sources.
+                    let in_a = if insn.bits(60, 1) == 0 { coordinates }
                         else if count <= 4 { (count + 1) / 2 }
                         else if opcode == 0x361 { coordinates } else { 4 };
                     let value = |i: u32| -> u32 {
@@ -4225,22 +4228,26 @@ impl InstructionLowering<'_> {
             0x3a1 => {
                 let source = insn.bits(24, 8);
                 let target = insn.bits(81, 3);
+                // Mesa NAK OpMatch: bit 73 selects a 64-bit source; bit 79
+                // selects ANY. MATCH.ALL.B32 compares one register, not a pair.
+                let wide = insn.bits(73, 1) != 0;
+                let scratch = if target == 6 { 5u32 } else { 6u32 };
                 if self.dest != 255
                     || source >= 254
-                    || source & 1 != 0
-                    || target >= 6
+                    || (wide && source & 1 != 0)
+                    || target == 7
                     || native_predicate != 7
                     || insn.words[1] != 0
-                    || (insn.words[2] & !0xe0000) != 0x200
+                    || (insn.words[2] & !0xe0200) != 0
                 {
                     return Err("native warp match mode");
                 }
-                self.save_predicate(1 << 6);
+                self.save_predicate(1 << scratch);
                 self.emit(0x50d8000000070000 | 250 | (7u64 << 39) | (7u64 << 45) | (1u64 << 48));
                 self.emit(0x5c10000000070000 | 251 | (250u64 << 8) | (255u64 << 20) | (1u64 << 49));
                 self.emit(0x5c40000000070000 | 250 | (250u64 << 8) | (251u64 << 20) | (7u64 << 48));
                 self.emit(0x5c30000000070000 | 250 | (250u64 << 20));
-                for word in 0..2u32 {
+                for word in 0..if wide { 2u32 } else { 1u32 } {
                     self.emit(
                         0xef10000000070000
                             | u64::from(251 + word)
@@ -4254,23 +4261,25 @@ impl InstructionLowering<'_> {
                 self.emit(
                     0x5b60000000070000
                         | 7
-                        | (6u64 << 3)
+                        | (u64::from(scratch) << 3)
                         | (u64::from(source) << 8)
                         | (251u64 << 20)
                         | (7u64 << 39)
                         | (2u64 << 49),
                 );
-                self.emit(
-                    0x5b60000000070000
-                        | 7
-                        | (6u64 << 3)
-                        | (u64::from(source + 1) << 8)
-                        | (252u64 << 20)
-                        | (6u64 << 39)
-                        | (2u64 << 49),
-                );
-                self.emit(0x50d8000000070000 | 255 | (6u64 << 39) | (u64::from(target) << 45));
-                self.restore_predicate(1 << 6);
+                if wide {
+                    self.emit(
+                        0x5b60000000070000
+                            | 7
+                            | (u64::from(scratch) << 3)
+                            | (u64::from(source + 1) << 8)
+                            | (252u64 << 20)
+                            | (u64::from(scratch) << 39)
+                            | (2u64 << 49),
+                    );
+                }
+                self.emit(0x50d8000000070000 | 255 | (u64::from(scratch) << 39) | (u64::from(target) << 45));
+                self.restore_predicate(1 << scratch);
             }
             0x3c4 => {
                 let source = insn.bits(24, 8);
@@ -4344,7 +4353,9 @@ impl InstructionLowering<'_> {
             }
             0xf8c => {
                 let stride = insn.bits(78, 2);
-                if self.dest != 255 || insn.words[1] != 0 || (insn.words[2] & !0xc000) != 0x0d00003f
+                let offset = insn.bits(40, 24);
+                if self.dest != 255 || insn.bits(32, 8) != 0 || offset & 3 != 0
+                    || (insn.words[2] & !0xc000) != 0x0d00003f
                 {
                     return Err("native shared increment mode");
                 }
@@ -4365,7 +4376,8 @@ impl InstructionLowering<'_> {
                         | self.predicate
                         | 255
                         | (u64::from(address) << 8)
-                        | (250u64 << 20),
+                        | (250u64 << 20)
+                        | (u64::from(offset >> 2) << 30),
                 );
             }
             0x38c => {
@@ -5401,12 +5413,18 @@ impl InstructionLowering<'_> {
                     if b.swizzle != 0 || b.absolute || b.reg >= 250 {
                         return Err("native half mixed-sign source mode");
                     }
+                    // Upstream H0_NH1 exchanges the halves and negates the new low half.
+                    self.emit(
+                        0x36f8000000000000 | self.predicate | 251
+                            | (u64::from(b.reg) << 8) | (16u64 << 20)
+                            | (u64::from(b.reg) << 39),
+                    );
                     self.emit(
                         0x0400000000000000
                             | self.predicate
                             | 251
-                            | (u64::from(b.reg) << 8)
-                            | (0x80000000u64 << 20)
+                            | (251u64 << 8)
+                            | (0x8000u64 << 20)
                             | (2u64 << 53),
                     );
                     b.reg = 251;
@@ -5913,6 +5931,120 @@ impl InstructionLowering<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_scalar_bit_controls_coordinate_and_metadata_partition() {
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        for scalar in [false, true] {
+            // 3D, explicit LOD, immediate offset: five words in total.
+            // Non-SCR: XYZ=A[0..3], LOD=B[0], offset=B[1].
+            // SCR: XYZ/LOD=A[0..4], offset=B[0].
+            let sample = Instruction { words: [0x08047b60,
+                20 | (2 << 22) | (2 << 29) | (u32::from(scalar) << 28),
+                255 | (15 << 8) | (1 << 12) | (7 << 17) | (3 << 23), 0] };
+            let lowered = lower_to_maxwell(&[sample, exit]);
+            assert!(lowered.is_valid(), "{}", lowered.error);
+            let start = lowered.source_instruction_offsets[0] as usize;
+            let words = &lowered.instructions[start..];
+            for (i, source) in [8, 9, 10, if scalar { 11 } else { 20 },
+                    if scalar { 20 } else { 21 }].into_iter().enumerate() {
+                assert_eq!((words[i] >> 20) & 255, source);
+            }
+        }
+    }
+
+    #[test]
+    fn half_fma_mixed_sign_exchanges_halves_before_negation() {
+        let native = Instruction { words: [0x04037231, 5, 6 | (1 << 22), 0] };
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        let lowered = lower_to_maxwell(&[native, exit]);
+        assert!(lowered.is_valid(), "{}", lowered.error);
+        let start = lowered.source_instruction_offsets[0] as usize;
+        let words = &lowered.instructions[start..];
+        // SHF.R with identical halves rotates B by 16 bits; LOP32I then
+        // flips bit15, the sign of the new low FP16 component, not bit31.
+        assert_eq!(words[0], 0x36f8000000000000 | (7 << 16) | 251
+            | (5 << 8) | (16 << 20) | (5 << 39));
+        assert_eq!(words[1], 0x0400000000000000 | (7 << 16) | 251
+            | (251 << 8) | (0x8000 << 20) | (2 << 53));
+        assert_eq!((words[2] >> 20) & 255, 251);
+    }
+
+    #[test]
+    fn shared_increment_preserves_address_displacement() {
+        use crate::frontend::translate::TranslatorVisitor;
+        use crate::ir::{basic_block::Block, opcodes::Opcode, program::Program, types::ShaderStage};
+
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        // Byte offsets become Maxwell's 22-bit word offsets. Preserve signed
+        // relative offsets and the unsigned absolute RZ form as raw bits.
+        for base in [10u32, 255] {
+            for stride in 0..4u32 {
+                for offset in [0, 4, 0x38, 0x7ffffc, 0x800000, 0xfffffc] {
+                    let native = Instruction { words: [0xff7f8c | (base << 24),
+                        offset << 8, 0x0d00003f | (stride << 14), 0] };
+                    let lowered = lower_to_maxwell(&[native, exit]);
+                    assert!(lowered.is_valid(), "{}", lowered.error);
+                    let words = &lowered.instructions[..lowered.source_instruction_offsets[1] as usize];
+                    let atomic = *words.iter().find(|&&w| w >> 52 == 0xec0).unwrap();
+                    assert_eq!((atomic >> 30) & 0x3fffff, u64::from(offset >> 2));
+                    assert_eq!((atomic >> 8) & 255,
+                        u64::from(if stride != 0 && base != 255 { 251 } else { base }));
+                    let mut program = Program::new(ShaderStage::Compute);
+                    program.blocks.push(Block::new());
+                    let mut visitor = TranslatorVisitor::new(&mut program, 0);
+                    for &word in words { visitor.translate_instruction(word); }
+                    assert_eq!(program.blocks[0].iter()
+                        .filter(|i| i.opcode == Opcode::SharedAtomicIAdd32).count(), 1);
+                }
+            }
+        }
+        for offset in [1u32, 2, 3, 0xffffff] {
+            let native = Instruction { words: [0x0aff7f8c, offset << 8, 0x0d00003f, 0] };
+            assert_eq!(lower_to_maxwell(&[native, exit]).error, "native shared increment mode");
+        }
+    }
+
+    #[test]
+    fn match_all_selects_one_or_two_source_words() {
+        use crate::frontend::translate::TranslatorVisitor;
+        use crate::ir::{basic_block::Block, opcodes::Opcode, program::Program, types::ShaderStage};
+
+        let exit = Instruction { words: [0x794d, 0, 0x03800000, 0] };
+        for (source, wide, target) in [(10u32, false, 0u32), (11, false, 0),
+                (10, true, 0), (10, false, 6), (11, false, 6), (10, true, 6)] {
+            let instruction = Instruction {
+                words: [0x73a1 | (255 << 16) | (source << 24), 0,
+                        (u32::from(wide) << 9) | (target << 17), 0],
+            };
+            let lowered = lower_to_maxwell(&[instruction, exit]);
+            assert!(lowered.is_valid(), "{}", lowered.error);
+            let words = &lowered.instructions[..lowered.source_instruction_offsets[1] as usize];
+            let shuffles: Vec<_> = words.iter().copied()
+                .filter(|word| (word >> 48) & 0xfff8 == 0xef10).collect();
+            assert_eq!(shuffles.len(), if wide { 2 } else { 1 });
+            assert_eq!((shuffles[0] >> 8) & 255, u64::from(source));
+            if wide {
+                assert_eq!((shuffles[1] >> 8) & 255, u64::from(source + 1));
+            }
+            let scratch = if target == 6 { 5u64 } else { 6u64 };
+            assert!(words.contains(&(0x50d8000000070000 | 255 | (scratch << 39)
+                | (u64::from(target) << 45))));
+            let mut program = Program::new(ShaderStage::Compute);
+            program.blocks.push(Block::new());
+            let mut visitor = TranslatorVisitor::new(&mut program, 0);
+            for &word in words { visitor.translate_instruction(word); }
+            assert_eq!(program.blocks[0].iter().filter(|i| i.opcode == Opcode::ShuffleIndex).count(), shuffles.len());
+            assert!(program.blocks[0].iter().any(|i| i.opcode == Opcode::VoteAll));
+        }
+        // ANY, a returned mask and predicated execution are not silently
+        // accepted by this predicate-only ALL expansion.
+        for (word, bits) in [(2, 1 << 15), (0, 1 << 16), (0, 1 << 12)] {
+            let mut instruction = Instruction { words: [0x0aff73a1, 0, 0, 0] };
+            instruction.words[word] ^= bits;
+            assert!(!lower_to_maxwell(&[instruction, exit]).is_valid());
+        }
+    }
 
     #[test]
     fn depth_gather_preserves_xy_comparison_and_split_destinations() {
@@ -6675,6 +6807,23 @@ mod tests {
                 .map(|v| v.parse().unwrap())
                 .collect();
             let actual = lower_to_maxwell(&code);
+            // The frozen C++ oracle rejected B32 MATCH.ALL. Keep that oracle
+            // unchanged; validate the explicit extension separately instead of
+            // claiming its output is upstream-identical.
+            if fields[2] == "native warp match mode" && actual.is_valid() {
+                assert_match_all_extension(code[0], &actual.instructions);
+                assert_eq!(actual.source_size, (code.len() * 16) as u32);
+                assert_eq!(actual.source_instruction_offsets.len(), code.len());
+                count += 1;
+                continue;
+            }
+            if fields[2] == "native shared increment mode" && actual.is_valid() {
+                assert_shared_increment_extension(code[0], &actual.instructions);
+                assert_eq!(actual.source_size, (code.len() * 16) as u32);
+                assert_eq!(actual.source_instruction_offsets.len(), code.len());
+                count += 1;
+                continue;
+            }
             // The frozen original oracle predates these two extensions. Its
             // all-zero operand probes are still rejected, now with the specific
             // mode error. Keep the original fixture and all metadata checks.
@@ -6793,6 +6942,42 @@ mod tests {
             if mode == "stub" { "emulate" } else { "stub" },
         );
         check_fixture(fixture, 165);
+    }
+
+    fn assert_match_all_extension(insn: Instruction, emitted: &[u64]) {
+        assert_eq!(insn.bits(0, 12), 0x3a1);
+        let wide = insn.bits(73, 1) != 0;
+        assert!(!wide || insn.bits(81, 3) == 6);
+        let scratch = if insn.bits(81, 3) == 6 { 5u64 } else { 6u64 };
+        assert_eq!(insn.bits(79, 1), 0);
+        assert_eq!(insn.bits(16, 8), 255);
+        assert_eq!(insn.bits(12, 4), 7);
+        let shuffles: Vec<_> = emitted.iter().copied()
+            .filter(|word| (word >> 48) & 0xfff8 == 0xef10).collect();
+        assert_eq!(shuffles.len(), if wide { 2 } else { 1 });
+        assert_eq!((shuffles[0] >> 8) & 255, u64::from(insn.bits(24, 8)));
+        let comparisons: Vec<_> = emitted.iter().copied()
+            .filter(|word| (word >> 48) & 0xfff0 == 0x5b60).collect();
+        assert_eq!(comparisons.len(), if wide { 2 } else { 1 });
+        assert_eq!((comparisons[0] >> 8) & 255, u64::from(insn.bits(24, 8)));
+        assert!(emitted.contains(&(0x50d8000000070000 | 255 | (scratch << 39)
+            | (u64::from(insn.bits(81, 3)) << 45))));
+    }
+
+    fn assert_shared_increment_extension(insn: Instruction, emitted: &[u64]) {
+        assert_eq!(insn.bits(0, 12), 0xf8c);
+        assert_eq!(insn.bits(16, 8), 255);
+        assert_eq!(insn.bits(32, 8), 0);
+        assert_eq!(insn.words[2] & !0xc000, 0x0d00003f);
+        let offset = insn.bits(40, 24);
+        assert_ne!(offset, 0);
+        assert_eq!(offset & 3, 0);
+        let base = insn.bits(24, 8);
+        let address = if base != 255 && insn.bits(78, 2) != 0 { 251 } else { base };
+        let expected = 0xec00000000000000 | (u64::from(insn.bits(12, 4)) << 16)
+            | 255 | (u64::from(address) << 8) | (250u64 << 20)
+            | (u64::from(offset >> 2) << 30);
+        assert!(emitted.contains(&expected));
     }
 
     fn check_fixture(fixture: &str, expected_count: usize) {
@@ -7114,6 +7299,18 @@ mod tests {
             };
             // UPOPC was absent in the frozen original scanner. Its new arm
             // requires the uniform bank; retain all other original assertions.
+            if input[0] == 12 && columns[2] == "native warp match mode" && value == 1 {
+                assert_match_all_extension(insn, lowering.instructions);
+                assert_eq!(lowering.operand_error, "");
+                count += 1;
+                continue;
+            }
+            if input[0] == 12 && columns[2] == "native shared increment mode" && value == 1 {
+                assert_shared_increment_extension(insn, lowering.instructions);
+                assert_eq!(lowering.operand_error, "");
+                count += 1;
+                continue;
+            }
             let expected_value = if input[0] == 10 && insn.bits(0, 12) == 0x2bf {
                 1
             } else {

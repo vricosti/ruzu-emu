@@ -3,6 +3,7 @@
 //! Raw-session helpers, nvsrv, syncpt, GPU, VI and video counterparts. GSV factory is pending.
 
 use super::kernel_helpers::ServiceContext;
+use super::nx2_video_input_queue::{Input as VideoInput, Nx2VideoInputQueue};
 use super::service::build_handler_map;
 use crate::core::SystemRef;
 use std::collections::BTreeMap;
@@ -1627,11 +1628,6 @@ fn nx2_first_video_command(service: &str, command: u32) -> bool {
         std::sync::LazyLock::new(|| Mutex::new(std::collections::BTreeSet::new()));
     SEEN.lock().unwrap().insert((service.to_owned(), command))
 }
-struct VideoInput {
-    data: Vec<u8>,
-    pts: u64,
-    end: bool,
-}
 struct VideoDecoded {
     picture: Option<crate::host1x_core::Nx2Picture>,
     pts: u64,
@@ -1661,7 +1657,8 @@ struct VideoState {
     frames_out: u64,
     syncpoint: u32,
     sync_base: u32,
-    inputs: std::collections::VecDeque<VideoInput>,
+    inputs: Nx2VideoInputQueue,
+    end_queued: bool,
     decoded: std::collections::VecDeque<VideoDecoded>,
     free: std::collections::VecDeque<u32>,
     release_fences: BTreeMap<u32, VideoFence>,
@@ -1695,7 +1692,6 @@ pub struct INx2VideoSession {
 }
 impl INx2VideoSession {
     const NO_SYNCPOINT: u32 = u32::MAX;
-    const MAX_QUEUED_INPUTS: usize = 8;
     const MAX_DECODED_AHEAD: usize = 2;
     const HOST_SYNCPOINTS: u32 = 192;
 
@@ -1745,6 +1741,7 @@ impl INx2VideoSession {
                     syncpoint: Self::NO_SYNCPOINT,
                     sync_base: 0,
                     inputs: Default::default(),
+                    end_queued: false,
                     decoded: Default::default(),
                     free: Default::default(),
                     release_fences: Default::default(),
@@ -1966,9 +1963,15 @@ impl INx2VideoSession {
         };
         {
             let mut state = this.shared.state.lock().unwrap();
-            state.inputs.push_back(VideoInput { data, pts, end });
+            if !state.inputs.submit(VideoInput { data, pts, end }) {
+                let busy = ResultCode::from_module_description(
+                    crate::hle::result::ErrorModule::HwOpus, 3603);
+                ResponseBuilder::new(ctx, 2, 0, 0).push_u32(busy.0);
+                return;
+            }
+            state.end_queued |= end;
             this.ready.room.store(
-                state.inputs.len() < Self::MAX_QUEUED_INPUTS,
+                !state.end_queued && state.inputs.below_ready_watermark(),
                 Ordering::Relaxed,
             );
         }
@@ -1993,6 +1996,7 @@ impl INx2VideoSession {
         {
             let mut state = this.shared.state.lock().unwrap();
             state.inputs.clear();
+            state.end_queued = false;
             state.flush = true;
             this.ready.room.store(true, Ordering::Relaxed);
         }
@@ -2045,7 +2049,7 @@ impl INx2VideoSession {
             while !(state.quit
                 || state.flush
                 || (!state.decoded.is_empty() && !state.free.is_empty())
-                || (!state.inputs.is_empty() && state.decoded.len() < Self::MAX_DECODED_AHEAD))
+                || (!state.inputs.empty() && state.decoded.len() < Self::MAX_DECODED_AHEAD))
             {
                 state = shared.cv.wait(state).unwrap();
             }
@@ -2108,9 +2112,9 @@ impl INx2VideoSession {
                 }
                 continue;
             }
-            let input = state.inputs.pop_front().unwrap();
+            let input = state.inputs.pop();
             ready.room.store(
-                state.inputs.len() < Self::MAX_QUEUED_INPUTS,
+                !state.end_queued && state.inputs.below_ready_watermark(),
                 Ordering::Relaxed,
             );
             let codec = state.codec.clone();
@@ -4021,6 +4025,32 @@ mod tests {
     }
 
     #[test]
+    fn video_submit_backpressure_does_not_advance_submission_id() {
+        let _scope = ScopedKernelForTest::without_kernel();
+        let service = INx2VideoSession::new(
+            SystemRef::null(),
+            Arc::new(Mutex::new(Nx2NativeObjects::default())),
+            "nx2:vdec-test",
+        );
+        for n in 0..Nx2VideoInputQueue::REFUSE_AT {
+            let response = video_request(&service, 109, &[0, 0, 0, n as u32, 0, 0]);
+            assert_eq!(response.command_buffer()[2], 0);
+        }
+        let response = video_request(&service, 109, &[0, 0, 0, 24, 0, 0]);
+        assert_eq!(response.command_buffer()[2],
+            ResultCode::from_module_description(crate::hle::result::ErrorModule::HwOpus, 3603).0);
+        assert_eq!(service.control.lock().unwrap().submitted, 24);
+        assert!(!service.ready.room.load(Ordering::Relaxed));
+        // End-of-stream is accepted even when the queue is full.
+        let response = video_request(&service, 109, &[0, 0, 0, 25, 0, 1]);
+        assert_eq!(&response.command_buffer()[2..5], &[0, 25, 0]);
+        assert!(!service.ready.room.load(Ordering::Relaxed));
+        video_request(&service, 8, &[]);
+        assert!(service.ready.room.load(Ordering::Relaxed));
+        assert!(!service.shared.state.lock().unwrap().end_queued);
+    }
+
+    #[test]
     fn video_queue_pressure_flush_preserves_image_ring_and_completed_outputs() {
         let _scope = ScopedKernelForTest::without_kernel();
         let service = INx2VideoSession::new(
@@ -4035,8 +4065,9 @@ mod tests {
         }
         {
             let mut state = service.shared.state.lock().unwrap();
-            assert_eq!(state.inputs[0].pts, 0xabcdef0112345678);
-            assert!(!state.inputs[0].end); // Only the low byte counts.
+            let input = state.inputs.pop();
+            assert_eq!(input.pts, 0xabcdef0112345678);
+            assert!(!input.end); // Only the low byte counts.
             state.free.extend([4, 5, 4]);
             state.release_fences.insert(
                 4,
@@ -4061,7 +4092,7 @@ mod tests {
         video_request(&service, 8, &[]);
         {
             let state = service.shared.state.lock().unwrap();
-            assert!(state.inputs.is_empty() && state.flush);
+            assert!(state.inputs.empty() && state.flush);
             assert_eq!(state.decoded.len(), 1); // Worker, not IPC flush, clears these.
             assert_eq!(state.free.iter().copied().collect::<Vec<_>>(), [4, 5, 4]);
             assert_eq!(state.outputs.len(), 1);

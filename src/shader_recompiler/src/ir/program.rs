@@ -104,6 +104,7 @@ impl ShaderInfoExt for ShaderInfo {
         {
             self.texture_descriptors
                 .push(shader_info::TextureDescriptor {
+                    handle_program: u32::MAX,
                     texture_type,
                     is_depth,
                     is_multisample: false,

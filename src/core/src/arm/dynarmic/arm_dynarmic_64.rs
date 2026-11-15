@@ -154,6 +154,9 @@ fn upstream_optimization_config(
             unsafe_optimizations = true;
             flags |= OptimizationFlag::UNSAFE_UNFUSE_FMA;
             fastmem_address_space_bits = 64;
+            // Eden arm_dynarmic_64.cpp:343-348 (Auto): restored upstream by Eden 421e0b834c,
+            // revert of #3846 ("kills performance on default setting").
+            flags |= OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
         }
         CpuAccuracy::Paranoid => {
             flags = OptimizationFlag::NO_OPTIMIZATIONS;
@@ -3180,7 +3183,7 @@ mod tests {
         assert!(auto_unsafe);
         assert_eq!(auto_fastmem_bits, 64);
         assert!(auto_flags.contains(OptimizationFlag::UNSAFE_UNFUSE_FMA));
-        assert!(!auto_flags.contains(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
+        assert!(auto_flags.contains(OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR));
         assert!(!auto_flags.contains(OptimizationFlag::UNSAFE_REDUCED_ERROR_FP));
         assert!(!auto_flags.contains(OptimizationFlag::UNSAFE_INACCURATE_NAN));
 
@@ -3235,7 +3238,8 @@ mod tests {
                     (
                         CpuAccuracy::Auto,
                         OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
-                            | OptimizationFlag::UNSAFE_UNFUSE_FMA,
+                            | OptimizationFlag::UNSAFE_UNFUSE_FMA
+                            | OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR,
                         true,
                         64,
                     ),

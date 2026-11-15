@@ -50,6 +50,28 @@
 - Not ported: `QueryDma::HasPendingQueries`, `HoldsReports`, `Trace`/`TraceEnabled`
   (EDEN_NX2_QUERY_DMA_TRACE), `GpuSplit::WaitForWrites` and Lichii's `page_filter` early-out in
   `SemiFlushRegion`.
+## 2026-11-15 — rdynarmic backend/x64/emit_exclusive_memory.rs + core/arm/dynarmic/arm_dynarmic_{32,64}.rs vs Eden dynarmic backend/x64/emit_x64_memory.h and core/arm/dynarmic/arm_dynarmic_{32,64}.cpp
+
+### Ported (restores Eden behavior)
+- `emit_exclusive_lock`, `emit_exclusive_unlock` and `emit_exclusive_test_and_clear` emit nothing
+  when `OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR` is enabled, as upstream
+  `EmitExclusiveLock` / `EmitExclusiveUnlock` / `EmitExclusiveTestAndClear` do
+  (emit_x64_memory.h:381-418). The x64 backend ignored the flag: every inline exclusive load and
+  store (LDXR/STXR, and the LSE CAS/LDADD/SWP... that the frontend builds from them) took the
+  global monitor spin lock and invalidated the other cores' reservations even when the flag was
+  set. The A32 and A64 inline paths share the helpers.
+- `CpuAccuracy::Auto` sets `Unsafe_IgnoreGlobalMonitor` again for A64 and A32
+  (arm_dynarmic_64.cpp:343-348, arm_dynarmic_32.cpp:291-297). Eden dropped it in #3846
+  (3a823de605) and restored it in 421e0b834c ("kills performance on default setting"); ruzu had
+  synced the removal but not the revert.
+- Measured on the NX2 title used for measurement (Auto accuracy, dense scene, 6 guest cores): the
+  inline 32-bit CAS block shrinks by 108 bytes (no `xchg` spin loop, no `mfence` unlock, no
+  three-core test-and-clear); CPUCore_0 CPU per frame 22.7 ms -> 15.4 ms, process CPU 458 % ->
+  347 %, fps unchanged (GPU-bound).
+
+### Intentional differences
+- None. The helpers keep their `bool` return (whether a lock was emitted) so callers pair lock and
+  unlock; upstream returns `void` and relies on both checking the same flag.
 
 ## 2026-11-15 — core/hle/service/service.rs `report_unimplemented_function` vs Lichii core/hle/service/service.cpp `ServiceFrameworkBase::ReportUnimplementedFunction`
 

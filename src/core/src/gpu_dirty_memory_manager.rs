@@ -151,28 +151,62 @@ impl GpuDirtyMemoryManager {
         }
 
         for transform in front_buffer.iter() {
-            let mut offset: usize = 0;
-            let mut mask = transform.mask as u64;
-
-            while mask != 0 {
-                let empty_bits = mask.trailing_zeros() as usize;
-                offset += empty_bits << ALIGN_BITS;
-                mask >>= empty_bits;
-
-                let continuous_bits = (!mask).trailing_zeros() as usize;
-                let phys_addr = ((transform.address as u64) << PAGE_BITS) + offset as u64;
-                callback(phys_addr, continuous_bits << ALIGN_BITS);
-
-                if continuous_bits < ALIGN_SIZE {
-                    mask >>= continuous_bits;
-                } else {
-                    mask = 0;
-                }
-                offset += continuous_bits << ALIGN_BITS;
-            }
+            Self::for_each_run(transform, callback);
         }
 
         front_buffer.clear();
+    }
+
+    /// Calls `callback` for each write collected and not yet applied, without
+    /// consuming them: those still collecting and those a `gather` is handing
+    /// out.
+    ///
+    /// Lichii `GPUDirtyMemoryManager::ForEachPending`
+    /// (`src/core/gpu_dirty_memory_manager.h:46-62`). The `front_buffer`
+    /// mutex is the Rust counterpart of Lichii's `gather_guard` (see
+    /// `gather`), taken before `back_buffer` (`guard`) as there.
+    pub fn for_each_pending(&self, callback: &mut dyn FnMut(u64, usize)) {
+        let pending = {
+            let front_buffer = self.front_buffer.lock().unwrap();
+            let back_buffer = self.back_buffer.lock().unwrap();
+            let mut pending = back_buffer.clone();
+            pending.extend(front_buffer.iter().copied());
+            let t = TransformAddress::from_u64(self.current.load(Ordering::Acquire));
+            if Self::is_valid(t.address as u64) {
+                pending.push(t);
+            }
+            pending
+        };
+        for transform in &pending {
+            Self::for_each_run(transform, callback);
+        }
+    }
+
+    /// The runs of 64-byte blocks a transform's mask holds.
+    ///
+    /// Lichii `GPUDirtyMemoryManager::ForEachRun`
+    /// (`gpu_dirty_memory_manager.h:159-172`); the loop body is the one
+    /// `gather` had inline (Eden `Gather`).
+    fn for_each_run(transform: &TransformAddress, callback: &mut dyn FnMut(u64, usize)) {
+        let mut offset: usize = 0;
+        let mut mask = transform.mask as u64;
+
+        while mask != 0 {
+            let empty_bits = mask.trailing_zeros() as usize;
+            offset += empty_bits << ALIGN_BITS;
+            mask >>= empty_bits;
+
+            let continuous_bits = (!mask).trailing_zeros() as usize;
+            let phys_addr = ((transform.address as u64) << PAGE_BITS) + offset as u64;
+            callback(phys_addr, continuous_bits << ALIGN_BITS);
+
+            if continuous_bits < ALIGN_SIZE {
+                mask >>= continuous_bits;
+            } else {
+                mask = 0;
+            }
+            offset += continuous_bits << ALIGN_BITS;
+        }
     }
 
     // --- Private helpers ---
@@ -250,6 +284,26 @@ mod tests {
         let current = TransformAddress::from_u64(mgr.current.load(Ordering::Relaxed));
         assert_eq!(current.address, !0u32);
         assert_eq!(current.mask, 0);
+    }
+
+    #[test]
+    fn for_each_pending_reports_collected_writes_without_consuming_them() {
+        let mgr = GpuDirtyMemoryManager::new();
+        mgr.collect(0x1_0040, 0x40); // pushed to back_buffer by the next page
+        mgr.collect(0x2_0080, 0x80); // still in `current`
+        let mut pending = Vec::new();
+        mgr.for_each_pending(&mut |address, size| pending.push((address, size)));
+        pending.sort_unstable();
+        assert_eq!(pending, vec![(0x1_0040, 0x40), (0x2_0080, 0x80)]);
+
+        let mut gathered = Vec::new();
+        mgr.gather(&mut |address, size| gathered.push((address, size)));
+        gathered.sort_unstable();
+        assert_eq!(gathered, pending);
+
+        let mut after = Vec::new();
+        mgr.for_each_pending(&mut |address, size| after.push((address, size)));
+        assert!(after.is_empty());
     }
 
     #[test]

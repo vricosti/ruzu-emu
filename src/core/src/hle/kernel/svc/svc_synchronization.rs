@@ -16,6 +16,25 @@ fn should_trace_wait_sync() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_WAIT_SYNC").is_some())
 }
 
+// Rust diagnostic switches, read once like should_trace_wait_sync: a getenv on
+// every WaitSynchronization walks the whole environment on the guest hot path.
+fn should_trace_waitsync_handles() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_TRACE_WAITSYNC").is_some())
+}
+
+fn trace_waitsync_tids() -> Option<&'static [u64]> {
+    static TIDS: std::sync::OnceLock<Option<Vec<u64>>> = std::sync::OnceLock::new();
+    TIDS.get_or_init(|| {
+        std::env::var("RUZU_TRACE_WAITSYNC_TID").ok().map(|spec| {
+            spec.split(',')
+                .filter_map(|part| part.trim().parse::<u64>().ok())
+                .collect()
+        })
+    })
+    .as_deref()
+}
+
 fn trace_wait_sync_record(
     stage: u64,
     current_thread_id: u64,
@@ -122,7 +141,7 @@ pub fn wait_synchronization(
     // Env-gated: log every WaitSync's actual handle values + caller tid.
     // Useful for identifying wedge-targeted handles (e.g. tid=73 polling
     // handle 0x000D01E8 with timeout=0).
-    if std::env::var_os("RUZU_TRACE_WAITSYNC").is_some() && num_handles > 0 {
+    if should_trace_waitsync_handles() && num_handles > 0 {
         let tid = system.current_thread_id().unwrap_or(0);
         // Quick peek: read first handle without holding any lock.
         let process_arc = system.current_process_arc();
@@ -243,14 +262,8 @@ pub fn wait_synchronization(
     }
     // Narrow diagnostic for wait wedges. Set RUZU_TRACE_WAITSYNC_TID to a
     // comma-separated tid list after identifying the target with SIGUSR1.
-    let trace_this_tid = std::env::var("RUZU_TRACE_WAITSYNC_TID")
-        .ok()
-        .map(|spec| {
-            spec.split(',')
-                .filter_map(|part| part.trim().parse::<u64>().ok())
-                .any(|tid| tid == current_thread_id)
-        })
-        .unwrap_or(false);
+    let trace_this_tid = trace_waitsync_tids()
+        .is_some_and(|tids| tids.contains(&current_thread_id));
     if trace_this_tid {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static TRACE_TID_COUNT: AtomicUsize = AtomicUsize::new(0);

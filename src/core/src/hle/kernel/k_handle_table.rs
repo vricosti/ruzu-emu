@@ -6,6 +6,13 @@
 
 use super::svc_common::Handle;
 
+/// Rust diagnostic switch `RUZU_HANDLE_MISS_TRACE`, read once: lookups of
+/// pseudo or stale handles are frequent on the guest WaitSynchronization path.
+fn handle_miss_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUZU_HANDLE_MISS_TRACE").is_some())
+}
+
 /// Maximum table size.
 pub const MAX_TABLE_SIZE: usize = 1024;
 
@@ -219,7 +226,7 @@ impl KHandleTable {
             // Useful to surface lookups where the value is architecturally
             // invalid (e.g., 0x1 → linear_id=0 → reserved=0 but linear_id=0
             // also fails is_valid_handle).
-            if std::env::var_os("RUZU_HANDLE_MISS_TRACE").is_some() {
+            if handle_miss_trace_enabled() {
                 eprintln!(
                     "[HANDLE_MISS] handle=0x{:08X} reserved={} (architecturally invalid)",
                     handle, reserved
@@ -235,7 +242,7 @@ impl KHandleTable {
             // surfacing here because libnx parsed `0x1` from an IPC reply
             // slot that should have contained a handle but actually held a
             // domain object ID or raw payload byte.
-            if std::env::var_os("RUZU_HANDLE_MISS_TRACE").is_some() {
+            if handle_miss_trace_enabled() {
                 let stored_obj = if (index as usize) < self.objects.len() {
                     self.objects[index as usize]
                 } else {

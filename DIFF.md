@@ -1,5 +1,103 @@
 # Upstream parity notes
 
+## 2026-11-15 — async read-back of GPU-written buffer memory: video_core/{gpu,rasterizer_interface,rasterizer_download_area,memory_manager,buffer_cache/{buffer_cache,buffer_cache_base},query_cache/query_cache_base,renderer_vulkan/{vk_rasterizer,buffer_cache,query_cache,renderer_vulkan},renderer_base}.rs and core/{gpu_core,gpu_dirty_memory_manager,memory/memory}.rs vs Lichii video_core/{gpu.cpp,rasterizer_interface.h,rasterizer_download_area.h,memory_manager.cpp,buffer_cache/buffer_cache{.h,_base.h},query_cache/query_cache.h,renderer_vulkan/vk_{rasterizer,buffer_cache,query_cache}.cpp} and core/{gpu_dirty_memory_manager.h,memory.cpp}
+
+Divergence from Eden accepted by the user on 2026-11-14 for `on_cpu_read`: asynchronous
+read-back of GPU-written buffer memory, from Lichii 0b83798bf6 (#1028, "async read-back: the
+reading thread waits for its downloads", port of #805), with its `cpu_read_ranges` and early
+downloads. Eden's `GPU::OnCPURead` has the GPU thread flush the region and
+`BufferCache::DownloadBufferMemory` call `runtime.Finish()`: one host GPU wait on the GPU thread
+per guest read of GPU-written memory. On the NX2 title used for measurement that was ~42 such
+flushes per frame, one page each, the same ~40 pages read every frame or every other frame. Not
+conditioned on a title, a setting or a switch: Lichii made it the only path ("always use async
+read-back, drop EDEN_NX2_ASYNC_READBACK").
+
+### Ported (Lichii extensions, absent from Eden)
+- `Gpu::on_cpu_read` (gpu.cpp:316-352): unless the area is `in_flight`, the GPU thread runs
+  `invalidate_gpu_cache` then `flush_region_for_read` in a sync operation; the reading thread
+  then calls `finish_read` itself. `RasterizerDownloadArea::in_flight`
+  (rasterizer_download_area.h:20-23).
+- `RasterizerInterface::flush_region_for_read` (default: `flush_region`), `finish_read`,
+  `note_report_pending`/`finish_report` (rasterizer_interface.h:115-133). Only Vulkan overrides
+  them (vk_rasterizer.cpp:2741-2776), as in Lichii: textures and queries still flush
+  synchronously, buffers go through `BufferCache::download_memory_for_read`.
+- Buffer cache read downloads (buffer_cache.h:574-1242, buffer_cache_base.h:288-345,
+  1121-1171): `ReadDownload`, `read_downloads`, `read_download_ranges`,
+  `download_memory_for_read`, `record_read_download`, `finish_read_downloads`,
+  `write_read_downloads`, `write_completed_read_downloads`, `write_finished_read_downloads`,
+  `read_downloads_cover`, `outdate_read_downloads` (from `mark_written_buffer` and the Vulkan
+  query cache's `SyncValues` copies), `pending_cpu_write_ranges`, `write_downloaded_memory`,
+  `G_READ_DOWNLOADS` and its decrement on drop. `get_flush_area` reports `in_flight`;
+  `tick_frame` and `pop_async_buffers` land completed downloads first.
+- `cpu_read_ranges`/`download_cpu_read_ranges` (buffer_cache.h:416-422, 436-460, 574-590, 4147):
+  an area a guest read found GPU-written (read-trap mode) is remembered, and the next download
+  (`download_memory` through `download_ranges_memory`, or `download_memory_for_read`) takes the
+  GPU-modified bytes of every remembered range too. `download_ranges_memory` ports
+  `DownloadRangesMemory` (buffer_cache.h:462-570).
+- Early downloads (buffer_cache.h:890-1012, buffer_cache_base.h:1138-1171): `ReadBackPage`,
+  `note_read_back` (learned in `get_flush_area`), `note_read_back_write` (from
+  `mark_written_buffer` and `dma_copy`), `record_early_downloads` (from `tick_frame`,
+  `download_memory_for_read` and `note_work_recorded`), `note_work_recorded` (after each draw
+  and dispatch, vk_rasterizer.cpp:1309, 2482, 2545), `may_be_read_back_page`,
+  `note_report_pending`/`finish_report` and the rewritten pending reports in
+  `write_read_downloads`; the query cache notes deferred results (query_cache.h:288-332). Same
+  constants: 2 reads, 4 unread writes, 64 pages, 1 MiB and 32 pending downloads.
+- `ClearDownload` split (buffer_cache.h:1405-1442): `clear_download` lands the read downloads over
+  the range first, `clear_replaced_download` only cuts them, Eden's body is
+  `clear_fence_downloads`.
+- Vulkan runtime `submit_for_host_read`, `queue_for_host_read`, `wait_for_host_read`,
+  `is_free_now` and `host_read_barrier` (vk_buffer_cache.cpp:31-40, 519-558).
+- Query results land the read downloads under them first (`QueryCacheBase::finish_reads`,
+  query_cache.h:360, 403-404, 706-707, 739-750).
+- Pending guest CPU writes: `Gpu::invalidate_gpu_cache` gathers, publishes in `applying_writes`
+  and then applies (gpu.cpp:143-166); `Gpu::for_each_pending_cpu_write` (gpu.cpp:169-180) feeds
+  `BufferCache::set_pending_cpu_writes` (vk_rasterizer.cpp:468-471) through
+  `RendererBase::set_pending_cpu_writes`; `GpuDirtyMemoryManager::for_each_pending`/`for_each_run`
+  (gpu_dirty_memory_manager.h:46-62, 159-172).
+- `DownloadLanding` (rasterizer_download_area.h:44-116) and its `r#await` after each collected
+  guest write (core/memory.cpp:991-993).
+
+### Intentional differences
+- Memory manager writes (`MemoryManager::finish_reads_before`, memory_manager.cpp:338-350,
+  550-596) call `RasterizerInterface::supersede_read_downloads` instead of Lichii's
+  `FinishRead`. It takes no buffer cache lock: it publishes the write (`superseding_writes`, with
+  the count of read downloads recorded so far) and waits for a landing under way over it
+  (`DownloadLanding::r#await`), as a collected guest CPU write does. The next landing applies
+  it: the downloads recorded before the write stop writing those bytes (`write_ranges`) but still
+  clean them (`clean_ranges`), which leaves guest memory and the GPU-modified ranges as landing
+  then writing does. Reason: ruzu's memory manager writes run under its `ParkingLotMutex`
+  (Lichii's memory manager has no lock). With the faithful call, the load of the measured scene
+  deadlocked in every run tried (4); stacks taken in the hung process: the fencing thread held that
+  mutex in `renderer_vulkan::query_cache::write_query_result` →
+  `MemoryManager::write_block_unsafe` → `finish_reads_before` and waited for the buffer cache's
+  lock, while the GPU thread held the buffer and texture caches' locks in `prepare_draw` and waited
+  for the memory manager's mutex in `TextureCacheBase::find_image_view_with_gpu_to_cpu`.
+  `clear_download` and `QueryCacheBase::finish_reads` (written through device memory, no memory
+  manager lock) land as in Lichii.
+- `queue_for_host_read` always submits: ruzu's scheduler has no `Scheduler::DeferFlush`
+  (Lichii batches only on its GPU split's back thread).
+- Not ported: the EDEN_NX2_READ_CHECK verification (`EarlyDownloadServes`, `NoteEarlyLanded`,
+  `early_landed`), the GPU split's macro DMA read changes (`FrontDmaRead`,
+  `GpuSplit::WaitForWrites`, `HoldsQueries`), `PrepareRegionWrite` (absent from ruzu), the
+  `AsyncReadback` counters and the sampled "CPU read of GPU-written memory" log line.
+- `DownloadLanding` lives in `core::gpu_core` (re-exported by
+  `video_core::rasterizer_download_area`): `core` cannot depend on `video_core`.
+- `may_hold_gpu_writes` is always true: ruzu has no `Nx2MayBeGpuWritten` page filter.
+- `cached_write_memory` (ruzu's path for gathered guest writes, where Lichii uses
+  `ClaimCpuWrites`) cuts read downloads with `clear_replaced_download` first, as `ClaimCpuWrites`
+  does.
+- `download_ranges_memory` copies everything through the staging buffer: ruzu's buffers have no
+  persistent mapping (Lichii `Buffer::Mapped`).
+- Eden's fence downloads (`pop_async_buffers`) and the per-buffer synchronous downloads keep
+  writing guest memory without a `DownloadLanding` or the pending-write exclusion.
+- `wait_for_host_read` waits on the master semaphore for a submitted tick (any thread) and falls
+  back to `Scheduler::wait` otherwise.
+- Runtimes other than Vulkan never record read downloads: their `submit_for_host_read`,
+  `queue_for_host_read`, `wait_for_host_read` and `is_free_now` are `unreachable!` trait defaults
+  (Lichii's are Vulkan-only members behind `if constexpr (!IS_OPENGL)`).
+- `note_work_recorded(false)` runs just before the draw command is recorded (Lichii: just after):
+  it only lands completed early downloads, and ruzu's draw recording has several early returns.
+
 ## 2026-11-15 — draw preparation cost: video_core/renderer_vulkan/{graphics_pipeline,vk_rasterizer,pipeline_cache}.rs and video_core/memory_manager.rs vs Eden/Lichii vk_graphics_pipeline.cpp, vk_rasterizer.cpp, memory_manager.{h,cpp}
 
 ### Realigned on Eden

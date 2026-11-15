@@ -2532,14 +2532,17 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         let segments: SmallVec<[MultiRangeSegment; 8]> =
             pool[first..first + count].iter().copied().collect();
+        if !super::multi_range_refresh::multi_range_segments_live(&segments, |id| {
+            self.slot_buffers.contains(id)
+        }) {
+            return false;
+        }
         let as_id = self.gpu_memory.as_deref().map_or(0, GpuMemoryAccess::get_id);
         let key = ((as_id as u64) << 48) ^ binding.gpu_addr;
         self.runtime.reset_multi_range();
         for segment in &segments {
             self.touch_buffer(segment.buffer_id);
-            if self.synchronize_buffer(segment.buffer_id, segment.device_addr, segment.size) {
-                self.runtime.invalidate_multi_range(key);
-            }
+            self.synchronize_buffer(segment.buffer_id, segment.device_addr, segment.size);
             let offset = self.slot_buffers[segment.buffer_id].offset(segment.device_addr);
             self.slot_buffers[segment.buffer_id].mark_usage(offset as u64, segment.size as u64);
             if is_written && write_mark_limit != 0 {
@@ -2553,7 +2556,37 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 segment.size,
             );
         }
+        // Upstream `BindFreshMultiRangeStorage` (multi_range_refresh.h): submission ticks are not
+        // content versions (several writes can share a tick, and graphics writes do not update
+        // it). Sparse aliases need no copy; gathered fallbacks must be refreshed for every bind.
+        self.runtime.invalidate_multi_range(key);
         self.runtime.bind_multi_range_storage_buffer(key, is_written)
+    }
+
+    /// Upstream `BufferCache<P>::RefreshMultiRangeSegments`.
+    fn refresh_multi_range_segments(&mut self, compute: bool) {
+        if !self.runtime.supports_multi_range_storage() {
+            return;
+        }
+        let mut pool = if compute {
+            std::mem::take(&mut self.compute_segments)
+        } else {
+            std::mem::take(&mut self.graphics_segments)
+        };
+        let prefer_sparse = self.runtime.prefers_sparse_sources();
+        // The buffer lookups below may merge buffers: a deleted buffer leaves the pool taken out
+        // here, so liveness is checked against the slots again on every pass.
+        super::multi_range_refresh::refresh_multi_range_segments(
+            &mut pool,
+            self,
+            |cache, id| cache.slot_buffers.contains(id),
+            |cache, address, size| cache.find_buffer(address, size, prefer_sparse),
+        );
+        if compute {
+            self.compute_segments = pool;
+        } else {
+            self.graphics_segments = pool;
+        }
     }
 
     fn bind_host_graphics_storage_buffers(&mut self, stage: usize) {
@@ -2865,6 +2898,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if cache.current_draw_indirect.is_some() {
                 cache.update_draw_indirect();
             }
+            cache.refresh_multi_range_segments(false);
         });
     }
 
@@ -2879,6 +2913,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         I: FnMut(u64) -> bool,
         M: FnMut(u64, u64) -> u64,
     {
+        // Upstream `DoUpdateGraphicsBuffers` starts the draw's segment pool afresh.
+        self.graphics_segments.clear();
         self.buffer_operations(|cache| {
             if is_indexed {
                 cache.update_index_buffer_with_gpu_resolver(gpu_to_cpu_address);
@@ -2897,6 +2933,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             if cache.current_draw_indirect.is_some() {
                 cache.update_draw_indirect_with_gpu_resolver(gpu_to_cpu_address);
             }
+            cache.refresh_multi_range_segments(false);
         });
     }
 
@@ -2907,6 +2944,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             cache.update_compute_uniform_buffers();
             cache.update_compute_storage_buffers();
             cache.update_compute_texture_buffers();
+            cache.refresh_multi_range_segments(true);
         });
     }
 
@@ -4154,6 +4192,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         for (index, binding) in updated_vertex_slots {
             self.update_vertex_buffer_slot(index, binding);
         }
+
+        // Lichii (buffer_cache.h:4199-4201): a deleted or joined buffer invalidates the segment
+        // references to it as well.
+        super::multi_range_refresh::invalidate_multi_range_segments(&mut self.graphics_segments, buffer_id);
+        super::multi_range_refresh::invalidate_multi_range_segments(&mut self.compute_segments, buffer_id);
 
         // Mark the whole buffer as CPU-modified to stop tracking.
         if !do_not_mark {

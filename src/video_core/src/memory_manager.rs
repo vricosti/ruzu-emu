@@ -274,6 +274,9 @@ pub struct GpuMemoryManager {
     rasterizer: Option<RasterizerHandle>,
     /// Upstream stores `std::unique_ptr<VideoCommon::InvalidationAccumulator>`.
     accumulator: InvalidationAccumulator,
+    /// Upstream `page_stash2`: the device ranges `FlushCaching` hands to
+    /// `RasterizerInterface::InnerInvalidation`, reused across calls.
+    page_stash2: Vec<(u64, usize)>,
     /// When `Some`, rasterizer notifications (`modify_gpu_memory`,
     /// `unmap_memory`) are recorded here instead of being invoked inline, so
     /// the caller can replay them AFTER releasing the memory-manager mutex.
@@ -393,6 +396,7 @@ impl GpuMemoryManager {
             device_memory,
             rasterizer: None,
             accumulator: InvalidationAccumulator::new(),
+            page_stash2: Vec::new(),
             deferred_rasterizer_ops: None,
             map_serial: AtomicU64::new(0),
             runs_guard: parking_lot::Mutex::new(ContinuousRunsState::default()),
@@ -1982,10 +1986,26 @@ impl GpuMemoryManager {
 
     fn get_submapped_device_ranges(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
         let mut result = Vec::new();
-        let mut last_segment: Option<(u64, u64)> = None;
+        self.get_submapped_device_ranges_into(gpu_addr, size, &mut result);
+        result
+            .into_iter()
+            .map(|(addr, size)| (addr, size as u64))
+            .collect()
+    }
+
+    /// Upstream: `MemoryManager::GetSubmappedRangeImpl<false>(gpu_addr, size, result)`;
+    /// appends the device ranges to the caller's `result` (Eden passes its
+    /// reusable `page_stash`/`page_stash2` members).
+    fn get_submapped_device_ranges_into(
+        &self,
+        gpu_addr: u64,
+        size: u64,
+        result: &mut Vec<(u64, usize)>,
+    ) {
+        let mut last_segment: Option<(u64, usize)> = None;
         let mut old_page_addr: Option<u64> = None;
 
-        let split = |last_segment: &mut Option<(u64, u64)>, result: &mut Vec<(u64, u64)>| {
+        let split = |last_segment: &mut Option<(u64, usize)>, result: &mut Vec<(u64, usize)>| {
             if let Some(seg) = last_segment.take() {
                 result.push(seg);
             }
@@ -2006,18 +2026,18 @@ impl GpuMemoryManager {
                     let dev_addr = dev_addr_base + big_page_offset as u64;
                     if let Some(expected) = old_page_addr {
                         if expected != dev_addr {
-                            split(&mut last_segment, &mut result);
+                            split(&mut last_segment, result);
                         }
                     }
                     old_page_addr = Some(dev_addr + copy_amount as u64);
                     if let Some(seg) = &mut last_segment {
-                        seg.1 += copy_amount as u64;
+                        seg.1 += copy_amount;
                     } else {
-                        last_segment = Some((dev_addr, copy_amount as u64));
+                        last_segment = Some((dev_addr, copy_amount));
                     }
                 }
                 EntryType::Reserved => {
-                    split(&mut last_segment, &mut result);
+                    split(&mut last_segment, result);
                     old_page_addr = None;
                 }
                 EntryType::Free => {
@@ -2037,18 +2057,18 @@ impl GpuMemoryManager {
                                 let dev_addr = dev_addr_base + sm_page_offset as u64;
                                 if let Some(expected) = old_page_addr {
                                     if expected != dev_addr {
-                                        split(&mut last_segment, &mut result);
+                                        split(&mut last_segment, result);
                                     }
                                 }
                                 old_page_addr = Some(dev_addr + sm_copy as u64);
                                 if let Some(seg) = &mut last_segment {
-                                    seg.1 += sm_copy as u64;
+                                    seg.1 += sm_copy;
                                 } else {
-                                    last_segment = Some((dev_addr, sm_copy as u64));
+                                    last_segment = Some((dev_addr, sm_copy));
                                 }
                             }
                             _ => {
-                                split(&mut last_segment, &mut result);
+                                split(&mut last_segment, result);
                                 old_page_addr = None;
                             }
                         }
@@ -2064,8 +2084,7 @@ impl GpuMemoryManager {
             remaining -= copy_amount;
             current_address += copy_amount as u64;
         }
-        split(&mut last_segment, &mut result);
-        result
+        split(&mut last_segment, result);
     }
 
     // ── Cache/rasterizer operations ─────────────────────────────────────
@@ -2115,23 +2134,22 @@ impl GpuMemoryManager {
 
     /// Upstream: `MemoryManager::FlushCaching()`.
     pub fn flush_caching(&mut self) {
-        let mut device_ranges = Vec::new();
+        // `page_stash2` and the accumulator are moved out only so that the
+        // range walk can borrow `self`; both keep their capacity across calls
+        // like Eden's members.
+        let mut page_stash2 = std::mem::take(&mut self.page_stash2);
         let mut accumulator = std::mem::take(&mut self.accumulator);
         let invalidated = accumulator.invalidate_all(|addr, size| {
-            device_ranges.extend(self.get_submapped_device_ranges(addr, size as u64));
+            self.get_submapped_device_ranges_into(addr, size as u64, &mut page_stash2);
         });
         self.accumulator = accumulator;
-        if !invalidated {
-            return;
+        if invalidated {
+            let _ = self.with_rasterizer_mut(|rasterizer| {
+                rasterizer.inner_invalidation(&page_stash2);
+            });
+            page_stash2.clear();
         }
-
-        let _ = self.with_rasterizer_mut(|rasterizer| {
-            let sequences: Vec<(u64, usize)> = device_ranges
-                .iter()
-                .map(|&(addr, size)| (addr, size as usize))
-                .collect();
-            rasterizer.inner_invalidation(&sequences);
-        });
+        self.page_stash2 = page_stash2;
     }
 
     /// Check if a GPU address is within the valid address range.
@@ -3474,6 +3492,53 @@ mod tests {
 
         mm.flush_caching();
         assert_eq!(inner_calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn flush_caching_reuses_page_stash2_and_hands_over_only_new_ranges() {
+        let mut mm = MemoryManager::new_with_geometry(14, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let inner_calls = Arc::clone(&rasterizer.inner_invalidation_calls);
+        mm.bind_rasterizer(&rasterizer);
+        // Two GPU-adjacent small pages backed by non-adjacent device pages.
+        mm.map(0x20000, 0x9100_0000, 0x1000, 0, false);
+        mm.map(0x21000, 0x9300_0000, 0x1000, 0, false);
+
+        mm.write_block_cached_with_callback(0x20FE0, &[0x11; 0x40], &mut |_, _| {});
+        mm.flush_caching();
+        // Eden GetSubmappedRangeImpl<false>: one device range per backing run.
+        assert_eq!(
+            *inner_calls.lock().unwrap(),
+            vec![vec![(0x9100_0FE0, 0x20), (0x9300_0000, 0x20)]]
+        );
+        assert!(mm.inner.page_stash2.is_empty());
+        assert!(mm.inner.page_stash2.capacity() >= 2);
+
+        mm.write_block_cached_with_callback(0x21100, &[0x22; 0x20], &mut |_, _| {});
+        mm.flush_caching();
+        assert_eq!(
+            inner_calls.lock().unwrap().last().unwrap(),
+            &vec![(0x9300_0100, 0x20)]
+        );
+        assert!(mm.inner.page_stash2.is_empty());
+    }
+
+    #[test]
+    fn scalar_read_does_not_flush_like_read_block() {
+        // Eden `MemoryManager::Read<T>` is GetPointer + memcpy; only
+        // `ReadBlock` flushes the rasterizer caches first. The graphics
+        // pipeline's texture handle reads rely on that difference.
+        let mut mm = MemoryManager::new_with_geometry(15, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let flush_calls = Arc::clone(&rasterizer.flush_calls);
+        mm.bind_rasterizer(&rasterizer);
+        mm.map(0x20000, 0x9100_0000, 0x1000, 0, false);
+
+        let _ = mm.read::<u32>(0x20010);
+        assert!(flush_calls.lock().unwrap().is_empty());
+        let mut bytes = [0u8; 4];
+        mm.read_block(0x20010, &mut bytes);
+        assert!(!flush_calls.lock().unwrap().is_empty());
     }
 
     #[test]

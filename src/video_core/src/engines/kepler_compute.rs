@@ -308,6 +308,16 @@ pub struct KeplerCompute {
     /// Port of upstream owner-local `indirect_compute`.
     indirect_compute: Option<u64>,
     rasterizer: Option<RasterizerHandle>,
+    /// Ocarina of Time's movie network: a pass that reads one colour image and stores none
+    /// retains its input here; the pass that stores an image upscaling it is replaced by a plain
+    /// copy (the network's matrix passes cost tens of milliseconds per frame). Cleared after the
+    /// copy. Port of Lichii `native_upscale_input` (aae0b063f7).
+    native_upscale_input: Option<TicEntry>,
+    /// Native dispatches left to skip while a retained network is being replaced (bounded, so a
+    /// non-network pass cannot silence the engine forever).
+    network_skip_remaining: u32,
+    /// Set when the replacement copy fails, so the full network runs from then on.
+    native_upscale_disabled: bool,
 }
 
 impl KeplerCompute {
@@ -386,6 +396,9 @@ impl KeplerCompute {
             state: State::default(),
             indirect_compute: None,
             rasterizer: None,
+            native_upscale_input: None,
+            network_skip_remaining: 0,
+            native_upscale_disabled: false,
         }
     }
 
@@ -671,18 +684,32 @@ impl KeplerCompute {
             if method == 0x45 || method == 0x47 {
                 self.native_compute_uploaded = true;
             }
-            self.native_macro_context = self.native_context.clone();
+            // Upstream re-points native_macro at the context on every method. The
+            // owning handle is replaced only when it names another context, so a
+            // method write does not touch the shared reference count.
+            let same = match (&self.native_macro_context, &self.native_context) {
+                (Some(current), Some(context)) => Arc::ptr_eq(current, context),
+                _ => false,
+            };
+            if !same {
+                self.native_macro_context = self.native_context.clone();
+            }
             self.native_macro_compute = self.native_compute_uploaded;
         }
         if method as usize >= self.native_registers.len() {
             log::error!("Native compute method out of range: {method:#x}");
             return true;
         }
-        let owner = self
-            .native_macro_context
-            .clone()
-            .expect("native compute requires macro owner");
-        let guard = owner.lock();
+        // Borrow the owner instead of cloning it for every method. The handle is
+        // only replaced by set_native_macro_mode (channel setup) or by the
+        // re-pointing above, which is a no-op for the nested calls a macro emits
+        // (same native_context), so the allocation outlives this guard.
+        let owner = Arc::as_ptr(
+            self.native_macro_context
+                .as_ref()
+                .expect("native compute requires macro owner"),
+        );
+        let guard = unsafe { (*owner).lock() };
         let context = guard.as_ptr();
         let this = self as *mut Self;
         // All accesses are serialized by the retained context lock. No RefMut spans callbacks.
@@ -757,18 +784,49 @@ impl KeplerCompute {
                 );
             }
             let engine = selected();
-            // Lease interpreter and FIFO so Rust callbacks can observe live uploads safely.
+            // Upstream assigns the active_dram pointer; the owning handle is only
+            // replaced when it names other storage (no refcount churn per call).
             if let Some(ram) = &self.native_data_ram {
                 unsafe {
-                    (*engine).native_interpreter.active_dram = Some(ram.clone());
+                    let active = &mut (*engine).native_interpreter.active_dram;
+                    if !active.as_ref().is_some_and(|current| Arc::ptr_eq(current, ram)) {
+                        *active = Some(ram.clone());
+                    }
                 }
             }
-            let mut interpreter = unsafe { std::mem::take(&mut (*engine).native_interpreter) };
+            #[cfg(target_arch = "x86_64")]
+            let use_jit = {
+                static USE_JIT: OnceLock<bool> = OnceLock::new();
+                *USE_JIT.get_or_init(|| {
+                    std::env::var_os("EDEN_NX2_MME_JIT")
+                        .is_none_or(|v| !v.to_string_lossy().starts_with('0'))
+                }) && !watched
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let use_jit = false;
+            // Lease interpreter and FIFO so Rust callbacks can observe live uploads
+            // safely. As in MacroEngine::execute_native, the 12 KiB interpreter
+            // (and its own RAM) is not leased when the JIT runs on active_dram:
+            // the JIT only uses active_dram, so moving and zeroing the
+            // interpreter on every compute macro call is avoided.
+            let shared = unsafe { (*engine).native_interpreter.active_dram.is_some() };
+            let mut interpreter = (!use_jit || !shared)
+                .then(|| unsafe { std::mem::take(&mut (*engine).native_interpreter) });
             let mut parameters = std::mem::take(&mut self.native_parameters);
-            let ram_owner = interpreter.active_dram.clone();
+            let ram_owner = match &interpreter {
+                Some(interpreter) => interpreter.active_dram.clone(),
+                None => unsafe { (*engine).native_interpreter.active_dram.clone() },
+            };
             let mut shared_ram = ram_owner.as_ref().map(|ram| ram.lock());
-            let mut local_ram = std::mem::replace(&mut interpreter.dram, [0; 0xc00]);
-            let ram = shared_ram.as_deref_mut().unwrap_or(&mut local_ram);
+            let mut local_ram = interpreter
+                .as_mut()
+                .map(|interpreter| std::mem::replace(&mut interpreter.dram, [0; 0xc00]));
+            let ram = match shared_ram.as_deref_mut() {
+                Some(shared) => shared,
+                None => local_ram
+                    .as_mut()
+                    .expect("the interpreter is leased when there is no active_dram"),
+            };
             let dram0_before = ram[0x27];
             let mut emit = |address: u32,
                             value: u32,
@@ -796,18 +854,12 @@ impl KeplerCompute {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                 #[cfg(target_arch = "x86_64")]
                 {
-                    static USE_JIT: OnceLock<bool> = OnceLock::new();
-                    if *USE_JIT.get_or_init(|| {
-                        std::env::var_os("EDEN_NX2_MME_JIT")
-                            .is_none_or(|v| !v.to_string_lossy().starts_with('0'))
-                    }) && !watched
-                    {
-                        let jit = (*engine)
-                            .native_jit
-                            .get_or_insert_with(|| {
-                                Arc::new(std::sync::Mutex::new(Default::default()))
-                            })
-                            .clone();
+                    if use_jit {
+                        // native_jit is created once and never replaced while the
+                        // engine (held by the context guard) lives: borrow it.
+                        let jit = &*Arc::as_ptr((*engine).native_jit.get_or_insert_with(|| {
+                            Arc::new(std::sync::Mutex::new(Default::default()))
+                        }));
                         let mut jit = jit
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -833,6 +885,9 @@ impl KeplerCompute {
                         return;
                     }
                 }
+                let interpreter = interpreter
+                    .as_mut()
+                    .expect("the interpreter is leased whenever the JIT is not used");
                 static USE_MEMO: OnceLock<bool> = OnceLock::new();
                 let use_memo = *USE_MEMO.get_or_init(|| {
                     std::env::var_os("EDEN_NX2_MME_MEMO")
@@ -880,7 +935,7 @@ impl KeplerCompute {
                 );
                 let current = selected();
                 let state = if current == engine {
-                    &interpreter
+                    &*interpreter
                 } else {
                     &(*current).native_interpreter
                 };
@@ -916,9 +971,13 @@ impl KeplerCompute {
                     log::error!("Native MME failed: compute start={:#x}, pc={:#x}, consumed={}/{}, error={}, parameters={parameters:08x?}", (*positions())[entry], result.pc, result.consumed, parameters.len(), result.error);
                 }
             }));
-            interpreter.dram = local_ram;
-            unsafe {
-                (*engine).native_interpreter = interpreter;
+            if let Some(mut interpreter) = interpreter {
+                if let Some(local_ram) = local_ram {
+                    interpreter.dram = local_ram;
+                }
+                unsafe {
+                    (*engine).native_interpreter = interpreter;
+                }
             }
             parameters.clear();
             self.native_parameters = parameters;
@@ -932,8 +991,10 @@ impl KeplerCompute {
             self.process_native_report_semaphore(argument);
             return true;
         }
-        let asid = self.memory_manager.lock().get_id() as u64;
+        // As upstream, memory_manager.GetID() is read only where it is traced,
+        // not under the memory-manager lock on every native method write.
         if method == 0x5a || (0xc6..=0x108).contains(&method) {
+            let asid = self.memory_manager.lock().get_id() as u64;
             trace_native_query(12, asid, method as u64, 0, 0, argument as u64, 0);
         }
         if method == 0x107 {
@@ -1029,6 +1090,7 @@ impl KeplerCompute {
                 true
             }
             0xae | 0xaf | 0xb0 => {
+                let asid = self.memory_manager.lock().get_id() as u64;
                 let address = (self.native_registers[0xad] as u64) << 8;
                 let cpu = self
                     .memory_manager
@@ -1214,6 +1276,188 @@ impl KeplerCompute {
         {
             return false;
         }
+        // Ocarina of Time's movie network (Lichii aae0b063f7, #721, port of Eglantine 92f119195f):
+        // a pass that reads one colour image and stores none retains its colour and opens a skip
+        // window; the pass that stores an image upscaling it is replaced by a plain copy and closes
+        // it. The gameplay network is left alone: its pair (+0xc0 -> +0xd0) carries the tonemap.
+        // Lichii also requires `!dlss_chain.active`; ruzu has no Fire Emblem DLSS chain, so that
+        // term is always true here (DIFF.md).
+        if !self.native_upscale_disabled
+            && common::settings::get_current_program_id() == crate::oot_network::PROGRAM_ID
+            && (self.launch_description.const_buffer_enable_mask & 1) != 0
+        {
+            use super::fermi_2d::{Config, Filter, MemoryLayout, Operation, Surface};
+            use super::native_upscale::find_native_upscale_output;
+            use crate::gpu::RenderTargetFormat as RTFormat;
+            use crate::textures::texture::TextureFormat;
+
+            let cbuf = self.launch_description.const_buffers[0].clone();
+            let cbuf_address = cbuf.address;
+            fn upscale_pair(from: &Option<TicEntry>, to: &Option<TicEntry>, same_format: bool) -> bool {
+                let (Some(from), Some(to)) = (from, to) else {
+                    return false;
+                };
+                if (same_format && from.format() != to.format())
+                    || from.address() == 0
+                    || to.address() == 0
+                    || from.address() == to.address()
+                    || !from.is_block_linear()
+                    || !to.is_block_linear()
+                {
+                    return false;
+                }
+                let (from_width, from_height) = (u64::from(from.width()), u64::from(from.height()));
+                let (to_width, to_height) = (u64::from(to.width()), u64::from(to.height()));
+                let (cross_a, cross_b) = (to_width * from_height, to_height * from_width);
+                from_width >= 64
+                    && to_width > from_width
+                    && to_width <= from_width * 4
+                    && cross_a.abs_diff(cross_b) * 32 <= cross_a
+            }
+            let (reads, stores) = self.native_image_handles(self.code_address());
+            let mut replacement_input: Option<TicEntry> = None;
+            let mut replacement_output: Option<TicEntry> = None;
+            {
+                let image = |offset: u32| -> Option<TicEntry> {
+                    if u64::from(offset) + 4 > u64::from(cbuf.size) {
+                        return None;
+                    }
+                    let handle = self
+                        .memory_manager
+                        .lock()
+                        .read::<u32>(cbuf_address + u64::from(offset));
+                    if handle == 0 || (handle & 0xfffff) > self.tic_limit() {
+                        return None;
+                    }
+                    Some(self.get_tic_entry(handle & 0xfffff))
+                };
+                if self.native_upscale_input.is_some()
+                    && self.network_skip_remaining > 0
+                    && !stores.is_empty()
+                {
+                    if let Some(store) = find_native_upscale_output(
+                        &self.native_upscale_input,
+                        &stores,
+                        &image,
+                        upscale_pair,
+                    ) {
+                        replacement_input = self.native_upscale_input;
+                        replacement_output = image(store);
+                    }
+                }
+            }
+            let mut skipping = false;
+            if reads.len() == 1 && stores.is_empty() && reads[0] == 0x58 {
+                // Ocarina's movie network reads its colour at +0x58; anchoring the window there
+                // keeps gameplay compute untouched.
+                self.remember_native_upscale_input();
+                if self.native_upscale_input.is_some() {
+                    self.network_skip_remaining = 32;
+                    skipping = true;
+                }
+            } else if replacement_input.is_none() && self.network_skip_remaining > 0 {
+                self.network_skip_remaining -= 1;
+                if self.network_skip_remaining == 0 {
+                    self.native_upscale_input = None;
+                }
+                skipping = true;
+            }
+            if let (Some(input), Some(output)) = (replacement_input, replacement_output) {
+                let surface = |tic: &TicEntry| -> Option<Surface> {
+                    let format = match TextureFormat::from_raw(tic.format()) {
+                        Some(TextureFormat::B10G11R11) => RTFormat::B10G11R11Float,
+                        Some(TextureFormat::R16G16B16A16) => RTFormat::R16G16B16A16Float,
+                        Some(TextureFormat::A8B8G8R8) => RTFormat::A8B8G8R8Unorm,
+                        Some(TextureFormat::A2B10G10R10) => RTFormat::A2B10G10R10Unorm,
+                        _ => return None,
+                    };
+                    if tic.address() == 0 || !tic.is_block_linear() {
+                        return None;
+                    }
+                    Some(Surface {
+                        format: format as u32,
+                        linear: MemoryLayout::BlockLinear as u32,
+                        block_dimensions: (tic.block_width() & 0xf)
+                            | ((tic.block_height() & 0xf) << 4)
+                            | ((tic.block_depth() & 0xf) << 8),
+                        depth: 1,
+                        width: tic.width(),
+                        height: tic.height(),
+                        addr_upper: (tic.address() >> 32) as u32,
+                        addr_lower: tic.address() as u32,
+                        ..Surface::default()
+                    })
+                };
+                if let (Some(source), Some(dest)) = (surface(&input), surface(&output)) {
+                    // Does the program decode sRGB itself? (Ocarina's movie network does.)
+                    let decodes_srgb = {
+                        let program = self.code_address();
+                        let mut bytes = [0u8; 0x400 * 4];
+                        let (mut threshold, mut exponent) = (false, false);
+                        let mut offset = 0u64;
+                        while offset < 0x20000 && !(threshold && exponent) {
+                            let memory = self.memory_manager.lock();
+                            if !memory.is_fully_mapped_range(program + offset, bytes.len() as u64) {
+                                break;
+                            }
+                            memory.read_block(program + offset, &mut bytes);
+                            drop(memory);
+                            let word = |index: usize| {
+                                u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+                            };
+                            for index in (0..0x400).step_by(4) {
+                                let opcode = word(index) & 0xfff;
+                                threshold |= opcode == 0x434 && word(index + 1) == 0x292d292d;
+                                exponent |= opcode == 0x832 && word(index + 1) == 0x40cc40cc;
+                            }
+                            offset += bytes.len() as u64;
+                        }
+                        threshold && exponent
+                    };
+                    let config = Config {
+                        operation: if decodes_srgb {
+                            Operation::SrcCopySrgbToLinear
+                        } else {
+                            Operation::SrcCopy
+                        },
+                        filter: Filter::Bilinear,
+                        must_accelerate: true,
+                        dst_x0: 0,
+                        dst_y0: 0,
+                        dst_x1: output.width() as i32,
+                        dst_y1: output.height() as i32,
+                        src_x0: 0,
+                        src_y0: 0,
+                        src_x1: input.width() as i32,
+                        src_y1: input.height() as i32,
+                    };
+                    let rasterizer = self
+                        .rasterizer
+                        .map(|handle| unsafe { handle.as_mut() })
+                        .expect("native compute requires a rasterizer");
+                    let done = rasterizer.accelerate_surface_copy(&source, &dest, &config);
+                    log::debug!(
+                        "Native network pass {:#x} replaced by input copy {}->{} ({}): {}",
+                        self.code_address(),
+                        input.address(),
+                        output.address(),
+                        if decodes_srgb { "sRGB" } else { "plain" },
+                        done
+                    );
+                    self.native_upscale_input = None;
+                    self.network_skip_remaining = 0;
+                    if done {
+                        return true;
+                    }
+                    // Run the real pass, and the whole network on later frames.
+                    self.native_upscale_disabled = true;
+                    skipping = false;
+                }
+            }
+            if skipping {
+                return true;
+            }
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Existing Rust rasterizer adapter snapshots the bound engine's launch state.
             let dispatch = DispatchCall {
@@ -1258,7 +1502,9 @@ impl KeplerCompute {
             }
             if message.contains("matrix multiply") {
                 self.describe_native_resources(qmd);
-                return self.upscale_instead_of_native_program();
+                log::error!(
+                    "Native tensor dispatch is unsupported; no validated replacement was available"
+                );
             }
             return false;
         }
@@ -1291,196 +1537,93 @@ impl KeplerCompute {
         }
     }
 
-    /// Port of KeplerCompute::UpscaleInsteadOfNativeProgram.
-    fn upscale_instead_of_native_program(&mut self) -> bool {
-        use super::fermi_2d::{Config, Filter, MemoryLayout, Operation, Surface};
-        use crate::cache_types::CacheType;
-        use crate::gpu::RenderTargetFormat as RTFormat;
-        use crate::textures::texture::TextureFormat;
-
-        let cbuf_address = self.launch_description.const_buffers[0].address;
-        let image = |offset: u64| {
-            let index = self
-                .memory_manager
-                .lock()
-                .read::<u32>(cbuf_address + offset)
-                & 0xfffff;
-            if index > self.tic_limit() {
-                None
-            } else {
-                Some(self.get_tic_entry(index))
+    /// Port of Lichii `KeplerCompute::NativeImageHandles` (aae0b063f7): the cbuf0 byte offsets of
+    /// the texture handles a native program reads (TEX, TLD, TLD4, TXD) and the surface handles it
+    /// stores to (SUST.P), from its code up to the first unconditional EXIT. Cached per program
+    /// address for the process lifetime, like upstream's function-local static.
+    fn native_image_handles(&self, program: u64) -> (Vec<u32>, Vec<u32>) {
+        static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, (Vec<u32>, Vec<u32>)>>> =
+            OnceLock::new();
+        let cache = CACHE.get_or_init(Default::default);
+        if let Some(handles) = cache.lock().get(&program) {
+            return handles.clone();
+        }
+        let mut handles: (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+        let add = |list: &mut Vec<u32>, offset: u32| {
+            if !list.contains(&offset) {
+                list.push(offset);
             }
         };
-        let (Some(input), Some(output)) = (image(0x90), image(0xa0)) else {
-            return false;
-        };
-        if input.format() != output.format()
-            || input.address() == 0
-            || output.address() == 0
-            || output.width() <= input.width()
-            || !input.is_block_linear()
-            || !output.is_block_linear()
-        {
-            return false;
-        }
-        let format = match TextureFormat::from_raw(input.format()) {
-            Some(TextureFormat::A2B10G10R10) => RTFormat::A2B10G10R10Unorm,
-            Some(TextureFormat::A8B8G8R8) => RTFormat::A8B8G8R8Unorm,
-            Some(TextureFormat::B10G11R11) => RTFormat::B10G11R11Float,
-            Some(TextureFormat::R16G16B16A16) => RTFormat::R16G16B16A16Float,
-            _ => return false,
-        };
-        let surface = |tic: &TicEntry| Surface {
-            format: format as u32,
-            linear: MemoryLayout::BlockLinear as u32,
-            block_dimensions: tic.block_width()
-                | (tic.block_height() << 4)
-                | (tic.block_depth() << 8),
-            depth: 1,
-            width: tic.width(),
-            height: tic.height(),
-            addr_upper: (tic.address() >> 32) as u32,
-            addr_lower: tic.address() as u32,
-            ..Surface::default()
-        };
-        let config = Config {
-            operation: Operation::SrcCopy,
-            filter: Filter::Bilinear,
-            must_accelerate: true,
-            dst_x0: 0,
-            dst_y0: 0,
-            dst_x1: output.width() as i32,
-            dst_y1: output.height() as i32,
-            src_x0: 0,
-            src_y0: 0,
-            src_x1: input.width() as i32,
-            src_y1: input.height() as i32,
-        };
-        // These lambdas are function-local in upstream; preserve libc prefix/sign parsing.
-        static SAMPLE_AT: OnceLock<u32> = OnceLock::new();
-        let sample_at = *SAMPLE_AT.get_or_init(|| {
-            std::env::var_os("EDEN_NX2_SAMPLE_AT")
-                .map(|value| {
-                    let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
-                    unsafe { libc::strtoul(value.as_ptr(), std::ptr::null_mut(), 10) as u32 }
-                })
-                .unwrap_or(20)
-        });
-        let rasterizer = self
-            .rasterizer
-            .map(|handle| unsafe { handle.as_mut() })
-            .expect("native upscale requires a rasterizer");
-        static SAMPLED: AtomicU32 = AtomicU32::new(0);
-        if SAMPLED.fetch_add(1, Ordering::Relaxed) == sample_at {
-            let mut sample = |tic: &TicEntry| {
-                let size = tic.width() as u64 * tic.height() as u64 * 4;
-                let device = self.memory_manager.lock().gpu_to_cpu_address(tic.address());
-                if let Some(device) = device {
-                    rasterizer.flush_region(device, size, CacheType::ALL);
-                }
-                let (mut nonzero, mut samples, mut sum) = (0u32, 0u32, 0u64);
-                for offset in (0..size).step_by(4096 + 4) {
-                    let word = self
-                        .memory_manager
-                        .lock()
-                        .read::<u32>(tic.address() + offset);
-                    samples += 1;
-                    nonzero += u32::from(word != 0);
-                    sum +=
-                        ((word & 0x3ff) + ((word >> 10) & 0x3ff) + ((word >> 20) & 0x3ff)) as u64;
-                }
-                log::info!("Upscale fallback image {:#x}: {nonzero}/{samples} sampled words non-zero, mean channel {}", tic.address(), if samples != 0 {sum / (samples as u64 * 3)} else {0});
+        let mut bytes = [0u8; 0x400 * 4];
+        let mut exited = false;
+        let mut offset = 0u64;
+        while offset < 0x40000 && !exited {
+            let memory = self.memory_manager.lock();
+            if !memory.is_fully_mapped_range(program + offset, bytes.len() as u64) {
+                break;
+            }
+            memory.read_block(program + offset, &mut bytes);
+            drop(memory);
+            let word = |index: usize| {
+                u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
             };
-            sample(&input);
-            sample(&output);
-            for address in [
-                0x8116a03000u64,
-                0x8117ae5000,
-                0x8114b62000,
-                0x8115a63000,
-                0x8117904000,
-                0x8114a02000,
-            ] {
-                let size = 2560u64 * 1440 * 4;
-                let device = self.memory_manager.lock().gpu_to_cpu_address(address);
-                if let Some(device) = device {
-                    rasterizer.flush_region(device, size, CacheType::ALL);
+            let mut index = 0;
+            while index < 0x400 && !exited {
+                let opcode = word(index) & 0xfff;
+                let binding = (word(index + 1) >> 22) & 0x1f;
+                let handle = ((word(index + 1) >> 8) & 0x3fff) * 4;
+                match opcode {
+                    0xb60 | 0xb63 | 0xb66 | 0xb6d => {
+                        if binding == 0 {
+                            add(&mut handles.0, handle);
+                        }
+                    }
+                    0xb9b => {
+                        if binding == 0 {
+                            add(&mut handles.1, handle);
+                        }
+                    }
+                    // EXIT, unconditional when guarded by PT
+                    0x94d => exited = ((word(index) >> 12) & 0xf) == 7,
+                    _ => {}
                 }
-                let (mut nonzero, mut samples, mut distinct, mut last) = (0u32, 0u32, 0u32, 0u32);
-                for offset in (0..size).step_by(4096 + 4) {
-                    let word = self.memory_manager.lock().read::<u32>(address + offset);
-                    samples += 1;
-                    nonzero += u32::from(word != 0);
-                    distinct += u32::from(word != last);
-                    last = word;
-                }
-                log::info!("Upscale fallback target {address:#x}: {nonzero}/{samples} non-zero, {distinct} changes");
+                index += 4;
             }
+            offset += bytes.len() as u64;
         }
-        let mut source = surface(&input);
-        static OVERRIDE_SOURCE: OnceLock<u64> = OnceLock::new();
-        let override_source = *OVERRIDE_SOURCE.get_or_init(|| {
-            std::env::var_os("EDEN_NX2_UPSCALE_SOURCE")
-                .map(|value| {
-                    let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
-                    unsafe { libc::strtoull(value.as_ptr(), std::ptr::null_mut(), 16) as u64 }
-                })
-                .unwrap_or(0)
-        });
-        if override_source != 0 {
-            source.addr_upper = (override_source >> 32) as u32;
-            source.addr_lower = override_source as u32;
-            if let Some(value) = std::env::var_os("EDEN_NX2_UPSCALE_SOURCE_FORMAT") {
-                let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
-                source.format =
-                    unsafe { libc::strtoul(value.as_ptr(), std::ptr::null_mut(), 16) as u32 };
-            }
+        cache.lock().entry(program).or_insert(handles).clone()
+    }
+
+    /// Port of Lichii `KeplerCompute::RememberNativeUpscaleInput` (aae0b063f7).
+    fn remember_native_upscale_input(&mut self) {
+        self.native_upscale_input = None;
+        let (reads, stores) = self.native_image_handles(self.code_address());
+        // An image-fed matrix pass writes its intermediate results to buffers. Retain its colour
+        // input: the final pass's sampled image is another intermediate that a skipped network
+        // never produced (Ocarina's movie network reads its colour at +0x58).
+        if reads.len() != 1 || !stores.is_empty() {
+            return;
         }
-        let done = rasterizer.accelerate_surface_copy(&source, &surface(&output), &config);
-        static CHECKED: AtomicU32 = AtomicU32::new(0);
-        if CHECKED.fetch_add(1, Ordering::Relaxed) == sample_at {
-            let size = output.width() as u64 * output.height() as u64 * 4;
-            let device = self
-                .memory_manager
-                .lock()
-                .gpu_to_cpu_address(output.address());
-            if let Some(device) = device {
-                rasterizer.flush_region(device, size, CacheType::ALL);
-            }
-            let (mut nonzero, mut samples, mut changes, mut last) = (0u32, 0u32, 0u32, 0u32);
-            for offset in (0..size).step_by(4096 + 4) {
-                let word = self
-                    .memory_manager
-                    .lock()
-                    .read::<u32>(output.address() + offset);
-                samples += 1;
-                nonzero += u32::from(word != 0);
-                changes += u32::from(word != last);
-                last = word;
-            }
-            log::info!("Upscale fallback output after blit: {nonzero}/{samples} non-zero, {changes} changes");
+        let cbuf = &self.launch_description.const_buffers[0];
+        if u64::from(reads[0]) + 4 > u64::from(cbuf.size) {
+            return;
         }
-        static TRACE_AT: OnceLock<u32> = OnceLock::new();
-        let trace_at = *TRACE_AT.get_or_init(|| {
-            std::env::var_os("EDEN_NX2_TRACE_AFTER_UPSCALE")
-                .map(|value| {
-                    let value = std::ffi::CString::new(value.to_string_lossy().as_bytes()).unwrap();
-                    unsafe { libc::strtoul(value.as_ptr(), std::ptr::null_mut(), 10) as u32 }
-                })
-                .unwrap_or(30)
-        });
-        static COUNT: AtomicU32 = AtomicU32::new(0);
-        if COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1) == trace_at {
-            G_NX2_TRACE_DRAWS_AFTER_UPSCALE.store(40, Ordering::SeqCst);
+        let address = cbuf.address;
+        let handle = self
+            .memory_manager
+            .lock()
+            .read::<u32>(address + u64::from(reads[0]));
+        if handle == 0 || (handle & 0xfffff) > self.tic_limit() {
+            return;
         }
-        static LOGGED: AtomicU32 = AtomicU32::new(0);
-        if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
-            log::info!("Upscale fallback {:#x} {}x{} block {}/{}/{} -> {:#x} {}x{} block {}/{}/{} levels {}: {}",
-                input.address(), input.width(), input.height(), input.block_width(), input.block_height(), input.block_depth(),
-                output.address(), output.width(), output.height(), output.block_width(), output.block_height(), output.block_depth(),
-                output.max_mip_level(), if done {"blitted"} else {"not accelerated"});
+        let input = self.get_tic_entry(handle & 0xfffff);
+        if input.address() != 0
+            && input.is_block_linear()
+            && input.width() >= 64
+            && input.height() >= 64
+        {
+            self.native_upscale_input = Some(input);
         }
-        done
     }
 
     /// Port of ProcessNativeReportSemaphore: SET_REPORT_SEMAPHORE_A-D.
@@ -1935,6 +2078,58 @@ mod tests {
             assert!(!state.compute_engine.native_execution_failed);
             if shared {
                 assert_eq!(&ram.lock()[0x27..=0x28], &[42, 0xabcdef]);
+            } else {
+                assert_eq!(&state.compute_engine.native_interpreter.dram[0x27..=0x28],
+                    &[42, 0xabcdef]);
+            }
+        }
+    }
+
+    // Backend (non-split) counterpart: the interpreter is no longer leased when
+    // the JIT runs on active_dram, and still is for the engine-owned RAM.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn native_macro_updates_shared_or_engine_ram_without_leasing_for_jit() {
+        for shared in [false, true] {
+            let context = Arc::new(parking_lot::ReentrantMutex::new(RefCell::new(
+                crate::r#macro::NativeMacroContext::default(),
+            )));
+            {
+                let guard = context.lock();
+                let mut state = guard.borrow_mut();
+                state.engine.native_turing = true;
+                state.compute_engine.native_turing = true;
+                state.compute_engine.native_interpreter.dram[0x28] = 0xabcdef;
+            }
+            let ram = Arc::new(Mutex::new([0; 0xc00]));
+            ram.lock()[0x28] = 0xabcdef;
+            let mut engine = Box::new(new_test_engine());
+            engine.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
+            if shared { engine.set_native_data_ram(Some(ram.clone())); }
+            engine.call_method(0x45, 0, true);
+            let code = [
+                front_instruction(&[(10, 5, 31), (20, 5, 25), (30, 16, 0x27),
+                    (25, 5, 26), (66, 16, 42)]),
+                front_instruction(&[(0, 1, 1), (10, 5, 30), (20, 5, 25),
+                    (30, 16, 0x27), (66, 16, 0x200), (82, 3, 6), (85, 4, 1)]),
+                front_instruction(&[]),
+            ].concat();
+            engine.call_multi_method(0x46, &code, code.len() as u32, code.len() as u32);
+            engine.call_multi_method(0x200, &[13, 17], 2, 2);
+            assert_eq!(engine.native_registers[0x200], 17);
+            engine.call_method(0xe00, 7, false);
+            engine.call_multi_method(0xe01, &[8, 9], 2, 2);
+            assert!(engine.native_parameters.is_empty());
+            assert_eq!(engine.native_registers[0x200], 42);
+            let guard = context.lock();
+            let state = guard.borrow();
+            assert!(!state.compute_engine.native_execution_failed);
+            assert_eq!(state.compute_engine.native_jit.is_some(),
+                std::env::var_os("EDEN_NX2_MME_JIT")
+                    .is_none_or(|v| !v.to_string_lossy().starts_with('0')));
+            if shared {
+                assert_eq!(&ram.lock()[0x27..=0x28], &[42, 0xabcdef]);
+                assert_eq!(state.compute_engine.native_interpreter.dram[0x27], 0);
             } else {
                 assert_eq!(&state.compute_engine.native_interpreter.dram[0x27..=0x28],
                     &[42, 0xabcdef]);
@@ -2585,176 +2780,22 @@ mod tests {
     }
 
     #[test]
-    fn native_upscale_preserves_formats_validation_overrides_and_sampling_order() {
-        const CHILD: &str = "RUZU_NATIVE_UPSCALE_CHILD";
-        let Ok(mode) = std::env::var(CHILD) else {
-            for mode in ["normal", "override", "sample"] {
-                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-                command
-                    .args([
-                        "--exact",
-                        std::thread::current().name().unwrap(),
-                        "--test-threads=1",
-                    ])
-                    .env(CHILD, mode)
-                    .env(
-                        "EDEN_NX2_SAMPLE_AT",
-                        if mode == "sample" { "0" } else { "4294967295" },
-                    )
-                    .env("EDEN_NX2_TRACE_AFTER_UPSCALE", "1")
-                    .env_remove("EDEN_NX2_UPSCALE_SOURCE")
-                    .env_remove("EDEN_NX2_UPSCALE_SOURCE_FORMAT");
-                if mode == "override" {
-                    command
-                        .env("EDEN_NX2_UPSCALE_SOURCE", "  +0x123456789tail")
-                        .env("EDEN_NX2_UPSCALE_SOURCE_FORMAT", "ca suffix");
-                }
-                assert!(command.status().unwrap().success(), "child {mode}");
-            }
-            return;
-        };
-        let mut backing = vec![0u8; 0x1000];
-        backing[0x90..0x94].copy_from_slice(&0xfff00000u32.to_le_bytes());
-        backing[0xa0..0xa4].copy_from_slice(&0xfff00001u32.to_le_bytes());
-        // Raw TIC descriptors: block-linear, Texture2D, distinct block dimensions.
-        let descriptors = [
-            [
-                8u32,
-                0x7800,
-                3 << 21,
-                1 | (2 << 3) | (3 << 6),
-                3 | (1 << 23),
-                1,
-                0,
-                0,
-            ],
-            [
-                8u32,
-                0x7900,
-                3 << 21,
-                2 | (3 << 3) | (1 << 6),
-                7 | (1 << 23),
-                0,
-                0,
-                0,
-            ],
-        ];
-        for (index, words) in descriptors.iter().enumerate() {
-            for (word, value) in words.iter().enumerate() {
-                let offset = 0x200 + index * 32 + word * 4;
-                backing[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-            }
-        }
+    fn native_matrix_multiply_rejection_is_reported_without_a_stand_in() {
+        // Lichii f6a8f51324 removed the plain-upscale stand-in for rejected tensor programs:
+        // the rejection is described and the dispatch reports failure, with no copy.
+        let backing = vec![0u8; 0x1000];
         let mut engine = new_owner_backed_engine(&backing, 0x7000);
-        engine.launch_description.const_buffers[0].address = 0x7000;
-        engine.regs[TIC_BASE as usize + 1] = 0x7200;
-        engine.regs[TIC_BASE as usize + 2] = 1;
         let rasterizer = TestRasterizer::new(0, 0);
-        engine.bind_rasterizer(&rasterizer);
-        assert!(!engine.upscale_instead_of_native_program()); // accelerator failure is forwarded
-        assert_eq!(G_NX2_TRACE_DRAWS_AFTER_UPSCALE.load(Ordering::SeqCst), 40);
-        let (src, dst, config) = rasterizer.copies.borrow()[0];
-        assert_eq!(
-            src.address(),
-            if mode == "override" {
-                0x123456789
-            } else {
-                0x7800
-            }
-        );
-        assert_eq!(src.format, if mode == "override" { 0xca } else { 0xd5 });
-        assert_eq!(dst.address(), 0x7900);
-        assert_eq!(
-            (src.block_width(), src.block_height(), src.block_depth()),
-            (1, 2, 3)
-        );
-        assert_eq!(
-            (dst.block_width(), dst.block_height(), dst.block_depth()),
-            (2, 3, 1)
-        );
-        assert_eq!((src.depth, src.pitch, src.layer), (1, 0, 0));
-        assert_eq!(
-            (config.src_x1, config.src_y1, config.dst_x1, config.dst_y1),
-            (4, 2, 8, 1)
-        );
-        assert_eq!(config.operation, super::super::fermi_2d::Operation::SrcCopy);
-        assert_eq!(config.filter, super::super::fermi_2d::Filter::Bilinear);
-        assert!(config.must_accelerate);
-        if mode == "sample" {
-            assert_eq!(
-                &*rasterizer.copy_events.borrow(),
-                &["flush", "flush", "copy", "flush"]
-            );
-            assert_eq!(
-                &*rasterizer.flushes.borrow(),
-                &[
-                    (0x7800, 32, crate::cache_types::CacheType::ALL),
-                    (0x7900, 32, crate::cache_types::CacheType::ALL),
-                    (0x7900, 32, crate::cache_types::CacheType::ALL)
-                ]
-            );
-        } else {
-            assert!(rasterizer.flushes.borrow().is_empty());
-        }
         rasterizer.copy_result.set(true);
-        if mode == "override" {
-            unsafe {
-                std::env::set_var("EDEN_NX2_UPSCALE_SOURCE", "999");
-                std::env::set_var("EDEN_NX2_UPSCALE_SOURCE_FORMAT", "d1");
-            }
-        }
-        for (texture, target) in [(9u32, 0xd1), (8, 0xd5), (0x21, 0xe0), (3, 0xca)] {
-            for offset in [0x200, 0x220] {
-                backing[offset..offset + 4].copy_from_slice(&texture.to_le_bytes());
-            }
-            assert!(engine.upscale_instead_of_native_program());
-            let copies = rasterizer.copies.borrow();
-            let (src, dst, _) = copies.last().unwrap();
-            assert_eq!(dst.format, target);
-            assert_eq!(src.format, if mode == "override" { 0xd1 } else { target });
-            assert_eq!(
-                src.address(),
-                if mode == "override" {
-                    0x123456789
-                } else {
-                    0x7800
-                }
-            );
-        }
-        let count = rasterizer.copies.borrow().len();
-        // Each unsupported condition returns before calling the accelerator.
-        for (offset, value) in [
-            (0x200, 1u32),
-            (0x220, 8),
-            (0x204, 0),
-            (0x224, 0),
-            (0x230, 3 | (1 << 23)),
-            (0x208, 2 << 21),
-            (0x228, 2 << 21),
-            (0xa0, 2),
-        ] {
-            let saved: [u8; 4] = backing[offset..offset + 4].try_into().unwrap();
-            if offset == 0x200 {
-                backing[0x220..0x224].copy_from_slice(&1u32.to_le_bytes());
-            }
-            backing[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-            assert!(
-                !engine.upscale_instead_of_native_program(),
-                "offset {offset:x}"
-            );
-            backing[offset..offset + 4].copy_from_slice(&saved);
-            backing[0x220..0x224].copy_from_slice(&3u32.to_le_bytes());
-        }
-        assert_eq!(rasterizer.copies.borrow().len(), count);
+        engine.bind_rasterizer(&rasterizer);
         let mut qmd = [0u32; 64];
         qmd[18] = 1 << 16;
         qmd[19] = 1 | (1 << 16);
         qmd[32] = 0x7000;
         rasterizer.dispatch_failure.set(2);
-        assert!(engine.dispatch_native_compute(&qmd));
-        assert_eq!(rasterizer.copies.borrow().len(), count + 1);
-        rasterizer.copy_result.set(false);
         assert!(!engine.dispatch_native_compute(&qmd));
+        assert_eq!(rasterizer.dispatches.get(), 1);
+        assert!(rasterizer.copies.borrow().is_empty());
     }
 
     #[test]
@@ -2850,6 +2891,256 @@ mod tests {
         }
         assert_eq!(rasterizer.queries.borrow().len(), 4);
         assert!(rasterizer.pending_fences.borrow().is_empty());
+    }
+
+    /// Writes one 128-bit native instruction (first two words) at `at`.
+    fn put_instruction(backing: &mut [u8], at: usize, word0: u32, word1: u32) {
+        backing[at..at + 4].copy_from_slice(&word0.to_le_bytes());
+        backing[at + 4..at + 8].copy_from_slice(&word1.to_le_bytes());
+    }
+
+    /// Image handle operand (cbuf0 byte offset, binding 0) of a texture or surface instruction.
+    fn handle_operand(offset: u32) -> u32 {
+        (offset / 4) << 8
+    }
+
+    /// Writes a block-linear 2D TIC entry at pool index `index`.
+    fn put_tic(backing: &mut [u8], pool: usize, index: usize, format: u32, address: u32, size: (u32, u32)) {
+        let words = [
+            format,
+            address,
+            3 << 21,
+            1 | (2 << 3),
+            (size.0 - 1) | (1 << 23),
+            size.1 - 1,
+            0,
+            0,
+        ];
+        for (word, value) in words.iter().enumerate() {
+            let at = pool + index * 32 + word * 4;
+            backing[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    const TEX: u32 = 0xb60;
+    const SUST_P: u32 = 0xb9b;
+    const EXIT_PT: u32 = 0x94d | (7 << 12);
+
+    #[test]
+    fn native_image_handles_lists_binding_zero_images_up_to_the_unconditional_exit() {
+        const BASE: u64 = 0x31_0000;
+        let mut backing = vec![0u8; 0x3000];
+        // Reads: TEX, TLD, TLD4, TXD (a repeated offset is listed once); a bound (binding 1)
+        // texture is not a cbuf0 handle. Store: SUST.P. A predicated EXIT does not end the scan.
+        put_instruction(&mut backing, 0x00, TEX, handle_operand(0x58));
+        put_instruction(&mut backing, 0x10, 0xb63, handle_operand(0x60));
+        put_instruction(&mut backing, 0x20, 0xb66, handle_operand(0x58));
+        put_instruction(&mut backing, 0x30, 0xb6d, handle_operand(0x70) | (1 << 22));
+        put_instruction(&mut backing, 0x40, 0x94d | (0 << 12), 0);
+        put_instruction(&mut backing, 0x50, 0xb6d, handle_operand(0x64));
+        put_instruction(&mut backing, 0x60, SUST_P, handle_operand(0x68));
+        put_instruction(&mut backing, 0x70, SUST_P, handle_operand(0x68));
+        put_instruction(&mut backing, 0x80, EXIT_PT, 0);
+        put_instruction(&mut backing, 0x90, TEX, handle_operand(0x80));
+        // The scan crosses 4 KiB block boundaries until the exit.
+        put_instruction(&mut backing, 0x1000, SUST_P, handle_operand(0x90));
+        put_instruction(&mut backing, 0x1010, EXIT_PT, 0);
+        let engine = new_owner_backed_engine(&backing, BASE);
+        assert_eq!(
+            engine.native_image_handles(BASE),
+            (vec![0x58, 0x60, 0x64], vec![0x68])
+        );
+        backing[0x80..0x90].fill(0);
+        let engine = new_owner_backed_engine(&backing, BASE + 0x10_0000);
+        assert_eq!(
+            engine.native_image_handles(BASE + 0x10_0000),
+            (vec![0x58, 0x60, 0x64, 0x80], vec![0x68, 0x90])
+        );
+        // Results are cached per program address, like upstream's static map.
+        backing[0x00..0x10].fill(0);
+        assert_eq!(
+            engine.native_image_handles(BASE + 0x10_0000),
+            (vec![0x58, 0x60, 0x64, 0x80], vec![0x68, 0x90])
+        );
+    }
+
+    #[test]
+    fn remember_native_upscale_input_retains_only_a_single_large_block_linear_read() {
+        const BASE: u64 = 0x52_0000;
+        let mut backing = vec![0u8; 0x4000];
+        put_instruction(&mut backing, 0x1000, TEX, handle_operand(0x58));
+        put_instruction(&mut backing, 0x1010, EXIT_PT, 0);
+        put_tic(&mut backing, 0x800, 1, 0x21, 0x9000, (960, 540));
+        put_tic(&mut backing, 0x800, 2, 0x21, 0x9000, (63, 540));
+        put_tic(&mut backing, 0x800, 3, 0x21, 0, (960, 540));
+        backing[0x58..0x5c].copy_from_slice(&1u32.to_le_bytes());
+        let mut engine = new_owner_backed_engine(&backing, BASE);
+        engine.regs[TIC_BASE as usize + 1] = (BASE + 0x800) as u32;
+        engine.regs[TIC_BASE as usize + 2] = 3;
+        engine.regs[CODE_LOC_BASE as usize + 1] = (BASE + 0x1000) as u32;
+        engine.launch_description.const_buffers[0] = ConstBufferConfig {
+            address: BASE,
+            size: 0x100,
+        };
+        engine.remember_native_upscale_input();
+        let input = engine.native_upscale_input.expect("input retained");
+        assert_eq!((input.width(), input.height(), input.address()), (960, 540, 0x9000));
+        for (handle, size) in [(2u32, 0x100u32), (3, 0x100), (4, 0x100), (0, 0x100), (1, 0x58)] {
+            backing[0x58..0x5c].copy_from_slice(&handle.to_le_bytes());
+            engine.launch_description.const_buffers[0].size = size;
+            engine.remember_native_upscale_input();
+            assert!(engine.native_upscale_input.is_none(), "handle {handle} size {size:#x}");
+        }
+    }
+
+    /// Ocarina of Time's movie network replacement (Lichii aae0b063f7), run in a child process
+    /// because it reads the global current program id.
+    #[test]
+    fn oot_movie_network_is_skipped_and_its_output_pass_replaced_by_a_copy() {
+        const CHILD: &str = "RUZU_OOT_MOVIE_NETWORK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--test-threads=1"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        const BASE: u64 = 0x74_0000;
+        const PREPASS: u64 = BASE + 0x2000;
+        const MIDDLE: u64 = BASE + 0x3000;
+        const OUTPUT: u64 = BASE + 0x4000;
+        const OUTPUT_PLAIN: u64 = BASE + 0x5000;
+        const GAMEPLAY: u64 = BASE + 0x6000;
+        let mut backing = vec![0u8; 0x8000];
+        put_instruction(&mut backing, 0x2000, TEX, handle_operand(0x58));
+        put_instruction(&mut backing, 0x2010, EXIT_PT, 0);
+        put_instruction(&mut backing, 0x3000, EXIT_PT, 0);
+        // The output pass decodes sRGB itself (HSETP2 0.04045, HMUL2 2.4) before its store.
+        put_instruction(&mut backing, 0x4000, TEX, handle_operand(0x60));
+        put_instruction(&mut backing, 0x4010, 0x434, 0x292d292d);
+        put_instruction(&mut backing, 0x4020, 0x832, 0x40cc40cc);
+        put_instruction(&mut backing, 0x4030, SUST_P, handle_operand(0x68));
+        put_instruction(&mut backing, 0x4040, EXIT_PT, 0);
+        put_instruction(&mut backing, 0x5000, TEX, handle_operand(0x60));
+        put_instruction(&mut backing, 0x5010, SUST_P, handle_operand(0x68));
+        put_instruction(&mut backing, 0x5020, EXIT_PT, 0);
+        put_instruction(&mut backing, 0x6000, TEX, handle_operand(0xc0));
+        put_instruction(&mut backing, 0x6010, SUST_P, handle_operand(0xd0));
+        put_instruction(&mut backing, 0x6020, EXIT_PT, 0);
+        const POOL: usize = 0x1000;
+        put_tic(&mut backing, POOL, 1, 0x21, 0x10_0000, (960, 540)); // movie colour
+        put_tic(&mut backing, POOL, 2, 0x03, 0x20_0000, (960, 540)); // network intermediate
+        put_tic(&mut backing, POOL, 3, 0x08, 0x30_0000, (1920, 1080)); // upscaled output
+        put_tic(&mut backing, POOL, 4, 0x08, 0x40_0000, (3841, 2160)); // more than 4x
+        for (offset, handle) in [(0x58usize, 1u32), (0x60, 2), (0x68, 3), (0xc0, 1), (0xd0, 3)] {
+            backing[offset..offset + 4].copy_from_slice(&handle.to_le_bytes());
+        }
+        let mut engine = new_owner_backed_engine(&backing, BASE);
+        engine.regs[TIC_BASE as usize + 1] = BASE as u32 + POOL as u32;
+        engine.regs[TIC_BASE as usize + 2] = 4;
+        let rasterizer = TestRasterizer::new(0, 0);
+        rasterizer.copy_result.set(true);
+        engine.bind_rasterizer(&rasterizer);
+        let qmd = |program: u64, cbuf_enabled: bool| {
+            let mut qmd = [0u32; 64];
+            qmd[18] = 1 << 16;
+            qmd[19] = 1 | (1 << 16);
+            qmd[20] = u32::from(cbuf_enabled);
+            qmd[32] = BASE as u32;
+            qmd[33] = (0x100 >> 4) << 19;
+            qmd[48] = program as u32;
+            qmd
+        };
+        let dispatches = || rasterizer.dispatches.get();
+        common::settings::set_current_program_id(crate::oot_network::PROGRAM_ID);
+
+        // The prepass opens the window; the network's passes are skipped; the output pass is
+        // replaced by a bilinear copy of the retained colour that decodes sRGB like the program.
+        assert!(engine.dispatch_native_compute(&qmd(PREPASS, true)));
+        assert_eq!(engine.network_skip_remaining, 32);
+        for _ in 0..3 {
+            assert!(engine.dispatch_native_compute(&qmd(MIDDLE, true)));
+        }
+        assert_eq!(engine.network_skip_remaining, 29);
+        assert!(engine.dispatch_native_compute(&qmd(OUTPUT, true)));
+        assert_eq!(dispatches(), 0);
+        {
+            let copies = rasterizer.copies.borrow();
+            assert_eq!(copies.len(), 1);
+            let (src, dst, config) = copies[0];
+            assert_eq!((src.address(), src.width, src.height), (0x10_0000, 960, 540));
+            assert_eq!((dst.address(), dst.width, dst.height), (0x30_0000, 1920, 1080));
+            assert_eq!(src.format, crate::gpu::RenderTargetFormat::B10G11R11Float as u32);
+            assert_eq!(dst.format, crate::gpu::RenderTargetFormat::A8B8G8R8Unorm as u32);
+            assert_eq!((src.block_width(), src.block_height(), src.depth), (1, 2, 1));
+            assert_eq!(config.operation, super::super::fermi_2d::Operation::SrcCopySrgbToLinear);
+            assert_eq!(config.filter, super::super::fermi_2d::Filter::Bilinear);
+            assert!(config.must_accelerate);
+            assert_eq!(
+                (config.src_x0, config.src_y0, config.src_x1, config.src_y1),
+                (0, 0, 960, 540)
+            );
+            assert_eq!(
+                (config.dst_x0, config.dst_y0, config.dst_x1, config.dst_y1),
+                (0, 0, 1920, 1080)
+            );
+        }
+        assert!(engine.native_upscale_input.is_none());
+        assert_eq!(engine.network_skip_remaining, 0);
+        // The window is closed: later passes run.
+        assert!(engine.dispatch_native_compute(&qmd(MIDDLE, true)));
+        assert_eq!(dispatches(), 1);
+
+        // A program without the sRGB decode gets a plain copy.
+        assert!(engine.dispatch_native_compute(&qmd(PREPASS, true)));
+        assert!(engine.dispatch_native_compute(&qmd(OUTPUT_PLAIN, true)));
+        assert_eq!(
+            rasterizer.copies.borrow()[1].2.operation,
+            super::super::fermi_2d::Operation::SrcCopy
+        );
+        assert_eq!(dispatches(), 1);
+
+        // An output more than 4x wider than the input is not an upscale of it: skipped as a
+        // network pass, the window then expires after 32 dispatches and drops the input.
+        backing[0x68..0x6c].copy_from_slice(&4u32.to_le_bytes());
+        assert!(engine.dispatch_native_compute(&qmd(PREPASS, true)));
+        for _ in 0..32 {
+            assert!(engine.dispatch_native_compute(&qmd(OUTPUT_PLAIN, true)));
+        }
+        assert_eq!(dispatches(), 1);
+        assert!(engine.native_upscale_input.is_none());
+        assert!(engine.dispatch_native_compute(&qmd(OUTPUT_PLAIN, true)));
+        assert_eq!(dispatches(), 2);
+        backing[0x68..0x6c].copy_from_slice(&3u32.to_le_bytes());
+
+        // The gameplay network (+0xc0 -> +0xd0) is not touched, nor is a dispatch without cbuf0.
+        assert!(engine.dispatch_native_compute(&qmd(GAMEPLAY, true)));
+        assert_eq!(dispatches(), 3);
+        assert!(engine.dispatch_native_compute(&qmd(PREPASS, false)));
+        assert_eq!(dispatches(), 4);
+        assert_eq!(engine.network_skip_remaining, 0);
+
+        // Another title runs every pass.
+        common::settings::set_current_program_id(crate::oot_network::PROGRAM_ID ^ 1);
+        assert!(engine.dispatch_native_compute(&qmd(PREPASS, true)));
+        assert!(engine.dispatch_native_compute(&qmd(MIDDLE, true)));
+        assert_eq!(dispatches(), 6);
+        common::settings::set_current_program_id(crate::oot_network::PROGRAM_ID);
+
+        // A failed copy runs the real output pass and disables the replacement from then on.
+        rasterizer.copy_result.set(false);
+        let copies = rasterizer.copies.borrow().len();
+        assert!(engine.dispatch_native_compute(&qmd(PREPASS, true)));
+        assert!(engine.dispatch_native_compute(&qmd(OUTPUT, true)));
+        assert_eq!(rasterizer.copies.borrow().len(), copies + 1);
+        assert_eq!(dispatches(), 7);
+        assert!(engine.native_upscale_disabled);
+        assert!(engine.dispatch_native_compute(&qmd(PREPASS, true)));
+        assert!(engine.dispatch_native_compute(&qmd(OUTPUT, true)));
+        assert_eq!(dispatches(), 9);
+        assert_eq!(rasterizer.copies.borrow().len(), copies + 1);
     }
 
     struct TestRasterizer {
@@ -2998,6 +3289,7 @@ mod tests {
                 start_address: 0,
                 end_address: 0,
                 preemtive: false,
+                in_flight: false,
             }
         }
 

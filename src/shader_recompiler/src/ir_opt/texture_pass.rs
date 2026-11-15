@@ -109,6 +109,20 @@ struct HandleBuildState {
     slots: std::collections::HashMap<InstRef, u32>,
     slot_count: u32,
     failure: Option<Opcode>,
+    // Lichii extension (texture_pass.cpp:643-660, g_handle_index_allowed and
+    // friends): a handle read from a table at an index each invocation reads
+    // for itself (a light index from a per-pixel light list) has no single
+    // value for a draw. With `index_allowed`, the build takes that index word
+    // as the element index of a descriptor array instead (HandleOp::Index),
+    // and `index` is the word, which the shader then indexes the array with.
+    // Only a word read at an address no draw-wide value gives (`load_depth`
+    // counts the reads whose address is being built), which is scaled to a
+    // byte offset (`scaled`) to give the address of another read, qualifies,
+    // and one word per program.
+    index_allowed: bool,
+    index: Option<InstRef>,
+    load_depth: i32,
+    scaled: i32,
 }
 
 fn is_undefined(op: Opcode) -> bool {
@@ -136,9 +150,13 @@ impl HandleBuildState {
         self.slots.insert(reference, u32::MAX);
         let start = code.len();
         let first_slot = self.slot_count;
+        let index_before = self.index;
         let result = self.build_handle_node(program, value, code, budget, block);
         self.slots.remove(&reference);
         if !result {
+            // The Tee of every value the dropped code kept goes with it, and
+            // so does an index word the dropped code took.
+            self.index = index_before;
             code.truncate(start);
             self.slots.retain(|_, slot| *slot == u32::MAX || *slot < first_slot);
             self.slot_count = first_slot;
@@ -168,9 +186,8 @@ impl HandleBuildState {
         };
         let mapped = match inst.opcode {
             Opcode::IAdd32 => Some((H::Add, 2)), Opcode::ISub32 => Some((H::Sub, 2)),
-            Opcode::IMul32 => Some((H::Mul, 2)), Opcode::BitwiseAnd32 => Some((H::And, 2)),
+            Opcode::BitwiseAnd32 => Some((H::And, 2)),
             Opcode::BitwiseOr32 => Some((H::Or, 2)), Opcode::BitwiseXor32 => Some((H::Xor, 2)),
-            Opcode::ShiftLeftLogical32 => Some((H::Shl, 2)),
             Opcode::ShiftRightLogical32 => Some((H::Shr, 2)),
             Opcode::ShiftRightArithmetic32 => Some((H::Sar, 2)),
             Opcode::INeg32 => Some((H::Neg, 1)), Opcode::BitwiseNot32 => Some((H::Not, 1)),
@@ -192,18 +209,34 @@ impl HandleBuildState {
             return true;
         }
         match inst.opcode {
+            Opcode::IMul32 | Opcode::ShiftLeftLogical32 => {
+                // By a constant: an index scaled to a byte offset (see
+                // build_handle_load_word's index word).
+                let is_shift = inst.opcode == Opcode::ShiftLeftLogical32;
+                let scaled = inst.arg(1).resolve(program).is_immediate()
+                    || (!is_shift && inst.arg(0).resolve(program).is_immediate());
+                self.scaled += i32::from(scaled);
+                let built = build(self, 0, code, budget) && build(self, 1, code, budget);
+                self.scaled -= i32::from(scaled);
+                if !built { return false; }
+                code.push(if is_shift { H::Shl } else { H::Mul } as u32);
+                true
+            }
             Opcode::Identity | Opcode::ConditionRef | Opcode::ShuffleIndex
             | Opcode::VoteAny | Opcode::VoteAll | Opcode::BitCastU32F32
             | Opcode::BitCastF32U32 => build(self, 0, code, budget),
-            Opcode::GetCbufU32 | Opcode::LoadStorage32 =>
-                self.build_handle_load_word(program, inst, 0, code, budget, block),
+            Opcode::GetCbufU32 | Opcode::LoadStorage32 => {
+                let node = get_inst_ref_recursive(program, value);
+                self.build_handle_load_word(program, inst, node, 0, code, budget, block)
+            }
             // Native storage loads can return four words as well as two.
             // Both extraction forms select a word at the same byte offset.
             Opcode::CompositeExtractU32x2 | Opcode::CompositeExtractU32x4 => {
                 let element = inst.arg(1).resolve(program);
                 if !element.is_immediate() { return false; }
                 let Some(source) = get_inst_recursive(program, *inst.arg(0)) else { return false };
-                self.build_handle_load_word(program, source, element.imm_u32().wrapping_mul(4),
+                let node = get_inst_ref_recursive(program, value);
+                self.build_handle_load_word(program, source, node, element.imm_u32().wrapping_mul(4),
                                             code, budget, block)
             }
             Opcode::Phi => {
@@ -295,8 +328,11 @@ impl HandleBuildState {
     }
 
     // Mechanical extraction of BuildHandleNode's load_word lambda: same owner.
-    fn build_handle_load_word(&mut self, program: &Program, source: &Inst, extra: u32,
-                              code: &mut Vec<u32>, budget: &mut i32, block: u32) -> bool {
+    // `node` is the instruction BuildHandleNode is building (the word), which
+    // the index word records.
+    fn build_handle_load_word(&mut self, program: &Program, source: &Inst, node: Option<InstRef>,
+                              extra: u32, code: &mut Vec<u32>, budget: &mut i32,
+                              block: u32) -> bool {
         use crate::shader_info::HandleOp as H;
         let is_cbuf = matches!(source.opcode, Opcode::GetCbufU32 | Opcode::GetCbufU32x2);
         if !is_cbuf && !matches!(source.opcode, Opcode::LoadStorage32
@@ -309,9 +345,45 @@ impl HandleBuildState {
             code.extend([H::Cbuf as u32, index, offset.imm_u32().wrapping_add(extra)]);
             return true;
         }
-        if !self.build_handle_program(program, offset, code, budget, block) { return false; }
+        if !self.build_handle_address(program, offset, code, budget, block) {
+            return self.build_handle_index_word(node, code);
+        }
         if extra != 0 { code.extend([H::Immediate as u32, extra, H::Add as u32]); }
         code.extend([if is_cbuf { H::CbufDynamic } else { H::Storage } as u32, index]);
+        true
+    }
+
+    // Mechanical extraction of load_word's `address` lambda (Lichii
+    // texture_pass.cpp:757-768): the read's address. One for a word that gives
+    // another read's address must be computable on its own: the word is the
+    // index word otherwise.
+    fn build_handle_address(&mut self, program: &Program, offset: Value, code: &mut Vec<u32>,
+                            budget: &mut i32, block: u32) -> bool {
+        let allowed = self.index_allowed;
+        let scaled = self.scaled;
+        self.index_allowed = allowed && self.load_depth == 0;
+        self.scaled = 0;
+        self.load_depth += 1;
+        let built = self.build_handle_program(program, offset, code, budget, block);
+        self.load_depth -= 1;
+        self.scaled = scaled;
+        self.index_allowed = allowed;
+        built
+    }
+
+    // Mechanical extraction of load_word's `index_word` lambda (Lichii
+    // texture_pass.cpp:770-779): this word as the element index of a
+    // descriptor array (`index_allowed`).
+    fn build_handle_index_word(&mut self, node: Option<InstRef>, code: &mut Vec<u32>) -> bool {
+        use crate::shader_info::HandleOp as H;
+        let Some(node) = node else { return false };
+        if !self.index_allowed || self.load_depth == 0 || self.scaled == 0
+            || self.index.is_some_and(|index| index != node)
+        {
+            return false;
+        }
+        self.index = Some(node);
+        code.push(H::Index as u32);
         true
     }
 }
@@ -354,6 +426,7 @@ fn texture_pass_impl(
         env.texture_pass_caches().clear();
     }
 
+    let mut dominance: Option<Dominance> = None;
     let post_order_blocks = program.post_order_blocks.clone();
     for block_index in post_order_blocks {
         if let Some(env) = env.as_deref_mut() {
@@ -384,7 +457,27 @@ fn texture_pass_impl(
                         let mut code = Vec::new();
                         let mut state = HandleBuildState::default();
                         let mut budget = 4096;
-                        if !state.build_handle_program(program, value, &mut code, &mut budget, block_index) {
+                        let mut built = state.build_handle_program(
+                            program, value, &mut code, &mut budget, block_index);
+                        let mut index_word = None;
+                        // Only sampled textures: an array of storage images would have
+                        // every element taken as written (Lichii texture_pass.cpp:1312-1327).
+                        let opcode = indexed_instruction(inst.opcode).unwrap_or(inst.opcode);
+                        let sampled = !is_storage_image_instruction(opcode)
+                            && TextureInstInfo::from_u32(inst.flags).texture_type
+                                != TextureType::Buffer as u8;
+                        if !built && sampled && host_info.support_handle_table_arrays {
+                            // Read from a table at an index each invocation reads for
+                            // itself: a descriptor array of the table's entries, which the
+                            // shader indexes with that index.
+                            code.clear();
+                            budget = 4096;
+                            state = HandleBuildState { index_allowed: true, ..Default::default() };
+                            built = state.build_handle_program(
+                                program, value, &mut code, &mut budget, block_index);
+                            index_word = if built { state.index } else { None };
+                        }
+                        if !built {
                             // Temporary, opt-in investigation capture. Remove before delivery.
                             if let Some(directory) = std::env::var_os("RUZU_HANDLE_FAILURE_DUMP_DIR") {
                                 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -411,7 +504,25 @@ fn texture_pass_impl(
                                 program.info.handle_programs.push(code);
                                 program.info.handle_programs.len() - 1
                             });
-                        ConstBufferAddr { handle_program: index as u32, ..ConstBufferAddr::bound(0, 0) }
+                        // The shader indexes the array with the index word, which must
+                        // be defined wherever the texture instruction runs; where it
+                        // isn't, every invocation takes the first element.
+                        let use_ref = InstRef { block: block_index, inst: inst_index as u32 };
+                        let count = match index_word {
+                            Some(index_word) if dominance
+                                .get_or_insert_with(|| Dominance::new(program))
+                                .dominates(program, index_word, use_ref) => HANDLE_TABLE_SIZE,
+                            _ => 1,
+                        };
+                        ConstBufferAddr {
+                            handle_program: index as u32,
+                            dynamic_offset: match index_word {
+                                Some(index_word) if count > 1 => Value::Inst(index_word),
+                                _ => Value::Void,
+                            },
+                            count,
+                            ..ConstBufferAddr::bound(0, 0)
+                        }
                     }
                 },
             };
@@ -524,10 +635,14 @@ fn texture_pass_impl(
             _ => {}
         }
 
-        let size_shift = if cbuf.count > 1 {
-            dynamic_descriptor_size_shift(cbuf.dynamic_offset, program)
-        } else {
+        // Lichii DescriptorSizeShift (texture_pass.cpp:366-370): the index word
+        // of a handle-table array is an element index, not a byte offset.
+        let size_shift = if cbuf.count <= 1 {
             DESCRIPTOR_SIZE_SHIFT
+        } else if cbuf.handle_program != u32::MAX {
+            0
+        } else {
+            dynamic_descriptor_size_shift(cbuf.dynamic_offset, program)
         };
         let mut count = cbuf.count;
 
@@ -623,13 +738,17 @@ fn texture_pass_impl(
         }
         let dynamic_index = if count > 1 {
             let block = &mut program.blocks[texture_inst.block as usize];
-            let shifted = insert_before(
-                block,
-                texture_inst.block,
-                texture_inst.inst,
-                Opcode::ShiftRightLogical32,
-                vec![cbuf.dynamic_offset, Value::ImmU32(size_shift)],
-            );
+            let shifted = if size_shift != 0 {
+                insert_before(
+                    block,
+                    texture_inst.block,
+                    texture_inst.inst,
+                    Opcode::ShiftRightLogical32,
+                    vec![cbuf.dynamic_offset, Value::ImmU32(size_shift)],
+                )
+            } else {
+                cbuf.dynamic_offset
+            };
             insert_before(
                 block,
                 texture_inst.block,
@@ -657,6 +776,96 @@ fn texture_pass_impl(
                 }
             }
         }
+    }
+}
+
+/// Elements of the descriptor array of a handle read from a table at an index
+/// word (see `HandleBuildState::index_allowed`): the table entries a draw
+/// binds, larger indices taking the last one.
+///
+/// Lichii extension: `texture_pass.cpp:1061-1063` `HANDLE_TABLE_SIZE`.
+const HANDLE_TABLE_SIZE: u32 = 64;
+
+/// The immediate dominator of each block of the program, over post order
+/// numbers (Cooper, Harvey and Kennedy), built when a handle program first
+/// needs it.
+///
+/// Lichii extension: `texture_pass.cpp:1068-1134` `Dominance`. The Rust IR
+/// names an instruction's block in its `InstRef`, so no instruction-to-block
+/// map is kept.
+struct Dominance {
+    numbers: std::collections::HashMap<u32, usize>,
+    idom: Vec<usize>,
+}
+
+impl Dominance {
+    const NONE: usize = usize::MAX;
+
+    fn new(program: &Program) -> Self {
+        let order = &program.post_order_blocks;
+        let numbers: std::collections::HashMap<u32, usize> =
+            order.iter().enumerate().map(|(number, &block)| (block, number)).collect();
+        let mut idom = vec![Self::NONE; order.len()];
+        if order.is_empty() {
+            return Self { numbers, idom };
+        }
+        let entry = order.len() - 1;
+        idom[entry] = entry;
+        let intersect = |idom: &[usize], mut lhs: usize, mut rhs: usize| {
+            while lhs != rhs {
+                while lhs < rhs { lhs = idom[lhs]; }
+                while rhs < lhs { rhs = idom[rhs]; }
+            }
+            lhs
+        };
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for number in (0..entry).rev() {
+                let mut dominator = Self::NONE;
+                for predecessor in &program.blocks[order[number] as usize].imm_predecessors {
+                    let Some(&pred) = numbers.get(predecessor) else { continue };
+                    if idom[pred] == Self::NONE { continue; }
+                    dominator = if dominator == Self::NONE {
+                        pred
+                    } else {
+                        intersect(&idom, pred, dominator)
+                    };
+                }
+                if dominator != idom[number] {
+                    idom[number] = dominator;
+                    changed = true;
+                }
+            }
+        }
+        Self { numbers, idom }
+    }
+
+    /// Whether `def` runs before `use_ref` on every path to `use_ref`.
+    fn dominates(&self, program: &Program, def: InstRef, use_ref: InstRef) -> bool {
+        let (Some(&target), Some(&use_number)) =
+            (self.numbers.get(&def.block), self.numbers.get(&use_ref.block))
+        else {
+            return false;
+        };
+        if def.block == use_ref.block {
+            for (index, _) in program.blocks[def.block as usize].indexed_iter() {
+                if index == def.inst { return true; }
+                if index == use_ref.inst { return false; }
+            }
+            return false;
+        }
+        let mut number = use_number;
+        while self.idom[number] != Self::NONE {
+            if self.idom[number] == number {
+                return false; // the entry
+            }
+            number = self.idom[number];
+            if number == target {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1878,6 +2087,114 @@ mod tests {
         );
     }
 
+    /// A handle read from a light table at an index each invocation reads for
+    /// itself (a per-tile light list), as Ocarina of Time's clustered light
+    /// loop does: Lichii's MakeInst turns it into a descriptor array of the
+    /// table's entries, indexed by that index word.
+    fn handle_table_program() -> (Program, u32, u32) {
+        let mut program = fragment_program();
+        let block = &mut program.blocks[0];
+        let reference = |inst| Value::Inst(InstRef { block: 0, inst });
+        let lane = block.append_inst(Inst::new(Opcode::LaneId, vec![]));
+        let word = block.append_new_inst(Opcode::LoadStorage32, vec![Value::ImmU32(0), reference(lane)]);
+        let scaled = block.append_new_inst(Opcode::IMul32, vec![reference(word), Value::ImmU32(0x60)]);
+        let address = block.append_new_inst(Opcode::IAdd32, vec![reference(scaled), Value::ImmU32(0x10)]);
+        let handle = block.append_new_inst(Opcode::LoadStorage32, vec![Value::ImmU32(1), reference(address)]);
+        let sample = block.append_inst(Inst::with_flags(
+            Opcode::BindlessImageSampleImplicitLod,
+            vec![reference(handle), Value::Void],
+            TextureInstInfo { texture_type: TextureType::Color2D as u8, ..Default::default() }.to_u32(),
+        ));
+        (program, word as u32, sample as u32)
+    }
+
+    #[test]
+    fn handle_read_at_per_invocation_index_becomes_descriptor_array() {
+        use crate::shader_info::{evaluate_handle_program, HandleOp as H};
+        let (mut program, word, sample) = handle_table_program();
+        let mut env = MockEnvironment::default();
+        let host_info = HostTranslateInfo { support_handle_table_arrays: true, ..Default::default() };
+        texture_pass(&mut env, &mut program, &host_info);
+
+        assert_eq!(program.info.texture_descriptors.len(), 1);
+        let desc = &program.info.texture_descriptors[0];
+        assert_eq!(desc.count, HANDLE_TABLE_SIZE);
+        assert_eq!(desc.size_shift, 0);
+        let code = &program.info.handle_programs[desc.handle_program as usize];
+        assert_eq!(code, &vec![H::Index as u32, H::Immediate as u32, 0x60, H::Mul as u32,
+                               H::Immediate as u32, 0x10, H::Add as u32, H::Storage as u32, 1]);
+        for element in [0, 7, 63] {
+            assert_eq!(evaluate_handle_program(code, |_, _| panic!("no cbuf"),
+                |binding, offset| { assert_eq!(binding, 1); offset }, element),
+                Some(element * 0x60 + 0x10));
+        }
+        // The shader indexes the array with the index word itself (an element
+        // index, no byte-offset shift), clamped to the last element.
+        let sample_inst = program.blocks[0].instructions[sample as usize].as_ref().unwrap();
+        assert_eq!(sample_inst.opcode, Opcode::ImageSampleImplicitLod);
+        let Value::Inst(clamp) = sample_inst.args[0] else { panic!("dynamic index expected") };
+        let clamp = get_inst(&program, clamp).unwrap();
+        assert_eq!(clamp.opcode, Opcode::UMin32);
+        assert_eq!(get_inst_ref_recursive(&program, clamp.args[0]),
+                   Some(InstRef { block: 0, inst: word }));
+        assert_eq!(clamp.args[1], Value::ImmU32(HANDLE_TABLE_SIZE - 1));
+    }
+
+    #[test]
+    fn handle_table_arrays_need_host_support() {
+        let (mut program, _, _) = handle_table_program();
+        let mut env = MockEnvironment::default();
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            texture_pass(&mut env, &mut program, &HostTranslateInfo::default());
+        }))
+        .expect_err("without nonuniform indexing the handle stays uncomputable");
+        let exception = payload
+            .downcast_ref::<crate::exception::NotImplementedException>()
+            .expect("failure must remain a shader NotImplementedException");
+        assert_eq!(exception.to_string(),
+                   "Failed to compute bindless texture handle: Some(LaneId) is not implemented");
+    }
+
+    #[test]
+    fn index_word_must_be_scaled_into_another_reads_address() {
+        // The unscaled word read at an unknown address is the handle itself,
+        // not an element index: no program.
+        let mut program = fragment_program();
+        let block = &mut program.blocks[0];
+        let lane = block.append_inst(Inst::new(Opcode::LaneId, vec![]));
+        let word = block.append_new_inst(Opcode::LoadStorage32,
+            vec![Value::ImmU32(0), Value::Inst(InstRef { block: 0, inst: lane })]);
+        let mut state = HandleBuildState { index_allowed: true, ..Default::default() };
+        let mut code = Vec::new();
+        let mut budget = 4096;
+        assert!(!state.build_handle_program(&program, Value::Inst(InstRef { block: 0, inst: word }),
+                                            &mut code, &mut budget, 0));
+        assert!(state.index.is_none());
+        assert!(code.is_empty());
+    }
+
+    #[test]
+    fn dominance_follows_the_immediate_dominator_chain() {
+        // 0 -> {1, 2} -> 3: block 0 dominates 3, neither branch does.
+        let mut program = Program::new(ShaderStage::Fragment);
+        for _ in 0..4 { program.blocks.push(Block::new()); }
+        program.blocks[1].imm_predecessors = vec![0];
+        program.blocks[2].imm_predecessors = vec![0];
+        program.blocks[3].imm_predecessors = vec![1, 2];
+        program.post_order_blocks = vec![3, 1, 2, 0];
+        let defs: Vec<u32> = (0..4).map(|block| program.blocks[block]
+            .append_inst(Inst::new(Opcode::LaneId, vec![])) as u32).collect();
+        let late = program.blocks[3].append_inst(Inst::new(Opcode::LaneId, vec![])) as u32;
+        let dominance = Dominance::new(&program);
+        let at = |block: u32, inst: u32| InstRef { block, inst };
+        let use_ref = at(3, late);
+        assert!(dominance.dominates(&program, at(0, defs[0]), use_ref));
+        assert!(!dominance.dominates(&program, at(1, defs[1]), use_ref));
+        assert!(!dominance.dominates(&program, at(2, defs[2]), use_ref));
+        assert!(dominance.dominates(&program, at(3, defs[3]), use_ref));
+        assert!(!dominance.dominates(&program, use_ref, at(3, defs[3])));
+    }
+
     #[test]
     fn zero_texture_handle_mask_preserves_upstream_countr_zero() {
         let mut program = fragment_program();
@@ -2059,7 +2376,7 @@ mod tests {
                 assert_eq!(evaluate_handle_program(&code, |_, _| panic!("storage only"),
                     |binding, offset| {
                         assert_eq!((binding, offset), (2, 32 + element * 4)); 123
-                    }), Some(123));
+                    }, 0), Some(123));
             }
         }
     }
@@ -2084,7 +2401,7 @@ mod tests {
         for data in [9, 15] {
             assert_eq!(evaluate_handle_program(&code,
                 |index, offset| { assert_eq!((index, offset), (0, 16)); 0x1000 },
-                |index, offset| { assert_eq!((index, offset), (2, 36)); data }), Some(data));
+                |index, offset| { assert_eq!((index, offset), (2, 36)); data }, 0), Some(data));
         }
     }
 
@@ -2112,7 +2429,7 @@ mod tests {
             let code = &program.info.handle_programs[index];
             for contents in [100, 200] {
                 assert_eq!(evaluate_handle_program(code, |_, _| panic!("not a cbuf handle"),
-                    |binding, offset| { assert_eq!(binding, 0); contents + offset }),
+                    |binding, offset| { assert_eq!(binding, 0); contents + offset }, 0),
                     Some(contents + (index as u32 + 1) * 4));
             }
         }
@@ -2136,7 +2453,7 @@ mod tests {
         let mut code = Vec::new();
         let mut state = HandleBuildState::default();
         assert!(state.build_handle_program(&program, value, &mut code, &mut 4096, 0));
-        assert_eq!(evaluate_handle_program(&code, |_, _| 6, |_, _| unreachable!()), Some(7));
+        assert_eq!(evaluate_handle_program(&code, |_, _| 6, |_, _| unreachable!(), 0), Some(7));
         assert_eq!(state.slot_count, 1);
         assert_eq!(state.failure, Some(Opcode::LaneId));
     }
@@ -2176,7 +2493,7 @@ mod tests {
             let mut code = Vec::new();
             assert!(HandleBuildState::default().build_handle_program(&program,
                 Value::Inst(InstRef { block: 0, inst }), &mut code, &mut 4096, 0));
-            assert_eq!(evaluate_handle_program(&code, |_, _| 0, |_, _| 0), Some(expected), "{op:?}");
+            assert_eq!(evaluate_handle_program(&code, |_, _| 0, |_, _| 0, 0), Some(expected), "{op:?}");
         }
         let mut program = fragment_program();
         let add = program.blocks[0].append_new_inst(Opcode::IAdd32,
@@ -2186,12 +2503,12 @@ mod tests {
         let mut code = Vec::new();
         assert!(HandleBuildState::default().build_handle_program(&program,
             Value::Inst(InstRef { block: 0, inst: carry }), &mut code, &mut 4096, 0));
-        assert_eq!(evaluate_handle_program(&code, |_, _| 0, |_, _| 0), Some(1));
+        assert_eq!(evaluate_handle_program(&code, |_, _| 0, |_, _| 0, 0), Some(1));
         let alias = program.blocks[0].append_new_inst(Opcode::Identity, vec![Value::ImmU1(true)]);
         code.clear();
         assert!(HandleBuildState::default().build_handle_program(&program,
             Value::Inst(InstRef { block: 0, inst: alias }), &mut code, &mut 4096, 0));
-        assert_eq!(evaluate_handle_program(&code, |_, _| 0, |_, _| 0), Some(1));
+        assert_eq!(evaluate_handle_program(&code, |_, _| 0, |_, _| 0, 0), Some(1));
     }
 
     #[test]
@@ -2719,7 +3036,7 @@ mod tests {
         for (descriptor, expected) in base.image_descriptors.iter().zip([17, 29]) {
             assert_eq!(crate::shader_info::evaluate_handle_program(
                 &base.handle_programs[descriptor.handle_program as usize],
-                |_, _| panic!("constant program"), |_, _| panic!("constant program"),
+                |_, _| panic!("constant program"), |_, _| panic!("constant program"), 0,
             ), Some(expected));
         }
     }

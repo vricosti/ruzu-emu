@@ -20,7 +20,9 @@ use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::maxwell_3d::{EngineHint, Maxwell3D, SamplerBinding, ShaderStageType};
 use crate::memory_manager::MemoryManager;
 use crate::texture_cache::format_lookup_table::pixel_format_from_texture_info_raw;
-use crate::textures::texture::{texture_pair, TextureType as TegraTextureType, TicEntry};
+use crate::textures::texture::{
+    texture_header_index, texture_pair, TextureType as TegraTextureType, TicEntry,
+};
 use common::fs::fs_util::path_to_utf8_string;
 use common::fs::path_util::{get_ruzu_path, RuzuPath};
 use parking_lot::Mutex as ParkingLotMutex;
@@ -103,6 +105,58 @@ fn make_indirect_cbuf_key(index: u32, offset: u32, indirect: u32) -> u64 {
 
 pub fn make_cbuf_key(index: u32, offset: u32) -> u64 {
     ((index as u64) << 32) | (offset as u64)
+}
+
+/// Lichii `NullStoragePointerSlots` (shader_environment.cpp:59-76): constant buffer slots that
+/// held a null pointer when the program was translated and were therefore not bound as storage
+/// buffers. A later non-null value makes the translation stale.
+fn null_storage_pointer_slots(
+    cbuf_values: &HashMap<u64, u32>,
+    storage_pointer_types: &HashMap<u64, bool>,
+) -> Vec<(u32, u32)> {
+    let mut slots = Vec::new();
+    for (&key, &mapped) in storage_pointer_types {
+        if mapped || (key >> 63) != 0 {
+            continue;
+        }
+        let low = cbuf_values.get(&key);
+        let high = cbuf_values.get(&key.wrapping_add(4));
+        if low == Some(&0) && high == Some(&0) {
+            slots.push(((key >> 32) as u32, key as u32));
+        }
+    }
+    slots
+}
+
+/// Lichii `MappedStoragePointerKeys` (shader_environment.cpp:79-88): the slots bound as storage
+/// buffer pointers, sorted.
+fn mapped_storage_pointer_keys(storage_pointer_types: &HashMap<u64, bool>) -> Vec<u64> {
+    let mut keys: Vec<u64> = storage_pointer_types
+        .iter()
+        .filter_map(|(&key, &mapped)| mapped.then_some(key))
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// The descriptor `GenericEnvironment::read_texture_info` compiles for when a
+/// handle indexes past the pool: what the texture cache's null view is, a
+/// plain normalized 2D A8B8G8R8 UNORM texture, every other bit zero.
+///
+/// Lichii extension: the fallback entry built inline in
+/// `GenericEnvironment::ReadTextureInfo` (shader_environment.cpp:479-487).
+fn null_view_tic_entry() -> TicEntry {
+    const FORMAT_A8B8G8R8: u64 = 0x08;
+    const COMPONENT_UNORM: u64 = 2;
+    const TEXTURE_2D: u64 = 1;
+    let word0 = FORMAT_A8B8G8R8
+        | (COMPONENT_UNORM << 7)
+        | (COMPONENT_UNORM << 10)
+        | (COMPONENT_UNORM << 13)
+        | (COMPONENT_UNORM << 16);
+    // texture_type: word 4 bits [26:23]; normalized_coords: word 5 bit 31.
+    let word4_5 = (TEXTURE_2D << 23) | (1u64 << 63);
+    TicEntry { raw: [word0, 0, word4_5, 0] }
 }
 
 fn stage_to_prefix(stage: ShaderStage) -> &'static str {
@@ -254,6 +308,24 @@ pub trait GenericEnvironmentOwner {
 }
 
 impl GenericEnvironment {
+    /// Lichii `GenericEnvironment::NullStoragePointerSlots`.
+    pub fn null_storage_pointer_slots(&self) -> Vec<(u32, u32)> {
+        null_storage_pointer_slots(&self.cbuf_values, &self.storage_pointer_types)
+    }
+
+    /// Lichii `GenericEnvironment::MappedStoragePointerKeys`.
+    pub fn mapped_storage_pointer_keys(&self) -> Vec<u64> {
+        mapped_storage_pointer_keys(&self.storage_pointer_types)
+    }
+
+    /// Lichii `GenericEnvironment::KeepStoragePointers`: answers the classification of these keys
+    /// as storage buffer pointers, whatever the slots hold now; called before translation.
+    pub fn keep_storage_pointers(&mut self, keys: &[u64]) {
+        for &key in keys {
+            self.storage_pointer_types.insert(key, true);
+        }
+    }
+
     /// GenericEnvironment::IsCbufStorageBufferPointer, with the derived
     /// environment retained for virtual constant-buffer reads.
     fn is_cbuf_storage_buffer_pointer<E: GenericEnvironmentOwner + shader_recompiler::environment::Environment>(
@@ -798,15 +870,25 @@ impl GenericEnvironment {
         via_header_index: bool,
         raw: u32,
     ) -> TicEntry {
-        let (tic_index, _) = texture_pair(raw, via_header_index);
+        let (handle_index, _) = texture_pair(raw, via_header_index);
+        // Lichii extension (shader_environment.cpp:465-489): a Switch 2 handle
+        // may hold the header's byte offset instead of its index
+        // (TextureHeaderIndex), and an index still past the pool compiles for
+        // the null view the texture cache binds for it at draw time
+        // (VisitImageView) instead of reading bytes that are no descriptor.
+        let native_tiling = self
+            .gpu_memory
+            .as_ref()
+            .is_some_and(|gpu_memory| gpu_memory.lock().uses_native_tiling());
+        let tic_index = texture_header_index(handle_index, tic_limit, native_tiling);
         if tic_index > tic_limit {
-            // Upstream uses ASSERT here. ASSERT is fail-soft unless the user
-            // explicitly enables debug asserts, so a Rust `assert!` would
-            // incorrectly kill the GPU thread in normal release builds.
-            log::error!(
-                "shader_environment.cpp: assert handle.first <= tic_limit (tic_index={tic_index:#x}, tic_limit={tic_limit:#x})"
-            );
-            common::assert::assert_fail_soft_impl();
+            static WARNINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                log::warn!(
+                    "Texture handle {raw:#x} indexes past the descriptor pool (index {tic_index} > limit {tic_limit}); using a null 2D texture"
+                );
+            }
+            return null_view_tic_entry();
         }
         let mut raw_bytes = [0u8; 32];
         if let Some(gpu_memory) = self.gpu_memory.as_ref() {
@@ -1872,6 +1954,16 @@ pub struct FileEnvironment {
 }
 
 impl FileEnvironment {
+    /// Lichii `FileEnvironment::NullStoragePointerSlots`.
+    pub fn null_storage_pointer_slots(&self) -> Vec<(u32, u32)> {
+        null_storage_pointer_slots(&self.cbuf_values, &self.storage_pointer_types)
+    }
+
+    /// Lichii `FileEnvironment::MappedStoragePointerKeys`.
+    pub fn mapped_storage_pointer_keys(&self) -> Vec<u64> {
+        mapped_storage_pointer_keys(&self.storage_pointer_types)
+    }
+
     /// Older entries persisted combined storage formats without the TIC
     /// swizzle. They cannot determine whether sampling returned depth or stencil.
     /// Loaders must consume the key, skip prebuilding this entry and let live
@@ -3751,7 +3843,9 @@ mod tests {
     }
 
     #[test]
-    fn read_texture_info_limit_assert_is_fail_soft_like_upstream() {
+    fn read_texture_info_past_the_pool_compiles_for_the_null_view() {
+        // Lichii shader_environment.cpp:471-489: the bytes past the pool are
+        // no descriptor; compile for the null 2D RGBA8 view bound at draw time.
         let reads = Arc::new(Mutex::new(Vec::new()));
         let reads_clone = Arc::clone(&reads);
         let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
@@ -3762,8 +3856,36 @@ mod tests {
 
         let entry = env.read_texture_info(0x1000, 0x10ff, false, u32::MAX);
 
-        assert!(entry == TicEntry::default());
-        assert_eq!(reads.lock().unwrap().as_slice(), &[(0x0200_0fe0, 32)]);
+        assert!(entry == null_view_tic_entry());
+        assert!(reads.lock().unwrap().is_empty());
+        assert_eq!(entry.format(), crate::textures::texture::TextureFormat::A8B8G8R8 as u32);
+        for component in [entry.r_type(), entry.g_type(), entry.b_type(), entry.a_type()] {
+            assert_eq!(component, crate::textures::texture::ComponentType::Unorm as u32);
+        }
+        assert_eq!(entry.texture_type(), TegraTextureType::Texture2D as u32);
+        assert_eq!(entry.normalized_coords(), 1);
+        assert_eq!(entry.address_low(), 0);
+        assert_eq!(
+            crate::texture_cache::format_lookup_table::pixel_format_from_texture_info_raw(
+                entry.format(), entry.r_type(), entry.g_type(), entry.b_type(), entry.a_type(),
+                entry.srgb_conversion() != 0),
+            crate::surface::PixelFormat::A8B8G8R8Unorm
+        );
+    }
+
+    #[test]
+    fn read_texture_info_inside_the_pool_reads_the_descriptor() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let reads_clone = Arc::clone(&reads);
+        let reader: GpuMemoryReader = Arc::new(move |gpu_addr, dst| {
+            reads_clone.lock().unwrap().push((gpu_addr, dst.len()));
+            dst.fill(0);
+        });
+        let env = GenericEnvironment::new().with_gpu_read(reader);
+
+        let _ = env.read_texture_info(0x1000, 0x10ff, false, 0x10ff);
+
+        assert_eq!(reads.lock().unwrap().as_slice(), &[(0x1000 + 0x10ff * 32, 32)]);
     }
 
     /// Build a 64 KiB GPU-memory mock with a Maxwell self-branch sentinel
@@ -4659,5 +4781,29 @@ mod tests {
             shader_recompiler::environment::Environment::read_texture_pixel_format(&mut env, 9),
             TexturePixelFormat::A8B8G8R8Unorm
         );
+    }
+
+    /// Lichii NullStoragePointerSlots / MappedStoragePointerKeys / KeepStoragePointers: a slot
+    /// classified as a non-pointer while it held zero is reported for the stale-translation
+    /// check; kept keys are answered as pointers on the next translation.
+    #[test]
+    fn null_pointer_slots_and_kept_pointers() {
+        let mut values = HashMap::new();
+        let mut types = HashMap::new();
+        values.insert(make_cbuf_key(4, 0x90), 0);
+        values.insert(make_cbuf_key(4, 0x94), 0);
+        types.insert(make_cbuf_key(4, 0x90), false);
+        values.insert(make_cbuf_key(4, 0xa0), 7); // a scalar, not a null pointer
+        values.insert(make_cbuf_key(4, 0xa4), 0);
+        types.insert(make_cbuf_key(4, 0xa0), false);
+        types.insert(make_cbuf_key(4, 0x130), true);
+        types.insert(make_indirect_cbuf_key(4, 0x90, 8), false);
+        assert_eq!(null_storage_pointer_slots(&values, &types), vec![(4, 0x90)]);
+        assert_eq!(mapped_storage_pointer_keys(&types), vec![make_cbuf_key(4, 0x130)]);
+        let mut env = GenericEnvironment::default();
+        env.storage_pointer_types = types;
+        env.keep_storage_pointers(&[make_cbuf_key(4, 0x90)]);
+        assert_eq!(env.mapped_storage_pointer_keys(),
+            vec![make_cbuf_key(4, 0x90), make_cbuf_key(4, 0x130)]);
     }
 }

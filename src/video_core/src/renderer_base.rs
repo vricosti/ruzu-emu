@@ -154,6 +154,16 @@ pub trait RendererBase: Send {
 
     /// Install the callback implementing upstream `gpu.InvalidateGPUCache()`.
     fn set_invalidate_gpu_cache_callback(&mut self, _callback: InvalidateGpuCacheCallback) {}
+
+    /// Install `Gpu::for_each_pending_cpu_write` as the buffer cache's source
+    /// of collected, not yet applied, guest CPU writes. Lichii wires it in
+    /// `RasterizerVulkan`'s constructor only (vk_rasterizer.cpp:468-471): the
+    /// other renderers take no read downloads and need none.
+    fn set_pending_cpu_writes(
+        &mut self,
+        _source: crate::buffer_cache::buffer_cache_base::PendingCpuWrites,
+    ) {
+    }
 }
 
 /// Concrete base renderer data, shared by all renderer implementations.

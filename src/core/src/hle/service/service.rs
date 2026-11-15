@@ -199,11 +199,47 @@ pub trait ServiceFramework: SessionRequestHandler {
     }
 
     /// Reports an unimplemented function and optionally writes a stub success response.
+    ///
+    /// Lichii `ServiceFrameworkBase::ReportUnimplementedFunction` (service.cpp:142-183): the
+    /// experimental Eden-NX2 auto stub replies with `STUB_ZEROED_WORDS` zeroed words (an empty
+    /// reply hands the caller the request's leftover words as output data) and reports each
+    /// auto-stubbed (service, command) pair once.
     fn report_unimplemented_function(
         &self,
         ctx: &mut HLERequestContext,
         info: Option<&FunctionInfo>,
     ) {
+        // Experimental Eden-NX2 fallback, explicitly authorized for this port.
+        // Like getenv upstream, presence (including an empty value) enables it.
+        static ENV_AUTO_STUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let env_auto_stub = *ENV_AUTO_STUB.get_or_init(|| std::env::var_os("EDEN_NX2_AUTO_STUB").is_some());
+        let caller = ctx.get_thread().and_then(|thread| {
+            thread.lock().unwrap().parent.as_ref().and_then(std::sync::Weak::upgrade)
+        });
+        let caller_is_switch2 = caller.is_some_and(|process| process.lock().unwrap().is_switch2());
+        let auto_stub = *common::settings::values().use_auto_stub.get_value()
+            || env_auto_stub
+            || self.get_service_name().starts_with(super::nx2_stub_interface::NX2_STUB_PREFIX)
+            || caller_is_switch2;
+        // Auto-stubbed commands are reported once each (Lichii: a title polling an unknown
+        // command every frame flushed the log file with one report per call).
+        if auto_stub {
+            static REPORTED: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::BTreeSet<(String, u32)>>,
+            > = std::sync::OnceLock::new();
+            let first_report = REPORTED
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .insert((self.get_service_name().to_owned(), ctx.get_command()));
+            if !first_report {
+                let mut rb = ipc_helpers::ResponseBuilder::new(ctx, 2 + STUB_ZEROED_WORDS, 0, 0);
+                rb.push_result(RESULT_SUCCESS);
+                push_stub_zeroes(&mut rb);
+                return;
+            }
+        }
+
         let function_name = match info {
             Some(fi) => fi.name.to_string(),
             None => "<unknown>".to_owned(),
@@ -217,7 +253,10 @@ pub trait ServiceFramework: SessionRequestHandler {
             self.get_service_name(),
             cmd_buf[0]
         );
-        for i in 1..=8 {
+        // Lichii: the Switch 2 video decoder sessions are being reverse engineered, so whole
+        // requests are dumped for them.
+        let last_word = if self.get_service_name().starts_with("nx2:vdec") { 47 } else { 8 };
+        for i in 1..=last_word {
             buf.push_str(&format!(", [{}]={:#x}", i, cmd_buf[i]));
         }
         buf.push('}');
@@ -239,22 +278,11 @@ pub trait ServiceFramework: SessionRequestHandler {
         log::error!("Unknown / unimplemented {}", buf);
         common::assert::assert_fail_soft_impl();
 
-        // Experimental Eden-NX2 fallback, explicitly authorized for this port.
-        // Like getenv upstream, presence (including an empty value) enables it.
-        static ENV_AUTO_STUB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let env_auto_stub = *ENV_AUTO_STUB.get_or_init(|| std::env::var_os("EDEN_NX2_AUTO_STUB").is_some());
-        let caller = ctx.get_thread().and_then(|thread| {
-            thread.lock().unwrap().parent.as_ref().and_then(std::sync::Weak::upgrade)
-        });
-        let caller_is_switch2 = caller.is_some_and(|process| process.lock().unwrap().is_switch2());
-        if *common::settings::values().use_auto_stub.get_value()
-            || env_auto_stub
-            || self.get_service_name().starts_with(super::nx2_stub_interface::NX2_STUB_PREFIX)
-            || caller_is_switch2
-        {
-            log::warn!("Using auto stub fallback!");
-            let mut rb = ipc_helpers::ResponseBuilder::new(ctx, 2, 0, 0);
+        if auto_stub {
+            log::warn!("Using auto stub fallback (repeats of this command are not logged)");
+            let mut rb = ipc_helpers::ResponseBuilder::new(ctx, 2 + STUB_ZEROED_WORDS, 0, 0);
             rb.push_result(RESULT_SUCCESS);
+            push_stub_zeroes(&mut rb);
         }
     }
 
@@ -415,6 +443,41 @@ mod tests {
         TestService::new().report_unimplemented_function(&mut ctx, None);
         assert_eq!(ctx.command_buffer()[4], 0x4f434653);
         assert!(ctx.command_buffer()[6..].iter().all(|word| *word == 0));
+    }
+
+    #[test]
+    fn nx2_auto_stub_reply_zeroes_request_leftovers_on_every_call() {
+        // Lichii service.cpp:155-183: first and repeated auto-stubbed calls both reply with
+        // ResultSuccess followed by StubZeroedWords zeroed words, so a caller reading an output
+        // word (a domain object id, a value) never sees the request's leftover words.
+        use crate::hle::kernel::k_process::{KProcess, ProcessLock};
+        use crate::hle::kernel::k_thread::{KThread, KThreadLock};
+        let _scope = crate::hle::kernel::kernel::ScopedKernelForTest::without_kernel();
+        let mut process = KProcess::new();
+        process.is_switch2 = true;
+        let process = Arc::new(ProcessLock::from_value(process));
+        let make_ctx = || {
+            let mut thread = KThread::new();
+            thread.parent = Some(Arc::downgrade(&process));
+            let thread = Arc::new(KThreadLock::new(thread));
+            let mut ctx = HLERequestContext::new_with_thread(thread, 0);
+            ctx.command_buffer_mut().fill(0x4943_4653); // 'SFCI' left over from the request
+            ctx
+        };
+        let mut expected = make_ctx();
+        {
+            let mut rb = ipc_helpers::ResponseBuilder::new(&mut expected, 2 + STUB_ZEROED_WORDS, 0, 0);
+            rb.push_result(RESULT_SUCCESS);
+            push_stub_zeroes(&mut rb);
+        }
+        for _ in 0..2 {
+            let mut ctx = make_ctx();
+            TestService::new().report_unimplemented_function(&mut ctx, None);
+            assert_eq!(ctx.command_buffer(), expected.command_buffer());
+        }
+        let words = expected.command_buffer();
+        let sfco = words.iter().position(|word| *word == 0x4f43_4653).unwrap();
+        assert!(words[sfco + 2..sfco + 4 + STUB_ZEROED_WORDS as usize].iter().all(|word| *word == 0));
     }
 
     #[test]

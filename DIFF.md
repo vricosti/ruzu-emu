@@ -1,5 +1,721 @@
 # Upstream parity notes
 
+## 2026-11-15 — video_core/{query_dma,macro,engines/maxwell_3d,rasterizer_interface,query_cache/query_cache_base,renderer_vulkan/{query_cache,vk_rasterizer}}.rs vs Lichii video_core/{query_dma.h,macro.cpp,engines/maxwell_3d.cpp,rasterizer_interface.h,query_cache/query_cache_base.h,renderer_vulkan/vk_rasterizer.cpp}
+
+### Ported (Lichii extensions, absent from Eden)
+- Macro DMA reads write out the query cache's pending reports first and wait for the ones still
+  waiting for host results (Lichii 7ae3e74014): `query_dma::flush_pending` (query_dma.h:63-76),
+  `RasterizerInterface::flush_query_results` (default `flush_region(QUERY_CACHE)`), its Vulkan
+  override (vk_rasterizer.cpp:3093-3112: a sync operation queued behind a signalled fence, then
+  a wait for it), called before the buffer cache flush in `MacroEngine::execute`'s
+  `MME_DMA_READ`/`MME_DMA_READ_FIFOED` and after it in `Maxwell3D::front_dma_read`.
+- `QueryCacheBase::semi_flush_region` split out of `flush_region` (query_cache_base.h:80-91), and
+  it visits every query in the range (Lichii 821ccd570a). Eden's `FlushRegion` callback returned
+  `result`, but Eden's `IterateCache` tested `std::invoke_result` (never `bool`) and never
+  stopped early, so Eden wrote every final value of the range; ruzu had ported the intended early
+  exit and stopped at the first report still pending. `flush_region_with_memory` visits every
+  query too.
+
+### Intentional differences
+- Ruzu's Vulkan query cache keeps the host-resolved reports (`ZPassPixelCount64` samples,
+  transform feedback, primitives) outside `QueryCacheBase`: `QueryCache::query` writes them back
+  through its own operation (`enqueue_query_writeback`). Upstream `CounterReport` indexes every
+  report in `QueryCacheBase`, so `SemiFlushQueryDirty` answers "pending" for a host-managed query
+  not yet guest-synced, and `FlushRegion` (`ReadBlock`, `flush_region(QUERY_CACHE)`, the macro
+  DMA write-out above) waits for it. Without that, nothing a region flush asked about saw these
+  reports. `PendingHostReports` (renderer_vulkan/query_cache.rs) restores the answer: each host
+  report is registered with its device range (16 bytes with a timestamp, else 4) when it is
+  taken, and its write-back operation unregisters it when it ends, on every exit (upstream
+  `pending_unregister`); `QueryCache::semi_flush_region`, and so `flush_query_results`, include
+  it. `QueryCache::flush_region` does not wait for these reports as upstream `FlushRegion` would:
+  it runs under the memory manager's `ParkingLotMutex` (`MemoryManager::read_block`), which their
+  write-back (`write_query_result`) takes, and making it wait hung the load of the measured scene
+  (1 run of 3); `query_dma::flush_pending` releases that lock before it waits. On the
+  NX2 title used for measurement, the game's macros read ~950 occlusion reports per frame by DMA
+  and write the render-enable mode from them; a report read before its write-back landed culled
+  objects for one frame (the character's G-buffer draws among them), seen as a saturated white
+  halo on the character and on sunlit surfaces. Per-frame detector, two runs each: 22 and 54
+  defective frames before (~6,400 frames per run), 0 and 0 after; with a full fence wait before
+  every macro DMA read instead (experiment only) also 0, at 17.9 fps instead of ~23. The defect
+  was 0 at bbb188d7 with the occlusion counter fix; the later draw preparation, macro and async
+  read-back commits removed synchronous waits that used to let these write-backs land first.
+- Lichii's `FlushQueryResults` also calls `scheduler.FlushDeferred()` (work its GPU split's back
+  deferred); ruzu's scheduler defers no submission.
+- Lichii flushes in `MacroEngine::Execute` only where the caches are owned
+  (`!GpuSplit::Active() || OnBackThread()`); ruzu's native macro path always runs on the GPU
+  thread, and the split front reads through `Maxwell3D::front_dma_read`, which flushes after its
+  drain on the front thread (as it already did for the buffer cache) instead of `split.Run` on
+  the back. The memory manager lock is released before `flush_query_results` waits, since report
+  write-backs (`write_query_result`) take it.
+- Not ported: `QueryDma::HasPendingQueries`, `HoldsReports`, `Trace`/`TraceEnabled`
+  (EDEN_NX2_QUERY_DMA_TRACE), `GpuSplit::WaitForWrites` and Lichii's `page_filter` early-out in
+  `SemiFlushRegion`.
+## 2026-11-15 — rdynarmic backend/x64/emit_exclusive_memory.rs + core/arm/dynarmic/arm_dynarmic_{32,64}.rs vs Eden dynarmic backend/x64/emit_x64_memory.h and core/arm/dynarmic/arm_dynarmic_{32,64}.cpp
+
+### Ported (restores Eden behavior)
+- `emit_exclusive_lock`, `emit_exclusive_unlock` and `emit_exclusive_test_and_clear` emit nothing
+  when `OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR` is enabled, as upstream
+  `EmitExclusiveLock` / `EmitExclusiveUnlock` / `EmitExclusiveTestAndClear` do
+  (emit_x64_memory.h:381-418). The x64 backend ignored the flag: every inline exclusive load and
+  store (LDXR/STXR, and the LSE CAS/LDADD/SWP... that the frontend builds from them) took the
+  global monitor spin lock and invalidated the other cores' reservations even when the flag was
+  set. The A32 and A64 inline paths share the helpers.
+- `CpuAccuracy::Auto` sets `Unsafe_IgnoreGlobalMonitor` again for A64 and A32
+  (arm_dynarmic_64.cpp:343-348, arm_dynarmic_32.cpp:291-297). Eden dropped it in #3846
+  (3a823de605) and restored it in 421e0b834c ("kills performance on default setting"); ruzu had
+  synced the removal but not the revert.
+- Measured on the NX2 title used for measurement (Auto accuracy, dense scene, 6 guest cores): the
+  inline 32-bit CAS block shrinks by 108 bytes (no `xchg` spin loop, no `mfence` unlock, no
+  three-core test-and-clear); CPUCore_0 CPU per frame 22.7 ms -> 15.4 ms, process CPU 458 % ->
+  347 %, fps unchanged (GPU-bound).
+
+### Intentional differences
+- None. The helpers keep their `bool` return (whether a lock was emitted) so callers pair lock and
+  unlock; upstream returns `void` and relies on both checking the same flag.
+
+## 2026-11-15 — core/hle/service/service.rs `report_unimplemented_function` vs Lichii core/hle/service/service.cpp `ServiceFrameworkBase::ReportUnimplementedFunction`
+
+### Ported (Lichii divergence from Eden)
+- The experimental Eden-NX2 auto stub (Switch 2 callers, `EDEN_NX2_AUTO_STUB`, `use_auto_stub`,
+  `nx2:` stub services) now replies `ResultSuccess` followed by `STUB_ZEROED_WORDS` (32) zeroed
+  words, as Lichii does (service.cpp:155-183), instead of an empty two-word reply. An empty reply
+  left the request's words in the caller's TLS: on the NX2 title used for measurement the play
+  report thread calls the unimplemented `prepo:u` command 10500 on a domain session, read its
+  output interface id from the leftover `SFCI` magic (object id 0x49434653), sent the next request
+  to that id (stubbed by `prepare_sync_request`, no handle), then waited on handle 0. The SDK
+  wait loop retries on any error, so `WaitSynchronization(handle 0, timeout -1)` returned
+  `ResultInvalidHandle` about 138,000 times a second on CPUCore_0 (Lichii: 179 WaitSynchronization
+  per second in total on that core). With the zeroed reply the thread no longer spins.
+- Each auto-stubbed (service, command) pair is reported once; repeats only get the zeroed reply
+  (Lichii's `reported` set), and `nx2:vdec*` reports dump request words 1-47 instead of 1-8.
+
+### Intentional differences
+- None in behavior. The once-per-command set is a function-local `OnceLock<Mutex<BTreeSet>>`
+  (Lichii: function-local `static std::set` behind a `std::mutex`).
+
+## 2026-11-15 — video_core/renderer_vulkan/{scheduler,query_cache}.rs vs Lichii video_core/renderer_vulkan/{vk_scheduler.cpp,vk_query_cache.cpp}
+
+### Ported (Lichii divergence from Eden)
+- `Scheduler::EndPendingOperations` closes (pauses) the `ZPassPixelCount64` counter at each
+  submission instead of resetting it (Lichii 5b89a3daf4, vk_scheduler.cpp:979-984; Eden resets it
+  since b1f3b568fb). A guest that resets the counter, draws and reports expects the report to
+  cover every draw since its own reset; a submission landing in that window dropped the samples
+  counted so far and the report read too low. On the NX2 title used for measurement the game then
+  culled a large distant mesh for one frame (22 draws missing from the frame), shown as one-frame
+  white bloom flashes in the forest scene: 50 to 85 per ~5,000 frames before, 0 after (two runs
+  each, single-frame saturation spikes measured on every presented frame).
+- `SamplesStreamer::CloseCounter` bounds the running query: past four banks
+  (`MaxRunningQuerySlots`, 1,024 slots) it drops the count as a reset would and logs the 1st,
+  2nd, 4th, 8th... drop (vk_query_cache.cpp:218-240; Lichii 5b89a3daf4, a08bf8f02d, 88783d558d),
+  because a title that counts without resetting or reporting grows the query by a slot at every
+  submission and render pass. Implemented as `SamplesQueryState::close_counter` (with
+  `MAX_RUNNING_QUERY_SLOTS` and the `bank_bound_resets` counter), used by the streamer's
+  `close_counter` and by `Scheduler::end_pending_operations`.
+
+### Intentional differences
+- The bound counts the slots of the cumulative query (`history`), which is what Lichii's
+  `current_query->size_slots` counts. Lichii's bound calls the streamer's full `ResetCounter()`;
+  the scheduler only reaches `SamplesQueryState`, so the drop abandons those slots as ruzu's
+  submission-time reset did before this change, without the streamer's amend/accumulation reset
+  and checkpoint update.
+- No unit test drives `close_counter` itself (it needs a Vulkan scheduler and query banks); the
+  bound and the log cadence are pinned by `running_samples_query_bound_matches_lichii`.
+
+### Not ported (tested on the same scene, no effect on the flash; candidates for later)
+- Lichii fixed_pipeline_state.cpp:260-277 (rebuild blend attachments for every key without
+  dynamic blend state), vk_texture_cache.cpp:4783-4786 (`VariantKey::drop_compare`),
+  vk_rasterizer.cpp `ClearVolumeSlices` (the scene issues no layered or 3D clear), and the Vulkan
+  half of Lichii 18cfe85563 (dispatch barrier with DRAW_INDIRECT, compute-to-graphics barrier at
+  render pass begin, wait-for-idle as a memory barrier instead of Eden's event wait).
+
+## 2026-11-15 — async read-back of GPU-written buffer memory: video_core/{gpu,rasterizer_interface,rasterizer_download_area,memory_manager,buffer_cache/{buffer_cache,buffer_cache_base},query_cache/query_cache_base,renderer_vulkan/{vk_rasterizer,buffer_cache,query_cache,renderer_vulkan},renderer_base}.rs and core/{gpu_core,gpu_dirty_memory_manager,memory/memory}.rs vs Lichii video_core/{gpu.cpp,rasterizer_interface.h,rasterizer_download_area.h,memory_manager.cpp,buffer_cache/buffer_cache{.h,_base.h},query_cache/query_cache.h,renderer_vulkan/vk_{rasterizer,buffer_cache,query_cache}.cpp} and core/{gpu_dirty_memory_manager.h,memory.cpp}
+
+Divergence from Eden accepted by the user on 2026-11-14 for `on_cpu_read`: asynchronous
+read-back of GPU-written buffer memory, from Lichii 0b83798bf6 (#1028, "async read-back: the
+reading thread waits for its downloads", port of #805), with its `cpu_read_ranges` and early
+downloads. Eden's `GPU::OnCPURead` has the GPU thread flush the region and
+`BufferCache::DownloadBufferMemory` call `runtime.Finish()`: one host GPU wait on the GPU thread
+per guest read of GPU-written memory. On the NX2 title used for measurement that was ~42 such
+flushes per frame, one page each, the same ~40 pages read every frame or every other frame. Not
+conditioned on a title, a setting or a switch: Lichii made it the only path ("always use async
+read-back, drop EDEN_NX2_ASYNC_READBACK").
+
+### Ported (Lichii extensions, absent from Eden)
+- `Gpu::on_cpu_read` (gpu.cpp:316-352): unless the area is `in_flight`, the GPU thread runs
+  `invalidate_gpu_cache` then `flush_region_for_read` in a sync operation; the reading thread
+  then calls `finish_read` itself. `RasterizerDownloadArea::in_flight`
+  (rasterizer_download_area.h:20-23).
+- `RasterizerInterface::flush_region_for_read` (default: `flush_region`), `finish_read`,
+  `note_report_pending`/`finish_report` (rasterizer_interface.h:115-133). Only Vulkan overrides
+  them (vk_rasterizer.cpp:2741-2776), as in Lichii: textures and queries still flush
+  synchronously, buffers go through `BufferCache::download_memory_for_read`.
+- Buffer cache read downloads (buffer_cache.h:574-1242, buffer_cache_base.h:288-345,
+  1121-1171): `ReadDownload`, `read_downloads`, `read_download_ranges`,
+  `download_memory_for_read`, `record_read_download`, `finish_read_downloads`,
+  `write_read_downloads`, `write_completed_read_downloads`, `write_finished_read_downloads`,
+  `read_downloads_cover`, `outdate_read_downloads` (from `mark_written_buffer` and the Vulkan
+  query cache's `SyncValues` copies), `pending_cpu_write_ranges`, `write_downloaded_memory`,
+  `G_READ_DOWNLOADS` and its decrement on drop. `get_flush_area` reports `in_flight`;
+  `tick_frame` and `pop_async_buffers` land completed downloads first.
+- `cpu_read_ranges`/`download_cpu_read_ranges` (buffer_cache.h:416-422, 436-460, 574-590, 4147):
+  an area a guest read found GPU-written (read-trap mode) is remembered, and the next download
+  (`download_memory` through `download_ranges_memory`, or `download_memory_for_read`) takes the
+  GPU-modified bytes of every remembered range too. `download_ranges_memory` ports
+  `DownloadRangesMemory` (buffer_cache.h:462-570).
+- Early downloads (buffer_cache.h:890-1012, buffer_cache_base.h:1138-1171): `ReadBackPage`,
+  `note_read_back` (learned in `get_flush_area`), `note_read_back_write` (from
+  `mark_written_buffer` and `dma_copy`), `record_early_downloads` (from `tick_frame`,
+  `download_memory_for_read` and `note_work_recorded`), `note_work_recorded` (after each draw
+  and dispatch, vk_rasterizer.cpp:1309, 2482, 2545), `may_be_read_back_page`,
+  `note_report_pending`/`finish_report` and the rewritten pending reports in
+  `write_read_downloads`; the query cache notes deferred results (query_cache.h:288-332). Same
+  constants: 2 reads, 4 unread writes, 64 pages, 1 MiB and 32 pending downloads.
+- `ClearDownload` split (buffer_cache.h:1405-1442): `clear_download` lands the read downloads over
+  the range first, `clear_replaced_download` only cuts them, Eden's body is
+  `clear_fence_downloads`.
+- Vulkan runtime `submit_for_host_read`, `queue_for_host_read`, `wait_for_host_read`,
+  `is_free_now` and `host_read_barrier` (vk_buffer_cache.cpp:31-40, 519-558).
+- Query results land the read downloads under them first (`QueryCacheBase::finish_reads`,
+  query_cache.h:360, 403-404, 706-707, 739-750).
+- Pending guest CPU writes: `Gpu::invalidate_gpu_cache` gathers, publishes in `applying_writes`
+  and then applies (gpu.cpp:143-166); `Gpu::for_each_pending_cpu_write` (gpu.cpp:169-180) feeds
+  `BufferCache::set_pending_cpu_writes` (vk_rasterizer.cpp:468-471) through
+  `RendererBase::set_pending_cpu_writes`; `GpuDirtyMemoryManager::for_each_pending`/`for_each_run`
+  (gpu_dirty_memory_manager.h:46-62, 159-172).
+- `DownloadLanding` (rasterizer_download_area.h:44-116) and its `r#await` after each collected
+  guest write (core/memory.cpp:991-993).
+
+### Intentional differences
+- Memory manager writes (`MemoryManager::finish_reads_before`, memory_manager.cpp:338-350,
+  550-596) call `RasterizerInterface::supersede_read_downloads` instead of Lichii's
+  `FinishRead`. It takes no buffer cache lock: it publishes the write (`superseding_writes`, with
+  the count of read downloads recorded so far) and waits for a landing under way over it
+  (`DownloadLanding::r#await`), as a collected guest CPU write does. The next landing applies
+  it: the downloads recorded before the write stop writing those bytes (`write_ranges`) but still
+  clean them (`clean_ranges`), which leaves guest memory and the GPU-modified ranges as landing
+  then writing does. Reason: ruzu's memory manager writes run under its `ParkingLotMutex`
+  (Lichii's memory manager has no lock). With the faithful call, the load of the measured scene
+  deadlocked in every run tried (4); stacks taken in the hung process: the fencing thread held that
+  mutex in `renderer_vulkan::query_cache::write_query_result` →
+  `MemoryManager::write_block_unsafe` → `finish_reads_before` and waited for the buffer cache's
+  lock, while the GPU thread held the buffer and texture caches' locks in `prepare_draw` and waited
+  for the memory manager's mutex in `TextureCacheBase::find_image_view_with_gpu_to_cpu`.
+  `clear_download` and `QueryCacheBase::finish_reads` (written through device memory, no memory
+  manager lock) land as in Lichii.
+- `queue_for_host_read` always submits: ruzu's scheduler has no `Scheduler::DeferFlush`
+  (Lichii batches only on its GPU split's back thread).
+- Not ported: the EDEN_NX2_READ_CHECK verification (`EarlyDownloadServes`, `NoteEarlyLanded`,
+  `early_landed`), the GPU split's macro DMA read changes (`FrontDmaRead`,
+  `GpuSplit::WaitForWrites`, `HoldsQueries`), `PrepareRegionWrite` (absent from ruzu), the
+  `AsyncReadback` counters and the sampled "CPU read of GPU-written memory" log line.
+- `DownloadLanding` lives in `core::gpu_core` (re-exported by
+  `video_core::rasterizer_download_area`): `core` cannot depend on `video_core`.
+- `may_hold_gpu_writes` is always true: ruzu has no `Nx2MayBeGpuWritten` page filter.
+- `cached_write_memory` (ruzu's path for gathered guest writes, where Lichii uses
+  `ClaimCpuWrites`) cuts read downloads with `clear_replaced_download` first, as `ClaimCpuWrites`
+  does.
+- `download_ranges_memory` copies everything through the staging buffer: ruzu's buffers have no
+  persistent mapping (Lichii `Buffer::Mapped`).
+- Eden's fence downloads (`pop_async_buffers`) and the per-buffer synchronous downloads keep
+  writing guest memory without a `DownloadLanding` or the pending-write exclusion.
+- `wait_for_host_read` waits on the master semaphore for a submitted tick (any thread) and falls
+  back to `Scheduler::wait` otherwise.
+- Runtimes other than Vulkan never record read downloads: their `submit_for_host_read`,
+  `queue_for_host_read`, `wait_for_host_read` and `is_free_now` are `unreachable!` trait defaults
+  (Lichii's are Vulkan-only members behind `if constexpr (!IS_OPENGL)`).
+- `note_work_recorded(false)` runs just before the draw command is recorded (Lichii: just after):
+  it only lands completed early downloads, and ruzu's draw recording has several early returns.
+
+## 2026-11-15 — draw preparation cost: video_core/renderer_vulkan/{graphics_pipeline,vk_rasterizer,pipeline_cache}.rs and video_core/memory_manager.rs vs Eden/Lichii vk_graphics_pipeline.cpp, vk_rasterizer.cpp, memory_manager.{h,cpp}
+
+### Realigned on Eden
+- `GraphicsPipeline::ConfigureImpl` texture handle reads (`read_handle`, and the handle-program
+  reads of `EvaluateTextureHandle`) now use `MemoryManager::read::<u32>` (Eden
+  vk_graphics_pipeline.cpp:389-396 `gpu_memory->Read<u32>`, Lichii :877-884 and
+  shader_handle_program.h:60-65) instead of `read_block`, which flushed the rasterizer caches
+  for every handle word. The compute-backed mesh path (`MeshGraphicsResources::prepare`) keeps
+  its caller's block reader.
+- The buffer cache's `GpuMemoryAccess::read_u64/read_u32` adapter (`GpuMemoryAccessAdapter` in
+  vk_rasterizer.rs) uses `read::<u64>/read::<u32>` (Eden buffer_cache.h:2004/2013
+  `gpu_memory->Read<u64>`) instead of `read_block`.
+- `MemoryManager::FlushCaching` appends the device ranges into a reusable `page_stash2` member
+  through `get_submapped_device_ranges_into` (Eden `GetSubmappedRangeImpl<false>(addr, size,
+  page_stash2)`, memory_manager.h:221, memory_manager.cpp:711-719) instead of allocating two
+  vectors per call.
+
+### Intentional differences
+- From Lichii, not Eden: `update_dynamic_states` receives whether the draw's already looked-up
+  pipeline has dynamic vertex input (Lichii `UpdateDynamicStates(const GraphicsPipeline*)`,
+  vk_rasterizer.cpp:4238, 4323-4329). Eden calls `PipelineCache::CurrentGraphicsPipeline()` a
+  second time per draw (vk_rasterizer.cpp:1141). `draw_texture` passes `None` and keeps the
+  lookup, like Lichii's `nullptr`.
+- ruzu-only pipeline-use sidecar (`note_pipeline_use`, not in Eden or Lichii): a draw whose
+  lookup keeps the current pipeline no longer re-hashes the key; the recency order of the
+  recorded keys is unchanged, the use clock only advances on pipeline changes.
+
+### Not ported
+- Lichii's sampled-texture memo (`SampledTextureMemo`, `ResolveMemoizedTextures`,
+  `MemoizeTextures`, texture_cache.h:738-850, vk_graphics_pipeline.cpp:759-1010), which is why
+  Lichii calls `FillImageViews` on about a third of its draws. It is a Lichii-only mechanism that
+  also needs `MemoryManager::HostPointerSerial` and `DescriptorTable::changes`.
+- ruzu's per-channel `image_view_ids` remains one hash map keyed by index | compute tag; Eden
+  keeps `graphics_image_view_ids`/`compute_image_view_ids` vectors indexed by the TIC index.
+## 2026-11-15 — video_core/{nx2_profile,macro,engines/kepler_compute,engines/maxwell_3d}.rs and core/hle/kernel/{svc/svc_synchronization,k_handle_table}.rs vs Lichii video_core/{nx2_profile.h,macro.cpp,engines/kepler_compute.cpp,engines/maxwell_3d.cpp} and Eden core/hle/kernel/{svc/svc_synchronization.cpp,k_handle_table.h}
+
+GPU-thread command processing overhead (no behavior change; measured on the NX2 title used for measurement).
+
+### Brought closer to upstream
+- `nx2_profile::Scope::new`/`drop` and `enabled()` are now inlined with only the enabled path
+  out of line, like Lichii's header-inline `Scope` (nx2_profile.h:184-214). The out-of-line
+  disabled constructor cost a call plus a store-forwarding stall per macro-emitted method.
+- `KeplerCompute::process_native_method`: Lichii re-points the raw `native_macro` pointer at the
+  context on every method (kepler_compute.cpp:133-137). The Rust owning handle is now replaced
+  only when it names another context (`Arc::ptr_eq`), and the retained context lock is taken
+  through a borrowed pointer instead of a per-method `Arc` clone/drop.
+- Same function: `memory_manager.GetID()` is read only in the traced branches, as upstream
+  (kepler_compute.cpp:281-283, 334), instead of locking the memory manager on every method write.
+- Compute macros on the JIT path no longer lease (move out, zero, move back) the 12 KiB
+  `TuringMacroInterpreter` nor swap its `dram`: like `MacroEngine::execute_native`, the
+  interpreter is leased only for the interpreter path or when there is no `active_dram`
+  (Lichii uses the engine's interpreter in place, kepler_compute.cpp:195-212).
+- `active_dram` (Kepler and `MacroEngine::execute_native`) is reassigned only when it names other
+  storage; the native data RAM lock, the macro JIT and the Maxwell3D native macro context are
+  reached through borrowed pointers instead of `Arc` clones per macro call (upstream: raw
+  pointers / `shared_ptr` members used in place, macro.cpp:1371-1372, maxwell_3d.h:3183).
+- `Maxwell3D::process_cb_multi_data` borrows its memory manager instead of cloning the `Arc`.
+- Rust-only diagnostic switches `RUZU_TRACE_WAITSYNC`, `RUZU_TRACE_WAITSYNC_TID`
+  (svc_synchronization.rs) and `RUZU_HANDLE_MISS_TRACE` (k_handle_table.rs) are read once
+  (`OnceLock`), no longer by a `getenv` per `WaitSynchronization` / handle lookup miss.
+
+### Intentional differences (unchanged)
+- Kepler/Maxwell still keep owning `Arc` handles where upstream keeps raw pointers; the borrowed
+  pointers rely on these owners being replaced only by channel setup
+  (`set_native_macro_mode`, `set_native_macro_context`), never while a method or macro runs.
+
+## 2026-11-14 — video_core/{buffer_cache/{buffer_cache,buffer_cache_base},memory_manager,renderer_{vulkan/vk_rasterizer,opengl/gl_rasterizer,metal/metal_rasterizer}}.rs vs Lichii video_core/{buffer_cache/buffer_cache.h,memory_manager.h}
+
+### Ported (Lichii extensions, absent from Eden)
+- The thread-local storage binding cache of `StorageBufferBinding` (buffer_cache.h:4266-4302,
+  4409-4410): 512 sets of 4 ways keyed by the address space (`GetID() + 1`), the pointer, the word
+  after it (when the binding reads it), `MapSerial`, the storage alignment and the binding kind
+  (written, native, table, compute); a hit returns the binding without computing its size again.
+  Native pointer tables bind pools of ~150 MiB whose size (`GetMemoryLayoutSize`,
+  `MaxContinuousRange`) was computed again for every storage buffer of every draw.
+- `MemoryManager::map_serial` (memory_manager.h:176-178) and `GpuMemoryAccess::map_serial`;
+  Vulkan, OpenGL and Metal adapters report it. The default (`None`) disables the cache.
+
+### Intentional differences
+- Lichii skips the cache under `Nx2Perf::Verify()`; ruzu has no verify mode for it.
+
+## 2026-11-15 — video_core/buffer_cache/usage_tracker.rs vs Lichii video_core/buffer_cache/usage_tracker.h
+
+### Ported (Lichii extensions, absent from Eden)
+- `Track` skips the last four ranges tracked since the reset, `FillPages` grows a run of pages
+  known to be all ones instead of writing them again, `Reset` clears only the words set since
+  the last reset and does nothing when nothing was tracked, and `Pages()` is exposed
+  (usage_tracker.h:29-170). Native pointer tables bind ~150 MiB per storage buffer; every draw
+  wrote one word per 4 KiB of each binding and every frame cleared the whole bitmap.
+- `TrackPage`/`IsPageUsed` mark exactly the 64-byte granules a range touches and nothing for an
+  empty range (usage_tracker.h:145-170). Eden computed the mask from the size alone, which set
+  the whole page for an empty range and could miss the second granule of a straddling range;
+  the two ruzu tests that pinned Eden's masks now pin Lichii's.
+
+### Intentional differences
+- Lichii's `Nx2Perf::Verify()`/`BackX::g_verify` cross-checks are not ported (no verify mode).
+
+## 2026-11-14 — shader_recompiler/{ir_opt/global_memory_to_storage_buffer_pass,ir/breadth_first_search,backend/spirv/spirv_emit_context,backend/spirv/emit_spirv_atomic,shader_info,frontend/translate_program}.rs vs Lichii shader_recompiler/{ir_opt/global_memory_to_storage_buffer_pass.cpp,frontend/ir/breadth_first_search.h,backend/spirv/spirv_emit_context.cpp,backend/spirv/emit_spirv_atomic.cpp,shader_info.h}
+
+### Ported (Lichii extensions, absent from Eden)
+- Native pointer tracking of the storage buffer pass. Ocarina of Time's Kokiri Forest runs four
+  native compute kernels whose append atomics (`GlobalAtomicIAdd32`/`UMax32`) take their pointer
+  from a constant buffer array at a run-time index (`c4[index * 8 + 0xe0]`) or from a pointer
+  loaded through a constant buffer pointer; ruzu's Eden-only pass left them global and the
+  pipelines were rejected (`Global atomic address has no registered storage ranges`). Ported:
+  `StorageBufferAddr::indirect` (pass.cpp:32-39), the extended `StorageInfo` (pass.cpp:65-106),
+  `IsRuntimeRoutable` (170-185), `TrackLowAddress`'s high word (357-405), `Track` as a
+  `BreadthFirstSearchPruned` that stops at loaded pointers (410-454), `TrackAddend` (457-480),
+  `TrackingConditions` (509-764), `ForEachSummedWord` (767-808), `SumWords`/
+  `CollectIteratorWords` (811-928), `ReadsCbufWord`/`CollectAtomicPointers` (931-1025),
+  `TrackPointerAddend` (1030-1058), `DynamicPointerSlots`/`CollectPointerSlots` (1063-1130),
+  `NativePointerCandidates` (1135-1328), `CollectStorageBuffers` (1332-1489), the pass's
+  competing-loaded and pointer-table retries, binding limit and `native_global_bounds` (2081-2189),
+  `StorageBufferLimit` (2191-2200), `StorageOffset`'s `UConvert` fallback (1957-1976) and the
+  `native_global_bounds` merge of `JoinStorageInfo` (2204).
+- `BreadthFirstSearch` with a resolver and `BreadthFirstSearchPruned`
+  (frontend/ir/breadth_first_search.h:22-101) as `breadth_first_search_resolved`/
+  `breadth_first_search_pruned`.
+- `Info::native_global_bounds` (shader_info.h:379).
+- SPIR-V global memory routing (spirv_emit_context.cpp:968-1165): `base_address` reads a pointer
+  table entry through its holder's binding; native programs route an address to the bound buffer
+  whose base is the closest one at or below it; 8/16-byte accesses read and write word by word
+  when the device storage alignment is below the vector size, and through the 32-bit functions
+  without descriptor aliasing. Global atomics are defined when any descriptor is routable
+  (`native_global_bounds` or NVN), and their emission reports Lichii's messages
+  (emit_spirv_atomic.cpp:431-441).
+
+### Intentional differences
+- IR identity is `InstRef` instead of `Inst*`; blocks are indices. `Value::resolve` plus an
+  `Inst` match stands for `IsImmediate()`/`InstRecursive()` (a register value counts as an
+  immediate, as upstream's non-opaque type check does).
+- `CollectIteratorWords`' Tarjan search is iterative (same edges, same order, same components)
+  so that its depth is not bounded by the host stack.
+- The global atomic functions stay keyed by opcode in `global_atomic_functions` and use
+  `emit_spirv_atomic::atomic_u32` for the operation.
+- `StorageBufferLimit` applies only `max_descriptor_set_storage_buffers`: ruzu's
+  `HostTranslateInfo` has no `max_per_stage_descriptor_storage_buffers`.
+
+### Accepted divergence from Eden (user decision, 2026-11-14)
+- The Lichii pointer tracking also applies to Switch 1 (non-native) programs: the paired pointer
+  (`TrackPointerAddend`), the legacy nearest-word search, `TrackAddend`, then the biased and
+  unbiased `Track` (now a pruned search that stops at loaded pointers), instead of Eden's two
+  `Track` calls. Not restricted to NX2.
+
+### Not ported (still missing)
+- Routed global `Inc32`/`Dec32`/`AddF32` atomics (CAS loops) and the routed
+  `GlobalAtomicCompareExchange32` function (spirv_emit_context.cpp:1166-1253,
+  emit_spirv_atomic.cpp:488-499): these opcodes still throw in ruzu's SPIR-V backend.
+- The compute pipeline rebuild when a constant buffer pointer that was null at translation
+  becomes mapped (`NullStoragePointerSlots`, `StaleNullPointerSlot`, `mapped_pointers`;
+  shader_environment.cpp:59-76, vk_pipeline_cache.cpp:987-1062). A candidate slot that is null when
+  the pipeline is first built stays unbound for that pipeline.
+- `JoinStorageInfo`'s binding limit and `requires_coherent_global_memory` merge (no ruzu
+  counterpart field; the VertexA/B merge has no host limits at hand).
+
+## 2026-11-14 — shader_recompiler/shader_info.rs and video_core/buffer_cache/{buffer_cache_base,buffer_cache}.rs vs Lichii shader_recompiler/shader_info.h and video_core/buffer_cache/buffer_cache_base.h
+
+### Ported (Lichii extensions, absent from Eden)
+- `Info::MAX_SSBOS` = 64 (shader_info.h:294; Eden 32) and `NUM_STORAGE_BUFFERS` =
+  `MAX_SSBOS` with u64 enabled/written/native storage masks (buffer_cache_base.h:74-75,
+  145-168; Eden 16 slots, u32 masks). The native pointer candidates bind every mapped slot of a
+  pointer array (Kokiri Forest's kernels bind 32): with 16 slots, `bind_compute_storage_buffer`
+  dropped slots 16+ ("index N exceeds maximum storage buffer count"), the descriptor stream
+  no longer matched the pipeline layout and the GPU faulted (GPUVM read fault, device lost).
+  `for_each_enabled_bit` takes any mask that widens to u64.
+
+## 2026-11-14 — video_core/buffer_cache/{multi_range_refresh,buffer_cache}.rs vs Lichii video_core/buffer_cache/{multi_range_refresh.h,buffer_cache.h}
+
+### Ported (Lichii extensions, absent from Eden)
+- `multi_range_refresh.rs` ports `InvalidateMultiRangeSegments`, `MultiRangeSegmentsLive` and
+  `RefreshMultiRangeSegments` (multi_range_refresh.h). `bind_multi_range_storage` refuses
+  segments whose buffer is gone and always invalidates the gathered copy before binding
+  (`BindFreshMultiRangeStorage`; ruzu invalidated only when a segment was synchronized).
+  `delete_buffer` forgets deleted buffers in both segment pools (buffer_cache.h:4199-4201), and
+  the graphics and compute updates refresh their pool at the end (buffer_cache.h:3027, 3038).
+  The resolver variant of the graphics update now clears the graphics pool first, as
+  `DoUpdateGraphicsBuffers` does (buffer_cache.h:3012).
+
+### Intentional differences
+- `refresh_multi_range_segments` takes the cache as an explicit context for its two callbacks
+  (upstream's lambdas both capture `this`). The pool is moved out of the cache while it is
+  refreshed: a buffer joined during the refresh is caught by the liveness check of the next pass
+  rather than by `InvalidateMultiRangeSegments`.
+
+## 2026-11-14 — video_core/{shader_environment,renderer_vulkan/pipeline_cache}.rs vs Lichii video_core/{shader_environment.cpp,renderer_vulkan/vk_pipeline_cache.{cpp,h}} (Lichii 6645721f2c)
+
+### Ported (Lichii extensions, absent from Eden)
+- Rebuild of native compute translations whose pointer slots were null at translation.
+  `null_storage_pointer_slots`, `mapped_storage_pointer_keys` (shader_environment.cpp:59-88) for
+  `GenericEnvironment` and `FileEnvironment`, `GenericEnvironment::keep_storage_pointers`
+  (shader_environment.cpp:295-299), `ComputePipelineCacheEntry` with `null_pointer_slots`,
+  `mapped_pointers` and `rebuilds` (vk_pipeline_cache.h:110-123), `MAX_COMPUTE_REBUILDS` = 4 and
+  `stale_null_pointer_slot` (vk_pipeline_cache.cpp:949, 987-1012), the rebuild in
+  `current_compute_pipeline` that keeps every pointer the old translation bound and keeps the old
+  pipeline when the rebuild fails (vk_pipeline_cache.cpp:1032-1053), and the entry's slots for
+  pipelines loaded from the disk cache (vk_pipeline_cache.cpp:3158-3161). Kokiri Forest's append
+  kernels are first translated while `c4[0x90]`, `c4[0x130]` and other list pointers are null.
+
+### Intentional differences
+- Replaced pipelines are kept in `retired_compute_pipelines` until the cache is destroyed
+  (at most four per key) instead of being freed once the scheduler tick passes.
+- The rebuild log names the shader hash instead of the program address.
+
+### Not ported (still missing)
+- Serializing every rebuilt translation and `OrderComputeTranslations` (choosing, at load, the
+  cached translation that binds every pointer the first one binds; vk_pipeline_cache.cpp:951-984):
+  ruzu still serializes a compute key once per session, so the next session loads the first
+  translation and rebuilds it again when a null slot is filled.
+- Graphics `EvictedPointerSlots` (evicted_pointer_slots.h): ruzu does not evict graphics pipelines.
+
+## 2026-11-14 — video_core/renderer_vulkan/pipeline_cache.rs: `CACHE_VERSION` 25 → 26
+
+### Intentional differences
+- Ruzu's own Vulkan pipeline cache version (Eden and Lichii number theirs independently; Lichii
+  is at 54 in pipeline_cache_files.h:30 and did not bump it for its native pointer tracking,
+  commit 6645721f2c). Bumped on the user's decision of 2026-11-14: records written by the
+  previous storage buffer pass lack the pointer classifications the new pass reads, and every
+  run failed to load ~480 of them ("Uncached storage pointer classification"). An older file is
+  deleted at load ("Deleting old pipeline cache") and rebuilt by the next session. The OpenGL
+  (15) and Metal (2) caches are not bumped.
+
+## 2026-11-14 — video_core/renderer_vulkan/{vk_rasterizer,compute_pipeline,pipeline_cache}.rs and shader_recompiler/backend/spirv/{emit_spirv,emit_spirv_mesh,spirv_emit_context}.rs vs Lichii video_core/renderer_vulkan/{vk_rasterizer.cpp,vk_rasterizer.h,vk_graphics_pipeline.cpp,vk_graphics_pipeline.h,vk_pipeline_cache.cpp} and shader_recompiler/backend/spirv/{emit_spirv.h,emit_spirv_mesh.cpp,spirv_emit_context.cpp}
+
+### Ported (Lichii extensions, absent from Eden)
+- Task/mesh emulation without a host readback. A task draw used to copy the task payloads to a
+  download buffer, `Scheduler::finish()` and build the mesh dispatch on the CPU, unless the task
+  program had a proven `task_mesh_workgroup_bound`; in Ocarina of Time's Kokiri Forest every task
+  draw (100 %, ~27 per frame) lacked that bound, so each one waited for the GPU. Lichii's
+  mechanism now replaces both the readback and the bounded reservation:
+  - per-submission output arena `MeshArena`, `acquire_mesh_arena`, `release_mesh_emulation_buffers`,
+    `mesh_arenas`/`mesh_arena_current`/`mesh_arena_size` (64 MiB, grown from the counter of a
+    finished submission, at most min(1 GiB, maxStorageBufferRange)) and `mesh_draw_buffers`
+    (vk_rasterizer.h:417-436, vk_rasterizer.cpp:365-437, 955-957, 1101-1164);
+  - the one-invocation distribution pass `emit_mesh_emulation_distribution` with
+    `MeshEmulationDistributionConstants` and `MESH_EMULATION_ARGS_*` /
+    `MESH_EMULATION_DRAW_ARGS_OFFSET` (emit_spirv.h:65-88, emit_spirv_mesh.cpp:602-730), owned by
+    `MeshEmulationDistribution` (vk_graphics_pipeline.h:519-527, vk_graphics_pipeline.cpp:565-604,
+    1550-1595 and 1766-1768) and recorded between the task dispatch and an indirect mesh dispatch
+    with the same barriers (vk_graphics_pipeline.cpp:1542-1602);
+  - the mesh workgroup's task lookup by binary search of the per-task offsets, and its arena base
+    read from the arguments (emit_spirv_mesh.cpp:166-176, 362-392;
+    spirv_emit_context.cpp:2055-2059: `define_mesh_task_args_buffer`,
+    `emit_mesh_compute_spirv_with_task_distribution`);
+  - one `vkCmdDrawIndirect` from the arguments for the whole draw (vk_rasterizer.cpp:1652-1662);
+  - zero vertex indices past a group's primitive count (emit_spirv_mesh.cpp:207-231).
+
+### Intentional differences
+- ruzu keeps its own transport (MeshDispatchRecord mapping, padded records with an embedded
+  VkDrawIndirectCommand, vertex pulling by `VertexIndex / vertex_span`) instead of Lichii's blocks
+  and `EmitMeshEmulationVertex`. Consequently the distribution pass rounds the draw's base up to a
+  whole record, stores a record index at `MESH_EMULATION_ARGS_BASE` (Lichii: a word) and writes
+  `firstVertex = base * vertex_span` (Lichii: 0, its vertex shader reads the base); the task
+  lookup fills the same `guest_workgroup_x`/`payload_base`/`output_record` the host mapping
+  supplies otherwise; the offsets go in the existing dispatch binding and the arguments in a
+  fourth transport binding.
+- Degenerate primitives past the count (Lichii ComputeMeshEpilogue, emit_spirv_mesh.cpp:207-231):
+  `emit_mesh_output_export` now writes 0 for every map word past `4 + count * corners`, since the
+  single task draw covers each record's whole vertex span. Without it the draw rasterized the
+  indices the guest left in unused map slots (the previous per-record draws never reached
+  them). ruzu also emulates point and line meshes, which Lichii skips; for them an unused slot
+  is a point or zero-length line at vertex 0 when drawn by a task draw.
+- The task lookup unrolls 32 steps instead of Lichii's 17, which stop being correct past 2^17
+  task workgroups (Lichii has no host guard).
+- The task dispatch keeps ruzu's per-parent mapping and batching by the device dispatch limit;
+  Lichii clamps the draw's task groups to maxComputeWorkGroupCount[0] instead. As in Lichii, the
+  mesh workgroups past the arena's room or the dispatch limit are dropped for that submission.
+- Not ported: the diagnostic probes (`EDEN_NX2_MESH_EMULATION_PROBE`, `mesh_probe`,
+  `mesh_task_probe`, survey and statistics logs), `EDEN_NX2_NO_MESH*`, and Lichii's pipeline-side
+  eligibility (triangles only, no per-primitive outputs), which ruzu's compute transport does not need.
+- Removed with the readback path: `MeshTaskIndirectCount` and the Vulkan use of
+  `task_mesh_workgroup_bound`, `MeshTaskDispatchPlan::bounded`/`from_task_payloads` (still used
+  by the Metal backend).
+
+## 2026-11-14 — video_core/{shader_handle_program,renderer_vulkan/graphics_pipeline,renderer_vulkan/compute_pipeline}.rs vs Lichii video_core/{shader_handle_program.h,renderer_vulkan/vk_graphics_pipeline.cpp,renderer_vulkan/vk_compute_pipeline.cpp}
+
+### Ported (Lichii extension, absent from Eden)
+- `HandleIsStoragePointer` and `NULL_TEXTURE_HANDLE` (shader_handle_program.h:170-200, from
+  Lichii 794602bfbd "bind no texture for a handle word that is a storage buffer address") as
+  `handle_is_storage_pointer` / `NULL_TEXTURE_HANDLE`, applied where Lichii applies them: the
+  graphics texture descriptors (vk_graphics_pipeline.cpp:940-942) and the compute ones
+  (vk_compute_pipeline.cpp:532-534). A texture whose cbuf handle word lies in the 8-byte address
+  word of a storage buffer of the same program gets the null view and sampler.
+- Ocarina of Time's Kokiri Forest: in ruzu that word read as handle 0xe4000, which
+  `texture_header_index` turns into texture header 0x7200 (a header byte offset). The game's
+  descriptor allocator gives that header to a different texture every ~256 frames (traced: R16G16
+  float, then D32 depth, then others), so many main-pass materials sampled an unrelated texture
+  for ~23 s at a time at 11 FPS: depth read as colour (tree bark and cliffs red), R16G16 as colour
+  (yellow), or values that saturated the exposure (white frame). Measured on bench.sh runs of the
+  Kokiri scenario (33 captures each, t=70..230 s, Link idle): base binary 4, 11 and 5 defective
+  captures (plus 8 in a traced run); with this port 0 and 0 (the t=70 loading-screen sun glare
+  the saturation score also flags in base runs excepted). 11.47 and 11.92 FPS against 11.25.
+
+### Intentional differences
+- Lichii's later `handle_is_pointer_word` translation flag (282a585aa8, shader_info.h:245) and
+  the delta-draw handle-word ranges that skip such words (vk_graphics_pipeline.cpp:482) have no
+  ruzu counterpart (ruzu has no `handle_is_pointer_word` or delta draws); only the
+  storage-descriptor test is ported.
+
+## 2026-11-14 — video_core/memory_manager.rs vs Lichii video_core/memory_manager.{h,cpp}
+
+### Ported (Lichii extension, absent from Eden)
+- Device-contiguous runs kept at map time. Eden's `MaxContinuousRange` walks the page tables on
+  each call; storage buffer binds (`storage_buffer_binding`) ask it for up to 8 MiB each, which
+  was 10.9 % of the GPU thread in Ocarina of Time's Kokiri Forest. Ported Lichii's
+  `ContinuousRun`/`continuous_runs` (memory_manager.h:301-307), `UpdateContinuousRuns`
+  (memory_manager.cpp:745-800; called after the kind map update at the end of `PageTableOp`
+  and `BigPageTableOp`, cpp:167, 231, followed by `map_serial` (cpp:168, 232)),
+  `MappingSnapshot` runs and `CurrentSnapshot` (h:214-222, cpp:802-831: per-thread view of an
+  immutable snapshot rebuilt under `runs_guard` when `map_serial` changes) and
+  `MaxContinuousRange`'s binary search (cpp:719-743). Eden's walk is kept as
+  `max_continuous_range_uncached` (cpp:833-871); unit tests check both give the same answer
+  across map/sparse/unmap/remap sequences (big and small pages, holes, adjacent separate maps,
+  unaligned operations, the end of the address space).
+
+### Intentional differences
+- `max_continuous_range` does not return 0 when `size > address_space_size - gpu_addr`
+  (Lichii cpp:723): ruzu's walk answers such ranges when their run ends inside the address
+  space, and the answer stays equal to the walk's.
+- The snapshot views are keyed by a never-reused per-instance token, not `unique_identifier`:
+  ruzu's `MemoryManager` constructors overwrite that id with a caller-chosen one two managers
+  may share. `current_snapshot` lends the snapshot to a closure instead of returning a
+  reference into thread-local storage.
+- Not ported: the kind-map copy in `MappingSnapshot` and `GetMemoryLayoutSize`'s lookup in it
+  (cpp:873-902), the `Nx2Perf::Verify` cross-check (`EDEN_NX2_PERF_VERIFY`, cpp:732-741),
+  `MapSerial`/`HostPointerSerial` (h:176-184), and `PageTableOp`/`BigPageTableOp`'s
+  out-of-address-space guard and merged `ModifyGPUMemory` notifications (cpp:123-162).
+## 2026-11-14 — shader_recompiler/{ir_opt/texture_pass,shader_info,host_translate_info}.rs and video_core/{shader_handle_program,renderer_vulkan/{graphics,compute}_pipeline,renderer_opengl/gl_{graphics,compute}_pipeline}.rs vs Lichii shader_recompiler/{ir_opt/texture_pass.cpp,shader_info.h,host_translate_info.h} and video_core/{shader_handle_program.h,renderer_vulkan/vk_{graphics,compute}_pipeline.cpp,renderer_vulkan/vk_pipeline_cache.cpp}
+
+### Ported (Lichii extensions, absent from Eden)
+- Handle-table descriptor arrays. A bindless handle read from a storage table at an index
+  each invocation loads for itself (Ocarina of Time's clustered light loop:
+  `table[light_list[i] * 0x60]`) has no draw-wide value; the handle program build failed with
+  `Phi` and the whole pipeline was rejected (`[DRAW_SKIP] pipeline compilation failed`).
+  Ported Lichii's `g_handle_index_allowed`/`g_handle_index`/`g_handle_load_depth`/
+  `g_handle_scaled` (texture_pass.cpp:643-660, 757-779, 875-886) as `HandleBuildState`
+  fields, `load_word`'s `address`/`index_word` lambdas as `build_handle_address`/
+  `build_handle_index_word`, `HandleOp::Index` (shader_info.h:438, 491-494), the MakeInst
+  retry and `HANDLE_TABLE_SIZE` = 64 element array (texture_pass.cpp:1061-1063, 1298-1390),
+  `Dominance` (texture_pass.cpp:1068-1134), `DescriptorSizeShift`'s zero shift for handle
+  programs (texture_pass.cpp:366-370) and `HostTranslateInfo::support_handle_table_arrays`
+  (host_translate_info.h:51; set from sampled-image nonuniform indexing as
+  vk_pipeline_cache.cpp:705-706, false for OpenGL and Metal).
+- `evaluate_texture_handle` takes the element (`HandleOp::Index`) and the storage alignment, and
+  `storage_buffer_base` ports Lichii `StorageBufferBase` (shader_handle_program.h:24-41): the
+  storage base honours `indirect_offset` and is aligned down to the host storage alignment,
+  as the translation's `storage_offset` assumes. ruzu read from the unaligned base and ignored
+  `indirect_offset`.
+
+### Intentional differences
+- No legacy breadth-first fallback (`pointer_word`, `handle_is_pointer_word`,
+  `binds_unmapped_pointer_word`) when even the index build fails: the pass still throws, as
+  before. (`HandleIsStoragePointer` was ported later, by 8c6626b1: see the entry for
+  video_core/{shader_handle_program,renderer_vulkan/graphics_pipeline,renderer_vulkan/compute_pipeline}.rs.)
+- Not ported: `TrimTrailingTees`, `EvaluateTextureHandles` (one evaluation per element instead,
+  same values), `HandleTableNotes`, `IsUncomparable` (pipeline_helper.h:399), Lichii's distinct-array
+  `DynamicSampledTextureArrayCount` (ruzu keeps Eden's per-instruction count) and
+  `LimitSampledTextureArrays`/`is_descriptor_array`.
+- `Dominance` takes each instruction's block from its `InstRef` instead of a map.
+
+## 2026-11-14 — video_core/{textures/texture,shader_environment,texture_cache/texture_cache}.rs vs Lichii video_core/{textures/texture.h,shader_environment.cpp,texture_cache/texture_cache.h}
+
+### Ported (Lichii extensions, absent from Eden)
+- `texture_header_index` (texture.h:167-176): on Switch 2 (native tiling) a handle past the pool
+  that is a multiple of 32 whose quotient lands inside it is a header byte offset. Applied in
+  `GenericEnvironment::read_texture_info` (shader_environment.cpp:465-470) and
+  `TextureCacheBase::visit_image_view` (texture_cache.h:1193). Ocarina of Time's Kokiri Forest
+  handle 0xf4000 with pool limit 0x812b now names header 0x7a00 instead of reading past the pool.
+- `read_texture_info` compiles for the null 2D A8B8G8R8 UNORM view when the index is still past
+  the pool (shader_environment.cpp:471-489, `null_view_tic_entry`), instead of the fail-soft
+  assert followed by a read of bytes that are no descriptor.
+
+### Intentional differences
+- Lichii's `SampledTextureMemo` use of `TextureHeaderIndex` (texture_cache.h:807) has no ruzu
+  counterpart (no memo). The diagnostic-only call in `ComputeEnvironment::ReadTexturePixelFormat`
+  (shader_environment.cpp:1122) is not ported.
+
+## 2026-11-14 — video_core/engines/{kepler_compute,native_upscale,fermi_2d}.rs, oot_network.rs and renderer_vulkan/blit_image.rs vs Lichii video_core/engines/{kepler_compute.cpp,native_upscale.h,fermi_2d.h}, oot_network.h and renderer_vulkan/blit_image.cpp
+
+### Ported
+- Ocarina of Time's movie network replacement, from Lichii aae0b063f7 (#721, port of
+  Eglantine 92f119195f): `dispatch_native_compute` skips the network's passes and replaces
+  the pass that stores the upscaled image with a bilinear Fermi2D copy of the retained input
+  (`SrcCopySrgbToLinear` when the program carries the sRGB decode immediates 0x434/0x292d292d
+  and 0x832/0x40cc40cc, otherwise `SrcCopy`). Same conditions, order, 32-dispatch window,
+  failure fallback (`native_upscale_disabled`) and helpers (`native_image_handles`,
+  `remember_native_upscale_input`, `find_native_upscale_output`, `find_native_upscale_slots`).
+- Game-specific by design, authorised by the user: active only when the current program id is
+  `oot_network::PROGRAM_ID` (0x0400486024DEC000) and cbuf0 is enabled for the dispatch.
+- `Fermi2D::Operation::SrcCopySrgbToLinear` (7) and its fragment shader
+  `blit_color_srgb_to_linear.frag` from Lichii 82e34d410f; the Vulkan blit helper selects it by
+  operation. OpenGL ignores the operation, as upstream.
+- Removed the legacy `upscale_instead_of_native_program` stand-in (fixed cbuf0 +0x90/+0xa0 pair,
+  reached only after a "matrix multiply" shader rejection), as Lichii f6a8f51324 did: the
+  rejection is now described and logged, and the dispatch reports failure. Its EDEN_NX2_SAMPLE_AT,
+  EDEN_NX2_UPSCALE_SOURCE(_FORMAT) and EDEN_NX2_TRACE_AFTER_UPSCALE diagnostics went with it.
+
+### Intentional differences
+- Lichii also requires `!dlss_chain.active`; ruzu has no Fire Emblem DLSS chain, so the term is
+  always true here.
+- `oot_network.rs` holds only `PROGRAM_ID`. The rest of Lichii's `oot_network.h` (the gameplay
+  anti-aliasing bypass: program keys, tonemap hashes, `BypassState`, `BypassEnabled` and the
+  `oot_anti_aliasing` setting) is a separate feature that ruzu does not have.
+- `find_native_upscale_slots` names `TicEntry` instead of a C++ template parameter; it has no
+  caller, upstream included.
+
+### Measurements
+- Setup: RX 5700 XT / RADV, Ocarina of Time with no controller (title screen over the movie),
+  window 30-90 s, release builds, bench.sh in headless gamescope, two runs each.
+- Per frame, 12 of 14 native dispatches belong to the movie network: one pass reads only
+  cbuf0+0x58 (1920x1080 A8B8G8R8) and stores nothing, ten passes have no image handles, and
+  the last stores cbuf0+0xc8 (2560x1440). The copy is the plain one (the program does not carry
+  the sRGB immediates), and it succeeded on every frame of the run that logged it.
+- Before: 43.60 and 43.57 FPS, host GPU busy 99.0 % in both runs.
+- After: 59.87 and 59.92 FPS, host GPU busy 14.0 % and 15.2 %. Same set of error and warning
+  messages as before. Screenshots at 40 s and 70 s showed a correct title screen.
+- Not verified: other scenes (gameplay, cutscenes after the intro), the sRGB-decoding copy path
+  at runtime, and other titles (the replacement is gated on this title's program id).
+## 2026-11-14 — core/file_sys/patch_manager.rs built-in patches vs Lichii core/file_sys/patch_manager.cpp
+
+### Intentional differences
+- Lichii extension, absent from Eden, ported at the user's explicit request
+  although it is title-specific: every built-in targets The Legend of Zelda:
+  Ocarina of Time (Switch 2), title `0400486024DEC000`, module `main`, build id
+  `E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348`. No other title-specific
+  behaviour is added. Source: Lichii `src/core/file_sys/patch_manager.cpp`
+  (`BuiltinPatchRecord`, `BuiltinPatch`, `BUILTIN_PATCHES`, the loop at the end
+  of `PatchNSO`, the check in `HasNSOPatch`, the listing in `GetPatches`), from
+  commits 99ac3d5955 (Max Resolution), 55532f2d81 (Dynamic FPS), 760183a2ad
+  (100 ms delta cap), cc3bfb9317 (FPS Unlock) and 12062785e3 (Texture Pool x2).
+  Tests port Lichii `src/tests/core/builtin_patches.cpp`.
+- Ported in Lichii's order, all default-on and listed in Add-Ons as mods whose
+  name is the disabled-add-on key (the existing per-title `disabled_addons`):
+  `Max Resolution (built-in)` (main+0x805BD0), `Texture Pool x2 (built-in)`
+  (main+0xC2A36C plus code cave main+0x3C462C0), `FPS Unlock (built-in)`
+  (main+0x6E6CC4 plus code cave main+0x3C46200, BSS state main+0x4E9FE00) and
+  `Dynamic FPS by Dark (built-in)` (same hook, cave and state). FPS Unlock
+  replaces Dynamic FPS: once it applies, Dynamic FPS is skipped with
+  "included in an applied built-in patch", and the Add-Ons list shows Dynamic
+  FPS as "IPS, replaced by FPS Unlock (built-in) when it applies". Original
+  bytes, executable-padding, BSS and user-mod-precedence guards and the log
+  messages are Lichii's.
+- Not ported: Lichii's three `DLSS ... render scale (built-in)` entries
+  (87d84d513c, ProfessorTee's Lichii #903 and QuincyForbes/Lichii f7d0938b5b)
+  and the `Settings::SetAppliedOcarinaRenderScale` bookkeeping. They apply only
+  in an `EGLANTINE_STREAMLINE` (NVIDIA Streamline) build with `nvidia_dlss` and
+  `nvidia_dlss_quality`; in Lichii's other builds they are neither applied nor
+  listed, which is ruzu's behaviour. Porting them needs the NVIDIA DLSS
+  settings, Streamline integration and the Ocarina upscale-pass replacement in
+  the Vulkan renderer (`vk_ocarina_camera_motion.cpp`, `ocarina_upscale.h`).
+- `patch_nso` now keeps the input image to compare against (Lichii takes it by
+  `const&` and copies it) and, like Lichii/Eden, returns the unpatched input
+  when the patched image is shorter than a header (it returned the short
+  patched image).
+
+### Attribution and licence status of the patch bytes
+- Max Resolution: Lichii 99ac3d5955 calls it "the community Max Resolution
+  exefs patch"; no author and no licence are given anywhere in Lichii. Licence:
+  unknown.
+- Texture Pool x2: "RsMan-Dev's patch as described in #247" (Lichii
+  12062785e3, by William RICHER, co-authored by Devin Alsup). No licence or
+  permission is stated. Licence: unknown.
+- Dynamic FPS by Dark: routine by Dark, "an Eglantine developer". Lichii
+  `docs/nx2/ocarina-dynamic-fps.md` says the bytes come from Frizti's
+  `oot-gather-fix` commit 765659af4ccb7201d1145c57f3b45ce84653cea0, "that
+  commit explicitly states that Dark gave permission to bundle it"; CTGL's
+  Lichii #299 changed the delta cap. Licence: permission to bundle mentioned
+  (second-hand, as reported by Lichii), no licence named.
+- FPS Unlock: Dark's routine head (as above) with a tail by atk3001 (Lichii
+  cc3bfb9317, contributed to Lichii, whose tree is GPL-3.0-or-later). Licence
+  of the head: as Dynamic FPS; of the tail: Lichii's project licence by
+  contribution, no separate statement.
+- The attributions are repeated in comments next to the bytes in
+  `patch_manager.rs`.
+
+## 2026-11-14 — common/settings.rs `frame_rate_limit` and nx2_gsv.rs vsync rate vs Lichii common/settings.h and core/hle/service/nx2_gsv.h
+
+### Intentional differences
+- Lichii extension (cc3bfb9317): `frame_rate_limit` (key
+  `nx2_frame_rate_limit`, Renderer, 30..=240, default 60, saved, not
+  runtime-modifiable) sets the nx2:vi2 vsync event rate through
+  `nx2_vsync_rate_hz` (`EDEN_NX2_VSYNC_HZ` still overrides it). It is what lets
+  the FPS Unlock built-in run Ocarina above 60 fps. The GTK Graphics page shows
+  it as a " Hz" slider after the FSR sharpness, in Lichii's setting order.
+- Lichii's `PaceToVblank` stops applying the 60 Hz present interval when the
+  rate is not 60 Hz (`timer_paced`). ruzu's `pace_to_vblank` has no swap
+  interval or FPS-limit pacing (it only paces to 60 Hz scaled by the speed
+  limit), so `timer_paced` just skips that pacing. At the default 60 Hz
+  nothing changes. As in Lichii, a non-60 `EDEN_NX2_VSYNC_HZ` now also skips
+  it (before, the variable changed only the vsync timer).
+
 ## 2026-11-14 — video_core/buffer_cache/{buffer_cache,buffer_cache_base}.rs vs Lichii video_core/buffer_cache/{buffer_cache,buffer_cache_base}.h
 
 ### Intentional differences

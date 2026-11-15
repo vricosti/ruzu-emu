@@ -421,6 +421,10 @@ pub struct Info {
     pub uses_atomic_s32_max: bool,
     pub uses_int64_bit_atomics: bool,
     pub uses_global_memory: bool,
+    /// Native programs: a global access was left global among several candidate buffers; the
+    /// backend routes it to the buffer whose base is the closest one at or below the address.
+    /// Lichii extension (`shader_info.h:379`).
+    pub native_global_bounds: bool,
     pub uses_atomic_image_u32: bool,
     pub uses_shadow_lod: bool,
     pub uses_rescaling_uniform: bool,
@@ -464,7 +468,8 @@ pub struct Info {
 impl Info {
     pub const MAX_INDIRECT_CBUFS: usize = 14;
     pub const MAX_CBUFS: usize = 18;
-    pub const MAX_SSBOS: usize = 32;
+    /// Lichii shader_info.h:294 (Eden: 32): native programs bind every candidate pointer.
+    pub const MAX_SSBOS: usize = 64;
 
     /// Whether a storage descriptor names a used entry of the driver table.
     /// The mask indexes guest table slots, not the compacted descriptor vector.
@@ -543,16 +548,23 @@ pub enum HandleOp {
     UMin, UMax, SMin, SMax,
     SLt, SLe, SGt, SGe, ULt, ULe, UGt, UGe, Eq, Ne,
     LAnd, LOr, LXor, LNot, Select, Tee, Load,
+    /// The element of the descriptor array being computed (see
+    /// `TextureDescriptor::handle_program`). Lichii extension:
+    /// `shader_recompiler/shader_info.h:438`.
+    Index,
 }
 
 /// Evaluate a handle against current constant/storage buffer words.
 /// Preserves upstream's zero-on-underflow/missing-operand behavior and bounded
 /// stack/slots, including ignored pushes at capacity. Unknown opcodes and a
-/// final stack size other than one return None.
+/// final stack size other than one return None. `element` is the descriptor
+/// array element computed (`HandleOp::Index`), as Lichii's
+/// `EvaluateHandleProgram` (shader_info.h:444) takes it.
 pub fn evaluate_handle_program(
     code: &[u32],
     mut read_cbuf: impl FnMut(u32, u32) -> u32,
     mut read_storage: impl FnMut(u32, u32) -> u32,
+    element: u32,
 ) -> Option<u32> {
     let mut stack = [0u32; 64];
     let mut slots = [0u32; 256];
@@ -590,6 +602,7 @@ pub fn evaluate_handle_program(
             x if x == HandleOp::Load as u32 => {
                 slots.get(code.next().unwrap_or(0) as usize).copied().unwrap_or(0)
             }
+            x if x == HandleOp::Index as u32 => element,
             x if x == HandleOp::Select as u32 => {
                 let false_value = pop(&stack, &mut size);
                 let true_value = pop(&stack, &mut size);
@@ -701,11 +714,11 @@ mod tests {
             }, |binding, offset| {
                 assert_eq!((binding, offset), (3, 28));
                 current
-            }), Some(current));
+            }, 0), Some(current));
         }
         assert_eq!(evaluate_handle_program(&[Immediate as u32, 12, CbufDynamic as u32, 4],
             |index, offset| { assert_eq!((index, offset), (4, 12)); 7 },
-            |_, _| panic!("unexpected storage read")), Some(7));
+            |_, _| panic!("unexpected storage read"), 0), Some(7));
     }
 
     #[test]
@@ -726,20 +739,33 @@ mod tests {
             (LOr, 0, 2, 1), (LXor, 4, 2, 0),
         ] {
             let code = [Immediate as u32, a, Immediate as u32, b, op as u32];
-            assert_eq!(evaluate_handle_program(&code, |_, _| 0, |_, _| 0),
+            assert_eq!(evaluate_handle_program(&code, |_, _| 0, |_, _| 0, 0),
                        Some(expected), "{op:?}");
         }
         for (op, value, expected) in [(Neg, 1, u32::MAX), (Not, 1, !1),
                                       (LNot, 0, 1), (LNot, 5, 0)] {
             assert_eq!(evaluate_handle_program(&[Immediate as u32, value, op as u32],
-                |_, _| 0, |_, _| 0), Some(expected));
+                |_, _| 0, |_, _| 0, 0), Some(expected));
+        }
+    }
+
+    #[test]
+    fn handle_program_index_pushes_the_descriptor_array_element() {
+        use HandleOp::*;
+        // A light table read at element * 0x60 + 0x10: one handle per element.
+        let code = [Index as u32, Immediate as u32, 0x60, Mul as u32, Immediate as u32, 0x10,
+                    Add as u32, Storage as u32, 1];
+        for element in [0u32, 1, 63] {
+            assert_eq!(evaluate_handle_program(&code, |_, _| panic!("no cbuf read"),
+                |binding, offset| { assert_eq!(binding, 1); offset }, element),
+                Some(element * 0x60 + 0x10));
         }
     }
 
     #[test]
     fn handle_program_slots_select_and_upstream_bounds() {
         use HandleOp::*;
-        let eval = |code: &[u32]| evaluate_handle_program(code, |_, _| 0, |_, _| 0);
+        let eval = |code: &[u32]| evaluate_handle_program(code, |_, _| 0, |_, _| 0, 0);
         assert_eq!(eval(&[Immediate as u32, 3, Tee as u32, 255, Load as u32, 255,
                          Add as u32]), Some(6));
         for (condition, expected) in [(0, 9), (7, 5)] {

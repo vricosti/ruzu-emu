@@ -64,6 +64,7 @@ use super::pipeline_statistics::PipelineStatistics;
 
 use super::render_pass_cache::RenderPassCache;
 use super::scheduler::Scheduler;
+use crate::engines::kepler_compute::KeplerCompute;
 use super::texture_cache::TextureCache;
 use super::update_descriptor::UpdateDescriptorQueue;
 
@@ -232,6 +233,9 @@ fn make_host_translate_info(device: &Device) -> HostTranslateInfo {
         support_viewport_index_layer: device.is_ext_shader_viewport_index_layer_supported(),
         support_geometry_shader_passthrough: device.is_nv_geometry_shader_passthrough_supported(),
         support_conditional_barrier: device.supports_conditional_barriers(),
+        // The arrays are indexed per invocation, which needs nonuniform
+        // indexing to be defined (Lichii vk_pipeline_cache.cpp:705-706).
+        support_handle_table_arrays: device.is_sampled_image_array_non_uniform_indexing_supported(),
     };
     host_info.apply_descriptor_limit_policy();
     host_info
@@ -1318,8 +1322,60 @@ impl CurrentComputePipeline {
     }
 }
 
+/// Lichii `MaxComputeRebuilds` (vk_pipeline_cache.cpp:949).
+const MAX_COMPUTE_REBUILDS: u32 = 4;
+
+/// Port of Lichii `ComputePipelineCacheEntry` (vk_pipeline_cache.h:110-123). Upstream's
+/// node-based cache keeps returned `ComputePipeline*` stable and retains a null pipeline after a
+/// failed build; `Box` keeps successful pipelines stable across HashMap growth.
+#[derive(Default)]
+pub(crate) struct ComputePipelineCacheEntry {
+    pipeline: Option<Box<ComputePipeline>>,
+    /// Constant buffer slots that were null pointers at translation
+    null_pointer_slots: Vec<(u32, u32)>,
+    /// Constant buffer slots bound as storage buffer pointers
+    mapped_pointers: Vec<u64>,
+    rebuilds: u32,
+}
+
+/// Port of Lichii `PipelineCache::StaleNullPointerSlot` (vk_pipeline_cache.cpp:987-1012): a slot
+/// that was null at translation now holds a mapped pointer.
+fn stale_null_pointer_slot(
+    entry: &ComputePipelineCacheEntry,
+    kepler_compute: &KeplerCompute,
+    gpu_memory: &crate::memory_manager::MemoryManager,
+    shader_hash: u64,
+) -> bool {
+    let qmd = kepler_compute.launch_description();
+    for &(index, offset) in &entry.null_pointer_slots {
+        if index as usize >= qmd.const_buffers.len() || (qmd.const_buffer_enable_mask >> index) & 1 == 0 {
+            continue;
+        }
+        let cbuf = qmd.const_buffers[index as usize];
+        if u64::from(offset) + 8 > u64::from(cbuf.size) {
+            continue; // The translator reads past the bound size as zero, too
+        }
+        let slot = cbuf.address.wrapping_add(u64::from(offset));
+        if !gpu_memory.is_fully_mapped_range(slot, 8) {
+            continue;
+        }
+        let address = gpu_memory.read::<u64>(slot);
+        if address != 0
+            && gpu_memory.is_within_gpu_address_range(address)
+            && gpu_memory.is_fully_mapped_range(address, 1)
+        {
+            log::info!(
+                "Rebuilding compute program {shader_hash:016x}: c{index}[{offset:#x}] was null at \
+                 translation and now points to {address:#x}"
+            );
+            return true;
+        }
+    }
+    false
+}
+
 enum DiskPipelineBuildResult {
-    Compute(ComputePipelineCacheKey, ComputePipeline),
+    Compute(ComputePipelineCacheKey, ComputePipeline, Vec<(u32, u32)>, Vec<u64>),
     Graphics(GraphicsPipelineKey, GraphicsPipeline),
 }
 
@@ -1479,7 +1535,9 @@ impl Default for ShaderPools {
 // Version 23: uniform compare/select, FP16 per-tap gather and LEA.HI negation.
 // Previously expanded native programs retain the old lowering behavior.
 // Version 24: corrected NOINC capture boundaries, depth gather and constant PTP offsets.
-const CACHE_VERSION: u32 = 25;
+/// 26: the storage buffer pass reads pointer classifications that records made by the earlier
+/// pass lack (they failed to load with "Uncached storage pointer classification").
+const CACHE_VERSION: u32 = 26;
 // Upstream: flush the Vulkan pipeline cache to disk at most once per
 // max(30 s, 1 s per MiB of cache) once 128 new pipelines were built.
 const VULKAN_CACHE_FLUSH_PIPELINES: usize = 128;
@@ -1903,7 +1961,9 @@ fn get_pipeline_worker_count(has_broken_parallel_shader_compiling: bool) -> usiz
 pub(crate) struct MeshComputePrograms {
     pub task: Option<super::compute_pipeline::MeshComputeStage>,
     pub task_info: Option<shader_recompiler::shader_info::MeshInfo>,
-    pub task_workgroup_bound: Option<u32>,
+    /// With a task program: the distribution pass that resolves the mesh
+    /// workgroup count on the GPU (Lichii mesh emulation, see vk_rasterizer).
+    pub distribution: Option<super::compute_pipeline::MeshEmulationDistribution>,
     pub mesh: super::compute_pipeline::MeshComputeStage,
     pub mesh_info: shader_recompiler::shader_info::MeshInfo,
 }
@@ -1964,7 +2024,10 @@ pub struct PipelineCache {
     // negative-cache entry; `Box` keeps successful pipelines stable across
     // HashMap growth.
     compute_cache:
-        HashMap<ComputePipelineCacheKey, Option<Box<ComputePipeline>>, BuildUnorderedDenseHasher>,
+        HashMap<ComputePipelineCacheKey, ComputePipelineCacheEntry, BuildUnorderedDenseHasher>,
+    /// Pipelines replaced by a rebuild (Lichii `retired_compute_pipelines`); dispatches already
+    /// recorded may still use them.
+    retired_compute_pipelines: Vec<Box<ComputePipeline>>,
     /// Upstream `Common::ThreadWorker workers`, owned by `PipelineCache`.
     ///
     /// This is the required owner for disk-cache rebuild jobs and asynchronous
@@ -2110,6 +2173,7 @@ impl PipelineCache {
             pipeline_use_clock: 0,
             vulkan_pipeline_cache: vk::PipelineCache::null(),
             compute_cache: HashMap::with_hasher(BuildUnorderedDenseHasher),
+            retired_compute_pipelines: Vec::new(),
             workers: ThreadWorker::new_stateless(
                 get_pipeline_worker_count(has_broken_parallel_shader_compiling),
                 "VkPipelineBuilder".to_string(),
@@ -2174,15 +2238,25 @@ impl PipelineCache {
             .fixed_state
             .refresh(draw, &self.dynamic_features);
 
-        // Record use here, where the key is final, rather than in the slow
-        // path: most draws are served by the transition fast path below and
-        // would otherwise never be counted as used at all.
-        self.note_pipeline_use(graphics_key_cache_hash(&self.graphics_key));
-
         let next = self
             .current_pipeline
             .as_ref()
             .and_then(|current| GraphicsPipeline::next(current, &self.graphics_key));
+
+        // Record use here, where the key is final, rather than in the slow
+        // path: most draws are served by the transition fast path below and
+        // would otherwise never be counted as used at all. A draw keeping the
+        // current pipeline (same key) is skipped: that key already holds the
+        // latest clock value, so the recency order is unchanged, and the
+        // per-draw key hash stays off the common path.
+        let keeps_current = matches!(
+            (&next, &self.current_pipeline),
+            (Some(next), Some(current)) if Rc::ptr_eq(next, current)
+        );
+        if !keeps_current {
+            self.note_pipeline_use(graphics_key_cache_hash(&self.graphics_key));
+        }
+
         if let Some(next) = next {
             self.current_pipeline = Some(next);
             let pipeline = self
@@ -2285,7 +2359,7 @@ impl PipelineCache {
             let built = catch_shader_exception(|| -> Result<MeshComputePrograms, String> {
                 let mut task = None;
                 let mut task_info = None;
-                let mut task_workgroup_bound = None;
+                let mut distribution = None;
                 let mut mesh = None;
                 let mut mesh_info = None;
                 for index in [1, 3] {
@@ -2302,9 +2376,17 @@ impl PipelineCache {
                     let start = env.generic_environment().cached_instruction_start();
                     let program = shader_recompiler::pipeline_cache::translate_program_from_env_with_host_info(
                         &code, start, env, &self.host_info);
-                    let shader = shader_recompiler::backend::spirv::emit_spirv::emit_mesh_compute_spirv_with_task_guard(
-                        &program, &self.profile, &RuntimeInfo::default(), &mut Bindings::default(), task.is_some())
-                        .map_err(|error| error.to_string())?;
+                    // A mesh after a task is dispatched by the distribution
+                    // pass and finds its task itself (Lichii mesh emulation).
+                    let task_payload_stride = task_info.as_ref()
+                        .map(|info: &shader_recompiler::shader_info::MeshInfo| info.payload_words);
+                    let shader = match task_payload_stride {
+                        Some(stride) if !program.info.is_task =>
+                            shader_recompiler::backend::spirv::emit_spirv::emit_mesh_compute_spirv_with_task_distribution(
+                                &program, &self.profile, &RuntimeInfo::default(), &mut Bindings::default(), stride),
+                        _ => shader_recompiler::backend::spirv::emit_spirv::emit_mesh_compute_spirv(
+                            &program, &self.profile, &RuntimeInfo::default(), &mut Bindings::default()),
+                    }.map_err(|error| error.to_string())?;
                     let stage = super::compute_pipeline::MeshComputeStage::new(self.device_owner.get(),
                         program.info.clone(), &shader, index - 1, self.vulkan_pipeline_cache)
                         .map_err(|error| format!("Mesh pipeline creation: {error:?}"))?;
@@ -2312,16 +2394,23 @@ impl PipelineCache {
                         if task.is_some() { return Err("Duplicate task stage".into()); }
                         task = Some(stage);
                         task_info = Some(program.mesh.clone());
-                        task_workgroup_bound = shader_recompiler::backend::spirv::emit_spirv_mesh::task_mesh_workgroup_bound(&program);
+                        let code = shader_recompiler::backend::spirv::emit_spirv_mesh::emit_mesh_emulation_distribution(&self.profile);
+                        distribution = Some(super::compute_pipeline::MeshEmulationDistribution::new(
+                            self.device_owner.get(), &code, self.vulkan_pipeline_cache)
+                            .map_err(|error| format!("Mesh distribution pipeline creation: {error:?}"))?);
                     } else {
                         if mesh.is_some() { return Err("Duplicate mesh stage".into()); }
                         mesh = Some(stage);
                         mesh_info = Some(program.mesh.clone());
                     }
                 }
+                let mesh = mesh.ok_or("Mesh graphics pipeline has no mesh stage")?;
+                if mesh.has_task_args() != task.is_some() {
+                    return Err("Task program must precede its mesh program".into());
+                }
                 Ok(MeshComputePrograms {
-                    task, task_info, task_workgroup_bound,
-                    mesh: mesh.ok_or("Mesh graphics pipeline has no mesh stage")?,
+                    task, task_info, distribution,
+                    mesh,
                     mesh_info: mesh_info.ok_or("Mesh graphics pipeline has no mesh metadata")?,
                 })
             }).and_then(|result| result);
@@ -2360,35 +2449,90 @@ impl PipelineCache {
             workgroup_size: [qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z],
         };
         if !self.compute_cache.contains_key(&key) {
-            self.compute_cache.insert(key, None);
-            let gpu_memory = shared_cache.current_gpu_memory()?;
-            let mut env = ComputeEnvironment::from_kepler_compute(kepler_compute, gpu_memory);
-            env.generic_environment_mut().set_cached_size(shader_size);
-            self.main_pools.release_contents();
-            let pipeline = self.create_compute_pipeline_from_environment(&key, &mut env);
-            self.queue_vulkan_pipeline_cache_flush();
-            let pipeline = pipeline?;
-            if !self.pipeline_cache_filename.as_os_str().is_empty()
-                && self.disk_compute_keys.insert(key)
-            {
-                let key_bytes = compute_key_to_cache_bytes(&key);
-                let filename = self.pipeline_cache_filename.clone();
-                let generic_env = env.generic_environment().clone();
-                self.serialization_thread.queue_stateless_work(move || {
-                    serialize_pipeline(&key_bytes, &[&generic_env], &filename, CACHE_VERSION);
-                });
-            }
+            self.compute_cache.insert(key, ComputePipelineCacheEntry::default());
+            let entry = self.create_runtime_compute_pipeline(shared_cache, &key, shader_size, &[])?;
             *self
                 .compute_cache
                 .get_mut(&key)
-                .expect("new compute cache entry disappeared") = Some(Box::new(pipeline));
+                .expect("new compute cache entry disappeared") = entry;
+        } else {
+            let stale = {
+                let entry = self.compute_cache.get(&key).expect("checked above");
+                !entry.null_pointer_slots.is_empty()
+                    && entry.rebuilds < MAX_COMPUTE_REBUILDS
+                    && shared_cache.current_gpu_memory().is_some_and(|gpu_memory| {
+                        stale_null_pointer_slot(entry, kepler_compute, &gpu_memory.lock(), shader_hash)
+                    })
+            };
+            if stale {
+                // The translation dropped accesses through a pointer that was null back then.
+                // Which slots the game fills depends on the area, so the new one keeps binding
+                // every pointer this one binds, null now or not: a null pointer binds nothing.
+                let keep = self.compute_cache[&key].mapped_pointers.clone();
+                let rebuilt = self.create_runtime_compute_pipeline(shared_cache, &key, shader_size, &keep);
+                let entry = self.compute_cache.get_mut(&key).expect("checked above");
+                match rebuilt {
+                    Some(mut rebuilt) if rebuilt.pipeline.is_some() => {
+                        if let Some(old) = entry.pipeline.take() {
+                            self.retired_compute_pipelines.push(old);
+                        }
+                        rebuilt.rebuilds = entry.rebuilds + 1;
+                        *entry = rebuilt;
+                    }
+                    _ => {
+                        // Keep the working translation when the new one cannot be built, and stop
+                        // retrying.
+                        log::warn!("Keeping compute shader {shader_hash:016x}: rebuild failed");
+                        entry.rebuilds = MAX_COMPUTE_REBUILDS;
+                    }
+                }
+            }
         }
         self.compute_cache
             .get_mut(&key)
-            .and_then(Option::as_deref_mut)
+            .and_then(|entry| entry.pipeline.as_deref_mut())
             .map(|pipeline| CurrentComputePipeline {
                 pipeline_owner: NonNull::from(pipeline),
             })
+    }
+
+    /// The runtime half of Lichii `PipelineCache::CreateComputePipeline(key, shader,
+    /// keep_pointers)` (vk_pipeline_cache.cpp:3024-3074): `keep_pointers` stay storage buffer
+    /// pointers whatever their slots hold now.
+    fn create_runtime_compute_pipeline(
+        &mut self,
+        shared_cache: &mut SharedShaderCache,
+        key: &ComputePipelineCacheKey,
+        shader_size: usize,
+        keep_pointers: &[u64],
+    ) -> Option<ComputePipelineCacheEntry> {
+        let kepler_compute = shared_cache.current_kepler_compute()?;
+        let gpu_memory = shared_cache.current_gpu_memory()?;
+        let mut env = ComputeEnvironment::from_kepler_compute(kepler_compute, gpu_memory);
+        env.generic_environment_mut().set_cached_size(shader_size);
+        env.generic_environment_mut().keep_storage_pointers(keep_pointers);
+        self.main_pools.release_contents();
+        let pipeline = self.create_compute_pipeline_from_environment(key, &mut env);
+        self.queue_vulkan_pipeline_cache_flush();
+        let pipeline = pipeline?;
+        if !self.pipeline_cache_filename.as_os_str().is_empty()
+            && self.disk_compute_keys.insert(*key)
+        {
+            let key_bytes = compute_key_to_cache_bytes(key);
+            let filename = self.pipeline_cache_filename.clone();
+            let generic_env = env.generic_environment().clone();
+            self.serialization_thread.queue_stateless_work(move || {
+                serialize_pipeline(&key_bytes, &[&generic_env], &filename, CACHE_VERSION);
+            });
+        }
+        let generic = env.generic_environment();
+        let native = generic.has_native_instructions();
+        Some(ComputePipelineCacheEntry {
+            pipeline: Some(Box::new(pipeline)),
+            null_pointer_slots: if native { generic.null_storage_pointer_slots() } else { Vec::new() },
+            mapped_pointers: if native { generic.mapped_storage_pointer_keys() } else { Vec::new() },
+            rebuilds: 0,
+        })
     }
 
     fn create_compute_pipeline_from_environment(
@@ -2717,6 +2861,11 @@ impl PipelineCache {
             let statistics = pipeline_statistics.clone();
             self.workers.queue_stateless_work(move || {
                 let mut env = env;
+                let native = env.has_native_instructions();
+                let null_pointer_slots =
+                    if native { env.null_storage_pointer_slots() } else { Vec::new() };
+                let mapped_pointers =
+                    if native { env.mapped_storage_pointer_keys() } else { Vec::new() };
                 match build_compute_pipeline_from_file_environment(
                     device_ref,
                     profile,
@@ -2731,7 +2880,12 @@ impl PipelineCache {
                     Some(pipeline) => results
                         .lock()
                         .unwrap()
-                        .push(DiskPipelineBuildResult::Compute(key, pipeline)),
+                        .push(DiskPipelineBuildResult::Compute(
+                            key,
+                            pipeline,
+                            null_pointer_slots,
+                            mapped_pointers,
+                        )),
                     None => {
                         skipped_jobs.fetch_add(1, Ordering::Relaxed);
                     }
@@ -2792,11 +2946,16 @@ impl PipelineCache {
         let mut skipped_count = skipped.get() + job_skipped.load(Ordering::Relaxed);
         for result in build_results.lock().unwrap().drain(..) {
             match result {
-                DiskPipelineBuildResult::Compute(key, pipeline) => {
+                DiskPipelineBuildResult::Compute(key, pipeline, null_pointer_slots, mapped_pointers) => {
                     if self.compute_cache.contains_key(&key) {
                         skipped_count += 1;
                     } else {
-                        self.compute_cache.insert(key, Some(Box::new(pipeline)));
+                        self.compute_cache.insert(key, ComputePipelineCacheEntry {
+                            pipeline: Some(Box::new(pipeline)),
+                            null_pointer_slots,
+                            mapped_pointers,
+                            rebuilds: 0,
+                        });
                         built += 1;
                     }
                 }

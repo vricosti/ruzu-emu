@@ -128,6 +128,10 @@ pub fn emit_mesh_dispatch_import(ctx: &mut SpirvEmitContext) {
         .builder
         .composite_extract(ctx.u32_type, None, group, [0])
         .unwrap();
+    if ctx.mesh_task_args_buffer != 0 {
+        emit_mesh_task_distribution_import(ctx, x);
+        return;
+    }
     let words = ctx.constant_u32(MeshDispatchRecord::WORDS);
     let base = ctx.builder.i_mul(ctx.u32_type, None, x, words).unwrap();
     let mut fields = [0; 3];
@@ -158,6 +162,79 @@ pub fn emit_mesh_dispatch_import(ctx: &mut SpirvEmitContext) {
         .unwrap();
     ctx.mesh_payload_base = fields[1];
     ctx.mesh_output_record = fields[2];
+}
+
+/// Binary-search steps of the task lookup. Lichii unrolls 17 (up to 2^17
+/// tasks, emit_spirv_mesh.cpp:368-377) with no host guard; 32 covers every u32
+/// task count, so a draw with more task workgroups never maps to a wrong task.
+pub const MESH_EMULATION_TASK_SEARCH_STEPS: u32 = 32;
+
+fn task_buffer_word(ctx: &mut SpirvEmitContext, buffer: Word, pointer_type: Word, index: Word) -> Word {
+    let pointer = ctx.builder.access_chain(pointer_type, None, buffer,
+        [ctx.const_zero_u32, index]).unwrap();
+    ctx.builder.load(ctx.u32_type, None, pointer, None, []).unwrap()
+}
+
+/// Port of Lichii's mesh emulation task lookup (emit_spirv_mesh.cpp:362-392):
+/// with the mesh workgroups dispatched indirectly by the distribution pass,
+/// this workgroup's task is the last one whose first mesh workgroup is not
+/// past it (a branchless binary search of the offsets; tasks with no mesh
+/// workgroups share the next task's offset and lose to it), and its guest X is
+/// its index within that task's mesh workgroups. ruzu adaptation: the result
+/// fills the same MeshDispatchRecord fields the host mapping otherwise
+/// supplies, and the output record is the draw's arena record base
+/// (MESH_EMULATION_ARGS_BASE) plus the global index.
+fn emit_mesh_task_distribution_import(ctx: &mut SpirvEmitContext, global: Word) {
+    use super::emit_spirv::{MESH_EMULATION_ARGS_BASE, MESH_EMULATION_ARGS_TASKS};
+    assert!(ctx.is_mesh && !ctx.is_task && ctx.mesh_task_payload_stride != 0);
+    let (args, args_u32) = (ctx.mesh_task_args_buffer, ctx.mesh_task_args_buffer_u32);
+    let (offsets, offsets_u32) = (ctx.mesh_dispatch_buffer, ctx.mesh_dispatch_buffer_u32);
+    let tasks_index = ctx.constant_u32(MESH_EMULATION_ARGS_TASKS);
+    let tasks = task_buffer_word(ctx, args, args_u32, tasks_index);
+    let one = ctx.const_one_u32;
+    let at_least_one = ctx.builder.ext_inst(ctx.u32_type, None, ctx.glsl_ext,
+        41, // GLSL.std.450 UMax
+        [Operand::IdRef(tasks), Operand::IdRef(one)]).unwrap();
+    let last_task = ctx.builder.i_sub(ctx.u32_type, None, at_least_one, one).unwrap();
+    let mut task = ctx.const_zero_u32;
+    let mut remaining = tasks;
+    for _ in 0..MESH_EMULATION_TASK_SEARCH_STEPS {
+        let half = ctx.builder.shift_right_logical(ctx.u32_type, None, remaining, one).unwrap();
+        let sum = ctx.builder.i_add(ctx.u32_type, None, task, half).unwrap();
+        let middle = ctx.builder.ext_inst(ctx.u32_type, None, ctx.glsl_ext, 38,
+            [Operand::IdRef(sum), Operand::IdRef(last_task)]).unwrap();
+        let first = task_buffer_word(ctx, offsets, offsets_u32, middle);
+        let take = ctx.builder.u_less_than_equal(ctx.bool_type, None, first, global).unwrap();
+        task = ctx.builder.select(ctx.u32_type, None, take, middle, task).unwrap();
+        remaining = ctx.builder.i_sub(ctx.u32_type, None, remaining, half).unwrap();
+    }
+    let first_group = task_buffer_word(ctx, offsets, offsets_u32, task);
+    let child = ctx.builder.i_sub(ctx.u32_type, None, global, first_group).unwrap();
+    let stride = ctx.constant_u32(ctx.mesh_task_payload_stride);
+    ctx.mesh_payload_base = ctx.builder.i_mul(ctx.u32_type, None, task, stride).unwrap();
+    let base_index = ctx.constant_u32(MESH_EMULATION_ARGS_BASE);
+    let base = task_buffer_word(ctx, args, args_u32, base_index);
+    ctx.mesh_output_record = ctx.builder.i_add(ctx.u32_type, None, base, global).unwrap();
+    ctx.mesh_guest_workgroup_id = ctx.builder.composite_construct(ctx.u32_vec3_type, None,
+        [child, ctx.const_zero_u32, ctx.const_zero_u32]).unwrap();
+}
+
+/// Host model of `emit_mesh_task_distribution_import`'s lookup, operation for
+/// operation: returns (task, guest X within the task).
+#[cfg(test)]
+pub(crate) fn mesh_task_lookup_model(offsets: &[u32], global: u32) -> (u32, u32) {
+    let tasks = offsets.len() as u32;
+    let last_task = tasks.max(1) - 1;
+    let (mut task, mut remaining) = (0u32, tasks);
+    for _ in 0..MESH_EMULATION_TASK_SEARCH_STEPS {
+        let half = remaining >> 1;
+        let middle = task.wrapping_add(half).min(last_task);
+        if offsets[middle as usize] <= global {
+            task = middle;
+        }
+        remaining -= half;
+    }
+    (task, global.wrapping_sub(offsets[task as usize]))
 }
 
 /// Reject unused reserved children before payload import, guest memory accesses
@@ -390,15 +467,25 @@ pub fn emit_mesh_output_export(ctx: &mut SpirvEmitContext, record: Word) {
             ctx.builder.store(pointer, value, None, []).unwrap();
         }
     });
+    // Lichii ComputeMeshEpilogue (emit_spirv_mesh.cpp:207-231): a primitive's
+    // vertex indices, or 0 0 0 (a degenerate primitive) past the count. One
+    // draw covers every record's full vertex span when a task program's
+    // counts stay on the GPU, so slots past the count must not keep the
+    // indices the guest left in its map.
+    let corners = ctx.constant_u32(ctx.mesh_info.primitive_vertices());
+    let used_corners = ctx.builder.i_mul(ctx.u32_type, None, count, corners).unwrap();
+    let map_header = ctx.constant_u32(4);
+    let used_map_words = ctx.builder.i_add(ctx.u32_type, None, used_corners, map_header).unwrap();
     // Raw ISBE layout is preserved, including its 32-element group padding.
     // Every reserved map byte still occupies its own U32 word.
-    for (source, offset, words) in [
+    for (source, offset, words, is_map) in [
         (
             ctx.mesh_attributes,
             layout.attribute_base,
             layout.attribute_words,
+            false,
         ),
-        (ctx.mesh_map, layout.map_base, layout.map_words),
+        (ctx.mesh_map, layout.map_base, layout.map_words, true),
     ] {
         let offset = ctx.constant_u32(offset);
         let destination_base = ctx.builder.i_add(ctx.u32_type, None, base, offset).unwrap();
@@ -415,10 +502,18 @@ pub fn emit_mesh_output_export(ctx: &mut SpirvEmitContext, record: Word) {
                     .i_add(ctx.u32_type, None, destination_base, index)
                     .unwrap();
                 let target = output_word(ctx, target_index);
-                let value = ctx
+                let mut value = ctx
                     .builder
                     .load(ctx.u32_type, None, source, None, [])
                     .unwrap();
+                if is_map {
+                    let used = ctx.builder
+                        .u_less_than(ctx.bool_type, None, index, used_map_words)
+                        .unwrap();
+                    value = ctx.builder
+                        .select(ctx.u32_type, None, used, value, ctx.const_zero_u32)
+                        .unwrap();
+                }
                 ctx.builder.store(target, value, None, []).unwrap();
             };
             if first + ctx.mesh_threads > words {
@@ -822,6 +917,211 @@ fn workgroup_zero_fill() -> bool {
         std::env::var_os("RUZU_NX2_WORKGROUP_ZERO")
             .is_none_or(|value| !value.to_string_lossy().starts_with('0'))
     })
+}
+
+/// Distribution pass (one invocation) between the task and mesh dispatches,
+/// set 0: payload buffer (binding 0), offsets (1: first mesh workgroup of each
+/// task), arguments (2) and the arena counter (3: output words allocated so
+/// far, kept counting past the arena's end). The draw's output is allocated
+/// from the arena every task draw of the submission shares; mesh workgroups
+/// that do not fit are not dispatched. Port of Lichii
+/// `EmitMeshEmulationDistribution` (emit_spirv_mesh.cpp:602-730).
+///
+/// ruzu adaptation: the arena holds transport records of `block_words` words,
+/// so the draw's base is rounded up to a whole record and stored as a record
+/// index at MESH_EMULATION_ARGS_BASE; the indirect draw's firstVertex selects
+/// that record (`base * vertices_per_group`), since the generated vertex shader
+/// derives its record from VertexIndex instead of reading the arguments.
+pub fn emit_mesh_emulation_distribution(profile: &crate::profile::Profile) -> Vec<u32> {
+    use super::emit_spirv::{MeshEmulationDistributionConstants, MESH_EMULATION_ARGS_BASE,
+        MESH_EMULATION_ARGS_REQUESTED, MESH_EMULATION_ARGS_TASKS, MESH_EMULATION_DRAW_ARGS_OFFSET};
+    use rspirv::dr::Builder;
+    let mut module = Builder::new();
+    module.set_version((profile.supported_spirv >> 16) as u8,
+        ((profile.supported_spirv >> 8) & 0xff) as u8);
+    module.capability(spirv::Capability::Shader);
+    module.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    module.extension("SPV_KHR_storage_buffer_storage_class");
+    let glsl = module.ext_inst_import("GLSL.std.450");
+
+    let void_type = module.type_void();
+    let bool_type = module.type_bool();
+    let u32_type = module.type_int(32, 0);
+    let constant = |module: &mut Builder, value: u32| module.constant_bit32(u32_type, value);
+
+    let array_type = module.type_runtime_array(u32_type);
+    module.decorate(array_type, spirv::Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
+    let struct_type = module.type_struct([array_type]);
+    module.decorate(struct_type, spirv::Decoration::Block, []);
+    module.member_decorate(struct_type, 0, spirv::Decoration::Offset, [Operand::LiteralBit32(0)]);
+    let buffer_pointer = module.type_pointer(None, spirv::StorageClass::StorageBuffer, struct_type);
+    let buffer_u32 = module.type_pointer(None, spirv::StorageClass::StorageBuffer, u32_type);
+    let mut interfaces = Vec::new();
+    let mut define_buffer = |module: &mut Builder, binding: u32, name: &str| {
+        let buffer = module.variable(buffer_pointer, None, spirv::StorageClass::StorageBuffer, None);
+        module.decorate(buffer, spirv::Decoration::Binding, [Operand::LiteralBit32(binding)]);
+        module.decorate(buffer, spirv::Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+        module.name(buffer, name);
+        interfaces.push(buffer);
+        buffer
+    };
+    let payload = define_buffer(&mut module, 0, "payload");
+    let offsets = define_buffer(&mut module, 1, "offsets");
+    let args = define_buffer(&mut module, 2, "args");
+    let counter = define_buffer(&mut module, 3, "arena_counter");
+
+    let num_constants = MeshEmulationDistributionConstants::WORDS;
+    let constants_type = module.type_struct(vec![u32_type; num_constants as usize]);
+    module.decorate(constants_type, spirv::Decoration::Block, []);
+    for member in 0..num_constants {
+        module.member_decorate(constants_type, member, spirv::Decoration::Offset,
+            [Operand::LiteralBit32(member * 4)]);
+    }
+    let constants_pointer = module.type_pointer(None, spirv::StorageClass::PushConstant, constants_type);
+    let constants = module.variable(constants_pointer, None, spirv::StorageClass::PushConstant, None);
+    interfaces.push(constants);
+    let constant_u32 = module.type_pointer(None, spirv::StorageClass::PushConstant, u32_type);
+    if profile.supported_spirv < 0x0001_0400 {
+        interfaces.clear(); // only Input and Output variables before SPIR-V 1.4
+    }
+
+    let word = |module: &mut Builder, buffer: Word, index: Word| {
+        let zero = constant(module, 0);
+        module.access_chain(buffer_u32, None, buffer, [zero, index]).unwrap()
+    };
+    let function_type = module.type_function(void_type, []);
+    let main = module.begin_function(void_type, None, spirv::FunctionControl::NONE, function_type)
+        .unwrap();
+    module.begin_block(None).unwrap();
+    let function_u32 = module.type_pointer(None, spirv::StorageClass::Function, u32_type);
+    let total_var = module.variable(function_u32, None, spirv::StorageClass::Function, None);
+    let task_var = module.variable(function_u32, None, spirv::StorageClass::Function, None);
+    let push = |module: &mut Builder, member: u32| {
+        let index = constant(module, member);
+        let pointer = module.access_chain(constant_u32, None, constants, [index]).unwrap();
+        module.load(u32_type, None, pointer, None, []).unwrap()
+    };
+    let tasks = push(&mut module, 0);
+    let payload_words = push(&mut module, 1);
+    let capacity_words = push(&mut module, 2);
+    let block_words = push(&mut module, 3);
+    let vertices_per_group = push(&mut module, 4);
+    let max_groups = push(&mut module, 5);
+    let zero = constant(&mut module, 0);
+    let one = constant(&mut module, 1);
+    module.store(total_var, zero, None, []).unwrap();
+    module.store(task_var, zero, None, []).unwrap();
+
+    // for (task = 0; task < tasks; ++task) { offsets[task] = total; total += count; }
+    let header = module.id();
+    let condition_label = module.id();
+    let body_label = module.id();
+    let continue_label = module.id();
+    let merge = module.id();
+    module.branch(header).unwrap();
+    module.begin_block(Some(header)).unwrap();
+    module.loop_merge(merge, continue_label, spirv::LoopControl::NONE, []).unwrap();
+    module.branch(condition_label).unwrap();
+    module.begin_block(Some(condition_label)).unwrap();
+    let task = module.load(u32_type, None, task_var, None, []).unwrap();
+    let in_range = module.u_less_than(bool_type, None, task, tasks).unwrap();
+    module.branch_conditional(in_range, body_label, merge, []).unwrap();
+    module.begin_block(Some(body_label)).unwrap();
+    {
+        let total = module.load(u32_type, None, total_var, None, []).unwrap();
+        let base = module.i_mul(u32_type, None, task, payload_words).unwrap();
+        let index = module.i_add(u32_type, None, base, one).unwrap();
+        let pointer = word(&mut module, payload, index);
+        let requested = module.load(u32_type, None, pointer, None, []).unwrap();
+        let pointer = word(&mut module, offsets, task);
+        module.store(pointer, total, None, []).unwrap();
+        let sum = module.i_add(u32_type, None, total, requested).unwrap();
+        module.store(total_var, sum, None, []).unwrap();
+    }
+    module.branch(continue_label).unwrap();
+    module.begin_block(Some(continue_label)).unwrap();
+    let task = module.load(u32_type, None, task_var, None, []).unwrap();
+    let next = module.i_add(u32_type, None, task, one).unwrap();
+    module.store(task_var, next, None, []).unwrap();
+    module.branch(header).unwrap();
+    module.begin_block(Some(merge)).unwrap();
+
+    // The draw's records are allocated from the arena every task draw of the
+    // submission shares. The passes of consecutive draws are ordered by
+    // barriers, so a plain read and write allocate. The counter keeps growing
+    // past the end, so the host sees how much the submission needed.
+    let total = module.load(u32_type, None, total_var, None, []).unwrap();
+    let counter_word = word(&mut module, counter, zero);
+    let base_words = module.load(u32_type, None, counter_word, None, []).unwrap();
+    let block_minus_one = module.i_sub(u32_type, None, block_words, one).unwrap();
+    let rounded = module.i_add(u32_type, None, base_words, block_minus_one).unwrap();
+    let base = module.u_div(u32_type, None, rounded, block_words).unwrap();
+    let records = module.i_add(u32_type, None, base, total).unwrap();
+    let allocated = module.i_mul(u32_type, None, records, block_words).unwrap();
+    module.store(counter_word, allocated, None, []).unwrap();
+    let capacity = module.u_div(u32_type, None, capacity_words, block_words).unwrap();
+    let fits = module.u_less_than(bool_type, None, base, capacity).unwrap();
+    let left = module.i_sub(u32_type, None, capacity, base).unwrap();
+    let room = module.select(u32_type, None, fits, left, zero).unwrap();
+    let umin = |module: &mut Builder, a: Word, b: Word| module.ext_inst(u32_type, None, glsl,
+        38, [Operand::IdRef(a), Operand::IdRef(b)]).unwrap();
+    let fitting = umin(&mut module, total, room);
+    let dispatched = umin(&mut module, fitting, max_groups);
+    let draw = MESH_EMULATION_DRAW_ARGS_OFFSET / 4;
+    let vertex_count = module.i_mul(u32_type, None, dispatched, vertices_per_group).unwrap();
+    let first_vertex = module.i_mul(u32_type, None, base, vertices_per_group).unwrap();
+    for (index, value) in [
+        (0, dispatched), (1, one), (2, one), (MESH_EMULATION_ARGS_REQUESTED, total),
+        (draw, vertex_count), (draw + 1, one), (draw + 2, first_vertex), (draw + 3, zero),
+        (MESH_EMULATION_ARGS_BASE, base), (MESH_EMULATION_ARGS_TASKS, tasks),
+    ] {
+        let index = constant(&mut module, index);
+        let pointer = word(&mut module, args, index);
+        module.store(pointer, value, None, []).unwrap();
+    }
+    module.ret().unwrap();
+    module.end_function().unwrap();
+    module.entry_point(spirv::ExecutionModel::GLCompute, main, "main", interfaces);
+    module.execution_mode(main, spirv::ExecutionMode::LocalSize, [1, 1, 1]);
+    let mut words = Vec::new();
+    rspirv::binary::Assemble::assemble_into(&module.module(), &mut words);
+    words
+}
+
+/// Host model of the distribution pass's arithmetic (one task draw), used by
+/// tests and kept next to the shader it mirrors: returns the arguments the
+/// pass writes and the counter it leaves.
+#[cfg(test)]
+pub(crate) fn mesh_emulation_distribution_model(
+    requested: &[u32], counter_words: u32,
+    constants: &super::emit_spirv::MeshEmulationDistributionConstants,
+) -> (Vec<u32>, [u32; super::emit_spirv::MESH_EMULATION_ARGS_WORDS as usize], u32) {
+    use super::emit_spirv::*;
+    let mut offsets = Vec::new();
+    let mut total = 0u32;
+    for &count in requested {
+        offsets.push(total);
+        total = total.wrapping_add(count);
+    }
+    let block = constants.block_words;
+    let base = counter_words.wrapping_add(block - 1) / block;
+    let counter = base.wrapping_add(total).wrapping_mul(block);
+    let capacity = constants.capacity_words / block;
+    let room = if base < capacity { capacity - base } else { 0 };
+    let dispatched = total.min(room).min(constants.max_groups);
+    let mut args = [0; MESH_EMULATION_ARGS_WORDS as usize];
+    let draw = (MESH_EMULATION_DRAW_ARGS_OFFSET / 4) as usize;
+    args[0] = dispatched;
+    args[1] = 1;
+    args[2] = 1;
+    args[MESH_EMULATION_ARGS_REQUESTED as usize] = total;
+    args[draw] = dispatched.wrapping_mul(constants.vertices_per_group);
+    args[draw + 1] = 1;
+    args[draw + 2] = base.wrapping_mul(constants.vertices_per_group);
+    args[draw + 3] = 0;
+    args[MESH_EMULATION_ARGS_BASE as usize] = base;
+    args[MESH_EMULATION_ARGS_TASKS as usize] = requested.len() as u32;
+    (offsets, args, counter)
 }
 
 #[cfg(test)]
@@ -1837,9 +2137,10 @@ mod tests {
                     (0..layout.attribute_words)
                         .map(|w| (base + layout.attribute_base + w, 0x8000_0000 ^ w)),
                 );
-                expected.extend(
-                    (0..layout.map_words).map(|w| (base + layout.map_base + w, 0xabcd_0000 ^ w)),
-                );
+                // Lichii's degenerate primitives: indices past the count are 0.
+                let used_map_words = 4 + raw_count.min(primitives) * mesh.primitive_vertices();
+                expected.extend((0..layout.map_words).map(|w| (base + layout.map_base + w,
+                    if w < used_map_words { 0xabcd_0000 ^ w } else { 0 })));
                 assert_eq!(writes, expected); // Also proves no duplicate/racing header writers.
             }
         }
@@ -2096,5 +2397,84 @@ mod tests {
         assert!(emit_isbe_write_map_u32(&mut ctx, Value::ImmU32(3), zero).is_err());
         emit_mesh_prologue(&mut ctx);
         assert!(instructions(&ctx).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mesh_emulation_distribution_tests {
+    use super::*;
+    use crate::backend::spirv::emit_spirv::*;
+
+    fn constants(tasks: u32, capacity_words: u32, max_groups: u32) -> MeshEmulationDistributionConstants {
+        MeshEmulationDistributionConstants {
+            tasks, payload_words: 4, capacity_words, block_words: 10,
+            vertices_per_group: 6, max_groups,
+        }
+    }
+
+    #[test]
+    fn task_lookup_matches_linear_scan_including_empty_tasks() {
+        let requested = [0, 3, 0, 0, 2, 0, 1, 0];
+        let (offsets, args, _) = mesh_emulation_distribution_model(&requested, 0,
+            &constants(requested.len() as u32, 1000, 1000));
+        assert_eq!(offsets, [0, 0, 3, 3, 3, 5, 5, 6]);
+        assert_eq!(args[0], 6);
+        let mut expected = Vec::new();
+        for (task, &count) in requested.iter().enumerate() {
+            for child in 0..count {
+                expected.push((task as u32, child));
+            }
+        }
+        let actual: Vec<_> = (0..args[0]).map(|global| mesh_task_lookup_model(&offsets, global)).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn task_lookup_covers_more_tasks_than_lichii_seventeen_steps() {
+        // Lichii's 17 unrolled steps stop at 2^17 tasks; the 32-step search
+        // still finds the last task of a larger draw.
+        let tasks = (1u32 << 17) + 5;
+        let offsets: Vec<u32> = (0..tasks).collect();
+        assert_eq!(mesh_task_lookup_model(&offsets, tasks - 1), (tasks - 1, 0));
+        assert_eq!(mesh_task_lookup_model(&offsets, 77), (77, 0));
+    }
+
+    #[test]
+    fn distribution_rounds_to_records_and_clips_to_the_arena() {
+        // 25 words already used by other draws: this draw starts at record 3.
+        let (_, args, counter) = mesh_emulation_distribution_model(&[4, 4], 25, &constants(2, 100, 1000));
+        assert_eq!(args[MESH_EMULATION_ARGS_BASE as usize], 3);
+        assert_eq!(args[MESH_EMULATION_ARGS_REQUESTED as usize], 8);
+        // Ten records fit: seven are dispatched, the rest are dropped.
+        assert_eq!(args[..3], [7, 1, 1]);
+        let draw = (MESH_EMULATION_DRAW_ARGS_OFFSET / 4) as usize;
+        assert_eq!(args[draw..draw + 4], [42, 1, 18, 0]);
+        assert_eq!(args[MESH_EMULATION_ARGS_TASKS as usize], 2);
+        // The counter keeps the full request so the next arena can grow.
+        assert_eq!(counter, 110);
+        let (_, args, counter) = mesh_emulation_distribution_model(&[5], counter, &constants(1, 100, 1000));
+        assert_eq!((args[0], args[draw], counter), (0, 0, 160));
+        let (_, args, _) = mesh_emulation_distribution_model(&[9], 0, &constants(1, 1000, 4));
+        assert_eq!(args[0], 4);
+    }
+
+    #[test]
+    fn distribution_module_declares_four_buffers_and_push_constants() {
+        let profile = crate::profile::Profile { supported_spirv: 0x0001_0400, ..Default::default() };
+        let module = rspirv::dr::load_words(emit_mesh_emulation_distribution(&profile)).unwrap();
+        assert_eq!(module.entry_points.len(), 1);
+        assert_eq!(module.entry_points[0].operands[0],
+            Operand::ExecutionModel(spirv::ExecutionModel::GLCompute));
+        // main, "main", four buffers and the push constants.
+        assert_eq!(module.entry_points[0].operands.len(), 3 + 5);
+        let mut bindings: Vec<u32> = module.annotations.iter()
+            .filter(|i| i.operands.get(1) == Some(&Operand::Decoration(spirv::Decoration::Binding)))
+            .map(|i| match i.operands[2] { Operand::LiteralBit32(b) => b, _ => panic!() })
+            .collect();
+        bindings.sort();
+        assert_eq!(bindings, [0, 1, 2, 3]);
+        let old = crate::profile::Profile { supported_spirv: 0x0001_0000, ..Default::default() };
+        let module = rspirv::dr::load_words(emit_mesh_emulation_distribution(&old)).unwrap();
+        assert_eq!(module.entry_points[0].operands.len(), 3);
     }
 }

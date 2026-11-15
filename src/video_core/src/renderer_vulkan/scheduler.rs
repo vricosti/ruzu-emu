@@ -1289,8 +1289,11 @@ impl Scheduler {
 
     /// Port of upstream `Scheduler::EndPendingOperations`.
     fn end_pending_operations(&mut self) {
+        // Lichii (5b89a3daf4): pause, don't reset. A submission can land between a guest's
+        // counter reset and its report, and resetting here (as Eden does) drops the samples
+        // counted so far, so the report reads too low.
         if let Some(state) = self.samples_query_state.as_ref().cloned() {
-            state.lock().reset_counter(self);
+            state.lock().close_counter(self);
         }
         self.request_outside_render_pass_operation_context();
     }

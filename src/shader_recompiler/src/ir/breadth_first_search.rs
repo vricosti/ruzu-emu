@@ -75,6 +75,82 @@ where
     None
 }
 
+/// Port of Lichii's `BreadthFirstSearch` with a resolver
+/// (`frontend/ir/breadth_first_search.h:22-74`): every operand goes through
+/// `resolve` before it is queued, and the predicate also receives the
+/// instruction's reference.
+pub fn breadth_first_search_resolved<T, F, R>(
+    value: Value,
+    program: &Program,
+    mut pred: F,
+    mut resolve: R,
+) -> Option<T>
+where
+    F: FnMut(InstRef, &Inst) -> Option<T>,
+    R: FnMut(Value) -> Value,
+{
+    let value = resolve(value);
+    let mut visited = HashSet::with_capacity(2);
+    let mut queue = VecDeque::from([inst_recursive(program, value)?]);
+    while let Some(inst_ref) = queue.pop_front() {
+        let inst = program.block(inst_ref.block).inst(inst_ref.inst);
+        if let Some(result) = pred(inst_ref, inst) {
+            return Some(result);
+        }
+        // Visit the right most arguments first
+        for index in (0..inst.num_args()).rev() {
+            let arg = resolve(*inst.arg(index));
+            let Some(arg_ref) = inst_recursive(program, arg) else {
+                continue;
+            };
+            if visited.insert(arg_ref) {
+                queue.push_back(arg_ref);
+            }
+        }
+    }
+    None
+}
+
+/// Port of Lichii's `BreadthFirstSearchPruned` (`frontend/ir/breadth_first_search.h:76-101`):
+/// a search over IR that does not change, where `exhausted` holds instructions from which
+/// nothing reachable matches. A failed search adds every instruction it visited; later searches
+/// resolve those to an immediate and skip them, which keeps the result of the unpruned search.
+pub fn breadth_first_search_pruned<T, F, R>(
+    value: Value,
+    program: &Program,
+    mut pred: F,
+    exhausted: &mut HashSet<InstRef>,
+    mut resolve: R,
+) -> Option<T>
+where
+    F: FnMut(InstRef, &Inst) -> Option<T>,
+    R: FnMut(Value) -> Value,
+{
+    let mut visited = Vec::new();
+    let result = {
+        let exhausted = &*exhausted;
+        breadth_first_search_resolved(
+            value,
+            program,
+            |inst_ref, inst| {
+                visited.push(inst_ref);
+                pred(inst_ref, inst)
+            },
+            |operand| {
+                let resolved = resolve(operand);
+                match inst_recursive(program, resolved) {
+                    Some(inst_ref) if exhausted.contains(&inst_ref) => Value::ImmU32(0),
+                    _ => resolved,
+                }
+            },
+        )
+    };
+    if result.is_none() {
+        exhausted.extend(visited);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

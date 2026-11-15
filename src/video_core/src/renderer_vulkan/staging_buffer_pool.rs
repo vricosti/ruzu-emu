@@ -313,12 +313,6 @@ impl StagingBufferPool {
         self.deferred_allocation(buffer).flush();
     }
 
-    /// Call only after GPU writes are complete and a HOST_READ dependency was
-    /// recorded. Invalidating mapped memory does not itself wait for the GPU.
-    pub(crate) fn invalidate_deferred(&self, buffer: &StagingBufferRef) {
-        self.deferred_allocation(buffer).invalidate();
-    }
-
     /// Per-frame housekeeping (upstream `TickFrame`): rotate the deletion
     /// level. The stream buffer is NOT reset here — its regions retire
     /// individually against the GPU timeline (see `try_stream_allocate`).

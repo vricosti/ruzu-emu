@@ -625,6 +625,10 @@ fn read_handle(
                 read_gpu(address, &mut bytes);
                 u32::from_le_bytes(bytes)
             },
+            // Storage offsets are relative to the base aligned down to the
+            // translation's min_ssbo_alignment.
+            crate::renderer_metal::metal_pipeline_cache::METAL_MIN_SSBO_ALIGNMENT,
+            element,
         );
         return Ok(texture_pair(raw, qmd.linked_tsc));
     }

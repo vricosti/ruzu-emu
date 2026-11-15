@@ -853,13 +853,19 @@ impl GraphicsPipeline {
         };
         // Native computed descriptors share the Vulkan evaluator; keep binding
         // ownership here, alongside Eden's direct-cbuf Configure path.
-        let read_computed = |program| {
+        let storage_alignment = {
+            use crate::buffer_cache::buffer_cache_base::BufferCacheRuntime;
+            buffer_cache.runtime.get_storage_buffer_alignment() as u64
+        };
+        let read_computed = |program, element| {
             crate::shader_handle_program::evaluate_texture_handle(
                 info,
                 program,
                 |index| cbufs.get(index as usize).filter(|cbuf| cbuf.enabled)
                     .map_or(0, |cbuf| cbuf.address),
                 |address| gpu_memory.read::<u32>(address),
+                storage_alignment,
+                element,
             )
         };
         macro_rules! read_handle {
@@ -867,7 +873,7 @@ impl GraphicsPipeline {
                 let index_offset = ($index as u32) << $desc.size_shift;
                 let offset = $desc.cbuf_offset.wrapping_add(index_offset);
                 if $desc.handle_program != u32::MAX {
-                    texture_pair(read_computed($desc.handle_program), via_header_index)
+                    texture_pair(read_computed($desc.handle_program, $index as u32), via_header_index)
                 } else if $desc.has_secondary {
                     let second_offset = $desc.secondary_cbuf_offset.wrapping_add(index_offset);
                     let lhs = read_word($desc.cbuf_index, offset) << $desc.shift_left;
@@ -885,7 +891,7 @@ impl GraphicsPipeline {
                     let index_offset = index << $desc.size_shift;
                     let offset = $desc.cbuf_offset.wrapping_add(index_offset);
                     let raw = if $desc.handle_program != u32::MAX {
-                        read_computed($desc.handle_program)
+                        read_computed($desc.handle_program, index)
                     } else {
                         read_word($desc.cbuf_index, offset)
                     };

@@ -138,6 +138,7 @@ fn compile_vulkan_present_shaders(manifest_dir: &std::path::Path) {
         ("SMAA_NEIGHBORHOOD_BLENDING_FRAG_SPV", "smaa_neighborhood_blending.frag"),
         ("FULL_SCREEN_TRIANGLE_VERT_SPV", "full_screen_triangle.vert"),
         ("BLIT_COLOR_FLOAT_FRAG_SPV", "blit_color_float.frag"),
+        ("BLIT_COLOR_SRGB_TO_LINEAR_FRAG_SPV", "blit_color_srgb_to_linear.frag"),
         ("BLIT_COLOR_MSAA_FRAG_SPV", "blit_color_msaa.frag"),
         ("BLIT_DEPTH_FRAG_SPV", "blit_depth.frag"),
         ("BLIT_DEPTH_MSAA_FRAG_SPV", "blit_depth_msaa.frag"),

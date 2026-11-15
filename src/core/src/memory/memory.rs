@@ -1325,6 +1325,10 @@ impl Memory {
             if let Some(manager) = self.gpu_dirty_managers.get(core) {
                 manager.collect(device_addr, size);
             }
+            // Lichii core/memory.cpp:991-993: a download writing to guest
+            // memory here may have looked at the collected writes before this
+            // one: its bytes would land over the ones stored after this returns.
+            crate::gpu_core::DownloadLanding::r#await(device_addr, size as u64);
         };
 
         if let Some(host1x) = self.system.get().host1x_core() {

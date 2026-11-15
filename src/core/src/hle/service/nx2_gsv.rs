@@ -959,6 +959,24 @@ struct Vi2State {
     previous_fence_value: u32,
     next_vblank: Option<std::time::Instant>,
 }
+/// Rate of the nx2:vi2 vsync event the game starts frames on: Settings frame_rate_limit, or
+/// EDEN_NX2_VSYNC_HZ=<rate> for experiments. Lichii `Nx2VsyncRateHz` (cc3bfb9317).
+pub fn nx2_vsync_rate_hz() -> u32 {
+    static FORCED: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+        std::env::var("EDEN_NX2_VSYNC_HZ")
+            .ok()
+            .map(|text| {
+                let text = std::ffi::CString::new(text).unwrap();
+                unsafe { libc::strtoll(text.as_ptr(), std::ptr::null_mut(), 10) }.max(1)
+            })
+            .unwrap_or(0)
+    });
+    if *FORCED != 0 {
+        *FORCED as u32
+    } else {
+        u32::from(*common::settings::values().frame_rate_limit.get_value()).max(1)
+    }
+}
 pub struct INx2Vi2Session {
     system: SystemRef,
     handlers: BTreeMap<u32, FunctionInfo>,
@@ -1123,8 +1141,12 @@ impl INx2Vi2Session {
     }
 
     fn pace_to_vblank(state: &mut Vi2State) {
+        // Lichii cc3bfb9317: with a frame rate limit other than 60 Hz the
+        // vsync event already paces the game; holding its 60 Hz interval here
+        // as well would cap it at 60 fps.
+        let timer_paced = nx2_vsync_rate_hz() != 60;
         let speed = common::settings::speed_limit();
-        if !*common::settings::values().use_speed_limit.get_value() || speed == 0 {
+        if timer_paced || !*common::settings::values().use_speed_limit.get_value() || speed == 0 {
             return;
         }
         let interval = std::time::Duration::from_nanos(100_000_000_000 / 60 / speed as u64);
@@ -1570,21 +1592,14 @@ impl INx2Vi2Session {
                     None
                 }),
             );
-            static INTERVAL: std::sync::LazyLock<std::time::Duration> =
-                std::sync::LazyLock::new(|| {
-                    let hz = std::env::var("EDEN_NX2_VSYNC_HZ")
-                        .ok()
-                        .map(|text| {
-                            let text = std::ffi::CString::new(text).unwrap();
-                            unsafe { libc::strtoll(text.as_ptr(), std::ptr::null_mut(), 10) }.max(1)
-                        })
-                        .unwrap_or(60);
-                    std::time::Duration::from_nanos((1_000_000_000 / hz) as u64)
-                });
+            // The game starts frames on this event, so its rate is the frame rate limit.
+            let vsync_hz = nx2_vsync_rate_hz();
+            let interval = std::time::Duration::from_nanos(1_000_000_000 / u64::from(vsync_hz));
+            log::info!("nx2:vi2 vsync rate: {} Hz", vsync_hz);
             self.system
                 .get()
                 .core_timing()
-                .schedule_looping_event(*INTERVAL, *INTERVAL, &timer, false);
+                .schedule_looping_event(interval, interval, &timer, false);
             state.vsync_timer = Some(timer);
         }
     }

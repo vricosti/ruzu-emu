@@ -41,6 +41,13 @@ pub struct HostTranslateInfo {
     pub support_geometry_shader_passthrough: bool,
     /// True when the device supports barriers in conditional control flow.
     pub support_conditional_barrier: bool,
+    /// True when a handle read from a table at a per-invocation index may
+    /// become a descriptor array of the table's entries (not OpenGL: its
+    /// pipelines bind at most 64 textures; Vulkan only with nonuniform sampled
+    /// image array indexing).
+    ///
+    /// Lichii extension: `shader_recompiler/host_translate_info.h:51`.
+    pub support_handle_table_arrays: bool,
 }
 
 impl HostTranslateInfo {

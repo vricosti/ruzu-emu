@@ -2684,6 +2684,169 @@ mod tests {
         );
     }
 
+    /// Inline (fastmem) LSE CAS/LDADD and 128-bit LDXP/STXP with and without
+    /// `Unsafe_IgnoreGlobalMonitor`. Upstream `EmitExclusiveLock`,
+    /// `EmitExclusiveUnlock` and `EmitExclusiveTestAndClear`
+    /// (backend/x64/emit_x64_memory.h:381-418) emit nothing under that flag, so
+    /// the block must complete while another thread holds the monitor's spin
+    /// lock; without the flag the lock is taken as before.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_a64_inline_lse_atomics_honor_ignore_global_monitor() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let code: [u32; 8] = [
+            0xD284_0001, // mov x1, #0x2000
+            0x88AA_7C2B, // cas w10, w11, [x1]
+            0xD284_0206, // mov x6, #0x2010
+            0xF82C_00CD, // ldadd x12, x13, [x6]
+            0xD284_040E, // mov x14, #0x2020
+            0xC87F_15C4, // ldxp x4, x5, [x14]
+            0xC82F_25C8, // stxp w15, x8, x9, [x14]
+            0xD400_0001, // svc #0
+        ];
+        for ignore_global_monitor in [false, true] {
+            let mut memory = vec![0; 0x3000];
+            for (index, word) in code.iter().enumerate() {
+                let offset = 0x1000 + index * 4;
+                memory[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            let old_lo = 0x1122_3344_5566_7788u64;
+            let old_hi = 0x99AA_BBCC_DDEE_FF00u64;
+            memory[0x2000..0x2004].copy_from_slice(&0x1111u32.to_le_bytes());
+            memory[0x2010..0x2018].copy_from_slice(&100u64.to_le_bytes());
+            memory[0x2020..0x2028].copy_from_slice(&old_lo.to_le_bytes());
+            memory[0x2028..0x2030].copy_from_slice(&old_hi.to_le_bytes());
+            let fastmem_pointer = memory.as_mut_ptr();
+            let memory = Arc::new(Mutex::new(memory));
+            // Four processors so that `EmitExclusiveTestAndClear` has other
+            // reservations to invalidate when the flag is off.
+            let mut monitor = Box::new(
+                crate::interface::exclusive_monitor::ExclusiveMonitor::new(4),
+            );
+
+            let mut config = A64UserConfig::new(Box::new(MockCallbacks::from_shared_memory(
+                0,
+                memory.clone(),
+            )));
+            config.enable_cycle_counting = false;
+            config.code_cache_size = 16 * 1024 * 1024;
+            config.optimizations = if ignore_global_monitor {
+                OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+                    | OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR
+            } else {
+                OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
+            };
+            config.unsafe_optimizations = ignore_global_monitor;
+            config.global_monitor = Some(&mut *monitor as *mut _);
+            config.fastmem_pointer = Some(fastmem_pointer);
+            config.define_unpredictable_behaviour = false;
+            config.hook_hint_instructions = false;
+            config.processor_id = 0;
+            config.wall_clock_cntpct = false;
+            config.cntfrq_el0 = 600_000_000;
+            config.ctr_el0 = 0x8444_c004;
+            config.dczid_el0 = 4;
+            config.hook_data_cache_operations = false;
+            config.hook_isb = false;
+            config.tpidrro_el0 = None;
+            config.tpidr_el0 = None;
+            config.page_table = None;
+            config.fastmem_address_space_bits = 16;
+            config.silently_mirror_fastmem = true;
+            config.fastmem_exclusive_access = true;
+            config.recompile_on_exclusive_fastmem_failure = true;
+            config.recompile_on_fastmem_failure = true;
+            config.page_table_address_space_bits = 16;
+            config.silently_mirror_page_table = true;
+            config.absolute_offset_page_table = true;
+            config.page_table_pointer_mask = 0;
+            config.page_table_log2_stride = 3;
+            config.detect_misaligned_access_via_page_table = 0;
+            config.only_detect_misalignment_via_page_table_on_page_boundary = false;
+            config.check_halt_on_memory_access = false;
+            let mut jit = A64Jit::new(config).expect("A64 JIT");
+            jit.set_pc(0x1000);
+            jit.set_register(10, 0x1111);
+            jit.set_register(11, 0x2222);
+            jit.set_register(12, 5);
+            jit.set_register(13, 0xdead);
+            jit.set_register(15, 0xdead);
+            let new_lo = 0x0123_4567_89AB_CDEFu64;
+            let new_hi = 0xFEDC_BA98_7654_3210u64;
+            jit.set_register(8, new_lo);
+            jit.set_register(9, new_hi);
+
+            // With the flag the emitted code never touches the monitor lock:
+            // hold it for the whole run. A watchdog releases it after 10 s so a
+            // regression fails the assertion instead of hanging the test.
+            let lock_word = &monitor.lock.locked as *const AtomicU32 as usize;
+            let finished = Arc::new(AtomicBool::new(false));
+            let watchdog = ignore_global_monitor.then(|| {
+                monitor.lock.lock();
+                let finished = finished.clone();
+                std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !finished.load(Ordering::Acquire) {
+                        if std::time::Instant::now() > deadline {
+                            // SAFETY: the monitor outlives the joined watchdog.
+                            let word = unsafe { &*(lock_word as *const AtomicU32) };
+                            word.store(0, Ordering::Release);
+                            return true;
+                        }
+                        std::thread::yield_now();
+                    }
+                    false
+                })
+            });
+            let halt = jit.run();
+            finished.store(true, Ordering::Release);
+            if let Some(watchdog) = watchdog {
+                assert!(
+                    !watchdog.join().unwrap(),
+                    "inline exclusives took the global monitor lock despite Unsafe_IgnoreGlobalMonitor"
+                );
+                monitor.lock.unlock();
+            }
+
+            assert!(halt.contains(HaltReason::SVC));
+            // Encoding: the lock and the other processors' reservation slots
+            // are burned into the code as `mov reg, imm64` only without the flag.
+            let monitor_ptr = &mut *monitor as *mut crate::interface::exclusive_monitor::ExclusiveMonitor;
+            let code = {
+                let emitter = jit.inner.inner.emitter.as_ref().unwrap();
+                unsafe {
+                    std::slice::from_raw_parts(emitter.code.code_base_ptr(), emitter.code.code_size())
+                }
+                .to_vec()
+            };
+            let contains_imm64 = |pointer: u64| code.windows(8).any(|w| w == pointer.to_le_bytes());
+            use crate::backend::x64::exclusive_monitor_friend::{
+                get_exclusive_monitor_address_pointer, get_exclusive_monitor_lock_pointer,
+            };
+            let lock_pointer = unsafe { get_exclusive_monitor_lock_pointer(monitor_ptr) } as u64;
+            assert_eq!(contains_imm64(lock_pointer), !ignore_global_monitor, "spin lock emission");
+            for other in 1..4 {
+                let address_pointer =
+                    unsafe { get_exclusive_monitor_address_pointer(monitor_ptr, other) } as u64;
+                assert_eq!(
+                    contains_imm64(address_pointer),
+                    !ignore_global_monitor,
+                    "test-and-clear of processor {other}"
+                );
+            }
+            let memory = memory.lock().unwrap();
+            assert_eq!(jit.get_register(10), 0x1111, "ignore={ignore_global_monitor}");
+            assert_eq!(u32::from_le_bytes(memory[0x2000..0x2004].try_into().unwrap()), 0x2222);
+            assert_eq!(jit.get_register(13), 100);
+            assert_eq!(u64::from_le_bytes(memory[0x2010..0x2018].try_into().unwrap()), 105);
+            assert_eq!(jit.get_register(4), old_lo);
+            assert_eq!(jit.get_register(5), old_hi);
+            assert_eq!(jit.get_register(15), 0, "STXP status");
+            assert_eq!(u64::from_le_bytes(memory[0x2020..0x2028].try_into().unwrap()), new_lo);
+            assert_eq!(u64::from_le_bytes(memory[0x2028..0x2030].try_into().unwrap()), new_hi);
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_a64_fastmem_ldaxr_stlxr_writes_status_and_memory() {

@@ -210,6 +210,18 @@ pub(crate) struct StorageDefinitions {
     pub u32x4: spirv::Word,
 }
 
+/// What a routed global memory function does with the storage word or vector it finds.
+#[derive(Debug, Clone, Copy)]
+enum GlobalStorageAccess {
+    Load { value_type: spirv::Word },
+    /// An 8 or 16 byte load read word by word (misaligned vector views).
+    LoadWords { value_type: spirv::Word, count: u32 },
+    Store { data: spirv::Word },
+    /// An 8 or 16 byte store written word by word (misaligned vector views).
+    StoreWords { data: spirv::Word, count: u32 },
+    Atomic { data: spirv::Word, operation: super::emit_spirv_atomic::StorageAtomicOp },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageDefinitionKind {
     U8,
@@ -550,6 +562,14 @@ pub struct SpirvEmitContext {
     pub(crate) mesh_payload_buffer_u32: spirv::Word,
     pub(crate) mesh_dispatch_buffer: spirv::Word,
     pub(crate) mesh_dispatch_buffer_u32: spirv::Word,
+    /// Lichii `EmitContext::mesh_task_args_buffer`: with a task program the
+    /// mesh dispatch buffer holds the distribution's per-task offsets, and
+    /// this one its arguments (MESH_EMULATION_ARGS_*).
+    pub(crate) mesh_task_args_buffer: spirv::Word,
+    pub(crate) mesh_task_args_buffer_u32: spirv::Word,
+    /// Lichii `RuntimeInfo::mesh_task_payload_stride`: words per task in the
+    /// payload transport.
+    pub(crate) mesh_task_payload_stride: u32,
     pub(crate) mesh_guest_workgroup_id: spirv::Word,
     pub(crate) mesh_payload_base: spirv::Word,
     /// Compute transport may reserve more children than the task emits.
@@ -874,6 +894,9 @@ impl SpirvEmitContext {
             mesh_dispatch_buffer: 0,
             mesh_dispatch_buffer_u32: 0,
             mesh_guest_workgroup_id: 0,
+            mesh_task_args_buffer: 0,
+            mesh_task_args_buffer_u32: 0,
+            mesh_task_payload_stride: 0,
             mesh_payload_base: 0,
             mesh_task_count_guard: false,
             mesh_output_record: 0,
@@ -2102,237 +2125,380 @@ impl SpirvEmitContext {
         self.write_storage_cas_loop_func = function;
     }
 
-    fn define_global_memory_function(
+    /// Lichii's `base_address` lambda of `DefineGlobalMemoryFunctions`
+    /// (spirv_emit_context.cpp:982-1010): the aligned base of a storage
+    /// descriptor, read from its constant buffer, or, for a pointer table
+    /// entry, through the buffer bound for the constant buffer pointer.
+    fn global_storage_base_address(&mut self, info: &crate::shader_info::Info, index: usize) -> spirv::Word {
+        let ssbo = &info.storage_buffers_descriptors[index];
+        let cbuf = self.cbufs.get(&ssbo.cbuf_index).copied().unwrap_or_default();
+        assert_ne!(cbuf.u32x2, 0, "missing storage address CBUF view");
+        let address_offset = self.constant_u32(ssbo.cbuf_offset / 8);
+        let address_pointer = self
+            .builder
+            .access_chain(self.uniform_types.u32x2, None, cbuf.u32x2, vec![self.const_zero_u32, address_offset])
+            .unwrap();
+        let words = self.builder.load(self.u32_vec2_type, None, address_pointer, None, []).unwrap();
+        let ssbo_align_mask = self
+            .builder
+            .constant_bit64(self.u64_type, !self.profile.min_ssbo_alignment.wrapping_sub(1));
+        if ssbo.indirect_offset == u32::MAX {
+            let unaligned = self.builder.bitcast(self.u64_type, None, words).unwrap();
+            return self.builder.bitwise_and(self.u64_type, None, unaligned, ssbo_align_mask).unwrap();
+        }
+        // The pointer is read through the buffer bound for the constant buffer pointer.
+        let holder = info.storage_buffers_descriptors.iter().position(|desc| {
+            desc.cbuf_index == ssbo.cbuf_index
+                && desc.cbuf_offset == ssbo.cbuf_offset
+                && desc.indirect_offset == u32::MAX
+        });
+        let Some(holder_index) = holder else {
+            return self.builder.constant_bit64(self.u64_type, !0u64);
+        };
+        let indirect_offset = ssbo.indirect_offset;
+        let holder_low = self.builder.composite_extract(self.u32_type, None, words, [0]).unwrap();
+        let low_mask = self.constant_u32(self.profile.min_ssbo_alignment.wrapping_sub(1) as u32);
+        let low_bits = self.builder.bitwise_and(self.u32_type, None, holder_low, low_mask).unwrap();
+        let indirect = self.constant_u32(indirect_offset);
+        let byte = self.builder.i_add(self.u32_type, None, low_bits, indirect).unwrap();
+        let two = self.constant_u32(2);
+        let word_index = self.builder.shift_right_logical(self.u32_type, None, byte, two).unwrap();
+        let storage = self
+            .ssbos
+            .get(&(holder_index as u32))
+            .copied()
+            .unwrap_or_default()
+            .get(StorageDefinitionKind::U32);
+        assert_ne!(storage, 0, "missing pointer table SSBO {holder_index}");
+        let element = self.storage_types.get(StorageDefinitionKind::U32).element;
+        let one = self.constant_u32(1);
+        let next_word = self.builder.i_add(self.u32_type, None, word_index, one).unwrap();
+        let load_word = |this: &mut Self, word: spirv::Word| {
+            let pointer = this
+                .builder
+                .access_chain(element, None, storage, vec![this.const_zero_u32, word])
+                .unwrap();
+            this.builder.load(this.u32_type, None, pointer, None, []).unwrap()
+        };
+        let low = load_word(self, word_index);
+        let high = load_word(self, next_word);
+        let pointer_words = self
+            .builder
+            .composite_construct(self.u32_vec2_type, None, vec![low, high])
+            .unwrap();
+        let pointer = self.builder.bitcast(self.u64_type, None, pointer_words).unwrap();
+        self.builder.bitwise_and(self.u64_type, None, pointer, ssbo_align_mask).unwrap()
+    }
+
+    /// Lichii's `access` lambda: the selected buffer's access, in a branch taken under `cond`.
+    #[allow(clippy::too_many_arguments)]
+    fn global_storage_access(
+        &mut self,
+        index: usize,
+        kind: StorageDefinitionKind,
+        address: spirv::Word,
+        element_pointer: spirv::Word,
+        shift: u32,
+        ssbo_address: spirv::Word,
+        cond: spirv::Word,
+        access: GlobalStorageAccess,
+    ) {
+        let then_label = self.builder.id();
+        let else_label = self.builder.id();
+        self.builder.selection_merge(else_label, spirv::SelectionControl::NONE).unwrap();
+        self.builder.branch_conditional(cond, then_label, else_label, []).unwrap();
+        self.builder.begin_block(Some(then_label)).unwrap();
+        let ssbo = self.ssbos.get(&(index as u32)).copied().unwrap_or_default().get(kind);
+        assert_ne!(ssbo, 0, "missing global SSBO {index} view {kind:?}");
+        assert_ne!(element_pointer, 0, "missing global SSBO type {kind:?}");
+        let byte_offset = self.builder.i_sub(self.u64_type, None, address, ssbo_address).unwrap();
+        let byte_offset = self.builder.u_convert(self.u32_type, None, byte_offset).unwrap();
+        let shift = self.constant_u32(shift);
+        let ssbo_index = self.builder.shift_right_logical(self.u32_type, None, byte_offset, shift).unwrap();
+        let pointer = self
+            .builder
+            .access_chain(element_pointer, None, ssbo, vec![self.const_zero_u32, ssbo_index])
+            .unwrap();
+        self.emit_global_storage_access(access, pointer, ssbo, ssbo_index);
+        self.builder.begin_block(Some(else_label)).unwrap();
+    }
+
+    /// The callbacks Lichii's `define_load`, `define_write` and atomic definitions pass to
+    /// `define_body`.
+    fn emit_global_storage_access(
+        &mut self,
+        access: GlobalStorageAccess,
+        pointer: spirv::Word,
+        ssbo: spirv::Word,
+        word_index: spirv::Word,
+    ) {
+        let word_pointer = |this: &mut Self, i: u32| {
+            let index = if i == 0 {
+                word_index
+            } else {
+                let offset = this.constant_u32(i);
+                this.builder.i_add(this.u32_type, None, word_index, offset).unwrap()
+            };
+            let element = this.storage_types.get(StorageDefinitionKind::U32).element;
+            this.builder.access_chain(element, None, ssbo, vec![this.const_zero_u32, index]).unwrap()
+        };
+        match access {
+            GlobalStorageAccess::Load { value_type } => {
+                let value = self.builder.load(value_type, None, pointer, None, []).unwrap();
+                self.builder.ret_value(value).unwrap();
+            }
+            GlobalStorageAccess::LoadWords { value_type, count } => {
+                let mut words = Vec::with_capacity(count as usize);
+                for i in 0..count {
+                    let word = word_pointer(self, i);
+                    words.push(self.builder.load(self.u32_type, None, word, None, []).unwrap());
+                }
+                let value = self.builder.composite_construct(value_type, None, words).unwrap();
+                self.builder.ret_value(value).unwrap();
+            }
+            GlobalStorageAccess::Store { data } => {
+                self.builder.store(pointer, data, None, []).unwrap();
+                self.builder.ret().unwrap();
+            }
+            GlobalStorageAccess::StoreWords { data, count } => {
+                for i in 0..count {
+                    let word = word_pointer(self, i);
+                    let value = self.builder.composite_extract(self.u32_type, None, data, [i]).unwrap();
+                    self.builder.store(word, value, None, []).unwrap();
+                }
+                self.builder.ret().unwrap();
+            }
+            GlobalStorageAccess::Atomic { data, operation } => {
+                let value = super::emit_spirv_atomic::atomic_u32(self, pointer, data, operation);
+                self.builder.ret_value(value).unwrap();
+            }
+        }
+    }
+
+    /// Lichii's `define_body` lambda (spirv_emit_context.cpp:976-1061): routes an address to the
+    /// storage buffer holding it. Native programs (`native_global_bounds`) pick the buffer whose
+    /// base is the closest one at or below the address; NVN descriptors carry a size word.
+    fn define_global_body(
         &mut self,
         info: &crate::shader_info::Info,
         kind: StorageDefinitionKind,
-        value_type: spirv::Word,
-        element_size: u32,
-        write: bool,
-        atomic: Option<super::emit_spirv_atomic::StorageAtomicOp>,
-    ) -> spirv::Word {
-        let has_data = write || atomic.is_some();
-        let result_type = if write { self.void_type } else { value_type };
-        let function_type = if has_data {
-            self.builder
-                .type_function(result_type, vec![self.u64_type, value_type])
-        } else {
-            self.builder.type_function(value_type, vec![self.u64_type])
-        };
-        let function = self
-            .builder
-            .begin_function(
-                result_type,
-                None,
-                spirv::FunctionControl::NONE,
-                function_type,
-            )
-            .unwrap();
-        let address = self.builder.function_parameter(self.u64_type).unwrap();
-        let data = has_data.then(|| self.builder.function_parameter(value_type).unwrap());
+        address: spirv::Word,
+        element_pointer: spirv::Word,
+        shift: u32,
+        access: GlobalStorageAccess,
+    ) {
         self.builder.begin_block(None).unwrap();
-
-        let element_pointer = self.storage_types.get(kind).element;
-        assert_ne!(element_pointer, 0, "missing global SSBO type {kind:?}");
-        let shift = element_size.trailing_zeros();
-        for (index, descriptor) in info.storage_buffers_descriptors.iter().enumerate() {
+        let num_buffers = info.storage_buffers_descriptors.len();
+        if info.native_global_bounds {
+            // Native pointers carry no NVN size word. The address belongs to the candidate buffer
+            // whose base is the closest one at or below it (bounds come from the binding).
+            let mut bases = Vec::with_capacity(num_buffers);
+            let mut best_index = self.constant_u32(!0u32);
+            let mut best_distance = self.builder.constant_bit64(self.u64_type, !0u64);
+            for index in 0..num_buffers {
+                let base = self.global_storage_base_address(info, index);
+                bases.push(base);
+                let distance = self.builder.i_sub(self.u64_type, None, address, base).unwrap();
+                let at_or_above = self.builder.u_greater_than_equal(self.bool_type, None, address, base).unwrap();
+                let closer = self.builder.u_less_than(self.bool_type, None, distance, best_distance).unwrap();
+                let better = self.builder.logical_and(self.bool_type, None, at_or_above, closer).unwrap();
+                best_distance = self.builder.select(self.u64_type, None, better, distance, best_distance).unwrap();
+                let index_id = self.constant_u32(index as u32);
+                best_index = self.builder.select(self.u32_type, None, better, index_id, best_index).unwrap();
+            }
+            for (index, &base) in bases.iter().enumerate() {
+                let index_id = self.constant_u32(index as u32);
+                let cond = self.builder.i_equal(self.bool_type, None, best_index, index_id).unwrap();
+                self.global_storage_access(index, kind, address, element_pointer, shift, base, cond, access);
+            }
+            return;
+        }
+        for index in 0..num_buffers {
+            let descriptor = &info.storage_buffers_descriptors[index];
             if !info.uses_nvn_storage_descriptor(descriptor) {
                 continue;
             }
-            let cbuf = self
-                .cbufs
-                .get(&descriptor.cbuf_index)
-                .copied()
-                .unwrap_or_default();
-            assert_ne!(cbuf.u32x2, 0, "missing NVN address CBUF view");
+            let cbuf = self.cbufs.get(&descriptor.cbuf_index).copied().unwrap_or_default();
             assert_ne!(cbuf.u32_scalar, 0, "missing NVN size CBUF view");
-            let address_offset = self.constant_u32(descriptor.cbuf_offset / 8);
             let size_offset = self.constant_u32(descriptor.cbuf_offset / 4 + 2);
-            let address_pointer = self
-                .builder
-                .access_chain(
-                    self.uniform_types.u32x2,
-                    None,
-                    cbuf.u32x2,
-                    vec![self.const_zero_u32, address_offset],
-                )
-                .unwrap();
+            let ssbo_address = self.global_storage_base_address(info, index);
             let size_pointer = self
                 .builder
-                .access_chain(
-                    self.uniform_types.u32_scalar,
-                    None,
-                    cbuf.u32_scalar,
-                    vec![self.const_zero_u32, size_offset],
-                )
+                .access_chain(self.uniform_types.u32_scalar, None, cbuf.u32_scalar, vec![self.const_zero_u32, size_offset])
                 .unwrap();
-            let address_words = self
-                .builder
-                .load(self.u32_vec2_type, None, address_pointer, None, [])
-                .unwrap();
-            let unaligned_address = self
-                .builder
-                .bitcast(self.u64_type, None, address_words)
-                .unwrap();
-            let alignment_mask = self.builder.constant_bit64(
-                self.u64_type,
-                !self.profile.min_ssbo_alignment.wrapping_sub(1),
-            );
-            let ssbo_address = self
-                .builder
-                .bitwise_and(self.u64_type, None, unaligned_address, alignment_mask)
-                .unwrap();
-            let size = self
-                .builder
-                .load(self.u32_type, None, size_pointer, None, [])
-                .unwrap();
+            let size = self.builder.load(self.u32_type, None, size_pointer, None, []).unwrap();
             let size = self.builder.u_convert(self.u64_type, None, size).unwrap();
-            let ssbo_end = self
-                .builder
-                .i_add(self.u64_type, None, ssbo_address, size)
-                .unwrap();
+            let ssbo_end = self.builder.i_add(self.u64_type, None, ssbo_address, size).unwrap();
             let at_or_after_start = self
                 .builder
                 .u_greater_than_equal(self.bool_type, None, address, ssbo_address)
                 .unwrap();
-            let before_end = self
-                .builder
-                .u_less_than(self.bool_type, None, address, ssbo_end)
-                .unwrap();
-            let in_range = self
-                .builder
-                .logical_and(self.bool_type, None, at_or_after_start, before_end)
-                .unwrap();
-            let then_label = self.builder.id();
-            let else_label = self.builder.id();
-            self.builder
-                .selection_merge(else_label, spirv::SelectionControl::NONE)
-                .unwrap();
-            self.builder
-                .branch_conditional(in_range, then_label, else_label, [])
-                .unwrap();
-            self.builder.begin_block(Some(then_label)).unwrap();
-            let ssbo = self
-                .ssbos
-                .get(&(index as u32))
-                .copied()
-                .unwrap_or_default()
-                .get(kind);
-            assert_ne!(ssbo, 0, "missing global SSBO {index} view {kind:?}");
-            let byte_offset = self
-                .builder
-                .i_sub(self.u64_type, None, address, ssbo_address)
-                .unwrap();
-            let byte_offset = self
-                .builder
-                .u_convert(self.u32_type, None, byte_offset)
-                .unwrap();
-            let shift = self.constant_u32(shift);
-            let ssbo_index = self
-                .builder
-                .shift_right_logical(self.u32_type, None, byte_offset, shift)
-                .unwrap();
-            let pointer = self
-                .builder
-                .access_chain(
-                    element_pointer,
-                    None,
-                    ssbo,
-                    vec![self.const_zero_u32, ssbo_index],
-                )
-                .unwrap();
-            if let Some(operation) = atomic {
-                let value = super::emit_spirv_atomic::atomic_u32(self, pointer, data.unwrap(), operation);
-                self.builder.ret_value(value).unwrap();
-            } else if let Some(data) = data {
-                self.builder.store(pointer, data, None, []).unwrap();
-                self.builder.ret().unwrap();
-            } else {
-                let value = self
-                    .builder
-                    .load(value_type, None, pointer, None, [])
-                    .unwrap();
-                self.builder.ret_value(value).unwrap();
+            let before_end = self.builder.u_less_than(self.bool_type, None, address, ssbo_end).unwrap();
+            let cond = self.builder.logical_and(self.bool_type, None, at_or_after_start, before_end).unwrap();
+            self.global_storage_access(index, kind, address, element_pointer, shift, ssbo_address, cond, access);
+        }
+    }
+
+    /// Lichii's `define_load` lambda (spirv_emit_context.cpp:1062-1101).
+    fn define_global_load(
+        &mut self,
+        info: &crate::shader_info::Info,
+        kind: StorageDefinitionKind,
+        value_type: spirv::Word,
+        shift: u32,
+    ) -> spirv::Word {
+        let function_type = self.builder.type_function(value_type, vec![self.u64_type]);
+        let function = self
+            .builder
+            .begin_function(value_type, None, spirv::FunctionControl::NONE, function_type)
+            .unwrap();
+        let address = self.builder.function_parameter(self.u64_type).unwrap();
+        if !self.profile.support_descriptor_aliasing && shift > 2 {
+            self.builder.begin_block(None).unwrap();
+            let count = 1u32 << (shift - 2);
+            let mut words = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let offset = self.builder.constant_bit64(self.u64_type, u64::from(i) * 4);
+                let word_address = self.builder.i_add(self.u64_type, None, address, offset).unwrap();
+                words.push(
+                    self.builder
+                        .function_call(self.u32_type, None, self.load_global_func_u32, [word_address])
+                        .unwrap(),
+                );
             }
-            self.builder.begin_block(Some(else_label)).unwrap();
+            let value = self.builder.composite_construct(value_type, None, words).unwrap();
+            self.builder.ret_value(value).unwrap();
+            self.builder.end_function().unwrap();
+            return function;
         }
-        if write {
-            self.builder.ret().unwrap();
+        // Buffers are bound at the device's storage buffer alignment (4 bytes on AMD), so an
+        // aligned 8 or 16 byte guest access can start at any word of the binding and the vector
+        // view (offset >> shift) would read the vector before it. Those accesses read the words
+        // of the buffer found for the address.
+        if shift > 2 && self.profile.min_ssbo_alignment < (1u64 << shift) {
+            let count = 1u32 << (shift - 2);
+            let element = self.storage_types.get(StorageDefinitionKind::U32).element;
+            self.define_global_body(
+                info,
+                StorageDefinitionKind::U32,
+                address,
+                element,
+                2,
+                GlobalStorageAccess::LoadWords { value_type, count },
+            );
         } else {
-            let zero = self.builder.constant_null(value_type);
-            self.builder.ret_value(zero).unwrap();
+            let element = self.storage_types.get(kind).element;
+            self.define_global_body(info, kind, address, element, shift, GlobalStorageAccess::Load { value_type });
         }
+        let zero = self.builder.constant_null(value_type);
+        self.builder.ret_value(zero).unwrap();
         self.builder.end_function().unwrap();
         function
     }
 
-    /// Port of upstream `EmitContext::DefineGlobalMemoryFunctions`.
+    /// Lichii's `define_write` lambda (spirv_emit_context.cpp:1102-1144).
+    fn define_global_write(
+        &mut self,
+        info: &crate::shader_info::Info,
+        kind: StorageDefinitionKind,
+        value_type: spirv::Word,
+        shift: u32,
+    ) -> spirv::Word {
+        let function_type = self.builder.type_function(self.void_type, vec![self.u64_type, value_type]);
+        let function = self
+            .builder
+            .begin_function(self.void_type, None, spirv::FunctionControl::NONE, function_type)
+            .unwrap();
+        let address = self.builder.function_parameter(self.u64_type).unwrap();
+        let data = self.builder.function_parameter(value_type).unwrap();
+        if !self.profile.support_descriptor_aliasing && shift > 2 {
+            self.builder.begin_block(None).unwrap();
+            let count = 1u32 << (shift - 2);
+            for i in 0..count {
+                let offset = self.builder.constant_bit64(self.u64_type, u64::from(i) * 4);
+                let word_address = self.builder.i_add(self.u64_type, None, address, offset).unwrap();
+                let word = self.builder.composite_extract(self.u32_type, None, data, [i]).unwrap();
+                self.builder
+                    .function_call(self.void_type, None, self.write_global_func_u32, [word_address, word])
+                    .unwrap();
+            }
+            self.builder.ret().unwrap();
+            self.builder.end_function().unwrap();
+            return function;
+        }
+        if shift > 2 && self.profile.min_ssbo_alignment < (1u64 << shift) {
+            let count = 1u32 << (shift - 2);
+            let element = self.storage_types.get(StorageDefinitionKind::U32).element;
+            self.define_global_body(
+                info,
+                StorageDefinitionKind::U32,
+                address,
+                element,
+                2,
+                GlobalStorageAccess::StoreWords { data, count },
+            );
+        } else {
+            let element = self.storage_types.get(kind).element;
+            self.define_global_body(info, kind, address, element, shift, GlobalStorageAccess::Store { data });
+        }
+        self.builder.ret().unwrap();
+        self.builder.end_function().unwrap();
+        function
+    }
+
+    /// A 32-bit global atomic routed like the loads and stores (Lichii
+    /// spirv_emit_context.cpp:1166-1236, for the operations ruzu routes).
+    fn define_global_atomic(
+        &mut self,
+        info: &crate::shader_info::Info,
+        operation: super::emit_spirv_atomic::StorageAtomicOp,
+    ) -> spirv::Word {
+        let function_type = self.builder.type_function(self.u32_type, vec![self.u64_type, self.u32_type]);
+        let function = self
+            .builder
+            .begin_function(self.u32_type, None, spirv::FunctionControl::NONE, function_type)
+            .unwrap();
+        let address = self.builder.function_parameter(self.u64_type).unwrap();
+        let data = self.builder.function_parameter(self.u32_type).unwrap();
+        let element = self.storage_types.get(StorageDefinitionKind::U32).element;
+        self.define_global_body(
+            info,
+            StorageDefinitionKind::U32,
+            address,
+            element,
+            2,
+            GlobalStorageAccess::Atomic { data, operation },
+        );
+        let zero = self.builder.constant_null(self.u32_type);
+        self.builder.ret_value(zero).unwrap();
+        self.builder.end_function().unwrap();
+        function
+    }
+
+    /// Port of upstream `EmitContext::DefineGlobalMemoryFunctions`, with Lichii's native routing
+    /// (spirv_emit_context.cpp:968-1253).
     fn define_global_memory_functions(&mut self, program: &ir::Program) {
         let info = &program.info;
         if !info.uses_global_memory || !self.profile.support_int64 {
             return;
         }
-        // Do not turn unresolved atomics into zero-returning functions with
-        // no memory effects. Validate before defining any storage helper.
-        let has_atomic = program.blocks.iter().any(|block| block.iter().any(|inst| {
-            super::emit_spirv_atomic::global_atomic_u32_operation(inst.opcode).is_some()
-        }));
-        if has_atomic && !info.storage_buffers_descriptors.iter().any(|descriptor| {
-            info.uses_nvn_storage_descriptor(descriptor)
+        self.load_global_func_u32 = self.define_global_load(info, StorageDefinitionKind::U32, self.u32_type, 2);
+        self.write_global_func_u32 = self.define_global_write(info, StorageDefinitionKind::U32, self.u32_type, 2);
+        self.load_global_func_u32x2 =
+            self.define_global_load(info, StorageDefinitionKind::U32x2, self.u32_vec2_type, 3);
+        self.write_global_func_u32x2 =
+            self.define_global_write(info, StorageDefinitionKind::U32x2, self.u32_vec2_type, 3);
+        self.load_global_func_u32x4 =
+            self.define_global_load(info, StorageDefinitionKind::U32x4, self.u32_vec4_type, 4);
+        self.write_global_func_u32x4 =
+            self.define_global_write(info, StorageDefinitionKind::U32x4, self.u32_vec4_type, 4);
+        if !info.storage_buffers_descriptors.iter().any(|descriptor| {
+            info.native_global_bounds || info.uses_nvn_storage_descriptor(descriptor)
         }) {
-            std::panic::panic_any(crate::exception::NotImplementedException::new(
-                "Global atomic address has no registered storage ranges",
-            ));
+            return;
         }
-        self.load_global_func_u32 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32,
-            self.u32_type,
-            4,
-            false,
-            None,
-        );
-        self.write_global_func_u32 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32,
-            self.u32_type,
-            4,
-            true,
-            None,
-        );
-        self.load_global_func_u32x2 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32x2,
-            self.u32_vec2_type,
-            8,
-            false,
-            None,
-        );
-        self.write_global_func_u32x2 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32x2,
-            self.u32_vec2_type,
-            8,
-            true,
-            None,
-        );
-        self.load_global_func_u32x4 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32x4,
-            self.u32_vec4_type,
-            16,
-            false,
-            None,
-        );
-        self.write_global_func_u32x4 = self.define_global_memory_function(
-            info,
-            StorageDefinitionKind::U32x4,
-            self.u32_vec4_type,
-            16,
-            true,
-            None,
-        );
-        // Emit only helpers actually referenced by IR, before the entry point.
+        // Atomics the storage buffer pass could not track: the same routing, with the operation on
+        // the routed word. Emit only helpers actually referenced by IR, before the entry point.
         // Operation emission remains in emit_spirv_atomic.rs.
         for block in &program.blocks {
             for inst in block.iter() {
@@ -2340,9 +2506,7 @@ impl SpirvEmitContext {
                     continue;
                 };
                 if !self.global_atomic_functions.contains_key(&inst.opcode) {
-                    let function = self.define_global_memory_function(
-                        info, StorageDefinitionKind::U32, self.u32_type, 4, false, Some(operation),
-                    );
+                    let function = self.define_global_atomic(info, operation);
                     self.global_atomic_functions.insert(inst.opcode, function);
                 }
             }
@@ -2902,6 +3066,16 @@ impl SpirvEmitContext {
     pub fn define_mesh_dispatch_buffer(&mut self, binding: u32) {
         (self.mesh_dispatch_buffer, self.mesh_dispatch_buffer_u32) =
             self.define_mesh_storage_buffer(binding, "mesh_dispatch_mapping");
+    }
+
+    /// Mesh emulation with a task program (Lichii `EmitContext::DefineMeshEmulationOutput`,
+    /// spirv_emit_context.cpp:2055-2059):
+    /// the distribution pass's argument buffer. The dispatch binding then holds
+    /// the first mesh workgroup of each task instead of per-workgroup records.
+    pub fn define_mesh_task_args_buffer(&mut self, binding: u32, payload_stride: u32) {
+        (self.mesh_task_args_buffer, self.mesh_task_args_buffer_u32) =
+            self.define_mesh_storage_buffer(binding, "mesh_task_args");
+        self.mesh_task_payload_stride = payload_stride;
     }
 
     /// Reserved descriptor shared by the compute exporter and vertex reader.

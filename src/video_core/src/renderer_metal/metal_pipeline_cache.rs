@@ -84,7 +84,7 @@ use super::metal_shader::{
 };
 
 const SPIRV_1_5: u32 = 0x0001_0500;
-const METAL_MIN_SSBO_ALIGNMENT: u64 = 4;
+pub(crate) const METAL_MIN_SSBO_ALIGNMENT: u64 = 4;
 const METAL_MAX_USER_CLIP_DISTANCES: u32 = 8;
 // GraphicsPipelineKey now includes an explicitly encoded resource-pool tail.
 const CACHE_VERSION: u32 = 2;
@@ -215,6 +215,9 @@ pub fn make_host_translate_info(device: &MetalDeviceProfile) -> HostTranslateInf
         // every barrier that follows a conditional return, and the phases of
         // (for one) the single-pass mip downsampler race through shared memory.
         support_conditional_barrier: true,
+        // Handle-table descriptor arrays are a Lichii Vulkan extension; the
+        // Metal pipelines evaluate one handle per descriptor.
+        support_handle_table_arrays: false,
     };
     host_info.apply_descriptor_limit_policy();
     host_info

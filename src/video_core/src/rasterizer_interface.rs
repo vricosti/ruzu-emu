@@ -203,6 +203,14 @@ pub trait RasterizerInterface {
     /// Release all pending fences.
     fn release_fences(&mut self, force: bool);
 
+    /// Writes the region's query reports to guest memory, waiting for pending host results.
+    ///
+    /// Lichii `RasterizerInterface::FlushQueryResults` (rasterizer_interface.h; from Lichii
+    /// 7ae3e74014); absent from Eden.
+    fn flush_query_results(&mut self, addr: u64, size: u64) {
+        self.flush_region(addr, size, CacheType::QUERY_CACHE);
+    }
+
     // ── Cache management ────────────────────────────────────────────────
 
     /// Flush all caches to Switch memory.
@@ -210,6 +218,43 @@ pub trait RasterizerInterface {
 
     /// Flush caches of the specified region to Switch memory.
     fn flush_region(&mut self, addr: u64, size: u64, which: CacheType);
+
+    /// `flush_region` for a guest CPU read of the region (`Gpu::on_cpu_read`),
+    /// on the GPU thread: a cache may submit its downloads without waiting for
+    /// the host GPU, for `finish_read` to write.
+    ///
+    /// Lichii `RasterizerInterface::FlushRegionForRead`
+    /// (rasterizer_interface.h:115-120; async read-back, DIFF.md 2026-11-15).
+    fn flush_region_for_read(&mut self, addr: u64, size: u64) {
+        self.flush_region(addr, size, CacheType::ALL);
+    }
+
+    /// Writes to guest memory what `flush_region_for_read` submitted over the
+    /// region (and anything submitted before it), waiting for the host GPU if
+    /// it must. Any thread: the reading one before it reads, and the GPU's
+    /// side before it writes guest memory there.
+    ///
+    /// Lichii `RasterizerInterface::FinishRead` (rasterizer_interface.h:122-125).
+    fn finish_read(&mut self, _addr: u64, _size: u64) {}
+
+    /// A write to guest memory from the GPU's side over `[addr, addr + size)`
+    /// (memory manager writes, query results) is about to be stored: the read
+    /// downloads still on their way must not land their older bytes over it.
+    /// Leaves guest memory and the GPU-modified ranges as Lichii's `FinishRead`
+    /// followed by the write does, without the buffer cache's lock or a host
+    /// GPU wait (ruzu-specific, see `BufferCache::supersede_read_downloads`).
+    fn supersede_read_downloads(&mut self, _addr: u64, _size: u64) {}
+
+    /// A query result the query cache writes to guest memory later, at a fence
+    /// or sync point. When this returns true, `finish_report` once it wrote or
+    /// dropped it.
+    ///
+    /// Lichii `RasterizerInterface::NoteReportPending` / `FinishReport`
+    /// (rasterizer_interface.h:127-133).
+    fn note_report_pending(&mut self, _addr: u64, _size: u64) -> bool {
+        false
+    }
+    fn finish_report(&mut self, _addr: u64, _size: u64) {}
 
     /// Check if the specified memory area requires flushing to CPU memory.
     fn must_flush_region(&self, addr: u64, size: u64, which: CacheType) -> bool;

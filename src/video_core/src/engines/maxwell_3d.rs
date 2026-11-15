@@ -2780,11 +2780,19 @@ impl Maxwell3D {
         if crate::nx2_profile::enabled() {
             crate::nx2_profile::add(crate::nx2_profile::Counter::DmaReadBytes, read_bytes);
         }
-        let mut memory = fs.memory_manager.as_ref()
-            .expect("Maxwell3D requires its upstream MemoryManager owner").lock();
+        let memory_handle = fs.memory_manager.as_ref()
+            .expect("Maxwell3D requires its upstream MemoryManager owner");
+        let mut memory = memory_handle.lock();
         if memory.is_memory_dirty_with_cache_type(source, read_bytes, crate::cache_types::CacheType::BUFFER_CACHE) {
             memory.flush_region_with_cache_type(source, read_bytes, crate::cache_types::CacheType::BUFFER_CACHE);
         }
+        drop(memory);
+        // Lichii Maxwell3D::FrontDmaRead (maxwell_3d.cpp:2265-2270, from Lichii 7ae3e74014):
+        // after the buffer cache, write out the reports the query cache holds until their fence
+        // or host result, else the read returns stale occlusion counts. Lichii runs it on the
+        // split's back; here the front does it after the drain, as for the buffer cache flush.
+        crate::query_dma::flush_pending(memory_handle, source, read_bytes);
+        let memory = memory_handle.lock();
         for i in 0..words {
             let word = memory.read::<u32>(source.wrapping_add(i as u64 * 4));
             if method == 0x158 { fifo.push(word); }
@@ -5025,7 +5033,7 @@ impl Maxwell3D {
         let copy_size = std::mem::size_of_val(data);
         let address = buffer_address.wrapping_add(offset as u64);
 
-        if let Some(memory_manager) = self.memory_manager.as_ref().cloned() {
+        if let Some(memory_manager) = self.memory_manager.as_ref() {
             // Upstream passes start_base directly to WriteBlockCached. On
             // little-endian hosts these words already have the guest layout.
             #[cfg(target_endian = "little")]
@@ -5408,8 +5416,12 @@ impl Maxwell3D {
         // Keep the context lock across execution, but no RefMut. Emitted uploads
         // reenter this lock and borrow only while updating code/bindings. The raw
         // pointer originates from RefCell's UnsafeCell, not a short-lived RefMut.
-        let context = self.native_macro_context.clone();
-        let guard = context.as_ref().map(|context| context.lock());
+        // Upstream reaches the context through its shared_ptr member without
+        // copying it. Borrow the allocation the same way (no refcount traffic
+        // per macro call): native_macro_context is only replaced by
+        // set_native_macro_context during channel setup, never by a macro.
+        let context = self.native_macro_context.as_ref().map(Arc::as_ptr);
+        let guard = context.map(|context| unsafe { (*context).lock() });
         let (macro_engine, macro_method) = if let Some(guard) = &guard {
             let context = guard.as_ptr();
             unsafe { (std::ptr::addr_of_mut!((*context).engine), (*context).positions[entry as usize]) }

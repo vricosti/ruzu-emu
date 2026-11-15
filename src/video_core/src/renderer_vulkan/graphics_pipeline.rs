@@ -166,16 +166,22 @@ enum GraphicsGpuMemory {
 unsafe impl Send for GraphicsGpuMemory {}
 
 impl GraphicsGpuMemory {
-    fn read(&self, addr: u64, output: &mut [u8]) {
+    /// Upstream `gpu_memory->Read<u32>(addr)`, as `ConfigureImpl`'s
+    /// `read_handle` uses it (Eden vk_graphics_pipeline.cpp:389-396, Lichii
+    /// :877-884 and shader_handle_program.h EvaluateTextureHandle): a plain
+    /// read of the backing page, without `ReadBlock`'s cache flush.
+    fn read_u32(&self, addr: u64) -> u32 {
         match self {
             // SAFETY: the rasterizer retains the channel's owning
             // `Arc<Mutex<MemoryManager>>` for the complete configure call and
             // serializes this GPU-thread access, matching upstream's stored
             // `Tegra::MemoryManager*`.
-            Self::Memory(memory) => unsafe {
-                memory.as_ref().read_block(addr, output);
-            },
-            Self::LegacyReaders { read, .. } => unsafe { (&**read)(addr, output) },
+            Self::Memory(memory) => unsafe { memory.as_ref().read::<u32>(addr) },
+            Self::LegacyReaders { read, .. } => {
+                let mut bytes = [0u8; 4];
+                unsafe { (&**read)(addr, &mut bytes) };
+                u32::from_le_bytes(bytes)
+            }
         }
     }
 
@@ -244,8 +250,14 @@ impl MeshGraphicsResources {
             num_image_elements: self.num_image_elements, num_textures: self.num_textures,
             num_descriptor_entries: self.num_descriptor_entries, uses_descriptor_buffer: false,
         };
+        // The compute-backed mesh path keeps its caller's block reader.
+        let read_u32 = |addr: u64| -> u32 {
+            let mut bytes = [0u8; 4];
+            read_gpu(addr, &mut bytes);
+            u32::from_le_bytes(bytes)
+        };
         let (prepared, views) = GraphicsPipeline::prepare_graphics_resources::<DefaultSpec>(
-            state, draw, read_gpu, scheduler, buffer_cache, texture_cache, queue,
+            state, draw, &read_u32, scheduler, buffer_cache, texture_cache, queue,
             fallback_sampler, is_indexed);
         // Copy before another stage acquires the shared descriptor queue.
         let entries = if self.num_descriptor_entries == 0 {
@@ -957,9 +969,7 @@ impl GraphicsPipeline {
         // both draw-scoped values remain exclusively borrowed by the rasterizer.
         let draw = unsafe { engine.draw.as_ref() };
         let dirty_flags = unsafe { engine.dirty_flags.as_mut() };
-        let read_gpu = |addr: u64, output: &mut [u8]| {
-            engine.gpu_memory.read(addr, output);
-        };
+        let read_u32 = |addr: u64| engine.gpu_memory.read_u32(addr);
         let read_gpu_unsafe =
             |addr: u64, output: &mut [u8]| engine.gpu_memory.read_unsafe(addr, output);
         // SAFETY: PipelineCache initializes these stable pointers before the
@@ -990,7 +1000,7 @@ impl GraphicsPipeline {
             uses_descriptor_buffer: self.uses_descriptor_buffer,
         };
         let (prepared, mut views) = Self::prepare_graphics_resources::<S>(
-            state, draw, &read_gpu, scheduler, buffer_cache, texture_cache,
+            state, draw, &read_u32, scheduler, buffer_cache, texture_cache,
             guest_descriptor_queue, engine.fallback_sampler, is_indexed,
         );
         // Diagnostic (RUZU_DEBUG_SKIP_VIEW_DRAWS=null|unbacked): drop every
@@ -1077,7 +1087,7 @@ impl GraphicsPipeline {
     fn prepare_graphics_resources<S: ConfigureSpec>(
         state: GraphicsDescriptorState<'_>,
         draw: &Maxwell3DDrawView<'_>,
-        read_gpu: &dyn Fn(u64, &mut [u8]),
+        read_u32: &dyn Fn(u64) -> u32,
         scheduler: &mut Scheduler,
         buffer_cache: &mut VulkanCommonBufferCache,
         texture_cache: &mut TextureCache,
@@ -1109,11 +1119,7 @@ impl GraphicsPipeline {
         }
 
         let via_header_index = descriptor_sync_regs.sampler_binding_via_header;
-        let read_u32 = |addr: u64| -> u32 {
-            let mut bytes = [0u8; 4];
-            read_gpu(addr, &mut bytes);
-            u32::from_le_bytes(bytes)
-        };
+        let storage_alignment = buffer_cache.runtime.get_storage_buffer_alignment() as u64;
         let read_stage_handle = |stage: usize,
                                  handle_program: u32,
                                  cbuf_index: u32,
@@ -1133,7 +1139,7 @@ impl GraphicsPipeline {
                         if index as usize >= shader_recompiler::shader_info::Info::MAX_CBUFS { return 0; }
                         let cbuf = draw.const_buffer_binding(stage, index as usize);
                         if cbuf.enabled { cbuf.address } else { 0 }
-                    }, read_u32);
+                    }, read_u32, storage_alignment, element);
                 return texture_pair(handle, via_header_index);
             }
             let index_offset = element.wrapping_shl(size_shift);
@@ -1223,19 +1229,27 @@ impl GraphicsPipeline {
                 }
                 for desc in &info.texture_descriptors {
                     for element in 0..desc.count {
-                        let (tic_id, tsc_id) = read_stage_handle(
-                            stage,
-                            desc.handle_program,
-                            desc.cbuf_index,
-                            desc.cbuf_offset,
-                            desc.size_shift,
-                            element,
-                            desc.has_secondary,
-                            desc.shift_left,
-                            desc.secondary_cbuf_index,
-                            desc.secondary_cbuf_offset,
-                            desc.secondary_shift_left,
-                        );
+                        // Lichii vk_graphics_pipeline.cpp:940-942: a handle word
+                        // holding a storage buffer address binds no texture.
+                        let (tic_id, tsc_id) = if crate::shader_handle_program::
+                            handle_is_storage_pointer(info, desc, element)
+                        {
+                            crate::shader_handle_program::NULL_TEXTURE_HANDLE
+                        } else {
+                            read_stage_handle(
+                                stage,
+                                desc.handle_program,
+                                desc.cbuf_index,
+                                desc.cbuf_offset,
+                                desc.size_shift,
+                                element,
+                                desc.has_secondary,
+                                desc.shift_left,
+                                desc.secondary_cbuf_index,
+                                desc.secondary_cbuf_offset,
+                                desc.secondary_shift_left,
+                            )
+                        };
                         add_view(tic_id, false);
                         samplers.push(texture_cache.get_sampler_id(tsc_id, false));
                     }

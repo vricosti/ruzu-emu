@@ -794,13 +794,39 @@ impl KeplerCompute {
                     }
                 }
             }
-            // Lease interpreter and FIFO so Rust callbacks can observe live uploads safely.
-            let mut interpreter = unsafe { std::mem::take(&mut (*engine).native_interpreter) };
+            #[cfg(target_arch = "x86_64")]
+            let use_jit = {
+                static USE_JIT: OnceLock<bool> = OnceLock::new();
+                *USE_JIT.get_or_init(|| {
+                    std::env::var_os("EDEN_NX2_MME_JIT")
+                        .is_none_or(|v| !v.to_string_lossy().starts_with('0'))
+                }) && !watched
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let use_jit = false;
+            // Lease interpreter and FIFO so Rust callbacks can observe live uploads
+            // safely. As in MacroEngine::execute_native, the 12 KiB interpreter
+            // (and its own RAM) is not leased when the JIT runs on active_dram:
+            // the JIT only uses active_dram, so moving and zeroing the
+            // interpreter on every compute macro call is avoided.
+            let shared = unsafe { (*engine).native_interpreter.active_dram.is_some() };
+            let mut interpreter = (!use_jit || !shared)
+                .then(|| unsafe { std::mem::take(&mut (*engine).native_interpreter) });
             let mut parameters = std::mem::take(&mut self.native_parameters);
-            let ram_owner = interpreter.active_dram.clone();
+            let ram_owner = match &interpreter {
+                Some(interpreter) => interpreter.active_dram.clone(),
+                None => unsafe { (*engine).native_interpreter.active_dram.clone() },
+            };
             let mut shared_ram = ram_owner.as_ref().map(|ram| ram.lock());
-            let mut local_ram = std::mem::replace(&mut interpreter.dram, [0; 0xc00]);
-            let ram = shared_ram.as_deref_mut().unwrap_or(&mut local_ram);
+            let mut local_ram = interpreter
+                .as_mut()
+                .map(|interpreter| std::mem::replace(&mut interpreter.dram, [0; 0xc00]));
+            let ram = match shared_ram.as_deref_mut() {
+                Some(shared) => shared,
+                None => local_ram
+                    .as_mut()
+                    .expect("the interpreter is leased when there is no active_dram"),
+            };
             let dram0_before = ram[0x27];
             let mut emit = |address: u32,
                             value: u32,
@@ -828,12 +854,7 @@ impl KeplerCompute {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                 #[cfg(target_arch = "x86_64")]
                 {
-                    static USE_JIT: OnceLock<bool> = OnceLock::new();
-                    if *USE_JIT.get_or_init(|| {
-                        std::env::var_os("EDEN_NX2_MME_JIT")
-                            .is_none_or(|v| !v.to_string_lossy().starts_with('0'))
-                    }) && !watched
-                    {
+                    if use_jit {
                         // native_jit is created once and never replaced while the
                         // engine (held by the context guard) lives: borrow it.
                         let jit = &*Arc::as_ptr((*engine).native_jit.get_or_insert_with(|| {
@@ -864,6 +885,9 @@ impl KeplerCompute {
                         return;
                     }
                 }
+                let interpreter = interpreter
+                    .as_mut()
+                    .expect("the interpreter is leased whenever the JIT is not used");
                 static USE_MEMO: OnceLock<bool> = OnceLock::new();
                 let use_memo = *USE_MEMO.get_or_init(|| {
                     std::env::var_os("EDEN_NX2_MME_MEMO")
@@ -911,7 +935,7 @@ impl KeplerCompute {
                 );
                 let current = selected();
                 let state = if current == engine {
-                    &interpreter
+                    &*interpreter
                 } else {
                     &(*current).native_interpreter
                 };
@@ -947,9 +971,13 @@ impl KeplerCompute {
                     log::error!("Native MME failed: compute start={:#x}, pc={:#x}, consumed={}/{}, error={}, parameters={parameters:08x?}", (*positions())[entry], result.pc, result.consumed, parameters.len(), result.error);
                 }
             }));
-            interpreter.dram = local_ram;
-            unsafe {
-                (*engine).native_interpreter = interpreter;
+            if let Some(mut interpreter) = interpreter {
+                if let Some(local_ram) = local_ram {
+                    interpreter.dram = local_ram;
+                }
+                unsafe {
+                    (*engine).native_interpreter = interpreter;
+                }
             }
             parameters.clear();
             self.native_parameters = parameters;
@@ -2047,6 +2075,58 @@ mod tests {
             assert!(!state.compute_engine.native_execution_failed);
             if shared {
                 assert_eq!(&ram.lock()[0x27..=0x28], &[42, 0xabcdef]);
+            } else {
+                assert_eq!(&state.compute_engine.native_interpreter.dram[0x27..=0x28],
+                    &[42, 0xabcdef]);
+            }
+        }
+    }
+
+    // Backend (non-split) counterpart: the interpreter is no longer leased when
+    // the JIT runs on active_dram, and still is for the engine-owned RAM.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn native_macro_updates_shared_or_engine_ram_without_leasing_for_jit() {
+        for shared in [false, true] {
+            let context = Arc::new(parking_lot::ReentrantMutex::new(RefCell::new(
+                crate::r#macro::NativeMacroContext::default(),
+            )));
+            {
+                let guard = context.lock();
+                let mut state = guard.borrow_mut();
+                state.engine.native_turing = true;
+                state.compute_engine.native_turing = true;
+                state.compute_engine.native_interpreter.dram[0x28] = 0xabcdef;
+            }
+            let ram = Arc::new(Mutex::new([0; 0xc00]));
+            ram.lock()[0x28] = 0xabcdef;
+            let mut engine = Box::new(new_test_engine());
+            engine.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
+            if shared { engine.set_native_data_ram(Some(ram.clone())); }
+            engine.call_method(0x45, 0, true);
+            let code = [
+                front_instruction(&[(10, 5, 31), (20, 5, 25), (30, 16, 0x27),
+                    (25, 5, 26), (66, 16, 42)]),
+                front_instruction(&[(0, 1, 1), (10, 5, 30), (20, 5, 25),
+                    (30, 16, 0x27), (66, 16, 0x200), (82, 3, 6), (85, 4, 1)]),
+                front_instruction(&[]),
+            ].concat();
+            engine.call_multi_method(0x46, &code, code.len() as u32, code.len() as u32);
+            engine.call_multi_method(0x200, &[13, 17], 2, 2);
+            assert_eq!(engine.native_registers[0x200], 17);
+            engine.call_method(0xe00, 7, false);
+            engine.call_multi_method(0xe01, &[8, 9], 2, 2);
+            assert!(engine.native_parameters.is_empty());
+            assert_eq!(engine.native_registers[0x200], 42);
+            let guard = context.lock();
+            let state = guard.borrow();
+            assert!(!state.compute_engine.native_execution_failed);
+            assert_eq!(state.compute_engine.native_jit.is_some(),
+                std::env::var_os("EDEN_NX2_MME_JIT")
+                    .is_none_or(|v| !v.to_string_lossy().starts_with('0')));
+            if shared {
+                assert_eq!(&ram.lock()[0x27..=0x28], &[42, 0xabcdef]);
+                assert_eq!(state.compute_engine.native_interpreter.dram[0x27], 0);
             } else {
                 assert_eq!(&state.compute_engine.native_interpreter.dram[0x27..=0x28],
                     &[42, 0xabcdef]);

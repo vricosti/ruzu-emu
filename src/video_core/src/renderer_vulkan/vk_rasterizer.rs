@@ -1850,7 +1850,7 @@ impl RasterizerVulkan {
         }
         {
             let _scope = ProfileScope::new(ProfileZone::DynamicState);
-            self.update_dynamic_states(draw, dirty_flags);
+            self.update_dynamic_states(draw, dirty_flags, Some(dynamic_vertex_input));
         }
         // Mesh output topology replaces the guest draw's group-launch topology.
         // Track the actual host state, and dirty overrides so ordinary draws
@@ -2064,6 +2064,7 @@ impl RasterizerVulkan {
             warn!("RasterizerVulkan: draw skipped because graphics pipeline configuration failed");
             return;
         }
+        let has_dynamic_vertex_input = gp.has_dynamic_vertex_input();
         if self.scheduler.current_tick() != command_buffer_tick_before_configure {
             // `StateTracker::InvalidateState` already writes the live Maxwell
             // flags, exactly as in Eden. Snapshot-only callers still need the
@@ -2112,7 +2113,7 @@ impl RasterizerVulkan {
         // `RasterizerVulkan::UpdateDynamicStates`.
         {
             let _scope = ProfileScope::new(ProfileZone::DynamicState);
-            self.update_dynamic_states(draw, dirty_flags);
+            self.update_dynamic_states(draw, dirty_flags, Some(has_dynamic_vertex_input));
         }
         self.query_cache.notify_segment(true);
         self.handle_transform_feedback();
@@ -2401,11 +2402,18 @@ impl RasterizerVulkan {
 
     // â”€â”€ Dynamic state update methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+    /// Port of `RasterizerVulkan::UpdateDynamicStates`. Lichii divergence
+    /// (vk_rasterizer.cpp:4238, 4323-4329): a draw passes what it learned from
+    /// the pipeline it already looked up, here whether that pipeline has
+    /// dynamic vertex input, instead of a second
+    /// `PipelineCache::CurrentGraphicsPipeline` lookup; `None` (DrawTexture)
+    /// keeps Eden's lookup.
     #[inline(never)]
     fn update_dynamic_states(
         &mut self,
         draw: &mut Maxwell3DDrawView<'_>,
         dirty_flags: &mut [bool; 256],
+        pipeline_has_dynamic_vertex_input: Option<bool>,
     ) {
         use super::state_tracker::dirty;
 
@@ -2486,10 +2494,13 @@ impl RasterizerVulkan {
             self.update_color_write_enable(draw);
         }
         if self.vertex_input_dynamic_state_supported {
-            let has_dynamic_vertex_input = self
-                .pipeline_cache
-                .current_graphics_pipeline(draw, &mut self.shader_cache)
-                .is_some_and(|pipeline| pipeline.has_dynamic_vertex_input());
+            let has_dynamic_vertex_input = match pipeline_has_dynamic_vertex_input {
+                Some(has_dynamic_vertex_input) => has_dynamic_vertex_input,
+                None => self
+                    .pipeline_cache
+                    .current_graphics_pipeline(draw, &mut self.shader_cache)
+                    .is_some_and(|pipeline| pipeline.has_dynamic_vertex_input()),
+            };
             if has_dynamic_vertex_input {
                 self.update_vertex_input(draw, dirty_flags);
             }
@@ -3628,7 +3639,7 @@ impl RasterizerInterface for RasterizerVulkan {
                     );
                     return;
                 }
-                self.update_dynamic_states(draw_texture_view.draw_view_mut(), dirty_flags.as_mut());
+                self.update_dynamic_states(draw_texture_view.draw_view_mut(), dirty_flags.as_mut(), None);
             }
         } else {
             let original_dirty_flags = *draw_texture_view.dirty_flags();
@@ -3643,7 +3654,7 @@ impl RasterizerInterface for RasterizerVulkan {
                 log::warn!("RasterizerVulkan::draw_texture skipped: render-target update failed");
                 return;
             }
-            self.update_dynamic_states(draw_texture_view.draw_view_mut(), &mut dirty_flags);
+            self.update_dynamic_states(draw_texture_view.draw_view_mut(), &mut dirty_flags, None);
             propagate_consumed_dirty_flags(
                 draw_texture_view.draw_view_mut(),
                 &original_dirty_flags,

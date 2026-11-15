@@ -3030,6 +3030,10 @@ impl QueryCache {
     pub fn invalidate_region(&mut self, addr: u64, size: usize) {
         self.base.invalidate_region(addr, size);
     }
+    /// Lichii `QueryCacheBase::page_filter`, read by inner_invalidation.
+    pub fn page_filter(&self) -> &crate::page_filter::PageFilter {
+        &self.base.page_filter
+    }
     /// Upstream `QueryCacheBase::FlushRegion`, over the reports `QueryCacheBase` holds only: it
     /// runs under the memory manager's lock (`MemoryManager::read_block`), which the host
     /// reports' write-back (`write_query_result`) takes, so it cannot wait for those.
@@ -3042,6 +3046,13 @@ impl QueryCache {
     pub fn semi_flush_region(&mut self, addr: u64, size: usize) -> bool {
         let base_pending = self.base.semi_flush_region(addr, size);
         base_pending || self.pending_host_reports.overlaps(addr, size as u64)
+    }
+    /// Lichii `QueryCacheBase::HoldsQueries` (any thread): whether a report can still land in
+    /// the region, which here also covers the host-resolved reports this backend keeps outside
+    /// `QueryCacheBase` until their write-back runs.
+    pub fn holds_queries(&self, addr: u64, size: usize) -> bool {
+        self.base.holds_queries(addr, size)
+            || self.pending_host_reports.overlaps(addr, size as u64)
     }
     pub fn notify_wfi(
         &mut self,

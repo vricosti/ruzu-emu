@@ -20,6 +20,7 @@ pub mod fence_manager;
 pub mod framebuffer_config;
 pub mod fsr;
 pub mod gpu;
+pub mod page_filter;
 pub mod gpu_logging;
 pub(crate) mod gpu_split;
 pub mod gpu_thread;

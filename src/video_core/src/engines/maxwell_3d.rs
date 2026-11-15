@@ -2364,7 +2364,73 @@ pub(crate) struct FrontState {
     back: Maxwell3DPtr,
     memory_manager: Option<Arc<Mutex<MemoryManager>>>,
     native_data_ram: Arc<Mutex<crate::macro_turing::DataRam>>,
+    /// The back's register and shadow RAM arrays (Rust: upstream reads
+    /// `regs.reg_array` and `shadow_state.reg_array` of the engine directly).
+    /// Read one entry at a time, only once the back ran the macro that may
+    /// have written it (FrontRegister, FrontTakeOver).
+    back_arrays: BackArrays,
+
+    /// Registers a macro the back ran may have written (front_run_on_back),
+    /// and their shadow RAM entries: the ring position after the last such
+    /// macro, 0 once the front knows the value.
+    back_regs: Box<[u64; NUM_REGS]>,
+    back_shadow: Box<[u64; NUM_REGS]>,
+    /// back_regs or back_shadow set.
+    back_owned: Box<[bool; NUM_REGS]>,
+    /// By start in the macro code of back_generation, once called.
+    back_macros: Vec<Option<Box<BackMacro>>>,
+    back_generation: u64,
+    /// Starts of macros that wrote outside their write set.
+    back_demoted: Vec<u32>,
+    /// The back's macro engine, its code a copy of the front's (when
+    /// back_code_copied).
+    back_engine: Option<Box<MacroEngine>>,
+    back_code_copied: bool,
+    /// The position after the last macro sent to the back.
+    back_last: u64,
+    /// Back macros that wrote outside their write set (boxed: the back
+    /// increments it through a pointer).
+    back_escapes: Box<std::sync::atomic::AtomicU32>,
+    back_escapes_seen: u32,
 }
+
+/// Maxwell3D::FrontState::BackMacro: a macro whose code reads memory into its
+/// FIFO, run on the back in the front's place (front_run_on_back).
+struct BackMacro {
+    start: u32,
+    /// Runs on the back (else on the front).
+    back: bool,
+    /// The registers its code can write.
+    writes: Vec<u32>,
+    /// The same, for the back's check (MacroEngine::split_writes).
+    write_set: Arc<[bool; NUM_REGS]>,
+    /// The back saw it write another register.
+    escaped: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+struct BackArrays {
+    regs: *const u32,
+    shadow: *const u32,
+}
+// SAFETY: the pointers name the back engine's register arrays, which live as
+// long as the engine. The front reads an entry only after the back ran the
+// last entry that may write it, and no entry sent after that writes it.
+unsafe impl Send for BackArrays {}
+
+/// The pointers and record a call the back runs in the front's place uses
+/// (upstream's lambda captures). Copy and Send for GpuSplit::defer_words.
+#[derive(Clone, Copy)]
+struct BackCall {
+    maxwell: *mut Maxwell3D,
+    engine: *mut MacroEngine,
+    record: *const BackMacro,
+    escapes: *const std::sync::atomic::AtomicU32,
+}
+// SAFETY: the front keeps the engine, the record and the counter alive until
+// the back ran every call sent with them (it waits for back_last before
+// clearing back_macros), and only the back touches the engine meanwhile.
+unsafe impl Send for BackCall {}
 
 fn front_verify_enabled() -> bool {
     static VERIFY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -2529,6 +2595,21 @@ impl Maxwell3D {
                 back: Maxwell3DPtr(engine),
                 memory_manager: engine.memory_manager.clone(),
                 native_data_ram: engine.native_data_ram.clone(),
+                back_arrays: BackArrays {
+                    regs: engine.regs.as_mut_ptr(),
+                    shadow: engine.shadow_state.as_mut_ptr(),
+                },
+                back_regs: Box::new([0; NUM_REGS]),
+                back_shadow: Box::new([0; NUM_REGS]),
+                back_owned: Box::new([false; NUM_REGS]),
+                back_macros: Vec::new(),
+                back_generation: u64::MAX,
+                back_demoted: Vec::new(),
+                back_engine: None,
+                back_code_copied: false,
+                back_last: 0,
+                back_escapes: Box::new(std::sync::atomic::AtomicU32::new(0)),
+                back_escapes_seen: 0,
             };
             engine.executing_macro = 0;
             engine.front = Some(Arc::new(Mutex::new(fs)));
@@ -2542,11 +2623,15 @@ impl Maxwell3D {
         is_last_call: bool, from_macro: bool)
     {
         let index = method as usize;
+        // As ProcessShadowRam does on the back. A register a macro the back
+        // ran may have written is the front's again, and its write is sent
+        // even if the front's copies hold the value.
         let mut value = argument;
-        let mut shadow_kept = true;
+        let back_owned = fs.back_owned[index];
+        let mut shadow_kept = !(back_owned && Self::front_take_over(fs, split, method));
         match ShadowRamControl::from_raw(fs.control) {
             ShadowRamControl::Track | ShadowRamControl::TrackWithFilter => {
-                shadow_kept = fs.shadow[index] == argument;
+                shadow_kept = shadow_kept && fs.shadow[index] == argument;
                 fs.shadow[index] = argument;
             }
             ShadowRamControl::Replay => value = fs.shadow[index],
@@ -2602,8 +2687,14 @@ impl Maxwell3D {
             }
         }
         // Context guards from uploads/bindings have been released before enqueue.
-        if from_macro { split.macro_write(engine, method, argument); }
-        else { split.method(engine, method, argument, is_last_call, None); }
+        use crate::gpu_split::Writes;
+        if from_macro { split.macro_write(engine, method, argument, Writes::Noted); }
+        else { split.method(engine, method, argument, is_last_call, None, Writes::Noted); }
+        // A write the back only keeps for later (its method sink) runs
+        // nothing there yet.
+        if from_macro || fs.execution_mask[index] {
+            Self::front_note_writes(fs, split, method, 1);
+        }
     }
 
     pub(crate) fn front_call_method(fs: &mut FrontState, engine: EngineHandle,
@@ -2631,6 +2722,11 @@ impl Maxwell3D {
             return;
         }
         let index = method as usize;
+        // What CallMultiMethod does to the registers on the back, then one
+        // entry for all the words (sent whatever the front's copies hold).
+        if fs.back_owned[index] {
+            Self::front_take_over(fs, split, method);
+        }
         let tracked = |control| matches!(control, 0 | 1);
         if (CB_DATA_BASE..CB_DATA_END).contains(&method) {
             let offset = CB_CONFIG_BASE as usize + 3;
@@ -2684,7 +2780,9 @@ impl Maxwell3D {
                 }
             }
         }
-        split.multi_method(engine, method, words, amount, methods_pending, None);
+        split.multi_method(engine, method, words, amount, methods_pending, None,
+            crate::gpu_split::Writes::Noted);
+        Self::front_note_writes(fs, split, method, amount);
     }
 
     fn front_run_macro(fs: &mut FrontState, engine: EngineHandle,
@@ -2697,12 +2795,18 @@ impl Maxwell3D {
             let owner = fs.macro_owner.clone();
             let ram_owner = fs.native_data_ram.clone();
             {
+                let start = {
+                    let guard = owner.lock();
+                    let context = guard.borrow();
+                    context.positions[((method - MACRO_REGISTERS_START) >> 1) as usize
+                        % context.positions.len()]
+                };
+                let on_back = Self::front_run_on_back(fs, split, start);
+                if !on_back {
                 let _profile = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::Macro);
-                let (start, jit) = {
+                let jit = {
                     let guard = owner.lock();
                     let mut context = guard.borrow_mut();
-                    let start = context.positions[((method - MACRO_REGISTERS_START) >> 1) as usize
-                        % context.positions.len()];
                     let macro_engine = &mut context.engine;
                     macro_engine.native_interpreter.active_dram = Some(ram_owner.clone());
                     let jit = macro_engine.native_jit.get_or_insert_with(|| {
@@ -2711,7 +2815,7 @@ impl Maxwell3D {
                     jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                         .prepare(&macro_engine.native_code, macro_engine.native_code_generation)
                         .expect("native graphics frontend macro JIT preparation failed");
-                    (start, jit)
+                    jit
                 }; // No context/engine borrow may span enqueue or DMA Drain.
                 fs.fifo.clone_from(&fs.parameters);
                 let mut fifo = std::mem::take(&mut fs.fifo);
@@ -2721,13 +2825,19 @@ impl Maxwell3D {
                     let mut jit = jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     jit.execute(start, &mut fifo, &mut ram,
                         |address| unsafe {
-                            (*front).regs.get(address as usize).copied().unwrap_or(0)
+                            let index = address as usize;
+                            if index >= NUM_REGS { 0 }
+                            else if (*front).back_owned[index] {
+                                Self::front_register(&mut *front, split, address)
+                            } else { (*front).regs[index] }
                         },
                         |address, value, fifo, ram| {
                             if address >= MACRO_REGISTERS_START { return false; }
                             unsafe { Self::front_write(&mut *front, engine, split, address, value, true, true); }
+                            // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED
+                            // (into the load FIFO).
                             if address == 0x157 || address == 0x158 {
-                                unsafe { Self::front_dma_read(&*front, split, address, value, fifo, ram); }
+                                unsafe { Self::front_dma_read(&mut *front, split, address, value, fifo, ram); }
                             }
                             true
                         },
@@ -2742,6 +2852,7 @@ impl Maxwell3D {
                     }
                     Err(payload) => std::panic::resume_unwind(payload),
                     _ => {}
+                }
                 }
             }
             fs.parameters.clear();
@@ -2767,32 +2878,403 @@ impl Maxwell3D {
         }
     }
 
-    /// FIFO and RAM are leased to Execute; use its callback arguments instead
-    /// of borrowing the stored FIFO or relocking the same channel RAM.
-    fn front_dma_read(fs: &FrontState, split: &crate::gpu_split::GpuSplitFrontend,
+    /// Port of FrontRunOnBack. A macro whose code reads memory into its FIFO
+    /// (MME_DMA_READ_FIFOED) and writes only registers back_writable allows
+    /// runs on the back, at its point of the method stream: it reads the words
+    /// as a drained front would, and the front goes on without waiting for
+    /// the work queued before it. The registers it can write (and, in a
+    /// tracked shadow RAM mode, their entries) are the back's until the front
+    /// writes them (front_take_over) or needs them (front_register). Returns
+    /// whether the call went to the back.
+    ///
+    /// Rust reads the macro code and its generation under the shared context
+    /// lock, never held while waiting for the back.
+    fn front_run_on_back(fs: &mut FrontState, split: &crate::gpu_split::GpuSplitFrontend,
+        start: u32) -> bool
+    {
+        use std::sync::atomic::Ordering;
+        if fs.parameters.len() > 0x1000 {
+            return false;
+        }
+        let (generation, code_words) = {
+            let guard = fs.macro_owner.lock();
+            let context = guard.borrow();
+            (context.engine.native_code_generation, context.engine.native_code.len())
+        };
+        if fs.back_generation != generation {
+            // The macros sent before run the code they were sent with, and
+            // check their records.
+            Self::wait_for_back_macros(split, fs.back_last);
+            if fs.back_escapes.load(Ordering::Relaxed) != fs.back_escapes_seen {
+                Self::front_take_escapes(fs, split);
+            }
+            fs.back_macros.clear();
+            fs.back_macros.resize_with(code_words / 3, || None);
+            fs.back_generation = generation;
+            fs.back_code_copied = false;
+        } else if fs.back_escapes.load(Ordering::Relaxed) != fs.back_escapes_seen {
+            Self::front_take_escapes(fs, split);
+        }
+        let start_index = start as usize;
+        if start_index >= fs.back_macros.len() {
+            return false;
+        }
+        if fs.back_macros[start_index].is_none() {
+            let effects = {
+                let guard = fs.macro_owner.lock();
+                let context = guard.borrow();
+                crate::macro_turing::TuringMacroInterpreter::analyze_effects(
+                    &context.engine.native_code, start)
+            };
+            let methods = &effects.methods;
+            let mut known = BackMacro {
+                start,
+                back: false,
+                writes: Vec::new(),
+                write_set: Arc::new([false; NUM_REGS]),
+                escaped: std::sync::atomic::AtomicBool::new(false),
+            };
+            let fifo_read = methods.binary_search(&0x158).is_ok();
+            if fifo_read || methods.binary_search(&0x157).is_ok() {
+                let reason = if fs.back_demoted.contains(&start) {
+                    "it wrote another register on the back before".to_string()
+                } else if !effects.methods_known {
+                    "it computes the method of a write".to_string()
+                } else if effects.data_ram {
+                    "it uses the data RAM".to_string()
+                } else if let Some(method) = methods.iter().find(|&&m| !Self::back_writable(fs, m)) {
+                    format!("it writes {method:#x}")
+                } else {
+                    String::new()
+                };
+                known.back = reason.is_empty() && fifo_read;
+                if known.back {
+                    known.writes = methods.clone();
+                    let mut write_set = [false; NUM_REGS];
+                    for &written in methods {
+                        write_set[written as usize] = true;
+                    }
+                    known.write_set = Arc::new(write_set);
+                }
+                static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if LOGGED.load(Ordering::Relaxed) < 32 {
+                    LOGGED.fetch_add(1, Ordering::Relaxed);
+                    log::info!("Split macro at {start:#x} reads memory and runs on the {}: {}",
+                        if known.back { "back" } else { "front" },
+                        if known.back {
+                            format!("writes {}", methods.iter().map(|m| format!("{m:#x}"))
+                                .collect::<Vec<_>>().join(","))
+                        } else { reason });
+                }
+            }
+            fs.back_macros[start_index] = Some(Box::new(known));
+        }
+        if !fs.back_macros[start_index].as_ref().unwrap().back {
+            return false;
+        }
+        let back = fs.back_engine.get_or_insert_with(|| {
+            let mut engine = MacroEngine::new(true);
+            engine.native_turing = true;
+            Box::new(engine)
+        });
+        if !fs.back_code_copied {
+            // Nothing sent with the old code is left to run (waited for above).
+            let guard = fs.macro_owner.lock();
+            let context = guard.borrow();
+            back.native_code = context.engine.native_code;
+            back.native_code_generation = context.engine.native_code_generation;
+            fs.back_code_copied = true;
+        }
+        let known = fs.back_macros[start_index].as_deref().unwrap();
+        let call = BackCall {
+            maxwell: fs.back.0,
+            engine: &mut **back,
+            record: known,
+            escapes: &*fs.back_escapes,
+        };
+        split.defer_words(move |parameters: &[u32]| {
+            // As ProcessMacro calls a macro, with the back's engine.
+            let call = call;
+            // SAFETY: see BackCall; the back owns the engine and Maxwell3D.
+            unsafe {
+                let maxwell = &mut *call.maxwell;
+                maxwell.consume_sink();
+                let record = &*call.record;
+                (*call.engine).split_writes = Some(record.write_set.clone());
+                let unexpected = (*call.engine).split_unexpected_writes;
+                let mut parameters = parameters.to_vec();
+                MacroEngine::execute_native(call.engine, call.maxwell, record.start,
+                    &mut parameters, |_: &mut [u32]| {});
+                if (*call.engine).split_unexpected_writes != unexpected {
+                    record.escaped.store(true, Ordering::Relaxed);
+                    (*call.escapes).fetch_add(1, Ordering::Release);
+                }
+            }
+        }, &fs.parameters);
+        let position = split.position();
+        fs.back_last = position;
+        let tracked = matches!(ShadowRamControl::from_raw(fs.control),
+            ShadowRamControl::Track | ShadowRamControl::TrackWithFilter);
+        let known = fs.back_macros[start_index].as_deref().unwrap();
+        for &written in &known.writes {
+            let written = written as usize;
+            fs.back_regs[written] = position;
+            if tracked {
+                fs.back_shadow[written] = position;
+            }
+            fs.back_owned[written] = true;
+        }
+        true
+    }
+
+    /// The take_escapes step of FrontRunOnBack: a macro the back ran wrote
+    /// another register, so the front's copies may be stale anywhere. It runs
+    /// on the front from now on, and the front takes the back's registers
+    /// (FrontVerify).
+    fn front_take_escapes(fs: &mut FrontState, split: &crate::gpu_split::GpuSplitFrontend) {
+        use std::sync::atomic::Ordering;
+        fs.back_escapes_seen = fs.back_escapes.load(Ordering::Acquire);
+        for record in fs.back_macros.iter_mut().flatten() {
+            if record.back && record.escaped.load(Ordering::Relaxed) {
+                record.back = false;
+                fs.back_demoted.push(record.start);
+                log::error!("Split back macro at {:#x} wrote outside the registers its code \
+                    can write; it runs on the front from now on", record.start);
+            }
+        }
+        Self::front_verify(fs, split);
+    }
+
+    /// Port of the anonymous-namespace BackWritable: whether a macro the
+    /// split's back runs may write `method` (front_run_on_back): the front
+    /// then only loses track of the register's value. Not the methods with
+    /// effects the front tracks (macro code and bindings, the shadow RAM mode,
+    /// draws, constant buffer data, reports, uploads, syncpoints), nor the
+    /// registers it reads to note their memory writes, nor registers the back
+    /// changes itself, nor MME_DMA_READ, whose words land in the front's data
+    /// RAM. ruzu has no root tables (RootTables::SelectMethod/LoadMethod),
+    /// which upstream lists as executable with effects on the back only.
+    fn back_writable(fs: &FrontState, method: u32) -> bool {
+        let const_buffer = CB_CONFIG_BASE;
+        let report = REPORT_SEMAPHORE_BASE;
+        let upload = UPLOAD_REGS_BASE as u32;
+        let upload_end = LAUNCH_DMA;
+        if method.wrapping_sub(const_buffer) < 4 || method.wrapping_sub(report) < 4
+            || method.wrapping_sub(upload) < upload_end - upload
+        {
+            return false;
+        }
+        match method {
+            LOAD_MME_START_ADDR_PTR // Advanced by load_mme.start_address
+            | SHADOW_SCRATCH_BASE   // Set by falcon[4]
+            | LOGIC_OP              // logic_op.enable: cleared by draws on AMD
+            | 0x157 => false,
+            WAIT_FOR_IDLE | CB_BIND_TRIGGER_0 | CB_BIND_TRIGGER_1 | CB_BIND_TRIGGER_2
+            | CB_BIND_TRIGGER_3 | CB_BIND_TRIGGER_4 | RENDER_ENABLE_MODE | CLEAR_REPORT_VALUE
+            | FRAGMENT_BARRIER | INVALIDATE_TEXTURE_DATA_CACHE
+            | TILED_CACHE_BARRIER => true, // Executable, with effects on the back only
+            _ => method < MACRO_REGISTERS_START && !fs.execution_mask[method as usize],
+        }
+    }
+
+    /// Port of WaitForBackMacros: split.WaitUntil for a macro the back runs in
+    /// the front's place. Upstream's async read-back profile counter
+    /// (AsyncReadback::CountBackWait) has no ruzu counterpart.
+    fn wait_for_back_macros(split: &crate::gpu_split::GpuSplitFrontend, position: u64) -> bool {
+        split.wait_until(position)
+    }
+
+    /// Port of FrontRegister. A register as the back holds it once it ran
+    /// what the front sent: the front's copy, or the back's once it ran the
+    /// last macro there that can write it. No entry sent after that macro
+    /// writes the register (a front write takes it over first, a later macro
+    /// there would be the one waited for), so the back's value stays until the
+    /// front writes the register again.
+    fn front_register(fs: &mut FrontState, split: &crate::gpu_split::GpuSplitFrontend,
+        method: u32) -> u32
+    {
+        let index = method as usize;
+        if fs.back_regs[index] != 0 {
+            Self::wait_for_back_macros(split, fs.back_regs[index]);
+            // SAFETY: see BackArrays; the back ran the last writer.
+            fs.regs[index] = unsafe { fs.back_arrays.regs.add(index).read_volatile() };
+            fs.back_regs[index] = 0;
+            fs.back_owned[index] = fs.back_shadow[index] != 0;
+        }
+        fs.regs[index]
+    }
+
+    /// Port of FrontTakeOver. Before the front writes `method`: the register,
+    /// and its shadow RAM entry unless the mode leaves that alone, are the
+    /// front's again; a replay takes the entry from the back first (as
+    /// FrontRegister). Returns whether the back may hold another value or
+    /// entry than the front's copies, so that the write must be sent even if
+    /// it seems to change nothing.
+    fn front_take_over(fs: &mut FrontState, split: &crate::gpu_split::GpuSplitFrontend,
+        method: u32) -> bool
+    {
+        let index = method as usize;
+        let control = ShadowRamControl::from_raw(fs.control);
+        let tracked = matches!(control, ShadowRamControl::Track | ShadowRamControl::TrackWithFilter);
+        if fs.back_shadow[index] != 0 && control == ShadowRamControl::Replay {
+            Self::wait_for_back_macros(split, fs.back_shadow[index]);
+            // SAFETY: see BackArrays; the back ran the last writer.
+            fs.shadow[index] = unsafe { fs.back_arrays.shadow.add(index).read_volatile() };
+            fs.back_shadow[index] = 0;
+        }
+        let differs = fs.back_regs[index] != 0 || (tracked && fs.back_shadow[index] != 0);
+        fs.back_regs[index] = 0;
+        if tracked {
+            fs.back_shadow[index] = 0;
+        }
+        fs.back_owned[index] = fs.back_shadow[index] != 0;
+        differs
+    }
+
+    /// Port of FrontNoteWrites: what the back can write to guest memory
+    /// running the entry just sent, `amount` words of `method`
+    /// (GpuSplit::Writes::Noted), for the macro DMA reads after it
+    /// (front_dma_read). The executable methods not named here change
+    /// registers and host state only: bindings, barriers, counter resets, the
+    /// WFI's host query copies, shadow RAM and macro code.
+    fn front_note_writes(fs: &FrontState, split: &crate::gpu_split::GpuSplitFrontend,
+        method: u32, amount: u32)
+    {
+        let address = |high: u32| -> u64 {
+            ((fs.regs[high as usize] as u64) << 32) | fs.regs[high as usize + 1] as u64
+        };
+        if fs.draw_pending {
+            // A draw, or one an instance loop deferred to this entry: where its
+            // shaders store, and what the caches download for it, only the
+            // back knows.
+            split.note_any_write();
+            return;
+        }
+        let Some(memory) = fs.memory_manager.as_ref() else {
+            split.note_any_write();
+            return;
+        };
+        if (CB_DATA_BASE..CB_DATA_END).contains(&method) {
+            // front_write and front_call_multi_method advanced the offset past
+            // these words already.
+            let bytes = amount.wrapping_mul(4);
+            let offset = fs.regs[CB_CONFIG_BASE as usize + 3].wrapping_sub(bytes);
+            split.note_write(memory, address(CB_CONFIG_BASE + 1).wrapping_add(offset as u64),
+                bytes as u64);
+            return;
+        }
+        match method {
+            REPORT_SEMAPHORE_QUERY => {
+                // CounterReport: the value and its timestamp, now or once the
+                // host result is in.
+                split.note_write(memory, address(REPORT_SEMAPHORE_BASE), 16);
+            }
+            INLINE_DATA => {
+                // Upload::State::ProcessData: lines of line_length_in bytes,
+                // pitch apart.
+                let upload = UPLOAD_REGS_BASE;
+                let launch = fs.regs[LAUNCH_DMA as usize];
+                let lines = fs.regs[upload + 1];
+                let length = fs.regs[upload];
+                if launch & 1 != 1 {
+                    split.note_any_write(); // Swizzled into the destination surface
+                } else if lines != 0 && length != 0 {
+                    split.note_write(memory, address(upload as u32 + 2),
+                        (fs.regs[upload + 4] as u64) * (lines as u64 - 1) + length as u64);
+                }
+            }
+            RENDER_ENABLE_MODE => {
+                // A condition read from memory (ProcessQueryCondition) flushes
+                // every cache over it (also under an override a macro the back
+                // ran may have set).
+                let override_method = RENDER_ENABLE_OVERRIDE as usize;
+                let mode = fs.regs[RENDER_ENABLE_MODE as usize];
+                // Override::UseRenderEnable = 0; Mode::Conditional = 2,
+                // IfEqual = 3, IfNotEqual = 4.
+                if (fs.back_regs[override_method] != 0 || fs.regs[override_method] == 0)
+                    && matches!(mode, 2..=4)
+                {
+                    split.note_any_write();
+                }
+            }
+            SYNC_INFO => {
+                // A syncpoint increment: macros read syncpoints through memory
+                // too (MemoryManager::Read).
+                split.note_any_write();
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the buffer cache holds GPU-written data over [source, source +
+    /// size) (MemoryManager::IsMemoryDirty with CacheType::BufferCache), asked
+    /// from the front while the back runs. Rust translates the range under
+    /// the MemoryManager lock and asks the rasterizer after releasing it: the
+    /// back takes that lock under the buffer cache's.
+    fn front_memory_dirty(memory: &Mutex<MemoryManager>, source: u64, size: u64) -> bool {
+        let mut ranges = Vec::new();
+        let rasterizer = {
+            let memory = memory.lock();
+            crate::gpu_split::for_each_device_range(&memory, source, size, |device, bytes| {
+                ranges.push((device, bytes));
+            });
+            memory.rasterizer_handle()
+        };
+        let Some(rasterizer) = rasterizer else { return false; };
+        // SAFETY: must_flush_region takes &self and the caches' own locks; it
+        // is called from guest threads in the same way.
+        let rasterizer = unsafe { &*rasterizer.as_ptr() };
+        ranges.into_iter().any(|(device, bytes)| {
+            rasterizer.must_flush_region(device, bytes, crate::cache_types::CacheType::BUFFER_CACHE)
+        })
+    }
+
+    /// Port of FrontDmaRead. FIFO and RAM are leased to Execute; use its
+    /// callback arguments instead of borrowing the stored FIFO or relocking
+    /// the same channel RAM.
+    fn front_dma_read(fs: &mut FrontState, split: &crate::gpu_split::GpuSplitFrontend,
         method: u32, count: u32, fifo: &mut Vec<u32>, ram: &mut crate::macro_turing::DataRam)
     {
-        split.drain();
-        let source = ((fs.regs[0x154] as u64 & 0x1ffffff) << 32) | fs.regs[0x155] as u64;
-        let ram_offset = fs.regs[0x156];
+        let source = ((Self::front_register(fs, split, 0x154) as u64 & 0x1ffffff) << 32)
+            | Self::front_register(fs, split, 0x155) as u64;
+        let ram_offset = Self::front_register(fs, split, 0x156);
         let words = count.min(0x1000);
         let read_bytes = words as u64 * 4;
         if crate::nx2_profile::enabled() {
             crate::nx2_profile::add(crate::nx2_profile::Counter::DmaReadBytes, read_bytes);
         }
-        let memory_handle = fs.memory_manager.as_ref()
+        let memory = fs.memory_manager.clone()
             .expect("Maxwell3D requires its upstream MemoryManager owner");
-        let mut memory = memory_handle.lock();
-        if memory.is_memory_dirty_with_cache_type(source, read_bytes, crate::cache_types::CacheType::BUFFER_CACHE) {
-            memory.flush_region_with_cache_type(source, read_bytes, crate::cache_types::CacheType::BUFFER_CACHE);
+        // Only the work still queued that can write the words has to run
+        // first (front_note_writes, GpuSplit::WaitForWrites). Past it no entry
+        // can make them GPU-written or add reports there, so the caches have
+        // nothing to write out unless they already hold it now.
+        split.wait_for_writes(&memory, source, read_bytes);
+        // Lichii FrontDmaRead (maxwell_3d.cpp:2242-2283): drained when the
+        // buffer cache holds GPU-written words or the query cache holds
+        // reports that can still land in them.
+        let drained = Self::front_memory_dirty(&memory, source, read_bytes)
+            || crate::query_dma::holds_reports(&memory, source, read_bytes);
+        if drained {
+            // Drains the split, and has the back write out what its caches
+            // hold of the words: data the GPU wrote (indirect draw arguments
+            // from a culling dispatch), reports the query cache holds until
+            // their fence or host result (else the read returns stale
+            // occlusion counts; Lichii 7ae3e74014).
+            split.drain();
+            if Self::front_memory_dirty(&memory, source, read_bytes) {
+                let flush_memory = memory.clone();
+                split.run(Box::new(move || {
+                    flush_memory.lock().flush_region_with_cache_type(source, read_bytes,
+                        crate::cache_types::CacheType::BUFFER_CACHE);
+                }));
+            }
+            let query_memory = memory.clone();
+            split.run(Box::new(move || {
+                crate::query_dma::flush_pending(&query_memory, source, read_bytes);
+            }));
         }
-        drop(memory);
-        // Lichii Maxwell3D::FrontDmaRead (maxwell_3d.cpp:2265-2270, from Lichii 7ae3e74014):
-        // after the buffer cache, write out the reports the query cache holds until their fence
-        // or host result, else the read returns stale occlusion counts. Lichii runs it on the
-        // split's back; here the front does it after the drain, as for the buffer cache flush.
-        crate::query_dma::flush_pending(memory_handle, source, read_bytes);
-        let memory = memory_handle.lock();
+        let memory = memory.lock();
         for i in 0..words {
             let word = memory.read::<u32>(source.wrapping_add(i as u64 * 4));
             if method == 0x158 { fifo.push(word); }
@@ -2819,6 +3301,19 @@ impl Maxwell3D {
                 back.shadow_state[method as usize]
             } else { value };
         }
+        // What macros the back ran may have written, the front takes over
+        // (front_run_on_back).
+        for i in 0..NUM_REGS {
+            if fs.back_regs[i] != 0 {
+                fs.regs[i] = expected[i];
+            }
+            if fs.back_shadow[i] != 0 {
+                fs.shadow[i] = back.shadow_state[i];
+            }
+        }
+        fs.back_regs.fill(0);
+        fs.back_shadow.fill(0);
+        fs.back_owned.fill(false);
         let control_index = SHADOW_RAM_CONTROL as usize;
         if (fs.control != control || fs.shadow[control_index] != back.shadow_state[control_index]
             || fs.regs[control_index] != expected[control_index])

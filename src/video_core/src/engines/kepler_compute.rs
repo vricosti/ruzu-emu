@@ -549,7 +549,7 @@ impl KeplerCompute {
         method: u32, argument: u32, is_last_call: bool, segment: Option<u64>,
     ) {
         if method as usize >= fs.registers.len() {
-            split.method(engine, method, argument, is_last_call, segment);
+            split.method(engine, method, argument, is_last_call, segment, crate::gpu_split::Writes::Anywhere);
             return;
         }
         if method >= 0xe00 {
@@ -567,7 +567,7 @@ impl KeplerCompute {
             return;
         }
         Self::front_apply(fs, method, argument);
-        split.method(engine, method, argument, is_last_call, segment);
+        split.method(engine, method, argument, is_last_call, segment, crate::gpu_split::Writes::Anywhere);
     }
 
     pub(crate) fn front_call_multi_method(
@@ -589,7 +589,7 @@ impl KeplerCompute {
                 Self::front_apply(fs, method, argument);
             }
         }
-        split.multi_method(engine, method, words, amount, methods_pending, segment);
+        split.multi_method(engine, method, words, amount, methods_pending, segment, crate::gpu_split::Writes::Anywhere);
     }
 
     fn front_run_macro(
@@ -646,7 +646,7 @@ impl KeplerCompute {
                     |address, value, _, _| {
                         if address >= 0xe00 { return false; }
                         unsafe { Self::front_apply(&mut *front, address, value); }
-                        split.macro_write(engine, address, value);
+                        split.macro_write(engine, address, value, crate::gpu_split::Writes::Anywhere);
                         true
                     },
                 )

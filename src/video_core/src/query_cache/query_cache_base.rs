@@ -130,6 +130,10 @@ pub struct QueryCacheBase {
     pub cached_queries: ContentCache,
     /// Mutex protecting `cached_queries`.
     pub cache_mutex: Mutex<()>,
+    /// Device pages this cache ever registered queries on (inner_invalidation
+    /// skips the rest). Lichii `QueryCacheBase::page_filter`
+    /// (query_cache_base.h:45-46).
+    pub page_filter: crate::page_filter::PageFilter,
     /// Inner shared owner state.
     ///
     /// Maps to upstream `QueryCacheBaseImpl`, which owns streamer mask/state,
@@ -144,6 +148,7 @@ impl QueryCacheBase {
             channel_caches: ChannelSetupCaches::new(),
             cached_queries: ContentCache::default(),
             cache_mutex: Mutex::new(()),
+            page_filter: crate::page_filter::PageFilter::new(),
             impl_: QueryCacheBaseImpl::new(),
         };
         this.refresh_owner_binding();
@@ -235,6 +240,12 @@ impl QueryCacheBase {
     /// `InvalidateQuery` sets the `IsInvalidated` flag before matching entries
     /// are removed from `cached_queries` by `IterateCache<true>`.
     pub fn invalidate_region(&mut self, addr: VAddr, size: usize) {
+        // Lichii (query_cache_base.h:64-71): compute inline writes come by the
+        // thousand a frame, mostly where no report ever was: pages never
+        // registered (page_filter) need no look under cache_mutex.
+        if !self.page_filter.any(addr, size as u64) {
+            return;
+        }
         let impl_ = &mut self.impl_;
         Self::iterate_cache::<true, _>(
             &self.cache_mutex,
@@ -264,6 +275,9 @@ impl QueryCacheBase {
     /// Lichii `QueryCacheBase::SemiFlushRegion` (query_cache_base.h:80-91; split out of
     /// `FlushRegion` by Lichii 7ae3e74014).
     pub fn semi_flush_region(&mut self, addr: VAddr, size: usize) -> bool {
+        if !self.page_filter.any(addr, size as u64) {
+            return false;
+        }
         let mut result = false;
         let impl_ = &mut self.impl_;
         Self::iterate_cache::<false, _>(
@@ -291,6 +305,10 @@ impl QueryCacheBase {
         size: usize,
         device_memory: &mut dyn DeviceMemoryWriter,
     ) -> bool {
+        // As semi_flush_region (Lichii query_cache_base.h:82).
+        if !self.page_filter.any(addr, size as u64) {
+            return false;
+        }
         let mut result = false;
         let impl_ = &self.impl_;
         Self::iterate_cache::<false, _>(
@@ -318,6 +336,8 @@ impl QueryCacheBase {
         let page = cpu_addr >> DEVICE_PAGEBITS;
         let offset = (cpu_addr & DEVICE_PAGEMASK) as u32;
         let _lock = self.cache_mutex.lock().unwrap();
+        // As Lichii CounterReport's indexing (query_cache.h:439).
+        self.page_filter.mark(cpu_addr, 16);
         let old_location = self
             .cached_queries
             .entry(page)
@@ -341,6 +361,41 @@ impl QueryCacheBase {
         mask
     }
 
+    /// Any thread: whether the cache holds a report that can still land in
+    /// `[addr, addr + size)`, written out by `semi_flush_region` or once its
+    /// host result comes in: one whose value and timestamp (16 bytes from its
+    /// address) reach into the range.
+    ///
+    /// Port of Lichii `QueryCacheBase::HoldsQueries`
+    /// (query_cache_base.h:101-128), absent from Eden. Like upstream it reads
+    /// `cached_queries` under `cache_mutex` only, which every writer of the map
+    /// holds; the split front calls it while the back owns the cache.
+    pub fn holds_queries(&self, addr: VAddr, size: usize) -> bool {
+        if size == 0 {
+            return false;
+        }
+        const REPORT_SIZE: u64 = 16;
+        let begin = addr.saturating_sub(REPORT_SIZE - 1);
+        let end = addr + size as u64;
+        if !self.page_filter.any(begin, end - begin) {
+            return false;
+        }
+        let _lock = self.cache_mutex.lock().unwrap();
+        for page in (begin >> DEVICE_PAGEBITS)..=((end - 1) >> DEVICE_PAGEBITS) {
+            let Some(contents) = self.cached_queries.get(&page) else {
+                continue;
+            };
+            let page_start = page << DEVICE_PAGEBITS;
+            for &offset in contents.keys() {
+                let query = page_start + offset as u64;
+                if query >= begin && query < end {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Return true when a CPU region has been modified from the GPU.
     ///
     /// Maps to C++ `QueryCacheBase::IsRegionGpuModified`:
@@ -354,6 +409,10 @@ impl QueryCacheBase {
     /// ```
     ///
     pub fn is_region_gpu_modified(&mut self, addr: VAddr, size: usize) -> bool {
+        // Lichii (query_cache_base.h:133-136).
+        if !self.page_filter.any(addr, size as u64) {
+            return false;
+        }
         let mut result = false;
         let impl_ = &self.impl_;
         Self::iterate_cache::<false, _>(
@@ -663,6 +722,8 @@ impl QueryCacheBase {
         let cont_addr = cpu_addr >> DEVICE_PAGEBITS;
         let base = (cpu_addr & DEVICE_PAGEMASK) as u32;
         let _lock = self.cache_mutex.lock().unwrap();
+        // Lichii CounterReport (query_cache.h:439).
+        self.page_filter.mark(cpu_addr, 16);
         let sub_container = self.cached_queries.entry(cont_addr).or_default();
         if let Some(old_location) = sub_container.get(&base).copied() {
             if let Some(old_query) = self.impl_.obtain_query_mut(old_location) {
@@ -1543,6 +1604,40 @@ mod tests {
         assert!(cache.should_wait_async_flushes());
         cache.pop_async_flushes();
         assert!(!cache.should_wait_async_flushes());
+    }
+
+    #[test]
+    fn cached_query_locations_mark_the_page_filter_and_invalidations_find_them() {
+        let mut cache = QueryCacheBase::new();
+        assert!(!cache.page_filter.any(0x4_5ff8, 0x10));
+        // A 16-byte report at the end of a page reaches into the next one.
+        cache.cache_query_location(0x4_5ff8, QueryLocation::new(1, 2));
+        assert!(cache.page_filter.any(0x4_5000, 0x1000));
+        assert!(cache.page_filter.any(0x4_6000, 4));
+        assert!(!cache.page_filter.any(0x4_7000, 0x1000));
+        // An invalidation of the report's page still reaches it.
+        cache.invalidate_region(0x4_5ff8, 4);
+        assert!(cache.cached_queries.values().all(|page| page.is_empty()));
+        // Nothing was registered there: nothing to find, without the lock.
+        assert!(!cache.semi_flush_region(0x8_0000, 0x1000));
+        assert!(!cache.is_region_gpu_modified(0x8_0000, 0x1000));
+    }
+
+    #[test]
+    fn holds_queries_finds_reports_reaching_into_the_range() {
+        // Lichii QueryCacheBase::HoldsQueries: a report is 16 bytes from its
+        // address, so one starting up to 15 bytes before the range counts.
+        let mut cache = QueryCacheBase::new();
+        assert!(!cache.holds_queries(0x4_5ff8, 0x10));
+        cache.cache_query_location(0x4_5ff8, QueryLocation::new(1, 2));
+        assert!(cache.holds_queries(0x4_5ff8, 4));
+        assert!(cache.holds_queries(0x4_6000, 4)); // the report's timestamp half
+        assert!(cache.holds_queries(0x4_6007, 1)); // its last byte
+        assert!(!cache.holds_queries(0x4_6008, 0x100)); // past the report
+        assert!(!cache.holds_queries(0x4_5000, 0xff8)); // before it
+        assert!(!cache.holds_queries(0x4_5ff8, 0)); // an empty range
+        cache.invalidate_region(0x4_5ff8, 4);
+        assert!(!cache.holds_queries(0x4_5ff8, 0x10));
     }
 
     #[test]

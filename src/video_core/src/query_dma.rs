@@ -1,9 +1,8 @@
 //! Port of Lichii `video_core/query_dma.h` (absent from Eden): macro DMA reads of memory the
 //! query cache still holds reports for.
 //!
-//! Only `FlushPending` is ported. `HasPendingQueries`, `HoldsReports`, `Trace` and
-//! `TraceEnabled` are diagnostics (the `EDEN_NX2_QUERY_DMA_TRACE` log) or serve paths ruzu does
-//! not have.
+//! `FlushPending` and `HoldsReports` are ported. `HasPendingQueries`, `Trace` and
+//! `TraceEnabled` are diagnostics (the `EDEN_NX2_QUERY_DMA_TRACE` log).
 
 use parking_lot::Mutex;
 
@@ -49,6 +48,27 @@ pub fn flush_pending(memory: &Mutex<MemoryManager>, source: u64, size: u64) {
         // through it, as for the memory manager's own rasterizer calls.
         unsafe { rasterizer.with_mut(|rasterizer| rasterizer.flush_query_results(device, length)) };
     }
+}
+
+/// Whether the query cache holds reports that can still land in `[source, source + size)`: a
+/// read sees them only once `flush_pending` wrote them out. Any thread
+/// (`RasterizerInterface::holds_queries`); the split front asks it while the back runs.
+///
+/// Lichii `QueryDma::HoldsReports` (query_dma.h:45-61). The range is translated under the
+/// memory manager's lock and the rasterizer asked after releasing it, as for
+/// `Maxwell3D::front_memory_dirty`: the back takes that lock under its caches' locks.
+pub fn holds_reports(memory: &Mutex<MemoryManager>, source: u64, size: u64) -> bool {
+    let (rasterizer, pages) = {
+        let memory = memory.lock();
+        let Some(rasterizer) = memory.rasterizer_handle() else {
+            return false;
+        };
+        (rasterizer, device_pages(source, size, |address| memory.gpu_to_cpu_address(address)))
+    };
+    // SAFETY: holds_queries takes &self and only the query cache's own locks; the rasterizer
+    // bound to the memory manager outlives the engines that read through it.
+    let rasterizer = unsafe { &*rasterizer.as_ptr() };
+    pages.into_iter().any(|(device, length)| rasterizer.holds_queries(device, length))
 }
 
 #[cfg(test)]

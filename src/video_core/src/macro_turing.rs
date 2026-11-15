@@ -461,6 +461,304 @@ impl TuringMacroInterpreter {
             error,
         }
     }
+
+    /// Port of TuringMacroInterpreter::AnalyzeEffects (Lichii macro_turing.h,
+    /// absent from Eden): what a call from `start` can do on any path through
+    /// the code (each branch either way, each loop any number of times), as
+    /// Execute runs it. Upstream's `Value{known, value}` (unknown always
+    /// `{false, 0}`) is an `Option<Word>`.
+    pub fn analyze_effects(code: &[Word], start: Word) -> Effects {
+        // The values the code fixes, before an instruction runs: registers,
+        // carry, the method and its increment.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        struct State {
+            regs: [Option<Word>; 24],
+            carry: Option<Word>,
+            method: Option<Word>,
+            increment: Option<Word>,
+        }
+        // Where an instruction may continue: unchanged, at `pc` (a taken
+        // branch also sets whether it cancels an END), or nowhere (a branch
+        // that stops the call).
+        #[derive(Clone, Copy, Default)]
+        enum Flow {
+            #[default]
+            Next,
+            Jump(Word),
+            Branch(Word, bool),
+            Stop,
+        }
+        let count = (code.len() / 3) as Word;
+        let mut effects = Effects { methods: Vec::new(), methods_known: true, data_ram: false,
+            instructions: Vec::new() };
+        // By instruction, and whether an END before it makes it the call's
+        // last (pc * 2 + 1).
+        let mut states: std::collections::HashMap<Word, State> = std::collections::HashMap::new();
+        // By a loop's last instruction: where its loops start over.
+        let mut loop_starts: std::collections::HashMap<Word, Vec<Word>> =
+            std::collections::HashMap::new();
+        let mut work: Vec<Word> = Vec::new();
+        let reach = |states: &mut std::collections::HashMap<Word, State>, work: &mut Vec<Word>,
+                     pc: Word, last: bool, state: &State| {
+            if pc >= count {
+                return; // The call fails there
+            }
+            let index = pc * 2 + u32::from(last);
+            match states.entry(index) {
+                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(*state); }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let mut joined = *entry.get();
+                    let join = |to: &mut Option<Word>, from: Option<Word>| {
+                        if *to != from { *to = None; }
+                    };
+                    for i in 0..joined.regs.len() { join(&mut joined.regs[i], state.regs[i]); }
+                    join(&mut joined.carry, state.carry);
+                    join(&mut joined.method, state.method);
+                    join(&mut joined.increment, state.increment);
+                    if joined == *entry.get() { return; }
+                    *entry.get_mut() = joined;
+                }
+            }
+            work.push(index);
+        };
+        // Reading a register before writing it fails the call.
+        let entry = State { regs: [None; 24], carry: Some(0), method: Some(0), increment: Some(0) };
+        reach(&mut states, &mut work, start, false, &entry);
+        while let Some(index) = work.pop() {
+            let pc = index / 2;
+            let last = index & 1 != 0;
+            let before = states[&index];
+            let base = pc as usize * 3;
+            let d = Self::decode([code[base + 2], code[base + 1], code[base]]);
+            let get = |state: &State, reg: Word, lane: usize| -> Option<Word> {
+                if reg < 24 { return state.regs[reg as usize]; }
+                match reg {
+                    24 => Some(0),
+                    25 => Some(d.imm[lane] as i16 as i32 as Word),
+                    26 => Some(d.imm[1 - lane] as i16 as i32 as Word),
+                    27 => Some((d.imm[0] << 16) | d.imm[1]),
+                    _ => None, // FIFO loads
+                }
+            };
+            // The lanes and outputs the predicate enables, both sets if its
+            // register is unknown.
+            let mut masks = [15, 15];
+            let mut mask_count = 1;
+            if d.pred_mode != 0 {
+                let predicate = get(&before, d.pred_reg, 0);
+                masks = [d.mask_true, d.mask_false];
+                match predicate {
+                    Some(value) => masks[0] = if value != 0 { d.mask_true } else { d.mask_false },
+                    None => mask_count = 2,
+                }
+            }
+            for &mask in &masks[..mask_count] {
+                let mut state = before;
+                let (mut xs, mut ys) = ([None; 2], [None; 2]);
+                for lane in 0..2 {
+                    if mask & (1 << lane) != 0 {
+                        xs[lane] = get(&before, d.src_a[lane], lane);
+                        ys[lane] = get(&before, d.src_b[lane], lane);
+                    }
+                }
+                let mut alu = [Some(0); 2];
+                let mut flows = [[Flow::Next; 2]; 2];
+                let mut flow_counts = [1usize; 2]; // Flow::Next by default
+                for lane in 0..2 {
+                    if mask & (1 << lane) == 0 { continue; }
+                    let (x, y) = (xs[lane], ys[lane]);
+                    let both = x.is_some() && y.is_some();
+                    let (a, b, imm) = (x.unwrap_or(0), y.unwrap_or(0), d.imm[lane]);
+                    let taken = |op: Word| match op {
+                        17 | 25 => (a as i32) < (b as i32),
+                        18 | 26 => a < b,
+                        19 | 27 => (a as i32) <= (b as i32),
+                        20 | 28 => a <= b,
+                        _ => a == b,
+                    };
+                    let both_value = |value: Word| if both { Some(value) } else { None };
+                    let flow = &mut flows[lane];
+                    let flow_count = &mut flow_counts[lane];
+                    let mut value = Some(0);
+                    match d.op[lane] {
+                        0 | 2 => {
+                            let result = if d.op[lane] == 0 { a.wrapping_add(b) } else { a.wrapping_sub(b) };
+                            value = both_value(result);
+                            let carry = if d.op[lane] == 0 { result < a } else { result > a };
+                            state.carry = both_value(Word::from(carry));
+                        }
+                        1 | 3 => {
+                            value = match (both, state.carry) {
+                                (true, Some(carry)) => Some(if d.op[lane] == 1 {
+                                    a.wrapping_add(b).wrapping_add(carry)
+                                } else {
+                                    a.wrapping_sub(b).wrapping_sub(carry)
+                                }),
+                                _ => None,
+                            };
+                        }
+                        4 | 6 => {
+                            let product = if d.op[lane] == 4 {
+                                (a as i32 as i64 as u64).wrapping_mul(b as i32 as i64 as u64)
+                            } else {
+                                u64::from(a) * u64::from(b)
+                            };
+                            value = both_value(product as Word);
+                            state.carry = both_value((product >> 32) as Word);
+                        }
+                        5 => value = state.carry,
+                        8 => value = x.map(|a| a.leading_zeros()),
+                        9 => value = both_value(a << (b & 31)),
+                        10 => value = both_value(a >> (b & 31)),
+                        11 => value = both_value(((a as i32) >> (b & 31)) as Word),
+                        12 => value = both_value(a & b),
+                        13 => value = both_value(!(a & b)),
+                        14 => value = both_value(a | b),
+                        15 => value = both_value(a ^ b),
+                        16 => {
+                            let dest = (imm >> 10) & 63;
+                            let bits = (imm >> 5) & 31;
+                            let bits_mask = (1u32 << bits).wrapping_sub(1);
+                            value = if both && dest < 32 {
+                                Some((a & !(bits_mask << dest))
+                                    | (((b >> (imm & 31)) & bits_mask) << dest))
+                            } else {
+                                None
+                            };
+                        }
+                        17..=21 => value = both_value(if taken(d.op[lane]) { !0 } else { 0 }),
+                        22 => value = None, // A register
+                        23 => {
+                            if imm >= 2 {
+                                // Entered, or skipped with a count of 0. Its last
+                                // instruction may start it over: reached already,
+                                // that instruction now continues here too.
+                                let end = pc.wrapping_add(imm).wrapping_sub(1);
+                                if end < count {
+                                    let starts = loop_starts.entry(end).or_default();
+                                    if !starts.contains(&(pc + 1)) {
+                                        starts.push(pc + 1);
+                                        for end_index in [end * 2, end * 2 + 1] {
+                                            if states.contains_key(&end_index) {
+                                                work.push(end_index);
+                                            }
+                                        }
+                                    }
+                                }
+                                *flow_count = 0;
+                                if x.is_none() || a != 0 {
+                                    flow[*flow_count] = Flow::Next;
+                                    *flow_count += 1;
+                                }
+                                if x.is_none() || a == 0 {
+                                    flow[*flow_count] = Flow::Jump(pc.wrapping_add(imm));
+                                    *flow_count += 1;
+                                }
+                            }
+                        }
+                        24 => flow[0] = Flow::Jump(pc.wrapping_add(imm & 0x7fff)),
+                        25..=29 => {
+                            let offset = ((imm << 19) as i32) >> 19;
+                            let target = (pc as i32).wrapping_add(offset) as Word;
+                            let jumps = taken(d.op[lane]) == (imm & 0x8000 != 0);
+                            *flow_count = 0;
+                            if !both || jumps {
+                                let cancel_end = imm & 0x4000 != 0;
+                                flow[*flow_count] = if offset == -4096 {
+                                    Flow::Stop
+                                } else {
+                                    Flow::Branch(target, cancel_end)
+                                };
+                                *flow_count += 1;
+                            }
+                            if !both || !jumps {
+                                flow[*flow_count] = Flow::Next;
+                                *flow_count += 1;
+                            }
+                        }
+                        30 => { effects.data_ram = true; value = None; }
+                        31 => effects.data_ram = true,
+                        _ => {} // 7: the load barrier
+                    }
+                    alu[lane] = value;
+                    if d.dst[lane] < 24 { state.regs[d.dst[lane] as usize] = value; }
+                }
+                let output = |selector: Word| -> Option<Word> {
+                    match selector {
+                        1 => alu[0],
+                        2 => alu[1],
+                        5 => Some(d.imm[0]),
+                        6 => Some(d.imm[1]),
+                        8 => Some(d.imm[0] >> 12),
+                        9 => Some(d.imm[1] >> 12),
+                        10 => Some((d.imm[0] << 16) | d.imm[1]),
+                        _ => None, // FIFO loads (the rest fail the call)
+                    }
+                };
+                for lane in 0..2 {
+                    if mask & (4 << lane) == 0 { continue; }
+                    if d.out_method[lane] != 0 {
+                        let address = output(d.out_method[lane]);
+                        state.method = address.map(|address| address & 0xfff);
+                        state.increment = address.map(|address| (address >> 12) & 15);
+                    }
+                    if d.out_emit[lane] != 0 {
+                        match state.method {
+                            Some(method) => effects.methods.push(method),
+                            None => effects.methods_known = false,
+                        }
+                        state.method = match (state.method, state.increment) {
+                            (Some(method), Some(increment)) => Some(method.wrapping_add(increment)),
+                            _ => None,
+                        };
+                    }
+                }
+                if last { continue; } // An END before this instruction ends the call after it
+                // Lane 1's control flow overrides lane 0's; a loop's last
+                // instruction may also start it over.
+                let repeats = loop_starts.get(&pc).cloned().unwrap_or_default();
+                for i in 0..flow_counts[0] {
+                    for j in 0..flow_counts[1] {
+                        let mut next = pc + 1;
+                        let (mut cancel_end, mut stopped) = (false, false);
+                        for flow in [flows[0][i], flows[1][j]] {
+                            match flow {
+                                Flow::Jump(pc) => next = pc,
+                                Flow::Branch(pc, cancel) => { next = pc; cancel_end = cancel; }
+                                Flow::Stop => stopped = true,
+                                Flow::Next => {}
+                            }
+                        }
+                        if stopped { continue; }
+                        let end_next = d.end && !cancel_end;
+                        reach(&mut states, &mut work, next, end_next, &state);
+                        for &repeat in &repeats {
+                            reach(&mut states, &mut work, repeat, end_next, &state);
+                        }
+                    }
+                }
+            }
+        }
+        effects.methods.sort_unstable();
+        effects.methods.dedup();
+        effects.instructions = states.keys().map(|index| index / 2).collect();
+        effects.instructions.sort_unstable();
+        effects.instructions.dedup();
+        effects
+    }
+}
+
+/// Port of TuringMacroInterpreter::Effects (Lichii macro_turing.h).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Effects {
+    /// The methods a call can write, ascending, each once.
+    pub methods: Vec<Word>,
+    /// Whether each written method is a constant of the code.
+    pub methods_known: bool,
+    /// Whether a call can use the data RAM.
+    pub data_ram: bool,
+    /// The PCs a call can run, ascending.
+    pub instructions: Vec<Word>,
 }
 
 #[cfg(test)]
@@ -543,6 +841,53 @@ mod tests {
         assert_eq!((result.pc, result.consumed), (1, 0));
         assert_eq!(writes, [7, 42]);
         assert_eq!(interpreter.decoded[1].imm[0], 42);
+    }
+
+    // Lichii TuringMacroInterpreter::AnalyzeEffects (macro_turing.h:267-523).
+    #[test]
+    fn analyze_effects_lists_constant_methods_on_every_path_as_execute_writes_them() {
+        // 0: method 0x1154 (0x154, increment 1), emit imm1 on both lanes.
+        // 1: branch if a FIFO word (unknown) is 0: to 3, else on to 2.
+        // 2: method 0x100 emit; 3: method 0x200 emit, END; 4: delay slot.
+        let code = [
+            instruction(&[(30, 16, 0x1154), (82, 3, 5), (66, 16, 9), (85, 4, 6), (92, 4, 6)]),
+            instruction(&[(10, 5, 29), (20, 5, 28), (30, 16, 2 | 0x8000)]),
+            instruction(&[(30, 16, 0x100), (82, 3, 5), (85, 4, 6)]),
+            instruction(&[(0, 1, 1), (30, 16, 0x200), (82, 3, 5), (85, 4, 6)]),
+            instruction(&[]),
+        ];
+        let effects = TuringMacroInterpreter::analyze_effects(&code.concat(), 0);
+        assert_eq!(effects.methods, [0x100, 0x154, 0x155, 0x200]);
+        assert!(effects.methods_known);
+        assert!(!effects.data_ram);
+        assert_eq!(effects.instructions, [0, 1, 2, 3, 4]);
+        // Each path Execute takes writes only methods the analysis lists.
+        for fifo in [0u32, 1] {
+            let (result, writes) = run(&code, vec![fifo]);
+            assert!(result.success, "{}", result.error);
+            assert!(writes.iter().all(|(method, _)| effects.methods.binary_search(method).is_ok()));
+            assert_eq!(writes.last().unwrap().0, 0x200);
+        }
+    }
+
+    #[test]
+    fn analyze_effects_reports_computed_methods_and_data_ram_use() {
+        // The method comes from the FIFO (ADD load0 + 0 into alu0).
+        let computed = [
+            instruction(&[(0, 1, 1), (20, 5, 28), (82, 3, 1), (85, 4, 6)]),
+            instruction(&[]),
+        ];
+        let effects = TuringMacroInterpreter::analyze_effects(&computed.concat(), 0);
+        assert!(!effects.methods_known);
+        assert!(effects.methods.is_empty());
+        // Lane 0 writes the data RAM (op 31).
+        let ram = [instruction(&[(0, 1, 1), (10, 5, 31)]), instruction(&[])];
+        let effects = TuringMacroInterpreter::analyze_effects(&ram.concat(), 0);
+        assert!(effects.data_ram);
+        assert!(effects.methods_known);
+        // A start past the code reaches nothing.
+        let effects = TuringMacroInterpreter::analyze_effects(&ram.concat(), 7);
+        assert!(effects.instructions.is_empty() && effects.methods.is_empty());
     }
 
     #[test]

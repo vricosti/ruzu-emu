@@ -2851,6 +2851,13 @@ pub struct MacroEngine {
         Option<std::sync::Arc<std::sync::Mutex<crate::macro_turing_jit::TuringMacroJit>>>,
     pub(crate) native_writes: crate::macro_memo::MacroMemoPairs,
     pub(crate) native_calls: u64,
+    /// Set while the split GPU thread's back runs a call in its front's place
+    /// (Maxwell3D::front_run_on_back): the 3D registers the call can write.
+    /// Such a call uses no data RAM; its writes to other registers are counted
+    /// in split_unexpected_writes. Upstream holds a `const std::bitset<0xe00>*`
+    /// into the call's record; Rust shares the record's set (Arc keeps this Send).
+    pub(crate) split_writes: Option<std::sync::Arc<[bool; crate::engines::maxwell_3d::NUM_REGS]>>,
+    pub(crate) split_unexpected_writes: u64,
 }
 
 /// Port of `NativeMacroContext` in macro.h. Channels share code and binding
@@ -2962,14 +2969,24 @@ impl MacroEngine {
         // is replaced only when it names other storage, and the lock is taken
         // through the allocation, which Maxwell3D owns for its whole lifetime
         // (native_data_ram is never reassigned), so no refcount traffic per call.
-        let ram_handle = (&*maxwell).get_native_data_ram();
-        if !(*engine).native_interpreter.active_dram.as_ref()
-            .is_some_and(|active| std::sync::Arc::ptr_eq(active, ram_handle))
-        {
-            (*engine).native_interpreter.active_dram = Some(ram_handle.clone());
+        // The channel's data RAM is the split's front's while it runs macros
+        // (split_writes): a call the back runs in the front's place uses the
+        // interpreter's own RAM (upstream `active_dram = &native_interpreter.dram`).
+        // Its record (split_writes) is shared for the whole call.
+        let split_writes = (*engine).split_writes.clone();
+        let mut ram_guard = None;
+        if split_writes.is_some() {
+            (*engine).native_interpreter.active_dram = None;
+        } else {
+            let ram_handle = (&*maxwell).get_native_data_ram();
+            if !(*engine).native_interpreter.active_dram.as_ref()
+                .is_some_and(|active| std::sync::Arc::ptr_eq(active, ram_handle))
+            {
+                (*engine).native_interpreter.active_dram = Some(ram_handle.clone());
+            }
+            let ram_handle = std::sync::Arc::as_ptr(ram_handle);
+            ram_guard = Some((*ram_handle).lock());
         }
-        let ram_handle = std::sync::Arc::as_ptr(ram_handle);
-        let mut ram = (*ram_handle).lock();
         // Upstream's JIT only uses active_dram, not the interpreter's own RAM.
         // Lease the interpreter only on the fallback path: taking it eagerly
         // copies and zeroes its 12 KiB RAM on every native JIT macro call.
@@ -3001,6 +3018,11 @@ impl MacroEngine {
         }
         let mut emit = |address: u32, value: u32, fifo: &mut Vec<u32>, ram: &mut DataRam| -> bool {
             if address >= 0xe00 { return false; }
+            if let Some(split_writes) = &split_writes {
+                if !split_writes[address as usize] {
+                    unsafe { (*engine).split_unexpected_writes += 1; }
+                }
+            }
             if address == 0x674 && trace_clear && CLEAR_CALLS.fetch_add(1, Ordering::Relaxed) < 128 {
                 log::info!("Clear macro probe: start={method:#x} value={value:#x} parameters={trace_parameters:08x?}");
             }
@@ -3101,7 +3123,11 @@ impl MacroEngine {
                         return;
                     }
                     fifo.clear(); fifo.extend_from_slice(parameters);
-                    let result = jit.execute(method, &mut fifo, &mut ram, read, &mut emit);
+                    let ram = match ram_guard.as_deref_mut() {
+                        Some(ram) => ram,
+                        None => &mut *std::ptr::addr_of_mut!((*engine).native_interpreter.dram),
+                    };
+                    let result = jit.execute(method, &mut fifo, ram, read, &mut emit);
                     if !result.success {
                         (*engine).native_execution_failed = true;
                         log::error!("Native MME (JIT) failed: start={method:#x}, consumed={}/{}, error={}", result.consumed, parameters.len(), result.error);
@@ -3110,6 +3136,14 @@ impl MacroEngine {
                 }
             }
             let interpreter = interpreter.insert(std::mem::take(&mut (*engine).native_interpreter));
+            // A split back call reads and writes the leased interpreter's own
+            // RAM: through this pointer only while the interpreter itself is
+            // not borrowed, and by the interpreter itself (None) while it runs.
+            let ram: *mut DataRam = match ram_guard.as_deref_mut() {
+                Some(ram) => ram,
+                None => std::ptr::addr_of_mut!(interpreter.dram),
+            };
+            let ram = &mut *ram;
             let memo = memo.insert(std::mem::take(&mut (*engine).native_memo));
             static USE_MEMO: OnceLock<bool> = OnceLock::new();
             let use_memo = *USE_MEMO.get_or_init(|| std::env::var_os("EDEN_NX2_MME_MEMO").is_none_or(|v| !v.to_string_lossy().starts_with('0')));
@@ -3124,7 +3158,7 @@ impl MacroEngine {
                 memo.synchronize((*engine).native_code_generation);
                 if let Some(effects) = memo.find(method, parameters, &ram[..]) {
                     for pair in effects.data_ram_writes.chunks_exact(2) { ram[pair[0] as usize] = pair[1]; }
-                    for pair in effects.writes.chunks_exact(2) { emit(pair[0], pair[1], &mut fifo, &mut ram); }
+                    for pair in effects.writes.chunks_exact(2) { emit(pair[0], pair[1], &mut fifo, ram); }
                     return;
                 }
                 writes.clear();
@@ -3138,7 +3172,7 @@ impl MacroEngine {
                 |address, value, fifo, ram| {
                     if use_memo { writes.push((address, value)); }
                     emit(address, value, fifo, ram)
-                }, Some(&mut ram),
+                }, if split_writes.is_some() { None } else { Some(&mut *ram) },
             );
             if use_memo && result.success && !read_memory.get() && !interpreter.read_registers
                 && !interpreter.reread_data_ram && generation == (*engine).native_code_generation
@@ -3184,6 +3218,8 @@ impl MacroEngine {
             native_jit: None,
             native_writes: Vec::new(),
             native_calls: 0,
+            split_writes: None,
+            split_unexpected_writes: 0,
         }
     }
 

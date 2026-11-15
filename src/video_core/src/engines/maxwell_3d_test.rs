@@ -88,6 +88,96 @@ fn front_macro_dma_drains_flushes_buffer_cache_and_extends_live_fifo() {
     }
 }
 
+// Lichii FrontRunOnBack/FrontRegister/FrontTakeOver (maxwell_3d.cpp:1954-2112):
+// a macro that reads memory into its FIFO and writes only back-writable state
+// registers runs on the back; the registers it can write are the back's until
+// the front reads them (after waiting for that macro) or writes them.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn front_fifo_dma_macro_runs_on_back_until_front_takes_its_registers() {
+    let backing = vec![0u8; 0x6000];
+    let mut engine = Box::new(new_descriptor_owner_backed_engine(&backing, 0x4000));
+    engine.set_native_turing_macro_mode(true);
+    let handle = EngineHandle::from_ref(&*engine);
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    split.start_back(|| {});
+    {
+        let mut fs = front.lock();
+        let code = [
+            front_test_instruction(Some(0x154), Some(0), false),
+            front_test_instruction(Some(0x155), Some(0x4000), false),
+            front_test_instruction(Some(0x158), Some(0), false),
+            // Emits the macro's parameter (FIFO load) to a state register.
+            front_test_instruction(Some(0x200), None, true),
+            front_test_instruction(None, None, false),
+        ].concat();
+        Maxwell3D::front_call_method(&mut fs, handle, &split, LOAD_MME_INSTRUCTION_PTR, 0, true);
+        Maxwell3D::front_call_multi_method(&mut fs, handle, &split,
+            LOAD_MME_INSTRUCTION, &code, code.len() as u32, code.len() as u32);
+        assert!(Maxwell3D::back_writable(&fs, 0x200));
+        Maxwell3D::front_call_method(&mut fs, handle, &split, MACRO_REGISTERS_START, 0x1234, true);
+        let record = fs.back_macros[0].as_deref().expect("analyzed on its first call");
+        assert!(record.back);
+        assert_eq!(record.writes, [0x154, 0x155, 0x158, 0x200]);
+        assert!(record.write_set[0x200] && !record.write_set[0x201]);
+        // The front never ran it: its copy keeps the old value.
+        assert_eq!(fs.regs[0x200], 0);
+        assert!(fs.back_owned[0x200]);
+        assert_ne!(fs.back_regs[0x200], 0);
+        // Tracked shadow RAM (the default): the entry is the back's too.
+        assert_eq!(fs.back_shadow[0x200], fs.back_regs[0x200]);
+        assert!(fs.parameters.is_empty());
+        assert_eq!(Maxwell3D::front_register(&mut fs, &split, 0x200), 0x1234);
+        assert_eq!(fs.back_regs[0x200], 0);
+        assert!(fs.back_owned[0x200], "the shadow entry stays the back's");
+        // A front write of the same value is sent (the back's entry may
+        // differ) and takes the register and its entry back.
+        assert!(Maxwell3D::front_take_over(&mut fs, &split, 0x200));
+        assert!(!fs.back_owned[0x200]);
+        assert_eq!(fs.back_shadow[0x200], 0);
+        assert!(!Maxwell3D::front_take_over(&mut fs, &split, 0x200));
+
+        // A record the back saw write outside its set is demoted on the next
+        // call, which runs on the front (FrontVerify takes the back's state).
+        let record = fs.back_macros[0].as_deref().unwrap();
+        record.escaped.store(true, std::sync::atomic::Ordering::Relaxed);
+        fs.back_escapes.fetch_add(1, std::sync::atomic::Ordering::Release);
+        Maxwell3D::front_call_method(&mut fs, handle, &split, MACRO_REGISTERS_START, 0x99, true);
+        assert_eq!(fs.back_demoted, [0]);
+        assert!(!fs.back_macros[0].as_deref().unwrap().back);
+        assert_eq!(fs.regs[0x200], 0x99);
+        assert!(!fs.back_owned[0x200]);
+    }
+    split.drain();
+    split.stop().unwrap();
+    assert_eq!(engine.regs[0x155], 0x4000);
+    assert_eq!(engine.regs[0x200], 0x99);
+}
+
+// Lichii BackWritable (maxwell_3d.cpp:1515-1546).
+#[test]
+fn back_writable_excludes_registers_the_front_tracks() {
+    let mut engine = Box::new(Maxwell3D::default());
+    engine.set_native_turing_macro_mode(true);
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    let fs = front.lock();
+    for method in [CB_CONFIG_BASE, CB_CONFIG_BASE + 3, REPORT_SEMAPHORE_BASE,
+        REPORT_SEMAPHORE_BASE + 3, UPLOAD_REGS_BASE as u32, LAUNCH_DMA - 1,
+        LOAD_MME_START_ADDR_PTR, SHADOW_SCRATCH_BASE, LOGIC_OP, 0x157, DRAW_END,
+        LOAD_MME_INSTRUCTION, CB_DATA_BASE, MACRO_REGISTERS_START]
+    {
+        assert!(!Maxwell3D::back_writable(&fs, method), "{method:#x}");
+    }
+    for method in [0x154, 0x155, 0x156, 0x158, 0x200, WAIT_FOR_IDLE,
+        CB_BIND_TRIGGER_0, CB_BIND_TRIGGER_4, RENDER_ENABLE_MODE, CLEAR_REPORT_VALUE,
+        FRAGMENT_BARRIER, INVALIDATE_TEXTURE_DATA_CACHE, TILED_CACHE_BARRIER]
+    {
+        assert!(Maxwell3D::back_writable(&fs, method), "{method:#x}");
+    }
+}
+
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn front_macro_worker_failure_propagates_through_jit_without_aborting() {

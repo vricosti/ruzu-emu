@@ -4315,6 +4315,11 @@ impl RasterizerInterface for RasterizerVulkan {
         );
     }
 
+    /// Lichii `RasterizerVulkan::HoldsQueries` (vk_rasterizer.cpp:2803-2805): any thread.
+    fn holds_queries(&self, addr: u64, size: u64) -> bool {
+        self.query_cache.holds_queries(addr, size as usize)
+    }
+
     /// Lichii `RasterizerVulkan::FlushQueryResults` (vk_rasterizer.cpp:3093-3112; from Lichii
     /// 7ae3e74014). Below High GPU accuracy a fence runs its own callback at once, so this waits
     /// for an operation queued behind the pending report writes instead.

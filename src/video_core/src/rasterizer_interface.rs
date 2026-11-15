@@ -211,6 +211,16 @@ pub trait RasterizerInterface {
         self.flush_region(addr, size, CacheType::QUERY_CACHE);
     }
 
+    /// Any thread: whether the query cache holds reports that can still land in the range, as
+    /// `flush_query_results` writes them out or once their host results come in. Without a
+    /// query cache that can tell, assume so.
+    ///
+    /// Lichii `RasterizerInterface::HoldsQueries` (rasterizer_interface.h:210-216); absent
+    /// from Eden.
+    fn holds_queries(&self, _addr: u64, _size: u64) -> bool {
+        true
+    }
+
     // ── Cache management ────────────────────────────────────────────────
 
     /// Flush all caches to Switch memory.

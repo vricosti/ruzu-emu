@@ -723,7 +723,7 @@ impl DmaPusher {
                         &split, state.method, argument, state.is_last_call, Some(segment));
                 }
                 _ => split.method(subchannel, state.method, argument, state.is_last_call,
-                    self.wants_segment().then_some(segment)),
+                    self.wants_segment().then_some(segment), crate::gpu_split::Writes::Anywhere),
             }
             return;
         }
@@ -781,7 +781,7 @@ impl DmaPusher {
                         &split, state.method, args, args.len() as u32, state.method_count, Some(segment));
                 }
                 _ => split.multi_method(subchannel, state.method, args, args.len() as u32,
-                    state.method_count, self.wants_segment().then_some(segment)),
+                    state.method_count, self.wants_segment().then_some(segment), crate::gpu_split::Writes::Anywhere),
             }
             return;
         }

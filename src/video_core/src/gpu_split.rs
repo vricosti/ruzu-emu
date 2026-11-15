@@ -130,13 +130,14 @@ impl GpuSplitFrontend {
         on_failure: &Arc<dyn Fn() + Send + Sync>) -> Option<Self> {
         if current().is_some() { return None; }
         static MODE: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
-            // Intentional divergence from upstream MaybeStart, which defaults
-            // to mode '2' when EDEN_NX2_SPLIT is absent: paired same-scene
-            // benchmarks on the validated host measured mode 2 below mode 0
-            // (Mario Kart World start grid, Low accuracy: 21.24 FPS at mode 0
-            // versus 19.53/17.63 FPS across two mode-2 windows). The split
-            // stays available through the same environment variable.
-            std::env::var_os("EDEN_NX2_SPLIT").map_or(b'0', |value| {
+            // As Lichii MaybeStart (gpu_split.cpp:150-154): mode '2' when
+            // EDEN_NX2_SPLIT is absent; EDEN_NX2_SPLIT=0 runs everything on
+            // one thread. ruzu defaulted to '0' while its front waited for the
+            // back at every macro DMA read (Mario Kart World start grid, Low
+            // accuracy: 21.24 FPS at mode 0 versus 19.53/17.63 FPS at mode 2);
+            // the FrontRunOnBack/FrontDmaRead port removed those waits. Mode 2
+            // has not been measured again on that title since.
+            std::env::var_os("EDEN_NX2_SPLIT").map_or(b'2', |value| {
                 value.to_string_lossy().as_bytes().first().copied().unwrap_or(0)
             })
         });
@@ -189,23 +190,111 @@ impl GpuSplitFrontend {
     pub(crate) fn publish(&self) { self.0.transport.borrow_mut().publish(); }
     pub(crate) fn drain(&self) { self.0.transport.borrow_mut().drain(); }
     pub(crate) fn method(&self, engine: EngineHandle, method: u32, argument: u32,
-        is_last: bool, segment: Option<u64>)
-    { self.0.transport.borrow_mut().method(engine, method, argument, is_last, segment); }
-    pub(crate) fn macro_write(&self, engine: EngineHandle, method: u32, argument: u32) {
-        self.0.transport.borrow_mut().macro_write(engine, method, argument);
+        is_last: bool, segment: Option<u64>, writes: Writes)
+    { self.0.transport.borrow_mut().method(engine, method, argument, is_last, segment, writes); }
+    pub(crate) fn macro_write(&self, engine: EngineHandle, method: u32, argument: u32,
+        writes: Writes) {
+        self.0.transport.borrow_mut().macro_write(engine, method, argument, writes);
     }
     pub(crate) fn multi_method(&self, engine: EngineHandle, method: u32, words: &[u32],
-        amount: u32, methods_pending: u32, segment: Option<u64>)
-    { self.0.transport.borrow_mut().multi_method(engine, method, words, amount, methods_pending, segment); }
+        amount: u32, methods_pending: u32, segment: Option<u64>, writes: Writes)
+    { self.0.transport.borrow_mut().multi_method(engine, method, words, amount, methods_pending, segment, writes); }
     pub(crate) fn defer<F: Fn() + Copy + Send + 'static>(&self, func: F) {
         self.0.transport.borrow_mut().defer(func);
+    }
+    pub(crate) fn defer_words<F: Fn(&[u32]) + Copy + Send + 'static>(&self, func: F, words: &[u32]) {
+        self.0.transport.borrow_mut().defer_words(func, words);
     }
     pub(crate) fn defer_function(&self, func: Box<dyn FnOnce() + Send>) {
         self.0.transport.borrow_mut().defer_function(func);
     }
+    /// Port of GpuSplit::Run: runs `func` on the back and waits for it. This
+    /// handle exists only on the front of an active split, so upstream's
+    /// on-back/inactive shortcut has no caller here. Rust takes an owned
+    /// callback (DeferFunction) instead of a trivially copyable one so it can
+    /// keep Arc owners such as the MemoryManager alive.
+    pub(crate) fn run(&self, func: Box<dyn FnOnce() + Send>) {
+        let mut transport = self.0.transport.borrow_mut();
+        transport.defer_function(func);
+        transport.drain();
+    }
+    pub(crate) fn position(&self) -> u64 { self.0.transport.borrow().position() }
+    pub(crate) fn wait_until(&self, position: u64) -> bool {
+        self.0.transport.borrow_mut().wait_until(position)
+    }
+    pub(crate) fn note_any_write(&self) { self.0.transport.borrow_mut().note_any_write(); }
+    /// Port of GpuSplit::NoteWrite. The MemoryManager lock is held only to
+    /// translate the range, never while waiting for the back.
+    pub(crate) fn note_write(&self, memory: &Mutex<crate::memory_manager::MemoryManager>,
+        address: u64, size: u64)
+    {
+        let mut transport = self.0.transport.borrow_mut();
+        if size > MAX_NOTED_BYTES || address.checked_add(size).is_none() {
+            transport.note_any_write();
+            return;
+        }
+        let memory = memory.lock();
+        for_each_device_range(&memory, address, size, |device, bytes| {
+            transport.note_device_write(device, bytes);
+        });
+    }
+    /// Port of GpuSplit::WaitForWrites. Rust computes the target under the
+    /// MemoryManager lock and releases it before waiting: the back takes that
+    /// lock under the buffer cache's, so holding it here could deadlock.
+    pub(crate) fn wait_for_writes(&self, memory: &Mutex<crate::memory_manager::MemoryManager>,
+        address: u64, size: u64) -> bool
+    {
+        let target = {
+            let memory = memory.lock();
+            self.0.transport.borrow().writes_target(&memory, address, size)
+        };
+        let mut transport = self.0.transport.borrow_mut();
+        let target = target.min(transport.write_position);
+        transport.wait_for(target)
+    }
+}
+
+/// Port of GpuSplit::Writes: what the sender of an entry tells about the
+/// guest memory the back writes running it, for the front's reads of guest
+/// memory (WaitForWrites).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Writes {
+    /// Unknown: a read anywhere waits for the entry.
+    Anywhere,
+    /// Nothing, or what the sender notes right after sending it (NoteWrite).
+    Noted,
+}
+
+/// Port of gpu_split.cpp ForEachDeviceRange: calls `func(device_address,
+/// size)` for each mapped piece of [address, address + size) within one 4 KiB
+/// GPU page; nothing is read or written where no device memory is mapped.
+pub(crate) fn for_each_device_range(memory: &crate::memory_manager::MemoryManager,
+    address: u64, size: u64, mut func: impl FnMut(u64, u64))
+{
+    const PAGE_SIZE: u64 = 0x1000;
+    let end = address.wrapping_add(size);
+    let mut begin = address;
+    while begin < end {
+        let page_end = ((begin & !(PAGE_SIZE - 1)) + PAGE_SIZE).min(end);
+        if let Some(device) = memory.gpu_to_cpu_address(begin) {
+            func(device, page_end - begin);
+        }
+        begin = page_end;
+    }
 }
 
 const RING_WORDS: usize = 1 << 20;
+/// NoteWrite places writes by 256-byte granule of device memory, up to
+/// MAX_NOTED_BYTES long (longer ones count as anywhere), in write_positions
+/// slots hashed by granule: granules that share a slot share its position, so
+/// a read may wait for a write elsewhere, never miss one.
+const WRITE_GRANULE_BITS: u32 = 8;
+const MAX_NOTED_BYTES: u64 = 0x4000;
+const WRITE_SLOT_BITS: u32 = 10;
+
+fn write_slot(granule: u64) -> usize {
+    (granule.wrapping_mul(0x9E3779B97F4A7C15) >> (64 - WRITE_SLOT_BITS)) as usize
+}
 const RING_MASK: usize = RING_WORDS - 1;
 const PUBLISH_EVERY: usize = 256;
 const MAX_MULTI_WORDS: usize = 8192;
@@ -268,6 +357,9 @@ struct GpuSplitShared {
     ring: Box<[UnsafeCell<u64>]>,
     published: CacheLine<AtomicU64>,
     consumed: CacheLine<AtomicU64>,
+    /// A position the front waits for (WaitFor): the back stores `consumed`
+    /// once past it.
+    wait_target: CacheLine<AtomicU64>,
     back_waiting: CacheLine<AtomicBool>,
     wake: Wake,
     owned_pending: AtomicUsize,
@@ -288,6 +380,7 @@ impl GpuSplitShared {
             ring: (0..RING_WORDS).map(|_| UnsafeCell::new(0)).collect(),
             published: CacheLine(AtomicU64::new(0)),
             consumed: CacheLine(AtomicU64::new(0)),
+            wait_target: CacheLine(AtomicU64::new(u64::MAX)),
             back_waiting: CacheLine(AtomicBool::new(false)),
             wake: Wake::new(),
             owned_pending: AtomicUsize::new(0),
@@ -344,7 +437,13 @@ impl GpuSplitBack {
                 // Consumed is released only after Execute finishes each packet.
                 let size = unsafe { self.execute(index) };
                 read_position += if size == 0 { (RING_WORDS - index) as u64 } else { size as u64 };
-                if read_position - last_store >= 4096 && read_position != available {
+                // Hand ring space back now and then while working through a
+                // long batch, and at once when the front waits for this
+                // position (WaitFor).
+                if (read_position - last_store >= 4096
+                    || read_position >= self.shared.wait_target.0.load(Ordering::Relaxed))
+                    && read_position != available
+                {
                     self.shared.consumed.0.store(read_position, Ordering::Release);
                     last_store = read_position;
                 }
@@ -459,11 +558,18 @@ pub(crate) struct GpuSplit {
     publish_every: usize,
     front_engine: Option<EngineHandle>,
     back_thread: Option<std::thread::JoinHandle<()>>,
+    /// After the last entry that may write guest memory anywhere
+    /// (NoteAnyWrite), the last one NoteWrite placed, and the last placed
+    /// write in each slot's granules.
+    last_any_write: u64,
+    last_noted_write: u64,
+    write_positions: Box<[u64; 1 << WRITE_SLOT_BITS]>,
 }
 impl GpuSplit {
     pub(crate) fn new() -> Self {
         Self { shared: Arc::new(GpuSplitShared::new()), write_position: 0,
-            published_local: 0, consumed_cache: 0, publish_every: PUBLISH_EVERY, front_engine: None, back_thread: None }
+            published_local: 0, consumed_cache: 0, publish_every: PUBLISH_EVERY, front_engine: None, back_thread: None,
+            last_any_write: 0, last_noted_write: 0, write_positions: Box::new([0; 1 << WRITE_SLOT_BITS]) }
     }
 
     /// Thread-creation portion of upstream MaybeStart. The registration action
@@ -544,7 +650,7 @@ impl GpuSplit {
     }
 
     pub(crate) fn method(&mut self, engine: EngineHandle, method: u32, argument: u32,
-              is_last: bool, segment: Option<u64>) {
+              is_last: bool, segment: Option<u64>, writes: Writes) {
         self.select_engine(engine);
         let words = if segment.is_some() { 2 } else { 1 };
         let entry = self.reserve(words);
@@ -555,9 +661,11 @@ impl GpuSplit {
             if let Some(segment) = segment { entry.add(1).write(segment); }
         }
         self.commit(words);
+        if writes == Writes::Anywhere { self.note_any_write(); }
     }
 
-    pub(crate) fn macro_write(&mut self, engine: EngineHandle, method: u32, argument: u32) {
+    pub(crate) fn macro_write(&mut self, engine: EngineHandle, method: u32, argument: u32,
+        writes: Writes) {
         self.select_engine(engine);
         let entry = self.reserve(1);
         unsafe {
@@ -565,10 +673,11 @@ impl GpuSplit {
                 | ((method as u64 & 0xffff) << 8) | ((argument as u64) << 32));
         }
         self.commit(1);
+        if writes == Writes::Anywhere { self.note_any_write(); }
     }
 
     pub(crate) fn multi_method(&mut self, engine: EngineHandle, method: u32, words: &[u32],
-                    amount: u32, mut methods_pending: u32, segment: Option<u64>) {
+                    amount: u32, mut methods_pending: u32, segment: Option<u64>, writes: Writes) {
         self.select_engine(engine);
         let mut words = &words[..amount as usize];
         while !words.is_empty() {
@@ -590,6 +699,7 @@ impl GpuSplit {
             words = &words[piece..];
             methods_pending = methods_pending.wrapping_sub(piece as u32);
         }
+        if writes == Writes::Anywhere { self.note_any_write(); }
     }
 
     /// Upstream's trivially-copyable deferred callback. Copy excludes owned
@@ -604,11 +714,48 @@ impl GpuSplit {
             entry.add(2).cast::<F>().write(func);
         }
         self.commit(2 + payload);
+        self.note_any_write();
     }
 
     unsafe fn call_thunk<F: Fn() + Copy>(payload: *const u64) {
         let func = unsafe { payload.cast::<F>().read() };
         func();
+    }
+
+    /// Port of GpuSplit::DeferWords: Defer, calling `func` with a copy of
+    /// `words`. Writes::Anywhere, upstream's default.
+    pub(crate) fn defer_words<F: Fn(&[u32]) + Copy + Send + 'static>(&mut self, func: F,
+        words: &[u32])
+    {
+        assert!(std::mem::align_of::<F>() <= std::mem::align_of::<u64>());
+        let function_words = std::mem::size_of::<F>().div_ceil(8);
+        let payload = function_words + 1 + words.len().div_ceil(2);
+        let entry = self.reserve(2 + payload);
+        // SAFETY: the reservation holds 2 + payload words: head, thunk, the
+        // function, the count and the words, padded after an odd count.
+        unsafe {
+            entry.write(Kind::Call as u64 | ((payload as u64) << 8));
+            entry.add(1).cast::<CallThunk>().write(Self::call_words_thunk::<F>);
+            entry.add(2).cast::<F>().write(func);
+            entry.add(2 + function_words).write(words.len() as u64);
+            if !words.is_empty() {
+                entry.add(1 + payload).write(0); // Padding after an odd count
+                std::ptr::copy_nonoverlapping(words.as_ptr(),
+                    entry.add(3 + function_words).cast::<u32>(), words.len());
+            }
+        }
+        self.commit(2 + payload);
+        self.note_any_write();
+    }
+
+    unsafe fn call_words_thunk<F: Fn(&[u32]) + Copy>(payload: *const u64) {
+        let function_words = std::mem::size_of::<F>().div_ceil(8);
+        let func = unsafe { payload.cast::<F>().read() };
+        let count = unsafe { payload.add(function_words).read() } as usize;
+        let words = unsafe {
+            std::slice::from_raw_parts(payload.add(function_words + 1).cast::<u32>(), count)
+        };
+        func(words);
     }
 
     fn defer_function(&mut self, func: OwnedCallback) {
@@ -621,6 +768,7 @@ impl GpuSplit {
         }
         self.shared.owned_pending.fetch_add(1, Ordering::Relaxed);
         self.commit(3);
+        self.note_any_write();
     }
 
     unsafe fn call_owned(payload: *const u64) {
@@ -740,6 +888,75 @@ impl GpuSplit {
             if self.consumed_cache == self.write_position {
                 self.publish_every = 8;
                 return;
+            }
+            if spins < 16384 { pause(); } else { std::thread::yield_now(); }
+            spins = spins.wrapping_add(1);
+        }
+    }
+}
+
+impl GpuSplit {
+    /// The ring position after the entries sent so far, for WaitUntil.
+    pub(crate) fn position(&self) -> u64 { self.write_position }
+
+    /// Waits until the back executed the entries sent before `position`.
+    /// Returns whether any of them was still queued.
+    pub(crate) fn wait_until(&mut self, position: u64) -> bool {
+        self.wait_for(position.min(self.write_position))
+    }
+
+    /// The entry just sent may write guest memory anywhere.
+    pub(crate) fn note_any_write(&mut self) { self.last_any_write = self.write_position; }
+
+    fn note_device_write(&mut self, address: u64, size: u64) {
+        let last = (address + size - 1) >> WRITE_GRANULE_BITS;
+        for granule in (address >> WRITE_GRANULE_BITS)..=last {
+            self.write_positions[write_slot(granule)] = self.write_position;
+        }
+        self.last_noted_write = self.write_position;
+    }
+
+    /// The position WaitForWrites waits for.
+    fn writes_target(&self, memory: &crate::memory_manager::MemoryManager, address: u64,
+        size: u64) -> u64
+    {
+        if size > MAX_NOTED_BYTES || address.checked_add(size).is_none() {
+            return self.last_any_write.max(self.last_noted_write);
+        }
+        let mut target = self.last_any_write;
+        for_each_device_range(memory, address, size, |device, bytes| {
+            target = target.max(self.device_writes_target(device, bytes));
+        });
+        target
+    }
+
+    fn device_writes_target(&self, address: u64, size: u64) -> u64 {
+        let last = (address + size - 1) >> WRITE_GRANULE_BITS;
+        let mut target = 0;
+        for granule in (address >> WRITE_GRANULE_BITS)..=last {
+            target = target.max(self.write_positions[write_slot(granule)]);
+        }
+        target
+    }
+
+    /// Port of GpuSplit::WaitFor. Rust keeps Drain's spin-then-yield wait
+    /// (upstream's Backoff sleeps on front_wake, which this port lacks).
+    fn wait_for(&mut self, target: u64) -> bool {
+        self.consumed_cache = self.shared.consumed.0.load(Ordering::Acquire);
+        // Nothing to wait for: the back's state is not needed (a failed back
+        // is reported by the next entry sent or by a real wait).
+        if self.consumed_cache >= target { return false; }
+        self.check_back_failure();
+        let _scope = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::SplitDrain);
+        self.shared.wait_target.0.store(target, Ordering::SeqCst);
+        self.publish();
+        let mut spins = 0u32;
+        loop {
+            self.check_back_failure();
+            self.consumed_cache = self.shared.consumed.0.load(Ordering::Acquire);
+            if self.consumed_cache >= target {
+                self.shared.wait_target.0.store(u64::MAX, Ordering::Relaxed);
+                return true;
             }
             if spins < 16384 { pause(); } else { std::thread::yield_now(); }
             spins = spins.wrapping_add(1);
@@ -1007,8 +1224,8 @@ mod tests {
         let probe = DropProbe(drops.clone());
         let called = calls.clone();
         split.defer_function(Box::new(move || { drop(probe); called.fetch_add(1, Ordering::SeqCst); }));
-        split.method(EngineHandle::from_ref(&engine), 0x40, 1, true, Some(0x1234));
-        split.multi_method(EngineHandle::from_ref(&engine), 0x80, &[1, 2, 3], 3, 3, None);
+        split.method(EngineHandle::from_ref(&engine), 0x40, 1, true, Some(0x1234), Writes::Anywhere);
+        split.multi_method(EngineHandle::from_ref(&engine), 0x80, &[1, 2, 3], 3, 3, None, Writes::Anywhere);
         split.defer(|| panic!("drop must not execute queued GPU callbacks"));
         assert!(split.write_position > split.shared.published.0.load(Ordering::Acquire));
         drop(split);
@@ -1063,14 +1280,14 @@ mod tests {
         let a = EngineHandle::from_ref(&mut first);
         let b = EngineHandle::from_ref(&mut second);
         let mut split = GpuSplit::new();
-        split.method(a, 0x40, 11, false, Some(100));
-        split.method(a, 0x80, 22, false, Some(200));
-        split.macro_write(a, 0x40, 33);
-        split.method(a, 0x41, 44, true, None);
-        split.multi_method(a, 0x90, &[55, 66, 77], 3, 9, Some(300));
+        split.method(a, 0x40, 11, false, Some(100), Writes::Anywhere);
+        split.method(a, 0x80, 22, false, Some(200), Writes::Anywhere);
+        split.macro_write(a, 0x40, 33, Writes::Anywhere);
+        split.method(a, 0x41, 44, true, None, Writes::Anywhere);
+        split.multi_method(a, 0x90, &[55, 66, 77], 3, 9, Some(300), Writes::Anywhere);
         let marker = 101u32;
         split.defer(move || EXECUTION_TRACE.lock().push(Event::Callback(marker)));
-        split.method(b, 0x80, 88, true, None);
+        split.method(b, 0x80, 88, true, None, Writes::Anywhere);
         split.defer(|| EXECUTION_TRACE.lock().push(Event::Callback(102)));
         assert!(EXECUTION_TRACE.lock().is_empty());
         split.publish();
@@ -1119,9 +1336,9 @@ mod tests {
         let first_handle = EngineHandle::from_ref(&first);
         let second_handle = EngineHandle::from_ref(&second);
         let mut split = GpuSplit::new();
-        split.method(first_handle, 0x12345, 0x89abcdef, true, Some(0x123456789abcdef0));
-        split.macro_write(first_handle, 0x1abcd, 0x76543210);
-        split.method(second_handle, 0x80, 42, false, None);
+        split.method(first_handle, 0x12345, 0x89abcdef, true, Some(0x123456789abcdef0), Writes::Anywhere);
+        split.macro_write(first_handle, 0x1abcd, 0x76543210, Writes::Anywhere);
+        split.method(second_handle, 0x80, 42, false, None, Writes::Anywhere);
         let mut index = 0;
         unsafe {
             assert_eq!(split.shared.at(index).read(), 1);
@@ -1151,7 +1368,7 @@ mod tests {
             let mut split = GpuSplit::new();
             let mut source: Vec<u32> = (0..8195).map(|i| i ^ 0xa5a50000).collect();
             let expected = source.clone();
-            split.multi_method(EngineHandle::from_ref(&engine), 0x180, &source, 8195, 8199, segment);
+            split.multi_method(EngineHandle::from_ref(&engine), 0x180, &source, 8195, 8199, segment, Writes::Anywhere);
             source.fill(0); // The caller may reuse its DMA scratch immediately.
             let mut index = 1 + ENGINE_WORDS;
             let mut offset = 0;
@@ -1178,9 +1395,9 @@ mod tests {
         let engine = TestEngine(1);
         let handle = EngineHandle::from_ref(&engine);
         let mut split = GpuSplit::new();
-        split.multi_method(handle, 1, &[], 0, 0, None);
+        split.multi_method(handle, 1, &[], 0, 0, None, Writes::Anywhere);
         assert_eq!(split.write_position, (1 + ENGINE_WORDS) as u64);
-        split.multi_method(handle, 1, &vec![0; 8193], 8193, 0, None);
+        split.multi_method(handle, 1, &vec![0; 8193], 8193, 0, None, Writes::Anywhere);
         let second = 1 + ENGINE_WORDS + 2 + 4096;
         assert_eq!(unsafe { split.shared.at(second + 1).read() }, 0u32.wrapping_sub(8192) as u64);
     }
@@ -1279,6 +1496,53 @@ mod tests {
         done_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         producer.join().unwrap();
         assert_eq!(unsafe { shared.at(0).read() }, 0x5678);
+    }
+
+    // Lichii DeferWords (gpu_split.h:266-284) and WaitUntil/WaitFor with the
+    // back storing `consumed` once past wait_target (gpu_split.cpp:418-439,
+    // 725-733): the front waits for one entry, not for the batch after it.
+    #[test]
+    fn defer_words_copies_words_and_wait_until_returns_before_later_entries() {
+        static SEEN: std::sync::Mutex<Vec<Vec<u32>>> = std::sync::Mutex::new(Vec::new());
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        let mut split = GpuSplit::new();
+        split.start_back(|| {});
+        let mut words = vec![1, 2, 3];
+        split.defer_words(|words: &[u32]| SEEN.lock().unwrap().push(words.to_vec()), &words);
+        words.fill(0); // The ring holds its own copy.
+        split.defer_words(|words: &[u32]| SEEN.lock().unwrap().push(words.to_vec()), &[]);
+        split.defer_words(|words: &[u32]| SEEN.lock().unwrap().push(words.to_vec()), &[7, 8]);
+        let position = split.position();
+        split.defer(|| while !RELEASE.load(Ordering::Acquire) { std::thread::yield_now(); });
+        assert_eq!(split.last_any_write, split.position(), "Writes::Anywhere");
+        // The back blocks in the entry after `position`, in the same batch.
+        assert!(split.wait_until(position));
+        assert_eq!(*SEEN.lock().unwrap(), [vec![1, 2, 3], vec![], vec![7, 8]]);
+        assert!(!split.wait_until(position), "already consumed");
+        RELEASE.store(true, Ordering::Release);
+        split.drain();
+        split.stop().unwrap();
+    }
+
+    // Lichii NoteWrite/WritesTarget (gpu_split.cpp:371-412): writes are placed
+    // by 256-byte device granule, hashed into slots; anywhere writes bound all.
+    #[test]
+    fn noted_writes_place_their_position_by_granule() {
+        let mut split = GpuSplit::new();
+        split.write_position = 10;
+        split.note_device_write(0x10_0080, 0x100);
+        assert_eq!(split.last_noted_write, 10);
+        split.write_position = 20;
+        split.note_any_write();
+        split.write_position = 30;
+        // Granules 0x1000 and 0x1001 hold position 10.
+        assert_eq!(split.device_writes_target(0x10_0000, 4), 10);
+        assert_eq!(split.device_writes_target(0x10_01fc, 4), 10);
+        let elsewhere = 0x20_0000u64;
+        let collides = [0x1000u64, 0x1001].iter()
+            .any(|&granule| write_slot(granule) == write_slot(elsewhere >> WRITE_GRANULE_BITS));
+        assert_eq!(split.device_writes_target(elsewhere, 4), if collides { 10 } else { 0 });
+        assert_eq!(split.last_any_write, 20);
     }
 
     #[test]

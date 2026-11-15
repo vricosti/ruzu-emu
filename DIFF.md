@@ -92,6 +92,81 @@
 ### Intentional differences
 - None in behavior. The once-per-command set is a function-local `OnceLock<Mutex<BTreeSet>>`
   (Lichii: function-local `static std::set` behind a `std::mutex`).
+## 2026-11-15 — GPU split, macros that read memory run on the back: video_core/{gpu_split,macro,macro_turing}.rs, engines/maxwell_3d.rs vs Lichii video_core/{gpu_split.{h,cpp},macro.{h,cpp},macro_turing.h}, engines/maxwell_3d.cpp
+
+Lichii extension, absent from Eden (Eden has no GPU thread split). Only active with the split
+(Switch 2 titles, Vulkan, not High GPU accuracy). Mode 2 is the default, as in Lichii
+(`gpu_split.cpp:150-154`); `EDEN_NX2_SPLIT=0` runs everything on one thread, `=1` keeps the
+macros on the back. ruzu defaulted to mode 0 until this port (see the measurement below, and the
+Mario Kart World measurement quoted in `GpuSplitFrontend::maybe_start`); the default has not been
+measured again since it changed.
+
+Measured on the NX2 title used for measurement (forest scene, 60 s window): with
+`EDEN_NX2_SPLIT=2` the front's waits in `front_dma_read` went from ~700 per frame (252 ms/s) to
+none (the scene's memory-reading macro, `0x142`, runs on the back ~700 times a frame); 24.35 /
+25.10 / 24.75 FPS against 23.03 before (mode 0: 24.20 / 23.93). The back thread is now the
+limit (93-94 % CPU, draw preparation and method execution); the front's remaining waits are the
+semaphore acquires (`puller.rs`, ~110 per frame, as in Lichii).
+
+`Maxwell3D::front_dma_read` follows Lichii `FrontDmaRead` (maxwell_3d.cpp:2242-2283) for the
+query cache too: after `wait_for_writes` it drains only when the buffer cache holds GPU-written
+words or `query_dma::holds_reports` says reports can still land in them (Lichii
+`QueryDma::HoldsReports`, `RasterizerInterface::HoldsQueries`, `QueryCacheBase::HoldsQueries`,
+query_cache_base.h:101-128), then has the back flush the buffer cache and run
+`query_dma::flush_pending`. Ported with it: `PageFilter` (Lichii `page_filter.h`) for the query
+cache, marked where a report is indexed and checked before `cache_mutex` in
+invalidate/semi-flush/flush/is-region-modified (query_cache_base.h:64-71, 82, 133-136). ruzu's
+Vulkan `holds_queries` also counts the host-resolved reports it keeps outside `QueryCacheBase`
+(`PendingHostReports`). This combination (split by default with the pending-report wait) has
+only been compiled and unit-tested, not run on a title.
+
+### Ported (Lichii extensions, absent from Eden)
+- `Maxwell3D::FrontState` back-macro fields (maxwell_3d.cpp:1382-1403): `back_regs`,
+  `back_shadow`, `back_owned`, `BackMacro` (`start`, `back`, `writes`, `write_set`, `escaped`),
+  `back_macros`, `back_generation`, `back_demoted`, `back_engine`, `back_code_copied`,
+  `back_last`, `back_escapes`, `back_escapes_seen`.
+- `BackWritable` (1515-1546), `WaitForBackMacros` (1550-1560), the `FrontRunOnBack` branch of
+  `FrontRunMacro` with the read callback through `FrontRegister` (1888-1911), `FrontRunOnBack`
+  (1954-2077, with the back engine's code copy, the escape check and the demotion),
+  `FrontRegister` (2083-2091), `FrontTakeOver` (2097-2112) and its calls in `FrontWrite`
+  (1619-1621) and `FrontCallMultiMethod` (1769-1771), `FrontNoteWrites` (2160-2224) and its calls,
+  `FrontDmaRead` in Lichii's form (2226-2283: `WaitForWrites`, then drain and back flush only when
+  the buffer cache holds the words), the back-register take-over in `FrontVerify` (2344-2355).
+- `GpuSplit` (gpu_split.h/.cpp): `Writes` and the `writes` argument of `Method`, `MacroWrite`,
+  `MultiMethod`; `NoteAnyWrite`, `NoteWrite`, `NoteDeviceWrite`, `WritesTarget`,
+  `DeviceWritesTarget`, `WaitForWrites`, `ForEachDeviceRange` (356-412); `Position`, `WaitUntil`,
+  `WaitFor` and the back's `wait_target` store (418-439, 725-733); `DeferWords` (266-284); `Run`
+  (290-297). `Defer`/`DeferFunction` note a write anywhere (upstream default `Writes::Anywhere`).
+- `MacroEngine::split_writes`/`split_unexpected_writes` (macro.h:267-272, macro.cpp:1370-1405):
+  a back call counts writes outside its set and uses the interpreter's own data RAM.
+- `TuringMacroInterpreter::AnalyzeEffects`/`Effects` (macro_turing.h:256-523).
+
+### Intentional differences
+- The front checks the buffer cache (`front_memory_dirty`) and computes `WaitForWrites`' target
+  with the MemoryManager lock released before asking the rasterizer or waiting: ruzu's memory
+  manager has a `ParkingLotMutex` (Lichii's has none) that the back takes under the buffer cache's
+  lock (see the async read-back entry below for the deadlock this ordering caused before).
+- `FrontRegister`/`FrontTakeOver` read the back engine's register and shadow arrays through raw
+  pointers taken when the front was created (Lichii reads the engine members directly).
+- `WaitFor` keeps ruzu's spin-then-yield wait (Lichii's `Backoff` sleeps on `front_wake`, not
+  ported). `DrainSite` and the wait counters (`CountedWait`, `AsyncReadback::CountBackWait`,
+  `CountBackMacro`) are not ported: ruzu has no `AcquireStats`.
+- `Run` takes an owned callback (`DeferFunction`), so it can keep the MemoryManager `Arc` alive.
+- `BackWritable` has no `RootTables::SelectMethod/LoadMethod` case: ruzu has no root tables, and
+  those methods fall in the default case (not executable), with the same answer.
+- `MacroEngine::split_writes` is an `Arc` of the record's set (Lichii: a raw `bitset*`), which keeps
+  `MacroEngine` `Send`.
+
+### Not ported
+- `FrontState::data_ram_macros`/`data_ram_generation` and the grid-marker resolution of
+  `FrontRunMacro` (1862-1880): ruzu has no `Nx2ListGrid`.
+- `FrontDmaRead`'s query-cache part (`QueryDma::HoldsReports`/`FlushPending`/`Trace`,
+  query_dma.h), the `EDEN_NX2_DMA_READ_VERIFY` check (`CheckDmaRead`) and `Nx2CmdPageDiag`: ruzu's
+  macro DMA reads never wrote held query reports out (split or not), the decision uses the buffer
+  cache only, as ruzu's non-split path does.
+- `FrontNoteReport`/`NoteSemaphoreWrite` (semaphore-acquire shortcuts), state blocks
+  (`StateWrite`, `FrontSkipsLoopWrite`, `FrontTrackInstanceLoop`), `Scheduler::DeferFlush` and the
+  back's idle hook: separate Lichii mechanisms.
 
 ## 2026-11-15 — video_core/renderer_vulkan/{scheduler,query_cache}.rs vs Lichii video_core/renderer_vulkan/{vk_scheduler.cpp,vk_query_cache.cpp}
 

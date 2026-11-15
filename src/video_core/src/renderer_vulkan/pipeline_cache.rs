@@ -2238,15 +2238,25 @@ impl PipelineCache {
             .fixed_state
             .refresh(draw, &self.dynamic_features);
 
-        // Record use here, where the key is final, rather than in the slow
-        // path: most draws are served by the transition fast path below and
-        // would otherwise never be counted as used at all.
-        self.note_pipeline_use(graphics_key_cache_hash(&self.graphics_key));
-
         let next = self
             .current_pipeline
             .as_ref()
             .and_then(|current| GraphicsPipeline::next(current, &self.graphics_key));
+
+        // Record use here, where the key is final, rather than in the slow
+        // path: most draws are served by the transition fast path below and
+        // would otherwise never be counted as used at all. A draw keeping the
+        // current pipeline (same key) is skipped: that key already holds the
+        // latest clock value, so the recency order is unchanged, and the
+        // per-draw key hash stays off the common path.
+        let keeps_current = matches!(
+            (&next, &self.current_pipeline),
+            (Some(next), Some(current)) if Rc::ptr_eq(next, current)
+        );
+        if !keeps_current {
+            self.note_pipeline_use(graphics_key_cache_hash(&self.graphics_key));
+        }
+
         if let Some(next) = next {
             self.current_pipeline = Some(next);
             let pipeline = self

@@ -434,6 +434,28 @@ fn common_buffer_usage_flags(device: &Device) -> vk::BufferUsageFlags {
     flags
 }
 
+/// Makes every device write visible to host reads of the download staging
+/// memory once the submission's semaphore is signaled.
+///
+/// Lichii anonymous-namespace `HostReadBarrier` (vk_buffer_cache.cpp:31-40),
+/// recorded by its `FinishForHostRead`/`SubmitForHostRead`.
+fn host_read_barrier(device: &ash::Device, cmdbuf: vk::CommandBuffer) {
+    let barrier = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::HOST_READ);
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmdbuf,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            std::slice::from_ref(&barrier),
+            &[],
+            &[],
+        );
+    }
+}
+
 fn common_buffer_base_usage_flags() -> vk::BufferUsageFlags {
     vk::BufferUsageFlags::TRANSFER_SRC
         | vk::BufferUsageFlags::TRANSFER_DST
@@ -1107,6 +1129,68 @@ impl base::BufferCacheRuntime for BufferCacheRuntime {
 
     fn wait(&mut self, tick: u64) {
         self.scheduler().wait(tick);
+    }
+
+    /// Lichii `BufferCacheRuntime::SubmitForHostRead` (vk_buffer_cache.cpp:519-523):
+    /// `FinishForHostRead` without the wait.
+    fn submit_for_host_read(&mut self) -> u64 {
+        let device = self.device_owner;
+        self.scheduler().request_outside_render_pass_operation_context();
+        self.scheduler().record(move |cmdbuf| {
+            host_read_barrier(device.get().get_logical(), cmdbuf);
+        });
+        self.scheduler().flush()
+    }
+
+    /// Lichii `BufferCacheRuntime::QueueForHostRead` (vk_buffer_cache.cpp:525-532).
+    /// Lichii submits unless `Scheduler::DeferFlush` batches the submission,
+    /// which it does only on its GPU split's back thread; ruzu's scheduler has
+    /// no deferred flushes, so this always submits, as Lichii does elsewhere.
+    fn queue_for_host_read(&mut self) -> u64 {
+        let device = self.device_owner;
+        self.scheduler().request_outside_render_pass_operation_context();
+        self.scheduler().record(move |cmdbuf| {
+            host_read_barrier(device.get().get_logical(), cmdbuf);
+        });
+        let tick = self.scheduler().current_tick();
+        self.scheduler().flush();
+        tick
+    }
+
+    /// Lichii `BufferCacheRuntime::WaitForHostRead` (vk_buffer_cache.cpp:534-547).
+    /// Lichii asks its GPU split's back to submit a deferred tick; ruzu's read
+    /// downloads are always submitted (`submit_for_host_read` flushes), so its
+    /// `Scheduler::Wait` path remains: a submitted tick only waits on the master
+    /// semaphore, which any thread may do; an unsubmitted one (reachable on
+    /// the scheduler's owner only) is flushed first.
+    fn wait_for_host_read(&self, tick: u64) {
+        let scheduler = unsafe { self.scheduler.as_ref() };
+        if scheduler.is_free(tick) {
+            return;
+        }
+        if tick < scheduler.current_tick() {
+            scheduler.get_master_semaphore().wait(tick);
+            return;
+        }
+        // SAFETY: an unsubmitted tick belongs to the scheduler's owner thread,
+        // the only one that records and flushes.
+        unsafe { self.scheduler.as_ptr().as_mut() }
+            .expect("buffer cache runtime scheduler")
+            .wait(tick);
+    }
+
+    /// Lichii `BufferCacheRuntime::IsFreeNow` (vk_buffer_cache.cpp:549-558).
+    fn is_free_now(&mut self, tick: u64) -> bool {
+        let scheduler = unsafe { self.scheduler.as_ref() };
+        if scheduler.is_free(tick) {
+            return true;
+        }
+        // Lichii Scheduler::IsSubmitted: tick < master_semaphore->CurrentTick().
+        if tick >= scheduler.current_tick() {
+            return false;
+        }
+        scheduler.get_master_semaphore().refresh();
+        scheduler.is_free(tick)
     }
 
     fn can_report_memory_usage(&self) -> bool {

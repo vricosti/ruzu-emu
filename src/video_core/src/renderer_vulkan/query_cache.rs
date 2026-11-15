@@ -1994,6 +1994,13 @@ fn sync_guest_values(backend: &mut QueryRuntimeBackend, values: &[SyncValuesStru
         }
         destination_buffers.push((vk::Buffer::from_raw(raw_buffer), u64::from(offset)));
     }
+    // Lichii QueryCacheRuntime::SyncValues (vk_query_cache.cpp:1781-1785;
+    // async read-back, DIFF.md 2026-11-15): the copies below are GPU writes
+    // the buffer cache doesn't record: reads taken before them must not keep
+    // the bytes they downloaded as the newest.
+    for value in values {
+        buffer_cache.outdate_read_downloads(value.address, value.size);
+    }
     drop(_lock);
 
     let Some(staging) =

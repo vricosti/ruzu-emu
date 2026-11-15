@@ -505,6 +505,8 @@ impl QueryCacheBase {
         drop(values);
 
         if !is_fence && !gpu_level_high && counter_type == QueryType::Payload {
+            // Lichii CounterReport (query_cache.h:403-404).
+            Self::finish_reads(&self.impl_, cpu_addr, if has_timestamp { 16 } else { 4 });
             let timestamp = if has_timestamp {
                 self.impl_.gpu_mut().map(|gpu| gpu.get_ticks()).unwrap_or(0)
             } else {
@@ -529,10 +531,35 @@ impl QueryCacheBase {
             Some((memory.capture_pointer(cpu_addr)?,
                 memory.capture_pointer(cpu_addr.wrapping_add(8))?))
         });
+        // Lichii CounterReport (query_cache.h:288-293): written later, the
+        // buffer cache keeps GPU writes over it until then (note_report_pending).
+        let report_size: u64 = if has_timestamp { 16 } else { 4 };
+        let report_noted = match self.impl_.rasterizer {
+            Some(rasterizer) => unsafe { (&mut *rasterizer).note_report_pending(cpu_addr, report_size) },
+            None => false,
+        };
         let owner = self as *mut Self as usize;
         let operation = Box::new(move || {
             let owner = owner as *mut QueryCacheBase;
             let owner = unsafe { &mut *owner };
+            // Lichii's SCOPE_EXIT (query_cache.h:327-332): on every exit.
+            struct FinishReportGuard {
+                rasterizer: Option<*mut dyn crate::rasterizer_interface::RasterizerInterface>,
+                cpu_addr: VAddr,
+                size: u64,
+            }
+            impl Drop for FinishReportGuard {
+                fn drop(&mut self) {
+                    if let Some(rasterizer) = self.rasterizer {
+                        unsafe { (&mut *rasterizer).finish_report(self.cpu_addr, self.size) };
+                    }
+                }
+            }
+            let _finish_report = FinishReportGuard {
+                rasterizer: if report_noted { owner.impl_.rasterizer } else { None },
+                cpu_addr,
+                size: report_size,
+            };
 
             let Some(query_snapshot) = owner
                 .impl_
@@ -570,6 +597,12 @@ impl QueryCacheBase {
             if let Some(streamer) = owner.impl_.get_streamer_for_query_type_mut(streamer_id) {
                 streamer.set_accumulation_value(final_value);
             }
+            // Lichii CounterReport's operation (query_cache.h:360).
+            Self::finish_reads(
+                &owner.impl_,
+                cpu_addr,
+                if query_flags.intersects(QueryFlagBits::HAS_TIMESTAMP) { 16 } else { 4 },
+            );
             let timestamp = if query_flags.intersects(QueryFlagBits::HAS_TIMESTAMP) {
                 owner
                     .impl_
@@ -1039,7 +1072,32 @@ impl QueryCacheBase {
         let Some(query) = impl_.obtain_query(location).cloned() else {
             return false;
         };
+        // Lichii SemiFlushQueryDirty (query_cache.h:706-707), ahead of the
+        // write semi_flush_query_value makes.
+        if query.flags.contains(QueryFlagBits::IS_FINAL_VALUE_SYNCED)
+            && !query.flags.contains(QueryFlagBits::IS_GUEST_SYNCED)
+        {
+            let size = if query.flags.contains(QueryFlagBits::HAS_TIMESTAMP) { 8 } else { 4 };
+            Self::finish_reads(impl_, query.guest_address, size);
+        }
         Self::semi_flush_query_value(&query, impl_.device_memory_mut())
+    }
+
+    /// Before a report's bytes go to guest memory: a download for a guest
+    /// read still on its way would write the GPU's older copy over them later
+    /// (as `MemoryManager::write`).
+    ///
+    /// Lichii `QueryCacheBase::FinishReads` (query_cache.h:739-750; async
+    /// read-back, DIFF.md 2026-11-15). SemiFlushQueryDirty asks with
+    /// cache_mutex held, which no holder of the buffer cache's lock takes.
+    /// The results it guards are written through device memory pointers, as
+    /// in Lichii, with no memory manager lock held.
+    fn finish_reads(impl_: &QueryCacheBaseImpl, address: VAddr, size: usize) {
+        if crate::rasterizer_download_area::read_downloads_may_cover(address, size as u64) {
+            if let Some(rasterizer) = impl_.rasterizer {
+                unsafe { (&mut *rasterizer).finish_read(address, size as u64) };
+            }
+        }
     }
 
     fn semi_flush_query_value(
@@ -1425,6 +1483,7 @@ mod tests {
                 start_address: 0,
                 end_address: 0,
                 preemtive: false,
+                in_flight: false,
             }
         }
         fn invalidate_region(

@@ -752,6 +752,39 @@ pub trait BufferCacheRuntime {
     /// Wait until the host GPU reaches `tick`.
     fn wait(&mut self, _tick: u64) {}
 
+    // -- Async read-back (Lichii vk_buffer_cache.h:138-156) --
+    //
+    // Only a backend whose rasterizer overrides `flush_region_for_read`
+    // (Vulkan, as in Lichii, where these exist on the Vulkan runtime alone)
+    // ever records a read download, and nothing else calls these: the
+    // defaults mark the other backends' paths as unreachable.
+
+    /// Lichii `BufferCacheRuntime::SubmitForHostRead`: `FinishForHostRead`
+    /// without the wait. Submits, and returns the tick to wait for.
+    fn submit_for_host_read(&mut self) -> u64 {
+        unreachable!("only runtimes whose rasterizer takes read downloads submit them")
+    }
+
+    /// Lichii `BufferCacheRuntime::QueueForHostRead`: `submit_for_host_read`
+    /// without the submission when the scheduler can defer it. Returns the
+    /// tick the copies go in.
+    fn queue_for_host_read(&mut self) -> u64 {
+        unreachable!("only runtimes whose rasterizer takes read downloads queue them")
+    }
+
+    /// Lichii `BufferCacheRuntime::WaitForHostRead`: waits for a
+    /// `submit_for_host_read` tick, on any thread. Takes `&self` because the
+    /// reading thread calls it without the buffer cache's lock.
+    fn wait_for_host_read(&self, _tick: u64) {
+        unreachable!("only runtimes whose rasterizer takes read downloads wait for them")
+    }
+
+    /// Lichii `BufferCacheRuntime::IsFreeNow`: whether the host GPU completed
+    /// `tick`, asking it when the tick is submitted but not known to be done.
+    fn is_free_now(&mut self, _tick: u64) -> bool {
+        unreachable!("only runtimes whose rasterizer takes read downloads poll them")
+    }
+
     // -- Staging buffers --
 
     /// Allocate a staging buffer for CPU→GPU upload.
@@ -1165,6 +1198,12 @@ pub(crate) struct TestBufferCacheRuntime {
     pub(crate) waited_ticks: Vec<u64>,
     pub(crate) queried_ticks: Vec<u64>,
     pub(crate) finish_count: usize,
+    /// Ticks returned by `submit_for_host_read`, in order.
+    pub(crate) host_read_submits: Vec<u64>,
+    /// Ticks returned by `queue_for_host_read`, in order.
+    pub(crate) host_read_queues: Vec<u64>,
+    /// Ticks `wait_for_host_read` waited for (it takes `&self`).
+    pub(crate) host_read_waits: parking_lot::Mutex<Vec<u64>>,
     limit_dynamic_storage_buffers: bool,
     max_dynamic_storage_buffers: u32,
     can_report_memory_usage: bool,
@@ -1279,6 +1318,30 @@ impl BufferCacheRuntime for TestBufferCacheRuntime {
     fn wait(&mut self, tick: u64) {
         self.waited_ticks.push(tick);
         self.completed_tick = self.completed_tick.max(tick);
+    }
+
+    /// Models `Scheduler::Flush`: the submitted tick is the current one, and
+    /// the next submission gets the one after it.
+    fn submit_for_host_read(&mut self) -> u64 {
+        self.current_tick += 1;
+        self.host_read_submits.push(self.current_tick);
+        self.current_tick
+    }
+
+    fn wait_for_host_read(&self, tick: u64) {
+        self.host_read_waits.lock().push(tick);
+    }
+
+    /// Models a queued submission: the copies go in the current tick, which
+    /// the next submission completes.
+    fn queue_for_host_read(&mut self) -> u64 {
+        self.current_tick += 1;
+        self.host_read_queues.push(self.current_tick);
+        self.current_tick
+    }
+
+    fn is_free_now(&mut self, tick: u64) -> bool {
+        self.is_free(tick)
     }
 
     fn upload_staging_buffer(&mut self, size: u64) -> Self::AsyncBuffer {
@@ -1558,6 +1621,14 @@ pub trait GpuMemoryAccess {
         Vec::new()
     }
 }
+
+/// Where the CPU writes into GPU-written memory that were collected but not
+/// applied yet come from: downloads must not write the GPU's older copy over
+/// them. The source calls its argument once per pending `(address, size)`.
+///
+/// Lichii `BufferCache<P>::PendingCpuWrites` (buffer_cache_base.h:444-449),
+/// fed by `GPU::ForEachPendingCpuWrite` (async read-back, DIFF.md 2026-11-15).
+pub type PendingCpuWrites = std::sync::Arc<dyn Fn(&mut dyn FnMut(u64, usize)) + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // DeviceMemoryAccess trait — host CPU memory read/write

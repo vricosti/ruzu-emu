@@ -907,6 +907,13 @@ impl RendererBase for RendererVulkan {
     ) {
         self.rasterizer.set_invalidate_gpu_cache_callback(callback);
     }
+
+    fn set_pending_cpu_writes(
+        &mut self,
+        source: crate::buffer_cache::buffer_cache_base::PendingCpuWrites,
+    ) {
+        self.rasterizer.set_pending_cpu_writes(source);
+    }
 }
 
 fn map_window_type(

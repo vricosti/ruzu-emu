@@ -1487,6 +1487,17 @@ impl RasterizerVulkan {
         self.invalidate_gpu_cache_callback = Some(callback);
     }
 
+    /// Lichii `RasterizerVulkan`'s constructor (vk_rasterizer.cpp:468-471):
+    /// `buffer_cache.SetPendingCpuWrites(gpu.ForEachPendingCpuWrite)`.
+    pub fn set_pending_cpu_writes(
+        &mut self,
+        source: crate::buffer_cache::buffer_cache_base::PendingCpuWrites,
+    ) {
+        let mutex = Arc::clone(&self.common_buffer_cache.mutex);
+        let _buffer_guard = mutex.lock();
+        self.common_buffer_cache.set_pending_cpu_writes(source);
+    }
+
     /// Request one deferred transport buffer for the current mesh draw. It is
     /// held in `mesh_draw_buffers` until `release_mesh_emulation_buffers`
     /// (Lichii vk_rasterizer.cpp:1113-1115 and 1134-1142).
@@ -2122,6 +2133,12 @@ impl RasterizerVulkan {
             QueryType::ZPassPixelCount64 as u32,
             zpass_pixel_count_enabled,
         );
+
+        // Lichii PrepareDraw calls BufferCache::NoteWorkRecorded(false) right
+        // after recording the draw (vk_rasterizer.cpp:1309): it only lands the
+        // early downloads the host GPU completed, so it is done here, before
+        // the draw's several early returns, with the caches still locked.
+        self.common_buffer_cache.note_work_recorded(false);
 
         // 7. Issue draw call
         let _record_scope = ProfileScope::new(ProfileZone::DrawRecord);
@@ -4116,6 +4133,8 @@ impl RasterizerInterface for RasterizerVulkan {
                 let device = device.get().get_logical();
                 device.cmd_dispatch_indirect(cmdbuf, indirect_buffer, offset as u64);
             });
+            // Lichii DispatchCompute (vk_rasterizer.cpp:2482).
+            self.common_buffer_cache.note_work_recorded(true);
             return;
         }
 
@@ -4156,6 +4175,8 @@ impl RasterizerInterface for RasterizerVulkan {
             let device = device.get().get_logical();
             device.cmd_dispatch(cmdbuf, dim[0], dim[1], dim[2]);
         });
+        // Lichii DispatchCompute (vk_rasterizer.cpp:2545).
+        self.common_buffer_cache.note_work_recorded(true);
         if is_active() && *common::settings::values().gpu_log_vulkan_calls.get_value() {
             get_instance().log_vulkan_call(
                 "vkCmdDispatch",
@@ -4319,6 +4340,59 @@ impl RasterizerInterface for RasterizerVulkan {
         }
     }
 
+    /// Lichii `RasterizerVulkan::FlushRegionForRead` (vk_rasterizer.cpp:2741-2757):
+    /// as `flush_region`, but the buffer cache doesn't wait for the host GPU
+    /// here (with its lock held): the reading thread does, in `finish_read`.
+    fn flush_region_for_read(&mut self, addr: u64, size: u64) {
+        if addr == 0 || size == 0 {
+            return;
+        }
+        self.invalidate_gpu_cache();
+        unsafe {
+            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+            let _texture_guard = (*texture_mutex).lock();
+            self.texture_cache.download_memory(addr, size as usize);
+        }
+        unsafe {
+            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+            let _buffer_guard = (*buffer_mutex).lock();
+            self.common_buffer_cache.download_memory_for_read(addr, size);
+        }
+        self.query_cache.flush_region(addr, size as usize);
+    }
+
+    /// Lichii `RasterizerVulkan::FinishRead` (vk_rasterizer.cpp:2759-2761).
+    fn finish_read(&mut self, addr: u64, size: u64) {
+        let cache: *mut VulkanCommonBufferCache = &mut *self.common_buffer_cache;
+        // SAFETY: the boxed cache outlives the rasterizer's callers;
+        // finish_read_downloads takes the cache's lock itself.
+        let _ = unsafe { VulkanCommonBufferCache::finish_read_downloads(cache, addr, size) };
+    }
+
+    /// Lichii `RasterizerVulkan::NoteReportPending` (vk_rasterizer.cpp:2763-2771):
+    /// a report per draw, rarely on a page the guest reads back: most skip the
+    /// buffer cache's lock.
+    fn note_report_pending(&mut self, addr: u64, size: u64) -> bool {
+        if !self.common_buffer_cache.may_be_read_back_page(addr) {
+            return false;
+        }
+        let mutex = Arc::clone(&self.common_buffer_cache.mutex);
+        let _buffer_guard = mutex.lock();
+        self.common_buffer_cache.note_report_pending(addr, size)
+    }
+
+    /// Lichii `RasterizerVulkan::FinishReport` (vk_rasterizer.cpp:2773-2776).
+    fn finish_report(&mut self, addr: u64, size: u64) {
+        let mutex = Arc::clone(&self.common_buffer_cache.mutex);
+        let _buffer_guard = mutex.lock();
+        self.common_buffer_cache.finish_report(addr, size);
+    }
+
+    /// Without the buffer cache's lock: see `BufferCache::supersede_read_downloads`.
+    fn supersede_read_downloads(&mut self, addr: u64, size: u64) {
+        self.common_buffer_cache.supersede_read_downloads(addr, size);
+    }
+
     fn must_flush_region(&self, addr: u64, size: u64, which: CacheType) -> bool {
         if which.contains(CacheType::BUFFER_CACHE) {
             let _buffer_guard = self.common_buffer_cache.mutex.lock();
@@ -4364,6 +4438,7 @@ impl RasterizerInterface for RasterizerVulkan {
                         start_address: area.start_address,
                         end_address: area.end_address,
                         preemtive: area.preemtive,
+                        in_flight: area.in_flight,
                     };
                 }
             }
@@ -4372,6 +4447,7 @@ impl RasterizerInterface for RasterizerVulkan {
             start_address: align_down(addr, PAGE_SIZE_U64),
             end_address: align_up(addr.wrapping_add(size), PAGE_SIZE_U64),
             preemtive: true,
+            in_flight: false,
         }
     }
 

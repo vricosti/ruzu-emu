@@ -248,6 +248,7 @@ impl RasterizerInterface for RasterizerNull {
             end_address: addr.wrapping_add(size).wrapping_add(DEVICE_PAGESIZE - 1)
                 & !(DEVICE_PAGESIZE - 1),
             preemtive: true,
+            in_flight: false,
         }
     }
 

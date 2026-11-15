@@ -905,6 +905,41 @@ impl GpuMemoryManager {
         }
     }
 
+    /// A download for a guest read not yet in guest memory would land over
+    /// this write later: finish those it overlaps first.
+    ///
+    /// Lichii `MemoryManager::FinishReadsBefore` (memory_manager.cpp:550-562;
+    /// async read-back, DIFF.md 2026-11-15). Its EDEN_NX2_READ_CHECK note is
+    /// a diagnostic and is not ported.
+    ///
+    /// Lichii lands the downloads here (`FinishRead`), which takes the buffer
+    /// cache's lock. ruzu's callers hold this memory manager's
+    /// `ParkingLotMutex`, which buffer cache lock holders take too: the GPU
+    /// thread, drawing with the buffer and texture caches locked, looks image
+    /// views up through it (`TextureCacheBase::find_image_view_with_gpu_to_cpu`),
+    /// while the fencing thread writes query results through it
+    /// (`renderer_vulkan::query_cache::write_query_result`). Landing here
+    /// deadlocked those two threads (stacks taken in a hung run,
+    /// DIFF.md 2026-11-15). It calls `supersede_read_downloads` instead, which
+    /// takes no buffer cache lock and leaves guest memory and the GPU-modified
+    /// ranges as landing then writing would.
+    pub(crate) fn finish_reads_before(&self, dev_addr: u64, size: usize) {
+        if crate::rasterizer_download_area::G_READ_DOWNLOADS.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let Some(handle) = self.rasterizer else {
+            return;
+        };
+        if !crate::rasterizer_download_area::read_downloads_may_cover(dev_addr, size as u64) {
+            return;
+        }
+        unsafe {
+            handle.with_mut(|rasterizer| {
+                rasterizer.supersede_read_downloads(dev_addr, size as u64);
+            });
+        }
+    }
+
     fn invalidate_device_segment(&self, dev_addr: u64, size: usize, which: CacheType) {
         let Some(handle) = self.rasterizer else {
             return;
@@ -1155,6 +1190,7 @@ impl GpuMemoryManager {
                     let dev_addr_base =
                         (self.big_page_table_dev[page_index] as u64) << CPU_PAGE_BITS;
                     let dev_addr = dev_addr_base + page_offset as u64;
+                    self.finish_reads_before(dev_addr, copy_amount);
                     write_cpu_mem(dev_addr, &src[src_offset..src_offset + copy_amount]);
                     src_offset += copy_amount;
                 }
@@ -1209,6 +1245,7 @@ impl GpuMemoryManager {
                     let dev_addr_base =
                         (self.big_page_table_dev[page_index] as u64) << CPU_PAGE_BITS;
                     let dev_addr = dev_addr_base + page_offset as u64;
+                    self.finish_reads_before(dev_addr, copy_amount);
                     self.invalidate_device_segment(dev_addr, copy_amount, which);
                     write_cpu_mem(dev_addr, &src[src_offset..src_offset + copy_amount]);
                     src_offset += copy_amount;
@@ -1254,6 +1291,7 @@ impl GpuMemoryManager {
             if entry == EntryType::Mapped {
                 let dev_addr_base = (self.page_table[page_index] as u64) << CPU_PAGE_BITS;
                 let dev_addr = dev_addr_base + page_offset as u64;
+                self.finish_reads_before(dev_addr, copy_amount);
                 self.invalidate_device_segment(dev_addr, copy_amount, which);
                 write_cpu_mem(dev_addr, &src[src_offset..src_offset + copy_amount]);
             }
@@ -1284,6 +1322,7 @@ impl GpuMemoryManager {
             if entry == EntryType::Mapped {
                 let dev_addr_base = (self.page_table[page_index] as u64) << CPU_PAGE_BITS;
                 let dev_addr = dev_addr_base + page_offset as u64;
+                self.finish_reads_before(dev_addr, copy_amount);
                 write_cpu_mem(dev_addr, &src[src_offset..src_offset + copy_amount]);
             }
             // For Reserved/Free, just skip (advance src).
@@ -2435,6 +2474,14 @@ impl MemoryManager {
     /// scalar types.
     #[inline]
     pub(crate) fn write<T: MemoryValue>(&mut self, gpu_addr: u64, data: T) {
+        // Lichii MemoryManager::Write<T> (memory_manager.cpp:338-350): a
+        // download for a guest read not yet in guest memory would land over
+        // this write later.
+        if crate::rasterizer_download_area::G_READ_DOWNLOADS.load(Ordering::Relaxed) != 0 {
+            if let Some(address) = self.inner.gpu_to_cpu_address(gpu_addr) {
+                self.inner.finish_reads_before(address, std::mem::size_of::<T>());
+            }
+        }
         let page_pointer = self.get_pointer(gpu_addr);
         if !page_pointer.is_null() {
             // Match Eden's memcpy fast path, including unaligned addresses.
@@ -2904,6 +2951,7 @@ mod tests {
                 start_address: addr,
                 end_address: addr + size,
                 preemtive: false,
+                in_flight: false,
             }
         }
         fn invalidate_region(&mut self, addr: u64, size: u64, which: CacheType) {

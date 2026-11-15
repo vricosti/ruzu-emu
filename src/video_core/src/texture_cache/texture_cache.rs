@@ -1271,6 +1271,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     start_address: cpu_addr,
                     end_address: cpu_addr.wrapping_add(size as u64),
                     preemtive: true,
+                    in_flight: false,
                 });
                 current.start_address = current.start_address.min(image.cpu_addr);
                 current.end_address = current.end_address.max(image.cpu_addr_end);

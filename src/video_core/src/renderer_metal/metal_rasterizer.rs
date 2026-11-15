@@ -2618,6 +2618,7 @@ impl RasterizerInterface for MetalRasterizer {
                         start_address: area.start_address,
                         end_address: area.end_address,
                         preemtive: area.preemtive,
+                        in_flight: area.in_flight,
                     };
                 }
             }
@@ -2627,6 +2628,7 @@ impl RasterizerInterface for MetalRasterizer {
             start_address: addr & !(PAGE - 1),
             end_address: (addr + size + PAGE - 1) & !(PAGE - 1),
             preemtive: true,
+            in_flight: false,
         }
     }
 

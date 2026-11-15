@@ -3289,6 +3289,7 @@ mod tests {
                 start_address: 0,
                 end_address: 0,
                 preemtive: false,
+                in_flight: false,
             }
         }
 

@@ -16,6 +16,7 @@
 
 use std::collections::VecDeque;
 use std::ptr::NonNull;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use common::div_ceil::div_ceil;
@@ -33,6 +34,7 @@ use crate::engines::draw_manager::Maxwell3DAccess;
 use crate::engines::kepler_compute::KeplerCompute;
 use crate::engines::maxwell_3d::Maxwell3D;
 use crate::host1x::gpu_device_memory_manager::AS_BITS;
+use crate::rasterizer_download_area::{DownloadLanding, G_READ_DOWNLOADS};
 use crate::surface::PixelFormat;
 
 use super::buffer_cache_base::*;
@@ -206,6 +208,45 @@ pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
     /// Upstream: `Common::OverlapRangeSet<DAddr> async_downloads`
     async_downloads: OverlapRangeSet,
 
+    // -- Async read-back (Lichii buffer_cache_base.h:1026, 1135-1149) --
+    /// Where the CPU writes into GPU-written memory that were collected but
+    /// not applied yet come from: downloads must not write the GPU's older
+    /// copy over them. Lichii `pending_cpu_writes`.
+    pending_cpu_writes: Option<PendingCpuWrites>,
+    /// Oldest first, and written to guest memory in that order: none lands
+    /// over newer bytes. Lichii `read_downloads`.
+    read_downloads: VecDeque<ReadDownload<P::AsyncBuffer>>,
+    /// All the read downloads' clean_ranges (they don't overlap): GPU-modified
+    /// bytes already on their way, which later reads wait for rather than
+    /// download again. Lichii `read_download_ranges`.
+    read_download_ranges: RangeSet,
+    /// Read downloads recorded so far, and the GPU-side writes published by
+    /// `supersede_read_downloads` with the count when each was made.
+    /// ruzu-specific (DIFF.md 2026-11-15).
+    read_download_sequence: std::sync::atomic::AtomicU64,
+    superseding_writes: std::sync::Mutex<Vec<(VAddr, u64, u64)>>,
+    /// The areas guest CPU reads found GPU-written on Switch 2 titles: the
+    /// guest soon reads them again, so the next download takes their
+    /// GPU-modified bytes too. Lichii `cpu_read_ranges` and
+    /// `download_cpu_read_ranges` (buffer_cache_base.h:1014-1015).
+    cpu_read_ranges: RangeSet,
+    download_cpu_read_ranges: bool,
+    /// Pages the guest CPU reads GPU writes from, sorted by page (Lichii
+    /// `read_back_pages`, buffer_cache_base.h:1138-1165).
+    read_back_pages: Vec<ReadBackPage>,
+    /// The first and last page of read_back_pages (`may_be_read_back_page`),
+    /// set under `mutex`.
+    read_back_first: std::sync::atomic::AtomicU64,
+    read_back_last: std::sync::atomic::AtomicU64,
+    /// `note_report_pending`'s results not yet written, oldest first.
+    pending_reports: Vec<PendingReport>,
+    /// Pages to download once the work writing them is recorded.
+    early_pages: SmallVec<[VAddr; 8]>,
+    read_back_reads: u64,
+    early_bytes_this_frame: u64,
+    pending_early_downloads: u32,
+    early_landing_checks: u32,
+
     // -- Immediate buffer --
     immediate_buffer_alloc: Vec<u8>,
 
@@ -298,6 +339,22 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             pending_downloads: VecDeque::new(),
             async_buffers_death_ring: VecDeque::new(),
             async_downloads: OverlapRangeSet::new(),
+            pending_cpu_writes: None,
+            read_downloads: VecDeque::new(),
+            read_download_ranges: RangeSet::new(),
+            read_download_sequence: std::sync::atomic::AtomicU64::new(0),
+            superseding_writes: std::sync::Mutex::new(Vec::new()),
+            cpu_read_ranges: RangeSet::new(),
+            download_cpu_read_ranges: false,
+            read_back_pages: Vec::new(),
+            read_back_first: std::sync::atomic::AtomicU64::new(!0),
+            read_back_last: std::sync::atomic::AtomicU64::new(0),
+            pending_reports: Vec::new(),
+            early_pages: SmallVec::new(),
+            read_back_reads: 0,
+            early_bytes_this_frame: 0,
+            pending_early_downloads: 0,
+            early_landing_checks: 0,
             immediate_buffer_alloc: Vec::new(),
             frame_tick: 0,
             total_used_memory: 0,
@@ -488,6 +545,19 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
 
         self.delayed_destruction_ring.tick();
 
+        // Lichii TickFrame (buffer_cache.h:217-226). Pages draws wrote: their
+        // early downloads, now that the frame's work is recorded.
+        self.record_early_downloads();
+        self.early_bytes_this_frame = 0;
+        // Read downloads no thread waited for (the other ranges the guest read
+        // before, early ones).
+        if !P::IS_OPENGL {
+            if let Some(front_tick) = self.read_downloads.front().map(|download| download.tick) {
+                let _ = self.runtime.is_free_now(front_tick);
+            }
+        }
+        self.write_completed_read_downloads();
+
         // Free deferred staging buffers from last frame.
         // Upstream: for (auto& buffer : async_buffers_death_ring) {
         //     runtime.FreeDeferredStagingBuffer(buffer);
@@ -515,7 +585,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Upstream: `BufferCache<P>::WriteMemory`
     pub fn write_memory(&mut self, device_addr: VAddr, size: u64) {
         if self.is_region_gpu_modified(device_addr, size as usize) {
-            self.clear_download(device_addr, size);
+            // Lichii WriteMemory (buffer_cache.h:279-281): the guest's newer
+            // bytes are already in guest memory, so a read download over them
+            // is cut, not landed.
+            self.clear_replaced_download(device_addr, size);
             self.gpu_modified_ranges
                 .subtract(device_addr, size as usize);
         }
@@ -546,6 +619,14 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         }
         // Upstream: device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size)
         //           InlineMemoryImplementation(device_addr, size, tmp_buffer)
+        //
+        // Async read-back (DIFF.md 2026-11-15): this applies a gathered guest
+        // CPU write whose bytes are already in guest memory. Lichii applies
+        // those through ClaimCpuWrites, which cuts read downloads with
+        // ClearReplacedDownload instead of landing them (buffer_cache.h:2164-
+        // 2173). Cut them here, so InlineMemoryImplementation's ClearDownload
+        // finds none to land (and never waits for the host GPU).
+        self.clear_replaced_download(device_addr, size);
         if let Some(ref dm) = self.device_memory {
             let mut tmp_buffer = std::mem::take(&mut self.tmp_buffer);
             tmp_buffer.resize(size as usize, 0);
@@ -585,7 +666,17 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Download GPU-modified memory back to the CPU for the given range.
     ///
     /// Upstream: `BufferCache<P>::DownloadMemory`
+    ///
+    /// Lichii (buffer_cache.h:437-460): after a read added an area to
+    /// `cpu_read_ranges`, the download takes the GPU-modified bytes of every
+    /// range the guest read too, in one wait (`download_ranges_memory`).
     pub fn download_memory(&mut self, device_addr: VAddr, size: u64) {
+        if P::USE_MEMORY_MAPS && self.download_cpu_read_ranges {
+            self.download_cpu_read_ranges = false;
+            let ranges = self.ranges_with_cpu_read_ranges(device_addr, size);
+            self.download_ranges_memory(&ranges);
+            return;
+        }
         let mut buffer_ids: SmallVec<[BufferId; 4]> = SmallVec::new();
         self.for_each_buffer_in_range(device_addr, size, |buffer_id, _buffer| {
             buffer_ids.push(buffer_id);
@@ -615,24 +706,83 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             && !self.has_gpu_writes_not_downloaded_at_fence(
                 device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned)
         {
+            // Lichii GetFlushArea (buffer_cache.h:366-371): fence downloads
+            // keep it, once the first read's download is in guest memory.
+            let in_flight = self.read_downloads.iter().any(|download| {
+                range_set_intersects(
+                    &download.write_ranges,
+                    device_addr_start_aligned,
+                    device_addr_end_aligned - device_addr_start_aligned,
+                )
+            });
             self.forget_read_traps(device_addr_start_aligned,
                 device_addr_end_aligned - device_addr_start_aligned);
             return Some(RasterizerDownloadArea {
                 start_address: device_addr_start_aligned,
                 end_address: device_addr_end_aligned,
-                preemtive: true,
+                preemtive: !in_flight,
+                in_flight,
             });
         }
 
-        let preemtive = !self.is_region_gpu_modified(
+        let mut preemtive = !self.is_region_gpu_modified(
             device_addr_start_aligned,
             device_addr_end_aligned.wrapping_sub(device_addr_start_aligned) as usize,
         );
+        // Lichii GetFlushArea (buffer_cache.h:379-403; its EDEN_NX2_READ_CHECK
+        // part is not ported).
+        self.note_read_back(device_addr_start_aligned, device_addr_end_aligned, !preemtive);
+        if !preemtive
+            && !self.read_downloads.is_empty()
+            && self.read_downloads_cover(
+                device_addr_start_aligned,
+                device_addr_end_aligned - device_addr_start_aligned,
+            )
+        {
+            // All of it on its way for an earlier read: no new copies. The
+            // core took the trap, as below.
+            self.forget_read_traps(device_addr_start_aligned,
+                device_addr_end_aligned - device_addr_start_aligned);
+            if !self.write_finished_read_downloads(
+                device_addr_start_aligned,
+                device_addr_end_aligned - device_addr_start_aligned,
+            ) {
+                return Some(RasterizerDownloadArea {
+                    start_address: device_addr_start_aligned,
+                    end_address: device_addr_end_aligned,
+                    preemtive,
+                    in_flight: true,
+                });
+            }
+            // The host GPU had run them: in guest memory now, nothing is left
+            // to wait for.
+            preemtive = !self.is_region_gpu_modified(
+                device_addr_start_aligned,
+                device_addr_end_aligned.wrapping_sub(device_addr_start_aligned) as usize,
+            );
+            if preemtive {
+                return Some(RasterizerDownloadArea {
+                    start_address: device_addr_start_aligned,
+                    end_address: device_addr_end_aligned,
+                    preemtive,
+                    in_flight: false,
+                });
+            }
+        }
         if self.async_buffer_downloads() {
             self.memory_tracker.mark_region_as_preflushable(
                 device_addr_start_aligned,
                 device_addr_end_aligned.wrapping_sub(device_addr_start_aligned),
             );
+        } else if !preemtive && P::USE_MEMORY_MAPS {
+            // Lichii GetFlushArea (buffer_cache.h:418-422): native titles keep
+            // read traps and flush on demand; the guest soon reads this area
+            // again, so later downloads take it too.
+            self.cpu_read_ranges.add(
+                device_addr_start_aligned,
+                (device_addr_end_aligned - device_addr_start_aligned) as usize,
+            );
+            self.download_cpu_read_ranges = true;
         }
         self.forget_read_traps(device_addr_start_aligned,
             device_addr_end_aligned - device_addr_start_aligned);
@@ -641,6 +791,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             start_address: device_addr_start_aligned,
             end_address: device_addr_end_aligned,
             preemtive,
+            in_flight: false,
         })
     }
 
@@ -1628,6 +1779,11 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     /// Upstream: `BufferCache<P>::PopAsyncBuffers`
     ///
     pub fn pop_async_buffers(&mut self) {
+        // Lichii PopAsyncBuffers (buffer_cache.h:2208-2210): the host GPU is
+        // past this fence: the read downloads taken before its copies are
+        // complete, and go to guest memory first. Those taken after took their
+        // bytes out of its copies (clear_fence_downloads).
+        self.write_completed_read_downloads();
         let Some(async_buffer) = self.async_buffers.pop_front() else {
             return;
         };
@@ -1754,6 +1910,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         let has_new_downloads = !tmp_intervals.is_empty();
         for &(addr, sz) in &tmp_intervals {
             self.gpu_modified_ranges.add(addr, sz as usize);
+            // Lichii DMACopy (buffer_cache.h:1495).
+            self.note_read_back_write(addr, sz);
         }
 
         self.slot_buffers[buffer_a].mark_usage(src_offset as u64, amount);
@@ -3638,6 +3796,10 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             let tick = needs_sync.then(|| self.runtime.current_tick());
             buffer.mark_written_region(tick, offset, u64::from(size));
         }
+        // Lichii MarkWrittenBuffer (buffer_cache.h:3286): a newer GPU write
+        // keeps its range GPU-modified when earlier read downloads land.
+        self.outdate_read_downloads(device_addr, u64::from(size));
+        self.note_read_back_write(device_addr, u64::from(size));
         self.memory_tracker
             .mark_region_as_gpu_modified(device_addr, size as u64);
         self.gpu_modified_ranges.add(device_addr, size as usize);
@@ -4119,7 +4281,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
                 largest_copy = largest_copy.max(new_size);
             }
 
-            self.clear_download(device_addr_out, range_size);
+            // Lichii DownloadBufferMemory (buffer_cache.h:4018): this download
+            // lands under the lock, newer than any read download over it.
+            self.clear_replaced_download(device_addr_out, range_size);
             self.gpu_modified_ranges
                 .subtract(device_addr_out, range_size as usize);
         }
@@ -4183,6 +4347,9 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
     fn delete_buffer(&mut self, buffer_id: BufferId, do_not_mark: bool) {
         self.read_trapped_ranges.subtract(self.slot_buffers[buffer_id].cpu_addr(),
             self.slot_buffers[buffer_id].size_bytes() as u64);
+        // Lichii DeleteBuffer (buffer_cache.h:4147).
+        self.cpu_read_ranges.subtract(self.slot_buffers[buffer_id].cpu_addr(),
+            self.slot_buffers[buffer_id].size_bytes());
         // Upstream: `if constexpr (requires { runtime.OnBufferDeleted(buffer); })`.
         self.runtime.on_buffer_deleted(&self.slot_buffers[buffer_id]);
         let Some(cs) = self.channel_caches.current_channel_state_mut() else {
@@ -4545,10 +4712,43 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             .is_some_and(|cs| ((cs.fast_bound_uniform_buffers[stage] >> binding_index) & 1) != 0)
     }
 
-    /// Remove `[base_addr, base_addr+size)` from all download tracking structures.
+    /// A write over `[device_addr, device_addr + size)` that guest memory
+    /// doesn't hold yet (a DMA copy or clear, a discarded write, an inline
+    /// write): lands the read downloads over it first, then drops the range
+    /// from every download, as Eden's `ClearDownload` did.
     ///
-    /// Upstream: `BufferCache<P>::ClearDownload`
-    fn clear_download(&mut self, base_addr: VAddr, size: u64) {
+    /// Lichii `BufferCache<P>::ClearDownload` (buffer_cache.h:1405-1412); the
+    /// landing counter it feeds is a diagnostic and is not ported.
+    fn clear_download(&mut self, device_addr: VAddr, size: u64) {
+        // SAFETY: `self` is exclusively borrowed here; the pointer is only
+        // reborrowed by `finish_read_downloads` for the duration of the call.
+        let _ = unsafe { Self::finish_read_downloads(self as *mut Self, device_addr, size) };
+        self.clear_replaced_download(device_addr, size);
+    }
+
+    /// For the callers that put the newer bytes in guest memory before a read
+    /// can find them (guest CPU writes, synchronous downloads landing under
+    /// the lock): takes the range out of every download, never waits.
+    ///
+    /// Lichii `BufferCache<P>::ClearReplacedDownload` (buffer_cache.h:1414-1431;
+    /// its EDEN_NX2_READ_CHECK bookkeeping is not ported).
+    fn clear_replaced_download(&mut self, device_addr: VAddr, size: u64) {
+        self.clear_fence_downloads(device_addr, size);
+        if !self.read_downloads.is_empty() {
+            for download in self.read_downloads.iter_mut() {
+                download.write_ranges.subtract(device_addr, size as usize);
+                download.clean_ranges.subtract(device_addr, size as usize);
+            }
+            self.read_download_ranges.subtract(device_addr, size as usize);
+        }
+    }
+
+    /// Remove `[base_addr, base_addr+size)` from the downloads taken at fences.
+    ///
+    /// Upstream: Eden `BufferCache<P>::ClearDownload`, which Lichii renamed
+    /// `ClearFenceDownloads` (buffer_cache.h:1433-1442) when ClearDownload
+    /// started landing read downloads.
+    fn clear_fence_downloads(&mut self, base_addr: VAddr, size: u64) {
         // Upstream: async_downloads.DeleteAll(base_addr, size);
         self.async_downloads.delete_all(base_addr, size as usize);
         self.uncommitted_gpu_modified_ranges
@@ -4611,6 +4811,881 @@ fn constexpr_align_up(total: &mut u64, new_size: u64, align: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Async read-back: Lichii's read downloads (DIFF.md 2026-11-15)
+// ---------------------------------------------------------------------------
+//
+// A guest CPU read of GPU-written buffer memory (`Gpu::on_cpu_read`) has the
+// GPU thread record and submit the copies (`download_memory_for_read`) and go
+// on. The reading thread waits for that submission and writes the bytes to
+// guest memory (`finish_read_downloads`). Ported from Lichii
+// `src/video_core/buffer_cache/buffer_cache.h` / `buffer_cache_base.h`
+// (commit 0b83798bf6, "async read-back"), with its `cpu_read_ranges` and its
+// early downloads (`record_early_downloads`, `note_read_back*`,
+// `note_report_pending`), without its EDEN_NX2_READ_CHECK verification and its
+// counters.
+
+/// A page the guest CPU read GPU writes from. Switch 2 titles read compute
+/// results back every frame, milliseconds after the dispatch that wrote them:
+/// a download recorded at the read waits for all the GPU work recorded in
+/// between. Pages read after each of their writes get their download recorded
+/// right behind the write instead (`record_early_downloads`), which the read
+/// finds landed or on its way (`get_flush_area`: in_flight).
+///
+/// Lichii `BufferCache<P>::ReadBackPage` (buffer_cache_base.h:1138-1150).
+#[derive(Debug, Clone, Copy, Default)]
+struct ReadBackPage {
+    page: VAddr,
+    /// read_back_reads at its last read of a write (eviction)
+    last_read: u64,
+    /// Writes in a row the guest read, up to EARLY_AFTER_READS
+    reads: u16,
+    /// GPU writes since its last read
+    unread_writes: u16,
+    /// A GPU write since its last read
+    written: bool,
+}
+
+/// Reads of a page's writes in a row before its writes get early downloads.
+const EARLY_AFTER_READS: u16 = 2;
+/// Writes in a row without a read that stop them.
+const MAX_UNREAD_WRITES: u16 = 4;
+const MAX_READ_BACK_PAGES: usize = 64;
+/// Early download bytes a frame, and early downloads not yet in guest memory:
+/// past them, reads flush on demand.
+const EARLY_BYTES_PER_FRAME: u64 = 1024 * 1024;
+const MAX_PENDING_EARLY_DOWNLOADS: u32 = 32;
+
+/// A query result written to guest memory later, kept while it lies on a
+/// read-back page (`note_report_pending`).
+///
+/// Lichii `BufferCache<P>::PendingReport` (buffer_cache_base.h:1166-1171).
+#[derive(Debug, Clone, Copy)]
+struct PendingReport {
+    addr: VAddr,
+    size: u64,
+    /// A GPU write over it since the report
+    rewritten: bool,
+}
+
+/// A `download_memory_for_read`: its copies, and what is left of them to do
+/// once the host GPU has run them.
+///
+/// Lichii `BufferCache<P>::ReadDownload` (buffer_cache_base.h:1121-1141; its
+/// EDEN_NX2_READ_CHECK `check` member is not ported).
+struct ReadDownload<A> {
+    /// The submission with the copies.
+    tick: u64,
+    /// Its place among the read downloads recorded (`supersede_read_downloads`).
+    sequence: u64,
+    staging: A,
+    /// src_offset: the device address copied; dst_offset: where it is in
+    /// `staging`.
+    copies: SmallVec<[BufferCopy; 4]>,
+    /// Still to write to guest memory: a newer value there
+    /// (`clear_replaced_download`) takes its bytes out. A newer GPU write
+    /// doesn't: until a download of its own lands, guest memory is to hold
+    /// what a synchronous flush would have left.
+    write_ranges: RangeSet,
+    /// No longer GPU-modified once written: a newer GPU write
+    /// (`outdate_read_downloads`) or value in guest memory takes its bytes out.
+    clean_ranges: RangeSet,
+    /// Recorded right after a GPU write, before any read (`record_early_downloads`).
+    early: bool,
+}
+
+/// Lichii `Common::RangeSet::Intersects`, which ruzu's `RangeSet` lacks.
+fn range_set_intersects(set: &RangeSet, addr: u64, size: u64) -> bool {
+    let mut found = false;
+    set.for_each_in_range(addr, size as usize, |_, _| found = true);
+    found
+}
+
+impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
+    /// Lichii `BufferCache<P>::SetPendingCpuWrites` (buffer_cache_base.h:447).
+    pub fn set_pending_cpu_writes(&mut self, source: PendingCpuWrites) {
+        self.pending_cpu_writes = Some(source);
+    }
+
+    /// `download_memory` for a guest CPU read: submits the copies without
+    /// waiting for the host GPU, for `finish_read_downloads` to write to guest
+    /// memory. Their ranges stay GPU-modified until then, and another read of
+    /// them waits for these copies (`get_flush_area`: in_flight).
+    ///
+    /// Lichii `BufferCache<P>::DownloadMemoryForRead` (buffer_cache.h:574-591).
+    pub fn download_memory_for_read(&mut self, device_addr: VAddr, size: u64) {
+        if P::IS_OPENGL || !P::USE_MEMORY_MAPS {
+            self.download_memory(device_addr, size);
+            return;
+        }
+        self.write_completed_read_downloads();
+        // Early downloads still to record are of older writes: they go first.
+        self.record_early_downloads();
+        // The ranges download_memory takes: the guest CPU soon reads those it
+        // read before too.
+        let ranges = if self.download_cpu_read_ranges {
+            self.download_cpu_read_ranges = false;
+            self.ranges_with_cpu_read_ranges(device_addr, size)
+        } else {
+            SmallVec::from_slice(&[(device_addr, size)])
+        };
+        self.record_read_download(&ranges, false);
+    }
+
+    /// `[(device_addr, size)]` followed by the GPU-modified parts of every
+    /// `cpu_read_ranges` range, as Lichii DownloadMemory and
+    /// DownloadMemoryForRead build them (buffer_cache.h:440-447, 578-587).
+    fn ranges_with_cpu_read_ranges(
+        &self,
+        device_addr: VAddr,
+        size: u64,
+    ) -> SmallVec<[(VAddr, u64); 16]> {
+        let mut ranges: SmallVec<[(VAddr, u64); 16]> = SmallVec::new();
+        ranges.push((device_addr, size));
+        self.cpu_read_ranges.for_each(|lower, upper| {
+            self.gpu_modified_ranges.for_each_in_range(
+                lower,
+                (upper - lower) as usize,
+                |start, end| ranges.push((start, end - start)),
+            );
+        });
+        ranges
+    }
+
+    /// Records a read download of the GPU-modified bytes over `ranges` that no
+    /// read download brings yet, and submits it.
+    ///
+    /// Lichii `BufferCache<P>::RecordReadDownload` (buffer_cache.h:593-818),
+    /// without its `own` parameter (the read check's). A read's download is
+    /// submitted at once; an early one goes with the GPU thread's next
+    /// submission.
+    fn record_read_download(&mut self, ranges: &[(VAddr, u64)], early: bool) {
+        if P::IS_OPENGL || !P::USE_MEMORY_MAPS {
+            return;
+        }
+        let mut copies: SmallVec<[(BufferId, BufferCopy); 16]> = SmallVec::new();
+        let mut write_ranges = RangeSet::new();
+        let mut clean_ranges = RangeSet::new();
+        let mut total_size_bytes = 0u64;
+        for &(range_addr, range_size) in ranges {
+            let mut spans: SmallVec<[(BufferId, VAddr, VAddr, VAddr); 4]> = SmallVec::new();
+            self.for_each_buffer_in_range(range_addr, range_size, |buffer_id, buffer| {
+                let buffer_addr = buffer.cpu_addr();
+                let begin = range_addr.max(buffer_addr);
+                let end = (range_addr + range_size).min(buffer_addr + buffer.size_bytes() as u64);
+                if begin < end {
+                    spans.push((buffer_id, buffer_addr, begin, end));
+                }
+            });
+            for (buffer_id, buffer_addr, begin, end) in spans {
+                // The bytes download_buffer_memory_range takes, but they stay
+                // GPU-modified until they are in guest memory
+                // (write_read_downloads).
+                let mut runs: SmallVec<[(VAddr, u64); 4]> = SmallVec::new();
+                self.memory_tracker.for_each_download_range(
+                    begin,
+                    end - begin,
+                    false,
+                    &mut |run_addr, run_size| runs.push((run_addr, run_size)),
+                );
+                for (run_addr, run_size) in runs {
+                    let mut modified: SmallVec<[(VAddr, VAddr); 4]> = SmallVec::new();
+                    self.gpu_modified_ranges.for_each_in_range(
+                        run_addr,
+                        run_size as usize,
+                        |start, range_end| modified.push((start, range_end)),
+                    );
+                    for (start, range_end) in modified {
+                        // Without the bytes a read download already brings (an
+                        // earlier one, or this one: the ranges can overlap).
+                        let mut gaps: SmallVec<[(VAddr, VAddr); 8]> = SmallVec::new();
+                        let mut next = start;
+                        self.read_download_ranges.for_each_in_range(
+                            start,
+                            (range_end - start) as usize,
+                            |lower, upper| {
+                                if lower > next {
+                                    gaps.push((next, lower));
+                                }
+                                next = next.max(upper);
+                            },
+                        );
+                        if next < range_end {
+                            gaps.push((next, range_end));
+                        }
+                        for (gap_begin, gap_end) in gaps {
+                            let gap_size = gap_end - gap_begin;
+                            copies.push((
+                                buffer_id,
+                                BufferCopy {
+                                    src_offset: gap_begin - buffer_addr,
+                                    dst_offset: total_size_bytes,
+                                    size: gap_size,
+                                },
+                            ));
+                            constexpr_align_up(&mut total_size_bytes, gap_size, 64);
+                            write_ranges.add(gap_begin, gap_size as usize);
+                            clean_ranges.add(gap_begin, gap_size as usize);
+                            self.read_download_ranges.add(gap_begin, gap_size as usize);
+                        }
+                    }
+                    // The downloads taken at fences are older: they must not
+                    // land over these.
+                    self.clear_fence_downloads(run_addr, run_size);
+                }
+            }
+        }
+        if copies.is_empty() {
+            return;
+        }
+        let staging = self.runtime.download_staging_buffer(total_size_bytes, true);
+        let mut download_copies: SmallVec<[BufferCopy; 4]> = SmallVec::new();
+        for (buffer_id, mut copy) in copies {
+            copy.dst_offset += staging.offset();
+            self.slot_buffers[buffer_id].mark_usage(copy.src_offset, copy.size);
+            // Mapped buffers too: the GPU thread's later work may write them
+            // before the copy is read.
+            self.runtime.copy_buffer_to_staging(
+                &staging,
+                &self.slot_buffers[buffer_id],
+                std::slice::from_ref(&copy),
+                true,
+            );
+            download_copies.push(BufferCopy {
+                src_offset: self.slot_buffers[buffer_id].cpu_addr() + copy.src_offset,
+                dst_offset: copy.dst_offset,
+                size: copy.size,
+            });
+        }
+        // A read waits for its copies; an early download's go with the next
+        // submission.
+        let tick = if early {
+            self.runtime.queue_for_host_read()
+        } else {
+            self.runtime.submit_for_host_read()
+        };
+        if early {
+            self.pending_early_downloads += 1;
+            self.early_bytes_this_frame += total_size_bytes;
+        }
+        let sequence = self.read_download_sequence.fetch_add(1, Ordering::Release);
+        self.read_downloads.push_back(ReadDownload {
+            tick,
+            sequence,
+            staging,
+            copies: download_copies,
+            write_ranges,
+            clean_ranges,
+            early,
+        });
+        G_READ_DOWNLOADS.fetch_add(1, Ordering::Release);
+    }
+
+    /// Writes the `download_memory_for_read` copies over
+    /// `[device_addr, device_addr + size)`, and those submitted before them,
+    /// to guest memory, waiting for the host GPU if it must. Any thread: the
+    /// reading one before it reads, the GPU's side before it writes guest
+    /// memory there. Takes `mutex` itself (a caller holding it keeps it held
+    /// while the host GPU finishes). Returns how long it waited for the host
+    /// GPU in ns (at least 1 if it did), or `None` when no download was over
+    /// the range.
+    ///
+    /// Lichii `BufferCache<P>::FinishReadDownloads` (buffer_cache.h:819-850).
+    ///
+    /// # Safety
+    /// `this` must point to a live cache. It is only dereferenced with
+    /// `mutex` held, except for the runtime's `wait_for_host_read`, which the
+    /// Vulkan runtime serves from its scheduler's master semaphore alone. As
+    /// for every other cross-thread entry of this cache (`get_flush_area`,
+    /// `on_cpu_write`), the cache is reached through a raw pointer rather
+    /// than a `&mut` held across the unlocked wait.
+    pub unsafe fn finish_read_downloads(
+        this: *mut Self,
+        device_addr: VAddr,
+        size: u64,
+    ) -> Option<u64> {
+        if P::IS_OPENGL {
+            return None;
+        }
+        let mutex = Arc::clone(unsafe { &(*this).mutex });
+        let mut lock = mutex.lock();
+        // The newest one over the range: those before it are written first.
+        let tick = {
+            let cache = unsafe { &*this };
+            let mut tick = None;
+            for download in &cache.read_downloads {
+                if range_set_intersects(&download.write_ranges, device_addr, size) {
+                    tick = Some(download.tick);
+                }
+            }
+            tick
+        }?;
+        let mut waited = 0u64;
+        if !unsafe { (*this).runtime.is_free(tick) } {
+            drop(lock);
+            let wait_start = std::time::Instant::now();
+            unsafe { (*this).runtime.wait_for_host_read(tick) };
+            waited = (wait_start.elapsed().as_nanos() as u64).max(1);
+            lock = mutex.lock();
+        }
+        unsafe { (*this).write_read_downloads(tick) };
+        drop(lock);
+        Some(waited)
+    }
+
+    /// A GPU write into the buffers over `[device_addr, device_addr + size)`,
+    /// after the read downloads taken so far: they still write their older
+    /// bytes to guest memory, as synchronous ones would have, but a later read
+    /// takes the range again. `mark_written_buffer` does this for the writes it
+    /// records; the query cache's copies of its results call it themselves.
+    ///
+    /// Lichii `BufferCache<P>::OutdateReadDownloads` (buffer_cache.h:852-869).
+    pub fn outdate_read_downloads(&mut self, device_addr: VAddr, size: u64) {
+        // The bytes stay GPU-modified when the downloads land, so a later read
+        // downloads them.
+        if !self.read_downloads.is_empty() {
+            for download in self.read_downloads.iter_mut() {
+                download.clean_ranges.subtract(device_addr, size as usize);
+            }
+            self.read_download_ranges.subtract(device_addr, size as usize);
+        }
+    }
+
+    /// A write to guest memory from the GPU's side over the range is about to
+    /// be stored: the read downloads recorded before it must not land their
+    /// older bytes over it (`write_ranges`), but still clean those bytes when
+    /// they land (`clean_ranges` kept), which leaves guest memory and the
+    /// GPU-modified ranges as Lichii's `FinishReadDownloads` followed by the
+    /// write does. Returns once the write may be stored. Any thread, without
+    /// the cache's lock: it only publishes the write
+    /// (`apply_superseding_writes` takes it inside the next landing) and waits
+    /// for a landing under way over it (`DownloadLanding::r#await`), as a
+    /// guest CPU write does. Either that landing's look finds the write, or
+    /// the write finds the landing and is stored after it.
+    ///
+    /// ruzu-specific replacement of the `FinishRead` that Lichii's
+    /// `MemoryManager::FinishReadsBefore` and `QueryCacheBase::FinishReads`
+    /// call (DIFF.md 2026-11-15): their ruzu callers hold the memory
+    /// manager's `ParkingLotMutex`, and taking this cache's lock there
+    /// deadlocked.
+    pub fn supersede_read_downloads(&self, device_addr: VAddr, size: u64) {
+        if !crate::rasterizer_download_area::read_downloads_may_cover(device_addr, size) {
+            return;
+        }
+        let sequence = self.read_download_sequence.load(Ordering::Acquire);
+        self.superseding_writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((device_addr, size, sequence));
+        DownloadLanding::r#await(device_addr, size);
+    }
+
+    /// Applies the writes `supersede_read_downloads` published: each one takes
+    /// its bytes out of the `write_ranges` of the downloads recorded before it
+    /// (`first` is the download the caller already took off the queue).
+    /// Called inside a landing, under the cache's lock.
+    fn apply_superseding_writes(&mut self, first: &mut ReadDownload<P::AsyncBuffer>) {
+        let writes = std::mem::take(
+            &mut *self
+                .superseding_writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for (device_addr, size, sequence) in writes {
+            for download in std::iter::once(&mut *first).chain(self.read_downloads.iter_mut()) {
+                if download.sequence < sequence {
+                    download.write_ranges.subtract(device_addr, size as usize);
+                }
+            }
+        }
+    }
+
+    /// `write_read_downloads` up to the newest read download over the range,
+    /// if the host GPU ran it. Returns whether it did.
+    ///
+    /// Lichii `BufferCache<P>::WriteFinishedReadDownloads` (buffer_cache.h:871-889).
+    fn write_finished_read_downloads(&mut self, device_addr: VAddr, size: u64) -> bool {
+        if P::IS_OPENGL {
+            return false;
+        }
+        let mut tick = None;
+        for download in &self.read_downloads {
+            if range_set_intersects(&download.write_ranges, device_addr, size) {
+                tick = Some(download.tick);
+            }
+        }
+        let Some(tick) = tick else {
+            return false;
+        };
+        if !self.runtime.is_free_now(tick) {
+            return false;
+        }
+        self.write_read_downloads(tick);
+        true
+    }
+
+    /// After a draw (`dispatch` false) or a dispatch was recorded: a dispatch's
+    /// pages get their early downloads at once (the scheduler is outside any
+    /// render pass), and early downloads the host GPU ran go to guest memory,
+    /// where their reads then find them. Asking the host GPU is a call: after
+    /// each dispatch, and every few draws.
+    ///
+    /// Lichii `BufferCache<P>::NoteWorkRecorded` (buffer_cache.h:890-904).
+    pub fn note_work_recorded(&mut self, dispatch: bool) {
+        if P::IS_OPENGL || !P::USE_MEMORY_MAPS {
+            return;
+        }
+        if dispatch {
+            self.record_early_downloads();
+        }
+        if self.pending_early_downloads != 0 {
+            let check = dispatch || {
+                self.early_landing_checks = self.early_landing_checks.wrapping_add(1);
+                self.early_landing_checks % 32 == 0
+            };
+            if check {
+                let front_tick = self
+                    .read_downloads
+                    .front()
+                    .map(|download| download.tick)
+                    .expect("pending early downloads are read downloads");
+                if self.runtime.is_free_now(front_tick) {
+                    self.write_completed_read_downloads();
+                }
+            }
+        }
+    }
+
+    /// A guest read of the pages `[begin, end)`: learns which pages the guest
+    /// reads after the GPU writes them. `gpu_modified`: the read found GPU
+    /// writes not yet in guest memory.
+    ///
+    /// Lichii `BufferCache<P>::NoteReadBack` (buffer_cache.h:906-938).
+    fn note_read_back(&mut self, begin: VAddr, end: VAddr, gpu_modified: bool) {
+        if P::IS_OPENGL || !P::USE_MEMORY_MAPS {
+            return;
+        }
+        if !gpu_modified && self.read_back_pages.is_empty() {
+            return;
+        }
+        let mut page = begin;
+        while page < end {
+            let mut index = self.read_back_pages.partition_point(|entry| entry.page < page);
+            if index == self.read_back_pages.len() || self.read_back_pages[index].page != page {
+                // Learned from reads that find GPU writes.
+                if !gpu_modified {
+                    page += DEVICE_PAGESIZE;
+                    continue;
+                }
+                if self.read_back_pages.len() >= MAX_READ_BACK_PAGES {
+                    // The page whose writes were read longest ago makes room.
+                    let oldest = self
+                        .read_back_pages
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, entry)| entry.last_read)
+                        .map(|(index, _)| index)
+                        .expect("read_back_pages is full");
+                    self.read_back_pages.remove(oldest);
+                    index = self.read_back_pages.partition_point(|entry| entry.page < page);
+                }
+                self.read_back_pages.insert(
+                    index,
+                    ReadBackPage { page, written: true, ..ReadBackPage::default() },
+                );
+                self.read_back_first
+                    .store(self.read_back_pages[0].page, Ordering::Release);
+                self.read_back_last.store(
+                    self.read_back_pages[self.read_back_pages.len() - 1].page,
+                    Ordering::Release,
+                );
+            }
+            let entry = &mut self.read_back_pages[index];
+            if entry.written {
+                entry.written = false;
+                entry.unread_writes = 0;
+                entry.reads = (entry.reads + 1).min(EARLY_AFTER_READS);
+                self.read_back_reads += 1;
+                entry.last_read = self.read_back_reads;
+            }
+            // Otherwise nothing new since its last read.
+            page += DEVICE_PAGESIZE;
+        }
+    }
+
+    /// Any thread: whether `device_addr`'s page may be a read-back page, from
+    /// the first and last of them, without the cache's lock.
+    ///
+    /// Lichii `BufferCache<P>::MayBeReadBackPage` (buffer_cache_base.h:331-337).
+    pub fn may_be_read_back_page(&self, device_addr: VAddr) -> bool {
+        let page = device_addr & !(DEVICE_PAGESIZE - 1);
+        page >= self.read_back_first.load(Ordering::Acquire)
+            && page <= self.read_back_last.load(Ordering::Acquire)
+    }
+
+    /// A query result over `[device_addr, device_addr + size)` that the query
+    /// cache writes to guest memory later: kept while it lies on a page that
+    /// gets early downloads, so a GPU write over it after the report stays
+    /// GPU-modified when an early download lands it (`finish_report` ends it).
+    /// Returns whether it was kept.
+    ///
+    /// Lichii `BufferCache<P>::NoteReportPending` (buffer_cache.h:940-950).
+    pub fn note_report_pending(&mut self, device_addr: VAddr, size: u64) -> bool {
+        if !P::IS_OPENGL && P::USE_MEMORY_MAPS {
+            let page = device_addr & !(DEVICE_PAGESIZE - 1);
+            if self
+                .read_back_pages
+                .binary_search_by_key(&page, |entry| entry.page)
+                .is_ok()
+            {
+                self.pending_reports.push(PendingReport {
+                    addr: device_addr,
+                    size,
+                    rewritten: false,
+                });
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The query cache wrote or dropped a result `note_report_pending` kept.
+    ///
+    /// Lichii `BufferCache<P>::FinishReport` (buffer_cache.h:952-961).
+    pub fn finish_report(&mut self, device_addr: VAddr, size: u64) {
+        if let Some(index) = self
+            .pending_reports
+            .iter()
+            .position(|report| report.addr == device_addr && report.size == size)
+        {
+            self.pending_reports.remove(index);
+        }
+    }
+
+    /// A GPU write over `[device_addr, device_addr + size)`: marks the kept
+    /// query results it covers as rewritten, and learns the read-back pages it
+    /// writes, queueing early downloads for those the guest reads after each
+    /// write.
+    ///
+    /// Lichii `BufferCache<P>::NoteReadBackWrite` (buffer_cache.h:963-993).
+    fn note_read_back_write(&mut self, device_addr: VAddr, size: u64) {
+        if P::IS_OPENGL || !P::USE_MEMORY_MAPS {
+            return;
+        }
+        for report in &mut self.pending_reports {
+            if report.addr < device_addr + size && device_addr < report.addr + report.size {
+                report.rewritten = true;
+            }
+        }
+        if self.read_back_pages.is_empty() {
+            return;
+        }
+        let end = device_addr + size;
+        let mut index = self
+            .read_back_pages
+            .partition_point(|entry| entry.page < (device_addr & !(DEVICE_PAGESIZE - 1)));
+        while index < self.read_back_pages.len() && self.read_back_pages[index].page < end {
+            let entry = &mut self.read_back_pages[index];
+            entry.written = true;
+            if entry.unread_writes < MAX_UNREAD_WRITES {
+                entry.unread_writes += 1;
+            } else {
+                // The guest no longer reads it after its writes.
+                entry.reads = 0;
+            }
+            if entry.reads >= EARLY_AFTER_READS && !self.early_pages.contains(&entry.page) {
+                self.early_pages.push(entry.page);
+            }
+            index += 1;
+        }
+    }
+
+    /// Records the early downloads of the pages `note_read_back_write` queued,
+    /// right behind the work that wrote them. Bounded: past
+    /// MAX_PENDING_EARLY_DOWNLOADS or EARLY_BYTES_PER_FRAME, the reads of these
+    /// pages flush on demand.
+    ///
+    /// Lichii `BufferCache<P>::RecordEarlyDownloads` (buffer_cache.h:994-1012).
+    fn record_early_downloads(&mut self) {
+        if P::IS_OPENGL || !P::USE_MEMORY_MAPS {
+            return;
+        }
+        if self.early_pages.is_empty() {
+            return;
+        }
+        let pages: SmallVec<[(VAddr, u64); 8]> = self
+            .early_pages
+            .iter()
+            .map(|&page| (page, DEVICE_PAGESIZE))
+            .collect();
+        self.early_pages.clear();
+        if self.pending_early_downloads >= MAX_PENDING_EARLY_DOWNLOADS
+            || self.early_bytes_this_frame >= EARLY_BYTES_PER_FRAME
+        {
+            return;
+        }
+        self.record_read_download(&pages, true);
+    }
+
+    /// Downloads the GPU-modified bytes of several ranges with one wait for
+    /// the host GPU.
+    ///
+    /// Lichii `BufferCache<P>::DownloadRangesMemory` (buffer_cache.h:462-570).
+    /// ruzu's buffers have no persistent mapping (Lichii `Buffer::Mapped`), so
+    /// every copy goes through the staging buffer.
+    fn download_ranges_memory(&mut self, ranges: &[(VAddr, u64)]) {
+        if !P::USE_MEMORY_MAPS {
+            for &(device_addr, size) in ranges {
+                self.download_memory(device_addr, size);
+            }
+            return;
+        }
+        let mut staged: SmallVec<[(BufferId, BufferCopy); 16]> = SmallVec::new();
+        let mut total_size_bytes = 0u64;
+        for &(range_addr, range_size) in ranges {
+            let mut spans: SmallVec<[(BufferId, VAddr, VAddr, VAddr); 4]> = SmallVec::new();
+            self.for_each_buffer_in_range(range_addr, range_size, |buffer_id, buffer| {
+                let buffer_addr = buffer.cpu_addr();
+                let begin = range_addr.max(buffer_addr);
+                let end = (range_addr + range_size).min(buffer_addr + buffer.size_bytes() as u64);
+                if begin < end {
+                    spans.push((buffer_id, buffer_addr, begin, end));
+                }
+            });
+            for (buffer_id, buffer_addr, begin, end) in spans {
+                let mut runs: SmallVec<[(VAddr, u64); 4]> = SmallVec::new();
+                self.memory_tracker.for_each_download_range_and_clear(
+                    begin,
+                    end - begin,
+                    &mut |run_addr, run_size| runs.push((run_addr, run_size)),
+                );
+                for (run_addr, run_size) in runs {
+                    let mut modified: SmallVec<[(VAddr, VAddr); 4]> = SmallVec::new();
+                    self.gpu_modified_ranges.for_each_in_range(
+                        run_addr,
+                        run_size as usize,
+                        |start, range_end| modified.push((start, range_end)),
+                    );
+                    for (start, range_end) in modified {
+                        staged.push((
+                            buffer_id,
+                            BufferCopy {
+                                src_offset: start - buffer_addr,
+                                dst_offset: total_size_bytes,
+                                size: range_end - start,
+                            },
+                        ));
+                        constexpr_align_up(&mut total_size_bytes, range_end - start, 64);
+                    }
+                    self.clear_replaced_download(run_addr, run_size);
+                    self.gpu_modified_ranges.subtract(run_addr, run_size as usize);
+                }
+            }
+        }
+        if staged.is_empty() {
+            return;
+        }
+        let staging = self.runtime.download_staging_buffer(total_size_bytes, false);
+        for (buffer_id, copy) in staged.iter_mut() {
+            copy.dst_offset += staging.offset();
+            self.slot_buffers[*buffer_id].mark_usage(copy.src_offset, copy.size);
+            self.runtime.copy_buffer_to_staging(
+                &staging,
+                &self.slot_buffers[*buffer_id],
+                std::slice::from_ref(copy),
+                true,
+            );
+        }
+        self.runtime.finish();
+        // Once the host GPU ran the copies: the CPU writes collected meanwhile
+        // keep their bytes too.
+        let mut landing_begin = !0u64;
+        let mut landing_end = 0u64;
+        for (buffer_id, copy) in &staged {
+            let address = self.slot_buffers[*buffer_id].cpu_addr() + copy.src_offset;
+            landing_begin = landing_begin.min(address);
+            landing_end = landing_end.max(address + copy.size);
+        }
+        let landing = DownloadLanding::new(landing_begin, landing_end);
+        let cpu_written = self.pending_cpu_write_ranges();
+        let mapped = staging.mapped_span();
+        for (buffer_id, copy) in &staged {
+            let address = self.slot_buffers[*buffer_id].cpu_addr() + copy.src_offset;
+            let offset = (copy.dst_offset - staging.offset()) as usize;
+            self.write_downloaded_memory(
+                &cpu_written,
+                address,
+                &mapped[offset..offset + copy.size as usize],
+            );
+        }
+        drop(landing);
+    }
+
+    /// Writes the read downloads up to `tick` to guest memory, oldest first
+    /// (`mutex` held, the host GPU past `tick`).
+    ///
+    /// Lichii `BufferCache<P>::WriteReadDownloads` (buffer_cache.h:1137-1219;
+    /// its read check, early-download and pending-report parts are not
+    /// ported).
+    fn write_read_downloads(&mut self, tick: u64) {
+        if P::IS_OPENGL {
+            return;
+        }
+        while self.read_downloads.front().is_some_and(|download| download.tick <= tick) {
+            let mut download = self
+                .read_downloads
+                .pop_front()
+                .expect("the loop condition saw a front read download");
+            // Guest memory this writes. The guest CPU writes collected from now
+            // on store their bytes once this download is in guest memory.
+            let mut landing_begin = !0u64;
+            let mut landing_end = 0u64;
+            for copy in &download.copies {
+                landing_begin = landing_begin.min(copy.src_offset);
+                landing_end = landing_end.max(copy.src_offset + copy.size);
+            }
+            let landing = DownloadLanding::new(landing_begin, landing_end);
+            // GPU-side writes published since the last landing (ruzu-specific,
+            // see supersede_read_downloads).
+            self.apply_superseding_writes(&mut download);
+            // CPU writes are collected before they reach guest memory, and stay
+            // pending until applied, which takes them out of write_ranges
+            // (clear_replaced_download): either way they keep their bytes.
+            let cpu_written = self.pending_cpu_write_ranges();
+            let base = download.staging.mapped_span();
+            let staging_offset = download.staging.offset();
+            for copy in &download.copies {
+                let copy_addr = copy.src_offset;
+                let data_start = (copy.dst_offset - staging_offset) as usize;
+                let data = &base[data_start..data_start + copy.size as usize];
+                let mut parts: SmallVec<[(VAddr, VAddr); 4]> = SmallVec::new();
+                download.write_ranges.for_each_in_range(
+                    copy_addr,
+                    copy.size as usize,
+                    |start, end| parts.push((start, end)),
+                );
+                for (start, end) in parts {
+                    self.write_downloaded_memory(
+                        &cpu_written,
+                        start,
+                        &data[(start - copy_addr) as usize..(end - copy_addr) as usize],
+                    );
+                }
+            }
+            // A query result older than these bytes lands over them later: they
+            // stay GPU-modified, for a later read to download again.
+            for report in &self.pending_reports {
+                if report.rewritten {
+                    download.clean_ranges.subtract(report.addr, report.size as usize);
+                    self.read_download_ranges.subtract(report.addr, report.size as usize);
+                }
+            }
+            download.clean_ranges.for_each(|start, end| {
+                self.gpu_modified_ranges.subtract(start, (end - start) as usize);
+                self.read_download_ranges.subtract(start, (end - start) as usize);
+            });
+            // As a synchronous download leaves them: pages without GPU-modified
+            // bytes left are clean in the tracker too.
+            download.clean_ranges.for_each(|start, end| {
+                let last = end.div_ceil(DEVICE_PAGESIZE) * DEVICE_PAGESIZE;
+                let mut page = start & !(DEVICE_PAGESIZE - 1);
+                while page < last {
+                    if !self.is_region_gpu_modified(page, DEVICE_PAGESIZE as usize) {
+                        self.memory_tracker.unmark_region_as_gpu_modified(page, DEVICE_PAGESIZE);
+                    }
+                    page += DEVICE_PAGESIZE;
+                }
+            });
+            // Freed by the GPU thread (tick_frame).
+            self.async_buffers_death_ring.push_back(download.staging);
+            if download.early {
+                self.pending_early_downloads -= 1;
+            }
+            G_READ_DOWNLOADS.fetch_sub(1, Ordering::Release);
+            drop(landing);
+        }
+    }
+
+    /// `write_read_downloads` for those the host GPU has completed: nothing
+    /// waits.
+    ///
+    /// Lichii `BufferCache<P>::WriteCompletedReadDownloads` (buffer_cache.h:1221-1228).
+    fn write_completed_read_downloads(&mut self) {
+        if P::IS_OPENGL {
+            return;
+        }
+        while let Some(tick) = self.read_downloads.front().map(|download| download.tick) {
+            if !self.runtime.is_free(tick) {
+                break;
+            }
+            self.write_read_downloads(tick);
+        }
+    }
+
+    /// Whether every GPU-modified byte in the range is in a read download's
+    /// clean_ranges.
+    ///
+    /// Lichii `BufferCache<P>::ReadDownloadsCover` (buffer_cache.h:1230-1242).
+    fn read_downloads_cover(&self, device_addr: VAddr, size: u64) -> bool {
+        let mut covered = true;
+        self.gpu_modified_ranges.for_each_in_range(device_addr, size as usize, |start, end| {
+            let mut next = start;
+            self.read_download_ranges.for_each_in_range(start, (end - start) as usize, |lower, upper| {
+                covered = covered && lower <= next;
+                next = next.max(upper);
+            });
+            covered = covered && next >= end;
+        });
+        covered
+    }
+
+    /// CPU writes collected but not yet applied (`set_pending_cpu_writes`).
+    ///
+    /// Lichii `BufferCache<P>::PendingCpuWriteRanges` (buffer_cache.h:2175-2183).
+    fn pending_cpu_write_ranges(&self) -> RangeSet {
+        let mut ranges = RangeSet::new();
+        if let Some(pending_cpu_writes) = &self.pending_cpu_writes {
+            pending_cpu_writes(&mut |device_addr, size| ranges.add(device_addr, size));
+        }
+        ranges
+    }
+
+    /// Writes downloaded bytes to guest memory, except over `cpu_written`.
+    /// Callers take `cpu_written` inside a `DownloadLanding` over the bytes
+    /// and write in it.
+    ///
+    /// Lichii `BufferCache<P>::WriteDownloadedMemory` (buffer_cache.h:2185-2204;
+    /// its EDEN_NX2_READ_CHECK bookkeeping is not ported).
+    fn write_downloaded_memory(&self, cpu_written: &RangeSet, device_addr: VAddr, data: &[u8]) {
+        let Some(device_memory) = self.device_memory.as_ref() else {
+            return;
+        };
+        let size = data.len() as u64;
+        if !range_set_intersects(cpu_written, device_addr, size) {
+            device_memory.write_block_unsafe(device_addr, data);
+            return;
+        }
+        let mut parts = RangeSet::new();
+        parts.add(device_addr, data.len());
+        cpu_written.for_each_in_range(device_addr, data.len(), |start, end| {
+            parts.subtract(start, (end - start) as usize);
+        });
+        parts.for_each(|start, end| {
+            device_memory.write_block_unsafe(
+                start,
+                &data[(start - device_addr) as usize..(end - device_addr) as usize],
+            );
+        });
+    }
+}
+
+/// Lichii `BufferCache<P>::~BufferCache` (buffer_cache.h:72-76).
+impl<P: BufferCacheParams, DT: DeviceTracker> Drop for BufferCache<P, DT> {
+    fn drop(&mut self) {
+        G_READ_DOWNLOADS.fetch_sub(self.read_downloads.len() as u32, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RasterizerDownloadArea — return type for GetFlushArea
 // ---------------------------------------------------------------------------
 
@@ -4620,6 +5695,9 @@ pub struct RasterizerDownloadArea {
     pub start_address: VAddr,
     pub end_address: VAddr,
     pub preemtive: bool,
+    /// Lichii `RasterizerDownloadArea::in_flight` (see
+    /// `crate::rasterizer_download_area`).
+    pub in_flight: bool,
 }
 
 #[cfg(test)]
@@ -6477,5 +7555,401 @@ mod tests {
         // Unregistered region should return false.
         let result = cache.inline_memory(0x5000, 0x10, &[0u8; 16]);
         assert!(!result);
+    }
+
+    // -- Async read-back (Lichii read downloads, DIFF.md 2026-11-15) --
+
+    type ReadCache = BufferCache<TestParams<true>, DummyTracker>;
+
+    const READ_BASE: u64 = 0x1_0000;
+    const READ_SIZE: u64 = 0x2000;
+
+    /// A cache whose buffer at READ_BASE holds `gpu_byte` everywhere, all of
+    /// it GPU-modified, while guest memory holds `guest_byte`.
+    fn read_cache(
+        tracker: &DummyTracker,
+        gpu_byte: u8,
+        guest_byte: u8,
+    ) -> (ReadCache, Arc<parking_lot::Mutex<Vec<u8>>>, BufferId) {
+        let mut cache = ReadCache::new(tracker, TestBufferCacheRuntime::default());
+        let guest = Arc::new(parking_lot::Mutex::new(vec![guest_byte; 0x4_0000]));
+        cache.set_device_memory(Box::new(SharedDeviceMemory { bytes: Arc::clone(&guest) }));
+        let buffer_id = cache.create_buffer(READ_BASE, READ_SIZE as u32, false);
+        let offset = cache.slot_buffers[buffer_id].offset(READ_BASE);
+        cache.slot_buffers[buffer_id]
+            .immediate_upload(u64::from(offset), &vec![gpu_byte; READ_SIZE as usize]);
+        gpu_write(&mut cache, READ_BASE, READ_SIZE);
+        (cache, guest, buffer_id)
+    }
+
+    /// What `mark_written_buffer` records for a GPU write.
+    fn gpu_write(cache: &mut ReadCache, address: u64, size: u64) {
+        cache.outdate_read_downloads(address, size);
+        cache.memory_tracker.unmark_region_as_cpu_modified(address, size);
+        cache.memory_tracker.mark_region_as_gpu_modified(address, size);
+        cache.gpu_modified_ranges.add(address, size as usize);
+    }
+
+    fn set_buffer_bytes(cache: &mut ReadCache, buffer_id: BufferId, address: u64, bytes: &[u8]) {
+        let offset = cache.slot_buffers[buffer_id].offset(address);
+        cache.slot_buffers[buffer_id].immediate_upload(u64::from(offset), bytes);
+    }
+
+    fn finish(cache: &mut ReadCache, address: u64, size: u64) -> Option<u64> {
+        unsafe { ReadCache::finish_read_downloads(cache as *mut ReadCache, address, size) }
+    }
+
+    fn guest_range(guest: &Arc<parking_lot::Mutex<Vec<u8>>>, address: u64, size: u64) -> Vec<u8> {
+        guest.lock()[address as usize..(address + size) as usize].to_vec()
+    }
+
+    #[test]
+    fn read_download_submits_without_waiting_and_the_reader_lands_it() {
+        let tracker = DummyTracker;
+        let (mut cache, guest, _) = read_cache(&tracker, 0xAB, 0x11);
+
+        cache.download_memory_for_read(READ_BASE + 0x100, 0x40);
+
+        // The GPU thread submitted the copy and went on: no Finish, nothing in
+        // guest memory yet, and the bytes stay GPU-modified until they land.
+        assert_eq!(cache.runtime.host_read_submits, vec![1]);
+        assert_eq!(cache.runtime.finish_count, 0);
+        assert!(cache.runtime.host_read_waits.lock().is_empty());
+        assert_eq!(guest_range(&guest, READ_BASE + 0x100, 0x40), vec![0x11; 0x40]);
+        assert!(cache.is_region_gpu_modified(READ_BASE + 0x100, 0x40));
+
+        // The reading thread waits for that submission, then lands it.
+        assert!(finish(&mut cache, READ_BASE + 0x100, 0x40).is_some());
+        assert_eq!(*cache.runtime.host_read_waits.lock(), vec![1]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x100, 0x40), vec![0xAB; 0x40]);
+        assert!(!cache.is_region_gpu_modified(READ_BASE + 0x100, 0x40));
+        assert!(cache.read_downloads.is_empty());
+        assert_eq!(cache.async_buffers_death_ring.len(), 1);
+        // Nothing left over the range.
+        assert!(finish(&mut cache, READ_BASE + 0x100, 0x40).is_none());
+    }
+
+    #[test]
+    fn read_download_lands_the_bytes_a_synchronous_flush_writes() {
+        let tracker = DummyTracker;
+        let pattern: Vec<u8> = (0..READ_SIZE).map(|i| (i * 7 + 3) as u8).collect();
+        let mut results = Vec::new();
+        for asynchronous in [false, true] {
+            let (mut cache, guest, buffer_id) = read_cache(&tracker, 0, 0x5A);
+            set_buffer_bytes(&mut cache, buffer_id, READ_BASE, &pattern);
+            // Only part of the buffer is GPU-written.
+            cache.gpu_modified_ranges.subtract(READ_BASE, READ_SIZE as usize);
+            cache.gpu_modified_ranges.add(READ_BASE + 0x80, 0x180);
+            cache.gpu_modified_ranges.add(READ_BASE + 0x1000, 0x10);
+            if asynchronous {
+                cache.download_memory_for_read(READ_BASE, READ_SIZE);
+                finish(&mut cache, READ_BASE, READ_SIZE);
+            } else {
+                cache.download_memory(READ_BASE, READ_SIZE);
+            }
+            results.push((guest_range(&guest, 0, 0x4_0000), cache.is_region_gpu_modified(READ_BASE, READ_SIZE as usize)));
+        }
+        assert_eq!(results[0], results[1]);
+        assert!(!results[1].1);
+    }
+
+    #[test]
+    fn read_download_keeps_cpu_writes_applied_or_still_pending() {
+        let tracker = DummyTracker;
+        let (mut cache, guest, _) = read_cache(&tracker, 0xAB, 0x11);
+        let pending = Arc::new(parking_lot::Mutex::new(Vec::<(u64, usize)>::new()));
+        let source = Arc::clone(&pending);
+        cache.set_pending_cpu_writes(Arc::new(move |callback| {
+            for &(address, size) in source.lock().iter() {
+                callback(address, size);
+            }
+        }));
+
+        cache.download_memory_for_read(READ_BASE, 0x200);
+        // An applied guest write: its bytes are in guest memory and it cuts the
+        // download (clear_replaced_download).
+        guest.lock()[(READ_BASE + 0x40) as usize..(READ_BASE + 0x80) as usize].fill(0xC1);
+        cache.write_memory(READ_BASE + 0x40, 0x40);
+        // A write collected and not applied yet: the landing leaves it out.
+        guest.lock()[(READ_BASE + 0x100) as usize..(READ_BASE + 0x140) as usize].fill(0xC2);
+        pending.lock().push((READ_BASE + 0x100, 0x40));
+
+        finish(&mut cache, READ_BASE, 0x200);
+
+        assert_eq!(guest_range(&guest, READ_BASE, 0x40), vec![0xAB; 0x40]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x40, 0x40), vec![0xC1; 0x40]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x80, 0x80), vec![0xAB; 0x80]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x100, 0x40), vec![0xC2; 0x40]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x140, 0xC0), vec![0xAB; 0xC0]);
+    }
+
+    #[test]
+    fn newer_gpu_write_keeps_its_range_gpu_modified_for_a_later_read() {
+        let tracker = DummyTracker;
+        let (mut cache, guest, buffer_id) = read_cache(&tracker, 0xAB, 0x11);
+
+        cache.download_memory_for_read(READ_BASE, 0x100);
+        // The GPU writes again after the download was taken.
+        set_buffer_bytes(&mut cache, buffer_id, READ_BASE, &[0xCD; 0x100]);
+        gpu_write(&mut cache, READ_BASE, 0x100);
+        finish(&mut cache, READ_BASE, 0x100);
+
+        // The older download still lands what a synchronous flush had left...
+        assert_eq!(guest_range(&guest, READ_BASE, 0x100), vec![0xAB; 0x100]);
+        // ...but the range stays GPU-modified, and the next read takes the
+        // newer bytes.
+        assert!(cache.is_region_gpu_modified(READ_BASE, 0x100));
+        let area = cache.get_flush_area(READ_BASE, 0x100).unwrap();
+        assert!(!area.preemtive && !area.in_flight);
+        cache.download_memory_for_read(READ_BASE, 0x100);
+        finish(&mut cache, READ_BASE, 0x100);
+        assert_eq!(guest_range(&guest, READ_BASE, 0x100), vec![0xCD; 0x100]);
+    }
+
+    #[test]
+    fn a_read_covered_by_a_pending_download_is_in_flight_until_the_host_gpu_ran_it() {
+        let tracker = DummyTracker;
+        let (mut cache, guest, _) = read_cache(&tracker, 0xAB, 0x11);
+        cache.download_memory_for_read(READ_BASE, READ_SIZE);
+
+        let area = cache.get_flush_area(READ_BASE + 0x10, 4).unwrap();
+        assert!(area.in_flight && !area.preemtive);
+        assert_eq!((area.start_address, area.end_address), (READ_BASE, READ_BASE + 0x1000));
+        assert_eq!(cache.runtime.host_read_submits.len(), 1);
+
+        // Once the host GPU ran it, the area lookup lands it itself.
+        cache.runtime.completed_tick = 1;
+        let area = cache.get_flush_area(READ_BASE + 0x10, 4).unwrap();
+        assert!(area.preemtive && !area.in_flight);
+        assert_eq!(guest_range(&guest, READ_BASE, READ_SIZE), vec![0xAB; READ_SIZE as usize]);
+        assert!(cache.runtime.host_read_waits.lock().is_empty());
+    }
+
+    #[test]
+    fn read_downloads_land_oldest_first_and_once() {
+        let tracker = DummyTracker;
+        let (mut cache, guest, _) = read_cache(&tracker, 0xAB, 0x11);
+        // The tracker hands out whole GPU-modified pages, as for a
+        // synchronous download: this takes the first page.
+        cache.download_memory_for_read(READ_BASE, 0x100);
+        assert_eq!(cache.read_downloads[0].copies[0].size, 0x1000);
+        // An overlapping read takes only the bytes no download brings yet.
+        cache.download_memory_for_read(READ_BASE + 0x800, 0x1000);
+        assert_eq!(cache.read_downloads.len(), 2);
+        assert_eq!(cache.read_downloads[1].copies.len(), 1);
+        assert_eq!(cache.read_downloads[1].copies[0].src_offset, READ_BASE + 0x1000);
+        assert_eq!(cache.read_downloads[1].copies[0].size, 0x1000);
+
+        // Finishing the newer one waits for its tick only and lands both.
+        finish(&mut cache, READ_BASE + 0x1000, 0x80);
+        assert_eq!(*cache.runtime.host_read_waits.lock(), vec![2]);
+        assert!(cache.read_downloads.is_empty());
+        assert_eq!(guest_range(&guest, READ_BASE, READ_SIZE), vec![0xAB; READ_SIZE as usize]);
+    }
+
+    #[test]
+    fn a_write_guest_memory_does_not_hold_yet_lands_the_read_download_first() {
+        let tracker = DummyTracker;
+        let (mut cache, guest, _) = read_cache(&tracker, 0xAB, 0x11);
+        cache.download_memory_for_read(READ_BASE, 0x100);
+        // A discarded write (indirect arguments, DMA copy or clear): Lichii
+        // ClearDownload lands the read's download before dropping the range.
+        cache.clear_download(READ_BASE + 0x20, 0x20);
+        cache.gpu_modified_ranges.subtract(READ_BASE + 0x20, 0x20);
+        assert!(cache.read_downloads.is_empty());
+        assert_eq!(guest_range(&guest, READ_BASE, 0x100), vec![0xAB; 0x100]);
+    }
+
+    #[test]
+    fn a_gpu_side_write_supersedes_a_pending_read_download_without_waiting() {
+        let tracker = DummyTracker;
+        let (mut cache, guest, _) = read_cache(&tracker, 0xAB, 0x11);
+        cache.download_memory_for_read(READ_BASE, 0x100);
+        // A semaphore release through the memory manager: newer than the
+        // download, written to guest memory right after.
+        cache.supersede_read_downloads(READ_BASE + 0x10, 4);
+        guest.lock()[(READ_BASE + 0x10) as usize..(READ_BASE + 0x14) as usize].fill(0x5E);
+        assert!(cache.runtime.host_read_waits.lock().is_empty());
+
+        finish(&mut cache, READ_BASE, 0x100);
+        // As landing then writing would leave it: the write's bytes, the
+        // download's elsewhere, and nothing left GPU-modified.
+        assert_eq!(guest_range(&guest, READ_BASE, 0x10), vec![0xAB; 0x10]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x10, 4), vec![0x5E; 4]);
+        assert_eq!(guest_range(&guest, READ_BASE + 0x14, 0xEC), vec![0xAB; 0xEC]);
+        assert!(!cache.is_region_gpu_modified(READ_BASE, 0x100));
+    }
+
+    /// A Switch 2 (native tiling, read traps) cache over READ_BASE, three
+    /// pages; guest memory holds `guest_byte`. Runs `body` in a child process,
+    /// as the other read-trap tests do (the policy reads process settings).
+    fn native_read_test(
+        test_name: &str,
+        body: impl FnOnce(&mut ReadCache, &Arc<parking_lot::Mutex<Vec<u8>>>, BufferId),
+    ) {
+        const CHILD: &str = "RUZU_TEST_NATIVE_READ_BACK";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let tracker = DummyTracker;
+        let mut cache = ReadCache::new(&tracker, TestBufferCacheRuntime::default());
+        let guest = Arc::new(parking_lot::Mutex::new(vec![0x11u8; 0x4_0000]));
+        cache.set_gpu_memory(Box::new(NativeGpuMemory));
+        cache.set_device_memory(Box::new(TrappedMemory {
+            memory: SharedDeviceMemory { bytes: Arc::clone(&guest) },
+            traps: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }));
+        let buffer_id = cache.create_buffer(READ_BASE, 0x3000, false);
+        cache.memory_tracker.unmark_region_as_cpu_modified(READ_BASE, 0x3000);
+        body(&mut cache, &guest, buffer_id);
+    }
+
+    /// The GPU writes `byte` over `[address, address + size)` of the buffer.
+    fn native_gpu_write(cache: &mut ReadCache, buffer_id: BufferId, address: u64, size: u64, byte: u8) {
+        set_buffer_bytes(cache, buffer_id, address, &vec![byte; size as usize]);
+        cache.mark_written_buffer(buffer_id, address, size as u32, false);
+    }
+
+    /// What `Gpu::on_cpu_read` does for a read of `[address, address + 4)`:
+    /// returns whether it needed a download.
+    fn native_read(cache: &mut ReadCache, address: u64) -> bool {
+        let area = cache.get_flush_area(address, 4).unwrap();
+        if area.preemtive {
+            return false;
+        }
+        let size = area.end_address - area.start_address;
+        if !area.in_flight {
+            cache.download_memory_for_read(area.start_address, size);
+        }
+        finish(cache, area.start_address, size);
+        true
+    }
+
+    #[test]
+    fn a_read_downloads_the_ranges_read_before_with_its_own() {
+        native_read_test(
+            "buffer_cache::buffer_cache::tests::a_read_downloads_the_ranges_read_before_with_its_own",
+            |cache, guest, buffer_id| {
+                let (page0, page2) = (READ_BASE, READ_BASE + 0x2000);
+                native_gpu_write(cache, buffer_id, page0, 0x100, 0xA0);
+                native_gpu_write(cache, buffer_id, page2, 0x100, 0xA2);
+                assert!(native_read(cache, page0));
+                assert!(native_read(cache, page2));
+                // The next GPU writes of both: one read downloads both pages.
+                native_gpu_write(cache, buffer_id, page0, 0x100, 0xB0);
+                native_gpu_write(cache, buffer_id, page2, 0x100, 0xB2);
+                let submits = cache.runtime.host_read_submits.len();
+                assert!(native_read(cache, page2));
+                assert_eq!(cache.runtime.host_read_submits.len(), submits + 1);
+                assert!(!native_read(cache, page0), "page 0 came with page 2's download");
+                assert_eq!(guest_range(guest, page0, 0x100), vec![0xB0; 0x100]);
+                assert_eq!(guest_range(guest, page2, 0x100), vec![0xB2; 0x100]);
+            },
+        );
+    }
+
+    #[test]
+    fn a_page_read_after_each_write_gets_its_download_behind_the_next_write() {
+        native_read_test(
+            "buffer_cache::buffer_cache::tests::a_page_read_after_each_write_gets_its_download_behind_the_next_write",
+            |cache, guest, buffer_id| {
+                let page = READ_BASE + 0x1000;
+                // Two writes in a row read back teach the page.
+                for byte in [0xC0, 0xC1] {
+                    native_gpu_write(cache, buffer_id, page, 0x40, byte);
+                    assert!(native_read(cache, page));
+                }
+                assert!(cache.runtime.host_read_queues.is_empty());
+                // The next write's download is recorded right behind its
+                // dispatch, before any read asks for it.
+                native_gpu_write(cache, buffer_id, page, 0x40, 0xC2);
+                cache.note_work_recorded(true);
+                assert_eq!(cache.runtime.host_read_queues.len(), 1);
+                let early_tick = cache.runtime.host_read_queues[0];
+                // A read before the host GPU ran it waits for that copy alone.
+                let area = cache.get_flush_area(page, 4).unwrap();
+                assert!(area.in_flight && !area.preemtive);
+                // Once the host GPU ran it, the read finds it in guest memory.
+                cache.runtime.completed_tick = early_tick;
+                cache.note_work_recorded(true);
+                assert!(cache.read_downloads.is_empty());
+                assert!(!native_read(cache, page));
+                assert_eq!(guest_range(guest, page, 0x40), vec![0xC2; 0x40]);
+                assert!(cache.runtime.host_read_waits.lock().iter().all(|&tick| tick != early_tick));
+            },
+        );
+    }
+
+    #[test]
+    fn a_page_no_longer_read_stops_getting_early_downloads() {
+        native_read_test(
+            "buffer_cache::buffer_cache::tests::a_page_no_longer_read_stops_getting_early_downloads",
+            |cache, _guest, buffer_id| {
+                let page = READ_BASE;
+                for byte in [0xD0, 0xD1] {
+                    native_gpu_write(cache, buffer_id, page, 0x40, byte);
+                    assert!(native_read(cache, page));
+                }
+                // Four writes in a row without a read, then one more: no
+                // early download for the fifth.
+                for byte in [0xD2, 0xD3, 0xD4, 0xD5] {
+                    native_gpu_write(cache, buffer_id, page, 0x40, byte);
+                    cache.note_work_recorded(true);
+                    cache.runtime.completed_tick = cache.runtime.current_tick;
+                    cache.note_work_recorded(true);
+                }
+                let queued = cache.runtime.host_read_queues.len();
+                native_gpu_write(cache, buffer_id, page, 0x40, 0xD6);
+                cache.note_work_recorded(true);
+                assert_eq!(cache.runtime.host_read_queues.len(), queued);
+            },
+        );
+    }
+
+    #[test]
+    fn a_kept_report_rewritten_by_a_later_gpu_write_stays_gpu_modified() {
+        native_read_test(
+            "buffer_cache::buffer_cache::tests::a_kept_report_rewritten_by_a_later_gpu_write_stays_gpu_modified",
+            |cache, _guest, buffer_id| {
+                let page = READ_BASE;
+                for byte in [0xE0, 0xE1] {
+                    native_gpu_write(cache, buffer_id, page, 0x40, byte);
+                    assert!(native_read(cache, page));
+                }
+                // A report on the page, then a dispatch over its words whose
+                // early download lands before the report is written.
+                assert!(cache.note_report_pending(page + 0x10, 4));
+                native_gpu_write(cache, buffer_id, page, 0x40, 0xE2);
+                cache.note_work_recorded(true);
+                cache.runtime.completed_tick = cache.runtime.current_tick;
+                cache.note_work_recorded(true);
+                assert!(cache.read_downloads.is_empty());
+                // The report's words stay GPU-modified: its older result lands
+                // over them later, and the next read downloads them again.
+                assert!(cache.is_region_gpu_modified(page + 0x10, 4));
+                assert!(!cache.is_region_gpu_modified(page, 0x10));
+                cache.finish_report(page + 0x10, 4);
+                assert!(cache.pending_reports.is_empty());
+                // A report on a page no read-back learned is not kept.
+                assert!(!cache.note_report_pending(READ_BASE + 0x2000, 4));
+            },
+        );
+    }
+
+    #[test]
+    fn a_fence_pop_lands_completed_read_downloads_first() {
+        let tracker = DummyTracker;
+        let (mut cache, guest, _) = read_cache(&tracker, 0xAB, 0x11);
+        cache.download_memory_for_read(READ_BASE, 0x100);
+        cache.runtime.completed_tick = 1;
+        cache.pop_async_buffers();
+        assert!(cache.read_downloads.is_empty());
+        assert_eq!(guest_range(&guest, READ_BASE, 0x100), vec![0xAB; 0x100]);
     }
 }

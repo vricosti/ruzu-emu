@@ -1218,6 +1218,7 @@ mod tests {
                 start_address: addr,
                 end_address: addr,
                 preemtive: true,
+                in_flight: false,
             }
         }
         fn invalidate_region(

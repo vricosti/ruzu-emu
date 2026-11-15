@@ -184,6 +184,12 @@ pub struct Gpu {
     guest_memory_writer: Mutex<Option<Arc<dyn Fn(u64, &[u8]) + Send + Sync>>>,
     /// Upstream owner: `Core::System& system`.
     system: Mutex<SystemRef>,
+    /// `invalidate_gpu_cache`: the writes it gathered and is applying, on each
+    /// thread doing so. The mutex is Lichii's `applying_writes_mutex`.
+    ///
+    /// Lichii `GPU::Impl::applying_writes` (gpu.cpp:483-485; async read-back,
+    /// DIFF.md 2026-11-15).
+    applying_writes: Mutex<Vec<Arc<Vec<(u64, usize)>>>>,
 }
 
 impl Drop for Gpu {
@@ -235,6 +241,7 @@ impl Gpu {
             guest_memory_reader: Mutex::new(None),
             guest_memory_writer: Mutex::new(None),
             system: Mutex::new(SystemRef::null()),
+            applying_writes: Mutex::new(Vec::new()),
         }
     }
 
@@ -310,6 +317,13 @@ impl Gpu {
             renderer.set_invalidate_gpu_cache_callback(Arc::new(move || unsafe {
                 let gpu = &*(gpu_ptr as *const Self);
                 gpu.invalidate_gpu_cache();
+            }));
+            // Lichii RasterizerVulkan's constructor (vk_rasterizer.cpp:468-471)
+            // hands its buffer cache GPU::ForEachPendingCpuWrite.
+            let gpu_ptr = self as *const Self as usize;
+            renderer.set_pending_cpu_writes(Arc::new(move |callback| unsafe {
+                let gpu = &*(gpu_ptr as *const Self);
+                gpu.for_each_pending_cpu_write(callback);
             }));
             if let Some(writer) = self.guest_memory_writer.lock().unwrap().clone() {
                 renderer.set_guest_memory_writer(writer);
@@ -505,9 +519,68 @@ impl Gpu {
             return;
         }
         let rasterizer = unsafe { rasterizer.as_mut() };
-        system
-            .get()
-            .gather_gpu_dirty_memory(&mut Self::callback_writes(rasterizer));
+        // Lichii GPU::Impl::ApplyCollectedWrites (gpu.cpp:143-166): gathered
+        // writes stay pending (for_each_pending_cpu_write) until they are
+        // applied: a download written to guest memory meanwhile on another
+        // thread (finish_read) would otherwise write the GPU's older bytes over
+        // them. Eden applied each write inside the gather callback; here they
+        // are gathered first and applied once published, in the same order.
+        let writes = {
+            let mut applying_writes = self.applying_writes.lock().unwrap();
+            let mut writes = Vec::new();
+            system
+                .get()
+                .gather_gpu_dirty_memory(&mut |address, size| writes.push((address, size)));
+            if writes.is_empty() {
+                return;
+            }
+            let writes = Arc::new(writes);
+            applying_writes.push(Arc::clone(&writes));
+            writes
+        };
+        // Lichii's SCOPE_EXIT: take them out on every exit, unwinding included.
+        struct ApplyingWritesGuard<'a> {
+            applying_writes: &'a Mutex<Vec<Arc<Vec<(u64, usize)>>>>,
+            writes: &'a Arc<Vec<(u64, usize)>>,
+        }
+        impl Drop for ApplyingWritesGuard<'_> {
+            fn drop(&mut self) {
+                let mut applying_writes = self
+                    .applying_writes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                applying_writes.retain(|writes| !Arc::ptr_eq(writes, self.writes));
+            }
+        }
+        let _guard = ApplyingWritesGuard {
+            applying_writes: &self.applying_writes,
+            writes: &writes,
+        };
+        let mut callback_writes = Self::callback_writes(rasterizer);
+        for &(address, size) in writes.iter() {
+            callback_writes(address, size);
+        }
+    }
+
+    /// Calls `callback` for each guest CPU write into GPU-written memory that
+    /// was collected and not applied yet: those the cores' dirty-memory
+    /// managers still hold, and those `invalidate_gpu_cache` is applying.
+    ///
+    /// Lichii `GPU::Impl::ForEachPendingCpuWrite` (gpu.cpp:169-180; async
+    /// read-back, DIFF.md 2026-11-15).
+    pub fn for_each_pending_cpu_write(&self, callback: &mut dyn FnMut(u64, usize)) {
+        let applying_writes = self.applying_writes.lock().unwrap();
+        let system = *self.system.lock().unwrap();
+        if !system.is_null() {
+            for manager in system.get().gpu_dirty_memory_managers() {
+                manager.for_each_pending(callback);
+            }
+        }
+        for writes in applying_writes.iter() {
+            for &(address, size) in writes.iter() {
+                callback(address, size);
+            }
+        }
     }
 
     // Mechanical extraction of GPU::InvalidateGPUCache's callback_writes so
@@ -727,6 +800,7 @@ impl Gpu {
                 start_address: addr,
                 end_address: addr,
                 preemtive: true,
+                in_flight: false,
             };
         };
 
@@ -736,21 +810,31 @@ impl Gpu {
         }
 
         raster_area.preemtive = true;
+        // Async read-back, Lichii GPU::Impl::OnCPURead (gpu.cpp:316-352;
+        // DIFF.md 2026-11-15). Its sampled log line and per-second counters
+        // are diagnostics and are not ported.
         let start_address = raster_area.start_address;
-        let end_address = raster_area.end_address;
-        let gpu_addr = self as *const Gpu as usize;
-        let fence = self.request_sync_operation(Box::new(move || {
-            let gpu = unsafe { &*(gpu_addr as *const Gpu) };
-            if let Some(rasterizer) = gpu.rasterizer_handle() {
-                unsafe { rasterizer.as_mut() }.flush_region(
-                    start_address,
-                    end_address - start_address,
-                    crate::cache_types::CacheType::ALL,
-                );
-            }
-        }));
-        self.gpu_thread.lock().unwrap().tick_gpu(self.is_async);
-        self.wait_for_sync_operation(fence);
+        let area_size = raster_area.end_address - raster_area.start_address;
+        // In flight: an earlier read's downloads cover the area, only
+        // finish_read is left.
+        if !raster_area.in_flight {
+            let gpu_addr = self as *const Gpu as usize;
+            let fence = self.request_sync_operation(Box::new(move || {
+                let gpu = unsafe { &*(gpu_addr as *const Gpu) };
+                // Apply collected guest writes before downloading GPU data over
+                // guest memory.
+                gpu.invalidate_gpu_cache();
+                if let Some(rasterizer) = gpu.rasterizer_handle() {
+                    unsafe { rasterizer.as_mut() }.flush_region_for_read(start_address, area_size);
+                }
+            }));
+            self.gpu_thread.lock().unwrap().tick_gpu(self.is_async);
+            self.wait_for_sync_operation(fence);
+        }
+        // The GPU thread submitted the downloads without waiting for the host
+        // GPU: this thread waits for them and writes them to guest memory,
+        // while the GPU thread goes on.
+        unsafe { rasterizer.as_mut() }.finish_read(start_address, area_size);
         raster_area
     }
 
@@ -1346,6 +1430,7 @@ mod tests {
                 start_address: addr,
                 end_address: addr,
                 preemtive: true,
+                in_flight: false,
             }
         }
         fn invalidate_region(

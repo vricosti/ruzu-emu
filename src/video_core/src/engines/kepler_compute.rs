@@ -684,18 +684,32 @@ impl KeplerCompute {
             if method == 0x45 || method == 0x47 {
                 self.native_compute_uploaded = true;
             }
-            self.native_macro_context = self.native_context.clone();
+            // Upstream re-points native_macro at the context on every method. The
+            // owning handle is replaced only when it names another context, so a
+            // method write does not touch the shared reference count.
+            let same = match (&self.native_macro_context, &self.native_context) {
+                (Some(current), Some(context)) => Arc::ptr_eq(current, context),
+                _ => false,
+            };
+            if !same {
+                self.native_macro_context = self.native_context.clone();
+            }
             self.native_macro_compute = self.native_compute_uploaded;
         }
         if method as usize >= self.native_registers.len() {
             log::error!("Native compute method out of range: {method:#x}");
             return true;
         }
-        let owner = self
-            .native_macro_context
-            .clone()
-            .expect("native compute requires macro owner");
-        let guard = owner.lock();
+        // Borrow the owner instead of cloning it for every method. The handle is
+        // only replaced by set_native_macro_mode (channel setup) or by the
+        // re-pointing above, which is a no-op for the nested calls a macro emits
+        // (same native_context), so the allocation outlives this guard.
+        let owner = Arc::as_ptr(
+            self.native_macro_context
+                .as_ref()
+                .expect("native compute requires macro owner"),
+        );
+        let guard = unsafe { (*owner).lock() };
         let context = guard.as_ptr();
         let this = self as *mut Self;
         // All accesses are serialized by the retained context lock. No RefMut spans callbacks.
@@ -770,12 +784,17 @@ impl KeplerCompute {
                 );
             }
             let engine = selected();
-            // Lease interpreter and FIFO so Rust callbacks can observe live uploads safely.
+            // Upstream assigns the active_dram pointer; the owning handle is only
+            // replaced when it names other storage (no refcount churn per call).
             if let Some(ram) = &self.native_data_ram {
                 unsafe {
-                    (*engine).native_interpreter.active_dram = Some(ram.clone());
+                    let active = &mut (*engine).native_interpreter.active_dram;
+                    if !active.as_ref().is_some_and(|current| Arc::ptr_eq(current, ram)) {
+                        *active = Some(ram.clone());
+                    }
                 }
             }
+            // Lease interpreter and FIFO so Rust callbacks can observe live uploads safely.
             let mut interpreter = unsafe { std::mem::take(&mut (*engine).native_interpreter) };
             let mut parameters = std::mem::take(&mut self.native_parameters);
             let ram_owner = interpreter.active_dram.clone();
@@ -815,12 +834,11 @@ impl KeplerCompute {
                             .is_none_or(|v| !v.to_string_lossy().starts_with('0'))
                     }) && !watched
                     {
-                        let jit = (*engine)
-                            .native_jit
-                            .get_or_insert_with(|| {
-                                Arc::new(std::sync::Mutex::new(Default::default()))
-                            })
-                            .clone();
+                        // native_jit is created once and never replaced while the
+                        // engine (held by the context guard) lives: borrow it.
+                        let jit = &*Arc::as_ptr((*engine).native_jit.get_or_insert_with(|| {
+                            Arc::new(std::sync::Mutex::new(Default::default()))
+                        }));
                         let mut jit = jit
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);

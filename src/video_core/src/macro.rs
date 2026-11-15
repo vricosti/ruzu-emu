@@ -2958,9 +2958,18 @@ impl MacroEngine {
                 }
             }
         }
-        let ram_handle = std::sync::Arc::clone((&*maxwell).get_native_data_ram());
-        (*engine).native_interpreter.active_dram = Some(ram_handle.clone());
-        let mut ram = ram_handle.lock();
+        // Upstream stores a plain pointer to the channel RAM. The owning handle
+        // is replaced only when it names other storage, and the lock is taken
+        // through the allocation, which Maxwell3D owns for its whole lifetime
+        // (native_data_ram is never reassigned), so no refcount traffic per call.
+        let ram_handle = (&*maxwell).get_native_data_ram();
+        if !(*engine).native_interpreter.active_dram.as_ref()
+            .is_some_and(|active| std::sync::Arc::ptr_eq(active, ram_handle))
+        {
+            (*engine).native_interpreter.active_dram = Some(ram_handle.clone());
+        }
+        let ram_handle = std::sync::Arc::as_ptr(ram_handle);
+        let mut ram = (*ram_handle).lock();
         // Upstream's JIT only uses active_dram, not the interpreter's own RAM.
         // Lease the interpreter only on the fallback path: taking it eagerly
         // copies and zeroes its 12 KiB RAM on every native JIT macro call.
@@ -3077,7 +3086,9 @@ impl MacroEngine {
             {
                 static USE_JIT: OnceLock<bool> = OnceLock::new();
                 if *USE_JIT.get_or_init(|| std::env::var_os("EDEN_NX2_MME_JIT").is_none_or(|v| !v.to_string_lossy().starts_with('0'))) {
-                    let jit = (*engine).native_jit.get_or_insert_with(|| std::sync::Arc::new(Mutex::new(Default::default()))).clone();
+                    // native_jit is created once and never replaced while the engine
+                    // lives (the caller holds its context): borrow, as upstream does.
+                    let jit = &*std::sync::Arc::as_ptr((*engine).native_jit.get_or_insert_with(|| std::sync::Arc::new(Mutex::new(Default::default()))));
                     let mut jit = jit.lock().unwrap();
                     if let Err(error) = jit.prepare(&(*engine).native_code, (*engine).native_code_generation) {
                         (*engine).native_execution_failed = true;

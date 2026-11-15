@@ -1,5 +1,25 @@
 # Upstream parity notes
 
+## 2026-11-15 — core/hle/service/service.rs `report_unimplemented_function` vs Lichii core/hle/service/service.cpp `ServiceFrameworkBase::ReportUnimplementedFunction`
+
+### Ported (Lichii divergence from Eden)
+- The experimental Eden-NX2 auto stub (Switch 2 callers, `EDEN_NX2_AUTO_STUB`, `use_auto_stub`,
+  `nx2:` stub services) now replies `ResultSuccess` followed by `STUB_ZEROED_WORDS` (32) zeroed
+  words, as Lichii does (service.cpp:155-183), instead of an empty two-word reply. An empty reply
+  left the request's words in the caller's TLS: on the NX2 title used for measurement the play
+  report thread calls the unimplemented `prepo:u` command 10500 on a domain session, read its
+  output interface id from the leftover `SFCI` magic (object id 0x49434653), sent the next request
+  to that id (stubbed by `prepare_sync_request`, no handle), then waited on handle 0. The SDK
+  wait loop retries on any error, so `WaitSynchronization(handle 0, timeout -1)` returned
+  `ResultInvalidHandle` about 138,000 times a second on CPUCore_0 (Lichii: 179 WaitSynchronization
+  per second in total on that core). With the zeroed reply the thread no longer spins.
+- Each auto-stubbed (service, command) pair is reported once; repeats only get the zeroed reply
+  (Lichii's `reported` set), and `nx2:vdec*` reports dump request words 1-47 instead of 1-8.
+
+### Intentional differences
+- None in behavior. The once-per-command set is a function-local `OnceLock<Mutex<BTreeSet>>`
+  (Lichii: function-local `static std::set` behind a `std::mutex`).
+
 ## 2026-11-15 — video_core/renderer_vulkan/{scheduler,query_cache}.rs vs Lichii video_core/renderer_vulkan/{vk_scheduler.cpp,vk_query_cache.cpp}
 
 ### Ported (Lichii divergence from Eden)

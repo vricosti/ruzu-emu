@@ -932,8 +932,12 @@ pub struct RasterizerVulkan {
     render_pass_cache: Box<RenderPassCache>,
     wfi_event: vk::Event,
 
-    // Upstream FlushWork checks every eighth operation and flushes at 4096.
+    // Counts operations for `flush_work` (Lichii `SubmissionPolicy::Advance`).
     draw_counter: u32,
+    /// Lichii `RasterizerVulkan::pending_native_work` (vk_rasterizer.h:383):
+    /// a native-tiling draw, clear or dispatch was recorded since the last
+    /// submission, so `flush_commands` submits even with `draw_counter == 0`.
+    pending_native_work: bool,
     /// Monotonic draw sequence used only by env-gated diagnostics.
     draw_sequence: u64,
     /// Draws dropped because pipeline compilation failed (diagnostic).
@@ -1151,17 +1155,6 @@ mod owner_reference_tests {
 }
 
 impl RasterizerVulkan {
-    /// Low-bit mask used by upstream to check every eighth operation.
-    #[cfg(not(target_os = "android"))]
-    const DISPATCH_THRESHOLD: u32 = 7;
-    #[cfg(target_os = "android")]
-    const DISPATCH_THRESHOLD: u32 = 3;
-    /// Hard flush threshold â€” full GPU submit every N draws.
-    #[cfg(not(target_os = "android"))]
-    const FLUSH_THRESHOLD: u32 = 4096;
-    #[cfg(target_os = "android")]
-    const FLUSH_THRESHOLD: u32 = 512;
-
     /// Create a new RasterizerVulkan.
     ///
     /// Takes Vulkan handles from the VulkanPresenter so they share the same
@@ -1430,6 +1423,7 @@ impl RasterizerVulkan {
             fence_backend: VkFenceBackend::new(fence_wait_handle),
             wfi_event,
             draw_counter: 0,
+            pending_native_work: false,
             draw_sequence: 0,
             draw_skipped_pipeline: 0,
             mesh_arenas: Vec::new(),
@@ -2315,18 +2309,75 @@ impl RasterizerVulkan {
         }
     }
 
+    /// Port of Lichii `RasterizerVulkan::FlushWork` (vk_rasterizer.cpp:4125-4170),
+    /// a Lichii extension of Eden's: native-tiling (NX2) titles submit every
+    /// `submission_policy::DEFAULT_NATIVE_BUDGET` (128) operations and dispatch
+    /// every 32; other titles dispatch every 32 (Eden: 8) and submit at 4096
+    /// (128 on MoltenVK). `EDEN_NX2_FLUSH_DRAWS` overrides either budget, read
+    /// once. The `state_tracker` invalidation after a submission is ruzu's, kept
+    /// from the Eden-shaped body this replaces.
     fn flush_work(&mut self) {
-        self.draw_counter = self.draw_counter.wrapping_add(1);
-        if self.draw_counter & Self::DISPATCH_THRESHOLD != Self::DISPATCH_THRESHOLD {
-            return;
+        use super::submission_policy::{self, Action};
+        #[cfg(target_os = "android")]
+        const ANDROID: bool = true;
+        #[cfg(not(target_os = "android"))]
+        const ANDROID: bool = false;
+        // Lichii `gpu_memory->UsesNativeTiling()`: the bound channel's manager.
+        let native = self
+            .channel_memory_manager_handle
+            .is_some_and(|memory| unsafe { memory.as_ref().uses_native_tiling() });
+        let mut budget = submission_policy::DEFAULT_NATIVE_BUDGET;
+        if native && !ANDROID {
+            static CONFIGURED_BUDGET: std::sync::LazyLock<Option<u32>> =
+                std::sync::LazyLock::new(|| {
+                    let value = std::env::var("EDEN_NX2_FLUSH_DRAWS").ok()?;
+                    let parsed = submission_policy::parse_budget(&value);
+                    if parsed.is_none() {
+                        warn!(
+                            "Invalid EDEN_NX2_FLUSH_DRAWS; expected an integer from 1 to {}",
+                            u32::MAX
+                        );
+                    }
+                    parsed
+                });
+            budget = CONFIGURED_BUDGET.unwrap_or(submission_policy::DEFAULT_NATIVE_BUDGET);
         }
-        if self.draw_counter < Self::FLUSH_THRESHOLD {
-            self.scheduler.dispatch_work();
-            return;
+        let mut legacy_budget = 4096;
+        if !native && !ANDROID {
+            // Lichii: `std::max(32L, std::strtol(value, nullptr, 10)) & ~31L`,
+            // truncated to u32; 0 when the variable is unset.
+            static FORCED_DRAWS: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+                std::env::var("EDEN_NX2_FLUSH_DRAWS")
+                    .map(|value| {
+                        let value = std::ffi::CString::new(value).unwrap_or_default();
+                        // SAFETY: `value` is NUL-terminated; a null end pointer is allowed.
+                        let parsed =
+                            unsafe { libc::strtol(value.as_ptr(), std::ptr::null_mut(), 10) };
+                        (parsed.max(32) & !31) as u32
+                    })
+                    .unwrap_or(0)
+            });
+            legacy_budget = if *FORCED_DRAWS != 0 {
+                *FORCED_DRAWS
+            } else if self.device.get().is_molten_vk() {
+                128
+            } else {
+                4096
+            };
         }
-        self.scheduler.flush();
-        self.draw_counter = 0;
-        self.state_tracker.invalidate_command_buffer_state();
+        match submission_policy::advance(&mut self.draw_counter, native, ANDROID, budget, legacy_budget)
+        {
+            Action::None => {}
+            Action::Dispatch => self.scheduler.dispatch_work(),
+            Action::Flush => {
+                self.scheduler.flush();
+                self.state_tracker.invalidate_command_buffer_state();
+                self.pending_native_work = false;
+            }
+        }
+        if native && !ANDROID {
+            self.pending_native_work = true;
+        }
     }
 
     /// Submit and wait for all GPU work to complete.
@@ -4675,16 +4726,31 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn tiled_cache_barrier(&mut self) {}
 
+    /// Port of Lichii `RasterizerVulkan::FlushCommands` (vk_rasterizer.cpp:3166-3185).
+    /// Lichii extensions over Eden: `pending_native_work` keeps a native draw
+    /// recorded after a budget submission from being left unsubmitted, and a
+    /// submission with nothing recorded since the last one is skipped (port of
+    /// Fritchii EXP61, Lichii 8e5259aa7b). Lichii's `Scheduler::CountSkippedFlush`
+    /// only feeds its GPU-profile scheduler report, which ruzu does not have, and
+    /// its `Scheduler::DeferFlush` (`EDEN_NX2_FENCE_FLUSH_US`) is not ported.
     fn flush_commands(&mut self) {
-        if self.draw_counter == 0 {
+        if self.draw_counter == 0 && !self.pending_native_work {
             return;
         }
         self.draw_counter = 0;
+        self.pending_native_work = false;
+        // A fence with a download is submitted by InnerFence::Queue, and SignalFence then
+        // comes here with nothing recorded since (Lichii: ~4,600 empty submits a second).
+        if !self.scheduler.recorded_since_submit() {
+            return;
+        }
         self.scheduler.flush();
     }
 
     fn tick_frame(&mut self) {
         self.draw_counter = 0;
+        // Lichii `RasterizerVulkan::TickFrame` (vk_rasterizer.cpp:3821-3822).
+        self.pending_native_work = false;
         // Upstream `RasterizerVulkan::TickFrame` rotates both descriptor
         // queues to the next per-frame payload slice before anything else
         // (vk_rasterizer.cpp:765-766). Without this the ring never advances

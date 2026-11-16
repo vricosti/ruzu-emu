@@ -272,6 +272,12 @@ pub struct Scheduler {
     state: SchedulerState,
     deferred_clear: DeferredClear,
 
+    /// Lichii `Scheduler::record_serial`: commands recorded.
+    record_serial: u64,
+    /// Lichii `Scheduler::submitted_serial`: `record_serial` at the last
+    /// Flush or Finish.
+    submitted_serial: u64,
+
     /// Port of upstream render-pass attachment tracking fields.
     num_renderpass_images: usize,
     renderpass_images: [vk::Image; NUM_RT + 1],
@@ -723,6 +729,8 @@ impl Scheduler {
             current_chunk: CommandChunk::new(),
             state: SchedulerState::default(),
             deferred_clear: DeferredClear::default(),
+            record_serial: 0,
+            submitted_serial: 0,
             num_renderpass_images: 0,
             renderpass_images: [vk::Image::null(); NUM_RT + 1],
             renderpass_image_ranges: [vk::ImageSubresourceRange::default(); NUM_RT + 1],
@@ -798,6 +806,7 @@ impl Scheduler {
         cmd: impl FnOnce(vk::CommandBuffer, vk::CommandBuffer) + Send + 'static,
     ) {
         crate::gpu_split::check_owner("Scheduler::Record");
+        self.record_serial = self.record_serial.wrapping_add(1);
         let command = match self.current_chunk.record(cmd) {
             Ok(()) => return,
             Err(command) => command,
@@ -1262,6 +1271,7 @@ impl Scheduler {
         crate::gpu_split::check_owner("Scheduler::Flush");
         let tick = self.submit_execution(signal_semaphore, wait_semaphore);
         self.allocate_new_context();
+        self.submitted_serial = self.record_serial;
         debug!("Scheduler: flushed at tick {}", tick);
         tick
     }
@@ -1314,6 +1324,16 @@ impl Scheduler {
         self.submit_execution(signal_semaphore, wait_semaphore);
         self.wait(presubmit_tick);
         self.allocate_new_context();
+        self.submitted_serial = self.record_serial;
+    }
+
+    /// Lichii `Scheduler::RecordedSinceSubmit` (vk_scheduler.h:240-245):
+    /// whether anything was recorded since the last Flush or Finish, or waits
+    /// to be (a deferred clear reaches the command buffer only at the next
+    /// record or submit). Lichii also counts its batched uploads
+    /// (`uploads_pending`); ruzu records uploads immediately, so it has none.
+    pub fn recorded_since_submit(&self) -> bool {
+        self.record_serial != self.submitted_serial || self.deferred_clear.framebuffer.is_some()
     }
 
     /// Get the current tick value.

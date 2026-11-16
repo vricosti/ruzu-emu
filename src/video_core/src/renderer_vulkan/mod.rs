@@ -32,6 +32,7 @@ pub mod resource_pool;
 pub mod scheduler;
 pub mod shader_util;
 pub mod staging_buffer_pool;
+pub mod submission_policy;
 pub mod state_tracker;
 pub mod swapchain;
 pub mod texture_cache;

@@ -1,5 +1,80 @@
 # Upstream parity notes
 
+## 2026-11-16 — Lichii NX2 performance mechanisms: submission policy, GPU thread pinning, fence batches, deferred fragment barriers
+
+All four are Lichii extensions, absent from Eden. The losses quoted are Lichii's own ablation on
+the NX2 title used for measurement (one 60 s run each with the mechanism disabled, against three
+references at 46.13-46.53 fps); none is measured in ruzu yet.
+
+### Submission policy (`EDEN_NX2_FLUSH_DRAWS`; Lichii loses 10.5 % fps without it)
+- `renderer_vulkan/submission_policy.rs` ports Lichii `renderer_vulkan/submission_policy.h`
+  (`DEFAULT_NATIVE_BUDGET = 128`, `Action`, `parse_budget`, `advance`).
+- `RasterizerVulkan::flush_work` ports Lichii `FlushWork` (vk_rasterizer.cpp:4125-4170): a
+  title using native tiling dispatches every 32 operations and submits every 128 (desktop);
+  `EDEN_NX2_FLUSH_DRAWS=n` (read once) replaces 128. Other titles dispatch every 32 instead of
+  Eden's 8 and submit at 4096 (128 on MoltenVK), and `EDEN_NX2_FLUSH_DRAWS` also forces their
+  budget (`max(32, strtol(value)) & ~31`). This part reaches Switch 1 titles too, as in Lichii.
+  Android keeps Eden's cadence. The `state_tracker` invalidation after the submission is ruzu's.
+- `pending_native_work` (vk_rasterizer.h:383; vk_rasterizer.cpp:3167-3171, 3822, 4165-4169):
+  `flush_commands` submits after a native draw even when `draw_counter` was reset by a budget
+  submission; `tick_frame` clears it.
+- `flush_commands` skips a submission with nothing recorded since the last one
+  (vk_rasterizer.cpp:3173-3177, Lichii 8e5259aa7b): `Scheduler::recorded_since_submit` with
+  `record_serial` / `submitted_serial` (vk_scheduler.h:223, 240-245, 363-364;
+  vk_scheduler.cpp:182, 267). ruzu has no batched uploads, so `uploads_pending` has no
+  counterpart.
+- Not ported: `Scheduler::CountSkippedFlush` (feeds only Lichii's GPU-profile scheduler report,
+  which ruzu lacks), `Scheduler::DeferFlush` in `FlushCommands` (`EDEN_NX2_FENCE_FLUSH_US`, no
+  measurable effect in the ablation: -0.7 %), and `DispatchWork` without a worker wake-up
+  (vk_scheduler.cpp:317-337).
+
+### GPU thread pinning (setting `pin_gpu_threads`, default on; Lichii loses 5.3 % fps without it)
+- `common/core_pinning.rs` ports Lichii `common/core_pinning.{h,cpp}` (Lichii 8f80816581):
+  `plan_gpu_thread_pinning` gives the split GPU thread's front and back the second and third
+  physical cores of the fastest class (all their SMT siblings) and the guest cores the others,
+  only with at least `MIN_CORES_FOR_GPU_THREAD_PINNING` (6) such cores; `parse_cpu_list`.
+- `common/thread.rs`: `PinnedRole`, `pin_current_thread` (thread.cpp:731-787) with the Linux
+  `read_cpu_list`, `linux_processors`, `set_current_thread_affinity` (thread.cpp:552-624). The
+  plan is made once and logged; too few cores, an unreadable topology or a refused affinity only
+  log.
+- `common/settings.rs`: `pin_gpu_threads`, `SwitchableSetting<bool>`, default true, category
+  RendererHacks, saved (settings.h:823-824). Callers as in Lichii: the GPU thread
+  (gpu_thread.cpp:69-71), the split back (gpu_split.cpp:649-651) and each CPU core thread
+  (cpu_manager.cpp:182-184). It applies to every title, as in Lichii.
+- Differences: no Windows pinning (Lichii uses its CPU-set helpers, which ruzu lacks; Windows
+  logs that pinning is Linux only); no GTK option (Lichii's Qt text, shared_translation.cpp:386)
+  and no recommended-settings entry (recommended_settings.h:59-62).
+
+### Fence batches (`EDEN_NX2_FENCE_BATCH`; Lichii loses 3.5 % fps without it)
+- `fence_manager.rs` `release_thread_func` ports Lichii `ReleaseThreadFunc`
+  (fence_manager.h:259-350): after waiting for the first fence, the release thread takes up to 64
+  fences already signaled (or stubbed), pops their texture flushes under one texture-cache lock,
+  then their buffer flushes under one buffer-cache lock, then runs each fence's query pop and
+  operations in fence order. `EDEN_NX2_FENCE_BATCH=0` (read once): one fence at a time. All
+  titles, as in Lichii.
+- Rust adaptation: the generic manager reaches the caches through the backend's
+  `pop_async_flushes` callback, which now takes `AsyncFlushPops` (pop counts per cache); each
+  async fence keeps that callback instead of a pre-operation. `FenceBase::is_signaled` gives the
+  release thread the backend's `IsFenceSignaled`. OpenGL and Metal have no release thread and
+  pop `AsyncFlushPops::for_fence`, Eden's per-fence order.
+- Not ported: `Nx2FastDraw::Break` (no fast draws in ruzu) and the `spare_operations` reuse.
+
+### Deferred fragment barriers (no switch in Lichii; not measured)
+- `RasterizerVulkan::fragment_barrier` defers the barrier (vk_rasterizer.cpp:3156-3160) through
+  `renderer_vulkan/fragment_barrier_state.rs` (Lichii `fragment_barrier_state.h`) and
+  `Scheduler::{defer_fragment_barrier, has_fragment_barrier, note_render_pass_stores,
+  render_pass_has_stores}` (vk_scheduler.h:141-155, 498-499), reset when a render pass ends
+  (vk_scheduler.cpp:993-994).
+- `GraphicsPipeline::configure` ends the pass after `check_feedback_loop` only when a barrier is
+  pending and the pass has stores or the draw samples an active render target
+  (vk_graphics_pipeline.cpp:1245-1248); `TextureCache::samples_render_target`
+  (texture_cache.h:924-945); `writes_storage` (vk_graphics_pipeline.cpp:427-433) notes the
+  stores after `request_renderpass` (vk_graphics_pipeline.cpp:1606-1608). All titles, as in Lichii
+  (Lichii's comment counts ~5,900 render passes a second avoided on the NX2 title it tuned).
+- Not ported: the delta-draw call site (vk_graphics_pipeline.cpp:1415-1418; ruzu has no delta
+  draws), the MoltenVK-only deferral in `WaitForIdle` (vk_rasterizer.cpp:3137-3141) and the
+  indirect-trace `NoteRenderPassStores` (vk_rasterizer.cpp:1951, a diagnostic).
+
 ## 2026-11-16 — inline-to-memory invalidations deferred: video_core/{renderer_vulkan/vk_rasterizer,memory_manager}.rs vs Lichii video_core/{renderer_vulkan/vk_rasterizer.cpp,memory_manager.h} (not measured in ruzu yet)
 
 ### Ported (Lichii extensions, absent from Eden)

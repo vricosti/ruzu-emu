@@ -430,6 +430,10 @@ struct GpuSplitShared {
     wait_target: CacheLine<AtomicU64>,
     back_waiting: CacheLine<AtomicBool>,
     wake: Wake,
+    /// Lichii front_waiting / front_wake: a front sleeping in Backoff, and
+    /// what the back bumps after storing `consumed` while it sleeps.
+    front_waiting: CacheLine<AtomicBool>,
+    front_wake: Wake,
     owned_pending: AtomicUsize,
     stop_requested: AtomicBool,
     back_failed: AtomicBool,
@@ -451,6 +455,8 @@ impl GpuSplitShared {
             wait_target: CacheLine(AtomicU64::new(u64::MAX)),
             back_waiting: CacheLine(AtomicBool::new(false)),
             wake: Wake::new(),
+            front_waiting: CacheLine(AtomicBool::new(false)),
+            front_wake: Wake::new(),
             owned_pending: AtomicUsize::new(0),
             stop_requested: AtomicBool::new(false),
             back_failed: AtomicBool::new(false),
@@ -461,6 +467,14 @@ impl GpuSplitShared {
     }
     fn at(&self, index: usize) -> *mut u64 {
         self.ring[index].get()
+    }
+
+    /// Port of GpuSplit::NotifyFront (Lichii gpu_split.h:481-487): after the
+    /// back stored `consumed` (SeqCst), wakes a front sleeping in Backoff.
+    fn notify_front(&self) {
+        if self.front_waiting.0.load(Ordering::SeqCst) {
+            self.front_wake.notify_one();
+        }
     }
 }
 
@@ -512,12 +526,16 @@ impl GpuSplitBack {
                     || read_position >= self.shared.wait_target.0.load(Ordering::Relaxed))
                     && read_position != available
                 {
-                    self.shared.consumed.0.store(read_position, Ordering::Release);
+                    // SeqCst as upstream: NotifyFront's front_waiting load
+                    // pairs with Backoff's store-then-load of consumed.
+                    self.shared.consumed.0.store(read_position, Ordering::SeqCst);
                     last_store = read_position;
+                    self.shared.notify_front();
                 }
             }
             self.shared.back_busy.store(false, Ordering::Release);
-            self.shared.consumed.0.store(read_position, Ordering::Release);
+            self.shared.consumed.0.store(read_position, Ordering::SeqCst);
+            self.shared.notify_front();
         }
     }
 
@@ -675,6 +693,9 @@ impl GpuSplit {
                 shared.back_failed.store(true, Ordering::Release);
                 shared.stop_requested.store(true, Ordering::Release);
                 shared.wake.notify_one();
+                // As upstream's back_running = false at BackLoop's end: a front
+                // sleeping in Backoff wakes and sees the failure.
+                shared.front_wake.notify_one();
                 on_failure();
                 std::panic::resume_unwind(panic);
             }
@@ -957,9 +978,35 @@ impl GpuSplit {
                 self.publish_every = 8;
                 return;
             }
-            if spins < 16384 { pause(); } else { std::thread::yield_now(); }
-            spins = spins.wrapping_add(1);
+            self.backoff(spins, self.write_position);
+            spins = spins.saturating_add(1);
         }
+    }
+
+    /// Port of GpuSplit::Backoff (Lichii gpu_split.cpp:441-458): one step of
+    /// a front wait for the back to consume `target`. Spins first, then
+    /// sleeps until the back stores a new position (NotifyFront): the back
+    /// checks front_waiting after each store, the front checks the position
+    /// after setting it.
+    fn backoff(&self, spins: u32, target: u64) {
+        if spins < 16384 {
+            pause();
+            return;
+        }
+        // Upstream's !back_running: no back to wake this front.
+        if self.back_thread.is_none() || self.shared.stop_requested.load(Ordering::Acquire) {
+            std::thread::yield_now();
+            return;
+        }
+        let shared = &self.shared;
+        shared.front_waiting.0.store(true, Ordering::SeqCst);
+        let seen = shared.front_wake.value.load(Ordering::SeqCst);
+        if shared.consumed.0.load(Ordering::SeqCst) < target
+            && !shared.stop_requested.load(Ordering::SeqCst)
+        {
+            shared.front_wake.wait(seen);
+        }
+        shared.front_waiting.0.store(false, Ordering::Relaxed);
     }
 }
 
@@ -1007,8 +1054,7 @@ impl GpuSplit {
         target
     }
 
-    /// Port of GpuSplit::WaitFor. Rust keeps Drain's spin-then-yield wait
-    /// (upstream's Backoff sleeps on front_wake, which this port lacks).
+    /// Port of GpuSplit::WaitFor, with its Backoff.
     fn wait_for(&mut self, target: u64) -> bool {
         self.consumed_cache = self.shared.consumed.0.load(Ordering::Acquire);
         // Nothing to wait for: the back's state is not needed (a failed back
@@ -1026,8 +1072,8 @@ impl GpuSplit {
                 self.shared.wait_target.0.store(u64::MAX, Ordering::Relaxed);
                 return true;
             }
-            if spins < 16384 { pause(); } else { std::thread::yield_now(); }
-            spins = spins.wrapping_add(1);
+            self.backoff(spins, target);
+            spins = spins.saturating_add(1);
         }
     }
 }
@@ -1664,6 +1710,32 @@ mod tests {
         let any_before = front.0.transport.borrow().last_noted_write;
         front.note_write(&memory, 0x4010, 8);
         assert_eq!(front.0.transport.borrow().last_noted_write, any_before, "nothing mapped");
+    }
+
+    // Lichii Backoff/NotifyFront (gpu_split.cpp:441-458, gpu_split.h:481-487):
+    // a front waiting past its spins sleeps until the back stores a position,
+    // and a failed back wakes it too.
+    #[test]
+    fn front_backoff_sleeps_until_back_stores_consumed_or_fails() {
+        let mut split = GpuSplit::new();
+        split.start_back(|| {});
+        split.defer(|| std::thread::sleep(std::time::Duration::from_millis(50)));
+        split.drain();
+        assert_eq!(split.shared.consumed.0.load(Ordering::Acquire), split.write_position);
+        assert!(!split.shared.front_waiting.0.load(Ordering::Relaxed));
+        assert!(split.shared.front_wake.value.load(Ordering::SeqCst) > 0,
+            "the back woke the sleeping front");
+        split.defer(|| std::thread::sleep(std::time::Duration::from_millis(50)));
+        let target = split.position();
+        assert!(split.wait_until(target));
+        assert!(!split.shared.front_waiting.0.load(Ordering::Relaxed));
+        split.defer(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            panic!("injected backend failure");
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| split.drain()));
+        assert!(result.is_err(), "drain reports the failed back instead of sleeping forever");
+        assert!(split.stop().is_err());
     }
 
     #[test]

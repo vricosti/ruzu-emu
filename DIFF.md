@@ -38,6 +38,11 @@
   a same-value `vertex_buffer.first`/`count`, or `draw.end` inside an instance loop, is not sent
   to the back unless state writes wait in its method sink. Lichii's `StateWrite` blocks and
   `FrontNoteReport` are not ported.
+- `GpuSplit::Backoff` / `NotifyFront` (Lichii gpu_split.cpp:441-458, gpu_split.h:481-487,
+  BackLoop's consumed stores): `drain` and `wait_for` sleep on `front_wake` after 16384 spins
+  instead of yielding forever; the back stores `consumed` with `SeqCst` and wakes a sleeping
+  front; a failed back wakes it too (upstream: `back_running = false` then `front_wake`
+  notify). `wait_for_space` keeps its spin-then-yield wait, as upstream.
 
 ## 2026-11-15 — video_core/{query_dma,macro,engines/maxwell_3d,rasterizer_interface,query_cache/query_cache_base,renderer_vulkan/{query_cache,vk_rasterizer}}.rs vs Lichii video_core/{query_dma.h,macro.cpp,engines/maxwell_3d.cpp,rasterizer_interface.h,query_cache/query_cache_base.h,renderer_vulkan/vk_rasterizer.cpp}
 

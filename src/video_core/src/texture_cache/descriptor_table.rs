@@ -153,6 +153,37 @@ impl<T: Copy + PartialEq + Default> DescriptorTable<T> {
         (descriptor, changed)
     }
 
+    /// Read a descriptor from the channel's GPU address space.
+    ///
+    /// Port of Lichii `DescriptorTable::Read(const MemoryManager&, u32)`
+    /// (descriptor_table.h:46-73): this runs for every texture and sampler of
+    /// every draw, so an entry within one page is copied from its host
+    /// pointer instead of going through the generic block read. Eden always
+    /// uses `ReadBlockUnsafe`.
+    pub fn read_from_memory(
+        &mut self,
+        gpu_memory: &crate::memory_manager::MemoryManager,
+        index: u32,
+    ) -> (T, bool) {
+        use ruzu_core::device_memory_manager::{DEVICE_PAGEMASK, DEVICE_PAGESIZE};
+        self.read_with(index, |gpu_addr, output| {
+            let one_page = (gpu_addr & DEVICE_PAGEMASK as u64) + output.len() as u64
+                <= DEVICE_PAGESIZE as u64;
+            let host = if one_page {
+                gpu_memory.get_pointer(gpu_addr).cast_const()
+            } else {
+                std::ptr::null()
+            };
+            if host.is_null() {
+                return gpu_memory.read_block_unsafe(gpu_addr, output);
+            }
+            // SAFETY: `get_pointer` returned the host page holding the whole
+            // entry, which stays mapped while the channel is bound.
+            unsafe { std::ptr::copy_nonoverlapping(host, output.as_mut_ptr(), output.len()) };
+            true
+        })
+    }
+
     // ── Private helpers ────────────────────────────────────────────────
 
     fn refresh(&mut self, gpu_addr: GPUVAddr, limit: u32) {

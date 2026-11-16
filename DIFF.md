@@ -1,5 +1,35 @@
 # Upstream parity notes
 
+## 2026-11-16 — texture view preparation: video_core/texture_cache/{texture_cache,image_base,descriptor_table}.rs and renderer_vulkan/texture_cache.rs vs Eden/Lichii video_core/texture_cache/{texture_cache.h,image_base.h,image_base.cpp,descriptor_table.h}
+
+### Ported (Lichii extensions, absent from Eden)
+- `ImageBase::newest_alias_tick` and `set_modification_tick` (image_base.h:135, 179-187;
+  image_base.cpp:255-256): every `modification_tick` change (`mark_modification_by_id`,
+  `JoinImages` copies, `synchronize_aliases`) raises the aliases' `newest_alias_tick`, and
+  `synchronize_aliases` returns at once while no alias was modified after the image
+  (texture_cache.h:4233-4240, 4253-4256, 4266-4267). Eden walks the whole alias list on every
+  preparation; the copies made are the same.
+- `DescriptorTable::read_from_memory` (Lichii `DescriptorTable::Read`, descriptor_table.h:46-73):
+  a TIC/TSC entry within one page is copied from its host pointer; Eden uses `ReadBlockUnsafe`.
+
+### Realigned on Eden
+- `synchronize_aliases` no longer clones every newer alias' `Vec<ImageCopy>` and `copy_image`
+  no longer copies it again: `copy_image` takes the copies by value like Eden's
+  `CopyImage(ImageId, ImageId, std::vector<ImageCopy>)` (texture_cache.h:2451-2501), and reads
+  `resolution_info` without cloning it.
+
+### Intentional differences
+- ruzu-only mechanics, no upstream counterpart: `TextureCacheParams::copy_image` /
+  `reinterpret_image` keep a backend image that matches its slot's `ImageBase`
+  (`ensure_slot_image`) instead of cloning both bases on every alias copy, and the Vulkan
+  `update_render_targets` translates addresses through the non-owning channel memory pointer
+  (upstream's `Tegra::MemoryManager*`) instead of cloning the owning `Arc` and locking it on
+  every draw.
+- Not changed: `FixedPipelineState::refresh` builds ruzu's `DepthStencilInfo`/`RasterizerInfo`
+  register snapshots (owned by `engines/maxwell_3d.rs`) where upstream reads `regs` fields;
+  the per-channel `sampler_ids`/`image_view_ids` stay hash maps as in Eden (Lichii keeps
+  `DescriptorTable::bound_ids`).
+
 ## 2026-11-16 — constant buffer data path: video_core/{memory_manager,rasterizer_interface,engines/maxwell_3d,buffer_cache/{buffer_cache,memory_tracker_base},renderer_vulkan/vk_rasterizer}.rs vs Lichii video_core/{memory_manager.{h,cpp},rasterizer_interface.h,engines/maxwell_3d.{h,cpp},buffer_cache/{buffer_cache.h,memory_tracker_base.h},renderer_vulkan/vk_rasterizer.cpp}
 
 ### Ported (Lichii extensions, absent from Eden)

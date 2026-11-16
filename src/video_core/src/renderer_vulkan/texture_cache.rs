@@ -5262,23 +5262,23 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
         copies: &[ImageCopy],
     ) {
         let texture_cache = texture_cache_from_base(cache);
-        let dst_base = texture_cache.base.slot_images[dst_id].base.as_ref().clone();
-        let src_base = texture_cache.base.slot_images[src_id].base.as_ref().clone();
-        let dst_aspect = image_aspect_mask(dst_base.info.format);
-        let src_aspect = image_aspect_mask(src_base.info.format);
+        let dst_pixel_format = texture_cache.base.slot_images[dst_id].base.info.format;
+        let src_pixel_format = texture_cache.base.slot_images[src_id].base.info.format;
+        let dst_aspect = image_aspect_mask(dst_pixel_format);
+        let src_aspect = image_aspect_mask(src_pixel_format);
         let dst_format = texture_cache
             .base
             .runtime()
-            .surface_format(dst_base.info.format, false);
+            .surface_format(dst_pixel_format, false);
         let src_format = texture_cache
             .base
             .runtime()
-            .surface_format(src_base.info.format, false);
+            .surface_format(src_pixel_format, false);
         if texture_cache
-            .ensure_image(dst_id, &dst_base, dst_format, dst_aspect)
+            .ensure_slot_image(dst_id, dst_format, dst_aspect)
             .is_err()
             || texture_cache
-                .ensure_image(src_id, &src_base, src_format, src_aspect)
+                .ensure_slot_image(src_id, src_format, src_aspect)
                 .is_err()
         {
             return;
@@ -5317,23 +5317,23 @@ impl crate::texture_cache::texture_cache_base::TextureCacheParams for TextureCac
         copies: &[ImageCopy],
     ) {
         let texture_cache = texture_cache_from_base(cache);
-        let dst_base = texture_cache.base.slot_images[dst_id].base.as_ref().clone();
-        let src_base = texture_cache.base.slot_images[src_id].base.as_ref().clone();
-        let dst_aspect = image_aspect_mask(dst_base.info.format);
-        let src_aspect = image_aspect_mask(src_base.info.format);
+        let dst_pixel_format = texture_cache.base.slot_images[dst_id].base.info.format;
+        let src_pixel_format = texture_cache.base.slot_images[src_id].base.info.format;
+        let dst_aspect = image_aspect_mask(dst_pixel_format);
+        let src_aspect = image_aspect_mask(src_pixel_format);
         let dst_format = texture_cache
             .base
             .runtime()
-            .surface_format(dst_base.info.format, false);
+            .surface_format(dst_pixel_format, false);
         let src_format = texture_cache
             .base
             .runtime()
-            .surface_format(src_base.info.format, false);
+            .surface_format(src_pixel_format, false);
         if texture_cache
-            .ensure_image(dst_id, &dst_base, dst_format, dst_aspect)
+            .ensure_slot_image(dst_id, dst_format, dst_aspect)
             .is_err()
             || texture_cache
-                .ensure_image(src_id, &src_base, src_format, src_aspect)
+                .ensure_slot_image(src_id, src_format, src_aspect)
                 .is_err()
         {
             return;
@@ -6005,7 +6005,10 @@ impl TextureCache {
         is_clear: bool,
         clear_scissor: Option<(u32, u32, u32, u32)>,
     ) -> bool {
-        let Some(gpu_memory) = self.base.channel_gpu_memory.as_ref().cloned() else {
+        // Upstream uses its stored `Tegra::MemoryManager*`: the non-owning
+        // channel pointer, derived together with the owning Arc, needs neither
+        // an Arc clone nor the owner's mutex on every draw.
+        let Some(gpu_memory) = self.base.channel_gpu_memory_handle else {
             return false;
         };
         let mut dirty_access = VulkanRenderTargetDirtyFlags { flags: dirty_flags };
@@ -6013,7 +6016,9 @@ impl TextureCache {
             render_targets,
             &mut dirty_access,
             |gpu_addr, guest_size| {
-                let gpu_memory = gpu_memory.lock();
+                // SAFETY: the bound channel keeps the manager alive; the GPU
+                // thread serializes this access like `visit_image_view`.
+                let gpu_memory = unsafe { gpu_memory.as_ref() };
                 gpu_memory
                     .gpu_to_cpu_address(gpu_addr)
                     .or_else(|| gpu_memory.gpu_to_cpu_address_range(gpu_addr, guest_size))
@@ -6074,6 +6079,32 @@ impl TextureCache {
 
     /// Ensure a backend `Image` exists for the common-cache `ImageId`.
     /// Returns `true` when an existing backend image was recreated.
+    /// `ensure_image` for the slot's own `ImageBase`: a backend that already
+    /// matches it is kept without copying the base (alias copies reach this for
+    /// every sampled image a newer alias overlaps).
+    fn ensure_slot_image(
+        &mut self,
+        image_id: ImageId,
+        format: vk::Format,
+        aspect: vk::ImageAspectFlags,
+    ) -> Result<bool, vk::Result> {
+        let slot = &self.base.slot_images[image_id];
+        if let Some(existing) = slot.backend.as_ref() {
+            let info = &slot.base.info;
+            if existing.format == format
+                && existing.aspect == aspect
+                && existing.base().info.size == info.size
+                && existing.base().info.resources == info.resources
+                && existing.base().info.image_type == info.image_type
+                && existing.base().info.num_samples == info.num_samples
+            {
+                return Ok(false);
+            }
+        }
+        let image_base = self.base.slot_images[image_id].base.as_ref().clone();
+        self.ensure_image(image_id, &image_base, format, aspect)
+    }
+
     fn ensure_image(
         &mut self,
         image_id: ImageId,

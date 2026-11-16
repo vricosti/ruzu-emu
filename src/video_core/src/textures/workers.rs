@@ -19,14 +19,12 @@ static THREAD_WORKERS: OnceLock<ThreadWorker> = OnceLock::new();
 /// Port of `Tegra::Texture::GetThreadWorkers()`.
 ///
 /// The pool is lazily initialized with `max(hardware_concurrency, 2) / 2` threads.
+/// `common::thread::hardware_concurrency` counts the online processors, not the
+/// calling thread's affinity: the first caller is usually a GPU thread, which
+/// `pin_gpu_threads` restricts to one physical core.
 pub fn get_thread_workers() -> &'static ThreadWorker {
     THREAD_WORKERS.get_or_init(|| {
-        let num_threads = std::cmp::max(
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(2),
-            2,
-        ) / 2;
+        let num_threads = std::cmp::max(common::thread::hardware_concurrency(), 2) / 2;
         ThreadWorker::new_stateless(num_threads, "ImageTranscode".to_string())
     })
 }

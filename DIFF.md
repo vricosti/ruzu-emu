@@ -44,6 +44,27 @@ references at 46.13-46.53 fps); none is measured in ruzu yet.
 - Differences: no Windows pinning (Lichii uses its CPU-set helpers, which ruzu lacks; Windows
   logs that pinning is Linux only); no GTK option (Lichii's Qt text, shared_translation.cpp:386)
   and no recommended-settings entry (recommended_settings.h:59-62).
+- Regression found and fixed (2026-11-16). On another NX2 title (map, then 3D title screen), the
+  first port made loading 56 % slower (5.68 / 9.73 fps against 16.20 / 18.83, presentation gaps
+  of 15-17 s against 1.4-2.5 s); with `pin_gpu_threads=false` the same binary ran 21.47 fps
+  against 21.78. Cause: the texture transcoding pool (`textures/workers.rs`) is created lazily,
+  usually from a GPU thread, and was sized with `std::thread::available_parallelism()`, which
+  follows the calling thread's affinity: 1 thread instead of 8, and that thread inherited the GPU
+  thread's single physical core. Upstream sizes its pools with
+  `std::thread::hardware_concurrency()`, which ignores affinity (libstdc++ `get_nprocs()`;
+  checked: 16 under `taskset -c 0` on a 16-thread host).
+- Fix: `common::thread::hardware_concurrency()` (online processors, `sysconf(_SC_NPROCESSORS_ONLN)`)
+  replaces `available_parallelism()` in every pool size (texture transcoding, Vulkan, OpenGL and
+  Metal pipeline workers, `cpu_detect::get_processor_count` on Linux). Inheritance: Linux threads
+  inherit their creator's affinity, and Lichii has the same latent defect (its desktop-Linux
+  `SetCurrentThreadToAllCores` / `ToBackgroundWork` / `ToEfficiencyCores` are no-ops, and its
+  `GetThreadWorkers` pool is also created lazily from the GPU thread). In ruzu these three
+  functions, which every `ThreadWorker` thread calls at start, give the thread back the process's
+  affinity captured before the first pin; while nothing is pinned they stay no-ops. The two raw
+  threads created from GPU threads (`TextureConvCache`, `Screenshot`) call
+  `set_current_thread_to_all_cores` too. Threads created from guest core threads (HLE service host
+  threads, the kernel worker task thread) keep the guest cores' mask, as in Lichii: they stay off
+  the two GPU cores. The fix is not measured yet.
 
 ### Fence batches (`EDEN_NX2_FENCE_BATCH`; Lichii loses 3.5 % fps without it)
 - `fence_manager.rs` `release_thread_func` ports Lichii `ReleaseThreadFunc`

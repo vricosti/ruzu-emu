@@ -1928,11 +1928,7 @@ impl MetalPipelineCache {
             return;
         }
 
-        let worker_count = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(2)
-            .max(2)
-            - 1;
+        let worker_count = common::thread::hardware_concurrency().max(2) - 1;
         let workers = ThreadWorker::new_stateless(worker_count, "MetalShaderBuilder".to_owned());
         let results = Arc::new(Mutex::new(Vec::<DiskPipelineBuildResult>::new()));
         let state = Arc::new(Mutex::new(DiskResourceLoadState { built: 0, total }));

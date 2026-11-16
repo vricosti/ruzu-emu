@@ -1925,11 +1925,7 @@ fn pipeline_cache_paths(
 
 /// Port of upstream `GetTotalPipelineWorkers`.
 fn get_total_pipeline_workers() -> usize {
-    let max_core_threads = std::thread::available_parallelism()
-        .map(|threads| threads.get())
-        .unwrap_or(2)
-        .max(2)
-        - 1;
+    let max_core_threads = common::thread::hardware_concurrency().max(2) - 1;
 
     #[cfg(target_os = "android")]
     {
@@ -3909,11 +3905,7 @@ mod tests {
 
     #[test]
     fn total_pipeline_workers_matches_upstream_minimum_policy() {
-        let expected = std::thread::available_parallelism()
-            .map(|threads| threads.get())
-            .unwrap_or(2)
-            .max(2)
-            - 1;
+        let expected = common::thread::hardware_concurrency().max(2) - 1;
         assert_eq!(get_total_pipeline_workers(), expected);
         assert!(get_total_pipeline_workers() >= 1);
     }

@@ -32,6 +32,12 @@
   `MemoryManager::map_serial_unlocked`) is unchanged, and locks only on a miss. The noted
   device ranges are those the locked translation gives.
 
+### Ported (Lichii extensions, absent from Eden)
+- `FrontSkipsLoopWrite` / `FrontTrackInstanceLoop` and `FrontState::sink_pending` /
+  `instance_loop` (Lichii maxwell_3d.cpp:1636-1641, 1697-1705, 1785, 1810, 1847, 2114-2154):
+  a same-value `vertex_buffer.first`/`count`, or `draw.end` inside an instance loop, is not sent
+  to the back unless state writes wait in its method sink. Lichii's `StateWrite` blocks and
+  `FrontNoteReport` are not ported.
 
 ## 2026-11-15 — video_core/{query_dma,macro,engines/maxwell_3d,rasterizer_interface,query_cache/query_cache_base,renderer_vulkan/{query_cache,vk_rasterizer}}.rs vs Lichii video_core/{query_dma.h,macro.cpp,engines/maxwell_3d.cpp,rasterizer_interface.h,query_cache/query_cache_base.h,renderer_vulkan/vk_rasterizer.cpp}
 

@@ -441,6 +441,62 @@ fn front_write_tracks_draw_side_effects_and_wraps_cb_offset() {
     }).join().unwrap();
 }
 
+// Lichii FrontSkipsLoopWrite/FrontTrackInstanceLoop (maxwell_3d.cpp:2114-2154):
+// a same-value vertex_buffer.first/count, or draw.end inside an instance loop,
+// stays on the front unless state writes wait in the back's method sink.
+#[test]
+fn front_skips_same_value_loop_writes_only_with_empty_sink() {
+    let mut engine = Box::new(Maxwell3D::default());
+    engine.set_native_turing_macro_mode(true);
+    let handle = EngineHandle::from_ref(&*engine);
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    let fs = unsafe { front.get(&split) };
+    assert!(fs.skip_same, "EDEN_NX2_SKIP_SAME and EDEN_NX2_SPLIT_SKIP default on");
+    let sent = |fs: &mut FrontState, method: u32, value: u32, from_macro: bool| {
+        let before = split.position();
+        Maxwell3D::front_write(fs, handle, &split, method, value, true, from_macro);
+        split.position() != before
+    };
+    assert!(sent(fs, VB_COUNT, 6, false), "a changed value is sent");
+    assert!(!fs.sink_pending);
+    assert!(!sent(fs, VB_COUNT, 6, false), "same value, empty sink");
+    assert!(!sent(fs, VB_FIRST, fs.regs[VB_FIRST as usize], true));
+    // A state write waits in the back's sink: the next executable method
+    // consumes it there, so it is sent even with the same value.
+    assert!(sent(fs, 0x123, 7, false));
+    assert!(fs.sink_pending);
+    assert!(sent(fs, VB_COUNT, 6, false));
+    assert!(!fs.sink_pending);
+    // Direct (macro) writes consume the sink first.
+    assert!(sent(fs, 0x124, 7, false));
+    assert!(sent(fs, 0x125, 7, true));
+    assert!(!fs.sink_pending);
+    assert!(!sent(fs, VB_COUNT, 6, true));
+    // draw.end outside an instance loop always draws.
+    assert!(!fs.instance_loop);
+    assert!(sent(fs, DRAW_END, 0, false));
+    assert!(sent(fs, DRAW_END, 0, false));
+    // draw.begin with instance id Subsequent (bits 27:26 = 1) enters the
+    // loop: a same-value draw.end does nothing on the back.
+    assert!(sent(fs, DRAW_BEGIN, 1 << 26, false));
+    assert!(fs.instance_loop);
+    assert!(!sent(fs, DRAW_END, 0, false));
+    assert!(sent(fs, DRAW_END, 1, false), "a changed value is sent");
+    // Inline indexes leave the loop (DrawMode::InlineIndex: draw.end draws).
+    assert!(sent(fs, DRAW_INLINE_INDEX, 0x0302_0100, false));
+    assert!(!fs.instance_loop);
+    assert!(sent(fs, DRAW_END, 1, false));
+    // So does draw.begin with instance id First, also within a multi method.
+    assert!(sent(fs, DRAW_BEGIN, 1 << 26, false));
+    assert!(fs.instance_loop);
+    Maxwell3D::front_call_multi_method(fs, handle, &split, DRAW_BEGIN, &[1 << 26, 0], 2, 2);
+    assert!(!fs.instance_loop);
+    // A replay writes the shadow RAM's entry, compared like any value.
+    assert!(sent(fs, SHADOW_RAM_CONTROL, ShadowRamControl::Replay as u32, false));
+    assert!(!sent(fs, VB_COUNT, 99, false), "replays the tracked 6");
+}
+
 #[test]
 fn register_count_matches_eden_maxwell_3d() {
     let engine = Maxwell3D::default();

@@ -2358,7 +2358,14 @@ pub(crate) struct FrontState {
     fifo: Vec<u32>,
     calls: u64,
     draw_pending: bool,
+    /// The back holds state writes in its method sink, which its next
+    /// executable method consumes (issuing a deferred draw a changed one
+    /// ends). Front() consumes it before copying the state.
+    sink_pending: bool,
     skip_same: bool,
+    /// The back's draw manager is in an instance loop (DrawMode::Instance):
+    /// draw.end does nothing.
+    instance_loop: bool,
     execution_mask: Vec<bool>,
     macro_owner: SharedNativeMacroContext,
     back: Maxwell3DPtr,
@@ -2591,7 +2598,9 @@ impl Maxwell3D {
                 fifo: Vec::new(),
                 calls: 0,
                 draw_pending: true,
+                sink_pending: false,
                 skip_same: Self::skip_same_value_writes() && front_skip_same(),
+                instance_loop: false,
                 execution_mask: engine.interface_state.execution_mask.clone(),
                 macro_owner: engine.native_macro_context.as_ref().unwrap().clone(),
                 back: Maxwell3DPtr(engine),
@@ -2648,6 +2657,12 @@ impl Maxwell3D {
             };
             fs.control_count = fs.control_count.wrapping_add(1);
         }
+        if fs.execution_mask[index] && Self::front_skips_loop_write(fs, method, value, shadow_kept) {
+            if crate::nx2_profile::enabled() {
+                crate::nx2_profile::add(crate::nx2_profile::Counter::SameValueWrites, 1);
+            }
+            return;
+        }
         if !fs.execution_mask[index] {
             if fs.regs[index] == value && shadow_kept && fs.skip_same {
                 if crate::nx2_profile::enabled() {
@@ -2690,8 +2705,14 @@ impl Maxwell3D {
         }
         // Context guards from uploads/bindings have been released before enqueue.
         use crate::gpu_split::Writes;
-        if from_macro { split.macro_write(engine, method, argument, Writes::Noted); }
-        else { split.method(engine, method, argument, is_last_call, None, Writes::Noted); }
+        if from_macro {
+            // Direct writes consume the sink first.
+            split.macro_write(engine, method, argument, Writes::Noted);
+            fs.sink_pending = false;
+        } else {
+            split.method(engine, method, argument, is_last_call, None, Writes::Noted);
+            fs.sink_pending = !fs.execution_mask[index];
+        }
         // A write the back only keeps for later (its method sink) runs
         // nothing there yet.
         if from_macro || fs.execution_mask[index] {
@@ -2738,6 +2759,7 @@ impl Maxwell3D {
         } else if matches!(method, DRAW_INLINE_INDEX | INLINE_INDEX_2X16_EVEN |
             INLINE_INDEX_4X8_INDEX0) && fs.control != ShadowRamControl::Replay as u32
         {
+            Self::front_track_instance_loop(fs, method, 0);
             if let Some(&last) = words.last() {
                 if tracked(fs.control) { fs.shadow[index] = last; }
                 fs.regs[index] = last;
@@ -2755,6 +2777,7 @@ impl Maxwell3D {
                 if tracked(fs.control) { fs.shadow[index] = argument; }
                 else if fs.control == ShadowRamControl::Replay as u32 { value = fs.shadow[index]; }
                 fs.regs[index] = value;
+                Self::front_track_instance_loop(fs, method, value); // DrawBegin runs for every word
                 if !fs.execution_mask[index] { continue; }
                 match method {
                     SHADOW_RAM_CONTROL => {
@@ -2784,7 +2807,51 @@ impl Maxwell3D {
         }
         split.multi_method(engine, method, words, amount, methods_pending, None,
             crate::gpu_split::Writes::Noted);
+        fs.sink_pending = false; // The back consumes the sink before a run.
         Self::front_note_writes(fs, split, method, amount);
+    }
+
+    /// Port of FrontTrackInstanceLoop (Lichii maxwell_3d.cpp:2114-2132):
+    /// follows the back's draw manager into and out of an instance loop.
+    fn front_track_instance_loop(fs: &mut FrontState, method: u32, value: u32) {
+        match method {
+            DRAW_BEGIN => {
+                // Instance id, bits 27:26: First leaves an instance loop,
+                // Subsequent enters one.
+                match (value >> 26) & 3 {
+                    0 => fs.instance_loop = false,
+                    1 => fs.instance_loop = true,
+                    _ => {}
+                }
+            }
+            // DrawMode::InlineIndex: draw.end draws.
+            DRAW_INLINE_INDEX | INLINE_INDEX_2X16_EVEN | INLINE_INDEX_4X8_INDEX0 => {
+                fs.instance_loop = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Port of FrontSkipsLoopWrite (Lichii maxwell_3d.cpp:2134-2154):
+    /// whether an executable write of the instance loop methods changes
+    /// nothing on the back and can stay on the front.
+    fn front_skips_loop_write(fs: &mut FrontState, method: u32, value: u32,
+        shadow_kept: bool) -> bool
+    {
+        Self::front_track_instance_loop(fs, method, value);
+        if !matches!(method, DRAW_END | VB_FIRST | VB_COUNT) {
+            return false;
+        }
+        // Sent while state writes wait in the back's sink: it consumes them
+        // at the next executable method, and a changed one ends a deferred
+        // draw that must issue before the next engine's work.
+        if !fs.skip_same || fs.sink_pending || !shadow_kept || fs.regs[method as usize] != value {
+            return false;
+        }
+        // Instance loop methods flush no deferred draw, and the draw manager
+        // ignores these: DrawEnd draws nothing in an instance loop, and it
+        // only reads the vertex buffer first and count.
+        method != DRAW_END || fs.instance_loop
     }
 
     fn front_run_macro(fs: &mut FrontState, engine: EngineHandle,

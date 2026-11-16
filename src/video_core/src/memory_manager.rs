@@ -2407,6 +2407,20 @@ impl MemoryManager {
         self.inner.map_serial()
     }
 
+    /// `map_serial()` read without taking the owner's mutex, as Lichii's unlocked readers do.
+    /// Rust adaptation: the split front checks its cached translations against it
+    /// (GpuSplitFrontend::note_write) instead of locking the manager for every noted write.
+    pub(crate) fn map_serial_unlocked(memory: &parking_lot::Mutex<Self>) -> u64 {
+        // SAFETY: the Mutex owns a live manager for the borrow of `memory`. Only the atomic
+        // field is reached, through a raw place projection (no reference to the manager is
+        // formed), and every access to that field, the lock holder's included, is atomic: the
+        // same unlocked-reader contract as `MemoryManagerHandle`. The load pairs with the
+        // Release bump after every page table change.
+        unsafe {
+            (*std::ptr::addr_of!((*memory.data_ptr()).inner.map_serial)).load(Ordering::Acquire)
+        }
+    }
+
     pub fn device_memory(&self) -> &Arc<MaxwellDeviceMemoryManager> {
         &self.device_memory
     }

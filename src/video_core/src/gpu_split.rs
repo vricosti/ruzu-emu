@@ -78,6 +78,20 @@ pub(crate) struct GpuSplitFrontend(std::rc::Rc<FrontendState>);
 struct FrontendState {
     transport: std::cell::RefCell<GpuSplit>,
     front_macros: bool,
+    /// GPU page translations note_write looked up, by page (Rust adaptation, see there).
+    note_cache: std::cell::RefCell<[NoteCacheEntry; NOTE_CACHE_ENTRIES]>,
+}
+
+const NOTE_CACHE_ENTRIES: usize = 8;
+
+/// One translation of note_write's cache: the 4 KiB GPU `page` of the manager `owner`
+/// maps to `device` (None: nothing mapped there) while its map_serial is `serial`. The Weak
+/// keeps the manager's allocation, so its address cannot name another manager later.
+struct NoteCacheEntry {
+    owner: std::sync::Weak<Mutex<crate::memory_manager::MemoryManager>>,
+    serial: u64,
+    page: u64,
+    device: Option<u64>,
 }
 
 thread_local! {
@@ -120,6 +134,8 @@ impl GpuSplitFrontend {
     pub(crate) fn new(front_macros: bool) -> Self {
         Self(std::rc::Rc::new(FrontendState {
             transport: std::cell::RefCell::new(GpuSplit::new()), front_macros,
+            note_cache: std::cell::RefCell::new(std::array::from_fn(|_| NoteCacheEntry {
+                owner: std::sync::Weak::new(), serial: 0, page: 0, device: None })),
         }))
     }
 
@@ -225,7 +241,7 @@ impl GpuSplitFrontend {
     pub(crate) fn note_any_write(&self) { self.0.transport.borrow_mut().note_any_write(); }
     /// Port of GpuSplit::NoteWrite. The MemoryManager lock is held only to
     /// translate the range, never while waiting for the back.
-    pub(crate) fn note_write(&self, memory: &Mutex<crate::memory_manager::MemoryManager>,
+    pub(crate) fn note_write(&self, memory: &Arc<Mutex<crate::memory_manager::MemoryManager>>,
         address: u64, size: u64)
     {
         let mut transport = self.0.transport.borrow_mut();
@@ -233,10 +249,33 @@ impl GpuSplitFrontend {
             transport.note_any_write();
             return;
         }
-        let memory = memory.lock();
-        for_each_device_range(&memory, address, size, |device, bytes| {
-            transport.note_device_write(device, bytes);
-        });
+        // Rust adaptation: Lichii's ForEachDeviceRange reads the page table unlocked. ruzu
+        // keeps the translations of the last noted pages, valid while the manager's
+        // map_serial is unchanged, and takes the manager's lock only to translate a page
+        // it has not noted since the last page table change (most noted writes are
+        // constant buffer words, page after page of the same buffer).
+        let serial = crate::memory_manager::MemoryManager::map_serial_unlocked(memory);
+        let owner = Arc::as_ptr(memory);
+        let mut cache = self.0.note_cache.borrow_mut();
+        let mut guard = None;
+        const PAGE_SIZE: u64 = 0x1000;
+        let end = address + size;
+        let mut begin = address;
+        while begin < end {
+            let page = begin & !(PAGE_SIZE - 1);
+            let page_end = (page + PAGE_SIZE).min(end);
+            let slot = &mut cache[((page >> 12) & (NOTE_CACHE_ENTRIES as u64 - 1)) as usize];
+            if !(std::ptr::eq(slot.owner.as_ptr(), owner) && slot.serial == serial && slot.page == page) {
+                let locked = guard.get_or_insert_with(|| memory.lock());
+                // Under the lock, the serial and the table agree.
+                *slot = NoteCacheEntry { owner: Arc::downgrade(memory), serial: locked.map_serial(),
+                    page, device: locked.gpu_to_cpu_address(page) };
+            }
+            if let Some(device) = slot.device {
+                transport.note_device_write(device + (begin - page), page_end - begin);
+            }
+            begin = page_end;
+        }
     }
     /// Port of GpuSplit::WaitForWrites. Rust computes the target under the
     /// MemoryManager lock and releases it before waiting: the back takes that
@@ -1592,6 +1631,39 @@ mod tests {
         assert_eq!(split.publish_every, 8);
         split.drain(); // already drained: preserve interval, no extra publication
         assert_eq!(split.publish_every, 8);
+    }
+
+    // Lichii GpuSplit::NoteWrite/ForEachDeviceRange (gpu_split.cpp:356-382): the front's
+    // cached translations follow every page table change (map_serial) and split ranges by
+    // 4 KiB GPU page, skipping unmapped pages.
+    #[test]
+    fn note_write_cache_follows_remaps_and_page_boundaries() {
+        let device_memory = Arc::new(
+            crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default());
+        let memory = Arc::new(Mutex::new(
+            crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+                1, device_memory, 32, 0x1_0000_0000, 16, 12)));
+        memory.lock().map(0x4000, 0x4000, 0x6000, 0, false);
+        let front = GpuSplitFrontend::new(true);
+        let position = |value: u64| front.0.transport.borrow_mut().write_position = value;
+        let target = |device: u64, size: u64| front.0.transport.borrow().device_writes_target(device, size);
+        position(5);
+        front.note_write(&memory, 0x4010, 8);
+        assert_eq!(target(0x4010, 8), 5);
+        position(6);
+        front.note_write(&memory, 0x4020, 8); // Same page, cached
+        assert_eq!(target(0x4020, 8), 6);
+        memory.lock().unmap(0x4000, 0x6000);
+        memory.lock().map(0x4000, 0x8_0000, 0x6000, 0, false);
+        position(7);
+        front.note_write(&memory, 0x4ff8, 16);
+        assert_eq!(target(0x8_0ff8, 8), 7, "remapped page");
+        assert_eq!(target(0x8_1000, 8), 7, "next page");
+        memory.lock().unmap(0x4000, 0x6000);
+        position(8);
+        let any_before = front.0.transport.borrow().last_noted_write;
+        front.note_write(&memory, 0x4010, 8);
+        assert_eq!(front.0.transport.borrow().last_noted_write, any_before, "nothing mapped");
     }
 
     #[test]

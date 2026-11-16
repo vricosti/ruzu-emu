@@ -1,6 +1,6 @@
 # Upstream parity notes
 
-## 2026-11-16 — video_core/{dma_pusher,gpu_split,engines/{maxwell_3d,kepler_compute}}.rs vs Lichii video_core/{dma_pusher.cpp,gpu_split.{h,cpp},engines/{maxwell_3d,kepler_compute}.cpp}
+## 2026-11-16 — video_core/{dma_pusher,gpu_split,memory_manager,engines/{maxwell_3d,kepler_compute}}.rs vs Lichii video_core/{dma_pusher.cpp,gpu_split.{h,cpp},memory_manager.h,engines/{maxwell_3d,kepler_compute}.cpp}
 
 ### Intentional differences (split front thread)
 - Front state ownership: Lichii keeps `std::unique_ptr<FrontState> front` in the engine and
@@ -24,6 +24,14 @@
 - `Maxwell3D::front_run_macro` replaces the macro engine's `active_dram` handle only when it
   names another data RAM (upstream stores the same pointer every call; Rust's `Arc` store was a
   reference count increment and decrement per macro).
+- `GpuSplitFrontend::note_write`: Lichii's `ForEachDeviceRange` translates the noted range with
+  `GpuToCpuAddress` without a lock. ruzu took the `MemoryManager` mutex for every noted write
+  (each constant buffer word a macro writes), contended with the back (0.67 ms of `lock_slow`
+  per frame in the profile of 21354e1e). It now keeps the translations of the last 8 GPU pages
+  noted, valid while the manager's `map_serial` (read with
+  `MemoryManager::map_serial_unlocked`) is unchanged, and locks only on a miss. The noted
+  device ranges are those the locked translation gives.
+
 
 ## 2026-11-15 — video_core/{query_dma,macro,engines/maxwell_3d,rasterizer_interface,query_cache/query_cache_base,renderer_vulkan/{query_cache,vk_rasterizer}}.rs vs Lichii video_core/{query_dma.h,macro.cpp,engines/maxwell_3d.cpp,rasterizer_interface.h,query_cache/query_cache_base.h,renderer_vulkan/vk_rasterizer.cpp}
 

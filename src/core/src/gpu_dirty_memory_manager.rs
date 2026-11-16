@@ -132,6 +132,19 @@ impl GpuDirtyMemoryManager {
         }
     }
 
+    /// False when `gather` would find nothing. Every `collect` that adds a
+    /// write leaves its transform in `current` (by compare-exchange, or by
+    /// swap after pushing the one before to `back_buffer` under its lock),
+    /// and only `gather`, which takes `back_buffer` too, empties `current`
+    /// again. An empty transform has no mask bits. Without the locks: a
+    /// collect it misses is one the caller may order after itself.
+    ///
+    /// Lichii `GPUDirtyMemoryManager::MayHavePending`
+    /// (gpu_dirty_memory_manager.h:83-90); Eden has no counterpart.
+    pub fn may_have_pending(&self) -> bool {
+        TransformAddress::from_u64(self.current.load(Ordering::Acquire)).mask != 0
+    }
+
     /// Gather all accumulated dirty regions and invoke the callback for each
     /// contiguous dirty range.
     ///
@@ -284,6 +297,25 @@ mod tests {
         let current = TransformAddress::from_u64(mgr.current.load(Ordering::Relaxed));
         assert_eq!(current.address, !0u32);
         assert_eq!(current.mask, 0);
+    }
+
+    #[test]
+    fn may_have_pending_follows_collect_and_gather() {
+        let mgr = GpuDirtyMemoryManager::new();
+        assert!(!mgr.may_have_pending());
+        mgr.collect(0x1_0040, 0x40);
+        assert!(mgr.may_have_pending());
+        // A write on another page pushes the first to back_buffer; `current`
+        // still shows a write.
+        mgr.collect(0x3_0000, 0x10);
+        assert!(mgr.may_have_pending());
+        let mut gathered = 0;
+        mgr.gather(&mut |_, _| gathered += 1);
+        assert_eq!(gathered, 2);
+        assert!(!mgr.may_have_pending());
+        // A write spanning two transform pages is still seen.
+        mgr.collect(0x4_07f0, 0x20);
+        assert!(mgr.may_have_pending());
     }
 
     #[test]

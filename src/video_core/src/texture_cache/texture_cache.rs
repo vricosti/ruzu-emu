@@ -3100,6 +3100,8 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
                     segment_size,
                     image_id,
                 ));
+                // Lichii RegisterImage (texture_cache.h:3884).
+                self.page_filter.mark(cpu_addr, segment_size as u64);
                 Self::for_each_cpu_page(cpu_addr, segment_size, |page| {
                     self.page_table.entry(page).or_default().push(map_id);
                 });
@@ -3125,6 +3127,8 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             let map = &self.slot_map_views[map_id];
             (map.cpu_addr, map.size)
         };
+        // Lichii RegisterImage (texture_cache.h:3874).
+        self.page_filter.mark(cpu_addr, size as u64);
         Self::for_each_cpu_page(cpu_addr, size, |page| {
             self.page_table.entry(page).or_default().push(map_id);
         });
@@ -7049,6 +7053,24 @@ mod tests {
             .values()
             .all(|image_ids| !image_ids.contains(&image_id)));
         assert!(!cache.image_gpu_page_table_indices.contains_key(&image_id));
+    }
+
+    #[test]
+    fn registered_images_mark_every_page_they_span_in_the_page_filter() {
+        let mut cache = test_cache();
+        let info = test_color_info(1024, 512);
+        let image_id = cache
+            .slot_images
+            .insert(ImageBase::new(info, 0x80000, 0x80000).into());
+        assert!(!cache.page_filter.any(0x80000, 0x1000));
+        cache.register_image(image_id);
+        let size = cache.slot_images[image_id].guest_size_bytes as u64;
+        let mut page = 0x80000u64;
+        while page < 0x80000 + size {
+            assert!(cache.page_filter.any(page, 1), "page {page:#x}");
+            page += 0x1000;
+        }
+        assert!(!cache.page_filter.any(0x80000 + size.next_multiple_of(0x1000), 0x1000));
     }
 
     #[test]

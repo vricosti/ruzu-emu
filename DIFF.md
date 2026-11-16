@@ -1,5 +1,42 @@
 # Upstream parity notes
 
+## 2026-11-16 — invalidation fast paths: core/gpu_dirty_memory_manager.rs, video_core/{gpu,shader_cache,texture_cache/{texture_cache_base,texture_cache},renderer_vulkan/vk_rasterizer,host1x/gpu_device_memory_manager}.rs vs Lichii core/gpu_dirty_memory_manager.h, video_core/{gpu.cpp,shader_cache.{h,cpp},texture_cache/{texture_cache_base.h,texture_cache.h},renderer_vulkan/vk_rasterizer.cpp} and Eden core/device_memory_manager.{h,inc}
+
+### Ported (Lichii extensions, absent from Eden)
+- `GpuDirtyMemoryManager::may_have_pending` (gpu_dirty_memory_manager.h:83-90) and the early
+  return of `Gpu::invalidate_gpu_cache` when no manager has a collected write (gpu.cpp:116-139).
+  Eden gathers on every call (one per fence). A write collected after the check is gathered by
+  the next call and meanwhile stays pending in its manager, where
+  `for_each_pending_cpu_write` (async read-back) still sees it, as in Lichii. Lichii's
+  EDEN_NX2_BACKX_VERIFY counters around it are not ported.
+- `page_filter` of the texture cache and of the shader cache (texture_cache_base.h:271,
+  shader_cache.h:68-69; the query cache's was already ported). Audit of the registration sites:
+  the texture cache's `write_memory` finds images only through `page_table`, filled at two sites,
+  both in `register_image` (sparse segments and plain image), which mark the filter
+  (texture_cache.h:3874, 3884); the shader cache's `invalidate_pages_in_region` finds shaders
+  through `invalidation_cache`, filled only by `register`, and rejections through
+  `rejected_native`, filled only by `remember_rejection`, which both mark it
+  (shader_cache.cpp:338, 383). No other site inserts into these tables.
+- `RasterizerVulkan::inner_invalidation` follows Lichii `InvalidateCachedWrites`
+  (vk_rasterizer.cpp:2882-2935): each cache is skipped when its page filter shows none of the
+  ranges, the texture cache is invalidated even with `skip_cpu_inner_invalidation` (Lichii: video
+  frames written in software reach it only there), and the shader cache takes all ranges under
+  one lock (`ShaderCache::invalidate_regions`, shader_cache.cpp:49-58). Eden's InnerInvalidation
+  (vk_rasterizer.cpp:748-767) locked every cache and ignored the setting; ruzu returned early with
+  the setting.
+
+### Realigned on Eden
+- The SMMU `continuity_tracker` is an array of atomic entries read without a lock
+  (`smmu_walk_block`, `get_span`), as Eden reads `tracked_entries[page].continuity_tracker`
+  (device_memory_manager.inc:301, 311, 381) and Lichii (:602-611); it is written under
+  `mapping_guard` as before. It was a `Mutex<DenseDevicePageTable>` locked per walk.
+
+### Intentional differences
+- `System::gpu_dirty_memory_managers` still returns a cloned `Vec` (Eden returns a span): its
+  other caller is in `core/hle`, outside this change; `invalidate_gpu_cache` pays one clone of a
+  few `Arc`s per call.
+- Lichii also reads the texture cache's page filter in `GetFlushArea`; not part of this change.
+
 ## 2026-11-16 — video_core/{dma_pusher,gpu_split,memory_manager,engines/{maxwell_3d,kepler_compute}}.rs vs Lichii video_core/{dma_pusher.cpp,gpu_split.{h,cpp},memory_manager.h,engines/{maxwell_3d,kepler_compute}.cpp}
 
 ### Intentional differences (split front thread)
@@ -43,7 +80,6 @@
   instead of yielding forever; the back stores `consumed` with `SeqCst` and wakes a sleeping
   front; a failed back wakes it too (upstream: `back_running = false` then `front_wake`
   notify). `wait_for_space` keeps its spin-then-yield wait, as upstream.
-
 ## 2026-11-15 — video_core/{query_dma,macro,engines/maxwell_3d,rasterizer_interface,query_cache/query_cache_base,renderer_vulkan/{query_cache,vk_rasterizer}}.rs vs Lichii video_core/{query_dma.h,macro.cpp,engines/maxwell_3d.cpp,rasterizer_interface.h,query_cache/query_cache_base.h,renderer_vulkan/vk_rasterizer.cpp}
 
 ### Ported (Lichii extensions, absent from Eden)

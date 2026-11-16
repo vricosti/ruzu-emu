@@ -846,6 +846,9 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     pub framebuffers: HashMap<RenderTargets, FramebufferId, BuildUnorderedDenseHasher>,
     // Page tables
     pub page_table: HashMap<u64, Vec<ImageMapId>, BuildUnorderedDenseHasher>,
+    /// Device pages images were ever registered on (inner_invalidation skips
+    /// the rest). Lichii `TextureCacheBase::page_filter` (texture_cache_base.h:271).
+    pub page_filter: crate::page_filter::PageFilter,
     pub sparse_views: HashMap<ImageId, SmallVec<[ImageMapId; 16]>, BuildUnorderedDenseHasher>,
 
     // Memory tracking
@@ -1170,6 +1173,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             last_framebuffer_serial: 0,
             framebuffers: HashMap::default(),
             page_table: HashMap::default(),
+            page_filter: crate::page_filter::PageFilter::new(),
             sparse_views: HashMap::default(),
             has_deleted_images: false,
             is_rescaling: false,

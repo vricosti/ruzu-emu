@@ -510,14 +510,28 @@ impl Gpu {
 
     /// Synchronizes CPU writes with Host GPU memory.
     pub fn invalidate_gpu_cache(&self) {
-        let Some(rasterizer) = self.rasterizer_handle() else {
-            return;
-        };
         let system = *self.system.lock().unwrap();
         if system.is_null() {
             log::warn!("Gpu::invalidate_gpu_cache: system ref not set");
             return;
         }
+        // Lichii GPU::Impl::InvalidateGPUCache (gpu.cpp:116-139): most calls
+        // (one per fence) find nothing collected; gather (applying_writes and
+        // two locks per core's manager) only when a manager shows a write. A
+        // write collected after this check is gathered by the next call, as
+        // one collected just after the gather would be; until then it stays
+        // pending in its manager, where for_each_pending_cpu_write sees it.
+        if !system
+            .get()
+            .gpu_dirty_memory_managers()
+            .iter()
+            .any(|manager| manager.may_have_pending())
+        {
+            return;
+        }
+        let Some(rasterizer) = self.rasterizer_handle() else {
+            return;
+        };
         let rasterizer = unsafe { rasterizer.as_mut() };
         // Lichii GPU::Impl::ApplyCollectedWrites (gpu.cpp:143-166): gathered
         // writes stay pending (for_each_pending_cpu_write) until they are

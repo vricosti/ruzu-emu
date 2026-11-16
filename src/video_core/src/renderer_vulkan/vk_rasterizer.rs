@@ -35,6 +35,17 @@ use ash::vk::Handle;
 static MESH_DRAW_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// `Core::DEVICE_PAGESIZE` as a device address quantity.
+const DEVICE_PAGESIZE_U64: u64 = ruzu_core::device_memory_manager::DEVICE_PAGESIZE as u64;
+
+/// Lichii `EDEN_NX2_INLINE_DEFER` (vk_rasterizer.cpp:3926-3930), read once:
+/// on unless set to a value starting with '0'. Inline-to-memory writes leave
+/// their cache invalidations to the next `flush_caching`.
+static INLINE_DEFER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var_os("EDEN_NX2_INLINE_DEFER")
+        .is_none_or(|value| value.as_encoded_bytes().first() != Some(&b'0'))
+});
+
 /// Ruzu extension (no upstream counterpart): choose the mesh draw path for
 /// the session being started.
 ///
@@ -4800,11 +4811,11 @@ impl RasterizerInterface for RasterizerVulkan {
             return;
         }
 
-        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+        let Some(mm_owner) = self.channel_memory_manager.as_ref().cloned() else {
             return;
         };
 
-        let mm = mm.lock();
+        let mm = mm_owner.lock();
         let cpu_addr = mm.gpu_to_cpu_address(address);
         // SAFETY: upstream accepts a span whose backing allocation is required
         // to contain copy_size bytes and forwards memory.data() plus copy_size
@@ -4820,16 +4831,46 @@ impl RasterizerInterface for RasterizerVulkan {
         drop(mm);
 
         let cpu_addr = cpu_addr.unwrap();
-        unsafe {
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            let _buffer_guard = (*buffer_mutex).lock();
-            if !self
-                .common_buffer_cache
-                .inline_memory(cpu_addr, copy_size, input)
-            {
-                self.common_buffer_cache
-                    .write_memory(cpu_addr, copy_size as u64);
+        // Lichii AccelerateInlineToMemory (vk_rasterizer.cpp:3926-3990), an
+        // extension of Eden's (vk_rasterizer.cpp:930-950).
+        // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
+        let defer = *INLINE_DEFER;
+        // One cache at a time. InlineMemory uploads only into GPU-written
+        // buffer data. Every range the buffer cache records as GPU-written
+        // marks its pages in G_NX2_GPU_WRITTEN_PAGES first, under its lock, on
+        // this thread, and the bits never clear. So when no written page has
+        // that mark the locked section changes nothing, and the write skips
+        // the lock (jpkto/Lichii 7a5e5357cb).
+        let mut uploaded = false;
+        let page_begin = cpu_addr & !(DEVICE_PAGESIZE_U64 - 1);
+        let page_end = (cpu_addr + copy_size as u64 + DEVICE_PAGESIZE_U64 - 1)
+            & !(DEVICE_PAGESIZE_U64 - 1);
+        let lock_free = defer
+            && crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::Relaxed)
+            && !crate::nx2::nx2_may_be_gpu_written(page_begin, page_end - page_begin);
+        if !lock_free {
+            unsafe {
+                let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+                let _buffer_guard = (*buffer_mutex).lock();
+                uploaded = self
+                    .common_buffer_cache
+                    .inline_memory(cpu_addr, copy_size, input);
+                if !uploaded && !defer {
+                    self.common_buffer_cache
+                        .write_memory(cpu_addr, copy_size as u64);
+                }
             }
+        }
+        // Pending query results must not land over the new words later: drop
+        // them now.
+        self.query_cache.invalidate_region(cpu_addr, copy_size);
+        if !uploaded && defer {
+            // Guest memory is written; the buffer, texture and shader caches
+            // see the merged ranges at the next flush_caching, which runs
+            // before anything of theirs is used. Writes into GPU-written
+            // buffer data were uploaded in place above, as before.
+            mm_owner.lock().accumulate_invalidation(address, copy_size);
+            return;
         }
         unsafe {
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
@@ -4837,7 +4878,6 @@ impl RasterizerInterface for RasterizerVulkan {
             self.texture_cache.base.write_memory(cpu_addr, copy_size);
         }
         self.shader_cache.invalidate_region(cpu_addr, copy_size);
-        self.query_cache.invalidate_region(cpu_addr, copy_size);
     }
 
     fn has_draw_transform_feedback(&self) -> bool {

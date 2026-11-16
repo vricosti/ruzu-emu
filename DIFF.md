@@ -1,5 +1,28 @@
 # Upstream parity notes
 
+## 2026-11-16 — inline-to-memory invalidations deferred: video_core/{renderer_vulkan/vk_rasterizer,memory_manager}.rs vs Lichii video_core/{renderer_vulkan/vk_rasterizer.cpp,memory_manager.h} (not measured in ruzu yet)
+
+### Ported (Lichii extensions, absent from Eden)
+- `EDEN_NX2_INLINE_DEFER` (on unless set to a value starting with '0', read once,
+  vk_rasterizer.cpp:3926-3930) in `RasterizerVulkan::accelerate_inline_to_memory`
+  (vk_rasterizer.cpp:3926-3990): when the buffer cache does not upload the words in place
+  (`inline_memory`: GPU-written buffer data), the buffer, texture and shader cache invalidations
+  wait for the next `flush_caching` (`MemoryManager::accumulate_invalidation`, memory_manager.h:
+  202-207), which runs before every draw, dispatch, clear, 2D blit and DMA copy (vk_rasterizer.rs
+  `prepare_draw`, `clear`, `dispatch_compute`, `accelerate_conditional_rendering`; fermi_2d.rs;
+  maxwell_dma.rs). The query cache is still invalidated at once, now before the texture and shader
+  caches (Lichii order). With the variable at 0 the function behaves as Eden's.
+- The buffer cache lock is skipped when deferring on an NX2 session (`G_NX2_AMPERE`) and no page
+  the write touches was ever GPU-written (`nx2_may_be_gpu_written`): `inline_memory` uploads only
+  into GPU-written buffer data, whose pages are all marked in that bitmap first, under the lock,
+  on this thread.
+
+### Intentional differences
+- Lichii's command list page test (`Nx2IsCommandListPage`, `Nx2NoteListHostWrite`), list grid
+  kept-word patches (`nx2_expected_words`, `InlineKeptWords`), native query tracing
+  (`TraceNativeQuery`, `EDEN_NX2_SEM_WATCH`) and its `BackX::g_verify` cross-check are not
+  ported: ruzu has none of those mechanisms.
+
 ## 2026-11-16 — video_core/buffer_cache/virtual_range_cache.rs vs Eden video_core/buffer_cache/virtual_range_cache.h
 
 ### Intentional differences

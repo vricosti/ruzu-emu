@@ -1481,6 +1481,16 @@ impl GpuMemoryManager {
         true
     }
 
+    /// Leaves the caches' invalidation of a range already written for the
+    /// next `flush_caching` (before every draw, dispatch, clear and copy),
+    /// merged with neighbouring ranges.
+    ///
+    /// Lichii `MemoryManager::AccumulateInvalidation` (memory_manager.h:202-207),
+    /// absent from Eden.
+    pub fn accumulate_invalidation(&mut self, gpu_addr: u64, size: usize) {
+        self.accumulator.add(gpu_addr, size);
+    }
+
     /// Constant buffer data to device memory the caller translated.
     /// `flush_caching` hands the written ranges, merged, to the rasterizer's
     /// `invalidate_constant_buffer_data` instead of `inner_invalidation`.
@@ -2728,6 +2738,11 @@ impl MemoryManager {
         self.inner.write_constant_buffer_data(device_addr, data);
     }
 
+    /// Lichii `MemoryManager::AccumulateInvalidation`.
+    pub fn accumulate_invalidation(&mut self, gpu_addr: u64, size: usize) {
+        self.inner.accumulate_invalidation(gpu_addr, size);
+    }
+
     pub fn copy_block(&mut self, gpu_dest: u64, gpu_src: u64, size: u64) -> bool {
         self.inner.copy_block(gpu_dest, gpu_src, size)
     }
@@ -3659,6 +3674,25 @@ mod tests {
             &vec![(0x9300_0100, 0x20)]
         );
         assert!(mm.inner.page_stash2.is_empty());
+    }
+
+    #[test]
+    fn accumulated_invalidations_reach_inner_invalidation_at_the_next_flush() {
+        // Lichii AccumulateInvalidation (EDEN_NX2_INLINE_DEFER): an inline
+        // write's invalidation waits for FlushCaching, merged with its
+        // neighbours and translated to device ranges there.
+        let mut mm = MemoryManager::new_with_geometry(16, 32, 0x1_0000_0000, 16, 12);
+        let rasterizer = TestRasterizer::new();
+        let inner_calls = Arc::clone(&rasterizer.inner_invalidation_calls);
+        mm.bind_rasterizer(&rasterizer);
+        mm.map(0x20000, 0x9100_0000, 0x1000, 0, false);
+        mm.accumulate_invalidation(0x20100, 0x10);
+        mm.accumulate_invalidation(0x20110, 0x10);
+        assert!(inner_calls.lock().unwrap().is_empty());
+        mm.flush_caching();
+        assert_eq!(*inner_calls.lock().unwrap(), vec![vec![(0x9100_0100, 0x20)]]);
+        mm.flush_caching();
+        assert_eq!(inner_calls.lock().unwrap().len(), 1);
     }
 
     #[test]

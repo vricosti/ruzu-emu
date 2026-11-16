@@ -16,6 +16,7 @@ pub mod descriptor_buffer;
 pub mod descriptor_pool;
 pub mod fence_manager;
 pub mod fixed_pipeline_state;
+pub mod fragment_barrier_state;
 pub mod graphics_pipeline;
 pub mod master_semaphore;
 pub mod multi_range_buffer;

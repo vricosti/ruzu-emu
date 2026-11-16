@@ -4728,12 +4728,15 @@ impl RasterizerInterface for RasterizerVulkan {
         );
     }
 
+    /// Port of Lichii `RasterizerVulkan::FragmentBarrier` (vk_rasterizer.cpp:3156-3160).
+    /// Lichii extension: Eden ends the active render pass here; Lichii defers
+    /// the barrier, and `GraphicsPipeline::configure` ends the pass (whose end
+    /// records the attachment write barrier) only before a draw that samples
+    /// one of its render targets or when the pass has stores.
     fn fragment_barrier(&mut self) {
-        // Upstream `RasterizerVulkan::FragmentBarrier` ends the active render
-        // pass. `Scheduler::request_outside_render_pass_operation_context` emits the attachment
-        // write barrier needed before a later texture read.
-        self.scheduler
-            .request_outside_render_pass_operation_context();
+        // The next draw breaks the render pass only if it reads what this one wrote (#161):
+        // Lichii measured ~5,900 render passes a second ended here on the NX2 title it tuned.
+        self.scheduler.defer_fragment_barrier();
     }
 
     fn tiled_cache_barrier(&mut self) {}

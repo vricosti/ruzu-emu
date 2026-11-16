@@ -1906,6 +1906,32 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         }
     }
 
+    /// Port of Lichii `TextureCache<P>::SamplesRenderTarget` (texture_cache.h:924-945),
+    /// a Lichii extension: whether one of `views` reads an image bound as an
+    /// active render target. A deferred fragment barrier ends the render pass
+    /// only before such a draw.
+    pub fn samples_render_target(&self, views: &[ImageViewInOut]) -> bool {
+        if self.rt_active_mask == 0 {
+            return false;
+        }
+        let depth_active = (self.rt_active_mask & (1 << NUM_RT)) != 0;
+        for view in views {
+            if !view.id.is_valid() {
+                continue;
+            }
+            let image_id = self.slot_image_views[view.id].image_id;
+            if depth_active && image_id == self.rt_depth_image_id {
+                return true;
+            }
+            for index in 0..NUM_RT {
+                if (self.rt_active_mask & (1 << index)) != 0 && image_id == self.rt_image_id[index] {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     // ── Descriptor synchronisation ─────────────────────────────────────
 
     /// Port of `TextureCache<P>::SynchronizeGraphicsDescriptors`
@@ -9106,6 +9132,48 @@ mod tests {
             || barriers += 1,
         );
         assert_eq!(barriers, 0);
+    }
+
+    fn sampled(ids: &[ImageViewId]) -> Vec<ImageViewInOut> {
+        ids.iter().map(|&id| ImageViewInOut { id, ..ImageViewInOut::default() }).collect()
+    }
+
+    #[test]
+    fn samples_render_target_detects_active_color_and_depth_targets() {
+        let mut cache = test_cache();
+        let color_image = insert_test_image(&mut cache, 0x6600_0000);
+        let depth_image = insert_test_image(&mut cache, 0x6700_0000);
+        let color_view = insert_test_view(&mut cache, color_image);
+        let depth_view = insert_test_view(&mut cache, depth_image);
+        // Unlike CheckFeedbackLoop, the bound colour view itself counts as a read.
+        cache.rt_active_mask = 1 << 2;
+        cache.rt_image_id[2] = color_image;
+        assert!(cache.samples_render_target(&sampled(&[color_view])));
+        assert!(!cache.samples_render_target(&sampled(&[depth_view])));
+        cache.rt_active_mask |= 1 << NUM_RT;
+        cache.rt_depth_image_id = depth_image;
+        assert!(cache.samples_render_target(&sampled(&[depth_view])));
+    }
+
+    #[test]
+    fn samples_render_target_ignores_inactive_slots_unrelated_and_invalid_views() {
+        let mut cache = test_cache();
+        let target_image = insert_test_image(&mut cache, 0x6800_0000);
+        let other_image = insert_test_image(&mut cache, 0x6900_0000);
+        let target_view = insert_test_view(&mut cache, target_image);
+        let other_view = insert_test_view(&mut cache, other_image);
+        // No active render target.
+        cache.rt_image_id[0] = target_image;
+        assert!(!cache.samples_render_target(&sampled(&[target_view])));
+        // The image is recorded for slot 0, but only slot 1 is active.
+        cache.rt_active_mask = 1 << 1;
+        assert!(!cache.samples_render_target(&sampled(&[target_view])));
+        // A depth image id with the depth bit clear is not a target either.
+        cache.rt_depth_image_id = target_image;
+        assert!(!cache.samples_render_target(&sampled(&[target_view])));
+        cache.rt_active_mask = 1;
+        assert!(!cache.samples_render_target(&sampled(&[ImageViewId::default(), other_view])));
+        assert!(cache.samples_render_target(&sampled(&[ImageViewId::default(), other_view, target_view])));
     }
 
     #[test]

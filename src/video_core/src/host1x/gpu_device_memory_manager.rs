@@ -114,8 +114,11 @@ pub struct MaxwellDeviceMemoryManager {
 
     /// Device page -> number of physically-contiguous pages from this page.
     /// Dense Rust counterpart for upstream `continuity_tracker`, initialized
-    /// to one entry per page.
-    smmu_continuity_tracker: Mutex<DenseDevicePageTable>,
+    /// to one entry per page. Upstream reads it from `tracked_entries` without
+    /// a lock (Eden device_memory_manager.inc:301, 311, 381; Lichii :602-611)
+    /// and writes it under `mapping_guard` (UpdateContinuityTracker); atomic
+    /// entries give the same lock-free reads, as for `compressed_physical_ptr`.
+    smmu_continuity_tracker: AtomicDevicePageTable,
 
     /// Physical page -> encoded device-page reverse mapping. Dense Rust
     /// counterpart for upstream `compressed_device_addr` plus
@@ -185,30 +188,6 @@ impl AtomicDevicePageTable {
     fn clear(&self, page: u64) -> Option<u32> {
         let entry = self.values.get(page as usize)?;
         let old = entry.swap(self.default_value, Ordering::AcqRel);
-        (old != self.default_value).then_some(old)
-    }
-}
-
-struct DenseDevicePageTable {
-    values: Vec<u32>,
-    default_value: u32,
-}
-
-impl DenseDevicePageTable {
-    fn new(default_value: u32) -> Self {
-        Self {
-            values: vec![default_value; SMMU_DEVICE_PAGE_COUNT],
-            default_value,
-        }
-    }
-
-    fn get(&self, page: &u64) -> Option<&u32> {
-        self.values.get(*page as usize)
-    }
-
-    fn insert(&mut self, page: u64, value: u32) -> Option<u32> {
-        let entry = self.values.get_mut(page as usize)?;
-        let old = std::mem::replace(entry, value);
         (old != self.default_value).then_some(old)
     }
 }
@@ -693,7 +672,7 @@ impl MaxwellDeviceMemoryManager {
             smmu_physical_page_count: physical_page_count,
             smmu_compressed_physical_ptr: AtomicDevicePageTable::new(0),
             smmu_cpu_backing: Mutex::new(DenseCpuBackingTable::new()),
-            smmu_continuity_tracker: Mutex::new(DenseDevicePageTable::new(1)),
+            smmu_continuity_tracker: AtomicDevicePageTable::new(1),
             smmu_reverse_mappings: Mutex::new(SmmuReverseMappings::new(physical_page_count)),
             smmu_mapping_guard: Mutex::new(()),
             smmu_translation_cache: TranslationCache::default(),
@@ -832,14 +811,7 @@ impl MaxwellDeviceMemoryManager {
     pub fn get_span(&self, src_addr: DAddr, size: usize) -> *mut u8 {
         let page = src_addr >> SMMU_PAGE_BITS;
         let subbits = (src_addr & (SMMU_PAGE_SIZE - 1)) as usize;
-        let continuity_pages = self
-            .smmu_continuity_tracker
-            .lock()
-            .unwrap()
-            .get(&page)
-            .copied()
-            .unwrap_or(1)
-            .max(1) as usize;
+        let continuity_pages = self.smmu_continuity_tracker.load(page).max(1) as usize;
 
         if (continuity_pages << SMMU_PAGE_BITS) < size.wrapping_add(subbits) {
             return std::ptr::null_mut();
@@ -1223,7 +1195,7 @@ impl MaxwellDeviceMemoryManager {
     fn smmu_track_continuity_impl(&self, d_address: DAddr, size: usize) {
         let start_page = d_address >> SMMU_PAGE_BITS;
         let end_page = start_page + smmu_num_pages_for_size(size);
-        let mut continuity = self.smmu_continuity_tracker.lock().unwrap();
+        let continuity = &self.smmu_continuity_tracker;
         let mut last_ptr = 0usize;
         let mut page_count = 1u32;
         for page in (start_page..end_page).rev() {
@@ -1239,7 +1211,7 @@ impl MaxwellDeviceMemoryManager {
                 page_count = 1;
             }
             last_ptr = new_ptr;
-            continuity.insert(page, page_count);
+            continuity.store(page, page_count);
         }
     }
 
@@ -1274,7 +1246,7 @@ impl MaxwellDeviceMemoryManager {
         let start_page = d_address >> SMMU_PAGE_BITS;
         let num_pages = smmu_num_pages_for_size(size) as usize;
         let memory = memory.access().unwrap();
-        let mut continuity = self.smmu_continuity_tracker.lock().unwrap();
+        let continuity = &self.smmu_continuity_tracker;
         let mut last_ptr = 0usize;
         let mut page_count = 1u32;
         for index in (0..num_pages).rev() {
@@ -1286,7 +1258,7 @@ impl MaxwellDeviceMemoryManager {
                 page_count = 1;
             }
             last_ptr = new_ptr;
-            continuity.insert(start_page + index as u64, page_count);
+            continuity.store(start_page + index as u64, page_count);
         }
     }
 
@@ -1540,7 +1512,7 @@ impl MaxwellDeviceMemoryManager {
         F: FnMut(usize, usize, usize),
         U: FnMut(DAddr, usize, usize),
     {
-        let continuity = self.smmu_continuity_tracker.lock().unwrap();
+        let continuity = &self.smmu_continuity_tracker;
         let mut remaining = size;
         let mut buffer_offset = 0usize;
         let mut page = d_address >> SMMU_PAGE_BITS;
@@ -1548,7 +1520,7 @@ impl MaxwellDeviceMemoryManager {
         let mut all_mapped = true;
 
         while remaining > 0 {
-            let requested_pages = continuity.get(&page).copied().unwrap_or(1).max(1) as usize;
+            let requested_pages = continuity.load(page).max(1) as usize;
             let current_daddr = (page << SMMU_PAGE_BITS) + page_offset as u64;
             let base_compressed = self.smmu_compressed_physical_ptr.load(page);
             if base_compressed == 0 {
@@ -2503,10 +2475,10 @@ mod tests {
         }
 
         {
-            let continuity = mgr.smmu_continuity_tracker.lock().unwrap();
-            assert_eq!(continuity.get(&(0x8000 >> SMMU_PAGE_BITS)), Some(&3));
-            assert_eq!(continuity.get(&(0x9000 >> SMMU_PAGE_BITS)), Some(&2));
-            assert_eq!(continuity.get(&(0xA000 >> SMMU_PAGE_BITS)), Some(&1));
+            let continuity = &mgr.smmu_continuity_tracker;
+            assert_eq!(continuity.load(0x8000 >> SMMU_PAGE_BITS), 3);
+            assert_eq!(continuity.load(0x9000 >> SMMU_PAGE_BITS), 2);
+            assert_eq!(continuity.load(0xA000 >> SMMU_PAGE_BITS), 1);
         }
 
         mgr.smmu_unmap(0x8000, 0x3000);
@@ -2521,10 +2493,10 @@ mod tests {
             })
         );
         {
-            let continuity = mgr.smmu_continuity_tracker.lock().unwrap();
-            assert_eq!(continuity.get(&(0x8000 >> SMMU_PAGE_BITS)), Some(&3));
-            assert_eq!(continuity.get(&(0x9000 >> SMMU_PAGE_BITS)), Some(&2));
-            assert_eq!(continuity.get(&(0xA000 >> SMMU_PAGE_BITS)), Some(&1));
+            let continuity = &mgr.smmu_continuity_tracker;
+            assert_eq!(continuity.load(0x8000 >> SMMU_PAGE_BITS), 3);
+            assert_eq!(continuity.load(0x9000 >> SMMU_PAGE_BITS), 2);
+            assert_eq!(continuity.load(0xA000 >> SMMU_PAGE_BITS), 1);
         }
     }
 
@@ -2576,8 +2548,8 @@ mod tests {
             })
         );
         assert_eq!(
-            mgr.smmu_continuity_tracker.lock().unwrap().get(&0x8),
-            Some(&2)
+            mgr.smmu_continuity_tracker.load(0x8),
+            2
         );
     }
 
@@ -2728,10 +2700,10 @@ mod tests {
         }
         mgr.smmu_track_continuity(0x8000, 0x3000);
 
-        let continuity = mgr.smmu_continuity_tracker.lock().unwrap();
-        assert_eq!(continuity.get(&(0x8000 >> SMMU_PAGE_BITS)), Some(&3));
-        assert_eq!(continuity.get(&(0x9000 >> SMMU_PAGE_BITS)), Some(&2));
-        assert_eq!(continuity.get(&(0xA000 >> SMMU_PAGE_BITS)), Some(&1));
+        let continuity = &mgr.smmu_continuity_tracker;
+        assert_eq!(continuity.load(0x8000 >> SMMU_PAGE_BITS), 3);
+        assert_eq!(continuity.load(0x9000 >> SMMU_PAGE_BITS), 2);
+        assert_eq!(continuity.load(0xA000 >> SMMU_PAGE_BITS), 1);
     }
 
     #[test]
@@ -2928,8 +2900,8 @@ mod tests {
         );
         assert!(mgr.smmu_cpu_backing.lock().unwrap().contains_key(&0x8));
         assert_eq!(
-            mgr.smmu_continuity_tracker.lock().unwrap().get(&0x8),
-            Some(&1)
+            mgr.smmu_continuity_tracker.load(0x8),
+            1
         );
         assert!(invalidations.lock().unwrap().is_empty());
     }

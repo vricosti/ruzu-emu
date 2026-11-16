@@ -220,6 +220,27 @@ impl<DT: DeviceTracker, const STACK_WORDS: usize, const SIZE_BYTES: u64>
         }
     }
 
+    /// `change_region_state(Type::Cpu, true, ...)` leaving the pages tracked
+    /// (Untracked unchanged): pages tracked now stay tracked, so clearing the
+    /// bits later tracks nothing again.
+    ///
+    /// Lichii `WordManager::MarkWrittenTracked` (word_manager.h:168-178),
+    /// absent from Eden. Lichii's `NoteCleanWord` bookkeeping (its clean word
+    /// summary) has no ruzu counterpart.
+    pub fn mark_written_tracked(&mut self, dirty_addr: u64, size: u64) {
+        let cpu_ptr = self.heap[Type::Cpu as usize].as_mut_ptr();
+        let cached_ptr = self.heap[Type::CachedCpu as usize].as_mut_ptr();
+        self.iterate_words(dirty_addr.wrapping_sub(self.cpu_addr), size, |index, mask| {
+            // SAFETY: `iterate_words` yields indices within the word spans;
+            // the CPU and cached CPU spans are distinct heap entries.
+            unsafe {
+                *cpu_ptr.add(index) |= mask;
+                *cached_ptr.add(index) &= !mask;
+            }
+            None
+        });
+    }
+
     /// Change the state of a range of pages.
     ///
     /// `enable` = true sets the bits, false clears them.

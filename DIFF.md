@@ -1,5 +1,318 @@
 # Upstream parity notes
 
+## 2026-11-16 — Lichii NX2 performance mechanisms: submission policy, GPU thread pinning, fence batches, deferred fragment barriers
+
+All four are Lichii extensions, absent from Eden. The losses quoted are Lichii's own ablation on
+the NX2 title used for measurement (one 60 s run each with the mechanism disabled, against three
+references at 46.13-46.53 fps); none is measured in ruzu yet.
+
+### Submission policy (`EDEN_NX2_FLUSH_DRAWS`; Lichii loses 10.5 % fps without it)
+- `renderer_vulkan/submission_policy.rs` ports Lichii `renderer_vulkan/submission_policy.h`
+  (`DEFAULT_NATIVE_BUDGET = 128`, `Action`, `parse_budget`, `advance`).
+- `RasterizerVulkan::flush_work` ports Lichii `FlushWork` (vk_rasterizer.cpp:4125-4170): a
+  title using native tiling dispatches every 32 operations and submits every 128 (desktop);
+  `EDEN_NX2_FLUSH_DRAWS=n` (read once) replaces 128. Other titles dispatch every 32 instead of
+  Eden's 8 and submit at 4096 (128 on MoltenVK), and `EDEN_NX2_FLUSH_DRAWS` also forces their
+  budget (`max(32, strtol(value)) & ~31`). This part reaches Switch 1 titles too, as in Lichii.
+  Android keeps Eden's cadence. The `state_tracker` invalidation after the submission is ruzu's.
+- `pending_native_work` (vk_rasterizer.h:383; vk_rasterizer.cpp:3167-3171, 3822, 4165-4169):
+  `flush_commands` submits after a native draw even when `draw_counter` was reset by a budget
+  submission; `tick_frame` clears it.
+- `flush_commands` skips a submission with nothing recorded since the last one
+  (vk_rasterizer.cpp:3173-3177, Lichii 8e5259aa7b): `Scheduler::recorded_since_submit` with
+  `record_serial` / `submitted_serial` (vk_scheduler.h:223, 240-245, 363-364;
+  vk_scheduler.cpp:182, 267). ruzu has no batched uploads, so `uploads_pending` has no
+  counterpart.
+- Not ported: `Scheduler::CountSkippedFlush` (feeds only Lichii's GPU-profile scheduler report,
+  which ruzu lacks), `Scheduler::DeferFlush` in `FlushCommands` (`EDEN_NX2_FENCE_FLUSH_US`, no
+  measurable effect in the ablation: -0.7 %), and `DispatchWork` without a worker wake-up
+  (vk_scheduler.cpp:317-337).
+
+### GPU thread pinning (setting `pin_gpu_threads`, default on; Lichii loses 5.3 % fps without it)
+- `common/core_pinning.rs` ports Lichii `common/core_pinning.{h,cpp}` (Lichii 8f80816581):
+  `plan_gpu_thread_pinning` gives the split GPU thread's front and back the second and third
+  physical cores of the fastest class (all their SMT siblings) and the guest cores the others,
+  only with at least `MIN_CORES_FOR_GPU_THREAD_PINNING` (6) such cores; `parse_cpu_list`.
+- `common/thread.rs`: `PinnedRole`, `pin_current_thread` (thread.cpp:731-787) with the Linux
+  `read_cpu_list`, `linux_processors`, `set_current_thread_affinity` (thread.cpp:552-624). The
+  plan is made once and logged; too few cores, an unreadable topology or a refused affinity only
+  log.
+- `common/settings.rs`: `pin_gpu_threads`, `SwitchableSetting<bool>`, default true, category
+  RendererHacks, saved (settings.h:823-824). Callers as in Lichii: the GPU thread
+  (gpu_thread.cpp:69-71), the split back (gpu_split.cpp:649-651) and each CPU core thread
+  (cpu_manager.cpp:182-184). It applies to every title, as in Lichii.
+- Differences: no Windows pinning (Lichii uses its CPU-set helpers, which ruzu lacks; Windows
+  logs that pinning is Linux only); no GTK option (Lichii's Qt text, shared_translation.cpp:386)
+  and no recommended-settings entry (recommended_settings.h:59-62).
+- Regression found and fixed (2026-11-16). On another NX2 title (map, then 3D title screen), the
+  first port made loading 56 % slower (5.68 / 9.73 fps against 16.20 / 18.83, presentation gaps
+  of 15-17 s against 1.4-2.5 s); with `pin_gpu_threads=false` the same binary ran 21.47 fps
+  against 21.78. Cause: the texture transcoding pool (`textures/workers.rs`) is created lazily,
+  usually from a GPU thread, and was sized with `std::thread::available_parallelism()`, which
+  follows the calling thread's affinity: 1 thread instead of 8, and that thread inherited the GPU
+  thread's single physical core. Upstream sizes its pools with
+  `std::thread::hardware_concurrency()`, which ignores affinity (libstdc++ `get_nprocs()`;
+  checked: 16 under `taskset -c 0` on a 16-thread host).
+- Fix: `common::thread::hardware_concurrency()` (online processors, `sysconf(_SC_NPROCESSORS_ONLN)`)
+  replaces `available_parallelism()` in every pool size (texture transcoding, Vulkan, OpenGL and
+  Metal pipeline workers, `cpu_detect::get_processor_count` on Linux). Inheritance: Linux threads
+  inherit their creator's affinity, and Lichii has the same latent defect (its desktop-Linux
+  `SetCurrentThreadToAllCores` / `ToBackgroundWork` / `ToEfficiencyCores` are no-ops, and its
+  `GetThreadWorkers` pool is also created lazily from the GPU thread). In ruzu these three
+  functions, which every `ThreadWorker` thread calls at start, give the thread back the process's
+  affinity captured before the first pin; while nothing is pinned they stay no-ops. The two raw
+  threads created from GPU threads (`TextureConvCache`, `Screenshot`) call
+  `set_current_thread_to_all_cores` too. Threads created from guest core threads (HLE service host
+  threads, the kernel worker task thread) keep the guest cores' mask, as in Lichii: they stay off
+  the two GPU cores. The fix is not measured yet.
+
+### Fence batches (`EDEN_NX2_FENCE_BATCH`; Lichii loses 3.5 % fps without it)
+- `fence_manager.rs` `release_thread_func` ports Lichii `ReleaseThreadFunc`
+  (fence_manager.h:259-350): after waiting for the first fence, the release thread takes up to 64
+  fences already signaled (or stubbed), pops their texture flushes under one texture-cache lock,
+  then their buffer flushes under one buffer-cache lock, then runs each fence's query pop and
+  operations in fence order. `EDEN_NX2_FENCE_BATCH=0` (read once): one fence at a time. All
+  titles, as in Lichii.
+- Rust adaptation: the generic manager reaches the caches through the backend's
+  `pop_async_flushes` callback, which now takes `AsyncFlushPops` (pop counts per cache); each
+  async fence keeps that callback instead of a pre-operation. `FenceBase::is_signaled` gives the
+  release thread the backend's `IsFenceSignaled`. OpenGL and Metal have no release thread and
+  pop `AsyncFlushPops::for_fence`, Eden's per-fence order.
+- Not ported: `Nx2FastDraw::Break` (no fast draws in ruzu) and the `spare_operations` reuse.
+
+### Deferred fragment barriers (no switch in Lichii; not measured)
+- `RasterizerVulkan::fragment_barrier` defers the barrier (vk_rasterizer.cpp:3156-3160) through
+  `renderer_vulkan/fragment_barrier_state.rs` (Lichii `fragment_barrier_state.h`) and
+  `Scheduler::{defer_fragment_barrier, has_fragment_barrier, note_render_pass_stores,
+  render_pass_has_stores}` (vk_scheduler.h:141-155, 498-499), reset when a render pass ends
+  (vk_scheduler.cpp:993-994).
+- `GraphicsPipeline::configure` ends the pass after `check_feedback_loop` only when a barrier is
+  pending and the pass has stores or the draw samples an active render target
+  (vk_graphics_pipeline.cpp:1245-1248); `TextureCache::samples_render_target`
+  (texture_cache.h:924-945); `writes_storage` (vk_graphics_pipeline.cpp:427-433) notes the
+  stores after `request_renderpass` (vk_graphics_pipeline.cpp:1606-1608). All titles, as in Lichii
+  (Lichii's comment counts ~5,900 render passes a second avoided on the NX2 title it tuned).
+- Not ported: the delta-draw call site (vk_graphics_pipeline.cpp:1415-1418; ruzu has no delta
+  draws), the MoltenVK-only deferral in `WaitForIdle` (vk_rasterizer.cpp:3137-3141) and the
+  indirect-trace `NoteRenderPassStores` (vk_rasterizer.cpp:1951, a diagnostic).
+
+## 2026-11-16 — inline-to-memory invalidations deferred: video_core/{renderer_vulkan/vk_rasterizer,memory_manager}.rs vs Lichii video_core/{renderer_vulkan/vk_rasterizer.cpp,memory_manager.h} (not measured in ruzu yet)
+
+### Ported (Lichii extensions, absent from Eden)
+- `EDEN_NX2_INLINE_DEFER` (on unless set to a value starting with '0', read once,
+  vk_rasterizer.cpp:3926-3930) in `RasterizerVulkan::accelerate_inline_to_memory`
+  (vk_rasterizer.cpp:3926-3990): when the buffer cache does not upload the words in place
+  (`inline_memory`: GPU-written buffer data), the buffer, texture and shader cache invalidations
+  wait for the next `flush_caching` (`MemoryManager::accumulate_invalidation`, memory_manager.h:
+  202-207), which runs before every draw, dispatch, clear, 2D blit and DMA copy (vk_rasterizer.rs
+  `prepare_draw`, `clear`, `dispatch_compute`, `accelerate_conditional_rendering`; fermi_2d.rs;
+  maxwell_dma.rs). The query cache is still invalidated at once, now before the texture and shader
+  caches (Lichii order). With the variable at 0 the function behaves as Eden's.
+- The buffer cache lock is skipped when deferring on an NX2 session (`G_NX2_AMPERE`) and no page
+  the write touches was ever GPU-written (`nx2_may_be_gpu_written`): `inline_memory` uploads only
+  into GPU-written buffer data, whose pages are all marked in that bitmap first, under the lock,
+  on this thread.
+
+### Intentional differences
+- Lichii's command list page test (`Nx2IsCommandListPage`, `Nx2NoteListHostWrite`), list grid
+  kept-word patches (`nx2_expected_words`, `InlineKeptWords`), native query tracing
+  (`TraceNativeQuery`, `EDEN_NX2_SEM_WATCH`) and its `BackX::g_verify` cross-check are not
+  ported: ruzu has none of those mechanisms.
+
+## 2026-11-16 — video_core/buffer_cache/virtual_range_cache.rs vs Eden video_core/buffer_cache/virtual_range_cache.h
+
+### Intentional differences
+- `VirtualRangeCache::entries` hashes its keys with ruzu's `BuildUnorderedDenseHasher` (an
+  integer mix) instead of Rust's default SipHash. Eden's `std::unordered_map<u64, Entry>` uses
+  the standard library's plain integer hash; the identity hash itself would leave hashbrown's
+  7-bit tags nearly constant for these keys (address space id shifted to bit 48). `Query` hashes
+  up to three times per storage buffer binding of every draw (0.18 ms per frame of the back on
+  the NX2 title used for measurement, profiled before the change; the gain is not measured).
+
+## 2026-11-16 — video_core/texture_cache/texture_cache.rs: channel binds skip the stand-in image walk
+
+### Intentional differences (ruzu-only code, no upstream counterpart)
+- `TextureCacheBase::rebase_virtual_invalid_images` (ruzu-only: neither Eden nor Lichii move an
+  image off its stand-in address; Lichii fixes the stand-in by GPU address,
+  texture_cache.h:2995-3006) walked every image on every channel bind, which the NX2 GPU split
+  issues once per back batch (0.6 ms per frame of the back on the NX2 title used for measurement,
+  where no image ever had a stand-in address). It now returns at once while
+  `virtual_invalid_space` is 0: only `resolve_or_allocate_cpu_addr` gives an image an address at
+  or above the sentinel, and it advances `virtual_invalid_space` by the image's aligned guest
+  size each time.
+
+## 2026-11-16 — texture view preparation: video_core/texture_cache/{texture_cache,image_base,descriptor_table}.rs and renderer_vulkan/texture_cache.rs vs Eden/Lichii video_core/texture_cache/{texture_cache.h,image_base.h,image_base.cpp,descriptor_table.h}
+
+### Ported (Lichii extensions, absent from Eden)
+- `ImageBase::newest_alias_tick` and `set_modification_tick` (image_base.h:135, 179-187;
+  image_base.cpp:255-256): every `modification_tick` change (`mark_modification_by_id`,
+  `JoinImages` copies, `synchronize_aliases`) raises the aliases' `newest_alias_tick`, and
+  `synchronize_aliases` returns at once while no alias was modified after the image
+  (texture_cache.h:4233-4240, 4253-4256, 4266-4267). Eden walks the whole alias list on every
+  preparation; the copies made are the same.
+- `DescriptorTable::read_from_memory` (Lichii `DescriptorTable::Read`, descriptor_table.h:46-73):
+  a TIC/TSC entry within one page is copied from its host pointer; Eden uses `ReadBlockUnsafe`.
+
+### Realigned on Eden
+- `synchronize_aliases` no longer clones every newer alias' `Vec<ImageCopy>` and `copy_image`
+  no longer copies it again: `copy_image` takes the copies by value like Eden's
+  `CopyImage(ImageId, ImageId, std::vector<ImageCopy>)` (texture_cache.h:2451-2501), and reads
+  `resolution_info` without cloning it.
+
+### Intentional differences
+- ruzu-only mechanics, no upstream counterpart: `TextureCacheParams::copy_image` /
+  `reinterpret_image` keep a backend image that matches its slot's `ImageBase`
+  (`ensure_slot_image`) instead of cloning both bases on every alias copy, and the Vulkan
+  `update_render_targets` translates addresses through the non-owning channel memory pointer
+  (upstream's `Tegra::MemoryManager*`) instead of cloning the owning `Arc` and locking it on
+  every draw.
+- Not changed: `FixedPipelineState::refresh` builds ruzu's `DepthStencilInfo`/`RasterizerInfo`
+  register snapshots (owned by `engines/maxwell_3d.rs`) where upstream reads `regs` fields;
+  the per-channel `sampler_ids`/`image_view_ids` stay hash maps as in Eden (Lichii keeps
+  `DescriptorTable::bound_ids`).
+
+## 2026-11-16 — constant buffer data path: video_core/{memory_manager,rasterizer_interface,engines/maxwell_3d,buffer_cache/{buffer_cache,memory_tracker_base},renderer_vulkan/vk_rasterizer}.rs vs Lichii video_core/{memory_manager.{h,cpp},rasterizer_interface.h,engines/maxwell_3d.{h,cpp},buffer_cache/{buffer_cache.h,memory_tracker_base.h},renderer_vulkan/vk_rasterizer.cpp}
+
+### Ported (Lichii extensions, absent from Eden)
+- `Maxwell3D::write_bound_constant_buffer` and `bound_constant_buffer` (maxwell_3d.cpp:1199-1240,
+  maxwell_3d.h:3299-3303, 3427-3437): `process_cb_multi_data` writes through the device address
+  of the buffer CB_ADDRESS/CB_SIZE select, translated once per selection and memory map
+  (`map_serial`), instead of `write_block_cached` (a GPU page walk, an SMMU walk and the
+  invalidation accumulator for each word).
+- `MemoryManager::write_constant_buffer_data` and `constant_buffer_writes`
+  (memory_manager.cpp:643-667): copies through the device page's host pointer and merges the
+  written ranges; `flush_caching` hands them to
+  `RasterizerInterface::invalidate_constant_buffer_data` after the accumulator's ranges
+  (memory_manager.cpp:1097-1109; rasterizer_interface.h:236-240, default `inner_invalidation`).
+- `RasterizerVulkan::invalidate_cached_writes` (vk_rasterizer.cpp:2873-2935) behind
+  `inner_invalidation` and `invalidate_constant_buffer_data`: constant buffer data reaches the
+  buffer cache only where `BufferCache::constant_data_reaches_buffers` (buffer_cache.h:1773-1795)
+  says it can change something: pages an upload or unmark took out of the CPU-modified state
+  managers are created in, or marked GPU-modified or preflushable
+  (`MemoryTrackerBase::is_region_ever_synchronized` and `ever_synchronized_pages`,
+  memory_tracker_base.h:92-110, 172-180, 228-233, 361), or pages added to the GPU-modified ranges
+  (`nx2::G_NX2_GPU_WRITTEN_PAGES`, `nx2_mark_gpu_written`, `nx2_may_be_gpu_written`: Lichii
+  `g_nx2_gpu_written_pages`, `Nx2MarkGpuWritten`, `Nx2MayBeGpuWritten`, nx2.h:45-71, 120-137,
+  marked at the same two sites, `DMACopy` and `MarkWrittenBuffer`, buffer_cache.h:1485, 3297).
+  `rasterizer_download_area::may_hold_gpu_writes` still answers true everywhere instead of
+  reading this bitmap as Lichii's `MayHoldGpuWrites` does (read downloads, outside this change).
+  Elsewhere `write_memory` would change nothing: pages never synchronized are CPU-modified, so a
+  cached buffer uploads them when next synchronized and uniform buffers streamed from guest
+  memory read the new data at their next bind.
+- Engine writes keep their pages tracked: `invalidate_cached_writes` takes the applied ranges out
+  of the GPU-written ranges first (`BufferCache::claim_cpu_writes`, buffer_cache.h:2165-2173) and
+  then calls `write_memory_with(addr, size, true, true)` (Lichii `WriteMemory(addr, size,
+  keep_page_gpu_data, engine_write)`, buffer_cache.h:241-270): when the pages hold no GPU-written
+  data the range is marked CPU-modified without untracking it
+  (`MemoryTrackerBase::mark_region_as_written_tracked`, memory_tracker_base.h:83-90;
+  `WordManager::mark_written_tracked`, word_manager.h:168-178), so the next upload does not track
+  it again (two host protection changes per write that no guest CPU access saw). This applies to
+  the accumulator's ranges (inline-to-memory, constant buffer data on the general path) too, as
+  in Lichii.
+
+### Intentional differences
+- Not ported, as they serve Lichii's fast draw deltas only (ruzu has none): the
+  `FastDraw::Enabled` gate of `WriteBoundConstantBuffer` (always on in Lichii), its texture and
+  sampler header overlap checks (`tic`/`tsc` fields of `BoundConstantBuffer`, `DeviceSpans`),
+  `FastDraw::NoteConstantData`/`NoteDeviceData`, and `CallConstBufferWords`.
+- Lichii's `ProcessCBMultiData` clamps the write to the buffer's end before
+  `WriteBoundConstantBuffer`; ruzu writes as Eden does, so a write past CB_SIZE takes the general
+  path (`write_block_cached`). Writes to Switch 2 sparse memory take it too, as in Lichii, through
+  `is_continuous_range` (reserved pages are not continuous) instead of `g_nx2_sparse_low/high`.
+- `write_constant_buffer_data`'s unmapped fallback is `smmu_write_block_unsafe` (logs, as
+  ruzu's `write_block_unsafe`), not Lichii's `WriteKept` (sparse page keeping, absent from ruzu).
+  `write_bound_constant_buffer` takes the locked memory manager as an argument: ruzu's
+  `MemoryManager` sits behind a mutex the caller already holds.
+- `constant_data_reaches_buffers` has no command list page term (`Nx2IsCommandListPage`) nor
+  repacked vertex buffer term (`AnyVertexRepacked`): ruzu neither copies command lists for the
+  front nor repacks vertex buffers.
+- `write_memory_with` ports only the fast path of Lichii's `WriteMemory(addr, size,
+  keep_page_gpu_data, engine_write)`: when the pages do hold GPU-written data it keeps ruzu's
+  `write_memory`, where Lichii uploads the CPU's bytes on the scheduler's owner
+  (buffer_cache.h:283-330). Its `Nx2NoteListHostWrite`, `NoteUniformWrite`, `ForgetEarlyLanded`
+  and `MarkVertexBuffersStale` calls have no ruzu counterpart. Rust has no default arguments:
+  Eden's two-argument `write_memory` keeps its name.
+
+## 2026-11-16 — invalidation fast paths: core/gpu_dirty_memory_manager.rs, video_core/{gpu,shader_cache,texture_cache/{texture_cache_base,texture_cache},renderer_vulkan/vk_rasterizer,host1x/gpu_device_memory_manager}.rs vs Lichii core/gpu_dirty_memory_manager.h, video_core/{gpu.cpp,shader_cache.{h,cpp},texture_cache/{texture_cache_base.h,texture_cache.h},renderer_vulkan/vk_rasterizer.cpp} and Eden core/device_memory_manager.{h,inc}
+
+### Ported (Lichii extensions, absent from Eden)
+- `GpuDirtyMemoryManager::may_have_pending` (gpu_dirty_memory_manager.h:83-90) and the early
+  return of `Gpu::invalidate_gpu_cache` when no manager has a collected write (gpu.cpp:116-139).
+  Eden gathers on every call (one per fence). A write collected after the check is gathered by
+  the next call and meanwhile stays pending in its manager, where
+  `for_each_pending_cpu_write` (async read-back) still sees it, as in Lichii. Lichii's
+  EDEN_NX2_BACKX_VERIFY counters around it are not ported.
+- `page_filter` of the texture cache and of the shader cache (texture_cache_base.h:271,
+  shader_cache.h:68-69; the query cache's was already ported). Audit of the registration sites:
+  the texture cache's `write_memory` finds images only through `page_table`, filled at two sites,
+  both in `register_image` (sparse segments and plain image), which mark the filter
+  (texture_cache.h:3874, 3884); the shader cache's `invalidate_pages_in_region` finds shaders
+  through `invalidation_cache`, filled only by `register`, and rejections through
+  `rejected_native`, filled only by `remember_rejection`, which both mark it
+  (shader_cache.cpp:338, 383). No other site inserts into these tables.
+- `RasterizerVulkan::inner_invalidation` follows Lichii `InvalidateCachedWrites`
+  (vk_rasterizer.cpp:2882-2935): each cache is skipped when its page filter shows none of the
+  ranges, the texture cache is invalidated even with `skip_cpu_inner_invalidation` (Lichii: video
+  frames written in software reach it only there), and the shader cache takes all ranges under
+  one lock (`ShaderCache::invalidate_regions`, shader_cache.cpp:49-58). Eden's InnerInvalidation
+  (vk_rasterizer.cpp:748-767) locked every cache and ignored the setting; ruzu returned early with
+  the setting.
+
+### Realigned on Eden
+- The SMMU `continuity_tracker` is an array of atomic entries read without a lock
+  (`smmu_walk_block`, `get_span`), as Eden reads `tracked_entries[page].continuity_tracker`
+  (device_memory_manager.inc:301, 311, 381) and Lichii (:602-611); it is written under
+  `mapping_guard` as before. It was a `Mutex<DenseDevicePageTable>` locked per walk.
+
+### Intentional differences
+- `System::gpu_dirty_memory_managers` still returns a cloned `Vec` (Eden returns a span): its
+  other caller is in `core/hle`, outside this change; `invalidate_gpu_cache` pays one clone of a
+  few `Arc`s per call.
+- Lichii also reads the texture cache's page filter in `GetFlushArea`; not part of this change.
+
+## 2026-11-16 — video_core/{dma_pusher,gpu_split,memory_manager,engines/{maxwell_3d,kepler_compute}}.rs vs Lichii video_core/{dma_pusher.cpp,gpu_split.{h,cpp},memory_manager.h,engines/{maxwell_3d,kepler_compute}.cpp}
+
+### Intentional differences (split front thread)
+- Front state ownership: Lichii keeps `std::unique_ptr<FrontState> front` in the engine and
+  reads it without a lock (only the split's front thread touches it). ruzu shares the allocation
+  between the engine and `DmaPusher::front_engines` (`Arc`), and now wraps it in
+  `gpu_split::FrontOwned` (an `UnsafeCell` whose `get` takes the front-thread-only
+  `GpuSplitFrontend` as proof) instead of a `parking_lot::Mutex`: the mutex cost two locked
+  instructions on every method the front handled.
+- Stack frames: upstream `Front()` tests `front` inline and creates it under `[[unlikely]]`.
+  Rust inlined the creation (register bank copies, the compute engine's 16 KiB register array)
+  into `DmaPusher::prepare_front_engine`, called for every method: its frame was 0x23818 bytes,
+  probed page by page (35 stores) before the early return, 14.3 % of the front thread. The
+  creation is now `DmaPusher::create_front_engine` (`#[cold]`, `#[inline(never)]`), and
+  `Maxwell3D::front` / `KeplerCompute::front` are `#[cold]`, `#[inline(never)]`. Likewise
+  `Maxwell3D::front_run_macro`'s frame (0x10938 bytes, 16 pages probed per macro call) came from
+  the first-call and code-copy steps of FrontRunOnBack, now the Rust-only cold helpers
+  `front_back_macro_record` and `front_copy_back_code` (the write-set array and the 0x3000-word
+  macro code copy), plus `front_verify` / `front_take_escapes` (`#[cold]`); and
+  `KeplerCompute::front_run_macro` (`#[inline(never)]`) no longer sizes
+  `KeplerCompute::front_call_method`'s frame (6 pages). Behavior and call order are unchanged.
+- `Maxwell3D::front_run_macro` replaces the macro engine's `active_dram` handle only when it
+  names another data RAM (upstream stores the same pointer every call; Rust's `Arc` store was a
+  reference count increment and decrement per macro).
+- `GpuSplitFrontend::note_write`: Lichii's `ForEachDeviceRange` translates the noted range with
+  `GpuToCpuAddress` without a lock. ruzu took the `MemoryManager` mutex for every noted write
+  (each constant buffer word a macro writes), contended with the back (0.67 ms of `lock_slow`
+  per frame in the profile of 21354e1e). It now keeps the translations of the last 8 GPU pages
+  noted, valid while the manager's `map_serial` (read with
+  `MemoryManager::map_serial_unlocked`) is unchanged, and locks only on a miss. The noted
+  device ranges are those the locked translation gives.
+
+### Ported (Lichii extensions, absent from Eden)
+- `FrontSkipsLoopWrite` / `FrontTrackInstanceLoop` and `FrontState::sink_pending` /
+  `instance_loop` (Lichii maxwell_3d.cpp:1636-1641, 1697-1705, 1785, 1810, 1847, 2114-2154):
+  a same-value `vertex_buffer.first`/`count`, or `draw.end` inside an instance loop, is not sent
+  to the back unless state writes wait in its method sink. Lichii's `StateWrite` blocks and
+  `FrontNoteReport` are not ported.
+- `GpuSplit::Backoff` / `NotifyFront` (Lichii gpu_split.cpp:441-458, gpu_split.h:481-487,
+  BackLoop's consumed stores): `drain` and `wait_for` sleep on `front_wake` after 16384 spins
+  instead of yielding forever; the back stores `consumed` with `SeqCst` and wakes a sleeping
+  front; a failed back wakes it too (upstream: `back_running = false` then `front_wake`
+  notify). `wait_for_space` keeps its spin-then-yield wait, as upstream.
 ## 2026-11-15 — video_core/{query_dma,macro,engines/maxwell_3d,rasterizer_interface,query_cache/query_cache_base,renderer_vulkan/{query_cache,vk_rasterizer}}.rs vs Lichii video_core/{query_dma.h,macro.cpp,engines/maxwell_3d.cpp,rasterizer_interface.h,query_cache/query_cache_base.h,renderer_vulkan/vk_rasterizer.cpp}
 
 ### Ported (Lichii extensions, absent from Eden)

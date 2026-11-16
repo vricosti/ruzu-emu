@@ -57,6 +57,10 @@ impl FenceBase for MetalFence {
         self.command_buffer.is_none()
     }
 
+    fn is_signaled(&self) -> bool {
+        MetalFence::is_signaled(self)
+    }
+
     fn wait_for_fence(&self) {
         let Some(command_buffer) = self.command_buffer.as_ref() else {
             return;

@@ -338,7 +338,8 @@ pub fn get_cpu_caps() -> &'static CpuCaps {
 pub fn get_processor_count() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
-        let thread_count = std::thread::available_parallelism().map(|n| n.get()).ok()?;
+        // Upstream `std::thread::hardware_concurrency()`: online processors, not affinity.
+        let thread_count = Some(crate::thread::hardware_concurrency()).filter(|&n| n != 0)?;
         // Read SMT status from sysfs
         let smt_state = std::fs::read_to_string("/sys/devices/system/cpu/smt/active").ok();
         match smt_state.as_deref().map(|s| s.trim()) {

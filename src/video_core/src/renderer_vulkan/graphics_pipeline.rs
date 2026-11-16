@@ -570,6 +570,9 @@ pub struct GraphicsPipeline {
     pub uniform_buffer_sizes: UniformBufferSizes,
     pub uses_render_area: bool,
     pub uses_rescaling_uniform: bool,
+    /// Lichii `GraphicsPipeline::writes_storage` (vk_graphics_pipeline.h:449):
+    /// a stage stores to global memory or writes a storage buffer or image.
+    writes_storage: bool,
     /// Upstream `std::array<vk::ShaderModule, NUM_STAGES> spv_modules`.
     pub shader_modules: [vk::ShaderModule; NUM_VK_GRAPHICS_STAGES],
     build_condvar: Arc<Condvar>,
@@ -776,6 +779,7 @@ impl GraphicsPipeline {
             buffer_cache_metadata(&stage_infos);
         let uses_render_area = stage_infos.iter().any(|info| info.uses_render_area);
         let uses_rescaling_uniform = stage_infos.iter().any(|info| info.uses_rescaling_uniform);
+        let writes_storage = writes_storage(&stage_infos);
         let num_descriptor_entries = stage_infos.iter().map(num_descriptor_entries).sum::<u32>()
             + u32::from(has_mesh_output);
         let (num_image_elements, num_textures, fragment_has_color0_output) =
@@ -812,6 +816,7 @@ impl GraphicsPipeline {
             uniform_buffer_sizes,
             uses_render_area,
             uses_rescaling_uniform,
+            writes_storage,
             shader_modules,
             build_condvar: Arc::new(Condvar::new()),
             build_mutex: Arc::new(Mutex::new(())),
@@ -1065,6 +1070,14 @@ impl GraphicsPipeline {
                 return false;
             }
             texture_cache.check_feedback_loop(&views);
+            // Lichii vk_graphics_pipeline.cpp:1245-1248: a deferred fragment barrier ends
+            // the render pass only before a draw that reads what the pass wrote.
+            if scheduler.has_fragment_barrier()
+                && (scheduler.render_pass_has_stores()
+                    || texture_cache.base.samples_render_target(&views))
+            {
+                scheduler.request_outside_render_pass_operation_context();
+            }
         }
         if self.is_built() && *self.pipeline.lock().unwrap() == vk::Pipeline::null() {
             return false;
@@ -1519,6 +1532,10 @@ impl GraphicsPipeline {
             }
         };
         scheduler.request_renderpass(&target);
+        // Lichii vk_graphics_pipeline.cpp:1606-1608.
+        if self.writes_storage {
+            scheduler.note_render_pass_stores();
+        }
 
         let is_built = self.is_built.load(Ordering::Relaxed);
         if !is_built {
@@ -2128,6 +2145,17 @@ fn graphics_resource_metadata(stage_infos: &[ShaderInfo; 5]) -> (usize, u32, boo
     (num_image_elements, num_textures, fragment_has_color0_output)
 }
 
+/// Lichii's `writes_storage` computation in the `GraphicsPipeline` constructor
+/// (vk_graphics_pipeline.cpp:427-433).
+fn writes_storage(stage_infos: &[ShaderInfo; NUM_VK_GRAPHICS_STAGES]) -> bool {
+    stage_infos.iter().any(|info| {
+        info.stores_global_memory
+            || info.storage_buffers_descriptors.iter().any(|desc| desc.is_written)
+            || info.image_descriptors.iter().any(|desc| desc.is_written)
+            || info.image_buffer_descriptors.iter().any(|desc| desc.is_written)
+    })
+}
+
 fn graphics_stage_flags(stage_index: usize) -> vk::ShaderStageFlags {
     match stage_index {
         0 => vk::ShaderStageFlags::VERTEX,
@@ -2642,6 +2670,7 @@ mod tests {
             uniform_buffer_sizes: [[0; NUM_GRAPHICS_UNIFORM_BUFFERS as usize]; NUM_STAGES as usize],
             uses_render_area: false,
             uses_rescaling_uniform: false,
+            writes_storage: false,
             shader_modules: [vk::ShaderModule::null(); NUM_VK_GRAPHICS_STAGES],
             build_condvar: Arc::new(Condvar::new()),
             build_mutex: Arc::new(Mutex::new(())),

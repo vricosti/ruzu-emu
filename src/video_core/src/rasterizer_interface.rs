@@ -288,6 +288,15 @@ pub trait RasterizerInterface {
         }
     }
 
+    /// `inner_invalidation` of constant buffer data
+    /// (`MemoryManager::write_constant_buffer_data`).
+    ///
+    /// Lichii `RasterizerInterface::InvalidateConstantBufferData`
+    /// (rasterizer_interface.h:236-240), absent from Eden.
+    fn invalidate_constant_buffer_data(&mut self, sequences: &[(u64, usize)]) {
+        self.inner_invalidation(sequences);
+    }
+
     /// Notify that caches of the specified region are desynced with guest.
     fn on_cache_invalidation(&mut self, addr: u64, size: u64);
 

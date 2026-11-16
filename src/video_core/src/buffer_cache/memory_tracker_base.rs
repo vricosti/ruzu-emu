@@ -98,6 +98,11 @@ pub struct MemoryTrackerBase<DT: DeviceTracker> {
     cached_pages: HashSet<u32>,
     /// Pointer to the device tracker (rasterizer).
     device_tracker: *const DT,
+    /// Lichii `ever_synchronized_pages` (memory_tracker_base.h:361): pages
+    /// that ever left the CPU-modified state managers are created in.
+    /// Shared with `for_each_upload_range`'s callback, which marks it while
+    /// the managers are borrowed.
+    ever_synchronized_pages: std::sync::Arc<crate::page_filter::PageFilter>,
 }
 
 unsafe impl<DT: DeviceTracker> Send for MemoryTrackerBase<DT> {}
@@ -115,6 +120,7 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
                 .unwrap_or_else(|_| unreachable!("memory tracker top tier has its fixed size")),
             cached_pages: HashSet::new(),
             device_tracker: device_tracker as *const DT,
+            ever_synchronized_pages: std::sync::Arc::new(crate::page_filter::PageFilter::new()),
         }
     }
 
@@ -174,8 +180,26 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
         });
     }
 
+    /// As `mark_region_as_cpu_modified`, for data the GPU's own engines wrote
+    /// to guest memory (inline constant buffer data): the pages stay tracked,
+    /// as no guest CPU write needs to be let through, and the next upload has
+    /// nothing to track again.
+    ///
+    /// Lichii `MemoryTrackerBase::MarkRegionAsWrittenTracked`
+    /// (memory_tracker_base.h:83-90), absent from Eden. Its
+    /// `ForgetSynchronized` call belongs to the synchronized-range skips
+    /// (`WatchSynchronized`), which ruzu does not have.
+    pub fn mark_region_as_written_tracked(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
+        self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
+            mgr.mark_written_tracked(mgr.get_cpu_addr().wrapping_add(offset), size);
+            IterateResult::Void
+        });
+    }
+
     /// Unmark region as CPU-modified, notifying the device tracker.
     pub fn unmark_region_as_cpu_modified(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
+        // Lichii UnmarkRegionAsCpuModified (memory_tracker_base.h:94).
+        self.ever_synchronized_pages.mark(dirty_cpu_addr, query_size);
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
             mgr.change_region_state(
                 Type::Cpu,
@@ -189,6 +213,8 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
 
     /// Mark region as modified from the host GPU.
     pub fn mark_region_as_gpu_modified(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
+        // Lichii MarkRegionAsGpuModified (memory_tracker_base.h:102).
+        self.ever_synchronized_pages.mark(dirty_cpu_addr, query_size);
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
             mgr.change_region_state(
                 Type::Gpu,
@@ -202,6 +228,8 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
 
     /// Mark region as preflushable.
     pub fn mark_region_as_preflushable(&mut self, dirty_cpu_addr: VAddr, query_size: u64) {
+        // Lichii MarkRegionAsPreflushable (memory_tracker_base.h:110).
+        self.ever_synchronized_pages.mark(dirty_cpu_addr, query_size);
         self.iterate_pages::<true, _>(dirty_cpu_addr, query_size, |mgr, offset, size| {
             mgr.change_region_state(
                 Type::Preflushable,
@@ -281,16 +309,34 @@ impl<DT: DeviceTracker> MemoryTrackerBase<DT> {
     ) where
         F: FnMut(VAddr, u64),
     {
+        // Lichii ForEachUploadRange (memory_tracker_base.h:172-180): each
+        // uploaded range is marked ever synchronized before `func` sees it.
+        let ever_synchronized_pages = std::sync::Arc::clone(&self.ever_synchronized_pages);
+        let mut upload = |address: VAddr, size: u64| {
+            ever_synchronized_pages.mark(address, size);
+            func(address, size);
+        };
         self.iterate_pages::<true, _>(query_cpu_range, query_size, |mgr, offset, size| {
             mgr.for_each_modified_range(
                 Type::Cpu,
                 true,
                 mgr.get_cpu_addr().wrapping_add(offset),
                 size,
-                func,
+                &mut upload,
             );
             IterateResult::Void
         });
+    }
+
+    /// Whether a page of the range ever left the CPU-modified state (an
+    /// upload or an unmark) or was marked GPU-modified or preflushable. Pages
+    /// without any are CPU-modified as their managers were created. Any
+    /// thread, without a lock.
+    ///
+    /// Lichii `MemoryTrackerBase::IsRegionEverSynchronized`
+    /// (memory_tracker_base.h:228-233), absent from Eden.
+    pub fn is_region_ever_synchronized(&self, query_cpu_addr: VAddr, query_size: u64) -> bool {
+        self.ever_synchronized_pages.any(query_cpu_addr, query_size)
     }
 
     /// Lichii ForEachPreflushableRange: enumerate marked pages without clearing
@@ -532,6 +578,72 @@ mod tests {
     struct DummyTracker;
     impl DeviceTracker for DummyTracker {
         fn update_pages_cached_batch(&self, _ranges: &[(VAddr, usize)], _delta: i32) {}
+    }
+
+    #[test]
+    fn written_tracked_pages_upload_again_without_changing_their_tracking() {
+        struct CountingTracker(std::sync::Mutex<Vec<(VAddr, usize, i32)>>);
+        impl DeviceTracker for CountingTracker {
+            fn update_pages_cached_batch(&self, ranges: &[(VAddr, usize)], delta: i32) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .extend(ranges.iter().map(|&(addr, size)| (addr, size, delta)));
+            }
+        }
+        let tracker = CountingTracker(std::sync::Mutex::new(Vec::new()));
+        let mut memory = MemoryTrackerBase::new(&tracker);
+        // The first upload tracks the pages.
+        memory.for_each_upload_range(0x1_0000, 0x2000, &mut |_, _| {});
+        assert!(!tracker.0.lock().unwrap().is_empty());
+        assert!(!memory.is_region_cpu_modified(0x1_0000, 0x2000));
+        tracker.0.lock().unwrap().clear();
+
+        // An engine write: CPU-modified for the next upload, still tracked.
+        memory.mark_region_as_written_tracked(0x1_0100, 0x10);
+        assert!(memory.is_region_cpu_modified(0x1_0000, 0x1000));
+        assert!(!memory.is_region_cpu_modified(0x1_1000, 0x1000));
+        let mut uploads = Vec::new();
+        memory.for_each_upload_range(0x1_0000, 0x2000, &mut |addr, size| uploads.push((addr, size)));
+        assert_eq!(uploads, [(0x1_0000, 0x1000)]);
+        let changes = tracker.0.lock().unwrap().clone();
+        assert!(changes.is_empty(), "{changes:?}");
+
+        // A CPU mark untracks the page and the upload tracks it again.
+        memory.mark_region_as_cpu_modified(0x1_0100, 0x10);
+        memory.for_each_upload_range(0x1_0000, 0x2000, &mut |_, _| {});
+        let changes = tracker.0.lock().unwrap().clone();
+        assert_eq!(changes, [(0x1_0000, 0x1000, -1), (0x1_0000, 0x1000, 1)]);
+    }
+
+    #[test]
+    fn ever_synchronized_pages_follow_every_way_out_of_the_cpu_modified_state() {
+        let tracker = DummyTracker;
+        let mut memory = MemoryTrackerBase::new(&tracker);
+        assert!(!memory.is_region_ever_synchronized(0, HIGHER_PAGE_SIZE * 2));
+        // A CPU mark keeps pages as created: CPU-modified, nothing to change.
+        memory.mark_region_as_cpu_modified(0x1_0000, 0x1000);
+        assert!(!memory.is_region_ever_synchronized(0x1_0000, 0x1000));
+        // An upload marks only the ranges it uploaded.
+        memory.for_each_upload_range(0x2_0000, 0x2000, &mut |_, _| {});
+        assert!(memory.is_region_ever_synchronized(0x2_0000, 4));
+        assert!(memory.is_region_ever_synchronized(0x2_1ffc, 4));
+        assert!(!memory.is_region_ever_synchronized(0x2_2000, 0x1000));
+        // A second upload over clean pages finds nothing and changes nothing.
+        let mut uploads = 0;
+        memory.for_each_upload_range(0x2_0000, 0x2000, &mut |_, _| uploads += 1);
+        assert_eq!(uploads, 0);
+        // An unmark, a GPU mark and a preflushable mark each count.
+        memory.unmark_region_as_cpu_modified(0x3_0000, 0x10);
+        memory.mark_region_as_gpu_modified(0x4_0000, 0x10);
+        memory.mark_region_as_preflushable(0x5_0000, 0x10);
+        for page in [0x3_0000u64, 0x4_0000, 0x5_0000] {
+            assert!(memory.is_region_ever_synchronized(page + 0xff0, 0x10), "{page:#x}");
+            assert!(!memory.is_region_ever_synchronized(page + 0x1000, 0x10), "{page:#x}");
+        }
+        // Marking CPU-modified again does not forget a page.
+        memory.mark_region_as_cpu_modified(0x2_0000, 0x2000);
+        assert!(memory.is_region_ever_synchronized(0x2_0000, 0x2000));
     }
 
     #[test]

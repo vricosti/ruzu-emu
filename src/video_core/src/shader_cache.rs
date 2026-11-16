@@ -126,6 +126,9 @@ pub struct ShaderCache {
     // Bounds of every rejected address; deliberately never shrink after invalidation.
     rejected_lowest: AtomicU64,
     rejected_highest: AtomicU64,
+    /// Device pages this cache ever registered objects on (inner_invalidation
+    /// skips the rest). Lichii `ShaderCache::page_filter` (shader_cache.h:68-69).
+    pub page_filter: crate::page_filter::PageFilter,
 }
 
 // Safety: Entry pointers are only used within locked sections.
@@ -188,6 +191,7 @@ impl ShaderCache {
             rejected_native: Mutex::new(HashMap::new()),
             rejected_lowest: AtomicU64::new(u64::MAX),
             rejected_highest: AtomicU64::new(0),
+            page_filter: crate::page_filter::PageFilter::new(),
         }
     }
 
@@ -567,6 +571,9 @@ impl ShaderCache {
     fn remember_rejection(&self, addr: VAddr, error: RejectedShaderException) {
         let mut rejected = self.rejected_native.lock();
         rejected.entry(addr).or_insert(error);
+        // Lichii RememberRejection (shader_cache.cpp:338): inner_invalidation
+        // reaches invalidate_pages_in_region for it.
+        self.page_filter.mark(addr, 1);
         self.rejected_lowest.store(
             self.rejected_lowest.load(Ordering::Relaxed).min(addr),
             Ordering::Relaxed,
@@ -648,6 +655,21 @@ impl ShaderCache {
         self.remove_pending_shaders();
     }
 
+    /// `invalidate_region` over several ranges, under one lock.
+    ///
+    /// Lichii `ShaderCache::InvalidateRegions` (shader_cache.cpp:49-58).
+    pub fn invalidate_regions(&mut self, sequences: &[(u64, usize)]) {
+        if sequences.is_empty() {
+            return;
+        }
+        let invalidation_mutex: *const Mutex<()> = &self.invalidation_mutex;
+        let _invalidation_guard = unsafe { (*invalidation_mutex).lock() };
+        for &(addr, size) in sequences {
+            self.invalidate_pages_in_region(addr, size);
+        }
+        self.remove_pending_shaders();
+    }
+
     /// Unmarks a memory region as cached and marks it for removal.
     pub fn on_cache_invalidation(&mut self, addr: VAddr, size: usize) {
         // Port of `ShaderCache::OnCacheInvalidation`.
@@ -676,6 +698,8 @@ impl ShaderCache {
         let addr_end = addr + size as u64;
         let data_ptr = (&*data as *const ShaderInfo).cast_mut();
         let entry = self.new_entry(addr, addr_end, data_ptr);
+        // Lichii Register (shader_cache.cpp:383).
+        self.page_filter.mark(addr, size as u64);
 
         let page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
         for page in (addr >> YUZU_PAGEBITS)..page_end {
@@ -1197,6 +1221,28 @@ mod tests {
             .invalidation_cache
             .values()
             .any(|entries| !entries.is_empty()));
+    }
+
+    #[test]
+    fn registered_shaders_and_rejections_mark_the_page_filter() {
+        let mut cache = ShaderCache::default();
+        assert!(!cache.page_filter.any(0x4000, 0x200));
+        cache.register(
+            Box::new(ShaderInfo { unique_hash: 0x1234, size_bytes: 0x1800 }),
+            0x4f00,
+            0x1800,
+        );
+        // Every page the shader spans is seen, the next one is not.
+        for page in [0x4000u64, 0x5000, 0x6000] {
+            assert!(cache.page_filter.any(page, 4), "page {page:#x}");
+        }
+        assert!(!cache.page_filter.any(0x7000, 0x1000));
+        cache.remember_rejection(0x9_0040, RejectedShaderException::Base(ShaderException::new("test")));
+        assert!(cache.page_filter.any(0x9_0000, 0x1000));
+        // invalidate_regions removes what invalidate_region would, under one lock.
+        cache.invalidate_regions(&[(0x1000, 0x10), (0x5000, 4), (0x9_0040, 1)]);
+        assert!(cache.try_get(0x4f00).is_none());
+        assert!(!cache.is_rejected(0x9_0040));
     }
 
     #[test]

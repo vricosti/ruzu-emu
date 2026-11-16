@@ -254,7 +254,11 @@ impl RendererBaseData {
         self.settings.screenshot_complete_callback = Some(Box::new(move |invert_y| {
             let _ = std::thread::Builder::new()
                 .name("Screenshot".to_owned())
-                .spawn(move || callback(invert_y));
+                .spawn(move || {
+                    // Created from the GPU thread, which pin_gpu_threads may have pinned.
+                    common::thread::set_current_thread_to_all_cores();
+                    callback(invert_y)
+                });
         }));
         self.settings.screenshot_framebuffer_layout = layout;
         self.settings.screenshot_layer_stack = layer_stack;

@@ -82,6 +82,10 @@ impl crate::fence_manager::FenceBase for Fence {
     fn wait_for_fence(&self) {
         self.lock().unwrap().wait();
     }
+
+    fn is_signaled(&self) -> bool {
+        self.lock().unwrap().is_signaled()
+    }
 }
 
 // ---------------------------------------------------------------------------

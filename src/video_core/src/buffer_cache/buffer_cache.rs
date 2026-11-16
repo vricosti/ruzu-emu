@@ -596,6 +596,67 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             .mark_region_as_cpu_modified(device_addr, size);
     }
 
+    /// `write_memory` with Lichii's two extra arguments. With
+    /// `keep_page_gpu_data`, when the written range's pages hold no
+    /// GPU-written data, the range is marked CPU-modified at once; with
+    /// `engine_write` too (the GPU's own engine writes: constant buffer data,
+    /// inline-to-memory uploads, whose bytes are already in guest memory) the
+    /// pages stay tracked (`mark_region_as_written_tracked`): untracking them
+    /// and tracking them again at the next upload changed their host
+    /// protection twice for writes no guest CPU access saw. Otherwise it is
+    /// `write_memory`.
+    ///
+    /// Lichii `BufferCache::WriteMemory(device_addr, size, keep_page_gpu_data,
+    /// engine_write)` (buffer_cache.h:241-270), absent from Eden; Rust has no
+    /// default arguments, so `write_memory` keeps Eden's two-argument form.
+    /// Not ported: `Nx2NoteListHostWrite`, `NoteUniformWrite`,
+    /// `ForgetEarlyLanded` and `MarkVertexBuffersStale` (command list copies,
+    /// uniform keeps, EDEN_NX2_READ_CHECK and repacked vertex buffers, absent
+    /// from ruzu), and its upload of the CPU's bytes on the scheduler's owner
+    /// when the pages do hold GPU-written data (buffer_cache.h:283-330), where
+    /// ruzu keeps its `write_memory` behaviour.
+    pub fn write_memory_with(
+        &mut self,
+        device_addr: VAddr,
+        size: u64,
+        keep_page_gpu_data: bool,
+        engine_write: bool,
+    ) {
+        if keep_page_gpu_data {
+            let page_begin = device_addr & !(DEVICE_PAGESIZE - 1);
+            let page_end = device_addr
+                .wrapping_add(size)
+                .wrapping_add(DEVICE_PAGESIZE - 1)
+                & !(DEVICE_PAGESIZE - 1);
+            if !self.is_region_gpu_modified(page_begin, page_end.wrapping_sub(page_begin) as usize)
+            {
+                if engine_write {
+                    self.memory_tracker
+                        .mark_region_as_written_tracked(device_addr, size);
+                } else {
+                    self.memory_tracker
+                        .mark_region_as_cpu_modified(device_addr, size);
+                }
+                return;
+            }
+        }
+        self.write_memory(device_addr, size);
+    }
+
+    /// Takes guest CPU writes out of the GPU-written ranges before they are
+    /// applied: a read download over them is cut, not landed.
+    ///
+    /// Lichii `BufferCache::ClaimCpuWrites` (buffer_cache.h:2165-2173),
+    /// absent from Eden.
+    pub fn claim_cpu_writes(&mut self, ranges: &[(u64, usize)]) {
+        for &(device_addr, size) in ranges {
+            if self.is_region_gpu_modified(device_addr, size) {
+                self.clear_replaced_download(device_addr, size as u64);
+                self.gpu_modified_ranges.subtract(device_addr, size);
+            }
+        }
+    }
+
     /// Notify the cache about a cached (deferred) CPU write.
     ///
     /// Upstream: `BufferCache<P>::CachedWriteMemory`
@@ -1909,6 +1970,8 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
             .subtract(cpu_dest_address, amount as usize);
         let has_new_downloads = !tmp_intervals.is_empty();
         for &(addr, sz) in &tmp_intervals {
+            // Lichii DMACopy (buffer_cache.h:1485).
+            crate::nx2::nx2_mark_gpu_written(addr, sz);
             self.gpu_modified_ranges.add(addr, sz as usize);
             // Lichii DMACopy (buffer_cache.h:1495).
             self.note_read_back_write(addr, sz);
@@ -3803,7 +3866,28 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         self.memory_tracker
             .mark_region_as_gpu_modified(device_addr, size as u64);
         self.gpu_modified_ranges.add(device_addr, size as usize);
+        // Lichii MarkWrittenBuffer (buffer_cache.h:3297).
+        crate::nx2::nx2_mark_gpu_written(device_addr, u64::from(size));
         self.queue_fence_download(device_addr, size as u64);
+    }
+
+    /// Whether constant buffer data written to `[device_addr, device_addr +
+    /// size)` needs buffer cache work (`write_memory`). Pages no upload ever
+    /// left CPU-modified, and no GPU write reached, hold nothing the cache
+    /// would change: uniform buffers streamed from guest memory read the new
+    /// data at their next bind, and a cached buffer over them uploads them
+    /// when it is next synchronized. Any thread, without the cache lock.
+    ///
+    /// Lichii `BufferCache::ConstantDataReachesBuffers`
+    /// (buffer_cache.h:1773-1795), absent from Eden. Its command list page
+    /// (`Nx2IsCommandListPage`, host copies of command lists the front reads)
+    /// and repacked vertex buffer (`AnyVertexRepacked`) terms have no ruzu
+    /// counterpart: ruzu neither copies command lists nor repacks vertex
+    /// buffers.
+    pub fn constant_data_reaches_buffers(&self, device_addr: VAddr, size: u64) -> bool {
+        self.memory_tracker
+            .is_region_ever_synchronized(device_addr, size)
+            || crate::nx2::nx2_may_be_gpu_written(device_addr, size)
     }
 
     /// Find or create a buffer covering `[device_addr, device_addr+size)`.
@@ -6528,6 +6612,80 @@ mod tests {
         assert!(cache.async_downloads.empty());
         assert!(cache.uncommitted_gpu_modified_ranges.empty());
         assert!(cache.committed_gpu_modified_ranges[0].empty());
+    }
+
+    #[test]
+    fn constant_data_reaches_buffers_only_where_the_cache_could_change_something() {
+        // Addresses no other test uses: the GPU-written page bitmap is
+        // process-wide (Lichii's is a global too).
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker,
+            TestBufferCacheRuntime::default(),
+        );
+        cache.set_gpu_memory(Box::new(IdentityGpuMemory));
+        // A buffer that was created but never synchronized: its pages are
+        // CPU-modified as created, write_memory would change nothing.
+        let id = cache.create_buffer(0xB_4001_0000, 0x1000, false);
+        assert!(!cache.constant_data_reaches_buffers(0xB_4001_0000, 0x100));
+        // A GPU write reaches them.
+        cache.mark_written_buffer(id, 0xB_4001_0800, 4, false);
+        assert!(cache.constant_data_reaches_buffers(0xB_4001_0800, 4));
+        // So does an upload (synchronize_buffer clears the CPU marks).
+        cache.memory_tracker.for_each_upload_range(0xB_4003_0000, 0x10, &mut |_, _| {});
+        assert!(cache.constant_data_reaches_buffers(0xB_4003_0000, 4));
+        // A DMA copy's GPU-modified destination, which the tracker never saw.
+        let src = 0xB_4004_0000;
+        let dst = 0xB_4005_0000;
+        let src_id = cache.create_buffer(src, 0x1000, false);
+        cache.create_buffer(dst, 0x1000, false);
+        cache.mark_written_buffer(src_id, src, 0x20, false);
+        assert!(!cache.constant_data_reaches_buffers(dst, 0x20));
+        assert!(cache.dma_copy(src, dst, 0x20));
+        assert!(cache.is_region_gpu_modified(dst, 0x20));
+        assert!(cache.constant_data_reaches_buffers(dst, 0x20));
+        // Elsewhere, nothing.
+        assert!(!cache.constant_data_reaches_buffers(0xB_4007_0000, 0x1000));
+    }
+
+    #[test]
+    fn constant_buffer_data_is_always_uploaded_again() {
+        // Addresses no other test uses: the GPU-written page bitmap is
+        // process-wide (Lichii's is a global too).
+        // Whatever constant_data_reaches_buffers answers, the written range is
+        // CPU-modified afterwards, so the next synchronize_buffer uploads it.
+        let tracker = DummyTracker;
+        let mut cache = BufferCache::<TestParams, DummyTracker>::new(
+            &tracker,
+            TestBufferCacheRuntime::default(),
+        );
+        cache.set_gpu_memory(Box::new(IdentityGpuMemory));
+        let address = 0xB_4011_0000;
+        cache.create_buffer(address, 0x2000, false);
+        // Never synchronized: skipped, and still CPU-modified as created.
+        assert!(!cache.constant_data_reaches_buffers(address + 0x10, 4));
+        assert!(cache.memory_tracker.is_region_cpu_modified(address + 0x10, 4));
+        // Synchronized: the write reaches the cache, which marks it again
+        // (keeping the page tracked, as no guest CPU access saw it).
+        cache.memory_tracker.for_each_upload_range(address, 0x2000, &mut |_, _| {});
+        assert!(!cache.memory_tracker.is_region_cpu_modified(address, 0x2000));
+        assert!(cache.constant_data_reaches_buffers(address + 0x10, 4));
+        cache.claim_cpu_writes(&[(address + 0x10, 4)]);
+        cache.write_memory_with(address + 0x10, 4, true, true);
+        assert!(cache.memory_tracker.is_region_cpu_modified(address + 0x10, 4));
+        let mut uploads = Vec::new();
+        cache
+            .memory_tracker
+            .for_each_upload_range(address, 0x2000, &mut |addr, size| uploads.push((addr, size)));
+        assert_eq!(uploads, [(address, 0x1000)]);
+        // On a page holding GPU-written data the write takes write_memory's
+        // path: the written bytes leave the GPU-modified ranges.
+        let id = cache.find_buffer(address, 0x2000, false);
+        cache.mark_written_buffer(id, address + 0x1000, 0x100, false);
+        cache.write_memory_with(address + 0x1080, 4, true, true);
+        assert!(cache.memory_tracker.is_region_cpu_modified(address + 0x1080, 4));
+        assert!(!cache.is_region_gpu_modified(address + 0x1080, 4));
+        assert!(cache.is_region_gpu_modified(address + 0x1000, 4));
     }
 
     #[test]

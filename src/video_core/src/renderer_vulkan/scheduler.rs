@@ -16,6 +16,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::command_pool::CommandPool;
+use super::fragment_barrier_state::FragmentBarrierState;
 use super::graphics_pipeline::GraphicsPipeline;
 use super::master_semaphore::MasterSemaphore;
 use super::query_cache::{QueryRuntimeState, SamplesQueryState, TfbCounterState};
@@ -271,6 +272,19 @@ pub struct Scheduler {
     /// Upstream scheduler-local command-buffer state.
     state: SchedulerState,
     deferred_clear: DeferredClear,
+
+    /// Lichii `Scheduler::record_serial`: commands recorded.
+    record_serial: u64,
+    /// Lichii `Scheduler::submitted_serial`: `record_serial` at the last
+    /// Flush or Finish.
+    submitted_serial: u64,
+
+    /// Lichii `Scheduler::fragment_barrier` (vk_scheduler.h:498): a fragment
+    /// barrier deferred until a draw reads what the active pass wrote.
+    fragment_barrier: FragmentBarrierState,
+    /// Lichii `Scheduler::render_pass_has_stores` (vk_scheduler.h:499): a draw
+    /// of the active render pass writes storage memory or images.
+    render_pass_has_stores: bool,
 
     /// Port of upstream render-pass attachment tracking fields.
     num_renderpass_images: usize,
@@ -723,6 +737,10 @@ impl Scheduler {
             current_chunk: CommandChunk::new(),
             state: SchedulerState::default(),
             deferred_clear: DeferredClear::default(),
+            record_serial: 0,
+            submitted_serial: 0,
+            fragment_barrier: FragmentBarrierState::default(),
+            render_pass_has_stores: false,
             num_renderpass_images: 0,
             renderpass_images: [vk::Image::null(); NUM_RT + 1],
             renderpass_image_ranges: [vk::ImageSubresourceRange::default(); NUM_RT + 1],
@@ -798,6 +816,7 @@ impl Scheduler {
         cmd: impl FnOnce(vk::CommandBuffer, vk::CommandBuffer) + Send + 'static,
     ) {
         crate::gpu_split::check_owner("Scheduler::Record");
+        self.record_serial = self.record_serial.wrapping_add(1);
         let command = match self.current_chunk.record(cmd) {
             Ok(()) => return,
             Err(command) => command,
@@ -1031,11 +1050,35 @@ impl Scheduler {
         self.end_render_pass();
     }
 
+    /// Lichii `Scheduler::DeferFragmentBarrier` (vk_scheduler.h:141-143).
+    pub fn defer_fragment_barrier(&mut self) {
+        let render_pass_active = self.state.renderpass != vk::RenderPass::null();
+        self.fragment_barrier.defer(render_pass_active);
+    }
+
+    /// Lichii `Scheduler::HasFragmentBarrier` (vk_scheduler.h:145-147).
+    pub fn has_fragment_barrier(&self) -> bool {
+        self.fragment_barrier.pending()
+    }
+
+    /// Lichii `Scheduler::NoteRenderPassStores` (vk_scheduler.h:149-151).
+    pub fn note_render_pass_stores(&mut self) {
+        self.render_pass_has_stores = true;
+    }
+
+    /// Lichii `Scheduler::RenderPassHasStores` (vk_scheduler.h:153-155).
+    pub fn render_pass_has_stores(&self) -> bool {
+        self.render_pass_has_stores
+    }
+
     fn end_render_pass(&mut self) {
         self.realize_deferred_clear();
         if self.state.renderpass == vk::RenderPass::null() {
             return;
         }
+        // Lichii `Scheduler::EndRenderPass` (vk_scheduler.cpp:993-994).
+        self.fragment_barrier.reset();
+        self.render_pass_has_stores = false;
 
         trace!("Scheduler: ending render pass");
         // Preserve upstream `Scheduler::EndRenderPass` ordering without
@@ -1262,6 +1305,7 @@ impl Scheduler {
         crate::gpu_split::check_owner("Scheduler::Flush");
         let tick = self.submit_execution(signal_semaphore, wait_semaphore);
         self.allocate_new_context();
+        self.submitted_serial = self.record_serial;
         debug!("Scheduler: flushed at tick {}", tick);
         tick
     }
@@ -1314,6 +1358,16 @@ impl Scheduler {
         self.submit_execution(signal_semaphore, wait_semaphore);
         self.wait(presubmit_tick);
         self.allocate_new_context();
+        self.submitted_serial = self.record_serial;
+    }
+
+    /// Lichii `Scheduler::RecordedSinceSubmit` (vk_scheduler.h:240-245):
+    /// whether anything was recorded since the last Flush or Finish, or waits
+    /// to be (a deferred clear reaches the command buffer only at the next
+    /// record or submit). Lichii also counts its batched uploads
+    /// (`uploads_pending`); ruzu records uploads immediately, so it has none.
+    pub fn recorded_since_submit(&self) -> bool {
+        self.record_serial != self.submitted_serial || self.deferred_clear.framebuffer.is_some()
     }
 
     /// Get the current tick value.

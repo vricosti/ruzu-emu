@@ -428,10 +428,7 @@ impl ShaderCache {
         cache.context_factory = context_factory.clone();
         if cache.use_asynchronous_shaders {
             if let Some(factory) = context_factory {
-                let worker_count = std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .max(2)
-                    - 1;
+                let worker_count = common::thread::hardware_concurrency().max(2) - 1;
                 cache.workers = Some(StatefulThreadWorker::new(
                     worker_count,
                     "GlShaderBuilder".to_string(),
@@ -546,10 +543,7 @@ impl ShaderCache {
                 .context_factory
                 .clone()
                 .expect("OpenGL shader loading requires the renderer's shared-context factory");
-            let worker_count = std::thread::available_parallelism()
-                .map_or(1, usize::from)
-                .max(2)
-                - 1;
+            let worker_count = common::thread::hardware_concurrency().max(2) - 1;
             self.workers = Some(StatefulThreadWorker::new(
                 worker_count,
                 "GlShaderBuilder".to_string(),

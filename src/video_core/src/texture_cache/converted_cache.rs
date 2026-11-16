@@ -163,6 +163,8 @@ fn open_store() -> Option<Store> {
     std::thread::Builder::new()
         .name("TextureConvCache".into())
         .spawn(move || {
+            // Opened lazily from a GPU thread, which pin_gpu_threads may have pinned.
+            common::thread::set_current_thread_to_all_cores();
             while let Ok((key, bytes)) = receiver.recv() {
                 if data_append.write_all(&bytes).is_err() {
                     continue;

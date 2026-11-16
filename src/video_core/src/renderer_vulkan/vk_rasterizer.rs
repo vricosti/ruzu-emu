@@ -35,6 +35,17 @@ use ash::vk::Handle;
 static MESH_DRAW_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// `Core::DEVICE_PAGESIZE` as a device address quantity.
+const DEVICE_PAGESIZE_U64: u64 = ruzu_core::device_memory_manager::DEVICE_PAGESIZE as u64;
+
+/// Lichii `EDEN_NX2_INLINE_DEFER` (vk_rasterizer.cpp:3926-3930), read once:
+/// on unless set to a value starting with '0'. Inline-to-memory writes leave
+/// their cache invalidations to the next `flush_caching`.
+static INLINE_DEFER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var_os("EDEN_NX2_INLINE_DEFER")
+        .is_none_or(|value| value.as_encoded_bytes().first() != Some(&b'0'))
+});
+
 /// Ruzu extension (no upstream counterpart): choose the mesh draw path for
 /// the session being started.
 ///
@@ -921,8 +932,12 @@ pub struct RasterizerVulkan {
     render_pass_cache: Box<RenderPassCache>,
     wfi_event: vk::Event,
 
-    // Upstream FlushWork checks every eighth operation and flushes at 4096.
+    // Counts operations for `flush_work` (Lichii `SubmissionPolicy::Advance`).
     draw_counter: u32,
+    /// Lichii `RasterizerVulkan::pending_native_work` (vk_rasterizer.h:383):
+    /// a native-tiling draw, clear or dispatch was recorded since the last
+    /// submission, so `flush_commands` submits even with `draw_counter == 0`.
+    pending_native_work: bool,
     /// Monotonic draw sequence used only by env-gated diagnostics.
     draw_sequence: u64,
     /// Draws dropped because pipeline compilation failed (diagnostic).
@@ -1140,17 +1155,6 @@ mod owner_reference_tests {
 }
 
 impl RasterizerVulkan {
-    /// Low-bit mask used by upstream to check every eighth operation.
-    #[cfg(not(target_os = "android"))]
-    const DISPATCH_THRESHOLD: u32 = 7;
-    #[cfg(target_os = "android")]
-    const DISPATCH_THRESHOLD: u32 = 3;
-    /// Hard flush threshold â€” full GPU submit every N draws.
-    #[cfg(not(target_os = "android"))]
-    const FLUSH_THRESHOLD: u32 = 4096;
-    #[cfg(target_os = "android")]
-    const FLUSH_THRESHOLD: u32 = 512;
-
     /// Create a new RasterizerVulkan.
     ///
     /// Takes Vulkan handles from the VulkanPresenter so they share the same
@@ -1419,6 +1423,7 @@ impl RasterizerVulkan {
             fence_backend: VkFenceBackend::new(fence_wait_handle),
             wfi_event,
             draw_counter: 0,
+            pending_native_work: false,
             draw_sequence: 0,
             draw_skipped_pipeline: 0,
             mesh_arenas: Vec::new(),
@@ -2304,18 +2309,75 @@ impl RasterizerVulkan {
         }
     }
 
+    /// Port of Lichii `RasterizerVulkan::FlushWork` (vk_rasterizer.cpp:4125-4170),
+    /// a Lichii extension of Eden's: native-tiling (NX2) titles submit every
+    /// `submission_policy::DEFAULT_NATIVE_BUDGET` (128) operations and dispatch
+    /// every 32; other titles dispatch every 32 (Eden: 8) and submit at 4096
+    /// (128 on MoltenVK). `EDEN_NX2_FLUSH_DRAWS` overrides either budget, read
+    /// once. The `state_tracker` invalidation after a submission is ruzu's, kept
+    /// from the Eden-shaped body this replaces.
     fn flush_work(&mut self) {
-        self.draw_counter = self.draw_counter.wrapping_add(1);
-        if self.draw_counter & Self::DISPATCH_THRESHOLD != Self::DISPATCH_THRESHOLD {
-            return;
+        use super::submission_policy::{self, Action};
+        #[cfg(target_os = "android")]
+        const ANDROID: bool = true;
+        #[cfg(not(target_os = "android"))]
+        const ANDROID: bool = false;
+        // Lichii `gpu_memory->UsesNativeTiling()`: the bound channel's manager.
+        let native = self
+            .channel_memory_manager_handle
+            .is_some_and(|memory| unsafe { memory.as_ref().uses_native_tiling() });
+        let mut budget = submission_policy::DEFAULT_NATIVE_BUDGET;
+        if native && !ANDROID {
+            static CONFIGURED_BUDGET: std::sync::LazyLock<Option<u32>> =
+                std::sync::LazyLock::new(|| {
+                    let value = std::env::var("EDEN_NX2_FLUSH_DRAWS").ok()?;
+                    let parsed = submission_policy::parse_budget(&value);
+                    if parsed.is_none() {
+                        warn!(
+                            "Invalid EDEN_NX2_FLUSH_DRAWS; expected an integer from 1 to {}",
+                            u32::MAX
+                        );
+                    }
+                    parsed
+                });
+            budget = CONFIGURED_BUDGET.unwrap_or(submission_policy::DEFAULT_NATIVE_BUDGET);
         }
-        if self.draw_counter < Self::FLUSH_THRESHOLD {
-            self.scheduler.dispatch_work();
-            return;
+        let mut legacy_budget = 4096;
+        if !native && !ANDROID {
+            // Lichii: `std::max(32L, std::strtol(value, nullptr, 10)) & ~31L`,
+            // truncated to u32; 0 when the variable is unset.
+            static FORCED_DRAWS: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+                std::env::var("EDEN_NX2_FLUSH_DRAWS")
+                    .map(|value| {
+                        let value = std::ffi::CString::new(value).unwrap_or_default();
+                        // SAFETY: `value` is NUL-terminated; a null end pointer is allowed.
+                        let parsed =
+                            unsafe { libc::strtol(value.as_ptr(), std::ptr::null_mut(), 10) };
+                        (parsed.max(32) & !31) as u32
+                    })
+                    .unwrap_or(0)
+            });
+            legacy_budget = if *FORCED_DRAWS != 0 {
+                *FORCED_DRAWS
+            } else if self.device.get().is_molten_vk() {
+                128
+            } else {
+                4096
+            };
         }
-        self.scheduler.flush();
-        self.draw_counter = 0;
-        self.state_tracker.invalidate_command_buffer_state();
+        match submission_policy::advance(&mut self.draw_counter, native, ANDROID, budget, legacy_budget)
+        {
+            Action::None => {}
+            Action::Dispatch => self.scheduler.dispatch_work(),
+            Action::Flush => {
+                self.scheduler.flush();
+                self.state_tracker.invalidate_command_buffer_state();
+                self.pending_native_work = false;
+            }
+        }
+        if native && !ANDROID {
+            self.pending_native_work = true;
+        }
     }
 
     /// Submit and wait for all GPU work to complete.
@@ -2366,24 +2428,36 @@ impl RasterizerVulkan {
         flushes
     }
 
-    fn pop_async_flushes(&mut self, committed: u8) {
-        if committed & crate::fence_manager::TEXTURE_FLUSHES != 0 {
+    /// The cache pops of Lichii `FenceManager::ReleaseThreadFunc`
+    /// (fence_manager.h:313-332): the fence thread pops a whole burst of
+    /// fences' texture flushes under one texture-cache lock, then their buffer
+    /// flushes under one buffer-cache lock (never both locks at once), then
+    /// each fence's query flushes. A single fence passes
+    /// `AsyncFlushPops::for_fence`, Eden's per-fence order.
+    fn pop_async_flushes(&mut self, pops: crate::fence_manager::AsyncFlushPops) {
+        if pops.texture_pops != 0 {
             unsafe {
                 let cache: *mut TextureCache = &mut *self.texture_cache;
                 let mutex: *const _ = &(*cache).base.mutex;
                 let _guard = (*mutex).lock();
-                (*cache).pop_async_flushes();
+                for _ in 0..pops.texture_pops {
+                    (*cache).pop_async_flushes();
+                }
             }
         }
-        if committed & crate::fence_manager::BUFFER_FLUSHES != 0 {
+        if pops.buffer_pops != 0 {
             unsafe {
                 let cache: *mut VulkanCommonBufferCache = &mut *self.common_buffer_cache;
                 let mutex: *const _ = &(*cache).mutex;
                 let _guard = (*mutex).lock();
-                (*cache).pop_async_flushes();
+                for _ in 0..pops.buffer_pops {
+                    (*cache).pop_async_flushes();
+                }
             }
         }
-        self.query_cache.pop_async_flushes();
+        for _ in 0..pops.query_pops {
+            self.query_cache.pop_async_flushes();
+        }
     }
 
     fn commit_async_flushes(&mut self) -> bool {
@@ -4241,7 +4315,7 @@ impl RasterizerInterface for RasterizerVulkan {
             move |fence| unsafe { (*this).queue_fence(fence) },
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
-            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move |pops| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(pops) },
             move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
@@ -4269,7 +4343,7 @@ impl RasterizerInterface for RasterizerVulkan {
             move |fence| unsafe { (*this).queue_fence(fence) },
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
-            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move |pops| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(pops) },
             move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
@@ -4286,7 +4360,7 @@ impl RasterizerInterface for RasterizerVulkan {
             move |fence| unsafe { (*this).queue_fence(fence) },
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
-            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move |pops| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(pops) },
             move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
@@ -4306,7 +4380,7 @@ impl RasterizerInterface for RasterizerVulkan {
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
             move |fence| unsafe { (*this).wait_fence(fence) },
-            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move |pops| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(pops) },
             move || unsafe { (*this).commit_cache_flushes() },
             move || unsafe { (*this).commit_async_flushes() },
             move || unsafe { (*this).flush_commands() },
@@ -4504,33 +4578,15 @@ impl RasterizerInterface for RasterizerVulkan {
         }
     }
 
+    /// Lichii `RasterizerVulkan::InnerInvalidation` (vk_rasterizer.cpp:2873-2875).
     fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
-        // This override bypasses RasterizerInterface's default implementation,
-        // so it must honor the same opt-in invalidation setting explicitly.
-        if *common::settings::values()
-            .skip_cpu_inner_invalidation
-            .get_value()
-        {
-            return;
-        }
-        unsafe {
-            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            let _texture_guard = (*texture_mutex).lock();
-            for &(addr, size) in sequences {
-                self.texture_cache.base.write_memory(addr, size);
-            }
-        }
-        unsafe {
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            let _buffer_guard = (*buffer_mutex).lock();
-            for &(addr, size) in sequences {
-                self.common_buffer_cache.write_memory(addr, size as u64);
-            }
-        }
-        for &(addr, size) in sequences {
-            self.query_cache.invalidate_region(addr, size);
-            self.shader_cache.invalidate_region(addr, size);
-        }
+        self.invalidate_cached_writes(sequences, false);
+    }
+
+    /// Lichii `RasterizerVulkan::InvalidateConstantBufferData`
+    /// (vk_rasterizer.cpp:2877-2880), absent from Eden.
+    fn invalidate_constant_buffer_data(&mut self, sequences: &[(u64, usize)]) {
+        self.invalidate_cached_writes(sequences, true);
     }
 
     fn on_cache_invalidation(&mut self, addr: u64, size: u64) {
@@ -4667,31 +4723,49 @@ impl RasterizerInterface for RasterizerVulkan {
         self.fence_manager.signal_ordering(
             move || unsafe { (*this).should_wait_async_flushes() },
             move |fence| unsafe { (*this).is_fence_signaled(fence) },
-            move |committed| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(committed) },
+            move |pops| unsafe { (*(this_for_pop as *mut Self)).pop_async_flushes(pops) },
             move || unsafe { (*this).accumulate_flushes() },
         );
     }
 
+    /// Port of Lichii `RasterizerVulkan::FragmentBarrier` (vk_rasterizer.cpp:3156-3160).
+    /// Lichii extension: Eden ends the active render pass here; Lichii defers
+    /// the barrier, and `GraphicsPipeline::configure` ends the pass (whose end
+    /// records the attachment write barrier) only before a draw that samples
+    /// one of its render targets or when the pass has stores.
     fn fragment_barrier(&mut self) {
-        // Upstream `RasterizerVulkan::FragmentBarrier` ends the active render
-        // pass. `Scheduler::request_outside_render_pass_operation_context` emits the attachment
-        // write barrier needed before a later texture read.
-        self.scheduler
-            .request_outside_render_pass_operation_context();
+        // The next draw breaks the render pass only if it reads what this one wrote (#161):
+        // Lichii measured ~5,900 render passes a second ended here on the NX2 title it tuned.
+        self.scheduler.defer_fragment_barrier();
     }
 
     fn tiled_cache_barrier(&mut self) {}
 
+    /// Port of Lichii `RasterizerVulkan::FlushCommands` (vk_rasterizer.cpp:3166-3185).
+    /// Lichii extensions over Eden: `pending_native_work` keeps a native draw
+    /// recorded after a budget submission from being left unsubmitted, and a
+    /// submission with nothing recorded since the last one is skipped (port of
+    /// Fritchii EXP61, Lichii 8e5259aa7b). Lichii's `Scheduler::CountSkippedFlush`
+    /// only feeds its GPU-profile scheduler report, which ruzu does not have, and
+    /// its `Scheduler::DeferFlush` (`EDEN_NX2_FENCE_FLUSH_US`) is not ported.
     fn flush_commands(&mut self) {
-        if self.draw_counter == 0 {
+        if self.draw_counter == 0 && !self.pending_native_work {
             return;
         }
         self.draw_counter = 0;
+        self.pending_native_work = false;
+        // A fence with a download is submitted by InnerFence::Queue, and SignalFence then
+        // comes here with nothing recorded since (Lichii: ~4,600 empty submits a second).
+        if !self.scheduler.recorded_since_submit() {
+            return;
+        }
         self.scheduler.flush();
     }
 
     fn tick_frame(&mut self) {
         self.draw_counter = 0;
+        // Lichii `RasterizerVulkan::TickFrame` (vk_rasterizer.cpp:3821-3822).
+        self.pending_native_work = false;
         // Upstream `RasterizerVulkan::TickFrame` rotates both descriptor
         // queues to the next per-frame payload slice before anything else
         // (vk_rasterizer.cpp:765-766). Without this the ring never advances
@@ -4818,11 +4892,11 @@ impl RasterizerInterface for RasterizerVulkan {
             return;
         }
 
-        let Some(mm) = self.channel_memory_manager.as_ref().cloned() else {
+        let Some(mm_owner) = self.channel_memory_manager.as_ref().cloned() else {
             return;
         };
 
-        let mm = mm.lock();
+        let mm = mm_owner.lock();
         let cpu_addr = mm.gpu_to_cpu_address(address);
         // SAFETY: upstream accepts a span whose backing allocation is required
         // to contain copy_size bytes and forwards memory.data() plus copy_size
@@ -4838,16 +4912,46 @@ impl RasterizerInterface for RasterizerVulkan {
         drop(mm);
 
         let cpu_addr = cpu_addr.unwrap();
-        unsafe {
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            let _buffer_guard = (*buffer_mutex).lock();
-            if !self
-                .common_buffer_cache
-                .inline_memory(cpu_addr, copy_size, input)
-            {
-                self.common_buffer_cache
-                    .write_memory(cpu_addr, copy_size as u64);
+        // Lichii AccelerateInlineToMemory (vk_rasterizer.cpp:3926-3990), an
+        // extension of Eden's (vk_rasterizer.cpp:930-950).
+        // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
+        let defer = *INLINE_DEFER;
+        // One cache at a time. InlineMemory uploads only into GPU-written
+        // buffer data. Every range the buffer cache records as GPU-written
+        // marks its pages in G_NX2_GPU_WRITTEN_PAGES first, under its lock, on
+        // this thread, and the bits never clear. So when no written page has
+        // that mark the locked section changes nothing, and the write skips
+        // the lock (jpkto/Lichii 7a5e5357cb).
+        let mut uploaded = false;
+        let page_begin = cpu_addr & !(DEVICE_PAGESIZE_U64 - 1);
+        let page_end = (cpu_addr + copy_size as u64 + DEVICE_PAGESIZE_U64 - 1)
+            & !(DEVICE_PAGESIZE_U64 - 1);
+        let lock_free = defer
+            && crate::nx2::G_NX2_AMPERE.load(std::sync::atomic::Ordering::Relaxed)
+            && !crate::nx2::nx2_may_be_gpu_written(page_begin, page_end - page_begin);
+        if !lock_free {
+            unsafe {
+                let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+                let _buffer_guard = (*buffer_mutex).lock();
+                uploaded = self
+                    .common_buffer_cache
+                    .inline_memory(cpu_addr, copy_size, input);
+                if !uploaded && !defer {
+                    self.common_buffer_cache
+                        .write_memory(cpu_addr, copy_size as u64);
+                }
             }
+        }
+        // Pending query results must not land over the new words later: drop
+        // them now.
+        self.query_cache.invalidate_region(cpu_addr, copy_size);
+        if !uploaded && defer {
+            // Guest memory is written; the buffer, texture and shader caches
+            // see the merged ranges at the next flush_caching, which runs
+            // before anything of theirs is used. Writes into GPU-written
+            // buffer data were uploaded in place above, as before.
+            mm_owner.lock().accumulate_invalidation(address, copy_size);
+            return;
         }
         unsafe {
             let texture_mutex: *const _ = &self.texture_cache.base.mutex;
@@ -4855,11 +4959,78 @@ impl RasterizerInterface for RasterizerVulkan {
             self.texture_cache.base.write_memory(cpu_addr, copy_size);
         }
         self.shader_cache.invalidate_region(cpu_addr, copy_size);
-        self.query_cache.invalidate_region(cpu_addr, copy_size);
     }
 
     fn has_draw_transform_feedback(&self) -> bool {
         self.transform_feedback_draw_supported
+    }
+}
+
+impl RasterizerVulkan {
+    /// Lichii `RasterizerVulkan::InvalidateCachedWrites`
+    /// (vk_rasterizer.cpp:2882-2935, an extension of Eden's InnerInvalidation,
+    /// vk_rasterizer.cpp:748-767). The GPU's own cached writes (constant
+    /// buffer data, every draw): most land where no image, query or shader was
+    /// ever registered, which each cache's page_filter tells without its
+    /// locks; the shader cache takes them all under one lock. Constant buffer
+    /// data reaches the buffer cache only where
+    /// `constant_data_reaches_buffers` says it can change something.
+    ///
+    fn invalidate_cached_writes(&mut self, sequences: &[(u64, usize)], constant_buffer_data: bool) {
+        let any = |filter: &crate::page_filter::PageFilter| {
+            sequences.iter().any(|&(addr, size)| filter.any(addr, size as u64))
+        };
+        // Even with skip_cpu_inner_invalidation: engines writing images in
+        // software (DMA pitch to block linear copies of decoded video frames)
+        // reach the texture cache only through here.
+        if any(&self.texture_cache.base.page_filter) {
+            unsafe {
+                let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+                let _texture_guard = (*texture_mutex).lock();
+                for &(addr, size) in sequences {
+                    self.texture_cache.base.write_memory(addr, size);
+                }
+            }
+        }
+        if *common::settings::values()
+            .skip_cpu_inner_invalidation
+            .get_value()
+        {
+            return;
+        }
+        // Constant buffer data only streamed uniform buffers read needs no
+        // buffer cache work: those pages stay CPU-modified.
+        let reaches_buffers = |cache: &VulkanCommonBufferCache, &(addr, size): &(u64, usize)| {
+            !constant_buffer_data || cache.constant_data_reaches_buffers(addr, size as u64)
+        };
+        if sequences
+            .iter()
+            .any(|range| reaches_buffers(&self.common_buffer_cache, range))
+        {
+            unsafe {
+                let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+                let _buffer_guard = (*buffer_mutex).lock();
+                let applied: SmallVec<[(u64, usize); 16]> = sequences
+                    .iter()
+                    .copied()
+                    .filter(|range| reaches_buffers(&self.common_buffer_cache, range))
+                    .collect();
+                // As OnCacheInvalidations: out of the GPU-written ranges first.
+                self.common_buffer_cache.claim_cpu_writes(&applied);
+                for &(addr, size) in &applied {
+                    self.common_buffer_cache
+                        .write_memory_with(addr, size as u64, true, true);
+                }
+            }
+        }
+        if any(self.query_cache.page_filter()) {
+            for &(addr, size) in sequences {
+                self.query_cache.invalidate_region(addr, size);
+            }
+        }
+        if any(&self.shader_cache.page_filter) {
+            self.shader_cache.invalidate_regions(sequences);
+        }
     }
 }
 

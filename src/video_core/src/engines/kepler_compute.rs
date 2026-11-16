@@ -293,7 +293,7 @@ pub struct KeplerCompute {
     native_bind_pointer: u32,
     native_mme_dumped: bool,
     front_macros: bool,
-    front: Option<Arc<Mutex<FrontState>>>,
+    front: Option<Arc<crate::gpu_split::FrontOwned<FrontState>>>,
     regs: Box<[u32; KEPLER_COMPUTE_REG_COUNT]>,
     interface_state: EngineInterfaceState,
     memory_manager: Arc<Mutex<MemoryManager>>,
@@ -451,10 +451,12 @@ impl KeplerCompute {
     /// The caller must be its sole command producer, with no engine references
     /// alive across this call. Cache the returned frontend allocation: subsequent
     /// dispatch must borrow that allocation, never the concurrently running back.
+    #[cold]
+    #[inline(never)]
     pub(crate) unsafe fn front(
         engine: *mut Self,
         split: &crate::gpu_split::GpuSplitFrontend,
-    ) -> Arc<Mutex<FrontState>> {
+    ) -> Arc<crate::gpu_split::FrontOwned<FrontState>> {
         // Upstream checks front before draining. We always drain on acquiring a
         // handle so even that field is never read through a concurrent &mut Self.
         split.drain();
@@ -473,7 +475,7 @@ impl KeplerCompute {
                 native_data_ram: engine.native_data_ram.clone(),
             };
             engine.native_executing_macro = None;
-            engine.front = Some(Arc::new(Mutex::new(state)));
+            engine.front = Some(Arc::new(crate::gpu_split::FrontOwned::new(state)));
             engine.front_macros = true;
         }
         engine.front.as_ref().unwrap().clone()
@@ -592,6 +594,9 @@ impl KeplerCompute {
         split.multi_method(engine, method, words, amount, methods_pending, segment, crate::gpu_split::Writes::Anywhere);
     }
 
+    // Out of line: its local data RAM copy must not size the stack frame of
+    // every front method call (front_call_method), probed page by page.
+    #[inline(never)]
     fn front_run_macro(
         fs: &mut FrontState, engine: EngineHandle,
         split: &crate::gpu_split::GpuSplitFrontend,
@@ -2043,7 +2048,7 @@ mod tests {
             // The engine allocation stays alive and unborrowed until stop joins.
             split.start_back(|| {});
             {
-                let mut fs = front.lock();
+                let mut fs = unsafe { front.get(&split) };
                 KeplerCompute::front_call_method(&mut fs, handle, &split, 0x45, 0, true, None);
                 let code = [
                     front_instruction(&[(10, 5, 31), (20, 5, 25), (30, 16, 0x27),
@@ -2168,7 +2173,7 @@ mod tests {
         let (go, wait) = std::sync::mpsc::channel();
         split.start_back(move || { let _ = wait.recv(); });
         {
-            let mut fs = front.lock();
+            let mut fs = unsafe { front.get(&split) };
             KeplerCompute::front_call_method(&mut fs, handle, &split, 0x201, 81, true, None);
             KeplerCompute::front_call_method(&mut fs, handle, &split, 0xe00, 0, true, None);
             assert_eq!(fs.registers[0x202], 81);
@@ -2213,7 +2218,7 @@ mod tests {
         let handle = EngineHandle::from_ref(&*engine);
         let split = crate::gpu_split::GpuSplitFrontend::new(true);
         let front = unsafe { KeplerCompute::front(&mut *engine, &split) };
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         KeplerCompute::front_call_method(&mut fs, handle, &split, 0xe00, 0, true, None);
         assert!(fs.parameters.is_empty());
         assert_eq!(fs.executing_macro, None);
@@ -2245,7 +2250,7 @@ mod tests {
         assert!(engine.native_parameters.is_empty());
         assert_eq!(engine.native_executing_macro, None);
         {
-            let mut fs = front.lock();
+            let mut fs = unsafe { front.get(&split) };
             assert_eq!(fs.parameters.as_ptr(), allocation);
             assert_eq!(fs.parameters, [11, 19]);
             assert_eq!(fs.executing_macro, Some(0xe00));
@@ -2257,7 +2262,7 @@ mod tests {
         }
         let again = unsafe { KeplerCompute::front(&mut *engine, &split) };
         assert!(Arc::ptr_eq(&front, &again));
-        assert_eq!(again.lock().registers[0x200], 23);
+        assert_eq!(unsafe { again.get(&split) }.registers[0x200], 23);
     }
 
     #[test]
@@ -2275,7 +2280,7 @@ mod tests {
         engine.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
         let split = crate::gpu_split::GpuSplitFrontend::new(true);
         let front = unsafe { KeplerCompute::front(&mut *engine, &split) };
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         // Before compute's first pointer upload, code is shared with graphics.
         KeplerCompute::front_apply(&mut fs, 0x46, 0xa);
         for (method, value) in [(0x45, 2), (0x46, 0xb), (0x47, 127), (0x48, 9), (0x48, 99)] {
@@ -2311,7 +2316,7 @@ mod tests {
         engine.set_native_macro_mode(Some(owner.clone()), None);
         let split = crate::gpu_split::GpuSplitFrontend::new(true);
         let front = unsafe { KeplerCompute::front(&mut *engine, &split) };
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         for (method, value) in [(0x45, 3), (0x46, 0x123), (0x47, 7), (0x48, 15)] {
             KeplerCompute::front_apply(&mut fs, method, value);
         }

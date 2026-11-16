@@ -34,7 +34,7 @@ fn front_macro_dma_drains_flushes_buffer_cache_and_extends_live_fifo() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         let code = [
             front_test_instruction(Some(0x154), Some(0), false),
             front_test_instruction(Some(0x155), Some(0x4000), false),
@@ -103,7 +103,7 @@ fn front_fifo_dma_macro_runs_on_back_until_front_takes_its_registers() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         let code = [
             front_test_instruction(Some(0x154), Some(0), false),
             front_test_instruction(Some(0x155), Some(0x4000), false),
@@ -162,7 +162,7 @@ fn back_writable_excludes_registers_the_front_tracks() {
     engine.set_native_turing_macro_mode(true);
     let split = crate::gpu_split::GpuSplitFrontend::new(true);
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
-    let fs = front.lock();
+    let fs = unsafe { front.get(&split) };
     for method in [CB_CONFIG_BASE, CB_CONFIG_BASE + 3, REPORT_SEMAPHORE_BASE,
         REPORT_SEMAPHORE_BASE + 3, UPLOAD_REGS_BASE as u32, LAUNCH_DMA - 1,
         LOAD_MME_START_ADDR_PTR, SHADOW_SCRATCH_BASE, LOGIC_OP, 0x157, DRAW_END,
@@ -192,7 +192,7 @@ fn front_macro_worker_failure_propagates_through_jit_without_aborting() {
     split.start_back(|| std::panic::panic_any(0xdeadu32));
     let failure = split.stop().err().expect("worker should report registration failure");
     assert_eq!(failure.downcast_ref::<u32>(), Some(&0xdead));
-    let mut fs = front.lock();
+    let mut fs = unsafe { front.get(&split) };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Maxwell3D::front_call_method(&mut fs, handle, &split, MACRO_REGISTERS_START, 7, true);
     }));
@@ -222,7 +222,7 @@ fn front_macro_completion_flushes_pending_instances_once_in_order() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         Maxwell3D::front_call_method(&mut fs, handle, &split, MACRO_REGISTERS_START, 7, false);
         assert_eq!(fs.parameters, [7]);
         assert_eq!(fs.regs[0x123], 0);
@@ -257,7 +257,7 @@ fn front_multi_methods_match_shadow_transitions_cb_and_packed_index_state() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         for (method, words) in [
             (0x123, vec![3, 7]),
             (SHADOW_RAM_CONTROL, vec![2, 3, 0]),
@@ -280,7 +280,7 @@ fn front_multi_methods_match_shadow_transitions_cb_and_packed_index_state() {
     split.drain();
     split.stop().unwrap();
     engine.consume_sink();
-    let fs = front.lock();
+    let fs = unsafe { front.get(&split) };
     assert_eq!(fs.regs.as_ref(), engine.regs.as_ref());
     assert_eq!(fs.shadow.as_ref(), engine.shadow_state.as_ref());
     assert_eq!(fs.control, engine.shadow_state[SHADOW_RAM_CONTROL as usize]);
@@ -305,7 +305,7 @@ fn front_verify_includes_pending_sink_without_executing_it() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         fs.skip_same = false;
         Maxwell3D::front_write(&mut fs, handle, &split, 0x123, 99, true, false);
         fs.regs[0x123] = u32::MAX;
@@ -338,7 +338,7 @@ fn front_takeover_consumes_sink_and_preserves_local_macro_state() {
     assert!(engine.macro_params.is_empty());
     assert_eq!(engine.executing_macro, 0);
     {
-        let fs = front.lock();
+        let fs = unsafe { front.get(&split) };
         assert_eq!(fs.regs[0x123], 19);
         assert_eq!(fs.shadow[0x123], 19);
         assert_eq!(fs.parameters, [3, 5]);
@@ -372,7 +372,7 @@ fn front_writes_match_backend_shadow_replay_and_do_not_repeat_uploads() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         fs.skip_same = true;
         for (index, (method, value)) in [
             (0x123, 7),
@@ -392,7 +392,7 @@ fn front_writes_match_backend_shadow_replay_and_do_not_repeat_uploads() {
     split.drain();
     split.stop().unwrap();
     engine.consume_sink();
-    let fs = front.lock();
+    let fs = unsafe { front.get(&split) };
     assert_eq!(fs.regs.as_ref(), engine.regs.as_ref());
     assert_eq!(fs.shadow.as_ref(), engine.shadow_state.as_ref());
     assert_eq!(fs.regs[0x123], 13);
@@ -415,7 +415,7 @@ fn front_write_tracks_draw_side_effects_and_wraps_cb_offset() {
     let handle = EngineHandle::from_ref(&*engine);
     let split = crate::gpu_split::GpuSplitFrontend::new(true);
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
-    let mut fs = front.lock();
+    let mut fs = unsafe { front.get(&split) };
     fs.draw_pending = false;
     for (method, value) in [
         (0x123, 9), (LOAD_MME_INSTRUCTION_PTR, 0),
@@ -439,6 +439,62 @@ fn front_write_tracks_draw_side_effects_and_wraps_cb_offset() {
     std::thread::spawn(move || {
         assert!(owner.try_lock().is_some(), "frontend retained the macro context lock");
     }).join().unwrap();
+}
+
+// Lichii FrontSkipsLoopWrite/FrontTrackInstanceLoop (maxwell_3d.cpp:2114-2154):
+// a same-value vertex_buffer.first/count, or draw.end inside an instance loop,
+// stays on the front unless state writes wait in the back's method sink.
+#[test]
+fn front_skips_same_value_loop_writes_only_with_empty_sink() {
+    let mut engine = Box::new(Maxwell3D::default());
+    engine.set_native_turing_macro_mode(true);
+    let handle = EngineHandle::from_ref(&*engine);
+    let split = crate::gpu_split::GpuSplitFrontend::new(true);
+    let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
+    let fs = unsafe { front.get(&split) };
+    assert!(fs.skip_same, "EDEN_NX2_SKIP_SAME and EDEN_NX2_SPLIT_SKIP default on");
+    let sent = |fs: &mut FrontState, method: u32, value: u32, from_macro: bool| {
+        let before = split.position();
+        Maxwell3D::front_write(fs, handle, &split, method, value, true, from_macro);
+        split.position() != before
+    };
+    assert!(sent(fs, VB_COUNT, 6, false), "a changed value is sent");
+    assert!(!fs.sink_pending);
+    assert!(!sent(fs, VB_COUNT, 6, false), "same value, empty sink");
+    assert!(!sent(fs, VB_FIRST, fs.regs[VB_FIRST as usize], true));
+    // A state write waits in the back's sink: the next executable method
+    // consumes it there, so it is sent even with the same value.
+    assert!(sent(fs, 0x123, 7, false));
+    assert!(fs.sink_pending);
+    assert!(sent(fs, VB_COUNT, 6, false));
+    assert!(!fs.sink_pending);
+    // Direct (macro) writes consume the sink first.
+    assert!(sent(fs, 0x124, 7, false));
+    assert!(sent(fs, 0x125, 7, true));
+    assert!(!fs.sink_pending);
+    assert!(!sent(fs, VB_COUNT, 6, true));
+    // draw.end outside an instance loop always draws.
+    assert!(!fs.instance_loop);
+    assert!(sent(fs, DRAW_END, 0, false));
+    assert!(sent(fs, DRAW_END, 0, false));
+    // draw.begin with instance id Subsequent (bits 27:26 = 1) enters the
+    // loop: a same-value draw.end does nothing on the back.
+    assert!(sent(fs, DRAW_BEGIN, 1 << 26, false));
+    assert!(fs.instance_loop);
+    assert!(!sent(fs, DRAW_END, 0, false));
+    assert!(sent(fs, DRAW_END, 1, false), "a changed value is sent");
+    // Inline indexes leave the loop (DrawMode::InlineIndex: draw.end draws).
+    assert!(sent(fs, DRAW_INLINE_INDEX, 0x0302_0100, false));
+    assert!(!fs.instance_loop);
+    assert!(sent(fs, DRAW_END, 1, false));
+    // So does draw.begin with instance id First, also within a multi method.
+    assert!(sent(fs, DRAW_BEGIN, 1 << 26, false));
+    assert!(fs.instance_loop);
+    Maxwell3D::front_call_multi_method(fs, handle, &split, DRAW_BEGIN, &[1 << 26, 0], 2, 2);
+    assert!(!fs.instance_loop);
+    // A replay writes the shadow RAM's entry, compared like any value.
+    assert!(sent(fs, SHADOW_RAM_CONTROL, ShadowRamControl::Replay as u32, false));
+    assert!(!sent(fs, VB_COUNT, 99, false), "replays the tracked 6");
 }
 
 #[test]
@@ -3829,6 +3885,72 @@ fn test_process_cb_multi_data_writes_through_memory_manager() {
         &[0, 0x7f, 1, 0xff, 0x80, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0]
     );
     assert_eq!(*writes.lock().unwrap(), 0);
+}
+
+#[test]
+fn bound_constant_buffer_translation_follows_selection_and_memory_map() {
+    // Lichii WriteBoundConstantBuffer: the selected buffer is translated once
+    // per CB_ADDRESS/CB_SIZE selection and memory map; writes past its end and
+    // buffers that are not one device range take the general path.
+    let mut engine = Maxwell3D::new();
+    let device_memory =
+        Arc::new(crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default());
+    let backing = vec![0u8; 0x3000];
+    device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+    device_memory.smmu_map_with_cpu_backing(
+        0x9000_0000,
+        backing.as_ptr(),
+        0x4000,
+        backing.len(),
+        1,
+        true,
+    );
+    let memory_manager = Arc::new(parking_lot::Mutex::new(
+        crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+            1,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        ),
+    ));
+    memory_manager
+        .lock()
+        .map(0x10000, 0x9000_0000, 0x1000, 0, false);
+    engine.set_memory_manager(Arc::clone(&memory_manager));
+
+    engine.call_method(CB_CONFIG_BASE, 0x10, true);
+    engine.call_method(CB_CONFIG_BASE + 1, 0, true);
+    engine.call_method(CB_CONFIG_BASE + 2, 0x10000, true);
+    engine.call_method(CB_CONFIG_BASE + 3, 0, true);
+    engine.process_cb_multi_data(&[0x0102_0304]);
+    assert_eq!(engine.bound_constant_buffer.device, 0x9000_0000);
+    assert_eq!(&backing[..4], &[4, 3, 2, 1]);
+
+    // The same device memory mapped at the buffer's address again: a new
+    // memory map, translated again.
+    memory_manager.lock().unmap(0x10000, 0x1000);
+    memory_manager
+        .lock()
+        .map(0x10000, 0x9000_2000, 0x1000, 0, false);
+    engine.process_cb_multi_data(&[0x0506_0708]);
+    assert_eq!(engine.bound_constant_buffer.device, 0x9000_2000);
+    assert_eq!(&backing[0x2004..0x2008], &[8, 7, 6, 5]);
+    assert_eq!(&backing[4..8], &[0; 4]);
+
+    // Past CB_SIZE: the general path, which writes as Eden does.
+    engine.call_method(CB_CONFIG_BASE + 3, 0xc, true);
+    engine.process_cb_multi_data(&[0x1111_1111, 0x2222_2222]);
+    assert_eq!(&backing[0x200c..0x2014], &[0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22]);
+
+    // A buffer reaching unmapped memory is not one device range.
+    engine.call_method(CB_CONFIG_BASE, 0x2000, true);
+    engine.call_method(CB_CONFIG_BASE + 3, 0, true);
+    engine.process_cb_multi_data(&[0x3333_3333]);
+    assert_eq!(engine.bound_constant_buffer.device, 0);
+    assert_eq!(&backing[0x2000..0x2004], &[0x33; 4]);
+    memory_manager.lock().flush_caching();
 }
 
 #[test]

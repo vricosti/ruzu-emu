@@ -230,8 +230,8 @@ struct DmaSyncState {
 // frontend allocation, not a reference into the concurrently mutated engine.
 enum FrontEngine {
     Backend,
-    Maxwell(Arc<Mutex<maxwell_3d::FrontState>>),
-    Kepler(Arc<Mutex<kepler_compute::FrontState>>),
+    Maxwell(Arc<crate::gpu_split::FrontOwned<maxwell_3d::FrontState>>),
+    Kepler(Arc<crate::gpu_split::FrontOwned<kepler_compute::FrontState>>),
 }
 
 #[derive(Clone, Copy)]
@@ -662,11 +662,28 @@ impl DmaPusher {
     // Mechanical equivalent of upstream's typed engine selection and Front().
     // Native-mode flags are initialized with the channel, before dispatch. Read
     // them once per binding, after draining; subsequent calls use only FrontState.
+    //
+    // Upstream Front() tests `front` inline and creates it under [[unlikely]].
+    // Rust keeps that split explicit: the per-method test stays inline and
+    // the creation is an out-of-line cold call, so the copies the engines'
+    // Front make (register banks, FrontState) never size this caller's stack
+    // frame (it was 0x23818 bytes, probed page by page at every method).
+    #[inline(always)]
     fn prepare_front_engine(&mut self, engine: EngineHandle,
         split: &crate::gpu_split::GpuSplitFrontend)
     {
         let index = self.dma_state.subchannel as usize;
         if !split.front_macros() || self.front_engines[index].is_some() { return; }
+        self.create_front_engine(engine, split);
+    }
+
+    /// The [[unlikely]] branch of upstream Front(), once per binding.
+    #[cold]
+    #[inline(never)]
+    fn create_front_engine(&mut self, engine: EngineHandle,
+        split: &crate::gpu_split::GpuSplitFrontend)
+    {
+        let index = self.dma_state.subchannel as usize;
         let kind = self.subchannel_type[index];
         self.front_engines[index] = Some(match kind {
             EngineTypes::Maxwell3D => {
@@ -713,13 +730,15 @@ impl DmaPusher {
             self.prepare_front_engine(subchannel, &split);
             let state = &self.dma_state;
             let segment = state.dma_get.wrapping_add(state.dma_word_offset);
+            // SAFETY (FrontOwned::get): one front call at a time on this, the
+            // split's front thread; front calls never re-enter DmaPusher.
             match if split.front_macros() { self.front_engines[state.subchannel as usize].as_ref() } else { None } {
                 Some(FrontEngine::Maxwell(front)) => {
-                    maxwell_3d::Maxwell3D::front_call_method(&mut front.lock(), subchannel,
+                    maxwell_3d::Maxwell3D::front_call_method(unsafe { front.get(&split) }, subchannel,
                         &split, state.method, argument, state.is_last_call);
                 }
                 Some(FrontEngine::Kepler(front)) => {
-                    kepler_compute::KeplerCompute::front_call_method(&mut front.lock(), subchannel,
+                    kepler_compute::KeplerCompute::front_call_method(unsafe { front.get(&split) }, subchannel,
                         &split, state.method, argument, state.is_last_call, Some(segment));
                 }
                 _ => split.method(subchannel, state.method, argument, state.is_last_call,
@@ -771,13 +790,15 @@ impl DmaPusher {
             self.prepare_front_engine(subchannel, &split);
             let state = &self.dma_state;
             let segment = state.dma_get.wrapping_add(state.dma_word_offset);
+            // SAFETY (FrontOwned::get): one front call at a time on this, the
+            // split's front thread; front calls never re-enter DmaPusher.
             match if split.front_macros() { self.front_engines[state.subchannel as usize].as_ref() } else { None } {
                 Some(FrontEngine::Maxwell(front)) => {
-                    maxwell_3d::Maxwell3D::front_call_multi_method(&mut front.lock(), subchannel,
+                    maxwell_3d::Maxwell3D::front_call_multi_method(unsafe { front.get(&split) }, subchannel,
                         &split, state.method, args, args.len() as u32, state.method_count);
                 }
                 Some(FrontEngine::Kepler(front)) => {
-                    kepler_compute::KeplerCompute::front_call_multi_method(&mut front.lock(), subchannel,
+                    kepler_compute::KeplerCompute::front_call_multi_method(unsafe { front.get(&split) }, subchannel,
                         &split, state.method, args, args.len() as u32, state.method_count, Some(segment));
                 }
                 _ => split.multi_method(subchannel, state.method, args, args.len() as u32,
@@ -1321,5 +1342,77 @@ mod tests {
 
         assert_eq!(dma.dma_pushbuffer.len(), 1);
         assert_eq!(dma.dma_pushbuffer_subindex, 7);
+    }
+
+    /// Off-emulator micro-benchmark of the split front's method path (no Vulkan, no title):
+    /// replays a synthetic command list through DmaPusher::process_commands with a native
+    /// Maxwell3D front, its back thread consuming. `cargo test --release -p video_core --lib
+    /// front_method_path_micro_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "x86_64")]
+    fn front_method_path_micro_benchmark() {
+        fn instruction(method: Option<u32>, end: bool) -> [u32; 3] {
+            let mut bits = u128::from(end);
+            for low in [15, 20, 25, 51, 56, 61] { bits |= 24u128 << low; }
+            if let Some(method) = method {
+                bits |= (method as u128) << 30;
+                bits |= 5u128 << 82;
+                bits |= 3u128 << 85;
+            }
+            [(bits >> 64) as u32, (bits >> 32) as u32, bits as u32]
+        }
+        let header = |mode: u32, method: u32, count: u32| CommandHeader {
+            raw: method | (count << 16) | (mode << 29) };
+        let gpu = Box::new(crate::gpu::Gpu::new(false, false));
+        let memory = Arc::new(Mutex::new(crate::memory_manager::MemoryManager::new(1)));
+        let context = Arc::new(parking_lot::ReentrantMutex::new(std::cell::RefCell::new(
+            crate::r#macro::NativeMacroContext::default())));
+        let mut graphics = Box::new(maxwell_3d::Maxwell3D::default());
+        graphics.set_native_macro_context(Some(context.clone()));
+        graphics.set_native_turing_macro_mode(true);
+        let mut dma = DmaPusher::new(&*gpu, SystemRef::null(), memory, std::ptr::null_mut());
+        dma.bind_subchannel_handle(EngineHandle::from_ref(&*graphics), 0, EngineTypes::Maxwell3D);
+        let split = crate::gpu_split::GpuSplitFrontend::new(true);
+        let scope = split.install();
+        split.start_back(|| {});
+        // Macro 0: emits its parameter to state register 0x210.
+        let code = [instruction(Some(0x210), true), instruction(None, false)].concat();
+        let mut upload = vec![header(1, 0x45, 1), CommandHeader { raw: 0 },
+            header(3, 0x46, code.len() as u32)];
+        upload.extend(code.iter().map(|&raw| CommandHeader { raw }));
+        dma.process_commands(&upload, 0);
+        // One frame-like batch: 16 state writes (half keep their value), the vertex buffer
+        // first/count (same values), 4 words of one state register (multi), a macro call.
+        let mut list = Vec::new();
+        let mut methods = 0u64;
+        for draw in 0..256u32 {
+            list.push(header(1, 0x200, 16));
+            for i in 0..16u32 { list.push(CommandHeader { raw: if i & 1 == 0 { draw } else { i } }); }
+            list.push(header(1, 0x35d, 2));
+            list.extend([CommandHeader { raw: 0 }, CommandHeader { raw: 3 }]);
+            list.push(header(3, 0x300, 4));
+            list.extend((0..4).map(|i| CommandHeader { raw: i }));
+            list.push(header(1, 0xe00, 1));
+            list.push(CommandHeader { raw: draw });
+            methods += 16 + 2 + 4 + 1;
+        }
+        dma.process_commands(&list, 0);
+        split.drain();
+        let iterations = 200u64;
+        let start_position = split.position();
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            dma.process_commands(&list, 0);
+        }
+        let elapsed = start.elapsed();
+        let words = split.position() - start_position;
+        split.drain();
+        split.stop().unwrap();
+        drop(scope);
+        let total = methods * iterations;
+        println!("front method path: {:.1} ns/method over {} methods, {:.2} ring words/method",
+            elapsed.as_nanos() as f64 / total as f64, total, words as f64 / total as f64);
+        assert_eq!(graphics.regs[0x210], 255);
     }
 }

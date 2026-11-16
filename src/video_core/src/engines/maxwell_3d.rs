@@ -2518,7 +2518,7 @@ pub struct Maxwell3D {
     macro_segments: Vec<(u64, u32)>,
     /// Whether the current macro has dirty memory.
     current_macro_dirty: bool,
-    front: Option<Arc<Mutex<FrontState>>>,
+    front: Option<Arc<crate::gpu_split::FrontOwned<FrontState>>>,
     front_macros: bool,
     back_control_writes: [ControlWrite; 16],
     back_control_count: u32,
@@ -2557,8 +2557,10 @@ impl Maxwell3D {
     /// The pointer must identify a stable, live channel engine owned by this
     /// split. No references to the engine may survive across the drain, and
     /// the caller must be the only command producer.
+    #[cold]
+    #[inline(never)]
     pub(crate) unsafe fn front(engine: *mut Self, split: &crate::gpu_split::GpuSplitFrontend)
-        -> Arc<Mutex<FrontState>>
+        -> Arc<crate::gpu_split::FrontOwned<FrontState>>
     {
         split.drain();
         let engine = unsafe { &mut *engine };
@@ -2612,7 +2614,7 @@ impl Maxwell3D {
                 back_escapes_seen: 0,
             };
             engine.executing_macro = 0;
-            engine.front = Some(Arc::new(Mutex::new(fs)));
+            engine.front = Some(Arc::new(crate::gpu_split::FrontOwned::new(fs)));
             engine.front_macros = true;
         }
         engine.front.as_ref().unwrap().clone()
@@ -2808,7 +2810,13 @@ impl Maxwell3D {
                     let guard = owner.lock();
                     let mut context = guard.borrow_mut();
                     let macro_engine = &mut context.engine;
-                    macro_engine.native_interpreter.active_dram = Some(ram_owner.clone());
+                    // Upstream stores the same pointer every call; the owning handle is
+                    // only replaced when it names another RAM (no reference count traffic).
+                    if !macro_engine.native_interpreter.active_dram.as_ref()
+                        .is_some_and(|ram| Arc::ptr_eq(ram, &ram_owner))
+                    {
+                        macro_engine.native_interpreter.active_dram = Some(ram_owner.clone());
+                    }
                     let jit = macro_engine.native_jit.get_or_insert_with(|| {
                         Arc::new(std::sync::Mutex::new(Default::default()))
                     }).clone();
@@ -2920,6 +2928,67 @@ impl Maxwell3D {
             return false;
         }
         if fs.back_macros[start_index].is_none() {
+            fs.back_macros[start_index] = Some(Self::front_back_macro_record(fs, start));
+        }
+        if !fs.back_macros[start_index].as_ref().unwrap().back {
+            return false;
+        }
+        if !fs.back_code_copied {
+            Self::front_copy_back_code(fs);
+        }
+        let back = fs.back_engine.as_mut().expect("front_copy_back_code creates the back engine");
+        let known = fs.back_macros[start_index].as_deref().unwrap();
+        let call = BackCall {
+            maxwell: fs.back.0,
+            engine: &mut **back,
+            record: known,
+            escapes: &*fs.back_escapes,
+        };
+        split.defer_words(move |parameters: &[u32]| {
+            // As ProcessMacro calls a macro, with the back's engine.
+            let call = call;
+            // SAFETY: see BackCall; the back owns the engine and Maxwell3D.
+            unsafe {
+                let maxwell = &mut *call.maxwell;
+                maxwell.consume_sink();
+                let record = &*call.record;
+                (*call.engine).split_writes = Some(record.write_set.clone());
+                let unexpected = (*call.engine).split_unexpected_writes;
+                let mut parameters = parameters.to_vec();
+                MacroEngine::execute_native(call.engine, call.maxwell, record.start,
+                    &mut parameters, |_: &mut [u32]| {});
+                if (*call.engine).split_unexpected_writes != unexpected {
+                    record.escaped.store(true, Ordering::Relaxed);
+                    (*call.escapes).fetch_add(1, Ordering::Release);
+                }
+            }
+        }, &fs.parameters);
+        let position = split.position();
+        fs.back_last = position;
+        let tracked = matches!(ShadowRamControl::from_raw(fs.control),
+            ShadowRamControl::Track | ShadowRamControl::TrackWithFilter);
+        let known = fs.back_macros[start_index].as_deref().unwrap();
+        for &written in &known.writes {
+            let written = written as usize;
+            fs.back_regs[written] = position;
+            if tracked {
+                fs.back_shadow[written] = position;
+            }
+            fs.back_owned[written] = true;
+        }
+        true
+    }
+
+    /// The first-call step of FrontRunOnBack for the macro at `start`: what
+    /// its code can do, and so whether it runs on the back. Upstream writes
+    /// it inline; Rust keeps it out of line and cold so its write-set array
+    /// does not size the stack frame of every front macro call
+    /// (front_run_macro), which the compiler probes page by page.
+    #[cold]
+    #[inline(never)]
+    fn front_back_macro_record(fs: &FrontState, start: u32) -> Box<BackMacro> {
+        use std::sync::atomic::Ordering;
+        {
             let effects = {
                 let guard = fs.macro_owner.lock();
                 let context = guard.borrow();
@@ -2967,70 +3036,35 @@ impl Maxwell3D {
                         } else { reason });
                 }
             }
-            fs.back_macros[start_index] = Some(Box::new(known));
+            Box::new(known)
         }
-        if !fs.back_macros[start_index].as_ref().unwrap().back {
-            return false;
-        }
+    }
+
+    /// The back_engine/back_code_copied step of FrontRunOnBack: the back's
+    /// macro engine, its code a copy of the front's. Out of line and cold for
+    /// the same reason as front_back_macro_record (the 0x3000-word code copy).
+    #[cold]
+    #[inline(never)]
+    fn front_copy_back_code(fs: &mut FrontState) {
         let back = fs.back_engine.get_or_insert_with(|| {
             let mut engine = MacroEngine::new(true);
             engine.native_turing = true;
             Box::new(engine)
         });
-        if !fs.back_code_copied {
-            // Nothing sent with the old code is left to run (waited for above).
-            let guard = fs.macro_owner.lock();
-            let context = guard.borrow();
-            back.native_code = context.engine.native_code;
-            back.native_code_generation = context.engine.native_code_generation;
-            fs.back_code_copied = true;
-        }
-        let known = fs.back_macros[start_index].as_deref().unwrap();
-        let call = BackCall {
-            maxwell: fs.back.0,
-            engine: &mut **back,
-            record: known,
-            escapes: &*fs.back_escapes,
-        };
-        split.defer_words(move |parameters: &[u32]| {
-            // As ProcessMacro calls a macro, with the back's engine.
-            let call = call;
-            // SAFETY: see BackCall; the back owns the engine and Maxwell3D.
-            unsafe {
-                let maxwell = &mut *call.maxwell;
-                maxwell.consume_sink();
-                let record = &*call.record;
-                (*call.engine).split_writes = Some(record.write_set.clone());
-                let unexpected = (*call.engine).split_unexpected_writes;
-                let mut parameters = parameters.to_vec();
-                MacroEngine::execute_native(call.engine, call.maxwell, record.start,
-                    &mut parameters, |_: &mut [u32]| {});
-                if (*call.engine).split_unexpected_writes != unexpected {
-                    record.escaped.store(true, Ordering::Relaxed);
-                    (*call.escapes).fetch_add(1, Ordering::Release);
-                }
-            }
-        }, &fs.parameters);
-        let position = split.position();
-        fs.back_last = position;
-        let tracked = matches!(ShadowRamControl::from_raw(fs.control),
-            ShadowRamControl::Track | ShadowRamControl::TrackWithFilter);
-        let known = fs.back_macros[start_index].as_deref().unwrap();
-        for &written in &known.writes {
-            let written = written as usize;
-            fs.back_regs[written] = position;
-            if tracked {
-                fs.back_shadow[written] = position;
-            }
-            fs.back_owned[written] = true;
-        }
-        true
+        // Nothing sent with the old code is left to run (waited for above).
+        let guard = fs.macro_owner.lock();
+        let context = guard.borrow();
+        back.native_code = context.engine.native_code;
+        back.native_code_generation = context.engine.native_code_generation;
+        fs.back_code_copied = true;
     }
 
     /// The take_escapes step of FrontRunOnBack: a macro the back ran wrote
     /// another register, so the front's copies may be stale anywhere. It runs
     /// on the front from now on, and the front takes the back's registers
     /// (FrontVerify).
+    #[cold]
+    #[inline(never)]
     fn front_take_escapes(fs: &mut FrontState, split: &crate::gpu_split::GpuSplitFrontend) {
         use std::sync::atomic::Ordering;
         fs.back_escapes_seen = fs.back_escapes.load(Ordering::Acquire);
@@ -3285,6 +3319,10 @@ impl Maxwell3D {
         }
     }
 
+    // Diagnostic (EDEN_NX2_SPLIT_VERIFY): out of line and cold, as upstream's
+    // [[unlikely]] call site; it must not size the front macro call's frame.
+    #[cold]
+    #[inline(never)]
     fn front_verify(fs: &mut FrontState, split: &crate::gpu_split::GpuSplitFrontend) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CHECKS: AtomicU64 = AtomicU64::new(0);

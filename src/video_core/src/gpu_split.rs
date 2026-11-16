@@ -265,6 +265,35 @@ pub(crate) enum Writes {
     Noted,
 }
 
+/// Rust adaptation of the engines' `std::unique_ptr<FrontState> front`
+/// (Lichii maxwell_3d.h / kepler_compute.h): the front's copy of an engine's
+/// state, which upstream reads and writes without a lock because only the
+/// split's front thread touches it. ruzu shares the allocation between the
+/// engine (so a rebinding finds it again) and the DmaPusher's per-subchannel
+/// cache, hence the Arc; a Mutex there cost two locked instructions on every
+/// method the front handled.
+pub(crate) struct FrontOwned<T>(UnsafeCell<T>);
+// SAFETY: the value is only reached through `get`, whose caller proves with a
+// GpuSplitFrontend (an Rc, so !Send, installed on the front thread only) that
+// it runs on the split's front thread; the value itself is Send.
+unsafe impl<T: Send> Send for FrontOwned<T> {}
+unsafe impl<T: Send> Sync for FrontOwned<T> {}
+impl<T> FrontOwned<T> {
+    pub(crate) fn new(value: T) -> Self { Self(UnsafeCell::new(value)) }
+
+    /// The front's state, for the duration of one front call.
+    ///
+    /// # Safety
+    /// No other reference returned by `get` for this value may be alive: the
+    /// front calls (FrontCallMethod, FrontCallMultiMethod) take it once at
+    /// their start and never re-enter one another for the same engine.
+    #[allow(clippy::mut_from_ref)]
+    #[inline(always)]
+    pub(crate) unsafe fn get(&self, _front_thread: &GpuSplitFrontend) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
 /// Port of gpu_split.cpp ForEachDeviceRange: calls `func(device_address,
 /// size)` for each mapped piece of [address, address + size) within one 4 KiB
 /// GPU page; nothing is read or written where no device memory is mapped.

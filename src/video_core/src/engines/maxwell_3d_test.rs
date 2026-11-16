@@ -34,7 +34,7 @@ fn front_macro_dma_drains_flushes_buffer_cache_and_extends_live_fifo() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         let code = [
             front_test_instruction(Some(0x154), Some(0), false),
             front_test_instruction(Some(0x155), Some(0x4000), false),
@@ -103,7 +103,7 @@ fn front_fifo_dma_macro_runs_on_back_until_front_takes_its_registers() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         let code = [
             front_test_instruction(Some(0x154), Some(0), false),
             front_test_instruction(Some(0x155), Some(0x4000), false),
@@ -162,7 +162,7 @@ fn back_writable_excludes_registers_the_front_tracks() {
     engine.set_native_turing_macro_mode(true);
     let split = crate::gpu_split::GpuSplitFrontend::new(true);
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
-    let fs = front.lock();
+    let fs = unsafe { front.get(&split) };
     for method in [CB_CONFIG_BASE, CB_CONFIG_BASE + 3, REPORT_SEMAPHORE_BASE,
         REPORT_SEMAPHORE_BASE + 3, UPLOAD_REGS_BASE as u32, LAUNCH_DMA - 1,
         LOAD_MME_START_ADDR_PTR, SHADOW_SCRATCH_BASE, LOGIC_OP, 0x157, DRAW_END,
@@ -192,7 +192,7 @@ fn front_macro_worker_failure_propagates_through_jit_without_aborting() {
     split.start_back(|| std::panic::panic_any(0xdeadu32));
     let failure = split.stop().err().expect("worker should report registration failure");
     assert_eq!(failure.downcast_ref::<u32>(), Some(&0xdead));
-    let mut fs = front.lock();
+    let mut fs = unsafe { front.get(&split) };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Maxwell3D::front_call_method(&mut fs, handle, &split, MACRO_REGISTERS_START, 7, true);
     }));
@@ -222,7 +222,7 @@ fn front_macro_completion_flushes_pending_instances_once_in_order() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         Maxwell3D::front_call_method(&mut fs, handle, &split, MACRO_REGISTERS_START, 7, false);
         assert_eq!(fs.parameters, [7]);
         assert_eq!(fs.regs[0x123], 0);
@@ -257,7 +257,7 @@ fn front_multi_methods_match_shadow_transitions_cb_and_packed_index_state() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         for (method, words) in [
             (0x123, vec![3, 7]),
             (SHADOW_RAM_CONTROL, vec![2, 3, 0]),
@@ -280,7 +280,7 @@ fn front_multi_methods_match_shadow_transitions_cb_and_packed_index_state() {
     split.drain();
     split.stop().unwrap();
     engine.consume_sink();
-    let fs = front.lock();
+    let fs = unsafe { front.get(&split) };
     assert_eq!(fs.regs.as_ref(), engine.regs.as_ref());
     assert_eq!(fs.shadow.as_ref(), engine.shadow_state.as_ref());
     assert_eq!(fs.control, engine.shadow_state[SHADOW_RAM_CONTROL as usize]);
@@ -305,7 +305,7 @@ fn front_verify_includes_pending_sink_without_executing_it() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         fs.skip_same = false;
         Maxwell3D::front_write(&mut fs, handle, &split, 0x123, 99, true, false);
         fs.regs[0x123] = u32::MAX;
@@ -338,7 +338,7 @@ fn front_takeover_consumes_sink_and_preserves_local_macro_state() {
     assert!(engine.macro_params.is_empty());
     assert_eq!(engine.executing_macro, 0);
     {
-        let fs = front.lock();
+        let fs = unsafe { front.get(&split) };
         assert_eq!(fs.regs[0x123], 19);
         assert_eq!(fs.shadow[0x123], 19);
         assert_eq!(fs.parameters, [3, 5]);
@@ -372,7 +372,7 @@ fn front_writes_match_backend_shadow_replay_and_do_not_repeat_uploads() {
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
     split.start_back(|| {});
     {
-        let mut fs = front.lock();
+        let mut fs = unsafe { front.get(&split) };
         fs.skip_same = true;
         for (index, (method, value)) in [
             (0x123, 7),
@@ -392,7 +392,7 @@ fn front_writes_match_backend_shadow_replay_and_do_not_repeat_uploads() {
     split.drain();
     split.stop().unwrap();
     engine.consume_sink();
-    let fs = front.lock();
+    let fs = unsafe { front.get(&split) };
     assert_eq!(fs.regs.as_ref(), engine.regs.as_ref());
     assert_eq!(fs.shadow.as_ref(), engine.shadow_state.as_ref());
     assert_eq!(fs.regs[0x123], 13);
@@ -415,7 +415,7 @@ fn front_write_tracks_draw_side_effects_and_wraps_cb_offset() {
     let handle = EngineHandle::from_ref(&*engine);
     let split = crate::gpu_split::GpuSplitFrontend::new(true);
     let front = unsafe { Maxwell3D::front(&mut *engine, &split) };
-    let mut fs = front.lock();
+    let mut fs = unsafe { front.get(&split) };
     fs.draw_pending = false;
     for (method, value) in [
         (0x123, 9), (LOAD_MME_INSTRUCTION_PTR, 0),

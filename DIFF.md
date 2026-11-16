@@ -1,5 +1,30 @@
 # Upstream parity notes
 
+## 2026-11-16 — video_core/{dma_pusher,gpu_split,engines/{maxwell_3d,kepler_compute}}.rs vs Lichii video_core/{dma_pusher.cpp,gpu_split.{h,cpp},engines/{maxwell_3d,kepler_compute}.cpp}
+
+### Intentional differences (split front thread)
+- Front state ownership: Lichii keeps `std::unique_ptr<FrontState> front` in the engine and
+  reads it without a lock (only the split's front thread touches it). ruzu shares the allocation
+  between the engine and `DmaPusher::front_engines` (`Arc`), and now wraps it in
+  `gpu_split::FrontOwned` (an `UnsafeCell` whose `get` takes the front-thread-only
+  `GpuSplitFrontend` as proof) instead of a `parking_lot::Mutex`: the mutex cost two locked
+  instructions on every method the front handled.
+- Stack frames: upstream `Front()` tests `front` inline and creates it under `[[unlikely]]`.
+  Rust inlined the creation (register bank copies, the compute engine's 16 KiB register array)
+  into `DmaPusher::prepare_front_engine`, called for every method: its frame was 0x23818 bytes,
+  probed page by page (35 stores) before the early return, 14.3 % of the front thread. The
+  creation is now `DmaPusher::create_front_engine` (`#[cold]`, `#[inline(never)]`), and
+  `Maxwell3D::front` / `KeplerCompute::front` are `#[cold]`, `#[inline(never)]`. Likewise
+  `Maxwell3D::front_run_macro`'s frame (0x10938 bytes, 16 pages probed per macro call) came from
+  the first-call and code-copy steps of FrontRunOnBack, now the Rust-only cold helpers
+  `front_back_macro_record` and `front_copy_back_code` (the write-set array and the 0x3000-word
+  macro code copy), plus `front_verify` / `front_take_escapes` (`#[cold]`); and
+  `KeplerCompute::front_run_macro` (`#[inline(never)]`) no longer sizes
+  `KeplerCompute::front_call_method`'s frame (6 pages). Behavior and call order are unchanged.
+- `Maxwell3D::front_run_macro` replaces the macro engine's `active_dram` handle only when it
+  names another data RAM (upstream stores the same pointer every call; Rust's `Arc` store was a
+  reference count increment and decrement per macro).
+
 ## 2026-11-15 — video_core/{query_dma,macro,engines/maxwell_3d,rasterizer_interface,query_cache/query_cache_base,renderer_vulkan/{query_cache,vk_rasterizer}}.rs vs Lichii video_core/{query_dma.h,macro.cpp,engines/maxwell_3d.cpp,rasterizer_interface.h,query_cache/query_cache_base.h,renderer_vulkan/vk_rasterizer.cpp}
 
 ### Ported (Lichii extensions, absent from Eden)

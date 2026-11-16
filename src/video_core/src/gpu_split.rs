@@ -683,6 +683,10 @@ impl GpuSplit {
                 common::thread::set_current_thread_name("GPUBack");
                 common::thread::set_current_thread_priority(common::thread::ThreadPriority::Critical);
                 common::thread::set_current_thread_to_performance_cores();
+                // Lichii gpu_split.cpp:649-651 (pin_gpu_threads).
+                if *common::settings::values().pin_gpu_threads.get_value() {
+                    common::thread::pin_current_thread(common::thread::PinnedRole::GpuBack);
+                }
                 register_host_thread();
                 #[cfg(windows)]
                 shared.back_thread_id.store(unsafe { owner_diagnostic::GetCurrentThreadId() }, Ordering::Relaxed);

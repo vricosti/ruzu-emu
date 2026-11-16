@@ -168,6 +168,160 @@ pub fn set_current_thread_name(name: &str) {
 /// same no-op branch.
 pub fn set_current_thread_to_performance_cores() {}
 
+/// Lichii `Common::PinnedRole` (common/thread.h:137).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PinnedRole {
+    GpuFront,
+    GpuBack,
+    GuestCore,
+}
+
+/// The CPUs of a sysfs CPU list file; empty when the file is missing.
+/// Lichii `ReadCpuList` (common/thread.cpp:556-571).
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+fn read_cpu_list(path: &str) -> libc::cpu_set_t {
+    // SAFETY: an all-zero cpu_set_t is the empty set (CPU_ZERO).
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return set;
+    };
+    // `file >> list`: the first whitespace-delimited word.
+    let Some(list) = contents.split_whitespace().next() else {
+        return set;
+    };
+    for cpu in crate::core_pinning::parse_cpu_list(list) {
+        if (cpu as usize) < libc::CPU_SETSIZE as usize {
+            // SAFETY: `cpu` is below CPU_SETSIZE.
+            unsafe { libc::CPU_SET(cpu as usize, &mut set) };
+        }
+    }
+    set
+}
+
+/// Lichii `LinuxProcessors` (common/thread.cpp:573-612): the logical
+/// processors this process may run on, with their physical core (package and
+/// core id) and, on hybrid CPUs, their relative capacity as the efficiency
+/// class.
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+fn linux_processors() -> Vec<crate::core_pinning::LogicalProcessor> {
+    let mut processors = Vec::new();
+    // SAFETY: an all-zero cpu_set_t is the empty set (CPU_ZERO).
+    let mut allowed: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `allowed` is a valid, writable cpu_set_t of the size passed.
+    if unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut allowed) }
+        != 0
+    {
+        return processors;
+    }
+    // Intel hybrid CPUs list their efficiency cores here (the cpu_atom PMU), also on kernels
+    // that don't report cpu_capacity on x86. Without it, all cores rank equal and a CPU with
+    // fewer than MIN_CORES_FOR_GPU_THREAD_PINNING performance cores would pass the check.
+    let efficiency = read_cpu_list("/sys/devices/cpu_atom/cpus");
+    let read = |cpu: usize, node: &str| -> Option<u32> {
+        let contents =
+            std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/{node}")).ok()?;
+        contents.split_whitespace().next()?.parse::<u32>().ok()
+    };
+    for cpu in 0..libc::CPU_SETSIZE as usize {
+        // SAFETY: `cpu` is below CPU_SETSIZE.
+        if !unsafe { libc::CPU_ISSET(cpu, &allowed) } {
+            continue;
+        }
+        let (Some(core), Some(package)) =
+            (read(cpu, "topology/core_id"), read(cpu, "topology/physical_package_id"))
+        else {
+            return Vec::new();
+        };
+        // cpu_capacity is 1024 for the fastest cores; absent on CPUs that are not hybrid, and
+        // often on x86 ones that are.
+        // SAFETY: `cpu` is below CPU_SETSIZE.
+        let in_efficiency = unsafe { libc::CPU_ISSET(cpu, &efficiency) };
+        let capacity = read(cpu, "cpu_capacity").unwrap_or(if in_efficiency { 512 } else { 1024 });
+        processors.push(crate::core_pinning::LogicalProcessor {
+            id: cpu as u32,
+            core: (package << 16) | core,
+            efficiency_class: (capacity.min(1024) >> 3) as u8,
+        });
+    }
+    processors
+}
+
+/// Lichii `SetCurrentThreadAffinity` (common/thread.cpp:614-624). A refused
+/// affinity is logged, never an error.
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+fn set_current_thread_affinity(cpus: &[u32]) {
+    // SAFETY: an all-zero cpu_set_t is the empty set (CPU_ZERO).
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for &cpu in cpus {
+        // SAFETY: the ids come from `linux_processors`, all below CPU_SETSIZE.
+        unsafe { libc::CPU_SET(cpu as usize, &mut set) };
+    }
+    // SAFETY: `set` is a valid cpu_set_t of the size passed, for the calling thread.
+    let error = unsafe {
+        libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set,
+        )
+    };
+    if error != 0 {
+        log::warn!("pthread_setaffinity_np failed: {}", std::io::Error::from_raw_os_error(error));
+    }
+}
+
+/// Lichii `Common::PinCurrentThread` (common/thread.cpp:731-787), behind the
+/// experimental `pin_gpu_threads` setting: the split GPU thread's front and
+/// back each get a physical performance core of their own and the guest cores
+/// keep off those two. The plan is made once, at the first call; skipped, with
+/// one log line, on CPUs with too few cores and on other hosts.
+///
+/// Divergence: Lichii also pins on Windows through its CPU-set helpers
+/// (`CpuSets`, `SelectCurrentThreadCpuSets`), which ruzu does not have (its
+/// `set_current_thread_to_performance_cores` is a no-op there), so Windows
+/// takes the unsupported-host branch.
+pub fn pin_current_thread(role: PinnedRole) {
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    {
+        use crate::core_pinning::{
+            plan_gpu_thread_pinning, GpuThreadPinning, MIN_CORES_FOR_GPU_THREAD_PINNING,
+        };
+        static PLAN: std::sync::LazyLock<GpuThreadPinning> = std::sync::LazyLock::new(|| {
+            let result = plan_gpu_thread_pinning(&linux_processors());
+            if result.front.is_empty() {
+                log::warn!(
+                    "GPU thread pinning skipped: {} physical performance cores, needs {}",
+                    result.performance_cores,
+                    MIN_CORES_FOR_GPU_THREAD_PINNING
+                );
+            } else {
+                log::info!(
+                    "GPU thread pinning: front and back on a physical core each, guest cores on \
+                     the other {} performance cores ({} logical processors)",
+                    result.performance_cores - 2,
+                    result.guest.len()
+                );
+            }
+            result
+        });
+        let cpus = match role {
+            PinnedRole::GpuFront => &PLAN.front,
+            PinnedRole::GpuBack => &PLAN.back,
+            PinnedRole::GuestCore => &PLAN.guest,
+        };
+        if !cpus.is_empty() {
+            set_current_thread_affinity(cpus);
+        }
+    }
+    #[cfg(not(all(target_os = "linux", not(target_os = "android"))))]
+    {
+        let _ = role;
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        // Lichii's message names Windows too; ruzu pins on Linux only (see above).
+        LOGGED.call_once(|| log::info!("GPU thread pinning is only supported on Linux"));
+    }
+}
+
 /// Port of upstream `Common::SetCurrentThreadToEfficiencyCores`.
 ///
 /// Eden only changes affinity in its Android implementation. Android JNI and

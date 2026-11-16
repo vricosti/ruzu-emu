@@ -229,6 +229,10 @@ impl ThreadManager {
                 set_current_thread_name("GPU");
                 set_current_thread_priority(ThreadPriority::Critical);
                 set_current_thread_to_performance_cores();
+                // Lichii gpu_thread.cpp:69-71 (pin_gpu_threads).
+                if *settings::values().pin_gpu_threads.get_value() {
+                    common::thread::pin_current_thread(common::thread::PinnedRole::GpuFront);
+                }
                 let _wake_on_failure = StopOnUnwind { state: &state, stop: &stop };
                 system.get().kernel().unwrap().register_host_thread();
                 let gpu_ref = unsafe { &*(gpu as *const crate::gpu::Gpu) };

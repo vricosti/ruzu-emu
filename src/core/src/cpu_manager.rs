@@ -2075,6 +2075,11 @@ impl CpuManager {
         };
         // Upstream: Common::SetCurrentThreadName(name.c_str());
         // Upstream: Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+        // Lichii core/cpu_manager.cpp:182-184 (pin_gpu_threads): the guest cores keep off
+        // the two cores the GPU threads are pinned to.
+        if *common::settings::values().pin_gpu_threads.get_value() {
+            common::thread::pin_current_thread(common::thread::PinnedRole::GuestCore);
+        }
         log::info!("CpuManager: {} starting", name);
 
         // Upstream: data.host_context = Common::Fiber::ThreadToFiber();

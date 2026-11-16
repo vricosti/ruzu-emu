@@ -1591,6 +1591,7 @@ mod tests {
             "gpu_unswizzle_stream_size",
             "gpu_unswizzle_chunk_size",
             "gpu_unswizzle_enabled",
+            "pin_gpu_threads",
             "gpu_astc_recompression",
             // Extras / Vulkan Extensions
             "dyna_state",

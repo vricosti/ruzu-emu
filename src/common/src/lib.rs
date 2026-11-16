@@ -7,6 +7,7 @@ pub mod bit_field;
 pub mod bit_set;
 pub mod bit_util;
 pub mod container_hash;
+pub mod core_pinning;
 pub mod div_ceil;
 pub mod elf;
 pub mod env_flag;

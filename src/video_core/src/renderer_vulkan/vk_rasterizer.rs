@@ -4504,52 +4504,15 @@ impl RasterizerInterface for RasterizerVulkan {
         }
     }
 
-    /// Lichii `RasterizerVulkan::InnerInvalidation` -> `InvalidateCachedWrites`
-    /// (vk_rasterizer.cpp:2872-2935, an extension of Eden's InnerInvalidation,
-    /// vk_rasterizer.cpp:748-767). The GPU's own cached writes (constant
-    /// buffer data, every draw): most land where no image, query or shader was
-    /// ever registered, which each cache's page_filter tells without its
-    /// locks; the shader cache takes them all under one lock. Lichii's
-    /// constant buffer data filter (`ConstantDataReachesBuffers`) belongs to
-    /// its uniform buffer keeps, which ruzu does not have: the buffer cache
-    /// sees every range, as in Eden.
+    /// Lichii `RasterizerVulkan::InnerInvalidation` (vk_rasterizer.cpp:2873-2875).
     fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
-        let any = |filter: &crate::page_filter::PageFilter| {
-            sequences.iter().any(|&(addr, size)| filter.any(addr, size as u64))
-        };
-        // Even with skip_cpu_inner_invalidation: engines writing images in
-        // software (DMA pitch to block linear copies of decoded video frames)
-        // reach the texture cache only through here.
-        if any(&self.texture_cache.base.page_filter) {
-            unsafe {
-                let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-                let _texture_guard = (*texture_mutex).lock();
-                for &(addr, size) in sequences {
-                    self.texture_cache.base.write_memory(addr, size);
-                }
-            }
-        }
-        if *common::settings::values()
-            .skip_cpu_inner_invalidation
-            .get_value()
-        {
-            return;
-        }
-        unsafe {
-            let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
-            let _buffer_guard = (*buffer_mutex).lock();
-            for &(addr, size) in sequences {
-                self.common_buffer_cache.write_memory(addr, size as u64);
-            }
-        }
-        if any(self.query_cache.page_filter()) {
-            for &(addr, size) in sequences {
-                self.query_cache.invalidate_region(addr, size);
-            }
-        }
-        if any(&self.shader_cache.page_filter) {
-            self.shader_cache.invalidate_regions(sequences);
-        }
+        self.invalidate_cached_writes(sequences, false);
+    }
+
+    /// Lichii `RasterizerVulkan::InvalidateConstantBufferData`
+    /// (vk_rasterizer.cpp:2877-2880), absent from Eden.
+    fn invalidate_constant_buffer_data(&mut self, sequences: &[(u64, usize)]) {
+        self.invalidate_cached_writes(sequences, true);
     }
 
     fn on_cache_invalidation(&mut self, addr: u64, size: u64) {
@@ -4879,6 +4842,74 @@ impl RasterizerInterface for RasterizerVulkan {
 
     fn has_draw_transform_feedback(&self) -> bool {
         self.transform_feedback_draw_supported
+    }
+}
+
+impl RasterizerVulkan {
+    /// Lichii `RasterizerVulkan::InvalidateCachedWrites`
+    /// (vk_rasterizer.cpp:2882-2935, an extension of Eden's InnerInvalidation,
+    /// vk_rasterizer.cpp:748-767). The GPU's own cached writes (constant
+    /// buffer data, every draw): most land where no image, query or shader was
+    /// ever registered, which each cache's page_filter tells without its
+    /// locks; the shader cache takes them all under one lock. Constant buffer
+    /// data reaches the buffer cache only where
+    /// `constant_data_reaches_buffers` says it can change something.
+    ///
+    fn invalidate_cached_writes(&mut self, sequences: &[(u64, usize)], constant_buffer_data: bool) {
+        let any = |filter: &crate::page_filter::PageFilter| {
+            sequences.iter().any(|&(addr, size)| filter.any(addr, size as u64))
+        };
+        // Even with skip_cpu_inner_invalidation: engines writing images in
+        // software (DMA pitch to block linear copies of decoded video frames)
+        // reach the texture cache only through here.
+        if any(&self.texture_cache.base.page_filter) {
+            unsafe {
+                let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+                let _texture_guard = (*texture_mutex).lock();
+                for &(addr, size) in sequences {
+                    self.texture_cache.base.write_memory(addr, size);
+                }
+            }
+        }
+        if *common::settings::values()
+            .skip_cpu_inner_invalidation
+            .get_value()
+        {
+            return;
+        }
+        // Constant buffer data only streamed uniform buffers read needs no
+        // buffer cache work: those pages stay CPU-modified.
+        let reaches_buffers = |cache: &VulkanCommonBufferCache, &(addr, size): &(u64, usize)| {
+            !constant_buffer_data || cache.constant_data_reaches_buffers(addr, size as u64)
+        };
+        if sequences
+            .iter()
+            .any(|range| reaches_buffers(&self.common_buffer_cache, range))
+        {
+            unsafe {
+                let buffer_mutex: *const _ = &self.common_buffer_cache.mutex;
+                let _buffer_guard = (*buffer_mutex).lock();
+                let applied: SmallVec<[(u64, usize); 16]> = sequences
+                    .iter()
+                    .copied()
+                    .filter(|range| reaches_buffers(&self.common_buffer_cache, range))
+                    .collect();
+                // As OnCacheInvalidations: out of the GPU-written ranges first.
+                self.common_buffer_cache.claim_cpu_writes(&applied);
+                for &(addr, size) in &applied {
+                    self.common_buffer_cache
+                        .write_memory_with(addr, size as u64, true, true);
+                }
+            }
+        }
+        if any(self.query_cache.page_filter()) {
+            for &(addr, size) in sequences {
+                self.query_cache.invalidate_region(addr, size);
+            }
+        }
+        if any(&self.shader_cache.page_filter) {
+            self.shader_cache.invalidate_regions(sequences);
+        }
     }
 }
 

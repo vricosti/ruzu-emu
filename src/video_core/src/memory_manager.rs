@@ -277,6 +277,11 @@ pub struct GpuMemoryManager {
     /// Upstream `page_stash2`: the device ranges `FlushCaching` hands to
     /// `RasterizerInterface::InnerInvalidation`, reused across calls.
     page_stash2: Vec<(u64, usize)>,
+    /// Lichii `constant_buffer_writes` (memory_manager.h): the device ranges
+    /// `write_constant_buffer_data` wrote since the last `flush_caching`,
+    /// merged when they touch, handed to
+    /// `RasterizerInterface::invalidate_constant_buffer_data`.
+    constant_buffer_writes: Vec<(u64, usize)>,
     /// When `Some`, rasterizer notifications (`modify_gpu_memory`,
     /// `unmap_memory`) are recorded here instead of being invoked inline, so
     /// the caller can replay them AFTER releasing the memory-manager mutex.
@@ -397,6 +402,7 @@ impl GpuMemoryManager {
             rasterizer: None,
             accumulator: InvalidationAccumulator::new(),
             page_stash2: Vec::new(),
+            constant_buffer_writes: Vec::new(),
             deferred_rasterizer_ops: None,
             map_serial: AtomicU64::new(0),
             runs_guard: parking_lot::Mutex::new(ContinuousRunsState::default()),
@@ -1475,6 +1481,53 @@ impl GpuMemoryManager {
         true
     }
 
+    /// Constant buffer data to device memory the caller translated.
+    /// `flush_caching` hands the written ranges, merged, to the rasterizer's
+    /// `invalidate_constant_buffer_data` instead of `inner_invalidation`.
+    ///
+    /// Lichii `MemoryManager::WriteConstantBufferData`
+    /// (memory_manager.cpp:643-667), absent from Eden. Lichii's unmapped
+    /// fallback `WriteKept` (sparse memory keeping) has no ruzu counterpart:
+    /// an unmapped page goes through `smmu_write_block_unsafe`, which logs it,
+    /// as ruzu's `write_block_unsafe` does.
+    pub fn write_constant_buffer_data(&mut self, device_addr: u64, data: &[u8]) {
+        let size = data.len();
+        if size == 0 {
+            return;
+        }
+        self.finish_reads_before(device_addr, size);
+        let end = device_addr + size as u64;
+        let mut address = device_addr;
+        let mut src = 0usize;
+        while address < end {
+            let amount = (end - address).min(DEVICE_PAGE_SIZE - (address & DEVICE_PAGE_MASK))
+                as usize;
+            let physical = self.device_memory.get_pointer_mut(address);
+            if !physical.is_null() {
+                // SAFETY: `get_pointer_mut` returned the host page holding
+                // `[address, address + amount)`, which stays within it.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr().add(src), physical, amount);
+                }
+            } else {
+                self.device_memory
+                    .smmu_write_block_unsafe(address, &data[src..src + amount]);
+            }
+            address += amount as u64;
+            src += amount;
+        }
+        if let Some((last, last_size)) = self.constant_buffer_writes.last_mut() {
+            let last_end = *last + *last_size as u64;
+            if device_addr <= last_end && *last <= end {
+                let merged_end = last_end.max(end);
+                *last = (*last).min(device_addr);
+                *last_size = (merged_end - *last) as usize;
+                return;
+            }
+        }
+        self.constant_buffer_writes.push((device_addr, size));
+    }
+
     /// Upstream-owned copy path using the stored `MaxwellDeviceMemoryManager`.
     pub fn copy_block(&mut self, gpu_dest: u64, gpu_src: u64, size: u64) -> bool {
         self.copy_block_with_cache_type(gpu_dest, gpu_src, size, CacheType::ALL)
@@ -2189,6 +2242,16 @@ impl GpuMemoryManager {
             page_stash2.clear();
         }
         self.page_stash2 = page_stash2;
+        // Lichii MemoryManager::FlushCaching (memory_manager.cpp:1097-1109):
+        // after the accumulator, the constant buffer data ranges.
+        if !self.constant_buffer_writes.is_empty() {
+            let constant_buffer_writes = std::mem::take(&mut self.constant_buffer_writes);
+            let _ = self.with_rasterizer_mut(|rasterizer| {
+                rasterizer.invalidate_constant_buffer_data(&constant_buffer_writes);
+            });
+            self.constant_buffer_writes = constant_buffer_writes;
+            self.constant_buffer_writes.clear();
+        }
     }
 
     /// Check if a GPU address is within the valid address range.
@@ -2660,6 +2723,11 @@ impl MemoryManager {
         self.inner.write_block_cached(gpu_dest, input)
     }
 
+    /// Lichii `MemoryManager::WriteConstantBufferData`.
+    pub fn write_constant_buffer_data(&mut self, device_addr: u64, data: &[u8]) {
+        self.inner.write_constant_buffer_data(device_addr, data);
+    }
+
     pub fn copy_block(&mut self, gpu_dest: u64, gpu_src: u64, size: u64) -> bool {
         self.inner.copy_block(gpu_dest, gpu_src, size)
     }
@@ -2878,6 +2946,7 @@ mod tests {
         invalidate_calls: Arc<Mutex<Vec<(u64, u64)>>>,
         invalidate_cache_types: Arc<Mutex<Vec<CacheType>>>,
         inner_invalidation_calls: Arc<Mutex<Vec<Vec<(u64, usize)>>>>,
+        constant_buffer_data_calls: Arc<Mutex<Vec<Vec<(u64, usize)>>>>,
         dirty_regions: Arc<Mutex<Vec<(u64, u64)>>>,
         must_flush_calls: Arc<Mutex<Vec<(u64, u64)>>>,
         must_flush_cache_types: Arc<Mutex<Vec<CacheType>>>,
@@ -2894,6 +2963,7 @@ mod tests {
                 invalidate_calls: Arc::new(Mutex::new(Vec::new())),
                 invalidate_cache_types: Arc::new(Mutex::new(Vec::new())),
                 inner_invalidation_calls: Arc::new(Mutex::new(Vec::new())),
+                constant_buffer_data_calls: Arc::new(Mutex::new(Vec::new())),
                 dirty_regions: Arc::new(Mutex::new(Vec::new())),
                 must_flush_calls: Arc::new(Mutex::new(Vec::new())),
                 must_flush_cache_types: Arc::new(Mutex::new(Vec::new())),
@@ -2974,6 +3044,12 @@ mod tests {
         }
         fn inner_invalidation(&mut self, sequences: &[(u64, usize)]) {
             self.inner_invalidation_calls
+                .lock()
+                .unwrap()
+                .push(sequences.to_vec());
+        }
+        fn invalidate_constant_buffer_data(&mut self, sequences: &[(u64, usize)]) {
+            self.constant_buffer_data_calls
                 .lock()
                 .unwrap()
                 .push(sequences.to_vec());
@@ -3583,6 +3659,60 @@ mod tests {
             &vec![(0x9300_0100, 0x20)]
         );
         assert!(mm.inner.page_stash2.is_empty());
+    }
+
+    #[test]
+    fn constant_buffer_data_is_written_merged_and_handed_over_after_cached_writes() {
+        let device_memory = Arc::new(MaxwellDeviceMemoryManager::default());
+        let mut backing = vec![0u8; 0x2000];
+        device_memory.smmu_set_physical_base_for_test(backing.as_mut_ptr() as usize);
+        device_memory.smmu_map_with_cpu_backing(
+            0x8000,
+            backing.as_mut_ptr(),
+            0x4000,
+            backing.len(),
+            1,
+            true,
+        );
+        let mut mm = MemoryManager::new_with_geometry_and_device_memory(
+            15,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        );
+        let rasterizer = TestRasterizer::new();
+        let inner_calls = Arc::clone(&rasterizer.inner_invalidation_calls);
+        let cb_calls = Arc::clone(&rasterizer.constant_buffer_data_calls);
+        mm.bind_rasterizer(&rasterizer);
+
+        // Words written one after another (and one rewritten) merge into one
+        // range; a write that neither touches nor overlaps starts another.
+        mm.write_constant_buffer_data(0x8100, &0x1111_1111u32.to_le_bytes());
+        mm.write_constant_buffer_data(0x8104, &0x2222_2222u32.to_le_bytes());
+        mm.write_constant_buffer_data(0x80FC, &0x3333_3333u32.to_le_bytes());
+        mm.write_constant_buffer_data(0x8100, &0x4444_4444u32.to_le_bytes());
+        mm.write_constant_buffer_data(0x8200, &[0x55; 8]);
+        // Across a device page boundary: both pages are written.
+        mm.write_constant_buffer_data(0x8FFC, &[0x66; 8]);
+        assert_eq!(&backing[0xFC..0x100], &0x3333_3333u32.to_le_bytes());
+        assert_eq!(&backing[0x100..0x104], &0x4444_4444u32.to_le_bytes());
+        assert_eq!(&backing[0x104..0x108], &0x2222_2222u32.to_le_bytes());
+        assert_eq!(&backing[0x200..0x208], &[0x55; 8]);
+        assert_eq!(&backing[0xFFC..0x1004], &[0x66; 8]);
+        assert!(cb_calls.lock().unwrap().is_empty());
+
+        mm.flush_caching();
+        // Nothing went through the accumulator; Lichii FlushCaching hands the
+        // constant buffer ranges over on their own.
+        assert!(inner_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            *cb_calls.lock().unwrap(),
+            vec![vec![(0x80FC, 0xC), (0x8200, 8), (0x8FFC, 8)]]
+        );
+        mm.flush_caching();
+        assert_eq!(cb_calls.lock().unwrap().len(), 1);
     }
 
     #[test]

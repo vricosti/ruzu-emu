@@ -41,6 +41,24 @@ pub(crate) struct PendingWrite {
     pub data: Vec<u8>,
 }
 
+/// The constant buffer `write_bound_constant_buffer` last translated, and the
+/// state it read.
+///
+/// Lichii `Maxwell3D::BoundConstantBuffer` (maxwell_3d.h:3427-3437), absent
+/// from Eden. Its `tic`, `tic_size`, `tsc` and `tsc_size` fields keep buffers
+/// over the texture and sampler headers on the general path for Lichii's fast
+/// draw deltas (`NoteFastDrawConstantData`), which ruzu does not have: both
+/// paths invalidate the texture cache alike, and ruzu reads the header tables
+/// again at every draw.
+#[derive(Clone, Copy, Default)]
+struct BoundConstantBuffer {
+    address: u64,
+    size: u32,
+    map_serial: u64,
+    /// 0: the general path writes its data.
+    device: u64,
+}
+
 #[derive(Clone, Copy)]
 struct Maxwell3DPtr(*mut Maxwell3D);
 
@@ -2492,6 +2510,9 @@ pub struct Maxwell3D {
     active_draw_manager_state: Option<usize>,
     /// Constant buffer bindings: 5 shader stages x 18 slots.
     cb_bindings: [[ConstBufferInfo; MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+    /// Lichii `bound_constant_buffer` (maxwell_3d.h:3427-3437): the constant
+    /// buffer `write_bound_constant_buffer` last translated.
+    bound_constant_buffer: BoundConstantBuffer,
     /// Pending semaphore writes to be returned by execute_pending.
     pending_semaphore_writes: Vec<PendingWrite>,
     /// Bound rasterizer backend.
@@ -3701,6 +3722,7 @@ impl Maxwell3D {
             draw_manager: Some(Box::new(dm::DrawManager::new())),
             active_draw_manager_state: None,
             cb_bindings: [[ConstBufferInfo::default(); MAX_CB_SLOTS]; NUM_SHADER_STAGES],
+            bound_constant_buffer: BoundConstantBuffer::default(),
             pending_semaphore_writes: Vec::new(),
             rasterizer: None,
             macro_positions: [0u32; 0x80],
@@ -5643,11 +5665,61 @@ impl Maxwell3D {
             #[cfg(target_endian = "big")]
             let bytes = storage.as_slice();
             let mut memory_manager = memory_manager.lock();
-            memory_manager.write_block_cached(address, bytes);
+            if !Self::write_bound_constant_buffer(
+                &mut self.bound_constant_buffer,
+                &mut memory_manager,
+                buffer_address,
+                size,
+                offset,
+                bytes,
+            ) {
+                memory_manager.write_block_cached(address, bytes);
+            }
         }
 
         // Increment the current buffer position.
         self.regs[cb_base + 3] = offset.wrapping_add(copy_size as u32);
+    }
+
+    /// Writes constant buffer data at `offset` (`data.len()` bytes within the
+    /// buffer) through the buffer CB_ADDRESS and CB_SIZE select, translated
+    /// once per selection and memory map. False, having done nothing, where
+    /// the general path has to: the buffer isn't one mapped device range
+    /// (sparse pages included), or the write goes past its end.
+    ///
+    /// Lichii `Maxwell3D::WriteBoundConstantBuffer` (maxwell_3d.cpp:1199-1240),
+    /// absent from Eden. Rust takes the bound state, the locked memory manager
+    /// and the CB_ADDRESS/CB_SIZE values as arguments: the caller already holds
+    /// the manager's lock (Lichii's `MemoryManager` has none). Not ported, as
+    /// they serve Lichii's fast draw deltas only: the `FastDraw::Enabled`
+    /// gate (always on in Lichii), the texture/sampler header overlap checks
+    /// and `FastDraw::NoteConstantData`/`NoteDeviceData`. Lichii's caller
+    /// clamps the write to the buffer's end beforehand (an extension of
+    /// ProcessCBMultiData); ruzu writes as Eden does, so a write past the end
+    /// takes the general path here.
+    fn write_bound_constant_buffer(
+        bound: &mut BoundConstantBuffer,
+        memory_manager: &mut MemoryManager,
+        address: u64,
+        size: u32,
+        offset: u32,
+        data: &[u8],
+    ) -> bool {
+        let map_serial = memory_manager.map_serial();
+        if bound.address != address || bound.size != size || bound.map_serial != map_serial {
+            *bound = BoundConstantBuffer { address, size, map_serial, device: 0 };
+            if address != 0 && size != 0 && memory_manager.is_continuous_range(address, u64::from(size))
+            {
+                if let Some(device) = memory_manager.gpu_to_cpu_address(address) {
+                    bound.device = device;
+                }
+            }
+        }
+        if bound.device == 0 || u64::from(offset) + data.len() as u64 > u64::from(size) {
+            return false;
+        }
+        memory_manager.write_constant_buffer_data(bound.device + u64::from(offset), data);
+        true
     }
 
     /// Handle CB_BIND trigger for a shader stage. Matches upstream `ProcessCBBind`.

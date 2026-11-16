@@ -3888,6 +3888,72 @@ fn test_process_cb_multi_data_writes_through_memory_manager() {
 }
 
 #[test]
+fn bound_constant_buffer_translation_follows_selection_and_memory_map() {
+    // Lichii WriteBoundConstantBuffer: the selected buffer is translated once
+    // per CB_ADDRESS/CB_SIZE selection and memory map; writes past its end and
+    // buffers that are not one device range take the general path.
+    let mut engine = Maxwell3D::new();
+    let device_memory =
+        Arc::new(crate::host1x::gpu_device_memory_manager::MaxwellDeviceMemoryManager::default());
+    let backing = vec![0u8; 0x3000];
+    device_memory.smmu_set_physical_base_for_test(backing.as_ptr() as usize);
+    device_memory.smmu_map_with_cpu_backing(
+        0x9000_0000,
+        backing.as_ptr(),
+        0x4000,
+        backing.len(),
+        1,
+        true,
+    );
+    let memory_manager = Arc::new(parking_lot::Mutex::new(
+        crate::memory_manager::MemoryManager::new_with_geometry_and_device_memory(
+            1,
+            Arc::clone(&device_memory),
+            32,
+            0x1_0000_0000,
+            16,
+            12,
+        ),
+    ));
+    memory_manager
+        .lock()
+        .map(0x10000, 0x9000_0000, 0x1000, 0, false);
+    engine.set_memory_manager(Arc::clone(&memory_manager));
+
+    engine.call_method(CB_CONFIG_BASE, 0x10, true);
+    engine.call_method(CB_CONFIG_BASE + 1, 0, true);
+    engine.call_method(CB_CONFIG_BASE + 2, 0x10000, true);
+    engine.call_method(CB_CONFIG_BASE + 3, 0, true);
+    engine.process_cb_multi_data(&[0x0102_0304]);
+    assert_eq!(engine.bound_constant_buffer.device, 0x9000_0000);
+    assert_eq!(&backing[..4], &[4, 3, 2, 1]);
+
+    // The same device memory mapped at the buffer's address again: a new
+    // memory map, translated again.
+    memory_manager.lock().unmap(0x10000, 0x1000);
+    memory_manager
+        .lock()
+        .map(0x10000, 0x9000_2000, 0x1000, 0, false);
+    engine.process_cb_multi_data(&[0x0506_0708]);
+    assert_eq!(engine.bound_constant_buffer.device, 0x9000_2000);
+    assert_eq!(&backing[0x2004..0x2008], &[8, 7, 6, 5]);
+    assert_eq!(&backing[4..8], &[0; 4]);
+
+    // Past CB_SIZE: the general path, which writes as Eden does.
+    engine.call_method(CB_CONFIG_BASE + 3, 0xc, true);
+    engine.process_cb_multi_data(&[0x1111_1111, 0x2222_2222]);
+    assert_eq!(&backing[0x200c..0x2014], &[0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22]);
+
+    // A buffer reaching unmapped memory is not one device range.
+    engine.call_method(CB_CONFIG_BASE, 0x2000, true);
+    engine.call_method(CB_CONFIG_BASE + 3, 0, true);
+    engine.process_cb_multi_data(&[0x3333_3333]);
+    assert_eq!(engine.bound_constant_buffer.device, 0);
+    assert_eq!(&backing[0x2000..0x2004], &[0x33; 4]);
+    memory_manager.lock().flush_caching();
+}
+
+#[test]
 fn process_cb_multi_data_uses_memory_manager_owner_without_guest_writer() {
     let mut engine = Maxwell3D::new();
     let device_memory =

@@ -5,6 +5,62 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub static G_NX2_AMPERE: AtomicBool = AtomicBool::new(false);
+
+/// Lichii `Nx2WrittenPageBits` (nx2.h:50).
+pub const NX2_WRITTEN_PAGE_BITS: u64 = 12;
+const NX2_GPU_WRITTEN_WORDS: usize = (1usize << (36 - NX2_WRITTEN_PAGE_BITS)) / 64;
+
+/// Device pages the GPU has written through the buffer cache (shader
+/// stores, copies), ever: one bit per 4 KiB of the 36-bit device address
+/// space (2 MiB). The bits never clear.
+///
+/// Lichii `g_nx2_gpu_written_pages` (nx2.h:45-51). ruzu marks it where Lichii
+/// does, at the two places the buffer cache adds a range to its GPU-modified
+/// ranges (`mark_written_buffer` and `dma_copy`), and reads it where this port
+/// reaches (`BufferCache::constant_data_reaches_buffers`,
+/// `RasterizerVulkan::accelerate_inline_to_memory`). Lichii's command list
+/// page bitmap beside it has no ruzu counterpart.
+pub static G_NX2_GPU_WRITTEN_PAGES: [AtomicU64; NX2_GPU_WRITTEN_WORDS] =
+    [const { AtomicU64::new(0) }; NX2_GPU_WRITTEN_WORDS];
+
+/// Lichii `Nx2MarkGpuWritten` (nx2.h:53-71): a word at a time.
+pub fn nx2_mark_gpu_written(device_address: u64, size: u64) {
+    if size == 0 {
+        return;
+    }
+    let last = ((device_address + size - 1) >> NX2_WRITTEN_PAGE_BITS)
+        .min(NX2_GPU_WRITTEN_WORDS as u64 * 64 - 1);
+    let mut page = device_address >> NX2_WRITTEN_PAGE_BITS;
+    while page <= last {
+        let first_bit = page % 64;
+        let bits = (64 - first_bit).min(last - page + 1);
+        let mask = if bits == 64 { !0u64 } else { (1u64 << bits) - 1 } << first_bit;
+        let word = &G_NX2_GPU_WRITTEN_PAGES[(page / 64) as usize];
+        if word.load(Ordering::Relaxed) & mask != mask {
+            word.fetch_or(mask, Ordering::Relaxed);
+        }
+        page += bits;
+    }
+}
+
+/// False only when no page of `[device_address, device_address + size)` has
+/// been GPU-written. Ranges past the bitmap answer true.
+///
+/// Lichii `Nx2MayBeGpuWritten` (nx2.h:120-137).
+pub fn nx2_may_be_gpu_written(device_address: u64, size: u64) -> bool {
+    if size == 0 {
+        return false;
+    }
+    let first = device_address >> NX2_WRITTEN_PAGE_BITS;
+    let last = device_address.wrapping_add(size).wrapping_sub(1) >> NX2_WRITTEN_PAGE_BITS;
+    if last < first || last >= NX2_GPU_WRITTEN_WORDS as u64 * 64 {
+        return true;
+    }
+    (first..=last).any(|page| {
+        (G_NX2_GPU_WRITTEN_PAGES[(page / 64) as usize].load(Ordering::Relaxed) >> (page % 64)) & 1
+            != 0
+    })
+}
 pub const NX2_MAX_SEMAPHORE_REGIONS: usize = 32;
 pub static G_NX2_SEMAPHORE_REGIONS: [AtomicU64; NX2_MAX_SEMAPHORE_REGIONS] =
     [const { AtomicU64::new(0) }; NX2_MAX_SEMAPHORE_REGIONS];
@@ -130,6 +186,26 @@ impl Nx2SemaphoreWaiters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_written_pages_are_seen_across_words_and_never_cleared() {
+        // Process-wide bitmap: addresses no other test uses.
+        let base = 0xC_7000_0000u64;
+        assert!(!nx2_may_be_gpu_written(base, 0x10_0000));
+        assert!(!nx2_may_be_gpu_written(base, 0));
+        // 70 pages starting mid-word: two words touched.
+        nx2_mark_gpu_written(base + 0x3_0ff0, 70 * 0x1000);
+        assert!(nx2_may_be_gpu_written(base + 0x3_0000, 1));
+        assert!(nx2_may_be_gpu_written(base + 0x3_0000 + 70 * 0x1000, 1));
+        assert!(!nx2_may_be_gpu_written(base + 0x3_0000 + 71 * 0x1000, 0x1000));
+        assert!(!nx2_may_be_gpu_written(base, 0x3_0000));
+        // A range reaching it from below.
+        assert!(nx2_may_be_gpu_written(base, 0x3_0001));
+        // Past the 36-bit bitmap: may be written.
+        assert!(nx2_may_be_gpu_written(1u64 << 36, 4));
+        nx2_mark_gpu_written(base + 0x3_0000, 0);
+        assert!(nx2_may_be_gpu_written(base + 0x3_0ff0, 4));
+    }
 
     #[test]
     fn region_mirroring_boundaries_capacity_and_removal() {

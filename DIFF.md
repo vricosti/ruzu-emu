@@ -1,5 +1,67 @@
 # Upstream parity notes
 
+## 2026-11-16 — constant buffer data path: video_core/{memory_manager,rasterizer_interface,engines/maxwell_3d,buffer_cache/{buffer_cache,memory_tracker_base},renderer_vulkan/vk_rasterizer}.rs vs Lichii video_core/{memory_manager.{h,cpp},rasterizer_interface.h,engines/maxwell_3d.{h,cpp},buffer_cache/{buffer_cache.h,memory_tracker_base.h},renderer_vulkan/vk_rasterizer.cpp}
+
+### Ported (Lichii extensions, absent from Eden)
+- `Maxwell3D::write_bound_constant_buffer` and `bound_constant_buffer` (maxwell_3d.cpp:1199-1240,
+  maxwell_3d.h:3299-3303, 3427-3437): `process_cb_multi_data` writes through the device address
+  of the buffer CB_ADDRESS/CB_SIZE select, translated once per selection and memory map
+  (`map_serial`), instead of `write_block_cached` (a GPU page walk, an SMMU walk and the
+  invalidation accumulator for each word).
+- `MemoryManager::write_constant_buffer_data` and `constant_buffer_writes`
+  (memory_manager.cpp:643-667): copies through the device page's host pointer and merges the
+  written ranges; `flush_caching` hands them to
+  `RasterizerInterface::invalidate_constant_buffer_data` after the accumulator's ranges
+  (memory_manager.cpp:1097-1109; rasterizer_interface.h:236-240, default `inner_invalidation`).
+- `RasterizerVulkan::invalidate_cached_writes` (vk_rasterizer.cpp:2873-2935) behind
+  `inner_invalidation` and `invalidate_constant_buffer_data`: constant buffer data reaches the
+  buffer cache only where `BufferCache::constant_data_reaches_buffers` (buffer_cache.h:1773-1795)
+  says it can change something: pages an upload or unmark took out of the CPU-modified state
+  managers are created in, or marked GPU-modified or preflushable
+  (`MemoryTrackerBase::is_region_ever_synchronized` and `ever_synchronized_pages`,
+  memory_tracker_base.h:92-110, 172-180, 228-233, 361), or pages added to the GPU-modified ranges
+  (`nx2::G_NX2_GPU_WRITTEN_PAGES`, `nx2_mark_gpu_written`, `nx2_may_be_gpu_written`: Lichii
+  `g_nx2_gpu_written_pages`, `Nx2MarkGpuWritten`, `Nx2MayBeGpuWritten`, nx2.h:45-71, 120-137,
+  marked at the same two sites, `DMACopy` and `MarkWrittenBuffer`, buffer_cache.h:1485, 3297).
+  `rasterizer_download_area::may_hold_gpu_writes` still answers true everywhere instead of
+  reading this bitmap as Lichii's `MayHoldGpuWrites` does (read downloads, outside this change).
+  Elsewhere `write_memory` would change nothing: pages never synchronized are CPU-modified, so a
+  cached buffer uploads them when next synchronized and uniform buffers streamed from guest
+  memory read the new data at their next bind.
+- Engine writes keep their pages tracked: `invalidate_cached_writes` takes the applied ranges out
+  of the GPU-written ranges first (`BufferCache::claim_cpu_writes`, buffer_cache.h:2165-2173) and
+  then calls `write_memory_with(addr, size, true, true)` (Lichii `WriteMemory(addr, size,
+  keep_page_gpu_data, engine_write)`, buffer_cache.h:241-270): when the pages hold no GPU-written
+  data the range is marked CPU-modified without untracking it
+  (`MemoryTrackerBase::mark_region_as_written_tracked`, memory_tracker_base.h:83-90;
+  `WordManager::mark_written_tracked`, word_manager.h:168-178), so the next upload does not track
+  it again (two host protection changes per write that no guest CPU access saw). This applies to
+  the accumulator's ranges (inline-to-memory, constant buffer data on the general path) too, as
+  in Lichii.
+
+### Intentional differences
+- Not ported, as they serve Lichii's fast draw deltas only (ruzu has none): the
+  `FastDraw::Enabled` gate of `WriteBoundConstantBuffer` (always on in Lichii), its texture and
+  sampler header overlap checks (`tic`/`tsc` fields of `BoundConstantBuffer`, `DeviceSpans`),
+  `FastDraw::NoteConstantData`/`NoteDeviceData`, and `CallConstBufferWords`.
+- Lichii's `ProcessCBMultiData` clamps the write to the buffer's end before
+  `WriteBoundConstantBuffer`; ruzu writes as Eden does, so a write past CB_SIZE takes the general
+  path (`write_block_cached`). Writes to Switch 2 sparse memory take it too, as in Lichii, through
+  `is_continuous_range` (reserved pages are not continuous) instead of `g_nx2_sparse_low/high`.
+- `write_constant_buffer_data`'s unmapped fallback is `smmu_write_block_unsafe` (logs, as
+  ruzu's `write_block_unsafe`), not Lichii's `WriteKept` (sparse page keeping, absent from ruzu).
+  `write_bound_constant_buffer` takes the locked memory manager as an argument: ruzu's
+  `MemoryManager` sits behind a mutex the caller already holds.
+- `constant_data_reaches_buffers` has no command list page term (`Nx2IsCommandListPage`) nor
+  repacked vertex buffer term (`AnyVertexRepacked`): ruzu neither copies command lists for the
+  front nor repacks vertex buffers.
+- `write_memory_with` ports only the fast path of Lichii's `WriteMemory(addr, size,
+  keep_page_gpu_data, engine_write)`: when the pages do hold GPU-written data it keeps ruzu's
+  `write_memory`, where Lichii uploads the CPU's bytes on the scheduler's owner
+  (buffer_cache.h:283-330). Its `Nx2NoteListHostWrite`, `NoteUniformWrite`, `ForgetEarlyLanded`
+  and `MarkVertexBuffersStale` calls have no ruzu counterpart. Rust has no default arguments:
+  Eden's two-argument `write_memory` keeps its name.
+
 ## 2026-11-16 — invalidation fast paths: core/gpu_dirty_memory_manager.rs, video_core/{gpu,shader_cache,texture_cache/{texture_cache_base,texture_cache},renderer_vulkan/vk_rasterizer,host1x/gpu_device_memory_manager}.rs vs Lichii core/gpu_dirty_memory_manager.h, video_core/{gpu.cpp,shader_cache.{h,cpp},texture_cache/{texture_cache_base.h,texture_cache.h},renderer_vulkan/vk_rasterizer.cpp} and Eden core/device_memory_manager.{h,inc}
 
 ### Ported (Lichii extensions, absent from Eden)

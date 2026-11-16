@@ -32,7 +32,13 @@ pub type VirtualSegments = SmallVec<[VirtualSegment; 8]>;
 
 /// Upstream `VideoCommon::VirtualRangeCache`.
 pub struct VirtualRangeCache {
-    entries: HashMap<u64, Entry>,
+    /// Upstream `std::unordered_map<u64, Entry>`, whose `std::hash<u64>` is a
+    /// plain integer hash. Rust's default SipHash cost three hashes per query
+    /// on every storage buffer binding of every draw; the identity hash would
+    /// leave hashbrown's 7-bit tags nearly constant for these keys (the
+    /// address space id shifted to bit 48), so this uses the integer mix ruzu
+    /// already uses for the texture cache's maps.
+    entries: HashMap<u64, Entry, common::hash::BuildUnorderedDenseHasher>,
     /// Upstream `deferred` + `deferred_overflow`, both guarded by
     /// `deferred_mutex`.
     deferred: Mutex<DeferredState>,
@@ -71,7 +77,7 @@ impl VirtualRangeCache {
 
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: HashMap::default(),
             deferred: Mutex::new(DeferredState::default()),
             has_deferred: AtomicBool::new(false),
         }

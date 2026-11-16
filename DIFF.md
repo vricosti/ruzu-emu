@@ -1,5 +1,15 @@
 # Upstream parity notes
 
+## 2026-11-16 — video_core/buffer_cache/virtual_range_cache.rs vs Eden video_core/buffer_cache/virtual_range_cache.h
+
+### Intentional differences
+- `VirtualRangeCache::entries` hashes its keys with ruzu's `BuildUnorderedDenseHasher` (an
+  integer mix) instead of Rust's default SipHash. Eden's `std::unordered_map<u64, Entry>` uses
+  the standard library's plain integer hash; the identity hash itself would leave hashbrown's
+  7-bit tags nearly constant for these keys (address space id shifted to bit 48). `Query` hashes
+  up to three times per storage buffer binding of every draw (0.18 ms per frame of the back on
+  the NX2 title used for measurement, profiled before the change; the gain is not measured).
+
 ## 2026-11-16 — video_core/texture_cache/texture_cache.rs: channel binds skip the stand-in image walk
 
 ### Intentional differences (ruzu-only code, no upstream counterpart)

@@ -842,6 +842,13 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
     }
 
     pub(crate) fn rebase_virtual_invalid_images(&mut self) {
+        // Only `resolve_or_allocate_cpu_addr` gives images an address at or
+        // above the sentinel, and each one advances `virtual_invalid_space`:
+        // while it is 0 no image can be found below, and the walk over every
+        // image (each channel bind, one per split batch on NX2) is skipped.
+        if self.virtual_invalid_space == 0 {
+            return;
+        }
         let Some(gpu_memory) = self.channel_gpu_memory.as_ref().cloned() else {
             return;
         };

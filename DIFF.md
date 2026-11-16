@@ -1,5 +1,17 @@
 # Upstream parity notes
 
+## 2026-11-16 — video_core/texture_cache/texture_cache.rs: channel binds skip the stand-in image walk
+
+### Intentional differences (ruzu-only code, no upstream counterpart)
+- `TextureCacheBase::rebase_virtual_invalid_images` (ruzu-only: neither Eden nor Lichii move an
+  image off its stand-in address; Lichii fixes the stand-in by GPU address,
+  texture_cache.h:2995-3006) walked every image on every channel bind, which the NX2 GPU split
+  issues once per back batch (0.6 ms per frame of the back on the NX2 title used for measurement,
+  where no image ever had a stand-in address). It now returns at once while
+  `virtual_invalid_space` is 0: only `resolve_or_allocate_cpu_addr` gives an image an address at
+  or above the sentinel, and it advances `virtual_invalid_space` by the image's aligned guest
+  size each time.
+
 ## 2026-11-16 — texture view preparation: video_core/texture_cache/{texture_cache,image_base,descriptor_table}.rs and renderer_vulkan/texture_cache.rs vs Eden/Lichii video_core/texture_cache/{texture_cache.h,image_base.h,image_base.cpp,descriptor_table.h}
 
 ### Ported (Lichii extensions, absent from Eden)

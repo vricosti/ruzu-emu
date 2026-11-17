@@ -1028,9 +1028,13 @@ impl KeplerCompute {
             self.process_native_report_semaphore(argument);
             return true;
         }
-        // As upstream, memory_manager.GetID() is read only where it is traced,
-        // not under the memory-manager lock on every native method write.
-        if method == 0x5a || (0xc6..=0x108).contains(&method) {
+        // Upstream reads memory_manager.GetID() without a lock; here it takes the
+        // memory-manager lock (shared with the command-list reads), so it is read
+        // only when the record is written: the 67 inline-QMD words of every
+        // dispatch would otherwise lock it 67 times for a disabled trace.
+        if (method == 0x5a || (0xc6..=0x108).contains(&method))
+            && crate::native_query_trace::native_query_trace_enabled()
+        {
             let asid = self.memory_manager.lock().get_id() as u64;
             trace_native_query(12, asid, method as u64, 0, 0, argument as u64, 0);
         }
@@ -1127,14 +1131,22 @@ impl KeplerCompute {
                 true
             }
             0xae | 0xaf | 0xb0 => {
-                let asid = self.memory_manager.lock().get_id() as u64;
+                // As above: the ID and the translations are trace record arguments only.
+                let trace = crate::native_query_trace::native_query_trace_enabled();
+                let asid = if trace {
+                    self.memory_manager.lock().get_id() as u64
+                } else {
+                    0
+                };
                 let address = (self.native_registers[0xad] as u64) << 8;
-                let cpu = self
-                    .memory_manager
-                    .lock()
-                    .gpu_to_cpu_address(address)
-                    .unwrap_or(0);
-                trace_native_query(9, asid, address, cpu, method, argument as u64, 0);
+                if trace {
+                    let cpu = self
+                        .memory_manager
+                        .lock()
+                        .gpu_to_cpu_address(address)
+                        .unwrap_or(0);
+                    trace_native_query(9, asid, address, cpu, method, argument as u64, 0);
+                }
                 if method == 0xae
                     || (method == 0xaf && argument & 2 == 0)
                     || (method == 0xb0 && matches!(argument & 15, 0 | 1))
@@ -1179,6 +1191,7 @@ impl KeplerCompute {
                             log::info!("Native QMD {address:#x} releases: {:08x?} | {:08x?} | {:08x?}",&descriptor[24..28],&descriptor[28..32],&descriptor[52..56]);
                         }
                         for slot in 0..2 {
+                            if !trace {break;}
                             let flags=descriptor[25+slot*4]; if flags&(1<<23)==0 {continue;}
                             let destination=((flags as u64&0xff)<<32)|descriptor[24+slot*4] as u64;
                             let cpu=memory.lock().gpu_to_cpu_address(destination).unwrap_or(0);

@@ -46,12 +46,21 @@ mod native_query_diagnostics {
     }
 }
 
+/// The `diagnostics` static `TraceNativeQuery` tests first (`EDEN_NATIVE_DRAW_DIAGNOSTICS`).
+///
+/// Upstream's callers pass `memory_manager.GetID()` and `GpuToCpuAddress()`, plain reads of
+/// the memory manager; the port's `MemoryManager` sits behind a lock, so callers that would
+/// take it only to build a trace record check this first.
+pub fn native_query_trace_enabled() -> bool {
+    static DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+    *DIAGNOSTICS.get_or_init(|| std::env::var_os("EDEN_NATIVE_DRAW_DIAGNOSTICS").is_some())
+}
+
 /// Events: 0=request, 1=written, 2=invalidated, 3=unsynchronized,
 /// 4=channel suspended, 5=channel resumed, 6=buffer readback,
 /// 7/8=QMD releases, 9=PCAS request, 10=DMA destination, 11=inline write.
 pub fn trace_native_query(event: u32, asid: u64, gpu: u64, cpu: u64, kind: u32, value: u64, flags: u32) {
-    static DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
-    if !*DIAGNOSTICS.get_or_init(|| std::env::var_os("EDEN_NATIVE_DRAW_DIAGNOSTICS").is_some()) {
+    if !native_query_trace_enabled() {
         return;
     }
     let mut state = native_query_diagnostics::get_state().lock();

@@ -52,7 +52,9 @@ fn front_macro_dma_drains_flushes_buffer_cache_and_extends_live_fifo() {
             MACRO_REGISTERS_START, &[], 0, 0);
         assert_eq!(fs.regs[0x123], 0x12345678);
         assert_eq!(fs.regs[0x124], 0x87654321);
-        assert_eq!(fs.fifo.len(), 0x1000);
+        // FrontDmaRead appended the words to the parameters the JIT ran on (the
+        // live FIFO), and that vector is the one put back, cleared, in FrontState.
+        assert!(fs.parameters.capacity() >= 0x1000);
         assert!(fs.parameters.is_empty());
         assert_eq!(fs.executing_macro, 0);
         assert!(!fs.draw_pending);
@@ -198,7 +200,7 @@ fn front_macro_worker_failure_propagates_through_jit_without_aborting() {
     }));
     assert!(result.is_err(), "failed worker must reach the frontend error boundary");
     assert_eq!(fs.executing_macro, 0);
-    assert_eq!(fs.fifo, [7], "FIFO ownership restored after callback panic");
+    assert!(fs.parameters.is_empty(), "a call that panics leaves no parameters for the next");
     assert_eq!(engine.regs[0x123], 0, "failed worker executed no guest writes");
 }
 

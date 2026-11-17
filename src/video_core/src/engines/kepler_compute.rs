@@ -603,14 +603,20 @@ impl KeplerCompute {
     ) {
         #[cfg(target_arch = "x86_64")]
         {
-            let owner = Self::front_macro_owner(fs).clone();
+            // Upstream reaches the context, the JIT and the channel's data RAM through raw
+            // pointers / shared_ptr members used in place. Rust borrows the allocations
+            // through their owning handles instead of cloning the Arcs per call.
+            // SAFETY: FrontState::native_context, macro_owner and native_data_ram are set once
+            // by KeplerCompute::front and never reassigned; `fs` (and so these Arcs) outlives
+            // this call, and nothing below touches those fields through `fs`.
+            let owner = unsafe { &*Arc::as_ptr(Self::front_macro_owner(fs)) };
             // Keep the original macro identity for restoring RAM and reporting
             // failures even if an emitted upload changes the frontend selector.
             let compute = if fs.native_context.is_some() {
                 fs.compute_uploaded
             } else { fs.macro_compute };
             let _profile = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::Macro);
-            let (start, jit, ram_owner, mut local_ram) = {
+            let (start, mut jit, kept_ram, mut local_ram) = {
                 let guard = owner.lock();
                 let mut context = guard.borrow_mut();
                 let positions = Self::front_macro_positions(fs, &mut context);
@@ -618,30 +624,52 @@ impl KeplerCompute {
                     % positions.len()];
                 fs.executing_macro = None;
                 let macro_engine = Self::front_macro_engine(fs, &mut context);
+                // Upstream stores the same pointer every call; the owning handle is only
+                // replaced when it names another RAM (no reference count traffic).
                 if let Some(ram) = &fs.native_data_ram {
-                    macro_engine.native_interpreter.active_dram = Some(ram.clone());
+                    if !macro_engine.native_interpreter.active_dram.as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, ram))
+                    {
+                        macro_engine.native_interpreter.active_dram = Some(ram.clone());
+                    }
                 }
-                let jit = macro_engine.native_jit.get_or_insert_with(|| {
+                // SAFETY: native_jit is created once and never replaced while the engine
+                // lives (as MacroEngine::execute_native borrows it); the engine lives in the
+                // context `owner` keeps alive.
+                let jit = unsafe { &*Arc::as_ptr(macro_engine.native_jit.get_or_insert_with(|| {
                     Arc::new(std::sync::Mutex::new(Default::default()))
-                }).clone();
-                jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .prepare(&macro_engine.native_code, macro_engine.native_code_generation)
+                })) };
+                // One JIT lock for Prepare and Execute (as execute_native); only the front
+                // runs this engine's macros while the split runs.
+                let mut jit = jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                jit.prepare(&macro_engine.native_code, macro_engine.native_code_generation)
                     .expect("native compute frontend macro JIT preparation failed");
-                let ram_owner = macro_engine.native_interpreter.active_dram.clone();
-                let local_ram = ram_owner.is_none().then(|| {
+                // The channel's RAM, which active_dram now names, is borrowed from
+                // FrontState below. Without one, the owning handle active_dram holds
+                // (another engine's RAM) is kept for the call, as before.
+                let kept_ram = if fs.native_data_ram.is_none() {
+                    macro_engine.native_interpreter.active_dram.clone()
+                } else { None };
+                let local_ram = (fs.native_data_ram.is_none() && kept_ram.is_none()).then(|| {
                     std::mem::replace(&mut macro_engine.native_interpreter.dram, [0; 0xc00])
                 });
-                (start, jit, ram_owner, local_ram)
+                (start, jit, kept_ram, local_ram)
             }; // Release the context before Execute can enqueue or wait for the back.
+            let ram_owner: Option<&Mutex<crate::macro_turing::DataRam>> = match &kept_ram {
+                Some(ram) => Some(&**ram),
+                // SAFETY: see `owner` above.
+                None => fs.native_data_ram.as_ref().map(|ram| unsafe { &*Arc::as_ptr(ram) }),
+            };
             let mut parameters = std::mem::take(&mut fs.parameters);
-            let mut shared_ram = ram_owner.as_ref().map(|ram| ram.lock());
+            let mut shared_ram = ram_owner.map(|ram| ram.lock());
             let ram = match shared_ram.as_deref_mut() {
                 Some(ram) => ram,
                 None => local_ram.as_mut().unwrap(),
             };
             let front = fs as *mut FrontState;
+            // Kept: on a panic out of Execute it puts the leased interpreter RAM (no
+            // active_dram) and the parameter vector back before re-raising it.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut jit = jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 jit.execute(start, &mut parameters, ram,
                     // Read/emit callbacks run sequentially. Parameters and RAM
                     // are leased separately, and no whole-state borrow spans a callback.
@@ -657,7 +685,11 @@ impl KeplerCompute {
                 )
             }));
             drop(shared_ram);
-            {
+            drop(jit);
+            // Upstream has nothing to put back and sets native_execution_failed in place:
+            // the context lock is only taken when there is something to write.
+            let failed = matches!(&result, Ok(result) if !result.success);
+            if local_ram.is_some() || failed {
                 let guard = owner.lock();
                 let mut context = guard.borrow_mut();
                 let macro_engine = if compute { &mut context.compute_engine }

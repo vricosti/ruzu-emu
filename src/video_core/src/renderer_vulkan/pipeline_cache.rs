@@ -2209,9 +2209,15 @@ impl PipelineCache {
         draw: &mut Maxwell3DDrawView<'_>,
         shared_cache: &mut SharedShaderCache,
     ) -> Option<&GraphicsPipeline> {
+        // `native_turing` is read once per lookup: upstream reads the flag without a lock
+        // (GetNativeMacroEngine().native_turing), here it sits under the macro context's lock,
+        // which the front thread takes for every macro.
+        let maxwell = shared_cache.current_maxwell3d();
+        let native_turing = maxwell
+            .is_some_and(|engine| engine.get_native_macro_engine_read(|macros| macros.native_turing));
         // Refresh before mesh lookup, Next(), and the slow-path lookup alike.
-        self.graphics_key.texture_pool_state = shared_cache.current_maxwell3d()
-            .filter(|engine| engine.get_native_macro_engine_read(|macros| macros.native_turing))
+        self.graphics_key.texture_pool_state = maxwell
+            .filter(|_| native_turing)
             .map(|engine| TexturePoolState {
                 texture_limit: engine.tex_header_pool_limit(),
                 sampler_limit: engine.tex_sampler_pool_limit(),
@@ -2220,8 +2226,8 @@ impl PipelineCache {
         // Launch-time opt-in for the compute mesh adaptation; avoid querying
         // the host environment on every ordinary graphics-pipeline lookup.
         if super::vk_rasterizer::mesh_draw_enabled()
-            && shared_cache.current_maxwell3d().is_some_and(|maxwell| maxwell.is_mesh_enabled()
-                && maxwell.get_native_macro_engine_read(|engine| engine.native_turing)) {
+            && native_turing
+            && maxwell.is_some_and(|maxwell| maxwell.is_mesh_enabled()) {
             let programs = self.current_mesh_compute_programs(shared_cache)?;
             self.current_pipeline = self.current_mesh_graphics_pipeline(draw, shared_cache, &programs.mesh_info);
             return self.current_pipeline.as_deref();

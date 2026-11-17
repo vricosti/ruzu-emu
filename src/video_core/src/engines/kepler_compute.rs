@@ -1091,10 +1091,8 @@ impl KeplerCompute {
                 log::error!("Unmapped native inline QMD destination");
                 return true;
             }
-            let bytes: Vec<u8> = self.native_registers[0xc8..0x108]
-                .iter()
-                .flat_map(|word| word.to_le_bytes())
-                .collect();
+            // Upstream passes a byte span over the register words; no copy.
+            let bytes: &[u8] = bytemuck::cast_slice(&self.native_registers[0xc8..0x108]);
             unsafe {
                 self.rasterizer
                     .expect("native inline QMD requires rasterizer")

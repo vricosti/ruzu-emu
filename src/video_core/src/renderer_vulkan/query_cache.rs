@@ -311,8 +311,12 @@ impl Drop for SamplesQuerySpan {
 pub(crate) struct SamplesQueryState {
     /// Slot currently recording, as `(bank, slot)`.
     current: Option<(Arc<SamplesQueryBank>, usize)>,
-    /// Slots closed since the last report, in acquisition order.
-    history: Vec<(Arc<SamplesQueryBank>, usize)>,
+    /// Slots closed since the last reset, in acquisition order, as `(bank, start, amount)`
+    /// runs of contiguous slots of one bank: upstream's `current_query` range
+    /// (`start_bank_id`/`start_slot`/`size_slots`, walked by `ApplyBankOp`).
+    history: Vec<(Arc<SamplesQueryBank>, usize, usize)>,
+    /// Upstream `current_query->size_slots`: the slots `history` covers.
+    history_slots: usize,
     /// Lichii `SamplesStreamer::bank_bound_resets`.
     bank_bound_resets: u64,
 }
@@ -328,7 +332,8 @@ impl SamplesQueryState {
         scheduler.record(move |cmdbuf| unsafe {
             device.cmd_end_query(cmdbuf, query_pool, slot as u32);
         });
-        self.history.push((bank, slot));
+        push_history_slot(&mut self.history, bank, slot);
+        self.history_slots += 1;
     }
 
     /// Port of Lichii's `SamplesStreamer::CloseCounter` (Lichii 5b89a3daf4), called at each
@@ -341,13 +346,13 @@ impl SamplesQueryState {
     /// banks (Lichii 88783d558d) the count is dropped as a reset would.
     pub(crate) fn close_counter(&mut self, scheduler: &mut Scheduler) {
         self.pause_counter(scheduler);
-        if self.history.len() > MAX_RUNNING_QUERY_SLOTS {
+        if self.history_slots > MAX_RUNNING_QUERY_SLOTS {
             // It drops a real count; logged on the 1st, 2nd, 4th, 8th... drop.
             self.bank_bound_resets += 1;
             if is_logged_bank_bound_reset(self.bank_bound_resets) {
                 log::warn!(
                     "Samples query ran {} slots with no reset or report, dropped its count (drop {})",
-                    self.history.len(),
+                    self.history_slots,
                     self.bank_bound_resets
                 );
             }
@@ -365,9 +370,10 @@ impl SamplesQueryState {
     /// Port of `SamplesStreamer::AbandonCurrentQuery` -> `Free`: closes the
     /// references `ReserveHostQuery` took for slots that are never reported.
     fn abandon_history(&mut self) {
-        for (bank, _) in self.history.drain(..) {
-            bank.close_reference(1);
+        for (bank, _, amount) in self.history.drain(..) {
+            bank.close_reference(amount);
         }
+        self.history_slots = 0;
     }
 }
 
@@ -453,6 +459,7 @@ impl SamplesStreamer {
             state: Arc::new(parking_lot::Mutex::new(SamplesQueryState {
                 current: None,
                 history: Vec::new(),
+                history_slots: 0,
                 bank_bound_resets: 0,
             })),
             prefix_scan_pass,
@@ -637,15 +644,20 @@ impl SamplesStreamer {
         if state.history.is_empty() {
             return None;
         }
-        // Upstream `WriteCounter` copies the whole current query and takes one
-        // additional bank reference per copied slot. Keep `history` as the
-        // current cumulative query until `ResetCounter` or `PresyncWrites`,
-        // and give this report its own matching references.
-        let history = clone_cumulative_history(&state.history, |bank| {
-            bank.add_reference(1, scheduler);
+        // Upstream `WriteCounter` copies the whole current query and takes, through
+        // `ApplyBankOp`, `amount` additional references on each bank it spans. Keep
+        // `history` as the current cumulative query until `ResetCounter` or
+        // `PresyncWrites`, and give this report its own matching references.
+        let spans = clone_cumulative_history(&state.history, |bank, start, amount| {
+            bank.add_reference(amount, scheduler);
+            SamplesQuerySpan {
+                bank: Arc::clone(bank),
+                start,
+                amount,
+            }
         });
         let report = SamplesReport::new(
-            coalesce_query_spans(history),
+            spans,
             Arc::clone(&self.amend_value),
             Arc::clone(&self.accumulation_value),
         );
@@ -792,15 +804,20 @@ impl SamplesStreamer {
 
         let replicated_history = {
             let mut state = self.state.lock();
-            let history = clone_cumulative_history(&state.history, |bank| {
-                bank.add_reference(1, scheduler);
+            let history = clone_cumulative_history(&state.history, |bank, start, amount| {
+                bank.add_reference(amount, scheduler);
+                SamplesQuerySpan {
+                    bank: Arc::clone(bank),
+                    start,
+                    amount,
+                }
             });
             state.abandon_history();
             history
         };
         if !replicated_history.is_empty() {
             let report = SamplesReport::new(
-                coalesce_query_spans(replicated_history),
+                replicated_history,
                 Arc::clone(&self.amend_value),
                 Arc::clone(&self.accumulation_value),
             );
@@ -866,44 +883,31 @@ impl SamplesStreamer {
     }
 }
 
-/// Snapshot the whole current query while retaining its original history.
-/// Each copy takes the independent bank reference that upstream `WriteCounter`
-/// adds to the newly built host query.
-fn clone_cumulative_history<T>(
-    history: &[(Arc<T>, usize)],
-    mut add_reference: impl FnMut(&Arc<T>),
-) -> Vec<(Arc<T>, usize)> {
-    history
-        .iter()
-        .map(|(bank, slot)| {
-            add_reference(bank);
-            (Arc::clone(bank), *slot)
-        })
-        .collect()
+/// Append a closed slot to the current query's runs: it extends the last run when it follows
+/// it in the same bank, as upstream's `ReserveHostQuery` grows `current_query->size_slots`,
+/// so a query that filled contiguous slots of one bank stays one `(bank, start, amount)` range
+/// and is synced with a single `vkGetQueryPoolResults`, like upstream's `ApplyBanksWideOp`.
+fn push_history_slot<T>(history: &mut Vec<(Arc<T>, usize, usize)>, bank: Arc<T>, slot: usize) {
+    if let Some((last_bank, start, amount)) = history.last_mut() {
+        if Arc::ptr_eq(last_bank, &bank) && *start + *amount == slot {
+            *amount += 1;
+            return;
+        }
+    }
+    history.push((bank, slot, 1));
 }
 
-/// Coalesce per-slot acquisitions into upstream's `(bank, start, amount)`
-/// ranges, so a query that filled contiguous slots of one bank is synced with a
-/// single `vkGetQueryPoolResults` like upstream's `ApplyBanksWideOp`.
-///
-/// Reference ownership moves from the acquisition list into the spans: each
-/// entry contributed one `AddReference`, and the span closes `amount` of them.
-fn coalesce_query_spans(history: Vec<(Arc<SamplesQueryBank>, usize)>) -> Vec<SamplesQuerySpan> {
-    let mut spans: Vec<SamplesQuerySpan> = Vec::new();
-    for (bank, slot) in history {
-        if let Some(last) = spans.last_mut() {
-            if Arc::ptr_eq(&last.bank, &bank) && last.start + last.amount == slot {
-                last.amount += 1;
-                continue;
-            }
-        }
-        spans.push(SamplesQuerySpan {
-            bank,
-            start: slot,
-            amount: 1,
-        });
-    }
-    spans
+/// Snapshot the whole current query while retaining its original history.
+/// `copy` is called once per `(bank, start, amount)` run: upstream's `ApplyBankOp`, through
+/// which `WriteCounter` adds the newly built host query's `amount` references on each bank.
+fn clone_cumulative_history<T, S>(
+    history: &[(Arc<T>, usize, usize)],
+    mut copy: impl FnMut(&Arc<T>, usize, usize) -> S,
+) -> Vec<S> {
+    history
+        .iter()
+        .map(|(bank, start, amount)| copy(bank, *start, *amount))
+        .collect()
 }
 
 /// Extend the min/max range associated with one bank.
@@ -3415,23 +3419,49 @@ mod tests {
     #[test]
     fn samples_reports_snapshot_the_full_history_within_one_sync_epoch() {
         let bank = Arc::new(());
-        let mut history = vec![(Arc::clone(&bank), 3), (Arc::clone(&bank), 4)];
+        let mut history = Vec::new();
+        push_history_slot(&mut history, Arc::clone(&bank), 3);
+        push_history_slot(&mut history, Arc::clone(&bank), 4);
         let mut references_added = 0;
+        let mut copy = |_: &Arc<()>, start: usize, amount: usize| {
+            references_added += amount;
+            (start, amount)
+        };
 
-        let first = clone_cumulative_history(&history, |_| references_added += 1);
-        history.push((Arc::clone(&bank), 5));
-        let second = clone_cumulative_history(&history, |_| references_added += 1);
+        let first = clone_cumulative_history(&history, &mut copy);
+        push_history_slot(&mut history, Arc::clone(&bank), 5);
+        let second = clone_cumulative_history(&history, &mut copy);
 
+        assert_eq!(first, [(3, 2)]);
+        assert_eq!(second, [(3, 3)]);
+        assert_eq!(history.len(), 1);
+        // One reference per copied slot, as upstream's `AddReference(amount)` per bank run.
+        assert_eq!(references_added, 2 + 3);
+    }
+
+    #[test]
+    fn samples_history_runs_split_on_bank_change_and_slot_gaps() {
+        // Runs are what the per-slot list coalesced to before (upstream `ApplyBankOp` ranges):
+        // contiguous slots of one bank merge; a new bank or a gap starts a new run.
+        let first_bank = Arc::new(());
+        let second_bank = Arc::new(());
+        let mut history = Vec::new();
+        for slot in [254, 255] {
+            push_history_slot(&mut history, Arc::clone(&first_bank), slot);
+        }
+        for slot in [0, 1, 2, 7] {
+            push_history_slot(&mut history, Arc::clone(&second_bank), slot);
+        }
+        push_history_slot(&mut history, Arc::clone(&first_bank), 256);
+
+        let runs: Vec<_> = history
+            .iter()
+            .map(|(bank, start, amount)| (Arc::ptr_eq(bank, &first_bank), *start, *amount))
+            .collect();
         assert_eq!(
-            first.iter().map(|(_, slot)| *slot).collect::<Vec<_>>(),
-            [3, 4]
+            runs,
+            [(true, 254, 2), (false, 0, 3), (false, 7, 1), (true, 256, 1)]
         );
-        assert_eq!(
-            second.iter().map(|(_, slot)| *slot).collect::<Vec<_>>(),
-            [3, 4, 5]
-        );
-        assert_eq!(history.len(), 3);
-        assert_eq!(references_added, first.len() + second.len());
     }
 
     #[test]

@@ -23,7 +23,7 @@ use common::lru_cache::LeastRecentlyUsedCache;
 use common::scratch_buffer::ScratchBuffer;
 use common::thread::ThreadPlacement;
 use common::thread_worker::ThreadWorker;
-use parking_lot::{Mutex as ParkingMutex, ReentrantMutex};
+use parking_lot::Mutex as ParkingMutex;
 use smallvec::SmallVec;
 
 use common::slot_vector::SlotVector;
@@ -955,8 +955,8 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     /// multi-channel support lands.
     pub channel_state: TextureCacheChannelInfo,
 
-    // Mutex
-    pub mutex: ReentrantMutex<()>,
+    // Mutex: Lichii `Common::SpinRecursiveMutex` (texture_cache_base.h; Eden: std::recursive_mutex)
+    pub mutex: common::spin_recursive_mutex::SpinRecursiveMutex,
 
     /// Owned storage behind upstream's `Runtime& runtime`. The Box keeps its
     /// address stable for backend objects which retain the runtime pointer.
@@ -1226,7 +1226,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             image_gpu_page_table_indices: HashMap::default(),
             channel_caches: ChannelSetupCaches::new(),
             channel_state: fallback_channel_state,
-            mutex: ReentrantMutex::new(()),
+            mutex: common::spin_recursive_mutex::SpinRecursiveMutex::new(),
             runtime: None,
         };
 

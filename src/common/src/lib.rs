@@ -63,6 +63,7 @@ pub mod detached_tasks;
 pub mod fiber;
 pub mod range_mutex;
 pub mod spin_lock;
+pub mod spin_recursive_mutex;
 pub mod thread;
 pub mod thread_worker;
 

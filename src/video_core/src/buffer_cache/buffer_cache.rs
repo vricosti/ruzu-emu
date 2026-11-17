@@ -24,7 +24,6 @@ use common::lru_cache::LeastRecentlyUsedCache;
 use common::range_sets::{OverlapRangeSet, RangeSet};
 use common::slot_vector::{SlotId, SlotVector};
 use common::types::VAddr;
-use parking_lot::ReentrantMutex;
 use smallvec::SmallVec;
 
 use crate::control::channel_state::ChannelState;
@@ -133,8 +132,9 @@ fn storage_binding_cache_store(key: StorageBindingKey, binding: Binding) {
 /// Corresponds to the C++ `BufferCache<P>` template. The generic parameter
 /// `P` is the backend policy (see `BufferCacheParams` trait).
 pub struct BufferCache<P: BufferCacheParams, DT: DeviceTracker> {
-    /// Recursive mutex for external synchronization.
-    pub mutex: Arc<ReentrantMutex<()>>,
+    /// Recursive mutex for external synchronization: Lichii `Common::SpinRecursiveMutex`
+    /// (buffer_cache_base.h; Eden: `std::recursive_mutex`).
+    pub mutex: Arc<common::spin_recursive_mutex::SpinRecursiveMutex>,
 
     // -- Channel state (upstream inherits from ChannelSetupCaches) --
     pub channel_caches: ChannelSetupCaches<BufferCacheChannelInfo>,
@@ -309,7 +309,7 @@ impl<P: BufferCacheParams, DT: DeviceTracker> BufferCache<P, DT> {
         };
 
         Self {
-            mutex: Arc::new(ReentrantMutex::new(())),
+            mutex: Arc::new(common::spin_recursive_mutex::SpinRecursiveMutex::new()),
             channel_caches: ChannelSetupCaches::new(),
             runtime,
             any_buffer_uploaded: false,
@@ -5862,7 +5862,7 @@ mod tests {
 
     #[test]
     fn gpu_memory_adapter_replacement_and_clear_hold_cache_lock() {
-        struct LockCheckedMemory(Arc<ReentrantMutex<()>>);
+        struct LockCheckedMemory(Arc<common::spin_recursive_mutex::SpinRecursiveMutex>);
         impl Drop for LockCheckedMemory {
             fn drop(&mut self) {
                 let mutex = Arc::clone(&self.0);

@@ -12,6 +12,7 @@ lz4_flex.workspace = true
 zstd = "0.13"
 libc = "0.2"
 parking_lot.workspace = true
+parking_lot_core = "0.9"
 context.workspace = true
 toml.workspace = true
 fastrand.workspace = true

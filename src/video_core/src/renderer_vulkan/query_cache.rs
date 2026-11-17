@@ -327,10 +327,13 @@ impl SamplesQueryState {
         let Some((bank, slot)) = self.current.take() else {
             return;
         };
-        let device = bank.device.clone();
+        // Upstream records `cmdbuf.EndQuery(query_pool, query_index)`, capturing only the pool
+        // and the slot: capture the entry point, not a copy of the whole `ash::Device`
+        // dispatch table (~1.5 KiB in the scheduler's 32 KiB command chunk, per query).
+        let cmd_end_query = bank.device.fp_v1_0().cmd_end_query;
         let query_pool = bank.query_pool;
         scheduler.record(move |cmdbuf| unsafe {
-            device.cmd_end_query(cmdbuf, query_pool, slot as u32);
+            cmd_end_query(cmdbuf, query_pool, slot as u32);
         });
         push_history_slot(&mut self.history, bank, slot);
         self.history_slots += 1;
@@ -596,11 +599,12 @@ impl SamplesStreamer {
                 return;
             }
         };
-        let device = bank.device.clone();
+        // As `pause_counter`: upstream's `BeginQuery` command captures the pool and the slot.
+        let cmd_begin_query = bank.device.fp_v1_0().cmd_begin_query;
         let query_pool = bank.query_pool;
         scheduler.record(move |cmdbuf| unsafe {
             let use_precise = common::settings::is_gpu_level_high(&common::settings::values());
-            device.cmd_begin_query(
+            cmd_begin_query(
                 cmdbuf,
                 query_pool,
                 slot as u32,

@@ -4145,7 +4145,7 @@ impl RasterizerInterface for RasterizerVulkan {
     fn dispatch_compute(&mut self, dispatch: &DispatchCall) {
         let _scope = ProfileScope::new(ProfileZone::Compute);
         self.flush_work();
-        if let Some(mm) = self.channel_memory_manager.as_ref().cloned() {
+        if let Some(mm) = self.channel_memory_manager.as_ref() {
             mm.lock().flush_caching();
         }
 
@@ -4900,7 +4900,9 @@ impl RasterizerInterface for RasterizerVulkan {
             return;
         }
 
-        let Some(mm_owner) = self.channel_memory_manager.as_ref().cloned() else {
+        // Upstream uses its gpu_memory reference; borrow the owner rather than
+        // cloning the Arc (two atomic updates of a shared count per upload).
+        let Some(mm_owner) = self.channel_memory_manager.as_ref() else {
             return;
         };
 

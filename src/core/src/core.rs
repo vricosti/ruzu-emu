@@ -2520,9 +2520,11 @@ impl System {
         self.memory.clone()
     }
 
-    /// Upstream: `System::GetGPUDirtyMemoryManager()`.
-    pub fn gpu_dirty_memory_managers(&self) -> Vec<Arc<GpuDirtyMemoryManager>> {
-        self.gpu_dirty_memory_managers.clone()
+    /// Upstream: `System::GetGPUDirtyMemoryManager()`, which returns a
+    /// `std::span` over the managers: a view, not a copy. The GPU thread
+    /// reads it at every fence (`GPU::InvalidateGPUCache`).
+    pub fn gpu_dirty_memory_managers(&self) -> &[Arc<GpuDirtyMemoryManager>] {
+        &self.gpu_dirty_memory_managers
     }
 
     /// Upstream: `System::GetCurrentHostThreadID()`.

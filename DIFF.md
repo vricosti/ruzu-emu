@@ -1,5 +1,45 @@
 # Upstream parity notes
 
+## 2026-11-16 — split front macro calls: video_core/engines/{maxwell_3d,kepler_compute}.rs vs Lichii video_core/engines/{maxwell_3d.cpp:1854-1946 (FrontRunMacro, FrontRunOnBack), kepler_compute.cpp:2044-2120 (FrontRunMacro)}
+
+### Intentional differences
+- Lichii's FrontRunMacro uses the shared macro engine, its JIT and the channel's data RAM
+  through references (`GetNativeMacroEngine()`, `shared_ptr` members, `native_data_ram`): no
+  atomic operation per call. ruzu's `Maxwell3D::front_run_macro` made about 20 locked
+  instructions per call (3 `Arc` clones and drops, 3 locks of the shared context's
+  `ReentrantMutex`, 2 of the JIT's `std::sync::Mutex`, 1 of the data RAM): 85 % of its own time
+  in the profile of 95229081 (3.4 ms per frame for ~33 400 calls). It now borrows
+  `FrontState::macro_owner`, `FrontState::native_data_ram` and the engine's `native_jit`
+  through `Arc::as_ptr` (all three set once and never replaced while the front lives), reads
+  the start position, the code generation and the code length under one context lock, takes
+  the context lock a second time only to prepare the JIT, and keeps one JIT lock from Prepare
+  to Execute (as `MacroEngine::execute_native`). The context lock stays: the back reads the
+  shared engine under it (`get_native_macro_engine_read`, `shader_cache`), and it is still
+  never held while the front waits for the back.
+- `Maxwell3D::front_run_on_back` takes the code generation and length (the two engine fields
+  upstream's `FrontRunOnBack` reads from its `const MacroEngine&`) instead of locking the
+  context itself.
+- The FIFO: Lichii executes on `fs.parameters`, to which FrontDmaRead appends. ruzu copied the
+  parameters into a separate `FrontState::fifo` per call (removed) and wrapped Execute in a
+  `catch_unwind` whose only effect was to restore that copy before re-raising. The parameter
+  vector is now moved out for Execute and put back cleared; a panic out of Execute (re-raised
+  by `TuringMacroJit::execute` after the JIT returned, its thunks catch it) leaves
+  `fs.parameters` empty, the state after any call.
+- `KeplerCompute::front_run_macro`: same borrowed context, JIT and RAM (no `Arc` clone),
+  `active_dram` replaced only when it names another RAM, one JIT lock, and the closing context
+  lock only when a leased interpreter RAM must be put back or Execute failed. Its
+  `catch_unwind` stays: it puts the leased interpreter RAM back on a panic.
+
+### Measured with the lock ports and the back-end changes (2026-11-16 session)
+NX2 title used for measurement, forest scene, 60 s window, two alternated series, one emulator at
+a time: base 35.60-35.93 fps (median frame 27.46-27.83 ms, three runs); guest lock ports alone
+36.87-36.95 (26.65-26.66, two runs); plus the feedback-loop gate and the virtual range prefixes
+36.55-37.25 (26.63-27.15, two runs); plus this front change 36.75-37.22 (26.63-27.01, three runs).
+The three stacks differ by less than the run-to-run spread. The GPU back thread stays at 91-95 %
+CPU in every state (no runqueue wait) and sets the pace; the front thread falls from 65-66 % to
+59-60 % with this change; the host GPU from 86-87 % busy at ~2000 MHz to 68-72 % at ~1390 MHz
+with the feedback-loop gate.
+
 ## 2026-11-16 — virtual range lookups reuse the longest contiguous walk: buffer_cache/virtual_range_cache.rs vs Lichii buffer_cache/virtual_range_cache.h
 
 ### Ported (Lichii 7083185c43, absent from Eden a538cd9aff; no switch)

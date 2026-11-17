@@ -4518,12 +4518,20 @@ impl RasterizerInterface for RasterizerVulkan {
     }
 
     fn get_flush_area(&self, addr: u64, size: u64) -> RasterizerDownloadArea {
-        let texture_area = unsafe {
-            let texture_mutex: *const _ = &self.texture_cache.base.mutex;
-            let _texture_guard = (*texture_mutex).lock();
-            let texture_cache: *mut TextureCache =
-                &*self.texture_cache as *const TextureCache as *mut TextureCache;
-            (*texture_cache).base.get_flush_area(addr, size as usize)
+        // Lichii RasterizerVulkan::GetFlushArea (vk_rasterizer.cpp:2807-2816): guest cores ask
+        // this on reads of cached pages, and the back holds the caches' locks through each draw.
+        // Pages no image was ever registered on get no look under the texture cache's lock.
+        // (Lichii's second gate, Nx2MayBeGpuWritten for the buffer cache, is not ported.)
+        let texture_area = if !self.texture_cache.base.page_filter.any(addr, size) {
+            None
+        } else {
+            unsafe {
+                let texture_mutex: *const _ = &self.texture_cache.base.mutex;
+                let _texture_guard = (*texture_mutex).lock();
+                let texture_cache: *mut TextureCache =
+                    &*self.texture_cache as *const TextureCache as *mut TextureCache;
+                (*texture_cache).base.get_flush_area(addr, size as usize)
+            }
         };
         unsafe {
             let mutex: *const _ = &self.common_buffer_cache.mutex;

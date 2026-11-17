@@ -1,5 +1,23 @@
 # Upstream parity notes
 
+## 2026-11-16 — feedback-loop barrier gated on depth/stencil writes: texture_cache/texture_cache.rs vs Lichii texture_cache/texture_cache.h
+
+### Ported (Lichii extension, absent from Eden; Lichii 3b1d6eb9cd, no switch)
+- `TextureCacheBase::check_feedback_loop` (Lichii texture_cache.h:845-921) issues the
+  feedback-loop barrier only while `feedback_depth_dirty` (texture_cache_base.h:653, initially
+  true) is set, and clears it after the barrier. The flag is raised when the render targets serial
+  differs from the one of the last check, and on exit of every check (Lichii's `SCOPE_EXIT`, after
+  the early returns but not when `barrier_feedback_loops` is off) when the draw has
+  `depth_write_enabled` or `stencil_enable` set. A depth target that is only sampled after the
+  first barrier therefore keeps its render pass open; Eden ended the pass before every such draw.
+- Lichii reads `maxwell3d->regs` inside `CheckFeedbackLoop`; ruzu's back end cannot borrow the live
+  engine, so `GraphicsPipeline::configure_impl` passes `depth_write_enable || stencil_enable` from
+  the draw's register view (`Maxwell3DDrawView::depth_stencil`).
+- As in Lichii, clears and render pass ends do not touch the flag (a clear changes no render target
+  serial); only the render targets serial and depth/stencil-writing draws raise it.
+- The Metal back end (ruzu only) passes `writes_depth_stencil = true`, which keeps Eden's behaviour
+  there (the flag is raised on every exit, so every aliasing draw still gets its barrier).
+
 ## 2026-11-16 — guest-side lock waits: core/hle/kernel/{k_spin_lock,svc/svc_info}.rs, common/spin_recursive_mutex.rs, video_core/{buffer_cache/buffer_cache,texture_cache/texture_cache_base,renderer_vulkan/vk_rasterizer}.rs vs Lichii core/hle/kernel/k_spin_lock.{h,cpp}, common/spin_recursive_mutex.h, video_core/{buffer_cache/buffer_cache_base.h,texture_cache/texture_cache_base.h,renderer_vulkan/vk_rasterizer.cpp} and Eden core/hle/kernel/svc/svc_info.cpp
 
 ### Ported (Lichii divergences from Eden)
@@ -38,7 +56,6 @@ back thread's voluntary context switches fall from ~115 to ~9 a frame, the guest
   against 46.12).
 - Lichii's second `GetFlushArea` gate (`Nx2MayBeGpuWritten` for the buffer cache): ruzu has no
   GPU-written page bitmap.
-
 ## 2026-11-16 — Lichii NX2 performance mechanisms: submission policy, GPU thread pinning, fence batches, deferred fragment barriers
 
 All four are Lichii extensions, absent from Eden. The losses quoted are Lichii's own ablation on

@@ -3214,7 +3214,7 @@ kernel void inspect_packed(texture2d<float, access::read> image [[texture(0)]],
             let mut barrier_requested = false;
             cache.base.check_feedback_loop(&[ImageViewInOut {
                 id: view_id, ..Default::default()
-            }], || barrier_requested = true);
+            }], true, || barrier_requested = true);
             assert!(!barrier_requested);
             assert!(prepared.snapshot_read_only_depth_feedback(&mut cache, false).unwrap());
             assert_eq!(prepared.fragment.textures[0].texture.as_deref().map(|t| t as *const _), Some(&*snapshot as *const _));

@@ -840,6 +840,9 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     pub last_feedback_loop_serial: u64,
     pub last_feedback_texture_serial: u64,
     pub last_feedback_loop_result: bool,
+    /// Lichii `feedback_depth_dirty` (texture_cache_base.h:653): depth or stencil
+    /// may have been written since the last feedback-loop barrier.
+    pub feedback_depth_dirty: bool,
     pub last_framebuffer_id: FramebufferId,
     pub last_framebuffer_serial: u64,
     /// Upstream keys cached framebuffers by the full `RenderTargets` object.
@@ -1169,6 +1172,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             last_feedback_loop_serial: 0,
             last_feedback_texture_serial: 0,
             last_feedback_loop_result: false,
+            feedback_depth_dirty: true,
             last_framebuffer_id: FramebufferId::default(),
             last_framebuffer_serial: 0,
             framebuffers: HashMap::default(),

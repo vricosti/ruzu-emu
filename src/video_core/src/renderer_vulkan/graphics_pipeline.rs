@@ -1069,7 +1069,12 @@ impl GraphicsPipeline {
             ) {
                 return false;
             }
-            texture_cache.check_feedback_loop(&views);
+            // Lichii texture_cache.h:849: `regs.depth_write_enabled != 0 || regs.stencil_enable != 0`.
+            let depth_stencil = draw.depth_stencil();
+            texture_cache.check_feedback_loop(
+                &views,
+                depth_stencil.depth_write_enable || depth_stencil.stencil_enable,
+            );
             // Lichii vk_graphics_pipeline.cpp:1245-1248: a deferred fragment barrier ends
             // the render pass only before a draw that reads what the pass wrote.
             if scheduler.has_fragment_barrier()

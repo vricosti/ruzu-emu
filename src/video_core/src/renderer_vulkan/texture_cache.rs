@@ -6359,10 +6359,12 @@ impl TextureCache {
 
     /// Port of `TextureCache<P>::CheckFeedbackLoop` with the Vulkan runtime
     /// kept at the backend-owned boundary.
-    pub fn check_feedback_loop(&mut self, views: &[ImageViewInOut]) {
+    pub fn check_feedback_loop(&mut self, views: &[ImageViewInOut], writes_depth_stencil: bool) {
         let base = &mut self.base;
         let runtime = base.runtime_mut() as *mut TextureCacheRuntime;
-        base.check_feedback_loop(views, || unsafe { &mut *runtime }.barrier_feedback_loop());
+        base.check_feedback_loop(views, writes_depth_stencil, || {
+            unsafe { &mut *runtime }.barrier_feedback_loop()
+        });
     }
 
     pub fn prepare_framebuffer_for_present(&mut self, image_id: ImageId) {

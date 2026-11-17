@@ -1,5 +1,18 @@
 # Upstream parity notes
 
+## 2026-11-16 — virtual range lookups reuse the longest contiguous walk: buffer_cache/virtual_range_cache.rs vs Lichii buffer_cache/virtual_range_cache.h
+
+### Ported (Lichii 7083185c43, absent from Eden a538cd9aff; no switch)
+- `VirtualRangeCache::query` (Lichii virtual_range_cache.h:36-85) answers a query from the cached
+  entry of the same address space and GPU address when the size is the same, or when the cached
+  entry is a single segment (host-contiguous) and the new size is shorter: its prefixes are
+  contiguous too. Eden required the exact size, so a storage buffer bound at one address with
+  several sizes walked the page table on every draw. A shorter query that is not a hit, and any
+  longer one, walks again and replaces the entry, as in Lichii. A single returned segment may then
+  cover more than the range asked for; the only caller, `resolve_multi_range_storage`, ignores lists
+  of fewer than two segments.
+- Tests port Lichii src/tests/video_core/virtual_range_cache.cpp (the three cases).
+
 ## 2026-11-16 — feedback-loop barrier gated on depth/stencil writes: texture_cache/texture_cache.rs vs Lichii texture_cache/texture_cache.h
 
 ### Ported (Lichii extension, absent from Eden; Lichii 3b1d6eb9cd, no switch)

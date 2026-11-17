@@ -86,6 +86,10 @@ impl VirtualRangeCache {
     /// Upstream `Query`: returns the segments covering `[gpu_addr, gpu_addr + size)`.
     /// The list is empty when the range is not fully mapped or not contiguous in
     /// GPU space; a single segment means the range is host-contiguous.
+    ///
+    /// Lichii: the segments of a range when it has more than one. Fewer than
+    /// two means that it needs no splitting: one segment may then cover more
+    /// than the range asked for.
     pub fn query(
         &mut self,
         memory: &dyn GpuMemoryAccess,
@@ -100,8 +104,13 @@ impl VirtualRangeCache {
         }
         let as_id = memory.get_id();
         let key = Self::make_key(as_id, gpu_addr);
-        let hit = self.entries.get(&key).is_some_and(|entry| {
-            entry.as_id == as_id && entry.gpu_addr == gpu_addr && entry.size == size
+        // Lichii 7083185c43 (virtual_range_cache.h:46-53): titles bind one address
+        // with several sizes; the page table walk of the longest contiguous one
+        // answers its prefixes, which are contiguous too.
+        let hit = self.entries.get(&key).is_some_and(|cached| {
+            cached.as_id == as_id
+                && cached.gpu_addr == gpu_addr
+                && (cached.size == size || (cached.segments.len() == 1 && size < cached.size))
         });
         if hit {
             return &self.entries[&key].segments;
@@ -360,5 +369,96 @@ mod tests {
         cache.query(&memory, 0x1000, 0x1000);
         // The overflow cleared the map before the new query inserted its entry.
         assert_eq!(cache.cached_entries(), 1);
+    }
+
+    // Ports of Lichii src/tests/video_core/virtual_range_cache.cpp (7083185c43).
+    const BASE: u64 = 0x100000;
+    const HOLE: u64 = 0x10000;
+
+    /// GPU memory that is contiguous, except for a device address jump at
+    /// `BASE + HOLE` into a split range. Counts the page table walks.
+    struct FakeMemory {
+        split: bool,
+        walks: std::cell::Cell<u32>,
+    }
+
+    impl FakeMemory {
+        fn new(split: bool) -> Self {
+            Self { split, walks: std::cell::Cell::new(0) }
+        }
+    }
+
+    impl GpuMemoryAccess for FakeMemory {
+        fn gpu_to_cpu_address(&self, gpu_addr: u64) -> Option<u64> {
+            Some(gpu_addr + 0x1000)
+        }
+        fn read_u64(&self, _gpu_addr: u64) -> Option<u64> {
+            None
+        }
+        fn read_u32(&self, _gpu_addr: u64) -> Option<u32> {
+            None
+        }
+        fn is_within_gpu_address_range(&self, _gpu_addr: u64) -> bool {
+            true
+        }
+        fn max_continuous_range(&self, _gpu_addr: u64, size: u64) -> u64 {
+            size
+        }
+        fn get_memory_layout_size(&self, _gpu_addr: u64) -> u64 {
+            0
+        }
+        fn get_id(&self) -> usize {
+            1
+        }
+        fn get_submapped_range(&self, gpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
+            self.walks.set(self.walks.get() + 1);
+            if self.split && gpu_addr < BASE + HOLE && gpu_addr + size > BASE + HOLE {
+                let first = BASE + HOLE - gpu_addr;
+                return vec![(gpu_addr, first), (BASE + HOLE, size - first)];
+            }
+            vec![(gpu_addr, size)]
+        }
+    }
+
+    #[test]
+    fn contiguous_address_is_walked_once_for_its_longest_size() {
+        let memory = FakeMemory::new(false);
+        let mut cache = VirtualRangeCache::new();
+        assert_eq!(cache.query(&memory, BASE, 0x4000).len(), 1);
+        assert_eq!(memory.walks.get(), 1);
+        // Longer: walked again, and kept.
+        assert_eq!(cache.query(&memory, BASE, 0x200000).len(), 1);
+        assert_eq!(memory.walks.get(), 2);
+        // Alternating sizes up to the longest walk nothing.
+        for _ in 0..16 {
+            assert_eq!(cache.query(&memory, BASE, 0x4000).len(), 1);
+            assert_eq!(cache.query(&memory, BASE, 0x200000).len(), 1);
+            assert_eq!(cache.query(&memory, BASE, 0x1000).len(), 1);
+        }
+        assert_eq!(memory.walks.get(), 2);
+    }
+
+    #[test]
+    fn ranges_of_a_split_address_are_walked_again() {
+        let memory = FakeMemory::new(true);
+        let mut cache = VirtualRangeCache::new();
+        assert_eq!(cache.query(&memory, BASE, (HOLE * 2) as u32).len(), 2);
+        // A prefix of a split range may be whole: the list of the longer range
+        // does not answer it.
+        assert_eq!(cache.query(&memory, BASE, (HOLE / 2) as u32).len(), 1);
+        assert_eq!(memory.walks.get(), 2);
+        assert_eq!(cache.query(&memory, BASE, (HOLE * 2) as u32).len(), 2);
+        assert_eq!(memory.walks.get(), 3);
+    }
+
+    #[test]
+    fn kept_range_is_forgotten_when_its_tail_is_unmapped() {
+        let mut memory = FakeMemory::new(false);
+        let mut cache = VirtualRangeCache::new();
+        assert_eq!(cache.query(&memory, BASE, 0x200000).len(), 1);
+        cache.unmap(memory.get_id(), BASE + 0x100000, 0x1000);
+        memory.split = true;
+        assert_eq!(cache.query(&memory, BASE, (HOLE * 2) as u32).len(), 2);
+        assert_eq!(memory.walks.get(), 2);
     }
 }

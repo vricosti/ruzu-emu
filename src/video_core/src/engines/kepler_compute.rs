@@ -746,18 +746,25 @@ impl KeplerCompute {
                 .as_ref()
                 .expect("native compute requires macro owner"),
         );
-        let guard = unsafe { (*owner).lock() };
-        let context = guard.as_ptr();
         let this = self as *mut Self;
-        // All accesses are serialized by the retained context lock. No RefMut spans callbacks.
-        let selected = || unsafe {
+        // Upstream dereferences native_macro / native_macro_positions only on the paths
+        // that use them (macro calls, code and bind uploads, failure flags); the shared
+        // context is locked on exactly those paths. Most methods reaching here (upload
+        // words, semaphores, QMD launches) never touch it, so they no longer lock it, and
+        // the front may run macros while the back dispatches.
+        //
+        // Every `selected`/`positions` dereference below happens while a guard from
+        // `lock_context` is alive in the same branch (the reentrant lock nests for the
+        // register writes a macro emits). No RefMut spans callbacks.
+        let lock_context = || unsafe { (*owner).lock() };
+        let selected = |context: *mut crate::r#macro::NativeMacroContext| unsafe {
             if (*this).native_macro_compute {
                 std::ptr::addr_of_mut!((*context).compute_engine)
             } else {
                 std::ptr::addr_of_mut!((*context).engine)
             }
         };
-        let positions = || unsafe {
+        let positions = |context: *mut crate::r#macro::NativeMacroContext| unsafe {
             if (*this).native_macro_compute {
                 std::ptr::addr_of_mut!((*context).compute_positions)
             } else {
@@ -797,7 +804,9 @@ impl KeplerCompute {
                     .native_parameters
                     .iter()
                     .any(|parameter| parameter & !0xf == watch);
-            let start = unsafe { (*positions())[entry] };
+            let guard = lock_context();
+            let context = guard.as_ptr();
+            let start = unsafe { (*positions(context))[entry] };
             if watched {
                 log::info!(
                     "Semaphore watch: compute macro start={start:#x} parameters={:08x?}",
@@ -811,7 +820,7 @@ impl KeplerCompute {
                 if !self.native_mme_dumped && start == 0xda {
                     self.native_mme_dumped = true;
                     dump_words(format!("native-compute-mme-{this:p}.bin"), unsafe {
-                        &(*selected()).native_code
+                        &(*selected(context)).native_code
                     });
                 }
                 log::info!(
@@ -820,7 +829,7 @@ impl KeplerCompute {
                     self.native_parameters
                 );
             }
-            let engine = selected();
+            let engine = selected(context);
             // Upstream assigns the active_dram pointer; the owning handle is only
             // replaced when it names other storage (no refcount churn per call).
             if let Some(ram) = &self.native_data_ram {
@@ -916,7 +925,7 @@ impl KeplerCompute {
                             &mut emit,
                         );
                         if !result.success {
-                            (*selected()).native_execution_failed = true;
+                            (*selected(context)).native_execution_failed = true;
                             log::error!("Native MME (JIT) failed: compute start={start:#x}, consumed={}/{}, error={}", result.consumed, parameters.len(), result.error);
                         }
                         return;
@@ -964,13 +973,13 @@ impl KeplerCompute {
                     },
                     |address, value, fifo, ram| {
                         if use_memo {
-                            (*selected()).native_writes.push((address, value));
+                            (*selected(context)).native_writes.push((address, value));
                         }
                         emit(address, value, fifo, ram)
                     },
                     Some(ram),
                 );
-                let current = selected();
+                let current = selected(context);
                 let state = if current == engine {
                     &*interpreter
                 } else {
@@ -995,7 +1004,7 @@ impl KeplerCompute {
                 if *MME_DUMP_AFTER.get_or_init(|| std::env::var_os("EDEN_NX2_MME_DUMP").is_some())
                     && ram[0x27] != dram0_before
                 {
-                    log::info!("MME data RAM[0x27] {dram0_before:#x} -> {:#x} by engine {this:p} macro start={:#x}", ram[0x27], (*positions())[entry]);
+                    log::info!("MME data RAM[0x27] {dram0_before:#x} -> {:#x} by engine {this:p} macro start={:#x}", ram[0x27], (*positions(context))[entry]);
                 }
                 if !result.success {
                     (*current).native_execution_failed = true;
@@ -1005,7 +1014,7 @@ impl KeplerCompute {
                     {
                         dump_words("native-compute-mme.bin".into(), &(*current).native_code);
                     }
-                    log::error!("Native MME failed: compute start={:#x}, pc={:#x}, consumed={}/{}, error={}, parameters={parameters:08x?}", (*positions())[entry], result.pc, result.consumed, parameters.len(), result.error);
+                    log::error!("Native MME failed: compute start={:#x}, pc={:#x}, consumed={}/{}, error={}, parameters={parameters:08x?}", (*positions(context))[entry], result.pc, result.consumed, parameters.len(), result.error);
                 }
             }));
             if let Some(mut interpreter) = interpreter {
@@ -1076,7 +1085,8 @@ impl KeplerCompute {
                 .is_fully_mapped_range(address, 256)
             {
                 unsafe {
-                    (*selected()).native_execution_failed = true;
+                    let guard = lock_context();
+                    (*selected(guard.as_ptr())).native_execution_failed = true;
                 }
                 log::error!("Unmapped native inline QMD destination");
                 return true;
@@ -1105,13 +1115,15 @@ impl KeplerCompute {
         match method {
             0x45 => {
                 unsafe {
-                    (*selected()).clear_code(argument);
+                    let guard = lock_context();
+                    (*selected(guard.as_ptr())).clear_code(argument);
                 }
                 true
             }
             0x46 => {
                 unsafe {
-                    (*selected()).add_code(0, argument);
+                    let guard = lock_context();
+                    (*selected(guard.as_ptr())).add_code(0, argument);
                 }
                 true
             }
@@ -1122,7 +1134,8 @@ impl KeplerCompute {
             0x48 => {
                 if self.native_bind_pointer < 0x80 {
                     unsafe {
-                        (*positions())[self.native_bind_pointer as usize] = argument;
+                        let guard = lock_context();
+                        (*positions(guard.as_ptr()))[self.native_bind_pointer as usize] = argument;
                     }
                     self.native_bind_pointer += 1;
                 } else {
@@ -1240,7 +1253,8 @@ impl KeplerCompute {
                     return true;
                 }
                 unsafe {
-                    (*selected()).native_execution_failed = true;
+                    let guard = lock_context();
+                    (*selected(guard.as_ptr())).native_execution_failed = true;
                 }
                 let mut qmd = [0u32; 128];
                 let mapped = self
@@ -1270,9 +1284,11 @@ impl KeplerCompute {
                 log::error!("Native QMD failed: {error}");
                 if diagnostics && mapped {
                     dump_words("native-qmd.bin".into(), &qmd);
+                    let guard = lock_context();
                     dump_words("native-dispatch-mme.bin".into(), unsafe {
-                        &(*selected()).native_code
+                        &(*selected(guard.as_ptr())).native_code
                     });
+                    drop(guard);
                     dump_words(
                         "native-dispatch-registers.bin".into(),
                         &self.native_registers,
@@ -2377,6 +2393,45 @@ mod tests {
         });
         unlocked.join().unwrap();
         assert!(fs.compute_uploaded);
+    }
+
+    #[test]
+    fn native_methods_lock_the_macro_context_only_where_they_use_it() {
+        // Upstream ProcessNativeMethod dereferences native_macro only on macro, code,
+        // bind and failure paths. A method outside them must not wait for a context
+        // another thread (the split's front running a macro) holds.
+        let context = Arc::new(parking_lot::ReentrantMutex::new(RefCell::new(
+            crate::r#macro::NativeMacroContext::default(),
+        )));
+        let mut engine = Box::new(new_test_engine());
+        engine.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let context = context.clone();
+            std::thread::spawn(move || {
+                let _guard = context.lock();
+                ready_tx.send(()).unwrap();
+                // Bounded so that a regression fails instead of hanging the test.
+                done_rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok()
+            })
+        };
+        ready_rx.recv().unwrap();
+        engine.call_method(0x47, 9, true); // bind pointer
+        engine.call_method(0xad, 0x70, true); // plain QMD address register
+        engine.call_method(0xae, 0, true); // QMD action without a launch
+        engine.call_method(0xb0, 1, true);
+        done_tx.send(()).unwrap();
+        assert!(holder.join().unwrap(), "a context-free method waited for the macro context");
+        assert_eq!(engine.native_bind_pointer, 9);
+        assert!(engine.native_compute_uploaded);
+        // A bind upload does use the context, and still writes the selected positions.
+        engine.call_method(0x48, 0x1234, true);
+        assert_eq!(engine.native_bind_pointer, 10);
+        let guard = context.lock();
+        let state = guard.borrow();
+        assert_eq!(state.compute_positions[9], 0x1234);
+        assert_eq!(state.positions[9], 0);
     }
 
     #[test]

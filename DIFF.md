@@ -28499,3 +28499,25 @@ drawn black and appearing or vanishing from one frame to the next.
 - Profile retains Vulkan's `32_BIT_ONLY` denorm-independence capability separately from upstream's `ALL` boolean. Only the optimized matrix helper consumes the additional property, and only in shaders without FP64: FP16 and FP64 remain coupled on these devices. Existing non-matrix denorm-control selection is unchanged. Other backend profiles default to false.
 - The profile is compilation metadata, not a raw serialized ABI payload. Tests exercise partial independence with and without FP64, full independence, and absent capabilities. The independent diagnostic shader also ran with the Vulkan validation layer without reported errors on the partial-independence device.
 
+
+## 2026-11-17 — src/video_core/src/{renderer_vulkan/query_cache.rs,engines/kepler_compute.rs,native_query_trace.rs,renderer_vulkan/pipeline_cache.rs} and src/core/src/core.rs vs Lichii video_core/{renderer_vulkan/vk_query_cache.cpp,engines/kepler_compute.cpp,native_query_trace.h,renderer_vulkan/vk_pipeline_cache.cpp} and core/core.h (GPU back thread per-draw costs)
+
+### Intentional differences
+- The samples streamer keeps the running query as `(bank, start, amount)` runs in
+  `SamplesQueryState::history`, with the slot count beside them (`history_slots`), where Lichii
+  keeps one `current_query` (`start_bank_id`, `size_banks`, `start_slot`, `size_slots`) and walks
+  its banks through `next_bank` (`ApplyBankOp`). A slot joins the runs when its counter is paused,
+  not when it is reserved (`ReserveHostQuery`): every report pauses the counter first, so a report
+  sees the same slots. Reports copy the runs and take `amount` references per run, as
+  `ApplyBankOp(..., AddReference(amount))`.
+- The begin/end query commands capture the `vkCmdBeginQuery` / `vkCmdEndQuery` entry points of the
+  bank's device instead of a copy of `ash::Device`; upstream's commands capture only the pool and
+  the slot and reach the dispatch through the command buffer.
+- `native_query_trace_enabled()` exposes the `diagnostics` static of `TraceNativeQuery`.
+  `KeplerCompute::process_native_method` builds the trace arguments (`memory_manager.GetID()`,
+  `GpuToCpuAddress`) only when it is set: the port's memory manager is behind a lock, which
+  upstream's plain reads do not take.
+- `PipelineCache::current_graphics_pipeline` reads `native_turing` once per lookup, under the
+  macro context's lock; upstream reads the flag without a lock at each use.
+- `System::gpu_dirty_memory_managers` returns a slice over the managers, as upstream's `std::span`;
+  `KProcess` copies it into the process memory.

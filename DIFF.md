@@ -28521,3 +28521,17 @@ drawn black and appearing or vanishing from one frame to the next.
   macro context's lock; upstream reads the flag without a lock at each use.
 - `System::gpu_dirty_memory_managers` returns a slice over the managers, as upstream's `std::span`;
   `KProcess` copies it into the process memory.
+
+## 2026-11-17 — src/video_core/src/{engines/kepler_compute.rs,renderer_vulkan/vk_rasterizer.rs} vs Lichii video_core/{engines/kepler_compute.cpp,renderer_vulkan/vk_rasterizer.cpp} (GPU back thread compute costs)
+
+### Intentional differences
+- The native macro context (`native_macro` / `native_macro_positions` upstream, raw pointers
+  read without a lock) is a reentrant mutex shared with the split GPU thread's front and with
+  Maxwell3D. `KeplerCompute::process_native_method` locks it only on the paths that dereference
+  it: a macro call (for the whole call, so the register writes the macro emits nest in the
+  reentrant lock), the code and bind uploads (0x45, 0x46, 0x48) and the
+  `native_execution_failed` writes. Upload words, report semaphores, QMD actions and launches,
+  the bind pointer and plain registers do not take it.
+- `RasterizerVulkan::accelerate_inline_to_memory` and `dispatch_compute` borrow the channel
+  memory manager's owner and lock it, where upstream uses its `gpu_memory` pointer; no clone of
+  the owning `Arc` per call.

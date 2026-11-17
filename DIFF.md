@@ -1,5 +1,44 @@
 # Upstream parity notes
 
+## 2026-11-16 — guest-side lock waits: core/hle/kernel/{k_spin_lock,svc/svc_info}.rs, common/spin_recursive_mutex.rs, video_core/{buffer_cache/buffer_cache,texture_cache/texture_cache_base,renderer_vulkan/vk_rasterizer}.rs vs Lichii core/hle/kernel/k_spin_lock.{h,cpp}, common/spin_recursive_mutex.h, video_core/{buffer_cache/buffer_cache_base.h,texture_cache/texture_cache_base.h,renderer_vulkan/vk_rasterizer.cpp} and Eden core/hle/kernel/svc/svc_info.cpp
+
+### Ported (Lichii divergences from Eden)
+- `KSpinLock` (Lichii 63244330cd): Eden wraps `std::mutex`; Lichii's three-state lock (0 free,
+  1 held, 2 held with sleepers) spins 128 pauses on contention before sleeping. ruzu's wrapped a
+  `parking_lot::Mutex`. The scheduler lock is a `KAlignedSpinLock`, so this reaches every
+  scheduler-lock acquisition, on Switch 1 titles too (as in Lichii).
+- `Common::SpinRecursiveMutex` (Lichii e08b402527) for the texture and buffer caches' mutexes
+  (Eden: `std::recursive_mutex`; ruzu had `parking_lot::ReentrantMutex`): ~1024 pauses before
+  sleeping. Guest CPU write traps (`on_cpu_write`) and reads (`get_flush_area`) take these locks
+  while the GPU thread holds them through each draw.
+- `RasterizerVulkan::get_flush_area` asks `texture_cache.page_filter` before taking the texture
+  cache's lock (Lichii vk_rasterizer.cpp:2812-2816). The filter was already maintained.
+
+Measured on the NX2 title used for measurement (forest scene, 60 s window, 2026-11-16 session):
+base 33.53-35.33 fps (median frame 27.91-28.57 ms, five runs); KSpinLock alone (with the GetInfo
+fix) 36.40 fps / 27.13 ms; SpinRecursiveMutex alone 36.13 / 27.32; page_filter gate alone
+34.55 / 28.65 (no effect on its own); all four 36.57-36.70 / 26.82-26.89 (four runs). The GPU
+back thread's voluntary context switches fall from ~115 to ~9 a frame, the guest cores' from
+~260 to ~130-190.
+
+### Realigned on Eden
+- `svc::GetInfo` logs at trace level (Eden svc_info.cpp:20 `LOG_TRACE`); ruzu logged every call
+  at info level (~120 lines a second on the NX2 title used for measurement).
+
+### Intentional differences
+- `std::atomic::wait`/`notify_one` become `parking_lot_core::park`/`unpark_one` keyed on the
+  state's address; the recursive mutex's owner is a per-thread token instead of
+  `std::thread::id`; Lichii's EDEN_NX2_GPU_PROFILE contention counters are not ported.
+
+### Not ported
+- Lichii's `PhysicalCore::Idle` poll (f26ad432ae, cedfc26f47: up to 100 us of polling before an
+  idle Switch 2 core blocks). Measured in ruzu on this host (Intel, so Lichii's yield fallback):
+  one run 32.30 fps against 33.53-35.33 for the references, median frame 29.5 ms against
+  27.9-28.6; Lichii itself loses nothing without it (46.47 fps with EDEN_NX2_IDLE_SPIN_US=0
+  against 46.12).
+- Lichii's second `GetFlushArea` gate (`Nx2MayBeGpuWritten` for the buffer cache): ruzu has no
+  GPU-written page bitmap.
+
 ## 2026-11-16 — Lichii NX2 performance mechanisms: submission policy, GPU thread pinning, fence batches, deferred fragment barriers
 
 All four are Lichii extensions, absent from Eden. The losses quoted are Lichii's own ablation on

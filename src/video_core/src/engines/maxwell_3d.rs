@@ -2373,7 +2373,6 @@ pub(crate) struct FrontState {
     control: u32,
     executing_macro: u32,
     parameters: Vec<u32>,
-    fifo: Vec<u32>,
     calls: u64,
     draw_pending: bool,
     /// The back holds state writes in its method sink, which its next
@@ -2616,7 +2615,6 @@ impl Maxwell3D {
                 control: engine.shadow_state[SHADOW_RAM_CONTROL as usize],
                 executing_macro: engine.executing_macro,
                 parameters: std::mem::take(&mut engine.macro_params),
-                fifo: Vec::new(),
                 calls: 0,
                 draw_pending: true,
                 sink_pending: false,
@@ -2882,73 +2880,89 @@ impl Maxwell3D {
         {
             let method = fs.executing_macro;
             fs.executing_macro = 0;
-            let owner = fs.macro_owner.clone();
-            let ram_owner = fs.native_data_ram.clone();
-            {
-                let start = {
-                    let guard = owner.lock();
-                    let context = guard.borrow();
-                    context.positions[((method - MACRO_REGISTERS_START) >> 1) as usize
-                        % context.positions.len()]
-                };
-                let on_back = Self::front_run_on_back(fs, split, start);
-                if !on_back {
+            // Upstream reaches the shared macro context through GetNativeMacroEngine() and the
+            // channel's data RAM as a member, with no reference counting. Rust borrows both
+            // allocations through their owning handles instead of cloning the Arcs per call.
+            // SAFETY: FrontState::macro_owner and FrontState::native_data_ram are set once by
+            // Maxwell3D::front and never reassigned; `fs` (and so both Arcs) outlives this call,
+            // and nothing below touches those two fields through `fs`.
+            let owner = unsafe { &*Arc::as_ptr(&fs.macro_owner) };
+            let ram_owner = unsafe { &*Arc::as_ptr(&fs.native_data_ram) };
+            // One context lock for what FrontRunOnBack reads of the engine (upstream passes it
+            // by reference): it is released before FrontRunOnBack, which may wait for the
+            // back, which takes this lock itself (Maxwell3D::get_native_macro_engine_read).
+            // Only this, the split's front thread, writes the code, its generation and the
+            // positions while the split runs (front_write; the back skips LOAD_MME_* with
+            // front_macros), so the values stay current until they are used below.
+            let (start, generation, code_words) = {
+                let guard = owner.lock();
+                let context = guard.borrow();
+                (context.positions[((method - MACRO_REGISTERS_START) >> 1) as usize
+                    % context.positions.len()],
+                    context.engine.native_code_generation, context.engine.native_code.len())
+            };
+            let on_back = Self::front_run_on_back(fs, split, start, generation, code_words);
+            if !on_back {
                 let _profile = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::Macro);
-                let jit = {
+                let parameter_count = fs.parameters.len();
+                let mut jit = {
                     let guard = owner.lock();
                     let mut context = guard.borrow_mut();
                     let macro_engine = &mut context.engine;
                     // Upstream stores the same pointer every call; the owning handle is
                     // only replaced when it names another RAM (no reference count traffic).
                     if !macro_engine.native_interpreter.active_dram.as_ref()
-                        .is_some_and(|ram| Arc::ptr_eq(ram, &ram_owner))
+                        .is_some_and(|ram| Arc::ptr_eq(ram, &fs.native_data_ram))
                     {
-                        macro_engine.native_interpreter.active_dram = Some(ram_owner.clone());
+                        macro_engine.native_interpreter.active_dram = Some(fs.native_data_ram.clone());
                     }
-                    let jit = macro_engine.native_jit.get_or_insert_with(|| {
+                    // SAFETY: native_jit is created once and never replaced while the engine
+                    // lives (as MacroEngine::execute_native borrows it), and the engine lives
+                    // in the context `owner` keeps alive.
+                    let jit = unsafe { &*Arc::as_ptr(macro_engine.native_jit.get_or_insert_with(|| {
                         Arc::new(std::sync::Mutex::new(Default::default()))
-                    }).clone();
-                    jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .prepare(&macro_engine.native_code, macro_engine.native_code_generation)
+                    })) };
+                    // One JIT lock for Prepare and Execute (as execute_native): it is
+                    // uncontended, the back runs the calls it makes in the front's place
+                    // with its own engine (front_run_on_back).
+                    let mut jit = jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    jit.prepare(&macro_engine.native_code, macro_engine.native_code_generation)
                         .expect("native graphics frontend macro JIT preparation failed");
                     jit
                 }; // No context/engine borrow may span enqueue or DMA Drain.
-                fs.fifo.clone_from(&fs.parameters);
-                let mut fifo = std::mem::take(&mut fs.fifo);
+                // Upstream executes on fs.parameters in place (FrontDmaRead appends to it).
+                // Rust moves the vector out for the call, so that the callbacks' accesses
+                // through `front` do not alias it; it is put back, cleared, below. No callback
+                // reads fs.parameters. A panic out of Execute (re-raised by it once the JIT
+                // returned, macro_turing_jit.rs) leaves fs.parameters empty, as after a call.
+                let mut fifo = std::mem::take(&mut fs.parameters);
                 let mut ram = ram_owner.lock();
                 let front = fs as *mut FrontState;
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut jit = jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    jit.execute(start, &mut fifo, &mut ram,
-                        |address| unsafe {
-                            let index = address as usize;
-                            if index >= NUM_REGS { 0 }
-                            else if (*front).back_owned[index] {
-                                Self::front_register(&mut *front, split, address)
-                            } else { (*front).regs[index] }
-                        },
-                        |address, value, fifo, ram| {
-                            if address >= MACRO_REGISTERS_START { return false; }
-                            unsafe { Self::front_write(&mut *front, engine, split, address, value, true, true); }
-                            // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED
-                            // (into the load FIFO).
-                            if address == 0x157 || address == 0x158 {
-                                unsafe { Self::front_dma_read(&mut *front, split, address, value, fifo, ram); }
-                            }
-                            true
-                        },
-                    )
-                }));
+                let result = jit.execute(start, &mut fifo, &mut ram,
+                    |address| unsafe {
+                        let index = address as usize;
+                        if index >= NUM_REGS { 0 }
+                        else if (*front).back_owned[index] {
+                            Self::front_register(&mut *front, split, address)
+                        } else { (*front).regs[index] }
+                    },
+                    |address, value, fifo, ram| {
+                        if address >= MACRO_REGISTERS_START { return false; }
+                        unsafe { Self::front_write(&mut *front, engine, split, address, value, true, true); }
+                        // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED
+                        // (into the load FIFO).
+                        if address == 0x157 || address == 0x158 {
+                            unsafe { Self::front_dma_read(&mut *front, split, address, value, fifo, ram); }
+                        }
+                        true
+                    },
+                );
                 drop(ram);
-                fs.fifo = fifo;
-                match result {
-                    Ok(result) if !result.success => {
-                        owner.lock().borrow_mut().engine.native_execution_failed = true;
-                        log::error!("Native MME (JIT, split front) failed: start={start:#x}, consumed={}/{}, error={}", result.consumed, fs.parameters.len(), result.error);
-                    }
-                    Err(payload) => std::panic::resume_unwind(payload),
-                    _ => {}
-                }
+                drop(jit);
+                fs.parameters = fifo;
+                if !result.success {
+                    owner.lock().borrow_mut().engine.native_execution_failed = true;
+                    log::error!("Native MME (JIT, split front) failed: start={start:#x}, consumed={}/{}, error={}", result.consumed, parameter_count, result.error);
                 }
             }
             fs.parameters.clear();
@@ -2983,20 +2997,17 @@ impl Maxwell3D {
     /// writes them (front_take_over) or needs them (front_register). Returns
     /// whether the call went to the back.
     ///
-    /// Rust reads the macro code and its generation under the shared context
-    /// lock, never held while waiting for the back.
+    /// Upstream takes the macro engine by reference. Rust takes the two fields
+    /// it reads, the code generation and the code length in words, which
+    /// front_run_macro reads under the shared context lock: that lock is never
+    /// held here, since this may wait for the back.
     fn front_run_on_back(fs: &mut FrontState, split: &crate::gpu_split::GpuSplitFrontend,
-        start: u32) -> bool
+        start: u32, generation: u64, code_words: usize) -> bool
     {
         use std::sync::atomic::Ordering;
         if fs.parameters.len() > 0x1000 {
             return false;
         }
-        let (generation, code_words) = {
-            let guard = fs.macro_owner.lock();
-            let context = guard.borrow();
-            (context.engine.native_code_generation, context.engine.native_code.len())
-        };
         if fs.back_generation != generation {
             // The macros sent before run the code they were sent with, and
             // check their records.

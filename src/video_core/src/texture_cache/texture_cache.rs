@@ -1845,13 +1845,21 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
         image_id
     }
 
-    /// Port of `TextureCache<P>::CheckFeedbackLoop`.
+    /// Port of `TextureCache<P>::CheckFeedbackLoop` with Lichii's
+    /// `feedback_depth_dirty` gate (Lichii texture_cache.h:845-921, commit 3b1d6eb9cd).
     ///
     /// Exact colour-target views and aliases are skipped; only a distinct view
-    /// aliasing the active depth image requires the feedback-loop barrier.
+    /// aliasing the active depth image requires the feedback-loop barrier, and
+    /// it is issued only when depth or stencil may have been written since the
+    /// last one or the render targets changed.
+    ///
+    /// Lichii reads `regs.depth_write_enabled != 0 || regs.stencil_enable != 0`
+    /// from `maxwell3d->regs`; ruzu's back end cannot borrow the live engine, so
+    /// the caller passes that value, read from the draw's register view.
     pub fn check_feedback_loop(
         &mut self,
         views: &[ImageViewInOut],
+        writes_depth_stencil: bool,
         mut barrier_feedback_loop: impl FnMut(),
     ) {
         if !*common::settings::values()
@@ -1861,48 +1869,60 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             return;
         }
 
-        if self.render_targets_serial == self.last_feedback_loop_serial
-            && self.texture_bindings_serial == self.last_feedback_texture_serial
-        {
-            if self.last_feedback_loop_result {
-                barrier_feedback_loop();
+        'check: {
+            if self.render_targets_serial == self.last_feedback_loop_serial
+                && self.texture_bindings_serial == self.last_feedback_texture_serial
+            {
+                if self.last_feedback_loop_result && self.feedback_depth_dirty {
+                    barrier_feedback_loop();
+                    self.feedback_depth_dirty = false;
+                }
+                break 'check;
             }
-            return;
-        }
-        if self.rt_active_mask == 0 {
+            if self.render_targets_serial != self.last_feedback_loop_serial {
+                self.feedback_depth_dirty = true;
+            }
+            if self.rt_active_mask == 0 {
+                self.last_feedback_loop_serial = self.render_targets_serial;
+                self.last_feedback_texture_serial = self.texture_bindings_serial;
+                self.last_feedback_loop_result = false;
+                break 'check;
+            }
+            let depth_active = (self.rt_active_mask & (1 << NUM_RT)) != 0;
+            let requires_barrier = views.iter().any(|view| {
+                if !view.id.is_valid() || view.id == NULL_IMAGE_VIEW_ID {
+                    return false;
+                }
+                if (0..NUM_RT).any(|index| {
+                    (self.rt_active_mask & (1 << index)) != 0
+                        && view.id == self.render_targets.color_buffer_ids[index]
+                }) {
+                    return false;
+                }
+                if depth_active && view.id == self.render_targets.depth_buffer_id {
+                    return false;
+                }
+                let view_image_id = self.slot_image_views[view.id].image_id;
+                if (0..NUM_RT).any(|index| {
+                    (self.rt_active_mask & (1 << index)) != 0
+                        && view_image_id == self.rt_image_id[index]
+                }) {
+                    return false;
+                }
+                depth_active && view_image_id == self.rt_depth_image_id
+            });
             self.last_feedback_loop_serial = self.render_targets_serial;
             self.last_feedback_texture_serial = self.texture_bindings_serial;
-            self.last_feedback_loop_result = false;
-            return;
+            self.last_feedback_loop_result = requires_barrier;
+            if requires_barrier && self.feedback_depth_dirty {
+                barrier_feedback_loop();
+                self.feedback_depth_dirty = false;
+            }
         }
-        let depth_active = (self.rt_active_mask & (1 << NUM_RT)) != 0;
-        let requires_barrier = views.iter().any(|view| {
-            if !view.id.is_valid() || view.id == NULL_IMAGE_VIEW_ID {
-                return false;
-            }
-            if (0..NUM_RT).any(|index| {
-                (self.rt_active_mask & (1 << index)) != 0
-                    && view.id == self.render_targets.color_buffer_ids[index]
-            }) {
-                return false;
-            }
-            if depth_active && view.id == self.render_targets.depth_buffer_id {
-                return false;
-            }
-            let view_image_id = self.slot_image_views[view.id].image_id;
-            if (0..NUM_RT).any(|index| {
-                (self.rt_active_mask & (1 << index)) != 0
-                    && view_image_id == self.rt_image_id[index]
-            }) {
-                return false;
-            }
-            depth_active && view_image_id == self.rt_depth_image_id
-        });
-        self.last_feedback_loop_serial = self.render_targets_serial;
-        self.last_feedback_texture_serial = self.texture_bindings_serial;
-        self.last_feedback_loop_result = requires_barrier;
-        if requires_barrier {
-            barrier_feedback_loop();
+        // Lichii's SCOPE_EXIT: this draw may write depth or stencil, so the next
+        // draw that samples the depth target needs a new barrier.
+        if writes_depth_stencil {
+            self.feedback_depth_dirty = true;
         }
     }
 
@@ -9080,6 +9100,7 @@ mod tests {
                 id: sampled_view_id,
                 ..ImageViewInOut::default()
             }],
+            true,
             || barriers += 1,
         );
         assert_eq!(barriers, 0);
@@ -9101,6 +9122,7 @@ mod tests {
                 id: sampled_view_id,
                 ..ImageViewInOut::default()
             }],
+            true,
             || barriers += 1,
         );
         assert_eq!(barriers, 1);
@@ -9129,6 +9151,7 @@ mod tests {
                     ..ImageViewInOut::default()
                 },
             ],
+            true,
             || barriers += 1,
         );
         assert_eq!(barriers, 0);
@@ -9194,6 +9217,7 @@ mod tests {
                 id: unrelated,
                 ..ImageViewInOut::default()
             }],
+            true,
             || barriers += 1,
         );
         cache.check_feedback_loop(
@@ -9201,6 +9225,7 @@ mod tests {
                 id: depth_alias,
                 ..ImageViewInOut::default()
             }],
+            true,
             || barriers += 1,
         );
         assert_eq!(barriers, 0);
@@ -9211,6 +9236,7 @@ mod tests {
                 id: depth_alias,
                 ..ImageViewInOut::default()
             }],
+            true,
             || barriers += 1,
         );
         cache.check_feedback_loop(
@@ -9218,8 +9244,95 @@ mod tests {
                 id: depth_alias,
                 ..ImageViewInOut::default()
             }],
+            true,
             || barriers += 1,
         );
         assert_eq!(barriers, 2);
+    }
+
+    /// Cache with an active depth target and a distinct view of its image.
+    fn depth_feedback_cache() -> (TextureCacheBase, ImageViewInOut) {
+        let mut cache = test_cache();
+        let depth_image_id = insert_test_image(&mut cache, 0x6A00_0000);
+        let depth_alias = insert_test_view(&mut cache, depth_image_id);
+        cache.render_targets.depth_buffer_id = insert_test_view(&mut cache, depth_image_id);
+        cache.rt_active_mask = 1 << NUM_RT;
+        cache.rt_depth_image_id = depth_image_id;
+        cache.render_targets_serial = 1;
+        let view = ImageViewInOut { id: depth_alias, ..ImageViewInOut::default() };
+        (cache, view)
+    }
+
+    #[test]
+    fn check_feedback_loop_skips_barrier_without_depth_stencil_writes() {
+        // Lichii texture_cache.h:845-921: once a barrier is issued, draws that
+        // keep sampling the depth target without writing depth or stencil keep
+        // the render pass open.
+        let (mut cache, view) = depth_feedback_cache();
+        let mut barriers = 0;
+        cache.check_feedback_loop(&[view], false, || barriers += 1);
+        assert_eq!(barriers, 1);
+        assert!(!cache.feedback_depth_dirty);
+        for _ in 0..4 {
+            cache.check_feedback_loop(&[view], false, || barriers += 1);
+        }
+        assert_eq!(barriers, 1);
+    }
+
+    #[test]
+    fn check_feedback_loop_depth_or_stencil_write_rearms_barrier() {
+        let (mut cache, view) = depth_feedback_cache();
+        let mut barriers = 0;
+        // The first draw writes depth: its barrier is issued, then the flag is
+        // raised again for the next draw.
+        cache.check_feedback_loop(&[view], true, || barriers += 1);
+        assert_eq!(barriers, 1);
+        assert!(cache.feedback_depth_dirty);
+        cache.check_feedback_loop(&[view], false, || barriers += 1);
+        assert_eq!(barriers, 2);
+        cache.check_feedback_loop(&[view], false, || barriers += 1);
+        assert_eq!(barriers, 2);
+    }
+
+    #[test]
+    fn check_feedback_loop_writes_without_aliasing_view_still_raise_flag() {
+        // The flag is raised on exit whatever the barrier decision, including
+        // a draw with no render target and an early return.
+        let (mut cache, view) = depth_feedback_cache();
+        let mut barriers = 0;
+        cache.check_feedback_loop(&[view], false, || barriers += 1);
+        assert!(!cache.feedback_depth_dirty);
+        cache.texture_bindings_serial += 1;
+        cache.check_feedback_loop(&[], true, || barriers += 1);
+        assert_eq!(barriers, 1);
+        assert!(cache.feedback_depth_dirty);
+        cache.texture_bindings_serial += 1;
+        cache.check_feedback_loop(&[view], false, || barriers += 1);
+        assert_eq!(barriers, 2);
+    }
+
+    #[test]
+    fn check_feedback_loop_render_target_change_rearms_barrier() {
+        let (mut cache, view) = depth_feedback_cache();
+        let mut barriers = 0;
+        cache.check_feedback_loop(&[view], false, || barriers += 1);
+        cache.check_feedback_loop(&[view], false, || barriers += 1);
+        assert_eq!(barriers, 1);
+        // A new texture binding serial alone does not re-arm the barrier.
+        cache.texture_bindings_serial += 1;
+        cache.check_feedback_loop(&[view], false, || barriers += 1);
+        assert_eq!(barriers, 1);
+        // New render targets do.
+        cache.render_targets_serial += 1;
+        cache.check_feedback_loop(&[view], false, || barriers += 1);
+        assert_eq!(barriers, 2);
+        // Even when the render targets changed while nothing was bound.
+        cache.render_targets_serial += 1;
+        cache.rt_active_mask = 0;
+        cache.check_feedback_loop(&[view], false, || barriers += 1);
+        cache.rt_active_mask = 1 << NUM_RT;
+        cache.texture_bindings_serial += 1;
+        cache.check_feedback_loop(&[view], false, || barriers += 1);
+        assert_eq!(barriers, 3);
     }
 }

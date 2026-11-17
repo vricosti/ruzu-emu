@@ -603,14 +603,20 @@ impl KeplerCompute {
     ) {
         #[cfg(target_arch = "x86_64")]
         {
-            let owner = Self::front_macro_owner(fs).clone();
+            // Upstream reaches the context, the JIT and the channel's data RAM through raw
+            // pointers / shared_ptr members used in place. Rust borrows the allocations
+            // through their owning handles instead of cloning the Arcs per call.
+            // SAFETY: FrontState::native_context, macro_owner and native_data_ram are set once
+            // by KeplerCompute::front and never reassigned; `fs` (and so these Arcs) outlives
+            // this call, and nothing below touches those fields through `fs`.
+            let owner = unsafe { &*Arc::as_ptr(Self::front_macro_owner(fs)) };
             // Keep the original macro identity for restoring RAM and reporting
             // failures even if an emitted upload changes the frontend selector.
             let compute = if fs.native_context.is_some() {
                 fs.compute_uploaded
             } else { fs.macro_compute };
             let _profile = crate::nx2_profile::Scope::new(crate::nx2_profile::Zone::Macro);
-            let (start, jit, ram_owner, mut local_ram) = {
+            let (start, mut jit, kept_ram, mut local_ram) = {
                 let guard = owner.lock();
                 let mut context = guard.borrow_mut();
                 let positions = Self::front_macro_positions(fs, &mut context);
@@ -618,30 +624,52 @@ impl KeplerCompute {
                     % positions.len()];
                 fs.executing_macro = None;
                 let macro_engine = Self::front_macro_engine(fs, &mut context);
+                // Upstream stores the same pointer every call; the owning handle is only
+                // replaced when it names another RAM (no reference count traffic).
                 if let Some(ram) = &fs.native_data_ram {
-                    macro_engine.native_interpreter.active_dram = Some(ram.clone());
+                    if !macro_engine.native_interpreter.active_dram.as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, ram))
+                    {
+                        macro_engine.native_interpreter.active_dram = Some(ram.clone());
+                    }
                 }
-                let jit = macro_engine.native_jit.get_or_insert_with(|| {
+                // SAFETY: native_jit is created once and never replaced while the engine
+                // lives (as MacroEngine::execute_native borrows it); the engine lives in the
+                // context `owner` keeps alive.
+                let jit = unsafe { &*Arc::as_ptr(macro_engine.native_jit.get_or_insert_with(|| {
                     Arc::new(std::sync::Mutex::new(Default::default()))
-                }).clone();
-                jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .prepare(&macro_engine.native_code, macro_engine.native_code_generation)
+                })) };
+                // One JIT lock for Prepare and Execute (as execute_native); only the front
+                // runs this engine's macros while the split runs.
+                let mut jit = jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                jit.prepare(&macro_engine.native_code, macro_engine.native_code_generation)
                     .expect("native compute frontend macro JIT preparation failed");
-                let ram_owner = macro_engine.native_interpreter.active_dram.clone();
-                let local_ram = ram_owner.is_none().then(|| {
+                // The channel's RAM, which active_dram now names, is borrowed from
+                // FrontState below. Without one, the owning handle active_dram holds
+                // (another engine's RAM) is kept for the call, as before.
+                let kept_ram = if fs.native_data_ram.is_none() {
+                    macro_engine.native_interpreter.active_dram.clone()
+                } else { None };
+                let local_ram = (fs.native_data_ram.is_none() && kept_ram.is_none()).then(|| {
                     std::mem::replace(&mut macro_engine.native_interpreter.dram, [0; 0xc00])
                 });
-                (start, jit, ram_owner, local_ram)
+                (start, jit, kept_ram, local_ram)
             }; // Release the context before Execute can enqueue or wait for the back.
+            let ram_owner: Option<&Mutex<crate::macro_turing::DataRam>> = match &kept_ram {
+                Some(ram) => Some(&**ram),
+                // SAFETY: see `owner` above.
+                None => fs.native_data_ram.as_ref().map(|ram| unsafe { &*Arc::as_ptr(ram) }),
+            };
             let mut parameters = std::mem::take(&mut fs.parameters);
-            let mut shared_ram = ram_owner.as_ref().map(|ram| ram.lock());
+            let mut shared_ram = ram_owner.map(|ram| ram.lock());
             let ram = match shared_ram.as_deref_mut() {
                 Some(ram) => ram,
                 None => local_ram.as_mut().unwrap(),
             };
             let front = fs as *mut FrontState;
+            // Kept: on a panic out of Execute it puts the leased interpreter RAM (no
+            // active_dram) and the parameter vector back before re-raising it.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut jit = jit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 jit.execute(start, &mut parameters, ram,
                     // Read/emit callbacks run sequentially. Parameters and RAM
                     // are leased separately, and no whole-state borrow spans a callback.
@@ -657,7 +685,11 @@ impl KeplerCompute {
                 )
             }));
             drop(shared_ram);
-            {
+            drop(jit);
+            // Upstream has nothing to put back and sets native_execution_failed in place:
+            // the context lock is only taken when there is something to write.
+            let failed = matches!(&result, Ok(result) if !result.success);
+            if local_ram.is_some() || failed {
                 let guard = owner.lock();
                 let mut context = guard.borrow_mut();
                 let macro_engine = if compute { &mut context.compute_engine }
@@ -714,18 +746,25 @@ impl KeplerCompute {
                 .as_ref()
                 .expect("native compute requires macro owner"),
         );
-        let guard = unsafe { (*owner).lock() };
-        let context = guard.as_ptr();
         let this = self as *mut Self;
-        // All accesses are serialized by the retained context lock. No RefMut spans callbacks.
-        let selected = || unsafe {
+        // Upstream dereferences native_macro / native_macro_positions only on the paths
+        // that use them (macro calls, code and bind uploads, failure flags); the shared
+        // context is locked on exactly those paths. Most methods reaching here (upload
+        // words, semaphores, QMD launches) never touch it, so they no longer lock it, and
+        // the front may run macros while the back dispatches.
+        //
+        // Every `selected`/`positions` dereference below happens while a guard from
+        // `lock_context` is alive in the same branch (the reentrant lock nests for the
+        // register writes a macro emits). No RefMut spans callbacks.
+        let lock_context = || unsafe { (*owner).lock() };
+        let selected = |context: *mut crate::r#macro::NativeMacroContext| unsafe {
             if (*this).native_macro_compute {
                 std::ptr::addr_of_mut!((*context).compute_engine)
             } else {
                 std::ptr::addr_of_mut!((*context).engine)
             }
         };
-        let positions = || unsafe {
+        let positions = |context: *mut crate::r#macro::NativeMacroContext| unsafe {
             if (*this).native_macro_compute {
                 std::ptr::addr_of_mut!((*context).compute_positions)
             } else {
@@ -765,7 +804,9 @@ impl KeplerCompute {
                     .native_parameters
                     .iter()
                     .any(|parameter| parameter & !0xf == watch);
-            let start = unsafe { (*positions())[entry] };
+            let guard = lock_context();
+            let context = guard.as_ptr();
+            let start = unsafe { (*positions(context))[entry] };
             if watched {
                 log::info!(
                     "Semaphore watch: compute macro start={start:#x} parameters={:08x?}",
@@ -779,7 +820,7 @@ impl KeplerCompute {
                 if !self.native_mme_dumped && start == 0xda {
                     self.native_mme_dumped = true;
                     dump_words(format!("native-compute-mme-{this:p}.bin"), unsafe {
-                        &(*selected()).native_code
+                        &(*selected(context)).native_code
                     });
                 }
                 log::info!(
@@ -788,7 +829,7 @@ impl KeplerCompute {
                     self.native_parameters
                 );
             }
-            let engine = selected();
+            let engine = selected(context);
             // Upstream assigns the active_dram pointer; the owning handle is only
             // replaced when it names other storage (no refcount churn per call).
             if let Some(ram) = &self.native_data_ram {
@@ -884,7 +925,7 @@ impl KeplerCompute {
                             &mut emit,
                         );
                         if !result.success {
-                            (*selected()).native_execution_failed = true;
+                            (*selected(context)).native_execution_failed = true;
                             log::error!("Native MME (JIT) failed: compute start={start:#x}, consumed={}/{}, error={}", result.consumed, parameters.len(), result.error);
                         }
                         return;
@@ -932,13 +973,13 @@ impl KeplerCompute {
                     },
                     |address, value, fifo, ram| {
                         if use_memo {
-                            (*selected()).native_writes.push((address, value));
+                            (*selected(context)).native_writes.push((address, value));
                         }
                         emit(address, value, fifo, ram)
                     },
                     Some(ram),
                 );
-                let current = selected();
+                let current = selected(context);
                 let state = if current == engine {
                     &*interpreter
                 } else {
@@ -963,7 +1004,7 @@ impl KeplerCompute {
                 if *MME_DUMP_AFTER.get_or_init(|| std::env::var_os("EDEN_NX2_MME_DUMP").is_some())
                     && ram[0x27] != dram0_before
                 {
-                    log::info!("MME data RAM[0x27] {dram0_before:#x} -> {:#x} by engine {this:p} macro start={:#x}", ram[0x27], (*positions())[entry]);
+                    log::info!("MME data RAM[0x27] {dram0_before:#x} -> {:#x} by engine {this:p} macro start={:#x}", ram[0x27], (*positions(context))[entry]);
                 }
                 if !result.success {
                     (*current).native_execution_failed = true;
@@ -973,7 +1014,7 @@ impl KeplerCompute {
                     {
                         dump_words("native-compute-mme.bin".into(), &(*current).native_code);
                     }
-                    log::error!("Native MME failed: compute start={:#x}, pc={:#x}, consumed={}/{}, error={}, parameters={parameters:08x?}", (*positions())[entry], result.pc, result.consumed, parameters.len(), result.error);
+                    log::error!("Native MME failed: compute start={:#x}, pc={:#x}, consumed={}/{}, error={}, parameters={parameters:08x?}", (*positions(context))[entry], result.pc, result.consumed, parameters.len(), result.error);
                 }
             }));
             if let Some(mut interpreter) = interpreter {
@@ -996,9 +1037,13 @@ impl KeplerCompute {
             self.process_native_report_semaphore(argument);
             return true;
         }
-        // As upstream, memory_manager.GetID() is read only where it is traced,
-        // not under the memory-manager lock on every native method write.
-        if method == 0x5a || (0xc6..=0x108).contains(&method) {
+        // Upstream reads memory_manager.GetID() without a lock; here it takes the
+        // memory-manager lock (shared with the command-list reads), so it is read
+        // only when the record is written: the 67 inline-QMD words of every
+        // dispatch would otherwise lock it 67 times for a disabled trace.
+        if (method == 0x5a || (0xc6..=0x108).contains(&method))
+            && crate::native_query_trace::native_query_trace_enabled()
+        {
             let asid = self.memory_manager.lock().get_id() as u64;
             trace_native_query(12, asid, method as u64, 0, 0, argument as u64, 0);
         }
@@ -1040,15 +1085,14 @@ impl KeplerCompute {
                 .is_fully_mapped_range(address, 256)
             {
                 unsafe {
-                    (*selected()).native_execution_failed = true;
+                    let guard = lock_context();
+                    (*selected(guard.as_ptr())).native_execution_failed = true;
                 }
                 log::error!("Unmapped native inline QMD destination");
                 return true;
             }
-            let bytes: Vec<u8> = self.native_registers[0xc8..0x108]
-                .iter()
-                .flat_map(|word| word.to_le_bytes())
-                .collect();
+            // Upstream passes a byte span over the register words; no copy.
+            let bytes: &[u8] = bytemuck::cast_slice(&self.native_registers[0xc8..0x108]);
             unsafe {
                 self.rasterizer
                     .expect("native inline QMD requires rasterizer")
@@ -1069,13 +1113,15 @@ impl KeplerCompute {
         match method {
             0x45 => {
                 unsafe {
-                    (*selected()).clear_code(argument);
+                    let guard = lock_context();
+                    (*selected(guard.as_ptr())).clear_code(argument);
                 }
                 true
             }
             0x46 => {
                 unsafe {
-                    (*selected()).add_code(0, argument);
+                    let guard = lock_context();
+                    (*selected(guard.as_ptr())).add_code(0, argument);
                 }
                 true
             }
@@ -1086,7 +1132,8 @@ impl KeplerCompute {
             0x48 => {
                 if self.native_bind_pointer < 0x80 {
                     unsafe {
-                        (*positions())[self.native_bind_pointer as usize] = argument;
+                        let guard = lock_context();
+                        (*positions(guard.as_ptr()))[self.native_bind_pointer as usize] = argument;
                     }
                     self.native_bind_pointer += 1;
                 } else {
@@ -1095,14 +1142,22 @@ impl KeplerCompute {
                 true
             }
             0xae | 0xaf | 0xb0 => {
-                let asid = self.memory_manager.lock().get_id() as u64;
+                // As above: the ID and the translations are trace record arguments only.
+                let trace = crate::native_query_trace::native_query_trace_enabled();
+                let asid = if trace {
+                    self.memory_manager.lock().get_id() as u64
+                } else {
+                    0
+                };
                 let address = (self.native_registers[0xad] as u64) << 8;
-                let cpu = self
-                    .memory_manager
-                    .lock()
-                    .gpu_to_cpu_address(address)
-                    .unwrap_or(0);
-                trace_native_query(9, asid, address, cpu, method, argument as u64, 0);
+                if trace {
+                    let cpu = self
+                        .memory_manager
+                        .lock()
+                        .gpu_to_cpu_address(address)
+                        .unwrap_or(0);
+                    trace_native_query(9, asid, address, cpu, method, argument as u64, 0);
+                }
                 if method == 0xae
                     || (method == 0xaf && argument & 2 == 0)
                     || (method == 0xb0 && matches!(argument & 15, 0 | 1))
@@ -1147,6 +1202,7 @@ impl KeplerCompute {
                             log::info!("Native QMD {address:#x} releases: {:08x?} | {:08x?} | {:08x?}",&descriptor[24..28],&descriptor[28..32],&descriptor[52..56]);
                         }
                         for slot in 0..2 {
+                            if !trace {break;}
                             let flags=descriptor[25+slot*4]; if flags&(1<<23)==0 {continue;}
                             let destination=((flags as u64&0xff)<<32)|descriptor[24+slot*4] as u64;
                             let cpu=memory.lock().gpu_to_cpu_address(destination).unwrap_or(0);
@@ -1195,7 +1251,8 @@ impl KeplerCompute {
                     return true;
                 }
                 unsafe {
-                    (*selected()).native_execution_failed = true;
+                    let guard = lock_context();
+                    (*selected(guard.as_ptr())).native_execution_failed = true;
                 }
                 let mut qmd = [0u32; 128];
                 let mapped = self
@@ -1225,9 +1282,11 @@ impl KeplerCompute {
                 log::error!("Native QMD failed: {error}");
                 if diagnostics && mapped {
                     dump_words("native-qmd.bin".into(), &qmd);
+                    let guard = lock_context();
                     dump_words("native-dispatch-mme.bin".into(), unsafe {
-                        &(*selected()).native_code
+                        &(*selected(guard.as_ptr())).native_code
                     });
+                    drop(guard);
                     dump_words(
                         "native-dispatch-registers.bin".into(),
                         &self.native_registers,
@@ -2332,6 +2391,45 @@ mod tests {
         });
         unlocked.join().unwrap();
         assert!(fs.compute_uploaded);
+    }
+
+    #[test]
+    fn native_methods_lock_the_macro_context_only_where_they_use_it() {
+        // Upstream ProcessNativeMethod dereferences native_macro only on macro, code,
+        // bind and failure paths. A method outside them must not wait for a context
+        // another thread (the split's front running a macro) holds.
+        let context = Arc::new(parking_lot::ReentrantMutex::new(RefCell::new(
+            crate::r#macro::NativeMacroContext::default(),
+        )));
+        let mut engine = Box::new(new_test_engine());
+        engine.set_native_macro_mode(Some(context.clone()), Some(context.clone()));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let context = context.clone();
+            std::thread::spawn(move || {
+                let _guard = context.lock();
+                ready_tx.send(()).unwrap();
+                // Bounded so that a regression fails instead of hanging the test.
+                done_rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok()
+            })
+        };
+        ready_rx.recv().unwrap();
+        engine.call_method(0x47, 9, true); // bind pointer
+        engine.call_method(0xad, 0x70, true); // plain QMD address register
+        engine.call_method(0xae, 0, true); // QMD action without a launch
+        engine.call_method(0xb0, 1, true);
+        done_tx.send(()).unwrap();
+        assert!(holder.join().unwrap(), "a context-free method waited for the macro context");
+        assert_eq!(engine.native_bind_pointer, 9);
+        assert!(engine.native_compute_uploaded);
+        // A bind upload does use the context, and still writes the selected positions.
+        engine.call_method(0x48, 0x1234, true);
+        assert_eq!(engine.native_bind_pointer, 10);
+        let guard = context.lock();
+        let state = guard.borrow();
+        assert_eq!(state.compute_positions[9], 0x1234);
+        assert_eq!(state.positions[9], 0);
     }
 
     #[test]

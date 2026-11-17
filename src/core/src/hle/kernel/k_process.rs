@@ -741,7 +741,7 @@ impl KProcess {
                 buffer_ptr,
             )
         };
-        memory.set_gpu_dirty_managers(system.gpu_dirty_memory_managers());
+        memory.set_gpu_dirty_managers(system.gpu_dirty_memory_managers().to_vec());
         let memory_arc = Arc::new(crate::memory::memory::SharedMemory::new(memory));
         // Wire into page table so page-table-level operations can use it
         self.page_table.get_base_mut().set_memory(memory_arc.clone());

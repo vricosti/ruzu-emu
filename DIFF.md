@@ -1,5 +1,114 @@
 # Upstream parity notes
 
+## 2026-11-16 — split front macro calls: video_core/engines/{maxwell_3d,kepler_compute}.rs vs Lichii video_core/engines/{maxwell_3d.cpp:1854-1946 (FrontRunMacro, FrontRunOnBack), kepler_compute.cpp:2044-2120 (FrontRunMacro)}
+
+### Intentional differences
+- Lichii's FrontRunMacro uses the shared macro engine, its JIT and the channel's data RAM
+  through references (`GetNativeMacroEngine()`, `shared_ptr` members, `native_data_ram`): no
+  atomic operation per call. ruzu's `Maxwell3D::front_run_macro` made about 20 locked
+  instructions per call (3 `Arc` clones and drops, 3 locks of the shared context's
+  `ReentrantMutex`, 2 of the JIT's `std::sync::Mutex`, 1 of the data RAM): 85 % of its own time
+  in the profile of 95229081 (3.4 ms per frame for ~33 400 calls). It now borrows
+  `FrontState::macro_owner`, `FrontState::native_data_ram` and the engine's `native_jit`
+  through `Arc::as_ptr` (all three set once and never replaced while the front lives), reads
+  the start position, the code generation and the code length under one context lock, takes
+  the context lock a second time only to prepare the JIT, and keeps one JIT lock from Prepare
+  to Execute (as `MacroEngine::execute_native`). The context lock stays: the back reads the
+  shared engine under it (`get_native_macro_engine_read`, `shader_cache`), and it is still
+  never held while the front waits for the back.
+- `Maxwell3D::front_run_on_back` takes the code generation and length (the two engine fields
+  upstream's `FrontRunOnBack` reads from its `const MacroEngine&`) instead of locking the
+  context itself.
+- The FIFO: Lichii executes on `fs.parameters`, to which FrontDmaRead appends. ruzu copied the
+  parameters into a separate `FrontState::fifo` per call (removed) and wrapped Execute in a
+  `catch_unwind` whose only effect was to restore that copy before re-raising. The parameter
+  vector is now moved out for Execute and put back cleared; a panic out of Execute (re-raised
+  by `TuringMacroJit::execute` after the JIT returned, its thunks catch it) leaves
+  `fs.parameters` empty, the state after any call.
+- `KeplerCompute::front_run_macro`: same borrowed context, JIT and RAM (no `Arc` clone),
+  `active_dram` replaced only when it names another RAM, one JIT lock, and the closing context
+  lock only when a leased interpreter RAM must be put back or Execute failed. Its
+  `catch_unwind` stays: it puts the leased interpreter RAM back on a panic.
+
+### Measured with the lock ports and the back-end changes (2026-11-16 session)
+NX2 title used for measurement, forest scene, 60 s window, two alternated series, one emulator at
+a time: base 35.60-35.93 fps (median frame 27.46-27.83 ms, three runs); guest lock ports alone
+36.87-36.95 (26.65-26.66, two runs); plus the feedback-loop gate and the virtual range prefixes
+36.55-37.25 (26.63-27.15, two runs); plus this front change 36.75-37.22 (26.63-27.01, three runs).
+The three stacks differ by less than the run-to-run spread. The GPU back thread stays at 91-95 %
+CPU in every state (no runqueue wait) and sets the pace; the front thread falls from 65-66 % to
+59-60 % with this change; the host GPU from 86-87 % busy at ~2000 MHz to 68-72 % at ~1390 MHz
+with the feedback-loop gate.
+
+## 2026-11-16 — virtual range lookups reuse the longest contiguous walk: buffer_cache/virtual_range_cache.rs vs Lichii buffer_cache/virtual_range_cache.h
+
+### Ported (Lichii 7083185c43, absent from Eden a538cd9aff; no switch)
+- `VirtualRangeCache::query` (Lichii virtual_range_cache.h:36-85) answers a query from the cached
+  entry of the same address space and GPU address when the size is the same, or when the cached
+  entry is a single segment (host-contiguous) and the new size is shorter: its prefixes are
+  contiguous too. Eden required the exact size, so a storage buffer bound at one address with
+  several sizes walked the page table on every draw. A shorter query that is not a hit, and any
+  longer one, walks again and replaces the entry, as in Lichii. A single returned segment may then
+  cover more than the range asked for; the only caller, `resolve_multi_range_storage`, ignores lists
+  of fewer than two segments.
+- Tests port Lichii src/tests/video_core/virtual_range_cache.cpp (the three cases).
+
+## 2026-11-16 — feedback-loop barrier gated on depth/stencil writes: texture_cache/texture_cache.rs vs Lichii texture_cache/texture_cache.h
+
+### Ported (Lichii extension, absent from Eden; Lichii 3b1d6eb9cd, no switch)
+- `TextureCacheBase::check_feedback_loop` (Lichii texture_cache.h:845-921) issues the
+  feedback-loop barrier only while `feedback_depth_dirty` (texture_cache_base.h:653, initially
+  true) is set, and clears it after the barrier. The flag is raised when the render targets serial
+  differs from the one of the last check, and on exit of every check (Lichii's `SCOPE_EXIT`, after
+  the early returns but not when `barrier_feedback_loops` is off) when the draw has
+  `depth_write_enabled` or `stencil_enable` set. A depth target that is only sampled after the
+  first barrier therefore keeps its render pass open; Eden ended the pass before every such draw.
+- Lichii reads `maxwell3d->regs` inside `CheckFeedbackLoop`; ruzu's back end cannot borrow the live
+  engine, so `GraphicsPipeline::configure_impl` passes `depth_write_enable || stencil_enable` from
+  the draw's register view (`Maxwell3DDrawView::depth_stencil`).
+- As in Lichii, clears and render pass ends do not touch the flag (a clear changes no render target
+  serial); only the render targets serial and depth/stencil-writing draws raise it.
+- The Metal back end (ruzu only) passes `writes_depth_stencil = true`, which keeps Eden's behaviour
+  there (the flag is raised on every exit, so every aliasing draw still gets its barrier).
+
+## 2026-11-16 — guest-side lock waits: core/hle/kernel/{k_spin_lock,svc/svc_info}.rs, common/spin_recursive_mutex.rs, video_core/{buffer_cache/buffer_cache,texture_cache/texture_cache_base,renderer_vulkan/vk_rasterizer}.rs vs Lichii core/hle/kernel/k_spin_lock.{h,cpp}, common/spin_recursive_mutex.h, video_core/{buffer_cache/buffer_cache_base.h,texture_cache/texture_cache_base.h,renderer_vulkan/vk_rasterizer.cpp} and Eden core/hle/kernel/svc/svc_info.cpp
+
+### Ported (Lichii divergences from Eden)
+- `KSpinLock` (Lichii 63244330cd): Eden wraps `std::mutex`; Lichii's three-state lock (0 free,
+  1 held, 2 held with sleepers) spins 128 pauses on contention before sleeping. ruzu's wrapped a
+  `parking_lot::Mutex`. The scheduler lock is a `KAlignedSpinLock`, so this reaches every
+  scheduler-lock acquisition, on Switch 1 titles too (as in Lichii).
+- `Common::SpinRecursiveMutex` (Lichii e08b402527) for the texture and buffer caches' mutexes
+  (Eden: `std::recursive_mutex`; ruzu had `parking_lot::ReentrantMutex`): ~1024 pauses before
+  sleeping. Guest CPU write traps (`on_cpu_write`) and reads (`get_flush_area`) take these locks
+  while the GPU thread holds them through each draw.
+- `RasterizerVulkan::get_flush_area` asks `texture_cache.page_filter` before taking the texture
+  cache's lock (Lichii vk_rasterizer.cpp:2812-2816). The filter was already maintained.
+
+Measured on the NX2 title used for measurement (forest scene, 60 s window, 2026-11-16 session):
+base 33.53-35.33 fps (median frame 27.91-28.57 ms, five runs); KSpinLock alone (with the GetInfo
+fix) 36.40 fps / 27.13 ms; SpinRecursiveMutex alone 36.13 / 27.32; page_filter gate alone
+34.55 / 28.65 (no effect on its own); all four 36.57-36.70 / 26.82-26.89 (four runs). The GPU
+back thread's voluntary context switches fall from ~115 to ~9 a frame, the guest cores' from
+~260 to ~130-190.
+
+### Realigned on Eden
+- `svc::GetInfo` logs at trace level (Eden svc_info.cpp:20 `LOG_TRACE`); ruzu logged every call
+  at info level (~120 lines a second on the NX2 title used for measurement).
+
+### Intentional differences
+- `std::atomic::wait`/`notify_one` become `parking_lot_core::park`/`unpark_one` keyed on the
+  state's address; the recursive mutex's owner is a per-thread token instead of
+  `std::thread::id`; Lichii's EDEN_NX2_GPU_PROFILE contention counters are not ported.
+
+### Not ported
+- Lichii's `PhysicalCore::Idle` poll (f26ad432ae, cedfc26f47: up to 100 us of polling before an
+  idle Switch 2 core blocks). Measured in ruzu on this host (Intel, so Lichii's yield fallback):
+  one run 32.30 fps against 33.53-35.33 for the references, median frame 29.5 ms against
+  27.9-28.6; Lichii itself loses nothing without it (46.47 fps with EDEN_NX2_IDLE_SPIN_US=0
+  against 46.12).
+- Lichii's second `GetFlushArea` gate (`Nx2MayBeGpuWritten` for the buffer cache): ruzu has no
+  GPU-written page bitmap.
 ## 2026-11-16 — Lichii NX2 performance mechanisms: submission policy, GPU thread pinning, fence batches, deferred fragment barriers
 
 All four are Lichii extensions, absent from Eden. The losses quoted are Lichii's own ablation on
@@ -28390,3 +28499,39 @@ drawn black and appearing or vanishing from one frame to the next.
 - Profile retains Vulkan's `32_BIT_ONLY` denorm-independence capability separately from upstream's `ALL` boolean. Only the optimized matrix helper consumes the additional property, and only in shaders without FP64: FP16 and FP64 remain coupled on these devices. Existing non-matrix denorm-control selection is unchanged. Other backend profiles default to false.
 - The profile is compilation metadata, not a raw serialized ABI payload. Tests exercise partial independence with and without FP64, full independence, and absent capabilities. The independent diagnostic shader also ran with the Vulkan validation layer without reported errors on the partial-independence device.
 
+
+## 2026-11-17 — src/video_core/src/{renderer_vulkan/query_cache.rs,engines/kepler_compute.rs,native_query_trace.rs,renderer_vulkan/pipeline_cache.rs} and src/core/src/core.rs vs Lichii video_core/{renderer_vulkan/vk_query_cache.cpp,engines/kepler_compute.cpp,native_query_trace.h,renderer_vulkan/vk_pipeline_cache.cpp} and core/core.h (GPU back thread per-draw costs)
+
+### Intentional differences
+- The samples streamer keeps the running query as `(bank, start, amount)` runs in
+  `SamplesQueryState::history`, with the slot count beside them (`history_slots`), where Lichii
+  keeps one `current_query` (`start_bank_id`, `size_banks`, `start_slot`, `size_slots`) and walks
+  its banks through `next_bank` (`ApplyBankOp`). A slot joins the runs when its counter is paused,
+  not when it is reserved (`ReserveHostQuery`): every report pauses the counter first, so a report
+  sees the same slots. Reports copy the runs and take `amount` references per run, as
+  `ApplyBankOp(..., AddReference(amount))`.
+- The begin/end query commands capture the `vkCmdBeginQuery` / `vkCmdEndQuery` entry points of the
+  bank's device instead of a copy of `ash::Device`; upstream's commands capture only the pool and
+  the slot and reach the dispatch through the command buffer.
+- `native_query_trace_enabled()` exposes the `diagnostics` static of `TraceNativeQuery`.
+  `KeplerCompute::process_native_method` builds the trace arguments (`memory_manager.GetID()`,
+  `GpuToCpuAddress`) only when it is set: the port's memory manager is behind a lock, which
+  upstream's plain reads do not take.
+- `PipelineCache::current_graphics_pipeline` reads `native_turing` once per lookup, under the
+  macro context's lock; upstream reads the flag without a lock at each use.
+- `System::gpu_dirty_memory_managers` returns a slice over the managers, as upstream's `std::span`;
+  `KProcess` copies it into the process memory.
+
+## 2026-11-17 — src/video_core/src/{engines/kepler_compute.rs,renderer_vulkan/vk_rasterizer.rs} vs Lichii video_core/{engines/kepler_compute.cpp,renderer_vulkan/vk_rasterizer.cpp} (GPU back thread compute costs)
+
+### Intentional differences
+- The native macro context (`native_macro` / `native_macro_positions` upstream, raw pointers
+  read without a lock) is a reentrant mutex shared with the split GPU thread's front and with
+  Maxwell3D. `KeplerCompute::process_native_method` locks it only on the paths that dereference
+  it: a macro call (for the whole call, so the register writes the macro emits nest in the
+  reentrant lock), the code and bind uploads (0x45, 0x46, 0x48) and the
+  `native_execution_failed` writes. Upload words, report semaphores, QMD actions and launches,
+  the bind pointer and plain registers do not take it.
+- `RasterizerVulkan::accelerate_inline_to_memory` and `dispatch_compute` borrow the channel
+  memory manager's owner and lock it, where upstream uses its `gpu_memory` pointer; no clone of
+  the owning `Arc` per call.

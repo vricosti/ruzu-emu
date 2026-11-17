@@ -23,7 +23,7 @@ use common::lru_cache::LeastRecentlyUsedCache;
 use common::scratch_buffer::ScratchBuffer;
 use common::thread::ThreadPlacement;
 use common::thread_worker::ThreadWorker;
-use parking_lot::{Mutex as ParkingMutex, ReentrantMutex};
+use parking_lot::Mutex as ParkingMutex;
 use smallvec::SmallVec;
 
 use common::slot_vector::SlotVector;
@@ -840,6 +840,9 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     pub last_feedback_loop_serial: u64,
     pub last_feedback_texture_serial: u64,
     pub last_feedback_loop_result: bool,
+    /// Lichii `feedback_depth_dirty` (texture_cache_base.h:653): depth or stencil
+    /// may have been written since the last feedback-loop barrier.
+    pub feedback_depth_dirty: bool,
     pub last_framebuffer_id: FramebufferId,
     pub last_framebuffer_serial: u64,
     /// Upstream keys cached framebuffers by the full `RenderTargets` object.
@@ -955,8 +958,8 @@ pub struct TextureCacheBase<P: TextureCacheParams = CommonTextureCacheParams> {
     /// multi-channel support lands.
     pub channel_state: TextureCacheChannelInfo,
 
-    // Mutex
-    pub mutex: ReentrantMutex<()>,
+    // Mutex: Lichii `Common::SpinRecursiveMutex` (texture_cache_base.h; Eden: std::recursive_mutex)
+    pub mutex: common::spin_recursive_mutex::SpinRecursiveMutex,
 
     /// Owned storage behind upstream's `Runtime& runtime`. The Box keeps its
     /// address stable for backend objects which retain the runtime pointer.
@@ -1169,6 +1172,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             last_feedback_loop_serial: 0,
             last_feedback_texture_serial: 0,
             last_feedback_loop_result: false,
+            feedback_depth_dirty: true,
             last_framebuffer_id: FramebufferId::default(),
             last_framebuffer_serial: 0,
             framebuffers: HashMap::default(),
@@ -1226,7 +1230,7 @@ impl<P: TextureCacheParams> TextureCacheBase<P> {
             image_gpu_page_table_indices: HashMap::default(),
             channel_caches: ChannelSetupCaches::new(),
             channel_state: fallback_channel_state,
-            mutex: ReentrantMutex::new(()),
+            mutex: common::spin_recursive_mutex::SpinRecursiveMutex::new(),
             runtime: None,
         };
 

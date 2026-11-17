@@ -1095,10 +1095,13 @@ impl MetalRasterizer {
         // Eden performs this after UpdateRenderTargets and before configuring
         // the draw. Defer the native boundary decision until effective write
         // state and independent sampled views are known.
+        // `writes_depth_stencil = true` keeps the Metal back end on Eden's
+        // behaviour: Lichii's `feedback_depth_dirty` gate is only applied to the
+        // Vulkan back end, which Lichii's commit 3b1d6eb9cd measured.
         let mut feedback_requested = false;
         self.texture_cache
             .base
-            .check_feedback_loop(&prepared.image_views, || {
+            .check_feedback_loop(&prepared.image_views, true, || {
                 feedback_requested = true;
             });
 

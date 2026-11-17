@@ -21,7 +21,8 @@ pub fn get_info(
     handle: Handle,
     info_sub_id: u64,
 ) -> ResultCode {
-    log::info!(
+    // Upstream: LOG_TRACE (svc_info.cpp:20).
+    log::trace!(
         "svc::GetInfo called info_id={:?}, info_sub_id=0x{:X}, handle=0x{:08X}",
         info_id_type,
         info_sub_id,

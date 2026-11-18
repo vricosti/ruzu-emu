@@ -12,7 +12,15 @@ impl<'a> TranslatorVisitor<'a> {
         let target = (pc as i64).wrapping_add(offset) as u64;
 
         let loc = self.ir.current_location.unwrap();
-        self.ir.set_term(Terminal::LinkBlock {
+        // Upstream `B_uncond`: `B .` keeps LinkBlock (its halt check stops the loop); every
+        // other unconditional branch is LinkBlockFast.
+        if target == pc {
+            self.ir.set_term(Terminal::LinkBlock {
+                next: loc.set_pc(target).to_location(),
+            });
+            return false;
+        }
+        self.ir.set_term(Terminal::LinkBlockFast {
             next: loc.set_pc(target).to_location(),
         });
         false
@@ -33,7 +41,8 @@ impl<'a> TranslatorVisitor<'a> {
         let return_loc = loc.advance_pc(4).to_location();
         self.ir.ir().push_rsb(return_loc);
 
-        self.ir.set_term(Terminal::LinkBlock {
+        // Upstream `BL`: LinkBlockFast.
+        self.ir.set_term(Terminal::LinkBlockFast {
             next: loc.set_pc(target).to_location(),
         });
         false

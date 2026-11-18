@@ -602,43 +602,32 @@ impl A64EmitX64 {
             None => code_base as usize + offsets[0], // fallback to dispatcher
         };
 
-        // Patch jg slots (6-byte jg rel32 at each offset)
-        for &offset in &info.jg {
-            let saved_size = self.code.asm.size();
-            self.code.asm.set_size(offset);
-            // jg rel32: 0x0F 0x8F + disp32
-            let jg_end = offset + 6;
-            let jg_end_addr = code_base as usize + jg_end;
-            let disp = (target as i64) - (jg_end_addr as i64);
-            self.code.asm.db(0x0F).unwrap();
-            self.code.asm.db(0x8F).unwrap();
-            self.code.asm.dd(disp as u32).unwrap();
-            self.code.asm.set_size(saved_size);
-        }
-
-        // Patch jz slots (6-byte jz rel32 at each offset)
-        for &offset in &info.jz {
-            let saved_size = self.code.asm.size();
-            self.code.asm.set_size(offset);
-            let jz_end = offset + 6;
-            let jz_end_addr = code_base as usize + jz_end;
-            let disp = (target as i64) - (jz_end_addr as i64);
-            self.code.asm.db(0x0F).unwrap();
-            self.code.asm.db(0x84).unwrap();
-            self.code.asm.dd(disp as u32).unwrap();
-            self.code.asm.set_size(saved_size);
-        }
-
-        // Patch jmp slots (5-byte jmp rel32 at each offset)
-        for &offset in &info.jmp {
-            let saved_size = self.code.asm.size();
-            self.code.asm.set_size(offset);
-            let jmp_end = offset + 5;
-            let jmp_end_addr = code_base as usize + jmp_end;
-            let disp = (target as i64) - (jmp_end_addr as i64);
-            self.code.asm.db(0xE9).unwrap();
-            self.code.asm.dd(disp as u32).unwrap();
-            self.code.asm.set_size(saved_size);
+        // Upstream `EmitX64::Patch`/`Unpatch`: each jg/jz/jmp slot is re-emitted in full with
+        // `EmitPatchJg/Jz/Jmp(target_desc, code_ptr)`, so an unlinked slot stores the target PC
+        // before returning to the dispatcher.
+        let target_pc = A64LocationDescriptor::from_location(target_loc).pc();
+        let pc_offset = A64JitState::offset_of_pc();
+        let slots = [
+            (&info.jg, Some(0x8Fu8), crate::backend::x64::patch_info::A64_PATCH_JG_SIZE),
+            (&info.jz, Some(0x84u8), crate::backend::x64::patch_info::A64_PATCH_JZ_SIZE),
+            (&info.jmp, None, crate::backend::x64::patch_info::A64_PATCH_JMP_SIZE),
+        ];
+        for (locations, jcc_opcode, slot_size) in slots {
+            for &offset in locations.iter() {
+                let saved_size = self.code.asm.size();
+                self.code.asm.set_size(offset);
+                crate::backend::x64::emit_terminal::emit_patch_a64(
+                    &mut self.code.asm,
+                    jcc_opcode,
+                    slot_size,
+                    target_pc,
+                    pc_offset,
+                    code_ptr,
+                    offsets,
+                    code_base,
+                );
+                self.code.asm.set_size(saved_size);
+            }
         }
 
         // Patch mov rcx slots (10-byte mov rcx, imm64)

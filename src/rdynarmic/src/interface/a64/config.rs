@@ -234,6 +234,11 @@ pub struct UserConfig {
     /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
     /// `interface/A64/config.h` (commit aab5393019, "omit_block_frame").
     pub omit_block_frame: bool,
+    /// x64 only. Return stack buffer entries used (power of two, 8 to 32).
+    ///
+    /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+    /// `interface/A64/config.h` (commit aab5393019, "rsb_size").
+    pub rsb_size: u32,
     /// x64 only, without cycle counting. Conditional branches, CSEL and CBZ/TBZ use the host
     /// flags directly when the flag-setting instruction was emitted right before them, instead
     /// of reloading NZCV from the guest state (the state is still written).
@@ -288,6 +293,7 @@ impl UserConfig {
             fold_address_offsets: false,
             elide_redundant_zext: false,
             omit_block_frame: false,
+            rsb_size: 8,
             reuse_host_flags: false,
             define_unpredictable_behaviour: false,
             wall_clock_cntpct: false,
@@ -295,6 +301,16 @@ impl UserConfig {
             enable_cycle_counting: true,
             very_verbose_debugging_output: false,
         }
+    }
+
+    /// Lichii `a64_interface.cpp::RsbPtrMask` (aab5393019): largest power of two <= rsb_size,
+    /// between 8 and `A64JitState::RSB_SIZE`, minus one.
+    pub fn rsb_ptr_mask(&self) -> usize {
+        let mut size = 32usize;
+        while size > 8 && size > self.rsb_size as usize {
+            size >>= 1;
+        }
+        size - 1
     }
 
     pub fn has_optimization(&self, mut flag: OptimizationFlag) -> bool {

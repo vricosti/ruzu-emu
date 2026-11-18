@@ -15,7 +15,9 @@ const PC_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const FPCR_LOC_MASK: u64 = 0x07C8_0000;
 const FPCR_LOC_SHIFT: u64 = 37;
 
-const RSB_SIZE: usize = 8;
+// Lichii (aab5393019, rsb_size): 32 entries, `A64::UserConfig::rsb_size` picks how many are
+// used (Eden: 8). Divergence from Eden allowed by the user on 2026-11-17 (see DIFF.md).
+const RSB_SIZE: usize = 32;
 
 #[repr(C, align(16))]
 pub struct A64JitState {
@@ -39,6 +41,7 @@ pub struct A64JitState {
 
 impl A64JitState {
     pub const RESERVATION_GRANULE_MASK: u64 = 0xFFFF_FFFF_FFFF_FFF0;
+    /// MUST be a power of 2. `A64::UserConfig::rsb_size` picks how many are used.
     pub const RSB_SIZE: usize = RSB_SIZE;
     pub const RSB_PTR_MASK: usize = Self::RSB_SIZE - 1;
 
@@ -185,7 +188,9 @@ mod tests {
     #[test]
     fn binary_layout_matches_upstream() {
         assert_eq!(core::mem::align_of::<A64JitState>(), 16);
-        assert_eq!(core::mem::size_of::<A64JitState>(), 960);
+        // Lichii's 32-entry return stack buffer (aab5393019); Eden: 960 bytes, rsb_codeptrs at
+        // 872, fpsr_exc at 936.
+        assert_eq!(core::mem::size_of::<A64JitState>(), 1344);
         assert_eq!(A64JitState::offset_of_reg(), 0);
         assert_eq!(A64JitState::offset_of_sp(), 248);
         assert_eq!(A64JitState::offset_of_pc(), 256);
@@ -197,10 +202,10 @@ mod tests {
         assert_eq!(A64JitState::offset_of_exclusive_state(), 796);
         assert_eq!(A64JitState::offset_of_rsb_ptr(), 800);
         assert_eq!(A64JitState::offset_of_rsb_location_descriptors(), 808);
-        assert_eq!(A64JitState::offset_of_rsb_codeptrs(), 872);
-        assert_eq!(A64JitState::offset_of_fpsr_exc(), 936);
-        assert_eq!(A64JitState::offset_of_fpsr_qc(), 940);
-        assert_eq!(A64JitState::offset_of_fpcr(), 944);
+        assert_eq!(A64JitState::offset_of_rsb_codeptrs(), 1064);
+        assert_eq!(A64JitState::offset_of_fpsr_exc(), 1320);
+        assert_eq!(A64JitState::offset_of_fpsr_qc(), 1324);
+        assert_eq!(A64JitState::offset_of_fpcr(), 1328);
     }
 
     #[test]

@@ -175,7 +175,10 @@ impl A64EmitX64 {
         codegen: A64CodegenOptions,
     ) -> Result<Self, String> {
         let mut code =
-            BlockOfCode::with_size_and_jit_state_info(cache_size, JitStateInfo::from_a64())
+            BlockOfCode::with_size_and_jit_state_info(
+                cache_size,
+                JitStateInfo::from_a64_with_rsb_ptr_mask(codegen.rsb_ptr_mask),
+            )
                 .map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
 
         let dispatcher_labels = code
@@ -680,6 +683,8 @@ impl A64EmitX64 {
         let code_base = self.code.code_base_ptr();
         let rfrc = self.dispatcher_labels.return_from_run_code;
         let has_sse42 = self.code.has_host_feature(HostFeature::SSE42);
+        // Lichii (aab5393019, rsb_size): `code.GetJitStateInfo().rsb_ptr_mask`.
+        let rsb_ptr_mask = self.code.jit_state_info().rsb_ptr_mask;
         let asm = &mut self.code.asm;
 
         // ---- PopRSBHint handler ----
@@ -724,7 +729,7 @@ impl A64EmitX64 {
         .map_err(|e| format!("RSB handler: {:?}", e))?;
         asm.sub(rxbyak::Reg::gpr32(0), 1i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
-        asm.and_(rxbyak::Reg::gpr32(0), A64JitState::RSB_PTR_MASK as i32)
+        asm.and_(rxbyak::Reg::gpr32(0), rsb_ptr_mask as i32)
             .map_err(|e| format!("RSB handler: {:?}", e))?;
         // Store updated pointer
         asm.mov(

@@ -34,7 +34,9 @@ mod tests {
         config.fast_dispatch_set_associative = true;
         config.rsb_size = 32;
         config.halt_check_on_back_edges = true;
+        config.host_call_return = true;
         config.reuse_host_flags = true;
+        config.compact_block_exits = true;
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -526,6 +528,256 @@ mod tests {
             assert!(halt.contains(HaltReason::EXTERNAL_HALT), "loop {loop_index}: {halt:?}");
             runner.join().unwrap();
         }
+    }
+
+    // --- host_call_return (port of Lichii tests/A64/host_call_return.cpp) ---------------------
+
+    /// A minimal A64 assembler for the host call/return programs: forward and backward labels.
+    #[derive(Default)]
+    struct MiniAsm {
+        code: Vec<u32>,
+        labels: Vec<Option<usize>>,
+        fixups: Vec<(usize, usize, u8)>, // (instruction index, label, kind: 0 imm26, 1 imm19, 2 adr)
+    }
+
+    impl MiniAsm {
+        fn label(&mut self) -> usize {
+            self.labels.push(None);
+            self.labels.len() - 1
+        }
+        fn bind(&mut self, label: usize) {
+            self.labels[label] = Some(self.code.len());
+        }
+        fn emit(&mut self, inst: u32) {
+            self.code.push(inst);
+        }
+        fn branch(&mut self, inst: u32, label: usize, kind: u8) {
+            self.fixups.push((self.code.len(), label, kind));
+            self.code.push(inst);
+        }
+        fn bl(&mut self, label: usize) {
+            self.branch(0x9400_0000, label, 0)
+        }
+        fn b_ne(&mut self, label: usize) {
+            self.branch(0x5400_0001, label, 1)
+        }
+        fn cbz(&mut self, rt: u32, label: usize) {
+            self.branch(0xB400_0000 | rt, label, 1)
+        }
+        fn adr(&mut self, rd: u32, label: usize) {
+            self.branch(0x1000_0000 | rd, label, 2)
+        }
+        fn finish(mut self) -> Vec<u32> {
+            for &(at, label, kind) in &self.fixups {
+                let offset = self.labels[label].unwrap() as i64 - at as i64;
+                self.code[at] |= match kind {
+                    0 => (offset as u32) & 0x03FF_FFFF,
+                    1 => ((offset as u32) & 0x7FFFF) << 5,
+                    _ => {
+                        let bytes = (offset * 4) as u32;
+                        ((bytes & 3) << 29) | (((bytes >> 2) & 0x7FFFF) << 5)
+                    }
+                };
+            }
+            self.code
+        }
+    }
+
+    const fn movz(rd: u32, imm: u32) -> u32 {
+        0xD280_0000 | imm << 5 | rd
+    }
+    const fn mov_zero(rd: u32) -> u32 {
+        0xAA1F_03E0 | rd
+    }
+    const fn add_x_imm(rd: u32, rn: u32, imm: u32) -> u32 {
+        0x9100_0000 | imm << 10 | rn << 5 | rd
+    }
+    const fn sub_x_imm(rd: u32, rn: u32, imm: u32) -> u32 {
+        0xD100_0000 | imm << 10 | rn << 5 | rd
+    }
+    const fn subs_x_imm(rd: u32, rn: u32, imm: u32) -> u32 {
+        0xF100_0000 | imm << 10 | rn << 5 | rd
+    }
+    const STP_FP_LR_PRE: u32 = 0xA9BF_7BFD; // stp x29, x30, [sp, #-16]!
+    const LDP_FP_LR_POST: u32 = 0xA8C1_7BFD; // ldp x29, x30, [sp], #16
+    const RET: u32 = 0xD65F_03C0;
+
+    fn run_host_call_program(code: &[u32], host_call_return: bool) -> ([u64; 31], u64, u32) {
+        let env = RandomBlockEnv {
+            state: Arc::new(Mutex::new(EnvState::default())),
+            halt_reason: Arc::new(Mutex::new(0)),
+            reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        env.state.lock().unwrap().code = code.to_vec();
+        let mut config = UserConfig::new(Box::new(env.clone()));
+        config.enable_cycle_counting = false;
+        config.code_cache_size = 16 * 1024 * 1024;
+        config.omit_block_frame = true;
+        config.halt_check_on_back_edges = true;
+        config.host_call_return = host_call_return;
+        let mut jit = A64Jit::new(config).expect("A64 JIT");
+        jit.set_sp(0x80000);
+        // Run twice: the second run starts with every block compiled and linked.
+        for _ in 0..2 {
+            jit.set_pc(0);
+            let halt = jit.run();
+            assert!(halt.contains(HaltReason::SVC), "{halt:?} at 0x{:x}", jit.get_pc());
+            jit.clear_halt(halt);
+        }
+        (jit.get_registers(), jit.get_sp(), jit.get_fpcr())
+    }
+
+    fn run_host_call_both(code: Vec<u32>) -> ([u64; 31], u64, u32) {
+        let off = run_host_call_program(&code, false);
+        let on = run_host_call_program(&code, true);
+        assert_eq!(on, off);
+        on
+    }
+
+    #[test]
+    fn host_call_return_nested_calls() {
+        let mut a = MiniAsm::default();
+        let (lp, f1, f2, skip) = (a.label(), a.label(), a.label(), a.label());
+        a.emit(mov_zero(0));
+        a.emit(mov_zero(1));
+        a.emit(movz(19, 1000));
+        a.bind(lp);
+        a.bl(f1);
+        a.emit(subs_x_imm(19, 19, 1));
+        a.b_ne(lp);
+        a.emit(SVC0);
+        a.bind(f1);
+        a.emit(STP_FP_LR_PRE);
+        a.emit(add_x_imm(0, 0, 1));
+        a.bl(f2);
+        a.cbz(1, skip); // CheckBit terminal
+        a.emit(add_x_imm(0, 0, 1000));
+        a.bind(skip);
+        a.emit(LDP_FP_LR_POST);
+        a.emit(RET);
+        a.bind(f2);
+        a.emit(add_x_imm(0, 0, 2));
+        a.emit(RET);
+        let (regs, sp, _) = run_host_call_both(a.finish());
+        assert_eq!(regs[0], 3000);
+        assert_eq!(sp, 0x80000);
+    }
+
+    #[test]
+    fn host_call_return_returns_elsewhere() {
+        // Each callee returns past the instruction after its BL (RET to another address) or
+        // with BR, so frames stay on the host stack: 5000 of them, beyond HOST_CALL_MAX_DEPTH.
+        let mut a = MiniAsm::default();
+        let (lp, skip_ret, br_ret) = (a.label(), a.label(), a.label());
+        a.emit(mov_zero(1));
+        a.emit(mov_zero(2));
+        a.emit(mov_zero(3));
+        a.emit(movz(19, 5000));
+        a.bind(lp);
+        a.bl(skip_ret);
+        a.emit(add_x_imm(1, 1, 100)); // skipped
+        a.emit(add_x_imm(2, 2, 1));
+        a.bl(br_ret);
+        a.emit(add_x_imm(3, 3, 1));
+        a.emit(subs_x_imm(19, 19, 1));
+        a.b_ne(lp);
+        a.emit(SVC0);
+        a.bind(skip_ret);
+        a.emit(add_x_imm(30, 30, 4));
+        a.emit(RET);
+        a.bind(br_ret);
+        a.emit(0xD61F_03C0); // br x30
+        let (regs, _, _) = run_host_call_both(a.finish());
+        assert_eq!(regs[1], 0);
+        assert_eq!(regs[2], 5000);
+        assert_eq!(regs[3], 5000);
+    }
+
+    #[test]
+    fn host_call_return_deep_recursion() {
+        let mut a = MiniAsm::default();
+        let (rec, base, lp) = (a.label(), a.label(), a.label());
+        a.emit(movz(19, 3));
+        a.emit(mov_zero(0));
+        a.bind(lp);
+        a.emit(movz(1, 2000));
+        a.bl(rec);
+        a.emit(subs_x_imm(19, 19, 1));
+        a.b_ne(lp);
+        a.emit(SVC0);
+        a.bind(rec);
+        a.cbz(1, base);
+        a.emit(STP_FP_LR_PRE);
+        a.emit(sub_x_imm(1, 1, 1));
+        a.bl(rec);
+        a.emit(add_x_imm(0, 0, 1));
+        a.emit(LDP_FP_LR_POST);
+        a.bind(base);
+        a.emit(RET);
+        let (regs, sp, _) = run_host_call_both(a.finish());
+        assert_eq!(regs[0], 6000);
+        assert_eq!(sp, 0x80000);
+    }
+
+    #[test]
+    fn host_call_return_indirect_calls_and_fpcr_changes() {
+        // BLR to two callees; one flips FPCR.FZ, so the RET's location (PC + FPCR) differs from
+        // the one the call pushed every other time.
+        let mut a = MiniAsm::default();
+        let (lp, fa, fb) = (a.label(), a.label(), a.label());
+        a.emit(mov_zero(0));
+        a.emit(mov_zero(7));
+        a.emit(0xD2A0_2005); // movz x5, #0x0100, lsl #16 (FPCR.FZ)
+        a.emit(movz(19, 300));
+        a.adr(9, fa);
+        a.adr(10, fb);
+        a.bind(lp);
+        a.emit(0xD63F_0120); // blr x9
+        a.emit(0xD63F_0140); // blr x10
+        a.emit(0xD53B_4406); // mrs x6, fpcr
+        a.emit(0x8B46_60E7); // add x7, x7, x6, lsr #24
+        a.emit(subs_x_imm(19, 19, 1));
+        a.b_ne(lp);
+        a.emit(SVC0);
+        a.bind(fa);
+        a.emit(add_x_imm(0, 0, 3));
+        a.emit(RET);
+        a.bind(fb);
+        a.emit(0xD53B_4406); // mrs x6, fpcr
+        a.emit(0xCA05_00C6); // eor x6, x6, x5
+        a.emit(0xD51B_4406); // msr fpcr, x6
+        a.emit(RET);
+        let (regs, _, _) = run_host_call_both(a.finish());
+        assert_eq!(regs[0], 900);
+        assert_eq!(regs[7], 150);
+    }
+
+    #[test]
+    fn host_call_return_spills() {
+        // 28 live values across one block: the register allocator spills (into the JIT state
+        // when host_call_return is on) inside a callee two frames deep.
+        let mut a = MiniAsm::default();
+        let (outer, inner) = (a.label(), a.label());
+        a.bl(outer);
+        a.emit(SVC0);
+        a.bind(outer);
+        a.emit(STP_FP_LR_PRE);
+        a.bl(inner);
+        a.emit(LDP_FP_LR_POST);
+        a.emit(RET);
+        a.bind(inner);
+        for i in 0..28u32 {
+            a.emit(movz(i, i * 7 + 1));
+        }
+        for _ in 0..3 {
+            for i in 0..28u32 {
+                // madd xi, xi, x((i+5)%28), x((i+11)%28)
+                a.emit(0x9B00_0000 | ((i + 5) % 28) << 16 | ((i + 11) % 28) << 10 | i << 5 | i);
+            }
+        }
+        a.emit(RET);
+        let (_, sp, _) = run_host_call_both(a.finish());
+        assert_eq!(sp, 0x80000);
     }
 
     // --- Fastmem faults --------------------------------------------------------------------

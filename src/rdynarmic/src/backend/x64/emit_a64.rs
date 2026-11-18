@@ -485,14 +485,20 @@ pub fn emit_a64_set_check_bit(
         ctx.check_bit_in_zf.set(Some(ra.asm.size()));
         return;
     }
-    let offset = STACK_LAYOUT_RSP_OFFSET + StackLayout::check_bit_offset();
     let src8 = source.cvt8().unwrap();
-    ra.asm
-        .mov(
-            rxbyak::byte_ptr(RegExp::from(rxbyak::RSP) + offset as i32),
-            src8,
-        )
-        .unwrap();
+    ra.asm.mov(check_bit_address(ctx), src8).unwrap();
+}
+
+/// Where the check bit lives: the JIT state with host_call_return, else the stack (Lichii
+/// `A64EmitX64::CheckBitAddress`, aab5393019).
+pub(crate) fn check_bit_address(ctx: &EmitContext) -> rxbyak::Address {
+    if ctx.a64_codegen.host_call_return {
+        return rxbyak::byte_ptr(
+            RegExp::from(R15) + A64JitState::offset_of_check_bit() as i32,
+        );
+    }
+    let offset = STACK_LAYOUT_RSP_OFFSET + StackLayout::check_bit_offset();
+    rxbyak::byte_ptr(RegExp::from(rxbyak::RSP) + offset as i32)
 }
 
 // ---------------------------------------------------------------------------

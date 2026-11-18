@@ -138,6 +138,19 @@ pub fn emit_push_rsb(
     inst: &crate::ir::inst::Inst,
 ) {
     let target_loc = LocationDescriptor::new(inst.args[0].get_imm_as_u64());
+    if !ctx.arch.is_a32() {
+        // Lichii `A64EmitX64::EmitPushRSB` (591aec40f6 in aab5393019): A64 blocks leave the
+        // push out when the ReturnStackBuffer optimization is off (Eden's opcode table always
+        // ran EmitX64::EmitPushRSB).
+        if !ctx.enable_rsb {
+            return;
+        }
+        if ctx.a64_codegen.host_call_return {
+            // host_call_return: pushed as a host call frame right before the terminal.
+            ctx.call_return_target.set(Some(target_loc));
+            return;
+        }
+    }
     emit_push_rsb_location(ctx, ra, target_loc);
 }
 
@@ -1932,6 +1945,14 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
         }
         if check_bit_in_zf {
             ctx.check_bit_in_zf.set(Some(ra.asm.size()));
+        }
+    }
+
+    // Lichii `A64EmitX64::Emit` (aab5393019, host_call_return): a BL/BLR block pushes its guest
+    // return address as a host call frame right before the terminal (the link to the callee).
+    if let Some(return_target) = ctx.call_return_target.take() {
+        if !ctx.is_single_step {
+            crate::backend::x64::a64_emit_x64::emit_host_call(ctx, ra, return_target);
         }
     }
 

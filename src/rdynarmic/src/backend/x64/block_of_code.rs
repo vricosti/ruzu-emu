@@ -113,6 +113,10 @@ pub struct RunCodeCallbacks {
     pub fastmem_pointer: Option<*const u8>,
     /// Page-table pointer loaded into R14 during JIT execution.
     pub page_table_pointer: Option<*const u8>,
+    /// Offset of a u64 in the JIT state holding the host stack pointer to restore whenever
+    /// control is back in the dispatcher (A64 host_call_return, Lichii aab5393019); none when
+    /// rsp never moves.
+    pub host_stack_base_offset: Option<u32>,
 }
 
 /// Index bits for return_from_run_code variants.
@@ -552,6 +556,37 @@ impl BlockOfCode {
     ///   System V (Linux/macOS): RDI = *mut A64JitState, RSI = *const u8
     ///   Windows x64:            RCX = *mut A64JitState, RDX = *const u8
     ///   Returns: u32 (HaltReason bits) in EAX
+    /// Lichii `GenRunCode`'s `reset_host_stack` (aab5393019, host_call_return).
+    fn emit_reset_host_stack(&mut self, cb: &RunCodeCallbacks) -> rxbyak::Result<()> {
+        if let Some(offset) = cb.host_stack_base_offset {
+            self.asm
+                .mov(RSP, qword_ptr(RegExp::from(R15) + offset as i32))?;
+        }
+        Ok(())
+    }
+
+    /// Lichii `GenRCP` (aab5393019, host_call_return): a RET compares its target with the
+    /// frame's [rsp + ABI_SHADOW_SPACE]; with no guest frame that is the first StackLayout word
+    /// (the spills live in the JIT state), which holds a value no location descriptor has (bits
+    /// 57-58 are never set in one). Records the frame-free rsp and the deepest allowed one.
+    fn emit_host_call_return_prelude(&mut self, cb: &RunCodeCallbacks) -> rxbyak::Result<()> {
+        let Some(offset) = cb.host_stack_base_offset else {
+            return Ok(());
+        };
+        use crate::backend::x64::a64_jitstate::{HOST_CALL_FRAME_SIZE, HOST_CALL_MAX_DEPTH};
+        self.asm
+            .mov(qword_ptr(RegExp::from(RSP) + STACK_LAYOUT_RSP_OFFSET as i32), -1i32)?;
+        self.asm
+            .mov(qword_ptr(RegExp::from(R15) + offset as i32), RSP)?;
+        self.asm.lea(
+            RAX,
+            qword_ptr(RegExp::from(RSP) + -((HOST_CALL_FRAME_SIZE * HOST_CALL_MAX_DEPTH) as i32)),
+        )?;
+        self.asm
+            .mov(qword_ptr(RegExp::from(R15) + offset as i32 + 8), RAX)?;
+        Ok(())
+    }
+
     pub fn gen_run_code(&mut self, cb: &RunCodeCallbacks) -> rxbyak::Result<DispatcherLabels> {
         assert!(
             !self.prelude_complete,
@@ -587,6 +622,7 @@ impl BlockOfCode {
         if let Some(ptr) = cb.page_table_pointer {
             self.asm.mov(R14, ptr as i64)?;
         }
+        self.emit_host_call_return_prelude(cb)?;
 
         // If cycle counting: call get_ticks_remaining, store result
         if cb.enable_cycle_counting {
@@ -613,7 +649,10 @@ impl BlockOfCode {
         self.asm.jmp_reg(RBX)?;
 
         // ---- return_from_run_code[0]: normal return (MXCSR in guest mode) ----
+        // With host_stack_base_offset, guest call frames may be on the stack here: every entry
+        // drops them before the StackLayout is addressed through rsp (Lichii aab5393019).
         let rfrc_0_offset = self.asm.size();
+        self.emit_reset_host_stack(cb)?;
 
         // Check halt_reason
         let force_return_label = self.asm.create_label();
@@ -638,6 +677,7 @@ impl BlockOfCode {
 
         // ---- return_from_run_code[MXCSR_ALREADY_EXITED]: MXCSR already host ----
         let rfrc_mxcsr_offset = self.asm.size();
+        self.emit_reset_host_stack(cb)?;
 
         let return_mxcsr_already_exited_label = self.asm.create_label();
         self.asm
@@ -662,6 +702,7 @@ impl BlockOfCode {
         // ---- return_from_run_code[FORCE_RETURN]: force return, MXCSR still guest ----
         let rfrc_force_offset = self.asm.size();
         self.asm.bind(&force_return_label)?;
+        self.emit_reset_host_stack(cb)?;
 
         // Switch MXCSR back to host
         self.emit_switch_mxcsr_on_exit()?;
@@ -671,6 +712,7 @@ impl BlockOfCode {
         let rfrc_force_mxcsr_offset = self.asm.size();
         self.asm.bind(&return_mxcsr_already_exited_label)?;
         self.asm.bind(&already_halted)?;
+        self.emit_reset_host_stack(cb)?;
 
         // If cycle counting: compute ticks used and call add_ticks.
         // Ticks go in the second ABI param register (RSI on SysV, RDX on Windows).
@@ -725,6 +767,7 @@ impl BlockOfCode {
         if let Some(ptr) = cb.page_table_pointer {
             self.asm.mov(R14, ptr as i64)?;
         }
+        self.emit_host_call_return_prelude(cb)?;
 
         // Set cycle budget to 1 instruction
         if cb.enable_cycle_counting {
@@ -887,6 +930,7 @@ mod tests {
             enable_cycle_counting: false,
             fastmem_pointer: None,
             page_table_pointer: None,
+            host_stack_base_offset: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
         boc.prelude_complete();
@@ -909,6 +953,7 @@ mod tests {
             enable_cycle_counting: true,
             fastmem_pointer: None,
             page_table_pointer: None,
+            host_stack_base_offset: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
         boc.prelude_complete();
@@ -955,6 +1000,7 @@ mod tests {
             enable_cycle_counting: false,
             fastmem_pointer: None,
             page_table_pointer: None,
+            host_stack_base_offset: None,
         };
         boc.gen_run_code(&cb).unwrap();
         boc.prelude_complete();
@@ -981,6 +1027,7 @@ mod tests {
             enable_cycle_counting: false,
             fastmem_pointer: None,
             page_table_pointer: None,
+            host_stack_base_offset: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
         boc.prelude_complete();
@@ -1031,6 +1078,7 @@ mod tests {
             enable_cycle_counting: true,
             fastmem_pointer: None,
             page_table_pointer: None,
+            host_stack_base_offset: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
         boc.prelude_complete();
@@ -1055,6 +1103,7 @@ mod tests {
             enable_cycle_counting: false,
             fastmem_pointer: None,
             page_table_pointer: None,
+            host_stack_base_offset: None,
         };
         let labels = boc.gen_run_code(&cb).unwrap();
         boc.prelude_complete();

@@ -188,6 +188,10 @@ pub struct A64EmitX64 {
     /// x86-64 code generation options of the A64 configuration (Lichii keeps the whole
     /// `A64::UserConfig` as `A64EmitX64::conf`).
     pub codegen: A64CodegenOptions,
+    /// compact_block_exits: one shared unlinked-exit stub per target descriptor, created while
+    /// a block that links to it is emitted, and kept until ClearCache (Lichii
+    /// `A64EmitX64::exit_stubs`, aab5393019). Code offsets.
+    exit_stubs: std::collections::HashMap<u64, usize>,
 }
 
 impl A64EmitX64 {
@@ -239,6 +243,7 @@ impl A64EmitX64 {
             run_callbacks,
             processor_id: 0,
             codegen,
+            exit_stubs: std::collections::HashMap::new(),
         };
 
         let host_features = emitter.code.host_features();
@@ -488,6 +493,7 @@ impl A64EmitX64 {
                 Some(&self.memory_128_accessors as *const Memory128Accessors as *const ());
             ctx.block = Some(&block);
             ctx.a64_codegen = self.codegen;
+            ctx.exit_stubs = Some(&self.exit_stubs as *const _);
 
             // Set up block lookup closure for checking if targets are already compiled
             if self.optimizations.contains(OptimizationFlag::BLOCK_LINKING) {
@@ -517,6 +523,11 @@ impl A64EmitX64 {
                 self.codegen.spill_to_free_gpr,
                 self.codegen.scratch_copy_to_free_reg,
             );
+            if self.codegen.host_call_return {
+                // Lichii (aab5393019, host_call_return): rsp follows the guest call depth, so
+                // the spill slots live in the JIT state.
+                ra.set_spill_jit_offset(Some(A64JitState::offset_of_spill() as i32));
+            }
 
             // RUZU_BLOCK_PROLOGUE_COUNT_PC=0xLO-0xHI — inline per-core hit
             // counter at the block prologue. Bypasses FAST_DISPATCH chaining
@@ -550,6 +561,26 @@ impl A64EmitX64 {
             }
 
             let desc = emit_block(&ctx, &mut ra, &block);
+
+            // Lichii `A64EmitX64::FlushPendingExitStubs` (aab5393019, compact_block_exits).
+            let pending: Vec<_> = ctx.pending_exit_stubs.borrow_mut().drain(..).collect();
+            for (target, label) in pending {
+                ra.asm.bind(&label).unwrap();
+                self.exit_stubs.insert(target, ra.asm.size());
+                let target_pc = A64LocationDescriptor::from_location(LocationDescriptor::new(target)).pc();
+                ra.asm.mov(RAX, target_pc as i64).unwrap();
+                ra.asm
+                    .mov(
+                        qword_ptr(RegExp::from(R15) + A64JitState::offset_of_pc() as i32),
+                        RAX,
+                    )
+                    .unwrap();
+                crate::backend::x64::emit_terminal::emit_jmp_to_offset(
+                    ra.asm,
+                    self.dispatcher_labels.return_from_run_code[0],
+                    code_base as *const u8,
+                );
+            }
 
             // Drain deferred-emit closures: each one binds an `abort`
             // label, calls the pre-generated fallback stub, records the
@@ -667,7 +698,42 @@ impl A64EmitX64 {
             (&info.jz, Some(0x84u8), crate::backend::x64::patch_info::A64_PATCH_JZ_SIZE),
             (&info.jmp, None, crate::backend::x64::patch_info::A64_PATCH_JMP_SIZE),
         ];
-        for (locations, jcc_opcode, slot_size) in slots {
+        let compact = self.codegen.compact_block_exits;
+        if compact {
+            // Lichii `COMPACT_PATCH` (aab5393019): a 5/6-byte rel32 jump to the target block or
+            // to its shared exit stub (every site got one when it was emitted).
+            let target = match code_ptr {
+                Some(ptr) => ptr as usize,
+                None => {
+                    code_base as usize
+                        + *self
+                            .exit_stubs
+                            .get(&target_loc.value())
+                            .expect("compact block exit without its exit stub")
+                }
+            };
+            for (locations, jcc_opcode) in [
+                (&info.jg, Some(0x8Fu8)),
+                (&info.jz, Some(0x84u8)),
+                (&info.jmp, None),
+            ] {
+                for &offset in locations.iter() {
+                    let saved_size = self.code.asm.size();
+                    self.code.asm.set_size(offset);
+                    crate::backend::x64::emit_terminal::emit_rel32_jump(
+                        &mut self.code.asm,
+                        jcc_opcode,
+                        target,
+                        code_base,
+                    );
+                    self.code.asm.set_size(saved_size);
+                }
+            }
+        }
+        for (locations, jcc_opcode, slot_size) in slots
+            .into_iter()
+            .filter(|_| !compact)
+        {
             for &offset in locations.iter() {
                 let saved_size = self.code.asm.size();
                 self.code.asm.set_size(offset);
@@ -715,6 +781,7 @@ impl A64EmitX64 {
         let rsb_ptr_mask = self.code.jit_state_info().rsb_ptr_mask;
         // Lichii `GenTerminalHandlers` (aab5393019, halt_check_on_back_edges): forward links
         // skip the halt check, so indirect branches (the PC is already stored) take it.
+        let host_call_return = self.codegen.host_call_return;
         let check_halt = self.codegen.halt_check_on_back_edges
             && !self.emit_config.enable_cycle_counting;
         let emit_check_halt = |asm: &mut rxbyak::CodeAssembler| -> Result<(), String> {
@@ -936,6 +1003,16 @@ impl A64EmitX64 {
         }
         asm.mov(qword_ptr(RegExp::from(rbp)), RBX)
             .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        if host_call_return {
+            // Lichii (aab5393019, host_call_return): compiling can clear the whole code cache,
+            // and the guest call frames hold return addresses into it: drop them first (as the
+            // dispatcher does).
+            asm.mov(
+                RSP,
+                qword_ptr(RegExp::from(R15) + A64JitState::offset_of_host_stack_base() as i32),
+            )
+            .map_err(|e| format!("FastDispatch handler: {:?}", e))?;
+        }
         // RBP and R15 are SystemV callee-saved → preserved across the
         // call. RAX returns the resolved code pointer.
         self.run_callbacks
@@ -1024,6 +1101,7 @@ impl A64EmitX64 {
     /// prelude, preserving the fallback tables and terminal handlers.
     pub fn clear_cache(&mut self) {
         self.patch_table.clear();
+        self.exit_stubs.clear();
         self.clear_fast_dispatch_table();
         self.cache.clear();
         self.block_ranges.clear_cache();
@@ -1043,6 +1121,51 @@ impl A64EmitX64 {
             self.invalidate_basic_block(location);
         }
     }
+}
+
+/// Lichii `A64EmitX64::EmitHostCall` (aab5393019, host_call_return).
+///
+/// Guest call frame, from the caller's rsp R down:
+///   [R - 8]                   host return address: the landing code after the `call`
+///   [R - 16]                  location descriptor of the guest return address
+///   [R - 16 - shadow, R - 16) shadow space for the host calls the callee makes
+/// so the callee runs with rsp = R - HOST_CALL_FRAME_SIZE, 16-byte aligned like R.
+pub(crate) fn emit_host_call(ctx: &EmitContext, ra: &mut RegAlloc, return_target: LocationDescriptor) {
+    use crate::backend::x64::a64_jitstate::HOST_CALL_FRAME_SIZE;
+    const _: () = assert!(HOST_CALL_FRAME_SIZE == 16 + crate::backend::x64::abi::ABI_SHADOW_SPACE);
+    let Some(offsets) = ctx.dispatcher_offsets else {
+        return;
+    };
+    let asm = &mut *ra.asm;
+    // Too deep (or frames left by returns that did not match): start again from no frames.
+    asm.cmp(
+        RSP,
+        qword_ptr(RegExp::from(R15) + A64JitState::offset_of_host_stack_limit() as i32),
+    )
+    .unwrap();
+    asm.cmovb(
+        RSP,
+        qword_ptr(RegExp::from(R15) + A64JitState::offset_of_host_stack_base() as i32),
+    )
+    .unwrap();
+    let frame = asm.create_label();
+    asm.mov(RAX, return_target.value() as i64).unwrap();
+    asm.call(&frame).unwrap();
+    // Landing: a RET to the return address popped the frame, rsp is R again.
+    crate::backend::x64::emit_terminal::emit_unchecked_link(ctx, ra, return_target, offsets);
+    let asm = &mut *ra.asm;
+    asm.bind(&frame).unwrap();
+    asm.lea(
+        RSP,
+        qword_ptr(RegExp::from(RSP) + -((HOST_CALL_FRAME_SIZE - 8) as i32)),
+    )
+    .unwrap();
+    asm.mov(
+        qword_ptr(RegExp::from(RSP) + crate::backend::x64::abi::ABI_SHADOW_SPACE as i32),
+        RAX,
+    )
+    .unwrap();
+    // The terminal (the link to the callee) follows.
 }
 
 /// The Add64(base, imm) instructions whose only use is the address of one 8-64-bit fastmem
@@ -1148,6 +1271,7 @@ mod tests {
             enable_cycle_counting: true,
             fastmem_pointer: None,
             page_table_pointer: None,
+            host_stack_base_offset: None,
         }
     }
 

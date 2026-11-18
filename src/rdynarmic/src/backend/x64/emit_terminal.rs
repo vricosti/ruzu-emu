@@ -43,6 +43,15 @@ pub fn emit_terminal(ctx: &EmitContext, ra: &mut RegAlloc, terminal: &Terminal) 
             emit_terminal_link_block_fast(ctx, ra, *next);
         }
 
+        Terminal::PopRSBHint
+            if ctx.a64_codegen.host_call_return
+                && ctx.enable_rsb
+                && !ctx.is_single_step
+                && ctx.dispatcher_offsets.is_some() =>
+        {
+            emit_terminal_host_return(ctx, ra);
+        }
+
         Terminal::PopRSBHint if ctx.halt_check_on_back_edges() => {
             // Lichii (aab5393019, halt_check_on_back_edges): the RSB / fast dispatch handlers
             // and the dispatcher check for a halt instead.
@@ -331,8 +340,10 @@ fn emit_terminal_link_block(
                 // Look up target in cache
                 let target_ptr = ctx.block_lookup.as_ref().and_then(|lookup| lookup(next));
 
-                emit_patch_jg(ra.asm, target_pc, pc_offset, target_ptr, offsets, ctx.code_base_ptr);
-                emit_set_pc(ctx, ra, next);
+                emit_a64_link_slot(ctx, ra, Some(0x8F), next, target_ptr, offsets, |asm| {
+                    emit_patch_jg(asm, target_pc, pc_offset, target_ptr, offsets, ctx.code_base_ptr)
+                });
+                emit_a64_unlinked_exit(ctx, ra, next, offsets);
             } else {
                 let budget_exhausted = ra.asm.create_label();
                 ra.asm.jle(&budget_exhausted, JmpType::Near).unwrap();
@@ -342,8 +353,8 @@ fn emit_terminal_link_block(
 
                 // Budget exhausted: force return
                 ra.asm.bind(&budget_exhausted).unwrap();
+                emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
             }
-            emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
         } else {
             // No cycle counting: check halt_reason
             let halt_offset = ctx.jit_state_info.offsetof_halt_reason;
@@ -363,8 +374,10 @@ fn emit_terminal_link_block(
                 // Look up target in cache
                 let target_ptr = ctx.block_lookup.as_ref().and_then(|lookup| lookup(next));
 
-                emit_patch_jz(ra.asm, target_pc, pc_offset, target_ptr, offsets, ctx.code_base_ptr);
-                emit_set_pc(ctx, ra, next);
+                emit_a64_link_slot(ctx, ra, Some(0x84), next, target_ptr, offsets, |asm| {
+                    emit_patch_jz(asm, target_pc, pc_offset, target_ptr, offsets, ctx.code_base_ptr)
+                });
+                emit_a64_unlinked_exit(ctx, ra, next, offsets);
             } else {
                 let halted = ra.asm.create_label();
                 ra.asm.jnz(&halted, JmpType::Near).unwrap();
@@ -374,8 +387,8 @@ fn emit_terminal_link_block(
 
                 // Halted: force return
                 ra.asm.bind(&halted).unwrap();
+                emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
             }
-            emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
         }
     } else {
         // Fallback for unit tests
@@ -409,8 +422,115 @@ fn emit_terminal_link_block(
     }
 }
 
+/// An A64 link patch slot. With `compact_block_exits` (Lichii `COMPACT_PATCH`, aab5393019): a
+/// 5/6-byte rel32 jump to the target block, or to the target's shared exit stub while
+/// unlinked; every site gets its stub at first emission, so an unpatch always finds one.
+/// Otherwise the upstream 22/23-byte slot (`emit_upstream`).
+fn emit_a64_link_slot(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    jcc_opcode: Option<u8>,
+    next: crate::ir::location::LocationDescriptor,
+    target_ptr: Option<*const u8>,
+    _offsets: [usize; 4],
+    emit_upstream: impl FnOnce(&mut CodeAssembler),
+) {
+    if !ctx.a64_codegen.compact_block_exits {
+        emit_upstream(ra.asm);
+        return;
+    }
+    let stub = existing_exit_stub(ctx, next);
+    let pending = stub.is_none().then(|| pending_exit_stub(ctx, ra.asm, next));
+    let target = target_ptr
+        .map(|ptr| ptr as usize)
+        .or_else(|| stub.map(|offset| ctx.code_base_ptr as usize + offset));
+    match (target, pending) {
+        (Some(target), _) => emit_rel32_jump(ra.asm, jcc_opcode, target, ctx.code_base_ptr),
+        (None, Some(label)) => emit_label_jump(ra.asm, jcc_opcode, &label),
+        (None, None) => unreachable!(),
+    }
+}
+
+/// Lichii `A64EmitX64::EmitUnlinkedExit` (aab5393019): leaves the block for `target` without
+/// linking. With `compact_block_exits` it jumps to the target's shared stub (PC store +
+/// dispatcher return; the dispatcher also returns when a halt is pending); otherwise it stores
+/// the PC and force-returns, as before.
+fn emit_a64_unlinked_exit(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    next: crate::ir::location::LocationDescriptor,
+    offsets: [usize; 4],
+) {
+    if ctx.a64_codegen.compact_block_exits {
+        if let Some(offset) = existing_exit_stub(ctx, next) {
+            emit_rel32_jump(ra.asm, None, ctx.code_base_ptr as usize + offset, ctx.code_base_ptr);
+        } else {
+            let label = pending_exit_stub(ctx, ra.asm, next);
+            emit_label_jump(ra.asm, None, &label);
+        }
+        return;
+    }
+    emit_set_pc(ctx, ra, next);
+    emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
+}
+
+/// The code offset of `target`'s shared exit stub, if one exists (Lichii `exit_stubs`).
+fn existing_exit_stub(
+    ctx: &EmitContext,
+    target: crate::ir::location::LocationDescriptor,
+) -> Option<usize> {
+    ctx.exit_stubs
+        .and_then(|stubs| unsafe { &*stubs }.get(&target.value()).copied())
+}
+
+/// Lichii `A64EmitX64::PendingExitStub`: a stub created after this block.
+fn pending_exit_stub(
+    ctx: &EmitContext,
+    asm: &mut CodeAssembler,
+    target: crate::ir::location::LocationDescriptor,
+) -> Label {
+    let mut pending = ctx.pending_exit_stubs.borrow_mut();
+    if let Some((_, label)) = pending.iter().find(|(desc, _)| *desc == target.value()) {
+        return *label;
+    }
+    let label = asm.create_label();
+    pending.push((target.value(), label));
+    label
+}
+
+/// `jmp rel32` / `jcc rel32` (`0F jcc_opcode`) to an absolute address.
+pub(crate) fn emit_rel32_jump(
+    asm: &mut CodeAssembler,
+    jcc_opcode: Option<u8>,
+    target: usize,
+    code_base: *const u8,
+) {
+    let len = if jcc_opcode.is_some() { 6 } else { 5 };
+    let end = code_base as usize + asm.size() + len;
+    let disp = target as i64 - end as i64;
+    match jcc_opcode {
+        Some(op) => {
+            asm.db(0x0F).unwrap();
+            asm.db(op).unwrap();
+        }
+        None => asm.db(0xE9).unwrap(),
+    }
+    asm.dd(disp as i32 as u32).unwrap();
+}
+
+/// rel32 `jmp`/`jg`/`jz` to a label (6/5 bytes like the compact patch sites).
+fn emit_label_jump(asm: &mut CodeAssembler, jcc_opcode: Option<u8>, label: &Label) {
+    match jcc_opcode {
+        None => asm.jmp(label, JmpType::Near),
+        Some(0x8F) => asm.jg(label, JmpType::Near),
+        Some(0x84) => asm.jz(label, JmpType::Near),
+        Some(op) => panic!("unexpected link jcc 0x{op:02x}"),
+    }
+    .unwrap();
+}
+
 /// Lichii `EmitUncheckedLink` (aab5393019): a patchable `jmp` to the next block, no halt check.
-fn emit_unchecked_link(
+pub(crate) fn emit_unchecked_link(
     ctx: &EmitContext,
     ra: &mut RegAlloc,
     next: crate::ir::location::LocationDescriptor,
@@ -423,14 +543,16 @@ fn emit_unchecked_link(
         code_offset: patch_offset,
     });
     let target_ptr = ctx.block_lookup.as_ref().and_then(|lookup| lookup(next));
-    emit_patch_jmp(
-        ra.asm,
-        ctx.arch.extract_pc(next),
-        ctx.arch.pc_offset(),
-        target_ptr,
-        offsets,
-        ctx.code_base_ptr,
-    );
+    emit_a64_link_slot(ctx, ra, None, next, target_ptr, offsets, |asm| {
+        emit_patch_jmp(
+            asm,
+            ctx.arch.extract_pc(next),
+            ctx.arch.pc_offset(),
+            target_ptr,
+            offsets,
+            ctx.code_base_ptr,
+        )
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -514,18 +636,19 @@ fn emit_terminal_link_block_fast(
             // Look up target in cache
             let target_ptr = ctx.block_lookup.as_ref().and_then(|lookup| lookup(next));
 
-            emit_patch_jmp(
-                ra.asm,
-                ctx.arch.extract_pc(next),
-                ctx.arch.pc_offset(),
-                target_ptr,
-                offsets,
-                ctx.code_base_ptr,
-            );
+            emit_a64_link_slot(ctx, ra, None, next, target_ptr, offsets, |asm| {
+                emit_patch_jmp(
+                    asm,
+                    ctx.arch.extract_pc(next),
+                    ctx.arch.pc_offset(),
+                    target_ptr,
+                    offsets,
+                    ctx.code_base_ptr,
+                )
+            });
             if check_halt {
                 ra.asm.bind(&halted).unwrap();
-                emit_set_pc(ctx, ra, next);
-                emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
+                emit_a64_unlinked_exit(ctx, ra, next, offsets);
             }
         } else {
             emit_set_pc(ctx, ra, next);
@@ -602,9 +725,12 @@ fn emit_terminal_check_bit(
             "check bit in ZF: code was emitted between A64SetCheckBit and the CheckBit terminal"
         );
     } else {
-        ra.asm
-            .cmp(byte_ptr(RegExp::from(RSP) + check_bit_offset as i32), 0i32)
-            .unwrap();
+        let address = if ctx.arch.is_a32() {
+            byte_ptr(RegExp::from(RSP) + check_bit_offset as i32)
+        } else {
+            crate::backend::x64::emit_a64::check_bit_address(ctx)
+        };
+        ra.asm.cmp(address, 0i32).unwrap();
     }
     ra.asm.jz(&fail_label, JmpType::Near).unwrap();
 
@@ -666,6 +792,51 @@ fn emit_jcc(asm: &mut CodeAssembler, cond: Cond, label: &Label) {
         Cond::AL | Cond::NV => asm.jmp(label, t),
     }
     .unwrap();
+}
+
+/// Lichii `EmitTerminalImpl(PopRSBHint)` with host_call_return (aab5393019): host `ret` when
+/// the guest returns to the address the innermost frame's call pushed: its location descriptor
+/// is the PC masked to the descriptor's PC bits plus this block's FPCR bits (an RET does not
+/// change the FPCR). Else the frame stays and the fast dispatcher runs. Halts are checked at
+/// every RET.
+fn emit_terminal_host_return(ctx: &EmitContext, ra: &mut RegAlloc) {
+    use crate::backend::x64::a64_jitstate::{A64JitState, HOST_CALL_FRAME_SIZE};
+    use crate::ir::location::A64LocationDescriptor;
+    let offsets = ctx.dispatcher_offsets.expect("host return needs the dispatcher");
+    let asm = &mut *ra.asm;
+    let halt_offset = ctx.jit_state_info.offsetof_halt_reason;
+    asm.cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32)
+        .unwrap();
+    emit_jcc_to_offset(asm, 0x85, offsets[FORCE_RETURN], ctx.code_base_ptr);
+    asm.mov(RAX, qword_ptr(RegExp::from(R15) + A64JitState::offset_of_pc() as i32))
+        .unwrap();
+    const _: () = assert!(A64LocationDescriptor::PC_MASK == (1u64 << 56) - 1);
+    asm.shl(RAX, 8u8).unwrap();
+    asm.shr(RAX, 8u8).unwrap();
+    let fpcr_bits = A64LocationDescriptor::from_location(ctx.location)
+        .set_pc(0)
+        .to_location()
+        .value();
+    if fpcr_bits != 0 {
+        asm.mov(RCX, fpcr_bits as i64).unwrap();
+        asm.or_(RAX, RCX).unwrap();
+    }
+    asm.cmp(
+        RAX,
+        qword_ptr(RegExp::from(RSP) + crate::backend::x64::abi::ABI_SHADOW_SPACE as i32),
+    )
+    .unwrap();
+    let miss_target = match ctx.terminal_handler_fast_dispatch_hint {
+        Some(handler) if ctx.enable_fast_dispatch => handler,
+        _ => offsets[0],
+    };
+    emit_jcc_to_offset(asm, 0x85, miss_target, ctx.code_base_ptr);
+    asm.lea(
+        RSP,
+        qword_ptr(RegExp::from(RSP) + (HOST_CALL_FRAME_SIZE - 8) as i32),
+    )
+    .unwrap();
+    asm.ret().unwrap();
 }
 
 // ---------------------------------------------------------------------------

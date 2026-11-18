@@ -621,6 +621,9 @@ impl A64Jit {
             )),
             enable_cycle_counting: config.enable_cycle_counting,
             fastmem_pointer: config.fastmem_pointer.map(|p| p as *const u8),
+            host_stack_base_offset: codegen.host_call_return.then_some(
+                A64JitState::offset_of_host_stack_base() as u32,
+            ),
             page_table_pointer: config
                 .page_table
                 .map(|pointer| pointer.cast::<u8>() as *const u8),

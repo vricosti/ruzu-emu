@@ -267,11 +267,16 @@ pub struct A64CodegenOptions {
     pub halt_check_on_back_edges: bool,
     /// `A64::UserConfig::rsb_ptr_mask()` (from `rsb_size`).
     pub rsb_ptr_mask: usize,
+    /// `A64::UserConfig::compact_block_exits`.
+    pub compact_block_exits: bool,
     /// `A64::UserConfig::fast_dispatch_table_bits` / `fast_dispatch_set_associative`.
     pub fast_dispatch_table_bits: u32,
     pub fast_dispatch_set_associative: bool,
     /// `A64::UserConfig::reuse_host_flags` (effective only without cycle counting).
     pub reuse_host_flags: bool,
+    /// Lichii `HostCallReturn(conf)`: `host_call_return && omit_block_frame &&
+    /// !enable_cycle_counting` (it needs rsp-free blocks).
+    pub host_call_return: bool,
 }
 
 impl Default for A64CodegenOptions {
@@ -285,9 +290,11 @@ impl Default for A64CodegenOptions {
             omit_block_frame: false,
             halt_check_on_back_edges: false,
             rsb_ptr_mask: 7,
+            compact_block_exits: false,
             fast_dispatch_table_bits: 0,
             fast_dispatch_set_associative: false,
             reuse_host_flags: false,
+            host_call_return: false,
         }
     }
 }
@@ -302,9 +309,13 @@ impl A64CodegenOptions {
             omit_block_frame: config.omit_block_frame,
             halt_check_on_back_edges: config.halt_check_on_back_edges,
             rsb_ptr_mask: config.rsb_ptr_mask(),
+            compact_block_exits: config.compact_block_exits,
             fast_dispatch_table_bits: config.fast_dispatch_table_bits,
             fast_dispatch_set_associative: config.fast_dispatch_set_associative,
             reuse_host_flags: config.reuse_host_flags,
+            host_call_return: config.host_call_return
+                && config.omit_block_frame
+                && !config.enable_cycle_counting,
         }
     }
 }
@@ -436,6 +447,14 @@ pub struct EmitContext<'a> {
     /// the base); the access adds disp in its addressing mode. Lichii keeps the list in
     /// `BlockOfCode::folded_address_adds` (aab5393019).
     pub folded_address_adds: RefCell<Vec<(crate::ir::value::InstRef, i32)>>,
+    /// host_call_return: the guest return address of the block's BL/BLR, pushed as a host call
+    /// frame right before the terminal (Lichii `A64EmitX64::call_return_target`).
+    pub call_return_target: std::cell::Cell<Option<LocationDescriptor>>,
+    /// compact_block_exits: the emitter's shared exit stubs (descriptor value → code offset,
+    /// Lichii `A64EmitX64::exit_stubs`) and the stubs this block still has to emit after its
+    /// code (`pending_exit_stubs`).
+    pub exit_stubs: Option<*const std::collections::HashMap<u64, usize>>,
+    pub pending_exit_stubs: RefCell<Vec<(u64, rxbyak::Label)>>,
 }
 
 impl<'a> EmitContext<'a> {
@@ -472,6 +491,9 @@ impl<'a> EmitContext<'a> {
             nzcv_flags_inst: std::cell::Cell::new(None),
             check_bit_in_zf: std::cell::Cell::new(None),
             folded_address_adds: RefCell::new(Vec::new()),
+            call_return_target: std::cell::Cell::new(None),
+            exit_stubs: None,
+            pending_exit_stubs: RefCell::new(Vec::new()),
         }
     }
 
@@ -517,6 +539,9 @@ impl<'a> EmitContext<'a> {
             nzcv_flags_inst: std::cell::Cell::new(None),
             check_bit_in_zf: std::cell::Cell::new(None),
             folded_address_adds: RefCell::new(Vec::new()),
+            call_return_target: std::cell::Cell::new(None),
+            exit_stubs: None,
+            pending_exit_stubs: RefCell::new(Vec::new()),
         }
     }
 

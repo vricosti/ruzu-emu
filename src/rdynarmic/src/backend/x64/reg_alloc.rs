@@ -366,6 +366,9 @@ pub struct RegAlloc<'a> {
     spill_to_gpr: bool,
     /// `A64::UserConfig::scratch_copy_to_free_reg` (Lichii aab5393019, `RegAlloc::scratch_copy`).
     scratch_copy: bool,
+    /// Lichii `RegAlloc::spill_jit_offset` (aab5393019, host_call_return): the spill slots are
+    /// at [R15 + offset] (the JIT state) instead of on the stack.
+    spill_jit_offset: Option<i32>,
 }
 
 impl<'a> RegAlloc<'a> {
@@ -392,6 +395,7 @@ impl<'a> RegAlloc<'a> {
             current_inst: None,
             spill_to_gpr: false,
             scratch_copy: false,
+            spill_jit_offset: None,
         }
     }
 
@@ -400,6 +404,16 @@ impl<'a> RegAlloc<'a> {
     pub fn set_spill_options(&mut self, spill_to_gpr: bool, scratch_copy: bool) {
         self.spill_to_gpr = spill_to_gpr;
         self.scratch_copy = scratch_copy;
+    }
+
+    /// Lichii `RegAlloc::Reset(..., new_spill_jit_offset)` (aab5393019, host_call_return).
+    pub fn set_spill_jit_offset(&mut self, offset: Option<i32>) {
+        self.spill_jit_offset = offset;
+    }
+
+    /// Lichii `RegAlloc::SpillJitOffset`.
+    pub fn spill_jit_offset(&self) -> Option<i32> {
+        self.spill_jit_offset
     }
 
     /// Create with default GPR/XMM ordering (from ANY_GPR/ANY_XMM).
@@ -1249,6 +1263,9 @@ impl<'a> RegAlloc<'a> {
             _ => panic!("spill_address called on non-spill"),
         };
         assert!(i < SPILL_SLOTS, "Spill index out of range");
+        if let Some(offset) = self.spill_jit_offset {
+            return xmmword_ptr(RegExp::from(rxbyak::R15) + offset + (i * 16) as i32);
+        }
         let offset =
             self.reserved_stack_space + STACK_LAYOUT_RSP_OFFSET + StackLayout::spill_offset(i);
         xmmword_ptr(RegExp::from(RSP) + offset as i32)

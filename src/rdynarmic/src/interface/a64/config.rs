@@ -246,6 +246,12 @@ pub struct UserConfig {
     /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
     /// `interface/A64/config.h` (commit aab5393019, "rsb_size").
     pub rsb_size: u32,
+    /// x64 only. Unlinked block exits jump to one shared stub per target (PC store + dispatcher
+    /// return) instead of an inline stub, so patch sites are 5/6 bytes instead of 22/23.
+    ///
+    /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+    /// `interface/A64/config.h` (commit aab5393019, "compact_block_exits").
+    pub compact_block_exits: bool,
     /// x64 only. log2 of the number of fast dispatch table entries (0 = default 20) and whether
     /// the table is 4-way set associative (the four ways of a set share one cache line).
     ///
@@ -261,6 +267,15 @@ pub struct UserConfig {
     /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
     /// `interface/A64/config.h` (commit aab5393019, "reuse_host_flags").
     pub reuse_host_flags: bool,
+    /// x64 only, without cycle counting and with omit_block_frame. BL and BLR become a host
+    /// `call` and RET a host `ret` once the guest return address matches the one the call
+    /// pushed (else the fast dispatcher runs), so the host's return predictor predicts guest
+    /// returns. Spills and the check bit move into the JIT state; the host stack holds one frame
+    /// per guest call.
+    ///
+    /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+    /// `interface/A64/config.h` (commit aab5393019, "host_call_return").
+    pub host_call_return: bool,
     pub define_unpredictable_behaviour: bool,
     pub wall_clock_cntpct: bool,
     pub check_halt_on_memory_access: bool,
@@ -310,9 +325,11 @@ impl UserConfig {
             omit_block_frame: false,
             halt_check_on_back_edges: false,
             rsb_size: 8,
+            compact_block_exits: false,
             fast_dispatch_table_bits: 0,
             fast_dispatch_set_associative: false,
             reuse_host_flags: false,
+            host_call_return: false,
             define_unpredictable_behaviour: false,
             wall_clock_cntpct: false,
             check_halt_on_memory_access: false,

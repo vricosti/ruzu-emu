@@ -9,7 +9,7 @@ use rxbyak::{dword_ptr, qword_ptr, xmmword_ptr, JmpType, RegExp, R15, RSP, XMM0}
 use crate::backend::x64::abi;
 use crate::backend::x64::constants::{cmp, convert_rounding_mode_to_x64_immediate};
 use crate::backend::x64::emit_context::{DeferredEmitCtx, EmitContext};
-use crate::backend::x64::emit_fp_vector::force_to_default_nan;
+use crate::backend::x64::emit_fp_vector::{force_to_default_nan, get_vector_of};
 use crate::backend::x64::emit_vector_helpers::*;
 use crate::backend::x64::fp_helpers;
 use crate::backend::x64::host_feature::HostFeature;
@@ -1411,122 +1411,252 @@ pub fn emit_fp_vector_round_int64(
 }
 
 // ---------------------------------------------------------------------------
-// FPVectorFromSignedFixed / FPVectorFromUnsignedFixed — fallback (with imm = frac bits)
+// FPVectorFromSignedFixed / FPVectorFromUnsignedFixed
+// Port of upstream EmitFPVectorFrom{Signed,Unsigned}Fixed{32,64}
+// (emit_x64_vector_floating_point.cpp).
+// Args: (value, fbits: U8, rounding: U8, fpcr_controlled: U1)
 // ---------------------------------------------------------------------------
 
-extern "C" fn fallback_fp_from_signed_fixed32(
-    result: *mut [u8; 16],
-    a: *const [u8; 16],
-    fbits: u8,
-) {
-    unsafe {
-        let va: [i32; 4] = std::mem::transmute(*a);
-        let scale = (1u64 << fbits) as f32;
-        let out: [f32; 4] = [
-            va[0] as f32 / scale,
-            va[1] as f32 / scale,
-            va[2] as f32 / scale,
-            va[3] as f32 / scale,
-        ];
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_fp_from_signed_fixed64(
-    result: *mut [u8; 16],
-    a: *const [u8; 16],
-    fbits: u8,
-) {
-    unsafe {
-        let va: [i64; 2] = std::mem::transmute(*a);
-        let scale = (1u64 << fbits) as f64;
-        let out: [f64; 2] = [va[0] as f64 / scale, va[1] as f64 / scale];
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_fp_from_unsigned_fixed32(
-    result: *mut [u8; 16],
-    a: *const [u8; 16],
-    fbits: u8,
-) {
-    unsafe {
-        let va: [u32; 4] = std::mem::transmute(*a);
-        let scale = (1u64 << fbits) as f32;
-        let out: [f32; 4] = [
-            va[0] as f32 / scale,
-            va[1] as f32 / scale,
-            va[2] as f32 / scale,
-            va[3] as f32 / scale,
-        ];
-        *result = std::mem::transmute(out);
-    }
-}
-
-extern "C" fn fallback_fp_from_unsigned_fixed64(
-    result: *mut [u8; 16],
-    a: *const [u8; 16],
-    fbits: u8,
-) {
-    unsafe {
-        let va: [u64; 2] = std::mem::transmute(*a);
-        let scale = (1u64 << fbits) as f64;
-        let out: [f64; 2] = [va[0] as f64 / scale, va[1] as f64 / scale];
-        *result = std::mem::transmute(out);
-    }
-}
-
 pub fn emit_fp_vector_from_signed_fixed32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_with_imm(
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_from_signed_fixed32 as *const () as usize,
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let xmm = ra.use_scratch_xmm(&mut args[0]);
+    let fbits = args[1].get_immediate_u8() as u32;
+    let rounding_mode = args[2].get_immediate_u8();
+    let fpcr_controlled = args[3].get_immediate_u1();
+    assert_eq!(
+        rounding_mode,
+        ctx.fpcr(fpcr_controlled).rmode() as u8,
+        "FPVectorFromSignedFixed32 rounding mode must match FPCR"
     );
+
+    maybe_standard_fpscr_value(ctx, ra, fpcr_controlled, |ra| {
+        ra.asm.cvtdq2ps(xmm, xmm).unwrap();
+        if fbits != 0 {
+            let scale = get_vector_of(ra, 32, ((127 - fbits) << 23) as u64);
+            ra.asm.mulps(xmm, scale).unwrap();
+        }
+    });
+
+    ra.define_value(inst_ref, xmm);
 }
+
 pub fn emit_fp_vector_from_signed_fixed64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_with_imm(
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_from_signed_fixed64 as *const () as usize,
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let xmm = ra.use_scratch_xmm(&mut args[0]);
+    let fbits = args[1].get_immediate_u8() as u64;
+    let rounding_mode = args[2].get_immediate_u8();
+    let fpcr_controlled = args[3].get_immediate_u1();
+    assert_eq!(
+        rounding_mode,
+        ctx.fpcr(fpcr_controlled).rmode() as u8,
+        "FPVectorFromSignedFixed64 rounding mode must match FPCR"
     );
+
+    maybe_standard_fpscr_value(ctx, ra, fpcr_controlled, |ra| {
+        if ctx.has_host_feature(HostFeature::AVX512_ORTHO_FLOAT) {
+            ra.asm.vcvtqq2pd(xmm, xmm).unwrap();
+        } else if ctx.has_host_feature(HostFeature::SSE41) {
+            let xmm_tmp = ra.scratch_xmm();
+            let tmp = ra.scratch_gpr();
+
+            // First quadword
+            ra.asm.movq(tmp, xmm).unwrap();
+            ra.asm.cvtsi2sd(xmm, tmp).unwrap();
+
+            // Second quadword
+            ra.asm.pextrq(tmp, xmm, 1).unwrap();
+            ra.asm.cvtsi2sd(xmm_tmp, tmp).unwrap();
+
+            // Combine
+            ra.asm.unpcklpd(xmm, xmm_tmp).unwrap();
+        } else {
+            let high_xmm = ra.scratch_xmm();
+            let xmm_tmp = ra.scratch_xmm();
+            let tmp = ra.scratch_gpr();
+
+            // First quadword
+            ra.asm.movhlps(high_xmm, xmm).unwrap();
+            ra.asm.movq(tmp, xmm).unwrap();
+            ra.asm.cvtsi2sd(xmm, tmp).unwrap();
+
+            // Second quadword
+            ra.asm.movq(tmp, high_xmm).unwrap();
+            ra.asm.cvtsi2sd(xmm_tmp, tmp).unwrap();
+
+            // Combine
+            ra.asm.unpcklpd(xmm, xmm_tmp).unwrap();
+        }
+
+        if fbits != 0 {
+            let scale = get_vector_of(ra, 64, (1023 - fbits) << 52);
+            ra.asm.mulpd(xmm, scale).unwrap();
+        }
+    });
+
+    ra.define_value(inst_ref, xmm);
 }
+
 pub fn emit_fp_vector_from_unsigned_fixed32(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_with_imm(
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_from_unsigned_fixed32 as *const () as usize,
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let xmm = ra.use_scratch_xmm(&mut args[0]);
+    let fbits = args[1].get_immediate_u8() as u32;
+    let rounding_mode = args[2].get_immediate_u8();
+    let fpcr_controlled = args[3].get_immediate_u1();
+    assert_eq!(
+        rounding_mode,
+        ctx.fpcr(fpcr_controlled).rmode() as u8,
+        "FPVectorFromUnsignedFixed32 rounding mode must match FPCR"
     );
+
+    maybe_standard_fpscr_value(ctx, ra, fpcr_controlled, |ra| {
+        if ctx.has_host_feature(HostFeature::AVX512_ORTHO) {
+            ra.asm.vcvtudq2ps(xmm, xmm).unwrap();
+        } else {
+            let mem_4b000000 = get_vector_of(ra, 32, 0x4B00_0000);
+            let mem_53000000 = get_vector_of(ra, 32, 0x5300_0000);
+            let mem_d3000080 = get_vector_of(ra, 32, 0xD300_0080);
+
+            let tmp = ra.scratch_xmm();
+
+            if ctx.has_host_feature(HostFeature::AVX) {
+                ra.asm
+                    .vpblendw(tmp, xmm, mem_4b000000, 0b1010_1010)
+                    .unwrap();
+                ra.asm.vpsrld_imm(xmm, xmm, 16).unwrap();
+                ra.asm
+                    .vpblendw(xmm, xmm, mem_53000000, 0b1010_1010)
+                    .unwrap();
+                ra.asm.vaddps(xmm, xmm, mem_d3000080).unwrap();
+                ra.asm.vaddps(xmm, tmp, xmm).unwrap();
+            } else {
+                let mem_0xffff = get_vector_of(ra, 32, 0x0000_FFFF);
+
+                ra.asm.movdqa(tmp, mem_0xffff).unwrap();
+
+                ra.asm.pand(tmp, xmm).unwrap();
+                ra.asm.por(tmp, mem_4b000000).unwrap();
+                ra.asm.psrld_imm(xmm, 16).unwrap();
+                ra.asm.por(xmm, mem_53000000).unwrap();
+                ra.asm.addps(xmm, mem_d3000080).unwrap();
+                ra.asm.addps(xmm, tmp).unwrap();
+            }
+        }
+
+        if fbits != 0 {
+            let scale = get_vector_of(ra, 32, ((127 - fbits) << 23) as u64);
+            ra.asm.mulps(xmm, scale).unwrap();
+        }
+
+        if ctx.fpcr(fpcr_controlled).rmode() == RoundingMode::TowardsMinusInfinity {
+            let mask = get_vector_of(ra, 32, 0x7FFF_FFFF);
+            ra.asm.pand(xmm, mask).unwrap();
+        }
+    });
+
+    ra.define_value(inst_ref, xmm);
 }
+
 pub fn emit_fp_vector_from_unsigned_fixed64(
-    _ctx: &EmitContext,
+    ctx: &EmitContext,
     ra: &mut RegAlloc,
     inst_ref: InstRef,
     inst: &Inst,
 ) {
-    emit_one_arg_fallback_with_imm(
-        ra,
-        inst_ref,
-        inst,
-        fallback_fp_from_unsigned_fixed64 as *const () as usize,
+    let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+    let xmm = ra.use_scratch_xmm(&mut args[0]);
+    let fbits = args[1].get_immediate_u8() as u64;
+    let rounding_mode = args[2].get_immediate_u8();
+    let fpcr_controlled = args[3].get_immediate_u1();
+    assert_eq!(
+        rounding_mode,
+        ctx.fpcr(fpcr_controlled).rmode() as u8,
+        "FPVectorFromUnsignedFixed64 rounding mode must match FPCR"
     );
+
+    maybe_standard_fpscr_value(ctx, ra, fpcr_controlled, |ra| {
+        if ctx.has_host_feature(HostFeature::AVX512_ORTHO_FLOAT) {
+            ra.asm.vcvtuqq2pd(xmm, xmm).unwrap();
+        } else {
+            let unpack = xmmword_ptr(
+                ra.constant_pool
+                    .as_mut()
+                    .expect("constant pool required")
+                    .get_constant(0x4530_0000_4330_0000, 0),
+            );
+            let subtrahend = xmmword_ptr(
+                ra.constant_pool
+                    .as_mut()
+                    .expect("constant pool required")
+                    .get_constant(0x4330_0000_0000_0000, 0x4530_0000_0000_0000),
+            );
+
+            let unpack_reg = ra.scratch_xmm();
+            let subtrahend_reg = ra.scratch_xmm();
+            let tmp1 = ra.scratch_xmm();
+
+            if ctx.has_host_feature(HostFeature::AVX) {
+                ra.asm.vmovapd(unpack_reg, unpack).unwrap();
+                ra.asm.vmovapd(subtrahend_reg, subtrahend).unwrap();
+
+                ra.asm.vunpcklps(tmp1, xmm, unpack_reg).unwrap();
+                ra.asm.vsubpd(tmp1, tmp1, subtrahend_reg).unwrap();
+
+                ra.asm.vpermilps_imm(xmm, xmm, 0b0100_1110).unwrap();
+
+                ra.asm.vunpcklps(xmm, xmm, unpack_reg).unwrap();
+                ra.asm.vsubpd(xmm, xmm, subtrahend_reg).unwrap();
+
+                ra.asm.vhaddpd(xmm, tmp1, xmm).unwrap();
+            } else {
+                let tmp2 = ra.scratch_xmm();
+
+                ra.asm.movapd(unpack_reg, unpack).unwrap();
+                ra.asm.movapd(subtrahend_reg, subtrahend).unwrap();
+
+                ra.asm.pshufd(tmp1, xmm, 0b0100_1110).unwrap();
+
+                ra.asm.punpckldq(xmm, unpack_reg).unwrap();
+                ra.asm.subpd(xmm, subtrahend_reg).unwrap();
+                ra.asm.pshufd(tmp2, xmm, 0b0100_1110).unwrap();
+                ra.asm.addpd(xmm, tmp2).unwrap();
+
+                ra.asm.punpckldq(tmp1, unpack_reg).unwrap();
+                ra.asm.subpd(tmp1, subtrahend_reg).unwrap();
+
+                ra.asm.pshufd(unpack_reg, tmp1, 0b0100_1110).unwrap();
+                ra.asm.addpd(unpack_reg, tmp1).unwrap();
+
+                ra.asm.unpcklpd(xmm, unpack_reg).unwrap();
+            }
+        }
+
+        if fbits != 0 {
+            let scale = get_vector_of(ra, 64, (1023 - fbits) << 52);
+            ra.asm.mulpd(xmm, scale).unwrap();
+        }
+
+        if ctx.fpcr(fpcr_controlled).rmode() == RoundingMode::TowardsMinusInfinity {
+            let mask = get_vector_of(ra, 64, 0x7FFF_FFFF_FFFF_FFFF);
+            ra.asm.pand(xmm, mask).unwrap();
+        }
+    });
+
+    ra.define_value(inst_ref, xmm);
 }
 
 // ---------------------------------------------------------------------------

@@ -102,7 +102,9 @@ impl Harness {
     /// The JIT is built with `features` as the detected host features
     /// and with the optimisation flags ruzu uses for CPU accuracy "Auto"
     /// (Eden `arm_dynarmic_64.cpp`): safe optimisations + Unsafe_UnfuseFMA
-    /// + Unsafe_IgnoreGlobalMonitor.
+    /// + Unsafe_IgnoreGlobalMonitor, and with the x86-64 code generation
+    /// options ruzu's `ArmDynarmic64` enables for A64 unless
+    /// `RDYNARMIC_FP_DIFF_CODEGEN_OPTIONS=0` (see `codegen_options()`).
     pub(super) fn new(code: &[u32], features: HostFeature) -> Self {
         let mut config = A64UserConfig::new(Box::new(Env {
             code: code.to_vec(),
@@ -114,6 +116,9 @@ impl Harness {
         config.optimizations = OptimizationFlag::ALL_SAFE_OPTIMIZATIONS
             | OptimizationFlag::UNSAFE_UNFUSE_FMA
             | OptimizationFlag::UNSAFE_IGNORE_GLOBAL_MONITOR;
+        if codegen_options() {
+            crate::tests_a64_codegen_options::tests::enable_codegen_options(&mut config);
+        }
         test_host_feature_mask::set(features);
         let jit = A64Jit::new(config).unwrap();
         test_host_feature_mask::set(HostFeature::all());
@@ -315,6 +320,15 @@ pub(super) fn all_fpcrs() -> Vec<u32> {
         }
     }
     out
+}
+
+/// Whether the JIT runs with the x86-64 code generation options (Lichii
+/// aab5393019, see DIFF.md) that ruzu's `ArmDynarmic64` turns on for A64:
+/// on unless `RDYNARMIC_FP_DIFF_CODEGEN_OPTIONS=0`, so that the inline
+/// floating-point emitters (and their out-of-line NaN paths, which call host
+/// functions) are checked both with and without them.
+pub(super) fn codegen_options() -> bool {
+    std::env::var("RDYNARMIC_FP_DIFF_CODEGEN_OPTIONS").map_or(true, |v| v != "0")
 }
 
 pub(super) fn iterations() -> usize {

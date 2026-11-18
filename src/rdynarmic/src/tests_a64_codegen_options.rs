@@ -5,7 +5,7 @@
 //! Eden allowed by the user on 2026-11-17 (see DIFF.md).
 
 #[cfg(all(test, target_arch = "x86_64"))]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};

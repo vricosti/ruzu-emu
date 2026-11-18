@@ -396,6 +396,9 @@ impl A64EmitX64 {
             opt::constant_propagation(&mut block);
             opt::dead_code_elimination(&mut block);
         }
+        // Eden `Optimization::Optimize` (A64, opt_passes.cpp): IdentityRemovalPass
+        // runs unconditionally after the optional passes.
+        opt::identity_removal(&mut block);
         if self.optimizations.contains(OptimizationFlag::MISC_IR_OPT) {}
         block.rebuild_pseudo_op_links();
 

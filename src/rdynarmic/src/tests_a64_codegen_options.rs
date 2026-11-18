@@ -238,21 +238,19 @@ pub(crate) mod tests {
         if !translate_single_instruction(&mut block, location, instruction) && !is_last {
             return false;
         }
-        // rdynarmic, not the options: some translations access W31/X31 as a general register,
-        // which the get/set elimination pass indexes out of bounds (reported).
+        // Upstream `A64::IREmitter` never emits a general-register access of register 31
+        // (ZR reads as zero, writes are dropped; SP has its own opcodes).
         let bad_register = block.instructions.iter().find(|inst| {
             matches!(
                 inst.opcode,
                 Opcode::A64GetW | Opcode::A64GetX | Opcode::A64SetW | Opcode::A64SetX
             ) && inst.args[0].get_a64_reg() as usize >= 31
         });
-        if let Some(inst) = bad_register {
-            eprintln!(
-                "[codegen options test] skipped 0x{instruction:08x}: {:?} of register 31",
-                inst.opcode
-            );
-            return false;
-        }
+        assert!(
+            bad_register.is_none(),
+            "0x{instruction:08x}: {:?} of register 31",
+            bad_register.map(|inst| inst.opcode)
+        );
         !block.instructions.iter().any(|inst| {
             matches!(
                 inst.opcode,

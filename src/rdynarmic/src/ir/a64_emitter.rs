@@ -97,11 +97,19 @@ impl<'a> A64IREmitter<'a> {
 
     // --- A64 register getters ---
 
+    /// Upstream `A64::IREmitter::GetW` (a64_ir_emitter.h): ZR reads as zero.
     pub fn get_w(&mut self, reg: Reg) -> Value {
+        if reg == Reg::ZR {
+            return self.base.imm32(0);
+        }
         self.emit(Opcode::A64GetW, &[Value::ImmA64Reg(reg)])
     }
 
+    /// Upstream `A64::IREmitter::GetX` (a64_ir_emitter.h): ZR reads as zero.
     pub fn get_x(&mut self, reg: Reg) -> Value {
+        if reg == Reg::ZR {
+            return self.base.imm64(0);
+        }
         self.emit(Opcode::A64GetX, &[Value::ImmA64Reg(reg)])
     }
 
@@ -131,11 +139,19 @@ impl<'a> A64IREmitter<'a> {
 
     // --- A64 register setters ---
 
+    /// Upstream `A64::IREmitter::SetW` (a64_ir_emitter.h): writes to ZR are discarded.
     pub fn set_w(&mut self, reg: Reg, value: Value) {
+        if reg == Reg::ZR {
+            return;
+        }
         self.emit_void(Opcode::A64SetW, &[Value::ImmA64Reg(reg), value]);
     }
 
+    /// Upstream `A64::IREmitter::SetX` (a64_ir_emitter.h): writes to ZR are discarded.
     pub fn set_x(&mut self, reg: Reg, value: Value) {
+        if reg == Reg::ZR {
+            return;
+        }
         self.emit_void(Opcode::A64SetX, &[Value::ImmA64Reg(reg), value]);
     }
 

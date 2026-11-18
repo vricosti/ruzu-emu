@@ -263,6 +263,8 @@ pub struct A64CodegenOptions {
     pub elide_redundant_zext: bool,
     /// `A64::UserConfig::omit_block_frame`.
     pub omit_block_frame: bool,
+    /// `A64::UserConfig::halt_check_on_back_edges` (effective only without cycle counting).
+    pub halt_check_on_back_edges: bool,
     /// `A64::UserConfig::rsb_ptr_mask()` (from `rsb_size`).
     pub rsb_ptr_mask: usize,
     /// `A64::UserConfig::fast_dispatch_table_bits` / `fast_dispatch_set_associative`.
@@ -281,6 +283,7 @@ impl Default for A64CodegenOptions {
             fold_address_offsets: false,
             elide_redundant_zext: false,
             omit_block_frame: false,
+            halt_check_on_back_edges: false,
             rsb_ptr_mask: 7,
             fast_dispatch_table_bits: 0,
             fast_dispatch_set_associative: false,
@@ -297,6 +300,7 @@ impl A64CodegenOptions {
             fold_address_offsets: config.fold_address_offsets,
             elide_redundant_zext: config.elide_redundant_zext,
             omit_block_frame: config.omit_block_frame,
+            halt_check_on_back_edges: config.halt_check_on_back_edges,
             rsb_ptr_mask: config.rsb_ptr_mask(),
             fast_dispatch_table_bits: config.fast_dispatch_table_bits,
             fast_dispatch_set_associative: config.fast_dispatch_set_associative,
@@ -533,6 +537,20 @@ impl<'a> EmitContext<'a> {
             .iter()
             .find(|(add, _)| *add == inst)
             .map(|(_, disp)| *disp)
+    }
+
+    /// Lichii `conf.halt_check_on_back_edges && !conf.enable_cycle_counting` (A64 only).
+    pub fn halt_check_on_back_edges(&self) -> bool {
+        self.a64_codegen.halt_check_on_back_edges && !self.config.enable_cycle_counting
+    }
+
+    /// Lichii `IsForwardLink` (aab5393019): a link to a higher guest PC cannot close a loop on
+    /// its own: every cycle of blocks contains a link to the same or a lower start PC, or an
+    /// indirect branch, and those check for a halt.
+    pub fn is_forward_link(&self, next: LocationDescriptor) -> bool {
+        self.halt_check_on_back_edges()
+            && A64LocationDescriptor::from_location(next).pc()
+                > A64LocationDescriptor::from_location(self.location).pc()
     }
 
     /// Whether the host flags still hold the guest NZCV at the current offset.

@@ -43,6 +43,16 @@ pub fn emit_terminal(ctx: &EmitContext, ra: &mut RegAlloc, terminal: &Terminal) 
             emit_terminal_link_block_fast(ctx, ra, *next);
         }
 
+        Terminal::PopRSBHint if ctx.halt_check_on_back_edges() => {
+            // Lichii (aab5393019, halt_check_on_back_edges): the RSB / fast dispatch handlers
+            // and the dispatcher check for a halt instead.
+            emit_terminal_pop_rsb_hint(ctx, ra);
+        }
+
+        Terminal::FastDispatchHint if ctx.halt_check_on_back_edges() => {
+            emit_terminal_fast_dispatch_hint(ctx, ra);
+        }
+
         Terminal::PopRSBHint => {
             // Check halt_reason before entering the RSB hot path.
             // Upstream wraps these terminals in CheckHalt at the IR level;
@@ -291,6 +301,11 @@ fn emit_terminal_link_block(
         // Upstream A64 `EmitTerminalImpl(LinkBlock)`: with block linking the PC is stored
         // only by the unlinked patch slot and by the fall-through to ForceReturnFromRunCode,
         // never on the linked path.
+        if use_linking && ctx.is_forward_link(next) {
+            // Lichii `EmitUncheckedLink` (aab5393019, halt_check_on_back_edges).
+            emit_unchecked_link(ctx, ra, next, offsets);
+            return;
+        }
         if !use_linking {
             emit_set_pc(ctx, ra, next);
         }
@@ -394,6 +409,30 @@ fn emit_terminal_link_block(
     }
 }
 
+/// Lichii `EmitUncheckedLink` (aab5393019): a patchable `jmp` to the next block, no halt check.
+fn emit_unchecked_link(
+    ctx: &EmitContext,
+    ra: &mut RegAlloc,
+    next: crate::ir::location::LocationDescriptor,
+    offsets: [usize; 4],
+) {
+    let patch_offset = ra.asm.size();
+    ctx.patch_entries.borrow_mut().push(PatchEntry {
+        target: next,
+        patch_type: PatchType::Jmp,
+        code_offset: patch_offset,
+    });
+    let target_ptr = ctx.block_lookup.as_ref().and_then(|lookup| lookup(next));
+    emit_patch_jmp(
+        ra.asm,
+        ctx.arch.extract_pc(next),
+        ctx.arch.pc_offset(),
+        target_ptr,
+        offsets,
+        ctx.code_base_ptr,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // LinkBlockFast: unconditional jump to next block
 // ---------------------------------------------------------------------------
@@ -451,7 +490,11 @@ fn emit_terminal_link_block_fast(
         // see an external halt (test `external_halt_stops_a_running_direct_link_loop`); the
         // not-taken `jnz` keeps the linked path straight, and the PC is stored only when halted.
         let halted = ra.asm.create_label();
-        let check_halt = use_linking && !ctx.config.enable_cycle_counting;
+        // Lichii (aab5393019, halt_check_on_back_edges): only links to the same or a lower PC
+        // check for a halt (Eden: none; ruzu without the option: every one).
+        let check_halt = use_linking
+            && !ctx.config.enable_cycle_counting
+            && !ctx.is_forward_link(next);
         if check_halt {
             let halt_offset = ctx.jit_state_info.offsetof_halt_reason;
             ra.asm

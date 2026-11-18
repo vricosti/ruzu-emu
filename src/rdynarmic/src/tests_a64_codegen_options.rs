@@ -33,6 +33,7 @@ mod tests {
         config.fast_dispatch_table_bits = 16;
         config.fast_dispatch_set_associative = true;
         config.rsb_size = 32;
+        config.halt_check_on_back_edges = true;
         config.reuse_host_flags = true;
     }
 

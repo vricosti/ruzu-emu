@@ -234,6 +234,13 @@ pub struct UserConfig {
     /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
     /// `interface/A64/config.h` (commit aab5393019, "omit_block_frame").
     pub omit_block_frame: bool,
+    /// x64 only, without cycle counting. Links to a higher guest PC skip the halt check; links
+    /// to the same or a lower PC and indirect branches (RSB/fast dispatch) check it instead, so
+    /// every loop still sees a halt request.
+    ///
+    /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+    /// `interface/A64/config.h` (commit aab5393019, "halt_check_on_back_edges").
+    pub halt_check_on_back_edges: bool,
     /// x64 only. Return stack buffer entries used (power of two, 8 to 32).
     ///
     /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
@@ -301,6 +308,7 @@ impl UserConfig {
             fold_address_offsets: false,
             elide_redundant_zext: false,
             omit_block_frame: false,
+            halt_check_on_back_edges: false,
             rsb_size: 8,
             fast_dispatch_table_bits: 0,
             fast_dispatch_set_associative: false,

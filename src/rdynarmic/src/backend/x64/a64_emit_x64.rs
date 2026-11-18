@@ -10,7 +10,8 @@ use crate::backend::x64::a64_emit_x64_memory::{
 use crate::backend::x64::a64_jitstate::A64JitState;
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{
-    BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn, STACK_LAYOUT_RSP_OFFSET,
+    BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn, FORCE_RETURN,
+    STACK_LAYOUT_RSP_OFFSET,
 };
 use crate::backend::x64::emit::emit_block;
 use crate::backend::x64::emit_context::{
@@ -712,12 +713,35 @@ impl A64EmitX64 {
         let has_sse42 = self.code.has_host_feature(HostFeature::SSE42);
         // Lichii (aab5393019, rsb_size): `code.GetJitStateInfo().rsb_ptr_mask`.
         let rsb_ptr_mask = self.code.jit_state_info().rsb_ptr_mask;
+        // Lichii `GenTerminalHandlers` (aab5393019, halt_check_on_back_edges): forward links
+        // skip the halt check, so indirect branches (the PC is already stored) take it.
+        let check_halt = self.codegen.halt_check_on_back_edges
+            && !self.emit_config.enable_cycle_counting;
+        let emit_check_halt = |asm: &mut rxbyak::CodeAssembler| -> Result<(), String> {
+            if !check_halt {
+                return Ok(());
+            }
+            asm.cmp(
+                dword_ptr(RegExp::from(R15) + A64JitState::offset_of_halt_reason() as i32),
+                0i32,
+            )
+            .map_err(|e| format!("halt check: {:?}", e))?;
+            // jne return_from_run_code[FORCE_RETURN]
+            let target = code_base as i64 + rfrc[FORCE_RETURN] as i64;
+            let end = code_base as i64 + asm.size() as i64 + 6;
+            asm.db(0x0F).map_err(|e| format!("halt check: {:?}", e))?;
+            asm.db(0x85).map_err(|e| format!("halt check: {:?}", e))?;
+            asm.dd((target - end) as i32 as u32)
+                .map_err(|e| format!("halt check: {:?}", e))?;
+            Ok(())
+        };
         let asm = &mut self.code.asm;
 
         // ---- PopRSBHint handler ----
         // Computes location descriptor from jit_state, looks up RSB.
         // On hit: jump directly to cached code. On miss: fall through to dispatcher.
         let pop_rsb_offset = asm.size();
+        emit_check_halt(asm)?;
 
         // Build location descriptor from PC + FPCR:
         // RBX = (fpcr & FPCR_MASK) << FPCR_SHIFT | (pc & PC_MASK)
@@ -825,6 +849,7 @@ impl A64EmitX64 {
         self.fast_dispatch_set_size = set_size;
 
         let fast_dispatch_offset = asm.size();
+        emit_check_halt(asm)?;
 
         // Build location descriptor from PC + FPCR → RBX (same as RSB)
         asm.mov(RBX, qword_ptr(RegExp::from(R15) + pc_offset as i32))

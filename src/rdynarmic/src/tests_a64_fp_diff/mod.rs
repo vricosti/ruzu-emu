@@ -18,6 +18,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
+mod fp_double_to_single_to_odd;
 mod fp_from_fixed;
 mod fp_min_max;
 mod fp_vector_compare;

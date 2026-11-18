@@ -907,6 +907,10 @@ pub fn emit_fp_double_to_single(
 // Args: (value, rounding_mode: U8, exact: U1)
 // ---------------------------------------------------------------------------
 
+/// Upstream `static_cast<FP::RoundingMode>(args[1].GetImmediateU8())`
+/// (emit_x64_floating_point.cpp): every `FP::RoundingMode` value, ToOdd included
+/// (FCVTXN emits `FPDoubleToSingle(value, RoundingMode::ToOdd)`,
+/// simd_scalar_two_register_misc.cpp:167, simd_two_register_misc.cpp:440).
 fn scalar_rounding_mode(rounding: u8) -> RoundingMode {
     match rounding {
         0 => RoundingMode::ToNearestTieEven,
@@ -914,6 +918,7 @@ fn scalar_rounding_mode(rounding: u8) -> RoundingMode {
         2 => RoundingMode::TowardsMinusInfinity,
         3 => RoundingMode::TowardsZero,
         4 => RoundingMode::ToNearestTieAwayFromZero,
+        5 => RoundingMode::ToOdd,
         _ => unreachable!("invalid FP rounding mode {rounding}"),
     }
 }

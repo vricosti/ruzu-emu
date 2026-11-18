@@ -204,11 +204,6 @@ pub(crate) mod tests {
             "FCMLA_elt",
             "SM4E",
             "SM4EKEY",
-            // rdynarmic, not the options: `emit_floating_point.rs::scalar_rounding_mode` panics
-            // on RoundingMode::ToOdd (5), which FCVTXN passes to FPDoubleToSingle (reported;
-            // that file belongs to the FP emission work).
-            "FCVTXN_1",
-            "FCVTXN_2",
         ];
         let mut result = Vec::new();
         for line in include_str!("frontend/a64/a64.inc").lines() {

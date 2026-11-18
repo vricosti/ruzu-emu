@@ -9,7 +9,7 @@ use rxbyak::{dword_ptr, qword_ptr, xmmword_ptr, JmpType, RegExp, R15, RSP, XMM0}
 use crate::backend::x64::abi;
 use crate::backend::x64::constants::{cmp, convert_rounding_mode_to_x64_immediate};
 use crate::backend::x64::emit_context::{DeferredEmitCtx, EmitContext};
-use crate::backend::x64::emit_fp_vector::force_to_default_nan_vector;
+use crate::backend::x64::emit_fp_vector::force_to_default_nan;
 use crate::backend::x64::emit_vector_helpers::*;
 use crate::backend::x64::fp_helpers;
 use crate::backend::x64::host_feature::HostFeature;
@@ -299,7 +299,7 @@ fn emit_fp_vector_muladd(
             ra.asm.vfmadd231pd(result, operand2, operand3).unwrap();
         }
         if fpcr.dn() {
-            force_to_default_nan_vector(ra, result, fsize);
+            force_to_default_nan(ctx, ra, fsize, fpcr, result);
         }
         ra.define_value(inst_ref, result);
         return;
@@ -384,7 +384,7 @@ fn emit_fp_vector_muladd(
         ra.asm.jnz(&fallback, JmpType::Near).unwrap();
         ra.asm.bind(&end).unwrap();
         if fpcr.dn() {
-            force_to_default_nan_vector(ra, result, fsize);
+            force_to_default_nan(ctx, ra, fsize, fpcr, result);
         }
 
         let fpcr_value = fpcr.value();
@@ -1971,7 +1971,7 @@ pub fn emit_fp_vector_from_half32(
         let value = ra.use_xmm(&mut args[0]);
         ra.asm.vcvtph2ps(result, value).unwrap();
         if ctx.fpcr(fpcr_controlled).dn() {
-            force_to_default_nan_vector(ra, result, 32);
+            force_to_default_nan(ctx, ra, 32, ctx.fpcr(fpcr_controlled), result);
         }
         ra.define_value(inst_ref, result);
         return;
@@ -2001,7 +2001,7 @@ pub fn emit_fp_vector_to_half32(
         let mut args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
         let result = ra.use_scratch_xmm(&mut args[0]);
         if ctx.fpcr(fpcr_controlled).dn() {
-            force_to_default_nan_vector(ra, result, 32);
+            force_to_default_nan(ctx, ra, 32, ctx.fpcr(fpcr_controlled), result);
         }
         let round_imm = convert_rounding_mode_to_x64_immediate(rounding_mode(rounding))
             .expect("hardware FP conversion rounding mode") as u8;

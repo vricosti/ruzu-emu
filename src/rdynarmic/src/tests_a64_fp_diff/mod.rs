@@ -20,6 +20,7 @@
 
 mod fp_min_max;
 mod fp_vector_compare;
+mod fp_vector_three_op;
 
 use crate::backend::x64::block_of_code::test_host_feature_mask;
 use crate::backend::x64::host_feature::HostFeature;

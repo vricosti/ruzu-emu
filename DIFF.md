@@ -1,5 +1,64 @@
 # Upstream parity notes
 
+## 2026-11-17 — src/rdynarmic/src/backend/x64/{a64_emit_x64,a64_emit_x64_memory,a64_interface,a64_jitstate,block_of_code,emit,emit_a64,emit_context,emit_data_processing,emit_terminal,exclusive_monitor_friend,jitstate_info,reg_alloc}.rs, src/rdynarmic/src/interface/{a64/config,exclusive_monitor}.rs and src/core/src/arm/dynarmic/arm_dynarmic_64.rs vs Eden dynarmic backend/x64 and Lichii dynarmic (aab5393019 "x86-64 code generation from #831", 591aec40f6, fd9c0133df) and core/arm/dynarmic/arm_dynarmic_64.cpp:479-517
+
+### Intentional differences (divergence from Eden allowed by the user on 2026-11-17)
+The x86-64 code generation options Lichii added to its Dynarmic are ported, each behind an
+`A64::UserConfig` field of the same name, off by default (Eden behaviour) and enabled by
+`ArmDynarmic64` like Lichii: every CPU accuracy but Paranoid, x86-64 and A64 only;
+`reuse_host_flags`, `halt_check_on_back_edges` and `host_call_return` only without cycle
+counting (multicore). Lichii dropped the PR's kill switches; ruzu keeps one per option,
+`RUZU_JIT_<OPTION>=0`, read when the JIT is created (`RUZU_JIT_FAST_DISPATCH_SET_ASSOCIATIVE`
+covers `fast_dispatch_table_bits` + `fast_dispatch_set_associative`, `RUZU_JIT_RSB_SIZE` covers
+`rsb_size`).
+- `omit_block_frame`: no per-block `%rbp` frame (3 instructions per executed block). Nothing in
+  the JIT reads `%rbp`; the Linux fastmem handler only rewrites RIP/RSP and the Windows unwind
+  info has no frame register.
+- `spill_to_free_gpr`: `RegAlloc::spill_register` parks an evicted GPR value in a free
+  callee-saved GPR (RBX/R12 on System V, also RSI/RDI on Windows; never RBP, R13-R15) before a
+  stack slot.
+- `scratch_copy_to_free_reg`: `RegAlloc::use_scratch_impl` copies a still-needed operand to a free
+  register instead of evicting the original.
+- `elide_redundant_zext` (with Lichii's fix): SetW and ZeroExtendWordToLong skip `mov r32, r32`
+  for values of GetW / ReadMemory32 / LeastSignificantWord / Add32 / Sub32 / ConditionalSelect32
+  (each rdynarmic emitter checked to end in a 32-bit write); ZeroExtendWordToLong only when the
+  value is in a GPR.
+- `fold_address_offsets`: an Add64(base, imm) whose only use is one 8-64-bit fastmem access with
+  unchecked 64-bit fastmem is not emitted; the access adds the displacement in its addressing
+  mode; its fault path adds the displacement around the fallback (stub + resume), callback and
+  page-table paths compute the full address.
+- `reuse_host_flags`: the host flags of an Add/Sub followed directly by A64SetNZCV feed the next
+  If terminal / ConditionalSelect (cmc for HI/LS), through SetW/SetX and the `%rbp` restore; the
+  last A64SetCheckBit of a CheckBit block leaves the bit in ZF. Prerequisite parity fix: the
+  `and eax, 0xC101` ruzu emitted after `lahf; seto al` (Eden has none; every reader of the stored
+  NZCV masks it) is removed, it destroyed the flags.
+- `halt_check_on_back_edges`: links to a higher guest PC jump without a halt check; links to the
+  same or a lower PC, and the RSB / fast-dispatch handlers, check it. With the option, ruzu's
+  in-block halt check before PopRSBHint / FastDispatchHint (a ruzu safety net, not Eden) moves
+  into the handlers; without it ruzu keeps its checks (including its LinkBlockFast check).
+- `rsb_size`: `A64JitState::RSB_SIZE` is 32 (Eden 8; `A64JitState` grows, layout test updated) and
+  the configured size picks the mask (default 8 entries).
+- `fast_dispatch_table_bits` / `fast_dispatch_set_associative`: table sized at run time (default
+  2^20 as Eden), optionally 4-way set associative with insertion at way 0; invalidation clears
+  every matching way.
+- `host_call_return`: BL/BLR end in a host `call` pushing {landing address, guest return
+  descriptor}; RET compares (PC masked | block FPCR bits) with the frame and does a host `ret`,
+  else the fast dispatcher. Spill slots and the check bit move into `A64JitState`; rsp is reset to
+  the frame-free base at every dispatcher entry, before a fast-dispatch lookup and beyond 512
+  frames; the halt reason is checked at every RET.
+- `compact_block_exits`: unlinked A64 exits jump to one shared stub per target (PC store +
+  dispatcher return), patch sites are 5/6-byte rel32 jumps.
+- Lichii 591aec40f6: A64 PushRSB is left out when the ReturnStackBuffer optimization is off.
+- Lichii fd9c0133df: each processor's exclusive reservation (address + value) on its own 64-byte
+  cache line.
+Measured on the NX2 title used for measurement (forest scene): 37.86 -> 40.62 fps (+7.3 %),
+JIT host instructions per frame 175.5 M -> 133.1 M, JIT cycles per frame 241 M -> 191 M (Lichii
+188 M). The rdynarmic tests run every program with the options off and on (random A64 blocks,
+fastmem faults, flag sequences, running-loop halts, host call/return programs) and require the
+same final state.
+Not ported: `far_code` (cold code region), Lichii's LDAR-as-mov (no gain measured in jit1),
+compile-time-only Lichii commits.
+
 ## 2026-11-17 — S2R invocation / workgroup ids: shader_recompiler/frontend/translate/move_special_register.rs vs Eden shader_recompiler/frontend/maxwell/translate/impl/move_special_register.cpp and frontend/ir/ir_emitter.cpp
 
 ### Fixed divergence

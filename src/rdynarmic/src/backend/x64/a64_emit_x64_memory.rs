@@ -801,6 +801,68 @@ fn emit_zero_extend(asm: &mut CodeAssembler, bitsize: usize, reg: Reg) {
 // from `emit_exclusive_memory.rs`.
 // ---------------------------------------------------------------------------
 
+/// The displacement of the Add64 folded into this access's address (Lichii
+/// `BlockOfCode::FoldedAddressDisp`, aab5393019, fold_address_offsets), if any.
+fn folded_address_disp(ctx: &EmitContext, vaddr: &crate::ir::value::Value) -> Option<i32> {
+    match vaddr {
+        crate::ir::value::Value::Inst(add) => ctx.folded_address_disp(*add),
+        _ => None,
+    }
+}
+
+/// `lea reg, [reg + disp]` (flag-neutral).
+fn emit_add_folded_disp(asm: &mut CodeAssembler, reg: Reg, disp: i32) {
+    asm.lea(reg, rxbyak::ptr(RegExp::from(reg) + disp)).unwrap();
+}
+
+/// `lea dst, [base + disp]`.
+fn emit_lea_folded_disp(asm: &mut CodeAssembler, dst: Reg, base: Reg, disp: i32) {
+    asm.lea(dst, rxbyak::ptr(RegExp::from(base) + disp)).unwrap();
+}
+
+/// Fastmem fault path of an access with a folded displacement (Lichii `EmitMemoryRead` /
+/// `EmitMemoryWrite`, aab5393019): the abort path adds disp to vaddr around the fallback
+/// call; a fault enters `stub`, which adds disp to vaddr and tail-calls the fallback; the
+/// fallback returns to `resume`, which takes disp off again, so the base register keeps its
+/// value for its other uses.
+#[allow(clippy::too_many_arguments)]
+fn emit_folded_fault_path(
+    dctx: &mut DeferredEmitCtx<'_>,
+    abort: Label,
+    end: &Label,
+    vaddr: Reg,
+    disp: i32,
+    wrapped_fn_off: usize,
+    mov_off: usize,
+    marker: DoNotFastmemMarker,
+    recompile: bool,
+    abort_info: A64MemoryAbortInfo,
+) {
+    let asm = &mut *dctx.asm;
+    asm.bind(&abort).unwrap();
+    emit_add_folded_disp(asm, vaddr, disp);
+    emit_call_to_offset(asm, wrapped_fn_off);
+    let resume_off = asm.size();
+    emit_add_folded_disp(asm, vaddr, disp.wrapping_neg());
+    emit_memory_abort_check(asm, abort_info, Some(end));
+    asm.jmp(end, JmpType::Near).unwrap();
+    let stub_off = asm.size();
+    emit_add_folded_disp(asm, vaddr, disp);
+    // jmp rel32 to the fallback stub.
+    let rel32 = wrapped_fn_off as i64 - (asm.size() as i64 + 5);
+    asm.db(0xE9).unwrap();
+    asm.dd(rel32 as i32 as u32).unwrap();
+    dctx.fastmem_patches.add(
+        dctx.code_base + mov_off as u64,
+        FastmemPatchInfo::new(
+            dctx.code_base + resume_off as u64,
+            dctx.code_base + stub_off as u64,
+            Some(marker),
+            recompile,
+        ),
+    );
+}
+
 /// Matches upstream `A64EmitX64::ShouldFastmem`.
 pub(crate) fn should_fastmem(ctx: &EmitContext, inst_ref: InstRef) -> Option<DoNotFastmemMarker> {
     if !ctx.fastmem_available {
@@ -845,6 +907,8 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
     let fastmem_marker = (!force_callback_for_r64)
         .then(|| should_fastmem(ctx, inst_ref))
         .flatten();
+    // The address is base + disp with the Add folded in here (A64 fold_address_offsets).
+    let mut disp = folded_address_disp(ctx, &inst.args[1]);
 
     // Path 1: pure callback when neither fastmem nor page table apply.
     if !mem_conf.page_table_present && fastmem_marker.is_none() {
@@ -860,6 +924,9 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
             return;
         }
         ra.host_call(Some(inst_ref), &mut [None, Some(&mut args[1]), None, None]);
+        if let Some(disp) = disp {
+            emit_add_folded_disp(ra.asm, abi::ABI_PARAMS[1].to_reg64(), disp);
+        }
         if ordered {
             ra.asm.mfence().unwrap();
         }
@@ -885,12 +952,19 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
     }
 
     // Allocate vaddr (use) + value (scratch).
-    let vaddr = ra.use_gpr(&mut args[1]);
+    let mut vaddr = ra.use_gpr(&mut args[1]);
     let value = if BITSIZE == 128 {
         ra.scratch_xmm()
     } else {
         ra.scratch_gpr()
     };
+    if let (Some(d), None) = (disp, fastmem_marker) {
+        // Lichii (aab5393019, fold_address_offsets): the page-table path takes the full address.
+        let real_vaddr = ra.scratch_gpr();
+        emit_lea_folded_disp(ra.asm, real_vaddr, vaddr, d);
+        vaddr = real_vaddr;
+        disp = None;
+    }
     let vaddr_idx = vaddr.index();
     let value_idx = value.index();
 
@@ -971,7 +1045,10 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
     if let Some(marker) = fastmem_marker {
         // Path 2: fastmem.
         let mut require_abort = false;
-        let src_ptr = emit_fastmem_vaddr_a64(ra, ctx, abort, vaddr, &mut require_abort, None);
+        let mut src_ptr = emit_fastmem_vaddr_a64(ra, ctx, abort, vaddr, &mut require_abort, None);
+        if let Some(d) = disp {
+            src_ptr = src_ptr + d;
+        }
         let mov_off =
             emit_read_memory_mov::<BITSIZE>(ra.asm, value_idx, src_ptr, ordered, ctx.host_features);
 
@@ -1036,6 +1113,13 @@ pub fn emit_a64_memory_read<const BITSIZE: usize>(
         ctx.deferred_emits
             .borrow_mut()
             .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
+                if let Some(d) = disp {
+                    emit_folded_fault_path(
+                        dctx, abort, &end, vaddr, d, wrapped_fn_off, mov_off, marker, recompile,
+                        abort_info,
+                    );
+                    return;
+                }
                 let asm = &mut *dctx.asm;
                 asm.bind(&abort).unwrap();
                 emit_call_to_offset(asm, wrapped_fn_off);
@@ -1107,6 +1191,8 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
     let fastmem_marker = (!force_callback)
         .then(|| should_fastmem(ctx, inst_ref))
         .flatten();
+    // The address is base + disp with the Add folded in here (A64 fold_address_offsets).
+    let mut disp = folded_address_disp(ctx, &inst.args[1]);
     let value_resolves_to_xmm =
         matches!(BITSIZE, 32 | 64) && ir_value_resolves_to_xmm(ctx, ra, &args[2].value);
     let value_is_vector_backed =
@@ -1133,6 +1219,9 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
             ra.use_loc(&mut rest[0], HostLoc::Xmm(1));
             ra.end_of_alloc_scope();
             ra.host_call(None, &mut [None, None, None, None]);
+            if let Some(disp) = disp {
+                emit_add_folded_disp(ra.asm, abi::ABI_PARAMS[1].to_reg64(), disp);
+            }
             if BITSIZE == 64 {
                 ra.asm.movq(RDX, Reg::xmm(1)).unwrap();
             } else {
@@ -1155,6 +1244,9 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
             None,
             &mut [None, Some(&mut first[1]), Some(&mut rest[0]), None],
         );
+        if let Some(disp) = disp {
+            emit_add_folded_disp(ra.asm, abi::ABI_PARAMS[1].to_reg64(), disp);
+        }
         let cb = match BITSIZE {
             8 => &ctx.config.callbacks.memory_write_8,
             16 => &ctx.config.callbacks.memory_write_16,
@@ -1178,7 +1270,7 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
     }
 
     // Allocate vaddr (use) + value (use).
-    let vaddr = ra.use_gpr(&mut args[1]);
+    let mut vaddr = ra.use_gpr(&mut args[1]);
     let value = if BITSIZE == 128 {
         ra.use_xmm(&mut args[2])
     } else if matches!(BITSIZE, 32 | 64) && (value_resolves_to_xmm || value_is_vector_backed) {
@@ -1202,6 +1294,16 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
     } else {
         ra.use_gpr(&mut args[2])
     };
+    // Lichii (aab5393019, fold_address_offsets): the fault path below adjusts vaddr in place,
+    // which needs it apart from the value; the page-table path takes the full address.
+    if let Some(d) = disp {
+        if fastmem_marker.is_none() || (BITSIZE != 128 && value.index() == vaddr.index()) {
+            let real_vaddr = ra.scratch_gpr();
+            emit_lea_folded_disp(ra.asm, real_vaddr, vaddr, d);
+            vaddr = real_vaddr;
+            disp = None;
+        }
+    }
     let vaddr_idx = vaddr.index();
     let value_idx = value.index();
 
@@ -1220,7 +1322,10 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
     if let Some(marker) = fastmem_marker {
         // Path 2: fastmem.
         let mut require_abort = false;
-        let dest_ptr = emit_fastmem_vaddr_a64(ra, ctx, abort, vaddr, &mut require_abort, None);
+        let mut dest_ptr = emit_fastmem_vaddr_a64(ra, ctx, abort, vaddr, &mut require_abort, None);
+        if let Some(d) = disp {
+            dest_ptr = dest_ptr + d;
+        }
         let mov_off = emit_write_memory_mov::<BITSIZE>(
             ra.asm,
             dest_ptr,
@@ -1599,6 +1704,13 @@ pub fn emit_a64_memory_write<const BITSIZE: usize>(
         ctx.deferred_emits
             .borrow_mut()
             .push(Box::new(move |dctx: &mut DeferredEmitCtx<'_>| {
+                if let Some(d) = disp {
+                    emit_folded_fault_path(
+                        dctx, abort, &end, vaddr, d, wrapped_fn_off, mov_off, marker, recompile,
+                        abort_info,
+                    );
+                    return;
+                }
                 let asm = &mut *dctx.asm;
                 asm.bind(&abort).unwrap();
                 emit_call_to_offset(asm, wrapped_fn_off);

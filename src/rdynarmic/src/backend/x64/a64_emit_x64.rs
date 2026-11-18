@@ -509,6 +509,15 @@ impl A64EmitX64 {
                 }
             }
 
+            // Lichii `A64EmitX64::Emit` (aab5393019, fold_address_offsets): fold Add64(base,
+            // disp) into the [r13 + base + disp] address of the fastmem access that is its only
+            // use (unchecked 64-bit fastmem only: the sum then wraps exactly like the guest's).
+            if self.codegen.fold_address_offsets
+                && self.emit_config.memory.fastmem_address_space_bits == 64
+            {
+                *ctx.folded_address_adds.borrow_mut() = find_folded_address_adds(&ctx, &block);
+            }
+
             let desc = emit_block(&ctx, &mut ra, &block);
 
             // Drain deferred-emit closures: each one binds an `abort`
@@ -952,6 +961,59 @@ impl A64EmitX64 {
             self.invalidate_basic_block(location);
         }
     }
+}
+
+/// The Add64(base, imm) instructions whose only use is the address of one 8-64-bit fastmem
+/// load or store, with their displacement (Lichii `A64EmitX64::Emit`, aab5393019).
+fn find_folded_address_adds(
+    ctx: &EmitContext,
+    block: &Block,
+) -> Vec<(crate::ir::value::InstRef, i32)> {
+    use crate::ir::opcode::Opcode;
+    use crate::ir::value::{InstRef, Value};
+    let mut folded = Vec::new();
+    for (index, inst) in block.instructions.iter().enumerate() {
+        if inst.is_tombstone() {
+            continue;
+        }
+        if !matches!(
+            inst.opcode,
+            Opcode::A64ReadMemory8
+                | Opcode::A64ReadMemory16
+                | Opcode::A64ReadMemory32
+                | Opcode::A64ReadMemory64
+                | Opcode::A64WriteMemory8
+                | Opcode::A64WriteMemory16
+                | Opcode::A64WriteMemory32
+                | Opcode::A64WriteMemory64
+        ) {
+            continue;
+        }
+        let Value::Inst(add_ref) = inst.args[1] else {
+            continue;
+        };
+        let add = block.get(add_ref);
+        if add.opcode != Opcode::Add64 || add.use_count != 1 {
+            continue;
+        }
+        let (base, offset, carry) = (add.args[0], add.args[1], add.args[2]);
+        if base.is_immediate()
+            || !offset.is_immediate()
+            || !carry.is_immediate()
+            || carry.get_imm_as_u64() != 0
+        {
+            continue;
+        }
+        let disp = offset.get_imm_as_u64() as i64;
+        if !(-0x7FFF_FFFF..=0x7FFF_FFFF).contains(&disp)
+            || crate::backend::x64::a64_emit_x64_memory::should_fastmem(ctx, InstRef(index as u32))
+                .is_none()
+        {
+            continue;
+        }
+        folded.push((add_ref, disp as i32));
+    }
+    folded
 }
 
 /// Map an IR Type to its bit width for register allocation.

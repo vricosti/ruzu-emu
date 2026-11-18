@@ -216,6 +216,12 @@ pub struct UserConfig {
     /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
     /// `interface/A64/config.h` (commit aab5393019, "scratch_copy_to_free_reg").
     pub scratch_copy_to_free_reg: bool,
+    /// x64 only, with unchecked 64-bit fastmem. A base + immediate address whose only use is one
+    /// load or store is folded into that access's addressing mode instead of computed with LEA.
+    ///
+    /// Divergence from Eden (allowed by the user on 2026-11-17, see DIFF.md): port of Lichii
+    /// `interface/A64/config.h` (commit aab5393019, "fold_address_offsets").
+    pub fold_address_offsets: bool,
     /// x64 only. A 32-bit value known to be zero-extended in its host register (written by a
     /// 32-bit instruction) is not zero-extended again by SetW / ZeroExtendWordToLong.
     ///
@@ -272,6 +278,7 @@ impl UserConfig {
             recompile_on_exclusive_fastmem_failure: true,
             spill_to_free_gpr: false,
             scratch_copy_to_free_reg: false,
+            fold_address_offsets: false,
             elide_redundant_zext: false,
             omit_block_frame: false,
             define_unpredictable_behaviour: false,

@@ -257,6 +257,8 @@ pub struct A64CodegenOptions {
     pub spill_to_free_gpr: bool,
     /// `A64::UserConfig::scratch_copy_to_free_reg`.
     pub scratch_copy_to_free_reg: bool,
+    /// `A64::UserConfig::fold_address_offsets`.
+    pub fold_address_offsets: bool,
     /// `A64::UserConfig::elide_redundant_zext`.
     pub elide_redundant_zext: bool,
     /// `A64::UserConfig::omit_block_frame`.
@@ -269,6 +271,7 @@ impl Default for A64CodegenOptions {
         Self {
             spill_to_free_gpr: false,
             scratch_copy_to_free_reg: false,
+            fold_address_offsets: false,
             elide_redundant_zext: false,
             omit_block_frame: false,
         }
@@ -280,6 +283,7 @@ impl A64CodegenOptions {
         Self {
             spill_to_free_gpr: config.spill_to_free_gpr,
             scratch_copy_to_free_reg: config.scratch_copy_to_free_reg,
+            fold_address_offsets: config.fold_address_offsets,
             elide_redundant_zext: config.elide_redundant_zext,
             omit_block_frame: config.omit_block_frame,
         }
@@ -393,6 +397,11 @@ pub struct EmitContext<'a> {
     /// x86-64 code generation options of the A64 configuration (Lichii
     /// `A64EmitContext::conf`); the defaults (all off) for A32 and unit tests.
     pub a64_codegen: A64CodegenOptions,
+    /// Address folding (`fold_address_offsets`), per block: Add64(base, disp) instructions
+    /// whose only use is the address of a fastmem access. The Add is not emitted (its value is
+    /// the base); the access adds disp in its addressing mode. Lichii keeps the list in
+    /// `BlockOfCode::folded_address_adds` (aab5393019).
+    pub folded_address_adds: RefCell<Vec<(crate::ir::value::InstRef, i32)>>,
 }
 
 impl<'a> EmitContext<'a> {
@@ -424,6 +433,7 @@ impl<'a> EmitContext<'a> {
             memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
             a64_codegen: A64CodegenOptions::default(),
+            folded_address_adds: RefCell::new(Vec::new()),
         }
     }
 
@@ -464,12 +474,22 @@ impl<'a> EmitContext<'a> {
             memory_128_accessors: None,
             prologue_counter_addr: std::cell::Cell::new(None),
             a64_codegen: A64CodegenOptions::default(),
+            folded_address_adds: RefCell::new(Vec::new()),
         }
     }
 
     /// Take collected patch entries out of the context.
     pub fn take_patch_entries(&self) -> Vec<PatchEntry> {
         self.patch_entries.borrow_mut().drain(..).collect()
+    }
+
+    /// Lichii `BlockOfCode::FoldedAddressDisp`.
+    pub fn folded_address_disp(&self, inst: crate::ir::value::InstRef) -> Option<i32> {
+        self.folded_address_adds
+            .borrow()
+            .iter()
+            .find(|(add, _)| *add == inst)
+            .map(|(_, disp)| *disp)
     }
 
     pub fn has_host_feature(&self, feature: HostFeature) -> bool {

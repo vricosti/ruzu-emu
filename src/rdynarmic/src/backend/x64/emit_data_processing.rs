@@ -178,6 +178,14 @@ fn do_nzcv(ra: &mut RegAlloc, nzcv_out: Option<InstRef>) -> Option<Reg> {
 fn emit_add(ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstRef, inst: &Inst, bitsize: usize) {
     use crate::ir::opcode::Opcode;
 
+    if bitsize == 64 && ctx.folded_address_disp(inst_ref).is_some() {
+        // Lichii `EmitAdd` (aab5393019, fold_address_offsets): folded into the address of the
+        // memory access that is its only use.
+        let args = ra.get_argument_info(inst_ref, &inst.args, inst.num_args());
+        ra.define_value_from_arg(inst_ref, &args[0]);
+        return;
+    }
+
     let carry_inst = ctx
         .block
         .and_then(|b| b.get_associated_pseudo_operation(inst_ref, Opcode::GetCarryFromOp));

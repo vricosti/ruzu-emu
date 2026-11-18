@@ -1,5 +1,33 @@
 # Upstream parity notes
 
+## 2026-11-17 — S2R invocation / workgroup ids: shader_recompiler/frontend/translate/move_special_register.rs vs Eden shader_recompiler/frontend/maxwell/translate/impl/move_special_register.cpp and frontend/ir/ir_emitter.cpp
+
+### Fixed divergence
+- SR_TID, SR_TID_X/Y/Z and SR_CTAID_X/Y/Z were lowered to `CompositeExtractU32x2` of
+  `LocalInvocationId` / `WorkgroupId`. Eden's `IREmitter::LocalInvocationIdX/Y/Z`,
+  `WorkgroupIdX/Y/Z` (ir_emitter.cpp:344-370) and the SR_TID packing call
+  `IREmitter::CompositeExtract`, which picks the opcode from the vector's type (U32x3):
+  `CompositeExtractU32x3`. Now the same. Both opcodes emit the same backend code (SPIR-V
+  `OpCompositeExtract` to a u32; GLSL, GLASM and MSL share one arm), so no shader output changes.
+- Consequence fixed: Lichii's native store extent analysis (`StoreExtentAnalysis` in
+  global_memory_to_storage_buffer_pass.rs, Lichii ee155a555b) matches only
+  `CompositeExtractU32x3` of the id vectors. Every native compute store indexed by the ids was
+  "unknown", so `BufferCache::bind_compute_storage_buffer` marked the whole binding (up to 8 MiB
+  behind a native pointer) GPU-written at every dispatch. On the NX2 title used for measurement,
+  265 of the 394 failed store analyses stopped at this extract; the over-marked pages included
+  the ones the guest reads back each frame, whose read-back records then stayed at four unread
+  writes (`note_read_back_write`), which disables their early downloads: 3.35 reads with a flush
+  per frame against 1.76 in Lichii (Lichii with `native_compute_write_mark=Full`: 3.0).
+- Freshness invariant (unchanged mechanism, Lichii's): a binding is marked over
+  `min(binding, pad + extent)`, where the extent is an upper bound of every store's end for all
+  invocations of the dispatch, proved affine in the ids with non-negative strides (inexact
+  bounds, wrap below zero, loops, other pointers, untracked or unbounded stores, indirect grids
+  with workgroup terms all leave it unknown, i.e. the whole binding). Bytes past the bound are
+  never written by the dispatch, so leaving them CPU-owned cannot serve a stale read.
+- Measured (forest scene, instrumented builds): reads with a flush 3.35 -> 1.81 per frame at
+  3.26 -> 1.89 ms each, reads served by downloads already on their way 1.33 -> 2.84 per frame at
+  2.36 -> 1.42 ms. Frame rate: see the merge commit.
+
 ## 2026-11-16 — split front macro calls: video_core/engines/{maxwell_3d,kepler_compute}.rs vs Lichii video_core/engines/{maxwell_3d.cpp:1854-1946 (FrontRunMacro, FrontRunOnBack), kepler_compute.cpp:2044-2120 (FrontRunMacro)}
 
 ### Intentional differences
